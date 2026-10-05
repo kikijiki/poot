@@ -1,0 +1,27 @@
+---
+id: megakernel
+title: The Megakernel
+sidebar_position: 8
+---
+
+# The Megakernel
+
+:::note[Removed]
+poot has no megakernel. The earlier implementation was deleted because nothing used it and it
+silently passed through ops it could not run.
+:::
+
+A megakernel combines work from several kernels into one persistent device launch. Extending it to
+an entire token loop also requires on-device sampling and stop handling. Related persistent-kernel
+work includes Mirage [^mirage] and MPK [^mpk].
+
+The current kernel IR has scoped fences and compare-and-swap, and the PTX and ROCm runtimes expose
+cooperative-launch mechanisms. Those pieces do not constitute a megakernel: a recorder alone cannot
+make arbitrary host-loaded kernels callable from a persistent kernel, and a multi-token loop needs
+sampling, cancellation and streaming contracts. wgpu lacks the grid-wide synchronization this
+strategy would require. Current execution uses
+[native replay or cached dispatch encoding](./execution).
+
+[^mirage]: Wu, M. et al., "Mirage: A Multi-Level Superoptimizer for Tensor Programs," OSDI, 2024. https://arxiv.org/abs/2405.05751
+
+[^mpk]: Wu, M. et al., "MPK: A Compiler and Runtime for Mega-Kernelizing Tensor Programs," arXiv:2512.22219, 2025. https://arxiv.org/abs/2512.22219

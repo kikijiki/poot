@@ -1,0 +1,102 @@
+# Required cases for `just test-device-wgpu` (card 670), one per line:
+# binary_id<TAB>test_name, the identity the lane's JUnit report carries as classname and name.
+# Hand-maintained: never generated from the justfile's selection. The gate
+# (scripts/check-required-cases.py wgpu) fails the lane unless every case here ran and passed -
+# a skip is never a pass. Sorted in canonical (LC_ALL=C) order.
+#
+# The migrated 546a cases this lane exists to prove: packed serving, launch widening and narrow
+# storage, I32 index, state/capture, failure lifecycle (cr30_lifecycle and the contract's
+# refusals/faults) and cache identity, plus every executor_contract row. The bare `poot-gpu` rows
+# are poot-gpu's own lib unit tests (src/lib.rs's #[path]-included modules), not an integration
+# binary: card 559's imported_kernel_tests are the only real dispatch consumers of the
+# rowsum_for/rmsnorm_dyn committed assets, so they must run here, not just in the staleness test.
+poot-executor	engine::kernel_identity_tests::colliding_display_keys_with_different_bodies_never_alias_in_either_order
+poot-executor::cr30_lifecycle	begin_failure_aborts_exactly_once_and_leaves_no_open_recording
+poot-executor::cr30_lifecycle	carried_state_has_no_ping_pong_pair
+poot-executor::cr30_lifecycle	copy_failure_during_recording_aborts_once_and_does_not_mark_needs_reset
+poot-executor::cr30_lifecycle	dispatch_failure_during_recording_aborts_once_and_does_not_mark_needs_reset
+poot-executor::cr30_lifecycle	failed_abort_poisons_the_device_and_reset_cannot_clear_it
+poot-executor::cr30_lifecycle	finish_failure_during_recording_aborts_once_and_does_not_mark_needs_reset
+poot-executor::cr30_lifecycle	non_fault_synchronize_failure_aborts_and_marks_needs_reset
+poot-executor::cr30_lifecycle	replay_failure_aborts_once_and_marks_needs_reset
+poot-executor::cr30_lifecycle	synchronize_fault_surfaces_as_exec_error_fault_from_step_with_no_output_read
+poot-gpu	imported_kernel_tests::rmsnorm_dyn_asset_matches_cpu_on_wgpu
+poot-gpu	imported_kernel_tests::rowsum_for_asset_matches_cpu_on_wgpu
+poot-gpu	parity_tests::alibi_slopes_attention_matches_the_oracle_and_the_reference_on_wgpu
+poot-gpu	parity_tests::bf16_const_cast_is_bit_exact_on_wgpu
+poot-gpu	parity_tests::checkpoint_orientation_projection_matches_the_oracle_on_wgpu
+poot-gpu	parity_tests::f16_checkpoint_orientation_projection_matches_the_oracle_on_wgpu
+poot-gpu	parity_tests::packed_linears_and_the_canonical_expert_chain_match_the_oracle_on_wgpu
+poot-gpu::buffer_plan	a_short_value_reusing_a_larger_slot_publishes_its_own_length_not_the_slots
+poot-gpu::buffer_plan	disjoint_lifetimes_reuse_one_slot_and_match_the_oracle
+poot-gpu::buffer_plan	len_probe_reads_the_operand_own_length_never_a_larger_slots_capacity
+poot-gpu::cross_backend	sample_token_gumbel_cross_backend
+poot-gpu::cross_backend	sample_token_gumbel_topk_cross_backend
+poot-gpu::cross_backend	sample_token_gumbel_topk_topp_cross_backend
+poot-gpu::cross_backend	sample_token_gumbel_topp_only_excludes_untruncated_winner_cross_backend
+poot-gpu::cross_backend	unary_tanh_erf_cross_backend
+poot-gpu::executor_contract	bf16_embed_weight_feeds_gather_and_decode_gemv_with_no_host_f32_copy
+poot-gpu::executor_contract	binder_and_target_refusals_are_typed
+poot-gpu::executor_contract	eager_submission_is_refused_at_add_entry_before_any_allocation
+poot-gpu::executor_contract	many_layer_prefill_splits_submits_by_dispatch_count_and_matches_the_oracle
+poot-gpu::executor_contract	mid_load_refusal_rolls_back_a_newly_allocated_state_and_leaves_the_existing_entry_unaffected
+poot-gpu::executor_contract	packed_awq_linear_binds_by_store_key_and_source_role_and_matches_the_oracle
+poot-gpu::executor_contract	packed_gptq_linear_binds_by_store_key_and_source_role_and_matches_the_oracle
+poot-gpu::executor_contract	packed_q4_k_linear_binds_by_store_key_and_source_role_and_matches_the_oracle
+poot-gpu::executor_contract	packed_q5_k_linear_binds_by_store_key_and_source_role_and_matches_the_oracle
+poot-gpu::executor_contract	packed_q6_k_linear_binds_by_store_key_and_source_role_and_matches_the_oracle
+poot-gpu::executor_contract	packed_q8_0_linear_binds_by_store_key_and_source_role_and_matches_the_oracle
+poot-gpu::executor_contract	planted_bad_validation_packet_fails_before_any_output_readback
+poot-gpu::executor_contract	prefill_and_decode_entries_share_state_and_reset_without_rerecording
+poot-gpu::executor_contract	qwen2_decode_on_the_contract_matches_the_oracle_and_records_once
+poot-gpu::executor_contract	remove_entry_frees_its_arena_and_leaves_the_other_entry_unaffected
+poot-gpu::executor_contract	single_decode_step_crosses_flush_work_by_summed_work_and_matches_the_oracle
+poot-gpu::executor_contract	state_with_same_name_and_other_aval_is_refused
+poot-gpu::executor_contract	two_phase_state_commit_matches_the_oracle_after_four_steps
+poot-gpu::executor_contract	wgpu_device_classifies_a_kernel_assert_fault_from_synchronize
+poot-gpu::graph	dense_gemv::a_contraction_keeps_its_lds_width_through_the_planner_on_wgpu
+poot-gpu::graph	dense_gemv::the_dense_gemv_meets_tier_2_in_every_lane_and_launch_on_wgpu
+poot-gpu::graph	flash::decomposed_prefill_attention_over_65535_query_groups_matches_cpu
+poot-gpu::graph	gather_scatter::i32_slot_gather_variants_compiled_match_cpu_bit_exact
+poot-gpu::packed_launch_widening	a_widened_materialize_after_a_narrow_one_is_bit_exact
+poot-gpu::packed_launch_widening	a_widened_row_gather_after_a_narrow_one_is_bit_exact
+poot-gpu::packed_serving	a_dense_traced_q6_k_expert_stack_binds_and_matches_the_oracle
+poot-gpu::packed_serving	canonical_packed_moe_chain_runs_bit_exact
+poot-gpu::packed_serving	packed_decode_through_resident_serving_path_is_bit_exact
+poot-gpu::packed_serving	packed_embedding_row_gather_is_bit_exact
+poot-gpu::packed_serving	packed_prefill_through_serving_paths_is_bit_exact
+poot-gpu::qwen2	prefill_kv_shared_pool_matches_contiguous
+poot-gpu::qwen2	qwen2_decode_gpu_matches_cpu
+poot-gpu::stress	sliding_window_mask_from_pos_gpu_matches_cpu
+poot-gpu::weight_map_binding	a_hosted_embed_gather_equals_the_device_gather
+poot-gpu::weight_map_binding	a_split_head_generates_the_unsplit_logits_and_tokens
+poot-gpu::weight_map_binding	chunked_prefill_then_decode_equals_token_by_token_decode
+poot-gpu::weight_map_binding	fused_and_stacked_views_equal_separate_storage
+poot-gpu::weight_map_binding	qwen2_binds_through_the_map_and_matches_the_oracle
+poot-llm	driver::device_tests::a_guided_row_takes_the_whole_step_to_the_logits_entry_wgpu
+poot-llm	driver::device_tests::a_refused_shape_is_typed_before_any_dispatch_wgpu
+poot-llm	driver::device_tests::an_unsupported_request_is_the_same_variant_for_two_families_wgpu
+poot-llm	driver::device_tests::capacity_does_not_change_the_tokens_wgpu
+poot-llm	driver::device_tests::chunked_prefill_equals_token_by_token_wgpu
+poot-llm	driver::device_tests::commit_keeps_fewer_than_returned_wgpu
+poot-llm	driver::device_tests::fixture_tokens_equal_the_recorded_literals_wgpu
+poot-llm	driver::device_tests::greedy_ties_take_the_first_index_wgpu
+poot-llm	driver::device_tests::guided_requests_sample_inside_the_mask_wgpu
+poot-llm	driver::device_tests::mixed_step_bloom_wgpu
+poot-llm	driver::device_tests::mixed_step_qwen2_wgpu
+poot-llm	driver::device_tests::packed_checkpoints_load_as_stored_through_the_registry_wgpu
+poot-llm	driver::device_tests::packed_q5_0_gguf_generates_like_its_dense_twin_wgpu
+poot-llm	driver::device_tests::packed_q8_0_gguf_generates_like_its_dense_twin_wgpu
+poot-llm	driver::device_tests::prefix_reuse_hits_and_matches_the_unshared_run_wgpu
+poot-llm	driver::device_tests::recorded_bloom_tokens_wgpu
+poot-llm	driver::device_tests::recorded_gemma3_tokens_wgpu
+poot-llm	driver::device_tests::recorded_granite_tokens_wgpu
+poot-llm	driver::device_tests::recorded_llama_tokens_wgpu
+poot-llm	driver::device_tests::recorded_mpt_tokens_wgpu
+poot-llm	driver::device_tests::recorded_olmo2_tokens_wgpu
+poot-llm	driver::device_tests::recorded_phi3_tokens_wgpu
+poot-llm	driver::device_tests::recorded_qwen2_tokens_wgpu
+poot-llm	driver::device_tests::recorded_qwen3_tokens_wgpu
+poot-llm	driver::device_tests::recorded_smollm3_tokens_wgpu
+poot-llm	driver::device_tests::sampled_differs_from_greedy_wgpu
+poot-runtime	context::init::launch_caps_device_receipt::a_live_amd_device_reports_the_launch_limits_the_fixture_documents

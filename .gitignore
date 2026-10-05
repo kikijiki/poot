@@ -1,0 +1,30 @@
+# build artifacts
+/target
+**/target
+Cargo.lock.bak
+
+# local secrets (RunPod API key etc.) loaded by direnv
+/.env
+/.env.local
+
+# Claude Code per-project local config
+.claude/
+
+# nix / direnv
+result
+result-*
+.direnv/
+
+# scratch artifacts from ad-hoc rustc / llc experiments
+/lib*.rlib
+/test_*
+*.spv
+*.ptx
+*.ll.scratch
+
+# embedded module caches in user kernel crates
+**/poot-cache.rs
+
+# local logs and env files
+*.log
+.env.*

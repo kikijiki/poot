@@ -1,0 +1,33 @@
+[package]
+name = "poot-models"
+description = "Model forward decompositions (the tracers) authored against poot-graph-ir's op surface"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+poot-graph-ir.workspace = true
+poot-tensor.workspace = true
+poot-load.workspace = true
+# `Model::weights` returns a `WeightMap`; `RawConfig::HfJson` carries the parsed `config.json`
+# and `generation_config.json`.
+poot-quant.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+poot-test-util = { workspace = true, features = ["graph-fixtures"] }
+poot-eval.workspace = true
+poot-executor-parity.workspace = true
+poot-runtime-common.workspace = true
+# Card 534a: fold_dense_bf16_row_gathers is pub(crate) in poot-graph-plan now,
+# reachable only through prepare_target_graph. Test-only and acyclic: poot-graph-plan's own
+# dependency on poot-models is dev-only, so building this crate's tests never needs poot-models.
+poot-graph-plan.workspace = true
+poot-target.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,148 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://poot/benchmarks/result.schema.json",
+  "title": "poot benchmark result record",
+  "description": "One record per (framework, model, precision, scenario) cell. The harness writes one JSON object per line into results.jsonl. Timing fields come from the runner; memory fields come from the harness external sampler; the env block is written once per run into env.json (not repeated per row). Which binary, on which backend and device, produced a row is on the row itself (build_sha, binary_sha256, backend, device).",
+  "definitions": {
+    "nonnegativePercentiles": {
+      "type": "object",
+      "required": ["p50", "p90", "p99"],
+      "properties": {
+        "p50": { "type": "number", "minimum": 0 },
+        "p90": { "type": "number", "minimum": 0 },
+        "p99": { "type": "number", "minimum": 0 }
+      }
+    },
+    "positivePercentiles": {
+      "type": "object",
+      "required": ["p50", "p90", "p99"],
+      "properties": {
+        "p50": { "type": "number", "exclusiveMinimum": 0 },
+        "p90": { "type": "number", "exclusiveMinimum": 0 },
+        "p99": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    }
+  },
+  "type": "object",
+  "required": ["framework", "model", "precision", "scenario", "status"],
+  "properties": {
+    "framework": {
+      "type": "string",
+      "enum": ["poot", "candle", "transformers", "vllm", "llamacpp"],
+      "description": "The engine under test."
+    },
+    "framework_version": {
+      "type": "string",
+      "description": "Resolved version of the engine (cargo pkg version / pip version / llama.cpp git tag)."
+    },
+    "model": {
+      "type": "string",
+      "description": "Manifest model id (stable key, e.g. 'qwen2.5-0.5b')."
+    },
+    "precision": {
+      "type": "string",
+      "description": "Precision actually run for this cell (e.g. f32, bf16, fp16, gptq-int4, awq-int4, mxfp4, q4_k_m).",
+      "examples": ["bf16", "fp16", "gptq-int4", "q4_k_m"]
+    },
+    "scenario": {
+      "type": "string",
+      "description": "Manifest scenario id (e.g. 'decode-128', 'prefill-1k')."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["ok", "unsupported", "error"],
+      "description": "ok = measured; unsupported = framework cannot run this model/precision (see reason); error = run failed (see reason)."
+    },
+    "reason": {
+      "type": "string",
+      "description": "Required when status is 'unsupported' or 'error': the explicit reason / error message. For 'unsupported' it is the refusal exactly as the tool reports it."
+    },
+    "build_sha": {
+      "type": "string",
+      "pattern": "[0-9a-f]{40}(-dirty)?",
+      "description": "The git sha the runner binary was built from, embedded at build time and reported by the runner ('-dirty' when the tree had uncommitted changes). Reported by runners built from this repository (poot), which must give it on an 'ok' row and on a refusal ('unsupported'); absent from other engines' rows and from an 'error' row whose runner reported nothing."
+    },
+    "binary_sha256": {
+      "type": ["string", "null"],
+      "pattern": "[0-9a-f]{64}",
+      "description": "SHA-256 of the runner executable that was asked to run, read from the file by the harness; null when the runner path names no file. Names the binary; build_sha names the source it was built from."
+    },
+    "backend": {
+      "type": "string",
+      "description": "The backend the cell ran on (poot: ptx, rocm or wgpu, as requested through POOT_BENCH_BACKEND and reported back by the runner; other engines: what they report, e.g. vulkan)."
+    },
+    "device": {
+      "type": ["string", "null"],
+      "description": "The accelerator the cell ran on, from the harness environment capture (env.json gpu_name); null when the host reports none. Part of a cell's identity for `bench compare`, with backend."
+    },
+    "prompt_tokens": { "type": "integer", "minimum": 0, "description": "Input length the runner tokenized." },
+    "gen_tokens": { "type": "integer", "minimum": 1, "description": "Tokens generated in the timed run (fixed per scenario for comparability)." },
+    "ttft_ms": { "type": "number", "minimum": 0, "description": "Time to first generated token, milliseconds (median over timed iterations)." },
+    "tpot_ms": { "type": "number", "minimum": 0, "description": "Mean inter-token gap over decode = decode_span/(gen_tokens-1), milliseconds (median over iterations)." },
+    "e2e_ms": { "type": "number", "minimum": 0, "description": "End-to-end request latency, start to last token, milliseconds (median)." },
+    "decode_tok_s": { "type": "number", "minimum": 0, "description": "Decode throughput = gen_tokens / e2e, tokens/second (median)." },
+    "iterations": { "type": "integer", "minimum": 1, "description": "Number of timed iterations the median/stats are over." },
+    "ttft_ms_stdev": { "type": "number", "minimum": 0, "description": "Stdev of TTFT across iterations (noise indicator)." },
+    "decode_tok_s_stdev": { "type": "number", "minimum": 0 },
+    "peak_vram_bytes": { "type": "integer", "description": "Peak GPU memory used during the runner's lifetime, from the harness NVML/nvidia-smi sampler (external, uniform across frameworks). Omitted when unavailable, including shared-memory iGPUs." },
+    "vram_baseline_bytes": { "type": "integer", "description": "GPU memory used just before the runner started (other processes), subtracted is left to the report; recorded raw." },
+    "peak_rss_bytes": { "type": "integer", "description": "Peak process resident set size during the runner's lifetime, from /proc (external)." },
+    "gpu_util_mean_pct": { "type": "number", "description": "Mean GPU compute utilization (% of sample periods the SMs were busy) over the cell, from the external sampler. Low = headroom (idle GPU between launches/syncs)." },
+    "gpu_util_peak_pct": { "type": "number", "description": "Peak GPU compute utilization over the cell, from the external sampler." },
+    "cpu_util_mean_pct": { "type": "number", "description": "Mean process-tree CPU utilization (%, 100% == one full core) over the cell, from psutil. Near 100% while GPU util is low points to a single-thread host bottleneck feeding the GPU." },
+    "cpu_util_peak_pct": { "type": "number", "description": "Peak process-tree CPU utilization (%, 100% == one full core) over the cell." },
+    "peak_power_w": { "type": "number", "description": "Peak instantaneous GPU board power draw (watts) during the runner's lifetime, from the harness NVML/nvidia-smi sampler (external, uniform across frameworks). Omitted when unavailable." },
+    "energy_j": { "type": "number", "description": "Total GPU energy consumed over the cell (joules), integrated from the same power samples as peak_power_w (power_w * wall-clock dt per sample, summed). Omitted when unavailable." },
+    "energy_wh": { "type": "number", "description": "energy_j converted to watt-hours (energy_j / 3600), for readability at bench-cell scale." },
+    "util_series": { "type": "array", "description": "Downsampled (~1 Hz) utilization trace over the cell for plotting util-over-time. Each entry is [t_s, gpu_pct, cpu_pct, vram_bytes, rss_bytes, power_w]; spans all ISLs of a decode-curve cell (no per-ISL markers).", "items": { "type": "array" } },
+    "sampler_interval_ms": { "type": "number", "description": "External sampler period; a coarse interval can miss a short-lived peak." },
+    "self_reported_vram_bytes": { "type": "integer", "minimum": 0, "description": "Optional: the framework's own VRAM number (torch.cuda.max_memory_allocated, vLLM weight footprint, etc.) for cross-check. Not the comparison number." },
+    "osl": { "type": "integer", "minimum": 2, "description": "decode-curve (spec 115): the fixed output length (tokens decoded + timed) at each context length." },
+    "isl": { "type": "integer", "minimum": 1, "description": "decode-curve: top-level summary context length (the smallest ISL point, for the report/index headline)." },
+    "curve": {
+      "type": "array",
+      "minItems": 1,
+      "description": "decode-curve (spec 115): one entry per requested context length (ISL), aggregated by the harness from the runner's validated raw per-token samples. Runtime validation requires exact requested ISL coverage before this row is written. The shape of decode_tok_s / tpot_ms across isl is the degradation curve.",
+      "items": {
+        "type": "object",
+        "required": ["isl", "osl", "prompt_tokens", "iters", "ttft_ms", "tpot_ms", "itl_ms", "decode_tok_s"],
+        "properties": {
+          "isl": { "type": "integer", "minimum": 1, "description": "Context length (synthetic prefill tokens) for this point." },
+          "osl": { "type": "integer", "minimum": 2, "description": "Decode tokens timed at this point." },
+          "prompt_tokens": { "type": "integer", "minimum": 1, "description": "Tokens the runner actually prefilled; runtime validation requires it to equal isl." },
+          "iters": { "type": "integer", "minimum": 1, "description": "Timed iterations aggregated into this point." },
+          "ttft_ms": { "$ref": "#/definitions/nonnegativePercentiles", "description": "Prefill cost (start to first token), percentiles p50/p90/p99 over iters." },
+          "tpot_ms": { "$ref": "#/definitions/positivePercentiles", "description": "Per-token decode cost = (e2e-ttft)/(osl-1), prefill EXCLUDED, percentiles p50/p90/p99." },
+          "itl_ms": { "$ref": "#/definitions/nonnegativePercentiles", "description": "Inter-token latency, token-weighted percentiles p50/p90/p99 over all decode gaps." },
+          "decode_tok_s": { "type": "number", "exclusiveMinimum": 0, "description": "Steady-state decode throughput = 1000 / median tpot_ms (prefill excluded)." }
+        }
+      }
+    },
+    "caveats": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Per-cell honesty notes: precision mismatch vs the matched target, vLLM KV-pool inflation, warmup excluded, etc. FR-009."
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "enum": ["unsupported", "error"] } }, "required": ["status"] },
+      "then": { "required": ["reason"] }
+    },
+    {
+      "if": {
+        "properties": { "framework": { "enum": ["poot"] }, "status": { "enum": ["ok"] } },
+        "required": ["framework", "status"]
+      },
+      "then": { "required": ["build_sha", "binary_sha256", "backend"] }
+    },
+    {
+      "if": {
+        "properties": { "framework": { "enum": ["poot"] }, "status": { "enum": ["unsupported"] } },
+        "required": ["framework", "status"]
+      },
+      "then": { "required": ["build_sha", "backend"] }
+    }
+  ],
+  "additionalProperties": true
+}

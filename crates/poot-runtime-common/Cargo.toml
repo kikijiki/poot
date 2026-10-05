@@ -1,0 +1,17 @@
+[package]
+name = "poot-runtime-common"
+description = "Backend-neutral helpers shared by poot GPU runtimes"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# poot-target (card 608): a leaf crate every other poot crate may depend on (card 522),
+# not a backend runtime/driver/executor/graph/planner, so this stays within ADR-0097's boundary.
+[dependencies]
+poot-target.workspace = true
+
+[lints]
+workspace = true

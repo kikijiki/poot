@@ -1,0 +1,30 @@
+[package]
+name = "poot-load"
+description = "Safetensors + HF config loading for poot (bf16/f16 -> f32), dependency-light"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+# Card 671: `load_weight_store_bytes` has no production caller anywhere in the workspace - every reference
+# is test code, and the one non-test reference is poot-test-util's own forwarder. Gated so a default build
+# never compiles it in, instead of leaving it unconditionally `pub` with poot-test-util as its sole non-test
+# "caller" - the gate would otherwise treat that as a real use and never flag it.
+test-support = []
+
+[dependencies]
+poot-quant.workspace = true
+poot-tensor.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ring.workspace = true
+
+[dev-dependencies]
+poot-test-util.workspace = true
+
+[lints]
+workspace = true

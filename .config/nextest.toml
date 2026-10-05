@@ -1,0 +1,54 @@
+# Device-dispatching tests share one physical GPU. Local Vulkan and HSA drivers, and the gfx1151 firmware in
+# particular, can hang or fault when separate test processes use the device at the same time, so every test
+# that dispatches runs alone. nextest runs each test in its own process, so the group is what serializes
+# them. It serializes a single nextest invocation only; concurrent cargo/nextest invocations can still
+# overlap (the box-wide GPU lock covers that).
+#
+# The group is scoped to tests that can reach a device, not to whole crates, so the host-only tests of
+# poot-llm and poot-serve run in parallel:
+#   - crates whose tests are device tests or drive device runtimes are grouped whole;
+#   - pootc dispatches from two test binaries only;
+#   - poot-llm and poot-serve are grouped by binary or test name (gpu, ptx, rocm, vulkan, hardware). A device
+#     test named without one of those words escapes the group, so name device tests that way. The filter
+#     language has no variables, so the binary regex and the test regex spell the same list: change both.
+
+[test-groups]
+gpu = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = '''
+package(poot-gpu) | package(poot-runtime) | package(poot-kernelgen)
+| package(poot-rocm-gpu) | package(poot-rocm-runtime) | package(poot-vulkan-runtime) | package(poot-vulkan-device)
+| package(poot-ptx-gpu) | package(poot-ptx-runtime)
+| (package(pootc) & (binary(import_run) | binary(macro_kernel)))
+| ((package(poot-llm) | package(poot-serve)) & (binary(/gpu|ptx|rocm|vulkan|hardware/) | test(/gpu|ptx|rocm|vulkan|hardware/)))
+'''
+test-group = 'gpu'
+
+# The device lanes each run under their own profile (card 670) so their JUnit results land in one
+# per-lane file: `target/nextest/device-<lane>/results.xml`, which scripts/check-required-cases.py
+# compares against the lane's hand-maintained scripts/required-device-cases/<lane>.txt. Profiles
+# inherit the default profile, so the gpu test-group override above still serializes device tests
+# under a lane profile. `store-success-output` keeps every passing test's captured stdout/stderr in
+# the report: a runtime skip prints its report and returns, and the gate must be able to read that
+# report - a skipped case is never a pass.
+
+[profile.device-wgpu.junit]
+path = "results.xml"
+store-success-output = true
+
+[profile.device-kernels.junit]
+path = "results.xml"
+store-success-output = true
+
+[profile.device-vulkan.junit]
+path = "results.xml"
+store-success-output = true
+
+[profile.device-rocm.junit]
+path = "results.xml"
+store-success-output = true
+
+[profile.device-ptx.junit]
+path = "results.xml"
+store-success-output = true

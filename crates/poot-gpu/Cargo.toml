@@ -1,0 +1,51 @@
+[package]
+name = "poot-gpu"
+description = "GPU graph executor: run a poot-graph-ir Graph by dispatching a generated kernel per op"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+poot-target.workspace = true
+poot-graph-plan.workspace = true
+poot-runtime.workspace = true
+poot-executor.workspace = true
+
+[dev-dependencies]
+bytemuck.workspace = true
+serde_json.workspace = true
+poot-executor-parity.workspace = true
+poot-test-util = { workspace = true, features = ["graph-fixtures", "kernel-fixtures"] }
+poot-graph-ir.workspace = true
+# Card 671: this crate's own `tests/graph/*.rs` and `src/tests/decode_cache_warmth.rs` call
+# `is_decode_gemv`/`is_tiled_gemm`/`reassociation_class`/`per_eqn_plans_outside_compile` directly (not
+# through poot-test-util); those are gated behind `test-support` in poot-graph-plan now.
+poot-graph-plan = { workspace = true, features = ["test-support"] }
+poot-models.workspace = true
+# tests/qwen2.rs's profiling row reads poot_executor::ExecutorStats.timing (poot_profile::TimingSnapshot)
+# through poot_profile::Report::window directly.
+poot-profile.workspace = true
+criterion.workspace = true
+# Tests build kernelgen's kernels to assert the imported ones (the on-device argmax) match.
+poot-kernelgen.workspace = true
+poot-tensor = { workspace = true, features = ["read-counter"] }
+poot-eval.workspace = true
+poot-quant.workspace = true
+poot-runtime-common.workspace = true
+# tests/coopmat_resident.rs's F16-const upload narrows via the loader's f32->f16, shared with the
+# GGUF loader and the resident bind path it fixtures.
+poot-load.workspace = true
+# tests/executor_contract.rs deserializes a committed offline-imported Body (.kir.json) and compiles
+# it directly against poot-codegen's on-disk kernel cache (the SC-015 fault probe).
+poot-kernel-ir = { workspace = true, features = ["serde"] }
+poot-codegen.workspace = true
+
+[[bench]]
+name = "op_dispatch"
+harness = false
+
+[lints]
+workspace = true

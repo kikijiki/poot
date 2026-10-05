@@ -1,0 +1,3315 @@
+{
+  "name": "__poot_kernel_gemv_batched_coalesced",
+  "param_count": 4,
+  "locals": [
+    {
+      "ty": "Unit",
+      "mutable": true
+    },
+    {
+      "ty": {
+        "Ref": {
+          "mutable": false,
+          "pointee": {
+            "Slice": "F32"
+          }
+        }
+      },
+      "mutable": false
+    },
+    {
+      "ty": {
+        "Ref": {
+          "mutable": false,
+          "pointee": {
+            "Slice": "F32"
+          }
+        }
+      },
+      "mutable": false
+    },
+    {
+      "ty": {
+        "Ref": {
+          "mutable": false,
+          "pointee": {
+            "Slice": "U32"
+          }
+        }
+      },
+      "mutable": false
+    },
+    {
+      "ty": {
+        "Ref": {
+          "mutable": true,
+          "pointee": {
+            "Slice": "F32"
+          }
+        }
+      },
+      "mutable": false
+    },
+    {
+      "ty": "Usize",
+      "mutable": false
+    },
+    {
+      "ty": {
+        "Ref": {
+          "mutable": false,
+          "pointee": {
+            "Slice": "F32"
+          }
+        }
+      },
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": false
+    },
+    {
+      "ty": "Usize",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": true
+    },
+    {
+      "ty": "Bool",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": false
+    },
+    {
+      "ty": "Bool",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": false
+    },
+    {
+      "ty": "Usize",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": true
+    },
+    {
+      "ty": "Bool",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": false
+    },
+    {
+      "ty": "U32",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": false
+    },
+    {
+      "ty": "Usize",
+      "mutable": true
+    },
+    {
+      "ty": "Bool",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": false
+    },
+    {
+      "ty": "Bool",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": false
+    },
+    {
+      "ty": "Usize",
+      "mutable": true
+    },
+    {
+      "ty": "Bool",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": false
+    },
+    {
+      "ty": "Usize",
+      "mutable": false
+    },
+    {
+      "ty": "Bool",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": false
+    },
+    {
+      "ty": "Bool",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": false
+    },
+    {
+      "ty": "Bool",
+      "mutable": false
+    },
+    {
+      "ty": "Usize",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": true
+    },
+    {
+      "ty": "Bool",
+      "mutable": true
+    },
+    {
+      "ty": "Bool",
+      "mutable": true
+    },
+    {
+      "ty": "F32",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": true
+    },
+    {
+      "ty": "Bool",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": true
+    },
+    {
+      "ty": "F32",
+      "mutable": true
+    },
+    {
+      "ty": "F32",
+      "mutable": true
+    },
+    {
+      "ty": "F32",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": false
+    },
+    {
+      "ty": "Usize",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": true
+    },
+    {
+      "ty": "Bool",
+      "mutable": true
+    },
+    {
+      "ty": "F32",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": false
+    },
+    {
+      "ty": "Usize",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": true
+    },
+    {
+      "ty": "Bool",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": true
+    },
+    {
+      "ty": "Bool",
+      "mutable": true
+    },
+    {
+      "ty": "Unit",
+      "mutable": false
+    },
+    {
+      "ty": "F32",
+      "mutable": true
+    },
+    {
+      "ty": "Unit",
+      "mutable": false
+    },
+    {
+      "ty": "Bool",
+      "mutable": true
+    },
+    {
+      "ty": "F32",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": true
+    },
+    {
+      "ty": "Bool",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": true
+    },
+    {
+      "ty": "Bool",
+      "mutable": true
+    },
+    {
+      "ty": "F32",
+      "mutable": true
+    },
+    {
+      "ty": "F32",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": true
+    },
+    {
+      "ty": "F32",
+      "mutable": true
+    },
+    {
+      "ty": {
+        "Ref": {
+          "mutable": false,
+          "pointee": {
+            "Slice": "F32"
+          }
+        }
+      },
+      "mutable": true
+    },
+    {
+      "ty": "Usize",
+      "mutable": true
+    },
+    {
+      "ty": "Bool",
+      "mutable": true
+    }
+  ],
+  "blocks": [
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 5
+              },
+              "projection": []
+            },
+            {
+              "Len": {
+                "local": {
+                  "index": 4
+                },
+                "projection": [
+                  "Deref"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 9
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Add",
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 5
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Const": {
+                    "Usize": 32
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 8
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Sub",
+                {
+                  "Move": {
+                    "local": {
+                      "index": 9
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Const": {
+                    "Usize": 1
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 10
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Eq",
+                {
+                  "Const": {
+                    "Usize": 32
+                  }
+                },
+                {
+                  "Const": {
+                    "Usize": 0
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "SwitchInt": {
+          "discr": {
+            "Move": {
+              "local": {
+                "index": 10
+              },
+              "projection": []
+            }
+          },
+          "targets": {
+            "branches": [
+              [
+                0,
+                {
+                  "index": 1
+                }
+              ]
+            ],
+            "otherwise": {
+              "index": 37
+            }
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 7
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Div",
+                {
+                  "Move": {
+                    "local": {
+                      "index": 8
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Const": {
+                    "Usize": 32
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 12
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Lt",
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 7
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Const": {
+                    "Usize": 65535
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "SwitchInt": {
+          "discr": {
+            "Move": {
+              "local": {
+                "index": 12
+              },
+              "projection": []
+            }
+          },
+          "targets": {
+            "branches": [
+              [
+                0,
+                {
+                  "index": 3
+                }
+              ]
+            ],
+            "otherwise": {
+              "index": 2
+            }
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 11
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 7
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "Goto": {
+          "target": {
+            "index": 4
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 11
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Const": {
+                  "Usize": 65535
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "Goto": {
+          "target": {
+            "index": 4
+          }
+        }
+      }
+    },
+    {
+      "statements": [],
+      "terminator": {
+        "ThreadIndexCall": {
+          "destination": {
+            "local": {
+              "index": 16
+            },
+            "projection": []
+          },
+          "dim": "GroupY",
+          "target": {
+            "index": 5
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 17
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 11
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 15
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Mul",
+                {
+                  "Move": {
+                    "local": {
+                      "index": 16
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Move": {
+                    "local": {
+                      "index": 17
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "ThreadIndexCall": {
+          "destination": {
+            "local": {
+              "index": 18
+            },
+            "projection": []
+          },
+          "dim": "GroupX",
+          "target": {
+            "index": 6
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 14
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Add",
+                {
+                  "Move": {
+                    "local": {
+                      "index": 15
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Move": {
+                    "local": {
+                      "index": 18
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 13
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Mul",
+                {
+                  "Move": {
+                    "local": {
+                      "index": 14
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Const": {
+                    "Usize": 32
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 19
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Lt",
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 13
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 5
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "SwitchInt": {
+          "discr": {
+            "Move": {
+              "local": {
+                "index": 19
+              },
+              "projection": []
+            }
+          },
+          "targets": {
+            "branches": [
+              [
+                0,
+                {
+                  "index": 36
+                }
+              ]
+            ],
+            "otherwise": {
+              "index": 7
+            }
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 22
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Const": {
+                  "Usize": 0
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 23
+              },
+              "projection": []
+            },
+            {
+              "Len": {
+                "local": {
+                  "index": 3
+                },
+                "projection": []
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 24
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Lt",
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 22
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 23
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "SwitchInt": {
+          "discr": {
+            "Move": {
+              "local": {
+                "index": 24
+              },
+              "projection": []
+            }
+          },
+          "targets": {
+            "branches": [
+              [
+                0,
+                {
+                  "index": 38
+                }
+              ]
+            ],
+            "otherwise": {
+              "index": 8
+            }
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 21
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 3
+                  },
+                  "projection": [
+                    "Deref",
+                    {
+                      "Index": {
+                        "index": 22
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 20
+              },
+              "projection": []
+            },
+            {
+              "Cast": {
+                "to": "Usize",
+                "operand": {
+                  "Move": {
+                    "local": {
+                      "index": 21
+                    },
+                    "projection": []
+                  }
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 26
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Eq",
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 20
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Const": {
+                    "Usize": 0
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "SwitchInt": {
+          "discr": {
+            "Move": {
+              "local": {
+                "index": 26
+              },
+              "projection": []
+            }
+          },
+          "targets": {
+            "branches": [
+              [
+                0,
+                {
+                  "index": 9
+                }
+              ]
+            ],
+            "otherwise": {
+              "index": 39
+            }
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 25
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Div",
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 5
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 20
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 28
+              },
+              "projection": []
+            },
+            {
+              "Len": {
+                "local": {
+                  "index": 1
+                },
+                "projection": []
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 29
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Eq",
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 20
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Const": {
+                    "Usize": 0
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "SwitchInt": {
+          "discr": {
+            "Move": {
+              "local": {
+                "index": 29
+              },
+              "projection": []
+            }
+          },
+          "targets": {
+            "branches": [
+              [
+                0,
+                {
+                  "index": 10
+                }
+              ]
+            ],
+            "otherwise": {
+              "index": 40
+            }
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 27
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Div",
+                {
+                  "Move": {
+                    "local": {
+                      "index": 28
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 20
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "ThreadIndexCall": {
+          "destination": {
+            "local": {
+              "index": 30
+            },
+            "projection": []
+          },
+          "dim": "LocalX",
+          "target": {
+            "index": 11
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 32
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Eq",
+                {
+                  "Const": {
+                    "Usize": 32
+                  }
+                },
+                {
+                  "Const": {
+                    "Usize": 0
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "SwitchInt": {
+          "discr": {
+            "Move": {
+              "local": {
+                "index": 32
+              },
+              "projection": []
+            }
+          },
+          "targets": {
+            "branches": [
+              [
+                0,
+                {
+                  "index": 12
+                }
+              ]
+            ],
+            "otherwise": {
+              "index": 41
+            }
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 31
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Div",
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 30
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Const": {
+                    "Usize": 32
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 34
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Eq",
+                {
+                  "Const": {
+                    "Usize": 32
+                  }
+                },
+                {
+                  "Const": {
+                    "Usize": 0
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "SwitchInt": {
+          "discr": {
+            "Move": {
+              "local": {
+                "index": 34
+              },
+              "projection": []
+            }
+          },
+          "targets": {
+            "branches": [
+              [
+                0,
+                {
+                  "index": 13
+                }
+              ]
+            ],
+            "otherwise": {
+              "index": 42
+            }
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 33
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Rem",
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 30
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Const": {
+                    "Usize": 32
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 35
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Add",
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 13
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 33
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 36
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Lt",
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 35
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 5
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 37
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Const": {
+                  "Usize": 0
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 38
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Const": {
+                  "Usize": 0
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "SwitchInt": {
+          "discr": {
+            "Copy": {
+              "local": {
+                "index": 36
+              },
+              "projection": []
+            }
+          },
+          "targets": {
+            "branches": [
+              [
+                0,
+                {
+                  "index": 17
+                }
+              ]
+            ],
+            "otherwise": {
+              "index": 14
+            }
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 39
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Eq",
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 25
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Const": {
+                    "Usize": 0
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "SwitchInt": {
+          "discr": {
+            "Move": {
+              "local": {
+                "index": 39
+              },
+              "projection": []
+            }
+          },
+          "targets": {
+            "branches": [
+              [
+                0,
+                {
+                  "index": 15
+                }
+              ]
+            ],
+            "otherwise": {
+              "index": 43
+            }
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 37
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Div",
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 35
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 25
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 40
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Eq",
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 25
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Const": {
+                    "Usize": 0
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "SwitchInt": {
+          "discr": {
+            "Move": {
+              "local": {
+                "index": 40
+              },
+              "projection": []
+            }
+          },
+          "targets": {
+            "branches": [
+              [
+                0,
+                {
+                  "index": 16
+                }
+              ]
+            ],
+            "otherwise": {
+              "index": 44
+            }
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 38
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Rem",
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 35
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 25
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "Goto": {
+          "target": {
+            "index": 17
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 41
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Const": {
+                  "F32": 0.0
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 42
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 31
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "Goto": {
+          "target": {
+            "index": 18
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 44
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 42
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 43
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Lt",
+                {
+                  "Move": {
+                    "local": {
+                      "index": 44
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 27
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "SwitchInt": {
+          "discr": {
+            "Move": {
+              "local": {
+                "index": 43
+              },
+              "projection": []
+            }
+          },
+          "targets": {
+            "branches": [
+              [
+                0,
+                {
+                  "index": 25
+                }
+              ]
+            ],
+            "otherwise": {
+              "index": 19
+            }
+          }
+        }
+      }
+    },
+    {
+      "statements": [],
+      "terminator": {
+        "SwitchInt": {
+          "discr": {
+            "Copy": {
+              "local": {
+                "index": 36
+              },
+              "projection": []
+            }
+          },
+          "targets": {
+            "branches": [
+              [
+                0,
+                {
+                  "index": 23
+                }
+              ]
+            ],
+            "otherwise": {
+              "index": 20
+            }
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 45
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 41
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 50
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 37
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 49
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Mul",
+                {
+                  "Move": {
+                    "local": {
+                      "index": 50
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 27
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 51
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 42
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 48
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Add",
+                {
+                  "Move": {
+                    "local": {
+                      "index": 49
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Move": {
+                    "local": {
+                      "index": 51
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 52
+              },
+              "projection": []
+            },
+            {
+              "Len": {
+                "local": {
+                  "index": 1
+                },
+                "projection": []
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 53
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Lt",
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 48
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 52
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "SwitchInt": {
+          "discr": {
+            "Move": {
+              "local": {
+                "index": 53
+              },
+              "projection": []
+            }
+          },
+          "targets": {
+            "branches": [
+              [
+                0,
+                {
+                  "index": 45
+                }
+              ]
+            ],
+            "otherwise": {
+              "index": 21
+            }
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 47
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 1
+                  },
+                  "projection": [
+                    "Deref",
+                    {
+                      "Index": {
+                        "index": 48
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 57
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 42
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 56
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Mul",
+                {
+                  "Move": {
+                    "local": {
+                      "index": 57
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 25
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 58
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 38
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 55
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Add",
+                {
+                  "Move": {
+                    "local": {
+                      "index": 56
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Move": {
+                    "local": {
+                      "index": 58
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 59
+              },
+              "projection": []
+            },
+            {
+              "Len": {
+                "local": {
+                  "index": 2
+                },
+                "projection": []
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 60
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Lt",
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 55
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 59
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "SwitchInt": {
+          "discr": {
+            "Move": {
+              "local": {
+                "index": 60
+              },
+              "projection": []
+            }
+          },
+          "targets": {
+            "branches": [
+              [
+                0,
+                {
+                  "index": 46
+                }
+              ]
+            ],
+            "otherwise": {
+              "index": 22
+            }
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 54
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 2
+                  },
+                  "projection": [
+                    "Deref",
+                    {
+                      "Index": {
+                        "index": 55
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 46
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Mul",
+                {
+                  "Move": {
+                    "local": {
+                      "index": 47
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Move": {
+                    "local": {
+                      "index": 54
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 41
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Add",
+                {
+                  "Move": {
+                    "local": {
+                      "index": 45
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Move": {
+                    "local": {
+                      "index": 46
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "Goto": {
+          "target": {
+            "index": 23
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 61
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 42
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 63
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Eq",
+                {
+                  "Const": {
+                    "Usize": 32
+                  }
+                },
+                {
+                  "Const": {
+                    "Usize": 0
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "SwitchInt": {
+          "discr": {
+            "Move": {
+              "local": {
+                "index": 63
+              },
+              "projection": []
+            }
+          },
+          "targets": {
+            "branches": [
+              [
+                0,
+                {
+                  "index": 24
+                }
+              ]
+            ],
+            "otherwise": {
+              "index": 47
+            }
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 62
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Div",
+                {
+                  "Const": {
+                    "Usize": 128
+                  }
+                },
+                {
+                  "Const": {
+                    "Usize": 32
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 42
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Add",
+                {
+                  "Move": {
+                    "local": {
+                      "index": 61
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Move": {
+                    "local": {
+                      "index": 62
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "Goto": {
+          "target": {
+            "index": 18
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 65
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 41
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "WorkgroupLocalWrite": {
+            "idx": {
+              "Copy": {
+                "local": {
+                  "index": 30
+                },
+                "projection": []
+              }
+            },
+            "value": {
+              "Move": {
+                "local": {
+                  "index": 65
+                },
+                "projection": []
+              }
+            },
+            "array": 0
+          }
+        }
+      ],
+      "terminator": {
+        "Goto": {
+          "target": {
+            "index": 26
+          }
+        }
+      }
+    },
+    {
+      "statements": [],
+      "terminator": {
+        "Barrier": {
+          "target": {
+            "index": 27
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 67
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Eq",
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 31
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Const": {
+                    "Usize": 0
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "SwitchInt": {
+          "discr": {
+            "Move": {
+              "local": {
+                "index": 67
+              },
+              "projection": []
+            }
+          },
+          "targets": {
+            "branches": [
+              [
+                0,
+                {
+                  "index": 36
+                }
+              ]
+            ],
+            "otherwise": {
+              "index": 28
+            }
+          }
+        }
+      }
+    },
+    {
+      "statements": [],
+      "terminator": {
+        "SwitchInt": {
+          "discr": {
+            "Copy": {
+              "local": {
+                "index": 36
+              },
+              "projection": []
+            }
+          },
+          "targets": {
+            "branches": [
+              [
+                0,
+                {
+                  "index": 36
+                }
+              ]
+            ],
+            "otherwise": {
+              "index": 29
+            }
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 68
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Const": {
+                  "F32": 0.0
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 69
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Const": {
+                  "Usize": 0
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "Goto": {
+          "target": {
+            "index": 30
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 71
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 69
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 73
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Eq",
+                {
+                  "Const": {
+                    "Usize": 32
+                  }
+                },
+                {
+                  "Const": {
+                    "Usize": 0
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "SwitchInt": {
+          "discr": {
+            "Move": {
+              "local": {
+                "index": 73
+              },
+              "projection": []
+            }
+          },
+          "targets": {
+            "branches": [
+              [
+                0,
+                {
+                  "index": 31
+                }
+              ]
+            ],
+            "otherwise": {
+              "index": 48
+            }
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 72
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Div",
+                {
+                  "Const": {
+                    "Usize": 128
+                  }
+                },
+                {
+                  "Const": {
+                    "Usize": 32
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 70
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Lt",
+                {
+                  "Move": {
+                    "local": {
+                      "index": 71
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Move": {
+                    "local": {
+                      "index": 72
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "SwitchInt": {
+          "discr": {
+            "Move": {
+              "local": {
+                "index": 70
+              },
+              "projection": []
+            }
+          },
+          "targets": {
+            "branches": [
+              [
+                0,
+                {
+                  "index": 34
+                }
+              ]
+            ],
+            "otherwise": {
+              "index": 32
+            }
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 74
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 68
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 78
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 69
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 77
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Mul",
+                {
+                  "Move": {
+                    "local": {
+                      "index": 78
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Const": {
+                    "Usize": 32
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 76
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Add",
+                {
+                  "Move": {
+                    "local": {
+                      "index": 77
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 33
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 75
+              },
+              "projection": []
+            },
+            {
+              "WorkgroupLocalRead": {
+                "idx": {
+                  "Move": {
+                    "local": {
+                      "index": 76
+                    },
+                    "projection": []
+                  }
+                },
+                "array": 0
+              }
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "Goto": {
+          "target": {
+            "index": 33
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 68
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Add",
+                {
+                  "Move": {
+                    "local": {
+                      "index": 74
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Move": {
+                    "local": {
+                      "index": 75
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 79
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 69
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 69
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Add",
+                {
+                  "Move": {
+                    "local": {
+                      "index": 79
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Const": {
+                    "Usize": 1
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "Goto": {
+          "target": {
+            "index": 30
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 80
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Copy": {
+                  "local": {
+                    "index": 68
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 82
+              },
+              "projection": []
+            },
+            {
+              "Len": {
+                "local": {
+                  "index": 4
+                },
+                "projection": [
+                  "Deref"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 83
+              },
+              "projection": []
+            },
+            {
+              "BinaryOp": [
+                "Lt",
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 35
+                    },
+                    "projection": []
+                  }
+                },
+                {
+                  "Copy": {
+                    "local": {
+                      "index": 82
+                    },
+                    "projection": []
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "Goto": {
+          "target": {
+            "index": 35
+          }
+        }
+      }
+    },
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 4
+              },
+              "projection": [
+                "Deref",
+                {
+                  "Index": {
+                    "index": 35
+                  }
+                }
+              ]
+            },
+            {
+              "Use": {
+                "Move": {
+                  "local": {
+                    "index": 80
+                  },
+                  "projection": []
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "Goto": {
+          "target": {
+            "index": 36
+          }
+        }
+      }
+    },
+    {
+      "statements": [],
+      "terminator": "Return"
+    },
+    {
+      "statements": [],
+      "terminator": {
+        "Trap": {
+          "code": 1
+        }
+      }
+    },
+    {
+      "statements": [],
+      "terminator": {
+        "Trap": {
+          "code": 2
+        }
+      }
+    },
+    {
+      "statements": [],
+      "terminator": {
+        "Trap": {
+          "code": 3
+        }
+      }
+    },
+    {
+      "statements": [],
+      "terminator": {
+        "Trap": {
+          "code": 4
+        }
+      }
+    },
+    {
+      "statements": [],
+      "terminator": {
+        "Trap": {
+          "code": 5
+        }
+      }
+    },
+    {
+      "statements": [],
+      "terminator": {
+        "Trap": {
+          "code": 6
+        }
+      }
+    },
+    {
+      "statements": [],
+      "terminator": {
+        "Trap": {
+          "code": 7
+        }
+      }
+    },
+    {
+      "statements": [],
+      "terminator": {
+        "Trap": {
+          "code": 8
+        }
+      }
+    },
+    {
+      "statements": [],
+      "terminator": {
+        "Trap": {
+          "code": 9
+        }
+      }
+    },
+    {
+      "statements": [],
+      "terminator": {
+        "Trap": {
+          "code": 10
+        }
+      }
+    },
+    {
+      "statements": [],
+      "terminator": {
+        "Trap": {
+          "code": 11
+        }
+      }
+    },
+    {
+      "statements": [],
+      "terminator": {
+        "Trap": {
+          "code": 12
+        }
+      }
+    },
+    {
+      "statements": [],
+      "terminator": {
+        "Trap": {
+          "code": 13
+        }
+      }
+    }
+  ],
+  "workgroup_size": [
+    128,
+    1,
+    1
+  ],
+  "workgroup_locals": [
+    {
+      "elem_ty": "F32",
+      "len": 128
+    }
+  ]
+}

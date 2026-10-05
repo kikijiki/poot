@@ -1,0 +1,193 @@
+---
+id: attention
+title: Attention and KV Cache
+sidebar_position: 9
+---
+
+import FlashAttentionDiagram from "@site/src/components/architecture/FlashAttentionDiagram";
+import KVCacheDiagram from "@site/src/components/architecture/KVCacheDiagram";
+
+# Attention and KV Cache
+
+The original Transformer [^transformer] attention mechanism computes
+`softmax(QK^T / sqrtd_k) * V`. Computed naively, this materializes an `[L x L]` score matrix
+that does not fit in GPU SRAM for long contexts. poot handles attention in three stages:
+primitive decomposition (what the tracer records), flash attention rewrite (what the compiler
+produces), and KV caching (how past context is stored).
+
+## Attention as primitive ops
+
+The model tracer (`ops::attention_masked`) emits attention as a sequence of about ten
+primitive eqns, plus the KV write and the GQA repeat:
+
+```
+# q: [1, H_q, 1, D]; the new k/v are written into the state buffers at position `pos`
+k_cache = DynamicUpdateSlice(k_cache, k, pos)     # state_in -> state_out
+v_cache = DynamicUpdateSlice(v_cache, v, pos)
+
+# GQA repeat: Reshape -> Broadcast -> Reshape (no-op if H_q == H_kv)
+k_exp = repeat_kv(k_cache, n_rep)
+v_exp = repeat_kv(v_cache, n_rep)
+
+scores = MatMul(q, Transpose(k_exp))       # [1, H_q, 1, cap]
+scores = Mul(scores, scale)                # scale, usually 1/sqrt(D)
+scores = Add(scores, mask)                 # large negative past `pos`; a graph computation over
+                                            # Slot::Pos for the dense families, Slot::Mask elsewhere
+
+# Numerically stable softmax (max-subtract, then normalize); binary ops broadcast implicitly
+m   = Reduce(Max, scores, axis=-1, keepdim=True)
+xs  = Sub(scores, m)
+ex  = Unary(Exp, xs)
+s   = Reduce(Sum, ex, axis=-1, keepdim=True)
+p   = Div(ex, s)
+
+out = MatMul(p, v_exp)                     # [1, H_q, 1, D]
+```
+
+No special attention opcode. The flash attention rewrite pass recognizes this chain and replaces it.
+
+## Multi-head, GQA, and MQA
+
+Multi-query attention (MQA) [^mqa] and grouped-query attention (GQA) [^gqa] reduce the
+number of K and V heads relative to Q. poot handles this with `repeat_kv`
+(`Reshape`, `Broadcast`, `Reshape`) over the head axis, no special opcode. For a model with
+32 Q heads and 8 KV heads, K and V are expanded 4x. After the flash rewrite the fused op
+carries `n_rep = 4` and the kernel reads `kv_head = q_head / n_rep`, so the same K/V rows
+are shared by several Q heads without a copy.
+
+## The flash attention rewrite pass
+
+Flash attention [^flash1] [^flash2] avoids materializing the `[H x L]` score matrix by
+streaming over K/V in chunks and maintaining a running (max, denominator, accumulator)
+triple in shared memory. poot implements this as a **compiler pass**, not an opt-in mode.
+
+`compile`'s flash-attention rewrite runs after canonicalization and RoPE recognition,
+using the target grid limit. It recognizes supported attention subgraphs and replaces them with a single
+`FlashAttentionDecode` (one query row) or `FlashAttentionPrefill` eqn. The planner then
+chooses the kernel and records the choice with the plan: a synthesized region kernel
+(`kg::flash_region_decode` for decode, `kg::flash_region_prefill` for a prefill with no softcap)
+within the LDS head-dim cap, and the imported `#[kernel]` source `flash_prefill.rs` for a
+softcapped prefill. A decode wider than the cap keeps its primitive decomposition.
+
+Models compose attention with `ops::attention_masked` or `ops::attention_prefill`. The compiler
+selects flash attention when the shape and target satisfy the matcher checks. Unsupported patterns
+keep their primitive decomposition; the typed `FusionPolicy::MoeHangGuard` also disables this rewrite.
+
+## Flash attention decode
+
+Used when M=1, one query token attending to a KV cache of up to `cap` positions.
+
+**Grid:** one workgroup per (batch row, query head): `B * n_q_heads` workgroups.
+
+**The online softmax algorithm** [^onlinesoftmax] keeps three accumulators in LDS
+(workgroup-local memory):
+
+<FlashAttentionDiagram />
+
+```rust
+// For each chunk of TILE keys/values from the KV cache:
+let score = dot_product(q, k_chunk, lane_id) * scale;
+let m_new = max(m_running, wg_reduce_max(score));
+// Rescale old accumulator, add contribution from this chunk
+for d in 0..head_dim {
+    let old = wg_read(&acc, d);
+    wg_write(&mut acc, d,
+        exp(m_running - m_new) * old + exp(score - m_new) * v_chunk[d]);
+}
+l_running = exp(m_running - m_new) * l_running + wg_reduce_sum(exp(score - m_new));
+m_running = m_new;
+wg_barrier();
+// After all chunks: normalize
+if lane < head_dim { out[lane] = wg_read(&acc, lane) / l_running; }
+```
+
+The accumulator `acc[head_dim]` is in workgroup LDS, not a private array: private arrays with
+dynamic indices crash some SPIR-V drivers (RADV). The imported `#[kernel]` source runs on wgpu, PTX and ROCm.
+
+Peak memory: **O(head_dim)** per workgroup. The `[H x cap]` score matrix is never written.
+
+## Flash attention prefill
+
+Used when M=L, a full sequence of query tokens during prefill.
+
+One workgroup handles one (head, query row) pair against all K/V chunks, so the grid is
+`n_q_heads * L` workgroups. Peak memory: **O(L x head_dim)**, with no `[L x L]` matrix. It
+runs on wgpu, PTX and ROCm and uses the same LDS-accumulator pattern as decode. On wgpu the
+default pipeline does not rewrite prefill attention when `n_q_heads * L` exceeds 65535
+workgroups (the `gridDim.x` limit), which keeps the primitive decomposition.
+
+## KV cache
+
+The attention kernel reads from K/V buffers accumulated over all past tokens. Without
+caching, K and V would be recomputed from scratch every decode step at O(L) cost.
+
+poot supports two KV allocation schemes:
+
+<KVCacheDiagram />
+
+**Fixed-capacity with causal masking:** K and V are `Storage::State` buffers pre-allocated to
+`cap` positions per layer. Per token, new K/V are written at position `pos` (a
+`DynamicUpdateSlice`). The attention kernel sweeps the full `[cap]` allocation; a mask hides
+positions after `pos` with a large negative value. For the dense families (qwen2 and its
+relatives, bloom, granite, mpt, smollm3, gemma2) that mask is built in-graph from `Slot::Pos`
+against an `Iota`; other families still carry it as a host-built `Slot::Mask` input. The grid is
+constant every token, capturable as a CUDA graph. Memory usage = capacity regardless of actual
+sequence length.
+
+**Paged KV** [^pagedattn]: K/V space is divided into fixed-size blocks (16 tokens,
+`poot_llm::driver::block_table::BLOCK_SIZE`) from a shared pool, inspired by virtual memory
+management in operating systems. Each layer holds one `[pool_slots, kv_heads, head_dim]` pool
+shared by every row of a step. The driver keeps a block table per sequence and binds two
+`Slot::SlotMap` inputs per step: `read`, an `[rows, cap]` i32 map from each row's logical position
+to its flat physical slot, and `write`, a `[pool_slots]` i32 map from a pool slot to the step's
+token that writes it (or -1, which leaves the slot alone, so a padding token writes nothing). The
+paged graph writes new rows with `ScatterUpdate` through `write`, then gathers each row's K/V
+through `read` and applies the same causal mask as the contiguous layout. Blocks are allocated on
+demand and freed when the sequence completes. Memory scales with actual usage. Shared prefix
+blocks enable prefix caching across requests.
+
+## Prefix caching
+
+When a new request begins with a prefix that matches a previous request's K/V blocks
+(identified by a hash of token ids plus the effective model weights), those blocks are pinned in
+the pool and the new request's block table is pointed at them. The prefill for the matching prefix
+is skipped. Because the weights identity is part of the key, the base model and each LoRA adapter
+keep separate prefix entries even when their token ids match, and a hot-reloaded adapter gets a
+fresh identity so it never reuses the previous adapter's cached K/V. This is a block-allocation
+policy, the kernel itself does not change.
+
+## Implementation details
+
+- **One shared head width for flash.** The flash rewrite requires Q, K, and V to share the same
+  trailing head dimension. MLA-style attention (multi-head latent attention [^mla]: compressed KV,
+  often with a narrower V head) stays on the primitive decomposition (`poot-graph-ir` flash matcher).
+  Folding those shapes would give the flash op the wrong output type and overrun V. See
+  [Crates and implementation details](./implementation).
+- **Softcap and flash decode.** Softcapped decode-shaped attention is not rewritten into
+  `FlashAttentionDecode` (that op has no softcap parameter). The matcher refuses the rewrite so the
+  softcap is not silently dropped.
+- **Prefill batching.** Flash prefill is batch=1 only today; a batched prefill stays decomposed.
+- **RADV.** Mesa's open-source AMD Vulkan driver. Several SPIR-V subset rules (no private arrays with
+  dynamic indices; structurized CFG) exist because RADV crashed on otherwise-valid patterns.
+
+More crate-level notes live on [Crates and implementation details](./implementation).
+
+---
+
+## References
+
+[^transformer]: Vaswani, A. et al., "Attention Is All You Need," NeurIPS, 2017.
+
+[^mqa]: Shazeer, N., "Fast Transformer Decoding: One Write-Head is All You Need," arXiv:1911.02150, 2019. https://arxiv.org/abs/1911.02150
+
+[^gqa]: Ainslie, J. et al., "GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints," EMNLP, 2023.
+
+[^flash1]: Dao, T. et al., "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness," NeurIPS, 2022. https://arxiv.org/abs/2205.14135
+
+[^flash2]: Dao, T., "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning," ICLR, 2024. https://arxiv.org/abs/2307.08691
+
+[^onlinesoftmax]: Milakov, M. & Gimelshein, N., "Online Normalizer Calculation for Softmax," arXiv:1805.02867, 2018. https://arxiv.org/abs/1805.02867
+
+[^pagedattn]: Kwon, W. et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention," SOSP, 2023. https://arxiv.org/abs/2309.06180
+
+[^mla]: DeepSeek-AI, "DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model," arXiv:2405.04434, 2024. https://arxiv.org/abs/2405.04434

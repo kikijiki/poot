@@ -1,0 +1,22 @@
+[package]
+name = "poot-tensor"
+description = "The one DType (every stored and graph dtype), HostView and the typed host carrier HostTensor: a rank-0 leaf crate"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+# Counts `HostTensor::to_f32` calls (`read_counter::reads`), for the test that proves a bind path never widens.
+read-counter = []
+
+# A rank-0 leaf crate (XC2-02): no dependency on any other poot crate, so every poot crate may depend on
+# it (card 522) with no cycle. The dtype table and the host carrier are pure data.
+[dependencies]
+bytemuck.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

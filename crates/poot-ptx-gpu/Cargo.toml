@@ -1,0 +1,41 @@
+[package]
+name = "poot-ptx-gpu"
+description = "PTX graph executor: run a poot-graph-ir Graph device-resident on NVIDIA (the PTX twin of poot-gpu's run_resident_kv)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+poot-graph-ir.workspace = true
+poot-graph-plan.workspace = true
+poot-executor.workspace = true
+poot-target.workspace = true
+poot-kernel-ir.workspace = true
+poot-kernelgen.workspace = true
+poot-codegen.workspace = true
+poot-ptx-runtime.workspace = true
+poot-runtime-common.workspace = true
+# Raw CUDA driver P2P surface (cuMemcpyPeerAsync, peer access, cross-device events). Dynamically loaded,
+# so this compiles with no CUDA toolkit or GPU present.
+cudarc.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+poot-test-util = { workspace = true, features = ["graph-fixtures", "kernel-fixtures"] }
+poot-models.workspace = true
+poot-eval.workspace = true
+poot-executor-parity.workspace = true
+poot-quant.workspace = true
+poot-tensor.workspace = true
+poot-load.workspace = true
+bytemuck.workspace = true
+serde_json.workspace = true
+# Deserializing the committed sampler-kernel `Body` assets (card 675's SC-001 PTX dispatch) needs
+# `Body: Deserialize`, test-only (the production `[dependencies]` poot-kernel-ir above stays serde-free).
+poot-kernel-ir = { workspace = true, features = ["serde"] }
+
+[lints]
+workspace = true

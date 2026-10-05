@@ -1,0 +1,193 @@
+---
+id: graph-ir
+title: The Graph IR
+sidebar_position: 2
+---
+
+import OpTable from "@site/src/components/architecture/OpTable";
+import GraphDagDiagram from "@site/src/components/architecture/GraphDagDiagram";
+
+# The Graph IR
+
+The graph IR is poot's central abstraction. It is a flat, typed, topologically ordered
+list of primitive tensor equations in SSA (static single assignment) form. Every other
+subsystem (the tracer, the fusion pass, the backends, the executor) is either a
+producer or a consumer of this one representation.
+
+## Why a fine-grained primitive IR
+
+ML compilers from XLA [^xla] to TVM [^tvm] to JAX [^jax] share a common design
+insight: general kernel fusion requires the IR to be finer-grained than the kernels it
+produces. poot's IR follows the same principle. Attention, RMSNorm, RoPE, and SwiGLU
+are not opcodes. They are compositions of the actual atomic operations (matmul, reduce,
+elementwise, broadcast). The fusion pass can then synthesize kernels for supported regions of
+those primitives.
+
+A practical consequence: flash attention [^flash1] is not a fixed primitive in the IR.
+`compile` recognizes supported attention subgraphs
+and rewrites them to a single fused dispatch. A model author composes attention with
+`ops::attention_masked(...)`; the rewrite depends on the shape, target and fusion policy.
+
+## Graph structure
+
+A simplified view of the main fields:
+
+```rust
+struct Graph {
+    values:  Vec<ValueMeta>,               // shape + dtype + storage class per id
+    inputs:  Vec<ValueId>,                 // all input binders: consts, slots, state
+    consts:  Vec<ValueId>,                 // the subset of inputs that are weights/tables
+    slots:   Vec<(ValueId, Slot)>,         // per-step inputs and their kind
+    eqns:    Vec<Eqn>,                     // topologically ordered SSA equations
+    output:  ValueId,                      // the primary output (logits)
+    state:   Vec<(ValueId, ValueId)>,      // (state_in, state_out) pairs: KV cache donation
+    // plus an optional validation channel
+}
+
+struct Eqn {
+    op:     OpKind,                        // the operation, with its parameters inline
+    inputs: Vec<Operand>,                  // Value(ValueId) or Lit(Scalar)
+    out:    ValueId,                       // single output
+}
+
+struct ValueMeta {
+    aval:    TensorType,                   // shape + dtype - no data
+    storage: Storage,                      // Device | Const | Slot(Slot) | State | Computed
+    name:    Option<String>,
+}
+```
+
+`ValueId` is a dense integer. Each computed value is defined by one `Eqn`; graph inputs are binders.
+There are no separate def-use chains; a use is an index into `values`, and an equation result
+is defined by the unique `Eqn` whose `out` is that index. This makes all transforms (fusion, substitution, dead-code elimination) straightforward.
+
+## Storage classes
+
+**`Device`**. An ordinary intermediate tensor. The planner derives its storage requirements from
+`ValueMeta.aval`; the executor allocates or aliases buffers and retains them for cached execution.
+Activation tensors such as attention scores, MLP outputs and the residual stream use this class.
+
+**`Const`**. A weight or constant tensor (weight matrices, embedding tables, RoPE tables).
+Bound from the input map and uploaded for execution. Weight caches use payload identity and storage
+representation, so reusing a name for different bytes does not reuse the previous weight. `Graph.consts` lists the const binders.
+
+**`Slot(Slot)`**. A per-step input routed through a stable device buffer that the host
+rewrites in place. The `Slot` kind says what it carries: `Token`, `Pos`, `SeqLen`, `Mask`
+(additive attention mask over the fixed-capacity cache), `SlotMap` (paged KV), `LoraIdx`, and
+others.
+
+**`State`**. A persistent buffer carried across decode steps: the KV cache. Pre-allocated to
+`cap` capacity per layer. `Graph.state` pairs each `state_in` binder with a `state_out`
+value of identical type. The executor feeds the buffer in and overwrites it with `state_out`
+(the JAX `donate_argnums` contract), which also orders the KV read before the KV write.
+
+**`Computed`**. A compiler-defined constant, such as a folded `Iota`. Its value comes from the graph
+rather than a checkpoint weight binder.
+
+## Primitive operations
+
+The `OpKind` vocabulary. Tracers emit the primitives (elementwise, reduce, movement, matmul,
+gather/scatter, quantization). The optimizer introduces the composite ops (`Fused`, `FusedRow`,
+`MatMulBias`, `FlashAttention*`, `Rope`, and the packed/dense contraction ops), each with the
+same semantics as the primitive chain it replaces; a tracer cannot emit them. No op records a
+kernel choice: which kernel runs an eqn (a tiled GEMM, a flash region kernel, an imported kernel)
+is a property of its plan.
+
+<OpTable />
+
+## What composite ops decompose to
+
+Higher-level operations are not opcodes; they are sequences of primitives recorded by
+the tracer. Here are three examples.
+
+**RMSNorm** [^rmsnorm], seven eqns, fused into one reduction kernel:
+
+```
+sq  = Mul(x, x)                            # [L, D]
+ss  = Reduce(Sum, sq, axis=-1, keepdim)    # [L, 1]
+ms  = Mul(ss, 1/D)                         # [L, 1]
+mse = Add(ms, eps)                         # [L, 1]
+den = Unary(Sqrt, mse)                     # [L, 1]
+xn  = Div(x, den)                          # [L, D], den broadcasts
+out = Mul(xn, weight)                      # [L, D]
+```
+
+**Numerically stable softmax**. Five eqns (binary ops broadcast implicitly, numpy style), fused into one reduction kernel:
+
+```
+m   = Reduce(Max, scores, axis=-1, keepdim=True)
+xs  = Binary(Sub, scores, m)
+ex  = Unary(Exp, xs)
+s   = Reduce(Sum, ex, axis=-1, keepdim=True)
+out = Binary(Div, ex, s)
+```
+
+The Max and Sum reductions share the same traversal. This is the two-pass safe pattern
+(subtract max, then normalize). The streaming "online" algorithm used inside flash attention
+is different, see [Attention](./attention#flash-attention-decode). After flash attention
+rewrite, this entire pattern (plus the surrounding matmuls) disappears into one fused dispatch.
+
+**RoPE** [^rope]. The tracer emits the rotate-half chain (`ops::rope_partial`), with `cos`/`sin`
+gathered from constant tables by position:
+
+```
+x1, x2 = Slice(x, 0..D/2), Slice(x, D/2..D)
+out = Concat([Sub(Mul(x1,cos), Mul(x2,sin)),
+              Add(Mul(x1,sin), Mul(x2,cos))], axis=-1)
+```
+
+`compile` recognizes this chain and replaces it with one `Rope { rot }` eqn with
+inputs `[x, cos, sin]`, lowered to one synthesized kernel instead of ~6-8 dispatches.
+
+## What an attention layer looks like as a DAG
+
+The diagram below shows the primitive eqns for one decode-step attention layer. Hover
+a node to highlight its edges.
+
+<GraphDagDiagram />
+
+## Host-side shape inference
+
+Every `OpKind` implements `infer(input_types) -> output_type`. Shape inference
+runs entirely on the host at trace time. No shape computation ever happens on the device.
+
+Two consequences. First, the executor knows every buffer size before the first dispatch
+and can allocate everything upfront at stable addresses, a requirement for CUDA graph
+capture. Second, because all shapes are static, the planner can select kernel
+specializations (GEMV vs GEMM, flash decode vs prefill) at compile time rather than
+conditionally at runtime.
+
+The exception: per-step inputs (token id, position) are `Storage::Slot` inputs (`Slot::Token`, `Slot::Pos`), small
+device buffers at stable addresses written by the host each token. The dense families (qwen2 and its
+relatives, bloom, granite, mpt, smollm3, gemma2) build their causal/windowed mask in-graph from `Slot::Pos`
+against an `Iota`; other families still carry a host-built `Slot::Mask`. Output shapes
+do not depend on slot values (the KV capacity is pre-fixed), so the captured graph remains valid
+across all positions.
+
+## Quantization in the IR
+
+`PackedDequant` is the single packed-weight primitive. Its `poot-quant::PackedWeight` descriptor names
+the `WeightFormat`, shape and source roles. The compiler recognizes dense projections as
+`PackedContraction` and embedding lookups as `PackedRowGather`; generated kernels decode only the
+weight values they consume.
+
+The old per-scheme dequant-matmul op family is removed. GPTQ, AWQ, supported GGUF quants and the
+registered FP8/E2M1 layouts use the descriptor-driven lowering. Support still depends on the consuming
+graph: the current packed MoE chain materializes its expert table before `IndexedMatMul` during
+execution; the packed loader itself keeps the weights packed.
+
+---
+
+## References
+
+[^xla]: OpenXLA / Google, "XLA: Compiling Machine Learning for Peak Performance" (engineering docs / talks). https://openxla.org/xla
+
+[^tvm]: Chen, T. et al., "TVM: An Automated End-to-End Optimizing Compiler for Deep Learning," OSDI, 2018.
+
+[^jax]: Bradbury, J. et al., "JAX: Composable Transformations of Python+NumPy Programs," 2018.
+
+[^flash1]: Dao, T. et al., "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness," NeurIPS, 2022. https://arxiv.org/abs/2205.14135
+
+[^rmsnorm]: Zhang, B. & Sennrich, R., "Root Mean Square Layer Normalization," NeurIPS, 2019.
+
+[^rope]: Su, J. et al., "RoFormer: Enhanced Transformer with Rotary Position Embedding," arXiv:2104.09864, 2021. https://arxiv.org/abs/2104.09864

@@ -1,0 +1,24 @@
+[package]
+name = "poot-rocm-check"
+description = "Standalone ROCm/HSA execution check (card 106 M1, 106b): load poot-emitted HSACO via poot-rocm-runtime and verify against the CPU oracle"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+poot-codegen.workspace = true
+poot-kernel-ir.workspace = true
+poot-rocm-runtime.workspace = true
+poot-target.workspace = true
+poot-runtime-common.workspace = true
+thiserror.workspace = true
+
+[[bin]]
+name = "poot-rocm-check"
+path = "src/main.rs"
+
+[lints]
+workspace = true

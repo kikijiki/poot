@@ -1,0 +1,25 @@
+[package]
+name = "poot-ptx-runtime"
+description = "poot PTX runtime: device-resident dispatch of poot-emitted NVPTX kernels via cudarc (the wgpu poot-runtime analogue)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+poot-runtime-common.workspace = true
+poot-target.workspace = true
+cudarc.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# Card 628: compiles real NVPTX fixture kernels (no_contract_probe_kernel) to exercise the production
+# poot_codegen::compile/kernel_handle path on the production dispatch path, not a hand-rolled artifact.
+poot-codegen.workspace = true
+poot-kernel-ir.workspace = true
+poot-test-util = { workspace = true, features = ["kernel-fixtures"] }
+
+[lints]
+workspace = true

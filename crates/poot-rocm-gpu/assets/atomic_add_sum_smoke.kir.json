@@ -1,0 +1,102 @@
+{
+  "name": "__poot_kernel_atomic_add_sum_smoke",
+  "param_count": 1,
+  "locals": [
+    {
+      "ty": "Unit",
+      "mutable": true
+    },
+    {
+      "ty": {
+        "Ref": {
+          "mutable": true,
+          "pointee": {
+            "Slice": "U32"
+          }
+        }
+      },
+      "mutable": false
+    },
+    {
+      "ty": "U32",
+      "mutable": false
+    },
+    {
+      "ty": "Usize",
+      "mutable": true
+    }
+  ],
+  "blocks": [
+    {
+      "statements": [
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 3
+              },
+              "projection": []
+            },
+            {
+              "Use": {
+                "Const": {
+                  "Usize": 0
+                }
+              }
+            }
+          ]
+        },
+        {
+          "Assign": [
+            {
+              "local": {
+                "index": 2
+              },
+              "projection": []
+            },
+            {
+              "GlobalAtomic": {
+                "place": {
+                  "local": {
+                    "index": 1
+                  },
+                  "projection": [
+                    "Deref",
+                    {
+                      "Index": {
+                        "index": 3
+                      }
+                    }
+                  ]
+                },
+                "value": {
+                  "Const": {
+                    "U32": 1
+                  }
+                },
+                "op": "Add"
+              }
+            }
+          ]
+        }
+      ],
+      "terminator": {
+        "Goto": {
+          "target": {
+            "index": 1
+          }
+        }
+      }
+    },
+    {
+      "statements": [],
+      "terminator": "Return"
+    }
+  ],
+  "workgroup_size": [
+    64,
+    1,
+    1
+  ],
+  "workgroup_locals": []
+}

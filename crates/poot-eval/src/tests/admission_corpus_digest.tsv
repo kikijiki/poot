@@ -1,0 +1,64 @@
+all_gather	5f4c50b4b58df34b
+all_reduce	5f4c50b4b58df34b
+arg_top_k	bdad7b1ee8e07f1a
+binary f32 add	0f72ef3db4a95703
+binary i32 Add	f01cf003431a0f81
+binary i32 GeU	0f17b70c4e0959a2
+binary i32 RemU	0f17b70c4e0959a2
+broadcast	ebb0f153a90d9b82
+cast BF16 -> BF16	e3eea6fe026d4fc0
+cast BF16 -> E4M3FN	e29969138fdc0740
+cast BF16 -> F16	e3eea6fe026d4fc0
+cast BF16 -> F32	e3eea6fe026d4fc0
+cast E4M3FN -> BF16	e3eea6fe026d4fc0
+cast E4M3FN -> E4M3FN	e29969138fdc0740
+cast E4M3FN -> F16	e3eea6fe026d4fc0
+cast E4M3FN -> F32	e3eea6fe026d4fc0
+cast F16 -> BF16	e3eea6fe026d4fc0
+cast F16 -> E4M3FN	e29969138fdc0740
+cast F16 -> F16	e3eea6fe026d4fc0
+cast F16 -> F32	e3eea6fe026d4fc0
+cast F32 -> BF16	e3eea6fe026d4fc0
+cast F32 -> E4M3FN	e29969138fdc0740
+cast F32 -> F16	e3eea6fe026d4fc0
+cast F32 -> F32	e3eea6fe026d4fc0
+cast F32 -> I32	23e3bf0eaed85c22
+cast I32 -> BF16	e3eea6fe026d4fc0
+cast I32 -> F16	e3eea6fe026d4fc0
+cast I32 -> F32	e3eea6fe026d4fc0
+cast I32 -> I32	23e3bf0eaed85c22
+cast I32 -> I8	23e3bf0eaed85c22
+concat	ebf8fdced7b4a8a0
+dynamic_update_slice	c2bbc9c15828bf1d
+gather	6c99c7cf2f01032c
+gather bf16 table, f32 index	6c99c7cf2f01032c
+gather bf16 table, i32 index (spec-376)	6c99c7cf2f01032c
+gather f16 table, i32 index	6c99c7cf2f01032c
+I32 -> I8 -> BF16	1537f0ebdfe4c5b7
+I32 -> I8 -> F16	1537f0ebdfe4c5b7
+I32 -> I8 -> F32	1537f0ebdfe4c5b7
+I32 -> I8 -> I32	155a4a8082ca5d1a
+indexed_matmul	b86f1eb2c9d01b0b
+indexed_matmul f32 x bf16 w	b86f1eb2c9d01b0b
+iota	50c01ed756a4aa90
+matmul	883d9902703ac7db
+matmul_bias	e5bfe64acdc39f72
+pack_i8	728bef064ec9ff8c
+pack_i8 exact i32 (words only)	728bef064ec9ff8c
+random_uniform	6c5b1dcd6be2e0ef
+reduce sum	930b6c43910d2d40
+reshape	6614b4737724d95d
+reshape f16 (legitimately narrowed)	6cf78079089ff22c
+sample_token_greedy	c6c6d2655604b20b
+sample_token_Gumbel	c2c25e34b5024edc
+sample_token_GumbelTopK	c2c25e34b5024edc
+sample_token_GumbelTopKTopP	c2c25e34b5024edc
+scatter	0106ad912c7e5c8c
+scatter bf16 src	0106ad912c7e5c8c
+scatter_update	93b7495b2b1e6c13
+select i32	683317e7900f89bd
+slice	58f208b4ac1adf03
+transpose	736b697e806eed9d
+unary f32 neg	aafae1ea68cb474b
+unary i32 not	b8bf89a8569ceadf
+unpack_i8	ebf8fdced7b4a8a0

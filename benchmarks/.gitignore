@@ -1,0 +1,11 @@
+# harness venv + build artifacts. uv.lock and Cargo.lock are committed (they pin exact versions).
+.venv/
+__pycache__/
+*.pyc
+runners/*/target/
+# model artifacts (GGUF conversions, downloaded checkpoints)
+*.gguf
+models/
+
+# orchestrator local run-state (SQLite db + logs)
+.orchestrator/

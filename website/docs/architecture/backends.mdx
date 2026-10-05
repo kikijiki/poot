@@ -1,0 +1,97 @@
+---
+id: backends
+title: Backends
+sidebar_position: 6
+---
+
+import BackendTable from "@site/src/components/architecture/BackendTable";
+
+# Backends
+
+poot has three first-class backends built from one kernel source: **wgpu** (Vulkan/SPIR-V, the
+portable default), **ROCm** (AMD, raw HSA) and **PTX** (NVIDIA). Raw Vulkan has a runtime crate but no
+executor or `Device` implementation. The NPU path was removed (see [NPU Offload](./npu)). The CPU
+oracle also powers current embeddings and reranking.
+
+Everything from model definition through graph IR, fusion and planning is backend-neutral. Backends
+diverge late, in three places:
+
+- **Kernel selection.** The planner picks a specialization per target, for example tensor-core matmul
+  (WMMA) on PTX and on ROCm's RDNA path, which wgpu does not use. What a target cannot run is a planner
+  refusal, not an executor branch.
+- **Codegen target.** `poot-codegen` emits LLVM IR for `SpirvVulkan`, `Nvptx` or `AmdGcn(arch)`, choosing
+  address spaces, intrinsics, atomics and the AMD tensor-core family. Experimental `AieCore` codegen
+  remains, but it has no runtime kernel handle or NPU execution path.
+- **Runtime dispatch.** wgpu re-encodes a cached command buffer; ROCm replays recorded HSA AQL
+  packets; PTX replays CUDA graphs through [cudarc](https://github.com/coreylowman/cudarc).
+
+All backends implement the backend-neutral executor contract (`poot-executor`: one generic
+`Engine<D>` over a thin `Device` trait): `poot-gpu`'s `WgpuDevice`, `poot-rocm-gpu`'s `RocmDevice`,
+`poot-ptx-gpu`'s `PtxDevice` and `poot-vulkan-device`'s `VulkanDevice` (raw Vulkan, verified on AMD RADV only). A dev-only table-driven parity crate (`poot-executor-parity`) runs
+the same fixture programs through the `Executor` on any `Device`. See [Execution](./execution) for
+the contract's shape.
+
+## wgpu (SPIR-V)
+
+Runs on any Vulkan-capable GPU, including integrated ones; needs no vendor SDK.
+
+```
+kernel IR -> poot-codegen (LLVM IR) -> llc (SPIR-V) -> wgpu::ShaderModule -> ComputePipeline
+```
+
+Cached graph execution reuses pipelines and bind groups, then re-encodes dispatches per token.
+Submission can be split, and sampling can add dispatches, temporary buffers and readback work.
+
+Constraints: no grid-wide sync or cooperative kernels; SPIR-V needs structured control flow (a
+structurization pass runs before emit, which fixed a class of RADV crashes); private arrays with
+dynamic indices are banned (use workgroup LDS); no bf16 on most iGPUs, so compute is f32.
+
+Verified on AMD Radeon (RADV) and Intel Arc iGPUs.
+
+## PTX (NVIDIA)
+
+```
+kernel IR -> poot-codegen (LLVM IR, NVVM intrinsics) -> llc (nvptx64, sm_80) -> PTX -> cudarc JIT
+```
+
+The decode dispatch sequence is captured once into a CUDA graph and replayed per token with one
+`cuGraphLaunch`; kernel arguments point at stable slot buffers the host rewrites in place (see
+[Execution](./execution)). Tensor-core GEMMs use `llvm.nvvm.mma.*`.
+
+PTX also has a lower-level captured multi-device executor: a captured graph per device,
+point-to-point and all-to-all transfers, replay without reallocation. It is not used for model
+partitioning or serving.
+
+Verified on NVIDIA L40S through rented pods.
+
+## ROCm (AMD)
+
+Talks to the GPU through raw HSA rather than HIP math libraries; poot supplies every kernel. Feature
+gated (`--features rocm`).
+
+```
+kernel IR -> poot-codegen (LLVM IR) -> clang -target amdgcn-amd-amdhsa -> HSACO -> HSA queue
+```
+
+ROCm has no vendor graph API, so poot records the dispatch sequence as AQL packets and resubmits them
+per token. Paged KV and flash attention are hardware-verified. Generation picks the next token
+on-device for greedy and plain-temperature (including top-k/top-p/min-p) requests, on every backend:
+a sampling step is appended to the decode graph itself and the host reads back only the chosen token
+id (and a non-finite flag), not the full logits. A request with a logit-bias/penalty, logprob
+recording, or a guided-decoding constraint still reads the full logits back and picks on the host,
+since those transforms are host-side.
+
+Verified on AMD Radeon 8060S (gfx1151) and gfx1100.
+
+## Capability comparison
+
+Kernel- and dispatch-level differences. For models and features, see the
+[feature matrix](../reference/feature-matrix.md).
+
+<BackendTable />
+
+## Correctness across backends
+
+Every backend is checked against the CPU oracle (`poot-eval`): per-backend executor tests dispatch
+kernels with identical inputs and compare to the oracle, and `poot-ptx-check` and `poot-rocm-check` do
+the same on real hardware. See [Execution](./execution#verification).

@@ -1,0 +1,258 @@
+# poot benchmark suite - the model + scenario matrix.
+#
+# Source of truth for what gets benchmarked. The harness enumerates (model x framework x scenario) and runs
+# every cell; a cell a tool refuses is recorded as "unsupported" with the refusal as that tool reports it
+# (FR-005). Edit here to add a model, a framework precision, or a scenario.
+#
+# Precision policy (spec 112): match per model where the baseline supports it, document gaps. Each
+# framework entry under a model gives the precision that framework runs. A precision that is not
+# bit-identical to the matched target (e.g. llama.cpp Q4_K_M vs a GPTQ int4) carries a "caveat".
+#
+# poot has no support list here. Whether poot runs a model on a backend is decided by planning it (ADR 0104):
+# the runner reports a refusal with its own text, and the harness records it. Adding "support" to a poot
+# entry fails harness/tests/test_benchmark_manifest.py. The other frameworks are external tools with no such
+# report available before a run: "support = false" and its "reason" there is a hand-checked fact about the
+# tool (see benchmarks/runners/*/NOTES.md).
+#
+# poot has three GPU backends selected by the runner's --backend flag: ptx (NVIDIA/PTX), rocm (AMD/ROCm),
+# and wgpu (Vulkan/SPIR-V). The same poot-bench-runner binary runs on all three, so the manifest records
+# poot as one framework with one precision. Use benchmarks/run-local-compare.sh to compare backends on
+# the same hardware.
+
+[suite]
+# Tokens generated per timed iteration (fixed so cells are comparable). Overridable per scenario.
+default_gen_tokens = 128
+warmup_iters = 2
+timed_iters = 5
+seed = 0
+
+# Local checkpoint root: pass --models-dir or set POOT_MODELS_DIR (see bench.py); there is no default.
+
+# ----------------------------------------------------------------------------------------------
+# Scenarios: fixed (prompt, gen-token) shapes. Prompts live in benchmarks/prompts/.
+# ----------------------------------------------------------------------------------------------
+[[scenario]]
+id = "decode-128"
+prompt_file = "short.txt"   # a few tokens in, 128 out: isolates decode throughput
+gen_tokens = 128
+
+[[scenario]]
+id = "prefill-1k"
+prompt_file = "long.txt"    # ~1000 tokens in, 32 out: isolates prefill / TTFT
+gen_tokens = 32
+
+# decode-curve (spec 115): at each ISL (context length) the runner prefills exactly ISL synthetic random
+# tokens, then decodes a fixed OSL window, timing every token. The harness reports TPOT/ITL percentiles and
+# steady decode tok/s per ISL. Drives every runner's `--mode decode-curve --isl-list ... --osl ... --synthetic`.
+[[scenario]]
+id = "decode-curve"
+kind = "decode-curve"
+isl = [128, 512, 2048, 8192]   # context lengths to sweep (cap per the model window + poot prefill cost)
+osl = 128                       # decode tokens timed at each ISL (per-token TPOT/ITL -> window-independent)
+synthetic = true                # exactly-ISL random in-vocab tokens: tokenizer-neutral + defeats prefix cache
+
+# ----------------------------------------------------------------------------------------------
+# Models. size_class picks which pods can run them (small = Arc + cheap pod; xl = RunPod only).
+# Each [model.frameworks.<fw>] = { precision, caveat? } for poot; { support, precision, reason?, caveat? }
+# for the other frameworks.
+# ----------------------------------------------------------------------------------------------
+
+# qwen2.5-0.5b: poot's most-verified model (coherence and PTX-parity anchor); all baselines run it. Fits the
+# cheapest pod.
+[[model]]
+id = "qwen2.5-0.5b"
+arch = "Qwen2ForCausalLM"
+hf_repo = "Qwen/Qwen2.5-0.5B-Instruct"
+local_dir = "qwen2.5-0.5b"
+size_class = "small"
+group = "dense"
+match_precision = "bf16"
+frameworks.poot         = { precision = "bf16", caveat = "poot loads bf16 but computes f32 (engine is f32 end to end)" }
+frameworks.candle       = { support = true, precision = "bf16" }
+frameworks.transformers = { support = true, precision = "bf16" }
+frameworks.vllm         = { support = true, precision = "bf16" }
+frameworks.llamacpp     = { support = true, precision = "f16", caveat = "GGUF f16 vs bf16" }
+
+[[model]]
+id = "qwen3-0.6b"
+arch = "Qwen3ForCausalLM"
+hf_repo = "Qwen/Qwen3-0.6B"
+local_dir = "qwen3-0.6b"
+size_class = "small"
+group = "dense"
+match_precision = "bf16"   # the target precision all frameworks aim to match
+# Newest Qwen on the PTX cross-framework bench path (standard transformer + QK-norm, spec 090). The
+# Qwen3-Next 35B-A3B MoE runs on poot on-box (wgpu/rocm, card 135) and token-matches llama.cpp, but is not
+# on this PTX bench matrix, which is qwen2/qwen3 dense only.
+frameworks.poot         = { precision = "bf16" }
+frameworks.candle       = { support = true, precision = "bf16" }
+frameworks.transformers = { support = true, precision = "bf16" }
+frameworks.vllm         = { support = true, precision = "bf16" }
+frameworks.llamacpp     = { support = true, precision = "f16", caveat = "GGUF f16 vs bf16 - closest full-precision GGUF" }
+
+# Qwen3 dense, the same Qwen3ForCausalLM poot runs at 0.6B. Apache, no HF token. 4B bf16 ~8GB and 8B ~16GB
+# fit a 24GB pod; 14B ~28GB needs a 48GB GPU (A6000/A40).
+[[model]]
+id = "qwen3-4b"
+arch = "Qwen3ForCausalLM"
+hf_repo = "Qwen/Qwen3-4B"
+local_dir = "qwen3-4b"
+size_class = "mid"
+group = "dense"
+match_precision = "bf16"
+frameworks.poot         = { precision = "bf16" }
+frameworks.candle       = { support = true, precision = "bf16" }
+frameworks.transformers = { support = true, precision = "bf16" }
+frameworks.vllm         = { support = true, precision = "bf16" }
+frameworks.llamacpp     = { support = true, precision = "f16", caveat = "GGUF f16 vs bf16" }
+
+[[model]]
+id = "qwen3-8b"
+arch = "Qwen3ForCausalLM"
+hf_repo = "Qwen/Qwen3-8B"
+local_dir = "qwen3-8b"
+size_class = "mid"
+group = "dense"
+match_precision = "bf16"
+frameworks.poot         = { precision = "bf16" }
+frameworks.candle       = { support = true, precision = "bf16" }
+frameworks.transformers = { support = true, precision = "bf16" }
+frameworks.vllm         = { support = true, precision = "bf16" }
+frameworks.llamacpp     = { support = true, precision = "f16", caveat = "GGUF f16 vs bf16" }
+
+[[model]]
+id = "qwen3-14b"
+arch = "Qwen3ForCausalLM"
+hf_repo = "Qwen/Qwen3-14B"
+local_dir = "qwen3-14b"
+size_class = "xl"           # 14B bf16 ~28GB - needs a 48GB GPU (A6000 / A40)
+group = "dense"
+match_precision = "bf16"
+# xl tier real sweep (RunPod L40S 48GB, 2026-08-20, snapshot 2026-08-20-l40s-qwen3-14b-474f03b2):
+frameworks.poot         = { precision = "bf16", caveat = "SIGKILL (rc=-9) during model load, before any GPU work: peak host RSS 116.1 GiB (124.7 GB) against this pod's ~116.4 GiB cgroup memory.max (single-GPU L40S RunPod pods are RAM-capped independent of the 48GB VRAM; not a poot correctness bug). isl 128/512/2048/8192 all untested as a result - poot's own load path needs a lower peak-RSS footprint (or a higher-RAM pod tier) to bench this model size" }
+frameworks.candle       = { support = true, precision = "bf16", caveat = "isl 8192 hits CUDA_ERROR_ILLEGAL_ADDRESS at peak_vram 44.76 GiB (near the L40S's ~46 GiB ceiling) - a real VRAM-exhaustion failure for this model+ISL on a 48GB GPU (not a poot bug). isl 128/512/2048 completed per the runner's own progress log before the isl=8192 crash, but no numeric decode-curve data survives for any point: the harness only parses the runner's FINAL stdout JSON, and the process died before printing it, so this cell is recorded as a full error, not a partial curve" }
+frameworks.transformers = { support = true, precision = "bf16" }
+frameworks.vllm         = { support = true, precision = "bf16", caveat = "this committed row is from the 2026-08-20 sweep at the OLD 0.30 default: errors ('No available memory for the cache blocks') since 0.30 * ~44 GiB usable = ~13 GiB < this model's ~28 GiB bf16 weights alone, independent of the known FlashInfer/nvcc image-bake gap (see card 031). FIXED 2026-08-21 (update 0653): runners/vllm/run.py's --gpu-mem-util default raised 0.30 -> 0.85, re-verified clean end to end on this exact model on a fresh pod with no manual override needed (22.4/22.3/22.1/21.4 tok/s at isl 128/512/2048/8192, peak_vram 40.67 GiB) - not re-run into this snapshot's results.jsonl, since the bench image is still not rebuilt with either fix baked in" }
+frameworks.llamacpp     = { support = true, precision = "f16", caveat = "GGUF f16 vs bf16" }
+
+# Phi-4 (14B) reuses Phi3ForCausalLM, which poot runs (spec phi3). MIT, not gated. 14B bf16 ~28GB needs a
+# 48GB GPU; 4-bit fits 24GB.
+[[model]]
+id = "phi-4"
+arch = "Phi3ForCausalLM"
+hf_repo = "microsoft/phi-4"
+local_dir = "phi-4"
+size_class = "xl"
+group = "dense"
+match_precision = "bf16"
+frameworks.poot         = { precision = "bf16" }
+frameworks.candle       = { support = false, reason = "candle-transformers 0.10.2 has no Phi3 (validated 2026-06-15: 'unsupported arch Phi3ForCausalLM')" }
+frameworks.transformers = { support = true, precision = "bf16" }
+# xl tier real sweep (RunPod RTX A6000 48GB, 2026-08-20, snapshot 2026-08-20-rtx-a6000-phi-4-b9b21fef):
+frameworks.vllm         = { support = true, precision = "bf16", caveat = "the automated sweep's default (no scp'd FlashInfer fix, --gpu-mem-util 0.30) fails exactly as update 0639 predicted for any xl-tier model: 0.30 * ~44 GiB usable < this model's ~28 GiB bf16 weights, so KV-cache sizing always errors. The committed results.jsonl row is instead from a manual re-run (poot-orchestrator exec, separate pod, same GPU class + image) with VLLM_USE_FLASHINFER_SAMPLER=0 (update 0629 fix, still not baked into the published bench image) and --gpu-mem-util 0.85 - both needed, both confirmed working end to end this time (unlike qwen3-14b's incomplete verification): full real decode-curve data, 19.4/19.3/19.1/18.3 tok/s at isl 128/512/2048/8192. FIXED 2026-08-21 (update 0653): the --gpu-mem-util 0.85 workaround used here is now runners/vllm/run.py's in-source default, so a future sweep needs only the still-open FlashInfer image-bake fix, not a manual flag too" }
+frameworks.llamacpp     = { support = true, precision = "f16", caveat = "GGUF f16 vs bf16" }
+
+# Llama-3.2-1B (card 135a): poot's LlamaForCausalLM tracer, exercised via the GGUF path's llama3 rope_freqs
+# NTK-by-parts rescale and mandatory-BOS handling. Meta license, gated on HF (token + license acceptance).
+# 1B fits any pod. The gate is a fact about the checkpoint, not about poot: the account's access request was
+# not approved as of 2026-09-08, so no framework can download it here and a cell with no local
+# checkpoint is recorded as the tool's own load error.
+[[model]]
+id = "llama-3.2-1b"
+arch = "LlamaForCausalLM"
+hf_repo = "meta-llama/Llama-3.2-1B-Instruct"
+local_dir = "llama-3.2-1b"
+size_class = "small"
+group = "dense"
+match_precision = "bf16"
+frameworks.poot         = { precision = "bf16" }
+frameworks.candle       = { support = true, precision = "bf16" }
+frameworks.transformers = { support = true, precision = "bf16" }
+frameworks.vllm         = { support = true, precision = "bf16" }
+frameworks.llamacpp     = { support = true, precision = "f16", caveat = "GGUF f16 vs bf16" }
+
+# OLMo-2 1B (card 135a): poot's dedicated OLMo-2 tracer (post-norm block + full-dim QK-norm, one of the
+# `uses_special_tracer()` arches). Apache, not gated. 1B fits any pod.
+[[model]]
+id = "olmo2-1b"
+arch = "Olmo2ForCausalLM"
+hf_repo = "allenai/OLMo-2-0425-1B-Instruct"
+local_dir = "olmo2-1b"
+size_class = "small"
+group = "dense"
+match_precision = "bf16"
+frameworks.poot         = { precision = "bf16", caveat = "isl 8192+ omitted: OLMo-2-0425-1B-Instruct max_position_embeddings is 4096, so isl past 2048 exceeds the model window (not a poot bug). PTX (RunPod RTX 3090, 2026-08-20, snapshot 2026-08-19-geforce-rtx-3090-olmo2-1b-91a511b2): isl 128/512/2048 ok. On-box AMD Strix Halo gfx1151, 2026-09-25, commit 6b64abcb2, HF revision 48d788eca847d4d7548f375ad03d3c9312f6139e, both backends run serially under flock with the user's vLLM services stopped: rocm full curve ok at isl 128/512/2048 (15.9/15.1/12.3 tok/s, TPOT p50 62.8/66.0/81.3 ms, peak host RSS 18.55 GiB; snapshot 2026-09-25-strix-halo-olmo2-1b-rocm-6b64abcb2) and wgpu full curve ok (12.4/10.8/10.5 tok/s, TPOT p50 80.6/92.3/95.0 ms, peak host RSS 18.53 GiB; snapshot 2026-09-25-strix-halo-olmo2-1b-wgpu-6b64abcb2). Both are card-312 contract ok, so every iteration delivered the full 128-token budget: the ROCm 2-token EOS stop is fixed (11743c3c8 seeds the post-prefill decode capture from the prefill KV) and wgpu isl 2048 no longer trips the WebGPU 65535/dim batched-prefill grid cap (78b71acfd). Superseded: 2026-09-23 at 7e71ad05a recorded rocm ok at ~0.45 tok/s (snapshot 2026-09-23-strix-halo-olmo2-1b-rocm-7e71ad05) and a wgpu error row at isl 2048 (snapshot 2026-09-23-strix-halo-olmo2-1b-wgpu-7e71ad05); the card 298 mixed-dtype planning fix (update 1176) is confirmed on both backends. Host memory: the cell peaks near 18.5 GiB RSS plus GPU device buffers that never show up in process RSS, so with ~70G of vLLM device memory resident (30Gi available) an earlier 2026-09-25 attempt reached a global OOM at isl 2048 - it needs >=40Gi available, or >=80Gi while other lanes are building. isl 8192+ stays omitted for the model window." }
+frameworks.candle       = { support = true, precision = "bf16" }
+frameworks.transformers = { support = true, precision = "bf16" }
+frameworks.vllm         = { support = true, precision = "bf16" }
+frameworks.llamacpp     = { support = true, precision = "f16", caveat = "GGUF f16 vs bf16" }
+
+# Phi-3.5-mini-instruct (card 135a): poot's Phi3ForCausalLM tracer (fused attn_qkv / ffn_up split, phi3
+# rotary_dim). MIT, not gated. 3.8B fits any pod.
+[[model]]
+id = "phi-3.5-mini"
+arch = "Phi3ForCausalLM"
+hf_repo = "microsoft/Phi-3.5-mini-instruct"
+local_dir = "phi-3.5-mini"
+size_class = "mid"
+group = "dense"
+match_precision = "bf16"
+frameworks.poot         = { precision = "bf16", caveat = "isl 8192+ omitted: CUDA out-of-memory on a 24GB RTX 3090 at that context length for this 3.8B model (not a poot correctness bug); isl 128/512/2048 all pass with real decode-curve data on PTX (RunPod RTX 3090, 2026-08-20, snapshot 2026-08-19-geforce-rtx-3090-phi-3-5-mini-1ece8859). On-box AMD Strix Halo (gfx1151) wgpu TIMED OUT: isl=128 alone took roughly 800s (apparently one-time kernelgen/shader-compile cost for this model's op set - no progress at all before then), then isl=512 ran 390+s more without finishing; killed at the 20-minute actual-runtime cap with no numeric data recovered (the runner only prints its aggregated JSON at the very end of all isl points, so even the completed isl=128 point is lost). rocm not attempted for this model given the wgpu timeout and time budget. Verified 2026-09-08, commit 6794ff7b, snapshot 2026-09-08-strix-halo-phi-3-5-mini-6794ff7b." }
+frameworks.candle       = { support = false, reason = "candle-transformers 0.10.2 has no Phi3 (validated 2026-06-15: 'unsupported arch Phi3ForCausalLM')" }
+frameworks.transformers = { support = true, precision = "bf16" }
+frameworks.vllm         = { support = true, precision = "bf16" }
+frameworks.llamacpp     = { support = true, precision = "f16", caveat = "GGUF f16 vs bf16" }
+
+# SmolLM3-3B. Apache, not gated. 3B ~6GB fits any pod. Card 135b / specs/260-smollm3-tracer: SmolLM3ForCausalLM
+# tracer (poot_models::smollm3, NoPE per-layer RoPE gate) + safetensors loader; CPU-coherent on the real
+# HuggingFaceTB/SmolLM3-3B checkpoint, exact-match PTX/NVIDIA parity, and a PTX decode-curve sweep on RunPod
+# RTX 3090 (isl 128/512 pass; isl 2048+ hits the 24GB VRAM limit).
+[[model]]
+id = "smollm3-3b"
+arch = "SmolLM3ForCausalLM"
+hf_repo = "HuggingFaceTB/SmolLM3-3B"
+local_dir = "smollm3-3b"
+size_class = "mid"
+group = "dense"
+match_precision = "bf16"
+frameworks.poot         = { precision = "bf16", caveat = "isl 2048+ omitted: CUDA out-of-memory on a 24GB RTX 3090 at that context length for this 3B model (not a poot correctness bug, peak VRAM already 23.96 GiB at isl=512); isl 128/512 pass with real decode-curve data (RunPod RTX 3090, 2026-08-20, snapshot 2026-08-20-geforce-rtx-3090-smollm3-3b-d4461ffc: 16.5 / 14.9 tok/s decode)" }
+frameworks.candle       = { support = false, reason = "candle-transformers 0.10.2 has no SmolLM3 (validated 2026-06-15: 'unsupported arch SmolLM3ForCausalLM')" }
+frameworks.transformers = { support = true, precision = "bf16" }
+frameworks.vllm         = { support = true, precision = "bf16" }
+frameworks.llamacpp     = { support = true, precision = "f16", caveat = "GGUF f16 vs bf16" }
+
+# Gemma 4 (26B MoE / 31B dense) runs on poot on-box (GGUF, wgpu/rocm, card 135) but is not on this PTX
+# cross-framework matrix. Benching Gemma here is blocked on the safetensors path: the Gemma 3 4B/12B/27B *it*
+# checkpoints are Gemma3ForConditionalGeneration (multimodal) and nest the text params under `text_config`, so
+# poot's safetensors gemma3 loader fails with "missing field num_attention_heads" (validated 2026-06-15); only
+# text-only Gemma3ForCausalLM (gemma-3-1b) loads. Needs multimodal-config handling or a Gemma-4 PTX bench cell.
+
+[[model]]
+id = "olmoe-1b-7b"
+arch = "OlmoeForCausalLM"
+hf_repo = "allenai/OLMoE-1B-7B-0924-Instruct"
+local_dir = "olmoe-1b-7b"
+size_class = "xl"           # 7B params, ~14GB bf16 - RunPod only
+group = "moe"
+match_precision = "bf16"
+frameworks.poot         = { precision = "bf16" }
+frameworks.transformers = { support = true, precision = "bf16" }
+frameworks.vllm         = { support = true, precision = "bf16" }
+frameworks.candle       = { support = false, reason = "candle-transformers 0.10.2 has no OLMoE (MoE list: mixtral/qwen2_moe/qwen3_moe/deepseek2/granitemoehybrid)" }
+frameworks.llamacpp     = { support = true, precision = "f16", caveat = "OLMoE GGUF support - verify in research" }
+
+[[model]]
+id = "gpt-oss-20b"
+arch = "GptOssForCausalLM"
+hf_repo = "openai/gpt-oss-20b"
+local_dir = ""              # downloaded on the pod (13.8GB)
+size_class = "xl"           # RunPod only
+group = "moe"
+match_precision = "mxfp4"
+# The runner loads f32/bf16/f16 checkpoints only. It refuses mxfp4 before reading any weight, so this cell is
+# recorded as unsupported with the runner's own text (the harness passes the model dir but nothing is loaded).
+frameworks.poot         = { precision = "mxfp4" }
+frameworks.transformers = { support = true, precision = "mxfp4", caveat = "verify native mxfp4 path" }
+frameworks.vllm         = { support = true, precision = "mxfp4" }
+frameworks.llamacpp     = { support = true, precision = "mxfp4", caveat = "gpt-oss has native GGUF/mxfp4 in llama.cpp - verify" }
+frameworks.candle       = { support = false, reason = "candle-transformers 0.10.2 has no gpt-oss model" }

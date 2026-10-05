@@ -1,0 +1,33 @@
+[package]
+name = "poot-vulkan-runtime"
+description = "poot raw-Vulkan (ash) compute runtime: dispatch poot's existing SPIR-V kernels without wgpu"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Dynamically loaded (`Entry::load` dlopens libvulkan.so.1, the default "loaded" feature), so this
+# crate builds without the Vulkan SDK or headers (spec 133 FR-001, as poot-rocm-runtime does for libhsa).
+ash = "0.38"
+poot-target.workspace = true
+thiserror.workspace = true
+# The library only dispatches the .spv bytes it is given. These three are for the `poot-vulkan-check`
+# binary, which compiles poot's `add` kernel and cross-checks against wgpu (spec 133 Verification). They
+# are ordinary dependencies because a `[[bin]]` target cannot use `[dev-dependencies]`.
+poot-codegen.workspace = true
+poot-kernel-ir.workspace = true
+poot-runtime.workspace = true
+poot-runtime-common.workspace = true
+
+[dev-dependencies]
+poot-test-util = { workspace = true, features = ["kernel-fixtures"] }
+
+[[bin]]
+name = "poot-vulkan-check"
+path = "src/bin/poot_vulkan_check.rs"
+
+[lints]
+workspace = true

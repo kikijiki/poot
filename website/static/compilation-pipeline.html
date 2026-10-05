@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>poot - Compilation Pipeline</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #7d8590;
+    --graph: #7ee787;
+    --kernel: #79c0ff;
+    --ptx: #ffa657;
+    --spirv: #d2a8ff;
+    --rocm: #ff7b72;
+    --gpu: #58a6ff;
+    --cpu: #8b949e;
+    --accent: #58a6ff;
+    --link: #6e40c9;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg); color: var(--text);
+    line-height: 1.6; padding: 2rem; max-width: 1400px; margin: 0 auto;
+  }
+  h1 { font-size: 2rem; margin-bottom: 0.5rem; }
+  h2 { font-size: 1.4rem; margin: 2.5rem 0 1rem; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  h3 { font-size: 1.1rem; margin: 1.5rem 0 0.5rem; color: var(--muted); }
+  p { margin-bottom: 0.8rem; color: var(--muted); }
+  code { background: var(--surface); padding: 0.15em 0.4em; border-radius: 4px; font-size: 0.9em; color: var(--text); }
+  a { color: var(--accent); text-decoration: none; }
+  .subtitle { color: var(--muted); font-size: 1rem; margin-bottom: 2rem; }
+
+  /* Diagram containers */
+  .diagram { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1rem 0 2rem; overflow-x: auto; }
+  .diagram svg { width: 100%; height: auto; }
+  .diagram-caption { color: var(--muted); font-size: 0.85rem; text-align: center; margin-top: 0.8rem; }
+
+  /* Tables */
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0 2rem; }
+  th, td { padding: 0.6rem 1rem; border: 1px solid var(--border); text-align: left; font-size: 0.9rem; }
+  th { background: var(--surface); color: var(--accent); font-weight: 600; }
+  td { color: var(--text); }
+  tr:nth-child(even) td { background: rgba(22,27,34,0.5); }
+
+  /* Legend */
+  .legend { display: flex; flex-wrap: wrap; gap: 1rem; margin: 1rem 0; }
+  .legend-item { display: flex; align-items: center; gap: 0.4rem; font-size: 0.85rem; }
+  .legend-dot { width: 12px; height: 12px; border-radius: 50%; }
+
+  /* Cards */
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1rem; margin: 1rem 0; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.2rem; }
+  .card h4 { margin-bottom: 0.5rem; font-size: 1rem; }
+  .card p { font-size: 0.85rem; }
+  .card ul { padding-left: 1.2rem; font-size: 0.85rem; color: var(--muted); }
+  .card li { margin-bottom: 0.3rem; }
+
+  /* Flow lines */
+  .flow { display: flex; flex-direction: column; align-items: center; gap: 0; }
+  .flow-box { padding: 0.6rem 1.5rem; border-radius: 6px; font-weight: 600; font-size: 0.9rem; text-align: center; min-width: 200px; }
+  .flow-arrow { color: var(--muted); font-size: 1.2rem; line-height: 1.2; }
+  .flow-split { display: flex; gap: 2rem; align-items: flex-start; flex-wrap: wrap; justify-content: center; }
+  .flow-branch { display: flex; flex-direction: column; align-items: center; gap: 0; }
+
+  /* Notes */
+  .note { background: rgba(88,166,255,0.08); border-left: 3px solid var(--accent); padding: 0.8rem 1rem; margin: 1rem 0; border-radius: 0 4px 4px 0; font-size: 0.9rem; }
+  .note strong { color: var(--text); }
+</style>
+</head>
+<body>
+
+<h1>poot Compilation Pipeline</h1>
+<p class="subtitle">How model code flows through graph IR, kernel IR, and backend-specific codegen to become GPU instructions.</p>
+
+<p>The end-to-end pipeline diagram lives on the <a href="/docs/architecture">Architecture docs page</a>; this page covers the detail below it.</p>
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-dot" style="background:var(--graph)"></div> Graph IR</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--kernel)"></div> Kernel IR</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--ptx)"></div> PTX / NVIDIA</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--spirv)"></div> SPIR-V / Vulkan</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--rocm)"></div> ROCm / AMD</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--cpu)"></div> CPU / Host</div>
+</div>
+
+<!-- ================================================================ -->
+<h2>1. Graph IR to Kernel IR: Two Sources</h2>
+
+<div class="diagram">
+<svg viewBox="0 0 1200 400" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, BlinkMacSystemFont, sans-serif">
+  <defs>
+    <marker id="a2" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6z" fill="var(--muted)"/></marker>
+  </defs>
+
+  <!-- Graph IR -->
+  <rect x="400" y="10" width="400" height="60" rx="8" fill="var(--surface)" stroke="var(--graph)" stroke-width="2"/>
+  <text x="600" y="35" text-anchor="middle" fill="var(--graph)" font-size="14" font-weight="600">Graph IR (optimized)</text>
+  <text x="600" y="55" text-anchor="middle" fill="var(--muted)" font-size="11">Eqn: OpKind + Operand[] -> ValueId</text>
+
+  <!-- plan_eqn_analyzed -->
+  <line x1="600" y1="70" x2="600" y2="100" stroke="var(--graph)" stroke-width="1.5" marker-end="url(#a2)"/>
+  <rect x="400" y="100" width="400" height="40" rx="8" fill="var(--surface)" stroke="var(--muted)" stroke-width="1.5"/>
+  <text x="600" y="125" text-anchor="middle" fill="var(--text)" font-size="13" font-weight="600">plan_eqn_analyzed</text>
+
+  <!-- Three paths down -->
+  <line x1="450" y1="140" x2="200" y2="180" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#a2)"/>
+  <line x1="600" y1="140" x2="600" y2="180" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#a2)"/>
+  <line x1="750" y1="140" x2="1000" y2="180" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#a2)"/>
+
+  <!-- Imported kernel path -->
+  <rect x="30" y="180" width="340" height="100" rx="8" fill="var(--surface)" stroke="var(--kernel)" stroke-width="2"/>
+  <text x="200" y="205" text-anchor="middle" fill="var(--kernel)" font-size="13" font-weight="600">Imported Kernel (pootc)</text>
+  <text x="200" y="225" text-anchor="middle" fill="var(--muted)" font-size="11">Rust #[kernel] -> rustc MIR -> Body</text>
+  <text x="200" y="245" text-anchor="middle" fill="var(--muted)" font-size="11">-> .kir.json asset (build time)</text>
+  <text x="200" y="265" text-anchor="middle" fill="var(--muted)" font-size="10">gemv, tiled_gemm, flash_prefill, argmax</text>
+
+  <!-- Synthesized kernel path -->
+  <rect x="430" y="180" width="340" height="100" rx="8" fill="var(--surface)" stroke="var(--kernel)" stroke-width="2"/>
+  <text x="600" y="205" text-anchor="middle" fill="var(--kernel)" font-size="13" font-weight="600">Synthesized (kernelgen)</text>
+  <text x="600" y="225" text-anchor="middle" fill="var(--muted)" font-size="11">Graph OpKind -> programmatic Body</text>
+  <text x="600" y="245" text-anchor="middle" fill="var(--muted)" font-size="11">Shape-specialized at runtime</text>
+  <text x="600" y="265" text-anchor="middle" fill="var(--muted)" font-size="10">fused, fused_row, binary, reduce, tiled GEMM, flash region</text>
+
+  <!-- Alias/Host path -->
+  <rect x="830" y="180" width="340" height="100" rx="8" fill="var(--surface)" stroke="var(--cpu)" stroke-width="1.5"/>
+  <text x="1000" y="205" text-anchor="middle" fill="var(--cpu)" font-size="13" font-weight="600">Alias / Host</text>
+  <text x="1000" y="225" text-anchor="middle" fill="var(--muted)" font-size="11">Reshape -> buffer alias (free)</text>
+  <text x="1000" y="245" text-anchor="middle" fill="var(--muted)" font-size="11">Non-axis-0 scatter -> CPU fallback</text>
+  <text x="1000" y="265" text-anchor="middle" fill="var(--muted)" font-size="10">Rarely used in practice</text>
+
+  <!-- All converge to dispatch -->
+  <line x1="200" y1="280" x2="200" y2="320" stroke="var(--kernel)" stroke-width="1.5" marker-end="url(#a2)"/>
+  <line x1="600" y1="280" x2="600" y2="320" stroke="var(--kernel)" stroke-width="1.5" marker-end="url(#a2)"/>
+  <line x1="1000" y1="280" x2="1000" y2="320" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#a2)"/>
+
+  <rect x="200" y="320" width="800" height="60" rx="8" fill="var(--surface)" stroke="var(--kernel)" stroke-width="2"/>
+  <text x="600" y="345" text-anchor="middle" fill="var(--kernel)" font-size="14" font-weight="600">Dispatch: compile Body -> backend binary -> GPU execute</text>
+  <text x="600" y="365" text-anchor="middle" fill="var(--muted)" font-size="11">Each Body goes through emit_llvm_ir(body, target) -> backend-specific compiler -> GPU runtime</text>
+</svg>
+<p class="diagram-caption">Figure 1: The planner selects between imported pre-compiled kernels, runtime-synthesized kernels, and host operations.</p>
+</div>
+
+<!-- ================================================================ -->
+<h2>2. Kernel IR (Body) Structure</h2>
+
+<div class="cards">
+<div class="card">
+  <h4 style="color:var(--kernel)">Body</h4>
+  <p>One kernel function: name, params, locals, basic blocks, workgroup_size, LDS declarations.</p>
+  <ul>
+    <li>params: <code>ptr addrspace(1)</code> + <code>i64 len</code> per slice</li>
+    <li>locals: typed registers (f32, bf16, i32, usize, bool, i32 fragments)</li>
+    <li>workgroup_size: e.g., [32, 1, 1] for one wave</li>
+    <li>workgroup_locals: LDS arrays (addrspace 3)</li>
+  </ul>
+</div>
+<div class="card">
+  <h4 style="color:var(--kernel)">BasicBlock</h4>
+  <p>Sequence of Statements ending with a Terminator.</p>
+  <ul>
+    <li>Statements: Assign, WmmaLoad, WmmaMma, WmmaStore, WmmaLoadLds</li>
+    <li>Terminators: Goto, SwitchInt, ThreadIndexCall, Barrier, Return</li>
+    <li>Rvalues: BinaryOp, UnaryOp, MathUnary, Cast, Bitcast, SubgroupReduce</li>
+  </ul>
+</div>
+<div class="card">
+  <h4 style="color:var(--kernel)">WMMA Ops</h4>
+  <p>Tensor core operations in the kernel IR.</p>
+  <ul>
+    <li><code>WmmaLoad { which: A|B, tile, stride, dst: [Local; 8] }</code></li>
+    <li><code>WmmaMma { a, b, c, dst: [Local; 8] }</code></li>
+    <li><code>WmmaStore { tile, stride, src: [Local; 8] }</code></li>
+    <li>8 VGPRs for fragments, same IR for all backends</li>
+  </ul>
+</div>
+</div>
+
+<!-- ================================================================ -->
+<h2>3. Backend-Specific Codegen</h2>
+
+<table>
+<thead>
+<tr>
+  <th>Aspect</th>
+  <th style="color:var(--spirv)">Vulkan / SPIR-V</th>
+  <th style="color:var(--ptx)">NVIDIA / PTX</th>
+  <th style="color:var(--rocm)">AMD / ROCm</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td>Target triple</td>
+  <td><code>spirv-unknown-vulkan1.3-compute</code></td>
+  <td><code>nvptx64-nvidia-cuda</code></td>
+  <td><code>amdgcn-amd-amdhsa</code></td>
+</tr>
+<tr>
+  <td>usize</td>
+  <td>i32</td>
+  <td>i64</td>
+  <td>i64</td>
+</tr>
+<tr>
+  <td>Pointer width</td>
+  <td>Logical (Vulkan handles)</td>
+  <td>64-bit flat</td>
+  <td>64-bit flat</td>
+</tr>
+<tr>
+  <td>Thread ID intrinsic</td>
+  <td><code>@llvm.spv.thread.id</code></td>
+  <td><code>@llvm.nvvm.read.ptx.sreg.tid.x</code></td>
+  <td><code>@llvm.amdgcn.workitem.id.x</code></td>
+</tr>
+<tr>
+  <td>Barrier</td>
+  <td><code>@llvm.spv.control.barrier</code></td>
+  <td><code>@llvm.nvvm.barrier0</code></td>
+  <td><code>@llvm.amdgcn.s.barrier</code></td>
+</tr>
+<tr>
+  <td>LDS / Shared</td>
+  <td><code>addrspace(3)</code> Workgroup</td>
+  <td><code>addrspace(3)</code> .shared</td>
+  <td><code>addrspace(3)</code></td>
+</tr>
+<tr>
+  <td>Private memory</td>
+  <td>Function addrspace</td>
+  <td>Function addrspace</td>
+  <td><code>addrspace(5)</code> (required)</td>
+</tr>
+<tr>
+  <td>Data layout</td>
+  <td>Default LLVM</td>
+  <td>Default LLVM</td>
+  <td><code>+ni:7:8:9</code> (ROCm device-libs)</td>
+</tr>
+<tr>
+  <td>WMMA support</td>
+  <td style="color:var(--rocm)">No</td>
+  <td style="color:var(--graph)">Yes: nvvm load+mma+store intrinsics</td>
+  <td style="color:var(--ptx)">Partial: amdgcn mma intrinsic only</td>
+</tr>
+<tr>
+  <td>WMMA fragment layout</td>
+  <td>N/A</td>
+  <td style="color:var(--graph)">Hardware handles it (opaque)</td>
+  <td style="color:var(--rocm)">Manual: we load/pack/store</td>
+</tr>
+<tr>
+  <td>bf16 support</td>
+  <td>No (needs SPV_KHR_bfloat16)</td>
+  <td>Yes (bfloat type)</td>
+  <td>Yes (bfloat type)</td>
+</tr>
+<tr>
+  <td>Compiler tool</td>
+  <td><code>llc -filetype=obj --spirv-ext=+</code></td>
+  <td><code>llc -mcpu=sm_80</code></td>
+  <td><code>amdclang -target amdgcn -mcpu=gfx1151</code></td>
+</tr>
+<tr>
+  <td>Output format</td>
+  <td>.spv (SPIR-V binary)</td>
+  <td>.ptx (text, JIT by driver)</td>
+  <td>.hsaco (ELF relocatable)</td>
+</tr>
+<tr>
+  <td>Extra passes</td>
+  <td>structurize CFG, fix barrier semantics</td>
+  <td>None</td>
+  <td>Device-libs linking, KD patching</td>
+</tr>
+</tbody>
+</table>
+
+<!-- ================================================================ -->
+<h2>4. The WMMA Fragment Layout Problem</h2>
+
+<p>This is the key architectural difference between PTX and AMDGPU. On PTX, the LLVM intrinsics handle memory-to-fragment mapping. On AMDGPU, we must do it ourselves.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 1200 480" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, BlinkMacSystemFont, sans-serif">
+  <defs>
+    <marker id="a5" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6z" fill="var(--muted)"/></marker>
+  </defs>
+
+  <!-- PTX side -->
+  <rect x="20" y="10" width="550" height="220" rx="8" fill="var(--surface)" stroke="var(--ptx)" stroke-width="2"/>
+  <text x="295" y="35" text-anchor="middle" fill="var(--ptx)" font-size="14" font-weight="600">PTX WMMA (simple)</text>
+
+  <rect x="40" y="50" width="160" height="30" rx="4" fill="rgba(255,166,87,0.1)" stroke="var(--ptx)" stroke-width="1"/>
+  <text x="120" y="70" text-anchor="middle" fill="var(--ptx)" font-size="11">Memory (bf16)</text>
+
+  <text x="200" y="70" text-anchor="middle" fill="var(--muted)" font-size="16">-></text>
+
+  <rect x="220" y="50" width="330" height="30" rx="4" fill="rgba(255,166,87,0.15)" stroke="var(--ptx)" stroke-width="1"/>
+  <text x="385" y="70" text-anchor="middle" fill="var(--ptx)" font-size="11">llvm.nvvm.wmma.load.{a,b}.row.stride.bf16.p0(ptr, stride)</text>
+
+  <text x="385" y="100" text-anchor="middle" fill="var(--muted)" font-size="12">Hardware handles lane-to-element mapping</text>
+
+  <rect x="220" y="115" width="330" height="30" rx="4" fill="rgba(255,166,87,0.15)" stroke="var(--ptx)" stroke-width="1"/>
+  <text x="385" y="135" text-anchor="middle" fill="var(--ptx)" font-size="11">llvm.nvvm.wmma.mma.row.row.bf16(4xi32, 4xi32, 8xfloat)</text>
+
+  <rect x="220" y="155" width="330" height="30" rx="4" fill="rgba(255,166,87,0.15)" stroke="var(--ptx)" stroke-width="1"/>
+  <text x="385" y="175" text-anchor="middle" fill="var(--ptx)" font-size="11">llvm.nvvm.wmma.store.d.row.stride.f32.p0(ptr, 8xfloat, stride)</text>
+
+  <text x="295" y="215" text-anchor="middle" fill="var(--graph)" font-size="12" font-weight="600">3 intrinsics: load, mma, store. Layout is opaque.</text>
+
+  <!-- AMDGPU side -->
+  <rect x="630" y="10" width="550" height="220" rx="8" fill="var(--surface)" stroke="var(--rocm)" stroke-width="2"/>
+  <text x="905" y="35" text-anchor="middle" fill="var(--rocm)" font-size="14" font-weight="600">AMDGPU WMMA (manual)</text>
+
+  <rect x="650" y="50" width="130" height="30" rx="4" fill="rgba(255,123,114,0.1)" stroke="var(--rocm)" stroke-width="1"/>
+  <text x="715" y="70" text-anchor="middle" fill="var(--rocm)" font-size="11">Memory (bf16)</text>
+
+  <text x="790" y="70" text-anchor="middle" fill="var(--muted)" font-size="16">-></text>
+
+  <rect x="810" y="45" width="350" height="45" rx="4" fill="rgba(255,123,114,0.15)" stroke="var(--rocm)" stroke-width="1"/>
+  <text x="985" y="62" text-anchor="middle" fill="var(--rocm)" font-size="10" font-weight="600">OUR CODE: load 16 bf16, bitcast to i16,</text>
+  <text x="985" y="78" text-anchor="middle" fill="var(--rocm)" font-size="10">insertelement into &lt;16 x i16&gt;, bitcast to &lt;8 x i32&gt;</text>
+
+  <text x="985" y="105" text-anchor="middle" fill="var(--rocm)" font-size="11" font-weight="600">A: offset = row * stride + col (row-major)</text>
+  <text x="985" y="120" text-anchor="middle" fill="var(--rocm)" font-size="11" font-weight="600">B: offset = col * stride + row (transposed!)</text>
+
+  <rect x="810" y="135" width="350" height="25" rx="4" fill="rgba(255,123,114,0.15)" stroke="var(--rocm)" stroke-width="1"/>
+  <text x="985" y="152" text-anchor="middle" fill="var(--rocm)" font-size="11">llvm.amdgcn.wmma.f32.16x16x16.bf16.v8f32.v16i16</text>
+
+  <rect x="810" y="170" width="350" height="25" rx="4" fill="rgba(255,123,114,0.15)" stroke="var(--rocm)" stroke-width="1"/>
+  <text x="985" y="187" text-anchor="middle" fill="var(--rocm)" font-size="10" font-weight="600">OUR CODE: extractelement 8xfloat, store to C</text>
+
+  <text x="905" y="215" text-anchor="middle" fill="var(--rocm)" font-size="12" font-weight="600">1 intrinsic (mma only). Load/store is our problem.</text>
+
+  <!-- Why -->
+  <rect x="20" y="250" width="1160" height="90" rx="8" fill="var(--surface)" stroke="var(--border)" stroke-width="1"/>
+  <text x="600" y="275" text-anchor="middle" fill="var(--text)" font-size="13" font-weight="600">Why the difference?</text>
+  <text x="600" y="295" text-anchor="middle" fill="var(--muted)" font-size="12">NVIDIA's LLVM backend has load/store intrinsics that map directly to PTX instructions (ldmatrix/stmatrix).</text>
+  <text x="600" y="315" text-anchor="middle" fill="var(--muted)" font-size="12">AMD's LLVM backend only exposes the MMA instruction itself. The fragment register layout is defined by the hardware ISA but not exposed as load/store intrinsics.</text>
+  <text x="600" y="330" text-anchor="middle" fill="var(--muted)" font-size="11">rocWMMA (AMD's library) handles this in C++ templates per-architecture. We had to reverse-engineer it for LLVM IR.</text>
+
+  <!-- Fragment layout detail -->
+  <rect x="20" y="360" width="570" height="110" rx="8" fill="var(--surface)" stroke="var(--rocm)" stroke-width="1.5"/>
+  <text x="305" y="385" text-anchor="middle" fill="var(--rocm)" font-size="13" font-weight="600">GFX11 Wave32 WMMA Fragment Layout</text>
+  <text x="305" y="405" text-anchor="middle" fill="var(--text)" font-size="11">Each lane holds 16 bf16 values (8 VGPRs, 2 packed per VGPR)</text>
+  <text x="305" y="422" text-anchor="middle" fill="var(--text)" font-size="11">A: lane L loads A[L%16, 0..15] - row L%16, all 16 K columns</text>
+  <text x="305" y="439" text-anchor="middle" fill="var(--text)" font-size="11">B: lane L loads B[0..15, L%16] - all 16 K rows, column L%16</text>
+  <text x="305" y="456" text-anchor="middle" fill="var(--text)" font-size="11">C/D: slot i, lane L -> C[2i + L/16, L%16] (8 f32 per lane)</text>
+
+  <rect x="610" y="360" width="570" height="110" rx="8" fill="var(--surface)" stroke="var(--ptx)" stroke-width="1.5"/>
+  <text x="895" y="385" text-anchor="middle" fill="var(--ptx)" font-size="13" font-weight="600">PTX WMMA Fragment Layout</text>
+  <text x="895" y="405" text-anchor="middle" fill="var(--muted)" font-size="11">Not exposed to the emitter.</text>
+  <text x="895" y="425" text-anchor="middle" fill="var(--muted)" font-size="11">The load intrinsic maps memory to fragments.</text>
+  <text x="895" y="445" text-anchor="middle" fill="var(--muted)" font-size="11">The store intrinsic maps fragments to memory.</text>
+  <text x="895" y="465" text-anchor="middle" fill="var(--muted)" font-size="11">Just pass a pointer and stride.</text>
+</svg>
+<p class="diagram-caption">Figure 2: The key difference between PTX and AMDGPU WMMA codegen. PTX has 3 intrinsics (load/mma/store), AMDGPU has 1 (mma only).</p>
+</div>
+
+<!-- ================================================================ -->
+<h2>5. LLVM IR Emission (Shared Emitter)</h2>
+
+<p>The same <code>emit_llvm_ir(body, target)</code> function handles all backends. Target-specific branches appear at key points:</p>
+
+<div class="diagram">
+<svg viewBox="0 0 1200 320" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, BlinkMacSystemFont, sans-serif">
+  <defs>
+    <marker id="a6" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6z" fill="var(--muted)"/></marker>
+  </defs>
+
+  <!-- Shared emitter -->
+  <rect x="400" y="10" width="400" height="50" rx="8" fill="var(--surface)" stroke="var(--kernel)" stroke-width="2"/>
+  <text x="600" y="30" text-anchor="middle" fill="var(--kernel)" font-size="13" font-weight="600">Emitter (emit.rs)</text>
+  <text x="600" y="48" text-anchor="middle" fill="var(--muted)" font-size="11">Walks Body blocks, emits LLVM IR text</text>
+
+  <!-- Shared ops -->
+  <line x1="600" y1="60" x2="600" y2="90" stroke="var(--kernel)" stroke-width="1.5" marker-end="url(#a6)"/>
+  <rect x="250" y="90" width="700" height="40" rx="6" fill="var(--surface)" stroke="var(--muted)" stroke-width="1"/>
+  <text x="600" y="115" text-anchor="middle" fill="var(--text)" font-size="12">Shared: BinaryOp, UnaryOp, MathUnary, Cast, Bitcast, Len, SubgroupReduce, WorkgroupLocal</text>
+
+  <!-- Target branches -->
+  <line x1="600" y1="130" x2="600" y2="160" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#a6)"/>
+  <rect x="250" y="160" width="700" height="40" rx="6" fill="var(--surface)" stroke="var(--accent)" stroke-width="1"/>
+  <text x="600" y="185" text-anchor="middle" fill="var(--accent)" font-size="12">Target branches: thread_id(), barrier(), wmma_load/mma/store(), allocas, pointer types</text>
+
+  <!-- Three outputs -->
+  <line x1="400" y1="200" x2="200" y2="240" stroke="var(--spirv)" stroke-width="1.5" marker-end="url(#a6)"/>
+  <line x1="600" y1="200" x2="600" y2="240" stroke="var(--ptx)" stroke-width="1.5" marker-end="url(#a6)"/>
+  <line x1="800" y1="200" x2="1000" y2="240" stroke="var(--rocm)" stroke-width="1.5" marker-end="url(#a6)"/>
+
+  <rect x="50" y="240" width="300" height="70" rx="6" fill="var(--surface)" stroke="var(--spirv)" stroke-width="1.5"/>
+  <text x="200" y="260" text-anchor="middle" fill="var(--spirv)" font-size="12" font-weight="600">SPIR-V LLVM IR</text>
+  <text x="200" y="278" text-anchor="middle" fill="var(--muted)" font-size="10">void @main(), spv.resource handles</text>
+  <text x="200" y="295" text-anchor="middle" fill="var(--muted)" font-size="10">i32 usize, logical pointers</text>
+
+  <rect x="450" y="240" width="300" height="70" rx="6" fill="var(--surface)" stroke="var(--ptx)" stroke-width="1.5"/>
+  <text x="600" y="260" text-anchor="middle" fill="var(--ptx)" font-size="12" font-weight="600">PTX LLVM IR</text>
+  <text x="600" y="278" text-anchor="middle" fill="var(--muted)" font-size="10">ptx_kernel void @k(), nvvm intrinsics</text>
+  <text x="600" y="295" text-anchor="middle" fill="var(--muted)" font-size="10">i64 usize, flat pointers</text>
+
+  <rect x="850" y="240" width="300" height="70" rx="6" fill="var(--surface)" stroke="var(--rocm)" stroke-width="1.5"/>
+  <text x="1000" y="260" text-anchor="middle" fill="var(--rocm)" font-size="12" font-weight="600">AMDGPU LLVM IR</text>
+  <text x="1000" y="278" text-anchor="middle" fill="var(--muted)" font-size="10">amdgpu_kernel void @k(), amdgcn intrinsics</text>
+  <text x="1000" y="295" text-anchor="middle" fill="var(--muted)" font-size="10">i64 usize, addrspace(5) private</text>
+</svg>
+<p class="diagram-caption">Figure 3: The shared emitter handles ~80% of IR generation. Target branches handle ~20% (intrinsics, addressing, types).</p>
+</div>
+
+<!-- ================================================================ -->
+<h2>6. Graph Execution Modes</h2>
+
+<div class="cards">
+<div class="card">
+  <h4 style="color:var(--spirv)">Vulkan / wgpu</h4>
+  <ul>
+    <li><strong>G1</strong>: Host round-trip (every value uploaded/downloaded)</li>
+    <li><strong>G4</strong>: Device-resident, cached re-encode (one submit per token)</li>
+    <li>Pipeline cache: in-memory -> disk -> llc compile</li>
+    <li>Bind groups from KernelBuffer slices</li>
+    <li>Grid cap: 65535 per dimension</li>
+  </ul>
+</div>
+<div class="card">
+  <h4 style="color:var(--ptx)">NVIDIA / CUDA</h4>
+  <ul>
+    <li><strong>G3</strong>: Eager per-dispatch (cuLaunchKernel)</li>
+    <li><strong>G3c</strong>: CUDA Graph capture/replay (one cuGraphLaunch per token)</li>
+    <li>Cooperative grid support</li>
+    <li>No grid cap (2^31-1)</li>
+  </ul>
+</div>
+<div class="card">
+  <h4 style="color:var(--rocm)">AMD / HSA</h4>
+  <ul>
+    <li>Per-dispatch AQL packets</li>
+    <li><strong>Batched replay</strong>: capture AQLs, replay with single doorbell per token</li>
+    <li>Strix Halo: 1 workgroup per AQL packet</li>
+    <li>Multi-block: N AQL packets with pointer offsets</li>
+    <li>KD (kernel descriptor) patching at load time</li>
+  </ul>
+</div>
+</div>
+
+<!-- ================================================================ -->
+<h2>7. Compiler Toolchain per Backend</h2>
+
+<table>
+<thead>
+<tr>
+  <th>Step</th>
+  <th style="color:var(--spirv)">Vulkan</th>
+  <th style="color:var(--ptx)">NVIDIA</th>
+  <th style="color:var(--rocm)">AMD</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td>IR -> Binary</td>
+  <td><code>llc</code> (system LLVM 22)</td>
+  <td><code>llc</code> (system LLVM 22)</td>
+  <td><code>amdclang</code> (TheRock LLVM 23)</td>
+</tr>
+<tr>
+  <td>Why clang not llc?</td>
+  <td>llc works fine for SPIR-V</td>
+  <td>llc produces PTX text directly</td>
+  <td>Bare llc misses HSA program headers + device-libs linking</td>
+</tr>
+<tr>
+  <td>Device libs</td>
+  <td>None needed</td>
+  <td>None needed (PTX is virtual)</td>
+  <td>ROCm device-libs (ockl, oclc_*) required</td>
+</tr>
+<tr>
+  <td>Post-processing</td>
+  <td>Barrier SeqCst -> AcquireRelease</td>
+  <td>None (CUDA JIT handles it)</td>
+  <td>KD ENABLE_SGPR patching</td>
+</tr>
+<tr>
+  <td>Runtime loader</td>
+  <td>wgpu (Vulkan driver)</td>
+  <td>CUDA driver (cuModuleLoadData)</td>
+  <td>HSA runtime (hsa_executable_load)</td>
+</tr>
+</tbody>
+</table>
+
+<div class="note">
+  <strong>The ROCm path requires <code>amdclang</code> (not bare <code>llc</code>)</strong> because:
+  bare <code>llc -filetype=obj</code> produces a relocatable without the <code>PT_AMDGPU_HSA_LOAD_GLOBAL_DATA</code> / <code>PT_AMDGPU_HSA_LOAD_KERNEL_ARGUMENT</code> program headers that the HSA runtime needs.
+  Additionally, <code>amdclang</code> auto-links ROCm device-libs (ockl, oclc_isa_version_1151, etc.) which provide implementations for things like <code>__ocml_exp_f32</code>.
+</div>
+
+<!-- ================================================================ -->
+<h2>8. Key Differences Summary</h2>
+
+<div class="cards">
+<div class="card">
+  <h4>What's shared across all backends</h4>
+  <ul>
+    <li>Graph IR (OpKind, Eqn, TensorType)</li>
+    <li>Graph optimization (CSE, fusion, DCE)</li>
+    <li>Kernel IR (Body, BasicBlock, Statement)</li>
+    <li>Planning (plan_eqn_analyzed, imported vs synthesized)</li>
+    <li>~80% of LLVM IR emission</li>
+    <li>Model definitions, checkpoint loading, serving</li>
+  </ul>
+</div>
+<div class="card">
+  <h4>What's per-backend</h4>
+  <ul>
+    <li>Target triple, pointer types, usize width</li>
+    <li>Thread ID, barrier, LDS intrinsics</li>
+    <li>WMMA: PTX has 3 intrinsics, AMD has 1, Vulkan has 0</li>
+    <li>Fragment layout: PTX opaque, AMD manual, Vulkan N/A</li>
+    <li>Compiler tool: llc vs amdclang</li>
+    <li>Post-processing: barrier fix, KD patch, device-libs</li>
+    <li>GPU dispatch API: wgpu / CUDA / HSA</li>
+    <li>Capture/replay mechanism</li>
+  </ul>
+</div>
+</div>
+
+<p style="margin-top:3rem;color:var(--muted);font-size:0.85rem;">Generated from poot codebase. See <a href="graph-architecture.md">graph-architecture.md</a> for the graph IR spec.</p>
+
+</body>
+</html>

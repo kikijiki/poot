@@ -1,0 +1,31 @@
+# The harness (orchestrator + observer) Python package, managed with uv.
+#
+#   cd benchmarks && uv sync          # create .venv with the pinned deps
+#   uv run bench matrix               # or: uv run python harness/bench.py matrix
+#
+# The report/compare paths are pure stdlib; the run path uses pynvml + psutil (falling back to
+# nvidia-smi / /proc if missing).
+[project]
+name = "poot-benchmarks"
+version = "0.1.0"
+license = "MIT"
+authors = [{ name = "Matteo Bernacchia", email = "dev@kikijiki.com" }]
+description = "Cross-framework LLM inference benchmark suite for poot (spec 112)"
+requires-python = ">=3.11"
+dependencies = [
+    "pynvml==11.5.3",   # NVML GPU-memory sampling; falls back to nvidia-smi.
+    "psutil==6.1.0",    # process-tree RSS sampling; falls back to /proc VmRSS.
+]
+
+[project.scripts]
+bench = "harness.bench:main"
+
+[tool.uv]
+package = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["harness"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

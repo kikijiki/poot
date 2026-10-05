@@ -1,0 +1,387 @@
+/* Pipeline diagram */
+
+.pipelineWrap {
+  margin: 2rem 0;
+  font-size: 0.875rem;
+}
+
+.pipelineTitle {
+  text-align: center;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ifm-color-emphasis-600);
+  margin-bottom: 1rem;
+}
+
+.pipeline {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0;
+}
+
+.layerBox {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  width: 340px;
+  padding: 0.55rem 1rem;
+  border-radius: 6px;
+  border: 1.5px solid transparent;
+  text-decoration: none !important;
+  transition: filter 0.15s, transform 0.1s;
+  cursor: pointer;
+}
+
+.layerBox:hover,
+.layerBoxActive {
+  filter: brightness(1.12);
+  transform: scale(1.02);
+}
+
+.layerModel  { background: color-mix(in srgb, var(--ifm-color-primary) 14%, transparent); border-color: color-mix(in srgb, var(--ifm-color-primary) 40%, transparent); }
+.layerIr     { background: color-mix(in srgb, #6c8ebf 14%, transparent);                  border-color: color-mix(in srgb, #6c8ebf 40%, transparent); }
+.layerCompile{ background: color-mix(in srgb, #9b59b6 14%, transparent);                  border-color: color-mix(in srgb, #9b59b6 40%, transparent); }
+.layerRuntime{ background: color-mix(in srgb, #27ae60 14%, transparent);                  border-color: color-mix(in srgb, #27ae60 40%, transparent); }
+
+.layerLabel {
+  font-weight: 600;
+  color: var(--ifm-font-color-base);
+}
+
+.layerSublabel {
+  font-size: 0.75rem;
+  color: var(--ifm-color-emphasis-600);
+  margin-top: 1px;
+}
+
+.arrow {
+  width: 2px;
+  height: 18px;
+  background: var(--ifm-color-emphasis-300);
+  position: relative;
+}
+
+.arrow::after {
+  content: '';
+  position: absolute;
+  bottom: -5px;
+  left: 50%;
+  transform: translateX(-50%);
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-top: 6px solid var(--ifm-color-emphasis-300);
+}
+
+.forkRow {
+  display: flex;
+  gap: 1.5rem;
+}
+
+.forkBranch {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.legend {
+  display: flex;
+  gap: 1.5rem;
+  justify-content: center;
+  margin-top: 1.25rem;
+  font-size: 0.75rem;
+  color: var(--ifm-color-emphasis-700);
+  flex-wrap: wrap;
+}
+
+.legendDot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  margin-right: 4px;
+  vertical-align: middle;
+}
+
+/* Execution timeline */
+
+.timelineWrap {
+  margin: 1.5rem 0;
+  border: 1px solid var(--ifm-color-emphasis-200);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.timelineTabs {
+  display: flex;
+  border-bottom: 1px solid var(--ifm-color-emphasis-200);
+}
+
+.timelineTab {
+  flex: 1;
+  padding: 0.6rem 1rem;
+  border: none;
+  background: transparent;
+  font-size: 0.875rem;
+  cursor: pointer;
+  border-bottom: 2.5px solid transparent;
+  color: var(--ifm-color-emphasis-700);
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.timelineTab:hover {
+  background: var(--ifm-color-emphasis-100);
+}
+
+.timelineTabActive {
+  font-weight: 600;
+}
+
+.timelineBody {
+  padding: 1.25rem 1.5rem;
+  background: var(--ifm-background-surface-color);
+}
+
+.timelineDesc {
+  font-size: 0.875rem;
+  color: var(--ifm-color-emphasis-700);
+  margin-bottom: 1rem;
+}
+
+.timelineRow {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.6rem;
+}
+
+.timelineMetaLabel {
+  width: 180px;
+  font-size: 0.8rem;
+  color: var(--ifm-color-emphasis-600);
+  flex-shrink: 0;
+}
+
+.timelineBar {
+  flex: 1;
+  height: 14px;
+  background: var(--ifm-color-emphasis-200);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.timelineBarFill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
+
+.timelineMetaValue {
+  width: 60px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Op table (graph-ir page) */
+
+.opTableWrap {
+  margin: 1.5rem 0;
+}
+
+.opSearch {
+  width: 100%;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--ifm-color-emphasis-300);
+  border-radius: 6px;
+  font-size: 0.875rem;
+  margin-bottom: 0.75rem;
+  background: var(--ifm-background-color);
+  color: var(--ifm-font-color-base);
+}
+
+.opSearch:focus {
+  outline: none;
+  border-color: var(--ifm-color-primary);
+}
+
+.opTable {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+}
+
+.opTable th {
+  background: var(--ifm-color-emphasis-100);
+  padding: 0.4rem 0.75rem;
+  text-align: left;
+  font-weight: 600;
+  border-bottom: 2px solid var(--ifm-color-emphasis-200);
+}
+
+.opTable td {
+  padding: 0.4rem 0.75rem;
+  border-bottom: 1px solid var(--ifm-color-emphasis-100);
+  vertical-align: top;
+}
+
+.opTable tr:last-child td {
+  border-bottom: none;
+}
+
+.opCategory {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 4px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.catElemwise { background: color-mix(in srgb, var(--ifm-color-primary) 15%, transparent); color: var(--ifm-color-primary-darkest); }
+.catShape    { background: color-mix(in srgb, #6c8ebf 15%, transparent);                  color: #2c5f8a; }
+.catData     { background: color-mix(in srgb, #9b59b6 15%, transparent);                  color: #6c3483; }
+.catReduce   { background: color-mix(in srgb, #e67e22 15%, transparent);                  color: #935116; }
+.catCompute  { background: color-mix(in srgb, #27ae60 15%, transparent);                  color: #1a6e3c; }
+
+/* Backend comparison table */
+
+.backendTable {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+  margin: 1.5rem 0;
+}
+
+.backendTable th {
+  background: var(--ifm-color-emphasis-100);
+  padding: 0.5rem 0.9rem;
+  text-align: left;
+  font-weight: 600;
+  border-bottom: 2px solid var(--ifm-color-emphasis-200);
+}
+
+.backendTable td {
+  padding: 0.4rem 0.9rem;
+  border-bottom: 1px solid var(--ifm-color-emphasis-100);
+}
+
+.backendTable tr:last-child td {
+  border-bottom: none;
+}
+
+/* Status badges live in custom.css (.matrix-status). BackendTable uses .matrix-table. */
+
+/* Fusion before/after toggle */
+
+.fusionToggle {
+  margin: 1.5rem 0;
+}
+
+.fusionToggleHeader {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.fusionBtn {
+  padding: 0.35rem 0.85rem;
+  border: 1.5px solid var(--ifm-color-emphasis-300);
+  border-radius: 5px;
+  background: transparent;
+  font-size: 0.82rem;
+  cursor: pointer;
+  color: var(--ifm-font-color-base);
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.fusionBtnActive {
+  border-color: var(--ifm-color-primary);
+  background: color-mix(in srgb, var(--ifm-color-primary) 10%, transparent);
+  color: var(--ifm-color-primary);
+  font-weight: 600;
+}
+
+/* Glossary */
+
+.glossaryWrap {
+  margin: 1rem 0;
+}
+
+.glossarySearch {
+  width: 100%;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--ifm-color-emphasis-300);
+  border-radius: 6px;
+  font-size: 0.875rem;
+  margin-bottom: 1.25rem;
+  background: var(--ifm-background-color);
+  color: var(--ifm-font-color-base);
+}
+
+.glossarySearch:focus {
+  outline: none;
+  border-color: var(--ifm-color-primary);
+}
+
+.glossaryJumps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin-bottom: 1rem;
+}
+
+.glossaryJump {
+  padding: 2px 7px;
+  border: 1px solid var(--ifm-color-emphasis-200);
+  border-radius: 4px;
+  font-size: 0.78rem;
+  cursor: pointer;
+  background: transparent;
+  color: var(--ifm-color-emphasis-700);
+  transition: background 0.12s;
+}
+
+.glossaryJump:hover {
+  background: var(--ifm-color-emphasis-100);
+}
+
+.glossaryJumpDisabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+.glossaryGroup {
+  margin-bottom: 1.5rem;
+}
+
+.glossaryGroupLetter {
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--ifm-color-primary);
+  border-bottom: 1px solid var(--ifm-color-emphasis-200);
+  padding-bottom: 0.2rem;
+  margin-bottom: 0.6rem;
+}
+
+.glossaryEntry {
+  padding: 0.4rem 0;
+}
+
+.glossaryTerm {
+  font-weight: 700;
+  margin-right: 0.5rem;
+}
+
+.glossaryDef {
+  color: var(--ifm-color-emphasis-800);
+  font-size: 0.875rem;
+}
+
+.glossaryLink {
+  font-size: 0.78rem;
+  margin-left: 0.4rem;
+}

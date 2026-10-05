@@ -1,0 +1,21 @@
+[package]
+name = "poot-ptx-check"
+description = "Standalone PTX execution check: load poot-emitted .ptx via cudarc and verify on NVIDIA"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+poot-ptx-runtime.workspace = true
+poot-runtime-common.workspace = true
+poot-target.workspace = true
+
+[[bin]]
+name = "poot-ptx-check"
+path = "src/main.rs"
+
+[lints]
+workspace = true

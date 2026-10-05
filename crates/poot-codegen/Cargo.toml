@@ -1,0 +1,23 @@
+[package]
+name = "poot-codegen"
+description = "poot kernel codegen: poot-kernel-ir Body -> LLVM IR -> llc -> SPIR-V / PTX"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+poot-kernel-ir.workspace = true
+poot-runtime-common.workspace = true
+poot-target.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+poot-kernelgen.workspace = true
+poot-test-util = { workspace = true, features = ["kernel-fixtures"] }
+
+[lints]
+workspace = true

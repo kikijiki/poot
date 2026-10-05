@@ -1,0 +1,29 @@
+[package]
+name = "poot-kernel-attr"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "The #[kernel] attribute: renames a kernel fn into poot's reserved namespace so it survives to MIR for pootc to import (invariant 8)."
+
+[lib]
+proc-macro = true
+
+[features]
+# Card 537 (ADR-0104 decision 5, SC-002): selects the macro's device pass at BUILD time (a separate
+# proc-macro artifact `pootc` extern-links for kernel extraction), replacing the `POOT_KERNEL_BUILD`
+# env-var read the macro used to do at EXPANSION time. Default (this feature off) is the host pass: a
+# normal `cargo build` of a crate that uses `#[kernel]` always gets the typed dispatch wrapper.
+device-pass = []
+
+[dependencies]
+syn.workspace = true
+quote.workspace = true
+proc-macro2.workspace = true
+# Used at macro-expansion time for the single source of truth on the mangling convention.
+poot-kernel-ir.workspace = true
+
+[lints]
+workspace = true

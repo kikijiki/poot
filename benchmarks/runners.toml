@@ -1,0 +1,67 @@
+# Runner registry: how the harness invokes each framework's runner.
+#
+# Each runner is a separate process that takes the standard flags and prints its timing result as the last
+# JSON object on stdout (the harness wraps it with the external memory observer). The argv uses
+# {placeholders} substituted per cell:
+#   {bin}         resolved from the entry's bin_env environment variable, else the `bin` default
+#   {model_dir}   absolute checkpoint dir for this cell
+#   {prompt_file} absolute path to the scenario prompt
+#   {gen_tokens}  tokens to generate (scenario)
+#   {warmup}      warmup iterations (suite)
+#   {iters}       timed iterations (suite)
+#   {precision}   precision string for this framework+model (manifest)
+#   {image}       absolute image path (multimodal cells; empty otherwise)
+#   {bench_root}  the benchmarks/ directory
+#
+# Override a binary path by exporting its bin_env (e.g. POOT_BENCH_POOT_BIN=/abs/path/to/model-bench).
+# Set `needs_gpu=false` only for engines that can run on CPU.
+
+[poot]
+# Built from benchmarks/runners/poot/ with `cargo build --release` (kernels are generated at runtime by
+# kernelgen). See setup/poot.sh. Backend is selected via POOT_BENCH_BACKEND (ptx|rocm|wgpu, default ptx).
+bin_env = "POOT_BENCH_POOT_BIN"
+bin = "poot-bench-runner"
+# --prefill selects the batched Q=N eager-prefill path (generate_kv_ptx_prefilled and its rocm/wgpu
+# equivalents) instead of token-by-token prefill (generate_kv_ptx_sampled), as `--mode decode-curve` does.
+# Without it, `--mode single` TTFT scales as per-token decode rate x prompt length.
+cmd = ["{bin}", "--model-dir", "{model_dir}", "--prompt-file", "{prompt_file}",
+       "--gen-tokens", "{gen_tokens}", "--warmup", "{warmup}", "--iters", "{iters}",
+       "--precision", "{precision}", "--backend", "{backend}", "--prefill", "--json"]
+needs_gpu = true
+
+[candle]
+# Built from runners/candle/ (cargo build --release --features cuda). See setup/.
+bin_env = "POOT_BENCH_CANDLE_BIN"
+bin = "bench-candle-runner"
+cmd = ["{bin}", "--model-dir", "{model_dir}", "--prompt-file", "{prompt_file}",
+       "--gen-tokens", "{gen_tokens}", "--warmup", "{warmup}", "--iters", "{iters}",
+       "--precision", "{precision}", "--json"]
+needs_gpu = true
+
+[transformers]
+# Separate per-engine python envs let one `bench run` route vLLM and transformers to their own venvs
+# (vLLM pins its own torch/transformers) and collect all engines into one snapshot.
+bin_env = "POOT_BENCH_TORCH_PYTHON"
+bin = "python"
+cmd = ["{bin}", "{bench_root}/runners/torch/run.py", "--model-dir", "{model_dir}",
+       "--prompt-file", "{prompt_file}", "--gen-tokens", "{gen_tokens}", "--warmup", "{warmup}",
+       "--iters", "{iters}", "--precision", "{precision}", "--image", "{image}"]
+needs_gpu = true
+
+[vllm]
+bin_env = "POOT_BENCH_VLLM_PYTHON"
+bin = "python"
+cmd = ["{bin}", "{bench_root}/runners/vllm/run.py", "--model-dir", "{model_dir}",
+       "--prompt-file", "{prompt_file}", "--gen-tokens", "{gen_tokens}", "--warmup", "{warmup}",
+       "--iters", "{iters}", "--precision", "{precision}", "--image", "{image}"]
+needs_gpu = true
+
+[llamacpp]
+# Python wrapper that drives the built llama-bench / llama-cli binaries (paths via env, see the runner).
+# Pure stdlib, so any python works.
+bin_env = "POOT_BENCH_LLAMACPP_PYTHON"
+bin = "python"
+cmd = ["{bin}", "{bench_root}/runners/llamacpp/run.py", "--gguf", "{model_dir}",
+       "--prompt-file", "{prompt_file}", "--gen-tokens", "{gen_tokens}", "--iters", "{iters}",
+       "--precision", "{precision}"]
+needs_gpu = true
