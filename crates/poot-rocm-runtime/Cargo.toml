@@ -1,0 +1,32 @@
+[package]
+name = "poot-rocm-runtime"
+description = "poot ROCm/HSA runtime: device-resident dispatch of poot-emitted AMDGPU kernels via raw HSA Foundation runtime (libhsa-runtime64.so.1) on the Strix Halo iGPU"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+object.workspace = true
+poot-runtime-common.workspace = true
+poot-target.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# For the agent-list example to surface tracing::info! lines from RocmContext::new.
+tracing-subscriber.workspace = true
+# SC-002/SC-003 (card 608): compiles real AMDGCN fixture kernels to exercise
+# the schema check and entry-point selection on the production dispatch path, not a hand-rolled artifact.
+poot-codegen.workspace = true
+poot-kernel-ir.workspace = true
+poot-test-util = { workspace = true, features = ["kernel-fixtures"] }
+
+[[example]]
+name = "agent-list"
+path = "examples/agent-list.rs"
+
+[lints]
+workspace = true

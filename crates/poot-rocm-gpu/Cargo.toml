@@ -1,0 +1,41 @@
+[package]
+name = "poot-rocm-gpu"
+description = "poot ROCm/HSA graph executor: the AMD/HSA twin of poot-ptx-gpu. Runs a poot-graph-ir Graph device-resident on the Strix Halo iGPU (Radeon 8060S, gfx1151) via raw HSA."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+poot-codegen.workspace = true
+poot-executor.workspace = true
+poot-graph-plan.workspace = true
+poot-target.workspace = true
+# `RocmDevice::copy`'s one generated copy kernel is the committed `assets/copy_words.kir.json`
+# fixture (Card 548), loaded at construction through `ImportedKernel::CopyWords` (card
+# 559) - never a parser or DSL, the fixture itself is a real `#[kernel]` fn compiled through `pootc`
+# (`just regen-kernel-assets`).
+poot-kernel-ir = { workspace = true, features = ["serde"] }
+poot-rocm-runtime.workspace = true
+poot-runtime-common.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+poot-eval.workspace = true
+poot-executor-parity.workspace = true
+poot-gpu.workspace = true
+poot-graph-ir.workspace = true
+poot-graph-plan.workspace = true
+poot-kernelgen.workspace = true
+poot-load.workspace = true
+poot-models.workspace = true
+poot-quant.workspace = true
+poot-tensor.workspace = true
+poot-test-util = { workspace = true, features = ["graph-fixtures", "kernel-fixtures"] }
+serde_json.workspace = true
+object = { workspace = true, features = ["write"] }
+
+[lints]
+workspace = true

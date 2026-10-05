@@ -1,0 +1,114 @@
+# Required cases for `just test-device-rocm` (card 670), one per line:
+# binary_id<TAB>test_name, the identity the lane's JUnit report carries as classname and name.
+# Hand-maintained: never generated from the justfile's selection. The gate
+# (scripts/check-required-cases.py rocm) fails the lane unless every case here ran and passed -
+# a skip is never a pass. Sorted in canonical (LC_ALL=C) order.
+#
+# The migrated card-548 cases this lane exists to prove: every executor_contract acceptance row
+# (SC-001 through SC-012), the packed-serving suite, and the SC-002/SC-003 parity suite. The old resident probes (tests::resident::probe_*) went with resident.rs; this card's
+# executor_contract tests cover the same ground (device-time, memory accounting, state commit,
+# timeout/poison lifecycle, the SC-009 narrow-storage copy and I32-index capabilities) on the
+# contract instead of the deleted eager/capture-replay executor.
+#
+# Card 607: the device coverage of the deleted ROCm probes, rebuilt over the executor contract in
+# executor_coverage (ArgTopK partial workgroups, tied MoE routing, packed linears and the W12 chain,
+# per-head ALiBi flash attention, captured replay of the toy graphs, the tiled region remainder, WMMA
+# bf16, a grid past 255 workgroups, chunked GDN prefill). The Qwen2.5-0.5B real-weight row is #[ignore]d
+# (it loads a checkpoint: run by exact name) and so is not a required case.
+# The deleted elementwise, reduce, matmul and attention-step probes are the whole cross_backend binary (the
+# lane selects every row of it now, not a subset).
+poot-llm	driver::device_tests::a_guided_row_takes_the_whole_step_to_the_logits_entry_rocm
+poot-llm	driver::device_tests::a_refused_shape_is_typed_before_any_dispatch_rocm
+poot-llm	driver::device_tests::an_unsupported_request_is_the_same_variant_for_two_families_rocm
+poot-llm	driver::device_tests::capacity_does_not_change_the_tokens_rocm
+poot-llm	driver::device_tests::chunked_prefill_equals_token_by_token_rocm
+poot-llm	driver::device_tests::commit_keeps_fewer_than_returned_rocm
+poot-llm	driver::device_tests::fixture_tokens_equal_the_recorded_literals_rocm
+poot-llm	driver::device_tests::greedy_ties_take_the_first_index_rocm
+poot-llm	driver::device_tests::guided_requests_sample_inside_the_mask_rocm
+poot-llm	driver::device_tests::mixed_step_bloom_rocm
+poot-llm	driver::device_tests::mixed_step_qwen2_rocm
+poot-llm	driver::device_tests::packed_checkpoints_load_as_stored_through_the_registry_rocm
+poot-llm	driver::device_tests::packed_q5_0_gguf_generates_like_its_dense_twin_rocm
+poot-llm	driver::device_tests::packed_q8_0_gguf_generates_like_its_dense_twin_rocm
+poot-llm	driver::device_tests::prefix_reuse_hits_and_matches_the_unshared_run_rocm
+poot-llm	driver::device_tests::recorded_bloom_tokens_rocm
+poot-llm	driver::device_tests::recorded_gemma3_tokens_rocm
+poot-llm	driver::device_tests::recorded_granite_tokens_rocm
+poot-llm	driver::device_tests::recorded_llama_tokens_rocm
+poot-llm	driver::device_tests::recorded_mpt_tokens_rocm
+poot-llm	driver::device_tests::recorded_olmo2_tokens_rocm
+poot-llm	driver::device_tests::recorded_phi3_tokens_rocm
+poot-llm	driver::device_tests::recorded_qwen2_tokens_rocm
+poot-llm	driver::device_tests::recorded_qwen3_tokens_rocm
+poot-llm	driver::device_tests::recorded_smollm3_tokens_rocm
+poot-llm	driver::device_tests::sampled_differs_from_greedy_rocm
+poot-rocm-gpu::buffer_plan	a_short_value_reusing_a_larger_slot_matches_the_oracle_on_rocm
+poot-rocm-gpu::buffer_plan	len_probe_reads_the_operand_own_length_never_a_larger_slots_capacity_on_rocm
+poot-rocm-gpu::cross_backend	broadcast_binary_rocm_matches_cpu
+poot-rocm-gpu::cross_backend	decomposed_prefill_attention_over_65535_query_groups_rocm_matches_cpu
+poot-rocm-gpu::cross_backend	dynamic_update_slice_rocm_matches_cpu
+poot-rocm-gpu::cross_backend	elementwise_add_rocm_matches_cpu
+poot-rocm-gpu::cross_backend	elementwise_mul_rocm_matches_cpu
+poot-rocm-gpu::cross_backend	elementwise_neg_rocm_matches_cpu
+poot-rocm-gpu::cross_backend	elementwise_sub_div_rocm_matches_cpu
+poot-rocm-gpu::cross_backend	gather_axis0_rocm_matches_cpu
+poot-rocm-gpu::cross_backend	layernorm_rocm_matches_cpu
+poot-rocm-gpu::cross_backend	masked_attention_rocm_matches_cpu
+poot-rocm-gpu::cross_backend	matmul_bias_rocm_matches_cpu
+poot-rocm-gpu::cross_backend	matmul_rocm_matches_cpu
+poot-rocm-gpu::cross_backend	non_power_of_2_rocm_matches_cpu
+poot-rocm-gpu::cross_backend	random_uniform_rocm_matches_cpu
+poot-rocm-gpu::cross_backend	reduce_max_last_axis_rocm_matches_cpu
+poot-rocm-gpu::cross_backend	reduce_max_nonpow2_wide_real_magnitude_rocm_matches_cpu
+poot-rocm-gpu::cross_backend	reduce_sum_nonpow2_wide_real_magnitude_rocm_matches_cpu
+poot-rocm-gpu::cross_backend	reduce_sum_rocm_matches_cpu
+poot-rocm-gpu::cross_backend	rmsnorm_rocm_matches_cpu
+poot-rocm-gpu::cross_backend	sample_token_greedy_rocm_matches_cpu
+poot-rocm-gpu::cross_backend	sample_token_gumbel_rocm_matches_cpu
+poot-rocm-gpu::cross_backend	sample_token_gumbel_topk_rocm_matches_cpu
+poot-rocm-gpu::cross_backend	sample_token_gumbel_topk_topp_rocm_matches_cpu
+poot-rocm-gpu::cross_backend	sample_token_gumbel_topp_only_excludes_untruncated_winner_rocm_matches_cpu
+poot-rocm-gpu::cross_backend	single_element_rocm_matches_cpu
+poot-rocm-gpu::cross_backend	transpose_slice_rocm_matches_cpu
+poot-rocm-gpu::cross_backend	unary_erf_rocm_matches_cpu
+poot-rocm-gpu::cross_backend	unary_exp_rocm_matches_cpu
+poot-rocm-gpu::cross_backend	unary_log_rocm_matches_cpu
+poot-rocm-gpu::cross_backend	unary_sqrt_rocm_matches_cpu
+poot-rocm-gpu::cross_backend	unary_tanh_rocm_matches_cpu
+poot-rocm-gpu::executor_contract	a_timed_out_dispatch_through_the_device_trait_retains_its_allocations_and_poisons
+poot-rocm-gpu::executor_contract	an_ordinary_unload_with_completion_proven_releases_its_allocations
+poot-rocm-gpu::executor_contract	copy_round_trips_every_narrow_element_width_with_no_sentinel_corruption
+poot-rocm-gpu::executor_contract	i32_slot_gather_variants_compiled_match_cpu_oracle_on_rocm
+poot-rocm-gpu::executor_contract	memory_counters_charge_the_roles_a_decode_entry_actually_allocates
+poot-rocm-gpu::executor_contract	qwen2_decode_on_the_contract_matches_the_oracle_and_records_once
+poot-rocm-gpu::executor_contract	rocm_device_time_is_always_unknown
+poot-rocm-gpu::executor_contract	sliding_window_mask_from_pos_rocm_matches_cpu
+poot-rocm-gpu::executor_contract	two_phase_state_commit_matches_the_oracle_after_four_steps_on_rocm
+poot-rocm-gpu::executor_contract	wait_timeout_is_typed_construction_state_not_an_env_read
+poot-rocm-gpu::executor_coverage	a_one_dispatch_grid_past_255_workgroups_matches_the_oracle_on_rocm
+poot-rocm-gpu::executor_coverage	arg_top_k_over_a_partial_last_workgroup_matches_the_oracle_on_rocm
+poot-rocm-gpu::executor_coverage	captured_replay_of_the_toy_graphs_equals_the_recording_step_on_rocm
+poot-rocm-gpu::executor_coverage	chunked_gdn_prefill_matches_the_sequential_recurrence_on_rocm
+poot-rocm-gpu::executor_coverage	decode_over_multi_head_and_multi_query_layouts_matches_the_oracle_on_rocm
+poot-rocm-gpu::executor_coverage	flash_attention_with_a_per_head_alibi_mask_matches_the_oracle_on_rocm
+poot-rocm-gpu::executor_coverage	packed_linears_and_the_canonical_expert_chain_match_the_oracle_on_rocm
+poot-rocm-gpu::executor_coverage	tied_moe_routing_picks_the_lowest_index_first_on_rocm
+poot-rocm-gpu::executor_coverage	tiled_region_with_a_remainder_tile_matches_the_oracle_on_rocm
+poot-rocm-gpu::executor_coverage	wmma_bf16_matmuls_match_the_oracle_on_rocm
+poot-rocm-gpu::packed_serving	a_swapped_packed_role_is_refused_before_upload
+poot-rocm-gpu::packed_serving	canonical_packed_moe_chain_runs_bit_exact
+poot-rocm-gpu::packed_serving	packed_decode_through_the_contract_is_bit_exact
+poot-rocm-gpu::packed_serving	packed_e4m3_per_channel_decode_through_the_contract_is_bit_exact
+poot-rocm-gpu::packed_serving	packed_embedding_row_gather_is_bit_exact
+poot-rocm-gpu::packed_serving	packed_prefill_through_the_contract_is_bit_exact
+poot-rocm-gpu::parity	alibi_slopes_attention_matches_the_oracle_and_the_reference_on_rocm
+poot-rocm-gpu::parity	bf16_const_cast_is_bit_exact_on_rocm
+poot-rocm-gpu::parity	checkpoint_orientation_projection_matches_the_oracle_on_rocm
+poot-rocm-gpu::parity	dense_gemv::the_dense_gemv_meets_tier_2_in_every_lane_and_launch_on_rocm
+poot-rocm-gpu::parity	f16_checkpoint_orientation_projection_matches_the_oracle_on_rocm
+poot-rocm-gpu::parity	parity_table_matches_the_oracle_on_rocm
+poot-rocm-gpu::weight_map_binding	a_split_head_generates_the_unsplit_logits_and_tokens
+poot-rocm-gpu::weight_map_binding	fused_and_stacked_views_equal_separate_storage
+poot-rocm-gpu::weight_map_binding	qwen2_binds_through_the_map_and_matches_the_oracle
+poot-rocm-runtime	context::caps_tests::a_live_agent_reports_the_workgroup_ceiling_the_caps_document

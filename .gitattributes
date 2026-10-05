@@ -1,0 +1,1 @@
+crates/poot-llm/src/architectures/minimax_m2/tests/fixtures/minimax_m25_chat_template.jinja whitespace=-trailing-space

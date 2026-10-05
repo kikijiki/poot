@@ -1,0 +1,114 @@
+{
+  "card": 31,
+  "source_git_sha": "d28d5fbe2068c9d0db5fd94f757196cf16f9d88f",
+  "container_image": "ghcr.io/kikijiki/poot-bench@sha256:ac10161ce1445e276412d2390faed4dc96b634400b4e6f9ebc8c478cefab730d",
+  "orchestrator_run_id": "run-1789072272",
+  "pod": {
+    "id": "mgxfmh47byzsem",
+    "name": "poot-bench-run-1789072272-a1",
+    "cloud": "SECURE",
+    "selector_order": [
+      "NVIDIA GeForce RTX 3090",
+      "NVIDIA RTX A5000",
+      "NVIDIA A40"
+    ],
+    "provision_attempt": 1,
+    "device": "NVIDIA GeForce RTX 3090",
+    "gpu_uuid": "GPU-59b85b79-7ec0-20c5-6681-b33db0e5a0d9",
+    "driver_version": "580.159.03",
+    "cuda_version": "13.0 (nvidia-smi driver API; nvcc absent)",
+    "memory_total_mib": 24576,
+    "container_disk_gb": 40,
+    "network_volume": null,
+    "created_at_utc": "2026-09-10T20:31:13.588Z",
+    "ssh_ready_at_utc": "2026-09-10T20:37:13Z",
+    "terminated_at_utc": "2026-09-10T20:48:26Z"
+  },
+  "checkpoint": {
+    "repository": "Qwen/Qwen2.5-0.5B-Instruct",
+    "download_selector": "public main",
+    "preflight_api_endpoint": "https://huggingface.co/api/models/Qwen/Qwen2.5-0.5B-Instruct/revision/main",
+    "preflight_api_http": 200,
+    "preflight_main_revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+    "upstream_last_modified_utc": "2024-09-25T12:32:56.000Z",
+    "download_metadata_revision": "7ae557604adf67be50417f59c2c2f167def9a775"
+  },
+  "sweep": {
+    "model": "qwen2.5-0.5b",
+    "scenario": "decode-curve",
+    "frameworks": [
+      "poot",
+      "candle",
+      "transformers",
+      "vllm",
+      "llamacpp"
+    ],
+    "isl": [128, 512, 2048, 8192],
+    "osl": 128,
+    "warmup_iters": 2,
+    "timed_iters": 5,
+    "cell_timeout_s": 10800,
+    "sweep_timeout_s": 14400,
+    "external_term_cap_s": 18000,
+    "cost_term_cap_s": 3600,
+    "provision_attempts_max": 3,
+    "provision_timeout_s": 600,
+    "ssh_timeout_s": 300
+  },
+  "injected_files_sha256": {
+    "manifest.toml": "bd71e8438cef2284dda1d82a648a8cb4349d4ba04de9ebcd1dddb0b40d48a154",
+    "runners.toml": "7cf58bb2481d93d0e1abe84fbb82a27a2e889c90dfc507b5664ad90b827f1970",
+    "harness/result_contract.py": "40c24f854843f79ab915885dfce98ddda609ed27d797989d5333eac5e074bf84",
+    "schema/result.schema.json": "81092ccd7ffe3597a93dcbb1545e859804211af72a1f3c45f488c652e4cbc203"
+  },
+  "runner_sha256": {
+    "local_before_patchelf": "90a30f8f5d31c968896149ad84ca79898a47314a9794d0c4394abb1db50139b6",
+    "pod_after_patchelf": "9fd7dbe591623c3da2aaf17c4b3e7de1f6308cc1bbf8122cfe565961ae630ba0"
+  },
+  "cost": {
+    "api_cost_per_hour_usd": 0.5,
+    "creation_to_termination_seconds": 1032.412,
+    "compute_upper_bound_usd": 0.143391,
+    "container_disk_upper_bound_usd": 0.001593,
+    "total_upper_bound_usd": 0.144984,
+    "billing_history_amount_usd": null,
+    "billing_history_note": "The authenticated billing endpoint had not populated this pod immediately after teardown and remained empty at finalization. Upper bounds charge the full creation-to-termination interval; RunPod does not charge unavailable-host time."
+  },
+  "teardown": {
+    "pod_get_http": 404,
+    "account_list_http": 200,
+    "account_pod_count": 0,
+    "shared_db_nonterminal_runs": 0,
+    "shared_db_nonterminated_pods": 0,
+    "local_runner_count": 0
+  },
+  "orchestrator_args": [
+    "run",
+    "--git-ref",
+    "d28d5fbe2068c9d0db5fd94f757196cf16f9d88f",
+    "--models",
+    "qwen2.5-0.5b",
+    "--scenario",
+    "decode-curve",
+    "--gpu-types",
+    "NVIDIA GeForce RTX 3090,NVIDIA RTX A5000,NVIDIA A40",
+    "--cloud",
+    "SECURE",
+    "--image",
+    "ghcr.io/kikijiki/poot-bench@sha256:ac10161ce1445e276412d2390faed4dc96b634400b4e6f9ebc8c478cefab730d",
+    "--min-cuda-version",
+    "12.6",
+    "--container-disk-gb",
+    "40",
+    "--provision-attempts",
+    "3",
+    "--provision-timeout-s",
+    "600",
+    "--ssh-timeout-s",
+    "300",
+    "--sweep-timeout-s",
+    "14400",
+    "--poot-bin",
+    "/tmp/poot-card031-five-cell-r1.ktocQK/poot-target/release/poot-bench-runner"
+  ]
+}

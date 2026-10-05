@@ -1,0 +1,8 @@
+# Pinned nightly for poot. The codegen backend links rustc internals via `rustc_private` (nightly-only), so
+# the toolchain is pinned exactly and bumped deliberately. `rustc-dev` ships the compiler libs linked;
+# `llvm-tools` provides LLVM libs at link time; `rust-src` is needed for rustc_private resolution and
+# rust-analyzer. 2026-04-03 is a known-good `rustc-dev` nightly (per the cuda-oxide reference flake).
+[toolchain]
+channel    = "nightly-2026-04-03"
+components = ["rustc-dev", "rust-src", "llvm-tools", "rust-analyzer", "clippy", "rustfmt"]
+profile    = "minimal"

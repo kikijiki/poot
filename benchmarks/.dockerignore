@@ -1,0 +1,13 @@
+# Build context = this benchmarks/ dir (see docker/Dockerfile). Must live at the context root, not next to
+# the Dockerfile, to be honored.
+results/
+.orchestrator/
+**/target/
+**/__pycache__/
+**/.venv/
+**/.pytest_cache/
+*.log
+docker/
+flake.nix
+flake.lock
+justfile

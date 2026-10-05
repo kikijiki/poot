@@ -1,0 +1,143 @@
+---
+id: serving-design
+title: Serving design
+sidebar_position: 10
+---
+
+import ContinuousBatchingDiagram from "@site/src/components/architecture/ContinuousBatchingDiagram";
+
+# Serving design
+
+`poot-serve` is an OpenAI-compatible HTTP server. **It serves no generation.** It starts, parses
+and bounds requests, serves encoder embeddings and reranking, and returns a typed `503` for
+`/v1/completions` and `/v1/chat/completions`. It refuses a dense decoder at startup until it serves
+through the driver, and registers no LoRA adapter. Operator guides live under
+[Serving](../serve/index.md).
+
+## API
+
+| Endpoint                    | Description                                       |
+| --------------------------- | ------------------------------------------------- |
+| `POST /v1/chat/completions` | Chat completion, streaming (SSE) or buffered JSON |
+| `POST /v1/completions`      | Raw text completion                               |
+| `POST /v1/embeddings`       | Embedding vectors (BERT-class models)             |
+| `POST /v1/rerank`           | Reranking scores (BERT-class models)              |
+| `GET /v1/models`            | List the served model(s)                          |
+| `GET /v1/models/{id}`       | Describe one served model                         |
+| `/v1/lora_adapters`         | LoRA administration (registers nothing yet)       |
+| `GET /metrics`              | Server metrics as JSON                            |
+| `GET /metrics/prometheus`   | Server metrics in Prometheus exposition format    |
+| `GET /health`               | Liveness probe                                    |
+
+## The design the scheduling loop builds on
+
+**Continuous batching** [^orca] [^vllm]. In-flight requests share one batch per token; when one
+finishes, a waiting request takes its slot before the next step, so the batch never drains.
+
+<ContinuousBatchingDiagram />
+
+Because the graph has static shapes, the batched decode graph is sized to a fixed slot count with a
+fixed per-slot KV capacity and runs at that width every step, with empty slots masked out. Each
+request draws paged KV blocks from a shared pool as it grows; the host flattens its block table into
+the `Slot::SlotMap` input. The scheduling pieces (slot admission, KV-fit budgeting, preemption, token
+commit and terminal delivery) exist with their unit tests; the running server does not call them.
+
+**Streaming.** Tokens are emitted as SSE events through a bounded channel, so a slow client applies
+back-pressure.
+
+**Sampling.** Greedy, temperature, top-k and top-p [^topp]. Generation picks the next token
+on-device for greedy and plain-temperature requests (a sampling step appended to the decode graph
+itself, reading back only the chosen token and a non-finite flag); a logit-bias/penalty, logprob
+recording, or a guided-decoding constraint still reads the full logits back and picks on the host.
+
+**Guided decoding.** Regex, JSON schema (`guided_json`, `response_format`), GBNF grammar, choice lists
+and forced tool calls are parsed and validated. They constrain sampling with a CPU automaton that masks
+disallowed tokens, which requires the host-readback sampling path.
+
+**Speculative decoding** is not available yet (poot is being refactored; planned to return).
+
+## Weights, adapters and multiple GPUs
+
+**Quantized checkpoints.** The library loads a single GGUF file or a safetensors directory. Packed
+projections stay packed at load time. Dense packed contractions and embedding gathers decode as they
+consume the weight. Packed MoE paths still materialize expert tables before indexed matmul.
+
+| Format                                  | Packed on GPU                                                         |
+| --------------------------------------- | --------------------------------------------------------------------- |
+| GGUF K-quants and legacy quants [^gguf] | Yes, by default                                                       |
+| MXFP4 (gpt-oss routed experts)          | Packed at load; expert tables materialized during execution           |
+| GPTQ [^gptq], AWQ [^awq]                | Packed 4-bit projections by default                                   |
+| FP8 (`compressed-tensors`)              | Packed E4M3 per-channel projections on the supported Qwen loader path |
+
+Mixed K-quant files such as `Q4_K_M` widen some layers, as the ggml quantizer writes them. KV-cache
+quantization is not available yet. Operator detail: [Using quantized checkpoints](../serve/quantized-checkpoints.md).
+
+**LoRA adapters** [^lora] use the PEFT [^peft] layout. They are not available yet (poot is being refactored; planned to return). When they return, adapters apply to the seven attention
+and MLP projections of dense qwen2/llama-shaped models. See [Using LoRA adapters](../serve/lora-adapters.md).
+
+**Tensor parallelism** is not available yet (poot is being refactored; planned to return). A
+captured multi-device executor exists in `poot-ptx-gpu` as a building block. See
+[Tensor parallelism](../serve/tensor-parallelism.md).
+
+## Metrics
+
+Every value is produced by poot itself, never read from sysfs or a vendor CLI. The server runs no
+generation engine, so the generation counters stay at zero and the batching and KV-pool gauges have
+no data.
+
+| Metric                                 | Type      | Description                                                              |
+| -------------------------------------- | --------- | ------------------------------------------------------------------------ |
+| `poot_ttft_ms`                         | Histogram | Time to first token (streaming requests)                                 |
+| `poot_itl_ms`                          | Histogram | Inter-token latency                                                      |
+| `poot_request_e2e_ms`                  | Histogram | End-to-end request latency                                               |
+| `poot_queue_wait_ms`                   | Histogram | Time a request waited for a free decode slot                             |
+| `poot_requests_total`                  | Counter   | Generation requests served                                               |
+| `poot_requests_completed_total`        | Counter   | Requests that finished normally                                          |
+| `poot_requests_cancelled_total`        | Counter   | Requests evicted on client disconnect                                    |
+| `poot_requests_errored_total`          | Counter   | Requests that ended in an engine error                                   |
+| `poot_prompt_tokens_total`             | Counter   | Prompt (prefill) tokens processed                                        |
+| `poot_completion_tokens_total`         | Counter   | Completion (decode) tokens generated                                     |
+| `poot_inflight_requests`               | Gauge     | Requests currently being processed                                       |
+| `poot_queue_depth`                     | Gauge     | Requests waiting for a free decode slot                                  |
+| `poot_batch_size`                      | Gauge     | Active batched-decode slots in the last engine step                      |
+| `poot_slot_capacity`                   | Gauge     | Batched-decode slot capacity                                             |
+| `poot_kv_cache_usage_ratio`            | Gauge     | Paged KV-cache block utilization (0..1)                                  |
+| `poot_kv_cache_blocks_used`            | Gauge     | Paged KV-cache blocks in use                                             |
+| `poot_kv_cache_blocks_total`           | Gauge     | Paged KV-cache blocks in the shared pool                                 |
+| `poot_prefix_cache_hit_rate`           | Gauge     | Cumulative prefix-cache hit rate (0..1)                                  |
+| `poot_prefix_cache_hit_tokens_total`   | Counter   | Prompt tokens served from a cached prefix                                |
+| `poot_prefix_cache_query_tokens_total` | Counter   | Prompt tokens looked up against the prefix cache                         |
+| `poot_gpu_active_ratio`                | Gauge     | GPU-active fraction (GPU-step / total decode-step wall time, 0..1)       |
+| `poot_gpu_weight_bytes`                | Gauge     | Model weight bytes resident in GPU memory                                |
+| `poot_gpu_kv_cache_bytes`              | Gauge     | KV-pool bytes resident in GPU memory                                     |
+| `poot_gpu_resident_bytes`              | Gauge     | Resident GPU memory the engine tracks (weights + KV pool)                |
+| `poot_gpu_vram_used_bytes`             | Gauge     | Device-wide VRAM in use, via the Vulkan runtime (`VK_EXT_memory_budget`) |
+| `poot_gpu_vram_total_bytes`            | Gauge     | Total device-local VRAM budget, via the Vulkan runtime                   |
+| `poot_decode_dispatch_count`           | Gauge     | Per-token GPU dispatch count of the optimized decode graph               |
+| `poot_decode_activation_peak_bytes`    | Gauge     | Peak transient activation bytes of the decode graph                      |
+| `poot_prefill_dispatch_count`          | Gauge     | GPU dispatch count of the optimized prefill (TTFT) graph                 |
+| `poot_prefill_activation_peak_bytes`   | Gauge     | Peak transient activation bytes of the prefill graph                     |
+| `poot_cpu_percent`                     | Gauge     | System CPU utilization since the last scrape                             |
+| `poot_mem_used_megabytes`              | Gauge     | Used system memory                                                       |
+| `poot_mem_total_megabytes`             | Gauge     | Total system memory                                                      |
+| `poot_uptime_seconds`                  | Gauge     | Server uptime                                                            |
+
+---
+
+## References
+
+[^orca]: Yu, G. et al., "Orca: A Distributed Serving System for Transformer-Based Generative Models," OSDI, 2022. https://www.usenix.org/conference/osdi22/presentation/yu
+
+[^vllm]: Kwon, W. et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention," SOSP, 2023. https://arxiv.org/abs/2309.06180
+
+[^topp]: Holtzman, A. et al., "The Curious Case of Neural Text Degeneration," ICLR, 2020. https://arxiv.org/abs/1904.09751
+
+[^gguf]: Gerganov, G. et al., llama.cpp / ggml GGUF format. https://github.com/ggerganov/llama.cpp
+
+[^gptq]: Frantar, E. et al., "GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers," ICLR, 2023. https://arxiv.org/abs/2210.17323
+
+[^awq]: Lin, J. et al., "AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration," MLSys, 2024. https://arxiv.org/abs/2306.00978
+
+[^lora]: Hu, E. et al., "LoRA: Low-Rank Adaptation of Large Language Models," ICLR, 2022. https://arxiv.org/abs/2106.09685
+
+[^peft]: Hugging Face PEFT. https://github.com/huggingface/peft

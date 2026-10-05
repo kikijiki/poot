@@ -1,0 +1,151 @@
+---
+id: tracing
+title: Tracing a Model
+sidebar_position: 3
+---
+
+# Tracing a Model
+
+A poot model definition is an ordinary Rust function that takes a `Builder` and builds a
+graph. The same graph runs two ways: the CPU oracle (`poot_eval::eval`) evaluates it tensor
+by tensor, and the planner lowers it to GPU kernels. This follows the functional
+transformations pattern of JAX [^jax], where one traced program can be interpreted as
+computation, JIT-compilation, or another transformation.
+
+## The Builder and Traced handles
+
+`poot_graph_ir::Builder` records equations. A `Traced` value is a type-only handle: a
+`ValueId` plus a host-computed `TensorType`, with no data. Model code creates inputs with
+`Builder::constant` (weights and tables), `Builder::slot` / `slot_named` (per-step inputs),
+and `Builder::state_input` (the KV cache), then calls the composite helpers in
+`poot_graph_ir::ops`:
+
+```rust
+let h  = ops::rmsnorm(b, x, attn_norm, eps);
+let q  = ops::linear(b, h, q_proj, q_bias);
+let q  = ops::rope(b, q, cos_table, sin_table, pos);
+let o  = ops::attention_masked(b, q, k_cache, v_cache, n_rep, scale, mask);
+let ff = ops::swiglu(b, gate, up);
+```
+
+Each helper appends primitive eqns; none of them is an opcode. `Builder::finish(out)` (or
+`finish_with_state(out, &[(state_in, state_out)])`) closes the graph. Per-architecture
+tracers live in `poot-models`, for example `poot_models::qwen2::trace_decode_kv_masked(cfg,
+cap)` for a constant-shape masked decode step.
+
+**Adding a model is writing a graph.** A family is a config type parsed from the checkpoint, a table
+mapping weight names to `(layer, role)`, and plain tracer functions over shared components. KV layout,
+batching, paging, weight format and device limits are not the tracer's business: they are binding
+choices, graph transforms or planner legalization. Today some of this still lives in per-variant
+tracer wrappers and in the runner.
+
+## How the tracer records eqns
+
+Each builder call:
+
+1. Allocates a new `ValueId` for the output.
+2. Calls `OpKind::infer` to compute the output `TensorType` (shape + dtype) from the input
+   types. No data is touched.
+3. Appends an `Eqn { op, inputs, out }` to the growing eqn list.
+4. Returns the output as a `Traced` handle.
+
+Because a `Traced` carries no data, model code cannot make host-side decisions based on
+activation values. That keeps the graph identical every token, which capture and replay
+require.
+
+## Consts, slots, state, and values
+
+Four kinds of values appear as eqn inputs (see [The Graph IR](./graph-ir#storage-classes)):
+
+**Consts** (`Storage::Const`). Weight matrices, embedding tables, RoPE tables. Declared by
+name with `Builder::constant`. The checkpoint loader binds device buffers to those names at
+close. Const buffers never move.
+
+**Slots** (`Storage::Slot`). Per-step inputs such as the token id and position
+(`Slot::Token`, `Slot::Pos`; paged decode adds `Slot::SlotMap`). The dense families (qwen2 and its
+relatives, bloom, granite, mpt, smollm3, gemma2) build the attention mask in-graph from `Slot::Pos`
+instead of taking it as a slot; other families still take it as a `Slot::Mask` input. Each slot is
+bound to a stable device buffer that the host rewrites in place every step.
+
+**State** (`Storage::State`). The KV cache. Each `state_in` binder is paired with a
+`state_out` value; the executor feeds the buffer in and overwrites it with the output.
+
+**Device intermediates** (`Storage::Device`). Every activation produced by an eqn.
+Allocated once at stable addresses determined at plan time, which CUDA graph capture
+requires.
+
+## What a full trace looks like
+
+A Qwen2.5-0.5B decode step (24 layers, 896 hidden dim, 14 Q heads, 2 KV heads) traces to
+a flat graph of primitive eqns, on the order of a thousand or more. Count it with
+`poot_graph_ir::analysis::dispatch_count` on `trace_decode_kv_masked(Qwen2Config::qwen2_0_5b(), cap)`.
+Every shape is known statically at trace time. The trace takes a few milliseconds and
+happens once at model load.
+
+## GQA and MQA: no special opcode
+
+For grouped-query attention (GQA) [^gqa] and multi-query attention (MQA) [^mqa], the
+K and V projections produce fewer heads than Q. `ops::repeat_kv` expands them to Q's head
+count with `Reshape`, `Broadcast`, `Reshape` before the score matmul:
+
+```rust
+// k: [1, H_kv, cap, D]  ->  [1, H_kv * n_rep, cap, D]
+let r = b.reshape(k, vec![bsz, h_kv, 1, seq, d]);
+let r = b.broadcast(r, vec![bsz, h_kv, n_rep, seq, d]);
+b.reshape(r, vec![bsz, h_kv * n_rep, seq, d])
+```
+
+GQA and MQA fall out of the primitives without special casing. When the flash attention
+rewrite fires, the fused op takes `n_rep` as a parameter and reads the shared K/V rows
+directly (`kv_head = q_head / n_rep`).
+
+## SwiGLU and GeLU FFN
+
+The SwiGLU [^swiglu] activation used in Llama, Qwen, and Mistral:
+
+```
+ffn(x) = (SiLU(gate_proj(x)) * up_proj(x)) @ down_proj
+```
+
+`ops::swiglu` is `silu(gate) * up` between the gate/up and down `MatMul`s, where `silu` is
+itself a composition, `x / (1 + exp(-x))`, over the `Neg`, `Exp`, `Add` and `Div` primitives.
+The GeLU [^gelu] variants replace `silu` with another composition: the tanh approximation
+(used by Gemma's `geglu`) is the same sigmoid form over `Exp` and `Div`, and the exact erf form
+(used by BERT-class encoders) is built on the `Erf` primitive. No activation unary and no
+special FFN opcode exists.
+
+## Checkpoint loading
+
+`poot-load` reads safetensors directories and GGUF files and binds tensors to the graph's named
+consts. Supported quantized formats bind packed constants. Dense projections decode them in the
+consuming contraction; packed MoE paths still materialize expert tables. Fused QKV tensors are split, and
+transposed layouts corrected, at load time. Packed projections stay packed. Dense BF16/F16 tensors are
+loaded as stored BF16/F16 words; there is one loader and no widened f32 copy of any tensor. The bound
+graph reads a stored BF16/F16 norm scale, bias or embedding through an explicit cast to f32 (a gather
+casts only the gathered rows), and a contraction reads its weight as stored. A stored dtype the graph
+cannot read this way is a typed error at bind.
+
+## Mixture-of-experts routing
+
+MoE layers (`ops::moe`, `moe_sparse`, `moe_grouped`) compute router scores, select the
+top-k expert ids with `ArgTopK`, and contract each row against its own expert with
+`IndexedMatMul`. Dense expert tables are read in place. Packed expert weights use per-expert
+`PackedDequant` branches followed by movement/stacking and `IndexedMatMul`; the current execution
+path materializes that table; there is no direct packed indexed contraction.
+
+Expert ids are runtime values, not slots. The graph structure (which ops run) is fixed;
+the ids are computed inside the graph each token.
+
+---
+
+## References
+
+[^jax]: Bradbury, J. et al., "JAX: Composable Transformations of Python+NumPy Programs," 2018.
+
+[^gqa]: Ainslie, J. et al., "GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints," EMNLP, 2023.
+
+[^mqa]: Shazeer, N., "Fast Transformer Decoding: One Write-Head is All You Need," arXiv:1911.02150, 2019.
+
+[^swiglu]: Shazeer, N., "GLU Variants Improve Transformer," arXiv:2002.05202, 2020.
+
+[^gelu]: Hendrycks, D. & Gimpel, K., "Gaussian Error Linear Units (GELUs)," arXiv:1606.08415, 2016.

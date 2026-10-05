@@ -1,0 +1,22 @@
+# Required cases for `just test-device-kernels` (card 670), one per line:
+# binary_id<TAB>test_name, the identity the lane's JUnit report carries as classname and name.
+# Hand-maintained: never generated from the justfile's selection. The gate
+# (scripts/check-required-cases.py kernels) fails the lane unless every case here ran and passed -
+# a skip is never a pass. Sorted in canonical (LC_ALL=C) order.
+#
+# The I32-index cases of the migration: the exact-I32 codegen bodies (scalars, shifts, compares,
+# packed i32 lanes) the lane must compile and run on every kernels run, plus one ROCm dispatch of
+# the packed suites: it guards on its own context (not the lane's required wgpu backend), so a
+# hidden ROCm device turns it into a skip - and a skipped required case fails the gate.
+poot-kernelgen	packed::rocm_tests::materialize_matches_decode_blocks_on_rocm
+poot-kernelgen::exact_i32	exact_i32_fused_body_keeps_i32_locals_and_literals
+poot-kernelgen::exact_i32	exact_i32_scalar_body_keeps_i32_buffers_literals_and_arithmetic
+poot-kernelgen::exact_i32	exact_i32_shift_masks_the_amount
+poot-kernelgen::exact_i32	exact_i32_shr_bitcasts_through_u32_for_logical_shift
+poot-kernelgen::exact_i32	exact_i32_unary_not_and_clz_keep_i32_storage
+poot-kernelgen::exact_i32	exact_i32_unsigned_compare_body_uses_u32_bitcasts
+poot-kernelgen::exact_i32	exact_i32_unsigned_remainder_bitcasts_through_u32
+poot-kernelgen::exact_i32	packed_i32_fused_kernel_guards_with_output_len_over_lanes
+poot-kernelgen::exact_i32	packed_i32_leaf_lane_broadcasts_a_unit_prefix
+poot-kernelgen::run	erf_matches_reference
+poot-kernelgen::run	tanh_matches_reference_and_saturates_exactly

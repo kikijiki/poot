@@ -1,0 +1,45 @@
+---
+id: implementation
+title: Crates and implementation details
+sidebar_position: 11
+---
+
+# Crates and implementation details
+
+Which crate owns which layer, and the few constraints that span several pages.
+
+## Crate map
+
+| Layer            | Crate(s)                                                                                              | Role                                                                                                    |
+| ---------------- | ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| Graph IR         | `poot-graph-ir`                                                                                       | Primitive graph, `Builder`, `ops` compositions (attention, norms, MoE, ...), and the `transform` passes |
+| CPU oracle       | `poot-eval`                                                                                           | Reference evaluator; test-side correctness ground truth                                                 |
+| Planning         | `poot-graph-plan`                                                                                     | `compile`: passes, plans, storage, slots and numerics; typed refusals                                   |
+| Kernel import    | `poot-kernel-attr`, `pootc`                                                                           | `#[kernel]` attribute; rustc driver that imports kernels from Stable MIR                                |
+| Kernel IR, synth | `poot-kernel-ir`, `poot-kernelgen`                                                                    | Kernel body IR; synthesized bodies (elementwise, reduction, tiled GEMM, flash, dequant)                 |
+| Codegen          | `poot-codegen`                                                                                        | Kernel IR to LLVM IR to SPIR-V, PTX, AMDGCN code objects or AIE                                         |
+| Runtimes         | `poot-runtime`, `poot-rocm-runtime`, `poot-ptx-runtime`, `poot-vulkan-runtime`, `poot-runtime-common` | Devices, buffers, transfers; mechanism only                                                             |
+| Executors        | `poot-gpu` (wgpu), `poot-rocm-gpu`, `poot-ptx-gpu`, `poot-vulkan-device`                                                 | Load, bind, capture, replay and read back a plan                                                        |
+| Models           | `poot-models`                                                                                         | Per-family tracers over shared components                                                               |
+| Loading          | `poot-load`, `poot-quant`                                                                             | Safetensors and GGUF readers; packed quantization descriptors shared by loader, IR and planner          |
+| Generation       | `poot-llm`                                                                                            | The runner: token loop, sampling, KV slots                                                              |
+| Serving          | `poot-serve`                                                                                          | OpenAI-compatible HTTP server; no generation until the new scheduling loop lands                        |
+| Tooling          | `poot-orchestrator`, `poot-profile`, `poot-ptx-check`, `poot-rocm-check`, `poot-test-util`            | Pod runs, profiling, hardware smoke checks, test helpers                                                |
+
+## Cross-cutting notes
+
+- **AIE codegen is not NPU execution.** The experimental emitter remains, but no graph-planner target
+  or runtime kernel handle connects it to an NPU. See [NPU Offload](./npu).
+- **Oracle use is still broader than the target.** The Runner's CPU generation and the server's
+  embeddings/reranking paths call the evaluator today. See [Execution](./execution#verification).
+- **Flash needs one head width.** The flash rewrite fires only when Q, K and V share a trailing head
+  width. MLA-style shapes (narrower V) stay on the primitive decomposition. See
+  [Attention](./attention#implementation-details).
+- **ROCm AQL publication.** Replay writes AQL packets to a host-coherent ring, then rings the doorbell.
+  A discrete-GPU device-memory ring needs an explicit store fence first; integrated APUs refuse that
+  constructor.
+- **RADV-driven kernel rules.** Structured control flow and no dynamic-index private arrays on the
+  SPIR-V path, because Mesa's RADV driver crashed on otherwise valid patterns.
+- **Synthetic versus real checkpoints.** Some families are verified only on bounded synthetic
+  checkpoints against the CPU oracle. That is not a real-checkpoint claim; the
+  [feature matrix](../reference/feature-matrix.md#models) tracks the difference.

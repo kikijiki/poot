@@ -1,0 +1,122 @@
+---
+id: index
+title: Architecture Overview
+sidebar_position: 1
+---
+
+import PipelineDiagram from "@site/src/components/architecture/PipelineDiagram";
+import ExecutionTimeline from "@site/src/components/architecture/ExecutionTimeline";
+
+# Architecture Overview
+
+poot is a from-scratch LLM inference engine in Rust. It runs its own GPU kernels, lowered from
+ordinary Rust source, on three first-class backends: wgpu (Vulkan/SPIR-V), ROCm (AMD, raw HSA) and
+PTX (NVIDIA). It uses no cuBLAS, cuDNN or other vendor math libraries.
+
+The problem it targets: small-batch decode is dominated by host overhead. A naive loop issues
+hundreds of tiny dispatches per token, each costing microseconds of driver time before the GPU does
+any work. poot answers with two mechanisms:
+
+- **Automatic fusion.** The IR is finer-grained than the kernels it produces: attention, RMSNorm,
+  RoPE and SwiGLU are compositions of primitives, not opcodes. A compiler pass synthesizes one kernel
+  per fusable region instead of picking from a menu of hand-written fused kernels.
+- **Capture and replay.** The decode graph has a constant shape (fixed-capacity KV plus masking), so
+  its dispatch sequence is recorded once and replayed per token: CUDA graphs on PTX, recorded HSA AQL
+  packets on ROCm, and cached re-encode on wgpu, with submits split where required.
+
+## The one pipeline
+
+The pipeline is one path for every model and backend: `compile` is the shared compiler entry and
+`poot-executor`'s `Engine<D>` is the shared executor. The diagram below shows that pipeline; the
+remaining gaps are listed under "Where the code is today".
+
+```text
+checkpoint -> loader -> typed weights
+config     -> model tracer -> Graph (primitives and compositions)
+Graph + target + options -> compile -> Program, or a typed refusal
+program + weights -> executor: load, capture, replay per step
+driver: token loop, sampling, stops, KV slots  ->  serve: one scheduling loop
+```
+
+<PipelineDiagram />
+
+1. **Tracing.** A model is plain Rust over a `Builder`, calling the composite helpers in
+   `poot_graph_ir::ops`. It runs once with data-free handles and produces a flat SSA graph.
+2. **Optimization.** Graph transforms (CSE, RoPE fusion, the flash-attention rewrite, pointwise and
+   reduction fusion, matmul tiling) rewrite the graph without changing its meaning. See
+   [Fusion](./fusion.mdx).
+3. **Planning.** `plan_eqn_analyzed` in `poot-graph-plan` gives each equation a plan: an imported or
+   synthesized kernel, a view or alias, or a refusal. `compile` runs this planning as its last step.
+4. **Capture.** The executor allocates stable buffers for weights, intermediates and per-step inputs
+   and records the dispatch sequence once per model and KV capacity.
+5. **Decode.** Per token the host writes the token id, position and mask into their slot buffers and
+   replays or re-encodes the dispatches; logits or the sampled id come back.
+
+<ExecutionTimeline />
+
+## Design principles
+
+These rules describe the target architecture. The current state of the code is listed below.
+
+- **One pipeline.** Every model is traced, compiled, executed through one executor contract and driven
+  by one generation loop. A family or backend never gets a private route.
+- **Primitive IR.** The IR is elementwise, reduce, broadcast, matmul, gather and view. Attention, norms,
+  RoPE and MoE routing are compositions. A new primitive needs a stated reason a composition cannot serve.
+- **General optimization.** A rewrite fires on any graph with the right semantics, not on one tracer's
+  spelling or op order. Fusion is codegen from the graph, not a catalogue of fused kernels.
+- **Capability is decided by planning.** A model runs on a backend if its graph compiles for that
+  target. Otherwise the planner returns a typed refusal naming the equation and the missing
+  capability. There is no support list.
+- **One semantic definition.** Each op is defined once and shared by tracing, the CPU oracle and every
+  lowering. No second evaluator or hand kernel redefines it.
+- **Backend-neutral above the planner, family-neutral below the model.** Nothing above planning
+  branches on a backend; nothing outside model definitions names a model family. A backend's limits
+  are handled inside that backend's lowering.
+- **Adding a model is writing a graph.** A family is a config type, a weight-name table and plain
+  tracer functions over shared components. Nothing in the driver, planner, executors or server changes.
+- **Types carry invariants.** Ownership, residency, dtype, layout, launch geometry and capability are
+  types, not comments, names or string matches.
+- **Verification proves behavior.** Tests exercise behavior and can fail. Device results match the
+  CPU oracle within a stated tolerance, real checkpoints match an independent reference on tokens, and
+  a skipped device test is reported as a skip.
+
+## Where the code is today
+
+The code runs on one pipeline: a target descriptor, a single `compile` entry, and a shared executor
+contract. Current state:
+
+- Tracing, optimization, planning, kernel import and codegen, and capture/replay work on wgpu, ROCm
+  and PTX. Generation runs through the `poot-llm` library runner.
+- `poot-serve` starts, bounds requests and serves encoder embeddings and reranking; it refuses a dense decoder
+  until it serves through the driver. **It serves no generation:** `/v1/completions` and `/v1/chat/completions` return a typed `503`.
+  See [Serving design](./serving-design.mdx).
+- `compile` owns the pass sequence and returns a `Program` with plans, storage, slots and numerics.
+  Runtime `DeviceCaps` and typed planner refusals are implemented.
+- One executor contract serves every backend: `poot-executor`'s `Engine<D>` over a per-backend
+  `Device` trait (`WgpuDevice`, `RocmDevice`, `PtxDevice`, `VulkanDevice`). The driver drives it for the registered (dense)
+  families, the Runner's `generate_kv_gpu_*` entries for the rest; the first step on an entry records,
+  later steps replay.
+- Packed projections keep their stored representation through loading. Dense BF16/F16 weights are kept
+  as stored words with no host f32 copy, and packed MoE execution can materialize expert tables on the
+  device.
+- NPU offload was removed; the megakernel is a possible future
+  execution strategy, not code.
+
+For models and features by backend, use the [feature matrix](../reference/feature-matrix.md).
+
+## Pages in this section
+
+| Page                                                  | What it covers                                       |
+| ----------------------------------------------------- | ---------------------------------------------------- |
+| [The Graph IR](./graph-ir.mdx)                            | The flat SSA primitive graph                         |
+| [Tracing a Model](./tracing.mdx)                          | How a model definition becomes a graph               |
+| [Kernels from Rust](./kernel-import.mdx)                  | `#[kernel]` functions, pootc, Stable MIR, lowering   |
+| [Fusion and Planning](./fusion.mdx)                       | Optimization passes, imported vs synthesized kernels |
+| [Backends](./backends.mdx)                                | wgpu, ROCm, PTX and raw Vulkan codegen and dispatch              |
+| [Execution](./execution.mdx)                              | Capture/replay, slot buffers, the CPU oracle         |
+| [Attention and KV Cache](./attention.mdx)                 | Flash-attention rewrite, paged KV, prefix caching    |
+| [Serving design](./serving-design.mdx)                    | HTTP API and the serving design                      |
+| [Crates and implementation details](./implementation.mdx) | Crate map and cross-cutting notes                    |
+| [The Megakernel](./megakernel.mdx)                        | Removed; a possible future execution strategy        |
+| [NPU Offload](./npu.mdx)                                  | Removed for now                                      |
+| [Glossary](./glossary.mdx)                                | Terms used in this section                           |

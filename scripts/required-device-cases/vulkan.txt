@@ -1,0 +1,45 @@
+# Required cases for `just test-device-vulkan` (card 670), one per line:
+# binary_id<TAB>test_name, the identity the lane's JUnit report carries as classname and name.
+# Hand-maintained: never generated from the justfile's selection. The gate
+# (scripts/check-required-cases.py vulkan) fails the lane unless every case here ran and passed -
+# a skip is never a pass. Sorted in canonical (LC_ALL=C) order.
+#
+# Card 553: the raw-Vulkan add dispatch and the live device caps receipts in poot-vulkan-runtime (the
+# RADV WMMA row is how a device that stops reporting its matrix hardware is caught: the cooperative-matrix
+# row below would only skip), and the whole poot-vulkan-device suite: the parity table and executor-coverage
+# rows (parity), the executor-contract rows (executor_contract: one recording over 16 steps, buffers across
+# threads, argument element counts, copy, submission cuts, kernel faults, device time, memory by role),
+# driver generation against wgpu (generate), the wide dispatch (large_grid) and the cooperative-matrix
+# matmul (coopmat). The Qwen2.5-0.5B row is #[ignore]d (it loads a checkpoint: run by exact name).
+poot-vulkan-device::coopmat	coopmat_matmul_plans_the_coopmat_arm_and_matches_the_cpu_product_on_vulkan
+poot-vulkan-device::executor_contract	a_copy_is_ordered_between_the_dispatches_around_it
+poot-vulkan-device::executor_contract	a_kernel_assert_is_a_fault_raised_at_synchronize
+poot-vulkan-device::executor_contract	a_long_recording_is_cut_into_several_submissions_and_replays_exactly
+poot-vulkan-device::executor_contract	a_vulkan_buffer_moves_into_another_thread
+poot-vulkan-device::executor_contract	copy_round_trips_every_element_width_with_no_sentinel_left
+poot-vulkan-device::executor_contract	device_time_is_unknown_without_timing_and_measured_per_dispatch_with_it
+poot-vulkan-device::executor_contract	dispatch_reads_the_argument_element_count_not_the_buffer_capacity
+poot-vulkan-device::executor_contract	memory_counters_charge_the_roles_a_decode_entry_allocates_as_wgpu_does
+poot-vulkan-device::executor_contract	sixteen_replayed_steps_record_once
+poot-vulkan-device::generate	chunked_prefill_equals_the_whole_prompt_on_vulkan
+poot-vulkan-device::generate	tiny_fixture_greedy_decode_equals_wgpu_on_vulkan
+poot-vulkan-device::large_grid	flash_prefill_over_65535_workgroups_is_one_wide_dispatch_and_matches_the_oracle_on_vulkan
+poot-vulkan-device::parity	a_one_dispatch_grid_past_255_workgroups_matches_the_oracle_on_vulkan
+poot-vulkan-device::parity	alibi_slopes_attention_matches_the_oracle_and_the_reference_on_vulkan
+poot-vulkan-device::parity	arg_top_k_over_a_partial_last_workgroup_matches_the_oracle_on_vulkan
+poot-vulkan-device::parity	bf16_const_cast_is_bit_exact_on_vulkan
+poot-vulkan-device::parity	captured_replay_of_the_toy_graphs_equals_the_recording_step_on_vulkan
+poot-vulkan-device::parity	checkpoint_orientation_projection_matches_the_oracle_on_vulkan
+poot-vulkan-device::parity	chunked_gdn_prefill_matches_the_sequential_recurrence_on_vulkan
+poot-vulkan-device::parity	decode_over_multi_head_and_multi_query_layouts_matches_the_oracle_on_vulkan
+poot-vulkan-device::parity	f16_checkpoint_orientation_projection_matches_the_oracle_on_vulkan
+poot-vulkan-device::parity	flash_attention_with_a_per_head_alibi_mask_matches_the_oracle_on_vulkan
+poot-vulkan-device::parity	packed_linears_and_the_canonical_expert_chain_match_the_oracle_on_vulkan
+poot-vulkan-device::parity	parity_table_matches_the_oracle_on_vulkan
+poot-vulkan-device::parity	softcapped_qwen2_matches_the_oracle_on_vulkan
+poot-vulkan-device::parity	tied_moe_routing_picks_the_lowest_index_first_on_vulkan
+poot-vulkan-device::parity	tiled_region_with_a_remainder_tile_matches_the_oracle_on_vulkan
+poot-vulkan-runtime	context::init::launch_caps_device_receipt::a_live_vulkan_device_reports_its_own_launch_limits
+poot-vulkan-runtime::device_caps	device_caps_is_plausible_on_the_real_device
+poot-vulkan-runtime::device_caps	raw_vulkan_reports_wmma_class_support_on_this_box
+poot-vulkan-runtime::run_add	add_runs_on_gpu_via_raw_vulkan

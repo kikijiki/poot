@@ -1,0 +1,39 @@
+[package]
+name = "poot-kernelgen"
+description = "Generate shape-specialized poot-kernel-ir Bodies for primitive tensor ops (the un-fused GPU path)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+poot-kernel-ir.workspace = true
+# `generate` reads the target's `Backend` and `DeviceCaps` (the leaf crate every poot crate may depend on).
+poot-target.workspace = true
+# The packed decode emitter (`crate::packed`) reads `FormatDescriptor` at generation time: kernelgen
+# generates kernel bodies for poot-quant's formats, so this is a real (non-dev) dependency of a leaf
+# crate, not a cycle (card 542a, dquant.md D1).
+poot-quant.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# ADR-0113: this crate's own `#[cfg(test)]` module (`emit.rs`) and its `tests/{flash,rope}_interp.rs`
+# call `poot_kernel_ir::interp::Buffer::from_f32s`/`from_u32s`/`to_f32s` directly, gated behind
+# `test-support` in poot-kernel-ir.
+poot-kernel-ir = { workspace = true, features = ["test-support"] }
+poot-codegen.workspace = true
+poot-runtime.workspace = true
+poot-ptx-runtime.workspace = true
+# The packed-kernel ROCm device rows (card 542a SC-004/SC-005) dispatch generated bodies on real
+# ROCm/HSA hardware, the same real-executable-path proof card 628's no_contract tests use.
+poot-rocm-runtime.workspace = true
+poot-runtime-common.workspace = true
+# Test fixture only (spec 135): the F16 matmul GPU probe uses the loader's f32->f16 encode
+# (poot_load::gguf::f32_to_f16); the f16->f32 decode below is poot-quant's scalar decoder.
+poot-load.workspace = true
+poot-test-util = { workspace = true, features = ["kernel-fixtures"] }
+
+[lints]
+workspace = true

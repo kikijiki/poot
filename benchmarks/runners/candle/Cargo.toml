@@ -1,0 +1,27 @@
+# spec 112: the candle baseline runner. Pinned to the 0.10.2 published crates (all on the same version).
+# Build with `cargo build --release --features cuda` (compiles .cu kernels; needs nvcc, see NOTES.md +
+# setup/). Point the harness at the binary with POOT_BENCH_CANDLE_BIN.
+[package]
+name = "bench-candle-runner"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Matteo Bernacchia <dev@kikijiki.com>"]
+repository = "https://github.com/kikijiki/poot"
+publish = false
+
+[dependencies]
+candle-core = { version = "=0.10.2" }
+candle-nn = { version = "=0.10.2" }
+candle-transformers = { version = "=0.10.2" }
+tokenizers = { version = "=0.22.0", default-features = false, features = ["onig"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+[features]
+default = []
+# CUDA backend: pulls candle-kernels and compiles .cu at build time, so nvcc is required.
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+
+[workspace]

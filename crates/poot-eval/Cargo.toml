@@ -1,0 +1,44 @@
+[package]
+name = "poot-eval"
+description = "poot's CPU eager reference executor for the graph IR (oracle stage 1: decomposition correctness)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+# ADR-0113: `apply_movement` (card 626) has no production caller left (the pre-contract device
+# executors it fell back to died in Cards 546b/549); the graph planner's strided-view fuzz test (spec
+# 132) is its only remaining caller, a dev-dependent crate reached through this feature edge, never a
+# forwarder. (Literal crate name omitted here: `poot_eval_does_not_depend_on_graph_plan` string-matches
+# this file for it - the dependency runs the other way, a dev-only cycle Cargo allows.)
+test-support = []
+
+[dependencies]
+poot-graph-ir.workspace = true
+poot-quant.workspace = true
+poot-tensor.workspace = true
+# spec 135: the F16 Cast/matmul oracle reuses poot-load's f32_to_f16 / f16_to_f32 so precision loss matches
+# native f16 checkpoint bytes bit-for-bit. poot-load depends only on thiserror/serde, so there is no cycle.
+poot-load.workspace = true
+# card 528b/531: `Tensor::const_upload`'s BF16<->F32 narrow/widen uses the shared round-to-nearest-even owner
+# every GPU backend already re-exports locally (poot-runtime-common depends only on poot-target, so this is
+# not a cycle either).
+poot-runtime-common.workspace = true
+libm = "0.2.16"
+thiserror.workspace = true
+
+[dev-dependencies]
+poot-executor-parity.workspace = true
+poot-models.workspace = true
+poot-target.workspace = true
+poot-test-util = { workspace = true, features = ["graph-fixtures"] }
+# Card 405: tests/dense_row_gather_e4m3.rs writes a minimal safetensors checkpoint (as
+# poot-models/src/test_safetensors.rs does) to get a Card 359 owner-backed E4M3 table through the
+# authenticated loading path; ExactSourceOwner's fields are private outside poot-load.
+serde_json.workspace = true
+
+[lints]
+workspace = true

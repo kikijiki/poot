@@ -1,0 +1,32 @@
+[package]
+name = "poot-runtime"
+description = "poot GPU runtime: dispatch a compiled SPIR-V kernel on wgpu (Vulkan)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+poot-runtime-common.workspace = true
+poot-target.workspace = true
+thiserror.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
+bytemuck.workspace = true
+# wgpu-hal + ash (pinned to wgpu's versions): used only to query device VRAM through the Vulkan
+# runtime (VK_EXT_memory_budget) for the GPU-memory metric (no sysfs/CLI).
+wgpu-hal = { version = "29.0.3", features = ["vulkan"] }
+ash = "0.38"
+
+[dev-dependencies]
+poot-codegen.workspace = true
+# "serde": the pending-fault test deserializes poot-rocm-gpu's committed assert_trap.kir.json fixture
+# (card 531c) instead of hand-building a Body.
+poot-kernel-ir = { workspace = true, features = ["serde"] }
+poot-test-util = { workspace = true, features = ["kernel-fixtures"] }
+serde_json.workspace = true
+
+[lints]
+workspace = true

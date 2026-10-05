@@ -1,0 +1,17 @@
+[package]
+name = "poot-graph-ir"
+description = "poot's backend-neutral flat-SSA primitive tensor-op graph IR, tracer, and op decompositions"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+poot-tensor.workspace = true
+poot-quant.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

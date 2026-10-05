@@ -1,0 +1,106 @@
+[package]
+name = "poot-llm"
+description = "poot LLM runner: load real weights + tokenizer and generate on the eager executor (host coherence path)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+poot-graph-ir.workspace = true
+poot-tensor.workspace = true
+poot-models.workspace = true
+poot-eval.workspace = true
+poot-target.workspace = true
+poot-load.workspace = true
+poot-gpu.workspace = true
+poot-ptx-gpu.workspace = true
+poot-vulkan-device.workspace = true
+poot-rocm-gpu = { workspace = true, optional = true }
+tokenizers.workspace = true
+# Guided decoding: byte-level DFA for regex-constrained generation (same 0.4 line as tokenizers/regex).
+regex-automata = "0.4"
+minijinja.workspace = true
+minijinja-contrib.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+image.workspace = true
+base64.workspace = true
+# Blocking HTTP(S) image loading for the Qwen2.5-VL chat constructor. Rustls avoids a platform TLS
+# dependency; response bytes are bounded before decode.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+# Binaries only: the `cli` feature turns it on and the two bins that use it require that feature.
+# The library's own API is `thiserror` types throughout (`RunnerError`, `driver::error::DriverError`).
+anyhow = { workspace = true, optional = true }
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# Production code (`components/exact_partition.rs`) builds Card 360 placement/communication rows, so this
+# is a regular dependency.
+poot-graph-plan.workspace = true
+# Card 540b: the Runner's loader reads checkpoints into a `poot_quant::weights::WeightStore` (bytes as
+# stored, ADR-0103) instead of a widened f32 `SafeTensors` decode.
+poot-quant.workspace = true
+# Card 546a: the one Runner consumer of the backend-neutral executor contract (`Runner::load_on`,
+# `generate_kv_gpu_cached`/`_sampled`).
+poot-executor.workspace = true
+bytemuck.workspace = true
+# bin/ptx-graph-check's --precompile mode (card 549): compiles graphs through the shared
+# poot_graph_plan::compile plus one poot_codegen::KernelCache, with no CUDA context.
+poot-codegen.workspace = true
+# The driver measures the retained size of each planned kernel body (`program_retention`).
+poot-kernel-ir.workspace = true
+
+[dev-dependencies]
+# The examples (`examples/`) are binaries and use it directly.
+anyhow.workspace = true
+poot-test-util = { workspace = true, features = ["graph-fixtures"] }
+# ADR-0113: this crate's own loader tests (`architectures/{nemotron_h,deepseek32}_load.rs`'s
+# `#[cfg(test)]` modules, `checkpoint/gguf/tests/{bf16,f16}_loader_tests.rs`,
+# `core/runner/tests/lm_head_drain_tests.rs`) call `poot_load::safetensors::load_weight_store_bytes`
+# directly, gated behind `test-support` in poot-load.
+poot-load = { workspace = true, features = ["test-support"] }
+poot-runtime-common.workspace = true
+# The dense family fixtures (`poot_executor_parity::dense`): the graphs the plan and equivalence tests trace.
+poot-executor-parity.workspace = true
+# `AmdArch` (poot-codegen) for a CPU-only `#[cfg(feature = "rocm")]` test that classifies prefill-graph
+# eqns without touching a GPU (no HSA/driver linkage).
+poot-codegen.workspace = true
+# The boxed-cause chain test constructs each backend's runtime error type to check that `source()` reaches
+# it. Already transitive dependencies of the backend crates; listed only so the test can name the types.
+# No driver linkage; construction touches no device.
+poot-runtime.workspace = true
+poot-ptx-runtime.workspace = true
+poot-rocm-runtime.workspace = true
+# Card 546b: the olmo2 decode-GEMV device-time bound reads Card 552's typed per-entry window
+# (`poot_profile::Report::window`) instead of the deleted `GpuExecutor` label profiler.
+poot-profile.workspace = true
+
+[features]
+# `anyhow` for the `qwen2-generate` and `poot-caption` binaries (a bin cannot carry its own dependency).
+cli = ["dep:anyhow"]
+# ROCm/HSA GPU path (Runner::generate_kv_rocm*).
+rocm = ["dep:poot-rocm-gpu"]
+
+[lib]
+name = "poot_llm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "qwen2-generate"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "poot-caption"
+path = "src/bin/caption.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "ptx-graph-check"
+path = "src/bin/ptx-graph-check/main.rs"
+
+[lints]
+workspace = true

@@ -1,0 +1,61 @@
+[package]
+name = "poot-graph-plan"
+description = "Backend-neutral per-eqn execution planner: map a graph-IR op to a kernelgen Body + cache key, a host fallback, or a buffer alias"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+# ADR-0113: `reassociation_class`/`per_eqn_plans_outside_compile` have no production caller anywhere in the
+# workspace - they read this crate's own private state (`recorded_numerics`, a crate-private thread-local
+# counter), so they cannot move to poot-test-util and stay here gated. A default build never has them;
+# consumers (this crate's own tests, poot-gpu's tests) call them directly through this feature, never
+# through a forwarder. (`is_decode_gemv`/`is_tiled_gemm` were the same shape but had no private-state reason
+# to stay - deleted; their callers now check the planned `Plan` instead.)
+test-support = []
+
+[dependencies]
+poot-codegen.workspace = true
+poot-graph-ir.workspace = true
+# serde: the B=1 decode GEMV Body is loaded from a committed .kir.json
+poot-kernel-ir = { workspace = true, features = ["serde"] }
+poot-kernelgen.workspace = true
+poot-quant.workspace = true
+poot-target.workspace = true
+poot-tensor.workspace = true
+thiserror.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+
+[dev-dependencies]
+# ADR-0113: `sampler_bodies.rs`'s own `#[cfg(test)]` module calls `poot_kernel_ir::interp::Buffer::from_f32s`/
+# `to_f32s` directly, gated behind `test-support` in poot-kernel-ir.
+poot-kernel-ir = { workspace = true, features = ["test-support"] }
+# Strided-view fuzz test (spec 132): checks a view's index math against poot-eval's `apply_movement`
+# (the CPU oracle for Transpose/Slice/Broadcast). `test-support`: `apply_movement` has no production
+# caller left (card 626), gated behind this feature edge (ADR-0113), not a forwarder.
+poot-eval = { workspace = true, features = ["test-support"] }
+# Pins `dispatch_count_planned` on the real Qwen2 decode graph shape. Test-only: poot-graph-plan must
+# never depend on a model crate.
+poot-models.workspace = true
+# The dense family fixtures (`dense::Dense`) the integration tests and benches trace through `Model::trace`.
+# A dev-dependency cycle: integration tests and benches link one copy of this crate.
+poot-executor-parity.workspace = true
+# `default_caps_for` fixture for this crate's own `tests/*.rs` integration binaries: a `#[cfg(test)]`
+# item in `src/` (predicates.rs's own twin) is invisible to those (card 522).
+# `graph-fixtures`: the reimplemented `plan_eqn` wrapper these integration binaries need (they only see
+# this crate's pub API, not its in-crate `*_analyzed` entry point); it also carries
+# `poot-graph-plan/test-support` back to this same crate for `reassociation_class`/
+# `per_eqn_plans_outside_compile` (ADR-0113).
+poot-test-util = { workspace = true, features = ["graph-fixtures", "kernel-fixtures"] }
+criterion.workspace = true
+
+[[bench]]
+name = "decode"
+harness = false
+
+[lints]
+workspace = true

@@ -1,0 +1,85 @@
+# poot benchmark image - build/push the pre-baked GHCR image + drive the harness.
+# Run inside `nix develop` (benchmarks/flake.nix) which provides podman / skopeo / gh / uv.
+# Override the registry owner with GHCR_OWNER (defaults to kikijiki).
+
+owner := env_var_or_default("GHCR_OWNER", "kikijiki")
+image := "ghcr.io/" + owner + "/poot-bench"
+tag := "latest"
+
+# list recipes
+default:
+    @just --list
+
+# build the image locally (rootless podman). ~20 GB + a long CUDA compile; use it to validate the Dockerfile.
+image-build:
+    podman build -t {{image}}:{{tag}} -f docker/Dockerfile .
+
+# push a locally built image (needs `podman login ghcr.io` with a PAT that has write:packages)
+image-push:
+    podman push {{image}}:{{tag}}
+
+# build + smoke + push locally
+image-build-push: image-build image-smoke image-push
+
+# smoke-test a locally built image (no GPU needed): Vulkan loader/diagnostic availability, harness env
+# imports, baked binaries. Ubuntu's vulkaninfo help can print usage and return 1, so require the usage text.
+image-smoke:
+    podman run --rm {{image}}:{{tag}} bash -lc 'set -euo pipefail; ldconfig -p | grep -q "libvulkan.so.1"; command -v vulkaninfo >/dev/null; help_rc=0; vulkaninfo --help >/tmp/vulkaninfo-help 2>&1 || help_rc=$?; test "$help_rc" -eq 0 -o "$help_rc" -eq 1; grep -q "USAGE" /tmp/vulkaninfo-help; /opt/tf-venv/bin/python -c "import transformers, torch; print(\"tf\", transformers.__version__)"; ls /opt/vllm-venv/bin/python /opt/llama.cpp/build/bin/llama-bench /opt/benchmarks/runners/candle/target/release/bench-candle-runner'
+
+# inspect image layers / size
+image-inspect:
+    dive {{image}}:{{tag}}
+
+# run the harness locally (report/compare/matrix need no GPU), e.g. `just harness matrix --model qwen2.5-0.5b`
+harness *args:
+    uv run bench {{args}}
+
+# the harness's own tests (stdlib only, no GPU, no models). None depends on wall-clock timing, so they hold on a
+# loaded machine. e.g. `just harness-test -k compare`.
+harness-test *args:
+    python3 -m unittest discover -s harness/tests -p 'test_*.py' {{args}}
+
+# The sweep* recipes below run `cargo run -p poot-orchestrator`, so they need the repo-root devshell
+# (`nix develop` at the repo root, which provides the Rust toolchain). The benchmarks devshell has no cargo.
+#
+# poot-orchestrator: resumable end-to-end sweep on a rented RunPod GPU (needs RUNPOD_API_KEY).
+# e.g. `just sweep run --models qwen2.5-0.5b,qwen3-0.6b --commit` ; `just sweep reap` ; `just sweep status`.
+# Resumable: re-run the same `run` to resume after a crash. See crates/poot-orchestrator/README.md.
+sweep *args:
+    cargo run -p poot-orchestrator --release -- {{args}}
+
+# read-only web dashboard of runs + phases + per-model progress + live logs (auto-refreshes).
+# Open http://127.0.0.1:8787.
+sweep-ui *args:
+    cargo run -p poot-orchestrator --release -- serve {{args}}
+
+# build (+ --push) the bench image via the orchestrator (streams progress to a log the dashboard tails).
+# e.g. `just sweep-image --tag latest --push` (builds docker/Dockerfile). Needs `podman login ghcr.io`.
+sweep-image *args:
+    cargo run -p poot-orchestrator --release -- image {{args}}
+
+# tail a run/build log captured by the orchestrator (no name lists them). e.g. `just sweep-logs image-latest.log -f`.
+sweep-logs *args:
+    cargo run -p poot-orchestrator --release -- logs {{args}}
+
+# upload local model weights to a RunPod network volume via its S3 API. The volume (bucket = its id) mounts
+# at /workspace on pods that attach it, so `just sweep run --network-volume-id <id> --data-center <dc>`
+# skips the per-pod hf download. Needs RUNPOD_S3_ACCESS_KEY + RUNPOD_S3_SECRET_KEY in .env and aws-cli.
+# usage: just volume-sync <volume-id> <datacenter> <models-dir> [model ...]   (no models = sync all subdirs)
+volume-sync volume datacenter models_dir *models:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${RUNPOD_S3_ACCESS_KEY:?set RUNPOD_S3_ACCESS_KEY (RunPod S3 access key = your user id)}"
+    : "${RUNPOD_S3_SECRET_KEY:?set RUNPOD_S3_SECRET_KEY (the rps_... secret)}"
+    dc_lower=$(echo {{datacenter}} | tr '[:upper:]' '[:lower:]')
+    endpoint="https://s3api-${dc_lower}.runpod.io"
+    export AWS_ACCESS_KEY_ID="$RUNPOD_S3_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$RUNPOD_S3_SECRET_KEY"
+    # RunPod's S3 gateway rejects aws-cli 2.23+ default integrity checksums; only send them when required.
+    export AWS_REQUEST_CHECKSUM_CALCULATION=WHEN_REQUIRED AWS_RESPONSE_CHECKSUM_VALIDATION=WHEN_REQUIRED
+    list="{{models}}"; [ -z "$list" ] && list=$(ls "{{models_dir}}")
+    for m in $list; do
+      echo ">> syncing $m -> s3://{{volume}}/models/$m/"
+      aws s3 sync "{{models_dir}}/$m" "s3://{{volume}}/models/$m/" \
+        --region {{datacenter}} --endpoint-url "$endpoint" --only-show-errors
+    done
+    echo "done. attach with: just sweep run --network-volume-id {{volume}} --data-center {{datacenter}}"

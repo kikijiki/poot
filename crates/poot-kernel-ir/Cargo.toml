@@ -1,0 +1,29 @@
+[package]
+name = "poot-kernel-ir"
+description = "poot's MIR-mirroring kernel-body IR (the permanent, rustc-free, GPU-free leaf-kernel layer)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+# the normalized Body can be serialized (cache / golden tests / a future CPU interpreter)
+serde = ["dep:serde"]
+# Card 671: `Buffer::from_f32s`/`from_u32s`/`to_f32s` have no production caller anywhere in the workspace -
+# every reference is test code, and the one non-test reference is poot-test-util's own forwarder. Gating them
+# behind this feature (enabled only by poot-test-util's optional dependency below) means a default/production
+# build never compiles them in at all, instead of leaving them unconditionally `pub` with poot-test-util as
+# their sole non-test "caller" - the gate would otherwise treat that as a real use and never flag them.
+test-support = []
+
+[dependencies]
+serde = { workspace = true, optional = true }
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

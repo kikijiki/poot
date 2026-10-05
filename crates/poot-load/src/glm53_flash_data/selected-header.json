@@ -1,0 +1,92 @@
+{
+  "schema": "poot.glm53_flash.selected_header.v1",
+  "source": {
+    "url": "https://huggingface.co/zai-org/GLM-5.3-Flash/resolve/eb9eb208eb0d988989d07a6a12d0fdeb5f52574a/model-00002-of-00062.safetensors",
+    "revision": "eb9eb208eb0d988989d07a6a12d0fdeb5f52574a",
+    "lfs_sha256": "328225cabdc9b1595bc8bd0062cdc99fb23872eb5bbf7ec5db62f2be8abeaeeb",
+    "shard_size": 5320647824,
+    "header_length": 160856,
+    "header_sha256": "4727368ca83ad19ddfea0bfcb0fbf4427087b5b0bf648968b863962454e85c15",
+    "header_entry_count": 1151
+  },
+  "tensors": [
+    {
+      "name": "model.language_model.layers.0.mlp.gate_proj.weight",
+      "shard": "model-00002-of-00062.safetensors",
+      "dtype": "F8_E4M3",
+      "shape": [
+        12288,
+        4096
+      ],
+      "data_offsets": [
+        5068828720,
+        5119160368
+      ]
+    },
+    {
+      "name": "model.language_model.layers.0.mlp.gate_proj.weight_scale_inv",
+      "shard": "model-00002-of-00062.safetensors",
+      "dtype": "F32",
+      "shape": [
+        96,
+        32
+      ],
+      "data_offsets": [
+        1140056,
+        1152344
+      ]
+    },
+    {
+      "name": "model.language_model.layers.0.mlp.up_proj.weight",
+      "shard": "model-00002-of-00062.safetensors",
+      "dtype": "F8_E4M3",
+      "shape": [
+        12288,
+        4096
+      ],
+      "data_offsets": [
+        5119160368,
+        5169492016
+      ]
+    },
+    {
+      "name": "model.language_model.layers.0.mlp.up_proj.weight_scale_inv",
+      "shard": "model-00002-of-00062.safetensors",
+      "dtype": "F32",
+      "shape": [
+        96,
+        32
+      ],
+      "data_offsets": [
+        1152344,
+        1164632
+      ]
+    },
+    {
+      "name": "model.language_model.layers.0.mlp.down_proj.weight",
+      "shard": "model-00002-of-00062.safetensors",
+      "dtype": "F8_E4M3",
+      "shape": [
+        4096,
+        12288
+      ],
+      "data_offsets": [
+        5018497072,
+        5068828720
+      ]
+    },
+    {
+      "name": "model.language_model.layers.0.mlp.down_proj.weight_scale_inv",
+      "shard": "model-00002-of-00062.safetensors",
+      "dtype": "F32",
+      "shape": [
+        32,
+        96
+      ],
+      "data_offsets": [
+        1127768,
+        1140056
+      ]
+    }
+  ]
+}

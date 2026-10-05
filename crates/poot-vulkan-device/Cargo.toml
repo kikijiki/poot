@@ -1,0 +1,37 @@
+[package]
+name = "poot-vulkan-device"
+description = "poot raw-Vulkan implementation of the executor contract's Device: native command-buffer replay over poot-vulkan-runtime"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+poot-executor.workspace = true
+poot-graph-plan.workspace = true
+poot-runtime-common.workspace = true
+poot-target.workspace = true
+poot-vulkan-runtime.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+poot-codegen.workspace = true
+poot-eval.workspace = true
+poot-executor-parity.workspace = true
+poot-gpu.workspace = true
+poot-graph-ir.workspace = true
+poot-kernel-ir.workspace = true
+poot-kernelgen.workspace = true
+poot-llm.workspace = true
+poot-load.workspace = true
+poot-models.workspace = true
+poot-quant.workspace = true
+poot-test-util = { workspace = true, features = ["graph-fixtures", "kernel-fixtures"] }
+poot-tensor.workspace = true
+serde_json.workspace = true
+tokenizers.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,31 @@
+[package]
+name = "poot-executor"
+description = "The backend-neutral executor contract: Engine<D: Device>, Executable, StepInputs/StepOutputs (ADR-0102, Card 546a)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# Implements nothing backend-specific: depends on poot-tensor, poot-graph-plan, poot-quant and
+# poot-target only, never poot-eval or a runtime/device crate (card 546a Scope).
+[dependencies]
+poot-tensor.workspace = true
+poot-graph-ir.workspace = true
+poot-graph-plan.workspace = true
+poot-codegen.workspace = true
+poot-kernel-ir.workspace = true
+poot-quant.workspace = true
+poot-target.workspace = true
+poot-runtime-common.workspace = true
+poot-profile.workspace = true
+bytemuck.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# SC-024's two-distinct-bodies-same-display-key fixture: ready-made Body constructors, nothing else.
+poot-test-util = { workspace = true, features = ["kernel-fixtures"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "poot-kernel-intrinsics"
+description = "The kernel-authoring intrinsics (dispatch-axis indices, the workgroup barrier, workgroup-local array access, the integer atomic add): the one declaration `pootc`'s importer resolves a kernel-intrinsic call against by crate + item path, never by the callee's bare name (R468-009, card 531c)."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true

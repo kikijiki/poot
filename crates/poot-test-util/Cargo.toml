@@ -1,0 +1,51 @@
+[package]
+name = "poot-test-util"
+description = "Shared test helpers (seeded fills, reference kernels, comparisons) used as a dev-dependency"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+poot-codegen = { workspace = true, optional = true }
+poot-eval = { workspace = true, optional = true }
+poot-graph-ir.workspace = true
+poot-graph-plan = { workspace = true, optional = true }
+poot-kernel-ir = { workspace = true, optional = true }
+poot-kernelgen = { workspace = true, optional = true }
+poot-quant.workspace = true
+poot-runtime-common.workspace = true
+poot-target.workspace = true
+poot-tensor.workspace = true
+
+[features]
+# Graph-level device-row fixtures (card 643): only the GPU backend crates' tests enable it, so every other
+# dev-dependent crate builds without poot-eval. Card 671 added poot-graph-plan to this feature: the
+# per-equation planner fixtures it moved in need the same Graph/Builder machinery.
+# ADR-0113: `poot-graph-plan/test-support` unlocks `reassociation_class`/`per_eqn_plans_outside_compile`
+# (a default poot-graph-plan build never compiles them in); this crate requests the feature so that
+# poot-graph-plan's own dev-dependency on this crate (for `graph_fixtures::plan_eqn`) carries it back to
+# poot-graph-plan's own test builds - no forwarder here calls either function directly (ADR-0113 point 3).
+graph-fixtures = [
+    "dep:poot-eval",
+    "dep:poot-graph-plan",
+    "dep:poot-kernelgen",
+    "poot-graph-plan/test-support",
+]
+# Kernel-IR / kernelgen / codegen fixtures (card 671): the generators and golden-IR helper that no
+# production code calls, only cross-crate kernel tests. ADR-0113: `poot-kernel-ir/test-support` unlocks
+# `Buffer::from_f32s`/`from_u32s`/`to_f32s` (a default poot-kernel-ir build never compiles them in);
+# consumers call them directly (no forwarder here, ADR-0113 point 3) through this feature edge.
+kernel-fixtures = [
+    "dep:poot-kernel-ir",
+    "poot-kernel-ir/test-support",
+    "dep:poot-kernelgen",
+    "dep:poot-codegen",
+]
+
+[lints]
+workspace = true

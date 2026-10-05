@@ -1,0 +1,23 @@
+[package]
+name = "poot-executor-parity"
+description = "Dev-only table-driven parity fixtures for the executor contract: run_once/run_parity take the oracle as a parameter, so poot-executor never depends on poot-eval"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+poot-tensor.workspace = true
+poot-executor.workspace = true
+poot-graph-plan.workspace = true
+poot-graph-ir.workspace = true
+poot-quant.workspace = true
+poot-models.workspace = true
+poot-test-util.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

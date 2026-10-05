@@ -1,0 +1,128 @@
+# poot workspace: a virtual workspace (no root package). The kernel codegen substrate (poot-kernel-ir +
+# poot-codegen) concentrates the nightly / rustc_private / LLVM dependencies; everything above it (graph IR,
+# tracer, eager executor, models) is plain host Rust that builds and unit-tests without a GPU.
+[workspace]
+resolver = "3"
+members = [
+    "crates/poot-graph-ir",
+    "crates/poot-tensor",
+    "crates/poot-executor",
+    "crates/poot-executor-parity",
+    "crates/poot-models",
+    "crates/poot-eval",
+    "crates/poot-load",
+    "crates/poot-llm",
+    "crates/poot-serve",
+    "crates/poot-kernel-ir",
+    "crates/poot-codegen",
+    "crates/poot-profile",
+    "crates/poot-test-util",
+    "crates/poot-quant",
+    "crates/poot-runtime",
+    "crates/poot-runtime-common",
+    "crates/poot-ptx-runtime",
+    "crates/poot-ptx-check",
+    "crates/poot-rocm-runtime",
+    "crates/poot-rocm-check",
+    "crates/poot-rocm-gpu",
+    "crates/poot-vulkan-runtime",
+    "crates/poot-vulkan-device",
+    "crates/poot-kernelgen",
+    "crates/poot-target",
+    "crates/poot-graph-plan",
+    "crates/poot-gpu",
+    "crates/poot-ptx-gpu",
+    "crates/pootc",
+    "crates/poot-kernel-attr",
+    "crates/poot-kernel-intrinsics",
+    "crates/poot-orchestrator",
+    # The cross-framework benchmark runner is a member so the binary that is benchmarked resolves from this
+    # lockfile and is checked by `--workspace` builds (it enables poot-llm's `rocm` feature).
+    "benchmarks/runners/poot",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.0.0"
+license = "MIT"
+authors = ["Matteo Bernacchia <dev@kikijiki.com>"]
+repository = "https://github.com/kikijiki/poot"
+rust-version = "1.96"
+
+# A bare `#[ignore]` hides why a test is skipped. Every crate opts in with `[lints] workspace = true`.
+[workspace.lints.clippy]
+ignore_without_reason = "deny"
+
+# A held `#[expect(dead_code, reason = "held for POOT-N")]` must fail once its item gains a caller: the
+# expectation is then unfulfilled, and `unfulfilled_lint_expectations` is warn-by-default. Deny it everywhere.
+# Every crate inherits this table via `[lints] workspace = true`; no crate may declare its own `[lints]` table.
+[workspace.lints.rust]
+dead_code = "deny"
+deprecated = "deny"
+unfulfilled_lint_expectations = "deny"
+
+[workspace.dependencies]
+# internal
+poot-graph-ir = { path = "crates/poot-graph-ir" }
+poot-tensor = { path = "crates/poot-tensor" }
+poot-executor = { path = "crates/poot-executor" }
+poot-executor-parity = { path = "crates/poot-executor-parity" }
+poot-models = { path = "crates/poot-models" }
+poot-kernel-ir = { path = "crates/poot-kernel-ir" }
+poot-codegen = { path = "crates/poot-codegen" }
+poot-profile = { path = "crates/poot-profile" }
+poot-quant = { path = "crates/poot-quant" }
+poot-target = { path = "crates/poot-target" }
+poot-graph-plan = { path = "crates/poot-graph-plan" }
+poot-runtime = { path = "crates/poot-runtime" }
+poot-runtime-common = { path = "crates/poot-runtime-common" }
+poot-ptx-runtime = { path = "crates/poot-ptx-runtime" }
+poot-rocm-runtime = { path = "crates/poot-rocm-runtime" }
+poot-rocm-gpu = { path = "crates/poot-rocm-gpu" }
+poot-vulkan-runtime = { path = "crates/poot-vulkan-runtime" }
+poot-vulkan-device = { path = "crates/poot-vulkan-device" }
+poot-kernel-attr = { path = "crates/poot-kernel-attr" }
+poot-eval = { path = "crates/poot-eval" }
+poot-gpu = { path = "crates/poot-gpu" }
+poot-kernelgen = { path = "crates/poot-kernelgen" }
+poot-llm = { path = "crates/poot-llm" }
+poot-load = { path = "crates/poot-load" }
+poot-ptx-gpu = { path = "crates/poot-ptx-gpu" }
+poot-test-util = { path = "crates/poot-test-util" }
+
+# external (libraries use typed errors + tracing; binaries may use anyhow)
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+criterion = "0.5"
+sysinfo = "0.32"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The plan-side kernel-choice digest (card 636): a content hash of the canonical request encoding.
+blake3 = "1"
+# image decoding for vision-language input: png + jpeg only.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# base64 for OpenAI image_url data URLs.
+base64 = "0.22"
+# wgpu runtime (the SPIR-V dispatch backend).
+wgpu = { version = "29.0.3", features = ["spirv"] }
+pollster = "0.4"
+bytemuck = "1"
+# PTX runtime; dynamic-loading dlopens libcuda, so it builds without a CUDA toolkit.
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "dynamic-loading", "cuda-12040"] }
+# ELF parsing in poot-rocm-runtime's load_hsaco: reads the embedded kernel descriptor for the AQL packet's
+# kernel_object handle (the HSA loader APIs only handle V1/V2 code objects; LLVM 22+ emits V4+).
+object = { version = "0.36", default-features = false, features = ["std", "read", "elf"] }
+# HF tokenizer (loads tokenizer.json)
+tokenizers = "0.20"
+# jinja engine for a model's chat_template. `json` enables the `tojson` filter used by HF tool-use templates.
+minijinja = { version = "2", features = ["json"] }
+# HF chat templates call Python dict/str/list methods (`.get`, `.items`, `.strip`, `.startswith`, ...) that
+# minijinja lacks; `pycompat` adds them (wired into the Environment in poot-llm's render_jinja_core).
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+anyhow = "1"
+ring = "0.17"
+subtle = "2.6"
