@@ -466,7 +466,7 @@ where
                 media: processed_media.processor_media(),
                 spatial_merge_size: processor_config.merge_size(),
                 temporal_patch_size,
-                fps: Some(processed_media.processor_fps_input()).filter(|_| video_count != 0),
+                fps: (video_count != 0).then(|| processed_media.processor_fps_input()),
             },
             metadata_snapshot,
         )?;

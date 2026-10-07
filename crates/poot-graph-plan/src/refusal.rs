@@ -77,6 +77,8 @@ pub enum Capability {
         shape: Vec<usize>,
         expected: Vec<usize>,
     },
+    /// An operand is a strided view the lowering cannot read: only the layouts the lowering names are admitted.
+    OperandLayout { value: ValueId },
     /// A literal in the first operand position, which the planner's operand grammar does not read.
     LiteralFirstOperand,
     /// The index operand is not a form the lowering reads.
@@ -87,10 +89,9 @@ pub enum Capability {
     /// contract admits no host fallback, so this equation is refused outright rather than routed to
     /// a host step.
     ScatterNonZeroAxis { axis: usize },
-    /// The attention kernel holds one head row in workgroup memory, so the head dim is capped.
-    HeadDimExceedsLdsCap { head_dim: usize, lds_cap: usize },
-    /// The synthesized flash-prefill kernel has no attention-logit softcap.
-    AttentionSoftcap,
+    /// The attention kernel keeps one lane's running state (`dv` output channels and two scalars) in
+    /// workgroup memory, and not even one lane's fits the device's `lds_bytes`.
+    AttentionLds { dv: usize, lds_bytes: u32 },
     /// The selected generator's own precondition on its shape or count arguments rejected this
     /// equation (card 531b): the planner chose this lowering for the equation's dtypes and target, but
     /// forwarded it a static value the generator itself refuses to build a body for.
@@ -276,6 +277,9 @@ impl fmt::Display for Capability {
             } => {
                 write!(f, "v{value} has shape {shape:?}, the lowering needs {expected:?}")
             }
+            Capability::OperandLayout { value } => {
+                write!(f, "v{value} is a strided view the lowering cannot read")
+            }
             Capability::LiteralFirstOperand => {
                 f.write_str("a literal first operand is outside the planner's operand grammar")
             }
@@ -288,13 +292,11 @@ impl fmt::Display for Capability {
             Capability::ScatterNonZeroAxis { axis } => {
                 write!(f, "no kernel scatters over axis {axis}, only axis 0")
             }
-            Capability::HeadDimExceedsLdsCap { head_dim, lds_cap } => write!(
+            Capability::AttentionLds { dv, lds_bytes } => write!(
                 f,
-                "head dim {head_dim} exceeds the workgroup-memory cap {lds_cap} of the attention kernel"
+                "the attention kernel needs {} bytes of workgroup memory for one lane at value dim {dv}, the device has {lds_bytes}",
+                4 * (dv + 2)
             ),
-            Capability::AttentionSoftcap => {
-                f.write_str("the synthesized flash-prefill kernel has no attention-logit softcap")
-            }
             Capability::KernelGen(err) => write!(f, "kernel generator: {err}"),
             Capability::KernelResources(err) => write!(f, "kernel resources: {err}"),
             Capability::PackedLowering { format, op } => {

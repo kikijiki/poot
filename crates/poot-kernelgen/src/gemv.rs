@@ -47,30 +47,22 @@ pub fn gemv_lds(
     k: usize,
     n: usize,
     w: usize,
-    bias: bool,
     x_groups: usize,
     elem_offset: usize,
     layout: WeightLayout,
     weight: BufferStorage,
 ) -> Result<Body, KernelGenError> {
     let weight_lane = WeightLane::of("gemv_lds", weight)?;
-    // params: _0 ret, _1 a, _2 b (weight), [_3 bias (f32 [N]) when `bias`], out (LAST). With `bias` the dot
-    // is followed by + bias[n_col] in the store (the MatMulBias epilogue - the q/k/v projections).
-    let mut params = vec![
+    // params: _0 ret, _1 a, _2 b (weight), _3 out (LAST).
+    let params = vec![
         ld(Ty::Unit, false),
         ld(slice_f32(false), false), // 1 a [B, K]
         weight_lane.param(),         // 2 b (weight) [K, N] or [N, K]
+        ld(slice_f32(true), true),   // 3 out [B, N]
     ];
-    if bias {
-        params.push(ld(slice_f32(false), false)); // 3 bias [N]
-    }
-    params.push(ld(slice_f32(true), true)); // out [B, N]
     let mut al = Alloc::new(params);
     let (a, b) = (local(1), local(2));
-    let bias_l = if bias { Some(local(3)) } else { None };
-    let out = local(if bias { 4 } else { 3 });
-    let bias_v = al.add(Ty::F32, false); // bias[n_col] (only read when `bias`)
-    let acc_b = al.add(Ty::F32, false); // acc + bias[n_col]
+    let out = local(3);
     let col = al.add(Ty::Usize, false);
     let gx = al.add(Ty::Usize, false); // GroupX
     let gy = al.add(Ty::Usize, false); // GroupY (>0 only when the output spills past the X grid cap)
@@ -239,44 +231,18 @@ pub fn gemv_lds(
         )],
         terminator: guard(cmp0, early_return_idx, store_idx),
     });
-    // store_idx: acc = LDS[0]; out[col] = acc (+ bias[n_col] for the MatMulBias epilogue); return
+    // store_idx: acc = LDS[0]; out[col] = acc; return
     blocks.push(BasicBlock {
-        statements: {
-            let mut stmts = vec![Statement::Assign(
+        statements: vec![
+            Statement::Assign(
                 Place::local(acc),
                 Rvalue::WorkgroupLocalRead {
                     idx: cu(0),
                     array: 0,
                 },
-            )];
-            match bias_l {
-                Some(bl) => {
-                    stmts.push(Statement::Assign(
-                        Place::local(bias_v),
-                        Rvalue::Use(copy(elem(bl, n_col))),
-                    ));
-                    stmts.push(Statement::Assign(
-                        Place::local(acc_b),
-                        Rvalue::BinaryOp(
-                            BinOp::Add,
-                            copy(Place::local(acc)),
-                            copy(Place::local(bias_v)),
-                        ),
-                    ));
-                    stmts.push(Statement::Assign(
-                        elem(out, col),
-                        Rvalue::Use(copy(Place::local(acc_b))),
-                    ));
-                }
-                None => {
-                    stmts.push(Statement::Assign(
-                        elem(out, col),
-                        Rvalue::Use(copy(Place::local(acc))),
-                    ));
-                }
-            }
-            stmts
-        },
+            ),
+            Statement::Assign(elem(out, col), Rvalue::Use(copy(Place::local(acc)))),
+        ],
         terminator: Terminator::Return,
     });
     // early_return_idx: non-lane-0 threads return without writing.
@@ -329,10 +295,8 @@ pub fn gemv_lds(
         terminator: Terminator::Return,
     });
     let mut body = Body::new(
-        name,
-        if bias { 4 } else { 3 }, // data params: a, b, [bias], out
-        al.locals,
-        blocks,
+        name, 3, // data params: a, b, out
+        al.locals, blocks,
     );
     body.workgroup_size = [w as u32, 1, 1];
     body.workgroup_locals = vec![WorkgroupLocalDecl {
@@ -594,239 +558,6 @@ pub fn attn_scores_v_gemv_lds(name: &str, cap: usize, d: usize, w: usize, x_grou
     let mut body = Body::new(
         name, 3, // data params: probs, v, out
         al.locals, blocks,
-    );
-    body.workgroup_size = [w as u32, 1, 1];
-    body.workgroup_locals = vec![WorkgroupLocalDecl {
-        elem_ty: Ty::F32,
-        len: w as u32,
-    }];
-    body
-}
-
-/// The [`gemv_lds`] LDS-reduction GEMV with the weight indexed per output row by an expert id: the gather-free
-/// sparse-MoE decode GEMV. `out[t, n] = sum_k x[t, k] * W[idx[t], k, n]`: each output row `t` contracts `x`'s
-/// row against expert `e = (usize) idx[t]`'s `[K,N]` slab of the stacked `W [E, K, N]`. One workgroup of `w`
-/// lanes per output element (`col = GroupX` over `M*N`), an LDS reduction over `K`, so the expert's weight
-/// column is read coalesced and once (unlike the naive `indexed_matmul_dt`). `idx` is the `\[M\]` f32 expert ids
-/// (`M = k` selected experts at decode). No bias. Params: `_1 x` \[M*K\] (f32), `_2 w` \[E*K*N\] (f32), `_3 idx` \[M\]
-/// (f32), `out` \[M*N\] (f32). SpirvVulkan decode path; launch `M*N*w` threads.
-pub fn indexed_gemv_lds(name: &str, k: usize, n: usize, w: usize) -> Body {
-    let mut al = Alloc::new(vec![
-        ld(Ty::Unit, false),
-        ld(slice_f32(false), false), // 1 x [M, K]
-        ld(slice_f32(false), false), // 2 w (stacked expert weights) [E, K, N]
-        ld(slice_f32(false), false), // 3 idx [M] (f32 expert ids)
-        ld(slice_f32(true), true),   // 4 out [M, N]
-    ]);
-    let (x, wt, idx, out) = (local(1), local(2), local(3), local(4));
-    let col = al.add(Ty::Usize, false);
-    let lane = al.add(Ty::Usize, false);
-    let n_col = al.add(Ty::Usize, false); // col % N
-    let b_row = al.add(Ty::Usize, false); // col / N  (the output/activation row t)
-    let x_off = al.add(Ty::Usize, false); // b_row * K  (x's row base)
-    let e_f = al.add(Ty::F32, false); // idx[b_row]
-    let e = al.add(Ty::Usize, false); // (usize) e_f  (the expert id)
-    let w_base = al.add(Ty::Usize, false); // e * (K*N)  (the expert's weight slab base)
-    let aidx = al.add(Ty::Usize, false);
-    let partial = al.add(Ty::F32, true);
-    let j = al.add(Ty::Usize, true);
-    let j_lt = al.add(Ty::Bool, false);
-    let bidx = al.add(Ty::Usize, false);
-    let av = al.add(Ty::F32, false);
-    let bv = al.add(Ty::F32, false);
-    let prod = al.add(Ty::F32, false);
-    let part_new = al.add(Ty::F32, false);
-    let j_new = al.add(Ty::Usize, false);
-    let cmp0 = al.add(Ty::Bool, false);
-    let acc = al.add(Ty::F32, true);
-    let kk = al.add(Ty::Usize, true);
-    let k_lt = al.add(Ty::Bool, false);
-    let lv = al.add(Ty::F32, false);
-    let acc_new = al.add(Ty::F32, false);
-    let k_new = al.add(Ty::Usize, false);
-    let cu = |x: usize| Operand::Const(Constant::Usize(x as u64));
-    let cf = |x: f32| Operand::Const(Constant::F32(x));
-    let goto = |bb: u32| Terminator::Goto {
-        target: BlockId { index: bb },
-    };
-
-    let bb0 = BasicBlock {
-        statements: vec![],
-        terminator: Terminator::ThreadIndexCall {
-            destination: Place::local(col),
-            dim: IndexAxis::GroupX,
-            target: BlockId { index: 1 },
-        },
-    };
-    let bb1 = BasicBlock {
-        statements: vec![],
-        terminator: Terminator::ThreadIndexCall {
-            destination: Place::local(lane),
-            dim: IndexAxis::LocalX,
-            target: BlockId { index: 2 },
-        },
-    };
-    // bb2: n_col=col%N; b_row=col/N; x_off=b_row*K; e=(usize)idx[b_row]; w_base=e*(K*N); partial=0; j=lane
-    let bb2 = BasicBlock {
-        statements: vec![
-            Statement::Assign(
-                Place::local(n_col),
-                Rvalue::BinaryOp(BinOp::Rem, copy(Place::local(col)), cu(n)),
-            ),
-            Statement::Assign(
-                Place::local(b_row),
-                Rvalue::BinaryOp(BinOp::Div, copy(Place::local(col)), cu(n)),
-            ),
-            Statement::Assign(
-                Place::local(x_off),
-                Rvalue::BinaryOp(BinOp::Mul, copy(Place::local(b_row)), cu(k)),
-            ),
-            Statement::Assign(Place::local(e_f), Rvalue::Use(copy(elem(idx, b_row)))),
-            Statement::Assign(
-                Place::local(e),
-                Rvalue::Cast {
-                    to: Ty::Usize,
-                    operand: copy(Place::local(e_f)),
-                },
-            ),
-            Statement::Assign(
-                Place::local(w_base),
-                Rvalue::BinaryOp(BinOp::Mul, copy(Place::local(e)), cu(k * n)),
-            ),
-            Statement::Assign(Place::local(partial), Rvalue::Use(cf(0.0))),
-            Statement::Assign(Place::local(j), Rvalue::Use(copy(Place::local(lane)))),
-        ],
-        terminator: goto(3),
-    };
-    let bb3 = BasicBlock {
-        statements: vec![Statement::Assign(
-            Place::local(j_lt),
-            Rvalue::BinaryOp(BinOp::Lt, copy(Place::local(j)), cu(k)),
-        )],
-        terminator: guard(j_lt, 5, 4),
-    };
-    // bb4: partial += x[x_off + j] * w[w_base + j*N + n_col]; j += w
-    let bb4 = BasicBlock {
-        statements: vec![
-            Statement::Assign(
-                Place::local(aidx),
-                Rvalue::BinaryOp(BinOp::Add, copy(Place::local(x_off)), copy(Place::local(j))),
-            ),
-            Statement::Assign(Place::local(av), Rvalue::Use(copy(elem(x, aidx)))),
-            Statement::Assign(
-                Place::local(bidx),
-                Rvalue::BinaryOp(BinOp::Mul, copy(Place::local(j)), cu(n)),
-            ),
-            Statement::Assign(
-                Place::local(bidx),
-                Rvalue::BinaryOp(
-                    BinOp::Add,
-                    copy(Place::local(bidx)),
-                    copy(Place::local(n_col)),
-                ),
-            ),
-            Statement::Assign(
-                Place::local(bidx),
-                Rvalue::BinaryOp(
-                    BinOp::Add,
-                    copy(Place::local(bidx)),
-                    copy(Place::local(w_base)),
-                ),
-            ),
-            Statement::Assign(Place::local(bv), Rvalue::Use(copy(elem(wt, bidx)))),
-            Statement::Assign(
-                Place::local(prod),
-                Rvalue::BinaryOp(BinOp::Mul, copy(Place::local(av)), copy(Place::local(bv))),
-            ),
-            Statement::Assign(
-                Place::local(part_new),
-                Rvalue::BinaryOp(
-                    BinOp::Add,
-                    copy(Place::local(partial)),
-                    copy(Place::local(prod)),
-                ),
-            ),
-            Statement::Assign(
-                Place::local(partial),
-                Rvalue::Use(copy(Place::local(part_new))),
-            ),
-            Statement::Assign(
-                Place::local(j_new),
-                Rvalue::BinaryOp(BinOp::Add, copy(Place::local(j)), cu(w)),
-            ),
-            Statement::Assign(Place::local(j), Rvalue::Use(copy(Place::local(j_new)))),
-        ],
-        terminator: goto(3),
-    };
-    let bb5 = BasicBlock {
-        statements: vec![Statement::WorkgroupLocalWrite {
-            idx: copy(Place::local(lane)),
-            value: copy(Place::local(partial)),
-            array: 0,
-        }],
-        terminator: Terminator::Barrier {
-            target: BlockId { index: 6 },
-        },
-    };
-    let bb6 = BasicBlock {
-        statements: vec![Statement::Assign(
-            Place::local(cmp0),
-            Rvalue::BinaryOp(BinOp::Eq, copy(Place::local(lane)), cu(0)),
-        )],
-        terminator: guard(cmp0, 11, 7),
-    };
-    let bb7 = BasicBlock {
-        statements: vec![
-            Statement::Assign(Place::local(acc), Rvalue::Use(cf(0.0))),
-            Statement::Assign(Place::local(kk), Rvalue::Use(cu(0))),
-        ],
-        terminator: goto(8),
-    };
-    let bb8 = BasicBlock {
-        statements: vec![Statement::Assign(
-            Place::local(k_lt),
-            Rvalue::BinaryOp(BinOp::Lt, copy(Place::local(kk)), cu(w)),
-        )],
-        terminator: guard(k_lt, 10, 9),
-    };
-    let bb9 = BasicBlock {
-        statements: vec![
-            Statement::Assign(
-                Place::local(lv),
-                Rvalue::WorkgroupLocalRead {
-                    idx: copy(Place::local(kk)),
-                    array: 0,
-                },
-            ),
-            Statement::Assign(
-                Place::local(acc_new),
-                Rvalue::BinaryOp(BinOp::Add, copy(Place::local(acc)), copy(Place::local(lv))),
-            ),
-            Statement::Assign(Place::local(acc), Rvalue::Use(copy(Place::local(acc_new)))),
-            Statement::Assign(
-                Place::local(k_new),
-                Rvalue::BinaryOp(BinOp::Add, copy(Place::local(kk)), cu(1)),
-            ),
-            Statement::Assign(Place::local(kk), Rvalue::Use(copy(Place::local(k_new)))),
-        ],
-        terminator: goto(8),
-    };
-    let bb10 = BasicBlock {
-        statements: vec![Statement::Assign(
-            elem(out, col),
-            Rvalue::Use(copy(Place::local(acc))),
-        )],
-        terminator: Terminator::Return,
-    };
-    let bb11 = BasicBlock {
-        statements: vec![],
-        terminator: Terminator::Return,
-    };
-    let mut body = Body::new(
-        name,
-        4, // data params: x, w, idx, out
-        al.locals,
-        vec![bb0, bb1, bb2, bb3, bb4, bb5, bb6, bb7, bb8, bb9, bb10, bb11],
     );
     body.workgroup_size = [w as u32, 1, 1];
     body.workgroup_locals = vec![WorkgroupLocalDecl {

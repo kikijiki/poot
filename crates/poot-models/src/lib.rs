@@ -16,7 +16,6 @@ pub mod names;
 pub mod registry;
 
 pub use architectures::*;
-pub use components::{moe_decode, moe_prefill};
 pub use multimodal::*;
 
 #[cfg(test)]

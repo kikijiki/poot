@@ -206,7 +206,7 @@ fn main() {
         );
         report("gather", &g, &[5.0, 6.0, 1.0, 2.0, 3.0, 4.0], &mut failures);
     }
-    // dyn_update_slice (KV slot write): operand[2,4,3]=0..24, write update[2,1,3] at slot idx=2
+    // DynamicUpdateSlice (KV slot write): operand[2,4,3]=0..24, write update[2,1,3] at slot idx=2
     // on axis 1; slot 2 (flat 6..9 and 18..21) is overwritten, the rest preserved.
     if maybe_skip(&dir, "dus") {
         let operand: Vec<f32> = (0..24).map(|i| i as f32).collect();
@@ -363,13 +363,12 @@ fn main() {
         report_close("imported_tiled_gemm", &got, &want, 1e-4, &mut failures);
     }
 
-    // Flash attention decode: the online-softmax kernel with a private o[D] array (NVPTX-only). Dims
-    // match the staged kernel (Hq=4, n_rep=2, cap=6, D=8); one thread per head. Compared to
-    // flash_decode_ref (CPU-verified == direct attention).
-    if std::path::Path::new(&format!("{dir}/flash_decode.ptx")).exists() {
-        let (hq, n_rep, cap, d) = (4usize, 2usize, 6usize, 8usize);
+    // Attention decode: the generated online-softmax kernel, 4 lanes per head. Dims match the staged kernel
+    // (Hq=4, n_rep=2, 6 keys, D=8); compared to the textbook two-pass attention.
+    if std::path::Path::new(&format!("{dir}/attention_decode.ptx")).exists() {
+        let (hq, n_rep, cap, d, lanes) = (4usize, 2usize, 6usize, 8usize, 4usize);
         let hkv = hq / n_rep;
-        let scale = 1.0f32 / (d as f32).sqrt();
+        let scale = 0.35355338f32;
         let q = det_fill(hq * d, 1);
         let k = det_fill(hkv * cap * d, 2);
         let v = det_fill(hkv * cap * d, 3);
@@ -379,15 +378,15 @@ fn main() {
         let got = run(
             &ctx,
             &dir,
-            "flash_decode",
-            "flash_decode",
+            "attention_decode",
+            "attention_decode",
             &[&q, &k, &v, &mask],
             hq * d,
-            [64, 1, 1],
-            [hq as u32, 1, 1],
+            [lanes as u32, 1, 1],
+            [(hq * lanes) as u32, 1, 1],
         );
-        let want = flash_decode_ref(&q, &k, &v, &mask, hq, n_rep, cap, d, scale);
-        report_close("flash_decode", &got, &want, 1e-4, &mut failures);
+        let want = attention_decode_ref(&q, &k, &v, &mask, hq, n_rep, cap, d, scale);
+        report_close("attention_decode", &got, &want, 1e-4, &mut failures);
     }
 
     if failures == 0 {
@@ -481,7 +480,7 @@ fn run_dims(
     ctx.download_f32(&out).expect("download")
 }
 
-/// Deterministic pseudo-random fill in [-1, 1) (xorshift64), matching `tests/flash_ref.rs::fill`.
+/// Deterministic pseudo-random fill in [-1, 1) (xorshift64), matching `poot-kernelgen`'s `tests/flash_interp.rs::fill`.
 fn det_fill(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed | 1;
     (0..n)
@@ -494,10 +493,9 @@ fn det_fill(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-/// The online-softmax decode reference (one thread per head's scalar recurrence). Mirrors
-/// `poot-kernelgen/tests/flash_ref.rs::flash_decode_ref`, which is verified == direct attention on CPU.
+/// The textbook two-pass decode attention: `softmax(scale * q.k + mask) @ v` per head, GQA `kv = h / n_rep`.
 #[allow(clippy::too_many_arguments)]
-fn flash_decode_ref(
+fn attention_decode_ref(
     q: &[f32],
     k: &[f32],
     v: &[f32],
@@ -511,26 +509,22 @@ fn flash_decode_ref(
     let mut out = vec![0.0f32; hq * d];
     for h in 0..hq {
         let kv = h / n_rep;
-        let mut m = f32::NEG_INFINITY;
-        let mut l = 0.0f32;
-        let mut o = vec![0.0f32; d];
-        for t in 0..cap {
-            let mut s = 0.0f32;
-            for dd in 0..d {
-                s += q[h * d + dd] * k[kv * cap * d + t * d + dd];
-            }
-            s = s * scale + mask[t];
-            let m_new = m.max(s);
-            let corr = (m - m_new).exp();
-            let e = (s - m_new).exp();
-            l = l * corr + e;
-            for dd in 0..d {
-                o[dd] = o[dd] * corr + e * v[kv * cap * d + t * d + dd];
-            }
-            m = m_new;
-        }
-        for dd in 0..d {
-            out[h * d + dd] = o[dd] / l;
+        let scores: Vec<f32> = (0..cap)
+            .map(|t| {
+                let dot: f32 = (0..d)
+                    .map(|c| q[h * d + c] * k[kv * cap * d + t * d + c])
+                    .sum();
+                dot * scale + mask[t]
+            })
+            .collect();
+        let top = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let weights: Vec<f32> = scores.iter().map(|s| (s - top).exp()).collect();
+        let denominator: f32 = weights.iter().sum();
+        for c in 0..d {
+            let acc: f32 = (0..cap)
+                .map(|t| weights[t] * v[kv * cap * d + t * d + c])
+                .sum();
+            out[h * d + c] = acc / denominator;
         }
     }
     out

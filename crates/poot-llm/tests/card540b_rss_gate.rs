@@ -32,8 +32,12 @@ fn resident_load_of_a_real_bf16_checkpoint_peaks_under_one_point_five_x_file_siz
         let baseline_rss = proc_status_kib("VmRSS") * 1024;
         let baseline_peak = proc_status_kib("VmHWM") * 1024;
         let registry = poot_models::registry::Registry::builtin().expect("builtin registry");
-        let handle = poot_llm::driver::ModelHandle::load(std::path::Path::new(&dir), &registry)
-            .expect("load");
+        let handle = poot_llm::driver::ModelHandle::load(
+            std::path::Path::new(&dir),
+            &registry,
+            &poot_llm::driver::LoadOptions::default(),
+        )
+        .expect("load");
         std::hint::black_box(&handle);
         let peak_rss = proc_status_kib("VmHWM") * 1024;
         let incremental_peak = peak_rss.saturating_sub(baseline_rss);

@@ -38,7 +38,7 @@ set -euo pipefail
 # cargo-mutants itself silently seeds nothing for such a row (Card 1013).
 readonly modules=(
   "matcher|poot-graph-plan|crates/poot-graph-plan/src/passes/attention_match.rs|match_attention|match_pre_mask|peel_repeat_kv"
-  "planner|poot-graph-plan|crates/poot-graph-plan/src/predicates.rs|is_movement_view_candidate|gemv_grid|flash_decode_width|is_tiled_gemm_in|tiled_gemm_plan"
+  "planner|poot-graph-plan|crates/poot-graph-plan/src/predicates.rs|is_movement_view_candidate|gemv_grid|attention_lanes|is_tiled_gemm_in|tiled_gemm_plan"
   "eval|poot-eval|crates/poot-eval/src/ops/cast.rs crates/poot-eval/src/walk.rs|narrow_f32|store_as|evaluate_composite"
   "runner|poot-llm|crates/poot-llm/src/core/sampler.rs crates/poot-llm/src/core/generate.rs|Sampler::adjust|Sampler::apply_constraint_mask|Sampler::truncated_candidates|Sampler::pick|Runner::generate_sampled|Runner::generate_kv_masked_tokens|Runner::hit_stop"
   # Epic 493's M4 packed-weight sample (designs/mutants-m4.md). These seeds name the function, not

@@ -64,7 +64,7 @@ fn moe_sparse_vs_dense_decode_timing() {
     let s0 = step_resident(&mut gpu, exe_s, entry_s, &gs);
     // Sparse uses the indexed LDS-GEMV (tree-ish reduction), dense sums serially, so they differ by the usual f32
     // reduction-order amount (~2e-3 relative), not bit-exactly. A loose sanity bound; the exact oracles are
-    // `indexed_gemv_lds_large_matches_cpu` and `moe_sparse_gpu_matches_dense`.
+    // `indexed_matmul_matches_the_oracle_bit_for_bit` and `moe_sparse_gpu_matches_dense`.
     for (a, b) in s0.as_f32().unwrap().iter().zip(d0.as_f32().unwrap().iter()) {
         assert!(
             (a - b).abs() <= 1e-2 * b.abs() + 1e-2,
@@ -226,6 +226,89 @@ fn moe_sparse_gpu_matches_dense() {
         assert!(
             (a - b).abs() <= tol,
             "sparse != dense MoE on GPU at {j}: {a} vs {b}"
+        );
+    }
+}
+
+/// The decode sparse MoE (`k` rows, each routed to its own expert) against the CPU oracle at tier 2 over a
+/// model-shaped graph whose experts are well separated: expert `e`'s weights are scaled by `e + 1` and carry their
+/// own pattern, so a row that reads another row's expert moves the logits by far more than the tolerance.
+///
+/// Mutation (`emit_row_expert`): read `ids[0]` for every row; the second and third selected experts are replaced by
+/// the first and the output goes red.
+#[test]
+fn moe_sparse_decode_with_separated_experts_matches_the_oracle() {
+    use poot_graph_ir::ops::moe_sparse;
+    let _gpu_guard = gpu_lock();
+    let Some((mut gpu, target)) = open_engine_or_skip() else {
+        return;
+    };
+    let (e, k, h, i) = (8usize, 3usize, 16usize, 12usize);
+    let fill = |n: usize, seed: u64| -> Vec<f32> {
+        (0..n)
+            .map(|j| (((j as u64 * 2654435761 + seed * 40503) % 1009) as f32) / 505.0 - 1.0)
+            .collect()
+    };
+    let scaled = |per_expert: usize, seed: u64| -> Vec<f32> {
+        (0..e)
+            .flat_map(|expert| {
+                fill(per_expert, seed + expert as u64 * 7)
+                    .into_iter()
+                    .map(move |v| v * (expert + 1) as f32)
+            })
+            .collect()
+    };
+    let mut data: HashMap<String, Vec<f32>> = HashMap::new();
+    data.insert("x".into(), fill(h, 1));
+    data.insert("router".into(), fill(h * e, 2));
+    data.insert("w_in".into(), scaled(h * 2 * i, 3));
+    data.insert("w_out".into(), scaled(i * h, 4));
+    let b = Builder::new();
+    let x = b.constant("x", TensorType::f32(vec![1, 1, h]));
+    let router = b.constant("router", TensorType::f32(vec![h, e]));
+    let w_in = b.constant("w_in", TensorType::f32(vec![e, h, 2 * i]));
+    let w_out = b.constant("w_out", TensorType::f32(vec![e, i, h]));
+    let out = moe_sparse(&b, x, router, w_in, w_out, e, k, i);
+    let g = b.finish(out);
+    let inputs: HashMap<_, HostTensor> = g
+        .inputs
+        .iter()
+        .map(|&id| {
+            let meta = g.meta(id);
+            let name = meta.name.as_deref().unwrap();
+            (
+                id,
+                HostTensor::f32(meta.aval.shape.clone(), data[name].clone()),
+            )
+        })
+        .collect();
+    let eval_inputs: HashMap<_, Value> = inputs
+        .iter()
+        .map(|(&id, t)| (id, Value::from(t.clone())))
+        .collect();
+    let want = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        .unwrap()
+        .output
+        .into_host()
+        .unwrap();
+    let got = run_via_contract(&mut gpu, target, &g, &inputs);
+    assert_eq!(got.shape(), want.shape());
+    let scale = want
+        .as_f32()
+        .unwrap()
+        .iter()
+        .fold(0.0f32, |m, v| m.max(v.abs()));
+    assert!(scale > 1.0, "the fixture must produce a signal: {scale}");
+    for (j, (a, b)) in got
+        .as_f32()
+        .unwrap()
+        .iter()
+        .zip(want.as_f32().unwrap())
+        .enumerate()
+    {
+        assert!(
+            (a - b).abs() <= 1e-4 * scale,
+            "decode MoE on the device differs from the oracle at {j}: {a} vs {b}"
         );
     }
 }

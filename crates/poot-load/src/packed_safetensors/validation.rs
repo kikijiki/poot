@@ -763,6 +763,45 @@ pub(crate) fn check_pin(
     Ok(())
 }
 
+/// [`check_pin`] for a file too large to hold: the reader is hashed in fixed chunks, once, and its
+/// total length and digest compared with `pin`. A short or long file is `ArtifactChanged`, a
+/// different digest `DigestMismatch`, a failed read `Io`; the same errors as the byte form.
+pub fn check_pin_reader(
+    mut reader: impl std::io::Read,
+    pin: FilePin,
+    name: &str,
+) -> Result<(), PackedSafetensorsError> {
+    let mut context = Context::new(&SHA256);
+    let mut buffer = [0u8; HASH_BUFFER_BYTES];
+    let mut total = 0usize;
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| PackedSafetensorsError::Io {
+                file: name.to_string(),
+                error,
+            })?;
+        if read == 0 {
+            break;
+        }
+        context.update(&buffer[..read]);
+        total += read;
+    }
+    if total != pin.length {
+        return Err(PackedSafetensorsError::ArtifactChanged {
+            file: name.to_string(),
+        });
+    }
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(context.finish().as_ref());
+    if Sha256Digest(digest) != pin.sha256 {
+        return Err(PackedSafetensorsError::DigestMismatch {
+            file: name.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// The one generic integrity step (card 544) every small file the loader reads - `config.json`,
 /// the shard index, a tokenizer file, a chat template - goes through: admit it with exactly one
 /// read of its content. A pin, when given, is checked against a digest computed from that same
@@ -1196,5 +1235,42 @@ mod tests {
             bypassed, tampered,
             "the bypass admits exactly the tampered bytes admit_file refused above"
         );
+    }
+
+    /// The streamed pin check agrees with the whole-buffer one: an input several chunks long with a
+    /// partial last chunk, one exactly a chunk long, and an empty file are admitted under their own
+    /// pin, refused as `DigestMismatch` when one byte differs and as `ArtifactChanged` under a wrong
+    /// length. Mutation: drop the last byte of every read from the hash in `check_pin_reader`
+    /// (`context.update(&buffer[..read - 1])`); the multi-chunk row fails with `DigestMismatch` for
+    /// the file it should admit.
+    #[test]
+    fn the_streamed_pin_check_equals_the_whole_buffer_one() {
+        for len in [0, HASH_BUFFER_BYTES, 3 * HASH_BUFFER_BYTES + 17] {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
+            let pin = FilePin {
+                length: len,
+                sha256: sha256_digest(&bytes),
+            };
+            check_pin_reader(bytes.as_slice(), pin, "f").unwrap_or_else(|e| panic!("{len}: {e:?}"));
+            check_pin(&bytes, Some(pin), "f").unwrap();
+            let mut other = bytes.clone();
+            if let Some(last) = other.last_mut() {
+                *last ^= 1;
+                let error = check_pin_reader(other.as_slice(), pin, "f").unwrap_err();
+                assert!(matches!(
+                    error,
+                    PackedSafetensorsError::DigestMismatch { .. }
+                ));
+            }
+            let short = FilePin {
+                length: len + 1,
+                ..pin
+            };
+            let error = check_pin_reader(bytes.as_slice(), short, "f").unwrap_err();
+            assert!(matches!(
+                error,
+                PackedSafetensorsError::ArtifactChanged { .. }
+            ));
+        }
     }
 }

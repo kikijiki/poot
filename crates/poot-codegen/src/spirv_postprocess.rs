@@ -255,120 +255,189 @@ pub fn fix_fence_semantics(words: Vec<u32>) -> Vec<u32> {
     out
 }
 
-/// Decorate the compiled module's marked float binops `NoContraction` (card 628):
-/// `ordinals` are 0-indexed positions into the instruction-stream order of every `OpFAdd`/`OpFSub`/`OpFMul`
-/// the module contains, as `Emitter::float_binop_ordinal` counted them while walking the source `Body`
-/// (`emit_llvm_ir_marked`; every `Rvalue::BinaryOp` and `Rvalue::BinaryOpNoContract` float Add/Sub/Mul
-/// counts, so the ordinals line up with the compiled stream one for one).
-///
-/// LLVM 22.1.5's SPIR-V backend does not translate any LLVM-level marker (a fast-math flag, a constrained
-/// intrinsic) into a `NoContraction` decoration - checked directly: a `contract`-flagged and a plain
-/// `fmul`/`fsub` compile to byte-identical SPIR-V, neither decorated - so the decoration has to be added to
-/// the compiled binary instead. That only works because `SpirvVulkan` always compiles at `-O0` (its only
-/// `llc_args` opt level): with no CSE, reassociation, dead-code elimination or instruction reordering, the
-/// Nth float `OpFAdd`/`OpFSub`/`OpFMul` in the compiled module is exactly the op `emit_llvm_ir_marked`
-/// counted as the Nth one in the source body - checked directly (`add_kernel`/three-op probe fixtures
-/// compile to the same op count and order as their source statements).
-///
-/// `OpDecorate` must sit in the module's dedicated annotation section - after the debug instructions
-/// (`OpName` etc.) and before the first type/constant/global-variable declaration (SPIR-V's logical layout
-/// rule; `spirv-val` rejects a `OpDecorate` placed later, e.g. right before `OpFunction`, as "in an invalid
-/// layout section"). Every poot module llc emits already carries at least the buffer binding decorations
-/// (`OpDecorate %bufN DescriptorSet`/`Binding`) whenever it has a float op to decorate at all (both need a
-/// buffer operand), so inserting right after the last existing `OpDecorate`/`OpMemberDecorate` keeps every
-/// decoration contiguous and lands well inside the annotation section. `Err` when the compiled module has
-/// no existing decoration to anchor on, or does not contain as many float binops as `ordinals` names (an
-/// emitter/postprocess ordinal drift - a silently-missing decoration is the exact bug this function exists
-/// to prevent, so a mismatch is a loud, typed failure rather than a best-effort no-op like the barrier/fence
-/// fixups above). No-op for an empty `ordinals` or non-SPIR-V input.
-/// Why [`fix_no_contraction`] could not place every requested decoration: an emitter/postprocess ordinal
-/// drift (card 628), not a malformed body (that fails at `body.verify()` earlier).
+/// The name prefix of the identity stub a marked float binop's result passes through on `SpirvVulkan` (see
+/// `Emitter::emit_binop_no_contract`); the emitter appends the operand type, so each type has its own stub.
+pub(crate) const NO_CONTRACT_MARKER: &str = "__poot_no_contract";
+
+/// Why [`fix_no_contraction`] could not place the markers: a malformed module, not a malformed body (that
+/// fails at `body.verify()` earlier).
 #[derive(Debug, thiserror::Error)]
 pub enum NoContractionError {
     #[error("no existing OpDecorate/OpMemberDecorate to anchor the new decoration after")]
     NoAnchor,
-    #[error(
-        "{requested} no-contraction ordinal(s) requested, only {found} float Add/Sub/Mul op(s) found in \
-         the compiled module ({total} total)"
-    )]
-    OrdinalMismatch {
-        requested: usize,
-        found: usize,
-        total: usize,
-    },
+    #[error("a no-contraction marker call has {operands} operand(s), expected one")]
+    MalformedMarkerCall { operands: usize },
 }
 
-pub fn fix_no_contraction(
-    words: Vec<u32>,
-    ordinals: &[usize],
-) -> Result<Vec<u32>, NoContractionError> {
-    if ordinals.is_empty() || words.len() < 5 || words[0] != MAGIC {
+/// Decorate every marked float binop `NoContraction` (card 628) and remove the markers.
+///
+/// LLVM 22.1.5's SPIR-V backend does not translate any LLVM-level marker (a fast-math flag, a constrained
+/// intrinsic, `!spirv.Decorations`) into a `NoContraction` decoration, and it lays out blocks in an order
+/// of its own, so the position of an op in the compiled stream does not identify the source op. The emitter
+/// therefore passes each marked op's result through a call to an identity stub named
+/// [`NO_CONTRACT_MARKER`] plus a type suffix. llc compiles that to `OpFunctionCall <stub> %marked`, an
+/// import declaration plus that call. This pass decorates every `%marked` and rewrites each call into
+/// an `OpCopyObject` of it (the call's result id keeps its uses), then drops the stub's declaration, name
+/// and `Import` decoration, and `OpCapability Linkage` when no other linkage decoration remains (Vulkan
+/// forbids it).
+///
+/// `OpDecorate` must sit in the module's annotation section, so the new decorations go right after the last
+/// surviving `OpDecorate`/`OpMemberDecorate`; every poot module llc emits carries the buffer binding
+/// decorations whenever it has a float op to decorate (both need a buffer operand). `Err` when the module
+/// has no decoration to anchor on, or a marker call is malformed: a silently missing decoration is the bug
+/// this pass exists to prevent, so a malformed module is a loud, typed failure. No-op for a module with no
+/// marker, or non-SPIR-V input.
+pub fn fix_no_contraction(words: Vec<u32>) -> Result<Vec<u32>, NoContractionError> {
+    if words.len() < 5 || words[0] != MAGIC {
         return Ok(words);
     }
 
-    const OP_FADD: u16 = 129;
-    const OP_FSUB: u16 = 131;
-    const OP_FMUL: u16 = 133;
+    const OP_NAME: u16 = 5;
+    const OP_CAPABILITY: u16 = 17;
+    const OP_FUNCTION: u16 = 54;
+    const OP_FUNCTION_PARAMETER: u16 = 55;
+    const OP_FUNCTION_END: u16 = 56;
+    const OP_FUNCTION_CALL: u16 = 57;
     const OP_DECORATE: u16 = 71;
     const OP_MEMBER_DECORATE: u16 = 72;
+    const OP_COPY_OBJECT: u16 = 83;
+    const DECORATION_LINKAGE_ATTRIBUTES: u32 = 41;
     const DECORATION_NO_CONTRACTION: u32 = 42;
+    const LINKAGE_TYPE_IMPORT: u32 = 1;
+    const CAPABILITY_LINKAGE: u32 = 5;
 
-    let wanted: std::collections::HashSet<usize> = ordinals.iter().copied().collect();
-
+    // Pass 1: the marker stubs (by their `Import` decoration), every linkage decoration, and the
+    // `Linkage` capability.
+    let mut markers: std::collections::HashMap<u32, (usize, usize)> =
+        std::collections::HashMap::new();
+    let mut linkage_decorations: Vec<(usize, usize)> = Vec::new();
+    let mut linkage_capability: Option<(usize, usize)> = None;
     let mut i = 5;
-    let mut ordinal = 0usize;
-    let mut target_ids: Vec<u32> = Vec::new();
-    let mut last_decoration_end: Option<usize> = None;
     while i < words.len() {
-        let header = words[i];
-        let wc = (header >> 16) as usize;
-        let op = (header & 0xFFFF) as u16;
+        let wc = (words[i] >> 16) as usize;
+        let op = (words[i] & 0xFFFF) as u16;
         if wc == 0 {
-            break; // malformed; bail out without changing anything
+            return Ok(words); // malformed; bail out without changing anything
         }
         match op {
-            OP_DECORATE | OP_MEMBER_DECORATE => {
-                last_decoration_end = Some(i + wc);
+            OP_CAPABILITY if wc == 2 && words[i + 1] == CAPABILITY_LINKAGE => {
+                linkage_capability = Some((i, i + wc));
             }
-            OP_FADD | OP_FSUB | OP_FMUL if wc == 5 => {
-                // OpFAdd/OpFSub/OpFMul <type-id> <result-id> <operand1> <operand2> (wordcount 5: the
-                // header word, then those four).
-                if wanted.contains(&ordinal) {
-                    target_ids.push(words[i + 2]);
+            OP_DECORATE if wc >= 5 && words[i + 2] == DECORATION_LINKAGE_ATTRIBUTES => {
+                linkage_decorations.push((i, i + wc));
+                if words[i + wc - 1] == LINKAGE_TYPE_IMPORT
+                    && decode_string(&words, i + 3, i + wc - 1).starts_with(NO_CONTRACT_MARKER)
+                {
+                    markers.insert(words[i + 1], (i, i + wc));
                 }
-                ordinal += 1;
             }
             _ => {}
         }
         i += wc;
     }
+    if markers.is_empty() {
+        return Ok(words);
+    }
 
-    let Some(insert_at) = last_decoration_end else {
+    // Pass 2: each marker's name and declaration, every call to one, and the annotation anchor.
+    let mut deleted: Vec<(usize, usize)> = markers.values().copied().collect();
+    // (call start, call word count, decorated id)
+    let mut calls: Vec<(usize, usize, u32)> = Vec::new();
+    let mut decorate_spans: Vec<(usize, usize)> = Vec::new();
+    i = 5;
+    while i < words.len() {
+        let wc = (words[i] >> 16) as usize;
+        let op = (words[i] & 0xFFFF) as u16;
+        match op {
+            OP_NAME if wc >= 2 && markers.contains_key(&words[i + 1]) => deleted.push((i, i + wc)),
+            OP_FUNCTION if wc == 5 && markers.contains_key(&words[i + 2]) => {
+                // A declaration: parameters, then `OpFunctionEnd`, no block.
+                let mut j = i + wc;
+                while j < words.len() && (words[j] & 0xFFFF) as u16 == OP_FUNCTION_PARAMETER {
+                    j += (words[j] >> 16) as usize;
+                }
+                if j < words.len() && (words[j] & 0xFFFF) as u16 == OP_FUNCTION_END {
+                    deleted.push((i, j + (words[j] >> 16) as usize));
+                }
+            }
+            OP_FUNCTION_CALL if wc >= 4 && markers.contains_key(&words[i + 3]) => {
+                if wc != 5 {
+                    return Err(NoContractionError::MalformedMarkerCall { operands: wc - 4 });
+                }
+                calls.push((i, wc, words[i + 4]));
+            }
+            OP_DECORATE | OP_MEMBER_DECORATE => decorate_spans.push((i, i + wc)),
+            _ => {}
+        }
+        i += wc;
+    }
+
+    // `Linkage` is required by any `Import`/`Export` decoration: drop it only when every one goes.
+    if let Some(span) = linkage_capability
+        && linkage_decorations.iter().all(|d| deleted.contains(d))
+    {
+        deleted.push(span);
+    }
+    let in_deleted = |at: usize| deleted.iter().any(|&(start, end)| at >= start && at < end);
+    let Some(insert_at) = decorate_spans
+        .iter()
+        .filter(|&&(start, _)| !in_deleted(start))
+        .map(|&(_, end)| end)
+        .max()
+    else {
         return Err(NoContractionError::NoAnchor);
     };
-    if target_ids.len() != wanted.len() {
-        return Err(NoContractionError::OrdinalMismatch {
-            requested: wanted.len(),
-            found: target_ids.len(),
-            total: ordinal,
-        });
-    }
 
-    let mut new_decorations: Vec<u32> = Vec::with_capacity(target_ids.len() * 3);
-    for id in &target_ids {
-        new_decorations.push((3u32 << 16) | OP_DECORATE as u32);
-        new_decorations.push(*id);
-        new_decorations.push(DECORATION_NO_CONTRACTION);
+    let mut new_decorations: Vec<u32> = Vec::with_capacity(calls.len() * 3);
+    for &(_, _, marked) in &calls {
+        new_decorations.extend_from_slice(&[
+            (3u32 << 16) | OP_DECORATE as u32,
+            marked,
+            DECORATION_NO_CONTRACTION,
+        ]);
     }
+    let call_at: std::collections::HashMap<usize, u32> = calls
+        .iter()
+        .map(|&(start, _, marked)| (start, marked))
+        .collect();
 
     let mut out = Vec::with_capacity(words.len() + new_decorations.len());
-    for (idx, &w) in words.iter().enumerate() {
-        if idx == insert_at {
+    out.extend_from_slice(&words[..5]);
+    i = 5;
+    while i < words.len() {
+        let wc = (words[i] >> 16) as usize;
+        if i == insert_at {
             out.extend_from_slice(&new_decorations);
         }
-        out.push(w);
+        if let Some(&marked) = call_at.get(&i) {
+            // OpFunctionCall <type> <result> <function> <arg>  ->  OpCopyObject <type> <result> <arg>
+            out.extend_from_slice(&[
+                (4u32 << 16) | OP_COPY_OBJECT as u32,
+                words[i + 1],
+                words[i + 2],
+                marked,
+            ]);
+        } else if !in_deleted(i) {
+            out.extend_from_slice(&words[i..i + wc]);
+        }
+        i += wc;
     }
     Ok(out)
+}
+
+/// Decode the null-terminated `LiteralString` packed 4 bytes/word (little-endian) from `words[start..end]`.
+fn decode_string(words: &[u32], start: usize, end: usize) -> String {
+    let mut s = String::new();
+    'outer: for &w in &words[start..end] {
+        for shift in [0, 8, 16, 24] {
+            let b = ((w >> shift) & 0xFF) as u8;
+            if b == 0 {
+                break 'outer;
+            }
+            s.push(b as char);
+        }
+    }
+    s
 }
 
 /// Rewrite Import-linkage `OpFunctionCall`s to the LLVM SPIR-V backend's
@@ -435,21 +504,6 @@ pub fn fix_coopmat_calls(words: Vec<u32>) -> Vec<u32> {
         CompositeConstruct,
     }
 
-    // Decode the null-terminated `LiteralString` packed 4 bytes/word (little-endian) from `words[start..end]`.
-    fn decode_string(words: &[u32], start: usize, end: usize) -> String {
-        let mut s = String::new();
-        'outer: for &w in &words[start..end] {
-            for shift in [0, 8, 16, 24] {
-                let b = ((w >> shift) & 0xFF) as u8;
-                if b == 0 {
-                    break 'outer;
-                }
-                s.push(b as char);
-            }
-        }
-        s
-    }
-
     fn classify(name: &str) -> Option<Kind> {
         if name.contains("CooperativeMatrixLoadKHR") {
             Some(Kind::Load)
@@ -482,8 +536,10 @@ pub fn fix_coopmat_calls(words: Vec<u32>) -> Vec<u32> {
             bytes.push(0);
         }
         bytes
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
             .collect()
     }
 
@@ -921,7 +977,9 @@ mod tests {
             bytes.push(0);
         }
         bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect()
     }
@@ -1184,7 +1242,9 @@ mod tests {
         );
 
         let before_words: Vec<u32> = before_bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         let after_words = fix_coopmat_calls(before_words);
@@ -1267,7 +1327,9 @@ mod tests {
         );
 
         let before_words: Vec<u32> = before_bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         let after_words = fix_coopmat_calls(before_words);

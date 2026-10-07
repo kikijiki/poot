@@ -11,24 +11,30 @@
 use poot_graph_ir::graph::{ComputedConst, Graph, Storage, ValidationChannel};
 use poot_graph_ir::op::OpKind;
 
-/// Rewrite every `OpKind::Iota { len }` into a [`Storage::Computed`] graph constant and drop its
+/// Rewrite every `OpKind::Iota { len, dtype }` into a [`Storage::Computed`] graph constant and drop its
 /// equation. The folded value stays the same [`ValueId`](poot_graph_ir::ValueId), so consumers need no rewiring.
 ///
 /// A graph with no `Iota` is returned unchanged (a clone-cost no-op callers still pay; the pass is
 /// written for the pipeline's simple `Graph -> Graph` shape).
 pub fn fold_iota<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
     let mut g = g.clone();
-    let mut folded: Vec<(usize, usize)> = Vec::new();
+    let mut folded: Vec<(usize, ComputedConst)> = Vec::new();
     for eqn in &g.eqns {
-        if let OpKind::Iota { len } = &eqn.op {
-            folded.push((eqn.out, *len));
+        if let OpKind::Iota { len, dtype } = &eqn.op {
+            folded.push((
+                eqn.out,
+                ComputedConst::Iota {
+                    len: *len,
+                    dtype: *dtype,
+                },
+            ));
         }
     }
     if folded.is_empty() {
         return g;
     }
-    for &(value, len) in &folded {
-        g.values[value].storage = Storage::Computed(ComputedConst::Iota { len });
+    for &(value, constant) in &folded {
+        g.values[value].storage = Storage::Computed(constant);
     }
     g.eqns.retain(|eqn| !matches!(eqn.op, OpKind::Iota { .. }));
     for &(value, _) in &folded {
@@ -48,7 +54,7 @@ mod tests {
     fn iota_count<V: ValidationChannel>(g: &Graph<V>, len: usize) -> usize {
         g.eqns
             .iter()
-            .filter(|eqn| matches!(eqn.op, OpKind::Iota { len: l } if l == len))
+            .filter(|eqn| matches!(eqn.op, OpKind::Iota { len: l, .. } if l == len))
             .count()
     }
 

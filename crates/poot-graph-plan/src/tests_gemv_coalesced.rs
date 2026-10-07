@@ -516,19 +516,6 @@ fn gemv_coalesced_subtile_n_and_k1_matches_cpu() {
     assert_close(&got2, &want2, "gemv_coalesced n1");
 }
 
-/// Bias epilogue at a ragged shape.
-#[test]
-fn gemv_coalesced_bias_ragged_matches_cpu() {
-    let body = ImportedKernel::GemvCoalescedBias.body();
-    let (k, n) = (5usize, 70usize); // N=70 = 2*32+6
-    let x = fill(9, k);
-    let w = fill(10, k * n);
-    let bias = fill(11, n);
-    let want = cpu_ref_b1(k, n, &x, &w, Some(&bias));
-    let got = run_b1(body, k, n, &x, &w, Some(&bias));
-    assert_close(&got, &want, "gemv_coalesced_bias ragged");
-}
-
 /// The launch the planner really emits for a `[1, K] @ [K, N]` decode GEMV, against the interpreter's
 /// tiled sweep: the plan (card 525: the planner stores the grid on the plan itself, alongside the
 /// kernel choice) must carry `GEMV_WIDTH` threads per workgroup, `x_groups` workgroups on X and the
@@ -562,9 +549,9 @@ fn gemv_coalesced_grid_matches_dispatch_formula() {
             &poot_test_util::graph_fixtures::roomy_body_limits(),
         )
         .unwrap();
-        let grid = match plan {
-            crate::Plan::Compute { grid, .. } | crate::Plan::ComputeMeta { grid, .. } => grid,
-            other => panic!("decode GEMV must plan as Compute/ComputeMeta, got {other:?}"),
+        let grid = match plan.single() {
+            Some(dispatch) => dispatch.launch.grid,
+            None => panic!("decode GEMV must plan as one dispatch, got {plan:?}"),
         };
         let (gx, gy) = tiled_grid(n);
         assert_eq!(
@@ -577,13 +564,13 @@ fn gemv_coalesced_grid_matches_dispatch_formula() {
     // A Y-spill shape (just over the X cap, so the tiled workgroup count needs a second row): at the
     // real wgpu cap (`test_grid_cap()`), a shape this large is always past `DECODE_GEMV_CHUNK_TRIGGER`
     // too (card 525 own premise), so `Backend::SpirvVulkan`'s own watchdog budget
-    // would route it to `Plan::ComputeChunks` instead of the 2-D tile-spill grid this case means to
+    // would split it into several `Plan::Dispatches` instead of the 2-D tile-spill grid this case means to
     // exercise. Card 546b: the grid cap is no longer one constant shared by
     // every backend (`DeviceCaps::rocm_default()`/`ptx_default()` are genuinely uncapped - HSA/CUDA
     // have no `gridDim` ceiling - so AmdGcn no longer spills here at all), so this test now plans
     // against `Backend::SpirvVulkan` itself, with its real `max_grid` but no watchdog budget (a
     // synthetic fixture: no real wgpu/RADV device both caps the grid and has no display watchdog, but
-    // the tile-spill grid math this asserts is backend-generic), to reach `Plan::Compute`'s Y-spill
+    // the tile-spill grid math this asserts is backend-generic), to reach the single-dispatch Y-spill
     // path on a real compiled `Plan` rather than just checking `tiled_grid` against itself.
     let n = test_grid_cap() * GEMV_TILE + 3;
     assert!(
@@ -611,10 +598,10 @@ fn gemv_coalesced_grid_matches_dispatch_formula() {
         &poot_test_util::graph_fixtures::roomy_body_limits(),
     )
     .unwrap();
-    let grid = match plan {
-        crate::Plan::Compute { grid, .. } => grid,
-        other => panic!(
-            "Y-spill decode GEMV with no watchdog budget must plan as Plan::Compute, got {other:?}"
+    let grid = match plan.single() {
+        Some(dispatch) if dispatch.launch.meta.is_empty() => dispatch.launch.grid,
+        _ => panic!(
+            "Y-spill decode GEMV with no watchdog budget must plan as one plain dispatch, got {plan:?}"
         ),
     };
     assert_eq!(
@@ -635,12 +622,6 @@ fn gemv_batched_coalesced_ragged_matches_cpu() {
     let want = cpu_ref_batched(batch, k, n, &x, &w, None);
     let got = run_batched(body, batch, k, n, &x, &w, None);
     assert_close(&got, &want, "gemv_batched_coalesced");
-
-    let body_b = ImportedKernel::GemvBatchedCoalescedBias.body();
-    let bias = fill(14, n);
-    let want_b = cpu_ref_batched(batch, k, n, &x, &w, Some(&bias));
-    let got_b = run_batched(body_b, batch, k, n, &x, &w, Some(&bias));
-    assert_close(&got_b, &want_b, "gemv_batched_coalesced_bias");
 }
 
 /// Batched B=1 degenerates to the single-sequence oracle (the plan still uses the B=1 body when
@@ -791,28 +772,7 @@ fn gemv_coalesced_bf16_bit_identical_to_f32_widened_reference() {
     eprintln!("gemv_coalesced_bf16 bit-identical to f32-widened body (n={n})");
 }
 
-/// Bias epilogue at a ragged shape, same bit-identity contract (bias stays F32).
-#[test]
-fn gemv_coalesced_bias_bf16_bit_identical_to_f32_widened_reference() {
-    let bf16_body = ImportedKernel::GemvCoalescedBiasBf16.body();
-    let f32_body = ImportedKernel::GemvCoalescedBias.body();
-    let (k, n) = (5usize, 70usize);
-    let x = fill(22, k);
-    let w = fill(23, k * n);
-    let bias = fill(24, n);
-    let (words, widened) = pack_widened(&w);
-    let want = run_b1(f32_body, k, n, &x, &widened, Some(&bias));
-    let got = run_b1_bf16(bf16_body, n, &x, &words, Some(&bias));
-    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-        assert_eq!(
-            g.to_bits(),
-            w.to_bits(),
-            "bias bf16 GEMV[{i}]: got {g}, want {w}"
-        );
-    }
-}
-
-/// Batched B>1 ragged, with and without bias, bit-identical to the f32 body on widened weights.
+/// Batched B>1 ragged, bit-identical to the f32 body on widened weights.
 #[test]
 fn gemv_batched_coalesced_bf16_bit_identical_to_f32_widened_reference() {
     let bf16_body = ImportedKernel::GemvBatchedCoalescedBf16.body();
@@ -825,15 +785,6 @@ fn gemv_batched_coalesced_bf16_bit_identical_to_f32_widened_reference() {
     let got = run_batched_bf16(bf16_body, batch, n, &x, &words, None);
     for (i, (g, w)) in got.iter().zip(&want).enumerate() {
         assert_eq!(g.to_bits(), w.to_bits(), "batched bf16 GEMV[{i}]");
-    }
-
-    let bf16_body_b = ImportedKernel::GemvBatchedCoalescedBiasBf16.body();
-    let f32_body_b = ImportedKernel::GemvBatchedCoalescedBias.body();
-    let bias = fill(27, n);
-    let want_b = run_batched(f32_body_b, batch, k, n, &x, &widened, Some(&bias));
-    let got_b = run_batched_bf16(bf16_body_b, batch, n, &x, &words, Some(&bias));
-    for (i, (g, w)) in got_b.iter().zip(&want_b).enumerate() {
-        assert_eq!(g.to_bits(), w.to_bits(), "batched bias bf16 GEMV[{i}]");
     }
 }
 

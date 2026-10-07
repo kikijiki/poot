@@ -37,8 +37,10 @@ pub(crate) fn encode_stored(
         // element is finite.
         (DType::F16, p) if p == BufferStorage::f16_packed() => {
             if let Some((index, bits)) = bytes
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes(*c))
                 .enumerate()
                 .find(|&(_, bits)| bits & 0x7c00 == 0x7c00)
             {
@@ -70,7 +72,9 @@ pub(crate) fn encode_host(dtype: DType, bytes: &[u8], planned: BufferStorage) ->
 /// The F32 bit-pattern mirror of declared-I32 values (Card 621).
 fn i32_to_f32_mirror(bytes: &[u8]) -> Vec<u8> {
     bytes
-        .chunks_exact(4)
-        .flat_map(|c| (i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32).to_le_bytes())
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .flat_map(|c| (i32::from_le_bytes(*c) as f32).to_le_bytes())
         .collect()
 }

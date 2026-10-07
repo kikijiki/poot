@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
 use poot_graph_ir::{BinOp, Builder, Graph, OpKind, Scalar, StateRole, TensorType, UnOp};
 use poot_graph_plan::canonicalize;
-use poot_graph_plan::{CompileOptions, FusionPolicy, Submission, Target, compile};
+use poot_graph_plan::{CompileOptions, Submission, Target, compile};
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::HostTensor;
 
@@ -16,7 +16,6 @@ use poot_tensor::HostTensor;
 /// `eval(..).environment` plus `Value::into_dense`.
 const OPTIONS: CompileOptions = CompileOptions {
     execution: Submission::Replay,
-    fusion: FusionPolicy::Full,
     limits: poot_graph_plan::CompileLimits::STANDARD,
 };
 
@@ -518,7 +517,7 @@ fn legal_attention_regions_keep_selection_and_prescaled_query() {
             .graph()
             .eqns
             .iter()
-            .filter(|eqn| matches!(eqn.op, OpKind::FlashAttentionDecode { .. }))
+            .filter(|eqn| matches!(eqn.op, OpKind::Attention(_)))
             .collect();
         assert_eq!(
             flash.len(),
@@ -530,10 +529,7 @@ fn legal_attention_regions_keep_selection_and_prescaled_query() {
                 matches!(flash[0].inputs[0], Operand::Value(id) if id == query.id),
                 "the fused kernel must consume the already-scaled query"
             );
-            assert!(matches!(
-                flash[0].op,
-                OpKind::FlashAttentionDecode { scale: 1.0, .. }
-            ));
+            assert!(matches!(&flash[0].op, OpKind::Attention(attrs) if attrs.scale == 1.0));
         }
         if reciprocal {
             assert!(
@@ -614,7 +610,7 @@ fn softcap_requires_the_exact_reciprocal_literal() {
             .graph()
             .eqns
             .iter()
-            .filter(|eqn| matches!(eqn.op, OpKind::FlashAttentionPrefill { .. }))
+            .filter(|eqn| matches!(eqn.op, OpKind::Attention(_)))
             .count();
         assert_eq!(
             flash,

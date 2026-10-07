@@ -46,23 +46,3 @@ pub(crate) fn layernorm_no_bias_ref(x: &[f32], w: &[f32], n: usize, eps: f32) ->
     let den = (var + eps).sqrt();
     (0..n).map(|i| (x[i] - mean) / den * w[i]).collect()
 }
-
-/// DeepSeek's interleaved-pair rotation (module docs, item 6): pairs `(x[2i], x[2i+1])`, not the
-/// half-split `rope_ref` used elsewhere. `cos`/`sin` are position-major `[max_pos, half]`.
-pub(crate) fn rope_interleaved_ref(
-    row: &[f32],
-    cos: &[f32],
-    sin: &[f32],
-    pos: usize,
-    half: usize,
-) -> Vec<f32> {
-    let c = &cos[pos * half..(pos + 1) * half];
-    let s = &sin[pos * half..(pos + 1) * half];
-    let mut out = vec![0.0f32; 2 * half];
-    for i in 0..half {
-        let (a, bb) = (row[2 * i], row[2 * i + 1]);
-        out[2 * i] = a * c[i] - bb * s[i];
-        out[2 * i + 1] = a * s[i] + bb * c[i];
-    }
-    out
-}

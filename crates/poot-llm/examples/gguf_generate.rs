@@ -10,7 +10,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::sync::Arc;
 
-use poot_graph_plan::{CompileLimits, CompileOptions, FusionPolicy, Submission};
+use poot_graph_plan::{CompileLimits, CompileOptions, Submission};
 use poot_llm::driver::{
     BackendChoice, Driver, DriverOptions, GenerateRequest, ModelHandle, PreparedSetLimits,
     open_executor,
@@ -30,12 +30,15 @@ fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| "The capital of France is".to_string());
 
     // Everything (config + weights + tokenizer) is read from the GGUF.
-    let handle = Arc::new(ModelHandle::load(Path::new(&path), &Registry::builtin()?)?);
+    let handle = Arc::new(ModelHandle::load(
+        Path::new(&path),
+        &Registry::builtin()?,
+        &poot_llm::driver::LoadOptions::default(),
+    )?);
     let tokens = handle.text().encode(&prompt)?;
     let max_new = 32;
     let compile = CompileOptions {
         execution: Submission::Replay,
-        fusion: FusionPolicy::Full,
         limits: CompileLimits::STANDARD,
     };
     let granule = handle.config().prefill_granule.get();
@@ -51,6 +54,7 @@ fn main() -> anyhow::Result<()> {
             max_retained_bytes: NonZeroU64::new(1 << 32).expect("nonzero"),
         },
         charge: poot_llm::driver::program_retention,
+        draft: poot_llm::driver::DraftPolicy::Off,
     };
     let mut driver = Driver::new(
         Arc::clone(&handle),

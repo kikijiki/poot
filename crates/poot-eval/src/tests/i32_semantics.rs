@@ -128,20 +128,20 @@ fn i32_literal_word_table_is_one_semantics_through_both_entries() {
         words_through_both_bindings(&[&[-1, 1], &[1, -1]], binary(BinOp::Ge)),
         &[0, 1],
     );
-    // Select by the condition word: 1 picks if_true, 0 picks if_false. The IR defines Select as
-    // `if_false + cond * (if_true - if_false)` in wrapping arithmetic, so a condition word of 2 gives
-    // 20 + 2 * (10 - 20) = 0, and with i32::MAX - i32::MIN the difference wraps to -1.
+    // Select by the condition word: any nonzero word picks if_true, zero picks if_false. A condition of 2
+    // or -1 is not a 0/1 flag and still selects if_true; the branch words pass through untouched even where
+    // `if_true - if_false` would wrap.
     assert_both(
         "Select by word",
         words_through_both_bindings(
             &[
-                &[1, 0, 2, 1],
+                &[1, 0, 2, -1],
                 &[10, 10, 10, i32::MAX],
                 &[20, 20, 20, i32::MIN],
             ],
             |b: &Builder, x: &[Traced]| b.select(x[0], x[1], x[2]),
         ),
-        &[10, 20, 0, i32::MAX],
+        &[10, 20, 10, i32::MAX],
     );
 }
 

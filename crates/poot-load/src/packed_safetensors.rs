@@ -37,8 +37,8 @@ mod validation;
 pub use inventory::*;
 pub(crate) use publication::*;
 pub use store::*;
-pub use validation::FilePin;
 pub(crate) use validation::*;
+pub use validation::{FilePin, check_pin_reader};
 
 #[cfg(test)]
 mod tests {

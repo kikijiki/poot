@@ -79,6 +79,14 @@ pub enum KernelGenError {
         format: poot_quant::format::WeightFormat,
         reason: &'static str,
     },
+    /// An I32 leaf of a float region feeds something other than a `Select` condition: an I32 word has no
+    /// float meaning, so it may only be read as the condition of a select.
+    #[error("{generator}: I32 leaf {leaf} feeds {consumer}; it may only be a Select condition")]
+    IndexLeafOperand {
+        generator: &'static str,
+        leaf: usize,
+        consumer: String,
+    },
     /// The target cannot state this request at all (not a violated argument: the arguments are fine, no
     /// body exists for them on this backend). `request` names the generator, `reason` what is missing.
     /// The planner turns it into a typed refusal at claim time.
@@ -133,6 +141,7 @@ impl KernelGenError {
             | Self::ExceedsBound { generator, .. }
             | Self::AxisOutOfRange { generator, .. }
             | Self::CountMismatch { generator, .. }
+            | Self::IndexLeafOperand { generator, .. }
             | Self::ShapeMismatch { generator, .. } => generator,
             Self::UnsupportedDescriptor { .. } => "packed_kernel",
             Self::Unsupported { request, .. } => request,

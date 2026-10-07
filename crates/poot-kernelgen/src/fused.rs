@@ -1,10 +1,13 @@
 use std::collections::HashMap;
 
+use poot_target::BufferStorage;
+
 use crate::KernelGenError;
 use crate::helpers::{
-    Alloc, BodySize, Layout, copy, elem, emit_lds_tree_blocks_at, guard, ld, lds_tree_block_count,
-    local, row_major_strides, slice_dtype, slice_f32, view_eff_strides,
+    Alloc, BodySize, Layout, WeightLane, copy, elem, emit_lds_tree_blocks_at, guard, ld,
+    lds_tree_block_count, local, row_major_strides, slice_dtype, slice_f32, view_eff_strides,
 };
+
 use poot_kernel_ir::{
     BasicBlock, BinOp, BlockId, Body, Constant, IndexAxis, IntScalarOp, Local, MathOp, Operand,
     Place, Rvalue, Statement, Terminator, Ty, UnOp, WorkgroupLocalDecl,
@@ -27,7 +30,9 @@ pub enum FusedScalarOp {
     /// Error function. Kernel-ir has no erf, so it is expanded inline with an abs-folded
     /// Abramowitz-Stegun 7.1.26 polynomial (about 1.5e-7 max abs error).
     Erf,
-    /// Pointwise wrapping select: `if_false + cond * (if_true - if_false)`. I32 fused regions only.
+    /// Pointwise select `(cond, if_true, if_false)`: the bit pattern of `if_true` where the I32 condition
+    /// word is nonzero, else of `if_false` ([`emit_bitwise_select`]). The condition is an I32 leaf; the
+    /// branches are F32 in a float region and I32 in an exact-I32 region.
     Select,
     /// Leading-zero count of an I32 word interpreted as u32. I32 fused regions only.
     Clz,
@@ -36,6 +41,10 @@ pub enum FusedScalarOp {
     /// Unsigned remainder of I32 storage bits (`(a as u32) % (b as u32)`), writing the I32 bit pattern
     /// of the u32 result. I32 fused regions only.
     RemU,
+    /// `Cast` of a narrow leaf to f32. The leaf's lane ([`RowKernel::leaf_storage`], an epilogue's
+    /// `leaf_storage`) already decodes its elements to f32 as it reads them, so the step is the register
+    /// copy that names the widened value; no f32 copy of the stored leaf exists.
+    Widen,
 }
 
 /// A kernel-ir comparison op: yields i1, so when it appears in an f32 pipeline its result is cast to f32
@@ -60,7 +69,12 @@ struct Emitter<'a> {
 impl Emitter<'_> {
     /// `tmp = rv` into a fresh f32 local; returns a copy-operand of it.
     fn rv(&mut self, rv: Rvalue) -> Operand {
-        let d = self.al.add(Ty::F32, false);
+        self.typed(Ty::F32, rv)
+    }
+
+    /// `tmp = rv` into a fresh local of `ty`; returns a copy-operand of it.
+    fn typed(&mut self, ty: Ty, rv: Rvalue) -> Operand {
+        let d = self.al.add(ty, false);
         self.stmts.push(Statement::Assign(Place::local(d), rv));
         copy(Place::local(d))
     }
@@ -115,6 +129,7 @@ pub(crate) fn emit_scalar_op(
             }
         }
         FusedScalarOp::Binary(b) => Rvalue::BinaryOp(b, operands[0].clone(), operands[1].clone()),
+        FusedScalarOp::Widen => Rvalue::Use(operands[0].clone()),
         FusedScalarOp::Recip => Rvalue::BinaryOp(
             BinOp::Div,
             Operand::Const(Constant::F32(1.0)),
@@ -165,7 +180,15 @@ pub(crate) fn emit_scalar_op(
             let sign = em.sign(x);
             Rvalue::BinaryOp(BinOp::Mul, mag, sign)
         }
-        FusedScalarOp::Select | FusedScalarOp::Clz | FusedScalarOp::GeU | FusedScalarOp::RemU => {
+        FusedScalarOp::Select => emit_bitwise_select(
+            al,
+            stmts,
+            Ty::F32,
+            operands[0].clone(),
+            operands[1].clone(),
+            operands[2].clone(),
+        ),
+        FusedScalarOp::Clz | FusedScalarOp::GeU | FusedScalarOp::RemU => {
             panic!("I32 fused op in the f32 synthesizer")
         }
     };
@@ -194,12 +217,30 @@ pub struct FusedStep {
     pub inputs: Vec<FusedInput>,
 }
 
-/// The recipe for a fused elementwise kernel: `n_leaves` input slices, a straight-line list of scalar
+/// The element type a fused kernel reads one leaf as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeafTy {
+    F32,
+    I32,
+}
+
+impl LeafTy {
+    fn ty(self) -> Ty {
+        match self {
+            Self::F32 => Ty::F32,
+            Self::I32 => Ty::I32,
+        }
+    }
+}
+
+/// The recipe for a fused elementwise kernel: one input slice per entry of `leaf_tys`, a straight-line list of scalar
 /// steps, and which value is written out. The kernelgen-native mirror of `poot_graph_ir::FusedRegion`
 /// (kept separate so kernelgen does not depend on the graph IR).
 #[derive(Clone, Debug)]
 pub struct FusedKernel {
-    pub n_leaves: usize,
+    /// The element type of each leaf, one per leaf. A float region reads F32 leaves, plus I32 leaves that
+    /// only a `Select` step may read (its condition); an exact-I32 region reads I32 leaves only.
+    pub leaf_tys: Vec<LeafTy>,
     pub steps: Vec<FusedStep>,
     pub output: FusedInput,
 }
@@ -233,9 +274,19 @@ pub enum RowOp {
 #[derive(Clone, Debug)]
 pub struct RowKernel {
     pub n_leaves: usize,
+    /// How each leaf's elements sit in its buffer, one per leaf: f32 for a leaf read as stored, packed
+    /// BF16 or F16 for a narrow leaf a [`FusedScalarOp::Widen`] step widens in registers.
+    pub leaf_storage: Vec<BufferStorage>,
     pub n_cols: usize,
     pub steps: Vec<RowOp>,
     pub output: usize,
+}
+
+impl FusedKernel {
+    /// The number of input leaves.
+    pub fn n_leaves(&self) -> usize {
+        self.leaf_tys.len()
+    }
 }
 
 impl FusedScalarOp {
@@ -243,14 +294,14 @@ impl FusedScalarOp {
     /// statements and the fresh temporaries it allocates, not counting the step's own result register.
     fn size(self) -> BodySize {
         let (instructions, locals) = match self {
-            Self::Unary(_) | Self::Math(_) | Self::Recip | Self::Clz => (1, 0),
+            Self::Unary(_) | Self::Math(_) | Self::Recip | Self::Clz | Self::Widen => (1, 0),
             Self::Binary(BinOp::Shl) => (2, 1),
             Self::Binary(BinOp::Shr) => (5, 4),
             Self::Binary(op) if is_cmp(op) => (2, 1),
             Self::Binary(_) => (1, 0),
             Self::Tanh => (11, 10),
             Self::Erf => (24, 23),
-            Self::Select => (3, 2),
+            Self::Select => (11, 9),
             Self::GeU | Self::RemU => (4, 3),
         };
         BodySize {
@@ -278,6 +329,13 @@ fn leaf_read_size(rank: usize) -> BodySize {
     }
 }
 
+/// What decoding one element of a packed 16-bit leaf adds over a plain load: the word index, the half select,
+/// the shift and mask, and the widening (the binary16 decode is the larger of the two lanes).
+const PACKED_LANE_READ: BodySize = BodySize {
+    instructions: 32,
+    locals: 32,
+};
+
 /// A checked upper bound on the body [`fused_views`], [`fused_i32_views_grid_pack`] build for `k` over
 /// an output of `rank` axes and a `pack_lanes`-wide packed store. Computed from the recipe alone, so a
 /// caller can refuse a region before any statement is built; `fused_size_bounds_the_generated_bodies`
@@ -300,14 +358,14 @@ pub(crate) fn pointwise_size(k: &FusedKernel, rank: usize, pack_lanes: usize) ->
     let read = leaf_read_size(rank);
     let params = BodySize {
         instructions: 0,
-        locals: k.n_leaves,
+        locals: k.n_leaves(),
     };
     let steps = k.steps.iter().fold(BodySize::default(), |sum, step| {
         sum.plus(step.op.step_size())
     });
     FIXED
         .plus(params)
-        .plus(read.times(k.n_leaves.saturating_add(lane_refs)))
+        .plus(read.times(k.n_leaves().saturating_add(lane_refs)))
         .plus(steps)
         .plus(BodySize {
             instructions: pack_lanes.saturating_mul(3),
@@ -335,8 +393,14 @@ pub(crate) fn row_size(k: &RowKernel, rank: usize, w: usize) -> BodySize {
             RowOp::Pointwise { op, .. } => sum.plus(op.step_size()),
             RowOp::Reduce { .. } => sum,
         });
+    let packed_leaves = k
+        .leaf_storage
+        .iter()
+        .filter(|&&storage| storage != BufferStorage::f32())
+        .count();
     let evaluation = leaf_read_size(rank)
         .times(k.n_leaves)
+        .plus(PACKED_LANE_READ.times(packed_leaves))
         .plus(chain)
         .plus(BodySize {
             instructions: 8,
@@ -370,42 +434,75 @@ pub fn fused(
     k: &FusedKernel,
 ) -> Result<Body, KernelGenError> {
     let layouts: Vec<Layout> = leaf_shapes.iter().map(|s| Layout::contiguous(s)).collect();
-    fused_views(name, out_shape, leaf_shapes, &layouts, k)
+    fused_views(name, out_shape, leaf_shapes, &layouts, k, None)
+}
+
+/// The leaf types of a float region: an I32 leaf is read only as a `Select` condition.
+fn check_float_leaf_tys(generator: &'static str, k: &FusedKernel) -> Result<(), KernelGenError> {
+    // The index of the I32 leaf `input` names, if it names one.
+    let index_leaf = |input: &FusedInput| match input {
+        FusedInput::Leaf(leaf) if k.leaf_tys.get(*leaf) == Some(&LeafTy::I32) => Some(*leaf),
+        _ => None,
+    };
+    for step in &k.steps {
+        for (position, input) in step.inputs.iter().enumerate() {
+            let is_condition = matches!(step.op, FusedScalarOp::Select) && position == 0;
+            if let Some(leaf) = index_leaf(input).filter(|_| !is_condition) {
+                return Err(KernelGenError::IndexLeafOperand {
+                    generator,
+                    leaf,
+                    consumer: format!("{:?}", step.op),
+                });
+            }
+        }
+    }
+    match index_leaf(&k.output) {
+        Some(leaf) => Err(KernelGenError::IndexLeafOperand {
+            generator,
+            leaf,
+            consumer: "the region output".to_string(),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// [`fused`] reading each leaf through its own physical [`Layout`]. Byte-identical to `fused` when every layout
-/// is `Layout::contiguous`.
+/// is `Layout::contiguous` and `x_groups` is `None`. `Some(xg)` folds the 1-D element index onto a 2-D grid like
+/// [`fused_i32_views_grid`], past the target's X grid cap: it must match the launch's `x_groups`
+/// (`fold_groups`), and the caller must bake `workgroup_size[0] = ELEMENTWISE_2D_WORKGROUP_SIZE`.
 pub fn fused_views(
     name: &str,
     out_shape: &[usize],
     leaf_shapes: &[&[usize]],
     leaf_layouts: &[Layout],
     k: &FusedKernel,
+    x_groups: Option<usize>,
 ) -> Result<Body, KernelGenError> {
-    if leaf_shapes.len() != k.n_leaves {
+    if leaf_shapes.len() != k.n_leaves() {
         return Err(KernelGenError::CountMismatch {
             generator: "fused_views",
             what: "leaf shape count".to_string(),
-            expected: k.n_leaves,
+            expected: k.n_leaves(),
             actual: leaf_shapes.len(),
         });
     }
-    if leaf_layouts.len() != k.n_leaves {
+    if leaf_layouts.len() != k.n_leaves() {
         return Err(KernelGenError::CountMismatch {
             generator: "fused_views",
             what: "leaf layout count".to_string(),
-            expected: k.n_leaves,
+            expected: k.n_leaves(),
             actual: leaf_layouts.len(),
         });
     }
+    check_float_leaf_tys("fused_views", k)?;
     let r = out_shape.len();
     let out_strides = row_major_strides(out_shape);
-    let n = k.n_leaves;
+    let n = k.n_leaves();
 
     // params: leaves are locals 1..=n (read-only slices), the output is local n+1 (mut slice).
     let mut locals = vec![ld(Ty::Unit, false)];
-    for _ in 0..n {
-        locals.push(ld(slice_f32(false), false));
+    for leaf in &k.leaf_tys {
+        locals.push(ld(slice_dtype(leaf.ty(), false), false));
     }
     locals.push(ld(slice_f32(true), true));
     let mut al = Alloc::new(locals);
@@ -421,7 +518,11 @@ pub fn fused_views(
     let off_new = al.add(Ty::Usize, false);
     // per-leaf running offset + the read value register.
     let leaf_off: Vec<Local> = (0..n).map(|_| al.add(Ty::Usize, true)).collect();
-    let leaf_val: Vec<Local> = (0..n).map(|_| al.add(Ty::F32, false)).collect();
+    let leaf_val: Vec<Local> = k
+        .leaf_tys
+        .iter()
+        .map(|leaf| al.add(leaf.ty(), false))
+        .collect();
     // per-step result register.
     let step_reg: Vec<Local> = (0..k.steps.len()).map(|_| al.add(Ty::F32, false)).collect();
     let cu = |x: usize| Operand::Const(Constant::Usize(x as u64));
@@ -489,14 +590,6 @@ pub fn fused_views(
         Rvalue::Use(resolve(&k.output)),
     ));
 
-    let bb0 = BasicBlock {
-        statements: vec![],
-        terminator: Terminator::ThreadIndexCall {
-            destination: Place::local(i),
-            dim: IndexAxis::X,
-            target: BlockId { index: 1 },
-        },
-    };
     let bb1 = BasicBlock {
         statements: vec![
             Statement::Assign(Place::local(len), Rvalue::Len(Place::local(out_local))),
@@ -515,11 +608,15 @@ pub fn fused_views(
         statements: vec![],
         terminator: Terminator::Return,
     };
-    Ok(Body::new(
+    Ok(pointwise_body(
         name,
         (n + 1) as u32,
-        al.locals,
-        vec![bb0, bb1, bb2, bb3],
+        al,
+        i,
+        bb1,
+        bb2,
+        bb3,
+        x_groups,
     ))
 }
 
@@ -528,7 +625,7 @@ pub fn fused_views(
 /// as [`crate::binary_broadcast_dt_views_grid`] (`x_groups: None` keeps the original flat
 /// `ThreadIndexCall(X)` body - the convenience `fused_i32_views` used to expose before it moved to
 /// `poot_test_util::kernel_fixtures`, card 671, its only caller; `Some(xg)` must match
-/// `elementwise_2d_grid(out_numel).0`, and the caller must bake `workgroup_size[0] =
+/// the launch's `x_groups` (`kg::fold_groups`), and the caller must bake `workgroup_size[0] =
 /// ELEMENTWISE_2D_WORKGROUP_SIZE`).
 pub fn fused_i32_views_grid(
     name: &str,
@@ -552,20 +649,33 @@ pub fn fused_i32_views_grid_pack(
     x_groups: Option<usize>,
     pack: &[FusedInput],
 ) -> Result<Body, KernelGenError> {
-    if leaf_shapes.len() != k.n_leaves {
+    if leaf_shapes.len() != k.n_leaves() {
         return Err(KernelGenError::CountMismatch {
             generator: "fused_i32_views_grid_pack",
             what: "leaf shape count".to_string(),
-            expected: k.n_leaves,
+            expected: k.n_leaves(),
             actual: leaf_shapes.len(),
         });
     }
-    if leaf_layouts.len() != k.n_leaves {
+    if leaf_layouts.len() != k.n_leaves() {
         return Err(KernelGenError::CountMismatch {
             generator: "fused_i32_views_grid_pack",
             what: "leaf layout count".to_string(),
-            expected: k.n_leaves,
+            expected: k.n_leaves(),
             actual: leaf_layouts.len(),
+        });
+    }
+    let float_leaves = k
+        .leaf_tys
+        .iter()
+        .filter(|&&leaf| leaf != LeafTy::I32)
+        .count();
+    if k.leaf_tys.len() != k.n_leaves() || float_leaves != 0 {
+        return Err(KernelGenError::NotEqualTo {
+            generator: "fused_i32_views_grid_pack",
+            dim: "F32 leaves of an exact-I32 region".to_string(),
+            value: float_leaves,
+            expected: 0,
         });
     }
     let lanes = pack.len();
@@ -592,7 +702,7 @@ pub fn fused_i32_views_grid_pack(
     };
     let r = index_shape.len();
     let out_strides = row_major_strides(&index_shape);
-    let n = k.n_leaves;
+    let n = k.n_leaves();
 
     let mut locals = vec![ld(Ty::Unit, false)];
     for _ in 0..n {
@@ -796,7 +906,35 @@ pub fn fused_i32_views_grid_pack(
         statements: vec![],
         terminator: Terminator::Return,
     };
-    Ok(match x_groups {
+    Ok(pointwise_body(
+        name,
+        (n + 1) as u32,
+        al,
+        i,
+        bb1,
+        bb2,
+        bb3,
+        x_groups,
+    ))
+}
+
+/// The body of a one-thread-per-element pointwise kernel from its blocks: `bb1` is the bounds check
+/// (entered with the flat element index `i`), `bb2` the work, `bb3` the early exit. `x_groups: None` reads
+/// the flat thread index; `Some(xg)` reads the 2-D folded grid (`i = (GroupY * xg + GroupX) * wg + LocalX`),
+/// which the launch's `x_groups` (`fold_groups`) and workgroup width must match.
+#[allow(clippy::too_many_arguments)]
+fn pointwise_body(
+    name: &str,
+    param_count: u32,
+    mut al: Alloc,
+    i: Local,
+    bb1: BasicBlock,
+    bb2: BasicBlock,
+    bb3: BasicBlock,
+    x_groups: Option<usize>,
+) -> Body {
+    let cu = |x: usize| Operand::Const(Constant::Usize(x as u64));
+    match x_groups {
         None => {
             let bb0 = BasicBlock {
                 statements: vec![],
@@ -806,7 +944,7 @@ pub fn fused_i32_views_grid_pack(
                     target: BlockId { index: 1 },
                 },
             };
-            Body::new(name, (n + 1) as u32, al.locals, vec![bb0, bb1, bb2, bb3])
+            Body::new(name, param_count, al.locals, vec![bb0, bb1, bb2, bb3])
         }
         Some(xg) => {
             let wg = crate::elementwise::ELEMENTWISE_2D_WORKGROUP_SIZE;
@@ -874,12 +1012,12 @@ pub fn fused_i32_views_grid_pack(
             };
             Body::new(
                 name,
-                (n + 1) as u32,
+                param_count,
                 al.locals,
                 vec![bb0, bb1, bb2, bb3, bb_gy, bb_lane, bb_combine],
             )
         }
-    })
+    }
 }
 
 fn emit_scalar_op_i32(
@@ -915,22 +1053,75 @@ fn emit_scalar_op_i32(
             emit_i32_shift(b, operands[0].clone(), operands[1].clone(), al, stmts)
         }
         FusedScalarOp::Binary(b) => Rvalue::BinaryOp(b, operands[0].clone(), operands[1].clone()),
-        FusedScalarOp::Select => {
-            let delta = al.add(Ty::I32, false);
-            stmts.push(Statement::Assign(
-                Place::local(delta),
-                Rvalue::BinaryOp(BinOp::Sub, operands[1].clone(), operands[2].clone()),
-            ));
-            let scaled = al.add(Ty::I32, false);
-            stmts.push(Statement::Assign(
-                Place::local(scaled),
-                Rvalue::BinaryOp(BinOp::Mul, operands[0].clone(), copy(Place::local(delta))),
-            ));
-            Rvalue::BinaryOp(BinOp::Add, operands[2].clone(), copy(Place::local(scaled)))
-        }
+        FusedScalarOp::Select => emit_bitwise_select(
+            al,
+            stmts,
+            Ty::I32,
+            operands[0].clone(),
+            operands[1].clone(),
+            operands[2].clone(),
+        ),
         other => panic!("float fused op in the I32 synthesizer: {other:?}"),
     };
     stmts.push(Statement::Assign(Place::local(dst), rv));
+}
+
+/// The one kernel definition of `Select`: `(t & mask) | (f & !mask)` over the branches' I32 bit
+/// patterns, `mask` all ones where the condition word is nonzero. `branch` is the branches' type (`F32` or
+/// `I32`); a float branch is bitcast to its word and the result bitcast back, so no arithmetic ever touches
+/// a branch and a NaN, Inf or `-0.0` passes through (or stays out) bit for bit. Returns the rvalue that
+/// writes the result.
+fn emit_bitwise_select(
+    al: &mut Alloc,
+    stmts: &mut Vec<Statement>,
+    branch: Ty,
+    condition: Operand,
+    if_true: Operand,
+    if_false: Operand,
+) -> Rvalue {
+    let mut em = Emitter { al, stmts };
+    let selected = em.typed(
+        Ty::Bool,
+        Rvalue::BinaryOp(BinOp::Ne, condition, Operand::Const(Constant::I32(0))),
+    );
+    let one = em.typed(
+        Ty::I32,
+        Rvalue::Cast {
+            to: Ty::I32,
+            operand: selected,
+        },
+    );
+    let mask = em.typed(Ty::I32, Rvalue::UnaryOp(UnOp::Neg, one));
+    let not_mask = em.typed(Ty::I32, Rvalue::UnaryOp(UnOp::Not, mask.clone()));
+    let mut bits = |operand: Operand| {
+        if branch == Ty::I32 {
+            operand
+        } else {
+            em.typed(
+                Ty::I32,
+                Rvalue::Bitcast {
+                    to: Ty::I32,
+                    operand,
+                },
+            )
+        }
+    };
+    let (true_bits, false_bits) = (bits(if_true), bits(if_false));
+    let kept_true = em.typed(Ty::I32, Rvalue::BinaryOp(BinOp::BitAnd, true_bits, mask));
+    let kept_false = em.typed(
+        Ty::I32,
+        Rvalue::BinaryOp(BinOp::BitAnd, false_bits, not_mask),
+    );
+    let merged = Rvalue::BinaryOp(BinOp::BitOr, kept_true, kept_false);
+    if branch == Ty::I32 {
+        merged
+    } else {
+        let merged = em.typed(Ty::I32, merged);
+        Rvalue::Bitcast {
+            to: branch,
+            operand: merged,
+        }
+    }
 }
 
 fn emit_i32_cmp(
@@ -1072,7 +1263,7 @@ enum RowKind {
 /// leaf's layout `base`, then for each output dim with a nonzero effective stride,
 /// `off += (i / out_strides[d] % out_shape[d]) * eff[d]`.
 #[allow(clippy::too_many_arguments)]
-fn emit_leaf_offset(
+pub(crate) fn emit_leaf_offset(
     leaf_eff: &[usize],
     base: usize,
     out_strides: &[usize],
@@ -1126,6 +1317,8 @@ struct RowCtx<'a> {
     leaf_eff: &'a [Vec<usize>],
     /// per-leaf layout base offset (0 for a plain buffer).
     leaf_base: &'a [usize],
+    /// per-leaf lane: how a leaf's buffer reads back as f32.
+    lanes: &'a [WeightLane],
     out_strides: &'a [usize],
     out_shape: &'a [usize],
     scalar_reg: &'a [Option<Local>],
@@ -1161,10 +1354,7 @@ fn emit_row_value(
             stmts,
         );
         let v = al.add(Ty::F32, false);
-        stmts.push(Statement::Assign(
-            Place::local(v),
-            Rvalue::Use(copy(elem(local_for_leaf(local), off))),
-        ));
+        stmts.extend(ctx.lanes[local].read(al, local_for_leaf(local), off, v));
         v
     } else if ctx.kind[local] == RowKind::Scalar {
         ctx.scalar_reg[local].expect("scalar value computed before use")
@@ -1199,6 +1389,23 @@ fn emit_row_value(
     };
     memo.insert(local, res);
     res
+}
+
+/// The lane each leaf of `k` is read through: its [`RowKernel::leaf_storage`] entry, which must exist for every
+/// leaf and name a storage a generated body reads.
+fn row_lanes(generator: &'static str, k: &RowKernel) -> Result<Vec<WeightLane>, KernelGenError> {
+    if k.leaf_storage.len() != k.n_leaves {
+        return Err(KernelGenError::CountMismatch {
+            generator,
+            what: "leaf storage count".to_string(),
+            expected: k.n_leaves,
+            actual: k.leaf_storage.len(),
+        });
+    }
+    k.leaf_storage
+        .iter()
+        .map(|&storage| WeightLane::of(generator, storage))
+        .collect()
 }
 
 /// leaf index j -> its parameter local (`_1..`).
@@ -1251,6 +1458,7 @@ fn fused_row_views(
             actual: leaf_layouts.len(),
         });
     }
+    let lanes = row_lanes("fused_row_views", k)?;
     let n = k.n_leaves;
     let n_cols = k.n_cols;
     let out_numel: usize = out_shape.iter().product::<usize>().max(1);
@@ -1287,8 +1495,8 @@ fn fused_row_views(
 
     // params: leaves are locals 1..=n, the output is local n+1.
     let mut locals = vec![ld(Ty::Unit, false)];
-    for _ in 0..n {
-        locals.push(ld(slice_f32(false), false));
+    for lane in &lanes {
+        locals.push(lane.param());
     }
     locals.push(ld(slice_f32(true), true));
     let mut al = Alloc::new(locals);
@@ -1395,6 +1603,7 @@ fn fused_row_views(
                     kind: &ctx_kind,
                     leaf_eff: &ctx_leaf_eff,
                     leaf_base: &ctx_leaf_base,
+                    lanes: &lanes,
                     out_strides: &out_strides,
                     out_shape,
                     scalar_reg: &scalar_reg,
@@ -1467,6 +1676,7 @@ fn fused_row_views(
         kind: &ctx_kind,
         leaf_eff: &ctx_leaf_eff,
         leaf_base: &ctx_leaf_base,
+        lanes: &lanes,
         out_strides: &out_strides,
         out_shape,
         scalar_reg: &scalar_reg,
@@ -1571,6 +1781,7 @@ pub fn fused_row_parallel_views(
             min: 1,
         });
     }
+    let lanes = row_lanes("fused_row_parallel_views", k)?;
     let n = k.n_leaves;
     let n_cols = k.n_cols;
     let out_numel: usize = out_shape.iter().product::<usize>().max(1);
@@ -1607,8 +1818,8 @@ pub fn fused_row_parallel_views(
 
     // params: leaves are locals 1..=n, the output is local n+1.
     let mut locals = vec![ld(Ty::Unit, false)];
-    for _ in 0..n {
-        locals.push(ld(slice_f32(false), false));
+    for lane in &lanes {
+        locals.push(lane.param());
     }
     locals.push(ld(slice_f32(true), true));
     let mut al = Alloc::new(locals);
@@ -1721,6 +1932,7 @@ pub fn fused_row_parallel_views(
                     kind: &ctx_kind,
                     leaf_eff: &ctx_leaf_eff,
                     leaf_base: &ctx_leaf_base,
+                    lanes: &lanes,
                     out_strides: &out_strides,
                     out_shape,
                     scalar_reg: &scalar_reg,
@@ -1843,6 +2055,7 @@ pub fn fused_row_parallel_views(
         kind: &ctx_kind,
         leaf_eff: &ctx_leaf_eff,
         leaf_base: &ctx_leaf_base,
+        lanes: &lanes,
         out_strides: &out_strides,
         out_shape,
         scalar_reg: &scalar_reg,
@@ -1940,6 +2153,7 @@ mod tests {
     fn rmsnorm_kernel(n_cols: usize, eps: f32) -> RowKernel {
         RowKernel {
             n_leaves: 2, // x, w
+            leaf_storage: vec![BufferStorage::f32(); 2],
             n_cols,
             steps: vec![
                 RowOp::Pointwise {
@@ -2011,6 +2225,7 @@ mod tests {
     fn softmax_kernel(n_cols: usize) -> RowKernel {
         RowKernel {
             n_leaves: 1,
+            leaf_storage: vec![BufferStorage::f32()],
             n_cols,
             steps: vec![
                 RowOp::Reduce {
@@ -2229,7 +2444,7 @@ mod tests {
     /// A step reading both leaves, then `steps` chained steps of `op`, each reading `arity` operands (the
     /// first from the step before, the rest from the leaves). The leading step keeps both leaves read
     /// whatever `steps` is, so a body with none differs from one with eight by the ops alone.
-    fn chain(op: FusedScalarOp, arity: usize, steps: usize) -> FusedKernel {
+    fn chain(op: FusedScalarOp, arity: usize, steps: usize, leaf: LeafTy) -> FusedKernel {
         let mut all = vec![FusedStep {
             op: FusedScalarOp::Binary(BinOp::Add),
             inputs: vec![FusedInput::Leaf(0), FusedInput::Leaf(1)],
@@ -2249,7 +2464,7 @@ mod tests {
             }
         }));
         FusedKernel {
-            n_leaves: 2,
+            leaf_tys: vec![leaf; 2],
             output: FusedInput::Step(steps),
             steps: all,
         }
@@ -2303,9 +2518,12 @@ mod tests {
                 Layout::contiguous(&out_shape),
             ];
             for (op, arity) in float_ops {
-                let (empty, full) = (chain(op, arity, 0), chain(op, arity, 8));
+                let (empty, full) = (
+                    chain(op, arity, 0, LeafTy::F32),
+                    chain(op, arity, 8, LeafTy::F32),
+                );
                 let build = |k: &FusedKernel| {
-                    BodySize::of(&fused_views("k", &out_shape, &leaves, &layouts, k).unwrap())
+                    BodySize::of(&fused_views("k", &out_shape, &leaves, &layouts, k, None).unwrap())
                 };
                 let (built, bound) = (
                     (build(&empty), build(&full)),
@@ -2319,9 +2537,63 @@ mod tests {
                     "f32 {op:?} rank {rank}: bound grows {bound:?}, the built body {built:?}"
                 );
             }
+            // A float `Select` reads its I32 condition leaf beside two float branch leaves.
+            {
+                let select = |steps: usize| FusedKernel {
+                    leaf_tys: vec![LeafTy::I32, LeafTy::F32, LeafTy::F32],
+                    steps: (0..steps)
+                        .map(|s| FusedStep {
+                            op: FusedScalarOp::Select,
+                            inputs: vec![
+                                FusedInput::Leaf(0),
+                                if s == 0 {
+                                    FusedInput::Leaf(1)
+                                } else {
+                                    FusedInput::Step(s - 1)
+                                },
+                                FusedInput::Leaf(2),
+                            ],
+                        })
+                        .collect(),
+                    output: if steps == 0 {
+                        FusedInput::Leaf(1)
+                    } else {
+                        FusedInput::Step(steps - 1)
+                    },
+                };
+                let shapes: [&[usize]; 3] = [&out_shape, &out_shape, &out_shape];
+                let select_layouts = [
+                    Layout::contiguous(&out_shape),
+                    Layout::contiguous(&out_shape),
+                    Layout::contiguous(&out_shape),
+                ];
+                for x_groups in [None, Some(4)] {
+                    let (empty, full) = (select(0), select(8));
+                    let build = |k: &FusedKernel| {
+                        BodySize::of(
+                            &fused_views("k", &out_shape, &shapes, &select_layouts, k, x_groups)
+                                .unwrap(),
+                        )
+                    };
+                    let (built, bound) = (
+                        (build(&empty), build(&full)),
+                        (
+                            pointwise_size(&empty, rank, 0),
+                            pointwise_size(&full, rank, 0),
+                        ),
+                    );
+                    assert!(
+                        grew(built, bound),
+                        "f32 Select rank {rank} grid {x_groups:?}: bound grows {bound:?}, the built body {built:?}"
+                    );
+                }
+            }
             for (op, arity) in i32_ops {
                 for x_groups in [None, Some(4)] {
-                    let (empty, full) = (chain(op, arity, 0), chain(op, arity, 8));
+                    let (empty, full) = (
+                        chain(op, arity, 0, LeafTy::I32),
+                        chain(op, arity, 8, LeafTy::I32),
+                    );
                     let build = |k: &FusedKernel| {
                         BodySize::of(
                             &fused_i32_views_grid("k", &out_shape, &leaves, &layouts, k, x_groups)
@@ -2350,7 +2622,7 @@ mod tests {
         let out_shape = [3usize, 2];
         let leaf_shape = [3usize, 2];
         let k = FusedKernel {
-            n_leaves: 1,
+            leaf_tys: vec![LeafTy::I32; 1],
             steps: vec![FusedStep {
                 op: FusedScalarOp::Binary(BinOp::Add),
                 inputs: vec![

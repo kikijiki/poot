@@ -11,25 +11,31 @@ use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
 use poot_graph_ir::{Builder, Graph, ValidationOutputs};
-use poot_quant::weights::{WeightEntry, WeightMap, WeightStore};
-use poot_tensor::DType;
+use poot_quant::weights::{WeightMap, WeightStore};
 
 use crate::chat::ChatFormat;
 use crate::components::attention::{AttentionParams, AttentionWeights, attention};
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
 use crate::components::ffn::{GatedFfnWeights, gated_ffn};
 use crate::components::linear::WeightError;
+use crate::components::moe::{self, MoeParams, MoeWeights};
+use crate::components::rope::{GGUF_ROPE_FREQS, rope_freq_factors};
+use crate::components::router::RouterKind;
 use crate::components::standard::{
-    LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step, standard_layer,
-    standard_stack,
+    BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
+    standard_layer, standard_stack,
 };
 use crate::model::{
     ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, StepShape,
     TraceError,
 };
 use crate::names::gguf::GGUF_BASE;
-use crate::names::{HF_BASE, family_weights, hf_base_shapes};
+use crate::names::{
+    ExpertNames, HF_BASE, MoeLayers, MoeNames, family_weights, family_weights_routed,
+    hf_base_shapes,
+};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use poot_quant::weights::ExpertProj;
 
 pub const FAMILY: FamilyKey = FamilyKey::new("llama");
 
@@ -38,10 +44,12 @@ pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     keys: &[
         (ConfigSource::HfModelType, "llama"),
         (ConfigSource::HfModelType, "mistral"),
+        (ConfigSource::HfModelType, "mixtral"),
         (ConfigSource::GgufArchitecture, "llama"),
     ],
     build,
     fixture,
+    variants: &[("mixtral", mixtral_fixture)],
 };
 
 /// llama's config facts: `LlamaConfig`'s and `MistralConfig`'s defaults (they agree), and
@@ -55,27 +63,66 @@ const SPEC: DenseSpec = DenseSpec {
     eos: Some(2),
 };
 
-/// A GGUF tensor llama.cpp writes for a llama3-style rope scaling: the per-frequency factors the
-/// config's RoPE is rescaled by.
-const GGUF_ROPE_FREQS: &str = "rope_freqs.weight";
+/// Mixtral's experts: `intermediate_size` is each expert's width and `w1`, `w3`, `w2` are its gate,
+/// up and down projections.
+const HF_MOE: MoeNames = MoeNames {
+    prefix: "model.layers.",
+    router: ".block_sparse_moe.gate",
+    router_bias: None,
+    shared: None,
+    experts: &[
+        ExpertNames {
+            proj: ExpertProj::Gate,
+            stack: None,
+            each: Some((".block_sparse_moe.experts.", ".w1.weight")),
+            bias: None,
+        },
+        ExpertNames {
+            proj: ExpertProj::Up,
+            stack: None,
+            each: Some((".block_sparse_moe.experts.", ".w3.weight")),
+            bias: None,
+        },
+        ExpertNames {
+            proj: ExpertProj::Down,
+            stack: None,
+            each: Some((".block_sparse_moe.experts.", ".w2.weight")),
+            bias: None,
+        },
+    ],
+};
 
-/// The per-frequency factors of a `rope_freqs.weight`: llama.cpp writes them as one F32 vector.
-fn rope_freq_factors(entry: &WeightEntry) -> Result<Vec<f32>, ModelError> {
-    let refuse = |reason| ModelError::Config {
-        family: FAMILY,
-        field: GGUF_ROPE_FREQS,
-        reason,
-    };
-    match entry {
-        WeightEntry::Dense(dense) if dense.dtype() == DType::F32 => Ok(dense
-            .bytes()
-            .as_slice()
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect()),
-        _ => Err(refuse(ConfigReason::WrongType)),
-    }
-}
+/// A llama-architecture GGUF with experts: one stacked tensor per projection, or the older
+/// converter's one tensor per expert (`blk.L.ffn_gate.E.weight`).
+const GGUF_MOE: MoeNames = MoeNames {
+    prefix: "blk.",
+    router: ".ffn_gate_inp",
+    router_bias: None,
+    shared: None,
+    experts: &[
+        ExpertNames {
+            proj: ExpertProj::Gate,
+            stack: Some(".ffn_gate_exps.weight"),
+            each: Some((".ffn_gate.", ".weight")),
+            bias: None,
+        },
+        ExpertNames {
+            proj: ExpertProj::Up,
+            stack: Some(".ffn_up_exps.weight"),
+            each: Some((".ffn_up.", ".weight")),
+            bias: None,
+        },
+        ExpertNames {
+            proj: ExpertProj::Down,
+            stack: Some(".ffn_down_exps.weight"),
+            each: Some((".ffn_down.", ".weight")),
+            bias: None,
+        },
+    ],
+};
+
+const EXPERTS: Field = Field::new("num_local_experts", "llama.expert_count");
+const TOP_K: Field = Field::new("num_experts_per_tok", "llama.expert_used_count");
 
 /// llama's typed config: every value checked once, here, so tracing cannot fail on it.
 #[derive(Clone, Debug, PartialEq)]
@@ -88,6 +135,9 @@ pub struct LlamaParams {
     attention: AttentionParams,
     layer: LayerParams,
     stack: StackParams,
+    /// The experts of every layer's feed-forward when the config names an expert count (`inter` is
+    /// then each expert's width).
+    moe: Option<MoeParams>,
     head_required: bool,
     eos: BTreeSet<u32>,
     bos: Option<u32>,
@@ -112,10 +162,14 @@ impl LlamaParams {
                 .with_window(window)
                 .map_err(|e| e.for_family(FAMILY))?;
         }
-        // The `mistral` key is a Mistral checkpoint: its own `[INST]` template, not Llama 3's.
+        // The `mistral` and `mixtral` keys are Mistral checkpoints: their own `[INST]` template,
+        // not Llama 3's.
         let chat = match raw {
             RawConfig::HfJson { config, .. }
-                if config.get("model_type").and_then(|v| v.as_str()) == Some("mistral") =>
+                if matches!(
+                    config.get("model_type").and_then(|v| v.as_str()),
+                    Some("mistral" | "mixtral")
+                ) =>
             {
                 ChatFormat::Mistral
             }
@@ -125,7 +179,21 @@ impl LlamaParams {
             attention = attention.with_interleaved_rope();
         }
         let norm = dims.norm(&fields, &SPEC)?;
+        // The feed-forward routes exactly when the config states an expert count (a GGUF writes
+        // `llama.expert_count = 0` for a dense model).
+        let moe = match fields.opt_u64(EXPERTS)? {
+            None | Some(0) => None,
+            Some(_) => Some(MoeParams::new(
+                FAMILY,
+                dims.width,
+                dims.inter,
+                fields.count(EXPERTS, None)?,
+                fields.count(TOP_K, None)?,
+                RouterKind::TopKSoftmax,
+            )?),
+        };
         Ok(Self {
+            moe,
             attention,
             layer: LayerParams::new(norm),
             stack: StackParams::new(norm),
@@ -143,10 +211,16 @@ impl LlamaParams {
 }
 
 #[derive(Debug)]
+enum Ffn {
+    Dense(GatedFfnWeights),
+    Routed(Box<MoeWeights>, MoeParams),
+}
+
+#[derive(Debug)]
 struct Layer {
     norms: LayerNorms,
     attn: AttentionWeights,
-    ffn: GatedFfnWeights,
+    ffn: Ffn,
 }
 
 #[derive(Debug)]
@@ -160,27 +234,45 @@ pub struct Llama {
 
 fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
     let mut p = LlamaParams::from_raw(raw)?;
-    let rows = match raw.source() {
-        ConfigSource::HfModelType => HF_BASE,
+    let (rows, moe_names) = match raw.source() {
+        ConfigSource::HfModelType => (HF_BASE, &HF_MOE),
         ConfigSource::GgufArchitecture => {
             if let Some(entry) = store.get(GGUF_ROPE_FREQS) {
                 p.attention = p
                     .attention
-                    .with_rope_freq_factors(&rope_freq_factors(entry)?)
+                    .with_rope_freq_factors(&rope_freq_factors(FAMILY, entry)?)
                     .map_err(|e| e.for_family(FAMILY))?;
             }
-            GGUF_BASE
+            (GGUF_BASE, &GGUF_MOE)
         }
     };
-    let weights = family_weights(FAMILY, store, &[rows], p.layers, p.head_required)?;
+    let weights = match &p.moe {
+        None => family_weights(FAMILY, store, &[rows], p.layers, p.head_required)?,
+        Some(moe) => family_weights_routed(
+            FAMILY,
+            store,
+            &[rows],
+            p.layers,
+            p.head_required,
+            MoeLayers {
+                names: moe_names,
+                sparse: &vec![true; p.layers],
+                experts: moe.experts(),
+            },
+        )?,
+    };
     let weight_error = |e: WeightError| e.for_family(FAMILY);
     let stack = StackWeights::new(&weights, p.vocab, p.width).map_err(weight_error)?;
     let layers = (0..p.layers)
         .map(|l| {
+            let ffn = match &p.moe {
+                None => Ffn::Dense(GatedFfnWeights::new(&weights, l, p.width, p.inter)?),
+                Some(moe) => Ffn::Routed(Box::new(MoeWeights::new(&weights, l, moe)?), *moe),
+            };
             Ok(Layer {
                 norms: LayerNorms::new(&weights, l, p.width)?,
                 attn: AttentionWeights::new(&weights, l, p.width, &p.attention)?,
-                ffn: GatedFfnWeights::new(&weights, l, p.width, p.inter)?,
+                ffn,
             })
         })
         .collect::<Result<Vec<_>, WeightError>>()
@@ -221,6 +313,9 @@ impl Model for Llama {
     ) -> Result<Graph<ValidationOutputs>, TraceError> {
         let p = &self.params;
         check_step(FAMILY, phase, shape, p.max_positions)?;
+        if let Some(params) = &p.moe {
+            moe::check_step(FAMILY, shape, params)?;
+        }
         let b = Builder::new();
         let step = Step::new(&b, shape);
         let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
@@ -231,7 +326,10 @@ impl Model for Llama {
                 &layer.norms,
                 &p.layer,
                 |b, h| attention(b, &step, l, h, &layer.attn, &p.attention),
-                |b, h| gated_ffn(b, h, &layer.ffn),
+                |b, BlockInput { block: h, .. }| match &layer.ffn {
+                    Ffn::Dense(w) => gated_ffn(b, h, w),
+                    Ffn::Routed(w, params) => moe::moe(b, &step, l, h, None, w, params),
+                },
             )
         });
         Ok(step.finish(b, logits))
@@ -261,6 +359,39 @@ pub(crate) fn fixture_config() -> serde_json::Value {
 fn fixture() -> Fixture {
     let config = fixture_config();
     let shapes = hf_base_shapes(&config, false);
+    Fixture::bf16(config, shapes)
+}
+
+/// How many experts the Mixtral fixture holds.
+const FIXTURE_EXPERTS: usize = 4;
+
+fn mixtral_config() -> serde_json::Value {
+    let mut config = fixture_config();
+    config["model_type"] = serde_json::json!("mixtral");
+    config["intermediate_size"] = serde_json::json!(64);
+    config["num_local_experts"] = serde_json::json!(FIXTURE_EXPERTS);
+    config["num_experts_per_tok"] = serde_json::json!(2);
+    config
+}
+
+/// A tiny untied Mixtral: every layer routes, `intermediate_size` is each expert's width.
+fn mixtral_fixture() -> Fixture {
+    let config = mixtral_config();
+    let h = 64;
+    let inter = 64;
+    let mut shapes: Vec<_> = hf_base_shapes(&config, false)
+        .into_iter()
+        .filter(|(name, _)| !name.contains(".mlp."))
+        .collect();
+    for l in 0..2 {
+        let k = |s: &str| format!("model.layers.{l}.block_sparse_moe.{s}");
+        shapes.push((k("gate.weight"), vec![FIXTURE_EXPERTS, h]));
+        for e in 0..FIXTURE_EXPERTS {
+            shapes.push((k(&format!("experts.{e}.w1.weight")), vec![inter, h]));
+            shapes.push((k(&format!("experts.{e}.w3.weight")), vec![inter, h]));
+            shapes.push((k(&format!("experts.{e}.w2.weight")), vec![h, inter]));
+        }
+    }
     Fixture::bf16(config, shapes)
 }
 
@@ -771,5 +902,323 @@ mod tests {
             model.trace(Phase::Prefill, shape(1, 1, 65)),
             Err(TraceError::ShapeUnsupported { .. })
         ));
+    }
+}
+
+/// Mixtral: the llama body whose feed-forward routes every layer through experts.
+#[cfg(test)]
+mod moe_tests {
+    use poot_load::gguf::GgufValue;
+    use poot_quant::weights::{MoeRole, WeightEntry, WeightKey, WeightMapError, WeightRole};
+    use serde_json::json;
+
+    use super::*;
+    use crate::components::standard::oracle::run_step;
+    use crate::components::testing::{
+        CAP, assert_chunked_prefill_equals_decode, assert_missing_weight_is_named, build as built,
+        close, f32_entry, gguf_dense_kvs, gguf_name_with_head, gguf_tensor, q8_0_store,
+        read_back_owned, values,
+    };
+    use crate::model::Phase;
+    use crate::olmoe::moe_support::{
+        GgufName, assert_bf16_and_q8_0_experts_trace_and_match, gguf_checkpoint,
+    };
+    use crate::registry::{LoadModelError, Registry};
+
+    use super::FIXTURE_EXPERTS as EXPERTS;
+
+    fn is_packed(key: &str) -> bool {
+        key.ends_with("_proj.weight")
+            || ["w1", "w2", "w3"]
+                .iter()
+                .any(|w| key.ends_with(&format!(".{w}.weight")))
+    }
+
+    fn has_router(model: &dyn Model) -> bool {
+        model
+            .weights()
+            .iter()
+            .any(|(id, _, _)| id.role == WeightRole::Moe(MoeRole::Router))
+    }
+
+    /// SC-007: the `mixtral` key resolves to the llama family, and its model has a router and
+    /// experts on every layer.
+    #[test]
+    fn the_mixtral_key_resolves_to_llama_with_experts() {
+        let registry = Registry::builtin().unwrap();
+        let fx = mixtral_fixture();
+        assert_eq!(registry.resolve(&fx.raw()).unwrap().family, FAMILY);
+        let model = registry.build(&fx.raw(), &fx.store).unwrap();
+        assert!(has_router(&*model));
+        assert_eq!(model.config().chat, ChatFormat::Mistral);
+        let routers = model
+            .weights()
+            .iter()
+            .filter(|(id, _, _)| id.role == WeightRole::Moe(MoeRole::Router))
+            .count();
+        assert_eq!(routers, 2);
+    }
+
+    #[test]
+    fn chunked_prefill_continuing_from_pos_equals_token_by_token_decode() {
+        let fx = mixtral_fixture();
+        let raw = fx.raw();
+        assert_chunked_prefill_equals_decode(&*built(&ENTRY, &raw, &fx.store), &fx.store);
+    }
+
+    #[test]
+    fn bf16_and_q8_0_experts_trace_through_the_one_body_and_match_the_decoded_reference() {
+        assert_bf16_and_q8_0_experts_trace_and_match(&ENTRY, &mixtral_fixture(), is_packed);
+    }
+
+    /// SC-005: a Mixtral store missing one required tensor, the router or one expert's projection,
+    /// fails `Registry::build` with the typed missing-weight error naming it. Mutation: report the
+    /// first expert instead of the absent one (`ExpertNames::find`); the expert-3 row goes red.
+    #[test]
+    fn a_missing_required_tensor_is_named_before_any_trace() {
+        let registry = Registry::builtin().unwrap();
+        let fx = mixtral_fixture();
+        for removed in [
+            "model.layers.1.block_sparse_moe.gate.weight",
+            "model.layers.0.block_sparse_moe.experts.0.w1.weight",
+            "model.layers.1.block_sparse_moe.experts.3.w2.weight",
+            "model.layers.1.input_layernorm.weight",
+        ] {
+            assert_missing_weight_is_named(&registry, &fx, removed);
+        }
+    }
+
+    /// The experts' width is `intermediate_size`; a `top_k` above the expert count is a typed config
+    /// error, and so is a zero expert count (no routed layer without experts is silently dense).
+    #[test]
+    fn an_expert_config_llama_cannot_trace_is_a_typed_error() {
+        let fx = mixtral_fixture();
+        let cases = [
+            (
+                "num_experts_per_tok",
+                json!(5),
+                "top_k",
+                ConfigReason::Exceeds { max: EXPERTS },
+            ),
+            (
+                "num_experts_per_tok",
+                json!(0),
+                "num_experts_per_tok",
+                ConfigReason::Zero,
+            ),
+        ];
+        for (key, value, field, reason) in cases {
+            let mut config = mixtral_config();
+            config[key] = value;
+            let raw = RawConfig::HfJson {
+                config: &config,
+                generation: None,
+            };
+            match build(&raw, &fx.store) {
+                Err(ModelError::Config {
+                    field: got,
+                    reason: why,
+                    ..
+                }) => assert_eq!((got, why), (field, reason)),
+                other => panic!("{key}: expected a config error, got {other:?}"),
+            }
+        }
+    }
+
+    /// llama.cpp's Q/K row permutation, undone (see the dense GGUF row).
+    fn unpermuted(key: &str, entry: &WeightEntry) -> WeightEntry {
+        let shape = entry.shape();
+        let decoded = values(entry);
+        if key.ends_with("q_proj.weight") || key.ends_with("k_proj.weight") {
+            let mut rows: Vec<Vec<f32>> = decoded.chunks(shape[1]).map(<[f32]>::to_vec).collect();
+            let d = 16;
+            let stored = rows.clone();
+            for (head, block) in stored.chunks(d).enumerate() {
+                for j in 0..d / 2 {
+                    rows[head * d + j] = block[2 * j].clone();
+                    rows[head * d + d / 2 + j] = block[2 * j + 1].clone();
+                }
+            }
+            f32_entry(shape, &rows.concat())
+        } else {
+            f32_entry(shape, &decoded)
+        }
+    }
+
+    fn gguf_kvs(experts: Option<usize>) -> Vec<(String, GgufValue)> {
+        let mut kvs = gguf_dense_kvs("llama", &mixtral_config());
+        if let Some(experts) = experts {
+            kvs.push(("llama.expert_count".into(), GgufValue::U32(experts as u32)));
+            kvs.push(("llama.expert_used_count".into(), GgufValue::U32(2)));
+        }
+        kvs
+    }
+
+    /// llama.cpp's name of a Mixtral tensor: the stacked `ffn_*_exps` or, for the older converter,
+    /// one tensor per expert (`blk.L.ffn_gate.E.weight`).
+    fn gguf_name_of(hf: &str, stacked: bool) -> GgufName {
+        let Some(rest) = hf.strip_prefix("model.layers.") else {
+            return GgufName::Plain(gguf_name_with_head(hf));
+        };
+        let (layer, tensor) = rest.split_once('.').unwrap();
+        let Some(moe) = tensor.strip_prefix("block_sparse_moe.") else {
+            return GgufName::Plain(gguf_name_with_head(hf));
+        };
+        if moe == "gate.weight" {
+            return GgufName::Plain(format!("blk.{layer}.ffn_gate_inp.weight"));
+        }
+        let (index, w) = moe
+            .strip_prefix("experts.")
+            .and_then(|e| e.split_once('.'))
+            .unwrap();
+        let index: usize = index.parse().unwrap();
+        let proj = match w {
+            "w1.weight" => "gate",
+            "w3.weight" => "up",
+            "w2.weight" => "down",
+            other => panic!("{other}"),
+        };
+        if stacked {
+            GgufName::Expert {
+                stack: format!("blk.{layer}.ffn_{proj}_exps.weight"),
+                index,
+            }
+        } else {
+            GgufName::Plain(format!("blk.{layer}.ffn_{proj}.{index}.weight"))
+        }
+    }
+
+    /// A Q8_0 Mixtral GGUF (general.architecture = llama, `llama.expert_count = 4`; the experts
+    /// stacked or one tensor each) and the HF F32 store holding the same values un-permuted.
+    fn gguf_case(stacked: bool) -> (poot_load::gguf::GgufIndex, WeightStore, WeightStore) {
+        let fx = mixtral_fixture();
+        let q8 = q8_0_store(&fx.store, is_packed);
+        let (index, store) = if stacked {
+            gguf_checkpoint(&gguf_kvs(Some(EXPERTS)), &q8, |k| gguf_name_of(k, true))
+        } else {
+            let tensors: Vec<_> = q8
+                .iter()
+                .map(|(key, entry)| match gguf_name_of(key.as_str(), false) {
+                    GgufName::Plain(name) => gguf_tensor(&name, entry),
+                    GgufName::Expert { .. } => unreachable!(),
+                })
+                .collect();
+            read_back_owned(&gguf_kvs(Some(EXPERTS)), &tensors)
+        };
+        let mut reference = WeightStore::builder();
+        for (key, entry) in q8.iter() {
+            reference
+                .insert(key.clone(), unpermuted(key.as_str(), entry))
+                .unwrap();
+        }
+        (index, store, reference.build())
+    }
+
+    fn assert_equals_the_hf_body(
+        index: &poot_load::gguf::GgufIndex,
+        store: &WeightStore,
+        reference_store: &WeightStore,
+    ) {
+        let registry = Registry::builtin().unwrap();
+        let raw = RawConfig::Gguf(index);
+        assert_eq!(registry.resolve(&raw).unwrap().family, FAMILY);
+        let model = registry.build(&raw, store).unwrap();
+        assert!(
+            has_router(&*model),
+            "expert_count = 4 resolves with experts"
+        );
+        let reference = built(
+            &ENTRY,
+            &RawConfig::HfJson {
+                config: &mixtral_config(),
+                generation: None,
+            },
+            reference_store,
+        );
+        let prompt = [3, 17, 40, 8];
+        let (got, state) = run_step(&*model, store, Phase::Prefill, CAP, &prompt, 0, &[]);
+        let (want, want_state) = run_step(
+            &*reference,
+            reference_store,
+            Phase::Prefill,
+            CAP,
+            &prompt,
+            0,
+            &[],
+        );
+        close(&got, &want);
+        let (got, _) = run_step(&*model, store, Phase::Decode, CAP, &[5], 4, &state);
+        let (want, _) = run_step(
+            &*reference,
+            reference_store,
+            Phase::Decode,
+            CAP,
+            &[5],
+            4,
+            &want_state,
+        );
+        close(&got, &want);
+    }
+
+    /// SC-007 and the held Mixtral rows: a Mixtral GGUF (architecture `llama`, `llama.expert_count`
+    /// 4) resolves to the llama family with experts and computes what the HF body computes over the
+    /// same values, with the experts stacked or in the older one-tensor-per-expert layout.
+    /// Mutation: key the MoE choice on the HF `model_type` string (a GGUF has none); the GGUF
+    /// resolves dense and `build` refuses the stacked expert tensors it does not read.
+    #[test]
+    fn a_mixtral_gguf_resolves_to_llama_with_experts_in_both_layouts() {
+        for stacked in [true, false] {
+            let (index, store, reference_store) = gguf_case(stacked);
+            assert_equals_the_hf_body(&index, &store, &reference_store);
+        }
+    }
+
+    /// Without `llama.expert_count` (or with a zero one) a llama GGUF is the dense llama.
+    #[test]
+    fn a_llama_gguf_without_an_expert_count_is_dense() {
+        let fx = fixture();
+        let mut tensors = Vec::new();
+        for (key, entry) in fx.store.iter() {
+            tensors.push(gguf_tensor(&gguf_name_with_head(key.as_str()), entry));
+        }
+        for experts in [None, Some(0)] {
+            let kvs = {
+                let mut kvs = gguf_dense_kvs("llama", &fx.config);
+                if let Some(n) = experts {
+                    kvs.push(("llama.expert_count".into(), GgufValue::U32(n)));
+                }
+                kvs
+            };
+            let (index, store) = read_back_owned(&kvs, &tensors);
+            let registry = Registry::builtin().unwrap();
+            let model = registry.build(&RawConfig::Gguf(&index), &store).unwrap();
+            assert!(!has_router(&*model), "expert_count {experts:?}");
+            assert_eq!(model.config().family, FAMILY);
+        }
+    }
+
+    /// A Mixtral GGUF missing its router names `blk.L.ffn_gate_inp.weight`.
+    #[test]
+    fn a_mixtral_gguf_without_a_router_is_named() {
+        let (index, store, _) = gguf_case(true);
+        let mut without = WeightStore::builder();
+        for (key, entry) in store.iter() {
+            if key.as_str() != "blk.0.ffn_gate_inp.weight" {
+                without.insert(key.clone(), entry.clone()).unwrap();
+            }
+        }
+        let err = Registry::builtin()
+            .unwrap()
+            .build(&RawConfig::Gguf(&index), &without.build())
+            .map(|_| ())
+            .unwrap_err();
+        let LoadModelError::Model(ModelError::Weight {
+            source: WeightMapError::Missing { key, .. },
+            ..
+        }) = &err
+        else {
+            panic!("{err}");
+        };
+        assert_eq!(key, &WeightKey::from("blk.0.ffn_gate_inp.weight"));
     }
 }

@@ -1586,8 +1586,7 @@ fn production_body_writer_leaves_header_invalid_on_synthetic_ring() {
             1,
             &kernel,
             kernarg,
-            (8, 1, 1),
-            (4, 1, 1),
+            DispatchGeometry::new((8, 1, 1), (4, 1, 1)).unwrap(),
             completion,
         );
     }
@@ -1662,8 +1661,7 @@ fn ring_writer_write_body_uses_the_shared_body_writer() {
     let dispatches = [(
         kernel.clone(),
         SyntheticKernarg(kernarg_address),
-        (8, 1, 1),
-        (4, 1, 1),
+        DispatchGeometry::new((8, 1, 1), (4, 1, 1)).unwrap(),
     )];
     let mut writer = AqlRingWriter {
         dispatches: &dispatches,
@@ -1708,14 +1706,12 @@ fn ring_writer_completion_signal_rides_only_the_final_packet() {
         (
             kernel.clone(),
             SyntheticKernarg(0x55u8 as *mut c_void),
-            (8, 1, 1),
-            (4, 1, 1),
+            DispatchGeometry::new((8, 1, 1), (4, 1, 1)).unwrap(),
         ),
         (
             kernel,
             SyntheticKernarg(0x66u8 as *mut c_void),
-            (8, 1, 1),
-            (4, 1, 1),
+            DispatchGeometry::new((8, 1, 1), (4, 1, 1)).unwrap(),
         ),
     ];
     let mut writer = AqlRingWriter {
@@ -1752,8 +1748,7 @@ fn ring_writer_device_store_fence_issues_the_architecture_fence() {
     let dispatches = [(
         kernel,
         SyntheticKernarg(0x55u8 as *mut c_void),
-        (1, 1, 1),
-        (1, 1, 1),
+        DispatchGeometry::new((1, 1, 1), (1, 1, 1)).unwrap(),
     )];
     let mut writer = AqlRingWriter {
         dispatches: &dispatches,
@@ -2407,7 +2402,9 @@ fn bf16_round_trips_through_the_storage_typed_primitives_with_exactly_elems_time
         "bf16 storage-typed round trip must be bit-exact"
     );
     let got_bits: Vec<u16> = got
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
     assert_eq!(got_bits, want_bits);
@@ -2471,4 +2468,130 @@ fn rocm_context_memory_returns_to_zero_after_every_allocation_drops() {
         "ctx.memory()'s Activation role must read zero live bytes once every allocation it \
          references has dropped: got {after}"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// POOT-1039: typed dispatch-geometry validation.
+// ---------------------------------------------------------------------------------------------
+
+/// SC-001 (table): every geometry no well-formed AQL packet can carry is refused with its own typed
+/// violation, and the boundary geometries a real kernel uses are accepted. Mutation observed red: drop
+/// the `value == 0` grid check in `validate_dispatch_geometry`; the first `ZeroGrid` row then gets `Ok`.
+/// `DispatchGeometry` is the only way to a packet body, so validation cannot be skipped by call order.
+#[test]
+fn dispatch_geometry_table_refuses_each_malformed_shape_with_its_own_violation() {
+    use DispatchAxis::{X, Y, Z};
+    use DispatchGeometryViolation as V;
+    let limit = poot_target::AMDGPU_MAX_WORKGROUP_INVOCATIONS;
+    type Dims = (u32, u32, u32);
+    let rows: [(Dims, Dims, Result<(), V>); 14] = [
+        ((1, 1, 1), (1, 1, 1), Ok(())),
+        ((u32::MAX, 1, 1), (limit, 1, 1), Ok(())),
+        ((64, 64, 64), (32, 32, 1), Ok(())),
+        ((8, 8, 8), (4, 4, 64), Ok(())),
+        ((0, 1, 1), (64, 1, 1), Err(V::ZeroGrid { axis: X })),
+        ((1, 0, 1), (64, 1, 1), Err(V::ZeroGrid { axis: Y })),
+        ((1, 1, 0), (64, 1, 1), Err(V::ZeroGrid { axis: Z })),
+        ((1, 1, 1), (0, 1, 1), Err(V::ZeroBlock { axis: X })),
+        ((1, 1, 1), (1, 0, 1), Err(V::ZeroBlock { axis: Y })),
+        ((1, 1, 1), (1, 1, 0), Err(V::ZeroBlock { axis: Z })),
+        (
+            (1, 1, 1),
+            (limit + 1, 1, 1),
+            Err(V::BlockAxisTooLarge {
+                axis: X,
+                value: limit + 1,
+                max: limit,
+            }),
+        ),
+        (
+            (1, 1, 1),
+            (1, 70_000, 1),
+            Err(V::BlockAxisTooLarge {
+                axis: Y,
+                value: 70_000,
+                max: limit,
+            }),
+        ),
+        (
+            (1, 1, 1),
+            (32, 32, 2),
+            Err(V::BlockInvocationsTooLarge {
+                invocations: 2048,
+                max: limit,
+            }),
+        ),
+        (
+            (1, 1, 1),
+            (1024, 1024, 1024),
+            Err(V::BlockInvocationsTooLarge {
+                invocations: 1 << 30,
+                max: limit,
+            }),
+        ),
+    ];
+    for (grid, block, want) in rows {
+        assert_eq!(
+            DispatchGeometry::new(grid, block).map(|_| ()),
+            want,
+            "grid {grid:?} workgroup {block:?}"
+        );
+    }
+}
+
+/// SC-001 (production entry, live device): `dispatch` and `replay_graph_batched` refuse a zero-sized
+/// workgroup with `InvalidDispatchGeometry` naming the offending dispatch, and reserve no ring slot.
+/// Mutation observed red: remove the validation loop in `submit_and_wait`; the call then publishes the
+/// packet and this row sees a queue fault or `Ok` instead of `InvalidDispatchGeometry`.
+#[test]
+fn dispatch_refuses_malformed_geometry_before_reserving_a_slot() {
+    let Some(ctx) =
+        open_context_or_skip("dispatch_refuses_malformed_geometry_before_reserving_a_slot")
+    else {
+        return;
+    };
+    let (kernel, kernarg) = unexecuted_dispatch(&ctx);
+    let write_index_before = write_index(&ctx);
+
+    let single = ctx.dispatch(&kernel, &kernarg, &[], (1, 1, 1), (0, 1, 1));
+    assert!(
+        matches!(
+            single,
+            Err(RocmError::InvalidDispatchGeometry {
+                op: "dispatch",
+                dispatch: 0,
+                violation: DispatchGeometryViolation::ZeroBlock {
+                    axis: DispatchAxis::X
+                },
+                ..
+            })
+        ),
+        "got {single:?}"
+    );
+
+    let batch = [
+        (kernel.clone(), kernarg.clone(), (1, 1, 1), (1, 1, 1)),
+        (kernel, kernarg, (1, 0, 1), (1, 1, 1)),
+    ];
+    let replay = ctx.replay_graph_batched(&batch, &[&[], &[]]);
+    assert!(
+        matches!(
+            replay,
+            Err(RocmError::InvalidDispatchGeometry {
+                op: "replay_graph_batched",
+                dispatch: 1,
+                violation: DispatchGeometryViolation::ZeroGrid {
+                    axis: DispatchAxis::Y
+                },
+                ..
+            })
+        ),
+        "got {replay:?}"
+    );
+    assert_eq!(
+        write_index(&ctx),
+        write_index_before,
+        "a refused geometry must not reserve a queue slot"
+    );
+    assert!(!ctx.is_poisoned(), "a refused geometry must not poison");
 }

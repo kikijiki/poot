@@ -15,7 +15,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::sync::Arc;
 
-use poot_graph_plan::{CompileLimits, CompileOptions, FusionPolicy, Submission};
+use poot_graph_plan::{CompileLimits, CompileOptions, Submission};
 use poot_llm::driver::{
     BackendChoice, Driver, DriverOptions, GenerateRequest, ModelHandle, PreparedSetLimits,
     open_executor, program_retention,
@@ -108,7 +108,6 @@ fn fixture_checkpoint() -> poot_test_util::UniqueTempPath {
 fn options(chunk: usize, capacity: usize) -> DriverOptions {
     let compile = CompileOptions {
         execution: Submission::Replay,
-        fusion: FusionPolicy::Full,
         limits: CompileLimits::STANDARD,
     };
     let nz = |n| NonZeroUsize::new(n).unwrap();
@@ -123,6 +122,7 @@ fn options(chunk: usize, capacity: usize) -> DriverOptions {
             max_retained_bytes: NonZeroU64::new(1 << 32).unwrap(),
         },
         charge: program_retention,
+        draft: poot_llm::driver::DraftPolicy::Off,
     }
 }
 
@@ -153,7 +153,14 @@ fn greedy(driver: &mut Driver, prompt: &[u32], max_new: usize) -> Vec<u32> {
 }
 
 fn load(path: &Path) -> Arc<ModelHandle> {
-    Arc::new(ModelHandle::load(path, &Registry::builtin().unwrap()).unwrap())
+    Arc::new(
+        ModelHandle::load(
+            path,
+            &Registry::builtin().unwrap(),
+            &poot_llm::driver::LoadOptions::default(),
+        )
+        .unwrap(),
+    )
 }
 
 #[test]

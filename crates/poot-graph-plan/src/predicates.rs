@@ -9,15 +9,13 @@
 use poot_tensor::DType;
 use std::collections::HashMap;
 
-use poot_graph_ir::op::{OpKind, UnOp as GUnOp};
+use poot_graph_ir::op::{ContractionHead, OpKind, UnOp as GUnOp};
 use poot_graph_ir::{Eqn, Graph, Operand, TensorType, ValidationChannel, ValueId, ValueMeta};
 use poot_kernelgen as kg;
 use poot_target::{Backend, DeviceCaps, TensorCoreSupport};
 
 use crate::imported::*;
-use crate::{
-    ContractionSpec, KernelRequest, Layout, MovementSpec, PlanError, Planned, Site, fty_ty,
-};
+use crate::{ContractionSpec, KernelRequest, Layout, PlanError, Planned, Site};
 
 /// The codegen capability query for the equation's backend (card 522, R468-014). `Backend`'s `AmdGcn`
 /// payload already carries the same `AmdArch` `poot_codegen::Target::AmdGcn` takes, so the conversion is
@@ -95,8 +93,9 @@ fn consumers(g: GraphTables<'_>) -> HashMap<ValueId, Vec<usize>> {
 /// Conservative allowlist: elementwise `Binary` against another value (`binary_broadcast_dt_views`),
 /// `Fused` / `FusedRow` (`fused_views` / `fused_row_parallel_views`), and the `Unary` sub-ops that share
 /// `build_unary_dt`'s skeleton (`Neg`/`Recip`/`Sqrt`/`Round`/`Exp`/`Log`, via [`map_unary_views_grid`]).
-/// Everything else (contractions, gather/scatter, concat, standalone `Reduce`, `Reshape`,
-/// `DynamicUpdateSlice`) keeps materializing.
+/// The indexed contraction reads its weight operand (operand 1 only) strided, so a `Transpose` of the stacked
+/// expert weight is a view there. Everything else (other contractions, gather/scatter, concat, standalone
+/// `Reduce`, `Reshape`, `DynamicUpdateSlice`) keeps materializing.
 ///
 /// `Binary` against a literal is excluded: it lowers to `binary_scalar_dt`, which reads its value operand
 /// as a flat `x[i]`, so a view would be misread. This is checked on `eqn.inputs`, not just the `OpKind`.
@@ -104,7 +103,7 @@ fn consumers(g: GraphTables<'_>) -> HashMap<ValueId, Vec<usize>> {
 /// `Unary(Tanh | Erf)` is excluded: they have bespoke bodies with no view-capable variant. A
 /// Transpose/Slice/Broadcast feeding only one of them still materializes. `Neg` is included because the
 /// qwen2 decode graph's RoPE `rotate_half` (`concat(neg(slice), slice)`) needs it.
-fn is_strided_capable(eqn: &Eqn) -> bool {
+fn is_strided_capable(eqn: &Eqn, value: ValueId) -> bool {
     match &eqn.op {
         OpKind::Binary(_) => matches!(eqn.inputs.get(1), Some(Operand::Value(_))),
         OpKind::Fused(_) | OpKind::FusedRow(_) => true,
@@ -112,8 +111,28 @@ fn is_strided_capable(eqn: &Eqn) -> bool {
             uop,
             GUnOp::Neg | GUnOp::Recip | GUnOp::Sqrt | GUnOp::Round | GUnOp::Exp | GUnOp::Log
         ),
+        // The indexed contraction reads its stacked weight (operand 1 only) through a transposed layout, so a
+        // `Transpose` feeding it is never materialized. Its activation, ids and epilogue leaves are read flat.
+        OpKind::IndexedMatMul
+        | OpKind::ContractionEpilogue {
+            head: ContractionHead::Indexed,
+            ..
+        } => reads_as_indexed_weight(eqn, value),
         _ => false,
     }
+}
+
+/// Whether `eqn` is an indexed contraction that reads `value` as its stacked weight and nowhere else.
+fn reads_as_indexed_weight(eqn: &Eqn, value: ValueId) -> bool {
+    matches!(
+        eqn.op,
+        OpKind::IndexedMatMul
+            | OpKind::ContractionEpilogue {
+                head: ContractionHead::Indexed,
+                ..
+            }
+    ) && matches!(eqn.inputs.get(1), Some(Operand::Value(weight)) if *weight == value)
+        && value_ids(eqn).iter().filter(|&&v| v == value).count() == 1
 }
 
 /// Is `op` one of the 3 movement ops promoted to a view (Transpose/Slice/Broadcast)? Reshape stays on
@@ -134,7 +153,8 @@ fn is_movement_view_candidate(op: &OpKind) -> bool {
 /// Layout needs the input's Layout (earlier):
 ///
 /// - Pass A walks `g.eqns` in reverse and decides the promoted set. A `Transpose`/`Slice`/`Broadcast`
-///   output (not pinned, F32) is promoted when every consumer is `is_strided_capable` or is itself a
+///   output (not pinned, F32, or BF16 read only as an indexed contraction's weight) is promoted when every
+///   consumer is `is_strided_capable` or is itself a
 ///   movement-view candidate already promoted (consumers are visited first in reverse order).
 /// - Pass B walks forward and composes each promoted value's Layout onto its input's Layout
 ///   (`Layout::contiguous` if the input was not promoted). A chain tail therefore has a Layout expressed
@@ -143,7 +163,7 @@ fn is_movement_view_candidate(op: &OpKind) -> bool {
 ///
 /// A value with no consumer is not promoted. A pinned value, a non-F32 dtype, or a non-strided-capable leaf
 /// consumer down the chain keeps the rest of the chain materialized. Unpromoted ops keep the
-/// `Plan::ComputeMeta` index-remap copy.
+/// metadata-launch index-remap copy.
 ///
 /// Every pinned value ([`Graph::pinned_values`]: the output, each validation value, and both sides of each
 /// state pair) keeps its own materialized buffer, so a validation packet can copy it row-major from offset 0.
@@ -162,16 +182,28 @@ pub fn compute_views<V: ValidationChannel>(
     let mut promoted: std::collections::HashSet<ValueId> = std::collections::HashSet::new();
     for eqn in g.eqns.iter().rev() {
         let out = eqn.out;
-        if pinned.contains(&out)
-            || g.aval(out).dtype != DType::F32
-            || !is_movement_view_candidate(&eqn.op)
-        {
+        if pinned.contains(&out) || !is_movement_view_candidate(&eqn.op) {
+            continue;
+        }
+        // A strided view is read element by element, so any f32 reader that takes strides reads it. A BF16 view
+        // is only ever the packed expert stack an indexed contraction reads in place; its other readers have no
+        // BF16 lane.
+        let admitted = match g.aval(out).dtype {
+            DType::F32 => true,
+            DType::BF16 => cons.get(&out).is_some_and(|users| {
+                users
+                    .iter()
+                    .all(|&i| reads_as_indexed_weight(&g.eqns[i], out))
+            }),
+            _ => false,
+        };
+        if !admitted {
             continue;
         }
         let all_strided_capable = cons.get(&out).is_some_and(|users| {
             users.iter().all(|&i| {
                 let c = &g.eqns[i];
-                is_strided_capable(c)
+                is_strided_capable(c, out)
                     || (is_movement_view_candidate(&c.op) && promoted.contains(&c.out))
             })
         });
@@ -248,7 +280,7 @@ pub(crate) fn is_decode_gemv_in(
     out_numel: usize,
     caps: &DeviceCaps,
 ) -> bool {
-    if !matches!(eqn.op, OpKind::MatMul | OpKind::MatMulBias) {
+    if !matches!(eqn.op, OpKind::MatMul) {
         return false;
     }
     // The imported decode GEMV is f32; bf16 decode on NVPTX/AmdGcn takes the tensor-core path.
@@ -259,7 +291,7 @@ pub(crate) fn is_decode_gemv_in(
     if r < 2 || out_shape[r - 2] != 1 || out_numel == 0 {
         return false;
     }
-    // B=1 is a plain `Plan::Compute`; batched B>1 is a `Plan::ComputeMeta` (`dims = [B]` buffer). On NVPTX
+    // B=1 is a single plain dispatch; batched B>1 is a metadata dispatch (`dims = [B]` buffer). On NVPTX
     // that buffer lives in the executor's const cache, keeping a stable device address across CUDA-graph
     // replay. The coalesced imported body lays one workgroup per [`GEMV_TILE`] columns over a 2-D grid
     // (`col0 = GroupY*x_groups+GroupX` times the tile), so the Y cap is on the tiled workgroup count;
@@ -273,7 +305,7 @@ pub(crate) fn is_decode_gemv_in(
     if matches!(backend, Backend::Nvptx) && out_shape[out_shape.len() - 1] > 256 {
         return false;
     }
-    // The weight (inputs[1]) must be rank-2 [K,N]; inputs[2], if present, is the bias [N].
+    // The weight (inputs[1]) must be rank-2 [K,N].
     let ids = value_ids(eqn);
     ids.len() >= 2 && g.aval(ids[1]).shape.len() == 2
 }
@@ -289,13 +321,13 @@ pub fn gemv_grid(out_numel: usize, caps: &DeviceCaps) -> (usize, usize) {
 
 /// Plan a decode-GEMV (`is_decode_gemv`'s `M==1` shared-weight matmul). Below `caps.watchdog_budget`'s
 /// `decode_gemv_out_elems` output elements, or on a device with no watchdog budget at all (no display
-/// watchdog off wgpu/RADV, card 163), this is the coalesced imported kernel: `Plan::Compute` for `B=1`,
-/// `Plan::ComputeMeta` with a `dims=[B]` buffer for `B>1`. Above the trigger it splits into
+/// watchdog off wgpu/RADV, card 163), this is the coalesced imported kernel: a plain dispatch for `B=1`,
+/// a metadata dispatch with a `dims=[B]` buffer for `B>1`. Above the trigger it splits into
 /// `kernelgen::gemv_lds` dispatches over disjoint column ranges of the same output buffer - that chunk
 /// body is still one workgroup per output element with the stride-N read (`elem_offset` baked per chunk;
 /// the coalesced import has no offset param), so it is the shape gate that keeps the old access pattern.
-/// `chunk_elems` is capped at `caps.max_grid[0]` because `Plan::ComputeChunks`' `groups` is a single 1-D
-/// workgroup count. `k`/`n` are the weight's `[K,N]` dims; `bias` selects the `MatMulBias` epilogue.
+/// `chunk_elems` is capped at `caps.max_grid[0]` because a split plan's dispatch is a single 1-D
+/// workgroup count. `k`/`n` are the weight's `[K,N]` dims.
 ///
 /// A single dispatch at BLOOM's scale (`N=250880, K=1024`) completes in ~0.6s alone, but the same dispatch
 /// right after another large one (a materializing `transpose` of the same weight, ~3.7s) trips the Strix
@@ -321,7 +353,6 @@ pub(crate) fn decode_gemv_plan(
     k: usize,
     n: usize,
     out_numel: usize,
-    bias: bool,
     weight_bf16: bool,
     caps: &DeviceCaps,
 ) -> Result<Planned, PlanError> {
@@ -340,11 +371,10 @@ pub(crate) fn decode_gemv_plan(
                 .is_none_or(|w| out_numel <= w.decode_gemv_out_elems as usize),
             "bf16 decode GEMV eligibility excludes the over-trigger chunk shape"
         );
-        let kernel = match (batch_meta.is_some(), bias) {
-            (false, false) => ImportedKernel::GemvCoalescedBf16,
-            (false, true) => ImportedKernel::GemvCoalescedBiasBf16,
-            (true, false) => ImportedKernel::GemvBatchedCoalescedBf16,
-            (true, true) => ImportedKernel::GemvBatchedCoalescedBiasBf16,
+        let kernel = if batch_meta.is_some() {
+            ImportedKernel::GemvBatchedCoalescedBf16
+        } else {
+            ImportedKernel::GemvCoalescedBf16
         };
         return Ok(Planned::imported(kernel, backend, batch_meta, grid));
     }
@@ -352,11 +382,10 @@ pub(crate) fn decode_gemv_plan(
         .watchdog_budget
         .is_some_and(|w| out_numel > w.decode_gemv_out_elems as usize);
     if !over_trigger {
-        let kernel = match (batch_meta.is_some(), bias) {
-            (false, false) => ImportedKernel::GemvCoalesced,
-            (false, true) => ImportedKernel::GemvCoalescedBias,
-            (true, false) => ImportedKernel::GemvBatchedCoalesced,
-            (true, true) => ImportedKernel::GemvBatchedCoalescedBias,
+        let kernel = if batch_meta.is_some() {
+            ImportedKernel::GemvBatchedCoalesced
+        } else {
+            ImportedKernel::GemvCoalesced
         };
         return Ok(Planned::imported(kernel, backend, batch_meta, grid));
     }
@@ -365,7 +394,6 @@ pub(crate) fn decode_gemv_plan(
             k,
             n,
             width: GEMV_WIDTH,
-            bias,
             elems,
             offset,
         })
@@ -374,9 +402,9 @@ pub(crate) fn decode_gemv_plan(
 }
 
 /// A decode GEMV as `kg::gemv_lds` dispatches over disjoint output ranges of one buffer: one workgroup of
-/// [`GEMV_WIDTH`] lanes per output element, at most `caps.max_grid[0]` of them per chunk (`Plan::ComputeChunks`'
-/// `groups` is a single 1-D workgroup count). `request(elems, offset)` builds one chunk's request, so the weight
-/// layout and bias are the caller's.
+/// [`GEMV_WIDTH`] lanes per output element, at most `caps.max_grid[0]` of them per dispatch (a split plan's dispatch is a
+/// single 1-D workgroup count). `request(elems, offset)` builds one dispatch's request, so the weight layout is
+/// the caller's.
 pub(crate) fn gemv_chunks(
     site: Site<'_>,
     backend: Backend,
@@ -390,10 +418,10 @@ pub(crate) fn gemv_chunks(
         .map(|ci| {
             let offset = ci * chunk_elems;
             let elems = (out_numel - offset).min(chunk_elems);
-            Planned::generated_chunk(site, request(elems, offset), backend, caps)
+            Planned::generated_dispatch(site, request(elems, offset), backend, caps)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Planned::chunked(chunks))
+    Planned::split(chunks)
 }
 
 /// The [`kg::Schedule::Gemv`] a `DenseContraction` decode GEMV runs (M == 1 once every leading dim folds into
@@ -406,9 +434,7 @@ pub(crate) fn dense_decode_gemv_in(
     out_numel: usize,
     caps: &DeviceCaps,
 ) -> Option<kg::Schedule> {
-    if !matches!(eqn.op, OpKind::DenseContraction { .. }) {
-        return None;
-    }
+    eqn.op.dense_weight()?;
     let n = *out_shape.last()?;
     if out_shape.len() < 2 || n == 0 || out_numel != n {
         return None;
@@ -449,25 +475,10 @@ pub(crate) fn dense_gemv_launch(n: usize, compute_units: u32) -> DenseGemvLaunch
     }
 }
 
-/// Workgroup width for the 2-D-folded one-thread-per-element imported kernels ([`OpKind::ScatterUpdate`],
-/// [`OpKind::DynamicUpdateSlice`]'s runtime-index `ComputeMeta` form): always 256 (the portable Vulkan
-/// max). Both kernels bake `WORKGROUP_SIZE = 256` (`pootc/tests/kernels/scatter_update.rs` /
-/// `dyn_update_slice.rs`) to compute their own `x_groups`, so the dispatch must not use the generic
-/// 64-or-256 wg-bump.
+/// Workgroup width of a one-thread-per-element kernel folded onto a 2-D grid: always 256 (the portable
+/// Vulkan max). A folded body derives its global index from this width, so the dispatch must not use the
+/// generic 64-or-256 wg-bump.
 pub const ELEMENTWISE_2D_WIDTH: usize = 256;
-
-/// The 2-D workgroup grid `(x_groups, y_groups)` for a one-thread-per-element kernel at
-/// [`ELEMENTWISE_2D_WIDTH`] lanes/workgroup over `out_numel` elements. Like [`gemv_grid`] but each
-/// workgroup covers `ELEMENTWISE_2D_WIDTH` elements. A batched shared-pool KV scatter/DUS write can exceed
-/// the `65535*256 = 16,776,960`-element 1-D ceiling (card 159: a 4-slot/1024-cap gemma4-dense local-layer
-/// pool write is 16,781,312). Used by `plan_eqn`, which always bakes `workgroup_size=[256,1,1]` for these
-/// ops and plans the matching `group_id = group_y*x_groups + group_x` grid.
-pub fn elementwise_2d_grid(out_numel: usize, caps: &DeviceCaps) -> (usize, usize) {
-    kg::fold_groups(
-        out_numel.div_ceil(ELEMENTWISE_2D_WIDTH).max(1),
-        caps.max_grid[0],
-    )
-}
 
 /// LDS tile edge for the wgpu prefill tiled GEMM (`tiled_gemm`). A workgroup of
 /// `GEMM_TILE*GEMM_TILE` lanes computes a `(2*GEMM_TILE) x GEMM_TILE` output tile (each lane computes 2
@@ -477,95 +488,84 @@ pub fn elementwise_2d_grid(out_numel: usize, caps: &DeviceCaps) -> (usize, usize
 /// planned grid.
 pub const GEMM_TILE: usize = 8;
 
-/// Workgroup width for [`kg::scatter_update_chunked_dt`] chunks; matches the imported
-/// `scatter_update.kir.json`'s baked `workgroup_size` ([64,1,1]) so a chunk's `groups` and dispatch agree.
+/// The workgroup width a scatter-update chunk is sized in: a generated body's default width, so a chunk's
+/// thread count and its dispatch agree.
 pub(crate) const SCATTER_UPDATE_WG: usize = 64;
 
 /// Plan a `ScatterUpdate` (card 059: `base[POOL,rest]`, `src[N,rest]`, `inv[POOL]` -> `out[POOL,rest]`).
-/// It is `O(POOL*rest)`: one thread per output element, since every pool row is passed through from `base`
-/// or overwritten from `src`. At or below `caps.watchdog_budget`'s `scatter_update_work` elements, or on
-/// a device with no watchdog budget, it is the single imported `Plan::Compute`. Otherwise it splits into
-/// `scatter_update_chunked_dt` dispatches over disjoint element ranges of the same output (card 159: a
-/// `pool_slots~=1025, Hkv=16, D=256` scatter is ~4.2M elements, over `poot-gpu`'s 4M `flush_work` cap
-/// alone; the batched gemma4-dense pool prefill's per-layer KV write reaches millions of elements twice
-/// per layer x 60 layers, so the box's own wgpu/RADV device keeps each chunk to 1M, a small fraction of
-/// that cap, so chunks batch with their neighbors).
+/// It is `O(POOL*rest)`: one thread per output unit, since every pool row is passed through from `base` or
+/// overwritten from `src`. At or below `caps.watchdog_budget`'s `scatter_update_work` units, or on a device
+/// with no watchdog budget, it is one dispatch. Otherwise it splits into dispatches over disjoint unit
+/// windows of the same output (card 159: a `pool_slots~=1025, Hkv=16, D=256` scatter is ~4.2M elements,
+/// over `poot-gpu`'s 4M `flush_work` cap alone; the batched gemma4-dense pool prefill's per-layer KV write
+/// reaches millions of elements twice per layer x 60 layers, so the box's own wgpu/RADV device keeps each
+/// chunk to 1M, a small fraction of that cap, so chunks batch with their neighbors).
 pub(crate) fn scatter_update_plan(
     site: Site<'_>,
     backend: Backend,
-    base_shape: &[usize],
-    out_numel: usize,
-    odt: DType,
+    storage: &kg::Storage,
+    out_shape: &[usize],
+    src_shape: Vec<usize>,
+    inverse_dtype: poot_kernel_ir::Ty,
     caps: &DeviceCaps,
 ) -> Result<Planned, PlanError> {
-    let rest = numel(&base_shape[1..]);
-    let use_imported = odt == DType::F32;
+    let units = storage.units(out_shape);
+    let spec = |window| {
+        kg::MovementSpec::new(
+            storage.clone(),
+            out_shape.to_vec(),
+            kg::MovementOp::ScatterRows {
+                src_shape: src_shape.clone(),
+                inverse_dtype: inverse_dtype.clone(),
+                window,
+            },
+        )
+    };
     let Some(chunk_work) = caps
         .watchdog_budget
         .map(|w| w.scatter_update_work as usize)
-        .filter(|&budget| out_numel > budget)
+        .filter(|&budget| units > budget)
     else {
-        // The imported F32 body always bakes the ELEMENTWISE_2D_WIDTH-wide fold (card 159 Inc 3); the
-        // kernelgen dt-generic fallback (non-F32) is the plain one-thread-per-output default.
-        if use_imported {
-            let (x, y) = elementwise_2d_grid(out_numel, caps);
-            return Ok(Planned::imported(
-                ImportedKernel::ScatterUpdate,
-                backend,
-                None,
-                [(x * ELEMENTWISE_2D_WIDTH) as u32, y as u32, 1],
-            ));
-        }
+        let fold_ceiling = caps.max_grid[0] as usize * ELEMENTWISE_2D_WIDTH;
         return Planned::generated(
             site,
-            KernelRequest::Movement(MovementSpec::ScatterUpdate {
-                dt: fty_ty(odt),
-                rest,
-                numel: out_numel,
-            }),
+            KernelRequest::Movement(spec(None).folded(units > fold_ceiling)),
             backend,
             caps,
         );
     };
-    // Large pool on wgpu: the imported kernel has no elem_offset param, so chunks use kernelgen.
-    let chunk_elems = (chunk_work / SCATTER_UPDATE_WG).max(1) * SCATTER_UPDATE_WG;
-    let n_chunks = out_numel.div_ceil(chunk_elems);
-    let chunks = (0..n_chunks)
-        .map(|ci| {
-            let offset = ci * chunk_elems;
-            let elems = (out_numel - offset).min(chunk_elems);
-            Planned::generated_chunk(
+    let chunk_units = (chunk_work / SCATTER_UPDATE_WG).max(1) * SCATTER_UPDATE_WG;
+    let chunks = (0..units.div_ceil(chunk_units))
+        .map(|chunk| {
+            let offset = chunk * chunk_units;
+            let remaining = (units - offset).min(chunk_units);
+            Planned::generated_dispatch(
                 site,
-                KernelRequest::Movement(MovementSpec::ScatterUpdateChunk {
-                    dt: fty_ty(odt),
-                    rest,
+                KernelRequest::Movement(spec(Some(kg::UnitWindow {
                     offset,
-                    groups: elems.div_ceil(SCATTER_UPDATE_WG),
-                    width: SCATTER_UPDATE_WG,
-                }),
+                    threads: remaining.div_ceil(SCATTER_UPDATE_WG) * SCATTER_UPDATE_WG,
+                }))),
                 backend,
                 caps,
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Planned::chunked(chunks))
+    Planned::split(chunks)
 }
 
-// FLASH_LDS_CAP / FLASH_PREFILL_LDS_CAP: both size the imported flash-decode/flash-prefill kernels' LDS
-// output scratch `o[D]` (spec 055). One owner, `poot_target` (card 522); the attention kernel choice
-// (`planner/attention.rs`, Card 557) imports both directly.
-
-/// Lane width (workgroup size) for the LDS-cooperative synthesized flash decode (card 143,
-/// `kernelgen::flash_region_decode`). Used by `plan_eqn` for both the `[w,1,1]` workgroup and the planned
-/// `B*Hq*w`-thread grid (`B*Hq` workgroups).
-///
-/// Each lane stages a partial online-softmax triple `(m, l, o[D])` in LDS: `w*(D+2)` f32. wgpu's default
-/// workgroup-storage limit is 16352 bytes (4088 f32, `downlevel_defaults()`, see `Context::new`); the
-/// budget is 2048 f32, half of that, and width is capped at 64 lanes (more lanes only lengthen the serial
-/// LDS fold in the epilogue). Head dims 64 and 128 give w=30 and w=15; D<=6 clamps to 64.
-pub fn flash_decode_width(d: usize) -> usize {
-    const LDS_BUDGET_F32: usize = 2048;
-    (LDS_BUDGET_F32 / (d + 2)).clamp(1, 64)
+/// The lane count of the streaming attention schedule: the widest power of two, at most 64, whose
+/// partials fit the device. Each lane stages one online-softmax triple `(m, l, o[dv])` in workgroup memory,
+/// so `lanes` lanes need `4 * (lanes * dv + 2 * lanes)` bytes of `caps.lds_bytes`, and `lanes` may not
+/// exceed the workgroup limits. More than 64 lanes only lengthen the serial per-lane combine. `None` when
+/// not even one lane fits.
+pub(crate) fn attention_lanes(dv: usize, caps: &DeviceCaps) -> Option<usize> {
+    const MAX_LANES: usize = 64;
+    let lanes_limit = (caps.max_workgroup_size[0] as usize)
+        .min(caps.max_workgroup_invocations as usize)
+        .min(MAX_LANES);
+    let lds_bytes = caps.lds_bytes as usize;
+    std::iter::successors(Some(MAX_LANES), |lanes| (*lanes > 1).then_some(lanes / 2))
+        .find(|&lanes| lanes <= lanes_limit && 4 * (lanes * dv + 2 * lanes) <= lds_bytes)
 }
 
 /// Is this `MatMul` a candidate for the generated tiled GEMM (`kg::tiled_region`, card 099b), the
@@ -575,22 +575,29 @@ pub fn flash_decode_width(d: usize) -> usize {
 /// operands because the generated body is f32-only (its LDS tiles and buffer reads are all `Ty::F32`; an
 /// F16 matmul takes the dtype-generic serial kernel). The dispatch-cap chunking is the choice's own.
 pub(crate) fn is_tileable_matmul_in(g: GraphTables<'_>, eqn: &Eqn) -> bool {
-    if !matches!(eqn.op, OpKind::MatMul) {
-        return false;
-    }
+    // A `ContractionEpilogue` over a `MatMul` head is judged by its head operands (its extra inputs are the
+    // epilogue's leaves); its output is the head's.
+    let head_operands = match &eqn.op {
+        OpKind::MatMul => 2,
+        OpKind::ContractionEpilogue {
+            head: ContractionHead::MatMul,
+            ..
+        } => ContractionHead::MatMul.operands(),
+        _ => return false,
+    };
     let out = &g.aval(eqn.out).shape;
     let r = out.len();
     if r < 2 || out[r - 2] <= 1 {
         return false;
     }
-    let ids = value_ids(eqn);
+    let ids = &value_ids(eqn)[..head_operands];
     ids.len() == 2
         && ids.iter().all(|&id| g.aval(id).dtype == DType::F32)
         && g.aval(ids[1]).shape.len() == 2
 }
 
 /// Does this MatMul take the wgpu prefill tiled-GEMM path (`tiled_gemm`)? Like `is_decode_gemv_in` for M>1:
-/// a `MatMul`/`MatMulBias` whose weight (`inputs[1]`) is rank-2 `[K,N]`. The launch is
+/// a `MatMul` whose weight (`inputs[1]`) is rank-2 `[K,N]`. The launch is
 /// `ceil(M/ts)*ceil(N/ts)` workgroups (chunked on a device with a confirmed ceiling,
 /// `caps.known_miscompiles.tiled_gemm_max_workgroups`, card 095).
 ///
@@ -603,13 +610,13 @@ pub(crate) fn is_tiled_gemm_in(
     out_shape: &[usize],
     out_numel: usize,
 ) -> bool {
-    // The imported tiled GEMM bodies (MatMul/MatMulBias) are f32-only and fail where the codegen
+    // The imported tiled GEMM body is f32-only and fail where the codegen
     // capability query says imported LDS-array bodies do not compile (R468-015: their Rust-compiled LDS
     // arrays have a zeroinitializer in addrspace(3), which AMDGPU LLVM rejects); there the generated
     // tiled GEMM (`is_tileable_matmul_in`, WorkgroupLocalDecl with undef init) is the tiled path. BF16
     // matmul takes the tc-arm on NVPTX and matmul_batched_dt on AmdGcn.
     if g.aval(eqn.out).dtype != DType::F32
-        || !matches!(eqn.op, OpKind::MatMul | OpKind::MatMulBias)
+        || !matches!(eqn.op, OpKind::MatMul)
         || !codegen_capability(backend).imported_lds_array_bodies
     {
         return false;
@@ -636,8 +643,7 @@ pub(crate) fn is_tiled_gemm_in(
     ids.len() >= 2 && g.aval(ids[1]).shape.len() == 2
 }
 
-/// Card 096: plan for a shared (`b_count=1`) wgpu tiled GEMM, M=`mrows` K=`kk` N=`nn`, with optional fused
-/// `bias`. One dispatch below `caps.known_miscompiles`' `tiled_gemm_max_workgroups` (card 095's RADV
+/// Card 096: plan for a shared (`b_count=1`) wgpu tiled GEMM, M=`mrows` K=`kk` N=`nn`. One dispatch below `caps.known_miscompiles`' `tiled_gemm_max_workgroups` (card 095's RADV
 /// miscompile ceiling; `None` on a device with no confirmed one); otherwise `ceil(groups / (cap-1))`
 /// dispatches over disjoint tile ranges (order is free), each with a per-chunk tile offset in the
 /// metadata buffer.
@@ -646,31 +652,26 @@ pub(crate) fn tiled_gemm_plan(
     mrows: usize,
     kk: usize,
     nn: usize,
-    bias: bool,
     caps: &DeviceCaps,
-) -> Planned {
+) -> Result<Planned, PlanError> {
     let ts = GEMM_TILE;
     let groups = mrows.div_ceil(2 * ts) * nn.div_ceil(ts);
-    // Card 044: the imported coarsened tiled GEMM, f32. Same grid and `[a, b, (bias,) out]` buffers as
+    // Card 044: the imported coarsened tiled GEMM, f32. Same grid and `[a, b, out]` buffers as
     // kernelgen's `tiled_gemm_dt`; dims ride in a `[M,K,N,offset]` metadata buffer, and one
     // shape-generic body covers every chunk.
-    let kernel = if bias {
-        ImportedKernel::TiledGemmBias
-    } else {
-        ImportedKernel::TiledGemm
-    };
+    let kernel = ImportedKernel::TiledGemm;
     let over_cap = caps
         .known_miscompiles
         .tiled_gemm_max_workgroups
         .is_some_and(|max| groups >= max as usize);
     if !over_cap {
-        return Planned::imported(
+        return Ok(Planned::imported(
             kernel,
             backend,
             Some(vec![mrows as u32, kk as u32, nn as u32, 0]),
             // GEMM_TILE^2 lanes per (2*GEMM_TILE) x GEMM_TILE output tile (see `is_tiled_gemm_in`'s doc).
             [(groups * ts * ts) as u32, 1, 1],
-        );
+        ));
     }
     // Card 096: the tile offset rides in the metadata buffer of each sub-cap dispatch.
     // `over_cap` is only true when a cap exists, so this is always `Some`.
@@ -679,7 +680,7 @@ pub(crate) fn tiled_gemm_plan(
     let chunks = (0..n_chunks)
         .map(|i| {
             let offset = i * chunk;
-            Planned::imported_chunk(
+            Planned::imported_split_dispatch(
                 kernel,
                 backend,
                 vec![mrows as u32, kk as u32, nn as u32, offset as u32],
@@ -687,7 +688,7 @@ pub(crate) fn tiled_gemm_plan(
             )
         })
         .collect();
-    Planned::chunked(chunks)
+    Planned::split(chunks)
 }
 
 pub(crate) fn is_batched_tiled_gemm_in(
@@ -782,21 +783,68 @@ pub(crate) fn is_decode_attn_gemv_in(
     gemv_grid(out_numel, caps).1 <= caps.max_grid[1] as usize
 }
 
-/// Does this `IndexedMatMul` take the wgpu indexed LDS-GEMV path ([`kernelgen::indexed_gemv_lds`])? The
-/// gather-free sparse-MoE decode GEMV: SpirvVulkan, f32, with `out_numel = M*N <= caps.max_grid[0]` (one
-/// workgroup per output element, within the target's own `gridDim.x` cap - never the
-/// wgpu-specific `65535` literal). Otherwise the naive one-thread-per-output `indexed_matmul_dt`.
-pub(crate) fn is_indexed_gemv_in(
+/// The most activation rows an `IndexedMatMul` runs as the Gemv (`M` rows are the `k` selected experts of a
+/// decode step, or a few such steps batched): above it the segmented Tiled schedule shares each expert's weight
+/// tile across the rows that selected it.
+pub(crate) const INDEXED_GEMV_MAX_ROWS: usize = 32;
+
+/// The [`kg::Schedule::Gemv`] an `IndexedMatMul` of `m` rows and `n` columns runs on every backend, or `None` when
+/// it is not a decode shape or its launch would not fit the device's X grid. The launch policy is the dense
+/// Gemv's ([`dense_gemv_launch`]) over the `m * n` outputs.
+pub(crate) fn indexed_gemv_in(m: usize, n: usize, caps: &DeviceCaps) -> Option<kg::Schedule> {
+    if m == 0 || n == 0 || m > INDEXED_GEMV_MAX_ROWS {
+        return None;
+    }
+    let launch = dense_gemv_launch(m * n, caps.compute_units);
+    ((m * n).div_ceil(launch.cols as usize) <= caps.max_grid[0] as usize).then_some(
+        kg::Schedule::Gemv {
+            width: launch.width,
+            cols: launch.cols,
+            unroll: launch.unroll,
+        },
+    )
+}
+
+/// Whether an `IndexedMatMul` (or a `ContractionEpilogue` over one) has a generated lowering by dtype: f32
+/// activation and output, an f32 id operand (the kernel reads ids as f32; the oracle also reads I32 words), and a
+/// stacked weight that is f32 or BF16. A BF16 weight additionally has to be a const, or a promoted view of one,
+/// which only the planner can tell ([`view_source`] over the views table); `plan_indexed` refuses any other BF16
+/// weight, so no BF16 buffer is read as packed lanes without having been uploaded as them.
+pub(crate) fn indexed_matmul_lowers(g: GraphTables<'_>, eqn: &Eqn) -> bool {
+    let ids = value_ids(eqn);
+    g.aval(eqn.out).dtype == DType::F32
+        && ids.len() >= 3
+        && g.aval(ids[0]).dtype == DType::F32
+        && matches!(g.aval(ids[1]).dtype, DType::F32 | DType::BF16)
+        && g.aval(ids[2]).dtype == DType::F32
+}
+
+/// The value a promoted view `value` reads in place ([`compute_views`]'s table): the input of the movement op
+/// that produced it, followed through every view in the chain; `value` itself when it is no view. The one answer to
+/// "what buffer does this view read", shared by the planner and the storage plan.
+pub(crate) fn view_source(
     g: GraphTables<'_>,
-    backend: Backend,
-    eqn: &Eqn,
-    out_numel: usize,
-    caps: &DeviceCaps,
-) -> bool {
-    backend == Backend::SpirvVulkan
-        && matches!(eqn.op, OpKind::IndexedMatMul)
-        && out_numel <= caps.max_grid[0] as usize
-        && g.aval(eqn.out).dtype == DType::F32
+    views: &HashMap<ValueId, Layout>,
+    mut value: ValueId,
+) -> ValueId {
+    while views.contains_key(&value) {
+        let producer = g.eqns.iter().find(|eqn| eqn.out == value);
+        match producer.and_then(|eqn| value_ids(eqn).first().copied()) {
+            Some(input) => value = input,
+            None => break,
+        }
+    }
+    value
+}
+
+/// The threads a data-movement equation launches: one per buffer unit of its output, which is a packed
+/// E4M3FN word rather than a logical element.
+fn movement_units(g: GraphTables<'_>, eqn: &Eqn, out_shape: &[usize], out_numel: usize) -> usize {
+    if g.aval(eqn.out).dtype == DType::E4M3FN {
+        kg::Storage::BYTE_LANES.units(out_shape)
+    } else {
+        out_numel
+    }
 }
 
 pub(crate) fn is_elementwise_2d_in(
@@ -807,27 +855,28 @@ pub(crate) fn is_elementwise_2d_in(
     out_numel: usize,
     caps: &DeviceCaps,
 ) -> bool {
-    // ScatterUpdate/DynamicUpdateSlice/Transpose/Slice/Broadcast/Concat use F32-only imported kernels
-    // (`ImportedKernel::IndexRemap`, `ImportedKernel::Concat2`, scatter/DUS bodies). Binary/Unary/MatMul build
-    // dtype-parameterized kernelgen bodies (`plan_eqn` picks the dtype from the output), so a BF16/F16 op
-    // past the `caps.max_grid[0] * ELEMENTWISE_2D_WIDTH` ceiling needs the fold too or it hits the same
-    // `GridCap` crash. The ceiling is the target's own cap, never the wgpu-specific
-    // `65535` literal: a fixture with a smaller `max_grid` must fold sooner.
-    let f32_only = g.aval(eqn.out).dtype != DType::F32;
+    // Every generated one-thread-per-unit body past `caps.max_grid[0] * ELEMENTWISE_2D_WIDTH` needs the fold,
+    // or it hits the `GridCap` crash a flat launch cannot clear however large its workgroup is. The ceiling
+    // is the target's own cap, never the wgpu-specific `65535` literal: a fixture with a smaller `max_grid`
+    // must fold sooner.
     let fold_ceiling = caps.max_grid[0] as usize * ELEMENTWISE_2D_WIDTH;
     match &eqn.op {
-        OpKind::ScatterUpdate => !f32_only,
-        OpKind::DynamicUpdateSlice { .. } => {
-            !f32_only && matches!(eqn.inputs[2], Operand::Value(_))
-        }
-        // Materializing path only (a promoted `Plan::View` never launches), above the wg-bump ceiling.
-        OpKind::Transpose { .. } | OpKind::Slice { .. } | OpKind::Broadcast { .. } => {
-            !f32_only && out_numel > fold_ceiling
-        }
+        // Data movement: one thread per output buffer unit (a packed E4M3FN word, else an element). The
+        // materializing path only (a promoted `Plan::View` never launches).
+        OpKind::ScatterUpdate
+        | OpKind::DynamicUpdateSlice { .. }
+        | OpKind::Transpose { .. }
+        | OpKind::Slice { .. }
+        | OpKind::Broadcast { .. }
+        | OpKind::Concat { .. }
+        | OpKind::Gather { .. }
+        | OpKind::Scatter { .. } => movement_units(g, eqn, out_shape, out_numel) > fold_ceiling,
         // Binary (broadcast-value and scalar/literal forms), any dtype.
         OpKind::Binary(_) | OpKind::Select => out_numel > fold_ceiling,
         // Unary (e.g. `Exp` over the full attention-score tensor), any dtype.
         OpKind::Unary(_) => out_numel > fold_ceiling,
+        // A float pointwise region (the exact-I32 regions launch their own packed grid).
+        OpKind::Fused(_) => g.aval(eqn.out).dtype != DType::I32 && out_numel > fold_ceiling,
         // An F32 or (Card 1007) packed-F16 contraction over a checkpoint-order weight: the one-thread-per-output
         // fallback when neither the GEMV nor the tiled GEMM is taken. The tiled GEMM is a `custom_grid` that
         // `finalize` already skips.
@@ -838,7 +887,7 @@ pub(crate) fn is_elementwise_2d_in(
                 && dense_decode_gemv_in(eqn, out_shape, out_numel, caps).is_none()
         }
         // Naive fallback only, when every specialized MatMul plan declines (mirrors `plan_eqn`'s routing).
-        OpKind::MatMul | OpKind::MatMulBias => {
+        OpKind::MatMul => {
             out_numel > fold_ceiling
                 && !is_decode_gemv_in(g, backend, eqn, out_shape, out_numel, caps)
                 && !is_tiled_gemm_in(g, backend, eqn, out_shape, out_numel)
@@ -846,11 +895,11 @@ pub(crate) fn is_elementwise_2d_in(
                 && !is_decode_attn_gemv_in(g, eqn, out_shape, out_numel, caps)
                 && !matmul_takes_tensorcore(g, backend, eqn, out_shape)
         }
-        // Concat's 2-input imported path only (`ImportedKernel::Concat2`; the N-input fallback is kernelgen).
-        // Measured: gemma4-dense batched decode's shared-pool KV gather (`gather_shared_pool`) folds rows via
-        // `concat(acc, row)`; at n_slots=4/cap=1024 a local-layer fold is `4*16*1024*256 = 16,777,216`
-        // elements (`GridCap([65536,1,1])`, card 159).
-        OpKind::Concat { .. } => !f32_only && eqn.inputs.len() == 2 && out_numel > fold_ceiling,
+        // The epilogue's one-thread-per-output body: a `MatMul` head's only lowering. A dense head's is the Gemv or
+        // the tiled GEMM (a custom grid, never folded).
+        OpKind::ContractionEpilogue { head, .. } => {
+            out_numel > fold_ceiling && matches!(head, ContractionHead::MatMul)
+        }
         _ => false,
     }
 }
@@ -878,8 +927,7 @@ pub(crate) fn packed_contraction_m_per_block(
 
 /// Does this `MatMul` eqn take a WMMA/tensor-core plan (AMD RDNA3 or NVPTX)? Factored out of
 /// [`is_elementwise_2d`] (card 181) so it can exclude the tensor-core path without duplicating
-/// `plan_eqn`'s gate (`amd_tc`/`tc`). `MatMulBias` never takes tensor cores (no WMMA bias epilogue), so
-/// only `MatMul`'s bf16-operand and 16-aligned-dims gates are checked.
+/// `plan_eqn`'s gate (`amd_tc`/`tc`): `MatMul`'s bf16-operand and 16-aligned-dims gates.
 fn matmul_takes_tensorcore(
     g: GraphTables<'_>,
     backend: Backend,
@@ -914,26 +962,6 @@ fn matmul_takes_tensorcore(
                 && out_shape[..r - 2].iter().product::<usize>() == 1
         }
         _ => false,
-    }
-}
-
-/// The launch grid (threads) of an imported one-thread-per-output-element kernel, folded onto the
-/// [`ELEMENTWISE_2D_WIDTH`] 2-D grid when [`is_elementwise_2d_in`] says this eqn's kernel bakes that
-/// fold (card 159; past the wgpu 65535-workgroup cap, or an imported kernel that always bakes it). A
-/// generated kernel gets the same grid from `generate`, through [`elementwise_fold`].
-pub(crate) fn default_grid_in(
-    g: GraphTables<'_>,
-    backend: Backend,
-    eqn: &Eqn,
-    out_shape: &[usize],
-    out_numel: usize,
-    caps: &DeviceCaps,
-) -> [u32; 3] {
-    if is_elementwise_2d_in(g, backend, eqn, out_shape, out_numel, caps) {
-        let (x, y) = elementwise_2d_grid(out_numel, caps);
-        [(x * ELEMENTWISE_2D_WIDTH) as u32, y as u32, 1]
-    } else {
-        [out_numel as u32, 1, 1]
     }
 }
 

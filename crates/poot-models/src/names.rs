@@ -4,8 +4,8 @@
 //! the `model.layers.{l}` layout shares; a family adds its own rows beside them.
 
 use poot_quant::weights::{
-    AttnRole, FfnRole, NormRole, WeightId, WeightKey, WeightMap, WeightMapError, WeightRole,
-    WeightStore, WeightView,
+    AttnRole, ExpertProj, FfnRole, MoeRole, NormRole, WeightEntry, WeightId, WeightKey, WeightMap,
+    WeightMapBuilder, WeightMapError, WeightRole, WeightStore, WeightView,
 };
 
 use crate::model::{FamilyKey, ModelError};
@@ -299,6 +299,36 @@ pub(crate) const HF_QK_NORM: &[NameRow] = &[
     ),
 ];
 
+/// gpt-oss's HF rows beside [`HF_BASE`]: attention with a bias on every projection (so the Q/K/V
+/// biases are required, not optional) and the per-head attention sink logits.
+pub(crate) const HF_SINK_ATTENTION: &[NameRow] = &[
+    layer_tensor(
+        WeightRole::Attn(AttnRole::QBias),
+        ".self_attn.q_proj.bias",
+        Presence::Required,
+    ),
+    layer_tensor(
+        WeightRole::Attn(AttnRole::KBias),
+        ".self_attn.k_proj.bias",
+        Presence::Required,
+    ),
+    layer_tensor(
+        WeightRole::Attn(AttnRole::VBias),
+        ".self_attn.v_proj.bias",
+        Presence::Required,
+    ),
+    layer_tensor(
+        WeightRole::Attn(AttnRole::OBias),
+        ".self_attn.o_proj.bias",
+        Presence::Required,
+    ),
+    layer_tensor(
+        WeightRole::Attn(AttnRole::Sinks),
+        ".self_attn.sinks",
+        Presence::Required,
+    ),
+];
+
 /// The `[out, in]` (or `[n]`) shape of every [`HF_BASE`] tensor a checkpoint with `config`'s HF dims
 /// carries (the QKV biases when `qkv_bias`), by its HF name: what a family's test fixture holds.
 pub(crate) fn hf_base_shapes(
@@ -370,8 +400,32 @@ pub(crate) fn family_weights_fused(
     head_required: bool,
     fused: FusedDims,
 ) -> Result<WeightMap, ModelError> {
-    let weights = build_map(store, tables, layers, fused)
+    let weights = build_map(store, tables, layers, fused, None)
         .map_err(|source| ModelError::Weight { family, source })?;
+    check_head(family, weights, head_required)
+}
+
+/// [`family_weights`] for a model whose layers `moe.sparse` marks routed: a routed layer maps the
+/// router and expert weights `moe.names` describes and no dense feed-forward, a dense layer the
+/// opposite.
+pub(crate) fn family_weights_routed(
+    family: FamilyKey,
+    store: &WeightStore,
+    tables: &[&[NameRow]],
+    layers: usize,
+    head_required: bool,
+    moe: MoeLayers<'_>,
+) -> Result<WeightMap, ModelError> {
+    let weights = build_map(store, tables, layers, FusedDims::NONE, Some(moe))
+        .map_err(|source| ModelError::Weight { family, source })?;
+    check_head(family, weights, head_required)
+}
+
+fn check_head(
+    family: FamilyKey,
+    weights: WeightMap,
+    head_required: bool,
+) -> Result<WeightMap, ModelError> {
     let head = WeightId::model(WeightRole::Head);
     if head_required && weights.view(head) == weights.view(WeightId::model(WeightRole::Embed)) {
         return Err(ModelError::Weight {
@@ -396,7 +450,191 @@ pub(crate) fn build_weight_map(
     tables: &[&[NameRow]],
     layers: usize,
 ) -> Result<WeightMap, WeightMapError> {
-    build_map(store, tables, layers, FusedDims::NONE)
+    build_map(store, tables, layers, FusedDims::NONE, None)
+}
+
+/// Where the routed layers of a model keep their weights.
+#[derive(Clone, Copy)]
+pub(crate) struct MoeLayers<'a> {
+    pub names: &'a MoeNames,
+    /// Per layer: routed (router and experts) or dense (the plain gated feed-forward).
+    pub sparse: &'a [bool],
+    pub experts: usize,
+}
+
+/// A routed layer's checkpoint names, each relative to `prefix` and the layer index.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MoeNames {
+    pub prefix: &'static str,
+    /// The router's linear stem (`.mlp.gate`).
+    pub router: &'static str,
+    /// The router's bias tensor, when the family has one.
+    pub router_bias: Option<&'static str>,
+    /// The always-active shared expert's three linear stems, when the family has one.
+    pub shared: Option<SharedNames>,
+    pub experts: &'static [ExpertNames],
+}
+
+/// A shared expert's gate, up and down linear stems, relative to `prefix` and the layer index.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SharedNames {
+    pub gate: &'static str,
+    pub up: &'static str,
+    pub down: &'static str,
+}
+
+/// One expert projection's checkpoint names.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ExpertNames {
+    pub proj: ExpertProj,
+    /// One tensor holding every expert (`.ffn_gate_exps.weight`), or the per-expert owners a
+    /// packed reader makes of it (`{stack}.{e}`).
+    pub stack: Option<&'static str>,
+    /// One tensor per expert, named `{before}{e}{after}` (`.mlp.experts.` and `.gate_proj.weight`).
+    pub each: Option<(&'static str, &'static str)>,
+    /// The bias stack `[experts, out]`, when the family has one.
+    pub bias: Option<&'static str>,
+}
+
+/// Where one expert projection of one layer was found in the store.
+enum ExpertKeys {
+    Stack(WeightKey),
+    PerExpert(Vec<WeightKey>),
+}
+
+impl ExpertNames {
+    /// The store keys holding this projection of `layer`: the stored stack, the per-expert owners of
+    /// a packed stack, or one tensor per expert (`.weight`-suffixed or a packed linear id). When
+    /// none is complete, the key to report as missing: the stack, or the first absent expert.
+    fn find(
+        &self,
+        store: &WeightStore,
+        prefix: &str,
+        layer: usize,
+        experts: usize,
+    ) -> Result<ExpertKeys, WeightKey> {
+        let per_expert = |key: &dyn Fn(usize) -> String| -> Result<ExpertKeys, WeightKey> {
+            (0..experts)
+                .map(|e| {
+                    let key = key(e);
+                    if store.contains(&key) {
+                        Ok(WeightKey::from(key))
+                    } else {
+                        Err(WeightKey::from(key))
+                    }
+                })
+                .collect::<Result<_, _>>()
+                .map(ExpertKeys::PerExpert)
+        };
+        let mut absent = None;
+        if let Some(stack) = self.stack {
+            let key = format!("{prefix}{layer}{stack}");
+            if store.contains(&key) {
+                return Ok(ExpertKeys::Stack(WeightKey::from(key)));
+            }
+            if store.contains(&format!("{key}.0")) {
+                return per_expert(&|e| format!("{key}.{e}"));
+            }
+            absent = Some(WeightKey::from(key));
+        }
+        if let Some((before, after)) = self.each {
+            let bare = after.strip_suffix(".weight").unwrap_or(after);
+            let named =
+                |after: &'static str| move |e: usize| format!("{prefix}{layer}{before}{e}{after}");
+            // The `.weight` spelling, or the packed linear id: whichever holds expert 0.
+            let form = [after, bare]
+                .into_iter()
+                .find(|&after| store.contains(&named(after)(0)))
+                .unwrap_or(after);
+            if store.contains(&named(form)(0)) {
+                return per_expert(&named(form));
+            }
+            absent.get_or_insert_with(|| WeightKey::from(named(after)(0)));
+        }
+        Err(absent.unwrap_or_else(|| WeightKey::from(format!("{prefix}{layer}"))))
+    }
+}
+
+fn map_moe_layer(
+    map: &mut WeightMapBuilder<'_>,
+    store: &WeightStore,
+    names: &MoeNames,
+    layer: usize,
+    experts: usize,
+) -> Result<(), WeightMapError> {
+    let id = |role| WeightId::layer(layer, WeightRole::Moe(role));
+    let prefix = names.prefix;
+    let linear = |stem: &str| {
+        let key = format!("{prefix}{layer}{stem}.weight");
+        if store.contains(&key) {
+            return key;
+        }
+        let bare = format!("{prefix}{layer}{stem}");
+        if store.contains(&bare) { bare } else { key }
+    };
+    let required = |role, key: String| -> Result<WeightView, WeightMapError> {
+        if store.contains(&key) {
+            Ok(WeightView::Stored(WeightKey::from(key)))
+        } else {
+            Err(WeightMapError::Missing {
+                id: id(role),
+                key: WeightKey::from(key),
+            })
+        }
+    };
+    map.map(
+        id(MoeRole::Router),
+        required(MoeRole::Router, linear(names.router))?,
+    )?;
+    if let Some(bias) = names.router_bias {
+        map.map(
+            id(MoeRole::RouterBias),
+            required(MoeRole::RouterBias, format!("{prefix}{layer}{bias}"))?,
+        )?;
+    }
+    if let Some(shared) = names.shared {
+        for (proj, stem) in [
+            (ExpertProj::Gate, shared.gate),
+            (ExpertProj::Up, shared.up),
+            (ExpertProj::Down, shared.down),
+        ] {
+            let role = MoeRole::Shared(proj);
+            map.map(id(role), required(role, linear(stem))?)?;
+        }
+    }
+    for expert in names.experts {
+        let stack = id(MoeRole::Stack(expert.proj));
+        let found = expert
+            .find(store, prefix, layer, experts)
+            .map_err(|key| WeightMapError::Missing { id: stack, key })?;
+        match found {
+            ExpertKeys::Stack(key) => {
+                map.map(stack, WeightView::Stored(key))?;
+            }
+            ExpertKeys::PerExpert(keys) => {
+                // Dense per-expert tensors stack into one `[experts, ..]` weight; packed ones
+                // are one `[out, K]` matrix each and stay one weight per expert.
+                let packed = store
+                    .get(keys[0].as_str())
+                    .is_some_and(|entry| matches!(entry, WeightEntry::Packed(_)));
+                if packed {
+                    for (e, key) in keys.into_iter().enumerate() {
+                        map.map(
+                            id(MoeRole::Expert(expert.proj, e as u32)),
+                            WeightView::Stored(key),
+                        )?;
+                    }
+                } else {
+                    map.map(stack, WeightView::ExpertStack(keys))?;
+                }
+            }
+        }
+        if let Some(bias) = expert.bias {
+            let role = MoeRole::StackBias(expert.proj);
+            map.map(id(role), required(role, format!("{prefix}{layer}{bias}"))?)?;
+        }
+    }
+    Ok(())
 }
 
 fn build_map(
@@ -404,12 +642,18 @@ fn build_map(
     tables: &[&[NameRow]],
     layers: usize,
     fused: FusedDims,
+    moe: Option<MoeLayers<'_>>,
 ) -> Result<WeightMap, WeightMapError> {
     let rows = &merged(tables);
     let mut map = WeightMap::builder(store);
+    let is_sparse =
+        |layer: usize| moe.is_some_and(|m| m.sparse.get(layer).copied().unwrap_or(false));
     for row in rows {
         let ids: Vec<WeightId> = if row.is_per_layer() {
-            (0..layers).map(|l| WeightId::layer(l, row.role)).collect()
+            (0..layers)
+                .filter(|&l| !(is_sparse(l) && matches!(row.role, WeightRole::Ffn(_))))
+                .map(|l| WeightId::layer(l, row.role))
+                .collect()
         } else {
             vec![WeightId::model(row.role)]
         };
@@ -442,6 +686,11 @@ fn build_map(
                 _ => WeightView::Stored(key),
             };
             map.map(id, view)?;
+        }
+    }
+    if let Some(moe) = moe {
+        for layer in (0..layers).filter(|&l| is_sparse(l)) {
+            map_moe_layer(&mut map, store, moe.names, layer, moe.experts)?;
         }
     }
     Ok(map.build())
@@ -612,7 +861,7 @@ mod tests {
             inter: 12,
         };
         let tables: &[&[NameRow]] = &[HF_BASE, HF_FUSED_QKV_GATE_UP];
-        let map = build_map(&fused_store(None), tables, 1, dims).unwrap();
+        let map = build_map(&fused_store(None), tables, 1, dims, None).unwrap();
         let view = |role| map.view(WeightId::layer(0, role)).cloned();
         let qkv = || WeightKey::from("model.layers.0.self_attn.qkv_proj.weight");
         for (role, rows) in [
@@ -648,7 +897,8 @@ mod tests {
                 &fused_store(Some("model.layers.0.self_attn.qkv_proj.weight")),
                 tables,
                 1,
-                dims
+                dims,
+                None
             ),
             Err(WeightMapError::Missing {
                 id: WeightId::layer(0, WeightRole::Attn(AttnRole::Q)),

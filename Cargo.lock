@@ -1787,15 +1787,10 @@ name = "poot-bench-runner"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "poot-executor",
- "poot-gpu",
  "poot-graph-plan",
  "poot-llm",
  "poot-models",
- "poot-profile",
- "poot-ptx-gpu",
  "poot-quant",
- "poot-rocm-gpu",
  "serde_json",
 ]
 
@@ -1857,6 +1852,8 @@ dependencies = [
  "poot-graph-plan",
  "poot-models",
  "poot-quant",
+ "poot-runtime-common",
+ "poot-target",
  "poot-tensor",
  "poot-test-util",
  "serde_json",

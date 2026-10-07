@@ -442,16 +442,14 @@ pub fn pack_quantized_linears(
                 }
                 // A g_idx that is exactly `k / group_size` (no act-order) is the contiguous
                 // map; any other order is read per K through the group-index source.
-                let contiguous =
-                    g_idx
-                        .bytes()
-                        .as_slice()
-                        .chunks_exact(4)
-                        .enumerate()
-                        .all(|(k, word)| {
-                            i32::from_le_bytes(word.try_into().unwrap()) as usize
-                                == k / group_size.get()
-                        });
+                let contiguous = g_idx
+                    .bytes()
+                    .as_slice()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .enumerate()
+                    .all(|(k, word)| i32::from_le_bytes(*word) as usize == k / group_size);
                 let mut sources = vec![
                     (
                         SourceRole::Planar(OperandRole::Codes),

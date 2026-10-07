@@ -122,7 +122,8 @@ fn dense_tensor(value: Value) -> HostTensor {
 /// row 0 (or the last row) would pass an `index = [0, 1]`-only check.
 ///
 /// Required red mutation (row 1): read `table.bytes()[source_flat + 1]` instead of
-/// `table.bytes()[source_flat]` in `fp8::dense_row_gather_e4m3`. Not yet run.
+/// `table.bytes()[source_flat]` in `gather_host`'s `HostData::Bytes` arm (`ops/gather.rs`; the
+/// `DenseRowGather` decomposition is `Gather { axis: 0 }` then `Cast { to: F32 }`). Not yet run.
 #[test]
 fn dense_row_gather_e4m3_reads_owner_backed_rows() {
     let row0 = e4m3fn_to_f32(ROW0_BYTE);
@@ -168,8 +169,8 @@ fn dense_row_gather_e4m3_reads_owner_backed_rows() {
     }
 }
 
-/// Card 405 FR-003 (mutation table row 3). Required red mutation: delete the bounds check inside
-/// `fp8::dense_row_gather_e4m3` (the `find(...)` block) and feed the same out-of-range index; the gather would
+/// Card 405 FR-003 (mutation table row 3). Required red mutation: delete the `index_at` bounds check inside
+/// `ops::gather::gather` (the decomposition's `Gather`) and feed the same out-of-range index; the gather would
 /// read past `table.bytes()`, panicking or reading unrelated memory instead of naming the row. Not yet run.
 #[test]
 fn dense_row_gather_e4m3_still_checks_bounds() {
@@ -200,7 +201,7 @@ fn dense_row_gather_e4m3_still_checks_bounds() {
 /// Required red mutations, each run once and recorded (not asserted here, since they need production edits):
 /// (a) mutate only the `Mul` scale literal in `build_graph` (e.g. `0.5` -> `0.75`): only this test's composed
 ///     assertion may change; `dense_row_gather_e4m3_reads_owner_backed_rows` must not, since it has no scale.
-/// (b) mutate only the gather index (swap `ROW0_BYTE`/`ROW1_BYTE`, or the row the arm selects): both this
+/// (b) mutate only the gather index (swap `ROW0_BYTE`/`ROW1_BYTE`, or the row `Gather { axis: 0 }` selects): both this
 ///     test and `dense_row_gather_e4m3_reads_owner_backed_rows` must change, since both read through the gather.
 /// Not yet run.
 #[test]

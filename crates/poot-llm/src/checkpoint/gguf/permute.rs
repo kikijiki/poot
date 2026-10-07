@@ -97,26 +97,6 @@ pub(crate) fn transpose2d(rt: &HostTensor) -> HostTensor {
     )
 }
 
-/// Per-expert transpose of a stacked `[E, A, B]` row-major tensor to `[E, B, A]` (the last two
-/// axes), for MoE expert weights stored `[out, in]` per expert -> the `[in, out]` matmul layout.
-pub(crate) fn transpose_experts(rt: &HostTensor) -> HostTensor {
-    let (e, a, b) = (rt.shape()[0], rt.shape()[1], rt.shape()[2]);
-    gather(
-        rt,
-        vec![e, b, a],
-        (0..e).flat_map(move |x| {
-            (0..b).flat_map(move |j| (0..a).map(move |i| x * a * b + i * b + j))
-        }),
-    )
-}
-
-/// Take rows `[lo, hi)` of a row-major `[rows, cols]` tensor as a new `[hi-lo, cols]` tensor.
-/// Used to split fused qkv/gate_up projections (the slices are contiguous in row-major order).
-pub(crate) fn row_slice(rt: &HostTensor, lo: usize, hi: usize) -> HostTensor {
-    let cols = rt.shape()[1];
-    gather(rt, vec![hi - lo, cols], lo * cols..hi * cols)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,26 +150,6 @@ mod tests {
                 .collect();
             assert_eq!(t.view().bytes(), want, "{dtype}");
         }
-    }
-
-    #[test]
-    fn transpose_experts_transposes_each_expert_in_its_own_dtype() {
-        // [2, 2, 3]: two experts, each the `0..6` matrix offset by 6e.
-        let words: Vec<u16> = (0..12).collect();
-        let t = transpose_experts(&HostTensor::bf16(vec![2, 2, 3], words));
-        assert_eq!((t.dtype(), t.shape()), (DType::BF16, &[2, 3, 2][..]));
-        let want: Vec<u16> = (0..2u16)
-            .flat_map(|e| TRANSPOSED.iter().map(move |&v| 6 * e + v as u16))
-            .collect();
-        assert_eq!(t.as_half().unwrap(), want);
-    }
-
-    #[test]
-    fn row_slice_takes_contiguous_rows_in_the_source_dtype() {
-        let words: Vec<u16> = (0..12).collect();
-        let t = row_slice(&HostTensor::f16(vec![4, 3], words), 1, 3);
-        assert_eq!((t.dtype(), t.shape()), (DType::F16, &[2, 3][..]));
-        assert_eq!(t.as_half().unwrap(), (3..9).collect::<Vec<u16>>());
     }
 
     #[test]

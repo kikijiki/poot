@@ -73,8 +73,18 @@ ir_node! {
         /// emit.rs). `Rvalue::VectorLoad`/`Statement::VectorStore` read/write a scalar-element slice
         /// `lanes` elements at a time.
         Vec { elem: Box<Ty>, lanes: u32 },
+        /// A subgroup-collective matrix fragment (spec 025/154, cards 530/663): one opaque value spread across
+        /// the lanes of a [`FRAGMENT_COLLECTIVE_LANES`]-lane group, never a scalar. The declared type is the
+        /// fragment's whole identity (role, operand dtype, tile); the verifier checks every producer and
+        /// consumer against it, and codegen allocates the local from it.
+        Fragment(FragmentTy),
     }
 }
+
+/// The lane count of the collective scope a matrix fragment lives in: one 32-lane subgroup (an NVPTX warp, a
+/// gfx11 wave32, a Vulkan subgroup of size 32). Every `Wmma*` statement is executed by all of these lanes
+/// together or by none; the verifier proves it (`Body::verify`'s collective-participation check).
+pub const FRAGMENT_COLLECTIVE_LANES: u32 = 32;
 
 impl Ty {
     pub fn is_float(&self) -> bool {
@@ -253,9 +263,6 @@ ir_node! {
         Cast { to: Ty, operand: Operand },
         /// Bit reinterpret (`f32::from_bits`), no value conversion.
         Bitcast { to: Ty, operand: Operand },
-        /// Decode the low 8 bits of a `U32` byte carrier to f32 using `format` semantics. Packed-word lane
-        /// extraction happens outside this rvalue.
-        Fp8Decode { format: Fp8Format, operand: Operand },
         /// Encode an f32 to the low 8 bits of a `U32` byte carrier using `format` semantics. Packed-word
         /// lane insertion happens outside this rvalue. FP8 is never a scalar `Ty`.
         Fp8Encode { format: Fp8Format, operand: Operand },
@@ -298,10 +305,56 @@ ir_node! {
 
 ir_node! {
     /// Which input matrix a WMMA load fills (the `a` or `b` fragment), spec 025.
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
     pub enum WmmaMat {
         A,
         B,
+    }
+}
+
+ir_node! {
+    /// What a fragment holds: an `A` or `B` operand matrix, or the f32 accumulator (`D = A * B + C`; its
+    /// elements are always f32, whatever the operand dtype).
+    #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+    pub enum FragmentRole {
+        Matrix(WmmaMat),
+        Accumulator,
+    }
+}
+
+ir_node! {
+    /// The declared type of a matrix-fragment local (see [`Ty::Fragment`]): its role, the operand `dtype` the
+    /// multiply consumes (an accumulator carries the dtype of the operands it accumulates), and the `m x n x k`
+    /// tile it covers.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+    pub struct FragmentTy {
+        pub role: FragmentRole,
+        pub dtype: WmmaDtype,
+        pub shape: WmmaShape,
+    }
+}
+
+impl FragmentTy {
+    pub const fn matrix(which: WmmaMat, dtype: WmmaDtype, shape: WmmaShape) -> Self {
+        FragmentTy {
+            role: FragmentRole::Matrix(which),
+            dtype,
+            shape,
+        }
+    }
+
+    pub const fn accumulator(dtype: WmmaDtype, shape: WmmaShape) -> Self {
+        FragmentTy {
+            role: FragmentRole::Accumulator,
+            dtype,
+            shape,
+        }
+    }
+}
+
+impl From<FragmentTy> for Ty {
+    fn from(fragment: FragmentTy) -> Ty {
+        Ty::Fragment(fragment)
     }
 }
 
@@ -312,7 +365,7 @@ ir_node! {
     /// `VK_KHR_shader_bfloat16`, so SPIR-V refuses it). A dtype a target cannot lower is a typed
     /// `EmitError::Unsupported`, never a silently wrong fragment layout (see
     /// `poot_codegen::emit`'s `wmma_check_target`).
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
     pub enum WmmaDtype {
         Bf16,
         F16,
@@ -352,10 +405,9 @@ ir_node! {
         VectorStore { place: Place, value: Operand },
         /// Warp/subgroup-collective matrix-fragment load (spec 025/154, card 530): one target-neutral op,
         /// lowered per target by `poot_codegen::emit` (AMDGCN/NVPTX WMMA, SPIR-V cooperative matrix). `dst`
-        /// is one opaque fragment handle: a `Local` that never goes through the ordinary alloca/load/store
-        /// path (see `emit`'s `frag_regs`) and whose declared `Ty` is a marker only (by convention the
-        /// operand scalar type, e.g. `F16`), never interpreted as that scalar's value. `tile` is the address
-        /// of the tile's first element (a slice element place); `stride` the row stride in elements.
+        /// is a fragment local declared `Ty::Fragment(FragmentTy::matrix(which, dtype, shape))`; the
+        /// verifier rejects any other declaration. `tile` is the address of the tile's first element (a
+        /// slice element place); `stride` the row stride in elements.
         WmmaLoad {
             which: WmmaMat,
             dtype: WmmaDtype,
@@ -364,9 +416,10 @@ ir_node! {
             stride: u32,
             dst: Local,
         },
-        /// `dst = a * b + c` (fused). `a`/`b`/`c`/`dst` are opaque fragment handles (see `WmmaLoad`); `a`/`b`
-        /// carry `dtype`, `c`/`dst` are always the f32 accumulator (every target implemented today only has
-        /// an f32-accumulate WMMA/coopmat instruction for `dtype`).
+        /// `dst = a * b + c` (fused). `a`/`b` are declared A/B fragments of `dtype`, `c`/`dst` the f32
+        /// accumulator fragment of that `dtype` (every target implemented today only has an f32-accumulate
+        /// WMMA/coopmat instruction for `dtype`). `c` and `dst` may be one local: the in-place accumulation of
+        /// a K-loop, which every target carries across the back-edge in the fragment's variable.
         WmmaMma {
             dtype: WmmaDtype,
             shape: WmmaShape,
@@ -382,8 +435,8 @@ ir_node! {
             stride: u32,
             src: Local,
         },
-        /// Seed a zero-valued f32 accumulator fragment (card 154, extended to every target by card 530): an
-        /// opaque fragment value has no addressable components a scalar `Assign` could zero lane by lane, so
+        /// Seed a zero-valued f32 accumulator fragment (card 154, extended to every target by card 530): a
+        /// fragment value has no addressable components a scalar `Assign` could zero lane by lane, so
         /// every target seeds it through one op. Lowers to `OpCompositeConstruct` on SPIR-V (extended by
         /// `SPV_KHR_cooperative_matrix` to broadcast a scalar into every component) and a zero vector/struct
         /// constant on AMDGCN/NVPTX (no device instruction; the fragment register group starts as literal
@@ -402,6 +455,7 @@ ir_node! {
         /// Store the f32 D fragment to a workgroup-local (LDS) `array` (base index 0) with row `stride`. Used
         /// by the bf16 tensor-core gemm epilogue (store to LDS, barrier, narrow-copy to bf16). NVPTX-only.
         WmmaStoreLds {
+            dtype: WmmaDtype,
             shape: WmmaShape,
             array: u8,
             stride: u32,
@@ -609,33 +663,33 @@ mod verify {
             "matrix-fragment shape {shape:?} is not implemented (only WmmaShape::M16N16K16 lowers today)"
         )]
         UnsupportedWmmaShape { shape: WmmaShape },
-        /// A known fragment producer has the wrong role for this consumer. `Some(A/B)` names an
-        /// operand matrix; `None` names the accumulator, not an unknown role. Scalar marker types do
-        /// not determine fragment roles.
-        #[error(
-            "fragment _{}: expected {}, found {}",
-            local.index,
-            fragment_role_name(*expected_matrix),
-            fragment_role_name(*found_matrix)
-        )]
-        FragmentRoleMismatch {
+        /// A matrix-fragment op's local is not declared as the fragment type the op needs (cards 530/663): the
+        /// role (A, B or accumulator), operand dtype and tile are all part of the declared [`Ty::Fragment`], so
+        /// a swapped A/B, an accumulator where a matrix belongs, a dtype or tile that disagrees with the
+        /// operation, or a scalar-typed local all land here.
+        #[error("fragment _{}: expected {expected:?}, declared {found:?}", local.index)]
+        FragmentTypeMismatch {
             local: Local,
-            expected_matrix: Option<WmmaMat>,
-            found_matrix: Option<WmmaMat>,
+            expected: FragmentTy,
+            found: Ty,
         },
-        /// One local has incompatible known fragment producers. The enclosing `Site` names the
-        /// conflicting producer; `previous` names the first. `None` is the accumulator role.
+        /// A matrix-fragment op is reachable under control flow that can split its collective subgroup
+        /// (card 663): `branch` switches on a value that can differ between lanes of one
+        /// [`FRAGMENT_COLLECTIVE_LANES`]-lane group, and a path from it reaches the op before the arms
+        /// reconverge. A collective op executed by only some lanes of its subgroup is undefined on every
+        /// target. Selecting a whole subgroup (`lane / 32 == 0`, `lane < 32`) is uniform at this scope and
+        /// accepted.
         #[error(
-            "fragment _{} is produced as {} at {previous} and as {} here",
-            local.index,
-            fragment_role_name(*previous_matrix),
-            fragment_role_name(*found_matrix)
+            "bb{} branches on a value that can differ between lanes of one subgroup: the matrix-fragment op at \
+             bb{} is reachable before the branch's arms reconverge{}",
+            branch.index,
+            op.index,
+            reconverge_desc(*reconverge)
         )]
-        FragmentProducerRoleConflict {
-            local: Local,
-            previous: Site,
-            previous_matrix: Option<WmmaMat>,
-            found_matrix: Option<WmmaMat>,
+        DivergentFragmentParticipation {
+            branch: BlockId,
+            op: BlockId,
+            reconverge: Option<BlockId>,
         },
         /// `Rvalue::BinaryOpNoContract`'s `op` is not `Add`, `Sub` or `Mul` (card 628): the no-contraction
         /// marker exists for the packed-dequant formula's multiply-add/-sub chain only, and every backend's
@@ -696,41 +750,6 @@ mod verify {
 
     type Check<T> = Result<T, VerifyErrorKind>;
 
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum FragmentRole {
-        Matrix(WmmaMat),
-        Accumulator,
-    }
-
-    impl FragmentRole {
-        fn matrix(self) -> Option<WmmaMat> {
-            match self {
-                Self::Matrix(which) => Some(which),
-                Self::Accumulator => None,
-            }
-        }
-    }
-
-    fn fragment_role_name(matrix: Option<WmmaMat>) -> &'static str {
-        match matrix {
-            Some(WmmaMat::A) => "matrix A",
-            Some(WmmaMat::B) => "matrix B",
-            None => "accumulator",
-        }
-    }
-
-    fn fragment_producer(stmt: &Statement) -> Option<(Local, FragmentRole)> {
-        match stmt {
-            Statement::WmmaLoad { which, dst, .. } | Statement::WmmaLoadLds { which, dst, .. } => {
-                Some((*dst, FragmentRole::Matrix(*which)))
-            }
-            Statement::WmmaZero { dst, .. } | Statement::WmmaMma { dst, .. } => {
-                Some((*dst, FragmentRole::Accumulator))
-            }
-            _ => None,
-        }
-    }
-
     fn is_scalar(ty: &Ty) -> bool {
         matches!(
             ty,
@@ -764,9 +783,11 @@ mod verify {
     impl Body {
         /// Check the body is well-formed before any backend sees it. Returns the first violation.
         ///
-        /// Barrier uniformity (every thread of the workgroup reaching the same barrier) is decided by
-        /// [`Self::verify_barrier_uniformity`]: a static divergence analysis independent of launch shape
-        /// and input values (card 618).
+        /// Barrier uniformity (every thread of the workgroup reaching the same barrier) and collective
+        /// fragment participation (every lane of a subgroup reaching the same matrix op) are decided by
+        /// [`Self::verify_divergent_control`]: a static divergence analysis independent of launch shape
+        /// and input values (cards 618, 663). Fragment roles, dtypes and tiles are the declared
+        /// [`Ty::Fragment`] of every producer and consumer, checked statement by statement.
         pub fn verify(&self) -> Result<(), VerifyError> {
             let at = |site| move |kind| VerifyError { site, kind };
             self.verify_signature().map_err(at(Site::Signature))?;
@@ -781,83 +802,8 @@ mod verify {
                 self.verify_terminator(&block.terminator)
                     .map_err(at(Site::Terminator { block: block_id }))?;
             }
-            self.verify_fragment_roles()?;
             self.verify_definitions()?;
-            self.verify_barrier_uniformity()
-        }
-
-        /// Collect known roles before checking consumers: CFG execution order need not match block
-        /// storage order. Local indices have already passed the statement checks. This does not infer
-        /// unknown roles from scalar marker types or prove collective participation; it is not a
-        /// complete opaque-fragment type system.
-        fn verify_fragment_roles(&self) -> Result<(), VerifyError> {
-            let mut producers: Vec<Option<(FragmentRole, Site)>> = vec![None; self.locals.len()];
-            for (b, block) in self.blocks.iter().enumerate() {
-                for (index, stmt) in block.statements.iter().enumerate() {
-                    let Some((local, role)) = fragment_producer(stmt) else {
-                        continue;
-                    };
-                    let site = Site::Statement {
-                        block: BlockId { index: b as u32 },
-                        index,
-                    };
-                    let known = &mut producers[local.index as usize];
-                    match *known {
-                        Some((previous_role, previous)) if previous_role != role => {
-                            return Err(VerifyError {
-                                site,
-                                kind: VerifyErrorKind::FragmentProducerRoleConflict {
-                                    local,
-                                    previous,
-                                    previous_matrix: previous_role.matrix(),
-                                    found_matrix: role.matrix(),
-                                },
-                            });
-                        }
-                        None => *known = Some((role, site)),
-                        // Repeated same-role definitions include the ordinary in-place MMA K-loop.
-                        Some(_) => {}
-                    }
-                }
-            }
-            let require = |local: Local, expected: FragmentRole| -> Check<()> {
-                if let Some((found, _)) = producers[local.index as usize]
-                    && found != expected
-                {
-                    return Err(VerifyErrorKind::FragmentRoleMismatch {
-                        local,
-                        expected_matrix: expected.matrix(),
-                        found_matrix: found.matrix(),
-                    });
-                }
-                Ok(())
-            };
-            for (b, block) in self.blocks.iter().enumerate() {
-                for (index, stmt) in block.statements.iter().enumerate() {
-                    let check = || -> Check<()> {
-                        match stmt {
-                            Statement::WmmaMma { a, b, c, .. } => {
-                                require(*a, FragmentRole::Matrix(WmmaMat::A))?;
-                                require(*b, FragmentRole::Matrix(WmmaMat::B))?;
-                                require(*c, FragmentRole::Accumulator)
-                            }
-                            Statement::WmmaStore { src, .. }
-                            | Statement::WmmaStoreLds { src, .. } => {
-                                require(*src, FragmentRole::Accumulator)
-                            }
-                            _ => Ok(()),
-                        }
-                    };
-                    check().map_err(|kind| VerifyError {
-                        site: Site::Statement {
-                            block: BlockId { index: b as u32 },
-                            index,
-                        },
-                        kind,
-                    })?;
-                }
-            }
-            Ok(())
+            self.verify_divergent_control()
         }
 
         fn verify_signature(&self) -> Check<()> {
@@ -1011,6 +957,14 @@ mod verify {
             match stmt {
                 Statement::Assign(place, rvalue) => {
                     let dest = self.place_ty(place)?;
+                    // A fragment is produced and consumed by the `Wmma*` statements only: a plain assignment
+                    // would move a collective value outside the participation check.
+                    if matches!(dest, Ty::Fragment(_)) {
+                        return Err(VerifyErrorKind::InvalidOperandType {
+                            what: "assignment destination",
+                            found: dest,
+                        });
+                    }
                     if let Some(element) = self.element(place)? {
                         self.require_writable(&element)?;
                     }
@@ -1040,59 +994,87 @@ mod verify {
                     }
                 }
                 Statement::WmmaLoad {
-                    shape, tile, dst, ..
+                    which,
+                    dtype,
+                    shape,
+                    tile,
+                    dst,
+                    ..
                 } => {
                     self.check_wmma_shape(*shape)?;
                     self.element(tile)?;
-                    self.declared_fragment(*dst)
+                    self.expect_fragment(*dst, FragmentTy::matrix(*which, *dtype, *shape))
                 }
                 Statement::WmmaMma {
+                    dtype,
                     shape,
                     a,
                     b,
                     c,
                     dst,
+                } => {
+                    self.check_wmma_shape(*shape)?;
+                    self.expect_fragment(*a, FragmentTy::matrix(WmmaMat::A, *dtype, *shape))?;
+                    self.expect_fragment(*b, FragmentTy::matrix(WmmaMat::B, *dtype, *shape))?;
+                    let accumulator = FragmentTy::accumulator(*dtype, *shape);
+                    self.expect_fragment(*c, accumulator)?;
+                    self.expect_fragment(*dst, accumulator)
+                }
+                Statement::WmmaStore {
+                    dtype,
+                    shape,
+                    tile,
+                    src,
                     ..
                 } => {
                     self.check_wmma_shape(*shape)?;
-                    for fragment in [*a, *b, *c, *dst] {
-                        self.declared_fragment(fragment)?;
-                    }
-                    Ok(())
-                }
-                Statement::WmmaStore {
-                    shape, tile, src, ..
-                } => {
-                    self.check_wmma_shape(*shape)?;
                     self.writable_element(tile)?;
-                    self.declared_fragment(*src)
+                    self.expect_fragment(*src, FragmentTy::accumulator(*dtype, *shape))
                 }
-                Statement::WmmaZero { shape, dst, .. } => {
+                Statement::WmmaZero { dtype, shape, dst } => {
                     self.check_wmma_shape(*shape)?;
-                    self.declared_fragment(*dst)
+                    self.expect_fragment(*dst, FragmentTy::accumulator(*dtype, *shape))
                 }
                 Statement::WmmaLoadLds {
-                    shape, array, dst, ..
+                    which,
+                    dtype,
+                    shape,
+                    array,
+                    dst,
+                    ..
                 } => {
                     self.check_wmma_shape(*shape)?;
                     self.workgroup_array(*array)?;
-                    self.declared_fragment(*dst)
+                    self.expect_fragment(*dst, FragmentTy::matrix(*which, *dtype, *shape))
                 }
                 Statement::WmmaStoreLds {
-                    shape, array, src, ..
+                    dtype,
+                    shape,
+                    array,
+                    src,
+                    ..
                 } => {
                     self.check_wmma_shape(*shape)?;
                     self.workgroup_array(*array)?;
-                    self.declared_fragment(*src)
+                    self.expect_fragment(*src, FragmentTy::accumulator(*dtype, *shape))
                 }
                 Statement::Fence { .. } => Ok(()),
             }
         }
 
-        /// Statement-local declaration check. Known producer/consumer roles are checked separately
-        /// by `verify_fragment_roles`; `Ty` remains a marker, not the fragment's type.
-        fn declared_fragment(&self, l: Local) -> Check<()> {
-            self.declared(l).map(|_| ())
+        /// `l` must be declared exactly as `expected`: the fragment type is the whole role/dtype/tile contract
+        /// (see [`Ty::Fragment`]), checked at every producer and consumer.
+        fn expect_fragment(&self, l: Local, expected: FragmentTy) -> Check<()> {
+            let found = self.declared(l)?;
+            if *found == Ty::Fragment(expected) {
+                Ok(())
+            } else {
+                Err(VerifyErrorKind::FragmentTypeMismatch {
+                    local: l,
+                    expected,
+                    found: found.clone(),
+                })
+            }
         }
 
         /// Card 530: only `WmmaShape::M16N16K16` is implemented by any target's codegen
@@ -1210,10 +1192,6 @@ mod verify {
                             found: to.clone(),
                         })
                     }
-                }
-                Rvalue::Fp8Decode { operand, .. } => {
-                    expect_ty("fp8 decode operand", &Ty::U32, &self.operand_ty(operand)?)?;
-                    Ok(Ty::F32)
                 }
                 Rvalue::Fp8Encode { operand, .. } => {
                     expect_ty("fp8 encode operand", &Ty::F32, &self.operand_ty(operand)?)?;
@@ -1403,13 +1381,13 @@ mod verify {
         /// post-dominator - the reconvergence point every arm is guaranteed (not merely able) to reach.
         /// Runs after [`Self::verify_definitions`], so every local read here is already known to be
         /// assigned on every path that reaches it.
-        fn verify_barrier_uniformity(&self) -> Result<(), VerifyError> {
+        fn verify_divergent_control(&self) -> Result<(), VerifyError> {
             let ipdom = post_dominators(&self.blocks);
             // `state_in[b]`: for every local, the [`FlowState`] guaranteed to hold on every path into
             // `b` (the same forward must/may-analysis shape as `verify_definitions`, tracking both
-            // thread-uniformity and a possibly-racing buffer write instead of definite assignment).
+            // the lane class and a possibly-racing buffer write instead of definite assignment).
             let mut state_in: Vec<Option<FlowState>> = vec![None; self.blocks.len()];
-            state_in[0] = Some(FlowState::entry(self.locals.len()));
+            state_in[0] = Some(FlowState::entry(self.locals.len(), self.workgroup_size));
             let mut work = vec![0usize];
             while let Some(b) = work.pop() {
                 let mut flow = state_in[b].clone().expect("queued blocks have a state");
@@ -1436,34 +1414,60 @@ mod verify {
                 let Terminator::SwitchInt { discr, .. } = &block.terminator else {
                     continue;
                 };
-                if operand_uniform(discr, &flow) {
+                let class = operand_class(discr, &flow);
+                if class == LaneClass::Uniform {
                     continue;
                 }
                 let block_id = BlockId { index: b as u32 };
                 let reconverge = ipdom[b];
-                if let Some(barrier) = self.barrier_before(block_id, reconverge) {
-                    return Err(VerifyError {
-                        site: Site::Terminator { block: block_id },
-                        kind: VerifyErrorKind::DivergentBarrierReachability {
+                let at_terminator = |kind| VerifyError {
+                    site: Site::Terminator { block: block_id },
+                    kind,
+                };
+                if let Some(barrier) = self.block_before(block_id, reconverge, |block| {
+                    matches!(block.terminator, Terminator::Barrier { .. })
+                }) {
+                    return Err(at_terminator(
+                        VerifyErrorKind::DivergentBarrierReachability {
                             branch: block_id,
                             barrier,
                             reconverge,
                         },
-                    });
+                    ));
+                }
+                // A condition constant across each collective subgroup selects whole subgroups; only a
+                // lane-varying one can split a fragment op's participants.
+                if class.splits_subgroup()
+                    && let Some(op) = self.block_before(block_id, reconverge, |block| {
+                        block.statements.iter().any(is_fragment_op)
+                    })
+                {
+                    return Err(at_terminator(
+                        VerifyErrorKind::DivergentFragmentParticipation {
+                            branch: block_id,
+                            op,
+                            reconverge,
+                        },
+                    ));
                 }
             }
             Ok(())
         }
 
-        /// The first `Barrier`-terminated block reachable from `branch`'s own arms without first
-        /// reaching `reconverge` (its immediate post-dominator): a barrier found here sits strictly
+        /// The first block satisfying `wanted` that is reachable from `branch`'s own arms without first
+        /// reaching `reconverge` (its immediate post-dominator): such a block sits strictly
         /// before the point every arm is guaranteed to reach, so some lanes could stop there while
-        /// others take a different arm past it, or to a different barrier, before ever reconverging -
+        /// others take a different arm past it, or to a different block, before ever reconverging -
         /// unsafe regardless of what happens at or after `reconverge` itself (even a barrier there is
         /// fine: every arm is guaranteed to reach that exact block). `reconverge: None` (no block
         /// post-dominates every arm) searches unbounded: with no guaranteed reunion at all, any
-        /// reachable barrier is already unprovable.
-        fn barrier_before(&self, branch: BlockId, reconverge: Option<BlockId>) -> Option<BlockId> {
+        /// reachable block is already unprovable.
+        fn block_before(
+            &self,
+            branch: BlockId,
+            reconverge: Option<BlockId>,
+            wanted: impl Fn(&BasicBlock) -> bool,
+        ) -> Option<BlockId> {
             let mut visited = HashSet::new();
             let mut work = successors(&self.blocks[branch.index as usize].terminator);
             while let Some(b) = work.pop() {
@@ -1471,7 +1475,7 @@ mod verify {
                     continue;
                 }
                 let block = &self.blocks[b.index as usize];
-                if matches!(block.terminator, Terminator::Barrier { .. }) {
+                if wanted(block) {
                     return Some(b);
                 }
                 work.extend(successors(&block.terminator));
@@ -1480,38 +1484,88 @@ mod verify {
         }
     }
 
-    /// A local's classification for [`Body::verify_barrier_uniformity`]'s forward dataflow: whether its
-    /// value is guaranteed identical across every lane of the workgroup (`uniform`), and whether a write
-    /// to it (only meaningful for a buffer param local) may have happened on some path from the entry
-    /// without an intervening barrier washing it out (`racy`) - card 618: a scalar load
-    /// at a uniform index is uniform only when no unsynchronized write to the same buffer can race it.
+    /// How a value varies across the lanes of one workgroup, for [`Body::verify_divergent_control`]'s forward
+    /// dataflow.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum LaneClass {
+        /// The same for every lane of the workgroup.
+        Uniform,
+        /// The same for every lane of one [`FRAGMENT_COLLECTIVE_LANES`]-lane subgroup, possibly different
+        /// between subgroups (a warp selector such as `lane / 32`).
+        Subgroup,
+        /// The lane's own thread index along the contiguous (X) axis, or that index taken modulo a multiple
+        /// of the subgroup size: each aligned subgroup holds 32 consecutive values starting at a multiple of
+        /// 32. Only tracked when the workgroup's X extent is a multiple of the subgroup size, so a subgroup
+        /// never straddles a row of the workgroup.
+        Lane,
+        /// Anything else: may differ between any two lanes.
+        Varying,
+    }
+
+    impl LaneClass {
+        /// The class of a local assigned `self` on one path and `other` on another.
+        fn join(self, other: LaneClass) -> LaneClass {
+            match (self, other) {
+                (a, b) if a == b => a,
+                (
+                    LaneClass::Uniform | LaneClass::Subgroup,
+                    LaneClass::Uniform | LaneClass::Subgroup,
+                ) => LaneClass::Subgroup,
+                _ => LaneClass::Varying,
+            }
+        }
+
+        /// Whether a branch on this class can send lanes of one collective subgroup different ways.
+        fn splits_subgroup(self) -> bool {
+            matches!(self, LaneClass::Lane | LaneClass::Varying)
+        }
+
+        /// The class of a value computed from `self` by an operation this analysis does not model: a lane
+        /// index loses its structure, every constant-per-group class survives.
+        fn opaque(self) -> LaneClass {
+            match self {
+                LaneClass::Lane => LaneClass::Varying,
+                other => other,
+            }
+        }
+    }
+
+    /// A local's classification for [`Body::verify_divergent_control`]'s forward dataflow: how its value varies
+    /// across lanes (`class`), and whether a write to it (only meaningful for a buffer param local) may have
+    /// happened on some path from the entry without an intervening barrier washing it out (`racy`) - card 618:
+    /// a scalar load at a uniform index is uniform only when no unsynchronized write to the same buffer can
+    /// race it.
     #[derive(Clone, PartialEq, Debug)]
     struct FlowState {
-        uniform: Vec<bool>,
+        class: Vec<LaneClass>,
         racy: Vec<bool>,
+        /// Whether a subgroup's lanes are consecutive X indices (the workgroup's X extent is a multiple of
+        /// [`FRAGMENT_COLLECTIVE_LANES`]): the precondition for any [`LaneClass::Lane`]/[`LaneClass::Subgroup`]
+        /// reading of a thread index.
+        subgroups_follow_x: bool,
     }
 
     impl FlowState {
         /// The state at the body's entry: every local uniform (params and never-yet-defined temporaries
         /// alike - a temporary is always overwritten by a uniform-or-not statement before any real use,
         /// already guaranteed by [`Body::verify_definitions`]), nothing yet written.
-        fn entry(n: usize) -> Self {
+        fn entry(n: usize, workgroup_size: [u32; 3]) -> Self {
             FlowState {
-                uniform: vec![true; n],
+                class: vec![LaneClass::Uniform; n],
                 racy: vec![false; n],
+                subgroups_follow_x: workgroup_size[0].is_multiple_of(FRAGMENT_COLLECTIVE_LANES),
             }
         }
 
-        /// The meet of two paths into the same block: uniform only where both agree (a local can be
-        /// varying via either path), racy where either does (a write on either path can still race a
-        /// read here).
+        /// The meet of two paths into the same block: the join of the classes (a local can be varying via
+        /// either path), racy where either does (a write on either path can still race a read here).
         fn merge(&self, other: &FlowState) -> FlowState {
             FlowState {
-                uniform: self
-                    .uniform
+                class: self
+                    .class
                     .iter()
-                    .zip(&other.uniform)
-                    .map(|(a, b)| *a && *b)
+                    .zip(&other.class)
+                    .map(|(a, b)| a.join(*b))
                     .collect(),
                 racy: self
                     .racy
@@ -1519,6 +1573,7 @@ mod verify {
                     .zip(&other.racy)
                     .map(|(a, b)| *a || *b)
                     .collect(),
+                subgroups_follow_x: self.subgroups_follow_x,
             }
         }
 
@@ -1528,7 +1583,7 @@ mod verify {
             for stmt in &block.statements {
                 self.apply_statement(stmt);
             }
-            apply_thread_index_uniformity(&block.terminator, &mut self.uniform);
+            apply_thread_index_class(&block.terminator, self);
             if matches!(block.terminator, Terminator::Barrier { .. }) {
                 // Every lane's writes before the barrier are visible to every lane's reads after it
                 // (the same contract `interp`'s module doc describes), so nothing is racy anymore.
@@ -1540,8 +1595,8 @@ mod verify {
         /// (if any) - in that order, so the definition sees the racy state as of *before* this
         /// statement's own write.
         fn apply_statement(&mut self, stmt: &Statement) {
-            if let Some((idx, uniform)) = stmt_uniform(stmt, self) {
-                self.uniform[idx] = uniform;
+            if let Some((idx, class)) = stmt_class(stmt, self) {
+                self.class[idx] = class;
             }
             if let Some(written) = stmt_writes_buffer(stmt) {
                 self.racy[written.index as usize] = true;
@@ -1549,12 +1604,25 @@ mod verify {
         }
     }
 
+    /// A statement that every lane of a collective subgroup must execute together (a `Wmma*` op).
+    fn is_fragment_op(stmt: &Statement) -> bool {
+        matches!(
+            stmt,
+            Statement::WmmaLoad { .. }
+                | Statement::WmmaMma { .. }
+                | Statement::WmmaStore { .. }
+                | Statement::WmmaZero { .. }
+                | Statement::WmmaLoadLds { .. }
+                | Statement::WmmaStoreLds { .. }
+        )
+    }
+
     /// The immediate post-dominator of every block: the nearest block every path from it - through the
     /// real control-flow graph, a `Barrier`'s own target included - is guaranteed to reach, treating
     /// every `Return` as flowing into one shared virtual exit (the standard way to make post-dominance
     /// well-defined over a CFG with more than one exit; card 618). `None` for a
     /// block that cannot reach that exit at all (every path from it loops forever): its arms' safety
-    /// cannot be proven to reconverge, so [`Body::barrier_before`] then searches unbounded instead of
+    /// cannot be proven to reconverge, so [`Body::block_before`] then searches unbounded instead of
     /// stopping at a (non-existent) reconvergence point.
     fn post_dominators(blocks: &[BasicBlock]) -> Vec<Option<BlockId>> {
         let n = blocks.len();
@@ -1655,21 +1723,14 @@ mod verify {
         a
     }
 
-    /// `Some((local index, is-uniform))` when `stmt` defines a local's value directly: a bare-local
-    /// `Assign` (mirrors [`stmt_defs`]), or a matrix-fragment op's `dst` (card 618): an
-    /// opaque fragment value is never meaningfully uniform, and nothing enforces that a fragment-typed
-    /// local can never also be declared a plain scalar and read by a `SwitchInt` - do not rest this
-    /// analysis on that being true elsewhere; mark it varying directly. `None` otherwise (a store through
-    /// a place defines no local).
-    fn stmt_uniform(stmt: &Statement, flow: &FlowState) -> Option<(usize, bool)> {
+    /// `Some((local index, class))` when `stmt` defines a scalar local's value directly: a bare-local
+    /// `Assign` (mirrors [`stmt_defs`]). `None` otherwise: a store through a place defines no local, and a
+    /// matrix-fragment op's `dst` is a `Ty::Fragment` the verifier never lets a branch read.
+    fn stmt_class(stmt: &Statement, flow: &FlowState) -> Option<(usize, LaneClass)> {
         match stmt {
             Statement::Assign(place, rvalue) if place.projection.is_empty() => {
-                Some((place.local.index as usize, rvalue_uniform(rvalue, flow)))
+                Some((place.local.index as usize, rvalue_class(rvalue, flow)))
             }
-            Statement::WmmaLoad { dst, .. }
-            | Statement::WmmaMma { dst, .. }
-            | Statement::WmmaZero { dst, .. }
-            | Statement::WmmaLoadLds { dst, .. } => Some((dst.index as usize, false)),
             _ => None,
         }
     }
@@ -1698,74 +1759,125 @@ mod verify {
         }
     }
 
-    /// `Some(dim)`'s `ThreadIndexCall` sets its destination's uniformity: `GroupX`/`GroupY`/`GroupZ` (the
-    /// workgroup index) are the same for every lane of one workgroup; every other axis (the local or
-    /// global dispatch id) varies lane to lane by construction.
-    fn apply_thread_index_uniformity(term: &Terminator, uniform: &mut [bool]) {
+    /// A `ThreadIndexCall` sets its destination's class: `GroupX`/`GroupY`/`GroupZ` (the workgroup index)
+    /// are the same for every lane of one workgroup. The X dispatch/local id is a [`LaneClass::Lane`] and the
+    /// Y/Z ids are constant within a subgroup when subgroups follow X; otherwise every id varies lane to lane
+    /// by construction.
+    fn apply_thread_index_class(term: &Terminator, flow: &mut FlowState) {
         if let Terminator::ThreadIndexCall {
             destination, dim, ..
         } = term
             && destination.projection.is_empty()
         {
-            uniform[destination.local.index as usize] = matches!(
-                dim,
-                IndexAxis::GroupX | IndexAxis::GroupY | IndexAxis::GroupZ
-            );
+            flow.class[destination.local.index as usize] = match (dim, flow.subgroups_follow_x) {
+                (IndexAxis::GroupX | IndexAxis::GroupY | IndexAxis::GroupZ, _) => {
+                    LaneClass::Uniform
+                }
+                (IndexAxis::X | IndexAxis::LocalX, true) => LaneClass::Lane,
+                (IndexAxis::Y | IndexAxis::Z | IndexAxis::LocalY | IndexAxis::LocalZ, true) => {
+                    LaneClass::Subgroup
+                }
+                (_, false) => LaneClass::Varying,
+            };
         }
     }
 
-    /// An [`Rvalue`]'s result is thread-uniform iff every operand it reads is: constants and
-    /// [`Rvalue::Len`] (a buffer's length, the same for every lane) are always uniform; a workgroup-local
-    /// or atomic/compare-exchange read is conservatively thread-varying (its index, ordering or contents
-    /// may differ per lane, and this analysis does not track them precisely enough to prove otherwise).
-    fn rvalue_uniform(rvalue: &Rvalue, flow: &FlowState) -> bool {
+    /// An [`Rvalue`]'s class: constants and [`Rvalue::Len`] (a buffer's length, the same for every lane) are
+    /// uniform; a workgroup-local or atomic/compare-exchange read is conservatively lane-varying (its
+    /// index, ordering or contents may differ per lane, and this analysis does not track them precisely
+    /// enough to prove otherwise); an operation of constant-per-group operands is constant per group.
+    fn rvalue_class(rvalue: &Rvalue, flow: &FlowState) -> LaneClass {
         match rvalue {
-            Rvalue::Use(op)
-            | Rvalue::UnaryOp(_, op)
+            Rvalue::Use(op) => operand_class(op, flow),
+            Rvalue::UnaryOp(_, op)
             | Rvalue::MathUnary(_, op)
             | Rvalue::IntScalarUnary(_, op)
-            | Rvalue::VectorSplat(op) => operand_uniform(op, flow),
-            Rvalue::BinaryOp(_, a, b) | Rvalue::BinaryOpNoContract(_, a, b) => {
-                operand_uniform(a, flow) && operand_uniform(b, flow)
-            }
+            | Rvalue::VectorSplat(op) => operand_class(op, flow).opaque(),
+            Rvalue::BinaryOp(op, a, b) => binary_class(*op, a, b, flow),
+            Rvalue::BinaryOpNoContract(_, a, b) => operand_class(a, flow)
+                .opaque()
+                .join(operand_class(b, flow).opaque()),
             Rvalue::Cast { operand, .. }
             | Rvalue::Bitcast { operand, .. }
-            | Rvalue::Fp8Decode { operand, .. }
-            | Rvalue::Fp8Encode { operand, .. } => operand_uniform(operand, flow),
-            Rvalue::Len(_) => true,
+            | Rvalue::Fp8Encode { operand, .. } => operand_class(operand, flow).opaque(),
+            Rvalue::Len(_) => LaneClass::Uniform,
             Rvalue::WorkgroupLocalRead { .. }
             | Rvalue::WorkgroupLocalAtomic { .. }
             | Rvalue::GlobalAtomic { .. }
             | Rvalue::WorkgroupLocalCompareExchange { .. }
             | Rvalue::GlobalCompareExchange { .. }
-            | Rvalue::VectorLoad { .. } => false,
+            | Rvalue::VectorLoad { .. } => LaneClass::Varying,
         }
     }
 
-    fn operand_uniform(op: &Operand, flow: &FlowState) -> bool {
+    /// A binary operation's class. Two constant-per-group operands give a constant-per-group result (the
+    /// coarser of the two). A [`LaneClass::Lane`] operand keeps structure only against a positive constant
+    /// multiple of the subgroup size `c`: `lane / c` and `lane < c` (or `lane >= c`) select the same value for
+    /// every lane of an aligned subgroup, and `lane % c` is again a lane index. Everything else with a lane
+    /// operand is varying.
+    fn binary_class(op: BinOp, a: &Operand, b: &Operand, flow: &FlowState) -> LaneClass {
+        let (ca, cb) = (operand_class(a, flow), operand_class(b, flow));
+        match (ca, cb) {
+            (
+                LaneClass::Uniform | LaneClass::Subgroup,
+                LaneClass::Uniform | LaneClass::Subgroup,
+            ) => ca.join(cb),
+            (LaneClass::Lane, _) if is_subgroup_multiple(b) => match op {
+                BinOp::Div | BinOp::Lt | BinOp::Ge => LaneClass::Subgroup,
+                BinOp::Rem => LaneClass::Lane,
+                _ => LaneClass::Varying,
+            },
+            // `c > lane` is `lane < c`; `c <= lane` is `lane >= c`.
+            (_, LaneClass::Lane) if is_subgroup_multiple(a) => match op {
+                BinOp::Gt | BinOp::Le => LaneClass::Subgroup,
+                _ => LaneClass::Varying,
+            },
+            _ => LaneClass::Varying,
+        }
+    }
+
+    /// A positive integer constant that is a multiple of [`FRAGMENT_COLLECTIVE_LANES`].
+    fn is_subgroup_multiple(op: &Operand) -> bool {
+        let value = match op {
+            Operand::Const(Constant::Usize(v)) => *v,
+            Operand::Const(Constant::U32(v)) => u64::from(*v),
+            Operand::Const(Constant::I32(v)) if *v > 0 => *v as u64,
+            _ => return false,
+        };
+        value > 0 && value.is_multiple_of(u64::from(FRAGMENT_COLLECTIVE_LANES))
+    }
+
+    fn operand_class(op: &Operand, flow: &FlowState) -> LaneClass {
         match op {
-            Operand::Const(_) => true,
-            Operand::Copy(place) | Operand::Move(place) => place_uniform(place, flow),
+            Operand::Const(_) => LaneClass::Uniform,
+            Operand::Copy(place) | Operand::Move(place) => place_class(place, flow),
         }
     }
 
-    /// A bare local's uniformity comes from `flow.uniform`; reading through any projection (a buffer or
-    /// private array element) is thread-varying unless it is a `[Deref, Index]` element of a shared
-    /// buffer (`element()`'s `binding: Some(..)`) at a thread-uniform index *and* the buffer is not
-    /// `flow.racy` (card 618): with both, every lane addresses the same memory with no
+    /// A bare local's class comes from `flow.class`; reading through any projection (a buffer or
+    /// private array element) is lane-varying unless it is a `[Deref, Index]` element of a shared
+    /// buffer (`element()`'s `binding: Some(..)`) at an index that is constant per group *and* the buffer is
+    /// not `flow.racy` (card 618): with both, every lane of the group addresses the same memory with no
     /// unsynchronized write racing the read, so every lane reads back the same value (the "scalar load"
     /// every real GPU compiler's uniformity analysis makes - `offsets[expert]` with a `GroupX`-derived
     /// `expert`, from the grouped-dequant-gemm kernel, and no store to `offsets` anywhere in the body, is
     /// exactly this). A private array's `[Index]` element is never uniform this way even at a uniform,
     /// race-free index: it is per-thread storage, so different lanes can hold different contents at the
     /// same index.
-    fn place_uniform(place: &Place, flow: &FlowState) -> bool {
+    fn place_class(place: &Place, flow: &FlowState) -> LaneClass {
         match place.projection.as_slice() {
-            [] => flow.uniform[place.local.index as usize],
+            [] => flow.class[place.local.index as usize],
             [ProjectionElem::Deref, ProjectionElem::Index(i)] => {
-                flow.uniform[i.index as usize] && !flow.racy[place.local.index as usize]
+                match flow.class[i.index as usize] {
+                    class @ (LaneClass::Uniform | LaneClass::Subgroup)
+                        if !flow.racy[place.local.index as usize] =>
+                    {
+                        class
+                    }
+                    _ => LaneClass::Varying,
+                }
             }
-            _ => false,
+            _ => LaneClass::Varying,
         }
     }
 
@@ -1833,7 +1945,6 @@ mod verify {
             | Rvalue::VectorSplat(a) => operand_reads(a, f),
             Rvalue::Cast { operand, .. }
             | Rvalue::Bitcast { operand, .. }
-            | Rvalue::Fp8Decode { operand, .. }
             | Rvalue::Fp8Encode { operand, .. } => operand_reads(operand, f),
             Rvalue::BinaryOp(_, a, b) | Rvalue::BinaryOpNoContract(_, a, b) => {
                 operand_reads(a, f);
@@ -3177,16 +3288,17 @@ mod tests {
         assert_eq!(branch_of(&rejection(&body).1), BlockId { index: 4 });
     }
 
-    /// a matrix-fragment op's `dst` is declared as a plain `Bool` local (nothing stops
-    /// this - `declared_fragment` accepts any declared local) and used directly as a `SwitchInt`
-    /// discriminant feeding two different barriers. Without marking a fragment `dst` varying in
-    /// `stmt_uniform`, it keeps its all-true entry uniformity forever (never reassigned) and this passes;
-    /// an opaque fragment value must never be trusted as uniform just because nothing reassigned it.
+    /// A fragment local is never a branch condition: its declared type is `Ty::Fragment`, which the verifier
+    /// refuses as a switch discriminant, so the divergence analysis never has to classify one. (Before cards
+    /// 530/663 a fragment local was declared with a plain scalar marker type and could be read this way.)
     #[test]
-    fn a_scalar_typed_wmma_dst_read_by_a_switch_is_treated_as_varying() {
-        let body = body_of(
+    fn a_fragment_cannot_be_a_switch_discriminant() {
+        let mut body = body_of(
             0,
-            vec![Ty::Bool],
+            vec![Ty::Fragment(FragmentTy::accumulator(
+                WmmaDtype::F16,
+                WmmaShape::M16N16K16,
+            ))],
             vec![
                 block(
                     vec![Statement::WmmaZero {
@@ -3197,28 +3309,23 @@ mod tests {
                     Terminator::SwitchInt {
                         discr: copy(1),
                         targets: SwitchTargets {
-                            branches: vec![(0, BlockId { index: 2 })],
+                            branches: vec![(0, BlockId { index: 1 })],
                             otherwise: BlockId { index: 1 },
                         },
                     },
                 ),
-                block(
-                    vec![],
-                    Terminator::Barrier {
-                        target: BlockId { index: 3 },
-                    },
-                ),
-                block(
-                    vec![],
-                    Terminator::Barrier {
-                        target: BlockId { index: 4 },
-                    },
-                ),
-                block(vec![], Terminator::Return),
                 block(vec![], Terminator::Return),
             ],
         );
-        assert_eq!(branch_of(&rejection(&body).1), BlockId { index: 0 });
+        body.workgroup_size = [32, 1, 1];
+        let error = body.verify().expect_err("a fragment cannot be branched on");
+        assert!(matches!(
+            error.kind,
+            VerifyErrorKind::InvalidOperandType {
+                what: "switch discriminant",
+                ..
+            }
+        ));
     }
 
     /// Positive counterpart to the loop probe above: a barrier inside a loop whose trip count is
@@ -3410,7 +3517,7 @@ mod tests {
 
     /// Round-2 probe 2: one arm returns immediately, the other barriers then returns - no shared real
     /// block before the body's exit, so the branch's immediate post-dominator is the virtual exit
-    /// itself (`reconverge: None`), exercising `barrier_before`'s unbounded search path.
+    /// itself (`reconverge: None`), exercising `block_before`'s unbounded search path.
     #[test]
     fn varying_branch_whose_post_dominator_is_the_virtual_exit_is_rejected() {
         let body = body_of(
@@ -3747,7 +3854,7 @@ mod tests {
     /// Round-2 probe 7 (structural): a block unreachable from the entry block, itself containing a
     /// divergent-looking `SwitchInt` to two different barriers. `post_dominators` computes over every
     /// block that can reach the virtual exit regardless of forward reachability from the entry (no
-    /// indexing panic), and `verify_barrier_uniformity`'s `state_in[b] == None` skip (the same pattern
+    /// indexing panic), and `verify_divergent_control`'s `state_in[b] == None` skip (the same pattern
     /// `verify_definitions` already uses) excludes a block no lane ever executes from the check, so
     /// `verify()` neither panics nor flags it.
     #[test]

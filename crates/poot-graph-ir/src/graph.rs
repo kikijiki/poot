@@ -3,6 +3,8 @@
 use std::collections::HashSet;
 use std::fmt;
 
+use poot_tensor::HostTensor;
+
 use crate::error::GraphValidationError;
 use crate::op::OpKind;
 use crate::rope_table::{self, RopeSpec, RopeTable};
@@ -193,8 +195,9 @@ pub enum Storage {
 /// bound: a binder materializes the value from this payload exactly like a slot from its [`Slot`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum ComputedConst {
-    /// The F32 range `[0, 1, .., len)`, shape `[len]`.
-    Iota { len: usize },
+    /// The range `[0, 1, .., len)`, shape `[len]`, in `dtype` (F32 or I32; an I32 range is exact for every
+    /// `len` a graph shape can hold, an F32 one only below 2^24).
+    Iota { len: usize, dtype: DType },
     /// One table of a RoPE pair, shape `[positions, spec.dim()]`, from
     /// [`crate::rope_table::rope_tables`]. `positions` is the entry's capacity, not the model's
     /// maximum context.
@@ -215,13 +218,45 @@ fn alibi_series(n: usize) -> impl Iterator<Item = f32> {
 }
 
 impl ComputedConst {
-    /// The exact elements of the constant, in row-major order, in the F32 dtype the graph declares.
-    ///
-    /// `len` is bounded by the graph shape it materializes into, so a length above `i32::MAX` cannot be
-    /// built (and the `as f32` casts below never lose an integer for a realizable value).
-    pub fn values_f32(self) -> Vec<f32> {
+    /// The dtype the graph declares for the value this constant materializes into.
+    pub fn dtype(self) -> DType {
         match self {
-            ComputedConst::Iota { len } => (0..len).map(|i| i as f32).collect(),
+            ComputedConst::Iota { dtype, .. } => dtype,
+            ComputedConst::Rope { .. } | ComputedConst::AlibiSlopes { .. } => DType::F32,
+        }
+    }
+
+    /// The exact constant as a host tensor of [`Self::dtype`] and [`Self::shape`]: the one materialization
+    /// every binder and oracle shares.
+    ///
+    /// # Panics
+    /// An `Iota` whose dtype is neither F32 nor I32, or whose `len` does not fit an `i32`: the graph
+    /// shape rule ([`crate::OpKind::Iota`]) rejects both before a constant exists.
+    pub fn tensor(self) -> HostTensor {
+        match self {
+            ComputedConst::Iota {
+                len,
+                dtype: DType::I32,
+            } => HostTensor::i32(
+                vec![len],
+                (0..len)
+                    .map(|i| i32::try_from(i).expect("an I32 iota length fits i32"))
+                    .collect(),
+            ),
+            ComputedConst::Iota { dtype, .. } if dtype != DType::F32 => {
+                panic!("an iota constant is F32 or I32, got {dtype:?}")
+            }
+            _ => HostTensor::f32(self.shape(), self.values_f32()),
+        }
+    }
+
+    /// The elements of an F32 constant, in row-major order.
+    ///
+    /// `len` is bounded by the graph shape it materializes into (the `as f32` cast of an iota never
+    /// loses an integer below 2^24, the F32 iota's checked bound).
+    fn values_f32(self) -> Vec<f32> {
+        match self {
+            ComputedConst::Iota { len, .. } => (0..len).map(|i| i as f32).collect(),
             ComputedConst::Rope {
                 table,
                 positions,
@@ -258,7 +293,7 @@ impl ComputedConst {
     /// The shape of the value this constant materializes into.
     pub fn shape(self) -> Vec<usize> {
         match self {
-            ComputedConst::Iota { len } => vec![len],
+            ComputedConst::Iota { len, .. } => vec![len],
             ComputedConst::Rope {
                 positions, spec, ..
             } => vec![positions as usize, spec.dim()],
@@ -1089,7 +1124,7 @@ impl ValidationPacketLayout {
     }
 }
 
-/// Whether a `MatMul`/`MatMulBias` eqn's stored output aval is a legitimate F32-accumulate widening of its
+/// Whether a `MatMul` eqn's stored output aval is a legitimate F32-accumulate widening of its
 /// `infer`red (narrower-operand) type, rather than a type error.
 ///
 /// `OpKind::MatMul::infer` reports the dtype of operand A, so a plain matmul type-checks normally. But backends
@@ -1100,13 +1135,13 @@ impl ValidationPacketLayout {
 /// operands, F32 output; RADV coopmat config 13 has no f16-accumulate mode). Rejecting this shape would make
 /// `run_resident` unusable for either backend's mixed-precision matmul.
 ///
-/// Only MatMul/MatMulBias get this exception: every other op's `infer` must match the stored aval exactly.
+/// Only MatMul gets this exception: every other op's `infer` must match the stored aval exactly.
 fn is_matmul_f32_accumulate_widening(
     op: &OpKind,
     inferred: &TensorType,
     stored: &TensorType,
 ) -> bool {
-    matches!(op, OpKind::MatMul | OpKind::MatMulBias)
+    matches!(op, OpKind::MatMul)
         && inferred.shape == stored.shape
         && stored.dtype == DType::F32
         && matches!(inferred.dtype, DType::F16 | DType::BF16)

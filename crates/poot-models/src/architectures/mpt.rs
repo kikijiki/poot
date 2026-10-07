@@ -63,8 +63,8 @@ use crate::components::linear::WeightError;
 use crate::components::norm::{NormKind, NormParams};
 use crate::components::rope::RopeParams;
 use crate::components::standard::{
-    LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step, standard_layer,
-    standard_stack,
+    BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
+    standard_layer, standard_stack,
 };
 use crate::model::{
     ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, StepShape,
@@ -89,6 +89,7 @@ pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     ],
     build,
     fixture,
+    variants: &[],
 };
 
 const WIDTH: Field = Field::new("d_model", "mpt.embedding_length");
@@ -379,7 +380,7 @@ impl Model for Mpt {
                 &layer.norms,
                 &p.layer,
                 |b, h| attention(b, &step, l, h, &layer.attn, &p.attention),
-                |b, h| plain_mlp(b, h, &layer.ffn, Gelu::Erf),
+                |b, BlockInput { block: h, .. }| plain_mlp(b, h, &layer.ffn, Gelu::Erf),
             )
         });
         Ok(step.finish(b, logits))

@@ -47,7 +47,7 @@ export default function FlashAttentionDiagram(): React.ReactElement {
   return (
     <div style={{ margin: '1.5rem 0' }}>
       <div style={{ fontSize: '0.75rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--ifm-color-emphasis-600)', textAlign: 'center', marginBottom: '0.5rem' }}>
-        Flash attention decode: one workgroup, streaming over K/V chunks
+        Streaming attention: one workgroup per query row, streaming over K/V chunks
       </div>
 
       <svg width={SVG_W} height={SVG_H} viewBox={`0 0 ${SVG_W} ${SVG_H}`}

@@ -72,7 +72,7 @@ pub fn random_payload(format: WeightFormat, shape: [usize; 2], seed: u64) -> Pac
                         unreachable!("only act-order GPTQ has a GroupIndex operand")
                     };
                     (0..shape[1])
-                        .flat_map(|k| (((k * 7) % groups.get()) as i32).to_le_bytes())
+                        .flat_map(|k| (((k * 7) % groups) as i32).to_le_bytes())
                         .collect()
                 }
                 (Storage::Planar(_), SourceRole::Planar(operand_role)) => {
@@ -87,6 +87,41 @@ pub fn random_payload(format: WeightFormat, shape: [usize; 2], seed: u64) -> Pac
                 }
                 (storage, role) => unreachable!("{storage:?} has no {role:?} source"),
             };
+            (role, Arc::from(bytes))
+        })
+        .collect();
+    PackedPayload::try_new(weight, sources)
+        .unwrap_or_else(|error| panic!("{format:?} {shape:?}: {error:?}"))
+}
+
+/// [`random_payload`] for a contraction fixture that must be sensitive to its scales: an E4M3 payload keeps its
+/// random codes but gets prescribed nonzero BF16 scales cycling through 0.5, 1.0, 1.5 and 2.0, so every output
+/// depends on every scale (a random sanitized BF16 scale is usually near zero, which hides a wrong scale). Any
+/// other format is the plain random payload.
+pub fn prescribed_scale_payload(
+    format: WeightFormat,
+    shape: [usize; 2],
+    seed: u64,
+) -> PackedPayload {
+    let base = random_payload(format, shape, seed);
+    if !matches!(
+        format,
+        WeightFormat::E4m3PerChannel { .. } | WeightFormat::E4m3Block128 { .. }
+    ) {
+        return base;
+    }
+    const SCALES: [u16; 4] = [0x3f00, 0x3f80, 0x3fc0, 0x4000];
+    let weight = base.weight();
+    let sources: Vec<(SourceRole, Arc<[u8]>)> = weight
+        .sources()
+        .into_iter()
+        .map(|role| {
+            let mut bytes = base.bytes(role).to_vec();
+            if role == SourceRole::Planar(OperandRole::Scale) {
+                for (index, scale) in bytes.chunks_mut(2).enumerate() {
+                    scale.copy_from_slice(&SCALES[index % SCALES.len()].to_le_bytes());
+                }
+            }
             (role, Arc::from(bytes))
         })
         .collect();

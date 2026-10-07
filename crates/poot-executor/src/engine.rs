@@ -464,18 +464,23 @@ impl<D: Device> Engine<D> {
                     (Loc::Weight(idx), elems)
                 }
                 Storage::Computed(computed) => {
-                    let bytes: Vec<u8> = computed
-                        .values_f32()
-                        .iter()
-                        .flat_map(|v| v.to_le_bytes())
-                        .collect();
+                    let tensor = computed.tensor();
+                    let dtype = tensor.dtype();
+                    let bytes: Vec<u8> = match (tensor.as_f32(), tensor.as_i32()) {
+                        (Some(words), _) => words.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                        (_, Some(words)) => words.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                        (None, None) => {
+                            unreachable!("a computed constant materializes as F32 or I32")
+                        }
+                    };
                     let encoded =
-                        crate::lanes::encode_host(poot_tensor::DType::F32, &bytes, storage)
-                            .ok_or_else(|| LoadError::WeightFormat {
+                        crate::lanes::encode_host(dtype, &bytes, storage).ok_or_else(|| {
+                            LoadError::WeightFormat {
                                 name: format!("computed v{id}"),
-                                stored: "F32".into(),
+                                stored: format!("{dtype:?}"),
                                 planned: storage,
-                            })?;
+                            }
+                        })?;
                     let (loc, elems) = push_local!(BufferRole::Input, storage, meta.aval.numel());
                     self.device
                         .write(resolve::<D>(loc, &locals, &arena, &[], &[]), &encoded)
@@ -553,14 +558,7 @@ impl<D: Device> Engine<D> {
             match plan {
                 Plan::Alias(source) => values[eqn.out] = Some(operand(&values, *source)?),
                 Plan::View { src, .. } => values[eqn.out] = Some(operand(&values, *src)?),
-                Plan::Compute {
-                    body,
-                    key,
-                    label,
-                    grid,
-                } => {
-                    let kernel = self.kernel(key, body, max_artifact_bytes)?;
-                    let inputs = operands_with_elems(&values, eqn)?;
+                Plan::Dispatches(dispatches) => {
                     let output_loc = out_loc(
                         OutLocArgs {
                             out: eqn.out,
@@ -570,78 +568,29 @@ impl<D: Device> Engine<D> {
                         &values,
                     )?;
                     let output = (output_loc, elems_of(eqn.out)?);
-                    steps.push(LoadedStep {
-                        kernel,
-                        inputs,
-                        output,
-                        threads: *grid,
-                        workgroup: body.workgroup_size,
-                        work,
-                        kind_name: eqn.op.kind_name(),
-                        label: label.clone(),
-                    });
-                    values[eqn.out] = Some(output);
-                }
-                Plan::ComputeMeta {
-                    body,
-                    key,
-                    label,
-                    meta,
-                    grid,
-                } => {
-                    let kernel = self.kernel(key, body, max_artifact_bytes)?;
-                    let mut inputs = operands_with_elems(&values, eqn)?;
-                    let meta_loc = self.meta_buffer(meta, &mut locals)?;
-                    inputs.push((meta_loc, meta.len() as u32));
-                    let output_loc = out_loc(
-                        OutLocArgs {
-                            out: eqn.out,
-                            commit_plan,
-                            buffer_plan,
-                        },
-                        &values,
-                    )?;
-                    let output = (output_loc, elems_of(eqn.out)?);
-                    steps.push(LoadedStep {
-                        kernel,
-                        inputs,
-                        output,
-                        threads: *grid,
-                        workgroup: body.workgroup_size,
-                        work,
-                        kind_name: eqn.op.kind_name(),
-                        label: label.clone(),
-                    });
-                    values[eqn.out] = Some(output);
-                }
-                Plan::ComputeChunks(chunks) => {
-                    let output_loc = out_loc(
-                        OutLocArgs {
-                            out: eqn.out,
-                            commit_plan,
-                            buffer_plan,
-                        },
-                        &values,
-                    )?;
-                    let output = (output_loc, elems_of(eqn.out)?);
-                    let per_chunk_work = work / (chunks.len().max(1) as u64);
-                    for chunk in chunks {
-                        let kernel = self.kernel(&chunk.key, &chunk.body, max_artifact_bytes)?;
+                    let per_dispatch_work = work / (dispatches.len().max(1) as u64);
+                    for dispatch in dispatches {
+                        let poot_graph_plan::Dispatch {
+                            body,
+                            key,
+                            label,
+                            launch,
+                        } = dispatch;
+                        let kernel = self.kernel(key, body, max_artifact_bytes)?;
                         let mut inputs = operands_with_elems(&values, eqn)?;
-                        if !chunk.meta.is_empty() {
-                            let meta_loc = self.meta_buffer(&chunk.meta, &mut locals)?;
-                            inputs.push((meta_loc, chunk.meta.len() as u32));
+                        if !launch.meta.is_empty() {
+                            let meta_loc = self.meta_buffer(&launch.meta, &mut locals)?;
+                            inputs.push((meta_loc, launch.meta.len() as u32));
                         }
-                        let wg = chunk.body.workgroup_size;
                         steps.push(LoadedStep {
                             kernel,
                             inputs,
                             output,
-                            threads: [chunk.groups as u32 * wg[0], wg[1], wg[2]],
-                            workgroup: wg,
-                            work: per_chunk_work,
+                            threads: launch.grid,
+                            workgroup: body.workgroup_size,
+                            work: per_dispatch_work,
                             kind_name: eqn.op.kind_name(),
-                            label: chunk.label.clone(),
+                            label: label.clone(),
                         });
                     }
                     values[eqn.out] = Some(output);
@@ -960,8 +909,10 @@ impl<D: Device> Engine<D> {
             let ids: Vec<i32> = value
                 .view
                 .bytes()
-                .chunks_exact(4)
-                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| i32::from_le_bytes(*c))
                 .collect();
             let expected = embed.numel / embed.rows.width();
             if ids.len() != expected {
@@ -1854,8 +1805,8 @@ mod f16_packed_weight_upload_tests {
     use crate::Executor;
     use poot_graph_ir::Builder;
     use poot_graph_plan::{
-        CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, FusionPolicy, Partition,
-        TargetSet, compile_staged,
+        CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, TargetSet,
+        compile_staged,
     };
     use poot_quant::weights::{DenseWeight, WeightEntry};
 
@@ -1964,7 +1915,6 @@ mod f16_packed_weight_upload_tests {
             },
             &CompileOptions {
                 execution: Submission::Replay,
-                fusion: FusionPolicy::Full,
                 limits: poot_graph_plan::CompileLimits::STANDARD,
             },
         )
@@ -2153,8 +2103,8 @@ mod weight_source_tests {
     use crate::{NoSync, StepInputs};
     use poot_graph_ir::{BinOp, Builder, Graph};
     use poot_graph_plan::{
-        CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, FusionPolicy, Partition,
-        TargetSet, WeightFormats, bind_packed_weights, compile_staged,
+        CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, TargetSet,
+        WeightFormats, bind_packed_weights, compile_staged,
     };
     use poot_quant::format::WeightFormat;
     use poot_quant::weights::{
@@ -2292,7 +2242,6 @@ mod weight_source_tests {
             },
             &CompileOptions {
                 execution: Submission::Replay,
-                fusion: FusionPolicy::Full,
                 limits: poot_graph_plan::CompileLimits::STANDARD,
             },
         )
@@ -2931,7 +2880,6 @@ mod weight_source_tests {
             },
             &CompileOptions {
                 execution: Submission::Replay,
-                fusion: FusionPolicy::Full,
                 limits: poot_graph_plan::CompileLimits::STANDARD,
             },
         )

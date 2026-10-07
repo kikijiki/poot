@@ -27,6 +27,11 @@ impl<'a> Emit<'a> {
         self.stmts
     }
 
+    /// The local allocator and the statements so far, for an emitter written against them directly.
+    pub(crate) fn parts(&mut self) -> (&mut Alloc, &mut Vec<Statement>) {
+        (&mut *self.al, &mut self.stmts)
+    }
+
     /// Mint a fresh local of `ty`, assign it `rvalue`, and return it.
     pub(crate) fn let_(&mut self, ty: Ty, rvalue: Rvalue) -> Local {
         let local = self.al.add(ty, false);

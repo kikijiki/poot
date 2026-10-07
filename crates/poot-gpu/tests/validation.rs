@@ -16,8 +16,8 @@ use poot_graph_ir::{
 };
 use poot_graph_plan::{
     CompileError, CompileOptions, DeviceId, DevicePlacement, DeviceWitnessRejection,
-    ExpertPlacement, FusionPolicy, Partition, PlanError, StagedCompileError, StagedProgram,
-    Submission, Target, TargetSet, compile_staged,
+    ExpertPlacement, Partition, PlanError, StagedCompileError, StagedProgram, Submission, Target,
+    TargetSet, compile_staged,
 };
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::DType;
@@ -42,7 +42,6 @@ fn staged(g: &Graph<ValidationOutputs>, target: Target) -> StagedProgram<Validat
         },
         &CompileOptions {
             execution: Submission::Replay,
-            fusion: FusionPolicy::Full,
             limits: poot_graph_plan::CompileLimits::STANDARD,
         },
     )
@@ -51,8 +50,10 @@ fn staged(g: &Graph<ValidationOutputs>, target: Target) -> StagedProgram<Validat
 
 fn f32_bytes(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 
@@ -359,7 +360,6 @@ fn wgpu_validation_prefill_refuses_noncanonical_witness_at_compile_staged() {
         },
         &CompileOptions {
             execution: Submission::Replay,
-            fusion: FusionPolicy::Full,
             limits: poot_graph_plan::CompileLimits::STANDARD,
         },
     )
@@ -527,4 +527,216 @@ fn wgpu_validation_plan_uses_prepared_graph_ids() {
     let step_in = step_inputs(&slot_binds);
     let result = exec.step(exe, entry, &step_in, &mut NoSync);
     assert_eq!(contract_failure(result), cpu_failure(&graph, &inputs));
+}
+
+// ---- live-capacity attention (POOT-730) ------------------------------------------------------------
+
+use poot_test_util::live_attention::{Inputs, LiveAttentionFixture, LiveAttentionGraph};
+
+/// One step of the live-attention decode through the executor contract, validation channel included: the
+/// output when the packet passes, the contract's error when it does not.
+fn live_attention_step(
+    exec: &mut dyn Executor,
+    target: Target,
+    built: &LiveAttentionGraph,
+    inputs: &Inputs,
+) -> Result<Vec<f32>, ExecError> {
+    let program = staged(&built.graph, target);
+    let (store, slot_binds) = split_consts_and_slots(&built.graph, &inputs.values());
+    let exe = exec
+        .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
+        .unwrap();
+    let entry = exec.add_entry(exe, &program).unwrap();
+    let step_in = step_inputs(&slot_binds);
+    let result = exec
+        .step(exe, entry, &step_in, &mut NoSync)
+        .map(|mut output| f32_bytes(&output.read().unwrap()));
+    exec.remove_entry(exe, entry).unwrap();
+    exec.unload(exe).unwrap();
+    result
+}
+
+fn assert_within(label: &str, got: &[f32], want: &[f32], tolerance: f32) {
+    assert_eq!(got.len(), want.len(), "{label}");
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        assert!(
+            (g - w).abs() <= tolerance,
+            "{label}: element {i}: device {g} vs oracle {w}"
+        );
+    }
+}
+
+/// SC-002 on wgpu: capacity 4096, the length derived in the graph as 64 from `Pos`, NaN in every key and value
+/// from position 64 on. The plan bounds the loop by the live length (`bound=live`), and the device output is
+/// finite and within the attention tier of both the CPU evaluation of the guarded graph and the first-64-key
+/// oracle. Mutation: bound the generated loop by the capacity (`KeyBound::Live` read as `lk` in
+/// `attention_body`); the device consumes the poisoned tail and the output is NaN.
+#[test]
+fn wgpu_live_attention_never_reads_the_poisoned_tail() {
+    let _gpu_guard = gpu_lock();
+    let Some(device) =
+        poot_test_util::device_skip::open_or_skip(DeviceBackend::Wgpu, WgpuDevice::new())
+    else {
+        return;
+    };
+    let target = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(poot_executor::Engine::new(device));
+    let fixture = LiveAttentionFixture {
+        batch: 1,
+        hq: 2,
+        hkv: 1,
+        cap: 4096,
+        dk: 64,
+        dv: 64,
+        shared_dim: None,
+        softcap: None,
+    };
+    let built = fixture.build(true);
+    let inputs = fixture.inputs(&built, &[64], true);
+    let program = staged(&built.graph, target);
+    let planned_live = program.stages().any(|(_, _, stage)| {
+        stage.planned().any(|(eqn, _)| {
+            matches!(stage.kernel_choice(eqn),
+                poot_graph_plan::KernelChoice::Generated(poot_kernelgen::KernelRequest::Attention(spec))
+                    if spec.bound == poot_kernelgen::KeyBound::Live)
+        })
+    });
+    assert!(
+        planned_live,
+        "the plan bounds the attention loop by the live length"
+    );
+    let got =
+        live_attention_step(&mut *exec, target, &built, &inputs).expect("a valid length publishes");
+    assert!(
+        got.iter().all(|x| x.is_finite()),
+        "poison reached the output: {got:?}"
+    );
+    let cpu = poot_eval::eval(
+        &built.graph,
+        &inputs.values(),
+        EvalOptions::new(EvalBudget::UNBOUNDED),
+    )
+    .unwrap()
+    .output
+    .into_host()
+    .unwrap();
+    assert_within("vs the guarded graph", &got, cpu.as_f32().unwrap(), 1e-4);
+    assert_within(
+        "vs the first 64 keys",
+        &got,
+        &fixture.oracle(&inputs, &built, &[64]),
+        1e-4,
+    );
+}
+
+/// SC-004 on wgpu: lengths 0, -1 and capacity + 1 fail through the validation packet exactly as the CPU oracle
+/// does, with nothing published; the endpoints 1 and capacity run and match the oracle. Mutation: widen the
+/// guard's bound in `ops::attention_live` (`lk + 8`); capacity + 1 then publishes.
+#[test]
+fn wgpu_live_attention_rejects_an_out_of_range_length_and_runs_the_endpoints() {
+    let _gpu_guard = gpu_lock();
+    let Some(device) =
+        poot_test_util::device_skip::open_or_skip(DeviceBackend::Wgpu, WgpuDevice::new())
+    else {
+        return;
+    };
+    let target = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(poot_executor::Engine::new(device));
+    let fixture = LiveAttentionFixture {
+        batch: 1,
+        hq: 2,
+        hkv: 1,
+        cap: 9,
+        dk: 8,
+        dv: 8,
+        shared_dim: None,
+        softcap: Some(30.0),
+    };
+    let built = fixture.build(true);
+    for len in [0, -1, 10] {
+        let inputs = fixture.inputs(&built, &[len], false);
+        let result = live_attention_step(&mut *exec, target, &built, &inputs);
+        assert_eq!(
+            contract_failure(result),
+            cpu_failure(&built.graph, &inputs.values()),
+            "len {len}"
+        );
+    }
+    for len in [1, 9] {
+        let inputs = fixture.inputs(&built, &[len], true);
+        let got = live_attention_step(&mut *exec, target, &built, &inputs)
+            .unwrap_or_else(|e| panic!("len {len}: {e:?}"));
+        assert_within(
+            &format!("len {len}"),
+            &got,
+            &fixture.oracle(&inputs, &built, &[len]),
+            1e-4,
+        );
+    }
+}
+
+/// POOT-1040 on wgpu: the live-attention graph with no declared length witness is never proved, so the matcher
+/// declines it and it stays the generic primitives, key ends in exact I32 included. The plan has no attention
+/// kernel, the device runs it, and with NaN in every key and value past the length the output is finite and
+/// within the attention tier of the first-5-key oracle. Mutation: build `LiveKeys::new`'s key ends from an F32
+/// iota plus a `Cast` to I32 (`ops::attention_over_keys`); the plan refuses the F32 -> I32 cast.
+#[test]
+fn wgpu_live_attention_declined_graph_runs_as_primitives() {
+    let _gpu_guard = gpu_lock();
+    let Some(device) =
+        poot_test_util::device_skip::open_or_skip(DeviceBackend::Wgpu, WgpuDevice::new())
+    else {
+        return;
+    };
+    let target = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(poot_executor::Engine::new(device));
+    let fixture = LiveAttentionFixture {
+        batch: 1,
+        hq: 2,
+        hkv: 1,
+        cap: 9,
+        dk: 8,
+        dv: 8,
+        shared_dim: None,
+        softcap: None,
+    };
+    let built = fixture.build(false);
+    let inputs = fixture.inputs(&built, &[5], true);
+    let program = staged(&built.graph, target);
+    let planned_attention = program.stages().any(|(_, _, stage)| {
+        stage.planned().any(|(eqn, _)| {
+            matches!(
+                stage.kernel_choice(eqn),
+                poot_graph_plan::KernelChoice::Generated(poot_kernelgen::KernelRequest::Attention(
+                    _
+                ))
+            )
+        })
+    });
+    assert!(
+        !planned_attention,
+        "the unproved graph stays generic primitives"
+    );
+    let got = live_attention_step(&mut *exec, target, &built, &inputs)
+        .expect("a declined graph runs on the device");
+    assert!(
+        got.iter().all(|x| x.is_finite()),
+        "poison reached the output: {got:?}"
+    );
+    let cpu = poot_eval::eval(
+        &built.graph,
+        &inputs.values(),
+        EvalOptions::new(EvalBudget::UNBOUNDED),
+    )
+    .unwrap()
+    .output
+    .into_host()
+    .unwrap();
+    assert_within("vs the guarded graph", &got, cpu.as_f32().unwrap(), 1e-4);
+    assert_within(
+        "vs the first 5 keys",
+        &got,
+        &fixture.oracle(&inputs, &built, &[5]),
+        1e-4,
+    );
 }

@@ -62,18 +62,6 @@ impl WgpuDevice {
         })
     }
 
-    /// A device for the typed Card 552 timing path: a positive `max_in_flight_queries` requests
-    /// per-dispatch device timestamps on every replay, bounded to that many concurrently un-drained
-    /// query resources (review F3; retention of the *retained* records is the caller engine's job,
-    /// via `TimingOptions`). `0` behaves exactly like [`Self::new`] (counters-only, no query
-    /// resources ever created).
-    pub fn new_with_timing(max_in_flight_queries: usize) -> Result<Self, RuntimeError> {
-        Ok(Self {
-            ctx: Context::new_with_device_timing(max_in_flight_queries)?,
-            open: None,
-        })
-    }
-
     /// Diagnostic counters of the underlying context (bind groups, pipelines, submits).
     pub fn context(&self) -> &Context {
         &self.ctx

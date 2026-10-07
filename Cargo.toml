@@ -41,13 +41,19 @@ members = [
     "benchmarks/runners/poot",
 ]
 
+# Test executables dominate a target dir and ~72% of one is DWARF. `test` inherits `dev`, so this covers both:
+# backtraces keep file and line; variable inspection in gdb/rocgdb needs `CARGO_PROFILE_DEV_DEBUG=2` or a
+# `[profile.dev.package.<crate>] debug = 2` entry (docs/operating-notes.md).
+[profile.dev]
+debug = "line-tables-only"
+
 [workspace.package]
 edition = "2024"
 version = "0.0.0"
 license = "MIT"
 authors = ["Matteo Bernacchia <dev@kikijiki.com>"]
 repository = "https://github.com/kikijiki/poot"
-rust-version = "1.96"
+rust-version = "1.101"
 
 # A bare `#[ignore]` hides why a test is skipped. Every crate opts in with `[lints] workspace = true`.
 [workspace.lints.clippy]
@@ -81,7 +87,6 @@ poot-rocm-runtime = { path = "crates/poot-rocm-runtime" }
 poot-rocm-gpu = { path = "crates/poot-rocm-gpu" }
 poot-vulkan-runtime = { path = "crates/poot-vulkan-runtime" }
 poot-vulkan-device = { path = "crates/poot-vulkan-device" }
-poot-kernel-attr = { path = "crates/poot-kernel-attr" }
 poot-eval = { path = "crates/poot-eval" }
 poot-gpu = { path = "crates/poot-gpu" }
 poot-kernelgen = { path = "crates/poot-kernelgen" }

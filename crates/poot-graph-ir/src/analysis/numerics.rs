@@ -80,11 +80,9 @@ pub enum Tier2Class {
 /// an elementwise op is float arithmetic (a real-device tier-2 class) or an exact-integer op (tier 1).
 fn implied_op_numerics(op: &OpKind, out_dtype: DType) -> NumericsProperty {
     match op {
-        OpKind::Fused(_)
-        | OpKind::FusedRow(_)
-        | OpKind::FlashAttentionDecode { .. }
-        | OpKind::FlashAttentionPrefill { .. }
-        | OpKind::Rope { .. } => NumericsProperty::Reassociating,
+        OpKind::Fused(_) | OpKind::FusedRow(_) | OpKind::Attention(_) | OpKind::Rope { .. } => {
+            NumericsProperty::Reassociating
+        }
         OpKind::PackedDequant { .. }
         | OpKind::PackedContraction { .. }
         | OpKind::PackedRowGather { .. }
@@ -104,12 +102,15 @@ fn implied_op_numerics(op: &OpKind, out_dtype: DType) -> NumericsProperty {
         // The unfused hardware baseline. A contraction or reduction sums in a device-defined order, and
         // a float elementwise chain is another device-executed arithmetic path, so none of them is
         // bit-exact against the CPU oracle.
-        OpKind::MatMul | OpKind::MatMulBias | OpKind::Reduce { .. } => NumericsProperty::Unfused,
-        OpKind::Binary(_) | OpKind::Unary(_) | OpKind::Select
+        OpKind::MatMul | OpKind::ContractionEpilogue { .. } | OpKind::Reduce { .. } => {
+            NumericsProperty::Unfused
+        }
+        OpKind::Binary(_) | OpKind::Unary(_)
             if matches!(out_dtype.class(), DTypeClass::Arithmetic) =>
         {
             NumericsProperty::Unfused
         }
+        // `Select` is a select, not arithmetic: it moves a branch's bits, so it stays exact at any dtype.
         // Movement, I32/quantized elementwise and every other op preserve their operand bits: the
         // exact-integer and exact-I32 paths are the only ones that stay bit-exact on a device.
         _ => NumericsProperty::Exact,
@@ -144,18 +145,15 @@ fn produces_rope(op: &OpKind) -> bool {
 }
 
 fn produces_flash(op: &OpKind) -> bool {
-    matches!(
-        op,
-        OpKind::FlashAttentionDecode { .. } | OpKind::FlashAttentionPrefill { .. }
-    )
+    matches!(op, OpKind::Attention(_))
 }
 
 fn produces_fused(op: &OpKind) -> bool {
     matches!(op, OpKind::Fused(_) | OpKind::FusedRow(_))
 }
 
-fn produces_bias_epilogue(op: &OpKind) -> bool {
-    matches!(op, OpKind::MatMulBias)
+fn produces_contraction_epilogue(op: &OpKind) -> bool {
+    matches!(op, OpKind::ContractionEpilogue { .. })
 }
 
 fn produces_dense_contraction(op: &OpKind) -> bool {
@@ -265,15 +263,6 @@ pub const PASS_DECLARATIONS: &[PassDeclaration] = &[
         property: NumericsProperty::Exact,
         produces: produces_nothing,
     },
-    // Card 557 (R-557-1): the one contraction fuse rule folds `ops::linear`'s broadcast bias add into
-    // its matmul as `MatMulBias`, after the packed claims (which match the unfused chain) and before
-    // `legalize` and the dtype passes (which plan the bias as the epilogue's fixed-F32 operand). The
-    // epilogue adds the bias to the finished dot, the same arithmetic as the unfused add.
-    PassDeclaration {
-        pass: "fuse_bias_epilogues",
-        property: NumericsProperty::Unfused,
-        produces: produces_bias_epilogue,
-    },
     // Card 534a: `compile`'s pipeline runs these four between `dce` and `fuse`, so the folds and the
     // reduce legalization see the traced `MatMul`/`Transpose`, `Cast`/`Gather` and non-last-axis
     // `Reduce` chains before `fuse` could absorb them into a region no target plans.
@@ -297,10 +286,26 @@ pub const PASS_DECLARATIONS: &[PassDeclaration] = &[
         property: NumericsProperty::Narrowing,
         produces: produces_nothing,
     },
+    // The contraction epilogue rule folds a contraction and the pointwise chain that consumes it into one
+    // equation. The lowering rounds the head through its declared dtype and every step through its own, so
+    // the fused result is the unfused program's, bit for bit, on the same schedule: an unfused contraction.
+    PassDeclaration {
+        pass: "fuse_contraction_epilogues",
+        property: NumericsProperty::Unfused,
+        produces: produces_contraction_epilogue,
+    },
     PassDeclaration {
         pass: "fuse",
         property: NumericsProperty::Reassociating,
         produces: produces_fused,
+    },
+    // `fuse_widening_casts` rewrites a region's own steps: the `Cast` of a narrow weight becomes the region's
+    // first step. Widening a narrow float is exact and no op kind is produced that was not already counted, so
+    // the class of the result is read off its ops, as for every pass.
+    PassDeclaration {
+        pass: "fuse_widening_casts",
+        property: NumericsProperty::Exact,
+        produces: produces_nothing,
     },
     // `legalize` needs `Target::caps` (card 522); `compile` (poot-graph-plan) runs it as its own pass,
     // between `dce` and `fuse` (card 523a).

@@ -1,7 +1,7 @@
 //! Card 642: packed decode through the PTX SERVING executor paths (run on
 //! the M4 pod: this box has no NVIDIA GPU).
 //!
-//! A `packed_linear` graph (compiled, so `compile` claims it as one `PackedContraction`) runs through
+//! A `packed_linear` graph (compiled, so `compile` claims it as a `PackedContraction`, or as the packed head of a `ContractionEpilogue`) runs through
 //! the executor contract - a one-shot entry for `run_resident`/`run_prefill`-shaped cases, a
 //! [`common::DecodeEntry`] stepped per token for the capture/replay-shaped cases - with the weight
 //! bound as `Value::Packed` carriers - never a dense f32 copy.
@@ -26,10 +26,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use poot_eval::Value;
+use poot_graph_ir::op::ContractionHead;
 use poot_graph_ir::{
-    BinOp, Builder, Graph, PackedSourceName, RedOp, Slot, StateRole, TensorType, ValueId,
+    BinOp, Builder, Graph, OpKind, PackedSourceName, RedOp, Slot, StateRole, TensorType, ValueId,
 };
-use poot_graph_plan::{CompileOptions, FusionPolicy, Submission, Target, compile};
+use poot_graph_plan::{CompileOptions, Submission, Target, compile};
 use poot_ptx_gpu::PtxDevice;
 use poot_quant::format::{GroupMap, WeightFormat};
 use poot_quant::{PackedComponentRef, PackedPayload};
@@ -73,15 +74,21 @@ fn target(ptx: &PtxDevice) -> Target {
     }
 }
 
-/// Only for the structural assertion (checking the compiled plan carries the expected op); the
-/// executor contract's own `common::run_resident`/`DecodeEntry` stage the raw graph themselves.
+/// Compiles `graph` and asserts `compile` claims the packed linear: as a bare `PackedContraction`, or as the
+/// head of a `ContractionEpilogue` when a single-use pointwise consumer (the captured decode's mask add)
+/// fused into it. The executor contract's own `common::run_resident`/`DecodeEntry` stage the raw graph
+/// themselves.
 fn compiled(ptx: &PtxDevice, graph: &Graph) -> Graph {
     let graph = compiled_graph(ptx, graph);
     assert!(
-        graph
-            .eqns
-            .iter()
-            .any(|eqn| matches!(eqn.op, poot_graph_ir::OpKind::PackedContraction { .. })),
+        graph.eqns.iter().any(|eqn| matches!(
+            eqn.op,
+            OpKind::PackedContraction { .. }
+                | OpKind::ContractionEpilogue {
+                    head: ContractionHead::Packed { .. },
+                    ..
+                }
+        )),
         "compile claims the packed linear"
     );
     graph
@@ -93,7 +100,6 @@ fn compiled_graph(ptx: &PtxDevice, graph: &Graph) -> Graph {
         &target(ptx),
         &CompileOptions {
             execution: Submission::Replay,
-            fusion: FusionPolicy::Full,
             limits: poot_graph_plan::CompileLimits::STANDARD,
         },
     )
@@ -201,13 +207,7 @@ fn packed_decode_through_resident_path_is_bit_exact_on_ptx() {
             seed as u64 + 11,
         ));
         let (graph, x, pos) = slot_decode_graph(owner.weight());
-        assert!(
-            compiled(&ptx, &graph)
-                .eqns
-                .iter()
-                .any(|eqn| matches!(eqn.op, poot_graph_ir::OpKind::PackedContraction { .. })),
-            "compile claims the packed linear"
-        );
+        compiled(&ptx, &graph);
         let weights = carriers(&graph, &owner);
         let path = "decode entry";
         let first_inputs = {
@@ -216,8 +216,7 @@ fn packed_decode_through_resident_path_is_bit_exact_on_ptx() {
             inputs.insert(pos, HostTensor::scalar(0.0).into());
             inputs
         };
-        let mut decode =
-            common::DecodeEntry::capture(&mut ptx, &graph, &first_inputs, FusionPolicy::Full);
+        let mut decode = common::DecodeEntry::capture(&mut ptx, &graph, &first_inputs, false);
         for step in 0..STEPS {
             let k = column(step);
             let mut inputs = weights.clone();
@@ -258,13 +257,7 @@ fn packed_decode_through_capture_and_replay_is_bit_exact_on_ptx() {
             seed as u64 + 47,
         ));
         let graph = captured_decode_graph(owner.weight());
-        assert!(
-            compiled(&ptx, &graph)
-                .eqns
-                .iter()
-                .any(|eqn| matches!(eqn.op, poot_graph_ir::OpKind::PackedContraction { .. })),
-            "compile claims the packed linear"
-        );
+        compiled(&ptx, &graph);
         let mut consts = carriers(&graph, &owner);
         let eye_id = graph
             .inputs
@@ -298,8 +291,7 @@ fn packed_decode_through_capture_and_replay_is_bit_exact_on_ptx() {
         first_inputs.insert(token_id, HostTensor::scalar(column(0) as f32).into());
         first_inputs.insert(pos_id, HostTensor::scalar(0.0).into());
         first_inputs.insert(mask_id, mask.clone().into());
-        let mut decode =
-            common::DecodeEntry::capture(&mut ptx, &graph, &first_inputs, FusionPolicy::Full);
+        let mut decode = common::DecodeEntry::capture(&mut ptx, &graph, &first_inputs, false);
         for step in 0..STEPS {
             let k = column(step);
             let mut inputs = consts.clone();
@@ -341,21 +333,14 @@ fn packed_prefill_through_serving_path_is_bit_exact_on_ptx() {
         );
         let cache_out = b.dynamic_update_slice(cache, y, 0, 0);
         let graph = b.finish_with_state(y, &[(cache, cache_out)]);
-        assert!(
-            compiled(&ptx, &graph)
-                .eqns
-                .iter()
-                .any(|eqn| matches!(eqn.op, poot_graph_ir::OpKind::PackedContraction { .. })),
-            "compile claims the packed linear"
-        );
+        compiled(&ptx, &graph);
         let mut inputs = carriers(&graph, &owner);
         inputs.insert(x.id, one_hot(K, |r| r).into());
         let path = "prefill entry";
         // A one-shot entry (the contract's twin of the pre-549 `run_prefill`): state starts zero
         // (Z5), the one step both computes `y` and commits its whole-cache write, then a probe entry
         // reads the carried result back by name.
-        let mut decode =
-            common::DecodeEntry::capture(&mut ptx, &graph, &inputs, FusionPolicy::Full);
+        let mut decode = common::DecodeEntry::capture(&mut ptx, &graph, &inputs, false);
         let y = decode.step(&graph, &inputs);
         let cache = decode.read_state("decoded", vec![K, OUT]);
         for r in 0..K {
@@ -515,6 +500,292 @@ fn packed_embedding_row_gather_is_bit_exact_on_ptx() {
                         got.to_bits(),
                         want.to_bits(),
                         "{what}: row {r} (id {id}) col {c}: device {got} vs oracle {want}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+// --- SC-001 and SC-003 of POOT-728: dense activations through the packed loaders, and a packed head's epilogue ---
+
+/// The packed formats of the loader rows: the K-quant and block-32 GGUF layouts and the FP8 planar cells (a
+/// per-row and a 128x128-block scale), so the block-storage and planar front ends both serve every row.
+fn loader_formats() -> Vec<WeightFormat> {
+    use poot_quant::format::ScaleEncoding;
+    vec![
+        WeightFormat::Q4_K,
+        WeightFormat::Q8_0,
+        WeightFormat::E4m3PerChannel {
+            scale: ScaleEncoding::Bf16,
+        },
+        WeightFormat::E4m3Block128 {
+            scale: ScaleEncoding::Bf16,
+        },
+    ]
+}
+
+/// A deterministic fill in `[-0.5, 0.5)` with no zero element, so a dropped term changes every output.
+fn fill(seed: u64, count: usize) -> Vec<f32> {
+    let mut s = seed.wrapping_add(0x9E37_79B9_7F4A_7C15) | 1;
+    (0..count)
+        .map(|_| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 40) as f32 / (1u64 << 24) as f32) * 0.9 - 0.45 + 0.05
+        })
+        .collect()
+}
+
+fn oracle(graph: &Graph, inputs: &HashMap<ValueId, Value>) -> HostTensor {
+    poot_eval::eval(
+        graph,
+        inputs,
+        poot_eval::EvalOptions::new(poot_eval::EvalBudget::UNBOUNDED),
+    )
+    .unwrap()
+    .output
+    .into_host()
+    .unwrap()
+}
+
+/// SC-001: Q4_K, Q8_0 and FP8 contractions through the packed loaders meet their tier-2 oracle contract. A
+/// dense activation makes every output a sum over every `K` block, so a dropped block or a wrong scale moves
+/// every element; `m == 1` takes the Gemv schedule and `m == 17` the Tiled schedule (ragged against its tile),
+/// and every output element is compared. Mutation: omit one block's contribution in `DecodePlan`'s address or
+/// scale a factor by a nonzero constant; every row goes red. Runs on the PTX pod.
+#[test]
+fn packed_loaders_match_the_oracle_on_every_output_on_ptx() {
+    let Some(mut ptx) = open_or_skip(DeviceBackend::Ptx, PtxDevice::new()) else {
+        return;
+    };
+    for (seed, format) in loader_formats().into_iter().enumerate() {
+        let owner = Arc::new(poot_test_util::packed::prescribed_scale_payload(
+            format,
+            [OUT, K],
+            seed as u64 + 31,
+        ));
+        for m in [1usize, 17] {
+            let what = format!("{format:?} m={m}");
+            let b = Builder::new();
+            let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![m, K]));
+            let y = poot_graph_ir::ops::packed_linear(&b, x, "layer", owner.weight(), None, None)
+                .unwrap();
+            let graph = b.finish(y);
+            let mut inputs = carriers(&graph, &owner);
+            inputs.insert(
+                x.id,
+                HostTensor::f32(vec![m, K], fill(7 + m as u64, m * K)).into(),
+            );
+            let got = common::run_resident(&mut ptx, &graph, &inputs);
+            let want = oracle(&graph, &inputs);
+            poot_executor_parity::weight_map::assert_close(
+                got.as_f32().unwrap(),
+                want.as_f32().unwrap(),
+                poot_executor_parity::weight_map::TIER2,
+                &what,
+            );
+        }
+    }
+}
+
+/// SC-003, the head half: with an epilogue that cannot be contracted (`head + bias`, no multiply to fuse
+/// with the add), the fused packed Gemv and the standalone one produce bit-identical results, so the head
+/// sum is the same computation in both bodies. Every loader format, a generic and a cancelling bias, at
+/// tolerance 0.0. A format whose decode carries `BinaryOpNoContract` (Q4_K's min term) loses that
+/// protection if the no-contraction marker lands on a different op in the longer fused body, and its fused
+/// head then drifts by an ulp or two. Mutation: place the SPIR-V `NoContraction` decoration by instruction
+/// ordinal, as card 628 first did; the Q4_K row goes red on wgpu while the other formats stay green.
+#[test]
+fn a_packed_gemv_head_is_shared_with_the_unfused_program_on_ptx() {
+    use poot_executor_parity::weight_map::assert_close;
+    use poot_graph_ir::op::BinOp;
+    let Some(mut ptx) = open_or_skip(DeviceBackend::Ptx, PtxDevice::new()) else {
+        return;
+    };
+    for (seed, format) in loader_formats().into_iter().enumerate() {
+        let owner = Arc::new(poot_test_util::packed::prescribed_scale_payload(
+            format,
+            [OUT, K],
+            seed as u64 + 51,
+        ));
+        let what = format!("{format:?}");
+        let activation = HostTensor::f32(
+            vec![1, K],
+            fill(3, K).into_iter().map(|v| v * 0.02).collect(),
+        );
+        let build = |with_bias: bool| {
+            let b = Builder::new();
+            let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![1, K]));
+            let head =
+                poot_graph_ir::ops::packed_linear(&b, x, "layer", owner.weight(), None, None)
+                    .unwrap();
+            if !with_bias {
+                return (b.finish(head), x.id, None);
+            }
+            let bias = b.constant("bias", TensorType::f32(vec![OUT]));
+            let out = b.binary(BinOp::Add, head, bias);
+            (b.finish(out), x.id, Some(bias.id))
+        };
+
+        let (head_graph, head_x, _) = build(false);
+        let mut head_inputs = carriers(&head_graph, &owner);
+        head_inputs.insert(head_x, activation.clone().into());
+        let head = common::run_resident(&mut ptx, &head_graph, &head_inputs);
+        let head = head.as_f32().unwrap().to_vec();
+
+        let (graph, x, bias) = build(true);
+        let bias = bias.unwrap();
+        let heads: Vec<ContractionHead> = compiled_graph(&ptx, &graph)
+            .eqns
+            .iter()
+            .filter_map(|eqn| match &eqn.op {
+                poot_graph_ir::OpKind::ContractionEpilogue { head, .. } => Some(*head),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            matches!(heads.as_slice(), [ContractionHead::Packed { .. }]),
+            "{what}: one fused packed contraction"
+        );
+        for (label, bias_values) in [
+            ("generic bias", fill(4, OUT)),
+            (
+                "cancelling bias",
+                head.iter().map(|v| -v).collect::<Vec<f32>>(),
+            ),
+        ] {
+            let mut inputs = carriers(&graph, &owner);
+            inputs.insert(x, activation.clone().into());
+            inputs.insert(bias, HostTensor::f32(vec![OUT], bias_values).into());
+            let fused = common::run_resident_with_fusion(&mut ptx, &graph, &inputs, false);
+            let unfused = common::run_resident_with_fusion(&mut ptx, &graph, &inputs, true);
+            assert_close(
+                fused.as_f32().unwrap(),
+                unfused.as_f32().unwrap(),
+                0.0,
+                &format!("{what} {label}: fused vs unfused head"),
+            );
+        }
+    }
+}
+
+/// SC-003: a packed head with a pointwise epilogue. `tanh(head + bias) * 0.5 + residual` over the `m == 1` Gemv
+/// forms one `ContractionEpilogue { head: Packed }`, and the fused device program agrees with the unfused one
+/// (same Gemv schedule, the head summed on the device in both). The head itself is bit-identical in both (the
+/// `head_is_shared` row); the epilogue's `bias` add and `0.5` multiply may contract to an FMA in one body and
+/// not the other (`contraction/epilogue.rs` deliberately does not forbid it), so this comparison is 1e-5, and
+/// is sharpened by a cancellation fixture: `bias` is the negated device head, so every pre-activation is within a few ulps of zero
+/// when the epilogue sees each column's completed sum, and the fused result is `residual` to a few ulps of the
+/// head. An epilogue applied to a lane's partial accumulator (before the LDS reduction) adds the bias once per
+/// lane and saturates the activation, moving the result by about half the lane count. Mutation: apply the
+/// epilogue to the per-lane partial before the LDS reduction in `gemv_body`; the cancellation row and the
+/// fused-versus-unfused row go red. Runs on the PTX pod.
+#[test]
+fn a_packed_gemv_epilogue_agrees_with_the_unfused_program_on_ptx() {
+    use poot_executor_parity::weight_map::assert_close;
+    use poot_graph_ir::op::UnOp;
+    use poot_graph_ir::types::Scalar;
+    let Some(mut ptx) = open_or_skip(DeviceBackend::Ptx, PtxDevice::new()) else {
+        return;
+    };
+    for (seed, format) in loader_formats().into_iter().enumerate() {
+        let owner = Arc::new(poot_test_util::packed::prescribed_scale_payload(
+            format,
+            [OUT, K],
+            seed as u64 + 51,
+        ));
+        let what = format!("{format:?}");
+        // Small activations keep the head sums O(1), so the activation does not saturate on the generic bias.
+        let activation = HostTensor::f32(
+            vec![1, K],
+            fill(3, K).into_iter().map(|v| v * 0.02).collect(),
+        );
+        let build = |with_chain: bool| {
+            let b = Builder::new();
+            let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![1, K]));
+            let head =
+                poot_graph_ir::ops::packed_linear(&b, x, "layer", owner.weight(), None, None)
+                    .unwrap();
+            if !with_chain {
+                return (b.finish(head), x.id, None);
+            }
+            let bias = b.constant("bias", TensorType::f32(vec![OUT]));
+            let residual = b.constant("residual", TensorType::f32(vec![1, OUT]));
+            let biased = b.binary(BinOp::Add, head, bias);
+            let activated = b.unary(UnOp::Tanh, biased);
+            let scaled = b.binary_scalar(BinOp::Mul, activated, Scalar::F32(0.5));
+            let out = b.binary(BinOp::Add, scaled, residual);
+            (b.finish(out), x.id, Some((bias.id, residual.id)))
+        };
+
+        // The device head alone, to cancel against.
+        let (head_graph, head_x, _) = build(false);
+        let mut head_inputs = carriers(&head_graph, &owner);
+        head_inputs.insert(head_x, activation.clone().into());
+        let head = common::run_resident(&mut ptx, &head_graph, &head_inputs);
+        let head = head.as_f32().unwrap().to_vec();
+        let head_scale = head.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+
+        let (graph, x, leaves) = build(true);
+        let (bias, residual) = leaves.unwrap();
+        let residual_values = fill(5, OUT);
+        let heads: Vec<ContractionHead> = compiled_graph(&ptx, &graph)
+            .eqns
+            .iter()
+            .filter_map(|eqn| match &eqn.op {
+                poot_graph_ir::OpKind::ContractionEpilogue { head, .. } => Some(*head),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            matches!(heads.as_slice(), [ContractionHead::Packed { .. }]),
+            "{what}: one fused packed contraction"
+        );
+        for (label, bias_values) in [
+            ("generic bias", fill(4, OUT)),
+            (
+                "cancelling bias",
+                head.iter().map(|v| -v).collect::<Vec<f32>>(),
+            ),
+        ] {
+            let mut inputs = carriers(&graph, &owner);
+            inputs.insert(x, activation.clone().into());
+            inputs.insert(bias, HostTensor::f32(vec![OUT], bias_values).into());
+            inputs.insert(
+                residual,
+                HostTensor::f32(vec![1, OUT], residual_values.clone()).into(),
+            );
+            let fused = common::run_resident_with_fusion(&mut ptx, &graph, &inputs, false);
+            let unfused = common::run_resident_with_fusion(&mut ptx, &graph, &inputs, true);
+            assert_close(
+                fused.as_f32().unwrap(),
+                unfused.as_f32().unwrap(),
+                1e-5,
+                &format!("{what} {label}: fused vs unfused"),
+            );
+            if label == "generic bias" {
+                assert_close(
+                    fused.as_f32().unwrap(),
+                    oracle(&graph, &inputs).as_f32().unwrap(),
+                    poot_executor_parity::weight_map::TIER2,
+                    &format!("{what}: fused vs the oracle"),
+                );
+            } else {
+                // With the head cancelled, the result is the residual to a few ulps of the head's size.
+                let tolerance = 64.0 * f32::EPSILON * head_scale.max(1.0);
+                for (index, (&got, &want)) in fused
+                    .as_f32()
+                    .unwrap()
+                    .iter()
+                    .zip(&residual_values)
+                    .enumerate()
+                {
+                    assert!(
+                        (got - want).abs() <= tolerance,
+                        "{what}: column {index}: {got} against the residual {want} (tolerance {tolerance}); \
+                         the epilogue must see each column's completed sum"
                     );
                 }
             }

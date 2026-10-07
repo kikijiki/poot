@@ -149,29 +149,6 @@ pub fn bind_mrope_prefill_positions(
     Ok(())
 }
 
-/// Bind one temporal/height/width tuple into a scalar-decode `[3]` mRoPE slot.
-pub fn bind_mrope_decode_position(
-    graph: &Graph,
-    inputs: &mut HashMap<ValueId, Value>,
-    position: MropePosition,
-) -> Result<(), MropeBindError> {
-    let id = one_mrope_slot(graph)?;
-    let expected = vec![3];
-    let actual = graph.aval(id).shape.clone();
-    if actual != expected {
-        return Err(MropeBindError::Shape {
-            mode: "decode",
-            expected,
-            actual,
-        });
-    }
-    inputs.insert(
-        id,
-        HostTensor::i32(actual, position.packed().to_vec()).into(),
-    );
-    Ok(())
-}
-
 /// Bind one temporal/height/width tuple per row into an axis-major `[3,B]` batched-decode slot.
 /// The complete slot contract is checked before `inputs` is mutated.
 #[cfg(test)]
@@ -223,9 +200,7 @@ mod tests {
     use super::*;
     use poot_graph_ir::{Builder, TensorType};
     use poot_models::mrope::{MropeSegment, build_mrope_position_ids};
-    use poot_models::qwen2::{
-        Qwen2Config, trace_decode_kv_masked_batched, trace_decode_mrope, trace_prefill_mrope,
-    };
+    use poot_models::qwen2::{Qwen2Config, trace_decode_kv_masked_batched, trace_prefill_mrope};
 
     fn tiny_cfg() -> Qwen2Config {
         Qwen2Config {
@@ -267,23 +242,6 @@ mod tests {
     }
 
     #[test]
-    fn mrope_decode_binder_accepts_next_text_position() {
-        let positions = build_mrope_position_ids(&[MropeSegment::Text(3)], 1).unwrap();
-        let graph = trace_decode_mrope(tiny_cfg(), 3);
-        let mut inputs = HashMap::new();
-        bind_mrope_decode_position(&graph, &mut inputs, positions.next_text_position()).unwrap();
-        let id = graph
-            .slots
-            .iter()
-            .find_map(|&(id, slot)| (slot == Slot::MropePosition).then_some(id))
-            .unwrap();
-        assert_eq!(
-            inputs[&id].as_host().expect("dense weight").as_i32(),
-            Some(&[3, 3, 3][..])
-        );
-    }
-
-    #[test]
     fn mrope_binder_rejects_length_shape_and_slot_contract_violations() {
         let positions = build_mrope_position_ids(&[MropeSegment::Text(2)], 1).unwrap();
         let graph = trace_prefill_mrope(tiny_cfg(), 3);
@@ -295,14 +253,6 @@ mod tests {
                     actual: 2,
                 }
             ))
-        );
-
-        let b = Builder::new();
-        let token = b.slot(Slot::Token, TensorType::scalar(DType::I32));
-        let no_mrope = b.finish(token);
-        assert_eq!(
-            bind_mrope_decode_position(&no_mrope, &mut HashMap::new(), MropePosition::collapsed(0)),
-            Err(MropeBindError::MissingSlot)
         );
     }
 
@@ -319,16 +269,6 @@ mod tests {
             Err(MropeBindError::WrongDType { actual: DType::F32 })
         );
         assert!(prefill_inputs.is_empty());
-
-        let b = Builder::new();
-        let slot = b.slot(Slot::MropePosition, TensorType::f32(vec![3]));
-        let decode = b.finish(slot);
-        let mut decode_inputs = HashMap::new();
-        assert_eq!(
-            bind_mrope_decode_position(&decode, &mut decode_inputs, positions.next_text_position()),
-            Err(MropeBindError::WrongDType { actual: DType::F32 })
-        );
-        assert!(decode_inputs.is_empty());
     }
 
     #[test]

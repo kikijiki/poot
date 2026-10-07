@@ -10,6 +10,7 @@
 //! `alibi_decode_flash_fusion.rs`); the flash-op tests here stage the op directly ([`stage_flash`]).
 
 use crate::{EvalBudget, EvalOptions, Value, eval};
+use poot_graph_ir::AttentionAttrs;
 use poot_graph_ir::builder::{Builder, Traced};
 use poot_graph_ir::op::OpKind;
 use poot_graph_ir::ops::attention_masked;
@@ -50,15 +51,11 @@ fn stage_flash(b: &Builder, op: OpKind, [q, k, v, mask]: [Traced; 4]) -> Traced 
 }
 
 fn decode(n_rep: usize, scale: f32) -> OpKind {
-    OpKind::FlashAttentionDecode { n_rep, scale }
+    OpKind::Attention(AttentionAttrs::new(n_rep, scale, None))
 }
 
 fn prefill(n_rep: usize, scale: f32) -> OpKind {
-    OpKind::FlashAttentionPrefill {
-        n_rep,
-        scale,
-        softcap: None,
-    }
+    OpKind::Attention(AttentionAttrs::new(n_rep, scale, None))
 }
 
 /// Hand-computed ALiBi decode mask row, independent of `poot_llm::graphs::alibi_decode_mask_row`
@@ -330,7 +327,7 @@ fn prefill_alibi_ref(
     out
 }
 
-/// Card 259 decode: `OpKind::FlashAttentionDecode` fed a per-head mask `[1,Hq,1,cap]` scores head `h`
+/// Card 259 decode: `OpKind::Attention` fed a per-head mask `[1,Hq,1,cap]` scores head `h`
 /// with its own bias row, matching the hand-rolled reference and the materialized `attention_masked`
 /// decomposition.
 ///
@@ -671,7 +668,7 @@ fn flash_decode_rejects_bad_mask_head_axis() {
     );
     let invalid = g.validate().unwrap_err().to_string();
     assert!(
-        invalid.contains("flash attention mask must be [1, 1, 1, 5], got [1, 2, 1, 5]"),
+        invalid.contains("attention mask must be [1, 1, 1, 5], got [1, 2, 1, 5]"),
         "expected the typed mask operand error, got: {invalid}"
     );
     // Card 554d: `eval` now runs `g.validate()` as its own first step (SC-010's fail-closed
@@ -686,7 +683,7 @@ fn flash_decode_rejects_bad_mask_head_axis() {
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains("flash attention mask must be [1, 1, 1, 5], got [1, 2, 1, 5]"),
+        err.contains("attention mask must be [1, 1, 1, 5], got [1, 2, 1, 5]"),
         "expected the same typed mask error from eval, got: {err}"
     );
 }

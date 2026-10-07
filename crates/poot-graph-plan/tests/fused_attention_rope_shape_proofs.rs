@@ -72,12 +72,7 @@ fn assert_optimize_preserves(name: &str, raw: &Graph, optimized: &Graph) {
 fn flash_ops(g: &Graph) -> Vec<String> {
     g.eqns
         .iter()
-        .filter(|e| {
-            matches!(
-                e.op,
-                OpKind::FlashAttentionDecode { .. } | OpKind::FlashAttentionPrefill { .. }
-            )
-        })
+        .filter(|e| matches!(e.op, OpKind::Attention(_)))
         .map(|e| e.op.name())
         .collect()
 }
@@ -130,8 +125,9 @@ fn prefill_attention(hkv: usize, n_rep: usize, l: usize, d: usize) -> Graph {
 
 /// SC-001 (R467-001, 467 probe p10): K/V with a size-1 head axis (MQA by broadcast) or a size-1 batch axis
 /// (one KV shared by every batch row) is a valid decomposition that the fused decode op would index past.
-/// It stays the decomposition: no flash op, the two attention MatMuls and the unfused dispatch count
-/// remain, and the oracle result equals the raw graph's.
+/// It stays the decomposition: no flash op, the two attention contractions and the unfused softmax
+/// remain (the scale and the mask ride in the score contraction's epilogue), and the oracle result equals
+/// the raw graph's.
 #[test]
 fn broadcast_kv_attention_stays_decomposed_and_matches_the_oracle() {
     let cases = [
@@ -160,16 +156,16 @@ fn broadcast_kv_attention_stays_decomposed_and_matches_the_oracle() {
                 OpKind::MatMul => "matmul",
                 OpKind::Fused(_) => "fused",
                 OpKind::FusedRow(_) => "fused_row",
+                OpKind::ContractionEpilogue { .. } => "contraction_epilogue",
                 _ => "other",
             })
             .collect();
-        // K^T, Q K^T, scale + mask, the softmax max/exp rows, P V.
+        // K^T, Q K^T with the scale and the mask in its epilogue, the softmax max/exp rows, P V.
         assert_eq!(
             kinds,
             [
                 "transpose",
-                "matmul",
-                "fused",
+                "contraction_epilogue",
                 "fused_row",
                 "fused_row",
                 "matmul"
@@ -178,7 +174,7 @@ fn broadcast_kv_attention_stays_decomposed_and_matches_the_oracle() {
         );
         assert_eq!(
             dispatch_count(&optimized),
-            6,
+            5,
             "{name}: optimized dispatches"
         );
         assert_optimize_preserves(name, &raw, &optimized);

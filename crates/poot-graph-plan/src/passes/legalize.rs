@@ -309,7 +309,7 @@ fn transposed_consts<V: ValidationChannel>(g: &Graph<V>) -> HashMap<ValueId, Val
 }
 
 /// Whether `eqn` is an oversized-weight `MatMul` [`split_oversized_matmul_weights`] can rewrite: a
-/// plain `x @ w^T` (not `MatMulBias`, which a bias-fused split is a follow-up card's job) against a 2D
+/// plain `x @ w^T` (not a `ContractionEpilogue`: the epilogue fuse rule runs after this pass) against a 2D
 /// named [`Storage::Const`] weight over `limit`, read through a `[1, 0]` transpose (`transposed`, from
 /// [`transposed_consts`]: the layout every driver-traced dense weight has), with at least two resulting
 /// chunks (a "split" into one chunk is not a rewrite). A matmul that reads a const directly has no

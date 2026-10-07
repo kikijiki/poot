@@ -11,8 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use poot_executor::{
-    Arg, BufferRole, Device, DeviceTime, Dispatch, Engine, Executor, ExecutorStats, NoSync,
-    StepInputs,
+    Arg, BufferRole, Device, Dispatch, Engine, Executor, ExecutorStats, NoSync, StepInputs,
 };
 use poot_graph_plan::{ImportedKernel, Submission};
 use poot_runtime_common::{CompiledKernel, DeviceBackend};
@@ -50,7 +49,9 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
 
 fn f32_values(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
@@ -455,83 +456,6 @@ fn a_kernel_assert_is_a_fault_raised_at_synchronize() {
     device.replay(&recording).unwrap();
     device.synchronize().expect("no fault on in-range indices");
     assert_eq!(read_f32(&mut device, &out), [40.0, 10.0, 30.0, 20.0]);
-}
-
-/// Device time is measured only when the device was built to measure it: a counters-only device reports
-/// `Unknown` after a replay (never a fabricated zero), and a timing device reports one duration per
-/// recorded dispatch, in record order, whose sum is no more than the device span.
-///
-/// Mutations: build the counters-only device with `GraphTiming::PerDispatch` (it reports `Measured`, so the
-/// first assertion goes red); drop the replay's timing (`VulkanDevice::replay` ignores `replay.time`; the
-/// timing device reports `Unknown` and the second goes red).
-#[test]
-fn device_time_is_unknown_without_timing_and_measured_per_dispatch_with_it() {
-    let run = |device: &mut VulkanDevice| {
-        let kernel = add_kernel(device);
-        let n = 1 << 20;
-        let a = f32_buffer(device, BufferRole::Input, &vec![1.0; n]);
-        let b = f32_buffer(device, BufferRole::Input, &vec![2.0; n]);
-        let c = f32_buffer(device, BufferRole::Activation, &vec![0.0; n]);
-        let d = f32_buffer(device, BufferRole::Output, &vec![0.0; n]);
-        device.begin(Submission::Replay).unwrap();
-        for (lhs, dst) in [(&a, &c), (&c, &d), (&d, &c)] {
-            device
-                .dispatch(Dispatch {
-                    kernel: &kernel,
-                    inputs: &[
-                        Arg {
-                            buffer: lhs,
-                            elems: n as u32,
-                        },
-                        Arg {
-                            buffer: &b,
-                            elems: n as u32,
-                        },
-                    ],
-                    output: Arg {
-                        buffer: dst,
-                        elems: n as u32,
-                    },
-                    threads: [n as u32, 1, 1],
-                    workgroup: [64, 1, 1],
-                    work: n as u64,
-                })
-                .unwrap();
-        }
-        let recording = device.finish().unwrap().expect("a recording");
-        device.replay(&recording).unwrap();
-        device.synchronize().unwrap();
-        device.device_time()
-    };
-
-    let Some(mut counters_only) = vulkan() else {
-        return;
-    };
-    assert_eq!(run(&mut counters_only), DeviceTime::Unknown);
-
-    let Some(mut timed) = open_or_skip(DeviceBackend::Vulkan, VulkanDevice::new_with_timing())
-    else {
-        return;
-    };
-    let DeviceTime::Measured(time) = run(&mut timed) else {
-        panic!("a timing device measures the replay");
-    };
-    assert_eq!(
-        time.dispatches.iter().map(|d| d.index).collect::<Vec<_>>(),
-        [0, 1, 2]
-    );
-    let sum = time.sum_of_dispatch_durations.expect("a sum");
-    let span = time.device_span.expect("a span");
-    assert!(!sum.is_zero(), "three 1M-element adds take measurable time");
-    assert_eq!(
-        sum,
-        time.dispatches.iter().map(|d| d.duration).sum(),
-        "the sum is the dispatches' durations"
-    );
-    assert!(
-        sum <= span,
-        "back-to-back dispatches do not overlap: {sum:?} > {span:?}"
-    );
 }
 
 /// The Weight and State roles charge the same live bytes on raw Vulkan and wgpu for the same decode

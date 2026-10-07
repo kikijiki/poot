@@ -7,8 +7,8 @@
 
 use poot_graph_ir::{BinOp, Builder, Graph, OpKind, Operand, RedOp, StateRole, TensorType, Traced};
 use poot_graph_plan::{
-    CompileError, CompileOptions, FusionPolicy, KernelChoice, PlanError, Program, StorageGap,
-    Submission, Target, compile,
+    CompileError, CompileOptions, KernelChoice, PlanError, Program, StorageGap, Submission, Target,
+    compile,
 };
 use poot_kernelgen::{ContractionSpec, KernelRequest};
 use poot_target::{AmdArch, Backend, BufferStorage, DeviceCaps};
@@ -37,13 +37,16 @@ fn target(backend: Backend) -> Target {
     }
 }
 
-fn program(g: &Graph, backend: Backend, fusion: FusionPolicy) -> Program {
+/// `g` compiled for `backend`: the full pipeline, or with `guarded` the routed-expert hang guard (the graph
+/// then carries a routed-expert site and the target has the hang).
+fn program(g: &Graph, backend: Backend, guarded: bool) -> Program {
     let options = CompileOptions {
         execution: Submission::Replay,
-        fusion,
         limits: poot_graph_plan::CompileLimits::STANDARD,
     };
-    compile(g, &target(backend), &options).expect("the graph compiles")
+    let base = target(backend);
+    let (g, caps) = poot_test_util::graph_fixtures::pipeline_input(g, base.caps, guarded);
+    compile(&g, &Target { caps, ..base }, &options).expect("the graph compiles")
 }
 
 /// `matmul(x, transpose(w))`, `w` an F32 `[N, K]` constant.
@@ -63,23 +66,16 @@ fn count(program: &Program, want: impl Fn(&OpKind) -> bool) -> usize {
     program.planned().filter(|(eqn, _)| want(&eqn.op)).count()
 }
 
-/// The generated requests behind one equation's plan, one per chunk.
-fn requests(program: &Program, want: impl Fn(&OpKind) -> bool) -> Vec<&KernelRequest> {
+/// The generated request behind one equation's plan.
+fn request(program: &Program, want: impl Fn(&OpKind) -> bool) -> &KernelRequest {
     let (eqn, _) = program
         .planned()
         .find(|(eqn, _)| want(&eqn.op))
         .expect("the equation is planned");
-    let leaves = match program.kernel_choice(eqn) {
-        KernelChoice::Chunked(chunks) => chunks.iter().collect(),
-        other => vec![other],
-    };
-    leaves
-        .into_iter()
-        .map(|choice| match choice {
-            KernelChoice::Generated(request) => request,
-            other => panic!("expected a generated kernel, got {other:?}"),
-        })
-        .collect()
+    match program.kernel_choice(eqn) {
+        KernelChoice::Generated(request) => request,
+        other => panic!("expected a generated kernel, got {other:?}"),
+    }
 }
 
 fn is_dense_f32(op: &OpKind) -> bool {
@@ -97,7 +93,7 @@ fn is_dense_f32(op: &OpKind) -> bool {
 fn checkpoint_orientation_projection_plans_one_dense_contraction_and_no_transpose() {
     for backend in backends() {
         for m in [1, 4, 33] {
-            let program = program(&projection(m), backend, FusionPolicy::Full);
+            let program = program(&projection(m), backend, false);
             let label = format!("{backend:?} M={m}: {:?}", op_names(&program));
             assert_eq!(count(&program, is_dense_f32), 1, "{label}");
             assert_eq!(
@@ -110,34 +106,34 @@ fn checkpoint_orientation_projection_plans_one_dense_contraction_and_no_transpos
                 0,
                 "{label}"
             );
-            let requests = requests(&program, is_dense_f32);
+            let request = request(&program, is_dense_f32);
             let gemv = m == 1;
             assert!(
-                requests.iter().all(|request| match request {
+                match request {
                     KernelRequest::Contraction(ContractionSpec::DenseGemv { .. }) => gemv,
                     KernelRequest::Contraction(ContractionSpec::DenseTiled { .. }) => !gemv,
                     _ => false,
-                }),
-                "{label}: {requests:?}"
+                },
+                "{label}: {request:?}"
             );
         }
     }
 }
 
-/// The same projection under `FusionPolicy::MoeHangGuard` keeps off the tiled GEMM (cards 186/192), so an
+/// The same projection under `true` keeps off the tiled GEMM (cards 186/192), so an
 /// `M > 1` contraction takes the one-thread-per-output `[N, K]` kernel.
 #[test]
 fn checkpoint_orientation_projection_under_the_moe_hang_guard_is_serial() {
     for backend in backends() {
-        let program = program(&projection(33), backend, FusionPolicy::MoeHangGuard);
+        let program = program(&projection(33), backend, true);
         assert_eq!(count(&program, is_dense_f32), 1, "{backend:?}");
-        let requests = requests(&program, is_dense_f32);
+        let request = request(&program, is_dense_f32);
         assert!(
-            requests.iter().all(|request| matches!(
+            matches!(
                 request,
                 KernelRequest::Contraction(ContractionSpec::DenseSerial { .. })
-            )),
-            "{backend:?}: {requests:?}"
+            ),
+            "{backend:?}: {request:?}"
         );
     }
 }
@@ -159,7 +155,7 @@ fn a_transposed_weight_with_a_second_consumer_keeps_the_transpose_and_the_matmul
     let total = b.binary(BinOp::Add, row_sums, column_sums);
     let g = b.finish(total);
     for backend in backends() {
-        let program = program(&g, backend, FusionPolicy::Full);
+        let program = program(&g, backend, false);
         let label = format!("{backend:?}: {:?}", op_names(&program));
         assert_eq!(count(&program, is_dense_f32), 0, "{label}");
         assert!(
@@ -191,7 +187,7 @@ fn a_transposed_weight_that_escapes_the_graph_keeps_the_transpose_and_the_matmul
     let y = b.matmul(x, wt);
     let g = b.finish_with_state(y, &[(kept, wt)]);
     for backend in backends() {
-        let program = program(&g, backend, FusionPolicy::Full);
+        let program = program(&g, backend, false);
         let label = format!("{backend:?}: {:?}", op_names(&program));
         assert_eq!(count(&program, is_dense_f32), 0, "{label}");
         assert!(
@@ -228,7 +224,7 @@ fn is_dense_f16(op: &OpKind) -> bool {
 
 /// The weight-operand storage every request of the contraction names, and the storage the program planned for
 /// that weight value.
-fn weight_storages(program: &Program) -> (Vec<BufferStorage>, BufferStorage) {
+fn weight_storages(program: &Program) -> (BufferStorage, BufferStorage) {
     let (eqn, _) = program
         .planned()
         .find(|(eqn, _)| is_dense_f16(&eqn.op))
@@ -236,17 +232,14 @@ fn weight_storages(program: &Program) -> (Vec<BufferStorage>, BufferStorage) {
     let Operand::Value(weight) = eqn.inputs[1] else {
         panic!("the weight operand is a value");
     };
-    let named = requests(program, is_dense_f16)
-        .into_iter()
-        .map(|request| match request {
-            KernelRequest::Contraction(
-                ContractionSpec::DenseGemv { weight, .. }
-                | ContractionSpec::DenseTiled { weight, .. }
-                | ContractionSpec::DenseSerial { weight, .. },
-            ) => *weight,
-            other => panic!("expected a dense-contraction request, got {other:?}"),
-        })
-        .collect();
+    let named = match request(program, is_dense_f16) {
+        KernelRequest::Contraction(
+            ContractionSpec::DenseGemv { weight, .. }
+            | ContractionSpec::DenseTiled { weight, .. }
+            | ContractionSpec::DenseSerial { weight, .. },
+        ) => *weight,
+        other => panic!("expected a dense-contraction request, got {other:?}"),
+    };
     (named, program.storage().storage(weight).buffer_storage())
 }
 
@@ -262,7 +255,7 @@ fn weight_storages(program: &Program) -> (Vec<BufferStorage>, BufferStorage) {
 fn an_f16_checkpoint_projection_plans_one_packed_dense_contraction_and_no_transpose() {
     for backend in backends() {
         for m in [1, 4, 33] {
-            let program = program(&f16_projection(m), backend, FusionPolicy::Full);
+            let program = program(&f16_projection(m), backend, false);
             let label = format!("{backend:?} M={m}: {:?}", op_names(&program));
             assert_eq!(count(&program, is_dense_f16), 1, "{label}");
             assert_eq!(
@@ -276,43 +269,43 @@ fn an_f16_checkpoint_projection_plans_one_packed_dense_contraction_and_no_transp
                 "{label}"
             );
             let gemv = m == 1;
-            let requests = requests(&program, is_dense_f16);
+            let request = request(&program, is_dense_f16);
             assert!(
-                requests.iter().all(|request| match request {
+                match request {
                     KernelRequest::Contraction(ContractionSpec::DenseGemv { .. }) => gemv,
                     KernelRequest::Contraction(ContractionSpec::DenseTiled { .. }) => !gemv,
                     _ => false,
-                }),
-                "{label}: {requests:?}"
+                },
+                "{label}: {request:?}"
             );
             let (named, planned) = weight_storages(&program);
             assert_eq!(planned, BufferStorage::f16_packed(), "{label}");
-            assert!(
-                named.iter().all(|&storage| storage == planned),
-                "{label}: requests name {named:?}, the weight is planned {planned}"
+            assert_eq!(
+                named, planned,
+                "{label}: the request names {named:?}, the weight is planned {planned}"
             );
         }
     }
 }
 
-/// Card 1007: under `FusionPolicy::MoeHangGuard` the F16 contraction at `M > 1` takes the one-thread-per-output
+/// Card 1007: under `true` the F16 contraction at `M > 1` takes the one-thread-per-output
 /// `[N, K]` kernel, reading the same packed weight.
 #[test]
 fn an_f16_checkpoint_projection_under_the_moe_hang_guard_is_serial_over_packed_words() {
     for backend in backends() {
-        let program = program(&f16_projection(33), backend, FusionPolicy::MoeHangGuard);
+        let program = program(&f16_projection(33), backend, true);
         assert_eq!(count(&program, is_dense_f16), 1, "{backend:?}");
-        let requests = requests(&program, is_dense_f16);
+        let request = request(&program, is_dense_f16);
         assert!(
-            requests.iter().all(|request| matches!(
+            matches!(
                 request,
                 KernelRequest::Contraction(ContractionSpec::DenseSerial { .. })
-            )),
-            "{backend:?}: {requests:?}"
+            ),
+            "{backend:?}: {request:?}"
         );
         let (named, planned) = weight_storages(&program);
         assert_eq!(planned, BufferStorage::f16_packed(), "{backend:?}");
-        assert_eq!(named, vec![planned], "{backend:?}");
+        assert_eq!(named, planned, "{backend:?}");
     }
 }
 
@@ -334,7 +327,6 @@ fn an_f16_weight_with_a_second_reader_is_not_folded() {
     let g = b.finish(total);
     let options = CompileOptions {
         execution: Submission::Replay,
-        fusion: FusionPolicy::Full,
         limits: poot_graph_plan::CompileLimits::STANDARD,
     };
     for backend in backends() {
@@ -390,7 +382,6 @@ fn a_packed_f16_weight_with_a_native_reader_is_a_typed_refusal() {
     matmul.inputs[1] = Operand::Value(w.id);
     let options = CompileOptions {
         execution: Submission::Replay,
-        fusion: FusionPolicy::Full,
         limits: poot_graph_plan::CompileLimits::STANDARD,
     };
     for backend in backends() {
@@ -408,6 +399,228 @@ fn a_packed_f16_weight_with_a_native_reader_is_a_typed_refusal() {
                 "{backend:?}: compiled a shared packed weight: {:?}",
                 op_names(&program)
             ),
+        }
+    }
+}
+
+/// `(x @ w^T + bias) + residual`, `w` a `[N, K]` constant of dtype `weight`: the shape of a biased projection
+/// feeding a residual connection.
+fn biased_residual_projection(m: usize, weight: DType) -> Graph {
+    let b = Builder::new();
+    let x = b.constant("x", TensorType::f32(vec![m, K]));
+    let w = b.constant("w", TensorType::new(vec![N, K], weight));
+    let bias = b.constant("bias", TensorType::f32(vec![N]));
+    let residual = b.constant("residual", TensorType::f32(vec![m, N]));
+    let projection = b.matmul(x, b.transpose(w, vec![1, 0]));
+    let out = b.binary(BinOp::Add, b.binary(BinOp::Add, projection, bias), residual);
+    b.finish(out)
+}
+
+/// POOT-1032: a dense head with a bias and a residual plans ONE `ContractionEpilogue` at every `M`, on every
+/// backend and for an F32 and a BF16 weight: the decode Gemv at `M = 1`, the generated tiled GEMM above it (a
+/// single partial row-tile at `M = 5`, many at `M = 160`). The epilogue carries both steps and both leaves in the
+/// store, so no standalone add is dispatched and no head result round-trips through memory.
+///
+/// Mutation: make `epilogue_head_lowers` answer `dense_decode_gemv_in(..).is_some()` for a dense head (the
+/// pre-1032 gate); at `M > 1` the rule leaves the head and both adds apart and this row goes red.
+#[test]
+fn a_biased_residual_dense_head_is_one_epilogue_contraction_at_every_m() {
+    for backend in backends() {
+        for weight in [DType::F32, DType::BF16] {
+            for m in [1, 5, 160] {
+                let program = program(&biased_residual_projection(m, weight), backend, false);
+                let label = format!("{backend:?} {weight:?} M={m}: {:?}", op_names(&program));
+                let is_head = |op: &OpKind| {
+                    matches!(
+                        op,
+                        OpKind::ContractionEpilogue {
+                            head: poot_graph_ir::op::ContractionHead::Dense { weight: stored },
+                            ..
+                        } if *stored == weight
+                    )
+                };
+                assert_eq!(program.planned().count(), 1, "{label}");
+                assert_eq!(count(&program, is_head), 1, "{label}");
+                match request(&program, is_head) {
+                    KernelRequest::Contraction(ContractionSpec::DenseGemv {
+                        epilogue: Some(epilogue),
+                        ..
+                    }) if m == 1 => assert_eq!(epilogue.steps.len(), 2, "{label}"),
+                    KernelRequest::Contraction(ContractionSpec::DenseTiled {
+                        epilogue: Some(epilogue),
+                        ..
+                    }) if m > 1 => {
+                        assert_eq!(epilogue.steps.len(), 2, "{label}");
+                        assert_eq!(epilogue.leaves.len(), 2, "{label}");
+                    }
+                    other => panic!("{label}: {other:?}"),
+                }
+            }
+        }
+    }
+}
+
+/// POOT-1036: a plain `MatMul` head over an f32 `[K, N]` weight at `M > 1` (the non-checkpoint route, the
+/// generated tiled GEMM) with a bias and a residual plans ONE `ContractionEpilogue { head: MatMul }` whose
+/// `TiledRegion` carries both steps and both leaves, on every backend; the `MoeHangGuard` policy keeps the
+/// head and both adds apart.
+///
+/// Mutation: make `epilogue_head_lowers` accept only `MatMulRoute::Serial` for a `MatMul` head (the pre-1036
+/// gate); the head and both adds stay apart and this row goes red.
+#[test]
+fn a_biased_residual_tiled_matmul_head_is_one_epilogue_contraction() {
+    for backend in backends() {
+        for m in [5, 160] {
+            let b = Builder::new();
+            let x = b.constant("x", TensorType::f32(vec![m, K]));
+            let w = b.constant("w", TensorType::f32(vec![K, N]));
+            let bias = b.constant("bias", TensorType::f32(vec![N]));
+            let residual = b.constant("residual", TensorType::f32(vec![m, N]));
+            let head = b.matmul(x, w);
+            let out = b.binary(BinOp::Add, b.binary(BinOp::Add, head, bias), residual);
+            let g = b.finish(out);
+            let fused = program(&g, backend, false);
+            let label = format!("{backend:?} M={m}: {:?}", op_names(&fused));
+            let is_head = |op: &OpKind| {
+                matches!(
+                    op,
+                    OpKind::ContractionEpilogue {
+                        head: poot_graph_ir::op::ContractionHead::MatMul,
+                        ..
+                    }
+                )
+            };
+            assert_eq!(fused.planned().count(), 1, "{label}");
+            assert_eq!(count(&fused, is_head), 1, "{label}");
+            match request(&fused, is_head) {
+                KernelRequest::Contraction(ContractionSpec::TiledRegion {
+                    epilogue: Some(epilogue),
+                    ..
+                }) => {
+                    assert_eq!(epilogue.steps.len(), 2, "{label}");
+                    assert_eq!(epilogue.leaves.len(), 2, "{label}");
+                }
+                other => panic!("{label}: {other:?}"),
+            }
+            let unfused = program(&g, backend, true);
+            assert_eq!(unfused.planned().count(), 3, "{label}: guard keeps 3 eqns");
+        }
+    }
+}
+
+/// `(x @ w + bias) + residual` with `x: [xs]`, `w: [ws]` of `head_dtype` (bias and residual of the head's dtype
+/// and the output's shape), the shape of a `MatMul` head the generated tiled GEMM must not take.
+fn biased_residual_matmul(xs: Vec<usize>, ws: Vec<usize>, head_dtype: DType) -> Graph {
+    let b = Builder::new();
+    let x = b.constant("x", TensorType::new(xs.clone(), head_dtype));
+    let w = b.constant("w", TensorType::new(ws.clone(), head_dtype));
+    let n = *ws.last().unwrap();
+    let mut out_shape = xs;
+    *out_shape.last_mut().unwrap() = n;
+    let bias = b.constant("bias", TensorType::new(vec![n], head_dtype));
+    let residual = b.constant("residual", TensorType::new(out_shape, head_dtype));
+    let out = b.binary(
+        BinOp::Add,
+        b.binary(BinOp::Add, b.matmul(x, w), bias),
+        residual,
+    );
+    b.finish(out)
+}
+
+/// POOT-1036: only an f32 `[K, N]` `MatMul` head above one row takes the generated tiled GEMM with an epilogue.
+/// Every other `MatMul` head keeps the plan it would get without one, so no head loses its schedule to a fused store:
+/// an F16 or BF16 head is not tileable (the body is f32-only) and fuses on its serial dtype-generic body (BF16 is
+/// refused on SPIR-V, which has no scalar bf16); a rank-3 weight takes the imported batched tiled GEMM on SPIR-V and
+/// PTX, which carries no epilogue, so its chain stays apart there (AMD plans it serially, fused); `M == 1` is the
+/// decode GEMV and keeps its chain everywhere.
+///
+/// Mutation: drop the F32-operand clause, the rank-2-weight clause or the `M > 1` clause of
+/// `is_tileable_matmul_in` (each lets the matcher admit the head onto the tiled GEMM); the matching case then plans
+/// a `TiledRegion` or loses its kept chain and this row goes red.
+#[test]
+fn a_matmul_head_off_the_tiled_route_never_takes_the_tiled_epilogue() {
+    /// What a case plans on a backend.
+    enum Plan {
+        /// Head and chain stay apart (`matmul` then `fused`).
+        ChainKept,
+        /// One `ContractionEpilogue` on the serial body.
+        SerialEpilogue,
+        /// The planner refuses the head by name.
+        Refused,
+    }
+    use Plan::{ChainKept, Refused, SerialEpilogue};
+    let cases = [
+        (
+            "f16 head",
+            biased_residual_matmul(vec![5, K], vec![K, N], DType::F16),
+            [SerialEpilogue, SerialEpilogue, SerialEpilogue],
+        ),
+        (
+            "bf16 head",
+            biased_residual_matmul(vec![5, K], vec![K, N], DType::BF16),
+            [Refused, SerialEpilogue, SerialEpilogue],
+        ),
+        (
+            "rank-3 weight",
+            biased_residual_matmul(vec![2, 5, K], vec![2, K, N], DType::F32),
+            [ChainKept, ChainKept, SerialEpilogue],
+        ),
+        (
+            "M == 1",
+            biased_residual_matmul(vec![1, K], vec![K, N], DType::F32),
+            [ChainKept, ChainKept, ChainKept],
+        ),
+    ];
+    let options = CompileOptions {
+        execution: Submission::Replay,
+        limits: poot_graph_plan::CompileLimits::STANDARD,
+    };
+    for (name, graph, expected) in &cases {
+        for (backend, expected) in backends().into_iter().zip(expected) {
+            let label = format!("{name} on {backend:?}");
+            let program = match (compile(graph, &target(backend), &options), expected) {
+                (Err(CompileError::Plan(_)), Refused) => continue,
+                (Ok(program), ChainKept | SerialEpilogue) => program,
+                (other, _) => panic!("{label}: unexpected compile result {:?}", other.err()),
+            };
+            for (eqn, _) in program.planned() {
+                assert!(
+                    !matches!(
+                        program.kernel_choice(eqn),
+                        KernelChoice::Generated(KernelRequest::Contraction(
+                            ContractionSpec::TiledRegion { .. }
+                        ))
+                    ),
+                    "{label}: {:?} took the generated tiled GEMM",
+                    op_names(&program)
+                );
+            }
+            let fused = count(&program, |op| {
+                matches!(op, OpKind::ContractionEpilogue { .. })
+            });
+            match expected {
+                ChainKept => {
+                    assert_eq!(fused, 0, "{label}: {:?}", op_names(&program));
+                    assert_eq!(program.planned().count(), 2, "{label}: head and chain");
+                }
+                SerialEpilogue => {
+                    assert_eq!(fused, 1, "{label}: {:?}", op_names(&program));
+                    assert!(
+                        matches!(
+                            request(&program, |op| matches!(
+                                op,
+                                OpKind::ContractionEpilogue { .. }
+                            )),
+                            KernelRequest::Contraction(ContractionSpec::Serial {
+                                epilogue: Some(_),
+                                ..
+                            })
+                        ),
+                        "{label}: the serial body carries the epilogue"
+                    );
+                }
+                Refused => unreachable!("a refusal continues above"),
+            }
         }
     }
 }

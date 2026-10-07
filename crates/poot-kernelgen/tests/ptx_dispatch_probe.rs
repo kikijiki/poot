@@ -13,6 +13,7 @@
 use poot_codegen::{Target, artifact_path, compile};
 use poot_kernelgen as kg;
 use poot_ptx_runtime::PtxContext;
+use poot_test_util::kernel_fixtures::{attention_reference, attention_reference_keys};
 
 /// Encode f32 -> f16 bytes (little-endian), reusing the loader's own f32->f16 narrowing
 /// (`poot_load::gguf::f32_to_f16`), matching `coopmat_dispatch_probe.rs`'s helper.
@@ -96,122 +97,140 @@ fn wmma_tile_dispatches_and_matches_cpu_on_ptx() {
     eprintln!("wmma_tile [16x16]@[16x16] OK on real PTX WMMA (max_abs={max_abs:.3e})");
 }
 
-/// card 674: `flash_attention_decode` is NVPTX-only (its `o[D]` private array crashes SPIR-V), so a real
-/// PTX dispatch is the only hardware check this kernel ever gets; `flash_interp.rs`'s sibling test only
-/// proves the kernel-IR recipe, not NVPTX codegen/JIT. Position 0 is masked with TRUE `-inf` while the
-/// running max is still `-inf` (nothing seen yet): the un-guarded recurrence computed
-/// `exp(-inf - -inf) = NaN` here (card 674's fix in `poot-kernelgen/src/flash.rs` routes around it).
-#[allow(clippy::too_many_arguments)]
-fn flash_decode_ref(
-    q: &[f32],
-    k: &[f32],
-    v: &[f32],
-    mask: &[f32],
-    hq: usize,
-    n_rep: usize,
-    cap: usize,
-    d: usize,
-    scale: f32,
+/// Generate `spec` for a PTX device, compile it to PTX and run it on `ctx` over its own launch.
+fn run_attention_on_ptx(
+    ctx: &PtxContext,
+    name: &str,
+    spec: &kg::AttentionSpec,
+    operands: [&[f32]; 4],
 ) -> Vec<f32> {
-    let mut out = vec![0.0f32; hq * d];
-    for h in 0..hq {
-        let kv = h / n_rep;
-        let mut m = f32::NEG_INFINITY;
-        let mut l = 0.0f32;
-        let mut o = vec![0.0f32; d];
-        for t in 0..cap {
-            let mut s = 0.0f32;
-            for dd in 0..d {
-                s += q[h * d + dd] * k[kv * cap * d + t * d + dd];
-            }
-            s = s * scale + mask[t];
-            let m_new = m.max(s);
-            let (corr, e) = if m_new == f32::NEG_INFINITY {
-                (0.0, 0.0)
-            } else {
-                ((m - m_new).exp(), (s - m_new).exp())
-            };
-            l = l * corr + e;
-            for dd in 0..d {
-                o[dd] = o[dd] * corr + e * v[kv * cap * d + t * d + dd];
-            }
-            m = m_new;
-        }
-        for dd in 0..d {
-            out[h * d + dd] = o[dd] / l;
-        }
-    }
-    out
+    run_attention_over_keys_on_ptx(ctx, name, spec, operands, None, None)
 }
 
+/// [`run_attention_on_ptx`] with a split key's shared part and a live bound's per-row lengths, the kernel's
+/// parameters after `mask` in that order.
+fn run_attention_over_keys_on_ptx(
+    ctx: &PtxContext,
+    name: &str,
+    spec: &kg::AttentionSpec,
+    [q, k, v, mask]: [&[f32]; 4],
+    k_shared: Option<&[f32]>,
+    len: Option<&[i32]>,
+) -> Vec<f32> {
+    let limits = kg::BodyLimits {
+        max_instructions: std::num::NonZeroUsize::new(1 << 22).unwrap(),
+        max_locals: std::num::NonZeroUsize::new(1 << 18).unwrap(),
+    };
+    let generated = kg::generate(
+        &kg::KernelRequest::Attention(spec.clone()),
+        &poot_target::DeviceCaps::ptx_default(),
+        &limits,
+    )
+    .expect("the attention request generates");
+    let body = generated.body;
+    let dir = std::env::temp_dir().join("poot-ptx-attention-dispatch-probe");
+    std::fs::create_dir_all(&dir).unwrap();
+    let out_path = artifact_path(&dir, name, Target::Nvptx);
+    compile(&body, Target::Nvptx, &out_path).expect("the attention kernel must compile to PTX");
+    let ptx_bytes = std::fs::read(&out_path).expect("read compiled PTX");
+    let kernel = poot_codegen::kernel_handle(&body, Target::Nvptx, ptx_bytes);
+
+    let q_buf = ctx.upload_f32(q).expect("upload q");
+    let k_buf = ctx.upload_f32(k).expect("upload k");
+    let v_buf = ctx.upload_f32(v).expect("upload v");
+    let mask_buf = ctx.upload_f32(mask).expect("upload mask");
+    let shared_buf = k_shared.map(|data| ctx.upload_f32(data).expect("upload k_shared"));
+    let len_buf = len.map(|data| ctx.upload_i32(data).expect("upload len"));
+    let out_len = spec.batch * spec.hq * spec.lq * spec.dv;
+    let out_buf = ctx.alloc_f32(out_len).expect("allocate out");
+    let mut buffers = vec![&q_buf, &k_buf, &v_buf, &mask_buf];
+    buffers.extend(shared_buf.as_ref());
+    buffers.extend(len_buf.as_ref());
+    let counts: Vec<u32> = buffers.iter().map(|buffer| buffer.elem_count()).collect();
+    ctx.dispatch_dev(
+        name,
+        &kernel,
+        body.workgroup_size,
+        generated.launch.grid,
+        &buffers,
+        &counts,
+        &out_buf,
+        out_buf.elem_count(),
+    )
+    .unwrap_or_else(|e| panic!("{name}: real PTX attention dispatch: {e:?}"));
+    ctx.download_f32(&out_buf).expect("download out")
+}
+
+fn attention_fill(n: usize, seed: u64) -> Vec<f32> {
+    let mut s = seed | 1;
+    (0..n)
+        .map(|_| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 40) as f32) / ((1u64 << 23) as f32) - 1.0
+        })
+        .collect()
+}
+
+/// The streaming attention spec for `[batch, hq, lq, d]` queries against `lk` keys, `hq / n_rep` kv heads.
+#[allow(clippy::too_many_arguments)]
+fn attention_spec(
+    (batch, hq, n_rep, lq, lk, d): (usize, usize, usize, usize, usize, usize),
+    lanes: usize,
+    mask: kg::MaskKind,
+    score: kg::ScoreTransform,
+) -> kg::AttentionSpec {
+    kg::AttentionSpec {
+        batch,
+        hq,
+        n_rep,
+        lq,
+        lk,
+        dk: d,
+        dv: d,
+        key: kg::KeyLayout::Single,
+        score,
+        mask,
+        bound: kg::KeyBound::Static,
+        schedule: kg::AttentionSchedule::Streaming { lanes },
+    }
+}
+
+/// A real PTX dispatch of the generated attention kernel, the only hardware check of its NVPTX codegen: the
+/// kernel-IR interpreter rows prove the recipe, not the lowering or the JIT. Position 0 is masked with TRUE
+/// `-inf` while every lane's running maximum is still `-inf`, and 4 lanes share 2 keys so two lanes see no
+/// key at all: the unguarded recurrence computed `exp(-inf - -inf) = NaN` for both.
 #[test]
-fn flash_decode_leading_true_inf_mask_dispatches_and_matches_cpu_on_ptx() {
+fn attention_leading_true_inf_mask_dispatches_and_matches_cpu_on_ptx() {
     let ctx = match PtxContext::new() {
         Ok(ctx) => ctx,
         Err(e) => {
             eprintln!(
-                "SKIP flash_decode_leading_true_inf_mask_dispatches_and_matches_cpu_on_ptx: no PTX device ({e})"
+                "SKIP attention_leading_true_inf_mask_dispatches_and_matches_cpu_on_ptx: no PTX device ({e})"
             );
             return;
         }
     };
-
     let (hq, n_rep, cap, d) = (2usize, 1usize, 2usize, 4usize);
-    let hkv = hq / n_rep;
-    let scale = 0.5f32;
-    let fill = |n: usize, seed: u64| -> Vec<f32> {
-        let mut s = seed | 1;
-        (0..n)
-            .map(|_| {
-                s ^= s << 13;
-                s ^= s >> 7;
-                s ^= s << 17;
-                ((s >> 40) as f32) / ((1u64 << 23) as f32) - 1.0
-            })
-            .collect()
-    };
-    let q = fill(hq * d, 21);
-    let k = fill(hkv * cap * d, 22);
-    let v = fill(hkv * cap * d, 23);
+    let spec = attention_spec(
+        (1, hq, n_rep, 1, cap, d),
+        4,
+        kg::MaskKind::Broadcast,
+        kg::ScoreTransform::Scale {
+            scale_bits: 0.5f32.to_bits(),
+        },
+    );
+    let q = attention_fill(hq * d, 21);
+    let k = attention_fill(hq / n_rep * cap * d, 22);
+    let v = attention_fill(hq / n_rep * cap * d, 23);
     let mask = vec![f32::NEG_INFINITY, 0.0];
-
-    let body = kg::flash_attention_decode("flash_decode", hq, n_rep, cap, d, scale, false);
-    let dir = std::env::temp_dir().join("poot-ptx-flash-decode-dispatch-probe");
-    std::fs::create_dir_all(&dir).unwrap();
-    let out_path = artifact_path(&dir, "flash_decode_ptx", Target::Nvptx);
-    compile(&body, Target::Nvptx, &out_path).expect("flash_attention_decode must compile to PTX");
-    let ptx_bytes = std::fs::read(&out_path).expect("read compiled PTX");
-    let kernel = poot_codegen::kernel_handle(&body, Target::Nvptx, ptx_bytes);
-
-    let q_buf = ctx.upload_f32(&q).expect("upload q");
-    let k_buf = ctx.upload_f32(&k).expect("upload k");
-    let v_buf = ctx.upload_f32(&v).expect("upload v");
-    let mask_buf = ctx.upload_f32(&mask).expect("upload mask");
-    let out_buf = ctx.alloc_f32(hq * d).expect("allocate out");
-
-    ctx.dispatch_dev(
-        "flash_decode_ptx",
-        &kernel,
-        body.workgroup_size,
-        [hq as u32, 1, 1],
-        &[&q_buf, &k_buf, &v_buf, &mask_buf],
-        &[
-            q_buf.elem_count(),
-            k_buf.elem_count(),
-            v_buf.elem_count(),
-            mask_buf.elem_count(),
-        ],
-        &out_buf,
-        out_buf.elem_count(),
-    )
-    .expect("real PTX flash_attention_decode dispatch");
-    let got = ctx.download_f32(&out_buf).expect("download out");
-
+    let got = run_attention_on_ptx(&ctx, "attention_ptx", &spec, [&q, &k, &v, &mask]);
     assert!(
         got.iter().all(|x| x.is_finite()),
-        "flash_attention_decode produced non-finite output on real PTX with a leading true-inf mask: {got:?}"
+        "the attention kernel produced non-finite output on real PTX with a leading true-inf mask: {got:?}"
     );
-    let want = flash_decode_ref(&q, &k, &v, &mask, hq, n_rep, cap, d, scale);
+    let want = attention_reference(&spec, &q, &k, &v, &mask);
     let max_abs = got
         .iter()
         .zip(&want)
@@ -219,9 +238,222 @@ fn flash_decode_leading_true_inf_mask_dispatches_and_matches_cpu_on_ptx() {
         .fold(0.0f32, f32::max);
     assert!(
         max_abs < 1e-4,
-        "flash_attention_decode PTX mismatch: got {got:?} want {want:?} (max_abs={max_abs:.3e})"
+        "attention PTX mismatch: got {got:?} want {want:?} (max_abs={max_abs:.3e})"
     );
-    eprintln!(
-        "flash_attention_decode leading-true-inf-mask OK on real PTX (max_abs={max_abs:.3e})"
+    eprintln!("attention leading-true-inf-mask OK on real PTX (max_abs={max_abs:.3e})");
+}
+
+/// The fixture bank on real PTX, each row with more keys than lanes so lanes walk several keys and the
+/// running state is rescaled between them: Llama GQA decode at `B = 1` and `B = 4` (D = 64, 64 lanes over 200
+/// keys), D = 512 decode (16 lanes over 96 keys, the head width SPIR-V used to refuse), a softcapped Gemma-style
+/// prefill (D = 128, 64 lanes over 100 rows), and an ALiBi per-head-mask decode. Each against the textbook
+/// two-pass attention.
+#[test]
+fn attention_fixture_bank_matches_cpu_on_ptx() {
+    let ctx = match PtxContext::new() {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            eprintln!("SKIP attention_fixture_bank_matches_cpu_on_ptx: no PTX device ({e})");
+            return;
+        }
+    };
+    let scale = |d: usize| kg::ScoreTransform::Scale {
+        scale_bits: (1.0 / (d as f32).sqrt()).to_bits(),
+    };
+    let rows = [
+        (
+            "llama_decode_b1",
+            attention_spec(
+                (1, 8, 4, 1, 200, 64),
+                64,
+                kg::MaskKind::Broadcast,
+                scale(64),
+            ),
+        ),
+        (
+            "llama_decode_b4",
+            attention_spec(
+                (4, 8, 4, 1, 200, 64),
+                64,
+                kg::MaskKind::Broadcast,
+                scale(64),
+            ),
+        ),
+        (
+            "decode_d512",
+            attention_spec(
+                (1, 2, 1, 1, 96, 512),
+                16,
+                kg::MaskKind::Broadcast,
+                scale(512),
+            ),
+        ),
+        (
+            "gemma_softcap_prefill",
+            attention_spec(
+                (1, 4, 2, 100, 100, 128),
+                64,
+                kg::MaskKind::Broadcast,
+                kg::ScoreTransform::ScaleSoftcap {
+                    scale_bits: (1.0 / (128f32).sqrt()).to_bits(),
+                    cap_bits: 50.0f32.to_bits(),
+                },
+            ),
+        ),
+        (
+            "prefill_into_a_cache",
+            attention_spec(
+                (1, 4, 2, 3, 100, 128),
+                64,
+                kg::MaskKind::Broadcast,
+                scale(128),
+            ),
+        ),
+        (
+            "alibi_decode",
+            attention_spec((2, 8, 2, 1, 150, 64), 64, kg::MaskKind::PerHead, scale(64)),
+        ),
+    ];
+    for (name, spec) in rows {
+        let hkv = spec.hq / spec.n_rep;
+        let q = attention_fill(spec.batch * spec.hq * spec.lq * spec.dk, 1);
+        let k = attention_fill(spec.batch * hkv * spec.lk * spec.dk, 2);
+        let v = attention_fill(spec.batch * hkv * spec.lk * spec.dv, 3);
+        let mask_heads = match spec.mask {
+            kg::MaskKind::Broadcast => 1,
+            kg::MaskKind::PerHead => spec.hq,
+        };
+        let mask: Vec<f32> = (0..spec.batch * mask_heads * spec.lq * spec.lk)
+            .map(|i| {
+                let (key, row) = (i % spec.lk, (i / spec.lk) % spec.lq);
+                let (plane, head) = (
+                    i / (spec.lq * spec.lk),
+                    (i / (spec.lq * spec.lk)) % mask_heads,
+                );
+                // Decode rows hide a different tail per plane; prefill rows are causal; per-head planes carry a
+                // per-head ALiBi-style bias.
+                let visible = if spec.lq == 1 {
+                    key < spec.lk - 3 * (plane / mask_heads)
+                } else {
+                    // Prefill is causal over the cache tail: row `i` sees the prefix and rows up to itself.
+                    key <= spec.lk - spec.lq + row
+                };
+                if !visible {
+                    -1.0e9
+                } else if spec.mask == kg::MaskKind::PerHead {
+                    -0.05 * (head as f32 + 1.0) * (spec.lk - key) as f32 / spec.lk as f32
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let got = run_attention_on_ptx(&ctx, name, &spec, [&q, &k, &v, &mask]);
+        let want = attention_reference(&spec, &q, &k, &v, &mask);
+        let max_abs = got
+            .iter()
+            .zip(&want)
+            .map(|(g, w)| {
+                if (g - w).is_nan() {
+                    f32::INFINITY
+                } else {
+                    (g - w).abs()
+                }
+            })
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs < 1e-3,
+            "{name}: attention PTX mismatch (max_abs={max_abs:.3e})"
+        );
+        eprintln!("attention {name} OK on real PTX (max_abs={max_abs:.3e})");
+    }
+}
+
+/// The split key and the live bound on real PTX, the only hardware check of their NVPTX codegen: a DeepSeek-V2
+/// MLA row (`dk` 192 = 128 per head + 64 shared, `dv` 128, 8 lanes over 100 keys) with a per-row live length,
+/// NaN in every key and value past it, and lengths outside `1..=Lk` (a NaN row for a length below one, every key
+/// for a length past the capacity, as the decomposition selects). Against the textbook attention over each
+/// row's own keys.
+#[test]
+fn attention_split_key_and_live_bound_match_cpu_on_ptx() {
+    let ctx = match PtxContext::new() {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            eprintln!(
+                "SKIP attention_split_key_and_live_bound_match_cpu_on_ptx: no PTX device ({e})"
+            );
+            return;
+        }
+    };
+    let (batch, hq, lk, dk, dv, shared) = (4usize, 2usize, 100usize, 192usize, 128usize, 64usize);
+    let head = dk - shared;
+    let spec = kg::AttentionSpec {
+        batch,
+        hq,
+        n_rep: 1,
+        lq: 1,
+        lk,
+        dk,
+        dv,
+        key: kg::KeyLayout::Split { shared_dim: shared },
+        score: kg::ScoreTransform::ScaleSoftcap {
+            scale_bits: 0.07f32.to_bits(),
+            cap_bits: 30.0f32.to_bits(),
+        },
+        mask: kg::MaskKind::Broadcast,
+        bound: kg::KeyBound::Live,
+        schedule: kg::AttentionSchedule::Streaming { lanes: 8 },
+    };
+    let len = [37i32, 100, -1, 1000];
+    let q = attention_fill(batch * hq * dk, 1);
+    let mut k = attention_fill(batch * hq * lk * head, 2);
+    let mut v = attention_fill(batch * hq * lk * dv, 3);
+    let mut k_shared = attention_fill(batch * lk * shared, 4);
+    for (b, &live) in len.iter().enumerate() {
+        for t in (live.max(0) as usize).min(lk)..lk {
+            // Rows past a valid length are poisoned; a row whose length is outside the range is read by the
+            // kernel per the clamp, never past the buffers.
+            if (1..=lk as i32).contains(&live) {
+                for h in 0..hq {
+                    let row = (b * hq + h) * lk + t;
+                    k[row * head..(row + 1) * head].fill(f32::NAN);
+                    v[row * dv..(row + 1) * dv].fill(f32::NAN);
+                }
+                k_shared[(b * lk + t) * shared..(b * lk + t + 1) * shared].fill(f32::NAN);
+            }
+        }
+    }
+    let mask = vec![0.0f32; batch * lk];
+    let got = run_attention_over_keys_on_ptx(
+        &ctx,
+        "attention_split_live_ptx",
+        &spec,
+        [&q, &k, &v, &mask],
+        Some(&k_shared),
+        Some(&len),
     );
+    let want = attention_reference_keys(&spec, &q, &k, Some(&k_shared), &v, &mask, Some(&len));
+    let row = hq * dv;
+    for (b, &live) in len.iter().enumerate() {
+        let (got, want) = (&got[b * row..(b + 1) * row], &want[b * row..(b + 1) * row]);
+        if live < 1 {
+            assert!(got.iter().all(|x| x.is_nan()), "len {live}: {got:?}");
+            continue;
+        }
+        let max_abs = got
+            .iter()
+            .zip(want)
+            .map(|(g, w)| {
+                if (g - w).is_nan() {
+                    f32::INFINITY
+                } else {
+                    (g - w).abs()
+                }
+            })
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs < 1e-3,
+            "len {live}: PTX mismatch (max_abs={max_abs:.3e})"
+        );
+        eprintln!("attention split+live len {live} OK on real PTX (max_abs={max_abs:.3e})");
+    }
 }

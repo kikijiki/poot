@@ -2,7 +2,7 @@
 //! (R-562-3). [`GGUF_BASE`] holds the rows the `blk.{l}` layout shares; a family adds the rows its
 //! architecture carries beside it (a later table's row for a role replaces an earlier one).
 
-use poot_quant::weights::{AttnRole, FfnRole, NormRole, WeightRole};
+use poot_quant::weights::{AttnRole, ExpertProj, FfnRole, MoeRole, NormRole, WeightRole};
 
 use super::{FusedPart, NameRow, Presence, Source};
 
@@ -115,6 +115,42 @@ pub(crate) const GGUF_QK_NORM: &[NameRow] = &[
     layer_tensor(
         WeightRole::Attn(AttnRole::KNorm),
         ".attn_k_norm.weight",
+        Presence::Required,
+    ),
+];
+
+/// gpt-oss's rows beside [`GGUF_BASE`]: llama.cpp names the norm before the feed-forward block
+/// `post_attention_norm` (HF's `post_attention_layernorm`), and the output projection has a bias
+/// and every head a sink logit; every projection's bias is required.
+pub(crate) const GGUF_SINK_ATTENTION: &[NameRow] = &[
+    layer_tensor(
+        WeightRole::Attn(AttnRole::QBias),
+        ".attn_q.bias",
+        Presence::Required,
+    ),
+    layer_tensor(
+        WeightRole::Attn(AttnRole::KBias),
+        ".attn_k.bias",
+        Presence::Required,
+    ),
+    layer_tensor(
+        WeightRole::Attn(AttnRole::VBias),
+        ".attn_v.bias",
+        Presence::Required,
+    ),
+    layer_tensor(
+        WeightRole::Norm(NormRole::Ffn),
+        ".post_attention_norm.weight",
+        Presence::Required,
+    ),
+    layer_tensor(
+        WeightRole::Attn(AttnRole::OBias),
+        ".attn_output.bias",
+        Presence::Required,
+    ),
+    layer_tensor(
+        WeightRole::Attn(AttnRole::Sinks),
+        ".attn_sinks.weight",
         Presence::Required,
     ),
 ];
@@ -285,6 +321,66 @@ pub(crate) const GGUF_SANDWICH_NORMS: &[NameRow] = &[
     layer_tensor(
         WeightRole::Norm(NormRole::PostFfn),
         ".post_ffw_norm.weight",
+        Presence::Required,
+    ),
+];
+
+/// Gemma 4's routed block beside [`GGUF_GEMMA4`]: the router, its input and gate scales, the fused
+/// expert stacks and the three norms the routed and the dense branches add around the sum.
+pub(crate) const GGUF_GEMMA4_MOE: &[NameRow] = &[
+    layer_tensor(
+        WeightRole::Norm(NormRole::PreRouted),
+        ".ffn_pre_norm_2.weight",
+        Presence::Required,
+    ),
+    layer_tensor(
+        WeightRole::Norm(NormRole::PostDense),
+        ".ffn_post_norm_1.weight",
+        Presence::Required,
+    ),
+    layer_tensor(
+        WeightRole::Norm(NormRole::PostRouted),
+        ".ffn_post_norm_2.weight",
+        Presence::Required,
+    ),
+    layer_linear(WeightRole::Moe(MoeRole::Router), ".ffn_gate_inp"),
+    layer_tensor(
+        WeightRole::Moe(MoeRole::RouterScale),
+        ".ffn_gate_inp.scale",
+        Presence::Required,
+    ),
+    layer_tensor(
+        WeightRole::Moe(MoeRole::ExpertScale),
+        ".ffn_down_exps.scale",
+        Presence::Required,
+    ),
+    layer_tensor(
+        WeightRole::Moe(MoeRole::Stack(ExpertProj::GateUp)),
+        ".ffn_gate_up_exps.weight",
+        Presence::Required,
+    ),
+    layer_tensor(
+        WeightRole::Moe(MoeRole::Stack(ExpertProj::Down)),
+        ".ffn_down_exps.weight",
+        Presence::Required,
+    ),
+];
+
+/// Gemma 4's rows beside [`GGUF_BASE`], [`GGUF_QK_NORM`] and [`GGUF_SANDWICH_NORMS`]: a global layer
+/// that reads V from K has no `attn_v` (so that row is optional), and every layer ends in its
+/// output scale.
+pub(crate) const GGUF_GEMMA4: &[NameRow] = &[
+    NameRow {
+        role: WeightRole::Attn(AttnRole::V),
+        source: Source::LayerLinear {
+            prefix: "blk.",
+            stem: ".attn_v",
+        },
+        presence: Presence::Optional,
+    },
+    layer_tensor(
+        WeightRole::LayerScale,
+        ".layer_output_scale.weight",
         Presence::Required,
     ),
 ];

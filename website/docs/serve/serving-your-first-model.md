@@ -51,13 +51,12 @@ curl http://localhost:8080/v1/embeddings \
 
 ## Which models load
 
-- A dense decoder (Qwen2/3, Llama, Mistral, Gemma, Granite, OLMo 2, Phi-3, SmolLM3, BLOOM, MPT) is refused at
-  startup: not available yet (poot is being refactored; planned to return).
-- A mixture-of-experts or hybrid decoder (Qwen3-MoE, GraniteMoE, Mixtral, OLMoE, gpt-oss, DeepSeek) loads; its
-  generation routes return `503`.
+- A decoder of a family the driver loads (Qwen2/3, Llama, Mistral, Mixtral, Gemma, Granite, Granite MoE,
+  OLMo 2, OLMoE, Phi-3, SmolLM3, BLOOM, MPT, Qwen3-MoE, gpt-oss, Gemma 4, DeepSeek-V2/V3/V3.2, Nemotron-H) is
+  refused at startup: not available yet (poot is being refactored; planned to return).
 - A BERT-class encoder (all-MiniLM, E5, BGE, ...) serves `/v1/embeddings`.
 - A BERT-class cross-encoder (ms-marco-MiniLM, ...) serves `/v1/rerank`.
-- Gemma 4 and Qwen3-Next checkpoints and SmolVLM / idefics3 checkpoints are not available yet (poot is being refactored; planned to return).
+- Qwen3-Next checkpoints and SmolVLM / idefics3 checkpoints are not available yet (poot is being refactored; planned to return).
 
 ## Next steps
 

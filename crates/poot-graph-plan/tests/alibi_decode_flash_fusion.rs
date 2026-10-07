@@ -1,6 +1,6 @@
 //! Card 259 fusion pass: the flash-attention matcher's mask-shape gate admits the per-head
 //! `[B,Hq,1,cap]` / `[1,Hq,L,L]` shapes as well as the broadcast ones, so `flash_attention_capped`
-//! fuses the decomposed ALiBi decode chain to one `FlashAttentionDecode` per layer without changing
+//! fuses the decomposed ALiBi decode chain to one `Attention` per layer without changing
 //! the logits.
 //!
 //! Card 626: moved here from `poot-eval/src/tests/alibi_attention.rs` with the pass itself -
@@ -111,7 +111,7 @@ fn bind(
                 (0..numel as i32).map(|i| first_pos + i).collect(),
             ),
             Storage::Slot(other) => panic!("unexpected slot {other:?}"),
-            Storage::Computed(c) => HostTensor::f32(c.shape(), c.values_f32()),
+            Storage::Computed(c) => c.tensor(),
             Storage::Const if m.name.as_deref() == Some(SLOPES) => {
                 HostTensor::f32(m.aval.shape.clone(), slopes.expect("bound slopes").to_vec())
             }
@@ -179,12 +179,10 @@ fn alibi_decode_chain_fuses_to_flash_without_changing_logits() {
     let (pos, cap) = (3usize, 8usize);
     let g = mpt_graph(Phase::Decode, 1, cap);
     let fused = dce(&flash_attention_capped(&cse(&g), None));
-    let n_flash = count(&fused, |op| {
-        matches!(op, OpKind::FlashAttentionDecode { .. })
-    });
+    let n_flash = count(&fused, |op| matches!(op, OpKind::Attention(_)));
     assert_eq!(
         n_flash, LAYERS,
-        "the ALiBi decode chain should fuse to one FlashAttentionDecode per layer"
+        "the ALiBi decode chain should fuse to one Attention per layer"
     );
     let out_fused = logits(&fused, pos as i32, None);
     assert_bits_equal(
@@ -211,7 +209,7 @@ fn alibi_decode_chain_fuses_to_flash_without_changing_logits() {
 /// Prefill twin of [`alibi_decode_chain_fuses_to_flash_without_changing_logits`] (Card 557: it replaces
 /// the poot-eval test that compared the deleted `trace_prefill_flash` tracer with `trace_prefill`):
 /// the matcher fuses the decomposed prefill chain, fed the `[1,Hq,L,L]` per-head mask, to one
-/// `FlashAttentionPrefill` per layer without changing the logits, and the slopes still reach the fused
+/// `Attention` per layer without changing the logits, and the slopes still reach the fused
 /// op. The prefill is a whole-prompt step (capacity equals the token count), the only shape whose
 /// mask is square.
 #[test]
@@ -219,12 +217,10 @@ fn alibi_prefill_chain_fuses_to_flash_without_changing_logits() {
     let l = 5usize;
     let g = mpt_graph(Phase::Prefill, l, l);
     let fused = dce(&flash_attention_capped(&cse(&g), None));
-    let n_flash = count(&fused, |op| {
-        matches!(op, OpKind::FlashAttentionPrefill { .. })
-    });
+    let n_flash = count(&fused, |op| matches!(op, OpKind::Attention(_)));
     assert_eq!(
         n_flash, LAYERS,
-        "the ALiBi prefill chain should fuse to one FlashAttentionPrefill per layer"
+        "the ALiBi prefill chain should fuse to one Attention per layer"
     );
 
     let out_fused = logits(&fused, 0, None);

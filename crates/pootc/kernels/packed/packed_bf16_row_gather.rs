@@ -8,8 +8,8 @@
 //!
 //! Decode is `f32::from_bits(word << 16)` (card 370), exact.
 //!
-//! No baked dims and no metadata buffer, like `gather_axis0.rs`: `rest = out.len() / index.len()`, so this
-//! is a 3-param `Plan::Compute`. The index is `i32`, not the f32 token convention of `gather_axis0.rs`:
+//! No baked dims and no metadata buffer: `rest = out.len() / index.len()`, so this
+//! is a 3-param single-dispatch plan. The index is `i32`, not the f32 token convention of the generated movement gather:
 //! the wgpu typed walk stores an I32 value as `Ty::I32`, and `OpKind::DenseRowGather` pins the operand
 //! dtype to match.
 //!

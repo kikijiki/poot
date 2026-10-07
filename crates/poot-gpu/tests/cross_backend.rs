@@ -16,8 +16,8 @@ use poot_graph_ir::ops::{attention_masked, rmsnorm, silu};
 use poot_graph_ir::types::TensorType;
 use poot_graph_ir::{Graph, SlotKey, Storage, ValueId};
 use poot_graph_plan::{
-    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, FusionPolicy, Partition,
-    StagedProgram, Submission, Target, TargetSet, compile_staged,
+    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram,
+    Submission, Target, TargetSet, compile_staged,
 };
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::DType;
@@ -47,7 +47,6 @@ fn staged(g: &Graph, target: Target) -> StagedProgram<poot_graph_ir::ValidationO
         },
         &CompileOptions {
             execution: Submission::Replay,
-            fusion: FusionPolicy::Full,
             limits: poot_graph_plan::CompileLimits::STANDARD,
         },
     )
@@ -56,15 +55,19 @@ fn staged(g: &Graph, target: Target) -> StagedProgram<poot_graph_ir::ValidationO
 
 fn f32_bytes(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 
 fn i32_bytes(bytes: &[u8]) -> Vec<i32> {
     bytes
-        .chunks_exact(4)
-        .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| i32::from_le_bytes(*c))
         .collect()
 }
 

@@ -40,7 +40,7 @@ pub(crate) fn op_label(op: &OpKind) -> &'static str {
         OpKind::PackedRowGather { .. } => "packed_row_gather",
         OpKind::DenseContraction { .. } => "dense_contraction",
         OpKind::DenseRowGather { .. } => "dense_row_gather",
-        OpKind::MatMulBias => "matmul_bias",
+        OpKind::ContractionEpilogue { .. } => "contraction_epilogue",
         OpKind::ArgTopK { .. } => "arg_top_k",
         OpKind::IndexedMatMul => "indexed_matmul",
         OpKind::DynamicUpdateSlice { .. } => "dynamic_update_slice",
@@ -48,8 +48,7 @@ pub(crate) fn op_label(op: &OpKind) -> &'static str {
         OpKind::UnpackI8 { .. } => "unpack_i8",
         OpKind::Fused(_) => "fused",
         OpKind::FusedRow(_) => "fused_row",
-        OpKind::FlashAttentionDecode { .. } => "flash_attention_decode",
-        OpKind::FlashAttentionPrefill { .. } => "flash_attention_prefill",
+        OpKind::Attention(_) => "attention",
         OpKind::Rope { .. } => "rope",
         OpKind::AllReduce { .. } => "all_reduce",
         OpKind::AllGather { .. } => "all_gather",
@@ -72,14 +71,6 @@ pub(crate) enum Bf16Equation<'a> {
     Transpose { perm: &'a [usize] },
     /// `MatMul(F32 activation, BF16 weight) -> F32`, the mixed-dtype linear.
     WeightMatMul,
-    /// `DenseContraction(F32 activation, BF16 weight [N, K]) -> F32`, Card 380. The same contraction as
-    /// [`Bf16Equation::WeightMatMul`] with the weight in checkpoint order instead of contraction order, so
-    /// the recognizer can drop the `Transpose` the LM head would otherwise materialize on device.
-    WeightContraction,
-    /// `DenseRowGather(BF16 table [V, R], I32 index) -> F32`, Card 381. Exactly
-    /// [`Bf16Equation::Gather`] on axis 0 followed by [`Bf16Equation::Widen`], folded into one equation so
-    /// the gathered rows never have to exist as a BF16 device value.
-    RowGatherWiden,
 }
 
 /// Whether `eqn` reads or produces a BF16 value.
@@ -101,10 +92,6 @@ pub(crate) fn classify<'a, V: ValidationChannel>(
     }
     let dtype = |position: usize| match eqn.inputs.get(position) {
         Some(Operand::Value(value)) => Some(graph.aval(*value).dtype),
-        _ => None,
-    };
-    let rank = |position: usize| match eqn.inputs.get(position) {
-        Some(Operand::Value(value)) => Some(graph.aval(*value).rank()),
         _ => None,
     };
     let (arity, first, second) = (eqn.inputs.len(), dtype(0), dtype(1));
@@ -129,24 +116,6 @@ pub(crate) fn classify<'a, V: ValidationChannel>(
         }
         OpKind::MatMul if (arity, first, second) == (2, Some(DType::F32), Some(DType::BF16)) => {
             Some(Bf16Equation::WeightMatMul)
-        }
-        // The weight is `[N, K]`: `evaluate_equation` relabels its strides with a rank-2 permutation, so an
-        // unadmitted rank must fail here, before anything runs.
-        OpKind::DenseContraction {
-            weight: DType::BF16,
-        } if (arity, first, second) == (2, Some(DType::F32), Some(DType::BF16))
-            && rank(1) == Some(2) =>
-        {
-            Some(Bf16Equation::WeightContraction)
-        }
-        // The table is `[V, R]`: the row selection reads the gathered axis extent, so an unadmitted rank
-        // must fail here, before anything runs.
-        OpKind::DenseRowGather {
-            source: DType::BF16,
-        } if (arity, first, second) == (2, Some(DType::BF16), Some(DType::I32))
-            && rank(0) == Some(2) =>
-        {
-            Some(Bf16Equation::RowGatherWiden)
         }
         _ => None,
     }

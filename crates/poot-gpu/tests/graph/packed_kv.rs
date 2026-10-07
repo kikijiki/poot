@@ -8,11 +8,10 @@ fn is_imported(choice: &KernelChoice, kernel: ImportedKernel) -> bool {
 
 #[test]
 fn nvptx_decode_gemv_plan_selection() {
-    // Card 044 PTX swap: on the NVPTX path the B=1 decode GEMV is the imported kernel (a plain Plan::Compute), while batched B>1
-    // stays on kernelgen (NVPTX has no stable-buffer dims path for ComputeMeta yet). Pure planner test (no GPU); also checks
+    // Card 044 PTX swap: on the NVPTX path the B=1 decode GEMV is the imported kernel (a plain single dispatch), while batched B>1
+    // stays on kernelgen (NVPTX has no stable-buffer dims path for metadata launches yet). Pure planner test (no GPU); also checks
     // wgpu is unchanged.
     use poot_graph_ir::op::OpKind;
-    use poot_graph_plan::Plan;
     use poot_target::Backend;
     let (k, n) = (4usize, 8usize);
     let plan_for = |bsz: usize, backend| {
@@ -34,9 +33,10 @@ fn nvptx_decode_gemv_plan_selection() {
         )
         .unwrap()
     };
-    // B=1 on NVPTX -> the coalesced imported GEMV (Plan::Compute, key "matmul:gemv:coalesced").
-    match plan_for(1, Backend::Nvptx) {
-        (Plan::Compute { .. }, choice) => {
+    // B=1 on NVPTX -> the coalesced imported GEMV (single dispatch, key "matmul:gemv:coalesced").
+    let (plan_, choice_) = plan_for(1, Backend::Nvptx);
+    match (single_meta(&plan_), choice_) {
+        (Some([]), choice) => {
             assert!(
                 is_imported(&choice, ImportedKernel::GemvCoalesced),
                 "B=1 NVPTX -> coalesced gemv: {choice:?}"
@@ -44,24 +44,25 @@ fn nvptx_decode_gemv_plan_selection() {
         }
         _ => panic!("B=1 NVPTX decode GEMV should be a Compute plan"),
     }
-    // B>1 on NVPTX -> the imported batched gemv ComputeMeta (the executor binds the dims=[B] buffer).
-    match plan_for(2, Backend::Nvptx) {
-        (Plan::ComputeMeta { meta, .. }, choice) => {
+    // B>1 on NVPTX -> the imported batched gemv metadata launch (the executor binds the dims=[B] buffer).
+    let (plan_, choice_) = plan_for(2, Backend::Nvptx);
+    match (single_meta(&plan_), choice_) {
+        (Some(meta @ [_, ..]), choice) => {
             assert!(
                 is_imported(&choice, ImportedKernel::GemvBatchedCoalesced),
-                "B>1 NVPTX -> batched gemv ComputeMeta: {choice:?}"
+                "B>1 NVPTX -> batched gemv metadata launch: {choice:?}"
             );
             assert_eq!(meta, vec![2], "dims = [B]");
         }
-        _ => panic!("B>1 NVPTX decode GEMV should be a ComputeMeta plan now"),
+        _ => panic!("B>1 NVPTX decode GEMV should be a metadata launch now"),
     }
-    // wgpu unchanged: B=1 coalesced Compute, B>1 ComputeMeta (the batched coalesced gemv).
+    // wgpu unchanged: B=1 coalesced single dispatch, B>1 metadata launch (the batched coalesced gemv).
     assert!(
-        matches!(plan_for(1, Backend::SpirvVulkan), (Plan::Compute { .. }, choice) if is_imported(&choice, ImportedKernel::GemvCoalesced))
+        matches!(plan_for(1, Backend::SpirvVulkan), (plan_, choice) if single_meta(&plan_).is_some_and(|meta| meta.is_empty()) && is_imported(&choice, ImportedKernel::GemvCoalesced))
     );
     assert!(matches!(
         plan_for(2, Backend::SpirvVulkan),
-        (Plan::ComputeMeta { .. }, _)
+        (plan_, _) if single_meta(&plan_).is_some_and(|meta| !meta.is_empty())
     ));
 }
 
@@ -73,7 +74,6 @@ fn decode_gemv_random_shapes_gpu_matches_cpu() {
     // Fuzz over random K/N, with a few seeds at N > 65535 to stress the Y-spill, asserting the plan key is `matmul:gemv...` and
     // `gpu.run == CPU`. Half the seeds use the fused-bias variant.
     use poot_graph_ir::op::OpKind;
-    use poot_graph_plan::Plan;
     let _gpu_guard = gpu_lock();
     let Some((mut gpu, target)) = open_engine_or_skip() else {
         return;
@@ -124,25 +124,27 @@ fn decode_gemv_random_shapes_gpu_matches_cpu() {
             b.matmul(x, w)
         };
         let g = b.finish(out);
-        // Card 557: `compile` fuses the traced bias add into `MatMulBias`; plan and choice are read off the
-        // compiled program.
+        // Plan and choice are read off the compiled program. The decode GEMV has no epilogue lowering, so
+        // `compile` leaves the traced bias add as its own equation.
         let program = compile_full(&g, &spirv_fixture_target());
         let (eqn, plan) = program
             .planned()
-            .find(|(e, _)| matches!(e.op, OpKind::MatMul | OpKind::MatMulBias))
+            .find(|(e, _)| matches!(e.op, OpKind::MatMul))
             .unwrap();
         assert_eq!(
-            matches!(eqn.op, OpKind::MatMulBias),
-            with_bias,
-            "seed {seed}: compile should fuse exactly the traced bias add"
+            program
+                .planned()
+                .filter(|(e, _)| matches!(e.op, OpKind::Binary(_)))
+                .count(),
+            usize::from(with_bias),
+            "seed {seed}: the traced bias add stays one equation beside the GEMV"
         );
-        let choice = match plan {
-            Plan::Compute { .. } => program.kernel_choice(eqn),
-            _ => panic!("seed {seed}: decode GEMV should be a Compute plan"),
+        let choice = match single_meta(plan) {
+            Some([]) => program.kernel_choice(eqn),
+            _ => panic!("seed {seed}: decode GEMV should be one dispatch without metadata"),
         };
         assert!(
-            is_imported(choice, ImportedKernel::GemvCoalesced)
-                || is_imported(choice, ImportedKernel::GemvCoalescedBias),
+            is_imported(choice, ImportedKernel::GemvCoalesced),
             "seed {seed} (K={k},N={n}): expected the decode GEMV path, got {choice:?}"
         );
         gemv_count += 1;
@@ -190,12 +192,11 @@ fn decode_gemv_random_shapes_gpu_matches_cpu() {
 #[test]
 fn batched_decode_gemv_gpu_matches_cpu() {
     // Card 044: the batched decode GEMV (B>1 rows, one token each, shared weight; continuous batching). `is_decode_gemv` routes
-    // it like B=1, but the imported batched kernel needs `dims = [B]`, so the plan is `Plan::ComputeMeta` and the executor binds
+    // it like B=1, but the imported batched kernel needs `dims = [B]`, so the plan is a metadata launch and the executor binds
     // an extra u32 buffer. Fuzz over random B/K/N, with and without fused bias, asserting the plan key is
-    // `matmul:gemv_batched...` and `gpu.run == CPU`; covers the ComputeMeta planner emit and the executor's metadata-buffer
+    // `matmul:gemv_batched...` and `gpu.run == CPU`; covers the metadata launchner emit and the executor's metadata-buffer
     // binding.
     use poot_graph_ir::op::OpKind;
-    use poot_graph_plan::Plan;
     let _gpu_guard = gpu_lock();
     let Some((mut gpu, target)) = open_engine_or_skip() else {
         return;
@@ -244,25 +245,27 @@ fn batched_decode_gemv_gpu_matches_cpu() {
             b.matmul(x, w)
         };
         let g = b.finish(out);
-        // Card 557: `compile` fuses the traced bias add into `MatMulBias`; plan and choice are read off the
-        // compiled program.
+        // Plan and choice are read off the compiled program. The decode GEMV has no epilogue lowering, so
+        // `compile` leaves the traced bias add as its own equation.
         let program = compile_full(&g, &spirv_fixture_target());
         let (eqn, plan) = program
             .planned()
-            .find(|(e, _)| matches!(e.op, OpKind::MatMul | OpKind::MatMulBias))
+            .find(|(e, _)| matches!(e.op, OpKind::MatMul))
             .unwrap();
         assert_eq!(
-            matches!(eqn.op, OpKind::MatMulBias),
-            with_bias,
-            "seed {seed}: compile should fuse exactly the traced bias add"
+            program
+                .planned()
+                .filter(|(e, _)| matches!(e.op, OpKind::Binary(_)))
+                .count(),
+            usize::from(with_bias),
+            "seed {seed}: the traced bias add stays one equation beside the GEMV"
         );
-        let (choice, meta) = match plan {
-            Plan::ComputeMeta { meta, .. } => (program.kernel_choice(eqn), meta),
-            _ => panic!("seed {seed}: batched GEMV should be ComputeMeta"),
+        let (choice, meta) = match single_meta(plan) {
+            Some(meta @ [_, ..]) => (program.kernel_choice(eqn), meta),
+            _ => panic!("seed {seed}: batched GEMV should be a metadata launch"),
         };
         assert!(
-            is_imported(choice, ImportedKernel::GemvBatchedCoalesced)
-                || is_imported(choice, ImportedKernel::GemvBatchedCoalescedBias),
+            is_imported(choice, ImportedKernel::GemvBatchedCoalesced),
             "seed {seed} (B={bsz},K={k},N={n}): expected the batched GEMV path, got {choice:?}"
         );
         assert_eq!(
@@ -297,11 +300,11 @@ fn batched_decode_gemv_gpu_matches_cpu() {
         }
     }
     eprintln!(
-        "batched-decode-gemv fuzz: {batched}/24 took the ComputeMeta batched path, all GPU==CPU"
+        "batched-decode-gemv fuzz: {batched}/24 took the metadata-launch batched path, all GPU==CPU"
     );
     assert_eq!(
         batched, 24,
-        "all B>1 M=1 shared-weight shapes should be ComputeMeta"
+        "all B>1 M=1 shared-weight shapes should be a metadata launch"
     );
 }
 
@@ -310,7 +313,6 @@ fn batched_decode_gemv_gpu_matches_cpu() {
 #[test]
 fn decode_bf16_gemv_gpu_matches_cpu() {
     use poot_graph_ir::op::OpKind;
-    use poot_graph_plan::Plan;
     let _gpu_guard = gpu_lock();
     let Some((mut gpu, target)) = open_engine_or_skip() else {
         return;
@@ -349,29 +351,27 @@ fn decode_bf16_gemv_gpu_matches_cpu() {
             b.matmul(x, w)
         };
         let g = b.finish(out);
-        // Card 557: `compile` fuses the traced bias add into `MatMulBias`; plan and choice are read off the
-        // compiled program.
+        // Plan and choice are read off the compiled program. The decode GEMV has no epilogue lowering, so
+        // `compile` leaves the traced bias add as its own equation.
         let program = compile_full(&g, &spirv_fixture_target());
         let (eqn, plan) = program
             .planned()
-            .find(|(e, _)| matches!(e.op, OpKind::MatMul | OpKind::MatMulBias))
+            .find(|(e, _)| matches!(e.op, OpKind::MatMul))
             .unwrap();
         assert_eq!(
-            matches!(eqn.op, OpKind::MatMulBias),
-            with_bias,
-            "seed {seed}: compile should fuse exactly the traced bias add"
+            program
+                .planned()
+                .filter(|(e, _)| matches!(e.op, OpKind::Binary(_)))
+                .count(),
+            usize::from(with_bias),
+            "seed {seed}: the traced bias add stays one equation beside the GEMV"
         );
-        let choice = match plan {
-            Plan::Compute { .. } => program.kernel_choice(eqn),
-            other => panic!("expected Compute, got {other:?}"),
-        };
-        let expected = if with_bias {
-            ImportedKernel::GemvCoalescedBiasBf16
-        } else {
-            ImportedKernel::GemvCoalescedBf16
+        let choice = match single_meta(plan) {
+            Some([]) => program.kernel_choice(eqn),
+            _ => panic!("expected one dispatch without metadata, got {plan:?}"),
         };
         assert!(
-            is_imported(choice, expected),
+            is_imported(choice, ImportedKernel::GemvCoalescedBf16),
             "seed {seed}: expected the bf16 GEMV, got {choice:?}"
         );
 

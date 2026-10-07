@@ -22,6 +22,7 @@ pub const CHECKPOINTS: &[&str] = &[
     "gemma-3-1b-gguf",
     "gemma-3-1b-it",
     "gemma-4-31B-it-GGUF",
+    "gemma4-moe-tiny",
     "gptoss-20b",
     "gpt-oss-20b-gguf",
     "gptoss-tiny",

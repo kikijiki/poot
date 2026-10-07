@@ -78,14 +78,13 @@ Use the compiler entry instead of assembling a production pass sequence:
 
 ```rust
 use poot_executor::Device;
-use poot_graph_plan::{compile, CompileLimits, CompileOptions, FusionPolicy, Submission, Target};
+use poot_graph_plan::{compile, CompileLimits, CompileOptions, Submission, Target};
 use poot_gpu::device::WgpuDevice;
 
 let device = WgpuDevice::new()?;
 let target: Target = device.target(); // backend plus measured DeviceCaps
 let program = compile(&g, &target, &CompileOptions {
     execution: Submission::Replay,
-    fusion: FusionPolicy::Full,
     limits: CompileLimits::STANDARD,
 })?;
 ```
@@ -118,7 +117,7 @@ use poot_executor::{Device, Engine, Executor, HostView, NoSync, StepInputs, Weig
 use poot_gpu::device::WgpuDevice;
 use poot_graph_plan::{
     compile_staged, CompileLimits, CompileOptions, DeviceId, DevicePlacement, ExpertPlacement,
-    FusionPolicy, Partition, Submission, TargetSet,
+    Partition, Submission, TargetSet,
 };
 use poot_quant::weights::WeightStore;
 
@@ -138,7 +137,6 @@ let staged = compile_staged(
     },
     &CompileOptions {
         execution: Submission::Replay,
-        fusion: FusionPolicy::Full,
         limits: CompileLimits::STANDARD,
     },
 )?;
@@ -158,7 +156,7 @@ let out = exec.step(exe, entry, &StepInputs::new(), &mut NoSync)?.read()?;
 The first `step` on an entry records the dispatch sequence; every later `step` replays it. Drop the
 entry with `Executor::remove_entry` when the graph shape changes, and `Executor::unload` to free the
 executable. `Engine<PtxDevice>` and `Engine<RocmDevice>` take the same `Graph` and the same calls;
-that is the engine `poot-llm` uses under `generate_kv_*`.
+that is the engine the `poot-llm` driver runs on.
 
 ## Direct `#[kernel]` dispatch
 

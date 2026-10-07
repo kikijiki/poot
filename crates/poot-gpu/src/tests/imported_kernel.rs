@@ -88,7 +88,9 @@ fn rowsum_for_asset_matches_cpu_on_wgpu() {
     let mut got = vec![0u8; rows * 4];
     device.read(&out_buf, &mut got).unwrap();
     let got: Vec<f32> = got
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     assert_eq!(
@@ -183,7 +185,9 @@ fn rmsnorm_dyn_asset_matches_cpu_on_wgpu() {
     let mut got = vec![0u8; rows * d * 4];
     device.read(&out_buf, &mut got).unwrap();
     let got: Vec<f32> = got
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     for (i, (g, w)) in got.iter().zip(&want).enumerate() {

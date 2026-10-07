@@ -156,14 +156,14 @@ fn run_precompile() {
     }
 
     // the M>1 prefill graph: shared-weight projection tiled GEMMs + batched-weight per-head attention
-    // tiled GEMMs run the imported ComputeMeta kernels on NVPTX (no chunking).
+    // tiled GEMMs run the imported metadata-launch kernels on NVPTX (no chunking).
     let gp = trace(
         &*model,
         Phase::Prefill,
         step(1, tokens, cap, KvLayout::Contiguous),
     );
     total += precompile_graph(&gp, &caps).expect("precompile prefill");
-    // the B>1 batched decode graph: the projection GEMVs run the imported batched gemv ComputeMeta
+    // the B>1 batched decode graph: the projection GEMVs run the imported batched gemv metadata launch
     // (dims = [B]) on NVPTX.
     let gb = trace(
         &*model,

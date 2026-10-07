@@ -9,9 +9,8 @@ use std::sync::Arc;
 use poot_executor::{ExecError, Executor, NoSync, StepInputs, WeightSource};
 use poot_graph_ir::{Graph, Slot, SlotKey, ValidationOutputs};
 use poot_graph_plan::{
-    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, FusionPolicy, Partition,
-    StagedProgram, Submission, Target, TargetSet, WeightFormats, bind_packed_weights,
-    compile_staged,
+    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram,
+    Submission, Target, TargetSet, WeightFormats, bind_packed_weights, compile_staged,
 };
 use poot_models::model::{KvLayout, LogitRows, Model, Phase, StepShape};
 use poot_models::registry::{RawConfig, Registry};
@@ -401,7 +400,6 @@ pub fn compile(g: &Graph<ValidationOutputs>, target: Target) -> StagedProgram<Va
         },
         &CompileOptions {
             execution: Submission::Replay,
-            fusion: FusionPolicy::Full,
             limits: poot_graph_plan::CompileLimits::STANDARD,
         },
     )
@@ -701,4 +699,84 @@ pub fn check_split_head(exec: &mut dyn Executor, target: Target) {
             "split head, step {step}: greedy tokens"
         );
     }
+}
+
+/// POOT-651: a qwen2.5-0.5B-shaped BF16 checkpoint whose head is tied to the embedding (two layers; vocab,
+/// hidden, heads and intermediate width are the real ones) decodes through [`WeightSource::Map`]. Every step's
+/// logits equal `oracle` within [`TIER2`], and the executable's `Weight` residency is exactly the stored tensors
+/// at two bytes per element: the tied head and the embedding share one packed BF16 buffer and no F32 copy of the
+/// head exists.
+pub fn check_tied_head(exec: &mut dyn Executor, target: Target, oracle: &MappedOracle<'_>) {
+    let dense = crate::dense::Dense::new(crate::dense::Family::Qwen2)
+        .vocab(151936)
+        .dims(896, 4864, 2)
+        .heads(14, 2)
+        .head_dim(64)
+        .max_positions(64)
+        .with("tie_word_embeddings", true);
+    let full = dense.store(Projections::Bf16, DType::BF16, None);
+    let mut builder = WeightStore::builder();
+    let mut stored_bytes = 0u64;
+    for (key, shape) in dense.tensors() {
+        if key == "lm_head.weight" {
+            continue;
+        }
+        stored_bytes += 2 * shape.iter().product::<usize>() as u64;
+        builder
+            .insert(key.clone(), full.get(&key).unwrap().clone())
+            .unwrap();
+    }
+    let store = Arc::new(builder.build());
+    let config = dense.config();
+    let model = Registry::builtin()
+        .unwrap()
+        .build(
+            &RawConfig::HfJson {
+                config: &config,
+                generation: None,
+            },
+            &store,
+        )
+        .unwrap();
+    let map = Arc::new(model.weights().clone());
+
+    let g = trace(model.as_ref(), &map, Phase::Decode, 1, CAPACITY);
+    let exe = exec
+        .load_weights(Arc::clone(&store), WeightSource::Map(Arc::clone(&map)))
+        .unwrap();
+    let entry = exec.add_entry(exe, &compile(&g, target)).unwrap();
+    let mut state: Vec<HostTensor> = g
+        .state
+        .iter()
+        .map(|&(input, _)| HostTensor::zeros(g.aval(input).shape.clone()))
+        .collect();
+    for step in [
+        Step::new(Phase::Decode, &[3], 0),
+        Step::new(Phase::Decode, &[1], 1),
+    ] {
+        let got = exec
+            .step(exe, entry, &step.inputs(), &mut NoSync)
+            .unwrap()
+            .to_host()
+            .unwrap();
+        let (want, next) = oracle(&g, &store, &map, &step.slots(), &state);
+        state = next;
+        assert_close(
+            got.as_f32().unwrap(),
+            want.as_f32().unwrap(),
+            TIER2,
+            &format!("tied head, decode at {}", step.start),
+        );
+    }
+    let weight_bytes = exec
+        .stats()
+        .memory
+        .iter()
+        .find(|&&(role, _)| role == poot_executor::BufferRole::Weight)
+        .map_or(0, |&(_, snapshot)| snapshot.live_bytes);
+    assert_eq!(
+        weight_bytes, stored_bytes,
+        "the tied head and the embedding are one BF16 buffer: stored bytes, no F32 copy"
+    );
+    exec.unload(exe).unwrap();
 }

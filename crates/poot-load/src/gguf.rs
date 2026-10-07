@@ -314,16 +314,22 @@ mod tests {
                 .ok_or_else(|| gerr(&format!("unsupported ggml type {}", info.ggml_type)))?;
             let data: Vec<f32> = match format {
                 WeightFormat::F32 => raw[..numel * 4]
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
                     .collect(),
                 WeightFormat::F16 => raw[..numel * 2]
-                    .chunks_exact(2)
-                    .map(|c| f16_to_f32(u16::from_le_bytes(c.try_into().unwrap())))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| f16_to_f32(u16::from_le_bytes(*c)))
                     .collect(),
                 WeightFormat::Bf16 => raw[..numel * 2]
-                    .chunks_exact(2)
-                    .map(|c| bf16_to_f32(u16::from_le_bytes(c.try_into().unwrap())))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| bf16_to_f32(u16::from_le_bytes(*c)))
                     .collect(),
                 format => dequant(format, raw, numel)?,
             };

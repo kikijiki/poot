@@ -157,6 +157,21 @@ impl DenseOwnerTensorView {
     }
 }
 
+/// Whether `eqn` reads a BF16 operand through the exact BF16 view: a Spec 376 equation, or a BF16
+/// contraction or row-gather composite, whose decomposition is made of Spec 376 equations (`infer` has
+/// already fixed their operand dtypes and ranks).
+fn reads_bf16_view<V: ValidationChannel>(g: &Graph<V>, eqn: &poot_graph_ir::Eqn) -> bool {
+    resolve::classify(g, eqn).is_some()
+        || matches!(
+            eqn.op,
+            OpKind::DenseContraction {
+                weight: DType::BF16
+            } | OpKind::DenseRowGather {
+                source: DType::BF16
+            }
+        )
+}
+
 /// Fail-closed input checks for every owner-backed exact-dense binding:
 /// each bound view's metadata must match its graph constant, and a BF16/F32 owner view not consumed
 /// by an admitted Spec 376 equation (`resolve::classify`) - and not the graph's own output - is an
@@ -199,7 +214,7 @@ pub(crate) fn validate_exact_dense_bindings<V: ValidationChannel>(
             let Some(Value::Owner(ExactValue::Dense(view))) = inputs.get(value_id) else {
                 continue;
             };
-            let admitted = (view.dtype() == DType::BF16 && resolve::classify(g, eqn).is_some())
+            let admitted = (view.dtype() == DType::BF16 && reads_bf16_view(g, eqn))
                 || (position == 0 && is_i32_indexed_gather_data);
             if !admitted {
                 return Err(graph_consumer(*value_id, eqn.op.name()));

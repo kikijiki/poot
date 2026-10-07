@@ -32,7 +32,8 @@ const OPS: Op[] = [
     category: "elementwise",
     inputs: "cond, if_true, if_false",
     outputShape: "[...] (same)",
-    notes: "I32 only; float tensors reject it",
+    notes:
+      "cond is I32, nonzero picks if_true; branches share one dtype. A bitwise select, so a NaN or Inf in the unselected branch never reaches the output. The IR and the oracle accept I32, F32, F16 and BF16; the device lowering is I32 and F32 only (F16/BF16 are a typed DtypeLowering refusal)",
   },
   {
     name: "Cast(to)",
@@ -131,13 +132,6 @@ const OPS: Op[] = [
       "Batched; B=1 (GEMV) and B>1 (GEMM) are one op; specialization at plan time",
   },
   {
-    name: "MatMulBias",
-    category: "compute",
-    inputs: "a, b, bias: [N]",
-    outputShape: "[..., M, N]",
-    notes: "MatMul with a fused bias epilogue",
-  },
-  {
     name: "IndexedMatMul",
     category: "compute",
     inputs: "x: [M, K], W: [E, K, N], idx: [M]",
@@ -183,12 +177,12 @@ const OPS: Op[] = [
     notes: "Introduced by rope_fusion from the rotate-half chain",
   },
   {
-    name: "FlashAttentionDecode / Prefill",
+    name: "Attention",
     category: "compute",
     inputs: "q, k, v, mask",
     outputShape: "same as q",
     notes:
-      "Introduced by the flash-attention rewrite in compile; online softmax, no score matrix. The planner chooses its kernel",
+      "Introduced by the attention rewrite in compile, for decode and prefill; online softmax, no score matrix. The planner generates its kernel",
   },
   {
     name: "Fused / FusedRow",
@@ -198,11 +192,12 @@ const OPS: Op[] = [
     notes: "Pointwise and row-wise (reduction-rooted) fused regions",
   },
   {
-    name: "MatMulBias",
+    name: "ContractionEpilogue",
     category: "compute",
-    inputs: "a, b, bias[N]",
-    outputShape: "as MatMul",
-    notes: "Introduced by the bias-epilogue fusion from a matmul then a broadcast bias add",
+    inputs: "head operands (a, b), then the epilogue's extra inputs (bias, residual, ...)",
+    outputShape: "as the head contraction",
+    notes:
+      "Introduced by the epilogue fusion from a dense contraction and the single-use pointwise chain that consumes it. The head's result keeps its dtype (a BF16 head rounds to BF16 before the first step reads it) and every step rounds through it",
   },
   {
     name: "AllReduce / AllGather",

@@ -49,8 +49,9 @@
         # Invariant: a shared target dir is only safe with checksum freshness on. Cargo's unit hash for path
         # packages omits the worktree path, so default mtime freshness can reuse an artifact built from
         # another worktree's different source (observed: E0432 flakiness). That is enabled by the committed
-        # .cargo/config.toml [unstable] checksum-freshness = true, not by this shell: config travels with
-        # the worktree and covers cargo invocations that never enter it.
+        # .cargo/config.toml (`[unstable] checksum-freshness` plus `[build] fingerprint = "content"`; the
+        # flag alone is a silent no-op), not by this shell: config travels with the worktree and covers
+        # cargo invocations that never enter it. `just cargo-freshness` proves it.
         #
         # Optional dev-box accelerators, none of which the committed build depends on:
         #  - kache (https://github.com/kunobi-ninja/kache), a content-addressed rustc output cache. It is

@@ -2,10 +2,12 @@ use super::*;
 
 #[test]
 fn concat2_plan_selection() {
-    // Card 044: on wgpu the f32 two-input concat runs the imported kernel (Plan::ComputeMeta, key "concat2:imported"); the NVPTX
-    // path and any non-f32 dtype keep kernelgen. Pure planner test (no GPU).
+    // The two-input concat is the one generated movement kernel on every backend and dtype: the request
+    // names the inputs' shapes and the axis, and the dispatch binds no metadata buffer. Pure planner test
+    // (no GPU).
     use poot_graph_ir::op::OpKind;
-    use poot_graph_plan::{ImportedKernel, KernelChoice, Plan};
+    use poot_graph_plan::KernelChoice;
+    use poot_kernelgen::{MovementOp, MovementSpec};
     use poot_target::Backend;
     use poot_tensor::DType;
     // a [2,3] concat b [2,5] along axis 1 -> out [2,8].
@@ -28,41 +30,39 @@ fn concat2_plan_selection() {
         )
         .unwrap()
     };
-    let is_concat2 = |choice: &KernelChoice| {
-        matches!(
-            choice,
-            KernelChoice::Imported {
-                kernel: ImportedKernel::Concat2,
-                ..
-            }
-        )
-    };
-    // f32 wgpu -> imported ComputeMeta; meta = [rank=2, axis=1, a_axis_len=3, ...].
-    match plan_for(DType::F32, Backend::SpirvVulkan) {
-        (Plan::ComputeMeta { meta, .. }, choice) => {
-            assert!(is_concat2(&choice), "{choice:?}");
-            assert_eq!(&meta[..3], &[2, 1, 3], "rank, axis, a_axis_len");
-        }
-        _ => panic!("f32 wgpu concat2 should be ComputeMeta"),
+    for (dt, backend) in [
+        (DType::F32, Backend::SpirvVulkan),
+        (DType::F32, Backend::Nvptx),
+        (DType::I32, Backend::SpirvVulkan),
+    ] {
+        let (plan_, choice_) = plan_for(dt, backend);
+        assert!(
+            matches!(single_meta(&plan_), Some([])),
+            "{dt:?} {backend:?}: one dispatch, no metadata buffer"
+        );
+        let KernelChoice::Generated(poot_kernelgen::KernelRequest::Movement(MovementSpec {
+            op: MovementOp::Concat { axis, in_shapes },
+            out_shape,
+            ..
+        })) = choice_
+        else {
+            panic!("{dt:?} {backend:?}: expected the generated concat");
+        };
+        assert_eq!(axis, 1);
+        assert_eq!(in_shapes, [vec![2, 3], vec![2, 5]]);
+        assert_eq!(out_shape, [2, 8]);
     }
-    // f32 NVPTX -> the imported ComputeMeta too (the PTX executor binds the dims buffer).
-    assert!(matches!(
-        plan_for(DType::F32, Backend::Nvptx),
-        (Plan::ComputeMeta { .. }, choice) if is_concat2(&choice)
-    ));
-    assert!(matches!(
-        plan_for(DType::I32, Backend::SpirvVulkan),
-        (Plan::Compute { .. }, KernelChoice::Generated(_))
-    ));
 }
 
 #[test]
 fn dyn_update_slice_plan_selection() {
-    // Card 044: on wgpu the f32 dynamic update-slice (runtime index, the contiguous KV-cache write) runs the imported kernel
-    // (Plan::ComputeMeta, key prefix "dus_dyn:imported:idx=<dtype>", card 529's R469-005 fix); a literal
-    // index (static), the NVPTX path, and any non-f32 dtype keep kernelgen. Pure planner test (no GPU).
+    // A dynamic update-slice is the one generated movement kernel on every backend and dtype: a runtime
+    // index names its own element type in the request (the contiguous KV-cache write stays valid at every
+    // position of a capture), a literal index is baked, and no form binds a metadata buffer. Pure planner
+    // test (no GPU).
     use poot_graph_ir::op::OpKind;
-    use poot_graph_plan::{ImportedKernel, KernelChoice, Plan};
+    use poot_graph_plan::KernelChoice;
+    use poot_kernelgen::{MovementOp, MovementSpec, UpdateIndex};
     use poot_target::Backend;
     // operand [4,5], update [4,2] along axis 1, runtime index -> the dynamic form.
     let plan_dyn = |dt: TensorType, backend| {
@@ -87,40 +87,45 @@ fn dyn_update_slice_plan_selection() {
         )
         .unwrap()
     };
-    // The choice names the shipped kernel and (card 529, R469-005) the index's own dtype (here F32, the
-    // fixture's index).
-    let is_imported_dus = |choice: &KernelChoice| {
-        matches!(
-            choice,
-            KernelChoice::Imported {
-                kernel: ImportedKernel::DynUpdateSlice,
-                index: Some(poot_tensor::DType::F32),
+    let update_index = |plan_: &poot_graph_plan::Plan, choice_: KernelChoice| {
+        assert!(
+            matches!(single_meta(plan_), Some([])),
+            "one dispatch, no metadata buffer"
+        );
+        match choice_ {
+            KernelChoice::Generated(poot_kernelgen::KernelRequest::Movement(MovementSpec {
+                op:
+                    MovementOp::UpdateSlice {
+                        update_shape,
+                        axis,
+                        index,
+                    },
                 ..
+            })) => {
+                assert_eq!((update_shape.as_slice(), axis), (&[4, 2][..], 1));
+                index
             }
-        )
-    };
-    // f32 wgpu, runtime index -> imported ComputeMeta; meta = [rank=2, axis=1, extent=2, ...].
-    match plan_dyn(TensorType::f32(vec![4, 5]), Backend::SpirvVulkan) {
-        (Plan::ComputeMeta { meta, .. }, choice) => {
-            assert!(is_imported_dus(&choice), "{choice:?}");
-            assert_eq!(&meta[..3], &[2, 1, 2], "rank, axis, extent");
+            other => panic!("expected the generated update-slice: {other:?}"),
         }
-        _ => panic!("f32 wgpu dynamic update-slice should be ComputeMeta"),
-    }
-    // f32 NVPTX -> the imported ComputeMeta too (the PTX executor binds the dims buffer).
-    assert!(matches!(
-        plan_dyn(TensorType::f32(vec![4, 5]), Backend::Nvptx),
-        (Plan::ComputeMeta { .. }, choice) if is_imported_dus(&choice)
-    ));
-    // non-f32 wgpu -> kernelgen.
-    assert!(matches!(
-        plan_dyn(
+    };
+    for (table, backend) in [
+        (TensorType::f32(vec![4, 5]), Backend::SpirvVulkan),
+        (TensorType::f32(vec![4, 5]), Backend::Nvptx),
+        (
             TensorType::new(vec![4, 5], poot_tensor::DType::I32),
-            Backend::SpirvVulkan
+            Backend::SpirvVulkan,
         ),
-        (Plan::Compute { .. }, KernelChoice::Generated(_))
-    ));
-    // LITERAL index (static form) on wgpu f32 -> kernelgen (the imported kernel only does the dynamic form).
+    ] {
+        let (plan_, choice_) = plan_dyn(table, backend);
+        assert_eq!(
+            update_index(&plan_, choice_),
+            UpdateIndex::Runtime {
+                dtype: poot_kernel_ir::Ty::F32
+            },
+            "{backend:?}"
+        );
+    }
+    // A LITERAL index is baked into the body.
     {
         let b = Builder::new();
         let operand = b.constant("operand", TensorType::f32(vec![4, 5]));
@@ -132,27 +137,14 @@ fn dyn_update_slice_plan_selection() {
             .iter()
             .find(|e| matches!(e.op, OpKind::DynamicUpdateSlice { .. }))
             .unwrap();
-        match plan_eqn_with_choice(
+        let (plan_, choice_) = plan_eqn_with_choice(
             &g,
             eqn,
             Backend::SpirvVulkan,
             &poot_test_util::device_caps::default_caps_for(Backend::SpirvVulkan),
         )
-        .unwrap()
-        {
-            (Plan::Compute { .. }, choice) => {
-                assert!(
-                    matches!(
-                        choice,
-                        KernelChoice::Generated(poot_kernelgen::KernelRequest::Movement(
-                            poot_kernelgen::MovementSpec::UpdateSliceStatic { .. }
-                        ))
-                    ),
-                    "literal index -> kernelgen static, got {choice:?}"
-                )
-            }
-            _ => panic!("literal-index update-slice should be a kernelgen Compute"),
-        }
+        .unwrap();
+        assert_eq!(update_index(&plan_, choice_), UpdateIndex::Static(1));
     }
 }
 
@@ -241,11 +233,8 @@ fn dyn_update_slice_dynamic_gpu_matches_static() {
 #[test]
 fn the_kernel_choice_names_generated_imported_and_no_dispatch_equations() {
     use poot_graph_ir::op::OpKind;
-    use poot_graph_plan::{
-        CompileOptions, FusionPolicy, ImportedKernel, KernelChoice, NoDispatch, Submission, Target,
-        compile,
-    };
-    use poot_kernelgen::{ContractionSpec, KernelRequest};
+    use poot_graph_plan::{CompileOptions, KernelChoice, NoDispatch, Submission, Target, compile};
+    use poot_kernelgen::{ContractionSpec, KernelRequest, ScoreTransform};
     use poot_target::{AmdArch, Backend};
 
     let (hq, l, d) = (2usize, 4usize, 8usize);
@@ -276,7 +265,6 @@ fn the_kernel_choice_names_generated_imported_and_no_dispatch_equations() {
     };
     let options = CompileOptions {
         execution: Submission::Replay,
-        fusion: FusionPolicy::Full,
         limits: poot_graph_plan::CompileLimits::STANDARD,
     };
     let program = compile(&g, &target, &options).expect("the fixture compiles for AMDGCN");
@@ -296,16 +284,14 @@ fn the_kernel_choice_names_generated_imported_and_no_dispatch_equations() {
         program.kernel_choice(eqn)
     };
 
-    let attention = choice_of(|op| matches!(op, OpKind::FlashAttentionPrefill { .. }));
+    let attention = choice_of(|op| matches!(op, OpKind::Attention(_)));
     assert!(
         matches!(
             attention,
-            KernelChoice::Imported {
-                kernel: ImportedKernel::FlashPrefill,
-                ..
-            }
+            KernelChoice::Generated(KernelRequest::Attention(spec))
+                if matches!(spec.score, ScoreTransform::ScaleSoftcap { .. })
         ),
-        "softcapped flash prefill is the shipped template: {attention:?}"
+        "softcapped flash prefill is the generated attention: {attention:?}"
     );
     let reshape = choice_of(|op| matches!(op, OpKind::Reshape { .. }));
     assert!(

@@ -143,7 +143,7 @@ fn exact_i32_fused_body_keeps_i32_locals_and_literals() {
             poot_kernelgen::Layout::contiguous(&[2]),
         ],
         &poot_kernelgen::FusedKernel {
-            n_leaves: 2,
+            leaf_tys: vec![poot_kernelgen::LeafTy::I32; 2],
             steps: vec![
                 poot_kernelgen::FusedStep {
                     op: poot_kernelgen::FusedScalarOp::Binary(BinOp::BitAnd),
@@ -204,7 +204,7 @@ fn packed_i32_fused_kernel_guards_with_output_len_over_lanes() {
         &[&[0, 2]],
         &[poot_kernelgen::Layout::contiguous(&[0, 2])],
         &poot_kernelgen::FusedKernel {
-            n_leaves: 1,
+            leaf_tys: vec![poot_kernelgen::LeafTy::I32; 1],
             steps: vec![],
             output: poot_kernelgen::FusedInput::LeafLane { leaf: 0, lane: 0 },
         },
@@ -258,7 +258,7 @@ fn packed_i32_leaf_lane_broadcasts_a_unit_prefix() {
         &[&[1, 2]],
         &[poot_kernelgen::Layout::contiguous(&[1, 2])],
         &poot_kernelgen::FusedKernel {
-            n_leaves: 1,
+            leaf_tys: vec![poot_kernelgen::LeafTy::I32; 1],
             steps: vec![],
             output: poot_kernelgen::FusedInput::LeafLane { leaf: 0, lane: 0 },
         },

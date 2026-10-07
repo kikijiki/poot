@@ -86,7 +86,9 @@ fn store_for(g: &Graph) -> Arc<WeightStore> {
 
 fn bytemuck_f32(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
@@ -105,7 +107,6 @@ fn decode_staged(
         },
         &poot_graph_plan::CompileOptions {
             execution: poot_graph_plan::Submission::Replay,
-            fusion: poot_graph_plan::FusionPolicy::Full,
             limits: poot_graph_plan::CompileLimits::STANDARD,
         },
     )
@@ -171,7 +172,7 @@ fn decode_slot_inputs(g: &Graph, token: u32, pos: usize, _cap: usize) -> StepInp
 /// the row also asks for generated tokens, not just logits, compared against the
 /// CPU oracle's own greedy choice (ADR-0101) - every step now feeds the ORACLE's own greedy
 /// (argmax) token forward into both the device and the oracle (real autoregressive generation, same
-/// schedule as `Runner::generate_kv_gpu_cached`'s production loop), and asserts the device's own
+/// schedule as the driver's production loop), and asserts the device's own
 /// argmax agrees with the oracle's at every position, on top of the existing numeric closeness
 /// check. There is no frozen pre-card baseline to compare bit-exactly against (548 is this backend's
 /// first executor-contract implementation, not a rewrite of a prior ROCm-on-the-contract one), so
@@ -284,9 +285,7 @@ fn oracle_decode_step(
                     )),
                 }
             }
-            poot_graph_ir::Storage::Computed(computed) => {
-                Value::from(HostTensor::f32(computed.shape(), computed.values_f32()))
-            }
+            poot_graph_ir::Storage::Computed(computed) => Value::from(computed.tensor()),
             other => panic!("decode fixture has no {other:?} input kind"),
         };
         inputs.insert(id, value);

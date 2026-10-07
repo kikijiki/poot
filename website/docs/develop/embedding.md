@@ -38,22 +38,22 @@ its weights exactly as stored. A directory is a Hugging Face checkpoint (`config
 `*.safetensors`); a file is a GGUF (config, weights and tokenizer inside).
 
 ```rust
-use poot_llm::driver::ModelHandle;
+use poot_llm::driver::{LoadOptions, ModelHandle};
 use poot_models::registry::Registry;
 
 let registry = Registry::builtin()?;
-let handle = ModelHandle::load("/path/to/qwen2.5-0.5b".as_ref(), &registry)?;
-let handle = ModelHandle::load("/path/to/model.gguf".as_ref(), &registry)?;
+let handle = ModelHandle::load("/path/to/qwen2.5-0.5b".as_ref(), &registry, &LoadOptions::default())?;
+let handle = ModelHandle::load("/path/to/model.gguf".as_ref(), &registry, &LoadOptions::default())?;
 
 // GPTQ, AWQ and FP8 projections stay packed as stored; dense BF16/F16 weights stay BF16/F16 words,
 // never widened to f32 copies.
-let handle = ModelHandle::load("/path/to/gptq-model".as_ref(), &registry)?;
+let handle = ModelHandle::load("/path/to/gptq-model".as_ref(), &registry, &LoadOptions::default())?;
 ```
 
 A family the registry does not know is a typed refusal, `DriverError::Unsupported(Unsupported::Registry(..))`.
-The mixture-of-experts and hybrid families are not registered yet; they load with `Runner::load` /
-`Runner::load_gguf` and generate through the Runner's own entry points (`generate`, and on a device
-`generate_kv_gpu_cached` after `Runner::load_on`). A registered family refuses to load on the Runner.
+The dense, mixture-of-experts (Qwen3-MoE, Granite MoE, Mixtral, OLMoE, gpt-oss), MLA (DeepSeek) and hybrid
+(Nemotron-H) families are registered. A registered family refuses to load on the Runner.
+`LoadOptions::integrity` names a manifest of file lengths and SHA-256 digests the load checks before it reads a tensor.
 
 Useful accessors after load: `handle.config()` (family, vocabulary, positions, end-of-sequence ids),
 `handle.text()` (tokenizer and chat template), `handle.store()` (the weights as stored).
@@ -66,7 +66,7 @@ A `Driver` runs one model on one device. Open the executor with `open_executor` 
 ```rust
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
-use poot_graph_plan::{CompileLimits, CompileOptions, FusionPolicy, Submission};
+use poot_graph_plan::{CompileLimits, CompileOptions, Submission};
 use poot_llm::driver::{
     BackendChoice, Driver, DriverOptions, GenerateRequest, PreparedSetLimits, open_executor,
 };
@@ -75,7 +75,6 @@ use poot_llm::{GenerationControl, Sampler};
 let handle = Arc::new(handle);
 let compile = CompileOptions {
     execution: Submission::Replay,
-    fusion: FusionPolicy::Full,
     limits: CompileLimits::STANDARD,
 };
 let options = DriverOptions {

@@ -6,7 +6,8 @@
 //! asks `Device::allocate`/`Device::dispatch` for), not a backend's numeric result (that half is
 //! `poot-gpu/tests/buffer_plan.rs`, on real wgpu hardware).
 //!
-//! Fixture (same shape as `poot-gpu`'s, `FusionPolicy::MoeHangGuard` so it stays five dispatches):
+//! Fixture (same shape as `poot-gpu`'s, compiled under the routed-expert hang guard so it stays five
+//! dispatches: the graph carries a dead routed-expert site and the fake target has the hang):
 //!
 //! ```text
 //! a, b: const [K]            K = 64
@@ -26,8 +27,8 @@ use poot_executor::{Arg, BufferRole, Device, Dispatch, Engine, Executor, NoSync,
 use poot_graph_ir::op::RedOp;
 use poot_graph_ir::{BinOp, Builder, TensorType, ValidationOutputs};
 use poot_graph_plan::{
-    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, FusionPolicy, Partition,
-    StagedProgram, Submission, Target, TargetSet, compile_staged,
+    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram,
+    Submission, Target, TargetSet, compile_staged,
 };
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_target::{Backend, DeviceCaps};
@@ -39,7 +40,6 @@ const K: usize = 64;
 
 const UNFUSED_REPLAY: CompileOptions = CompileOptions {
     execution: Submission::Replay,
-    fusion: FusionPolicy::MoeHangGuard,
     limits: poot_graph_plan::CompileLimits::STANDARD,
 };
 
@@ -53,7 +53,8 @@ fn fixture() -> (Graph, Arc<WeightStore>) {
     let v2 = b.binary(BinOp::Add, tc, tc);
     let s2 = b.reduce(RedOp::Sum, v2, 0, true);
     let out = b.binary(BinOp::Add, s1, s2);
-    let g = b.finish(out).with_validations(Vec::new());
+    let g = poot_test_util::graph_fixtures::with_routed_expert_site(b.finish(out))
+        .with_validations(Vec::new());
 
     let mut wb = WeightStore::builder();
     for (name, n) in [("a", K), ("b", K), ("c", 1)] {
@@ -85,7 +86,7 @@ fn staged(g: &Graph, target: Target) -> StagedProgram<ValidationOutputs> {
 fn fake_target() -> Target {
     Target {
         backend: Backend::SpirvVulkan,
-        caps: DeviceCaps::wgpu_rdna3_igpu(),
+        caps: poot_test_util::graph_fixtures::with_routed_expert_hang(DeviceCaps::wgpu_rdna3_igpu()),
     }
 }
 
@@ -384,9 +385,10 @@ fn state_commit_export_keeps_its_own_slot_through_the_epilogue() {
     let junk = b.binary(BinOp::Add, v1, v1);
     let new_s = b.binary(BinOp::Add, a, bias);
     let result = b.binary(BinOp::Add, junk, new_s);
-    let g = b
-        .finish_with_state(result, &[(a, new_a), (s, new_s)])
-        .with_validations(Vec::new());
+    let g = poot_test_util::graph_fixtures::with_routed_expert_site(
+        b.finish_with_state(result, &[(a, new_a), (s, new_s)]),
+    )
+    .with_validations(Vec::new());
 
     let mut wb = WeightStore::builder();
     let bias_bytes: Vec<u8> = (0..K).flat_map(|_| 1.0f32.to_le_bytes()).collect();

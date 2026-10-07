@@ -18,7 +18,7 @@ use std::sync::Arc;
 use poot_eval::Value;
 use poot_executor::Device;
 use poot_graph_ir::{Builder, Graph, PackedSourceName, Slot, TensorType, ValueId};
-use poot_graph_plan::{CompileOptions, FusionPolicy, Submission, Target, compile};
+use poot_graph_plan::{CompileOptions, Submission, Target, compile};
 use poot_ptx_gpu::PtxDevice;
 use poot_quant::format::WeightFormat;
 use poot_quant::{PackedComponentRef, PackedPayload};
@@ -40,7 +40,6 @@ fn compiled(gpu: &PtxDevice, graph: &Graph) -> Graph {
         },
         &CompileOptions {
             execution: Submission::Replay,
-            fusion: FusionPolicy::Full,
             limits: poot_graph_plan::CompileLimits::STANDARD,
         },
     )

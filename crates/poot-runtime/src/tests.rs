@@ -850,7 +850,9 @@ mod vec4_probe_tests {
     /// is not compiler output, so the test builds the handle itself).
     fn kernel_from_spv(spv: &[u8], args: Vec<ArgSchema>) -> CompiledKernel {
         let words: Vec<u32> = spv
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         // SAFETY: `spv` is `llc`/`spirv-val`-clean SPIR-V (checked by `compile_and_validate`) whose
@@ -947,7 +949,9 @@ fn bf16_round_trips_through_the_storage_typed_primitives_with_exactly_elems_time
         "bf16 storage-typed round trip must be bit-exact"
     );
     let got_bits: Vec<u16> = got
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
     assert_eq!(got_bits, want_bits);

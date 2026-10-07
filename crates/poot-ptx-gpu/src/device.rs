@@ -73,12 +73,6 @@ impl PtxDevice {
         Ok(Self::with_context(PtxContext::new()?))
     }
 
-    /// A device for the Card 552 typed timing path: [`Device::device_time`] reports a measured
-    /// device span instead of `Unknown` (SC-006). See [`PtxContext::new_with_device_timing`].
-    pub fn new_with_device_timing() -> Result<Self, PtxGpuError> {
-        Ok(Self::with_context(PtxContext::new_with_device_timing()?))
-    }
-
     fn with_context(ctx: PtxContext) -> Self {
         Self {
             ctx,
@@ -155,7 +149,17 @@ impl Device for PtxDevice {
         if n == 0 {
             return Ok(());
         }
-        let body = poot_kernelgen::broadcast_dt("ptx_device_copy", ty, &[n], &[n]);
+        // A bit-mover: the identity broadcast of `n` elements of the buffer's own element type.
+        let body = poot_kernelgen::movement_body(
+            "ptx_device_copy",
+            &poot_kernelgen::MovementSpec::new(
+                poot_kernelgen::Storage::Elements { carrier: ty },
+                vec![n],
+                poot_kernelgen::MovementOp::Broadcast { in_shape: vec![n] },
+            ),
+            None,
+        )
+        .map_err(|error| PtxGpuError::Graph(format!("device copy kernel: {error}")))?;
         let artifact = self.copy_kernel_cache.load_or_compile(
             &body,
             poot_graph_plan::CompileLimits::STANDARD.max_artifact_bytes,

@@ -54,10 +54,7 @@ compiler lowering as other quantized projections. It no longer expands those pro
 load time or requires a separate resident-E4M3 executor route. Generated kernels decode the stored
 values and apply their scales; this does not require native FP8 tensor-core instructions.
 
-The DeepSeek-V3.2 loader also preserves block-FP8 expert payloads and scales. That loader coverage is
-not a real-checkpoint generation claim for DeepSeek-V3.2 or other FP8 families. Its bounded synthetic
-family coverage and current backend limits are listed in the feature matrix. Packed MoE table
-materialization also applies here.
+Packed MoE table materialization also applies here.
 
 ## Memory expectations
 

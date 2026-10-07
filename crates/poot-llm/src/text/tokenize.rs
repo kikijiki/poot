@@ -36,6 +36,8 @@ pub struct TextCodec {
     pub(crate) spm: Option<SpmData>,
     /// The BOS id [`Self::encode`] prepends: `Some` only for a checkpoint trained with a mandatory BOS.
     pub(crate) bos: Option<u32>,
+    /// The EOS id [`Self::encode`] appends: `Some` only for a GGUF whose `add_eos_token` is set.
+    pub(crate) eos_suffix: Option<u32>,
     /// The id a guided constraint permits once its pattern is complete.
     pub(crate) eos: u32,
     pub(crate) chat_format: ChatFormat,
@@ -61,6 +63,7 @@ impl TextCodec {
             tokenizer,
             spm,
             bos,
+            eos_suffix: None,
             eos,
             chat_format,
             chat_template,
@@ -99,21 +102,14 @@ impl TextCodec {
 
     /// The text services of a GGUF checkpoint, read from the same header index its weights were:
     /// the tokenizer (SentencePiece or byte-level BPE), the chat template and the bos/eos strings
-    /// looked up in the token table. `encode` prepends BOS only when the file's own
-    /// `tokenizer.ggml.add_bos_token` says so (Llama-3.2's GGUF omits the key, and prepending there
-    /// makes generation diverge from the reference).
+    /// looked up in the token table. `encode` adds BOS and EOS as llama.cpp does
+    /// ([`gguf_special_policy`]).
     pub(crate) fn from_gguf(g: &GgufIndex, eos: u32, chat_format: ChatFormat) -> Result<Self> {
         let tokenizer = gguf_tokenizer(g)?;
-        let bos = g
-            .get("tokenizer.ggml.add_bos_token")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-            .then(|| {
-                g.get("tokenizer.ggml.bos_token_id")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32)
-            })
-            .flatten();
+        let token_id = |key: &str| g.get(key).and_then(|v| v.as_u64()).map(|v| v as u32);
+        let (add_bos, add_eos) = gguf_special_policy(g);
+        let bos = token_id("tokenizer.ggml.bos_token_id").filter(|_| add_bos);
+        let eos_suffix = token_id("tokenizer.ggml.eos_token_id").filter(|_| add_eos);
         let token_str = |key: &str| -> Option<String> {
             let id = g.get(key).and_then(|v| v.as_u64())? as usize;
             g.get("tokenizer.ggml.tokens")
@@ -137,7 +133,14 @@ impl TextCodec {
             eos,
             chat_format,
             chat_template,
-        ))
+        )
+        .with_eos_suffix(eos_suffix))
+    }
+
+    /// This codec with `encode` appending `eos_suffix` (a GGUF's `add_eos_token`).
+    fn with_eos_suffix(mut self, eos_suffix: Option<u32>) -> Self {
+        self.eos_suffix = eos_suffix;
+        self
     }
 }
 
@@ -185,6 +188,9 @@ impl TextCodec {
             if ids.first() != Some(&bos) {
                 ids.insert(0, bos);
             }
+        }
+        if let Some(eos) = self.eos_suffix {
+            ids.push(eos);
         }
         Ok(ids)
     }
@@ -528,6 +534,77 @@ pub(crate) fn gguf_spm_data(g: &GgufIndex) -> Option<SpmData> {
     })
 }
 
+/// Whether llama.cpp adds BOS and EOS around a GGUF's text: the file's `tokenizer.ggml.add_bos_token` /
+/// `add_eos_token` when present, else the vocab family's default (`llama_vocab::impl::load`): SentencePiece
+/// adds BOS, byte-level BPE adds none except the llama3 pre-tokenizer, and none adds EOS.
+fn gguf_special_policy(g: &GgufIndex) -> (bool, bool) {
+    let default_bos = match g.get("tokenizer.ggml.model").and_then(|v| v.as_str()) {
+        Some("llama" | "gemma4") => true,
+        _ => BpePre::from_gguf(g) == BpePre::Llama3,
+    };
+    let flag = |key: &str, default: bool| g.get(key).and_then(|v| v.as_bool()).unwrap_or(default);
+    (
+        flag("tokenizer.ggml.add_bos_token", default_bos),
+        flag("tokenizer.ggml.add_eos_token", false),
+    )
+}
+
+/// llama.cpp's pre-tokenizer families for byte-level BPE GGUFs, selected by `tokenizer.ggml.pre`. The
+/// regexes are llama.cpp's `LLAMA_VOCAB_PRE_TYPE_*` split patterns: they differ in how digit runs group
+/// (llama3 in runs of up to three from the left, qwen2 one digit at a time, gpt2 the whole run).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BpePre {
+    /// `llama-bpe` (and its `llama3`/`llama-v3` aliases): Llama-3 family.
+    Llama3,
+    /// `qwen2`: Qwen2/2.5/3.
+    Qwen2,
+    /// Anything else (including an absent key): the GPT-2 split, the `tokenizers` ByteLevel default.
+    Gpt2,
+}
+
+impl BpePre {
+    const LLAMA3_REGEX: &'static str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+    const QWEN2_REGEX: &'static str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+    fn from_gguf(g: &GgufIndex) -> Self {
+        match g.get("tokenizer.ggml.pre").and_then(|v| v.as_str()) {
+            Some("llama-bpe" | "llama3" | "llama-v3") => Self::Llama3,
+            Some("qwen2") => Self::Qwen2,
+            _ => Self::Gpt2,
+        }
+    }
+
+    /// llama.cpp sets `ignore_merges` for llama3: a whole pre-token that is a vocab entry is emitted
+    /// as that id without running the merges.
+    fn ignore_merges(self) -> bool {
+        self == Self::Llama3
+    }
+
+    fn pre_tokenizer(self) -> Result<tokenizers::PreTokenizerWrapper> {
+        use tokenizers::SplitDelimiterBehavior;
+        use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+        use tokenizers::pre_tokenizers::sequence::Sequence;
+        use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
+        let regex = match self {
+            Self::Llama3 => Self::LLAMA3_REGEX,
+            Self::Qwen2 => Self::QWEN2_REGEX,
+            // No prefix space, trim offsets, GPT-2 regex split.
+            Self::Gpt2 => return Ok(ByteLevel::new(false, true, true).into()),
+        };
+        let split = Split::new(
+            SplitPattern::Regex(regex.to_string()),
+            SplitDelimiterBehavior::Isolated,
+            false,
+        )
+        .map_err(|e| err!("split: {e}"))?;
+        Ok(Sequence::new(vec![
+            split.into(),
+            ByteLevel::new(false, true, false).into(),
+        ])
+        .into())
+    }
+}
+
 /// Builds a byte-level BPE [`Tokenizer`] from a GGUF's `tokenizer.ggml.tokens` + `.merges` (qwen2 is
 /// gpt2-style byte-level BPE). Special tokens already live in the vocab; the ByteLevel
 /// pre-tokenizer/decoder (no prefix space) handles plain text.
@@ -586,13 +663,14 @@ pub(crate) fn gguf_tokenizer(g: &GgufIndex) -> Result<Tokenizer> {
         );
     }
 
+    let pre = BpePre::from_gguf(g);
     let bpe = BPE::builder()
         .vocab_and_merges(vocab, merges)
+        .ignore_merges(pre.ignore_merges())
         .build()
         .map_err(|e| err!("build bpe: {e}"))?;
     let mut tok = Tokenizer::new(bpe);
-    // qwen byte-level: no prefix space, trim offsets, regex split.
-    tok.with_pre_tokenizer(Some(ByteLevel::new(false, true, true)));
+    tok.with_pre_tokenizer(Some(pre.pre_tokenizer()?));
     tok.with_decoder(Some(ByteLevel::new(false, true, true)));
     // Register control/user-defined tokens as atomic added-tokens (see `gguf_special_tokens`).
     tok.add_special_tokens(&gguf_special_tokens(g));
@@ -1257,5 +1335,249 @@ mod gemma_tokenizer {
             let b = hf.encode(s, false).unwrap().get_ids().to_vec();
             eprintln!("wip   {s:?} match={}\n  gguf={a:?}\n  hf  ={b:?}", a == b);
         }
+    }
+}
+
+/// `TextCodec::encode` against llama.cpp's own token ids on the Llama-3.2-1B vocabulary (the llama-bpe
+/// pre-tokenizer: digits in runs of up to three from the left, the llama3 regex splits, BOS from the
+/// file's defaults). Skips when the checkpoint is absent from the models directory.
+#[cfg(test)]
+mod llama3_golden_tests {
+    use super::*;
+
+    /// `(text, ids)`, each recorded with
+    /// `llama-tokenize -m Llama-3.2-1B-Instruct-Q4_K_M.gguf -f <file holding exactly the text> --ids`
+    /// (llama.cpp build of the dev box, 2026-10-06). BOS 128000 leads every row: llama.cpp adds it for
+    /// the llama-bpe pre-tokenizer.
+    const GOLDEN: &[(&str, &[u32])] = &[
+        ("", &[128000]),
+        ("x", &[128000, 87]),
+        (
+            "The number 4719 and 1234567 and 0042",
+            &[
+                128000, 791, 1396, 220, 20617, 24, 323, 220, 4513, 10961, 22, 323, 220, 8759, 17,
+            ],
+        ),
+        (
+            "Total: 3.14159, 2024-10-06, 1000000",
+            &[
+                128000, 7749, 25, 220, 18, 13, 9335, 2946, 11, 220, 2366, 19, 12, 605, 12, 2705,
+                11, 220, 1041, 931, 15,
+            ],
+        ),
+        (
+            "héllo wörld, 你好世界, 😀 café",
+            &[
+                128000, 71, 19010, 385, 289, 9603, 509, 11, 118195, 53901, 102616, 11, 91416, 53050,
+            ],
+        ),
+        ("a  b   c    d", &[128000, 64, 220, 293, 256, 272, 262, 294]),
+        (
+            "line one\n\n\nline two\r\n  indented",
+            &[128000, 1074, 832, 1432, 1074, 1403, 319, 220, 1280, 16243],
+        ),
+        (
+            "fn main() {\n    println!(\"{}\", x[0] + 12);\n}",
+            &[
+                128000, 8998, 1925, 368, 341, 262, 14069, 80978, 865, 58, 15, 60, 489, 220, 717,
+                317, 92,
+            ],
+        ),
+        (
+            "don't I'll WE'RE can't",
+            &[128000, 15357, 956, 358, 3358, 20255, 95253, 649, 956],
+        ),
+        (
+            "hi<|eot_id|>x<|start_header_id|>user<|end_header_id|>",
+            &[128000, 6151, 128009, 87, 128006, 882, 128007],
+        ),
+        (
+            "  leading and trailing   ",
+            &[128000, 220, 6522, 323, 28848, 262],
+        ),
+    ];
+
+    /// The qwen2 pre-tokenizer on the Qwen2.5-0.5B vocabulary (one digit per token, no BOS), recorded as
+    /// above with `qwen2.5-0.5b-instruct-q4_k_m.gguf`. The upper-case contractions and the newline runs
+    /// are where the qwen2 regex differs from the GPT-2 split, so a wrong selector changes these ids.
+    #[test]
+    fn qwen2_encode_equals_llama_cpp_token_ids() {
+        const GOLDEN: &[(&str, &[u32])] = &[
+            (
+                "The number 4719 and 1234567, don't  go\nx",
+                &[
+                    785, 1372, 220, 19, 22, 16, 24, 323, 220, 16, 17, 18, 19, 20, 21, 22, 11, 1513,
+                    944, 220, 728, 198, 87,
+                ],
+            ),
+            ("WE'RE I'LL", &[12457, 94153, 358, 6, 4086]),
+            ("a \n\nb  \n  c", &[64, 4710, 65, 2303, 220, 272]),
+        ];
+        let Some(path) = poot_test_util::model_path(poot_test_util::checkpoint!(
+            "qwen2.5-0.5b-gguf/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+        )) else {
+            return;
+        };
+        let g = GgufIndex::open(&path).expect("open the Qwen2.5 GGUF");
+        assert_eq!(
+            BpePre::from_gguf(&g),
+            BpePre::Qwen2,
+            "tokenizer.ggml.pre must select the qwen2 split"
+        );
+        let codec = TextCodec::from_gguf(&g, 151645, ChatFormat::ChatML).expect("build codec");
+        for (text, want) in GOLDEN {
+            assert_eq!(
+                &codec.encode(text).expect("encode"),
+                want,
+                "token ids of {text:?} differ from llama.cpp"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_equals_llama_cpp_token_ids() {
+        let Some(path) = poot_test_util::model_path(poot_test_util::checkpoint!(
+            "llama-3.2-1b-gguf/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+        )) else {
+            return;
+        };
+        let g = GgufIndex::open(&path).expect("open the Llama-3.2-1B GGUF");
+        assert_eq!(
+            BpePre::from_gguf(&g),
+            BpePre::Llama3,
+            "tokenizer.ggml.pre must select the llama3 split"
+        );
+        let codec = TextCodec::from_gguf(&g, 128009, ChatFormat::ChatML).expect("build codec");
+        for (text, want) in GOLDEN {
+            assert_eq!(
+                &codec.encode(text).expect("encode"),
+                want,
+                "token ids of {text:?} differ from llama.cpp"
+            );
+        }
+    }
+}
+
+/// The BOS/EOS rows of [`gguf_special_policy`] through `TextCodec::from_gguf`/`encode`, on synthetic GGUF
+/// vocabularies: llama.cpp's per-family defaults and the explicit `add_bos_token` / `add_eos_token` keys.
+#[cfg(test)]
+mod gguf_special_policy_tests {
+    use super::*;
+    use poot_load::gguf::{GgufValue, write_gguf};
+
+    const BOS: u32 = 3;
+    const EOS: u32 = 4;
+
+    /// A byte-level BPE vocab (`a`=0, `b`=1, `ab`=2, `<s>`=3, `</s>`=4): `encode("ab")` is `[2]` before
+    /// BOS/EOS. `pre` is `tokenizer.ggml.pre`; `flags` the add_bos/add_eos keys under test.
+    fn bpe_codec(pre: &str, flags: &[(&'static str, bool)]) -> TextCodec {
+        let str_array = |items: &[&str]| {
+            GgufValue::Array(
+                items
+                    .iter()
+                    .map(|s| GgufValue::Str(s.to_string()))
+                    .collect(),
+            )
+        };
+        let mut kvs = vec![
+            ("general.architecture", GgufValue::Str("llama".into())),
+            ("tokenizer.ggml.model", GgufValue::Str("gpt2".into())),
+            ("tokenizer.ggml.pre", GgufValue::Str(pre.into())),
+            (
+                "tokenizer.ggml.tokens",
+                str_array(&["a", "b", "ab", "<s>", "</s>"]),
+            ),
+            ("tokenizer.ggml.merges", str_array(&["a b"])),
+            ("tokenizer.ggml.bos_token_id", GgufValue::U32(BOS)),
+            ("tokenizer.ggml.eos_token_id", GgufValue::U32(EOS)),
+        ];
+        kvs.extend(flags.iter().map(|&(k, v)| (k, GgufValue::Bool(v))));
+        let index = GgufIndex::from_bytes(&write_gguf(&kvs, &[])).expect("parse the BPE fixture");
+        TextCodec::from_gguf(&index, EOS, ChatFormat::ChatML).expect("build the BPE codec")
+    }
+
+    /// A SentencePiece vocab (`<unk>`=0, `<s>`=1, `</s>`=2, `▁a`=3, `a`=4): `encode("a")` is `[3]`.
+    fn spm_codec(flags: &[(&'static str, bool)]) -> TextCodec {
+        let tokens = ["<unk>", "<s>", "</s>", "\u{2581}a", "a"];
+        let mut kvs = vec![
+            ("general.architecture", GgufValue::Str("llama".into())),
+            ("tokenizer.ggml.model", GgufValue::Str("llama".into())),
+            (
+                "tokenizer.ggml.tokens",
+                GgufValue::Array(
+                    tokens
+                        .iter()
+                        .map(|s| GgufValue::Str(s.to_string()))
+                        .collect(),
+                ),
+            ),
+            (
+                "tokenizer.ggml.scores",
+                GgufValue::Array([0.0, 0.0, 0.0, -1.0, -2.0].map(GgufValue::F32).to_vec()),
+            ),
+            ("tokenizer.ggml.bos_token_id", GgufValue::U32(1)),
+            ("tokenizer.ggml.eos_token_id", GgufValue::U32(2)),
+        ];
+        kvs.extend(flags.iter().map(|&(k, v)| (k, GgufValue::Bool(v))));
+        let index = GgufIndex::from_bytes(&write_gguf(&kvs, &[])).expect("parse the SPM fixture");
+        TextCodec::from_gguf(&index, 2, ChatFormat::ChatML).expect("build the SPM codec")
+    }
+
+    const ADD_BOS: &str = "tokenizer.ggml.add_bos_token";
+    const ADD_EOS: &str = "tokenizer.ggml.add_eos_token";
+
+    #[test]
+    fn byte_level_bpe_adds_no_bos_by_default() {
+        assert_eq!(bpe_codec("gpt-2", &[]).encode("ab").unwrap(), [2]);
+    }
+
+    #[test]
+    fn the_llama3_pre_tokenizer_adds_bos_by_default() {
+        assert_eq!(bpe_codec("llama-bpe", &[]).encode("ab").unwrap(), [BOS, 2]);
+    }
+
+    #[test]
+    fn an_explicit_add_bos_false_overrides_the_llama3_default() {
+        let codec = bpe_codec("llama-bpe", &[(ADD_BOS, false)]);
+        assert_eq!(codec.encode("ab").unwrap(), [2]);
+    }
+
+    #[test]
+    fn an_explicit_add_bos_true_overrides_the_bpe_default() {
+        let codec = bpe_codec("gpt-2", &[(ADD_BOS, true)]);
+        assert_eq!(codec.encode("ab").unwrap(), [BOS, 2]);
+    }
+
+    #[test]
+    fn add_eos_token_appends_eos() {
+        let codec = bpe_codec("gpt-2", &[(ADD_EOS, true)]);
+        assert_eq!(codec.encode("ab").unwrap(), [2, EOS]);
+    }
+
+    #[test]
+    fn add_bos_and_add_eos_wrap_the_text() {
+        let codec = bpe_codec("gpt-2", &[(ADD_BOS, true), (ADD_EOS, true)]);
+        assert_eq!(codec.encode("ab").unwrap(), [BOS, 2, EOS]);
+    }
+
+    #[test]
+    fn no_eos_is_appended_by_default() {
+        assert_eq!(bpe_codec("llama-bpe", &[]).encode("ab").unwrap(), [BOS, 2]);
+    }
+
+    #[test]
+    fn sentencepiece_adds_bos_by_default() {
+        assert_eq!(spm_codec(&[]).encode("a").unwrap(), [1, 3]);
+    }
+
+    #[test]
+    fn an_explicit_add_bos_false_overrides_the_sentencepiece_default() {
+        assert_eq!(spm_codec(&[(ADD_BOS, false)]).encode("a").unwrap(), [3]);
+    }
+
+    #[test]
+    fn sentencepiece_honours_add_eos_token() {
+        let codec = spm_codec(&[(ADD_EOS, true)]);
+        assert_eq!(codec.encode("a").unwrap(), [1, 3, 2]);
     }
 }

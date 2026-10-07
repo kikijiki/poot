@@ -115,7 +115,7 @@ fn checkpoint_orientation_projection_matches_the_oracle_on_ptx() {
 /// `ComputedConst::AlibiSlopes` of 6 heads, decode at three positions and a 4-token prefill), compiled for
 /// PTX, matches `eval(g)` at every replayed step (ADR-0101 tier 1) AND an f64 reference that writes the
 /// published slopes out as literals (tier 2), so a slope formula both the oracle and the device read from
-/// the same constant cannot hide. Mutation: in `ComputedConst::values_f32` return zero slopes (or drop the
+/// the same constant cannot hide. Mutation: in `ComputedConst::tensor` return zero slopes (or drop the
 /// odd-index series of the second half); the reference comparison goes red.
 #[test]
 fn alibi_slopes_attention_matches_the_oracle_and_the_reference_on_ptx() {
@@ -156,6 +156,22 @@ fn f16_checkpoint_orientation_projection_matches_the_oracle_on_ptx() {
     }
 }
 
+/// POOT-1033: `Select` is a bitwise select. An F32 select (standalone, and inside a fused float region) over
+/// poisoned branches and an I32 select over nonzero condition words each equal the hand-written select words
+/// and the oracle's, bit for bit: a NaN or an infinity in the unselected branch stays out, and a NaN payload,
+/// an infinity or `-0.0` in the selected one passes through.
+/// Mutation: emit the arithmetic form `if_false + cond * (if_true - if_false)` in `emit_bitwise_select`
+/// (`poot-kernelgen`'s `fused.rs`), with a fresh `POOT_KERNEL_CACHE_DIR`; every row goes red.
+#[test]
+fn select_is_bitwise_on_ptx() {
+    let Some(device) = open_or_skip(DeviceBackend::Ptx, PtxDevice::new()) else {
+        return;
+    };
+    let t = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    poot_executor_parity::select::assert_select_is_bitwise(exec.as_mut(), t);
+}
+
 /// Card 1011: a BF16 const cast to F32 is read from its packed `u32` lanes by the imported
 /// `packed_bf16_to_f32` body. Four cases (five elements ending in a half-used lane, and three single
 /// elements) carry a quiet NaN payload, a negative NaN payload and a subnormal; every device word equals the
@@ -176,4 +192,46 @@ fn bf16_const_cast_is_bit_exact_on_ptx() {
             .unwrap_or_else(|e| panic!("{e}"));
         poot_executor_parity::bf16_cast::assert_bit_exact(fixture, &got[0], &oracle);
     }
+}
+
+/// Card 663 SC-001, PTX. The batched, multi-block tensor-core matmul: `[2, 32, 48] x [2, 48, 32]` bf16 operands
+/// (`poot_executor_parity::launch::wmma_bf16_batched_fixture`), 2 x 2 x 2 output tiles each accumulating three
+/// 16-wide K blocks, every output element of both steps compared with the oracle. The fixture values give every
+/// K block a distinct nonzero contribution to every output (at least 16 per block), so a dropped, doubled or
+/// wrong-batch block moves all outputs far past the parity tolerance.
+///
+/// Mutation: drop the last K block in `poot-kernelgen`'s `tensor_core_tiles` (the loop bound `k0 < k` becomes
+/// `k0 + 16 < k`), with a fresh `POOT_KERNEL_CACHE_DIR`; every output is short by its last block's contribution
+/// and the row goes red.
+#[test]
+fn batched_multi_block_wmma_matmul_matches_the_oracle_on_ptx() {
+    let Some(device) = open_or_skip(DeviceBackend::Ptx, PtxDevice::new()) else {
+        return;
+    };
+    let t = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    let fixture = poot_executor_parity::launch::wmma_bf16_batched_fixture();
+    let multiplies_on_tensor_cores =
+        poot_executor_parity::staged(&fixture, t, poot_graph_plan::Submission::Replay)
+            .stages()
+            .flat_map(|(_, _, program)| {
+                program
+                    .planned()
+                    .filter_map(|(_, plan)| plan.single().map(|dispatch| dispatch.body.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .any(|body| {
+                body.blocks
+                    .iter()
+                    .flat_map(|block| &block.statements)
+                    .any(|statement| matches!(statement, poot_kernel_ir::Statement::WmmaMma { .. }))
+            });
+    assert!(
+        multiplies_on_tensor_cores,
+        "{}: no dispatched kernel multiplies on the WMMA tensor cores",
+        fixture.name
+    );
+    let mut oracle = oracle_for(&fixture.graph, &fixture.store);
+    poot_executor_parity::run_parity(exec.as_mut(), t, &fixture, &mut oracle)
+        .unwrap_or_else(|e| panic!("{e}"));
 }

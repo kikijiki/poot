@@ -81,16 +81,16 @@ others.
 value of identical type. The executor feeds the buffer in and overwrites it with `state_out`
 (the JAX `donate_argnums` contract), which also orders the KV read before the KV write.
 
-**`Computed`**. A compiler-defined constant, such as a folded `Iota`. Its value comes from the graph
-rather than a checkpoint weight binder.
+**`Computed`**. A compiler-defined constant, such as a folded `Iota` (an `F32` range, or an exact
+`I32` range). Its value comes from the graph rather than a checkpoint weight binder.
 
 ## Primitive operations
 
 The `OpKind` vocabulary. Tracers emit the primitives (elementwise, reduce, movement, matmul,
 gather/scatter, quantization). The optimizer introduces the composite ops (`Fused`, `FusedRow`,
-`MatMulBias`, `FlashAttention*`, `Rope`, and the packed/dense contraction ops), each with the
+`ContractionEpilogue`, `Attention`, `Rope`, and the packed/dense contraction ops), each with the
 same semantics as the primitive chain it replaces; a tracer cannot emit them. No op records a
-kernel choice: which kernel runs an eqn (a tiled GEMM, a flash region kernel, an imported kernel)
+kernel choice: which kernel runs an eqn (a tiled GEMM, the attention kernel, an imported kernel)
 is a property of its plan.
 
 <OpTable />
@@ -124,7 +124,7 @@ out = Binary(Div, ex, s)
 
 The Max and Sum reductions share the same traversal. This is the two-pass safe pattern
 (subtract max, then normalize). The streaming "online" algorithm used inside flash attention
-is different, see [Attention](./attention#flash-attention-decode). After flash attention
+is different, see [Attention](./attention#the-streaming-schedule). After flash attention
 rewrite, this entire pattern (plus the surrounding matmuls) disappears into one fused dispatch.
 
 **RoPE** [^rope]. The tracer emits the rotate-half chain (`ops::rope_partial`), with `cos`/`sin`
@@ -154,7 +154,7 @@ runs entirely on the host at trace time. No shape computation ever happens on th
 Two consequences. First, the executor knows every buffer size before the first dispatch
 and can allocate everything upfront at stable addresses, a requirement for CUDA graph
 capture. Second, because all shapes are static, the planner can select kernel
-specializations (GEMV vs GEMM, flash decode vs prefill) at compile time rather than
+specializations (GEMV vs GEMM, the attention schedule) at compile time rather than
 conditionally at runtime.
 
 The exception: per-step inputs (token id, position) are `Storage::Slot` inputs (`Slot::Token`, `Slot::Pos`), small

@@ -58,7 +58,7 @@ enum WitnessOp {
     Sub,
     Mul,
     Max,
-    /// `f + c * (t - f)` over I32 counts.
+    /// A true select of one branch: the bound is the larger branch bound whatever the condition.
     Select,
     ReduceSum {
         axis: usize,
@@ -139,7 +139,7 @@ fn witness_op(op: &OpKind) -> WitnessOp {
         | OpKind::PackedRowGather { .. }
         | OpKind::DenseContraction { .. }
         | OpKind::DenseRowGather { .. }
-        | OpKind::MatMulBias
+        | OpKind::ContractionEpilogue { .. }
         | OpKind::ArgTopK { .. }
         | OpKind::IndexedMatMul
         | OpKind::DynamicUpdateSlice { .. }
@@ -147,8 +147,7 @@ fn witness_op(op: &OpKind) -> WitnessOp {
         | OpKind::UnpackI8 { .. }
         | OpKind::Fused(_)
         | OpKind::FusedRow(_)
-        | OpKind::FlashAttentionDecode { .. }
-        | OpKind::FlashAttentionPrefill { .. }
+        | OpKind::Attention(_)
         | OpKind::Rope { .. }
         | OpKind::AllReduce { .. }
         | OpKind::AllGather { .. }
@@ -247,19 +246,13 @@ impl<'g, V: ValidationChannel> WitnessWalk<'g, V> {
             }
             WitnessOp::Select => {
                 let bounds = self.operands(eqn)?;
-                let &[condition, if_true, if_false] = bounds.as_slice() else {
+                let &[_condition, if_true, if_false] = bounds.as_slice() else {
                     return Err(DeviceWitnessRejection::UnsupportedOp {
                         value,
                         op: eqn.op.name(),
                     });
                 };
-                Self::checked(
-                    value,
-                    if_true
-                        .checked_add(if_false)
-                        .and_then(|sum| condition.checked_mul(sum))
-                        .and_then(|scaled| scaled.checked_add(if_false)),
-                )?
+                if_true.max(if_false)
             }
             WitnessOp::ReduceSum { axis } => {
                 let bounds = self.operands(eqn)?;

@@ -354,8 +354,10 @@ impl<const N: usize> ConstPlan<N> {
     pub(crate) fn decode_blocks(&self, bytes: &[u8], out: &mut [f32]) -> Result<(), DecodeError> {
         let mut padded: Padded = [0; MAX_BLOCK_BYTES + 8];
         let mut slots: Slots = [[0.0; MAX_SLOTS]; 4];
-        for (block, out) in bytes.chunks_exact(self.bytes).zip(out.chunks_exact_mut(N)) {
-            let out: &mut [f32; N] = out.try_into().expect("chunks of N values");
+        for (block, out) in bytes
+            .chunks_exact(self.bytes)
+            .zip(out.as_chunks_mut::<N>().0.iter_mut())
+        {
             self.load(block, &mut padded, &mut slots)?;
             self.decode_block(&padded, &slots, out);
             if matches!(self.value, ValueMap::Float) && out.iter().any(|value| value.is_nan()) {

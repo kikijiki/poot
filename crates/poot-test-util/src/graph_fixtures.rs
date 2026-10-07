@@ -106,6 +106,50 @@ pub fn roomy_body_limits() -> poot_kernelgen::BodyLimits {
     }
 }
 
+/// The graph and device caps to compile for the full pipeline (`guarded == false`) or for the
+/// routed-expert hang guard (`guarded == true`, see [`with_routed_expert_site`] and
+/// [`with_routed_expert_hang`]). Caps, not a `Target`, so the in-crate tests of `poot-graph-plan` (which
+/// see their own `Target` type) can call it too.
+pub fn pipeline_input(g: &Graph, caps: DeviceCaps, guarded: bool) -> (Graph, DeviceCaps) {
+    if guarded {
+        (
+            with_routed_expert_site(g.clone()),
+            with_routed_expert_hang(caps),
+        )
+    } else {
+        (g.clone(), caps)
+    }
+}
+
+/// `caps` with the routed-expert hang fact set, as the ROCm and PTX presets carry it.
+pub fn with_routed_expert_hang(caps: DeviceCaps) -> DeviceCaps {
+    let mut caps = caps;
+    caps.known_miscompiles.routed_expert_tiling_hang = true;
+    caps
+}
+
+/// `g` with one routed-expert site that nothing consumes: a two-row router contraction, the `ArgTopK`
+/// over its ranks and an `IndexedMatMul` indexed by the selection, all built from `iota` so the graph
+/// gains no input. Compiled for a target that has the hang ([`with_routed_expert_hang`]) the graph takes
+/// the guarded pipeline (one kernel per equation, no fusion, no tiled GEMM) and `dce` then drops the site,
+/// so a test gets the guarded program of exactly `g`'s own computation.
+pub fn with_routed_expert_site(g: Graph) -> Graph {
+    let resumed = Builder::resume(g);
+    let (b, out, state) = (resumed.builder, resumed.out, resumed.state);
+    let (rows, width, experts) = (2usize, 2usize, 3usize);
+    let x = b.reshape(b.iota(rows * width), vec![rows, width]);
+    let w = b.reshape(b.iota(width * experts), vec![width, experts]);
+    let logits = b.matmul(x, w);
+    let rank = poot_graph_ir::ops::stable_descending_rank(&b, logits);
+    let ids = b.reshape(b.arg_top_k(rank, 1), vec![rows]);
+    let stack = b.broadcast(
+        b.reshape(b.iota(width * width), vec![1, width, width]),
+        vec![experts, width, width],
+    );
+    b.indexed_matmul(x, stack, ids);
+    b.finish_with_state(out, &state)
+}
+
 /// Choose how to execute an eqn at `world_size = 1`, with no caller-owned graph-wide analysis. Reimplements
 /// `poot-graph-plan`'s deleted `plan_eqn` by building the one-shot analysis the deleted wrapper built
 /// internally, then calling the still-pub, still-production-used `plan_eqn_analyzed`.

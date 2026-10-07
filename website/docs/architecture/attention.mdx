@@ -55,66 +55,96 @@ number of K and V heads relative to Q. poot handles this with `repeat_kv`
 carries `n_rep = 4` and the kernel reads `kv_head = q_head / n_rep`, so the same K/V rows
 are shared by several Q heads without a copy.
 
-## The flash attention rewrite pass
+## The attention rewrite pass
 
-Flash attention [^flash1] [^flash2] avoids materializing the `[H x L]` score matrix by
-streaming over K/V in chunks and maintaining a running (max, denominator, accumulator)
-triple in shared memory. poot implements this as a **compiler pass**, not an opt-in mode.
+Flash attention [^flash1] [^flash2] avoids materializing the `[Lq x Lk]` score matrix by
+streaming over K/V and maintaining a running (max, denominator, accumulator) triple in
+workgroup memory. poot implements this as a **compiler pass**, not an opt-in mode.
 
-`compile`'s flash-attention rewrite runs after canonicalization and RoPE recognition,
-using the target grid limit. It recognizes supported attention subgraphs and replaces them with a single
-`FlashAttentionDecode` (one query row) or `FlashAttentionPrefill` eqn. The planner then
-chooses the kernel and records the choice with the plan: a synthesized region kernel
-(`kg::flash_region_decode` for decode, `kg::flash_region_prefill` for a prefill with no softcap)
-within the LDS head-dim cap, and the imported `#[kernel]` source `flash_prefill.rs` for a
-softcapped prefill. A decode wider than the cap keeps its primitive decomposition.
+`compile`'s attention rewrite runs after canonicalization and RoPE recognition, using the
+target grid limit. It recognizes supported attention subgraphs and replaces them with a single
+`Attention` eqn. Decode (one query row against a capacity-long cache) and prefill (every
+query row against the prompt) are the same op: `q [B, Hq, Lq, Dk]`, `k [B, Hkv, Lk, Dk]`,
+`v [B, Hkv, Lk, Dv]` (the value width is independent of the key width), an additive
+`mask [B, Hm, Lq, Lk]` whose head axis is 1 or `Hq` (ALiBi), and an optional attention-logit
+softcap. Two more forms ride on the same op: a split key (below) and a live length.
+
+The planner turns the eqn into one generation request that names the shape, the score
+transform (scale, or scale plus softcap), the mask kind, the key bound and the schedule. One
+generator serves every phase, target and head width. The planner picks the schedule's lane
+count from the device's workgroup memory and records the request with the plan. It refuses the
+eqn with a typed capability error only when the device cannot hold the running state of even
+one lane (`AttentionLds`, naming the value width and the device's bytes).
 
 Models compose attention with `ops::attention_masked` or `ops::attention_prefill`. The compiler
-selects flash attention when the shape and target satisfy the matcher checks. Unsupported patterns
-keep their primitive decomposition; the typed `FusionPolicy::MoeHangGuard` also disables this rewrite.
+selects the fused op when the shape and target satisfy the matcher checks. Unsupported patterns
+keep their primitive decomposition; a routed-expert prefill on a target with the recorded routed-expert hang also skips this rewrite.
 
-## Flash attention decode
+## The streaming schedule
 
-Used when M=1, one query token attending to a KV cache of up to `cap` positions.
+The implemented schedule runs one workgroup of `lanes` threads per (batch row, query head,
+query row): `B * n_q_heads * Lq` workgroups, laid over a 2-D grid when that count passes the
+device's X grid limit. Each lane strides over the keys (`t = lane, lane + lanes, ...`) and
+keeps its own running state. The lane count is the widest power of two, at most 64, whose
+state fits the device's workgroup memory: `lanes * (dv + 2)` floats.
 
-**Grid:** one workgroup per (batch row, query head): `B * n_q_heads` workgroups.
-
-**The online softmax algorithm** [^onlinesoftmax] keeps three accumulators in LDS
+**The online softmax algorithm** [^onlinesoftmax] keeps three accumulators per lane in LDS
 (workgroup-local memory):
 
 <FlashAttentionDiagram />
 
 ```rust
-// For each chunk of TILE keys/values from the KV cache:
-let score = dot_product(q, k_chunk, lane_id) * scale;
-let m_new = max(m_running, wg_reduce_max(score));
-// Rescale old accumulator, add contribution from this chunk
+// Per lane, over its keys:
+let score = softcap_or_identity(dot(q, k[t]) * scale) + mask[t];
+let m_new = max(m, score);
+let rescale = exp(m - m_new);        // 0 while the lane has seen nothing
+let weight = exp(score - m_new);
+l = l * rescale + weight;
 for d in 0..head_dim {
-    let old = wg_read(&acc, d);
-    wg_write(&mut acc, d,
-        exp(m_running - m_new) * old + exp(score - m_new) * v_chunk[d]);
+    o[d] = o[d] * rescale + weight * v[t][d];
 }
-l_running = exp(m_running - m_new) * l_running + wg_reduce_sum(exp(score - m_new));
-m_running = m_new;
-wg_barrier();
-// After all chunks: normalize
-if lane < head_dim { out[lane] = wg_read(&acc, lane) / l_running; }
+m = m_new;
+// One barrier, then every lane folds the lanes' partials over a slice of the output channels:
+// M = max of the lane maxima, out[c] = sum_i o_i[c] * exp(m_i - M) / sum_i l_i * exp(m_i - M)
 ```
 
-The accumulator `acc[head_dim]` is in workgroup LDS, not a private array: private arrays with
-dynamic indices crash some SPIR-V drivers (RADV). The imported `#[kernel]` source runs on wgpu, PTX and ROCm.
+The accumulators are in workgroup LDS, not private arrays: private arrays with dynamic indices
+crash some SPIR-V drivers (RADV). The same generated kernel runs on wgpu, PTX and ROCm.
 
-Peak memory: **O(head_dim)** per workgroup. The `[H x cap]` score matrix is never written.
+A key whose score is `-inf` adds exactly zero weight, and a row with no visible key at all is
+`0 / 0`, as the oracle's softmax gives. Peak memory is **O(head_dim)** per workgroup: the
+`[Lq x Lk]` score matrix is never written.
 
-## Flash attention prefill
+## Split keys and the live length
 
-Used when M=L, a full sequence of query tokens during prefill.
+**Split keys.** Multi-head latent attention [^mla] builds each key from a per-head part and one
+rotary part shared by every head: `concat(k_nope, broadcast(k_pe))`. The rewrite recognizes that
+chain and keeps the two parts as separate operands, `k [B, Hkv, Lk, Dk - s]` and
+`k_shared [B, 1, Lk, s]`. The kernel reads the shared part once per key for every head, so the
+broadcast key is never built. A value narrower than the key (DeepSeek-V2: key width 192, value width
+128) is part of the op's type.
 
-One workgroup handles one (head, query row) pair against all K/V chunks, so the grid is
-`n_q_heads * L` workgroups. Peak memory: **O(L x head_dim)**, with no `[L x L]` matrix. It
-runs on wgpu, PTX and ROCm and uses the same LDS-accumulator pattern as decode. On wgpu the
-default pipeline does not rewrite prefill attention when `n_q_heads * L` exceeds 65535
-workgroups (the `gridDim.x` limit), which keeps the primitive decomposition.
+**Live length.** A decode over a capacity-long cache normally visits every slot and lets the mask
+hide the unused ones. The live form takes an `I32 len [B]` operand and visits only the first
+`len[b]` keys of each batch row, so a decode step costs the live length, not the capacity. The grid
+and the recorded launch do not depend on `len`, so capture and replay stay valid. The length is built
+in the graph from the position (`len = pos + 1`).
+
+`ops::attention_live` is the one definition. It requires `1 <= len[b] <= Lk` and checks the range
+with the canonical index-bounds guard: an out-of-range length fails through the validation channel
+and publishes nothing. It then selects the inactive key and value rows to zero before either matmul
+(a true select, so a NaN in an unused row cannot reach the output; multiplying by zero would keep
+it) and selects the inactive scores to `-inf` before the softmax. The rewrite emits the live bound
+only for a graph that already has that shape and declares the length witness as a validation output.
+A graph with only a score mask (the in-graph causal mask of the dense families), a guard on some
+operands, or a length no validation bounds keeps its capacity form or its primitive decomposition,
+and its results do not change. That primitive form runs on every device: the key positions it
+compares against `len` are an exact `I32` range, with no round trip through `F32`. A generated
+kernel clamps `len` into `0..=Lk` before it bounds the loop, so no length can read outside the
+buffers.
+
+This is the portable first schedule. Later schedules (tiled prefill, split-KV decode) reuse the
+same score, mask and softmax-combine semantics and are chosen by the planner per shape.
 
 ## KV cache
 
@@ -158,15 +188,14 @@ policy, the kernel itself does not change.
 
 ## Implementation details
 
-- **One shared head width for flash.** The flash rewrite requires Q, K, and V to share the same
-  trailing head dimension. MLA-style attention (multi-head latent attention [^mla]: compressed KV,
-  often with a narrower V head) stays on the primitive decomposition (`poot-graph-ir` flash matcher).
-  Folding those shapes would give the flash op the wrong output type and overrun V. See
-  [Crates and implementation details](./implementation).
-- **Softcap and flash decode.** Softcapped decode-shaped attention is not rewritten into
-  `FlashAttentionDecode` (that op has no softcap parameter). The matcher refuses the rewrite so the
-  softcap is not silently dropped.
-- **Prefill batching.** Flash prefill is batch=1 only today; a batched prefill stays decomposed.
+- **Key and value widths.** The value width is independent of the key width, and a split key
+  (multi-head latent attention [^mla]) is a first-class operand layout. The matcher declines a chain
+  whose key or value the op's typing rule cannot type, such as a single key head the matmul merely
+  broadcasts. See [Crates and implementation details](./implementation).
+- **Softcap.** The softcap is part of the score transform on every phase: Gemma 2's decode and
+  prefill both run the generated kernel.
+- **Head width.** There is no fixed head-width limit: the lane count follows the device's workgroup
+  memory, so a 512-wide head runs on every target with fewer lanes than a 64-wide one.
 - **RADV.** Mesa's open-source AMD Vulkan driver. Several SPIR-V subset rules (no private arrays with
   dynamic indices; structurized CFG) exist because RADV crashed on otherwise-valid patterns.
 

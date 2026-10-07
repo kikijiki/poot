@@ -13,8 +13,8 @@ use poot_graph_ir::op::SampleRule;
 use poot_graph_ir::{BinOp, Builder, Graph, OpKind, RedOp, TensorType, UnOp};
 use poot_graph_plan::{
     Capability, CompileError, CompileLimits, CompileOptions, ExactI32StorageAnalysis,
-    ExpansionError, FusionPolicy, GraphResource, KernelChoice, PlanError, Submission, Target,
-    compile, decompose_large_vocab_greedy, plan_eqn_choice_analyzed,
+    ExpansionError, GraphResource, KernelChoice, PlanError, Submission, Target, compile,
+    decompose_large_vocab_greedy, plan_eqn_choice_analyzed,
 };
 use poot_kernelgen::{BodyLimits, BodyResource, BodyStage, KernelGenError, KernelRequest};
 use poot_target::Backend;
@@ -32,7 +32,6 @@ fn wgpu() -> Target {
 fn options(limits: CompileLimits) -> CompileOptions {
     CompileOptions {
         execution: Submission::Replay,
-        fusion: FusionPolicy::Full,
         limits,
     }
 }

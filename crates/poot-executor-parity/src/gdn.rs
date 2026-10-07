@@ -3,7 +3,6 @@
 
 use poot_graph_ir::ops::gdn_prefill_chunked;
 use poot_graph_ir::{Builder, Slot, StateRole, TensorType};
-use poot_graph_plan::FusionPolicy;
 use poot_tensor::HostTensor;
 
 use poot_test_util::StepFixture;
@@ -130,7 +129,7 @@ pub fn gdn_prefill_chunked_case() -> GdnChunkedCase {
             graph,
             store,
             steps,
-            fusion: FusionPolicy::Full,
+            guarded: false,
         },
         inputs: calls,
     }

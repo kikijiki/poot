@@ -25,7 +25,7 @@ fn is_fusable<V: ValidationChannel>(g: &Graph<V>, eqn: &Eqn) -> bool {
             matches!(u, UnOp::Not | UnOp::Clz)
         }
         OpKind::Unary(u) => FUSABLE_FLOAT_UNARY_OPS.contains(u),
-        OpKind::Select => g.aval(eqn.out).dtype == DType::I32,
+        OpKind::Select => true,
         _ => false,
     }
 }
@@ -90,9 +90,11 @@ fn row_reduce_op<V: ValidationChannel>(
 
 /// A candidate for row-wise (reduction-rooted) fusion: a pointwise op or a last-axis keepdim reduce.
 /// Exact I32 stays out of this phase: I32 reduction is rejected at inference, and I32 row-fusion is not
-/// part of the pointwise-DAG fusion contract.
+/// part of the pointwise-DAG fusion contract. `Select` stays out too: its condition is an I32 leaf, and a
+/// row kernel reads float lanes only, so a select ends a row region and joins a pointwise one.
 fn is_row_candidate<V: ValidationChannel>(g: &Graph<V>, eqn: &Eqn) -> bool {
-    (is_fusable(g, eqn) && g.aval(eqn.out).dtype != DType::I32) || row_reduce_op(g, eqn).is_some()
+    (is_fusable(g, eqn) && g.aval(eqn.out).dtype != DType::I32 && !matches!(eqn.op, OpKind::Select))
+        || row_reduce_op(g, eqn).is_some()
 }
 
 /// `shape` fits a row-region signature `(L, N)`: it is `L ++ [N]` (a row) or `L ++ [1]` (a per-row scalar).
@@ -528,76 +530,182 @@ pub fn fuse<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
     // rebuild the eqn list in order: a root emits its fused eqn, an absorbed member is dropped, the rest
     // pass through.
     let mut eqns: Vec<Eqn> = Vec::with_capacity(n_eqns);
-    for e in 0..n_eqns {
+    for (e, eqn) in g.eqns.iter().enumerate() {
         if let Some(fe) = fused_at.remove(&e) {
             eqns.push(fe);
         } else if !absorbed.contains(&e) {
-            eqns.push(g.eqns[e].clone());
+            eqns.push(eqn.clone());
         }
     }
 
     Graph { eqns, ..g.clone() }
 }
 
-/// The one contraction fuse rule (Card 557, R-557-1): a `MatMul` whose output is read only by a
-/// broadcast `Add` of an `[N]` leaf (a bias the graph binds, `N` the matmul's output width) becomes one
-/// `MatMulBias(a, b, bias)` at the add's output, so the bias rides in the contraction kernel's epilogue
-/// instead of a second dispatch. This is the only producer of `MatMulBias`: tracers state the matmul
-/// and the add (`ops::linear`), and Card 727 generalizes this rule into the contraction epilogue.
+/// The contraction epilogue fuse rule: a dense contraction head whose result is read only by a chain of float
+/// pointwise steps becomes one [`OpKind::ContractionEpilogue`] at the chain's last equation, so a bias, a
+/// residual add or an activation rides in the contraction kernel's store instead of costing a dispatch and a
+/// round trip through memory. This is the only producer of the op: tracers state the contraction and the
+/// chain (`ops::linear`, the residual add), never the fused form.
 ///
-/// The legality is `fuse`'s: the matmul output is used exactly once and is not pinned (a graph output
-/// or state value). The bias must be a leaf, so the fused equation reads no value defined after the
-/// matmul. The matmul's own equation is dropped; every other equation passes through in order.
-pub fn fuse_bias_epilogues<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
+/// A chain extends while the current value has exactly one use, is not pinned (a graph output or state
+/// value), and that use is a pointwise step ([`is_fusable`], float dtype) whose output has the head's shape.
+/// Each step's other operands become the epilogue region's extra inputs, read at their broadcast position of
+/// the output element (a bias `[N]`, a residual `[.., M, N]`, a per-row scale `[M, 1]`) or inline literals.
+/// A single-use `Broadcast` feeding a step is folded into its leaf. The rule never reads a value defined after the
+/// chain's last equation, because the fused equation sits where that equation was. Two heads never share a step: a
+/// step is claimed by the first chain that reaches it.
+///
+/// Near misses stay as they were: a head with two consumers, a reducing or reshaping consumer, a step that
+/// changes the shape or the dtype, and a head `head_lowers` refuses (the planner has no epilogue lowering
+/// for it on the target: a tensor-core `MatMul`).
+pub fn fuse_contraction_epilogues<V: ValidationChannel>(
+    g: &Graph<V>,
+    head_lowers: impl Fn(&Graph<V>, &Eqn) -> bool,
+) -> Graph<V> {
     let mut producer: Vec<Option<usize>> = vec![None; g.values.len()];
     let mut uses: Vec<usize> = vec![0; g.values.len()];
+    let mut consumer: Vec<Option<usize>> = vec![None; g.values.len()];
     for (e, eqn) in g.eqns.iter().enumerate() {
         producer[eqn.out] = Some(e);
         for operand in &eqn.inputs {
             if let Operand::Value(v) = operand {
                 uses[*v] += 1;
+                consumer[*v].get_or_insert(e);
             }
         }
     }
     let pinned: HashSet<ValueId> = g.pinned_values().collect();
-    // The `MatMul` equation index and bias value an `Add` folds, if it is the epilogue shape.
-    let epilogue = |add: &Eqn| -> Option<(usize, ValueId)> {
-        let (OpKind::Binary(BinOp::Add), [Operand::Value(x), Operand::Value(y)]) =
-            (&add.op, add.inputs.as_slice())
-        else {
-            return None;
-        };
-        [(*x, *y), (*y, *x)]
-            .into_iter()
-            .find_map(|(product, bias)| {
-                let matmul = producer[product]?;
-                let width = *g.aval(product).shape.last()?;
-                (matches!(g.eqns[matmul].op, OpKind::MatMul)
-                    && uses[product] == 1
-                    && !pinned.contains(&product)
-                    && producer[bias].is_none()
-                    && g.aval(bias).shape == [width])
-                .then_some((matmul, bias))
-            })
-    };
+    let single_use = |v: ValueId| uses[v] == 1 && !pinned.contains(&v);
     let mut fused_at: HashMap<usize, Eqn> = HashMap::new();
     let mut absorbed: HashSet<usize> = HashSet::new();
-    for (e, add) in g.eqns.iter().enumerate() {
-        let Some((matmul, bias)) = epilogue(add) else {
+    for (h, head) in g.eqns.iter().enumerate() {
+        if absorbed.contains(&h) {
+            continue;
+        }
+        let Some(contraction) = epilogue_head(g, head) else {
             continue;
         };
-        let mut inputs = g.eqns[matmul].inputs.clone();
-        inputs.push(Operand::Value(bias));
+        if !head_lowers(g, head) {
+            continue;
+        }
+        let head_ty = g.aval(head.out);
+        let mut chain: Vec<usize> = Vec::new();
+        let mut current = head.out;
+        while single_use(current) {
+            let Some(next) = consumer[current] else {
+                break;
+            };
+            let step = &g.eqns[next];
+            if absorbed.contains(&next)
+                || fused_at.contains_key(&next)
+                || !is_epilogue_step(g, step, head_ty)
+            {
+                break;
+            }
+            chain.push(next);
+            current = step.out;
+        }
+        let Some(&root) = chain.last() else {
+            continue;
+        };
+        // The region's inputs: the head result (local 0), then every other value the chain reads, in order. A
+        // single-use `Broadcast` of a value is read through: the leaf is its source, which the epilogue reads
+        // at the output element's broadcast position, so the expanded copy (or a view of it) is never made.
+        let chain_values: HashSet<ValueId> = chain.iter().map(|&c| g.eqns[c].out).collect();
+        let mut extras: Vec<ValueId> = Vec::new();
+        let mut leaf_of: HashMap<ValueId, usize> = HashMap::new();
+        let mut folded: Vec<usize> = Vec::new();
+        for &c in &chain {
+            for operand in &g.eqns[c].inputs {
+                let Operand::Value(v) = operand else {
+                    continue;
+                };
+                if *v == head.out || chain_values.contains(v) || leaf_of.contains_key(v) {
+                    continue;
+                }
+                let source = match producer[*v].map(|b| (b, &g.eqns[b])) {
+                    Some((b, broadcast))
+                        if matches!(broadcast.op, OpKind::Broadcast { .. })
+                            && single_use(*v)
+                            && !absorbed.contains(&b)
+                            && matches!(
+                                broadcast.inputs.as_slice(),
+                                [Operand::Value(s)] if g.aval(*s).dtype == g.aval(*v).dtype
+                            ) =>
+                    {
+                        let [Operand::Value(s)] = broadcast.inputs.as_slice() else {
+                            unreachable!("matched a one-operand broadcast above");
+                        };
+                        folded.push(b);
+                        *s
+                    }
+                    _ => *v,
+                };
+                let position = extras.iter().position(|e| *e == source).unwrap_or_else(|| {
+                    extras.push(source);
+                    extras.len() - 1
+                });
+                leaf_of.insert(*v, position);
+            }
+        }
+        let n_inputs = 1 + extras.len();
+        let local_of = |v: ValueId| -> usize {
+            if v == head.out {
+                0
+            } else if let Some(position) = chain.iter().position(|&c| g.eqns[c].out == v) {
+                n_inputs + position
+            } else {
+                1 + leaf_of[&v]
+            }
+        };
+        let steps: Vec<FusedStep> = chain
+            .iter()
+            .map(|&c| FusedStep {
+                op: to_fused_op(&g.eqns[c].op),
+                inputs: g.eqns[c]
+                    .inputs
+                    .iter()
+                    .map(|operand| match operand {
+                        Operand::Value(v) => FusedOperand::Local(local_of(*v)),
+                        Operand::Lit(scalar) => FusedOperand::Lit(*scalar),
+                    })
+                    .collect(),
+            })
+            .collect();
+        let op = OpKind::ContractionEpilogue {
+            head: contraction,
+            region: FusedRegion {
+                n_inputs,
+                steps,
+                output: n_inputs + chain.len() - 1,
+                pack: Vec::new(),
+            },
+        };
+        let mut inputs = head.inputs.clone();
+        inputs.extend(extras.into_iter().map(Operand::Value));
+        let operand_types: Vec<_> = inputs
+            .iter()
+            .map(|operand| match operand {
+                Operand::Value(v) => g.aval(*v).clone(),
+                Operand::Lit(scalar) => scalar.ty(),
+            })
+            .collect();
+        // The fused equation must type exactly as the chain's last equation did.
+        if op.infer(&operand_types).as_ref() != Ok(g.aval(g.eqns[root].out)) {
+            continue;
+        }
         fused_at.insert(
-            e,
+            root,
             Eqn {
-                op: OpKind::MatMulBias,
+                op,
                 inputs,
-                out: add.out,
-                layer: add.layer,
+                out: g.eqns[root].out,
+                layer: g.eqns[root].layer,
             },
         );
-        absorbed.insert(matmul);
+        absorbed.insert(h);
+        absorbed.extend(chain.iter().copied().filter(|&c| c != root));
+        absorbed.extend(folded);
     }
     let eqns = g
         .eqns
@@ -607,6 +715,60 @@ pub fn fuse_bias_epilogues<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
         .map(|(e, eqn)| fused_at.remove(&e).unwrap_or_else(|| eqn.clone()))
         .collect();
     Graph { eqns, ..g.clone() }
+}
+
+/// The [`ContractionHead`] of `eqn` when it is a contraction an epilogue can follow: a `MatMul` whose operands
+/// and result share one float dtype (a mixed-dtype matmul is the tensor-core and decode-GEMV arms' contract), an
+/// `IndexedMatMul` of one float dtype (the routed expert matmul, whose gate weighting is the epilogue), a
+/// `DenseContraction`, or a plain (`blocks == 1`) `PackedContraction`.
+fn epilogue_head<V: ValidationChannel>(g: &Graph<V>, eqn: &Eqn) -> Option<ContractionHead> {
+    match &eqn.op {
+        OpKind::DenseContraction { weight } => Some(ContractionHead::Dense { weight: *weight }),
+        OpKind::PackedContraction {
+            descriptor,
+            blocks: 1,
+        } => Some(ContractionHead::Packed {
+            descriptor: *descriptor,
+            blocks: 1,
+        }),
+        OpKind::IndexedMatMul => {
+            let [Operand::Value(x), Operand::Value(w), Operand::Value(_)] = eqn.inputs.as_slice()
+            else {
+                return None;
+            };
+            let dtype = g.aval(eqn.out).dtype;
+            // An f32 contraction over an f32 or BF16 expert stack (the packed lane widens in-register).
+            let weight_fits = g.aval(*w).dtype == dtype
+                || (dtype == DType::F32 && g.aval(*w).dtype == DType::BF16);
+            (is_float(dtype) && g.aval(*x).dtype == dtype && weight_fits)
+                .then_some(ContractionHead::Indexed)
+        }
+        OpKind::MatMul => {
+            let [Operand::Value(a), Operand::Value(b)] = eqn.inputs.as_slice() else {
+                return None;
+            };
+            let dtype = g.aval(eqn.out).dtype;
+            (is_float(dtype) && g.aval(*a).dtype == dtype && g.aval(*b).dtype == dtype)
+                .then_some(ContractionHead::MatMul)
+        }
+        _ => None,
+    }
+}
+
+/// Whether `step` can follow a contraction head of type `head_ty` inside an epilogue: a float pointwise
+/// equation with the head's shape and dtype, so every step's operands broadcast into the head's output.
+fn is_epilogue_step<V: ValidationChannel>(g: &Graph<V>, step: &Eqn, head_ty: &TensorType) -> bool {
+    let out = g.aval(step.out);
+    is_fusable(g, step)
+        && out == head_ty
+        && step.inputs.iter().all(|operand| match operand {
+            Operand::Value(v) => g.aval(*v).dtype == out.dtype,
+            Operand::Lit(_) => true,
+        })
+}
+
+fn is_float(dtype: DType) -> bool {
+    matches!(dtype, DType::F32 | DType::BF16 | DType::F16)
 }
 
 fn fuse_i32_pack_concat<V: ValidationChannel>(

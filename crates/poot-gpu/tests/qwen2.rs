@@ -18,8 +18,8 @@ use poot_gpu::device::WgpuDevice;
 use poot_graph_ir::Slot;
 use poot_graph_ir::{Graph, SlotKey, Storage};
 use poot_graph_plan::{
-    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, FusionPolicy, Partition,
-    StagedProgram, Submission, Target, TargetSet, compile_staged,
+    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram,
+    Submission, Target, TargetSet, compile_staged,
 };
 use poot_models::model::{LogitRows, Phase, StepShape};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
@@ -40,7 +40,6 @@ fn staged(g: &Graph, target: Target) -> StagedProgram<poot_graph_ir::ValidationO
         },
         &CompileOptions {
             execution: Submission::Replay,
-            fusion: FusionPolicy::Full,
             limits: poot_graph_plan::CompileLimits::STANDARD,
         },
     )
@@ -49,8 +48,10 @@ fn staged(g: &Graph, target: Target) -> StagedProgram<poot_graph_ir::ValidationO
 
 fn f32_bytes(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 
@@ -274,7 +275,7 @@ fn bind(g: &Graph, feed: &Feed, seed_state: bool) -> HashMap<usize, Value> {
                 assert_eq!(meta.aval.dtype, DType::F32, "an F32 model's const");
                 weight(meta.name.as_deref().expect("a named const"), &shape)
             }
-            Storage::Computed(c) => HostTensor::f32(c.shape(), c.values_f32()),
+            Storage::Computed(c) => c.tensor(),
             Storage::State if seed_state => HostTensor::zeros(shape),
             Storage::State => continue,
             Storage::Device => unreachable!(),
@@ -373,7 +374,7 @@ fn qwen2_decode_gpu_matches_cpu() {
 #[test]
 fn flash_attention_pass_prefill_gpu_matches_cpu() {
     // card 038: the flash-attention pass inside `compile` rewrites a raw prefill trace's materialized attention into
-    // FlashAttentionPrefill, and the rewritten graph runs on the wgpu executor with the same logits as the
+    // Attention, and the rewritten graph runs on the wgpu executor with the same logits as the
     // un-rewritten prefill on CPU. Pipeline: canonicalize -> cse -> fold_iota -> rope_fusion -> flash_attention -> dce
     // -> GPU (the mask is a graph computation over `Slot::Pos`, so the flash pass needs it folded).
     use poot_graph_ir::op::OpKind;
@@ -397,7 +398,7 @@ fn flash_attention_pass_prefill_gpu_matches_cpu() {
         fused
             .eqns
             .iter()
-            .any(|e| matches!(e.op, OpKind::FlashAttentionPrefill { .. })),
+            .any(|e| matches!(e.op, OpKind::Attention(_))),
         "the flash pass must rewrite the prefill attention"
     );
     let (cpu, _) = cpu_step(&g, &bind(&g, &feed, false), &[]);
@@ -776,85 +777,6 @@ fn batched_shared_pool_decode_gpu_matches_cpu() {
     assert_replay_matches_cpu(&g, &feeds, "batched shared-pool decode GPU");
 }
 
-/// GP (spec 007): profiling is non-perturbing and produces a usable report. The same decode graph run with
-/// profiling off and on yields bit-identical logits (FR-006); the profiled run records a nonzero dispatch count
-/// with a per-category breakdown summing to the total (SC-001).
-///
-/// Card 546b: `GpuExecutor`'s own `Profiler`/`Snapshot` (h2d/d2h byte counters, a `category()`-keyed
-/// `ops` map, `profile_report`'s formatted string) has no contract equivalent - it is a different,
-/// deleted abstraction from `poot_executor::ExecutorStats.timing` (`poot_profile::TimingSnapshot`,
-/// Card 552: host/device TIME and per-`kind_name` dispatch buckets, no transfer-byte counters at all).
-/// This keeps the SAME two claims (FR-006, SC-001) on the new API: bit-identical results with timing
-/// on vs off, and a per-dispatch-kind breakdown that accounts for the recorded dispatches - via
-/// `Engine::with_timing(..., TimingOptions::Detailed(..))` and `poot_profile::Report::window`.
-#[test]
-fn profiling_is_non_perturbing_and_reports() {
-    let _gpu_guard = gpu_lock();
-    let (g, feed) = tiny_decode_graph();
-    let inputs = bind(&g, &feed, false);
-
-    let Some(plain_device) = open_or_skip(DeviceBackend::Wgpu, WgpuDevice::new()) else {
-        return;
-    };
-    let plain_target = plain_device.target();
-    let mut plain: Box<dyn Executor> = Box::new(poot_executor::Engine::new(plain_device));
-    let off = run_once_contract_v(&mut *plain, plain_target, &g, &inputs);
-
-    let Some(timed_device) = open_or_skip(DeviceBackend::Wgpu, WgpuDevice::new_with_timing(4))
-    else {
-        return;
-    };
-    let target = timed_device.target();
-    let timing = poot_executor::TimingOptions::Detailed(poot_executor::DetailedTiming::every_step(
-        8, 256, 4,
-    ));
-    let mut prof = poot_executor::Engine::with_timing(timed_device, timing);
-    let program = staged(&g, target);
-    let (store, slot_binds) = split_consts_and_slots_v(&g, &inputs);
-    let exe = prof
-        .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
-        .unwrap();
-    let entry = prof.add_entry(exe, &program).unwrap();
-    let mark = prof.stats().timing.mark();
-    let t0 = std::time::Instant::now();
-    let step_in = step_inputs(&slot_binds);
-    let on = f32_bytes(
-        &prof
-            .step(exe, entry, &step_in, &mut NoSync)
-            .unwrap()
-            .read()
-            .unwrap(),
-    );
-    let wall = t0.elapsed();
-
-    // FR-006: profiling changes no computed value.
-    assert_eq!(off, on, "profiling must not perturb the result");
-
-    let stats = prof.stats();
-    let window = poot_profile::Report::window(&stats.timing, &mark, &[entry.raw()]);
-    assert!(window.steps > 0, "profiled run records a step");
-    let rendered = window.render(1, wall);
-    eprintln!("{rendered}");
-    match window.detail {
-        poot_profile::Coverage::Complete => {
-            // SC-001 (review 546b-b1b F2): `WindowReport` exposes no independent total-dispatch
-            // count to compare against, so this only proves the per-kind breakdown is non-empty,
-            // not that it accounts for every dispatch; restore the equality against a real total if
-            // one is ever exposed.
-            let by_cat: u64 = window.buckets.values().map(|b| b.dispatch_count).sum();
-            assert!(by_cat > 0, "category counts must be non-empty");
-            eprintln!("per-kind dispatch coverage: Complete ({by_cat} dispatches)");
-        }
-        other => {
-            // FR-005: device timing (TIMESTAMP_QUERY) is backend/adapter-dependent; only assert the
-            // breakdown when the device actually measured every retained dispatch.
-            eprintln!("per-kind dispatch coverage: {other:?} (adapter may lack TIMESTAMP_QUERY)");
-        }
-    }
-    prof.remove_entry(exe, entry).unwrap();
-    prof.unload(exe).unwrap();
-}
-
 /// G3d-3: the constant-shape masked decode graph (built once) runs device-resident with the KV cache carried
 /// across steps and matches the CPU reference step for step.
 #[test]
@@ -898,7 +820,7 @@ fn real_trace(dense: &Dense, phase: Phase, shape: StepShape) -> Graph {
 }
 
 /// G5 dispatch-reduction receipt on the real Qwen2.5-0.5B architecture (weights-free: dispatch count depends
-/// only on graph structure). Counts the kernels that dispatch (Plan::Compute) before vs after fusion and
+/// only on graph structure). Counts the kernels that dispatch (Plan::Dispatches) before vs after fusion and
 /// asserts a material reduction.
 #[test]
 fn fusion_dispatch_reduction_on_real_qwen2_config() {
@@ -918,7 +840,7 @@ fn fusion_dispatch_reduction_on_real_qwen2_config() {
                         Backend::SpirvVulkan,
                         &poot_test_util::device_caps::default_caps_for(Backend::SpirvVulkan)
                     ),
-                    Ok(Plan::Compute { .. })
+                    Ok(Plan::Dispatches(_))
                 )
             })
             .count()
@@ -965,7 +887,7 @@ fn fusion_dispatch_reduction_on_real_qwen2_config() {
                 Backend::SpirvVulkan,
                 &poot_test_util::device_caps::default_caps_for(Backend::SpirvVulkan)
             ),
-            Ok(Plan::Compute { .. })
+            Ok(Plan::Dispatches(_))
         ) {
             let kind = eqn.op.name();
             let head = kind.split_whitespace().next().unwrap_or(&kind).to_string();
@@ -988,7 +910,7 @@ fn fusion_dispatch_reduction_on_real_qwen2_config() {
                     Backend::SpirvVulkan,
                     &poot_test_util::device_caps::default_caps_for(Backend::SpirvVulkan)
                 ),
-                Ok(Plan::Compute { .. })
+                Ok(Plan::Dispatches(_))
             )
         {
             *add_shapes
@@ -1068,147 +990,6 @@ fn fusion_decode_latency_on_gpu() {
         fused_ms < unfused_ms,
         "fusion must cut decode latency on the GPU: fused {fused_ms:.3} ms vs unfused {unfused_ms:.3} ms"
     );
-}
-
-#[test]
-#[ignore = "perf profile: per-op-category device-time breakdown of the real-config decode; --release --ignored --nocapture"]
-fn decode_profile_breakdown_on_gpu() {
-    // Card 035 perf: where does the decode time go? Card 546b: `GpuExecutor::new_profiled`'s own
-    // `Profiler`/`Snapshot` has no contract equivalent (see `profiling_is_non_perturbing_and_reports`'s
-    // doc comment); `Engine::with_timing(..., TimingOptions::Detailed(..))` + `poot_profile::Report::
-    // window` buckets per-dispatch device time into `kind_name` instead of a `category()` string.
-    use poot_graph_plan::{cse, fuse};
-    let _gpu_guard = gpu_lock();
-    let Some(device) = open_or_skip(DeviceBackend::Wgpu, WgpuDevice::new_with_timing(4)) else {
-        return;
-    };
-    let target = device.target();
-    let timing = poot_executor::TimingOptions::Detailed(poot_executor::DetailedTiming::every_step(
-        64, 8192, 4,
-    ));
-    let mut exec = poot_executor::Engine::with_timing(device, timing);
-    let cap = 64usize;
-    let g = fuse(&cse(&real_trace(
-        &real_dense(),
-        Phase::Decode,
-        step(1, 1, cap, LogitRows::Last),
-    )));
-    let inputs = bind(&g, &Feed::new(vec![5], vec![16]), false);
-    let program = staged(&g, target);
-    let (store, slot_binds) = split_consts_and_slots_v(&g, &inputs);
-    let exe = exec
-        .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
-        .unwrap();
-    let entry = exec.add_entry(exe, &program).unwrap();
-    let step_in = step_inputs(&slot_binds);
-    let _ = exec
-        .step(exe, entry, &step_in, &mut NoSync)
-        .unwrap()
-        .read()
-        .unwrap(); // warm (JIT + const upload)
-    let mark = exec.stats().timing.mark();
-    let n = 30usize;
-    let t = std::time::Instant::now();
-    for _ in 0..n {
-        let _ = exec
-            .step(exe, entry, &step_in, &mut NoSync)
-            .unwrap()
-            .read()
-            .unwrap();
-    }
-    let wall = t.elapsed();
-    let stats = exec.stats();
-    let window = poot_profile::Report::window(&stats.timing, &mark, &[entry.raw()]);
-    eprintln!("{}", window.render(n, wall));
-    // per-kind breakdown over the `n`-token window.
-    let mut ops: Vec<_> = window.buckets.into_iter().collect();
-    ops.sort_by(|a, b| {
-        b.1.device
-            .unwrap_or_default()
-            .cmp(&a.1.device.unwrap_or_default())
-            .then(b.1.dispatch_count.cmp(&a.1.dispatch_count))
-    });
-    eprintln!("--- top kernels by device time ({n} tokens) ---");
-    for (name, s) in ops.iter().take(18) {
-        eprintln!(
-            "{:>7} disp  {:>8.2} ms dev   {name}",
-            s.dispatch_count,
-            s.device.unwrap_or_default().as_secs_f64() * 1e3
-        );
-    }
-    exec.remove_entry(exe, entry).unwrap();
-    exec.unload(exe).unwrap();
-}
-
-#[test]
-#[ignore = "perf profile: per-op device-time breakdown of the PREFILL (M>1 GEMM); --release --ignored --nocapture"]
-fn prefill_profile_breakdown_on_gpu() {
-    // Card 035 perf: is prefill GEMM-bound (the M>1 matmul)? Random consts, since only kernel timing matters.
-    // n=64-token prefill, real config.
-    use poot_graph_plan::{cse, fuse};
-    let _gpu_guard = gpu_lock();
-    let Some(device) = open_or_skip(DeviceBackend::Wgpu, WgpuDevice::new_with_timing(4)) else {
-        return;
-    };
-    let target = device.target();
-    let timing = poot_executor::TimingOptions::Detailed(poot_executor::DetailedTiming::every_step(
-        16, 8192, 4,
-    ));
-    let mut exec = poot_executor::Engine::with_timing(device, timing);
-    let dense = real_dense();
-    let (n, cap) = (64usize, 128usize);
-    let g = fuse(&cse(&real_trace(
-        &dense,
-        Phase::Prefill,
-        step(1, n, cap, LogitRows::Last),
-    )));
-    let feed = Feed::new(
-        (0..n).map(|j| (j % dense.vocab) as i32).collect(),
-        (0..n as i32).collect(),
-    );
-    let inputs = bind(&g, &feed, false);
-    // Card 546b: state zero-seeds automatically on first use; every later step overwrites the same
-    // `cap` positions with the same deterministic input regardless, so reusing one entry across `reps`
-    // steps keeps the identical dispatch workload a fresh-zero prefill would have (this is a timing
-    // diagnostic, not a correctness gate).
-    let program = staged(&g, target);
-    let (store, slot_binds) = split_consts_and_slots_v(&g, &inputs);
-    let exe = exec
-        .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
-        .unwrap();
-    let entry = exec.add_entry(exe, &program).unwrap();
-    let step_in = step_inputs(&slot_binds);
-    let _ = exec
-        .step(exe, entry, &step_in, &mut NoSync)
-        .unwrap()
-        .read()
-        .unwrap(); // warm
-    let mark = exec.stats().timing.mark();
-    let reps = 10usize;
-    let t = std::time::Instant::now();
-    for _ in 0..reps {
-        let _ = exec
-            .step(exe, entry, &step_in, &mut NoSync)
-            .unwrap()
-            .read()
-            .unwrap();
-    }
-    let wall = t.elapsed();
-    let stats = exec.stats();
-    let window = poot_profile::Report::window(&stats.timing, &mark, &[entry.raw()]);
-    eprintln!("{}", window.render(reps, wall));
-    let mut ops: Vec<_> = window.buckets.into_iter().collect();
-    ops.sort_by_key(|b| std::cmp::Reverse(b.1.device.unwrap_or_default()));
-    eprintln!("--- top prefill kernels by device time ({reps} reps, n={n}) ---");
-    for (name, s) in ops.iter().take(12) {
-        eprintln!(
-            "{:>7} disp  {:>8.2} ms dev   {name}",
-            s.dispatch_count,
-            s.device.unwrap_or_default().as_secs_f64() * 1e3
-        );
-    }
-    exec.remove_entry(exe, entry).unwrap();
-    exec.unload(exe).unwrap();
 }
 
 /// Card 550 SC-006 (wgpu leg): a chunked prefill starting at a NONZERO position

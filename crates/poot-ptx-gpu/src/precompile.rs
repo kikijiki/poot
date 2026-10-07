@@ -4,12 +4,12 @@
 //! second, bespoke per-equation plan walk - R472-001).
 
 use poot_graph_ir::Graph;
-use poot_graph_plan::{CompileOptions, FusionPolicy, Submission, Target, compile};
+use poot_graph_plan::{CompileOptions, Submission, Target, compile};
 use poot_target::{Backend, DeviceCaps};
 
 use crate::PtxGpuError;
 
-/// Pre-compile every `Plan::Compute`/`ComputeMeta`/`ComputeChunks` kernel body `g` needs through
+/// Pre-compile every `Plan::Dispatches` kernel body `g` needs through
 /// `compile`, into the on-disk PTX [`poot_codegen::KernelCache`] (shared across calls by its own
 /// epoch-scoped directory). Returns the number of kernels newly built this call (a cache hit built
 /// none). `caps` lets a caller with no measured device (a precompile/warm-up host may have no GPU at
@@ -21,7 +21,6 @@ pub fn precompile_graph(g: &Graph, caps: &DeviceCaps) -> Result<usize, PtxGpuErr
     };
     let options = CompileOptions {
         execution: Submission::Replay,
-        fusion: FusionPolicy::Full,
         limits: poot_graph_plan::CompileLimits::STANDARD,
     };
     let program = compile(g, &target, &options)?;
@@ -29,19 +28,11 @@ pub fn precompile_graph(g: &Graph, caps: &DeviceCaps) -> Result<usize, PtxGpuErr
     let mut built = 0usize;
     for (_, plan) in program.planned() {
         match plan {
-            poot_graph_plan::Plan::Compute { body, .. }
-            | poot_graph_plan::Plan::ComputeMeta { body, .. } => {
-                built += usize::from(
-                    cache
-                        .load_or_compile(body, options.limits.max_artifact_bytes)?
-                        .built,
-                );
-            }
-            poot_graph_plan::Plan::ComputeChunks(chunks) => {
-                for chunk in chunks {
+            poot_graph_plan::Plan::Dispatches(dispatches) => {
+                for dispatch in dispatches {
                     built += usize::from(
                         cache
-                            .load_or_compile(&chunk.body, options.limits.max_artifact_bytes)?
+                            .load_or_compile(&dispatch.body, options.limits.max_artifact_bytes)?
                             .built,
                     );
                 }

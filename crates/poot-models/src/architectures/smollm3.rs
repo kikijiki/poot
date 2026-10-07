@@ -51,8 +51,8 @@ use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
 use crate::components::ffn::{GatedFfnWeights, gated_ffn};
 use crate::components::linear::WeightError;
 use crate::components::standard::{
-    LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step, standard_layer,
-    standard_stack,
+    BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
+    standard_layer, standard_stack,
 };
 use crate::model::{
     ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, StepShape,
@@ -72,6 +72,7 @@ pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     ],
     build,
     fixture,
+    variants: &[],
 };
 
 /// smollm3's config facts: `SmolLM3Config`'s defaults (a `2e6` base, `eos_token_id` `128001`) and
@@ -258,7 +259,7 @@ impl Model for Smollm3 {
                 &layer.norms,
                 &p.layer,
                 |b, h| attention(b, &step, l, h, &layer.attn, &p.attention[l]),
-                |b, h| gated_ffn(b, h, &layer.ffn),
+                |b, BlockInput { block: h, .. }| gated_ffn(b, h, &layer.ffn),
             )
         });
         Ok(step.finish(b, logits))

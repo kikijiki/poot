@@ -629,7 +629,7 @@ impl FormatDescriptor {
             WeightFormat::Gptq {
                 groups: GroupMap::Contiguous { size },
             }
-            | WeightFormat::Awq { group_size: size } => Ok(k / size.get()),
+            | WeightFormat::Awq { group_size: size } => Ok(k / size),
             _ => unreachable!("descriptor tests: only GPTQ and AWQ have Extent::Group"),
         }
     }

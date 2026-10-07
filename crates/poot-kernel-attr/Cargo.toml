@@ -16,13 +16,17 @@ proc-macro = true
 # proc-macro artifact `pootc` extern-links for kernel extraction), replacing the `POOT_KERNEL_BUILD`
 # env-var read the macro used to do at EXPANSION time. Default (this feature off) is the host pass: a
 # normal `cargo build` of a crate that uses `#[kernel]` always gets the typed dispatch wrapper.
-device-pass = []
+device-pass = ["dep:poot-kernel-ir"]
 
 [dependencies]
 syn.workspace = true
 quote.workspace = true
 proc-macro2.workspace = true
-# Used at macro-expansion time for the single source of truth on the mangling convention.
+# Used at macro-expansion time by the device pass for the single source of truth on the mangling convention.
+poot-kernel-ir = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The unit tests call the device pass directly without the `device-pass` feature (see `device_fn`).
 poot-kernel-ir.workspace = true
 
 [lints]

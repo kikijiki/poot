@@ -118,6 +118,7 @@ fn qwen25_vl_video_temporal_padding_matches_cached_rule_for_arbitrary_patch_size
             let temporal_grid = padded_frame_count / temporal_patch_size;
             let mut expected = Vec::new();
             for group in 0..temporal_grid {
+                #[allow(clippy::needless_range_loop)]
                 for channel in 0..3 {
                     for temporal_offset in 0..temporal_patch_size {
                         let frame_index = (group * temporal_patch_size + temporal_offset)

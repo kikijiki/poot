@@ -548,8 +548,8 @@ impl VlmRunner {
         // `Runner::generate_kv_gpu_prefilled`'s prefill-then-decode handoff (card 546b): the prefill entry
         // is removed right after its one step (R-546-3), and the decode entry below shares its carried K/V
         // state by (name, aval, storage). Safe unconditionally: `self.cfg` is a `Qwen2Config`
-        // with `head_dim = 64` (`TextConfig::smolvlm`), under both the flash-decode cap (`FLASH_LDS_CAP = 256`)
-        // and flash-prefill cap (`FLASH_PREFILL_LDS_CAP = 512`); the text model is dense.
+        // with `head_dim = 64` (`TextConfig::smolvlm`), well inside every device's workgroup memory for the
+        // attention kernel; the text model is dense.
         // `trace_prefill_kv_embeds` shares its attention/MLP composition with `trace_prefill_kv`, which
         // `qwen2::tests::optimize_fuses_flash_prefill_no_materialized_scores` covers (see
         // `qwen2::tests::optimize_fuses_flash_prefill_vlm_embeds_no_materialized_scores` for the embeds path).

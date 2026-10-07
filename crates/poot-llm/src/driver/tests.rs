@@ -17,7 +17,7 @@ use poot_executor::{
     ExecutorStats, HostSync, StateScope, StepInputs, StepOutputs, WeightSource,
 };
 use poot_graph_ir::{BinOp, Builder, Graph, Slot, StateRole, TensorType, ValidationOutputs};
-use poot_graph_plan::{CompileOptions, FusionPolicy, StagedProgram, Submission, Target, TargetSet};
+use poot_graph_plan::{CompileOptions, StagedProgram, Submission, Target, TargetSet};
 use poot_models::chat::ChatFormat;
 use poot_models::components::standard::Step;
 use poot_models::model::{
@@ -34,11 +34,11 @@ use tokenizers::models::wordlevel::WordLevel;
 use crate::GenerationControl;
 use crate::core::sampler::{Sampler, SamplerFault};
 use crate::driver::error::{
-    DriverError, InvalidOptions, InvalidRequest, PreparedSetRefusal, Unsupported,
+    DriverError, InvalidOptions, InvalidRequest, LoadError, PreparedSetRefusal, Unsupported,
 };
 use crate::driver::{
-    Driver, DriverOptions, FinishReason, GenerateRequest, Generation, Head, Layout, ModelHandle,
-    PreparedSetLimits, Retention, ServingShapes, Warm,
+    Driver, DriverOptions, FinishReason, GenerateRequest, Generation, Head, Layout, LoadOptions,
+    ModelHandle, PreparedSetLimits, Retention, ServingShapes, Warm,
 };
 use crate::text::tokenize::{ChatTemplate, TextCodec};
 
@@ -339,18 +339,22 @@ struct FakeError;
 /// planner reads as f32 arrives as f32 words, an I32 one as I32 words.
 fn ints(kind: ElementKind, bytes: &[u8]) -> Vec<i32> {
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| match kind {
-            ElementKind::F32 => f32::from_le_bytes(c.try_into().unwrap()) as i32,
-            _ => i32::from_le_bytes(c.try_into().unwrap()),
+            ElementKind::F32 => f32::from_le_bytes(*c) as i32,
+            _ => i32::from_le_bytes(*c),
         })
         .collect()
 }
 
 fn floats(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 
@@ -659,6 +663,7 @@ fn build_rig(options: RigOptions, script: Script) -> Result<Rig, DriverError> {
                 generation: None,
                 store: WeightStore::default(),
             },
+            variants: &[],
         })
         .unwrap();
     let config = tiny_config(options.granule, options.max_positions, options.variant);
@@ -691,7 +696,6 @@ fn build_rig(options: RigOptions, script: Script) -> Result<Rig, DriverError> {
     };
     let compile = CompileOptions {
         execution: Submission::Replay,
-        fusion: FusionPolicy::Full,
         limits: poot_graph_plan::CompileLimits::STANDARD,
     };
     let driver = Driver::new(
@@ -708,6 +712,7 @@ fn build_rig(options: RigOptions, script: Script) -> Result<Rig, DriverError> {
                 max_retained_bytes: NonZeroU64::new(options.max_retained_bytes).unwrap(),
             },
             charge: options.charge,
+            draft: crate::driver::DraftPolicy::Off,
         },
     )?;
     Ok(Rig { driver, world })
@@ -1275,36 +1280,6 @@ fn a_sink_that_stops_ends_the_run() {
 // The production loader: `ModelHandle::load` over an HF directory and a GGUF file, model-free.
 // ---------------------------------------------------------------------------------------------
 
-/// A safetensors file holding `store`'s dense entries (the HF layout `load_weight_store` reads).
-fn write_safetensors(path: &std::path::Path, store: &WeightStore) {
-    let mut header = serde_json::Map::new();
-    let mut data = Vec::new();
-    for (key, entry) in store.iter() {
-        let poot_quant::weights::WeightEntry::Dense(dense) = entry else {
-            panic!("the fixture store is dense")
-        };
-        let start = data.len();
-        data.extend_from_slice(dense.bytes().as_slice());
-        header.insert(
-            key.to_string(),
-            serde_json::json!({
-                "dtype": match dense.dtype() {
-                    DType::BF16 => "BF16",
-                    DType::F32 => "F32",
-                    other => panic!("{other:?}"),
-                },
-                "shape": dense.shape(),
-                "data_offsets": [start, data.len()],
-            }),
-        );
-    }
-    let header = serde_json::to_vec(&header).unwrap();
-    let mut file = (header.len() as u64).to_le_bytes().to_vec();
-    file.extend_from_slice(&header);
-    file.extend_from_slice(&data);
-    std::fs::write(path, file).unwrap();
-}
-
 /// `ModelHandle::load` of an HF directory builds the model from `config.json`, takes the end-of-sequence
 /// set from the union of `config.json` and `generation_config.json`, reads the weights as stored and
 /// the tokenizer from `tokenizer.json`. The checkpoint is the registry's own qwen2 fixture written out.
@@ -1320,13 +1295,14 @@ fn a_hf_directory_loads_through_the_registry() {
         serde_json::json!({"eos_token_id": [46, 47]}).to_string(),
     )
     .unwrap();
-    write_safetensors(&dir.join("model.safetensors"), &fixture.store);
+    poot_test_util::safetensors::write(&dir.join("model.safetensors"), &fixture.store);
     tiny_text()
         .tokenizer
         .save(dir.join("tokenizer.json"), false)
         .unwrap();
 
-    let handle = ModelHandle::load(&dir, &registry).unwrap();
+    let handle =
+        ModelHandle::load(&dir, &registry, &crate::driver::LoadOptions::default()).unwrap();
     let config = handle.config();
     assert_eq!(config.family.as_str(), "qwen2");
     assert_eq!(config.vocab, 48);
@@ -1338,8 +1314,162 @@ fn a_hf_directory_loads_through_the_registry() {
     assert_eq!(handle.store(), &fixture.store, "weights exactly as stored");
     assert_eq!(handle.text().encode("a b").unwrap(), [1, 2]);
 
-    let missing = ModelHandle::load(&dir.join("absent"), &registry).unwrap_err();
+    let missing = ModelHandle::load(
+        &dir.join("absent"),
+        &registry,
+        &crate::driver::LoadOptions::default(),
+    )
+    .unwrap_err();
     assert!(matches!(missing, DriverError::Load(_)), "{missing:?}");
+}
+
+/// The registry's qwen2 fixture as an HF directory, written with the shared safetensors writer, and
+/// the manifest text pinning its `model.safetensors` with `sha256_hex` (the real digest when `None`).
+fn pinned_hf_directory(
+    name: &str,
+    weights: Option<&[u8]>,
+    sha256_hex: Option<&str>,
+) -> (poot_test_util::UniqueTempPath, std::path::PathBuf) {
+    let fixture = (Registry::builtin().unwrap().entries()[0].fixture)();
+    let dir = poot_test_util::unique_temp_path(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("config.json"), fixture.config.to_string()).unwrap();
+    let weights_path = dir.join("model.safetensors");
+    match weights {
+        Some(bytes) => std::fs::write(&weights_path, bytes).unwrap(),
+        None => poot_test_util::safetensors::write(&weights_path, &fixture.store),
+    }
+    tiny_text()
+        .tokenizer
+        .save(dir.join("tokenizer.json"), false)
+        .unwrap();
+    let bytes = std::fs::read(&weights_path).unwrap();
+    let real: String = poot_load::packed_safetensors::sha256_digest(&bytes)
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let manifest = dir.join("integrity.json");
+    std::fs::write(
+        &manifest,
+        serde_json::json!({"files": {"model.safetensors": {
+            "length": bytes.len(),
+            "sha256": sha256_hex.unwrap_or(&real),
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    (dir, manifest)
+}
+
+/// SC-006: a dense fixture written with the `poot-test-util` writer loads with no manifest and with
+/// its right manifest; a manifest whose digest for `model.safetensors` is wrong is the typed
+/// integrity error. Mutation: skip `check_pin_reader` in `check_integrity`; the wrong-digest row loads.
+#[test]
+fn an_integrity_manifest_pins_the_weights_file() {
+    let registry = Registry::builtin().unwrap();
+    let (dir, manifest) = pinned_hf_directory("driver_integrity_ok", None, None);
+    ModelHandle::load(&dir, &registry, &LoadOptions::default()).unwrap();
+    let pinned = LoadOptions {
+        integrity: Some(manifest),
+    };
+    ModelHandle::load(&dir, &registry, &pinned).expect("the right pin admits the checkpoint");
+
+    let wrong = "00".repeat(32);
+    let (dir, manifest) = pinned_hf_directory("driver_integrity_bad", None, Some(&wrong));
+    let pinned = LoadOptions {
+        integrity: Some(manifest),
+    };
+    let err = ModelHandle::load(&dir, &registry, &pinned).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            DriverError::Load(LoadError::Integrity(
+                poot_load::packed_safetensors::PackedSafetensorsError::DigestMismatch { ref file }
+            )) if file == "model.safetensors"
+        ),
+        "{err:?}"
+    );
+}
+
+/// SC-006, an ORDER WITNESS (there is no read counter): the pin is checked before any tensor is
+/// parsed. The weights file here is not a
+/// safetensors file at all, so reading any tensor would be a parse error; the wrong pin is refused
+/// first, and without a manifest the same file is the parse error (the control). Mutation: move the
+/// check after the weights are loaded; the pinned load is the parse error and the row fails.
+#[test]
+fn a_wrong_pin_is_refused_before_any_tensor_is_read() {
+    let registry = Registry::builtin().unwrap();
+    let garbage = b"not a safetensors file".as_slice();
+    let wrong = "11".repeat(32);
+    let (dir, manifest) =
+        pinned_hf_directory("driver_integrity_unread", Some(garbage), Some(&wrong));
+    let control = ModelHandle::load(&dir, &registry, &LoadOptions::default()).unwrap_err();
+    assert!(
+        matches!(control, DriverError::Load(LoadError::Weights(_))),
+        "without a manifest the file is read and fails to parse: {control:?}"
+    );
+    let pinned = LoadOptions {
+        integrity: Some(manifest),
+    };
+    let err = ModelHandle::load(&dir, &registry, &pinned).unwrap_err();
+    assert!(
+        matches!(err, DriverError::Load(LoadError::Integrity(_))),
+        "the pin is checked before the parse: {err:?}"
+    );
+}
+
+/// An integrity manifest that does not name the GGUF file checks nothing, so it is refused: the
+/// typed `Unpinned` naming the file, before the file is opened (it is garbage here, so opening it
+/// would be a `Weights` error, which is also what the no-manifest control gives). Mutation: admit a
+/// weight file the manifest does not list (drop the `required` check in `check_integrity`); the
+/// load then fails as `Weights` and the row goes red.
+#[test]
+fn a_manifest_that_does_not_pin_the_gguf_is_refused() {
+    let registry = Registry::builtin().unwrap();
+    let dir = poot_test_util::unique_temp_path("driver_integrity_gguf");
+    std::fs::create_dir_all(&dir).unwrap();
+    let gguf = dir.join("model.gguf");
+    std::fs::write(&gguf, b"not a gguf").unwrap();
+    let manifest = dir.join("integrity.json");
+    std::fs::write(
+        &manifest,
+        serde_json::json!({"files": {"other.gguf": {"length": 1, "sha256": "00".repeat(32)}}})
+            .to_string(),
+    )
+    .unwrap();
+    let control = ModelHandle::load(&gguf, &registry, &LoadOptions::default()).unwrap_err();
+    assert!(
+        matches!(control, DriverError::Load(LoadError::Weights(_))),
+        "{control:?}"
+    );
+    let pinned = LoadOptions {
+        integrity: Some(manifest),
+    };
+    let err = ModelHandle::load(&gguf, &registry, &pinned).unwrap_err();
+    assert!(
+        matches!(&err, DriverError::Load(LoadError::Unpinned { file }) if file == "model.gguf"),
+        "{err:?}"
+    );
+}
+
+/// Every `*.safetensors` shard of an HF directory must be pinned: with `model.safetensors` pinned and
+/// a second shard not, the load is the typed `Unpinned` naming the second shard. Mutation: check
+/// only the shards the manifest lists (drop the `required` check in `check_integrity`); the load
+/// then reaches the garbage shard and fails as `Weights`, so the row goes red.
+#[test]
+fn an_unpinned_shard_is_refused() {
+    let registry = Registry::builtin().unwrap();
+    let (dir, manifest) = pinned_hf_directory("driver_integrity_shard", None, None);
+    std::fs::write(dir.join("model-extra.safetensors"), b"an unpinned shard").unwrap();
+    let pinned = LoadOptions {
+        integrity: Some(manifest),
+    };
+    let err = ModelHandle::load(&dir, &registry, &pinned).unwrap_err();
+    assert!(
+        matches!(&err, DriverError::Load(LoadError::Unpinned { file }) if file == "model-extra.safetensors"),
+        "{err:?}"
+    );
 }
 
 /// `ModelHandle::load` of a GGUF file: the family comes from `general.architecture`, the weights from
@@ -1403,7 +1533,12 @@ fn a_gguf_file_loads_through_the_registry() {
     let path = poot_test_util::unique_temp_path("driver_gguf_checkpoint.gguf");
     std::fs::write(&path, write_gguf(&kvs, &tensors)).unwrap();
 
-    let handle = ModelHandle::load(&path, &Registry::builtin().unwrap()).unwrap();
+    let handle = ModelHandle::load(
+        &path,
+        &Registry::builtin().unwrap(),
+        &crate::driver::LoadOptions::default(),
+    )
+    .unwrap();
     assert_eq!(handle.config().family.as_str(), "qwen2");
     assert_eq!(handle.config().eos, BTreeSet::from([7]));
     assert_eq!(handle.config().max_positions, 64);

@@ -1,4 +1,4 @@
-//! Types shared by the planner: [`Plan`], [`PlanError`], [`CollectiveKind`], [`ComputeChunk`]. `Backend`
+//! Types shared by the planner: [`Plan`], [`PlanError`], [`CollectiveKind`], [`Dispatch`]. `Backend`
 //! moved to `poot-target` (card 522 review): callers import it from there directly.
 //! Re-exported at the crate root.
 
@@ -93,38 +93,39 @@ pub enum CollectiveKind {
     AllToAll,
 }
 
+/// One kernel launch of a [`Plan::Dispatches`] plan.
+#[derive(Debug)]
+pub struct Dispatch {
+    pub body: Body,
+    pub key: String,
+    /// A human-readable name for the kernel (family, form and, for a contraction, its shape):
+    /// display only, carried into the per-dispatch timing so device time can be read per shape.
+    pub label: String,
+    pub launch: Launch,
+}
+
+/// The shape of one launch: the total thread count and the optional metadata buffer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Launch {
+    /// The total thread count (`[x, y, z]`); the executor divides it by `body.workgroup_size` to get the
+    /// dispatch's workgroup counts. The planner sets it once, alongside the kernel choice that shapes it
+    /// (card 525); no executor recomputes it.
+    pub grid: [u32; 3],
+    /// One read-only `u32` metadata buffer bound between the eqn's data inputs and the output (param
+    /// order `[data inputs.., meta, out]`); empty binds none. An imported shape-generic kernel gets its
+    /// dims this way instead of baked consts (card 044: batched decode GEMV takes `dims = [B]`).
+    pub meta: Vec<u32>,
+}
+
 /// How to execute one eqn (independent of host vs device buffers, and of the backend).
 #[derive(Debug)]
 pub enum Plan {
-    /// Dispatch `body` reading the eqn's value-operand buffers (in order) and writing the output.
-    /// `grid` is the total thread count (`[x, y, z]`); the executor divides it by `body.workgroup_size`
-    /// to get the dispatch's workgroup counts. The planner sets it once, alongside the kernel choice
-    /// that shapes it (card 525); no executor recomputes it.
-    Compute {
-        body: Body,
-        key: String,
-        /// A human-readable name for the kernel (family, form and, for a contraction, its shape):
-        /// display only, carried into the per-dispatch timing so device time can be read per shape.
-        label: String,
-        grid: [u32; 3],
-    },
-    /// Like [`Plan::Compute`], but binds one extra read-only `u32` metadata buffer between the eqn's data
-    /// inputs and the output (param order `[data inputs.., meta, out]`). An imported shape-generic kernel
-    /// gets its dims this way instead of baked consts (card 044: batched decode GEMV takes `dims = [B]`).
-    /// Used by SPIR-V and NVPTX, and by AMDGCN where the target planner selects the same imported body.
-    ComputeMeta {
-        body: Body,
-        key: String,
-        /// The display label, as on [`Plan::Compute`].
-        label: String,
-        meta: Vec<u32>,
-        grid: [u32; 3],
-    },
-    /// Dispatch several kernels over the same input/output buffers, each a tiled-GEMM variant with a baked
-    /// tile offset covering a disjoint sub-2^15 tile range (avoids the RADV 2^15-workgroup miscompile).
-    /// Each chunk's `groups` is its workgroup count (< 2^15). Chunks write disjoint output tiles, so
-    /// dispatch order is irrelevant.
-    ComputeChunks(Vec<ComputeChunk>),
+    /// Dispatch these kernels, in order, over the eqn's value-operand buffers (in order) writing its
+    /// output. Never empty. A plan holds several dispatches when one launch cannot cover the output: a
+    /// tiled GEMM split into disjoint sub-2^15 tile ranges (the RADV 2^15-workgroup miscompile), or a
+    /// scatter / decode GEMV split to stay under the device watchdog. Dispatches write disjoint output
+    /// ranges, so their order is irrelevant.
+    Dispatches(Vec<Dispatch>),
     /// The output aliases the given input value's buffer (reshape).
     Alias(ValueId),
     /// The output is a strided view of `src`'s buffer (spec 132): no dispatch, like [`Plan::Alias`], but
@@ -152,39 +153,52 @@ pub enum Plan {
 /// cannot run the plan it was given.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PlanKind {
-    Compute,
-    ComputeMeta,
-    ComputeChunks,
+    Dispatches,
     Alias,
     View,
     Collective,
 }
 
 impl Plan {
+    /// The one dispatch of a plan that launches exactly one kernel; `None` for a split plan and for a
+    /// plan with no launch.
+    pub fn single(&self) -> Option<&Dispatch> {
+        match self {
+            Plan::Dispatches(dispatches) => match dispatches.as_slice() {
+                [dispatch] => Some(dispatch),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// [`Plan::single`], mutably.
+    pub fn single_mut(&mut self) -> Option<&mut Dispatch> {
+        match self {
+            Plan::Dispatches(dispatches) => match dispatches.as_mut_slice() {
+                [dispatch] => Some(dispatch),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Every kernel launch the plan makes, in order; empty for a plan with no launch.
+    pub fn dispatches(&self) -> &[Dispatch] {
+        match self {
+            Plan::Dispatches(dispatches) => dispatches,
+            _ => &[],
+        }
+    }
+
     pub fn kind(&self) -> PlanKind {
         match self {
-            Plan::Compute { .. } => PlanKind::Compute,
-            Plan::ComputeMeta { .. } => PlanKind::ComputeMeta,
-            Plan::ComputeChunks(_) => PlanKind::ComputeChunks,
+            Plan::Dispatches(_) => PlanKind::Dispatches,
             Plan::Alias(_) => PlanKind::Alias,
             Plan::View { .. } => PlanKind::View,
             Plan::Collective { .. } => PlanKind::Collective,
         }
     }
-}
-
-/// One sub-2^15 dispatch of a chunked tiled GEMM (card 096): a tiled-GEMM `body` with a baked tile offset,
-/// launched with `groups` workgroups (one output tile each, in `[offset, offset+groups)`).
-#[derive(Clone, Debug)]
-pub struct ComputeChunk {
-    pub body: Body,
-    pub key: String,
-    /// The display label, as on [`Plan::Compute`].
-    pub label: String,
-    pub groups: usize,
-    /// Optional u32 metadata buffer (bound like [`Plan::ComputeMeta`]). Empty for a kernelgen chunk (tile
-    /// offset baked as a const); an imported chunk carries `[M,K,N,offset]` (card 044).
-    pub meta: Vec<u32>,
 }
 
 /// How [`ValueStorage`] packs its dtype into a device buffer (card 526).

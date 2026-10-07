@@ -2,7 +2,11 @@
 # Cargo's unit hash for path packages does not include the worktree path, and default mtime freshness
 # lets a build in worktree B accept an artifact built from worktree A's different source as fresh
 # (observed: E0432 flakiness, a false exit-0 on a real E0308). Checksum freshness compares source
-# checksums instead of mtimes, so the shared target dir is only safe with it on. An `[unstable]` table
+# checksums instead of mtimes, so the shared target dir is only safe with it on. In cargo 1.101 (the pinned nightly)
+# `-Zchecksum-freshness` alone only makes the mode available: the fingerprint method is the stable
+# `build.fingerprint` key, default "mtime", and cargo silently stays on mtime unless it is
+# "content" (POOT-1037: the bump to nightly-2026-10-06 turned the old `[unstable]`-only setting into a
+# no-op, so worktrees sharing a slot dir reused each other's units). An `[unstable]` table
 # is a stable-cargo error, but every in-tree build path is the pinned nightly (rust-toolchain.toml);
 # the benchmarks image build context is benchmarks/ only, so it never sees this file.
 #
@@ -11,3 +15,6 @@
 # it is on PATH, or per machine with RUSTC_WRAPPER / a user-level ~/.cargo/config.toml.
 [unstable]
 checksum-freshness = true
+
+[build]
+fingerprint = "content"

@@ -18,7 +18,7 @@ pub mod fp8;
 pub mod observer;
 mod weight_store;
 
-pub use weight_store::{materialize_dense, take_dense};
+pub use weight_store::materialize_dense;
 
 pub use exact_bf16::ExactBf16Error;
 

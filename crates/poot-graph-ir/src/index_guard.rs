@@ -27,8 +27,8 @@
 //!   becomes a very large unsigned value and fails the same test as an id at or above `upper_exclusive`.
 //!   There is no lower-bound comparison to keep in step with the upper one.
 //! - The condition is the *invalid* flag, not `valid`. The planner rejects a literal-first `Binary`, so
-//!   neither `GeU(Lit, raw)` nor `Sub(Lit(1), invalid)` can be planned. `Select` computes
-//!   `if_false + cond * (if_true - if_false)`, so `Select(invalid, zero, raw)` is the same function of
+//!   neither `GeU(Lit, raw)` nor `Sub(Lit(1), invalid)` can be planned. `Select` picks `if_true`
+//!   where the condition word is nonzero, so `Select(invalid, zero, raw)` is the same function of
 //!   `raw` that `Select(valid, raw, 0)` would be.
 //! - `zero` is a value, not a literal operand. The planner's `Select` builds a three-leaf kernel from the
 //!   equation's *value* operands, so a literal `0` would not produce three leaves. `Sub(raw, raw)` keeps

@@ -411,7 +411,7 @@ fn composited_apng_frame_to_rgb8(
         .map_err(|_| Qwen25VlApngError::Allocation {
             stage: "selected RGB frame",
         })?;
-    for pixel in rgba.chunks_exact(4) {
+    for pixel in rgba.as_chunks::<4>().0 {
         // `image` has already applied APNG disposal and alpha blending to this RGBA canvas; the
         // decoded-image boundary is RGB8, so alpha is dropped.
         rgb.extend_from_slice(&pixel[..3]);

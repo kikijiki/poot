@@ -6,9 +6,9 @@ use poot_target::Backend;
 
 // --- Card 542a: the descriptor-driven packed kernel lowering table -----------------------------
 
-/// A generated packed kernel's op, without the [`poot_kernelgen::Schedule`]/[`poot_kernelgen::RowSelect`]
-/// detail a lowering-table row does not admit or refuse on (dquant.md D3, section 5): the schedule is
-/// chosen from shapes, never from the format, so it cannot change whether a row admits a format.
+/// A generated packed kernel's op, without the [`poot_kernelgen::Schedule`] detail a lowering-table row
+/// does not admit or refuse on (dquant.md D3, section 5): the schedule is chosen from shapes, never from
+/// the format, so it cannot change whether a row admits a format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PackedKernelOpKind {
     Materialize,
@@ -21,7 +21,6 @@ impl From<poot_kernelgen::PackedKernelOp> for PackedKernelOpKind {
         match op {
             poot_kernelgen::PackedKernelOp::Materialize => Self::Materialize,
             poot_kernelgen::PackedKernelOp::RowGather => Self::RowGather,
-            poot_kernelgen::PackedKernelOp::Contraction { .. } => Self::Contraction,
         }
     }
 }
@@ -110,18 +109,17 @@ pub const PACKED_LOWERING: &[PackedLoweringRow] = &[
     },
 ];
 
-/// Select a generated packed kernel from `table`: `op`'s [`PackedKernelOpKind`] must have a row
-/// admitting `weight`'s descriptor on `backend`, or the equation is refused by name
-/// (`Capability::PackedLowering`) at claim time, never a panic (dquant.md section 5, SC-006).
-pub fn select_packed_kernel(
+/// Whether `table` has a row admitting `weight`'s descriptor for `kind` on `backend`: the weight's format when
+/// it does, else the equation is refused by name (`Capability::PackedLowering`) at claim time, never a panic
+/// (dquant.md section 5, SC-006).
+pub fn admit_packed(
     table: &[PackedLoweringRow],
     weight: PackedWeight,
-    op: poot_kernelgen::PackedKernelOp,
+    kind: PackedKernelOpKind,
     backend: Backend,
-) -> Result<poot_kernelgen::PackedKernelSpec, crate::refusal::Capability> {
+) -> Result<poot_quant::format::WeightFormat, crate::refusal::Capability> {
     let format = weight.format();
     let descriptor = format.descriptor();
-    let kind = PackedKernelOpKind::from(op);
     let backend_kind = PackedLoweringBackend::from(backend);
     let admitted = table.iter().any(|row| {
         row.op == kind && row.backends.contains(&backend_kind) && (row.admits)(&descriptor)
@@ -129,6 +127,18 @@ pub fn select_packed_kernel(
     if !admitted {
         return Err(crate::refusal::Capability::PackedLowering { format, op: kind });
     }
+    Ok(format)
+}
+
+/// Select a generated packed kernel (a dequantize or a row gather) from `table`: `op`'s
+/// [`PackedKernelOpKind`] must have a row admitting `weight`'s descriptor on `backend` ([`admit_packed`]).
+pub fn select_packed_kernel(
+    table: &[PackedLoweringRow],
+    weight: PackedWeight,
+    op: poot_kernelgen::PackedKernelOp,
+    backend: Backend,
+) -> Result<poot_kernelgen::PackedKernelSpec, crate::refusal::Capability> {
+    let format = admit_packed(table, weight, PackedKernelOpKind::from(op), backend)?;
     let spec = poot_kernelgen::PackedKernelSpec { format, op };
     // The table's `admits` predicate is a descriptor property (dquant.md D3): it says this format's
     // shape is card 542a's staging, not that `packed_kernel` can build every body for it (a field of
@@ -143,7 +153,7 @@ pub fn select_packed_kernel(
 
 #[cfg(test)]
 mod packed_lowering_tests {
-    use poot_kernelgen::{PackedKernelOp, RowSelect, Schedule};
+    use poot_kernelgen::PackedKernelOp;
     use poot_quant::format::{GroupMap, ScaleEncoding, WeightFormat};
 
     use super::*;
@@ -169,28 +179,18 @@ mod packed_lowering_tests {
             // No Contraction row: a Gemv contraction has nothing to admit it.
         ];
         let weight = PackedWeight::try_new(WeightFormat::Q4_0, [4, 32]).unwrap();
-        let op = PackedKernelOp::Contraction {
-            rows: RowSelect::Dense,
-            schedule: Schedule::Gemv {
-                width: 256,
-                cols: 64,
-                unroll: 4,
-            },
-        };
+        let kind = PackedKernelOpKind::Contraction;
         assert_eq!(
-            select_packed_kernel(table, weight, op, Backend::SpirvVulkan),
+            admit_packed(table, weight, kind, Backend::SpirvVulkan),
             Err(Capability::PackedLowering {
                 format: WeightFormat::Q4_0,
-                op: PackedKernelOpKind::Contraction,
+                op: kind,
             })
         );
         // Restoring the row (the real table) makes the same call succeed.
         assert_eq!(
-            select_packed_kernel(PACKED_LOWERING, weight, op, Backend::SpirvVulkan),
-            Ok(poot_kernelgen::PackedKernelSpec {
-                format: WeightFormat::Q4_0,
-                op
-            })
+            admit_packed(PACKED_LOWERING, weight, kind, Backend::SpirvVulkan),
+            Ok(WeightFormat::Q4_0)
         );
     }
 
@@ -243,26 +243,18 @@ mod packed_lowering_tests {
             // No Contraction row: a Tiled contraction has nothing to admit it.
         ];
         let weight = PackedWeight::try_new(WeightFormat::Q4_K, [4, 256]).unwrap();
-        let op = PackedKernelOp::Contraction {
-            rows: RowSelect::Dense,
-            schedule: Schedule::Tiled {
-                tile: poot_kernelgen::TileSize::new(8).expect("a dense contraction tiles"),
-            },
-        };
+        let kind = PackedKernelOpKind::Contraction;
         assert_eq!(
-            select_packed_kernel(table, weight, op, Backend::SpirvVulkan),
+            admit_packed(table, weight, kind, Backend::SpirvVulkan),
             Err(Capability::PackedLowering {
                 format: WeightFormat::Q4_K,
-                op: PackedKernelOpKind::Contraction,
+                op: kind,
             })
         );
         // Restoring the row (the real table) makes the same call succeed.
         assert_eq!(
-            select_packed_kernel(PACKED_LOWERING, weight, op, Backend::SpirvVulkan),
-            Ok(poot_kernelgen::PackedKernelSpec {
-                format: WeightFormat::Q4_K,
-                op
-            })
+            admit_packed(PACKED_LOWERING, weight, kind, Backend::SpirvVulkan),
+            Ok(WeightFormat::Q4_K)
         );
     }
 
@@ -296,17 +288,14 @@ mod packed_lowering_tests {
                 }),
                 "{backend:?}: GPTQ Materialize must be admitted (card 542c)"
             );
-            let op = PackedKernelOp::Contraction {
-                rows: RowSelect::Dense,
-                schedule: Schedule::Gemv {
-                    width: 256,
-                    cols: 8,
-                    unroll: 8,
-                },
-            };
             assert_eq!(
-                select_packed_kernel(PACKED_LOWERING, weight, op, backend),
-                Ok(poot_kernelgen::PackedKernelSpec { format, op }),
+                admit_packed(
+                    PACKED_LOWERING,
+                    weight,
+                    PackedKernelOpKind::Contraction,
+                    backend
+                ),
+                Ok(format),
                 "{backend:?}: GPTQ Contraction must be admitted (card 542c)"
             );
         }

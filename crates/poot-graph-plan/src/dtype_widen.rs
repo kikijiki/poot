@@ -1,6 +1,6 @@
 //! Card 235: the mixed-operand-dtype decode `MatMul` planner gap.
 //!
-//! `plan_eqn`'s `OpKind::MatMul`/`MatMulBias` arms reject any matmul whose operand dtype does not
+//! `plan_eqn`'s `OpKind::MatMul` arm reject any matmul whose operand dtype does not
 //! match the output dtype unless a tensor-core arm (`amd_tc` on AmdGcn/RDNA3, `tc` on Nvptx) fires;
 //! both require bf16 operands with 16-aligned M/N/K and no batch dims. Decode is always a GEMV
 //! (`M == 1`), never 16-aligned, so a decode-time mixed-dtype matmul can never take the tensor-core
@@ -25,19 +25,20 @@
 //! for that lane refuses at planning; nothing widens the weight on upload.
 
 use poot_graph_ir::graph::{Storage, ValueMeta};
-use poot_graph_ir::op::OpKind;
+use poot_graph_ir::op::{ContractionHead, OpKind};
 use poot_graph_ir::types::TensorType;
 use poot_graph_ir::{Eqn, Graph, Operand, ValidationChannel, ValueId};
 use poot_target::{Backend, DECODE_GEMV_CHUNK_TRIGGER, DeviceCaps, TensorCoreSupport};
 use poot_tensor::DType;
 
-use crate::{GEMV_TILE, numel};
+use crate::{GEMV_TILE, Layout, numel};
 use std::collections::{HashMap, HashSet};
 
-/// Whether `OpKind::MatMul`/`MatMulBias`'s AMD WMMA tensor-core arm (`plan_eqn`'s local `amd_tc`)
+/// Whether `OpKind::MatMul`'s AMD WMMA tensor-core arm (`plan_eqn`'s local `amd_tc`)
 /// fires for the given backend, operand dtypes, and output shape. Spec 130 FR-004: RDNA3 only
-/// (`TensorCoreSupport::Wmma16x16x16Rdna3`); CDNA and unknown arch fall through. `batch_dims_product` is
-/// the product of every leading (non M/N) output dim - the tensor-core arm requires no batch dims.
+/// (`TensorCoreSupport::Wmma16x16x16Rdna3`); CDNA and unknown arch fall through. bf16 operands with 16-aligned
+/// M/N/K; any batch dims (the tile kernel indexes each batch element and loops K in 16-wide blocks, device-checked
+/// on gfx1151 at a batched three-block shape, card 663).
 pub fn matmul_amd_tc_eligible(
     backend: Backend,
     a_dtype: DType,
@@ -45,7 +46,6 @@ pub fn matmul_amd_tc_eligible(
     m: usize,
     n: usize,
     k: usize,
-    batch_dims_product: usize,
 ) -> bool {
     let operands_bf16 = a_dtype == DType::BF16 && b_dtype == DType::BF16;
     matches!(backend, Backend::AmdGcn(arch) if arch.tensor_core == TensorCoreSupport::Wmma16x16x16Rdna3)
@@ -53,12 +53,10 @@ pub fn matmul_amd_tc_eligible(
         && m.is_multiple_of(16)
         && n.is_multiple_of(16)
         && k.is_multiple_of(16)
-        && batch_dims_product == 1
 }
 
-/// Whether `OpKind::MatMul`/`MatMulBias`'s NVPTX tensor-core arm (`plan_eqn`'s local `tc`) fires for
-/// the given backend, operand dtypes, and shape. Spec 025: bf16 operands with 16-aligned M/N/K (batch
-/// dims are fine on NVPTX, unlike the AMD arm).
+/// Whether `OpKind::MatMul`'s NVPTX tensor-core arm (`plan_eqn`'s local `tc`) fires for
+/// the given backend, operand dtypes, and shape. Spec 025: bf16 operands with 16-aligned M/N/K (any batch dims).
 pub fn matmul_nvptx_tc_eligible(
     backend: Backend,
     a_dtype: DType,
@@ -77,14 +75,12 @@ pub fn matmul_nvptx_tc_eligible(
 
 /// Whether `OpKind::MatMul`'s SPIR-V cooperative-matrix arm (`plan_eqn`'s local `coopmat`, card 154)
 /// fires for the given backend, operand dtypes, and shape. RADV coopmat config 13: F16 operands (RADV
-/// has no `VK_KHR_shader_bfloat16`), 16x16x16 Subgroup scope. Unlike the AMD/NVPTX arms, this gate
-/// requires `k == 16` exactly (not just 16-aligned) and no batch dims: `matmul_tensorcore_coopmat`'s
-/// kernel body has no K-loop, because a coopmat value is one opaque SSA register that cannot be
-/// carried across a loop back-edge without a `phi` node the emitter cannot insert (see
-/// `poot_kernel_ir::WmmaDtype`), so only a single K-step is implemented. M/N may be multi-tile (each
-/// output tile is independent). The accumulator is always F32 (RADV has no f16-accumulate config), so
-/// this only fires for a mixed f16-in/f32-out matmul; a pure f16-output matmul would need an extra
-/// narrowing store that is not implemented (as in the AMD WMMA arm's F32-only path, see
+/// has no `VK_KHR_shader_bfloat16`), 16x16x16 Subgroup scope, 16-aligned M/N/K, any batch dims. The kernel
+/// carries its accumulator fragment across a K-loop of 16-wide blocks and indexes each batch element (card 663;
+/// before it a cooperative-matrix value could not cross a loop back-edge, so only `K == 16` was admitted). A ragged
+/// K, M or N is not padded: it is not eligible and plans the serial kernel. The accumulator is always F32 (RADV has
+/// no f16-accumulate config), so this only fires for a mixed f16-in/f32-out matmul; a pure f16-output matmul would
+/// need an extra narrowing store that is not implemented (as in the AMD WMMA arm's F32-only path, see
 /// `matmul_amd_tc_eligible`'s caller in `lib.rs`).
 pub fn matmul_spirv_coopmat_eligible(
     backend: Backend,
@@ -93,15 +89,13 @@ pub fn matmul_spirv_coopmat_eligible(
     m: usize,
     n: usize,
     k: usize,
-    batch_dims_product: usize,
 ) -> bool {
     let operands_f16 = a_dtype == DType::F16 && b_dtype == DType::F16;
     backend == Backend::SpirvVulkan
         && operands_f16
         && m.is_multiple_of(16)
         && n.is_multiple_of(16)
-        && k == 16
-        && batch_dims_product == 1
+        && k.is_multiple_of(16)
 }
 
 /// True if any tensor-core/coopmat arm fires, i.e. `plan_eqn`'s mixed-operand-dtype guard would not
@@ -114,11 +108,10 @@ pub fn matmul_tensor_core_eligible(
     m: usize,
     n: usize,
     k: usize,
-    batch_dims_product: usize,
 ) -> bool {
-    matmul_amd_tc_eligible(backend, a_dtype, b_dtype, m, n, k, batch_dims_product)
+    matmul_amd_tc_eligible(backend, a_dtype, b_dtype, m, n, k)
         || matmul_nvptx_tc_eligible(backend, a_dtype, b_dtype, m, n, k)
-        || matmul_spirv_coopmat_eligible(backend, a_dtype, b_dtype, m, n, k, batch_dims_product)
+        || matmul_spirv_coopmat_eligible(backend, a_dtype, b_dtype, m, n, k)
 }
 
 /// Card 1011: whether the device buffer that holds BF16 const `id` on `backend` is the packed `u32` lanes
@@ -136,6 +129,7 @@ pub fn matmul_tensor_core_eligible(
 /// `Cast` kernel reads and the lane its source uploads to cannot drift apart.
 pub(crate) fn bf16_const_is_packed<V: ValidationChannel>(
     g: &Graph<V>,
+    views: &HashMap<ValueId, Layout>,
     id: ValueId,
     backend: Backend,
     caps: &DeviceCaps,
@@ -144,9 +138,9 @@ pub(crate) fn bf16_const_is_packed<V: ValidationChannel>(
         Backend::SpirvVulkan => true,
         Backend::AmdGcn(_) => {
             bf16_const_feeds_decode_bf16_gemv(g, id, backend, caps)
-                || bf16_const_feeds_only_packed_readers(g, id)
+                || bf16_const_feeds_only_packed_readers(g, views, id)
         }
-        Backend::Nvptx => bf16_const_feeds_only_packed_readers(g, id),
+        Backend::Nvptx => bf16_const_feeds_only_packed_readers(g, views, id),
     }
 }
 
@@ -207,14 +201,14 @@ pub fn matmul_bf16_decode_gemv_eligible(
 }
 
 /// Shape/dtype projection of [`matmul_bf16_decode_gemv_eligible`] for one eqn of `g` (the weight is
-/// `inputs[1]`). `None` when the eqn is not a `MatMul`/`MatMulBias` with the shape the predicate needs.
+/// `inputs[1]`). `None` when the eqn is not a `MatMul` with the shape the predicate needs.
 fn matmul_bf16_decode_gemv_eligible_in<V: ValidationChannel>(
     g: &Graph<V>,
     backend: Backend,
     eqn: &Eqn,
     caps: &DeviceCaps,
 ) -> Option<bool> {
-    if !matches!(eqn.op, OpKind::MatMul | OpKind::MatMulBias) || eqn.inputs.len() < 2 {
+    if !matches!(eqn.op, OpKind::MatMul) || eqn.inputs.len() < 2 {
         return None;
     }
     let (Operand::Value(a), Operand::Value(b)) = (&eqn.inputs[0], &eqn.inputs[1]) else {
@@ -283,26 +277,41 @@ pub fn bf16_const_feeds_decode_bf16_gemv<V: ValidationChannel>(
     consumed
 }
 
-/// The operand position at which `op` reads a value as packed BF16 lanes on a typed value walk, if it
-/// does. One row per imported kernel that decodes the Card 380 lane layout: the `DenseContraction`
-/// weight (card 380), the `DenseRowGather` table (card 381) and the `Cast` to F32 of a norm scale, bias or
-/// other elementwise const (card 1011, `packed_bf16_to_f32`). A further reader is a row here plus its
-/// kernel, never a second hand-written branch.
+/// Whether `op` reads its operand `position` as packed BF16 lanes on a typed value walk. One row per kernel
+/// that decodes the Card 380 lane layout: the `DenseContraction` weight (card 380), the `DenseRowGather` table
+/// (card 381), the `Cast` to F32 of a norm scale, bias or other elementwise const (card 1011,
+/// `packed_bf16_to_f32`), and the narrow inputs a `FusedRow` or `ContractionEpilogue` region widens in
+/// registers with a `FusedOp::Cast` step. A further reader is a row here plus its kernel, never a second
+/// hand-written branch.
 ///
 /// Every other operand of those operations is an ordinary F32 or I32 buffer, so the position matters:
 /// a contraction activation or a row-gather index read through this table would be a const uploaded as
 /// two-byte words for a kernel that reads four-byte ones.
-fn packed_bf16_reader_operand(op: &OpKind) -> Option<usize> {
-    match op {
-        OpKind::DenseContraction { .. } => Some(1),
-        OpKind::DenseRowGather { .. } => Some(0),
-        OpKind::Cast { to: DType::F32 } => Some(0),
-        _ => None,
-    }
+fn packed_bf16_reader(op: &OpKind, position: usize) -> bool {
+    let weight = (op.dense_weight().is_some()
+        || matches!(
+            op,
+            OpKind::IndexedMatMul
+                | OpKind::ContractionEpilogue {
+                    head: ContractionHead::Indexed,
+                    ..
+                }
+        ))
+        && position == 1;
+    weight
+        || match op {
+            OpKind::DenseRowGather { .. } | OpKind::Cast { to: DType::F32 } => position == 0,
+            OpKind::FusedRow(region) => region.widens_input(position),
+            // Operands `0..OPERANDS` are the head's; the region's local `n` is operand `OPERANDS + n - 1`.
+            OpKind::ContractionEpilogue { head, region } => position
+                .checked_sub(head.operands() - 1)
+                .is_some_and(|local| local >= 1 && region.widens_input(local)),
+            _ => false,
+        }
 }
 
 /// Card 380 and card 381: true if every consumer of `id` reads it through
-/// `packed_bf16_reader_operand`, and `id` does not escape the graph. This is the condition under
+/// `packed_bf16_reader`, and `id` does not escape the graph. This is the condition under
 /// which a BF16 const may stay narrow on a typed value walk: those imported kernels are the only ones
 /// there that read BF16, and they read it as packed `u32` lanes holding the checkpoint bytes.
 ///
@@ -318,6 +327,7 @@ fn packed_bf16_reader_operand(op: &OpKind) -> Option<usize> {
 /// `crate::validate_wgpu_tensor_execution`.
 pub fn bf16_const_feeds_only_packed_readers<V: ValidationChannel>(
     g: &Graph<V>,
+    views: &HashMap<ValueId, Layout>,
     id: ValueId,
 ) -> bool {
     if g.liveness_roots().any(|root| root == id) {
@@ -330,7 +340,13 @@ pub fn bf16_const_feeds_only_packed_readers<V: ValidationChannel>(
                 continue;
             }
             consumed = true;
-            if packed_bf16_reader_operand(&eqn.op) != Some(position) {
+            // A promoted view of the const is read in place by its consumer (the checkpoint-order `[E, N, K]`
+            // expert stack an indexed contraction reads strided), so the const is packed exactly when that
+            // view's readers are packed readers.
+            let through_view = position == 0
+                && views.contains_key(&eqn.out)
+                && bf16_const_feeds_only_packed_readers(g, views, eqn.out);
+            if !through_view && !packed_bf16_reader(&eqn.op, position) {
                 return false;
             }
         }
@@ -813,7 +829,7 @@ pub(crate) fn lower_nonlast_reduces<V: ValidationChannel>(g: &Graph<V>) -> Graph
     out
 }
 
-/// Widen a `MatMul`/`MatMulBias`/`Binary` operand whose dtype does not match the eqn's output dtype
+/// Widen a `MatMul`/`Binary` operand whose dtype does not match the eqn's output dtype
 /// back to the output dtype via an explicit `Cast`, whenever [`matmul_tensor_core_eligible`] says the
 /// tensor-core arm will not fire for `backend` (a `Binary` eqn never has a tensor-core arm, so its
 /// mismatches are always widened). Tensor-core-eligible matmuls (e.g. prefill matmuls narrowed by
@@ -901,9 +917,7 @@ pub fn widen_mismatched_matmul_dtypes<V: ValidationChannel>(
             continue;
         }
         let is_matmul = matches!(eqn.op, OpKind::MatMul);
-        let is_matmul_bias = matches!(eqn.op, OpKind::MatMulBias);
-        let mm = is_matmul || is_matmul_bias;
-        let widenable = mm || matches!(eqn.op, OpKind::Binary(_));
+        let widenable = is_matmul || matches!(eqn.op, OpKind::Binary(_));
         let (a_id, b_id) = match (eqn.inputs.first(), eqn.inputs.get(1)) {
             (Some(Operand::Value(a)), Some(Operand::Value(b))) if widenable => (*a, *b),
             _ => {
@@ -911,19 +925,6 @@ pub fn widen_mismatched_matmul_dtypes<V: ValidationChannel>(
                 continue;
             }
         };
-        // Card 273: `MatMulBias`'s bias operand (`eqn.inputs[2]`) is deliberately not widened, even
-        // though its declared dtype (F32 after the PTX Const safety transform) never matches a BF16
-        // `odt`. `matmul_batched_impl`'s bias kernel parameter is hardcoded `slice_f32` regardless of
-        // `dt` (`crates/poot-kernelgen/src/matmul.rs`: bias is an `[N]` f32 vector, unlike `a`/`b`/`c`,
-        // which use `slice_dtype(dt, ..)`), so the kernel's contract is "bias is always f32". Widening
-        // bias to `odt` produced a 2-byte bf16 bias buffer that the kernel's `slice_f32` param read at
-        // 2x the real width (`reldiff` 1.1 at the first q-proj `matmul_bias` in
-        // `ptx_prefill_check_bf16`, per `ptx_prefill_compare_bf16`'s CPU-oracle diff). The PTX Const
-        // safety transform already leaves the bias Const F32-declared, matching that contract, so only
-        // `a`/`b` (which the kernel narrows to `dt`) are widened below. `MatMulBias` never takes a
-        // tensor-core arm (the tensor-core path does not carry bias, so it always uses the serial
-        // batched kernel), so the `matmul_tensor_core_eligible` skip below applies only to plain
-        // `MatMul`.
         let odt = g.aval(eqn.out).dtype;
         let a_dt = g.aval(a_id).dtype;
         let b_dt = g.aval(b_id).dtype;
@@ -931,18 +932,17 @@ pub fn widen_mismatched_matmul_dtypes<V: ValidationChannel>(
             out.eqns.push(eqn.clone());
             continue;
         }
-        if is_matmul || is_matmul_bias {
+        if is_matmul {
             let out_shape = &g.aval(eqn.out).shape;
             let r = out_shape.len();
             if r < 2 {
-                // MatMul/MatMulBias always infer a rank >= 2 output (see OpKind::infer); defensive only.
+                // MatMul always infers a rank >= 2 output (see OpKind::infer); defensive only.
                 out.eqns.push(eqn.clone());
                 continue;
             }
             let (m, n) = (out_shape[r - 2], out_shape[r - 1]);
             let k = g.aval(a_id).shape.last().copied().unwrap_or(0);
-            let batch = out_shape[..r - 2].iter().product::<usize>();
-            if is_matmul && matmul_tensor_core_eligible(backend, a_dt, b_dt, m, n, k, batch) {
+            if matmul_tensor_core_eligible(backend, a_dt, b_dt, m, n, k) {
                 out.eqns.push(eqn.clone());
                 continue;
             }
@@ -1081,7 +1081,7 @@ mod tensor_core_weight_tests {
     use poot_tensor::DType;
 
     use super::widen_mismatched_matmul_dtypes;
-    use crate::{ExactI32StorageAnalysis, Plan};
+    use crate::ExactI32StorageAnalysis;
 
     #[test]
     fn card278_existing_tensor_core_choice_keeps_eligible_bf16_weight_narrow() {
@@ -1118,12 +1118,12 @@ mod tensor_core_weight_tests {
         .expect("eligible BF16 matmul plans")
         {
             crate::Planned {
-                plan: Plan::Compute { .. },
+                plan,
                 choice:
                     crate::KernelChoice::Generated(crate::KernelRequest::Contraction(
                         crate::ContractionSpec::TensorCore { .. },
                     )),
-            } => {}
+            } if plan.single().is_some() => {}
             other => panic!("eligible BF16 matmul chose {:?}", other.choice),
         }
     }
@@ -1380,8 +1380,8 @@ mod fold_dense_bf16_tests {
     }
 
     /// Card 645: the F32 contraction the fold makes is the matmul it replaced. `eval` of the folded graph
-    /// (the oracle's `DenseContraction` arm) equals `eval` of the traced `Transpose` + `MatMul`, element for
-    /// element, on a weight whose `[N, K]` and `[K, N]` readings differ.
+    /// (the oracle's `DenseContraction` arm) equals `eval` of the traced `Transpose` + `MatMul`, bit for
+    /// bit, on a weight whose `[N, K]` and `[K, N]` readings differ.
     #[test]
     fn folded_f32_contraction_evaluates_as_the_traced_matmul() {
         use poot_eval::{EvalBudget, EvalOptions, Value, eval};
@@ -1420,7 +1420,15 @@ mod fold_dense_bf16_tests {
         };
         let (traced, contracted) = (run(&graph), run(&folded));
         assert_eq!(contracted.shape(), traced.shape());
-        assert_eq!(contracted.as_f32().unwrap(), traced.as_f32().unwrap());
+        let bits = |tensor: &HostTensor| -> Vec<u32> {
+            tensor
+                .as_f32()
+                .unwrap()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect()
+        };
+        assert_eq!(bits(&contracted), bits(&traced));
     }
 
     /// Card 380 FR-005. A transposed value something else also reads is a real materialization: folding it
@@ -1849,6 +1857,113 @@ mod lower_nonlast_reduces_tests {
                     "lowering changed values (op={op:?}, keepdim={keepdim})"
                 );
             }
+        }
+    }
+}
+
+/// POOT-651: the tied lm_head of a BF16 checkpoint plans on the dense BF16 Gemv over its BF16-resident weight.
+#[cfg(test)]
+mod tied_head_tests {
+    use poot_executor_parity::dense::{Dense, Family, plain, step};
+    use poot_graph_ir::{OpKind, Operand, Storage};
+    use poot_kernelgen::{ContractionSpec, KernelRequest, WeightLayout};
+    use poot_models::model::{LogitRows, Phase};
+    use poot_target::{AmdArch, Backend, BufferStorage};
+    use poot_tensor::DType;
+    use poot_test_util::device_caps::default_caps_for;
+
+    use crate::{CompileLimits, CompileOptions, KernelChoice, Submission, Target, compile, numel};
+
+    const VOCAB: usize = 151936;
+    const HIDDEN: usize = 896;
+
+    /// Qwen2.5-0.5B's dimensions over a natively BF16 checkpoint; the head is tied, so it is its own `w.head`
+    /// const of the embedding's values.
+    fn qwen2_5_0_5b_decode() -> poot_graph_ir::Graph {
+        let dense = Dense::new(Family::Qwen2)
+            .vocab(VOCAB)
+            .dims(HIDDEN, 4864, 24)
+            .heads(14, 2)
+            .head_dim(64)
+            .max_positions(32768);
+        plain(
+            dense
+                .zeroed_model(DType::BF16)
+                .model
+                .trace(Phase::Decode, step(1, 1, 64, LogitRows::Last))
+                .unwrap(),
+        )
+    }
+
+    /// POOT-651 SC-001, at planning, through `compile` on wgpu and ROCm: the head contraction is the dense Gemv over
+    /// the `[vocab, hidden]` weight in checkpoint order, reading packed BF16 storage, and the program's constants
+    /// hold no F32 buffer of the head's element count: the head's residency is `vocab * hidden * 2` bytes.
+    ///
+    /// Mutation: in `fold_dense_contractions`, skip the fold for a BF16 weight (`continue` before the
+    /// `DENSE_CONTRACTION_WEIGHT_DTYPES` check); the head stays a `Transpose` and a mixed-dtype `MatMul` over the BF16
+    /// weight, which no backend lowers (no pass retypes a const), so `compile` refuses it and this row goes red.
+    #[test]
+    fn the_tied_head_decode_runs_the_bf16_gemv_over_bf16_resident_weight() {
+        let graph = qwen2_5_0_5b_decode();
+        let options = CompileOptions {
+            execution: Submission::Replay,
+            limits: CompileLimits::STANDARD,
+        };
+        for backend in [Backend::SpirvVulkan, Backend::AmdGcn(AmdArch::gfx1151())] {
+            let target = Target {
+                backend,
+                caps: default_caps_for(backend),
+            };
+            let program = compile(&graph, &target, &options).expect("the decode graph compiles");
+            let (eqn, _) = program
+                .planned()
+                .find(|(eqn, _)| program.graph().aval(eqn.out).shape.last() == Some(&VOCAB))
+                .expect("the head contraction is planned");
+            assert_eq!(
+                eqn.op,
+                OpKind::DenseContraction {
+                    weight: DType::BF16
+                },
+                "{backend:?}: the head reads the weight in checkpoint order"
+            );
+            let KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::DenseGemv {
+                weight,
+                layout,
+                n,
+                ..
+            })) = program.kernel_choice(eqn)
+            else {
+                panic!(
+                    "{backend:?}: the head is the dense Gemv, got {:?}",
+                    program.kernel_choice(eqn)
+                );
+            };
+            assert_eq!((*layout, *n), (WeightLayout::Nk, VOCAB), "{backend:?}");
+            assert_eq!(*weight, BufferStorage::bf16_packed(), "{backend:?}");
+
+            let Operand::Value(head) = eqn.inputs[1] else {
+                panic!("the head weight is a value");
+            };
+            assert_eq!(
+                program.storage().storage(head).buffer_storage(),
+                BufferStorage::bf16_packed(),
+                "{backend:?}: the head weight is resident as packed BF16"
+            );
+            let g = program.graph();
+            let head_elems = VOCAB * HIDDEN;
+            assert!(
+                g.values.iter().enumerate().all(|(id, meta)| {
+                    meta.storage != Storage::Const
+                        || g.aval(id).dtype != DType::F32
+                        || numel(&g.aval(id).shape) < head_elems
+                }),
+                "{backend:?}: no F32 constant is as large as the head weight"
+            );
+            assert_eq!(
+                (g.aval(head).dtype, g.aval(head).shape.as_slice()),
+                (DType::BF16, [VOCAB, HIDDEN].as_slice()),
+                "{backend:?}: the head weight is the BF16 [vocab, hidden] const"
+            );
         }
     }
 }

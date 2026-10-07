@@ -265,7 +265,9 @@ impl WeightBinder {
                 };
                 let parts = match view {
                     WeightView::Stored(key) => vec![Part::Whole(key.clone())],
-                    WeightView::RowStack(keys) => keys.iter().cloned().map(Part::Whole).collect(),
+                    WeightView::RowStack(keys) | WeightView::ExpertStack(keys) => {
+                        keys.iter().cloned().map(Part::Whole).collect()
+                    }
                     WeightView::RowRange { key, rows } => {
                         vec![Part::Rows(key.clone(), rows.clone())]
                     }

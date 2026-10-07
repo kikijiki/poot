@@ -11,9 +11,7 @@ use crate::graph::{
     ValueMeta,
 };
 use crate::op::{OpKind, SampleRule};
-#[cfg(test)]
-use crate::types::DType;
-use crate::types::{Scalar, TensorType};
+use crate::types::{DType, Scalar, TensorType};
 use poot_quant::PackedWeight;
 
 /// A type-only tensor handle: a `ValueId` with no data. There is no `Deref`/`as_slice`/`to_scalar`, so a host
@@ -299,7 +297,7 @@ impl PreparedAppendResult {
 /// use poot_graph_ir::QuantScheme;
 /// ```
 ///
-/// Card 557: a tracer emits primitives and `ops::` compositions only. The bias epilogue and flash
+/// Card 557: a tracer emits primitives and `ops::` compositions only. The contraction epilogue and flash
 /// attention are composites `compile`'s passes form ([`crate::op::OpKind::class`]), and the kernel choice
 /// behind them is the planner's, so `Builder` has no method for either. Each call below uses the deleted
 /// method's own signature, so re-adding one makes its example compile.
@@ -935,9 +933,9 @@ impl Builder {
     }
 
     /// A constant the binder materializes from its own payload (a derived table such as RoPE's):
-    /// no name, no weight. Declared F32 in [`ComputedConst::shape`].
+    /// no name, no weight. Declared in [`ComputedConst::dtype`] and [`ComputedConst::shape`].
     pub fn computed(&self, computed: ComputedConst) -> Traced {
-        let aval = TensorType::f32(computed.shape());
+        let aval = TensorType::new(computed.shape(), computed.dtype());
         let id = self.push_value(aval, Storage::Computed(computed), None, None, None);
         {
             let mut g = self.g.borrow_mut();
@@ -1099,7 +1097,14 @@ impl Builder {
         )
     }
 
-    /// I32 `Select(cond, if_true, if_false)` with wrapping `if_false + cond * (if_true - if_false)`.
+    /// `Select(cond, if_true, if_false)`: the bit pattern of `if_true` where the I32 condition word is
+    /// nonzero, else of `if_false`. The branches share one I32 or float dtype. A true select, so a NaN or
+    /// Inf in the unselected branch cannot reach the result.
+    ///
+    /// Any nonzero condition word picks `if_true`, not only 1. Audited at POOT-1033: no production caller
+    /// relied on a condition outside {0, 1} (`index_guard`, `ple`'s equality flag, the bf16 binary cond and
+    /// the exact-I32 fixtures all feed `GeU`/`Ge`/`And` flags); two tests that pinned the old arithmetic on a
+    /// wider condition word were re-pinned to this definition.
     pub fn select(&self, cond: Traced, if_true: Traced, if_false: Traced) -> Traced {
         let (tc, tt, tf) = (self.aval(cond), self.aval(if_true), self.aval(if_false));
         self.emit(
@@ -1132,10 +1137,29 @@ impl Builder {
     }
 
     /// The F32 range `[0, 1, .., len)`, shape `[len]` (R466-019): a computed range, not a bound constant.
-    /// The dtype stays F32 until Card 558b switches indices and ranges to I32 end to end. The compiler
-    /// folds it into a [`crate::Storage::Computed`] graph constant before planning.
+    /// The compiler folds it into a [`crate::Storage::Computed`] graph constant before planning.
     pub fn iota(&self, len: usize) -> Traced {
-        self.emit(OpKind::Iota { len }, Vec::new(), &[])
+        self.emit(
+            OpKind::Iota {
+                len,
+                dtype: DType::F32,
+            },
+            Vec::new(),
+            &[],
+        )
+    }
+
+    /// The exact I32 range `[0, 1, .., len)`, shape `[len]`: the integer sibling of [`Self::iota`], for
+    /// positions and bounds that must not round-trip through F32.
+    pub fn iota_i32(&self, len: usize) -> Traced {
+        self.emit(
+            OpKind::Iota {
+                len,
+                dtype: DType::I32,
+            },
+            Vec::new(),
+            &[],
+        )
     }
 
     pub fn reshape(&self, x: Traced, shape: Vec<usize>) -> Traced {

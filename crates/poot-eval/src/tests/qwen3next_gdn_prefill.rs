@@ -1199,7 +1199,7 @@ fn qwen3next_batched_decode_slotmap_kinds_bind_independently_via_kind_keyed_bind
                 inputs.insert(id, qwen3next_const_tensor(&weights, name, &shape));
             }
             Storage::Computed(computed) => {
-                inputs.insert(id, HostTensor::f32(computed.shape(), computed.values_f32()));
+                inputs.insert(id, computed.tensor());
             }
             Storage::State => {
                 inputs.insert(id, HostTensor::zeros(shape));

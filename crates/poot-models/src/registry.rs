@@ -179,6 +179,9 @@ impl Fixture {
 /// Builds a family's [`Model`] from a raw config and the checkpoint's weights.
 pub type BuildModel = fn(&RawConfig<'_>, &WeightStore) -> Result<Box<dyn Model>, ModelError>;
 
+/// A named extra fixture of a family: `(option name, fixture)`.
+pub type FixtureVariant = (&'static str, fn() -> Fixture);
+
 /// One family, as data: the config keys that name it, how to build it and its test fixture.
 #[derive(Clone, Copy)]
 pub struct FamilyEntry {
@@ -186,6 +189,9 @@ pub struct FamilyEntry {
     pub keys: &'static [(ConfigSource, &'static str)],
     pub build: BuildModel,
     pub fixture: fn() -> Fixture,
+    /// More fixtures of the same family, one per option a key can select (llama's Mixtral experts,
+    /// granite's `granitemoe` experts), by name.
+    pub variants: &'static [FixtureVariant],
 }
 
 impl fmt::Debug for FamilyEntry {
@@ -322,6 +328,15 @@ pub(crate) enum Family {
     Bloom,
     Gemma3,
     Gemma2,
+    Qwen3Moe,
+    GptOss,
+    Olmoe,
+    Gemma4,
+    MiniMaxM2,
+    Deepseek2,
+    Deepseek3,
+    Deepseek32,
+    NemotronH,
 }
 
 impl Family {
@@ -338,6 +353,15 @@ impl Family {
         Family::Bloom,
         Family::Gemma3,
         Family::Gemma2,
+        Family::Qwen3Moe,
+        Family::GptOss,
+        Family::Olmoe,
+        Family::Gemma4,
+        Family::MiniMaxM2,
+        Family::Deepseek2,
+        Family::Deepseek3,
+        Family::Deepseek32,
+        Family::NemotronH,
     ];
 
     pub(crate) const fn entry(self) -> FamilyEntry {
@@ -353,6 +377,15 @@ impl Family {
             Family::Bloom => crate::bloom::ENTRY,
             Family::Gemma3 => crate::gemma3::ENTRY,
             Family::Gemma2 => crate::gemma2::ENTRY,
+            Family::Qwen3Moe => crate::qwen3moe::ENTRY,
+            Family::GptOss => crate::gpt_oss::ENTRY,
+            Family::Olmoe => crate::olmoe::ENTRY,
+            Family::Gemma4 => crate::gemma4::ENTRY,
+            Family::MiniMaxM2 => crate::minimax_m2::ENTRY,
+            Family::Deepseek2 => crate::deepseek2::ENTRY,
+            Family::Deepseek3 => crate::deepseek3::ENTRY,
+            Family::Deepseek32 => crate::deepseek32::ENTRY,
+            Family::NemotronH => crate::nemotron_h::ENTRY,
         }
     }
 
@@ -372,6 +405,15 @@ impl Family {
             Family::Bloom => 8,
             Family::Gemma3 => 9,
             Family::Gemma2 => 10,
+            Family::Qwen3Moe => 11,
+            Family::GptOss => 12,
+            Family::Olmoe => 13,
+            Family::Gemma4 => 14,
+            Family::MiniMaxM2 => 15,
+            Family::Deepseek2 => 16,
+            Family::Deepseek3 => 17,
+            Family::Deepseek32 => 18,
+            Family::NemotronH => 19,
         }
     }
 }
@@ -520,6 +562,7 @@ mod tests {
                 generation: None,
                 store: WeightStore::default(),
             },
+            variants: &[],
         }
     }
 

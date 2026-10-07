@@ -51,6 +51,10 @@ pub enum RopeFlavor<'a> {
         short: Option<&'a [f32]>,
         long: Option<&'a [f32]>,
     },
+    /// Proportional RoPE (HF `proportional`, Gemma 4's global layers): the first `rotated`
+    /// frequency pairs are plain (`theta^(-2j / dim)` over the full width), every later pair has
+    /// zero frequency, so those dims pass through unrotated (NoPE).
+    Proportional { rotated: usize },
 }
 
 /// A `[positions, dim]` cos table and sin table, row-major.
@@ -120,6 +124,11 @@ pub fn rope_tables(
                     let base = base_theta.powf(-((2 * j) as f32) / d as f32);
                     if let Some(ls) = long_short {
                         return base / ls.get(j).copied().unwrap_or(1.0);
+                    }
+                    if let RopeFlavor::Proportional { rotated } = *flavor
+                        && j >= rotated
+                    {
+                        return 0.0;
                     }
                     let f = llama3_rescale(base, flavor);
                     let f = linear_rescale(f, flavor);
@@ -281,6 +290,9 @@ pub enum RopeScaling {
         high_freq_factor_bits: u32,
         original: u32,
     },
+    Proportional {
+        rotated: u32,
+    },
 }
 
 /// The config facts of one RoPE table: rotary width, base and scaling. With a table and a position
@@ -343,6 +355,9 @@ impl RopeSpec {
                 high_freq_factor_bits: high_freq_factor.to_bits(),
                 original: extent("original context", original)?,
             },
+            RopeFlavor::Proportional { rotated } => RopeScaling::Proportional {
+                rotated: extent("rotated pairs", rotated)?,
+            },
             RopeFlavor::LongRope { .. } => return Err(RopeSpecError::FactorArrays),
         };
         Ok(Self {
@@ -399,6 +414,9 @@ impl RopeSpec {
                 low_freq_factor: f32::from_bits(low_freq_factor_bits),
                 high_freq_factor: f32::from_bits(high_freq_factor_bits),
                 original: original as usize,
+            },
+            RopeScaling::Proportional { rotated } => RopeFlavor::Proportional {
+                rotated: rotated as usize,
             },
         }
     }
@@ -532,7 +550,11 @@ mod tests {
         for (table, want) in [(RopeTable::Cos, cos), (RopeTable::Sin, sin)] {
             let c = spec.computed(table, 4).unwrap();
             assert_eq!(c.shape(), vec![4, spec.dim()], "{label} {table:?}: shape");
-            assert_table(&format!("{label} {table:?}"), &c.values_f32(), want);
+            assert_table(
+                &format!("{label} {table:?}"),
+                c.tensor().as_f32().expect("an F32 table"),
+                want,
+            );
         }
     }
 
@@ -634,7 +656,11 @@ mod tests {
         let s = spec(4, 10_000.0, RopeFlavor::Plain);
         let c = s.computed(RopeTable::Cos, 2).unwrap();
         assert_eq!(c.shape(), vec![2, 4]);
-        assert_table("plain cos, capacity 2", &c.values_f32(), &PLAIN_COS[..8]);
+        assert_table(
+            "plain cos, capacity 2",
+            c.tensor().as_f32().expect("an F32 table"),
+            &PLAIN_COS[..8],
+        );
     }
 
     #[test]

@@ -20,8 +20,8 @@ use poot_graph_ir::builder::Builder;
 use poot_graph_ir::op::{BinOp, RedOp, UnOp};
 use poot_graph_ir::types::TensorType;
 use poot_graph_plan::{
-    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, FusionPolicy, Partition,
-    Submission, TargetSet, compile_staged,
+    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, Submission, TargetSet,
+    compile_staged,
 };
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::DType;
@@ -70,7 +70,6 @@ fn setup(
         },
         &CompileOptions {
             execution: Submission::Replay,
-            fusion: FusionPolicy::Full,
             limits: poot_graph_plan::CompileLimits::STANDARD,
         },
     )

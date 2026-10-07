@@ -161,6 +161,7 @@ pub(crate) fn slice_f32(mutable: bool) -> Ty {
 }
 /// Per-thread private array element `arr[idx]` (projection `[Index]`, no Deref - distinguishing a private
 /// `Ty::Array` local from a slice param `[Deref, Index]`).
+#[cfg(test)]
 pub(crate) fn arr_elem(arr: Local, idx: Local) -> Place {
     Place {
         local: arr,
@@ -477,7 +478,7 @@ impl WeightLane {
         } else {
             Err(KernelGenError::Unsupported {
                 request: generator,
-                reason: "a dense weight is read as f32, f16-packed or bf16-packed storage only",
+                reason: "a contraction weight is read as f32, f16-packed or bf16-packed storage only",
             })
         }
     }

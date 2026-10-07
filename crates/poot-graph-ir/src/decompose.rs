@@ -10,9 +10,13 @@
 use crate::builder::{Builder, BuilderAppendPlan, Traced};
 use crate::error::BuilderAppendError;
 use crate::graph::{Graph, Operand, ValueId};
-use crate::op::{FusedOp, FusedOperand, FusedRegion, OpKind, RowRegion, RowStep};
+use crate::op::{
+    ContractionHead, FusedOperand, FusedRegion, KeyLayout, KvBound, OpKind, PackedWeight,
+    RowRegion, RowStep,
+};
 use crate::ops;
-use crate::types::TensorType;
+use crate::packed_source::packed_source_constants;
+use crate::types::{DType, TensorType};
 
 /// A composite's primitive definition: `graph` computes the composite's result as its output from the
 /// constants `operands`, one per equation operand, in operand order. An evaluator binds the equation's
@@ -29,36 +33,69 @@ pub struct Decomposition {
 /// Every operand is a [`Builder::constant`] placeholder; the composite's parameters are baked into the
 /// primitive equations exactly as the tracer's `ops::` function bakes them:
 ///
-/// - `FlashAttentionDecode { n_rep, scale }`: [`ops::attention_masked_softcap`] with no softcap.
-/// - `FlashAttentionPrefill { n_rep, scale, softcap }`: [`ops::attention_prefill_softcap`].
+/// - `Attention(attrs)`: the one attention composite, `ops::attention_over_keys` (the body of
+///   [`ops::attention_masked_softcap`] and [`ops::attention_live`]), for every phase, key layout and bound.
 /// - `Rope { rot }`: [`ops::rope_partial`] over `x`'s last axis.
-/// - `MatMulBias`: [`ops::linear`] with the bias.
+/// - `ContractionEpilogue { head, region }`: the head op over its two operands, then the region's steps with
+///   local 0 the head's result (the dtype the head declares: a narrow head has already rounded).
+/// - `PackedContraction { descriptor, blocks }`: `PackedDequant` of the carriers, then the `MatMul` of
+///   `ops::packed_linear` (`blocks == 1`) or `ops::packed_block_diagonal_linear` (`blocks > 1`).
+/// - `DenseContraction { .. }`: `MatMul(activation, Transpose([1, 0], w))`, the chain the dense fold replaces.
+/// - `DenseRowGather { .. }`: `Cast { to: F32 }` of `Gather { axis: 0 }`, the pair the row-gather fold
+///   replaces.
 /// - `Fused(region)` / `FusedRow(region)`: the region's steps as equations, operands in place (a
 ///   `PackLane` leaf is the unit `Slice` of its packed input, a non-empty `pack` the last-axis `Concat`).
 pub fn decompose(op: &OpKind, operands: &[TensorType]) -> Option<Decomposition> {
     let out = op.infer(operands).ok()?;
     let b = Builder::new();
+    // A packed carrier is bound by its role-carrying source name, which the evaluator checks.
+    let carrier_names: Vec<String> = match op {
+        OpKind::PackedContraction { descriptor, .. } => {
+            packed_source_constants("operand", *descriptor)
+                .into_iter()
+                .map(|(name, _)| name.as_str().to_owned())
+                .collect()
+        }
+        _ => Vec::new(),
+    };
     let inputs: Vec<Traced> = operands
         .iter()
         .enumerate()
-        .map(|(position, ty)| b.constant(&format!("operand.{position}"), ty.clone()))
+        .map(|(position, ty)| {
+            let name = match position.checked_sub(1).and_then(|i| carrier_names.get(i)) {
+                Some(carrier) => carrier.clone(),
+                None => format!("operand.{position}"),
+            };
+            b.constant(&name, ty.clone())
+        })
         .collect();
     let result = match op {
-        OpKind::FlashAttentionDecode { n_rep, scale } => {
-            let &[q, k, v, mask] = inputs.as_slice() else {
-                return None;
+        OpKind::Attention(attrs) => {
+            let (&[q, k, v, mask], extra) = inputs.split_first_chunk::<4>()?;
+            let (shared, len) = match (attrs.key, attrs.bound, extra) {
+                (KeyLayout::Single, KvBound::Capacity, []) => (None, None),
+                (KeyLayout::Split { .. }, KvBound::Capacity, &[shared]) => (Some(shared), None),
+                (KeyLayout::Single, KvBound::Live, &[len]) => (None, Some(len)),
+                (KeyLayout::Split { .. }, KvBound::Live, &[shared, len]) => {
+                    (Some(shared), Some(len))
+                }
+                _ => return None,
             };
-            ops::attention_masked_softcap(&b, q, k, v, *n_rep, *scale, mask, None)
-        }
-        OpKind::FlashAttentionPrefill {
-            n_rep,
-            scale,
-            softcap,
-        } => {
-            let &[q, k, v, mask] = inputs.as_slice() else {
-                return None;
+            let keys = match shared {
+                Some(shared) => ops::AttentionKeys::Split { head: k, shared },
+                None => ops::AttentionKeys::Single(k),
             };
-            ops::attention_prefill_softcap(&b, q, k, v, *n_rep, *scale, mask, *softcap)
+            ops::attention_over_keys(
+                &b,
+                q,
+                keys,
+                v,
+                attrs.n_rep,
+                attrs.scale,
+                mask,
+                attrs.softcap,
+                len,
+            )
         }
         OpKind::Rope { rot } => {
             let &[x, cos, sin] = inputs.as_slice() else {
@@ -68,14 +105,30 @@ pub fn decompose(op: &OpKind, operands: &[TensorType]) -> Option<Decomposition> 
             let last = shape.len() - 1;
             ops::rope_partial(&b, x, cos, sin, shape[last], *rot, last)
         }
-        OpKind::MatMulBias => {
-            let &[x, w, bias] = inputs.as_slice() else {
-                return None;
-            };
-            ops::linear(&b, x, w, Some(bias))
+        OpKind::ContractionEpilogue { head, region } => {
+            let (head_operands, extras) = inputs.split_at(head.operands());
+            contraction_epilogue(&b, *head, region, head_operands, extras).ok()??
         }
         OpKind::Fused(region) => fused(&b, region, &inputs).ok()??,
         OpKind::FusedRow(region) => fused_row(&b, region, &inputs).ok()??,
+        OpKind::PackedContraction { descriptor, blocks } => {
+            let [activation, carriers @ ..] = inputs.as_slice() else {
+                return None;
+            };
+            packed_contraction(&b, *descriptor, *blocks, *activation, carriers)
+        }
+        OpKind::DenseContraction { .. } => {
+            let &[activation, weight] = inputs.as_slice() else {
+                return None;
+            };
+            b.matmul(activation, b.transpose(weight, vec![1, 0]))
+        }
+        OpKind::DenseRowGather { .. } => {
+            let &[table, index] = inputs.as_slice() else {
+                return None;
+            };
+            b.cast(b.gather(table, 0, index), DType::F32)
+        }
         OpKind::Unary(_)
         | OpKind::Binary(_)
         | OpKind::Select
@@ -92,10 +145,7 @@ pub fn decompose(op: &OpKind, operands: &[TensorType]) -> Option<Decomposition> 
         | OpKind::ScatterUpdate
         | OpKind::MatMul
         | OpKind::PackedDequant { .. }
-        | OpKind::PackedContraction { .. }
         | OpKind::PackedRowGather { .. }
-        | OpKind::DenseContraction { .. }
-        | OpKind::DenseRowGather { .. }
         | OpKind::ArgTopK { .. }
         | OpKind::IndexedMatMul
         | OpKind::DynamicUpdateSlice { .. }
@@ -115,6 +165,30 @@ pub fn decompose(op: &OpKind, operands: &[TensorType]) -> Option<Decomposition> 
         operands: inputs.iter().map(|input| input.id).collect(),
         graph: b.finish(result),
     })
+}
+
+/// A packed contraction: the weight dequantized to `[out, k]` F32, then the activation contracted against
+/// it. `blocks == 1` is `ops::packed_linear`'s chain, `MatMul(activation, Transpose([1, 0], w))`.
+/// `blocks > 1` states [`ops::packed_block_diagonal_linear`]'s semantics: the weight is grouped into
+/// `[blocks, out / blocks, k]` before the `[0, 2, 1]` transpose, so each `[blocks, M, k]` activation block
+/// contracts only against its own weight block. The dequantized weight is a real intermediate (an
+/// `[out, k]` F32 tensor), which the evaluator charges to its budget.
+fn packed_contraction(
+    b: &Builder,
+    descriptor: PackedWeight,
+    blocks: usize,
+    activation: Traced,
+    carriers: &[Traced],
+) -> Traced {
+    let weight = b.packed_dequant(carriers, descriptor);
+    let [out, k] = descriptor.shape();
+    let weight = if blocks == 1 {
+        b.transpose(weight, vec![1, 0])
+    } else {
+        let grouped = b.reshape(weight, vec![blocks, out / blocks, k]);
+        b.transpose(grouped, vec![0, 2, 1])
+    };
+    b.matmul(activation, weight)
 }
 
 /// One region local as an equation operand: an input or step result, or a literal kept in place.
@@ -151,14 +225,6 @@ fn region_operand(
     }))
 }
 
-fn pointwise(op: FusedOp) -> OpKind {
-    match op {
-        FusedOp::Unary(op) => OpKind::Unary(op),
-        FusedOp::Binary(op) => OpKind::Binary(op),
-        FusedOp::Select => OpKind::Select,
-    }
-}
-
 /// Stage the equations of a region whose steps `stage` emits, then commit them; `Ok(None)` when a
 /// region operand names no local.
 fn commit_region(
@@ -185,41 +251,75 @@ fn commit_region(
     }))
 }
 
+/// A pointwise region's steps as equations over `locals`, then its output local or its last-axis `pack`.
+fn stage_region(
+    plan: &mut BuilderAppendPlan,
+    locals: &mut Vec<Traced>,
+    region: &FusedRegion,
+) -> Result<Option<Traced>, BuilderAppendError> {
+    for step in &region.steps {
+        let mut operands = Vec::with_capacity(step.inputs.len());
+        for operand in &step.inputs {
+            let Some(operand) = region_operand(plan, locals, operand)? else {
+                return Ok(None);
+            };
+            operands.push(operand);
+        }
+        locals.push(plan.equation(step.op.kind(), operands)?);
+    }
+    if region.pack.is_empty() {
+        return Ok(locals.get(region.output).copied());
+    }
+    let mut parts = Vec::with_capacity(region.pack.len());
+    for local in &region.pack {
+        let Some(part) = locals.get(*local) else {
+            return Ok(None);
+        };
+        parts.push(Operand::Value(part.id));
+    }
+    let Some(axis) = plan
+        .type_of(locals[region.pack[0]].id)
+        .and_then(|ty| ty.rank().checked_sub(1))
+    else {
+        return Ok(None);
+    };
+    Ok(Some(plan.equation(OpKind::Concat { axis }, parts)?))
+}
+
 /// A pointwise region's steps as equations, then its output local or its last-axis `pack`.
 fn fused(
     b: &Builder,
     region: &FusedRegion,
     inputs: &[Traced],
 ) -> Result<Option<Traced>, BuilderAppendError> {
-    commit_region(b, inputs, |plan, locals| {
-        for step in &region.steps {
-            let mut operands = Vec::with_capacity(step.inputs.len());
-            for operand in &step.inputs {
-                let Some(operand) = region_operand(plan, locals, operand)? else {
-                    return Ok(None);
-                };
-                operands.push(operand);
-            }
-            locals.push(plan.equation(pointwise(step.op), operands)?);
-        }
-        if region.pack.is_empty() {
-            return Ok(locals.get(region.output).copied());
-        }
-        let mut parts = Vec::with_capacity(region.pack.len());
-        for local in &region.pack {
-            let Some(part) = locals.get(*local) else {
-                return Ok(None);
-            };
-            parts.push(Operand::Value(part.id));
-        }
-        let Some(axis) = plan
-            .type_of(locals[region.pack[0]].id)
-            .and_then(|ty| ty.rank().checked_sub(1))
-        else {
-            return Ok(None);
-        };
-        Ok(Some(plan.equation(OpKind::Concat { axis }, parts)?))
-    })
+    commit_region(b, inputs, |plan, locals| stage_region(plan, locals, region))
+}
+
+/// A contraction epilogue: the head op over `head_operands`, then `region` over the head's result (local 0)
+/// and the `extras` (locals `1..`). The head is an equation of the same plan, so the whole composite commits
+/// as one append.
+fn contraction_epilogue(
+    b: &Builder,
+    head: ContractionHead,
+    region: &FusedRegion,
+    head_operands: &[Traced],
+    extras: &[Traced],
+) -> Result<Option<Traced>, BuilderAppendError> {
+    let mut plan = b.append_plan(0);
+    let operands = head_operands
+        .iter()
+        .map(|operand| Operand::Value(operand.id))
+        .collect();
+    let mut locals = vec![plan.equation(head.op(), operands)?];
+    locals.extend_from_slice(extras);
+    let Some(result) = stage_region(&mut plan, &mut locals, region)? else {
+        return Ok(None);
+    };
+    plan.declare_result(result)?;
+    let mut prepared = b.preflight_append(plan)?;
+    Ok(Some(Traced {
+        id: b.commit_append(&mut prepared)?,
+    }))
 }
 
 /// A row region's steps as equations: pointwise steps in place, each reduction a keepdim `Reduce` over
@@ -232,7 +332,7 @@ fn fused_row(
     commit_region(b, inputs, |plan, locals| {
         for step in &region.steps {
             let (op, step_operands) = match step {
-                RowStep::Pointwise { op, inputs } => (pointwise(*op), inputs.as_slice()),
+                RowStep::Pointwise { op, inputs } => (op.kind(), inputs.as_slice()),
                 RowStep::Reduce { op, input } => (
                     OpKind::Reduce {
                         op: *op,
@@ -259,7 +359,8 @@ fn fused_row(
 mod tests {
     use super::*;
     use crate::op::{
-        BinOp, FusedStep, OpClass, PackedWeight, RedOp, SampleRule, UnOp, WeightFormat,
+        AttentionAttrs, BinOp, FusedOp, FusedStep, OpClass, PackedWeight, RedOp, SampleRule, UnOp,
+        WeightFormat,
     };
     use crate::types::{DType, Scalar};
 
@@ -295,7 +396,7 @@ mod tests {
             OpKind::PackedRowGather { .. } => 17,
             OpKind::DenseContraction { .. } => 18,
             OpKind::DenseRowGather { .. } => 19,
-            OpKind::MatMulBias => 20,
+            OpKind::ContractionEpilogue { .. } => 20,
             OpKind::ArgTopK { .. } => 21,
             OpKind::IndexedMatMul => 22,
             OpKind::DynamicUpdateSlice { .. } => 23,
@@ -303,17 +404,35 @@ mod tests {
             OpKind::UnpackI8 { .. } => 25,
             OpKind::Fused(_) => 26,
             OpKind::FusedRow(_) => 27,
-            OpKind::FlashAttentionDecode { .. } => 28,
-            OpKind::FlashAttentionPrefill { .. } => 29,
-            OpKind::Rope { .. } => 30,
-            OpKind::AllReduce { .. } => 31,
-            OpKind::AllGather { .. } => 32,
-            OpKind::RandomUniform { .. } => 33,
-            OpKind::SampleToken { .. } => 34,
+            OpKind::Attention(_) => 28,
+            OpKind::Rope { .. } => 29,
+            OpKind::AllReduce { .. } => 30,
+            OpKind::AllGather { .. } => 31,
+            OpKind::RandomUniform { .. } => 32,
+            OpKind::SampleToken { .. } => 33,
         }
     }
 
-    const VARIANTS: usize = 35;
+    const VARIANTS: usize = 34;
+
+    /// The epilogue region `(head + bias) + residual`: local 0 the head result, 1 the bias, 2 the residual.
+    fn bias_residual_region() -> FusedRegion {
+        FusedRegion {
+            n_inputs: 3,
+            steps: vec![
+                FusedStep {
+                    op: FusedOp::Binary(BinOp::Add),
+                    inputs: vec![FusedOperand::Local(0), FusedOperand::Local(1)],
+                },
+                FusedStep {
+                    op: FusedOp::Binary(BinOp::Add),
+                    inputs: vec![FusedOperand::Local(3), FusedOperand::Local(2)],
+                },
+            ],
+            output: 4,
+            pack: Vec::new(),
+        }
+    }
 
     /// One instance of every `OpKind` variant over canonical operand types (each row types under
     /// `infer`), the composites in each form the evaluator meets (prefill with and without softcap, a
@@ -426,7 +545,13 @@ mod tests {
                 vec![f32(&[2, 3])],
             ),
             (OpKind::Concat { axis: 0 }, vec![f32(&[2, 3]), f32(&[1, 3])]),
-            (OpKind::Iota { len: 4 }, Vec::new()),
+            (
+                OpKind::Iota {
+                    len: 4,
+                    dtype: DType::F32,
+                },
+                Vec::new(),
+            ),
             (
                 OpKind::Gather { axis: 0 },
                 vec![f32(&[4, 3]), typed(&[2], i32)],
@@ -452,6 +577,13 @@ mod tests {
                 with_sources(vec![f32(&[2, 32])], false),
             ),
             (
+                OpKind::PackedContraction {
+                    descriptor: packed,
+                    blocks: 2,
+                },
+                with_sources(vec![f32(&[2, 3, 32])], false),
+            ),
+            (
                 OpKind::PackedRowGather { descriptor: packed },
                 with_sources(vec![typed(&[2], i32)], true),
             ),
@@ -462,14 +594,31 @@ mod tests {
                 vec![f32(&[2, 4]), typed(&[3, 4], DType::BF16)],
             ),
             (
+                OpKind::DenseContraction { weight: DType::F32 },
+                vec![f32(&[2, 3, 4]), f32(&[5, 4])],
+            ),
+            (
+                OpKind::DenseContraction { weight: DType::F16 },
+                vec![f32(&[2, 4]), typed(&[3, 4], DType::F16)],
+            ),
+            (
                 OpKind::DenseRowGather {
                     source: DType::BF16,
                 },
                 vec![typed(&[5, 4], DType::BF16), typed(&[2], i32)],
             ),
             (
-                OpKind::MatMulBias,
-                vec![f32(&[2, 3]), f32(&[3, 4]), f32(&[4])],
+                OpKind::DenseRowGather {
+                    source: DType::E4M3FN,
+                },
+                vec![typed(&[5, 4], DType::E4M3FN), typed(&[2, 3], i32)],
+            ),
+            (
+                OpKind::ContractionEpilogue {
+                    head: ContractionHead::MatMul,
+                    region: bias_residual_region(),
+                },
+                vec![f32(&[2, 3]), f32(&[3, 4]), f32(&[4]), f32(&[2, 4])],
             ),
             (OpKind::ArgTopK { k: 2 }, vec![f32(&[2, 5])]),
             (
@@ -485,27 +634,13 @@ mod tests {
             (OpKind::Fused(f32_region), vec![f32(&[3, 4]), f32(&[3, 4])]),
             (OpKind::Fused(i32_region), vec![typed(&[3, 2], i32)]),
             (OpKind::FusedRow(softmax), vec![f32(&[3, 7])]),
+            (OpKind::Attention(AttentionAttrs::new(2, 0.5, None)), decode),
             (
-                OpKind::FlashAttentionDecode {
-                    n_rep: 2,
-                    scale: 0.5,
-                },
-                decode,
-            ),
-            (
-                OpKind::FlashAttentionPrefill {
-                    n_rep: 2,
-                    scale: 0.5,
-                    softcap: None,
-                },
+                OpKind::Attention(AttentionAttrs::new(2, 0.5, None)),
                 prefill.clone(),
             ),
             (
-                OpKind::FlashAttentionPrefill {
-                    n_rep: 2,
-                    scale: 0.5,
-                    softcap: Some(30.0),
-                },
+                OpKind::Attention(AttentionAttrs::new(2, 0.5, Some(30.0))),
                 prefill,
             ),
             (
@@ -602,7 +737,12 @@ mod tests {
             typed(&[3, 4], DType::I32),
         ];
         assert!(decompose(&rope, &i32_rope).is_none());
-        let bias = [f32(&[2, 3]), f32(&[3, 4]), f32(&[1, 4])];
-        assert!(decompose(&OpKind::MatMulBias, &bias).is_none());
+        // A bias of width 5 does not broadcast against the head's `[2, 4]` result.
+        let epilogue = OpKind::ContractionEpilogue {
+            head: ContractionHead::MatMul,
+            region: bias_residual_region(),
+        };
+        let wide_bias = [f32(&[2, 3]), f32(&[3, 4]), f32(&[5]), f32(&[2, 4])];
+        assert!(decompose(&epilogue, &wide_bias).is_none());
     }
 }

@@ -14,8 +14,7 @@ use std::num::NonZeroUsize;
 use poot_eval::{EvalBudget, EvalOptions, Value, eval, materialize_dense};
 use poot_graph_ir::{Slot, SlotKey, Storage};
 use poot_graph_plan::{
-    CompileError, CompileLimits, CompileOptions, FusionPolicy, LegalizeError, Submission, Target,
-    compile,
+    CompileError, CompileLimits, CompileOptions, LegalizeError, Submission, Target, compile,
 };
 use poot_models::model::{KvLayout, LogitRows, Phase, StepShape};
 use poot_models::registry::{RawConfig, Registry};
@@ -42,7 +41,6 @@ fn caps(max_buffer_bytes: u64) -> DeviceCaps {
 fn options() -> CompileOptions {
     CompileOptions {
         execution: Submission::Replay,
-        fusion: FusionPolicy::Full,
         limits: CompileLimits::STANDARD,
     }
 }
@@ -159,7 +157,7 @@ fn driver_compile_splits_transposed_weights_under_a_small_buffer_limit() {
         let name = meta.name.as_deref();
         let value = match meta.storage {
             Storage::State => continue,
-            Storage::Computed(c) => HostTensor::f32(c.shape(), c.values_f32()),
+            Storage::Computed(c) => c.tensor(),
             Storage::Slot(Slot::TokenEmbed) => {
                 let embed = dense_weight(&d.map, &d.store, name.expect("a hosted embed is named"));
                 let row = rows_of(&embed, TOKEN as usize, 1);

@@ -16,6 +16,7 @@ pub(super) fn plan(
     odt: DType,
     caps: &DeviceCaps,
     limits: BodyLimits,
+    packed_operands: &[bool],
 ) -> Result<Planned, PlanError> {
     let site = Site::new(g, eqn, backend, limits);
     let shape = |vid: ValueId| g.aval(vid).shape.clone();
@@ -150,11 +151,14 @@ pub(super) fn plan(
             }
         }
         OpKind::Select => {
-            if odt != DType::I32 {
-                return Err(site.refuse(Capability::DtypeLowering));
-            }
+            // The condition leaf is an I32 word; the branches are I32 (exact-I32 form) or F32 (float form).
+            let branch = match odt {
+                DType::I32 => kg::LeafTy::I32,
+                DType::F32 => kg::LeafTy::F32,
+                _ => return Err(site.refuse(Capability::DtypeLowering)),
+            };
             let kernel = kg::FusedKernel {
-                n_leaves: 3,
+                leaf_tys: vec![kg::LeafTy::I32, branch, branch],
                 steps: vec![kg::FusedStep {
                     op: kg::FusedScalarOp::Select,
                     inputs: vec![
@@ -170,7 +174,11 @@ pub(super) fn plan(
                 numel: out_numel,
                 leaves: leaves(&ids),
                 kernel,
-                form: PointwiseForm::ExactI32 { fold },
+                form: if odt == DType::I32 {
+                    PointwiseForm::ExactI32 { fold }
+                } else {
+                    PointwiseForm::Float { fold }
+                },
             }))?
         }
         OpKind::Unary(uop) => {
@@ -238,12 +246,10 @@ pub(super) fn plan(
                 .steps
                 .iter()
                 .map(|st| {
+                    // The pointwise kernels read every leaf as f32: a `Cast` step has no leaf lane to widen.
+                    check_widening_step(site, st.op, &st.inputs, |_| false)?;
                     Ok(kg::FusedStep {
-                        op: if exact_i32 {
-                            map_fused_op_i32(site, st.op)?
-                        } else {
-                            map_fused_op(site, st.op)?
-                        },
+                        op: map_pointwise_op(site, st.op, exact_i32)?,
                         inputs: st
                             .inputs
                             .iter()
@@ -258,8 +264,16 @@ pub(super) fn plan(
                     })
                 })
                 .collect::<Result<Vec<_>, PlanError>>()?;
+            // An I32 leaf is a select condition (a float region) or one of an exact-I32 region's words.
+            let leaf_tys = ids
+                .iter()
+                .map(|&id| match g.aval(id).dtype {
+                    DType::I32 => kg::LeafTy::I32,
+                    _ => kg::LeafTy::F32,
+                })
+                .collect();
             let kernel = kg::FusedKernel {
-                n_leaves: region.n_inputs,
+                leaf_tys,
                 steps,
                 output: map_fused_local(region.output, region.n_inputs),
             };
@@ -273,7 +287,7 @@ pub(super) fn plan(
                         .collect(),
                 }
             } else {
-                PointwiseForm::Float
+                PointwiseForm::Float { fold }
             };
             generate(KernelRequest::Pointwise(PointwiseSpec {
                 out_shape: out_shape.to_vec(),
@@ -290,7 +304,10 @@ pub(super) fn plan(
                 .map(|st| {
                     Ok(match st {
                         RowStep::Pointwise { op, inputs } => kg::RowOp::Pointwise {
-                            op: map_fused_op(site, *op)?,
+                            op: {
+                                check_widening_step(site, *op, inputs, |id| id < region.n_inputs)?;
+                                map_fused_op(site, *op)?
+                            },
                             inputs: inputs
                                 .iter()
                                 .map(|o| map_fused_input(site, o, region.n_inputs))
@@ -306,8 +323,17 @@ pub(super) fn plan(
                     })
                 })
                 .collect::<Result<Vec<_>, PlanError>>()?;
+            let leaf_storage = ids
+                .iter()
+                .enumerate()
+                .map(|(j, &id)| {
+                    let packed = packed_operands.get(j).copied().unwrap_or(false);
+                    float_region_leaf_storage(site, g.aval(id).dtype, packed)
+                })
+                .collect::<Result<Vec<_>, PlanError>>()?;
             let kernel = kg::RowKernel {
                 n_leaves: region.n_inputs,
+                leaf_storage,
                 n_cols: out_shape[region.axis],
                 steps,
                 // the region's output local id uses the same 0..n_inputs leaves, n_inputs+s steps

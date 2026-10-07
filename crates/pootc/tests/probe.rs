@@ -33,12 +33,13 @@ fn pootc_exe() -> &'static str {
     .as_str()
 }
 
-/// Build `poot-kernel-intrinsics` from this checkout and return its rlib path, memoized for the process
+/// Build `poot-kernel-intrinsics` from this checkout and return its `.rmeta` path (cargo builds rlibs without
+/// embedded metadata, so the metadata a `--crate-type lib` compile reads lives in the `.rmeta`), memoized for the process
 /// (every `pootc_command` needs `--extern poot_kernel_intrinsics=...`; kernel sources depend on it instead
 /// of redeclaring their own intrinsic stubs, card 531c). The target directory is keyed by the checkout so
 /// no other worktree's build lands in a shared slot target dir (mirrors `macro_kernel.rs`'s
 /// `build_proc_macro`).
-fn kernel_intrinsics_rlib() -> &'static Path {
+fn kernel_intrinsics_rmeta() -> &'static Path {
     static RLIB: OnceLock<PathBuf> = OnceLock::new();
     RLIB.get_or_init(|| {
         use std::collections::hash_map::DefaultHasher;
@@ -77,11 +78,11 @@ fn kernel_intrinsics_rlib() -> &'static Path {
             .filter(|message| message["target"]["kind"] == serde_json::json!(["lib"]))
             .flat_map(|message| message["filenames"].as_array().cloned().unwrap_or_default())
             .filter_map(|name| name.as_str().map(PathBuf::from))
-            .filter(|path| path.extension().is_some_and(|ext| ext == "rlib"))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "rmeta"))
             .collect();
         let [library] = libraries.as_slice() else {
             panic!(
-                "cargo reported {} rlibs for poot-kernel-intrinsics, wanted exactly one: {libraries:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                "cargo reported {} rmeta files for poot-kernel-intrinsics, wanted exactly one: {libraries:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
                 libraries.len()
             );
         };
@@ -89,12 +90,12 @@ fn kernel_intrinsics_rlib() -> &'static Path {
     })
 }
 
-/// `--extern poot_kernel_intrinsics=<rlib>`, appended to every pootc invocation that compiles a kernel
+/// `--extern poot_kernel_intrinsics=<rmeta>`, appended to every pootc invocation that compiles a kernel
 /// source (they all depend on the crate now; card 531c).
 fn kernel_intrinsics_extern() -> String {
     format!(
         "poot_kernel_intrinsics={}",
-        kernel_intrinsics_rlib().display()
+        kernel_intrinsics_rmeta().display()
     )
 }
 

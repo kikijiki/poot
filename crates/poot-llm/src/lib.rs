@@ -2,7 +2,7 @@
 //! PTX device executors.
 //!
 //! A registered family loads as a [`driver::ModelHandle`] and generates through [`driver::Driver`]. The
-//! families not yet registered (MoE and hybrid, POOT-738) load as a `Runner`, which owns their weights
+//! families not yet registered (MLA and hybrid) load as a `Runner`, which owns their weights
 //! and tracer selection and runs their generate loops; the CPU eager path is the oracle that validates
 //! the graph IR, decompositions and executors.
 //!
@@ -50,7 +50,6 @@ pub mod driver;
 mod multimodal;
 mod text;
 
-pub use core::cpu_oracle::arm_nan_tap;
 pub use multimodal::{encoder, vlm};
 pub use text::grammar;
 
@@ -58,9 +57,7 @@ pub use checkpoint::lora::LoraAdapterLease;
 pub use core::modality::Modality;
 pub use core::runner::Runner;
 pub use core::sampler::{Sampler, SamplerFault, TokenLogprob};
-pub use multimodal::mrope::{
-    MropeBindError, MropeDecodeState, bind_mrope_decode_position, bind_mrope_prefill_positions,
-};
+pub use multimodal::mrope::{MropeBindError, MropeDecodeState, bind_mrope_prefill_positions};
 pub use multimodal::qwen_vl_chat::{
     QWEN2_5_VL_MAX_REMOTE_IMAGE_BYTES, Qwen25VlChatContent, Qwen25VlChatFileUrlError,
     Qwen25VlChatImageDataUrlError, Qwen25VlChatImageFileError, Qwen25VlChatMessage,
@@ -115,61 +112,5 @@ pub use text::guided::{Constraint, JsonAcceptor, json_schema_to_regex, tool_call
 pub use text::tokenize::{ChatTemplate, TextCodec};
 
 #[cfg(test)]
-#[path = "tests/coherence.rs"]
-mod coherence_private_tests;
-
-#[cfg(test)]
-#[path = "tests/gpu_batched_prefill.rs"]
-mod gpu_batched_prefill_tests;
-
-#[cfg(all(test, feature = "rocm"))]
-#[path = "tests/card234_rocm_batched_decode_gpu.rs"]
-mod card234_rocm_batched_decode_gpu_tests;
-
-#[cfg(all(test, feature = "rocm"))]
-#[path = "tests/moe_rocm_batched_decode_isolation.rs"]
-mod moe_rocm_batched_decode_isolation_tests;
-
-#[cfg(test)]
-#[path = "tests/card271_dtype_diag.rs"]
-mod card271_dtype_diag_tests;
-
-#[cfg(test)]
-#[path = "tests/moe_unpooled_greedy_tokens.rs"]
-mod moe_unpooled_greedy_tokens_tests;
-
-#[cfg(test)]
 #[path = "tests/validation_mapping.rs"]
 mod validation_mapping_tests;
-
-#[cfg(all(test, feature = "rocm"))]
-#[path = "tests/kv_masked_special_arch_rocm.rs"]
-mod kv_masked_special_arch_rocm_tests;
-
-#[cfg(all(test, feature = "rocm"))]
-#[path = "tests/card135d_deepseek2_rocm_reprefill.rs"]
-mod card135d_deepseek2_rocm_reprefill_tests;
-
-#[cfg(all(test, feature = "rocm"))]
-#[path = "tests/card135d_gptoss_rocm_reprefill.rs"]
-mod card135d_gptoss_rocm_reprefill_tests;
-
-#[cfg(all(test, feature = "rocm"))]
-#[path = "tests/card135d_mixtral_rocm_reprefill.rs"]
-mod card135d_mixtral_rocm_reprefill_tests;
-
-#[cfg(all(test, feature = "rocm"))]
-#[path = "tests/card135d_olmoe_rocm_reprefill.rs"]
-mod card135d_olmoe_rocm_reprefill_tests;
-
-#[cfg(all(test, feature = "rocm"))]
-#[path = "tests/deepseek3_synthetic_rocm_reprefill.rs"]
-mod deepseek3_synthetic_rocm_reprefill_tests;
-
-#[cfg(test)]
-#[path = "tests/post_prefill_prepare.rs"]
-mod post_prefill_prepare_tests;
-
-#[cfg(test)]
-#[path = "tests/card551b_sampling_suffix.rs"]
-mod card551b_sampling_suffix_tests;

@@ -18,8 +18,8 @@ use crate::timing::{DetailedTiming, TimingOptions};
 use crate::{BufferRole, Device, Dispatch, Engine, Executor, NoSync, StepInputs};
 use poot_graph_ir::{BinOp, Builder, StateRole, TensorType, UnOp};
 use poot_graph_plan::{
-    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, FusionPolicy, Partition,
-    StagedProgram, Submission, Target, TargetSet, compile_staged,
+    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram,
+    Submission, Target, TargetSet, compile_staged,
 };
 use poot_quant::weights::WeightStore;
 use poot_target::{Backend, DeviceCaps};
@@ -202,7 +202,6 @@ fn staged(
         },
         &CompileOptions {
             execution: Submission::Replay,
-            fusion: FusionPolicy::Full,
             limits: poot_graph_plan::CompileLimits::STANDARD,
         },
     )

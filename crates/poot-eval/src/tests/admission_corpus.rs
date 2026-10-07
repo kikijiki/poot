@@ -12,10 +12,10 @@
 //!
 //! Scope: every `OpKind` variant `Builder` exposes gets a row here, covering the dtype tuples that
 //! make this walk dispatch differently (F32 vs I32 for the word-level ops; the full `Cast` dtype x
-//! dtype sweep), plus the compiler-only `MatMulBias` (staged through an append plan). The other
+//! dtype sweep), plus the compiler-only `ContractionEpilogue` (staged through an append plan). The other
 //! compiler-only variants (`DenseContraction`, `DenseRowGather`, `PackedDequant`,
 //! `PackedContraction`, `PackedRowGather`, `Fused`, `FusedRow`) and the ops with one fixed, intricate
-//! operand shape (`Rope`, `FlashAttentionDecode`/`FlashAttentionPrefill`) already have dedicated
+//! operand shape (`Rope`, `Attention`) already have dedicated
 //! correctness suites elsewhere (`exact_bf16.rs`,
 //! `packed_dequant.rs`, `fuzz_primitives.rs`, `cast_quant_norm_rope.rs`, `alibi_attention.rs`,
 //! `flash_optimize.rs`) that exercise their one real shape repeatedly; this file does not duplicate
@@ -29,6 +29,7 @@
 use poot_tensor::DType;
 use std::collections::HashMap;
 
+use poot_graph_ir::op::{ContractionHead, FusedOp, FusedOperand, FusedRegion, FusedStep};
 use poot_graph_ir::{BinOp, Builder, OpKind, Operand, RedOp, StateRole, TensorType, Traced, UnOp};
 
 use super::helpers;
@@ -314,7 +315,7 @@ fn binary_admits_f32_arithmetic_and_i32_word_forms() {
 }
 
 #[test]
-fn select_admits_only_i32_operands() {
+fn select_evaluates_i32_branches_through_every_binding() {
     let b = Builder::new();
     let cond = helpers::i32_constant(&b, "cond", vec![2]).unwrap();
     let t = helpers::i32_constant(&b, "t", vec![2]).unwrap();
@@ -414,7 +415,7 @@ fn reduce_broadcast_reshape_transpose_slice_concat_iota_evaluate() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Gather / Scatter / ScatterUpdate / MatMul / MatMulBias / DynamicUpdateSlice / PackI8 / UnpackI8 /
+// Gather / Scatter / ScatterUpdate / MatMul / ContractionEpilogue / DynamicUpdateSlice / PackI8 / UnpackI8 /
 // ArgTopK / IndexedMatMul / AllReduce / AllGather.
 // ---------------------------------------------------------------------------------------------
 
@@ -472,7 +473,7 @@ fn gather_scatter_scatter_update_evaluate() {
 }
 
 #[test]
-fn matmul_matmul_bias_indexed_matmul_evaluate() {
+fn matmul_contraction_epilogue_indexed_matmul_evaluate() {
     let b = Builder::new();
     let a = b.constant("a", TensorType::f32(vec![1, 2]));
     let w = b.constant("w", TensorType::f32(vec![2, 2]));
@@ -489,19 +490,30 @@ fn matmul_matmul_bias_indexed_matmul_evaluate() {
     let a = b.constant("a", TensorType::f32(vec![1, 2]));
     let w = b.constant("w", TensorType::f32(vec![2, 2]));
     let bias = b.constant("bias", TensorType::f32(vec![2]));
-    // Card 557: `MatMulBias` is compiler-only (the contraction-epilogue fuse rule forms it), so this
-    // row stages it through an append plan to evaluate the op itself.
+    // `ContractionEpilogue` is compiler-only (the fuse rule forms it), so this row stages it through an
+    // append plan to evaluate the op itself: the matmul, then `head + bias`.
     let mut plan = b.append_plan(0);
     let staged = plan
         .equation(
-            OpKind::MatMulBias,
+            OpKind::ContractionEpilogue {
+                head: ContractionHead::MatMul,
+                region: FusedRegion {
+                    n_inputs: 2,
+                    steps: vec![FusedStep {
+                        op: FusedOp::Binary(BinOp::Add),
+                        inputs: vec![FusedOperand::Local(0), FusedOperand::Local(1)],
+                    }],
+                    output: 2,
+                    pack: Vec::new(),
+                },
+            },
             vec![
                 Operand::Value(a.id),
                 Operand::Value(w.id),
                 Operand::Value(bias.id),
             ],
         )
-        .expect("stage MatMulBias");
+        .expect("stage ContractionEpilogue");
     plan.declare_result(staged).expect("declare result");
     let mut prepared = b.preflight_append(plan).expect("preflight append");
     let out = Traced {
@@ -513,7 +525,7 @@ fn matmul_matmul_bias_indexed_matmul_evaluate() {
         (w.id, HostTensor::f32(vec![2, 2], vec![1.0, 0.0, 0.0, 1.0])),
         (bias.id, HostTensor::f32(vec![2], vec![10.0, 20.0])),
     ]);
-    let out = eval_every_combination("matmul_bias", &g, &inputs).unwrap();
+    let out = eval_every_combination("contraction_epilogue", &g, &inputs).unwrap();
     assert_eq!(out.as_host().unwrap().as_f32().unwrap(), &[11.0, 22.0]);
 
     let b = Builder::new();

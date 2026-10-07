@@ -24,8 +24,8 @@ use std::sync::Arc;
 use poot_executor::{Device, Engine, Executor, NoSync, StepInputs};
 use poot_graph_ir::{Builder, Graph, PackedSourceName, Slot, SlotKey, StateRole, TensorType};
 use poot_graph_plan::{
-    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, FusionPolicy, Partition,
-    Submission, Target, TargetSet, compile_staged,
+    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, Submission, Target,
+    TargetSet, compile_staged,
 };
 use poot_quant::PackedPayload;
 use poot_quant::format::{GroupMap, WeightFormat};
@@ -65,7 +65,19 @@ fn staged(
     target: Target,
     graph: &Graph,
 ) -> poot_graph_plan::StagedProgram<poot_graph_ir::ValidationOutputs> {
-    let graph = graph.clone().with_validations(Vec::new());
+    staged_under(target, graph, false)
+}
+
+/// [`staged`], with `guarded` under the routed-expert hang guard: the unfused program, one kernel per
+/// equation (the graph carries a dead routed-expert site and the target has the hang).
+fn staged_under(
+    target: Target,
+    graph: &Graph,
+    guarded: bool,
+) -> poot_graph_plan::StagedProgram<poot_graph_ir::ValidationOutputs> {
+    let (graph, caps) = poot_test_util::graph_fixtures::pipeline_input(graph, target.caps, guarded);
+    let target = Target { caps, ..target };
+    let graph = graph.with_validations(Vec::new());
     compile_staged(
         &graph,
         &TargetSet::single(DeviceId(0), target),
@@ -75,7 +87,6 @@ fn staged(
         },
         &CompileOptions {
             execution: Submission::Replay,
-            fusion: FusionPolicy::Full,
             limits: poot_graph_plan::CompileLimits::STANDARD,
         },
     )
@@ -155,7 +166,9 @@ fn assert_decode_row(what: &str, owner: &PackedPayload, got: &[f32], k: usize) {
 
 fn bytemuck_f32(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
@@ -578,6 +591,409 @@ fn packed_embedding_row_gather_is_bit_exact() {
                 }
             }
             engine.unload(exe).unwrap();
+        }
+    }
+}
+
+// --- SC-001 and SC-003 of POOT-728: dense activations through the packed loaders, and a packed head's epilogue ---
+
+/// The packed formats of the loader rows: the K-quant and block-32 GGUF layouts and the FP8 planar cells (a
+/// per-row and a 128x128-block scale), so the block-storage and planar front ends both serve every row.
+fn loader_formats() -> Vec<WeightFormat> {
+    use poot_quant::format::ScaleEncoding;
+    vec![
+        WeightFormat::Q4_K,
+        WeightFormat::Q8_0,
+        WeightFormat::E4m3PerChannel {
+            scale: ScaleEncoding::Bf16,
+        },
+        WeightFormat::E4m3Block128 {
+            scale: ScaleEncoding::Bf16,
+        },
+    ]
+}
+
+/// A deterministic fill in `[-0.5, 0.5)` with no zero element, so a dropped term changes every output.
+fn fill(seed: u64, count: usize) -> Vec<f32> {
+    let mut s = seed.wrapping_add(0x9E37_79B9_7F4A_7C15) | 1;
+    (0..count)
+        .map(|_| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 40) as f32 / (1u64 << 24) as f32) * 0.9 - 0.45 + 0.05
+        })
+        .collect()
+}
+
+/// `graph` stepped once on `engine` (under the routed-expert hang guard when `guarded`), the packed weight bound as `owner`, the activation slot
+/// `x_key` bound to `activation` (`[rows, K]`) and every named dense `[OUT]`-or-`[1, OUT]` const in `consts`
+/// bound by name; the output read back.
+#[allow(clippy::too_many_arguments)]
+fn run_dense_activation(
+    engine: &mut Engine<RocmDevice>,
+    target: Target,
+    graph: &Graph,
+    owner: &Arc<PackedPayload>,
+    x_key: &SlotKey,
+    activation: (&[usize], &[f32]),
+    consts: &[(&str, &[usize], &[f32])],
+    guarded: bool,
+) -> Vec<f32> {
+    let mut builder = WeightStore::builder();
+    let mut seen = std::collections::HashSet::new();
+    for &id in &graph.inputs {
+        let Some(name) = graph
+            .meta(id)
+            .name
+            .as_deref()
+            .and_then(PackedSourceName::parse)
+        else {
+            continue;
+        };
+        if seen.insert(name.linear_id().to_string()) {
+            builder
+                .insert(name.linear_id(), WeightEntry::Packed(Arc::clone(owner)))
+                .unwrap();
+        }
+    }
+    for (name, shape, values) in consts {
+        let dense = poot_quant::weights::DenseWeight::try_new(
+            DType::F32,
+            shape.to_vec(),
+            Arc::from(f32_bytes(values)),
+        )
+        .unwrap();
+        builder
+            .insert(name.to_string(), WeightEntry::Dense(dense))
+            .unwrap();
+    }
+    let exe = engine
+        .load_weights(
+            Arc::new(builder.build()),
+            poot_executor::WeightSource::ConstNames,
+        )
+        .unwrap();
+    let entry = engine
+        .add_entry(exe, &staged_under(target, graph, guarded))
+        .unwrap();
+    let activation_bytes = f32_bytes(activation.1);
+    let values = [(
+        x_key.clone(),
+        activation.0.to_vec(),
+        DType::F32,
+        activation_bytes,
+    )];
+    let inputs = slot_inputs(graph, &values);
+    let bytes = engine
+        .step(exe, entry, &inputs, &mut NoSync)
+        .unwrap()
+        .read()
+        .unwrap();
+    engine.remove_entry(exe, entry).unwrap();
+    engine.unload(exe).unwrap();
+    bytemuck_f32(&bytes)
+}
+
+/// SC-001: Q4_K, Q8_0 and FP8 contractions through the packed loaders meet their tier-2 oracle contract. A
+/// dense activation makes every output a sum over every `K` block, so a dropped block or a wrong scale moves
+/// every element; `m == 1` takes the Gemv schedule and `m == 17` the Tiled schedule (ragged against its tile),
+/// and every output element is compared. Mutation: omit one block's contribution in `DecodePlan`'s address or
+/// scale a factor by a nonzero constant; every row goes red.
+#[test]
+fn packed_loaders_match_the_oracle_on_every_output_on_rocm() {
+    let Some(device) = open_or_skip(DeviceBackend::Rocm, RocmDevice::new()) else {
+        return;
+    };
+    let target = device.target();
+    let mut engine = Engine::new(device);
+    for (seed, format) in loader_formats().into_iter().enumerate() {
+        let owner = Arc::new(poot_test_util::packed::prescribed_scale_payload(
+            format,
+            [OUT, K],
+            seed as u64 + 31,
+        ));
+        for m in [1usize, 17] {
+            let what = format!("{format:?} m={m}");
+            let b = Builder::new();
+            let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![m, K]));
+            let y = poot_graph_ir::ops::packed_linear(&b, x, "layer", owner.weight(), None, None)
+                .unwrap();
+            let graph = b.finish(y);
+            let x_key = graph.meta(x.id).slot_key().unwrap().clone();
+            let activation = fill(7 + m as u64, m * K);
+            let got = run_dense_activation(
+                &mut engine,
+                target,
+                &graph,
+                &owner,
+                &x_key,
+                (&[m, K], &activation),
+                &[],
+                false,
+            );
+            let mut oracle_inputs: HashMap<poot_graph_ir::ValueId, poot_eval::Value> =
+                HashMap::new();
+            for &id in &graph.inputs {
+                if let Some(name) = graph
+                    .meta(id)
+                    .name
+                    .as_deref()
+                    .and_then(PackedSourceName::parse)
+                {
+                    oracle_inputs.insert(
+                        id,
+                        poot_quant::PackedComponentRef::new(Arc::clone(&owner), name.role()).into(),
+                    );
+                }
+            }
+            oracle_inputs.insert(
+                x.id,
+                poot_tensor::HostTensor::f32(vec![m, K], activation).into(),
+            );
+            let want = poot_eval::eval(
+                &graph,
+                &oracle_inputs,
+                poot_eval::EvalOptions::new(poot_eval::EvalBudget::UNBOUNDED),
+            )
+            .unwrap()
+            .output
+            .into_host()
+            .unwrap();
+            poot_executor_parity::weight_map::assert_close(
+                &got,
+                want.as_f32().unwrap(),
+                poot_executor_parity::weight_map::TIER2,
+                &what,
+            );
+        }
+    }
+}
+
+/// SC-003, the head half: with an epilogue that cannot be contracted (`head + bias`, no multiply to fuse
+/// with the add), the fused packed Gemv and the standalone one produce bit-identical results, so the head
+/// sum is the same computation in both bodies. Every loader format, a generic and a cancelling bias, at
+/// tolerance 0.0. A format whose decode carries `BinaryOpNoContract` (Q4_K's min term) loses that
+/// protection if the no-contraction marker lands on a different op in the longer fused body, and its fused
+/// head then drifts by an ulp or two. Mutation: place the SPIR-V `NoContraction` decoration by instruction
+/// ordinal, as card 628 first did; the Q4_K row goes red on wgpu while the other formats stay green.
+#[test]
+fn a_packed_gemv_head_is_shared_with_the_unfused_program_on_rocm() {
+    use poot_executor_parity::weight_map::assert_close;
+    use poot_graph_ir::op::{BinOp, ContractionHead};
+    let Some(device) = open_or_skip(DeviceBackend::Rocm, RocmDevice::new()) else {
+        return;
+    };
+    let target = device.target();
+    let mut engine = Engine::new(device);
+    for (seed, format) in loader_formats().into_iter().enumerate() {
+        let owner = Arc::new(poot_test_util::packed::prescribed_scale_payload(
+            format,
+            [OUT, K],
+            seed as u64 + 51,
+        ));
+        let what = format!("{format:?}");
+        let activation: Vec<f32> = fill(3, K).into_iter().map(|v| v * 0.02).collect();
+        let build = |with_bias: bool| {
+            let b = Builder::new();
+            let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![1, K]));
+            let head =
+                poot_graph_ir::ops::packed_linear(&b, x, "layer", owner.weight(), None, None)
+                    .unwrap();
+            let out = if with_bias {
+                let bias = b.constant("bias", TensorType::f32(vec![OUT]));
+                b.binary(BinOp::Add, head, bias)
+            } else {
+                head
+            };
+            let g = b.finish(out);
+            let key = g.meta(x.id).slot_key().unwrap().clone();
+            (g, key)
+        };
+
+        let (head_graph, head_key) = build(false);
+        let head = run_dense_activation(
+            &mut engine,
+            target,
+            &head_graph,
+            &owner,
+            &head_key,
+            (&[1, K], &activation),
+            &[],
+            false,
+        );
+
+        let (graph, x_key) = build(true);
+        let fused_program = staged(target, &graph);
+        let fused_graph = fused_program.stages().next().unwrap().2.graph();
+        let heads: Vec<ContractionHead> = fused_graph
+            .eqns
+            .iter()
+            .filter_map(|eqn| match &eqn.op {
+                poot_graph_ir::OpKind::ContractionEpilogue { head, .. } => Some(*head),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            matches!(heads.as_slice(), [ContractionHead::Packed { .. }]),
+            "{what}: one fused packed contraction: {:?}",
+            fused_graph.eqns
+        );
+        for (label, bias_values) in [
+            ("generic bias", fill(4, OUT)),
+            (
+                "cancelling bias",
+                head.iter().map(|v| -v).collect::<Vec<f32>>(),
+            ),
+        ] {
+            let mut run = |guarded| {
+                run_dense_activation(
+                    &mut engine,
+                    target,
+                    &graph,
+                    &owner,
+                    &x_key,
+                    (&[1, K], &activation),
+                    &[("bias", &[OUT], &bias_values)],
+                    guarded,
+                )
+            };
+            let fused = run(false);
+            let unfused = run(true);
+            assert_close(
+                &fused,
+                &unfused,
+                0.0,
+                &format!("{what} {label}: fused vs unfused head"),
+            );
+        }
+    }
+}
+
+/// SC-003: a packed head with a pointwise epilogue. `tanh(head + bias) * 0.5 + residual` over the `m == 1` Gemv
+/// forms one `ContractionEpilogue { head: Packed }`, and the fused device program agrees with the unfused one
+/// (same Gemv schedule, the head summed on the device in both). The head itself is bit-identical in both (the
+/// `head_is_shared` row); the epilogue's `bias` add and `0.5` multiply may contract to an FMA in one body and
+/// not the other (`contraction/epilogue.rs` deliberately does not forbid it), so this comparison is 1e-5, and
+/// is sharpened by a cancellation fixture: `bias` is the negated device head, so every pre-activation is within a few ulps of zero
+/// when the epilogue sees each column's completed sum, and the fused result is `residual` to a few ulps of the
+/// head. An epilogue applied to a lane's partial accumulator (before the LDS reduction) adds the bias once per
+/// lane and saturates the activation, moving the result by about half the lane count. Mutation: apply the
+/// epilogue to the per-lane partial before the LDS reduction in `gemv_body`; the cancellation row and the
+/// fused-versus-unfused row go red.
+#[test]
+fn a_packed_gemv_epilogue_agrees_with_the_unfused_program_on_rocm() {
+    use poot_executor_parity::weight_map::assert_close;
+    use poot_graph_ir::op::{BinOp, ContractionHead, UnOp};
+    use poot_graph_ir::types::Scalar;
+    let Some(device) = open_or_skip(DeviceBackend::Rocm, RocmDevice::new()) else {
+        return;
+    };
+    let target = device.target();
+    let mut engine = Engine::new(device);
+    for (seed, format) in loader_formats().into_iter().enumerate() {
+        let owner = Arc::new(poot_test_util::packed::prescribed_scale_payload(
+            format,
+            [OUT, K],
+            seed as u64 + 51,
+        ));
+        let what = format!("{format:?}");
+        // Small activations keep the head sums O(1), so the activation does not saturate on the generic bias.
+        let activation: Vec<f32> = fill(3, K).into_iter().map(|v| v * 0.02).collect();
+        let build = |with_chain: bool| {
+            let b = Builder::new();
+            let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![1, K]));
+            let head =
+                poot_graph_ir::ops::packed_linear(&b, x, "layer", owner.weight(), None, None)
+                    .unwrap();
+            if !with_chain {
+                let g = b.finish(head);
+                let key = g.meta(x.id).slot_key().unwrap().clone();
+                return (g, x.id, key);
+            }
+            let bias = b.constant("bias", TensorType::f32(vec![OUT]));
+            let residual = b.constant("residual", TensorType::f32(vec![1, OUT]));
+            let biased = b.binary(BinOp::Add, head, bias);
+            let activated = b.unary(UnOp::Tanh, biased);
+            let scaled = b.binary_scalar(BinOp::Mul, activated, Scalar::F32(0.5));
+            let out = b.binary(BinOp::Add, scaled, residual);
+            let g = b.finish(out);
+            let key = g.meta(x.id).slot_key().unwrap().clone();
+            (g, x.id, key)
+        };
+
+        // The device head alone, to cancel against.
+        let (head_graph, _, head_key) = build(false);
+        let head = run_dense_activation(
+            &mut engine,
+            target,
+            &head_graph,
+            &owner,
+            &head_key,
+            (&[1, K], &activation),
+            &[],
+            false,
+        );
+        let head_scale = head.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+
+        let (graph, _, x_key) = build(true);
+        let residual_values = fill(5, OUT);
+        let fused_program = staged(target, &graph);
+        let fused_graph = fused_program.stages().next().unwrap().2.graph();
+        let heads: Vec<ContractionHead> = fused_graph
+            .eqns
+            .iter()
+            .filter_map(|eqn| match &eqn.op {
+                poot_graph_ir::OpKind::ContractionEpilogue { head, .. } => Some(*head),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            matches!(heads.as_slice(), [ContractionHead::Packed { .. }]),
+            "{what}: one fused packed contraction: {:?}",
+            fused_graph.eqns
+        );
+        for (label, bias_values) in [
+            ("generic bias", fill(4, OUT)),
+            (
+                "cancelling bias",
+                head.iter().map(|v| -v).collect::<Vec<f32>>(),
+            ),
+        ] {
+            let run = |engine: &mut Engine<RocmDevice>, guarded| {
+                run_dense_activation(
+                    engine,
+                    target,
+                    &graph,
+                    &owner,
+                    &x_key,
+                    (&[1, K], &activation),
+                    &[
+                        ("bias", &[OUT], &bias_values),
+                        ("residual", &[1, OUT], &residual_values),
+                    ],
+                    guarded,
+                )
+            };
+            let fused = run(&mut engine, false);
+            let unfused = run(&mut engine, true);
+            assert_close(
+                &fused,
+                &unfused,
+                1e-5,
+                &format!("{what} {label}: fused vs unfused"),
+            );
+            if label == "cancelling bias" {
+                // With the head cancelled, the result is the residual to a few ulps of the head's size.
+                let tolerance = 64.0 * f32::EPSILON * head_scale.max(1.0);
+                for (index, (&got, &want)) in fused.iter().zip(&residual_values).enumerate() {
+                    assert!(
+                        (got - want).abs() <= tolerance,
+                        "{what}: column {index}: {got} against the residual {want} (tolerance {tolerance}); \
+                         the epilogue must see each column's completed sum"
+                    );
+                }
+            }
         }
     }
 }

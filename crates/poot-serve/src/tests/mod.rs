@@ -397,122 +397,18 @@ fn unique_fixture_suffix() -> String {
     format!("{}_{n}", std::process::id())
 }
 
-/// A tiny all-F32 granitemoe GGUF (one layer, two experts, 4-token vocab): a decoder the Runner loads.
-/// granitemoe is not a registered family, so it stays on the Runner until POOT-738; a registered
-/// (dense) family is refused by `Runner::load_gguf`.
-pub(crate) fn write_tiny_granitemoe_gguf() -> std::path::PathBuf {
-    use poot_load::gguf::{GgufValue, write_gguf};
-    let (h, qd, kvd, inter, vocab, experts) = (32usize, 32usize, 16usize, 64usize, 4usize, 2usize);
-    let f32_bytes = |n: usize| -> Vec<u8> {
-        (0..n)
-            .flat_map(|i| (((i % 7) as f32) * 0.1 - 0.3).to_le_bytes())
-            .collect()
-    };
-    const F32: u32 = 0;
-    // ggml dims are reversed: a `[out, in]` weight is `[in, out]` here, an `[E, out, in]` expert stack
-    // `[in, out, E]`.
-    let tensors: Vec<(&str, Vec<u64>, u32, Vec<u8>)> = vec![
-        (
-            "token_embd.weight",
-            vec![h as u64, vocab as u64],
-            F32,
-            f32_bytes(h * vocab),
-        ),
-        (
-            "output.weight",
-            vec![h as u64, vocab as u64],
-            F32,
-            f32_bytes(h * vocab),
-        ),
-        ("output_norm.weight", vec![h as u64], F32, f32_bytes(h)),
-        (
-            "blk.0.attn_q.weight",
-            vec![h as u64, qd as u64],
-            F32,
-            f32_bytes(h * qd),
-        ),
-        (
-            "blk.0.attn_k.weight",
-            vec![h as u64, kvd as u64],
-            F32,
-            f32_bytes(h * kvd),
-        ),
-        (
-            "blk.0.attn_v.weight",
-            vec![h as u64, kvd as u64],
-            F32,
-            f32_bytes(h * kvd),
-        ),
-        (
-            "blk.0.attn_output.weight",
-            vec![qd as u64, h as u64],
-            F32,
-            f32_bytes(qd * h),
-        ),
-        ("blk.0.attn_norm.weight", vec![h as u64], F32, f32_bytes(h)),
-        ("blk.0.ffn_norm.weight", vec![h as u64], F32, f32_bytes(h)),
-        (
-            "blk.0.ffn_gate_inp.weight",
-            vec![h as u64, experts as u64],
-            F32,
-            f32_bytes(h * experts),
-        ),
-        (
-            "blk.0.ffn_gate_exps.weight",
-            vec![h as u64, inter as u64, experts as u64],
-            F32,
-            f32_bytes(h * inter * experts),
-        ),
-        (
-            "blk.0.ffn_up_exps.weight",
-            vec![h as u64, inter as u64, experts as u64],
-            F32,
-            f32_bytes(h * inter * experts),
-        ),
-        (
-            "blk.0.ffn_down_exps.weight",
-            vec![inter as u64, h as u64, experts as u64],
-            F32,
-            f32_bytes(inter * h * experts),
-        ),
-    ];
-    let kvs = vec![
-        ("general.architecture", GgufValue::Str("granitemoe".into())),
-        ("granitemoe.embedding_length", GgufValue::U32(h as u32)),
-        ("granitemoe.block_count", GgufValue::U32(1)),
-        ("granitemoe.attention.head_count", GgufValue::U32(2)),
-        ("granitemoe.attention.head_count_kv", GgufValue::U32(1)),
-        (
-            "granitemoe.feed_forward_length",
-            GgufValue::U32(inter as u32),
-        ),
-        ("granitemoe.context_length", GgufValue::U32(64)),
-        ("granitemoe.expert_count", GgufValue::U32(experts as u32)),
-        ("granitemoe.expert_used_count", GgufValue::U32(1)),
-        ("granitemoe.embedding_scale", GgufValue::F32(1.0)),
-        ("granitemoe.attention.scale", GgufValue::F32(0.25)),
-        ("granitemoe.residual_scale", GgufValue::F32(1.0)),
-        ("granitemoe.logit_scale", GgufValue::F32(1.0)),
-        ("tokenizer.ggml.eos_token_id", GgufValue::U32(99)),
-        (
-            "tokenizer.ggml.tokens",
-            GgufValue::Array(
-                ["a", "b", "ab", "c"]
-                    .iter()
-                    .map(|s| GgufValue::Str(s.to_string()))
-                    .collect(),
-            ),
-        ),
-        (
-            "tokenizer.ggml.merges",
-            GgufValue::Array(vec![GgufValue::Str("a b".into())]),
-        ),
-    ];
+#[path = "../../tests/support/tiny_gguf.rs"]
+mod tiny_gguf;
+
+/// A tiny all-F32 deepseek2-architecture GGUF (two layers, a 4-token vocabulary): a decoder the
+/// `Runner` still loads. A registered family is refused by `Runner::load_gguf`, so the serve tests
+/// use a family that has not moved onto the driver.
+pub(crate) fn write_tiny_runner_gguf() -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!(
-        "poot_serve_granitemoe_fixture_{}.gguf",
+        "poot_serve_deepseek2_fixture_{}.gguf",
         unique_fixture_suffix()
     ));
-    std::fs::write(&path, write_gguf(&kvs, &tensors)).unwrap();
+    tiny_gguf::write_tiny_deepseek2_gguf(&path, 64);
     path
 }
 

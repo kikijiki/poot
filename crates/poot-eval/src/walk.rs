@@ -11,7 +11,8 @@ use std::sync::Arc;
 
 use poot_graph_ir::decompose::{Decomposition, decompose};
 use poot_graph_ir::{
-    Eqn, Graph, OpClass, OpKind, Operand as IrOperand, TensorType, ValidationChannel, ValueId,
+    ComputedConst, Eqn, Graph, OpClass, OpKind, Operand as IrOperand, TensorType,
+    ValidationChannel, ValueId,
 };
 
 use crate::cast_authority::{CastAuthority, ExactI32CastRole, validate_cast_source};
@@ -20,7 +21,7 @@ use crate::exact_dense;
 use crate::exact_value::ExactValue;
 use crate::observer::EvalObserver;
 use crate::operand::{e4m3_tensor, env_value, host_tensor, i32_words, value_i32_words};
-use crate::ops::elementwise::I32Operand;
+use crate::ops::elementwise::{I32Operand, LaneOperand, SelectLane};
 use crate::resolve::Bf16Equation;
 use crate::{EvalError, Value, ops, resolve};
 
@@ -60,6 +61,9 @@ pub struct EvalOptions<'a> {
     /// The composite equation whose decomposition is being evaluated, if any: every charge made inside
     /// it is attributed to that equation, the one the caller's graph names.
     composite: Option<ValueId>,
+    /// Set while one equation of a decomposition evaluates: the decomposition loop has already charged
+    /// that equation's output, so an arm's own charge for it is not a second allocation.
+    charged_by_composite: bool,
 }
 
 impl<'a> EvalOptions<'a> {
@@ -70,6 +74,7 @@ impl<'a> EvalOptions<'a> {
             keep_environment: false,
             cast_authority: None,
             composite: None,
+            charged_by_composite: false,
         }
     }
 
@@ -100,6 +105,9 @@ impl<'a> EvalOptions<'a> {
         elements: usize,
         bytes: usize,
     ) -> Result<(), EvalError> {
+        if self.charged_by_composite {
+            return Ok(());
+        }
         let eqn = self.composite.unwrap_or(eqn);
         if let Some(limit) = self.budget.max_work_elements
             && elements as u64 > limit
@@ -402,10 +410,7 @@ fn bind_inputs<V: ValidationChannel>(
 ) -> Result<(), EvalError> {
     for &id in &g.inputs {
         if let poot_graph_ir::Storage::Computed(computed) = g.meta(id).storage {
-            env[id] = Some(Value::Host(HostTensor::f32(
-                computed.shape(),
-                computed.values_f32(),
-            )));
+            env[id] = Some(Value::Host(computed.tensor()));
             continue;
         }
         env[id] = Some(inputs.get(&id).ok_or(EvalError::MissingInput(id))?.clone());
@@ -444,23 +449,6 @@ fn evaluate_equation<V: ValidationChannel>(
             opts.charge(eqn.out, idx, DType::F32, out * k, out * k * 4)?;
             Ok(Value::Host(ops::evaluate_packed_dequant(
                 owner, descriptor,
-            )?))
-        }
-        OpKind::PackedContraction { descriptor, blocks } => {
-            let [IrOperand::Value(activation_id), ..] = eqn.inputs.as_slice() else {
-                return Err(EvalError::Unsupported {
-                    eqn: eqn.out,
-                    op: "packed_contraction",
-                    detail: "malformed PackedContraction operands".into(),
-                });
-            };
-            let activation = host_tensor(eqn, 0, env)?;
-            let _ = activation_id;
-            let owner = ops::packed_components(g, eqn, env, descriptor)?;
-            let elements: usize = g.aval(eqn.out).shape.iter().product();
-            opts.charge(eqn.out, idx, DType::F32, elements, elements * 4)?;
-            Ok(Value::Host(ops::evaluate_packed_contraction(
-                activation, owner, descriptor, blocks,
             )?))
         }
         OpKind::PackedRowGather { descriptor } => {
@@ -573,6 +561,7 @@ fn evaluate_composite<V: ValidationChannel>(
                 elements,
                 elements.saturating_mul(4),
             )?;
+            opts.charged_by_composite = true;
             let value = evaluate_equation(
                 inner,
                 inner_eqn,
@@ -581,7 +570,9 @@ fn evaluate_composite<V: ValidationChannel>(
                 idx,
                 opts,
                 decompositions,
-            )?;
+            );
+            opts.charged_by_composite = false;
+            let value = value?;
             let value = store_as_declared(value, declared.dtype)?;
             check_published(inner, inner_eqn, &value)?;
             inner_env[inner_eqn.out] = Some(value);
@@ -984,11 +975,7 @@ fn evaluate_bf16<V: ValidationChannel>(
                 crate::operand::initialized_arc_slice(source.numel(), |flat| source.value(flat));
             Ok(Value::Host(HostTensor::f32_arc(out_shape.clone(), data)))
         }
-        equation @ (Bf16Equation::Gather { .. } | Bf16Equation::RowGatherWiden) => {
-            let axis = match equation {
-                Bf16Equation::Gather { axis } => axis,
-                _ => 0,
-            };
+        Bf16Equation::Gather { axis } => {
             let table = crate::operand::bf16_view(eqn, 0, env)?;
             let (rows, index_shape) = i32_words(eqn, 1, env)?;
             let extent = table.shape()[axis];
@@ -1017,24 +1004,12 @@ fn evaluate_bf16<V: ValidationChannel>(
                 )
             };
             let elements: usize = out_shape.iter().product();
-            match equation {
-                Bf16Equation::RowGatherWiden => {
-                    opts.charge(eqn.out, idx, DType::F32, elements, elements * 4)?;
-                    let data = crate::operand::initialized_arc_slice(elements, |flat| {
-                        table.value(source_flat(flat))
-                    });
-                    Ok(Value::Host(HostTensor::f32_arc(out_shape.clone(), data)))
-                }
-                _ => {
-                    opts.charge(eqn.out, idx, DType::BF16, elements, elements * 2)?;
-                    let words: Arc<[u16]> =
-                        crate::operand::initialized_arc_slice(elements, |flat| {
-                            table.word(source_flat(flat))
-                        });
-                    let view = ExactBf16TensorView::from_derived(words, out_shape.clone())?;
-                    Ok(Value::Owner(ExactValue::Bf16(view)))
-                }
-            }
+            opts.charge(eqn.out, idx, DType::BF16, elements, elements * 2)?;
+            let words: Arc<[u16]> = crate::operand::initialized_arc_slice(elements, |flat| {
+                table.word(source_flat(flat))
+            });
+            let view = ExactBf16TensorView::from_derived(words, out_shape.clone())?;
+            Ok(Value::Owner(ExactValue::Bf16(view)))
         }
         Bf16Equation::Reshape { shape } => Ok(Value::Owner(ExactValue::Bf16(
             crate::operand::bf16_view(eqn, 0, env)?.reshape(shape.to_vec())?,
@@ -1042,7 +1017,7 @@ fn evaluate_bf16<V: ValidationChannel>(
         Bf16Equation::Transpose { perm } => Ok(Value::Owner(ExactValue::Bf16(
             crate::operand::bf16_view(eqn, 0, env)?.transpose(perm),
         ))),
-        equation @ (Bf16Equation::WeightMatMul | Bf16Equation::WeightContraction) => {
+        Bf16Equation::WeightMatMul => {
             let activation = host_tensor(eqn, 0, env)?;
             let activation_values = activation.to_f32()?;
             let elements: usize = out_shape.iter().product();
@@ -1051,10 +1026,6 @@ fn evaluate_bf16<V: ValidationChannel>(
             // The weight is a BF16 host tensor or an owner-backed view; both read through the same
             // exact BF16 view, never widened ahead of the contraction.
             let weight = crate::operand::bf16_view(eqn, 1, env)?;
-            let weight = match equation {
-                Bf16Equation::WeightContraction => weight.transpose(&[1, 0]),
-                _ => weight,
-            };
             ops::contraction::matmul_accumulate(
                 activation.shape(),
                 |flat| activation_values[flat],
@@ -1078,18 +1049,6 @@ fn evaluate_e4m3<V: ValidationChannel>(
     env: &[Option<Value>],
 ) -> Result<Value, EvalError> {
     match &eqn.op {
-        OpKind::DenseRowGather {
-            source: DType::E4M3FN,
-        } => {
-            let table = e4m3_tensor(eqn, 0, env)?;
-            let index = host_tensor(eqn, 1, env)?;
-            Ok(Value::Host(ops::index::dense_row_gather_e4m3(
-                table,
-                index,
-                &g.aval(eqn.out).shape,
-                eqn.out,
-            )?))
-        }
         OpKind::Reshape { shape } => {
             crate::operand::value_operand(eqn, 0, env)?.reshape(shape.clone())
         }
@@ -1248,17 +1207,49 @@ fn evaluate_dense<V: ValidationChannel>(
                 get(&eqn.inputs[1])?,
                 get(&eqn.inputs[2])?,
             ];
-            let words = operands
-                .iter()
-                .map(|t| ops::i32_lane(t, "select"))
-                .collect::<Result<Vec<_>, _>>()?;
-            let operand = |i: usize| I32Operand {
-                shape: operands[i].shape(),
-                words: words[i],
+            let condition = I32Operand {
+                shape: operands[0].shape(),
+                words: ops::i32_lane(&operands[0], "select")?,
             };
-            let selected =
-                ops::elementwise::select_i32(operand(0), operand(1), operand(2), &out_shape)?;
-            HostTensor::i32_arc(out_shape, selected)
+            match out_dtype {
+                DType::I32 => {
+                    let words = ops::elementwise::select(
+                        condition,
+                        select_lanes(&operands[1], out_dtype)?,
+                        select_lanes(&operands[2], out_dtype)?,
+                        &out_shape,
+                    )?;
+                    HostTensor::i32_arc(out_shape, words)
+                }
+                DType::F32 => {
+                    let words = ops::elementwise::select(
+                        condition,
+                        select_lanes(&operands[1], out_dtype)?,
+                        select_lanes(&operands[2], out_dtype)?,
+                        &out_shape,
+                    )?;
+                    HostTensor::f32_arc(out_shape, words)
+                }
+                half @ (DType::F16 | DType::BF16) => {
+                    let words = ops::elementwise::select(
+                        condition,
+                        select_lanes(&operands[1], out_dtype)?,
+                        select_lanes(&operands[2], out_dtype)?,
+                        &out_shape,
+                    )?;
+                    if half == DType::F16 {
+                        HostTensor::f16_arc(out_shape, words)
+                    } else {
+                        HostTensor::bf16_arc(out_shape, words)
+                    }
+                }
+                other => {
+                    return Err(EvalError::unsupported(
+                        "select",
+                        format!("Select has no {other} lane"),
+                    ));
+                }
+            }
         }
         OpKind::Binary(bop) => {
             let a = get(&eqn.inputs[0])?;
@@ -1310,7 +1301,11 @@ fn evaluate_dense<V: ValidationChannel>(
         OpKind::ArgTopK { k } => ops::index::arg_top_k(&get(&eqn.inputs[0])?, *k, eqn.out)?,
         OpKind::PackI8 => ops::index::pack_i8(&get(&eqn.inputs[0])?, &out_shape)?,
         OpKind::UnpackI8 { len } => ops::index::unpack_i8(&get(&eqn.inputs[0])?, *len, &out_shape)?,
-        OpKind::Iota { len } => ops::index::iota(*len),
+        OpKind::Iota { len, dtype } => ComputedConst::Iota {
+            len: *len,
+            dtype: *dtype,
+        }
+        .tensor(),
         OpKind::MatMul => {
             let a = get(&eqn.inputs[0])?;
             let b = get(&eqn.inputs[1])?;
@@ -1344,23 +1339,6 @@ fn evaluate_dense<V: ValidationChannel>(
         OpKind::AllReduce { .. } | OpKind::AllGather { .. } => {
             ops::collective::single_rank_identity(get(&eqn.inputs[0])?)
         }
-        // Card 1007: an F16 weight reads through the same definition; `matmul` widens each element exactly.
-        OpKind::DenseContraction {
-            weight: DType::F32 | DType::F16,
-        } => {
-            let a = get(&eqn.inputs[0])?;
-            let w = get(&eqn.inputs[1])?;
-            ops::contraction::dense_contraction(&a, &w, &out_shape)?
-        }
-        OpKind::DenseContraction { .. } | OpKind::DenseRowGather { .. } => {
-            return Err(EvalError::Unsupported {
-                eqn: eqn.out,
-                op: resolve::op_label(&eqn.op),
-                detail: format!(
-                    "{out_dtype} is a dense narrow-float operation; needs the storage-aware exact BF16 binding"
-                ),
-            });
-        }
         OpKind::RandomUniform { cols } => {
             let seed = get(&eqn.inputs[0])?;
             ops::sampling::random_uniform(&seed, *cols)?
@@ -1393,15 +1371,16 @@ fn evaluate_dense<V: ValidationChannel>(
         OpKind::Cast { .. }
         | OpKind::Gather { .. }
         | OpKind::PackedDequant { .. }
-        | OpKind::PackedContraction { .. }
         | OpKind::PackedRowGather { .. } => {
             unreachable!("handled before evaluate_dense in evaluate_equation")
         }
-        OpKind::MatMulBias
+        OpKind::PackedContraction { .. }
+        | OpKind::DenseContraction { .. }
+        | OpKind::DenseRowGather { .. }
+        | OpKind::ContractionEpilogue { .. }
         | OpKind::Fused(_)
         | OpKind::FusedRow(_)
-        | OpKind::FlashAttentionDecode { .. }
-        | OpKind::FlashAttentionPrefill { .. }
+        | OpKind::Attention(_)
         | OpKind::Rope { .. } => {
             unreachable!("a composite evaluates through its decomposition (evaluate_composite)")
         }
@@ -1432,6 +1411,27 @@ fn dense_tensor_or_materialize(
             got: other.carrier_name(),
         }),
     }
+}
+
+/// A `Select` branch's lanes in the result's lane type, or the typed refusal naming the mismatch.
+fn select_lanes<W: SelectLane>(
+    tensor: &HostTensor,
+    out_dtype: DType,
+) -> Result<LaneOperand<'_, W>, EvalError> {
+    W::lanes_of(tensor)
+        .map(|words| LaneOperand {
+            shape: tensor.shape(),
+            words,
+        })
+        .ok_or_else(|| {
+            EvalError::unsupported(
+                "select",
+                format!(
+                    "a {out_dtype} Select branch carries {} lanes",
+                    tensor.dtype()
+                ),
+            )
+        })
 }
 
 /// Test-only counter of calls to the publication helpers on this thread, so a test can prove a failed

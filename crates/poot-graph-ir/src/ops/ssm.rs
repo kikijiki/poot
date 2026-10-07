@@ -100,33 +100,33 @@ pub fn mamba2_ssd_decode(
     (y, h_out)
 }
 
-/// Mamba2 / SSD prefill (nemotron_h spec 279): the whole-sequence twin of [`mamba2_ssd_decode`], a
-/// thin wrapper over [`decay_mask_from_gates`] + [`linear_attention_prefill`]. The plain
-/// (non-per-channel) prefill primitives suffice because Mamba2's gate `Abar_t = exp(Delta_t * A)` is
-/// a per-head scalar (one per head per position), unlike Qwen3-Next's Gated-DeltaNet, whose gate is
-/// per state cell and needs the chunked UT-transform (`gdn_prefill_chunked`).
-///
-/// Assumes a fresh start (`h_in = 0`), like every other prefill entry point here
-/// ([`causal_conv1d_prefill`]'s zero left-pad, `qwen3next_gdn_prefill_block`, [`attention_prefill`]).
+/// Mamba2 / SSD over a chunk of `L` positions continuing a carried state `h_in`: the whole-chunk twin
+/// of [`mamba2_ssd_decode`] (`L = 1` is one decode step), a wrapper over [`decay_mask_from_cumlog`] +
+/// [`linear_attention_prefill`]. The plain (non-per-channel) prefill primitives suffice because
+/// Mamba2's gate `Abar_t = exp(Delta_t * A)` is a per-head scalar (one per head per position), unlike
+/// Qwen3-Next's Gated-DeltaNet, whose gate is per state cell and needs the chunked UT-transform
+/// (`gdn_prefill_chunked`).
 ///
 /// ```text
 /// Abar_t = exp(Delta_t (.) A)             // [1,Hq,L,1] per-head, per-position scalar gate
 /// Bbar_t = Delta_t (.) B_t                // [1,Hq,L,N]
-/// mask   = decay_mask_from_gates(Abar, tril)      // [1,Hq,L,L], mask[t,j] = prod_{j<k<=t} Abar_k
-/// o      = linear_attention_prefill(q=C, k=Bbar, v=x, mask)   // [1,Hq,L,P]
+/// mask   = decay_mask_from_cumlog(G, tril)        // [1,Hq,L,L], G = prefix sum of Delta A; mask[t,j] = prod_{j<k<=t} Abar_k
+/// P_t    = prod_{k<=t} Abar_k             // the carried state's decay up to t (the prefix sum of the log gates)
+/// o_t    = sum_{j<=t} mask[t,j] (C_t . Bbar_j) x_j  +  P_t (C_t @ h_in)
 /// y      = o + D (.) x                    // residual skip, same as the decode form
 /// ```
 ///
-/// The final state `h_out` (to seed a [`mamba2_ssd_decode`] continuation) needs no sequential scan:
-/// unrolling from `h_{-1}=0` gives `h_{L-1} = sum_j (prod_{k=j+1}^{L-1} Abar_k) Bbar_j^T x_j`, and the
-/// weight `prod_{j<k<=L-1} Abar_k` is exactly the mask's last row (`t = L-1`). So `h_out` is one more
-/// weighted-outer-product matmul reusing that row.
+/// The final state needs no sequential scan: unrolling from `h_{-1} = h_in` gives
+/// `h_{L-1} = P_{L-1} h_in + sum_j (prod_{k=j+1}^{L-1} Abar_k) Bbar_j^T x_j`, and the weight
+/// `prod_{j<k<=L-1} Abar_k` is exactly the mask's last row (`t = L-1`). So `h_out` is one more
+/// weighted-outer-product matmul reusing that row, plus the decayed seed. A zero `h_in` is a fresh
+/// start.
 ///
 /// `x[1,Hq,L,P]` (input / value), `b_in`/`c_in[1,Hq,L,N]` (input-dependent SSM B/C, already broadcast
 /// to `Hq` heads by the caller via [`repeat_kv`], as in [`mamba2_ssd_decode`]), `delta`
-/// (`[1,Hq,L,1]`), `a_param`/`d_skip[1,Hq,1,1]` (learned per-head A / D), `tril[1,Hq,L,L]`
-/// (lower-triangular ones including the diagonal, per-head-broadcast, as [`decay_mask_from_gates`]
-/// expects). Returns `(y[1,Hq,L,P], h_out[1,Hq,N,P])`.
+/// (`[1,Hq,L,1]`), `a_param`/`d_skip[1,Hq,1,1]` (learned per-head A / D), `h_in[1,Hq,N,P]` (carried
+/// SSM state), `tril[1,Hq,L,L]` (lower-triangular ones including the diagonal, per-head-broadcast, as
+/// [`decay_mask_from_cumlog`] expects). Returns `(y[1,Hq,L,P], h_out[1,Hq,N,P])`.
 #[allow(clippy::too_many_arguments)]
 pub fn mamba2_ssd_prefill(
     b: &Builder,
@@ -136,27 +136,35 @@ pub fn mamba2_ssd_prefill(
     delta: Traced,
     a_param: Traced,
     d_skip: Traced,
+    h_in: Traced,
     tril: Traced,
 ) -> (Traced, Traced) {
     let shape = b.aval(x).shape;
     let (hq, l) = (shape[1], shape[2]);
 
-    let a_bar = b.unary(UnOp::Exp, b.binary(BinOp::Mul, delta, a_param)); // [1,Hq,L,1]
+    let log_gate = b.binary(BinOp::Mul, delta, a_param); // log Abar = Delta * A [1,Hq,L,1]
     let b_bar = b.binary(BinOp::Mul, delta, b_in); // Delta * B [1,Hq,L,N]
 
-    let gates = b.reshape(a_bar, vec![1, hq, 1, l]); // [1,Hq,L,1] -> [1,Hq,1,L], same L-major memory order
-    let mask = decay_mask_from_gates(b, gates, tril, hq, l); // [1,Hq,L,L]
+    // One prefix sum of the log gates serves the mask and the seed decay, with no exp/log round
+    // trip: a very negative `Delta * A` stays finite here instead of reaching `log(0) = -inf`.
+    let cumlog = b.matmul(tril, log_gate); // [1,Hq,L,1]
+    let mask = decay_mask_from_cumlog(b, cumlog, tril, hq, l); // [1,Hq,L,L]
 
     let y_lin = linear_attention_prefill(b, c_in, b_bar, x, 1, mask); // [1,Hq,L,P]
-    let skip = b.binary(BinOp::Mul, d_skip, x); // D * x [1,Hq,L,P], d_skip broadcasts over L
-    let y = b.binary(BinOp::Add, y_lin, skip);
 
-    // h_out = sum_j weight_j * Bbar_j^T x_j, weight_j = mask's own last row (t=L-1): prod_{j<k<=L-1} Abar_k.
+    // P_t = exp(prefix sum of the log gates): the decay the seed state has suffered by position t.
+    let seed_decay = b.unary(UnOp::Exp, cumlog); // [1,Hq,L,1]
+    let from_seed = b.binary(BinOp::Mul, b.matmul(c_in, h_in), seed_decay); // [1,Hq,L,P]
+    let skip = b.binary(BinOp::Mul, d_skip, x); // D * x [1,Hq,L,P], d_skip broadcasts over L
+    let y = b.binary(BinOp::Add, b.binary(BinOp::Add, y_lin, from_seed), skip);
+
+    // h_out = P_{L-1} h_in + sum_j weight_j * Bbar_j^T x_j, weight_j = mask's own last row (t=L-1).
     let weight_row = b.slice(mask, 2, l - 1, l); // [1,Hq,1,L]
     let weight_col = b.reshape(weight_row, vec![1, hq, l, 1]); // same L-major order, now column-shaped
     let weighted_b = b.binary(BinOp::Mul, b_bar, weight_col); // [1,Hq,L,N], broadcast over N
     let weighted_b_t = b.transpose(weighted_b, vec![0, 1, 3, 2]); // [1,Hq,N,L]
-    let h_out = b.matmul(weighted_b_t, x); // [1,Hq,N,L] @ [1,Hq,L,P] -> [1,Hq,N,P]
+    let seeded = b.binary(BinOp::Mul, h_in, b.slice(seed_decay, 2, l - 1, l)); // [1,Hq,N,P]
+    let h_out = b.binary(BinOp::Add, b.matmul(weighted_b_t, x), seeded); // [1,Hq,N,P]
 
     (y, h_out)
 }
@@ -191,29 +199,22 @@ pub fn causal_conv1d_decode(
     (out, new_cache)
 }
 
-/// Batched causal depthwise conv1d for prefill (card 153 / spec 139 B5): the same conv as
-/// [`causal_conv1d_decode`], computed for all `L` positions at once (the GDN block's conv feeds Q/K/V,
-/// so chunked GDN prefill needs it over the whole chunk). `x[1,L,C]`, `w[K,C]`. Returns `out[1,L,C]`.
+/// Batched causal depthwise conv1d over a chunk of `L` positions that starts from zeros: the
+/// zero-window case of [`causal_conv1d_windowed`] (`x[B,L,C]`, `w[K,C]`, `out[B,L,C]`).
 ///
 /// `out[t,c] = sum_{j=0..K-1} w[j,c] * x[t-(K-1)+j,c]`, with `x[<0,c] = 0`, matching
 /// [`causal_conv1d_decode`] per position (`causal_conv1d_prefill_matches_decode`). No bias, no
 /// activation; the caller applies SiLU (e.g. `qwen3next_gdn_block`).
-///
-/// Left-pad `x` by `K-1` zeros along the sequence axis (concat of zeros; there is no `Pad`
-/// primitive), then for each of the `K` taps (small static constant, unrolled at trace time) slice
-/// the shifted window `x_pad[:, j:j+L, :]`, multiply by `w[j,:]`, and sum. The zero pad is `x`'s first
-/// time-slice times 0, broadcast to `[1,K-1,C]`, rather than a new host constant.
 pub fn causal_conv1d_prefill(b: &Builder, x: Traced, w: Traced, k: usize) -> Traced {
     causal_conv1d_prefill_dilated(b, x, w, k, 1)
 }
 
-/// Dilated generalization of [`causal_conv1d_prefill`] (spec 282's N-gram/PLE): the `K` taps are
-/// `dilation` positions apart: `out[t,c] = sum_{j=0..K-1} w[j,c] * x[t - (K-1-j)*dilation, c]`, with
-/// `x[<0,c] = 0`. `dilation == 1` is exactly [`causal_conv1d_prefill`] (which delegates here).
+/// [`causal_conv1d_prefill`] with the `K` taps `dilation` positions apart (spec 282's N-gram/PLE):
+/// `out[t,c] = sum_{j=0..K-1} w[j,c] * x[t - (K-1-j)*dilation, c]`, with `x[<0,c] = 0`.
 ///
 /// Needed by `Qwen4ExpTextPLELayer._short_conv` (`modeling_qwen4_exp.py`), a depthwise and dilated
 /// `nn.Conv1d` (`ple_conv_kernel_size = 4`, `ngram_size = 3`, so the causal left pad is
-/// `(K-1)*dilation = 9`). The pad width and tap stride are trace-time constants.
+/// `(K-1)*dilation = 9`).
 pub fn causal_conv1d_prefill_dilated(
     b: &Builder,
     x: Traced,
@@ -221,28 +222,60 @@ pub fn causal_conv1d_prefill_dilated(
     k: usize,
     dilation: usize,
 ) -> Traced {
-    assert!(dilation >= 1, "dilation must be >= 1");
     let shape = b.aval(x).shape;
-    let (l, c) = (shape[1], shape[2]);
+    let (batch, l, c) = (shape[0], shape[1], shape[2]);
     let pad = (k - 1) * dilation;
-
-    // zero-pad the left by (K-1)*dilation: x's own first time-slice, zeroed, broadcast to [1, pad, C].
-    let x_pad = if pad == 0 {
+    // The zero window is `x`'s own first time-slice times 0, broadcast, rather than a host constant
+    // (there is no `Pad` primitive).
+    let x_ext = if pad == 0 {
         x
     } else {
-        let first = b.slice(x, 1, 0, 1); // [1, 1, C]
-        let zero_slice = b.binary_scalar(BinOp::Mul, first, Scalar::F32(0.0)); // [1, 1, C] zeros
-        let zeros = b.broadcast(zero_slice, vec![1, pad, c]); // [1, pad, C]
-        b.concat(1, &[zeros, x]) // [1, pad+L, C]
+        let first = b.slice(x, 1, 0, 1); // [B, 1, C]
+        let zero_slice = b.binary_scalar(BinOp::Mul, first, Scalar::F32(0.0)); // [B, 1, C] zeros
+        let zeros = b.broadcast(zero_slice, vec![batch, pad, c]); // [B, pad, C]
+        b.concat(1, &[zeros, x])
     };
+    conv_taps(b, x_ext, w, l, k, dilation)
+}
 
-    // K-tap shift-multiply-add (K static, unrolled at trace time - the sum in causal_conv1d_decode's math).
+/// The causal depthwise conv continuing a carried `window` `[B,(K-1)*dilation,C]` (the previous
+/// inputs, oldest first): `out[t,c] = sum_{j=0..K-1} w[j,c] * x_ext[t + j*dilation, c]` over
+/// `x_ext = window ++ x`, `x[B,L,C]`, `w[K,C]`. Returns `(out[B,L,C], next_window)`, the last
+/// `(K-1)*dilation` inputs of `x_ext`. `L = 1` is one decode step, so one body serves every phase
+/// and a chunk continues the previous one exactly; [`causal_conv1d_prefill_dilated`] is the same
+/// body over a zero window. Needs `(K-1)*dilation >= 1` for a window to carry.
+pub fn causal_conv1d_windowed(
+    b: &Builder,
+    x: Traced,
+    w: Traced,
+    window: Traced,
+    k: usize,
+    dilation: usize,
+) -> (Traced, Traced) {
+    let shape = b.aval(x).shape;
+    let (batch, l, c) = (shape[0], shape[1], shape[2]);
+    let pad = (k - 1) * dilation;
+    assert_eq!(
+        b.aval(window).shape,
+        vec![batch, pad, c],
+        "the conv window is [B, (K-1)*dilation, C]"
+    );
+    let x_ext = b.concat(1, &[window, x]);
+    let out = conv_taps(b, x_ext, w, l, k, dilation);
+    (out, b.slice(x_ext, 1, l, pad + l))
+}
+
+/// The `K` taps over the extended input `x_ext[B, (K-1)*dilation + L, C]` (a static constant,
+/// unrolled at trace time).
+fn conv_taps(b: &Builder, x_ext: Traced, w: Traced, l: usize, k: usize, dilation: usize) -> Traced {
+    assert!(dilation >= 1, "dilation must be >= 1");
+    let c = b.aval(x_ext).shape[2];
     let mut acc: Option<Traced> = None;
     for j in 0..k {
         let off = j * dilation;
-        let window = b.slice(x_pad, 1, off, off + l); // [1, L, C] = x_pad[j*dilation ..][..L]
+        let tap = b.slice(x_ext, 1, off, off + l); // [B, L, C] = x_ext[j*dilation ..][..L]
         let wj = b.reshape(b.slice(w, 0, j, j + 1), vec![1, 1, c]); // [1, 1, C] = w[j, :]
-        let term = b.binary(BinOp::Mul, window, wj); // broadcast wj over L
+        let term = b.binary(BinOp::Mul, tap, wj); // broadcast wj over B and L
         acc = Some(match acc {
             None => term,
             Some(prev) => b.binary(BinOp::Add, prev, term),

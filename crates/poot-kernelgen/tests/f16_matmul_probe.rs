@@ -35,7 +35,9 @@ fn f16_encode(data: &[f32]) -> Vec<u8> {
 /// half decode the loader uses for native f16 checkpoint bytes).
 fn f16_decode(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| poot_quant::scalar::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
         .collect()
 }

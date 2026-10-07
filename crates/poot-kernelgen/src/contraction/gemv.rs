@@ -7,9 +7,20 @@ use poot_kernel_ir::{
     Terminator, Ty,
 };
 
+use super::epilogue::{Epilogue, emit_epilogue};
 use crate::KernelGenError;
 use crate::emit::{Emit, bin, copy, cu, emit_read_meta};
-use crate::helpers::{Alloc, elem, guard};
+use crate::helpers::{Alloc, WeightLane, elem, guard};
+
+/// The epilogue a Gemv applies to each column's sum before its one store, and the buffers its leaves read.
+/// The body's output is f32, so the epilogue's dtype is f32 too.
+#[derive(Clone, Copy)]
+pub(crate) struct GemvEpilogue<'a> {
+    pub(crate) epilogue: &'a Epilogue,
+    pub(crate) leaves: &'a [Local],
+    /// How each leaf buffer reads back as a value ([`Epilogue::lanes`]).
+    pub(crate) lanes: &'a [Option<WeightLane>],
+}
 
 /// A [`super::Schedule::Gemv`]'s launch shape, checked once before emission: every extent at least one and
 /// `width` a multiple of `cols`, so each column owns exactly `width / cols` lanes.
@@ -65,13 +76,15 @@ impl GemvLaunch {
 /// finished element by element, so no `K` is refused. A column past the output (the last
 /// workgroup's tail) reads the last real column instead and never stores, keeping every lane at
 /// every barrier. Partials land in LDS at `s * cols + c`, so the per-column fold is a tree of
-/// stride `cols` over the `L` sub-lanes and leaves column `c`'s sum at `LDS[c]`.
+/// stride `cols` over the `L` sub-lanes and leaves column `c`'s sum at `LDS[c]`; `epilogue`, when given,
+/// runs over that sum (at output element `store_col`) before the store.
 pub(crate) fn gemv_body(
     name: &str,
     mut al: Alloc,
     param_count: u32,
     [activation, metadata, out]: [Local; 3],
     launch: GemvLaunch,
+    epilogue: Option<GemvEpilogue>,
     mut decode_run: impl FnMut(&mut Emit, Local, Local, usize, Local, Local) -> Vec<Local>,
 ) -> Body {
     let GemvLaunch {
@@ -291,7 +304,15 @@ pub(crate) fn gemv_body(
     });
     let mut store = Emit::new(&mut al);
     let sum = store.read_lds(Ty::F32, 0, copy(lane));
-    store.assign(elem(out, store_col), Rvalue::Use(copy(sum)));
+    let value = match epilogue {
+        Some(GemvEpilogue {
+            epilogue,
+            leaves,
+            lanes,
+        }) => emit_epilogue(&mut store, epilogue, store_col, leaves, lanes, sum),
+        None => sum,
+    };
+    store.assign(elem(out, store_col), Rvalue::Use(copy(value)));
     blocks.push(BasicBlock {
         statements: store.take(),
         terminator: Terminator::Return,

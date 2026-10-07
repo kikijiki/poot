@@ -122,8 +122,29 @@ pub enum SampleRule {
 pub enum FusedOp {
     Unary(UnOp),
     Binary(BinOp),
-    /// Pointwise `Select(cond, if_true, if_false)` with three operands.
+    /// Pointwise `Select(cond, if_true, if_false)` with three operands: the bit pattern of `if_true` where the
+    /// I32 condition word is nonzero, else of `if_false`. A select, never arithmetic: a NaN, Inf or `-0.0`
+    /// in the unselected branch cannot reach the result and the selected one passes through bit for bit.
     Select,
+    /// [`OpKind::Cast`] of one operand to `to`. A lowering reads a narrow (BF16, F16) region input and widens it
+    /// in registers, so a norm scale or a bias that a region reads as F32 is never a separate dispatch and
+    /// never an f32 copy of the stored weight.
+    Cast {
+        to: DType,
+    },
+}
+
+impl FusedOp {
+    /// The primitive op this step computes: the one definition [`FusedRegion::infer`], [`RowRegion::infer`]
+    /// and [`crate::decompose`] share.
+    pub fn kind(self) -> OpKind {
+        match self {
+            Self::Unary(op) => OpKind::Unary(op),
+            Self::Binary(op) => OpKind::Binary(op),
+            Self::Select => OpKind::Select,
+            Self::Cast { to } => OpKind::Cast { to },
+        }
+    }
 }
 
 /// An operand of a [`FusedStep`]: a local value id, or an inline literal captured from the source graph. Locals
@@ -164,6 +185,24 @@ pub struct FusedRegion {
 }
 
 impl FusedRegion {
+    /// Whether external input `input` is read: by a step, or as the region's output.
+    pub fn reads_input(&self, input: usize) -> bool {
+        self.output == input
+            || self.steps.iter().any(|step| {
+                step.inputs
+                    .iter()
+                    .any(|operand| matches!(operand, FusedOperand::Local(local) if *local == input))
+            })
+    }
+
+    /// Whether a [`FusedOp::Cast`] step reads external input `input`: the input a lowering widens as it reads it.
+    pub fn widens_input(&self, input: usize) -> bool {
+        self.steps.iter().any(|step| {
+            matches!(step.op, FusedOp::Cast { .. })
+                && matches!(step.inputs.as_slice(), [FusedOperand::Local(local)] if *local == input)
+        })
+    }
+
     /// The output type, threading the input types through the steps. `ins` are the `n_inputs` external input
     /// types, in order. Mirrors how the un-fused chain would infer.
     pub fn infer(&self, ins: &[TensorType]) -> Result<TensorType, ShapeError> {
@@ -183,11 +222,7 @@ impl FusedRegion {
                     FusedOperand::PackLane { input, lane } => pack_lane_ty(&ins[*input], *lane)?,
                 });
             }
-            let ty = match step.op {
-                FusedOp::Unary(u) => OpKind::Unary(u).infer(&in_tys)?,
-                FusedOp::Binary(b) => OpKind::Binary(b).infer(&in_tys)?,
-                FusedOp::Select => OpKind::Select.infer(&in_tys)?,
-            };
+            let ty = step.op.kind().infer(&in_tys)?;
             locals.push(ty);
         }
         if self.pack.is_empty() {
@@ -259,6 +294,17 @@ pub struct RowRegion {
 }
 
 impl RowRegion {
+    /// Whether a [`FusedOp::Cast`] step reads external input `input`: the input a lowering widens as it reads it.
+    pub fn widens_input(&self, input: usize) -> bool {
+        self.steps.iter().any(|step| {
+            matches!(
+                step,
+                RowStep::Pointwise { op: FusedOp::Cast { .. }, inputs }
+                    if matches!(inputs.as_slice(), [FusedOperand::Local(local)] if *local == input)
+            )
+        })
+    }
+
     /// The output type, threading input types through the steps (the un-fused chain's inference).
     pub fn infer(&self, ins: &[TensorType]) -> Result<TensorType, ShapeError> {
         if ins.len() != self.n_inputs {
@@ -280,11 +326,7 @@ impl RowRegion {
                 RowStep::Pointwise { op, inputs } => {
                     let in_tys: Vec<TensorType> =
                         inputs.iter().map(|o| ty_of(o, &locals)).collect();
-                    match op {
-                        FusedOp::Unary(u) => OpKind::Unary(*u).infer(&in_tys)?,
-                        FusedOp::Binary(b) => OpKind::Binary(*b).infer(&in_tys)?,
-                        FusedOp::Select => OpKind::Select.infer(&in_tys)?,
-                    }
+                    op.kind().infer(&in_tys)?
                 }
                 RowStep::Reduce { op, input } => OpKind::Reduce {
                     op: *op,
@@ -348,13 +390,123 @@ pub enum OpClass {
     Composite,
 }
 
+/// The contraction an [`OpKind::ContractionEpilogue`] runs before its pointwise region: the heads the planner
+/// lowers with an epilogue. Each names the primitive op whose result local 0 of the region reads.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum ContractionHead {
+    /// [`OpKind::MatMul`] over `A[.., M, K]` and `B[.., K, N]`.
+    MatMul,
+    /// [`OpKind::DenseContraction`] over an activation and a `[N, K]` weight of dtype `weight`.
+    Dense { weight: DType },
+    /// [`OpKind::PackedContraction`] over an f32 activation and the carriers of the packed weight
+    /// `descriptor`. Its result is f32, so the head applies no narrowing before the region reads it.
+    Packed {
+        descriptor: PackedWeight,
+        blocks: usize,
+    },
+    /// [`OpKind::IndexedMatMul`] over an activation `x [M, K]`, a stacked weight `W [E, K, N]` and the per-row
+    /// expert ids `idx [M]`: a routed expert matmul followed by its gate weighting.
+    Indexed,
+}
+
+impl ContractionHead {
+    /// The number of operands the head reads: its activation and its weight, which for a packed weight is one
+    /// carrier per source role of its descriptor, and for an indexed head the weight and the row ids.
+    pub fn operands(self) -> usize {
+        match self {
+            Self::MatMul | Self::Dense { .. } => 2,
+            Self::Indexed => 3,
+            Self::Packed { descriptor, .. } => 1 + descriptor.sources().len(),
+        }
+    }
+
+    /// The primitive op that computes the head's result.
+    pub fn op(self) -> OpKind {
+        match self {
+            Self::MatMul => OpKind::MatMul,
+            Self::Dense { weight } => OpKind::DenseContraction { weight },
+            Self::Indexed => OpKind::IndexedMatMul,
+            Self::Packed { descriptor, blocks } => OpKind::PackedContraction { descriptor, blocks },
+        }
+    }
+}
+
+/// The parameters of [`OpKind::Attention`]: the one attention family, whatever its phase.
+///
+/// `mask`, `key` and `bound` name the operand conventions the kernels read. A variant added to one is a new case
+/// every consumer matches, never a flag on the others. The operand list is `[q, k, v, mask]`, then the shared key
+/// part when `key` is [`KeyLayout::Split`], then `len` when `bound` is [`KvBound::Live`].
+#[derive(Clone, PartialEq, Debug)]
+pub struct AttentionAttrs {
+    /// Query heads per key/value head (`Hq / Hkv`).
+    pub n_rep: usize,
+    /// Multiplier on the `Q K^T` scores.
+    pub scale: f32,
+    /// `Some(c)` applies `c * tanh(scores / c)` (Gemma2/Grok logit softcapping, [`crate::ops::softcap`]) to the
+    /// scaled scores before the mask is added; `None` applies none.
+    pub softcap: Option<f32>,
+    /// How the mask operand enters the scores.
+    pub mask: MaskOperand,
+    /// How the key operand is laid out.
+    pub key: KeyLayout,
+    /// Which keys the kernel visits.
+    pub bound: KvBound,
+}
+
+impl AttentionAttrs {
+    /// Attention over a dense key tensor, an additive mask operand and every key position (the form the
+    /// matcher emits).
+    pub fn new(n_rep: usize, scale: f32, softcap: Option<f32>) -> Self {
+        Self {
+            n_rep,
+            scale,
+            softcap,
+            mask: MaskOperand::Additive,
+            key: KeyLayout::Single,
+            bound: KvBound::Capacity,
+        }
+    }
+}
+
+/// How [`AttentionAttrs`]'s mask operand enters the scores.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum MaskOperand {
+    /// A `[B,Hm,Lq,Lk]` tensor added to the scaled (and softcapped) scores.
+    Additive,
+}
+
+/// How [`AttentionAttrs`]'s key operand is laid out.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum KeyLayout {
+    /// One dense `[B,Hkv,Lk,D]` tensor.
+    Single,
+    /// The key is two operands concatenated on the head axis: `k_head [B,Hkv,Lk,D - shared_dim]` and
+    /// `k_shared [B,1,Lk,shared_dim]`, the latter broadcast over every key head (MLA's `k_nope` and the
+    /// rotary `k_pe`). The shared operand follows `mask` in the operand list.
+    Split { shared_dim: usize },
+}
+
+/// Which keys [`AttentionAttrs`]'s kernel visits.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum KvBound {
+    /// All `Lk` positions: the mask removes the ones that must not count.
+    Capacity,
+    /// The first `len[b]` positions of batch row `b`, `1 <= len[b] <= Lk`, read from an I32 `len [B]` operand
+    /// that follows the key operands. Inactive keys and values are selected away before either matmul and
+    /// inactive scores to `-inf` before softmax, so whatever they hold (NaN included) never reaches the output
+    /// ([`crate::ops::attention_live`] is the one definition).
+    Live,
+}
+
 /// Orthogonal tensor algebra. The whole transformer composes from these (graph-architecture.md 3.2).
 #[derive(Clone, PartialEq, Debug)]
 pub enum OpKind {
     Unary(UnOp),
     Binary(BinOp),
-    /// Pointwise I32 select: `out = if_false + cond * (if_true - if_false)` with wrapping arithmetic.
-    /// Inputs are `cond`, `if_true`, `if_false`. Float tensors reject this form.
+    /// Pointwise select, `out = cond != 0 ? if_true : if_false`, as a bit-pattern select and never arithmetic:
+    /// a NaN, Inf or `-0.0` in the unselected branch cannot reach `out`, and the selected one passes through bit
+    /// for bit. Inputs are `cond` (I32), `if_true`, `if_false`; the branches share one I32, F32, F16 or BF16
+    /// dtype, which is `out`'s. Every executor and the oracle share this one definition.
     Select,
     Reduce {
         op: RedOp,
@@ -384,14 +536,16 @@ pub enum OpKind {
     Concat {
         axis: usize,
     },
-    /// A nullary range `[0, 1, .., len)`, shape `[len]`, in F32: the explicit iota primitive that
+    /// A nullary range `[0, 1, .., len)`, shape `[len]`, in `dtype` (F32 or I32): the explicit iota primitive that
     /// replaces the reserved named per-expert range graph constants (R466-019). Ranges are computed from
     /// this equation, not bound by a checkpoint binder. The compiler folds every `Iota` into a
     /// [`crate::Storage::Computed`] graph constant ([`crate::transform::fold_iota`]) before planning, so
     /// the planner never lowers an iota kernel; an unfolded `Iota` at the planner is a typed refusal.
-    /// The dtype stays F32 until Card 558b switches indices and ranges to I32 end to end.
+    /// An I32 range is exact for every `len` an `i32` holds; an F32 one only below 2^24 (any other `dtype`,
+    /// or an I32 `len` above `i32::MAX`, is a shape error).
     Iota {
         len: usize,
+        dtype: DType,
     },
     /// Gather rows of `data` (input 0) along `axis` by an index (input 1). Scalar-index case only for now
     /// (embedding lookup, RoPE cos/sin row): drops `axis` from the result.
@@ -476,12 +630,21 @@ pub enum OpKind {
     DenseRowGather {
         source: DType,
     },
-    /// MatMul with a fused bias epilogue: `(A@B)[..,m,n] + bias[n]`, `bias` (input 2) an `[N]` vector. Same
-    /// `[..,M,N]` output as `MatMul`; folds `linear`'s post-matmul bias add into the matmul kernel (one dispatch,
-    /// not two). One definition (the eager eval is matmul-then-add; the kernel is `matmul_batched_bias_dt`).
-    /// Compiler-only (Card 557): `ops::linear` traces `matmul` then a broadcast `add`, and `compile`'s one
-    /// contraction-epilogue fuse rule forms this op.
-    MatMulBias,
+    /// A contraction followed by a pointwise chain: the head's result, then `region`'s steps with local 0 bound to
+    /// the head's output. Inputs are the head's two operands, then the region's other external inputs (the region's
+    /// locals `1..n_inputs`, in order): a bias `[N]`, a residual `[.., M, N]` or a per-row scale, each broadcasting to
+    /// the head's output shape on read. The output has the head's shape; its dtype is the region's.
+    ///
+    /// Compiler-only: `fuse` forms it from a head and the single-use pointwise chain that consumes it, so there is
+    /// one epilogue mechanism for every contraction head ([`ContractionHead`]) and every pointwise op the fused
+    /// regions admit. A composite: its definition is the head op, then the region's steps ([`crate::decompose`]).
+    /// The head's output keeps its declared dtype before the first step reads it, so a narrow head (BF16, F16)
+    /// rounds once at the head, exactly as the unfused program stores it; a lowering keeps that rounding inside the
+    /// kernel.
+    ContractionEpilogue {
+        head: ContractionHead,
+        region: FusedRegion,
+    },
     /// Batched argtop-k index extraction (spec 136, grouped-MoE prefill routing): `rank [..,E] -> [..,k]` expert
     /// ids. `out[..,r]` is the index `i` along the last axis with `rank[..,i] == r`, for `r` in `0..k`. One shared
     /// `[..,E]` stable rank tensor feeds this directly, with no per-row host loop. Output dtype is F32 (required):
@@ -497,7 +660,8 @@ pub enum OpKind {
     /// the activation `x [M,K]`, a stacked weight `W [E,K,N]`, and per-row expert ids `idx [M]` (f32). Each row `m`
     /// contracts against its own expert `W[idx[m]]` with no prior copy of the selected experts' weights (that copy
     /// made `moe_sparse` slower than dense). Output `[M,N]`, dtype = x's. One definition (the eager eval gathers
-    /// per-row; the kernel is `indexed_matmul_dt`, reading the selected expert's rows in-kernel).
+    /// per-row; the kernel reads the selected expert's rows in-kernel through `ContractionSpec::Indexed`). An id
+    /// outside `0..E` or not an integer is a typed oracle error and a NaN output row on every device.
     IndexedMatMul,
     /// Write `update` (input 1) into a copy of `operand` (input 0) starting at the scalar index `index` (input 2)
     /// along `axis`, leaving the rest unchanged (XLA DynamicUpdateSlice, single axis). The KV-cache slot write:
@@ -522,32 +686,13 @@ pub enum OpKind {
     /// A row-wise (reduction-rooted) fused region (G5b): last-axis reductions + their pointwise feed and
     /// epilogue, lowered to one row-at-a-time kernel; see [`RowRegion`].
     FusedRow(RowRegion),
-    /// Fused decode attention (spec 014, flash attention), inputs `[q, k_cache, v_cache, mask]` with `q[B,Hq,1,D]`,
-    /// `k`/`v[B,Hq/n_rep,cap,D]`, `mask[B,Hm,1,cap]` (`Hm` is 1 or Hq), all dense: `infer` rejects any other
-    /// operand shape. Output `[B,Hq,1,D]` (== q's type). The op does GQA (`n_rep = Hq/Hkv`),
-    /// the implicit transpose, and the online softmax internally; its definition is the `ops::attention_masked`
-    /// decomposition (eval reproduces it). The `flash_attention_capped` pass introduces it on every backend
-    /// for the shapes in the LDS cap; the planner chooses its kernel (Card 557: the generated region decode
-    /// within the LDS cap, the generated private-array decode above it).
-    FlashAttentionDecode {
-        n_rep: usize,
-        scale: f32,
-    },
-    /// Fused prefill attention (flash prefill, card 038), inputs `[q, k, v, mask]` with `q[1,Hq,L,D]`,
-    /// `k`/`v[1,Hq/n_rep,L,D]`, `mask[1,Hm,L,L]` (causal; `Hm` is 1 or Hq), all dense: `infer` rejects any other
-    /// operand shape. Output `[1,Hq,L,D]` (== q's type). The op does GQA
-    /// (`n_rep = Hq/Hkv`), the implicit transpose, and an online (running max/sum) softmax over the KV internally,
-    /// never materializing the `[1,Hq,L,L]` scores (peak attention memory `O(L*D)`, not `O(L^2)`). Its definition
-    /// is the `ops::attention_prefill_softcap` decomposition. The planner chooses its kernel (Card 557): the
-    /// generated region prefill for a single sequence within `FLASH_PREFILL_LDS_CAP` and no softcap, else the
-    /// imported `flash_prefill` kernel (one workgroup per (head, query row)). `softcap` (card 198): `Some(c)`
-    /// applies Gemma2/Grok attention-logit softcapping (`c * tanh(scores / c)`, [`crate::ops::softcap`]) to the
-    /// scaled `Q K^T` before the mask-add, matching `attention_prefill_softcap`; `None` applies no softcap.
-    FlashAttentionPrefill {
-        n_rep: usize,
-        scale: f32,
-        softcap: Option<f32>,
-    },
+    /// Fused attention, inputs `[q, k, v, mask]` with `q[B,Hq,Lq,D]`, `k`/`v[B,Hq/n_rep,Lk,D]` and
+    /// `mask[B,Hm,Lq,Lk]` (`Hm` is 1 or Hq), all dense: `infer` rejects any other operand shape. Output
+    /// `[B,Hq,Lq,D]` (== q's type). `Lq` and `Lk` are independent: decode is `Lq == 1` against a capacity-long cache, a
+    /// first prefill `Lq == Lk`, a prefill into a cache `1 < Lq < Lk`; all one op. The op does GQA (`n_rep = Hq/Hkv`), the implicit transpose and an online (running max/sum)
+    /// softmax over the keys internally, never materializing the `[B,Hq,Lq,Lk]` scores. Its definition is the
+    /// `ops::attention_masked_softcap` decomposition. The planner chooses its kernel and schedule.
+    Attention(AttentionAttrs),
     /// Fused RoPE (rotary position embedding), inputs `[x, cos, sin]`. `x[.., D]` is the per-head tensor;
     /// `cos`/`sin` are the position-selected tables of width `rot` (`rot <= D`; `rot == D` for full rotary,
     /// `rot < D` for phi3/qwen3next partial rotary where `[rot, D)` passes through unrotated). cos/sin broadcast
@@ -712,7 +857,7 @@ fn matmul_operand_dtypes_allowed(a: DType, b: DType) -> bool {
 
 impl OpKind {
     /// Fold this op's own parameters (not just its discriminant) into a hasher, allocation-free (no `Debug` or
-    /// `format!`). `OpKind` cannot derive `Hash` because `FlashAttentionDecode`/`Prefill` etc. carry an `f32 scale`,
+    /// `format!`). `OpKind` cannot derive `Hash` because `Attention` etc. carry an `f32 scale`,
     /// which is not `Eq`/`Hash` under IEEE NaN semantics; every f32 field hashes its bit pattern instead. Hashing
     /// only the discriminant cannot distinguish two eqns of the same op kind with different params (a `Slice` at
     /// a different offset, a `DynamicUpdateSlice` on a different axis, a different `DType`).
@@ -746,15 +891,27 @@ impl OpKind {
                 end.hash(h);
             }
             OpKind::Concat { axis } => axis.hash(h),
-            OpKind::Iota { len } => len.hash(h),
+            OpKind::Iota { len, dtype } => {
+                len.hash(h);
+                dtype.hash(h);
+            }
             OpKind::Gather { axis } => axis.hash(h),
             OpKind::Scatter { axis } => axis.hash(h),
             OpKind::Select
             | OpKind::ScatterUpdate
             | OpKind::MatMul
-            | OpKind::MatMulBias
             | OpKind::IndexedMatMul
             | OpKind::PackI8 => {} // no params beyond the discriminant already hashed
+            OpKind::ContractionEpilogue { head, region } => {
+                head.hash(h);
+                region.n_inputs.hash(h);
+                region.steps.len().hash(h);
+                for step in &region.steps {
+                    step.op.hash(h);
+                    hash_fused_operands(&step.inputs, h);
+                }
+                region.output.hash(h);
+            }
             OpKind::PackedDequant { descriptor } => descriptor.hash(h),
             OpKind::PackedContraction { descriptor, blocks } => {
                 descriptor.hash(h);
@@ -796,18 +953,13 @@ impl OpKind {
                 }
                 region.output.hash(h);
             }
-            OpKind::FlashAttentionDecode { n_rep, scale } => {
-                n_rep.hash(h);
-                scale.to_bits().hash(h);
-            }
-            OpKind::FlashAttentionPrefill {
-                n_rep,
-                scale,
-                softcap,
-            } => {
-                n_rep.hash(h);
-                scale.to_bits().hash(h);
-                softcap.map(f32::to_bits).hash(h);
+            OpKind::Attention(attrs) => {
+                attrs.n_rep.hash(h);
+                attrs.scale.to_bits().hash(h);
+                attrs.softcap.map(f32::to_bits).hash(h);
+                attrs.mask.hash(h);
+                attrs.key.hash(h);
+                attrs.bound.hash(h);
             }
             OpKind::Rope { rot } => rot.hash(h),
             OpKind::AllReduce { op, axis } => {
@@ -905,14 +1057,29 @@ impl OpKind {
             }
             OpKind::Select => {
                 arity(ins, 3)?;
-                if ins.iter().any(|ty| ty.dtype != DType::I32) {
+                // The condition is an I32 word (nonzero picks `if_true`); the branches share one
+                // arithmetic or I32 dtype, and the result is that dtype.
+                if ins[0].dtype != DType::I32 {
                     return Err(ShapeError::DtypeOp {
                         op: "Select",
-                        dtype: ins
-                            .iter()
-                            .find(|ty| ty.dtype != DType::I32)
-                            .map(|ty| ty.dtype)
-                            .unwrap_or(DType::I32),
+                        dtype: ins[0].dtype,
+                    });
+                }
+                for branch in &ins[1..] {
+                    if !matches!(
+                        branch.dtype.class(),
+                        DTypeClass::Arithmetic | DTypeClass::Index
+                    ) {
+                        return Err(ShapeError::DtypeOp {
+                            op: "Select",
+                            dtype: branch.dtype,
+                        });
+                    }
+                }
+                if ins[1].dtype != ins[2].dtype {
+                    return Err(ShapeError::Dtype {
+                        a: ins[1].clone(),
+                        b: ins[2].clone(),
                     });
                 }
                 let ab = broadcast_shapes(&ins[1].shape, &ins[2].shape).ok_or_else(|| {
@@ -926,7 +1093,7 @@ impl OpKind {
                         a: ins[0].shape.clone(),
                         b: ab,
                     })?;
-                Ok(TensorType::new(shape, DType::I32))
+                Ok(TensorType::new(shape, ins[1].dtype))
             }
             OpKind::Reduce { axis, keepdim, .. } => {
                 arity(ins, 1)?;
@@ -1078,11 +1245,22 @@ impl OpKind {
                 shape[*axis] = total;
                 Ok(TensorType::new(shape, ins[0].dtype))
             }
-            OpKind::Iota { len } => {
+            OpKind::Iota { len, dtype } => {
                 // Nullary: a compile-time-computed range, shape [len]. `fold_iota` replaces every
                 // Iota with a computed graph constant before planning.
                 arity(ins, 0)?;
-                Ok(TensorType::new(vec![*len], DType::F32))
+                let exact = match dtype {
+                    DType::F32 => *len <= 1 << f32::MANTISSA_DIGITS,
+                    DType::I32 => i32::try_from(*len).is_ok(),
+                    _ => false,
+                };
+                if !exact {
+                    return Err(ShapeError::IotaRange {
+                        len: *len,
+                        dtype: *dtype,
+                    });
+                }
+                Ok(TensorType::new(vec![*len], *dtype))
             }
             OpKind::Gather { axis } => {
                 arity(ins, 2)?;
@@ -1362,20 +1540,27 @@ impl OpKind {
                 shape.push(table.shape[1]);
                 Ok(TensorType::f32(shape))
             }
-            OpKind::MatMulBias => {
-                // A[..,M,K], B[..,K,N], bias[N] -> [..,M,N] (same as MatMul; bias does not change the shape).
-                // The bias is exactly what its decomposition's `Add` reads: `[N]` of the product's dtype.
-                arity(ins, 3)?;
-                let product = OpKind::MatMul.infer(&ins[0..2])?;
-                let bias = &ins[2];
-                check_binary_value_dtypes(&product, bias)?;
-                if bias.shape.as_slice() != &product.shape[product.rank() - 1..] {
-                    return Err(ShapeError::Broadcast {
-                        a: product.shape.clone(),
-                        b: bias.shape.clone(),
+            OpKind::ContractionEpilogue { head, region } => {
+                // The head's operands, then the region's inputs after local 0 (the head's result). The region
+                // runs over the head's output shape, so the epilogue never reshapes or reduces it.
+                let head_operands = head.operands();
+                arity(ins, head_operands + region.n_inputs.saturating_sub(1))?;
+                if !region.pack.is_empty() || !region.reads_input(0) {
+                    return Err(ShapeError::ContractionEpilogueRegion {
+                        packed: !region.pack.is_empty(),
                     });
                 }
-                Ok(product)
+                let head_ty = head.op().infer(&ins[..head_operands])?;
+                let mut region_ins = vec![head_ty.clone()];
+                region_ins.extend_from_slice(&ins[head_operands..]);
+                let out = region.infer(&region_ins)?;
+                if out.shape != head_ty.shape {
+                    return Err(ShapeError::Broadcast {
+                        a: head_ty.shape,
+                        b: out.shape,
+                    });
+                }
+                Ok(out)
             }
             OpKind::IndexedMatMul => {
                 // x[M,K], W[E,K,N], idx[M] -> [M,N]. Each row m contracts x[m] against expert W[idx[m]].
@@ -1437,12 +1622,7 @@ impl OpKind {
             }
             OpKind::Fused(region) => region.infer(ins),
             OpKind::FusedRow(region) => reject_i32_region("FusedRow", region.infer(ins)?),
-            OpKind::FlashAttentionDecode { n_rep, .. } => {
-                infer_flash_attention(ins, *n_rep, FlashForm::Decode)
-            }
-            OpKind::FlashAttentionPrefill { n_rep, .. } => {
-                infer_flash_attention(ins, *n_rep, FlashForm::Prefill)
-            }
+            OpKind::Attention(attrs) => infer_attention(ins, attrs),
             OpKind::Rope { rot } => infer_rope(ins, *rot),
             OpKind::AllReduce { .. } => {
                 // Shape-preserving: each rank holds a same-shaped partial; the collective combines across ranks and returns
@@ -1486,9 +1666,9 @@ impl OpKind {
     ///
     /// | Op | Formed by |
     /// | --- | --- |
-    /// | `FlashAttentionDecode`, `FlashAttentionPrefill` | `flash_attention_capped` from the attention chain |
+    /// | `Attention` | `flash_attention_capped` from the attention chain |
     /// | `Rope` | `rope_fusion` from the half-split rotation chain |
-    /// | `MatMulBias` | the contraction-epilogue fuse rule from `matmul` then a broadcast `[N]` add |
+    /// | `ContractionEpilogue` | `fuse` from a contraction and the single-use pointwise chain that consumes it |
     /// | `Fused`, `FusedRow` | `fuse` from pointwise chains and their last-axis reductions |
     ///
     /// The ops that are neither an IR primitive above nor a composite, and why each stays primitive:
@@ -1496,8 +1676,7 @@ impl OpKind {
     /// | Op | Reason |
     /// | --- | --- |
     /// | `PackedDequant` | the one quantized primitive (ADR-0103 decision 2); its definition is `poot-quant`'s decoder |
-    /// | `PackedContraction`, `PackedRowGather` | the packed claims; the oracle defines them directly until Card 629 gives the contraction a decomposition |
-    /// | `DenseContraction`, `DenseRowGather` | the narrow-float folds; the oracle defines them directly until Card 629 gives them a decomposition |
+    /// | `PackedRowGather` | the packed gather claim; the oracle defines it directly and decodes only the rows it gathers |
     /// | `ArgTopK` | inverts a rank permutation without the `[.., E]` scatter a decomposition would need |
     /// | `PackI8`, `UnpackI8` | bit packing of KV codes; no arithmetic decomposition |
     /// | `AllReduce`, `AllGather` | cross-rank collectives; the identity at world size 1 |
@@ -1532,16 +1711,29 @@ impl OpKind {
             | Self::IndexedMatMul
             | Self::RandomUniform { .. }
             | Self::SampleToken { .. }
-            | Self::PackedContraction { .. }
-            | Self::PackedRowGather { .. }
+            | Self::PackedRowGather { .. } => OpClass::Primitive,
+            Self::PackedContraction { .. }
             | Self::DenseContraction { .. }
-            | Self::DenseRowGather { .. } => OpClass::Primitive,
-            Self::FlashAttentionDecode { .. }
-            | Self::FlashAttentionPrefill { .. }
+            | Self::DenseRowGather { .. }
+            | Self::Attention(_)
             | Self::Rope { .. }
-            | Self::MatMulBias
+            | Self::ContractionEpilogue { .. }
             | Self::Fused(_)
             | Self::FusedRow(_) => OpClass::Composite,
+        }
+    }
+
+    /// The weight dtype when this equation contracts an activation against a `[N, K]` dense weight: a
+    /// [`OpKind::DenseContraction`], or a [`OpKind::ContractionEpilogue`] over a dense head. The weight is
+    /// input 1 in both.
+    pub fn dense_weight(&self) -> Option<DType> {
+        match self {
+            Self::DenseContraction { weight }
+            | Self::ContractionEpilogue {
+                head: ContractionHead::Dense { weight },
+                ..
+            } => Some(*weight),
+            _ => None,
         }
     }
 
@@ -1574,7 +1766,7 @@ impl OpKind {
             Self::PackedRowGather { .. } => "packed_row_gather",
             Self::DenseContraction { .. } => "dense_contraction",
             Self::DenseRowGather { .. } => "dense_row_gather",
-            Self::MatMulBias => "matmul_bias",
+            Self::ContractionEpilogue { .. } => "contraction_epilogue",
             Self::ArgTopK { .. } => "arg_top_k",
             Self::IndexedMatMul => "indexed_matmul",
             Self::DynamicUpdateSlice { .. } => "dynamic_update_slice",
@@ -1582,8 +1774,7 @@ impl OpKind {
             Self::UnpackI8 { .. } => "unpack_i8",
             Self::Fused(_) => "fused",
             Self::FusedRow(_) => "fused_row",
-            Self::FlashAttentionDecode { .. } => "flash_attention_decode",
-            Self::FlashAttentionPrefill { .. } => "flash_attention_prefill",
+            Self::Attention(_) => "attention",
             Self::Rope { .. } => "rope",
             Self::AllReduce { .. } => "all_reduce",
             Self::AllGather { .. } => "all_gather",
@@ -1610,7 +1801,7 @@ impl OpKind {
             OpKind::Transpose { perm } => format!("transpose {perm:?}"),
             OpKind::Slice { axis, start, end } => format!("slice ax={axis} {start}..{end}"),
             OpKind::Concat { axis } => format!("concat ax={axis}"),
-            OpKind::Iota { len } => format!("iota len={len}"),
+            OpKind::Iota { len, dtype } => format!("iota len={len} {dtype}"),
             OpKind::Gather { axis } => format!("gather ax={axis}"),
             OpKind::Scatter { axis } => format!("scatter ax={axis}"),
             OpKind::ArgTopK { k } => format!("arg_top_k k={k}"),
@@ -1638,21 +1829,19 @@ impl OpKind {
             OpKind::DenseRowGather { source } => {
                 format!("dense_row_gather {source:?}").to_lowercase()
             }
-            OpKind::MatMulBias => "matmul_bias".to_string(),
+            OpKind::ContractionEpilogue { head, region } => format!(
+                "contraction_epilogue {head:?} n_in={} steps={}",
+                region.n_inputs,
+                region.steps.len()
+            ),
             OpKind::IndexedMatMul => "indexed_matmul".to_string(),
             OpKind::DynamicUpdateSlice { axis } => format!("dyn_update_slice ax={axis}"),
             OpKind::Fused(r) => format!("fused n_in={} steps={}", r.n_inputs, r.steps.len()),
             OpKind::FusedRow(r) => format!("fused_row n_in={} steps={}", r.n_inputs, r.steps.len()),
-            OpKind::FlashAttentionDecode { n_rep, scale } => {
-                format!("flash_attn_decode n_rep={n_rep} scale={scale}")
-            }
-            OpKind::FlashAttentionPrefill {
-                n_rep,
-                scale,
-                softcap,
-            } => {
-                format!("flash_attn_prefill n_rep={n_rep} scale={scale} softcap={softcap:?}")
-            }
+            OpKind::Attention(a) => format!(
+                "attention n_rep={} scale={} softcap={:?} mask={:?} key={:?} bound={:?}",
+                a.n_rep, a.scale, a.softcap, a.mask, a.key, a.bound
+            ),
             OpKind::Rope { rot } => format!("rope rot={rot}"),
             OpKind::AllReduce { op, axis } => {
                 format!("all_reduce.{} ax={axis}", format!("{op:?}").to_lowercase())
@@ -1675,93 +1864,132 @@ fn reject_i32_region(op: &'static str, output: TensorType) -> Result<TensorType,
     }
 }
 
-/// Which fused flash-attention form [`infer_flash_attention`] types.
-#[derive(Clone, Copy)]
-enum FlashForm {
-    /// One query row per (batch, head) against a `cap`-long KV cache.
-    Decode,
-    /// Batch 1, `L` query rows against the same `L` keys (no carried cache).
-    Prefill,
-}
-
-/// The typing rule shared by the fused flash-attention ops: inputs `[q, k, v, mask]`, output q's type.
-/// Every consumer (the oracle, the imported kernels, the synthesized regions) indexes the operands
-/// densely, with no broadcast strides: `q[B,Hq,M,D]` with `n_rep | Hq`, `k`/`v[B,Hq/n_rep,T,D]` and
-/// `mask[B,Hm,M,T]` with `Hm` either 1 (one row/plane shared by every head) or `Hq` (one per head, for
-/// ALiBi). Decode has `M == 1`; prefill has `B == 1` and `T == M`. A K/V or mask that the decomposition
-/// would merely broadcast (a size-1 head or batch axis) is not this op.
-fn infer_flash_attention(
-    ins: &[TensorType],
-    n_rep: usize,
-    form: FlashForm,
-) -> Result<TensorType, ShapeError> {
-    arity(ins, 4)?;
+/// The typing rule of `Attention`. Operands are `[q, k, v, mask]`, then the shared key part for a
+/// [`KeyLayout::Split`], then the I32 `len [B]` for a [`KvBound::Live`]. Every consumer (the oracle, the
+/// generated kernels) indexes the operands densely, with no broadcast strides: `q[B,Hq,Lq,Dk]` with `n_rep | Hq`,
+/// `k[B,Hq/n_rep,Lk,Dk]` (or `Dk - shared_dim` wide next to `k_shared[B,1,Lk,shared_dim]`), `v[B,Hq/n_rep,Lk,Dv]`
+/// and `mask[B,Hm,Lq,Lk]` with `Hm` either 1 (one plane shared by every head) or `Hq` (one per head, for ALiBi).
+/// The output is `[B,Hq,Lq,Dv]` in q's dtype. A K/V or mask that the decomposition would merely broadcast (a
+/// size-1 head or batch axis) is not this op. `Lq` and `Lk` are independent: decode (`Lq == 1`), a first prefill
+/// (`Lq == Lk`) and a prefill into a cache (`1 < Lq < Lk`) all type here. A live bound types over F32 only: its
+/// decomposition selects inactive keys with a float `Select`, and neither the oracle (a `Select` branch that is
+/// the result of a narrowing `Cast` carries F32 lanes) nor the planner (F32 and I32 branches only) lowers it for
+/// BF16/F16.
+fn infer_attention(ins: &[TensorType], attrs: &AttentionAttrs) -> Result<TensorType, ShapeError> {
+    let split = matches!(attrs.key, KeyLayout::Split { .. });
+    let live = matches!(attrs.bound, KvBound::Live);
+    arity(ins, 4 + usize::from(split) + usize::from(live))?;
     let (q, k, v, mask) = (&ins[0], &ins[1], &ins[2], &ins[3]);
+    let shared = split.then(|| &ins[4]);
+    let len = live.then(|| &ins[ins.len() - 1]);
     // Float operands only: the decomposition's softmax (`Exp`, `Div`) does not type over I32.
-    if q.dtype.class() != DTypeClass::Arithmetic {
+    if q.dtype.class() != DTypeClass::Arithmetic || (live && q.dtype != DType::F32) {
         return Err(ShapeError::DtypeOp {
-            op: "FlashAttention",
+            op: "Attention",
             dtype: q.dtype,
         });
     }
-    for (operand, t) in [("k", k), ("v", v), ("mask", mask)] {
+    for (operand, t) in [("k", k), ("v", v), ("mask", mask)]
+        .into_iter()
+        .chain(shared.map(|t| ("k_shared", t)))
+    {
         if t.dtype != q.dtype {
-            return Err(ShapeError::FlashAttentionDtype {
+            return Err(ShapeError::AttentionDtype {
                 operand,
                 expected: q.dtype,
                 actual: t.dtype,
             });
         }
     }
-    let &[bsz, hq, m, d] = q.shape.as_slice() else {
-        return Err(flash_query_error(form, n_rep, q));
+    let n_rep = attrs.n_rep;
+    let &[bsz, hq, lq, dk] = q.shape.as_slice() else {
+        return Err(ShapeError::AttentionQuery {
+            n_rep,
+            actual: q.shape.clone(),
+        });
     };
-    let form_holds = match form {
-        FlashForm::Decode => m == 1,
-        FlashForm::Prefill => bsz == 1,
-    };
-    if !form_holds || n_rep == 0 || hq % n_rep != 0 {
-        return Err(flash_query_error(form, n_rep, q));
+    if n_rep == 0 || hq % n_rep != 0 {
+        return Err(ShapeError::AttentionQuery {
+            n_rep,
+            actual: q.shape.clone(),
+        });
     }
-    let kv_len = match (form, k.shape.get(2)) {
-        (FlashForm::Decode, Some(&cap)) => cap,
-        _ => m,
+    let Some(&lk) = k.shape.get(2) else {
+        return Err(ShapeError::AttentionOperand {
+            operand: "k",
+            expected: vec![bsz, hq / n_rep, lq, dk],
+            actual: k.shape.clone(),
+        });
     };
-    let kv = [bsz, hq / n_rep, kv_len, d];
-    for (operand, t) in [("k", k), ("v", v)] {
-        if t.shape != kv {
-            return Err(ShapeError::FlashAttentionOperand {
-                operand,
-                expected: kv.to_vec(),
-                actual: t.shape.clone(),
+    let key_width = match attrs.key {
+        KeyLayout::Single => dk,
+        KeyLayout::Split { shared_dim } => {
+            if shared_dim == 0 || shared_dim >= dk {
+                return Err(ShapeError::AttentionOperand {
+                    operand: "k_shared",
+                    expected: vec![bsz, 1, lk, shared_dim],
+                    actual: vec![bsz, 1, lk, dk],
+                });
+            }
+            dk - shared_dim
+        }
+    };
+    let k_expected = [bsz, hq / n_rep, lk, key_width];
+    if k.shape != k_expected {
+        return Err(ShapeError::AttentionOperand {
+            operand: "k",
+            expected: k_expected.to_vec(),
+            actual: k.shape.clone(),
+        });
+    }
+    if let (KeyLayout::Split { shared_dim }, Some(shared)) = (attrs.key, shared) {
+        let expected = [bsz, 1, lk, shared_dim];
+        if shared.shape != expected {
+            return Err(ShapeError::AttentionOperand {
+                operand: "k_shared",
+                expected: expected.to_vec(),
+                actual: shared.shape.clone(),
             });
         }
+    }
+    let Some(&dv) = v.shape.get(3) else {
+        return Err(ShapeError::AttentionOperand {
+            operand: "v",
+            expected: vec![bsz, hq / n_rep, lk, dk],
+            actual: v.shape.clone(),
+        });
+    };
+    let v_expected = [bsz, hq / n_rep, lk, dv];
+    if dv == 0 || v.shape != v_expected {
+        return Err(ShapeError::AttentionOperand {
+            operand: "v",
+            expected: v_expected.to_vec(),
+            actual: v.shape.clone(),
+        });
     }
     let mask_heads = if mask.shape.get(1) == Some(&hq) {
         hq
     } else {
         1
     };
-    let dense_mask = [bsz, mask_heads, m, kv_len];
+    let dense_mask = [bsz, mask_heads, lq, lk];
     if mask.shape != dense_mask {
-        return Err(ShapeError::FlashAttentionOperand {
+        return Err(ShapeError::AttentionOperand {
             operand: "mask",
             expected: dense_mask.to_vec(),
             actual: mask.shape.clone(),
         });
     }
-    Ok(q.clone())
-}
-
-fn flash_query_error(form: FlashForm, n_rep: usize, q: &TensorType) -> ShapeError {
-    ShapeError::FlashAttentionQuery {
-        form: match form {
-            FlashForm::Decode => "decode: M == 1",
-            FlashForm::Prefill => "prefill: B == 1",
-        },
-        n_rep,
-        actual: q.shape.clone(),
+    if let Some(len) = len
+        && (len.dtype != DType::I32 || len.shape != [bsz])
+    {
+        return Err(ShapeError::AttentionOperand {
+            operand: "len",
+            expected: vec![bsz],
+            actual: len.shape.clone(),
+        });
     }
+    Ok(TensorType::new(vec![bsz, hq, lq, dv], q.dtype))
 }
 
 /// The typing rule of `Rope { rot }`: inputs `[x, cos, sin]`, output x's type. `rot` is even and within
@@ -2575,11 +2803,8 @@ mod tests {
     }
 
     #[test]
-    fn flash_attention_decode_rejects_a_kv_or_mask_dtype_mismatch() {
-        let op = OpKind::FlashAttentionDecode {
-            n_rep: 1,
-            scale: 1.0,
-        };
+    fn attention_rejects_a_kv_or_mask_dtype_mismatch() {
+        let op = OpKind::Attention(AttentionAttrs::new(1, 1.0, None));
         let (q, k, v, mask) = (
             f(&[1, 1, 1, 4]),
             f(&[1, 1, 3, 4]),
@@ -2594,7 +2819,7 @@ mod tests {
         let bf16_k = TensorType::new(vec![1, 1, 3, 4], DType::BF16);
         assert!(matches!(
             op.infer(&[q.clone(), bf16_k, v.clone(), mask.clone()]),
-            Err(ShapeError::FlashAttentionDtype {
+            Err(ShapeError::AttentionDtype {
                 operand: "k",
                 expected: DType::F32,
                 actual: DType::BF16
@@ -2604,7 +2829,7 @@ mod tests {
         let bf16_v = TensorType::new(vec![1, 1, 3, 4], DType::BF16);
         assert!(matches!(
             op.infer(&[q.clone(), k.clone(), bf16_v, mask.clone()]),
-            Err(ShapeError::FlashAttentionDtype {
+            Err(ShapeError::AttentionDtype {
                 operand: "v",
                 expected: DType::F32,
                 actual: DType::BF16
@@ -2614,7 +2839,7 @@ mod tests {
         let bf16_mask = TensorType::new(vec![1, 1, 1, 3], DType::BF16);
         assert!(matches!(
             op.infer(&[q, k, v, bf16_mask]),
-            Err(ShapeError::FlashAttentionDtype {
+            Err(ShapeError::AttentionDtype {
                 operand: "mask",
                 expected: DType::F32,
                 actual: DType::BF16
@@ -2731,12 +2956,23 @@ mod tests {
                 .unwrap(),
             i(&[2, 3])
         );
+        // The condition is an I32 word; the branches share one dtype and the result carries it.
+        assert_eq!(
+            OpKind::Select
+                .infer(&[i(&[2, 1]), f(&[3]), f(&[])])
+                .unwrap(),
+            f(&[2, 3])
+        );
         assert!(matches!(
             OpKind::Select.infer(&[f(&[2]), f(&[2]), f(&[2])]),
             Err(ShapeError::DtypeOp {
                 op: "Select",
                 dtype: DType::F32
             })
+        ));
+        assert!(matches!(
+            OpKind::Select.infer(&[i(&[2]), f(&[2]), i(&[2])]),
+            Err(ShapeError::Dtype { .. })
         ));
         assert!(matches!(
             OpKind::Binary(BinOp::Add).infer(&[i(&[2]), TensorType::scalar(DType::F32)]),
@@ -2956,9 +3192,9 @@ mod tests {
     }
 
     /// R469-005-style key correctness for the nullary `Iota`: `hash_params` fingerprints the op's content, so two
-    /// iotas of different lengths must not hash alike while equal lengths do.
+    /// iotas of different lengths or dtypes must not hash alike while equal ones do.
     #[test]
-    fn iota_hash_params_distinguish_lengths() {
+    fn iota_hash_params_distinguish_lengths_and_dtypes() {
         use std::hash::Hasher;
 
         fn hash(op: &OpKind) -> u64 {
@@ -2967,14 +3203,10 @@ mod tests {
             hasher.finish()
         }
 
-        assert_eq!(
-            hash(&OpKind::Iota { len: 4 }),
-            hash(&OpKind::Iota { len: 4 })
-        );
-        assert_ne!(
-            hash(&OpKind::Iota { len: 4 }),
-            hash(&OpKind::Iota { len: 5 })
-        );
+        let iota = |len, dtype| OpKind::Iota { len, dtype };
+        assert_eq!(hash(&iota(4, DType::F32)), hash(&iota(4, DType::F32)));
+        assert_ne!(hash(&iota(4, DType::F32)), hash(&iota(5, DType::F32)));
+        assert_ne!(hash(&iota(4, DType::F32)), hash(&iota(4, DType::I32)));
     }
 
     /// Card 528a SC-003. `hash_params` is the content fingerprint that guards the wgpu CSE memo and decode

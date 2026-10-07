@@ -258,7 +258,9 @@ pub(crate) fn exact_i32_pointwise_observation(op: &OpKind) -> Option<bool> {
                         pointwise = true;
                         observed = true;
                     }
-                    FusedOp::Binary(_) | FusedOp::Unary(_) => pointwise = true,
+                    FusedOp::Binary(_) | FusedOp::Unary(_) | FusedOp::Cast { .. } => {
+                        pointwise = true
+                    }
                 }
             }
             pointwise.then_some(observed)
@@ -309,7 +311,8 @@ pub(crate) fn value_storage_of_plans<'p, V: ValidationChannel>(
     let lanes = I32ReadLanes::of_plans(g, plans.iter().copied());
     lanes.check_agreement()?;
     let weights = dense_contraction_weight_storages(g)?;
-    let storage = storage_of_read_lanes(g, backend, &lanes, &weights, caps);
+    let views = compute_views(g, backend);
+    let storage = storage_of_read_lanes(g, backend, &views, &lanes, &weights, caps);
     check_bf16_const_reads(g, backend, &storage, &plans)?;
     Ok(storage)
 }
@@ -321,8 +324,8 @@ pub(crate) fn value_storage_of_plans<'p, V: ValidationChannel>(
 /// instead of reading the buffer at the wrong element width or failing later in codegen.
 ///
 /// The invariant this relies on: a plan's value operand `i` is its kernel's data param `i` (data params come
-/// first in both `Compute` and `ComputeMeta`, the meta buffer rides after them), and every chunk of a
-/// `ComputeChunks` plan shares the first chunk's param types. A reader whose params were not 1:1 with its value
+/// first with or without a metadata buffer, which rides after them), and every dispatch of a
+/// split plan shares the first dispatch's param types. A reader whose params were not 1:1 with its value
 /// operands would be skipped here, so `bf16_const_reads_refuse_a_reader_without_the_lane` pins the refusal on a
 /// real reader.
 fn check_bf16_const_reads<V: ValidationChannel>(
@@ -338,13 +341,8 @@ fn check_bf16_const_reads<V: ValidationChannel>(
             roots.insert(eqn.out, root);
             continue;
         }
-        let body = match plan {
-            Some(Plan::Compute { body, .. }) | Some(Plan::ComputeMeta { body, .. }) => body,
-            Some(Plan::ComputeChunks(chunks)) => match chunks.first() {
-                Some(chunk) => &chunk.body,
-                None => continue,
-            },
-            _ => continue,
+        let Some(Dispatch { body, .. }) = plan.and_then(|plan| plan.dispatches().first()) else {
+            continue;
         };
         let params: Vec<_> = body.params().collect();
         for (i, &vid) in value_ids(eqn).iter().enumerate() {
@@ -378,6 +376,7 @@ fn check_bf16_const_reads<V: ValidationChannel>(
 fn storage_of_read_lanes<V: ValidationChannel>(
     g: &Graph<V>,
     backend: Backend,
+    views: &HashMap<ValueId, Layout>,
     lanes: &I32ReadLanes,
     weights: &HashMap<ValueId, StorageKind>,
     caps: &DeviceCaps,
@@ -386,7 +385,7 @@ fn storage_of_read_lanes<V: ValidationChannel>(
         .map(|id| {
             ValueStorage::new(match weights.get(&id) {
                 Some(&kind) => kind,
-                None => value_storage_kind(g, id, backend, lanes, caps),
+                None => value_storage_kind(g, views, id, backend, lanes, caps),
             })
         })
         .collect();
@@ -415,12 +414,10 @@ pub(crate) fn dense_contraction_weight_storage(dtype: DType) -> Option<StorageKi
 fn dense_contraction_weight_storages<V: ValidationChannel>(
     g: &Graph<V>,
 ) -> Result<HashMap<ValueId, StorageKind>, PlanError> {
-    let reads = |eqn: &Eqn| match (&eqn.op, eqn.inputs.get(1)) {
-        (OpKind::DenseContraction { weight }, Some(Operand::Value(value))) => {
-            dense_contraction_weight_storage(*weight)
-                .filter(|&kind| kind != StorageKind::Dense(*weight))
-                .map(|kind| (*value, kind))
-        }
+    let reads = |eqn: &Eqn| match (eqn.op.dense_weight(), eqn.inputs.get(1)) {
+        (Some(weight), Some(Operand::Value(value))) => dense_contraction_weight_storage(weight)
+            .filter(|&kind| kind != StorageKind::Dense(weight))
+            .map(|kind| (*value, kind)),
         _ => None,
     };
     let weights: HashMap<ValueId, StorageKind> = g.eqns.iter().filter_map(reads).collect();
@@ -485,17 +482,13 @@ impl I32ReadLanes {
                 roots.insert(eqn.out, root);
                 continue;
             }
-            // Data-input params come first in both Compute and ComputeMeta (the meta buffer rides after
-            // them), so value_ids[i] maps to params[i] either way. ComputeChunks is scanned via chunk 0's
-            // body (every chunk shares the same param types).
-            let body = match plan {
-                Some(Plan::Compute { body, .. }) | Some(Plan::ComputeMeta { body, .. }) => {
-                    Some(body)
-                }
-                Some(Plan::ComputeChunks(chunks)) => chunks.first().map(|c| &c.body),
-                _ => None,
+            // Data-input params come first, with or without a metadata buffer (it rides after them), so
+            // value_ids[i] maps to params[i] either way. A split plan is scanned via its first
+            // dispatch's body (every dispatch shares the same param types).
+            let Some(Dispatch { body, .. }) = plan.and_then(|plan| plan.dispatches().first())
+            else {
+                continue;
             };
-            let Some(body) = body else { continue };
             let params: Vec<_> = body.params().collect();
             for (i, &vid) in value_ids(eqn).iter().enumerate() {
                 let Some(&param) = params.get(i) else {
@@ -566,6 +559,7 @@ fn slice_elem(ty: &poot_kernel_ir::Ty) -> Option<&poot_kernel_ir::Ty> {
 /// packed two-per-`u32` word or native two-byte bf16, the one answer the cast planner reads too.
 fn value_storage_kind<V: ValidationChannel>(
     g: &Graph<V>,
+    views: &HashMap<ValueId, Layout>,
     id: ValueId,
     backend: Backend,
     lanes: &I32ReadLanes,
@@ -582,7 +576,7 @@ fn value_storage_kind<V: ValidationChannel>(
     if g.meta(id).storage != Storage::Const || declared != DType::BF16 {
         return StorageKind::Dense(declared);
     }
-    if bf16_const_is_packed(g, id, backend, caps) {
+    if bf16_const_is_packed(g, views, id, backend, caps) {
         StorageKind::Bf16Packed
     } else {
         StorageKind::Dense(DType::BF16)
@@ -802,8 +796,8 @@ mod value_storage_tests {
         use poot_graph_ir::Slot;
 
         use crate::{
-            Capability, CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, FusionPolicy,
-            PlanError, Submission, Target, TargetSet, compile_staged,
+            Capability, CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, PlanError,
+            Submission, Target, TargetSet, compile_staged,
         };
 
         let b = Builder::new();
@@ -834,7 +828,6 @@ mod value_storage_tests {
             },
             &CompileOptions {
                 execution: Submission::Replay,
-                fusion: FusionPolicy::Full,
                 limits: crate::CompileLimits::STANDARD,
             },
         )
@@ -865,8 +858,8 @@ mod value_storage_tests {
         use poot_graph_ir::Slot;
 
         use crate::{
-            CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, FusionPolicy, Partition,
-            Submission, Target, TargetSet, compile_staged,
+            CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, Submission,
+            Target, TargetSet, compile_staged,
         };
 
         let b = Builder::new();
@@ -890,7 +883,6 @@ mod value_storage_tests {
                 },
                 &CompileOptions {
                     execution: Submission::Replay,
-                    fusion: FusionPolicy::Full,
                     limits: crate::CompileLimits::STANDARD,
                 },
             )

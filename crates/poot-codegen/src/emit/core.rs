@@ -14,11 +14,7 @@ impl<'a> Emitter<'a> {
             tmp: 0,
             declares: BTreeSet::new(),
             uses_len: false,
-            frag_regs: std::collections::HashMap::new(),
-            frag_layout: super::wmma::scan_frag_layout(body),
             error_accum,
-            float_binop_ordinal: 0,
-            no_contract_ordinals: Vec::new(),
             strictfp_needed: false,
         }
     }
@@ -140,16 +136,13 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// The alloca'd LLVM type for `l`: a matrix-fragment handle (card 530) on AMDGCN/NVPTX overrides its
-    /// marker `Ty`'s scalar size with the real register-group aggregate/vector (see `frag_layout`'s doc and
-    /// `wmma::frag_alloca_llty`); every other local, and every fragment on SPIR-V (tracked via `frag_regs`
-    /// instead, never alloca'd), uses its declared `Ty` as before.
+    /// The alloca'd LLVM type for `l`. A matrix fragment (cards 530/663) takes its physical type from its
+    /// declared [`Ty::Fragment`] (`wmma::fragment_llty`) instead of a scalar size; every other local uses
+    /// its declared scalar `Ty`.
     pub(super) fn local_llty(&self, l: Local) -> Result<String, EmitError> {
-        match (self.frag_layout.get(&l.index), self.target) {
-            (Some(&(dtype, is_acc)), Target::AmdGcn(_) | Target::Nvptx) => {
-                self.frag_alloca_llty(dtype, is_acc)
-            }
-            _ => self.scalar_llty(&self.body.locals[l.index as usize].ty),
+        match &self.body.locals[l.index as usize].ty {
+            Ty::Fragment(fragment) => self.fragment_llty(*fragment),
+            other => self.scalar_llty(other),
         }
     }
 
@@ -536,11 +529,12 @@ impl<'a> Emitter<'a> {
                 self.emit_wmma_zero(*dtype, *shape, *dst, w)
             }
             Statement::WmmaStoreLds {
+                dtype,
                 shape,
                 array,
                 stride,
                 src,
-            } => self.emit_wmma_store_lds(*shape, *array, *stride, *src, w),
+            } => self.emit_wmma_store_lds(*dtype, *shape, *array, *stride, *src, w),
             Statement::WmmaLoadLds {
                 which,
                 dtype,

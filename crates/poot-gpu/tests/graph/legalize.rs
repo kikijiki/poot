@@ -7,7 +7,7 @@
 //! `compile` directly on a small synthetic oversized weight instead.
 
 use super::*;
-use poot_graph_plan::{CompileOptions, FusionPolicy, Submission, Target, compile};
+use poot_graph_plan::{CompileOptions, Submission, Target, compile};
 use poot_target::{Backend, DeviceCaps};
 
 #[test]
@@ -40,7 +40,6 @@ fn compile_split_matmul_matches_cpu_on_real_wgpu_hardware() {
     };
     let options = CompileOptions {
         execution: Submission::Replay,
-        fusion: FusionPolicy::Full,
         limits: poot_graph_plan::CompileLimits::STANDARD,
     };
     let program =

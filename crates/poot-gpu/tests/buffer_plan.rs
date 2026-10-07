@@ -13,7 +13,7 @@
 //! internally (the `executor_contract.rs` SC-015 precedent) - and, model-free and backend-neutral,
 //! in `poot_executor`'s own `tests/buffer_plan_arena.rs`.
 //!
-//! The fixture below is unfused (`FusionPolicy::MoeHangGuard`) so its five equations compile to five
+//! The fixture below is unfused (the routed-expert hang guard) so its five equations compile to five
 //! separate dispatches, in a known order, with a known buffer-plan lifetime for each:
 //!
 //! ```text
@@ -39,8 +39,8 @@ use poot_gpu::device::WgpuDevice;
 use poot_graph_ir::op::RedOp;
 use poot_graph_ir::{Builder, TensorType, ValidationOutputs};
 use poot_graph_plan::{
-    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, FusionPolicy, Partition,
-    StagedProgram, Submission, Target, TargetSet, compile_staged,
+    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram,
+    Submission, Target, TargetSet, compile_staged,
 };
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_target::BufferStorage;
@@ -70,7 +70,9 @@ fn fixture() -> (Graph, Vec<f32>, Vec<f32>, f32) {
     let v2 = builder.binary(poot_graph_ir::op::BinOp::Add, tc, tc);
     let s2 = builder.reduce(RedOp::Max, v2, 0, true);
     let out = builder.binary(poot_graph_ir::op::BinOp::Add, s1, s2);
-    (builder.finish(out).with_validations(Vec::new()), a, b, c)
+    // The routed-expert hang guard (compile's `staged` below) needs a routed-expert site in the graph.
+    let g = poot_test_util::graph_fixtures::with_routed_expert_site(builder.finish(out));
+    (g.with_validations(Vec::new()), a, b, c)
 }
 
 fn store(a: &[f32], b: &[f32], c: f32) -> Arc<WeightStore> {
@@ -93,21 +95,30 @@ fn bytemuck_bytes(v: &[f32]) -> Vec<u8> {
 
 fn bytemuck_f32(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
 
-/// `compile`'s own `MoeHangGuard` test pattern (`compile.rs`'s `compile_moe_hang_guard_skips_fuse`):
-/// skip `fuse` (and the tiled-GEMM choice) so the fixture's five equations stay five separate
-/// dispatches, each with the exact lifetime the module doc names.
+/// `compile` under the routed-expert hang guard (`compile.rs`'s
+/// `compile_skips_fuse_only_for_a_routed_site_on_a_target_with_the_hang`): skip `fuse` (and the
+/// tiled-GEMM choice) so the fixture's five equations stay five separate dispatches, each with the exact
+/// lifetime the module doc names. The guard needs a routed-expert site in the graph (`fixture`) and a target
+/// with the hang ([`staged`]).
 const UNFUSED_REPLAY: CompileOptions = CompileOptions {
     execution: Submission::Replay,
-    fusion: FusionPolicy::MoeHangGuard,
     limits: poot_graph_plan::CompileLimits::STANDARD,
 };
 
+/// Compiled under the routed-expert hang guard: the fixture's graph carries a routed-expert site and
+/// the target is given the hang.
 fn staged(g: &Graph, target: Target) -> StagedProgram<ValidationOutputs> {
+    let target = Target {
+        caps: poot_test_util::graph_fixtures::with_routed_expert_hang(target.caps),
+        ..target
+    };
     compile_staged(
         g,
         &TargetSet::single(DeviceId(0), target),
@@ -143,6 +154,8 @@ fn disjoint_lifetimes_reuse_one_slot_and_match_the_oracle() {
         eprintln!("skip: no wgpu adapter");
         return;
     };
+    // The unfused fixture is compiled under the routed-expert hang guard, so the device reports the hang.
+    let device = poot_executor_parity::hung::WithRoutedHang(device);
     let target = device.target();
     let (g, a, b, c) = fixture();
     let program = poot_graph_plan::compile(&g, &target, &UNFUSED_REPLAY)
@@ -193,6 +206,8 @@ fn a_short_value_reusing_a_larger_slot_publishes_its_own_length_not_the_slots() 
         eprintln!("skip: no wgpu adapter");
         return;
     };
+    // The unfused fixture is compiled under the routed-expert hang guard, so the device reports the hang.
+    let device = poot_executor_parity::hung::WithRoutedHang(device);
     let target = device.target();
     let (g, a, b, c) = fixture();
     let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));

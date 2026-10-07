@@ -1,9 +1,17 @@
 use super::*;
-use poot_graph_plan::{ImportedKernel, KernelChoice};
+use poot_graph_plan::KernelChoice;
+use poot_kernelgen::{KernelRequest, MovementOp, MovementSpec};
 
-/// Whether a plan's choice is the shipped kernel `kernel`.
-fn is_imported(choice: &KernelChoice, kernel: ImportedKernel) -> bool {
-    matches!(choice, KernelChoice::Imported { kernel: k, .. } if *k == kernel)
+/// The generated movement a choice names, and whether its plan is one dispatch with no metadata buffer.
+fn movement_of(plan: &poot_graph_plan::Plan, choice: &KernelChoice) -> MovementSpec {
+    assert!(
+        matches!(single_meta(plan), Some([])),
+        "a movement is one dispatch with no metadata buffer: {plan:?}"
+    );
+    match choice {
+        KernelChoice::Generated(KernelRequest::Movement(spec)) => spec.clone(),
+        other => panic!("expected the generated movement kernel: {other:?}"),
+    }
 }
 
 #[test]
@@ -122,8 +130,8 @@ fn arg_top_k_gpu_matches_cpu() {
 #[test]
 fn gather_nonaxis0_gpu_matches_cpu() {
     // Non-axis-0 gather lowers to a GPU kernel instead of the host fallback, keeping the op on-device; on f32 it
-    // is the imported ComputeMeta kernel (card 044). Two cases on a [3,4,5] table: (a) axis=1 with a vector index [2] ->
-    // out [3,2,5]; (b) axis=2 with a scalar index -> out [3,4]. Each asserts the plan is the imported kernel (not Host, else
+    // is the generated movement kernel. Two cases on a [3,4,5] table: (a) axis=1 with a vector index [2] ->
+    // out [3,2,5]; (b) axis=2 with a scalar index -> out [3,4]. Each asserts the plan is the generated kernel (not Host, else
     // GPU==CPU would pass via the host path) and output == CPU eval.
     use poot_graph_ir::op::OpKind;
     let _gpu_guard = gpu_lock();
@@ -152,17 +160,19 @@ fn gather_nonaxis0_gpu_matches_cpu() {
             &poot_test_util::device_caps::default_caps_for(poot_target::Backend::SpirvVulkan),
         )
         .unwrap();
-        // f32 non-axis-0 gather lowers to the imported ComputeMeta kernel (meta=[inner,axis_len] = [5, 4] here), not the host fallback or kernelgen.
-        match &plan {
-            poot_graph_plan::Plan::ComputeMeta { meta, .. } => {
-                assert!(
-                    is_imported(&choice, ImportedKernel::GatherAxis),
-                    "{choice:?}"
-                );
-                assert_eq!(meta, &vec![5u32, 4u32], "[inner, axis_len]");
-            }
-            _ => panic!("axis-1 f32 gather must be the imported ComputeMeta kernel"),
-        }
+        // The gather is the generated movement kernel, not a host fallback.
+        let spec = movement_of(&plan, &choice);
+        assert!(
+            matches!(
+                spec.op,
+                MovementOp::Gather {
+                    axis: 1,
+                    index_numel: 2,
+                    ..
+                }
+            ),
+            "{spec:?}"
+        );
         let mut inputs = HashMap::new();
         inputs.insert(di, HostTensor::f32(vec![3, 4, 5], datad.clone()));
         inputs.insert(ii, HostTensor::f32(vec![2], vec![3.0, 1.0]));
@@ -212,17 +222,19 @@ fn gather_nonaxis0_gpu_matches_cpu() {
             &poot_test_util::device_caps::default_caps_for(poot_target::Backend::SpirvVulkan),
         )
         .unwrap();
-        // card 044: f32, imported ComputeMeta. inner = numel(data[3..]) = 1, axis_len = data[2] = 5.
-        match &plan {
-            poot_graph_plan::Plan::ComputeMeta { meta, .. } => {
-                assert!(
-                    is_imported(&choice, ImportedKernel::GatherAxis),
-                    "{choice:?}"
-                );
-                assert_eq!(meta, &vec![1u32, 5u32], "[inner, axis_len]");
-            }
-            _ => panic!("axis-2 f32 scalar gather must be the imported ComputeMeta kernel"),
-        }
+        // The scalar-index gather over the last axis is the generated movement kernel too.
+        let spec = movement_of(&plan, &choice);
+        assert!(
+            matches!(
+                spec.op,
+                MovementOp::Gather {
+                    axis: 2,
+                    index_numel: 1,
+                    ..
+                }
+            ),
+            "{spec:?}"
+        );
         let mut inputs = HashMap::new();
         inputs.insert(di, HostTensor::f32(vec![3, 4, 5], datad.clone()));
         inputs.insert(ii, HostTensor::f32(vec![], vec![2.0]));
@@ -255,10 +267,9 @@ fn gather_nonaxis0_gpu_matches_cpu() {
 
 #[test]
 fn gather_nonaxis0_plan_selection() {
-    // The f32 non-axis-0 gather lowers to the imported ComputeMeta kernel (choice `GatherAxis`, meta=[inner,axis_len])
-    // on both backends; other dtypes keep the dt-generic kernelgen kernel. No GPU.
+    // A non-axis-0 gather is the one generated movement kernel on every backend and dtype: the request
+    // names the table's storage and the gather axis, and the dispatch binds no metadata buffer. No GPU.
     use poot_graph_ir::op::OpKind;
-    use poot_graph_plan::Plan;
     use poot_target::Backend;
     use poot_tensor::DType;
     let plan_for = |dt: DType, backend| {
@@ -280,36 +291,33 @@ fn gather_nonaxis0_plan_selection() {
         )
         .unwrap()
     };
-    // f32 -> imported ComputeMeta on both backends.
-    for backend in [Backend::SpirvVulkan, Backend::Nvptx] {
-        match plan_for(DType::F32, backend) {
-            (Plan::ComputeMeta { meta, .. }, choice) => {
-                assert!(
-                    is_imported(&choice, ImportedKernel::GatherAxis),
-                    "{choice:?} {backend:?}"
-                );
-                assert_eq!(meta, vec![5u32, 4u32], "[inner, axis_len] {backend:?}");
-            }
-            _ => panic!(
-                "f32 non-axis-0 gather {backend:?} should be the imported ComputeMeta kernel"
+    for (dt, backend) in [
+        (DType::F32, Backend::SpirvVulkan),
+        (DType::F32, Backend::Nvptx),
+        (DType::I32, Backend::SpirvVulkan),
+    ] {
+        let (plan_, choice_) = plan_for(dt, backend);
+        let spec = movement_of(&plan_, &choice_);
+        assert_eq!(
+            spec.storage,
+            poot_kernelgen::Storage::Elements {
+                carrier: poot_kernel_ir::Ty::F32
+            },
+            "{dt:?} {backend:?}"
+        );
+        assert!(
+            matches!(
+                &spec.op,
+                MovementOp::Gather { in_shape, axis: 1, index_numel: 2, .. } if in_shape == &[3, 4, 5]
             ),
-        }
-    }
-    // non-f32 -> kernelgen (the imported kernel is f32-only).
-    match plan_for(DType::I32, Backend::SpirvVulkan) {
-        (Plan::Compute { .. }, choice) => {
-            assert!(
-                !is_imported(&choice, ImportedKernel::GatherAxis),
-                "non-f32 keeps kernelgen: {choice:?}"
-            )
-        }
-        _ => panic!("i32 non-axis-0 gather should be a kernelgen Compute plan"),
+            "{dt:?} {backend:?}: {spec:?}"
+        );
+        assert_eq!(spec.out_shape, [3, 2, 5]);
     }
 }
-
 #[test]
 fn gather_nonaxis0_gpu_matches_cpu_over_random_shapes() {
-    // Property fuzzer for the imported non-axis-0 gather (`gather_axis`, ComputeMeta `[inner, axis_len]`), which the axis-0-only
+    // Property fuzzer for the imported non-axis-0 gather (`gather_axis`, metadata launch `[inner, axis_len]`), which the axis-0-only
     // gather-composition fuzzer does not cover. Random data rank (3-4), gather axis (>=1) and vector-index size and positions
     // stress the in-kernel `inner`/`axis_len`/`idx_numel` derivation and the meta buffer. Gather is a pure copy, so `gpu.run`
     // must equal CPU eval bit-for-bit.
@@ -439,11 +447,9 @@ fn scatter_update_gpu_matches_cpu() {
 
 #[test]
 fn gather_axis0_plan_selection() {
-    // Card 044: the f32 axis-0 embedding gather is the imported-from-Rust kernel (Plan::Compute, choice `GatherAxis0`) on both
-    // backends (a plain Compute, so the PTX executor dispatches it like the B=1 GEMV); any non-f32 dtype keeps kernelgen
-    // ("gather0:<dt>.."). Pure planner test (no GPU).
+    // The axis-0 embedding gather is the one generated movement kernel on every backend and dtype, with the
+    // table's row width implied by its shape rather than a metadata buffer. Pure planner test (no GPU).
     use poot_graph_ir::op::OpKind;
-    use poot_graph_plan::Plan;
     use poot_target::Backend;
     let plan_for = |dt: TensorType, backend| {
         let b = Builder::new();
@@ -465,47 +471,31 @@ fn gather_axis0_plan_selection() {
         )
         .unwrap()
     };
-    // f32 on wgpu -> the imported gather.
-    match plan_for(TensorType::f32(vec![5, 8]), Backend::SpirvVulkan) {
-        (Plan::Compute { .. }, choice) => {
-            assert!(
-                is_imported(&choice, ImportedKernel::GatherAxis0),
-                "f32 wgpu -> imported gather: {choice:?}"
-            )
-        }
-        _ => panic!("f32 wgpu axis-0 gather should be a Compute plan"),
-    }
-    // f32 on NVPTX -> the imported gather too (the PTX-engine swap).
-    match plan_for(TensorType::f32(vec![5, 8]), Backend::Nvptx) {
-        (Plan::Compute { .. }, choice) => {
-            assert!(
-                is_imported(&choice, ImportedKernel::GatherAxis0),
-                "f32 NVPTX -> imported gather: {choice:?}"
-            )
-        }
-        _ => panic!("NVPTX axis-0 gather should be a Compute plan"),
-    }
-    // non-f32 (i32 table) on wgpu -> kernelgen (the imported kernel is f32-only).
-    match plan_for(
-        TensorType::new(vec![5, 8], poot_tensor::DType::I32),
-        Backend::SpirvVulkan,
-    ) {
-        (Plan::Compute { .. }, choice) => {
-            assert!(
-                !is_imported(&choice, ImportedKernel::GatherAxis0),
-                "non-f32 wgpu must keep kernelgen: {choice:?}"
-            )
-        }
-        _ => panic!("i32 wgpu axis-0 gather should be a Compute plan"),
+    for (table, backend) in [
+        (TensorType::f32(vec![5, 8]), Backend::SpirvVulkan),
+        (TensorType::f32(vec![5, 8]), Backend::Nvptx),
+        (
+            TensorType::new(vec![5, 8], poot_tensor::DType::I32),
+            Backend::SpirvVulkan,
+        ),
+    ] {
+        let (plan_, choice_) = plan_for(table, backend);
+        let spec = movement_of(&plan_, &choice_);
+        assert!(
+            matches!(
+                &spec.op,
+                MovementOp::Gather { in_shape, axis: 0, index_numel: 3, .. } if in_shape == &[5, 8]
+            ),
+            "{backend:?}: {spec:?}"
+        );
+        assert_eq!(spec.out_shape, [3, 8]);
     }
 }
-
 #[test]
 fn scatter_update_plan_selection() {
-    // Card 044: the f32 paged-KV scatter-update is the imported kernel (Plan::Compute, choice `ScatterUpdate`) on both
-    // backends (NVPTX-verified, 0290); any non-f32 dtype keeps kernelgen. Pure planner test.
+    // The paged-KV scatter-update is the one generated movement kernel on every backend and dtype: a whole
+    // dispatch below the watchdog budget, no metadata buffer. Pure planner test.
     use poot_graph_ir::op::OpKind;
-    use poot_graph_plan::Plan;
     use poot_target::Backend;
     use poot_tensor::DType;
     // base [4,3] pool, src [2,3], inv [4].
@@ -529,34 +519,28 @@ fn scatter_update_plan_selection() {
         )
         .unwrap()
     };
-    for backend in [Backend::SpirvVulkan, Backend::Nvptx] {
-        match plan_for(DType::F32, backend) {
-            (Plan::Compute { .. }, choice) => {
-                assert!(
-                    is_imported(&choice, ImportedKernel::ScatterUpdate),
-                    "f32 {backend:?} -> imported: {choice:?}"
-                )
-            }
-            _ => panic!("f32 {backend:?} scatter_update should be a Compute plan"),
-        }
-    }
-    match plan_for(DType::I32, Backend::SpirvVulkan) {
-        (Plan::Compute { .. }, choice) => {
-            assert!(
-                !is_imported(&choice, ImportedKernel::ScatterUpdate),
-                "non-f32 keeps kernelgen: {choice:?}"
-            )
-        }
-        _ => panic!("i32 wgpu scatter_update should be a Compute plan"),
+    for (dt, backend) in [
+        (DType::F32, Backend::SpirvVulkan),
+        (DType::F32, Backend::Nvptx),
+        (DType::I32, Backend::SpirvVulkan),
+    ] {
+        let (plan_, choice_) = plan_for(dt, backend);
+        let spec = movement_of(&plan_, &choice_);
+        assert!(
+            matches!(
+                &spec.op,
+                MovementOp::ScatterRows { src_shape, window: None, .. } if src_shape == &[2, 3]
+            ),
+            "{dt:?} {backend:?}: {spec:?}"
+        );
+        assert_eq!(spec.out_shape, [4, 3]);
     }
 }
-
 #[test]
 fn scatter_axis0_plan_selection() {
-    // Card 044: the f32 axis-0 scatter is the imported-from-Rust kernel (Plan::Compute, choice `ScatterAxis0`) on both
-    // backends (NVPTX-verified, 0290); any non-f32 dtype keeps kernelgen. Pure planner test (no GPU).
+    // The axis-0 permutation scatter is the one generated movement kernel on every backend and dtype, one
+    // thread per source element. Pure planner test (no GPU).
     use poot_graph_ir::op::OpKind;
-    use poot_graph_plan::Plan;
     use poot_target::Backend;
     let plan_for = |dt: TensorType, backend| {
         let b = Builder::new();
@@ -578,41 +562,32 @@ fn scatter_axis0_plan_selection() {
         )
         .unwrap()
     };
-    // f32 on BOTH backends -> the imported scatter.
-    for backend in [Backend::SpirvVulkan, Backend::Nvptx] {
-        match plan_for(TensorType::f32(vec![4, 3]), backend) {
-            (Plan::Compute { .. }, choice) => {
-                assert!(
-                    is_imported(&choice, ImportedKernel::ScatterAxis0),
-                    "f32 {backend:?} -> imported scatter: {choice:?}"
-                )
-            }
-            _ => panic!("f32 {backend:?} axis-0 scatter should be a Compute plan"),
-        }
-    }
-    // non-f32 (i32) on wgpu -> kernelgen (the imported kernel is f32-only).
-    match plan_for(
-        TensorType::new(vec![4, 3], poot_tensor::DType::I32),
-        Backend::SpirvVulkan,
-    ) {
-        (Plan::Compute { .. }, choice) => {
-            assert!(
-                !is_imported(&choice, ImportedKernel::ScatterAxis0),
-                "non-f32 wgpu must keep kernelgen: {choice:?}"
-            )
-        }
-        _ => panic!("i32 wgpu axis-0 scatter should be a Compute plan"),
+    for (table, backend) in [
+        (TensorType::f32(vec![4, 3]), Backend::SpirvVulkan),
+        (TensorType::f32(vec![4, 3]), Backend::Nvptx),
+        (
+            TensorType::new(vec![4, 3], poot_tensor::DType::I32),
+            Backend::SpirvVulkan,
+        ),
+    ] {
+        let (plan_, choice_) = plan_for(table, backend);
+        let spec = movement_of(&plan_, &choice_);
+        assert!(
+            matches!(
+                &spec.op,
+                MovementOp::PermuteRows { src_shape, .. } if src_shape == &[4, 3]
+            ),
+            "{backend:?}: {spec:?}"
+        );
+        assert_eq!(spec.threads(), 12);
     }
 }
-
 #[test]
 fn index_remap_layout_plan_selection() {
-    // Card 044: on wgpu the f32 transpose / slice / broadcast all run the one imported index_remap kernel (Plan::ComputeMeta,
-    // choice `IndexRemap`); the NVPTX path and any non-f32 dtype keep kernelgen
-    // (Plan::Compute). Pure planner test (no GPU). Also checks the planner's meta buffer matches the kernel's
-    // `[rank, src_base, (out_stride,out_dim,src_term)*]` layout.
+    // Transpose, slice and broadcast are the one generated movement kernel on every backend and dtype:
+    // the request names the layout change and the dispatch binds no metadata buffer. Pure planner test
+    // (no GPU).
     use poot_graph_ir::op::OpKind;
-    use poot_graph_plan::Plan;
     use poot_target::Backend;
     let plan_op = |build: &dyn Fn(&Builder) -> poot_graph_ir::builder::Traced,
                    want: fn(&OpKind) -> bool,
@@ -632,98 +607,64 @@ fn index_remap_layout_plan_selection() {
     let f32t = |b: &Builder, sh: Vec<usize>| b.constant("x", TensorType::f32(sh));
     let i32t =
         |b: &Builder, sh: Vec<usize>| b.constant("x", TensorType::new(sh, poot_tensor::DType::I32));
-
-    // TRANSPOSE [2,3,4] perm [2,0,1] -> [4,2,3]. wgpu f32 -> imported ComputeMeta; meta = [rank=3, base=0, ...].
     let is_t = |o: &OpKind| matches!(o, OpKind::Transpose { .. });
-    match plan_op(
-        &|b| b.transpose(f32t(b, vec![2, 3, 4]), vec![2, 0, 1]),
-        is_t,
-        Backend::SpirvVulkan,
-    ) {
-        (Plan::ComputeMeta { meta, .. }, choice) => {
-            assert!(
-                is_imported(&choice, ImportedKernel::IndexRemap),
-                "{choice:?} "
-            );
-            assert_eq!(meta[0], 3, "rank");
-            assert_eq!(meta.len(), 2 + 3 * 3, "rank,base + 3 triples");
-            // out [4,2,3] row-major strides [6,3,1]; out dims [4,2,3]; src_terms = in_strides[perm[d]]
-            // (in [2,3,4] strides [12,4,1]) = [1,12,4].
-            assert_eq!(&meta[2..], &[6, 4, 1, 3, 2, 12, 1, 3, 4]);
-        }
-        _ => panic!("f32 wgpu transpose should be ComputeMeta"),
-    }
-    // f32 NVPTX -> the imported ComputeMeta too now (the PTX executor binds the dims buffer).
-    assert!(matches!(
-        plan_op(
+    let is_s = |o: &OpKind| matches!(o, OpKind::Slice { .. });
+    let is_b = |o: &OpKind| matches!(o, OpKind::Broadcast { .. });
+
+    for backend in [Backend::SpirvVulkan, Backend::Nvptx] {
+        // TRANSPOSE [2,3,4] perm [2,0,1] -> [4,2,3].
+        let (plan_, choice_) = plan_op(
             &|b| b.transpose(f32t(b, vec![2, 3, 4]), vec![2, 0, 1]),
             is_t,
-            Backend::Nvptx
-        ),
-        (Plan::ComputeMeta { .. }, choice) if is_imported(&choice, ImportedKernel::IndexRemap)
-    ));
-    // non-f32 keeps kernelgen.
-    assert!(matches!(
-        plan_op(
-            &|b| b.transpose(i32t(b, vec![2, 3, 4]), vec![2, 0, 1]),
-            is_t,
-            Backend::SpirvVulkan
-        ),
-        (Plan::Compute { .. }, KernelChoice::Generated(_))
-    ));
+            backend,
+        );
+        let spec = movement_of(&plan_, &choice_);
+        assert!(
+            matches!(
+                &spec.op,
+                MovementOp::Transpose { in_shape, perm } if in_shape == &[2, 3, 4] && perm == &[2, 0, 1]
+            ),
+            "{backend:?}: {spec:?}"
+        );
+        assert_eq!(spec.out_shape, [4, 2, 3]);
 
-    // SLICE [4,5] axis 1 start 1 end 4 -> [4,3]; base = start*in_stride[axis] = 1*1 = 1.
-    let is_s = |o: &OpKind| matches!(o, OpKind::Slice { .. });
-    match plan_op(
-        &|b| b.slice(f32t(b, vec![4, 5]), 1, 1, 4),
-        is_s,
-        Backend::SpirvVulkan,
-    ) {
-        (Plan::ComputeMeta { meta, .. }, choice) => {
-            assert!(
-                is_imported(&choice, ImportedKernel::IndexRemap),
-                "{choice:?} "
-            );
-            assert_eq!(meta[1], 1, "src_base = start*in_stride[axis]");
-        }
-        _ => panic!("f32 wgpu slice should be ComputeMeta"),
-    }
-    assert!(matches!(
-        plan_op(
-            &|b| b.slice(f32t(b, vec![4, 5]), 1, 1, 4),
-            is_s,
-            Backend::Nvptx
-        ),
-        (Plan::ComputeMeta { .. }, choice) if is_imported(&choice, ImportedKernel::IndexRemap)
-    ));
+        // SLICE [4,5] axis 1 start 1 end 4 -> [4,3].
+        let (plan_, choice_) = plan_op(&|b| b.slice(f32t(b, vec![4, 5]), 1, 1, 4), is_s, backend);
+        let spec = movement_of(&plan_, &choice_);
+        assert!(
+            matches!(
+                &spec.op,
+                MovementOp::Slice { in_shape, axis: 1, start: 1 } if in_shape == &[4, 5]
+            ),
+            "{backend:?}: {spec:?}"
+        );
 
-    // BROADCAST [3,1] -> [3,4]; src_term 0 on the broadcast dim.
-    let is_b = |o: &OpKind| matches!(o, OpKind::Broadcast { .. });
-    match plan_op(
-        &|b| b.broadcast(f32t(b, vec![3, 1]), vec![3, 4]),
-        is_b,
-        Backend::SpirvVulkan,
-    ) {
-        (Plan::ComputeMeta { meta, .. }, choice) => {
-            assert!(
-                is_imported(&choice, ImportedKernel::IndexRemap),
-                "{choice:?} "
-            );
-            // out [3,4] strides [4,1] dims [3,4]; src_terms = [1, 0] (dim0 own stride 1, dim1 broadcast 0).
-            assert_eq!(&meta[2..], &[4, 3, 1, 1, 4, 0]);
-        }
-        _ => panic!("f32 wgpu broadcast should be ComputeMeta"),
-    }
-    assert!(matches!(
-        plan_op(
-            &|b| b.broadcast(i32t(b, vec![3, 1]), vec![3, 4]),
+        // BROADCAST [3,1] -> [3,4].
+        let (plan_, choice_) = plan_op(
+            &|b| b.broadcast(f32t(b, vec![3, 1]), vec![3, 4]),
             is_b,
-            Backend::SpirvVulkan
-        ),
-        (Plan::Compute { .. }, KernelChoice::Generated(_))
-    ));
+            backend,
+        );
+        let spec = movement_of(&plan_, &choice_);
+        assert!(
+            matches!(&spec.op, MovementOp::Broadcast { in_shape } if in_shape == &[3, 1]),
+            "{backend:?}: {spec:?}"
+        );
+    }
+    // An exact-I32 carrier is a different storage, so a different request than the f32 lane: a transpose
+    // of a constant I32 value stays on the f32 lane (no exact consumer), and says so.
+    let (plan_, choice_) = plan_op(
+        &|b| b.transpose(i32t(b, vec![2, 3, 4]), vec![2, 0, 1]),
+        is_t,
+        Backend::SpirvVulkan,
+    );
+    assert_eq!(
+        movement_of(&plan_, &choice_).storage,
+        poot_kernelgen::Storage::Elements {
+            carrier: poot_kernel_ir::Ty::F32
+        }
+    );
 }
-
 #[test]
 fn gather_composition_gpu_matches_cpu_over_random_graphs() {
     // The gather coverage gap: the fused and movement fuzzers above exclude gather/scatter, yet gather is everywhere in real
@@ -1036,7 +977,6 @@ fn i32_slot_gather_variants_compiled_match_cpu_bit_exact() {
         // once to inspect/bind, `run_via_contract`/`staged_replay` compiles again to execute).
         let options = poot_graph_plan::CompileOptions {
             execution: poot_graph_plan::Submission::Replay,
-            fusion: poot_graph_plan::FusionPolicy::Full,
             limits: poot_graph_plan::CompileLimits::STANDARD,
         };
         let program = poot_graph_plan::compile(&variant.graph, &target, &options)
@@ -1157,7 +1097,9 @@ fn i32_slot_gather_variants_compiled_match_cpu_bit_exact() {
         Ok(HostTensor::f32(
             out.shape.clone(),
             bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect(),
         ))

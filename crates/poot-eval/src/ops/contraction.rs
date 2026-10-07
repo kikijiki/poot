@@ -1,5 +1,4 @@
-//! Contractions: `MatMul`, `IndexedMatMul`, `DenseContraction` over an F32 or F16 weight,
-//! and the F32-activation times BF16-weight `MatMul`/`DenseContraction` of the BF16 table.
+//! Contractions: `MatMul` (every contraction composite decomposes into it) and `IndexedMatMul`.
 
 use poot_graph_ir::ValueId;
 use poot_tensor::HostTensor;
@@ -20,19 +19,8 @@ pub(crate) fn matmul_to(
     matmul(a, b, out_shape)
 }
 
-/// `DenseContraction` over an F32 or (Card 1007) F16 weight held in checkpoint `[N, K]` order:
-/// `out[.., m, n] = sum over k of a[.., m, k] * w[n, k]`, exactly `MatMul(a, Transpose([1, 0], w))`, the
-/// equation the fold replaces.
-pub(crate) fn dense_contraction(
-    a: &HostTensor,
-    w: &HostTensor,
-    out_shape: &[usize],
-) -> Result<HostTensor, EvalError> {
-    matmul(a, &super::movement::transpose(w, &[1, 0])?, out_shape)
-}
-
 /// `IndexedMatMul`: `out[m, n] = sum_k x[m, k] * W[idx[m], k, n]`, each row contracting against its own
-/// expert (the eager oracle for `indexed_matmul_dt`). `x` and `w` are read through
+/// expert (the eager oracle for the generated indexed contraction). `x` and `w` are read through
 /// [`HostTensor::to_f32`] (either may be BF16/F16); `idx` is F32 or I32 words.
 pub(crate) fn indexed_matmul(
     x: &HostTensor,
@@ -141,41 +129,6 @@ fn extend_idx(batch: &[usize], tail: &[usize]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Card 645: the F32 `DenseContraction` oracle reads the weight in checkpoint `[N, K]` order, so
-    /// `out[m, n] = sum over k of a[m, k] * w[n, k]`. The values are chosen so reading `w` as `[K, N]` cannot
-    /// produce them.
-    #[test]
-    fn dense_contraction_contracts_the_last_axis_of_a_checkpoint_order_weight() {
-        let a = HostTensor::f32(vec![2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let w = HostTensor::f32(
-            vec![4, 3],
-            vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 2.0, 2.0, 2.0, 1.0, 1.0, 1.0],
-        );
-        let out = dense_contraction(&a, &w, &[2, 4]).unwrap();
-        assert_eq!(out.shape(), [2, 4]);
-        assert_eq!(
-            out.as_f32().unwrap().to_vec(),
-            vec![4.0, 2.0, 12.0, 6.0, 10.0, 5.0, 30.0, 15.0]
-        );
-    }
-
-    /// Card 1007: an F16 weight (binary16 words 0x3c00 = 1.0, 0x4000 = 2.0) contracts to the same values as
-    /// its F32 twin above, read in checkpoint `[N, K]` order and widened exactly.
-    #[test]
-    fn dense_contraction_reads_an_f16_checkpoint_order_weight() {
-        let a = HostTensor::f32(vec![2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let (one, two) = (0x3c00u16, 0x4000u16);
-        let w = HostTensor::f16(
-            vec![4, 3],
-            vec![one, 0, one, 0, one, 0, two, two, two, one, one, one],
-        );
-        let out = dense_contraction(&a, &w, &[2, 4]).unwrap();
-        assert_eq!(
-            out.as_f32().unwrap().to_vec(),
-            vec![4.0, 2.0, 12.0, 6.0, 10.0, 5.0, 30.0, 15.0]
-        );
-    }
 
     /// ADR-0101 decision 4 (R470-007): the reference `MatMul` computes every product. A zero activation times
     /// an Inf weight is NaN (IEEE), so the output is NaN; skipping the zero activation hid it as 0.

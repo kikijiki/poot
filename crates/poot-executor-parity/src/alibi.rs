@@ -14,7 +14,6 @@ use poot_tensor::{DType, HostTensor};
 use poot_test_util::StepFixture;
 
 use crate::{Fixture, step_fixtures, store_for};
-use poot_graph_plan::FusionPolicy;
 
 const HEADS: usize = 6;
 const D: usize = 4;
@@ -48,7 +47,7 @@ fn fixture(name: &'static str, tokens: usize, starts: &[usize]) -> Fixture {
         graph,
         store,
         steps,
-        fusion: FusionPolicy::Full,
+        guarded: false,
     }
 }
 
@@ -68,8 +67,10 @@ fn stored_f32(store: &WeightStore, name: &str) -> Vec<f64> {
     dense
         .bytes()
         .as_slice()
-        .chunks_exact(4)
-        .map(|b| f64::from(f32::from_le_bytes(b.try_into().unwrap())))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f64::from(f32::from_le_bytes(*b)))
         .collect()
 }
 
@@ -81,8 +82,10 @@ fn positions(step: &[StepFixture]) -> Vec<usize> {
     pos.tensor
         .view()
         .bytes()
-        .chunks_exact(4)
-        .map(|b| i32::from_le_bytes(b.try_into().unwrap()) as usize)
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| i32::from_le_bytes(*b) as usize)
         .collect()
 }
 

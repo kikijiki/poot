@@ -8,7 +8,7 @@ use poot_tensor::{DType, HostTensor};
 
 use poot_load::LoadError;
 use poot_load::safetensors::{decode_dense, dense_bytes};
-use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
+use poot_quant::weights::{DenseWeight, WeightStore};
 
 /// A stored dense tensor as its own dtype: a BF16/F16 entry keeps its stored words (the GPU
 /// zero-copy upload form, never widened here), every other float dtype is decoded to F32.
@@ -31,23 +31,4 @@ fn dense_tensor(dense: &DenseWeight) -> Result<HostTensor, LoadError> {
 /// (`transpose2d`, `row_slice`, ...) already operates on.
 pub fn materialize_dense(store: &WeightStore, name: &str) -> Result<HostTensor, LoadError> {
     dense_tensor(dense_bytes(store, name)?)
-}
-
-/// Like [`materialize_dense`], but removes the entry from `store` first: once the returned
-/// [`HostTensor`] (or the caller's transform of it) is the only thing referencing this tensor's
-/// bytes, the store's own copy is gone rather than staying resident until the whole store drops. A
-/// checkpoint loader that reads every tensor exactly once (`build_weights`'s generic loop, e.g.)
-/// uses this so the store's footprint shrinks as it drains, keeping peak host RSS near one file-size
-/// instead of file-size-plus-final-weight-map-size (card 540b's M4 RSS gate, SC-001).
-pub fn take_dense(store: &mut WeightStore, name: &str) -> Result<HostTensor, LoadError> {
-    let dense = match store.remove(name) {
-        Some(WeightEntry::Dense(dense)) => dense,
-        Some(WeightEntry::Packed(_)) => {
-            return Err(LoadError::SafeTensors(format!(
-                "{name}: expected a dense stored tensor, found a packed entry"
-            )));
-        }
-        None => return Err(LoadError::SafeTensors(format!("missing tensor {name}"))),
-    };
-    dense_tensor(&dense)
 }

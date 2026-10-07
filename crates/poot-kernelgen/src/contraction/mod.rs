@@ -6,11 +6,16 @@
 //! implements it.
 
 mod dense;
+mod epilogue;
 mod gemv;
+mod indexed;
 
 pub(crate) use dense::DenseLoad;
 pub(crate) use dense::dense_contraction;
-pub(crate) use gemv::{GemvLaunch, gemv_body};
+pub(crate) use epilogue::emit_epilogue;
+pub use epilogue::{Epilogue, EpilogueInput, EpilogueLeaf, EpilogueStep};
+pub(crate) use gemv::{GemvEpilogue, GemvLaunch, gemv_body};
+pub(crate) use indexed::indexed_contraction;
 
 use crate::KernelGenError;
 

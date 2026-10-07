@@ -567,7 +567,7 @@ fn bind_batched_decode_mrope_oracle(
                 HostTensor::i32(vec![3, batch], packed)
             }
             Storage::Const | Storage::State => weight(m.name.as_deref().unwrap(), &m.aval.shape),
-            Storage::Computed(computed) => HostTensor::f32(computed.shape(), computed.values_f32()),
+            Storage::Computed(computed) => computed.tensor(),
             Storage::Slot(other) => panic!("unexpected batched decode slot: {other:?}"),
             Storage::Device => panic!("unexpected device input in CPU oracle"),
         };

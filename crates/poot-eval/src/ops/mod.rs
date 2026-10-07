@@ -18,8 +18,7 @@ pub(crate) mod reduce;
 pub(crate) mod sampling;
 
 pub(crate) use packed::{
-    evaluate_packed_contraction, evaluate_packed_dequant, evaluate_packed_row_gather,
-    packed_components, packed_row_ids,
+    evaluate_packed_dequant, evaluate_packed_row_gather, packed_components, packed_row_ids,
 };
 
 use poot_tensor::HostTensor;

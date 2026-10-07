@@ -359,7 +359,7 @@ pub(super) fn eval_step(
             }
             Storage::Slot(other) => panic!("unexpected slot {other:?}"),
             Storage::Const => named_weight(m.name.as_deref().unwrap(), &m.aval.shape),
-            Storage::Computed(c) => HostTensor::f32(c.shape(), c.values_f32()),
+            Storage::Computed(c) => c.tensor(),
             Storage::State => continue,
             Storage::Device => unreachable!(),
         };

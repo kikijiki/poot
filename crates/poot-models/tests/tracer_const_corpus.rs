@@ -17,40 +17,10 @@ use std::collections::BTreeMap;
 use poot_executor_parity::dense::{Dense, Family, paged_step, plain, step};
 use poot_graph_ir::{Graph, Storage};
 use poot_models::bloom::{BloomConfig, trace_bloom_decode_kv_masked, trace_bloom_prefill};
-use poot_models::deepseek2::{
-    DeepseekV2Config, DeepseekV2MoeParams, trace_deepseek2_decode_kv_masked,
-    trace_deepseek2_prefill,
-};
-use poot_models::deepseek3::{
-    DeepseekV3MoeParams, trace_deepseek3_decode_kv_masked,
-    trace_deepseek3_decode_kv_masked_batched_shared_pool, trace_deepseek3_prefill,
-    trace_deepseek3_prefill_kv_shared_pool,
-};
-use poot_models::deepseek32::{
-    DsaConfig, trace_deepseek32_dsa_decode, trace_deepseek32_dsa_prefill,
-};
-use poot_models::gpt_oss::{GptOssParams, trace_gptoss_decode_kv_masked, trace_gptoss_prefill};
-use poot_models::granite::{
-    GraniteParams, MoeShape, trace_granite_decode_kv_masked, trace_granite_prefill,
-    trace_granite_prefill_kv, trace_granite_prefill_kv_shared_pool,
-};
-use poot_models::mixtral::{
-    MixtralParams, trace_mixtral_decode_kv_masked, trace_mixtral_prefill,
-    trace_mixtral_prefill_kv_shared_pool,
-};
 use poot_models::model::{LogitRows, Phase};
 use poot_models::mpt::{MptConfig, trace_mpt_decode_kv_masked, trace_mpt_prefill};
-use poot_models::nemotron_h::{
-    NemotronHAttnConfig, NemotronHConfig, NemotronHLayerKind, NemotronHMambaConfig,
-    trace_nemotron_h_decode, trace_nemotron_h_prefill,
-};
-use poot_models::olmoe::{OlmoeParams, trace_olmoe_decode_kv_masked, trace_olmoe_prefill};
 use poot_models::qwen2::{
     trace_prefill_kv_embeds, trace_prefill_mrope, trace_qwen2_5_vl_prefill_kv_embeds,
-};
-use poot_models::qwen3moe::{
-    Qwen3MoeParams, trace_qwen3_moe_decode_kv_masked, trace_qwen3_moe_prefill,
-    trace_qwen3_moe_prefill_kv, trace_qwen3_moe_prefill_kv_shared_pool,
 };
 use poot_models::qwen3next::{Qwen3NextConfig, qwen3next_decode_trace};
 use poot_models::qwen38::{
@@ -127,61 +97,6 @@ fn dense_trace(family: Family, phase: Phase, shape: poot_models::model::StepShap
     )
 }
 
-fn granite_params(moe: Option<MoeShape>) -> GraniteParams {
-    GraniteParams {
-        moe,
-        embed_mult: 1.0,
-        attn_mult: 1.0,
-        residual_mult: 1.0,
-        logits_scale: 1.0,
-    }
-}
-
-fn granite_moe() -> MoeShape {
-    MoeShape {
-        n_experts: 6,
-        top_k: 2,
-        inter: 12,
-    }
-}
-
-fn qwen3_moe_params() -> Qwen3MoeParams {
-    Qwen3MoeParams {
-        n_experts: 6,
-        top_k: 2,
-        inter: 12,
-        sparse_layer: vec![false, true],
-    }
-}
-
-fn mixtral_params() -> MixtralParams {
-    MixtralParams {
-        n_experts: 6,
-        top_k: 2,
-        inter: 12,
-    }
-}
-
-fn olmoe_params() -> OlmoeParams {
-    OlmoeParams {
-        n_experts: 6,
-        top_k: 2,
-        inter: 12,
-        norm_topk_prob: false,
-    }
-}
-
-fn gpt_oss_params() -> GptOssParams {
-    GptOssParams {
-        n_experts: 6,
-        top_k: 2,
-        inter: 12,
-        swiglu_limit: 2.5,
-        sliding_window: 2,
-        layer_is_sliding: vec![true, false],
-    }
-}
-
 fn bloom_cfg() -> BloomConfig {
     BloomConfig {
         vocab: 24,
@@ -215,88 +130,6 @@ fn smollm3_cfg() -> Smollm3Config {
         eps: 1e-6,
         max_pos: 32,
         use_rope: vec![true, false],
-    }
-}
-
-fn deepseek_cfg(q_lora_rank: Option<usize>) -> DeepseekV2Config {
-    DeepseekV2Config {
-        vocab: 24,
-        hidden: 16,
-        layers: LAYERS,
-        n_heads: 4,
-        q_lora_rank,
-        kv_lora_rank: 6,
-        qk_nope_head_dim: 5,
-        qk_rope_head_dim: 4,
-        v_head_dim: 7,
-        eps: 1e-5,
-        max_pos: 32,
-        rope_theta: 10_000.0,
-        yarn: None,
-    }
-}
-
-fn deepseek2_moe() -> DeepseekV2MoeParams {
-    DeepseekV2MoeParams {
-        n_routed_experts: 6,
-        top_k: 2,
-        moe_inter: 8,
-        n_shared_experts: 2,
-        dense_inter: 10,
-        first_k_dense_replace: 1,
-        n_group: 1,
-        topk_group: 1,
-        routed_scaling_factor: 1.0,
-    }
-}
-
-fn deepseek3_moe() -> DeepseekV3MoeParams {
-    DeepseekV3MoeParams {
-        n_routed_experts: 8,
-        top_k: 3,
-        moe_inter: 6,
-        n_shared_experts: 1,
-        dense_inter: 10,
-        first_k_dense_replace: 1,
-        n_group: 1,
-        topk_group: 1,
-        routed_scaling_factor: 1.0,
-    }
-}
-
-fn dsa_cfg() -> DsaConfig {
-    DsaConfig {
-        index_n_heads: 2,
-        index_head_dim: 4,
-        index_topk: 3,
-    }
-}
-
-fn nemotron_h_cfg() -> NemotronHConfig {
-    NemotronHConfig {
-        vocab_size: 12,
-        hidden: 6,
-        mlp_inter: 10,
-        eps: 1e-6,
-        pattern: vec![
-            NemotronHLayerKind::Mamba,
-            NemotronHLayerKind::Attention,
-            NemotronHLayerKind::Mlp,
-        ],
-        mamba: NemotronHMambaConfig {
-            hidden: 6,
-            mamba_num_heads: 4,
-            mamba_head_dim: 2,
-            n_groups: 2,
-            ssm_state: 3,
-            conv_kernel: 3,
-        },
-        attn: NemotronHAttnConfig {
-            hidden: 6,
-            num_heads: 4,
-            num_kv_heads: 2,
-            head_dim: 2,
-        },
     }
 }
 
@@ -524,88 +357,6 @@ fn corpus() -> Vec<Row> {
             },
         },
         Row {
-            name: "granite.prefill",
-            build: |prompt, _| trace_granite_prefill(base_cfg(), granite_params(None), prompt),
-        },
-        Row {
-            name: "granite.prefill_kv",
-            build: |prompt, cap| {
-                trace_granite_prefill_kv(base_cfg(), granite_params(None), prompt, cap)
-            },
-        },
-        Row {
-            name: "granite.prefill_shared_pool",
-            build: |prompt, cap| {
-                trace_granite_prefill_kv_shared_pool(base_cfg(), granite_params(None), prompt, cap)
-            },
-        },
-        Row {
-            name: "granite.decode",
-            build: |_, cap| trace_granite_decode_kv_masked(base_cfg(), granite_params(None), cap),
-        },
-        Row {
-            name: "granitemoe.prefill",
-            build: |prompt, _| {
-                trace_granite_prefill(base_cfg(), granite_params(Some(granite_moe())), prompt)
-            },
-        },
-        Row {
-            name: "granitemoe.decode",
-            build: |_, cap| {
-                trace_granite_decode_kv_masked(base_cfg(), granite_params(Some(granite_moe())), cap)
-            },
-        },
-        Row {
-            name: "qwen3_moe.prefill",
-            build: |prompt, _| trace_qwen3_moe_prefill(base_cfg(), qwen3_moe_params(), prompt),
-        },
-        Row {
-            name: "qwen3_moe.prefill_kv",
-            build: |prompt, cap| {
-                trace_qwen3_moe_prefill_kv(base_cfg(), qwen3_moe_params(), prompt, cap)
-            },
-        },
-        Row {
-            name: "qwen3_moe.prefill_shared_pool",
-            build: |prompt, cap| {
-                trace_qwen3_moe_prefill_kv_shared_pool(base_cfg(), qwen3_moe_params(), prompt, cap)
-            },
-        },
-        Row {
-            name: "qwen3_moe.decode",
-            build: |_, cap| trace_qwen3_moe_decode_kv_masked(base_cfg(), qwen3_moe_params(), cap),
-        },
-        Row {
-            name: "mixtral.prefill",
-            build: |prompt, _| trace_mixtral_prefill(base_cfg(), mixtral_params(), prompt),
-        },
-        Row {
-            name: "mixtral.prefill_shared_pool",
-            build: |prompt, cap| {
-                trace_mixtral_prefill_kv_shared_pool(base_cfg(), mixtral_params(), prompt, cap)
-            },
-        },
-        Row {
-            name: "mixtral.decode",
-            build: |_, cap| trace_mixtral_decode_kv_masked(base_cfg(), mixtral_params(), cap),
-        },
-        Row {
-            name: "olmoe.prefill",
-            build: |prompt, _| trace_olmoe_prefill(base_cfg(), olmoe_params(), prompt),
-        },
-        Row {
-            name: "olmoe.decode",
-            build: |_, cap| trace_olmoe_decode_kv_masked(base_cfg(), olmoe_params(), cap),
-        },
-        Row {
-            name: "gpt_oss.prefill",
-            build: |prompt, _| trace_gptoss_prefill(base_cfg(), gpt_oss_params(), prompt),
-        },
-        Row {
-            name: "gpt_oss.decode",
-            build: |_, cap| trace_gptoss_decode_kv_masked(base_cfg(), gpt_oss_params(), cap),
-        },
-        Row {
             name: "bloom.prefill",
             build: |prompt, _| trace_bloom_prefill(&bloom_cfg(), prompt),
         },
@@ -628,78 +379,6 @@ fn corpus() -> Vec<Row> {
         Row {
             name: "smollm3.decode",
             build: |_, cap| trace_smollm3_decode_kv_masked(&smollm3_cfg(), cap),
-        },
-        Row {
-            name: "deepseek2.prefill",
-            build: |prompt, _| {
-                trace_deepseek2_prefill(deepseek_cfg(Some(3)), deepseek2_moe(), prompt)
-            },
-        },
-        Row {
-            name: "deepseek2.decode",
-            build: |_, cap| {
-                trace_deepseek2_decode_kv_masked(deepseek_cfg(Some(3)), deepseek2_moe(), cap)
-            },
-        },
-        Row {
-            name: "deepseek3.prefill",
-            build: |prompt, _| {
-                trace_deepseek3_prefill(deepseek_cfg(Some(3)), deepseek3_moe(), prompt)
-            },
-        },
-        Row {
-            name: "deepseek3.prefill_shared_pool",
-            build: |prompt, cap| {
-                trace_deepseek3_prefill_kv_shared_pool(
-                    deepseek_cfg(Some(3)),
-                    deepseek3_moe(),
-                    prompt,
-                    cap,
-                )
-            },
-        },
-        Row {
-            name: "deepseek3.decode",
-            build: |_, cap| {
-                trace_deepseek3_decode_kv_masked(deepseek_cfg(Some(3)), deepseek3_moe(), cap)
-            },
-        },
-        Row {
-            name: "deepseek3.decode_batched_pool",
-            build: |_, cap| {
-                trace_deepseek3_decode_kv_masked_batched_shared_pool(
-                    deepseek_cfg(Some(3)),
-                    deepseek3_moe(),
-                    cap,
-                    2,
-                    cap,
-                )
-            },
-        },
-        Row {
-            name: "deepseek32.prefill",
-            build: |prompt, _| {
-                trace_deepseek32_dsa_prefill(
-                    deepseek_cfg(Some(5)),
-                    dsa_cfg(),
-                    deepseek3_moe(),
-                    prompt,
-                )
-            },
-        },
-        Row {
-            name: "deepseek32.decode",
-            build: |_, cap| {
-                trace_deepseek32_dsa_decode(deepseek_cfg(Some(5)), dsa_cfg(), deepseek3_moe(), cap)
-            },
-        },
-        Row {
-            name: "nemotron_h.prefill",
-            build: |prompt, _| trace_nemotron_h_prefill(&nemotron_h_cfg(), prompt),
-        },
-        Row {
-            name: "nemotron_h.decode",
-            build: |_, cap| trace_nemotron_h_decode(&nemotron_h_cfg(), cap),
         },
         Row {
             name: "qwen38.prefill",
@@ -777,7 +456,7 @@ fn call_dependent_consts(a: &Graph, b: &Graph) -> Vec<String> {
 fn traced_corpus_counts_zero_call_dependent_const_avals() {
     let rows = corpus();
     assert!(
-        rows.len() >= 55,
+        rows.len() >= 28,
         "the corpus must cover every family's tracers; got {} rows",
         rows.len()
     );
@@ -800,8 +479,6 @@ fn traced_corpus_counts_zero_call_dependent_const_avals() {
 /// Card 550's dense families, by this corpus's row names: every row card 550 converted to the new
 /// Pos/mask contract (`Slot::Pos` drives an in-graph `causal_mask_from_pos`/`alibi_mask_from_pos`
 /// instead of a host-built `Slot::Mask` step input or tracer-synthesized mask `Storage::Const`).
-/// Deliberately excluded: `granite.prefill_shared_pool` (delegates to the MoE shared-pool infra,
-/// deferred to card 567).
 const CARD_550_DENSE_ROWS: &[&str] = &[
     "qwen2.decode",
     "qwen2.decode_batched",
@@ -819,9 +496,6 @@ const CARD_550_DENSE_ROWS: &[&str] = &[
     "gemma3.decode",
     "gemma2.prefill",
     "gemma2.decode",
-    "granite.prefill",
-    "granite.prefill_kv",
-    "granite.decode",
     "bloom.prefill",
     "bloom.decode",
     "mpt.prefill",

@@ -15,7 +15,7 @@ pub(crate) fn encode_q8_0(vals: &[f32]) -> Vec<u8> {
         "Q8_0 needs a multiple of 32 values"
     );
     let mut out = Vec::with_capacity((vals.len() / 32) * 34);
-    for blk in vals.chunks_exact(32) {
+    for blk in vals.as_chunks::<32>().0.iter() {
         let amax = blk.iter().fold(0.0f32, |a, &x| a.max(x.abs()));
         let d = amax / 127.0;
         out.extend_from_slice(&f32_to_f16(d).to_le_bytes());
@@ -50,7 +50,7 @@ pub(crate) fn encode_q4_0(vals: &[f32]) -> Vec<u8> {
         }
     };
     let mut out = Vec::with_capacity((vals.len() / 32) * 18);
-    for blk in vals.chunks_exact(32) {
+    for blk in vals.as_chunks::<32>().0.iter() {
         let amax = blk.iter().fold(0.0f32, |a, &x| a.max(x.abs()));
         let d = amax / 8.0;
         out.extend_from_slice(&f32_to_f16(d).to_le_bytes());
@@ -81,7 +81,7 @@ pub(crate) fn encode_q5_0(vals: &[f32]) -> Vec<u8> {
         }
     };
     let mut out = Vec::with_capacity((vals.len() / 32) * 22);
-    for blk in vals.chunks_exact(32) {
+    for blk in vals.as_chunks::<32>().0.iter() {
         let amax = blk.iter().fold(0.0f32, |a, &x| a.max(x.abs()));
         let d = amax / 16.0;
         out.extend_from_slice(&f32_to_f16(d).to_le_bytes());
@@ -170,7 +170,7 @@ pub(crate) fn encode_mxfp4(vals: &[f32]) -> Vec<u8> {
         "MXFP4 needs a multiple of 32 values"
     );
     let mut out = Vec::with_capacity((vals.len() / 32) * 17);
-    for blk in vals.chunks_exact(32) {
+    for blk in vals.as_chunks::<32>().0.iter() {
         let amax = blk.iter().fold(0.0f32, |a, &x| a.max(x.abs()));
         let e: u8 = if amax > 0.0 {
             (amax.log2().floor() - 2.0 + 127.0).clamp(0.0, 254.0) as u8

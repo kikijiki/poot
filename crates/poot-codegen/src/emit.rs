@@ -14,13 +14,10 @@ use poot_kernel_ir::{
 
 use crate::{EmitError, Target};
 
-/// Body -> target-shaped textual LLVM IR, plus the ordinal positions (card 628) of every
-/// `Rvalue::BinaryOpNoContract` float binop among the module's `OpFAdd`/`OpFSub`/`OpFMul` stream - empty
-/// for every target but `SpirvVulkan` (Nvptx/AmdGcn mark the op itself, as a constrained intrinsic; see
-/// `Emitter::emit_binop_no_contract`). `compile_with` uses the ordinals to decorate the compiled SPIR-V
-/// module `NoContraction` (`spirv_postprocess::fix_no_contraction`); `poot_test_util::kernel_fixtures`'s
-/// golden-IR helper discards them (card 671: its callers never needed the ordinals, only the IR text).
-pub fn emit_llvm_ir_marked(body: &Body, target: Target) -> Result<(String, Vec<usize>), EmitError> {
+/// Body -> target-shaped textual LLVM IR. A `Rvalue::BinaryOpNoContract` is marked in the IR itself, per
+/// target (see `Emitter::emit_binop_no_contract`), so the text alone carries every marker `compile_with`'s
+/// post-processing needs.
+pub fn emit_llvm_ir(body: &Body, target: Target) -> Result<String, EmitError> {
     // Every stage below indexes locals, blocks and workgroup arrays directly; a malformed body must be rejected
     // as a typed error first, not panic or reach llc.
     body.verify()?;
@@ -41,8 +38,7 @@ pub fn emit_llvm_ir_marked(body: &Body, target: Target) -> Result<(String, Vec<u
     }
     let mut e = Emitter::new(&structured, target, error_accum);
     e.run()?;
-    let ordinals = std::mem::take(&mut e.no_contract_ordinals);
-    Ok((e.finish(), ordinals))
+    Ok(e.finish())
 }
 
 struct Emitter<'a> {
@@ -54,43 +50,12 @@ struct Emitter<'a> {
     declares: BTreeSet<String>,
     /// SPIR-V: whether the length buffer handle/declares are needed.
     uses_len: bool,
-    /// The matrix-fragment op (card 530) is target-neutral in the IR: `WmmaLoad`/`WmmaMma`/`WmmaStore`/
-    /// `WmmaZero`'s operands are each one opaque fragment handle (a `Local` whose declared `Ty` is a marker
-    /// only). SPIR-V's fragment value is one opaque `target("spirv.CooperativeMatrixKHR", ...)` value with
-    /// no addressable components, so it cannot go through the ordinary alloca/`store_place` path (Vulkan's
-    /// Logical addressing cannot store an opaque handle type); this map tracks it as a live SSA register
-    /// instead (SPIR-V only - see `wmma.rs`'s `frag_llty`/`emit_wmma_*_coopmat`). Straight-line use only: a
-    /// loop-carried coopmat fragment would need a `phi`, which this emitter cannot insert (`wmma_tile`'s
-    /// single-K-step body never needs one; `matmul_tensorcore_coopmat` is K==16-only for the same reason).
-    /// AMDGCN and NVPTX fragments are ordinary alloca'd locals instead (register-group aggregate/vector
-    /// types `wmma.rs`'s `frag_alloca_llty` picks in `emit_entry`), so they loop-carry like any other local
-    /// and never populate this map.
-    frag_regs: std::collections::HashMap<u32, (String, String)>,
-    /// Every `Local` this body uses as a matrix-fragment handle (any `dst` of `WmmaLoad`/`WmmaLoadLds`/
-    /// `WmmaZero`/`WmmaMma`), with the dtype and whether it is the f32 accumulator (`WmmaZero`/`WmmaMma`'s
-    /// `dst`) or an A/B operand fragment (`WmmaLoad`/`WmmaLoadLds`'s `dst`, carrying `dtype`). Computed once
-    /// by `wmma::scan_frag_layout` before `emit_entry` runs, so AMDGCN/NVPTX can alloca each fragment local
-    /// at its real physical size instead of its marker `Ty`'s scalar size.
-    frag_layout: std::collections::HashMap<u32, (poot_kernel_ir::WmmaDtype, bool)>,
     /// SpirvVulkan only: the per-thread fault-accumulator local `debranch::debranch_traps_for_spirv` added
     /// (card 531c), when the body had a `Trap`. `emit_entry` binds the reserved error-word resource
     /// exactly when this is `Some`; `emit_terminator`'s `Terminator::Return` arm flushes the accumulator's
     /// current value into it there. `None` on every other target, and on SpirvVulkan when the body has no
     /// `Assert`/`Unreachable` at all.
     error_accum: Option<Local>,
-    /// SpirvVulkan only (card 628): a running count of every float `Add`/`Sub`/`Mul` emitted so far
-    /// (`Rvalue::BinaryOp` and `Rvalue::BinaryOpNoContract` alike), i.e. the ordinal each one will have
-    /// among the compiled module's `OpFAdd`/`OpFSub`/`OpFMul` stream. llc's SPIR-V backend at `-O0` (the
-    /// only level `SpirvVulkan` ever compiles at) emits exactly one such instruction per source op, in
-    /// program order, with no CSE/reordering/DCE (checked directly), so this ordinal reliably identifies
-    /// the instruction post-compilation - the only way to, since llc's SPIR-V backend does not translate any
-    /// LLVM-level marker into a `NoContraction` decoration itself (checked directly against the shipped
-    /// llc: neither a missing nor a present `contract` fast-math flag changes the emitted SPIR-V at all).
-    float_binop_ordinal: usize,
-    /// SpirvVulkan only (card 628): the [`Self::float_binop_ordinal`] values of every
-    /// `Rvalue::BinaryOpNoContract` emitted. `emit_llvm_ir_marked` returns this so `compile_with` can
-    /// decorate the corresponding compiled instructions `NoContraction` (`spirv_postprocess`).
-    no_contract_ordinals: Vec<usize>,
     /// Nvptx/AmdGcn only (card 628): whether any `Rvalue::BinaryOpNoContract` was emitted, so
     /// `emit_signature`/`emit_footer` add the `strictfp` function attribute the constrained intrinsics
     /// (`llvm.experimental.constrained.{fadd,fsub,fmul}`) require.

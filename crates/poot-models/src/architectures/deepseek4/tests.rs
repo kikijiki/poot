@@ -2627,7 +2627,9 @@ every layer"
             assert_eq!(out.shape(), vec![tokens.len(), 2]);
             out.as_f32()
                 .unwrap()
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|row| [row[0] as i32, row[1] as i32])
                 .collect()
         }

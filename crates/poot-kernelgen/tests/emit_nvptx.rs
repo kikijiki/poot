@@ -12,6 +12,50 @@ use poot_test_util::kernel_fixtures::{
     gather_axis0_dt, matmul_kernel, reduce_last, square_kernel, wg_sum,
 };
 
+/// The f32-element movement `op` into `out_shape`.
+fn movement(name: &str, out_shape: Vec<usize>, op: kg::MovementOp) -> poot_kernel_ir::Body {
+    kg::movement_body(
+        name,
+        &kg::MovementSpec::new(kg::Storage::Elements { carrier: Ty::F32 }, out_shape, op),
+        None,
+    )
+    .expect("a valid movement request")
+}
+
+/// The attention generator's decode body through the one generation seam, on a PTX device.
+fn attention_decode_body() -> poot_kernel_ir::Body {
+    let spec = kg::AttentionSpec {
+        batch: 1,
+        hq: 4,
+        n_rep: 2,
+        lq: 1,
+        lk: 6,
+        dk: 8,
+        dv: 8,
+        key: kg::KeyLayout::Single,
+        score: kg::ScoreTransform::Scale {
+            scale_bits: 0.35355338f32.to_bits(),
+        },
+        mask: kg::MaskKind::Broadcast,
+        bound: kg::KeyBound::Static,
+        schedule: kg::AttentionSchedule::Streaming { lanes: 4 },
+    };
+    let limits = kg::BodyLimits {
+        max_instructions: std::num::NonZeroUsize::new(1 << 22).unwrap(),
+        max_locals: std::num::NonZeroUsize::new(1 << 18).unwrap(),
+    };
+    let mut body = kg::generate(
+        &kg::KernelRequest::Attention(spec),
+        &poot_target::DeviceCaps::ptx_default(),
+        &limits,
+    )
+    .expect("the attention request generates")
+    .body;
+    // The PTX entry and the staged file carry the body's name; `poot-ptx-check` runs `attention_decode`.
+    body.name = "attention_decode".to_string();
+    body
+}
+
 #[test]
 fn emit_nvptx_kernel_set() {
     fn have_llc() -> bool {
@@ -33,7 +77,7 @@ fn emit_nvptx_kernel_set() {
         &[4],
         &[&[4], &[4]],
         &kg::FusedKernel {
-            n_leaves: 2,
+            leaf_tys: vec![kg::LeafTy::F32; 2],
             steps: vec![kg::FusedStep {
                 op: kg::FusedScalarOp::Binary(BinOp::Add),
                 inputs: vec![kg::FusedInput::Leaf(0), kg::FusedInput::Leaf(1)],
@@ -52,7 +96,7 @@ fn emit_nvptx_kernel_set() {
             &[4],
             &[&[4]],
             &kg::FusedKernel {
-                n_leaves: 1,
+                leaf_tys: vec![kg::LeafTy::F32; 1],
                 steps: vec![kg::FusedStep {
                     op,
                     inputs: vec![kg::FusedInput::Leaf(0)],
@@ -66,15 +110,27 @@ fn emit_nvptx_kernel_set() {
         fused_unary("tanh", kg::FusedScalarOp::Tanh),
         fused_unary("erf", kg::FusedScalarOp::Erf),
         reduce_last("reduce", BinOp::Add, 4, 0.0),
-        kg::broadcast("bcast", &[2, 3], &[3]),
+        movement(
+            "bcast",
+            vec![2, 3],
+            kg::MovementOp::Broadcast { in_shape: vec![3] },
+        ),
         gather_axis0_dt("gather", Ty::F32, 2),
-        kg::dyn_update_slice_dt("dus", Ty::F32, &[2, 4, 3], 1, 2, 1),
+        movement(
+            "dus",
+            vec![2, 4, 3],
+            kg::MovementOp::UpdateSlice {
+                update_shape: vec![2, 1, 3],
+                axis: 1,
+                index: kg::UpdateIndex::Static(2),
+            },
+        ),
         fused_pointwise,
         // LDS + barrier: the NVPTX .shared + bar.sync lowering.
         wg_sum("wg_sum", 8),
-        // the flash-attention decode kernel (online softmax, private o[D]), NVPTX-only. GQA decode shapes: Hq=4,
-        // n_rep=2, cap=6, D=8.
-        kg::flash_attention_decode("flash_decode", 4, 2, 6, 8, 0.35355338, false),
+        // the attention kernel (online softmax, LDS partials): a GQA decode, Hq=4, n_rep=2, 6 keys, D=8, over 4
+        // lanes.
+        attention_decode_body(),
         // base codegen fixtures, so this one emit also stages everything poot-ptx-check needs (one dir).
         fixtures::add_kernel(),
         square_kernel(),

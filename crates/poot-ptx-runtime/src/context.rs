@@ -123,7 +123,8 @@ fn caps_from_attributes(total_memory: u64, attrs: &CudaAttributes) -> poot_targe
         tensor_core: poot_target::TensorCoreSupport::from_cuda_compute_capability(
             attrs.compute_capability_major,
         ),
-        known_miscompiles: poot_target::KnownMiscompiles::default(),
+        // A device's miscompiles are the target family's known facts, not something CUDA reports.
+        known_miscompiles: poot_target::DeviceCaps::ptx_default().known_miscompiles,
         compute_units: attrs.multiprocessor_count,
     }
 }
@@ -797,6 +798,19 @@ mod caps_tests {
         );
         assert_eq!(caps.compute_units, 99);
         assert_eq!(caps.tensor_core, TensorCoreSupport::NvidiaWmma16x16x16Sm80);
+    }
+
+    /// The routed-expert hang is a known miscompile of the PTX target family, so a live device's caps
+    /// carry it for `compile` to read (the family test that chose the guard is gone). Mutation: build
+    /// the caps with `KnownMiscompiles::default()`; this row goes red.
+    #[test]
+    fn a_live_device_carries_the_ptx_target_miscompile_facts() {
+        let caps = caps_from_attributes(1, &sentinel(9));
+        assert_eq!(
+            caps.known_miscompiles,
+            poot_target::DeviceCaps::ptx_default().known_miscompiles
+        );
+        assert!(caps.known_miscompiles.routed_expert_tiling_hang);
     }
 
     /// A pre-Ampere device is a confirmed absence of the bf16 fragments poot's kernels use.

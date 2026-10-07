@@ -6,12 +6,12 @@
 //! any length, not a baked-in size); the naive reductions loop serially over the reduced dim (no LDS). The
 //! standard skeleton is `i = tid.x; if i < out.len() { ... }`.
 
+mod attention;
 mod contraction;
 mod data_movement;
 mod elementwise;
 mod emit;
 mod error;
-mod flash;
 mod fp8;
 mod fused;
 mod gemv;
@@ -24,22 +24,28 @@ mod synchronization;
 mod tiled_region;
 mod wmma;
 
+pub use attention::{
+    AttentionSchedule, AttentionSpec, KeyBound, KeyLayout, MaskKind, ScoreTransform,
+};
+
 // The one generation seam. `poot-graph-plan` plans every generated kernel through `generate` and the request
 // types; nothing else it needs from this crate is a generator.
 pub use error::{BodyResource, BodyStage, KernelGenError};
 pub use request::{
-    AttentionSpec, BodyUse, CastSpec, ContractionSpec, E4m3Movement, ElementwiseSpec, Fold,
-    FragmentUse, Generated, I32Binary, KernelRequest, KernelRequirements, Launch, MatmulShapes,
-    MovementSpec, PackedRequest, PointwiseForm, PointwiseSpec, RopeSpec, RowSpec, SerialWork,
-    TopKSpec, UnaryOp, UnmeasurableLds, ValueBinary, ViewOperand, fold_groups, generate,
+    BodyUse, CastSpec, ContractionSpec, ElementwiseSpec, Fold, FragmentUse, Generated, I32Binary,
+    IndexedContraction, KernelRequest, KernelRequirements, Launch, MatmulShapes, PackedContraction,
+    PackedRequest, PointwiseForm, PointwiseSpec, RopeSpec, RowSpec, SerialWork, TopKSpec, UnaryOp,
+    UnmeasurableLds, ValueBinary, ViewOperand, fold_groups, generate,
 };
 
 // The types a request carries (the planner builds them), and `view_eff_strides`, the planner's strided-view
 // legality predicate shares with the generators.
-pub use contraction::{Schedule, TileSize};
-pub use fused::{FusedInput, FusedKernel, FusedScalarOp, FusedStep, RowKernel, RowOp, RowReduce};
+pub use contraction::{Epilogue, EpilogueInput, EpilogueLeaf, EpilogueStep, Schedule, TileSize};
+pub use fused::{
+    FusedInput, FusedKernel, FusedScalarOp, FusedStep, LeafTy, RowKernel, RowOp, RowReduce,
+};
 pub use helpers::{BodyBudget, BodyLimits, BodySize, Layout, WeightLayout, view_eff_strides};
-pub use packed::{PackedKernelOp, PackedKernelSpec, RowSelect};
+pub use packed::{PackedKernelOp, PackedKernelSpec};
 
 // Generators still called by name outside `generate`, each for a recorded reason (card 636 census, at
 // dispatch the planner calls none of them):
@@ -52,9 +58,8 @@ pub use packed::{PackedKernelOp, PackedKernelSpec, RowSelect};
 //   tests; this crate's own `tests/`: they build one generator's body directly to compile, run or compare
 //   it, which is the generator under test rather than planning. None is a dispatch path.
 pub use data_movement::{
-    arg_top_k_dt, broadcast, broadcast_dt, concat_n_dt, concat2_dt, dyn_update_slice_dt,
-    dyn_update_slice_dynamic_dt, gather_axis0_index_dt, rope, rope_dt, scatter_axis0_dt,
-    scatter_update_dt, slice_dt, transpose_dt,
+    MovementOp, MovementSpec, Storage, UnitWindow, UpdateIndex, arg_top_k_dt, movement_body, rope,
+    rope_dt,
 };
 pub use elementwise::{
     binary, binary_broadcast_dt_views_grid, binary_broadcast_i32_geu_views_grid, binary_scalar,
@@ -62,18 +67,12 @@ pub use elementwise::{
     cast_bf16_to_f32, cast_f16_to_f32, cast_f32_to_bf16, cast_f32_to_f16, unary, unary_dt_grid,
     unary_i32_clz_grid,
 };
-pub use flash::{flash_attention_decode, flash_region_decode, flash_region_prefill};
-pub use fp8::{
-    e4m3fn_broadcast_packed, e4m3fn_concat_packed, e4m3fn_dynamic_update_slice_dynamic_packed,
-    e4m3fn_dynamic_update_slice_packed, e4m3fn_gather_packed, e4m3fn_packed_to_f32,
-    e4m3fn_repack_reshape, e4m3fn_scatter_update_packed, e4m3fn_slice_packed,
-    e4m3fn_transpose_packed, f32_to_e4m3fn_packed,
-};
+pub use fp8::{e4m3fn_packed_to_f32, f32_to_e4m3fn_packed};
 pub use fused::{
     fused, fused_i32_views_grid, fused_i32_views_grid_pack, fused_row_parallel_views, fused_views,
 };
 pub use gemv::{attn_scores_v_gemv_lds, gemv_lds};
-pub use matmul::{indexed_matmul_dt, matmul_batched_bias_dt_grid, matmul_batched_dt_grid};
+pub use matmul::{matmul_batched_dt_grid, matmul_batched_epilogue_dt_grid};
 pub use packed::packed_kernel;
 pub use reduce::reduce_last_dt;
 pub use synchronization::cross_block_fence_spin_wait_coop;

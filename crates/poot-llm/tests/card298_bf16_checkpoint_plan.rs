@@ -83,7 +83,7 @@ fn eligible_decode_gemv(
     eqn: &Eqn,
     caps: &poot_target::DeviceCaps,
 ) -> bool {
-    if !matches!(eqn.op, OpKind::MatMul | OpKind::MatMulBias) || eqn.inputs.len() < 2 {
+    if !matches!(eqn.op, OpKind::MatMul) || eqn.inputs.len() < 2 {
         return false;
     }
     let (Operand::Value(a), Operand::Value(b)) = (&eqn.inputs[0], &eqn.inputs[1]) else {
@@ -112,8 +112,8 @@ fn eligible_decode_gemv(
 
 /// A non-GEMV BF16 consumer that production's raw-graph mixed-dtype guard must reject.
 ///
-/// The guard lives only on [`OpKind::MatMul`]: `MatMulBias` has no mixed-dtype arm (prepare retypes
-/// its weight before any entry point plans it), so a bias epilogue is not part of the rejected set.
+/// The guard lives only on [`OpKind::MatMul`]: a bias epilogue is never formed over a mixed-dtype head, so
+/// it is not part of the rejected set.
 fn non_gemv_bf16_matmul(
     g: &Graph,
     backend: Backend,

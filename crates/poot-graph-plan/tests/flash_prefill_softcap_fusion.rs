@@ -1,4 +1,4 @@
-//! Card 198: `FlashAttentionPrefill{softcap: Some(c)}` must reproduce `ops::attention_prefill_softcap`'s
+//! Card 198: `Attention{softcap: Some(c)}` must reproduce `ops::attention_prefill_softcap`'s
 //! `c * tanh(scores/c)` clamp exactly. Gemma2 numbers: `d=256` (`gemma2_2b()` head_dim, also the imported
 //! flash-prefill kernel's LDS cap), `cap=50.0` (`attn_logit_softcap`), `n_rep=4`/`hkv=2` as a representative GQA ratio.
 //!
@@ -104,7 +104,7 @@ fn flash_prefill_softcap_matches_attention_prefill_softcap_and_f64_reference() {
             .eqns
             .iter()
             .map(|e| &e.op)
-            .filter(|op| matches!(op, poot_graph_ir::op::OpKind::FlashAttentionPrefill { .. }))
+            .filter(|op| matches!(op, poot_graph_ir::op::OpKind::Attention(_)))
             .collect();
         assert_eq!(
             flash_ops.len(),
@@ -112,7 +112,7 @@ fn flash_prefill_softcap_matches_attention_prefill_softcap_and_f64_reference() {
             "expected optimize() to fuse this attention_prefill_softcap chain into exactly one flash op"
         );
         let got_softcap = match flash_ops[0] {
-            poot_graph_ir::op::OpKind::FlashAttentionPrefill { softcap, .. } => *softcap,
+            poot_graph_ir::op::OpKind::Attention(attrs) => attrs.softcap,
             _ => unreachable!(),
         };
         assert_eq!(
@@ -142,7 +142,7 @@ fn flash_prefill_softcap_matches_attention_prefill_softcap_and_f64_reference() {
          max_abs={drop_diff}) - this test cannot detect a dropped softcap at this magnitude"
     );
 
-    // The claim: FlashAttentionPrefill{softcap: Some(c)} == the materialized decomposition.
+    // The claim: Attention{softcap: Some(c)} == the materialized decomposition.
     let fuse_err = max_abs_error(
         fused_capped.as_f32().unwrap(),
         materialized_capped.as_f32().unwrap(),

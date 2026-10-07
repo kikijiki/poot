@@ -25,7 +25,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 # SC-024's two-distinct-bodies-same-display-key fixture: ready-made Body constructors, nothing else.
-poot-test-util = { workspace = true, features = ["kernel-fixtures"] }
+poot-test-util = { workspace = true, features = ["kernel-fixtures", "graph-fixtures"] }
 
 [lints]
 workspace = true

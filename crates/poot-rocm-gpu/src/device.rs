@@ -104,7 +104,7 @@ impl RocmDevice {
     }
 
     /// Build one kernarg buffer of flat `(ptr: u64, len: u64)` pairs, `[in0, in1, ..., out]` (the
-    /// output last; a `Plan::ComputeMeta` metadata buffer is already the last entry of `inputs` by the
+    /// output last; a launch metadata buffer is already the last entry of `inputs` by the
     /// time `Engine::walk` calls `dispatch`, so there is no separate meta slot to carry here - mirrors
     /// `poot-gpu`'s single flat kernarg layout, ROCm's own flavor of "one dispatch, one buffer").
     /// `len`'s unit is the kernel body's own: a generated kernel's typed slice parameters (`&[f32]`,
