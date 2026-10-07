@@ -172,25 +172,31 @@ impl HostTensor {
         let data = match dtype.storage_class() {
             StorageClass::F32 => HostData::F32(
                 bytes
-                    .chunks_exact(4)
-                    .map(|word| f32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|word| f32::from_le_bytes(*word))
                     .collect(),
             ),
             StorageClass::I32 => HostData::I32(
                 bytes
-                    .chunks_exact(4)
-                    .map(|word| i32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|word| i32::from_le_bytes(*word))
                     .collect(),
             ),
             StorageClass::Half => HostData::Half(
                 bytes
-                    .chunks_exact(2)
-                    .map(|word| u16::from_le_bytes([word[0], word[1]]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|word| u16::from_le_bytes(*word))
                     .collect(),
             ),
             StorageClass::Bytes => HostData::Bytes(Arc::from(bytes)),
         };
-        // A trailing partial word is dropped by `chunks_exact`; `new` then sees a short payload.
+        // A trailing partial word is dropped by `as_chunks`; `new` then sees a short payload.
         Self::new(dtype, shape, data)
     }
 

@@ -1,6 +1,6 @@
 //! `pootc` - poot's rustc driver (a kernel is real Rust, lowered from real rustc MIR).
 //!
-//! It is `rustc` plus a hook. `run_compiler` runs the normal pipeline, so rustc's own static LLVM
+//! It is `rustc` plus a hook. `compiler_entrypoint` runs the normal pipeline, so rustc's own static LLVM
 //! backend compiles host code into a working binary (no separate codegen-backend dylib is needed on
 //! the stock nix toolchain). A `Callbacks::after_analysis` hook then reads MIR via Stable MIR
 //! (`rustc_public`), finds the name-mangled `#[kernel]` functions (`poot_kernel_ir::naming::is_kernel`),
@@ -929,7 +929,7 @@ fn main() {
         failed: false,
         pending: None,
     };
-    rustc_driver::run_compiler(&args, &mut driver);
+    rustc_driver::compiler_entrypoint(&args, &mut driver);
     if driver.failed {
         std::process::exit(1);
     }

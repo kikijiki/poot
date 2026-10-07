@@ -1,15 +1,58 @@
 //! Unit tests for the planner: dispatch-predicate gating, cache-key stability, strided-view promotion,
 //! real-config dispatch-count regressions.
 
-use poot_graph_ir::{Builder, ShapeError, StateRole, Storage, TensorType, ValidationId};
+use poot_graph_ir::{
+    AttentionAttrs, Builder, ShapeError, StateRole, Storage, TensorType, ValidationId,
+};
 use poot_target::{
-    AmdArch, Backend, DECODE_GEMV_CHUNK_TRIGGER, DeviceCaps, FLASH_LDS_CAP, TensorCoreSupport,
+    AmdArch, Backend, DECODE_GEMV_CHUNK_TRIGGER, DeviceCaps, Queried, TensorCoreSupport,
     WatchdogBudget,
 };
 use poot_tensor::DType as GDt;
 use poot_test_util::device_caps::default_caps_for;
 
 use super::*;
+use crate::device_validation::ResourceRefusal;
+
+/// The one dispatch of a plan that launches one kernel and binds no metadata buffer.
+fn plain(plan: &Plan) -> &Dispatch {
+    match plan.single() {
+        Some(dispatch) if dispatch.launch.meta.is_empty() => dispatch,
+        _ => panic!("expected one dispatch without a metadata buffer, got {plan:?}"),
+    }
+}
+
+/// The one dispatch of a plan that launches one kernel and binds a metadata buffer.
+fn with_meta(plan: &Plan) -> &Dispatch {
+    match plan.single() {
+        Some(dispatch) if !dispatch.launch.meta.is_empty() => dispatch,
+        _ => panic!("expected one dispatch with a metadata buffer, got {plan:?}"),
+    }
+}
+
+fn is_plain(plan: &Plan) -> bool {
+    plan.single()
+        .is_some_and(|dispatch| dispatch.launch.meta.is_empty())
+}
+
+/// [`plain`], taking the plan by value.
+fn into_plain(plan: Plan) -> Dispatch {
+    plain(&plan);
+    one_dispatch(plan)
+}
+
+/// [`with_meta`], taking the plan by value.
+fn into_with_meta(plan: Plan) -> Dispatch {
+    with_meta(&plan);
+    one_dispatch(plan)
+}
+
+fn one_dispatch(plan: Plan) -> Dispatch {
+    match plan {
+        Plan::Dispatches(mut dispatches) if dispatches.len() == 1 => dispatches.remove(0),
+        other => panic!("expected one dispatch, got {other:?}"),
+    }
+}
 
 /// Whole-graph exact-I32 storage query, as the planner and executors ask it.
 fn value_requires_exact_i32_storage(g: &Graph, id: ValueId) -> bool {
@@ -573,7 +616,7 @@ fn contraction(choice: &KernelChoice) -> Option<&ContractionSpec> {
 fn serial_matmul_dtype(choice: &KernelChoice) -> Option<&Ty> {
     match contraction(choice) {
         Some(ContractionSpec::Serial {
-            dt, bias: false, ..
+            dt, epilogue: None, ..
         }) => Some(dt),
         _ => None,
     }
@@ -607,11 +650,8 @@ fn exact_i32_binary_plans_typed_integer_kernels_on_every_compute_backend() {
             Backend::Nvptx,
             Backend::AmdGcn(AmdArch::gfx1151()),
         ] {
-            let (Plan::Compute { body, .. }, choice) =
-                planned_with_choice(&g, eqn, backend).unwrap()
-            else {
-                panic!("exact I32 Binary must plan as Compute");
-            };
+            let (planned_plan, choice) = planned_with_choice(&g, eqn, backend).unwrap();
+            let Dispatch { body, .. } = into_plain(planned_plan);
             // The request names the exact-I32 operation, not the f32 lane's.
             let named = match (&choice, expected_name) {
                 (
@@ -685,11 +725,8 @@ fn exact_i32_bit_select_and_closed_fusion_plan_as_i32() {
             Backend::Nvptx,
             Backend::AmdGcn(AmdArch::gfx1151()),
         ] {
-            let (Plan::Compute { body, .. }, choice) =
-                planned_with_choice(&g, eqn, backend).unwrap()
-            else {
-                panic!("{:?} must plan as Compute", eqn.op);
-            };
+            let (planned_plan, choice) = planned_with_choice(&g, eqn, backend).unwrap();
+            let Dispatch { body, .. } = into_plain(planned_plan);
             // Every step runs over exact I32 storage: an I32 element type, the exact-I32 pointwise
             // forms, or the unsigned-literal kernels.
             let exact = match &choice {
@@ -728,11 +765,8 @@ fn exact_i32_bit_select_and_closed_fusion_plan_as_i32() {
     fused.validate().unwrap();
     assert_eq!(fused.eqns.len(), 1);
     let eqn = &fused.eqns[0];
-    let (Plan::Compute { body, .. }, choice) =
-        planned_with_choice(&fused, eqn, Backend::Nvptx).unwrap()
-    else {
-        panic!("fused I32 DAG must plan as Compute");
-    };
+    let (planned_plan, choice) = planned_with_choice(&fused, eqn, Backend::Nvptx).unwrap();
+    let Dispatch { body, .. } = into_plain(planned_plan);
     assert!(
         matches!(
             &choice,
@@ -762,11 +796,8 @@ fn exact_i32_select_past_the_grid_ceiling_emits_a_2d_fold() {
     let selected = b.select(cond, if_true, if_false);
     let g = b.finish(selected);
     let eqn = &g.eqns[0];
-    let (Plan::Compute { body, .. }, choice) =
-        planned_with_choice(&g, eqn, Backend::SpirvVulkan).unwrap()
-    else {
-        panic!("large I32 Select must plan as Compute");
-    };
+    let (planned_plan, choice) = planned_with_choice(&g, eqn, Backend::SpirvVulkan).unwrap();
+    let Dispatch { body, .. } = into_plain(planned_plan);
     assert!(
         matches!(
             &choice,
@@ -791,6 +822,130 @@ fn exact_i32_select_past_the_grid_ceiling_emits_a_2d_fold() {
     );
 }
 
+/// POOT-1033: a float `Select` plans as one float pointwise kernel whose condition leaf is I32 and whose
+/// branch leaves are F32, on every compute backend: the kernel's parameters carry both element types, so
+/// the I32 condition is never read as float bits. Mutation: type every leaf `F32` in the planner's `Select`
+/// arm; the condition parameter turns into an f32 slice and this row goes red.
+#[test]
+fn float_select_plans_a_float_pointwise_kernel_with_an_i32_condition_leaf() {
+    let b = Builder::new();
+    let cond = b.constant("cond", TensorType::new(vec![4], GDt::I32));
+    let if_true = b.constant("t", TensorType::new(vec![4], GDt::F32));
+    let if_false = b.constant("f", TensorType::new(vec![4], GDt::F32));
+    let selected = b.select(cond, if_true, if_false);
+    let g = b.finish(selected);
+    let eqn = &g.eqns[0];
+    for backend in [
+        Backend::SpirvVulkan,
+        Backend::Nvptx,
+        Backend::AmdGcn(AmdArch::gfx1151()),
+    ] {
+        let (planned_plan, choice) = planned_with_choice(&g, eqn, backend).unwrap();
+        let Dispatch { body, .. } = into_plain(planned_plan);
+        let KernelChoice::Generated(KernelRequest::Pointwise(spec)) = &choice else {
+            panic!("a float Select is one pointwise kernel: {choice:?}");
+        };
+        assert!(
+            matches!(spec.form, PointwiseForm::Float { .. }),
+            "{choice:?}"
+        );
+        assert_eq!(
+            spec.kernel.leaf_tys,
+            [kg::LeafTy::I32, kg::LeafTy::F32, kg::LeafTy::F32]
+        );
+        let element = |index: usize| {
+            let Ty::Ref { pointee, .. } = &body.locals[index].ty else {
+                panic!("parameter {index} must be a slice reference");
+            };
+            (**pointee).clone()
+        };
+        assert_eq!(element(1), Ty::Slice(Box::new(Ty::I32)), "{backend:?}");
+        assert_eq!(element(2), Ty::Slice(Box::new(Ty::F32)), "{backend:?}");
+        assert_eq!(element(3), Ty::Slice(Box::new(Ty::F32)), "{backend:?}");
+        assert_eq!(element(4), Ty::Slice(Box::new(Ty::F32)), "{backend:?}");
+    }
+}
+
+/// A float `Select` past the grid ceiling takes the same 2-D fold the exact-I32 `Select` does, standalone and
+/// inside a fused float region (the K/V zero-select of a long batched cache is far past 65535 * 256 elements):
+/// the request carries the fold and the body reads `GroupY`. Mutation: pass `PointwiseForm::Float`'s fold as
+/// flat in `request::pointwise` (or drop `OpKind::Fused` from `is_elementwise_2d_in`); the body reads no
+/// `GroupY` and this row goes red.
+#[test]
+fn float_select_past_the_grid_ceiling_emits_a_2d_fold() {
+    let over_ceiling = 65_535 * 256 + 256;
+    let b = Builder::new();
+    let cond = b.constant("cond", TensorType::new(vec![over_ceiling], GDt::I32));
+    let if_true = b.constant("t", TensorType::new(vec![over_ceiling], GDt::F32));
+    let if_false = b.constant("f", TensorType::new(vec![over_ceiling], GDt::F32));
+    let selected = b.select(cond, if_true, if_false);
+    let standalone = b.finish(selected);
+    // The same select followed by a pointwise neighbour fuses into one float region.
+    let b = Builder::new();
+    let cond = b.constant("cond", TensorType::new(vec![over_ceiling], GDt::I32));
+    let if_true = b.constant("t", TensorType::new(vec![over_ceiling], GDt::F32));
+    let if_false = b.constant("f", TensorType::new(vec![over_ceiling], GDt::F32));
+    let negated = b.unary(GUnOp::Neg, b.select(cond, if_true, if_false));
+    let fused = crate::fuse(&b.finish(negated));
+    assert!(matches!(fused.eqns[..], [ref eqn] if matches!(eqn.op, OpKind::Fused(_))));
+    for (what, g) in [("standalone", &standalone), ("fused", &fused)] {
+        let eqn = g.eqns.last().unwrap();
+        // The capped-grid target: NVPTX's X grid limit is far above this size, so it needs no fold.
+        let backend = Backend::SpirvVulkan;
+        {
+            let (planned_plan, choice) = planned_with_choice(g, eqn, backend).unwrap();
+            let Dispatch { body, .. } = into_plain(planned_plan);
+            assert!(
+                matches!(
+                    &choice,
+                    KernelChoice::Generated(KernelRequest::Pointwise(PointwiseSpec {
+                        form: PointwiseForm::Float {
+                            fold: kg::Fold { two_d: true, .. }
+                        },
+                        ..
+                    }))
+                ),
+                "{what} {backend:?}: a float pointwise kernel past the ceiling must request the 2-D fold: {choice:?}"
+            );
+            assert!(
+                body.blocks.iter().any(|block| matches!(
+                    block.terminator,
+                    poot_kernel_ir::Terminator::ThreadIndexCall {
+                        dim: poot_kernel_ir::IndexAxis::GroupY,
+                        ..
+                    }
+                )),
+                "{what} {backend:?}: the folded float kernel must read GroupY"
+            );
+        }
+    }
+}
+
+/// Only I32 and F32 branches have a kernel today: an F16 `Select` traces and evaluates (the oracle moves its
+/// bits) but the planner refuses it with the typed dtype-lowering refusal, never a wrong kernel.
+#[test]
+fn half_width_select_is_refused_as_a_dtype_lowering_gap() {
+    let b = Builder::new();
+    let cond = b.constant("cond", TensorType::new(vec![4], GDt::I32));
+    let if_true = b.constant("t", TensorType::new(vec![4], GDt::F16));
+    let if_false = b.constant("f", TensorType::new(vec![4], GDt::F16));
+    let selected = b.select(cond, if_true, if_false);
+    let g = b.finish(selected);
+    let eqn = &g.eqns[0];
+    let refusal = refusal_of(
+        plan_eqn_analyzed(
+            &ExactI32StorageAnalysis::new(&g),
+            &g,
+            eqn,
+            Backend::SpirvVulkan,
+            &default_caps_for(Backend::SpirvVulkan),
+            &poot_test_util::graph_fixtures::roomy_body_limits(),
+        ),
+        "an F16 Select",
+    );
+    assert_eq!(refusal.missing, Capability::DtypeLowering);
+}
+
 #[test]
 fn bounded_i32_planning_remains_compatible_outside_exact_paths() {
     // The legacy helper is unchanged for index-consuming kernels. Exact integer selection is limited to
@@ -802,7 +957,7 @@ fn bounded_i32_planning_remains_compatible_outside_exact_paths() {
     let y = b.binary_scalar(GBinOp::Add, x, Scalar::I32(1));
     let g = b.finish(y);
     let eqn = &g.eqns[0];
-    let Plan::Compute { body, .. } = plan_eqn_analyzed(
+    let planned_plan = plan_eqn_analyzed(
         &ExactI32StorageAnalysis::new(&g),
         &g,
         eqn,
@@ -810,9 +965,8 @@ fn bounded_i32_planning_remains_compatible_outside_exact_paths() {
         &default_caps_for(Backend::Nvptx),
         &poot_test_util::graph_fixtures::roomy_body_limits(),
     )
-    .unwrap() else {
-        panic!("I32 scalar add must compute");
-    };
+    .unwrap();
+    let Dispatch { body, .. } = into_plain(planned_plan);
     assert!(matches!(
         body.locals[1].ty,
         Ty::Ref {
@@ -853,11 +1007,8 @@ fn i32_movement_storage_is_graph_connected_and_cache_distinct() {
             .iter()
             .find(|eqn| matches!(eqn.op, OpKind::Broadcast { .. }))
             .unwrap();
-        let (Plan::Compute { body, key, .. }, choice) =
-            planned_with_choice(&g, eqn, Backend::Nvptx).unwrap()
-        else {
-            panic!("broadcast must compute");
-        };
+        let (planned_plan, choice) = planned_with_choice(&g, eqn, Backend::Nvptx).unwrap();
+        let Dispatch { body, key, .. } = into_plain(planned_plan);
         (body, key, choice)
     };
 
@@ -866,10 +1017,12 @@ fn i32_movement_storage_is_graph_connected_and_cache_distinct() {
     assert_eq!(slice_element_ty(&legacy_body, 1), &Ty::F32);
     assert_eq!(slice_element_ty(&exact_body, 1), &Ty::I32);
     let broadcast_dtype = |choice: &KernelChoice| match choice {
-        KernelChoice::Generated(KernelRequest::Movement(MovementSpec::Broadcast {
-            dt, ..
-        })) => dt.clone(),
-        other => panic!("a non-f32 broadcast must be generated: {other:?}"),
+        KernelChoice::Generated(KernelRequest::Movement(kg::MovementSpec {
+            storage: kg::Storage::Elements { carrier },
+            op: kg::MovementOp::Broadcast { .. },
+            ..
+        })) => carrier.clone(),
+        other => panic!("a broadcast must be generated: {other:?}"),
     };
     assert_eq!(broadcast_dtype(&legacy_choice), Ty::F32);
     assert_eq!(broadcast_dtype(&exact_choice), Ty::I32);
@@ -894,11 +1047,8 @@ fn exact_and_legacy_i32_binary_cache_keys_cannot_collide() {
             .iter()
             .find(|eqn| matches!(eqn.op, OpKind::Binary(_)))
             .unwrap();
-        let (Plan::Compute { body, key, .. }, choice) =
-            planned_with_choice(&g, eqn, Backend::Nvptx).unwrap()
-        else {
-            panic!("Binary must compute");
-        };
+        let (planned_plan, choice) = planned_with_choice(&g, eqn, Backend::Nvptx).unwrap();
+        let Dispatch { body, key, .. } = into_plain(planned_plan);
         (body, key, choice)
     };
     let (exact_body, exact_key, exact_choice) = binary_plan(true);
@@ -955,36 +1105,23 @@ fn gather_reads_exact_i32_index_chains_without_retyping_legacy_indices() {
 
     // The index element type the request names.
     let generated_index = |choice: &KernelChoice| match choice {
-        KernelChoice::Generated(KernelRequest::Movement(
-            MovementSpec::GatherAxis0 { index_dt, .. } | MovementSpec::GatherAxis { index_dt, .. },
-        )) => index_dt.clone(),
+        KernelChoice::Generated(KernelRequest::Movement(kg::MovementSpec {
+            op: kg::MovementOp::Gather { index_dtype, .. },
+            ..
+        })) => index_dtype.clone(),
         other => panic!("expected a generated gather: {other:?}"),
     };
     for axis in [0, 1] {
-        let (Plan::Compute { body, .. }, choice) = gather_plan(true, axis) else {
-            panic!("exact-index gather must use a generated Compute body");
-        };
+        let (planned_plan, choice) = gather_plan(true, axis);
+        let Dispatch { body, .. } = into_plain(planned_plan);
         assert_eq!(slice_element_ty(&body, 1), &Ty::F32);
         assert_eq!(slice_element_ty(&body, 2), &Ty::I32);
         assert_eq!(generated_index(&choice), Ty::I32);
 
         let (legacy, choice) = gather_plan(false, axis);
-        match legacy {
-            Plan::Compute { body, .. } => {
-                assert_eq!(slice_element_ty(&body, 2), &Ty::F32);
-                // The f32-index gather is the shipped axis-0 kernel, or a generated one on the f32 lane.
-                if !is_imported(&choice, ImportedKernel::GatherAxis0) {
-                    assert_eq!(generated_index(&choice), Ty::F32);
-                }
-            }
-            Plan::ComputeMeta { .. } => {
-                assert!(
-                    matches!(choice, KernelChoice::Imported { .. }),
-                    "{choice:?}"
-                );
-            }
-            other => panic!("legacy gather planned unexpectedly: {other:?}"),
-        }
+        let Dispatch { body, .. } = into_plain(legacy);
+        assert_eq!(slice_element_ty(&body, 2), &Ty::F32);
+        assert_eq!(generated_index(&choice), Ty::F32);
     }
 }
 
@@ -1003,7 +1140,7 @@ fn gather_over_exact_i32_data_with_no_binary_component_keeps_the_f32_lane() {
             .find(|eqn| matches!(eqn.op, OpKind::Gather { .. }))
             .unwrap();
         let analysis = ExactI32StorageAnalysis::new(&g);
-        let (body, _) = match plan_eqn_analyzed(
+        let body = match plan_eqn_analyzed(
             &analysis,
             &g,
             eqn,
@@ -1013,7 +1150,7 @@ fn gather_over_exact_i32_data_with_no_binary_component_keeps_the_f32_lane() {
         )
         .unwrap()
         {
-            Plan::Compute { body, key, .. } => (body, key),
+            plan if is_plain(&plan) => one_dispatch(plan).body,
             other => panic!("axis {axis}: exact I32 Gather planned as {other:?}"),
         };
         // An isolated I32 Gather has no Binary component, so the component rule keeps it on the f32 lane.
@@ -1031,35 +1168,31 @@ fn legacy_i32_gather_plans_are_unchanged_and_mixed_exact_storage_rejects() {
         let gathered = b.gather(table, axis, index);
         let g = b.finish(gathered);
         let eqn = &g.eqns[0];
-        let (Plan::Compute { body, .. }, choice) =
-            planned_with_choice(&g, eqn, Backend::SpirvVulkan).unwrap()
-        else {
-            panic!("legacy I32 Gather must stay a generated Compute body");
-        };
+        let (planned_plan, choice) = planned_with_choice(&g, eqn, Backend::SpirvVulkan).unwrap();
+        let Dispatch { body, .. } = into_plain(planned_plan);
         // The f32 lane: the legacy element and index types, with the table's own geometry.
-        match (axis, &choice) {
-            (
-                0,
-                KernelChoice::Generated(KernelRequest::Movement(MovementSpec::GatherAxis0 {
-                    dt: Ty::F32,
-                    index_dt: Ty::F32,
-                    rest: 2,
-                    numel: 6,
-                })),
-            ) => {}
-            (
-                1,
-                KernelChoice::Generated(KernelRequest::Movement(MovementSpec::GatherAxis {
-                    dt: Ty::F32,
-                    index_dt: Ty::F32,
-                    inner: 2,
-                    axis_len: 4,
-                    idx_numel: 3,
-                    numel: 12,
-                })),
-            ) => {}
-            _ => panic!("axis {axis}: {choice:?}"),
-        }
+        let (in_shape, out_shape) = if axis == 0 {
+            (vec![4, 2], vec![3, 2])
+        } else {
+            (vec![2, 4, 2], vec![2, 3, 2])
+        };
+        let KernelChoice::Generated(KernelRequest::Movement(spec)) = &choice else {
+            panic!("axis {axis}: {choice:?}");
+        };
+        assert_eq!(
+            spec,
+            &kg::MovementSpec::new(
+                kg::Storage::Elements { carrier: Ty::F32 },
+                out_shape,
+                kg::MovementOp::Gather {
+                    in_shape,
+                    axis,
+                    index_dtype: Ty::F32,
+                    index_numel: 3,
+                },
+            ),
+            "axis {axis}"
+        );
         assert_eq!(slice_element_ty(&body, 1), &Ty::F32, "axis {axis} data");
         assert_eq!(slice_element_ty(&body, 2), &Ty::F32, "axis {axis} index");
     }
@@ -1287,7 +1420,7 @@ fn plan_eqn_derives_shape_from_the_graph_not_a_caller_argument() {
     let out = b.binary(GBinOp::Add, x, y);
     let g = b.finish(out);
     let eqn = &g.eqns[0];
-    let Plan::Compute { grid, .. } = plan_eqn_analyzed(
+    let planned_plan = plan_eqn_analyzed(
         &ExactI32StorageAnalysis::new(&g),
         &g,
         eqn,
@@ -1295,9 +1428,11 @@ fn plan_eqn_derives_shape_from_the_graph_not_a_caller_argument() {
         &default_caps_for(Backend::SpirvVulkan),
         &poot_test_util::graph_fixtures::roomy_body_limits(),
     )
-    .unwrap() else {
-        panic!("Binary Add must plan as Plan::Compute");
-    };
+    .unwrap();
+    let Dispatch {
+        launch: Launch { grid, .. },
+        ..
+    } = into_plain(planned_plan);
     // 4*8 = 32 elements, one thread each (well under the elementwise-2D fold's threshold): the grid
     // must reflect the graph's real output shape, which plan_eqn can no longer be told to ignore.
     assert_eq!(grid, [32, 1, 1]);
@@ -1325,39 +1460,76 @@ fn try_matmul_plan(g: &Graph, backend: Backend) -> Result<Plan, PlanError> {
     try_matmul_plan_planned(g, backend).map(|(plan, _)| plan)
 }
 
-/// Card 253: `OpKind::MatMulBias` (unlike `OpKind::MatMul`) has no mismatched-operand-dtype guard;
-/// `operand_dts` appears once in `lib.rs`, inside the `MatMul` arm. Real qwen2/llama q/k/v decode
-/// projections go through `MatMulBias`, so a BF16 weight against an F32 activation plans at
-/// `fty(odt) = F32` with no rejection and no inserted Cast. Executors must run
-/// `widen_mismatched_matmul_dtypes` before planning a mixed MatMulBias (required for PTX correctness
-/// because eligible BF16 weights have two-byte backing storage). If this raw plan begins rejecting the
-/// mismatch, re-audit the widening pass and all executor call sites together.
+/// A biased matmul whose weight dtype differs from its activation's is not a contraction epilogue: the
+/// fuse rule only forms one over a head whose operands and result share a dtype (a mixed pairing is the
+/// tensor-core and decode-GEMV arms' contract, and `widen_mismatched_matmul_dtypes` casts the rest), so
+/// the graph keeps its matmul and its add. Mutation: drop the dtype check in `epilogue_head`; the mixed
+/// matmul fuses and this row goes red.
 #[test]
-fn matmul_bias_mismatched_dtype_is_unguarded_by_design() {
+fn a_biased_matmul_with_mismatched_operand_dtypes_is_not_fused_into_an_epilogue() {
     let bld = Builder::new();
     let a = bld.constant("a", TensorType::new(vec![1, 1, 32], GDt::F32));
     let w = bld.constant("w", TensorType::new(vec![32, 16], GDt::BF16));
     let bias = bld.constant("bias", TensorType::new(vec![16], GDt::F32));
     let mm = poot_graph_ir::ops::linear(&bld, a, w, Some(bias));
-    let g = crate::passes::fuse_bias_epilogues(&bld.finish(mm));
-    let eqn = g
-        .eqns
-        .iter()
-        .find(|e| matches!(e.op, OpKind::MatMulBias))
-        .expect("a matmul_bias eqn");
-    let r = plan_eqn_analyzed(
-        &ExactI32StorageAnalysis::new(&g),
-        &g,
-        eqn,
-        Backend::Nvptx,
-        &default_caps_for(Backend::Nvptx),
-        &poot_test_util::graph_fixtures::roomy_body_limits(),
-    );
+    let g = crate::passes::fuse_contraction_epilogues(&bld.finish(mm), |_, _| true);
     assert!(
-        r.is_ok(),
-        "MatMulBias with a mismatched BF16 weight operand now errors - re-audit every eager decode \
-         call site's widening contract (see this test's doc comment): {r:?}"
+        g.eqns
+            .iter()
+            .all(|e| !matches!(e.op, OpKind::ContractionEpilogue { .. })),
+        "a mixed-dtype matmul must keep its add: {:?}",
+        g.eqns
     );
+}
+
+/// Card 645's review item, closed: a biased projection against a checkpoint-orientation `[N, K]` weight
+/// (`x @ w^T + bias`, the qwen2 q/k/v shape) compiles on every backend to exactly one equation, a
+/// `ContractionEpilogue` over a dense head reading the weight as stored: no device `Transpose`, no standalone
+/// `MatMul` or add. The head is the `M == 1` decode Gemv, and the bias rides in its store. Mutation: put the
+/// epilogue rule back before `fold_dense_contractions` (the pre-fold order, where the rule saw only a plain
+/// `MatMul` over a `Transpose`): the weight keeps its device transpose and this row goes red.
+#[test]
+fn a_biased_checkpoint_orientation_projection_is_one_contraction_with_bias_and_no_transpose() {
+    use poot_graph_ir::op::ContractionHead;
+
+    for backend in [
+        Backend::SpirvVulkan,
+        Backend::AmdGcn(AmdArch::gfx1151()),
+        Backend::Nvptx,
+    ] {
+        for weight in [GDt::F32, GDt::BF16] {
+            let bld = Builder::new();
+            let x = bld.constant("x", TensorType::new(vec![1, 1, 32], GDt::F32));
+            let w = bld.constant("w", TensorType::new(vec![16, 32], weight));
+            let bias = bld.constant("bias", TensorType::new(vec![16], GDt::F32));
+            let projection = bld.matmul(x, bld.transpose(w, vec![1, 0]));
+            let out = bld.binary(poot_graph_ir::op::BinOp::Add, projection, bias);
+            let g = bld.finish(out);
+            let program = compile(
+                &g,
+                &Target {
+                    backend,
+                    caps: default_caps_for(backend),
+                },
+                &CompileOptions {
+                    execution: Submission::Replay,
+                    limits: CompileLimits::STANDARD,
+                },
+            )
+            .unwrap_or_else(|e| panic!("{backend:?} {weight:?}: {e}"));
+            let ops: Vec<&OpKind> = program.graph().eqns.iter().map(|e| &e.op).collect();
+            assert!(
+                matches!(
+                    ops.as_slice(),
+                    [OpKind::ContractionEpilogue {
+                        head: ContractionHead::Dense { weight: stored },
+                        ..
+                    }] if *stored == weight
+                ),
+                "{backend:?} {weight:?}: one dense contraction with its bias, got {ops:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1434,33 +1606,32 @@ fn e4m3fn_scatter_update_materializes_exact_packed_output_and_keys_all_shapes() 
     };
     let graph = build(3);
     let eqn = &graph.eqns[0];
-    let (
-        Plan::Compute {
-            body, key, grid, ..
-        },
-        choice,
-    ) = planned_with_choice(&graph, eqn, Backend::SpirvVulkan).unwrap()
-    else {
-        panic!("e4m3fn ScatterUpdate must materialize conservatively")
-    };
-    assert_eq!(body.param_count, 4);
-    let KernelChoice::Generated(KernelRequest::Movement(MovementSpec::E4m3 {
-        op: E4m3Movement::ScatterUpdate {
-            base_shape,
-            src_shape,
-        },
+    let (planned_plan, choice) = planned_with_choice(&graph, eqn, Backend::SpirvVulkan).unwrap();
+    let Dispatch {
+        body,
+        key,
+        launch: Launch { grid, .. },
         ..
-    })) = &choice
-    else {
+    } = into_plain(planned_plan);
+    assert_eq!(body.param_count, 4);
+    let KernelChoice::Generated(KernelRequest::Movement(spec)) = &choice else {
         panic!("expected the packed E4M3FN scatter-update request: {choice:?}");
     };
-    assert_eq!(base_shape, &[4, 2, 5]);
-    assert_eq!(src_shape, &[3, 2, 5]);
+    assert_eq!(spec.storage, kg::Storage::BYTE_LANES);
+    assert_eq!(spec.out_shape, [4, 2, 5]);
+    assert_eq!(
+        spec.op,
+        kg::MovementOp::ScatterRows {
+            src_shape: vec![3, 2, 5],
+            inverse_dtype: Ty::F32,
+            window: None
+        }
+    );
     assert_eq!(grid, [16, 1, 1]);
 
     let other = build(2);
     let other_eqn = &other.eqns[0];
-    let Plan::Compute { key: other_key, .. } = plan_eqn_analyzed(
+    let planned_plan = plan_eqn_analyzed(
         &ExactI32StorageAnalysis::new(&other),
         &other,
         other_eqn,
@@ -1468,13 +1639,12 @@ fn e4m3fn_scatter_update_materializes_exact_packed_output_and_keys_all_shapes() 
         &default_caps_for(Backend::SpirvVulkan),
         &poot_test_util::graph_fixtures::roomy_body_limits(),
     )
-    .unwrap() else {
-        panic!("e4m3fn ScatterUpdate must materialize")
-    };
+    .unwrap();
+    let Dispatch { key: other_key, .. } = into_plain(planned_plan);
     assert_ne!(key, other_key, "source row count must separate plan keys");
 
-    assert!(matches!(
-        plan_eqn_analyzed(
+    assert!(is_plain(
+        &plan_eqn_analyzed(
             &ExactI32StorageAnalysis::new(&graph),
             &graph,
             eqn,
@@ -1482,8 +1652,7 @@ fn e4m3fn_scatter_update_materializes_exact_packed_output_and_keys_all_shapes() 
             &default_caps_for(Backend::Nvptx),
             &poot_test_util::graph_fixtures::roomy_body_limits()
         )
-        .unwrap(),
-        Plan::Compute { .. }
+        .unwrap()
     ));
     let backend = Backend::AmdGcn(AmdArch::gfx1151());
     let refusal = refusal_of(
@@ -1508,19 +1677,23 @@ fn e4m3fn_scatter_update_materializes_exact_packed_output_and_keys_all_shapes() 
     let output = builder.scatter_update(base, src, inverse);
     let rank1 = builder.finish(output);
     let rank1_eqn = &rank1.eqns[0];
-    let (Plan::Compute { body, grid, .. }, choice) =
-        planned_with_choice(&rank1, rank1_eqn, Backend::SpirvVulkan).unwrap()
-    else {
-        panic!("rank-1 e4m3fn ScatterUpdate must materialize")
-    };
+    let (planned_plan, choice) =
+        planned_with_choice(&rank1, rank1_eqn, Backend::SpirvVulkan).unwrap();
+    let Dispatch {
+        body,
+        launch: Launch { grid, .. },
+        ..
+    } = into_plain(planned_plan);
     assert_eq!(body.param_count, 4);
     assert!(
         matches!(
             &choice,
-            KernelChoice::Generated(KernelRequest::Movement(MovementSpec::E4m3 {
-                op: E4m3Movement::ScatterUpdate { base_shape, src_shape },
+            KernelChoice::Generated(KernelRequest::Movement(kg::MovementSpec {
+                storage: kg::Storage::PackedRows { lane_bits: 8 },
+                out_shape,
+                op: kg::MovementOp::ScatterRows { src_shape, window: None, .. },
                 ..
-            })) if base_shape == &[5] && src_shape == &[3]
+            })) if out_shape == &[5] && src_shape == &[3]
         ),
         "{choice:?}"
     );
@@ -1539,21 +1712,26 @@ fn e4m3fn_dynamic_update_slice_plans_static_and_runtime_exact_packed_outputs() {
     let output = builder.dynamic_update_slice(operand, update, 1, 1);
     let graph = builder.finish(output);
     let eqn = &graph.eqns[0];
-    let (Plan::Compute { body, grid, .. }, choice) =
-        planned_with_choice(&graph, eqn, Backend::SpirvVulkan).unwrap()
-    else {
-        panic!("static e4m3fn DynamicUpdateSlice must materialize")
-    };
+    let (planned_plan, choice) = planned_with_choice(&graph, eqn, Backend::SpirvVulkan).unwrap();
+    let Dispatch {
+        body,
+        launch: Launch { grid, .. },
+        ..
+    } = into_plain(planned_plan);
     assert_eq!(body.param_count, 3);
     assert!(
         matches!(
             &choice,
-            KernelChoice::Generated(KernelRequest::Movement(MovementSpec::E4m3 {
-                op: E4m3Movement::DynamicUpdateSlice {
-                    operand_shape, update_shape, axis: 1, index: 1,
+            KernelChoice::Generated(KernelRequest::Movement(kg::MovementSpec {
+                storage: kg::Storage::PackedRows { lane_bits: 8 },
+                out_shape,
+                op: kg::MovementOp::UpdateSlice {
+                    update_shape,
+                    axis: 1,
+                    index: kg::UpdateIndex::Static(1),
                 },
                 ..
-            })) if operand_shape == &[2, 4, 5] && update_shape == &[2, 2, 5]
+            })) if out_shape == &[2, 4, 5] && update_shape == &[2, 2, 5]
         ),
         "{choice:?}"
     );
@@ -1566,27 +1744,32 @@ fn e4m3fn_dynamic_update_slice_plans_static_and_runtime_exact_packed_outputs() {
     let output = builder.dynamic_update_slice_dyn(operand, update, index, 1);
     let graph = builder.finish(output);
     let eqn = &graph.eqns[0];
-    let (Plan::Compute { body, grid, .. }, choice) =
-        planned_with_choice(&graph, eqn, Backend::SpirvVulkan).unwrap()
-    else {
-        panic!("runtime e4m3fn DynamicUpdateSlice must materialize")
-    };
+    let (planned_plan, choice) = planned_with_choice(&graph, eqn, Backend::SpirvVulkan).unwrap();
+    let Dispatch {
+        body,
+        launch: Launch { grid, .. },
+        ..
+    } = into_plain(planned_plan);
     assert_eq!(body.param_count, 4);
     assert!(
         matches!(
             &choice,
-            KernelChoice::Generated(KernelRequest::Movement(MovementSpec::E4m3 {
-                op: E4m3Movement::DynamicUpdateSliceRuntime {
-                    operand_shape, update_shape, axis: 1,
+            KernelChoice::Generated(KernelRequest::Movement(kg::MovementSpec {
+                storage: kg::Storage::PackedRows { lane_bits: 8 },
+                out_shape,
+                op: kg::MovementOp::UpdateSlice {
+                    update_shape,
+                    axis: 1,
+                    index: kg::UpdateIndex::Runtime { dtype: Ty::F32 },
                 },
                 ..
-            })) if operand_shape == &[2, 5] && update_shape == &[2, 2]
+            })) if out_shape == &[2, 5] && update_shape == &[2, 2]
         ),
         "{choice:?}"
     );
     assert_eq!(grid, [4, 1, 1]);
-    assert!(matches!(
-        plan_eqn_analyzed(
+    assert!(is_plain(
+        &plan_eqn_analyzed(
             &ExactI32StorageAnalysis::new(&graph),
             &graph,
             eqn,
@@ -1594,8 +1777,7 @@ fn e4m3fn_dynamic_update_slice_plans_static_and_runtime_exact_packed_outputs() {
             &default_caps_for(Backend::Nvptx),
             &poot_test_util::graph_fixtures::roomy_body_limits()
         )
-        .unwrap(),
-        Plan::Compute { .. }
+        .unwrap()
     ));
     let backend = Backend::AmdGcn(AmdArch::gfx1151());
     let refusal = refusal_of(
@@ -1701,7 +1883,7 @@ fn e4m3fn_dynamic_update_slice_cache_keys_separate_forms_axes_windows_and_layout
         };
         let graph = builder.finish(output);
         let eqn = &graph.eqns[0];
-        let Plan::Compute { key, .. } = plan_eqn_analyzed(
+        let planned_plan = plan_eqn_analyzed(
             &ExactI32StorageAnalysis::new(&graph),
             &graph,
             eqn,
@@ -1709,9 +1891,8 @@ fn e4m3fn_dynamic_update_slice_cache_keys_separate_forms_axes_windows_and_layout
             &default_caps_for(Backend::SpirvVulkan),
             &poot_test_util::graph_fixtures::roomy_body_limits(),
         )
-        .unwrap() else {
-            panic!("e4m3fn DynamicUpdateSlice must materialize")
-        };
+        .unwrap();
+        let Dispatch { key, .. } = into_plain(planned_plan);
         key
     }
 
@@ -1811,19 +1992,28 @@ fn e4m3fn_dynamic_update_slice_rejects_zero_invalid_window_and_index_storage() {
 /// could silently apply to the other.
 #[test]
 fn dynamic_update_slice_runtime_index_dtype_separates_the_plan_key() {
+    // An exact-I32 index (an integer-only `Or` makes its component authoritative, so it is stored as i32)
+    // against an F32 one.
     let key_for = |index_dtype: GDt| {
         let builder = Builder::new();
         let operand = builder.constant("operand", TensorType::f32(vec![4, 5]));
         let update = builder.constant("update", TensorType::f32(vec![2, 5]));
         let index = builder.constant("index", TensorType::scalar(index_dtype));
+        let index = if index_dtype == GDt::I32 {
+            builder.binary_scalar(GBinOp::Or, index, Scalar::I32(0))
+        } else {
+            index
+        };
         let output = builder.dynamic_update_slice_dyn(operand, update, index, 0);
         let graph = builder.finish(output);
-        let eqn = &graph.eqns[0];
-        let (Plan::ComputeMeta { key, .. }, choice) =
-            planned_with_choice(&graph, eqn, Backend::SpirvVulkan).unwrap()
-        else {
-            panic!("F32 DynamicUpdateSlice with a runtime index must plan as ComputeMeta")
-        };
+        let eqn = graph
+            .eqns
+            .iter()
+            .find(|eqn| matches!(eqn.op, OpKind::DynamicUpdateSlice { .. }))
+            .unwrap();
+        let (planned_plan, choice) =
+            planned_with_choice(&graph, eqn, Backend::SpirvVulkan).unwrap();
+        let Dispatch { key, .. } = into_plain(planned_plan);
         (key, choice)
     };
 
@@ -1835,15 +2025,18 @@ fn dynamic_update_slice_runtime_index_dtype_separates_the_plan_key() {
     );
     // The choice records the index element type the equation binds.
     let index_of = |choice: KernelChoice| match choice {
-        KernelChoice::Imported {
-            kernel: ImportedKernel::DynUpdateSlice,
-            index,
+        KernelChoice::Generated(KernelRequest::Movement(kg::MovementSpec {
+            op:
+                kg::MovementOp::UpdateSlice {
+                    index: kg::UpdateIndex::Runtime { dtype },
+                    ..
+                },
             ..
-        } => index,
-        other => panic!("expected the imported dynamic-update-slice: {other:?}"),
+        })) => dtype,
+        other => panic!("expected the generated dynamic-update-slice: {other:?}"),
     };
-    assert_eq!(index_of(f32_choice), Some(GDt::F32));
-    assert_eq!(index_of(i32_choice), Some(GDt::I32));
+    assert_eq!(index_of(f32_choice), Ty::F32);
+    assert_eq!(index_of(i32_choice), Ty::I32);
 }
 
 #[test]
@@ -1857,24 +2050,28 @@ fn e4m3fn_concat_preserves_n_input_contract_and_aliases_only_one_input_on_wgpu()
     let eqn = &graph.eqns[0];
     let shape = graph.aval(eqn.out).shape.clone();
     let (plan, choice) = planned_with_choice(&graph, eqn, Backend::SpirvVulkan).unwrap();
-    let Plan::Compute { body, grid, .. } = plan else {
-        panic!("three-input e4m3fn Concat must materialize")
-    };
+    let planned_plan = plan;
+    let Dispatch {
+        body,
+        launch: Launch { grid, .. },
+        ..
+    } = into_plain(planned_plan);
     assert_eq!(shape, [2, 6, 3]);
     assert_eq!(body.param_count, 4);
     assert!(
         matches!(
             &choice,
-            KernelChoice::Generated(KernelRequest::Movement(MovementSpec::E4m3 {
-                op: E4m3Movement::Concat { axis: 1, in_shapes },
+            KernelChoice::Generated(KernelRequest::Movement(kg::MovementSpec {
+                storage: kg::Storage::PackedRows { lane_bits: 8 },
+                op: kg::MovementOp::Concat { axis: 1, in_shapes },
                 ..
             })) if in_shapes.len() == 3
         ),
         "{choice:?}"
     );
     assert_eq!(grid, [12, 1, 1]);
-    assert!(matches!(
-        plan_eqn_analyzed(
+    assert!(is_plain(
+        &plan_eqn_analyzed(
             &ExactI32StorageAnalysis::new(&graph),
             &graph,
             eqn,
@@ -1882,8 +2079,7 @@ fn e4m3fn_concat_preserves_n_input_contract_and_aliases_only_one_input_on_wgpu()
             &default_caps_for(Backend::Nvptx),
             &poot_test_util::graph_fixtures::roomy_body_limits()
         )
-        .unwrap(),
-        Plan::Compute { .. }
+        .unwrap()
     ));
     let backend = Backend::AmdGcn(AmdArch::gfx1151());
     let refusal = refusal_of(
@@ -1908,7 +2104,7 @@ fn e4m3fn_concat_preserves_n_input_contract_and_aliases_only_one_input_on_wgpu()
     let graph = builder.finish(output);
     let eqn = &graph.eqns[0];
     let shape = graph.aval(eqn.out).shape.clone();
-    let Plan::Compute { grid, .. } = plan_eqn_analyzed(
+    let planned_plan = plan_eqn_analyzed(
         &ExactI32StorageAnalysis::new(&graph),
         &graph,
         eqn,
@@ -1916,9 +2112,11 @@ fn e4m3fn_concat_preserves_n_input_contract_and_aliases_only_one_input_on_wgpu()
         &default_caps_for(Backend::SpirvVulkan),
         &poot_test_util::graph_fixtures::roomy_body_limits(),
     )
-    .unwrap() else {
-        panic!("two-input e4m3fn Concat must materialize")
-    };
+    .unwrap();
+    let Dispatch {
+        launch: Launch { grid, .. },
+        ..
+    } = into_plain(planned_plan);
     assert_eq!(shape, [2, 5]);
     assert_eq!(grid, [4, 1, 1]);
 
@@ -1996,7 +2194,7 @@ fn e4m3fn_broadcast_materializes_expansions_and_aliases_only_identity_on_wgpu() 
         let eqn = &graph.eqns[0];
         let shape = graph.aval(eqn.out).shape.clone();
         assert_eq!(shape, output_shape);
-        let Plan::Compute { grid, .. } = plan_eqn_analyzed(
+        let planned_plan = plan_eqn_analyzed(
             &ExactI32StorageAnalysis::new(&graph),
             &graph,
             eqn,
@@ -2004,12 +2202,14 @@ fn e4m3fn_broadcast_materializes_expansions_and_aliases_only_identity_on_wgpu() 
             &default_caps_for(Backend::SpirvVulkan),
             &poot_test_util::graph_fixtures::roomy_body_limits(),
         )
-        .unwrap() else {
-            panic!("E4M3FN Broadcast must materialize")
-        };
+        .unwrap();
+        let Dispatch {
+            launch: Launch { grid, .. },
+            ..
+        } = into_plain(planned_plan);
         assert_eq!(grid, [expected_words, 1, 1]);
-        assert!(matches!(
-            plan_eqn_analyzed(
+        assert!(is_plain(
+            &plan_eqn_analyzed(
                 &ExactI32StorageAnalysis::new(&graph),
                 &graph,
                 eqn,
@@ -2017,8 +2217,7 @@ fn e4m3fn_broadcast_materializes_expansions_and_aliases_only_identity_on_wgpu() 
                 &default_caps_for(Backend::Nvptx),
                 &poot_test_util::graph_fixtures::roomy_body_limits()
             )
-            .unwrap(),
-            Plan::Compute { .. }
+            .unwrap()
         ));
         let backend = Backend::AmdGcn(AmdArch::gfx1151());
         let refusal = refusal_of(
@@ -2100,7 +2299,7 @@ fn e4m3fn_cast_and_reshape_plan_only_for_spirv_wgpu_value_executor() {
     for graph in [&decode, &encode, &repack] {
         let eqn = &graph.eqns[0];
         let shape = graph.aval(eqn.out).shape.clone();
-        let Plan::Compute { grid, .. } = plan_eqn_analyzed(
+        let planned_plan = plan_eqn_analyzed(
             &ExactI32StorageAnalysis::new(graph),
             graph,
             eqn,
@@ -2108,9 +2307,11 @@ fn e4m3fn_cast_and_reshape_plan_only_for_spirv_wgpu_value_executor() {
             &default_caps_for(Backend::SpirvVulkan),
             &poot_test_util::graph_fixtures::roomy_body_limits(),
         )
-        .unwrap() else {
-            panic!("E4M3FN Cast/Reshape must plan as Compute on wgpu")
-        };
+        .unwrap();
+        let Dispatch {
+            launch: Launch { grid, .. },
+            ..
+        } = into_plain(planned_plan);
         if graph.aval(eqn.out).dtype == GDt::E4M3FN {
             let layout_words = shape[..shape.len() - 1].iter().product::<usize>()
                 * shape.last().unwrap().div_ceil(4);
@@ -2127,7 +2328,7 @@ fn e4m3fn_cast_and_reshape_plan_only_for_spirv_wgpu_value_executor() {
                 &poot_test_util::graph_fixtures::roomy_body_limits()
             )
             .unwrap(),
-            Plan::Compute { .. } | Plan::Alias(_)
+            plan if is_plain(&plan) || matches!(plan, Plan::Alias(_))
         ));
         let backend = Backend::AmdGcn(AmdArch::gfx1151());
         let refusal = refusal_of(
@@ -2265,9 +2466,8 @@ fn sc003_grid_cap_bump_respects_custom_device_caps_not_hardcoded_65535() {
         &poot_test_util::graph_fixtures::roomy_body_limits(),
     )
     .unwrap();
-    let Plan::Compute { body, .. } = plan else {
-        panic!("elementwise add must plan as Plan::Compute");
-    };
+    let planned_plan = plan;
+    let Dispatch { body, .. } = into_plain(planned_plan);
     let wg0 = body.workgroup_size[0] as usize;
     assert_eq!(
         wg0, 256,
@@ -2320,12 +2520,15 @@ fn sc003_elementwise_2d_fold_respects_custom_device_caps_not_hardcoded_65535x256
         &poot_test_util::graph_fixtures::roomy_body_limits(),
     )
     .unwrap();
-    let Plan::Compute { body, grid, .. } = plan else {
-        panic!("elementwise add must plan as Plan::Compute");
-    };
+    let planned_plan = plan;
+    let Dispatch {
+        body,
+        launch: Launch { grid, .. },
+        ..
+    } = into_plain(planned_plan);
     let wg0 = body.workgroup_size[0].max(1) as usize;
     let wg1 = body.workgroup_size[1].max(1) as usize;
-    // `grid` is the total thread count (card 525: `types.rs`'s `Plan::Compute` doc); the executor
+    // `grid` is the total thread count (card 525: `types.rs`'s `Launch` doc); the executor
     // derives the dispatched workgroup count per axis by CEILING division against `workgroup_size`
     // (`poot-runtime`'s `workgroup_count`), never a floor division that would silently truncate.
     let workgroups_x = (grid[0] as usize).div_ceil(wg0);
@@ -2397,7 +2600,7 @@ fn e4m3fn_transpose_materializes_nonidentity_and_aliases_only_identity_on_wgpu()
     let transposed = builder.transpose(x, vec![1, 0]);
     let graph = builder.finish(transposed);
     let eqn = &graph.eqns[0];
-    let Plan::Compute { grid, .. } = plan_eqn_analyzed(
+    let planned_plan = plan_eqn_analyzed(
         &ExactI32StorageAnalysis::new(&graph),
         &graph,
         eqn,
@@ -2405,12 +2608,14 @@ fn e4m3fn_transpose_materializes_nonidentity_and_aliases_only_identity_on_wgpu()
         &default_caps_for(Backend::SpirvVulkan),
         &poot_test_util::graph_fixtures::roomy_body_limits(),
     )
-    .unwrap() else {
-        panic!("nonidentity E4M3FN Transpose must materialize")
-    };
+    .unwrap();
+    let Dispatch {
+        launch: Launch { grid, .. },
+        ..
+    } = into_plain(planned_plan);
     assert_eq!(grid, [5, 1, 1]);
-    assert!(matches!(
-        plan_eqn_analyzed(
+    assert!(is_plain(
+        &plan_eqn_analyzed(
             &ExactI32StorageAnalysis::new(&graph),
             &graph,
             eqn,
@@ -2418,8 +2623,7 @@ fn e4m3fn_transpose_materializes_nonidentity_and_aliases_only_identity_on_wgpu()
             &default_caps_for(Backend::Nvptx),
             &poot_test_util::graph_fixtures::roomy_body_limits()
         )
-        .unwrap(),
-        Plan::Compute { .. }
+        .unwrap()
     ));
     let backend = Backend::AmdGcn(AmdArch::gfx1151());
     let refusal = refusal_of(
@@ -2458,8 +2662,8 @@ fn e4m3fn_transpose_materializes_nonidentity_and_aliases_only_identity_on_wgpu()
     let moved_unit_axis = builder.transpose(x, vec![1, 0, 2]);
     let graph = builder.finish(moved_unit_axis);
     let eqn = &graph.eqns[0];
-    assert!(matches!(
-        plan_eqn_analyzed(
+    assert!(is_plain(
+        &plan_eqn_analyzed(
             &ExactI32StorageAnalysis::new(&graph),
             &graph,
             eqn,
@@ -2467,8 +2671,7 @@ fn e4m3fn_transpose_materializes_nonidentity_and_aliases_only_identity_on_wgpu()
             &default_caps_for(Backend::SpirvVulkan),
             &poot_test_util::graph_fixtures::roomy_body_limits()
         )
-        .unwrap(),
-        Plan::Compute { .. }
+        .unwrap()
     ));
 }
 
@@ -2504,7 +2707,7 @@ fn e4m3fn_slice_materializes_proper_ranges_and_aliases_only_full_range_on_wgpu()
     let graph = builder.finish(sliced);
     let eqn = &graph.eqns[0];
     let shape = graph.aval(eqn.out).shape.clone();
-    let Plan::Compute { grid, .. } = plan_eqn_analyzed(
+    let planned_plan = plan_eqn_analyzed(
         &ExactI32StorageAnalysis::new(&graph),
         &graph,
         eqn,
@@ -2512,13 +2715,15 @@ fn e4m3fn_slice_materializes_proper_ranges_and_aliases_only_full_range_on_wgpu()
         &default_caps_for(Backend::SpirvVulkan),
         &poot_test_util::graph_fixtures::roomy_body_limits(),
     )
-    .unwrap() else {
-        panic!("E4M3FN Slice must materialize")
-    };
+    .unwrap();
+    let Dispatch {
+        launch: Launch { grid, .. },
+        ..
+    } = into_plain(planned_plan);
     assert_eq!(shape, [2, 3]);
     assert_eq!(grid, [2, 1, 1]);
-    assert!(matches!(
-        plan_eqn_analyzed(
+    assert!(is_plain(
+        &plan_eqn_analyzed(
             &ExactI32StorageAnalysis::new(&graph),
             &graph,
             eqn,
@@ -2526,8 +2731,7 @@ fn e4m3fn_slice_materializes_proper_ranges_and_aliases_only_full_range_on_wgpu()
             &default_caps_for(Backend::Nvptx),
             &poot_test_util::graph_fixtures::roomy_body_limits()
         )
-        .unwrap(),
-        Plan::Compute { .. }
+        .unwrap()
     ));
     let backend = Backend::AmdGcn(AmdArch::gfx1151());
     let refusal = refusal_of(
@@ -2566,7 +2770,7 @@ fn e4m3fn_slice_materializes_proper_ranges_and_aliases_only_full_range_on_wgpu()
     let contiguous_rows = builder.slice(x, 0, 1, 3);
     let graph = builder.finish(contiguous_rows);
     let eqn = &graph.eqns[0];
-    let Plan::Compute { grid, .. } = plan_eqn_analyzed(
+    let planned_plan = plan_eqn_analyzed(
         &ExactI32StorageAnalysis::new(&graph),
         &graph,
         eqn,
@@ -2574,9 +2778,11 @@ fn e4m3fn_slice_materializes_proper_ranges_and_aliases_only_full_range_on_wgpu()
         &default_caps_for(Backend::SpirvVulkan),
         &poot_test_util::graph_fixtures::roomy_body_limits(),
     )
-    .unwrap() else {
-        panic!("contiguous-row E4M3FN Slice must materialize")
-    };
+    .unwrap();
+    let Dispatch {
+        launch: Launch { grid, .. },
+        ..
+    } = into_plain(planned_plan);
     assert_eq!(grid, [4, 1, 1]);
 }
 
@@ -2617,7 +2823,7 @@ fn e4m3fn_gather_always_materializes_exact_packed_output_on_wgpu() {
         let eqn = &graph.eqns[0];
         let shape = graph.aval(eqn.out).shape.clone();
         assert_eq!(shape, expected_shape);
-        let Plan::Compute { grid, .. } = plan_eqn_analyzed(
+        let planned_plan = plan_eqn_analyzed(
             &ExactI32StorageAnalysis::new(&graph),
             &graph,
             eqn,
@@ -2625,9 +2831,11 @@ fn e4m3fn_gather_always_materializes_exact_packed_output_on_wgpu() {
             &default_caps_for(Backend::SpirvVulkan),
             &poot_test_util::graph_fixtures::roomy_body_limits(),
         )
-        .unwrap() else {
-            panic!("E4M3FN Gather must materialize on wgpu")
-        };
+        .unwrap();
+        let Dispatch {
+            launch: Launch { grid, .. },
+            ..
+        } = into_plain(planned_plan);
         assert_eq!(grid, [expected_words, 1, 1]);
     }
 
@@ -2637,8 +2845,8 @@ fn e4m3fn_gather_always_materializes_exact_packed_output_on_wgpu() {
     let gathered = builder.gather(data, 0, index);
     let graph = builder.finish(gathered);
     let eqn = &graph.eqns[0];
-    assert!(matches!(
-        plan_eqn_analyzed(
+    assert!(is_plain(
+        &plan_eqn_analyzed(
             &ExactI32StorageAnalysis::new(&graph),
             &graph,
             eqn,
@@ -2646,8 +2854,7 @@ fn e4m3fn_gather_always_materializes_exact_packed_output_on_wgpu() {
             &default_caps_for(Backend::Nvptx),
             &poot_test_util::graph_fixtures::roomy_body_limits()
         )
-        .unwrap(),
-        Plan::Compute { .. }
+        .unwrap()
     ));
     let backend = Backend::AmdGcn(AmdArch::gfx1151());
     let refusal = refusal_of(
@@ -2782,8 +2989,7 @@ fn mixed_matmul_graph(op_dt: GDt, out_dt: GDt) -> Graph {
     mixed_matmul_graph_shape(16, 32, 16, op_dt, out_dt)
 }
 
-/// Like [`mixed_matmul_graph`] but with an explicit M/K/N shape (card 154's coopmat gate needs `K == 16`,
-/// which the fixed K=32 shape cannot satisfy).
+/// Like [`mixed_matmul_graph`] but with an explicit M/K/N shape.
 fn mixed_matmul_graph_shape(m: usize, k: usize, n: usize, op_dt: GDt, out_dt: GDt) -> Graph {
     let mut g = matmul_graph(m, k, n, op_dt);
     let out = g
@@ -3018,7 +3224,7 @@ fn gdn_decode_matmuls_route_as_expected_on_amdgcn() {
     assert!(
         matches!(
             contraction(&choice_outer),
-            Some(ContractionSpec::Serial { dt: Ty::F32, bias: false, shapes, .. })
+            Some(ContractionSpec::Serial { dt: Ty::F32, epilogue: None, shapes, .. })
                 if shapes.out_shape == [1, 32, 128, 128]
                     && shapes.a_shape == [1, 32, 128, 1]
                     && shapes.b_shape == [1, 32, 1, 128]
@@ -3091,10 +3297,7 @@ fn mixed_bf16_tc_key_encodes_operand_dtype_not_just_output() {
             .iter()
             .find(|e| matches!(e.op, OpKind::MatMul))
             .unwrap();
-        match planned_with_choice(g, eqn, gfx1151).unwrap().0 {
-            Plan::Compute { key, .. } => key,
-            other => panic!("matmul must be a plain compute: {other:?}"),
-        }
+        into_plain(planned_with_choice(g, eqn, gfx1151).unwrap().0).key
     };
     assert_ne!(
         plan_key(&gm),
@@ -3220,8 +3423,8 @@ fn widen_inserts_cast_for_decode_shaped_mixed_matmul() {
             panic!("decode-shaped mixed matmul must plan as bf16 GEMV on {backend:?}: {e}")
         });
         assert!(
-            matches!(plan, Plan::Compute { .. } | Plan::ComputeMeta { .. }),
-            "expected a Compute/ComputeMeta plan, got {plan:?}"
+            plan.single().is_some(),
+            "expected a single-dispatch plan, got {plan:?}"
         );
         assert!(
             is_imported(&choice, ImportedKernel::GemvCoalescedBf16),
@@ -3403,9 +3606,11 @@ fn cast_arm_matches_dtype_pairs_exhaustively() {
         };
         match cast_planned(in_dt, to, Backend::SpirvVulkan) {
             Ok((
-                Plan::Compute { .. },
+                compute_plan,
                 KernelChoice::Generated(KernelRequest::Elementwise(ElementwiseSpec::Cast(got))),
-            )) => assert_eq!(format!("{got:?}"), format!("{want:?}"), "{in_dt:?}->{to:?}"),
+            )) if is_plain(&compute_plan) => {
+                assert_eq!(format!("{got:?}"), format!("{want:?}"), "{in_dt:?}->{to:?}")
+            }
             other => panic!("cast {in_dt:?}->{to:?} should plan a Compute kernel: {other:?}"),
         }
     }
@@ -3417,7 +3622,7 @@ fn cast_arm_matches_dtype_pairs_exhaustively() {
         Backend::AmdGcn(AmdArch::gfx1151()),
     ] {
         match cast_planned(GDt::BF16, GDt::F32, backend) {
-            Ok((Plan::Compute { .. }, choice)) => assert!(
+            Ok((compute_plan, choice)) if is_plain(&compute_plan) => assert!(
                 is_imported(&choice, ImportedKernel::PackedBf16ToF32),
                 "{backend:?}: {choice:?}"
             ),
@@ -3441,9 +3646,9 @@ fn cast_arm_matches_dtype_pairs_exhaustively() {
             .unwrap();
         match planned_with_choice(&g, eqn, Backend::Nvptx) {
             Ok((
-                Plan::Compute { .. },
+                compute_plan,
                 KernelChoice::Generated(KernelRequest::Elementwise(ElementwiseSpec::Cast(got))),
-            )) => assert_eq!(
+            )) if is_plain(&compute_plan) => assert_eq!(
                 format!("{got:?}"),
                 format!("{:?}", CastSpec::Bf16ToF32 { numel: 8 })
             ),
@@ -3530,7 +3735,7 @@ fn cast_i32_to_f32_plans_an_i32_in_f32_out_kernel() {
     // types are asserted from the body.
     let (plan, choice) = exact_i32_cast_planned(Backend::SpirvVulkan).expect("i32->f32 is wired");
     assert!(
-        matches!(plan, Plan::Compute { .. }),
+        is_plain(&plan),
         "cast i32->f32 should plan a Compute kernel: {plan:?}"
     );
     assert!(
@@ -3550,10 +3755,7 @@ fn cast_i32_to_f32_plans_an_i32_in_f32_out_kernel() {
         },
         "the source operand must be an i32 slice, not bf16 or f32 bytes"
     );
-    let body = match &plan {
-        Plan::Compute { body, .. } | Plan::ComputeMeta { body, .. } => body,
-        _ => unreachable!(),
-    };
+    let body = &plan.single().expect("one dispatch").body;
     assert_eq!(
         body.locals[2].ty,
         Ty::Ref {
@@ -3611,14 +3813,14 @@ fn matmul_plan(g: &Graph, backend: Backend) -> Plan {
     .unwrap()
 }
 
-/// The `Ty` of a `Plan::Compute`/`Plan::ComputeMeta` body's first non-return parameter local (`_1`, the
+/// The `Ty` of a single-dispatch plan's body's first non-return parameter local (`_1`, the
 /// `a` operand). Asserts the actual kernel element type the `fty` bridge chose, which the cache-key
 /// string alone would not catch (a bug mapped `DType::F16 -> Ty::F32` while the key still said "f16:").
 fn body_param1_ty(plan: &Plan) -> Ty {
-    let body = match plan {
-        Plan::Compute { body, .. } | Plan::ComputeMeta { body, .. } => body,
-        other => panic!("expected a Compute/ComputeMeta plan, got {other:?}"),
-    };
+    let body = &plan
+        .single()
+        .unwrap_or_else(|| panic!("expected a single-dispatch plan, got {plan:?}"))
+        .body;
     body.locals[1].ty.clone()
 }
 
@@ -3653,11 +3855,7 @@ fn f32_matmul_request_is_the_f32_serial_kernel_after_f16_dtype_added() {
     // M==1; the guard keeps the generated tiled GEMM off it, Card 557; the imported tiled and
     // batched-tiled GEMMs are SpirvVulkan/Nvptx-only for a plain MatMul) to the naive serial fallback.
     let g = matmul_graph(32, 32, 16, GDt::F32);
-    let program = compiled(
-        &g,
-        Backend::AmdGcn(AmdArch::gfx1151()),
-        FusionPolicy::MoeHangGuard,
-    );
+    let program = compiled(&g, Backend::AmdGcn(AmdArch::gfx1151()), true);
     let (_, choice) = compiled_matmul(&program);
     assert_eq!(
         serial_matmul_dtype(choice),
@@ -3671,7 +3869,7 @@ fn f16_non_wired_op_rejected_with_diagnostic() {
     // FR-004: an F16-typed equation on an op not on the wired allow-list must be rejected with a clear
     // diagnostic, not silently emit an f32 kernel over 2-byte storage. IndexedMatMul's output dtype follows
     // its `x` operand (op.rs infer), so an F16 `x` gives an F16-typed IndexedMatMul eqn, and IndexedMatMul
-    // is not in the BF16/F16 wired list (MatMul/MatMulBias/Reshape/Transpose/Slice/Broadcast/Binary/
+    // is not in the BF16/F16 wired list (MatMul/ContractionEpilogue/Reshape/Transpose/Slice/Broadcast/Binary/
     // Unary/Gather/Concat/DynamicUpdateSlice/Reduce/Cast).
     let b = Builder::new();
     let x = b.constant("x", TensorType::new(vec![4, 8], GDt::F16));
@@ -3816,10 +4014,11 @@ fn coopmat_matmul_traces_plans_and_validates() {
         .expect("a matmul eqn");
     let (plan, choice) = planned_with_choice(&g, eqn, Backend::SpirvVulkan)
         .expect("a 16x16x16 f16-in/f32-out matmul must plan on SpirvVulkan");
-    let (body, grid) = match plan {
-        Plan::Compute { body, grid, .. } => (body, grid),
-        other => panic!("expected Plan::Compute, got {other:?}"),
-    };
+    let Dispatch {
+        body,
+        launch: Launch { grid, .. },
+        ..
+    } = into_plain(plan);
     assert!(
         matches!(contraction(&choice), Some(ContractionSpec::Coopmat { .. })),
         "expected the coopmat arm to fire: got {choice:?}"
@@ -3890,10 +4089,7 @@ fn nvptx_tc_batched_bf16_matmul_grid_includes_batch_factor() {
         .expect("a matmul eqn");
     let (plan, choice) = planned_with_choice(&g, eqn, Backend::Nvptx)
         .expect("a batched 16x16x16 bf16 matmul must plan on Nvptx");
-    let grid = match plan {
-        Plan::Compute { grid, .. } => grid,
-        other => panic!("expected Plan::Compute, got {other:?}"),
-    };
+    let grid = into_plain(plan).launch.grid;
     assert!(
         is_tensor_core(&choice),
         "expected the NVPTX tc arm to fire: got {choice:?}"
@@ -3903,6 +4099,74 @@ fn nvptx_tc_batched_bf16_matmul_grid_includes_batch_factor() {
         [512, 1, 1],
         "planned grid must include the batch factor (2 batches * 1 tile * 256 threads)"
     );
+}
+
+/// `batched_matmul_graph` with the output retagged to the f32 accumulate type (the mixed shape every tensor-core arm
+/// admits), planned for `backend`: the plan and its kernel choice.
+fn mixed_batched_matmul_plan(
+    batch: usize,
+    (m, k, n): (usize, usize, usize),
+    operand: GDt,
+    backend: Backend,
+) -> Result<(Plan, KernelChoice), PlanError> {
+    let mut g = batched_matmul_graph(batch, m, k, n, operand);
+    let out = g.output;
+    g.values[out].aval.dtype = GDt::F32;
+    let eqn = g
+        .eqns
+        .iter()
+        .find(|e| matches!(e.op, OpKind::MatMul))
+        .expect("a matmul eqn");
+    planned_with_choice(&g, eqn, backend)
+}
+
+/// Card 663 SC-001/SC-003, planner side: the cooperative-matrix arm admits a multi-block (`K = 48`) batched
+/// (`[2, 32, 48] @ [48, 32]`) matmul, launching one subgroup per output tile of every batch element
+/// (`2 * 2 * 2 = 8` tiles of 32 lanes); a ragged `K` (not a multiple of 16) is not eligible, is not padded, and
+/// refuses the mixed-dtype lowering (the f16-in/f32-out shape has no other kernel).
+///
+/// Mutation: restore the single K tile in `matmul_spirv_coopmat_eligible` (`k == 16`); the multi-block shape
+/// stops selecting the coopmat arm and the first assertion goes red.
+#[test]
+fn coopmat_arm_admits_multi_block_batched_shapes_and_refuses_a_ragged_k() {
+    let (plan, choice) = mixed_batched_matmul_plan(2, (32, 48, 32), GDt::F16, Backend::SpirvVulkan)
+        .expect("a 16-aligned batched f16-in/f32-out matmul plans on SpirvVulkan");
+    assert!(
+        matches!(contraction(&choice), Some(ContractionSpec::Coopmat { .. })),
+        "expected the coopmat arm for K = 48: got {choice:?}"
+    );
+    assert_eq!(
+        into_plain(plan).launch.grid,
+        [8 * 32, 1, 1],
+        "one 32-lane subgroup per output tile of every batch element"
+    );
+    let ragged = mixed_batched_matmul_plan(2, (32, 40, 32), GDt::F16, Backend::SpirvVulkan);
+    assert!(
+        matches!(&ragged, Err(PlanError::Refused(r)) if r.missing == Capability::DtypeLowering),
+        "a ragged K must refuse rather than pad: got {ragged:?}"
+    );
+}
+
+/// Card 663 SC-001, planner side for the AMD arm: a batched multi-block bf16 matmul on gfx1151 selects the WMMA
+/// tensor-core kernel (it used to fall to the serial kernel for any batch dim) and launches one 256-thread block per
+/// output tile of every batch element.
+///
+/// Mutation: restore the single-batch requirement in `matmul_amd_tc_eligible`; the choice is no longer the
+/// tensor-core kernel and the row goes red.
+#[test]
+fn amd_tensor_core_arm_admits_multi_block_batched_shapes() {
+    let (plan, choice) = mixed_batched_matmul_plan(
+        2,
+        (32, 48, 32),
+        GDt::BF16,
+        Backend::AmdGcn(AmdArch::gfx1151()),
+    )
+    .expect("a 16-aligned batched bf16-in/f32-out matmul plans on gfx1151");
+    assert!(
+        is_tensor_core(&choice),
+        "expected the WMMA tensor-core arm for a batched K = 48: got {choice:?}"
+    );
+    assert_eq!(into_plain(plan).launch.grid, [8 * 256, 1, 1]);
 }
 
 #[test]
@@ -3916,18 +4180,19 @@ fn tensorcore_not_selected_for_spirv() {
     );
 }
 
-/// `g` compiled for `backend` under `fusion`.
-fn compiled(g: &Graph, backend: Backend, fusion: FusionPolicy) -> Program {
+/// `g` compiled for `backend`: the full pipeline, or with `guarded` the routed-expert hang guard (the graph
+/// then carries a routed-expert site and the target has the hang).
+fn compiled(g: &Graph, backend: Backend, guarded: bool) -> Program {
     let target = Target {
         backend,
         caps: default_caps_for(backend),
     };
     let options = CompileOptions {
         execution: Submission::Replay,
-        fusion,
         limits: crate::CompileLimits::STANDARD,
     };
-    compile(g, &target, &options).expect("the matmul compiles")
+    let (g, caps) = poot_test_util::graph_fixtures::pipeline_input(g, target.caps, guarded);
+    compile(&g, &Target { caps, ..target }, &options).expect("the matmul compiles")
 }
 
 /// The compiled MatMul's plan and kernel choice.
@@ -3958,26 +4223,22 @@ fn tiled_matmul_gets_the_tiled_grid_not_the_naive_fallthrough() {
     let g = matmul_graph(m, k, n, GDt::F32);
     let out_numel = m * n;
 
-    let full = compiled(&g, Backend::SpirvVulkan, FusionPolicy::Full);
+    let full = compiled(&g, Backend::SpirvVulkan, false);
     let (plan, choice) = compiled_matmul(&full);
     assert!(
         is_tiled_region(choice),
         "Full chooses the tiled GEMM: {choice:?}"
     );
-    let &Plan::Compute { grid: tiled, .. } = plan else {
-        panic!("the generated tiled GEMM plans as Compute, got {plan:?}")
-    };
+    let tiled = plain(plan).launch.grid;
     // Under the guard the MatMul keeps `is_tiled_gemm_in`'s imported tiled-GEMM body
-    // (`tiled_gemm_plan`, a `Plan::ComputeMeta`: its dims ride in a metadata buffer).
-    let guarded = compiled(&g, Backend::SpirvVulkan, FusionPolicy::MoeHangGuard);
+    // (`tiled_gemm_plan`, a single dispatch with a metadata buffer: its dims ride in a metadata buffer).
+    let guarded = compiled(&g, Backend::SpirvVulkan, true);
     let (plan, choice) = compiled_matmul(&guarded);
     assert!(
         !is_tiled_region(choice),
         "the guard keeps the imported GEMM: {choice:?}"
     );
-    let &Plan::ComputeMeta { grid: imported, .. } = plan else {
-        panic!("the imported tiled GEMM plans as ComputeMeta, got {plan:?}")
-    };
+    let imported = with_meta(plan).launch.grid;
 
     let groups = m.div_ceil(2 * GEMM_TILE) * n.div_ceil(GEMM_TILE);
     assert_eq!(
@@ -3996,6 +4257,52 @@ fn tiled_matmul_gets_the_tiled_grid_not_the_naive_fallthrough() {
     );
 }
 
+/// The imported tiled GEMM over the RADV tile ceiling (card 096) splits into sub-cap dispatches whose grids
+/// are `groups * GEMM_TILE^2` threads each, whose groups sum to the whole tile range, and whose metadata
+/// buffers carry their tile offset. Mutation: build a split dispatch's grid as `groups + workgroup`
+/// instead of `groups * workgroup`; the grid assertion goes red.
+#[test]
+fn an_imported_tiled_gemm_over_the_tile_ceiling_splits_into_disjoint_launches() {
+    let (m, k, n) = (4096usize, 8usize, 4096usize);
+    let g = matmul_graph(m, k, n, GDt::F32);
+    let program = compiled(&g, Backend::SpirvVulkan, true);
+    let (plan, choice) = compiled_matmul(&program);
+    assert!(
+        !is_tiled_region(choice),
+        "the guard keeps the imported GEMM: {choice:?}"
+    );
+    let ceiling = default_caps_for(Backend::SpirvVulkan)
+        .known_miscompiles
+        .tiled_gemm_max_workgroups
+        .expect("wgpu on RADV has a tile ceiling") as usize;
+    let groups = m.div_ceil(2 * GEMM_TILE) * n.div_ceil(GEMM_TILE);
+    assert!(groups >= ceiling, "the fixture must reach the ceiling");
+    let dispatches = plan.dispatches();
+    assert!(dispatches.len() > 1, "{plan:?}");
+    let lanes = GEMM_TILE * GEMM_TILE;
+    let mut covered = 0usize;
+    for dispatch in dispatches {
+        let launch = &dispatch.launch;
+        let chunk_groups = launch.grid[0] as usize / lanes;
+        assert_eq!(
+            launch.grid,
+            [(chunk_groups * lanes) as u32, 1, 1],
+            "a split dispatch launches whole tile workgroups"
+        );
+        assert!(
+            chunk_groups < ceiling,
+            "each launch stays under the ceiling"
+        );
+        assert_eq!(
+            launch.meta,
+            [m as u32, k as u32, n as u32, covered as u32],
+            "the tile offset rides in the metadata"
+        );
+        covered += chunk_groups;
+    }
+    assert_eq!(covered, groups, "the launches tile the whole output");
+}
+
 /// Card 557: the generated tiled GEMM owns its launch (`GEMM_TILE^2`-lane workgroups over a 64-lane LDS
 /// tile), and the op alone no longer says so: `finalize` reads the recorded choice. On AMDGCN (where
 /// the imported tiled GEMM, and so `is_tiled_gemm_in`, does not apply) a MatMul whose output is past the
@@ -4008,16 +4315,19 @@ fn a_large_tiled_matmul_keeps_its_tile_workgroup_on_amdgcn() {
     let (k, n) = (8usize, 2048usize);
     let m = (caps.max_grid[0] as usize * GEMM_TILE * GEMM_TILE).div_ceil(n) + 1;
     let g = matmul_graph(m, k, n, GDt::F32);
-    let program = compiled(&g, backend, FusionPolicy::Full);
+    let program = compiled(&g, backend, false);
     let (plan, choice) = compiled_matmul(&program);
-    let bodies: Vec<&Body> = match plan {
-        Plan::Compute { body, .. } => vec![body],
-        Plan::ComputeChunks(chunks) => chunks.iter().map(|chunk| &chunk.body).collect(),
-        other => panic!("the tiled GEMM plans as Compute or ComputeChunks, got {other:?}"),
-    };
+    let bodies: Vec<&Body> = plan
+        .dispatches()
+        .iter()
+        .map(|dispatch| &dispatch.body)
+        .collect();
     assert!(
-        is_tiled_region(choice)
-            || matches!(choice, KernelChoice::Chunked(chunks) if chunks.iter().all(is_tiled_region)),
+        !bodies.is_empty(),
+        "the tiled GEMM plans a dispatch: {plan:?}"
+    );
+    assert!(
+        is_tiled_region(choice),
         "an M>1 F32 matmul takes the generated tiled GEMM: {choice:?}"
     );
     for body in bodies {
@@ -4234,8 +4544,8 @@ fn transpose_into_binary_add_lowers_to_view_zero_dispatch() {
     )
     .unwrap()
     {
-        Plan::ComputeMeta { .. } => {}
-        other => panic!("expected the unchanged ComputeMeta copy plan, got {other:?}"),
+        copy_plan if is_plain(&copy_plan) => {}
+        other => panic!("expected the unchanged materialize copy plan, got {other:?}"),
     }
 }
 
@@ -4269,9 +4579,9 @@ fn transpose_into_matmul_keeps_the_materialize_copy() {
     )
     .unwrap()
     {
-        // exactly one Cont (the `index_remap_copy`-backed ComputeMeta).
-        Plan::ComputeMeta { .. } => {}
-        other => panic!("expected the unchanged materialize (ComputeMeta) plan, got {other:?}"),
+        // exactly one dispatch: the generated movement copy.
+        copy_plan if is_plain(&copy_plan) => {}
+        other => panic!("expected the unchanged materialize copy plan, got {other:?}"),
     }
 }
 
@@ -4299,36 +4609,40 @@ fn view_cache_key_never_collides_with_a_plain_buffer_of_the_same_shape() {
 
     let eqn_view = g.eqns.iter().find(|e| e.out == y_view.id).unwrap();
     let eqn_plain = g.eqns.iter().find(|e| e.out == y_plain.id).unwrap();
-    let (key_view, body_view) = match plan_eqn_views_analyzed(
-        &ExactI32StorageAnalysis::new(&g),
-        &g,
-        eqn_view,
-        Backend::SpirvVulkan,
-        1,
-        &views,
-        &default_caps_for(Backend::SpirvVulkan),
-        &poot_test_util::graph_fixtures::roomy_body_limits(),
-    )
-    .unwrap()
-    {
-        Plan::Compute { key, body, .. } => (key, body),
-        other => panic!("expected Plan::Compute, got {other:?}"),
-    };
-    let (key_plain, body_plain) = match plan_eqn_views_analyzed(
-        &ExactI32StorageAnalysis::new(&g),
-        &g,
-        eqn_plain,
-        Backend::SpirvVulkan,
-        1,
-        &views,
-        &default_caps_for(Backend::SpirvVulkan),
-        &poot_test_util::graph_fixtures::roomy_body_limits(),
-    )
-    .unwrap()
-    {
-        Plan::Compute { key, body, .. } => (key, body),
-        other => panic!("expected Plan::Compute, got {other:?}"),
-    };
+    let Dispatch {
+        key: key_view,
+        body: body_view,
+        ..
+    } = into_plain(
+        plan_eqn_views_analyzed(
+            &ExactI32StorageAnalysis::new(&g),
+            &g,
+            eqn_view,
+            Backend::SpirvVulkan,
+            1,
+            &views,
+            &default_caps_for(Backend::SpirvVulkan),
+            &poot_test_util::graph_fixtures::roomy_body_limits(),
+        )
+        .unwrap(),
+    );
+    let Dispatch {
+        key: key_plain,
+        body: body_plain,
+        ..
+    } = into_plain(
+        plan_eqn_views_analyzed(
+            &ExactI32StorageAnalysis::new(&g),
+            &g,
+            eqn_plain,
+            Backend::SpirvVulkan,
+            1,
+            &views,
+            &default_caps_for(Backend::SpirvVulkan),
+            &poot_test_util::graph_fixtures::roomy_body_limits(),
+        )
+        .unwrap(),
+    );
     assert_ne!(
         key_view, key_plain,
         "a view operand and a plain buffer of the same shape must not share a cache key"
@@ -4339,6 +4653,15 @@ fn view_cache_key_never_collides_with_a_plain_buffer_of_the_same_shape() {
         "the generated Bodies must differ too (not just the label) - a same-key collision would \
          have silently reused one Body's compiled shader for the other's inputs"
     );
+}
+
+/// Row-major strides of `shape`, the reference the view tests decode coordinates against.
+fn row_major_strides(shape: &[usize]) -> Vec<usize> {
+    let mut strides = vec![1usize; shape.len()];
+    for d in (0..shape.len().saturating_sub(1)).rev() {
+        strides[d] = strides[d + 1] * shape[d + 1];
+    }
+    strides
 }
 
 /// Seeded xorshift64 for the fuzz tests below (no external RNG dependency).
@@ -4510,36 +4833,59 @@ fn view_broadcast_matches_oracle_fuzz() {
     }
 }
 
+/// Dispatches per token of the 24-layer Qwen2.5-0.5B real-config decode graph (the legacy tracer planned 415).
+const QWEN2_0_5B_DISPATCHES: usize = 367;
+
+/// Dispatches per token of the 28-layer Qwen3-0.6B real-config decode graph (the legacy tracer planned 539).
+const QWEN3_0_6B_DISPATCHES: usize = 483;
+
+/// Dispatches `program` runs per step: every planned equation but the free ones (an alias or a strided view).
+fn dispatches(program: &Program) -> usize {
+    program
+        .planned()
+        .filter(|(_, plan)| !matches!(plan, Plan::Alias(_) | Plan::View { .. }))
+        .count()
+}
+
 #[test]
 fn dispatch_count_planned_regression_on_real_qwen2_decode_configs() {
-    // Planner-level sibling of poot-eval's `dispatch_count_regression_on_real_qwen2_decode_configs`:
-    // pins `dispatch_count_planned(_, Backend::SpirvVulkan)` (spec 132 phase 1; an eqn `compute_views`
-    // promoted to a free `Plan::View` counts as 0 dispatches) on the real Qwen2.5-0.5B / Qwen3-0.6B
-    // decode graphs through [`optimize`] (the pre-`compile` IR passes alone, the former
-    // `transform::optimize()` pipeline). The pins are exact: a bound that sits above the real count
-    // would still pass with a fusion pass (rope fusion) deleted, so any change in either direction
-    // fails here and the pin is updated deliberately with the change that moved it. Weights-free: the
-    // count depends only on graph structure.
+    // Pins the dispatches per token of the real Qwen2.5-0.5B / Qwen3-0.6B decode graphs (`Model::trace`,
+    // one token) through `compile`, the production pipeline, on both planner families (SPIR-V and PTX).
+    // The pins are exact: a bound above the real count would still pass with a fusion pass deleted, so any
+    // change in either direction fails here and the pin is updated deliberately with the change that moved
+    // it. Weights-free: the count depends only on graph structure.
     let cap = 64usize;
-
-    // 24-layer Qwen2.5-0.5B real-config decode graph (`Model::trace`, one token), full optimize():
-    // 825 planned dispatches. The dense decode body plans about twice the dispatches per layer it
-    // should: POOT-1022 brings it down, and this pin moves down with that card.
-    let og = optimize(&real_decode_graph(qwen2_0_5b(), cap));
-    assert_eq!(
-        dispatch_count_planned(&og, Backend::SpirvVulkan),
-        825,
-        "qwen2_0_5b real-config dispatch_count_planned moved off its pin"
-    );
-
-    // 28-layer Qwen3-0.6B real-config decode graph, full optimize(): 905 planned dispatches; see the
-    // qwen2_0_5b comment above (POOT-1022 moves this pin down too).
-    let og3 = optimize(&real_decode_graph(qwen3_0_6b(), cap));
-    assert_eq!(
-        dispatch_count_planned(&og3, Backend::SpirvVulkan),
-        905,
-        "qwen3_0_6b real-config dispatch_count_planned moved off its pin"
-    );
+    for (name, dense, pin) in [
+        ("qwen2_0_5b", qwen2_0_5b(), QWEN2_0_5B_DISPATCHES),
+        ("qwen3_0_6b", qwen3_0_6b(), QWEN3_0_6B_DISPATCHES),
+    ] {
+        let g = real_decode_graph(dense, cap);
+        for backend in [Backend::SpirvVulkan, Backend::Nvptx] {
+            let program = compiled(&g, backend, false);
+            assert_eq!(
+                dispatches(&program),
+                pin,
+                "{name} {backend:?} dispatches per token moved off its pin"
+            );
+            // Every norm scale and bias is read narrow by the region that uses it: no cast of a weight runs.
+            let weight_casts = program
+                .graph()
+                .eqns
+                .iter()
+                .filter(|eqn| {
+                    matches!(eqn.op, OpKind::Cast { .. })
+                        && matches!(
+                            eqn.inputs.as_slice(),
+                            [Operand::Value(src)] if program.graph().meta(*src).storage == Storage::Const
+                        )
+                })
+                .count();
+            assert_eq!(
+                weight_casts, 0,
+                "{name} {backend:?}: a weight cast still dispatches"
+            );
+        }
+    }
 }
 
 /// A copy of `g` with every named value renamed by `rename(value_index, old_name)`. Ids, shapes,
@@ -4786,7 +5132,7 @@ fn nvptx_view_promotion_matches_amdgcn_on_real_qwen2_decode_configs() {
 /// (dispatch) count on Nvptx as on AmdGcn - a GPU-free plan-level restatement of SC-004's acceptance
 /// text ("the strided-view fixture runs on PTX without the extra copy ... the counter reads one more
 /// copy per view") as a planning-time assertion instead of a pod-measured native copy count: every
-/// view the planner promotes (`Plan::View`, no dispatch) is one fewer `Plan::Compute`/`ComputeMeta`
+/// view the planner promotes (`Plan::View`, no dispatch) is one fewer
 /// materialize-copy dispatch than an unpromoted plan would need, so an equal promoted-dispatch count
 /// between backends is exactly "PTX pays no extra copy for the views it shares with ROCm". Separate
 /// from `nvptx_view_promotion_matches_amdgcn_on_real_qwen2_decode_configs` above (which checks the
@@ -4995,7 +5341,7 @@ fn view_chain_matches_oracle_fuzz() {
 
 /// Card 159 Inc3: at gemma4-dense's batched-shared-pool-prefill local-layer scatter shape
 /// (`pool_slots=1025, Hkv=16, D=256` -> `out_numel=4,198,400`, over `SCATTER_UPDATE_CHUNK_WORK`), the
-/// wgpu `ScatterUpdate` plan must split into several `ComputeChunks` (kernelgen
+/// wgpu `ScatterUpdate` plan must split into several dispatches (kernelgen
 /// `scatter_update_chunked_dt`, not the fixed-signature imported kernel) covering disjoint,
 /// full-coverage element ranges, avoiding the flush_work-watchdog single-dispatch thrashing (see
 /// `gemma4_prefill_kv_trace_shared_pool` in poot-models). NVPTX (no display watchdog) stays the single
@@ -5022,7 +5368,7 @@ fn scatter_update_chunks_on_wgpu_at_gemma4_local_layer_pool_shape() {
     let out_shape = g.aval(eqn.out).shape.clone();
     assert_eq!(numel(&out_shape), out_numel);
 
-    match plan_eqn_analyzed(
+    let plan = plan_eqn_analyzed(
         &ExactI32StorageAnalysis::new(&g),
         &g,
         eqn,
@@ -5030,24 +5376,20 @@ fn scatter_update_chunks_on_wgpu_at_gemma4_local_layer_pool_shape() {
         &default_caps_for(Backend::SpirvVulkan),
         &poot_test_util::graph_fixtures::roomy_body_limits(),
     )
-    .unwrap()
-    {
-        Plan::ComputeChunks(chunks) => {
-            assert!(
-                chunks.len() > 1,
-                "large wgpu scatter should split into >1 chunk"
-            );
-            // chunks must be disjoint and fully cover out_numel (the ComputeChunks contract).
-            let covered: usize = chunks
-                .iter()
-                .map(|c| c.groups * SCATTER_UPDATE_WG)
-                .sum::<usize>()
-                .min(out_numel + (chunks.len() - 1) * SCATTER_UPDATE_WG); // last chunk may over-launch to a wg boundary
-            assert!(covered >= out_numel, "chunks must cover the full output");
-        }
-        _ => panic!("large wgpu ScatterUpdate should be Plan::ComputeChunks"),
-    }
-    // A small pool (well under the chunk budget) stays the single imported dispatch. card 525: plan_eqn
+    .unwrap();
+    let chunks = plan.dispatches();
+    assert!(
+        chunks.len() > 1,
+        "large wgpu scatter should split into >1 dispatch: {plan:?}"
+    );
+    // dispatches must be disjoint and fully cover out_numel (the split-plan contract).
+    let covered: usize = chunks
+        .iter()
+        .map(|c| c.launch.grid[0] as usize / c.body.workgroup_size[0] as usize * SCATTER_UPDATE_WG)
+        .sum::<usize>()
+        .min(out_numel + (chunks.len() - 1) * SCATTER_UPDATE_WG); // last chunk may over-launch to a wg boundary
+    assert!(covered >= out_numel, "chunks must cover the full output");
+    // A small pool (well under the chunk budget) stays the single dispatch. card 525: plan_eqn
     // can no longer be handed a shape that disagrees with the graph, so this needs its own small
     // ScatterUpdate graph rather than replaying the large one under a fake `[4, 3]` shape.
     let small_b = Builder::new();
@@ -5062,32 +5404,35 @@ fn scatter_update_chunks_on_wgpu_at_gemma4_local_layer_pool_shape() {
         .find(|e| matches!(e.op, OpKind::ScatterUpdate))
         .unwrap();
     assert_eq!(numel(&small_g.aval(small_eqn.out).shape), 4 * 3);
+    let whole_scatter = |choice: &KernelChoice| {
+        matches!(
+            choice,
+            KernelChoice::Generated(KernelRequest::Movement(kg::MovementSpec {
+                op: kg::MovementOp::ScatterRows { window: None, .. },
+                ..
+            }))
+        )
+    };
     match planned_with_choice(&small_g, small_eqn, Backend::SpirvVulkan) {
-        Ok((Plan::Compute { .. }, choice)) => {
-            assert!(
-                is_imported(&choice, ImportedKernel::ScatterUpdate),
-                "{choice:?}"
-            )
+        Ok((compute_plan, choice)) if is_plain(&compute_plan) => {
+            assert!(whole_scatter(&choice), "{choice:?}")
         }
         other => {
-            panic!("small wgpu ScatterUpdate should be the single imported dispatch: {other:?}")
+            panic!("small wgpu ScatterUpdate should be the single whole dispatch: {other:?}")
         }
     }
-    // NVPTX has no display watchdog: stays the single imported dispatch even at the large shape.
+    // NVPTX has no display watchdog: stays the single whole dispatch even at the large shape.
     match planned_with_choice(&g, eqn, Backend::Nvptx).unwrap() {
-        (Plan::Compute { .. }, choice) => {
-            assert!(
-                is_imported(&choice, ImportedKernel::ScatterUpdate),
-                "{choice:?}"
-            )
+        (compute_plan, choice) if is_plain(&compute_plan) => {
+            assert!(whole_scatter(&choice), "{choice:?}")
         }
-        _ => panic!("NVPTX ScatterUpdate should stay Plan::Compute (no chunking)"),
+        _ => panic!("NVPTX ScatterUpdate should stay a single dispatch (no chunking)"),
     }
 }
 
 /// Card 258: at BLOOM's tied-`lm_head` decode-GEMV scale (`M=1, K=1024, N=250880`, the shape that hung
 /// real hardware, over
-/// `DECODE_GEMV_CHUNK_TRIGGER`), the wgpu decode-GEMV plan must split into several `Plan::ComputeChunks`
+/// `DECODE_GEMV_CHUNK_TRIGGER`), the wgpu decode-GEMV plan must split into several dispatches
 /// (kernelgen `gemv_lds` with a baked `elem_offset`, not the fixed-signature imported kernel) covering
 /// disjoint, full-coverage output-column ranges, like `serial_kquant_dequant_plan` (card 163). gpt-oss's
 /// scale (`N=201088`, at/under the trigger) stays a single unchunked imported dispatch. AmdGcn (no display
@@ -5109,7 +5454,7 @@ fn decode_gemv_chunks_on_wgpu_at_bloom_lm_head_shape() {
         "test fixture must exceed the chunk trigger"
     );
 
-    match plan_eqn_analyzed(
+    let plan = plan_eqn_analyzed(
         &ExactI32StorageAnalysis::new(&g),
         &g,
         eqn,
@@ -5117,33 +5462,30 @@ fn decode_gemv_chunks_on_wgpu_at_bloom_lm_head_shape() {
         &default_caps_for(Backend::SpirvVulkan),
         &poot_test_util::graph_fixtures::roomy_body_limits(),
     )
-    .unwrap()
-    {
-        Plan::ComputeChunks(chunks) => {
-            assert!(
-                chunks.len() > 1,
-                "BLOOM-scale wgpu decode-GEMV should split into >1 chunk"
-            );
-            // every chunk's workgroup count must clear the wgpu per-dim grid cap (chunk size is capped at
-            // caps.max_grid[0]; each chunk is a plain 1-D ComputeChunks grid).
-            let grid_cap = default_caps_for(Backend::SpirvVulkan).max_grid[0] as usize;
-            for c in &chunks {
-                assert!(c.groups <= grid_cap, "chunk grid must clear the grid cap");
-                assert!(
-                    c.meta.is_empty(),
-                    "a kernelgen chunk bakes its offset as a const, no meta buffer"
-                );
-            }
-            // chunks must be disjoint and fully cover out_numel (one workgroup per output element, so
-            // `groups` sums exactly to out_numel, with no workgroup-size rounding slack).
-            let covered: usize = chunks.iter().map(|c| c.groups).sum();
-            assert_eq!(
-                covered, out_numel,
-                "chunks must exactly cover the full output"
-            );
-        }
-        other => panic!("BLOOM-scale wgpu decode-GEMV should be Plan::ComputeChunks: {other:?}"),
+    .unwrap();
+    let chunks = plan.dispatches();
+    assert!(
+        chunks.len() > 1,
+        "BLOOM-scale wgpu decode-GEMV should split into >1 dispatch: {plan:?}"
+    );
+    // every chunk's workgroup count must clear the wgpu per-dim grid cap (chunk size is capped at
+    // caps.max_grid[0]; each chunk is a plain 1-D grid).
+    let grid_cap = default_caps_for(Backend::SpirvVulkan).max_grid[0] as usize;
+    let groups = |c: &Dispatch| c.launch.grid[0] as usize / c.body.workgroup_size[0] as usize;
+    for c in chunks {
+        assert!(groups(c) <= grid_cap, "chunk grid must clear the grid cap");
+        assert!(
+            c.launch.meta.is_empty(),
+            "a kernelgen chunk bakes its offset as a const, no meta buffer"
+        );
     }
+    // chunks must be disjoint and fully cover out_numel (one workgroup per output element, so
+    // `groups` sums exactly to out_numel, with no workgroup-size rounding slack).
+    let covered: usize = chunks.iter().map(groups).sum();
+    assert_eq!(
+        covered, out_numel,
+        "chunks must exactly cover the full output"
+    );
 
     // gpt-oss's scale (at/under the trigger) stays the single unchunked imported dispatch.
     let (k2, n2) = (32usize, 201_088usize);
@@ -5154,26 +5496,26 @@ fn decode_gemv_chunks_on_wgpu_at_bloom_lm_head_shape() {
         .find(|e| matches!(e.op, OpKind::MatMul))
         .unwrap();
     match planned_with_choice(&g2, eqn2, Backend::SpirvVulkan).unwrap() {
-        (Plan::Compute { .. }, choice) => {
+        (compute_plan, choice) if is_plain(&compute_plan) => {
             assert!(
                 is_imported(&choice, ImportedKernel::GemvCoalesced),
                 "{choice:?}"
             )
         }
-        other => panic!("gpt-oss-scale wgpu decode-GEMV should stay Plan::Compute: {other:?}"),
+        other => panic!("gpt-oss-scale wgpu decode-GEMV should stay one dispatch: {other:?}"),
     }
 
     // AmdGcn has no display watchdog: stays the single unchunked imported dispatch even at BLOOM's
     // large shape (chunking is SpirvVulkan-only, as in card 163).
     let amdgcn = Backend::AmdGcn(AmdArch::gfx1151());
     match planned_with_choice(&g, eqn, amdgcn).unwrap() {
-        (Plan::Compute { .. }, choice) => {
+        (compute_plan, choice) if is_plain(&compute_plan) => {
             assert!(
                 is_imported(&choice, ImportedKernel::GemvCoalesced),
                 "{choice:?}"
             )
         }
-        other => panic!("AmdGcn decode-GEMV should stay Plan::Compute (no chunking): {other:?}"),
+        other => panic!("AmdGcn decode-GEMV should stay one dispatch (no chunking): {other:?}"),
     }
 }
 
@@ -5227,7 +5569,7 @@ fn decode_gemv_chunking_follows_the_caps_watchdog_trigger_not_a_fixed_constant()
 
     // Low trigger (under this shape's 230_000 elements): chunks, like the BLOOM-scale case above.
     let low = caps_for(100_000);
-    match plan_eqn_analyzed(
+    let chunked = plan_eqn_analyzed(
         &ExactI32StorageAnalysis::new(&g),
         &g,
         eqn,
@@ -5235,17 +5577,17 @@ fn decode_gemv_chunking_follows_the_caps_watchdog_trigger_not_a_fixed_constant()
         &low,
         &poot_test_util::graph_fixtures::roomy_body_limits(),
     )
-    .unwrap()
-    {
-        Plan::ComputeChunks(chunks) => assert!(chunks.len() > 1),
-        other => panic!("low watchdog trigger should chunk this shape: {other:?}"),
-    }
+    .unwrap();
+    assert!(
+        chunked.dispatches().len() > 1,
+        "low watchdog trigger should chunk this shape: {chunked:?}"
+    );
 
     // High trigger (over this shape's 230_000 elements): a single unchunked dispatch, even though this
     // is the exact same backend and the exact same shape that chunked above.
     let high = caps_for(1_000_000);
     match planned_with_choice_caps(&g, eqn, Backend::SpirvVulkan, &high).unwrap() {
-        (Plan::Compute { .. }, choice) => {
+        (compute_plan, choice) if is_plain(&compute_plan) => {
             assert!(
                 is_imported(&choice, ImportedKernel::GemvCoalesced),
                 "{choice:?}"
@@ -5255,153 +5597,362 @@ fn decode_gemv_chunking_follows_the_caps_watchdog_trigger_not_a_fixed_constant()
     }
 }
 
-/// Card 522 SC-003, Card 557 SC-001: the flash decode's kernel choice reads one shared
-/// `poot_target::FLASH_LDS_CAP`. A head dim at the cap plans the synthesized region decode on every
-/// target with no cap error (no plan-summary fixture has D = 256, so this row pins the boundary); one
-/// above the cap, planned on `Backend::SpirvVulkan` (which has no D>cap fallback), refuses with
-/// `Capability::HeadDimExceedsLdsCap`. Mutation: change the region-decode choice to
-/// `d < FLASH_LDS_CAP` (`planner/attention.rs`); the D = 256 decode leaves the region decode and this
-/// row goes red.
-#[test]
-fn flash_decode_lds_cap_boundary_is_one_planner_choice() {
-    let at_cap = flash_decode_graph(poot_target::FLASH_LDS_CAP);
-    for backend in [
-        Backend::SpirvVulkan,
-        Backend::AmdGcn(AmdArch::gfx1151()),
-        Backend::Nvptx,
-    ] {
-        let (_, choice) = flash_decode_planned(&at_cap, backend)
-            .unwrap_or_else(|e| panic!("{backend:?}: head_dim == FLASH_LDS_CAP must plan: {e:?}"));
-        assert!(
-            matches!(
-                choice,
-                KernelChoice::Generated(KernelRequest::Attention(AttentionSpec::RegionDecode {
-                    d,
-                    ..
-                })) if d == poot_target::FLASH_LDS_CAP
-            ),
-            "{backend:?}: head_dim == FLASH_LDS_CAP must take the region decode, got {choice:?}"
-        );
+/// One attention equation to plan: `q[B,Hq,Lq,D]`, `k`/`v[B,Hq/n_rep,Lk,D]`, `mask[B,Hm,Lq,Lk]`.
+#[derive(Clone, Copy)]
+struct AttentionFixture {
+    name: &'static str,
+    batch: usize,
+    hq: usize,
+    n_rep: usize,
+    lq: usize,
+    lk: usize,
+    d: usize,
+    per_head_mask: bool,
+    softcap: Option<f32>,
+}
+
+impl AttentionFixture {
+    /// Decode: one query row against a `cap`-key cache.
+    const fn decode(
+        name: &'static str,
+        batch: usize,
+        hq: usize,
+        n_rep: usize,
+        cap: usize,
+        d: usize,
+    ) -> Self {
+        Self {
+            name,
+            batch,
+            hq,
+            n_rep,
+            lq: 1,
+            lk: cap,
+            d,
+            per_head_mask: false,
+            softcap: None,
+        }
     }
 
-    let err = flash_decode_planned(
-        &flash_decode_graph(poot_target::FLASH_LDS_CAP + 1),
-        Backend::SpirvVulkan,
-    )
-    .expect_err("head_dim == FLASH_LDS_CAP + 1 must refuse on SpirvVulkan");
-    assert!(
-        matches!(
-            &err,
-            PlanError::Refused(refusal) if refusal.missing == Capability::HeadDimExceedsLdsCap {
-                head_dim: poot_target::FLASH_LDS_CAP + 1,
-                lds_cap: FLASH_LDS_CAP,
-            }
-        ),
-        "expected a HeadDimExceedsLdsCap refusal, got {err:?}"
-    );
+    /// Prefill: `l` query rows against the same `l` keys.
+    const fn prefill(name: &'static str, hq: usize, n_rep: usize, l: usize, d: usize) -> Self {
+        Self {
+            name,
+            batch: 1,
+            hq,
+            n_rep,
+            lq: l,
+            lk: l,
+            d,
+            per_head_mask: false,
+            softcap: None,
+        }
+    }
+
+    fn alibi(self) -> Self {
+        Self {
+            per_head_mask: true,
+            ..self
+        }
+    }
+
+    fn softcapped(self, cap: f32) -> Self {
+        Self {
+            softcap: Some(cap),
+            ..self
+        }
+    }
+
+    /// The fused equation, staged directly: the planner answers for any valid equation, whatever the matcher
+    /// would have formed.
+    fn graph(self) -> Graph {
+        let hkv = self.hq / self.n_rep;
+        let mask_heads = if self.per_head_mask { self.hq } else { 1 };
+        let bld = Builder::new();
+        let operand =
+            |name: &str, shape: Vec<usize>| bld.constant(name, TensorType::new(shape, GDt::F32));
+        let q = operand("q", vec![self.batch, self.hq, self.lq, self.d]);
+        let k = operand("k", vec![self.batch, hkv, self.lk, self.d]);
+        let v = operand("v", vec![self.batch, hkv, self.lk, self.d]);
+        let mask = operand("mask", vec![self.batch, mask_heads, self.lq, self.lk]);
+        let mut plan = bld.append_plan(0);
+        let out = plan
+            .equation(
+                OpKind::Attention(AttentionAttrs::new(
+                    self.n_rep,
+                    1.0 / (self.d as f32).sqrt(),
+                    self.softcap,
+                )),
+                [q, k, v, mask]
+                    .map(|operand| Operand::Value(operand.id))
+                    .to_vec(),
+            )
+            .unwrap_or_else(|e| panic!("{}: stage the attention: {e:?}", self.name));
+        plan.declare_result(out).expect("declare the result");
+        let mut prepared = bld.preflight_append(plan).expect("preflight");
+        let id = bld.commit_append(&mut prepared).expect("commit");
+        bld.finish(poot_graph_ir::Traced { id })
+    }
 }
 
-/// A single-sequence (B=1) `FlashAttentionDecode` with head dim `d`, to exercise both the
-/// `d <= FLASH_LDS_CAP` (region decode) and `d > FLASH_LDS_CAP` (kernelgen fallback) choices.
-/// `q[1,Hq,1,d]`, `k`/`v[1,Hq,cap,d]` (n_rep=1, so Hkv==Hq), `mask[1,1,1,cap]`. The composite is staged
-/// directly: `flash_attention_capped` (what `compile` runs) declines a decode wider than the cap,
-/// and the planner still answers for any valid equation.
-fn flash_decode_graph(d: usize) -> Graph {
-    let hq = 2;
-    let cap = 8;
-    let bld = Builder::new();
-    let q = bld.constant("q", TensorType::new(vec![1, hq, 1, d], GDt::F32));
-    let k = bld.constant("k", TensorType::new(vec![1, hq, cap, d], GDt::F32));
-    let v = bld.constant("v", TensorType::new(vec![1, hq, cap, d], GDt::F32));
-    let mask = bld.constant("mask", TensorType::new(vec![1, 1, 1, cap], GDt::F32));
-    let mut plan = bld.append_plan(0);
-    let out = plan
-        .equation(
-            OpKind::FlashAttentionDecode {
-                n_rep: 1,
-                scale: 1.0 / (d as f32).sqrt(),
-            },
-            [q, k, v, mask]
-                .map(|operand| Operand::Value(operand.id))
-                .to_vec(),
-        )
-        .expect("stage the flash decode");
-    plan.declare_result(out).expect("declare the result");
-    let mut prepared = bld.preflight_append(plan).expect("preflight");
-    let id = bld.commit_append(&mut prepared).expect("commit");
-    bld.finish(poot_graph_ir::Traced { id })
-}
-
-fn flash_decode_planned(g: &Graph, backend: Backend) -> Result<(Plan, KernelChoice), PlanError> {
+fn attention_planned(
+    fixture: AttentionFixture,
+    backend: Backend,
+    caps: &DeviceCaps,
+) -> Result<(Plan, KernelChoice), PlanError> {
+    let g = fixture.graph();
     let eqn = g
         .eqns
         .iter()
-        .find(|e| matches!(e.op, OpKind::FlashAttentionDecode { .. }))
-        .expect("a FlashAttentionDecode eqn");
-    planned_with_choice(g, eqn, backend)
+        .find(|e| matches!(e.op, OpKind::Attention(_)))
+        .expect("an attention eqn");
+    planned_with_choice_caps(&g, eqn, backend, caps)
 }
 
-fn flash_decode_plan(g: &Graph, backend: Backend) -> Result<Plan, PlanError> {
-    flash_decode_planned(g, backend).map(|(plan, _)| plan)
-}
-
-/// Flashdecode SPIR-V guard: the single-sequence (B=1), D > FLASH_LDS_CAP fallback arm emits
-/// `kg::flash_attention_decode`, which uses a private array that is NVPTX-only and crashes SPIR-V codegen
-/// (lib.rs:1009-1016). `Backend::SpirvVulkan` must be refused with a typed [`Refusal`] at plan time,
-/// while Nvptx is unaffected, and the `d <= FLASH_LDS_CAP` imported path is unaffected on either backend.
-#[test]
-fn flash_decode_fallback_rejects_spirv_but_keeps_nvptx() {
-    let g = flash_decode_graph(512); // D=512 > FLASH_LDS_CAP (256)
-
-    // SpirvVulkan: a clean refusal naming the head dim and the cap, not a crashing Plan::Compute.
-    let refusal = refusal_of(
-        flash_decode_plan(&g, Backend::SpirvVulkan),
-        "flash decode D > LDS cap on SpirvVulkan",
-    );
-    assert_eq!(refusal.target, Backend::SpirvVulkan);
-    assert_eq!(
-        refusal.missing,
-        Capability::HeadDimExceedsLdsCap {
-            head_dim: 512,
-            lds_cap: FLASH_LDS_CAP,
-        }
-    );
-
-    // Nvptx: still Plan::Compute with the kernelgen fallback body/key.
-    match flash_decode_planned(&g, Backend::Nvptx).expect("nvptx flash decode should still plan") {
-        (Plan::Compute { .. }, choice) => {
-            assert!(
-                matches!(
-                    &choice,
-                    KernelChoice::Generated(KernelRequest::Attention(
-                        AttentionSpec::DecodeSingle { d: 512, .. }
-                    ))
-                ),
-                "nvptx D>{FLASH_LDS_CAP} should select the kernelgen fallback: {choice:?}"
-            );
-        }
-        other => panic!("expected Plan::Compute on Nvptx, got {other:?}"),
+/// The attention request a choice generated.
+fn attention_spec(choice: &KernelChoice) -> &kg::AttentionSpec {
+    match choice {
+        KernelChoice::Generated(KernelRequest::Attention(spec)) => spec,
+        other => panic!("expected a generated attention request, got {other:?}"),
     }
 }
 
-/// The `d <= FLASH_LDS_CAP` choice is unaffected by the SpirvVulkan guard above: it plans the
-/// synthesized region decode, a plain `Plan::Compute`, on SpirvVulkan.
-#[test]
-fn flash_decode_within_the_cap_takes_the_region_decode_on_spirv() {
-    let g = flash_decode_graph(128); // D=128 <= FLASH_LDS_CAP (256)
+const ATTENTION_TARGETS: [fn() -> Backend; 3] = [
+    || Backend::SpirvVulkan,
+    || Backend::AmdGcn(AmdArch::gfx1151()),
+    || Backend::Nvptx,
+];
 
-    match flash_decode_planned(&g, Backend::SpirvVulkan).expect("the region decode should plan") {
-        (Plan::Compute { .. }, choice) => assert!(
-            matches!(
-                choice,
-                KernelChoice::Generated(KernelRequest::Attention(AttentionSpec::RegionDecode {
-                    d: 128,
-                    ..
-                }))
-            ),
-            "{choice:?}"
+/// Every attention shape the five old bodies covered plans one generated attention request on all three
+/// targets: Llama GQA decode (`B = 1` and `B = 4`), the D = 256 decode the imported body capped at, the
+/// D = 512 decode SPIR-V used to refuse, a plain prefill, gemma-style softcapped prefill, and the ALiBi
+/// per-head-mask decode and prefill. The request carries each equation's own extents, mask kind and score
+/// transform. Mutation: map the per-head mask to `MaskKind::Broadcast` (or drop the per-head case from the
+/// planner's spec) and the ALiBi rows go red.
+#[test]
+fn every_attention_fixture_plans_the_generated_attention_family_on_every_target() {
+    let fixtures = [
+        AttentionFixture::decode("llama decode", 1, 8, 4, 64, 64),
+        AttentionFixture::decode("llama decode B=4", 4, 8, 4, 64, 64),
+        AttentionFixture::decode("decode D=256", 1, 4, 2, 32, 256),
+        AttentionFixture::decode("decode D=512", 1, 4, 2, 32, 512),
+        AttentionFixture::prefill("prefill", 8, 4, 32, 64),
+        AttentionFixture::prefill("gemma softcap prefill", 4, 2, 24, 256).softcapped(50.0),
+        AttentionFixture::decode("alibi decode", 2, 4, 1, 16, 64).alibi(),
+        AttentionFixture::prefill("alibi prefill", 4, 1, 16, 64).alibi(),
+    ];
+    for backend in ATTENTION_TARGETS.map(|target| target()) {
+        for fixture in fixtures {
+            let (_, choice) = attention_planned(fixture, backend, &default_caps_for(backend))
+                .unwrap_or_else(|e| panic!("{} on {backend:?}: {e:?}", fixture.name));
+            let spec = attention_spec(&choice);
+            let want_mask = if fixture.per_head_mask {
+                kg::MaskKind::PerHead
+            } else {
+                kg::MaskKind::Broadcast
+            };
+            let scale_bits = (1.0 / (fixture.d as f32).sqrt()).to_bits();
+            let want_score = match fixture.softcap {
+                None => kg::ScoreTransform::Scale { scale_bits },
+                Some(cap) => kg::ScoreTransform::ScaleSoftcap {
+                    scale_bits,
+                    cap_bits: cap.to_bits(),
+                },
+            };
+            let got = (
+                (
+                    spec.batch, spec.hq, spec.n_rep, spec.lq, spec.lk, spec.dk, spec.dv,
+                ),
+                spec.mask,
+                spec.score,
+            );
+            let want = (
+                (
+                    fixture.batch,
+                    fixture.hq,
+                    fixture.n_rep,
+                    fixture.lq,
+                    fixture.lk,
+                    fixture.d,
+                    fixture.d,
+                ),
+                want_mask,
+                want_score,
+            );
+            assert_eq!(got, want, "{} on {backend:?}", fixture.name);
+        }
+    }
+}
+
+/// The streaming schedule's lane count is the widest power of two whose partials fit the device's workgroup
+/// memory: `4 * (lanes * dv + 2 * lanes)` bytes. The same decode plans 32, 16, 8 and 4 lanes at value dim 64,
+/// 128, 256 and 512 on the wgpu cap (16352 bytes), and more on the larger ROCm and PTX caps. A fixture
+/// device whose workgroup memory cannot hold even one lane at `dv = 512` (2056 bytes) refuses with
+/// `AttentionLds { dv: 512, .. }`, one byte over the boundary plans a single lane, and the same graph plans
+/// on the real caps. Mutation: take the lane width from a constant 256 instead of `caps.lds_bytes`; the
+/// small-caps device plans and the refusal row goes red.
+#[test]
+fn attention_lanes_follow_the_device_workgroup_memory() {
+    // (backend, dv) -> lanes, by hand from `4 * (lanes * dv + 2 * lanes) <= lds_bytes` and the 64 cap.
+    let lanes = |backend: Backend, d: usize| {
+        let fixture = AttentionFixture::decode("lanes", 1, 2, 1, 16, d);
+        let (_, choice) = attention_planned(fixture, backend, &default_caps_for(backend))
+            .unwrap_or_else(|e| panic!("{backend:?} D={d}: {e:?}"));
+        let kg::AttentionSchedule::Streaming { lanes } = attention_spec(&choice).schedule;
+        lanes
+    };
+    let wgpu = Backend::SpirvVulkan;
+    assert_eq!(
+        [64, 128, 256, 512].map(|d| lanes(wgpu, d)),
+        [32, 16, 8, 4],
+        "16352 bytes of workgroup memory"
+    );
+    let rocm = Backend::AmdGcn(AmdArch::gfx1151());
+    assert_eq!(
+        [64, 128, 256, 512].map(|d| lanes(rocm, d)),
+        [64, 64, 32, 16],
+        "65536 bytes of workgroup memory"
+    );
+    assert_eq!(
+        [64, 128, 256, 512].map(|d| lanes(Backend::Nvptx, d)),
+        [64, 64, 32, 16],
+        "49152 bytes of workgroup memory"
+    );
+
+    let fixture = AttentionFixture::decode("dv 512", 1, 2, 1, 16, 512);
+    let with_lds = |lds_bytes: u32| DeviceCaps {
+        lds_bytes,
+        ..default_caps_for(wgpu)
+    };
+    let refusal = refusal_of(
+        attention_planned(fixture, wgpu, &with_lds(2055)).map(|(plan, _)| plan),
+        "dv 512 on 2055 bytes of workgroup memory",
+    );
+    assert_eq!(
+        refusal.missing,
+        Capability::AttentionLds {
+            dv: 512,
+            lds_bytes: 2055
+        }
+    );
+    let (_, one_lane) = attention_planned(fixture, wgpu, &with_lds(2056))
+        .expect("2056 bytes hold exactly one lane at dv 512");
+    assert_eq!(
+        attention_spec(&one_lane).schedule,
+        kg::AttentionSchedule::Streaming { lanes: 1 }
+    );
+    attention_planned(fixture, wgpu, &default_caps_for(wgpu))
+        .expect("the same graph plans on the real caps");
+}
+
+/// The plan records the implemented streaming schedule and the exact resources it needs, over a fixed bank:
+/// short and long prefill, low- and high-head decode, and a D = 256 softcapped prefill. Per row the request
+/// names `Streaming { lanes }`, the dispatch body states `lanes * (dv + 2) * 4` bytes of workgroup memory
+/// and a `[lanes, 1, 1]` workgroup, and the kernel declares the serial work one thread does (its share of
+/// the keys, twice over the head width). Finalization enforces the declaration: a device whose dispatch
+/// budget is exactly that work admits the equation, one step less refuses with `DispatchWork` naming it.
+/// Mutation: drop the attention arm of `KernelRequest::requirements` (an under-declaration), or bypass
+/// resource finalization in the planner; the one-step-short row is admitted and goes red.
+#[test]
+fn the_streaming_schedule_records_its_exact_resources_and_finalization_enforces_them() {
+    // (fixture, backend, lanes, workgroup-memory bytes, threads, steps per thread), from the shapes by hand.
+    let wgpu = Backend::SpirvVulkan;
+    let rows = [
+        (
+            AttentionFixture::prefill("short prefill", 8, 4, 16, 64),
+            wgpu,
+            32usize,
+            8448usize,
+            8 * 16 * 32,
+            16u64.div_ceil(32) * 2 * 64,
         ),
-        other => panic!("expected the region decode's Plan::Compute, got {other:?}"),
+        (
+            AttentionFixture::prefill("long prefill", 8, 4, 512, 128),
+            wgpu,
+            16,
+            8320,
+            8 * 512 * 16,
+            512u64.div_ceil(16) * 2 * 128,
+        ),
+        (
+            AttentionFixture::decode("low-head decode", 1, 2, 1, 1024, 128),
+            wgpu,
+            16,
+            8320,
+            2 * 16,
+            1024u64.div_ceil(16) * 2 * 128,
+        ),
+        (
+            AttentionFixture::decode("high-head decode", 4, 32, 4, 2048, 128),
+            Backend::AmdGcn(AmdArch::gfx1151()),
+            64,
+            4 * (64 * 128 + 2 * 64),
+            4 * 32 * 64,
+            2048u64.div_ceil(64) * 2 * 128,
+        ),
+        (
+            AttentionFixture::prefill("softcap prefill D=256", 4, 2, 24, 256).softcapped(50.0),
+            Backend::Nvptx,
+            32,
+            4 * (32 * 256 + 2 * 32),
+            4 * 24 * 32,
+            24u64.div_ceil(32) * 2 * 256,
+        ),
+    ];
+    for (fixture, backend, lanes, lds_bytes, threads, steps) in rows {
+        let caps = default_caps_for(backend);
+        let (plan, choice) = attention_planned(fixture, backend, &caps)
+            .unwrap_or_else(|e| panic!("{}: {e:?}", fixture.name));
+        assert_eq!(
+            attention_spec(&choice).schedule,
+            kg::AttentionSchedule::Streaming { lanes },
+            "{}",
+            fixture.name
+        );
+        let dispatch = plan.single().expect("one dispatch");
+        let used = kg::BodyUse::measure(&dispatch.body).expect("measurable workgroup memory");
+        assert_eq!(used.lds_bytes, lds_bytes as u64, "{}: LDS", fixture.name);
+        assert_eq!(
+            used.workgroup,
+            [lanes as u32, 1, 1],
+            "{}: workgroup",
+            fixture.name
+        );
+        let KernelChoice::Generated(request) = &choice else {
+            unreachable!("asserted generated above")
+        };
+        let work = kg::SerialWork {
+            threads: threads as u64,
+            steps_per_thread: steps,
+        };
+        assert_eq!(
+            request.requirements().serial_work,
+            Some(work),
+            "{}: declared serial work",
+            fixture.name
+        );
+
+        let budgeted = |budget: u64| DeviceCaps {
+            max_dispatch_work: Queried::Known(budget),
+            ..caps
+        };
+        attention_planned(fixture, backend, &budgeted(work.total()))
+            .unwrap_or_else(|e| panic!("{}: the exact budget admits: {e:?}", fixture.name));
+        let refusal = refusal_of(
+            attention_planned(fixture, backend, &budgeted(work.total() - 1)).map(|(plan, _)| plan),
+            fixture.name,
+        );
+        assert!(
+            matches!(
+                refusal.missing,
+                Capability::KernelResources(ResourceRefusal::DispatchWork { work: w, .. })
+                    if w == work.total()
+            ),
+            "{}: one step short must refuse naming {} steps, got {:?}",
+            fixture.name,
+            work.total(),
+            refusal.missing
+        );
     }
 }
 
@@ -5521,8 +6072,8 @@ fn is_elementwise_2d_folds_binary_and_unary_for_a_non_f32_dtype() {
         256
     ));
 
-    // ScatterUpdate's materializing path is F32-only (its imported kernel has no BF16 variant), so a
-    // BF16 output must not take the 2-D-fold path meant for that imported body.
+    // Every data-movement body is dtype-generic, so a BF16 ScatterUpdate past the ceiling folds like any
+    // other movement, and one below it stays on the flat launch.
     let scatter_eqn = Eqn {
         op: OpKind::ScatterUpdate,
         inputs: vec![],
@@ -5530,15 +6081,22 @@ fn is_elementwise_2d_folds_binary_and_unary_for_a_non_f32_dtype() {
         layer: None,
     };
     assert!(
-        !is_elementwise_2d(
+        is_elementwise_2d(
             &g,
             Backend::SpirvVulkan,
             &scatter_eqn,
             &out_shape,
             over_ceiling
         ),
-        "ScatterUpdate's imported body is F32-only - a BF16 output must not take this fold"
+        "a BF16 ScatterUpdate past the ceiling must 2-D-fold"
     );
+    assert!(!is_elementwise_2d(
+        &g,
+        Backend::SpirvVulkan,
+        &scatter_eqn,
+        &small_shape,
+        256
+    ));
 }
 
 /// Find the named const's value id in `g`.
@@ -5604,8 +6162,8 @@ fn card298_decode_shaped_mixed_matmul_plans_after_widen() {
             panic!("decode-shaped mixed matmul must plan as bf16 GEMV on {backend:?}: {e}")
         });
         assert!(
-            matches!(plan, Plan::Compute { .. } | Plan::ComputeMeta { .. }),
-            "expected a Compute/ComputeMeta plan, got {plan:?}"
+            plan.single().is_some(),
+            "expected a single-dispatch plan, got {plan:?}"
         );
         assert!(
             is_imported(&choice, ImportedKernel::GemvCoalescedBf16),
@@ -5700,30 +6258,36 @@ fn try_dense_contraction_plan_planned(
     planned_with_choice(g, eqn, backend)
 }
 
-/// Card 380 FR-009, narrowed by cards 450 ROCm and 450 PTX. The lowering is scoped by name to the
-/// backends that have a kernel: wgpu's typed walk landed it (card 380), the ROCm typed walk the same
-/// lowering on AmdGcn (card 450 ROCm), and the PTX typed walk the same lowering on Nvptx (card 450
-/// PTX). Above M == 1 all three dispatch the identical imported body and key.
+/// Card 380 FR-009, narrowed by cards 450 ROCm and 450 PTX; the body is Card 1024's. The lowering is scoped by
+/// name to the backends that have a typed packed walk: wgpu's (card 380), ROCm's (card 450 ROCm) and PTX's
+/// (card 450 PTX). Above M == 1 all three plan the same generated `[N, K]` Tiled body over the packed-BF16 lanes.
 #[test]
 fn card450_dense_contraction_plans_on_nvptx_with_the_wgpu_key() {
     let g = dense_contraction_graph(2, 32, 16);
-    let Ok((Plan::ComputeMeta { meta, .. }, choice)) =
-        try_dense_contraction_plan_planned(&g, Backend::Nvptx)
-    else {
-        panic!("the packed-BF16 contraction must plan on Nvptx as ComputeMeta");
-    };
+    let requests: Vec<_> = [
+        Backend::SpirvVulkan,
+        Backend::AmdGcn(AmdArch::gfx1151()),
+        Backend::Nvptx,
+    ]
+    .into_iter()
+    .map(|backend| {
+        let Ok((_, choice)) = try_dense_contraction_plan_planned(&g, backend) else {
+            panic!("the packed-BF16 contraction must plan on {backend:?}");
+        };
+        let KernelChoice::Generated(KernelRequest::Contraction(
+            request @ ContractionSpec::DenseTiled { weight, .. },
+        )) = choice
+        else {
+            panic!("{backend:?}: expected the generated dense Tiled body, got {choice:?}");
+        };
+        assert_eq!(weight, poot_target::BufferStorage::bf16_packed());
+        format!("{request:?}")
+    })
+    .collect();
     assert!(
-        matches!(
-            choice,
-            KernelChoice::Imported {
-                kernel: ImportedKernel::DenseBf16Contraction,
-                meta_schema: 3,
-                ..
-            }
-        ),
-        "{choice:?}"
+        requests.windows(2).all(|pair| pair[0] == pair[1]),
+        "{requests:?}"
     );
-    assert_eq!(meta, vec![2, 32, 16]);
 }
 
 /// Card 727: at M == 1 every backend plans the same generated dense Gemv request over the packed-BF16
@@ -5739,13 +6303,15 @@ fn an_m1_dense_bf16_contraction_plans_the_generated_gemv_on_every_backend() {
     ]
     .into_iter()
     .map(|backend| {
-        let Ok((Plan::ComputeMeta { meta, .. }, choice)) =
-            try_dense_contraction_plan_planned(&g, backend)
-        else {
+        let Ok((planned_plan, choice)) = try_dense_contraction_plan_planned(&g, backend) else {
             panic!(
-                "the M == 1 contraction must plan as the Gemv's ComputeMeta step on {backend:?}"
+                "the M == 1 contraction must plan as the Gemv's metadata-launch step on {backend:?}"
             );
         };
+        let Dispatch {
+            launch: Launch { meta, .. },
+            ..
+        } = into_with_meta(planned_plan);
         assert_eq!(meta, vec![32, 16], "{backend:?}: metadata is [K, N]");
         let KernelChoice::Generated(KernelRequest::Contraction(
             request @ ContractionSpec::DenseGemv { weight, layout, .. },
@@ -5793,13 +6359,18 @@ fn card380_bf16_const_stays_narrow_only_for_a_contraction_weight() {
             .any(|e| matches!(e.op, OpKind::Cast { .. })),
         "the fold plus the narrowed retype leave no widening cast"
     );
-    assert!(bf16_const_feeds_only_packed_readers(&folded, weight));
+    assert!(bf16_const_feeds_only_packed_readers(
+        &folded,
+        &Default::default(),
+        weight
+    ));
 
     // An ordinary mixed matmul at M>1 (prefill, not a decode GEMV) has no packed-lane consumer until the
     // widening pass puts a `Cast` in front of it; the weight is never retyped.
     let mixed = mixed_operand_matmul_graph(128, 32, 16);
     assert!(!bf16_const_feeds_only_packed_readers(
         &mixed,
+        &Default::default(),
         const_id(&mixed, "w")
     ));
     assert!(!bf16_const_feeds_decode_bf16_gemv(
@@ -5816,6 +6387,7 @@ fn card380_bf16_const_stays_narrow_only_for_a_contraction_weight() {
     assert_eq!(widened.aval(const_id(&mixed, "w")).dtype, GDt::BF16);
     assert!(bf16_const_feeds_only_packed_readers(
         &widened,
+        &Default::default(),
         const_id(&widened, "w")
     ));
 
@@ -5853,7 +6425,11 @@ fn card380_bf16_const_stays_narrow_only_for_a_contraction_weight() {
         out: widened,
         layer: None,
     });
-    assert!(bf16_const_feeds_only_packed_readers(&shared, weight));
+    assert!(bf16_const_feeds_only_packed_readers(
+        &shared,
+        &Default::default(),
+        weight
+    ));
     let negated = shared.values.len();
     shared.values.push(poot_graph_ir::graph::ValueMeta::new(
         TensorType::new(vec![16, 32], GDt::BF16),
@@ -5866,7 +6442,11 @@ fn card380_bf16_const_stays_narrow_only_for_a_contraction_weight() {
         out: negated,
         layer: None,
     });
-    assert!(!bf16_const_feeds_only_packed_readers(&shared, weight));
+    assert!(!bf16_const_feeds_only_packed_readers(
+        &shared,
+        &Default::default(),
+        weight
+    ));
 
     // Only the weight operand is admitted. A const read as a contraction's activation is an f32 operand of
     // that kernel, so keeping it narrow would feed two-byte words to an `&[f32]` param.
@@ -5890,6 +6470,7 @@ fn card380_bf16_const_stays_narrow_only_for_a_contraction_weight() {
     });
     assert!(!bf16_const_feeds_only_packed_readers(
         &as_activation,
+        &Default::default(),
         weight
     ));
 
@@ -5902,7 +6483,11 @@ fn card380_bf16_const_stays_narrow_only_for_a_contraction_weight() {
         Storage::Const,
         Some("orphan".into()),
     ));
-    assert!(!bf16_const_feeds_only_packed_readers(&orphaned, orphan));
+    assert!(!bf16_const_feeds_only_packed_readers(
+        &orphaned,
+        &Default::default(),
+        orphan
+    ));
 }
 
 /// A Qwen3.8-27B token-embedding shape (BF16 source) or a Qwen4Exp PLE shard shape (E4M3FN source)
@@ -5942,10 +6527,10 @@ fn try_dense_row_gather_plan(g: &Graph, backend: Backend) -> Result<Plan, PlanEr
 #[test]
 fn card450_dense_row_gather_plans_on_nvptx_with_the_wgpu_key() {
     let g = dense_row_gather_graph(8, 4, 3, GDt::BF16);
-    let Ok((Plan::Compute { .. }, choice)) = try_dense_row_gather_plan_planned(&g, Backend::Nvptx)
-    else {
+    let Ok((planned_plan, choice)) = try_dense_row_gather_plan_planned(&g, Backend::Nvptx) else {
         panic!("the row gather must plan on Nvptx as a plain Compute");
     };
+    let Dispatch { .. } = into_plain(planned_plan);
     assert!(
         is_imported(&choice, ImportedKernel::PackedBf16RowGather),
         "{choice:?}"
@@ -5971,11 +6556,11 @@ fn card449_d1_dense_row_gather_e4m3_plans_on_spirv_and_stays_named_elsewhere() {
         )),
         "the fold must have produced a DenseRowGather over the E4M3FN table"
     );
-    let Ok((Plan::Compute { .. }, choice)) =
-        try_dense_row_gather_plan_planned(&g, Backend::SpirvVulkan)
+    let Ok((planned_plan, choice)) = try_dense_row_gather_plan_planned(&g, Backend::SpirvVulkan)
     else {
         panic!("the E4M3FN row gather must plan on SpirvVulkan, with no metadata buffer");
     };
+    let Dispatch { .. } = into_plain(planned_plan);
     assert!(
         is_imported(&choice, ImportedKernel::PackedE4m3RowGather),
         "the choice must name the E4M3FN source dtype's kernel: {choice:?}"
@@ -6009,11 +6594,12 @@ fn card449_d1_dense_row_gather_e4m3_plans_on_spirv_and_stays_named_elsewhere() {
 #[test]
 fn card450_dense_row_gather_plans_on_amdgcn_with_the_wgpu_key() {
     let g = dense_row_gather_graph(8, 4, 3, GDt::BF16);
-    let Ok((Plan::Compute { .. }, choice)) =
+    let Ok((planned_plan, choice)) =
         try_dense_row_gather_plan_planned(&g, Backend::AmdGcn(AmdArch::gfx1151()))
     else {
         panic!("the row gather must plan on AmdGcn as a plain Compute");
     };
+    let Dispatch { .. } = into_plain(planned_plan);
     assert!(
         is_imported(&choice, ImportedKernel::PackedBf16RowGather),
         "{choice:?}"
@@ -6028,7 +6614,11 @@ fn card450_dense_row_gather_plans_on_amdgcn_with_the_wgpu_key() {
 fn card381_bf16_const_stays_narrow_for_a_row_gather_table() {
     let folded = dense_row_gather_graph(8, 4, 3, GDt::BF16);
     let table = const_id(&folded, "embed");
-    assert!(bf16_const_feeds_only_packed_readers(&folded, table));
+    assert!(bf16_const_feeds_only_packed_readers(
+        &folded,
+        &Default::default(),
+        table
+    ));
     let prepared = widen_mismatched_matmul_dtypes(
         &folded,
         Backend::SpirvVulkan,
@@ -6059,7 +6649,11 @@ fn card381_bf16_const_stays_narrow_for_a_row_gather_table() {
     let unfolded_widened = bld.cast(bld.gather(unfolded_table, 0, token), GDt::F32);
     let unfolded = bld.finish(unfolded_widened);
     let id = const_id(&unfolded, "embed");
-    assert!(!bf16_const_feeds_only_packed_readers(&unfolded, id));
+    assert!(!bf16_const_feeds_only_packed_readers(
+        &unfolded,
+        &Default::default(),
+        id
+    ));
     let prepared = widen_mismatched_matmul_dtypes(
         &unfolded,
         Backend::SpirvVulkan,
@@ -6083,10 +6677,14 @@ fn card381_bf16_const_stays_narrow_for_a_row_gather_table() {
         out,
         layer: None,
     });
-    assert!(!bf16_const_feeds_only_packed_readers(&as_index, table));
+    assert!(!bf16_const_feeds_only_packed_readers(
+        &as_index,
+        &Default::default(),
+        table
+    ));
 }
 
-/// Card 381. On wgpu the row gather plans to the imported packed kernel as a plain `Plan::Compute` with no
+/// Card 381. On wgpu the row gather plans to the imported packed kernel as a plain dispatch with no
 /// metadata buffer (the row width is derived in-kernel). The key must name the source dtype, so a
 /// packed-BF16 gather never shares a cache entry or disk artifact with the f32 table gather of the same
 /// shapes (the card-128 Bug-1 class) - nor, since Card 449 D1, with the packed-E4M3FN gather of the
@@ -6094,11 +6692,12 @@ fn card381_bf16_const_stays_narrow_for_a_row_gather_table() {
 #[test]
 fn card381_row_gather_plan_key_names_the_source_dtype() {
     let folded = dense_row_gather_graph(8, 4, 3, GDt::BF16);
-    let Ok((Plan::Compute { key, .. }, choice)) =
+    let Ok((planned_plan, choice)) =
         try_dense_row_gather_plan_planned(&folded, Backend::SpirvVulkan)
     else {
         panic!("the row gather must plan on SpirvVulkan, with no metadata buffer");
     };
+    let Dispatch { key, .. } = into_plain(planned_plan);
     assert!(
         is_imported(&choice, ImportedKernel::PackedBf16RowGather),
         "the choice must name the source dtype's kernel: {choice:?}"
@@ -6106,11 +6705,10 @@ fn card381_row_gather_plan_key_names_the_source_dtype() {
 
     // The packed-E4M3FN gather of the same shapes is a different body and must not collide either.
     let e4m3_folded = dense_row_gather_graph(8, 4, 3, GDt::E4M3FN);
-    let Ok(Plan::Compute { key: e4m3_key, .. }) =
-        try_dense_row_gather_plan(&e4m3_folded, Backend::SpirvVulkan)
-    else {
+    let Ok(e4m3_plan) = try_dense_row_gather_plan(&e4m3_folded, Backend::SpirvVulkan) else {
         panic!("the E4M3FN row gather must plan on SpirvVulkan, with no metadata buffer");
     };
+    let e4m3_key = into_plain(e4m3_plan).key;
     assert_ne!(
         key, e4m3_key,
         "the BF16 and E4M3FN row gathers of the same shapes must not share a cache entry"
@@ -6129,16 +6727,19 @@ fn card381_row_gather_plan_key_names_the_source_dtype() {
         .iter()
         .find(|e| matches!(e.op, OpKind::Gather { .. }))
         .expect("an f32 gather eqn");
-    let f32_key = match planned_with_choice(&f32_gather, eqn, Backend::SpirvVulkan).unwrap() {
-        (Plan::Compute { key, .. } | Plan::ComputeMeta { key, .. }, choice) => {
-            assert!(
-                is_imported(&choice, ImportedKernel::GatherAxis0),
-                "{choice:?}"
-            );
-            key
-        }
-        other => panic!("an f32 gather plans to a compute kernel: {other:?}"),
-    };
+    let (f32_plan, choice) = planned_with_choice(&f32_gather, eqn, Backend::SpirvVulkan).unwrap();
+    assert!(
+        matches!(
+            &choice,
+            KernelChoice::Generated(KernelRequest::Movement(kg::MovementSpec {
+                storage: kg::Storage::Elements { carrier: Ty::F32 },
+                op: kg::MovementOp::Gather { axis: 0, .. },
+                ..
+            }))
+        ),
+        "{choice:?}"
+    );
+    let f32_key = one_dispatch(f32_plan).key;
     assert_ne!(key, f32_key);
 }
 
@@ -6147,16 +6748,19 @@ fn card381_row_gather_plan_key_names_the_source_dtype() {
 /// tensor-core keys guard against).
 ///
 /// At M == 1 the plan is the generated dense Gemv (see [`dense_bf16_decode_gemv_selection_rows`]), whose
-/// request names the packed-BF16 weight storage, so the key this row pins is that body's; the imported
-/// body's `[rows, K, N]` metadata row is the M > 1 half of the selection test.
+/// request names the packed-BF16 weight storage, so the key this row pins is that body's; the
+/// M > 1 half is in the selection test.
 #[test]
 fn card380_dense_contraction_plan_key_names_the_operand_dtype() {
     let contraction = dense_contraction_graph(1, 32, 16);
-    let Ok((Plan::ComputeMeta { key, .. }, choice)) =
+    let Ok((planned_plan, choice)) =
         try_dense_contraction_plan_planned(&contraction, Backend::SpirvVulkan)
     else {
-        panic!("the M == 1 contraction must plan as the Gemv's ComputeMeta step on SpirvVulkan");
+        panic!(
+            "the M == 1 contraction must plan as the Gemv's metadata-launch step on SpirvVulkan"
+        );
     };
+    let Dispatch { key, .. } = into_with_meta(planned_plan);
     assert!(
         matches!(
             choice,
@@ -6176,18 +6780,14 @@ fn card380_dense_contraction_plan_key_names_the_operand_dtype() {
         let mm = bld.matmul(a, w);
         bld.finish(mm)
     };
-    let f32_key = match try_matmul_plan(&f32_matmul, Backend::SpirvVulkan).unwrap() {
-        Plan::Compute { key, .. } | Plan::ComputeMeta { key, .. } => key,
-        other => panic!("an f32 matmul plans to a compute kernel: {other:?}"),
-    };
+    let f32_key = one_dispatch(try_matmul_plan(&f32_matmul, Backend::SpirvVulkan).unwrap()).key;
     assert_ne!(key, f32_key);
 }
 
 /// Body, launch and selection for one packed-BF16 `DenseContraction` are chosen together (Card 727): at
 /// M == 1, on every backend, the generated dense Gemv takes it with the launch `dense_gemv_launch` picks,
 /// its workgroup the schedule's `width` and its grid the schedule's own `grid_threads`, `[K, N]` riding in
-/// metadata; above M == 1 the shape-generic imported body keeps its `[rows, K, N]` metadata and the
-/// one-thread-per-element launch.
+/// metadata; above M == 1 the generated `[N, K]` Tiled body takes it (Card 1024).
 ///
 /// Mutation: make `dense_decode_gemv_in` return `None`; the M == 1 rows go red with "the dense Gemv must
 /// take the M == 1 contraction".
@@ -6228,15 +6828,12 @@ fn dense_bf16_decode_gemv_selection_rows() {
             }
         );
 
-        let (
-            Plan::ComputeMeta {
-                body, grid, meta, ..
-            },
-            choice,
-        ) = try_dense_contraction_plan_planned(&g, backend).unwrap()
-        else {
-            panic!("M == 1 must plan as the Gemv's ComputeMeta step on {backend:?}");
-        };
+        let (planned_plan, choice) = try_dense_contraction_plan_planned(&g, backend).unwrap();
+        let Dispatch {
+            body,
+            launch: Launch { grid, meta, .. },
+            ..
+        } = into_with_meta(planned_plan);
         assert!(
             matches!(
                 &choice,
@@ -6256,7 +6853,7 @@ fn dense_bf16_decode_gemv_selection_rows() {
         assert_eq!(meta, vec![k as u32, n as u32], "{backend:?}: [K, N]");
     }
 
-    // M > 1 keeps the imported body on every backend: no Gemv, one thread per output element.
+    // M > 1 runs the generated `[N, K]` Tiled body on every backend: no Gemv, no imported kernel.
     for backend in [
         Backend::SpirvVulkan,
         Backend::AmdGcn(AmdArch::gfx1151()),
@@ -6276,24 +6873,17 @@ fn dense_bf16_decode_gemv_selection_rows() {
             None,
             "{backend:?}: the Gemv is M == 1, so M > 1 must decline"
         );
-        let (Plan::ComputeMeta { meta, grid, .. }, choice) =
-            try_dense_contraction_plan_planned(&g, backend).unwrap()
-        else {
-            panic!("M > 1 must plan as the imported ComputeMeta step on {backend:?}");
-        };
+        let (_, choice) = try_dense_contraction_plan_planned(&g, backend).unwrap();
         assert!(
-            is_imported(&choice, ImportedKernel::DenseBf16Contraction),
-            "{backend:?}: {choice:?}"
-        );
-        assert_eq!(
-            meta,
-            vec![2, k as u32, n as u32],
-            "{backend:?}: metadata is [rows, K, N]"
-        );
-        assert_eq!(
-            grid,
-            [out_numel as u32, 1, 1],
-            "{backend:?}: above M == 1 the launch stays one thread per output element"
+            matches!(
+                &choice,
+                KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::DenseTiled {
+                    m: 2,
+                    weight,
+                    ..
+                })) if *weight == poot_target::BufferStorage::bf16_packed()
+            ),
+            "{backend:?}: M > 1 must plan the generated dense Tiled body: {choice:?}"
         );
     }
 }
@@ -6390,9 +6980,8 @@ fn the_dense_gemv_arm_is_finalized() {
         .iter()
         .find(|e| matches!(e.op, OpKind::DenseContraction { .. }))
         .expect("a dense contraction eqn");
-    let (Plan::ComputeMeta { body, .. }, _) = planned_with_choice(&g, eqn, backend).unwrap() else {
-        panic!("the roomy device plans the Gemv");
-    };
+    let (planned_plan, _) = planned_with_choice(&g, eqn, backend).unwrap();
+    let Dispatch { body, .. } = into_with_meta(planned_plan);
     let width = body.workgroup_size[0];
     let mut small = default_caps_for(backend);
     small.max_workgroup_invocations = width - 1;
@@ -6448,7 +7037,7 @@ fn a_contraction_plan_keeps_its_lds_width_through_the_planner() {
         ),
         "{choice:?}"
     );
-    let (Plan::Compute { body, .. } | Plan::ComputeMeta { body, .. }) = plan else {
+    let Some(Dispatch { body, .. }) = plan.single() else {
         panic!("a single dispatch: {plan:?}");
     };
     assert_eq!(body.workgroup_size, [GEMV_WIDTH as u32, 1, 1]);
@@ -6483,7 +7072,6 @@ fn bf16_projection_contraction_choice(
     let graph = b.finish(out);
     let options = CompileOptions {
         execution: Submission::Replay,
-        fusion: FusionPolicy::Full,
         limits: CompileLimits::STANDARD,
     };
     let target = Target {

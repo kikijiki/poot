@@ -40,6 +40,37 @@ pub enum Unsupported {
     /// This build has no executor for the requested backend.
     #[error("backend {backend:?} is not built into this binary")]
     Backend { backend: &'static str },
+    /// The draft policy cannot be served on this model or with this draft.
+    #[error(transparent)]
+    Speculation(SpeculationRefusal),
+}
+
+/// Why a [`DraftPolicy`](crate::driver::DraftPolicy) is refused at `prepare`.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SpeculationRefusal {
+    /// The model carries a recurrent state: a rejected draft token has already been folded into it
+    /// and `commit(kept)` cannot undo that.
+    #[error(
+        "speculation needs positional state; a rejected draft cannot be rolled out of recurrent state"
+    )]
+    RecurrentState,
+    /// The draft model cannot propose tokens the target verifies.
+    #[error("the draft model does not fit the target: {0}")]
+    DraftMismatch(DraftMismatch),
+}
+
+/// How a draft model disagrees with the target it proposes for.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum DraftMismatch {
+    /// A draft token id the target has no row for.
+    #[error("the draft's vocabulary of {draft} exceeds the target's {target}")]
+    Vocab { draft: usize, target: usize },
+    /// A draft token the target's tokenizer names differently.
+    #[error("a draft token has a different id in the target's tokenizer")]
+    Tokens,
+    /// The draft's positions cannot hold the target's cache capacity.
+    #[error("the draft holds {draft} positions, fewer than the driver's capacity {capacity}")]
+    Positions { draft: usize, capacity: usize },
 }
 
 /// A request that cannot run, whatever the model or device.
@@ -79,7 +110,7 @@ pub enum InvalidRequest {
     /// The step would write a position past the blocks reserved at `open` (more than `max_new` tokens).
     #[error("sequence {0:?} runs past the positions reserved at open")]
     BeyondReservation(SeqId),
-    /// A verify window is a greedy pick per position; a sampled window is a speculation policy's.
+    /// An explicit verify window is a greedy pick per position; a sampled window is a draft policy's.
     #[error("sequence {0:?} asks for a verify window with a sampler that is not greedy")]
     WindowNeedsGreedy(SeqId),
     /// One step is one entry, compiled for one adapter-set generation.
@@ -128,8 +159,8 @@ pub enum InvalidOptions {
     /// A verify window is a query token plus at least one draft.
     #[error("a verify window of width {width} is narrower than two")]
     WindowBelowTwo { width: usize },
-    /// The contiguous layout is one private cache: one row, no verify windows.
-    #[error("the contiguous layout serves one row and no verify windows")]
+    /// The contiguous layout is one private cache: one row.
+    #[error("the contiguous layout serves one row")]
     ContiguousServesOneRow,
     /// A model with recurrent state has no per-row state reset yet, so it serves one sequence at a
     /// time in one row, without verify windows.
@@ -184,6 +215,12 @@ pub enum LoadError {
     },
     #[error(transparent)]
     Weights(#[from] poot_load::LoadError),
+    /// A checkpoint file does not match the pin its integrity manifest gives it.
+    #[error(transparent)]
+    Integrity(#[from] poot_load::packed_safetensors::PackedSafetensorsError),
+    /// An integrity manifest was given but does not pin a weight file the load would read.
+    #[error("the integrity manifest does not pin {file}")]
+    Unpinned { file: String },
     /// The tokenizer or chat template could not be built from the checkpoint.
     #[error("tokenizer: {0}")]
     Text(#[source] Box<RunnerError>),

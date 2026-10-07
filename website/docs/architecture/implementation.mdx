@@ -22,7 +22,7 @@ Which crate owns which layer, and the few constraints that span several pages.
 | Executors        | `poot-gpu` (wgpu), `poot-rocm-gpu`, `poot-ptx-gpu`, `poot-vulkan-device`                                                 | Load, bind, capture, replay and read back a plan                                                        |
 | Models           | `poot-models`                                                                                         | Per-family tracers over shared components                                                               |
 | Loading          | `poot-load`, `poot-quant`                                                                             | Safetensors and GGUF readers; packed quantization descriptors shared by loader, IR and planner          |
-| Generation       | `poot-llm`                                                                                            | The runner: token loop, sampling, KV slots                                                              |
+| Generation       | `poot-llm`                                                                                            | The driver: token loop, sampling, KV slots                                                              |
 | Serving          | `poot-serve`                                                                                          | OpenAI-compatible HTTP server; no generation until the new scheduling loop lands                        |
 | Tooling          | `poot-orchestrator`, `poot-profile`, `poot-ptx-check`, `poot-rocm-check`, `poot-test-util`            | Pod runs, profiling, hardware smoke checks, test helpers                                                |
 
@@ -30,10 +30,10 @@ Which crate owns which layer, and the few constraints that span several pages.
 
 - **AIE codegen is not NPU execution.** The experimental emitter remains, but no graph-planner target
   or runtime kernel handle connects it to an NPU. See [NPU Offload](./npu).
-- **Oracle use is still broader than the target.** The Runner's CPU generation and the server's
+- **Oracle use is still broader than the target.** The driver's CPU-oracle checks and the server's
   embeddings/reranking paths call the evaluator today. See [Execution](./execution#verification).
-- **Flash needs one head width.** The flash rewrite fires only when Q, K and V share a trailing head
-  width. MLA-style shapes (narrower V) stay on the primitive decomposition. See
+- **Attention takes its own value width and split keys.** The fused attention op types a value head
+  narrower than the key head and a key split into per-head and shared parts (MLA). See
   [Attention](./attention#implementation-details).
 - **ROCm AQL publication.** Replay writes AQL packets to a host-coherent ring, then rings the doorbell.
   A discrete-GPU device-memory ring needs an explicit store fence first; integrated APUs refuse that

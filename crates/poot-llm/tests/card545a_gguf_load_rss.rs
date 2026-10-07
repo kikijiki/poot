@@ -25,8 +25,12 @@ fn model_handle_load_gguf_peaks_near_one_x_file_size() {
         let file_bytes = std::fs::metadata(&path).expect("stat gguf").len();
         let baseline_rss = proc_status_kib("VmRSS") * 1024;
         let registry = poot_models::registry::Registry::builtin().expect("builtin registry");
-        let handle = poot_llm::driver::ModelHandle::load(std::path::Path::new(&path), &registry)
-            .expect("load the gguf");
+        let handle = poot_llm::driver::ModelHandle::load(
+            std::path::Path::new(&path),
+            &registry,
+            &poot_llm::driver::LoadOptions::default(),
+        )
+        .expect("load the gguf");
         std::hint::black_box(&handle);
         let peak_rss = proc_status_kib("VmHWM") * 1024;
         let incremental_peak = peak_rss.saturating_sub(baseline_rss);

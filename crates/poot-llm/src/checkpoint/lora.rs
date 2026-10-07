@@ -561,13 +561,12 @@ fn pad_rank_rows(data: &[f32], slots: usize, r: usize, out_dim: usize, rank_to: 
 mod pool_tests {
     use poot_load::lora::{LoraAdapter, LoraAdapterConfig};
 
-    use crate::core::decode_arch::DecodeArch;
-    use crate::core::decode_arch::fixtures::runner_for;
+    use crate::core::runner::fixtures::bare_runner;
 
     #[test]
-    fn registering_an_adapter_on_any_runner_family_is_refused() {
-        for &arch in DecodeArch::ALL {
-            let mut runner = runner_for(arch);
+    fn registering_an_adapter_on_a_runner_is_refused() {
+        {
+            let mut runner = bare_runner();
             let adapter = LoraAdapter {
                 config: LoraAdapterConfig {
                     r: 2,
@@ -584,10 +583,7 @@ mod pool_tests {
                 error.to_string().contains("no family the Runner loads"),
                 "{error}"
             );
-            assert!(
-                runner.lora_pool_names().is_empty(),
-                "{arch:?}: nothing registered"
-            );
+            assert!(runner.lora_pool_names().is_empty(), "nothing registered");
         }
     }
 }

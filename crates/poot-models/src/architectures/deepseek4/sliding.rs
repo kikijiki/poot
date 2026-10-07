@@ -175,7 +175,7 @@ pub(crate) fn deepseek4_sliding_layer_decode(
 /// Trace a single `sliding_attention`-only DECODE step: one new token against a fixed-capacity single-head K==V
 /// cache, with mHC at the attention and MLP sites and a final [`hyper_head`] collapse (spec 281 FR-001..FR-006).
 /// `cap` is the physical cache capacity and may exceed `cfg.sliding_window`; the window is enforced by
-/// [`gemma4_local_window_floor`].
+/// [`sliding_window_floor`].
 #[cfg(test)]
 pub(crate) fn trace_deepseek4_sliding_decode(
     cfg: DeepseekV4Config,
@@ -198,8 +198,7 @@ pub(crate) fn trace_deepseek4_sliding_decode(
     let iota_full = b.iota(cfg.max_pos);
     let iota_cap = b.slice(iota_full, 0, 0, cap);
     let pos_f = b.gather_scalar(iota_full, 0, pos_slot);
-    let local_mask =
-        gemma4_local_window_floor(&b, mask, pos_f, iota_cap, cfg.sliding_window, 1, cap);
+    let local_mask = sliding_window_floor(&b, mask, pos_f, iota_cap, cfg.sliding_window, 1, cap);
 
     let cos = b.constant(V4_ROPE_COS, TensorType::f32(vec![cfg.max_pos, rd / 2]));
     let sin = b.constant(V4_ROPE_SIN, TensorType::f32(vec![cfg.max_pos, rd / 2]));

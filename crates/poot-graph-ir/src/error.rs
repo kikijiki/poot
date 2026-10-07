@@ -347,6 +347,9 @@ pub enum ShapeError {
     #[error("dtype mismatch: {a:?} vs {b:?}")]
     Dtype { a: TensorType, b: TensorType },
 
+    #[error("iota of {len} elements is not an exact {dtype} range")]
+    IotaRange { len: usize, dtype: DType },
+
     #[error("{op} does not support {dtype}")]
     DtypeOp { op: &'static str, dtype: DType },
 
@@ -396,6 +399,11 @@ pub enum ShapeError {
         actual: DType,
     },
 
+    #[error(
+        "a contraction epilogue's region must read the head result (local 0) and carry no pack (packed: {packed})"
+    )]
+    ContractionEpilogueRegion { packed: bool },
+
     #[error("dense contraction weight must be rank-2 [N, K] in checkpoint order, got {actual:?}")]
     DenseContractionWeightRank { actual: TensorType },
 
@@ -423,23 +431,19 @@ pub enum ShapeError {
     TopK { k: usize, extent: usize },
 
     #[error(
-        "flash attention q must be rank-4 [B, Hq, M, D] with n_rep={n_rep} dividing Hq ({form}), got {actual:?}"
+        "attention q must be rank-4 [B, Hq, Lq, D] with n_rep={n_rep} dividing Hq, got {actual:?}"
     )]
-    FlashAttentionQuery {
-        form: &'static str,
-        n_rep: usize,
-        actual: Vec<usize>,
-    },
+    AttentionQuery { n_rep: usize, actual: Vec<usize> },
 
-    #[error("flash attention {operand} must be {expected:?}, got {actual:?}")]
-    FlashAttentionOperand {
+    #[error("attention {operand} must be {expected:?}, got {actual:?}")]
+    AttentionOperand {
         operand: &'static str,
         expected: Vec<usize>,
         actual: Vec<usize>,
     },
 
-    #[error("flash attention {operand} dtype {actual} must match q's {expected}")]
-    FlashAttentionDtype {
+    #[error("attention {operand} dtype {actual} must match q's {expected}")]
+    AttentionDtype {
         operand: &'static str,
         expected: DType,
         actual: DType,

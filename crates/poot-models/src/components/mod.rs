@@ -5,18 +5,24 @@
 //! similar.
 
 pub mod attention;
+pub mod conv;
 pub mod dims;
+pub mod dsa;
 pub mod embed;
 pub mod ffn;
 pub mod head;
 mod kv_pool;
 pub mod linear;
-pub mod moe_decode;
-pub mod moe_prefill;
+pub mod mamba2;
+pub mod mla;
+pub mod moe;
 pub mod norm;
 pub mod rope;
+pub mod router;
+pub(crate) mod sparse_top_k;
 pub mod standard;
 #[cfg(test)]
 pub(crate) mod testing;
+pub mod witness;
 
 pub use kv_pool::*;

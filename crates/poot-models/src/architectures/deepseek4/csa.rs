@@ -407,8 +407,7 @@ pub(crate) fn trace_deepseek4_csa_decode(
     let iota_full = b.iota(cfg.max_pos);
     let iota_cap = b.slice(iota_full, 0, 0, cap);
     let pos_f = b.gather_scalar(iota_full, 0, pos_slot);
-    let local_mask =
-        gemma4_local_window_floor(&b, mask, pos_f, iota_cap, cfg.sliding_window, 1, cap);
+    let local_mask = sliding_window_floor(&b, mask, pos_f, iota_cap, cfg.sliding_window, 1, cap);
 
     let cos = b.constant(
         V4_COMPRESS_ROPE_COS,

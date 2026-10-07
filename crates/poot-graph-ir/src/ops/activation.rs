@@ -63,8 +63,26 @@ pub fn decay_mask_from_gates(
     let lg = b.unary(UnOp::Log, gates); // [1,H,1,L] log gates
     let lg_col = b.reshape(lg, vec![1, h, l, 1]); // [1,H,L,1]
     let cumlog = b.matmul(tril, lg_col); // [1,H,L,L] @ [1,H,L,1] -> [1,H,L,1] = prefix sum of log gates
+    decay_mask_from_cumlog(b, cumlog, tril, h, l)
+}
+
+/// The decay mask of a prefix sum of log gates already formed: `cumlog` is `[1, H, L, 1]`, the
+/// inclusive prefix sum over positions of each step's log gate. Returns the `[1, H, L, L]` mask of
+/// [`decay_mask_from_gates`], `exp(cumlog[t] - cumlog[j])` on and below the diagonal and `0` above.
+/// A caller whose log gates are known directly (Mamba2's `Delta * A`) forms the prefix sum once
+/// and shares it with its other consumers, with no `exp`/`log` round trip.
+pub fn decay_mask_from_cumlog(
+    b: &Builder,
+    cumlog: Traced,
+    tril: Traced,
+    h: usize,
+    l: usize,
+) -> Traced {
     let cum_row = b.reshape(cumlog, vec![1, h, 1, l]); // [1,H,1,L] = cumlog[j] (same L values, moved axis)
     let diff = b.binary(BinOp::Sub, cumlog, cum_row); // [1,H,L,L] diff[t,j] = cumlog[t] - cumlog[j]
+    // Above the diagonal the difference is positive and unbounded (`exp` of it overflows to `inf`, and
+    // `inf * 0` is NaN), so zero it first: on and below the diagonal `* 1.0` is exact.
+    let diff = b.binary(BinOp::Mul, diff, tril);
     let prod = b.unary(UnOp::Exp, diff); // exp(diff) = prod_{j<k<=t} g[k] (and 1 on the diagonal)
     b.binary(BinOp::Mul, prod, tril) // zero the strict upper triangle (j > t)
 }

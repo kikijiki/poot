@@ -123,3 +123,20 @@ fn a_split_head_generates_the_unsplit_logits_and_tokens() {
     };
     fixture::check_split_head(exec.as_mut(), target);
 }
+
+/// POOT-651 SC-001: a qwen2.5-0.5B-shaped BF16 checkpoint with a tied head decodes to the oracle's logits
+/// with BF16-only `Weight` residency (the head and embedding are one buffer, no F32 copy).
+///
+/// Mutations: (1) in `fold_dense_contractions`, skip the fold for a BF16 weight: `compile` refuses the
+/// head's `transpose` or the bound weight mismatches the kernel's element kind. (2) in
+/// `Engine::weight_buffer`, skip the residency lookup: the head uploads as a second buffer, `Weight` bytes
+/// grow by the head's `vocab * hidden * 2` and the equality goes red.
+#[test]
+fn the_tied_head_decodes_on_bf16_resident_weights_and_matches_the_oracle() {
+    let Some((mut exec, target)) = engine() else {
+        return;
+    };
+    fixture::check_tied_head(exec.as_mut(), target, &|g, store, map, slots, state| {
+        eval_mapped(g, store, map, slots, state)
+    });
+}

@@ -76,13 +76,6 @@ impl VulkanDevice {
         Self::with_timing(GraphTiming::Off)
     }
 
-    /// A device for the typed device-timing path: every dispatch is bracketed by two device timestamps,
-    /// read back after the replay's fence wait (no extra synchronization), and [`Device::device_time`]
-    /// reports them.
-    pub fn new_with_timing() -> Result<Self, VulkanGpuError> {
-        Self::with_timing(GraphTiming::PerDispatch)
-    }
-
     fn with_timing(timing: GraphTiming) -> Result<Self, VulkanGpuError> {
         let ctx = Context::new()?;
         if timing == GraphTiming::PerDispatch && !ctx.timestamps_supported() {

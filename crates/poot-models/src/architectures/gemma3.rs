@@ -22,8 +22,8 @@ use crate::components::linear::WeightError;
 use crate::components::norm::{NormKind, NormParams};
 use crate::components::rope::RopeParams;
 use crate::components::standard::{
-    LayerNorms, LayerParams, NormPlacement, StackParams, StackWeights, Step, check_step,
-    standard_layer, standard_stack,
+    BlockInput, LayerNorms, LayerParams, NormPlacement, StackParams, StackWeights, Step,
+    check_step, standard_layer, standard_stack,
 };
 use crate::model::{
     ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, StepShape,
@@ -46,6 +46,7 @@ pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     ],
     build,
     fixture,
+    variants: &[],
 };
 
 /// Gemma 3's config facts: `Gemma3TextConfig`'s defaults (eos `1`, global base `1e6`) and
@@ -259,7 +260,7 @@ impl Model for Gemma3 {
                 &layer.norms,
                 &p.layer,
                 |b, h| attention(b, &step, l, h, &layer.attn, &p.attention[l]),
-                |b, h| geglu_ffn(b, h, &layer.ffn),
+                |b, BlockInput { block: h, .. }| geglu_ffn(b, h, &layer.ffn),
             )
         });
         Ok(step.finish(b, logits))

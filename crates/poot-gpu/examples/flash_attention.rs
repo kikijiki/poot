@@ -1,9 +1,9 @@
-//! Flash-attention decode on the GPU (card 044 / spec 055, Card 557).
+//! Attention decode on the GPU.
 //!
 //! Traces one decode attention (GQA + masked softmax for one query token against a fixed-capacity KV) with
 //! `ops::attention_masked` and runs it through the executor contract. `compile` fuses the chain into one
-//! `FlashAttentionDecode`, and the planner lowers it to the synthesized flash decode
-//! (`kg::flash_region_decode`, online softmax with the running output in LDS), so it runs on wgpu/Vulkan as
+//! `Attention`, and the planner lowers it to the generated attention kernel
+//! (online softmax with the running state in LDS), so it runs on wgpu/Vulkan as
 //! well as NVIDIA.
 //!
 //! The fixture is hand-checkable: 1 head, head_dim 2, two KV positions, scale 1.0, no masking.

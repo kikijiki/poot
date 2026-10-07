@@ -175,21 +175,162 @@ pub fn attention_masked_softcap(
     mask: Traced,
     attn_logit_softcap: Option<f32>,
 ) -> Traced {
+    attention_over_keys(
+        b,
+        q,
+        AttentionKeys::Single(k),
+        v,
+        n_rep,
+        scale,
+        mask,
+        attn_logit_softcap,
+        None,
+    )
+}
+
+/// The key operand of the attention composite: one dense tensor, or the two parts of a split key.
+#[derive(Clone, Copy, Debug)]
+pub enum AttentionKeys {
+    /// `[B,Hkv,Lk,D]`.
+    Single(Traced),
+    /// `head [B,Hkv,Lk,D - s]` and `shared [B,1,Lk,s]`: the key is `concat(head, broadcast(shared))` on the
+    /// last axis (MLA's `k_nope` and rotary `k_pe`).
+    Split { head: Traced, shared: Traced },
+}
+
+/// What [`attention_live`] returns: the attention output and the length-validation witness the caller
+/// declares as a validation output.
+#[derive(Clone, Copy, Debug)]
+pub struct LiveAttention {
+    /// `[B,Hq,Lq,Dv]`.
+    pub out: Traced,
+    /// Zero when every `len[b]` was in `1..=Lk`; otherwise an executor publishes nothing.
+    pub witness: Traced,
+}
+
+/// Live-capacity attention: the attention composite over the first `len[b]` of the `Lk` key positions of batch
+/// row `b`, with `len` a raw I32 `[B]` that must lie in `1..=Lk`. The range is checked by the canonical
+/// index-bounds guard ([`Builder::guard_index_bounds`] on `len - 1`), so an out-of-range length publishes
+/// nothing through the validation channel and the graph reads a valid in-range fallback.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_live(
+    b: &Builder,
+    q: Traced,
+    keys: AttentionKeys,
+    v: Traced,
+    n_rep: usize,
+    scale: f32,
+    mask: Traced,
+    attn_logit_softcap: Option<f32>,
+    len: Traced,
+) -> Result<LiveAttention, crate::index_guard::IndexGuardError> {
+    let lk = b.aval(v).shape[2];
+    let last = b.binary_scalar(BinOp::Sub, len, Scalar::I32(1));
+    let guard = b.guard_index_bounds(last, lk)?;
+    let live_len = b.binary_scalar(BinOp::Add, guard.guarded, Scalar::I32(1));
+    let out = attention_over_keys(
+        b,
+        q,
+        keys,
+        v,
+        n_rep,
+        scale,
+        mask,
+        attn_logit_softcap,
+        Some(live_len),
+    );
+    Ok(LiveAttention {
+        out,
+        witness: guard.witness,
+    })
+}
+
+/// The one attention definition behind [`attention_masked_softcap`] and [`attention_live`], and the
+/// decomposition of `OpKind::Attention` over every key layout and bound.
+///
+/// With `live_len == None` every key position counts and the mask removes the ones that must not. With
+/// `Some(len)` (`len [B]` I32, already in `1..=Lk`) key `j` of batch row `b` is active when `j < len[b]`:
+/// inactive K and V rows are *selected* to zero before either matmul (a float `Select`, never a multiplication
+/// by zero, so a NaN there cannot survive) and inactive scores are selected to `-inf` after the mask is
+/// added, so inactive positions weigh exactly zero. Both parts of a split key are guarded.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attention_over_keys(
+    b: &Builder,
+    q: Traced,
+    keys: AttentionKeys,
+    v: Traced,
+    n_rep: usize,
+    scale: f32,
+    mask: Traced,
+    attn_logit_softcap: Option<f32>,
+    live_len: Option<Traced>,
+) -> Traced {
+    let live = live_len.map(|len| LiveKeys::new(b, len, b.aval(v).shape[2]));
+    let guard_rows = |x: Traced| match &live {
+        Some(live) => b.select(live.rows, x, live.zero_rows),
+        None => x,
+    };
+    let k = match keys {
+        AttentionKeys::Single(k) => guard_rows(k),
+        AttentionKeys::Split { head, shared } => {
+            let head = guard_rows(head);
+            let shared = guard_rows(shared);
+            // The shared part reaches every key head through the same `repeat_kv` chain a per-head key does.
+            let shared = repeat_kv(b, shared, b.aval(head).shape[1]);
+            b.concat(3, &[head, shared])
+        }
+    };
+    let v = guard_rows(v);
     let k = repeat_kv(b, k, n_rep);
     let v = repeat_kv(b, v, n_rep);
-    let kt = b.transpose(k, vec![0, 1, 3, 2]); // [1,Hq,D,cap]
-    let scores = b.matmul(q, kt); // [1,Hq,1,cap]
+    let kt = b.transpose(k, vec![0, 1, 3, 2]); // [B,Hq,D,Lk]
+    let scores = b.matmul(q, kt); // [B,Hq,Lq,Lk]
     let scores = b.binary_scalar(BinOp::Mul, scores, Scalar::F32(scale));
     let scores = match attn_logit_softcap {
         Some(c) => softcap(b, scores, c),
         None => scores,
     };
     let scores = b.binary(BinOp::Add, scores, mask); // additive mask, broadcast over Hq
+    let scores = match &live {
+        Some(live) => b.select(live.columns, scores, live.neg_inf_columns),
+        None => scores,
+    };
     let last = b.aval(scores).rank() - 1;
     let m = b.reduce(RedOp::Max, scores, last, true);
     let shifted = b.binary(BinOp::Sub, scores, m);
     let e = b.unary(UnOp::Exp, shifted);
     let denom = b.reduce(RedOp::Sum, e, last, true);
     let p = b.binary(BinOp::Div, e, denom);
-    b.matmul(p, v) // [1,Hq,1,D]
+    b.matmul(p, v) // [B,Hq,Lq,Dv]
+}
+
+/// The activity conditions and select fallbacks of a live bound, built once from `len [B]`.
+struct LiveKeys {
+    /// `[B,1,Lk,1]` I32: key row `j` of batch row `b` is active (`j < len[b]`).
+    rows: Traced,
+    /// `[B,1,1,Lk]` I32: the same condition laid along the score row.
+    columns: Traced,
+    /// `[1,1,Lk,1]` finite zeros, the fallback for an inactive K or V row.
+    zero_rows: Traced,
+    /// `[1,1,1,Lk]` `-inf`, the fallback for an inactive score.
+    neg_inf_columns: Traced,
+}
+
+impl LiveKeys {
+    fn new(b: &Builder, len: Traced, lk: usize) -> Self {
+        let batch = b.aval(len).shape[0];
+        let len = b.reshape(len, vec![batch, 1, 1, 1]);
+        // `j < len` is `len >= j + 1`; the key ends `1..=Lk` are built exactly in I32, with no float round trip.
+        let ends = b.binary_scalar(BinOp::Add, b.iota_i32(lk), Scalar::I32(1)); // [Lk] i32
+        // The select fallbacks come from the F32 range scaled by zero, so they are finite zeros whatever the
+        // scalar, and `-inf` is added to a zero rather than multiplied into a possible `0 * inf`.
+        let zero = b.binary_scalar(BinOp::Mul, b.iota(lk), Scalar::F32(0.0));
+        let neg_inf = b.binary_scalar(BinOp::Add, zero, Scalar::F32(f32::NEG_INFINITY));
+        Self {
+            rows: b.binary(BinOp::Ge, len, b.reshape(ends, vec![1, 1, lk, 1])),
+            columns: b.binary(BinOp::Ge, len, b.reshape(ends, vec![1, 1, 1, lk])),
+            zero_rows: b.reshape(zero, vec![1, 1, lk, 1]),
+            neg_inf_columns: b.reshape(neg_inf, vec![1, 1, 1, lk]),
+        }
+    }
 }

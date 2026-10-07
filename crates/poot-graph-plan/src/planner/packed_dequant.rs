@@ -6,7 +6,7 @@
 //!
 //! `OpKind::PackedDequant`/`PackedContraction` carry their carrier operands in
 //! `descriptor.sources()`'s role order (`op.rs`'s shape inference proves this at graph-build time), so
-//! the ordinary `Plan::ComputeMeta` consumer (`value_ids(eqn)` bound to kernel params 1..=n, in every
+//! the ordinary metadata-launch consumer (`value_ids(eqn)` bound to kernel params 1..=n, in every
 //! executor's typed-value walk and its own `run()`) already binds every source in role order: D9's
 //! "role-ordered source binding" is this convention, not new per-executor code. The one place role
 //! order has to be threaded by hand is the generated kernel's own declared parameter order
@@ -16,7 +16,7 @@
 //! `eqn.inputs[1]`).
 
 use super::*;
-use poot_kernelgen::{PackedKernelOp, RowSelect, Schedule};
+use poot_kernelgen::{PackedContraction, PackedKernelOp, Schedule};
 use poot_target::{Backend, DeviceCaps};
 
 /// `Ok(None)` when card 542a's table does not admit this equation's descriptor for this op: the
@@ -32,6 +32,7 @@ pub(super) fn try_plan(
     odt: DType,
     caps: &DeviceCaps,
     limits: BodyLimits,
+    packed_operands: &[bool],
 ) -> Result<Option<Planned>, PlanError> {
     match &eqn.op {
         OpKind::PackedDequant { descriptor } => try_plan_materialize(
@@ -56,6 +57,27 @@ pub(super) fn try_plan(
             limits,
             *descriptor,
             *blocks,
+            None,
+            packed_operands,
+        ),
+        // A packed contraction followed by its pointwise epilogue (`fuse_contraction_epilogues`): the same
+        // Gemv as above with the epilogue applied to each column's sum before its store.
+        OpKind::ContractionEpilogue {
+            head: ContractionHead::Packed { descriptor, blocks },
+            region,
+        } => try_plan_contraction(
+            g,
+            eqn,
+            out_shape,
+            out_numel,
+            backend,
+            odt,
+            caps,
+            limits,
+            *descriptor,
+            *blocks,
+            Some(region),
+            packed_operands,
         ),
         OpKind::PackedRowGather { descriptor } => try_plan_row_gather(
             g,
@@ -174,8 +196,10 @@ fn try_plan_row_gather(
 }
 
 /// `out[row, col] = sum over k of activation[row, k] * decode(weight_row(row, col), k)`: the
-/// `PackedContraction` equation. Params `(activation, words, metadata, out)` - `eqn.inputs[0]` is the
-/// activation, `eqn.inputs[1]` the one `Blocks` carrier. The schedule is chosen from shapes alone
+/// `PackedContraction` equation, or a `ContractionEpilogue` over a packed head (`epilogue`). Params
+/// `(activation, words, metadata, out)` - `eqn.inputs[0]` is the activation, `eqn.inputs[1]` the one
+/// `Blocks` carrier (with an epilogue, its leaves sit between the carriers and the metadata). The schedule is
+/// chosen from shapes alone
 /// (dquant.md D3, section 5): `M == 1` (one activation row per block) is `Schedule::Gemv`, its launch
 /// shape from the output count and the device's compute units ([`gemv_schedule`], card 653); `M > 1`
 /// is `Schedule::Tiled` (card 542b, dquant.md D6/Q9), so GGUF prefill does not fall back to
@@ -192,7 +216,7 @@ fn try_plan_row_gather(
 /// count ([`Schedule::grid_threads`] divided by `tile*tile`); above `caps.max_grid[0]` it is folded
 /// onto a 2-D `(x_groups, y_groups)` grid the body reconstructs as `gy*x_groups+gx`
 /// (`poot_kernelgen`'s `contraction_tiled` doc - the same `GroupY`-spill convention `gemv_lds`/
-/// `flash_region_prefill` use, `x_groups` riding in `metadata[3]` rather than baked, matching this
+/// `attention_body` use, `x_groups` riding in `metadata[3]` rather than baked, matching this
 /// kernel family's own shape-in-metadata design). Above `caps.max_grid[1]` too, or on any `usize ->
 /// u32` overflow along the way, `try_plan_contraction` refuses with `Capability::DispatchGridLimit`/
 /// `DispatchSizeOverflow` naming the equation, before any dispatch - `finalize`'s generic wg-bump
@@ -211,6 +235,8 @@ fn try_plan_contraction(
     limits: BodyLimits,
     descriptor: poot_quant::PackedWeight,
     blocks: usize,
+    epilogue: Option<&FusedRegion>,
+    packed_operands: &[bool],
 ) -> Result<Option<Planned>, PlanError> {
     let site = Site::new(g, eqn, backend, limits);
     let k = descriptor.shape()[1];
@@ -258,27 +284,38 @@ fn try_plan_contraction(
         let meta = vec![k as u32, out_per_block as u32, m_per_block as u32, x_groups];
         (schedule, meta, [threads_x, y_groups, 1])
     };
-    let op = PackedKernelOp::Contraction {
-        rows: RowSelect::Dense,
-        schedule,
-    };
-    let spec = match crate::packed_block_float::select_packed_kernel(
+    let Ok(format) = crate::packed_block_float::admit_packed(
         crate::packed_block_float::PACKED_LOWERING,
         descriptor,
-        op,
+        crate::packed_block_float::PackedKernelOpKind::Contraction,
         backend,
-    ) {
-        Ok(spec) => spec,
-        Err(_) => return Ok(None),
+    ) else {
+        return Ok(None);
+    };
+    let epilogue = match epilogue {
+        // The tiled schedule has no epilogue (the generator refuses it by name), and the fuse rule forms one
+        // only over a Gemv head (`epilogue_head_lowers`).
+        Some(region) => Some(matmul::epilogue_of(
+            site,
+            g,
+            eqn,
+            ContractionHead::Packed { descriptor, blocks }.operands(),
+            region,
+            out_shape,
+            odt,
+            packed_operands,
+        )?),
+        None => None,
     };
     let mut planned = Planned::generated(
         site,
-        KernelRequest::Packed(PackedRequest {
-            name: "packed_contraction",
-            spec,
+        KernelRequest::Contraction(ContractionSpec::Packed(PackedContraction {
+            format,
+            schedule,
+            epilogue,
             grid,
             meta,
-        }),
+        })),
         backend,
         caps,
     )?;
@@ -321,7 +358,7 @@ fn gemv_schedule(outputs: usize, compute_units: u32) -> Schedule {
 #[cfg(test)]
 mod tests {
     use poot_graph_ir::{Builder, OpKind, Slot, TensorType};
-    use poot_kernelgen::{KernelRequest, PackedKernelOp, RowSelect, Schedule};
+    use poot_kernelgen::{ContractionSpec, KernelRequest, PackedContraction, Schedule};
     use poot_quant::PackedWeight;
     use poot_quant::format::WeightFormat;
     use poot_target::{Backend, DeviceCaps};
@@ -329,7 +366,7 @@ mod tests {
     use crate::{Capability, PlanError};
 
     use crate::{
-        CompileError, CompileOptions, FusionPolicy, KernelChoice, Plan, Submission, Target, compile,
+        CompileError, CompileOptions, Dispatch, KernelChoice, Launch, Submission, Target, compile,
     };
 
     /// SC-003 (card 653): a decode (`M == 1`) packed contraction compiled for a device with a
@@ -366,7 +403,6 @@ mod tests {
             };
             let options = CompileOptions {
                 execution: Submission::Replay,
-                fusion: FusionPolicy::Full,
                 limits: crate::CompileLimits::STANDARD,
             };
             let program = compile(&builder.finish(out), &target, &options)
@@ -375,32 +411,33 @@ mod tests {
                 .planned()
                 .find(|(eqn, _)| matches!(eqn.op, OpKind::PackedContraction { .. }))
                 .unwrap_or_else(|| panic!("{what}: no PackedContraction planned"));
-            let Plan::ComputeMeta { body, grid, .. } = plan else {
-                panic!("{what}: expected a ComputeMeta plan, got {plan:?}");
+            let Some(Dispatch { body, launch, .. }) = plan.single() else {
+                panic!("{what}: expected a single dispatch, got {plan:?}");
             };
+            let grid = launch.grid;
             let schedule = Schedule::Gemv {
                 width: 256,
                 cols,
                 unroll: 8,
             };
-            let KernelChoice::Generated(KernelRequest::Packed(request)) =
-                program.kernel_choice(eqn)
+            let KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::Packed(
+                PackedContraction {
+                    format,
+                    schedule: planned,
+                    epilogue: None,
+                    ..
+                },
+            ))) = program.kernel_choice(eqn)
             else {
-                panic!("{what}: a packed contraction is a generated request");
+                panic!("{what}: a packed contraction is a generated contraction request");
             };
             assert_eq!(
-                request.spec,
-                poot_kernelgen::PackedKernelSpec {
-                    format: WeightFormat::Q8_0,
-                    op: PackedKernelOp::Contraction {
-                        rows: RowSelect::Dense,
-                        schedule,
-                    },
-                },
+                (*format, *planned),
+                (WeightFormat::Q8_0, schedule),
                 "{what}"
             );
             assert_eq!(
-                *grid,
+                grid,
                 [n.div_ceil(cols as usize) as u32 * 256, 1, 1],
                 "{what}"
             );
@@ -439,7 +476,6 @@ mod tests {
         };
         let options = CompileOptions {
             execution: Submission::Replay,
-            fusion: FusionPolicy::Full,
             limits: crate::CompileLimits::STANDARD,
         };
         let program = compile(&builder.finish(out_value), &target, &options).unwrap();
@@ -447,28 +483,27 @@ mod tests {
             .planned()
             .find(|(eqn, _)| matches!(eqn.op, OpKind::PackedContraction { .. }))
             .unwrap_or_else(|| panic!("no PackedContraction planned"));
-        let Plan::ComputeMeta { grid, .. } = plan else {
-            panic!("expected a ComputeMeta plan, got {plan:?}");
+        let Some(Dispatch { launch, .. }) = plan.single() else {
+            panic!("expected a single dispatch, got {plan:?}");
         };
+        let grid = launch.grid;
         let schedule = Schedule::Tiled {
             tile: poot_kernelgen::TileSize::new(super::GEMM_TILE as u32).unwrap(),
         };
-        let KernelChoice::Generated(KernelRequest::Packed(request)) = program.kernel_choice(eqn)
+        let KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::Packed(
+            PackedContraction {
+                format,
+                schedule: planned,
+                epilogue: None,
+                ..
+            },
+        ))) = program.kernel_choice(eqn)
         else {
-            panic!("a packed contraction is a generated request");
+            panic!("a packed contraction is a generated contraction request");
         };
+        assert_eq!((*format, *planned), (WeightFormat::E2m1Row32, schedule));
         assert_eq!(
-            request.spec,
-            poot_kernelgen::PackedKernelSpec {
-                format: WeightFormat::E2m1Row32,
-                op: PackedKernelOp::Contraction {
-                    rows: RowSelect::Dense,
-                    schedule,
-                },
-            }
-        );
-        assert_eq!(
-            *grid,
+            grid,
             [
                 schedule.grid_threads(blocks, m_per_block, out_per_block) as u32,
                 1,
@@ -549,12 +584,15 @@ mod tests {
             &poot_test_util::graph_fixtures::roomy_body_limits(),
         )
         .unwrap();
-        let Plan::ComputeMeta {
-            body, grid, meta, ..
-        } = plan
+        let Some(Dispatch {
+            body,
+            launch: Launch { grid, meta },
+            ..
+        }) = plan.single()
         else {
-            panic!("expected a ComputeMeta plan, got {plan:?}");
+            panic!("expected a single dispatch, got {plan:?}");
         };
+        let grid = *grid;
         assert_eq!(grid, [4 * 64, 2, 1], "folded grid: x_groups=4, y_groups=2");
         assert_eq!(
             body.workgroup_size,
@@ -640,7 +678,6 @@ mod tests {
         };
         let options = CompileOptions {
             execution: Submission::Replay,
-            fusion: FusionPolicy::Full,
             limits: crate::CompileLimits::STANDARD,
         };
         let Err(error) = compile(&graph, &target, &options) else {
@@ -705,12 +742,15 @@ mod tests {
             &poot_test_util::graph_fixtures::roomy_body_limits(),
         )
         .unwrap_or_else(|error| panic!("expected a bounded plan, got a refusal: {error}"));
-        let Plan::ComputeMeta {
-            body, grid, meta, ..
-        } = plan
+        let Some(Dispatch {
+            body,
+            launch: Launch { grid, meta },
+            ..
+        }) = plan.single()
         else {
-            panic!("expected a ComputeMeta plan, got {plan:?}");
+            panic!("expected a single dispatch, got {plan:?}");
         };
+        let grid = *grid;
         assert_eq!(
             body.workgroup_size,
             [64, 1, 1],

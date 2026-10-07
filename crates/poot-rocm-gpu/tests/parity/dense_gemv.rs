@@ -4,9 +4,7 @@
 use poot_executor::{Device, Engine, Executor};
 use poot_executor_parity::{Fixture, run_outputs};
 use poot_graph_ir::{Builder, OpKind, Slot, TensorType};
-use poot_graph_plan::{
-    CompileLimits, CompileOptions, FusionPolicy, KernelChoice, Submission, Target, compile,
-};
+use poot_graph_plan::{CompileLimits, CompileOptions, KernelChoice, Submission, Target, compile};
 use poot_kernelgen::{ContractionSpec, KernelRequest, Schedule};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_rocm_gpu::device::RocmDevice;
@@ -98,7 +96,7 @@ fn gemv_case(dtype: DType, k: usize, n: usize) -> GemvCase {
             graph,
             store: builder.build(),
             steps,
-            fusion: FusionPolicy::Full,
+            guarded: false,
         },
         activation,
         held,
@@ -109,7 +107,6 @@ fn gemv_case(dtype: DType, k: usize, n: usize) -> GemvCase {
 
 const OPTIONS: CompileOptions = CompileOptions {
     execution: Submission::Replay,
-    fusion: FusionPolicy::Full,
     limits: CompileLimits::STANDARD,
 };
 

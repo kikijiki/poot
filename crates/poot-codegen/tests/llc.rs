@@ -6,10 +6,11 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use poot_codegen::{Target, compile};
-use poot_kernel_ir::fixtures;
+use poot_kernel_ir::{Ty, fixtures};
+use poot_kernelgen::{MovementOp, MovementSpec, Storage, UpdateIndex};
 use poot_test_util::kernel_fixtures::{
-    e4m3fn_decode_kernel, e4m3fn_encode_kernel, emit_llvm_ir, gemv_loop_kernel, matmul_kernel,
-    square_kernel, vadd_loop_kernel,
+    e4m3fn_encode_kernel, emit_llvm_ir, gemv_loop_kernel, matmul_kernel, square_kernel,
+    vadd_loop_kernel,
 };
 
 fn have(bin: &str) -> bool {
@@ -126,7 +127,7 @@ fn exact_i32_arithmetic_lowers_without_float_conversion() {
                     poot_kernelgen::Layout::contiguous(&[2]),
                 ],
                 &poot_kernelgen::FusedKernel {
-                    n_leaves: 2,
+                    leaf_tys: vec![poot_kernelgen::LeafTy::I32; 2],
                     steps: vec![
                         poot_kernelgen::FusedStep {
                             op: poot_kernelgen::FusedScalarOp::Binary(
@@ -184,8 +185,19 @@ fn exact_i32_arithmetic_lowers_without_float_conversion() {
     }
 }
 
-/// Spec 149 Stage 1 SC-004 (CPU-safe compile gate): both format-aware conversion directions lower through
-/// the software integer/float path without an LLVM FP8 type or native target instruction.
+/// The packed E4M3FN movement `op` into `out_shape`, as one generated body.
+fn packed_movement(name: &str, out_shape: Vec<usize>, op: MovementOp) -> poot_kernel_ir::Body {
+    poot_kernelgen::movement_body(
+        name,
+        &MovementSpec::new(Storage::BYTE_LANES, out_shape, op),
+        None,
+    )
+    .expect("a valid packed movement")
+}
+
+/// Spec 149 Stage 1 SC-004 (CPU-safe compile gate): both format-aware conversion directions and every
+/// packed movement lower through the software integer/float path without an LLVM FP8 type or native
+/// target instruction.
 #[test]
 fn e4m3fn_software_conversion_lowers_on_all_gpu_targets() {
     if !have("llc") {
@@ -195,7 +207,6 @@ fn e4m3fn_software_conversion_lowers_on_all_gpu_targets() {
     let dir = out_dir("e4m3fn");
     for (body, name) in [
         (e4m3fn_encode_kernel(), "e4m3fn_encode"),
-        (e4m3fn_decode_kernel(), "e4m3fn_decode"),
         (
             poot_kernelgen::f32_to_e4m3fn_packed("e4m3fn_pack", 5)
                 .expect("f32_to_e4m3fn_packed precondition"),
@@ -207,73 +218,118 @@ fn e4m3fn_software_conversion_lowers_on_all_gpu_targets() {
             "e4m3fn_unpack",
         ),
         (
-            poot_kernelgen::e4m3fn_repack_reshape("e4m3fn_repack", 5, 2)
-                .expect("e4m3fn_repack_reshape precondition"),
+            packed_movement(
+                "e4m3fn_repack",
+                vec![2, 5],
+                MovementOp::Reshape {
+                    in_shape: vec![5, 2],
+                },
+            ),
             "e4m3fn_repack",
         ),
         (
-            poot_kernelgen::e4m3fn_transpose_packed("e4m3fn_transpose", &[5, 2], &[2, 5], &[1, 0])
-                .expect("e4m3fn_transpose_packed precondition"),
+            packed_movement(
+                "e4m3fn_transpose",
+                vec![5, 2],
+                MovementOp::Transpose {
+                    in_shape: vec![2, 5],
+                    perm: vec![1, 0],
+                },
+            ),
             "e4m3fn_transpose",
         ),
         (
-            poot_kernelgen::e4m3fn_slice_packed("e4m3fn_slice", &[2, 3], &[2, 5], 1, 1)
-                .expect("e4m3fn_slice_packed precondition"),
+            packed_movement(
+                "e4m3fn_slice",
+                vec![2, 3],
+                MovementOp::Slice {
+                    in_shape: vec![2, 5],
+                    axis: 1,
+                    start: 1,
+                },
+            ),
             "e4m3fn_slice",
         ),
         (
-            poot_kernelgen::e4m3fn_concat_packed(
+            packed_movement(
                 "e4m3fn_concat",
-                &[2, 6, 3],
-                1,
-                &[&[2, 2, 3], &[2, 1, 3], &[2, 3, 3]],
-            )
-            .expect("e4m3fn_concat_packed precondition"),
+                vec![2, 6, 3],
+                MovementOp::Concat {
+                    axis: 1,
+                    in_shapes: vec![vec![2, 2, 3], vec![2, 1, 3], vec![2, 3, 3]],
+                },
+            ),
             "e4m3fn_concat",
         ),
         (
-            poot_kernelgen::e4m3fn_gather_packed("e4m3fn_gather", &[2, 2, 5], &[2, 3, 5], 1, &[2])
-                .expect("e4m3fn_gather_packed precondition"),
+            packed_movement(
+                "e4m3fn_gather",
+                vec![2, 2, 5],
+                MovementOp::Gather {
+                    in_shape: vec![2, 3, 5],
+                    axis: 1,
+                    index_dtype: Ty::F32,
+                    index_numel: 2,
+                },
+            ),
             "e4m3fn_gather",
         ),
         (
-            poot_kernelgen::e4m3fn_dynamic_update_slice_packed(
+            packed_movement(
                 "e4m3fn_dynamic_update",
-                &[2, 4, 5],
-                &[2, 2, 5],
-                1,
-                1,
-            )
-            .expect("e4m3fn_dynamic_update_slice_packed precondition"),
+                vec![2, 4, 5],
+                MovementOp::UpdateSlice {
+                    update_shape: vec![2, 2, 5],
+                    axis: 1,
+                    index: UpdateIndex::Static(1),
+                },
+            ),
             "e4m3fn_dynamic_update",
         ),
         (
-            poot_kernelgen::e4m3fn_dynamic_update_slice_dynamic_packed(
+            packed_movement(
                 "e4m3fn_dynamic_update_runtime",
-                &[2, 5],
-                &[2, 2],
-                1,
-            )
-            .expect("e4m3fn_dynamic_update_slice_dynamic_packed precondition"),
+                vec![2, 5],
+                MovementOp::UpdateSlice {
+                    update_shape: vec![2, 2],
+                    axis: 1,
+                    index: UpdateIndex::Runtime { dtype: Ty::F32 },
+                },
+            ),
             "e4m3fn_dynamic_update_runtime",
         ),
         (
-            poot_kernelgen::e4m3fn_broadcast_packed("e4m3fn_broadcast", &[2, 3, 5], &[2, 1, 5])
-                .expect("e4m3fn_broadcast_packed precondition"),
+            packed_movement(
+                "e4m3fn_broadcast",
+                vec![2, 3, 5],
+                MovementOp::Broadcast {
+                    in_shape: vec![2, 1, 5],
+                },
+            ),
             "e4m3fn_broadcast",
         ),
         (
-            poot_kernelgen::e4m3fn_scatter_update_packed(
+            packed_movement(
                 "e4m3fn_scatter_update",
-                &[4, 2, 5],
-                &[3, 2, 5],
-            )
-            .expect("e4m3fn_scatter_update_packed precondition"),
+                vec![4, 2, 5],
+                MovementOp::ScatterRows {
+                    src_shape: vec![3, 2, 5],
+                    inverse_dtype: Ty::F32,
+                    window: None,
+                },
+            ),
             "e4m3fn_scatter_update",
         ),
         (
-            poot_kernelgen::e4m3fn_scatter_update_packed("e4m3fn_scatter_update_rank1", &[5], &[3])
-                .expect("e4m3fn_scatter_update_packed precondition"),
+            packed_movement(
+                "e4m3fn_scatter_update_rank1",
+                vec![5],
+                MovementOp::ScatterRows {
+                    src_shape: vec![3],
+                    inverse_dtype: Ty::F32,
+                    window: None,
+                },
+            ),
             "e4m3fn_scatter_update_rank1",
         ),
     ] {
@@ -442,6 +498,196 @@ fn coopmat_tile_spirv_validates() {
     let out = poot_codegen::artifact_path(&dir, "wmma_coopmat_tile", Target::SpirvVulkan);
     let body = poot_test_util::kernel_fixtures::wmma_tile("wmma_coopmat_tile");
     compile(&body, Target::SpirvVulkan, &out).unwrap();
+    let v = Command::new("spirv-val")
+        .arg("--target-env")
+        .arg("vulkan1.3")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        v.status.success(),
+        "spirv-val failed:\n{}",
+        String::from_utf8_lossy(&v.stderr)
+    );
+}
+
+/// Card 663 SC-003: the K-loop cooperative-matrix matmul (`K = 48`, three 16-wide blocks, batched) lowers through
+/// the real `compile()` path (`llc`, the `fix_coopmat_calls` post-process) to SPIR-V that `spirv-val` accepts: the
+/// accumulator fragment is a `Function` variable the loop reads and writes on every iteration, not a value that
+/// dies at the back-edge. The device result of the same kernel is the multi-block row in
+/// `poot-vulkan-device`'s parity table.
+#[test]
+fn coopmat_k_loop_spirv_validates() {
+    if !have("llc") || !have("spirv-val") {
+        eprintln!("llc/spirv-val not on PATH; skipping");
+        return;
+    }
+    let dir = out_dir("coopmat-k-loop");
+    let out = poot_codegen::artifact_path(&dir, "coopmat_k_loop", Target::SpirvVulkan);
+    let body = poot_kernelgen::matmul_tensorcore_coopmat(
+        "coopmat_k_loop",
+        &[2, 32, 32],
+        &[2, 32, 48],
+        &[2, 48, 32],
+    )
+    .expect("a 16-aligned batched shape");
+    compile(&body, Target::SpirvVulkan, &out).unwrap();
+    let v = Command::new("spirv-val")
+        .arg("--target-env")
+        .arg("vulkan1.3")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        v.status.success(),
+        "spirv-val failed:\n{}",
+        String::from_utf8_lossy(&v.stderr)
+    );
+}
+
+/// `wmma_tile`'s matrix work moved behind a branch on `lane < bound` (the thread index along X): the shape of a
+/// kernel that selects some lanes of its workgroup to run a collective matrix op. `bound == 32` selects the first
+/// whole subgroup; any other bound splits one.
+fn wmma_tile_behind_lane_bound(bound: u64) -> poot_kernel_ir::Body {
+    use poot_kernel_ir::{
+        BasicBlock, BinOp, BlockId, Constant, IndexAxis, LocalDecl, Operand, Place, Rvalue,
+        Statement, SwitchTargets, Terminator,
+    };
+    let mut body = poot_test_util::kernel_fixtures::wmma_tile("wmma_tile_behind_lane_bound");
+    let lane = poot_kernel_ir::Local {
+        index: body.locals.len() as u32,
+    };
+    let selected = poot_kernel_ir::Local {
+        index: lane.index + 1,
+    };
+    for ty in [Ty::Usize, Ty::Bool] {
+        body.locals.push(LocalDecl { ty, mutable: true });
+    }
+    let mut statements = std::mem::take(&mut body.blocks[0].statements);
+    let matrix_work = statements.split_off(1); // statements[0] is the tile index assignment
+    body.blocks = vec![
+        BasicBlock {
+            statements,
+            terminator: Terminator::ThreadIndexCall {
+                destination: Place::local(lane),
+                dim: IndexAxis::X,
+                target: BlockId { index: 1 },
+            },
+        },
+        BasicBlock {
+            statements: vec![Statement::Assign(
+                Place::local(selected),
+                Rvalue::BinaryOp(
+                    BinOp::Lt,
+                    Operand::Copy(Place::local(lane)),
+                    Operand::Const(Constant::Usize(bound)),
+                ),
+            )],
+            terminator: Terminator::SwitchInt {
+                discr: Operand::Copy(Place::local(selected)),
+                targets: SwitchTargets {
+                    branches: vec![(0, BlockId { index: 3 })],
+                    otherwise: BlockId { index: 2 },
+                },
+            },
+        },
+        BasicBlock {
+            statements: matrix_work,
+            terminator: Terminator::Return,
+        },
+        BasicBlock {
+            statements: vec![],
+            terminator: Terminator::Return,
+        },
+    ];
+    body.workgroup_size = [64, 1, 1];
+    body
+}
+
+/// Card 663 SC-002 on the production path: matrix work under a lane-varying branch is refused by `compile()`
+/// itself, on every target, before any IR is emitted.
+///
+/// Mutation: drop the collective-participation check in `Body::verify_divergent_control`
+/// (`poot-kernel-ir`); the body compiles and this row goes red.
+#[test]
+fn matrix_work_under_a_lane_varying_branch_is_refused_before_codegen() {
+    use poot_codegen::EmitError;
+    use poot_kernel_ir::VerifyErrorKind;
+    let body = wmma_tile_behind_lane_bound(16);
+    for target in [
+        Target::SpirvVulkan,
+        Target::Nvptx,
+        Target::AmdGcn(poot_target::AmdArch::gfx1151()),
+    ] {
+        let Err(EmitError::InvalidBody(error)) = emit_llvm_ir(&body, target) else {
+            panic!("{target:?}: a body splitting a subgroup must be refused as invalid");
+        };
+        assert!(
+            matches!(
+                error.kind,
+                VerifyErrorKind::DivergentFragmentParticipation { .. }
+            ),
+            "{target:?}: {error}"
+        );
+    }
+}
+
+/// Card 663 SC-002 on the production path, roles: `wmma_tile` with the multiply's A and B operands swapped is
+/// refused by `emit_llvm_ir` itself on every target, naming the local and the fragment type it needed.
+///
+/// Mutation: make `Body::expect_fragment` (`poot-kernel-ir`) accept any declaration; the swapped body lowers
+/// and this row goes red.
+#[test]
+fn swapped_matrix_operands_are_refused_before_codegen() {
+    use poot_codegen::EmitError;
+    use poot_kernel_ir::{FragmentTy, Statement, VerifyErrorKind, WmmaDtype, WmmaMat, WmmaShape};
+    let mut body = poot_test_util::kernel_fixtures::wmma_tile("wmma_tile_swapped_operands");
+    let mma = body.blocks[0]
+        .statements
+        .iter_mut()
+        .find_map(|statement| match statement {
+            Statement::WmmaMma { a, b, .. } => Some((a, b)),
+            _ => None,
+        })
+        .expect("the tile multiplies");
+    std::mem::swap(mma.0, mma.1);
+    // `a` now names the B fragment: it is the first operand the verifier checks.
+    let offending = *mma.0;
+    for target in [
+        Target::SpirvVulkan,
+        Target::Nvptx,
+        Target::AmdGcn(poot_target::AmdArch::gfx1151()),
+    ] {
+        let Err(EmitError::InvalidBody(error)) = emit_llvm_ir(&body, target) else {
+            panic!("{target:?}: swapped A/B operands must be refused as an invalid body");
+        };
+        assert_eq!(
+            error.kind,
+            VerifyErrorKind::FragmentTypeMismatch {
+                local: offending,
+                expected: FragmentTy::matrix(WmmaMat::A, WmmaDtype::F16, WmmaShape::M16N16K16),
+                found: Ty::Fragment(FragmentTy::matrix(
+                    WmmaMat::B,
+                    WmmaDtype::F16,
+                    WmmaShape::M16N16K16
+                )),
+            },
+            "{target:?}"
+        );
+    }
+}
+
+/// Card 663 SC-002 positive side: selecting a whole subgroup (`lane < 32` in a 64-lane workgroup, the warp-zero
+/// selection) is accepted and lowers to SPIR-V that validates.
+#[test]
+fn whole_subgroup_selection_lowers_to_valid_spirv() {
+    if !have("llc") || !have("spirv-val") {
+        eprintln!("llc/spirv-val not on PATH; skipping");
+        return;
+    }
+    let dir = out_dir("coopmat-warp-select");
+    let out = poot_codegen::artifact_path(&dir, "coopmat_warp_select", Target::SpirvVulkan);
+    compile(&wmma_tile_behind_lane_bound(32), Target::SpirvVulkan, &out).unwrap();
     let v = Command::new("spirv-val")
         .arg("--target-env")
         .arg("vulkan1.3")

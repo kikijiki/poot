@@ -408,15 +408,12 @@ fn compile_chooses_the_generated_tiled_gemm_for_m_over_one_only() {
     // matmul, and records it as the plan's kernel choice (the graph keeps a plain `MatMul`). A decode
     // GEMV (M==1) does not take it.
     use poot_graph_ir::op::OpKind;
-    use poot_graph_plan::{
-        CompileOptions, FusionPolicy, KernelChoice, Submission, Target, compile,
-    };
+    use poot_graph_plan::{CompileOptions, KernelChoice, Submission, Target, compile};
     use poot_kernelgen::{ContractionSpec, KernelRequest};
     use poot_target::{AmdArch, Backend};
 
     let options = CompileOptions {
         execution: Submission::Replay,
-        fusion: FusionPolicy::Full,
         limits: poot_graph_plan::CompileLimits::STANDARD,
     };
     let backend = Backend::AmdGcn(AmdArch::gfx1151());

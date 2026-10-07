@@ -4,7 +4,7 @@
 //! [vocab]`), one thread per output element for `RandomUniform` (shape-generic over `[rows, cols]`,
 //! `dims = [cols]`). Authored in Rust (`pootc/kernels/sampling/*.rs`); `poot-gpu` lowers each to SPIR-V,
 //! `poot-ptx-gpu` to NVPTX and `poot-rocm-gpu` to AMDGCN, so there is one kernel definition and one copy
-//! of each asset. See `planner::sampling` for their `Plan::ComputeMeta` lowering.
+//! of each asset. See `planner::sampling` for their metadata-launch lowering.
 
 kernel_assets! {
     family = body_sampling;

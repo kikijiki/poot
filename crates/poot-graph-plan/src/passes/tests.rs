@@ -8,6 +8,7 @@ use poot_graph_ir::analysis::{
 use poot_graph_ir::op::{BinOp, RedOp};
 use poot_graph_ir::ops::{attention_masked, attention_masked_softcap};
 use poot_graph_ir::types::TensorType;
+use poot_graph_ir::{KeyLayout, KvBound};
 use poot_quant::PackedWeight;
 use poot_quant::format::WeightFormat;
 
@@ -493,8 +494,10 @@ fn production_rejects_packed_dequant_escape_table() -> Result<(), poot_graph_ir:
     Ok(())
 }
 
+/// A value head narrower than the key head fuses: the attention op types `dv != dk`, and the output is
+/// `dv` wide. Mutation: require `dv == dk` again in `infer_attention`; the chain stays decomposed.
 #[test]
-fn flash_attention_keeps_distinct_value_head_width_decomposed() {
+fn flash_attention_fuses_a_distinct_value_head_width() {
     let b = Builder::new();
     let q = b.constant("q", TensorType::f32(vec![1, 2, 1, 3]));
     let k = b.constant("k", TensorType::f32(vec![1, 2, 5, 3]));
@@ -506,19 +509,16 @@ fn flash_attention_keeps_distinct_value_head_width_decomposed() {
 
     assert_eq!(optimized.aval(optimized.output).shape, vec![1, 2, 1, 2]);
     assert!(
-        optimized.eqns.iter().all(|eqn| !matches!(
-            eqn.op,
-            OpKind::FlashAttentionDecode { .. } | OpKind::FlashAttentionPrefill { .. }
-        )),
-        "flash kernels have one shared Q/K/V head width"
+        optimized
+            .eqns
+            .iter()
+            .any(|eqn| matches!(eqn.op, OpKind::Attention(_))),
+        "the generated kernel takes a value width of its own"
     );
 }
 
 fn is_flash(op: &OpKind) -> bool {
-    matches!(
-        op,
-        OpKind::FlashAttentionDecode { .. } | OpKind::FlashAttentionPrefill { .. }
-    )
+    matches!(op, OpKind::Attention(_))
 }
 
 /// R467-001: K/V with a size-1 head axis (MQA written by broadcasting, not `repeat_kv`) or a size-1 batch
@@ -561,11 +561,10 @@ fn flash_attention_declines_broadcast_kv() {
     }
 }
 
-/// A graph whose last equation is the fused flash `op` over dense MHA operands (`Hq = 4`, `n_rep = 1`),
-/// with the ids of its `k`, `v` and `mask` inputs. Decode forms use batch 2 and `cap = 5`; prefill forms
-/// use batch 1 and `L = 3`.
-fn flash_graph(op: OpKind) -> (Graph, [ValueId; 3]) {
-    let decode = matches!(op, OpKind::FlashAttentionDecode { .. });
+/// A graph whose last equation is the fused attention op over dense MHA operands (`Hq = 4`, `n_rep = 1`),
+/// with the ids of its `k`, `v` and `mask` inputs. The decode form uses batch 2 and `cap = 5`; the prefill
+/// form batch 1 and `L = 3`.
+fn flash_graph(decode: bool) -> (Graph, [ValueId; 3]) {
     let (bsz, hq, m, t, d) = if decode {
         (2, 4, 1, 5, 8)
     } else {
@@ -582,38 +581,23 @@ fn flash_graph(op: OpKind) -> (Graph, [ValueId; 3]) {
         poot_graph_ir::ops::attention_prefill(&b, q, k, v, 1, 0.25, mask)
     };
     // A tracer states attention as primitives; the flash op is the matcher's.
-    let mut g = dce(&flash_attention_capped(&b.finish(out), None));
-    let flash = g.eqns.last_mut().expect("the flash equation");
+    let g = dce(&flash_attention_capped(&b.finish(out), None));
+    let flash = g.eqns.last().expect("the flash equation");
     assert!(
-        matches!(
-            flash.op,
-            OpKind::FlashAttentionDecode { .. } | OpKind::FlashAttentionPrefill { .. }
-        ),
+        matches!(flash.op, OpKind::Attention(_)),
         "the matcher forms the flash op: {:?}",
         flash.op
     );
-    flash.op = op;
     (g, [k.id, v.id, mask.id])
 }
 
 /// R467-001: `Graph::validate` rejects a fused flash op whose K/V or mask the op would index past, from
-/// any source (not just the matcher), with the typed `FlashAttentionOperand` error.
+/// any source (not just the matcher), with the typed `AttentionOperand` error.
 #[test]
 fn validate_rejects_flash_ops_with_inconsistent_kv_or_mask() {
-    let ops = [
-        OpKind::FlashAttentionDecode {
-            n_rep: 1,
-            scale: 0.25,
-        },
-        OpKind::FlashAttentionPrefill {
-            n_rep: 1,
-            scale: 0.25,
-            softcap: None,
-        },
-    ];
-    for op in ops {
-        let name = op.name();
-        let (dense, [k, v, mask]) = flash_graph(op);
+    for decode in [true, false] {
+        let name = if decode { "decode" } else { "prefill" };
+        let (dense, [k, v, mask]) = flash_graph(decode);
         dense
             .validate()
             .unwrap_or_else(|e| panic!("{name}: dense operands must validate: {e}"));
@@ -632,7 +616,7 @@ fn validate_rejects_flash_ops_with_inconsistent_kv_or_mask() {
             match bad.validate() {
                 Err(GraphValidationError::EquationInference {
                     source:
-                        poot_graph_ir::error::ShapeError::FlashAttentionOperand {
+                        poot_graph_ir::error::ShapeError::AttentionOperand {
                             operand: got,
                             expected: want,
                             actual: seen,
@@ -796,6 +780,38 @@ fn cse_is_idempotent() {
     assert_eq!(c1.eqns.len(), c2.eqns.len());
 }
 
+#[test]
+fn cse_merges_computed_constants_of_one_payload_and_drops_the_duplicate_binder() {
+    // A tracer that declares the same computed table per use (a RoPE table per layer) still gathers it
+    // once: two declarations of one payload are one value, and only the first stays a graph input.
+    // A different payload stays a separate constant.
+    let b = Builder::new();
+    let pos = b.constant("pos", TensorType::new(vec![1, 1], poot_tensor::DType::I32));
+    let table = |len| {
+        b.computed(poot_graph_ir::ComputedConst::Iota {
+            len,
+            dtype: poot_tensor::DType::F32,
+        })
+    };
+    let (first, second, other) = (table(8), table(8), table(9));
+    let rows = |t| b.gather(t, 0, pos);
+    let out = b.binary(BinOp::Add, rows(first), rows(second));
+    let out = b.binary(BinOp::Add, out, rows(other));
+    let g = b.finish(out);
+    let c = cse(&g);
+    c.validate().expect("cse graph should validate");
+    let gathers = |g: &Graph| {
+        g.eqns
+            .iter()
+            .filter(|e| matches!(e.op, OpKind::Gather { .. }))
+            .count()
+    };
+    assert_eq!(gathers(&g), 3);
+    assert_eq!(gathers(&c), 2, "the two gathers of one payload merge");
+    assert_eq!(c.consts.len(), g.consts.len() - 1);
+    assert_eq!(c.inputs.len(), g.inputs.len() - 1);
+}
+
 fn f(b: &Builder, shape: &[usize]) -> poot_graph_ir::builder::Traced {
     b.constant("x", TensorType::f32(shape.to_vec()))
 }
@@ -905,6 +921,93 @@ fn fuse_i32_closed_dag_absorbs_non_escaping_multi_use() {
         }
         other => panic!("expected Fused, got {}", other.name()),
     }
+}
+
+/// POOT-1033: a float `Select` fuses into a pointwise float region; its I32 condition (made by an I32
+/// equation, which a float region cannot hold) is a region input leaf, and the select is a step.
+#[test]
+fn fuse_float_select_is_a_step_of_a_float_region_with_the_condition_as_a_leaf() {
+    let b = Builder::new();
+    let cond = b.constant("cond", TensorType::new(vec![4], poot_tensor::DType::I32));
+    let if_true = b.constant("t", TensorType::f32(vec![4]));
+    let if_false = b.constant("f", TensorType::f32(vec![4]));
+    let selected = b.select(cond, if_true, if_false);
+    let out = b.unary(UnOp::Neg, selected);
+    let g = b.finish(out);
+    let fg = fuse(&g);
+    fg.validate().expect("the fused graph stays valid");
+    assert_eq!(fg.eqns.len(), 1);
+    let OpKind::Fused(region) = &fg.eqns[0].op else {
+        panic!("expected Fused, got {}", fg.eqns[0].op.name());
+    };
+    assert!(
+        region
+            .steps
+            .iter()
+            .any(|step| matches!(step.op, FusedOp::Select))
+    );
+    let leaf_dtypes: Vec<_> = fg.eqns[0]
+        .inputs
+        .iter()
+        .map(|input| match input {
+            poot_graph_ir::Operand::Value(id) => fg.aval(*id).dtype,
+            poot_graph_ir::Operand::Lit(_) => unreachable!("a region input is a value"),
+        })
+        .collect();
+    assert_eq!(
+        leaf_dtypes,
+        [
+            poot_tensor::DType::I32,
+            poot_tensor::DType::F32,
+            poot_tensor::DType::F32
+        ]
+    );
+}
+
+/// A `Select` between two reductions of a softmax-shaped chain ends the row region instead of entering it: a
+/// row kernel reads float lanes only, so the I32 condition has no lane there. No `FusedRow` holds a `Select`.
+/// Mutation: drop the `Select` exclusion in `is_row_candidate`; the select joins the row region and this
+/// row goes red.
+#[test]
+fn fuse_keeps_a_float_select_out_of_row_regions() {
+    let b = Builder::new();
+    let x = b.constant("x", TensorType::f32(vec![2, 4]));
+    let cond = b.constant("cond", TensorType::new(vec![2, 4], poot_tensor::DType::I32));
+    let floor = b.constant("floor", TensorType::f32(vec![2, 4]));
+    let max = b.reduce(RedOp::Max, x, 1, true);
+    let shifted = b.binary(BinOp::Sub, x, max);
+    let masked = b.select(cond, shifted, floor);
+    let exp = b.unary(UnOp::Exp, masked);
+    let sum = b.reduce(RedOp::Sum, exp, 1, true);
+    let out = b.binary(BinOp::Div, exp, sum);
+    let g = b.finish(out);
+    let fg = fuse(&g);
+    fg.validate().expect("the fused graph stays valid");
+    let mut selects = 0;
+    for eqn in &fg.eqns {
+        match &eqn.op {
+            OpKind::FusedRow(region) => assert!(
+                region.steps.iter().all(|step| !matches!(
+                    step,
+                    RowStep::Pointwise {
+                        op: FusedOp::Select,
+                        ..
+                    }
+                )),
+                "a row region holds a Select"
+            ),
+            OpKind::Select => selects += 1,
+            OpKind::Fused(region) => {
+                selects += region
+                    .steps
+                    .iter()
+                    .filter(|step| matches!(step.op, FusedOp::Select))
+                    .count();
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(selects, 1, "the select survives outside the row regions");
 }
 
 #[test]
@@ -2137,7 +2240,9 @@ fn card533_optimize_passes_keep_witness_outputs() {
             flash_attention_capped(g, None)
         }),
         ("dce", dce),
-        ("fuse_bias_epilogues", fuse_bias_epilogues),
+        ("fuse_contraction_epilogues", |g| {
+            fuse_contraction_epilogues(g, |_, _| true)
+        }),
         ("fuse", fuse),
     ];
     for (name, pass) in passes {
@@ -2248,7 +2353,7 @@ use super::attention_match::{
     AttentionDecline, RopeDecline, canonicalize, match_attention, match_rope_core, producer_map,
 };
 
-fn output_eqn(g: &Graph) -> &Eqn {
+fn output_eqn<V: ValidationChannel>(g: &Graph<V>) -> &Eqn {
     g.eqns
         .iter()
         .find(|eqn| eqn.out == g.output)
@@ -2358,19 +2463,20 @@ fn card536a_attention_near_misses_decline_with_a_reason() {
         AttentionDecline::SoftcapShape,
     ));
 
-    // Mask: the value width differs from the QK width (MLA); the fused op indexes one width.
-    let mla = {
+    // Type gate: a shared single-head key the decomposition merely broadcasts (MQA written by broadcasting
+    // instead of `repeat_kv`); the fused op indexes one key head per group, so its typing rule refuses.
+    let broadcast_key = {
         let b = Builder::new();
         let q = b.constant("q", TensorType::f32(vec![1, 2, 1, 3]));
-        let k = b.constant("k", TensorType::f32(vec![1, 2, 5, 3]));
-        let v = b.constant("v", TensorType::f32(vec![1, 2, 5, 2]));
+        let k = b.constant("k", TensorType::f32(vec![1, 1, 5, 3]));
+        let v = b.constant("v", TensorType::f32(vec![1, 1, 5, 2]));
         let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, 5]));
         let out = attention_masked(&b, q, k, v, 1, 1.0, mask);
         b.finish(out)
     };
     cases.push((
-        "V width differs from QK",
-        mla,
+        "a size-1 key head broadcast by the matmul",
+        broadcast_key,
         AttentionDecline::TypeMismatch,
     ));
 
@@ -2447,16 +2553,16 @@ fn card536a_rope_near_misses_decline_with_a_reason() {
 }
 
 /// SC-003: each surviving legality guard turns a test red when mutated. This pins the
-/// reasons the four R486 guards produce, so dropping one changes its fixture's reason:
+/// reasons the three surviving R486 guards produce, so dropping one changes its fixture's reason:
 ///
 /// - the softcap reciprocal-literal check (`SoftcapRecip`),
 /// - the K/V GQA repeat cross-check (`GqaRepeatMismatch`),
-/// - the decode-softcap refusal (`DecodeSoftcap`),
 /// - the row-softmax reduce-axis check (`Denom`, the surviving form of the deleted softmax matcher's
 ///   `softmax.rs:27` guard).
 #[test]
 fn card536a_guards_have_killing_reasons() {
-    // Decode softcap refusal.
+    // A softcapped decode matches: the generated kernel takes the softcap on every phase. Mutation: restore a
+    // decode-softcap decline in `match_attention`; this match fails with that decline.
     let decode_softcap = {
         let (hq, cap, d) = (4usize, 6usize, 16usize);
         let b = Builder::new();
@@ -2467,15 +2573,17 @@ fn card536a_guards_have_killing_reasons() {
         let out = attention_masked_softcap(&b, q, k, v, 1, 0.25, mask, Some(30.0));
         b.finish(out)
     };
-    assert_eq!(
-        match_attention(
-            &decode_softcap,
-            &producer_map(&decode_softcap),
-            output_eqn(&decode_softcap)
-        )
-        .err(),
-        Some(AttentionDecline::DecodeSoftcap)
+    let matched = match_attention(
+        &decode_softcap,
+        &producer_map(&decode_softcap),
+        output_eqn(&decode_softcap),
     );
+    assert_eq!(
+        matched.as_ref().err(),
+        None,
+        "a softcapped decode must match"
+    );
+    assert_eq!(matched.unwrap().softcap, Some(30.0));
 
     // GQA repeat cross-check: k is repeated by 2, v is not. The chain stays a valid decomposition
     // (V keeps four heads) but the repeated K carries a different factor.
@@ -2502,12 +2610,11 @@ fn card536a_guards_have_killing_reasons() {
     );
 }
 
-/// Head-dim awareness decline reason: a decode match wider than `FLASH_LDS_CAP` declines
-/// with `HeadDimExceedsCap` (the oracle-unchanged half of this fixture lives in
-/// `transform_soundness.rs`'s `card536a_flash_head_dim_is_aware`). Mutation: remove the head-dim
-/// gate; this assertion fails (the match succeeds instead of declining).
+/// The matcher puts no head-dim limit on a match: the planner's device caps decide whether a kernel fits,
+/// so a decode and a prefill at head dim 512 both fuse. Mutation: restore a head-dim decline in
+/// `match_attention`; this assertion fails with that decline.
 #[test]
-fn card536a_flash_head_dim_is_aware_decline_reason() {
+fn a_wide_head_dim_still_matches() {
     let build = |m: usize, d: usize| {
         let b = Builder::new();
         let q = b.constant("q", TensorType::f32(vec![1, 2, m, d]));
@@ -2517,12 +2624,269 @@ fn card536a_flash_head_dim_is_aware_decline_reason() {
         let out = attention_masked(&b, q, k, v, 1, 0.25, mask);
         b.finish(out)
     };
-    let wide = build(1, 512);
+    for m in [1, 3] {
+        let wide = build(m, 512);
+        let matched = match_attention(&wide, &producer_map(&wide), output_eqn(&wide));
+        assert!(
+            matched.is_ok(),
+            "M={m} D=512 must match: {:?}",
+            matched.err()
+        );
+    }
+}
+
+/// MLA: a split key (`concat(k_nope, repeat_kv(k_pe))`, the form `deepseek2` traces) with a value narrower
+/// than the key matches as a `Split` attention with `dk != dv`, over the per-head part and the shared part.
+/// Mutation: drop the split-key recognition in `peel_key`; the key stays one `Concat` and the match fails
+/// the typing gate (`TypeMismatch`).
+#[test]
+fn a_split_key_with_a_narrower_value_matches_as_a_split_attention() {
+    let (hq, cap, nope, rope, dv) = (2usize, 5usize, 6usize, 4usize, 3usize);
+    let b = Builder::new();
+    let q = b.constant("q", TensorType::f32(vec![1, hq, 1, nope + rope]));
+    let k_nope = b.constant("k_nope", TensorType::f32(vec![1, hq, cap, nope]));
+    let k_pe = b.constant("k_pe", TensorType::f32(vec![1, 1, cap, rope]));
+    let v = b.constant("v", TensorType::f32(vec![1, hq, cap, dv]));
+    let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
+    let k = b.concat(3, &[k_nope, poot_graph_ir::ops::repeat_kv(&b, k_pe, hq)]);
+    let out = attention_masked(&b, q, k, v, 1, 0.25, mask);
+    let graph = b.finish(out);
+    let matched = match_attention(&graph, &producer_map(&graph), output_eqn(&graph))
+        .unwrap_or_else(|decline| panic!("the MLA chain must match, declined {decline:?}"));
+    assert_eq!(matched.k, k_nope.id);
+    assert_eq!(matched.k_shared, Some(k_pe.id));
+    assert_eq!(matched.key, KeyLayout::Split { shared_dim: rope });
+    assert_eq!(matched.len, None);
+    let OpKind::Attention(attrs) = matched.op() else {
+        panic!("the match collapses to an attention op")
+    };
     assert_eq!(
-        match_attention(&wide, &producer_map(&wide), output_eqn(&wide)).err(),
-        Some(AttentionDecline::HeadDimExceedsCap),
-        "D=512 decode must decline"
+        (attrs.key, attrs.bound),
+        (KeyLayout::Split { shared_dim: rope }, KvBound::Capacity)
     );
+}
+
+/// A live-capacity decode over `cap` keys, built by the one composite ([`ops::attention_live`]): batch 2, two
+/// key heads shared by four query heads, an additive mask, an optional softcap, a split key when `split`,
+/// and the raw I32 `len`. The length witness is declared as a validation output when `validated`.
+fn live_attention_graph(
+    split: bool,
+    validated: bool,
+) -> poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs> {
+    let (batch, hq, hkv, cap, d, dv) = (2usize, 4usize, 2usize, 6usize, 8usize, 5usize);
+    let b = Builder::new();
+    let q = b.constant("q", TensorType::f32(vec![batch, hq, 1, d]));
+    let v = b.constant("v", TensorType::f32(vec![batch, hkv, cap, dv]));
+    let mask = b.constant("mask", TensorType::f32(vec![batch, 1, 1, cap]));
+    let len = b.constant("len", TensorType::new(vec![batch], poot_tensor::DType::I32));
+    let keys = if split {
+        poot_graph_ir::ops::AttentionKeys::Split {
+            head: b.constant("k_head", TensorType::f32(vec![batch, hkv, cap, d - 3])),
+            shared: b.constant("k_shared", TensorType::f32(vec![batch, 1, cap, 3])),
+        }
+    } else {
+        poot_graph_ir::ops::AttentionKeys::Single(
+            b.constant("k", TensorType::f32(vec![batch, hkv, cap, d])),
+        )
+    };
+    let live =
+        poot_graph_ir::ops::attention_live(&b, q, keys, v, hq / hkv, 0.25, mask, Some(30.0), len)
+            .expect("the live composite builds");
+    let validations = if validated {
+        vec![poot_graph_ir::ValidationOutput {
+            id: poot_graph_ir::ValidationId(1),
+            name: "attention.len".to_owned(),
+            value: live.witness.id,
+        }]
+    } else {
+        Vec::new()
+    };
+    let graph = b.finish(live.out).with_validations(validations);
+    graph
+        .validate()
+        .expect("the live composite is a valid graph");
+    graph
+}
+
+/// The float selects of a live composite in construction order: the key source(s), the value, the scores.
+fn float_selects(graph: &poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs>) -> Vec<usize> {
+    graph
+        .eqns
+        .iter()
+        .enumerate()
+        .filter(|(_, eqn)| {
+            matches!(eqn.op, OpKind::Select) && graph.aval(eqn.out).dtype == poot_tensor::DType::F32
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Replace the select at `index` with a reshape of its data operand: the same value, no guard.
+fn remove_guard(graph: &mut poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs>, index: usize) {
+    let eqn = &mut graph.eqns[index];
+    let data = eqn.inputs[1];
+    eqn.op = OpKind::Reshape {
+        shape: graph.values[eqn.out].aval.shape.clone(),
+    };
+    eqn.inputs = vec![data];
+}
+
+/// The guarded live-capacity composite matches as a `Live` attention over the proved length, for a dense and a
+/// split key. Mutation: emit the live bound from the score select alone (accept an unguarded source in
+/// `peel_live_rows`); the near-miss rows below stop declining.
+#[test]
+fn the_guarded_live_composite_matches_as_a_live_attention() {
+    for split in [false, true] {
+        let graph = live_attention_graph(split, true);
+        let matched = match_attention(&graph, &producer_map(&graph), output_eqn(&graph))
+            .unwrap_or_else(|decline| panic!("split={split}: declined {decline:?}"));
+        let len = matched.len.expect("a live match carries its length");
+        assert_eq!(matched.k_shared.is_some(), split);
+        let OpKind::Attention(attrs) = matched.op() else {
+            panic!("the match collapses to an attention op")
+        };
+        assert_eq!(attrs.bound, KvBound::Live);
+        assert_eq!(matched.operands().last(), Some(&len));
+        assert_eq!(graph.aval(len).dtype, poot_tensor::DType::I32);
+        assert_eq!(attrs.softcap, Some(30.0));
+    }
+}
+
+/// Everything short of the full guard stays the generic chain, with a typed reason: a source without its
+/// select (K, V), a condition one key off, a condition over another length, a length no declared witness
+/// bounds by the capacity, and a length with no witness at all. Mutation: accept the named shape in the
+/// matcher; the row's near miss matches instead.
+#[test]
+fn live_near_misses_decline_with_a_reason() {
+    use poot_graph_ir::{BinOp as B, Scalar};
+    let mut cases: Vec<(&str, poot_graph_ir::Graph<_>, AttentionDecline)> = Vec::new();
+
+    let mut no_key_guard = live_attention_graph(false, true);
+    let target = float_selects(&no_key_guard)[0];
+    remove_guard(&mut no_key_guard, target);
+    cases.push((
+        "K without its guard",
+        no_key_guard,
+        AttentionDecline::LiveKeyGuard,
+    ));
+
+    let mut no_value_guard = live_attention_graph(false, true);
+    let target = float_selects(&no_value_guard)[1];
+    remove_guard(&mut no_value_guard, target);
+    cases.push((
+        "V without its guard",
+        no_value_guard,
+        AttentionDecline::LiveKeyGuard,
+    ));
+
+    let mut no_shared_guard = live_attention_graph(true, true);
+    let target = float_selects(&no_shared_guard)[1];
+    remove_guard(&mut no_shared_guard, target);
+    cases.push((
+        "the shared part of a split key without its guard",
+        no_shared_guard,
+        AttentionDecline::LiveKeyGuard,
+    ));
+
+    // One key off: the key positions start at 2 instead of 1.
+    let mut off_by_one = live_attention_graph(false, true);
+    let iotas: Vec<usize> = off_by_one
+        .eqns
+        .iter()
+        .filter(|eqn| {
+            matches!(
+                eqn.op,
+                OpKind::Iota {
+                    dtype: poot_tensor::DType::I32,
+                    ..
+                }
+            )
+        })
+        .map(|eqn| eqn.out)
+        .collect();
+    let mut changed = 0;
+    for eqn in &mut off_by_one.eqns {
+        if matches!(eqn.op, OpKind::Binary(B::Add))
+            && matches!(eqn.inputs.first(), Some(Operand::Value(id)) if iotas.contains(id))
+            && matches!(eqn.inputs.get(1), Some(Operand::Lit(Scalar::I32(1))))
+        {
+            eqn.inputs[1] = Operand::Lit(Scalar::I32(2));
+            changed += 1;
+        }
+    }
+    assert_eq!(changed, 1, "exactly the key-position offset is rewritten");
+    cases.push((
+        "conditions one key off",
+        off_by_one,
+        AttentionDecline::LiveScoreGuard,
+    ));
+
+    // The key rows select by another length than the scores do.
+    let mut other_len = live_attention_graph(false, true);
+    let rows = other_len
+        .eqns
+        .iter()
+        .position(|eqn| {
+            matches!(eqn.op, OpKind::Binary(B::Ge)) && other_len.aval(eqn.out).shape == [2, 1, 6, 1]
+        })
+        .expect("the key-row condition");
+    let other = other_len.values.len();
+    other_len.values.push(poot_graph_ir::graph::ValueMeta::new(
+        TensorType::new(vec![2], poot_tensor::DType::I32),
+        Storage::Const,
+        Some("other_len".into()),
+    ));
+    other_len.consts.push(other);
+    other_len.inputs.push(other);
+    let view = other_len.values.len();
+    other_len.values.push(poot_graph_ir::graph::ValueMeta::new(
+        TensorType::new(vec![2, 1, 1, 1], poot_tensor::DType::I32),
+        Storage::Device,
+        None,
+    ));
+    other_len.eqns.insert(
+        rows,
+        Eqn {
+            op: OpKind::Reshape {
+                shape: vec![2, 1, 1, 1],
+            },
+            inputs: vec![Operand::Value(other)],
+            out: view,
+            layer: None,
+        },
+    );
+    other_len.eqns[rows + 1].inputs[0] = Operand::Value(view);
+    cases.push((
+        "K/V select by another length",
+        other_len,
+        AttentionDecline::LiveKeyGuard,
+    ));
+
+    // A guard bounding the length by one more than the capacity, and no witness at all.
+    let mut wrong_bound = live_attention_graph(false, true);
+    for eqn in &mut wrong_bound.eqns {
+        if matches!(eqn.op, OpKind::Binary(B::GeU)) {
+            eqn.inputs[1] = Operand::Lit(Scalar::I32(7));
+        }
+    }
+    cases.push((
+        "length bounded by capacity + 1",
+        wrong_bound,
+        AttentionDecline::LiveLengthUnproved,
+    ));
+    cases.push((
+        "length with no declared witness",
+        live_attention_graph(false, false),
+        AttentionDecline::LiveLengthUnproved,
+    ));
+
+    for (name, graph, expected) in cases {
+        graph
+            .validate()
+            .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+        let reason = match_attention(&graph, &producer_map(&graph), output_eqn(&graph));
+        assert_eq!(reason.err(), Some(expected), "{name}: wrong decline reason");
+    }
 }
 
 /// Canonicalization retains unproved arithmetic and reports why; only F32 multiply-by-one is
@@ -2607,14 +2971,15 @@ fn card536a_scale_as_a_runtime_value_declines() {
     );
 }
 
-/// Card 557 SC-003 (R-557-1): a traced bias linear is primitives only, `matmul` then a broadcast `add`
-/// with no `MatMulBias`, and the one contraction fuse rule forms exactly one `MatMulBias(x, w, bias)`
-/// from it, with the operands in the order every planner arm and the oracle read (`inputs[2]` is the
-/// `[N]` bias). The fused graph evaluates bit for bit like the traced one. Mutations: emit `MatMulBias`
-/// from `ops::linear` (the traced assertion goes red); emit the bias as the rule's first operand (the
+/// Card 557 SC-003 (R-557-1), restated for the contraction epilogue: a traced bias linear is primitives
+/// only, `matmul` then a broadcast `add` with no `ContractionEpilogue`, and the one contraction fuse rule
+/// forms exactly one `ContractionEpilogue { head: MatMul, region: head + leaf }` over `(x, w, bias)`, with
+/// the operands in the order every planner arm and the oracle read (the head's two operands, then the
+/// region's extra inputs). The fused graph evaluates bit for bit like the traced one. Mutations: emit the
+/// epilogue from `ops::linear` (the traced assertion goes red); put the bias before the head operands (the
 /// operand assertion goes red).
 #[test]
-fn a_traced_bias_linear_is_primitive_and_fuses_into_one_matmul_bias() {
+fn a_traced_bias_linear_is_primitive_and_fuses_into_one_contraction_epilogue() {
     use poot_eval::{EvalBudget, EvalOptions, Value, eval};
     use poot_graph_ir::OpClass;
     use poot_tensor::HostTensor;
@@ -2635,20 +3000,25 @@ fn a_traced_bias_linear_is_primitive_and_fuses_into_one_matmul_bias() {
         traced.eqns
     );
 
-    let fused = fuse_bias_epilogues(&traced);
+    let fused = fuse_contraction_epilogues(&traced, |_, _| true);
     let epilogues: Vec<&Eqn> = fused
         .eqns
         .iter()
-        .filter(|eqn| matches!(eqn.op, OpKind::MatMulBias))
+        .filter(|eqn| matches!(eqn.op, OpKind::ContractionEpilogue { .. }))
         .collect();
-    assert_eq!(epilogues.len(), 1, "one MatMulBias: {:?}", fused.eqns);
+    assert_eq!(
+        epilogues.len(),
+        1,
+        "one ContractionEpilogue: {:?}",
+        fused.eqns
+    );
     assert!(
         matches!(
             epilogues[0].inputs.as_slice(),
             [Operand::Value(a), Operand::Value(b), Operand::Value(c)]
                 if [*a, *b, *c] == [x.id, w.id, bias.id]
         ),
-        "MatMulBias reads (activation, weight, bias): {:?}",
+        "ContractionEpilogue reads (activation, weight, bias): {:?}",
         epilogues[0].inputs
     );
     assert_eq!(
@@ -2689,4 +3059,180 @@ fn a_traced_bias_linear_is_primitive_and_fuses_into_one_matmul_bias() {
         run(&traced),
         "the epilogue is the same arithmetic"
     );
+}
+
+/// The `ContractionEpilogue` equations of `g`.
+fn epilogues_of(g: &Graph) -> Vec<&Eqn> {
+    g.eqns
+        .iter()
+        .filter(|eqn| matches!(eqn.op, OpKind::ContractionEpilogue { .. }))
+        .collect()
+}
+
+/// The oracle's output bits of `g` over `[m, k]`, `[k, n]` and `[n]` data and any further `[m, n]` inputs
+/// the fixture declares, filled deterministically.
+fn eval_bits(g: &Graph) -> Vec<u32> {
+    use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+    use poot_tensor::HostTensor;
+
+    let inputs: HashMap<ValueId, Value> = g
+        .inputs
+        .iter()
+        .map(|&id| {
+            let shape = g.aval(id).shape.clone();
+            let numel: usize = shape.iter().product();
+            let data = (0..numel)
+                .map(|i| ((i as f32 + id as f32) * 0.37).sin())
+                .collect();
+            (id, Value::from(HostTensor::f32(shape, data)))
+        })
+        .collect();
+    eval(g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        .expect("the graph evaluates")
+        .output
+        .into_host()
+        .expect("a dense output")
+        .as_f32()
+        .unwrap()
+        .iter()
+        .map(|value| value.to_bits())
+        .collect()
+}
+
+/// Contraction epilogue near misses (the fuse rule's legality): a head with a second consumer, a reducing
+/// consumer, a step that changes the shape, a pinned head output and a step over another dtype each stay
+/// exactly as traced, and every fused fixture evaluates bit for bit like its unfused graph. Mutation: drop the
+/// single-use check in `fuse_contraction_epilogues` (`single_use`): the two-consumer graph fuses and its second
+/// consumer then reads the epilogue's result instead of the contraction's, so this row goes red.
+#[test]
+fn contraction_epilogue_near_misses_stay_unfused() {
+    let (m, k, n) = (3usize, 5usize, 4usize);
+    let linear = |b: &Builder| {
+        let x = b.constant("x", TensorType::f32(vec![m, k]));
+        let w = b.constant("w", TensorType::f32(vec![k, n]));
+        let bias = b.constant("bias", TensorType::f32(vec![n]));
+        (b.matmul(x, w), bias)
+    };
+
+    // The fixture that does fuse: head, bias, residual.
+    let b = Builder::new();
+    let (head, bias) = linear(&b);
+    let residual = b.constant("residual", TensorType::f32(vec![m, n]));
+    let out = b.binary(BinOp::Add, b.binary(BinOp::Add, head, bias), residual);
+    let fused_case = b.finish(out);
+    let fused = fuse_contraction_epilogues(&fused_case, |_, _| true);
+    assert_eq!(epilogues_of(&fused).len(), 1, "{:?}", fused.eqns);
+    assert_eq!(fused.eqns.len(), 1, "head and both adds are one equation");
+    assert_eq!(eval_bits(&fused), eval_bits(&fused_case), "fused fixture");
+
+    // A head read twice: the add and a second consumer.
+    let b = Builder::new();
+    let (head, bias) = linear(&b);
+    let out = b.binary(BinOp::Mul, b.binary(BinOp::Add, head, bias), head);
+    let two_consumers = b.finish(out);
+    // A reducing consumer.
+    let b = Builder::new();
+    let (head, _) = linear(&b);
+    let out = b.reduce(RedOp::Sum, head, 1, true);
+    let reducing = b.finish(out);
+    // A step whose output is larger than the head: a leaf of another shape broadcast against it.
+    let b = Builder::new();
+    let (head, _) = linear(&b);
+    let wide = b.constant("wide", TensorType::f32(vec![2, m, n]));
+    let out = b.binary(BinOp::Add, head, wide);
+    let shape_changing = b.finish(out);
+    // The head is the graph output, so a step beyond it cannot absorb it.
+    let b = Builder::new();
+    let (head, _) = linear(&b);
+    let pinned = b.finish(head);
+    for (name, graph) in [
+        ("a head with two consumers", &two_consumers),
+        ("a reducing consumer", &reducing),
+        ("a shape-changing step", &shape_changing),
+        ("a head that is the graph output", &pinned),
+    ] {
+        let after = fuse_contraction_epilogues(graph, |_, _| true);
+        assert!(
+            epilogues_of(&after).is_empty(),
+            "{name} must stay unfused: {:?}",
+            after.eqns
+        );
+        assert_eq!(after.eqns.len(), graph.eqns.len(), "{name}: untouched");
+        assert_eq!(eval_bits(&after), eval_bits(graph), "{name}: same bits");
+    }
+}
+
+/// An explicit `Broadcast` of a bias feeding the chain is read through: the epilogue's leaf is the `[N]` bias
+/// itself, not an expanded `[M, N]` copy, and the broadcast equation is gone. A broadcast another equation also
+/// reads stays (its expanded value is still needed). Mutation: stop folding the broadcast; the fused equation
+/// then holds the broadcast's output as its leaf and the broadcast equation remains, so the leaf and equation
+/// count assertions go red.
+#[test]
+fn a_single_use_bias_broadcast_folds_into_the_epilogue_leaf() {
+    let (m, k, n) = (3usize, 5usize, 4usize);
+    let b = Builder::new();
+    let x = b.constant("x", TensorType::f32(vec![m, k]));
+    let w = b.constant("w", TensorType::f32(vec![k, n]));
+    let bias = b.constant("bias", TensorType::f32(vec![n]));
+    let expanded = b.broadcast(bias, vec![m, n]);
+    let out = b.binary(BinOp::Add, b.matmul(x, w), expanded);
+    let traced = b.finish(out);
+    let fused = fuse_contraction_epilogues(&traced, |_, _| true);
+    let epilogues = epilogues_of(&fused);
+    assert_eq!(epilogues.len(), 1, "{:?}", fused.eqns);
+    assert_eq!(
+        fused.eqns.len(),
+        1,
+        "the broadcast folds away: {:?}",
+        fused.eqns
+    );
+    assert!(
+        matches!(
+            epilogues[0].inputs.as_slice(),
+            [Operand::Value(a), Operand::Value(bw), Operand::Value(leaf)]
+                if [*a, *bw, *leaf] == [x.id, w.id, bias.id]
+        ),
+        "the leaf is the [N] bias: {:?}",
+        epilogues[0].inputs
+    );
+    assert_eq!(eval_bits(&fused), eval_bits(&traced));
+
+    // The same broadcast read by a second equation is not folded away.
+    let b = Builder::new();
+    let x = b.constant("x", TensorType::f32(vec![m, k]));
+    let w = b.constant("w", TensorType::f32(vec![k, n]));
+    let bias = b.constant("bias", TensorType::f32(vec![n]));
+    let expanded = b.broadcast(bias, vec![m, n]);
+    let out = b.binary(
+        BinOp::Mul,
+        b.binary(BinOp::Add, b.matmul(x, w), expanded),
+        expanded,
+    );
+    let shared = b.finish(out);
+    let after = fuse_contraction_epilogues(&shared, |_, _| true);
+    assert!(
+        after
+            .eqns
+            .iter()
+            .any(|eqn| matches!(eqn.op, OpKind::Broadcast { .. })),
+        "a shared broadcast stays: {:?}",
+        after.eqns
+    );
+    assert_eq!(eval_bits(&after), eval_bits(&shared));
+}
+
+/// POOT-1033: a float `Select` is a select, not float arithmetic: it moves a branch's bits, so a graph of
+/// nothing else is bit-exact on a device (tier 1). Mutation: put `Select` back with `Binary`/`Unary` in
+/// `implied_op_numerics`; the graph reads `Unfused` and this row goes red.
+#[test]
+fn float_select_is_exact_not_float_arithmetic() {
+    let b = Builder::new();
+    let cond = b.constant("cond", TensorType::new(vec![4], poot_tensor::DType::I32));
+    let if_true = b.constant("t", TensorType::f32(vec![4]));
+    let if_false = b.constant("f", TensorType::f32(vec![4]));
+    let selected = b.select(cond, if_true, if_false);
+    let graph = b.finish(selected);
+    assert!(matches!(graph.eqns.as_slice(), [eqn] if matches!(eqn.op, OpKind::Select)));
+    assert_eq!(implied_numerics(&graph), NumericsProperty::Exact);
+    assert_eq!(implied_numerics(&graph).tier2_class(), Tier2Class::BitExact);
 }

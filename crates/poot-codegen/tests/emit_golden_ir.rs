@@ -1,6 +1,6 @@
 //! Golden-IR tests for `poot_codegen::emit` (moved from `src/emit.rs`'s own `#[cfg(test)]` module, card
 //! 671): that module called `poot_test_util::kernel_fixtures::emit_llvm_ir`, and `poot-test-util` depends on
-//! `poot-codegen` (for the real, still-pub `emit_llvm_ir_marked` the golden-IR helper wraps), so building it
+//! `poot-codegen` (for the real, still-pub `emit_llvm_ir` the golden-IR helper re-exports), so building it
 //! as part of poot-codegen's own lib-test unit compiled two different instances of `poot-codegen` into one
 //! binary (`Target`/`EmitError` each becoming two distinct, mismatched types). An integration test under
 //! `tests/` always treats its own crate as an ordinary external dependency, which has no such cycle.
@@ -9,8 +9,7 @@ use poot_codegen::{CompileError, EmitError, Target, artifact_path, compile};
 use poot_kernel_ir::fixtures;
 use poot_target::AmdArch;
 use poot_test_util::kernel_fixtures::{
-    e4m3fn_decode_kernel, e4m3fn_encode_kernel, emit_llvm_ir, gemv_loop_kernel, vadd_loop_kernel,
-    wmma_tile,
+    e4m3fn_encode_kernel, emit_llvm_ir, gemv_loop_kernel, vadd_loop_kernel, wmma_tile,
 };
 
 #[test]
@@ -114,7 +113,7 @@ fn exact_i32_pointwise_emits_integer_arithmetic_and_unsigned_comparison() {
 }
 
 #[test]
-fn e4m3fn_software_conversion_is_target_neutral_ir() {
+fn e4m3fn_software_encode_is_target_neutral_ir() {
     for target in [
         Target::SpirvVulkan,
         Target::Nvptx,
@@ -124,11 +123,6 @@ fn e4m3fn_software_conversion_is_target_neutral_ir() {
         assert!(encode.contains("fcmp uno float"), "{target:?}");
         assert!(encode.contains("select i1"), "{target:?}");
         assert!(!encode.to_lowercase().contains("fp8"), "{target:?}");
-
-        let decode = emit_llvm_ir(&e4m3fn_decode_kernel(), target).unwrap();
-        assert!(decode.contains("and i32"), "{target:?}");
-        assert!(decode.contains("bitcast i32"), "{target:?}");
-        assert!(!decode.to_lowercase().contains("fp8"), "{target:?}");
     }
 }
 
@@ -710,8 +704,8 @@ fn wmma_dtype_target_mismatch_is_typed_error() {
 #[test]
 fn wmma_dtype_tile_mismatch_is_typed_error() {
     use poot_kernel_ir::{
-        BasicBlock, Body, Constant, Local, LocalDecl, Operand, Place, ProjectionElem, Rvalue,
-        Statement, Terminator, Ty, WmmaDtype, WmmaShape,
+        BasicBlock, Body, Constant, FragmentTy, Local, LocalDecl, Operand, Place, ProjectionElem,
+        Rvalue, Statement, Terminator, Ty, WmmaDtype, WmmaMat, WmmaShape,
     };
     let tile_param = Ty::Ref {
         mutable: false,
@@ -731,7 +725,11 @@ fn wmma_dtype_tile_mismatch_is_typed_error() {
             mutable: false,
         },
         LocalDecl {
-            ty: Ty::F16,
+            ty: Ty::Fragment(FragmentTy::matrix(
+                WmmaMat::A,
+                WmmaDtype::F16,
+                WmmaShape::M16N16K16,
+            )),
             mutable: false,
         },
     ];

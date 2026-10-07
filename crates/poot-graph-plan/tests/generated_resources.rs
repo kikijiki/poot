@@ -11,8 +11,8 @@
 use poot_graph_ir::{Builder, TensorType};
 use poot_graph_plan::device_validation::ResourceRefusal;
 use poot_graph_plan::{
-    Capability, CompileError, CompileLimits, CompileOptions, FusionPolicy, KernelChoice, Plan,
-    PlanError, Program, Submission, Target, compile,
+    Capability, CompileError, CompileLimits, CompileOptions, KernelChoice, Plan, PlanError,
+    Program, Submission, Target, compile,
 };
 use poot_kernel_ir::{Body, Ty, WmmaDtype, WmmaShape};
 use poot_kernelgen::{ContractionSpec, FragmentUse, KernelRequest};
@@ -23,7 +23,6 @@ use poot_test_util::device_caps::default_caps_for;
 fn options() -> CompileOptions {
     CompileOptions {
         execution: Submission::Replay,
-        fusion: FusionPolicy::Full,
         limits: CompileLimits::STANDARD,
     }
 }
@@ -42,16 +41,11 @@ struct FakeLoader {
 impl FakeLoader {
     fn load(&mut self, program: &Program) {
         for (_, plan) in program.planned() {
-            match plan {
-                Plan::Compute { key, .. } | Plan::ComputeMeta { key, .. } => {
-                    self.loaded.push(key.clone());
-                }
-                Plan::ComputeChunks(chunks) => {
-                    self.loaded
-                        .extend(chunks.iter().map(|chunk| chunk.key.clone()));
-                }
-                Plan::Alias(_) | Plan::View { .. } | Plan::Collective { .. } => {}
-            }
+            self.loaded.extend(
+                plan.dispatches()
+                    .iter()
+                    .map(|dispatch| dispatch.key.clone()),
+            );
         }
     }
 }
@@ -88,12 +82,8 @@ fn resource_refusal(result: Result<Program, CompileError>, what: &str) -> Resour
 fn dispatched(program: &Program) -> Vec<(&Body, [u32; 3])> {
     program
         .planned()
-        .filter_map(|(_, plan)| match plan {
-            Plan::Compute { body, grid, .. } | Plan::ComputeMeta { body, grid, .. } => {
-                Some((body, *grid))
-            }
-            _ => None,
-        })
+        .filter_map(|(_, plan)| plan.single())
+        .map(|dispatch| (&dispatch.body, dispatch.launch.grid))
         .collect()
 }
 
@@ -102,7 +92,7 @@ fn the_plan(program: &Program) -> &Plan {
     let mut plans = program
         .planned()
         .map(|(_, plan)| plan)
-        .filter(|plan| matches!(plan, Plan::Compute { .. } | Plan::ComputeMeta { .. }));
+        .filter(|plan| plan.single().is_some());
     let plan = plans.next().expect("a dispatching plan");
     assert!(
         plans.next().is_none(),
@@ -159,7 +149,7 @@ fn imported_gemv_graph() -> poot_graph_ir::Graph {
 fn choice_of(program: &Program) -> &KernelChoice {
     let (eqn, _) = program
         .planned()
-        .find(|(_, plan)| matches!(plan, Plan::Compute { .. } | Plan::ComputeMeta { .. }))
+        .find(|(_, plan)| plan.single().is_some())
         .expect("a dispatched equation");
     program.kernel_choice(eqn)
 }
@@ -530,9 +520,11 @@ fn a_finalizer_workgroup_bump_is_reflected_in_the_plan_key() {
 
     let plain_program = compile(&add_graph(n), &plain, &options()).unwrap();
     let tight_program = compile(&add_graph(n), &tight, &options()).unwrap();
-    let key_and_wg = |program: &Program| match the_plan(program) {
-        Plan::Compute { body, key, .. } => (key.clone(), body.workgroup_size),
-        other => panic!("expected Plan::Compute, got {other:?}"),
+    let key_and_wg = |program: &Program| match the_plan(program).single() {
+        Some(dispatch) if dispatch.launch.meta.is_empty() => {
+            (dispatch.key.clone(), dispatch.body.workgroup_size)
+        }
+        _ => panic!("expected one plain dispatch, got {:?}", the_plan(program)),
     };
     let (plain_key, plain_wg) = key_and_wg(&plain_program);
     let (tight_key, tight_wg) = key_and_wg(&tight_program);
@@ -552,14 +544,6 @@ fn a_finalizer_workgroup_bump_is_reflected_in_the_plan_key() {
 
 /// `a [1, m, k] f32 @ w [n, k] bf16 ^T`: folded by `compile` into the dense BF16 contraction, whose
 /// `M > 1` arm plans the imported one-thread-per-output body.
-fn dense_bf16_graph(m: usize, k: usize, n: usize) -> poot_graph_ir::Graph {
-    let b = Builder::new();
-    let a = b.constant("a", TensorType::new(vec![1, m, k], DType::F32));
-    let w = b.constant("w", TensorType::new(vec![n, k], DType::BF16));
-    let out = b.matmul(a, b.transpose(w, vec![1, 0]));
-    b.finish(out)
-}
-
 fn imported_kernel(program: &Program) -> poot_graph_plan::ImportedKernel {
     match choice_of(program) {
         KernelChoice::Imported { kernel, .. } => *kernel,
@@ -569,67 +553,36 @@ fn imported_kernel(program: &Program) -> poot_graph_plan::ImportedKernel {
 
 /// Imported contractions loop over K per thread, so they declare serial work and a device's
 /// `max_dispatch_work` bounds them like a generated serial contraction: `output elements * K` steps. A
-/// budget equal to the work admits the imported kernel; one step less either refuses the plan (the
-/// coalesced GEMV, no alternative) or sends the equation down its primitive lowering, which no longer
-/// names the imported kernel (the dense BF16 contraction, whose fold `compile` only keeps while the folded
-/// plan is legal).
+/// budget equal to the work admits the imported kernel; one step less refuses the plan (the coalesced
+/// GEMV, no alternative).
 ///
 /// Mutation: in `ImportedKernel::needs`, move the contraction family to `ImportedNeeds::NONE`; the
-/// one-step-short compile still plans the imported kernel and the row fails ("the program compiled" or
-/// "still plans the imported kernel").
+/// one-step-short compile still plans the imported kernel and the row fails ("the program compiled").
 #[test]
 fn imported_contractions_are_bounded_by_the_dispatch_work_budget() {
-    let gemv = (
-        Backend::SpirvVulkan,
-        imported_gemv_graph(),
-        512u64 * 256,
-        true,
-    );
-    let dense = (
-        Backend::Nvptx,
-        dense_bf16_graph(2, 64, 32),
-        2 * 32 * 64,
-        false,
-    );
-    for (what, (backend, graph, work, refuses)) in
-        [("coalesced gemv", gemv), ("dense bf16 M>1", dense)]
-    {
-        let roomy = target(backend, default_caps_for(backend));
-        let (_, result) = compile_and_load(&graph, &roomy);
-        let program = result.unwrap_or_else(|error| panic!("{what}: {error}"));
-        let imported = imported_kernel(&program);
+    let (backend, graph, work) = (Backend::SpirvVulkan, imported_gemv_graph(), 512u64 * 256);
+    let what = "coalesced gemv";
+    let roomy = target(backend, default_caps_for(backend));
+    let (_, result) = compile_and_load(&graph, &roomy);
+    let program = result.unwrap_or_else(|error| panic!("{what}: {error}"));
+    let _ = imported_kernel(&program);
 
-        let mut exact = roomy;
-        exact.caps.max_dispatch_work = Queried::Known(work);
-        let (loader, result) = compile_and_load(&graph, &exact);
-        result.unwrap_or_else(|error| {
-            panic!("{what}: a budget equal to the work admits it: {error}")
-        });
-        assert_eq!(loader.loaded.len(), 1, "{what}");
+    let mut exact = roomy;
+    exact.caps.max_dispatch_work = Queried::Known(work);
+    let (loader, result) = compile_and_load(&graph, &exact);
+    result.unwrap_or_else(|error| panic!("{what}: a budget equal to the work admits it: {error}"));
+    assert_eq!(loader.loaded.len(), 1, "{what}");
 
-        let mut short = roomy;
-        short.caps.max_dispatch_work = Queried::Known(work - 1);
-        let (loader, result) = compile_and_load(&graph, &short);
-        if refuses {
-            assert_eq!(
-                resource_refusal(result, what),
-                ResourceRefusal::DispatchWork {
-                    work,
-                    budget: work - 1,
-                },
-                "{what}"
-            );
-            assert!(loader.loaded.is_empty(), "{what}");
-        } else {
-            let program = result.unwrap_or_else(|error| panic!("{what}: {error}"));
-            let still = program.planned().any(|(eqn, _)| {
-                matches!(program.kernel_choice(eqn),
-                    KernelChoice::Imported { kernel, .. } if *kernel == imported)
-            });
-            assert!(
-                !still,
-                "{what}: one step over the budget still plans the imported kernel"
-            );
-        }
-    }
+    let mut short = roomy;
+    short.caps.max_dispatch_work = Queried::Known(work - 1);
+    let (loader, result) = compile_and_load(&graph, &short);
+    assert_eq!(
+        resource_refusal(result, what),
+        ResourceRefusal::DispatchWork {
+            work,
+            budget: work - 1,
+        },
+        "{what}"
+    );
+    assert!(loader.loaded.is_empty(), "{what}");
 }

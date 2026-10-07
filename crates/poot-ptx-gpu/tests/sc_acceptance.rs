@@ -10,7 +10,6 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
 
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
 use poot_executor::{
@@ -23,8 +22,8 @@ use poot_graph_ir::op::{BinOp, RedOp, SampleRule};
 use poot_graph_ir::ops::sampling::sample_head;
 use poot_graph_ir::{Graph, Slot, SlotKey, Storage, TensorType, ValueId};
 use poot_graph_plan::{
-    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, FusionPolicy, Partition,
-    Submission, Target, TargetSet, compile_staged,
+    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, Submission, Target,
+    TargetSet, compile_staged,
 };
 use poot_models::model::{LogitRows, Phase};
 use poot_ptx_gpu::PtxDevice;
@@ -127,7 +126,6 @@ fn staged(
         },
         &CompileOptions {
             execution: submission,
-            fusion: FusionPolicy::Full,
             limits: poot_graph_plan::CompileLimits::STANDARD,
         },
     )
@@ -219,7 +217,7 @@ fn oracle_step(
                     .or_insert_with(|| HostTensor::zeros(meta.aval.shape.clone()))
                     .clone(),
             ),
-            Storage::Computed(c) => Value::from(HostTensor::f32(c.shape(), c.values_f32())),
+            Storage::Computed(c) => Value::from(c.tensor()),
             Storage::Slot(_) => {
                 let key = meta.slot_key().unwrap();
                 let v = values.iter().find(|v| &v.key == key).unwrap();
@@ -250,7 +248,9 @@ fn oracle_step(
 
 fn bytemuck_f32(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
@@ -429,163 +429,6 @@ fn sc002_parity_suite_has_real_per_op_bite_ptx() {
             tol,
         );
     }
-}
-
-// ── SC-006 ───────────────────────────────────────────────────────────────
-
-/// Forwards every `Device` call to a real `PtxDevice`, except `replay`, which sleeps 200ms on the host
-/// after the real replay returns. The real device-timed span is bracketed by CUDA events recorded
-/// inside the real `replay` call itself (`PtxContext::launch_timed`), so this host-side pause after it
-/// returns must NOT inflate the reported span - only a host-wall fabrication would be fooled by it.
-struct SlowReplayDevice(PtxDevice);
-
-impl Device for SlowReplayDevice {
-    type Buffer = <PtxDevice as Device>::Buffer;
-    type Kernel = <PtxDevice as Device>::Kernel;
-    type Recording = <PtxDevice as Device>::Recording;
-    type Error = <PtxDevice as Device>::Error;
-
-    fn target(&self) -> Target {
-        self.0.target()
-    }
-    fn memory(&self) -> Vec<(BufferRole, MemoryCounterSnapshot)> {
-        self.0.memory()
-    }
-    fn allocate(
-        &mut self,
-        role: BufferRole,
-        storage: poot_target::BufferStorage,
-        elems: usize,
-    ) -> Result<Self::Buffer, Self::Error> {
-        self.0.allocate(role, storage, elems)
-    }
-    fn load_kernel(
-        &mut self,
-        key: &str,
-        kernel: poot_runtime_common::CompiledKernel,
-    ) -> Result<Self::Kernel, Self::Error> {
-        self.0.load_kernel(key, kernel)
-    }
-    fn begin(&mut self, submission: Submission) -> Result<(), Self::Error> {
-        self.0.begin(submission)
-    }
-    fn dispatch(&mut self, d: Dispatch<'_, Self>) -> Result<(), Self::Error> {
-        self.0.dispatch(Dispatch {
-            kernel: d.kernel,
-            inputs: unsafe {
-                std::mem::transmute::<
-                    &[poot_executor::Arg<'_, Self>],
-                    &[poot_executor::Arg<'_, PtxDevice>],
-                >(d.inputs)
-            },
-            output: poot_executor::Arg {
-                buffer: d.output.buffer,
-                elems: d.output.elems,
-            },
-            threads: d.threads,
-            workgroup: d.workgroup,
-            work: d.work,
-        })
-    }
-    fn copy(&mut self, src: &Self::Buffer, dst: &Self::Buffer) -> Result<(), Self::Error> {
-        self.0.copy(src, dst)
-    }
-    fn finish(&mut self) -> Result<Option<Self::Recording>, Self::Error> {
-        self.0.finish()
-    }
-    fn replay(&mut self, recording: &Self::Recording) -> Result<(), Self::Error> {
-        let result = self.0.replay(recording);
-        std::thread::sleep(Duration::from_millis(200));
-        result
-    }
-    fn write(&mut self, dst: &Self::Buffer, bytes: &[u8]) -> Result<(), Self::Error> {
-        self.0.write(dst, bytes)
-    }
-    fn read(&mut self, src: &Self::Buffer, out: &mut [u8]) -> Result<(), Self::Error> {
-        self.0.read(src, out)
-    }
-    fn synchronize(&mut self) -> Result<(), Self::Error> {
-        self.0.synchronize()
-    }
-    fn device_time(&self) -> poot_executor::DeviceTime {
-        self.0.device_time()
-    }
-    fn abort(&mut self) -> Result<(), Self::Error> {
-        self.0.abort()
-    }
-}
-
-/// SC-006: `Device::device_time` reports `Measured` with a real, honest device span when the device
-/// was built via `PtxDevice::new_with_device_timing`, and `Unknown` for a plain `PtxDevice` - never a
-/// fabricated host-wall duration. A 200ms host-side sleep injected right after the real `replay()`
-/// call (via `SlowReplayDevice`, forwarding everything else to the real device) must not move the
-/// reported span: it is bracketed by CUDA events recorded inside the real replay, not by anything the
-/// caller does afterward.
-///
-/// MUTATION (recorded here, never left in the tree): in `poot-ptx-gpu/src/device.rs`'s
-/// `PtxDevice::device_time`, replace the body with `DeviceTime::Measured(MeasuredDeviceTime {
-/// sum_of_dispatch_durations: Some(self.last_step_wall), device_span: Some(self.last_step_wall),
-/// dispatches: Vec::new() })` fed by an `Instant` captured at `replay()` entry/exit (a host-wall
-/// duration, not a device one). Result: RED - the reported span is ~200ms (the injected sleep), not the
-/// real sub-millisecond device time. Reverted: GREEN.
-#[test]
-fn sc006_device_time_is_measured_or_unknown_never_host_wall_ptx() {
-    let Some(timed) =
-        device_skip::open_or_skip(DeviceBackend::Ptx, PtxDevice::new_with_device_timing())
-    else {
-        return;
-    };
-    let Some(plain) = try_ptx() else { return };
-    let target = Device::target(&timed);
-    let g = decode_graph();
-    let store = Arc::new(store_for(&[&g]));
-
-    let mut plain_engine = Engine::new(plain);
-    let exe_p = plain_engine
-        .load_weights(Arc::clone(&store), poot_executor::WeightSource::ConstNames)
-        .unwrap();
-    let decode_p = plain_engine
-        .add_entry(exe_p, &staged(&g, target, Submission::Replay))
-        .unwrap();
-    let values = slot_values(&g, &[5], 0);
-    let time_p = plain_engine
-        .step(exe_p, decode_p, &step_inputs(&values), &mut NoSync)
-        .unwrap()
-        .device_time();
-    assert_eq!(
-        time_p,
-        poot_executor::DeviceTime::Unknown,
-        "a counters-only PTX device must never fabricate a measurement"
-    );
-
-    let mut timed_engine = Engine::new(SlowReplayDevice(timed));
-    let exe_t = timed_engine
-        .load_weights(store, poot_executor::WeightSource::ConstNames)
-        .unwrap();
-    let decode_t = timed_engine
-        .add_entry(exe_t, &staged(&g, target, Submission::Replay))
-        .unwrap();
-    // First step records (capture + first replay, overhead-heavy); the span assertion below reads a
-    // later pure-replay step.
-    let _ = timed_engine
-        .step(exe_t, decode_t, &step_inputs(&values), &mut NoSync)
-        .unwrap();
-    let time_t = timed_engine
-        .step(exe_t, decode_t, &step_inputs(&values), &mut NoSync)
-        .unwrap()
-        .device_time();
-    let poot_executor::DeviceTime::Measured(measured) = time_t else {
-        panic!("a device-timed PTX device must report Measured, got {time_t:?}");
-    };
-    let span = measured
-        .device_span
-        .expect("PTX device timing reports one span per replay");
-    assert!(span.as_nanos() > 0, "positive device span: {span:?}");
-    assert!(
-        span < Duration::from_millis(50),
-        "the reported device span ({span:?}) must reflect the real CUDA-event-bracketed replay, not \
-         the 200ms host-side sleep injected after it returns"
-    );
 }
 
 // ── SC-007 ───────────────────────────────────────────────────────────────

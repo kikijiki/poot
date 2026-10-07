@@ -11,7 +11,10 @@
 
 use std::collections::HashMap;
 
-use poot_graph_ir::op::{FusedOp, FusedOperand, FusedRegion, FusedStep, RowRegion, RowStep};
+use poot_graph_ir::AttentionAttrs;
+use poot_graph_ir::op::{
+    ContractionHead, FusedOp, FusedOperand, FusedRegion, FusedStep, RowRegion, RowStep,
+};
 use poot_graph_ir::{
     BinOp, Builder, Graph, OpKind, Operand, RedOp, Scalar, TensorType, Traced, UnOp, ValueId, ops,
 };
@@ -129,7 +132,7 @@ fn assert_composite_matches_chain(
     assert_bits_equal(&composite, &traced, what);
 }
 
-/// SC-002 (decode): `FlashAttentionDecode { n_rep, scale }` is `ops::attention_masked` with the same
+/// SC-002 (decode): `Attention { n_rep, scale }` is `ops::attention_masked` with the same
 /// GQA ratio and scale, over a batched cache and a per-row mask.
 #[test]
 fn flash_decode_composite_is_the_traced_masked_attention() {
@@ -144,13 +147,13 @@ fn flash_decode_composite_is_the_traced_masked_attention() {
     ];
     assert_composite_matches_chain(
         "flash decode",
-        OpKind::FlashAttentionDecode { n_rep, scale },
+        OpKind::Attention(AttentionAttrs::new(n_rep, scale, None)),
         &inputs,
         |b, t| ops::attention_masked(b, t[0], t[1], t[2], n_rep, scale, t[3]),
     );
 }
 
-/// SC-002 (prefill, no softcap): `FlashAttentionPrefill { softcap: None }` is `ops::attention_prefill`,
+/// SC-002 (prefill, no softcap): `Attention { softcap: None }` is `ops::attention_prefill`,
 /// here with a per-head (ALiBi-shaped) mask.
 #[test]
 fn flash_prefill_composite_is_the_traced_prefill_attention() {
@@ -175,17 +178,13 @@ fn flash_prefill_composite_is_the_traced_prefill_attention() {
     ];
     assert_composite_matches_chain(
         "flash prefill",
-        OpKind::FlashAttentionPrefill {
-            n_rep,
-            scale,
-            softcap: None,
-        },
+        OpKind::Attention(AttentionAttrs::new(n_rep, scale, None)),
         &inputs,
         |b, t| ops::attention_prefill(b, t[0], t[1], t[2], n_rep, scale, t[3]),
     );
 }
 
-/// SC-002 (prefill, softcap): `FlashAttentionPrefill { softcap: Some(c) }` is
+/// SC-002 (prefill, softcap): `Attention { softcap: Some(c) }` is
 /// `ops::attention_prefill_softcap` with the same cap. The scores reach past the cap, so a dropped or
 /// different softcap changes the bits.
 #[test]
@@ -201,11 +200,7 @@ fn softcapped_flash_prefill_composite_is_the_traced_softcapped_prefill() {
     ];
     assert_composite_matches_chain(
         "softcapped flash prefill",
-        OpKind::FlashAttentionPrefill {
-            n_rep,
-            scale,
-            softcap: Some(cap),
-        },
+        OpKind::Attention(AttentionAttrs::new(n_rep, scale, Some(cap))),
         &inputs,
         |b, t| ops::attention_prefill_softcap(b, t[0], t[1], t[2], n_rep, scale, t[3], Some(cap)),
     );
@@ -231,16 +226,39 @@ fn rope_composite_is_the_traced_half_split_rotation() {
     }
 }
 
-/// SC-002 (`MatMulBias`): the contraction then the `[N]` bias add, `ops::linear` with the bias.
+/// SC-002 (`ContractionEpilogue`): the head contraction, then the region's steps over its result: a bias
+/// add, a residual add and a literal scale, `ops::linear` then the chain the tracer states.
 #[test]
-fn matmul_bias_composite_is_the_traced_biased_linear() {
+fn contraction_epilogue_composite_is_the_traced_matmul_then_chain() {
+    let local = FusedOperand::Local;
+    let step = |op, inputs| FusedStep { op, inputs };
+    let region = FusedRegion {
+        n_inputs: 3,
+        steps: vec![
+            step(FusedOp::Binary(BinOp::Add), vec![local(0), local(1)]),
+            step(FusedOp::Binary(BinOp::Add), vec![local(3), local(2)]),
+            step(
+                FusedOp::Binary(BinOp::Mul),
+                vec![local(4), FusedOperand::Lit(Scalar::F32(0.5))],
+            ),
+        ],
+        output: 5,
+        pack: Vec::new(),
+    };
     let inputs = [
         data(&[2, 3, 5], 24, 1.0),
         data(&[5, 4], 25, 1.0),
         data(&[4], 26, 1.0),
+        data(&[2, 3, 4], 27, 1.0),
     ];
-    assert_composite_matches_chain("matmul_bias", OpKind::MatMulBias, &inputs, |b, t| {
-        ops::linear(b, t[0], t[1], Some(t[2]))
+    let op = OpKind::ContractionEpilogue {
+        head: ContractionHead::MatMul,
+        region,
+    };
+    assert_composite_matches_chain("contraction_epilogue", op, &inputs, |b, t| {
+        let biased = ops::linear(b, t[0], t[1], Some(t[2]));
+        let summed = b.binary(BinOp::Add, biased, t[3]);
+        b.binary_scalar(BinOp::Mul, summed, Scalar::F32(0.5))
     });
 }
 
@@ -443,11 +461,7 @@ fn prefill_composite_scores_are_charged_to_the_budget() {
         data(&[1, hq, l, d], 32, 1.0),
         causal_mask(&[1, 1, l, l], 0),
     ];
-    let op = OpKind::FlashAttentionPrefill {
-        n_rep: 1,
-        scale,
-        softcap: None,
-    };
+    let op = OpKind::Attention(AttentionAttrs::new(1, scale, None));
     let graph = one_equation(op, &inputs);
     let composite = graph.0.eqns[0].out;
     let scores = hq * l * l;
@@ -522,4 +536,124 @@ fn an_error_inside_a_decomposition_names_the_composite_equation() {
         }
         other => panic!("a zero RemU divisor must be refused: {other:?}"),
     }
+}
+
+/// The output as f32 values (an exact widening of every dtype the oracle holds).
+fn widened(tensor: &HostTensor) -> Vec<f32> {
+    tensor.to_f32().expect("a float tensor").into_owned()
+}
+
+/// A `[1, 1]` epilogue region `head <op> leaf`, one step.
+fn one_step_region(op: BinOp) -> FusedRegion {
+    FusedRegion {
+        n_inputs: 2,
+        steps: vec![FusedStep {
+            op: FusedOp::Binary(op),
+            inputs: vec![FusedOperand::Local(0), FusedOperand::Local(1)],
+        }],
+        output: 2,
+        pack: Vec::new(),
+    }
+}
+
+/// SC-006 (CPU oracle; BF16 and F16): a narrow contraction head rounds to its dtype before the epilogue reads
+/// it. `A = [1, 1]` against `B = [1, tie]^T`, where `tie` is half a unit in the last place of 1.0 (`2^-8` for
+/// BF16, `2^-11` for F16), accumulates to exactly halfway between 1.0 and its successor; round-to-nearest-even
+/// rounds the head to 1.0, so the residual `-1` leaves zero. The composite, evaluated through its
+/// decomposition, and the traced matmul-then-add are bit-identical and zero; an epilogue that read the
+/// unrounded accumulator would give `tie`.
+///
+/// This is the reference every device row of the same name compares against: the oracle's zero is what
+/// ROCm's fused and unfused programs must reproduce. Its mutation lives on the device rows (remove the head's
+/// narrow and widen from the generated kernel: the device yields `tie` instead of zero).
+#[test]
+fn a_narrow_head_rounds_before_its_residual_in_the_composite_and_the_chain() {
+    // (dtype, words of 1.0, words of the tie, words of -1.0)
+    let cases = [
+        (DType::BF16, 0x3f80u16, 0x3b80u16, 0xbf80u16),
+        (DType::F16, 0x3c00, 0x1000, 0xbc00),
+    ];
+    for (dtype, one, tie, minus_one) in cases {
+        let tensor = |shape: &[usize], words: Vec<u16>| match dtype {
+            DType::BF16 => HostTensor::bf16(shape.to_vec(), words),
+            _ => HostTensor::f16(shape.to_vec(), words),
+        };
+        let inputs = [
+            tensor(&[1, 2], vec![one, one]),
+            tensor(&[2, 1], vec![one, tie]),
+            tensor(&[1, 1], vec![minus_one]),
+        ];
+        let op = OpKind::ContractionEpilogue {
+            head: ContractionHead::MatMul,
+            region: one_step_region(BinOp::Add),
+        };
+        let composite = evaluate(&one_equation(op, &inputs), EvalBudget::UNBOUNDED).unwrap();
+        let chain = evaluate(
+            &graph_over(&inputs, |b, t| {
+                let head = b.matmul(t[0], t[1]);
+                b.binary(BinOp::Add, head, t[2])
+            }),
+            EvalBudget::UNBOUNDED,
+        )
+        .unwrap();
+        assert_eq!(
+            composite.dtype(),
+            dtype,
+            "{dtype:?}: the epilogue keeps the head's dtype"
+        );
+        assert_eq!(
+            widened(&composite),
+            [0.0],
+            "{dtype:?}: the head rounds to 1.0 first"
+        );
+        assert_eq!(
+            widened(&composite)[0].to_bits(),
+            widened(&chain)[0].to_bits(),
+            "{dtype:?}: the composite equals the traced chain"
+        );
+    }
+}
+
+/// SC-006 (CPU oracle; multistage narrow pointwise): every step of an epilogue over a narrow head rounds through
+/// the head's dtype. `1.0 + tie` rounds to 1.0 (a tie to even) at each of two adds, so the chain ends at 1.0; an
+/// epilogue that kept the intermediate in f32 would end at `1 + 2 tie`, which BF16 holds exactly.
+#[test]
+fn every_step_of_a_narrow_epilogue_rounds_through_the_head_dtype() {
+    let (one, tie) = (0x3f80u16, 0x3b80u16);
+    let tensor = |words: Vec<u16>| HostTensor::bf16(vec![1, 1], words);
+    let inputs = [tensor(vec![one]), tensor(vec![one]), tensor(vec![tie])];
+    let local = FusedOperand::Local;
+    let region = FusedRegion {
+        n_inputs: 2,
+        steps: vec![
+            FusedStep {
+                op: FusedOp::Binary(BinOp::Add),
+                inputs: vec![local(0), local(1)],
+            },
+            FusedStep {
+                op: FusedOp::Binary(BinOp::Add),
+                inputs: vec![local(2), local(1)],
+            },
+        ],
+        output: 3,
+        pack: Vec::new(),
+    };
+    let op = OpKind::ContractionEpilogue {
+        head: ContractionHead::MatMul,
+        region,
+    };
+    // Inputs: A = [1], B = [1] (head 1.0), then the leaf `tie` read by both steps.
+    let composite = evaluate(
+        &one_equation(
+            op,
+            &[inputs[0].clone(), inputs[1].clone(), inputs[2].clone()],
+        ),
+        EvalBudget::UNBOUNDED,
+    )
+    .unwrap();
+    assert_eq!(
+        widened(&composite),
+        [1.0],
+        "each step rounds to nearest even"
+    );
 }

@@ -17,8 +17,8 @@ use poot_executor::{
 };
 use poot_graph_ir::{BinOp, Builder, StateRole, TensorType};
 use poot_graph_plan::{
-    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, FusionPolicy, Partition,
-    StagedProgram, Submission, Target, TargetSet, compile_staged,
+    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram,
+    Submission, Target, TargetSet, compile_staged,
 };
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_target::{Backend, DeviceCaps};
@@ -221,7 +221,6 @@ fn staged(
         },
         &CompileOptions {
             execution: submission,
-            fusion: FusionPolicy::Full,
             limits: poot_graph_plan::CompileLimits::STANDARD,
         },
     )

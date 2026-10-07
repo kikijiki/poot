@@ -15,7 +15,7 @@ use poot_executor::{
 };
 use poot_graph_ir::{BinOp, Builder, Graph, Slot, StateRole, TensorType, ValidationOutputs};
 use poot_graph_plan::{
-    CompileLimits, CompileOptions, FusionPolicy, StagedProgram, Submission, Target, TargetSet,
+    CompileLimits, CompileOptions, StagedProgram, Submission, Target, TargetSet,
 };
 use poot_llm::driver::error::{DriverError, PreparedSetRefusal};
 use poot_llm::driver::{
@@ -415,10 +415,12 @@ fn rig(options: RigOptions) -> Rig {
                 generation: None,
                 store: WeightStore::default(),
             },
+            variants: &[],
         })
         .unwrap();
     let dir = checkpoint_dir(&config, "prepared_budgets_checkpoint");
-    let handle = ModelHandle::load(&dir, &registry).unwrap();
+    let handle =
+        ModelHandle::load(&dir, &registry, &poot_llm::driver::LoadOptions::default()).unwrap();
     let asked: Rc<RefCell<Asked>> = Rc::default();
     let executor = Wrapped {
         inner: Engine::new(FakeDevice),
@@ -427,7 +429,6 @@ fn rig(options: RigOptions) -> Rig {
     };
     let compile = CompileOptions {
         execution: Submission::Replay,
-        fusion: FusionPolicy::Full,
         limits: options.limits,
     };
     let driver = Driver::new(
@@ -444,6 +445,7 @@ fn rig(options: RigOptions) -> Rig {
                 max_retained_bytes: NonZeroU64::new(options.max_retained_bytes).unwrap(),
             },
             charge: options.charge,
+            draft: poot_llm::driver::DraftPolicy::Off,
         },
     )
     .unwrap();

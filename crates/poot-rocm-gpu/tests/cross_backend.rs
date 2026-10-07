@@ -74,7 +74,6 @@ fn run_once_rocm(
             },
             &poot_graph_plan::CompileOptions {
                 execution: poot_graph_plan::Submission::Replay,
-                fusion: poot_graph_plan::FusionPolicy::Full,
                 limits: poot_graph_plan::CompileLimits::STANDARD,
             },
         )
@@ -91,7 +90,9 @@ fn run_once_rocm(
         .unwrap();
     engine.unload(exe).unwrap();
     let data: Vec<f32> = bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     HostTensor::f32(g.aval(g.output).shape.clone(), data)
@@ -1102,7 +1103,6 @@ fn sample_token_greedy_rocm_matches_cpu() {
             },
             &poot_graph_plan::CompileOptions {
                 execution: poot_graph_plan::Submission::Replay,
-                fusion: poot_graph_plan::FusionPolicy::Full,
                 limits: poot_graph_plan::CompileLimits::STANDARD,
             },
         )
@@ -1119,7 +1119,9 @@ fn sample_token_greedy_rocm_matches_cpu() {
         .unwrap();
     rocm.unload(exe).unwrap();
     let got: Vec<i32> = bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     assert_eq!(
@@ -1174,7 +1176,6 @@ fn random_uniform_rocm_matches_cpu() {
             },
             &poot_graph_plan::CompileOptions {
                 execution: poot_graph_plan::Submission::Replay,
-                fusion: poot_graph_plan::FusionPolicy::Full,
                 limits: poot_graph_plan::CompileLimits::STANDARD,
             },
         )
@@ -1200,7 +1201,9 @@ fn random_uniform_rocm_matches_cpu() {
         .unwrap();
     rocm.unload(exe).unwrap();
     let got: Vec<f32> = bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     assert_close(&got, cpu.as_f32().unwrap(), "rocm_random_uniform", 0.0);
@@ -1241,7 +1244,6 @@ fn run_gumbel_family_contract_rocm(
             },
             &poot_graph_plan::CompileOptions {
                 execution: poot_graph_plan::Submission::Replay,
-                fusion: poot_graph_plan::FusionPolicy::Full,
                 limits: poot_graph_plan::CompileLimits::STANDARD,
             },
         )
@@ -1271,7 +1273,9 @@ fn run_gumbel_family_contract_rocm(
         .unwrap();
     rocm.unload(exe).unwrap();
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
@@ -1605,4 +1609,425 @@ fn sample_token_gumbel_topp_only_excludes_untruncated_winner_rocm_matches_cpu() 
          over {{3, 6}} picks 3"
     );
     assert_eq!(got, vec![3, -1]);
+}
+
+// ---- contraction epilogue (SC-001, SC-006) ------------------------------------------------------------
+//
+// A bias, a pointwise activation and a residual add fuse into the contraction that feeds them, and the fused
+// device program equals the same graph compiled under the routed-expert hang guard (one kernel per equation, the
+// contraction on the schedule its fused plan picks) bit for bit. A narrow head (BF16, F16) rounds to its dtype in
+// registers before the epilogue reads it: the fused kernel keeps the narrow and widen the unfused program's store
+// and reload perform.
+
+/// `g` run once on `engine` under the routed-expert hang guard when `guarded`; every input is a named const of its own dtype and the output is
+/// returned as the graph declares it.
+fn run_under(
+    engine: &mut Engine<RocmDevice>,
+    target: Target,
+    g: &Graph,
+    inputs: &HashMap<ValueId, HostTensor>,
+    guarded: bool,
+) -> HostTensor {
+    let mut builder = WeightStore::builder();
+    for (&id, tensor) in inputs {
+        let meta = g.meta(id);
+        assert_eq!(meta.storage, Storage::Const, "{id} is a const");
+        let dense = DenseWeight::try_new(
+            tensor.dtype(),
+            tensor.shape().to_vec(),
+            Arc::from(tensor.view().bytes()),
+        )
+        .unwrap();
+        builder
+            .insert(meta.name.clone().unwrap(), WeightEntry::Dense(dense))
+            .unwrap();
+    }
+    let exe = engine
+        .load_weights(
+            Arc::new(builder.build()),
+            poot_executor::WeightSource::ConstNames,
+        )
+        .unwrap();
+    let (gc, caps) = poot_test_util::graph_fixtures::pipeline_input(g, target.caps, guarded);
+    let target = Target { caps, ..target };
+    let staged = poot_graph_plan::compile_staged(
+        &gc.with_validations(Vec::new()),
+        &poot_graph_plan::TargetSet::single(poot_graph_plan::DeviceId(0), target),
+        &poot_graph_plan::Partition {
+            experts: poot_graph_plan::ExpertPlacement::AllResident,
+            devices: poot_graph_plan::DevicePlacement::Single(poot_graph_plan::DeviceId(0)),
+        },
+        &poot_graph_plan::CompileOptions {
+            execution: poot_graph_plan::Submission::Replay,
+            limits: poot_graph_plan::CompileLimits::STANDARD,
+        },
+    )
+    .expect("compile_staged");
+    let entry = engine.add_entry(exe, &staged).unwrap();
+    let bytes = engine
+        .step(exe, entry, &StepInputs::new(), &mut NoSync)
+        .unwrap()
+        .read()
+        .unwrap();
+    engine.remove_entry(exe, entry).unwrap();
+    engine.unload(exe).unwrap();
+    let out = g.aval(g.output);
+    let words = || -> Vec<u16> {
+        bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect()
+    };
+    match out.dtype {
+        DType::F32 => HostTensor::f32(
+            out.shape.clone(),
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+        ),
+        DType::BF16 => HostTensor::bf16(out.shape.clone(), words()),
+        DType::F16 => HostTensor::f16(out.shape.clone(), words()),
+        other => panic!("unexpected output dtype {other:?}"),
+    }
+}
+
+/// The bits of `tensor` widened to f32 (exact for every dtype the rows use).
+fn widened_bits(tensor: &HostTensor) -> Vec<u32> {
+    tensor
+        .to_f32()
+        .expect("a float tensor")
+        .iter()
+        .map(|v| v.to_bits())
+        .collect()
+}
+
+/// The fused program holds exactly one `ContractionEpilogue` over `head`, and the unfused one none.
+fn assert_fuses_into_one_epilogue(
+    g: &Graph,
+    target: &Target,
+    head: poot_graph_ir::op::ContractionHead,
+) {
+    let compile = |guarded| {
+        let (g, caps) = poot_test_util::graph_fixtures::pipeline_input(g, target.caps, guarded);
+        poot_graph_plan::compile(
+            &g,
+            &Target { caps, ..*target },
+            &poot_graph_plan::CompileOptions {
+                execution: poot_graph_plan::Submission::Replay,
+                limits: poot_graph_plan::CompileLimits::STANDARD,
+            },
+        )
+        .expect("the graph compiles")
+    };
+    let fused = compile(false);
+    let heads: Vec<_> = fused
+        .graph()
+        .eqns
+        .iter()
+        .filter_map(|eqn| match &eqn.op {
+            poot_graph_ir::OpKind::ContractionEpilogue { head, .. } => Some(*head),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        heads,
+        [head],
+        "one fused contraction: {:?}",
+        fused.graph().eqns
+    );
+    assert!(
+        compile(true)
+            .graph()
+            .eqns
+            .iter()
+            .all(|eqn| !matches!(eqn.op, poot_graph_ir::OpKind::ContractionEpilogue { .. })),
+        "the guard keeps one kernel per equation"
+    );
+}
+
+/// The fused and the unfused device results are bit-identical, and the fused one meets the oracle's tier-2
+/// tolerance (`label` names the row in a failure).
+fn assert_fused_equals_unfused(
+    engine: &mut Engine<RocmDevice>,
+    target: Target,
+    g: &Graph,
+    inputs: &HashMap<ValueId, HostTensor>,
+    label: &str,
+) -> HostTensor {
+    let fused = run_under(engine, target, g, inputs, false);
+    let unfused = run_under(engine, target, g, inputs, true);
+    assert_eq!(
+        widened_bits(&fused),
+        widened_bits(&unfused),
+        "{label}: the fused device program must equal the unfused one bit for bit"
+    );
+    let oracle_inputs: HashMap<ValueId, Value> = inputs
+        .iter()
+        .map(|(&id, t)| (id, Value::from(t.clone())))
+        .collect();
+    let want = eval(g, &oracle_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        .unwrap()
+        .output
+        .into_host()
+        .unwrap();
+    assert_eq!(fused.shape(), want.shape(), "{label}: shape");
+    poot_executor_parity::weight_map::assert_close(
+        &fused.to_f32().unwrap(),
+        &want.to_f32().unwrap(),
+        poot_executor_parity::weight_map::TIER2,
+        label,
+    );
+    fused
+}
+
+/// `tanh(head + bias) * 0.5 + residual`: a bias, a representative pointwise activation, a literal scale and a
+/// residual add, each value read once, so the whole chain is one epilogue.
+fn epilogue_chain(
+    b: &Builder,
+    head: poot_graph_ir::Traced,
+    bias: poot_graph_ir::Traced,
+    residual: poot_graph_ir::Traced,
+) -> poot_graph_ir::Traced {
+    let biased = b.binary(BinOp::Add, head, bias);
+    let activated = b.unary(UnOp::Tanh, biased);
+    let scaled = b.binary_scalar(
+        BinOp::Mul,
+        activated,
+        poot_graph_ir::types::Scalar::F32(0.5),
+    );
+    b.binary(BinOp::Add, scaled, residual)
+}
+
+/// SC-001 (ROCm, the decode Gemv): an F32 `[N, K]` projection at `M == 1` with a bias, an activation, a scale
+/// and a residual fuses into one `ContractionEpilogue { head: Dense }`; fused and unfused device results are
+/// bit-identical. Mutation: omit the bias or the residual leaf in `emit_epilogue` (`read_leaf` yields zero); the
+/// nonzero inputs then differ and this row goes red.
+#[test]
+fn a_dense_gemv_epilogue_equals_the_unfused_program_on_rocm() {
+    let Some((target, mut rocm)) = try_rocm() else {
+        return;
+    };
+    let (k, n) = (37usize, 53usize);
+    let b = Builder::new();
+    let x = b.constant("x", TensorType::f32(vec![1, 1, k]));
+    let w = b.constant("w", TensorType::f32(vec![n, k]));
+    let bias = b.constant("bias", TensorType::f32(vec![n]));
+    let residual = b.constant("residual", TensorType::f32(vec![1, 1, n]));
+    let head = b.matmul(x, b.transpose(w, vec![1, 0]));
+    let out = epilogue_chain(&b, head, bias, residual);
+    let inputs = HashMap::from([
+        (x.id, HostTensor::f32(vec![1, 1, k], fill(1, k))),
+        (w.id, HostTensor::f32(vec![n, k], fill(2, n * k))),
+        (bias.id, HostTensor::f32(vec![n], fill(3, n))),
+        (residual.id, HostTensor::f32(vec![1, 1, n], fill(4, n))),
+    ]);
+    let g = b.finish(out);
+    assert_fuses_into_one_epilogue(
+        &g,
+        &target,
+        poot_graph_ir::op::ContractionHead::Dense { weight: DType::F32 },
+    );
+    assert_fused_equals_unfused(&mut rocm, target, &g, &inputs, "dense gemv epilogue");
+}
+
+/// Round an f32 to its BF16 bits, nearest even.
+fn bf16_bits(x: f32) -> u16 {
+    let bits = x.to_bits();
+    ((bits + 0x7fff + ((bits >> 16) & 1)) >> 16) as u16
+}
+
+/// POOT-1032 (ROCm, the generated tiled GEMM): the dense head at `M > 1` over an F32 and a packed-BF16 `[N, K]`
+/// weight, with the same chain, fuses into one `ContractionEpilogue { head: Dense }` at a single partial row-tile
+/// (`M == 5`) and at many (`M == 160`); fused and unfused device results are bit-identical. Mutation: drop the
+/// epilogue from the tiled store in `tiled_region`; the nonzero inputs then differ and this row goes red.
+#[test]
+fn a_dense_tiled_epilogue_equals_the_unfused_program_on_rocm() {
+    let Some((target, mut rocm)) = try_rocm() else {
+        return;
+    };
+    let (k, n) = (37usize, 53usize);
+    for weight_dtype in [DType::F32, DType::BF16] {
+        for m in [5usize, 160] {
+            let b = Builder::new();
+            let x = b.constant("x", TensorType::f32(vec![m, k]));
+            let w = b.constant("w", TensorType::new(vec![n, k], weight_dtype));
+            let bias = b.constant("bias", TensorType::f32(vec![n]));
+            let residual = b.constant("residual", TensorType::f32(vec![m, n]));
+            let head = b.matmul(x, b.transpose(w, vec![1, 0]));
+            let out = epilogue_chain(&b, head, bias, residual);
+            let weight_values = fill(2, n * k);
+            let weight = match weight_dtype {
+                DType::BF16 => HostTensor::bf16(
+                    vec![n, k],
+                    weight_values.into_iter().map(bf16_bits).collect(),
+                ),
+                _ => HostTensor::f32(vec![n, k], weight_values),
+            };
+            let inputs = HashMap::from([
+                (x.id, HostTensor::f32(vec![m, k], fill(1, m * k))),
+                (w.id, weight),
+                (bias.id, HostTensor::f32(vec![n], fill(3, n))),
+                (residual.id, HostTensor::f32(vec![m, n], fill(4, m * n))),
+            ]);
+            let g = b.finish(out);
+            assert_fuses_into_one_epilogue(
+                &g,
+                &target,
+                poot_graph_ir::op::ContractionHead::Dense {
+                    weight: weight_dtype,
+                },
+            );
+            assert_fused_equals_unfused(
+                &mut rocm,
+                target,
+                &g,
+                &inputs,
+                &format!("dense tiled epilogue {weight_dtype:?} M={m}"),
+            );
+        }
+    }
+}
+
+/// SC-001 (ROCm, the one-thread-per-output body): a batched F32 `MatMul` the planner lowers serially, with the
+/// same chain, fuses into `ContractionEpilogue { head: MatMul }` and equals the unfused program bit for bit.
+#[test]
+fn a_serial_matmul_epilogue_equals_the_unfused_program_on_rocm() {
+    let Some((target, mut rocm)) = try_rocm() else {
+        return;
+    };
+    let b = Builder::new();
+    let a = b.constant("a", TensorType::f32(vec![1, 2, 3, 4]));
+    let w = b.constant("w", TensorType::f32(vec![1, 1, 4, 5]));
+    let bias = b.constant("bias", TensorType::f32(vec![5]));
+    let residual = b.constant("residual", TensorType::f32(vec![1, 2, 3, 5]));
+    let head = b.matmul(a, w);
+    let out = epilogue_chain(&b, head, bias, residual);
+    let inputs = HashMap::from([
+        (a.id, HostTensor::f32(vec![1, 2, 3, 4], fill(11, 24))),
+        (w.id, HostTensor::f32(vec![1, 1, 4, 5], fill(12, 20))),
+        (bias.id, HostTensor::f32(vec![5], fill(13, 5))),
+        (residual.id, HostTensor::f32(vec![1, 2, 3, 5], fill(14, 30))),
+    ]);
+    let g = b.finish(out);
+    assert_fuses_into_one_epilogue(&g, &target, poot_graph_ir::op::ContractionHead::MatMul);
+    assert_fused_equals_unfused(&mut rocm, target, &g, &inputs, "serial matmul epilogue");
+}
+
+/// POOT-1036 (ROCm, the generated tiled GEMM over an f32 `[K, N]` weight): a plain `MatMul` head at `M > 1`
+/// with the same chain fuses into one `ContractionEpilogue { head: MatMul }` at a single partial row-tile
+/// (`M == 5`) and at many (`M == 160`); fused and unfused device results are bit-identical. Mutation: drop the
+/// `Tileable` arm of `epilogue_head_lowers`; the head stays apart from its chain and this row goes red.
+#[test]
+fn a_tiled_matmul_epilogue_equals_the_unfused_program_on_rocm() {
+    let Some((target, mut rocm)) = try_rocm() else {
+        return;
+    };
+    let (k, n) = (37usize, 53usize);
+    for m in [5usize, 160] {
+        let b = Builder::new();
+        let x = b.constant("x", TensorType::f32(vec![m, k]));
+        let w = b.constant("w", TensorType::f32(vec![k, n]));
+        let bias = b.constant("bias", TensorType::f32(vec![n]));
+        let residual = b.constant("residual", TensorType::f32(vec![m, n]));
+        let head = b.matmul(x, w);
+        let out = epilogue_chain(&b, head, bias, residual);
+        let inputs = HashMap::from([
+            (x.id, HostTensor::f32(vec![m, k], fill(1, m * k))),
+            (w.id, HostTensor::f32(vec![k, n], fill(2, k * n))),
+            (bias.id, HostTensor::f32(vec![n], fill(3, n))),
+            (residual.id, HostTensor::f32(vec![m, n], fill(4, m * n))),
+        ]);
+        let g = b.finish(out);
+        assert_fuses_into_one_epilogue(&g, &target, poot_graph_ir::op::ContractionHead::MatMul);
+        assert_fused_equals_unfused(
+            &mut rocm,
+            target,
+            &g,
+            &inputs,
+            &format!("tiled matmul epilogue M={m}"),
+        );
+    }
+}
+
+/// SC-006 (ROCm, BF16 and F16 heads): a narrow head rounds to its dtype before its residual reads it. `A = [1, 1]`
+/// against `B = [1, tie]^T`, `tie` half a unit in the last place of 1.0 (`2^-8` BF16, `2^-11` F16), accumulates
+/// to exactly halfway between 1.0 and its successor; round-to-nearest-even rounds the head to 1.0 and the residual
+/// `-1` leaves zero. The fused device program, the unfused one and the CPU decomposition agree and are zero.
+///
+/// Mutation: remove the head's narrow and widen from `emit_epilogue` (`round_through` returns its input
+/// unrounded); the fused kernel then reads the f32 accumulator, yields `tie`, and this row goes red.
+#[test]
+fn a_narrow_head_rounds_before_its_residual_on_rocm() {
+    let Some((target, mut rocm)) = try_rocm() else {
+        return;
+    };
+    // (dtype, words of 1.0, words of the tie, words of -1.0)
+    let cases = [
+        (DType::BF16, 0x3f80u16, 0x3b80u16, 0xbf80u16),
+        (DType::F16, 0x3c00, 0x1000, 0xbc00),
+    ];
+    for (dtype, one, tie, minus_one) in cases {
+        let tensor = |shape: &[usize], words: Vec<u16>| match dtype {
+            DType::BF16 => HostTensor::bf16(shape.to_vec(), words),
+            _ => HostTensor::f16(shape.to_vec(), words),
+        };
+        let b = Builder::new();
+        let a = b.constant("a", TensorType::new(vec![1, 2], dtype));
+        let w = b.constant("w", TensorType::new(vec![2, 1], dtype));
+        let residual = b.constant("residual", TensorType::new(vec![1, 1], dtype));
+        let out = b.binary(BinOp::Add, b.matmul(a, w), residual);
+        let inputs = HashMap::from([
+            (a.id, tensor(&[1, 2], vec![one, one])),
+            (w.id, tensor(&[2, 1], vec![one, tie])),
+            (residual.id, tensor(&[1, 1], vec![minus_one])),
+        ]);
+        let g = b.finish(out);
+        assert_fuses_into_one_epilogue(&g, &target, poot_graph_ir::op::ContractionHead::MatMul);
+        let got = assert_fused_equals_unfused(
+            &mut rocm,
+            target,
+            &g,
+            &inputs,
+            &format!("{dtype:?} narrow head"),
+        );
+        assert_eq!(got.dtype(), dtype);
+        assert_eq!(
+            got.to_f32().unwrap().as_ref(),
+            [0.0],
+            "{dtype:?}: the head rounds to 1.0 before the residual, not to 1 + tie"
+        );
+    }
+}
+
+/// SC-006 (ROCm, multistage narrow pointwise): every step of an epilogue over a BF16 head rounds through BF16.
+/// `1.0 + tie` is a tie that rounds to 1.0 at each of two adds, so the chain ends at 1.0; an epilogue that kept
+/// its intermediate in f32 would end at `1 + 2 tie`, which BF16 holds exactly. Mutation: skip the per-step
+/// rounding in `emit_epilogue` (keep the head's round, drop `round_through` after each step); this row goes red
+/// with `1.0078125`.
+#[test]
+fn every_step_of_a_narrow_epilogue_rounds_through_its_dtype_on_rocm() {
+    let Some((target, mut rocm)) = try_rocm() else {
+        return;
+    };
+    let (one, tie) = (0x3f80u16, 0x3b80u16);
+    let b = Builder::new();
+    let a = b.constant("a", TensorType::new(vec![1, 1], DType::BF16));
+    let w = b.constant("w", TensorType::new(vec![1, 1], DType::BF16));
+    let leaf = b.constant("tie", TensorType::new(vec![1, 1], DType::BF16));
+    let head = b.matmul(a, w);
+    let out = b.binary(BinOp::Add, b.binary(BinOp::Add, head, leaf), leaf);
+    let inputs = HashMap::from([
+        (a.id, HostTensor::bf16(vec![1, 1], vec![one])),
+        (w.id, HostTensor::bf16(vec![1, 1], vec![one])),
+        (leaf.id, HostTensor::bf16(vec![1, 1], vec![tie])),
+    ]);
+    let g = b.finish(out);
+    assert_fuses_into_one_epilogue(&g, &target, poot_graph_ir::op::ContractionHead::MatMul);
+    let got = assert_fused_equals_unfused(&mut rocm, target, &g, &inputs, "bf16 multistage");
+    assert_eq!(got.to_f32().unwrap().as_ref(), [1.0]);
 }

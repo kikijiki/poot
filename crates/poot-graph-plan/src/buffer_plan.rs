@@ -130,8 +130,8 @@ impl SlotInfo {
 /// result); `state_commit` and `validation` are the program's already-derived plans, read only to find
 /// the values this program's epilogue exports by a whole-buffer `copy`/`read` (see the module doc).
 ///
-/// A value's lifetime spans the equation index that materializes it (`Plan::Compute`/`ComputeMeta`/
-/// `ComputeChunks`/`Collective`; `Alias`/`View` never materialize - a read of them extends their
+/// A value's lifetime spans the equation index that materializes it (`Plan::Dispatches`/
+/// `Collective`; `Alias`/`View` never materialize - a read of them extends their
 /// root's lifetime instead, the same alias resolution [`crate::state_commit::state_commit_from_plans`]
 /// already runs) to the last equation that reads it, inclusive: an equation that both reads a value
 /// last and produces a new one is one dispatch with distinct input/output buffers, so the two are

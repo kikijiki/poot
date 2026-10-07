@@ -3,27 +3,8 @@ use super::*;
 use poot_graph_plan::{ImportedKernel, KernelChoice};
 use poot_kernelgen::{ContractionSpec, KernelRequest};
 
-/// ADR-0113: a test checks the production kernel choice instead of calling the deleted test-only predicates
-/// `is_decode_gemv`/`is_tiled_gemm`. A plan split into chunks has one choice per chunk.
-fn leaf_choices(choice: &KernelChoice) -> Vec<&KernelChoice> {
-    match choice {
-        KernelChoice::Chunked(chunks) => chunks.iter().collect(),
-        other => vec![other],
-    }
-}
-
-/// The shipped tiled GEMM (shared or batched weight, with or without bias).
-fn is_tiled_gemm_kernel(choice: &KernelChoice) -> bool {
-    matches!(
-        choice,
-        KernelChoice::Imported {
-            kernel: ImportedKernel::TiledGemm
-                | ImportedKernel::TiledGemmBias
-                | ImportedKernel::TiledGemmBatched,
-            ..
-        }
-    )
-}
+// ADR-0113: a test checks the production kernel choice instead of calling the deleted test-only predicates
+// `is_decode_gemv`/`is_tiled_gemm`.
 
 /// The generated tiled GEMM (`kg::tiled_region`), the planner's choice for an M>1 F32 matmul against a rank-2
 /// weight (Card 557).
@@ -42,13 +23,9 @@ fn is_decode_gemv_kernel(choice: &KernelChoice) -> bool {
         choice,
         KernelChoice::Imported {
             kernel: ImportedKernel::GemvCoalesced
-                | ImportedKernel::GemvCoalescedBias
                 | ImportedKernel::GemvBatchedCoalesced
-                | ImportedKernel::GemvBatchedCoalescedBias
                 | ImportedKernel::GemvCoalescedBf16
-                | ImportedKernel::GemvCoalescedBiasBf16
-                | ImportedKernel::GemvBatchedCoalescedBf16
-                | ImportedKernel::GemvBatchedCoalescedBiasBf16,
+                | ImportedKernel::GemvBatchedCoalescedBf16,
             ..
         } | KernelChoice::Generated(KernelRequest::Contraction(
             ContractionSpec::GemvChunk { .. }
@@ -84,9 +61,7 @@ fn tiled_gemm_large_n_under_tile_threshold_matches_cpu() {
     )
     .unwrap();
     assert!(
-        leaf_choices(&choice)
-            .into_iter()
-            .all(is_generated_tiled_gemm),
+        is_generated_tiled_gemm(&choice),
         "expected tiled path, got {plan:?} / {choice:?}"
     );
     let r = |s: usize, num: usize| -> Vec<f32> {
@@ -120,7 +95,6 @@ fn tiled_gemm_tile_count_threshold_gated_and_correct() {
     //  (b) just over (M=16, N=262144 -> 32768 tiles): chunked tiled path;
     //  both GPU==CPU and deterministic across runs.
     use poot_graph_ir::op::OpKind;
-    use poot_graph_plan::Plan;
     use poot_target::Backend;
     let _gpu_guard = gpu_lock();
     let Some((mut gpu, target)) = open_engine_or_skip() else {
@@ -148,7 +122,7 @@ fn tiled_gemm_tile_count_threshold_gated_and_correct() {
             .iter()
             .find(|e| matches!(e.op, OpKind::MatMul))
             .unwrap();
-        // both take the tiled path; the plan is single Compute vs ComputeChunks.
+        // both take the tiled path; the plan is one dispatch or several.
         let (plan, choice) = plan_eqn_with_choice(
             &g,
             eqn,
@@ -157,12 +131,10 @@ fn tiled_gemm_tile_count_threshold_gated_and_correct() {
         )
         .unwrap();
         assert!(
-            leaf_choices(&choice)
-                .into_iter()
-                .all(is_generated_tiled_gemm),
+            is_generated_tiled_gemm(&choice),
             "m={m} n={n}: should take the tiled path, got {plan:?} / {choice:?}"
         );
-        let chunked = matches!(plan, Plan::ComputeChunks(_));
+        let chunked = plan.dispatches().len() > 1;
         assert_eq!(
             chunked,
             expect_chunked,
@@ -259,7 +231,7 @@ fn lm_head_gemv_2d_grid_matches_cpu() {
     )
     .unwrap();
     assert!(
-        leaf_choices(&choice).into_iter().all(is_decode_gemv_kernel),
+        is_decode_gemv_kernel(&choice),
         "large-N decode matmul should take the 2-D GEMV path, got {plan:?} / {choice:?}"
     );
     let r = |s: usize, num: usize| -> Vec<f32> {
@@ -299,7 +271,7 @@ fn lm_head_gemv_2d_grid_matches_cpu() {
 fn decode_gemv_chunked_at_bloom_lm_head_n_matches_cpu() {
     // Card 258: BLOOM's tied lm_head has `vocab=250880` (over `DECODE_GEMV_CHUNK_TRIGGER`), which hung real wgpu/RADV hardware
     // at K=1024. This uses the real vocab (N=250880) with a
-    // small K (~32MB weight) to check the `Plan::ComputeChunks` split (`decode_gemv_plan`/`kernelgen::gemv_lds`'s
+    // small K (~32MB weight) to check the split-dispatch plan (`decode_gemv_plan`/`kernelgen::gemv_lds`'s
     // `elem_offset`) bit-for-bit against the CPU oracle. N, not K, is the watchdog hazard axis, so it is safe to run
     // unconditionally (unlike the `#[ignore]`d real-BLOOM-scale diagnostics in `cross_backend.rs`).
     use poot_graph_ir::op::OpKind;
@@ -314,7 +286,7 @@ fn decode_gemv_chunked_at_bloom_lm_head_n_matches_cpu() {
     let out = b.matmul(a, wt);
     let g = b.finish(out);
     // sanity: this is the decode-GEMV path, over the chunk trigger - plan_eqn must actually take the new
-    // ComputeChunks branch, not silently stay a single dispatch.
+    // split-dispatch branch, not silently stay a single dispatch.
     let eqn = g
         .eqns
         .iter()
@@ -328,16 +300,13 @@ fn decode_gemv_chunked_at_bloom_lm_head_n_matches_cpu() {
     )
     .unwrap();
     assert!(
-        leaf_choices(&choice).into_iter().all(is_decode_gemv_kernel),
+        is_decode_gemv_kernel(&choice),
         "large-N decode matmul should take the decode-GEMV path, got {plan:?} / {choice:?}"
     );
-    match &plan {
-        poot_graph_plan::Plan::ComputeChunks(chunks) => assert!(
-            chunks.len() > 1,
-            "BLOOM-scale N should split into >1 watchdog-safety chunk"
-        ),
-        other => panic!("BLOOM-scale N should plan as Plan::ComputeChunks: {other:?}"),
-    }
+    assert!(
+        plan.dispatches().len() > 1,
+        "BLOOM-scale N should split into >1 watchdog-safety chunk, got {plan:?}"
+    );
     let r = |s: usize, num: usize| -> Vec<f32> {
         (0..num)
             .map(|i| ((i + s) as f32 * 0.001).sin() * 0.1)
@@ -358,305 +327,6 @@ fn decode_gemv_chunked_at_bloom_lm_head_n_matches_cpu() {
     let got = run_via_contract(&mut gpu, target, &g, &inp);
     assert_eq!(got.shape(), vec![1, n]);
     assert_close(got.as_f32().unwrap(), cpu.as_f32().unwrap(), 1e-3);
-}
-
-#[test]
-#[ignore = "perf measurement (card 248): IndexedMatMul at LoRA-scale tiny r vs MoE-scale K; run with \
-            --ignored --nocapture --test-threads=1"]
-fn card248_indexed_matmul_lora_tiny_r_vs_moe_scale() {
-    // Card 248: `lora_linear_batched` (crates/poot-graph-ir/src/ops.rs) dispatches `indexed_matmul` twice per targeted
-    // projection: `xa = x[M,in] @ A_stacked[E,in,r]` (K=hidden, N=r) then `xab = xa[M,r] @ B_stacked[E,r,out]` (K=r,
-    // N=hidden). The second call's K is the LoRA rank (typically 2-64), far below the MoE `indexed_matmul` K (hundreds to
-    // thousands).
-    //
-    // On wgpu both shapes take `indexed_gemv_lds` (crates/poot-kernelgen/src/gemv.rs); `is_indexed_gemv`
-    // (crates/poot-graph-plan/src/predicates.rs) gates only on `out_numel = M*N <= 65535` and backend/dtype. The kernel runs
-    // one workgroup of GEMV_WIDTH=128 lanes per output element; each lane strides `j+=128` over K, writes its partial to LDS,
-    // and lane 0 serially sums all 128 slots after a barrier, a fixed cost independent of K. For K < 128 the lanes `K..127`
-    // do no multiply-adds but the barrier and 128-wide reduction still run. This measures whether that fixed cost shows in
-    // wall-clock time, with the same methodology as `igpu_matmul_latency_vs_npu`.
-    //
-    // Three sweeps, all M*N <= 65535 so the same kernel is used throughout:
-    //   1. dispatch-2 shape (K varies, N=896, M=8): per-workgroup lane utilization, K from LoRA rank through the 128 boundary
-    //      to MoE-scale K.
-    //   2. dispatch-1 shape (K=896, N varies small, M=8): K is large but N=r is tiny, so the workgroup count (M*N) is tiny:
-    //      an occupancy question.
-    //   3. batch scaling (K=8 vs K=1024, N=896, M varies): does a larger batch narrow the K=8 vs K=1024 gap?
-    use std::time::Instant;
-    let _gpu_guard = gpu_lock();
-    let Some((mut gpu, target)) = open_engine_or_skip() else {
-        return;
-    };
-
-    let f = |sz: usize, seed: u64| -> Vec<f32> {
-        (0..sz)
-            .map(|i| {
-                (((i as u64)
-                    .wrapping_mul(2654435761)
-                    .wrapping_add(seed * 40503))
-                    % 1009) as f32
-                    / 500.0
-                    - 1.0
-            })
-            .collect()
-    };
-    let build = |m: usize,
-                 k: usize,
-                 n: usize,
-                 e: usize|
-     -> (
-        poot_graph_ir::Graph,
-        HashMap<poot_graph_ir::ValueId, HostTensor>,
-    ) {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![m, k]));
-        let w = b.constant("w", TensorType::f32(vec![e, k, n]));
-        let idx = b.constant("idx", TensorType::f32(vec![m]));
-        let out = b.indexed_matmul(x, w, idx);
-        let g = b.finish(out);
-        let mut inp: HashMap<poot_graph_ir::ValueId, HostTensor> = HashMap::new();
-        for &id in &g.inputs {
-            let meta = g.meta(id);
-            let name = meta.name.as_deref().unwrap();
-            let t = match name {
-                "x" => HostTensor::f32(vec![m, k], f(m * k, 1)),
-                "w" => HostTensor::f32(vec![e, k, n], f(e * k * n, 2)),
-                "idx" => HostTensor::f32(vec![m], (0..m).map(|i| (i % e) as f32).collect()),
-                other => panic!("unexpected input {other}"),
-            };
-            inp.insert(id, t);
-        }
-        assert!(
-            m * n <= 65535,
-            "sweep shape M={m} N={n} exceeds the wgpu is_indexed_gemv out_numel cap - would silently \
-             switch kernels mid-sweep"
-        );
-        (g, inp)
-    };
-
-    const WARMUP: usize = 5;
-    const ITERS: usize = 100;
-    let measure = |exec: &mut dyn Executor, m: usize, k: usize, n: usize, e: usize| -> (f64, f64) {
-        let (g, inp) = build(m, k, n, e);
-        let (exe, entry) = add_resident_entry(exec, target, &g, &inp);
-        for _ in 0..WARMUP {
-            step_resident(exec, exe, entry, &g);
-        }
-        let mut lat_us: Vec<f64> = Vec::with_capacity(ITERS);
-        for _ in 0..ITERS {
-            let t = Instant::now();
-            step_resident(exec, exe, entry, &g);
-            lat_us.push(t.elapsed().as_secs_f64() * 1e6);
-        }
-        exec.remove_entry(exe, entry).unwrap();
-        exec.unload(exe).unwrap();
-        lat_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let median_us = lat_us[ITERS / 2];
-        let ops = 2.0 * m as f64 * k as f64 * n as f64;
-        let gflops = ops / (median_us * 1e-6) / 1e9;
-        (median_us, gflops)
-    };
-
-    // --- Sweep 1: dispatch-2 shape, K varies, N=896 (qwen2.5-0.5b hidden), M=8, E=8 ---
-    eprintln!(
-        "\n[card248] Sweep 1 (dispatch-2 shape xa@B: K varies, N=896, M=8, E=8) - per-workgroup lane \
-         utilization"
-    );
-    let (m1, n1, e1) = (8usize, 896usize, 8usize);
-    let ks1: [(&str, usize); 10] = [
-        ("r=2", 2),
-        ("r=4", 4),
-        ("r=8", 8),
-        ("r=16", 16),
-        ("r=32", 32),
-        ("r=64", 64),
-        ("r=128=GEMV_WIDTH", 128),
-        ("r=256", 256),
-        ("K=896 (qwen2.5-0.5b hidden, dense-equiv)", 896),
-        ("K=1024 (mixtral-tiny hidden, MoE-scale)", 1024),
-    ];
-    let mut sweep1: Vec<(usize, f64, f64)> = Vec::new();
-    for (label, k) in ks1 {
-        let (median_us, gflops) = measure(&mut gpu, m1, k, n1, e1);
-        eprintln!("  K={k:>5} ({label:<42}) median={median_us:>9.1} us  GFLOPS={gflops:>7.3}");
-        sweep1.push((k, median_us, gflops));
-    }
-    let tiny = sweep1.iter().find(|&&(k, ..)| k == 8).unwrap();
-    let moe = sweep1.iter().find(|&&(k, ..)| k == 1024).unwrap();
-    eprintln!(
-        "  => r=8 (LoRA-typical) median {:.1} us vs K=1024 (MoE-scale) median {:.1} us: {:.2}x wall time \
-         for {:.0}x fewer FLOPs (K ratio) => {:.1}x lower GFLOPS/s at tiny r",
-        tiny.1,
-        moe.1,
-        tiny.1 / moe.1,
-        moe.0 as f64 / tiny.0 as f64,
-        moe.2 / tiny.2
-    );
-
-    // --- Sweep 2: dispatch-1 shape, K=896 fixed, N varies (=r), M=8, E=8 ---
-    eprintln!(
-        "\n[card248] Sweep 2 (dispatch-1 shape x@A: K=896 fixed, N=r varies, M=8, E=8) - total workgroup \
-         count (M*N) occupancy"
-    );
-    let ns2: [usize; 6] = [2, 8, 16, 32, 64, 896];
-    for n in ns2 {
-        let (median_us, gflops) = measure(&mut gpu, m1, 896, n, e1);
-        eprintln!(
-            "  N={n:>4} (workgroups={:>6}) median={median_us:>9.1} us  GFLOPS={gflops:>7.3}",
-            m1 * n
-        );
-    }
-
-    // --- Sweep 3: batch-size scaling at K=8 (LoRA-typical) vs K=1024 (MoE-scale), N=896, E=8 ---
-    eprintln!(
-        "\n[card248] Sweep 3 (batch scaling: N=896, E=8, K=8 vs K=1024) - does a bigger concurrently-served \
-         batch narrow the gap?"
-    );
-    let ms3: [usize; 4] = [1, 8, 32, 64]; // M*896 <= 65535 for every M here (cap at M=64)
-    for m in ms3 {
-        let (lo_us, lo_gf) = measure(&mut gpu, m, 8, 896, 8);
-        let (hi_us, hi_gf) = measure(&mut gpu, m, 1024, 896, 8);
-        eprintln!(
-            "  M={m:>3}: K=8 median={lo_us:>9.1} us ({lo_gf:>6.3} GFLOPS)   K=1024 median={hi_us:>9.1} us \
-             ({hi_gf:>7.3} GFLOPS)   ratio={:.2}x",
-            lo_us / hi_us
-        );
-    }
-}
-
-#[test]
-#[ignore = "perf measurement (card 248): device-time (GPU timestamp) breakdown, isolating host-submit \
-            overhead from actual kernel device time at LoRA-scale vs MoE-scale K; run with --ignored \
-            --nocapture --test-threads=1"]
-fn card248_indexed_matmul_device_time_lora_vs_moe_scale() {
-    // The sweep above (card248_indexed_matmul_lora_tiny_r_vs_moe_scale) times one replayed `step` per
-    // shape, so each measurement includes a host submit and wait that a real decode step (one command
-    // buffer, one submit+wait per token) amortizes across many dispatches. This uses
-    // `WgpuDevice::new_with_timing` (Card 552's typed per-dispatch device-time path, the contract
-    // replacement for `GpuExecutor::new_profiled`/`profiler`/`profile_report`) to isolate on-device
-    // kernel time at sweep 1's two decisive shapes: K=8 (LoRA-typical rank) and K=1024 (mixtral-tiny
-    // MoE hidden), M=8, N=896, E=8.
-    use std::time::Instant;
-    let _gpu_guard = gpu_lock();
-    let Some(device) = poot_test_util::device_skip::open_or_skip(
-        poot_runtime_common::DeviceBackend::Wgpu,
-        poot_gpu::device::WgpuDevice::new_with_timing(4),
-    ) else {
-        return;
-    };
-    let target = device.target();
-    let mut gpu = Engine::new(device);
-    let f = |sz: usize, seed: u64| -> Vec<f32> {
-        (0..sz)
-            .map(|i| {
-                (((i as u64)
-                    .wrapping_mul(2654435761)
-                    .wrapping_add(seed * 40503))
-                    % 1009) as f32
-                    / 500.0
-                    - 1.0
-            })
-            .collect()
-    };
-    let e = 8usize;
-    let build = |m: usize,
-                 k: usize,
-                 n: usize|
-     -> (
-        poot_graph_ir::Graph,
-        HashMap<poot_graph_ir::ValueId, HostTensor>,
-    ) {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![m, k]));
-        let w = b.constant("w", TensorType::f32(vec![e, k, n]));
-        let idx = b.constant("idx", TensorType::f32(vec![m]));
-        let out = b.indexed_matmul(x, w, idx);
-        let g = b.finish(out);
-        let mut inp: HashMap<poot_graph_ir::ValueId, HostTensor> = HashMap::new();
-        for &id in &g.inputs {
-            let meta = g.meta(id);
-            let name = meta.name.as_deref().unwrap();
-            let t = match name {
-                "x" => HostTensor::f32(vec![m, k], f(m * k, 1)),
-                "w" => HostTensor::f32(vec![e, k, n], f(e * k * n, 2)),
-                "idx" => HostTensor::f32(vec![m], (0..m).map(|i| (i % e) as f32).collect()),
-                other => panic!("unexpected input {other}"),
-            };
-            inp.insert(id, t);
-        }
-        (g, inp)
-    };
-    let iters = 50u32;
-    // Only one real dispatch per step (the graph is a single `indexed_matmul`), so the step's own
-    // `sum_of_dispatch_durations` (Card 552) is that kernel's device time - no per-name filter needed.
-    let measure = |exec: &mut dyn Executor, m: usize, k: usize, n: usize| -> (f64, f64) {
-        let (g, inp) = build(m, k, n);
-        let (exe, entry) = add_resident_entry(exec, target, &g, &inp);
-        step_resident(exec, exe, entry, &g); // warmup: records the entry
-        let t0 = Instant::now();
-        let mut dev_total = std::time::Duration::ZERO;
-        let empty = poot_executor::StepInputs::new();
-        for _ in 0..iters {
-            let mut out = exec
-                .step(exe, entry, &empty, &mut poot_executor::NoSync)
-                .expect("timed");
-            if let poot_executor::DeviceTime::Measured(m) = out.device_time() {
-                dev_total += m.sum_of_dispatch_durations.unwrap_or_default();
-            }
-            out.read().expect("timed read");
-        }
-        let wall_ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
-        let dev_ms = dev_total.as_secs_f64() * 1e3 / iters as f64;
-        exec.remove_entry(exe, entry).unwrap();
-        exec.unload(exe).unwrap();
-        (wall_ms, dev_ms)
-    };
-
-    eprintln!("\n[card248_indexed_matmul_device_time_lora_vs_moe_scale]");
-
-    // Dispatch-2 shape (xa@B: K varies, N=hidden=896 fixed, M=8, E=8).
-    eprintln!("  -- dispatch-2 shape (K varies, N=896, M=8) --");
-    let (wall_lo, dev_lo) = measure(&mut gpu, 8, 8, 896);
-    let (wall_hi, dev_hi) = measure(&mut gpu, 8, 1024, 896);
-    eprintln!(
-        "  K=8    (LoRA-typical): wall {wall_lo:.4} ms/op (host submit+wait), device {dev_lo:.4} ms/op \
-         (GPU timestamp)"
-    );
-    eprintln!(
-        "  K=1024 (MoE-scale):    wall {wall_hi:.4} ms/op (host submit+wait), device {dev_hi:.4} ms/op \
-         (GPU timestamp)"
-    );
-    let host_frac_lo = (1.0 - dev_lo / wall_lo) * 100.0;
-    eprintln!(
-        "  => at K=8: {host_frac_lo:.1}% of WALL time is host-submit overhead, not device execution \
-         ({wall_lo:.4} ms wall - {dev_lo:.4} ms device = {:.4} ms host-side)",
-        wall_lo - dev_lo
-    );
-    let expected_linear_dev_lo = dev_hi * (8.0 / 1024.0);
-    eprintln!(
-        "  => DEVICE time only: K=8 is {dev_lo:.4} ms; pure-FLOP-linear scaling from K=1024's {dev_hi:.4} \
-         ms would predict {expected_linear_dev_lo:.4} ms (dev_hi * 8/1024) - measured is {:.2}x that \
-         prediction, i.e. a real but modest fixed device-side floor (~{:.4} ms) beyond pure compute scaling",
-        dev_lo / expected_linear_dev_lo,
-        dev_lo - expected_linear_dev_lo
-    );
-
-    // Dispatch-1 shape (x@A: K=hidden=896, N=r tiny vs N=896, M=8, E=8): does device time also floor out when the workgroup
-    // count (M*N) is tiny though K is large and every lane is used?
-    eprintln!("  -- dispatch-1 shape (K=896 fixed, N varies, M=8) --");
-    let (wall_n8, dev_n8) = measure(&mut gpu, 8, 896, 8);
-    let (wall_n896, dev_n896) = measure(&mut gpu, 8, 896, 896);
-    eprintln!("  N=8   (r=8, workgroups=64):   wall {wall_n8:.4} ms/op, device {dev_n8:.4} ms/op");
-    eprintln!(
-        "  N=896 (dense-equiv, workgroups=7168): wall {wall_n896:.4} ms/op, device {dev_n896:.4} ms/op"
-    );
-    let expected_linear_dev_n8 = dev_n896 * (64.0 / 7168.0);
-    eprintln!(
-        "  => DEVICE time only: N=8 is {dev_n8:.4} ms; pure-workgroup-count-linear scaling from N=896's \
-         {dev_n896:.4} ms would predict {expected_linear_dev_n8:.4} ms (dev_n896 * 64/7168) - measured is \
-         {:.2}x that prediction",
-        dev_n8 / expected_linear_dev_n8
-    );
 }
 
 #[test]
@@ -690,7 +360,8 @@ fn concat_n_gpu_matches_cpu() {
     )
     .unwrap();
     assert!(
-        matches!(plan, poot_graph_plan::Plan::Compute { .. }),
+        plan.single()
+            .is_some_and(|dispatch| dispatch.launch.meta.is_empty()),
         ">2-input concat must lower to a kernel, not the host fallback"
     );
     let mk = |off: f32, n: usize| -> Vec<f32> { (0..n).map(|i| i as f32 + off).collect() };
@@ -752,7 +423,8 @@ fn concat_n_rank4_axis2_gpu_matches_cpu() {
     )
     .unwrap();
     assert!(
-        matches!(plan, poot_graph_plan::Plan::Compute { .. }),
+        plan.single()
+            .is_some_and(|dispatch| dispatch.launch.meta.is_empty()),
         ">2-input concat must lower to a kernel"
     );
     let mut inputs = HashMap::new();
@@ -787,111 +459,492 @@ fn concat_n_rank4_axis2_gpu_matches_cpu() {
     }
 }
 
-#[test]
-fn indexed_matmul_gpu_matches_cpu() {
-    // The `IndexedMatMul` graph op (gather-free MoE GEMM) lowers on the GPU and matches the CPU oracle.
-    // out[m,n] = sum_k x[m,k] * W[idx[m],k,n]; the two rows route to experts 2 and 0, so each contracts against a different
-    // expert block. Tracer-emittable op, plan route and eager eval agree (one definition, both backends).
-    let _gpu_guard = gpu_lock();
-    let Some((mut gpu, target)) = open_engine_or_skip() else {
-        return;
+/// An `IndexedMatMul` fixture: `x [m, k] x W [e, k, n]` with row `r` reading expert `ids[r]`.
+struct IndexedCase {
+    name: &'static str,
+    m: usize,
+    k: usize,
+    n: usize,
+    e: usize,
+    ids: Vec<f32>,
+}
+
+/// Integer-valued fill in `[-3, 3]`: with `K * 3 * 3` far below `2^24` every partial sum is exact, so every
+/// summation order and every fused multiply-add gives the same bits and a wrong expert changes the value.
+fn int_fill(seed: u64, count: usize) -> Vec<f32> {
+    let mut s = seed.wrapping_add(0x9E37_79B9_7F4A_7C15) | 1;
+    (0..count)
+        .map(|_| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 33) % 7) as f32 - 3.0
+        })
+        .collect()
+}
+
+const INDEXED_EXPERTS: usize = 4;
+/// `K` is not a multiple of the 8-row tile and `N` not a multiple of its column edge, so the tail masks run.
+const INDEXED_K: usize = 36;
+const INDEXED_N: usize = 21;
+
+/// Sorted expert ids over `rows` rows, runs of unequal length so tile boundaries (every 8 rows) cut across
+/// expert boundaries.
+fn sorted_ids(rows: usize) -> Vec<f32> {
+    let bounds = [37, 78, 116];
+    (0..rows)
+        .map(|r| bounds.iter().filter(|&&b| r >= b).count() as f32)
+        .collect()
+}
+
+/// The same multiset in a deterministic shuffled order (stride 7 is coprime to 160).
+fn shuffled_ids(rows: usize) -> Vec<f32> {
+    let sorted = sorted_ids(rows);
+    (0..rows).map(|r| sorted[(r * 7) % rows]).collect()
+}
+
+/// One expert per 8-row tile: the fixture on which a walk that stops after its first step stays green.
+fn tile_aligned_ids(rows: usize) -> Vec<f32> {
+    (0..rows)
+        .map(|r| ((r / 8) % INDEXED_EXPERTS) as f32)
+        .collect()
+}
+
+fn indexed_cases() -> Vec<IndexedCase> {
+    let case = |name, m, ids: Vec<f32>| IndexedCase {
+        name,
+        m,
+        k: INDEXED_K,
+        n: INDEXED_N,
+        e: INDEXED_EXPERTS,
+        ids,
     };
-    let (e, m, k, n) = (3usize, 2usize, 4usize, 3usize);
+    vec![
+        case(
+            "decode, unsorted ids with a repeat",
+            5,
+            vec![2.0, 0.0, 3.0, 2.0, 1.0],
+        ),
+        case("prefill, sorted ids", 160, sorted_ids(160)),
+        case("prefill, shuffled ids", 160, shuffled_ids(160)),
+        case("prefill, one expert per tile", 160, tile_aligned_ids(160)),
+    ]
+}
+
+struct IndexedProgram {
+    graph: poot_graph_ir::Graph,
+    inputs: HashMap<poot_graph_ir::ValueId, HostTensor>,
+}
+
+/// `IndexedMatMul(x, w, ids)`, and with `gate` that product times `gate[m]` (the routed gate weighting), every
+/// operand a named const.
+fn indexed_program(case: &IndexedCase, gate: Option<Vec<f32>>) -> IndexedProgram {
+    let IndexedCase {
+        m, k, n, e, ids, ..
+    } = case;
+    let (m, k, n, e) = (*m, *k, *n, *e);
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![m, k]));
     let w = b.constant("w", TensorType::f32(vec![e, k, n]));
     let idx = b.constant("idx", TensorType::f32(vec![m]));
-    let out = b.indexed_matmul(x, w, idx);
-    let (xi, wi, ii) = (x.id, w.id, idx.id);
-    let g = b.finish(out);
-
-    let xd: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.3 - 1.0).collect();
-    let wd: Vec<f32> = (0..e * k * n).map(|i| (i as f32) * 0.07 - 1.0).collect();
-    let idxd: Vec<f32> = vec![2.0, 0.0];
     let mut inputs = HashMap::new();
-    inputs.insert(xi, HostTensor::f32(vec![m, k], xd));
-    inputs.insert(wi, HostTensor::f32(vec![e, k, n], wd));
-    inputs.insert(ii, HostTensor::f32(vec![m], idxd));
-
-    let eval_inputs: HashMap<_, Value> = inputs
-        .iter()
-        .map(|(&id, t)| (id, Value::from(t.clone())))
-        .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
-        .unwrap()
-        .output
-        .into_host()
-        .unwrap();
-    let got = run_via_contract(&mut gpu, target, &g, &inputs);
-    assert_eq!(got.shape(), vec![m, n]);
-    assert_eq!(got.shape(), cpu.shape());
-    for (i, (a, b)) in got
-        .as_f32()
-        .unwrap()
-        .iter()
-        .zip(cpu.as_f32().unwrap().iter())
-        .enumerate()
-    {
-        assert!(
-            (a - b).abs() < 1e-5,
-            "indexed_matmul elem {i}: gpu {a} vs cpu {b}"
-        );
+    inputs.insert(x.id, HostTensor::f32(vec![m, k], int_fill(1, m * k)));
+    inputs.insert(w.id, HostTensor::f32(vec![e, k, n], int_fill(2, e * k * n)));
+    inputs.insert(idx.id, HostTensor::f32(vec![m], ids.clone()));
+    let mut out = b.indexed_matmul(x, w, idx);
+    if let Some(gate) = gate {
+        let gate_t = b.constant("gate", TensorType::f32(vec![m]));
+        inputs.insert(gate_t.id, HostTensor::f32(vec![m], gate));
+        let column = b.reshape(gate_t, vec![m, 1]);
+        out = b.binary(poot_graph_ir::op::BinOp::Mul, out, column);
+    }
+    IndexedProgram {
+        graph: b.finish(out),
+        inputs,
     }
 }
 
+/// The CPU oracle over `program`.
+fn indexed_oracle(program: &IndexedProgram) -> Result<HostTensor, poot_eval::EvalError> {
+    let eval_inputs: HashMap<_, Value> = program
+        .inputs
+        .iter()
+        .map(|(&id, t)| (id, Value::from(t.clone())))
+        .collect();
+    eval(
+        &program.graph,
+        &eval_inputs,
+        EvalOptions::new(EvalBudget::UNBOUNDED),
+    )
+    .map(|evaluation| evaluation.output.into_host().unwrap())
+}
+
+fn bits(t: &HostTensor) -> Vec<u32> {
+    t.as_f32().unwrap().iter().map(|v| v.to_bits()).collect()
+}
+
+/// SC-001, SC-002: `IndexedMatMul` through `compile` equals the oracle `to_bits` on every element at a decode
+/// shape (`M = 5`, the Gemv) and at prefill shapes (`M = 160`, the segmented Tiled) whose tiles cross expert
+/// boundaries, with the ids sorted, shuffled and tile-aligned. A wrong expert changes a value by an integer, so
+/// the comparison is exact.
+///
+/// Mutation (`emit_row_slab`): read `ids[(m + 1) % M]`; every case goes red. Mutation (the segmented walk): stop
+/// after its first step; the two crossing cases go red and the tile-aligned case stays green (its tiles hold
+/// one expert each).
 #[test]
-fn indexed_gemv_lds_large_matches_cpu() {
-    // The indexed LDS-GEMV at a realistic K, exercising the K-loop, the LDS reduction and the per-row expert offset (the small
-    // `indexed_matmul_gpu_matches_cpu`, K=4, does not). Relative tolerance: the gemv reduces in a different order than eval's
-    // serial sum, so they agree to ~f32 reduction-order precision, not bit-exactly.
+fn indexed_matmul_matches_the_oracle_bit_for_bit() {
     let _gpu_guard = gpu_lock();
     let Some((mut gpu, target)) = open_engine_or_skip() else {
         return;
     };
-    let (e, m, k, n) = (4usize, 3usize, 256usize, 48usize);
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![m, k]));
-    let w = b.constant("w", TensorType::f32(vec![e, k, n]));
-    let idx = b.constant("idx", TensorType::f32(vec![m]));
-    let out = b.indexed_matmul(x, w, idx);
-    let (xi, wi, ii) = (x.id, w.id, idx.id);
-    let g = b.finish(out);
-
-    let xd: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32) * 0.05 - 0.3).collect();
-    let wd: Vec<f32> = (0..e * k * n)
-        .map(|i| ((i % 11) as f32) * 0.04 - 0.2)
-        .collect();
-    let idxd: Vec<f32> = vec![2.0, 0.0, 3.0]; // distinct experts, incl. the last
-    let mut inputs = HashMap::new();
-    inputs.insert(xi, HostTensor::f32(vec![m, k], xd));
-    inputs.insert(wi, HostTensor::f32(vec![e, k, n], wd));
-    inputs.insert(ii, HostTensor::f32(vec![m], idxd.clone()));
-
-    let eval_inputs: HashMap<_, Value> = inputs
-        .iter()
-        .map(|(&id, t)| (id, Value::from(t.clone())))
-        .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
-        .unwrap()
-        .output
-        .into_host()
-        .unwrap();
-    let got = run_via_contract(&mut gpu, target, &g, &inputs);
-    assert_eq!(got.shape(), vec![m, n]);
-    for (i, (a, b)) in got
-        .as_f32()
-        .unwrap()
-        .iter()
-        .zip(cpu.as_f32().unwrap().iter())
-        .enumerate()
-    {
-        assert!(
-            (a - b).abs() <= 1e-3 * b.abs() + 1e-4,
-            "indexed_gemv elem {i} (row {}, expert {}): gpu {a} vs cpu {b}",
-            i / n,
-            idxd[i / n]
-        );
+    let mut failures = Vec::new();
+    for case in indexed_cases() {
+        let program = indexed_program(&case, None);
+        let want = indexed_oracle(&program).unwrap();
+        let got = run_via_contract(&mut gpu, target, &program.graph, &program.inputs);
+        assert_eq!(got.shape(), vec![case.m, case.n], "{}", case.name);
+        let (got_bits, want_bits) = (bits(&got), bits(&want));
+        let wrong: Vec<usize> = (0..got_bits.len())
+            .filter(|&i| got_bits[i] != want_bits[i])
+            .collect();
+        if let Some(&first) = wrong.first() {
+            failures.push(format!(
+                "{}: {} of {} elements differ; row {} col {} is {} on the device, {} in the oracle",
+                case.name,
+                wrong.len(),
+                got_bits.len(),
+                first / case.n,
+                first % case.n,
+                f32::from_bits(got_bits[first]),
+                f32::from_bits(want_bits[first]),
+            ));
+        }
     }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// POOT-646 SC-001: experts held in checkpoint `[E, N, K]` order and read through `transpose(w, [0, 2, 1])` equal
+/// the oracle `to_bits` on every element (`E = 8`): `M = 1` and `M = 5` (the Gemv, ids unsorted with repeats) and a
+/// prefill shape (the segmented Tiled, shuffled ids). `compile` folds the transpose into the contraction.
+///
+/// Mutation (`weight_layout` in `planner/moe.rs`): return `WeightLayout::Kn` for the view; the weight is read as
+/// `[E, K, N]` and every case goes red.
+#[test]
+fn indexed_matmul_checkpoint_order_experts_match_the_oracle_bit_for_bit() {
+    let _gpu_guard = gpu_lock();
+    let Some((mut gpu, target)) = open_engine_or_skip() else {
+        return;
+    };
+    let (e, k, n) = (8usize, INDEXED_K, INDEXED_N);
+    let prefill: Vec<f32> = (0..160)
+        .map(|r| [7.0, 2.0, 2.0, 5.0, 0.0, 7.0, 3.0][(r * 5) % 7])
+        .collect();
+    let cases = [
+        ("M=1", vec![5.0]),
+        ("M=5, unsorted with repeats", vec![6.0, 0.0, 6.0, 3.0, 1.0]),
+        ("M=160, shuffled", prefill),
+    ];
+    let mut failures = Vec::new();
+    for (name, ids) in cases {
+        let m = ids.len();
+        let b = Builder::new();
+        let x = b.constant("x", TensorType::f32(vec![m, k]));
+        let w = b.constant("w", TensorType::f32(vec![e, n, k]));
+        let idx = b.constant("idx", TensorType::f32(vec![m]));
+        let mut inputs = HashMap::new();
+        inputs.insert(x.id, HostTensor::f32(vec![m, k], int_fill(1, m * k)));
+        inputs.insert(w.id, HostTensor::f32(vec![e, n, k], int_fill(2, e * n * k)));
+        inputs.insert(idx.id, HostTensor::f32(vec![m], ids));
+        let out = b.indexed_matmul(x, b.transpose(w, vec![0, 2, 1]), idx);
+        let program = IndexedProgram {
+            graph: b.finish(out),
+            inputs,
+        };
+        let want = indexed_oracle(&program).unwrap();
+        let got = run_via_contract(&mut gpu, target, &program.graph, &program.inputs);
+        let (got_bits, want_bits) = (bits(&got), bits(&want));
+        if let Some(first) = (0..got_bits.len()).find(|&i| got_bits[i] != want_bits[i]) {
+            failures.push(format!(
+                "{name}: row {} col {} is {} on the device, {} in the oracle",
+                first / n,
+                first % n,
+                f32::from_bits(got_bits[first]),
+                f32::from_bits(want_bits[first]),
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// SC-004: an expert id outside `0..E` or not an integer (`4`, `-1`, `NaN`, `1.5` with `E = 4`) makes its device
+/// output row NaN, never another expert's value, and every other row is exact. The oracle refuses the same ids
+/// with a typed error naming the id.
+///
+/// Mutation (`emit_row_slab`): drop the range flag; the `4` row reads a clamped expert and comes back finite.
+#[test]
+fn indexed_matmul_invalid_ids_write_nan_rows_and_the_oracle_refuses_them() {
+    use poot_eval::{EvalError, IndexFaultKind, IndexValue};
+    let _gpu_guard = gpu_lock();
+    let Some((mut gpu, target)) = open_engine_or_skip() else {
+        return;
+    };
+    let bad = [
+        (4.0f32, IndexFaultKind::OutOfRange),
+        (-1.0, IndexFaultKind::Negative),
+        (f32::NAN, IndexFaultKind::NotFinite),
+        (1.5, IndexFaultKind::NotIntegral),
+    ];
+    for (id, kind) in bad {
+        let case = IndexedCase {
+            name: "oracle",
+            m: 4,
+            k: INDEXED_K,
+            n: INDEXED_N,
+            e: INDEXED_EXPERTS,
+            ids: vec![id, 0.0, 1.0, 2.0],
+        };
+        let Err(EvalError::Index(fault)) = indexed_oracle(&indexed_program(&case, None)) else {
+            panic!("the oracle must refuse id {id}");
+        };
+        assert_eq!((fault.position, fault.len, fault.kind), (0, 4, kind));
+        match fault.value {
+            IndexValue::F32(v) => assert_eq!(v.to_bits(), id.to_bits()),
+            other => panic!("id {id} reported as {other:?}"),
+        }
+    }
+    let mut decode = vec![4.0, -1.0, f32::NAN, 1.5, 2.0, 0.0];
+    let mut prefill = shuffled_ids(160);
+    for (row, value) in [(3, 4.0), (17, -1.0), (64, f32::NAN), (159, 1.5)] {
+        prefill[row] = value;
+    }
+    for (name, ids) in [
+        ("decode", std::mem::take(&mut decode)),
+        ("prefill", prefill),
+    ] {
+        let case = IndexedCase {
+            name: "fail-closed",
+            m: ids.len(),
+            k: INDEXED_K,
+            n: INDEXED_N,
+            e: INDEXED_EXPERTS,
+            ids: ids.clone(),
+        };
+        // The oracle's values for the rows that have a valid id: the same program with the bad ids replaced.
+        let clean: Vec<f32> = ids
+            .iter()
+            .map(|&v| {
+                if (0.0..4.0).contains(&v) && v.fract() == 0.0 {
+                    v
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let want =
+            indexed_oracle(&indexed_program(&IndexedCase { ids: clean, ..case }, None)).unwrap();
+        let program = indexed_program(
+            &IndexedCase {
+                name: "fail-closed",
+                m: ids.len(),
+                k: INDEXED_K,
+                n: INDEXED_N,
+                e: INDEXED_EXPERTS,
+                ids: ids.clone(),
+            },
+            None,
+        );
+        let got = run_via_contract(&mut gpu, target, &program.graph, &program.inputs);
+        let (got, want) = (got.as_f32().unwrap(), want.as_f32().unwrap());
+        for (row, &id) in ids.iter().enumerate() {
+            let valid = (0.0..4.0).contains(&id) && id.fract() == 0.0;
+            for col in 0..INDEXED_N {
+                let i = row * INDEXED_N + col;
+                if valid {
+                    assert_eq!(
+                        got[i].to_bits(),
+                        want[i].to_bits(),
+                        "{name} row {row} col {col}"
+                    );
+                } else {
+                    assert!(
+                        got[i].is_nan(),
+                        "{name} row {row} (id {id}) col {col}: {}",
+                        got[i]
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// SC-005: a routed gate weighting runs as one `ContractionEpilogue` over the indexed contraction and its output
+/// equals the unfused program's (the routed-expert hang guard, one kernel per equation) bit for bit, and the
+/// oracle's, at a decode and a prefill shape.
+///
+/// Mutation (the epilogue's store index): index the epilogue by column instead of the flat output index; the
+/// per-row gate is read at the wrong row and the fused output goes red against the unfused one.
+#[test]
+fn routed_gate_weighting_fused_equals_unfused_bit_for_bit() {
+    let _gpu_guard = gpu_lock();
+    let Some((mut gpu, target)) = open_engine_or_skip() else {
+        return;
+    };
+    let Some(mut hung) = open_hung_engine_or_skip() else {
+        return;
+    };
+    for case in indexed_cases().into_iter().take(3) {
+        // Dyadic gates, so the product with an exact integer sum is exact in both programs.
+        let gate: Vec<f32> = (0..case.m)
+            .map(|r| [0.5, -2.0, 1.25, 3.0, -0.75][r % 5])
+            .collect();
+        let program = indexed_program(&case, Some(gate));
+        let run = |gpu: &mut dyn Executor, guarded| {
+            let (exe, entry) =
+                add_resident_entry_with(gpu, target, &program.graph, &program.inputs, guarded);
+            step_resident(gpu, exe, entry, &program.graph)
+        };
+        let fused = run(&mut gpu, false);
+        // The guarded program loads on an engine whose device reports the routed-expert hang.
+        let unfused = run(&mut hung, true);
+        let want = indexed_oracle(&program).unwrap();
+        assert_eq!(
+            bits(&fused),
+            bits(&unfused),
+            "{}: fused vs unfused",
+            case.name
+        );
+        assert_eq!(bits(&fused), bits(&want), "{}: fused vs oracle", case.name);
+    }
+}
+
+/// POOT-646: the routed gate weighting fused over checkpoint-order experts (`ContractionEpilogue { head: Indexed }`
+/// reading the `[E, N, K]` weight in place) equals the oracle `to_bits` (`E = 8`, a decode and a prefill shape).
+///
+/// Mutation: drop the `ContractionEpilogue` arm of `is_strided_capable`; the transpose runs as a copy, the plan
+/// row goes red, and this one stays green (the value is the same, only the copy returns).
+#[test]
+fn routed_gate_weighting_checkpoint_order_equals_the_oracle_bit_for_bit() {
+    let _gpu_guard = gpu_lock();
+    let Some((mut gpu, target)) = open_engine_or_skip() else {
+        return;
+    };
+    let (e, k, n) = (8usize, INDEXED_K, INDEXED_N);
+    for ids in [vec![6.0, 0.0, 6.0, 3.0, 1.0], shuffled_ids(160)] {
+        let m = ids.len();
+        let b = Builder::new();
+        let x = b.constant("x", TensorType::f32(vec![m, k]));
+        let w = b.constant("w", TensorType::f32(vec![e, n, k]));
+        let idx = b.constant("idx", TensorType::f32(vec![m]));
+        let gate_t = b.constant("gate", TensorType::f32(vec![m]));
+        let mut inputs = HashMap::new();
+        inputs.insert(x.id, HostTensor::f32(vec![m, k], int_fill(1, m * k)));
+        inputs.insert(w.id, HostTensor::f32(vec![e, n, k], int_fill(2, e * n * k)));
+        inputs.insert(idx.id, HostTensor::f32(vec![m], ids));
+        // Dyadic gates, so the product with an exact integer sum is exact.
+        let gate: Vec<f32> = (0..m)
+            .map(|r| [0.5, -2.0, 1.25, 3.0, -0.75][r % 5])
+            .collect();
+        inputs.insert(gate_t.id, HostTensor::f32(vec![m], gate));
+        let product = b.indexed_matmul(x, b.transpose(w, vec![0, 2, 1]), idx);
+        let out = b.binary(
+            poot_graph_ir::op::BinOp::Mul,
+            product,
+            b.reshape(gate_t, vec![m, 1]),
+        );
+        let program = IndexedProgram {
+            graph: b.finish(out),
+            inputs,
+        };
+        let want = indexed_oracle(&program).unwrap();
+        let got = run_via_contract(&mut gpu, target, &program.graph, &program.inputs);
+        assert_eq!(bits(&got), bits(&want), "M={m}");
+    }
+}
+
+/// POOT-1028: `IndexedMatMul` over a BF16-resident expert stack (a BF16 const, `[E, K, N]` or the checkpoint's
+/// `[E, N, K]` behind `transpose(w, [0, 2, 1])`; f32 activation and output) equals the oracle `to_bits` on every
+/// element, with and without the routed gate epilogue, at a decode shape (the Gemv) and a prefill shape whose tiles
+/// cross expert boundaries (the segmented Tiled). The fill is integer-valued, so each element is exactly a BF16 and
+/// the widened sums are exact in any order. The packed lanes are widened in-register: no f32 copy of the stack
+/// exists.
+///
+/// Mutation (`WeightLane::decode_low_half`, `poot-kernelgen/src/helpers.rs`): shift the BF16 bits by 15 instead of
+/// 16 when widening; every case goes red.
+#[test]
+fn indexed_matmul_bf16_experts_match_the_oracle_bit_for_bit() {
+    let _gpu_guard = gpu_lock();
+    let Some((mut gpu, target)) = open_engine_or_skip() else {
+        return;
+    };
+    let (e, k, n) = (8usize, INDEXED_K, INDEXED_N);
+    let decode = vec![6.0, 0.0, 6.0, 3.0, 1.0];
+    let prefill: Vec<f32> = (0..160)
+        .map(|r| [7.0, 2.0, 2.0, 5.0, 0.0, 7.0, 3.0][(r * 5) % 7])
+        .collect();
+    let mut failures = Vec::new();
+    for (name, ids) in [("M=5", decode), ("M=160, shuffled", prefill)] {
+        for checkpoint_order in [false, true] {
+            for gated in [false, true] {
+                let m = ids.len();
+                let b = Builder::new();
+                let x = b.constant("x", TensorType::f32(vec![m, k]));
+                let idx = b.constant("idx", TensorType::f32(vec![m]));
+                let stored = if checkpoint_order {
+                    vec![e, n, k]
+                } else {
+                    vec![e, k, n]
+                };
+                let w = b.constant(
+                    "w",
+                    TensorType::new(stored.clone(), poot_tensor::DType::BF16),
+                );
+                let mut inputs = HashMap::new();
+                inputs.insert(x.id, HostTensor::f32(vec![m, k], int_fill(1, m * k)));
+                inputs.insert(idx.id, HostTensor::f32(vec![m], ids.clone()));
+                let words = int_fill(2, e * k * n)
+                    .iter()
+                    .map(|v| (v.to_bits() >> 16) as u16)
+                    .collect();
+                inputs.insert(w.id, HostTensor::bf16(stored, words));
+                let weight = if checkpoint_order {
+                    b.transpose(w, vec![0, 2, 1])
+                } else {
+                    w
+                };
+                let mut out = b.indexed_matmul(x, weight, idx);
+                if gated {
+                    let gate_t = b.constant("gate", TensorType::f32(vec![m]));
+                    // Dyadic gates, so the product with an exact integer sum is exact.
+                    let gate: Vec<f32> = (0..m)
+                        .map(|r| [0.5, -2.0, 1.25, 3.0, -0.75][r % 5])
+                        .collect();
+                    inputs.insert(gate_t.id, HostTensor::f32(vec![m], gate));
+                    out = b.binary(
+                        poot_graph_ir::op::BinOp::Mul,
+                        out,
+                        b.reshape(gate_t, vec![m, 1]),
+                    );
+                }
+                let program = IndexedProgram {
+                    graph: b.finish(out),
+                    inputs,
+                };
+                let want = indexed_oracle(&program).unwrap();
+                let got = run_via_contract(&mut gpu, target, &program.graph, &program.inputs);
+                let (got_bits, want_bits) = (bits(&got), bits(&want));
+                if let Some(first) = (0..got_bits.len()).find(|&i| got_bits[i] != want_bits[i]) {
+                    failures.push(format!(
+                        "{name} nk={checkpoint_order} gate={gated}: row {} col {} is {} on the device, {} in the oracle",
+                        first / n,
+                        first % n,
+                        f32::from_bits(got_bits[first]),
+                        f32::from_bits(want_bits[first]),
+                    ));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 #[test]
@@ -952,11 +1005,11 @@ fn tiled_gemm_random_shapes_gpu_matches_cpu() {
     // 2-rows-per-lane coarsening) and the prefill workhorse; it had a real RADV miscompile (card 095), and its partial-tile
     // handling (row<M, col<N, k<K guards) is covered by one fixed shape. Fuzz random M/K/N (mostly partial tiles in all three
     // dims, under the 2^15-tile gate so the tiled path is taken, asserted via the compiled kernel choice) and require
-    // `gpu.run` == CPU eval. Half the seeds trace a bias linear, which `compile` fuses into `MatMulBias` and the planner
-    // lowers to the imported tiled GEMM with the bias epilogue; the other half are bare matmuls, which the planner lowers
-    // to the generated tiled GEMM (Card 557). Small well-conditioned values keep the f32 dot near-exact.
-    use poot_graph_ir::op::OpKind;
-    use poot_graph_plan::{CompileOptions, FusionPolicy, Plan, Submission, compile};
+    // `gpu.run` == CPU eval. Half the seeds trace a bias linear, whose add `compile` folds into the matmul as its
+    // epilogue; every matmul lowers to the generated tiled GEMM (Card 557). Small well-conditioned
+    // values keep the f32 dot near-exact.
+    use poot_graph_ir::op::{ContractionHead, OpKind};
+    use poot_graph_plan::{CompileOptions, Submission, compile};
     let _gpu_guard = gpu_lock();
     let Some((mut gpu, target)) = open_engine_or_skip() else {
         return;
@@ -1009,45 +1062,40 @@ fn tiled_gemm_random_shapes_gpu_matches_cpu() {
             &spirv_fixture_target(),
             &CompileOptions {
                 execution: Submission::Replay,
-                fusion: FusionPolicy::Full,
                 limits: poot_graph_plan::CompileLimits::STANDARD,
             },
         )
         .unwrap();
-        let (eqn, plan) = program
+        let (eqn, _) = program
             .planned()
-            .find(|(e, _)| matches!(e.op, OpKind::MatMul | OpKind::MatMulBias))
+            .find(|(e, _)| {
+                matches!(
+                    e.op,
+                    OpKind::MatMul
+                        | OpKind::ContractionEpilogue {
+                            head: ContractionHead::MatMul,
+                            ..
+                        }
+                )
+            })
             .unwrap();
         let choice = program.kernel_choice(eqn);
-        if with_bias {
-            assert!(
-                matches!(eqn.op, OpKind::MatMulBias),
-                "seed {seed}: compile should fuse the bias add into MatMulBias"
-            );
-            // The non-chunked imported tiled GEMM is dispatched as `ComputeMeta` (the `[M,K,N]` dims buffer).
-            match plan {
-                Plan::ComputeMeta { meta, .. } => assert_eq!(
-                    meta,
-                    &vec![m as u32, k as u32, n as u32, 0],
-                    "seed {seed}: dims [M,K,N]"
-                ),
-                _ => panic!("seed {seed}: non-chunked tiled GEMM should be a ComputeMeta plan"),
-            }
-            assert!(
-                is_tiled_gemm_kernel(choice),
-                "seed {seed} (M={m},K={k},N={n}): expected the imported tiled path, got {choice:?}"
-            );
-        } else {
-            assert!(
-                matches!(
-                    choice,
-                    KernelChoice::Generated(KernelRequest::Contraction(
-                        ContractionSpec::TiledRegion { .. }
-                    ))
-                ),
-                "seed {seed} (M={m},K={k},N={n}): expected the generated tiled path, got {choice:?}"
-            );
-        }
+        // The generated tiled GEMM carries the epilogue, so a traced bias add folds into it as one
+        // `ContractionEpilogue` and no standalone add remains (POOT-1036).
+        assert_eq!(
+            matches!(eqn.op, OpKind::ContractionEpilogue { .. }),
+            with_bias,
+            "seed {seed}: a tiled matmul fuses its bias add exactly when it has one"
+        );
+        assert!(
+            matches!(
+                choice,
+                KernelChoice::Generated(KernelRequest::Contraction(
+                    ContractionSpec::TiledRegion { .. }
+                ))
+            ),
+            "seed {seed} (M={m},K={k},N={n}): expected the generated tiled path, got {choice:?}"
+        );
         tiled_count += 1;
 
         let eval_inputs: HashMap<_, Value> = inputs
@@ -1164,9 +1212,8 @@ fn chunked_large_tiled_gemm_gpu_matches_cpu() {
     // Card 096: a tiled GEMM whose tile count crosses the RADV 2^15-workgroup miscompile threshold is dispatched as several
     // sub-2^15 chunks (each a baked-offset kernel variant covering a disjoint tile range) instead of the slow naive kernel.
     // M=544 (34 row-tiles, 2*GEMM_TILE=16 rows each) x N=8192 (1024 col-tiles, GEMM_TILE=8 cols each) = 34816 tiles > 32768
-    // -> 2 chunks. Assert the plan is ComputeChunks and `gpu.run == CPU eval` (the chunks reconstruct the full result).
+    // -> 2 chunks. Assert the plan is split and `gpu.run == CPU eval` (the chunks reconstruct the full result).
     use poot_graph_ir::op::OpKind;
-    use poot_graph_plan::Plan;
     use poot_target::Backend;
     let _gpu_guard = gpu_lock();
     let Some((mut gpu, target)) = open_engine_or_skip() else {
@@ -1183,17 +1230,14 @@ fn chunked_large_tiled_gemm_gpu_matches_cpu() {
         .iter()
         .find(|e| matches!(e.op, OpKind::MatMul))
         .unwrap();
-    let n_chunks = match plan_eqn_with_choice(
+    let (plan, _) = plan_eqn_with_choice(
         &g,
         eqn,
         Backend::SpirvVulkan,
         &poot_test_util::device_caps::default_caps_for(Backend::SpirvVulkan),
     )
-    .unwrap()
-    {
-        (Plan::ComputeChunks(c), _) => c.len(),
-        _ => panic!("expected a ComputeChunks plan for a 34816-tile GEMM"),
-    };
+    .unwrap();
+    let n_chunks = plan.dispatches().len();
     assert_eq!(n_chunks, 2, "34816 tiles / 32767-per-chunk = 2 chunks");
 
     let xd: Vec<f32> = (0..m * k).map(|i| ((i % 7) as f32) * 0.1 - 0.3).collect();
@@ -1244,7 +1288,6 @@ fn batched_tiled_gemm_random_shapes_gpu_matches_cpu() {
     // (under the 2^15-tile gate). Each asserts the kernel choice is the batched tiled GEMM (so the batched tiled kernel is under
     // test) and `gpu.run == CPU eval`.
     use poot_graph_ir::op::OpKind;
-    use poot_graph_plan::Plan;
     use poot_target::Backend;
     let _gpu_guard = gpu_lock();
     let Some((mut gpu, target)) = open_engine_or_skip() else {
@@ -1305,21 +1348,20 @@ fn batched_tiled_gemm_random_shapes_gpu_matches_cpu() {
             .iter()
             .find(|e| matches!(e.op, OpKind::MatMul))
             .unwrap();
-        // the batched-weight tiled GEMM is the imported kernel, dispatched as `ComputeMeta` (the `[E,M,K,N]` dims buffer) rather than a kernelgen `Compute`.
-        let choice = match plan_eqn_with_choice(
+        // the batched-weight tiled GEMM is the imported kernel, dispatched with a metadata buffer (the `[E,M,K,N]` dims buffer) rather than a kernelgen launch with none.
+        let (plan, choice) = plan_eqn_with_choice(
             &g,
             eqn,
             Backend::SpirvVulkan,
             &poot_test_util::device_caps::default_caps_for(Backend::SpirvVulkan),
         )
-        .unwrap()
-        {
-            (Plan::ComputeMeta { meta, .. }, choice) => {
-                assert_eq!(meta.len(), 4, "seed {seed}: batched dims [E,M,K,N]");
-                choice
+        .unwrap();
+        match single_meta(&plan) {
+            Some(meta @ [_, ..]) => {
+                assert_eq!(meta.len(), 4, "seed {seed}: batched dims [E,M,K,N]")
             }
-            _ => panic!("seed {seed}: batched tiled GEMM should be a ComputeMeta plan"),
-        };
+            _ => panic!("seed {seed}: batched tiled GEMM should be a metadata launch"),
+        }
         assert!(
             matches!(
                 choice,
@@ -1366,9 +1408,10 @@ fn batched_tiled_gemm_random_shapes_gpu_matches_cpu() {
 }
 
 #[test]
-fn tiled_gemm_bias_gpu_matches_cpu() {
-    // The tiled GEMM with the fused bias epilogue (`MatMulBias`, the q/k/v projections at M>1), formed by `compile` from a
-    // traced bias linear. Tile-unaligned (M=20, K=16, N=33): K is exactly one tile, M and N straddle.
+fn tiled_gemm_then_bias_add_gpu_matches_cpu() {
+    // The q/k/v projections at M>1: the generated tiled GEMM with the traced bias add folded in as its epilogue
+    // (POOT-1036). Tile-unaligned (M=20, K=16, N=33): K is
+    // exactly one tile, M and N straddle.
     let _gpu_guard = gpu_lock();
     let Some((mut gpu, target)) = open_engine_or_skip() else {
         return;
@@ -1382,11 +1425,17 @@ fn tiled_gemm_bias_gpu_matches_cpu() {
     let (xi, wi, bi) = (x.id, w.id, bias.id);
     let g = b.finish(out);
     let choice = compiled_choice(&g, &spirv_fixture_target(), |op| {
-        matches!(op, OpKind::MatMulBias)
+        matches!(
+            op,
+            OpKind::ContractionEpilogue {
+                head: poot_graph_ir::op::ContractionHead::MatMul,
+                ..
+            }
+        )
     });
     assert!(
-        leaf_choices(&choice).into_iter().all(is_tiled_gemm_kernel),
-        "the fused bias linear should take the imported tiled GEMM: {choice:?}"
+        is_generated_tiled_gemm(&choice),
+        "the bias linear's matmul should take the generated tiled GEMM: {choice:?}"
     );
 
     let xd: Vec<f32> = (0..m * k).map(|i| ((i % 9) as f32) * 0.05 - 0.2).collect();
@@ -1418,7 +1467,7 @@ fn tiled_gemm_bias_gpu_matches_cpu() {
     {
         assert!(
             (a - b).abs() < 1e-5,
-            "tiled_gemm_bias elem {i} (row {}, col {}): gpu {a} vs cpu {b}",
+            "tiled_gemm then bias add elem {i} (row {}, col {}): gpu {a} vs cpu {b}",
             i / n,
             i % n
         );
@@ -1539,11 +1588,10 @@ fn rank4_batched_tiled_gemm_gpu_matches_cpu() {
 #[test]
 fn nvptx_prefill_tiled_gemm_plan_selection() {
     // Card 557: the M>1 shared-weight F32 projection matmul takes the generated tiled GEMM (`kg::tiled_region`, a
-    // single `Plan::Compute`) on NVPTX as on wgpu. The chunked case (a large GEMM that would trip the RADV 2^15 cap on
-    // wgpu) stays a single dispatch on NVPTX: NVPTX has no cap, and the PTX executor `unreachable!`s on ComputeChunks.
+    // single dispatch) on NVPTX as on wgpu. The chunked case (a large GEMM that would trip the RADV 2^15 cap on
+    // wgpu) stays a single dispatch on NVPTX: NVPTX has no cap, and the PTX executor `unreachable!`s on split plans.
     // Pure planner test (no GPU).
     use poot_graph_ir::op::OpKind;
-    use poot_graph_plan::Plan;
     use poot_target::Backend;
     let plan_for = |m: usize, n: usize, backend| {
         let b = Builder::new();
@@ -1574,18 +1622,18 @@ fn nvptx_prefill_tiled_gemm_plan_selection() {
         )
     };
     assert!(
-        matches!(plan_for(8, 8, Backend::Nvptx), (Plan::Compute { .. }, choice) if is_tiled_region(&choice))
+        matches!(plan_for(8, 8, Backend::Nvptx), (plan_, choice) if single_meta(&plan_).is_some_and(|meta| meta.is_empty()) && is_tiled_region(&choice))
     );
     assert!(
-        matches!(plan_for(8, 8, Backend::SpirvVulkan), (Plan::Compute { .. }, choice) if is_tiled_region(&choice))
+        matches!(plan_for(8, 8, Backend::SpirvVulkan), (plan_, choice) if single_meta(&plan_).is_some_and(|meta| meta.is_empty()) && is_tiled_region(&choice))
     );
-    // a GEMM large enough to chunk on wgpu: ComputeChunks on SpirvVulkan, but a single Compute on NVPTX.
+    // a GEMM large enough to chunk on wgpu: split on SpirvVulkan, but a single dispatch on NVPTX.
     let big_n = 8 * 40_000; // groups = ceil(8/16)*ceil(N/8) = 1 * 40000 > 2^15 (RADV chunk threshold)
     assert!(matches!(
         plan_for(8, big_n, Backend::SpirvVulkan),
-        (Plan::ComputeChunks(_), KernelChoice::Chunked(_))
+        (plan, choice) if plan.dispatches().len() > 1 && is_tiled_region(&choice)
     ));
     assert!(
-        matches!(plan_for(8, big_n, Backend::Nvptx), (Plan::Compute { .. }, choice) if is_tiled_region(&choice))
+        matches!(plan_for(8, big_n, Backend::Nvptx), (plan_, choice) if single_meta(&plan_).is_some_and(|meta| meta.is_empty()) && is_tiled_region(&choice))
     );
 }

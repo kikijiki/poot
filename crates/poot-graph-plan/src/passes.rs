@@ -20,9 +20,10 @@ use poot_graph_ir::error::GraphValidationError;
 use poot_graph_ir::graph::StateRole;
 use poot_graph_ir::graph::{Eqn, Graph, Operand, Storage, ValidationChannel, ValueId, ValueMeta};
 use poot_graph_ir::op::{
-    BinOp, FusedOp, FusedOperand, FusedRegion, FusedStep, OpKind, RedOp, RowRegion, RowStep, UnOp,
+    BinOp, ContractionHead, FusedOp, FusedOperand, FusedRegion, FusedStep, OpKind, RedOp,
+    RowRegion, RowStep, UnOp,
 };
-use poot_graph_ir::types::Scalar;
+use poot_graph_ir::types::{Scalar, TensorType};
 use poot_tensor::DType;
 
 mod attention_match;
@@ -34,8 +35,10 @@ mod iota;
 mod legalize;
 mod packed;
 mod packed_bind;
+mod routed_experts;
 mod sample_token_large_vocab;
 mod stage_split;
+mod widen;
 
 pub(crate) use budget::GraphBudget;
 pub use legalize::{LegalizeError, legalize};
@@ -54,7 +57,7 @@ pub use dtype::collapse_reshape_chains;
 pub use dtype::elide_noop_transposes;
 #[cfg(any(test, feature = "test-support"))]
 pub use fuse::FUSABLE_FLOAT_UNARY_OPS;
-pub use fuse::{fuse, fuse_bias_epilogues};
+pub use fuse::{fuse, fuse_contraction_epilogues};
 pub use iota::fold_iota;
 #[cfg(any(test, feature = "test-support"))]
 pub use packed::PackedDequantErrorContext;
@@ -68,11 +71,13 @@ pub use packed_bind::{
     PackedBindError, PackedConst, PackedLayout, WeightFormats, WeightFormatsError,
     bind_packed_weights,
 };
+pub use routed_experts::{RoutedExpertSite, routed_expert_sites};
 pub use stage_split::BoundaryDescriptor;
 #[cfg(test)]
 pub(crate) use stage_split::{
     StageAssignment, StageSplitError, split_stages, split_stages_after_layers,
 };
+pub use widen::fuse_widening_casts;
 
 #[cfg(test)]
 pub(crate) use dtype::transpose_is_noop;
@@ -83,10 +88,13 @@ pub(crate) use dtype::transpose_is_noop;
 /// production path (`compile` is the pipeline, Card 626).
 #[cfg(any(test, feature = "test-support"))]
 pub fn passes_without_target<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
-    fuse(&fuse_bias_epilogues(&dce(&flash_attention_capped(
-        &rope_fusion(&fold_iota(&cse(&canonicalize(g)))),
-        Some(65_535),
-    ))))
+    fuse_widening_casts(&fuse(&fuse_contraction_epilogues(
+        &dce(&flash_attention_capped(
+            &rope_fusion(&fold_iota(&cse(&canonicalize(g)))),
+            Some(65_535),
+        )),
+        |_, _| true,
+    )))
 }
 
 #[cfg(test)]

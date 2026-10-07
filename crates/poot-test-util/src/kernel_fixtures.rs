@@ -18,9 +18,9 @@
 //! handful of dead fixtures.
 
 use poot_kernel_ir::{
-    BasicBlock, BinOp, BlockId, Body, Constant, Fp8Format, IndexAxis, Local, LocalDecl, Operand,
-    Place, ProjectionElem, Rvalue, Statement, SwitchTargets, Terminator, Ty, WmmaDtype, WmmaMat,
-    WmmaShape, WorkgroupLocalDecl,
+    BasicBlock, BinOp, BlockId, Body, Constant, Fp8Format, FragmentTy, IndexAxis, Local, LocalDecl,
+    Operand, Place, ProjectionElem, Rvalue, Statement, SwitchTargets, Terminator, Ty, WmmaDtype,
+    WmmaMat, WmmaShape, WorkgroupLocalDecl,
 };
 
 // --- small IR-builder primitives, duplicated from `poot_kernelgen`'s crate-private `helpers` module ---------
@@ -67,23 +67,19 @@ fn slice_f32(mutable: bool) -> Ty {
 
 // --- poot-kernel-ir Body fixtures (ex poot-kernel-ir/src/fixtures.rs) ---------------------------------------
 
-fn fp8_conversion_kernel(encode: bool) -> Body {
-    let (input_ty, output_ty) = if encode {
-        (Ty::F32, Ty::U32)
-    } else {
-        (Ty::U32, Ty::F32)
-    };
+/// Software fixture for `f32 -> E4M3FN byte`. Each output u32 carries one byte in its low lane.
+pub fn e4m3fn_encode_kernel() -> Body {
     let locals = vec![
         ld(Ty::Unit, false),
-        ld(slice_dtype(input_ty.clone(), false), false),
-        ld(slice_dtype(output_ty.clone(), true), true),
+        ld(slice_dtype(Ty::F32, false), false),
+        ld(slice_dtype(Ty::U32, true), true),
         ld(Ty::Usize, false),
         ld(Ty::Usize, false),
         ld(Ty::Bool, false),
-        ld(input_ty, false),
-        ld(output_ty, false),
+        ld(Ty::F32, false),
+        ld(Ty::U32, false),
     ];
-    let (input, output, i, len, in_bounds, source, converted) = (
+    let (input, output, i, len, in_bounds, source, encoded) = (
         local(1),
         local(2),
         local(3),
@@ -92,17 +88,6 @@ fn fp8_conversion_kernel(encode: bool) -> Body {
         local(6),
         local(7),
     );
-    let conversion = if encode {
-        Rvalue::Fp8Encode {
-            format: Fp8Format::E4M3Fn,
-            operand: copy(Place::local(source)),
-        }
-    } else {
-        Rvalue::Fp8Decode {
-            format: Fp8Format::E4M3Fn,
-            operand: copy(Place::local(source)),
-        }
-    };
     let blocks = vec![
         BasicBlock {
             statements: vec![],
@@ -125,8 +110,14 @@ fn fp8_conversion_kernel(encode: bool) -> Body {
         BasicBlock {
             statements: vec![
                 Statement::Assign(Place::local(source), Rvalue::Use(copy(elem(input, i)))),
-                Statement::Assign(Place::local(converted), conversion),
-                Statement::Assign(elem(output, i), Rvalue::Use(copy(Place::local(converted)))),
+                Statement::Assign(
+                    Place::local(encoded),
+                    Rvalue::Fp8Encode {
+                        format: Fp8Format::E4M3Fn,
+                        operand: copy(Place::local(source)),
+                    },
+                ),
+                Statement::Assign(elem(output, i), Rvalue::Use(copy(Place::local(encoded)))),
             ],
             terminator: Terminator::Return,
         },
@@ -135,26 +126,7 @@ fn fp8_conversion_kernel(encode: bool) -> Body {
             terminator: Terminator::Return,
         },
     ];
-    Body::new(
-        if encode {
-            "e4m3fn_encode"
-        } else {
-            "e4m3fn_decode"
-        },
-        2,
-        locals,
-        blocks,
-    )
-}
-
-/// Software fixture for `f32 -> E4M3FN byte`. Each output u32 carries one byte in its low lane.
-pub fn e4m3fn_encode_kernel() -> Body {
-    fp8_conversion_kernel(true)
-}
-
-/// Software fixture for `E4M3FN byte -> f32`. Each input u32 carries one byte in its low lane.
-pub fn e4m3fn_decode_kernel() -> Body {
-    fp8_conversion_kernel(false)
+    Body::new("e4m3fn_encode", 2, locals, blocks)
 }
 
 /// `vadd_loop(a: Slice<f32>, b: Slice<f32>, c: SliceMut<f32>)`:
@@ -694,10 +666,25 @@ pub fn workgroups_covering(body: &Body, threads: usize) -> [u32; 3] {
 
 // --- poot-kernelgen generators with no production caller ----------------------------------------------------
 
-/// f32 gather over axis 0 with an f32 index cast to usize internally. Thin wrapper over the still-pub,
-/// still-production-used [`poot_kernelgen::gather_axis0_index_dt`] with `index_dt = Ty::F32`.
+/// A gather of two rows of a four-row `[4, rest]` table in element type `dt`, with an f32 index cast to
+/// usize internally: [`poot_kernelgen::movement_body`] over a fixed shape, for the tests that compile or
+/// dump a representative body.
 pub fn gather_axis0_dt(name: &str, dt: Ty, rest: usize) -> Body {
-    poot_kernelgen::gather_axis0_index_dt(name, dt, Ty::F32, rest)
+    poot_kernelgen::movement_body(
+        name,
+        &poot_kernelgen::MovementSpec::new(
+            poot_kernelgen::Storage::Elements { carrier: dt },
+            vec![2, rest],
+            poot_kernelgen::MovementOp::Gather {
+                in_shape: vec![4, rest],
+                axis: 0,
+                index_dtype: Ty::F32,
+                index_numel: 2,
+            },
+        ),
+        None,
+    )
+    .expect("a two-row gather over a four-row table is a valid movement")
 }
 
 /// Workgroup-sum of the first `w` elements of `a` into `out[0]`, via LDS + a barrier. Each lane writes
@@ -1037,9 +1024,29 @@ pub fn wmma_tile(name: &str) -> Body {
         ld(slice_dtype(Ty::F16, false), false), // 2 b
         ld(slice_f32(true), true),              // 3 c (f32 out)
         ld(Ty::Usize, false),                   // 4 idx0
-        ld(Ty::F16, false),                     // 5 af (fragment handle, A)
-        ld(Ty::F16, false),                     // 6 bf (fragment handle, B)
-        ld(Ty::F32, false),                     // 7 acc (fragment handle, accumulator)
+        ld(
+            Ty::Fragment(FragmentTy::matrix(
+                WmmaMat::A,
+                WmmaDtype::F16,
+                WmmaShape::M16N16K16,
+            )),
+            false,
+        ), // 5 af
+        ld(
+            Ty::Fragment(FragmentTy::matrix(
+                WmmaMat::B,
+                WmmaDtype::F16,
+                WmmaShape::M16N16K16,
+            )),
+            false,
+        ), // 6 bf
+        ld(
+            Ty::Fragment(FragmentTy::accumulator(
+                WmmaDtype::F16,
+                WmmaShape::M16N16K16,
+            )),
+            false,
+        ), // 7 acc
     ];
     let (a, b, c) = (local(1), local(2), local(3));
     let (idx0, af, bf, acc) = (local(4), local(5), local(6), local(7));
@@ -1096,17 +1103,103 @@ pub fn wmma_tile(name: &str) -> Body {
     body
 }
 
+/// The textbook attention the generated kernel must equal, in `f64`: per `(b, h, i)`,
+/// `softmax(softcap(q . k * scale) + mask) @ v` over every key, in one pass over the whole row (no running
+/// maximum, no rescale). `q [B,Hq,Lq,D]`, `k` and `v [B,Hkv,Lk,D]`, `mask [B,Hm,Lq,Lk]`, GQA through
+/// `h / n_rep`. A masked score of `-inf` weighs exactly zero; a row with no finite score is `0 / 0`, NaN.
+/// The dense, every-key case of [`attention_reference_keys`].
+pub fn attention_reference(
+    spec: &poot_kernelgen::AttentionSpec,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    mask: &[f32],
+) -> Vec<f32> {
+    attention_reference_keys(spec, q, k, None, v, mask, None)
+}
+
+/// [`attention_reference`] over a split key (`k` the first `dk - s` channels of each key, `k_shared [B,1,Lk,s]`
+/// the last `s`, shared by every head) and a live bound (`len [B]`: batch row `b` visits only its first
+/// `clamp(len[b], 0, Lk)` keys, an empty row being `0 / 0`, NaN). `v` is `[B,Hkv,Lk,Dv]` and the output
+/// `[B,Hq,Lq,Dv]`. Keys past a row's bound are never read, so poison there cannot reach the result.
+pub fn attention_reference_keys(
+    spec: &poot_kernelgen::AttentionSpec,
+    q: &[f32],
+    k: &[f32],
+    k_shared: Option<&[f32]>,
+    v: &[f32],
+    mask: &[f32],
+    len: Option<&[i32]>,
+) -> Vec<f32> {
+    use poot_kernelgen::{KeyLayout, MaskKind, ScoreTransform};
+    let (hq, lq, lk, dk, dv) = (spec.hq, spec.lq, spec.lk, spec.dk, spec.dv);
+    let hkv = hq / spec.n_rep;
+    let shared_dim = match spec.key {
+        KeyLayout::Single => 0,
+        KeyLayout::Split { shared_dim } => shared_dim,
+    };
+    let head_dim = dk - shared_dim;
+    let mask_heads = match spec.mask {
+        MaskKind::Broadcast => 1,
+        MaskKind::PerHead => hq,
+    };
+    let (scale, softcap) = match spec.score {
+        ScoreTransform::Scale { scale_bits } => (f32::from_bits(scale_bits), None),
+        ScoreTransform::ScaleSoftcap {
+            scale_bits,
+            cap_bits,
+        } => (f32::from_bits(scale_bits), Some(f32::from_bits(cap_bits))),
+    };
+    let mut out = vec![0.0f32; spec.batch * hq * lq * dv];
+    for b in 0..spec.batch {
+        let keys = len.map_or(lk, |len| len[b].clamp(0, lk as i32) as usize);
+        for h in 0..hq {
+            let kv_row = (b * hkv + h / spec.n_rep) * lk;
+            let mask_plane = (b * mask_heads + if mask_heads == 1 { 0 } else { h }) * lq * lk;
+            for i in 0..lq {
+                let q_row = ((b * hq + h) * lq + i) * dk;
+                let scores: Vec<f64> = (0..keys)
+                    .map(|t| {
+                        let mut dot: f64 = (0..head_dim)
+                            .map(|c| {
+                                f64::from(q[q_row + c]) * f64::from(k[(kv_row + t) * head_dim + c])
+                            })
+                            .sum();
+                        if let Some(shared) = k_shared {
+                            let shared_row = (b * lk + t) * shared_dim;
+                            dot += (0..shared_dim)
+                                .map(|c| {
+                                    f64::from(q[q_row + head_dim + c])
+                                        * f64::from(shared[shared_row + c])
+                                })
+                                .sum::<f64>();
+                        }
+                        let mut score = dot * f64::from(scale);
+                        if let Some(cap) = softcap {
+                            score = f64::from(cap) * (score / f64::from(cap)).tanh();
+                        }
+                        score + f64::from(mask[mask_plane + i * lk + t])
+                    })
+                    .collect();
+                let top = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let weights: Vec<f64> = scores.iter().map(|s| (s - top).exp()).collect();
+                let denominator: f64 = weights.iter().sum();
+                let out_row = ((b * hq + h) * lq + i) * dv;
+                for c in 0..dv {
+                    let acc: f64 = (0..keys)
+                        .map(|t| weights[t] * f64::from(v[(kv_row + t) * dv + c]))
+                        .sum();
+                    out[out_row + c] = (acc / denominator) as f32;
+                }
+            }
+        }
+    }
+    out
+}
+
 // --- poot-codegen golden-IR helper (ex poot-codegen/src/emit.rs's public wrapper) ---------------------------
 
-/// `Body` -> target-shaped textual LLVM IR, discarding the `NoContraction` ordinals
-/// [`poot_codegen::emit_llvm_ir_marked`] returns alongside it: every caller here only inspects the IR text
-/// (golden-IR comparisons, `llc` round-trips), never the ordinals `compile_with` uses in production.
-pub fn emit_llvm_ir(
-    body: &Body,
-    target: poot_codegen::Target,
-) -> Result<String, poot_codegen::EmitError> {
-    Ok(poot_codegen::emit_llvm_ir_marked(body, target)?.0)
-}
+pub use poot_codegen::emit_llvm_ir;
 
 #[cfg(test)]
 mod tests {
@@ -1120,7 +1213,6 @@ mod tests {
     fn fixture_bodies_verify() {
         for body in [
             e4m3fn_encode_kernel(),
-            e4m3fn_decode_kernel(),
             vadd_loop_kernel(),
             gemv_loop_kernel(4, 8),
             square_kernel(),

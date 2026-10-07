@@ -13,7 +13,6 @@ pub mod gpt_oss;
 pub mod granite;
 pub mod llama;
 pub mod minimax_m2;
-pub mod mixtral;
 pub mod mpt;
 pub mod nemotron_h;
 pub mod olmo2;

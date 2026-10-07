@@ -61,10 +61,9 @@ is a typed refusal there. The three `Device` implementations are `poot-gpu`'s `W
 
 The `poot-llm` driver drives this contract on every backend: `Driver::new` loads a `ModelHandle`'s weights
 once (`WeightSource::Map`), and each step's entry comes from the family's `trace` for that step shape,
-compiled for the executor's target. The families not yet registered (mixture-of-experts and hybrid) still
-run on the Runner, whose `Runner::load_on` bakes its weights into the `WeightStore` that
-`Engine::load_weights` records and whose generation entries (`generate_kv_gpu_cached`,
-`generate_kv_gpu_cached_sampled`, `generate_kv_gpu_prefilled`, the VLM caption path) take the returned
+compiled for the executor's target. Every causal family that generates is registered and runs on the driver.
+The vision-language caption path still runs on the Runner, whose `Runner::load_on` bakes its weights into the
+`WeightStore` that `Engine::load_weights` records and whose caption entry takes the returned
 `ExecutableId` together with `&mut dyn Executor`. Greedy and plain-temperature generation (including top-k/top-p/min-p)
 pick the next token on-device: a sampling step is appended to the decode graph itself, and the host
 reads back only the chosen token id and a non-finite flag, not the full logits. A request with a
@@ -76,9 +75,9 @@ engine.
 ## Verification
 
 `poot-eval` is the CPU reference: one evaluation walk, `poot_eval::eval(&graph, &inputs, EvalOptions)`,
-which returns an `Evaluation` (primary output, carried state, optional environment). The Runner's
-CPU-oracle generation and the encoder embeddings/reranking server paths call it; GPU generation never
-does.
+which returns an `Evaluation` (primary output, carried state, optional environment). The driver's
+oracle checks, the vision-language caption path's CPU runs and the encoder embeddings/reranking server paths call it;
+GPU generation never does.
 The verification contract has three tiers; these are requirements, not a claim that every current
 path has complete coverage:
 

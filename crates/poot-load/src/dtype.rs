@@ -37,16 +37,22 @@ pub(crate) fn element_width_bytes(dtype: &str) -> Option<usize> {
 pub(crate) fn decode(dtype: &str, raw: &[u8]) -> Result<Vec<f32>, LoadError> {
     match parse_dtype(dtype)? {
         DType::F32 => Ok(raw
-            .chunks_exact(4)
-            .map(|c| f32::from_bits(u32::from_le_bytes(c.try_into().unwrap())))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_bits(u32::from_le_bytes(*c)))
             .collect()),
         DType::BF16 => Ok(raw
-            .chunks_exact(2)
-            .map(|c| scalar::bf16_to_f32(u16::from_le_bytes(c.try_into().unwrap())))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| scalar::bf16_to_f32(u16::from_le_bytes(*c)))
             .collect()),
         DType::F16 => Ok(raw
-            .chunks_exact(2)
-            .map(|c| scalar::f16_to_f32(u16::from_le_bytes(c.try_into().unwrap())))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| scalar::f16_to_f32(u16::from_le_bytes(*c)))
             .collect()),
         // FP8 E4M3 codes, unscaled: a quantized linear's codes and scale are packed together by
         // `safetensors::pack_quantized_linears` and decoded by `poot-quant`, never here.

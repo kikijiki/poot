@@ -29,7 +29,7 @@
 //! executor contract and `poot-graph-plan` read one weight identity without depending on the model
 //! families. [`WeightId::const_name`] is the one graph const name of a mapped weight.
 
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::collections::BTreeMap;
 use std::collections::btree_map;
 use std::fmt;
@@ -395,12 +395,21 @@ pub enum WeightRole {
     Attn(AttnRole),
     Ffn(FfnRole),
     Norm(NormRole),
+    Moe(MoeRole),
+    /// The multi-head latent attention projections beside [`AttnRole::Q`] and [`AttnRole::O`].
+    Mla(MlaRole),
+    /// A Mamba2 mixer's weights.
+    Mamba2(Mamba2Role),
+    /// The DeepSeek sparse-attention lightning indexer's weights.
+    Dsa(DsaRole),
     /// The bias of a model-level LayerNorm (the final norm's; a layer norm's bias is
     /// [`NormRole::AttnBias`] or [`NormRole::FfnBias`]).
     FinalNormBias,
     /// A LayerNorm over the embedded tokens, before the first layer (BLOOM), and its bias.
     EmbedNorm,
     EmbedNormBias,
+    /// The scalar a layer multiplies its output by (Gemma 4's `layer_scalar`), `[1]`.
+    LayerScale,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -421,6 +430,8 @@ pub enum AttnRole {
     /// it instead of `Q`/`K`/`V`.
     Qkv,
     QkvBias,
+    /// The per-query-head attention sink logits (gpt-oss), `[heads]`.
+    Sinks,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -431,6 +442,106 @@ pub enum FfnRole {
     /// The biases of a plain MLP's two projections.
     UpBias,
     DownBias,
+}
+
+/// The projection of a routed expert a weight holds. `GateUp` is the one fused gate and up projection
+/// a checkpoint stores as a single tensor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ExpertProj {
+    Gate,
+    Up,
+    GateUp,
+    Down,
+}
+
+impl ExpertProj {
+    const fn spelling(self) -> &'static str {
+        match self {
+            ExpertProj::Gate => "gate",
+            ExpertProj::Up => "up",
+            ExpertProj::GateUp => "gate_up",
+            ExpertProj::Down => "down",
+        }
+    }
+}
+
+/// The weights of a routed mixture-of-experts block. A dense checkpoint stores one projection of
+/// every expert as a stack ([`MoeRole::Stack`]); a packed one stores each expert's projection as
+/// its own packed weight ([`MoeRole::Expert`]), because a packed weight is one `[out, K]` matrix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MoeRole {
+    /// The router projection, `[experts, width]`.
+    Router,
+    /// The router's bias, `[experts]`.
+    RouterBias,
+    /// The scale on the router's normalized input, `[width]` (Gemma 4).
+    RouterScale,
+    /// The scale on each expert's routing weight, `[experts]` (Gemma 4's `per_expert_scale`).
+    ExpertScale,
+    /// One projection of every expert, dense: the stored stack `[experts, out, K]` /
+    /// `[experts, K, out]`, or per-expert tensors stacked into `[experts, out, K]`
+    /// ([`WeightView::ExpertStack`]).
+    Stack(ExpertProj),
+    /// One projection of one expert, packed: `[out, K]`.
+    Expert(ExpertProj, u32),
+    /// The bias of every expert's projection, `[experts, out]`.
+    StackBias(ExpertProj),
+    /// One projection of the always-active shared expert, `[out, K]`.
+    Shared(ExpertProj),
+}
+
+/// The weights of multi-head latent attention (DeepSeek). A plain query is [`AttnRole::Q`]; the
+/// output projection is [`AttnRole::O`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MlaRole {
+    /// The low-rank query's down projection `[q_lora_rank, width]`, its norm scale and its up
+    /// projection `[heads * (nope + rope), q_lora_rank]`.
+    QA,
+    QANorm,
+    QB,
+    /// The shared KV latent's down projection `[kv_lora_rank + rope, width]` and its norm scale.
+    KvA,
+    KvANorm,
+    /// HF's one up projection `[heads * (nope + v), kv_lora_rank]`, viewed per head in the graph.
+    KvB,
+    /// llama.cpp's split up projections, stored per head: the key's `[heads, kv_lora_rank, nope]`
+    /// and the value's `[heads, v, kv_lora_rank]`.
+    KB,
+    VB,
+}
+
+/// The weights of a Mamba2 mixer layer (Nemotron-H). The layer's pre-mixer norm is
+/// [`NormRole::Attn`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Mamba2Role {
+    /// The three row ranges of the fused input projection: the output gate `z`, the conv input
+    /// `xBC` and the timestep `dt`.
+    Z,
+    Xbc,
+    Dt,
+    DtBias,
+    /// The depthwise conv kernel `[K, channels]` and its bias.
+    Conv,
+    ConvBias,
+    /// `log(-A)` per head and the skip `D` per head.
+    ALog,
+    D,
+    /// The gated RMSNorm scale before the output projection, and the output projection.
+    GateNorm,
+    Out,
+}
+
+/// The lightning indexer of DeepSeek sparse attention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DsaRole {
+    /// The query projection from the low-rank query `[heads * dim, q_lora_rank]`.
+    Q,
+    /// The key projection `[dim, width]`, its LayerNorm scale and bias.
+    K,
+    KNorm,
+    KNormBias,
+    /// The per-head weights projection `[heads, width]`.
+    Weights,
 }
 
 /// The per-layer norms around a block (the model-level output norm is [`WeightRole::FinalNorm`]).
@@ -445,14 +556,50 @@ pub enum NormRole {
     /// The biases of a LayerNorm's [`NormRole::Attn`] and [`NormRole::Ffn`] scales.
     AttnBias,
     FfnBias,
+    /// The norm before a routed block that sits beside a dense feed-forward (Gemma 4's MoE
+    /// layers): the dense block reads [`NormRole::Ffn`], the routed experts read this one.
+    PreRouted,
+    /// The norms applied to the dense and the routed block's outputs before they are summed.
+    PostDense,
+    PostRouted,
 }
 
 impl WeightRole {
     /// The role's stable spelling inside [`WeightId::const_name`]. Written out per role, never
     /// derived from `Debug`: the name enters kernel caches and plan summaries, so renaming a variant
     /// must not silently rename a graph const.
-    pub const fn spelling(self) -> &'static str {
-        match self {
+    pub fn spelling(self) -> Cow<'static, str> {
+        Cow::Borrowed(match self {
+            WeightRole::Moe(role) => return role.spelling(),
+            WeightRole::Mla(role) => match role {
+                MlaRole::QA => "mla.q_a",
+                MlaRole::QANorm => "mla.q_a_norm",
+                MlaRole::QB => "mla.q_b",
+                MlaRole::KvA => "mla.kv_a",
+                MlaRole::KvANorm => "mla.kv_a_norm",
+                MlaRole::KvB => "mla.kv_b",
+                MlaRole::KB => "mla.k_b",
+                MlaRole::VB => "mla.v_b",
+            },
+            WeightRole::Mamba2(role) => match role {
+                Mamba2Role::Z => "mamba2.z",
+                Mamba2Role::Xbc => "mamba2.xbc",
+                Mamba2Role::Dt => "mamba2.dt",
+                Mamba2Role::DtBias => "mamba2.dt_bias",
+                Mamba2Role::Conv => "mamba2.conv",
+                Mamba2Role::ConvBias => "mamba2.conv_bias",
+                Mamba2Role::ALog => "mamba2.a_log",
+                Mamba2Role::D => "mamba2.d",
+                Mamba2Role::GateNorm => "mamba2.gate_norm",
+                Mamba2Role::Out => "mamba2.out",
+            },
+            WeightRole::Dsa(role) => match role {
+                DsaRole::Q => "dsa.q",
+                DsaRole::K => "dsa.k",
+                DsaRole::KNorm => "dsa.k_norm",
+                DsaRole::KNormBias => "dsa.k_norm_bias",
+                DsaRole::Weights => "dsa.weights",
+            },
             WeightRole::Embed => "embed",
             WeightRole::Head => "head",
             WeightRole::FinalNorm => "final_norm",
@@ -472,6 +619,7 @@ impl WeightRole {
                 AttnRole::OBias => "attn.o_bias",
                 AttnRole::Qkv => "attn.qkv",
                 AttnRole::QkvBias => "attn.qkv_bias",
+                AttnRole::Sinks => "attn.sinks",
             },
             WeightRole::Ffn(role) => match role {
                 FfnRole::Gate => "ffn.gate",
@@ -487,7 +635,28 @@ impl WeightRole {
                 NormRole::PostFfn => "norm.post_ffn",
                 NormRole::AttnBias => "norm.attn_bias",
                 NormRole::FfnBias => "norm.ffn_bias",
+                NormRole::PreRouted => "norm.pre_routed",
+                NormRole::PostDense => "norm.post_dense",
+                NormRole::PostRouted => "norm.post_routed",
             },
+            WeightRole::LayerScale => "layer_scale",
+        })
+    }
+}
+
+impl MoeRole {
+    fn spelling(self) -> Cow<'static, str> {
+        match self {
+            MoeRole::Router => Cow::Borrowed("moe.router"),
+            MoeRole::RouterBias => Cow::Borrowed("moe.router_bias"),
+            MoeRole::RouterScale => Cow::Borrowed("moe.router_scale"),
+            MoeRole::ExpertScale => Cow::Borrowed("moe.expert_scale"),
+            MoeRole::Stack(proj) => Cow::Owned(format!("moe.stack.{}", proj.spelling())),
+            MoeRole::Expert(proj, index) => {
+                Cow::Owned(format!("moe.expert{index}.{}", proj.spelling()))
+            }
+            MoeRole::StackBias(proj) => Cow::Owned(format!("moe.stack_bias.{}", proj.spelling())),
+            MoeRole::Shared(proj) => Cow::Owned(format!("moe.shared.{}", proj.spelling())),
         }
     }
 }
@@ -536,6 +705,10 @@ pub enum WeightView {
     /// Several entries stacked along the leading (row) axis, in order (split `gate`/`up`, expert
     /// stacks).
     RowStack(Vec<WeightKey>),
+    /// Dense entries of one dtype and shape stacked along a new leading axis, in order: the
+    /// `[experts, out, K]` stack of per-expert tensors. A packed weight is one `[out, K]` matrix and
+    /// is never stacked (each packed expert is its own weight).
+    ExpertStack(Vec<WeightKey>),
     /// A leading-axis row range of one entry (a slice of a fused `qkv`).
     RowRange {
         key: WeightKey,
@@ -604,6 +777,14 @@ pub enum WeightMapError {
         id: WeightId,
         source: Box<crate::PackedWeightError>,
     },
+    /// A [`WeightView::ExpertStack`] over an entry that is not dense, or whose dtype or shape differs
+    /// from the first part's.
+    NotStackable {
+        id: WeightId,
+        key: WeightKey,
+        first: Box<WeightHandle>,
+        other: Box<WeightHandle>,
+    },
 }
 
 impl fmt::Display for WeightMapError {
@@ -631,6 +812,15 @@ impl fmt::Display for WeightMapError {
                 "weight {id}: row-stack parts must share one format and row shape: {first:?} vs {other:?}"
             ),
             Self::Packed { id, source } => write!(f, "weight {id}: {source}"),
+            Self::NotStackable {
+                id,
+                key,
+                first,
+                other,
+            } => write!(
+                f,
+                "weight {id}: entry {key} cannot join an expert stack of {first:?}: it is {other:?}"
+            ),
         }
     }
 }
@@ -834,6 +1024,27 @@ fn view_handle(
                 }
             }
         }
+        WeightView::ExpertStack(parts) => {
+            let first_key = parts.first().ok_or(WeightMapError::EmptyStack { id })?;
+            let first = WeightHandle::of(stored(id, first_key, store)?);
+            for key in parts {
+                let other = WeightHandle::of(stored(id, key, store)?);
+                if !matches!(other.format, HandleFormat::Dense(_)) || other != first {
+                    return Err(WeightMapError::NotStackable {
+                        id,
+                        key: key.clone(),
+                        first: Box::new(first),
+                        other: Box::new(other),
+                    });
+                }
+            }
+            let mut shape = vec![parts.len()];
+            shape.extend_from_slice(&first.shape);
+            Ok(WeightHandle {
+                format: first.format,
+                shape,
+            })
+        }
     }
 }
 
@@ -909,6 +1120,24 @@ fn materialize_view(
                         .map_err(packed_error(id))
                 }
             }
+        }
+        WeightView::ExpertStack(parts) => {
+            // The handle checks every part is dense, of one dtype and one shape.
+            let handle = view_handle(id, view, store)?;
+            let HandleFormat::Dense(dtype) = handle.format else {
+                unreachable!("an expert stack handle is dense: view_handle refuses packed parts");
+            };
+            let mut bytes = Vec::new();
+            for key in parts {
+                if let WeightEntry::Dense(dense) = stored(id, key, store)? {
+                    bytes.extend_from_slice(dense.bytes().as_slice());
+                }
+            }
+            Ok(WeightEntry::Dense(DenseWeight {
+                dtype,
+                shape: handle.shape,
+                bytes: StoredBytes::new(Arc::from(bytes)),
+            }))
         }
     }
 }
@@ -1102,6 +1331,30 @@ mod tests {
             (
                 WeightId::layer(1, WeightRole::Norm(NormRole::FfnBias)),
                 "w.l1.norm.ffn_bias",
+            ),
+            (
+                WeightId::layer(1, WeightRole::Attn(AttnRole::Sinks)),
+                "w.l1.attn.sinks",
+            ),
+            (
+                WeightId::layer(2, WeightRole::Moe(MoeRole::Router)),
+                "w.l2.moe.router",
+            ),
+            (
+                WeightId::layer(2, WeightRole::Moe(MoeRole::RouterBias)),
+                "w.l2.moe.router_bias",
+            ),
+            (
+                WeightId::layer(2, WeightRole::Moe(MoeRole::Stack(ExpertProj::GateUp))),
+                "w.l2.moe.stack.gate_up",
+            ),
+            (
+                WeightId::layer(2, WeightRole::Moe(MoeRole::Expert(ExpertProj::Down, 7))),
+                "w.l2.moe.expert7.down",
+            ),
+            (
+                WeightId::layer(2, WeightRole::Moe(MoeRole::StackBias(ExpertProj::Up))),
+                "w.l2.moe.stack_bias.up",
             ),
             (
                 WeightId::layer(3, WeightRole::Attn(AttnRole::Q)),

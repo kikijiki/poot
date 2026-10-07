@@ -2,7 +2,7 @@
 //! of `pack_i8`, spec 048). Input is i32 words `[.., W]` with `W = ceil(len/4)`; output is f32 codes
 //! `[.., len]`. One thread per output code reads its word, extracts its byte, and sign-extends it via an
 //! arithmetic right shift (`(word << (24 - 8*lane)) >> 24`, the unpack the Q8_0 dequant uses). `len` rides
-//! in a `[len]` metadata buffer (`Plan::ComputeMeta`); `W = (len+3)/4` is derived in-kernel. Branchless.
+//! in a `[len]` metadata buffer (launch metadata); `W = (len+3)/4` is derived in-kernel. Branchless.
 //! card 044 / spec 055.
 
 #![crate_type = "lib"]

@@ -1,7 +1,7 @@
 //! SC-001, the large-grid row: a dispatch wider than wgpu's 65535-workgroup grid runs as the one 1-D
 //! dispatch the device's measured `DeviceCaps::max_grid` allows, and matches the CPU oracle.
 //!
-//! Flash prefill over `Hq * L = 512 * 130 = 66560` query groups (the staged `FlashAttentionPrefill`, as a
+//! Flash prefill over `Hq * L = 512 * 130 = 66560` query groups (the staged prefill `Attention`, as a
 //! pass would form it). The planner reads `caps.max_grid[0]` to choose between one 1-D launch and the 2-D
 //! fold, so this row holds only while the caps are the physical limit: it asserts the program really
 //! dispatches more than 65535 workgroups on x, then compares the output to `eval` of the same graph.
@@ -13,10 +13,10 @@
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
 use poot_executor::{Device, Engine, Executor};
 use poot_executor_parity::{ConstFixture, run_once};
-use poot_graph_ir::OpKind;
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::types::TensorType;
-use poot_graph_plan::{CompileLimits, CompileOptions, FusionPolicy, Plan, Submission, compile};
+use poot_graph_ir::{AttentionAttrs, OpKind};
+use poot_graph_plan::{CompileLimits, CompileOptions, Submission, compile};
 use poot_runtime_common::DeviceBackend;
 use poot_tensor::HostTensor;
 use poot_test_util::device_skip::open_or_skip;
@@ -52,11 +52,7 @@ fn flash_prefill_over_65535_workgroups_is_one_wide_dispatch_and_matches_the_orac
     let mut plan = b.append_plan(0);
     let o = plan
         .equation(
-            OpKind::FlashAttentionPrefill {
-                n_rep: 1,
-                scale,
-                softcap: None,
-            },
+            OpKind::Attention(AttentionAttrs::new(1, scale, None)),
             ids.map(poot_graph_ir::Operand::Value).to_vec(),
         )
         .expect("stage the flash prefill");
@@ -71,18 +67,16 @@ fn flash_prefill_over_65535_workgroups_is_one_wide_dispatch_and_matches_the_orac
         &target,
         &CompileOptions {
             execution: Submission::Replay,
-            fusion: FusionPolicy::Full,
             limits: CompileLimits::STANDARD,
         },
     )
     .expect("the flash prefill compiles for this device");
     let widest = program
         .planned()
-        .filter_map(|(_, plan)| match plan {
-            Plan::Compute { body, grid, .. } | Plan::ComputeMeta { body, grid, .. } => {
-                Some(grid[0].div_ceil(body.workgroup_size[0].max(1)))
-            }
-            _ => None,
+        .filter_map(|(_, plan)| {
+            plan.single().map(|dispatch| {
+                dispatch.launch.grid[0].div_ceil(dispatch.body.workgroup_size[0].max(1))
+            })
         })
         .max()
         .expect("the program dispatches a kernel");

@@ -2,8 +2,8 @@
 //! by the macro into `__poot_kernel_add`, which `pootc` discovers, imports, and compiles to a dispatchable
 //! SPIR-V module that runs on the GPU. The proc-macro artifact is wired in via `--extern`.
 
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeSet, HashMap};
 use std::env::consts::DLL_EXTENSION;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -112,9 +112,10 @@ fn build_proc_macro(device_pass: bool) -> PathBuf {
     library.clone()
 }
 
-/// Build `poot-kernel-intrinsics` from this checkout and return its rlib path: `add_macro.rs` calls
+/// Build `poot-kernel-intrinsics` from this checkout and return its `.rmeta` path (cargo builds rlibs without
+/// embedded metadata, so the metadata a `--crate-type lib` compile reads lives in the `.rmeta`): `add_macro.rs` calls
 /// `poot_kernel_intrinsics::thread_index` (card 531c), which needs `--extern` alongside the proc-macro.
-fn build_kernel_intrinsics_rlib() -> PathBuf {
+fn build_kernel_intrinsics_rmeta() -> PathBuf {
     let manifest_dir = manifest_dir();
     let mut checkout = DefaultHasher::new();
     manifest_dir.hash(&mut checkout);
@@ -149,11 +150,11 @@ fn build_kernel_intrinsics_rlib() -> PathBuf {
         .filter(|message| message["target"]["kind"] == serde_json::json!(["lib"]))
         .flat_map(|message| message["filenames"].as_array().cloned().unwrap_or_default())
         .filter_map(|name| name.as_str().map(PathBuf::from))
-        .filter(|path| path.extension().is_some_and(|ext| ext == "rlib"))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rmeta"))
         .collect();
     let [library] = libraries.as_slice() else {
         panic!(
-            "cargo reported {} rlibs for poot-kernel-intrinsics, wanted exactly one: {libraries:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            "cargo reported {} rmeta files for poot-kernel-intrinsics, wanted exactly one: {libraries:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
             libraries.len()
         );
     };
@@ -164,7 +165,7 @@ fn build_kernel_intrinsics_rlib() -> PathBuf {
 fn kernel_attribute_is_discovered_by_pootc() {
     let exe = PathBuf::from(pootc_exe());
     let pm = build_proc_macro(true); // device pass: the macro emits the renamed device fn
-    let intrinsics = build_kernel_intrinsics_rlib();
+    let intrinsics = build_kernel_intrinsics_rmeta();
 
     let kernel = manifest_path("tests/kernels/add_macro.rs");
     let out_dir = std::env::temp_dir().join("pootc-macro-add");
@@ -231,12 +232,13 @@ fn kernel_attribute_is_discovered_by_pootc() {
 
 /// Build `poot-runtime`, `poot-codegen` and `poot-kernel-ir` (with its `serde` feature) into an isolated
 /// scratch target directory, keyed like `build_proc_macro`'s (see its doc: a shared `deps/` can hand back
-/// another worktree's rlib for the same crate name), and return every rlib cargo reports, keyed by crate
-/// name. `--tests` also builds their dev-dependencies, since `serde_json` (needed by the generated
+/// another worktree's rlib for the same crate name), and return every rlib, rmeta and proc-macro library cargo reports, keyed
+/// by crate name (cargo builds rlibs without embedded metadata, so a dependent needs both: the `.rmeta`
+/// carries the metadata, the `.rlib` the code to link). `--tests` also builds their dev-dependencies, since `serde_json` (needed by the generated
 /// `poot_kernel_body`) is only a dev-dependency of `poot-runtime`/`poot-kernel-ir`, not a regular one. Card
 /// 608 host-pass probe below `--extern`-links its generated wrapper's
 /// `poot_runtime`/`poot_codegen`/`poot_kernel_ir`/`serde_json` (transitive) references against these.
-fn build_host_pass_rlibs() -> HashMap<String, PathBuf> {
+fn build_host_pass_rlibs() -> HashMap<String, Vec<PathBuf>> {
     let manifest_dir = manifest_dir();
     let mut checkout = DefaultHasher::new();
     manifest_dir.hash(&mut checkout);
@@ -283,9 +285,14 @@ fn build_host_pass_rlibs() -> HashMap<String, PathBuf> {
         };
         for file in files {
             if let Some(path) = file.as_str()
-                && path.ends_with(".rlib")
+                && ["rlib", "rmeta", DLL_EXTENSION]
+                    .iter()
+                    .any(|ext| Path::new(path).extension().is_some_and(|e| e == *ext))
             {
-                rlibs.insert(name.to_string(), PathBuf::from(path));
+                rlibs
+                    .entry(name.to_string())
+                    .or_insert_with(Vec::new)
+                    .push(PathBuf::from(path));
             }
         }
     }
@@ -318,7 +325,7 @@ fn host_pass_wrapper_dispatches_using_the_bodys_real_trap_and_schema() {
     // `kernel_attribute_is_discovered_by_pootc`. This test needs `poot_kernel_intrinsics` extern-linked only
     // for that pass (the device-renamed body still calls `thread_index`); the host-pass source below never
     // does.
-    let intrinsics = build_kernel_intrinsics_rlib();
+    let intrinsics = build_kernel_intrinsics_rmeta();
     let device_pass = Command::new(&exe)
         .args(["--edition", "2021", "--crate-type", "lib", kernel_src, "-o"])
         .arg(out_dir.join("add.out"))
@@ -396,34 +403,40 @@ fn main() {
     .expect("write the host-pass probe source");
 
     let rlibs = build_host_pass_rlibs();
-    let deps_dir = rlibs
-        .get("poot_runtime")
-        .expect("poot_runtime rlib reported by the host-pass probe build")
-        .parent()
-        .expect("an rlib path has a parent deps directory")
-        .to_path_buf();
+    // Cargo gives every unit its own output directory, so the transitive dependencies the `--extern`ed
+    // crates were built against (`serde`, `serde_core`, ...) are found only through a `-L` per directory.
+    let dependency_dirs: BTreeSet<&Path> = rlibs
+        .values()
+        .flatten()
+        .filter_map(|file| file.parent())
+        .collect();
     let bin_out = out_dir.join(format!("add_host{}", std::env::consts::EXE_SUFFIX));
     let mut host_pass = Command::new(&exe);
     host_pass
         .args(["--edition", "2021", "--crate-type", "bin", "-o"])
         .arg(&bin_out)
         .arg(&host_src)
-        .arg("-L")
-        .arg(format!("dependency={}", deps_dir.display()))
         .arg("--extern")
         .arg(format!("poot_kernel_attr={}", pm_host.display()));
+    for dir in dependency_dirs {
+        host_pass
+            .arg("-L")
+            .arg(format!("dependency={}", dir.display()));
+    }
     for name in [
         "poot_runtime",
         "poot_codegen",
         "poot_kernel_ir",
         "serde_json",
     ] {
-        let rlib = rlibs
+        let files = rlibs
             .get(name)
             .unwrap_or_else(|| panic!("{name} rlib reported by the host-pass probe build"));
-        host_pass
-            .arg("--extern")
-            .arg(format!("{name}={}", rlib.display()));
+        for file in files {
+            host_pass
+                .arg("--extern")
+                .arg(format!("{name}={}", file.display()));
+        }
     }
     let host_pass = host_pass.output().expect("run pootc (host pass)");
     assert!(

@@ -39,24 +39,25 @@ Today `poot-serve` serves encoder embeddings and reranking. `/v1/completions` an
 |                                                                                                  | wgpu                                                                             | ROCm                                                                                                                      | PTX                                                                                                                       |
 | ------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
 | Dense decoders (Qwen2/3, Llama, Mistral, Gemma 2/3, Granite, OLMo 2, Phi-3/4, SmolLM3, BLOOM, MPT)[^dense-driver] | <span class="matrix-status matrix-status--yes">Yes</span>                        | <span class="matrix-status matrix-status--yes">Yes</span>                                                                 | <span class="matrix-status matrix-status--yes">Yes</span>                                                                 |
-| Mixture-of-experts (Qwen3-MoE, GraniteMoE, Mixtral, OLMoE, gpt-oss)                              | <span class="matrix-status matrix-status--yes">Yes</span>                        | <span class="matrix-status matrix-status--yes">Yes</span>[^moe-rocm-ptx]                                                  | <span class="matrix-status matrix-status--yes">Yes</span>[^moe-rocm-ptx]                                                  |
-| DeepSeek-V2/V3 (multi-head latent attention)                                                     | <span class="matrix-status matrix-status--yes">Yes</span>                        | <span class="matrix-status matrix-status--yes">Yes</span>                                                                 | <span class="matrix-status matrix-status--yes">Yes</span>                                                                 |
+| Mixture-of-experts (Qwen3-MoE, Granite MoE, Mixtral, OLMoE, gpt-oss)                              | <span class="matrix-status matrix-status--yes">Yes</span>                        | <span class="matrix-status matrix-status--yes">Yes</span>[^moe-rocm-ptx]                                                  | <span class="matrix-status matrix-status--yes">Yes</span>[^moe-rocm-ptx]                                                  |
+| DeepSeek-V2/V3 (multi-head latent attention)                                                     | <span class="matrix-status matrix-status--yes">Yes</span> | <span class="matrix-status matrix-status--yes">Yes</span> | <span class="matrix-status matrix-status--yes">Yes</span> |
 | Qwen3-Next (hybrid linear-attention + MoE)                                                       | <span class="matrix-status matrix-status--no">No</span> (being restored)[^not-loadable]           | <span class="matrix-status matrix-status--no">No</span> (being restored)                                                                   | <span class="matrix-status matrix-status--no">No</span> (being restored)                                                                   |
-| Gemma 4 (dense and MoE)                                                                          | <span class="matrix-status matrix-status--no">No</span> (being restored)[^not-loadable]           | <span class="matrix-status matrix-status--no">No</span> (being restored)                                                                   | <span class="matrix-status matrix-status--no">No</span> (being restored)                                                                   |
+| Gemma 4 (dense and MoE text)                                                                     | <span class="matrix-status matrix-status--yes">Yes</span>                        | <span class="matrix-status matrix-status--partial">Partial</span>[^gemma4-moe] | <span class="matrix-status matrix-status--partial">Partial</span>[^gemma4-moe] |
 | BERT-class embeddings and cross-encoder reranking                                                | <span class="matrix-status matrix-status--yes">Yes</span>[^encoder-cpu]          | <span class="matrix-status matrix-status--yes">Yes</span>[^encoder-cpu]                                                   | <span class="matrix-status matrix-status--yes">Yes</span>[^encoder-cpu]                                                   |
 | SmolVLM / idefics3 (vision-language)                                                             | <span class="matrix-status matrix-status--yes">Yes</span>                        | <span class="matrix-status matrix-status--partial">Partial</span> (wgpu-verified; ROCm/PTX hardware verification pending) | <span class="matrix-status matrix-status--partial">Partial</span> (wgpu-verified; ROCm/PTX hardware verification pending) |
-| DeepSeek-V3.2 Sparse Attention (DSA)                                                             | <span class="matrix-status matrix-status--partial">Partial</span>[^synth-family] | <span class="matrix-status matrix-status--no">No</span>                                                                   | <span class="matrix-status matrix-status--no">No</span>                                                                   |
-| Nemotron-H (hybrid Mamba2 + attention)                                                           | <span class="matrix-status matrix-status--partial">Partial</span>[^synth-family] | <span class="matrix-status matrix-status--no">No</span>                                                                   | <span class="matrix-status matrix-status--no">No</span>                                                                   |
+| DeepSeek-V3.2 Sparse Attention (DSA)                                                             | <span class="matrix-status matrix-status--yes">Yes</span> | <span class="matrix-status matrix-status--yes">Yes</span> | <span class="matrix-status matrix-status--yes">Yes</span> |
+| Nemotron-H (hybrid Mamba2 + attention)                                                           | <span class="matrix-status matrix-status--yes">Yes</span> | <span class="matrix-status matrix-status--yes">Yes</span> | <span class="matrix-status matrix-status--yes">Yes</span> |
 | Qwen3.8 QSA                                                                                      | <span class="matrix-status matrix-status--no">No</span> (being restored)[^not-loadable]           | <span class="matrix-status matrix-status--no">No</span> (being restored)                                                                   | <span class="matrix-status matrix-status--no">No</span> (being restored)                                                                   |
 | DeepSeek-V4-Flash-0731 (routed MoE)                                                              | <span class="matrix-status matrix-status--no">No</span> (being restored)[^not-loadable]           | <span class="matrix-status matrix-status--no">No</span> (being restored)                                                                   | <span class="matrix-status matrix-status--no">No</span> (being restored)                                                                   |
-| MiniMax-M2.5 (packed-expert MoE)                                                                 | <span class="matrix-status matrix-status--no">No</span> (being restored)[^not-loadable]           | <span class="matrix-status matrix-status--no">No</span> (being restored)                                                                   | <span class="matrix-status matrix-status--no">No</span> (being restored)                                                                   |
+| MiniMax-M2 (sigmoid-router MoE)                                                                  | <span class="matrix-status matrix-status--partial">Partial</span>[^minimax-synth] | <span class="matrix-status matrix-status--partial">Partial</span>[^minimax-synth] | <span class="matrix-status matrix-status--partial">Partial</span>[^minimax-synth] |
 | GLM-5.3-Flash                                                                                    | <span class="matrix-status matrix-status--no">No</span> (being restored)[^not-loadable]           | <span class="matrix-status matrix-status--no">No</span> (being restored)                                                                   | <span class="matrix-status matrix-status--no">No</span> (being restored)                                                                   |
 | Qwen3.8-27B-FP8 (`qwen3_5` text tower)                                                           | <span class="matrix-status matrix-status--no">No</span> (being restored)[^not-loadable]           | <span class="matrix-status matrix-status--no">No</span> (being restored)                                                                   | <span class="matrix-status matrix-status--no">No</span> (being restored)                                                                   |
 
 [^dense-driver]:
-    The dense families load through the model registry (`ModelHandle::load`) and generate through the
-    driver; the other families in this table load through `Runner::load`. A Mixtral GGUF names the dense
-    `llama` architecture and does not load for now.
+    The dense, mixture-of-experts, MLA (DeepSeek-V2/V3/V3.2) and hybrid (Nemotron-H) families load through
+    the model registry (`ModelHandle::load`) and generate through the driver. A Mixtral GGUF names the
+    `llama` architecture and is the llama family with experts when its metadata has
+    `llama.expert_count`; a DeepSeek-V3 GGUF names `deepseek2` and loads as that family with sigmoid gating.
 
 [^encoder-cpu]:
     Embedding and cross-encoder reranking requests always run on the CPU evaluator, not on the selected
@@ -69,10 +70,15 @@ Today `poot-serve` serves encoder embeddings and reranking. `/v1/completions` an
     Mixtral/Qwen3-MoE's, test the specific architecture + backend combination you plan to run. Serving is
     being restored (see the caution above).
 
-[^synth-family]:
-    Bounded synthetic safetensors fixtures load through `Runner::load` and complete cached
-    single-sequence wgpu generation against the CPU oracle (logits, recurrent/cache tensors, greedy tokens).
-    This is not a real public-checkpoint claim and not HTTP/`poot-serve` continuous-batching support.
+[^gemma4-moe]:
+    The dense Gemma 4 text model generates the oracle's tokens through the driver on ROCm and PTX. On those two
+    backends a routed (MoE) graph compiles without the fused attention kernel, because of the routed-expert
+    guard the planner applies there; the Gemma 4 MoE tokens match the oracle, but the attention is not fused.
+
+[^minimax-synth]:
+    A synthetic MiniMax-M2 fixture loads through `ModelHandle::load` and generates through `Driver` on wgpu, ROCm and PTX, matching an
+    independent f64 reference (greedy tokens, first-step log-probabilities, the cached keys and values). No real public checkpoint has run, and
+    `poot-serve` continuous batching is not available for it.
 
 [^not-loadable]:
     `Runner::load` refuses this family with an unsupported-model error naming its architecture string. It is
@@ -85,8 +91,8 @@ The MoE models above run through their ordinary, unpooled decode paths, with eve
 weights resident.
 
 The former pooled-decode rows for DeepSeek-V3 and Gemma 4 MoE are removed from the Models table. DeepSeek-V3
-is covered by the DeepSeek-V2/V3 row, which is the unpooled decode path. Gemma 4 and Qwen3-Next have a row that
-says they are being restored.
+is covered by the DeepSeek-V2/V3 row, which is the unpooled decode path. Gemma 4 is covered by its own row (its
+vision and audio towers are not loaded). Qwen3-Next has a row that says it is being restored.
 
 [^serve-removed]:
     Generation serving is not available yet (poot is being refactored; planned to return). `/v1/completions` and `/v1/chat/completions` return a typed `503`
@@ -140,7 +146,7 @@ says they are being restored.
 | Prometheus metrics (`/metrics/prometheus`)                                                           | <span class="matrix-status matrix-status--yes">Yes</span>               | <span class="matrix-status matrix-status--yes">Yes</span>                             | <span class="matrix-status matrix-status--yes">Yes</span>               |
 
 [^device-sample]:
-    A `poot-llm` library capability (the driver, and the Runner for the families still on it), verified by
+    A `poot-llm` library capability (the driver), verified by
     test on real hardware for every backend: a sampling step is appended to the decode graph itself, and the host reads back only the chosen
     token id (and a non-finite flag), not the full logits, for greedy and plain-temperature (including
     top-k/top-p/min-p) requests. A request with a logit-bias/penalty, logprob recording, or a
@@ -164,9 +170,9 @@ says they are being restored.
 | On by default                                         | <span class="matrix-status matrix-status--yes">Yes</span>                             | <span class="matrix-status matrix-status--no">No</span> (`--features rocm`, `--backend rocm`) | <span class="matrix-status matrix-status--no">No</span> (`--backend ptx`)            |
 
 [^wgpu-coopmat]:
-    A narrowly-scoped SPIR-V cooperative-matrix primitive exists and is hardware-verified
-    (`K == 16` only, f32 output, weight operand only), but no model's matmul feeds it yet, so it is not on
-    the hot path for any model today.
+    A SPIR-V cooperative-matrix matmul exists and is hardware-verified on RDNA3.5 (f16 operands, f32 output,
+    16-aligned M/N/K, any batch; the accumulator is carried across K blocks), but no model's matmul feeds it
+    yet, so it is not on the hot path for any model today.
 
 [^megakernel-scope]:
     The implementation was removed. The strategy is planned as a recorder behind the one compiled
@@ -184,7 +190,7 @@ one device family.
 | Executor parity table                   | <span class="matrix-status matrix-status--yes">Yes</span> (the parity table and the backend-neutral coverage fixtures) |
 | Dense decoder, greedy decode            | <span class="matrix-status matrix-status--yes">Yes</span> (the registry's qwen2 fixture generates the same tokens as wgpu) |
 | Tensor-core matmul (cooperative matrix) | <span class="matrix-status matrix-status--yes">Yes</span> (needs `VK_KHR_cooperative_matrix` and subgroup-size control; verified RDNA3.5) |
-| Device-time profiling                   | <span class="matrix-status matrix-status--partial">Partial</span> (library only: `VulkanDevice::new_with_timing`; the device span runs from the first dispatch's start to the last dispatch's end, so it includes the fence waits between submissions, and a replay of more than 4096 dispatches reports no time) |
+| Device-time profiling                   | <span class="matrix-status matrix-status--no">No</span> (no typed timing mode constructs a raw Vulkan device yet) |
 | Multi-GPU / collectives                 | <span class="matrix-status matrix-status--no">No</span>                                            |
 | Serving                                 | <span class="matrix-status matrix-status--no">No</span> (being restored, see the caution above) |
 | Hardware verified                       | AMD Strix Halo iGPU under RADV only. NVIDIA and Intel Vulkan drivers are untested.                 |

@@ -1,6 +1,7 @@
 //! Linear-attention fuzz, hybrid model loops, decay masks, mamba2 block, layer-level decode-vs-prefill.
 
 use crate::{EvalBudget, EvalOptions, Value, eval};
+use poot_graph_ir::AttentionAttrs;
 use poot_graph_ir::builder::{Builder, Traced};
 use poot_graph_ir::graph::{Operand, StateRole};
 use poot_graph_ir::op::{BinOp, OpKind};
@@ -15,7 +16,7 @@ use std::collections::HashMap;
 use super::helpers::*;
 use poot_test_util::{assert_close_rel, max_abs_error, max_abs_error_f64};
 
-/// Stage one `FlashAttentionPrefill { softcap: None }` over `[q, k, v, mask]`. Card 557: `Builder` has no
+/// Stage one `Attention { softcap: None }` over `[q, k, v, mask]`. Card 557: `Builder` has no
 /// method for a composite (`compile`'s `flash_attention_capped` forms it from the traced chain), so a test
 /// of the op's own eval stages it through an append plan, as `e4m3_per_channel.rs` stages a
 /// `PackedContraction`.
@@ -28,17 +29,13 @@ fn stage_flash_prefill(
     let mut plan = b.append_plan(0);
     let out = plan
         .equation(
-            OpKind::FlashAttentionPrefill {
-                n_rep,
-                scale,
-                softcap: None,
-            },
+            OpKind::Attention(AttentionAttrs::new(n_rep, scale, None)),
             [q, k, v, mask]
                 .iter()
                 .map(|t| Operand::Value(t.id))
                 .collect(),
         )
-        .expect("stage FlashAttentionPrefill");
+        .expect("stage Attention");
     plan.declare_result(out).expect("declare result");
     let mut prepared = b.preflight_append(plan).expect("preflight append");
     Traced {
@@ -446,7 +443,8 @@ fn mamba2_ssd_prefill_matches_decode_loop() {
         let ap = bp.constant("a", TensorType::f32(vec![1, hq, 1, 1]));
         let dskp = bp.constant("d", TensorType::f32(vec![1, hq, 1, 1]));
         let trilp = bp.constant("tr", TensorType::f32(vec![1, hq, l, l]));
-        let (yp, h_outp) = mamba2_ssd_prefill(&bp, xp, binp, cinp, deltap, ap, dskp, trilp);
+        let h0p = bp.constant("h0", TensorType::f32(vec![1, hq, n, p]));
+        let (yp, h_outp) = mamba2_ssd_prefill(&bp, xp, binp, cinp, deltap, ap, dskp, h0p, trilp);
         let gy = bp.finish(yp);
         let mut gh = gy.clone();
         gh.output = h_outp.id;
@@ -501,6 +499,10 @@ fn mamba2_ssd_prefill_matches_decode_loop() {
         inp.insert(
             trilp.id,
             Value::from(HostTensor::f32(vec![1, hq, l, l], tril)),
+        );
+        inp.insert(
+            h0p.id,
+            Value::from(HostTensor::f32(vec![1, hq, n, p], vec![0.0; hq * n * p])),
         );
 
         let got_y_hm = eval(&gy, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -895,7 +897,7 @@ fn gated_linattn_recurrence(
 
 #[test]
 fn flash_prefill_matches_materialized_attention_prefill() {
-    // card 038: the fused flash-prefill op (FlashAttentionPrefill, online softmax, never materializing [1,Hq,L,L])
+    // card 038: the fused flash-prefill op (Attention, online softmax, never materializing [1,Hq,L,L])
     // must equal the materialized `attention_prefill` (softmax(scale*QK^T + mask) @ V), its definition.
     // Direct vs online softmax are different algorithms. Random Hkv / n_rep / D / L (multiple of the block), causal mask. 30 seeds.
     let mut s: u64 = 0xF1A5_4E11_2233_4455;
@@ -2063,4 +2065,92 @@ fn linear_attention_decode_loop_matches_prefill() {
         .into_host()
         .expect("linear_attention_hybrid tests evaluate dense graphs");
     assert_close_rel(&got, want.as_f32().unwrap(), 1e-4);
+}
+
+/// A `Delta * A` far below the f32 `exp` underflow point (`-150`, where `exp` is exactly `0`) leaves
+/// every cross-position decay at `0` and the output finite: only each position's own diagonal term, the
+/// skip and nothing from the carried seed survive. The prefix sum is formed from `Delta * A` itself, so
+/// no `log(0) = -inf` reaches the `tril` matmul (`0 * -inf` is NaN).
+///
+/// Mutation: form the prefix sum as `tril @ log(exp(Delta * A))` (the round trip); every output and the
+/// state go NaN and this row goes red.
+#[test]
+fn mamba2_ssd_prefill_stays_finite_when_delta_a_underflows_the_gate() {
+    use poot_graph_ir::ops::mamba2_ssd_prefill;
+    let (hq, l, n, p) = (1usize, 4usize, 2usize, 2usize);
+    let (delta, a, d_skip) = (50.0f32, -3.0f32, 0.5f32);
+    let x: Vec<f32> = (0..l * p).map(|i| 0.1 * (i as f32 + 1.0)).collect();
+    let b_in: Vec<f32> = (0..l * n).map(|i| 0.2 * (i as f32 - 3.0)).collect();
+    let c_in: Vec<f32> = (0..l * n).map(|i| 0.3 * (2.0 - i as f32)).collect();
+    let h0: Vec<f32> = (0..n * p).map(|i| 1.0 + i as f32).collect();
+    let mut tril = vec![0.0f32; l * l];
+    for t in 0..l {
+        for j in 0..=t {
+            tril[t * l + j] = 1.0;
+        }
+    }
+
+    let b = Builder::new();
+    let xs = b.constant("x", TensorType::f32(vec![1, hq, l, p]));
+    let bs = b.constant("b", TensorType::f32(vec![1, hq, l, n]));
+    let cs = b.constant("c", TensorType::f32(vec![1, hq, l, n]));
+    let dl = b.constant("dl", TensorType::f32(vec![1, hq, l, 1]));
+    let ap = b.constant("a", TensorType::f32(vec![1, hq, 1, 1]));
+    let dk = b.constant("d", TensorType::f32(vec![1, hq, 1, 1]));
+    let tr = b.constant("tr", TensorType::f32(vec![1, hq, l, l]));
+    let h = b.constant("h0", TensorType::f32(vec![1, hq, n, p]));
+    let (y, h_out) = mamba2_ssd_prefill(&b, xs, bs, cs, dl, ap, dk, h, tr);
+    let gy = b.finish(y);
+    let mut gh = gy.clone();
+    gh.output = h_out.id;
+
+    let mut inp = HashMap::new();
+    let mut put = |id, shape: Vec<usize>, data: Vec<f32>| {
+        inp.insert(id, Value::from(HostTensor::f32(shape, data)));
+    };
+    put(xs.id, vec![1, hq, l, p], x.clone());
+    put(bs.id, vec![1, hq, l, n], b_in.clone());
+    put(cs.id, vec![1, hq, l, n], c_in.clone());
+    put(dl.id, vec![1, hq, l, 1], vec![delta; l]);
+    put(ap.id, vec![1, hq, 1, 1], vec![a]);
+    put(dk.id, vec![1, hq, 1, 1], vec![d_skip]);
+    put(tr.id, vec![1, hq, l, l], tril);
+    put(h.id, vec![1, hq, n, p], h0);
+    let run = |g: &poot_graph_ir::Graph| {
+        eval(g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+            .unwrap()
+            .output
+            .into_host()
+            .unwrap()
+            .as_f32()
+            .unwrap()
+            .to_vec()
+    };
+    let (got_y, got_h) = (run(&gy), run(&gh));
+
+    // Every cross-position and seed decay is exactly 0, so each position sees only itself.
+    for t in 0..l {
+        let dot: f64 = (0..n)
+            .map(|k| f64::from(c_in[t * n + k]) * f64::from(delta) * f64::from(b_in[t * n + k]))
+            .sum();
+        for q in 0..p {
+            let want = dot * f64::from(x[t * p + q]) + f64::from(d_skip) * f64::from(x[t * p + q]);
+            assert!(
+                (f64::from(got_y[t * p + q]) - want).abs() < 1e-4,
+                "y[{t},{q}] = {} want {want}",
+                got_y[t * p + q]
+            );
+        }
+    }
+    for k in 0..n {
+        for q in 0..p {
+            let want =
+                f64::from(delta) * f64::from(b_in[(l - 1) * n + k]) * f64::from(x[(l - 1) * p + q]);
+            assert!(
+                (f64::from(got_h[k * p + q]) - want).abs() < 1e-4,
+                "h[{k},{q}] = {} want {want}",
+                got_h[k * p + q]
+            );
+        }
+    }
 }

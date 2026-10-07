@@ -1,179 +1,93 @@
-//! Attention equation planning: the kernel choice between the synthesized and imported flash
-//! decode/prefill kernels.
+//! Attention equation planning: one generated online-softmax kernel for every phase, its shape read from
+//! the equation and its lane count from the device.
 
 use super::*;
-use poot_target::{Backend, DeviceCaps, FLASH_LDS_CAP, FLASH_PREFILL_LDS_CAP};
+use poot_graph_ir::{AttentionAttrs, KeyLayout, KvBound, MaskOperand};
+use poot_kernelgen::{
+    AttentionSchedule, AttentionSpec, KeyBound, KeyLayout as KernelKeyLayout, MaskKind,
+    ScoreTransform,
+};
+use poot_target::{Backend, DeviceCaps};
 
-/// Plan one attention equation (FlashAttentionDecode/FlashAttentionPrefill) and record which kernel it
-/// takes.
-#[allow(clippy::too_many_arguments)]
+/// Plan one attention equation and record the kernel it takes.
+///
+/// `q[B,Hq,Lq,Dk]`, `k[B,Hkv,Lk,Dk]` (or its split parts), `v[B,Hkv,Lk,Dv]`, `mask[B,Hm,Lq,Lk]`: `Lq` and `Lk` are
+/// independent (decode `Lq == 1`, prefill `Lq == Lk`, prefill into a cache `1 < Lq < Lk`), and all are the same
+/// request. A live bound reads the `len [B]` operand at run time; the grid never depends on it. The streaming
+/// schedule runs one workgroup of `lanes` threads per `(b, h, i)`; `lanes` is the widest power of two whose
+/// partials fit the device's workgroup memory, and the equation is refused only when not even one lane's fit.
 pub(super) fn plan(
     g: GraphTables<'_>,
     eqn: &Eqn,
-    out_shape: &[usize],
     backend: Backend,
     caps: &DeviceCaps,
     limits: BodyLimits,
 ) -> Result<Planned, PlanError> {
-    let site = Site::new(g, eqn, backend, limits);
-    let shape = |vid: ValueId| g.aval(vid).shape.clone();
-    let ids = value_ids(eqn);
-    let planned = match &eqn.op {
-        OpKind::FlashAttentionDecode { n_rep, scale } => {
-            // out [B,Hq,1,D]; inputs q[B,Hq,1,D], k/v[B,Hkv,cap,D], mask[B,Hm,1,cap]. GQA + masked online
-            // softmax.
-            let bsz = out_shape[0];
-            let hq = out_shape[1];
-            let d = out_shape[out_shape.len() - 1];
-            let cap = shape(ids[1])[2];
-            let mask_per_head = flash_mask_per_head(&shape(ids[3]), hq, "flash decode")?;
-            if d <= FLASH_LDS_CAP {
-                // card 099d / spec 061, card 143 lever 1a: within the LDS cap the synthesizer generates
-                // the flash decode Body (LDS-cooperative online softmax, `kg::flash_region_decode`),
-                // batched (B>1, card 038) included: `B*Hq` workgroups of `flash_decode_width(d)` lanes
-                // each. Card 557 moved this choice here from the `flash_region_synth` retag pass.
-                Planned::generated(
-                    site,
-                    KernelRequest::Attention(AttentionSpec::RegionDecode {
-                        bsz,
-                        hq,
-                        n_rep: *n_rep,
-                        cap,
-                        d,
-                        scale_bits: scale.to_bits(),
-                        width: flash_decode_width(d),
-                        mask_per_head,
-                    }),
-                    backend,
-                    caps,
-                )?
-            } else if bsz > 1 {
-                // the kernelgen flash fallback (D > LDS cap) is single-sequence only; a batched decode with
-                // such a head dim is not a real config (head dims are <= 128). Reject clearly.
-                return Err(site.refuse(Capability::HeadDimExceedsLdsCap {
-                    head_dim: d,
-                    lds_cap: FLASH_LDS_CAP,
-                }));
-            } else {
-                // The kernelgen flash fallback (D > LDS cap) holds its running output in a private
-                // array: NVPTX is its intended target, and SPIR-V cannot state it (unimportable, and it
-                // crashes SPIR-V codegen: wgpu and the raw-Vulkan runtime both go through
-                // `Backend::SpirvVulkan`). `generate` reports that as `Unsupported`; it is refused here
-                // by name instead of emitting a kernel that hangs the GPU.
-                Planned::generated(
-                    site,
-                    KernelRequest::Attention(AttentionSpec::DecodeSingle {
-                        bsz,
-                        hq,
-                        n_rep: *n_rep,
-                        cap,
-                        d,
-                        scale_bits: scale.to_bits(),
-                        mask_per_head,
-                    }),
-                    backend,
-                    caps,
-                )
-                .map_err(|error| match error {
-                    PlanError::Refused(refusal)
-                        if matches!(
-                            refusal.missing,
-                            Capability::KernelGen(kg::KernelGenError::Unsupported { .. })
-                        ) =>
-                    {
-                        site.refuse(Capability::HeadDimExceedsLdsCap {
-                            head_dim: d,
-                            lds_cap: FLASH_LDS_CAP,
-                        })
-                    }
-                    other => other,
-                })?
-            }
-        }
-        OpKind::FlashAttentionPrefill {
-            n_rep,
-            scale,
-            softcap,
-        } => {
-            // out [1,Hq,L,D]; inputs q[1,Hq,L,D], k/v[1,Hkv,L,D], mask[1,Hm,L,L] (`infer` admits only a
-            // single sequence). GQA + masked online softmax, one workgroup per (head, query row): Hq*L
-            // workgroups laid over a 2-D grid, never materializing the [1,Hq,L,L] scores.
-            let hq = out_shape[1];
-            let l = out_shape[2];
-            let d = out_shape[out_shape.len() - 1];
-            let mask_per_head = flash_mask_per_head(&shape(ids[3]), hq, "flash prefill")?;
-            if d <= FLASH_PREFILL_LDS_CAP && softcap.is_none() {
-                // card 099d / spec 061: the synthesizer generates the flash prefill Body (online softmax,
-                // o[D] in LDS) via `kg::flash_region_prefill`. Its LDS `o[D]` scratch sizes dynamically to
-                // `d`, verified up to the separate, higher `FLASH_PREFILL_LDS_CAP` (512, card 185); the
-                // `x_groups` grid X width is baked into the kernel, so it is a plain Plan::Compute. Card
-                // 198: the generated body has no softcap, so a softcapped prefill takes the imported
-                // kernel below. Card 557 moved this choice here from the `flash_region_synth` retag pass.
-                Planned::generated(
-                    site,
-                    KernelRequest::Attention(AttentionSpec::RegionPrefill {
-                        hq,
-                        l,
-                        d,
-                        n_rep: *n_rep,
-                        scale_bits: scale.to_bits(),
-                        mask_per_head,
-                    }),
-                    backend,
-                    caps,
-                )?
-            } else {
-                // The imported kernel holds each (head,row)'s running output `o[D]` in a fixed
-                // 256-entry LDS array (`const LDS_SIZE: usize = 256` in `flash_prefill.rs`), so it runs
-                // on both backends but `D` must fit the shared FLASH_LDS_CAP (256), not
-                // FLASH_PREFILL_LDS_CAP. The kernel forms `gi = GroupY*x_groups + GroupX`, so `x_groups`
-                // (the 2-D grid X width, <= the wgpu 65535 gridDim.x cap) rides in the meta and
-                // long-context Hq*L spills onto Y, with no cap on context length on either backend.
-                if d > FLASH_LDS_CAP {
-                    return Err(site.refuse(Capability::HeadDimExceedsLdsCap {
-                        head_dim: d,
-                        lds_cap: FLASH_LDS_CAP,
-                    }));
-                }
-                let (x_groups, y_groups) = gemv_grid(hq * l, caps);
-                // Card 198: `has_softcap` + `cap_bits` ride as two extra meta words (indices 6-7); a
-                // `softcap: None` op gets `[0, 0]` (has_softcap=0), so the kernel skips the softcap
-                // branch.
-                let (has_softcap, cap_bits) = match softcap {
-                    Some(c) => (1u32, c.to_bits()),
-                    None => (0u32, 0u32),
-                };
-                Planned::imported(
-                    ImportedKernel::FlashPrefill,
-                    backend,
-                    Some(vec![
-                        hq as u32,
-                        l as u32,
-                        d as u32,
-                        *n_rep as u32,
-                        scale.to_bits(),
-                        x_groups as u32,
-                        has_softcap,
-                        cap_bits,
-                        // card 259: mask head stride in elements: 0 for the broadcast `[1,1,L,L]` mask
-                        // (`h*0 + row*L`), `L*L` for the per-head `[1,Hq,L,L]` ALiBi mask.
-                        if mask_per_head { (l * l) as u32 } else { 0 },
-                    ]),
-                    [x_groups as u32, y_groups as u32, 1],
-                )
-            }
-        }
-        OpKind::Iota { .. } => {
-            unreachable!("plan_eqn refuses an unfolded Iota before dispatching to a family")
-        }
-        imported_ops!()
-        | packed_ops!()
-        | moe_ops!()
-        | elementwise_ops!()
-        | matmul_ops!()
-        | cast_ops!()
-        | movement_ops!()
-        | sampling_ops!() => unreachable!("plan_eqn routes only attention ops here"),
+    let OpKind::Attention(AttentionAttrs {
+        n_rep,
+        scale,
+        softcap,
+        mask: MaskOperand::Additive,
+        key,
+        bound,
+    }) = &eqn.op
+    else {
+        unreachable!("plan_eqn routes only attention ops here")
     };
-    Ok(planned)
+    let site = Site::new(g, eqn, backend, limits);
+    let ids = value_ids(eqn);
+    let shape = |operand: usize| g.aval(ids[operand]).shape.clone();
+    let (q, k, v, mask) = (shape(0), shape(1), shape(2), shape(3));
+    let [batch, hq, lq, dk] = q[..] else {
+        unreachable!("`infer` types attention over a rank-4 query")
+    };
+    let lk = k[2];
+    let mask_kind = if flash_mask_per_head(&mask, hq, "attention")? {
+        MaskKind::PerHead
+    } else {
+        MaskKind::Broadcast
+    };
+    let dv = v[3];
+    let lanes = attention_lanes(dv, caps).ok_or_else(|| {
+        site.refuse(Capability::AttentionLds {
+            dv,
+            lds_bytes: caps.lds_bytes,
+        })
+    })?;
+    let score = match softcap {
+        None => ScoreTransform::Scale {
+            scale_bits: scale.to_bits(),
+        },
+        Some(cap) => ScoreTransform::ScaleSoftcap {
+            scale_bits: scale.to_bits(),
+            cap_bits: cap.to_bits(),
+        },
+    };
+    Planned::generated(
+        site,
+        KernelRequest::Attention(AttentionSpec {
+            batch,
+            hq,
+            n_rep: *n_rep,
+            lq,
+            lk,
+            dk,
+            dv,
+            key: match key {
+                KeyLayout::Single => KernelKeyLayout::Single,
+                KeyLayout::Split { shared_dim } => KernelKeyLayout::Split {
+                    shared_dim: *shared_dim,
+                },
+            },
+            score,
+            mask: mask_kind,
+            bound: match bound {
+                KvBound::Capacity => KeyBound::Static,
+                KvBound::Live => KeyBound::Live,
+            },
+            schedule: AttentionSchedule::Streaming { lanes },
+        }),
+        backend,
+        caps,
+    )
 }

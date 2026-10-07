@@ -3,9 +3,7 @@
 
 use poot_executor_parity::{Fixture, run_outputs};
 use poot_graph_ir::{Builder, OpKind, Slot, TensorType};
-use poot_graph_plan::{
-    CompileLimits, CompileOptions, FusionPolicy, KernelChoice, Submission, Target, compile,
-};
+use poot_graph_plan::{CompileLimits, CompileOptions, KernelChoice, Submission, Target, compile};
 use poot_kernelgen::{ContractionSpec, KernelRequest, Schedule};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::{DType, HostTensor};
@@ -96,7 +94,7 @@ fn gemv_case(dtype: DType, k: usize, n: usize) -> GemvCase {
             graph,
             store: builder.build(),
             steps,
-            fusion: FusionPolicy::Full,
+            guarded: false,
         },
         activation,
         held,
@@ -107,7 +105,6 @@ fn gemv_case(dtype: DType, k: usize, n: usize) -> GemvCase {
 
 const OPTIONS: CompileOptions = CompileOptions {
     execution: Submission::Replay,
-    fusion: FusionPolicy::Full,
     limits: CompileLimits::STANDARD,
 };
 
@@ -218,7 +215,7 @@ fn attention_gemv_case(hq: usize, cap: usize, d: usize) -> (Fixture, Vec<f32>, V
         graph,
         store: builder.build(),
         steps,
-        fusion: FusionPolicy::Full,
+        guarded: false,
     };
     (fixture, scores, values)
 }
@@ -258,12 +255,14 @@ fn a_contraction_keeps_its_lds_width_through_the_planner_on_wgpu() {
         "{:?}",
         program.kernel_choice(eqn)
     );
-    let (poot_graph_plan::Plan::Compute { body, .. }
-    | poot_graph_plan::Plan::ComputeMeta { body, .. }) = plan
-    else {
+    let Some(dispatch) = plan.single() else {
         panic!("a single dispatch: {plan:?}");
     };
-    assert_eq!(body.workgroup_size, [128, 1, 1], "the baked LDS width");
+    assert_eq!(
+        dispatch.body.workgroup_size,
+        [128, 1, 1],
+        "the baked LDS width"
+    );
     let outputs = run_outputs(exec.as_mut(), target, &fixture).unwrap_or_else(|e| panic!("{e}"));
     let got = outputs[0].as_f32().expect("f32 output");
     assert_eq!(got.len(), hq * d);

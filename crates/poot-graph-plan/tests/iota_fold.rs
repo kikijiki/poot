@@ -91,3 +91,47 @@ fn iota_matches_the_bound_range_oracle_and_folds_to_the_same_values() {
         "the folded computed constant must materialize the same [0..6) range (v{folded_value})"
     );
 }
+
+/// POOT-1040: the exact I32 iota evaluates to the integer range on the oracle, folds to a computed constant
+/// that materializes the identical I32 words, and an F32 range past 2^24 (not exact) is a typed shape error
+/// while the same I32 length is not. Mutation: build the I32 constant through `values_f32` (F32 tensor);
+/// the dtype assertion fails.
+#[test]
+fn the_i32_iota_is_exact_through_the_oracle_and_the_folded_constant() {
+    let b = Builder::new();
+    let out = b.iota_i32(6);
+    let graph = b.finish(out);
+    let run = |g: &poot_graph_ir::Graph| {
+        eval(g, &HashMap::new(), EvalOptions::new(EvalBudget::UNBOUNDED))
+            .expect("oracle eval")
+            .output
+            .into_host()
+            .expect("dense oracle output")
+    };
+    let direct = run(&graph);
+    assert_eq!(direct.dtype(), DType::I32);
+    assert_eq!(direct.as_i32().unwrap(), &[0, 1, 2, 3, 4, 5]);
+    let folded = run(&fold_iota(&graph));
+    assert_eq!(folded.dtype(), DType::I32);
+    assert_eq!(folded.as_i32().unwrap(), direct.as_i32().unwrap());
+
+    let beyond_f32 = OpKind::Iota {
+        len: (1 << 24) + 1,
+        dtype: DType::F32,
+    };
+    assert!(
+        matches!(
+            beyond_f32.infer(&[]),
+            Err(poot_graph_ir::ShapeError::IotaRange { .. })
+        ),
+        "an F32 iota past 2^24 is not an exact range"
+    );
+    let exact_i32 = OpKind::Iota {
+        len: (1 << 24) + 1,
+        dtype: DType::I32,
+    };
+    assert_eq!(
+        exact_i32.infer(&[]).unwrap(),
+        TensorType::new(vec![(1 << 24) + 1], DType::I32)
+    );
+}

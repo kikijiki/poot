@@ -23,7 +23,8 @@ use poot_tensor::DType;
 use std::collections::HashMap;
 
 use poot_graph_ir::op::{
-    BinOp as GBinOp, FusedOp, FusedOperand, OpKind, RedOp, RowStep, UnOp as GUnOp,
+    BinOp as GBinOp, ContractionHead, FusedOp, FusedOperand, FusedRegion, OpKind, RedOp, RowStep,
+    UnOp as GUnOp,
 };
 
 #[cfg(test)]
@@ -36,9 +37,9 @@ use poot_kernel_ir::{BinOp, Body, MathOp, Ty, UnOp};
 
 use poot_kernelgen as kg;
 use poot_kernelgen::{
-    AttentionSpec, CastSpec, ContractionSpec, E4m3Movement, ElementwiseSpec, I32Binary,
-    KernelRequest, MatmulShapes, MovementSpec, PackedRequest, PointwiseForm, PointwiseSpec,
-    RopeSpec, RowSpec, TopKSpec, UnaryOp, ValueBinary, ViewOperand, WeightLayout,
+    CastSpec, ContractionSpec, ElementwiseSpec, I32Binary, KernelRequest, MatmulShapes,
+    PackedRequest, PointwiseForm, PointwiseSpec, RopeSpec, RowSpec, TopKSpec, UnaryOp, ValueBinary,
+    ViewOperand, WeightLayout,
 };
 
 // `Layout` (strided views, spec 132) is defined in poot-kernelgen, the lower crate the generated kernel
@@ -50,7 +51,7 @@ pub use poot_kernelgen::Layout;
 pub mod device_validation;
 
 /// Card 235: the widen-mismatched-matmul-operand-dtype graph transform + the tensor-core eligibility
-/// predicate it shares with `plan_eqn`'s `OpKind::MatMul`/`MatMulBias` arms (single source of truth).
+/// predicate it shares with `plan_eqn`'s `OpKind::MatMul` arm (single source of truth).
 pub mod dtype_widen;
 
 /// Card 360: packed multi-device topology and communication planner (planner half only - see
@@ -74,7 +75,7 @@ pub mod staged;
 
 /// The one kernel-authoring route and asset manifest (card 559): `ImportedKernel::X.body()` for every
 /// kernel authored in Rust and shipped as a committed asset, plus the row-major/broadcast/index-remap
-/// geometry helpers that build the `Plan::ComputeMeta` buffers these kernels read their dims from.
+/// geometry helpers that build the launch metadata buffers these kernels read their dims from.
 mod imported;
 
 /// The strided-view promotion pass (`compute_views`, spec 132) and the dispatch predicates + launch-grid
@@ -82,7 +83,7 @@ mod imported;
 mod predicates;
 
 /// The small pub types every caller matches on: [`Backend`], [`Plan`], [`PlanError`], [`CollectiveKind`],
-/// [`ComputeChunk`].
+/// [`Dispatch`].
 mod types;
 
 /// Buffer-plan lifetimes and arena slots: allocation follows the buffer plan, not one buffer per
@@ -125,11 +126,6 @@ pub use types::*;
 // the `probe` family's kernels are each consumed by a different crate (`poot-rocm-gpu`'s `Device::copy`
 // and executor-contract fixtures, `poot-gpu`'s importer-capability probes), through this one accessor.
 pub use imported::{AssetDest, AssetEntry, ImportedKernel, MANIFEST};
-// The `Plan::ComputeMeta` geometry helpers stay `pub(crate)`; this brings them into the crate-root
-// namespace so every planner/predicates call site's `use crate::*` sees them.
-pub(crate) use imported::{
-    broadcast_eff_strides, concat2_meta, dus_meta, index_remap_meta, row_major_strides,
-};
 
 mod compile;
 mod graph_validation;
@@ -146,8 +142,8 @@ pub use compile::*;
 pub use graph_validation::*;
 pub(crate) use kernel_mapping::*;
 pub use passes::{
-    BoundaryDescriptor, PackedBindError, PackedConst, PackedLayout, WeightFormats,
-    WeightFormatsError, bind_packed_weights,
+    BoundaryDescriptor, PackedBindError, PackedConst, PackedLayout, RoutedExpertSite,
+    WeightFormats, WeightFormatsError, bind_packed_weights, routed_expert_sites,
 };
 // `poot-llm`'s CPU oracle (`core/cpu_oracle.rs`) claims a traced graph's packed contractions/row
 // gathers the same way `compile` does, so its eval matches what the device plans - a real production
@@ -166,8 +162,9 @@ pub use passes::{
     FUSABLE_FLOAT_UNARY_OPS, LegalizeError, PackedDequantErrorContext,
     PackedDequantProductionError, canonicalize, canonicalize_with_declines,
     collapse_reshape_chains, cse, dce, dce_with_roots, decompose_large_vocab_greedy,
-    elide_noop_transposes, flash_attention_capped, fold_iota, fuse, fuse_bias_epilogues, legalize,
-    passes_without_target, reject_packed_dequant_escapes, rope_fusion,
+    elide_noop_transposes, flash_attention_capped, fold_iota, fuse, fuse_contraction_epilogues,
+    fuse_widening_casts, legalize, passes_without_target, reject_packed_dequant_escapes,
+    rope_fusion,
 };
 #[cfg(test)]
 pub(crate) use passes::{StageAssignment, split_stages, split_stages_after_layers};

@@ -232,6 +232,11 @@ impl RocmContext {
         )?;
         let request = queue_request(plan, max_size);
         let mut queue: *mut hsa_queue_t = std::ptr::null_mut();
+        // No error callback: ROCr 7.2.3 serves a COOPERATIVE queue from the agent's internal GWS queue
+        // (`GpuAgent::InitGWS`), created with `core::Queue::DefaultErrorHandler`, so a callback passed
+        // here is never invoked (measured, POOT-1039). On a queue fault that handler prints `Queue at
+        // .. inactivated due to async error` and aborts the process; with `HSA_ENABLE_QUEUE_FAULT_MESSAGE=0`
+        // it returns and the queue stays dead until the bounded wait times out.
         // SAFETY: `gpu_agent` belongs to the initialized runtime; no error callback or data; `queue`
         // is a valid out-pointer.
         let create_status = unsafe {
@@ -694,7 +699,7 @@ impl RocmContext {
         Ok(buf)
     }
 
-    /// Upload `data` (i32 slice) into a fresh native-I32 buffer charged to `role` (Card 547a F1/F4: caller-stated role; metadata buffers, e.g. ComputeMeta's dims, pass `BufferRole::Meta`),
+    /// Upload `data` (i32 slice) into a fresh native-I32 buffer charged to `role` (Card 547a F1/F4: caller-stated role; metadata buffers, e.g. a launch's metadata dims, pass `BufferRole::Meta`),
     /// copying the i32 bytes directly. The bit pattern is identical to u32 for small non-negative
     /// values.
     pub fn upload_i32(&self, data: &[i32], role: BufferRole) -> Result<RocmBuffer, RocmError> {

@@ -329,15 +329,11 @@ fn verify_forward_is_causally_invariant_to_later_draft_tokens() {
 
 /// Card 094 bug 2 root cause: the verify step's raw decomposition (`ops::attention_masked`) is
 /// causally correct (`verify_forward_is_causally_invariant_to_later_draft_tokens`), but serving
-/// lowers through `compile`'s pass pipeline, which includes `flash_attention_capped`.
-/// That pass classified any multi-row (`L>1`) query as `FlashAttentionPrefill`, whose op
-/// (`ops::attention_prefill` and its eval/GPU kernels) assumes K/V length == Q's `L` with a square
-/// `[L,L]` mask. The verify step's K/V is the full `[.,.,cap,.]` carried cache (`cap > L` once a
-/// prefix exists) with a `[L,cap]` mask: same op-chain shape, different semantics, so it attended
-/// only the first `L` cache slots and corrupted every row (including row 0) once any prefix
-/// existed. Fixed in `match_attention` (transform.rs) by requiring K's sequence axis to equal Q's
-/// `L`; a longer K falls back to the decomposition. This test pins that `optimize(verify graph)`
-/// computes the raw graph's logits.
+/// lowers through `compile`'s pass pipeline, which includes `flash_attention_capped`. The verify step's
+/// K/V is the full `[.,.,cap,.]` carried cache (`cap > L` once a prefix exists) with a `[L,cap]` mask,
+/// so the fused `Attention` op must index its keys by their own length, not by the query's `L`: a kernel
+/// that attended only the first `L` cache slots corrupted every row (including row 0) once any prefix
+/// existed. This test pins that `optimize(verify graph)` computes the raw graph's logits.
 #[test]
 fn optimize_preserves_verify_forward_semantics() {
     let m = tiny();

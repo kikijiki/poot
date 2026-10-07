@@ -10,6 +10,7 @@ use poot_test_util::assert_close;
 fn softmax_kernel(n_cols: usize) -> kg::RowKernel {
     kg::RowKernel {
         n_leaves: 1,
+        leaf_storage: vec![poot_target::BufferStorage::f32()],
         n_cols,
         steps: vec![
             kg::RowOp::Reduce {
@@ -68,6 +69,109 @@ fn fused_row_parallel_folded_grid_covers_every_row() {
             let e: Vec<f32> = row.iter().map(|x| (x - m).exp()).collect();
             let sum: f32 = e.iter().sum();
             e.into_iter().map(move |x| x / sum)
+        })
+        .collect();
+    assert_close(&got, &want, 1e-5);
+}
+
+/// One-pass RMSNorm whose scale (leaf 1) is a BF16 weight in the packed lane, widened in registers by a `Widen`
+/// step: `out = x / sqrt(mean(x^2) + eps) * widen(w)`.
+fn rmsnorm_with_packed_scale(n_cols: usize, eps: f32) -> kg::RowKernel {
+    use kg::{FusedInput as In, FusedScalarOp as Op, RowOp};
+    let leaves = 2;
+    kg::RowKernel {
+        n_leaves: leaves,
+        leaf_storage: vec![
+            poot_target::BufferStorage::f32(),
+            poot_target::BufferStorage::bf16_packed(),
+        ],
+        n_cols,
+        steps: vec![
+            RowOp::Pointwise {
+                op: Op::Binary(BinOp::Mul),
+                inputs: vec![In::Leaf(0), In::Leaf(0)],
+            },
+            RowOp::Reduce {
+                op: kg::RowReduce::Sum,
+                input: In::Step(0),
+            },
+            RowOp::Pointwise {
+                op: Op::Binary(BinOp::Mul),
+                inputs: vec![In::Step(1), In::Lit(1.0 / n_cols as f32)],
+            },
+            RowOp::Pointwise {
+                op: Op::Binary(BinOp::Add),
+                inputs: vec![In::Step(2), In::Lit(eps)],
+            },
+            RowOp::Pointwise {
+                op: Op::Math(MathOp::Sqrt),
+                inputs: vec![In::Step(3)],
+            },
+            RowOp::Pointwise {
+                op: Op::Binary(BinOp::Div),
+                inputs: vec![In::Leaf(0), In::Step(4)],
+            },
+            RowOp::Pointwise {
+                op: Op::Widen,
+                inputs: vec![In::Leaf(1)],
+            },
+            RowOp::Pointwise {
+                op: Op::Binary(BinOp::Mul),
+                inputs: vec![In::Step(5), In::Step(6)],
+            },
+        ],
+        output: leaves + 7,
+    }
+}
+
+#[test]
+fn fused_row_reads_a_packed_bf16_leaf_as_its_widened_values() {
+    // An odd row width leaves the scale's last packed word with one element and a zero pad.
+    let (num_rows, n_cols, width, eps) = (3usize, 7usize, 4usize, 1e-6f32);
+    let x: Vec<f32> = (0..num_rows * n_cols)
+        .map(|i| (i as f32 * 0.37).sin() * 2.0 + 0.5)
+        .collect();
+    // BF16 values exactly: the top half of an f32 whose low half is zero.
+    let scale_bits: Vec<u16> = (0..n_cols)
+        .map(|j| ((0.5 + j as f32 * 0.3125).to_bits() >> 16) as u16)
+        .collect();
+    let scale: Vec<f32> = scale_bits
+        .iter()
+        .map(|&b| f32::from_bits(u32::from(b) << 16))
+        .collect();
+    let words: Vec<u32> = scale_bits
+        .chunks(2)
+        .map(|pair| u32::from(pair[0]) | (u32::from(pair.get(1).copied().unwrap_or(0)) << 16))
+        .collect();
+    let body = kg::fused_row_parallel_views(
+        "frp_packed_scale",
+        &[num_rows, n_cols],
+        &[&[num_rows, n_cols][..], &[n_cols][..]],
+        &[
+            kg::Layout::contiguous(&[num_rows, n_cols]),
+            kg::Layout::contiguous(&[n_cols]),
+        ],
+        &rmsnorm_with_packed_scale(n_cols, eps),
+        width,
+        num_rows,
+    )
+    .expect("a packed leaf is a stated lane");
+    let mut buffers = [
+        Buffer::from_f32s(&x),
+        Buffer::from_u32s(&words),
+        Buffer::from_f32s(&vec![f32::NAN; num_rows * n_cols]),
+    ];
+    run(&body, [num_rows as u32, 1, 1], &mut buffers).expect("interpret");
+    let got = buffers[2].to_f32s().unwrap();
+    let want: Vec<f32> = x
+        .chunks(n_cols)
+        .flat_map(|row| {
+            let mean = row.iter().map(|v| v * v).sum::<f32>() / n_cols as f32;
+            let inv = (mean + eps).sqrt();
+            row.iter()
+                .zip(&scale)
+                .map(move |(v, w)| v / inv * w)
+                .collect::<Vec<_>>()
         })
         .collect();
     assert_close(&got, &want, 1e-5);

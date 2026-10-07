@@ -29,7 +29,7 @@ pub use cache::{
     Artifact, ArtifactTooLarge, KernelCache, KernelKey, body_fingerprint,
     epoch as kernel_cache_epoch, kernel_cache_root, kernel_entry_key,
 };
-pub use emit::emit_llvm_ir_marked;
+pub use emit::emit_llvm_ir;
 pub use handle::kernel_handle;
 use poot_target::AmdArch;
 
@@ -68,7 +68,7 @@ pub struct Capability {
     /// `Target::Nvptx` like any other kernel; `false` here just meant PTX paid an extra materialize copy
     /// for no codegen reason (R-546-9, card 549).
     pub strided_views: bool,
-    /// The imported tiled-GEMM bodies (`MatMul`/`MatMulBias`, card 044) compile for this target. Their
+    /// The imported tiled-GEMM bodies (`MatMul`, card 044) compile for this target. Their
     /// Rust-compiled LDS arrays carry a zeroinitializer in addrspace(3), which AMDGPU LLVM rejects
     /// (R468-015); AmdGcn takes the synthesized tiled-GEMM body (`kg::tiled_region`) instead, which
     /// uses an uninitialized `WorkgroupLocalDecl`.
@@ -199,9 +199,9 @@ pub enum CompileError {
         status: String,
         stderr: String,
     },
-    /// `spirv_postprocess::fix_no_contraction` could not place every `Rvalue::BinaryOpNoContract` marker
-    /// (card 628): an emitter/postprocess ordinal drift, not a malformed body (that fails at `body.verify()`
-    /// earlier) - loud rather than a silently-unprotected compiled kernel.
+    /// `spirv_postprocess::fix_no_contraction` could not place the `Rvalue::BinaryOpNoContract` markers
+    /// (card 628): a malformed module, not a malformed body (that fails at `body.verify()` earlier) - loud
+    /// rather than a silently-unprotected compiled kernel.
     #[error("SPIR-V no-contraction decoration: {0}")]
     NoContraction(#[from] spirv_postprocess::NoContractionError),
     /// The compiled artifact is longer than the caller's `max_artifact_bytes`; nothing was loaded or
@@ -276,7 +276,7 @@ fn compile_with(
     out: &Path,
     toolchain: &Toolchain,
 ) -> Result<String, CompileError> {
-    let (ir, no_contract_ordinals) = emit::emit_llvm_ir_marked(body, target)?;
+    let ir = emit::emit_llvm_ir(body, target)?;
 
     // The `.ll` scratch and the object llc writes must be unique across all concurrent compiles in this
     // process. `out` is content-addressed (same `body`+arch -> same `out`), so two threads compiling the
@@ -300,7 +300,7 @@ fn compile_with(
         return Err(e);
     }
     if target == Target::SpirvVulkan
-        && let Err(e) = fixup_spirv_barriers(&tmp_out, &no_contract_ordinals)
+        && let Err(e) = fixup_spirv_barriers(&tmp_out)
     {
         let _ = std::fs::remove_file(&tmp_out);
         return Err(e);
@@ -336,26 +336,24 @@ fn compile_scratch_paths(
 /// `Statement::Fence` `OpMemoryBarrier` semantics (the storage-class bit LLVM's generic `fence` lowering
 /// omits; spec 138 Phase 2), the coopmat builtin-call rewrite (card 154: LLVM's Vulkan-mode
 /// `__spirv_CooperativeMatrix{Load,Store,MulAdd}KHR`/`__spirv_CompositeConstruct` stub calls become real
-/// instructions), and the `NoContraction` decoration (card 628: `no_contract_ordinals`, from
-/// `emit::emit_llvm_ir_marked`, names which compiled float binops `Rvalue::BinaryOpNoContract` marked - see
-/// `spirv_postprocess::fix_no_contraction`). No-op for a module with none of these.
-fn fixup_spirv_barriers(
-    spv_path: &Path,
-    no_contract_ordinals: &[usize],
-) -> Result<(), CompileError> {
+/// instructions), and the `NoContraction` decoration (card 628: the marker calls `emit::emit_llvm_ir` wraps each
+/// `Rvalue::BinaryOpNoContract` in - see `spirv_postprocess::fix_no_contraction`). No-op for a module with none of these.
+fn fixup_spirv_barriers(spv_path: &Path) -> Result<(), CompileError> {
     let bytes = std::fs::read(spv_path)?;
     // SPIR-V is a stream of little-endian 32-bit words.
     if bytes.len() % 4 != 0 {
         return Ok(()); // not a word-aligned SPIR-V blob; leave it
     }
     let words: Vec<u32> = bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect();
     let fixed = spirv_postprocess::fix_barrier_semantics(words);
     let fixed = spirv_postprocess::fix_fence_semantics(fixed);
     let fixed = spirv_postprocess::fix_coopmat_calls(fixed);
-    let fixed = spirv_postprocess::fix_no_contraction(fixed, no_contract_ordinals)?;
+    let fixed = spirv_postprocess::fix_no_contraction(fixed)?;
     let mut out = Vec::with_capacity(fixed.len() * 4);
     for w in fixed {
         out.extend_from_slice(&w.to_le_bytes());

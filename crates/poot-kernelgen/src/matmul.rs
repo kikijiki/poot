@@ -1,8 +1,9 @@
 use crate::KernelGenError;
+use crate::contraction::{Epilogue, emit_epilogue};
 use crate::elementwise::ELEMENTWISE_2D_WORKGROUP_SIZE;
+use crate::emit::Emit;
 use crate::helpers::{
     Alloc, WeightLane, batch_eff, copy, elem, guard, ld, local, row_major_strides, slice_dtype,
-    slice_f32,
 };
 use poot_kernel_ir::{
     BasicBlock, BinOp, BlockId, Body, Constant, IndexAxis, Local, Operand, Place, Rvalue,
@@ -39,40 +40,43 @@ pub fn matmul_batched_dt_grid(
         a_shape,
         b_shape,
         WeightRead::Kn,
-        false,
+        None,
+        &[],
         x_groups,
     )
 }
 
-/// Batched matmul with a fused bias epilogue: `C[..,m,n] = (A@B)[..,m,n] + bias[n]` in one kernel, `bias`
-/// an `[N]` f32 vector (the 3rd input, before the output). Folds `linear`'s post-matmul bias add into the
-/// matmul (one dispatch instead of two; the q/k/v projection bias adds). See [`matmul_batched_dt_grid`]'s
-/// doc for the dtype/fallback rationale. `x_groups: None` is the plain (non-folded) grid.
-pub fn matmul_batched_bias_dt_grid(
+/// [`matmul_batched_dt_grid`] with a pointwise epilogue applied to each output element in registers before the
+/// store: `C = epilogue(A@B)`. The epilogue's leaves are extra input buffers (a bias, a residual) between `b`
+/// and the output; its dtype is `dt`, and the head result rounds through `dt` before the first step reads it
+/// (see [`Epilogue`]).
+pub fn matmul_batched_epilogue_dt_grid(
     name: &str,
     dt: Ty,
     out_shape: &[usize],
     a_shape: &[usize],
     b_shape: &[usize],
+    epilogue: &Epilogue,
     x_groups: Option<usize>,
-) -> Body {
-    matmul_batched_impl(
+) -> Result<Body, KernelGenError> {
+    let lanes = epilogue.lanes("matmul_batched_epilogue_dt_grid")?;
+    Ok(matmul_batched_impl(
         name,
         dt,
         out_shape,
         a_shape,
         b_shape,
         WeightRead::Kn,
-        true,
+        Some(epilogue),
+        &lanes,
         x_groups,
-    )
+    ))
 }
 
 /// [`matmul_batched_dt_grid`] over a weight held in checkpoint `[N, K]` order (`w_shape` is `[N, K]`, rank 2):
 /// `C[..,M,N] = A[..,M,K] @ W[N,K]^T`, without materializing the transpose. The one-thread-per-output
 /// fallback of `DenseContraction` where the tiled GEMM is not taken. The activation and output are f32; the
-/// weight is read in its planned `weight` storage (`BufferStorage::f32()` or, Card 1007,
-/// `BufferStorage::f16_packed()`).
+/// weight is read in its planned `weight` storage (`BufferStorage::f32()`, `f16_packed()` or `bf16_packed()`).
 pub(crate) fn matmul_batched_nk_grid(
     name: &str,
     weight: BufferStorage,
@@ -89,7 +93,8 @@ pub(crate) fn matmul_batched_nk_grid(
         a_shape,
         w_shape,
         WeightRead::Nk(lane),
-        false,
+        None,
+        &[],
         x_groups,
     ))
 }
@@ -103,7 +108,7 @@ enum WeightRead {
     Nk(WeightLane),
 }
 
-#[allow(clippy::too_many_arguments)] // shapes plus the bias/weight/fold modes the public entry points fix
+#[allow(clippy::too_many_arguments)] // shapes plus the epilogue/weight/fold modes the public entry points fix
 fn matmul_batched_impl(
     name: &str,
     dt: Ty,
@@ -111,7 +116,8 @@ fn matmul_batched_impl(
     a_shape: &[usize],
     b_shape: &[usize],
     weight: WeightRead,
-    bias: bool,
+    epilogue: Option<&Epilogue>,
+    lanes: &[Option<WeightLane>],
     x_groups: Option<usize>,
 ) -> Body {
     let r = out_shape.len();
@@ -130,7 +136,8 @@ fn matmul_batched_impl(
     let a_beff = batch_eff(r - 2, a_shape, &a_strides);
     let b_beff = batch_eff(r - 2, b_shape, &b_strides);
 
-    // params: _0 ret, _1 a, _2 b, [_3 bias (f32 [N], read-only)], c (output, LAST - inputs bind first).
+    // params: _0 ret, _1 a, _2 b, [epilogue leaves, read-only], c (output, LAST - inputs bind first).
+    let leaf_count = epilogue.map_or(0, Epilogue::leaf_count);
     let mut params = vec![
         ld(Ty::Unit, false),
         ld(slice_dtype(dt.clone(), false), false),
@@ -139,15 +146,15 @@ fn matmul_batched_impl(
             WeightRead::Nk(lane) => lane.param(),
         },
     ];
-    if bias {
-        params.push(ld(slice_f32(false), false));
+    if let Some(epilogue) = epilogue {
+        params.extend(lanes.iter().map(|&lane| epilogue.leaf_param(lane)));
     }
     params.push(ld(slice_dtype(dt.clone(), true), true));
     let mut al = Alloc::new(params);
     let a = local(1);
     let b = local(2);
-    let bias_l = if bias { Some(local(3)) } else { None };
-    let c = local(if bias { 4 } else { 3 });
+    let leaves: Vec<Local> = (0..leaf_count).map(|j| local(3 + j as u32)).collect();
+    let c = local(3 + leaf_count as u32);
     let i = al.add(Ty::Usize, false);
     let len = al.add(Ty::Usize, false);
     let cmp = al.add(Ty::Bool, false);
@@ -374,23 +381,13 @@ fn matmul_batched_impl(
             target: BlockId { index: 3 },
         },
     };
-    // bb5: store. For a bias matmul, fold `+ bias[ncol]` into the accumulator before the (optional) narrow.
-    let biased = if bias_l.is_some() {
-        Some(al.add(Ty::F32, false))
-    } else {
-        None
+    // bb5: store. The epilogue (if any) runs over the f32 accumulator, which it rounds through `dt` first.
+    let mut e = Emit::new(&mut al);
+    let to_store = match epilogue {
+        Some(epilogue) => emit_epilogue(&mut e, epilogue, i, &leaves, lanes, acc),
+        None => acc,
     };
-    let mut bb5_stmts = Vec::new();
-    let to_store = match (bias_l, biased) {
-        (Some(bl), Some(biased)) => {
-            bb5_stmts.push(Statement::Assign(
-                Place::local(biased),
-                Rvalue::BinaryOp(BinOp::Add, copy(Place::local(acc)), copy(elem(bl, ncol))),
-            ));
-            biased
-        }
-        _ => acc,
-    };
+    let mut bb5_stmts = e.take();
     bb5_stmts.push(Statement::Assign(
         elem(c, i),
         // narrow the f32 accumulator back to the storage dtype on store; a no-op for f32.
@@ -411,7 +408,7 @@ fn matmul_batched_impl(
         statements: vec![],
         terminator: Terminator::Return,
     };
-    let n_params = if bias { 4 } else { 3 };
+    let n_params = 3 + leaf_count as u32;
     match x_groups {
         None => {
             // the flat 1-D grid: `i = ThreadIndexCall(X)`
@@ -508,197 +505,4 @@ fn matmul_batched_impl(
             )
         }
     }
-}
-
-/// Indexed GEMM for gather-free sparse MoE: `out[m, n] = sum_k x[m, k] * W[e_m, k, n]` where the per-row
-/// expert `e_m = (usize) idx[m]` selects one `[K, N]` weight matrix from the stacked `W [E, K, N]` inside the
-/// kernel, with no gather copy of the selected experts' weights first. The batched MoE case: `M` tokens, each
-/// routed to its own expert; `M = 1` is the decode-GEMV case. One thread per output element `i = m*N + n`; the
-/// dot reads `x`'s row `m` and the selected expert's column `n` directly. dt-generic: reads widen to f32, the
-/// f32 accumulator narrows on store (a no-op for f32). Top-k is this summed over the k selected experts; this is
-/// the top-1 primitive.
-///
-/// Params: `_1 x` \[M*K\] (dt), `_2 w` \[E*K*N\] flat row-major (dt), `_3 idx` \[M\] (f32 expert ids), `out` \[M*N\]
-/// (dt).
-pub fn indexed_matmul_dt(name: &str, dt: Ty, m_dim: usize, k: usize, n: usize) -> Body {
-    let _ = m_dim; // M is implied by the output length; kept in the signature for call-site clarity.
-    let mut al = Alloc::new(vec![
-        ld(Ty::Unit, false),
-        ld(slice_dtype(dt.clone(), false), false), // x (dt) [M*K]
-        ld(slice_dtype(dt.clone(), false), false), // w (dt) [E*K*N]
-        ld(slice_f32(false), false),               // idx (f32) [M]
-        ld(slice_dtype(dt.clone(), true), true),   // out (dt) [M*N]
-    ]);
-    let (x, w, idx, out) = (local(1), local(2), local(3), local(4));
-    let i = al.add(Ty::Usize, false); // the flat output index m*N + n
-    let len = al.add(Ty::Usize, false);
-    let cmp = al.add(Ty::Bool, false);
-    let mrow = al.add(Ty::Usize, false); // i / N
-    let ncol = al.add(Ty::Usize, false); // i % N
-    let xbase = al.add(Ty::Usize, false); // mrow * K
-    let idxf = al.add(Ty::F32, false);
-    let expert = al.add(Ty::Usize, false);
-    let ebase = al.add(Ty::Usize, false); // expert * (K*N)
-    let acc = al.add(Ty::F32, true);
-    let kk = al.add(Ty::Usize, true);
-    let k_lt = al.add(Ty::Bool, false);
-    let kn = al.add(Ty::Usize, false); // kk * N
-    let woff0 = al.add(Ty::Usize, false); // ebase + kk*N
-    let woff = al.add(Ty::Usize, false); // ebase + kk*N + ncol
-    let xoff = al.add(Ty::Usize, false); // xbase + kk
-    let vx = al.add(Ty::F32, false);
-    let vw = al.add(Ty::F32, false);
-    let prod = al.add(Ty::F32, false);
-    let acc_new = al.add(Ty::F32, false);
-    let k_new = al.add(Ty::Usize, false);
-    let cu = |v: usize| Operand::Const(Constant::Usize(v as u64));
-    let widen = |slot: Local, at: Local| {
-        if dt == Ty::F32 {
-            Rvalue::Use(copy(elem(slot, at)))
-        } else {
-            Rvalue::Cast {
-                to: Ty::F32,
-                operand: copy(elem(slot, at)),
-            }
-        }
-    };
-
-    let bb0 = BasicBlock {
-        statements: vec![],
-        terminator: Terminator::ThreadIndexCall {
-            destination: Place::local(i),
-            dim: IndexAxis::X,
-            target: BlockId { index: 1 },
-        },
-    };
-    let bb1 = BasicBlock {
-        statements: vec![
-            Statement::Assign(Place::local(len), Rvalue::Len(Place::local(out))),
-            Statement::Assign(
-                Place::local(cmp),
-                Rvalue::BinaryOp(BinOp::Lt, copy(Place::local(i)), copy(Place::local(len))),
-            ),
-        ],
-        terminator: guard(cmp, 6, 2),
-    };
-    // bb2: mrow = i/N; ncol = i%N; xbase = mrow*K; expert = (usize) idx[mrow]; ebase = expert*(K*N); acc=0; kk=0.
-    let bb2 = BasicBlock {
-        statements: vec![
-            Statement::Assign(
-                Place::local(mrow),
-                Rvalue::BinaryOp(BinOp::Div, copy(Place::local(i)), cu(n)),
-            ),
-            Statement::Assign(
-                Place::local(ncol),
-                Rvalue::BinaryOp(BinOp::Rem, copy(Place::local(i)), cu(n)),
-            ),
-            Statement::Assign(
-                Place::local(xbase),
-                Rvalue::BinaryOp(BinOp::Mul, copy(Place::local(mrow)), cu(k)),
-            ),
-            Statement::Assign(Place::local(idxf), Rvalue::Use(copy(elem(idx, mrow)))),
-            Statement::Assign(
-                Place::local(expert),
-                Rvalue::Cast {
-                    to: Ty::Usize,
-                    operand: copy(Place::local(idxf)),
-                },
-            ),
-            Statement::Assign(
-                Place::local(ebase),
-                Rvalue::BinaryOp(BinOp::Mul, copy(Place::local(expert)), cu(k * n)),
-            ),
-            Statement::Assign(
-                Place::local(acc),
-                Rvalue::Use(Operand::Const(Constant::F32(0.0))),
-            ),
-            Statement::Assign(Place::local(kk), Rvalue::Use(cu(0))),
-        ],
-        terminator: Terminator::Goto {
-            target: BlockId { index: 3 },
-        },
-    };
-    let bb3 = BasicBlock {
-        statements: vec![Statement::Assign(
-            Place::local(k_lt),
-            Rvalue::BinaryOp(BinOp::Lt, copy(Place::local(kk)), cu(k)),
-        )],
-        terminator: guard(k_lt, 5, 4),
-    };
-    // bb4: woff = ebase + kk*N + ncol; xoff = xbase + kk; acc += x[xoff] * w[woff]; kk++.
-    let bb4 = BasicBlock {
-        statements: vec![
-            Statement::Assign(
-                Place::local(kn),
-                Rvalue::BinaryOp(BinOp::Mul, copy(Place::local(kk)), cu(n)),
-            ),
-            Statement::Assign(
-                Place::local(woff0),
-                Rvalue::BinaryOp(
-                    BinOp::Add,
-                    copy(Place::local(ebase)),
-                    copy(Place::local(kn)),
-                ),
-            ),
-            Statement::Assign(
-                Place::local(woff),
-                Rvalue::BinaryOp(
-                    BinOp::Add,
-                    copy(Place::local(woff0)),
-                    copy(Place::local(ncol)),
-                ),
-            ),
-            Statement::Assign(
-                Place::local(xoff),
-                Rvalue::BinaryOp(
-                    BinOp::Add,
-                    copy(Place::local(xbase)),
-                    copy(Place::local(kk)),
-                ),
-            ),
-            Statement::Assign(Place::local(vx), widen(x, xoff)),
-            Statement::Assign(Place::local(vw), widen(w, woff)),
-            Statement::Assign(
-                Place::local(prod),
-                Rvalue::BinaryOp(BinOp::Mul, copy(Place::local(vx)), copy(Place::local(vw))),
-            ),
-            Statement::Assign(
-                Place::local(acc_new),
-                Rvalue::BinaryOp(
-                    BinOp::Add,
-                    copy(Place::local(acc)),
-                    copy(Place::local(prod)),
-                ),
-            ),
-            Statement::Assign(Place::local(acc), Rvalue::Use(copy(Place::local(acc_new)))),
-            Statement::Assign(
-                Place::local(k_new),
-                Rvalue::BinaryOp(BinOp::Add, copy(Place::local(kk)), cu(1)),
-            ),
-            Statement::Assign(Place::local(kk), Rvalue::Use(copy(Place::local(k_new)))),
-        ],
-        terminator: Terminator::Goto {
-            target: BlockId { index: 3 },
-        },
-    };
-    // bb5: store out[i] = acc (narrow to dt on store; a no-op for f32).
-    let bb5 = BasicBlock {
-        statements: vec![Statement::Assign(
-            elem(out, i),
-            if dt == Ty::F32 {
-                Rvalue::Use(copy(Place::local(acc)))
-            } else {
-                Rvalue::Cast {
-                    to: dt.clone(),
-                    operand: copy(Place::local(acc)),
-                }
-            },
-        )],
-        terminator: Terminator::Return,
-    };
-    let bb6 = BasicBlock {
-        statements: vec![],
-        terminator: Terminator::Return,
-    };
-    Body::new(name, 4, al.locals, vec![bb0, bb1, bb2, bb3, bb4, bb5, bb6])
 }

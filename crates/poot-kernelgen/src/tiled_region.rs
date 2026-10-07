@@ -1,4 +1,6 @@
 use crate::KernelGenError;
+use crate::contraction::{Epilogue, emit_epilogue};
+use crate::emit::{Emit, bin, copy as copy_local};
 use crate::helpers::{Alloc, WeightLane, WeightLayout, copy, elem, guard, ld, local, slice_f32};
 use poot_kernel_ir::{
     BasicBlock, BinOp, BlockId, Body, Constant, IndexAxis, Local, Operand, Place, Rvalue,
@@ -28,8 +30,17 @@ pub fn tiled_region(
     tile_offset: usize,
     layout: WeightLayout,
     weight: BufferStorage,
+    epilogue: Option<&Epilogue>,
 ) -> Result<Body, KernelGenError> {
     let weight_lane = WeightLane::of("tiled_region", weight)?;
+    let leaf_count = epilogue.map_or(0, Epilogue::leaf_count);
+    let lanes = match epilogue {
+        Some(epilogue) => {
+            epilogue.require_f32("tiled_region")?;
+            epilogue.lanes("tiled_region")?
+        }
+        None => Vec::new(),
+    };
     let ts2 = ts * ts;
     let tiles_n = n.div_ceil(ts);
     let kt_count = k.div_ceil(ts);
@@ -44,19 +55,23 @@ pub fn tiled_region(
         1
     };
 
-    // params: a [M*K] f32, b [K*N] (the weight lane), out [M*N] f32 (last).
-    let params = vec![
+    // params: a [M*K] f32, b [K*N] (the weight lane), the epilogue's leaves, out [M*N] f32 (last).
+    let mut params = vec![
         ld(Ty::Unit, false),         // 0
         ld(slice_f32(false), false), // 1 a [M*K]
         weight_lane.param(),         // 2 b [K*N]
-        ld(slice_f32(true), true),   // 3 out [M*N]
     ];
+    if let Some(epilogue) = epilogue {
+        params.extend(lanes.iter().map(|&lane| epilogue.leaf_param(lane)));
+    }
+    params.push(ld(slice_f32(true), true)); // out [M*N]
     let n_inputs = (params.len() - 1) as u32;
     let c_idx = (params.len() - 1) as u32;
     let mut al = Alloc::new(params);
     let a = local(1);
     let b = local(2);
     let c = local(c_idx);
+    let leaves: Vec<Local> = (0..leaf_count).map(|j| local(3 + j as u32)).collect();
 
     let g = al.add(Ty::Usize, false);
     let l = al.add(Ty::Usize, false);
@@ -104,7 +119,6 @@ pub fn tiled_region(
     let storeok = al.add(Ty::Bool, false);
     let wrok1 = al.add(Ty::Bool, false);
     let storeok1 = al.add(Ty::Bool, false);
-    let cidx = al.add(Ty::Usize, false);
 
     let cu = |x: usize| Operand::Const(Constant::Usize(x as u64));
     let cf = |x: f32| Operand::Const(Constant::F32(x));
@@ -429,14 +443,24 @@ pub fn tiled_region(
             target: BlockId { index: 3 },
         },
     };
-    // store one output row: cidx = row_l*N + col; out[cidx] = acc_l.
-    let store_block = |row_l: Local, acc_l: Local, next: u32, ret: bool| -> BasicBlock {
+    // store one output row: cidx = row_l*N + col; out[cidx] = epilogue(acc_l).
+    let store_block = |al: &mut Alloc, row_l: Local, acc_l: Local, next: u32, ret: bool| {
+        let mut s = Emit::new(al);
+        let row_base = bin(&mut s, Ty::Usize, BinOp::Mul, copy_local(row_l), cu(n));
+        let cidx = bin(
+            &mut s,
+            Ty::Usize,
+            BinOp::Add,
+            copy_local(row_base),
+            copy_local(col),
+        );
+        let value = match epilogue {
+            Some(epilogue) => emit_epilogue(&mut s, epilogue, cidx, &leaves, &lanes, acc_l),
+            None => acc_l,
+        };
+        s.assign(elem(c, cidx), Rvalue::Use(copy(Place::local(value))));
         BasicBlock {
-            statements: vec![
-                mulc(tmp, row_l, n),
-                addl(cidx, tmp, col),
-                Statement::Assign(elem(c, cidx), Rvalue::Use(copy(Place::local(acc_l)))),
-            ],
+            statements: s.take(),
             terminator: if ret { Terminator::Return } else { goto(next) },
         }
     };
@@ -457,7 +481,7 @@ pub fn tiled_region(
         terminator: guard(storeok, 9, 8),
     };
     // bb8 (store row0): out[row0] = acc; fall through to the row1 guard (9).
-    let bb8 = store_block(row, acc, 9, false);
+    let bb8 = store_block(&mut al, row, acc, 9, false);
     // bb9 (row1 store guard): storeok1 = (row1<M) & (col<N) (col<N reuses colok2); else -> ret(11).
     let bb9 = BasicBlock {
         statements: vec![
@@ -474,7 +498,7 @@ pub fn tiled_region(
         terminator: guard(storeok1, 11, 10),
     };
     // bb10 (store row1): out[row1] = acc1; return.
-    let bb10 = store_block(row1, acc1, 0, true);
+    let bb10 = store_block(&mut al, row1, acc1, 0, true);
     // bb11: return.
     let bb11 = BasicBlock {
         statements: vec![],

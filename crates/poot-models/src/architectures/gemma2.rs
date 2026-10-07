@@ -21,8 +21,8 @@ use crate::components::ffn::{GatedFfnWeights, geglu_ffn};
 use crate::components::linear::WeightError;
 use crate::components::norm::{NormKind, NormParams};
 use crate::components::standard::{
-    LayerNorms, LayerParams, NormPlacement, ParamError, StackParams, StackWeights, Step,
-    check_step, standard_layer, standard_stack,
+    BlockInput, LayerNorms, LayerParams, NormPlacement, ParamError, StackParams, StackWeights,
+    Step, check_step, standard_layer, standard_stack,
 };
 use crate::model::{
     ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, StepShape,
@@ -45,6 +45,7 @@ pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     ],
     build,
     fixture,
+    variants: &[],
 };
 
 /// Gemma 2's config facts: `Gemma2Config`'s defaults (eos `1`, base `10000`) and llama.cpp's GGUF
@@ -276,7 +277,7 @@ impl Model for Gemma2 {
                 &layer.norms,
                 &p.layer,
                 |b, h| attention(b, &step, l, h, &layer.attn, &p.attention[l]),
-                |b, h| geglu_ffn(b, h, &layer.ffn),
+                |b, BlockInput { block: h, .. }| geglu_ffn(b, h, &layer.ffn),
             )
         });
         Ok(step.finish(b, logits))
@@ -767,9 +768,8 @@ mod family_tests {
     }
 
     /// Every layer of the real-dimension prefill flash-fuses with the real softcap and no
-    /// materialized `[., ., L, L]` score matrix remains. `FlashAttentionDecode` has no softcap
-    /// parameter, so a softcapped decode does not fuse; a prefill carries the cap in
-    /// `FlashAttentionPrefill { softcap }`. `n = 2048` collides with no dimension of this config
+    /// materialized `[., ., L, L]` score matrix remains. The matcher does not fuse a softcapped
+    /// decode yet; a prefill carries the cap in `Attention { softcap }`. `n = 2048` collides with no dimension of this config
     /// (hidden 2304, feed-forward 2560, head 256, vocabulary 4096), so the shape-aware score
     /// check below cannot mistake a projection for the scores. Mutation: drop the attention
     /// softcap in the body; the fused ops carry no cap and the first assertion fails.
@@ -781,8 +781,8 @@ mod family_tests {
         let softcaps: Vec<Option<f32>> = opt
             .eqns
             .iter()
-            .filter_map(|e| match e.op {
-                poot_graph_ir::OpKind::FlashAttentionPrefill { softcap, .. } => Some(softcap),
+            .filter_map(|e| match &e.op {
+                poot_graph_ir::OpKind::Attention(attrs) => Some(attrs.softcap),
                 _ => None,
             })
             .collect();
@@ -803,7 +803,7 @@ mod family_tests {
         let fused = opt
             .eqns
             .iter()
-            .filter(|e| matches!(e.op, poot_graph_ir::OpKind::FlashAttentionPrefill { .. }))
+            .filter(|e| matches!(e.op, poot_graph_ir::OpKind::Attention(_)))
             .count();
         assert_eq!(fused, 4, "one fused flash prefill per layer");
         assert_no_materialized_scores(&opt, n);

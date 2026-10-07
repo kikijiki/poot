@@ -2,17 +2,106 @@
 //! family's [`Model`] built through a [`Registry`], the checkpoint's weights exactly as stored, and the
 //! [`TextCodec`] of its tokenizer and chat template. It names no family and no backend.
 
+use std::collections::BTreeMap;
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use poot_load::gguf::{GgufIndex, IdentityNames, read_gguf};
+use poot_load::packed_safetensors::{FilePin, Sha256Digest, check_pin_reader};
 use poot_models::model::{Model, ModelConfig};
 use poot_models::registry::{FamilyEntry, RawConfig, Registry};
 use poot_quant::weights::WeightStore;
 
 use crate::driver::error::{DriverError, LoadError, Unsupported};
 use crate::text::tokenize::TextCodec;
+
+/// How [`ModelHandle::load`] treats the checkpoint's files.
+#[derive(Clone, Debug, Default)]
+pub struct LoadOptions {
+    /// A JSON manifest pinning checkpoint files by name:
+    /// `{"files": {"model.safetensors": {"length": 123, "sha256": "<64 hex digits>"}}}`.
+    /// Every listed file is checked against its pin before any tensor is read, and every weight
+    /// file the load will parse (the GGUF itself, each `*.safetensors` shard of an HF directory)
+    /// must be listed: an unlisted one is refused. `None` checks nothing.
+    pub integrity: Option<PathBuf>,
+}
+
+#[derive(serde::Deserialize)]
+struct Manifest {
+    files: BTreeMap<String, ManifestPin>,
+}
+
+#[derive(serde::Deserialize)]
+struct ManifestPin {
+    length: usize,
+    #[serde(deserialize_with = "digest_from_hex")]
+    sha256: [u8; 32],
+}
+
+fn digest_from_hex<'de, D: serde::Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+    use serde::de::Error;
+    let hex = <String as serde::Deserialize>::deserialize(d)?;
+    if hex.len() != 64 || !hex.is_ascii() {
+        return Err(D::Error::custom("sha256 must be 64 hex digits"));
+    }
+    let mut out = [0u8; 32];
+    for (byte, pair) in out.iter_mut().zip(hex.as_bytes().chunks(2)) {
+        let pair = std::str::from_utf8(pair).map_err(D::Error::custom)?;
+        *byte = u8::from_str_radix(pair, 16).map_err(D::Error::custom)?;
+    }
+    Ok(out)
+}
+
+/// Check the checkpoint's files against `options.integrity`, each streamed through the hash once,
+/// before any tensor is read. The weight files the load will parse must all be pinned: a GGUF's own
+/// file name (`only`), or for an HF directory every `*.safetensors` shard in it. An unpinned weight
+/// file is [`LoadError::Unpinned`], never admitted unchecked. Files that are not tensors (config,
+/// tokenizer, the shard index) need no pin, but an HF manifest entry for one is still checked.
+fn check_integrity(options: &LoadOptions, dir: &Path, only: Option<&str>) -> Result<(), LoadError> {
+    let Some(manifest_path) = &options.integrity else {
+        return Ok(());
+    };
+    let text = std::fs::read(manifest_path).map_err(io_error(manifest_path))?;
+    let manifest: Manifest = serde_json::from_slice(&text).map_err(|source| LoadError::Json {
+        path: manifest_path.clone(),
+        source,
+    })?;
+    let mut required: Vec<String> = match only {
+        Some(name) => vec![name.to_string()],
+        None => std::fs::read_dir(dir)
+            .map_err(io_error(dir))?
+            .map(|entry| entry.map_err(io_error(dir)))
+            .filter_map(|entry| match entry {
+                Ok(entry) => {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    name.ends_with(".safetensors").then_some(Ok(name))
+                }
+                Err(e) => Some(Err(e)),
+            })
+            .collect::<Result<_, _>>()?,
+    };
+    required.sort();
+    if let Some(file) = required
+        .iter()
+        .find(|name| !manifest.files.contains_key(*name))
+    {
+        return Err(LoadError::Unpinned { file: file.clone() });
+    }
+    for (name, pin) in &manifest.files {
+        if only.is_some_and(|only| only != name) {
+            continue;
+        }
+        let path = dir.join(name);
+        let file = File::open(&path).map_err(io_error(&path))?;
+        let pin = FilePin {
+            length: pin.length,
+            sha256: Sha256Digest::new(pin.sha256),
+        };
+        check_pin_reader(file, pin, name)?;
+    }
+    Ok(())
+}
 
 /// A model, its weights and its text services.
 #[derive(Debug)]
@@ -58,15 +147,23 @@ impl ModelHandle {
     /// ships one, safetensors and `tokenizer.json`), a file is a GGUF. The family is resolved from the
     /// config before any weight is read, so an unregistered family is refused without reading the
     /// checkpoint's tensors; the one resolve then builds the model.
-    pub fn load(path: &Path, registry: &Registry) -> Result<Self, DriverError> {
+    pub fn load(
+        path: &Path,
+        registry: &Registry,
+        options: &LoadOptions,
+    ) -> Result<Self, DriverError> {
         if path.is_dir() {
-            Self::load_hf(path, registry)
+            Self::load_hf(path, registry, options)
         } else {
-            Self::load_gguf(path, registry)
+            Self::load_gguf(path, registry, options)
         }
     }
 
-    fn load_hf(dir: &Path, registry: &Registry) -> Result<Self, DriverError> {
+    fn load_hf(
+        dir: &Path,
+        registry: &Registry,
+        options: &LoadOptions,
+    ) -> Result<Self, DriverError> {
         let config = read_json(&dir.join("config.json"))?;
         let generation_path = dir.join("generation_config.json");
         let generation = generation_path
@@ -78,6 +175,7 @@ impl ModelHandle {
             generation: generation.as_ref(),
         };
         let family = resolve(&raw, registry)?;
+        check_integrity(options, dir, None)?;
         // A GPTQ, AWQ or FP8 checkpoint's quantized linears are packed straight from their stored
         // bytes, never decoded: the family maps the packed entries like any other weight.
         let scheme = poot_load::config::quant_scheme(&config).map_err(LoadError::from)?;
@@ -93,7 +191,14 @@ impl ModelHandle {
         })
     }
 
-    fn load_gguf(path: &Path, registry: &Registry) -> Result<Self, DriverError> {
+    fn load_gguf(
+        path: &Path,
+        registry: &Registry,
+        options: &LoadOptions,
+    ) -> Result<Self, DriverError> {
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            check_integrity(options, path.parent().unwrap_or(Path::new("")), Some(name))?;
+        }
         let index = GgufIndex::open(path).map_err(LoadError::from)?;
         let raw = RawConfig::Gguf(&index);
         let family = resolve(&raw, registry)?;

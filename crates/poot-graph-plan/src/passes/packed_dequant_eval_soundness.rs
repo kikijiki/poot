@@ -416,7 +416,11 @@ fn packed_dequant_fused_and_unfused_compositions_match() -> Result<(), BuilderAp
             .iter()
             .zip(fused.as_f32().unwrap().iter())
         {
-            assert!((left - right).abs() <= 1e-5, "{left} != {right}");
+            assert_eq!(
+                left.to_bits(),
+                right.to_bits(),
+                "unfused {left} != fused {right}"
+            );
         }
     }
     Ok(())
@@ -672,7 +676,11 @@ fn transposed_packed_contraction_fused_and_unfused_compositions_match()
                 left.is_finite() && right.is_finite(),
                 "non-finite element: {left} vs {right}"
             );
-            assert!((left - right).abs() <= 1e-5, "{left} != {right}");
+            assert_eq!(
+                left.to_bits(),
+                right.to_bits(),
+                "unfused {left} != fused {right}"
+            );
         }
     }
     Ok(())
@@ -750,7 +758,11 @@ fn blocked_packed_contraction_fused_and_unfused_compositions_match()
             .iter()
             .zip(fused_output.as_f32().unwrap().iter())
         {
-            assert!((left - right).abs() <= 1e-5, "{left} != {right}");
+            assert_eq!(
+                left.to_bits(),
+                right.to_bits(),
+                "unfused {left} != fused {right}"
+            );
         }
     }
     Ok(())
@@ -1813,6 +1825,10 @@ fn packed_oracle_decode_work_is_linear_in_k() -> Result<(), BuilderAppendError> 
     // Generous per-logical-value budget for a linear oracle (output, row buffer, bookkeeping); the
     // per-element path spends `4 * K` bytes per value, over 100x this at both widths.
     const LINEAR_BYTES_PER_VALUE: usize = 16;
+    // The contraction is a composite (Card 629): it materializes the dequantized `[out, K]` weight, its
+    // transposed copy and the product, so it spends a small constant number of weight copies more than
+    // the bare dequant. Still `O(out * K)`: the per-element path is over 100x this.
+    const CONTRACTION_BYTES_PER_VALUE: usize = 64;
     let out = 4;
     for format in [WeightFormat::Q8_0, WeightFormat::Q4_K] {
         for k in [512, 1024] {
@@ -1864,11 +1880,15 @@ fn packed_oracle_decode_work_is_linear_in_k() -> Result<(), BuilderAppendError> 
             });
             assert!(matches!(result.unwrap(), Value::Host(_)));
 
-            let budget = LINEAR_BYTES_PER_VALUE * out * k;
-            for (entry, bytes) in [
-                ("PackedDequant", dequant_bytes),
-                ("PackedContraction", contraction_bytes),
+            for (entry, bytes, per_value) in [
+                ("PackedDequant", dequant_bytes, LINEAR_BYTES_PER_VALUE),
+                (
+                    "PackedContraction",
+                    contraction_bytes,
+                    CONTRACTION_BYTES_PER_VALUE,
+                ),
             ] {
+                let budget = per_value * out * k;
                 assert!(
                     bytes <= budget,
                     "{format:?} {entry} K={k}: the oracle allocated {bytes} bytes, over the linear \
@@ -1885,8 +1905,8 @@ fn packed_oracle_decode_work_is_linear_in_k() -> Result<(), BuilderAppendError> 
 /// equal the scalar definition bit for bit: every output is `sum over k of x[r,k] * decode([o,k])`,
 /// summed in K order from `0.0` with the per-element decoder. Q8_0 and Q4_K (multi-super-block rows),
 /// dense and block-diagonal (`blocks = 2`). Mutation: decode weight row `output` instead of
-/// `block * block_out + output` in `evaluate_packed_contraction`; the block-diagonal Q8_0 case goes
-/// red.
+/// `block * block_out + output` in `PackedPayload::decode_row`'s caller (`decode_packed_row`); the
+/// block-diagonal Q8_0 case goes red.
 #[test]
 fn packed_contraction_oracle_decodes_gguf_rows_bit_exactly() -> Result<(), BuilderAppendError> {
     for (format, blocks) in [
@@ -2116,21 +2136,9 @@ fn bind_carriers(graph: &Graph, owner: &Arc<PackedPayload>) -> HashMap<usize, Va
 }
 
 /// Card 545a SC-006, over one weight whose `[out, K]` exceeds the historical
-/// `PACKED_ORACLE_MAX_ELEMENTS`: a packed projection (claimed `PackedContraction`) evaluates through
-/// the row decode, uncapped, each output equal bit for bit to the dot product of the activation with
-/// the decoded row.
-///
-/// Mutation (recorded, never left in the tree): re-adding the cap to the row decode
-/// (`check_packed_oracle_work(rows * block_out, k)` in `evaluate_packed_contraction`) turns the
-/// projection row red with `OracleLimit { resource: "elements", requested: 8448000, limit: 8388608 }`.
-///
-/// Card 554d FLAG: this test used to have a second half asserting that materializing the same weight
-/// (a bare `PackedDequant` as the output) is refused with the fixed cap's `OracleLimit` error. That
-/// fixed cap is gone (`ops/packed.rs`: the packed oracle's allocation limit is now an opt-in
-/// `EvalBudget` the caller states per call); with this file's calls stating `EvalBudget::
-/// UNBOUNDED`, the same materialization now succeeds instead of erroring. Removed rather than
-/// improvised - which `EvalBudget` the materialization path should be bound to, if any, is a
-/// deliberate call-site decision; see this crate's migration report.
+/// `PACKED_ORACLE_MAX_ELEMENTS`: a packed projection (claimed `PackedContraction`) evaluates through its
+/// decomposition (Card 629), the dequantized weight charged to a caller-stated budget, here
+/// `UNBOUNDED`; each output equals bit for bit the dot product of the activation with the decoded row.
 #[test]
 fn a_packed_projection_past_the_oracle_cap_evaluates() {
     use super::recognize_packed_contractions;
@@ -2178,11 +2186,12 @@ fn a_packed_projection_past_the_oracle_cap_evaluates() {
 }
 
 /// SC-008 (first clause): a `PackedContraction` above `EvalBudget::bounded(work, bytes)` is
-/// `EvalError::Budget { needed, limit }` with the literal element count; the same equation under
-/// `EvalBudget::UNBOUNDED` evaluates.
+/// `EvalError::Budget { needed, limit }` with the literal element count of its first intermediate, the
+/// dequantized `[3, 35]` weight (Card 629: the contraction is a composite, so its decomposition's
+/// intermediates are charged); the same equation under `EvalBudget::UNBOUNDED` evaluates.
 ///
-/// Mutation: drop the `opts.charge(...)` call on `OpKind::PackedContraction` in
-/// `walk.rs::evaluate_equation`; the bounded row stops erroring and this test goes red.
+/// Mutation: drop the `opts.charge(...)` of `walk.rs::evaluate_composite`'s loop; the bounded row stops
+/// erroring and this test goes red.
 #[test]
 fn packed_contraction_above_budget_is_refused_unbounded_evaluates() -> Result<(), BuilderAppendError>
 {
@@ -2229,7 +2238,8 @@ fn packed_contraction_above_budget_is_refused_unbounded_evaluates() -> Result<()
         (*scale_id, Value::Packed(scale)),
     ]);
 
-    // The output is [2, 3]: 6 elements, 24 bytes. A 3-element ceiling must refuse before evaluating.
+    // The dequantized weight is [3, 35]: 105 elements, 420 bytes. A 3-element ceiling must refuse before
+    // evaluating.
     let bounded = eval(
         &direct,
         &inputs,
@@ -2241,7 +2251,7 @@ fn packed_contraction_above_budget_is_refused_unbounded_evaluates() -> Result<()
             bounded,
             EvalError::Budget {
                 resource: "elements",
-                needed: 6,
+                needed: 105,
                 limit: 3,
                 ..
             }

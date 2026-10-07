@@ -17,12 +17,17 @@ use crate::dtype_widen::bf16_const_is_packed;
 use crate::*;
 use poot_graph_ir::Storage;
 
-/// Ops that lower through imported-kernel production planning, never through `plan_eqn`.
+/// Ops over a packed weight, planned by the descriptor-driven lowering table (`planner::packed_dequant`),
+/// never through the per-family `plan_eqn` bodies.
 macro_rules! imported_ops {
     () => {
         OpKind::PackedDequant { .. }
             | OpKind::PackedContraction { .. }
             | OpKind::PackedRowGather { .. }
+            | OpKind::ContractionEpilogue {
+                head: ContractionHead::Packed { .. },
+                ..
+            }
     };
 }
 
@@ -30,6 +35,10 @@ macro_rules! imported_ops {
 macro_rules! packed_ops {
     () => {
         OpKind::DenseContraction { .. }
+            | OpKind::ContractionEpilogue {
+                head: ContractionHead::Dense { .. },
+                ..
+            }
             | OpKind::DenseRowGather { .. }
             | OpKind::PackI8
             | OpKind::UnpackI8 { .. }
@@ -39,7 +48,12 @@ macro_rules! packed_ops {
 /// Ops planned by `planner::moe`.
 macro_rules! moe_ops {
     () => {
-        OpKind::IndexedMatMul | OpKind::ArgTopK { .. }
+        OpKind::IndexedMatMul
+            | OpKind::ContractionEpilogue {
+                head: ContractionHead::Indexed,
+                ..
+            }
+            | OpKind::ArgTopK { .. }
     };
 }
 
@@ -59,14 +73,18 @@ macro_rules! elementwise_ops {
 /// Ops planned by `planner::matmul`.
 macro_rules! matmul_ops {
     () => {
-        OpKind::MatMul | OpKind::MatMulBias
+        OpKind::MatMul
+            | OpKind::ContractionEpilogue {
+                head: ContractionHead::MatMul,
+                ..
+            }
     };
 }
 
 /// Ops planned by `planner::attention`.
 macro_rules! attention_ops {
     () => {
-        OpKind::FlashAttentionDecode { .. } | OpKind::FlashAttentionPrefill { .. }
+        OpKind::Attention(_)
     };
 }
 
@@ -114,6 +132,7 @@ mod sampling;
 
 pub use choice::Planned;
 pub use choice::{KernelChoice, NoDispatch};
+pub(crate) use matmul::epilogue_head_lowers;
 
 use std::cell::Cell;
 
@@ -139,7 +158,7 @@ pub(crate) struct PlannedGraph {
 pub(crate) fn plan_graph<V: ValidationChannel>(
     g: &Graph<V>,
     target: &Target,
-    fusion: FusionPolicy,
+    guarded: bool,
     limits: &BodyLimits,
 ) -> Result<PlannedGraph, CompileError> {
     let _scope = CompileScope::enter();
@@ -151,7 +170,7 @@ pub(crate) fn plan_graph<V: ValidationChannel>(
         .eqns
         .iter()
         .map(|eqn| {
-            plan_eqn_compiled(&analysis, g, eqn, target, &views, fusion, limits)
+            plan_eqn_compiled(&analysis, g, eqn, target, &views, guarded, limits)
                 .map(|Planned { plan, choice }| (plan, choice))
         })
         .collect::<Result<Vec<_>, _>>()?
@@ -336,8 +355,8 @@ pub fn plan_eqn_views_analyzed<V: ValidationChannel>(
 }
 
 /// [`plan_eqn_views_analyzed`], keeping the [`KernelChoice`] the plan was built from. A planner test that
-/// asserts on the choice calls it directly. It plans as [`crate::compile`] does under
-/// [`FusionPolicy::Full`]; `compile` itself plans through `plan_eqn_compiled` with the policy it was given.
+/// asserts on the choice calls it directly. It plans as [`crate::compile`] does for a graph with no
+/// routed-expert hang guard; `compile` itself plans through `plan_eqn_compiled` with the guard it decided.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_eqn_choice_analyzed<V: ValidationChannel>(
     analysis: &ExactI32StorageAnalysis<'_, V>,
@@ -350,29 +369,21 @@ pub fn plan_eqn_choice_analyzed<V: ValidationChannel>(
     limits: &BodyLimits,
 ) -> Result<Planned, PlanError> {
     plan_eqn_policy(
-        analysis,
-        g,
-        eqn,
-        backend,
-        world_size,
-        views,
-        caps,
-        FusionPolicy::Full,
-        limits,
+        analysis, g, eqn, backend, world_size, views, caps, false, limits,
     )
 }
 
 /// The single-device per-equation plan [`crate::compile`] makes, in [`plan_graph`] and in its rewrite
-/// legality probes: `target`'s backend and caps, the graph's strided `views`, and the compile's `fusion`
-/// policy, which the contraction choice reads (Card 557: [`FusionPolicy::MoeHangGuard`] keeps a matmul
-/// off the generated tiled GEMM).
+/// legality probes: `target`'s backend and caps, the graph's strided `views`, and whether the compile
+/// `guarded` the routed-expert hang, which the contraction choice reads (Card 557: a guarded compile
+/// keeps a matmul off the generated tiled GEMM).
 pub(crate) fn plan_eqn_compiled<V: ValidationChannel>(
     analysis: &ExactI32StorageAnalysis<'_, V>,
     g: &Graph<V>,
     eqn: &Eqn,
     target: &Target,
     views: &HashMap<ValueId, Layout>,
-    fusion: FusionPolicy,
+    guarded: bool,
     limits: &BodyLimits,
 ) -> Result<Planned, PlanError> {
     plan_eqn_policy(
@@ -383,8 +394,17 @@ pub(crate) fn plan_eqn_compiled<V: ValidationChannel>(
         1,
         views,
         &target.caps,
-        fusion,
+        guarded,
         limits,
+    )
+}
+
+/// Whether `op` can read a BF16 const operand through a packed lane: the `Cast` kernel, and the fused regions
+/// whose `Cast` steps widen their narrow inputs in registers.
+fn reads_narrow_operands(op: &OpKind) -> bool {
+    matches!(
+        op,
+        OpKind::Cast { .. } | OpKind::FusedRow(_) | OpKind::ContractionEpilogue { .. }
     )
 }
 
@@ -397,23 +417,32 @@ fn plan_eqn_policy<V: ValidationChannel>(
     world_size: usize,
     views: &HashMap<ValueId, Layout>,
     caps: &DeviceCaps,
-    fusion: FusionPolicy,
+    guarded: bool,
     limits: &BodyLimits,
 ) -> Result<Planned, PlanError> {
     analysis.ensure_graph(g)?;
     analysis.ensure_eqn(eqn)?;
     let out_shape = g.aval(eqn.out).shape.clone();
     let out_numel = out_numel_saturating(&out_shape);
-    // Card 1011: whether a `Cast` reads its BF16 const source from packed `u32` lanes. The lane is the
-    // storage plan's (`bf16_const_is_packed`), which needs the whole graph, so it is decided here.
-    let packed_cast_source = matches!(eqn.op, OpKind::Cast { .. })
-        && matches!(
-            eqn.inputs.as_slice(),
-            [Operand::Value(src)]
-                if g.meta(*src).storage == Storage::Const
-                    && g.aval(*src).dtype == DType::BF16
-                    && bf16_const_is_packed(g, *src, backend, caps)
-        );
+    // Card 1011: which operands a narrow reader (a `Cast`, or a fused region that widens its input) reads from
+    // packed `u32` lanes. The lane is the storage plan's (`bf16_const_is_packed`), which needs the whole graph,
+    // so it is decided here.
+    let packed_operands: Vec<bool> = if reads_narrow_operands(&eqn.op) {
+        eqn.inputs
+            .iter()
+            .map(|operand| {
+                matches!(
+                    operand,
+                    Operand::Value(src)
+                        if g.meta(*src).storage == Storage::Const
+                            && g.aval(*src).dtype == DType::BF16
+                            && bf16_const_is_packed(g, views, *src, backend, caps)
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     plan_eqn_views_impl(
         analysis.requirement_table(),
         GraphTables::from(g),
@@ -424,8 +453,8 @@ fn plan_eqn_policy<V: ValidationChannel>(
         world_size,
         views,
         caps,
-        fusion,
-        packed_cast_source,
+        guarded,
+        &packed_operands,
         *limits,
     )
 }
@@ -458,8 +487,8 @@ pub(crate) fn plan_eqn_views_impl(
     world_size: usize,
     views: &HashMap<ValueId, Layout>,
     caps: &DeviceCaps,
-    fusion: FusionPolicy,
-    packed_cast_source: bool,
+    guarded: bool,
+    packed_operands: &[bool],
     limits: BodyLimits,
 ) -> Result<Planned, PlanError> {
     count_per_eqn_plan();
@@ -468,9 +497,17 @@ pub(crate) fn plan_eqn_views_impl(
         // Card 542a: a block-32 descriptor (the seven GGUF schemes `packed_block_float::
         // PACKED_LOWERING` admits) reaches here through the descriptor-driven lowering table.
         let odt = g.aval(eqn.out).dtype;
-        if let Some(planned) =
-            packed_dequant::try_plan(g, eqn, out_shape, out_numel, backend, odt, caps, limits)?
-        {
+        if let Some(planned) = packed_dequant::try_plan(
+            g,
+            eqn,
+            out_shape,
+            out_numel,
+            backend,
+            odt,
+            caps,
+            limits,
+            packed_operands,
+        )? {
             return Ok(planned);
         }
         return Err(site.refuse(Capability::ImportedKernelPlanning));
@@ -579,7 +616,7 @@ pub(crate) fn plan_eqn_views_impl(
         let wired = matches!(
             eqn.op,
             OpKind::MatMul
-                | OpKind::MatMulBias
+                | OpKind::ContractionEpilogue { .. }
                 | OpKind::Reshape { .. }
                 | OpKind::Transpose { .. }
                 | OpKind::Slice { .. }
@@ -609,17 +646,58 @@ pub(crate) fn plan_eqn_views_impl(
         // other family falls through to the `finalize` below. No arm returns a plan without it.
         packed_ops!() => {
             return packed::plan(
-                g, eqn, out_shape, out_numel, backend, odt, caps, limits, fusion,
+                g,
+                eqn,
+                out_shape,
+                out_numel,
+                backend,
+                odt,
+                caps,
+                limits,
+                guarded,
+                packed_operands,
             );
         }
-        moe_ops!() => return moe::plan(g, eqn, out_shape, out_numel, backend, odt, caps, limits),
+        moe_ops!() => {
+            return moe::plan(
+                g,
+                eqn,
+                out_shape,
+                out_numel,
+                backend,
+                views,
+                odt,
+                caps,
+                limits,
+                packed_operands,
+            );
+        }
         elementwise_ops!() => elementwise::plan(
-            analysis, g, eqn, out_shape, out_numel, backend, views, odt, caps, limits,
+            analysis,
+            g,
+            eqn,
+            out_shape,
+            out_numel,
+            backend,
+            views,
+            odt,
+            caps,
+            limits,
+            packed_operands,
         )?,
         matmul_ops!() => matmul::plan(
-            g, eqn, out_shape, out_numel, backend, odt, caps, limits, fusion,
+            g,
+            eqn,
+            out_shape,
+            out_numel,
+            backend,
+            odt,
+            caps,
+            limits,
+            guarded,
+            packed_operands,
         )?,
-        attention_ops!() => attention::plan(g, eqn, out_shape, backend, caps, limits)?,
+        attention_ops!() => attention::plan(g, eqn, backend, caps, limits)?,
         cast_ops!() => cast::plan(
             analysis,
             g,
@@ -629,7 +707,7 @@ pub(crate) fn plan_eqn_views_impl(
             backend,
             caps,
             limits,
-            packed_cast_source,
+            packed_operands.first().copied().unwrap_or(false),
         )?,
         movement_ops!() => movement::plan(
             analysis, g, eqn, out_shape, out_numel, backend, views, odt, world_size, caps, limits,

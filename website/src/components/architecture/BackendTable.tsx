@@ -57,7 +57,7 @@ const ROWS: Row[] = [
     wgpu: 'no',
     rocm: 'yes',
     ptx: 'yes',
-    note: 'ROCm: RDNA WMMA, verified on gfx1151. wgpu has a narrow experimental SPIR-V coopmat primitive no model uses yet.',
+    note: 'ROCm: RDNA WMMA, verified on gfx1151. wgpu has a hardware-verified SPIR-V cooperative-matrix matmul (f16 operands, f32 output, K loop, batched) that no model uses yet.',
   },
 ];
 

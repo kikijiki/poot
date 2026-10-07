@@ -49,7 +49,11 @@ pub struct DetailedTiming {
 impl DetailedTiming {
     /// Every step, bounded to `max_retained_steps` records and `max_retained_dispatch_records`
     /// dispatch records, at most `max_in_flight_queries` query resources in flight at once.
-    pub fn every_step(
+    ///
+    /// Test-only until a typed timing mode constructs it in production: the bench runner's Runner
+    /// engines were its one production caller.
+    #[cfg(test)]
+    pub(crate) fn every_step(
         max_retained_steps: usize,
         max_retained_dispatch_records: usize,
         max_in_flight_queries: usize,

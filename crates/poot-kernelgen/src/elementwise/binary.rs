@@ -16,9 +16,8 @@ use super::*;
 /// `x_groups`: `None` keeps the flat `ThreadIndexCall(X)` (one dispatch dimension, capped at
 /// `65535 * workgroup_size` threads by wgpu's `gridDim.x` limit). `Some(xg)` folds the launch onto a 2-D
 /// grid (card 159 Inc 3): read `GroupX`/`GroupY`, form `group_id = GroupY*xg + GroupX`, then
-/// `i = group_id*workgroup_size + LocalX`. This matches the reconstruction in
-/// `pootc/tests/kernels/scatter_update.rs`/`dyn_update_slice.rs`/`index_remap.rs`, so `dispatch_grid`'s
-/// `elementwise_2d_grid(out_numel)` launches the matching grid. The caller must bake
+/// `i = group_id*workgroup_size + LocalX`. This is the fold the movement generator's `Fold` applies, so
+/// `fold_groups` over the output's element count launches the matching grid. The caller must bake
 /// `workgroup_size = [ELEMENTWISE_2D_WIDTH, 1, 1]` on the returned `Body`; this function leaves the
 /// default `[64,1,1]` because it cannot see `poot-graph-plan`'s constant.
 #[allow(clippy::too_many_arguments)]

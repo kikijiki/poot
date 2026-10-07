@@ -512,7 +512,7 @@ fn clz_of_zero_and_sign_bit_are_defined() {
 }
 
 #[test]
-fn select_wrapping_formula_is_not_a_boolean_select() {
+fn select_takes_if_true_for_any_nonzero_condition_word() {
     let b = Builder::new();
     let cond = b.constant("cond", TensorType::new(vec![2], DType::I32));
     let if_true = b.constant("t", TensorType::new(vec![2], DType::I32));
@@ -532,7 +532,7 @@ fn select_wrapping_formula_is_not_a_boolean_select() {
     .output
     .into_host()
     .unwrap();
-    assert_eq!(got.as_i32(), Some(&[17, -4][..]));
+    assert_eq!(got.as_i32(), Some(&[10, 10][..]));
 }
 
 #[test]
@@ -879,7 +879,7 @@ fn exact_i32_compare_sub_select_are_wordwise() {
     let Value::Host(result) = result else {
         panic!("expected a dense I32 result, got {result:?}")
     };
-    assert_eq!(result.as_i32(), Some(&[i32::MIN, i32::MIN][..]));
+    assert_eq!(result.as_i32(), Some(&[0, 1][..]));
 
     let builder = Builder::new();
     let left = helpers::i32_constant(&builder, "tie.left", vec![1]).unwrap();

@@ -52,6 +52,16 @@ pub enum RocmError {
     /// leaked instead of freed. The context refuses every later submission before touching the queue.
     #[error("{op} refused: an earlier GPU wait timed out, so this ROCm context is poisoned")]
     ContextPoisoned { op: &'static str },
+    /// A dispatch whose grid or workgroup size no well-formed AQL packet can carry, refused before any
+    /// ring slot was reserved.
+    #[error("{op} refused dispatch {dispatch} (grid {grid:?}, workgroup {block:?}): {violation}")]
+    InvalidDispatchGeometry {
+        op: &'static str,
+        dispatch: usize,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        violation: DispatchGeometryViolation,
+    },
     /// The queue returned by HSA does not satisfy the requested type/features/size contract.
     #[error("HSA queue contract violation: {0}")]
     QueueContract(String),

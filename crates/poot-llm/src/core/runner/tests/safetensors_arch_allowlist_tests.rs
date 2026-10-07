@@ -1,20 +1,11 @@
-use super::super::{SAFETENSORS_SUPPORTED_ARCHS, validate_safetensors_arch};
+use super::super::unsupported_safetensors_arch;
 use crate::{Runner, RunnerError};
 
-// Card-190-class regression: the safetensors `Runner::load` path must reject any model_type it cannot
-// trace instead of falling through to another family's tracer. Pure-host: no config, SafeTensors, or
-// file.
+// Card-190-class regression: the safetensors `Runner::load` path must refuse any model_type it cannot
+// trace instead of falling through to another family's tracer. Every decoder family is a registered
+// `Model` now, so no model_type loads on the Runner. Pure-host: no config, SafeTensors, or file.
 #[test]
-fn validate_safetensors_arch_rejects_unsupported() {
-    for arch in SAFETENSORS_SUPPORTED_ARCHS {
-        assert!(
-            validate_safetensors_arch(arch).is_ok(),
-            "expected supported arch {arch:?} to be allowed"
-        );
-    }
-    // "mixtral" is a supported arch (see SAFETENSORS_SUPPORTED_ARCHS above and the loop above), so it is
-    // not repeated here: a supported arch in both loops would let the first loop's pass swallow the second
-    // loop's failure.
+fn unsupported_safetensors_arch_refuses_every_model_type() {
     for arch in [
         "qwen2",
         "llama",
@@ -23,20 +14,25 @@ fn validate_safetensors_arch_rejects_unsupported() {
         "qwen2_vl",
         "qwen2_5_vl",
         "gpt-oss",
+        "deepseek_v3",
+        "nemotron_h",
         "totally_unknown",
     ] {
+        let error = unsupported_safetensors_arch(arch).to_string();
         assert!(
-            validate_safetensors_arch(arch).is_err(),
-            "expected unsupported arch {arch:?} to be rejected"
+            !error.is_empty(),
+            "expected {arch:?} to be refused with a typed error"
         );
     }
-    let qwen25_vl_err = validate_safetensors_arch("qwen2_5_vl")
-        .unwrap_err()
-        .to_string();
+    let qwen25_vl_err = unsupported_safetensors_arch("qwen2_5_vl").to_string();
     assert!(
         qwen25_vl_err.contains("load_qwen2_5_vl_text_tower_config_from_files"),
         "qwen2_5_vl error should name the closed config handoff: {qwen25_vl_err}"
     );
+    assert!(matches!(
+        unsupported_safetensors_arch("llama"),
+        RunnerError::UnsupportedModel { .. }
+    ));
 }
 
 /// Card 540b SC-003: `Runner::weight_bytes` must count each weight's stored payload at its stored
@@ -45,9 +41,7 @@ fn validate_safetensors_arch_rejects_unsupported() {
 /// bf16 weight 2x.
 #[test]
 fn weight_bytes_counts_each_weights_stored_dtype_width() {
-    let mut runner = crate::core::decode_arch::fixtures::runner_for(
-        crate::core::decode_arch::DecodeArch::Mixtral,
-    );
+    let mut runner = crate::core::runner::fixtures::bare_runner();
     runner.weights.clear();
     runner.weights.insert(
         "bf16".to_string(),
@@ -62,64 +56,6 @@ fn weight_bytes_counts_each_weights_stored_dtype_width() {
         64 + 128,
         "the bf16 weight counts 2 bytes per element, the f32 weight 4"
     );
-}
-
-/// Card 1008: `Runner::weight_value` binds a stored weight as stored. A stored dtype that differs from the
-/// dtype the traced graph declares for its const is a typed error naming the weight and both dtypes, in every
-/// direction (a stored BF16 weight bound to an F32 const included: no widening at bind).
-///
-/// Mutation: restore the BF16/F16 -> F32 widening arm in `weight_value`; the first case turns red.
-#[test]
-fn weight_value_binds_as_stored_and_refuses_every_dtype_mismatch() {
-    use poot_graph_ir::TensorType;
-    use poot_tensor::{DType, HostTensor};
-
-    let mut runner = crate::core::decode_arch::fixtures::runner_for(
-        crate::core::decode_arch::DecodeArch::Mixtral,
-    );
-    runner.weights.clear();
-    let words: Vec<u16> = vec![0x3f80, 0x8000, 0xc02e, 0x0080, 0x7f80, 0x4049];
-    runner.weights.insert(
-        "bf16".to_string(),
-        HostTensor::bf16(vec![2, 3], words.clone()).into(),
-    );
-    runner.weights.insert(
-        "f32".to_string(),
-        HostTensor::f32(vec![2, 3], vec![1.0; 6]).into(),
-    );
-    runner.weights.insert(
-        "f16".to_string(),
-        HostTensor::f16(vec![2, 3], vec![0x3c00; 6]).into(),
-    );
-    let declared = |dtype| TensorType::new(vec![2, 3], dtype);
-
-    let as_declared = runner
-        .weight_value("bf16", &declared(DType::BF16))
-        .expect("a matching dtype binds as stored");
-    assert_eq!(
-        as_declared.into_host().unwrap().as_half().unwrap(),
-        words.as_slice()
-    );
-
-    for (name, stored, declared_dtype) in [
-        ("bf16", DType::BF16, DType::F32),
-        ("f16", DType::F16, DType::F32),
-        ("f32", DType::F32, DType::BF16),
-        ("f16", DType::F16, DType::BF16),
-    ] {
-        let error = runner
-            .weight_value(name, &declared(declared_dtype))
-            .expect_err("a stored/declared dtype mismatch is refused");
-        assert!(
-            matches!(
-                super::stored_dtype_tests::stored_dtype_error(&error),
-                crate::core::runner::weights::StoredDtypeError::Mismatch {
-                    name: n, stored: s, declared: d
-                } if n == name && *s == stored && *d == declared_dtype
-            ),
-            "{error}"
-        );
-    }
 }
 
 /// Write `config.json` into a fresh directory and return it. The loader must refuse before it looks for a
@@ -170,11 +106,9 @@ fn deepseek_v4_checkpoint_is_refused_with_the_typed_unknown_architecture_error()
 #[test]
 fn every_deleted_exact_family_is_refused_with_its_architecture_string() {
     for (model_type, config) in [
-        // Card 595 SC-002: gemma4 and qwen3_next lost their private runtimes; the loader names them like any
-        // other unknown architecture until cards 574 and 575 land them on the driver.
-        ("gemma4", r#"{"model_type":"gemma4"}"#),
+        // Card 595 SC-002: qwen3_next lost its private runtime; the loader names it like any other unknown
+        // architecture until card 575 lands it on the driver.
         ("qwen3_next", r#"{"model_type":"qwen3_next"}"#),
-        ("minimax_m2", r#"{"model_type":"minimax_m2"}"#),
         (
             "glm5_next",
             r#"{"model_type":"glm5_next","text_config":{"model_type":"glm5_next_text"}}"#,
@@ -225,12 +159,13 @@ fn config_without_a_string_model_type_is_refused_before_any_weight_read() {
     }
 }
 
-// Card 595 SC-002 (GGUF route): a GGUF whose `general.architecture` is gemma4 or qwen35moe (Qwen3-Next) is
-// refused with the typed unknown-architecture error naming the architecture string, before any tensor is
-// read. The file holds metadata only, so a loader that kept a route for either family would have to read
-// tensors (and fail differently) rather than name the architecture.
+// Card 595 SC-002 (GGUF route): a GGUF whose `general.architecture` is qwen35moe (Qwen3-Next) is refused
+// with the typed unknown-architecture error naming the architecture string, before any tensor is read; a
+// gemma4 GGUF is a registered family (POOT-574) and is refused as one. The file holds metadata only, so a
+// loader that kept a route for either family would have to read tensors (and fail differently) rather
+// than name the architecture.
 #[test]
-fn gemma4_and_qwen3next_ggufs_are_refused_with_the_typed_unknown_architecture_error() {
+fn qwen3next_and_gemma4_ggufs_are_refused_by_the_runner_naming_the_architecture() {
     use poot_load::gguf::{GgufValue, write_gguf};
     for arch in ["gemma4", "qwen35moe"] {
         let bytes = write_gguf(
@@ -243,10 +178,15 @@ fn gemma4_and_qwen3next_ggufs_are_refused_with_the_typed_unknown_architecture_er
             Ok(_) => panic!("{arch} gguf must not load"),
             Err(error) => error,
         };
-        let RunnerError::UnsupportedModel { model_type, .. } = &error else {
-            panic!("{arch}: expected RunnerError::UnsupportedModel, got {error:?}");
-        };
-        assert_eq!(model_type, arch);
+        match (arch, &error) {
+            ("gemma4", RunnerError::RegisteredFamily { family }) => {
+                assert_eq!(family.as_str(), arch);
+            }
+            ("qwen35moe", RunnerError::UnsupportedModel { model_type, .. }) => {
+                assert_eq!(model_type, arch);
+            }
+            _ => panic!("{arch}: unexpected refusal {error:?}"),
+        }
     }
 }
 
@@ -257,7 +197,7 @@ fn gemma4_and_qwen3next_ggufs_are_refused_with_the_typed_unknown_architecture_er
 /// goes red.
 #[test]
 fn a_registered_familys_checkpoint_is_refused_by_the_runner() {
-    for model_type in ["qwen2", "llama", "granite", "bloom"] {
+    for model_type in ["qwen2", "llama", "granite", "bloom", "minimax_m2", "gemma4"] {
         let dir = poot_test_util::unique_temp_path(format!("poot_card737_registered_{model_type}"));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(

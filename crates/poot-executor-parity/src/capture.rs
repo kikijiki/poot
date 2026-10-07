@@ -9,7 +9,6 @@ use poot_graph_ir::ops::{
     rmsnorm, rope, sigmoid, silu, softplus,
 };
 use poot_graph_ir::{BinOp, Builder, Slot, StateRole, TensorType, UnOp};
-use poot_graph_plan::FusionPolicy;
 use poot_tensor::{DType, HostTensor};
 
 use poot_test_util::StepFixture;
@@ -165,7 +164,7 @@ fn toy_fixture(name: &'static str, bias: bool) -> Fixture {
         graph,
         store,
         steps,
-        fusion: FusionPolicy::Full,
+        guarded: false,
     }
 }
 

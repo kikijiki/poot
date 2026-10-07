@@ -12,7 +12,7 @@ use poot_quant::format::{Storage, WeightFormat};
 use super::decode_plan::DecodePlan;
 use super::planar::PlanarPlan;
 use crate::KernelGenError;
-use crate::contraction::{GemvLaunch, Schedule, TileSize, gemv_body};
+use crate::contraction::{Epilogue, GemvEpilogue, GemvLaunch, Schedule, TileSize, gemv_body};
 use crate::emit::{Emit, bin, copy, cu, emit_read_meta};
 use crate::helpers::{Alloc, elem, guard, ld, local, slice_dtype, slice_f32};
 
@@ -29,16 +29,6 @@ pub enum PackedKernelOp {
     Materialize,
     /// `out[r, :] = decode(ids[r], :)`: `Gather(axis 0)` over `PackedDequant`.
     RowGather,
-    /// `PackedContraction` and the ADR-0109 indexed and grouped forms.
-    Contraction { rows: RowSelect, schedule: Schedule },
-}
-
-/// Which weight rows an output row reads.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum RowSelect {
-    Dense,
-    Indexed,
-    Grouped,
 }
 
 /// `metadata[0]`: every generated body reads `K` (and further shape facts, by op) from this
@@ -49,22 +39,38 @@ pub fn packed_kernel(name: &str, spec: PackedKernelSpec) -> Result<Body, KernelG
     match spec.op {
         PackedKernelOp::Materialize => materialize(name, spec.format),
         PackedKernelOp::RowGather => row_gather(name, spec.format),
-        PackedKernelOp::Contraction { rows, schedule } => {
-            if rows != RowSelect::Dense {
-                return Err(KernelGenError::UnsupportedDescriptor {
-                    format: spec.format,
-                    reason: "RowSelect::Indexed/Grouped are not yet generated (542a covers Dense)",
-                });
-            }
-            match schedule {
-                Schedule::Gemv {
-                    width,
-                    cols,
-                    unroll,
-                } => contraction_gemv(name, spec.format, GemvLaunch::new(width, cols, unroll)?),
-                Schedule::Tiled { tile } => contraction_tiled(name, spec.format, tile),
-            }
-        }
+    }
+}
+
+/// The packed operand load of a [`crate::ContractionSpec`]: `format`'s descriptor-driven decode served to
+/// `schedule`'s loop nest, with `epilogue` applied to each column's sum before its store. The Gemv carries an
+/// epilogue (its leaves ride between the weight sources and the metadata); the tiled schedule has none yet,
+/// so an epilogue on it is a typed refusal.
+pub(crate) fn packed_contraction(
+    name: &str,
+    format: WeightFormat,
+    schedule: Schedule,
+    epilogue: Option<&Epilogue>,
+) -> Result<Body, KernelGenError> {
+    if let Some(epilogue) = epilogue {
+        epilogue.require_f32("packed_contraction")?;
+    }
+    match schedule {
+        Schedule::Gemv {
+            width,
+            cols,
+            unroll,
+        } => contraction_gemv(
+            name,
+            format,
+            GemvLaunch::new(width, cols, unroll)?,
+            epilogue,
+        ),
+        Schedule::Tiled { .. } if epilogue.is_some() => Err(KernelGenError::Unsupported {
+            request: "packed_contraction",
+            reason: "a packed Tiled contraction has no epilogue",
+        }),
+        Schedule::Tiled { tile } => contraction_tiled(name, format, tile),
     }
 }
 
@@ -304,26 +310,39 @@ fn row_gather(name: &str, format: WeightFormat) -> Result<Body, KernelGenError> 
 /// index; `blocks == 1` is the ordinary dense GEMV) and `b = col_flat / out_per_block`. Params
 /// `(activation, words, metadata, out)` - activation first, matching `OpKind::PackedContraction`'s
 /// own operand order (card 542a production wiring, D9). `metadata` is `[K, out_per_block]`;
-/// `activation` is `[blocks, K]` (one row per block, `M == 1`).
+/// `activation` is `[blocks, K]` (one row per block, `M == 1`). With an `epilogue` its leaves are
+/// parameters between `words` and `metadata`, and it runs over each column's sum before the store.
 fn contraction_gemv(
     name: &str,
     format: WeightFormat,
     launch: GemvLaunch,
+    epilogue: Option<&Epilogue>,
 ) -> Result<Body, KernelGenError> {
     let descriptor = format.descriptor();
     if let Storage::Planar(_) = descriptor.storage {
-        return contraction_gemv_planar(name, format, launch);
+        return contraction_gemv_planar(name, format, launch, epilogue);
     }
     let plan = DecodePlan::of(&descriptor)?;
     let values = plan.values();
-    let al = Alloc::new(vec![
+    let leaf_count = epilogue.map_or(0, Epilogue::leaf_count);
+    let lanes = match epilogue {
+        Some(epilogue) => epilogue.lanes("packed_contraction")?,
+        None => Vec::new(),
+    };
+    let mut params = vec![
         ld(Ty::Unit, false),
         ld(slice_f32(false), false),
         ld(slice_dtype(Ty::U32, false), false),
-        ld(slice_dtype(Ty::U32, false), false),
-        ld(slice_f32(true), true),
-    ]);
-    let (activation, words, metadata, out) = (local(1), local(2), local(3), local(4));
+    ];
+    if let Some(epilogue) = epilogue {
+        params.extend(lanes.iter().map(|&lane| epilogue.leaf_param(lane)));
+    }
+    params.push(ld(slice_dtype(Ty::U32, false), false));
+    params.push(ld(slice_f32(true), true));
+    let al = Alloc::new(params);
+    let (activation, words) = (local(1), local(2));
+    let leaves: Vec<Local> = (0..leaf_count).map(|j| local(3 + j as u32)).collect();
+    let (metadata, out) = (local(3 + leaf_count as u32), local(4 + leaf_count as u32));
     // A run of `count` elements starting at a multiple of `count` stays inside one block when
     // `count` divides the block, so the block is addressed once; when `count` also divides the
     // factor run, the run's factors are decoded once and shared by all its elements. Otherwise each
@@ -362,9 +381,14 @@ fn contraction_gemv(
     Ok(gemv_body(
         name,
         al,
-        4,
+        4 + leaf_count as u32,
         [activation, metadata, out],
         launch,
+        epilogue.map(|epilogue| GemvEpilogue {
+            epilogue,
+            leaves: &leaves,
+            lanes: &lanes,
+        }),
         decode_run,
     ))
 }
@@ -377,21 +401,33 @@ fn contraction_gemv_planar(
     name: &str,
     format: WeightFormat,
     launch: GemvLaunch,
+    epilogue: Option<&Epilogue>,
 ) -> Result<Body, KernelGenError> {
     let descriptor = format.descriptor();
     let plan = PlanarPlan::of(&descriptor)?;
     let n = plan.source_count();
+    let leaf_count = epilogue.map_or(0, Epilogue::leaf_count);
+    let lanes = match epilogue {
+        Some(epilogue) => epilogue.lanes("packed_contraction")?,
+        None => Vec::new(),
+    };
     let mut params = vec![ld(Ty::Unit, false), ld(slice_f32(false), false)];
     for _ in 0..n {
         params.push(ld(slice_dtype(Ty::U32, false), false));
+    }
+    if let Some(epilogue) = epilogue {
+        params.extend(lanes.iter().map(|&lane| epilogue.leaf_param(lane)));
     }
     params.push(ld(slice_dtype(Ty::U32, false), false));
     params.push(ld(slice_f32(true), true));
     let al = Alloc::new(params);
     let activation = local(1);
     let sources: Vec<Local> = (0..n as u32).map(|idx| local(2 + idx)).collect();
-    let metadata = local(2 + n as u32);
-    let out = local(3 + n as u32);
+    let leaves: Vec<Local> = (0..leaf_count)
+        .map(|j| local(2 + n as u32 + j as u32))
+        .collect();
+    let metadata = local(2 + (n + leaf_count) as u32);
+    let out = local(3 + (n + leaf_count) as u32);
     let decode_run =
         |e: &mut Emit, row: Local, k0: Local, count: usize, k: Local, out_total: Local| {
             (0..count)
@@ -405,9 +441,14 @@ fn contraction_gemv_planar(
     Ok(gemv_body(
         name,
         al,
-        3 + n as u32,
+        3 + (n + leaf_count) as u32,
         [activation, metadata, out],
         launch,
+        epilogue.map(|epilogue| GemvEpilogue {
+            epilogue,
+            leaves: &leaves,
+            lanes: &lanes,
+        }),
         decode_run,
     ))
 }
@@ -421,7 +462,11 @@ fn contraction_gemv_planar(
 /// `a_k >= K`, `col >= out_per_block`, `b_k >= K`) is masked to zero after a clamped, in-bounds read,
 /// never branched on - the same RADV-safe shape `tiled_region_impl` (the hand-written GGUF
 /// `TiledRegionDequant` family this schedule's production callers replaced, dquant.md D6/Q9, since
-/// deleted by card 545b) uses for its own cooperative load. Performance (K-unroll, multi-row-per-lane
+/// deleted by card 545b) uses for its own cooperative load.
+///
+/// Known duplication (POOT-728 review): this tiled loop nest is a parallel copy of the dense tiled region's,
+/// not yet one tiled body parameterized by an operand load; the follow-up card replaces it (the Gemv
+/// already rides the shared `gemv_body`). Performance (K-unroll, multi-row-per-lane
 /// coarsening) is out of this card's scope; only one output element per lane, one K-tile per barrier
 /// round. Params `(activation, words, metadata, out)` - activation first, matching
 /// `OpKind::PackedContraction`'s own operand order (card 542a production wiring, D9); `metadata` is
@@ -506,7 +551,7 @@ fn contraction_tiled(
     );
     // `x_groups` (`metadata[3]`): the number of tiles the fold-aware planner placed along the X grid
     // dim - `g = gy*x_groups + gx` recovers the flat block-major tile index `try_plan_contraction`
-    // laid out, exactly as `gemv_lds`/`flash_region_prefill` recover their own flat index over a
+    // laid out, exactly as `gemv_lds`/`attention_body` recover their own flat index over a
     // `GroupY`-spilled grid. Unfolded, `x_groups` is the real tile count and `gy` is always 0, so `g`
     // is unchanged from a plain `GroupX` read.
     let meta3 = setup.let_(Ty::Usize, Rvalue::Use(cu(3)));

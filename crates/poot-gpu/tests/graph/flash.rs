@@ -1,43 +1,48 @@
 use super::*;
+use poot_graph_ir::AttentionAttrs;
 use poot_graph_ir::ops::{attention_prefill, attention_prefill_softcap};
-use poot_graph_plan::{ImportedKernel, KernelChoice};
-use poot_kernelgen::{AttentionSpec, ContractionSpec, KernelRequest};
+use poot_graph_plan::KernelChoice;
+use poot_kernelgen as kg;
+use poot_kernelgen::{AttentionSpec, ContractionSpec, KernelRequest, MaskKind, ScoreTransform};
 
-/// Whether a choice is the generated region flash decode (`kg::flash_region_decode`), the planner's
-/// choice for every decode within `FLASH_LDS_CAP` (Card 557).
-fn is_region_decode(choice: &KernelChoice) -> bool {
-    matches!(
-        choice,
-        KernelChoice::Generated(KernelRequest::Attention(AttentionSpec::RegionDecode { .. }))
-    )
+/// The attention request a choice generated, if it generated one.
+fn generated_attention(choice: &KernelChoice) -> Option<&AttentionSpec> {
+    match choice {
+        KernelChoice::Generated(KernelRequest::Attention(spec)) => Some(spec),
+        _ => None,
+    }
 }
 
-/// Whether a choice is the generated region flash prefill (`kg::flash_region_prefill`).
-fn is_region_prefill(choice: &KernelChoice) -> bool {
+/// Whether a choice is the generated attention kernel over one query row per sequence (decode).
+fn is_attention_decode(choice: &KernelChoice) -> bool {
+    generated_attention(choice).is_some_and(|spec| spec.lq == 1)
+}
+
+/// Whether a choice is the generated attention kernel over several query rows (prefill).
+fn is_attention_prefill(choice: &KernelChoice) -> bool {
+    generated_attention(choice).is_some_and(|spec| spec.lq > 1)
+}
+
+/// Whether a choice is the generated attention kernel carrying an attention-logit softcap.
+fn is_softcapped_attention(choice: &KernelChoice) -> bool {
+    generated_attention(choice)
+        .is_some_and(|spec| matches!(spec.score, ScoreTransform::ScaleSoftcap { .. }))
+}
+
+/// Whether a choice is the generated tiled GEMM (`kg::tiled_region`), one dispatch or split.
+fn is_tiled_region(choice: &KernelChoice) -> bool {
     matches!(
         choice,
-        KernelChoice::Generated(KernelRequest::Attention(
-            AttentionSpec::RegionPrefill { .. }
+        KernelChoice::Generated(KernelRequest::Contraction(
+            ContractionSpec::TiledRegion { .. }
         ))
     )
 }
 
-/// Whether a choice is the generated tiled GEMM (`kg::tiled_region`), one dispatch or chunked.
-fn is_tiled_region(choice: &KernelChoice) -> bool {
-    match choice {
-        KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::TiledRegion {
-            ..
-        })) => true,
-        KernelChoice::Chunked(chunks) => chunks.iter().all(is_tiled_region),
-        _ => false,
-    }
-}
-
 #[test]
 fn flash_decode_gpu_matches_cpu() {
-    // The traced decode attention chain, which `compile` fuses into `FlashAttentionDecode` and the planner
-    // lowers to the generated region flash decode (D within the LDS cap), matches CPU eval of the same
-    // graph (`attention_masked`). GQA with Hq=4/Hkv=2 (n_rep=2), cap=3 with the last position masked
+    // The traced decode attention chain, which `compile` fuses into `Attention` and the planner
+    // lowers to the generated attention kernel, matches CPU eval of the same graph (`attention_masked`). GQA with Hq=4/Hkv=2 (n_rep=2), cap=3 with the last position masked
     // out, D=4, scale=0.5.
     use poot_graph_ir::builder::Builder;
     let _gpu_guard = gpu_lock();
@@ -55,10 +60,8 @@ fn flash_decode_gpu_matches_cpu() {
     let y = attention_masked(&b, q, k, v, n_rep, scale, mask);
     let (qi, ki, vi, mi) = (q.id, k.id, v.id, mask.id);
     let g = b.finish(y);
-    let choice = compiled_choice(&g, &target, |op| {
-        matches!(op, OpKind::FlashAttentionDecode { .. })
-    });
-    assert!(is_region_decode(&choice), "{choice:?}");
+    let choice = compiled_choice(&g, &target, |op| matches!(op, OpKind::Attention(_)));
+    assert!(is_attention_decode(&choice), "{choice:?}");
     let qd: Vec<f32> = (0..hq * d).map(|i| (i as f32) * 0.1 - 0.3).collect();
     let kd: Vec<f32> = (0..hkv * cap * d)
         .map(|i| (i as f32) * 0.05 - 0.2)
@@ -95,10 +98,9 @@ fn flash_decode_gpu_matches_cpu() {
 }
 
 #[test]
-fn synthesized_flash_region_decode_matches_cpu() {
-    // A traced decode attention compiles to `FlashAttentionDecode`, which the planner lowers via the generated
-    // `kg::flash_region_decode` (online softmax, o[D] in LDS; Card 557: the choice is the planner's). Confirm
-    // the compiled choice is the synthesized kernel and `gpu.run == eval` (== attention_masked) over a couple
+fn attention_decode_matches_cpu() {
+    // A traced decode attention compiles to `Attention`, which the planner lowers to the generated attention
+    // kernel (online softmax, partials in LDS). Confirm the compiled choice is that kernel and `gpu.run == eval` (== attention_masked) over a couple
     // of head dims, with the last KV position masked out.
     use poot_graph_ir::builder::Builder;
     let _gpu_guard = gpu_lock();
@@ -118,11 +120,11 @@ fn synthesized_flash_region_decode_matches_cpu() {
         let g = b.finish(y);
 
         let choice = compiled_choice(&g, &spirv_fixture_target(), |op| {
-            matches!(op, OpKind::FlashAttentionDecode { .. })
+            matches!(op, OpKind::Attention(_))
         });
         assert!(
-            is_region_decode(&choice),
-            "expected the synthesized flash_region_decode choice, got {choice:?}"
+            is_attention_decode(&choice),
+            "expected the generated attention decode, got {choice:?}"
         );
 
         let fill = |seed: u64, n: usize| -> Vec<f32> {
@@ -176,13 +178,180 @@ fn synthesized_flash_region_decode_matches_cpu() {
     eprintln!("synthesized flash region decode (graph path) runs GPU==CPU");
 }
 
+/// Every row below has more keys than the kernel has lanes, so each lane walks several keys and the running
+/// maximum, denominator and output are rescaled between them (a kernel that skipped the rescale only passes a
+/// fixture whose lanes see one key each). Decode at `B = 1` over a long cache (64 wide: 32 lanes, 200 keys),
+/// decode at D = 512 (4 lanes, 48 keys, the head width SPIR-V used to refuse), batched decode at `B = 4`
+/// (D = 128: 16 lanes, 96 keys) and a prefill over 100 rows (D = 64), each against the CPU oracle with a
+/// mask that hides a different tail per batch row.
 #[test]
-fn synthesized_flash_region_decode_batched_matches_cpu() {
-    // The synthesized flash decode handles batched (B>1) decode: `kg::flash_region_decode` decodes `gi = batch*Hq + head`
-    // (qbase/kvbase/maskbase offset by batch), so in-flight-batched serving decode uses the generated kernel, not the imported
-    // `flash_decode.rs`. Compile a traced B>1 attention, confirm the planner chose the synthesized kernel, and
-    // check `gpu.run == eval` (== attention_masked per batch row) over random shapes. B=1 is covered by
-    // `synthesized_flash_region_decode_matches_cpu`.
+fn attention_over_many_key_tiles_matches_cpu() {
+    use poot_graph_ir::builder::Builder;
+    // (batch, hq, hkv, lq, lk, d): decode has lq == 1, prefill lq == lk (prefill into a cache has its own row).
+    let rows: [(usize, usize, usize, usize, usize, usize); 4] = [
+        (1, 4, 2, 1, 200, 64),
+        (1, 2, 1, 1, 48, 512),
+        (4, 4, 2, 1, 96, 128),
+        (1, 2, 2, 100, 100, 64),
+    ];
+    let _gpu_guard = gpu_lock();
+    let Some((mut gpu, target)) = open_engine_or_skip() else {
+        return;
+    };
+    let fill = |seed: u64, n: usize| -> Vec<f32> {
+        let mut s = seed | 1;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+            })
+            .collect()
+    };
+    for (batch, hq, hkv, lq, lk, d) in rows {
+        let n_rep = hq / hkv;
+        let scale = 1.0 / (d as f32).sqrt();
+        let b = Builder::new();
+        let q = b.constant("q", TensorType::f32(vec![batch, hq, lq, d]));
+        let k = b.constant("k", TensorType::f32(vec![batch, hkv, lk, d]));
+        let v = b.constant("v", TensorType::f32(vec![batch, hkv, lk, d]));
+        let mask = b.constant("mask", TensorType::f32(vec![batch, 1, lq, lk]));
+        let ids = [q.id, k.id, v.id, mask.id];
+        let y = attention_masked(&b, q, k, v, n_rep, scale, mask);
+        let g = b.finish(y);
+        let choice = compiled_choice(&g, &spirv_fixture_target(), |op| {
+            matches!(op, OpKind::Attention(_))
+        });
+        let kg::AttentionSchedule::Streaming { lanes } = generated_attention(&choice)
+            .unwrap_or_else(|| panic!("d={d}: expected the generated attention, got {choice:?}"))
+            .schedule;
+        assert!(lk > lanes, "d={d}: {lk} keys must exceed the {lanes} lanes");
+
+        // Batch row `bi` shows its first `lk - 7 * bi` keys (decode), or the causal prefix (prefill).
+        let md: Vec<f32> = (0..batch * lq * lk)
+            .map(|i| {
+                let (bi, row, key) = (i / (lq * lk), (i / lk) % lq, i % lk);
+                let visible = if lq == 1 {
+                    key < lk - 7 * bi
+                } else {
+                    key <= row
+                };
+                if visible { 0.0 } else { -1.0e9 }
+            })
+            .collect();
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            ids[0],
+            HostTensor::f32(vec![batch, hq, lq, d], fill(1, batch * hq * lq * d)),
+        );
+        inputs.insert(
+            ids[1],
+            HostTensor::f32(vec![batch, hkv, lk, d], fill(2, batch * hkv * lk * d)),
+        );
+        inputs.insert(
+            ids[2],
+            HostTensor::f32(vec![batch, hkv, lk, d], fill(3, batch * hkv * lk * d)),
+        );
+        inputs.insert(ids[3], HostTensor::f32(vec![batch, 1, lq, lk], md));
+        let eval_inputs: HashMap<_, Value> = inputs
+            .iter()
+            .map(|(&id, t)| (id, Value::from(t.clone())))
+            .collect();
+        let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+            .unwrap()
+            .output
+            .into_host()
+            .unwrap();
+        let got = run_via_contract(&mut gpu, target, &g, &inputs);
+        assert_eq!(got.shape(), vec![batch, hq, lq, d]);
+        let max_abs = max_abs_error(got.as_f32().unwrap(), cpu.as_f32().unwrap());
+        assert!(
+            max_abs <= 1e-3,
+            "B={batch} Hq={hq} Lq={lq} Lk={lk} D={d} ({lanes} lanes): max abs diff {max_abs}"
+        );
+    }
+}
+
+/// Prefill into a cache: `1 < Lq < Lk`. Three new query rows attend an 8-slot cache whose first five slots
+/// hold the prefix, so row `i` sees keys `0..=5 + i`. The traced chain goes through the matcher, the planner
+/// and the device, and is compared with the oracle. A kernel that indexed the mask row with `Lq` instead of
+/// `Lk` reads the wrong plane offset and goes red.
+#[test]
+fn attention_prefill_into_a_cache_matches_cpu() {
+    use poot_graph_ir::builder::Builder;
+    let (hq, hkv, lq, lk, d) = (4usize, 2usize, 3usize, 8usize, 16usize);
+    let _gpu_guard = gpu_lock();
+    let Some((mut gpu, target)) = open_engine_or_skip() else {
+        return;
+    };
+    let fill = |seed: u64, n: usize| -> Vec<f32> {
+        let mut s = seed | 1;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+            })
+            .collect()
+    };
+    let b = Builder::new();
+    let q = b.constant("q", TensorType::f32(vec![1, hq, lq, d]));
+    let k = b.constant("k", TensorType::f32(vec![1, hkv, lk, d]));
+    let v = b.constant("v", TensorType::f32(vec![1, hkv, lk, d]));
+    let mask = b.constant("m", TensorType::f32(vec![1, 1, lq, lk]));
+    let ids = [q.id, k.id, v.id, mask.id];
+    let y = attention_prefill(&b, q, k, v, hq / hkv, 0.25, mask);
+    let g = b.finish(y);
+    let choice = compiled_choice(&g, &spirv_fixture_target(), |op| {
+        matches!(op, OpKind::Attention(_))
+    });
+    let spec = generated_attention(&choice)
+        .unwrap_or_else(|| panic!("expected the generated attention, got {choice:?}"));
+    assert_eq!((spec.lq, spec.lk), (lq, lk), "{choice:?}");
+    let md: Vec<f32> = (0..lq * lk)
+        .map(|i| if i % lk <= 5 + i / lk { 0.0 } else { -1.0e9 })
+        .collect();
+    let mut inputs = HashMap::new();
+    inputs.insert(
+        ids[0],
+        HostTensor::f32(vec![1, hq, lq, d], fill(1, hq * lq * d)),
+    );
+    inputs.insert(
+        ids[1],
+        HostTensor::f32(vec![1, hkv, lk, d], fill(2, hkv * lk * d)),
+    );
+    inputs.insert(
+        ids[2],
+        HostTensor::f32(vec![1, hkv, lk, d], fill(3, hkv * lk * d)),
+    );
+    inputs.insert(ids[3], HostTensor::f32(vec![1, 1, lq, lk], md));
+    let eval_inputs: HashMap<_, Value> = inputs
+        .iter()
+        .map(|(&id, t)| (id, Value::from(t.clone())))
+        .collect();
+    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        .unwrap()
+        .output
+        .into_host()
+        .unwrap();
+    let got = run_via_contract(&mut gpu, target, &g, &inputs);
+    assert_eq!(got.shape(), vec![1, hq, lq, d]);
+    let max_abs = max_abs_error(got.as_f32().unwrap(), cpu.as_f32().unwrap());
+    assert!(
+        max_abs <= 1e-4,
+        "prefill into a cache: max abs diff {max_abs}"
+    );
+}
+
+#[test]
+fn attention_batched_decode_matches_cpu() {
+    // The generated attention kernel handles batched (B>1) decode: the flat workgroup index is
+    // `(batch*Hq + head)*Lq + row`, with the q/k/v/mask offsets following the batch. Compile a traced B>1
+    // attention, confirm the planner chose the generated kernel, and check `gpu.run == eval`
+    // (== attention_masked per batch row) over random shapes. B=1 is covered by
+    // `attention_decode_matches_cpu`.
     use poot_graph_ir::builder::Builder;
     let _gpu_guard = gpu_lock();
     let Some((mut gpu, target)) = open_engine_or_skip() else {
@@ -227,11 +396,11 @@ fn synthesized_flash_region_decode_batched_matches_cpu() {
         let g = b.finish(y);
 
         let choice = compiled_choice(&g, &spirv_fixture_target(), |op| {
-            matches!(op, OpKind::FlashAttentionDecode { .. })
+            matches!(op, OpKind::Attention(_))
         });
         assert!(
-            is_region_decode(&choice),
-            "expected the synthesized batched flash_region_decode choice, got {choice:?}"
+            is_attention_decode(&choice),
+            "expected the generated attention decode, got {choice:?}"
         );
 
         let md: Vec<f32> = (0..bsz * cap)
@@ -291,11 +460,10 @@ fn synthesized_flash_region_decode_batched_matches_cpu() {
 }
 
 #[test]
-fn synthesized_flash_region_prefill_matches_cpu() {
-    // A traced prefill attention compiles to `FlashAttentionPrefill`, which the planner lowers via the generated
-    // `kg::flash_region_prefill` (online softmax, o[D] in LDS, 2-D Hq*L grid) instead of the imported
-    // `flash_prefill.rs` (Card 557: the choice is the planner's). Confirm the compiled choice is the synthesized
-    // kernel and `gpu.run == eval` (== attention_prefill) with a causal mask.
+fn attention_prefill_matches_cpu() {
+    // A traced prefill attention compiles to `Attention`, which the planner lowers to the generated attention
+    // kernel (online softmax, partials in LDS, one workgroup per (head, row) on a 2-D grid). Confirm the
+    // compiled choice is that kernel and `gpu.run == eval` (== attention_prefill) with a causal mask.
     use poot_graph_ir::builder::Builder;
     let _gpu_guard = gpu_lock();
     let Some((mut gpu, target)) = open_engine_or_skip() else {
@@ -314,11 +482,11 @@ fn synthesized_flash_region_prefill_matches_cpu() {
         let g = b.finish(o);
 
         let choice = compiled_choice(&g, &spirv_fixture_target(), |op| {
-            matches!(op, OpKind::FlashAttentionPrefill { .. })
+            matches!(op, OpKind::Attention(_))
         });
         assert!(
-            is_region_prefill(&choice),
-            "expected the synthesized flash_region_prefill choice, got {choice:?}"
+            is_attention_prefill(&choice),
+            "expected the generated attention prefill, got {choice:?}"
         );
 
         let fill = |seed: u64, n: usize| -> Vec<f32> {
@@ -375,13 +543,10 @@ fn synthesized_flash_region_prefill_matches_cpu() {
 }
 
 #[test]
-fn flash_region_prefill_d512_matches_cpu() {
-    // Card 185: gemma4's global attention layers use head_dim D=512, above the FLASH_LDS_CAP=256 of the imported
-    // flash-decode/flash-prefill kernels (fixed `[f32;256]` LDS array). The synthesized flash-prefill kernel
-    // (`kg::flash_region_prefill`) sizes its LDS `o[D]` scratch dynamically, with its own
-    // FLASH_PREFILL_LDS_CAP=512 (2KB, well under the per-workgroup LDS budget on both backends). Regression test for that cap:
-    // the planner must choose the region prefill for a D=512 B=1 prefill (not reject it or leave it on the
-    // fixed-256 imported kernel), and the kernel must be correct (gpu.run == eval). Small L/Hq keeps the run
+fn attention_prefill_d512_matches_cpu() {
+    // Card 185: gemma4's global attention layers use head_dim D=512. The generated attention kernel sizes its
+    // LDS partials from the device's workgroup memory (a few lanes at D=512), so the planner must choose it
+    // for a D=512 prefill (not reject it), and the kernel must be correct (gpu.run == eval). Small L/Hq keeps the run
     // fast; varied random inputs so an indexing bug or near-tie shows in max_abs/max_rel.
     use poot_graph_ir::builder::Builder;
     let _gpu_guard = gpu_lock();
@@ -401,11 +566,11 @@ fn flash_region_prefill_d512_matches_cpu() {
     let g = b.finish(o);
 
     let choice = compiled_choice(&g, &spirv_fixture_target(), |op| {
-        matches!(op, OpKind::FlashAttentionPrefill { .. })
+        matches!(op, OpKind::Attention(_))
     });
     assert!(
-        is_region_prefill(&choice),
-        "the B=1 D=512 prefill should choose the synthesized flash_region_prefill (cap 512), got {choice:?}"
+        is_attention_prefill(&choice),
+        "the B=1 D=512 prefill should choose the generated attention, got {choice:?}"
     );
 
     let fill = |seed: u64, n: usize| -> Vec<f32> {
@@ -566,10 +731,10 @@ fn synthesized_production_kernels_random_shapes_match_cpu() {
             let o = attention_prefill(&b, q, k, v, n_rep, scale, mask);
             let g = b.finish(o);
             let choice = compiled_choice(&g, &spirv_fixture_target(), |op| {
-                matches!(op, OpKind::FlashAttentionPrefill { .. })
+                matches!(op, OpKind::Attention(_))
             });
             assert!(
-                is_region_prefill(&choice),
+                is_attention_prefill(&choice),
                 "seed {seed}: prefill should choose the region prefill, got {choice:?}"
             );
             let maskd: Vec<f32> = (0..l * l)
@@ -620,10 +785,10 @@ fn synthesized_production_kernels_random_shapes_match_cpu() {
             let o = attention_masked(&b, q, k, v, n_rep, scale, mask);
             let g = b.finish(o);
             let choice = compiled_choice(&g, &spirv_fixture_target(), |op| {
-                matches!(op, OpKind::FlashAttentionDecode { .. })
+                matches!(op, OpKind::Attention(_))
             });
             assert!(
-                is_region_decode(&choice),
+                is_attention_decode(&choice),
                 "seed {seed}: decode should choose the region decode, got {choice:?}"
             );
             // mask: a random KV position masked out (exercise the masked online softmax).
@@ -783,7 +948,7 @@ fn flash_decode_plan_selection() {
     // A traced decode attention with D within the LDS cap compiles to the generated region flash decode on
     // both backends (Card 557: the planner's choice). No GPU.
     //
-    // This pins the request contract between the planner and `kg::flash_region_decode`: the shape, the
+    // This pins the request contract between the planner and the attention generator: the shape, the
     // GQA ratio, the scale as its bits (0.5 -> 0x3f000000, not always 1/sqrt(D)) and the mask layout. Card
     // 259: the broadcast `[1,1,1,cap]` and the per-head `[1,Hq,1,cap]` (ALiBi) masks are different
     // requests, since a wrong mask stride is a silently wrong mask read on the shared path every non-ALiBi
@@ -804,36 +969,32 @@ fn flash_decode_plan_selection() {
             caps: poot_test_util::device_caps::default_caps_for(backend),
         };
         compiled_choice(&b.finish(y), &target, |op| {
-            matches!(op, OpKind::FlashAttentionDecode { .. })
+            matches!(op, OpKind::Attention(_))
         })
     };
     for backend in [Backend::SpirvVulkan, Backend::Nvptx] {
         for (mask_heads, per_head) in [(1usize, false), (4, true)] {
-            match choice_for_mask(mask_heads, backend) {
-                KernelChoice::Generated(KernelRequest::Attention(
-                    AttentionSpec::RegionDecode {
-                        bsz,
-                        hq,
-                        n_rep,
-                        cap,
-                        d,
-                        scale_bits,
-                        mask_per_head,
-                        ..
-                    },
-                )) => {
-                    assert_eq!(
-                        (bsz, hq, n_rep, cap, d, scale_bits),
-                        (1, 4, 2, 3, 4, 0.5f32.to_bits()),
-                        "{backend:?}"
-                    );
-                    assert_eq!(
-                        mask_per_head, per_head,
-                        "{backend:?} mask heads {mask_heads}"
-                    );
-                }
-                other => panic!("{backend:?}: expected the generated region decode, got {other:?}"),
-            }
+            let choice = choice_for_mask(mask_heads, backend);
+            let Some(spec) = generated_attention(&choice) else {
+                panic!("{backend:?}: expected the generated attention, got {choice:?}");
+            };
+            assert_eq!(
+                (spec.batch, spec.hq, spec.n_rep, spec.lq, spec.lk, spec.dk),
+                (1, 4, 2, 1, 3, 4),
+                "{backend:?}"
+            );
+            assert_eq!(
+                spec.score,
+                ScoreTransform::Scale {
+                    scale_bits: 0.5f32.to_bits()
+                },
+                "{backend:?}"
+            );
+            assert_eq!(
+                spec.mask == MaskKind::PerHead,
+                per_head,
+                "{backend:?} mask heads {mask_heads}"
+            );
         }
     }
 }
@@ -972,11 +1133,7 @@ fn flash_prefill_gpu_2d_grid_over_65535_workgroups() {
     let mut plan = b.append_plan(0);
     let o = plan
         .equation(
-            OpKind::FlashAttentionPrefill {
-                n_rep,
-                scale,
-                softcap: None,
-            },
+            OpKind::Attention(AttentionAttrs::new(n_rep, scale, None)),
             ids.map(poot_graph_ir::Operand::Value).to_vec(),
         )
         .expect("stage the flash prefill");
@@ -985,8 +1142,8 @@ fn flash_prefill_gpu_2d_grid_over_65535_workgroups() {
     let id = b.commit_append(&mut prepared).expect("commit");
     let g = b.finish(poot_graph_ir::Traced { id });
     assert!(
-        is_region_prefill(&compiled_choice(&g, &target, |op| {
-            matches!(op, OpKind::FlashAttentionPrefill { .. })
+        is_attention_prefill(&compiled_choice(&g, &target, |op| {
+            matches!(op, OpKind::Attention(_))
         })),
         "the over-cap flash prefill plans the generated region prefill"
     );
@@ -1061,7 +1218,7 @@ fn decomposed_prefill_attention_over_65535_query_groups_matches_cpu() {
             .graph()
             .eqns
             .iter()
-            .any(|e| matches!(e.op, OpKind::FlashAttentionPrefill { .. })),
+            .any(|e| matches!(e.op, OpKind::Attention(_))),
         "the over-grid prefill stays the decomposed chain"
     );
     let maskd: Vec<f32> = (0..l * l)
@@ -1101,10 +1258,9 @@ fn decomposed_prefill_attention_over_65535_query_groups_matches_cpu() {
 
 #[test]
 fn flash_prefill_gpu_matches_cpu_over_random_shapes() {
-    // Flash prefill (FlashAttentionPrefill, one workgroup per (head, query row), online softmax, running output o[D] in
-    // LDS) on the wgpu executor == CPU eval (== attention_prefill_softcap). Both kernels the planner chooses between are
-    // covered (Card 557): odd seeds carry an attention-logit softcap, which only the imported `flash_prefill.rs`
-    // implements, so they take it; even seeds take the generated region prefill. Sweeps random Hkv / n_rep / D / L
+    // Prefill attention (one workgroup per (head, query row), online softmax, partials in LDS) on the wgpu
+    // executor == CPU eval (== attention_prefill_softcap). Odd seeds carry an attention-logit softcap, even
+    // seeds none: one generated kernel, two score transforms. Sweeps random Hkv / n_rep / D / L
     // with a causal mask; D <= 256 and Hq*L <= 65535. 24 seeds.
     let _gpu_guard = gpu_lock();
     let Some((mut gpu, target)) = open_engine_or_skip() else {
@@ -1149,18 +1305,15 @@ fn flash_prefill_gpu_matches_cpu_over_random_shapes() {
         let o = attention_prefill_softcap(&b, q, k, v, n_rep, scale, mask, softcap);
         let g = b.finish(o);
         let choice = compiled_choice(&g, &spirv_fixture_target(), |op| {
-            matches!(op, OpKind::FlashAttentionPrefill { .. })
+            matches!(op, OpKind::Attention(_))
         });
-        let imported = matches!(
-            choice,
-            KernelChoice::Imported {
-                kernel: ImportedKernel::FlashPrefill,
-                ..
-            }
+        assert!(
+            is_attention_prefill(&choice),
+            "seed {seed} softcap {softcap:?}: {choice:?}"
         );
         assert_eq!(
-            (imported, is_region_prefill(&choice)),
-            (softcap.is_some(), softcap.is_none()),
+            is_softcapped_attention(&choice),
+            softcap.is_some(),
             "seed {seed} softcap {softcap:?}: {choice:?}"
         );
         // additive causal mask: 0 if j<=t else -1e9.
@@ -1297,14 +1450,16 @@ fn synthesized_tiled_region_element_by_element_matches_cpu() {
 #[test]
 fn synthesized_tiled_region_perf_is_competitive_with_imported() {
     // The synthesized tiled GEMM (`kg::tiled_region`, the default) must not be materially slower than the imported coarsened
-    // kernel (same structure, so perf should be ~equal). Time the same GEMM compiled under `FusionPolicy::MoeHangGuard`
-    // (which keeps it off the generated tiled GEMM: the imported coarsened kernel, `is_tiled_gemm`) vs `FusionPolicy::Full`
+    // kernel (same structure, so perf should be ~equal). Time the same GEMM compiled under the routed-expert hang guard
+    // (which keeps it off the generated tiled GEMM: the imported coarsened kernel, `is_tiled_gemm`) vs the full pipeline
     // (the synthesized default, Card 557's contraction choice) over many iterations in one run (the box is noisy; the
     // ratio is the signal). Assert the synthesized path is within 2x (a generous sanity bound, not a perf claim).
-    use poot_graph_plan::FusionPolicy;
     use std::time::Instant;
     let _gpu_guard = gpu_lock();
     let Some((mut gpu, target)) = open_engine_or_skip() else {
+        return;
+    };
+    let Some(mut hung) = open_hung_engine_or_skip() else {
         return;
     };
     let (m, k, n) = (128usize, 2048usize, 2048usize);
@@ -1313,8 +1468,8 @@ fn synthesized_tiled_region_perf_is_competitive_with_imported() {
     let w = b.constant("w", TensorType::f32(vec![k, n]));
     let out = b.matmul(x, w);
     let g = b.finish(out);
-    let choice_under = |fusion: FusionPolicy| {
-        let program = staged_replay_with(&g, target, fusion);
+    let choice_under = |guarded: bool| {
+        let program = staged_replay_with(&g, target, guarded);
         let stage = program.stages().next().expect("single stage").2;
         let eqn = stage
             .graph()
@@ -1324,15 +1479,15 @@ fn synthesized_tiled_region_perf_is_competitive_with_imported() {
             .expect("the matmul");
         stage.kernel_choice(eqn).clone()
     };
-    let synth_choice = choice_under(FusionPolicy::Full);
+    let synth_choice = choice_under(false);
     assert!(
         is_tiled_region(&synth_choice),
-        "Full should choose the synthesized tiled GEMM: {synth_choice:?}"
+        "The full pipeline should choose the synthesized tiled GEMM: {synth_choice:?}"
     );
-    let imported_choice = choice_under(FusionPolicy::MoeHangGuard);
+    let imported_choice = choice_under(true);
     assert!(
         !is_tiled_region(&imported_choice),
-        "MoeHangGuard should leave the matmul on the imported tiled GEMM: {imported_choice:?}"
+        "The hang guard should leave the matmul on the imported tiled GEMM: {imported_choice:?}"
     );
     let xd: Vec<f32> = (0..m * k).map(|i| ((i % 7) as f32) * 0.1 - 0.3).collect();
     let wd: Vec<f32> = (0..k * n).map(|i| ((i % 5) as f32) * 0.08 - 0.16).collect();
@@ -1344,8 +1499,8 @@ fn synthesized_tiled_region_perf_is_competitive_with_imported() {
     // compile/add_entry/remove_entry/unload, which would charge planning overhead equally to both
     // graphs and dilute the real kernel-time ratio this test measures). `add_entry`'s own first
     // `step` records; that call is the warmup, and only the following replayed steps are timed.
-    let time = |exec: &mut dyn Executor, fusion: FusionPolicy| -> f64 {
-        let (exe, entry) = add_resident_entry_with(exec, target, &g, &inputs, fusion);
+    let time = |exec: &mut dyn Executor, guarded: bool| -> f64 {
+        let (exe, entry) = add_resident_entry_with(exec, target, &g, &inputs, guarded);
         step_resident(exec, exe, entry, &g); // warmup: records the entry
         let iters = 30;
         let t0 = Instant::now();
@@ -1357,8 +1512,8 @@ fn synthesized_tiled_region_perf_is_competitive_with_imported() {
         exec.unload(exe).unwrap();
         dt
     };
-    let t_imported = time(&mut gpu, FusionPolicy::MoeHangGuard);
-    let t_synth = time(&mut gpu, FusionPolicy::Full);
+    let t_imported = time(&mut hung, true);
+    let t_synth = time(&mut gpu, false);
     let ratio = t_synth / t_imported.max(1e-9);
     eprintln!(
         "tiled GEMM {m}x{k}x{n}: imported {:.3}ms vs synthesized {:.3}ms (ratio {ratio:.2}x)",
@@ -1377,7 +1532,7 @@ fn synthesized_tiled_region_chunked_large_matches_cpu() {
     // The synthesized tiled GEMM (`kg::tiled_region`) also chunks a >= 2^15-tile GEMM into sub-2^15 dispatches (each a baked
     // `tile_offset` variant), so the synthesized path handles any size on RADV. Same 544x8192 shape as the imported chunked
     // test (34816 tiles -> 2 chunks); the planner's contraction choice (Card 557) takes the synthesized tiled GEMM, and
-    // this asserts the compiled choice is chunked and `gpu.run == CPU eval`.
+    // this asserts the compiled plan is split and `gpu.run == CPU eval`.
     let _gpu_guard = gpu_lock();
     let Some((mut gpu, target)) = open_engine_or_skip() else {
         return;
@@ -1388,25 +1543,17 @@ fn synthesized_tiled_region_chunked_large_matches_cpu() {
     let w = b.constant("w", TensorType::f32(vec![k, n]));
     let out = b.matmul(x, w);
     let g = b.finish(out);
-    let n_chunks = match compiled_choice(&g, &spirv_fixture_target(), |op| {
-        matches!(op, OpKind::MatMul)
-    }) {
-        KernelChoice::Chunked(choices) => {
-            assert!(
-                choices.iter().all(|choice| matches!(
-                    choice,
-                    KernelChoice::Generated(KernelRequest::Contraction(
-                        ContractionSpec::TiledRegion { .. }
-                    ))
-                )),
-                "chunks should be the synthesized tiled_region kernel: {choices:?}"
-            );
-            choices.len()
-        }
-        other => {
-            panic!("expected a chunked choice for a 34816-tile synthesized GEMM, got {other:?}")
-        }
-    };
+    let program = compile_full(&g, &spirv_fixture_target());
+    let (eqn, plan) = program
+        .planned()
+        .find(|(eqn, _)| matches!(eqn.op, OpKind::MatMul))
+        .expect("the compiled graph holds the matmul");
+    let choice = program.kernel_choice(eqn);
+    assert!(
+        is_tiled_region(choice),
+        "chunks should be the synthesized tiled_region kernel: {choice:?}"
+    );
+    let n_chunks = plan.dispatches().len();
     assert_eq!(n_chunks, 2, "34816 tiles / 32767-per-chunk = 2 chunks");
 
     let xd: Vec<f32> = (0..m * k).map(|i| ((i % 7) as f32) * 0.1 - 0.3).collect();
@@ -1442,10 +1589,9 @@ fn synthesized_tiled_region_chunked_large_matches_cpu() {
     eprintln!("synthesized chunked tiled GEMM: {m}x{k}x{n} -> 2 chunks, GPU==CPU");
 }
 
-/// Card 259: real-wgpu dispatch of the per-head flash-attention mask, the layout ALiBi needs. Covers every flash kernel
-/// the planner chooses (Card 557) in one GPU session: the synthesized region decode and region prefill (strides baked
-/// into the generated Body) and the imported flash prefill, chosen for a softcapped prefill (per-head stride rides as
-/// the `dims[8]` metadata word). Each is checked against the CPU oracle, which is checked against a hand-rolled ALiBi
+/// Card 259: real-wgpu dispatch of the per-head attention mask, the layout ALiBi needs. Covers the generated
+/// attention kernel in all three forms in one GPU session: decode, prefill and softcapped prefill (the mask
+/// plane stride is baked into the generated Body). Each is checked against the CPU oracle, which is checked against a hand-rolled ALiBi
 /// forward pass in `poot-eval`'s `alibi_attention` tests.
 ///
 /// The mask is a real ALiBi mask (visibility plus `-slope[h]*(pos-t)`) and every head has a different slope, so a kernel that
@@ -1554,22 +1700,12 @@ fn flash_per_head_alibi_mask_gpu_matches_cpu() {
     let assert_choice =
         |label: &str, g: &poot_graph_ir::Graph, want: &dyn Fn(&KernelChoice) -> bool| {
             let choice = compiled_choice(g, &spirv_fixture_target(), |op| {
-                matches!(
-                    op,
-                    OpKind::FlashAttentionDecode { .. } | OpKind::FlashAttentionPrefill { .. }
-                )
+                matches!(op, OpKind::Attention(_))
             });
             assert!(want(&choice), "{label}: unexpected choice {choice:?}");
         };
-    let is_imported_prefill = |choice: &KernelChoice| {
-        matches!(
-            choice,
-            KernelChoice::Imported {
-                kernel: ImportedKernel::FlashPrefill,
-                ..
-            }
-        )
-    };
+    let is_softcapped_prefill =
+        |choice: &KernelChoice| is_attention_prefill(choice) && is_softcapped_attention(choice);
 
     // (1) the synthesized region decode, the planner's only decode choice within the LDS cap.
     {
@@ -1619,14 +1755,14 @@ fn flash_per_head_alibi_mask_gpu_matches_cpu() {
         );
         bcast_inputs.insert(bmi, HostTensor::f32(vec![1, 1, 1, cap], head0));
 
-        assert_choice("synthesized flash region decode", &g, &is_region_decode);
+        assert_choice("generated attention decode", &g, &is_attention_decode);
         assert_choice(
-            "synthesized flash region decode (bcast)",
+            "generated attention decode (bcast)",
             &gb,
-            &is_region_decode,
+            &is_attention_decode,
         );
         check(
-            "synthesized flash region decode",
+            "generated attention decode",
             &g,
             &inputs,
             &gb,
@@ -1635,12 +1771,12 @@ fn flash_per_head_alibi_mask_gpu_matches_cpu() {
         );
     }
 
-    // (2) the synthesized region prefill (no softcap) + (3) the imported flash prefill, which the planner
-    // chooses for a softcapped prefill (the region prefill has no softcap). The large cap keeps the softcap
-    // nearly linear over these scores, so the per-head mask difference still shows.
+    // (2) the prefill and (3) the softcapped prefill, one generated kernel with a different score transform.
+    // The large cap keeps the softcap nearly linear over these scores, so the per-head mask difference still
+    // shows.
     for (label, softcap) in [
-        ("synthesized flash region prefill", None),
-        ("imported flash prefill", Some(50.0f32)),
+        ("generated attention prefill", None),
+        ("generated attention softcapped prefill", Some(50.0f32)),
     ] {
         let l = 6usize;
         let b = Builder::new();
@@ -1688,12 +1824,146 @@ fn flash_per_head_alibi_mask_gpu_matches_cpu() {
         bcast_inputs.insert(bmi, HostTensor::f32(vec![1, 1, l, l], head0));
 
         let want: &dyn Fn(&KernelChoice) -> bool = if softcap.is_some() {
-            &is_imported_prefill
+            &is_softcapped_prefill
         } else {
-            &is_region_prefill
+            &is_attention_prefill
         };
         assert_choice(label, &g, want);
         assert_choice(label, &gb, want);
         check(label, &g, &inputs, &gb, &bcast_inputs, &mut gpu);
     }
+}
+
+/// Run `g` on the device and on the CPU oracle with the same operands and return the worst absolute
+/// difference; the operands are deterministic fills, the `mask` the caller's.
+fn device_vs_oracle(
+    gpu: &mut Engine<WgpuDevice>,
+    target: poot_graph_plan::Target,
+    g: &poot_graph_ir::Graph,
+    operands: &[(poot_graph_ir::ValueId, Vec<usize>, u32)],
+    mask: (poot_graph_ir::ValueId, Vec<usize>, Vec<f32>),
+) -> f32 {
+    let mut inputs = HashMap::new();
+    for (id, shape, seed) in operands {
+        let n = shape.iter().product::<usize>();
+        let data: Vec<f32> = (0..n)
+            .map(|i| ((i as f32 + *seed as f32) * 0.37).sin() * 0.5)
+            .collect();
+        inputs.insert(*id, HostTensor::f32(shape.clone(), data));
+    }
+    inputs.insert(mask.0, HostTensor::f32(mask.1, mask.2));
+    let eval_inputs: HashMap<_, Value> = inputs
+        .iter()
+        .map(|(&id, t)| (id, Value::from(t.clone())))
+        .collect();
+    let cpu = eval(g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        .unwrap()
+        .output
+        .into_host()
+        .unwrap();
+    let got = run_via_contract(gpu, target, g, &inputs);
+    assert_eq!(got.shape(), cpu.shape());
+    got.as_f32()
+        .unwrap()
+        .iter()
+        .zip(cpu.as_f32().unwrap())
+        .map(|(a, b)| {
+            if (a - b).is_nan() {
+                f32::INFINITY
+            } else {
+                (a - b).abs()
+            }
+        })
+        .fold(0.0, f32::max)
+}
+
+/// SC-001 on wgpu, Gemma2: a GQA decode with attention-logit softcapping (scores reach well past the cap) is
+/// the generated attention carrying its softcap and matches the CPU oracle within tier 2. Mutation: restore
+/// the decode softcap decline in `match_attention`; the chain stays materialized and the choice assertion fails.
+#[test]
+fn gemma2_softcap_decode_gpu_matches_cpu() {
+    use poot_graph_ir::builder::Builder;
+    let _gpu_guard = gpu_lock();
+    let Some((mut gpu, target)) = open_engine_or_skip() else {
+        return;
+    };
+    let (hq, hkv, cap, d) = (4usize, 2usize, 40usize, 32usize);
+    let b = Builder::new();
+    let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d]));
+    let k = b.constant("k", TensorType::f32(vec![1, hkv, cap, d]));
+    let v = b.constant("v", TensorType::f32(vec![1, hkv, cap, d]));
+    let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
+    // Scale 4.0 pushes the raw scores far past the cap of 3.0.
+    let y =
+        poot_graph_ir::ops::attention_masked_softcap(&b, q, k, v, hq / hkv, 4.0, mask, Some(3.0));
+    let (qi, ki, vi, mi) = (q.id, k.id, v.id, mask.id);
+    let g = b.finish(y);
+    let choice = compiled_choice(&g, &target, |op| matches!(op, OpKind::Attention(_)));
+    assert!(
+        is_attention_decode(&choice) && is_softcapped_attention(&choice),
+        "{choice:?}"
+    );
+    let mut mask_data = vec![0.0; cap];
+    mask_data[cap - 7..].fill(-1.0e9);
+    let worst = device_vs_oracle(
+        &mut gpu,
+        target,
+        &g,
+        &[
+            (qi, vec![1, hq, 1, d], 1),
+            (ki, vec![1, hkv, cap, d], 2),
+            (vi, vec![1, hkv, cap, d], 3),
+        ],
+        (mi, vec![1, 1, 1, cap], mask_data),
+    );
+    assert!(
+        worst <= 1e-4,
+        "device differs from the oracle by {worst:.3e}"
+    );
+}
+
+/// SC-001 on wgpu, DeepSeek-V2 MLA: `dk` 192 (`k_nope` 128 per head plus the one shared 64-wide `k_pe`) and a
+/// 128-wide value, a split key, over more keys than lanes. The choice is the generated split-key attention
+/// and the device matches the CPU oracle within tier 2. Mutation: drop the split-key recognition in
+/// `peel_key`; the chain stays materialized and the choice assertion fails.
+#[test]
+fn deepseek_v2_mla_split_key_decode_gpu_matches_cpu() {
+    use poot_graph_ir::builder::Builder;
+    let _gpu_guard = gpu_lock();
+    let Some((mut gpu, target)) = open_engine_or_skip() else {
+        return;
+    };
+    let (hq, cap, nope, rope, dv) = (2usize, 70usize, 128usize, 64usize, 128usize);
+    let b = Builder::new();
+    let q = b.constant("q", TensorType::f32(vec![1, hq, 1, nope + rope]));
+    let k_nope = b.constant("k_nope", TensorType::f32(vec![1, hq, cap, nope]));
+    let k_pe = b.constant("k_pe", TensorType::f32(vec![1, 1, cap, rope]));
+    let v = b.constant("v", TensorType::f32(vec![1, hq, cap, dv]));
+    let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
+    let key = b.concat(3, &[k_nope, poot_graph_ir::ops::repeat_kv(&b, k_pe, hq)]);
+    let y = poot_graph_ir::ops::attention_masked(&b, q, key, v, 1, 0.07, mask);
+    let ids = (q.id, k_nope.id, k_pe.id, v.id, mask.id);
+    let g = b.finish(y);
+    let choice = compiled_choice(&g, &target, |op| matches!(op, OpKind::Attention(_)));
+    let spec = generated_attention(&choice).expect("the MLA chain is the generated attention");
+    assert_eq!(spec.key, kg::KeyLayout::Split { shared_dim: rope });
+    assert_eq!((spec.dk, spec.dv), (nope + rope, dv));
+    let mut mask_data = vec![0.0; cap];
+    mask_data[cap - 9..].fill(-1.0e9);
+    let worst = device_vs_oracle(
+        &mut gpu,
+        target,
+        &g,
+        &[
+            (ids.0, vec![1, hq, 1, nope + rope], 1),
+            (ids.1, vec![1, hq, cap, nope], 2),
+            (ids.2, vec![1, 1, cap, rope], 3),
+            (ids.3, vec![1, hq, cap, dv], 4),
+        ],
+        (ids.4, vec![1, 1, 1, cap], mask_data),
+    );
+    assert!(
+        worst <= 1e-4,
+        "device differs from the oracle by {worst:.3e}"
+    );
 }

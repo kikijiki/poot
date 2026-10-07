@@ -270,9 +270,9 @@ fn named_usize_const_from_body(body: &smir::Body, name: &str) -> Option<u32> {
     };
     let from_rvalue = |rv: &smir::Rvalue| -> Option<u32> {
         match rv {
-            smir::Rvalue::Use(op) | smir::Rvalue::UnaryOp(_, op) | smir::Rvalue::Cast(_, op, _) => {
-                from_operand(op)
-            }
+            smir::Rvalue::Use(op, _)
+            | smir::Rvalue::UnaryOp(_, op)
+            | smir::Rvalue::Cast(_, op, _) => from_operand(op),
             smir::Rvalue::BinaryOp(_, a, b) => from_operand(a).or_else(|| from_operand(b)),
             _ => None,
         }
@@ -347,7 +347,6 @@ fn rewrite_slice_reads(blocks: &mut [kir::BasicBlock], loopvar: kir::Local, slic
             | kir::Rvalue::IntScalarUnary(_, op)
             | kir::Rvalue::Cast { operand: op, .. }
             | kir::Rvalue::Bitcast { operand: op, .. }
-            | kir::Rvalue::Fp8Decode { operand: op, .. }
             | kir::Rvalue::Fp8Encode { operand: op, .. } => fix_operand(op, loopvar, slice),
             kir::Rvalue::BinaryOp(_, a, b) => {
                 fix_operand(a, loopvar, slice);
@@ -515,7 +514,7 @@ fn analyze_range_loops(body: &smir::Body) -> R<Loops> {
                     smir::Rvalue::Discriminant(_) => {
                         support.insert(dest.local);
                     }
-                    smir::Rvalue::Use(smir::Operand::Copy(p) | smir::Operand::Move(p))
+                    smir::Rvalue::Use(smir::Operand::Copy(p) | smir::Operand::Move(p), _)
                     | smir::Rvalue::Ref(_, _, p)
                         if p.projection.is_empty() =>
                     {
@@ -607,7 +606,7 @@ fn analyze_range_loops(body: &smir::Body) -> R<Loops> {
             .find_map(|s| {
                 if let smir::StatementKind::Assign(
                     dest,
-                    smir::Rvalue::Use(smir::Operand::Copy(p) | smir::Operand::Move(p)),
+                    smir::Rvalue::Use(smir::Operand::Copy(p) | smir::Operand::Move(p), _),
                 ) = &s.kind
                     && p.projection
                         .iter()
@@ -719,7 +718,7 @@ fn stmt_is_iter_plumbing(
     }
     match rv {
         smir::Rvalue::Aggregate(..) | smir::Rvalue::Discriminant(_) => true,
-        smir::Rvalue::Use(smir::Operand::Copy(p) | smir::Operand::Move(p)) => p
+        smir::Rvalue::Use(smir::Operand::Copy(p) | smir::Operand::Move(p), _) => p
             .projection
             .iter()
             .any(|e| matches!(e, smir::ProjectionElem::Downcast(_))),
@@ -870,7 +869,7 @@ fn map_binop(op: smir::BinOp) -> R<kir::BinOp> {
 
 fn map_rvalue(rv: &smir::Rvalue) -> R<kir::Rvalue> {
     match rv {
-        smir::Rvalue::Use(op) => Ok(kir::Rvalue::Use(map_operand(op)?)),
+        smir::Rvalue::Use(op, _) => Ok(kir::Rvalue::Use(map_operand(op)?)),
         smir::Rvalue::BinaryOp(op, a, b) => Ok(kir::Rvalue::BinaryOp(
             map_binop(*op)?,
             map_operand(a)?,
@@ -1057,7 +1056,7 @@ fn map_terminator(
             }
             // `f32::from_bits(u32)` becomes a `Bitcast` to f32 (reinterprets the bits, not a numeric `as`
             // cast), so a kernel can read an f32 carried in a u32 buffer, e.g. an attention `scale` in the
-            // u32 `Plan::ComputeMeta` dims buffer. One arg (no `self`).
+            // u32 launch dims buffer. One arg (no `self`).
             if args.len() == 1
                 && callee_full_name(func, body)
                     .as_deref()

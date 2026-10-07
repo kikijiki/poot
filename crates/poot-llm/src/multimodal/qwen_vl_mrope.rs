@@ -1117,7 +1117,7 @@ pub(crate) fn bind_qwen2_5_vl_prefill_kv_embeds_inputs(
     for &id in &graph.inputs {
         let meta = graph.meta(id);
         let tensor = match meta.storage {
-            Storage::Computed(computed) => HostTensor::f32(computed.shape(), computed.values_f32()),
+            Storage::Computed(computed) => computed.tensor(),
             Storage::Slot(Slot::Mask) => {
                 let name = meta
                     .name

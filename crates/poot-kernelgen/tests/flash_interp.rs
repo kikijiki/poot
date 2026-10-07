@@ -1,68 +1,45 @@
-//! Verifies that `flash_attention_decode`'s Body computes `flash_decode_ref` on the kernel-IR reference
-//! interpreter, without a GPU. The flash kernel is NVPTX-only (private `o[D]` array), so its only hardware
-//! target is RunPod; interpreting the Body here confirms it is a faithful translation of the recurrence,
-//! leaving only NVPTX codegen lowering for the RunPod run.
+//! The generated attention kernel against the textbook two-pass attention, on the kernel-IR reference
+//! interpreter (no GPU). Every row builds its body through `generate`, the one seam the planner uses, and
+//! launches it on the grid that call returns, so the lane count, the 2-D fold and the workgroup shape are
+//! the production ones.
 
-use poot_kernel_ir::Body;
 use poot_kernel_ir::interp::{Buffer, run};
 use poot_kernelgen as kg;
-use poot_test_util::kernel_fixtures::workgroups_covering;
+use poot_target::DeviceCaps;
+use poot_test_util::kernel_fixtures::{attention_reference, attention_reference_keys};
 use poot_test_util::{assert_close, max_abs_error};
 
-/// Run `body` with one thread per head over `params` (param local i -> params[i-1]) and return the output,
-/// the last param.
-fn interpret(body: &Body, params: [&[f32]; 5], threads: usize) -> Vec<f32> {
-    let mut buffers = params.map(Buffer::from_f32s);
-    run(body, workgroups_covering(body, threads), &mut buffers).unwrap();
-    buffers[4].to_f32s().unwrap()
-}
-
-#[allow(clippy::too_many_arguments)]
-fn flash_decode_ref(
-    q: &[f32],
-    k: &[f32],
-    v: &[f32],
-    mask: &[f32],
+fn spec(
+    batch: usize,
     hq: usize,
     n_rep: usize,
-    cap: usize,
+    lq: usize,
+    lk: usize,
     d: usize,
-    scale: f32,
-    // 0 for a broadcast `[cap]` mask, `cap` for a per-head `[Hq, cap]` (ALiBi) mask.
-    mask_head_stride: usize,
-) -> Vec<f32> {
-    let mut out = vec![0.0f32; hq * d];
-    for h in 0..hq {
-        let kv = h / n_rep;
-        let mut m = f32::NEG_INFINITY;
-        let mut l = 0.0f32;
-        let mut o = vec![0.0f32; d];
-        for t in 0..cap {
-            let mut s = 0.0f32;
-            for dd in 0..d {
-                s += q[h * d + dd] * k[kv * cap * d + t * d + dd];
-            }
-            s = s * scale + mask[h * mask_head_stride + t];
-            let m_new = m.max(s);
-            // card 674: `m_new == -inf` means every position up to and including this one is masked;
-            // `(m - m_new).exp()`/`(s - m_new).exp()` would be `(-inf - -inf).exp() = NaN.exp() = NaN`.
-            // Nothing has been seen yet, so this step contributes zero weight.
-            let (corr, e) = if m_new == f32::NEG_INFINITY {
-                (0.0, 0.0)
-            } else {
-                ((m - m_new).exp(), (s - m_new).exp())
-            };
-            l = l * corr + e;
-            for dd in 0..d {
-                o[dd] = o[dd] * corr + e * v[kv * cap * d + t * d + dd];
-            }
-            m = m_new;
-        }
-        for dd in 0..d {
-            out[h * d + dd] = o[dd] / l;
-        }
+) -> kg::AttentionSpec {
+    kg::AttentionSpec {
+        batch,
+        hq,
+        n_rep,
+        lq,
+        lk,
+        dk: d,
+        dv: d,
+        key: kg::KeyLayout::Single,
+        score: kg::ScoreTransform::Scale {
+            scale_bits: (1.0 / (d as f32).sqrt()).to_bits(),
+        },
+        mask: kg::MaskKind::Broadcast,
+        bound: kg::KeyBound::Static,
+        schedule: kg::AttentionSchedule::Streaming { lanes: 4 },
     }
-    out
+}
+
+fn with_lanes(spec: kg::AttentionSpec, lanes: usize) -> kg::AttentionSpec {
+    kg::AttentionSpec {
+        schedule: kg::AttentionSchedule::Streaming { lanes },
+        ..spec
+    }
 }
 
 fn fill(n: usize, seed: u64) -> Vec<f32> {
@@ -77,182 +54,408 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-#[test]
-fn flash_decode_body_interprets_to_reference() {
-    // Interpret the flash_attention_decode Body on CPU and confirm it equals flash_decode_ref (the RunPod run then
-    // only confirms NVPTX lowering).
-    let (hq, n_rep, cap, d) = (4usize, 2usize, 6usize, 8usize);
-    let hkv = hq / n_rep;
-    let scale = 1.0f32 / (d as f32).sqrt();
-    let q = fill(hq * d, 1);
-    let k = fill(hkv * cap * d, 2);
-    let v = fill(hkv * cap * d, 3);
-    let mask: Vec<f32> = (0..cap)
-        .map(|t| if t <= 3 { 0.0 } else { -1.0e9 })
-        .collect();
-
-    let body = kg::flash_attention_decode("flash_decode", hq, n_rep, cap, d, scale, false);
-    // params: 1=q, 2=k, 3=v, 4=mask, 5=out.
-    let got = interpret(&body, [&q, &k, &v, &mask, &vec![0.0f32; hq * d]], hq);
-    let want = flash_decode_ref(&q, &k, &v, &mask, hq, n_rep, cap, d, scale, 0);
-    assert_close(&got, &want, 1e-5);
+/// The operands a spec reads, filled from fixed seeds, with `mask` the caller's.
+struct Operands {
+    q: Vec<f32>,
+    k: Vec<f32>,
+    /// The shared part of a split key.
+    k_shared: Option<Vec<f32>>,
+    v: Vec<f32>,
+    mask: Vec<f32>,
+    /// The live length of each batch row.
+    len: Option<Vec<i32>>,
 }
 
-/// The same Body-level check for the per-head mask (`mask_per_head = true`), the layout ALiBi needs. The
-/// generated Body must read `mask[h*cap + t]`, so head `h`'s own bias row enters the online softmax inside the
-/// running-max/rescale recurrence.
-///
-/// The mutation this pins: a Body that kept the broadcast `mask[t]` index would score every head with head 0's
-/// row. The second assertion checks the interpreted result differs from that.
-#[test]
-fn flash_decode_body_per_head_mask_interprets_to_reference() {
-    let (hq, n_rep, cap, d) = (4usize, 2usize, 6usize, 8usize);
-    let hkv = hq / n_rep;
-    let scale = 1.0f32 / (d as f32).sqrt();
-    let q = fill(hq * d, 1);
-    let k = fill(hkv * cap * d, 2);
-    let v = fill(hkv * cap * d, 3);
-    // One ALiBi row per head: visibility (0 / -1e9) plus -slope[h]*(pos - t), pos = 3.
-    let slopes = [0.25f32, 0.0625, 0.015625, 0.00390625];
-    let pos = 3usize;
-    let mask: Vec<f32> = (0..hq)
-        .flat_map(|h| {
-            (0..cap).map(move |t| {
-                if t <= pos {
-                    -slopes[h] * (pos as f32 - t as f32)
-                } else {
-                    -1.0e9
-                }
-            })
-        })
-        .collect();
-
-    let body = kg::flash_attention_decode("flash_decode", hq, n_rep, cap, d, scale, true);
-    let got = interpret(&body, [&q, &k, &v, &mask, &vec![0.0f32; hq * d]], hq);
-    let want = flash_decode_ref(&q, &k, &v, &mask, hq, n_rep, cap, d, scale, cap);
-    assert_close(&got, &want, 1e-5);
-
-    // MUTATION: head 0's row broadcast over every head (a Body that ignored the head stride).
-    let head0: Vec<f32> = mask[..cap].to_vec();
-    let broadcast = flash_decode_ref(&q, &k, &v, &head0, hq, n_rep, cap, d, scale, 0);
-    let max_diff = max_abs_error(&got, &broadcast);
-    assert!(
-        max_diff > 1e-4,
-        "the per-head Body must not collapse to head 0's mask row; max_diff={max_diff:.2e}"
-    );
-}
-
-/// card 674: every other mask-construction site in the repo uses the `-1.0e9` finite sentinel for a
-/// masked position; these three tests use the mathematically literal `f32::NEG_INFINITY` instead -
-/// what the quantized-KV decode acceptance tests (`poot-gpu/tests/qwen2.rs`) also use. Mutation: drop
-/// the `m_new == f32::NEG_INFINITY` guards added to `flash_attention_decode`/`flash_region_decode` in
-/// `poot-kernelgen/src/flash.rs` (card 674) and these three go red (NaN output, confirmed by hand
-/// before the fix landed).
-#[test]
-fn flash_decode_body_leading_true_inf_mask_does_not_nan() {
-    // Position 0 is masked with TRUE -inf while the running max is still -inf (nothing seen yet):
-    // `m_new = max(-inf, -inf) = -inf`, and the un-guarded recurrence computed
-    // `exp(-inf - -inf) = NaN`, poisoning the whole row even though position 1 is unmasked and should
-    // carry all the weight. A causal mask (`t <= pos` valid) never hits this for a single-thread
-    // sequential loop (position 0 is always valid), so this needs an explicit non-causal-shaped mask.
-    let (hq, n_rep, cap, d) = (2usize, 1usize, 2usize, 4usize);
-    let hkv = hq / n_rep;
-    let scale = 0.5f32;
-    let q = fill(hq * d, 21);
-    let k = fill(hkv * cap * d, 22);
-    let v = fill(hkv * cap * d, 23);
-    let mask = vec![f32::NEG_INFINITY, 0.0];
-
-    let body = kg::flash_attention_decode("flash_decode", hq, n_rep, cap, d, scale, false);
-    let got = interpret(&body, [&q, &k, &v, &mask, &vec![0.0f32; hq * d]], hq);
-    assert!(
-        got.iter().all(|x| x.is_finite()),
-        "flash_attention_decode produced non-finite output with a leading true-inf mask: {got:?}"
-    );
-    let want = flash_decode_ref(&q, &k, &v, &mask, hq, n_rep, cap, d, scale, 0);
-    assert_close(&got, &want, 1e-5);
-}
-
-/// The textbook two-pass reference (`softmax(scale*qkᵀ+mask) @ v`, one pass over the whole row): never
-/// subtracts two infinities as long as at least one position is unmasked, so it is a safe oracle for
-/// [`flash_region_decode_body_fully_masked_lane_does_not_nan`]'s partially-masked row.
-#[allow(clippy::too_many_arguments)]
-fn direct_decode_ref(
-    q: &[f32],
-    k: &[f32],
-    v: &[f32],
-    mask: &[f32],
-    hq: usize,
-    n_rep: usize,
-    cap: usize,
-    d: usize,
-    scale: f32,
-) -> Vec<f32> {
-    let mut out = vec![0.0f32; hq * d];
-    for h in 0..hq {
-        let kv = h / n_rep;
-        let mut scores = vec![0.0f32; cap];
-        for (t, sc) in scores.iter_mut().enumerate() {
-            let mut s = 0.0f32;
-            for dd in 0..d {
-                s += q[h * d + dd] * k[kv * cap * d + t * d + dd];
-            }
-            *sc = s * scale + mask[t];
-        }
-        let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let mut denom = 0.0f32;
-        for sc in scores.iter_mut() {
-            *sc = (*sc - m).exp();
-            denom += *sc;
-        }
-        for dd in 0..d {
-            let mut acc = 0.0f32;
-            for (t, &sc) in scores.iter().enumerate() {
-                acc += sc / denom * v[kv * cap * d + t * d + dd];
-            }
-            out[h * d + dd] = acc;
+impl Operands {
+    fn new(spec: &kg::AttentionSpec, mask: Vec<f32>) -> Self {
+        let hkv = spec.hq / spec.n_rep;
+        let (head_dim, k_shared) = match spec.key {
+            kg::KeyLayout::Single => (spec.dk, None),
+            kg::KeyLayout::Split { shared_dim } => (
+                spec.dk - shared_dim,
+                Some(fill(spec.batch * spec.lk * shared_dim, 4)),
+            ),
+        };
+        Self {
+            q: fill(spec.batch * spec.hq * spec.lq * spec.dk, 1),
+            k: fill(spec.batch * hkv * spec.lk * head_dim, 2),
+            k_shared,
+            v: fill(spec.batch * hkv * spec.lk * spec.dv, 3),
+            mask,
+            len: None,
         }
     }
-    out
+
+    /// These operands with a live length per batch row.
+    fn with_len(self, len: &[i32]) -> Self {
+        Self {
+            len: Some(len.to_vec()),
+            ..self
+        }
+    }
+
+    /// The textbook reference over every operand the spec reads.
+    fn reference(&self, spec: &kg::AttentionSpec) -> Vec<f32> {
+        attention_reference_keys(
+            spec,
+            &self.q,
+            &self.k,
+            self.k_shared.as_deref(),
+            &self.v,
+            &self.mask,
+            self.len.as_deref(),
+        )
+    }
 }
 
-/// card 674: `flash_region_decode`'s LDS-cooperative kernel strides `cap` KV positions over `w` lanes
-/// (`t = lane, lane+w, ..`); with `cap=3 < w=8`, lanes 3..7 get no position at all (idle: `m` stays its
-/// initial `-inf`) and lane 0's one assigned position (`t=0`) is masked with true `-inf` (so lane 0's
-/// own running max also stays `-inf`). Both the per-lane update and the cross-lane merge must fold
-/// these "nothing seen yet" states in without computing `exp(-inf - -inf)`. Runs on the kernel-IR
-/// interpreter (`poot_kernel_ir::interp::run`, which supports the workgroup-local arrays and barrier
-/// this Body uses) - no GPU needed.
-#[test]
-fn flash_region_decode_body_fully_masked_lane_does_not_nan() {
-    let (hq, n_rep, cap, d, w) = (2usize, 1usize, 3usize, 4usize, 8usize);
-    let hkv = hq / n_rep;
-    let scale = 0.5f32;
-    let q = fill(hq * d, 31);
-    let k = fill(hkv * cap * d, 32);
-    let v = fill(hkv * cap * d, 33);
-    // Lanes 0 and 1 (t=0, t=1) are masked - two LEADING lanes empty, not just one. The merge folds
-    // lane ii=1 into the running state seeded from lane 0 first (`ii` starts at 1): with only lane 0
-    // masked, lane 1 would already be finite and the running max would never be `-inf` at a merge
-    // step, leaving the merge's own `m_merged == -inf` branch dead. Masking both forces that merge
-    // step itself to combine two still-empty partials (card 674).
-    let mask = vec![f32::NEG_INFINITY, f32::NEG_INFINITY, 0.0];
-
-    let body =
-        kg::flash_region_decode("flash_region_decode", 1, hq, n_rep, cap, d, scale, w, false);
-    let mut buffers = [
-        Buffer::from_f32s(&q),
-        Buffer::from_f32s(&k),
-        Buffer::from_f32s(&v),
-        Buffer::from_f32s(&mask),
-        Buffer::from_f32s(&vec![0.0f32; hq * d]),
+/// Generate `spec` for `caps` and run it on the interpreter over the launch `generate` returns.
+fn interpret(spec: &kg::AttentionSpec, caps: &DeviceCaps, operands: &Operands) -> Vec<f32> {
+    let limits = kg::BodyLimits {
+        max_instructions: std::num::NonZeroUsize::new(1 << 22).unwrap(),
+        max_locals: std::num::NonZeroUsize::new(1 << 18).unwrap(),
+    };
+    let generated = kg::generate(&kg::KernelRequest::Attention(spec.clone()), caps, &limits)
+        .expect("the attention request generates");
+    let kg::AttentionSchedule::Streaming { lanes } = spec.schedule;
+    assert_eq!(generated.body.workgroup_size, [lanes as u32, 1, 1]);
+    let grid = generated.launch.grid;
+    let workgroups = [grid[0] / lanes as u32, grid[1], grid[2]];
+    let out_len = spec.batch * spec.hq * spec.lq * spec.dv;
+    let mut buffers = vec![
+        Buffer::from_f32s(&operands.q),
+        Buffer::from_f32s(&operands.k),
+        Buffer::from_f32s(&operands.v),
+        Buffer::from_f32s(&operands.mask),
     ];
-    run(&body, workgroups_covering(&body, hq * w), &mut buffers).unwrap();
-    let got = buffers[4].to_f32s().unwrap();
+    buffers.extend(operands.k_shared.as_deref().map(Buffer::from_f32s));
+    buffers.extend(operands.len.as_deref().map(Buffer::from_i32s));
+    buffers.push(Buffer::from_f32s(&vec![f32::NAN; out_len]));
+    run(&generated.body, workgroups, &mut buffers).unwrap();
+    buffers.last().unwrap().to_f32s().unwrap()
+}
+
+fn caps() -> DeviceCaps {
+    DeviceCaps::wgpu_rdna3_igpu()
+}
+
+/// `[B, 1, Lq, Lk]` causal mask with `valid[b]` keys visible to every row of batch `b` (decode) or the
+/// diagonal-and-below keys (prefill, `valid == None`).
+fn additive_mask(batch: usize, lq: usize, lk: usize, valid: Option<&[usize]>) -> Vec<f32> {
+    let mut mask = Vec::new();
+    for b in 0..batch {
+        for i in 0..lq {
+            for t in 0..lk {
+                let visible = match valid {
+                    Some(valid) => t < valid[b],
+                    None => t <= i,
+                };
+                mask.push(if visible { 0.0 } else { -1.0e9 });
+            }
+        }
+    }
+    mask
+}
+
+/// Decode, one query row against a 13-key cache over 5 lanes: 13 is not a multiple of 5, so lanes 3 and 4
+/// take one key fewer, and every lane takes more than one key (the running state is rescaled).
+#[test]
+fn decode_over_ragged_lanes_matches_the_reference() {
+    let spec = with_lanes(spec(1, 4, 2, 1, 13, 8), 5);
+    let operands = Operands::new(&spec, additive_mask(1, 1, 13, Some(&[10])));
+    let got = interpret(&spec, &caps(), &operands);
+    let want = attention_reference(&spec, &operands.q, &operands.k, &operands.v, &operands.mask);
+    assert_close(&got, &want, 1e-5);
+}
+
+/// Batched decode: four batch rows, each with its own visible length, so the per-batch mask plane and the
+/// per-batch key/value rows are all read at the right offsets.
+#[test]
+fn batched_decode_reads_each_rows_own_operands() {
+    let spec = spec(4, 4, 2, 1, 11, 8);
+    let operands = Operands::new(&spec, additive_mask(4, 1, 11, Some(&[3, 7, 11, 1])));
+    let got = interpret(&spec, &caps(), &operands);
+    let want = attention_reference(&spec, &operands.q, &operands.k, &operands.v, &operands.mask);
+    assert_close(&got, &want, 1e-5);
+}
+
+/// Prefill: every query row attends to the prompt through a causal mask, so rows differ in how many keys
+/// they see and the `[Lq, Lk]` mask plane is indexed by row.
+#[test]
+fn prefill_matches_the_reference() {
+    let spec = spec(1, 4, 2, 6, 6, 8);
+    let operands = Operands::new(&spec, additive_mask(1, 6, 6, None));
+    let got = interpret(&spec, &caps(), &operands);
+    let want = attention_reference(&spec, &operands.q, &operands.k, &operands.v, &operands.mask);
+    assert_close(&got, &want, 1e-5);
+}
+
+/// Gemma-style attention-logit softcap on a prefill whose scores reach well past the cap. A kernel that
+/// dropped the softcap, or applied it after the mask, differs from the reference by far more than the
+/// tolerance.
+#[test]
+fn softcapped_prefill_matches_the_reference() {
+    let softcapped = kg::AttentionSpec {
+        score: kg::ScoreTransform::ScaleSoftcap {
+            scale_bits: 1.5f32.to_bits(),
+            cap_bits: 2.0f32.to_bits(),
+        },
+        ..with_lanes(spec(1, 2, 1, 9, 9, 8), 2)
+    };
+    let operands = Operands::new(&softcapped, additive_mask(1, 9, 9, None));
+    let got = interpret(&softcapped, &caps(), &operands);
+    let want = attention_reference(
+        &softcapped,
+        &operands.q,
+        &operands.k,
+        &operands.v,
+        &operands.mask,
+    );
+    assert_close(&got, &want, 1e-5);
+
+    let uncapped = kg::AttentionSpec {
+        score: kg::ScoreTransform::Scale {
+            scale_bits: 1.5f32.to_bits(),
+        },
+        ..softcapped
+    };
+    let without = attention_reference(
+        &uncapped,
+        &operands.q,
+        &operands.k,
+        &operands.v,
+        &operands.mask,
+    );
+    assert!(
+        max_abs_error(&got, &without) > 1e-2,
+        "the fixture must be sensitive to the softcap"
+    );
+}
+
+/// ALiBi: one mask plane per head, so head `h` scores against its own row. A kernel that read head 0's plane
+/// for every head differs from the reference.
+#[test]
+fn per_head_mask_reads_each_heads_plane() {
+    let per_head = kg::AttentionSpec {
+        mask: kg::MaskKind::PerHead,
+        ..spec(2, 4, 2, 1, 6, 8)
+    };
+    let slopes = [0.25f32, 0.0625, 0.015625, 0.00390625];
+    let (pos, lk) = (3usize, 6usize);
+    let mut mask = Vec::new();
+    for b in 0..2 {
+        for slope in slopes {
+            for t in 0..lk {
+                let bias = if t <= pos + b {
+                    -slope * ((pos + b) as f32 - t as f32)
+                } else {
+                    -1.0e9
+                };
+                mask.push(bias);
+            }
+        }
+    }
+    let operands = Operands::new(&per_head, mask);
+    let got = interpret(&per_head, &caps(), &operands);
+    let want = attention_reference(
+        &per_head,
+        &operands.q,
+        &operands.k,
+        &operands.v,
+        &operands.mask,
+    );
+    assert_close(&got, &want, 1e-5);
+
+    // Every head scored against its batch row's first plane instead.
+    let mut collapsed = operands.mask.clone();
+    for plane in collapsed.chunks_mut(4 * lk) {
+        let first = plane[..lk].to_vec();
+        for head in plane.chunks_mut(lk) {
+            head.copy_from_slice(&first);
+        }
+    }
+    let wrong = attention_reference(&per_head, &operands.q, &operands.k, &operands.v, &collapsed);
+    assert!(
+        max_abs_error(&got, &wrong) > 1e-4,
+        "the per-head fixture must tell a collapsed mask apart"
+    );
+}
+
+/// A device whose X grid cap is below the workgroup count folds the launch onto Y; the kernel's flat
+/// `(batch, head, row)` index must follow the fold and the remainder workgroups must return.
+#[test]
+fn a_folded_grid_covers_every_row_once() {
+    let spec = spec(2, 4, 2, 3, 3, 8);
+    let mut narrow = caps();
+    narrow.max_grid[0] = 5;
+    let operands = Operands::new(&spec, additive_mask(2, 3, 3, None));
+    let limits = kg::BodyLimits {
+        max_instructions: std::num::NonZeroUsize::new(1 << 22).unwrap(),
+        max_locals: std::num::NonZeroUsize::new(1 << 18).unwrap(),
+    };
+    let launch = kg::generate(
+        &kg::KernelRequest::Attention(spec.clone()),
+        &narrow,
+        &limits,
+    )
+    .unwrap()
+    .launch;
+    assert_eq!(
+        launch.grid,
+        [5 * 4, 5, 1],
+        "24 workgroups of 4 lanes fold onto 5 across and 5 down"
+    );
+    let got = interpret(&spec, &narrow, &operands);
+    let want = attention_reference(&spec, &operands.q, &operands.k, &operands.v, &operands.mask);
+    assert_close(&got, &want, 1e-5);
+}
+
+/// A position masked with a true `-inf` while a lane's running maximum is still `-inf` must contribute
+/// nothing: `exp(-inf - -inf)` is NaN and would poison the row. Here one lane sees `-inf` first (and
+/// then a finite key), and with 8 lanes over 3 keys five lanes see no key at all, so the combine must also
+/// fold in lanes whose maximum is `-inf`.
+#[test]
+fn a_true_inf_mask_and_idle_lanes_do_not_make_nan() {
+    let leading = with_lanes(spec(1, 2, 1, 1, 2, 4), 1);
+    let operands = Operands::new(&leading, vec![f32::NEG_INFINITY, 0.0]);
+    let got = interpret(&leading, &caps(), &operands);
+    let want = attention_reference(
+        &leading,
+        &operands.q,
+        &operands.k,
+        &operands.v,
+        &operands.mask,
+    );
+    assert_close(&got, &want, 1e-5);
+
+    let idle = with_lanes(spec(1, 2, 1, 1, 3, 4), 8);
+    let operands = Operands::new(&idle, vec![f32::NEG_INFINITY, f32::NEG_INFINITY, 0.0]);
+    let got = interpret(&idle, &caps(), &operands);
+    let want = attention_reference(&idle, &operands.q, &operands.k, &operands.v, &operands.mask);
+    assert_close(&got, &want, 1e-5);
+}
+
+/// A row with no visible key is `0 / 0`: NaN, as the oracle's softmax gives, and only that row.
+#[test]
+fn a_row_with_no_visible_key_is_nan_and_its_neighbours_are_not() {
+    let spec = spec(1, 1, 1, 2, 4, 4);
+    let mut mask = additive_mask(1, 2, 4, Some(&[4]));
+    mask[..4].fill(f32::NEG_INFINITY); // row 0 sees nothing
+    let operands = Operands::new(&spec, mask);
+    let got = interpret(&spec, &caps(), &operands);
+    assert!(
+        got[..4].iter().all(|x| x.is_nan()),
+        "row 0: {:?}",
+        &got[..4]
+    );
+    let want = attention_reference(&spec, &operands.q, &operands.k, &operands.v, &operands.mask);
+    assert_close(&got[4..], &want[4..], 1e-5);
+}
+
+/// MLA: a split key (`k_nope` per head, `k_pe` shared by every head) with a value narrower than the key
+/// (`dk` 24, `dv` 16, shared part 8). A kernel that read the shared part with the head's stride, dropped it
+/// from the dot product, or wrote the output with the key width differs from the reference.
+#[test]
+fn a_split_key_with_a_narrower_value_matches_the_reference() {
+    let mla = kg::AttentionSpec {
+        dk: 24,
+        dv: 16,
+        key: kg::KeyLayout::Split { shared_dim: 8 },
+        ..with_lanes(spec(2, 4, 1, 1, 11, 8), 4)
+    };
+    let operands = Operands::new(&mla, additive_mask(2, 1, 11, Some(&[11, 6])));
+    let got = interpret(&mla, &caps(), &operands);
+    assert_eq!(got.len(), 2 * 4 * 16, "the output is `dv` wide");
+    assert_close(&got, &operands.reference(&mla), 1e-5);
+
+    let without_shared = Operands {
+        k_shared: operands.k_shared.as_ref().map(|part| vec![0.0; part.len()]),
+        ..Operands::new(&mla, operands.mask.clone())
+    };
+    assert!(
+        max_abs_error(&got, &without_shared.reference(&mla)) > 1e-3,
+        "the fixture must be sensitive to the shared part of the key"
+    );
+}
+
+/// A live bound visits the first `len[b]` keys of each batch row and never reads the rest: NaN in the
+/// inactive keys and values of every row leaves the output finite and equal to the reference, which never
+/// reads them either. Softcap and a split key ride along.
+#[test]
+fn a_live_bound_never_reads_the_poisoned_tail() {
+    let live = kg::AttentionSpec {
+        dk: 12,
+        dv: 8,
+        key: kg::KeyLayout::Split { shared_dim: 4 },
+        score: kg::ScoreTransform::ScaleSoftcap {
+            scale_bits: 0.5f32.to_bits(),
+            cap_bits: 3.0f32.to_bits(),
+        },
+        bound: kg::KeyBound::Live,
+        ..with_lanes(spec(3, 4, 2, 1, 37, 8), 4)
+    };
+    let len = [5, 37, 1];
+    let mut operands = Operands::new(&live, vec![0.0; 3 * 37]).with_len(&len);
+    let (hkv, head_dim, shared_dim) = (2, 8, 4);
+    for (b, &live_len) in len.iter().enumerate() {
+        for t in live_len as usize..37 {
+            for h in 0..hkv {
+                let row = (b * hkv + h) * 37 + t;
+                operands.k[row * head_dim..(row + 1) * head_dim].fill(f32::NAN);
+                operands.v[row * 8..(row + 1) * 8].fill(f32::NAN);
+            }
+            let row = b * 37 + t;
+            operands.k_shared.as_mut().unwrap()[row * shared_dim..(row + 1) * shared_dim]
+                .fill(f32::NAN);
+        }
+    }
+    let got = interpret(&live, &caps(), &operands);
     assert!(
         got.iter().all(|x| x.is_finite()),
-        "flash_region_decode produced non-finite output with a fully -inf-masked lane: {got:?}"
+        "poison reached the output: {got:?}"
     );
-    let want = direct_decode_ref(&q, &k, &v, &mask, hq, n_rep, cap, d, scale);
-    assert_close(&got, &want, 1e-5);
+    assert_close(&got, &operands.reference(&live), 1e-5);
+
+    // The bound is the live length, not the capacity: a full-capacity bound reads the poison.
+    let at_capacity = operands.with_len(&[37, 37, 37]);
+    assert!(
+        interpret(&live, &caps(), &at_capacity)
+            .iter()
+            .any(|x| x.is_nan()),
+        "the fixture must put NaN where a capacity bound reads"
+    );
+}
+
+/// A length outside `1..=Lk` reaches no memory past the buffers (the interpreter faults on any out-of-bounds
+/// access) and selects what the decomposition selects: no key at all (a NaN row) for a length below one, every
+/// key for a length past the capacity. A negative length turned into an unsigned loop bound reads every key
+/// instead of none, and an unclamped one reads past the end.
+#[test]
+fn an_out_of_range_live_length_is_safe_and_selects_what_the_decomposition_selects() {
+    let live = kg::AttentionSpec {
+        bound: kg::KeyBound::Live,
+        ..with_lanes(spec(5, 2, 1, 1, 9, 4), 4)
+    };
+    let len = [-1, 0, 10, i32::MIN, i32::MAX];
+    let operands = Operands::new(&live, vec![0.0; 5 * 9]).with_len(&len);
+    let got = interpret(&live, &caps(), &operands);
+    let want = operands.reference(&live);
+    let row = 2 * 4;
+    for (b, &l) in len.iter().enumerate() {
+        let (got, want) = (&got[b * row..(b + 1) * row], &want[b * row..(b + 1) * row]);
+        if l < 1 {
+            assert!(got.iter().all(|x| x.is_nan()), "len {l}: {got:?}");
+            assert!(want.iter().all(|x| x.is_nan()), "len {l}: {want:?}");
+        } else {
+            assert_close(got, want, 1e-5);
+        }
+    }
+    // Valid endpoints: one key and every key.
+    for len in [[1, 1, 1, 1, 1], [9, 9, 9, 9, 9]] {
+        let operands = Operands::new(&live, vec![0.0; 5 * 9]).with_len(&len);
+        assert_close(
+            &interpret(&live, &caps(), &operands),
+            &operands.reference(&live),
+            1e-5,
+        );
+    }
 }

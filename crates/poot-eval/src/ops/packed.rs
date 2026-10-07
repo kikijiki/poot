@@ -1,4 +1,4 @@
-//! Packed-quant ops: `PackedDequant`, `PackedContraction`, `PackedRowGather`, and the shared carrier
+//! Packed-quant ops: `PackedDequant` and `PackedRowGather`, and the shared carrier
 //! binding contract (card 642) every packed equation and its executors' pre-upload check share.
 //!
 //! Oracle allocation limits were a fixed const (`PACKED_ORACLE_MAX_ELEMENTS`/`BYTES`); `walk.rs` now
@@ -22,7 +22,7 @@ pub(crate) fn checked_packed_oracle_product(
         .ok_or(PackedEvalError::OracleArithmeticOverflow { field }.into())
 }
 
-/// Bind a `PackedDequant`/`PackedContraction` equation's carrier operands by role and return the
+/// Bind a `PackedDequant`/`PackedRowGather` equation's carrier operands by role and return the
 /// shared payload owner every source resolves to.
 ///
 /// Operand `i` binds `descriptor.sources()[i]`'s role (no positional slots): a block format has one
@@ -55,7 +55,6 @@ fn bind_packed_carriers<'a, V: ValidationChannel>(
 ) -> Result<Option<&'a std::sync::Arc<PackedPayload>>, EvalError> {
     let carrier_ids = match eqn.op {
         OpKind::PackedDequant { .. } => eqn.inputs.as_slice(),
-        OpKind::PackedContraction { .. } => &eqn.inputs[1..],
         OpKind::PackedRowGather { .. } => &eqn.inputs[..eqn.inputs.len().saturating_sub(1)],
         _ => unreachable!("bind_packed_carriers called for another operation"),
     };
@@ -223,59 +222,5 @@ pub(crate) fn evaluate_packed_row_gather(
     }
     let mut shape = ids.shape().to_vec();
     shape.push(k);
-    Ok(HostTensor::f32(shape, values))
-}
-
-/// Card 385's block-diagonal contraction: `blocks == 1` collapses every derived quantity
-/// (`rows_per_block = rows`, `block_out = out`, `block = 0`) to the plain dense formula, so one definition
-/// serves `OpKind::PackedContraction { blocks: 1, .. }` (`ops::packed_linear`) and `blocks > 1`
-/// (`ops::packed_block_diagonal_linear`).
-pub(crate) fn evaluate_packed_contraction(
-    activation: &HostTensor,
-    owner: &PackedPayload,
-    descriptor: poot_quant::PackedWeight,
-    blocks: usize,
-) -> Result<HostTensor, EvalError> {
-    let [out, k] = descriptor.shape();
-    if blocks == 0 || out % blocks != 0 {
-        return Err(PackedEvalError::Binding { field: "blocks" }.into());
-    }
-    let block_out = out / blocks;
-    let activation_data = activation.as_f32().ok_or(PackedEvalError::Binding {
-        field: "activation.dtype",
-    })?;
-    let rows = activation_data.len() / k;
-    if rows % blocks != 0 {
-        return Err(PackedEvalError::Binding {
-            field: "activation.rows",
-        }
-        .into());
-    }
-    let rows_per_block = rows / blocks;
-    // the row-decode paths are not capped (each weight row decodes once, `O(out * K)`,
-    // like the dense contraction it replaces); only a full `[out, K]` materialization is.
-    let output_elements = checked_packed_oracle_product(rows, block_out, "rows_out")?;
-    let mut values = vec![0.0; output_elements];
-    // Each weight row decodes once and serves every activation row of its block; the per-output sum
-    // runs over K in the same order as the scalar definition, so the result is unchanged bit for bit.
-    let mut weight_row = vec![0.0; k];
-    for block in 0..blocks {
-        let block_rows = block * rows_per_block..(block + 1) * rows_per_block;
-        for output in 0..block_out {
-            decode_packed_row(owner, block * block_out + output, &mut weight_row)?;
-            for row in block_rows.clone() {
-                let activation_row = &activation_data[row * k..(row + 1) * k];
-                let mut sum = 0.0;
-                for (x, w) in activation_row.iter().zip(&weight_row) {
-                    sum += x * w;
-                }
-                values[row * block_out + output] = sum;
-            }
-        }
-    }
-    let mut shape = activation.shape().to_vec();
-    *shape
-        .last_mut()
-        .expect("packed contraction rank was inferred") = block_out;
     Ok(HostTensor::f32(shape, values))
 }

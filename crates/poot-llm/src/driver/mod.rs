@@ -38,6 +38,7 @@ mod host_sample;
 pub mod lora;
 pub mod open;
 pub mod prefix_cache;
+pub mod speculate;
 pub mod step;
 pub mod stops;
 pub(crate) mod suffix;
@@ -66,11 +67,17 @@ pub use caps::{
     DriverCaps, HeadSet, InputSet, Layout, LoraCaps, PoolShape, ServingShapes, StateResidency,
 };
 use chunks::ChunkPolicy;
-use error::{DriverError, InvalidOptions, InvalidRequest, PreparedSetRefusal, Unsupported};
-pub use handle::ModelHandle;
+use error::{
+    DriverError, InvalidOptions, InvalidRequest, PreparedSetRefusal, SpeculationRefusal,
+    Unsupported,
+};
+pub use handle::{LoadOptions, ModelHandle};
 pub use lora::{AdapterRef, AdapterSet, AdapterSource, AdapterSpec, GenerationId, LoraIdx};
 pub use open::{BackendChoice, open_executor};
 pub use prefix_cache::{PrefixOutcome, PrefixSkip};
+pub use speculate::{
+    DraftPolicy, NotSpeculated, RowSpeculation, SpeculationCaps, SpeculationStats,
+};
 use step::PickPolicy;
 pub use step::{Admission, Release, RowResult, RowWork, SeqId, SeqRequest, StepRow};
 pub use stops::FinishReason;
@@ -140,13 +147,9 @@ pub fn program_retention(program: &StagedProgram<ValidationOutputs>) -> Retentio
         retention.private += (values + eqns) as u64;
         for (_, plan) in p.planned() {
             match plan {
-                poot_graph_plan::Plan::Compute { body, key, .. }
-                | poot_graph_plan::Plan::ComputeMeta { body, key, .. } => {
-                    own(key, body, &mut retention)
-                }
-                poot_graph_plan::Plan::ComputeChunks(chunks) => {
-                    for chunk in chunks {
-                        own(&chunk.key, &chunk.body, &mut retention);
+                poot_graph_plan::Plan::Dispatches(dispatches) => {
+                    for dispatch in dispatches {
+                        own(&dispatch.key, &dispatch.body, &mut retention);
                     }
                 }
                 poot_graph_plan::Plan::Alias(_)
@@ -172,7 +175,7 @@ fn body_bytes(body: &poot_kernel_ir::Body) -> u64 {
 }
 
 /// Every choice the caller makes about a driver; there is no `Default`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct DriverOptions {
     pub prefill: CompileOptions,
     pub decode: CompileOptions,
@@ -187,6 +190,8 @@ pub struct DriverOptions {
     pub max_trace_tokens: NonZeroUsize,
     pub prepared: PreparedSetLimits,
     pub charge: RetentionCharge,
+    /// How a decode row proposes tokens to verify ([`speculate`]).
+    pub draft: DraftPolicy,
 }
 
 /// One sequence to generate. `sampler` carries its own knobs, penalty history, constraint and seed.
@@ -231,6 +236,8 @@ pub struct DriverStats {
     pub steps: u64,
     /// Picks that took the host sampling path.
     pub host_picks: u64,
+    /// What the draft policy did across the rows stepped.
+    pub speculation: SpeculationStats,
 }
 
 /// Which entries [`Driver::prepare`] warms.
@@ -243,8 +250,17 @@ pub enum Warm<'a> {
     Prompts(&'a [usize]),
 }
 
+/// Whose program an entry is: the served model's, or the draft model's under a
+/// [`DraftPolicy::DraftModel`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ModelRole {
+    Target,
+    Draft,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct EntryKey {
+    role: ModelRole,
     phase: Phase,
     shape: StepShape,
     head: Head,
@@ -257,6 +273,8 @@ struct EntryKey {
 #[derive(Clone, Debug)]
 struct Prepared {
     id: EntryId,
+    /// The executable the entry was added to.
+    exe: ExecutableId,
     /// What the entry holds against the retention limit.
     held: Held,
     slots: Vec<SlotSpec>,
@@ -376,6 +394,7 @@ pub struct Driver {
     /// Whether any prepared entry carries recurrent state; read from the traced graphs' state roles.
     residency: StateResidency,
     lora: lora::LoraRegistry,
+    speculation: speculate::Speculation,
     /// The paged pool, the open sequences and the published caps; absent until `prepare`.
     serving: Option<step::Serving>,
     /// The one layout `prepare` has admitted, and the caps it published.
@@ -427,6 +446,7 @@ impl Driver {
         let weights = Arc::new(handle.model().weights().clone());
         let exe =
             executor.load_weights(handle.shared_store().clone(), WeightSource::Map(weights))?;
+        let speculation = speculate::Speculation::new(options.draft.clone());
         Ok(Self {
             handle,
             executor,
@@ -441,6 +461,7 @@ impl Driver {
             stats: DriverStats::default(),
             residency: StateResidency::KvOnly,
             lora: lora::LoraRegistry::default(),
+            speculation,
             serving: None,
             layout: None,
             caps: None,
@@ -501,13 +522,17 @@ impl Driver {
         {
             return Err(lora::LoraError::UnknownGeneration(generation).into());
         }
-        let graph = self
-            .handle
+        let (handle, exe) = self.scope(key.role)?;
+        let graph = handle
             .model()
             .trace(key.phase, key.shape)
             .map_err(Unsupported::Trace)?;
-        let residency = self.check_state_rows(&graph, key.shape)?;
-        let graph = bind_packed_weights(&graph, &self.formats).map_err(Unsupported::PackedBind)?;
+        let residency = Self::check_state_rows(&handle, &graph, key.shape)?;
+        if key.role == ModelRole::Draft && residency == StateResidency::Recurrent {
+            return Err(Unsupported::Speculation(SpeculationRefusal::RecurrentState).into());
+        }
+        let graph = bind_packed_weights(&graph, self.formats_of(key.role))
+            .map_err(Unsupported::PackedBind)?;
         let (graph, _) = suffix::append_head(graph, key.head);
         let slots = Prepared::slots_of(&graph)?;
         let program = compile_staged(
@@ -538,15 +563,16 @@ impl Driver {
             }
             .into());
         }
-        let id = self.executor.add_entry(self.exe, &program)?;
+        let id = self.executor.add_entry(exe, &program)?;
         self.stats.entries_added += 1;
         self.hold(&reservation);
         let entry = Prepared {
             id,
+            exe,
             held: reservation.held,
             slots,
         };
-        if residency == StateResidency::Recurrent {
+        if key.role == ModelRole::Target && residency == StateResidency::Recurrent {
             self.residency = StateResidency::Recurrent;
         }
         self.entries.insert(key, entry.clone());
@@ -613,7 +639,7 @@ impl Driver {
     /// without a row axis: the `Positional` cache whose leading axis is the pool's slots. Returns the
     /// graph's state residency, read from its state roles, never from a family.
     fn check_state_rows(
-        &self,
+        handle: &ModelHandle,
         graph: &Graph<ValidationOutputs>,
         shape: StepShape,
     ) -> Result<StateResidency, Unsupported> {
@@ -628,7 +654,7 @@ impl Driver {
             );
             if leading != rows && !pool {
                 return Err(Unsupported::Trace(TraceError::ShapeUnsupported {
-                    family: self.handle.config().family,
+                    family: handle.config().family,
                     shape,
                     reason: ShapeReason::StateRowAxis { leading, rows },
                 }));
@@ -671,7 +697,28 @@ impl Driver {
         self.stats.steps += 1;
         Ok(self
             .executor
-            .step(self.exe, entry.id, &inputs, &mut NoSync)?)
+            .step(entry.exe, entry.id, &inputs, &mut NoSync)?)
+    }
+
+    /// The model and executable `role`'s entries run: the served model's, or the loaded draft's.
+    fn scope(&self, role: ModelRole) -> Result<(Arc<ModelHandle>, ExecutableId), DriverError> {
+        match role {
+            ModelRole::Target => Ok((Arc::clone(&self.handle), self.exe)),
+            ModelRole::Draft => self
+                .speculation
+                .draft
+                .as_ref()
+                .map(|draft| (Arc::clone(&draft.handle), draft.exe))
+                .ok_or_else(|| InvalidRequest::NotPrepared.into()),
+        }
+    }
+
+    /// Which of `role`'s weights its checkpoint stores packed.
+    fn formats_of(&self, role: ModelRole) -> &WeightFormats {
+        match (role, &self.speculation.draft) {
+            (ModelRole::Draft, Some(draft)) => &draft.formats,
+            _ => &self.formats,
+        }
     }
 
     /// Generate one sequence on the serving surface: prepare what the request needs (nothing when it is
@@ -782,11 +829,11 @@ impl Driver {
         let config = handle.config();
         let upto = prompt.len();
         let mut logprobs = Vec::new();
-        let mut next = loop {
+        let mut pending = loop {
             let result = self.step_one(seq, RowWork::Prefill { upto }, sampler)?;
             logprobs.extend(result.logprobs);
-            if let Some(&token) = result.tokens.first() {
-                break token;
+            if !result.tokens.is_empty() {
+                break result.tokens;
             }
         };
 
@@ -800,18 +847,31 @@ impl Driver {
         let mut context = prompt;
         let gen_start = context.len();
         let finish = loop {
-            if stop_rule.is_eos(next) {
-                break FinishReason::Eos;
+            // A step returns one token, or under a draft policy the accepted drafts and one more:
+            // keep tokens until one ends the sequence, and commit what was kept.
+            let mut ended = None;
+            let mut kept = 0;
+            for &next in &pending {
+                if stop_rule.is_eos(next) {
+                    ended = Some(FinishReason::Eos);
+                    break;
+                }
+                kept += 1;
+                context.push(next);
+                let piece = text
+                    .stream_piece(&context, gen_start)
+                    .map_err(|e| DriverError::Text(Box::new(e)))?;
+                if sink.token(next, &piece).is_break() {
+                    ended = Some(FinishReason::Cancelled);
+                    break;
+                }
+                if let Some(reason) = stop_rule.after_token(&piece, context.len() - gen_start) {
+                    ended = Some(reason);
+                    break;
+                }
             }
-            self.commit(seq, 1, sampler)?;
-            context.push(next);
-            let piece = text
-                .stream_piece(&context, gen_start)
-                .map_err(|e| DriverError::Text(Box::new(e)))?;
-            if sink.token(next, &piece).is_break() {
-                break FinishReason::Cancelled;
-            }
-            if let Some(reason) = stop_rule.after_token(&piece, context.len() - gen_start) {
+            self.commit(seq, kept, sampler)?;
+            if let Some(reason) = ended {
                 break reason;
             }
             let result = self.step_one(
@@ -823,7 +883,7 @@ impl Driver {
                 sampler,
             )?;
             logprobs.extend(result.logprobs);
-            next = result.tokens[0];
+            pending = result.tokens;
         };
         Ok(Generation {
             tokens: context.split_off(gen_start),

@@ -128,7 +128,10 @@ impl RawEmitter<'_> {
             self.values,
             ValueMeta::new(
                 TensorType::f32(vec![len]),
-                Storage::Computed(ComputedConst::Iota { len }),
+                Storage::Computed(ComputedConst::Iota {
+                    len,
+                    dtype: DType::F32,
+                }),
                 None,
             ),
         )?;

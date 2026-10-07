@@ -1,11 +1,10 @@
 use crate::KernelGenError;
 use crate::helpers::{
-    Alloc, batch_eff, copy, elem, guard, ld, local, row_major_strides, slice_bf16, slice_dtype,
-    slice_f32,
+    Alloc, batch_eff, copy, elem, guard, ld, local, row_major_strides, slice_dtype,
 };
 use poot_kernel_ir::{
-    BasicBlock, BinOp, BlockId, Body, Constant, IndexAxis, Local, Operand, Place, Rvalue,
-    Statement, Terminator, Ty, WmmaDtype, WmmaShape,
+    BasicBlock, BinOp, BlockId, Body, Constant, FragmentTy, IndexAxis, Local, Operand, Place,
+    Rvalue, Statement, Terminator, Ty, WmmaDtype, WmmaMat, WmmaShape,
 };
 
 /// Probe: WMMA-load both A and B fragments from a bf16 LDS tile (`WmmaLoadLds`), mma, store to a global f32 C.
@@ -14,16 +13,27 @@ use poot_kernel_ir::{
 /// codegen check (does `wmma.load` from `.shared` lower), not a value test. NVPTX-only (see `WmmaLoadLds`'s doc).
 #[cfg(test)]
 pub(crate) fn wmma_loadlds_probe(name: &str) -> Body {
-    use poot_kernel_ir::{WmmaMat, WorkgroupLocalDecl};
+    use crate::helpers::slice_f32;
+    use poot_kernel_ir::WorkgroupLocalDecl;
+    let shape = WmmaShape::M16N16K16;
     let mut al = Alloc::new(vec![
         ld(Ty::Unit, false),
         ld(slice_f32(true), true), // 1 c (f32 out [16x16])
     ]);
     let c = local(1);
     let idx0 = al.add(Ty::Usize, false);
-    let af = al.add(Ty::I32, false);
-    let bf = al.add(Ty::I32, false);
-    let acc = al.add(Ty::F32, false);
+    let af = al.add(
+        Ty::Fragment(FragmentTy::matrix(WmmaMat::A, WmmaDtype::Bf16, shape)),
+        false,
+    );
+    let bf = al.add(
+        Ty::Fragment(FragmentTy::matrix(WmmaMat::B, WmmaDtype::Bf16, shape)),
+        false,
+    );
+    let acc = al.add(
+        Ty::Fragment(FragmentTy::accumulator(WmmaDtype::Bf16, shape)),
+        false,
+    );
 
     let stmts = vec![
         Statement::Assign(
@@ -82,29 +92,11 @@ pub(crate) fn wmma_loadlds_probe(name: &str) -> Body {
 
 /// Tiled tensor-core gemm: `C = A @ B` over `m16n16k16` WMMA tiles, bf16 inputs / f32 accumulate, output
 /// storage dtype `dt` (f32 or bf16). One block of 256 threads computes one 16x16 output tile: warp 0 runs the
-/// WMMA K-loop, loading the A and B fragments directly from global memory (the WMMA load takes a
-/// (pointer, leading-dim-stride)). There is no LDS input staging; multi-warp LDS tile sharing is a deferred
-/// perf follow-on. The f32 accumulator fragment updates in place (`c` and `dst` are the same `Local`) across
-/// the K-loop, so it loop-carries the ordinary way (an alloca'd local, see `poot_codegen::emit`'s
-/// `frag_layout` doc) with no extra copy statement.
-///
-/// Bf16 (not the target-neutral `wmma_tile`'s F16): the production dense/dequant path keeps weights
-/// bf16-resident, and this generator stays AMDGCN/NVPTX-only (`WmmaDtype::Bf16` has no SPIR-V lowering, see
-/// `WmmaDtype`'s doc) - a second, K==16-only sibling for SPIR-V coopmat is `matmul_tensorcore_coopmat`: a
-/// coopmat accumulator fragment cannot loop-carry across a back-edge without a `phi` node this codegen does
-/// not insert, so the two generators stay separate rather than one shared K-loop body (card 530's "one
-/// generator" unification applies to the straight-line fragment op, not to this loop-carrying control flow,
-/// which is a real per-target SSA constraint, not an op-shape difference).
-///
-/// Output epilogue depends on `dt`: f32 stores the D fragment straight to C (`WmmaStore`); bf16 stages the D
-/// fragment to a per-block f32 LDS tile (`WmmaStoreLds`), barriers, then the block's 256 threads narrow-copy the
-/// 256 tile elements to the bf16 output (one per thread), since the WMMA D-store is f32-only.
+/// WMMA K-loop (see [`tensor_core_tiles`]), the other seven warps help narrow a bf16 output. AMDGCN/NVPTX only
+/// (`WmmaDtype::Bf16` has no SPIR-V lowering); the bf16 output epilogue is NVPTX-only (`WmmaStoreLds`).
 ///
 /// Shapes are the same batched layout as `matmul_batched_dt`: out `[..batch, M, N]`, a `[..batch, M, K]`, b
-/// `[..batch, K, N]`, all row-major. M, N, K must be multiples of 16 (the planner checks; non-aligned shapes fall
-/// back to the serial `matmul_batched_dt`). Launch with `out_numel` threads, wg `[256,1,1]`, so blocks =
-/// `out_numel/256 = num_tiles = prod(batch) * (M/16) * (N/16)` (`dispatch_grid`'s default `out_numel` is
-/// correct). NVPTX-only in scope today (WMMA has no SPIR-V equivalent).
+/// `[..batch, K, N]`, all row-major. Launch with `batch * tiles * 256` threads, wg `[256,1,1]`.
 pub fn matmul_tensorcore(
     name: &str,
     dt: Ty,
@@ -112,8 +104,87 @@ pub fn matmul_tensorcore(
     a_shape: &[usize],
     b_shape: &[usize],
 ) -> Result<Body, KernelGenError> {
-    use poot_kernel_ir::{WmmaMat, WorkgroupLocalDecl};
-    let bf16 = dt != Ty::F32;
+    tensor_core_tiles(
+        name,
+        TileKernel {
+            operand: WmmaDtype::Bf16,
+            threads_per_tile: 256,
+            out: dt,
+        },
+        out_shape,
+        a_shape,
+        b_shape,
+    )
+}
+
+/// SPIR-V cooperative-matrix tiled matmul: `out[..batch, M, N] = A[..batch, M, K] @ B[..batch, K, N]`, F16
+/// inputs / F32 accumulate, over `m16n16k16` coopmat tiles, with the same K-loop and batching as
+/// [`matmul_tensorcore`]. One subgroup (32 invocations, gfx1151's wave32) computes one 16x16 output tile
+/// collectively (coopmat's Subgroup scope means every invocation cooperates, so there is no "warp 0 does the
+/// WMMA" split). Launch with `batch * tiles * 32` threads, wg `[32,1,1]`.
+///
+/// Output is always F32 (RADV coopmat config 13 has no f16-accumulate variant); an F16-output matmul would need
+/// an extra narrowing store, as with [`matmul_tensorcore`]'s AMD arm.
+pub fn matmul_tensorcore_coopmat(
+    name: &str,
+    out_shape: &[usize],
+    a_shape: &[usize],
+    b_shape: &[usize],
+) -> Result<Body, KernelGenError> {
+    tensor_core_tiles(
+        name,
+        TileKernel {
+            operand: WmmaDtype::F16,
+            threads_per_tile: 32,
+            out: Ty::F32,
+        },
+        out_shape,
+        a_shape,
+        b_shape,
+    )
+}
+
+/// What distinguishes one tensor-core tile kernel from another: the operand dtype the fragments multiply, how
+/// many threads cooperate on one output tile (one subgroup, or a whole 256-thread block of which warp 0 runs
+/// the matrix ops), and the output element type.
+struct TileKernel {
+    operand: WmmaDtype,
+    threads_per_tile: usize,
+    out: Ty,
+}
+
+/// The one tensor-core tile generator behind [`matmul_tensorcore`] and [`matmul_tensorcore_coopmat`]: each
+/// output tile's accumulator fragment is zero-seeded, then carried across a K-loop of `m16n16k16` MMAs
+/// (`k0 += 16`), then stored. The accumulator is an ordinary fragment local the loop updates in place
+/// (`c == dst`), which every target holds in a variable (see `poot_codegen::emit`'s `fragment_llty`).
+///
+/// Tails: M, N and K must each be a multiple of 16, otherwise [`KernelGenError::NotDivisible`]. A ragged
+/// edge is refused, never zero-padded or masked: the planner's admission predicates carry the same
+/// constraint and route a ragged matmul to the serial kernel instead.
+fn tensor_core_tiles(
+    name: &str,
+    kernel: TileKernel,
+    out_shape: &[usize],
+    a_shape: &[usize],
+    b_shape: &[usize],
+) -> Result<Body, KernelGenError> {
+    use poot_kernel_ir::WorkgroupLocalDecl;
+    let TileKernel {
+        operand,
+        threads_per_tile,
+        out: dt,
+    } = kernel;
+    let generator = match operand {
+        WmmaDtype::Bf16 => "matmul_tensorcore",
+        WmmaDtype::F16 => "matmul_tensorcore_coopmat",
+    };
+    let shape = WmmaShape::M16N16K16;
+    let operand_ty = match operand {
+        WmmaDtype::Bf16 => Ty::BF16,
+        WmmaDtype::F16 => Ty::F16,
+    };
+    let narrow = dt != Ty::F32;
+    let warp_split = threads_per_tile > 32;
     let r = out_shape.len();
     let m = out_shape[r - 2];
     let n = out_shape[r - 1];
@@ -121,7 +192,7 @@ pub fn matmul_tensorcore(
     for (dim, value) in [("M", m), ("N", n), ("K", k)] {
         if !value.is_multiple_of(16) {
             return Err(KernelGenError::NotDivisible {
-                generator: "matmul_tensorcore",
+                generator,
                 dim: dim.to_string(),
                 value,
                 divisor: 16,
@@ -145,9 +216,9 @@ pub fn matmul_tensorcore(
 
     let mut al = Alloc::new(vec![
         ld(Ty::Unit, false),
-        ld(slice_bf16(false), false),            // 1 a (bf16)
-        ld(slice_bf16(false), false),            // 2 b (bf16)
-        ld(slice_dtype(dt.clone(), true), true), // 3 c (dt out)
+        ld(slice_dtype(operand_ty.clone(), false), false), // 1 a
+        ld(slice_dtype(operand_ty, false), false),         // 2 b
+        ld(slice_dtype(dt.clone(), true), true),           // 3 c (dt out)
     ]);
     let (a, b, c) = (local(1), local(2), local(3));
     let tid = al.add(Ty::Usize, false);
@@ -174,9 +245,16 @@ pub fn matmul_tensorcore(
     let kn = al.add(Ty::Usize, false);
     let a_off = al.add(Ty::Usize, false);
     let b_off = al.add(Ty::Usize, false);
-    let af = al.add(Ty::I32, false);
-    let bf = al.add(Ty::I32, false);
-    let acc = al.add(Ty::F32, true); // accumulator fragment: zero-seeded, then updated in place each K-step
+    let af = al.add(
+        Ty::Fragment(FragmentTy::matrix(WmmaMat::A, operand, shape)),
+        false,
+    );
+    let bf = al.add(
+        Ty::Fragment(FragmentTy::matrix(WmmaMat::B, operand, shape)),
+        false,
+    );
+    // accumulator fragment: zero-seeded, then updated in place each K-step
+    let acc = al.add(Ty::Fragment(FragmentTy::accumulator(operand, shape)), true);
     // bf16 narrow epilogue temps.
     let row = al.add(Ty::Usize, false);
     let col = al.add(Ty::Usize, false);
@@ -191,31 +269,30 @@ pub fn matmul_tensorcore(
         Rvalue::BinaryOp(op, copy(Place::local(x)), copy(Place::local(y)))
     };
 
-    // block indices differ between the f32 (no epilogue) and bf16 (LDS-stage + barrier + narrow) tails.
+    // block indices differ between the f32 (no epilogue) and narrowing (LDS-stage + barrier + narrow) tails.
     let (kloop, kbody, store) = (3u32, 4u32, 5u32);
-    let (ret, barrier, narrow) = if bf16 {
+    let (ret, barrier, narrow_block) = if narrow {
         (8u32, 6u32, 7u32)
     } else {
         (6u32, 6u32, 6u32)
     };
 
-    // bb1: block = tid / 256 (one block per tile); valid = block < num_tiles.
+    // bb1: block = tid / threads_per_tile (one block per tile); valid = block < num_tiles.
     let bb1 = BasicBlock {
         statements: vec![
-            set(block, binc(BinOp::Div, tid, 256)),
+            set(block, binc(BinOp::Div, tid, threads_per_tile)),
             set(cmp, binc(BinOp::Lt, block, num_tiles)),
         ],
         terminator: guard(cmp, ret, 2),
     };
 
     // bb2: decode the tile coords (from `block`), batch bases, tile bases, c_off; localid + warp-0 flag; zero
-    // the accumulator fragment; k0 = 0. Non-warp-0 threads skip the WMMA: bf16 -> barrier (they help narrow),
-    // f32 -> return.
+    // the accumulator fragment; k0 = 0. With a warp split, non-warp-0 threads skip the matrix ops: narrowing ->
+    // barrier (they help narrow), f32 -> return.
     let mut pre = vec![
         set(a_bb, Rvalue::Use(cu(0))),
         set(b_bb, Rvalue::Use(cu(0))),
-        set(localid, binc(BinOp::Rem, tid, 256)),
-        set(is_w0, binc(BinOp::Lt, localid, 32)),
+        set(localid, binc(BinOp::Rem, tid, threads_per_tile)),
         set(tn, binc(BinOp::Rem, block, tiles_n)),
         set(tmp, binc(BinOp::Div, block, tiles_n)),
         set(tm, binc(BinOp::Rem, tmp, tiles_m)),
@@ -239,6 +316,9 @@ pub fn matmul_tensorcore(
             pre.push(set(b_bb, Rvalue::Use(copy(Place::local(tmpoff)))));
         }
     }
+    if warp_split {
+        pre.push(set(is_w0, binc(BinOp::Lt, localid, 32)));
+    }
     pre.push(set(m0, binc(BinOp::Mul, tm, 16)));
     pre.push(set(n0, binc(BinOp::Mul, tn, 16)));
     // a_row_base = a_bb + m0*K (A tile top-left at K-step 0); in the loop a_off = a_row_base + k0.
@@ -252,8 +332,8 @@ pub fn matmul_tensorcore(
     pre.push(set(c_off, bin(BinOp::Add, c_off, term)));
     pre.push(set(c_off, bin(BinOp::Add, c_off, n0)));
     pre.push(Statement::WmmaZero {
-        dtype: WmmaDtype::Bf16,
-        shape: WmmaShape::M16N16K16,
+        dtype: operand,
+        shape,
         dst: acc,
     });
     pre.push(set(k0, Rvalue::Use(cu(0))));
@@ -268,8 +348,14 @@ pub fn matmul_tensorcore(
     };
     let bb2 = BasicBlock {
         statements: pre,
-        // warp 0 -> the K loop; others -> barrier (bf16, to help narrow) or return (f32).
-        terminator: guard(is_w0, barrier, kloop),
+        // warp 0 -> the K loop; others -> barrier (narrowing, to help narrow) or return (f32).
+        terminator: if warp_split {
+            guard(is_w0, barrier, kloop)
+        } else {
+            Terminator::Goto {
+                target: BlockId { index: kloop },
+            }
+        },
     };
     let bb3 = BasicBlock {
         statements: vec![set(k_lt, binc(BinOp::Lt, k0, k))],
@@ -278,8 +364,8 @@ pub fn matmul_tensorcore(
     // bb4: load A/B fragments at the current K-step from global, mma-accumulate in place, advance k0 by 16.
     let mut body4 = vec![set(a_off, bin(BinOp::Add, a_row_base, k0))];
     body4.push(Statement::WmmaLoad {
-        dtype: WmmaDtype::Bf16,
-        shape: WmmaShape::M16N16K16,
+        dtype: operand,
+        shape,
         which: WmmaMat::A,
         tile: elem(a, a_off),
         stride: a_ld,
@@ -288,16 +374,16 @@ pub fn matmul_tensorcore(
     body4.push(set(kn, binc(BinOp::Mul, k0, n)));
     body4.push(set(b_off, bin(BinOp::Add, b_col_base, kn)));
     body4.push(Statement::WmmaLoad {
-        dtype: WmmaDtype::Bf16,
-        shape: WmmaShape::M16N16K16,
+        dtype: operand,
+        shape,
         which: WmmaMat::B,
         tile: elem(b, b_off),
         stride: b_ld,
         dst: bf,
     });
     body4.push(Statement::WmmaMma {
-        dtype: WmmaDtype::Bf16,
-        shape: WmmaShape::M16N16K16,
+        dtype: operand,
+        shape,
         a: af,
         b: bf,
         c: acc,
@@ -312,11 +398,12 @@ pub fn matmul_tensorcore(
     };
 
     let mut blocks = vec![bb0, bb1, bb2, bb3, bb4];
-    if bf16 {
+    if narrow {
         // bb5: warp 0 stages the D fragment into the per-block f32 LDS tile -> barrier.
         blocks.push(BasicBlock {
             statements: vec![Statement::WmmaStoreLds {
-                shape: WmmaShape::M16N16K16,
+                dtype: operand,
+                shape,
                 array: 0,
                 stride: 16,
                 src: acc,
@@ -329,7 +416,9 @@ pub fn matmul_tensorcore(
         blocks.push(BasicBlock {
             statements: vec![],
             terminator: Terminator::Barrier {
-                target: BlockId { index: narrow },
+                target: BlockId {
+                    index: narrow_block,
+                },
             },
         });
         // bb7: each thread narrows LDS[localid] (row=localid/16, col=localid%16) to C[c_off + row*N + col].
@@ -366,8 +455,8 @@ pub fn matmul_tensorcore(
         // bb5: warp 0 stores the D fragment straight to C (f32).
         blocks.push(BasicBlock {
             statements: vec![Statement::WmmaStore {
-                dtype: WmmaDtype::Bf16,
-                shape: WmmaShape::M16N16K16,
+                dtype: operand,
+                shape,
                 tile: elem(c, c_off),
                 stride: c_ld,
                 src: acc,
@@ -382,172 +471,14 @@ pub fn matmul_tensorcore(
     }
 
     let mut body = Body::new(name, 3, al.locals, blocks);
-    body.workgroup_size = [256, 1, 1]; // one block (8 warps) per output tile; warp 0 does the WMMA
-    if bf16 {
+    // one block per output tile; with a warp split its first warp does the matrix ops
+    body.workgroup_size = [threads_per_tile as u32, 1, 1];
+    if narrow {
         body.workgroup_locals = vec![WorkgroupLocalDecl {
             elem_ty: Ty::F32,
             len: 256, // one 16x16 f32 tile staged by warp 0, narrowed by the block
         }];
     }
-    Ok(body)
-}
-
-/// SPIR-V cooperative-matrix tiled matmul: `out[M,N] = A[M,K] @ B[K,N]`, F16 inputs / F32 accumulate, over
-/// independent `m16n16k16` coopmat tiles; the [`matmul_tensorcore`] sibling for RADV coopmat (see that
-/// function's doc for why the two stay separate generators rather than one shared K-loop body). One
-/// subgroup (32 invocations, gfx1151's wave32) computes one 16x16 output tile collectively (coopmat's
-/// Subgroup scope means every invocation cooperates, so there is no "warp 0 does the WMMA, the rest
-/// barrier" split).
-///
-/// Unlike `matmul_tensorcore` there is no K-loop: `K` must be exactly 16 (a single coopmat tile). A coopmat value
-/// is one opaque SSA register (see `poot_kernel_ir::WmmaDtype`'s doc) and cannot be carried across a loop
-/// back-edge without a `phi` node this codegen cannot insert; `WmmaZero`'s `OpCompositeConstruct` zero-seed
-/// avoids that only because it is used once, straight-line, per tile. M/N can be multi-tile (tiles are
-/// independent); only the last two dims of `out_shape`/`a_shape`/`b_shape` are read (leading dims must all be
-/// size 1: the caller's `matmul_spirv_coopmat_eligible` gate enforces `batch_dims_product == 1`; see its doc in
-/// `poot-graph-plan` for why real batching is deferred).
-///
-/// Output is always F32 (RADV coopmat config 13 has no f16-accumulate variant); an F16-output matmul would need
-/// an extra narrowing store, as with [`matmul_tensorcore`]'s AMD arm.
-pub fn matmul_tensorcore_coopmat(
-    name: &str,
-    out_shape: &[usize],
-    a_shape: &[usize],
-    _b_shape: &[usize],
-) -> Result<Body, KernelGenError> {
-    use poot_kernel_ir::WmmaMat;
-    let r = out_shape.len();
-    let (m, n) = (out_shape[r - 2], out_shape[r - 1]);
-    let k = a_shape[a_shape.len() - 1];
-    for (dim, value) in [("M", m), ("N", n)] {
-        if !value.is_multiple_of(16) {
-            return Err(KernelGenError::NotDivisible {
-                generator: "matmul_tensorcore_coopmat",
-                dim: dim.to_string(),
-                value,
-                divisor: 16,
-            });
-        }
-    }
-    if k != 16 {
-        return Err(KernelGenError::NotEqualTo {
-            generator: "matmul_tensorcore_coopmat",
-            dim: "K".to_string(),
-            value: k,
-            expected: 16,
-        });
-    }
-    let tiles_n = n / 16;
-    let num_tiles = (m / 16) * tiles_n;
-    let (a_ld, b_ld, c_ld) = (k as u32, n as u32, n as u32);
-
-    let mut al = Alloc::new(vec![
-        ld(Ty::Unit, false),
-        ld(slice_dtype(Ty::F16, false), false), // 1 a (f16, row-major MxK)
-        ld(slice_dtype(Ty::F16, false), false), // 2 b (f16, row-major KxN)
-        ld(slice_f32(true), true),              // 3 out (f32, row-major MxN)
-    ]);
-    let (a, b, out) = (local(1), local(2), local(3));
-    let tid = al.add(Ty::Usize, false);
-    let block = al.add(Ty::Usize, false);
-    let cmp = al.add(Ty::Bool, false);
-    let tn = al.add(Ty::Usize, false);
-    let tm = al.add(Ty::Usize, false);
-    let m0 = al.add(Ty::Usize, false);
-    let n0 = al.add(Ty::Usize, false);
-    let a_off = al.add(Ty::Usize, false);
-    let b_off = al.add(Ty::Usize, false);
-    let c_off = al.add(Ty::Usize, false);
-    let term = al.add(Ty::Usize, false);
-    let af = al.add(Ty::F16, false); // fragment handle (A)
-    let bf = al.add(Ty::F16, false); // fragment handle (B)
-    let acc = al.add(Ty::F32, false); // fragment handle (zero-seeded accumulator, updated in place)
-
-    let cu = |x: usize| Operand::Const(Constant::Usize(x as u64));
-    let set = |l: Local, rv: Rvalue| Statement::Assign(Place::local(l), rv);
-    let binc =
-        |op: BinOp, src: Local, x: usize| Rvalue::BinaryOp(op, copy(Place::local(src)), cu(x));
-    let bin = |op: BinOp, x: Local, y: Local| {
-        Rvalue::BinaryOp(op, copy(Place::local(x)), copy(Place::local(y)))
-    };
-
-    let bb0 = BasicBlock {
-        statements: vec![],
-        terminator: Terminator::ThreadIndexCall {
-            destination: Place::local(tid),
-            dim: IndexAxis::X,
-            target: BlockId { index: 1 },
-        },
-    };
-    // bb1: block = tid / 32 (one subgroup per tile); valid = block < num_tiles.
-    let bb1 = BasicBlock {
-        statements: vec![
-            set(block, binc(BinOp::Div, tid, 32)),
-            set(cmp, binc(BinOp::Lt, block, num_tiles)),
-        ],
-        terminator: guard(cmp, 3, 2),
-    };
-    // bb2: decode the tile coords, compute the A/B/out tile offsets (K == 16, so K-step 0 IS the
-    // whole K range - a_off is the tile's top-left, no per-step advance), load A/B, zero-seed the
-    // accumulator, mma, store D straight to `out`.
-    let body_stmts = vec![
-        set(tn, binc(BinOp::Rem, block, tiles_n)),
-        set(tm, binc(BinOp::Div, block, tiles_n)),
-        set(m0, binc(BinOp::Mul, tm, 16)),
-        set(n0, binc(BinOp::Mul, tn, 16)),
-        set(a_off, binc(BinOp::Mul, m0, k)), // A[m0, 0]
-        set(b_off, Rvalue::Use(copy(Place::local(n0)))), // B[0, n0]
-        set(term, binc(BinOp::Mul, m0, n)),
-        set(c_off, bin(BinOp::Add, term, n0)), // out[m0, n0]
-        Statement::WmmaLoad {
-            dtype: WmmaDtype::F16,
-            shape: WmmaShape::M16N16K16,
-            which: WmmaMat::A,
-            tile: elem(a, a_off),
-            stride: a_ld,
-            dst: af,
-        },
-        Statement::WmmaLoad {
-            dtype: WmmaDtype::F16,
-            shape: WmmaShape::M16N16K16,
-            which: WmmaMat::B,
-            tile: elem(b, b_off),
-            stride: b_ld,
-            dst: bf,
-        },
-        Statement::WmmaZero {
-            dtype: WmmaDtype::F16,
-            shape: WmmaShape::M16N16K16,
-            dst: acc,
-        },
-        Statement::WmmaMma {
-            dtype: WmmaDtype::F16,
-            shape: WmmaShape::M16N16K16,
-            a: af,
-            b: bf,
-            c: acc,
-            dst: acc,
-        },
-        Statement::WmmaStore {
-            dtype: WmmaDtype::F16,
-            shape: WmmaShape::M16N16K16,
-            tile: elem(out, c_off),
-            stride: c_ld,
-            src: acc,
-        },
-    ];
-    let bb2 = BasicBlock {
-        statements: body_stmts,
-        terminator: Terminator::Return,
-    };
-    // bb3: return (invalid-block exit).
-    let bb3 = BasicBlock {
-        statements: vec![],
-        terminator: Terminator::Return,
-    };
-
-    let mut body = Body::new(name, 3, al.locals, vec![bb0, bb1, bb2, bb3]);
-    body.workgroup_size = [32, 1, 1]; // one subgroup (gfx1151 wave32) per output tile
     Ok(body)
 }
 

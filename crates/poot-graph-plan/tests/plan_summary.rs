@@ -23,44 +23,19 @@ use std::path::PathBuf;
 
 use poot_executor_parity::dense::{Dense, Family, plain, step};
 use poot_executor_parity::weight_map::Projections;
-use poot_graph_ir::Graph;
+use poot_graph_ir::{Eqn, Graph, Operand, ValidationChannel, ValidationOutputs};
 use poot_graph_plan::{
-    CompileError, CompileOptions, FusionPolicy, KernelChoice, Plan, PlanError, Submission, Target,
+    CompileError, CompileOptions, Dispatch, KernelChoice, Plan, PlanError, Submission, Target,
     compile,
 };
 use poot_models::bloom::{BloomConfig, trace_bloom_decode_kv_masked, trace_bloom_prefill};
-use poot_models::deepseek2::{
-    DeepseekV2Config, DeepseekV2MoeParams, trace_deepseek2_decode_kv_masked,
-    trace_deepseek2_prefill,
-};
-use poot_models::deepseek3::{
-    DeepseekV3MoeParams, trace_deepseek3_decode_kv_masked, trace_deepseek3_prefill,
-};
-use poot_models::deepseek32::{
-    DsaConfig, trace_deepseek32_dsa_decode, trace_deepseek32_dsa_prefill,
-};
-use poot_models::gpt_oss::{GptOssParams, trace_gptoss_decode_kv_masked, trace_gptoss_prefill};
-use poot_models::granite::{
-    GraniteParams, MoeShape, trace_granite_decode_kv_masked, trace_granite_prefill,
-    trace_granite_prefill_kv,
-};
-use poot_models::mixtral::{MixtralParams, trace_mixtral_decode_kv_masked, trace_mixtral_prefill};
 use poot_models::model::{LogitRows, Phase};
 use poot_models::mpt::{MptConfig, trace_mpt_decode_kv_masked, trace_mpt_prefill};
-use poot_models::nemotron_h::{
-    NemotronHAttnConfig, NemotronHConfig, NemotronHLayerKind, NemotronHMambaConfig,
-    trace_nemotron_h_decode, trace_nemotron_h_prefill,
-};
-use poot_models::olmoe::{OlmoeParams, trace_olmoe_decode_kv_masked, trace_olmoe_prefill};
-use poot_models::qwen2::Qwen2Config;
-use poot_models::qwen3moe::{
-    Qwen3MoeParams, trace_qwen3_moe_decode_kv_masked, trace_qwen3_moe_prefill,
-    trace_qwen3_moe_prefill_kv,
-};
 use poot_models::qwen38::{
     QsaConfig, Qwen4ExpConfig, Qwen4ExpGdnConfig, Qwen4ExpModelConfig, trace_qwen38_decode,
     trace_qwen38_prefill,
 };
+use poot_models::registry::Registry;
 use poot_models::smollm3::{Smollm3Config, trace_smollm3_decode_kv_masked, trace_smollm3_prefill};
 use poot_target::AmdArch;
 use poot_target::Backend;
@@ -94,26 +69,6 @@ struct Row {
 }
 
 // ---- tiny dims -------------------------------------------------------------------------------
-
-/// The shared tiny qwen2-shaped config for the fixtures that read a `Qwen2Config`: GQA, head_dim
-/// decoupled from hidden/n_heads, and a real `rotary_dim` and `max_pos`.
-fn base_cfg() -> Qwen2Config {
-    Qwen2Config {
-        vocab: 24,
-        hidden: 16,
-        inter: 16,
-        layers: LAYERS,
-        n_heads: 4,
-        n_kv_heads: 2,
-        head_dim: 6,
-        rotary_dim: 6,
-        eps: 1e-5,
-        max_pos: 32,
-        qkv_bias: false,
-        qk_norm: false,
-        ..Qwen2Config::default()
-    }
-}
 
 /// The tiny dense checkpoint of `family` the registry rows trace: [`base_cfg`]'s dimensions through
 /// the family's own config (the head dimension is explicit, as the family fixtures give it).
@@ -157,59 +112,39 @@ fn traced_bf16(d: Dense, phase: Phase, tokens: usize, cap: usize) -> Graph {
     )
 }
 
-fn granite_params(moe: Option<MoeShape>) -> GraniteParams {
-    GraniteParams {
-        moe,
-        embed_mult: 1.0,
-        attn_mult: 1.0,
-        residual_mult: 1.0,
-        logits_scale: 1.0,
-    }
-}
-
-fn granite_moe() -> MoeShape {
-    MoeShape {
-        n_experts: 6,
-        top_k: 2,
-        inter: 12,
-    }
-}
-
-fn qwen3_moe_params() -> Qwen3MoeParams {
-    Qwen3MoeParams {
-        n_experts: 6,
-        top_k: 2,
-        inter: 12,
-        sparse_layer: vec![false, true],
-    }
-}
-
-fn mixtral_params() -> MixtralParams {
-    MixtralParams {
-        n_experts: 6,
-        top_k: 2,
-        inter: 12,
-    }
-}
-
-fn olmoe_params() -> OlmoeParams {
-    OlmoeParams {
-        n_experts: 6,
-        top_k: 2,
-        inter: 12,
-        norm_topk_prob: false,
-    }
-}
-
-fn gpt_oss_params() -> GptOssParams {
-    GptOssParams {
-        n_experts: 6,
-        top_k: 2,
-        inter: 12,
-        swiglu_limit: 2.5,
-        sliding_window: 2,
-        layer_is_sliding: vec![true, false],
-    }
+/// `family`'s registered fixture traced for one step: `rows` sequences of `tokens` new tokens over `cap`
+/// positions, last-token logits (the fixture's own dimensions; a family joins the corpus by name).
+fn registered(
+    family: &str,
+    phase: Phase,
+    rows: usize,
+    tokens: usize,
+    cap: usize,
+) -> Graph<ValidationOutputs> {
+    let registry = Registry::builtin().expect("the builtin registry");
+    // `family/variant` names one of the family's option fixtures (llama's Mixtral, granite's granitemoe).
+    let (name, variant) = family.split_once('/').unwrap_or((family, ""));
+    let entry = registry
+        .entries()
+        .iter()
+        .find(|entry| entry.family.as_str() == name)
+        .unwrap_or_else(|| panic!("no registered family {name}"));
+    let fixture = match variant {
+        "" => (entry.fixture)(),
+        variant => {
+            let (_, make) = entry
+                .variants
+                .iter()
+                .find(|(n, _)| *n == variant)
+                .unwrap_or_else(|| panic!("{name} has no fixture variant {variant}"));
+            make()
+        }
+    };
+    let model =
+        (entry.build)(&fixture.raw(), &fixture.store).unwrap_or_else(|e| panic!("{family}: {e}"));
+    model
+        .trace(phase, step(rows, tokens, cap, LogitRows::Last))
+        .unwrap_or_else(|e| panic!("{family}: {e}"))
 }
 
 fn bloom_cfg() -> BloomConfig {
@@ -249,90 +184,8 @@ fn smollm3_cfg() -> Smollm3Config {
 }
 
 /// DeepSeek-family MLA dims: v_head_dim differs from qk_nope+qk_rope, qk_rope_head_dim is even.
-fn deepseek_cfg(q_lora_rank: Option<usize>) -> DeepseekV2Config {
-    DeepseekV2Config {
-        vocab: 24,
-        hidden: 16,
-        layers: LAYERS,
-        n_heads: 4,
-        q_lora_rank,
-        kv_lora_rank: 6,
-        qk_nope_head_dim: 5,
-        qk_rope_head_dim: 4,
-        v_head_dim: 7,
-        eps: 1e-5,
-        max_pos: 32,
-        rope_theta: 10_000.0,
-        yarn: None,
-    }
-}
-
 /// One dense layer, then one routed layer.
-fn deepseek2_moe() -> DeepseekV2MoeParams {
-    DeepseekV2MoeParams {
-        n_routed_experts: 6,
-        top_k: 2,
-        moe_inter: 8,
-        n_shared_experts: 2,
-        dense_inter: 10,
-        first_k_dense_replace: 1,
-        n_group: 1,
-        topk_group: 1,
-        routed_scaling_factor: 1.0,
-    }
-}
-
-fn deepseek3_moe() -> DeepseekV3MoeParams {
-    DeepseekV3MoeParams {
-        n_routed_experts: 8,
-        top_k: 3,
-        moe_inter: 6,
-        n_shared_experts: 1,
-        dense_inter: 10,
-        first_k_dense_replace: 1,
-        n_group: 1,
-        topk_group: 1,
-        routed_scaling_factor: 1.0,
-    }
-}
-
-fn dsa_cfg() -> DsaConfig {
-    DsaConfig {
-        index_n_heads: 2,
-        index_head_dim: 4,
-        index_topk: 3,
-    }
-}
-
 /// All three layer kinds, so the mixer, attention and MLP planners each see a graph.
-fn nemotron_h_cfg() -> NemotronHConfig {
-    NemotronHConfig {
-        vocab_size: 12,
-        hidden: 6,
-        mlp_inter: 10,
-        eps: 1e-6,
-        pattern: vec![
-            NemotronHLayerKind::Mamba,
-            NemotronHLayerKind::Attention,
-            NemotronHLayerKind::Mlp,
-        ],
-        mamba: NemotronHMambaConfig {
-            hidden: 6,
-            mamba_num_heads: 4,
-            mamba_head_dim: 2,
-            n_groups: 2,
-            ssm_state: 3,
-            conv_kernel: 3,
-        },
-        attn: NemotronHAttnConfig {
-            hidden: 6,
-            num_heads: 4,
-            num_kv_heads: 2,
-            head_dim: 2,
-        },
-    }
-}
-
 /// A mixed GDN then QSA schedule; `chunk` is a multiple of both `index_compress_ratio` and `conv_k`.
 fn qwen38_cfg() -> Qwen4ExpModelConfig {
     Qwen4ExpModelConfig {
@@ -376,11 +229,11 @@ fn qwen38_cfg() -> Qwen4ExpModelConfig {
 
 /// The named corpus. A new row is a new graph in the summary; renaming a row renames its lines.
 ///
-/// - Every `DecodeArch` family of poot-llm: fixed-capacity decode, and the stateless prefill the CPU
+/// - The qwen2 tracers poot-llm still uses: fixed-capacity decode and the stateless prefill the CPU
 ///   oracle traces. Qwen2 appears as qwen2 (bias), qwen3 (QK-norm) and qwen2 with bf16 projections.
 /// - The contiguous fixed-KV prefill of the five architectures that have one, and a batched decode.
-/// - The MoE families are the routed rows above: qwen3-moe, mixtral, olmoe, gpt-oss, granitemoe and the
-///   DeepSeek family.
+/// - The registered families trace through `Model::trace` over their own fixture (`registered`): granite and
+///   qwen3-moe, olmoe, gpt-oss, mixtral, granitemoe, deepseek2/3/32 and nemotron_h.
 ///
 /// Deliberately not in the corpus: the exact families (DeepSeek-V4, MiniMax-M2, Qwen3.5 exact, Qwen4Exp,
 /// GLM-5.3). Their tracers served the exact route that Card 573 deleted, and the test-support features
@@ -433,40 +286,16 @@ fn corpus() -> Vec<Row> {
             build: || traced(gemma(), Phase::Prefill, 1, PROMPT, CAP),
         },
         Row {
-            name: "granite.decode",
-            build: || trace_granite_decode_kv_masked(base_cfg(), granite_params(None), CAP),
+            name: "gemma4.decode",
+            build: || plain(registered("gemma4", Phase::Decode, 1, 1, CAP)),
         },
         Row {
-            name: "granite.prefill",
-            build: || trace_granite_prefill(base_cfg(), granite_params(None), PROMPT),
+            name: "gemma4.prefill",
+            build: || plain(registered("gemma4", Phase::Prefill, 1, PROMPT, PROMPT)),
         },
         Row {
-            name: "granite.prefill_kv",
-            build: || trace_granite_prefill_kv(base_cfg(), granite_params(None), PROMPT, CAP),
-        },
-        Row {
-            name: "granitemoe.decode",
-            build: || {
-                trace_granite_decode_kv_masked(base_cfg(), granite_params(Some(granite_moe())), CAP)
-            },
-        },
-        Row {
-            name: "granitemoe.prefill",
-            build: || {
-                trace_granite_prefill(base_cfg(), granite_params(Some(granite_moe())), PROMPT)
-            },
-        },
-        Row {
-            name: "qwen3_moe.decode",
-            build: || trace_qwen3_moe_decode_kv_masked(base_cfg(), qwen3_moe_params(), CAP),
-        },
-        Row {
-            name: "qwen3_moe.prefill",
-            build: || trace_qwen3_moe_prefill(base_cfg(), qwen3_moe_params(), PROMPT),
-        },
-        Row {
-            name: "qwen3_moe.prefill_kv",
-            build: || trace_qwen3_moe_prefill_kv(base_cfg(), qwen3_moe_params(), PROMPT, CAP),
+            name: "gemma4.prefill_kv",
+            build: || plain(registered("gemma4", Phase::Prefill, 1, PROMPT, CAP)),
         },
         Row {
             name: "olmo2.decode",
@@ -505,63 +334,6 @@ fn corpus() -> Vec<Row> {
             build: || trace_smollm3_prefill(&smollm3_cfg(), PROMPT),
         },
         Row {
-            name: "mixtral.decode",
-            build: || trace_mixtral_decode_kv_masked(base_cfg(), mixtral_params(), CAP),
-        },
-        Row {
-            name: "mixtral.prefill",
-            build: || trace_mixtral_prefill(base_cfg(), mixtral_params(), PROMPT),
-        },
-        Row {
-            name: "olmoe.decode",
-            build: || trace_olmoe_decode_kv_masked(base_cfg(), olmoe_params(), CAP),
-        },
-        Row {
-            name: "olmoe.prefill",
-            build: || trace_olmoe_prefill(base_cfg(), olmoe_params(), PROMPT),
-        },
-        Row {
-            name: "gpt_oss.decode",
-            build: || trace_gptoss_decode_kv_masked(base_cfg(), gpt_oss_params(), CAP),
-        },
-        Row {
-            name: "gpt_oss.prefill",
-            build: || trace_gptoss_prefill(base_cfg(), gpt_oss_params(), PROMPT),
-        },
-        Row {
-            name: "deepseek2.decode",
-            build: || trace_deepseek2_decode_kv_masked(deepseek_cfg(Some(3)), deepseek2_moe(), CAP),
-        },
-        Row {
-            name: "deepseek2.prefill",
-            build: || trace_deepseek2_prefill(deepseek_cfg(Some(3)), deepseek2_moe(), PROMPT),
-        },
-        Row {
-            name: "deepseek3.decode",
-            build: || trace_deepseek3_decode_kv_masked(deepseek_cfg(Some(3)), deepseek3_moe(), CAP),
-        },
-        Row {
-            name: "deepseek3.prefill",
-            build: || trace_deepseek3_prefill(deepseek_cfg(Some(3)), deepseek3_moe(), PROMPT),
-        },
-        Row {
-            name: "deepseek32.decode",
-            build: || {
-                trace_deepseek32_dsa_decode(deepseek_cfg(Some(5)), dsa_cfg(), deepseek3_moe(), CAP)
-            },
-        },
-        Row {
-            name: "deepseek32.prefill",
-            build: || {
-                trace_deepseek32_dsa_prefill(
-                    deepseek_cfg(Some(5)),
-                    dsa_cfg(),
-                    deepseek3_moe(),
-                    PROMPT,
-                )
-            },
-        },
-        Row {
             name: "qwen38.decode",
             build: || trace_qwen38_decode(&qwen38_cfg(), CAP),
         },
@@ -569,13 +341,138 @@ fn corpus() -> Vec<Row> {
             name: "qwen38.prefill",
             build: || trace_qwen38_prefill(&qwen38_cfg(), PROMPT),
         },
-        Row {
-            name: "nemotron_h.decode",
-            build: || trace_nemotron_h_decode(&nemotron_h_cfg(), CAP),
+    ]
+}
+
+/// A row whose graph declares validation outputs (a routed layer's router witnesses): the plan covers the
+/// witnesses too. Rows are appended after [`corpus`].
+struct ValidatedRow {
+    name: &'static str,
+    build: fn() -> Graph<ValidationOutputs>,
+}
+
+/// The registered families that declare witnesses, traced through `Model::trace` over their fixtures.
+fn validated_corpus() -> Vec<ValidatedRow> {
+    vec![
+        ValidatedRow {
+            name: "granite.decode",
+            build: || registered("granite", Phase::Decode, 1, 1, CAP),
         },
-        Row {
+        ValidatedRow {
+            name: "granite.prefill",
+            build: || registered("granite", Phase::Prefill, 1, PROMPT, PROMPT),
+        },
+        ValidatedRow {
+            name: "granite.prefill_kv",
+            build: || registered("granite", Phase::Prefill, 1, PROMPT, CAP),
+        },
+        ValidatedRow {
+            name: "qwen3_moe.decode",
+            build: || registered("qwen3moe", Phase::Decode, 1, 1, CAP),
+        },
+        ValidatedRow {
+            name: "qwen3_moe.prefill",
+            build: || registered("qwen3moe", Phase::Prefill, 1, PROMPT, PROMPT),
+        },
+        ValidatedRow {
+            name: "qwen3_moe.prefill_kv",
+            build: || registered("qwen3moe", Phase::Prefill, 1, PROMPT, CAP),
+        },
+        ValidatedRow {
+            name: "granitemoe.decode",
+            build: || registered("granite/granitemoe", Phase::Decode, 1, 1, CAP),
+        },
+        ValidatedRow {
+            name: "granitemoe.prefill",
+            build: || registered("granite/granitemoe", Phase::Prefill, 1, PROMPT, PROMPT),
+        },
+        ValidatedRow {
+            name: "mixtral.decode",
+            build: || registered("llama/mixtral", Phase::Decode, 1, 1, CAP),
+        },
+        ValidatedRow {
+            name: "mixtral.prefill",
+            build: || registered("llama/mixtral", Phase::Prefill, 1, PROMPT, PROMPT),
+        },
+        ValidatedRow {
+            name: "olmoe.decode",
+            build: || registered("olmoe", Phase::Decode, 1, 1, CAP),
+        },
+        ValidatedRow {
+            name: "olmoe.prefill",
+            build: || registered("olmoe", Phase::Prefill, 1, PROMPT, PROMPT),
+        },
+        ValidatedRow {
+            name: "gemma4_moe.decode",
+            build: || registered("gemma4/moe", Phase::Decode, 1, 1, CAP),
+        },
+        ValidatedRow {
+            name: "gemma4_moe.prefill",
+            build: || registered("gemma4/moe", Phase::Prefill, 1, PROMPT, PROMPT),
+        },
+        ValidatedRow {
+            name: "gpt_oss.decode",
+            build: || registered("gpt_oss", Phase::Decode, 1, 1, CAP),
+        },
+        ValidatedRow {
+            name: "gpt_oss.prefill",
+            build: || registered("gpt_oss", Phase::Prefill, 1, PROMPT, PROMPT),
+        },
+        ValidatedRow {
+            name: "minimax_m2.decode",
+            build: || registered("minimax_m2", Phase::Decode, 1, 1, CAP),
+        },
+        ValidatedRow {
+            name: "minimax_m2.prefill",
+            build: || registered("minimax_m2", Phase::Prefill, 1, PROMPT, PROMPT),
+        },
+        ValidatedRow {
+            name: "deepseek2.decode",
+            build: || registered("deepseek2", Phase::Decode, 1, 1, CAP),
+        },
+        ValidatedRow {
+            name: "deepseek2.prefill",
+            build: || registered("deepseek2", Phase::Prefill, 1, PROMPT, PROMPT),
+        },
+        ValidatedRow {
+            name: "deepseek2.prefill_kv",
+            build: || registered("deepseek2", Phase::Prefill, 1, PROMPT, CAP),
+        },
+        ValidatedRow {
+            name: "deepseek3.decode",
+            build: || registered("deepseek3", Phase::Decode, 1, 1, CAP),
+        },
+        ValidatedRow {
+            name: "deepseek3.prefill",
+            build: || registered("deepseek3", Phase::Prefill, 1, PROMPT, PROMPT),
+        },
+        ValidatedRow {
+            name: "deepseek3.prefill_kv",
+            build: || registered("deepseek3", Phase::Prefill, 1, PROMPT, CAP),
+        },
+        ValidatedRow {
+            name: "deepseek32.decode",
+            build: || registered("deepseek32", Phase::Decode, 1, 1, CAP),
+        },
+        ValidatedRow {
+            name: "deepseek32.prefill",
+            build: || registered("deepseek32", Phase::Prefill, 1, PROMPT, PROMPT),
+        },
+        ValidatedRow {
+            name: "deepseek32.prefill_kv",
+            build: || registered("deepseek32", Phase::Prefill, 1, PROMPT, CAP),
+        },
+        ValidatedRow {
+            name: "nemotron_h.decode",
+            build: || registered("nemotron_h", Phase::Decode, 1, 1, CAP),
+        },
+        ValidatedRow {
             name: "nemotron_h.prefill",
-            build: || trace_nemotron_h_prefill(&nemotron_h_cfg(), PROMPT),
+            build: || registered("nemotron_h", Phase::Prefill, 1, PROMPT, PROMPT),
+        },
+        ValidatedRow {
+            name: "nemotron_h.prefill_kv",
+            build: || registered("nemotron_h", Phase::Prefill, 1, PROMPT, CAP),
         },
     ]
 }
@@ -637,9 +534,36 @@ impl PlanCells {
     }
 }
 
+/// What an attention equation's plan records beyond its grid: the schedule, its lane count, the workgroup
+/// memory the body states, the key layout and the key bound (`live(v<id>)` names the length operand of
+/// `eqn`). `-` for any other choice.
+fn attention_detail(eqn: &Eqn, choice: &KernelChoice, dispatch: &Dispatch) -> String {
+    let KernelChoice::Generated(poot_kernelgen::KernelRequest::Attention(spec)) = choice else {
+        return "-".to_string();
+    };
+    let poot_kernelgen::AttentionSchedule::Streaming { lanes } = spec.schedule;
+    let used = poot_kernelgen::BodyUse::measure(&dispatch.body)
+        .expect("an attention body states measurable workgroup memory");
+    let key = match spec.key {
+        poot_kernelgen::KeyLayout::Single => "single".to_string(),
+        poot_kernelgen::KeyLayout::Split { shared_dim } => format!("split({shared_dim})"),
+    };
+    let bound = match (spec.bound, eqn.inputs.last()) {
+        (poot_kernelgen::KeyBound::Static, _) => "capacity".to_string(),
+        (poot_kernelgen::KeyBound::Live, Some(Operand::Value(len))) => format!("live(v{len})"),
+        (poot_kernelgen::KeyBound::Live, _) => {
+            unreachable!("a live bound reads its length operand")
+        }
+    };
+    format!(
+        "schedule=streaming lanes={lanes} lds={} key={key} bound={bound}",
+        used.lds_bytes
+    )
+}
+
 /// `plan`'s summary cells, for one equation of a successfully compiled [`poot_graph_plan::Program`],
 /// with the kernel choice the program recorded for it.
-fn describe_plan(plan: &Plan, choice: &KernelChoice) -> PlanCells {
+fn describe_plan(eqn: &Eqn, plan: &Plan, choice: &KernelChoice) -> PlanCells {
     let grid_str = |[x, y, z]: [u32; 3]| format!("{x},{y},{z}");
     let cells = |plan, grid, detail| PlanCells {
         plan,
@@ -650,23 +574,37 @@ fn describe_plan(plan: &Plan, choice: &KernelChoice) -> PlanCells {
         detail,
     };
     match plan {
-        Plan::Compute { grid, .. } => cells("compute", grid_str(*grid), "-".to_string()),
-        Plan::ComputeMeta { meta, grid, .. } => {
-            cells("compute_meta", grid_str(*grid), format!("meta={meta:?}"))
-        }
-        Plan::ComputeChunks(chunks) => PlanCells {
-            plan: "chunks",
-            choice: choice.label(),
-            request: request_cell(choice),
-            launches: chunks.len(),
-            grid: format!(
-                "groups={:?}",
-                chunks.iter().map(|c| c.groups).collect::<Vec<_>>()
+        Plan::Dispatches(dispatches) => match dispatches.as_slice() {
+            [dispatch] if dispatch.launch.meta.is_empty() => cells(
+                "compute",
+                grid_str(dispatch.launch.grid),
+                attention_detail(eqn, choice, dispatch),
             ),
-            detail: format!(
-                "meta={:?}",
-                chunks.iter().map(|c| c.meta.as_slice()).collect::<Vec<_>>()
+            [Dispatch { launch, .. }] => cells(
+                "compute_meta",
+                grid_str(launch.grid),
+                format!("meta={:?}", launch.meta),
             ),
+            dispatches => PlanCells {
+                plan: "chunks",
+                choice: choice.label(),
+                request: request_cell(choice),
+                launches: dispatches.len(),
+                grid: format!(
+                    "groups={:?}",
+                    dispatches
+                        .iter()
+                        .map(|d| d.launch.grid[0] / d.body.workgroup_size[0])
+                        .collect::<Vec<_>>()
+                ),
+                detail: format!(
+                    "meta={:?}",
+                    dispatches
+                        .iter()
+                        .map(|d| d.launch.meta.as_slice())
+                        .collect::<Vec<_>>()
+                ),
+            },
         },
         Plan::Alias(src) => PlanCells::no_launch("alias", choice, format!("src=v{src}")),
         Plan::View {
@@ -751,25 +689,37 @@ fn render(backend: Backend) -> String {
     };
     let options = CompileOptions {
         execution: Submission::Replay,
-        fusion: FusionPolicy::Full,
         limits: poot_graph_plan::CompileLimits::STANDARD,
     };
     for row in corpus() {
-        let g: Graph = (row.build)();
-        match compile(&g, &target, &options) {
-            Ok(program) => {
-                for (i, (eqn, plan)) in program.planned().enumerate() {
-                    let c = describe_plan(plan, program.kernel_choice(eqn));
-                    write_line(&mut out, row.name, &i.to_string(), &eqn.op.name(), &c);
-                }
-            }
-            Err(error) => {
-                let (eqn, op, c) = describe_compile_error(&error);
-                write_line(&mut out, row.name, &eqn, &op, &c);
-            }
-        }
+        summarize(&mut out, row.name, &(row.build)(), &target, &options);
+    }
+    for row in validated_corpus() {
+        summarize(&mut out, row.name, &(row.build)(), &target, &options);
     }
     out
+}
+
+/// One graph's lines: one per planned equation, or one for the whole graph when `compile` refuses it.
+fn summarize<V: ValidationChannel>(
+    out: &mut String,
+    name: &str,
+    g: &Graph<V>,
+    target: &Target,
+    options: &CompileOptions,
+) {
+    match compile(g, target, options) {
+        Ok(program) => {
+            for (i, (eqn, plan)) in program.planned().enumerate() {
+                let c = describe_plan(eqn, plan, program.kernel_choice(eqn));
+                write_line(out, name, &i.to_string(), &eqn.op.name(), &c);
+            }
+        }
+        Err(error) => {
+            let (eqn, op, c) = describe_compile_error(&error);
+            write_line(out, name, &eqn, &op, &c);
+        }
+    }
 }
 
 fn expected_path(target: &str) -> PathBuf {
@@ -933,11 +883,7 @@ fn nvptx_plan_summary_matches_the_checked_in_file() {
 /// `LoadError::UnloadablePlan`.
 fn is_loadable(plan: &Plan) -> bool {
     match plan {
-        Plan::Compute { .. }
-        | Plan::ComputeMeta { .. }
-        | Plan::ComputeChunks(_)
-        | Plan::Alias(_)
-        | Plan::View { .. } => true,
+        Plan::Dispatches(_) | Plan::Alias(_) | Plan::View { .. } => true,
         Plan::Collective { .. } => false,
     }
 }
@@ -956,7 +902,6 @@ fn compile_emits_only_loadable_plan_kinds_over_the_whole_corpus() {
         };
         let options = CompileOptions {
             execution: Submission::Replay,
-            fusion: FusionPolicy::Full,
             limits: poot_graph_plan::CompileLimits::STANDARD,
         };
         for row in corpus() {
@@ -1000,10 +945,10 @@ fn plan_summary_rendering_is_deterministic() {
 
 /// Card 557 SC-003: a tracer states primitives and `ops::` compositions only. Every corpus graph, as
 /// traced and before `compile`, holds no compiler-fusion or schedule-choice composite (`OpClass::
-/// Composite`: the flash ops, `Rope`, `MatMulBias` and the fused regions; the packed and dense claims
+/// Composite`: the flash ops, `Rope`, `ContractionEpilogue` and the fused regions; the packed and dense claims
 /// are `Primitive` until Card 629 gives them a decomposition); no
 /// bounded semantic source carrier is authorized yet. Then `compile`'s passes do form composites, so
-/// the check is not vacuous. Mutation: emit `MatMulBias` from `ops::linear`, or mark one of those ops
+/// the check is not vacuous. Mutation: emit `ContractionEpilogue` from `ops::linear`, or mark one of those ops
 /// `OpClass::Primitive` and trace it; this row names the graph and equation.
 #[test]
 fn every_corpus_trace_is_primitive_before_compile() {
@@ -1016,7 +961,6 @@ fn every_corpus_trace_is_primitive_before_compile() {
     };
     let options = CompileOptions {
         execution: Submission::Replay,
-        fusion: FusionPolicy::Full,
         limits: poot_graph_plan::CompileLimits::STANDARD,
     };
     for row in corpus() {

@@ -86,16 +86,15 @@ The code runs on one pipeline: a target descriptor, a single `compile` entry, an
 contract. Current state:
 
 - Tracing, optimization, planning, kernel import and codegen, and capture/replay work on wgpu, ROCm
-  and PTX. Generation runs through the `poot-llm` library runner.
-- `poot-serve` starts, bounds requests and serves encoder embeddings and reranking; it refuses a dense decoder
+  and PTX. Generation runs through the `poot-llm` library driver.
+- `poot-serve` starts, bounds requests and serves encoder embeddings and reranking; it refuses a decoder
   until it serves through the driver. **It serves no generation:** `/v1/completions` and `/v1/chat/completions` return a typed `503`.
   See [Serving design](./serving-design.mdx).
 - `compile` owns the pass sequence and returns a `Program` with plans, storage, slots and numerics.
   Runtime `DeviceCaps` and typed planner refusals are implemented.
 - One executor contract serves every backend: `poot-executor`'s `Engine<D>` over a per-backend
-  `Device` trait (`WgpuDevice`, `RocmDevice`, `PtxDevice`, `VulkanDevice`). The driver drives it for the registered (dense)
-  families, the Runner's `generate_kv_gpu_*` entries for the rest; the first step on an entry records,
-  later steps replay.
+  `Device` trait (`WgpuDevice`, `RocmDevice`, `PtxDevice`, `VulkanDevice`). The driver drives it for every registered
+  family; the first step on an entry records, later steps replay.
 - Packed projections keep their stored representation through loading. Dense BF16/F16 weights are kept
   as stored words with no host f32 copy, and packed MoE execution can materialize expert tables on the
   device.

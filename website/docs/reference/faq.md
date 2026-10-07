@@ -22,7 +22,7 @@ activations, KV capacity, staging and temporary tensors; a packed checkpoint's s
 - Packed MoE paths currently materialize expert tables before indexed matmul.
 - Dense BF16/F16 weights are kept as stored words after loading; there is no host f32 copy. The CPU
   reference reads them through explicit casts in the graph on each step.
-- The serving settings that tuned the wgpu batch (`POOT_SLOTS` / `POOT_CAP`) and stored int8 KV (`POOT_KV_QUANT`) are not available yet (poot is being refactored; planned to return). Library callers
+- The serving settings that tuned the wgpu batch (`POOT_SLOTS` / `POOT_CAP`) are not available yet (poot is being refactored; planned to return). Library callers
   set the batch shape directly.
 
 FP8 projection storage and model support are separate questions. See

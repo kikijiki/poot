@@ -158,8 +158,10 @@ impl ExactValue {
                     }
                     DType::F32 => view
                         .bytes()
-                        .chunks_exact(4)
-                        .map(|word| f32::from_le_bytes(word.try_into().expect("chunks_exact(4)")))
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|word| f32::from_le_bytes(*word))
                         .collect(),
                     other => unreachable!(
                         "DenseOwnerTensorView::new only admits BF16 or F32, got {other:?}"

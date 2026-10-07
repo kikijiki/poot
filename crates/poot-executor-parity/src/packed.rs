@@ -12,7 +12,6 @@ use std::sync::Arc;
 
 use poot_graph_ir::ops::{PackedLinearGraphRow, packed_grouped_linear, packed_indexed_linear};
 use poot_graph_ir::{Builder, Slot, TensorType, ops};
-use poot_graph_plan::FusionPolicy;
 use poot_quant::format::{
     FieldEncoding, FloatFormat, GroupMap, OperandRole, Storage as FormatStorage, WeightFormat,
 };
@@ -102,7 +101,7 @@ fn random_bytes(len: usize, seed: u64) -> Vec<u8> {
 }
 
 /// The binary16 bits of a positive normal `value`.
-fn f16_bits(value: f32) -> u16 {
+pub(crate) fn f16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
     let exponent = ((bits >> 23) & 0xff) as i32 - 127 + 15;
     assert!(
@@ -162,7 +161,7 @@ fn real_magnitude_payload(scheme: &Scheme, seed: u64) -> Arc<PackedPayload> {
                         unreachable!("only act-order GPTQ has a group index");
                     };
                     bytes = (0..K)
-                        .flat_map(|k| (((k * 7) % groups.get()) as i32).to_le_bytes())
+                        .flat_map(|k| (((k * 7) % groups) as i32).to_le_bytes())
                         .collect();
                 }
                 (FormatStorage::Planar(_), SourceRole::Planar(operand_role)) => {
@@ -244,7 +243,7 @@ pub fn packed_linear_fixtures() -> Vec<Fixture> {
                 graph,
                 store: packed_store(&[("layer".to_string(), Arc::clone(&payload))]),
                 steps,
-                fusion: FusionPolicy::Full,
+                guarded: false,
             });
         }
     }
@@ -312,7 +311,7 @@ pub fn packed_chain_fixtures() -> Vec<Fixture> {
                 graph,
                 store: packed_store(&entries),
                 steps,
-                fusion: FusionPolicy::Full,
+                guarded: false,
             });
         }
     }

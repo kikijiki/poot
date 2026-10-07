@@ -249,10 +249,7 @@ impl Sampler {
     }
 
     /// A uniform f32 in [0, 1) from an xorshift64 step. `pub(crate)` for speculative sampling's accept-test
-    /// draw (`speculative::spec_sample_round`).
-    ///
-    /// Its one caller is the held `spec_sample_round` (POOT-751), so it is dead with that root; the
-    /// hold sits there.
+    /// draw (`driver::speculate::spec_sample_round`).
     pub(crate) fn uniform(&mut self) -> f32 {
         let s = self.next_u64();
         ((s >> 40) as f32) / ((1u64 << 24) as f32)
@@ -494,14 +491,8 @@ impl Sampler {
     /// one-hot distribution on the argmax. Entries outside the min-p/top-k/top-p candidate set are exactly
     /// 0; kept entries are normalized to sum to 1. Pure (`&self`, no rng draw); the same truncation as
     /// [`Self::pick_from`], materialized as a vector. A [`SamplerFault`] on the logits [`Self::pick`] rejects.
-    ///
-    /// No caller outside this crate's own tests (`core::speculative`'s sampled speculative decoding,
-    /// card 094): held for POOT-751 (formerly 586a) (sampled two-model speculation over host p/q, the draft rng stream).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "held for POOT-751 (formerly 586a)")
-    )]
-    pub(crate) fn probs(&self, logits: &[f32]) -> Result<Vec<f32>, SamplerFault> {
+    /// Speculative sampling's target `p` over a window's logits (`driver::speculate`).
+    pub fn probs(&self, logits: &[f32]) -> Result<Vec<f32>, SamplerFault> {
         let mut v = vec![0.0f32; logits.len()];
         if self.temperature <= 0.0 {
             v[argmax(logits)?] = 1.0;
@@ -521,7 +512,7 @@ impl Sampler {
     /// draft): the inverse-CDF draw `pick_from` does internally. Falls back to `probs`'s argmax if the mass
     /// is numerically <= 0 (a float-rounding safety net). A [`SamplerFault`] when `probs` holds a NaN or
     /// infinity.
-    pub(crate) fn sample_from_probs(&mut self, probs: &[f32]) -> Result<u32, SamplerFault> {
+    pub fn sample_from_probs(&mut self, probs: &[f32]) -> Result<u32, SamplerFault> {
         check_pickable(probs)?;
         let total: f32 = probs.iter().sum();
         if total <= 0.0 {
@@ -543,14 +534,7 @@ impl Sampler {
     /// `salt`. Sampled speculative decoding (card 094) needs two independent draw streams per request (the
     /// draft's proposals, the target's accept-test/residual draws), reproducible from one request seed. Call
     /// once before the round loop, not per round, or the streams would resync every round.
-    ///
-    /// No caller outside this crate's own tests (`core::speculative`'s sampled speculative decoding,
-    /// card 094): held for POOT-751 (formerly 586a) (sampled two-model speculation over host p/q, the draft rng stream).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "held for POOT-751 (formerly 586a)")
-    )]
-    pub(crate) fn fork(&self, salt: u64) -> Sampler {
+    pub fn fork(&self, salt: u64) -> Sampler {
         Sampler::new(self.temperature, self.top_k, self.top_p, self.rng ^ salt)
             .with_min_p(self.min_p)
     }

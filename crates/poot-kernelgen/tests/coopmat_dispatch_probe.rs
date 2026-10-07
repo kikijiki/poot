@@ -86,7 +86,9 @@ fn coopmat_tile_dispatches_and_matches_cpu_on_radv() {
     let mut got_bytes = vec![0u8; 256 * 4];
     ctx.read_bytes(&out_buf, &mut got_bytes).unwrap();
     let got: Vec<f32> = got_bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
 
@@ -187,7 +189,9 @@ fn coopmat_multi_tile_matmul_dispatches_and_matches_cpu_on_radv() {
     let mut got_bytes = vec![0u8; m * n * 4];
     ctx.read_bytes(&out_buf, &mut got_bytes).unwrap();
     let got: Vec<f32> = got_bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
 

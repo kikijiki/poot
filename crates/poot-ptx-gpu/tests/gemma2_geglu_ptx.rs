@@ -2,8 +2,8 @@
 //! exactly the pointwise chain this card's fusion-legality fix newly admits into one region -
 //! `is_fusable` refused `Gelu` before, so every GeGLU MLP paid for two dispatches (the `Gelu` and the
 //! `Mul`) instead of one. Real device regression: compile the decode graph twice against the real PTX
-//! device caps - once with `FusionPolicy::Full`, once with `FusionPolicy::MoeHangGuard` - confirm the
-//! `Full` compile actually carries a `Fused` region with the `Gelu` step per layer and the guarded
+//! device caps - once through the full pipeline, once under the routed-expert hang guard - confirm the
+//! full compile actually carries a `Fused` region with the `Gelu` step per layer and the guarded
 //! compile carries none (so this row proves the fix, not merely "fusion happens somewhere"), then run
 //! both compiled graphs on PTX/NVIDIA through the executor contract's resident path
 //! (`tests/common::run_resident_with_fusion`, real carried KV cache, zero seeded) and compare dense-decode
@@ -12,12 +12,14 @@
 //! `poot-rocm-gpu/src/tests/decode.rs`'s `gemma2_geglu_fused_decode_matches_unfused_and_cpu_oracle_rocm`.
 //!
 //! Card 535a/535b: no caller composes passes itself any more (`compile` owns the one fixed pass order;
-//! card 626 deletes the bare `cse`/`fuse` pattern this test used to follow). `FusionPolicy::MoeHangGuard`
-//! (cards 186/192's MoE-router-hang guard) is the clean unfused baseline here: it skips exactly
+//! card 626 deletes the bare `cse`/`fuse` pattern this test used to follow). The routed-expert hang guard
+//! (cards 186/192) is the clean unfused baseline here, reached by giving the graph a dead routed-expert
+//! site (`poot_test_util::graph_fixtures::with_routed_expert_site`) on the PTX target, which has the
+//! hang: it skips exactly
 //! `flash_attention_capped` and `fuse` and keeps matmuls off the tiled GEMM (so the compiled graph
 //! can carry no `Fused` region), while `canonicalize`, `cse`, `legalize`, the BF16 folds,
 //! `lower_nonlast_reduces` and
-//! `widen_mismatched_matmul_dtypes` still run identically to `FusionPolicy::Full` - the two compiles diverge only
+//! `widen_mismatched_matmul_dtypes` still run identically in the full pipeline - the two compiles diverge only
 //! in the fusion-adjacent passes, not in dtype/legality handling, so the comparison below isolates
 //! fusion's effect the same way the wgpu/ROCm siblings' `cse`-only-vs-`cse`+`fuse` pair did.
 //!
@@ -26,7 +28,7 @@
 //!
 //! Mutation (recorded in the card's landing note, never left in the tree): drop `Exp` from
 //! `poot_graph_plan::FUSABLE_FLOAT_UNARY_OPS` (`fuse.rs`) - the GeGLU region assertion on the
-//! `FusionPolicy::Full` compile below fails immediately (the GELU chain splits at its `exp`, so no
+//! full compile below fails immediately (the GELU chain splits at its `exp`, so no
 //! `Fused` region carries the whole GELU any more), before the device even runs.
 
 use std::collections::HashMap;
@@ -36,7 +38,7 @@ use poot_executor::Device;
 use poot_executor_parity::dense::{Dense, Family, plain, step};
 use poot_graph_ir::op::{FusedOp, FusedOperand, OpKind, UnOp};
 use poot_graph_ir::{Slot, Storage, ValueId};
-use poot_graph_plan::{CompileOptions, FusionPolicy, Submission, Target, compile};
+use poot_graph_plan::{CompileOptions, Submission, Target, compile};
 use poot_models::model::{LogitRows, Phase};
 use poot_ptx_gpu::PtxDevice;
 use poot_runtime_common::DeviceBackend;
@@ -151,14 +153,13 @@ fn gemma2_geglu_fused_decode_matches_unfused_and_cpu_oracle_ptx() {
         &target,
         &CompileOptions {
             execution: Submission::Replay,
-            fusion: FusionPolicy::Full,
             limits: poot_graph_plan::CompileLimits::STANDARD,
         },
     )
-    .expect("compile the gemma2 GeGLU decode graph, FusionPolicy::Full");
+    .expect("compile the gemma2 GeGLU decode graph, full pipeline");
     assert!(
         fused.passes().any(|p| p == "fuse"),
-        "FusionPolicy::Full must run fuse"
+        "the full pipeline must run fuse"
     );
     let fused_geglu_count = geglu_region_count(fused.graph());
     assert_eq!(
@@ -174,24 +175,28 @@ fn gemma2_geglu_fused_decode_matches_unfused_and_cpu_oracle_ptx() {
             .collect::<Vec<_>>()
     );
 
+    let (guarded_graph, guarded_caps) =
+        poot_test_util::graph_fixtures::pipeline_input(&g, target.caps, true);
     let unfused = compile(
-        &g,
-        &target,
+        &guarded_graph,
+        &Target {
+            caps: guarded_caps,
+            ..target
+        },
         &CompileOptions {
             execution: Submission::Replay,
-            fusion: FusionPolicy::MoeHangGuard,
             limits: poot_graph_plan::CompileLimits::STANDARD,
         },
     )
-    .expect("compile the gemma2 GeGLU decode graph, FusionPolicy::MoeHangGuard (unfused baseline)");
+    .expect("compile the gemma2 GeGLU decode graph, hang guard (unfused baseline)");
     assert!(
         !unfused.passes().any(|p| p == "fuse"),
-        "FusionPolicy::MoeHangGuard must skip fuse"
+        "the hang guard must skip fuse"
     );
     assert_eq!(
         geglu_region_count(unfused.graph()),
         0,
-        "the MoeHangGuard baseline must carry no Fused region"
+        "the hang-guard baseline must carry no Fused region"
     );
     assert!(
         fused.graph().eqns.len() < unfused.graph().eqns.len(),
@@ -219,10 +224,7 @@ fn gemma2_geglu_fused_decode_matches_unfused_and_cpu_oracle_ptx() {
     let mut cpu_inputs = inputs.clone();
     for &id in &g.inputs {
         if let Storage::Computed(computed) = g.meta(id).storage {
-            cpu_inputs.insert(
-                id,
-                HostTensor::f32(computed.shape(), computed.values_f32()).into(),
-            );
+            cpu_inputs.insert(id, computed.tensor().into());
         }
     }
     for (i, &(si, _)) in g.state.iter().enumerate() {
@@ -237,9 +239,8 @@ fn gemma2_geglu_fused_decode_matches_unfused_and_cpu_oracle_ptx() {
         .map(Value::into_host)
         .collect::<Result<Vec<_>, _>>()
         .expect("dense state");
-    let unfused_ptx =
-        common::run_resident_with_fusion(&mut ptx, &g, &inputs, FusionPolicy::MoeHangGuard);
-    let fused_ptx = common::run_resident_with_fusion(&mut ptx, &g, &inputs, FusionPolicy::Full);
+    let unfused_ptx = common::run_resident_with_fusion(&mut ptx, &g, &inputs, true);
+    let fused_ptx = common::run_resident_with_fusion(&mut ptx, &g, &inputs, false);
 
     assert_eq!(fused_ptx.shape(), unfused_ptx.shape());
     assert_eq!(fused_ptx.shape(), cpu.shape());

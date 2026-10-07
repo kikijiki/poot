@@ -7,8 +7,8 @@
 //! matmul with `Builder`, runs it through [`poot_executor_parity::run_once`] and compares against the
 //! f16-rounded CPU oracle.
 //!
-//! Shape/dtype follow `matmul_spirv_coopmat_eligible` (card 154): F16 operands, F32 output, K == 16, M/N
-//! 16-aligned, no batch dims. `Builder::matmul` infers the output dtype from operand A (F16), so the
+//! Shape/dtype follow `matmul_spirv_coopmat_eligible` (card 154): F16 operands, F32 output, M/N/K
+//! 16-aligned. `Builder::matmul` infers the output dtype from operand A (F16), so the
 //! output is retagged to F32 via `ValueMeta::aval`, as `poot-graph-plan`'s `mixed_matmul_graph_shape`
 //! helper does; no checkpoint loader produces an f16-in/f32-out matmul yet.
 
@@ -151,7 +151,6 @@ fn coopmat_matmul_run_resident_matches_cpu_on_radv() {
 /// Inspects the kernel choice directly; no GPU needed.
 #[test]
 fn coopmat_matmul_run_resident_graph_selects_coopmat_arm() {
-    use poot_graph_plan::Plan;
     use poot_graph_plan::cse;
     use poot_target::Backend;
 
@@ -170,8 +169,9 @@ fn coopmat_matmul_run_resident_graph_selects_coopmat_arm() {
     )
     .expect("the coopmat-eligible graph must plan on SpirvVulkan");
     assert!(
-        matches!(plan, Plan::Compute { .. }),
-        "expected Plan::Compute, got {plan:?}"
+        plan.single()
+            .is_some_and(|dispatch| dispatch.launch.meta.is_empty()),
+        "expected one dispatch without metadata, got {plan:?}"
     );
     assert!(
         matches!(

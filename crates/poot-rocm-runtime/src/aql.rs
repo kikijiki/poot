@@ -19,8 +19,10 @@ pub struct DeviceRingReceiptProvenance {
     pub contract: QueuePublicationContract,
 }
 
-/// HSA packet type `INVALID` (header bits 0..7). Body writes must leave this value until the
-/// reverse header-publication step release-stores a valid KERNEL_DISPATCH header.
+/// Header value a body write leaves in the slot until the reverse header-publication step
+/// release-stores a valid KERNEL_DISPATCH header. Note the HSA numbering: packet type 0 is
+/// `VENDOR_SPECIFIC` and type 1 is `INVALID`, so this is not the spec's `INVALID` type; the packet
+/// processor only reads slots up to the doorbell, which follows header publication.
 pub(crate) const AQL_PACKET_HEADER_INVALID: u16 = 0;
 
 /// Write one kernel-dispatch packet body into `ring[slot_index]` while leaving the header
@@ -35,10 +37,11 @@ pub(crate) unsafe fn write_kernel_dispatch_packet_body(
     slot_index: u64,
     kernel: &KernelHandle,
     kernarg_address: *mut c_void,
-    grid: (u32, u32, u32),
-    block: (u32, u32, u32),
+    geometry: DispatchGeometry,
     completion_signal: bindings::hsa_signal_t,
 ) {
+    let grid = geometry.grid();
+    let block = geometry.block();
     let setup = if block.1 == 1 && block.2 == 1 && grid.1 == 1 && grid.2 == 1 {
         1u16
     } else if block.2 == 1 && grid.2 == 1 {
@@ -49,9 +52,9 @@ pub(crate) unsafe fn write_kernel_dispatch_packet_body(
     let packet = bindings::hsa_kernel_dispatch_packet_t {
         header: AQL_PACKET_HEADER_INVALID,
         setup,
-        workgroup_size_x: block.0 as u16,
-        workgroup_size_y: block.1 as u16,
-        workgroup_size_z: block.2 as u16,
+        workgroup_size_x: block.0,
+        workgroup_size_y: block.1,
+        workgroup_size_z: block.2,
         reserved0: 0,
         grid_size_x: grid.0,
         grid_size_y: grid.1,
@@ -98,7 +101,7 @@ impl KernargAddress for RocmBuffer {
 /// shares that ring with the queue half and never touches the queue, the doorbell or the context.
 #[allow(clippy::type_complexity)]
 pub(crate) struct AqlRingWriter<'a, K: KernargAddress> {
-    pub(crate) dispatches: &'a [(KernelHandle, K, (u32, u32, u32), (u32, u32, u32))],
+    pub(crate) dispatches: &'a [(KernelHandle, K, DispatchGeometry)],
     pub(crate) completion: bindings::hsa_signal_t,
     pub(crate) ring: *mut bindings::hsa_kernel_dispatch_packet_t,
     pub(crate) header: u16,
@@ -114,7 +117,7 @@ impl<K: KernargAddress> AqlRingWriter<'_, K> {
         slot_index: u64,
         is_final_packet: bool,
     ) {
-        let (kernel, kernarg, grid, block) = &self.dispatches[packet_index];
+        let (kernel, kernarg, geometry) = &self.dispatches[packet_index];
         // SAFETY: `slot_index` addresses a free slot of the ring (see `AqlRingWriter`), and only this
         // thread writes it.
         unsafe {
@@ -123,8 +126,7 @@ impl<K: KernargAddress> AqlRingWriter<'_, K> {
                 slot_index,
                 kernel,
                 kernarg.kernarg_address(),
-                *grid,
-                *block,
+                *geometry,
                 if is_final_packet {
                     self.completion
                 } else {
@@ -231,5 +233,116 @@ impl publication::AqlChunkSink for LiveAqlChunkSink<'_> {
             (self.context.hsa.funcs.hsa_signal_store_release)(self.doorbell, packet_index as i64);
         }
         Ok(())
+    }
+}
+
+/// Why [`DispatchGeometry::new`] refused a dispatch: the packet it would build is one the HSA
+/// packet processor rejects as malformed (`HSA_STATUS_ERROR_INVALID_PACKET_FORMAT`), or one whose
+/// 16-bit workgroup fields cannot hold the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DispatchGeometryViolation {
+    /// A grid dimension is 0: the dispatch would launch no work-items.
+    #[error("grid {axis} is 0")]
+    ZeroGrid { axis: DispatchAxis },
+    /// A workgroup dimension is 0.
+    #[error("workgroup {axis} is 0")]
+    ZeroBlock { axis: DispatchAxis },
+    /// One workgroup dimension exceeds the per-dimension ceiling.
+    #[error("workgroup {axis} is {value}, above the per-dimension limit {max}")]
+    BlockAxisTooLarge {
+        axis: DispatchAxis,
+        value: u32,
+        max: u32,
+    },
+    /// The workgroup's invocation count exceeds the device ceiling.
+    #[error("workgroup invocations {invocations} exceed the limit {max}")]
+    BlockInvocationsTooLarge { invocations: u64, max: u32 },
+}
+
+/// A dispatch dimension, for diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchAxis {
+    X,
+    Y,
+    Z,
+}
+
+impl std::fmt::Display for DispatchAxis {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::X => "x",
+            Self::Y => "y",
+            Self::Z => "z",
+        })
+    }
+}
+
+const AXES: [DispatchAxis; 3] = [DispatchAxis::X, DispatchAxis::Y, DispatchAxis::Z];
+
+/// A dispatch's grid and workgroup size, proven to fit a well-formed kernel-dispatch packet. The
+/// only constructor is [`Self::new`], and the packet writer takes this type, so geometry that skipped
+/// validation cannot reach a ring slot and the writer's `u16` workgroup fields cannot truncate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DispatchGeometry {
+    grid: (u32, u32, u32),
+    block: (u16, u16, u16),
+}
+
+impl DispatchGeometry {
+    /// Check a dispatch's grid (work-items) and workgroup size: every dimension nonzero, every
+    /// workgroup dimension and the invocation count within
+    /// [`poot_target::AMDGPU_MAX_WORKGROUP_INVOCATIONS`]. That constant, not a live query here, is
+    /// trusted because it is the documented gfx9+ ceiling and
+    /// `context::caps_tests::a_live_agent_reports_the_workgroup_ceiling_the_caps_document` ties it to
+    /// the live agent's `HSA_AGENT_INFO_WORKGROUP_MAX_SIZE` and `_MAX_DIM` in the ROCm device lane.
+    /// Runs before any ring slot is reserved.
+    pub(crate) fn new(
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+    ) -> Result<Self, DispatchGeometryViolation> {
+        const MAX: u32 = poot_target::AMDGPU_MAX_WORKGROUP_INVOCATIONS;
+        const _: () = assert!(
+            MAX <= u16::MAX as u32,
+            "the packet's workgroup fields are u16"
+        );
+        let grid_axes = [grid.0, grid.1, grid.2];
+        let block_axes = [block.0, block.1, block.2];
+        for (axis, &value) in AXES.into_iter().zip(&grid_axes) {
+            if value == 0 {
+                return Err(DispatchGeometryViolation::ZeroGrid { axis });
+            }
+        }
+        for (axis, &value) in AXES.into_iter().zip(&block_axes) {
+            if value == 0 {
+                return Err(DispatchGeometryViolation::ZeroBlock { axis });
+            }
+            if value > MAX {
+                return Err(DispatchGeometryViolation::BlockAxisTooLarge {
+                    axis,
+                    value,
+                    max: MAX,
+                });
+            }
+        }
+        let invocations = block_axes.iter().map(|&b| u64::from(b)).product::<u64>();
+        if invocations > u64::from(MAX) {
+            return Err(DispatchGeometryViolation::BlockInvocationsTooLarge {
+                invocations,
+                max: MAX,
+            });
+        }
+        // Each axis is at most `MAX`, which fits `u16` (asserted above).
+        Ok(Self {
+            grid,
+            block: (block.0 as u16, block.1 as u16, block.2 as u16),
+        })
+    }
+
+    pub(crate) fn grid(self) -> (u32, u32, u32) {
+        self.grid
+    }
+
+    pub(crate) fn block(self) -> (u16, u16, u16) {
+        self.block
     }
 }

@@ -284,7 +284,7 @@ fn inputs_are_const_slot_or_state() {
 }
 
 /// The flash gate for `family`'s prefill under `kv`: `optimize()` must fuse attention into
-/// `FlashAttentionPrefill` (one per layer) and leave no materialized `[1,Hq,L,L]` softmax(QK^T)
+/// `Attention` (one per layer) and leave no materialized `[1,Hq,L,L]` softmax(QK^T)
 /// score `MatMul` (card 183; that O(L^2) matrix blew past the wgpu grid cap at long context,
 /// docs/updates/0483). `L=2048` is far from every fixture dimension, avoiding a false positive
 /// where a per-row weight matmul or attention reshape collides with `L` on some axis. This is the
@@ -301,7 +301,7 @@ fn assert_flash_fused_prefill(family: &str, kv: KvLayout) {
     let flash_prefill = opt
         .eqns
         .iter()
-        .filter(|e| matches!(e.op, OpKind::FlashAttentionPrefill { .. }))
+        .filter(|e| matches!(e.op, OpKind::Attention(_)))
         .count();
     assert_eq!(
         flash_prefill, layers,
@@ -366,7 +366,7 @@ fn optimize_fuses_flash_prefill_vlm_embeds_no_materialized_scores() {
     let flash_prefill = opt
         .eqns
         .iter()
-        .filter(|e| matches!(e.op, poot_graph_ir::OpKind::FlashAttentionPrefill { .. }))
+        .filter(|e| matches!(e.op, poot_graph_ir::OpKind::Attention(_)))
         .count();
     assert_eq!(
         flash_prefill, cfg.layers,

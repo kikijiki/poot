@@ -9,8 +9,11 @@
 use poot_graph_ir::rope_table::{RopeFlavor, RopeSpec, RopeSpecError, RopeTable, rope_tables};
 use poot_graph_ir::{BinOp, Builder, Traced, UnOp};
 
+use poot_quant::weights::WeightEntry;
+use poot_tensor::DType;
+
 use super::standard::ParamError;
-use crate::model::ConfigReason;
+use crate::model::{ConfigReason, FamilyKey, ModelError};
 
 /// Which dims a rotation pairs: the two halves of the rotary width (HF checkpoints), or adjacent
 /// even/odd dims (llama.cpp's GGUF Q/K rows, stored permuted for that layout). Both rotate the same
@@ -56,6 +59,16 @@ impl RopeParams {
         positive("rope_theta", theta)?;
         match *flavor {
             RopeFlavor::Plain | RopeFlavor::LongRope { .. } => {}
+            RopeFlavor::Proportional { rotated } => {
+                if rotated > rotary_dim / 2 {
+                    return Err(ParamError::new(
+                        "rotated_pairs",
+                        ConfigReason::Exceeds {
+                            max: rotary_dim / 2,
+                        },
+                    ));
+                }
+            }
             RopeFlavor::Linear { factor } => {
                 positive("rope_scaling.factor", factor)?;
             }
@@ -113,6 +126,29 @@ impl RopeParams {
     }
 }
 
+/// The GGUF tensor llama.cpp writes for a scaled or partial RoPE: the per-frequency factors the
+/// config's RoPE is rescaled by.
+pub const GGUF_ROPE_FREQS: &str = "rope_freqs.weight";
+
+/// The per-frequency factors of a `rope_freqs.weight`: llama.cpp writes them as one F32 vector.
+pub fn rope_freq_factors(family: FamilyKey, entry: &WeightEntry) -> Result<Vec<f32>, ModelError> {
+    match entry {
+        WeightEntry::Dense(dense) if dense.dtype() == DType::F32 => Ok(dense
+            .bytes()
+            .as_slice()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect()),
+        _ => Err(ModelError::Config {
+            family,
+            field: GGUF_ROPE_FREQS,
+            reason: ConfigReason::WrongType,
+        }),
+    }
+}
+
 /// How far a decoded llama3 rescale may sit from the stored factors, as the largest absolute
 /// cos/sin difference over the checked positions. The stored factors are `f32`, so a faithful
 /// decode lands orders of magnitude below it; a tensor that is not a llama3 rescale does not.
@@ -122,6 +158,19 @@ const LLAMA3_DECODE_TOLERANCE: f32 = 1e-3;
 /// original context for every checkpoint llama.cpp converts, so the low-frequency band, where the
 /// factors matter, rotates far enough to show an error.
 const LLAMA3_DECODE_POSITIONS: usize = 8192;
+
+/// A factor at least this large divides a frequency to nothing: llama.cpp's Gemma 4 converter
+/// (`Gemma4Model.generate_extra_tensors`) writes `1e30` for a pair that does not rotate, as the
+/// real 31B file's `rope_freqs.weight` shows (64 ones, then `1e30`).
+const NOPE_FACTOR: f32 = 1e20;
+
+/// The number of rotated pairs of a proportional `rope_freqs.weight` (Gemma 4): ones up to a point,
+/// then only NoPE factors. All-ones and any other shape are not proportional.
+fn proportional_pairs(factors: &[f32]) -> Option<usize> {
+    let rotated = factors.iter().take_while(|f| **f == 1.0).count();
+    let tail = &factors[rotated..];
+    (!tail.is_empty() && tail.iter().all(|f| *f >= NOPE_FACTOR)).then_some(rotated)
+}
 
 /// The llama3 flavor a llama.cpp `rope_freqs.weight` was written from.
 ///
@@ -153,6 +202,9 @@ fn llama3_flavor_from_factors(
     }
     if factors.iter().any(|f| !(f.is_finite() && *f >= 1.0)) {
         return Err(ConfigReason::Unsupported);
+    }
+    if let Some(rotated) = proportional_pairs(factors) {
+        return Ok(RopeFlavor::Proportional { rotated });
     }
     let plateau = factors.iter().copied().fold(1.0f32, f32::max);
     if plateau == 1.0 {

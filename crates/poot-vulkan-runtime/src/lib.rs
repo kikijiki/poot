@@ -25,7 +25,7 @@
 //! unified heap is out of scope for P1 (see `specs/133-raw-vulkan-backend/spec.md`, "Open questions").
 //!
 //! Pipelines (spec 133 P2 slice 1, card 139): [`Context::pipeline`] builds a pipeline/module once per
-//! caller-supplied kernel key (like `poot-runtime`'s `CachedPipeline`, and the `Plan::Compute`/`ComputeMeta`
+//! caller-supplied kernel key (like `poot-runtime`'s `CachedPipeline`, and the `Plan::Dispatches`
 //! `key` the executor loads kernels under) and returns a shared [`Pipeline`]. A later call with the same
 //! key returns the same pipeline, and is refused ([`RuntimeError::PipelineKeyConflict`]) if the kernel's
 //! code, argument schema or trap shape differs, so a key can never dispatch another body's pipeline.

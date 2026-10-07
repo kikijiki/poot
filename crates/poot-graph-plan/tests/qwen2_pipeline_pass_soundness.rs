@@ -60,7 +60,7 @@ fn bind_decode(g: &Graph, token: i32, pos: i32) -> HashMap<ValueId, HostTensor> 
             Storage::Slot(Slot::Token) => HostTensor::i32(aval.shape, vec![token]),
             Storage::Slot(Slot::Pos) => HostTensor::i32(aval.shape, vec![pos]),
             Storage::Slot(other) => unreachable!("unexpected slot {other:?}"),
-            Storage::Computed(c) => HostTensor::f32(c.shape(), c.values_f32()),
+            Storage::Computed(c) => c.tensor(),
             Storage::Const | Storage::State => {
                 let data: Vec<f32> = fill(aval.numel(), 100 + i as u64)
                     .iter()
@@ -332,9 +332,7 @@ fn legalize_hosts_the_decode_embed_gather_without_changing_hidden_state() {
             Storage::Slot(Slot::Pos) => di.insert(id, HostTensor::i32(vec![1, 1], vec![pos])),
             Storage::Slot(other) => unreachable!("unexpected slot {other:?}"),
             Storage::Const => di.insert(id, weight(m.name.as_deref().unwrap(), &m.aval.shape)),
-            Storage::Computed(computed) => {
-                Some(HostTensor::f32(computed.shape(), computed.values_f32()))
-            }
+            Storage::Computed(computed) => Some(computed.tensor()),
             Storage::State => None,
             Storage::Device => unreachable!(),
         };
@@ -387,9 +385,7 @@ fn legalize_hosts_the_decode_embed_gather_without_changing_hidden_state() {
             }
             Storage::Slot(other) => unreachable!("unexpected slot {other:?}"),
             Storage::Const => hi.insert(id, weight(m.name.as_deref().unwrap(), &m.aval.shape)),
-            Storage::Computed(computed) => {
-                Some(HostTensor::f32(computed.shape(), computed.values_f32()))
-            }
+            Storage::Computed(computed) => Some(computed.tensor()),
             Storage::State => None,
             Storage::Device => unreachable!(),
         };
@@ -455,9 +451,7 @@ fn legalize_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
             }
             Storage::Slot(other) => unreachable!("unexpected slot {other:?}"),
             Storage::Const => di.insert(id, weight(m.name.as_deref().unwrap(), &m.aval.shape)),
-            Storage::Computed(computed) => {
-                Some(HostTensor::f32(computed.shape(), computed.values_f32()))
-            }
+            Storage::Computed(computed) => Some(computed.tensor()),
             Storage::State => None,
             Storage::Device => unreachable!(),
         };
@@ -505,9 +499,7 @@ fn legalize_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
             }
             Storage::Slot(other) => unreachable!("unexpected slot {other:?}"),
             Storage::Const => hi.insert(id, weight(m.name.as_deref().unwrap(), &m.aval.shape)),
-            Storage::Computed(computed) => {
-                Some(HostTensor::f32(computed.shape(), computed.values_f32()))
-            }
+            Storage::Computed(computed) => Some(computed.tensor()),
             Storage::State => None,
             Storage::Device => unreachable!(),
         };

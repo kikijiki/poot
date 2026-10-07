@@ -1,7 +1,7 @@
 //! Card 559: the one authoring route and one asset manifest for kernels authored in ordinary Rust
 //! (`pootc/kernels/<family>/*.rs`), imported by `pootc` to a [`Body`], shipped as a committed
 //! `assets/*.kir.json` and parsed once per process via `OnceLock`. One file per family
-//! ([`contraction`], [`attention`], [`movement`], [`packed`], [`sampling`], [`probe`]) so a later card
+//! ([`contraction`], [`packed`], [`sampling`], [`probe`]) so a later card
 //! that retires a whole family (560a/560b/561a) deletes one file plus its lines here, never a
 //! scattered edit. [`MANIFEST`] is the single source of truth `pootc/tests/import_run.rs`'s
 //! `committed_assets_match_their_kernel_sources` iterates: every committed asset has exactly one entry,
@@ -199,19 +199,10 @@ macro_rules! kernel_assets {
     };
 }
 
-mod attention;
 mod contraction;
-mod movement;
 mod packed;
 mod probe;
 mod sampling;
-
-// The movement family's geometry helpers build the `Plan::ComputeMeta` buffers its own imported bodies
-// read their dims from; re-exported here (not just `pub(crate)` in `movement`) so `lib.rs` can bring
-// them into the crate-root namespace for every planner call site's `use crate::*`.
-pub(crate) use movement::{
-    broadcast_eff_strides, concat2_meta, dus_meta, index_remap_meta, row_major_strides,
-};
 
 /// The one kernel-authoring accessor: `ImportedKernel::GemvCoalesced.body()`. One variant per shipped
 /// kernel, contributed by its family file's `kernel_assets!` invocation. `pub`, not `pub(crate)`: the
@@ -221,28 +212,11 @@ pub(crate) use movement::{
 pub enum ImportedKernel {
     // contraction.rs
     GemvCoalesced,
-    GemvCoalescedBias,
     GemvBatchedCoalesced,
-    GemvBatchedCoalescedBias,
     GemvCoalescedBf16,
-    GemvCoalescedBiasBf16,
     GemvBatchedCoalescedBf16,
-    GemvBatchedCoalescedBiasBf16,
     TiledGemm,
-    TiledGemmBias,
     TiledGemmBatched,
-    DenseBf16Contraction,
-    // attention.rs
-    FlashDecode,
-    FlashPrefill,
-    // movement.rs
-    GatherAxis0,
-    GatherAxis,
-    ScatterAxis0,
-    ScatterUpdate,
-    IndexRemap,
-    DynUpdateSlice,
-    Concat2,
     // packed.rs
     PackI8,
     UnpackI8,
@@ -284,9 +258,6 @@ pub(crate) enum SerialLoop {
     /// One thread per output element loops over the contraction depth K, the first operand's last
     /// dimension.
     ContractionDepth,
-    /// One thread per (batch, head, query row) loops over the KV length (`k`'s second-to-last dimension),
-    /// twice over the head dim `d` (the score dot product, then the output update): `2 * kv * d` steps.
-    AttentionCache,
 }
 
 impl ImportedNeeds {
@@ -307,37 +278,19 @@ impl ImportedKernel {
             // Every contraction kernel loops over K per thread (the GEMVs per output column, the tiled
             // GEMMs per output tile element).
             ImportedKernel::GemvCoalesced
-            | ImportedKernel::GemvCoalescedBias
             | ImportedKernel::GemvBatchedCoalesced
-            | ImportedKernel::GemvBatchedCoalescedBias
             | ImportedKernel::GemvCoalescedBf16
-            | ImportedKernel::GemvCoalescedBiasBf16
             | ImportedKernel::GemvBatchedCoalescedBf16
-            | ImportedKernel::GemvBatchedCoalescedBiasBf16
             | ImportedKernel::TiledGemm
-            | ImportedKernel::TiledGemmBias
-            | ImportedKernel::TiledGemmBatched
-            | ImportedKernel::DenseBf16Contraction => {
+            | ImportedKernel::TiledGemmBatched => {
                 ImportedNeeds::serial(SerialLoop::ContractionDepth)
             }
-            // The flash kernels run one single-lane workgroup per (batch, head[, query row]); that
-            // thread walks the whole KV in a serial online-softmax loop.
-            ImportedKernel::FlashDecode | ImportedKernel::FlashPrefill => {
-                ImportedNeeds::serial(SerialLoop::AttentionCache)
-            }
-            // Movement and packing loops are bounded by rank or a constant; sampling's per-row
+            // Packing loops are bounded by rank or a constant; sampling's per-row
             // vocabulary loops are not modeled yet (POOT-634). The probes are test kernels no planner
             // route selects, so none is bounded here (`RmsnormDyn` loops over its row width; `RowsumFor`
             // over a constant). None uses a subgroup collective or a matrix fragment
             // (`a_declared_subgroup_matches_the_fragments_the_body_uses` pins that against the bodies).
-            ImportedKernel::GatherAxis0
-            | ImportedKernel::GatherAxis
-            | ImportedKernel::ScatterAxis0
-            | ImportedKernel::ScatterUpdate
-            | ImportedKernel::IndexRemap
-            | ImportedKernel::DynUpdateSlice
-            | ImportedKernel::Concat2
-            | ImportedKernel::PackI8
+            ImportedKernel::PackI8
             | ImportedKernel::UnpackI8
             | ImportedKernel::PackedBf16RowGather
             | ImportedKernel::PackedBf16ToF32
@@ -361,8 +314,6 @@ impl ImportedKernel {
     /// exhaustive over that family's own variants).
     pub fn body(self) -> &'static Body {
         self.body_contraction()
-            .or_else(|| self.body_attention())
-            .or_else(|| self.body_movement())
             .or_else(|| self.body_packed())
             .or_else(|| self.body_sampling())
             .or_else(|| self.body_probe())
@@ -376,8 +327,6 @@ impl ImportedKernel {
 /// from its `pootc/kernels/<family>/<source>.rs`.
 pub const MANIFEST: &[&[AssetEntry]] = &[
     contraction::ENTRIES,
-    attention::ENTRIES,
-    movement::ENTRIES,
     packed::ENTRIES,
     sampling::ENTRIES,
     probe::ENTRIES,
@@ -396,7 +345,7 @@ mod needs_tests {
 
     use super::*;
     use crate::device_validation::ResourceRefusal;
-    use crate::{Capability, FusionPolicy, KernelChoice, PlanError, Target};
+    use crate::{Capability, KernelChoice, PlanError, Target};
 
     /// Every shipped body states its fragment use, and a body with none declares no subgroup: the
     /// declaration table and the bodies cannot drift apart. Mutation: declare `subgroup_lanes: Some(32)`
@@ -416,8 +365,6 @@ mod needs_tests {
     fn all_kernels() -> impl Iterator<Item = ImportedKernel> {
         [
             contraction::VARIANTS,
-            attention::VARIANTS,
-            movement::VARIANTS,
             packed::VARIANTS,
             sampling::VARIANTS,
             probe::VARIANTS,
@@ -433,29 +380,21 @@ mod needs_tests {
         backend: Backend,
         graph: Graph,
         is_eqn: fn(&OpKind) -> bool,
-        /// The compile's fusion policy: `MoeHangGuard` keeps a matmul off the generated tiled GEMM and so
-        /// on the shipped one.
-        fusion: FusionPolicy,
+        /// Whether the compile is guarded against the routed-expert hang, which keeps a matmul off the
+        /// generated tiled GEMM and so on the shipped one.
+        guarded: bool,
     }
 
-    fn matmul_graph(
-        batch: usize,
-        m: usize,
-        k: usize,
-        n: usize,
-        weight: DType,
-        bias: bool,
-    ) -> Graph {
+    fn matmul_graph(batch: usize, m: usize, k: usize, n: usize, weight: DType) -> Graph {
         let b = Builder::new();
         let a = b.constant("a", TensorType::new(vec![batch, m, k], DType::F32));
         let w = b.constant("w", TensorType::new(vec![k, n], weight));
-        let bias = bias.then(|| b.constant("bias", TensorType::new(vec![n], DType::F32)));
-        let out = poot_graph_ir::ops::linear(&b, a, w, bias);
-        crate::passes::fuse_bias_epilogues(&b.finish(out))
+        let out = poot_graph_ir::ops::linear(&b, a, w, None);
+        b.finish(out)
     }
 
     fn is_matmul(op: &OpKind) -> bool {
-        matches!(op, OpKind::MatMul | OpKind::MatMulBias)
+        matches!(op, OpKind::MatMul)
     }
 
     fn fixtures() -> Vec<Fixture> {
@@ -464,36 +403,16 @@ mod needs_tests {
         let f32w = DType::F32;
         let bf16w = DType::BF16;
         let mut all = vec![
-            // Decode GEMVs: single sequence and batched, with and without bias, F32 and BF16 weights.
-            (GemvCoalesced, matmul_graph(1, 1, 256, 512, f32w, false)),
-            (GemvCoalescedBias, matmul_graph(1, 1, 256, 512, f32w, true)),
-            (
-                GemvBatchedCoalesced,
-                matmul_graph(4, 1, 256, 512, f32w, false),
-            ),
-            (
-                GemvBatchedCoalescedBias,
-                matmul_graph(4, 1, 256, 512, f32w, true),
-            ),
-            (
-                GemvCoalescedBf16,
-                matmul_graph(1, 1, 256, 512, bf16w, false),
-            ),
-            (
-                GemvCoalescedBiasBf16,
-                matmul_graph(1, 1, 256, 512, bf16w, true),
-            ),
+            // Decode GEMVs: single sequence and batched, F32 and BF16 weights.
+            (GemvCoalesced, matmul_graph(1, 1, 256, 512, f32w)),
+            (GemvBatchedCoalesced, matmul_graph(4, 1, 256, 512, f32w)),
+            (GemvCoalescedBf16, matmul_graph(1, 1, 256, 512, bf16w)),
             (
                 GemvBatchedCoalescedBf16,
-                matmul_graph(4, 1, 256, 512, bf16w, false),
+                matmul_graph(4, 1, 256, 512, bf16w),
             ),
-            (
-                GemvBatchedCoalescedBiasBf16,
-                matmul_graph(4, 1, 256, 512, bf16w, true),
-            ),
-            // Prefill tiled GEMMs: shared weight (with and without bias) and the per-batch attention matmul.
-            (TiledGemm, matmul_graph(1, 64, 256, 512, f32w, false)),
-            (TiledGemmBias, matmul_graph(1, 64, 256, 512, f32w, true)),
+            // Prefill tiled GEMM: shared weight, and the per-batch attention matmul below.
+            (TiledGemm, matmul_graph(1, 64, 256, 512, f32w)),
         ]
         .into_iter()
         .map(|(kernel, graph)| Fixture {
@@ -501,11 +420,7 @@ mod needs_tests {
             backend: wgpu,
             graph,
             is_eqn: is_matmul,
-            fusion: if matches!(kernel, TiledGemm | TiledGemmBias) {
-                FusionPolicy::MoeHangGuard
-            } else {
-                FusionPolicy::Full
-            },
+            guarded: matches!(kernel, TiledGemm),
         })
         .collect::<Vec<_>>();
         let attention_scores = {
@@ -520,83 +435,35 @@ mod needs_tests {
             backend: wgpu,
             graph: attention_scores,
             is_eqn: is_matmul,
-            fusion: FusionPolicy::Full,
-        });
-        // The dense BF16 contraction's one-thread-per-output body (M > 1; M == 1 is the generated Gemv).
-        let dense_bf16 = {
-            let b = Builder::new();
-            let a = b.constant("a", TensorType::new(vec![1, 2, 64], DType::F32));
-            let w = b.constant("w", TensorType::new(vec![32, 64], DType::BF16));
-            let out = b.matmul(a, b.transpose(w, vec![1, 0]));
-            crate::fold_dense_contractions(&b.finish(out))
-        };
-        all.push(Fixture {
-            kernel: DenseBf16Contraction,
-            backend: Backend::Nvptx,
-            graph: dense_bf16,
-            is_eqn: |op| matches!(op, OpKind::DenseContraction { .. }),
-            fusion: FusionPolicy::Full,
-        });
-        // Softcapped flash prefill is the one attention shape the planner still lowers to a shipped kernel.
-        let flash = {
-            let (hkv, n_rep, d, l) = (2, 2, 64, 16);
-            let b = Builder::new();
-            let q = b.constant("q", TensorType::f32(vec![1, hkv * n_rep, l, d]));
-            let k = b.constant("k", TensorType::f32(vec![1, hkv, l, d]));
-            let v = b.constant("v", TensorType::f32(vec![1, hkv, l, d]));
-            let mask = b.constant("m", TensorType::f32(vec![1, 1, l, l]));
-            let out = poot_graph_ir::ops::attention_prefill_softcap(
-                &b,
-                q,
-                k,
-                v,
-                n_rep,
-                0.125,
-                mask,
-                Some(50.0),
-            );
-            crate::passes_without_target(&b.finish(out))
-        };
-        all.push(Fixture {
-            kernel: FlashPrefill,
-            backend: wgpu,
-            graph: flash,
-            is_eqn: |op| matches!(op, OpKind::FlashAttentionPrefill { .. }),
-            fusion: FusionPolicy::Full,
+            guarded: false,
         });
         all
     }
 
     /// Every kernel whose declaration is a serial loop bounds a dispatch the planner really builds: the
     /// equation lowers to it on a backend whose gate selects it, and a device whose dispatch budget is one
-    /// step refuses it with `DispatchWork`. The table covers every declared kernel; `FlashDecode` is the one
-    /// exception, because the planner no longer lowers any attention decode to the shipped kernel (the
-    /// generated region kernel replaced it), so its declaration is pinned directly.
+    /// step refuses it with `DispatchWork`. The table covers every declared kernel.
     ///
-    /// Mutation, per group: move one variant (a bias, batched, bf16 or tiled GEMM, the dense BF16 GEMV, or
-    /// `FlashPrefill`) to `ImportedNeeds::NONE` in `ImportedKernel::needs`; that fixture plans under the
+    /// Mutation, per group: move one variant (a bias, batched, bf16 or tiled GEMM, or the dense BF16 GEMV)
+    /// to `ImportedNeeds::NONE` in `ImportedKernel::needs`; that fixture plans under the
     /// one-step budget and its row fails ("expected a DispatchWork refusal").
     #[test]
     fn every_serial_declaration_bounds_a_planned_dispatch() {
         let fixtures = fixtures();
         for kernel in all_kernels() {
-            if kernel.needs().serial != SerialLoop::None && kernel != ImportedKernel::FlashDecode {
+            if kernel.needs().serial != SerialLoop::None {
                 assert!(
                     fixtures.iter().any(|f| f.kernel == kernel),
                     "{kernel:?} declares a serial loop but has no planner fixture"
                 );
             }
         }
-        assert_eq!(
-            ImportedKernel::FlashDecode.needs().serial,
-            SerialLoop::AttentionCache
-        );
         for Fixture {
             kernel,
             backend,
             graph,
             is_eqn,
-            fusion,
+            guarded,
         } in fixtures
         {
             let eqn = graph
@@ -611,7 +478,7 @@ mod needs_tests {
                     eqn,
                     &Target { backend, caps },
                     &HashMap::new(),
-                    fusion,
+                    guarded,
                     &poot_test_util::graph_fixtures::roomy_body_limits(),
                 )
             };
@@ -619,10 +486,6 @@ mod needs_tests {
             let planned = plan(roomy).unwrap_or_else(|e| panic!("{kernel:?}: {e}"));
             let chosen = match &planned.choice {
                 KernelChoice::Imported { kernel, .. } => Some(*kernel),
-                KernelChoice::Chunked(chunks) => chunks.iter().find_map(|c| match c {
-                    KernelChoice::Imported { kernel, .. } => Some(*kernel),
-                    _ => None,
-                }),
                 _ => None,
             };
             assert_eq!(
@@ -646,48 +509,5 @@ mod needs_tests {
                 ),
             }
         }
-    }
-
-    /// The flash prefill kernel's declared work is the loop it runs: one thread per (head, query row)
-    /// (`4 * 16`), each walking the 16 KV rows twice over the head dim 64 (`2 * 16 * 64` steps). A budget of
-    /// exactly that admits it; one step less refuses. Mutation: change the rule to `kv * d` and the exact
-    /// budget is refused (or to `4 * kv * d` and the short one is admitted).
-    #[test]
-    fn flash_prefill_work_is_two_kv_d_steps_per_row() {
-        let fixture = fixtures()
-            .into_iter()
-            .find(|f| f.kernel == ImportedKernel::FlashPrefill)
-            .unwrap();
-        let eqn = fixture
-            .graph
-            .eqns
-            .iter()
-            .find(|e| (fixture.is_eqn)(&e.op))
-            .unwrap();
-        let work = (4 * 16) * (2 * 16 * 64);
-        let plan = |budget: u64| {
-            let mut caps = default_caps_for(fixture.backend);
-            caps.max_dispatch_work = Queried::Known(budget);
-            crate::plan_eqn_compiled(
-                &crate::ExactI32StorageAnalysis::new(&fixture.graph),
-                &fixture.graph,
-                eqn,
-                &Target {
-                    backend: fixture.backend,
-                    caps,
-                },
-                &HashMap::new(),
-                fixture.fusion,
-                &poot_test_util::graph_fixtures::roomy_body_limits(),
-            )
-        };
-        plan(work).unwrap_or_else(|e| panic!("exact budget: {e}"));
-        let short = plan(work - 1).map(|p| p.choice);
-        assert!(
-            matches!(&short, Err(PlanError::Refused(r)) if matches!(
-                r.missing,
-                Capability::KernelResources(ResourceRefusal::DispatchWork { work: w, .. }) if w == work)),
-            "one step short: {short:?}"
-        );
     }
 }

@@ -487,7 +487,7 @@ pub(super) fn run_step(
             Storage::Const => {
                 HostTensor::f32(shape.clone(), weight(m.name.as_deref().unwrap(), &shape))
             }
-            Storage::Computed(c) => HostTensor::f32(c.shape(), c.values_f32()),
+            Storage::Computed(c) => c.tensor(),
             Storage::State => continue,
             Storage::Device => panic!("a graph input is never a device intermediate"),
         };

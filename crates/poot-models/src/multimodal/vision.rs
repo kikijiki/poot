@@ -809,7 +809,7 @@ mod tests {
         for &(oh, ow) in &[(4usize, 3usize), (20, 14), (10, 7)] {
             let out = resize_lanczos(&rgb, sh, sw, oh, ow);
             assert_eq!(out.len(), oh * ow * 3);
-            for (i, chunk) in out.chunks_exact(3).enumerate() {
+            for (i, chunk) in out.as_chunks::<3>().0.iter().enumerate() {
                 assert!(chunk.iter().all(|v| v.is_finite()), "nonfinite at {i}");
                 assert!((chunk[0] - 200.0).abs() < 0.5, "R {} at {i}", chunk[0]);
                 assert!((chunk[1] - 50.0).abs() < 0.5, "G {} at {i}", chunk[1]);

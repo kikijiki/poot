@@ -212,225 +212,6 @@ pub fn qwen38_ngram_tables(ple: &Qwen4ExpPleConfig, ple_layer_index: usize) -> Q
     }
 }
 
-// Card 638: this whole cluster is a CPU reference oracle with no production caller -
-// `qwen38_ngram_ids` is checked bit-exactly against the real in-graph composition
-// (`qwen38_ngram_ids_graph`/`trace_qwen38_ngram_ids`, below, outside this module) by many tests. A
-// production-shaped item must not be hidden behind its own `#[cfg(test)]`; a genuine test oracle like this
-// one belongs in a test module instead, so it lives here rather than at `ple`'s top level.
-#[cfg(test)]
-pub(crate) mod ngram_oracle {
-    use super::*;
-
-    /// Real `Qwen4ExpTextNGramEmbedding._shift_right_ignore_eos` (`modeling_qwen4_exp.py` lines 1126-1139):
-    /// shift `tokens` right by `shift`, filling with `eos` wherever the source position would fall before the
-    /// current EOS-delimited segment's start (so an n-gram never straddles a document boundary) or before the
-    /// start of the buffer.
-    ///
-    /// The real code uses `cummax` over `where(token == eos, position, -1)`, then a one-position right shift
-    /// so the boundary token itself belongs to the old segment (`previous_eos =
-    /// cat([-1], previous_eos_inclusive[:-1])`). This port scans forward once, updating `seg_start` only after
-    /// position `t` is emitted (the same "exclusive of `t`" rule).
-    pub(crate) fn ngram_shift_right_ignore_eos(tokens: &[i64], shift: usize, eos: i64) -> Vec<i64> {
-        if shift == 0 {
-            return tokens.to_vec();
-        }
-        let mut out = Vec::with_capacity(tokens.len());
-        let mut seg_start = 0usize;
-        for (t, &tok) in tokens.iter().enumerate() {
-            let in_segment = t >= shift && t - shift >= seg_start;
-            out.push(if in_segment { tokens[t - shift] } else { eos });
-            if tok == eos {
-                seg_start = t + 1;
-            }
-        }
-        out
-    }
-
-    /// Host-side n-gram id hashing: `Qwen4ExpTextNGramEmbedding.forward` (`modeling_qwen4_exp.py` lines
-    /// 1141-1187), everything up to but excluding the embedding lookup. Returns the
-    /// `[input_ids.len() * ngram_heads]` row-major id block the graph then `Gather`s (see `qwen38_ple_core_with_embeddings`).
-    ///
-    /// # Why host-side
-    ///
-    /// The real hash is 64-bit integer arithmetic: each shifted token is multiplied by an odd ~2^45
-    /// multiplier (wrapping at 64 bits), XORed together, then reduced modulo a ~20M prime. `poot_graph_ir`
-    /// has no i64 dtype, no bitwise-XOR `OpKind`, and no integer modulo. The result is a pure function of the
-    /// token ids, like the tokenizer output and the causal/RoPE tables, so the ids are computed here and bound
-    /// as an `I32` step input (`{layer}.ple.ngram_ids`, card 550a). No new `OpKind` is needed.
-    ///
-    /// # Arguments
-    ///
-    /// `previous_context` is the source's `previous_context`: exactly [`Qwen4ExpPleConfig::context_len`] token ids
-    /// preceding `input_ids`. For a from-scratch prefill the real code fills it with `eos_token_id`
-    /// (`input_ids.new_full((batch, context_len), self.eos_token_id)`); for a decode step it is the last
-    /// `context_len` generated tokens (the real code carries them in the cache's third conv-state slot). The
-    /// caller builds it (see `qwen38_ngram_previous_context`) or, preferably, threads it through
-    /// `Qwen4ExpNgramHistory`, which owns the trailing window and advances it per chunk.
-    ///
-    /// A `previous_context` whose length is not `context_len` is caller-controlled input, so this returns
-    /// [`Qwen4ExpNgramError`] rather than panicking.
-    ///
-    /// # Signed 64-bit wrapping and Python's `remainder`
-    ///
-    /// `shifted_tokens[i] * layer_multipliers[i]` overflows `int64` for realistic vocab sizes and PyTorch
-    /// wraps (two's complement), so this uses `wrapping_mul` on `i64`. `torch.remainder` is Python-style (the
-    /// result takes the divisor's sign, always non-negative here), not Rust's `%`, so this uses `rem_euclid`;
-    /// plain `%` on a negative `mixed_ids` would give a negative row index.
-    ///
-    /// No caller outside this crate's own tests, where it is the CPU oracle
-    /// [`qwen38_ngram_ids_graph`]/[`trace_qwen38_ngram_ids`] (the real in-graph, production path) is checked
-    /// against.
-    pub(crate) fn qwen38_ngram_ids(
-        ple: &Qwen4ExpPleConfig,
-        tables: &Qwen4ExpNgramTables,
-        previous_context: &[i32],
-        input_ids: &[i32],
-    ) -> Result<Vec<i32>, Qwen4ExpNgramError> {
-        let want = ple.context_len();
-        if previous_context.len() != want {
-            return Err(Qwen4ExpNgramError::ContextLength {
-                got: previous_context.len(),
-                want,
-            });
-        }
-        let eos = ple.eos_token_id as i64;
-        let heads = ple.ngram_heads();
-        let per = ple.heads_per_ngram;
-
-        // Real `token_history = torch.cat([previous_context, input_ids], dim=-1)`.
-        let history: Vec<i64> = previous_context
-            .iter()
-            .chain(input_ids.iter())
-            .map(|&v| v as i64)
-            .collect();
-        let hist_len = history.len();
-        let shifted: Vec<Vec<i64>> = (0..ple.ngram_size)
-            .map(|shift| ngram_shift_right_ignore_eos(&history, shift, eos))
-            .collect();
-
-        // Real: one `blocks` entry per n-gram order in `2..=ngram_size`, concatenated along the head axis.
-        let mut ids = vec![0i32; hist_len * heads];
-        for ngram in 2..=ple.ngram_size {
-            let start_idx = (ngram - 2) * per;
-            for t in 0..hist_len {
-                let mut mixed = shifted[0][t].wrapping_mul(tables.layer_multipliers[0]);
-                for (position, row) in shifted.iter().enumerate().take(ngram).skip(1) {
-                    mixed ^= row[t].wrapping_mul(tables.layer_multipliers[position]);
-                }
-                for j in 0..per {
-                    let head = start_idx + j;
-                    let id =
-                        mixed.rem_euclid(tables.head_vocab_sizes[head]) + tables.head_offsets[head];
-                    ids[t * heads + head] = id as i32;
-                }
-            }
-        }
-
-        // Real `[:, -input_ids.shape[1]:]`: drop the `context_len` history-only rows.
-        let drop = hist_len - input_ids.len();
-        Ok(ids[drop * heads..].to_vec())
-    }
-
-    /// Caller-controlled input failures from [`qwen38_ngram_ids`] / `Qwen4ExpNgramHistory`. Internal
-    /// invariants (a carrier window it advanced itself, a non-empty shard list in the sharded lookup) stay
-    /// `assert!`s; only shapes the caller supplies get here.
-    ///
-    /// No caller outside this crate's own tests.
-    #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-    pub(crate) enum Qwen4ExpNgramError {
-        /// `previous_context` must be exactly `context_len = ngram_size - 1` tokens.
-        #[error(
-            "previous_context must be exactly context_len = ngram_size - 1 tokens; got {got}, want {want}"
-        )]
-        ContextLength { got: usize, want: usize },
-    }
-
-    /// Build the `previous_context` argument [`qwen38_ngram_ids`] expects from a token history: the last
-    /// [`Qwen4ExpPleConfig::context_len`] entries of `prior_tokens`, left-padded with `eos_token_id` when there
-    /// are fewer (the real code's two fill sites: the no-cache `new_full(.., eos_token_id)` initializer and
-    /// the `F.pad(.., value=self.eos_token_id)` for a first call shorter than `context_len`,
-    /// `modeling_qwen4_exp.py` lines 1149-1163). An empty slice gives the from-scratch prefill case.
-    ///
-    /// Prefer [`Qwen4ExpNgramHistory`] when feeding a sequence in more than one call: it owns this window and
-    /// advances it, so chunked prefill and decode reproduce one full prefill's ids.
-    pub(crate) fn qwen38_ngram_previous_context(
-        ple: &Qwen4ExpPleConfig,
-        prior_tokens: &[i32],
-    ) -> Vec<i32> {
-        let n = ple.context_len();
-        let mut ctx = vec![ple.eos_token_id; n];
-        let take = prior_tokens.len().min(n);
-        ctx[n - take..].copy_from_slice(&prior_tokens[prior_tokens.len() - take..]);
-        ctx
-    }
-
-    /// Carried n-gram history for chunked prefill and token-by-token decode: owns exactly
-    /// [`Qwen4ExpPleConfig::context_len`] trailing tokens and yields the next chunk's ids through
-    /// [`qwen38_ngram_ids`], then advances the window so the following call sees this chunk as prior
-    /// context. One full prefill over a sequence and any chunked/decode split of the same sequence must
-    /// therefore produce the same concatenated ids (Card 449 SC-003 foundation, Card 363 FR-006/FR-012
-    /// two-token prior carry). This is host-side id derivation only; it adds no graph `Slot`.
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    pub(crate) struct Qwen4ExpNgramHistory {
-        /// Trailing window handed to [`qwen38_ngram_ids`] as `previous_context`. Invariant: always exactly
-        /// `context_len` tokens (enforced by construction and by `ids_for_chunk`).
-        trailing: Vec<i32>,
-        context_len: usize,
-    }
-
-    impl Qwen4ExpNgramHistory {
-        /// From-scratch prefill history: `context_len` copies of `eos_token_id` (equivalent to
-        /// [`qwen38_ngram_previous_context`] on an empty prior).
-        pub fn new(ple: &Qwen4ExpPleConfig) -> Self {
-            Self::from_prior(ple, &[])
-        }
-
-        /// Resume over `prior_tokens` with the same last-`context_len` / EOS-pad rule as
-        /// [`qwen38_ngram_previous_context`].
-        pub fn from_prior(ple: &Qwen4ExpPleConfig, prior_tokens: &[i32]) -> Self {
-            Self {
-                trailing: qwen38_ngram_previous_context(ple, prior_tokens),
-                context_len: ple.context_len(),
-            }
-        }
-
-        /// The window that would be (and is) passed to [`qwen38_ngram_ids`] for the next chunk.
-        pub fn previous_context(&self) -> &[i32] {
-            &self.trailing
-        }
-
-        /// Ids for `input_ids` against the carried window, then advance the window to the last
-        /// `context_len` tokens of the combined history (via [`qwen38_ngram_previous_context`], so the
-        /// EOS-pad rule stays in one place). `input_ids` may be empty (ids are empty, window unchanged).
-        pub fn ids_for_chunk(
-            &mut self,
-            ple: &Qwen4ExpPleConfig,
-            tables: &Qwen4ExpNgramTables,
-            input_ids: &[i32],
-        ) -> Result<Vec<i32>, Qwen4ExpNgramError> {
-            let ids = qwen38_ngram_ids(ple, tables, &self.trailing, input_ids)?;
-            // Advance: next previous_context = last context_len of (trailing ++ input_ids). `trailing` is
-            // already context_len long, so the combined slice never needs an EOS pad, but going through
-            // the helper keeps the two fill rules identical.
-            if !input_ids.is_empty() {
-                let combined: Vec<i32> = self.trailing.iter().chain(input_ids).copied().collect();
-                self.trailing = qwen38_ngram_previous_context(ple, &combined);
-            }
-            // True internal invariant: only this type mutates `trailing`, and both constructors and the
-            // advance path preserve `context_len`.
-            assert_eq!(
-                self.trailing.len(),
-                self.context_len,
-                "Qwen4ExpNgramHistory window must stay context_len long"
-            );
-            Ok(ids)
-        }
-    }
-} // mod ngram_oracle
-
-#[cfg(test)]
-pub(crate) use ngram_oracle::*;
-
 /// In-graph n-gram id derivation: the composition counterpart of [`qwen38_ngram_ids`], built from
 /// `poot_graph_ir::ops` primitives (I32 `Mul`/`Xor`/`RemU` over the little-endian u64 hash helpers).
 ///
@@ -1052,3 +833,222 @@ pub(crate) fn qwen4exp_ple_scaled_row(
     let scale_row = b.broadcast(scale, b.aval(row).shape);
     b.binary(BinOp::Mul, row, scale_row)
 }
+
+#[cfg(test)]
+pub(crate) use ngram_oracle::*;
+
+// Card 638: this whole cluster is a CPU reference oracle with no production caller -
+// `qwen38_ngram_ids` is checked bit-exactly against the real in-graph composition
+// (`qwen38_ngram_ids_graph`/`trace_qwen38_ngram_ids`, below, outside this module) by many tests. A
+// production-shaped item must not be hidden behind its own `#[cfg(test)]`; a genuine test oracle like this
+// one belongs in a test module instead, so it lives here rather than at `ple`'s top level.
+#[cfg(test)]
+pub(crate) mod ngram_oracle {
+    use super::*;
+
+    /// Real `Qwen4ExpTextNGramEmbedding._shift_right_ignore_eos` (`modeling_qwen4_exp.py` lines 1126-1139):
+    /// shift `tokens` right by `shift`, filling with `eos` wherever the source position would fall before the
+    /// current EOS-delimited segment's start (so an n-gram never straddles a document boundary) or before the
+    /// start of the buffer.
+    ///
+    /// The real code uses `cummax` over `where(token == eos, position, -1)`, then a one-position right shift
+    /// so the boundary token itself belongs to the old segment (`previous_eos =
+    /// cat([-1], previous_eos_inclusive[:-1])`). This port scans forward once, updating `seg_start` only after
+    /// position `t` is emitted (the same "exclusive of `t`" rule).
+    pub(crate) fn ngram_shift_right_ignore_eos(tokens: &[i64], shift: usize, eos: i64) -> Vec<i64> {
+        if shift == 0 {
+            return tokens.to_vec();
+        }
+        let mut out = Vec::with_capacity(tokens.len());
+        let mut seg_start = 0usize;
+        for (t, &tok) in tokens.iter().enumerate() {
+            let in_segment = t >= shift && t - shift >= seg_start;
+            out.push(if in_segment { tokens[t - shift] } else { eos });
+            if tok == eos {
+                seg_start = t + 1;
+            }
+        }
+        out
+    }
+
+    /// Host-side n-gram id hashing: `Qwen4ExpTextNGramEmbedding.forward` (`modeling_qwen4_exp.py` lines
+    /// 1141-1187), everything up to but excluding the embedding lookup. Returns the
+    /// `[input_ids.len() * ngram_heads]` row-major id block the graph then `Gather`s (see `qwen38_ple_core_with_embeddings`).
+    ///
+    /// # Why host-side
+    ///
+    /// The real hash is 64-bit integer arithmetic: each shifted token is multiplied by an odd ~2^45
+    /// multiplier (wrapping at 64 bits), XORed together, then reduced modulo a ~20M prime. `poot_graph_ir`
+    /// has no i64 dtype, no bitwise-XOR `OpKind`, and no integer modulo. The result is a pure function of the
+    /// token ids, like the tokenizer output and the causal/RoPE tables, so the ids are computed here and bound
+    /// as an `I32` step input (`{layer}.ple.ngram_ids`, card 550a). No new `OpKind` is needed.
+    ///
+    /// # Arguments
+    ///
+    /// `previous_context` is the source's `previous_context`: exactly [`Qwen4ExpPleConfig::context_len`] token ids
+    /// preceding `input_ids`. For a from-scratch prefill the real code fills it with `eos_token_id`
+    /// (`input_ids.new_full((batch, context_len), self.eos_token_id)`); for a decode step it is the last
+    /// `context_len` generated tokens (the real code carries them in the cache's third conv-state slot). The
+    /// caller builds it (see `qwen38_ngram_previous_context`) or, preferably, threads it through
+    /// `Qwen4ExpNgramHistory`, which owns the trailing window and advances it per chunk.
+    ///
+    /// A `previous_context` whose length is not `context_len` is caller-controlled input, so this returns
+    /// [`Qwen4ExpNgramError`] rather than panicking.
+    ///
+    /// # Signed 64-bit wrapping and Python's `remainder`
+    ///
+    /// `shifted_tokens[i] * layer_multipliers[i]` overflows `int64` for realistic vocab sizes and PyTorch
+    /// wraps (two's complement), so this uses `wrapping_mul` on `i64`. `torch.remainder` is Python-style (the
+    /// result takes the divisor's sign, always non-negative here), not Rust's `%`, so this uses `rem_euclid`;
+    /// plain `%` on a negative `mixed_ids` would give a negative row index.
+    ///
+    /// No caller outside this crate's own tests, where it is the CPU oracle
+    /// [`qwen38_ngram_ids_graph`]/[`trace_qwen38_ngram_ids`] (the real in-graph, production path) is checked
+    /// against.
+    pub(crate) fn qwen38_ngram_ids(
+        ple: &Qwen4ExpPleConfig,
+        tables: &Qwen4ExpNgramTables,
+        previous_context: &[i32],
+        input_ids: &[i32],
+    ) -> Result<Vec<i32>, Qwen4ExpNgramError> {
+        let want = ple.context_len();
+        if previous_context.len() != want {
+            return Err(Qwen4ExpNgramError::ContextLength {
+                got: previous_context.len(),
+                want,
+            });
+        }
+        let eos = ple.eos_token_id as i64;
+        let heads = ple.ngram_heads();
+        let per = ple.heads_per_ngram;
+
+        // Real `token_history = torch.cat([previous_context, input_ids], dim=-1)`.
+        let history: Vec<i64> = previous_context
+            .iter()
+            .chain(input_ids.iter())
+            .map(|&v| v as i64)
+            .collect();
+        let hist_len = history.len();
+        let shifted: Vec<Vec<i64>> = (0..ple.ngram_size)
+            .map(|shift| ngram_shift_right_ignore_eos(&history, shift, eos))
+            .collect();
+
+        // Real: one `blocks` entry per n-gram order in `2..=ngram_size`, concatenated along the head axis.
+        let mut ids = vec![0i32; hist_len * heads];
+        for ngram in 2..=ple.ngram_size {
+            let start_idx = (ngram - 2) * per;
+            for t in 0..hist_len {
+                let mut mixed = shifted[0][t].wrapping_mul(tables.layer_multipliers[0]);
+                for (position, row) in shifted.iter().enumerate().take(ngram).skip(1) {
+                    mixed ^= row[t].wrapping_mul(tables.layer_multipliers[position]);
+                }
+                for j in 0..per {
+                    let head = start_idx + j;
+                    let id =
+                        mixed.rem_euclid(tables.head_vocab_sizes[head]) + tables.head_offsets[head];
+                    ids[t * heads + head] = id as i32;
+                }
+            }
+        }
+
+        // Real `[:, -input_ids.shape[1]:]`: drop the `context_len` history-only rows.
+        let drop = hist_len - input_ids.len();
+        Ok(ids[drop * heads..].to_vec())
+    }
+
+    /// Caller-controlled input failures from [`qwen38_ngram_ids`] / `Qwen4ExpNgramHistory`. Internal
+    /// invariants (a carrier window it advanced itself, a non-empty shard list in the sharded lookup) stay
+    /// `assert!`s; only shapes the caller supplies get here.
+    ///
+    /// No caller outside this crate's own tests.
+    #[derive(Debug, thiserror::Error, PartialEq, Eq)]
+    pub(crate) enum Qwen4ExpNgramError {
+        /// `previous_context` must be exactly `context_len = ngram_size - 1` tokens.
+        #[error(
+            "previous_context must be exactly context_len = ngram_size - 1 tokens; got {got}, want {want}"
+        )]
+        ContextLength { got: usize, want: usize },
+    }
+
+    /// Build the `previous_context` argument [`qwen38_ngram_ids`] expects from a token history: the last
+    /// [`Qwen4ExpPleConfig::context_len`] entries of `prior_tokens`, left-padded with `eos_token_id` when there
+    /// are fewer (the real code's two fill sites: the no-cache `new_full(.., eos_token_id)` initializer and
+    /// the `F.pad(.., value=self.eos_token_id)` for a first call shorter than `context_len`,
+    /// `modeling_qwen4_exp.py` lines 1149-1163). An empty slice gives the from-scratch prefill case.
+    ///
+    /// Prefer [`Qwen4ExpNgramHistory`] when feeding a sequence in more than one call: it owns this window and
+    /// advances it, so chunked prefill and decode reproduce one full prefill's ids.
+    pub(crate) fn qwen38_ngram_previous_context(
+        ple: &Qwen4ExpPleConfig,
+        prior_tokens: &[i32],
+    ) -> Vec<i32> {
+        let n = ple.context_len();
+        let mut ctx = vec![ple.eos_token_id; n];
+        let take = prior_tokens.len().min(n);
+        ctx[n - take..].copy_from_slice(&prior_tokens[prior_tokens.len() - take..]);
+        ctx
+    }
+
+    /// Carried n-gram history for chunked prefill and token-by-token decode: owns exactly
+    /// [`Qwen4ExpPleConfig::context_len`] trailing tokens and yields the next chunk's ids through
+    /// [`qwen38_ngram_ids`], then advances the window so the following call sees this chunk as prior
+    /// context. One full prefill over a sequence and any chunked/decode split of the same sequence must
+    /// therefore produce the same concatenated ids (Card 449 SC-003 foundation, Card 363 FR-006/FR-012
+    /// two-token prior carry). This is host-side id derivation only; it adds no graph `Slot`.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) struct Qwen4ExpNgramHistory {
+        /// Trailing window handed to [`qwen38_ngram_ids`] as `previous_context`. Invariant: always exactly
+        /// `context_len` tokens (enforced by construction and by `ids_for_chunk`).
+        trailing: Vec<i32>,
+        context_len: usize,
+    }
+
+    impl Qwen4ExpNgramHistory {
+        /// From-scratch prefill history: `context_len` copies of `eos_token_id` (equivalent to
+        /// [`qwen38_ngram_previous_context`] on an empty prior).
+        pub fn new(ple: &Qwen4ExpPleConfig) -> Self {
+            Self::from_prior(ple, &[])
+        }
+
+        /// Resume over `prior_tokens` with the same last-`context_len` / EOS-pad rule as
+        /// [`qwen38_ngram_previous_context`].
+        pub fn from_prior(ple: &Qwen4ExpPleConfig, prior_tokens: &[i32]) -> Self {
+            Self {
+                trailing: qwen38_ngram_previous_context(ple, prior_tokens),
+                context_len: ple.context_len(),
+            }
+        }
+
+        /// The window that would be (and is) passed to [`qwen38_ngram_ids`] for the next chunk.
+        pub fn previous_context(&self) -> &[i32] {
+            &self.trailing
+        }
+
+        /// Ids for `input_ids` against the carried window, then advance the window to the last
+        /// `context_len` tokens of the combined history (via [`qwen38_ngram_previous_context`], so the
+        /// EOS-pad rule stays in one place). `input_ids` may be empty (ids are empty, window unchanged).
+        pub fn ids_for_chunk(
+            &mut self,
+            ple: &Qwen4ExpPleConfig,
+            tables: &Qwen4ExpNgramTables,
+            input_ids: &[i32],
+        ) -> Result<Vec<i32>, Qwen4ExpNgramError> {
+            let ids = qwen38_ngram_ids(ple, tables, &self.trailing, input_ids)?;
+            // Advance: next previous_context = last context_len of (trailing ++ input_ids). `trailing` is
+            // already context_len long, so the combined slice never needs an EOS pad, but going through
+            // the helper keeps the two fill rules identical.
+            if !input_ids.is_empty() {
+                let combined: Vec<i32> = self.trailing.iter().chain(input_ids).copied().collect();
+                self.trailing = qwen38_ngram_previous_context(ple, &combined);
+            }
+            // True internal invariant: only this type mutates `trailing`, and both constructors and the
+            // advance path preserve `context_len`.
+            assert_eq!(
+                self.trailing.len(),
+                self.context_len,
+                "Qwen4ExpNgramHistory window must stay context_len long"
+            );
+            Ok(ids)
+        }
+    }
+} // mod ngram_oracle

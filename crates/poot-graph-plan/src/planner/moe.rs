@@ -1,9 +1,10 @@
-//! MoE equation planning: the indexed matmul and the ArgTopK rank inversion.
+//! MoE equation planning: the indexed matmul (with its fused gate-weighting epilogue) and the ArgTopK rank
+//! inversion.
 
 use super::*;
-use poot_target::{Backend, DeviceCaps};
+use poot_target::{Backend, BufferStorage, DeviceCaps};
 
-/// Plan one MoE-family equation (IndexedMatMul/ArgTopK).
+/// Plan one MoE-family equation (IndexedMatMul, its `ContractionEpilogue`, or ArgTopK).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn plan(
     g: GraphTables<'_>,
@@ -11,38 +12,34 @@ pub(super) fn plan(
     out_shape: &[usize],
     out_numel: usize,
     backend: Backend,
+    views: &HashMap<ValueId, Layout>,
     odt: DType,
     caps: &DeviceCaps,
     limits: BodyLimits,
+    packed_operands: &[bool],
 ) -> Result<Planned, PlanError> {
     let site = Site::new(g, eqn, backend, limits);
     let shape = |vid: ValueId| g.aval(vid).shape.clone();
     let ids = value_ids(eqn);
-    let fty = fty_ty;
     let mut planned = match &eqn.op {
-        OpKind::IndexedMatMul => {
-            // card 088: x[M,K], W[E,K,N], idx[M] -> [M,N]; each row reads its own expert's rows in-kernel.
-            let (x, w) = (shape(ids[0]), shape(ids[1]));
-            let (m, k, n) = (x[0], x[1], w[2]);
-            let spec = if is_indexed_gemv_in(g, backend, eqn, out_numel, caps) {
-                // wgpu sparse-MoE decode: an LDS-reduction GEMV (GEMV_WIDTH lanes per output, coalesced
-                // expert-weight reads) instead of the naive one-thread-per-output.
-                ContractionSpec::IndexedGemv {
-                    k,
-                    n,
-                    width: GEMV_WIDTH,
-                    numel: out_numel,
-                }
-            } else {
-                ContractionSpec::IndexedSerial {
-                    dt: fty(odt),
-                    m,
-                    k,
-                    n,
-                    fold: elementwise_fold(g, backend, eqn, out_shape, out_numel, caps),
-                }
-            };
-            Planned::generated(site, KernelRequest::Contraction(spec), backend, caps)?
+        // card 088: x[M,K], W[E,K,N], idx[M] -> [M,N]; each row reads its own expert's slab in-kernel. With a
+        // routed gate weighting fused behind it (`ContractionEpilogue`), the epilogue runs over each sum.
+        OpKind::IndexedMatMul => plan_indexed(site, g, eqn, backend, views, caps, None)?,
+        OpKind::ContractionEpilogue {
+            head: ContractionHead::Indexed,
+            region,
+        } => {
+            let epilogue = matmul::epilogue_of(
+                site,
+                g,
+                eqn,
+                ContractionHead::Indexed.operands(),
+                region,
+                out_shape,
+                odt,
+                packed_operands,
+            )?;
+            plan_indexed(site, g, eqn, backend, views, caps, Some(epilogue))?
         }
         OpKind::ArgTopK { k } => {
             // spec 136 P2: rank[..,E] -> [..,k] expert ids, one thread per output element, a naive
@@ -88,4 +85,128 @@ pub(super) fn plan(
         caps,
     )?;
     Ok(planned)
+}
+
+/// How the stacked weight `w` (logical `[E, K, N]`) sits in its buffer: row-major `[E, K, N]` when it is no view,
+/// and the checkpoint's `[E, N, K]` when it is the view a `Transpose { perm: [0, 2, 1] }` of such a stack became
+/// ([`crate::compute_views`]), which the contraction reads in place. Any other view is refused, typed.
+fn weight_layout(
+    site: Site<'_>,
+    value: ValueId,
+    shape: &[usize],
+    views: &HashMap<ValueId, Layout>,
+) -> Result<kg::WeightLayout, PlanError> {
+    let Some(view) = views.get(&value) else {
+        return Ok(kg::WeightLayout::Kn);
+    };
+    let (k, n) = (shape[1], shape[2]);
+    let stored_nk = Layout {
+        strides: vec![k * n, 1, k],
+        offset: 0,
+    };
+    if *view == stored_nk {
+        Ok(kg::WeightLayout::Nk)
+    } else {
+        Err(site.refuse(Capability::OperandLayout { value }))
+    }
+}
+
+/// One generated indexed contraction ([`ContractionSpec::Indexed`]): `x[M, K]` against the stacked `W[E, K, N]`
+/// (or its checkpoint `[E, N, K]` view) with row `m` reading slab `idx[m]`, optionally with an epilogue over each
+/// sum. The schedule is chosen from shapes and the device alone ([`indexed_gemv_in`]): the Gemv at decode row
+/// counts, else the segmented Tiled, whose grid is folded onto `GroupY` above the device's X extent and refused
+/// with a typed error beyond that too.
+fn plan_indexed(
+    site: Site<'_>,
+    g: GraphTables<'_>,
+    eqn: &Eqn,
+    backend: Backend,
+    views: &HashMap<ValueId, Layout>,
+    caps: &DeviceCaps,
+    epilogue: Option<kg::Epilogue>,
+) -> Result<Planned, PlanError> {
+    let ids = value_ids(eqn);
+    if !indexed_matmul_lowers(g, eqn) {
+        return Err(site.refuse(if g.aval(ids[2]).dtype == DType::F32 {
+            Capability::DtypeLowering
+        } else {
+            Capability::IndexOperand
+        }));
+    }
+    let (x, w) = (g.aval(ids[0]).shape.clone(), g.aval(ids[1]).shape.clone());
+    let (m, k, experts, n) = (x[0], x[1], w[0], w[2]);
+    let layout = weight_layout(site, ids[1], &w, views)?;
+    // The BF16 stack is read as packed lanes, which only a const upload (or a view of one, read in place) has.
+    let weight = match g.aval(ids[1]).dtype {
+        DType::F32 => BufferStorage::f32(),
+        DType::BF16 if g.values[view_source(g, views, ids[1])].storage == Storage::Const => {
+            BufferStorage::bf16_packed()
+        }
+        _ => return Err(site.refuse(Capability::DtypeLowering)),
+    };
+    if experts == 0 {
+        return Err(site.refuse(Capability::OperandShape {
+            value: ids[1],
+            shape: w,
+            expected: vec![1, k, n],
+        }));
+    }
+    let overflow = || site.refuse(Capability::DispatchSizeOverflow);
+    let (schedule, grid, x_groups) = match indexed_gemv_in(m, n, caps) {
+        Some(schedule) => {
+            let threads = u32::try_from(schedule.grid_threads(1, m, n)).map_err(|_| overflow())?;
+            (schedule, [threads, 1, 1], 0)
+        }
+        None => {
+            let tile = kg::TileSize::new(GEMM_TILE as u32)
+                .map_err(|error| site.refuse(Capability::KernelGen(error)))?;
+            let ts = tile.get() as usize;
+            let tiles = m
+                .div_ceil(ts)
+                .checked_mul(n.div_ceil(ts))
+                .ok_or_else(overflow)?;
+            let tiles = u32::try_from(tiles).map_err(|_| overflow())?;
+            let limit_x = caps.max_grid[0].max(1);
+            let (x_groups, y_groups) = if tiles <= limit_x {
+                (tiles, 1)
+            } else {
+                let y_groups = tiles.div_ceil(limit_x);
+                if y_groups > caps.max_grid[1] {
+                    return Err(site.refuse(Capability::DispatchGridLimit {
+                        threads: tiles as usize * ts * ts,
+                        workgroups_x: tiles as usize,
+                        workgroup_width: ts * ts,
+                        limit: limit_x as usize,
+                    }));
+                }
+                (limit_x, y_groups)
+            };
+            let threads_x = x_groups
+                .checked_mul((ts * ts) as u32)
+                .ok_or_else(overflow)?;
+            (
+                kg::Schedule::Tiled { tile },
+                [threads_x, y_groups, 1],
+                x_groups,
+            )
+        }
+    };
+    let meta = [k, n, experts, m]
+        .into_iter()
+        .map(|extent| u32::try_from(extent).map_err(|_| overflow()))
+        .chain([Ok(x_groups)])
+        .collect::<Result<Vec<_>, _>>()?;
+    Planned::generated(
+        site,
+        KernelRequest::Contraction(ContractionSpec::Indexed(kg::IndexedContraction {
+            schedule,
+            layout,
+            weight,
+            epilogue,
+            grid,
+            meta,
+        })),
+        backend,
+        caps,
+    )
 }

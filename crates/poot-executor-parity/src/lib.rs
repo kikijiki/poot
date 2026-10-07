@@ -34,9 +34,11 @@ pub mod bf16_cast;
 pub mod capture;
 pub mod dense;
 pub mod gdn;
+pub mod hung;
 pub mod launch;
 pub mod packed;
 pub mod routing;
+pub mod select;
 pub mod weight_map;
 
 use std::collections::HashMap;
@@ -46,8 +48,8 @@ use crate::dense::{Dense, Family, plain, step};
 use poot_executor::{Executor, NoSync, StateScope, StepInputs};
 use poot_graph_ir::{Graph, Slot, Storage, TensorType};
 use poot_graph_plan::{
-    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, FusionPolicy, Partition,
-    StagedProgram, Submission, Target, TargetSet, compile_staged,
+    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram,
+    Submission, Target, TargetSet, compile_staged,
 };
 use poot_models::model::{LogitRows, Phase};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
@@ -61,9 +63,11 @@ pub struct Fixture {
     pub graph: Graph,
     pub store: WeightStore,
     pub steps: Vec<Vec<StepFixture>>,
-    /// The compile policy the fixture runs under: most fixtures run `Full`; a fixture for a kernel choice the
-    /// `MoeHangGuard` policy changes names it.
-    pub fusion: FusionPolicy,
+    /// Whether the fixture compiles under the routed-expert hang guard: its graph carries a routed-expert
+    /// site and its target has the hang, so the program is the guarded one (one kernel per equation, no
+    /// tiled GEMM). Most fixtures run the full pipeline; a fixture for a kernel choice the guard changes
+    /// says so.
+    pub guarded: bool,
 }
 
 fn fill(n: usize, seed: u64) -> Vec<f32> {
@@ -194,7 +198,7 @@ pub(crate) fn decode_fixture(
         graph: g,
         store,
         steps,
-        fusion: FusionPolicy::Full,
+        guarded: false,
     }
 }
 
@@ -220,7 +224,7 @@ fn prefill_fixture(
         graph: g,
         store,
         steps,
-        fusion: FusionPolicy::Full,
+        guarded: false,
     }
 }
 
@@ -269,8 +273,8 @@ fn softcap_weights(name: &str, data: &mut [f32]) {
 }
 
 /// Card 557 SC-004: [`qwen2_decode_fixture`] over a Gemma 2 body traced with `softcap` as its
-/// attention-logit softcap. A softcapped decode stays the attention decomposition
-/// (`FlashAttentionDecode` has no softcap), with the softcap in the graph.
+/// attention-logit softcap. A softcapped decode stays the attention decomposition (the matcher does not
+/// fuse a softcapped decode yet), with the softcap in the graph.
 pub fn qwen2_softcap_decode_fixture(cap: usize, softcap: Option<f32>) -> Fixture {
     decode_fixture("qwen2_softcap_decode", &softcap_dense(softcap), cap, |g| {
         store_with(g, softcap_weights)
@@ -278,8 +282,8 @@ pub fn qwen2_softcap_decode_fixture(cap: usize, softcap: Option<f32>) -> Fixture
 }
 
 /// Card 557 SC-004: [`qwen2_prefill_fixture`] over a Gemma 2 body traced with `softcap`. `compile`
-/// fuses a softcapped prefill into `FlashAttentionPrefill { softcap }`, which the planner gives the
-/// imported flash prefill kernel (the generated region prefill has no softcap).
+/// fuses a softcapped prefill into `Attention { softcap }`, which the planner lowers to the generated
+/// attention kernel with its softcap score transform.
 pub fn qwen2_softcap_prefill_fixture(n: usize, cap: usize, softcap: Option<f32>) -> Fixture {
     prefill_fixture(
         "qwen2_softcap_prefill",
@@ -303,13 +307,18 @@ fn checkpoint_projection_fixture(
     k: usize,
     n: usize,
     weight: DType,
-    fusion: FusionPolicy,
+    guarded: bool,
 ) -> Fixture {
     let b = poot_graph_ir::Builder::new();
     let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![m, k]));
     let w = b.constant("w", TensorType::new(vec![n, k], weight));
     let out = b.matmul(x, b.transpose(w, vec![1, 0]));
     let graph = b.finish(out);
+    let graph = if guarded {
+        poot_test_util::graph_fixtures::with_routed_expert_site(graph)
+    } else {
+        graph
+    };
     let key = graph.meta(x.id).slot_key().unwrap().clone();
     let steps = (0..2u64)
         .map(|step| {
@@ -320,7 +329,7 @@ fn checkpoint_projection_fixture(
         })
         .collect();
     let store = match weight {
-        DType::F16 => f16_weight_store("w", vec![n, k]),
+        DType::F16 | DType::BF16 => narrow_weight_store("w", vec![n, k], weight),
         _ => store_for(&graph),
     };
     Fixture {
@@ -328,13 +337,13 @@ fn checkpoint_projection_fixture(
         graph,
         store,
         steps,
-        fusion,
+        guarded,
     }
 }
 
-/// A store holding one F16 weight `name` of `shape`: finite binary16 words of both signs with magnitudes in
-/// `[2^-8, 2^-1)`, generated as bits (so no f32 rounding step decides them).
-fn f16_weight_store(name: &str, shape: Vec<usize>) -> WeightStore {
+/// A store holding one 2-byte float weight `name` of `shape` and `dtype` (F16 or BF16): finite words of both
+/// signs with magnitudes in `[2^-8, 2^-1)`, generated as bits (so no f32 rounding step decides them).
+fn narrow_weight_store(name: &str, shape: Vec<usize>, dtype: DType) -> WeightStore {
     let numel = shape.iter().product::<usize>();
     let mut s = 0x0F16_u64.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
     let bytes: Vec<u8> = (0..numel)
@@ -343,12 +352,22 @@ fn f16_weight_store(name: &str, shape: Vec<usize>) -> WeightStore {
             s ^= s >> 7;
             s ^= s << 17;
             let r = (s >> 32) as u16;
-            let exponent = 7 + (r >> 10) % 7;
-            ((r & 0x8000) | (exponent << 10) | (r & 0x03ff)).to_le_bytes()
+            let word = match dtype {
+                DType::F16 => {
+                    let exponent = 7 + (r >> 10) % 7;
+                    (r & 0x8000) | (exponent << 10) | (r & 0x03ff)
+                }
+                DType::BF16 => {
+                    let exponent = 119 + (r >> 7) % 7;
+                    (r & 0x8000) | (exponent << 7) | (r & 0x007f)
+                }
+                other => unreachable!("not a 2-byte float weight: {other:?}"),
+            };
+            word.to_le_bytes()
         })
         .collect();
     let mut builder = WeightStore::builder();
-    let dense = DenseWeight::try_new(DType::F16, shape, Arc::from(bytes)).unwrap();
+    let dense = DenseWeight::try_new(dtype, shape, Arc::from(bytes)).unwrap();
     builder
         .insert(name.to_string(), WeightEntry::Dense(dense))
         .unwrap();
@@ -358,7 +377,7 @@ fn f16_weight_store(name: &str, shape: Vec<usize>) -> WeightStore {
 /// Card 645 SC-001: [`checkpoint_projection_fixture`] at the decode GEMV (`M = 1`), a few rows (`M = 4`) and a
 /// prefill (`M = 33`, not a multiple of the 16-row tile), with `K = 200` (past one 128-lane workgroup and
 /// not a multiple of the K-unroll) and `N = 37` (not a multiple of the 8-column tile); plus a `K` that is a
-/// multiple of the K-unroll, and one prefill under `FusionPolicy::MoeHangGuard`, which keeps a matmul off the
+/// multiple of the K-unroll, and one prefill under the routed-expert hang guard, which keeps a matmul off the
 /// generated tiled GEMM and so runs the one-thread-per-output `[N, K]` kernel.
 pub fn checkpoint_projection_fixtures() -> Vec<Fixture> {
     checkpoint_projection_set(
@@ -375,7 +394,7 @@ pub fn checkpoint_projection_fixtures() -> Vec<Fixture> {
 
 /// Card 1007: the same table over an F16 `[N, K]` weight: the decode GEMV (`M = 1`), the tiled GEMM (`M = 4`,
 /// `33`, and a `K` that is a multiple of the K-unroll), and the one-thread-per-output kernel under
-/// `FusionPolicy::MoeHangGuard`, each reading the weight's packed binary16 words. `N * K` is odd in the
+/// the routed-expert hang guard, each reading the weight's packed binary16 words. `N * K` is odd in the
 /// `K = 200, N = 37` rows, so the last packed word carries one element and a zero pad.
 pub fn checkpoint_projection_f16_fixtures() -> Vec<Fixture> {
     checkpoint_projection_set(
@@ -390,15 +409,32 @@ pub fn checkpoint_projection_f16_fixtures() -> Vec<Fixture> {
     )
 }
 
+/// Card 1024: the same table over a BF16 `[N, K]` weight: the decode GEMV (`M = 1`), the generated tiled GEMM
+/// (`M = 4`, `33`, and a `K` that is a multiple of the K-unroll) and the one-thread-per-output kernel under
+/// the routed-expert hang guard, each reading the weight's packed bfloat16 words. `N * K` is odd in the
+/// `K = 200, N = 37` rows, so the last packed word carries one element and a zero pad.
+pub fn checkpoint_projection_bf16_fixtures() -> Vec<Fixture> {
+    checkpoint_projection_set(
+        [
+            "checkpoint_projection_bf16_m1",
+            "checkpoint_projection_bf16_m4",
+            "checkpoint_projection_bf16_m33",
+            "checkpoint_projection_bf16_m33_k64",
+            "checkpoint_projection_bf16_m33_moe_hang_guard",
+        ],
+        DType::BF16,
+    )
+}
+
 /// The shared projection table, named `[m1, m4, m33, m33_k64, m33_moe_hang_guard]`.
 fn checkpoint_projection_set(names: [&'static str; 5], weight: DType) -> Vec<Fixture> {
     let [m1, m4, m33, m33_k64, moe] = names;
     vec![
-        checkpoint_projection_fixture(m1, 1, 200, 37, weight, FusionPolicy::Full),
-        checkpoint_projection_fixture(m4, 4, 200, 37, weight, FusionPolicy::Full),
-        checkpoint_projection_fixture(m33, 33, 200, 37, weight, FusionPolicy::Full),
-        checkpoint_projection_fixture(m33_k64, 33, 64, 40, weight, FusionPolicy::Full),
-        checkpoint_projection_fixture(moe, 33, 200, 37, weight, FusionPolicy::MoeHangGuard),
+        checkpoint_projection_fixture(m1, 1, 200, 37, weight, false),
+        checkpoint_projection_fixture(m4, 4, 200, 37, weight, false),
+        checkpoint_projection_fixture(m33, 33, 200, 37, weight, false),
+        checkpoint_projection_fixture(m33_k64, 33, 64, 40, weight, false),
+        checkpoint_projection_fixture(moe, 33, 200, 37, weight, true),
     ]
 }
 
@@ -458,7 +494,7 @@ fn const_fixture(
         graph,
         store: store_from_tensors(consts),
         steps: (0..steps).map(|_| Vec::new()).collect(),
-        fusion: FusionPolicy::Full,
+        guarded: false,
     }
 }
 
@@ -478,6 +514,14 @@ pub fn staged(
     submission: Submission,
 ) -> StagedProgram<poot_graph_ir::ValidationOutputs> {
     let g = fixture.graph.clone().with_validations(Vec::new());
+    let target = Target {
+        caps: if fixture.guarded {
+            poot_test_util::graph_fixtures::with_routed_expert_hang(target.caps)
+        } else {
+            target.caps
+        },
+        ..target
+    };
     compile_staged(
         &g,
         &TargetSet::single(DeviceId(0), target),
@@ -487,7 +531,6 @@ pub fn staged(
         },
         &CompileOptions {
             execution: submission,
-            fusion: fixture.fusion,
             limits: poot_graph_plan::CompileLimits::STANDARD,
         },
     )
@@ -588,7 +631,6 @@ pub fn run_once(
         },
         &CompileOptions {
             execution: Submission::Replay,
-            fusion: FusionPolicy::Full,
             limits: poot_graph_plan::CompileLimits::STANDARD,
         },
     )

@@ -110,7 +110,7 @@ impl PrefixCache {
     ) -> (Vec<u32>, usize) {
         let mut out = Vec::new();
         let mut chain = 0xcbf29ce484222325u64; // FNV offset basis
-        for block in tokens.chunks_exact(BLOCK_SIZE) {
+        for block in tokens.as_chunks::<BLOCK_SIZE>().0 {
             chain = chain_hash(chain, block);
             match self.cached.get(&(chain, identity)) {
                 Some(&blk) => {
@@ -137,7 +137,7 @@ impl PrefixCache {
         pool: &mut BlockPool,
     ) {
         let mut chain = 0xcbf29ce484222325u64;
-        for (i, block) in tokens.chunks_exact(BLOCK_SIZE).enumerate() {
+        for (i, block) in tokens.as_chunks::<BLOCK_SIZE>().0.iter().enumerate() {
             chain = chain_hash(chain, block);
             if i >= physical.len() {
                 break;

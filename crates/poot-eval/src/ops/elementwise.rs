@@ -1,7 +1,8 @@
 //! Pointwise `Unary`, `Binary` and `Select`, one function per (op, dtype).
 //!
 //! The I32 word functions are the one definition of I32 pointwise semantics: the dense walk, the
-//! exact-I32 lane and both fused replays call them, so no lane restates I32 arithmetic.
+//! exact-I32 lane and both fused replays call them, so no lane restates I32 arithmetic. `Select` is
+//! one bitwise definition ([`select_word`]) for every lane type.
 
 use std::sync::Arc;
 
@@ -138,10 +139,56 @@ pub(crate) fn unary_i32_word(op: UnOp, value: i32) -> Result<i32, EvalError> {
     }
 }
 
-/// The I32 `Select` word: `if_false + condition * (if_true - if_false)` in wrapping arithmetic (the
-/// IR's definition of `OpKind::Select`).
-pub(crate) fn select_i32_word(condition: i32, if_true: i32, if_false: i32) -> i32 {
-    if_false.wrapping_add(condition.wrapping_mul(if_true.wrapping_sub(if_false)))
+/// A `Select` lane: a 32-bit-or-narrower word the select moves by bit pattern. The select never
+/// reads the value as a number, so a NaN payload, an infinity or `-0.0` passes through unchanged.
+pub(crate) trait SelectLane: Copy {
+    fn to_bits(self) -> u32;
+    fn from_bits(bits: u32) -> Self;
+    /// The tensor's words in this lane type, `None` when it stores another.
+    fn lanes_of(tensor: &HostTensor) -> Option<&[Self]>;
+}
+
+impl SelectLane for i32 {
+    fn to_bits(self) -> u32 {
+        self as u32
+    }
+    fn from_bits(bits: u32) -> Self {
+        bits as i32
+    }
+    fn lanes_of(tensor: &HostTensor) -> Option<&[Self]> {
+        tensor.as_i32()
+    }
+}
+
+impl SelectLane for f32 {
+    fn to_bits(self) -> u32 {
+        f32::to_bits(self)
+    }
+    fn from_bits(bits: u32) -> Self {
+        f32::from_bits(bits)
+    }
+    fn lanes_of(tensor: &HostTensor) -> Option<&[Self]> {
+        tensor.as_f32()
+    }
+}
+
+impl SelectLane for u16 {
+    fn to_bits(self) -> u32 {
+        u32::from(self)
+    }
+    fn from_bits(bits: u32) -> Self {
+        bits as u16
+    }
+    fn lanes_of(tensor: &HostTensor) -> Option<&[Self]> {
+        tensor.as_half()
+    }
+}
+
+/// The `Select` word, the one definition of `OpKind::Select`: the bit pattern of `if_true` where the
+/// condition word is nonzero, else of `if_false`, as `(t & mask) | (f & !mask)` with an all-ones mask.
+pub(crate) fn select_word<W: SelectLane>(condition: i32, if_true: W, if_false: W) -> W {
+    let mask = 0u32.wrapping_sub(u32::from(condition != 0));
+    W::from_bits((if_true.to_bits() & mask) | (if_false.to_bits() & !mask))
 }
 
 /// I32 `Binary` with numpy broadcasting to `out_shape`, word by word through [`binary_i32_word`].
@@ -173,31 +220,36 @@ pub(crate) fn unary_i32(op: UnOp, x: I32Operand<'_>) -> Result<Arc<[i32]>, EvalE
     try_initialized_arc_slice(x.words.len(), |index| unary_i32_word(op, x.words[index]))
 }
 
-/// I32 `Select` with numpy broadcasting to `out_shape`, word by word through [`select_i32_word`].
-pub(crate) fn select_i32(
+/// A row-major `Select` branch: its shape and its words in the lane type `W`.
+#[derive(Clone, Copy)]
+pub(crate) struct LaneOperand<'a, W> {
+    pub shape: &'a [usize],
+    pub words: &'a [W],
+}
+
+/// `Select` with numpy broadcasting to `out_shape`, word by word through [`select_word`].
+pub(crate) fn select<W: SelectLane>(
     condition: I32Operand<'_>,
-    if_true: I32Operand<'_>,
-    if_false: I32Operand<'_>,
+    if_true: LaneOperand<'_, W>,
+    if_false: LaneOperand<'_, W>,
     out_shape: &[usize],
-) -> Result<Arc<[i32]>, EvalError> {
+) -> Result<Arc<[W]>, EvalError> {
     let count = element_count(out_shape)?;
     let out_strides = row_major_strides(out_shape)?;
-    let operands = [condition, if_true, if_false];
-    let strides = operands
-        .iter()
-        .map(|operand| row_major_strides(operand.shape))
-        .collect::<Result<Vec<_>, _>>()?;
-    let word = |flat: usize, which: usize| {
-        let operand = operands[which];
-        operand.words[broadcast_source(
-            flat,
-            out_shape,
-            &out_strides,
-            operand.shape,
-            &strides[which],
-        )]
-    };
+    // Strides are per operand, not per element: hoist them out of the element loop.
+    let strides = [
+        row_major_strides(condition.shape)?,
+        row_major_strides(if_true.shape)?,
+        row_major_strides(if_false.shape)?,
+    ];
     Ok(initialized_arc_slice(count, |flat| {
-        select_i32_word(word(flat, 0), word(flat, 1), word(flat, 2))
+        let at = |shape: &[usize], strides: &[usize]| {
+            broadcast_source(flat, out_shape, &out_strides, shape, strides)
+        };
+        select_word(
+            condition.words[at(condition.shape, &strides[0])],
+            if_true.words[at(if_true.shape, &strides[1])],
+            if_false.words[at(if_false.shape, &strides[2])],
+        )
     }))
 }

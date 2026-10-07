@@ -21,7 +21,7 @@ impl Context {
     }
 
     /// Number of length/meta `create_buffer_init` calls so far (the per-dispatch `[u32;N]` length buffer
-    /// and any `ComputeMeta`/chunk metadata buffer). Card 156 phase 4 (SC-001): 0 after token 0 on the
+    /// and any launch metadata buffer). Card 156 phase 4 (SC-001): 0 after token 0 on the
     /// cached-decode path (step-invariant for a fixed-shape decode graph, built once at cache-build time).
     pub fn length_buffer_creates(&self) -> usize {
         self.length_buffer_creates.get()
@@ -135,7 +135,11 @@ impl Context {
     /// counts plus physical submit/wait/transfer counts by [`poot_runtime_common::CallPurpose`].
     /// Independent of the diagnostic gauges above (`submits`, `pipeline_builds`, ...), and never
     /// reset by a profiler reset - this is the cumulative cross-backend contract.
-    pub fn execution_counters(&self) -> poot_runtime_common::ExecutionCounters {
+    ///
+    /// Read by this crate's reconciliation tests only: the bench runner's Runner engines were its
+    /// one production reader.
+    #[cfg(test)]
+    pub(crate) fn execution_counters(&self) -> poot_runtime_common::ExecutionCounters {
         let mut ec = self.exec_counters.borrow().clone();
         // `self.dispatches` already counts every `dispatch_workgroups` call (Card 156); read it as
         // the logical count rather than keeping a second incremented copy.

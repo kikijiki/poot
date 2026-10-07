@@ -51,10 +51,9 @@ OpenAI-shaped: `{"error": {"message", "type", "code"}}`. Over-limit requests get
 
 ## Checkpoints
 
-The model can be a safetensors directory or a single **GGUF** file. A causal decoder of a mixture-of-experts
-or hybrid family loads as a `Runner`; its generation routes return `503`. A dense decoder (Qwen2/3, Llama,
-Mistral, Gemma, Granite, OLMo 2, Phi-3, SmolLM3, BLOOM, MPT) is refused at startup until serving runs on the
-driver. A BERT encoder or cross-encoder serves embeddings and reranking. Gemma 4 and Qwen3-Next checkpoints and vision-language checkpoints are not available yet (poot is being refactored; planned to return). See the [feature matrix](../reference/feature-matrix.md) for what the
+The model can be a safetensors directory or a single **GGUF** file. A causal decoder (Qwen2/3, Llama, Mistral,
+Mixtral, Gemma, Granite, Granite MoE, OLMo 2, OLMoE, Phi-3, SmolLM3, BLOOM, MPT, Qwen3-MoE, gpt-oss, Gemma 4,
+DeepSeek-V2/V3/V3.2, Nemotron-H) is refused at startup until serving runs on the driver. A BERT encoder or cross-encoder serves embeddings and reranking. Qwen3-Next checkpoints and vision-language checkpoints are not available yet (poot is being refactored; planned to return). See the [feature matrix](../reference/feature-matrix.md) for what the
 libraries support.
 
 Related: [Configuration reference](./configuration.md), [LoRA adapters](./lora-adapters.md),

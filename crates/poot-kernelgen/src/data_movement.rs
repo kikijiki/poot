@@ -1,29 +1,24 @@
+//! Data movement: the one generator that copies elements between buffers by an index mapping
+//! ([`movement_body`]), and the two index-extraction and rotation bodies that are not copies.
+
 use crate::KernelGenError;
 use crate::helpers::{
-    Alloc, broadcast_eff_strides, copy, elem, guard, ld, local, row_major_strides, slice_dtype,
-    slice_f32,
+    Alloc, copy, elem, guard, ld, local, row_major_strides, slice_dtype, slice_f32,
 };
 use poot_kernel_ir::{
     BasicBlock, BinOp, BlockId, Body, Constant, IndexAxis, Local, Operand, Place, Rvalue,
     Statement, Terminator, Ty, UnOp,
 };
 
-mod common;
-mod concat;
-mod dynamic_update;
-mod gather;
-mod layout;
+mod builder;
+mod generate;
 mod rope;
-mod scatter;
-mod slice;
+mod spec;
 mod topk;
 
-pub(crate) use common::*;
-pub use concat::*;
-pub use dynamic_update::*;
-pub use gather::*;
-pub use layout::*;
+pub(crate) use builder::Cfg;
+pub use generate::movement_body;
+pub(crate) use generate::{Buf, read_lane, write_packed_word};
 pub use rope::*;
-pub use scatter::*;
-pub use slice::*;
+pub use spec::{MovementOp, MovementSpec, Storage, UnitWindow, UpdateIndex};
 pub use topk::*;

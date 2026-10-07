@@ -11,7 +11,10 @@ mod hang_guard;
 pub mod i32_slot_gather;
 #[cfg(feature = "kernel-fixtures")]
 pub mod kernel_fixtures;
+#[cfg(feature = "graph-fixtures")]
+pub mod live_attention;
 pub mod packed;
+pub mod safetensors;
 #[cfg(feature = "graph-fixtures")]
 pub mod weight_map_oracle;
 

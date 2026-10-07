@@ -1,5 +1,7 @@
 use std::fmt::Write as _;
 
+use crate::spirv_postprocess::NO_CONTRACT_MARKER;
+
 use super::{
     AtomicOp, BinOp, EmitError, Emitter, Fp8Format, NO_CONTRACT_STRICTFP_ATTR, Operand, ResultTy,
     Rvalue, Target, Ty, align_of, binop_inst, float_bits, int_bits, positive_e4m3fn_value,
@@ -25,9 +27,6 @@ impl<'a> Emitter<'a> {
             Rvalue::Len(place) => self.emit_len(place.local, w),
             Rvalue::Cast { to, operand } => self.emit_cast(to, operand, w),
             Rvalue::Bitcast { to, operand } => self.emit_bitcast(to, operand, w),
-            Rvalue::Fp8Decode { format, operand } => {
-                self.emit_fp8_decode(*format, operand, dest_ty, w)
-            }
             Rvalue::Fp8Encode { format, operand } => {
                 self.emit_fp8_encode(*format, operand, dest_ty, w)
             }
@@ -427,97 +426,6 @@ impl<'a> Emitter<'a> {
         let t = self.fresh();
         let _ = writeln!(w, "  {t} = {op} {from_llty} {v} to {to_llty}");
         Ok((t, to_llty))
-    }
-
-    pub(super) fn emit_fp8_decode(
-        &mut self,
-        format: Fp8Format,
-        operand: &Operand,
-        dest_ty: &Ty,
-        w: &mut String,
-    ) -> Result<(String, String), EmitError> {
-        if self.operand_ty(operand)? != Ty::U32 || *dest_ty != Ty::F32 {
-            return Err(EmitError::Unsupported(format!(
-                "Fp8Decode requires U32 byte carrier -> F32, got {:?} -> {dest_ty:?}",
-                self.operand_ty(operand)?
-            )));
-        }
-        match format {
-            Fp8Format::E4M3Fn => {}
-        }
-        let (value, _) = self.operand(operand, w)?;
-        let code = self.fresh();
-        let _ = writeln!(w, "  {code} = and i32 {value}, 255");
-        let sign_lane = self.fresh();
-        let _ = writeln!(w, "  {sign_lane} = and i32 {code}, 128");
-        let sign = self.fresh();
-        let _ = writeln!(w, "  {sign} = shl i32 {sign_lane}, 24");
-        let shifted = self.fresh();
-        let _ = writeln!(w, "  {shifted} = lshr i32 {code}, 3");
-        let exponent = self.fresh();
-        let _ = writeln!(w, "  {exponent} = and i32 {shifted}, 15");
-        let mantissa = self.fresh();
-        let _ = writeln!(w, "  {mantissa} = and i32 {code}, 7");
-
-        let exponent_is_zero = self.fresh();
-        let _ = writeln!(w, "  {exponent_is_zero} = icmp eq i32 {exponent}, 0");
-        let exponent_is_special = self.fresh();
-        let _ = writeln!(w, "  {exponent_is_special} = icmp eq i32 {exponent}, 15");
-        let mantissa_is_nan = self.fresh();
-        let _ = writeln!(w, "  {mantissa_is_nan} = icmp eq i32 {mantissa}, 7");
-        let is_nan = self.fresh();
-        let _ = writeln!(
-            w,
-            "  {is_nan} = and i1 {exponent_is_special}, {mantissa_is_nan}"
-        );
-
-        let subnormal_integer = self.fresh();
-        let _ = writeln!(w, "  {subnormal_integer} = uitofp i32 {mantissa} to float");
-        let subnormal = self.fresh();
-        let _ = writeln!(
-            w,
-            "  {subnormal} = fmul float {subnormal_integer}, 0x3F60000000000000"
-        );
-        let subnormal_bits = self.fresh();
-        let _ = writeln!(w, "  {subnormal_bits} = bitcast float {subnormal} to i32");
-        let signed_subnormal_bits = self.fresh();
-        let _ = writeln!(
-            w,
-            "  {signed_subnormal_bits} = or i32 {subnormal_bits}, {sign}"
-        );
-
-        let normal_exponent = self.fresh();
-        let _ = writeln!(w, "  {normal_exponent} = add i32 {exponent}, 120");
-        let normal_exponent_bits = self.fresh();
-        let _ = writeln!(
-            w,
-            "  {normal_exponent_bits} = shl i32 {normal_exponent}, 23"
-        );
-        let normal_mantissa_bits = self.fresh();
-        let _ = writeln!(w, "  {normal_mantissa_bits} = shl i32 {mantissa}, 20");
-        let normal_magnitude_bits = self.fresh();
-        let _ = writeln!(
-            w,
-            "  {normal_magnitude_bits} = or i32 {normal_exponent_bits}, {normal_mantissa_bits}"
-        );
-        let signed_normal_bits = self.fresh();
-        let _ = writeln!(
-            w,
-            "  {signed_normal_bits} = or i32 {normal_magnitude_bits}, {sign}"
-        );
-        let finite_bits = self.fresh();
-        let _ = writeln!(
-            w,
-            "  {finite_bits} = select i1 {exponent_is_zero}, i32 {signed_subnormal_bits}, i32 {signed_normal_bits}"
-        );
-        let result_bits = self.fresh();
-        let _ = writeln!(
-            w,
-            "  {result_bits} = select i1 {is_nan}, i32 2143289344, i32 {finite_bits}"
-        );
-        let result = self.fresh();
-        let _ = writeln!(w, "  {result} = bitcast i32 {result_bits} to float");
-        Ok((result, "float".into()))
     }
 
     pub(super) fn emit_fp8_encode(
@@ -1010,14 +918,6 @@ impl<'a> Emitter<'a> {
         let (inst, result_ty) = binop_inst(op, is_float, signed);
         // comparison instructions take the operand type but yield i1.
         let _ = writeln!(w, "  {t} = {inst} {tya} {va}, {vb}", tya = tya);
-        // card 628: keep `float_binop_ordinal` counting every float Add/Sub/Mul this body emits (marked or
-        // not), so `emit_binop_no_contract`'s ordinals stay correct positions in the SpirvVulkan stream.
-        if self.target == Target::SpirvVulkan
-            && is_float
-            && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
-        {
-            self.float_binop_ordinal += 1;
-        }
         let res_llty = match result_ty {
             ResultTy::Bool => "i1".to_string(),
             ResultTy::Same => tya,
@@ -1029,13 +929,16 @@ impl<'a> Emitter<'a> {
     /// type are already float/Add-Sub-Mul by construction (`Body::verify`'s `BinaryOpNoContract` arm), so
     /// this only needs the per-target lowering, not a redundant re-check.
     ///
-    /// - `SpirvVulkan`: emitted as the ordinary plain instruction (`fadd`/`fsub`/`fmul`, byte-identical to
-    ///   an unmarked `BinaryOp`), but its [`Emitter::float_binop_ordinal`] is recorded in
-    ///   `no_contract_ordinals` first. llc's SPIR-V backend does not translate any LLVM-level fast-math flag
-    ///   or intrinsic into a `NoContraction` decoration (checked directly: a `contract`-flagged and a
-    ///   plain `fmul`/`fsub` compile to byte-identical SPIR-V, neither decorated), so the decoration has to
-    ///   be added to the compiled binary; `compile_with` does that positionally via `spirv_postprocess`,
-    ///   using these ordinals (checked positionally since -O0 never reorders/merges/drops a float binop).
+    /// - `SpirvVulkan`: the ordinary plain instruction (`fadd`/`fsub`/`fmul`), whose result then goes
+    ///   through a call to the identity stub [`NO_CONTRACT_MARKER`]. llc's SPIR-V backend does not translate
+    ///   any LLVM-level fast-math flag, metadata or intrinsic into a `NoContraction` decoration (checked
+    ///   directly: a `contract`-flagged and a plain `fmul`/`fsub` compile to byte-identical SPIR-V, neither
+    ///   decorated; `!spirv.Decorations` on an instruction is ignored, and value names are dropped), and it
+    ///   lays blocks out in an order of its own, so an instruction's position in the compiled stream does
+    ///   not identify it. The stub call survives as an `OpFunctionCall` whose argument is exactly the
+    ///   marked instruction, and `spirv_postprocess::fix_no_contraction` decorates that argument and
+    ///   rewrites the call into an `OpCopyObject`, so the marker names its instruction whatever else
+    ///   (an epilogue, an unrolled loop) surrounds it.
     /// - `Nvptx`/`AmdGcn`: an `llvm.experimental.constrained.{fadd,fsub,fmul}.f32` call, which needs the
     ///   `strictfp` function attribute (`strictfp_needed`, consumed by `emit_signature`/`emit_footer`).
     ///   LLVM's DAG combiner never forms an FMA from a constrained node, independent of the backend's own
@@ -1068,9 +971,14 @@ impl<'a> Emitter<'a> {
         let (inst, _) = binop_inst(op, true, false);
         let t = self.fresh();
         if self.target == Target::SpirvVulkan {
-            let _ = writeln!(w, "  {t} = {inst} {tya} {va}, {vb}");
-            self.no_contract_ordinals.push(self.float_binop_ordinal);
-            self.float_binop_ordinal += 1;
+            let marker = format!("{NO_CONTRACT_MARKER}.{tya}");
+            self.declares
+                .insert(format!("declare {tya} @{marker}({tya})"));
+            let unmarked = t;
+            let _ = writeln!(w, "  {unmarked} = {inst} {tya} {va}, {vb}");
+            let t = self.fresh();
+            let _ = writeln!(w, "  {t} = call {tya} @{marker}({tya} {unmarked})");
+            return Ok((t, tya));
         } else {
             let intrin = format!("llvm.experimental.constrained.{inst}.f32");
             self.declares.insert(format!(

@@ -1,544 +1,1128 @@
-//! DeepSeek-V2 MLA tracer (card 135d, see `tasks/deferred/135-modern-model-support-and-benching.md`,
-//! `specs/<NNN>-deepseek-mla-tracer/spec.md`) for `deepseek-ai/DeepSeek-V2-Lite` and
-//! `deepseek-ai/DeepSeek-V2`. Its distinguishing mechanism is **Multi-head Latent Attention (MLA)**,
-//! not an MoE variant. Verified against `deepseek-ai/DeepSeek-V2-Lite`'s `config.json`, the HF
-//! `transformers` `modeling_deepseek_v2.py`, and the `yujiepan/deepseek-v2-tiny-random` checkpoint
-//! (BF16, safetensors header read via HTTP Range request).
+//! DeepSeek-V2 behind [`Model`], and the MLA-plus-routed-MoE body its V3 and V3.2 relatives share.
 //!
-//! # MLA
+//! A DeepSeek layer is the standard pre-norm pair ([`standard_layer`]) whose mixer is multi-head
+//! latent attention ([`mla`]) and whose feed-forward is a dense SwiGLU for the leading
+//! `first_k_dense_replace` layers and a routed mixture with an always-active shared expert after
+//! them ([`moe`]). The families differ in config keys and router:
 //!
-//! MLA compresses K and V into a shared low-rank latent instead of per-head K/V projections, and
-//! splits each Q/K head into a rotated "decoupled RoPE" region and an unrotated "nope" region, using
-//! DeepSeek's interleaved-pair rotary convention (not the half-split convention of every other arch
-//! here). HF `DeepseekV2Attention.forward`:
+//! - `deepseek_v2` (HF) and `deepseek2` (GGUF): softmax scoring with group-limited greedy routing.
+//!   llama.cpp's `deepseek2` also names V3 checkpoints; the gating function the GGUF declares
+//!   (`expert_gating_func`) chooses the router, as `scoring_func` does for an HF config.
+//! - `deepseek_v3` ([`super::deepseek3`]): sigmoid scoring with a selection-only bias.
+//! - `deepseek_v32` ([`super::deepseek32`]): V3 plus the sparse-attention indexer ([`dsa`]).
 //!
-//! ```text
-//! # Query: low-rank compressed (if q_lora_rank is set) or a plain projection; either way split nope/rope:
-//! q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))   # or self.q_proj(hidden_states)
-//! q = q.view(query_shape).transpose(1, 2)
-//! q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+//! RoPE is DeepSeek's interleaved pairing over the rotated slice, with YaRN scaling whose
+//! `mscale` terms are resolved here: the table's magnitude (`attention_factor`) and a separate
+//! softmax-scale correction (`mscale_all_dim`) are different scalars.
 //!
-//! # KV: down-projected to one shared low-rank latent + a shared (not per-head) RoPE slice:
-//! compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
-//! kv_nope, k_pe = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-//! k_nope = self.kv_a_layernorm(kv_nope).view(batch_size, 1, seq_length, self.kv_lora_rank)  # single head
-//! k_pe = k_pe.view(batch_size, 1, seq_length, self.qk_rope_head_dim)                        # single head
-//!
-//! q_pe, k_pe = apply_rotary_emb(q_pe, k_pe, position_embeddings)   # only the *_pe slices rotate
-//!
-//! # Cache read/write is on the still-compressed latent (k_nope here is the normed latent, not the
-//! # per-head key): past_key_values.update(k_nope, k_pe, self.layer_idx)
-//!
-//! query_states = torch.cat((q_nope, q_pe), dim=-1)
-//! key_states, value_states = self.expand_kv(k_nope, k_pe)   # decompress the whole cached latent, every call
-//! ```
-//!
-//! `expand_kv`: `kv_b_proj` up-projects the latent to per-head `(qk_nope_head_dim + v_head_dim)`,
-//! split into `k_nope`/`value_states`; the shared single-head `k_pe` is broadcast across heads and
-//! concatenated onto `k_nope`. Standard scaled-dot-product attention then runs on the result.
-//!
-//! The HF implementation does not use the "weight absorption" trick (folding `W_UK`/`W_UV` into the
-//! query/output projections so decode never materializes per-head K/V). It decompresses the entire
-//! cached latent through `kv_b_proj` on every forward, prefill or decode. The decode tracer mirrors
-//! that (see [`trace_deepseek2_decode_kv_masked`]), costing O(cap) extra matmul work per decode step.
-//! Weight absorption is out of scope (see "Out of scope" in the spec).
-//!
-//! # Composition from existing primitives (AGENTS.md: no new graph-IR op)
-//!
-//! 1. Low-rank compress/decompress is two more matmuls (`kv_a_proj_with_mqa`/`kv_b_proj`,
-//!    `q_a_proj`/`q_b_proj`) through [`poot_graph_ir::ops::linear`].
-//! 2. The compressed KV cache is a fixed-capacity cache with masking, with per-position width
-//!    `kv_lora_rank + qk_rope_head_dim` shared across heads. `b.state_input` and
-//!    `dynamic_update_slice_dyn` apply unchanged.
-//! 3. The shared single-head `k_pe` is broadcast to all `H` query heads with
-//!    [`poot_graph_ir::ops::repeat_kv`] (`n_rep = H`, `H_kv = 1`), the GQA extreme.
-//! 4. The nope/rope concat-then-attend is [`poot_graph_ir::ops::attention_prefill`]/`attention_masked`
-//!    unchanged. `v_head_dim` may differ from the Q/K width; only `P @ V`'s contraction axis must match.
-//! 5. The nope/rope split is [`Builder::slice`] + [`Builder::concat`], as in
-//!    `poot_graph_ir::ops::rope_partial` (phi3), applied to independent sub-tensors (`q_pe`/`k_pe`).
-//! 6. DeepSeek's RoPE pairing is interleaved (GPT-J-style), not half-split (GPT-NeoX-style). HF
-//!    `apply_rotary_emb` uses `torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))`, so
-//!    each adjacent pair `(x[2i], x[2i+1])` rotates by its own angle, unlike
-//!    [`poot_graph_ir::ops::rope`] which pairs `x[i]` with `x[i+d/2]`. Using the half-split pairing
-//!    gives a finite, wrong rotation that only a numeric reference comparison catches.
-//!    [`rope_interleave_apply`] is a module-local composition: reshape+slice to deinterleave,
-//!    concat to reinterleave (as in gpt-oss's `gptoss_ffn`), with no `Complex` dtype.
-//!
-//! Nothing needs a new `OpKind`, a non-fixed-capacity KV cache, or a data-dependent shape.
-//!
-//! # MoE: shared experts + routed top-k + dense-layer prefix
-//!
-//! - **Shared experts.** `n_shared_experts` always-active experts are combined into one SwiGLU MLP of
-//!   width `moe_intermediate_size * n_shared_experts`, added unconditionally to the routed output:
-//!   `hidden_states = self.experts(...) + self.shared_experts(residuals)`. Unlike
-//!   `poot_models::qwen3next`, there is no per-token sigmoid gate.
-//! - **Router.** `DeepseekV2TopkRouter.forward`: `scores = softmax(router_logits)` over all experts,
-//!   `topk` on the raw softmax values (no renormalization; identical to
-//!   [`poot_graph_ir::ops::top_k_gate`]'s masked-numerator-over-full-denominator construction with
-//!   `norm_topk_prob=false`, as in `crate::olmoe::olmoe_top_k_gate`), then
-//!   `topk_weights *= self.routed_scaling_factor` (`16.0` on the tiny fixture, `1.0` on V2-Lite).
-//!   [`deepseek2_router_gate`] is its own composition (OlmoE's non-renormalized construction plus the
-//!   scalar multiply).
-//! - **Dense prefix by threshold.** Layers `< first_k_dense_replace` (`1` on V2-Lite and the fixture)
-//!   use a dense SwiGLU MLP (`DeepseekV2MLP`, width `intermediate_size`); later layers route
-//!   (`DeepseekV2Moe`). The switch is `li >= first_k_dense_replace`.
-//! - **Expert tensors.** Routed experts are separate per-expert tensors named like qwen3-moe
-//!   (`mlp.experts.{e}.{gate,up,down}_proj.weight`), so the loader reuses `fuse_qwen3_moe_experts`.
-//! - **Loader gotcha.** `poot_llm::runner::build_weights`'s generic transpose rule
-//!   (`name.ends_with("proj.weight")`) misses `kv_a_proj_with_mqa.weight`, which ends in
-//!   `_with_mqa`. Left untransposed it has a wrong but plausible shape
-//!   (`[kv_lora_rank+qk_rope_head_dim, hidden]`) and surfaced only as an out-of-bounds panic in
-//!   `poot_eval::matmul` under the real-checkpoint crosswalk test. It gets an explicit per-layer
-//!   transpose, as does the router (`mlp.gate.weight`).
-//!
-//! # Group-limited routing (card 296)
-//!
-//! The tiny fixture sets `topk_method: "group_limited_greedy"` (`n_group: 8`, `topk_group: 3`): the
-//! larger DeepSeek-V2 checkpoints group the routed experts and restrict top-k to a subset of groups.
-//! `deepseek-ai/DeepSeek-V2-Lite` sets `n_group: 1`/`topk_group: 1`, where group restriction is a
-//! no-op (`topk_method: "greedy"`). [`deepseek2_router_gate`] implements the cross-group masking,
-//! following `crate::deepseek3::deepseek3_router_gate`, except that the group score is `max` per
-//! group (V2), not V3's sum-of-top-2. MoE selection uses the shared stable rank/mask composition;
-//! DSA/CSA/QSA keep the older attention rank helper. The crosswalk test exercises the fixture's real
-//! `n_group: 8`/`topk_group: 3` routing against a hand-rolled reference.
-//!
-//! # Real config fields (`deepseek-ai/DeepSeek-V2-Lite/config.json` / `yujiepan/deepseek-v2-tiny-random/config.json`)
-//!
-//! `hidden_size` 2048/8, `kv_lora_rank` 512/2, `q_lora_rank` `null`/2 (both branches of
-//! [`DeepseekV2Config::q_lora_rank`] are real), `qk_nope_head_dim` 128/2, `qk_rope_head_dim` 64/2,
-//! `v_head_dim` 128/2, `num_attention_heads` 16/2, `num_key_value_heads` equal to
-//! `num_attention_heads` on both (the shared latent replaces KV-head reduction, so `n_rep=1`),
-//! `n_routed_experts` 64/160, `n_shared_experts` 2/2, `num_experts_per_tok` 6/6,
-//! `moe_intermediate_size` 1408/4, `intermediate_size` (dense-layer width) 10944/16,
-//! `first_k_dense_replace` 1/1, `routed_scaling_factor` 1.0/16.0, `rms_norm_eps` 1e-6/1e-6,
-//! `attention_bias` `false`/absent (q/kv down-projections carry no bias, so none are declared).
-//! `rope_scaling` is YaRN on both (`factor` 40, `mscale`/`mscale_all_dim` 0.707); see
-//! [`DeepseekV2Yarn`] (specs/264): an NTK-by-parts inv_freq ramp on the interleaved-pair table plus
-//! the `mscale_all_dim`-derived softmax-scale correction from `yarn_apply_mscale`.
-//!
-//! Uses its own [`DeepseekV2Config`] rather than `crate::qwen2::Qwen2Config`, since MLA has no
-//! per-head K/V at the cache level and rotary applies to a slice of the head (as
-//! `crate::bloom`/`crate::mpt`), plus [`DeepseekV2MoeParams`] for the MoE shape.
+//! The up projection binds as stored: HF's one `kv_b_proj`, or llama.cpp's split per-head `k_b` and
+//! `v_b` (no rebuilt buffer).
 
-use poot_graph_ir::ops::{attention_masked, attention_prefill, linear, repeat_kv, rmsnorm, swiglu};
-use poot_graph_ir::{BinOp, Builder, Graph, Slot, StateRole, TensorType, Traced};
-use poot_tensor::DType;
+use std::collections::BTreeSet;
+use std::num::NonZeroUsize;
 
-/// DeepSeek-V2's MLA attention shape plus the shared block dims (hidden/layers/vocab/eps/max_pos/
-/// rope_theta) in one config; MLA's dims do not map onto `crate::qwen2::Qwen2Config`.
+use poot_graph_ir::rope_table::RopeFlavor;
+#[cfg(test)]
+use poot_graph_ir::{BinOp, TensorType, Traced, ops::swiglu};
+use poot_graph_ir::{Builder, Graph, ValidationOutputs};
+use poot_quant::weights::{
+    AttnRole, DsaRole, ExpertProj, FfnRole, MlaRole, NormRole, WeightMap, WeightRole, WeightStore,
+};
+
+use crate::chat::ChatFormat;
+use crate::components::dims::{Field, Fields};
+use crate::components::dsa::{DsaParams, DsaWeights, dsa_select};
+use crate::components::ffn::{GatedFfnWeights, gated_ffn};
+use crate::components::linear::WeightError;
+use crate::components::mla::{KvForm, MlaParams, MlaWeights, Selection, mla};
+use crate::components::moe::{self, MoeParams, MoeWeights};
+use crate::components::norm::NormParams;
+use crate::components::rope::RopeParams;
+use crate::components::router::{RouterBias, RouterKind, SigmoidTopK};
+use crate::components::standard::{
+    BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
+    standard_layer, standard_stack,
+};
+use crate::model::{
+    ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, StepShape,
+    TraceError,
+};
+use crate::names::{
+    ExpertNames, MoeLayers, MoeNames, NameRow, Presence, SharedNames, Source, family_weights_routed,
+};
+use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+
+pub const FAMILY: FamilyKey = FamilyKey::new("deepseek2");
+
+pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
+    family: FAMILY,
+    keys: &[
+        (ConfigSource::HfModelType, "deepseek_v2"),
+        (ConfigSource::GgufArchitecture, "deepseek2"),
+    ],
+    build,
+    fixture,
+    variants: &[],
+};
+
+/// How a router scores the experts before it selects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Scoring {
+    Softmax,
+    Sigmoid,
+}
+
+/// What a DeepSeek family fixes about its configs: its name, the model type's default router and
+/// whether it carries the sparse-attention indexer.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Kind {
+    pub family: FamilyKey,
+    pub scoring: Scoring,
+    pub dsa: bool,
+}
+
+const V2: Kind = Kind {
+    family: FAMILY,
+    scoring: Scoring::Softmax,
+    dsa: false,
+};
+
+/// How the routed experts are chosen and weighted: the router's scoring, the group limit and the
+/// scale on the selected weights.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct DeepseekV2Config {
+pub(crate) struct Routing {
+    pub scoring: Scoring,
+    pub groups: usize,
+    pub group_top: usize,
+    pub scale: f32,
+    pub renormalize: bool,
+}
+
+/// `moe` with the group limit and the routed scale `routing` names. A single group (V2-Lite's greedy
+/// selection) and a scale of `1.0` are the identity, so they add no option and the traced router
+/// carries no group-eligibility ops and no multiply by one.
+fn with_routing(
+    moe: MoeParams,
+    routing: &Routing,
+) -> Result<MoeParams, crate::components::standard::ParamError> {
+    let moe = match routing.scoring {
+        Scoring::Softmax => moe,
+        Scoring::Sigmoid => moe.with_router_bias(RouterBias::SelectionOnly)?,
+    };
+    let moe = if routing.groups > 1 {
+        moe.with_group_limit(routing.groups, routing.group_top)?
+    } else {
+        moe
+    };
+    if routing.scale == 1.0 {
+        Ok(moe)
+    } else {
+        moe.with_routed_scale(routing.scale)
+    }
+}
+
+/// The typed config of a DeepSeek MLA family: every value checked once, here, so tracing cannot
+/// fail on it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DeepseekConfig {
     pub vocab: usize,
-    pub hidden: usize,
+    pub width: usize,
     pub layers: usize,
-    /// query heads (`num_attention_heads`). No separate KV-head count; the tracer uses `n_rep=1`.
-    pub n_heads: usize,
-    /// `q_lora_rank`: `Some(r)` compresses the query through `q_a_proj`/`q_a_layernorm`/`q_b_proj`
-    /// (V2/V3 and the tiny fixture); `None` uses a plain `q_proj` (V2-Lite). Either way `q` splits into
-    /// `qk_nope_head_dim`/`qk_rope_head_dim` per head.
-    pub q_lora_rank: Option<usize>,
-    /// `kv_lora_rank`: width of the shared single-head latent K and V decompress from.
-    pub kv_lora_rank: usize,
-    /// per-head unrotated K/Q slice width.
-    pub qk_nope_head_dim: usize,
-    /// per-head rotated K/Q slice width (decoupled RoPE). Must be even (whole interleaved pairs).
-    pub qk_rope_head_dim: usize,
-    /// per-head V width; independent of `qk_nope_head_dim + qk_rope_head_dim` (see module docs, item 4).
-    pub v_head_dim: usize,
-    pub eps: f32,
-    pub max_pos: usize,
-    /// RoPE base frequency (`rope_theta`).
-    pub rope_theta: f32,
-    /// YaRN parameters resolved by the loader from `rope_scaling`. `None` is plain RoPE and softmax
-    /// scale; `Some` is required for a correct forward pass on both real configs (see
-    /// [`DeepseekV2Yarn`]).
-    pub yarn: Option<DeepseekV2Yarn>,
-}
-
-/// YaRN RoPE-scaling parameters, resolved by the loader from `poot_load::RopeScaling` (this module
-/// does not depend on `poot-load` types).
-///
-/// Two separate corrections from `modeling_deepseek_v2.py`:
-/// 1. **The RoPE table** (`DeepseekV2RotaryEmbedding`/`_compute_yarn_parameters`, see
-///    `poot_llm::gguf::yarn_inv_freq`): an NTK-by-parts ramp blending extrapolated (unscaled) and
-///    interpolated (divided by `factor`) per-frequency values, plus a constant `attention_factor`
-///    multiplier on the cos/sin table (`freqs_cis * self.attention_scaling`).
-/// 2. **The attention softmax scale** (`self.scaling = yarn_apply_mscale(config.rope_parameters,
-///    self.qk_head_dim ** (-0.5))`): a `mscale^2` correction from `mscale_all_dim` on top of
-///    `qk_head_dim^-0.5`, applied whenever `rope_scaling.type != "default"`
-///    (`yarn_get_mscale(factor, mscale_all_dim)`, squared); see `softmax_mscale_sq`.
-///
-/// These are different scalars. V2-Lite's `mscale == mscale_all_dim == 0.707` gives
-/// `attention_factor == 1.0` while `softmax_mscale_sq` is still ~1.59 (`get_mscale(40, 0.707)^2`).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct DeepseekV2Yarn {
-    /// context-extension factor (`rope_scaling.factor`).
-    pub factor: f32,
-    /// NTK-by-parts ramp low-end, extrapolation side (`rope_scaling.beta_fast`, HF default 32).
-    pub beta_fast: f32,
-    /// NTK-by-parts ramp high-end, interpolation side (`rope_scaling.beta_slow`, HF default 1).
-    pub beta_slow: f32,
-    /// the checkpoint's pretrained context length (`rope_scaling.original_max_position_embeddings`).
-    pub original_max_position_embeddings: usize,
-    /// the RoPE table's cos/sin magnitude multiplier, as resolved by the loader: an explicit
-    /// `rope_scaling.attention_factor` if present, else `get_mscale(factor, mscale) /
-    /// get_mscale(factor, mscale_all_dim)` when both `mscale` and `mscale_all_dim` are nonzero, else the
-    /// generic YaRN default `get_mscale(factor, 1.0)`.
-    pub attention_factor: f32,
-    /// the extra softmax-scale correction: `get_mscale(factor, mscale_all_dim)^2` when
-    /// `rope_scaling.mscale_all_dim` is nonzero, else `1.0`.
-    pub softmax_mscale_sq: f32,
-}
-
-impl DeepseekV2Config {
-    /// The per-head Q/K width `Q K^T` contracts over (`qk_nope_head_dim + qk_rope_head_dim`).
-    pub fn qk_head_dim(&self) -> usize {
-        self.qk_nope_head_dim + self.qk_rope_head_dim
-    }
-    /// The softmax scale: `qk_head_dim^-0.5`, times [`DeepseekV2Yarn::softmax_mscale_sq`] when `yarn`
-    /// is `Some`. Distinct from the RoPE table's `attention_factor` (see [`DeepseekV2Yarn`]).
-    pub fn attn_scale(&self) -> f32 {
-        let base = 1.0 / (self.qk_head_dim() as f32).sqrt();
-        match &self.yarn {
-            Some(y) => base * y.softmax_mscale_sq,
-            None => base,
-        }
-    }
-}
-
-/// DeepSeek-V2's MoE shape: routed top-k experts, shared expert(s), and the dense-vs-routed layer
-/// threshold (see the module docs).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct DeepseekV2MoeParams {
-    /// total routed experts per MoE layer (`n_routed_experts`).
-    pub n_routed_experts: usize,
-    /// routed experts selected per token (`num_experts_per_tok`).
-    pub top_k: usize,
-    /// per-ROUTED-expert FFN intermediate size (`moe_intermediate_size`).
-    pub moe_inter: usize,
-    /// always-active shared experts, combined into one MLP of width `moe_inter * n_shared_experts`
-    /// (`n_shared_experts`). `0` disables the branch.
-    pub n_shared_experts: usize,
-    /// the dense-layer (`li < first_k_dense_replace`) SwiGLU MLP width (`intermediate_size`), separate
-    /// from `moe_inter`.
+    pub max_positions: usize,
+    pub mla: MlaParams,
+    pub layer: LayerParams,
+    pub stack: StackParams,
     pub dense_inter: usize,
-    /// layers `< first_k_dense_replace` use the dense MLP, later layers route (`1` on observed configs).
-    pub first_k_dense_replace: usize,
-    /// scalar applied to the selected gate weights after the non-renormalized softmax selection
-    /// (`routed_scaling_factor`). `1.0` is a no-op (V2-Lite); the tiny fixture uses `16.0`.
-    pub routed_scaling_factor: f32,
-    /// Card 296: equal-size groups the routed experts split into for `topk_method:
-    /// "group_limited_greedy"` (`n_group`; `8` on non-Lite V2). Must divide `n_routed_experts`. `1`
-    /// makes group-limiting a no-op (V2-Lite, see [`deepseek2_router_gate`]).
-    pub n_group: usize,
-    /// Card 296: groups selected per token before the expert-level top-`k` (`topk_group`; `3` on
-    /// non-Lite V2). `topk_group == n_group` is also a no-op.
-    pub topk_group: usize,
+    /// Layers below this index use the dense feed-forward, the rest route.
+    pub first_routed: usize,
+    pub moe: MoeParams,
+    pub routing: Routing,
+    pub dsa: Option<DsaParams>,
+    pub head_required: bool,
+    pub eos: BTreeSet<u32>,
+    pub bos: Option<u32>,
+    pub kv: KvForm,
+    pub shared: bool,
 }
 
-impl DeepseekV2MoeParams {
-    /// Whether layer `li` routes (`true`) or uses the dense MLP (`false`).
-    pub fn is_moe_layer(&self, li: usize) -> bool {
-        li >= self.first_k_dense_replace
-    }
+const fn field(hf: &'static str, gguf: &'static str) -> Field {
+    Field::new(hf, gguf)
 }
 
-/// `Runner`-level bundle of DeepSeek-V2's two param structs, populated and cleared together as one
-/// `Option` (the special-tracer field pattern of `crate::bloom`/`crate::mpt`/`crate::mixtral`/...).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct DeepseekV2Params {
-    pub cfg: DeepseekV2Config,
-    pub moe: DeepseekV2MoeParams,
-}
+const HEADS: Field = field("num_attention_heads", "deepseek2.attention.head_count");
+const Q_RANK: Field = field("q_lora_rank", "deepseek2.attention.q_lora_rank");
+const KV_RANK: Field = field("kv_lora_rank", "deepseek2.attention.kv_lora_rank");
+const NOPE: Field = field("qk_nope_head_dim", "");
+const ROPE_DIM: Field = field("qk_rope_head_dim", "deepseek2.rope.dimension_count");
+const KEY_LENGTH: Field = field("", "deepseek2.attention.key_length_mla");
+const V_DIM: Field = field("v_head_dim", "deepseek2.attention.value_length_mla");
+const WIDTH: Field = field("hidden_size", "deepseek2.embedding_length");
+const LAYERS: Field = field("num_hidden_layers", "deepseek2.block_count");
+const EPS: Field = field("rms_norm_eps", "deepseek2.attention.layer_norm_rms_epsilon");
+const MAX_POSITIONS: Field = field("max_position_embeddings", "deepseek2.context_length");
+const THETA: Field = field("rope_theta", "deepseek2.rope.freq_base");
+const DENSE_INTER: Field = field("intermediate_size", "deepseek2.feed_forward_length");
+const MOE_INTER: Field = field(
+    "moe_intermediate_size",
+    "deepseek2.expert_feed_forward_length",
+);
+const EXPERTS: Field = field("n_routed_experts", "deepseek2.expert_count");
+const SHARED: Field = field("n_shared_experts", "deepseek2.expert_shared_count");
+const TOP_K: Field = field("num_experts_per_tok", "deepseek2.expert_used_count");
+const FIRST_DENSE: Field = field(
+    "first_k_dense_replace",
+    "deepseek2.leading_dense_block_count",
+);
+const GROUPS: Field = field("n_group", "deepseek2.expert_group_count");
+const GROUP_TOP: Field = field("topk_group", "deepseek2.expert_group_used_count");
+const SCALE: Field = field("routed_scaling_factor", "deepseek2.expert_weights_scale");
+const NORM_TOPK: Field = field("norm_topk_prob", "deepseek2.expert_weights_norm");
+const INDEX_HEADS: Field = Field::hf("index_n_heads");
+const INDEX_DIM: Field = Field::hf("index_head_dim");
+const INDEX_TOPK: Field = Field::hf("index_topk");
 
-/// Trace a full-sequence DeepSeek-V2 prefill forward (the CPU-oracle path): embeddings, `cfg.layers`
-/// pre-norm blocks (MLA attention, `o_proj` + residual, dense-or-routed+shared MoE MLP + residual),
-/// final `model.norm`, `lm_head.weight`.
-///
-/// Expects these constants bound at eval time: `model.embed_tokens.weight` `[vocab,hidden]`,
-/// `rope.cos`/`rope.sin` `[max_pos,qk_rope_head_dim/2]` (interleaved-pair
-/// table, half the width of a half-split table; see [`rope_interleave_apply`]), plus the `mask.prefill`
-/// step input (card 550a) `[1,1,l,l]`,
-/// per-layer `model.layers.{li}.{input_layernorm,post_attention_layernorm}.weight`,
-/// `self_attn.{q_a_proj,q_a_layernorm,q_b_proj}.weight` (when `cfg.q_lora_rank.is_some()`) OR
-/// `self_attn.q_proj.weight` (when `None`), `self_attn.{kv_a_proj_with_mqa,kv_a_layernorm,kv_b_proj,
-/// o_proj}.weight`, and either `mlp.{gate,up,down}_proj.weight` (dense layers) or `mlp.gate.weight` +
-/// `mlp.experts.{gate_up,down}_proj.weight` + (if `mp.n_shared_experts>0`)
-/// `mlp.shared_experts.{gate,up,down}_proj.weight` (routed layers, per [`deepseek2_moe_ffn`]'s doc
-/// comment), `model.norm.weight`, and `lm_head.weight`.
-pub fn trace_deepseek2_prefill(
-    cfg: DeepseekV2Config,
-    mp: DeepseekV2MoeParams,
-    seq_len: usize,
-) -> Graph {
-    let b = Builder::new();
-    let h = cfg.hidden;
-    let hq = cfg.n_heads;
-    let (nope, rope_d, vd) = (cfg.qk_nope_head_dim, cfg.qk_rope_head_dim, cfg.v_head_dim);
-    let qk_head_dim = cfg.qk_head_dim();
-    let kv_rank = cfg.kv_lora_rank;
-    let scale = cfg.attn_scale();
-    let l = seq_len;
+/// `llama.cpp`'s `LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX` and `_SIGMOID`.
+const GATING_SOFTMAX: u64 = 1;
+const GATING_SIGMOID: u64 = 2;
 
-    let tokens = b.slot(Slot::Token, TensorType::new(vec![l], DType::I32));
-    let cos = b.constant("rope.cos", TensorType::f32(vec![cfg.max_pos, rope_d / 2]));
-    let sin = b.constant("rope.sin", TensorType::f32(vec![cfg.max_pos, rope_d / 2]));
-    let mask = b.slot_named(Slot::Mask, "prefill", TensorType::f32(vec![1, 1, l, l]));
-
-    let embed = b.constant(
-        "model.embed_tokens.weight",
-        TensorType::f32(vec![cfg.vocab, h]),
-    );
-    let emb = b.gather(embed, 0, tokens); // [L, hidden]
-    let mut x = b.reshape(emb, vec![1, l, h]);
-
-    for li in 0..cfg.layers {
-        let p = |s: &str| format!("model.layers.{li}.{s}");
-
-        let ln1 = b.constant(&p("input_layernorm.weight"), TensorType::f32(vec![h]));
-        let normed = rmsnorm(&b, x, ln1, cfg.eps);
-
-        // Q: low-rank-compressed (Some) or plain (None); either way split nope/rope per head.
-        let (q, _qr) = mla_query_proj(&b, &p, normed, cfg, h, hq, qk_head_dim);
-        let q = b.transpose(b.reshape(q, vec![1, l, hq, qk_head_dim]), vec![0, 2, 1, 3]); // [1,Hq,L,qk_head_dim]
-        let q_nope = b.slice(q, 3, 0, nope);
-        let q_pe = b.slice(q, 3, nope, qk_head_dim);
-        let q_pe = rope_interleaved_prefill(&b, q_pe, cos, sin, l);
-        let q_full = b.concat(3, &[q_nope, q_pe]); // [1,Hq,L,qk_head_dim]
-
-        // KV: down-project to the shared latent, split nope/rope, normalize + rotate, then decompress the
-        // whole latent through kv_b_proj (as HF does).
-        let w_kva = b.constant(
-            &p("self_attn.kv_a_proj_with_mqa.weight"),
-            TensorType::f32(vec![h, kv_rank + rope_d]),
-        );
-        let kv_a = linear(&b, normed, w_kva, None); // [1,L,kv_rank+rope_d]
-        let kv_nope_raw = b.slice(kv_a, 2, 0, kv_rank); // [1,L,kv_rank]
-        let k_pe_raw = b.slice(kv_a, 2, kv_rank, kv_rank + rope_d); // [1,L,rope_d]
-        let kva_ln = b.constant(
-            &p("self_attn.kv_a_layernorm.weight"),
-            TensorType::f32(vec![kv_rank]),
-        );
-        let c_kv = rmsnorm(&b, kv_nope_raw, kva_ln, cfg.eps); // [1,L,kv_rank] - the compressed latent
-
-        let k_pe = b.reshape(k_pe_raw, vec![1, 1, l, rope_d]); // single shared "head"
-        let k_pe = rope_interleaved_prefill(&b, k_pe, cos, sin, l);
-
-        let w_kvb = b.constant(
-            &p("self_attn.kv_b_proj.weight"),
-            TensorType::f32(vec![kv_rank, hq * (nope + vd)]),
-        );
-        let kv_expanded = linear(&b, c_kv, w_kvb, None); // [1,L,Hq*(nope+vd)]
-        let kv_expanded = b.transpose(
-            b.reshape(kv_expanded, vec![1, l, hq, nope + vd]),
-            vec![0, 2, 1, 3],
-        ); // [1,Hq,L,nope+vd]
-        let k_nope_h = b.slice(kv_expanded, 3, 0, nope); // [1,Hq,L,nope]
-        let v_h = b.slice(kv_expanded, 3, nope, nope + vd); // [1,Hq,L,vd]
-
-        let k_pe_b = repeat_kv(&b, k_pe, hq); // [1,1,L,rope_d] -> [1,Hq,L,rope_d] (H_kv=1 broadcast)
-        let k_full = b.concat(3, &[k_nope_h, k_pe_b]); // [1,Hq,L,qk_head_dim]
-
-        let attn = attention_prefill(&b, q_full, k_full, v_h, 1, scale, mask); // [1,Hq,L,vd]
-        let attn = b.transpose(attn, vec![0, 2, 1, 3]);
-        let attn = b.reshape(attn, vec![1, l, hq * vd]);
-        let wo = b.constant(
-            &p("self_attn.o_proj.weight"),
-            TensorType::f32(vec![hq * vd, h]),
-        );
-        let attn = linear(&b, attn, wo, None);
-        x = b.binary(BinOp::Add, x, attn);
-
-        let ln2 = b.constant(
-            &p("post_attention_layernorm.weight"),
-            TensorType::f32(vec![h]),
-        );
-        let normed = rmsnorm(&b, x, ln2, cfg.eps);
-        let m = if mp.is_moe_layer(li) {
-            deepseek2_moe_ffn(&b, normed, h, &mp, li)
-        } else {
-            deepseek2_dense_ffn(&b, normed, h, mp.dense_inter, li)
+impl DeepseekConfig {
+    pub(crate) fn from_raw(raw: &RawConfig<'_>, kind: Kind) -> Result<Self, ModelError> {
+        let fields = Fields::new(raw, kind.family);
+        let gguf = matches!(raw, RawConfig::Gguf(_));
+        let heads = fields.count(HEADS, None)?;
+        let kv_rank = fields.count(KV_RANK, None)?;
+        let q_rank = match fields.opt_u64(Q_RANK)? {
+            None => None,
+            Some(r) => Some(
+                usize::try_from(r)
+                    .map_err(|_| fields.error("q_lora_rank", ConfigReason::WrongType))?,
+            ),
         };
-        x = b.binary(BinOp::Add, x, m);
-    }
-
-    let norm = b.constant("model.norm.weight", TensorType::f32(vec![h]));
-    let x = rmsnorm(&b, x, norm, cfg.eps);
-    let last = b.slice(x, 1, l - 1, l);
-    let lm_head = b.constant("lm_head.weight", TensorType::f32(vec![h, cfg.vocab]));
-    let logits = linear(&b, last, lm_head, None);
-    b.finish(logits)
-}
-
-/// DeepSeek-V2 single-token fixed-KV masked decode, the capture/replay analog of
-/// [`trace_deepseek2_prefill`]. The KV cache is the compressed latent (`c_kv[1,1,cap,kv_lora_rank]` +
-/// `k_pe[1,1,cap,qk_rope_head_dim]`, shared across all `Hq` heads), fixed-capacity with masking.
-/// Every step decompresses the whole cache (0..cap) through `kv_b_proj` before attention, as HF
-/// `expand_kv` does, costing O(cap) extra matmul work per step (no weight absorption; see the
-/// module docs).
-pub fn trace_deepseek2_decode_kv_masked(
-    cfg: DeepseekV2Config,
-    mp: DeepseekV2MoeParams,
-    cap: usize,
-) -> Graph {
-    let b = Builder::new();
-    let h = cfg.hidden;
-    let hq = cfg.n_heads;
-    let (nope, rope_d, vd) = (cfg.qk_nope_head_dim, cfg.qk_rope_head_dim, cfg.v_head_dim);
-    let qk_head_dim = cfg.qk_head_dim();
-    let kv_rank = cfg.kv_lora_rank;
-    let scale = cfg.attn_scale();
-
-    let token = b.slot(Slot::Token, TensorType::scalar(DType::I32));
-    let pos_slot = b.slot(Slot::Pos, TensorType::scalar(DType::I32));
-    let _seq_len = b.slot(Slot::SeqLen, TensorType::scalar(DType::I32));
-    let mask = b.slot(Slot::Mask, TensorType::f32(vec![cap]));
-    let mask = b.reshape(mask, vec![1, 1, 1, cap]);
-
-    let cos = b.constant("rope.cos", TensorType::f32(vec![cfg.max_pos, rope_d / 2]));
-    let sin = b.constant("rope.sin", TensorType::f32(vec![cfg.max_pos, rope_d / 2]));
-
-    let embed = b.constant(
-        "model.embed_tokens.weight",
-        TensorType::f32(vec![cfg.vocab, h]),
-    );
-    let x0 = b.gather_scalar(embed, 0, token);
-    let mut x = b.reshape(x0, vec![1, 1, h]);
-
-    let mut state: Vec<(Traced, Traced)> = Vec::with_capacity(2 * cfg.layers);
-
-    for li in 0..cfg.layers {
-        let p = |s: &str| format!("model.layers.{li}.{s}");
-
-        let ln1 = b.constant(&p("input_layernorm.weight"), TensorType::f32(vec![h]));
-        let normed = rmsnorm(&b, x, ln1, cfg.eps);
-
-        let (q, _qr) = mla_query_proj(&b, &p, normed, cfg, h, hq, qk_head_dim);
-        let q = b.transpose(b.reshape(q, vec![1, 1, hq, qk_head_dim]), vec![0, 2, 1, 3]); // [1,Hq,1,qk_head_dim]
-        let q_nope = b.slice(q, 3, 0, nope);
-        let q_pe = b.slice(q, 3, nope, qk_head_dim);
-        let q_pe = rope_interleaved_decode(&b, q_pe, cos, sin, pos_slot);
-        let q_full = b.concat(3, &[q_nope, q_pe]);
-
-        let w_kva = b.constant(
-            &p("self_attn.kv_a_proj_with_mqa.weight"),
-            TensorType::f32(vec![h, kv_rank + rope_d]),
-        );
-        let kv_a = linear(&b, normed, w_kva, None); // [1,1,kv_rank+rope_d]
-        let kv_nope_raw = b.slice(kv_a, 2, 0, kv_rank);
-        let k_pe_raw = b.slice(kv_a, 2, kv_rank, kv_rank + rope_d);
-        let kva_ln = b.constant(
-            &p("self_attn.kv_a_layernorm.weight"),
-            TensorType::f32(vec![kv_rank]),
-        );
-        let c_kv_new = rmsnorm(&b, kv_nope_raw, kva_ln, cfg.eps); // [1,1,kv_rank]
-        let c_kv_new = b.reshape(c_kv_new, vec![1, 1, 1, kv_rank]);
-
-        let k_pe_new = b.reshape(k_pe_raw, vec![1, 1, 1, rope_d]);
-        let k_pe_new = rope_interleaved_decode(&b, k_pe_new, cos, sin, pos_slot);
-
-        let c_cache = b.state_input(
-            &p("mla.c_cache"),
-            TensorType::f32(vec![1, 1, cap, kv_rank]),
-            StateRole::Recurrent,
-        );
-        let rope_cache = b.state_input(
-            &p("mla.rope_cache"),
-            TensorType::f32(vec![1, 1, cap, rope_d]),
-            StateRole::Recurrent,
-        );
-        let c_cache_out = b.dynamic_update_slice_dyn(c_cache, c_kv_new, pos_slot, 2);
-        let rope_cache_out = b.dynamic_update_slice_dyn(rope_cache, k_pe_new, pos_slot, 2);
-        state.push((c_cache, c_cache_out));
-        state.push((rope_cache, rope_cache_out));
-
-        // Decompress the whole cache through kv_b_proj (HF expand_kv):
-        // c_cache_out[1,1,cap,kv_rank] -> [cap,kv_rank] -> linear -> [cap,Hq*(nope+vd)].
-        let c_flat = b.reshape(c_cache_out, vec![cap, kv_rank]);
-        let w_kvb = b.constant(
-            &p("self_attn.kv_b_proj.weight"),
-            TensorType::f32(vec![kv_rank, hq * (nope + vd)]),
-        );
-        let kv_expanded = linear(&b, c_flat, w_kvb, None); // [cap,Hq*(nope+vd)]
-        let kv_expanded = b.transpose(
-            b.reshape(kv_expanded, vec![1, cap, hq, nope + vd]),
-            vec![0, 2, 1, 3],
-        ); // [1,Hq,cap,nope+vd]
-        let k_nope_h = b.slice(kv_expanded, 3, 0, nope); // [1,Hq,cap,nope]
-        let v_h = b.slice(kv_expanded, 3, nope, nope + vd); // [1,Hq,cap,vd]
-
-        let k_pe_b = repeat_kv(&b, rope_cache_out, hq); // [1,1,cap,rope_d] -> [1,Hq,cap,rope_d]
-        let k_full = b.concat(3, &[k_nope_h, k_pe_b]); // [1,Hq,cap,qk_head_dim]
-
-        let attn = attention_masked(&b, q_full, k_full, v_h, 1, scale, mask); // [1,Hq,1,vd]
-        let attn = b.transpose(attn, vec![0, 2, 1, 3]);
-        let attn = b.reshape(attn, vec![1, 1, hq * vd]);
-        let wo = b.constant(
-            &p("self_attn.o_proj.weight"),
-            TensorType::f32(vec![hq * vd, h]),
-        );
-        let attn = linear(&b, attn, wo, None);
-        x = b.binary(BinOp::Add, x, attn);
-
-        let ln2 = b.constant(
-            &p("post_attention_layernorm.weight"),
-            TensorType::f32(vec![h]),
-        );
-        let normed = rmsnorm(&b, x, ln2, cfg.eps);
-        let m = if mp.is_moe_layer(li) {
-            deepseek2_moe_ffn(&b, normed, h, &mp, li)
+        let rope_dim = fields.count(ROPE_DIM, None)?;
+        // A GGUF states the whole per-head query width, not the unrotated part.
+        let nope = if gguf {
+            fields
+                .count(KEY_LENGTH, None)?
+                .checked_sub(rope_dim)
+                .filter(|&n| n > 0)
+                .ok_or(fields.error(fields.key(KEY_LENGTH), ConfigReason::Zero))?
         } else {
-            deepseek2_dense_ffn(&b, normed, h, mp.dense_inter, li)
+            fields.count(NOPE, None)?
         };
-        x = b.binary(BinOp::Add, x, m);
-    }
-
-    let norm = b.constant("model.norm.weight", TensorType::f32(vec![h]));
-    let x = rmsnorm(&b, x, norm, cfg.eps);
-    let lm_head = b.constant("lm_head.weight", TensorType::f32(vec![h, cfg.vocab]));
-    let logits = linear(&b, x, lm_head, None);
-    b.finish_with_state(logits, &state)
-}
-
-/// The query-side projection shared by prefill/decode: `q_a_proj -> q_a_layernorm -> q_b_proj` when
-/// `cfg.q_lora_rank.is_some()`, else a plain `q_proj`. Returns `([.., Hq*qk_head_dim], qr)` (the
-/// first un-reshaped, the caller splits heads), where `qr` is the `q_a_layernorm` output
-/// (`[.., q_lora_rank]`, `Some` only for the low-rank branch). DeepSeek-V3.2's DSA Lightning Indexer
-/// feeds its `wq_b` from the same `qr` (update 0857, `crate::deepseek32`), so it is returned here
-/// rather than recomputed.
-pub(crate) fn mla_query_proj(
-    b: &Builder,
-    p: &dyn Fn(&str) -> String,
-    normed: Traced,
-    cfg: DeepseekV2Config,
-    h: usize,
-    hq: usize,
-    qk_head_dim: usize,
-) -> (Traced, Option<Traced>) {
-    match cfg.q_lora_rank {
-        Some(r) => {
-            let wqa = b.constant(&p("self_attn.q_a_proj.weight"), TensorType::f32(vec![h, r]));
-            let q_a = linear(b, normed, wqa, None); // [..,r]
-            let qa_ln = b.constant(
-                &p("self_attn.q_a_layernorm.weight"),
-                TensorType::f32(vec![r]),
-            );
-            let q_a_normed = rmsnorm(b, q_a, qa_ln, cfg.eps);
-            let wqb = b.constant(
-                &p("self_attn.q_b_proj.weight"),
-                TensorType::f32(vec![r, hq * qk_head_dim]),
-            );
-            (linear(b, q_a_normed, wqb, None), Some(q_a_normed))
+        let v_dim = fields.count(V_DIM, None)?;
+        let width = fields.count(WIDTH, None)?;
+        let layers = fields.count(LAYERS, None)?;
+        let max_positions = fields.count(MAX_POSITIONS, None)?;
+        if u32::try_from(max_positions).is_err() {
+            return Err(fields.error(
+                fields.key(MAX_POSITIONS),
+                ConfigReason::Exceeds {
+                    max: u32::MAX as usize,
+                },
+            ));
         }
-        None => {
-            let wq = b.constant(
-                &p("self_attn.q_proj.weight"),
-                TensorType::f32(vec![h, hq * qk_head_dim]),
-            );
-            (linear(b, normed, wq, None), None)
+        let eps = fields.float(EPS, 1e-6)?;
+        let theta = fields.float(THETA, 10_000.0)?;
+        if fields.flag(Field::hf("attention_bias"), false)? {
+            return Err(fields.error("attention_bias", ConfigReason::Unsupported));
+        }
+        if fields
+            .opt_u64(Field::hf("moe_layer_freq"))?
+            .is_some_and(|f| f != 1)
+        {
+            return Err(fields.error("moe_layer_freq", ConfigReason::Unsupported));
+        }
+
+        let (flavor, softmax_scale_sq) = yarn(&fields, max_positions)?;
+        let norm = NormParams::new(eps).map_err(|e| e.for_family(kind.family))?;
+        let rope =
+            RopeParams::new(rope_dim, theta, &flavor).map_err(|e| e.for_family(kind.family))?;
+        let qk = nope + rope_dim;
+        let scale = softmax_scale_sq / (qk as f32).sqrt();
+        let kv = if gguf { KvForm::Split } else { KvForm::Fused };
+        let mla = MlaParams::new(
+            heads,
+            kv_rank,
+            q_rank,
+            nope,
+            rope_dim,
+            v_dim,
+            norm,
+            rope.interleaved(),
+            scale,
+            kv,
+        )
+        .map_err(|e| e.for_family(kind.family))?;
+
+        let dsa = if kind.dsa {
+            if q_rank.is_none() {
+                return Err(fields.error("q_lora_rank", ConfigReason::Missing));
+            }
+            Some(
+                DsaParams::new(
+                    fields.count(INDEX_HEADS, None)?,
+                    fields.count(INDEX_DIM, None)?,
+                    fields.count(INDEX_TOPK, None)?,
+                    rope,
+                )
+                .map_err(|e| e.for_family(kind.family))?,
+            )
+        } else {
+            None
+        };
+
+        let routing = routing(&fields, kind)?;
+        let experts = fields.count(EXPERTS, None)?;
+        let moe_inter = fields.count(MOE_INTER, None)?;
+        let n_shared = fields.opt_u64(SHARED)?.map_or(Ok(0), |n| {
+            usize::try_from(n)
+                .map_err(|_| fields.error(fields.key(SHARED), ConfigReason::WrongType))
+        })?;
+        let mut moe = with_routing(
+            MoeParams::new(
+                kind.family,
+                width,
+                moe_inter,
+                experts,
+                fields.count(TOP_K, None)?,
+                router_kind(&routing),
+            )?,
+            &routing,
+        )
+        .map_err(|e| e.for_family(kind.family))?;
+        if n_shared > 0 {
+            moe = moe
+                .with_shared(moe_inter * n_shared)
+                .map_err(|e| e.for_family(kind.family))?;
+        }
+        let first_routed = fields
+            .opt_u64(FIRST_DENSE)?
+            .map_or(Ok(0), |n| {
+                usize::try_from(n)
+                    .map_err(|_| fields.error(fields.key(FIRST_DENSE), ConfigReason::WrongType))
+            })?
+            .min(layers);
+        let dense_inter = if first_routed > 0 {
+            fields.count(DENSE_INTER, None)?
+        } else {
+            0
+        };
+        let head_required = match raw {
+            RawConfig::HfJson { config, .. } => !config
+                .get("tie_word_embeddings")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            RawConfig::Gguf(_) => false,
+        };
+        Ok(Self {
+            vocab: fields.vocab()?,
+            width,
+            layers,
+            max_positions,
+            mla,
+            layer: LayerParams::new(norm),
+            stack: StackParams::new(norm),
+            dense_inter,
+            first_routed,
+            moe,
+            routing,
+            dsa,
+            head_required,
+            eos: fields.eos(None)?,
+            bos: fields.bos()?,
+            kv,
+            shared: n_shared > 0,
+        })
+    }
+
+    fn routed(&self, layer: usize) -> bool {
+        layer >= self.first_routed
+    }
+}
+
+/// The router a config declares. HF names the scoring function (`softmax` or `sigmoid`) and the
+/// top-k method (`greedy`, `group_limited_greedy` or `noaux_tc`); a GGUF names the gating function
+/// and the group counts (a `deepseek2` GGUF also holds V3 checkpoints). A router that normalizes
+/// the selected weights does so only when asked: `norm_topk_prob`, `expert_weights_norm`.
+fn routing(fields: &Fields<'_>, kind: Kind) -> Result<Routing, ModelError> {
+    let scale = fields.float(SCALE, 1.0)?;
+    let renormalize = fields.flag(NORM_TOPK, kind.scoring == Scoring::Sigmoid)?;
+    let count = |field: Field, default: usize| -> Result<usize, ModelError> {
+        fields.opt_u64(field)?.map_or(Ok(default), |n| {
+            usize::try_from(n).map_err(|_| fields.error(fields.key(field), ConfigReason::WrongType))
+        })
+    };
+    let (scoring, grouped) = match fields.raw() {
+        RawConfig::HfJson { config, .. } => {
+            let text = |key: &'static str| {
+                config
+                    .get(key)
+                    .filter(|v| !v.is_null())
+                    .map(|v| v.as_str().ok_or(fields.error(key, ConfigReason::WrongType)))
+                    .transpose()
+            };
+            let scoring = match text("scoring_func")? {
+                None => kind.scoring,
+                Some("softmax") => Scoring::Softmax,
+                Some("sigmoid") => Scoring::Sigmoid,
+                Some(_) => return Err(fields.error("scoring_func", ConfigReason::Unsupported)),
+            };
+            let grouped = match text("topk_method")? {
+                None | Some("group_limited_greedy" | "noaux_tc") => true,
+                Some("greedy") => false,
+                Some(_) => return Err(fields.error("topk_method", ConfigReason::Unsupported)),
+            };
+            (scoring, grouped)
+        }
+        RawConfig::Gguf(_) => {
+            let scoring = match fields.opt_u64(Field::new("", "deepseek2.expert_gating_func"))? {
+                None => kind.scoring,
+                Some(GATING_SOFTMAX) => Scoring::Softmax,
+                Some(GATING_SIGMOID) => Scoring::Sigmoid,
+                Some(_) => {
+                    return Err(
+                        fields.error("deepseek2.expert_gating_func", ConfigReason::Unsupported)
+                    );
+                }
+            };
+            (scoring, true)
+        }
+    };
+    let groups = if grouped { count(GROUPS, 1)? } else { 1 };
+    let group_top = if grouped {
+        count(GROUP_TOP, groups)?
+    } else {
+        1
+    };
+    if groups == 0 {
+        return Err(fields.error(fields.key(GROUPS), ConfigReason::Zero));
+    }
+    if group_top == 0 || group_top > groups {
+        return Err(fields.error(
+            fields.key(GROUP_TOP),
+            if group_top == 0 {
+                ConfigReason::Zero
+            } else {
+                ConfigReason::Exceeds { max: groups }
+            },
+        ));
+    }
+    Ok(Routing {
+        scoring,
+        groups,
+        group_top,
+        scale,
+        renormalize,
+    })
+}
+
+/// The router `routing` names: the softmax of V2, or V3's sigmoid with a selection-only bias.
+fn router_kind(routing: &Routing) -> RouterKind {
+    match routing.scoring {
+        Scoring::Softmax => RouterKind::SoftmaxTopK {
+            renormalize: routing.renormalize,
+        },
+        Scoring::Sigmoid => {
+            RouterKind::SigmoidBiasedTopK(SigmoidTopK::new().with_renormalize(routing.renormalize))
         }
     }
 }
+
+/// DeepSeek's YaRN: the RoPE flavor and the extra softmax-scale factor `get_mscale(factor,
+/// mscale_all_dim)^2` (`1.0` when the config has no `mscale_all_dim`), read from HF's
+/// `rope_scaling` or a GGUF's `rope.scaling.*` keys. Absent or `default` scaling is plain RoPE and
+/// a factor of one; any other type is refused.
+fn yarn(
+    fields: &Fields<'_>,
+    max_positions: usize,
+) -> Result<(RopeFlavor<'static>, f32), ModelError> {
+    struct Scaling {
+        factor: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+        original: usize,
+        attention_factor: Option<f32>,
+        mscale: Option<f32>,
+        mscale_all_dim: Option<f32>,
+    }
+    let scaling = match fields.raw() {
+        RawConfig::HfJson { config, .. } => {
+            let Some(block) = config.get("rope_scaling").filter(|v| !v.is_null()) else {
+                return Ok((RopeFlavor::Plain, 1.0));
+            };
+            let wrong = |field| fields.error(field, ConfigReason::WrongType);
+            let block = block.as_object().ok_or(wrong("rope_scaling"))?;
+            let kind = block
+                .get("rope_type")
+                .or_else(|| block.get("type"))
+                .ok_or(fields.error("rope_scaling.rope_type", ConfigReason::Missing))?
+                .as_str()
+                .ok_or(wrong("rope_scaling.rope_type"))?;
+            match kind {
+                "default" => return Ok((RopeFlavor::Plain, 1.0)),
+                "yarn" => {}
+                _ => return Err(fields.error("rope_scaling.rope_type", ConfigReason::Unsupported)),
+            }
+            let float = |key: &'static str| {
+                block
+                    .get(key)
+                    .filter(|v| !v.is_null())
+                    .map(|v| v.as_f64().map(|v| v as f32).ok_or(wrong(key)))
+                    .transpose()
+            };
+            let original = block
+                .get("original_max_position_embeddings")
+                .filter(|v| !v.is_null())
+                .map(|v| {
+                    v.as_u64()
+                        .and_then(|v| usize::try_from(v).ok())
+                        .ok_or(wrong("rope_scaling.original_max_position_embeddings"))
+                })
+                .transpose()?
+                .unwrap_or(max_positions);
+            Scaling {
+                factor: float("factor")?
+                    .ok_or(fields.error("rope_scaling.factor", ConfigReason::Missing))?,
+                beta_fast: float("beta_fast")?.unwrap_or(32.0),
+                beta_slow: float("beta_slow")?.unwrap_or(1.0),
+                original,
+                attention_factor: float("attention_factor")?,
+                mscale: float("mscale")?,
+                mscale_all_dim: float("mscale_all_dim")?,
+            }
+        }
+        RawConfig::Gguf(gguf) => {
+            let kind = gguf
+                .get("deepseek2.rope.scaling.type")
+                .and_then(|v| v.as_str());
+            if kind != Some("yarn") {
+                return Ok((RopeFlavor::Plain, 1.0));
+            }
+            let float = |key: &'static str| -> Result<Option<f32>, ModelError> {
+                gguf.get(key)
+                    .map(|v| v.as_f32().ok_or(fields.error(key, ConfigReason::WrongType)))
+                    .transpose()
+            };
+            let original_key = "deepseek2.rope.scaling.original_context_length";
+            let original = gguf
+                .get(original_key)
+                .map(|v| {
+                    v.as_u64()
+                        .and_then(|n| usize::try_from(n).ok())
+                        .ok_or(fields.error(original_key, ConfigReason::WrongType))
+                })
+                .transpose()?
+                .unwrap_or(max_positions);
+            // The GGUF carries one multiplier, `0.1 * mscale_all_dim`, and cannot say `mscale`
+            // separately: the converter wrote both from the same value.
+            let mscale_all_dim =
+                float("deepseek2.rope.scaling.yarn_log_multiplier")?.map(|v| v / 0.1);
+            Scaling {
+                factor: float("deepseek2.rope.scaling.factor")?.unwrap_or(1.0),
+                beta_fast: float("deepseek2.rope.scaling.yarn_beta_fast")?.unwrap_or(32.0),
+                beta_slow: float("deepseek2.rope.scaling.yarn_beta_slow")?.unwrap_or(1.0),
+                original,
+                attention_factor: float("deepseek2.rope.scaling.attn_factor")?,
+                mscale: mscale_all_dim,
+                mscale_all_dim,
+            }
+        }
+    };
+    let factor = scaling.factor.max(1e-6);
+    // `yarn_get_mscale`: one at a scale of at most one, else a log ramp.
+    let get_mscale = |scale: f32, mscale: f32| {
+        if scale <= 1.0 {
+            1.0
+        } else {
+            0.1 * mscale * scale.ln() + 1.0
+        }
+    };
+    // The table's magnitude: an explicit override, else the `mscale` / `mscale_all_dim` ratio
+    // (released DeepSeek-V2 configs set both to 0.707, so one), else the generic YaRN default.
+    let attention_factor = scaling.attention_factor.unwrap_or_else(|| {
+        match (scaling.mscale, scaling.mscale_all_dim) {
+            (Some(m), Some(all)) if m != 0.0 && all != 0.0 => {
+                get_mscale(factor, m) / get_mscale(factor, all)
+            }
+            _ => get_mscale(factor, 1.0),
+        }
+    });
+    // The softmax scale's own correction: `mscale_all_dim`'s square, or nothing.
+    let softmax_scale_sq = match scaling.mscale_all_dim {
+        Some(all) if all != 0.0 => {
+            let m = get_mscale(factor, all);
+            m * m
+        }
+        _ => 1.0,
+    };
+    Ok((
+        RopeFlavor::Yarn {
+            factor,
+            original: scaling.original,
+            beta_fast: scaling.beta_fast,
+            beta_slow: scaling.beta_slow,
+            attention_factor: Some(attention_factor),
+        },
+        softmax_scale_sq,
+    ))
+}
+
+// ---- weight names -----------------------------------------------------------------------------
+
+const HF_PREFIX: &str = "model.layers.";
+const GGUF_PREFIX: &str = "blk.";
+
+const fn row_linear(prefix: &'static str, role: WeightRole, stem: &'static str) -> NameRow {
+    NameRow {
+        role,
+        source: Source::LayerLinear { prefix, stem },
+        presence: Presence::Required,
+    }
+}
+
+const fn row_tensor(prefix: &'static str, role: WeightRole, suffix: &'static str) -> NameRow {
+    NameRow {
+        role,
+        source: Source::LayerTensor { prefix, suffix },
+        presence: Presence::Required,
+    }
+}
+
+/// HF rows every DeepSeek MLA checkpoint carries: the model-level weights, the two norms, the
+/// latent projections, the output projection and the dense feed-forward of the leading layers.
+const HF_BASE: &[NameRow] = &[
+    NameRow {
+        role: WeightRole::Embed,
+        source: Source::Tensor("model.embed_tokens.weight"),
+        presence: Presence::Required,
+    },
+    NameRow {
+        role: WeightRole::FinalNorm,
+        source: Source::Tensor("model.norm.weight"),
+        presence: Presence::Required,
+    },
+    NameRow {
+        role: WeightRole::Head,
+        source: Source::Linear("lm_head"),
+        presence: Presence::TiedTo(WeightRole::Embed),
+    },
+    row_tensor(
+        HF_PREFIX,
+        WeightRole::Norm(NormRole::Attn),
+        ".input_layernorm.weight",
+    ),
+    row_tensor(
+        HF_PREFIX,
+        WeightRole::Norm(NormRole::Ffn),
+        ".post_attention_layernorm.weight",
+    ),
+    row_linear(
+        HF_PREFIX,
+        WeightRole::Attn(AttnRole::O),
+        ".self_attn.o_proj",
+    ),
+    row_linear(
+        HF_PREFIX,
+        WeightRole::Mla(MlaRole::KvA),
+        ".self_attn.kv_a_proj_with_mqa",
+    ),
+    row_tensor(
+        HF_PREFIX,
+        WeightRole::Mla(MlaRole::KvANorm),
+        ".self_attn.kv_a_layernorm.weight",
+    ),
+    row_linear(
+        HF_PREFIX,
+        WeightRole::Mla(MlaRole::KvB),
+        ".self_attn.kv_b_proj",
+    ),
+    row_linear(HF_PREFIX, WeightRole::Ffn(FfnRole::Gate), ".mlp.gate_proj"),
+    row_linear(HF_PREFIX, WeightRole::Ffn(FfnRole::Up), ".mlp.up_proj"),
+    row_linear(HF_PREFIX, WeightRole::Ffn(FfnRole::Down), ".mlp.down_proj"),
+];
+
+const HF_Q_PLAIN: &[NameRow] = &[row_linear(
+    HF_PREFIX,
+    WeightRole::Attn(AttnRole::Q),
+    ".self_attn.q_proj",
+)];
+
+const HF_Q_LOW_RANK: &[NameRow] = &[
+    row_linear(
+        HF_PREFIX,
+        WeightRole::Mla(MlaRole::QA),
+        ".self_attn.q_a_proj",
+    ),
+    row_tensor(
+        HF_PREFIX,
+        WeightRole::Mla(MlaRole::QANorm),
+        ".self_attn.q_a_layernorm.weight",
+    ),
+    row_linear(
+        HF_PREFIX,
+        WeightRole::Mla(MlaRole::QB),
+        ".self_attn.q_b_proj",
+    ),
+];
+
+/// The sparse-attention indexer's rows (V3.2).
+pub(crate) const HF_DSA: &[NameRow] = &[
+    row_linear(
+        HF_PREFIX,
+        WeightRole::Dsa(DsaRole::Q),
+        ".self_attn.indexer.wq_b",
+    ),
+    row_linear(
+        HF_PREFIX,
+        WeightRole::Dsa(DsaRole::K),
+        ".self_attn.indexer.wk",
+    ),
+    row_tensor(
+        HF_PREFIX,
+        WeightRole::Dsa(DsaRole::KNorm),
+        ".self_attn.indexer.k_norm.weight",
+    ),
+    row_tensor(
+        HF_PREFIX,
+        WeightRole::Dsa(DsaRole::KNormBias),
+        ".self_attn.indexer.k_norm.bias",
+    ),
+    row_linear(
+        HF_PREFIX,
+        WeightRole::Dsa(DsaRole::Weights),
+        ".self_attn.indexer.weights_proj",
+    ),
+];
+
+/// GGUF rows beside the same set: llama.cpp's names, with the up projection stored split per head.
+const GGUF_BASE: &[NameRow] = &[
+    NameRow {
+        role: WeightRole::Embed,
+        source: Source::Tensor("token_embd.weight"),
+        presence: Presence::Required,
+    },
+    NameRow {
+        role: WeightRole::FinalNorm,
+        source: Source::Tensor("output_norm.weight"),
+        presence: Presence::Required,
+    },
+    NameRow {
+        role: WeightRole::Head,
+        source: Source::Linear("output"),
+        presence: Presence::TiedTo(WeightRole::Embed),
+    },
+    row_tensor(
+        GGUF_PREFIX,
+        WeightRole::Norm(NormRole::Attn),
+        ".attn_norm.weight",
+    ),
+    row_tensor(
+        GGUF_PREFIX,
+        WeightRole::Norm(NormRole::Ffn),
+        ".ffn_norm.weight",
+    ),
+    row_linear(GGUF_PREFIX, WeightRole::Attn(AttnRole::O), ".attn_output"),
+    row_linear(GGUF_PREFIX, WeightRole::Mla(MlaRole::KvA), ".attn_kv_a_mqa"),
+    row_tensor(
+        GGUF_PREFIX,
+        WeightRole::Mla(MlaRole::KvANorm),
+        ".attn_kv_a_norm.weight",
+    ),
+    row_linear(GGUF_PREFIX, WeightRole::Mla(MlaRole::KB), ".attn_k_b"),
+    row_linear(GGUF_PREFIX, WeightRole::Mla(MlaRole::VB), ".attn_v_b"),
+    row_linear(GGUF_PREFIX, WeightRole::Ffn(FfnRole::Gate), ".ffn_gate"),
+    row_linear(GGUF_PREFIX, WeightRole::Ffn(FfnRole::Up), ".ffn_up"),
+    row_linear(GGUF_PREFIX, WeightRole::Ffn(FfnRole::Down), ".ffn_down"),
+];
+
+const GGUF_Q_PLAIN: &[NameRow] = &[row_linear(
+    GGUF_PREFIX,
+    WeightRole::Attn(AttnRole::Q),
+    ".attn_q",
+)];
+
+const GGUF_Q_LOW_RANK: &[NameRow] = &[
+    row_linear(GGUF_PREFIX, WeightRole::Mla(MlaRole::QA), ".attn_q_a"),
+    row_tensor(
+        GGUF_PREFIX,
+        WeightRole::Mla(MlaRole::QANorm),
+        ".attn_q_a_norm.weight",
+    ),
+    row_linear(GGUF_PREFIX, WeightRole::Mla(MlaRole::QB), ".attn_q_b"),
+];
+
+const HF_EXPERTS: &[ExpertNames] = &[
+    ExpertNames {
+        proj: ExpertProj::Gate,
+        stack: None,
+        each: Some((".mlp.experts.", ".gate_proj.weight")),
+        bias: None,
+    },
+    ExpertNames {
+        proj: ExpertProj::Up,
+        stack: None,
+        each: Some((".mlp.experts.", ".up_proj.weight")),
+        bias: None,
+    },
+    ExpertNames {
+        proj: ExpertProj::Down,
+        stack: None,
+        each: Some((".mlp.experts.", ".down_proj.weight")),
+        bias: None,
+    },
+];
+
+const GGUF_EXPERTS: &[ExpertNames] = &[
+    ExpertNames {
+        proj: ExpertProj::Gate,
+        stack: Some(".ffn_gate_exps.weight"),
+        each: None,
+        bias: None,
+    },
+    ExpertNames {
+        proj: ExpertProj::Up,
+        stack: Some(".ffn_up_exps.weight"),
+        each: None,
+        bias: None,
+    },
+    ExpertNames {
+        proj: ExpertProj::Down,
+        stack: Some(".ffn_down_exps.weight"),
+        each: None,
+        bias: None,
+    },
+];
+
+/// The routed layers' names: the router's bias exists for a sigmoid router, the shared expert when
+/// the config has one.
+fn moe_names(source: ConfigSource, routing: &Routing, shared: bool) -> MoeNames {
+    let biased = routing.scoring == Scoring::Sigmoid;
+    match source {
+        ConfigSource::HfModelType => MoeNames {
+            prefix: HF_PREFIX,
+            router: ".mlp.gate",
+            router_bias: biased.then_some(".mlp.gate.e_score_correction_bias"),
+            shared: shared.then_some(SharedNames {
+                gate: ".mlp.shared_experts.gate_proj",
+                up: ".mlp.shared_experts.up_proj",
+                down: ".mlp.shared_experts.down_proj",
+            }),
+            experts: HF_EXPERTS,
+        },
+        ConfigSource::GgufArchitecture => MoeNames {
+            prefix: GGUF_PREFIX,
+            router: ".ffn_gate_inp",
+            router_bias: biased.then_some(".exp_probs_b.bias"),
+            shared: shared.then_some(SharedNames {
+                gate: ".ffn_gate_shexp",
+                up: ".ffn_up_shexp",
+                down: ".ffn_down_shexp",
+            }),
+            experts: GGUF_EXPERTS,
+        },
+    }
+}
+
+// ---- the model --------------------------------------------------------------------------------
+
+#[derive(Debug)]
+enum Ffn {
+    Dense(Box<GatedFfnWeights>),
+    Routed(Box<MoeWeights>),
+}
+
+#[derive(Debug)]
+struct Layer {
+    norms: LayerNorms,
+    mla: MlaWeights,
+    dsa: Option<DsaWeights>,
+    ffn: Ffn,
+}
+
+#[derive(Debug)]
+pub struct Deepseek {
+    params: DeepseekConfig,
+    weights: WeightMap,
+    stack: StackWeights,
+    layers: Vec<Layer>,
+    config: ModelConfig,
+    family: FamilyKey,
+}
+
+fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+    build_family(V2, raw, store)
+}
+
+/// The model of a DeepSeek MLA family `kind` over `raw` and `store`.
+pub(crate) fn build_family(
+    kind: Kind,
+    raw: &RawConfig<'_>,
+    store: &WeightStore,
+) -> Result<Box<dyn Model>, ModelError> {
+    let p = DeepseekConfig::from_raw(raw, kind)?;
+    let low_rank = p.mla.q_rank().is_some();
+    let hf = matches!(raw.source(), ConfigSource::HfModelType);
+    let q: &[NameRow] = match (hf, low_rank) {
+        (true, true) => HF_Q_LOW_RANK,
+        (true, false) => HF_Q_PLAIN,
+        (false, true) => GGUF_Q_LOW_RANK,
+        (false, false) => GGUF_Q_PLAIN,
+    };
+    let base: &[NameRow] = if hf { HF_BASE } else { GGUF_BASE };
+    // The GGUF's up projection is split per head; HF's is one tensor. Each table holds only its
+    // own form.
+    let dsa: &[NameRow] = if p.dsa.is_some() { HF_DSA } else { &[] };
+    let tables: [&[NameRow]; 3] = [base, q, dsa];
+    let names = moe_names(raw.source(), &p.routing, p.shared);
+    let sparse: Vec<bool> = (0..p.layers).map(|l| p.routed(l)).collect();
+    let weights = family_weights_routed(
+        kind.family,
+        store,
+        &tables,
+        p.layers,
+        p.head_required,
+        MoeLayers {
+            names: &names,
+            sparse: &sparse,
+            experts: p.moe.experts(),
+        },
+    )?;
+    let weight_error = |e: WeightError| e.for_family(kind.family);
+    let stack = StackWeights::new(&weights, p.vocab, p.width).map_err(weight_error)?;
+    let layers = (0..p.layers)
+        .map(|l| {
+            let ffn = if p.routed(l) {
+                Ffn::Routed(Box::new(MoeWeights::new(&weights, l, &p.moe)?))
+            } else {
+                Ffn::Dense(Box::new(GatedFfnWeights::new(
+                    &weights,
+                    l,
+                    p.width,
+                    p.dense_inter,
+                )?))
+            };
+            Ok(Layer {
+                norms: LayerNorms::new(&weights, l, p.width)?,
+                mla: MlaWeights::new(&weights, l, p.width, &p.mla)?,
+                dsa: p
+                    .dsa
+                    .as_ref()
+                    .map(|dsa| {
+                        let q_rank = p.mla.q_rank().expect("DSA needs the low-rank query");
+                        DsaWeights::new(&weights, l, p.width, q_rank, dsa)
+                    })
+                    .transpose()?,
+                ffn,
+            })
+        })
+        .collect::<Result<Vec<_>, WeightError>>()
+        .map_err(weight_error)?;
+    let config = ModelConfig {
+        family: kind.family,
+        vocab: p.vocab,
+        max_positions: p.max_positions,
+        eos: p.eos.clone(),
+        bos: p.bos,
+        prompt_bos: None,
+        output: ModelOutput::Logits { vocab: p.vocab },
+        prefill_granule: NonZeroUsize::MIN,
+        chat: ChatFormat::ChatML,
+    };
+    Ok(Box::new(Deepseek {
+        params: p,
+        weights,
+        stack,
+        layers,
+        config,
+        family: kind.family,
+    }))
+}
+
+impl Model for Deepseek {
+    fn config(&self) -> &ModelConfig {
+        &self.config
+    }
+
+    fn weights(&self) -> &WeightMap {
+        &self.weights
+    }
+
+    fn trace(
+        &self,
+        phase: Phase,
+        shape: StepShape,
+    ) -> Result<Graph<ValidationOutputs>, TraceError> {
+        let p = &self.params;
+        check_step(self.family, phase, shape, p.max_positions)?;
+        moe::check_step(self.family, shape, &p.moe)?;
+        let b = Builder::new();
+        let step = Step::new(&b, shape);
+        let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
+            let layer = &self.layers[l];
+            standard_layer(
+                b,
+                x,
+                &layer.norms,
+                &p.layer,
+                |b, h| match (&layer.dsa, &p.dsa) {
+                    (Some(w), Some(dsa)) => {
+                        let select =
+                            |b: &Builder, sel: Selection| dsa_select(b, &step, l, h, sel, w, dsa);
+                        mla(b, &step, l, h, &layer.mla, &p.mla, Some(&select))
+                    }
+                    _ => mla(b, &step, l, h, &layer.mla, &p.mla, None),
+                },
+                |b, BlockInput { block: h, .. }| match &layer.ffn {
+                    Ffn::Dense(w) => gated_ffn(b, h, w),
+                    Ffn::Routed(w) => moe::moe(b, &step, l, h, None, w, &p.moe),
+                },
+            )
+        });
+        Ok(step.finish(b, logits))
+    }
+}
+
+// ---- the fixture ------------------------------------------------------------------------------
+
+/// The fixture's config: a tiny V2 with a low-rank query, YaRN with `mscale`, group-limited
+/// routing and two shared experts, whose widths are multiples of 32 where a Q8_0 copy needs them.
+pub(crate) fn fixture_config() -> serde_json::Value {
+    serde_json::json!({
+        "model_type": "deepseek_v2",
+        "vocab_size": 48,
+        "hidden_size": 32,
+        "intermediate_size": 64,
+        "moe_intermediate_size": 16,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "q_lora_rank": 8,
+        "kv_lora_rank": 8,
+        "qk_nope_head_dim": 8,
+        "qk_rope_head_dim": 4,
+        "v_head_dim": 8,
+        "n_routed_experts": 8,
+        "n_shared_experts": 2,
+        "num_experts_per_tok": 2,
+        "first_k_dense_replace": 1,
+        "n_group": 4,
+        "topk_group": 2,
+        "topk_method": "group_limited_greedy",
+        "scoring_func": "softmax",
+        "routed_scaling_factor": 2.0,
+        "rms_norm_eps": 1e-6,
+        "max_position_embeddings": 64,
+        "rope_theta": 10000.0,
+        "rope_scaling": {
+            "type": "yarn",
+            "factor": 4.0,
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "original_max_position_embeddings": 16,
+            "mscale": 0.707,
+            "mscale_all_dim": 0.707
+        },
+        "tie_word_embeddings": false,
+        "eos_token_id": 47,
+    })
+}
+
+/// The tensors of an HF DeepSeek MLA checkpoint of `config` (`bias` adds the V3 selection bias,
+/// `indexer` the V3.2 indexer's weights), by HF name.
+pub(crate) fn hf_shapes(
+    config: &serde_json::Value,
+    bias: bool,
+    indexer: bool,
+) -> Vec<(String, Vec<usize>)> {
+    let n = |f: &str| config[f].as_u64().unwrap() as usize;
+    let (vocab, w) = (n("vocab_size"), n("hidden_size"));
+    let (heads, nope, rope, v) = (
+        n("num_attention_heads"),
+        n("qk_nope_head_dim"),
+        n("qk_rope_head_dim"),
+        n("v_head_dim"),
+    );
+    let (kv_rank, q_rank) = (n("kv_lora_rank"), n("q_lora_rank"));
+    let qk = nope + rope;
+    let (experts, moe_inter, dense_inter) = (
+        n("n_routed_experts"),
+        n("moe_intermediate_size"),
+        n("intermediate_size"),
+    );
+    let shared = moe_inter * n("n_shared_experts");
+    let mut shapes = vec![
+        ("model.embed_tokens.weight".to_string(), vec![vocab, w]),
+        ("model.norm.weight".to_string(), vec![w]),
+        ("lm_head.weight".to_string(), vec![vocab, w]),
+    ];
+    for l in 0..n("num_hidden_layers") {
+        let k = |s: &str| format!("model.layers.{l}.{s}");
+        shapes.extend([
+            (k("input_layernorm.weight"), vec![w]),
+            (k("post_attention_layernorm.weight"), vec![w]),
+            (k("self_attn.q_a_proj.weight"), vec![q_rank, w]),
+            (k("self_attn.q_a_layernorm.weight"), vec![q_rank]),
+            (k("self_attn.q_b_proj.weight"), vec![heads * qk, q_rank]),
+            (
+                k("self_attn.kv_a_proj_with_mqa.weight"),
+                vec![kv_rank + rope, w],
+            ),
+            (k("self_attn.kv_a_layernorm.weight"), vec![kv_rank]),
+            (
+                k("self_attn.kv_b_proj.weight"),
+                vec![heads * (nope + v), kv_rank],
+            ),
+            (k("self_attn.o_proj.weight"), vec![w, heads * v]),
+        ]);
+        if indexer {
+            let (hi, di) = (n("index_n_heads"), n("index_head_dim"));
+            shapes.extend([
+                (k("self_attn.indexer.wq_b.weight"), vec![hi * di, q_rank]),
+                (k("self_attn.indexer.wk.weight"), vec![di, w]),
+                (k("self_attn.indexer.k_norm.weight"), vec![di]),
+                (k("self_attn.indexer.k_norm.bias"), vec![di]),
+                (k("self_attn.indexer.weights_proj.weight"), vec![hi, w]),
+            ]);
+        }
+        if l < n("first_k_dense_replace") {
+            shapes.extend([
+                (k("mlp.gate_proj.weight"), vec![dense_inter, w]),
+                (k("mlp.up_proj.weight"), vec![dense_inter, w]),
+                (k("mlp.down_proj.weight"), vec![w, dense_inter]),
+            ]);
+            continue;
+        }
+        shapes.push((k("mlp.gate.weight"), vec![experts, w]));
+        if bias {
+            shapes.push((k("mlp.gate.e_score_correction_bias"), vec![experts]));
+        }
+        shapes.extend([
+            (k("mlp.shared_experts.gate_proj.weight"), vec![shared, w]),
+            (k("mlp.shared_experts.up_proj.weight"), vec![shared, w]),
+            (k("mlp.shared_experts.down_proj.weight"), vec![w, shared]),
+        ]);
+        for e in 0..experts {
+            for (proj, shape) in [
+                ("gate_proj", [moe_inter, w]),
+                ("up_proj", [moe_inter, w]),
+                ("down_proj", [w, moe_inter]),
+            ] {
+                shapes.push((k(&format!("mlp.experts.{e}.{proj}.weight")), shape.to_vec()));
+            }
+        }
+    }
+    shapes
+}
+
+fn fixture() -> Fixture {
+    let config = fixture_config();
+    let shapes = hf_shapes(&config, false, false);
+    Fixture::bf16(config, shapes)
+}
+
+// ---- test references ---------------------------------------------------------------------------
+// The interleaved RoPE, its YaRN tables written from HF's `_compute_yarn_parameters` and the dense
+// SwiGLU block that deepseek4's and qwen3.8's tests compare against (held for POOT-568 and 572).
 
 /// DeepSeek's interleaved-pair RoPE (module docs, item 6): each adjacent pair `(x[2i], x[2i+1])`
 /// rotates by its own angle, unlike [`poot_graph_ir::ops::rope`]'s half-split pairing
@@ -554,6 +1138,7 @@ pub(crate) fn mla_query_proj(
 /// `poot_models::gpt_oss::gptoss_ffn` does), rotate elementwise, then reshape each half to
 /// `[.., D/2, 1]` and `concat` on the new trailing axis to reinterleave (the row-major flatten of
 /// `[.., D/2, 2]` is the interleaved order).
+#[cfg(test)]
 pub(crate) fn rope_interleave_apply(b: &Builder, x: Traced, cos: Traced, sin: Traced) -> Traced {
     let shape = b.aval(x).shape;
     let d = *shape.last().expect("rope on a scalar");
@@ -588,6 +1173,7 @@ pub(crate) fn rope_interleave_apply(b: &Builder, x: Traced, cos: Traced, sin: Tr
 
 /// [`rope_interleave_apply`] for a full sequence `x[.., L, D]` at positions `0..L`; the interleaved
 /// analog of [`poot_graph_ir::ops::rope_prefill`].
+#[cfg(test)]
 pub(crate) fn rope_interleaved_prefill(
     b: &Builder,
     x: Traced,
@@ -602,6 +1188,7 @@ pub(crate) fn rope_interleaved_prefill(
 
 /// [`rope_interleave_apply`] for one decode step at a runtime `pos`; the interleaved analog of
 /// [`poot_graph_ir::ops::rope`].
+#[cfg(test)]
 pub(crate) fn rope_interleaved_decode(
     b: &Builder,
     x: Traced,
@@ -614,30 +1201,42 @@ pub(crate) fn rope_interleaved_decode(
     rope_interleave_apply(b, x, cos, sin)
 }
 
-/// Batched-decode analog of [`rope_interleaved_decode`]: `pos` is a `[batch]` vector, as
-/// [`poot_graph_ir::ops::rope_batched`] relates to [`poot_graph_ir::ops::rope`] (spec 269).
+#[cfg(test)]
+/// YaRN RoPE-scaling parameters of the reference tables.
 ///
-/// `rope_interleaved_decode` gathers `cos`/`sin` with `gather_scalar`, giving rank-1 `[D/2]` that
-/// broadcasts against `x`'s trailing axis. A plain `gather` with a `[batch]` `pos` gives
-/// `[batch, D/2]`, which right-aligned broadcasting against `x[batch, H, 1, D/2]` places on the
-/// query-length axis and fails a later reshape for `batch > 1`. This function gathers, then reshapes to
-/// `[batch, 1, 1, D/2]` before calling [`rope_interleave_apply`], as `rope_batched` does.
-pub(crate) fn rope_interleaved_decode_batched(
-    b: &Builder,
-    x: Traced,
-    cos_table: Traced,
-    sin_table: Traced,
-    pos: Traced,
-    batch: usize,
-) -> Traced {
-    let rot = *b.aval(cos_table).shape.last().expect("rope table rank>=1");
-    let cos = b.gather(cos_table, 0, pos); // [batch, D/2]
-    let sin = b.gather(sin_table, 0, pos);
-    let cos = b.reshape(cos, vec![batch, 1, 1, rot]);
-    let sin = b.reshape(sin, vec![batch, 1, 1, rot]);
-    rope_interleave_apply(b, x, cos, sin)
+/// Two separate corrections from `modeling_deepseek_v2.py`:
+/// 1. **The RoPE table** (`DeepseekV2RotaryEmbedding`/`_compute_yarn_parameters`, see
+///    `poot_llm::gguf::yarn_inv_freq`): an NTK-by-parts ramp blending extrapolated (unscaled) and
+///    interpolated (divided by `factor`) per-frequency values, plus a constant `attention_factor`
+///    multiplier on the cos/sin table (`freqs_cis * self.attention_scaling`).
+/// 2. **The attention softmax scale** (`self.scaling = yarn_apply_mscale(config.rope_parameters,
+///    self.qk_head_dim ** (-0.5))`): a `mscale^2` correction from `mscale_all_dim` on top of
+///    `qk_head_dim^-0.5`, applied whenever `rope_scaling.type != "default"`
+///    (`yarn_get_mscale(factor, mscale_all_dim)`, squared); see `softmax_mscale_sq`.
+///
+/// These are different scalars. V2-Lite's `mscale == mscale_all_dim == 0.707` gives
+/// `attention_factor == 1.0` while `softmax_mscale_sq` is still ~1.59 (`get_mscale(40, 0.707)^2`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct DeepseekV2Yarn {
+    /// context-extension factor (`rope_scaling.factor`).
+    pub factor: f32,
+    /// NTK-by-parts ramp low-end, extrapolation side (`rope_scaling.beta_fast`, HF default 32).
+    pub beta_fast: f32,
+    /// NTK-by-parts ramp high-end, interpolation side (`rope_scaling.beta_slow`, HF default 1).
+    pub beta_slow: f32,
+    /// the checkpoint's pretrained context length (`rope_scaling.original_max_position_embeddings`).
+    pub original_max_position_embeddings: usize,
+    /// the RoPE table's cos/sin magnitude multiplier, as resolved by the loader: an explicit
+    /// `rope_scaling.attention_factor` if present, else `get_mscale(factor, mscale) /
+    /// get_mscale(factor, mscale_all_dim)` when both `mscale` and `mscale_all_dim` are nonzero, else the
+    /// generic YaRN default `get_mscale(factor, 1.0)`.
+    pub attention_factor: f32,
+    /// the extra softmax-scale correction: `get_mscale(factor, mscale_all_dim)^2` when
+    /// `rope_scaling.mscale_all_dim` is nonzero, else `1.0`.
+    pub softmax_mscale_sq: f32,
 }
 
+#[cfg(test)]
 /// The dense per-layer MLP for layers `< first_k_dense_replace`: SwiGLU without bias
 /// (`DeepseekV2MLP`), `linear -> linear -> swiglu -> linear`.
 pub(crate) fn deepseek2_dense_ffn(
@@ -651,190 +1250,13 @@ pub(crate) fn deepseek2_dense_ffn(
     let wg = b.constant(&p("mlp.gate_proj.weight"), TensorType::f32(vec![h, inter]));
     let wu = b.constant(&p("mlp.up_proj.weight"), TensorType::f32(vec![h, inter]));
     let wd = b.constant(&p("mlp.down_proj.weight"), TensorType::f32(vec![inter, h]));
-    let g = linear(b, normed, wg, None);
-    let u = linear(b, normed, wu, None);
+    let g = poot_graph_ir::ops::linear(b, normed, wg, None);
+    let u = poot_graph_ir::ops::linear(b, normed, wu, None);
     let act = swiglu(b, g, u);
-    linear(b, act, wd, None)
+    poot_graph_ir::ops::linear(b, act, wd, None)
 }
 
-/// One MoE layer's MLP (`li >= first_k_dense_replace`): [`deepseek2_router_gate`]'s routed top-k
-/// experts in dense form (every expert evaluated, non-selected zero-weighted, as
-/// `crate::olmoe::olmoe_ffn`/`poot_graph_ir::ops::moe_dense`) plus `mp.n_shared_experts` shared
-/// experts (one SwiGLU MLP of width `moe_inter * n_shared_experts`), summed without a gate.
-fn deepseek2_moe_ffn(
-    b: &Builder,
-    normed: Traced,
-    h: usize,
-    mp: &DeepseekV2MoeParams,
-    li: usize,
-) -> Traced {
-    let p = |s: &str| format!("model.layers.{li}.{s}");
-    let e = mp.n_routed_experts;
-    let k = mp.top_k;
-    let inter = mp.moe_inter;
-
-    let router_w = b.constant(&p("mlp.gate.weight"), TensorType::f32(vec![h, e]));
-    let w_in = b.constant(
-        &p("mlp.experts.gate_up_proj.weight"),
-        TensorType::f32(vec![e, h, 2 * inter]),
-    );
-    let w_out = b.constant(
-        &p("mlp.experts.down_proj.weight"),
-        TensorType::f32(vec![e, inter, h]),
-    );
-
-    let shape = b.aval(normed).shape;
-    let l = shape[shape.len() - 2];
-    let xm = b.reshape(normed, vec![l, h]);
-
-    let logits = linear(b, xm, router_w, None);
-    let gate = deepseek2_router_gate(
-        b,
-        logits,
-        k,
-        mp.n_group,
-        mp.topk_group,
-        mp.routed_scaling_factor,
-    ); // [L, E]
-
-    let x_e = b.broadcast(b.reshape(xm, vec![1, l, h]), vec![e, l, h]); // [E,L,H]
-    let gu = b.matmul(x_e, w_in); // [E,L,2I]
-    let g_part = b.slice(gu, 2, 0, inter);
-    let u_part = b.slice(gu, 2, inter, 2 * inter);
-    let act = swiglu(b, g_part, u_part);
-    let out = b.matmul(act, w_out); // [E,L,H]
-
-    let gate_w = b.reshape(b.transpose(gate, vec![1, 0]), vec![e, l, 1]); // [E,L,1]
-    let weighted = b.binary(BinOp::Mul, out, gate_w);
-    let weighted_t = b.transpose(weighted, vec![1, 2, 0]); // [L,H,E]
-    let routed = b.reduce(poot_graph_ir::RedOp::Sum, weighted_t, 2, false); // [L,H]
-    let routed = b.reshape(routed, vec![1, l, h]);
-
-    if mp.n_shared_experts == 0 {
-        return routed;
-    }
-    let shared_inter = mp.moe_inter * mp.n_shared_experts;
-    let wsg = b.constant(
-        &p("mlp.shared_experts.gate_proj.weight"),
-        TensorType::f32(vec![h, shared_inter]),
-    );
-    let wsu = b.constant(
-        &p("mlp.shared_experts.up_proj.weight"),
-        TensorType::f32(vec![h, shared_inter]),
-    );
-    let wsd = b.constant(
-        &p("mlp.shared_experts.down_proj.weight"),
-        TensorType::f32(vec![shared_inter, h]),
-    );
-    let sg = linear(b, normed, wsg, None);
-    let su = linear(b, normed, wsu, None);
-    let sact = swiglu(b, sg, su);
-    let shared = linear(b, sact, wsd, None); // [1,L,H]
-
-    b.binary(BinOp::Add, routed, shared)
-}
-
-/// DeepSeek's routed-expert gate (`DeepseekV2TopkRouter.forward` and the `topk_method:
-/// "group_limited_greedy"` branch of `MoEGate.forward` in `deepseek-ai/DeepSeek-V2`'s
-/// `modeling_deepseek.py`, card 296): `scores = softmax(logits)` over all `E` experts. Group limiting
-/// runs before expert selection: `group_scores = scores.view(.., n_group, -1).max(-1)` (plain max per
-/// group; V3 in `crate::deepseek3::deepseek3_router_gate` uses sum-of-top-2),
-/// `group_idx = topk(group_scores, topk_group)`, and experts outside a selected group are masked to
-/// `0.0` in the reference (safe since softmax is strictly positive). Softmax is monotonic with a
-/// common denominator, so this operates on `logits` for both group and expert ranking. The graph gives
-/// eligible groups lexicographic priority before expert score, matching the `0.0`-fill without an
-/// additive sentinel that could collide with canonical `f32::MIN`. The denominator still covers every
-/// expert, as the reference softmax runs once before masking.
-///
-/// `topk` then selects the `k` largest eligible positions (raw softmax values, not renormalized:
-/// the masked-numerator-over-full-denominator construction of `crate::olmoe::olmoe_top_k_gate` with
-/// `norm_topk_prob=false`), scaled by `routed_scaling_factor`. Ranking, numerator and denominator use
-/// the same canonical finite scores. Selection uses [`poot_graph_ir::ops::stable_descending_rank`]
-/// and [`poot_graph_ir::ops::stable_descending_rank_masked`]; DSA/CSA/QSA attention ranking is
-/// unchanged.
-///
-/// `n_group=1` (V2-Lite) and `topk_group=n_group` are no-ops: a single group always ranks `0` and is
-/// kept, so this degenerates bit-for-bit to plain top-k (checked by the CPU-oracle tests).
-fn deepseek2_router_gate(
-    b: &Builder,
-    x: Traced,
-    k: usize,
-    n_group: usize,
-    topk_group: usize,
-    routed_scaling_factor: f32,
-) -> Traced {
-    deepseek2_router_gate_and_mask(b, x, k, n_group, topk_group, routed_scaling_factor).0
-}
-
-fn deepseek2_router_gate_and_mask(
-    b: &Builder,
-    x: Traced,
-    k: usize,
-    n_group: usize,
-    topk_group: usize,
-    routed_scaling_factor: f32,
-) -> (Traced, Traced) {
-    let shape = b.aval(x).shape;
-    let e = *shape.last().expect("router logits have an expert axis");
-    let last = shape.len() - 1;
-    assert!(
-        n_group > 0 && e.is_multiple_of(n_group),
-        "n_routed_experts ({e}) must be evenly divisible by n_group ({n_group})"
-    );
-    let group_size = e / n_group;
-    assert!(
-        topk_group > 0 && topk_group <= n_group,
-        "topk_group must be in 1..=n_group"
-    );
-    assert!(
-        k > 0 && k <= topk_group * group_size,
-        "top_k must fit in the selected expert groups"
-    );
-
-    // Ranking, numerator and denominator share one finite canonical score domain: keeps
-    // norm_topk_prob=false semantics and avoids inf-inf NaNs.
-    let scores = poot_graph_ir::ops::canonical_router_scores(b, x);
-
-    // Group-limited routing (topk_method "group_limited_greedy"): group score is the max logit per
-    // group (monotonic with max softmax); keep the topk_group best groups.
-    let mut group_shape = shape.clone();
-    group_shape[last] = n_group;
-    group_shape.push(group_size); // [.., n_group, group_size]
-    let x_grouped = b.reshape(scores, group_shape.clone());
-    let group_scores = b.reduce(poot_graph_ir::RedOp::Max, x_grouped, last + 1, false); // [.., n_group]
-
-    let group_rank = poot_graph_ir::ops::stable_descending_rank(b, group_scores);
-    let group_keep = poot_graph_ir::ops::top_k_keep_mask(b, group_rank, topk_group);
-
-    let mut group_keep_shape = shape.clone();
-    group_keep_shape[last] = n_group;
-    group_keep_shape.push(1);
-    let group_keep_r = b.reshape(group_keep, group_keep_shape);
-    let group_keep_b = b.broadcast(group_keep_r, group_shape);
-    let expert_keep = b.reshape(group_keep_b, shape.clone()); // [.., E], 1.0 iff expert's group is selected
-
-    // Mask-aware lexicographic rank: eligible experts first, no additive sentinel at f32 endpoints.
-    let rank = poot_graph_ir::ops::stable_descending_rank_masked(b, scores, expert_keep);
-    let keep = poot_graph_ir::ops::top_k_keep_mask(b, rank, k);
-    let m = b.reduce(poot_graph_ir::RedOp::Max, scores, last, true);
-    let ex_full = b.unary(poot_graph_ir::UnOp::Exp, b.binary(BinOp::Sub, scores, m));
-    let ex_masked = b.binary(BinOp::Mul, ex_full, keep);
-
-    // Non-renormalized shape: the softmax denominator covers all E experts (the reference softmax
-    // runs before group masking).
-    let denom = b.reduce(poot_graph_ir::RedOp::Sum, ex_full, last, true);
-    let gate = b.binary(BinOp::Div, ex_masked, denom);
-
-    (
-        b.binary_scalar(
-            BinOp::Mul,
-            gate,
-            poot_graph_ir::Scalar::F32(routed_scaling_factor),
-        ),
-        keep,
-    )
-}
-
+#[cfg(test)]
 /// Build the interleaved-pair RoPE table for DeepSeek's decoupled-rope slice: `cos`/`sin`
 /// `[max_pos, rope_dim/2]`, one angle per pair. Shared by this module's CPU-oracle test and (via
 /// `poot_llm::runner`) the safetensors loader, so the table math has one definition.
@@ -843,7 +1265,7 @@ fn deepseek2_router_gate_and_mask(
 /// `attention_factor` scale of `poot_llm::gguf::yarn_inv_freq` (verified against an f64 reference by
 /// `yarn_matches_hf_reference_formula`), on an interleaved table (see [`DeepseekV2Yarn`]). The math is
 /// duplicated here because `poot-models` must not depend on `poot-llm`.
-pub fn deepseek2_rope_tables_interleaved(
+pub(crate) fn deepseek2_rope_tables_interleaved(
     max_pos: usize,
     rope_dim: usize,
     theta: f32,
@@ -864,6 +1286,7 @@ pub fn deepseek2_rope_tables_interleaved(
     (cos, sin)
 }
 
+#[cfg(test)]
 /// The inv_freq/attention_factor computation shared by [`deepseek2_rope_tables_interleaved`]
 /// (interleaved-pair layout) and `crate::deepseek32`'s Lightning Indexer RoPE table (half-split layout,
 /// spec 277). Both use the same frequencies: in `deepseek-ai/DeepSeek-V3.2-Exp`'s `inference/model.py`,
@@ -917,1246 +1340,586 @@ pub(crate) fn deepseek2_rope_inv_freq(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod family_tests {
+    //! The rows every DeepSeek MLA family owes, parameterized by its entry and fixture so
+    //! `deepseek3` and `deepseek32` run the same ones.
+
+    use poot_graph_ir::OpKind;
+    use poot_graph_plan::{WeightFormats, bind_packed_weights};
+    use poot_load::gguf::GgufValue;
+    use poot_quant::weights::{HandleFormat, WeightEntry};
+    use serde_json::json;
+
     use super::*;
-    use poot_graph_ir::Storage;
+    use crate::components::standard::oracle::run_step;
+    use crate::components::testing::{
+        CAP, assert_chunked_prefill_equals_decode, assert_missing_weight_is_named, build, close,
+        close_all, decoded, f32_entry, gguf_tensor, greedy_tokens, q8_0_store, read_back_owned,
+        step_shape, values,
+    };
+    use crate::model::LogitRows;
+    use crate::registry::Registry;
 
-    fn tiny_cfg(q_lora_rank: Option<usize>) -> DeepseekV2Config {
-        // v_head_dim differs from qk_nope+qk_rope (independent V width), qk_rope_head_dim is even
-        // (interleaved pairs), q_lora_rank is covered both ways by the two configs below.
-        DeepseekV2Config {
-            vocab: 24,
-            hidden: 16,
-            layers: 3,
-            n_heads: 4,
-            q_lora_rank,
-            kv_lora_rank: 6,
-            qk_nope_head_dim: 5,
-            qk_rope_head_dim: 4,
-            v_head_dim: 7,
-            eps: 1e-5,
-            max_pos: 32,
-            rope_theta: 10_000.0,
-            yarn: None,
+    /// The projections a Q8_0 copy packs: every HF `*_proj.weight` whose input width is a block
+    /// multiple.
+    fn is_packable(store: &WeightStore) -> impl Fn(&str) -> bool + '_ {
+        |key| {
+            key.ends_with("_proj.weight")
+                && store
+                    .get(key)
+                    .is_some_and(|e| e.shape().len() == 2 && e.shape()[1] % 32 == 0)
         }
     }
 
-    fn tiny_mp(first_k_dense_replace: usize, routed_scaling_factor: f32) -> DeepseekV2MoeParams {
-        DeepseekV2MoeParams {
-            n_routed_experts: 6,
-            top_k: 2,
-            moe_inter: 8,
-            n_shared_experts: 2,
-            dense_inter: 10,
-            first_k_dense_replace,
-            routed_scaling_factor,
-            // n_group=1, topk_group=1: group limiting is a no-op (V2-Lite); the group-limited tests
-            // (card 296) use a dedicated fixture.
-            n_group: 1,
-            topk_group: 1,
+    /// SC-004 (F6): a store missing one required tensor, the MLA latent, an expert's projection, the
+    /// router and the head included, fails `Registry::build` with the typed missing-weight error
+    /// naming it, before any trace. Mutation: skip the row check in `map_moe_layer`; red.
+    pub(crate) fn assert_missing_tensors_are_named(fixture: &Fixture, removed: &[&str]) {
+        let registry = Registry::builtin().unwrap();
+        for removed in removed {
+            assert_missing_weight_is_named(&registry, fixture, removed);
         }
     }
 
-    #[test]
-    fn deepseek2_prefill_validates_q_lora_and_dense_moe_split() {
-        let cfg = tiny_cfg(Some(3));
-        let mp = tiny_mp(1, 1.7);
-        let g = trace_deepseek2_prefill(cfg, mp, 5);
-        g.validate()
-            .expect("deepseek2 prefill graph should validate");
-        assert_eq!(g.aval(g.output).shape, vec![1, 1, cfg.vocab]);
-
-        // q_lora_rank Some: q_a_proj/q_a_layernorm/q_b_proj present, no q_proj.
-        let has_name = |suf: &str| {
-            g.inputs.iter().any(|id| {
-                matches!(g.values[*id].storage, Storage::Const)
-                    && g.values[*id]
-                        .name
-                        .as_deref()
-                        .is_some_and(|n| n.ends_with(suf))
-            })
-        };
-        assert!(has_name("self_attn.q_a_proj.weight"));
-        assert!(has_name("self_attn.q_a_layernorm.weight"));
-        assert!(has_name("self_attn.q_b_proj.weight"));
-        assert!(!has_name("self_attn.q_proj.weight"));
-
-        // Layer 0 is dense (gate/up/down, no router); layers 1,2 route. "mlp.gate_proj" and
-        // "mlp.gate.weight" are distinct names, so check presence counts by layer.
-        let router_count = g
-            .inputs
-            .iter()
-            .filter(|id| {
-                matches!(g.values[**id].storage, Storage::Const)
-                    && g.values[**id]
-                        .name
-                        .as_deref()
-                        .is_some_and(|n| n.ends_with("mlp.gate.weight"))
-            })
-            .count();
-        assert_eq!(
-            router_count, 2,
-            "layers 1,2 route (first_k_dense_replace=1)"
-        );
-        let dense_count = g
-            .inputs
-            .iter()
-            .filter(|id| {
-                matches!(g.values[**id].storage, Storage::Const)
-                    && g.values[**id]
-                        .name
-                        .as_deref()
-                        .is_some_and(|n| n.ends_with("mlp.gate_proj.weight"))
-            })
-            .count();
-        assert_eq!(
-            dense_count, 1,
-            "only layer 0 is dense (first_k_dense_replace=1)"
-        );
-        let shared_count = g
-            .inputs
-            .iter()
-            .filter(|id| {
-                matches!(g.values[**id].storage, Storage::Const)
-                    && g.values[**id]
-                        .name
-                        .as_deref()
-                        .is_some_and(|n| n.ends_with("shared_experts.gate_proj.weight"))
-            })
-            .count();
-        assert_eq!(shared_count, 2, "one shared-expert MLP per MoE layer");
+    /// Chunked prefill continuing from `Pos` equals token-by-token decode at every logit and every
+    /// carried cache element (the one body serves both phases).
+    pub(crate) fn assert_chunks_equal_decode(entry: &FamilyEntry, fixture: &Fixture) {
+        let model = build(entry, &fixture.raw(), &fixture.store);
+        assert_chunked_prefill_equals_decode(&*model, &fixture.store);
     }
 
-    #[test]
-    fn deepseek2_prefill_validates_plain_q_proj_when_no_q_lora() {
-        let cfg = tiny_cfg(None);
-        let mp = tiny_mp(1, 1.0);
-        let g = trace_deepseek2_prefill(cfg, mp, 4);
-        g.validate()
-            .expect("deepseek2 prefill graph should validate");
-        let has_name = |suf: &str| {
-            g.inputs.iter().any(|id| {
-                matches!(g.values[*id].storage, Storage::Const)
-                    && g.values[*id]
-                        .name
-                        .as_deref()
-                        .is_some_and(|n| n.ends_with(suf))
-            })
-        };
-        assert!(has_name("self_attn.q_proj.weight"));
-        assert!(!has_name("self_attn.q_a_proj.weight"));
-    }
-
-    #[test]
-    fn deepseek2_decode_kv_masked_validates_compressed_cache_shapes() {
-        let cfg = tiny_cfg(Some(3));
-        let mp = tiny_mp(1, 1.0);
-        let cap = 16;
-        let g = trace_deepseek2_decode_kv_masked(cfg, mp, cap);
-        g.validate()
-            .expect("deepseek2 decode graph should validate");
-        assert_eq!(g.aval(g.output).shape, vec![1, 1, cfg.vocab]);
-        assert_eq!(g.state.len(), 2 * cfg.layers);
-        // The compressed cache is shared across heads (head dim 1) and much narrower than a per-head
-        // cache (kv_lora_rank=6 / qk_rope_head_dim=4 vs n_heads*(qk_head_dim or v_head_dim) = 36 or 28).
-        for (i, (si, _so)) in g.state.iter().enumerate() {
-            let shape = g.aval(*si).shape.clone();
-            if i % 2 == 0 {
-                assert_eq!(shape, vec![1, 1, cap, cfg.kv_lora_rank], "c_cache shape");
-            } else {
-                assert_eq!(
-                    shape,
-                    vec![1, 1, cap, cfg.qk_rope_head_dim],
-                    "rope_cache shape"
-                );
-            }
-            assert_eq!(g.values[*si].storage, Storage::State);
-        }
-        let mask_id = g
-            .inputs
-            .iter()
-            .find(|id| matches!(g.values[**id].storage, Storage::Slot(Slot::Mask)))
-            .expect("Slot::Mask present");
-        assert_eq!(g.values[*mask_id].aval.shape, vec![cap]);
-    }
-
-    // ---- CPU-oracle numerics (poot_eval): decomposition checked against an independent Rust
-    // reference forward pass. ----
-
-    mod cpu_oracle {
-        use super::*;
-        use std::collections::HashMap;
-
-        use poot_test_util::fill;
-
-        use poot_test_util::seed_of;
-
-        fn weight(name: &str, n: usize, ln_gamma: bool) -> Vec<f32> {
-            let raw = fill(n, seed_of(name));
-            if ln_gamma {
-                raw.iter().map(|v| 1.0 + v * 0.05).collect()
-            } else {
-                raw.iter().map(|v| v * 0.1).collect()
-            }
-        }
-
-        /// All constants [`trace_deepseek2_prefill`]/[`trace_deepseek2_decode_kv_masked`] declare, keyed
-        /// by graph const name (both share per-layer names).
-        fn all_weights(
-            cfg: &DeepseekV2Config,
-            mp: &DeepseekV2MoeParams,
-        ) -> HashMap<String, Vec<f32>> {
-            let h = cfg.hidden;
-            let hq = cfg.n_heads;
-            let (nope, rope_d, vd) = (cfg.qk_nope_head_dim, cfg.qk_rope_head_dim, cfg.v_head_dim);
-            let qk_head_dim = cfg.qk_head_dim();
-            let kv_rank = cfg.kv_lora_rank;
-            let mut w = HashMap::new();
-            w.insert(
-                "model.embed_tokens.weight".to_string(),
-                weight("embed", cfg.vocab * h, false),
-            );
-            let (cos, sin) = deepseek2_rope_tables_interleaved(
-                cfg.max_pos,
-                rope_d,
-                cfg.rope_theta,
-                cfg.yarn.as_ref(),
-            );
-            w.insert("rope.cos".to_string(), cos);
-            w.insert("rope.sin".to_string(), sin);
-            for li in 0..cfg.layers {
-                let p = |s: &str| format!("model.layers.{li}.{s}");
-                w.insert(p("input_layernorm.weight"), weight(&p("ln1"), h, true));
-                w.insert(
-                    p("post_attention_layernorm.weight"),
-                    weight(&p("ln2"), h, true),
-                );
-                match cfg.q_lora_rank {
-                    Some(r) => {
-                        w.insert(
-                            p("self_attn.q_a_proj.weight"),
-                            weight(&p("qa"), h * r, false),
-                        );
-                        w.insert(
-                            p("self_attn.q_a_layernorm.weight"),
-                            weight(&p("qaln"), r, true),
-                        );
-                        w.insert(
-                            p("self_attn.q_b_proj.weight"),
-                            weight(&p("qb"), r * hq * qk_head_dim, false),
-                        );
-                    }
-                    None => {
-                        w.insert(
-                            p("self_attn.q_proj.weight"),
-                            weight(&p("q"), h * hq * qk_head_dim, false),
-                        );
-                    }
-                }
-                w.insert(
-                    p("self_attn.kv_a_proj_with_mqa.weight"),
-                    weight(&p("kva"), h * (kv_rank + rope_d), false),
-                );
-                w.insert(
-                    p("self_attn.kv_a_layernorm.weight"),
-                    weight(&p("kvaln"), kv_rank, true),
-                );
-                w.insert(
-                    p("self_attn.kv_b_proj.weight"),
-                    weight(&p("kvb"), kv_rank * hq * (nope + vd), false),
-                );
-                w.insert(
-                    p("self_attn.o_proj.weight"),
-                    weight(&p("o"), hq * vd * h, false),
-                );
-                if mp.is_moe_layer(li) {
-                    w.insert(
-                        p("mlp.gate.weight"),
-                        weight(&p("router"), h * mp.n_routed_experts, false),
-                    );
-                    let e = mp.n_routed_experts;
-                    let inter = mp.moe_inter;
-                    let mut gate_up = vec![0.0f32; e * h * 2 * inter];
-                    let mut down = vec![0.0f32; e * inter * h];
-                    for ei in 0..e {
-                        let g = weight(&p(&format!("e{ei}.gate")), h * inter, false);
-                        let u = weight(&p(&format!("e{ei}.up")), h * inter, false);
-                        let d_ = weight(&p(&format!("e{ei}.down")), inter * h, false);
-                        for row in 0..h {
-                            let dst = (ei * h + row) * 2 * inter;
-                            gate_up[dst..dst + inter]
-                                .copy_from_slice(&g[row * inter..(row + 1) * inter]);
-                            gate_up[dst + inter..dst + 2 * inter]
-                                .copy_from_slice(&u[row * inter..(row + 1) * inter]);
-                        }
-                        let dst = ei * inter * h;
-                        down[dst..dst + inter * h].copy_from_slice(&d_);
-                    }
-                    w.insert(p("mlp.experts.gate_up_proj.weight"), gate_up);
-                    w.insert(p("mlp.experts.down_proj.weight"), down);
-                    if mp.n_shared_experts > 0 {
-                        let shared_inter = mp.moe_inter * mp.n_shared_experts;
-                        w.insert(
-                            p("mlp.shared_experts.gate_proj.weight"),
-                            weight(&p("sg"), h * shared_inter, false),
-                        );
-                        w.insert(
-                            p("mlp.shared_experts.up_proj.weight"),
-                            weight(&p("su"), h * shared_inter, false),
-                        );
-                        w.insert(
-                            p("mlp.shared_experts.down_proj.weight"),
-                            weight(&p("sd"), shared_inter * h, false),
-                        );
-                    }
-                } else {
-                    w.insert(
-                        p("mlp.gate_proj.weight"),
-                        weight(&p("dg"), h * mp.dense_inter, false),
-                    );
-                    w.insert(
-                        p("mlp.up_proj.weight"),
-                        weight(&p("du"), h * mp.dense_inter, false),
-                    );
-                    w.insert(
-                        p("mlp.down_proj.weight"),
-                        weight(&p("dd"), mp.dense_inter * h, false),
-                    );
-                }
-            }
-            w.insert("model.norm.weight".to_string(), weight("ln_f", h, true));
-            w.insert(
-                "lm_head.weight".to_string(),
-                weight("lm_head", h * cfg.vocab, false),
-            );
-            w
-        }
-
-        use poot_test_util::rmsnorm_ref;
-
-        use poot_test_util::silu_ref;
-
-        use poot_test_util::linear_ref;
-
-        // Interleaved-pair rotation (module docs, item 6): pairs `(x[2i],x[2i+1])`, not the half-split
-        // `rope_ref` used elsewhere. Shared by the DeepSeek family tests (`crate::reference_ops`).
-        use crate::reference_ops::rope_interleaved_ref;
-
-        /// Independent MLA attention for one query position `qpos` over key positions `0..=kpos_max`:
-        /// decompress c_kv/k_pe to per-head K/V (kv_b_proj + shared-rope broadcast), then scaled
-        /// dot-product attention.
-        #[allow(clippy::too_many_arguments)]
-        fn mla_attend_ref(
-            cfg: &DeepseekV2Config,
-            q_full: &[Vec<f32>], // [Hq][qk_head_dim] for this ONE query position
-            c_kv_cache: &[Vec<f32>], // [kpos][kv_lora_rank], positions 0..=kpos_max
-            k_pe_cache: &[Vec<f32>], // [kpos][rope_dim], ALREADY ROTATED
-            kv_b_w: &[f32],
-            scale: f32,
-        ) -> Vec<f32> {
-            let (hq, nope, vd, rope_d) = (
-                cfg.n_heads,
-                cfg.qk_nope_head_dim,
-                cfg.v_head_dim,
-                cfg.qk_rope_head_dim,
-            );
-            let kv_rank = cfg.kv_lora_rank;
-            let s = c_kv_cache.len();
-            // decompress every cached position to per-head nope+v
-            let mut k_nope = vec![vec![vec![0.0f32; nope]; s]; hq]; // [h][t][nope]
-            let mut v = vec![vec![vec![0.0f32; vd]; s]; hq];
-            for (t, c) in c_kv_cache.iter().enumerate() {
-                let expanded = linear_ref(c, kv_b_w, kv_rank, hq * (nope + vd));
-                for hh in 0..hq {
-                    let base = hh * (nope + vd);
-                    k_nope[hh][t].copy_from_slice(&expanded[base..base + nope]);
-                    v[hh][t].copy_from_slice(&expanded[base + nope..base + nope + vd]);
-                }
-            }
-            let mut out = vec![0.0f32; hq * vd];
-            for hh in 0..hq {
-                let mut scores = vec![0.0f32; s];
-                for (t, sc) in scores.iter_mut().enumerate() {
-                    let mut dot = 0.0f32;
-                    for i in 0..nope {
-                        dot += q_full[hh][i] * k_nope[hh][t][i];
-                    }
-                    for i in 0..rope_d {
-                        dot += q_full[hh][nope + i] * k_pe_cache[t][i]; // SHARED rope, same for every head
-                    }
-                    *sc = dot * scale;
-                }
-                let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let mut denom = 0.0f32;
-                let mut e = vec![0.0f32; s];
-                for (t, sc) in scores.iter().enumerate() {
-                    e[t] = (sc - m).exp();
-                    denom += e[t];
-                }
-                for i in 0..vd {
-                    let mut acc = 0.0f32;
-                    for (t, ei) in e.iter().enumerate() {
-                        acc += (ei / denom) * v[hh][t][i];
-                    }
-                    out[hh * vd + i] = acc;
-                }
-            }
-            out
-        }
-
-        fn top_k_router_ref(
-            logits: &[f32],
-            top_k: usize,
-            routed_scaling_factor: f32,
-        ) -> Vec<(usize, f32)> {
-            let mut idx: Vec<usize> = (0..logits.len()).collect();
-            idx.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
-            let sel = &idx[..top_k];
-            let m = logits.iter().cloned().fold(f32::MIN, f32::max);
-            let exp_sel: Vec<f32> = sel.iter().map(|&i| (logits[i] - m).exp()).collect();
-            let denom_full: f32 = logits.iter().map(|&v| (v - m).exp()).sum();
-            sel.iter()
-                .zip(exp_sel.iter())
-                .map(|(&i, &ex)| (i, (ex / denom_full) * routed_scaling_factor))
-                .collect()
-        }
-
-        /// Direct-loop reference forward pass for [`trace_deepseek2_prefill`] (last token only), not a
-        /// copy of the graph decomposition.
-        fn deepseek2_prefill_ref(
-            cfg: &DeepseekV2Config,
-            mp: &DeepseekV2MoeParams,
-            tokens: &[usize],
-            w: &HashMap<String, Vec<f32>>,
-        ) -> Vec<f32> {
-            let h = cfg.hidden;
-            let hq = cfg.n_heads;
-            let (nope, rope_d, vd) = (cfg.qk_nope_head_dim, cfg.qk_rope_head_dim, cfg.v_head_dim);
-            let qk_head_dim = cfg.qk_head_dim();
-            let kv_rank = cfg.kv_lora_rank;
-            let scale = cfg.attn_scale();
-            let l = tokens.len();
-            let embed = &w["model.embed_tokens.weight"];
-            let cos = &w["rope.cos"];
-            let sin = &w["rope.sin"];
-            let half = rope_d / 2;
-
-            let mut x: Vec<Vec<f32>> = tokens
-                .iter()
-                .map(|&t| embed[t * h..(t + 1) * h].to_vec())
-                .collect();
-
-            for li in 0..cfg.layers {
-                let p = |s: &str| format!("model.layers.{li}.{s}");
-                let ln1w = &w[&p("input_layernorm.weight")];
-                let normed: Vec<Vec<f32>> = x
-                    .iter()
-                    .map(|row| rmsnorm_ref(row, ln1w, h, cfg.eps))
-                    .collect();
-
-                // Q
-                let q_flat: Vec<Vec<f32>> = match cfg.q_lora_rank {
-                    Some(r) => {
-                        let wqa = &w[&p("self_attn.q_a_proj.weight")];
-                        let wqaln = &w[&p("self_attn.q_a_layernorm.weight")];
-                        let wqb = &w[&p("self_attn.q_b_proj.weight")];
-                        normed
-                            .iter()
-                            .map(|row| {
-                                let qa = linear_ref(row, wqa, h, r);
-                                let qa_n = rmsnorm_ref(&qa, wqaln, r, cfg.eps);
-                                linear_ref(&qa_n, wqb, r, hq * qk_head_dim)
-                            })
-                            .collect()
-                    }
-                    None => {
-                        let wq = &w[&p("self_attn.q_proj.weight")];
-                        normed
-                            .iter()
-                            .map(|row| linear_ref(row, wq, h, hq * qk_head_dim))
-                            .collect()
-                    }
-                };
-                // split per head into nope/rope, rotate rope
-                let mut q_full: Vec<Vec<Vec<f32>>> = vec![vec![vec![0.0f32; qk_head_dim]; hq]; l]; // [pos][h][dim]
-                for (pos, qrow) in q_flat.iter().enumerate() {
-                    for (hh, q_slot) in q_full[pos].iter_mut().enumerate() {
-                        let base = hh * qk_head_dim;
-                        let q_nope = &qrow[base..base + nope];
-                        let q_pe = &qrow[base + nope..base + qk_head_dim];
-                        let q_pe_rot = rope_interleaved_ref(q_pe, cos, sin, pos, half);
-                        q_slot[..nope].copy_from_slice(q_nope);
-                        q_slot[nope..].copy_from_slice(&q_pe_rot);
-                    }
-                }
-
-                // KV: compress, cache compressed, rotate k_pe
-                let wkva = &w[&p("self_attn.kv_a_proj_with_mqa.weight")];
-                let wkvaln = &w[&p("self_attn.kv_a_layernorm.weight")];
-                let wkvb = &w[&p("self_attn.kv_b_proj.weight")];
-                let mut c_kv_cache: Vec<Vec<f32>> = Vec::with_capacity(l);
-                let mut k_pe_cache: Vec<Vec<f32>> = Vec::with_capacity(l);
-                for (pos, row) in normed.iter().enumerate() {
-                    let kva = linear_ref(row, wkva, h, kv_rank + rope_d);
-                    let kv_nope_raw = &kva[..kv_rank];
-                    let k_pe_raw = &kva[kv_rank..];
-                    let c_kv = rmsnorm_ref(kv_nope_raw, wkvaln, kv_rank, cfg.eps);
-                    let k_pe_rot = rope_interleaved_ref(k_pe_raw, cos, sin, pos, half);
-                    c_kv_cache.push(c_kv);
-                    k_pe_cache.push(k_pe_rot);
-                }
-
-                // attention: causal, per query position attends 0..=pos.
-                let mut attn_out = vec![vec![0.0f32; hq * vd]; l];
-                for qpos in 0..l {
-                    let ao = mla_attend_ref(
-                        cfg,
-                        &q_full[qpos],
-                        &c_kv_cache[..=qpos],
-                        &k_pe_cache[..=qpos],
-                        wkvb,
-                        scale,
-                    );
-                    attn_out[qpos] = ao;
-                }
-                let wo = &w[&p("self_attn.o_proj.weight")];
-                for pos in 0..l {
-                    let proj = linear_ref(&attn_out[pos], wo, hq * vd, h);
-                    for c in 0..h {
-                        x[pos][c] += proj[c];
-                    }
-                }
-
-                // FFN
-                let ln2w = &w[&p("post_attention_layernorm.weight")];
-                for row in x.iter_mut().take(l) {
-                    let normed2 = rmsnorm_ref(row, ln2w, h, cfg.eps);
-                    let ffn_out = if mp.is_moe_layer(li) {
-                        let router_w = &w[&p("mlp.gate.weight")];
-                        let gate_up = &w[&p("mlp.experts.gate_up_proj.weight")];
-                        let down = &w[&p("mlp.experts.down_proj.weight")];
-                        let logits = linear_ref(&normed2, router_w, h, mp.n_routed_experts);
-                        let selected =
-                            top_k_router_ref(&logits, mp.top_k, mp.routed_scaling_factor);
-                        let inter = mp.moe_inter;
-                        let mut moe_out = vec![0.0f32; h];
-                        for (e, gate_weight) in selected {
-                            let e_gate_up = &gate_up[e * h * 2 * inter..(e + 1) * h * 2 * inter];
-                            let mut gate_w = vec![0.0f32; h * inter];
-                            let mut up_w = vec![0.0f32; h * inter];
-                            for row_i in 0..h {
-                                let src = row_i * 2 * inter;
-                                gate_w[row_i * inter..(row_i + 1) * inter]
-                                    .copy_from_slice(&e_gate_up[src..src + inter]);
-                                up_w[row_i * inter..(row_i + 1) * inter]
-                                    .copy_from_slice(&e_gate_up[src + inter..src + 2 * inter]);
-                            }
-                            let e_down = &down[e * inter * h..(e + 1) * inter * h];
-                            let gate = linear_ref(&normed2, &gate_w, h, inter);
-                            let up = linear_ref(&normed2, &up_w, h, inter);
-                            let act: Vec<f32> = gate
-                                .iter()
-                                .zip(up.iter())
-                                .map(|(&g, &u)| silu_ref(g) * u)
-                                .collect();
-                            let expert_out = linear_ref(&act, e_down, inter, h);
-                            for c in 0..h {
-                                moe_out[c] += gate_weight * expert_out[c];
-                            }
-                        }
-                        if mp.n_shared_experts > 0 {
-                            let shared_inter = mp.moe_inter * mp.n_shared_experts;
-                            let wsg = &w[&p("mlp.shared_experts.gate_proj.weight")];
-                            let wsu = &w[&p("mlp.shared_experts.up_proj.weight")];
-                            let wsd = &w[&p("mlp.shared_experts.down_proj.weight")];
-                            let sg = linear_ref(&normed2, wsg, h, shared_inter);
-                            let su = linear_ref(&normed2, wsu, h, shared_inter);
-                            let sact: Vec<f32> = sg
-                                .iter()
-                                .zip(su.iter())
-                                .map(|(&g, &u)| silu_ref(g) * u)
-                                .collect();
-                            let shared_out = linear_ref(&sact, wsd, shared_inter, h);
-                            for c in 0..h {
-                                moe_out[c] += shared_out[c];
-                            }
-                        }
-                        moe_out
-                    } else {
-                        let wg = &w[&p("mlp.gate_proj.weight")];
-                        let wu = &w[&p("mlp.up_proj.weight")];
-                        let wd = &w[&p("mlp.down_proj.weight")];
-                        let g = linear_ref(&normed2, wg, h, mp.dense_inter);
-                        let u = linear_ref(&normed2, wu, h, mp.dense_inter);
-                        let act: Vec<f32> = g
-                            .iter()
-                            .zip(u.iter())
-                            .map(|(&gg, &uu)| silu_ref(gg) * uu)
-                            .collect();
-                        linear_ref(&act, wd, mp.dense_inter, h)
-                    };
-                    for c in 0..h {
-                        row[c] += ffn_out[c];
-                    }
-                }
-            }
-
-            let ln_f_w = &w["model.norm.weight"];
-            let last = rmsnorm_ref(&x[l - 1], ln_f_w, h, cfg.eps);
-            let lm_head = &w["lm_head.weight"];
-            linear_ref(&last, lm_head, h, cfg.vocab)
-        }
-
-        fn eval_deepseek2_prefill(
-            g: &Graph,
-            tokens: &[usize],
-            weights: &HashMap<String, Vec<f32>>,
-        ) -> poot_tensor::HostTensor {
-            let mut inputs: HashMap<poot_graph_ir::ValueId, poot_eval::Value> = HashMap::new();
-            for &id in &g.inputs {
-                let meta = g.meta(id);
-                let t = match &meta.storage {
-                    Storage::Slot(Slot::Token) => poot_tensor::HostTensor::i32(
-                        vec![tokens.len()],
-                        tokens.iter().map(|&t| t as i32).collect(),
-                    ),
-                    Storage::Slot(Slot::Mask) => {
-                        let name = meta.name.as_deref().expect("mask slot without a name");
-                        assert_eq!(name, "mask.prefill", "unexpected mask slot {name}");
-                        let l = meta.aval.shape[2];
-                        let mut m = vec![0.0f32; l * l];
-                        for i in 0..l {
-                            for j in 0..l {
-                                m[i * l + j] = if j <= i { 0.0 } else { -1.0e30 };
-                            }
-                        }
-                        poot_tensor::HostTensor::f32(meta.aval.shape.clone(), m)
-                    }
-                    Storage::Const => {
-                        let name = meta.name.as_deref().expect("const without a name");
-                        let data = weights
-                            .get(name)
-                            .unwrap_or_else(|| panic!("no weight bound for {name}"));
-                        poot_tensor::HostTensor::f32(meta.aval.shape.clone(), data.clone())
-                    }
-                    other => panic!("unexpected storage {other:?} in a stateless prefill graph"),
-                };
-                inputs.insert(id, t.into());
-            }
-            poot_eval::eval(
-                g,
-                &inputs,
-                poot_eval::EvalOptions::new(poot_eval::EvalBudget::UNBOUNDED),
-            )
-            .expect("cpu eval")
-            .output
-            .into_host()
-            .expect("dense output")
-        }
-
-        fn assert_matches(got: &poot_tensor::HostTensor, want: &[f32], vocab: usize) {
-            assert_eq!(got.shape(), vec![1, 1, vocab]);
-            poot_test_util::assert_close_rel(got.as_f32().unwrap(), want, 1e-4);
-            assert!(got.as_f32().unwrap().iter().all(|v| v.is_finite()));
-        }
-
-        /// `trace_deepseek2_prefill` matches the independent reference within f32 tolerance, low-rank Q
-        /// branch.
-        #[test]
-        fn deepseek2_prefill_matches_hand_rolled_reference_with_q_lora() {
-            let cfg = tiny_cfg(Some(3));
-            let mp = tiny_mp(1, 1.7);
-            let tokens = [3usize, 7, 1, 9, 15];
-            let weights = all_weights(&cfg, &mp);
-
-            let g = trace_deepseek2_prefill(cfg, mp, tokens.len());
-            let got = eval_deepseek2_prefill(&g, &tokens, &weights);
-            let want = deepseek2_prefill_ref(&cfg, &mp, &tokens, &weights);
-            assert_matches(&got, &want, cfg.vocab);
-            assert!(
-                got.as_f32()
-                    .unwrap()
-                    .iter()
-                    .any(|&v| v != got.as_f32().unwrap()[0])
-            );
-        }
-
-        /// Same oracle with `q_lora_rank: None` (V2-Lite: plain `q_proj`), covering [`mla_query_proj`]'s
-        /// other branch.
-        #[test]
-        fn deepseek2_prefill_matches_hand_rolled_reference_no_q_lora() {
-            let cfg = tiny_cfg(None);
-            let mp = tiny_mp(2, 1.0);
-            let tokens = [2usize, 4, 6, 8, 10, 12];
-            let weights = all_weights(&cfg, &mp);
-
-            let g = trace_deepseek2_prefill(cfg, mp, tokens.len());
-            let got = eval_deepseek2_prefill(&g, &tokens, &weights);
-            let want = deepseek2_prefill_ref(&cfg, &mp, &tokens, &weights);
-            assert_matches(&got, &want, cfg.vocab);
-        }
-
-        /// Every layer dense (`first_k_dense_replace >= layers`).
-        #[test]
-        fn deepseek2_prefill_matches_hand_rolled_reference_all_dense() {
-            let cfg = tiny_cfg(Some(4));
-            let mp = tiny_mp(10, 1.0); // first_k_dense_replace > layers: every layer dense
-            let tokens = [1usize, 2, 3];
-            let weights = all_weights(&cfg, &mp);
-
-            let g = trace_deepseek2_prefill(cfg, mp, tokens.len());
-            let got = eval_deepseek2_prefill(&g, &tokens, &weights);
-            let want = deepseek2_prefill_ref(&cfg, &mp, &tokens, &weights);
-            assert_matches(&got, &want, cfg.vocab);
-        }
-
-        /// The interleaved-pair convention matters: half-split pairing with the same cos/sin values
-        /// must change the output (module docs, item 6).
-        #[test]
-        fn deepseek2_interleaved_rope_differs_from_half_split_pairing() {
-            let cfg = tiny_cfg(Some(3));
-            let mp = tiny_mp(1, 1.0);
-            let tokens = [5usize, 9, 2];
-            let weights = all_weights(&cfg, &mp);
-            let g = trace_deepseek2_prefill(cfg, mp, tokens.len());
-            let interleaved = eval_deepseek2_prefill(&g, &tokens, &weights);
-
-            // Half-split reference: same rope values, x[i]/x[i+half] pairing instead of x[2i]/x[2i+1].
-            // The two coincide only for rope_dim<=2; this test uses rope_dim=4.
-            fn rope_half_split_ref(
-                row: &[f32],
-                cos: &[f32],
-                sin: &[f32],
-                pos: usize,
-                half: usize,
-            ) -> Vec<f32> {
-                let c = &cos[pos * half..(pos + 1) * half];
-                let s = &sin[pos * half..(pos + 1) * half];
-                let mut out = vec![0.0f32; 2 * half];
-                for i in 0..half {
-                    let (a, b) = (row[i], row[half + i]);
-                    out[i] = a * c[i] - b * s[i];
-                    out[half + i] = b * c[i] + a * s[i];
-                }
-                out
-            }
-            // Confirm the output is finite and non-trivial, and that a hand pairing swap on a single
-            // vector differs, showing the conventions are distinct.
-            let half = cfg.qk_rope_head_dim / 2;
-            let sample = [0.7f32, -1.3, 0.4, 0.9];
-            let cos = vec![0.8f32, 0.6];
-            let sin = vec![0.6f32, 0.8];
-            let inter = rope_interleaved_ref(&sample, &cos, &sin, 0, half);
-            let halfsplit = rope_half_split_ref(&sample, &cos, &sin, 0, half);
-            assert_ne!(
-                inter, halfsplit,
-                "interleaved-pair and half-split RoPE must give different results for a non-degenerate input"
-            );
-            assert!(interleaved.as_f32().unwrap().iter().all(|v| v.is_finite()));
-        }
-
-        /// Zeroing `n_shared_experts` (dropping the shared MLP) must change the output.
-        #[test]
-        fn deepseek2_shared_expert_is_load_bearing() {
-            let cfg = tiny_cfg(Some(3));
-            let mp_with = tiny_mp(1, 1.0);
-            let mp_without = DeepseekV2MoeParams {
-                n_shared_experts: 0,
-                ..mp_with
-            };
-            let tokens = [4usize, 6, 8];
-            let weights = all_weights(&cfg, &mp_with); // shared-expert weights present but unused by mp_without
-
-            let g_with = trace_deepseek2_prefill(cfg, mp_with, tokens.len());
-            let g_without = trace_deepseek2_prefill(cfg, mp_without, tokens.len());
-            let out_with = eval_deepseek2_prefill(&g_with, &tokens, &weights);
-            let out_without = eval_deepseek2_prefill(&g_without, &tokens, &weights);
-
-            let max_diff = poot_test_util::max_abs_error(
-                out_with.as_f32().unwrap(),
-                out_without.as_f32().unwrap(),
-            );
-            assert!(
-                max_diff > 1e-4,
-                "shared-expert branch should change the output; max_diff={max_diff:.2e}"
-            );
-        }
-
-        /// `routed_scaling_factor` (`topk_weights *= routed_scaling_factor`) must affect the output.
-        #[test]
-        fn deepseek2_routed_scaling_factor_is_load_bearing() {
-            let cfg = tiny_cfg(Some(3));
-            let mp_a = tiny_mp(1, 1.0);
-            let mp_b = tiny_mp(1, 3.5);
-            let tokens = [2usize, 5, 9];
-            let weights = all_weights(&cfg, &mp_a);
-            let g_a = trace_deepseek2_prefill(cfg, mp_a, tokens.len());
-            let g_b = trace_deepseek2_prefill(cfg, mp_b, tokens.len());
-            let out_a = eval_deepseek2_prefill(&g_a, &tokens, &weights);
-            let out_b = eval_deepseek2_prefill(&g_b, &tokens, &weights);
-            let max_diff =
-                poot_test_util::max_abs_error(out_a.as_f32().unwrap(), out_b.as_f32().unwrap());
-            assert!(
-                max_diff > 1e-4,
-                "routed_scaling_factor should change the output; max_diff={max_diff:.2e}"
-            );
-        }
-
-        /// A V2-Lite-like `DeepseekV2Yarn` (`factor: 40`, `mscale`-derived `attention_factor`/
-        /// `softmax_mscale_sq`) must change both the RoPE table and `DeepseekV2Config::attn_scale`
-        /// relative to plain RoPE, so YaRN cannot silently degrade to plain theta.
-        #[test]
-        fn deepseek2_yarn_scaling_is_load_bearing() {
-            let yarn = DeepseekV2Yarn {
-                factor: 40.0,
-                beta_fast: 32.0,
-                beta_slow: 1.0,
-                original_max_position_embeddings: 4096,
-                attention_factor: 1.3,     // explicit non-1.0 override
-                softmax_mscale_sq: 1.5896, // real V2-Lite's own get_mscale(40, 0.707)^2
-            };
-
-            // RoPE table: yarn's NTK-by-parts ramp + attention_factor must differ from plain theta.
-            let (plain_cos, plain_sin) = deepseek2_rope_tables_interleaved(16, 8, 10_000.0, None);
-            let (yarn_cos, yarn_sin) =
-                deepseek2_rope_tables_interleaved(16, 8, 10_000.0, Some(&yarn));
-            assert_ne!(
-                plain_cos, yarn_cos,
-                "YaRN-scaled cos table must differ from plain-theta RoPE"
-            );
-            assert_ne!(
-                plain_sin, yarn_sin,
-                "YaRN-scaled sin table must differ from plain-theta RoPE"
-            );
-            assert!(
-                yarn_cos.iter().all(|v| v.is_finite()) && yarn_sin.iter().all(|v| v.is_finite())
-            );
-            // Position 0 has angle 0, but attention_factor still scales cos[0] away from 1.0.
-            assert!(
-                (yarn_cos[0] - yarn.attention_factor).abs() < 1e-5,
-                "cos[pos=0] should equal attention_factor exactly: {}",
-                yarn_cos[0]
-            );
-
-            // Softmax scale: attn_scale() must apply softmax_mscale_sq on top of the plain qk_head_dim^-0.5.
-            let cfg_plain = DeepseekV2Config {
-                yarn: None,
-                ..tiny_cfg(Some(3))
-            };
-            let cfg_yarn = DeepseekV2Config {
-                yarn: Some(yarn),
-                ..tiny_cfg(Some(3))
-            };
-            let plain_scale = cfg_plain.attn_scale();
-            let yarn_scale = cfg_yarn.attn_scale();
-            assert!(
-                (yarn_scale - plain_scale * yarn.softmax_mscale_sq).abs() < 1e-6,
-                "yarn attn_scale should be plain_scale * softmax_mscale_sq: {yarn_scale} vs \
-                 {plain_scale}*{}",
-                yarn.softmax_mscale_sq
-            );
-            assert_ne!(plain_scale, yarn_scale);
-        }
-
-        /// End-to-end: `trace_deepseek2_prefill` matches the hand-rolled reference (reading cos/sin from
-        /// the same weights map) with a V2-Lite-shaped YaRN config, so YaRN flows through the full graph.
-        #[test]
-        fn deepseek2_yarn_prefill_matches_hand_rolled_reference() {
-            let yarn = DeepseekV2Yarn {
-                factor: 40.0,
-                beta_fast: 32.0,
-                beta_slow: 1.0,
-                original_max_position_embeddings: 4096,
-                attention_factor: 1.0, // real V2-Lite's own degenerate mscale==mscale_all_dim ratio
-                softmax_mscale_sq: 1.5896,
-            };
-            let cfg = DeepseekV2Config {
-                yarn: Some(yarn),
-                ..tiny_cfg(None)
-            }; // no q_lora, like V2-Lite
-            let mp = tiny_mp(1, 1.0);
-            let tokens = [3usize, 7, 1, 9, 15];
-            let weights = all_weights(&cfg, &mp);
-
-            let g = trace_deepseek2_prefill(cfg, mp, tokens.len());
-            let got = eval_deepseek2_prefill(&g, &tokens, &weights);
-            let want = deepseek2_prefill_ref(&cfg, &mp, &tokens, &weights);
-            assert_matches(&got, &want, cfg.vocab);
-            assert!(
-                got.as_f32()
-                    .unwrap()
-                    .iter()
-                    .any(|&v| v != got.as_f32().unwrap()[0])
-            );
-        }
-
-        /// Decode-vs-prefill consistency: feeding a prompt one token at a time through
-        /// [`trace_deepseek2_decode_kv_masked`] yields, at every position, the logits
-        /// [`trace_deepseek2_prefill`] computes for that prefix. Checks the compressed-latent cache
-        /// round-trips through `dynamic_update_slice_dyn` and per-step `kv_b_proj` decompression.
-        #[test]
-        fn deepseek2_decode_matches_prefill_at_every_position() {
-            let cfg = tiny_cfg(Some(3));
-            let mp = tiny_mp(1, 1.7);
-            let tokens = [3usize, 7, 1, 9, 15, 2];
-            let weights = all_weights(&cfg, &mp);
-            let cap = tokens.len();
-
-            let g_decode = trace_deepseek2_decode_kv_masked(cfg, mp, cap);
-            let mut caches: Vec<poot_tensor::HostTensor> = g_decode
-                .state
-                .iter()
-                .map(|&(si, _)| poot_tensor::HostTensor::zeros(g_decode.aval(si).shape.clone()))
-                .collect();
-
-            for pos in 0..tokens.len() {
-                let mut inputs: HashMap<poot_graph_ir::ValueId, poot_eval::Value> = HashMap::new();
-                for &id in &g_decode.inputs {
-                    let meta = g_decode.meta(id);
-                    let t = match meta.storage {
-                        Storage::Slot(Slot::Token) => {
-                            poot_tensor::HostTensor::i32(vec![], vec![tokens[pos] as i32])
-                        }
-                        Storage::Slot(Slot::Pos) => {
-                            poot_tensor::HostTensor::i32(vec![], vec![pos as i32])
-                        }
-                        Storage::Slot(Slot::SeqLen) => {
-                            poot_tensor::HostTensor::i32(vec![], vec![(pos + 1) as i32])
-                        }
-                        Storage::Slot(Slot::Mask) => {
-                            let cap_n = meta.aval.shape.iter().product::<usize>();
-                            let m: Vec<f32> = (0..cap_n)
-                                .map(|t| if t <= pos { 0.0 } else { -1.0e9 })
-                                .collect();
-                            poot_tensor::HostTensor::f32(meta.aval.shape.clone(), m)
-                        }
-                        Storage::State => continue,
-                        Storage::Const => {
-                            let name = meta.name.as_deref().expect("const without a name");
-                            let data = weights
-                                .get(name)
-                                .unwrap_or_else(|| panic!("no weight for {name}"));
-                            poot_tensor::HostTensor::f32(meta.aval.shape.clone(), data.clone())
-                        }
-                        other => panic!("unexpected storage {other:?}"),
-                    };
-                    inputs.insert(id, t.into());
-                }
-                for (ci, &(si, _)) in g_decode.state.iter().enumerate() {
-                    inputs.insert(si, caches[ci].clone().into());
-                }
-                let step = poot_eval::eval(
-                    &g_decode,
-                    &inputs,
-                    poot_eval::EvalOptions::new(poot_eval::EvalBudget::UNBOUNDED),
+    /// The BF16 store and its Q8_0 copy trace through the one body: the Q8_0 graph holds one
+    /// `PackedDequant` per packed weight and no packed const, and each equals the same body over
+    /// its store decoded to F32, in prefill and a decode step.
+    pub(crate) fn assert_bf16_and_q8_0_trace_and_match(entry: &FamilyEntry, fixture: &Fixture) {
+        let raw = fixture.raw();
+        let prompt = [3, 17, 40, 8];
+        let packed_store = q8_0_store(&fixture.store, is_packable(&fixture.store));
+        for (label, store) in [("bf16", fixture.store.clone()), ("q8_0", packed_store)] {
+            let model = build(entry, &raw, &store);
+            let g = model
+                .trace(
+                    Phase::Prefill,
+                    step_shape(prompt.len(), CAP, LogitRows::All),
                 )
-                .expect("decode step eval");
-                let logits = step.output.into_host().expect("dense output");
-                caches = step
-                    .state
-                    .into_iter()
-                    .map(|v| v.into_host().expect("dense state"))
-                    .collect();
-
-                // the prefill reference for the prefix 0..=pos
-                let prefix: Vec<usize> = tokens[..=pos].to_vec();
-                let g_prefill = trace_deepseek2_prefill(cfg, mp, prefix.len());
-                let prefill_out = eval_deepseek2_prefill(&g_prefill, &prefix, &weights);
-
-                assert_eq!(logits.shape(), vec![1, 1, cfg.vocab]);
-                // decode (actual) vs prefill (expected) at position `pos`
-                poot_test_util::assert_close_rel(
-                    logits.as_f32().unwrap(),
-                    prefill_out.as_f32().unwrap(),
-                    1e-3,
-                );
-            }
-        }
-
-        /// Card 296: independent reference for [`deepseek2_router_gate`]'s group-limited form (see
-        /// `sigmoid_bias_grouped_router_ref` in `crate::deepseek3`): softmax scoring, top-k only over
-        /// experts in the `topk_group` groups with the highest max `logits` (V2's plain max, not V3's
-        /// sum-of-top-2). Not renormalized (`norm_topk_prob: false`).
-        fn softmax_grouped_router_ref(
-            logits: &[f32],
-            n_group: usize,
-            topk_group: usize,
-            top_k: usize,
-            routed_scaling_factor: f32,
-        ) -> Vec<(usize, f32)> {
-            let e = logits.len();
-            assert_eq!(e % n_group, 0);
-            let group_size = e / n_group;
-            let canonical = |v: f32| {
-                if v.is_nan() || v == f32::NEG_INFINITY {
-                    f32::MIN
-                } else if v == f32::INFINITY {
-                    f32::MAX
-                } else if v == 0.0 {
-                    0.0
-                } else {
-                    v
-                }
-            };
-            let scores: Vec<f32> = logits.iter().map(|&v| canonical(v)).collect();
-
-            let mut group_scores = vec![f32::MIN; n_group];
-            for (g, gs) in group_scores.iter_mut().enumerate() {
-                *gs = scores[g * group_size..(g + 1) * group_size]
-                    .iter()
-                    .cloned()
-                    .fold(f32::MIN, f32::max);
-            }
-            let mut group_idx: Vec<usize> = (0..n_group).collect();
-            group_idx.sort_by(|&a, &b| group_scores[b].total_cmp(&group_scores[a]));
-            let selected_groups: std::collections::HashSet<usize> =
-                group_idx[..topk_group].iter().copied().collect();
-
-            let mut idx: Vec<usize> = (0..e)
-                .filter(|&i| selected_groups.contains(&(i / group_size)))
-                .collect();
-            idx.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
-            let sel = &idx[..top_k];
-
-            let m = scores.iter().cloned().fold(f32::MIN, f32::max);
-            let exp_sel: Vec<f32> = sel.iter().map(|&i| (scores[i] - m).exp()).collect();
-            let denom_full: f32 = scores.iter().map(|&v| (v - m).exp()).sum();
-            sel.iter()
-                .zip(exp_sel.iter())
-                .map(|(&i, &ex)| (i, (ex / denom_full) * routed_scaling_factor))
-                .collect()
-        }
-
-        /// Runs a `[1, E]`-logits router-gate graph and returns the raw gate weights.
-        fn eval_router_gate(g: &Graph, logits_data: &[f32]) -> poot_tensor::HostTensor {
-            let mut inputs: HashMap<poot_graph_ir::ValueId, poot_eval::Value> = HashMap::new();
-            for &id in &g.inputs {
-                let meta = g.meta(id);
-                let data = logits_data.to_vec();
-                inputs.insert(
-                    id,
-                    poot_tensor::HostTensor::f32(meta.aval.shape.clone(), data).into(),
-                );
-            }
-            poot_eval::eval(
-                g,
-                &inputs,
-                poot_eval::EvalOptions::new(poot_eval::EvalBudget::UNBOUNDED),
-            )
-            .expect("cpu eval")
-            .output
-            .into_host()
-            .expect("dense output")
-        }
-
-        /// Card 296: `n_group=1` and `topk_group == n_group` are group-limiting no-ops and must match
-        /// plain top-k (`top_k_router_ref`) bit-for-bit, protecting V2-Lite's `n_group: 1`.
-        #[test]
-        fn deepseek2_router_gate_group_limited_degenerates_to_ungated_when_unrestricted() {
-            let e = 6usize;
-            let k = 3usize;
-            let scale = 2.5f32;
-            let logits_data = [0.3f32, -1.2, 2.1, -0.4, 0.9, -2.5];
-
-            let eval_with = |n_group: usize, topk_group: usize| -> poot_tensor::HostTensor {
-                let b = Builder::new();
-                let logits = b.constant("logits", TensorType::f32(vec![1, e]));
-                let gate = deepseek2_router_gate(&b, logits, k, n_group, topk_group, scale);
-                let g = b.finish(gate);
-                eval_router_gate(&g, &logits_data)
-            };
-
-            let one_group = eval_with(1, 1); // n_group=1: single group, trivially selected
-            let all_groups = eval_with(6, 6); // n_group=6, topk_group=6: six 1-expert groups, all selected
-
-            for (i, (&a, &b2)) in one_group
-                .as_f32()
-                .unwrap()
+                .unwrap();
+            let packed = model
+                .weights()
                 .iter()
-                .zip(all_groups.as_f32().unwrap().iter())
-                .enumerate()
-            {
-                assert_eq!(
-                    a.to_bits(),
-                    b2.to_bits(),
-                    "index {i}: n_group=1 ({a}) and topk_group=n_group=6 ({b2}) should be bit-exact"
-                );
-            }
+                .filter(|(_, _, h)| matches!(h.format, HandleFormat::Packed(_)))
+                .count();
+            let bound =
+                bind_packed_weights(&g, &WeightFormats::from_weight_map(model.weights())).unwrap();
+            let dequants = bound
+                .eqns
+                .iter()
+                .filter(|e| matches!(e.op, OpKind::PackedDequant { .. }))
+                .count();
+            assert_eq!(dequants, packed, "{label}: one decode per packed weight");
+            assert_eq!(packed > 0, label == "q8_0", "{label}: {packed} packed");
 
-            let want = top_k_router_ref(&logits_data, k, scale);
-            let mut want_full = vec![0.0f32; e];
-            for (i, wv) in want {
-                want_full[i] = wv;
-            }
-            // group-limited-but-unrestricted (actual) vs the ungated reference (expected)
-            poot_test_util::assert_close(one_group.as_f32().unwrap(), &want_full, 1e-4);
+            let reference_store = decoded(&store);
+            let reference = build(entry, &raw, &reference_store);
+            let (got, state) = run_step(&*model, &store, Phase::Prefill, CAP, &prompt, 0, &[]);
+            let (want, want_state) = run_step(
+                &*reference,
+                &reference_store,
+                Phase::Prefill,
+                CAP,
+                &prompt,
+                0,
+                &[],
+            );
+            close(&got, &want);
+            close_all(&state, &want_state);
+            let (got, _) = run_step(&*model, &store, Phase::Decode, CAP, &[5], 4, &state);
+            let (want, _) = run_step(
+                &*reference,
+                &reference_store,
+                Phase::Decode,
+                CAP,
+                &[5],
+                4,
+                &want_state,
+            );
+            close(&got, &want);
         }
+    }
 
-        #[test]
-        fn deepseek2_nonrenormalized_router_nonfinite_matches_independent_full_denominator() {
-            struct Case {
-                name: &'static str,
-                logits: [f32; 6],
-                k: usize,
-            }
-            let cases = [
-                Case {
-                    name: "finite",
-                    logits: [5.0, 4.0, 3.0, 2.0, 1.0, 0.0],
-                    k: 3,
-                },
-                Case {
-                    name: "positive infinity",
-                    logits: [f32::INFINITY, f32::INFINITY, 5.0, 4.0, -1.0, -2.0],
-                    k: 3,
-                },
-                Case {
-                    name: "canonical low tie",
-                    logits: [
-                        f32::NEG_INFINITY,
-                        f32::NAN,
-                        f32::MIN,
-                        f32::NEG_INFINITY,
-                        f32::NAN,
-                        f32::MIN,
-                    ],
-                    k: 3,
-                },
-                Case {
-                    name: "canonical endpoints underflow",
-                    logits: [f32::MAX, f32::MIN, 0.0, -0.0, f32::MIN, f32::MIN],
-                    k: 4,
-                },
-                Case {
-                    name: "signed zero boundary",
-                    logits: [-0.0, 0.0, -0.0, 0.0, -1.0, -2.0],
-                    k: 3,
-                },
-            ];
-            let (n_group, topk_group, scale) = (3usize, 2usize, 2.5f32);
-
-            for case in cases {
-                let b = Builder::new();
-                let logits = b.constant("logits", TensorType::f32(vec![1, case.logits.len()]));
-                let (gate, mask) =
-                    deepseek2_router_gate_and_mask(&b, logits, case.k, n_group, topk_group, scale);
-                let out = b.concat(1, &[mask, gate]);
-                let graph = b.finish(out);
-                let got = eval_router_gate(&graph, &case.logits);
-                let e = case.logits.len();
-                let (got_mask, got_gate) = got.as_f32().unwrap().split_at(e);
-
-                let reference =
-                    softmax_grouped_router_ref(&case.logits, n_group, topk_group, case.k, scale);
-                let mut want_mask = vec![0.0f32; e];
-                let mut want_gate = vec![0.0f32; e];
-                for &(id, weight) in &reference {
-                    want_mask[id] = 1.0;
-                    want_gate[id] = weight;
-                }
-
-                assert_eq!(got_mask, want_mask, "{}: selected mask", case.name);
-                assert_eq!(
-                    got_mask.iter().filter(|&&v| v == 1.0).count(),
-                    case.k,
-                    "{}: exactly k selected entries",
-                    case.name
-                );
-                for (id, (&actual, &expected)) in got_gate.iter().zip(&want_gate).enumerate() {
-                    assert!(actual.is_finite(), "{} expert {id}: non-finite", case.name);
-                    assert!(
-                        (actual - expected).abs() <= 1e-6,
-                        "{} expert {id}: graph {actual} vs full-denominator reference {expected}",
-                        case.name
-                    );
-                    if got_mask[id] == 0.0 {
-                        assert_eq!(actual, 0.0, "{} expert {id}: unselected", case.name);
+    /// llama.cpp's GGUF of an HF fixture: the same values under llama.cpp's names, `kv_b_proj`
+    /// split into the per-head `attn_k_b` `[heads, rank, nope]` and `attn_v_b` `[heads, v, rank]`
+    /// tensors, experts stacked.
+    fn gguf_of(fixture: &Fixture) -> (poot_load::gguf::GgufIndex, WeightStore) {
+        let n = |f: &str| fixture.config[f].as_u64().unwrap();
+        let (heads, nope, rope, v, rank) = (
+            n("num_attention_heads") as usize,
+            n("qk_nope_head_dim") as usize,
+            n("qk_rope_head_dim") as usize,
+            n("v_head_dim") as usize,
+            n("kv_lora_rank") as usize,
+        );
+        let mut tensors = Vec::new();
+        let mut stacks: std::collections::BTreeMap<String, Vec<(usize, &WeightEntry)>> =
+            Default::default();
+        for (key, entry) in fixture.store.iter() {
+            let hf = key.as_str();
+            let plain = |name: &str| (name.to_string(), entry);
+            let named = match hf {
+                "model.embed_tokens.weight" => plain("token_embd.weight"),
+                "model.norm.weight" => plain("output_norm.weight"),
+                "lm_head.weight" => plain("output.weight"),
+                _ => {
+                    let rest = hf.strip_prefix("model.layers.").unwrap();
+                    let (layer, tensor) = rest.split_once('.').unwrap();
+                    if let Some(expert) = tensor.strip_prefix("mlp.experts.") {
+                        let (index, proj) = expert.split_once('.').unwrap();
+                        let stack = match proj {
+                            "gate_proj.weight" => "ffn_gate_exps.weight",
+                            "up_proj.weight" => "ffn_up_exps.weight",
+                            "down_proj.weight" => "ffn_down_exps.weight",
+                            other => panic!("{other}"),
+                        };
+                        stacks
+                            .entry(format!("blk.{layer}.{stack}"))
+                            .or_default()
+                            .push((index.parse().unwrap(), entry));
+                        continue;
                     }
+                    if tensor == "self_attn.kv_b_proj.weight" {
+                        let fused = values(entry);
+                        let per_head = nope + v;
+                        let (mut k_b, mut v_b) = (Vec::new(), Vec::new());
+                        for h in 0..heads {
+                            let at = |c: usize, r: usize| fused[(h * per_head + c) * rank + r];
+                            for r in 0..rank {
+                                k_b.extend((0..nope).map(|c| at(c, r)));
+                            }
+                            for c in 0..v {
+                                v_b.extend((0..rank).map(|r| at(nope + c, r)));
+                            }
+                        }
+                        let layer_name = |s: &str| format!("blk.{layer}.{s}");
+                        tensors.push(gguf_tensor(
+                            &layer_name("attn_k_b.weight"),
+                            &f32_entry(vec![heads, rank, nope], &k_b),
+                        ));
+                        tensors.push(gguf_tensor(
+                            &layer_name("attn_v_b.weight"),
+                            &f32_entry(vec![heads, v, rank], &v_b),
+                        ));
+                        continue;
+                    }
+                    let name = match tensor {
+                        "input_layernorm.weight" => "attn_norm.weight",
+                        "post_attention_layernorm.weight" => "ffn_norm.weight",
+                        "self_attn.q_a_proj.weight" => "attn_q_a.weight",
+                        "self_attn.q_a_layernorm.weight" => "attn_q_a_norm.weight",
+                        "self_attn.q_b_proj.weight" => "attn_q_b.weight",
+                        "self_attn.kv_a_proj_with_mqa.weight" => "attn_kv_a_mqa.weight",
+                        "self_attn.kv_a_layernorm.weight" => "attn_kv_a_norm.weight",
+                        "self_attn.o_proj.weight" => "attn_output.weight",
+                        "mlp.gate_proj.weight" => "ffn_gate.weight",
+                        "mlp.up_proj.weight" => "ffn_up.weight",
+                        "mlp.down_proj.weight" => "ffn_down.weight",
+                        "mlp.gate.weight" => "ffn_gate_inp.weight",
+                        "mlp.gate.e_score_correction_bias" => "exp_probs_b.bias",
+                        "mlp.shared_experts.gate_proj.weight" => "ffn_gate_shexp.weight",
+                        "mlp.shared_experts.up_proj.weight" => "ffn_up_shexp.weight",
+                        "mlp.shared_experts.down_proj.weight" => "ffn_down_shexp.weight",
+                        other => panic!("unmapped fixture tensor {other}"),
+                    };
+                    (format!("blk.{layer}.{name}"), entry)
                 }
-                if case.name == "canonical endpoints underflow" {
-                    assert_eq!(got_mask[1], 1.0, "endpoint expert stays selected");
-                    assert_eq!(got_gate[1], 0.0, "selected endpoint weight underflows");
-                }
+            };
+            tensors.push(gguf_tensor(&named.0, named.1));
+        }
+        for (name, mut experts) in stacks {
+            experts.sort_by_key(|&(index, _)| index);
+            let count = experts.len() as u64;
+            let (_, mut dims, ty, mut bytes) = gguf_tensor(&name, experts[0].1);
+            for &(_, entry) in &experts[1..] {
+                bytes.extend(gguf_tensor(&name, entry).3);
             }
+            dims.push(count);
+            tensors.push((name, dims, ty, bytes));
         }
 
-        /// Card 296 negative control: with `n_group: 8`, `topk_group: 3`, group-limited masking must
-        /// change the selection relative to ungated top-k. Because V2's group score is a plain max, the
-        /// globally best expert is never excluded, so the fixture targets the 4th-best expert (expert 6,
-        /// group 3): groups 0/1/2 (experts 0/2/4) outrank it and fill the `topk_group=3` cut, while
-        /// ungated `k=4` selects it. Each group's second member is below every other group's primary
-        /// (so it never displaces one in the ungated top-4) but close enough to its own group's max to
-        /// carry non-negligible softmax weight, and no two values tie, so no rank tie lands on the
-        /// k-th boundary. A mask with no effect would make gated and ungated selections identical.
-        #[test]
-        fn deepseek2_router_gate_group_limited_routing_changes_selection() {
-            let e = 16usize;
-            let n_group = 8usize;
-            let topk_group = 3usize;
-            let k = 4usize;
-            let scale = 16.0f32; // real DeepSeek-V2's own routed_scaling_factor
-            #[rustfmt::skip]
-            let logits_data = [
-                5.0f32, 3.4, // group 0 (selected: max 5.0)
-                4.5, 3.3,    // group 1 (selected: max 4.5)
-                4.0, 3.2,    // group 2 (selected: max 4.0)
-                3.5, 3.1,    // group 3 (EXCLUDED: max 3.5, 4th-highest group, cut is top-3)
-                1.0, 0.9,    // group 4
-                0.0, -0.5,   // group 5
-                -1.0, -1.5,  // group 6
-                -2.0, -2.5,  // group 7
-            ];
-
-            let build_and_eval = |n_group: usize, topk_group: usize| -> poot_tensor::HostTensor {
-                let b = Builder::new();
-                let logits = b.constant("logits", TensorType::f32(vec![1, e]));
-                let gate = deepseek2_router_gate(&b, logits, k, n_group, topk_group, scale);
-                let g = b.finish(gate);
-                eval_router_gate(&g, &logits_data)
-            };
-
-            let gated = build_and_eval(n_group, topk_group);
-            let ungated = build_and_eval(1, 1);
-
-            let selected = |t: &poot_tensor::HostTensor| -> Vec<usize> {
-                t.as_f32()
-                    .unwrap()
-                    .iter()
-                    .enumerate()
-                    .filter(|&(_, &v)| v.abs() > 1e-6)
-                    .map(|(i, _)| i)
-                    .collect()
-            };
-            let gated_sel = selected(&gated);
-            let ungated_sel = selected(&ungated);
-            assert_ne!(
-                gated_sel, ungated_sel,
-                "group-limited masking should change the selected expert set (gated {gated_sel:?} vs ungated {ungated_sel:?})"
-            );
-            assert_eq!(
-                ungated_sel,
-                vec![0, 2, 4, 6],
-                "sanity: ungated top-4 picks the 4 individually-highest experts, including expert 6"
-            );
-            assert_eq!(
-                gated_sel,
-                vec![0, 1, 2, 4],
-                "group 3 (expert 6's group) is excluded, so expert 1 (group 0's low filler, still higher \
-                 than anything outside groups 0-2) fills the 4th slot instead"
-            );
-            assert!(
-                !gated_sel.contains(&6),
-                "expert 6's group (max 3.5, group-rank 4th, cut is top-3 of 8) should be masked out"
-            );
-
-            // cross-check against the independent grouped reference
-            let want = softmax_grouped_router_ref(&logits_data, n_group, topk_group, k, scale);
-            let mut want_full = vec![0.0f32; e];
-            for (i, wv) in want {
-                want_full[i] = wv;
-            }
-            // graph (actual) vs the grouped reference (expected)
-            poot_test_util::assert_close(gated.as_f32().unwrap(), &want_full, 1e-4);
+        let u = |v: u64| GgufValue::U32(v as u32);
+        let f = |key: &str| GgufValue::F32(fixture.config[key].as_f64().unwrap() as f32);
+        let scaling = &fixture.config["rope_scaling"];
+        let sf = |key: &str| GgufValue::F32(scaling[key].as_f64().unwrap() as f32);
+        let sigmoid = fixture.config["scoring_func"] == "sigmoid";
+        let mut kvs = vec![
+            (
+                "general.architecture".to_string(),
+                GgufValue::Str("deepseek2".into()),
+            ),
+            ("deepseek2.block_count".into(), u(n("num_hidden_layers"))),
+            ("deepseek2.embedding_length".into(), u(n("hidden_size"))),
+            ("deepseek2.attention.head_count".into(), u(heads as u64)),
+            (
+                "deepseek2.attention.q_lora_rank".into(),
+                u(n("q_lora_rank")),
+            ),
+            ("deepseek2.attention.kv_lora_rank".into(), u(rank as u64)),
+            (
+                "deepseek2.attention.key_length_mla".into(),
+                u((nope + rope) as u64),
+            ),
+            ("deepseek2.attention.value_length_mla".into(), u(v as u64)),
+            ("deepseek2.rope.dimension_count".into(), u(rope as u64)),
+            (
+                "deepseek2.attention.layer_norm_rms_epsilon".into(),
+                f("rms_norm_eps"),
+            ),
+            (
+                "deepseek2.context_length".into(),
+                u(n("max_position_embeddings")),
+            ),
+            ("deepseek2.rope.freq_base".into(), f("rope_theta")),
+            (
+                "deepseek2.rope.scaling.type".into(),
+                GgufValue::Str("yarn".into()),
+            ),
+            ("deepseek2.rope.scaling.factor".into(), sf("factor")),
+            (
+                "deepseek2.rope.scaling.original_context_length".into(),
+                u(n_of(scaling, "original_max_position_embeddings")),
+            ),
+            (
+                "deepseek2.rope.scaling.yarn_beta_fast".into(),
+                sf("beta_fast"),
+            ),
+            (
+                "deepseek2.rope.scaling.yarn_beta_slow".into(),
+                sf("beta_slow"),
+            ),
+            (
+                "deepseek2.rope.scaling.yarn_log_multiplier".into(),
+                GgufValue::F32(0.1 * scaling["mscale_all_dim"].as_f64().unwrap() as f32),
+            ),
+            (
+                "deepseek2.feed_forward_length".into(),
+                u(n("intermediate_size")),
+            ),
+            ("deepseek2.expert_count".into(), u(n("n_routed_experts"))),
+            (
+                "deepseek2.expert_feed_forward_length".into(),
+                u(n("moe_intermediate_size")),
+            ),
+            (
+                "deepseek2.expert_used_count".into(),
+                u(n("num_experts_per_tok")),
+            ),
+            (
+                "deepseek2.expert_shared_count".into(),
+                u(n("n_shared_experts")),
+            ),
+            (
+                "deepseek2.leading_dense_block_count".into(),
+                u(n("first_k_dense_replace")),
+            ),
+            ("deepseek2.expert_group_count".into(), u(n("n_group"))),
+            (
+                "deepseek2.expert_group_used_count".into(),
+                u(n("topk_group")),
+            ),
+            (
+                "deepseek2.expert_weights_scale".into(),
+                f("routed_scaling_factor"),
+            ),
+            (
+                "deepseek2.expert_gating_func".into(),
+                u(if sigmoid { 2 } else { 1 }),
+            ),
+            ("tokenizer.ggml.eos_token_id".into(), u(n("eos_token_id"))),
+            (
+                "tokenizer.ggml.tokens".into(),
+                GgufValue::Array(
+                    (0..n("vocab_size"))
+                        .map(|t| GgufValue::Str(format!("t{t}")))
+                        .collect(),
+                ),
+            ),
+        ];
+        if sigmoid {
+            kvs.push((
+                "deepseek2.expert_weights_norm".into(),
+                GgufValue::Bool(fixture.config["norm_topk_prob"].as_bool().unwrap()),
+            ));
         }
+        read_back_owned(&kvs, &tensors)
+    }
+
+    fn n_of(block: &serde_json::Value, key: &str) -> u64 {
+        block[key].as_u64().unwrap()
+    }
+
+    /// SC-001/SC-004 (GGUF half, R-566a-8): a GGUF of the fixture resolves by its architecture
+    /// key and binds `attn_k_b` and `attn_v_b` as stored (no rebuilt `kv_b_proj`), and computes what
+    /// the HF body computes over the same values, in prefill and a decode step. Mutation: read the
+    /// split `k_b` as `[heads, nope, rank]` (the `Fused` orientation); every output goes red.
+    pub(crate) fn assert_gguf_equals_the_hf_body(entry: &FamilyEntry, fixture: &Fixture) {
+        let (index, gguf_store) = gguf_of(fixture);
+        let registry = Registry::builtin().unwrap();
+        let raw = RawConfig::Gguf(&index);
+        assert_eq!(registry.resolve(&raw).unwrap().family, FAMILY);
+        let model = registry.build(&raw, &gguf_store).unwrap();
+        assert!(
+            model
+                .weights()
+                .iter()
+                .all(|(id, _, _)| !matches!(id.role, WeightRole::Mla(MlaRole::KvB))),
+            "no rebuilt kv_b_proj"
+        );
+        assert!(
+            model
+                .weights()
+                .iter()
+                .any(|(id, _, _)| id.role == WeightRole::Mla(MlaRole::KB)),
+            "k_b is bound as stored"
+        );
+        let reference_store = decoded(&fixture.store);
+        let reference = build(entry, &fixture.raw(), &reference_store);
+        let prompt = [3, 17, 40, 8];
+        let (got, state) = run_step(&*model, &gguf_store, Phase::Prefill, CAP, &prompt, 0, &[]);
+        let (want, want_state) = run_step(
+            &*reference,
+            &reference_store,
+            Phase::Prefill,
+            CAP,
+            &prompt,
+            0,
+            &[],
+        );
+        close(&got, &want);
+        close_all(&state, &want_state);
+        let (got, _) = run_step(&*model, &gguf_store, Phase::Decode, CAP, &[5], 4, &state);
+        let (want, _) = run_step(
+            &*reference,
+            &reference_store,
+            Phase::Decode,
+            CAP,
+            &[5],
+            4,
+            &want_state,
+        );
+        close(&got, &want);
+    }
+
+    fn config_error_of(
+        entry: &FamilyEntry,
+        fixture: &Fixture,
+        config: &serde_json::Value,
+    ) -> (&'static str, ConfigReason) {
+        let raw = RawConfig::HfJson {
+            config,
+            generation: None,
+        };
+        match (entry.build)(&raw, &fixture.store) {
+            Err(ModelError::Config { field, reason, .. }) => (field, reason),
+            other => panic!("{config}: expected a config error, got {other:?}"),
+        }
+    }
+
+    /// Tier 3 on the oracle (ADR-0101): the fixture's 24 greedy tokens after the 7-token prompt equal
+    /// the literals recorded from the Runner's CPU `generate` at the base commit `64602bced`.
+    pub(crate) fn assert_generates_the_recorded_tokens(
+        entry: &FamilyEntry,
+        fixture: &Fixture,
+        recorded: [u32; 24],
+    ) {
+        let model = build(entry, &fixture.raw(), &fixture.store);
+        let got = greedy_tokens(&*model, &fixture.store, &[3, 17, 40, 8, 25, 11, 2], 24, 32);
+        assert_eq!(got, recorded);
+    }
+
+    /// A config the family cannot trace is a typed error naming the field.
+    pub(crate) fn assert_bad_configs_are_typed(entry: &FamilyEntry, fixture: &Fixture) {
+        let cases: &[(&str, serde_json::Value, &str, ConfigReason)] = &[
+            (
+                "attention_bias",
+                json!(true),
+                "attention_bias",
+                ConfigReason::Unsupported,
+            ),
+            (
+                "moe_layer_freq",
+                json!(2),
+                "moe_layer_freq",
+                ConfigReason::Unsupported,
+            ),
+            (
+                "scoring_func",
+                json!("tanh"),
+                "scoring_func",
+                ConfigReason::Unsupported,
+            ),
+            (
+                "topk_method",
+                json!("magic"),
+                "topk_method",
+                ConfigReason::Unsupported,
+            ),
+            (
+                "num_experts_per_tok",
+                json!(9),
+                "top_k",
+                ConfigReason::Exceeds { max: 8 },
+            ),
+            (
+                "qk_rope_head_dim",
+                json!(5),
+                "rotary_dim",
+                ConfigReason::NotDivisible { by: 2 },
+            ),
+            (
+                "topk_group",
+                json!(5),
+                "topk_group",
+                ConfigReason::Exceeds { max: 4 },
+            ),
+            (
+                "n_routed_experts",
+                json!(0),
+                "n_routed_experts",
+                ConfigReason::Zero,
+            ),
+            (
+                "rope_scaling",
+                json!({"type": "linear", "factor": 2.0}),
+                "rope_scaling.rope_type",
+                ConfigReason::Unsupported,
+            ),
+        ];
+        for (key, value, field, reason) in cases {
+            let mut config = fixture.config.clone();
+            config[*key] = value.clone();
+            assert_eq!(
+                config_error_of(entry, fixture, &config),
+                (*field, *reason),
+                "{key} = {value}"
+            );
+        }
+    }
+
+    /// SC-002 (family half): the sigmoid and softmax routers, the shared expert and the dense
+    /// prefix each reach the logits: a different scaling factor changes them.
+    pub(crate) fn assert_the_routing_scale_reaches_the_logits(
+        entry: &FamilyEntry,
+        fixture: &Fixture,
+    ) {
+        let run = |scale: f64| {
+            let mut config = fixture.config.clone();
+            config["routed_scaling_factor"] = json!(scale);
+            let model = build(
+                entry,
+                &RawConfig::HfJson {
+                    config: &config,
+                    generation: None,
+                },
+                &fixture.store,
+            );
+            run_step(
+                &*model,
+                &fixture.store,
+                Phase::Prefill,
+                CAP,
+                &[3, 17, 40],
+                0,
+                &[],
+            )
+            .0
+        };
+        assert_ne!(run(1.0), run(3.0));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::family_tests::*;
+    use super::*;
+
+    #[test]
+    fn a_missing_required_tensor_is_named_before_any_trace() {
+        assert_missing_tensors_are_named(
+            &fixture(),
+            &[
+                "model.layers.1.mlp.gate.weight",
+                "model.layers.1.mlp.experts.0.gate_proj.weight",
+                "model.layers.1.mlp.experts.7.down_proj.weight",
+                "model.layers.1.mlp.shared_experts.up_proj.weight",
+                "model.layers.0.mlp.down_proj.weight",
+                "model.layers.0.self_attn.q_a_proj.weight",
+                "model.layers.1.self_attn.kv_b_proj.weight",
+                "model.layers.0.self_attn.kv_a_layernorm.weight",
+                "lm_head.weight",
+            ],
+        );
+    }
+
+    #[test]
+    fn chunked_prefill_continuing_from_pos_equals_token_by_token_decode() {
+        assert_chunks_equal_decode(&ENTRY, &fixture());
+    }
+
+    #[test]
+    fn bf16_and_q8_0_stores_trace_through_the_one_body() {
+        assert_bf16_and_q8_0_trace_and_match(&ENTRY, &fixture());
+    }
+
+    #[test]
+    fn a_gguf_equals_the_hf_body() {
+        assert_gguf_equals_the_hf_body(&ENTRY, &fixture());
+    }
+
+    #[test]
+    fn a_config_deepseek_cannot_trace_is_a_typed_error_naming_the_field() {
+        assert_bad_configs_are_typed(&ENTRY, &fixture());
+    }
+
+    #[test]
+    fn the_routing_scale_reaches_the_logits() {
+        assert_the_routing_scale_reaches_the_logits(&ENTRY, &fixture());
+    }
+
+    /// A single group and a scale of one add no router option, so a greedy V2-Lite layer traces no
+    /// group or scale ops; a real group limit and scale are options.
+    #[test]
+    fn the_identity_group_limit_and_scale_add_no_router_option() {
+        let identity = Routing {
+            scoring: Scoring::Softmax,
+            groups: 1,
+            group_top: 1,
+            scale: 1.0,
+            renormalize: false,
+        };
+        let plain = MoeParams::new(ENTRY.family, 8, 4, 6, 2, router_kind(&identity)).unwrap();
+        assert_eq!(with_routing(plain, &identity).unwrap(), plain);
+        let limited = Routing {
+            groups: 3,
+            group_top: 2,
+            ..identity
+        };
+        assert_ne!(with_routing(plain, &limited).unwrap(), plain);
+        let scaled = Routing {
+            scale: 2.5,
+            ..identity
+        };
+        assert_ne!(with_routing(plain, &scaled).unwrap(), plain);
+    }
+
+    /// SC-001 (tier 3 on the oracle): the Runner's recorded tokens. Mutation: swap two experts'
+    /// ids in the router arm; the first tokens change.
+    #[test]
+    fn the_fixture_generates_the_tokens_the_runner_recorded() {
+        assert_generates_the_recorded_tokens(
+            &ENTRY,
+            &fixture(),
+            [
+                11, 32, 18, 32, 18, 32, 29, 38, 32, 20, 6, 19, 20, 6, 19, 20, 6, 19, 20, 6, 19, 20,
+                6, 19,
+            ],
+        );
     }
 }

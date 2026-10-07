@@ -13,15 +13,13 @@
 //!   filled in one batched prefill and `--osl` tokens are decoded with EOS ignored, timing every token. The
 //!   raw per-iteration samples (ttft, e2e, inter-token gaps) go out for the harness to aggregate.
 //!
-//! `--backend ptx|rocm|wgpu` picks the executor. A backend is a [`Generate`] implementation: it names which
-//! `Runner` generation entry the backend uses and nothing else, so the measure loop never branches on it.
+//! `--backend ptx|rocm|wgpu` picks the executor the driver opens; the measure loop never branches on it.
 //! `--gguf <path>` (or a `.gguf` `--model-dir`) loads the quant-resident weights; that decode exists on
 //! wgpu and rocm only.
 //!
-//! The registry decides what generates: a checkpoint of a family `Registry::builtin()` holds loads as a
-//! `driver::ModelHandle` and runs on the one `poot_llm::driver::Driver` loop; a family it does not hold
-//! (the MoE and hybrid families, POOT-738) loads as a `Runner` and runs on its entry points. The result
-//! line records which (`engine`). The driver prefills a decode-curve context in the pieces of the chunk
+//! A checkpoint of a family `Registry::builtin()` holds loads as a `driver::ModelHandle` and runs on the
+//! one `poot_llm::driver::Driver` loop; a family it does not hold is a recorded refusal. The result
+//! line records the engine. The driver prefills a decode-curve context in the pieces of the chunk
 //! plan and a single-mode prompt in one forward under `--prefill`, token by token without it.
 //!
 //! Only `--precision f32|bf16|f16` are accepted: the engine loads bf16/f16 weights and computes in f32.
@@ -33,7 +31,6 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::{NonZeroU64, NonZeroUsize};
-use std::ops::ControlFlow;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::Arc;
@@ -42,18 +39,17 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use serde_json::{json, Value};
 
-use poot_executor::Executor as _;
-use poot_graph_plan::{CompileOptions, FusionPolicy, Submission};
-use poot_llm::driver::error::{DriverError, Unsupported};
+use poot_graph_plan::{CompileOptions, Submission};
+use poot_llm::driver::error::DriverError;
+#[cfg(test)]
+use poot_llm::driver::error::Unsupported;
 use poot_llm::driver::{
     open_executor, BackendChoice, Driver, DriverOptions, GenerateRequest, Head, Layout,
     ModelHandle, PreparedSetLimits, ServingShapes, Warm,
 };
-use poot_llm::{GenerationControl, Runner, RunnerError, Sampler};
-use poot_models::registry::{Registry, RegistryError};
-use poot_ptx_gpu::PtxDevice;
+use poot_llm::{GenerationControl, Sampler};
+use poot_models::registry::Registry;
 use poot_quant::weights::WeightEntry;
-use poot_rocm_gpu::device::RocmDevice;
 
 /// The git sha this binary was built from (`build.rs`); the harness records it with every result.
 const BUILD_SHA: &str = env!("POOT_BUILD_SHA");
@@ -113,18 +109,15 @@ impl Mode {
     }
 }
 
-/// What generated a result: the Runner's entry points, or the driver's one loop. The registry decides
-/// it from the checkpoint; it is recorded, never chosen.
+/// What generated a result: the driver's one loop. It is recorded, never chosen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Engine {
-    Runner,
     Driver,
 }
 
 impl Engine {
     fn label(self) -> &'static str {
         match self {
-            Engine::Runner => "runner",
             Engine::Driver => "driver",
         }
     }
@@ -269,8 +262,8 @@ fn parse_args(args: &[String]) -> anyhow::Result<Invocation> {
     Ok(Invocation::Run(config))
 }
 
-/// A loaded model on one backend, as the measure loop drives it. The methods are the `Runner` generation
-/// entries the backend uses (poot-llm owns them); the loop is written once against this trait.
+/// A loaded model on one backend, as the measure loop drives it; the loop is written once against this
+/// trait.
 trait Generate {
     fn encode(&self, text: &str) -> anyhow::Result<Vec<u32>>;
 
@@ -304,258 +297,7 @@ trait Generate {
     }
 
     /// What generates.
-    fn engine(&self) -> Engine {
-        Engine::Runner
-    }
-}
-
-fn keep_going(on_token: &mut dyn FnMut(&str)) -> impl FnMut(&str) -> ControlFlow<()> + '_ {
-    move |piece| {
-        on_token(piece);
-        ControlFlow::Continue(())
-    }
-}
-
-struct Ptx {
-    runner: Runner,
-    /// Card 549: the executor contract, used by every arm now that `PtxGraphExecutor` is deleted.
-    exec: poot_executor::Engine<poot_ptx_gpu::PtxDevice>,
-    exe: poot_executor::ExecutableId,
-    /// Card 552: a mark taken at `reset_profile` time, against `exec`'s own typed `TimingSnapshot`
-    /// (mirrors `Wgpu`'s identical field; `PtxDevice` carries no legacy label profiler to reset).
-    mark: Option<poot_profile::Mark>,
-}
-
-impl Generate for Ptx {
-    fn encode(&self, text: &str) -> anyhow::Result<Vec<u32>> {
-        Ok(self.runner.encode(text)?)
-    }
-
-    fn generate_context(
-        &mut self,
-        context: &[u32],
-        max_new: usize,
-        on_token: &mut dyn FnMut(&str),
-    ) -> anyhow::Result<()> {
-        self.runner.generate_kv_ptx_prefilled_tokens(
-            context,
-            max_new,
-            &mut self.exec,
-            self.exe,
-            true,
-            keep_going(on_token),
-        )?;
-        Ok(())
-    }
-
-    fn generate_prompt(
-        &mut self,
-        prompt: &str,
-        max_new: usize,
-        prefill: bool,
-        on_token: &mut dyn FnMut(&str),
-    ) -> anyhow::Result<()> {
-        let on_token = keep_going(on_token);
-        if prefill {
-            self.runner.generate_kv_ptx_prefilled(
-                prompt,
-                max_new,
-                &mut self.exec,
-                self.exe,
-                on_token,
-            )?;
-        } else {
-            self.runner.generate_kv_gpu_cached_sampled(
-                prompt,
-                max_new,
-                &mut self.exec,
-                self.exe,
-                &mut Sampler::greedy(),
-                &[],
-                on_token,
-            )?;
-        }
-        Ok(())
-    }
-
-    fn reset_profile(&mut self) {
-        self.mark = Some(self.exec.stats().timing.mark());
-    }
-
-    fn profile_report(&self, tokens: usize, wall: Duration) -> Option<String> {
-        let mark = self.mark.as_ref()?;
-        let stats = self.exec.stats();
-        let entries = stats.timing.entries_with_activity_since(mark);
-        if entries.is_empty() {
-            return None;
-        }
-        let report = poot_profile::Report::window(&stats.timing, mark, &entries);
-        (report.steps > 0).then(|| report.render(tokens, wall))
-    }
-}
-
-struct Rocm {
-    runner: Runner,
-    /// Card 548: the executor contract is this backend's only path (RocmGraphExecutor and its
-    /// eager run loop are deleted). One executable loaded once at `open()` time; every mode/arm
-    /// below drives it through `&mut dyn Executor` + `ExecutableId`.
-    executor: poot_executor::Engine<RocmDevice>,
-    exe: poot_executor::ExecutableId,
-}
-
-impl Generate for Rocm {
-    fn encode(&self, text: &str) -> anyhow::Result<Vec<u32>> {
-        Ok(self.runner.encode(text)?)
-    }
-
-    fn generate_context(
-        &mut self,
-        context: &[u32],
-        max_new: usize,
-        on_token: &mut dyn FnMut(&str),
-    ) -> anyhow::Result<()> {
-        self.runner.generate_kv_rocm_prefilled_tokens(
-            context,
-            max_new,
-            &mut self.executor,
-            self.exe,
-            true,
-            keep_going(on_token),
-        )?;
-        Ok(())
-    }
-
-    fn generate_prompt(
-        &mut self,
-        prompt: &str,
-        max_new: usize,
-        prefill: bool,
-        on_token: &mut dyn FnMut(&str),
-    ) -> anyhow::Result<()> {
-        let on_token = keep_going(on_token);
-        if prefill {
-            self.runner.generate_kv_rocm_prefilled(
-                prompt,
-                max_new,
-                &mut self.executor,
-                self.exe,
-                on_token,
-            )?;
-        } else {
-            self.runner.generate_kv_gpu_cached(
-                prompt,
-                max_new,
-                &mut self.executor,
-                self.exe,
-                on_token,
-            )?;
-        }
-        Ok(())
-    }
-
-    fn reset_profile(&mut self) {
-        // Card 548: RocmDevice::device_time() is always Unknown (no HSA timestamp
-        // binding yet) and the pre-contract executor's label profiler is gone with it - nothing to
-        // reset.
-    }
-
-    fn profile_report(&self, _tokens: usize, _wall: Duration) -> Option<String> {
-        None
-    }
-}
-
-struct Wgpu {
-    runner: Runner,
-    /// Card 546a/546b: the backend-neutral executor contract drives every arm (prefill and cached
-    /// decode alike) on this one executable.
-    executor: poot_executor::Engine<poot_gpu::device::WgpuDevice>,
-    exe: poot_executor::ExecutableId,
-    /// Card 552: a mark taken at `reset_profile` time, against `executor`'s own typed
-    /// `TimingSnapshot`. `None` until the first `reset_profile` call (or when `--profile` is off).
-    mark: Option<poot_profile::Mark>,
-}
-
-impl Generate for Wgpu {
-    fn encode(&self, text: &str) -> anyhow::Result<Vec<u32>> {
-        Ok(self.runner.encode(text)?)
-    }
-
-    fn generate_context(
-        &mut self,
-        context: &[u32],
-        max_new: usize,
-        on_token: &mut dyn FnMut(&str),
-    ) -> anyhow::Result<()> {
-        self.runner.generate_kv_gpu_prefilled_tokens(
-            context,
-            max_new,
-            &mut self.executor,
-            self.exe,
-            true,
-            keep_going(on_token),
-        )?;
-        Ok(())
-    }
-
-    fn generate_prompt(
-        &mut self,
-        prompt: &str,
-        max_new: usize,
-        prefill: bool,
-        on_token: &mut dyn FnMut(&str),
-    ) -> anyhow::Result<()> {
-        let on_token = keep_going(on_token);
-        if prefill {
-            self.runner.generate_kv_gpu_prefilled(
-                prompt,
-                max_new,
-                &mut self.executor,
-                self.exe,
-                on_token,
-            )?;
-        } else {
-            self.runner.generate_kv_gpu_cached(
-                prompt,
-                max_new,
-                &mut self.executor,
-                self.exe,
-                on_token,
-            )?;
-        }
-        Ok(())
-    }
-
-    fn reset_profile(&mut self) {
-        self.mark = Some(self.executor.stats().timing.mark());
-    }
-
-    fn profile_report(&self, tokens: usize, wall: Duration) -> Option<String> {
-        // Card 552: the typed window over the entries this run actually touched (their ids churn
-        // per generation call, so they are discovered from the snapshot rather than named ahead of
-        // time).
-        let mark = self.mark.as_ref()?;
-        let stats = self.executor.stats();
-        let entries = stats.timing.entries_with_activity_since(mark);
-        if entries.is_empty() {
-            return None;
-        }
-        let report = poot_profile::Report::window(&stats.timing, mark, &entries);
-        if report.steps == 0 {
-            return None;
-        }
-        let mut text = report.render(tokens, wall);
-        // Card 552 SC-007: the typed, purpose-tagged native call counters, read from the same
-        // `WgpuDevice`'s own context - independent of the step/dispatch timing above, and never
-        // reset by it.
-        let calls = self.executor.device().context().execution_counters();
-        text.push_str(&format!(
-            "native calls: {} submits, {} waits (logical dispatches: {})\n",
-            calls.total_submits(),
-            calls.total_waits(),
-            calls.logical_dispatches,
-        ));
-        Some(text)
-    }
+    fn engine(&self) -> Engine;
 }
 
 /// The driver engine on one backend (Card 734): [`Driver::generate`] behind the same [`Generate`] seam, so
@@ -572,7 +314,6 @@ struct DriverCell {
 fn driver_options(capacity: NonZeroUsize, chunk: usize) -> anyhow::Result<DriverOptions> {
     let compile = CompileOptions {
         execution: Submission::Replay,
-        fusion: FusionPolicy::Full,
         limits: poot_graph_plan::CompileLimits::STANDARD,
     };
     Ok(DriverOptions {
@@ -586,6 +327,7 @@ fn driver_options(capacity: NonZeroUsize, chunk: usize) -> anyhow::Result<Driver
             max_retained_bytes: NonZeroU64::new(8 << 30).expect("nonzero"),
         },
         charge: poot_llm::driver::program_retention,
+        draft: poot_llm::driver::DraftPolicy::Off,
     })
 }
 
@@ -751,104 +493,16 @@ fn open(config: &Config) -> anyhow::Result<(Box<dyn Generate>, String)> {
     let path = match &config.weights {
         Weights::Safetensors(path) | Weights::Gguf(path) => path.as_str(),
     };
-    // One registry resolve decides: a registered family runs on the driver, any other on the Runner.
+    // One registry resolve decides: a registered family runs on the driver, any other is a refusal.
     let registry = Registry::builtin().context("build the family registry")?;
-    match ModelHandle::load(Path::new(path), &registry) {
+    match ModelHandle::load(
+        Path::new(path),
+        &registry,
+        &poot_llm::driver::LoadOptions::default(),
+    ) {
         Ok(handle) => open_driver(config, handle),
-        Err(DriverError::Unsupported(Unsupported::Registry(RegistryError::Unregistered {
-            ..
-        }))) => open_runner(config),
         Err(error) => Err(anyhow::Error::from(error).context(format!("load {path}"))),
     }
-}
-
-/// The Runner engine: the families the registry does not hold yet.
-fn open_runner(config: &Config) -> anyhow::Result<(Box<dyn Generate>, String)> {
-    // The typed `RunnerError` stays in the chain (`refusal` reads it); only context is added.
-    let runner = match &config.weights {
-        Weights::Safetensors(dir) => Runner::load(dir).with_context(|| format!("load {dir}"))?,
-        Weights::Gguf(path) => {
-            Runner::load_gguf(path).with_context(|| format!("load gguf {path}"))?
-        }
-    };
-    let precision = match &config.weights {
-        Weights::Safetensors(_) => config.precision.clone(),
-        // A quantized GGUF stays packed (card 545a); it reports the format most of its packed weights
-        // are stored in.
-        Weights::Gguf(path) => {
-            let mut counts = std::collections::BTreeMap::<String, usize>::new();
-            for (_, packed) in runner.weight_formats().iter() {
-                *counts
-                    .entry(format!("{:?}", packed.weight.format()).to_lowercase())
-                    .or_default() += 1;
-            }
-            counts
-                .into_iter()
-                .max_by_key(|&(_, n)| n)
-                .map(|(format, _)| format)
-                .ok_or_else(|| anyhow::anyhow!("{path}: no weight is stored packed"))?
-        }
-    };
-    let engine: Box<dyn Generate> = match config.backend {
-        Backend::Ptx => {
-            let device = if config.profile {
-                PtxDevice::new_with_device_timing()
-            } else {
-                PtxDevice::new()
-            }
-            .context("init PTX device (libcuda?)")?;
-            let mut exec = poot_executor::Engine::new(device);
-            let exe = runner.load_on(&mut exec).context("ptx load_on")?;
-            Box::new(Ptx {
-                runner,
-                exec,
-                exe,
-                mark: None,
-            })
-        }
-        Backend::Rocm => {
-            let device =
-                RocmDevice::new().context("init ROCm device (card 546a executor contract)")?;
-            let mut executor = poot_executor::Engine::new(device);
-            let exe = runner
-                .load_on(&mut executor)
-                .context("load_on (card 546a executor contract)")?;
-            Box::new(Rocm {
-                runner,
-                executor,
-                exe,
-            })
-        }
-        Backend::Wgpu => {
-            // Card 552: `--profile` drives the executor with bounded detailed device-time
-            // collection (the same declared bound feeds both the device's in-flight-query cap and
-            // the engine's own retention); otherwise it stays the counters-only default (no query
-            // resources are ever created, no added synchronization).
-            let detail = poot_executor::DetailedTiming::every_step(4096, 1 << 20, 4);
-            let device = if config.profile {
-                poot_gpu::device::WgpuDevice::new_with_timing(detail.max_in_flight_queries)
-            } else {
-                poot_gpu::device::WgpuDevice::new()
-            }
-            .context("init wgpu device (card 546a executor contract)")?;
-            let timing_options = if config.profile {
-                poot_executor::TimingOptions::Detailed(detail)
-            } else {
-                poot_executor::TimingOptions::CountersOnly
-            };
-            let mut executor = poot_executor::Engine::with_timing(device, timing_options);
-            let exe = runner
-                .load_on(&mut executor)
-                .context("load_on (card 546a executor contract)")?;
-            Box::new(Wgpu {
-                runner,
-                executor,
-                exe,
-                mark: None,
-            })
-        }
-    };
-    Ok((engine, precision))
 }
 
 /// One timed generation: time to the first token, the whole generation, and the gaps between tokens.
@@ -1186,16 +840,12 @@ impl std::fmt::Display for Declined {
 impl std::error::Error for Declined {}
 
 /// The refusal a failure carries, if it is one, as its own text. This is the runner's only classification
-/// of "poot does not run this": [`Declined`], the [`RunnerError::UnsupportedModel`] the safetensors
-/// loader raises for an architecture outside its allowlist, or the driver's [`DriverError::Unsupported`]
+/// of "poot does not run this": [`Declined`], or the driver's [`DriverError::Unsupported`]
 /// (a family the registry does not hold, a shape the family or the planner refuses), found anywhere in
 /// the error chain. Card 577's
 /// compile-generated support list adds its typed planner refusal as one more arm here.
 fn refusal(error: &anyhow::Error) -> Option<(Option<Engine>, String)> {
     error.chain().find_map(|cause| {
-        if let Some(RunnerError::UnsupportedModel { .. }) = cause.downcast_ref::<RunnerError>() {
-            return Some((Some(Engine::Runner), cause.to_string()));
-        }
         if let Some(DriverError::Unsupported(_)) = cause.downcast_ref::<DriverError>() {
             return Some((Some(Engine::Driver), cause.to_string()));
         }
@@ -1379,6 +1029,10 @@ mod tests {
                 .push(Event::ProfileReport { tokens });
             None
         }
+
+        fn engine(&self) -> Engine {
+            Engine::Driver
+        }
     }
 
     fn config(extra: &[&str]) -> Config {
@@ -1402,10 +1056,9 @@ mod tests {
     }
 
     fn refused() -> anyhow::Error {
-        anyhow::Error::from(RunnerError::UnsupportedModel {
-            model_type: "stub_model".to_string(),
-            reason: "not a supported safetensors architecture",
-        })
+        anyhow::Error::from(DriverError::Unsupported(Unsupported::Backend {
+            backend: "stub_backend",
+        }))
         .context("generate")
     }
 
@@ -1629,9 +1282,10 @@ mod tests {
         stub.error = refused;
         let line = result_line(&config, measure(&config, &mut stub, "bf16")).unwrap();
         assert_eq!(line["status"], "unsupported");
-        assert_eq!(
-            line["reason"],
-            "stub_model is not supported by the generic Runner: not a supported safetensors architecture"
+        assert!(
+            line["reason"].as_str().unwrap().contains("stub_backend"),
+            "{}",
+            line["reason"]
         );
         assert_eq!(line["backend"], "wgpu");
         assert_eq!(line["build_sha"], BUILD_SHA);
@@ -1650,7 +1304,7 @@ mod tests {
         dir
     }
 
-    /// SC-002 (runner half, real entry): a model the loader does not serve is refused by `Runner::load`
+    /// SC-002 (real entry): a model the registry does not hold is refused by `ModelHandle::load`
     /// itself, and the refusal reaches the result line with its text and passes the harness's contract.
     /// Nothing here builds the error by hand, so the test cannot pass against a type the bench path never
     /// raises.
@@ -1667,7 +1321,7 @@ mod tests {
         assert_eq!(line["status"], "unsupported");
         let reason = line["reason"].as_str().unwrap();
         assert!(
-            reason.starts_with("stub_arch is not supported by the generic Runner"),
+            reason.contains("no family is registered") && reason.contains("stub_arch"),
             "{reason}"
         );
         assert_eq!(harness_refusal(&line, Backend::Rocm), reason);
@@ -1769,6 +1423,9 @@ mod tests {
             fn profile_report(&self, _: usize, _: Duration) -> Option<String> {
                 None
             }
+            fn engine(&self) -> Engine {
+                Engine::Driver
+            }
         }
         let config = config(&[
             "--mode",
@@ -1845,10 +1502,6 @@ mod tests {
 
         let line = identity(Some(Engine::Driver), Backend::Wgpu, Mode::Single, "bf16");
         assert_eq!(line["engine"], "driver");
-        assert_eq!(
-            identity(Some(Engine::Runner), Backend::Wgpu, Mode::Single, "bf16")["engine"],
-            "runner"
-        );
         assert!(identity(None, Backend::Wgpu, Mode::Single, "bf16")
             .get("engine")
             .is_none());

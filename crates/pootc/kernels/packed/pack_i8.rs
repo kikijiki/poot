@@ -2,7 +2,7 @@
 //! KV-cache quant) in ordinary Rust. Input is f32 codes `[.., L]`; output is i32 words `[.., W]` with
 //! `W = ceil(L/4)`. One thread per output word rounds and clamps each of its 4 codes to a signed int8 and
 //! packs them into the word's bytes. `L` is not recoverable from `W` (the last word may hold fewer than 4
-//! codes), so it rides in a `[L]` metadata buffer (`Plan::ComputeMeta`). Branchless (the c<L tail check is
+//! codes), so it rides in a `[L]` metadata buffer (launch metadata). Branchless (the c<L tail check is
 //! a multiply mask), so it imports and `spirv-val`s on both backends. card 044 / spec 055.
 
 #![crate_type = "lib"]

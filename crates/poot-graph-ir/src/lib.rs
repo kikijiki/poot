@@ -41,8 +41,8 @@ pub use index_guard::{
     recognize_index_bounds_guard,
 };
 pub use op::{
-    BinOp, DENSE_CONTRACTION_WEIGHT_DTYPES, DENSE_ROW_GATHER_SOURCE_DTYPES, OpClass, OpKind, RedOp,
-    UnOp,
+    AttentionAttrs, BinOp, DENSE_CONTRACTION_WEIGHT_DTYPES, DENSE_ROW_GATHER_SOURCE_DTYPES,
+    KeyLayout, KvBound, MaskOperand, OpClass, OpKind, RedOp, UnOp,
 };
 pub use packed_source::{PackedSourceName, packed_source_constants, packed_source_type};
 pub use types::{Scalar, TensorType};

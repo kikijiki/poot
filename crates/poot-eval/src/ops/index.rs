@@ -8,12 +8,6 @@ use poot_tensor::HostTensor;
 
 use crate::EvalError;
 
-/// `Iota { len }`: the range `[0, len)` in F32. The folded `Storage::Computed` constant the walks
-/// materialize must agree with this element for element.
-pub(crate) fn iota(len: usize) -> HostTensor {
-    HostTensor::f32(vec![len], (0..len).map(|i| i as f32).collect::<Vec<_>>())
-}
-
 /// `PackI8`: pack 4 int8 codes per i32 word along the last axis (spec 048); the output is an I32
 /// tensor. `x` is normally an f32 quantization result (`round`/`clamp` do the real work); a BF16/F16
 /// operand widens exactly, and an I32 operand's already-integer words (exact below 2^24) are read as
@@ -56,35 +50,6 @@ pub(crate) fn unpack_i8(
             data[r * len + c] = byte as i8 as f32;
         }
     }
-    Ok(HostTensor::f32(out_shape.to_vec(), data))
-}
-
-/// Card 405: the E4M3 row of `DENSE_ROW_GATHER_SOURCE_DTYPES`: the table's rows selected by
-/// authoritative I32 ids (through the one [`super::gather::gather`] engine) and decoded to f32 in one
-/// step.
-pub(crate) fn dense_row_gather_e4m3(
-    table: &HostTensor,
-    index: &HostTensor,
-    out_shape: &[usize],
-    eqn: ValueId,
-) -> Result<HostTensor, EvalError> {
-    let rows = index.as_i32().ok_or_else(|| {
-        EvalError::unsupported("dense_row_gather", "the row ids must be an I32 tensor")
-    })?;
-    let bytes = table.view().bytes();
-    let selected = super::gather::gather(
-        |i| bytes[i],
-        table.shape(),
-        |p| IndexValue::I32(rows[p]),
-        rows.len(),
-        index.shape(),
-        0,
-        eqn,
-    )?;
-    let data: Vec<f32> = selected
-        .iter()
-        .map(|&b| poot_quant::scalar::e4m3fn_to_f32(b))
-        .collect();
     Ok(HostTensor::f32(out_shape.to_vec(), data))
 }
 

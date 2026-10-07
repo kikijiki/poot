@@ -63,10 +63,9 @@ fn pack_unpack_i8_gpu_matches_cpu() {
 
 #[test]
 fn pack_unpack_i8_plan_selection() {
-    // The INT8 KV-cache pack/unpack kernels lower to the imported ComputeMeta kernels (keys "pack_i8:imported" /
+    // The INT8 KV-cache pack/unpack kernels lower to the imported metadata-launch kernels (keys "pack_i8:imported" /
     // "unpack_i8:imported", meta=[L]) on both backends. No GPU.
     use poot_graph_ir::op::OpKind;
-    use poot_graph_plan::Plan;
     use poot_target::Backend;
     let plan_of = |g: &poot_graph_ir::Graph, want: fn(&OpKind) -> bool, backend| {
         let eqn = g.eqns.iter().find(|e| want(&e.op)).unwrap();
@@ -85,25 +84,27 @@ fn pack_unpack_i8_plan_selection() {
         let packed = b.pack_i8(x);
         let out = b.unpack_i8(packed, 10);
         let g = b.finish(out);
-        match plan_of(&g, |op| matches!(op, OpKind::PackI8), backend) {
-            (Plan::ComputeMeta { meta, .. }, choice) => {
+        let (plan_, choice_) = plan_of(&g, |op| matches!(op, OpKind::PackI8), backend);
+        match (single_meta(&plan_), choice_) {
+            (Some(meta @ [_, ..]), choice) => {
                 assert!(
                     is_imported(&choice, ImportedKernel::PackI8),
                     "{backend:?}: {choice:?}"
                 );
                 assert_eq!(meta, vec![10u32], "pack meta=[L] {backend:?}");
             }
-            _ => panic!("pack_i8 {backend:?} should be the imported ComputeMeta kernel"),
+            _ => panic!("pack_i8 {backend:?} should be the imported metadata-launch kernel"),
         }
-        match plan_of(&g, |op| matches!(op, OpKind::UnpackI8 { .. }), backend) {
-            (Plan::ComputeMeta { meta, .. }, choice) => {
+        let (plan_, choice_) = plan_of(&g, |op| matches!(op, OpKind::UnpackI8 { .. }), backend);
+        match (single_meta(&plan_), choice_) {
+            (Some(meta @ [_, ..]), choice) => {
                 assert!(
                     is_imported(&choice, ImportedKernel::UnpackI8),
                     "{backend:?}: {choice:?}"
                 );
                 assert_eq!(meta, vec![10u32], "unpack meta=[len] {backend:?}");
             }
-            _ => panic!("unpack_i8 {backend:?} should be the imported ComputeMeta kernel"),
+            _ => panic!("unpack_i8 {backend:?} should be the imported metadata-launch kernel"),
         }
     }
 }

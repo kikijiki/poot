@@ -6,7 +6,7 @@
 //! [`validate_kernel_resources`], so no plan that cannot run reaches a loader.
 
 use poot_kernelgen::{KernelRequirements, SerialWork};
-use poot_target::{Backend, DeviceCaps};
+use poot_target::{Backend, BufferStorage, DeviceCaps};
 
 use crate::device_validation::validate_kernel_resources;
 use crate::imported::SerialLoop;
@@ -64,10 +64,29 @@ pub(crate) fn map_fused_op(site: Site<'_>, op: FusedOp) -> Result<kg::FusedScala
         FusedOp::Unary(GUnOp::Sqrt) => kg::FusedScalarOp::Math(MathOp::Sqrt),
         FusedOp::Unary(GUnOp::Tanh) => kg::FusedScalarOp::Tanh,
         FusedOp::Unary(GUnOp::Erf) => kg::FusedScalarOp::Erf,
-        FusedOp::Unary(_) | FusedOp::Select => {
+        // The widening itself is the leaf's lane decode: see `FusedScalarOp::Widen`.
+        FusedOp::Cast { to: DType::F32 } => kg::FusedScalarOp::Widen,
+        FusedOp::Unary(_) | FusedOp::Select | FusedOp::Cast { .. } => {
             return Err(site.refuse(Capability::FusedStep(FusedStepGap::OpInFloatRegion(op))));
         }
     })
+}
+
+/// The kernel op of one step of a pointwise region (`OpKind::Fused`): the one place `Select` is admitted
+/// into a float region, whose I32 condition leaf only a pointwise kernel reads. A row or epilogue region
+/// reads float lanes only and goes through [`map_fused_op`], which refuses it.
+pub(crate) fn map_pointwise_op(
+    site: Site<'_>,
+    op: FusedOp,
+    exact_i32: bool,
+) -> Result<kg::FusedScalarOp, PlanError> {
+    if exact_i32 {
+        map_fused_op_i32(site, op)
+    } else if op == FusedOp::Select {
+        Ok(kg::FusedScalarOp::Select)
+    } else {
+        map_fused_op(site, op)
+    }
 }
 
 pub(crate) fn map_fused_op_i32(
@@ -81,10 +100,43 @@ pub(crate) fn map_fused_op_i32(
         FusedOp::Unary(GUnOp::Not) => kg::FusedScalarOp::Unary(UnOp::Not),
         FusedOp::Unary(GUnOp::Clz) => kg::FusedScalarOp::Clz,
         FusedOp::Select => kg::FusedScalarOp::Select,
-        FusedOp::Unary(_) => {
+        FusedOp::Unary(_) | FusedOp::Cast { .. } => {
             return Err(site.refuse(Capability::FusedStep(FusedStepGap::OpInExactRegion(op))));
         }
     })
+}
+
+/// Refuses a `Cast` step of a float region unless it widens one of the region's own inputs (`is_input`): the
+/// lowering widens by reading the input through its narrow lane, so a `Cast` of a computed value has no
+/// lowering.
+pub(crate) fn check_widening_step(
+    site: Site<'_>,
+    op: FusedOp,
+    inputs: &[FusedOperand],
+    is_input: impl Fn(usize) -> bool,
+) -> Result<(), PlanError> {
+    match (op, inputs) {
+        (FusedOp::Cast { .. }, [FusedOperand::Local(id)]) if is_input(*id) => Ok(()),
+        (FusedOp::Cast { .. }, _) => {
+            Err(site.refuse(Capability::FusedStep(FusedStepGap::OpInFloatRegion(op))))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// How region input `value`'s elements sit in its buffer, for a region that computes in f32: f32 as stored, or
+/// the packed BF16 lane (`packed`, the storage plan's choice for this operand) a `Cast` step widens in
+/// registers. A narrow input with no packed lane, or any other narrow dtype, has no body.
+pub(crate) fn float_region_leaf_storage(
+    site: Site<'_>,
+    dtype: DType,
+    packed: bool,
+) -> Result<BufferStorage, PlanError> {
+    match dtype {
+        DType::BF16 if packed => Ok(BufferStorage::bf16_packed()),
+        DType::BF16 | DType::F16 => Err(site.refuse(Capability::DtypeLowering)),
+        _ => Ok(BufferStorage::f32()),
+    }
 }
 
 pub(crate) fn map_binop(op: GBinOp) -> BinOp {
@@ -145,7 +197,7 @@ pub(crate) fn finalize(
 
 /// What a choice's kernel declares beyond its body: a generated request declares its own; a shipped
 /// template declares through [`ImportedKernel::needs`], and its serial work follows from the equation's
-/// shapes (see [`SerialLoop`]). A chunked plan's
+/// shapes (see [`SerialLoop`]). A split plan's
 /// dispatches each carry their share (`chunks` of them, as the engine weighs submit batching).
 fn choice_requirements(
     choice: &KernelChoice,
@@ -169,12 +221,6 @@ fn choice_requirements(
             let serial_work = match needs.serial {
                 SerialLoop::None => None,
                 SerialLoop::ContractionDepth => dim(0, 1).map(|k| (out_numel, k as u64)),
-                SerialLoop::AttentionCache => {
-                    let head_dim = g.aval(eqn.out).shape.last().copied().filter(|&d| d > 0);
-                    dim(1, 2)
-                        .zip(head_dim)
-                        .map(|(kv, d)| (out_numel / d as u64, 2 * kv as u64 * d as u64))
-                }
             };
             KernelRequirements {
                 subgroup_lanes: needs.subgroup_lanes,
@@ -184,16 +230,13 @@ fn choice_requirements(
                 }),
             }
         }
-        KernelChoice::NoDispatch(_) | KernelChoice::Chunked(_) => KernelRequirements::default(),
+        KernelChoice::NoDispatch(_) => KernelRequirements::default(),
     }
 }
 
 /// The workgroup shape of a single-dispatch plan.
 fn single_workgroup(plan: &Plan) -> Option<[u32; 3]> {
-    match plan {
-        Plan::Compute { body, .. } | Plan::ComputeMeta { body, .. } => Some(body.workgroup_size),
-        _ => None,
-    }
+    plan.single().map(|dispatch| dispatch.body.workgroup_size)
 }
 
 /// Check every kernel `planned` dispatches: its measured body against `caps`, and the requirements its
@@ -207,30 +250,16 @@ fn validate_planned_resources(
     caps: &DeviceCaps,
 ) -> Result<(), PlanError> {
     let refuse = |refusal| refusal_at(g, eqn, backend, Capability::KernelResources(refusal));
-    match (&planned.plan, &planned.choice) {
-        (Plan::Compute { body, .. } | Plan::ComputeMeta { body, .. }, choice) => {
-            validate_kernel_resources(
-                body,
-                choice_requirements(choice, g, eqn, out_numel, 1),
-                caps,
-            )
-            .map_err(refuse)
-        }
-        (Plan::ComputeChunks(chunks), KernelChoice::Chunked(choices)) => {
-            debug_assert_eq!(chunks.len(), choices.len());
-            for (chunk, choice) in chunks.iter().zip(choices) {
-                validate_kernel_resources(
-                    &chunk.body,
-                    choice_requirements(choice, g, eqn, out_numel, chunks.len()),
-                    caps,
-                )
-                .map_err(refuse)?;
-            }
-            Ok(())
-        }
-        (Plan::ComputeChunks(_), _)
-        | (Plan::Alias(_) | Plan::View { .. } | Plan::Collective { .. }, _) => Ok(()),
+    let dispatches = planned.plan.dispatches();
+    for dispatch in dispatches {
+        validate_kernel_resources(
+            &dispatch.body,
+            choice_requirements(&planned.choice, g, eqn, out_numel, dispatches.len()),
+            caps,
+        )
+        .map_err(refuse)?;
     }
+    Ok(())
 }
 
 /// Shape the launch of a planned equation: the wgpu grid-cap workgroup bump, the elementwise 2-D fold
@@ -258,7 +287,7 @@ fn shape_launch(
     // covers outputs up to ~16.7M elems). FusedRow/Flash own their own wg+grid (row/head parallel), so
     // leave those untouched. NVPTX has no such cap, but the larger wg is harmless there.
     // The bump applies to the one-thread-per-output kernels (the default `out_numel` grid), whether
-    // they dispatch as a plain `Plan::Compute` or as a `Plan::ComputeMeta` (the card-044
+    // they dispatch as a single plain dispatch or as a metadata dispatch (the card-044
     // transpose/slice/broadcast layout swaps via the imported index_remap). It must not touch the ops
     // that size their own launch.
     //
@@ -267,20 +296,16 @@ fn shape_launch(
     // reduction or tile by its baked width, so a bump would corrupt it; the one-thread-per-output
     // contraction bodies run on `Fold`'s fixed-width workgroups. The rest are named below: the row- and
     // head-parallel ops and the shipped matmul bodies, whose launch is the template's.
-    let contraction = match &planned.choice {
-        KernelChoice::Generated(KernelRequest::Contraction(_)) => true,
-        KernelChoice::Generated(KernelRequest::Packed(request)) => {
-            matches!(request.spec.op, kg::PackedKernelOp::Contraction { .. })
-        }
-        _ => false,
-    };
-    let mut plan = &mut planned.plan;
+    let contraction = matches!(
+        &planned.choice,
+        KernelChoice::Generated(KernelRequest::Contraction(_))
+    );
+    let plan = &mut planned.plan;
     let custom_grid = contraction
         || matches!(
             eqn.op,
             OpKind::FusedRow(_)
-            | OpKind::FlashAttentionDecode { .. }
-            | OpKind::FlashAttentionPrefill { .. }
+            | OpKind::Attention(_)
             // Card 551a: every SampleToken body is one fixed-64-lane workgroup per row (the LDS
             // reduce arrays are sized for exactly 64 lanes); the generic bump below would silently
             // corrupt that reduction by redispatching at workgroup_size[0] = 256.
@@ -297,27 +322,17 @@ fn shape_launch(
         // conditional 64-or-256 bump below, which would leave small dispatches at the kernel's stock 64
         // and desync the two `x_groups` derivations once `out_numel` crosses the 65535*64 threshold at
         // wg=64 but not yet 65535*256 at wg=256).
-        let body = match &mut plan {
-            Plan::Compute { body, .. } | Plan::ComputeMeta { body, .. } => Some(body),
-            _ => None,
-        };
-        if let Some(body) = body {
-            body.workgroup_size[0] = ELEMENTWISE_2D_WIDTH as u32;
+        if let Some(dispatch) = plan.single_mut() {
+            dispatch.body.workgroup_size[0] = ELEMENTWISE_2D_WIDTH as u32;
         }
-    } else if !custom_grid {
-        let body = match &mut plan {
-            Plan::Compute { body, .. } | Plan::ComputeMeta { body, .. } => Some(body),
-            _ => None,
-        };
-        if let Some(body) = body {
-            let wg0 = body.workgroup_size[0].max(1) as usize;
-            if out_numel.div_ceil(wg0) > caps.max_grid[0] as usize {
-                body.workgroup_size[0] = 256;
-            }
+    } else if !custom_grid && let Some(dispatch) = plan.single_mut() {
+        let wg0 = dispatch.body.workgroup_size[0].max(1) as usize;
+        if out_numel.div_ceil(wg0) > caps.max_grid[0] as usize {
+            dispatch.body.workgroup_size[0] = 256;
         }
     }
     if single_workgroup(plan) != workgroup_before
-        && let Plan::Compute { body, key, .. } | Plan::ComputeMeta { body, key, .. } = &mut *plan
+        && let Some(Dispatch { body, key, .. }) = plan.single_mut()
     {
         // The choice digest names the body the generator built; the bump above made it a different
         // kernel on this device, so the key must say so (two devices with different grid caps must not
@@ -325,13 +340,15 @@ fn shape_launch(
         let [x, y, z] = body.workgroup_size;
         key.push_str(&format!("+wg{x}x{y}x{z}"));
     }
-    // The typed E4M3FN value kernels use a one-dimensional global index. Unlike the dense elementwise
-    // kernels, they have no 2-D folded body for dispatches beyond the target's x-grid (`caps.max_grid[0]`).
-    // Reject such a materialization while planning, before compilation or buffer allocation. Use the exact packed
-    // output word count for E4M3FN writers; decode owns one thread per logical f32 output.
+    // The E4M3FN pack and unpack casts use a one-dimensional global index. Unlike the movement bodies and
+    // the dense elementwise kernels, they have no 2-D folded form for dispatches beyond the target's x-grid
+    // (`caps.max_grid[0]`). Reject such a launch while planning, before compilation or buffer allocation. Use
+    // the exact packed output word count for E4M3FN writers; decode owns one thread per logical f32 output.
     if backend == Backend::SpirvVulkan
         && (odt == DType::E4M3FN || has_e4m3fn_input)
-        && let Plan::Compute { body, .. } = &plan
+        && let Some(Dispatch { body, launch, .. }) = plan.single()
+        && launch.meta.is_empty()
+        && launch.grid[1] == 1
     {
         let dispatch_threads = if odt == DType::E4M3FN {
             let row_len = out_shape.last().copied().unwrap_or(1);

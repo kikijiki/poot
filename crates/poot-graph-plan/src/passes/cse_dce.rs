@@ -1,3 +1,5 @@
+use poot_graph_ir::graph::ComputedConst;
+
 use super::*;
 
 /// Common-subexpression elimination: collapse structurally identical eqns (same op + same operands)
@@ -5,10 +7,23 @@ use super::*;
 /// matters: e.g. the RoPE `gather(cos_table, pos)` is recomputed in every layer's q and k rope, all
 /// referencing the same const + slot, so CSE folds them to one.
 ///
-/// The value table is preserved (dead entries are harmless); only the eqn list shrinks and the
+/// A [`Storage::Computed`] constant is a pure function of its payload, so two declarations of one
+/// payload are one value: a tracer that declares the RoPE tables per layer still gathers them once
+/// per step. The duplicate's binder is dropped from the graph's inputs, so nothing materializes it.
+///
+/// The rest of the value table is preserved (dead entries are harmless); the eqn list shrinks and the
 /// output is remapped to its canonical value.
 pub fn cse<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
     let mut remap: HashMap<usize, usize> = HashMap::new(); // old value id -> canonical id
+    let mut computed: HashMap<ComputedConst, usize> = HashMap::new();
+    for (id, value) in g.values.iter().enumerate() {
+        if let Storage::Computed(payload) = value.storage {
+            let canon = *computed.entry(payload).or_insert(id);
+            if canon != id {
+                remap.insert(id, canon);
+            }
+        }
+    }
     let mut seen: HashMap<String, usize> = HashMap::new(); // eqn key -> canonical out id
     let mut eqns: Vec<Eqn> = Vec::with_capacity(g.eqns.len());
 
@@ -38,6 +53,8 @@ pub fn cse<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
 
     let canon = |v: usize| remap.get(&v).copied().unwrap_or(v);
     let mut out = Graph { eqns, ..g.clone() };
+    out.inputs.retain(|id| !remap.contains_key(id));
+    out.consts.retain(|id| !remap.contains_key(id));
     out.remap_results(canon);
     out
 }

@@ -153,6 +153,38 @@ impl Buffer {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn from_i32s(values: &[i32]) -> Self {
+        Buffer {
+            elem: Ty::I32,
+            data: values.iter().map(|&v| Scalar::I32(v)).collect(),
+        }
+    }
+
+    /// The elements of a `u32` buffer, or [`InterpError::NotU32`] for any other element type.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn to_u32s(&self) -> Result<Vec<u32>, InterpError> {
+        self.data
+            .iter()
+            .map(|v| match v {
+                Scalar::U32(v) => Ok(*v),
+                _ => Err(InterpError::NotU32(self.elem.clone())),
+            })
+            .collect()
+    }
+
+    /// The elements of an `i32` buffer, or [`InterpError::NotI32`] for any other element type.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn to_i32s(&self) -> Result<Vec<i32>, InterpError> {
+        self.data
+            .iter()
+            .map(|v| match v {
+                Scalar::I32(v) => Ok(*v),
+                _ => Err(InterpError::NotI32(self.elem.clone())),
+            })
+            .collect()
+    }
+
     /// The elements of an `f32` buffer, or [`InterpError::NotF32`] for any other element type.
     #[cfg(any(test, feature = "test-support"))]
     pub fn to_f32s(&self) -> Result<Vec<f32>, InterpError> {
@@ -219,6 +251,10 @@ pub enum InterpError {
     },
     #[error("expected an f32 buffer, found {0:?} elements")]
     NotF32(Ty),
+    #[error("expected a u32 buffer, found {0:?} elements")]
+    NotU32(Ty),
+    #[error("expected an i32 buffer, found {0:?} elements")]
+    NotI32(Ty),
     #[error("workgroup {workgroup:?} lane {lane} at {site}: {fault}")]
     Fault {
         workgroup: [u32; 3],
@@ -613,12 +649,6 @@ impl Workgroup<'_> {
             Rvalue::Bitcast { to, operand } => {
                 let a = self.scalar_operand(lane, operand)?;
                 bitcast(to, a).map(Value::Scalar)
-            }
-            Rvalue::Fp8Decode { format, operand } => {
-                let Scalar::U32(carrier) = self.scalar_operand(lane, operand)? else {
-                    return Err(Fault::IllTyped("fp8 decode reads a u32 carrier"));
-                };
-                Ok(Value::Scalar(Scalar::F32(fp8_decode(*format, carrier))))
             }
             Rvalue::Fp8Encode { format, operand } => {
                 let Scalar::F32(value) = self.scalar_operand(lane, operand)? else {
@@ -1100,23 +1130,6 @@ fn e4m3fn_magnitude(code: u8) -> f32 {
         mantissa / 512.0
     } else {
         (1.0 + mantissa / 8.0) * 2.0f32.powi(exponent - 7)
-    }
-}
-
-fn fp8_decode(format: Fp8Format, carrier: u32) -> f32 {
-    match format {
-        Fp8Format::E4M3Fn => {
-            let code = (carrier & 0xff) as u8;
-            if code & 0x7f == 0x7f {
-                return f32::NAN;
-            }
-            let magnitude = e4m3fn_magnitude(code & 0x7f);
-            if code & 0x80 == 0 {
-                magnitude
-            } else {
-                -magnitude
-            }
-        }
     }
 }
 
@@ -1707,13 +1720,17 @@ mod tests {
     }
 
     #[test]
-    fn e4m3fn_decode_and_encode_agree_on_every_finite_code() {
+    fn e4m3fn_encode_rounds_every_finite_code_back_to_itself() {
         for code in 0u32..=0xff {
             if code & 0x7f == 0x7f {
-                assert!(fp8_decode(Fp8Format::E4M3Fn, code).is_nan(), "0x{code:02x}");
                 continue;
             }
-            let value = fp8_decode(Fp8Format::E4M3Fn, code);
+            let magnitude = e4m3fn_magnitude((code & 0x7f) as u8);
+            let value = if code & 0x80 == 0 {
+                magnitude
+            } else {
+                -magnitude
+            };
             assert_eq!(
                 fp8_encode(Fp8Format::E4M3Fn, value),
                 code,
@@ -1721,10 +1738,9 @@ mod tests {
             );
         }
         // Landmarks.
-        assert_eq!(fp8_decode(Fp8Format::E4M3Fn, 0x38), 1.0);
-        assert_eq!(fp8_decode(Fp8Format::E4M3Fn, 0x7e), 448.0);
-        assert_eq!(fp8_decode(Fp8Format::E4M3Fn, 0x01), 1.0 / 512.0);
-        assert_eq!(fp8_decode(Fp8Format::E4M3Fn, 0xb8), -1.0);
+        assert_eq!(e4m3fn_magnitude(0x38), 1.0);
+        assert_eq!(e4m3fn_magnitude(0x7e), 448.0);
+        assert_eq!(e4m3fn_magnitude(0x01), 1.0 / 512.0);
         // Saturation, NaN, and the tie between 0x38 (1.0) and 0x39 (1.125) going to the even code.
         assert_eq!(fp8_encode(Fp8Format::E4M3Fn, 1.0e9), 0x7e);
         assert_eq!(fp8_encode(Fp8Format::E4M3Fn, f32::INFINITY), 0x7e);
@@ -1894,10 +1910,17 @@ mod tests {
     #[test]
     fn wmma_is_refused_by_name() {
         let mut body = atomic_counter_body(1, AtomicOp::Add);
+        body.locals.push(crate::LocalDecl {
+            ty: Ty::Fragment(crate::FragmentTy::accumulator(
+                crate::WmmaDtype::F16,
+                crate::WmmaShape::M16N16K16,
+            )),
+            mutable: true,
+        });
         body.blocks[1].statements.push(Statement::WmmaZero {
             dtype: crate::WmmaDtype::F16,
             shape: crate::WmmaShape::M16N16K16,
-            dst: l(5),
+            dst: l(6),
         });
         let mut buffers = [Buffer::from_u32s(&[0]), Buffer::from_u32s(&[0])];
         let err = run(&body, [1, 1, 1], &mut buffers).unwrap_err();

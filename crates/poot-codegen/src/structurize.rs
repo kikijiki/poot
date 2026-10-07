@@ -289,9 +289,9 @@ fn duplicate_escape_tail(body: &mut Body, tail: &[usize], idom: &[usize], h: usi
         map_successors(&mut clone.terminator, enter);
         body.blocks.push(clone);
     }
-    for b in 0..region_end {
+    for (b, block) in body.blocks[..region_end].iter_mut().enumerate() {
         if dominates(h, b, idom, 0) {
-            map_successors(&mut body.blocks[b].terminator, enter);
+            map_successors(&mut block.terminator, enter);
         }
     }
 }

@@ -19,7 +19,7 @@ use poot_eval::{EvalBudget, EvalOptions, Value, eval};
 use poot_executor::{Device, Engine, Executor};
 use poot_executor_parity::Fixture;
 use poot_graph_ir::Storage;
-use poot_graph_plan::{Plan, Submission, Target};
+use poot_graph_plan::{Submission, Target};
 use poot_kernel_ir::{Body, Statement};
 use poot_rocm_gpu::device::RocmDevice;
 use poot_runtime_common::DeviceBackend;
@@ -48,11 +48,9 @@ fn dispatched_bodies(fixture: &Fixture, target: Target) -> Vec<(Body, [u32; 3])>
         .flat_map(|(_, _, program)| {
             program
                 .planned()
-                .filter_map(|(_, plan)| match plan {
-                    Plan::Compute { body, grid, .. } | Plan::ComputeMeta { body, grid, .. } => {
-                        Some((body.clone(), *grid))
-                    }
-                    _ => None,
+                .filter_map(|(_, plan)| {
+                    plan.single()
+                        .map(|dispatch| (dispatch.body.clone(), dispatch.launch.grid))
                 })
                 .collect::<Vec<_>>()
         })
@@ -137,9 +135,8 @@ fn tied_moe_routing_picks_the_lowest_index_first_on_rocm() {
 }
 
 /// SC-004. Replaces `probe_rocm_flash_decode_test`, `probe_rocm_flash_prefill_test` and
-/// `probe_rocm_flash_per_head_alibi_mask_test`. Flash decode and flash prefill (the generated region
-/// kernels, and the imported flash prefill that a softcapped prefill selects) with a real per-head
-/// ALiBi mask match the oracle's materialized attention. Every head has its own slope, so a lowering
+/// `probe_rocm_flash_per_head_alibi_mask_test`. Attention decode and prefill (the one generated
+/// attention kernel, with and without a softcap) with a real per-head ALiBi mask match the oracle's materialized attention. Every head has its own slope, so a lowering
 /// that read the mask at head stride 0 would score every head with head 0's row; the row also requires
 /// the oracle itself to tell that apart (the per-head output differs materially from the head-0
 /// broadcast output), so it cannot pass vacuously.
@@ -264,6 +261,35 @@ fn wmma_bf16_matmuls_match_the_oracle_on_rocm() {
         );
         assert_matches_oracle(exec.as_mut(), target, fixture);
     }
+}
+
+/// Card 663 SC-001, ROCm. The batched, multi-block tensor-core matmul: `[2, 32, 48] x [2, 48, 32]` bf16 operands
+/// (`poot_executor_parity::launch::wmma_bf16_batched_fixture`), 2 x 2 x 2 output tiles each accumulating
+/// three 16-wide K blocks, every output element of both steps compared with the oracle. The fixture values give
+/// every K block a distinct nonzero contribution to every output (at least 16 per block), so a dropped, doubled
+/// or wrong-batch block moves all outputs far past the parity tolerance.
+///
+/// Mutation: drop the last K block in `poot-kernelgen`'s `tensor_core_tiles` (the loop bound `k0 < k` becomes
+/// `k0 + 16 < k`), with a fresh `POOT_KERNEL_CACHE_DIR`; every output is short by its last block's
+/// contribution and the row goes red.
+#[test]
+fn batched_multi_block_wmma_matmul_matches_the_oracle_on_rocm() {
+    let Some((mut exec, target)) = rocm() else {
+        return;
+    };
+    let fixture = poot_executor_parity::launch::wmma_bf16_batched_fixture();
+    assert!(
+        dispatched_bodies(&fixture, target)
+            .iter()
+            .any(|(body, _)| body
+                .blocks
+                .iter()
+                .flat_map(|block| &block.statements)
+                .any(|statement| matches!(statement, Statement::WmmaMma { .. }))),
+        "{}: no dispatched kernel multiplies on the WMMA tensor cores",
+        fixture.name
+    );
+    assert_matches_oracle(exec.as_mut(), target, &fixture);
 }
 
 /// SC-008, grid half. Replaces the deleted single-AQL 256-workgroup probe: one elementwise region over
@@ -485,7 +511,7 @@ fn qwen05b_fixture(checkpoint: &std::path::Path, prompt: &[u32]) -> Fixture {
         graph,
         store,
         steps,
-        fusion: poot_graph_plan::FusionPolicy::Full,
+        guarded: false,
     }
 }
 

@@ -1,5 +1,4 @@
-# spec 112: the poot runner for the cross-framework benchmark suite (poot-llm Runner + poot-gpu fused
-# decode). Built with a plain `cargo build --release`; kernels are generated at runtime by kernelgen. Runs
+# spec 112: the poot runner for the cross-framework benchmark suite (the poot-llm driver). Built with a plain `cargo build --release`; kernels are generated at runtime by kernelgen. Runs
 # warmup + timed iterations of a fixed (prompt, gen-tokens) scenario and emits one JSON line (the suite
 # runner contract). A member of the root workspace, so it shares the root Cargo.lock.
 [package]
@@ -17,14 +16,9 @@ path = "src/main.rs"
 
 [dependencies]
 poot-llm = { workspace = true, features = ["rocm"] }
-poot-gpu.workspace = true
-poot-executor.workspace = true
 poot-graph-plan.workspace = true
 poot-models.workspace = true
-poot-profile.workspace = true
 poot-quant.workspace = true
-poot-ptx-gpu.workspace = true
-poot-rocm-gpu.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
 

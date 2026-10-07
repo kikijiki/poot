@@ -386,8 +386,8 @@ fn packed_grouped_linear_is_card356_canonical() -> Result<(), BuilderAppendError
     let graph = b.finish(output);
 
     // The leading two equations are the computed row/expert iotas.
-    assert!(matches!(graph.eqns[0].op, OpKind::Iota { len: 4 }));
-    assert!(matches!(graph.eqns[1].op, OpKind::Iota { len: 3 }));
+    assert!(matches!(graph.eqns[0].op, OpKind::Iota { len: 4, .. }));
+    assert!(matches!(graph.eqns[1].op, OpKind::Iota { len: 3, .. }));
     let expert_iota = graph.eqns[1].out;
     assert_eq!(graph.eqns.len(), 40);
     let perm = graph.eqns[20].out;
@@ -705,5 +705,54 @@ fn ut_transform_neumann_doubling_is_log_op_count() {
         g.eqns.len() > 900,
         "block-recursive C=64 should stay LINEAR (~947 eqns), got {}",
         g.eqns.len()
+    );
+}
+
+/// POOT-1040: a live bound types over F32 only (the decomposition's float `Select` has no BF16/F16 lowering in
+/// the oracle or the planner). BF16 and F16 queries are a typed `DtypeOp` error for `Live`, while the same
+/// operands type under `Capacity`. Mutation: drop `(live && q.dtype != DType::F32)` in `infer_attention`; the
+/// BF16/F16 live rows type and the rejection assertion fails.
+#[test]
+fn a_live_attention_bound_is_typed_for_f32_only() {
+    use crate::error::ShapeError;
+    use crate::op::{AttentionAttrs, KvBound};
+    use crate::types::DType;
+    let (hq, lk, d) = (2, 4, 8);
+    let operands = |dtype| {
+        vec![
+            TensorType::new(vec![1, hq, 1, d], dtype),
+            TensorType::new(vec![1, hq, lk, d], dtype),
+            TensorType::new(vec![1, hq, lk, d], dtype),
+            TensorType::new(vec![1, 1, 1, lk], dtype),
+        ]
+    };
+    let attrs = |bound| AttentionAttrs {
+        bound,
+        ..AttentionAttrs::new(1, 0.5, None)
+    };
+    let len = TensorType::new(vec![1], DType::I32);
+    for dtype in [DType::BF16, DType::F16] {
+        let capacity = OpKind::Attention(attrs(KvBound::Capacity)).infer(&operands(dtype));
+        assert_eq!(
+            capacity.unwrap().dtype,
+            dtype,
+            "{dtype:?} types as capacity"
+        );
+        let mut live_operands = operands(dtype);
+        live_operands.push(len.clone());
+        let live = OpKind::Attention(attrs(KvBound::Live)).infer(&live_operands);
+        assert!(
+            matches!(live, Err(ShapeError::DtypeOp { op: "Attention", dtype: d }) if d == dtype),
+            "{dtype:?} live must be a typed shape error, got {live:?}"
+        );
+    }
+    let mut f32_live = operands(DType::F32);
+    f32_live.push(len);
+    assert_eq!(
+        OpKind::Attention(attrs(KvBound::Live))
+            .infer(&f32_live)
+            .unwrap()
+            .dtype,
+        DType::F32
     );
 }

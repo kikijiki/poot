@@ -24,7 +24,7 @@ use crate::core::sampler::{Sampler, SamplerFault};
 use crate::error::Result;
 
 /// Which suffix (if any) a compiled entry carries after its raw logits. `Logits` is the raw graph:
-/// the host sampling path, and the Runner's `core::speculative` verification and VLM caption path,
+/// the host sampling path, a sampled speculative window's verification and the VLM caption path,
 /// which need the full logits, never a suffix. `Sample(rule)` is [`with_head`]'s
 /// appended suffix, read back as `[rows, 2]` I32 `(token, non_finite_index)` through [`read_tokens`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

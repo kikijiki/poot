@@ -1,14 +1,10 @@
 //! qwen2-generate: load a checkpoint and generate text greedily.
 //!
-//! A checkpoint of a registered family loads as a `driver::ModelHandle` and generates through the
-//! driver on the device `--backend` names (`wgpu`, `rocm`, `ptx`, `vulkan`, or `auto`, the default). A checkpoint
-//! of a family not yet registered (the MoE and hybrid families) loads as a `Runner`:
-//!   (default)         CPU eager reference executor
-//!   --gpu             cached decode on wgpu
-//!   --ptx             captured PTX decode (NVPTX kernels, cudarc; requires an NVIDIA GPU)
-//! The registry decides which: a family it does not know continues on the Runner.
+//! A checkpoint loads as a `driver::ModelHandle` and generates through the driver on the device
+//! `--backend` names (`wgpu`, `rocm`, `ptx`, `vulkan`, or `auto`, the default). A family the registry
+//! does not know is a typed error.
 //! Usage:
-//!   qwen2-generate \[MODEL_PATH\] \[PROMPT\] \[MAX_NEW_TOKENS\] [--backend B] [--gpu|--ptx]
+//!   qwen2-generate \[MODEL_PATH\] \[PROMPT\] \[MAX_NEW_TOKENS\] [--backend B]
 //!
 //! Without `MODEL_PATH` the model is `qwen2.5-0.5b` under the `POOT_MODELS_DIR` directory; with neither, it
 //! exits with an error naming the variable.
@@ -19,14 +15,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use poot_graph_plan::{CompileLimits, CompileOptions, FusionPolicy, Submission};
-use poot_llm::driver::error::{DriverError, Unsupported};
+use poot_graph_plan::{CompileLimits, CompileOptions, Submission};
+use poot_llm::GenerationControl;
 use poot_llm::driver::{
     BackendChoice, Driver, DriverOptions, GenerateRequest, ModelHandle, PreparedSetLimits,
     open_executor,
 };
-use poot_llm::{GenerationControl, Runner, Sampler};
-use poot_models::registry::{Registry, RegistryError};
+use poot_models::registry::Registry;
 
 /// The value after a `--name` flag, if present (e.g. `--backend rocm`).
 fn flag_val(args: &[String], name: &str) -> Option<String> {
@@ -74,7 +69,6 @@ fn generate_on_driver(
     );
     let compile = CompileOptions {
         execution: Submission::Replay,
-        fusion: FusionPolicy::Full,
         limits: CompileLimits::STANDARD,
     };
     let options = DriverOptions {
@@ -88,6 +82,7 @@ fn generate_on_driver(
             max_retained_bytes: NonZeroU64::new(1 << 32).expect("nonzero"),
         },
         charge: poot_llm::driver::program_retention,
+        draft: poot_llm::driver::DraftPolicy::Off,
     };
     let mut driver = Driver::new(Arc::clone(&handle), open_executor(choice)?, options)?;
     // Generated text is program output (stdout), distinct from status logs (tracing).
@@ -111,58 +106,6 @@ fn generate_on_driver(
         finish = ?generation.finish,
         "generation complete"
     );
-    Ok(())
-}
-
-/// Generate on the Runner: the families the registry does not know yet.
-fn generate_on_runner(path: &Path, args: &[String], prompt: &str, max_new: usize) -> Result<()> {
-    let runner = if path.is_dir() {
-        Runner::load(path)?
-    } else {
-        Runner::load_gguf(path)?
-    };
-    let use_gpu = args.iter().any(|a| a == "--gpu");
-    let use_ptx = args.iter().any(|a| a == "--ptx");
-    let config = runner.config();
-    tracing::info!(
-        hidden = config.hidden,
-        layers = config.layers,
-        n_heads = config.n_heads,
-        n_kv_heads = config.n_kv_heads,
-        head_dim = config.head_dim,
-        vocab = config.vocab,
-        "model config (runner)"
-    );
-
-    emit(prompt);
-    let on_piece = |piece: &str| {
-        emit(piece);
-        GenerationControl::Continue(())
-    };
-    let tokens = if use_gpu {
-        let mut engine = poot_executor::Engine::new(poot_gpu::device::WgpuDevice::new()?);
-        let exe = runner.load_on(&mut engine)?;
-        runner.generate_kv_gpu_cached(prompt, max_new, &mut engine, exe, on_piece)?
-    } else if use_ptx {
-        // captured PTX decode; needs an NVIDIA GPU at runtime (kernels JIT'd here if llc is present).
-        let mut engine = poot_executor::Engine::new(
-            poot_ptx_gpu::PtxDevice::new().context("init PtxDevice (libcuda present?)")?,
-        );
-        let exe = runner.load_on(&mut engine)?;
-        runner.generate_kv_gpu_cached_sampled(
-            prompt,
-            max_new,
-            &mut engine,
-            exe,
-            &mut Sampler::greedy(),
-            &[],
-            on_piece,
-        )?
-    } else {
-        runner.generate(prompt, max_new, on_piece)?
-    };
-    println!();
-    tracing::info!(full = %runner.decode(&tokens)?, "generation complete");
     Ok(())
 }
 
@@ -196,9 +139,6 @@ fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
-    // POOT_DEBUG_NAN=1 logs the first non-finite forward eqn: a typed choice this binary makes
-    // (ADR-0104 decision 5), read here rather than inside poot-llm's own library code.
-    poot_llm::arm_nan_tap(std::env::var("POOT_DEBUG_NAN").is_ok_and(|v| v == "1"));
     let args: Vec<String> = std::env::args().collect();
     // positional args skip the flags (anything starting with '-' and the value after a valued flag).
     let valued: [&str; 1] = ["--backend"];
@@ -229,11 +169,6 @@ fn main() -> Result<()> {
     tracing::info!(model_path, "loading model");
     let path = Path::new(&model_path);
     let registry = Registry::builtin()?;
-    match ModelHandle::load(path, &registry) {
-        Ok(handle) => generate_on_driver(handle, choice, &prompt, max_new),
-        Err(DriverError::Unsupported(Unsupported::Registry(RegistryError::Unregistered {
-            ..
-        }))) => generate_on_runner(path, &args, &prompt, max_new),
-        Err(error) => Err(error.into()),
-    }
+    let handle = ModelHandle::load(path, &registry, &poot_llm::driver::LoadOptions::default())?;
+    generate_on_driver(handle, choice, &prompt, max_new)
 }

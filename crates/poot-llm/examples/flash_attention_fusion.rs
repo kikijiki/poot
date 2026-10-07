@@ -33,14 +33,14 @@ fn main() {
 
     // Default pipeline without flash (cse + pointwise/row fusion) vs with it (`optimize` = cse ->
     // flash_attention -> dce -> fuse). flash_attention collapses each layer's materialized attention chain
-    // (transpose K, QKt matmul, scale, mask add, softmax, PV matmul) into one FlashAttentionDecode op.
+    // (transpose K, QKt matmul, scale, mask add, softmax, PV matmul) into one Attention op.
     let no_flash = poot_graph_plan::fuse(&poot_graph_plan::cse(&g));
     let with_flash = optimize(&g);
 
     let n_flash = with_flash
         .eqns
         .iter()
-        .filter(|e| matches!(e.op, OpKind::FlashAttentionDecode { .. }))
+        .filter(|e| matches!(e.op, OpKind::Attention(_)))
         .count();
 
     let (d0, m0) = (
@@ -57,7 +57,7 @@ fn main() {
         LAYERS
     );
     println!(
-        "flash_attention rewrote {n_flash} attention chains -> {n_flash} FlashAttentionDecode ops (one per layer).\n"
+        "flash_attention rewrote {n_flash} attention chains -> {n_flash} Attention ops (one per layer).\n"
     );
     println!("                       no flash    with flash");
     println!(

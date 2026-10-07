@@ -14,7 +14,7 @@ see [Develop](../develop/index.md).
 poot is being refactored. This is not available yet and is planned to return.
 :::
 
-Today the server starts, parses and bounds requests, and serves encoder embeddings and reranking. `/v1/completions` and `/v1/chat/completions` return `503`, and `/health` reports `"engine_loaded": false`. Continuous batching, speculative decoding, tensor parallelism, pooled MoE serving, vision-language serving, LoRA adapters, Gemma 4 and Qwen3-Next are not available yet.
+Today the server starts, parses and bounds requests, and serves encoder embeddings and reranking. `/v1/completions` and `/v1/chat/completions` return `503`, and `/health` reports `"engine_loaded": false`. Continuous batching, speculative decoding, tensor parallelism, pooled MoE serving, vision-language serving, LoRA adapters and Qwen3-Next are not available yet.
 
 Design and paper provenance for continuous batching, speculative decoding, LoRA, quantization,
 and tensor parallelism live under [Serving design](../architecture/serving-design.mdx).

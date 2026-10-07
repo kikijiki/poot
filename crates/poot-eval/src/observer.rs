@@ -13,9 +13,9 @@ pub trait EvalObserver {
     /// An equation's output was reserved: `eqn` is its position in `Graph::eqns`, `out` its value id.
     ///
     /// `EvalBudget`/this hook are a materialization ceiling for the packed, cast and Spec-376 BF16
-    /// arms (`walk.rs`'s `opts.charge` call sites: `PackedDequant`, `PackedContraction`,
+    /// arms (`walk.rs`'s `opts.charge` call sites: `PackedDequant`,
     /// `PackedRowGather`, `Cast`'s `I32 -> F32` and BF16 widens, and the Spec-376 `Widen`/`Gather`/
-    /// `RowGatherWiden`/`WeightMatMul`/`WeightContraction` arms) - the paths where one equation can
+    /// `WeightMatMul` arms) - the paths where one equation can
     /// lazily materialize an allocation whose size depends on a checkpoint table far larger than the
     /// graph's own declared shapes would suggest. Every intermediate of a
     /// composite's decomposition charges too (Card 556), attributed to the composite equation: a
@@ -38,45 +38,3 @@ pub trait EvalObserver {
 
 /// A no-op observer: the default when a caller passes none.
 impl EvalObserver for () {}
-
-/// Names the first equation whose output holds a non-finite F32/BF16/F16 element (the `POOT_DEBUG_NAN`
-/// successor, card 537/554d): a production caller opts in by passing `&mut NanTap::default()` as
-/// `EvalOptions::observer`, instead of this crate reading an environment variable itself.
-#[derive(Debug, Default)]
-pub struct NanTap {
-    first: Option<NanTapHit>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct NanTapHit {
-    pub eqn: usize,
-    pub out: ValueId,
-    pub dtype: DType,
-}
-
-impl NanTap {
-    /// The first equation this tap saw with a non-finite output, if any.
-    pub fn first(&self) -> Option<NanTapHit> {
-        self.first
-    }
-
-    fn note(&mut self, eqn: usize, out: ValueId, dtype: DType, non_finite: bool) {
-        if non_finite && self.first.is_none() {
-            self.first = Some(NanTapHit { eqn, out, dtype });
-        }
-    }
-}
-
-impl EvalObserver for NanTap {
-    fn value(&mut self, eqn: usize, out: ValueId, value: &Value) {
-        if let Value::Host(tensor) = value
-            && matches!(tensor.dtype(), DType::F32 | DType::BF16 | DType::F16)
-            && let Ok(view) = tensor.to_f32()
-        {
-            // A BF16/F16 output is held as words; widen exactly so its non-finite values are scanned
-            // too, not just the plain F32 payload.
-            let non_finite = view.iter().any(|v| !v.is_finite());
-            self.note(eqn, out, tensor.dtype(), non_finite);
-        }
-    }
-}

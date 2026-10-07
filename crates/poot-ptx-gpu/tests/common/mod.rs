@@ -16,8 +16,8 @@ use poot_eval::Value;
 use poot_executor::{Device, EntryId, ExecutableId, Executor, NoSync, StepInputs};
 use poot_graph_ir::{Graph, PackedSourceName, Storage, ValueId};
 use poot_graph_plan::{
-    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, FusionPolicy, Partition,
-    StagedProgram, Submission, Target, TargetSet, compile_staged,
+    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram,
+    Submission, Target, TargetSet, compile_staged,
 };
 use poot_ptx_gpu::PtxDevice;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
@@ -27,9 +27,11 @@ use poot_tensor::HostTensor;
 pub fn staged_program(
     g: &Graph,
     target: Target,
-    fusion: FusionPolicy,
+    guarded: bool,
 ) -> StagedProgram<poot_graph_ir::ValidationOutputs> {
-    let g = g.clone().with_validations(Vec::new());
+    let (g, caps) = poot_test_util::graph_fixtures::pipeline_input(g, target.caps, guarded);
+    let target = Target { caps, ..target };
+    let g = g.with_validations(Vec::new());
     compile_staged(
         &g,
         &TargetSet::single(DeviceId(0), target),
@@ -39,7 +41,6 @@ pub fn staged_program(
         },
         &CompileOptions {
             execution: Submission::Replay,
-            fusion,
             limits: poot_graph_plan::CompileLimits::STANDARD,
         },
     )
@@ -48,8 +49,8 @@ pub fn staged_program(
 
 /// A [`WeightStore`] holding every `Storage::Const` value `g` declares, read from `inputs` by name
 /// (Z8). A dense `Value` becomes one `WeightEntry::Dense`; a `Value::Packed` becomes one
-/// `WeightEntry::Packed` keyed by its [`PackedSourceName`]'s `linear_id` (card 642's const naming)
-/// - every role-component of one packed linear shares its owner's identical
+/// `WeightEntry::Packed` keyed by its [`PackedSourceName`]'s `linear_id` (card 642's const naming),
+/// where every role-component of one packed linear shares its owner's identical
 /// `Arc<PackedPayload>`, so the first role seen for a `linear_id` inserts it and later roles are a
 /// no-op, exactly mirroring `poot-llm`'s `Runner::load_on`/`weight_store`.
 fn const_store(g: &Graph, inputs: &HashMap<ValueId, Value>) -> WeightStore {
@@ -66,11 +67,21 @@ fn const_store(g: &Graph, inputs: &HashMap<ValueId, Value>) -> WeightStore {
             .unwrap_or_else(|| panic!("no value bound for const {name}"));
         match value {
             Value::Host(dense) => {
-                let bytes: Arc<[u8]> =
-                    Arc::from(bytemuck::cast_slice::<f32, u8>(dense.as_f32().unwrap()));
-                let entry =
-                    DenseWeight::try_new(poot_tensor::DType::F32, dense.shape().to_vec(), bytes)
-                        .unwrap_or_else(|e| panic!("{name}: {e}"));
+                let (dtype, bytes): (_, Arc<[u8]>) = match dense.dtype() {
+                    poot_tensor::DType::F32 => (
+                        poot_tensor::DType::F32,
+                        Arc::from(bytemuck::cast_slice::<f32, u8>(dense.as_f32().unwrap())),
+                    ),
+                    poot_tensor::DType::BF16 => (
+                        poot_tensor::DType::BF16,
+                        Arc::from(bytemuck::cast_slice::<u16, u8>(dense.as_half().unwrap())),
+                    ),
+                    other => panic!(
+                        "{name}: dense const dtype {other:?} is not supported by this test helper"
+                    ),
+                };
+                let entry = DenseWeight::try_new(dtype, dense.shape().to_vec(), bytes)
+                    .unwrap_or_else(|e| panic!("{name}: {e}"));
                 builder
                     .insert(name.clone(), WeightEntry::Dense(entry))
                     .unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -125,16 +136,16 @@ pub fn run_resident(
     g: &Graph,
     inputs: &HashMap<ValueId, Value>,
 ) -> HostTensor {
-    run_resident_with_fusion(device, g, inputs, FusionPolicy::Full)
+    run_resident_with_fusion(device, g, inputs, false)
 }
 
-/// Like [`run_resident`], but with an explicit fusion policy (for a test that compares two policies'
+/// Like [`run_resident`], but `guarded` compiles under the routed-expert hang guard (for a test that compares the two programs.
 /// output, e.g. a fused-vs-unfused regression).
 pub fn run_resident_with_fusion(
     device: &mut PtxDevice,
     g: &Graph,
     inputs: &HashMap<ValueId, Value>,
-    fusion: FusionPolicy,
+    guarded: bool,
 ) -> HostTensor {
     let mut engine = poot_executor::Engine::new(PtxDeviceProxy(device));
     let exe = engine
@@ -143,7 +154,7 @@ pub fn run_resident_with_fusion(
             poot_executor::WeightSource::ConstNames,
         )
         .expect("load_weights");
-    let staged = staged_program(g, Device::target(engine.device()), fusion);
+    let staged = staged_program(g, Device::target(engine.device()), guarded);
     let entry = engine.add_entry(exe, &staged).expect("add_entry");
     let bytes = engine
         .step(exe, entry, &slot_inputs(g, inputs), &mut NoSync)
@@ -172,7 +183,7 @@ pub fn run_resident_i32(
             poot_executor::WeightSource::ConstNames,
         )
         .expect("load_weights");
-    let staged = staged_program(g, Device::target(engine.device()), FusionPolicy::Full);
+    let staged = staged_program(g, Device::target(engine.device()), false);
     let entry = engine.add_entry(exe, &staged).expect("add_entry");
     let bytes = engine
         .step(exe, entry, &slot_inputs(g, inputs), &mut NoSync)
@@ -199,7 +210,7 @@ impl<'d> DecodeEntry<'d> {
         device: &'d mut PtxDevice,
         g: &Graph,
         inputs: &HashMap<ValueId, Value>,
-        fusion: FusionPolicy,
+        guarded: bool,
     ) -> Self {
         let mut engine = poot_executor::Engine::new(PtxDeviceProxy(device));
         let exe = engine
@@ -208,7 +219,7 @@ impl<'d> DecodeEntry<'d> {
                 poot_executor::WeightSource::ConstNames,
             )
             .expect("load_weights");
-        let staged = staged_program(g, Device::target(engine.device()), fusion);
+        let staged = staged_program(g, Device::target(engine.device()), guarded);
         let entry = engine.add_entry(exe, &staged).expect("add_entry");
         Self {
             engine,
@@ -255,11 +266,7 @@ impl<'d> DecodeEntry<'d> {
             poot_graph_ir::StateRole::Recurrent,
         );
         let probe = b.finish(state);
-        let staged = staged_program(
-            &probe,
-            Device::target(self.engine.device()),
-            FusionPolicy::Full,
-        );
+        let staged = staged_program(&probe, Device::target(self.engine.device()), false);
         let probe_entry = self
             .engine
             .add_entry(self.exe, &staged)

@@ -106,8 +106,9 @@ fn assert_publishes_before_delivery(
 /// The commit path: both of `commit_token`'s terminal sends (EOS and stop/`max_new`), each delivered to
 /// a live receiver and undelivered to a dropped one.
 #[test]
+#[ignore = "constructs a Runner and no family loads on it (POOT-740); POOT-739 retypes serve onto ModelHandle and re-enables this row"]
 fn commit_token_publishes_the_terminal_count_before_done_is_delivered() {
-    let model_path = write_tiny_granitemoe_gguf();
+    let model_path = write_tiny_runner_gguf();
     let runner = Runner::load_gguf(&model_path).expect("load terminal fixture runner");
     let _ = std::fs::remove_file(&model_path);
     for branch in [TerminalBranch::Eos, TerminalBranch::MaxNew] {

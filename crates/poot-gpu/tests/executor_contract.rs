@@ -21,8 +21,8 @@ use poot_gpu::device::WgpuDevice;
 use poot_graph_ir::PackedSourceName;
 use poot_graph_ir::{Graph, Slot, SlotKey, StateRole, Storage, TensorType, ValueId};
 use poot_graph_plan::{
-    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, FusionPolicy, Partition,
-    Submission, Target, TargetSet, compile_staged,
+    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, Submission, Target,
+    TargetSet, compile_staged,
 };
 use poot_models::model::{LogitRows, Phase};
 use poot_quant::PackedComponentRef;
@@ -135,7 +135,6 @@ fn staged(
         },
         &CompileOptions {
             execution: submission,
-            fusion: FusionPolicy::Full,
             limits: poot_graph_plan::CompileLimits::STANDARD,
         },
     )
@@ -227,7 +226,7 @@ fn oracle_step(
                     .or_insert_with(|| HostTensor::zeros(meta.aval.shape.clone()))
                     .clone(),
             ),
-            Storage::Computed(c) => Value::from(HostTensor::f32(c.shape(), c.values_f32())),
+            Storage::Computed(c) => Value::from(c.tensor()),
             Storage::Slot(_) => {
                 let key = meta.slot_key().unwrap();
                 let v = values.iter().find(|v| &v.key == key).unwrap();
@@ -258,7 +257,9 @@ fn oracle_step(
 
 fn bytemuck_f32(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
@@ -1314,7 +1315,6 @@ fn planted_bad_validation_packet_fails_before_any_output_readback() {
         },
         &poot_graph_plan::CompileOptions {
             execution: Submission::Replay,
-            fusion: poot_graph_plan::FusionPolicy::Full,
             limits: poot_graph_plan::CompileLimits::STANDARD,
         },
     )
@@ -1340,7 +1340,7 @@ fn planted_bad_validation_packet_fails_before_any_output_readback() {
 /// `compile`'s own legalization (card 380/381: `fold_dense_contractions`,
 /// `fold_dense_bf16_row_gathers`) rewrites `Cast(Reshape(Gather(w)))` into `DenseRowGather` and
 /// `MatMul(x, Transpose(w))` into `DenseContraction`, both reading `w` directly - exactly the two
-/// `packed_bf16_reader_operand` cases - so `w` stays eligible to stay BF16-native (packed two
+/// `packed_bf16_reader` cases - so `w` stays eligible to stay BF16-native (packed two
 /// elements per `u32` word on SpirvVulkan) rather than being widened to F32 (no
 /// pass retypes a const, Card 1011). The residency map holds one buffer per (store key, planned
 /// `BufferStorage`): `stats().memory`'s `Weight` total is exactly `rows*cols*2` bytes (native BF16),
@@ -1466,92 +1466,4 @@ fn bf16_embed_weight_feeds_gather_and_decode_gemv_with_no_host_f32_copy() {
         .unwrap()
         .to_vec();
     assert_close_rel(&actual, &oracle, 1e-4);
-}
-
-/// Card 552: a real qwen2 decode entry on `WgpuDevice::new_with_timing(4)` produces measured,
-/// honest device time through the production `step()` path - `DeviceTime::Measured` with a
-/// positive `sum_of_dispatch_durations`, one `DispatchTiming` per dispatch in the entry's
-/// recording, each a real `OpKind::kind_name` (never the empty/placeholder string) - while a
-/// sibling engine over `WgpuDevice::new()` (the counters-only default) stays `DeviceTime::Unknown`
-/// for the identical graph and inputs. Skips cleanly without a wgpu adapter.
-///
-/// MUTATION (recorded here, not left in the tree; Card 552): in `WgpuDevice::device_time`, return
-/// `DeviceTime::Unknown` unconditionally (the pre-552 behavior) instead of draining
-/// `drain_device_timing`. Result: RED - "timed device must report Measured, got Unknown".
-/// Reverted: GREEN.
-#[test]
-fn wgpu_device_timing_produces_measured_per_dispatch_device_time() {
-    let Some(timed_device) = WgpuDevice::new_with_timing(4).ok() else {
-        eprintln!("skip: no wgpu adapter");
-        return;
-    };
-    let Some(plain_device) = require_wgpu() else {
-        eprintln!("skip: no wgpu adapter");
-        return;
-    };
-    let target = wgpu_target(&timed_device);
-    let g = decode_graph(&dense(), CAP);
-    let store = Arc::new(store_for(&[&g]));
-
-    let mut timed = poot_executor::Engine::with_timing(
-        timed_device,
-        poot_executor::TimingOptions::Detailed(poot_executor::DetailedTiming::every_step(
-            4, 256, 4,
-        )),
-    );
-    let exe_t = timed
-        .load_weights(Arc::clone(&store), poot_executor::WeightSource::ConstNames)
-        .unwrap();
-    let decode_t = timed
-        .add_entry(exe_t, &staged(&g, target, Submission::Replay))
-        .unwrap();
-
-    let mut plain = poot_executor::Engine::new(plain_device);
-    let exe_p = plain
-        .load_weights(store, poot_executor::WeightSource::ConstNames)
-        .unwrap();
-    let decode_p = plain
-        .add_entry(exe_p, &staged(&g, target, Submission::Replay))
-        .unwrap();
-
-    let values = slot_values(&g, &[5], 0);
-    let time_t = timed
-        .step(exe_t, decode_t, &step_inputs(&values), &mut NoSync)
-        .unwrap()
-        .device_time();
-    let time_p = plain
-        .step(exe_p, decode_p, &step_inputs(&values), &mut NoSync)
-        .unwrap()
-        .device_time();
-
-    assert_eq!(
-        time_p,
-        poot_executor::DeviceTime::Unknown,
-        "counters-only mode must never fabricate a measurement"
-    );
-    let poot_executor::DeviceTime::Measured(measured) = time_t else {
-        panic!("timed device must report Measured, got {time_t:?}");
-    };
-    let sum = measured
-        .sum_of_dispatch_durations
-        .expect("a real decode step dispatches real kernels");
-    assert!(sum.as_nanos() > 0, "positive device time: {sum:?}");
-    assert!(
-        !measured.dispatches.is_empty(),
-        "detailed mode must retain per-dispatch records"
-    );
-    for d in &measured.dispatches {
-        assert!(
-            d.duration.as_nanos() > 0,
-            "every retained dispatch must have a positive duration"
-        );
-    }
-
-    // The engine's own cumulative timing counters (Card 552) reflect the step above exactly.
-    let stats = timed.stats();
-    assert_eq!(
-        stats.timing.cumulative(decode_t.raw()).steps,
-        1,
-        "the step above must be reflected in the engine's cumulative timing counters"
-    );
 }

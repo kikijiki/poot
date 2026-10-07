@@ -232,6 +232,9 @@ pub struct DenseKeys {
     pub theta: &'static str,
     pub rope_scaling_type: &'static str,
     pub rope_scaling_factor: &'static str,
+    pub rope_scaling_original: &'static str,
+    pub yarn_beta_fast: &'static str,
+    pub yarn_beta_slow: &'static str,
 }
 
 /// [`DenseKeys`] for a literal architecture prefix: `dense_keys!("llama")`.
@@ -249,6 +252,9 @@ macro_rules! dense_keys {
             theta: concat!($arch, ".rope.freq_base"),
             rope_scaling_type: concat!($arch, ".rope.scaling.type"),
             rope_scaling_factor: concat!($arch, ".rope.scaling.factor"),
+            rope_scaling_original: concat!($arch, ".rope.scaling.original_context_length"),
+            yarn_beta_fast: concat!($arch, ".rope.scaling.yarn_beta_fast"),
+            yarn_beta_slow: concat!($arch, ".rope.scaling.yarn_beta_slow"),
         }
     };
 }
@@ -289,6 +295,20 @@ pub struct DenseDims {
 
 impl DenseDims {
     pub fn read(fields: &Fields<'_>, spec: &DenseSpec) -> Result<Self, ModelError> {
+        Self::read_with_inter(
+            fields,
+            spec,
+            Field::new("intermediate_size", spec.gguf.inter),
+        )
+    }
+
+    /// [`Self::read`] with `inter` read from `inter_field`: a routed family whose feed-forward
+    /// width is the per-expert one names that field instead of `intermediate_size`.
+    pub fn read_with_inter(
+        fields: &Fields<'_>,
+        spec: &DenseSpec,
+        inter_field: Field,
+    ) -> Result<Self, ModelError> {
         let k = &spec.gguf;
         let field = |hf, gguf| Field::new(hf, gguf);
         let width_f = field("hidden_size", k.width);
@@ -351,7 +371,7 @@ impl DenseDims {
         Ok(Self {
             vocab,
             width,
-            inter: fields.count(field("intermediate_size", k.inter), None)?,
+            inter: fields.count(inter_field, None)?,
             layers: fields.count(field("num_hidden_layers", k.layers), None)?,
             heads,
             kv_heads,
@@ -410,8 +430,9 @@ impl DenseDims {
     }
 }
 
-/// A GGUF's RoPE scaling: absent or `none` is plain, `linear` reads `rope.scaling.factor`; any
-/// other type is refused (llama.cpp carries those as tensors a table cannot hold).
+/// A GGUF's RoPE scaling: absent or `none` is plain, `linear` reads `rope.scaling.factor`, `yarn`
+/// also the original context and the `yarn_beta_*` ramp (defaults 32 and 1); any other type is
+/// refused (llama.cpp carries those as tensors a table cannot hold).
 fn gguf_rope_flavor(
     fields: &Fields<'_>,
     gguf: &GgufIndex,
@@ -431,6 +452,29 @@ fn gguf_rope_flavor(
                 .as_f32()
                 .ok_or(fields.error(key, ConfigReason::WrongType))?;
             Ok(RopeFlavor::Linear { factor })
+        }
+        Some("yarn") => {
+            let float = |key: &'static str| -> Result<Option<f32>, ModelError> {
+                gguf.get(key)
+                    .map(|v| v.as_f32().ok_or(fields.error(key, ConfigReason::WrongType)))
+                    .transpose()
+            };
+            let required =
+                |key: &'static str| float(key)?.ok_or(fields.error(key, ConfigReason::Missing));
+            let original_key = spec.gguf.rope_scaling_original;
+            let original = gguf
+                .get(original_key)
+                .ok_or(fields.error(original_key, ConfigReason::Missing))?
+                .as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or(fields.error(original_key, ConfigReason::WrongType))?;
+            Ok(RopeFlavor::Yarn {
+                factor: required(spec.gguf.rope_scaling_factor)?,
+                original,
+                beta_fast: float(spec.gguf.yarn_beta_fast)?.unwrap_or(32.0),
+                beta_slow: float(spec.gguf.yarn_beta_slow)?.unwrap_or(1.0),
+                attention_factor: None,
+            })
         }
         Some(_) => Err(fields.error(key, ConfigReason::Unsupported)),
         None => Err(fields.error(key, ConfigReason::WrongType)),

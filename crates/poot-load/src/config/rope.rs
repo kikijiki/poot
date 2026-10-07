@@ -46,7 +46,7 @@ pub struct RopeScaling {
     /// YaRN: denominator of the `attention_factor` mscale ratio, and (per DeepSeek
     /// `modeling_deepseek_v2.py`'s `yarn_apply_mscale`) a separate correction
     /// `get_mscale(factor, mscale_all_dim)^2` on the attention softmax scale on top of
-    /// `qk_head_dim^-0.5` (see `poot_models::deepseek2::DeepseekV2Config::attn_scale`). DeepSeek-V2's
+    /// `qk_head_dim^-0.5`. DeepSeek-V2's
     /// `mscale_all_dim` key; `None` on non-DeepSeek YaRN configs.
     #[serde(default)]
     pub mscale_all_dim: Option<f32>,

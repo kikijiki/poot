@@ -10,7 +10,7 @@ sidebar_position: 9
 poot is being refactored. This is not available yet and is planned to return.
 :::
 
-`poot-serve` does not batch requests yet: `/v1/completions` and `/v1/chat/completions` return `503` naming the missing engine. The `POOT_SLOTS`, `POOT_CAP`, `POOT_KV_QUANT`, `POOT_PREFILL_CHUNK_SIZE` and `POOT_MAX_BATCHED_TOKENS` settings are not read, and a command-line option the server does not know fails startup.
+`poot-serve` does not batch requests yet: `/v1/completions` and `/v1/chat/completions` return `503` naming the missing engine. The `POOT_SLOTS`, `POOT_CAP` and `POOT_MAX_BATCHED_TOKENS` settings are not read, and a command-line option the server does not know fails startup.
 
 What stays in the server today:
 

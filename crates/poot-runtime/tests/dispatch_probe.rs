@@ -23,7 +23,9 @@ use poot_runtime_common::KernelCode;
 /// fixtures are not compiler output, so this test builds the handle itself).
 fn kernel_from_spv(spv: &[u8], args: Vec<ArgSchema>) -> CompiledKernel {
     let words: Vec<u32> = spv
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     // SAFETY: `spv` is `llc`/`spirv-val`-clean SPIR-V (checked by `compile_and_validate`) whose bindings

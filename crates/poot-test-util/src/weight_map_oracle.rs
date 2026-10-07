@@ -37,7 +37,7 @@ pub fn eval_mapped<V: ValidationChannel>(
         let meta = g.meta(id);
         let value: Value = match meta.storage {
             Storage::State => continue,
-            Storage::Computed(c) => HostTensor::f32(c.shape(), c.values_f32()).into(),
+            Storage::Computed(c) => c.tensor().into(),
             Storage::Slot(_) => {
                 let key = meta.slot_key().expect("a builder slot has a key");
                 let (_, tensor) = slots
@@ -119,7 +119,7 @@ pub fn oracle_for<'a, V: ValidationChannel>(
                         .or_insert_with(|| HostTensor::zeros(meta.aval.shape.clone()))
                         .clone(),
                 ),
-                Storage::Computed(c) => Value::from(HostTensor::f32(c.shape(), c.values_f32())),
+                Storage::Computed(c) => Value::from(c.tensor()),
                 Storage::Slot(_) => {
                     let key = meta.slot_key().unwrap();
                     let v = step.iter().find(|v| &v.key == key).unwrap();

@@ -2,6 +2,7 @@
 //! CPU eager reference (executor equivalence on the GPU path). Skips if no Vulkan adapter.
 mod bf16_carrier;
 mod dense_gemv;
+mod epilogue;
 mod flash;
 mod gather_scatter;
 mod gemm;
@@ -33,6 +34,13 @@ use poot_graph_plan::Target;
 use poot_tensor::HostTensor;
 use poot_test_util::{assert_close, max_abs_error};
 
+/// The metadata buffer of a plan that launches exactly one kernel (empty when it binds none); `None` for
+/// every other plan.
+fn single_meta(plan: &poot_graph_plan::Plan) -> Option<&[u32]> {
+    plan.single()
+        .map(|dispatch| dispatch.launch.meta.as_slice())
+}
+
 fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
     static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
     GPU.lock().unwrap_or_else(|e| e.into_inner())
@@ -47,6 +55,20 @@ fn open_engine_or_skip() -> Option<(Engine<WgpuDevice>, Target)> {
     )?;
     let target = device.target();
     Some((Engine::new(device), target))
+}
+
+/// A second engine whose device reports the routed-expert hang, so programs compiled under the guard
+/// (one kernel per equation, no fusion, see [`staged_replay_with`]) load on it. Open it beside
+/// [`open_engine_or_skip`]'s engine when a row compares the fused program with the guarded one.
+fn open_hung_engine_or_skip()
+-> Option<Engine<poot_executor_parity::hung::WithRoutedHang<WgpuDevice>>> {
+    let device = poot_test_util::device_skip::open_or_skip(
+        poot_runtime_common::DeviceBackend::Wgpu,
+        WgpuDevice::new(),
+    )?;
+    Some(Engine::new(poot_executor_parity::hung::WithRoutedHang(
+        device,
+    )))
 }
 
 /// Card 546b: `GpuExecutor::run`'s executor-contract replacement for this crate's hand-built test
@@ -115,17 +137,21 @@ fn staged_replay(
     g: &poot_graph_ir::Graph,
     target: Target,
 ) -> poot_graph_plan::StagedProgram<poot_graph_ir::ValidationOutputs> {
-    staged_replay_with(g, target, poot_graph_plan::FusionPolicy::Full)
+    staged_replay_with(g, target, false)
 }
 
-/// [`staged_replay`] under a chosen fusion policy (Card 557: `FusionPolicy::MoeHangGuard` keeps a
-/// matmul off the generated tiled GEMM, the one way to plan the imported tiled GEMM for a comparison).
+/// [`staged_replay`] with `guarded` compiling under the routed-expert hang guard (Card 557: the guard
+/// keeps a matmul off the generated tiled GEMM, the one way to plan the imported tiled GEMM for a
+/// comparison). The graph then carries a dead routed-expert site and the target has the hang
+/// (`poot_test_util::graph_fixtures::pipeline_input`).
 fn staged_replay_with(
     g: &poot_graph_ir::Graph,
     target: Target,
-    fusion: poot_graph_plan::FusionPolicy,
+    guarded: bool,
 ) -> poot_graph_plan::StagedProgram<poot_graph_ir::ValidationOutputs> {
-    let gc = g.clone().with_validations(Vec::new());
+    let (gc, caps) = poot_test_util::graph_fixtures::pipeline_input(g, target.caps, guarded);
+    let target = Target { caps, ..target };
+    let gc = gc.with_validations(Vec::new());
     poot_graph_plan::compile_staged(
         &gc,
         &poot_graph_plan::TargetSet::single(poot_graph_plan::DeviceId(0), target),
@@ -135,7 +161,6 @@ fn staged_replay_with(
         },
         &poot_graph_plan::CompileOptions {
             execution: poot_graph_plan::Submission::Replay,
-            fusion,
             limits: poot_graph_plan::CompileLimits::STANDARD,
         },
     )
@@ -155,16 +180,17 @@ fn add_resident_entry(
     g: &poot_graph_ir::Graph,
     inputs: &HashMap<poot_graph_ir::ValueId, HostTensor>,
 ) -> (poot_executor::ExecutableId, poot_executor::EntryId) {
-    add_resident_entry_with(exec, target, g, inputs, poot_graph_plan::FusionPolicy::Full)
+    add_resident_entry_with(exec, target, g, inputs, false)
 }
 
-/// [`add_resident_entry`] compiled under a chosen fusion policy (see [`staged_replay_with`]).
+/// [`add_resident_entry`] compiled under the routed-expert hang guard when `guarded` (see
+/// [`staged_replay_with`]).
 fn add_resident_entry_with(
     exec: &mut dyn Executor,
     target: Target,
     g: &poot_graph_ir::Graph,
     inputs: &HashMap<poot_graph_ir::ValueId, HostTensor>,
-    fusion: poot_graph_plan::FusionPolicy,
+    guarded: bool,
 ) -> (poot_executor::ExecutableId, poot_executor::EntryId) {
     let mut builder = poot_quant::weights::WeightStore::builder();
     for (&id, t) in inputs {
@@ -196,7 +222,7 @@ fn add_resident_entry_with(
             poot_executor::WeightSource::ConstNames,
         )
         .unwrap();
-    let staged = staged_replay_with(g, target, fusion);
+    let staged = staged_replay_with(g, target, guarded);
     let entry = exec.add_entry(exe, &staged).unwrap();
     (exe, entry)
 }
@@ -223,7 +249,9 @@ fn step_resident(
     HostTensor::f32(
         out.shape.clone(),
         bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
     )
@@ -462,7 +490,7 @@ fn check_gdn_prefill_chunked_gpu(
 }
 
 /// Card 557: the kernel the planner chooses for `g`'s first compiled equation whose op matches `op`,
-/// after the production `compile` for `target` (`FusionPolicy::Full`). Kernel choice is a plan property,
+/// after the production `compile` for `target` (the full pipeline). Kernel choice is a plan property,
 /// so a test asserts on it here, on the graph `compile` actually plans, never on a retagged op.
 fn compiled_choice(
     g: &poot_graph_ir::Graph,
@@ -479,7 +507,7 @@ fn compiled_choice(
     program.kernel_choice(eqn).clone()
 }
 
-/// The production `compile` of `g` for `target` under `FusionPolicy::Full`, for a test that reads a compiled
+/// The production `compile` of `g` for `target` (the full pipeline), for a test that reads a compiled
 /// equation's plan and choice together (`Program::planned`, `Program::kernel_choice`).
 fn compile_full(g: &poot_graph_ir::Graph, target: &Target) -> poot_graph_plan::Program {
     poot_graph_plan::compile(
@@ -487,7 +515,6 @@ fn compile_full(g: &poot_graph_ir::Graph, target: &Target) -> poot_graph_plan::P
         target,
         &poot_graph_plan::CompileOptions {
             execution: poot_graph_plan::Submission::Replay,
-            fusion: poot_graph_plan::FusionPolicy::Full,
             limits: poot_graph_plan::CompileLimits::STANDARD,
         },
     )

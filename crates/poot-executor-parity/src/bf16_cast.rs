@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use poot_graph_ir::{Builder, TensorType};
-use poot_graph_plan::{FusionPolicy, ImportedKernel, KernelChoice, Submission, Target};
+use poot_graph_plan::{ImportedKernel, KernelChoice, Submission, Target};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::{DType, HostTensor};
 
@@ -64,7 +64,7 @@ pub fn bf16_const_cast_fixtures() -> Vec<Fixture> {
                 graph,
                 store: store.build(),
                 steps: vec![Vec::<StepFixture>::new()],
-                fusion: FusionPolicy::Full,
+                guarded: false,
             }
         })
         .collect()

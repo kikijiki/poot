@@ -563,8 +563,9 @@ impl RocmContext {
     /// `QueueWaitTimeout` instead of an infinite host spin (the card-188 batched-serve hang, likely the
     /// card-186 gemma4-MoE hang). Returns the number of physical submissions.
     ///
-    /// A poisoned context is refused before the queue is touched. Once the publisher has reserved ring
-    /// slots, a failure (the queue-space wait timing out) can leave packets in flight and a slot
+    /// A poisoned context is refused before the queue is touched, and every dispatch's geometry is
+    /// validated before any slot is reserved ([`DispatchGeometry::new`]). Once the publisher has
+    /// reserved ring slots, a failure (the queue-space wait timing out) can leave packets in flight and a slot
     /// reserved but never published, so it leaks the completion signal like a timed-out completion
     /// wait and poisons the context.
     #[allow(clippy::type_complexity)]
@@ -574,6 +575,21 @@ impl RocmContext {
         tag: &'static str,
     ) -> Result<usize, RocmError> {
         self.ensure_not_poisoned(tag)?;
+        let validated = dispatches
+            .iter()
+            .enumerate()
+            .map(|(dispatch, (kernel, kernarg, grid, block))| {
+                DispatchGeometry::new(*grid, *block)
+                    .map(|geometry| (kernel.clone(), kernarg.clone(), geometry))
+                    .map_err(|violation| RocmError::InvalidDispatchGeometry {
+                        op: tag,
+                        dispatch,
+                        grid: *grid,
+                        block: *block,
+                        violation,
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         // Create a completion signal for the last packet, initialised to 1; the packet decrements it.
         let mut completion: bindings::hsa_signal_t = bindings::hsa_signal_t { handle: 0 };
@@ -599,7 +615,7 @@ impl RocmContext {
             context: self,
             doorbell: q.doorbell_signal,
             writer: AqlRingWriter {
-                dispatches,
+                dispatches: &validated,
                 completion,
                 ring,
                 header,

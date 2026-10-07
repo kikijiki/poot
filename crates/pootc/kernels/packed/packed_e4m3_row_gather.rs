@@ -17,9 +17,9 @@
 //! CPU and never emits `.spv`, with no child process. `row >= 0 && row < outer` one level up does not
 //! trigger it, so the nesting is what matters).
 //!
-//! No baked dims and no metadata buffer, like `gather_axis0.rs`: `row_width = out.len() / index.len()`,
-//! so this is a 3-param `Plan::Compute`. The index is `i32`, not the f32 token convention of
-//! `gather_axis0.rs`: `OpKind::DenseRowGather` pins an authoritative exact-I32 index (Card 405's
+//! No baked dims and no metadata buffer: `row_width = out.len() / index.len()`,
+//! so this is a 3-param single-dispatch plan. The index is `i32`, not the f32 token convention of
+//! the generated movement gather: `OpKind::DenseRowGather` pins an authoritative exact-I32 index (Card 405's
 //! `gather_exact_i32`), which is what keeps n-gram ids above `2^24` from rounding through f32.
 //!
 //! The guards bound the two buffers a wrong shape would over-read furthest: `out` and `table_words`

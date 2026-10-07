@@ -110,7 +110,7 @@ impl I32SlotGatherVariant {
                     (Storage::State, _) => {
                         HostTensor::f32(vec![CACHE_ROWS, WIDTH], self.cache.clone())
                     }
-                    (Storage::Computed(c), _) => HostTensor::f32(c.shape(), c.values_f32()),
+                    (Storage::Computed(c), _) => c.tensor(),
                     other => panic!("{}: unexpected input v{id}: {other:?}", self.name),
                 };
                 (id, Value::from(tensor))

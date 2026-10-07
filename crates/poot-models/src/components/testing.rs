@@ -649,3 +649,43 @@ pub(crate) fn assert_same_graph<V: ValidationChannel, W: ValidationChannel>(
         "named inputs"
     );
 }
+
+/// Tier 3 on the oracle (ADR-0101): the `new` greedy tokens `model` generates over `store` after
+/// `prompt`, one prefill and then one decode step per token, over a cache of `capacity` positions.
+pub(crate) fn greedy_tokens(
+    model: &dyn Model,
+    store: &WeightStore,
+    prompt: &[i32],
+    new: usize,
+    capacity: usize,
+) -> Vec<u32> {
+    fn argmax(logits: &[f32]) -> i32 {
+        let mut best = 0;
+        for (i, &v) in logits.iter().enumerate() {
+            assert!(v.is_finite(), "logit {i} is {v}");
+            if v > logits[best] {
+                best = i;
+            }
+        }
+        best as i32
+    }
+    let vocab = model.config().vocab;
+    let (logits, mut state) = run_step(model, store, Phase::Prefill, capacity, prompt, 0, &[]);
+    let mut token = argmax(&logits[(prompt.len() - 1) * vocab..]);
+    let mut tokens = vec![token as u32];
+    for pos in prompt.len()..prompt.len() + new - 1 {
+        let (logits, next) = run_step(
+            model,
+            store,
+            Phase::Decode,
+            capacity,
+            &[token],
+            pos as i32,
+            &state,
+        );
+        token = argmax(&logits);
+        tokens.push(token as u32);
+        state = next;
+    }
+    tokens
+}

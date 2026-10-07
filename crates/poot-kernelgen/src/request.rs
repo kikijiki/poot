@@ -3,7 +3,7 @@
 //!
 //! A request is plain data: the planner picks the family, schedule and widths from shapes and
 //! [`DeviceCaps`] (policy lives in `poot-graph-plan`), and the generator implements that selection. It
-//! does not choose a performance policy. [`generate`] is a pure function of `(request, backend, caps)`, so
+//! does not choose a performance policy. [`generate`] is a pure function of `(request, caps)`, so
 //! the request is the kernel's identity: its `Debug` form is the canonical encoding the planner digests
 //! into a plan key, and two requests that differ in any parameter (an `f32` is stored as its bits) are
 //! different kernels. `Debug` is the canonical encoding only while no request type has a lossy hand-written
@@ -14,16 +14,15 @@
 //! body's workgroup size to get dispatch counts), so a body and the grid that shapes it come out of one
 //! function and cannot disagree.
 
-use poot_kernel_ir::{BinOp, Body, MathOp, Statement, Ty, UnOp, WmmaDtype, WmmaShape};
-use poot_target::{Backend, BufferStorage, DeviceCaps};
+use poot_kernel_ir::{
+    BinOp, Body, FRAGMENT_COLLECTIVE_LANES, MathOp, Statement, Ty, UnOp, WmmaDtype, WmmaShape,
+};
+use poot_target::{BufferStorage, DeviceCaps};
 
 use crate::KernelGenError;
-use crate::contraction::{DenseLoad, Schedule, dense_contraction};
-use crate::data_movement::{
-    arg_top_k_dt, broadcast_dt, concat_n_dt, concat2_dt, dyn_update_slice_dt,
-    dyn_update_slice_dynamic_dt, gather_axis_index_dt, gather_axis0_index_dt, rope_dt,
-    scatter_axis0_dt, scatter_update_chunked_dt, scatter_update_dt, slice_dt, transpose_dt,
-};
+use crate::attention::{AttentionSchedule, AttentionSpec, attention_body};
+use crate::contraction::{DenseLoad, Epilogue, Schedule, dense_contraction, indexed_contraction};
+use crate::data_movement::{MovementSpec, Storage, arg_top_k_dt, movement_body, rope_dt};
 use crate::elementwise::{
     binary_broadcast_dt_views_grid, binary_broadcast_i32_geu_views_grid,
     binary_broadcast_i32_remu_views_grid, binary_scalar_dt_grid, binary_scalar_i32_geu_grid,
@@ -33,34 +32,25 @@ use crate::elementwise::{
     unary_dt_views_grid, unary_i32_clz_grid, unary_i32_clz_views_grid,
 };
 use crate::error::BodyStage;
-use crate::flash::{flash_attention_decode, flash_region_decode, flash_region_prefill};
-use crate::fp8::{
-    e4m3fn_broadcast_packed, e4m3fn_concat_packed, e4m3fn_dynamic_update_slice_dynamic_packed,
-    e4m3fn_dynamic_update_slice_packed, e4m3fn_gather_packed, e4m3fn_packed_to_f32,
-    e4m3fn_repack_reshape, e4m3fn_scatter_update_packed, e4m3fn_slice_packed,
-    e4m3fn_transpose_packed, f32_to_e4m3fn_packed,
-};
+use crate::fp8::{e4m3fn_packed_to_f32, f32_to_e4m3fn_packed};
 use crate::fused::{
     FusedInput, FusedKernel, RowKernel, fused_i32_views_grid, fused_i32_views_grid_pack,
     fused_row_parallel_views, fused_views, pointwise_size, row_size,
 };
-use crate::gemv::{attn_scores_v_gemv_lds, gemv_lds, indexed_gemv_lds};
+use crate::gemv::{attn_scores_v_gemv_lds, gemv_lds};
 use crate::helpers::{BodyBudget, BodyLimits, BodySize, Layout, WeightLayout};
 use crate::matmul::{
-    indexed_matmul_dt, matmul_batched_bias_dt_grid, matmul_batched_dt_grid, matmul_batched_nk_grid,
+    matmul_batched_dt_grid, matmul_batched_epilogue_dt_grid, matmul_batched_nk_grid,
 };
-use crate::packed::{PackedKernelSpec, packed_kernel};
+use crate::packed::{PackedKernelSpec, packed_contraction, packed_kernel};
 use crate::reduce::reduce_last_dt;
 use crate::tiled_region::tiled_region;
 use crate::wmma::{matmul_tensorcore, matmul_tensorcore_coopmat};
+use poot_quant::format::WeightFormat;
 
 /// The entry-point name every generated body but the named ones below carries; the shared name the GPU
 /// emitters look up.
 const ENTRY: &str = "k";
-
-/// The subgroup lane count every matrix-fragment kernel is written for: an NVIDIA warp, an RDNA3 wave32 and
-/// the RADV cooperative-matrix subgroup each run one 16x16x16 fragment across 32 lanes.
-const FRAGMENT_SUBGROUP_LANES: u32 = 32;
 
 fn product(shape: &[usize]) -> u64 {
     shape
@@ -166,7 +156,8 @@ impl BodyUse {
                 | Ty::Ref { .. }
                 | Ty::Slice(_)
                 | Ty::Array { .. }
-                | Ty::Vec { .. } => {
+                | Ty::Vec { .. }
+                | Ty::Fragment(_) => {
                     return Err(UnmeasurableLds {
                         array,
                         elem: decl.elem_ty.clone(),
@@ -269,7 +260,7 @@ impl KernelRequest {
             Self::Contraction(
                 ContractionSpec::TensorCore { .. } | ContractionSpec::Coopmat { .. },
             ) => KernelRequirements {
-                subgroup_lanes: Some(FRAGMENT_SUBGROUP_LANES),
+                subgroup_lanes: Some(FRAGMENT_COLLECTIVE_LANES),
                 serial_work: None,
             },
             Self::Contraction(ContractionSpec::Serial { shapes, .. }) => KernelRequirements {
@@ -286,15 +277,10 @@ impl KernelRequest {
                     steps_per_thread: k as u64,
                 }),
             },
-            Self::Contraction(ContractionSpec::IndexedSerial { m, k, n, .. }) => {
-                KernelRequirements {
-                    subgroup_lanes: None,
-                    serial_work: Some(SerialWork {
-                        threads: (*m as u64).saturating_mul(*n as u64),
-                        steps_per_thread: *k as u64,
-                    }),
-                }
-            }
+            Self::Attention(spec) => KernelRequirements {
+                subgroup_lanes: None,
+                serial_work: Some(spec.serial_work()),
+            },
             _ => KernelRequirements::default(),
         }
     }
@@ -310,6 +296,7 @@ impl KernelRequest {
                 schedule,
                 k,
                 n,
+                epilogue,
             }) => {
                 let launch = match schedule {
                     Schedule::Gemv {
@@ -319,7 +306,10 @@ impl KernelRequest {
                     } => format!("w{width}c{cols}u{unroll}"),
                     Schedule::Tiled { tile } => format!("tiled{}", tile.get()),
                 };
-                format!("contraction:dense_gemv:{weight}:{layout:?}:{launch}:{k}x{n}")
+                let epilogue = epilogue.as_ref().map_or_else(String::new, |epilogue| {
+                    format!(":epilogue{}", epilogue.steps.len())
+                });
+                format!("contraction:dense_gemv:{weight}:{layout:?}:{launch}:{k}x{n}{epilogue}")
             }
             Self::Contraction(spec) => format!("contraction:{}", spec.form()),
             other => other.family().to_string(),
@@ -437,8 +427,8 @@ pub enum ElementwiseSpec {
 /// Which element form a pointwise region computes in.
 #[derive(Clone, Debug)]
 pub enum PointwiseForm {
-    /// Float arithmetic (`fused_views`), one thread per output element.
-    Float,
+    /// Float arithmetic (`fused_views`) on the elementwise 2-D fold, one thread per output element.
+    Float { fold: Fold },
     /// A single exact-I32 step on the elementwise 2-D fold (the `Select` equation).
     ExactI32 { fold: Fold },
     /// An exact-I32 region; `pack` (empty for none) lists the lanes a row-folded pack writes, one thread
@@ -485,16 +475,16 @@ pub struct MatmulShapes {
 
 #[derive(Clone, Debug)]
 pub enum ContractionSpec {
-    /// The one-thread-per-output reference kernel, with the bias epilogue when `bias`.
+    /// The one-thread-per-output reference kernel, with `epilogue` applied to each output before the store.
     Serial {
         dt: Ty,
-        bias: bool,
+        epilogue: Option<Epilogue>,
         shapes: MatmulShapes,
         fold: Fold,
     },
     /// The one-thread-per-output kernel over a weight in checkpoint `[N, K]` order (`shapes.b_shape` is `[N, K]`):
-    /// `DenseContraction` where the tiled GEMM is not taken. No bias. The activation and output are f32; `weight`
-    /// is the weight's planned storage, `BufferStorage::f32()` or (Card 1007) `BufferStorage::f16_packed()`.
+    /// `DenseContraction` where the tiled GEMM is not taken. The activation and output are f32; `weight` is the
+    /// weight's planned storage, `BufferStorage::f32()`, `f16_packed()` or `bf16_packed()`.
     DenseSerial {
         weight: BufferStorage,
         shapes: MatmulShapes,
@@ -510,21 +500,21 @@ pub enum ContractionSpec {
         k: usize,
         n: usize,
         width: usize,
-        bias: bool,
         elems: usize,
         offset: usize,
     },
     /// The `DenseContraction` decode GEMV (`M == 1`): `schedule` (a [`Schedule::Gemv`]) over a weight read in
     /// `layout` from `weight` storage (`BufferStorage::f32()`, `f16_packed()` or `bf16_packed()`), the shared Gemv
-    /// loop nest with the dense operand load. The body is shape-generic: `K` and `N` ride in its `[K, N]`
-    /// metadata; `k` also fixes whether a packed weight row starts on a word boundary. A Gemv over a `[K, N]`
-    /// layout is refused.
+    /// loop nest with the dense operand load, `epilogue` (f32) applied to each column's sum before its store. The
+    /// body is shape-generic: `K` and `N` ride in its `[K, N]` metadata; `k` also fixes whether a packed weight
+    /// row starts on a word boundary. A Gemv over a `[K, N]` layout is refused.
     DenseGemv {
         weight: BufferStorage,
         layout: WeightLayout,
         schedule: Schedule,
         k: usize,
         n: usize,
+        epilogue: Option<Epilogue>,
     },
     /// Decode attention `scores @ V`: an LDS-parallel reduction over `cap`, `width` lanes per output.
     AttnScoresVGemv {
@@ -533,7 +523,8 @@ pub enum ContractionSpec {
         width: usize,
         numel: usize,
     },
-    /// The synthesized tiled GEMM: `groups` workgroups of `tile * tile` lanes starting at tile `offset`.
+    /// The synthesized tiled GEMM: `groups` workgroups of `tile * tile` lanes starting at tile `offset`, with
+    /// `epilogue` (f32) applied to each output element's sum before its store.
     TiledRegion {
         m: usize,
         k: usize,
@@ -541,6 +532,7 @@ pub enum ContractionSpec {
         tile: usize,
         offset: usize,
         groups: usize,
+        epilogue: Option<Epilogue>,
     },
     /// [`ContractionSpec::TiledRegion`] reading its weight in checkpoint `[N, K]` order: the `DenseContraction`
     /// prefill GEMM. `weight` as in [`ContractionSpec::DenseSerial`].
@@ -552,22 +544,14 @@ pub enum ContractionSpec {
         offset: usize,
         groups: usize,
         weight: BufferStorage,
+        epilogue: Option<Epilogue>,
     },
-    /// The MoE per-expert GEMV: `width` lanes per output element.
-    IndexedGemv {
-        k: usize,
-        n: usize,
-        width: usize,
-        numel: usize,
-    },
-    /// The MoE per-expert one-thread-per-output kernel.
-    IndexedSerial {
-        dt: Ty,
-        m: usize,
-        k: usize,
-        n: usize,
-        fold: Fold,
-    },
+    /// A contraction over a packed weight: the descriptor-driven decode of `format` served to the planner's
+    /// schedule ([`PackedContraction`]).
+    Packed(PackedContraction),
+    /// A contraction over a stacked `[E, K, N]` weight whose output row `m` reads expert slab `ids[m]`
+    /// ([`IndexedContraction`]).
+    Indexed(IndexedContraction),
 }
 
 impl ContractionSpec {
@@ -583,192 +567,46 @@ impl ContractionSpec {
             Self::AttnScoresVGemv { .. } => "attn_scores_v_gemv",
             Self::TiledRegion { .. } => "tiled_region",
             Self::DenseTiled { .. } => "dense_tiled",
-            Self::IndexedGemv { .. } => "indexed_gemv",
-            Self::IndexedSerial { .. } => "indexed_serial",
+            Self::Packed(_) => "packed",
+            Self::Indexed(_) => "indexed",
         }
     }
 }
 
+/// A contraction over a packed weight in `format`: `schedule`'s loop nest over the weight's descriptor-driven
+/// decode, with `epilogue` applied to each column's sum before its store. The planner validates and chooses the
+/// launch (the schedule's grid, folded and checked against the device's limits with a typed refusal), so `grid`
+/// and `meta` ride in the request.
 #[derive(Clone, Debug)]
-pub enum AttentionSpec {
-    /// Single-sequence decode with a private output array (head dim above the LDS cap): NVPTX and AMDGCN
-    /// only.
-    DecodeSingle {
-        bsz: usize,
-        hq: usize,
-        n_rep: usize,
-        cap: usize,
-        d: usize,
-        scale_bits: u32,
-        mask_per_head: bool,
-    },
-    /// LDS-cooperative decode: `bsz * hq` workgroups of `width` lanes.
-    RegionDecode {
-        bsz: usize,
-        hq: usize,
-        n_rep: usize,
-        cap: usize,
-        d: usize,
-        scale_bits: u32,
-        width: usize,
-        mask_per_head: bool,
-    },
-    /// Prefill, one workgroup per (head, row) on a folded 2-D grid.
-    RegionPrefill {
-        hq: usize,
-        l: usize,
-        d: usize,
-        n_rep: usize,
-        scale_bits: u32,
-        mask_per_head: bool,
-    },
+pub struct PackedContraction {
+    pub format: WeightFormat,
+    pub schedule: Schedule,
+    pub epilogue: Option<Epilogue>,
+    pub grid: [u32; 3],
+    pub meta: Vec<u32>,
 }
 
-/// A packed-row E4M3FN data-movement kernel; one thread per physical output word.
+/// A contraction over a stacked `[E, K, N]` weight, `out[m, n] = sum over k of x[m, k] * W[ids[m], k, n]`: output
+/// row `m` reads expert slab `ids[m]`, and an id outside `0..E` or not an integer makes that row NaN. `schedule` is
+/// [`Schedule::Gemv`] (decode) or [`Schedule::Tiled`], which is segmented here: a tile whose rows select several
+/// experts walks them. The activation, ids and output are f32 and the weight is read in `weight` storage (f32 or
+/// packed BF16); `epilogue` (f32) runs over each output element's sum before its store. The planner chooses the
+/// launch (the grid folded and checked against the device's limits) and the metadata `[K, N, E, M, x_groups]`.
 #[derive(Clone, Debug)]
-pub enum E4m3Movement {
-    ScatterUpdate {
-        base_shape: Vec<usize>,
-        src_shape: Vec<usize>,
-    },
-    Transpose {
-        in_shape: Vec<usize>,
-        perm: Vec<usize>,
-    },
-    Slice {
-        in_shape: Vec<usize>,
-        axis: usize,
-        start: usize,
-    },
-    Concat {
-        axis: usize,
-        in_shapes: Vec<Vec<usize>>,
-    },
-    Gather {
-        in_shape: Vec<usize>,
-        axis: usize,
-        index_shape: Vec<usize>,
-    },
-    DynamicUpdateSlice {
-        operand_shape: Vec<usize>,
-        update_shape: Vec<usize>,
-        axis: usize,
-        index: usize,
-    },
-    DynamicUpdateSliceRuntime {
-        operand_shape: Vec<usize>,
-        update_shape: Vec<usize>,
-        axis: usize,
-    },
-    Broadcast {
-        in_shape: Vec<usize>,
-    },
-    RepackReshape {
-        input_row_len: usize,
-        output_row_len: usize,
-    },
+pub struct IndexedContraction {
+    pub schedule: Schedule,
+    /// How each expert slab of the weight is stored: [`WeightLayout::Kn`] `[K, N]` or [`WeightLayout::Nk`] `[N, K]`.
+    pub layout: WeightLayout,
+    /// The weight buffer's planned storage: `BufferStorage::f32()` or `BufferStorage::bf16_packed()`. Part of the
+    /// request, so a body built for one storage is never served for another.
+    pub weight: BufferStorage,
+    pub epilogue: Option<Epilogue>,
+    pub grid: [u32; 3],
+    pub meta: Vec<u32>,
 }
 
-#[derive(Clone, Debug)]
-pub enum MovementSpec {
-    GatherAxis0 {
-        dt: Ty,
-        index_dt: Ty,
-        rest: usize,
-        numel: usize,
-    },
-    GatherAxis {
-        dt: Ty,
-        index_dt: Ty,
-        inner: usize,
-        axis_len: usize,
-        idx_numel: usize,
-        numel: usize,
-    },
-    ScatterAxis0 {
-        dt: Ty,
-        rest: usize,
-        numel: usize,
-    },
-    ScatterUpdate {
-        dt: Ty,
-        rest: usize,
-        numel: usize,
-    },
-    /// One range of a watchdog-split scatter-update: `groups` workgroups of `width` lanes starting at
-    /// output element `offset`.
-    ScatterUpdateChunk {
-        dt: Ty,
-        rest: usize,
-        offset: usize,
-        groups: usize,
-        width: usize,
-    },
-    Transpose {
-        dt: Ty,
-        out_shape: Vec<usize>,
-        in_shape: Vec<usize>,
-        perm: Vec<usize>,
-        numel: usize,
-    },
-    Slice {
-        dt: Ty,
-        out_shape: Vec<usize>,
-        in_shape: Vec<usize>,
-        axis: usize,
-        start: usize,
-        numel: usize,
-    },
-    Broadcast {
-        dt: Ty,
-        out_shape: Vec<usize>,
-        in_shape: Vec<usize>,
-        numel: usize,
-    },
-    Concat2 {
-        dt: Ty,
-        out_shape: Vec<usize>,
-        axis: usize,
-        a_shape: Vec<usize>,
-        b_shape: Vec<usize>,
-        numel: usize,
-    },
-    ConcatN {
-        dt: Ty,
-        out_shape: Vec<usize>,
-        axis: usize,
-        in_shapes: Vec<Vec<usize>>,
-        numel: usize,
-    },
-    /// A dynamic-update-slice at a baked index.
-    UpdateSliceStatic {
-        dt: Ty,
-        out_shape: Vec<usize>,
-        axis: usize,
-        index: usize,
-        extent: usize,
-        numel: usize,
-    },
-    /// A dynamic-update-slice whose index is read from a buffer. `index_dt` names that buffer's element
-    /// type: the body reads either lane the same, but the two are different kernels' identities (an
-    /// F32-index and an I32-index update must never share a plan key).
-    UpdateSliceRuntime {
-        dt: Ty,
-        index_dt: Ty,
-        out_shape: Vec<usize>,
-        axis: usize,
-        extent: usize,
-        numel: usize,
-    },
-    /// A packed E4M3FN movement; `out_shape` shapes the grid (one thread per physical output word).
-    E4m3 {
-        out_shape: Vec<usize>,
-        op: E4m3Movement,
-    },
-}
-
-/// A generated packed-weight kernel. The planner validates and chooses the launch (the schedule's grid,
-/// folded and checked against the device's limits with a typed refusal), so it rides in the request.
+/// A generated packed-weight kernel that is not a contraction (a standalone dequantize or a row gather). The
+/// planner validates and chooses the launch, so it rides in the request.
 #[derive(Clone, Debug)]
 pub struct PackedRequest {
     pub name: &'static str,
@@ -793,21 +631,6 @@ pub struct TopKSpec {
     pub numel: usize,
 }
 
-/// One thread per physical output word of a packed-row E4M3FN output (`rows * ceil(row_len / 4)`).
-fn e4m3_row_launch(out_shape: &[usize]) -> Launch {
-    let row_len = out_shape.last().copied().unwrap_or(1);
-    let rows: usize = if out_shape.is_empty() {
-        1
-    } else {
-        out_shape[..out_shape.len() - 1].iter().product()
-    };
-    Launch::flat(rows.saturating_mul(row_len.div_ceil(4)))
-}
-
-fn slices(shapes: &[Vec<usize>]) -> Vec<&[usize]> {
-    shapes.iter().map(Vec::as_slice).collect()
-}
-
 fn leaf_shapes(leaves: &[ViewOperand]) -> Vec<&[usize]> {
     leaves.iter().map(|leaf| leaf.shape.as_slice()).collect()
 }
@@ -824,7 +647,7 @@ fn with(body: Body, launch: Launch) -> Result<Generated, KernelGenError> {
     Ok(Generated { body, launch })
 }
 
-/// Generate the kernel `req` names for `backend`.
+/// Generate the kernel `req` names.
 ///
 /// A pure function of its arguments. A request the target cannot state returns
 /// [`KernelGenError::Unsupported`]; a request that violates a generator's own precondition returns that
@@ -836,14 +659,13 @@ fn with(body: Body, launch: Launch) -> Result<Generated, KernelGenError> {
 /// and refused rather than returned. Either way the refusal is [`KernelGenError::BodyLimit`].
 pub fn generate(
     req: &KernelRequest,
-    backend: Backend,
     caps: &DeviceCaps,
     limits: &BodyLimits,
 ) -> Result<Generated, KernelGenError> {
     if let Some(size) = recipe_size(req) {
         BodyBudget::new(*limits).reserve(req.family(), BodyStage::Sizing, size)?;
     }
-    let generated = build(req, backend, caps)?;
+    let generated = build(req, caps)?;
     BodyBudget::new(*limits).reserve(
         req.family(),
         BodyStage::Finished,
@@ -858,7 +680,7 @@ fn recipe_size(req: &KernelRequest) -> Option<BodySize> {
         KernelRequest::Pointwise(spec) => {
             let pack_lanes = match &spec.form {
                 PointwiseForm::ExactI32Packed { pack } => pack.len(),
-                PointwiseForm::Float | PointwiseForm::ExactI32 { .. } => 0,
+                PointwiseForm::Float { .. } | PointwiseForm::ExactI32 { .. } => 0,
             };
             Some(pointwise_size(
                 &spec.kernel,
@@ -876,18 +698,14 @@ fn recipe_size(req: &KernelRequest) -> Option<BodySize> {
     }
 }
 
-fn build(
-    req: &KernelRequest,
-    backend: Backend,
-    caps: &DeviceCaps,
-) -> Result<Generated, KernelGenError> {
+fn build(req: &KernelRequest, caps: &DeviceCaps) -> Result<Generated, KernelGenError> {
     match req {
         KernelRequest::Elementwise(spec) => elementwise(spec, caps),
         KernelRequest::Pointwise(spec) => pointwise(spec, caps),
         KernelRequest::Row(spec) => row(spec, caps),
         KernelRequest::Contraction(spec) => contraction(spec, caps),
-        KernelRequest::Attention(spec) => attention(spec, backend, caps),
-        KernelRequest::Movement(spec) => movement(spec),
+        KernelRequest::Attention(spec) => attention(spec, caps),
+        KernelRequest::Movement(spec) => movement(spec, caps),
         KernelRequest::Packed(spec) => {
             let body = packed_kernel(spec.name, spec.spec)?;
             Ok(Generated {
@@ -1009,7 +827,7 @@ fn elementwise(spec: &ElementwiseSpec, caps: &DeviceCaps) -> Result<Generated, K
             CastSpec::I32ToF32 { numel } => with(cast_i32_to_f32(ENTRY), Launch::flat(*numel)),
             CastSpec::F32ToE4m3 { out_shape, row_len } => with(
                 f32_to_e4m3fn_packed(ENTRY, *row_len)?,
-                e4m3_row_launch(out_shape),
+                Launch::flat(Storage::BYTE_LANES.units(out_shape)),
             ),
             CastSpec::E4m3ToF32 { row_len, numel } => {
                 with(e4m3fn_packed_to_f32(ENTRY, *row_len)?, Launch::flat(*numel))
@@ -1022,9 +840,16 @@ fn pointwise(spec: &PointwiseSpec, caps: &DeviceCaps) -> Result<Generated, Kerne
     let shapes = leaf_shapes(&spec.leaves);
     let layouts = leaf_layouts(&spec.leaves);
     match &spec.form {
-        PointwiseForm::Float => with(
-            fused_views(ENTRY, &spec.out_shape, &shapes, &layouts, &spec.kernel)?,
-            Launch::flat(spec.numel),
+        PointwiseForm::Float { fold } => with(
+            fused_views(
+                ENTRY,
+                &spec.out_shape,
+                &shapes,
+                &layouts,
+                &spec.kernel,
+                fold.x_groups(caps),
+            )?,
+            fold.launch(caps),
         ),
         PointwiseForm::ExactI32 { fold } => with(
             fused_i32_views_grid(
@@ -1098,23 +923,29 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
     match spec {
         ContractionSpec::Serial {
             dt,
-            bias,
+            epilogue,
             shapes,
             fold,
         } => {
-            let build = if *bias {
-                matmul_batched_bias_dt_grid
-            } else {
-                matmul_batched_dt_grid
+            let body = match epilogue {
+                Some(epilogue) => matmul_batched_epilogue_dt_grid(
+                    ENTRY,
+                    dt.clone(),
+                    &shapes.out_shape,
+                    &shapes.a_shape,
+                    &shapes.b_shape,
+                    epilogue,
+                    fold.x_groups(caps),
+                )?,
+                None => matmul_batched_dt_grid(
+                    ENTRY,
+                    dt.clone(),
+                    &shapes.out_shape,
+                    &shapes.a_shape,
+                    &shapes.b_shape,
+                    fold.x_groups(caps),
+                ),
             };
-            let body = build(
-                ENTRY,
-                dt.clone(),
-                &shapes.out_shape,
-                &shapes.a_shape,
-                &shapes.b_shape,
-                fold.x_groups(caps),
-            );
             fold.contraction(body, caps)
         }
         ContractionSpec::DenseSerial {
@@ -1154,14 +985,14 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
                 &shapes.b_shape,
             )?;
             let r = shapes.out_shape.len();
+            let batch: usize = shapes.out_shape[..r - 2].iter().product();
             let tiles = (shapes.out_shape[r - 2] / 16) * (shapes.out_shape[r - 1] / 16);
-            with(body, Launch::flat(tiles * 32))
+            with(body, Launch::flat(batch * tiles * 32))
         }
         ContractionSpec::GemvChunk {
             k,
             n,
             width,
-            bias,
             elems,
             offset,
         } => with(
@@ -1170,7 +1001,6 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
                 *k,
                 *n,
                 *width,
-                *bias,
                 *elems,
                 *offset,
                 WeightLayout::Kn,
@@ -1184,18 +1014,36 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
             schedule,
             k,
             n,
+            epilogue,
         } => {
             let load = DenseLoad {
                 weight: *weight,
                 layout: *layout,
             };
-            let body = dense_contraction(ENTRY, load, *schedule, *k)?;
+            let body = dense_contraction(ENTRY, load, *schedule, *k, epilogue.as_ref())?;
             let threads = schedule.grid_threads(1, 1, *n);
             with(
                 body,
                 Launch {
                     grid: [threads as u32, 1, 1],
                     meta: Some(vec![*k as u32, *n as u32]),
+                },
+            )
+        }
+        ContractionSpec::Packed(PackedContraction {
+            format,
+            schedule,
+            epilogue,
+            grid,
+            meta,
+        }) => {
+            let body =
+                packed_contraction("packed_contraction", *format, *schedule, epilogue.as_ref())?;
+            with(
+                body,
+                Launch {
+                    grid: *grid,
+                    meta: Some(meta.clone()),
                 },
             )
         }
@@ -1218,6 +1066,7 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
             tile,
             offset,
             groups,
+            epilogue,
         } => with(
             tiled_region(
                 "tiled_region",
@@ -1228,6 +1077,7 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
                 *offset,
                 WeightLayout::Kn,
                 BufferStorage::f32(),
+                epilogue.as_ref(),
             )?,
             Launch::flat(groups * tile * tile),
         ),
@@ -1239,6 +1089,7 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
             offset,
             groups,
             weight,
+            epilogue,
         } => with(
             tiled_region(
                 "dense_tiled",
@@ -1249,285 +1100,47 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
                 *offset,
                 WeightLayout::Nk,
                 *weight,
+                epilogue.as_ref(),
             )?,
             Launch::flat(groups * tile * tile),
         ),
-        ContractionSpec::IndexedGemv { k, n, width, numel } => with(
-            indexed_gemv_lds(ENTRY, *k, *n, *width),
-            Launch::flat(numel * width),
+        ContractionSpec::Indexed(IndexedContraction {
+            schedule,
+            layout,
+            weight,
+            epilogue,
+            grid,
+            meta,
+        }) => with(
+            indexed_contraction(ENTRY, *schedule, *layout, *weight, epilogue.as_ref())?,
+            Launch {
+                grid: *grid,
+                meta: Some(meta.clone()),
+            },
         ),
-        ContractionSpec::IndexedSerial { dt, m, k, n, fold } => {
-            fold.contraction(indexed_matmul_dt(ENTRY, dt.clone(), *m, *k, *n), caps)
-        }
     }
 }
 
-fn attention(
-    spec: &AttentionSpec,
-    backend: Backend,
-    caps: &DeviceCaps,
-) -> Result<Generated, KernelGenError> {
-    match spec {
-        AttentionSpec::DecodeSingle {
-            bsz,
-            hq,
-            n_rep,
-            cap,
-            d,
-            scale_bits,
-            mask_per_head,
-        } => {
-            // The body holds its running output in a private array: unimportable, and it crashes SPIR-V
-            // codegen (the wgpu and raw-Vulkan runtimes both go through `Backend::SpirvVulkan`). NVPTX is
-            // its intended target; AMDGCN lowers through a different path and is not known to fail.
-            if backend == Backend::SpirvVulkan {
-                return Err(unsupported(
-                    "flash_attention_decode",
-                    "a head dim above the LDS cap needs a private output array, which SPIR-V cannot state",
-                ));
-            }
-            with(
-                flash_attention_decode(
-                    ENTRY,
-                    *hq,
-                    *n_rep,
-                    *cap,
-                    *d,
-                    f32::from_bits(*scale_bits),
-                    *mask_per_head,
-                ),
-                Launch::flat(bsz * hq),
-            )
-        }
-        AttentionSpec::RegionDecode {
-            bsz,
-            hq,
-            n_rep,
-            cap,
-            d,
-            scale_bits,
-            width,
-            mask_per_head,
-        } => with(
-            flash_region_decode(
-                ENTRY,
-                *bsz,
-                *hq,
-                *n_rep,
-                *cap,
-                *d,
-                f32::from_bits(*scale_bits),
-                *width,
-                *mask_per_head,
-            ),
-            // `bsz * hq` workgroups of `width` lanes.
-            Launch::flat(bsz * hq * width),
-        ),
-        AttentionSpec::RegionPrefill {
-            hq,
-            l,
-            d,
-            n_rep,
-            scale_bits,
-            mask_per_head,
-        } => {
-            let (x, y) = fold_groups(hq * l, caps.max_grid[0]);
-            with(
-                flash_region_prefill(
-                    ENTRY,
-                    *hq,
-                    *l,
-                    *d,
-                    *n_rep,
-                    f32::from_bits(*scale_bits),
-                    x,
-                    *mask_per_head,
-                ),
-                Launch::grid([x as u32, y as u32, 1]),
-            )
-        }
-    }
+fn attention(spec: &AttentionSpec, caps: &DeviceCaps) -> Result<Generated, KernelGenError> {
+    let AttentionSchedule::Streaming { lanes } = spec.schedule;
+    // One workgroup of `lanes` threads per (batch, head, row), folded onto a 2-D grid past the X cap.
+    let (x, y) = fold_groups(spec.workgroups(), caps.max_grid[0]);
+    with(
+        attention_body(ENTRY, spec, x)?,
+        Launch::grid([(x * lanes) as u32, y as u32, 1]),
+    )
 }
 
-fn movement(spec: &MovementSpec) -> Result<Generated, KernelGenError> {
-    match spec {
-        MovementSpec::GatherAxis0 {
-            dt,
-            index_dt,
-            rest,
-            numel,
-        } => with(
-            gather_axis0_index_dt(ENTRY, dt.clone(), index_dt.clone(), *rest),
-            Launch::flat(*numel),
-        ),
-        MovementSpec::GatherAxis {
-            dt,
-            index_dt,
-            inner,
-            axis_len,
-            idx_numel,
-            numel,
-        } => with(
-            gather_axis_index_dt(
-                ENTRY,
-                dt.clone(),
-                index_dt.clone(),
-                *inner,
-                *axis_len,
-                *idx_numel,
-            ),
-            Launch::flat(*numel),
-        ),
-        MovementSpec::ScatterAxis0 { dt, rest, numel } => with(
-            scatter_axis0_dt(ENTRY, dt.clone(), *rest),
-            Launch::flat(*numel),
-        ),
-        MovementSpec::ScatterUpdate { dt, rest, numel } => with(
-            scatter_update_dt(ENTRY, dt.clone(), *rest),
-            Launch::flat(*numel),
-        ),
-        MovementSpec::ScatterUpdateChunk {
-            dt,
-            rest,
-            offset,
-            groups,
-            width,
-        } => with(
-            scatter_update_chunked_dt(ENTRY, dt.clone(), *rest, *offset),
-            Launch::flat(groups * width),
-        ),
-        MovementSpec::Transpose {
-            dt,
-            out_shape,
-            in_shape,
-            perm,
-            numel,
-        } => with(
-            transpose_dt(ENTRY, dt.clone(), out_shape, in_shape, perm),
-            Launch::flat(*numel),
-        ),
-        MovementSpec::Slice {
-            dt,
-            out_shape,
-            in_shape,
-            axis,
-            start,
-            numel,
-        } => with(
-            slice_dt(ENTRY, dt.clone(), out_shape, in_shape, *axis, *start),
-            Launch::flat(*numel),
-        ),
-        MovementSpec::Broadcast {
-            dt,
-            out_shape,
-            in_shape,
-            numel,
-        } => with(
-            broadcast_dt(ENTRY, dt.clone(), out_shape, in_shape),
-            Launch::flat(*numel),
-        ),
-        MovementSpec::Concat2 {
-            dt,
-            out_shape,
-            axis,
-            a_shape,
-            b_shape,
-            numel,
-        } => with(
-            concat2_dt(ENTRY, dt.clone(), out_shape, *axis, a_shape, b_shape),
-            Launch::flat(*numel),
-        ),
-        MovementSpec::ConcatN {
-            dt,
-            out_shape,
-            axis,
-            in_shapes,
-            numel,
-        } => with(
-            concat_n_dt(ENTRY, dt.clone(), out_shape, *axis, &slices(in_shapes))?,
-            Launch::flat(*numel),
-        ),
-        MovementSpec::UpdateSliceStatic {
-            dt,
-            out_shape,
-            axis,
-            index,
-            extent,
-            numel,
-        } => with(
-            dyn_update_slice_dt(ENTRY, dt.clone(), out_shape, *axis, *index, *extent),
-            Launch::flat(*numel),
-        ),
-        MovementSpec::UpdateSliceRuntime {
-            dt,
-            index_dt: _,
-            out_shape,
-            axis,
-            extent,
-            numel,
-        } => with(
-            dyn_update_slice_dynamic_dt(ENTRY, dt.clone(), out_shape, *axis, *extent),
-            Launch::flat(*numel),
-        ),
-        MovementSpec::E4m3 { out_shape, op } => {
-            let body = match op {
-                E4m3Movement::ScatterUpdate {
-                    base_shape,
-                    src_shape,
-                } => e4m3fn_scatter_update_packed(ENTRY, base_shape, src_shape)?,
-                E4m3Movement::Transpose { in_shape, perm } => {
-                    e4m3fn_transpose_packed(ENTRY, out_shape, in_shape, perm)?
-                }
-                E4m3Movement::Slice {
-                    in_shape,
-                    axis,
-                    start,
-                } => e4m3fn_slice_packed(ENTRY, out_shape, in_shape, *axis, *start)?,
-                E4m3Movement::Concat { axis, in_shapes } => {
-                    e4m3fn_concat_packed(ENTRY, out_shape, *axis, &slices(in_shapes))?
-                }
-                E4m3Movement::Gather {
-                    in_shape,
-                    axis,
-                    index_shape,
-                } => e4m3fn_gather_packed(ENTRY, out_shape, in_shape, *axis, index_shape)?,
-                E4m3Movement::DynamicUpdateSlice {
-                    operand_shape,
-                    update_shape,
-                    axis,
-                    index,
-                } => e4m3fn_dynamic_update_slice_packed(
-                    ENTRY,
-                    operand_shape,
-                    update_shape,
-                    *axis,
-                    *index,
-                )?,
-                E4m3Movement::DynamicUpdateSliceRuntime {
-                    operand_shape,
-                    update_shape,
-                    axis,
-                } => e4m3fn_dynamic_update_slice_dynamic_packed(
-                    ENTRY,
-                    operand_shape,
-                    update_shape,
-                    *axis,
-                )?,
-                E4m3Movement::Broadcast { in_shape } => {
-                    e4m3fn_broadcast_packed(ENTRY, out_shape, in_shape)?
-                }
-                E4m3Movement::RepackReshape {
-                    input_row_len,
-                    output_row_len,
-                } => e4m3fn_repack_reshape(ENTRY, *input_row_len, *output_row_len)?,
-            };
-            with(body, e4m3_row_launch(out_shape))
-        }
-    }
+fn movement(spec: &MovementSpec, caps: &DeviceCaps) -> Result<Generated, KernelGenError> {
+    with(
+        movement_body(ENTRY, spec, spec.fold.x_groups(caps))?,
+        spec.fold.launch(caps),
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::{EpilogueInput, EpilogueLeaf, EpilogueStep, FusedScalarOp};
     use std::num::NonZeroUsize;
 
     use super::*;
@@ -1564,6 +1177,7 @@ mod tests {
                     },
                     k: 896,
                     n: 4864,
+                    epilogue: None,
                 }),
                 format!(
                     "contraction:dense_gemv:{}:Nk:w256c4u4:896x4864",
@@ -1573,7 +1187,7 @@ mod tests {
             (
                 KernelRequest::Contraction(ContractionSpec::Serial {
                     dt: Ty::F32,
-                    bias: false,
+                    epilogue: None,
                     shapes: MatmulShapes {
                         out_shape: vec![2, 3],
                         a_shape: vec![2, 4],
@@ -1631,7 +1245,6 @@ mod tests {
                 width,
                 numel: d * batch,
             }),
-            Backend::SpirvVulkan,
             &caps,
             &roomy(),
         )
@@ -1644,33 +1257,183 @@ mod tests {
         assert_eq!(generated.launch.meta, None);
     }
 
-    /// Card 636 SC-004: a request the target cannot state returns `Unsupported`, never a panic. The
-    /// single-sequence flash decode holds its running output in a private array, which SPIR-V cannot
-    /// state; NVPTX and AMDGCN can. Mutation: make the unsupported arm `panic!` instead of returning the
-    /// error; this row panics.
+    /// Finite BF16 bit patterns (both signs, exponents around zero) from a fixed xorshift stream.
+    fn finite_bf16_bits(count: usize, seed: u64) -> Vec<u16> {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..count)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let bits = (state >> 32) as u16;
+                let exponent = 0x70 + ((bits >> 7) & 0xff) % 0x18;
+                (bits & 0x8000) | (exponent << 7) | (bits & 0x7f)
+            })
+            .collect()
+    }
+
+    /// Run `request` in the KIR interpreter over `[activation, weight, leaf, meta.., out]` and return `out`.
+    fn interpret_with_leaf(
+        request: &KernelRequest,
+        weight: poot_kernel_ir::interp::Buffer,
+        activation: &[f32],
+        leaf: poot_kernel_ir::interp::Buffer,
+        out_len: usize,
+    ) -> Vec<f32> {
+        use poot_kernel_ir::interp::{Buffer, run};
+        let caps = DeviceCaps::wgpu_rdna3_igpu();
+        let generated = generate(request, &caps, &roomy()).expect("stateable");
+        let workgroup = generated.body.workgroup_size;
+        let workgroups =
+            std::array::from_fn(|axis| generated.launch.grid[axis].div_ceil(workgroup[axis]));
+        let mut buffers = vec![Buffer::from_f32s(activation), weight, leaf];
+        buffers.extend(generated.launch.meta.as_deref().map(Buffer::from_u32s));
+        buffers.push(Buffer::from_f32s(&vec![0.0; out_len]));
+        run(&generated.body, workgroups, &mut buffers).expect("interpreter");
+        buffers.last().unwrap().to_f32s().unwrap()
+    }
+
+    /// A bias stored BF16 and widened by a `Cast` step reads, through the packed lane of every epilogue body (the
+    /// decode GEMV, the one-thread-per-output dense kernel and the `[K, N]` generated kernel), to the bit what the
+    /// same bias reads from an f32 buffer holding its widened values. The bias is odd-sized, so the last packed word
+    /// carries one element and a zero pad. Mutation: in `Epilogue::leaf_param` declare a packed leaf as an f32
+    /// slice; the three bodies stop verifying (or read the wrong words).
     #[test]
-    fn a_private_array_flash_decode_is_unsupported_on_spirv_only() {
-        let request = KernelRequest::Attention(AttentionSpec::DecodeSingle {
-            bsz: 1,
-            hq: 2,
-            n_rep: 1,
-            cap: 8,
-            d: 512,
-            scale_bits: 0.5f32.to_bits(),
-            mask_per_head: false,
-        });
-        let spirv = DeviceCaps::wgpu_rdna3_igpu();
-        match generate(&request, Backend::SpirvVulkan, &spirv, &roomy()) {
-            Err(KernelGenError::Unsupported { request, reason }) => {
-                assert_eq!(request, "flash_attention_decode");
-                assert!(reason.contains("SPIR-V"), "{reason}");
-            }
-            other => panic!("expected Unsupported on SPIR-V, got {other:?}"),
+    fn epilogue_bodies_read_a_packed_bf16_bias_as_its_widened_values() {
+        use poot_kernel_ir::interp::Buffer;
+        let (k, n) = (6usize, 5usize);
+        let bias_bits = finite_bf16_bits(n, 11);
+        let widened: Vec<f32> = bias_bits
+            .iter()
+            .map(|&b| f32::from_bits(u32::from(b) << 16))
+            .collect();
+        let words: Vec<u32> = bias_bits
+            .chunks(2)
+            .map(|pair| u32::from(pair[0]) | (u32::from(pair.get(1).copied().unwrap_or(0)) << 16))
+            .collect();
+        let weight_values: Vec<f32> = (0..n * k).map(|i| ((i % 7) as f32) * 0.25 - 0.5).collect();
+        let activation: Vec<f32> = (0..k).map(|i| (i as f32) * 0.5 - 1.0).collect();
+        // `head + bias`, the bias read through `lane`: a Widen step over a packed leaf, or the f32 leaf itself.
+        let epilogue = |storage: Option<BufferStorage>| match storage {
+            Some(_) => Epilogue {
+                dt: Ty::F32,
+                out_shape: vec![1, n],
+                leaves: vec![EpilogueLeaf {
+                    shape: vec![n],
+                    storage,
+                }],
+                steps: vec![
+                    EpilogueStep {
+                        op: FusedScalarOp::Widen,
+                        inputs: vec![EpilogueInput::Leaf(0)],
+                    },
+                    EpilogueStep {
+                        op: FusedScalarOp::Binary(BinOp::Add),
+                        inputs: vec![EpilogueInput::Head, EpilogueInput::Step(0)],
+                    },
+                ],
+                output: EpilogueInput::Step(1),
+            },
+            None => Epilogue {
+                dt: Ty::F32,
+                out_shape: vec![1, n],
+                leaves: vec![EpilogueLeaf {
+                    shape: vec![n],
+                    storage: None,
+                }],
+                steps: vec![EpilogueStep {
+                    op: FusedScalarOp::Binary(BinOp::Add),
+                    inputs: vec![EpilogueInput::Head, EpilogueInput::Leaf(0)],
+                }],
+                output: EpilogueInput::Step(0),
+            },
+        };
+        let shapes = |b_shape: Vec<usize>| MatmulShapes {
+            out_shape: vec![1, n],
+            a_shape: vec![1, k],
+            b_shape,
+        };
+        let fold = Fold {
+            numel: n,
+            two_d: false,
+            width: 64,
+        };
+        let bodies = |storage: Option<BufferStorage>| {
+            [
+                (
+                    ContractionSpec::DenseGemv {
+                        weight: BufferStorage::f32(),
+                        layout: WeightLayout::Nk,
+                        schedule: Schedule::Gemv {
+                            width: 16,
+                            cols: 2,
+                            unroll: 2,
+                        },
+                        k,
+                        n,
+                        epilogue: Some(epilogue(storage)),
+                    },
+                    weight_values.clone(),
+                ),
+                (
+                    ContractionSpec::DenseTiled {
+                        m: 1,
+                        k,
+                        n,
+                        tile: 8,
+                        offset: 0,
+                        groups: n.div_ceil(8),
+                        weight: BufferStorage::f32(),
+                        epilogue: Some(epilogue(storage)),
+                    },
+                    weight_values.clone(),
+                ),
+                (
+                    ContractionSpec::Serial {
+                        dt: Ty::F32,
+                        epilogue: Some(epilogue(storage)),
+                        shapes: shapes(vec![k, n]),
+                        fold,
+                    },
+                    // the same weight, `[K, N]`
+                    (0..k * n)
+                        .map(|i| weight_values[(i % n) * k + i / n])
+                        .collect(),
+                ),
+            ]
+        };
+        let packed = bodies(Some(BufferStorage::bf16_packed()));
+        let wide = bodies(None);
+        for ((packed_spec, weight), (wide_spec, _)) in packed.iter().zip(&wide) {
+            let name = packed_spec_name(packed_spec);
+            let got = interpret_with_leaf(
+                &KernelRequest::Contraction(packed_spec.clone()),
+                Buffer::from_f32s(weight),
+                &activation,
+                Buffer::from_u32s(&words),
+                n,
+            );
+            let want = interpret_with_leaf(
+                &KernelRequest::Contraction(wide_spec.clone()),
+                Buffer::from_f32s(weight),
+                &activation,
+                Buffer::from_f32s(&widened),
+                n,
+            );
+            let (got_bits, want_bits): (Vec<u32>, Vec<u32>) = (
+                got.iter().map(|v| v.to_bits()).collect(),
+                want.iter().map(|v| v.to_bits()).collect(),
+            );
+            assert_eq!(got_bits, want_bits, "{name}: packed BF16 bias differs");
         }
-        let nvptx = DeviceCaps::ptx_default();
-        let generated = generate(&request, Backend::Nvptx, &nvptx, &roomy())
-            .expect("the same request is stateable on NVPTX");
-        assert_eq!(generated.launch.grid, [2, 1, 1], "bsz * hq workgroups");
+    }
+
+    fn packed_spec_name(spec: &ContractionSpec) -> &'static str {
+        match spec {
+            ContractionSpec::DenseGemv { .. } => "dense gemv",
+            ContractionSpec::DenseTiled { .. } => "dense tiled",
+            _ => "serial",
+        }
     }
 
     /// Finite binary16 bit patterns (zero, subnormal and normal, both signs; the packed decode's admitted
@@ -1708,8 +1471,7 @@ mod tests {
     ) -> Vec<f32> {
         use poot_kernel_ir::interp::{Buffer, run};
         let caps = DeviceCaps::wgpu_rdna3_igpu();
-        let generated =
-            generate(request, Backend::SpirvVulkan, &caps, &roomy()).expect("stateable");
+        let generated = generate(request, &caps, &roomy()).expect("stateable");
         let workgroup = generated.body.workgroup_size;
         let workgroups =
             std::array::from_fn(|axis| generated.launch.grid[axis].div_ceil(workgroup[axis]));
@@ -1760,6 +1522,7 @@ mod tests {
                         },
                         k,
                         n,
+                        epilogue: None,
                     },
                     (4, 19) => ContractionSpec::DenseSerial {
                         weight,
@@ -1782,6 +1545,7 @@ mod tests {
                         offset: 0,
                         groups: m.div_ceil(2 * tile) * n.div_ceil(tile),
                         weight,
+                        epilogue: None,
                     },
                 })
             };
@@ -1838,8 +1602,9 @@ mod tests {
                 },
                 k: 8,
                 n: 4,
+                epilogue: None,
             });
-            match generate(&request, Backend::SpirvVulkan, &caps, &roomy()) {
+            match generate(&request, &caps, &roomy()) {
                 Err(KernelGenError::Unsupported { request, .. }) => {
                     assert_eq!(request, "dense_contraction")
                 }
@@ -1867,6 +1632,7 @@ mod tests {
                 },
                 k: 896,
                 n: 4864,
+                epilogue: None,
             })
         };
         for weight in [
@@ -1874,12 +1640,7 @@ mod tests {
             BufferStorage::f16_packed(),
             BufferStorage::bf16_packed(),
         ] {
-            match generate(
-                &request(weight, WeightLayout::Kn),
-                Backend::SpirvVulkan,
-                &caps,
-                &roomy(),
-            ) {
+            match generate(&request(weight, WeightLayout::Kn), &caps, &roomy()) {
                 Err(KernelGenError::Unsupported { request, reason }) => {
                     assert_eq!(request, "dense_contraction", "{weight}");
                     assert!(
@@ -1893,13 +1654,8 @@ mod tests {
                     generated.body.name
                 ),
             }
-            generate(
-                &request(weight, WeightLayout::Nk),
-                Backend::SpirvVulkan,
-                &caps,
-                &roomy(),
-            )
-            .unwrap_or_else(|e| panic!("{weight}: the [N, K] Gemv must generate: {e}"));
+            generate(&request(weight, WeightLayout::Nk), &caps, &roomy())
+                .unwrap_or_else(|e| panic!("{weight}: the [N, K] Gemv must generate: {e}"));
         }
     }
 
@@ -1971,6 +1727,7 @@ mod tests {
                         },
                         k,
                         n,
+                        epilogue: None,
                     });
                     let got = interpret(&request, buffer, &activation, n);
                     for (col, &value) in got.iter().enumerate() {
@@ -2080,7 +1837,7 @@ mod tests {
                 layout: Layout::contiguous(&shape),
             }],
             kernel: FusedKernel {
-                n_leaves: 1,
+                leaf_tys: vec![crate::LeafTy::F32; 1],
                 steps: (0..steps)
                     .map(|s| crate::fused::FusedStep {
                         op: crate::fused::FusedScalarOp::Erf,
@@ -2093,7 +1850,13 @@ mod tests {
                     .collect(),
                 output: FusedInput::Step(steps - 1),
             },
-            form: PointwiseForm::Float,
+            form: PointwiseForm::Float {
+                fold: Fold {
+                    numel: 1,
+                    two_d: false,
+                    width: 256,
+                },
+            },
         })
     }
 
@@ -2108,20 +1871,14 @@ mod tests {
         let caps = DeviceCaps::wgpu_rdna3_igpu();
         let request = erf_chain(6);
         let bound = recipe_size(&request).expect("a pointwise request is sized from its recipe");
-        let fits = generate(
-            &request,
-            Backend::SpirvVulkan,
-            &caps,
-            &limits(bound.instructions, bound.locals),
-        )
-        .expect("a cap equal to the bound admits the region");
+        let fits = generate(&request, &caps, &limits(bound.instructions, bound.locals))
+            .expect("a cap equal to the bound admits the region");
         assert!(
             BodySize::of(&fits.body).instructions <= bound.instructions,
             "the bound covers the built body"
         );
         let refused = generate(
             &request,
-            Backend::SpirvVulkan,
             &caps,
             &limits(bound.instructions - 1, bound.locals),
         )
@@ -2138,7 +1895,6 @@ mod tests {
         );
         let refused = generate(
             &request,
-            Backend::SpirvVulkan,
             &caps,
             &limits(bound.instructions, bound.locals - 1),
         )
@@ -2167,16 +1923,10 @@ mod tests {
             numel: 4,
         });
         assert!(recipe_size(&request).is_none());
-        let built = generate(&request, Backend::SpirvVulkan, &caps, &roomy())
-            .expect("generates under roomy limits");
+        let built = generate(&request, &caps, &roomy()).expect("generates under roomy limits");
         let size = BodySize::of(&built.body);
-        let refused = generate(
-            &request,
-            Backend::SpirvVulkan,
-            &caps,
-            &limits(size.instructions - 1, size.locals),
-        )
-        .unwrap_err();
+        let refused =
+            generate(&request, &caps, &limits(size.instructions - 1, size.locals)).unwrap_err();
         assert_eq!(
             refused,
             KernelGenError::BodyLimit {

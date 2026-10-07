@@ -13,7 +13,7 @@ use std::collections::HashMap as Map;
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
 use poot_executor_parity::dense::{Dense, Family, plain, step};
 use poot_graph_ir::{Slot, Storage, ValueId};
-use poot_graph_plan::{CompileOptions, FusionPolicy, Submission, Target, compile};
+use poot_graph_plan::{CompileOptions, Submission, Target, compile};
 use poot_models::model::{LogitRows, Phase};
 use poot_target::Backend;
 use poot_tensor::HostTensor;
@@ -169,10 +169,7 @@ fn compile_hosts_the_decode_embed_gather_without_changing_hidden_state() {
                 id,
                 Value::from(weight(m.name.as_deref().unwrap(), &m.aval.shape)),
             ),
-            Storage::Computed(computed) => Some(Value::from(HostTensor::f32(
-                computed.shape(),
-                computed.values_f32(),
-            ))),
+            Storage::Computed(computed) => Some(Value::from(computed.tensor())),
             Storage::State => None,
             Storage::Device => unreachable!(),
         };
@@ -195,7 +192,6 @@ fn compile_hosts_the_decode_embed_gather_without_changing_hidden_state() {
     };
     let options = CompileOptions {
         execution: Submission::Replay,
-        fusion: FusionPolicy::Full,
         limits: poot_graph_plan::CompileLimits::STANDARD,
     };
     let program = compile(&gd, &target, &options)
@@ -233,10 +229,7 @@ fn compile_hosts_the_decode_embed_gather_without_changing_hidden_state() {
                 id,
                 Value::from(weight(m.name.as_deref().unwrap(), &m.aval.shape)),
             ),
-            Storage::Computed(computed) => Some(Value::from(HostTensor::f32(
-                computed.shape(),
-                computed.values_f32(),
-            ))),
+            Storage::Computed(computed) => Some(Value::from(computed.tensor())),
             Storage::State => None,
             Storage::Device => unreachable!(),
         };
@@ -301,10 +294,7 @@ fn compile_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
                 id,
                 Value::from(weight(m.name.as_deref().unwrap(), &m.aval.shape)),
             ),
-            Storage::Computed(computed) => Some(Value::from(HostTensor::f32(
-                computed.shape(),
-                computed.values_f32(),
-            ))),
+            Storage::Computed(computed) => Some(Value::from(computed.tensor())),
             Storage::State => None,
             Storage::Device => unreachable!(),
         };
@@ -327,7 +317,6 @@ fn compile_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
     };
     let options = CompileOptions {
         execution: Submission::Replay,
-        fusion: FusionPolicy::Full,
         limits: poot_graph_plan::CompileLimits::STANDARD,
     };
     let program = compile(&gd, &target, &options)
@@ -362,10 +351,7 @@ fn compile_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
                 id,
                 Value::from(weight(m.name.as_deref().unwrap(), &m.aval.shape)),
             ),
-            Storage::Computed(computed) => Some(Value::from(HostTensor::f32(
-                computed.shape(),
-                computed.values_f32(),
-            ))),
+            Storage::Computed(computed) => Some(Value::from(computed.tensor())),
             Storage::State => None,
             Storage::Device => unreachable!(),
         };

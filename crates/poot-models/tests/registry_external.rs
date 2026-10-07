@@ -135,6 +135,7 @@ const ENTRY: FamilyEntry = FamilyEntry {
     ],
     build,
     fixture,
+    variants: &[],
 };
 
 fn decode_shape() -> StepShape {

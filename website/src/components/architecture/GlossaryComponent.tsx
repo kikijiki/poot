@@ -44,8 +44,8 @@ const ENTRIES: Entry[] = [
     see: "attention",
   },
   {
-    term: "ComputeMeta",
-    def: "A Plan variant (Plan::ComputeMeta) that binds a small read-only u32 metadata buffer to an imported kernel: shape and parameter information such as head counts, capacity, and the scale as f32 bits. Allows one kernel binary to serve multiple configurations.",
+    term: "Launch metadata",
+    def: "A dispatch's launch metadata (Launch::meta) binds a small read-only u32 metadata buffer to an imported kernel: shape and parameter information such as head counts, capacity, and the scale as f32 bits. Allows one kernel binary to serve multiple configurations.",
     see: "fusion",
   },
   {
@@ -208,7 +208,7 @@ const ENTRIES: Entry[] = [
   },
   {
     term: "OpKind",
-    def: "The enum of all operations in the graph IR: primitives (Unary, Binary, Select, Reduce, Broadcast, Cast, Reshape, Transpose, Slice, Concat, Gather, Scatter, MatMul, ...) and compiler-introduced composites (Fused, FusedRow, MatMulBias, FlashAttention*, Rope, packed and dense contractions). No op records a kernel choice; the planner records it with each plan.",
+    def: "The enum of all operations in the graph IR: primitives (Unary, Binary, Select, Reduce, Broadcast, Cast, Reshape, Transpose, Slice, Concat, Gather, Scatter, MatMul, ...) and compiler-introduced composites (Fused, FusedRow, ContractionEpilogue, Attention, Rope, packed and dense contractions). No op records a kernel choice; the planner records it with each plan.",
     see: "graph-ir",
   },
   {

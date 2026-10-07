@@ -10,7 +10,10 @@
 
 use std::cell::RefCell;
 
-use poot_graph_ir::{BinOp, Builder, Graph, Slot, TensorType, Traced, ValidationOutputs, ops};
+use poot_graph_ir::{
+    BinOp, Builder, Graph, Slot, TensorType, Traced, ValidationId, ValidationOutput,
+    ValidationOutputs, ops,
+};
 use poot_quant::weights::{NormRole, WeightId, WeightMap, WeightRole};
 use poot_tensor::DType;
 
@@ -56,6 +59,7 @@ pub struct Step {
     pos: Traced,
     paged: Option<PagedMaps>,
     state: RefCell<Vec<(Traced, Traced)>>,
+    validations: RefCell<Vec<ValidationOutput>>,
 }
 
 /// The two slot maps of a [`KvLayout::Paged`] step, both I32 `Slot::SlotMap` inputs.
@@ -94,6 +98,7 @@ impl Step {
             pos: b.slot(Slot::Pos, ids),
             paged,
             state: RefCell::new(Vec::new()),
+            validations: RefCell::new(Vec::new()),
         }
     }
 
@@ -120,10 +125,21 @@ impl Step {
         self.state.borrow_mut().push((input, output));
     }
 
-    /// The step's graph: `out` plus every carried state pair, in carry order.
+    /// Declare `value`, a bounded F32 witness, as validation root `id` named `name`: the executor
+    /// checks it every step before any output is read back.
+    pub fn validate(&self, id: ValidationId, name: String, value: Traced) {
+        self.validations.borrow_mut().push(ValidationOutput {
+            id,
+            name,
+            value: value.id,
+        });
+    }
+
+    /// The step's graph: `out` plus every carried state pair, in carry order, and every declared
+    /// validation root, in declaration order.
     pub fn finish(self, b: Builder, out: Traced) -> Graph<ValidationOutputs> {
         b.finish_with_state(out, &self.state.into_inner())
-            .with_validations(Vec::new())
+            .with_validations(self.validations.into_inner())
     }
 }
 
@@ -186,6 +202,21 @@ impl LayerNorms {
             post: Some([post(NormRole::PostAttn)?, post(NormRole::PostFfn)?]),
             ..Self::new(map, layer, width)?
         })
+    }
+}
+
+/// The scalar a layer multiplies its output by (Gemma 4's `layer_scalar`): a learned `[1]` weight,
+/// applied after the layer's last residual add.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayerScale(Weight);
+
+impl LayerScale {
+    pub fn new(map: &WeightMap, layer: usize) -> Result<Self, WeightError> {
+        Weight::new(map, WeightId::layer(layer, WeightRole::LayerScale), &[1]).map(Self)
+    }
+
+    pub fn apply(&self, b: &Builder, x: Traced) -> Traced {
+        b.binary(BinOp::Mul, x, self.0.declare_f32(b))
     }
 }
 
@@ -252,11 +283,22 @@ pub fn standard_layer(
     norms: &LayerNorms,
     p: &LayerParams,
     mixer: impl FnOnce(&Builder, Traced) -> Traced,
-    ffn: impl FnOnce(&Builder, Traced) -> Traced,
+    ffn: impl FnOnce(&Builder, BlockInput) -> Traced,
 ) -> Traced {
     let post = |i: usize| norms.post.as_ref().map(|post| &post[i]);
-    let x = residual_block(b, x, &norms.attn, post(0), p, mixer);
+    let x = residual_block(b, x, &norms.attn, post(0), p, |b, input| {
+        mixer(b, input.block)
+    });
     residual_block(b, x, &norms.ffn, post(1), p, ffn)
+}
+
+/// What a block of a standard layer reads: the block's normalized input (the raw residual under
+/// [`NormPlacement::Post`]) and the residual stream it joins. Most blocks read only `block`; Gemma
+/// 4's routed feed-forward also routes on `residual` and normalizes it with its own norm.
+#[derive(Clone, Copy, Debug)]
+pub struct BlockInput {
+    pub block: Traced,
+    pub residual: Traced,
 }
 
 fn residual_block(
@@ -265,14 +307,15 @@ fn residual_block(
     w: &NormWeights,
     post: Option<&Weight>,
     p: &LayerParams,
-    block: impl FnOnce(&Builder, Traced) -> Traced,
+    block: impl FnOnce(&Builder, BlockInput) -> Traced,
 ) -> Traced {
+    let input = |block| BlockInput { block, residual: x };
     let out = match p.placement {
-        NormPlacement::Pre => block(b, norm_with(b, x, w, p.norm)),
-        NormPlacement::Post => norm_with(b, block(b, x), w, p.norm),
+        NormPlacement::Pre => block(b, input(norm_with(b, x, w, p.norm))),
+        NormPlacement::Post => norm_with(b, block(b, input(x)), w, p.norm),
         NormPlacement::Sandwich => {
             let post = post.expect("a Sandwich layer is built with LayerNorms::sandwich");
-            norm(b, block(b, norm_with(b, x, w, p.norm)), post, p.norm)
+            norm(b, block(b, input(norm_with(b, x, w, p.norm))), post, p.norm)
         }
     };
     let out = match p.residual_scale {
@@ -887,7 +930,7 @@ mod tests {
                 &norms,
                 &LayerParams::new(NormParams::new(eps as f32).unwrap()),
                 |b, h| super::super::linear::linear(b, h, &m, None),
-                |b, h| super::super::linear::linear(b, h, &f, None),
+                |b, BlockInput { block: h, .. }| super::super::linear::linear(b, h, &f, None),
             );
             fx.eval(&b.finish(y), &[("x", &x)], &[], &[]).0
         };
@@ -1017,7 +1060,7 @@ mod tests {
                 &norms,
                 &params,
                 |b, h| super::super::linear::linear(b, h, &m, None),
-                |b, h| super::super::linear::linear(b, h, &f, None),
+                |b, BlockInput { block: h, .. }| super::super::linear::linear(b, h, &f, None),
             );
             fx.eval(&b.finish(y), &[("x", &x)], &[], &[]).0
         };
@@ -1158,7 +1201,7 @@ mod tests {
                 &norms,
                 &params,
                 |b, h| super::super::linear::linear(b, h, &m, None),
-                |b, h| super::super::linear::linear(b, h, &f, None),
+                |b, BlockInput { block: h, .. }| super::super::linear::linear(b, h, &f, None),
             );
             fx.eval(&b.finish(y), &[("x", &x)], &[], &[]).0
         };
@@ -1262,7 +1305,7 @@ mod tests {
                 &norms,
                 &params,
                 |b, h| super::super::linear::linear(b, h, &m, None),
-                |b, h| super::super::linear::linear(b, h, &f, None),
+                |b, BlockInput { block: h, .. }| super::super::linear::linear(b, h, &f, None),
             );
             fx.eval(&b.finish(y), &[("x", &x)], &[], &[]).0
         };

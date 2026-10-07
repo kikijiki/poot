@@ -18,8 +18,8 @@ use poot_graph_ir::op::{BinOp, RedOp, UnOp};
 use poot_graph_ir::types::TensorType;
 use poot_graph_ir::{Graph, SlotKey, Storage};
 use poot_graph_plan::{
-    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, FusionPolicy, Partition,
-    StagedProgram, Submission, Target, TargetSet, compile_staged,
+    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram,
+    Submission, Target, TargetSet, compile_staged,
 };
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_test_util::max_abs_error;
@@ -48,7 +48,6 @@ fn staged(g: &Graph, target: Target) -> StagedProgram<poot_graph_ir::ValidationO
         },
         &CompileOptions {
             execution: Submission::Replay,
-            fusion: FusionPolicy::Full,
             limits: poot_graph_plan::CompileLimits::STANDARD,
         },
     )
@@ -57,8 +56,10 @@ fn staged(g: &Graph, target: Target) -> StagedProgram<poot_graph_ir::ValidationO
 
 fn f32_bytes(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 
@@ -827,7 +828,7 @@ fn deep_fused_chain_gpu_matches_cpu() {
 // Card 159 Inc 3: batched KV-write grid > 65535 workgroups
 
 /// Card 159 Inc 3 synthetic repro: force `scatter_update`'s dispatch grid past wgpu's 65535-per-dim workgroup
-/// cap so the `elementwise_2d_grid` 2-D fold (`poot-graph-plan`) engages. At `WORKGROUP_SIZE=256` the fold only
+/// cap so the movement generator's 2-D grid fold (`MovementSpec::folded`) engages. At `WORKGROUP_SIZE=256` the fold only
 /// kicks in above `out_numel = 65535*256 = 16_776_960`, so `pool` is just over that with `d=1` (~64MB f32).
 /// Compares `run_resident_kv` (per-dispatch) bit-exact against a plain CPU `poot_eval::eval`, so a
 /// wrong-but-self-consistent GPU result is caught as well as a hang.
@@ -909,7 +910,7 @@ fn wgpu_scatter_update_grid_over_65535_workgroups() {
 
 /// Card 159 Inc 3 synthetic repro, `dynamic_update_slice` (dynamic buffer-index) sibling of
 /// [`wgpu_scatter_update_grid_over_65535_workgroups`]. The same grid-cap logic
-/// (`is_elementwise_2d`/`elementwise_2d_grid`) applies to the `DynamicUpdateSlice` runtime-index `ComputeMeta`
+/// (`is_elementwise_2d`/`MovementSpec::folded`) applies to the `DynamicUpdateSlice` runtime-index metadata launch
 /// form.
 #[test]
 fn wgpu_dyn_update_slice_grid_over_65535_workgroups() {

@@ -2120,7 +2120,7 @@ pub mod card416_test_support {
         for (layer, (&kind, pairs)) in layout
             .layer_types
             .iter()
-            .zip(graph.state.chunks_exact(2))
+            .zip(graph.state.as_chunks::<2>().0.iter())
             .enumerate()
         {
             let root = format!("model.language_model.layers.{layer}");

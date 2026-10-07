@@ -12,7 +12,8 @@ pub(crate) mod float_decode;
 mod kernel;
 mod planar;
 
-pub use kernel::{PackedKernelOp, PackedKernelSpec, RowSelect, packed_kernel};
+pub(crate) use kernel::packed_contraction;
+pub use kernel::{PackedKernelOp, PackedKernelSpec, packed_kernel};
 
 #[cfg(test)]
 mod float_decode_tests {
@@ -514,7 +515,7 @@ mod planar_fixtures {
                         unreachable!("format tests: only act-order GPTQ has a GroupIndex operand")
                     };
                     (0..k)
-                        .flat_map(|kk| ((kk % groups.get()) as i32).to_le_bytes())
+                        .flat_map(|kk| ((kk % groups) as i32).to_le_bytes())
                         .collect()
                 } else {
                     let len = descriptor
@@ -1200,7 +1201,7 @@ mod row_gather_tests {
 #[cfg(test)]
 mod contraction_tests {
     //! SC-005 (card 542a, GPU-free rehearsal): `packed_kernel(Contraction)` (Gemv and Tiled,
-    //! `RowSelect::Dense`, blocks 1 and 2) run in the KIR interpreter is within tier-2 tolerance of a
+    //! blocks 1 and 2) run in the KIR interpreter is within tier-2 tolerance of a
     //! plain f32 reference contraction over `poot_quant::plan::decode_blocks`'s decode. Device rows
     //! (wgpu/ROCm/PTX) are separate, real-hardware evidence (the card's final report).
 
@@ -1211,7 +1212,7 @@ mod contraction_tests {
         BLOCK32, GEMV_SCHEDULES, KQUANT, assert_close, contraction_fixture, pack_words,
         schedule_tag,
     };
-    use super::kernel::{PackedKernelOp, PackedKernelSpec, RowSelect, packed_kernel};
+    use super::kernel::packed_contraction;
     use crate::contraction::{Schedule, TileSize};
 
     fn run_case(
@@ -1225,16 +1226,11 @@ mod contraction_tests {
             contraction_fixture(format, blocks, m_per_block, out_per_block);
         let rows = blocks * m_per_block;
 
-        let spec = PackedKernelSpec {
-            format,
-            op: PackedKernelOp::Contraction {
-                rows: RowSelect::Dense,
-                schedule,
-            },
-        };
-        let body = packed_kernel(
+        let body = packed_contraction(
             &format!("contraction_{format:?}_{}_{blocks}", schedule_tag(schedule)),
-            spec,
+            format,
+            schedule,
+            None,
         )
         .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
 
@@ -1287,6 +1283,127 @@ mod contraction_tests {
                 run_case(format, schedule, 2, 1, 5);
             }
         }
+    }
+
+    /// The bias, tanh, scale and residual chain of the fuse rule: `tanh(head + bias) * 0.5 + residual`, as the
+    /// kernelgen epilogue the planner builds from a `ContractionEpilogue` over a packed head.
+    pub(super) fn bias_activation_residual_chain(out: usize) -> crate::contraction::Epilogue {
+        use crate::contraction::{
+            Epilogue, EpilogueInput as In, EpilogueLeaf, EpilogueStep as Step,
+        };
+        use crate::fused::FusedScalarOp as Op;
+        Epilogue {
+            dt: poot_kernel_ir::Ty::F32,
+            out_shape: vec![1, out],
+            leaves: [vec![out], vec![1, out]]
+                .into_iter()
+                .map(|shape| EpilogueLeaf {
+                    shape,
+                    storage: None,
+                })
+                .collect(),
+            steps: vec![
+                Step {
+                    op: Op::Binary(poot_kernel_ir::BinOp::Add),
+                    inputs: vec![In::Head, In::Leaf(0)],
+                },
+                Step {
+                    op: Op::Tanh,
+                    inputs: vec![In::Step(0)],
+                },
+                Step {
+                    op: Op::Binary(poot_kernel_ir::BinOp::Mul),
+                    inputs: vec![In::Step(1), In::Lit(0.5)],
+                },
+                Step {
+                    op: Op::Binary(poot_kernel_ir::BinOp::Add),
+                    inputs: vec![In::Step(2), In::Leaf(1)],
+                },
+            ],
+            output: In::Step(3),
+        }
+    }
+
+    /// The host image of [`bias_activation_residual_chain`] over one head value.
+    pub(super) fn apply_chain(head: f32, bias: f32, residual: f32) -> f32 {
+        (head + bias).tanh() * 0.5 + residual
+    }
+
+    /// A packed Gemv with an epilogue applies it once to each column's completed sum, before the one store:
+    /// the result equals the reference contraction with the chain applied on the host, for every Gemv launch
+    /// shape (lanes of a column reduce in LDS, so an epilogue applied per lane would add the bias `lanes`
+    /// times). The leaves ride between the weight words and the metadata.
+    #[test]
+    fn contraction_gemv_epilogue_is_applied_once_to_the_completed_sum() {
+        let out_per_block = 11;
+        let bias: Vec<f32> = (0..out_per_block).map(|i| 0.3 - i as f32 * 0.07).collect();
+        let residual: Vec<f32> = (0..out_per_block).map(|i| i as f32 * 0.11 - 0.5).collect();
+        for format in [
+            poot_quant::format::WeightFormat::Q8_0,
+            poot_quant::format::WeightFormat::Q4_K,
+        ] {
+            let (k, bytes, activation, head) = contraction_fixture(format, 1, 1, out_per_block);
+            // The head sums are O(10); scale them so tanh does not saturate every column.
+            let activation: Vec<f32> = activation.iter().map(|v| v * 0.02).collect();
+            let head: Vec<f32> = head.iter().map(|v| v * 0.02).collect();
+            let expected: Vec<f32> = (0..out_per_block)
+                .map(|i| apply_chain(head[i], bias[i], residual[i]))
+                .collect();
+            let epilogue = bias_activation_residual_chain(out_per_block);
+            for schedule in GEMV_SCHEDULES {
+                let body = packed_contraction(
+                    &format!("epilogue_{format:?}_{}", schedule_tag(schedule)),
+                    format,
+                    schedule,
+                    Some(&epilogue),
+                )
+                .unwrap_or_else(|error| panic!("{format:?}: {error}"));
+                body.verify().expect("the epilogue body verifies");
+                let words = pack_words(&bytes);
+                let mut buffers = [
+                    Buffer::from_f32s(&activation),
+                    Buffer::from_u32s(&words),
+                    Buffer::from_f32s(&bias),
+                    Buffer::from_f32s(&residual),
+                    Buffer::from_u32s(&[k as u32, out_per_block as u32]),
+                    Buffer::from_f32s(&vec![0.0; out_per_block]),
+                ];
+                run(
+                    &body,
+                    workgroups_covering(&body, schedule.grid_threads(1, 1, out_per_block)),
+                    &mut buffers,
+                )
+                .unwrap_or_else(|error| panic!("{format:?}: interpreter: {error}"));
+                assert_close(
+                    format,
+                    &format!("epilogue {schedule:?}"),
+                    &buffers[5].to_f32s().unwrap(),
+                    &expected,
+                );
+            }
+        }
+    }
+
+    /// The tiled schedule has no epilogue: an epilogue on it is a typed refusal, never a body that drops it.
+    #[test]
+    fn a_tiled_packed_contraction_refuses_an_epilogue_by_name() {
+        let epilogue = bias_activation_residual_chain(4);
+        let error = packed_contraction(
+            "tiled_epilogue",
+            poot_quant::format::WeightFormat::Q8_0,
+            Schedule::Tiled {
+                tile: TileSize::new(4).unwrap(),
+            },
+            Some(&epilogue),
+        )
+        .expect_err("a packed Tiled contraction has no epilogue");
+        assert_eq!(
+            error,
+            crate::KernelGenError::Unsupported {
+                request: "packed_contraction",
+                reason: "a packed Tiled contraction has no epilogue",
+            }
+        );
     }
 
     /// SC-002 (card 542b, GPU-free rehearsal): `Contraction` `Schedule::Tiled` (`tile = 4`), `blocks =
@@ -1406,15 +1523,13 @@ mod contraction_tests {
             let schedule = Schedule::Tiled {
                 tile: TileSize::new(tile).unwrap(),
             };
-            let spec = PackedKernelSpec {
+            let body = packed_contraction(
+                &format!("contraction_folded_interp_{format:?}"),
                 format,
-                op: PackedKernelOp::Contraction {
-                    rows: RowSelect::Dense,
-                    schedule,
-                },
-            };
-            let body = packed_kernel(&format!("contraction_folded_interp_{format:?}"), spec)
-                .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
+                schedule,
+                None,
+            )
+            .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
 
             let words = pack_words(&bytes);
             let metadata = [k as u32, out_per_block as u32, m_per_block as u32, x_groups];
@@ -1448,15 +1563,8 @@ mod contraction_tests {
         let arch = poot_target::AmdArch::gfx1151();
         for format in BLOCK32 {
             for schedule in GEMV_SCHEDULES {
-                let spec = PackedKernelSpec {
-                    format,
-                    op: PackedKernelOp::Contraction {
-                        rows: RowSelect::Dense,
-                        schedule,
-                    },
-                };
                 let name = format!("contraction_{format:?}_{}", schedule_tag(schedule));
-                let body = packed_kernel(&name, spec).unwrap();
+                let body = packed_contraction(&name, format, schedule, None).unwrap();
                 let _ = crate::test_support::spv(&body, &format!("{name}_spv"));
                 let _ = crate::test_support::ptx(&body, &format!("{name}_ptx"));
                 let dir = std::env::temp_dir()
@@ -1480,15 +1588,8 @@ mod contraction_tests {
         let arch = poot_target::AmdArch::gfx1151();
         for format in KQUANT {
             for schedule in GEMV_SCHEDULES {
-                let spec = PackedKernelSpec {
-                    format,
-                    op: PackedKernelOp::Contraction {
-                        rows: RowSelect::Dense,
-                        schedule,
-                    },
-                };
                 let name = format!("contraction_kquant_{format:?}_{}", schedule_tag(schedule));
-                let body = packed_kernel(&name, spec).unwrap();
+                let body = packed_contraction(&name, format, schedule, None).unwrap();
                 let _ = crate::test_support::spv(&body, &format!("{name}_spv"));
                 let _ = crate::test_support::ptx(&body, &format!("{name}_ptx"));
                 let dir = std::env::temp_dir()
@@ -1505,15 +1606,8 @@ mod contraction_tests {
             let schedule = Schedule::Tiled {
                 tile: TileSize::new(4).unwrap(),
             };
-            let spec = PackedKernelSpec {
-                format,
-                op: PackedKernelOp::Contraction {
-                    rows: RowSelect::Dense,
-                    schedule,
-                },
-            };
             let name = format!("contraction_{format:?}_{}", schedule_tag(schedule));
-            let body = packed_kernel(&name, spec).unwrap();
+            let body = packed_contraction(&name, format, schedule, None).unwrap();
             let _ = crate::test_support::spv(&body, &format!("{name}_spv"));
             let _ = crate::test_support::ptx(&body, &format!("{name}_ptx"));
             let dir = std::env::temp_dir()
@@ -1526,7 +1620,7 @@ mod contraction_tests {
         }
     }
 
-    /// SC-005 (card 542a, device tier 2): `Contraction` (Gemv, `RowSelect::Dense`, blocks
+    /// SC-005 (card 542a, device tier 2): `Contraction` (Gemv, blocks
     /// 1 and 2) is within tier-2 tolerance of the reference on the local wgpu (SPIR-V/RADV) device
     /// (the `materialize_matches_decode_blocks_on_wgpu` row's sibling).
     fn run_wgpu_case(
@@ -1543,18 +1637,11 @@ mod contraction_tests {
         let (k, bytes, activation, expected) =
             contraction_fixture(format, blocks, m_per_block, out_per_block);
         let rows = blocks * m_per_block;
-        let spec = PackedKernelSpec {
-            format,
-            op: PackedKernelOp::Contraction {
-                rows: RowSelect::Dense,
-                schedule,
-            },
-        };
         let name = format!(
             "contraction_wgpu_{format:?}_{}_{blocks}",
             schedule_tag(schedule)
         );
-        let body = packed_kernel(&name, spec)
+        let body = packed_contraction(&name, format, schedule, None)
             .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
         let dir = std::env::temp_dir()
             .join("poot-kernelgen-sc004")
@@ -1735,15 +1822,8 @@ mod contraction_tests {
             let schedule = Schedule::Tiled {
                 tile: TileSize::new(tile).unwrap(),
             };
-            let spec = PackedKernelSpec {
-                format,
-                op: PackedKernelOp::Contraction {
-                    rows: RowSelect::Dense,
-                    schedule,
-                },
-            };
             let name = format!("contraction_wgpu_folded_{format:?}");
-            let body = packed_kernel(&name, spec)
+            let body = packed_contraction(&name, format, schedule, None)
                 .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
             let dir = std::env::temp_dir()
                 .join("poot-kernelgen-card658-fold")
@@ -1951,7 +2031,7 @@ mod planar_materialize_tests {
 #[cfg(test)]
 mod planar_contraction_tests {
     //! SC-002 (card 542c, GPU-free rehearsal): `packed_kernel(Contraction)` (Gemv and Tiled,
-    //! `RowSelect::Dense`) for every planar format run in the KIR interpreter is within
+    //! dense rows) for every planar format run in the KIR interpreter is within
     //! tier-2 tolerance of a plain f32 reference contraction over `decode_planar_value` - the planar
     //! counterpart of `contraction_tests`.
 
@@ -1959,7 +2039,7 @@ mod planar_contraction_tests {
     use poot_test_util::kernel_fixtures::workgroups_covering;
 
     use super::fixtures::{GEMV_SCHEDULES, assert_close};
-    use super::kernel::{PackedKernelOp, PackedKernelSpec, RowSelect, packed_kernel};
+    use super::kernel::packed_contraction;
     use super::planar_fixtures::{every_planar_format, fixture, pack_words};
     use crate::contraction::{Schedule, TileSize};
 
@@ -2002,19 +2082,14 @@ mod planar_contraction_tests {
             .collect();
         let expected = reference_contraction(&activation, &decoded, K, out_rows);
 
-        let spec = PackedKernelSpec {
-            format,
-            op: PackedKernelOp::Contraction {
-                rows: RowSelect::Dense,
-                schedule,
-            },
-        };
-        let body = packed_kernel(
+        let body = packed_contraction(
             &format!(
                 "contraction_planar_{}",
                 super::planar_fixtures::format_tag(format)
             ),
-            spec,
+            format,
+            schedule,
+            None,
         )
         .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
 
@@ -2119,19 +2194,14 @@ mod planar_contraction_tests {
             let schedule = Schedule::Tiled {
                 tile: TileSize::new(4).unwrap(),
             };
-            let spec = PackedKernelSpec {
-                format,
-                op: PackedKernelOp::Contraction {
-                    rows: RowSelect::Dense,
-                    schedule,
-                },
-            };
-            let body = packed_kernel(
+            let body = packed_contraction(
                 &format!(
                     "contraction_planar_blockdiag_{}",
                     super::planar_fixtures::format_tag(format)
                 ),
-                spec,
+                format,
+                schedule,
+                None,
             )
             .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
 
@@ -2163,7 +2233,7 @@ mod planar_contraction_tests {
 #[cfg(test)]
 mod rocm_tests {
     //! SC-004/SC-005 (card 542a, device tier 1/2): Materialize, RowGather and Contraction (Gemv,
-    //! `RowSelect::Dense`, blocks 1 and 2) for every block-32 format, dispatched on real
+    //! blocks 1 and 2) for every block-32 format, dispatched on real
     //! ROCm/HSA hardware (gfx1151) - the AMDGCN counterpart of the wgpu row above, through the same
     //! production path every real caller uses (`poot_codegen::compile` + `kernel_handle`, card 628's
     //! `no_contract` tests' pattern). Skips (does not fail) with no HSA library or GPU agent, matching
@@ -2178,7 +2248,7 @@ mod rocm_tests {
         BLOCK32, GEMV_SCHEDULES, KQUANT, assert_close, contraction_fixture, fixture, pack_words,
         schedule_tag,
     };
-    use super::kernel::{PackedKernelOp, PackedKernelSpec, RowSelect, packed_kernel};
+    use super::kernel::{PackedKernelOp, PackedKernelSpec, packed_contraction, packed_kernel};
     use crate::contraction::{Schedule, TileSize};
 
     fn open_or_skip(test: &str) -> Option<RocmContext> {
@@ -2424,18 +2494,11 @@ mod rocm_tests {
         let (k, bytes, activation, expected) =
             contraction_fixture(format, blocks, m_per_block, out_per_block);
         let rows = blocks * m_per_block;
-        let spec = PackedKernelSpec {
-            format,
-            op: PackedKernelOp::Contraction {
-                rows: RowSelect::Dense,
-                schedule,
-            },
-        };
         let name = format!(
             "contraction_rocm_{format:?}_{}_{blocks}",
             schedule_tag(schedule)
         );
-        let body = packed_kernel(&name, spec)
+        let body = packed_contraction(&name, format, schedule, None)
             .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
         let words = pack_words(&bytes);
         // metadata[3] (x_groups): 0 is fine here - every dispatch below is `[threads, 1, 1]`
@@ -2732,19 +2795,12 @@ mod rocm_tests {
                     })
                     .collect();
 
-                let spec = PackedKernelSpec {
-                    format,
-                    op: PackedKernelOp::Contraction {
-                        rows: RowSelect::Dense,
-                        schedule,
-                    },
-                };
                 let name = format!(
                     "contraction_planar_rocm_{}_{}",
                     super::planar_fixtures::format_tag(format),
                     schedule_tag(schedule)
                 );
-                let body = packed_kernel(&name, spec)
+                let body = packed_contraction(&name, format, schedule, None)
                     .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
                 let metadata = [k as u32, out_rows as u32, m as u32, 0]; // metadata[3] (x_groups): unused, unfolded grid
                 let out_len = m * out_rows;
@@ -2769,7 +2825,7 @@ mod rocm_tests {
 #[cfg(test)]
 mod ptx_tests {
     //! SC-004/SC-005 (card 542a, device tier 1/2, M4 pod batch): Materialize, RowGather and
-    //! Contraction (Gemv, `RowSelect::Dense`, blocks 1 and 2) for every block-32 format,
+    //! Contraction (Gemv, blocks 1 and 2) for every block-32 format,
     //! dispatched on real NVIDIA/PTX hardware, the NVPTX counterpart of `rocm_tests` (same fixtures,
     //! same tier-1/tier-2 comparisons). `PtxContext::new()` implements the project's device-skip
     //! convention: it returns `Err` (this test then skips, does not fail) with no NVIDIA driver, and
@@ -2793,7 +2849,7 @@ mod ptx_tests {
         BLOCK32, GEMV_SCHEDULES, KQUANT, assert_close, contraction_fixture, fixture, pack_words,
         schedule_tag,
     };
-    use super::kernel::{PackedKernelOp, PackedKernelSpec, RowSelect, packed_kernel};
+    use super::kernel::{PackedKernelOp, PackedKernelSpec, packed_contraction, packed_kernel};
     use crate::contraction::{Schedule, TileSize};
 
     fn open_or_skip(test: &str) -> Option<PtxContext> {
@@ -2936,18 +2992,11 @@ mod ptx_tests {
         let (k, bytes, activation, expected) =
             contraction_fixture(format, blocks, m_per_block, out_per_block);
         let rows = blocks * m_per_block;
-        let spec = PackedKernelSpec {
-            format,
-            op: PackedKernelOp::Contraction {
-                rows: RowSelect::Dense,
-                schedule,
-            },
-        };
         let name = format!(
             "contraction_ptx_{format:?}_{}_{blocks}",
             schedule_tag(schedule)
         );
-        let body = packed_kernel(&name, spec)
+        let body = packed_contraction(&name, format, schedule, None)
             .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
         let kernel = compile_and_load(&name, &body);
         let words = pack_words(&bytes);
@@ -3199,7 +3248,7 @@ mod planar_ptx_tests {
     use poot_ptx_runtime::{PtxBuffer, PtxContext};
 
     use super::fixtures::{GEMV_SCHEDULES, schedule_tag};
-    use super::kernel::{PackedKernelOp, PackedKernelSpec, RowSelect, packed_kernel};
+    use super::kernel::{PackedKernelOp, PackedKernelSpec, packed_contraction, packed_kernel};
     use super::planar_fixtures::{every_planar_format, fixture, format_tag, pack_words};
     use crate::contraction::{Schedule, TileSize};
 
@@ -3320,19 +3369,12 @@ mod planar_ptx_tests {
             .collect();
         let expected = reference_contraction(&activation, &decoded, K, out_rows);
 
-        let spec = PackedKernelSpec {
-            format,
-            op: PackedKernelOp::Contraction {
-                rows: RowSelect::Dense,
-                schedule,
-            },
-        };
         let name = format!(
             "contraction_planar_ptx_{}_{}",
             format_tag(format),
             schedule_tag(schedule)
         );
-        let body = packed_kernel(&name, spec)
+        let body = packed_contraction(&name, format, schedule, None)
             .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
         let kernel = compile_and_load(&name, &body);
         let source_bufs: Vec<PtxBuffer> = word_bufs

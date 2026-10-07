@@ -36,15 +36,14 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 anyhow = { workspace = true, optional = true }
 thiserror.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
+tracing-subscriber = { workspace = true, optional = true }
 # Production code (`components/exact_partition.rs`) builds Card 360 placement/communication rows, so this
 # is a regular dependency.
 poot-graph-plan.workspace = true
 # Card 540b: the Runner's loader reads checkpoints into a `poot_quant::weights::WeightStore` (bytes as
 # stored, ADR-0103) instead of a widened f32 `SafeTensors` decode.
 poot-quant.workspace = true
-# Card 546a: the one Runner consumer of the backend-neutral executor contract (`Runner::load_on`,
-# `generate_kv_gpu_cached`/`_sampled`).
+# Card 546a: the Runner's consumer of the backend-neutral executor contract (`Runner::load_on`).
 poot-executor.workspace = true
 bytemuck.workspace = true
 # bin/ptx-graph-check's --precompile mode (card 549): compiles graphs through the shared
@@ -79,9 +78,10 @@ poot-rocm-runtime.workspace = true
 poot-profile.workspace = true
 
 [features]
-# `anyhow` for the `qwen2-generate` and `poot-caption` binaries (a bin cannot carry its own dependency).
-cli = ["dep:anyhow"]
-# ROCm/HSA GPU path (Runner::generate_kv_rocm*).
+# `anyhow` and `tracing-subscriber` for the `qwen2-generate` and `poot-caption` binaries (a bin cannot carry its
+# own dependency).
+cli = ["dep:anyhow", "dep:tracing-subscriber"]
+# ROCm/HSA GPU path.
 rocm = ["dep:poot-rocm-gpu"]
 
 [lib]

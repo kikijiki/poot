@@ -1,5 +1,5 @@
 //! R486-013 / SC-006: a GQA sliding-window prefill fixture (`n_heads=4`, `n_kv_heads=2`) must fuse to a
-//! `FlashAttentionPrefill` that carries the grouped head count `n_rep = 2`. The branch value is printed.
+//! `Attention` that carries the grouped head count `n_rep = 2`. The branch value is printed.
 //! Setting `n_kv_heads` back to `n_heads` makes `n_rep = 1` and the grouped-path assertion fails.
 //!
 //! Card 626: moved here from `poot-eval/src/tests/swa_gemma3.rs` with the pass itself - poot-eval
@@ -32,8 +32,8 @@ fn swa_gqa_prefill_reaches_the_grouped_flash_path() {
     let reps: Vec<usize> = fused
         .eqns
         .iter()
-        .filter_map(|e| match e.op {
-            OpKind::FlashAttentionPrefill { n_rep, .. } => Some(n_rep),
+        .filter_map(|e| match &e.op {
+            OpKind::Attention(attrs) => Some(attrs.n_rep),
             _ => None,
         })
         .collect();
@@ -46,7 +46,7 @@ fn swa_gqa_prefill_reaches_the_grouped_flash_path() {
     );
     assert!(
         !reps.is_empty(),
-        "the GQA windowed prefill must fuse to FlashAttentionPrefill"
+        "the GQA windowed prefill must fuse to Attention"
     );
     assert!(
         reps.iter().all(|&r| r == n_rep),

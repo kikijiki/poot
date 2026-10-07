@@ -1,40 +1,13 @@
-use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use poot_kernel_ir::{Body, Statement, WmmaDtype, WmmaShape};
+use poot_kernel_ir::{FragmentRole, FragmentTy, WmmaMat, WmmaShape};
 
 use super::{EmitError, Emitter, Local, Place, ProjectionElem, Target};
-
-/// Every `Local` a body uses as a matrix-fragment handle, with its dtype and whether it is the f32
-/// accumulator (a `WmmaZero`/`WmmaMma` `dst`) or an A/B operand fragment (a `WmmaLoad`/`WmmaLoadLds` `dst`,
-/// carrying `dtype`). Run once before `emit_entry` so AMDGCN/NVPTX can alloca each fragment local at its
-/// real physical size (see `Emitter::frag_layout`'s doc) instead of its marker `Ty`'s scalar size. A
-/// fragment `Local` is always some statement's own `dst`: `WmmaMma`'s `a`/`b`/`c` and `WmmaStore`/
-/// `WmmaStoreLds`'s `src` read a definition recorded here when it was produced, so they need no entry of
-/// their own.
-pub(super) fn scan_frag_layout(body: &Body) -> HashMap<u32, (WmmaDtype, bool)> {
-    let mut layout = HashMap::new();
-    for block in &body.blocks {
-        for stmt in &block.statements {
-            match stmt {
-                Statement::WmmaLoad { dtype, dst, .. }
-                | Statement::WmmaLoadLds { dtype, dst, .. } => {
-                    layout.insert(dst.index, (*dtype, false));
-                }
-                Statement::WmmaZero { dtype, dst, .. } | Statement::WmmaMma { dtype, dst, .. } => {
-                    layout.insert(dst.index, (*dtype, true));
-                }
-                _ => {}
-            }
-        }
-    }
-    layout
-}
 
 impl<'a> Emitter<'a> {
     // ---- WMMA tensor-core intrinsics (spec 025, NVPTX + AMDGPU) ------------------------------------
     // m16n16k16, row-major, f32 accumulate. Fragments are register-group aggregates/vectors, alloca'd like
-    // any other local at the physical size `frag_alloca_llty` picks (see `emit_entry`); the load/store
+    // any other local at the physical type `fragment_llty` picks (see `emit_entry`); the load/store
     // intrinsics handle the fragment<->lane layout via (ptr, stride). See the llc-22 feasibility probe in
     // specs/025. Card 110 adds AMDGPU WMMA via `llvm.amdgcn.wmma.*` intrinsics; card 530 makes F16 the
     // dtype every target shares (NVPTX/AMDGCN also keep Bf16 for the production tiled dequant/matmul path;
@@ -160,23 +133,28 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
-    // ---- AMDGCN/NVPTX fragment storage (card 530) --------------------------------------------------
-    // A fragment `Local` is an ordinary alloca'd value on these two targets (unlike SPIR-V's opaque coopmat
-    // handle, see `frag_regs`'s doc): `emit_entry` allocas it at the size below instead of its marker `Ty`'s
-    // scalar size, and every op reads/writes it through the normal `load_place`/`store_place` path. This is
-    // what lets a fragment loop-carry (the tiled `matmul_tensorcore` K-loop) with no special machinery.
+    // ---- fragment storage (cards 530/663) -----------------------------------------------------------
+    // A fragment `Local` is an ordinary alloca'd local on every target: `emit_entry` allocas it at the
+    // physical type its declared `Ty::Fragment` names (below) instead of a scalar size, and every op
+    // reads/writes it through the normal `load_place`/`store_place` path. Being a plain variable is what lets a
+    // fragment, the accumulator above all, carry across a loop back-edge on every target with no phi
+    // machinery.
 
-    /// The alloca'd LLVM type for one fragment local on AMDGCN/NVPTX: `is_acc` (a `WmmaZero`/`WmmaMma` `dst`)
-    /// is always the f32 accumulator/D fragment (8 lanes); otherwise an A/B operand fragment of `dtype`.
-    /// AMDGCN packs every dtype into the same `<8 x i32>` raw-bits vector (16 lanes of a 2-byte element,
-    /// bitcast to the dtype-typed vector only at the point of use - see `emit_wmma_load_amdgcn`); NVPTX's
-    /// fragment shape is dtype-sized (bf16: 4 lanes of i32; f16: 8 lanes of `<2 x half>`, per the NVVM WMMA
-    /// fragment table), so its aggregate type must match exactly what the load/mma intrinsics return/accept.
-    pub(super) fn frag_alloca_llty(
-        &self,
-        dtype: WmmaDtype,
-        is_acc: bool,
-    ) -> Result<String, EmitError> {
+    /// The alloca'd LLVM type of a fragment local. The accumulator/D fragment is always f32; an A/B operand
+    /// fragment carries `dtype`.
+    ///
+    /// - AMDGCN packs every dtype into the same `<8 x i32>` raw-bits vector (16 lanes of a 2-byte element,
+    ///   bitcast to the dtype-typed vector only at the point of use - see `emit_wmma_load_amdgcn`); the
+    ///   accumulator is `<8 x float>`.
+    /// - NVPTX's fragment shape is dtype-sized (bf16: 4 lanes of i32; f16: 8 lanes of `<2 x half>`, per the
+    ///   NVVM WMMA fragment table), so its aggregate type must match exactly what the load/mma intrinsics
+    ///   return/accept; the accumulator is eight floats.
+    /// - SPIR-V's is the opaque `OpTypeCooperativeMatrixKHR` of the fragment's `Use`, held in a `Function`
+    ///   variable.
+    pub(super) fn fragment_llty(&self, fragment: FragmentTy) -> Result<String, EmitError> {
+        self.wmma_check_target(fragment.dtype)?;
+        self.wmma_check_shape(fragment.shape)?;
+        let is_acc = fragment.role == FragmentRole::Accumulator;
         match self.target {
             Target::AmdGcn(_) => Ok(if is_acc {
                 "<8 x float>".into()
@@ -184,29 +162,25 @@ impl<'a> Emitter<'a> {
                 "<8 x i32>".into()
             }),
             Target::Nvptx => Ok(if is_acc {
-                "{float, float, float, float, float, float, float, float}".into()
+                Self::NVPTX_ACC_STRUCT_TY.into()
             } else {
-                match dtype {
-                    WmmaDtype::Bf16 => "{i32, i32, i32, i32}".into(),
-                    WmmaDtype::F16 => {
-                        "{<2 x half>, <2 x half>, <2 x half>, <2 x half>, <2 x half>, <2 x half>, \
-                         <2 x half>, <2 x half>}"
-                            .into()
-                    }
-                }
+                Self::nvptx_ab_struct_ty(fragment.dtype)
             }),
-            Target::SpirvVulkan | Target::AieCore => Err(EmitError::Unsupported(
-                "frag_alloca_llty is AMDGCN/NVPTX-only (SPIR-V fragments are opaque SSA values, see \
-                 frag_regs)"
-                    .into(),
+            Target::SpirvVulkan => Ok(match fragment.role {
+                FragmentRole::Matrix(WmmaMat::A) => self.coopmat_ty("half", 0),
+                FragmentRole::Matrix(WmmaMat::B) => self.coopmat_ty("half", 1),
+                FragmentRole::Accumulator => self.coopmat_ty("float", 2),
+            }),
+            Target::AieCore => Err(EmitError::Unsupported(
+                "matrix fragments have no AIE-core representation".into(),
             )),
         }
     }
 
     // ---- SPIR-V cooperative-matrix (card 154) --------------------------------------------------
-    // RADV config 13: F16xF16->F32, 16x16x16, Subgroup scope. Unlike NVPTX/AMDGCN's alloca'd register-group
-    // fragments, a coopmat value is one opaque `OpTypeCooperativeMatrixKHR` SSA value with no addressable
-    // components, so it stays in `frag_regs` (an SSA-register cache) instead of memory.
+    // RADV config 13: F16xF16->F32, 16x16x16, Subgroup scope. A coopmat value is one opaque
+    // `OpTypeCooperativeMatrixKHR` with no addressable components; a fragment local holds it in a `Function`
+    // variable (see `fragment_llty`), so a K-loop carries the accumulator through that variable.
     // `spirv_postprocess::fix_coopmat_calls` rewrites the Import-linkage stub calls that LLVM's Vulkan-mode
     // SPIR-V backend emits for these `__spirv_*` builtins into the real
     // `OpCooperativeMatrix{Load,Store,MulAdd}KHR`/`OpCompositeConstruct` instructions (in `compile()`'s
@@ -219,18 +193,6 @@ impl<'a> Emitter<'a> {
     /// 1=MatrixB, 2=MatrixAccumulator).
     pub(super) fn coopmat_ty(&self, component_llty: &str, use_: u32) -> String {
         format!("target(\"spirv.CooperativeMatrixKHR\", {component_llty}, 3, 16, 16, {use_})")
-    }
-
-    /// The live SSA register + LLVM type text for a `Local` holding a coopmat value - see
-    /// `frag_regs`'s doc on the `Emitter` struct.
-    pub(super) fn coopmat_reg(&self, l: Local) -> Result<(String, String), EmitError> {
-        self.frag_regs.get(&l.index).cloned().ok_or_else(|| {
-            EmitError::Unsupported(format!(
-                "SPIR-V cooperative-matrix local %l{} read before a WmmaLoad/WmmaMma/WmmaZero \
-                 populated it",
-                l.index
-            ))
-        })
     }
 
     /// A `[0 x i8]` (byte-array) `spirv.VulkanBuffer` type + its `llvm.spv.resource.*` mangle suffix, following
@@ -327,8 +289,7 @@ impl<'a> Emitter<'a> {
             w,
             "  {d} = tail call spir_func {ty} @{mangled}(ptr addrspace(11) {ptr}, i32 0, i64 {stride_bytes}, i32 0)"
         );
-        self.frag_regs.insert(dst.index, (d, ty));
-        Ok(())
+        self.store_place(&Place::local(dst), &d, &ty, w)
     }
 
     /// Seed a zero-valued `float` accumulator fragment via `OpCompositeConstruct` (the coopmat
@@ -348,8 +309,7 @@ impl<'a> Emitter<'a> {
             w,
             "  {d} = tail call spir_func {ty} @{mangled}(float 0.000000e+00)"
         );
-        self.frag_regs.insert(dst.index, (d, ty));
-        Ok(())
+        self.store_place(&Place::local(dst), &d, &ty, w)
     }
 
     /// `OpCooperativeMatrixMulAddKHR`: `dst = a * b + c` (fused).
@@ -361,9 +321,9 @@ impl<'a> Emitter<'a> {
         dst: Local,
         w: &mut String,
     ) -> Result<(), EmitError> {
-        let (a_reg, a_ty) = self.coopmat_reg(a)?;
-        let (b_reg, b_ty) = self.coopmat_reg(b)?;
-        let (c_reg, c_ty) = self.coopmat_reg(c)?;
+        let (a_reg, a_ty) = self.load_place(&Place::local(a), w)?;
+        let (b_reg, b_ty) = self.load_place(&Place::local(b), w)?;
+        let (c_reg, c_ty) = self.load_place(&Place::local(c), w)?;
         let d_ty = c_ty.clone(); // the accumulator shape is unchanged by MulAdd
         let mangled = "_Z34__spirv_CooperativeMatrixMulAddKHR";
         self.declares.insert(format!(
@@ -374,8 +334,7 @@ impl<'a> Emitter<'a> {
             w,
             "  {d} = tail call spir_func {d_ty} @{mangled}({a_ty} {a_reg}, {b_ty} {b_reg}, {c_ty} {c_reg}, i32 0)"
         );
-        self.frag_regs.insert(dst.index, (d, d_ty));
-        Ok(())
+        self.store_place(&Place::local(dst), &d, &d_ty, w)
     }
 
     /// `OpCooperativeMatrixStoreKHR`, RowMajor.
@@ -386,7 +345,7 @@ impl<'a> Emitter<'a> {
         src: Local,
         w: &mut String,
     ) -> Result<(), EmitError> {
-        let (v_reg, v_ty) = self.coopmat_reg(src)?;
+        let (v_reg, v_ty) = self.load_place(&Place::local(src), w)?;
         const ELEM_BYTES: u32 = 4; // float (the accumulator/D fragment is always F32 - config 13)
         let ptr = self.coopmat_byte_ptr(tile, ELEM_BYTES, w)?;
         let stride_bytes = stride * ELEM_BYTES;
@@ -482,7 +441,7 @@ impl<'a> Emitter<'a> {
 
     /// NVPTX WMMA fragment load: call the `load.{a,b}.row.stride.<dtype>.p0` intrinsic on `gptr` and store the
     /// returned aggregate straight into `dst`'s alloca (one store, no per-lane spill - `dst`'s alloca is
-    /// exactly this aggregate type, see `frag_alloca_llty`). `gptr` is a generic (addrspace 0) pointer.
+    /// exactly this aggregate type, see `fragment_llty`). `gptr` is a generic (addrspace 0) pointer.
     pub(super) fn emit_wmma_load_from_nvptx(
         &mut self,
         which: poot_kernel_ir::WmmaMat,
@@ -855,12 +814,14 @@ impl<'a> Emitter<'a> {
     /// NVPTX-only.
     pub(super) fn emit_wmma_store_lds(
         &mut self,
+        dtype: poot_kernel_ir::WmmaDtype,
         shape: WmmaShape,
         array: u8,
         stride: u32,
         src: Local,
         w: &mut String,
     ) -> Result<(), EmitError> {
+        self.wmma_check_target(dtype)?;
         self.wmma_check_shape(shape)?;
         if self.target != Target::Nvptx {
             return Err(EmitError::Unsupported(

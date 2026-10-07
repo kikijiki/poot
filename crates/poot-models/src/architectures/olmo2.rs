@@ -16,8 +16,8 @@ use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
 use crate::components::ffn::{GatedFfnWeights, gated_ffn};
 use crate::components::linear::WeightError;
 use crate::components::standard::{
-    LayerNorms, LayerParams, NormPlacement, StackParams, StackWeights, Step, check_step,
-    standard_layer, standard_stack,
+    BlockInput, LayerNorms, LayerParams, NormPlacement, StackParams, StackWeights, Step,
+    check_step, standard_layer, standard_stack,
 };
 use crate::model::{
     ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, StepShape,
@@ -39,6 +39,7 @@ pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     ],
     build,
     fixture,
+    variants: &[],
 };
 
 /// OLMo 2's config facts: `Olmo2Config`'s defaults (its `eos_token_id` is `50279`) and llama.cpp's
@@ -190,7 +191,7 @@ impl Model for Olmo2 {
                 &layer.norms,
                 &p.layer,
                 |b, h| attention(b, &step, l, h, &layer.attn, &p.attention),
-                |b, h| gated_ffn(b, h, &layer.ffn),
+                |b, BlockInput { block: h, .. }| gated_ffn(b, h, &layer.ffn),
             )
         });
         Ok(step.finish(b, logits))

@@ -118,7 +118,9 @@ fn step_inputs_from(values: &[SlotValue]) -> StepInputs<'_> {
 
 fn bytemuck_f32(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
@@ -163,7 +165,6 @@ fn staged(
         },
         &poot_graph_plan::CompileOptions {
             execution: poot_graph_plan::Submission::Replay,
-            fusion: poot_graph_plan::FusionPolicy::Full,
             limits: poot_graph_plan::CompileLimits::STANDARD,
         },
     )

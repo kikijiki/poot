@@ -84,12 +84,7 @@ fn assert_same_bits(a: &HostTensor, b: &HostTensor) {
 fn flash_count(g: &Graph) -> usize {
     g.eqns
         .iter()
-        .filter(|e| {
-            matches!(
-                e.op,
-                OpKind::FlashAttentionDecode { .. } | OpKind::FlashAttentionPrefill { .. }
-            )
-        })
+        .filter(|e| matches!(e.op, OpKind::Attention(_)))
         .count()
 }
 
@@ -321,17 +316,18 @@ fn card536a_attention_near_misses_decline_with_a_reason() {
     assert!(rewrote, "the softcap reciprocal literal must be present");
     cases.push(("softcap constants not reciprocal", wrong_softcap));
 
-    // Mask: the value width differs from the QK width (MLA); the fused op indexes one width.
-    let mla = {
+    // Type gate: a shared single-head key the decomposition merely broadcasts; the fused op indexes one key
+    // head per group.
+    let broadcast_key = {
         let b = Builder::new();
         let q = b.constant("q", TensorType::f32(vec![1, 2, 1, 3]));
-        let k = b.constant("k", TensorType::f32(vec![1, 2, 5, 3]));
-        let v = b.constant("v", TensorType::f32(vec![1, 2, 5, 2]));
+        let k = b.constant("k", TensorType::f32(vec![1, 1, 5, 3]));
+        let v = b.constant("v", TensorType::f32(vec![1, 1, 5, 2]));
         let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, 5]));
         let out = attention_masked(&b, q, k, v, 1, 1.0, mask);
         b.finish(out)
     };
-    cases.push(("V width differs from QK", mla));
+    cases.push(("a size-1 key head broadcast by the matmul", broadcast_key));
 
     for (name, graph) in cases {
         let optimized = optimize(&graph);
@@ -340,11 +336,9 @@ fn card536a_attention_near_misses_decline_with_a_reason() {
     }
 }
 
-/// Head-dim awareness (R480-009): a decode match at or under `FLASH_LDS_CAP` fuses; wider than it
-/// stays unfused with the oracle result unchanged. A prefill at D=512 still fuses through the
-/// prefill cap. The typed `HeadDimExceedsCap` decline reason for the D=512 decode case is
-/// `card536a_flash_head_dim_is_aware_decline_reason` in `src/transform/tests.rs`. Mutation: remove
-/// the head-dim gate; the widening op is emitted (and the D=512 assertion fails).
+/// The matcher has no head-dim limit (the planner's device caps decide whether a kernel fits): a decode and a
+/// prefill match at any head dim, and the oracle result is unchanged by the fusion. Mutation: restore a
+/// head-dim decline in the matcher; the D=512 decode assertion fails.
 #[test]
 fn card536a_flash_head_dim_is_aware() {
     let build = |m: usize, d: usize| {
@@ -362,14 +356,14 @@ fn card536a_flash_head_dim_is_aware() {
 
     let wide = build(1, 512);
     let optimized = optimize(&wide);
-    assert_eq!(flash_count(&optimized), 0, "D=512 decode must stay unfused");
+    assert_eq!(flash_count(&optimized), 1, "D=512 decode must fuse");
     assert_same_bits(&eval_graph(&wide), &eval_graph(&optimized));
 
     let prefill_wide = build(5, 512);
     assert_eq!(
         flash_count(&optimize(&prefill_wide)),
         1,
-        "D=512 prefill must fuse through the prefill cap"
+        "D=512 prefill must fuse"
     );
 }
 
@@ -402,7 +396,7 @@ fn card536a_contraction_is_covered_by_the_in_crate_oracle() {
 }
 
 /// The attention flash decode's own typing oracle, kept with the transform soundness suite
-/// (R486-014): `FlashAttentionDecode` with B>1 (`q [B,Hq,1,D]`, `k/v [B,Hkv,cap,D]`,
+/// (R486-014): `Attention` with B>1 (`q [B,Hq,1,D]`, `k/v [B,Hkv,cap,D]`,
 /// `mask [B,1,1,cap]`) equals the materialized `attention_masked` per batch row over random shapes.
 /// Card 038 originally, moved from `poot-eval`'s `flash_optimize.rs` (card 536a): unlike its neighbors
 /// there, it needs only `poot_graph_ir`/`poot_eval`, not a real model's traces.

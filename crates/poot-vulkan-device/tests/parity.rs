@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
 use poot_executor::{Device, Engine, Executor};
 use poot_executor_parity::Fixture;
-use poot_graph_plan::{Plan, Submission, Target};
+use poot_graph_plan::{Submission, Target};
 use poot_kernel_ir::Body;
 use poot_runtime_common::DeviceBackend;
 use poot_tensor::HostTensor;
@@ -43,11 +43,9 @@ fn dispatched_bodies(fixture: &Fixture, target: Target) -> Vec<(Body, [u32; 3])>
         .flat_map(|(_, _, program)| {
             program
                 .planned()
-                .filter_map(|(_, plan)| match plan {
-                    Plan::Compute { body, grid, .. } | Plan::ComputeMeta { body, grid, .. } => {
-                        Some((body.clone(), *grid))
-                    }
-                    _ => None,
+                .filter_map(|(_, plan)| {
+                    plan.single()
+                        .map(|dispatch| (dispatch.body.clone(), dispatch.launch.grid))
                 })
                 .collect::<Vec<_>>()
         })
@@ -166,7 +164,7 @@ fn checkpoint_orientation_projection_matches_the_oracle_on_vulkan() {
 /// `ComputedConst::AlibiSlopes` of 6 heads, decode at three positions and a 4-token prefill), compiled for
 /// raw Vulkan, matches `eval(g)` at every replayed step (ADR-0101 tier 1) AND an f64 reference that writes the
 /// published slopes out as literals (tier 2), so a slope formula both the oracle and the device read from
-/// the same constant cannot hide. Mutation: in `ComputedConst::values_f32` return zero slopes (or drop the
+/// the same constant cannot hide. Mutation: in `ComputedConst::tensor` return zero slopes (or drop the
 /// odd-index series of the second half); the reference comparison goes red.
 #[test]
 fn alibi_slopes_attention_matches_the_oracle_and_the_reference_on_vulkan() {
@@ -204,6 +202,22 @@ fn f16_checkpoint_orientation_projection_matches_the_oracle_on_vulkan() {
         poot_executor_parity::run_parity(exec.as_mut(), t, fixture, &mut oracle)
             .unwrap_or_else(|e| panic!("{e}"));
     }
+}
+
+/// POOT-1033: `Select` is a bitwise select. An F32 select (standalone, and inside a fused float region) over
+/// poisoned branches and an I32 select over nonzero condition words each equal the hand-written select words
+/// and the oracle's, bit for bit: a NaN or an infinity in the unselected branch stays out, and a NaN payload,
+/// an infinity or `-0.0` in the selected one passes through.
+/// Mutation: emit the arithmetic form `if_false + cond * (if_true - if_false)` in `emit_bitwise_select`
+/// (`poot-kernelgen`'s `fused.rs`), with a fresh `POOT_KERNEL_CACHE_DIR`; every row goes red.
+#[test]
+fn select_is_bitwise_on_vulkan() {
+    let Some(device) = open_or_skip(DeviceBackend::Vulkan, VulkanDevice::new()) else {
+        return;
+    };
+    let t = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    poot_executor_parity::select::assert_select_is_bitwise(exec.as_mut(), t);
 }
 
 /// Card 1011: a BF16 const cast to F32 is read from its packed `u32` lanes by the imported
@@ -284,8 +298,7 @@ fn tied_moe_routing_picks_the_lowest_index_first_on_vulkan() {
     }
 }
 
-/// Flash decode and flash prefill (the generated region kernels, and the imported flash prefill that a
-/// softcapped prefill selects) with a real per-head ALiBi mask match the oracle's materialized attention.
+/// Attention decode and prefill (the one generated attention kernel, with and without a softcap) with a real per-head ALiBi mask match the oracle's materialized attention.
 /// Every head has its own slope, so a lowering that read the mask at head stride 0 would score every head
 /// with head 0's row; the row also requires the oracle itself to tell that apart (the per-head output differs
 /// materially from the head-0 broadcast output), so it cannot pass vacuously.
@@ -359,6 +372,41 @@ fn tiled_region_with_a_remainder_tile_matches_the_oracle_on_vulkan() {
     for fixture in &poot_executor_parity::launch::tiled_region_fixtures() {
         assert_matches_oracle(exec.as_mut(), target, fixture);
     }
+}
+
+/// Card 663 SC-001, raw Vulkan. The batched, multi-block cooperative-matrix matmul: `[2, 32, 48] x [2, 48, 32]`
+/// f16 operands (`poot_executor_parity::launch::wmma_f16_batched_fixture`), 2 x 2 x 2 output tiles each carrying its
+/// accumulator across three 16-wide K blocks, every output element of both steps compared with the oracle. The
+/// fixture values give every K block a distinct nonzero contribution to every output (at least 16 per block), so a
+/// dropped, doubled or wrong-batch block moves all outputs far past the parity tolerance. Skips on a device with no
+/// cooperative-matrix hardware.
+///
+/// Mutation: drop the last K block in `poot-kernelgen`'s `tensor_core_tiles` (the loop bound `k0 < k` becomes
+/// `k0 + 16 < k`), with a fresh `POOT_KERNEL_CACHE_DIR`; every output is short by its last block's contribution and
+/// the row goes red. A second mutation, restoring the single K tile (`K == 16` only) in
+/// `matmul_spirv_coopmat_eligible`, plans the serial kernel, and the dispatched-body check goes red.
+#[test]
+fn batched_multi_block_coopmat_matmul_matches_the_oracle_on_vulkan() {
+    let Some((mut exec, target)) = vulkan() else {
+        return;
+    };
+    if target.caps.tensor_core == poot_target::TensorCoreSupport::None {
+        eprintln!("SKIP: this device reports no cooperative-matrix hardware");
+        return;
+    }
+    let fixture = poot_executor_parity::launch::wmma_f16_batched_fixture();
+    assert!(
+        dispatched_bodies(&fixture, target)
+            .iter()
+            .any(|(body, _)| body
+                .blocks
+                .iter()
+                .flat_map(|block| &block.statements)
+                .any(|statement| matches!(statement, poot_kernel_ir::Statement::WmmaMma { .. }))),
+        "{}: no dispatched kernel multiplies on the cooperative matrix",
+        fixture.name
+    );
+    assert_matches_oracle(exec.as_mut(), target, &fixture);
 }
 
 /// One elementwise region over 70001 elements is one dispatch whose grid needs more than 256 workgroups at any

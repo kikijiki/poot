@@ -32,9 +32,11 @@ fn qwen25_05b() -> Dense {
 
 fn plan_tag(p: &Plan) -> &'static str {
     match p {
-        Plan::Compute { .. } => "Compute",
-        Plan::ComputeMeta { .. } => "ComputeMeta",
-        Plan::ComputeChunks(_) => "ComputeChunks",
+        Plan::Dispatches(dispatches) => match dispatches.as_slice() {
+            [dispatch] if dispatch.launch.meta.is_empty() => "Dispatch",
+            [_] => "DispatchWithMeta",
+            _ => "SplitDispatches",
+        },
         Plan::Alias(_) => "Alias",
         Plan::View { .. } => "View",
         Plan::Collective { .. } => "Collective",

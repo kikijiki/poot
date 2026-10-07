@@ -12,8 +12,8 @@ use poot_graph_ir::builder::Builder;
 use poot_graph_ir::types::{Scalar, TensorType};
 use poot_graph_ir::{Graph, OpKind, Slot, ValidationOutputs};
 use poot_graph_plan::{
-    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, FusionPolicy, Partition,
-    StagedProgram, Submission, Target, TargetSet, compile_staged,
+    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram,
+    Submission, Target, TargetSet, compile_staged,
 };
 use poot_quant::format::WeightFormat;
 use poot_quant::weights::{WeightEntry, WeightStore};
@@ -28,7 +28,9 @@ fn wgpu() -> Option<WgpuDevice> {
 
 fn bytemuck_f32(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
@@ -45,7 +47,6 @@ fn staged(g: &Graph<ValidationOutputs>, target: Target) -> StagedProgram<Validat
         },
         &CompileOptions {
             execution: Submission::Replay,
-            fusion: FusionPolicy::Full,
             limits: poot_graph_plan::CompileLimits::STANDARD,
         },
     )

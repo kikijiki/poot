@@ -11,7 +11,6 @@ use std::path::Path;
 pub mod gguf;
 pub mod glm53_flash;
 pub mod lora;
-pub mod minimax_m2;
 pub mod packed_safetensors;
 pub mod qwen_vl;
 

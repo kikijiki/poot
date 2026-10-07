@@ -26,6 +26,10 @@ shift || true
 # `real_dims_pattern` is a naming contract, not detection: a test that builds real model dimensions is named
 # `*_real_dims`, and a test so named is class real-dims, never model-free; it runs in the release-profile lane
 # (`just test-real-dims`). A real-dimension test that does not carry the suffix lands model-free.
+# Test selectors for every nextest call: each test executable and no example. Without them cargo compiles each
+# example into target/debug/examples as well; `just clippy` (--all-targets) still checks that they compile.
+readonly test_targets=(--lib --bins --tests)
+
 readonly gate_policy=(
   "poot-bench-runner|excluded|no tests; enables poot-llm rocm, which would unify into the lane builds"
   "poot-codegen|host|"
@@ -116,7 +120,7 @@ discover_tests() {
   while IFS= read -r -d '' arg; do
     package_args+=("$arg")
   done < <(lane_package_args)
-  cargo nextest list "${package_args[@]}" --message-format json >"$json"
+  cargo nextest list "${test_targets[@]}" "${package_args[@]}" --message-format json >"$json"
   jq -r '
     .["rust-suites"] | to_entries[]
     | [.value["package-name"], .key] | @tsv
@@ -351,7 +355,7 @@ run_lane_tests() {
   if [[ -n "$only" ]]; then
     filter=(-E "(${filter[1]:-all()}) & ($only)")
   fi
-  lane_environment cargo nextest run --no-tests=fail --no-fail-fast "${package_args[@]}" "${filter[@]}"
+  lane_environment cargo nextest run --no-tests=fail --no-fail-fast "${test_targets[@]}" "${package_args[@]}" "${filter[@]}"
 }
 
 run_model_free() {
@@ -383,7 +387,7 @@ run_real_dims() {
   while IFS= read -r -d '' arg; do
     package_args+=("$arg")
   done < <(lane_package_args)
-  cargo nextest run --no-tests=fail --no-fail-fast "${package_args[@]}" -E "$selected" "$@"
+  cargo nextest run --no-tests=fail --no-fail-fast "${test_targets[@]}" "${package_args[@]}" -E "$selected" "$@"
 }
 
 expect_mutation_failure() {

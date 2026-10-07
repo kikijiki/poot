@@ -6,11 +6,43 @@ use crate::device::WgpuDevice;
 use poot_executor::Executor;
 use poot_executor::{Device, Engine};
 use poot_executor_parity::Fixture;
+use poot_executor_parity::hung::WithRoutedHang;
 use poot_tensor::HostTensor;
 use poot_test_util::weight_map_oracle::oracle_for;
 
 fn target(device: &WgpuDevice) -> poot_graph_plan::Target {
     device.target()
+}
+
+/// Every fixture against its oracle, a plain one on an engine over the bare device and a guarded one
+/// (compiled under the routed-expert hang guard) on an engine over a device that reports the hang, so
+/// the guarded program loads. `before` runs on each fixture with the target it will be compiled for.
+/// `None` when no adapter opens.
+fn run_each(
+    fixtures: &[Fixture],
+    before: impl Fn(&Fixture, poot_graph_plan::Target),
+) -> Option<()> {
+    let plain = WgpuDevice::new().ok()?;
+    let t = target(&plain);
+    let mut plain: Box<dyn Executor> = Box::new(Engine::new(plain));
+    let mut hung: Option<(Box<dyn Executor>, poot_graph_plan::Target)> = None;
+    for fixture in fixtures {
+        let (exec, t) = if fixture.guarded {
+            let (exec, t) = hung.get_or_insert_with(|| {
+                let device = WithRoutedHang(WgpuDevice::new().expect("a second wgpu device"));
+                let t = device.target();
+                (Box::new(Engine::new(device)) as Box<dyn Executor>, t)
+            });
+            (exec, *t)
+        } else {
+            (&mut plain, t)
+        };
+        before(fixture, t);
+        let mut oracle = oracle_for(&fixture.graph, &fixture.store);
+        poot_executor_parity::run_parity(exec.as_mut(), t, fixture, &mut oracle)
+            .unwrap_or_else(|e| panic!("{e}"));
+    }
+    Some(())
 }
 
 #[test]
@@ -40,16 +72,13 @@ fn parity_table_matches_the_oracle_on_wgpu() {
 /// Mutation: in the F32 GEMV body read B as `[K, N]` (`gemv_lds`, `WeightLayout::Nk` arm); the `M = 1` row goes red.
 #[test]
 fn checkpoint_orientation_projection_matches_the_oracle_on_wgpu() {
-    let Ok(device) = WgpuDevice::new() else {
+    if run_each(
+        &poot_executor_parity::checkpoint_projection_fixtures(),
+        |_, _| {},
+    )
+    .is_none()
+    {
         eprintln!("skip: no wgpu adapter");
-        return;
-    };
-    let t = target(&device);
-    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
-    for fixture in &poot_executor_parity::checkpoint_projection_fixtures() {
-        let mut oracle = oracle_for(&fixture.graph, &fixture.store);
-        poot_executor_parity::run_parity(exec.as_mut(), t, fixture, &mut oracle)
-            .unwrap_or_else(|e| panic!("{e}"));
     }
 }
 
@@ -57,7 +86,7 @@ fn checkpoint_orientation_projection_matches_the_oracle_on_wgpu() {
 /// `ComputedConst::AlibiSlopes` of 6 heads, decode at three positions and a 4-token prefill), compiled for
 /// wgpu, matches `eval(g)` at every replayed step (ADR-0101 tier 1) AND an f64 reference that writes the
 /// published slopes out as literals (tier 2), so a slope formula both the oracle and the device read from
-/// the same constant cannot hide. Mutation: in `ComputedConst::values_f32` return zero slopes (or drop the
+/// the same constant cannot hide. Mutation: in `ComputedConst::tensor` return zero slopes (or drop the
 /// odd-index series of the second half); the reference comparison goes red.
 #[test]
 fn alibi_slopes_attention_matches_the_oracle_and_the_reference_on_wgpu() {
@@ -85,17 +114,31 @@ fn alibi_slopes_attention_matches_the_oracle_and_the_reference_on_wgpu() {
 /// red.
 #[test]
 fn f16_checkpoint_orientation_projection_matches_the_oracle_on_wgpu() {
-    let Ok(device) = WgpuDevice::new() else {
+    if run_each(
+        &poot_executor_parity::checkpoint_projection_f16_fixtures(),
+        poot_executor_parity::assert_one_dense_contraction,
+    )
+    .is_none()
+    {
         eprintln!("skip: no wgpu adapter");
-        return;
-    };
-    let t = target(&device);
-    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
-    for fixture in &poot_executor_parity::checkpoint_projection_f16_fixtures() {
-        poot_executor_parity::assert_one_dense_contraction(fixture, t);
-        let mut oracle = oracle_for(&fixture.graph, &fixture.store);
-        poot_executor_parity::run_parity(exec.as_mut(), t, fixture, &mut oracle)
-            .unwrap_or_else(|e| panic!("{e}"));
+    }
+}
+
+/// Card 1024: `matmul(x, transpose(w))` over a BF16 `[N, K]` const, at `M = 1` (the decode GEMV), `4` and `33`
+/// (the generated tiled GEMM) and under the MoE hang guard (the serial kernel), compiled for wgpu: the program
+/// holds one `DenseContraction` and no `Transpose`, and every replayed step matches `eval(g)` of the traced graph
+/// within the parity tolerance (ADR-0101 tier 2). The weight lives on the device as packed bfloat16 words.
+/// Mutation: in `tiled_region`'s `WeightLayout::Nk` arm index the weight as `[K, N]`; the `M = 4` and `M = 33`
+/// rows go red.
+#[test]
+fn bf16_checkpoint_orientation_projection_matches_the_oracle_on_wgpu() {
+    if run_each(
+        &poot_executor_parity::checkpoint_projection_bf16_fixtures(),
+        poot_executor_parity::assert_one_dense_contraction,
+    )
+    .is_none()
+    {
+        eprintln!("skip: no wgpu adapter");
     }
 }
 
@@ -208,6 +251,23 @@ fn run_once_matches_a_hand_computed_elementwise_add() {
     let got = poot_executor_parity::run_once(exec.as_mut(), t, &g, &consts, &slots)
         .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(got.as_f32().unwrap(), [11.0, 22.0, 33.0, 44.0]);
+}
+
+/// POOT-1033: `Select` is a bitwise select. An F32 select (standalone, and inside a fused float region) over
+/// poisoned branches and an I32 select over nonzero condition words each equal the hand-written select words
+/// and the oracle's, bit for bit: a NaN or an infinity in the unselected branch stays out, and a NaN payload,
+/// an infinity or `-0.0` in the selected one passes through.
+/// Mutation: emit the arithmetic form `if_false + cond * (if_true - if_false)` in `emit_bitwise_select`
+/// (`poot-kernelgen`'s `fused.rs`), with a fresh `POOT_KERNEL_CACHE_DIR`; every row goes red.
+#[test]
+fn select_is_bitwise_on_wgpu() {
+    let Ok(device) = WgpuDevice::new() else {
+        eprintln!("skip: no wgpu adapter");
+        return;
+    };
+    let t = target(&device);
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    poot_executor_parity::select::assert_select_is_bitwise(exec.as_mut(), t);
 }
 
 /// Card 1011: a BF16 const cast to F32 is read from its packed `u32` lanes by the imported

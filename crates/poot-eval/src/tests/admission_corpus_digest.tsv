@@ -42,7 +42,7 @@ indexed_matmul	b86f1eb2c9d01b0b
 indexed_matmul f32 x bf16 w	b86f1eb2c9d01b0b
 iota	50c01ed756a4aa90
 matmul	883d9902703ac7db
-matmul_bias	e5bfe64acdc39f72
+contraction_epilogue	e5bfe64acdc39f72
 pack_i8	728bef064ec9ff8c
 pack_i8 exact i32 (words only)	728bef064ec9ff8c
 random_uniform	6c5b1dcd6be2e0ef

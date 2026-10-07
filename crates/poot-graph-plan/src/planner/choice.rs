@@ -24,6 +24,9 @@ pub enum NoDispatch {
 }
 
 /// The kernel the planner chose for one equation.
+// One record per planned equation, matched by value in many places: boxing the request would put a
+// `Box` pattern wall between every caller and the request it reads.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum KernelChoice {
     /// A body `poot-kernelgen` generated from this request.
@@ -40,25 +43,17 @@ pub enum KernelChoice {
     },
     /// No launch at all.
     NoDispatch(NoDispatch),
-    /// One equation planned as several dispatches over disjoint ranges of its output (a watchdog or
-    /// miscompile-ceiling split), each with its own choice. Deleted with `Plan::ComputeChunks`.
-    Chunked(Vec<KernelChoice>),
 }
 
 impl KernelChoice {
     /// A short, stable name for diagnostics and the plan summary: `generated:<family>`,
-    /// `imported:<kernel>`, `nodispatch:<kind>` or `chunked:<count>x<choice of the first chunk>`. It
+    /// `imported:<kernel>`, or `nodispatch:<kind>`. It
     /// names the kind of choice, not its parameters; the plan key carries the parameters.
     pub fn label(&self) -> String {
         match self {
             Self::Generated(request) => format!("generated:{}", request.family()),
             Self::Imported { kernel, .. } => format!("imported:{kernel:?}").to_lowercase(),
             Self::NoDispatch(kind) => format!("nodispatch:{kind:?}").to_lowercase(),
-            Self::Chunked(chunks) => format!(
-                "chunked:{}x{}",
-                chunks.len(),
-                chunks.first().map(Self::label).unwrap_or_default()
-            ),
         }
     }
 
@@ -105,9 +100,9 @@ pub struct Planned {
     pub choice: KernelChoice,
 }
 
-/// One dispatch of a [`KernelChoice::Chunked`] plan, with its choice.
-pub(crate) struct PlannedChunk {
-    chunk: ComputeChunk,
+/// One dispatch of a split plan, with the choice that built it.
+pub(crate) struct PlannedDispatch {
+    dispatch: Dispatch,
     choice: KernelChoice,
 }
 
@@ -126,7 +121,7 @@ fn build(
     backend: Backend,
     caps: &DeviceCaps,
 ) -> Result<Built, PlanError> {
-    let generated = generate(&request, backend, caps, site.limits())
+    let generated = generate(&request, caps, site.limits())
         .map_err(|error| site.refuse(Capability::KernelGen(error)))?;
     let choice = KernelChoice::Generated(request);
     let key = choice.digest(backend).to_string();
@@ -141,47 +136,28 @@ fn build(
 }
 
 impl Planned {
-    /// Generate `request` and plan the dispatch it describes: a plain `Plan::Compute`, or a
-    /// `Plan::ComputeMeta` when the launch carries a metadata buffer.
+    /// Generate `request` and plan the dispatch it describes.
     pub(crate) fn generated(
         site: Site<'_>,
         request: KernelRequest,
         backend: Backend,
         caps: &DeviceCaps,
     ) -> Result<Self, PlanError> {
-        let Built {
-            body,
-            launch,
+        let PlannedDispatch { dispatch, choice } =
+            Self::generated_dispatch(site, request, backend, caps)?;
+        Ok(Self {
+            plan: Plan::Dispatches(vec![dispatch]),
             choice,
-            key,
-            label,
-        } = build(site, request, backend, caps)?;
-        let plan = match launch.meta {
-            None => Plan::Compute {
-                body,
-                key,
-                label,
-                grid: launch.grid,
-            },
-            Some(meta) => Plan::ComputeMeta {
-                body,
-                key,
-                label,
-                meta,
-                grid: launch.grid,
-            },
-        };
-        Ok(Self { plan, choice })
+        })
     }
 
-    /// Generate `request` as one range of a chunked plan. The chunk's workgroup count is its launch grid
-    /// over the body's workgroup size: the request builds its grid as `groups * workgroup`.
-    pub(crate) fn generated_chunk(
+    /// Generate `request` as one dispatch of a split plan.
+    pub(crate) fn generated_dispatch(
         site: Site<'_>,
         request: KernelRequest,
         backend: Backend,
         caps: &DeviceCaps,
-    ) -> Result<PlannedChunk, PlanError> {
+    ) -> Result<PlannedDispatch, PlanError> {
         let Built {
             body,
             launch,
@@ -189,14 +165,15 @@ impl Planned {
             key,
             label,
         } = build(site, request, backend, caps)?;
-        let groups = launch.grid[0] as usize / body.workgroup_size[0].max(1) as usize;
-        Ok(PlannedChunk {
-            chunk: ComputeChunk {
+        Ok(PlannedDispatch {
+            dispatch: Dispatch {
                 body,
                 key,
                 label,
-                groups,
-                meta: launch.meta.unwrap_or_default(),
+                launch: Launch {
+                    grid: launch.grid,
+                    meta: launch.meta.unwrap_or_default(),
+                },
             },
             choice,
         })
@@ -220,58 +197,70 @@ impl Planned {
         grid: [u32; 3],
         index: Option<DType>,
     ) -> Self {
-        let choice = imported_choice(kernel, meta.as_deref(), index);
-        let body = kernel.body().clone();
-        let key = choice.digest(backend).to_string();
-        let label = choice.display_label();
-        let plan = match meta {
-            None => Plan::Compute {
-                body,
-                key,
-                label,
-                grid,
-            },
-            Some(meta) => Plan::ComputeMeta {
-                body,
-                key,
-                label,
-                meta,
-                grid,
-            },
-        };
-        Self { plan, choice }
+        let PlannedDispatch { dispatch, choice } =
+            Self::imported_dispatch(kernel, backend, meta, grid, index);
+        Self {
+            plan: Plan::Dispatches(vec![dispatch]),
+            choice,
+        }
     }
 
-    /// One range of a chunked plan that runs a shipped template; `meta` is the chunk's metadata.
-    pub(crate) fn imported_chunk(
+    /// One dispatch of a split plan that runs a shipped template; `meta` is its metadata, and the grid is
+    /// `groups` workgroups of the template's own workgroup size.
+    pub(crate) fn imported_split_dispatch(
         kernel: ImportedKernel,
         backend: Backend,
         meta: Vec<u32>,
         groups: usize,
-    ) -> PlannedChunk {
-        let choice = imported_choice(kernel, Some(&meta), None);
-        PlannedChunk {
-            chunk: ComputeChunk {
+    ) -> PlannedDispatch {
+        let [x, y, z] = kernel.body().workgroup_size;
+        let grid = [groups as u32 * x, y, z];
+        Self::imported_dispatch(kernel, backend, Some(meta), grid, None)
+    }
+
+    fn imported_dispatch(
+        kernel: ImportedKernel,
+        backend: Backend,
+        meta: Option<Vec<u32>>,
+        grid: [u32; 3],
+        index: Option<DType>,
+    ) -> PlannedDispatch {
+        let choice = imported_choice(kernel, meta.as_deref(), index);
+        let key = choice.digest(backend).to_string();
+        let label = choice.display_label();
+        PlannedDispatch {
+            dispatch: Dispatch {
                 body: kernel.body().clone(),
-                key: choice.digest(backend).to_string(),
-                label: choice.display_label(),
-                groups,
-                meta,
+                key,
+                label,
+                launch: Launch {
+                    grid,
+                    meta: meta.unwrap_or_default(),
+                },
             },
             choice,
         }
     }
 
-    /// Several dispatches over disjoint ranges of one output.
-    pub(crate) fn chunked(chunks: Vec<PlannedChunk>) -> Self {
-        let (chunks, choices) = chunks
-            .into_iter()
-            .map(|PlannedChunk { chunk, choice }| (chunk, choice))
-            .unzip();
-        Self {
-            plan: Plan::ComputeChunks(chunks),
-            choice: KernelChoice::Chunked(choices),
-        }
+    /// Several dispatches over disjoint ranges of one output. The equation's choice is its first
+    /// dispatch's: the dispatches are one kernel family and differ only in the range they cover. An empty
+    /// split (a zero-element output) has no choice to record and is refused.
+    pub(crate) fn split(dispatches: Vec<PlannedDispatch>) -> Result<Self, PlanError> {
+        let Some(first) = dispatches.first() else {
+            return Err(PlanError::BadShape(
+                "a split plan needs at least one dispatch (zero-element output)".into(),
+            ));
+        };
+        let choice = first.choice.clone();
+        Ok(Self {
+            plan: Plan::Dispatches(
+                dispatches
+                    .into_iter()
+                    .map(|PlannedDispatch { dispatch, .. }| dispatch)
+                    .collect(),
+            ),
+            choice,
+        })
     }
 
     pub(crate) fn alias(src: ValueId) -> Self {
@@ -316,13 +305,16 @@ fn imported_choice(
 
 #[cfg(test)]
 mod tests {
+    use poot_graph_ir::AttentionAttrs;
     use poot_graph_ir::{Builder, TensorType};
-    use poot_kernelgen::AttentionSpec;
+    use poot_kernelgen::{
+        AttentionSchedule, AttentionSpec, KeyBound, KeyLayout, MaskKind, ScoreTransform,
+    };
     use poot_tensor::DType;
     use poot_test_util::device_caps::default_caps_for;
 
     use super::*;
-    use crate::{CompileError, CompileOptions, FusionPolicy, Program, Submission, Target, compile};
+    use crate::{CompileError, CompileOptions, Program, Submission, Target, compile};
 
     /// A single-sequence decode attention (`d` head dim, `scale` attention scale), traced as the
     /// primitive chain `ops::attention_masked` builds; `compile` forms the flash op from it.
@@ -339,7 +331,6 @@ mod tests {
 
     const OPTIONS: CompileOptions = CompileOptions {
         execution: Submission::Replay,
-        fusion: FusionPolicy::Full,
         limits: crate::CompileLimits::STANDARD,
     };
 
@@ -354,21 +345,20 @@ mod tests {
     fn compiled_flash_decode(program: &Program) -> (&Plan, &KernelChoice) {
         let (eqn, plan) = program
             .planned()
-            .find(|(eqn, _)| matches!(eqn.op, OpKind::FlashAttentionDecode { .. }))
+            .find(|(eqn, _)| matches!(eqn.op, OpKind::Attention(_)))
             .expect("compile forms the flash decode");
         (plan, program.kernel_choice(eqn))
     }
 
     fn key_of(plan: &Plan) -> &str {
         match plan {
-            Plan::Compute { key, .. } | Plan::ComputeMeta { key, .. } => key,
+            Plan::Dispatches(dispatches) if dispatches.len() == 1 => &dispatches[0].key,
             other => panic!("expected a single dispatch, got {other:?}"),
         }
     }
 
     /// Card 636 SC-003 (dkernel B2): two requests that differ only in one f32 parameter get different
-    /// digests, hence different plan keys. The synthesized region decode, which the planner chooses for
-    /// a flash decode within the LDS cap, takes `scale` as a request parameter stored as its bits.
+    /// digests, hence different plan keys. The generated attention request takes `scale` as a request parameter stored as its bits.
     /// Mutation: store `scale` as `*scale as u32` (the integer value; both 1/8 and 1/16 truncate to 0):
     /// the requests, digests and keys collide and this row goes red.
     #[test]
@@ -393,20 +383,19 @@ mod tests {
             "flash scale 1/8 and 1/16 must not share a plan key"
         );
         for ((_, choice), scale) in [(eighth, 1.0f32 / 8.0), (sixteenth, 1.0 / 16.0)] {
-            let KernelChoice::Generated(KernelRequest::Attention(AttentionSpec::RegionDecode {
-                scale_bits,
-                ..
-            })) = choice
-            else {
-                panic!("expected a generated region decode: {choice:?}");
+            let KernelChoice::Generated(KernelRequest::Attention(spec)) = choice else {
+                panic!("expected a generated attention request: {choice:?}");
             };
-            assert_eq!(*scale_bits, scale.to_bits());
+            assert_eq!(
+                spec.score,
+                ScoreTransform::Scale {
+                    scale_bits: scale.to_bits()
+                }
+            );
         }
     }
 
-    /// A graph holding one `FlashAttentionDecode` with head dim `d`, staged directly: the matcher
-    /// `compile` runs declines a decode wider than the LDS cap (R480-009), so no traced graph reaches
-    /// the planner's D>cap answer, but the planner still answers for any valid equation.
+    /// A graph holding one `Attention` decode with head dim `d`, staged directly.
     fn flash_decode_composite(d: usize) -> Graph {
         let (hq, cap) = (2usize, 8usize);
         let b = Builder::new();
@@ -417,10 +406,7 @@ mod tests {
         let mut plan = b.append_plan(0);
         let out = plan
             .equation(
-                OpKind::FlashAttentionDecode {
-                    n_rep: 1,
-                    scale: 0.5,
-                },
+                OpKind::Attention(AttentionAttrs::new(1, 0.5, None)),
                 [q, k, v, mask]
                     .map(|operand| poot_graph_ir::Operand::Value(operand.id))
                     .to_vec(),
@@ -432,32 +418,38 @@ mod tests {
         b.finish(poot_graph_ir::Traced { id })
     }
 
-    /// Card 636 SC-004: a request the target cannot state is a typed refusal out of `compile`, not a
-    /// panic. A head dim above the LDS cap needs the private-array decode, which SPIR-V cannot state;
-    /// `generate` returns `Unsupported` and the planner names the missing capability. NVPTX states the
-    /// same request. Mutation: make `generate` panic on that arm; this row panics.
+    /// Card 636 SC-004: a request the device cannot hold is a typed refusal out of `compile`, not a panic.
+    /// A device whose workgroup memory cannot hold one attention lane at head dim 512 (2056 bytes) is
+    /// refused with `AttentionLds` naming the head dim and the device's bytes; the same graph compiles on
+    /// the real caps. Mutation: make the planner panic where it refuses; this row panics.
     #[test]
-    fn an_unstateable_request_compiles_to_a_typed_refusal() {
-        let head_dim = poot_target::FLASH_LDS_CAP + 256;
-        let g = flash_decode_composite(head_dim);
-        match compile(&g, &target(Backend::SpirvVulkan), &OPTIONS) {
+    fn a_device_too_small_for_the_request_compiles_to_a_typed_refusal() {
+        let g = flash_decode_composite(512);
+        let small = Target {
+            backend: Backend::SpirvVulkan,
+            caps: poot_target::DeviceCaps {
+                lds_bytes: 2048,
+                ..default_caps_for(Backend::SpirvVulkan)
+            },
+        };
+        match compile(&g, &small, &OPTIONS) {
             Err(CompileError::Plan(error)) => match *error {
                 PlanError::Refused(refusal) => assert_eq!(
                     refusal.missing,
-                    Capability::HeadDimExceedsLdsCap {
-                        head_dim,
-                        lds_cap: poot_target::FLASH_LDS_CAP,
+                    Capability::AttentionLds {
+                        dv: 512,
+                        lds_bytes: 2048,
                     }
                 ),
                 other => panic!("expected a typed refusal, got {other:?}"),
             },
-            other => panic!("expected a refusal on SPIR-V, got {:?}", other.map(|_| ())),
+            other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
         }
-        let nvptx =
-            compile(&g, &target(Backend::Nvptx), &OPTIONS).expect("NVPTX states the same request");
+        let real = compile(&g, &target(Backend::SpirvVulkan), &OPTIONS)
+            .expect("the real caps hold the same request");
         assert!(matches!(
-            compiled_flash_decode(&nvptx).1,
-            KernelChoice::Generated(KernelRequest::Attention(AttentionSpec::DecodeSingle { .. }))
+            compiled_flash_decode(&real).1,
+            KernelChoice::Generated(KernelRequest::Attention(_))
         ));
     }
 
@@ -477,9 +469,10 @@ mod tests {
         use poot_kernel_ir::{BinOp, Ty};
         use poot_kernelgen::{
             ContractionSpec, ElementwiseSpec, Fold, FusedInput, FusedKernel, FusedScalarOp,
-            FusedStep, MatmulShapes, MovementSpec, PackedKernelOp, PackedKernelSpec, PackedRequest,
-            PointwiseForm, PointwiseSpec, RopeSpec, RowKernel, RowOp, RowSelect, RowSpec, Schedule,
-            TileSize, TopKSpec, UnaryOp, ViewOperand,
+            FusedStep, LeafTy, MatmulShapes, MovementOp, MovementSpec, PackedContraction,
+            PackedKernelOp, PackedKernelSpec, PackedRequest, PointwiseForm, PointwiseSpec,
+            RopeSpec, RowKernel, RowOp, RowSpec, Schedule, Storage, TileSize, TopKSpec, UnaryOp,
+            ViewOperand,
         };
         use poot_quant::format::WeightFormat;
 
@@ -489,7 +482,7 @@ mod tests {
             width: 256,
         };
         let fused = |literal: f32| FusedKernel {
-            n_leaves: 1,
+            leaf_tys: vec![LeafTy::F32; 1],
             steps: vec![FusedStep {
                 op: FusedScalarOp::Binary(BinOp::Add),
                 inputs: vec![FusedInput::Leaf(0), FusedInput::Lit(literal)],
@@ -506,7 +499,7 @@ mod tests {
                 numel: 4,
                 leaves: vec![leaf()],
                 kernel: fused(literal),
-                form: PointwiseForm::Float,
+                form: PointwiseForm::Float { fold: fold(4) },
             })
         };
         let row = |width: usize| {
@@ -516,6 +509,7 @@ mod tests {
                 leaves: vec![leaf()],
                 kernel: RowKernel {
                     n_leaves: 1,
+                    leaf_storage: vec![poot_target::BufferStorage::f32()],
                     n_cols: 4,
                     steps: vec![RowOp::Pointwise {
                         op: FusedScalarOp::Recip,
@@ -529,7 +523,7 @@ mod tests {
         let serial = |b_cols: usize| {
             KernelRequest::Contraction(ContractionSpec::Serial {
                 dt: Ty::F32,
-                bias: false,
+                epilogue: None,
                 shapes: MatmulShapes {
                     out_shape: vec![2, 3],
                     a_shape: vec![2, 4],
@@ -539,25 +533,32 @@ mod tests {
             })
         };
         let attention = |scale: f32| {
-            KernelRequest::Attention(AttentionSpec::RegionDecode {
-                bsz: 1,
+            KernelRequest::Attention(AttentionSpec {
+                batch: 1,
                 hq: 2,
                 n_rep: 1,
-                cap: 8,
-                d: 4,
-                scale_bits: scale.to_bits(),
-                width: 4,
-                mask_per_head: false,
+                lq: 1,
+                lk: 8,
+                dk: 4,
+                dv: 4,
+                key: KeyLayout::Single,
+                score: ScoreTransform::Scale {
+                    scale_bits: scale.to_bits(),
+                },
+                mask: MaskKind::Broadcast,
+                bound: KeyBound::Static,
+                schedule: AttentionSchedule::Streaming { lanes: 4 },
             })
         };
         let transpose = |perm: Vec<usize>| {
-            KernelRequest::Movement(MovementSpec::Transpose {
-                dt: Ty::F32,
-                out_shape: vec![2, 3],
-                in_shape: vec![3, 2],
-                perm,
-                numel: 6,
-            })
+            KernelRequest::Movement(MovementSpec::new(
+                Storage::Elements { carrier: Ty::F32 },
+                vec![2, 3],
+                MovementOp::Transpose {
+                    in_shape: vec![3, 2],
+                    perm,
+                },
+            ))
         };
         let packed = |grid_x: u32| {
             KernelRequest::Packed(PackedRequest {
@@ -571,18 +572,13 @@ mod tests {
             })
         };
         let packed_contraction = |schedule: Schedule| {
-            KernelRequest::Packed(PackedRequest {
-                name: "packed_contraction",
-                spec: PackedKernelSpec {
-                    format: WeightFormat::Q8_0,
-                    op: PackedKernelOp::Contraction {
-                        rows: RowSelect::Dense,
-                        schedule,
-                    },
-                },
+            KernelRequest::Contraction(ContractionSpec::Packed(PackedContraction {
+                format: WeightFormat::Q8_0,
+                schedule,
+                epilogue: None,
                 grid: [64, 1, 1],
                 meta: vec![32, 4],
-            })
+            }))
         };
         let tiled = |edge: u32| Schedule::Tiled {
             tile: TileSize::new(edge).expect("a valid tile edge"),
@@ -645,5 +641,34 @@ mod tests {
             );
             assert_eq!(digest_of(base.clone()), digest_of(base), "{family}: stable");
         }
+    }
+
+    /// A split plan with no dispatch has no choice to record. `Planned::split` refuses it as a typed
+    /// error, and the production splitters reach it with a zero-element output (no chunks to plan).
+    /// Mutation: have `split` return `Ok` with a default choice for an empty list; both rows go red.
+    #[test]
+    fn an_empty_split_is_a_typed_refusal() {
+        assert!(matches!(
+            Planned::split(Vec::new()),
+            Err(PlanError::BadShape(_))
+        ));
+
+        let g = flash_decode_graph(8, 1.0);
+        let eqn = g.eqns.last().expect("the graph has an equation");
+        let backend = Backend::SpirvVulkan;
+        let site = Site::new(
+            (&g).into(),
+            eqn,
+            backend,
+            poot_test_util::graph_fixtures::roomy_body_limits(),
+        );
+        let planned = crate::gemv_chunks(
+            site,
+            backend,
+            0,
+            |_, _| unreachable!("a zero-element output plans no chunk"),
+            &default_caps_for(backend),
+        );
+        assert!(matches!(planned, Err(PlanError::BadShape(_))));
     }
 }

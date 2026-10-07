@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
-use poot_graph_plan::{CompileOptions, FusionPolicy, Submission};
+use poot_graph_plan::{CompileOptions, Submission};
 use poot_models::registry::{RawConfig, Registry};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_runtime_common::DeviceBackend;
@@ -40,10 +40,15 @@ pub(super) fn nz(n: usize) -> NonZeroUsize {
 /// The fixture's text services: 48 single-character words (`a`..`z`, `0`..`9`, then `p0`..`p11`), so
 /// a regex over letters masks exactly the tokens it names.
 pub(super) fn fixture_text() -> TextCodec {
+    text_of(VOCAB)
+}
+
+/// [`fixture_text`] over `vocab` words.
+fn text_of(vocab: usize) -> TextCodec {
     let mut words: Vec<String> = ('a'..='z').map(String::from).collect();
     words.extend(('0'..='9').map(String::from));
-    words.extend((0..VOCAB - words.len()).map(|i| format!("p{i}")));
-    assert_eq!(words.len(), VOCAB);
+    words.extend((0..vocab - words.len()).map(|i| format!("p{i}")));
+    assert_eq!(words.len(), vocab);
     let vocab: HashMap<String, u32> = words
         .into_iter()
         .enumerate()
@@ -111,7 +116,6 @@ fn handle(weights: Weights, eos: u32) -> Arc<ModelHandle> {
 pub(super) fn options(chunk: usize, capacity: usize) -> DriverOptions {
     let compile = CompileOptions {
         execution: Submission::Replay,
-        fusion: FusionPolicy::Full,
         limits: poot_graph_plan::CompileLimits::STANDARD,
     };
     DriverOptions {
@@ -125,6 +129,7 @@ pub(super) fn options(chunk: usize, capacity: usize) -> DriverOptions {
             max_retained_bytes: NonZeroU64::new(1 << 32).unwrap(),
         },
         charge: crate::driver::program_retention,
+        draft: crate::driver::DraftPolicy::Off,
     }
 }
 
@@ -241,6 +246,83 @@ macro_rules! per_backend {
         }
     };
 }
+
+/// POOT-574 SC-002 (R476-001 on Gemma4's path): the Gemma4 fixture with a 64-token vocabulary and its
+/// head zeroed (every logit exactly 0, so the distribution is uniform) answers a seeded temperature
+/// request with the sampler's tokens, not the greedy ones. A 16-token sampled run equal to the greedy
+/// run has probability 64^-16 = 2^-96, so the row also draws from a fresh seed and requires the same.
+/// Mutation: ignore the sampler in the head (`rule_of` always answers `Greedy`); the draw becomes
+/// the greedy run and the row fails.
+fn gemma4_sampled_differs_from_greedy(choice: BackendChoice) {
+    const WIDE: usize = 64;
+    let registry = Registry::builtin().unwrap();
+    let entry = registry
+        .entries()
+        .iter()
+        .find(|entry| entry.family.as_str() == "gemma4")
+        .unwrap();
+    let fixture = (entry.fixture)();
+    let mut config = fixture.config.clone();
+    config["eos_token_id"] = serde_json::json!(NO_EOS);
+    config["text_config"]["vocab_size"] = serde_json::json!(WIDE);
+    let mut store = WeightStore::builder();
+    for (key, entry) in fixture.store.iter() {
+        let entry = match (key.as_str(), entry) {
+            ("model.language_model.embed_tokens.weight", WeightEntry::Dense(dense)) => {
+                // The embedding's rows again for the added tokens.
+                let row = dense.bytes().len() / dense.shape()[0];
+                let mut bytes = dense.bytes().as_slice().to_vec();
+                bytes.extend_from_slice(&dense.bytes().as_slice()[..(WIDE - VOCAB) * row]);
+                let shape = vec![WIDE, dense.shape()[1]];
+                WeightEntry::Dense(
+                    DenseWeight::try_new(dense.dtype(), shape, bytes.into()).unwrap(),
+                )
+            }
+            ("lm_head.weight", WeightEntry::Dense(dense)) => {
+                let shape = vec![WIDE, dense.shape()[1]];
+                let zeros = vec![0u8; dense.bytes().len() / VOCAB * WIDE];
+                WeightEntry::Dense(
+                    DenseWeight::try_new(dense.dtype(), shape, zeros.into()).unwrap(),
+                )
+            }
+            _ => entry.clone(),
+        };
+        store.insert(key.clone(), entry).unwrap();
+    }
+    let raw = RawConfig::HfJson {
+        config: &config,
+        generation: None,
+    };
+    let handle = Arc::new(
+        ModelHandle::from_checkpoint(&raw, store.build(), &registry, |_| Ok(text_of(WIDE)))
+            .unwrap(),
+    );
+    let Some(mut driver) = driver(choice, &handle, 4, CAPACITY) else {
+        return;
+    };
+    let prompt = [1, 3, 17, 40, 8, 25, 11, 2];
+    let greedy = generate(&mut driver, &prompt, 16, Sampler::greedy());
+    let sampled = generate(&mut driver, &prompt, 16, Sampler::new(1.0, 0, 1.0, 42));
+    let again = generate(&mut driver, &prompt, 16, Sampler::new(1.0, 0, 1.0, 42));
+    let entropy = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    let fresh = generate(&mut driver, &prompt, 16, Sampler::new(1.0, 0, 1.0, entropy));
+    assert_eq!(greedy, [0; 16], "a tie takes the first index on every step");
+    assert_ne!(sampled, greedy, "the sampler's tokens, not greedy ones");
+    assert_eq!(sampled, again, "the same seed draws the same tokens");
+    assert_ne!(
+        fresh, greedy,
+        "a fresh seed ({entropy}) draws the sampler's tokens"
+    );
+}
+per_backend!(
+    gemma4_sampled_differs_from_greedy,
+    gemma4_sampled_differs_from_greedy_wgpu,
+    gemma4_sampled_differs_from_greedy_rocm,
+    gemma4_sampled_differs_from_greedy_ptx
+);
 
 /// SC-001: a seeded temperature draw and a greedy request on a uniform fixture (every logit 0) give
 /// different tokens: the draw reaches the sampler head. With 48 equal logits a sampled run equal to the
@@ -551,18 +633,156 @@ const RECORDED: &[RecordedFamily] = &[
             32,
         ],
     },
+    // Recorded with the CPU oracle (`run_step` over the fixture, a prefill and 23 decode steps) on
+    // this card's base; the f64 reference test in `gemma4.rs` pins the oracle itself (tier 3).
+    RecordedFamily {
+        family: "gemma4",
+        prompt: &GEMMA3_PROMPT,
+        tied_head: false,
+        tokens: [
+            29, 29, 28, 29, 31, 10, 44, 14, 40, 9, 13, 47, 22, 43, 42, 11, 24, 10, 10, 29, 16, 8,
+            45, 44,
+        ],
+    },
+    RecordedFamily {
+        family: "gemma4/moe",
+        prompt: &GEMMA3_PROMPT,
+        tied_head: false,
+        tokens: [
+            34, 12, 5, 47, 33, 43, 13, 45, 36, 7, 22, 32, 2, 1, 10, 43, 8, 21, 41, 24, 11, 6, 20,
+            33,
+        ],
+    },
+    // The five MoE rows below (POOT-738) were recorded with the Runner's CPU `generate` on each family's
+    // fixture at the base commit. All 24 tokens agreed: the driver on wgpu and on ROCm produce exactly the
+    // recorded ids, in one whole-prompt prefill and in chunks of four, so no row has a divergence index or
+    // a tier-3 top-two margin to record. (A token flip on a tiny random fixture would be judged by the
+    // reference's top-two logit margin, ADR-0101.) The first-token figures of the router-id-swap mutation
+    // (qwen3moe 10 vs 28, Mixtral 38 vs 40, granitemoe 43 vs 40, gpt-oss 6 vs 11, olmoe 11 vs 11 with a
+    // later split) are the red outcome of that mutation, not Runner disagreements.
+    RecordedFamily {
+        family: "qwen3moe",
+        prompt: &PROMPT,
+        tied_head: false,
+        tokens: [
+            28, 28, 28, 28, 28, 38, 27, 15, 34, 15, 42, 18, 15, 16, 38, 27, 44, 21, 28, 38, 40, 15,
+            38, 40,
+        ],
+    },
+    RecordedFamily {
+        family: "olmoe",
+        prompt: &PROMPT,
+        tied_head: false,
+        tokens: [
+            11, 11, 11, 11, 11, 11, 11, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 27, 11, 22, 22, 27,
+            11, 27,
+        ],
+    },
+    RecordedFamily {
+        family: "llama/mixtral",
+        prompt: &PROMPT,
+        tied_head: false,
+        tokens: [
+            40, 44, 24, 11, 24, 11, 44, 24, 11, 46, 21, 31, 11, 24, 42, 40, 28, 14, 8, 44, 40, 38,
+            24, 21,
+        ],
+    },
+    RecordedFamily {
+        family: "granite/granitemoe",
+        prompt: &PROMPT,
+        tied_head: false,
+        tokens: [
+            40, 38, 31, 17, 28, 40, 5, 43, 10, 20, 38, 31, 20, 20, 38, 19, 45, 14, 10, 20, 20, 20,
+            20, 20,
+        ],
+    },
+    RecordedFamily {
+        family: "gpt_oss",
+        prompt: &PROMPT,
+        tied_head: false,
+        tokens: [
+            11, 35, 8, 18, 31, 41, 42, 14, 3, 19, 44, 25, 30, 12, 10, 18, 19, 3, 35, 10, 31, 37,
+            47, 3,
+        ],
+    },
+    // minimax_m2 (POOT-570) has no Runner recording: its tokens are the independent f64 reference's greedy
+    // decode (`minimax_m2::tests::the_driver_literals_are_the_references_greedy_decode`, smallest top-two
+    // logit margin 1.2e-4), so the device is compared with the reference, not with an earlier run.
+    RecordedFamily {
+        family: "minimax_m2",
+        prompt: &PROMPT,
+        tied_head: false,
+        tokens: [
+            40, 38, 40, 38, 10, 21, 20, 21, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 19, 24, 46, 21,
+            46, 21,
+        ],
+    },
+    // The four group-B rows below (POOT-740) were recorded with the Runner's CPU `generate` on each
+    // family's fixture at the base commit `64602bced`, over the HF checkpoint the fixture writes (eos
+    // unreachable): MLA (deepseek2 with YaRN, group-limited softmax routing and two shared experts;
+    // deepseek3 with the sigmoid router; deepseek32 with the sparse-attention indexer keeping three
+    // positions) and the NemotH hybrid (Mamba2, attention, MLP).
+    RecordedFamily {
+        family: "deepseek2",
+        prompt: &PROMPT,
+        tied_head: false,
+        tokens: [
+            11, 32, 18, 32, 18, 32, 29, 38, 32, 20, 6, 19, 20, 6, 19, 20, 6, 19, 20, 6, 19, 20, 6,
+            19,
+        ],
+    },
+    RecordedFamily {
+        family: "deepseek3",
+        prompt: &PROMPT,
+        tied_head: false,
+        tokens: [
+            11, 2, 11, 2, 11, 2, 11, 32, 35, 5, 15, 32, 23, 12, 2, 20, 18, 32, 27, 2, 38, 12, 2, 20,
+        ],
+    },
+    RecordedFamily {
+        family: "deepseek32",
+        prompt: &PROMPT,
+        tied_head: false,
+        tokens: [
+            14, 20, 2, 14, 9, 37, 19, 35, 11, 34, 33, 14, 17, 33, 14, 20, 46, 3, 17, 0, 1, 33, 14,
+            8,
+        ],
+    },
+    RecordedFamily {
+        family: "nemotron_h",
+        prompt: &PROMPT,
+        tied_head: false,
+        tokens: [
+            28, 31, 1, 1, 1, 27, 2, 0, 36, 25, 22, 25, 28, 31, 1, 1, 1, 27, 32, 34, 31, 1, 25, 28,
+        ],
+    },
 ];
 
 /// `family`'s builtin fixture as the Runner was fed it (see [`RecordedFamily`]), with no reachable
 /// end-of-sequence id.
 fn recorded_family_handle(recorded: &RecordedFamily) -> Arc<ModelHandle> {
     let registry = Registry::builtin().unwrap();
+    // `family/variant` names one of the family's option fixtures (llama's Mixtral).
+    let (name, variant) = recorded
+        .family
+        .split_once('/')
+        .unwrap_or((recorded.family, ""));
     let entry = registry
         .entries()
         .iter()
-        .find(|entry| entry.family.as_str() == recorded.family)
-        .unwrap_or_else(|| panic!("no builtin family {}", recorded.family));
-    let fixture = (entry.fixture)();
+        .find(|entry| entry.family.as_str() == name)
+        .unwrap_or_else(|| panic!("no builtin family {name}"));
+    let fixture = match variant {
+        "" => (entry.fixture)(),
+        variant => {
+            let (_, make) = entry
+                .variants
+                .iter()
+                .find(|(n, _)| *n == variant)
+                .unwrap_or_else(|| panic!("{name} has no variant {variant}"));
+            make()
+        }
+    };
     let mut config = fixture.config.clone();
     config["eos_token_id"] = serde_json::json!(NO_EOS);
     let mut store = WeightStore::builder();
@@ -633,6 +853,8 @@ macro_rules! recorded_family_rows {
 recorded_family_rows! {
     "qwen2" => recorded_qwen2_tokens_wgpu, recorded_qwen2_tokens_rocm, recorded_qwen2_tokens_ptx;
     "gemma3" => recorded_gemma3_tokens_wgpu, recorded_gemma3_tokens_rocm, recorded_gemma3_tokens_ptx;
+    "gemma4" => recorded_gemma4_tokens_wgpu, recorded_gemma4_tokens_rocm, recorded_gemma4_tokens_ptx;
+    "gemma4/moe" => recorded_gemma4_moe_tokens_wgpu, recorded_gemma4_moe_tokens_rocm, recorded_gemma4_moe_tokens_ptx;
     "granite" => recorded_granite_tokens_wgpu, recorded_granite_tokens_rocm, recorded_granite_tokens_ptx;
     "olmo2" => recorded_olmo2_tokens_wgpu, recorded_olmo2_tokens_rocm, recorded_olmo2_tokens_ptx;
     "bloom" => recorded_bloom_tokens_wgpu, recorded_bloom_tokens_rocm, recorded_bloom_tokens_ptx;
@@ -641,6 +863,16 @@ recorded_family_rows! {
     "llama" => recorded_llama_tokens_wgpu, recorded_llama_tokens_rocm, recorded_llama_tokens_ptx;
     "qwen3" => recorded_qwen3_tokens_wgpu, recorded_qwen3_tokens_rocm, recorded_qwen3_tokens_ptx;
     "phi3" => recorded_phi3_tokens_wgpu, recorded_phi3_tokens_rocm, recorded_phi3_tokens_ptx;
+    "qwen3moe" => recorded_qwen3moe_tokens_wgpu, recorded_qwen3moe_tokens_rocm, recorded_qwen3moe_tokens_ptx;
+    "olmoe" => recorded_olmoe_tokens_wgpu, recorded_olmoe_tokens_rocm, recorded_olmoe_tokens_ptx;
+    "llama/mixtral" => recorded_mixtral_tokens_wgpu, recorded_mixtral_tokens_rocm, recorded_mixtral_tokens_ptx;
+    "granite/granitemoe" => recorded_granitemoe_tokens_wgpu, recorded_granitemoe_tokens_rocm, recorded_granitemoe_tokens_ptx;
+    "gpt_oss" => recorded_gpt_oss_tokens_wgpu, recorded_gpt_oss_tokens_rocm, recorded_gpt_oss_tokens_ptx;
+    "minimax_m2" => recorded_minimax_m2_tokens_wgpu, recorded_minimax_m2_tokens_rocm, recorded_minimax_m2_tokens_ptx;
+    "deepseek2" => recorded_deepseek2_tokens_wgpu, recorded_deepseek2_tokens_rocm, recorded_deepseek2_tokens_ptx;
+    "deepseek3" => recorded_deepseek3_tokens_wgpu, recorded_deepseek3_tokens_rocm, recorded_deepseek3_tokens_ptx;
+    "deepseek32" => recorded_deepseek32_tokens_wgpu, recorded_deepseek32_tokens_rocm, recorded_deepseek32_tokens_ptx;
+    "nemotron_h" => recorded_nemotron_h_tokens_wgpu, recorded_nemotron_h_tokens_rocm, recorded_nemotron_h_tokens_ptx;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -790,15 +1022,11 @@ fn write_hf_checkpoint(
     dir
 }
 
-/// `family`'s builtin fixture written as an HF checkpoint directory, every tensor as stored.
-fn builtin_fixture_dir(family: &str) -> poot_test_util::UniqueTempPath {
-    let registry = Registry::builtin().unwrap();
-    let entry = registry
-        .entries()
-        .iter()
-        .find(|entry| entry.family.as_str() == family)
-        .unwrap();
-    let fixture = (entry.fixture)();
+/// `fixture` written as an HF checkpoint directory, every tensor as stored.
+fn fixture_dir(
+    label: &str,
+    fixture: &poot_models::registry::Fixture,
+) -> poot_test_util::UniqueTempPath {
     let tensors: Vec<ArchiveTensor> = fixture
         .store
         .iter()
@@ -814,7 +1042,18 @@ fn builtin_fixture_dir(family: &str) -> poot_test_util::UniqueTempPath {
             }
         })
         .collect();
-    write_hf_checkpoint(&format!("{family}_fixture"), &fixture.config, &tensors)
+    write_hf_checkpoint(label, &fixture.config, &tensors)
+}
+
+/// `family`'s builtin fixture written as an HF checkpoint directory, every tensor as stored.
+fn builtin_fixture_dir(family: &str) -> poot_test_util::UniqueTempPath {
+    let registry = Registry::builtin().unwrap();
+    let entry = registry
+        .entries()
+        .iter()
+        .find(|entry| entry.family.as_str() == family)
+        .unwrap();
+    fixture_dir(&format!("{family}_fixture"), &(entry.fixture)())
 }
 
 /// `ModelHandle::load` resolves the family before it reads a tensor: a checkpoint whose config names an
@@ -832,10 +1071,39 @@ fn an_unregistered_family_is_refused_before_any_tensor_is_read() {
     )
     .unwrap();
     std::fs::write(dir.join("model.safetensors"), b"not a safetensors archive").unwrap();
-    match ModelHandle::load(&dir, &Registry::builtin().unwrap()) {
+    match ModelHandle::load(
+        &dir,
+        &Registry::builtin().unwrap(),
+        &crate::driver::LoadOptions::default(),
+    ) {
         Err(DriverError::Unsupported(Unsupported::Registry(_))) => {}
         other => panic!("expected the registry refusal before any tensor read, got {other:?}"),
     }
+}
+
+/// POOT-570 SC-002: a MiniMax-M2 checkpoint directory whose config the old pinned counts refused (one
+/// layer, four experts, no manifest anywhere) loads through `ModelHandle::load`, resolves to the
+/// `minimax_m2` family and keeps the config's own counts. Mutation: reinstate a pinned layer count in
+/// `MiniMaxM2Config::from_raw`; the load is refused and the row goes red.
+#[test]
+fn a_finetune_like_minimax_checkpoint_loads_through_model_handle_load() {
+    let registry = Registry::builtin().unwrap();
+    let entry = registry
+        .entries()
+        .iter()
+        .find(|entry| entry.family.as_str() == "minimax_m2")
+        .unwrap();
+    let (_, finetune) = entry
+        .variants
+        .iter()
+        .find(|(name, _)| *name == "finetune")
+        .expect("minimax_m2 ships a finetune-like fixture");
+    let fixture = finetune();
+    let dir = fixture_dir("minimax_m2_finetune", &fixture);
+    let handle =
+        ModelHandle::load(&dir, &registry, &crate::driver::LoadOptions::default()).unwrap();
+    assert_eq!(handle.config().family, entry.family);
+    assert_eq!(handle.config().vocab, VOCAB);
 }
 
 /// Gemma is trained with a mandatory BOS: an HF gemma3 checkpoint's prompts encode with its BOS id
@@ -845,14 +1113,24 @@ fn an_unregistered_family_is_refused_before_any_tensor_is_read() {
 #[test]
 fn an_hf_gemma3_checkpoint_encodes_with_its_mandatory_bos() {
     let registry = Registry::builtin().unwrap();
-    let gemma3 = ModelHandle::load(&builtin_fixture_dir("gemma3"), &registry).unwrap();
+    let gemma3 = ModelHandle::load(
+        &builtin_fixture_dir("gemma3"),
+        &registry,
+        &crate::driver::LoadOptions::default(),
+    )
+    .unwrap();
     assert_eq!(gemma3.config().prompt_bos, Some(1));
     assert_eq!(
         gemma3.text().encode("d r p4").unwrap(),
         [1, 3, 17, 40],
         "gemma3 prepends its BOS"
     );
-    let qwen2 = ModelHandle::load(&builtin_fixture_dir("qwen2"), &registry).unwrap();
+    let qwen2 = ModelHandle::load(
+        &builtin_fixture_dir("qwen2"),
+        &registry,
+        &crate::driver::LoadOptions::default(),
+    )
+    .unwrap();
     assert_eq!(qwen2.config().prompt_bos, None);
     assert_eq!(qwen2.text().encode("d r p4").unwrap(), [3, 17, 40]);
 }
@@ -1145,8 +1423,13 @@ fn packed_checkpoints_load_as_stored_through_the_registry(choice: BackendChoice)
     fp8_config["quantization_config"] = compressed_tensors_fp8();
     let fp8_dir = write_hf_checkpoint("llama_fp8", &fp8_config, &packed);
     let twin_dir = write_hf_checkpoint("llama_fp8_twin", &base, &twin);
-    let fp8 = Arc::new(ModelHandle::load(&fp8_dir, &registry).expect("the FP8 llama loads"));
-    let dense = Arc::new(ModelHandle::load(&twin_dir, &registry).unwrap());
+    let fp8 = Arc::new(
+        ModelHandle::load(&fp8_dir, &registry, &crate::driver::LoadOptions::default())
+            .expect("the FP8 llama loads"),
+    );
+    let dense = Arc::new(
+        ModelHandle::load(&twin_dir, &registry, &crate::driver::LoadOptions::default()).unwrap(),
+    );
 
     // The packed handle each stored E4M3 tensor maps to.
     let handle_of = |name: &str| {
@@ -1190,9 +1473,22 @@ fn packed_checkpoints_load_as_stored_through_the_registry(choice: BackendChoice)
     );
 
     let gguf = packed_gguf("granite", WeightFormat::Q4_K, GGML_Q4_K, 256, false);
-    let granite =
-        Arc::new(ModelHandle::load(&gguf.packed, &registry).expect("the Q4_K granite loads"));
-    let granite_twin = Arc::new(ModelHandle::load(&gguf.twin, &registry).unwrap());
+    let granite = Arc::new(
+        ModelHandle::load(
+            &gguf.packed,
+            &registry,
+            &crate::driver::LoadOptions::default(),
+        )
+        .expect("the Q4_K granite loads"),
+    );
+    let granite_twin = Arc::new(
+        ModelHandle::load(
+            &gguf.twin,
+            &registry,
+            &crate::driver::LoadOptions::default(),
+        )
+        .unwrap(),
+    );
     assert!(
         poot_graph_plan::WeightFormats::from_weight_map(granite_twin.model().weights()).is_empty(),
         "the granite twin is dense"
@@ -1291,8 +1587,22 @@ fn packed_gguf_generates_like_its_dense_twin(
         .into_iter()
         .map(|arch| {
             let files = packed_gguf(arch, format, ggml_type, 32, true);
-            let packed = Arc::new(ModelHandle::load(&files.packed, &registry).unwrap());
-            let twin = Arc::new(ModelHandle::load(&files.twin, &registry).unwrap());
+            let packed = Arc::new(
+                ModelHandle::load(
+                    &files.packed,
+                    &registry,
+                    &crate::driver::LoadOptions::default(),
+                )
+                .unwrap(),
+            );
+            let twin = Arc::new(
+                ModelHandle::load(
+                    &files.twin,
+                    &registry,
+                    &crate::driver::LoadOptions::default(),
+                )
+                .unwrap(),
+            );
             let formats = poot_graph_plan::WeightFormats::from_weight_map(packed.model().weights());
             // Seven projections, the embedding gather and the tied head (the same payload twice).
             assert_eq!(
@@ -1408,8 +1718,22 @@ mod checkpoint {
     const QWEN2_5_0_5B_PROMPT: [u32; 12] = [
         785, 6722, 315, 9856, 374, 19846, 13, 576, 6722, 315, 9625, 374,
     ];
+    /// `gemma4-moe-tiny` (the multimodal `Gemma4ForConditionalGeneration` wrapper, 128 experts): the
+    /// CPU oracle's 24 greedy tokens after this prompt (POOT-574 rule 18, ADR-0101 tier 3).
+    const GEMMA4_MOE_TINY_PROMPT: [u32; 8] = [2, 105, 2364, 7, 11, 300, 1044, 9];
+    const GEMMA4_MOE_TINY: [u32; 24] = [
+        121029, 109844, 185071, 99208, 185071, 99208, 185071, 99208, 185071, 99208, 185071, 99208,
+        185071, 99208, 185071, 99208, 185071, 99208, 185071, 99208, 185071, 99208, 185071, 99208,
+    ];
     fn load(path: &std::path::Path) -> Arc<ModelHandle> {
-        Arc::new(ModelHandle::load(path, &Registry::builtin().unwrap()).unwrap())
+        Arc::new(
+            ModelHandle::load(
+                path,
+                &Registry::builtin().unwrap(),
+                &crate::driver::LoadOptions::default(),
+            )
+            .unwrap(),
+        )
     }
 
     /// The recorded tokens for `prompt` at the whole prompt and at `prefill_chunk = 5`.
@@ -1592,10 +1916,8 @@ mod checkpoint {
 
     /// A secret word stated once at the start of ~5900 tokens of filler, asked for at the end. The
     /// rescaled low-frequency band (`rope_freqs.weight`) is what carries that long-range lookup:
-    /// plain RoPE answers a distractor word instead (measured, Card 1019). The prompt starts with BOS
-    /// (llama3 was trained with it, but this tokenizer does not add it for a llama GGUF) and the word
-    /// has no digits (this tokenizer groups them differently from llama.cpp's). Both workarounds go
-    /// when POOT-1023 fixes the tokenizer.
+    /// plain RoPE answers a distractor word instead (measured, Card 1019). The filler carries digits and
+    /// the prompt gets its BOS from `encode`, both as llama.cpp tokenizes them.
     fn recalls_a_word_across_a_long_context(path: &std::path::Path, choice: BackendChoice) {
         const WORDS: [&str; 8] = [
             "amber", "birch", "cedar", "dune", "ember", "fjord", "grove", "harbor",
@@ -1607,7 +1929,7 @@ mod checkpoint {
         let filler: String = (0..730)
             .map(|i| {
                 format!(
-                    "The {} crate holds {} bolts. ",
+                    "The {} crate no. {i} holds {} bolts. ",
                     WORDS[i % 8],
                     WORDS[(i * 3 + 1) % 8]
                 )
@@ -1616,8 +1938,7 @@ mod checkpoint {
         let prompt = format!(
             "The secret word is pelican. {filler}\nQuestion: what is the secret word?\nAnswer: The secret word is"
         );
-        let mut ids = handle.config().bos.into_iter().collect::<Vec<_>>();
-        ids.extend(handle.text().encode(&prompt).unwrap());
+        let ids = handle.text().encode(&prompt).unwrap();
         eprintln!("prompt tokens: {}", ids.len());
         let tokens = generate(&mut driver, &ids, 8, Sampler::greedy());
         let text = handle.text().decode(&tokens).unwrap();
@@ -1897,6 +2218,29 @@ mod checkpoint {
         }
     }
 
+    /// The old Runner MoE coherence rows (qwen3-moe, mixtral, olmoe, gpt-oss, granitemoe tiny checkpoints):
+    /// the checkpoint loads through the registry and decodes through the driver, a prefill split into
+    /// chunks of four generates the tokens a whole-prompt prefill does, and the continuation is not empty.
+    /// The Runner compared the device with its CPU re-prefill; the driver has no CPU path, so the
+    /// independent claim is the chunking invariance of the routed prefill.
+    fn moe_generates(path: &std::path::Path, choice: BackendChoice) {
+        let handle = load(path);
+        // Every executor opens before any runs (see `fixture_tokens_equal_the_recorded_literals`).
+        let Some(mut whole) = driver(choice, &handle, 64, 128) else {
+            return;
+        };
+        let Some(mut chunked) = driver(choice, &handle, 4, 128) else {
+            return;
+        };
+        let ids = handle.text().encode(CAPITAL).unwrap();
+        let tokens = generate(&mut whole, &ids, 12, Sampler::greedy());
+        let split = generate(&mut chunked, &ids, 12, Sampler::greedy());
+        let text = handle.text().decode(&tokens).unwrap();
+        eprintln!("{}: {text:?}", path.display());
+        assert!(!tokens.is_empty(), "{}: nothing generated", path.display());
+        assert_eq!(tokens, split, "{}: prefill chunking", path.display());
+    }
+
     /// One `#[ignore]`d row per checkpoint and backend (each its own test and process: the ROCm runtime
     /// does not survive reopening an executor in one process). The `ptx` rows run on a pod that holds
     /// the model.
@@ -1946,6 +2290,9 @@ mod checkpoint {
         qwen2_q8_0_recorded: "qwen2.5-0.5b-gguf/qwen2.5-0.5b-instruct-q8_0.gguf",
             |path, choice| recorded(path, &QWEN2_5_0_5B_PROMPT, &QWEN2_5_0_5B, choice),
             "loads the real qwen2.5-0.5b Q8_0 GGUF onto the GPU; needs >= 40Gi available";
+        gemma4_moe_tiny_recorded: "gemma4-moe-tiny",
+            |path, choice| recorded(path, &GEMMA4_MOE_TINY_PROMPT, &GEMMA4_MOE_TINY, choice),
+            "loads the real gemma4-moe-tiny checkpoint onto the GPU; needs >= 40Gi available";
         qwen2_greedy_reference: "qwen2.5-0.5b", qwen2_reference,
             "loads the real qwen2.5-0.5b bf16 checkpoint onto the GPU; needs >= 40Gi available";
         qwen2_masked_decode_capacity_independent: "qwen2.5-0.5b", masked_decode_is_capacity_independent,
@@ -2004,6 +2351,44 @@ mod checkpoint {
         smollm3_coherent: "smollm3-3b",
             |path, choice| continues_with(path, choice, CAPITAL, 20, "paris"),
             "loads the bf16 SmolLM3-3B onto the GPU; needs >= 40Gi available";
+        qwen3_moe_tiny: "qwen3-moe-tiny", moe_generates,
+            "loads qwen3-moe-tiny onto the GPU; needs >= 40Gi available";
+        qwen3_moe_sparse: "qwen3-moe-tiny-sparse", moe_generates,
+            "loads qwen3-moe-tiny-sparse onto the GPU; needs >= 40Gi available";
+        qwen3_moe_sparse_gguf: "qwen3-moe-tiny-sparse-gguf/model.gguf", moe_generates,
+            "loads the qwen3-moe-tiny-sparse GGUF onto the GPU; needs >= 40Gi available";
+        mixtral_tiny: "mixtral-tiny", moe_generates,
+            "loads mixtral-tiny (~945MB f32) onto the GPU; needs >= 40Gi available";
+        mixtral_tiny_gguf: "mixtral-tiny/mixtral-tiny-f32.gguf", moe_generates,
+            "loads the mixtral-tiny f32 GGUF (a llama-architecture GGUF with experts) onto the GPU; needs >= 40Gi available";
+        olmoe_tiny: "olmoe-tiny", moe_generates,
+            "loads olmoe-tiny onto the GPU; needs >= 40Gi available";
+        olmoe_tiny_gguf: "olmoe-tiny/olmoe-tiny-f32.gguf", moe_generates,
+            "loads the olmoe-tiny f32 GGUF onto the GPU; needs >= 40Gi available";
+        gptoss_tiny: "gptoss-tiny", moe_generates,
+            "loads gptoss-tiny onto the GPU; needs >= 40Gi available";
+        gptoss_tiny_gguf: "gptoss-tiny/gptoss-tiny-f32.gguf", moe_generates,
+            "loads the gptoss-tiny f32 GGUF onto the GPU; needs >= 40Gi available";
+        granitemoe_tiny: "granitemoe-tiny", moe_generates,
+            "loads granitemoe-tiny onto the GPU; needs >= 40Gi available";
+        granite_moe_1b_gguf: "granite-moe-1b-gguf/granite-3.0-1b-a400m-instruct-Q8_0.gguf", moe_generates,
+            "loads the granite-3.0-1b-a400m Q8_0 GGUF onto the GPU; needs >= 40Gi available";
+        deepseek2_tiny: "deepseek2-tiny", moe_generates,
+            "loads deepseek2-tiny (the MLA checkpoint, safetensors) onto the GPU; needs >= 40Gi available";
+        deepseek2_tiny_gguf: "deepseek2-tiny/deepseek2-tiny-f32.gguf", moe_generates,
+            "loads the deepseek2-tiny f32 GGUF (split per-head attn_k_b and attn_v_b) onto the GPU; needs >= 40Gi available";
+        deepseek3_tiny: "deepseek3-tiny", moe_generates,
+            "loads deepseek3-tiny (the sigmoid-router MLA checkpoint) onto the GPU; needs >= 40Gi available";
+        deepseek3_tiny_gguf: "deepseek3-tiny/deepseek3-tiny-f32.gguf", moe_generates,
+            "loads the deepseek3-tiny f32 GGUF (a deepseek2-architecture GGUF with the sigmoid gating function) onto the GPU; needs >= 40Gi available";
+        deepseek2_lite: "deepseek2-lite", moe_generates,
+            "loads the real ~31GB bf16 DeepSeek-V2-Lite (16B) onto the GPU; needs the 40Gi gate";
+        olmoe_1b_7b: "olmoe-1b-7b", moe_generates,
+            "loads the real ~14GB bf16 OLMoE-1B-7B onto the GPU; needs the 40Gi gate";
+        gptoss_20b_gguf: "gpt-oss-20b-gguf/gpt-oss-20b-MXFP4.gguf", moe_generates,
+            "loads the real 20B gpt-oss MXFP4 GGUF; runs on a pod, never locally";
+        mixtral_8x7b_gguf: "mixtral-8x7b-instruct-gguf/mixtral-8x7b-instruct-v0.1.Q4_K_M.gguf", moe_generates,
+            "loads the real Mixtral-8x7B Q4_K_M GGUF; runs on a pod, never locally";
         guided_choice_on_qwen2: "qwen2.5-0.5b", guided_choice,
             "loads the real qwen2.5-0.5b onto the GPU; needs >= 40Gi available";
         guided_gbnf_sentence_on_qwen2: "qwen2.5-0.5b", guided_gbnf_sentence,
@@ -2518,3 +2903,286 @@ per_backend!(
     a_guided_row_takes_the_whole_step_to_the_logits_entry_rocm,
     a_guided_row_takes_the_whole_step_to_the_logits_entry_ptx
 );
+
+// ---------------------------------------------------------------------------------------------
+// POOT-738 SC-004 (F4): a NaN in one router weight is a typed validation fault naming the witness
+// and its layer, through the driver, not a published token.
+// ---------------------------------------------------------------------------------------------
+
+/// `family`'s fixture with one BF16 element of the tensor `key` set to NaN.
+fn poisoned_router_handle(family: &str, key_to_poison: &str) -> Arc<ModelHandle> {
+    let registry = Registry::builtin().unwrap();
+    let entry = registry
+        .entries()
+        .iter()
+        .find(|entry| entry.family.as_str() == family)
+        .unwrap();
+    let fixture = (entry.fixture)();
+    let mut config = fixture.config.clone();
+    config["eos_token_id"] = serde_json::json!(NO_EOS);
+    let mut store = WeightStore::builder();
+    for (key, weight) in fixture.store.iter() {
+        let weight = match weight {
+            WeightEntry::Dense(dense) if key.as_str() == key_to_poison => {
+                let mut bytes = dense.bytes().as_slice().to_vec();
+                bytes[..2].copy_from_slice(&0x7fc0u16.to_le_bytes());
+                WeightEntry::Dense(
+                    DenseWeight::try_new(dense.dtype(), dense.shape().to_vec(), bytes.into())
+                        .unwrap(),
+                )
+            }
+            other => other.clone(),
+        };
+        store.insert(key.clone(), weight).unwrap();
+    }
+    let raw = RawConfig::HfJson {
+        config: &config,
+        generation: None,
+    };
+    Arc::new(
+        ModelHandle::from_checkpoint(&raw, store.build(), &registry, |_| Ok(fixture_text()))
+            .unwrap(),
+    )
+}
+
+/// SC-004: the poisoned router stops generation with `ExecError::Validation` carrying the
+/// `RouterLogitsFinite` witness of layer 1. Mutation: drop the router's witness emission in
+/// `components::router`; the NaN is canonicalized by the rank and tokens publish, so the row goes red.
+fn a_nan_router_weight_is_a_typed_validation_fault(choice: BackendChoice) {
+    a_nan_router_weight_is_a_typed_validation_fault_of(
+        choice,
+        "qwen3moe",
+        "model.layers.1.mlp.gate.weight",
+    );
+}
+
+fn a_nan_router_weight_is_a_typed_validation_fault_of(
+    choice: BackendChoice,
+    family: &str,
+    router: &str,
+) {
+    use poot_executor::ExecError;
+    use poot_graph_ir::ValidationPacketError;
+    use poot_models::components::witness::WitnessKind;
+    let handle = poisoned_router_handle(family, router);
+    let Some(mut driver) = driver(choice, &handle, 8, CAPACITY) else {
+        return;
+    };
+    let error = driver
+        .generate(
+            GenerateRequest {
+                prompt: PROMPT.to_vec(),
+                max_new: 4,
+                sampler: Sampler::greedy(),
+                stops: Vec::new(),
+                ignore_eos: false,
+            },
+            &mut |_: u32, _: &str| GenerationControl::Continue(()),
+        )
+        .expect_err("a NaN router weight must not publish tokens");
+    let DriverError::Device(ExecError::Validation(failure)) = error else {
+        panic!("expected a validation fault, got {error:?}");
+    };
+    let ValidationPacketError::Failure(failure) = *failure else {
+        panic!("expected one failing lane, got {failure:?}");
+    };
+    assert_eq!(
+        WitnessKind::decode(failure.id),
+        Some((1, WitnessKind::RouterLogitsFinite)),
+        "{failure}"
+    );
+}
+per_backend!(
+    a_nan_router_weight_is_a_typed_validation_fault,
+    a_nan_router_weight_is_a_typed_validation_fault_wgpu,
+    a_nan_router_weight_is_a_typed_validation_fault_rocm,
+    a_nan_router_weight_is_a_typed_validation_fault_ptx
+);
+
+/// POOT-570 SC-008: MiniMax-M2 uses the same component witness: a NaN in layer 1's router (the tensor
+/// `block_sparse_moe.gate`) is `RouterLogitsFinite` naming layer 1 through the driver. Mutation: drop the
+/// router's witness emission in `components::router`; the NaN publishes tokens and the row goes red.
+fn a_nan_minimax_router_weight_is_a_typed_validation_fault(choice: BackendChoice) {
+    a_nan_router_weight_is_a_typed_validation_fault_of(
+        choice,
+        "minimax_m2",
+        "model.layers.1.block_sparse_moe.gate.weight",
+    );
+}
+per_backend!(
+    a_nan_minimax_router_weight_is_a_typed_validation_fault,
+    a_nan_minimax_router_weight_is_a_typed_validation_fault_wgpu,
+    a_nan_minimax_router_weight_is_a_typed_validation_fault_rocm,
+    a_nan_minimax_router_weight_is_a_typed_validation_fault_ptx
+);
+
+/// POOT-570 SC-005: three positions of the MiniMax-M2 fixture through the driver against the reference:
+/// the greedy tokens after a three-token prompt and the log-probability of each (within 1e-3), which
+/// read the key and value caches of every earlier position. Literals are the reference's
+/// (`minimax_m2::tests::the_driver_literals_are_the_references_greedy_decode`). Mutation: swap K and V in
+/// the cache write (`components::attention`); the first log-probability moves and the row goes red.
+fn minimax_three_positions_match_the_reference(choice: BackendChoice) {
+    const PROMPT3: [u32; 3] = [3, 17, 40];
+    const TOKENS: [u32; 3] = [40, 40, 38];
+    const LOGPROBS: [f32; 3] = [-0.006_896_56, -0.145_637_38, -0.826_256_9];
+    let recorded = RECORDED
+        .iter()
+        .find(|recorded| recorded.family == "minimax_m2")
+        .unwrap();
+    let handle = recorded_family_handle(recorded);
+    let Some(mut driver) = driver(choice, &handle, 8, CAPACITY) else {
+        return;
+    };
+    let (tokens, logprobs) = generate_traced(&mut driver, &PROMPT3, 3);
+    assert_eq!(tokens, TOKENS, "minimax_m2 on {choice:?}");
+    for (step, (got, want)) in logprobs.iter().zip(LOGPROBS).enumerate() {
+        assert!(
+            (got - want).abs() <= 1e-3,
+            "minimax_m2 on {choice:?}, step {step}: log-probability {got}, the reference gives {want}"
+        );
+    }
+}
+per_backend!(
+    minimax_three_positions_match_the_reference,
+    minimax_three_positions_match_the_reference_wgpu,
+    minimax_three_positions_match_the_reference_rocm,
+    minimax_three_positions_match_the_reference_ptx
+);
+
+// ---------------------------------------------------------------------------------------------
+// POOT-738 SC-001 (ADR-0101 tier 2): the first step of each MoE family on the device equals the CPU
+// oracle on the same traced graph.
+// ---------------------------------------------------------------------------------------------
+
+/// The oracle's top five `(token, log-probability)` for the last prompt position of `handle`'s model,
+/// over its own traced prefill graph and weight map.
+fn oracle_top5(handle: &ModelHandle) -> Vec<(u32, f64)> {
+    use poot_graph_ir::{Slot, SlotKey};
+    use poot_models::model::{KvLayout, LogitRows, Phase, StepShape};
+    let n = PROMPT.len();
+    let shape = StepShape {
+        rows: nz(1),
+        tokens: nz(n),
+        capacity: nz(CAPACITY),
+        kv: KvLayout::Contiguous,
+        logits: LogitRows::Last,
+    };
+    let model = handle.model();
+    let graph = model.trace(Phase::Prefill, shape).unwrap();
+    let formats = poot_graph_plan::WeightFormats::from_weight_map(model.weights());
+    let graph = poot_graph_plan::bind_packed_weights(&graph, &formats).unwrap();
+    let ids: Vec<i32> = PROMPT.iter().map(|&t| t as i32).collect();
+    let slots = [
+        (
+            SlotKey::new(Slot::Token, None),
+            poot_tensor::HostTensor::i32(vec![1, n], ids),
+        ),
+        (
+            SlotKey::new(Slot::Pos, None),
+            poot_tensor::HostTensor::i32(vec![1, n], (0..n as i32).collect()),
+        ),
+    ];
+    let zeros: Vec<poot_tensor::HostTensor> = graph
+        .state
+        .iter()
+        .map(|&(si, _)| poot_tensor::HostTensor::zeros(graph.aval(si).shape.clone()))
+        .collect();
+    let (out, _) = poot_test_util::weight_map_oracle::eval_mapped(
+        &graph,
+        handle.store(),
+        model.weights(),
+        &slots,
+        &zeros,
+    );
+    let logits: Vec<f64> = out
+        .as_f32()
+        .unwrap()
+        .iter()
+        .map(|&v| f64::from(v))
+        .collect();
+    let max = logits.iter().copied().fold(f64::MIN, f64::max);
+    let log_sum = logits.iter().map(|l| (l - max).exp()).sum::<f64>().ln() + max;
+    let mut ranked: Vec<(u32, f64)> = logits
+        .iter()
+        .enumerate()
+        .map(|(t, l)| (t as u32, l - log_sum))
+        .collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+    ranked.truncate(5);
+    ranked
+}
+
+/// SC-001, tier 2: the device's first generated token and its top-five log-probabilities equal the
+/// oracle's over the same graph (token ids exact, log-probabilities within `1e-3`). Mutation: swap two
+/// experts' router ids in `components::router`; the family's first token or a log-probability
+/// moves and the row goes red.
+fn moe_first_step_matches_the_oracle(family: &str, choice: BackendChoice) {
+    let recorded = RECORDED
+        .iter()
+        .find(|recorded| recorded.family == family)
+        .unwrap_or_else(|| panic!("no recorded row for {family}"));
+    let handle = recorded_family_handle(recorded);
+    let want = oracle_top5(&handle);
+    let Some(mut driver) = driver(choice, &handle, 8, CAPACITY) else {
+        return;
+    };
+    let generated = driver
+        .generate(
+            GenerateRequest {
+                prompt: recorded.prompt.to_vec(),
+                max_new: 1,
+                sampler: Sampler::greedy().with_logprobs(5),
+                stops: Vec::new(),
+                ignore_eos: false,
+            },
+            &mut |_: u32, _: &str| GenerationControl::Continue(()),
+        )
+        .unwrap();
+    assert_eq!(
+        generated.tokens,
+        [want[0].0],
+        "{family} on {choice:?}: first token"
+    );
+    let got = &generated.logprobs[0].top;
+    assert_eq!(
+        got.iter().map(|&(t, _)| t).collect::<Vec<_>>(),
+        want.iter().map(|&(t, _)| t).collect::<Vec<_>>(),
+        "{family} on {choice:?}: the five most likely tokens"
+    );
+    for ((token, got), (_, want)) in got.iter().zip(&want) {
+        assert!(
+            (f64::from(*got) - want).abs() <= 1e-3,
+            "{family} on {choice:?}: token {token} has log-probability {got}, the oracle gives {want}"
+        );
+    }
+}
+
+macro_rules! moe_oracle_rows {
+    ($($family:literal => $wgpu:ident, $rocm:ident;)*) => {
+        $(
+            #[test]
+            fn $wgpu() {
+                moe_first_step_matches_the_oracle($family, BackendChoice::Wgpu);
+            }
+
+            #[cfg(feature = "rocm")]
+            #[test]
+            fn $rocm() {
+                moe_first_step_matches_the_oracle($family, BackendChoice::Rocm);
+            }
+        )*
+    };
+}
+
+moe_oracle_rows! {
+    "qwen3moe" => qwen3moe_first_step_matches_the_oracle_wgpu, qwen3moe_first_step_matches_the_oracle_rocm;
+    "olmoe" => olmoe_first_step_matches_the_oracle_wgpu, olmoe_first_step_matches_the_oracle_rocm;
+    "llama/mixtral" => mixtral_first_step_matches_the_oracle_wgpu, mixtral_first_step_matches_the_oracle_rocm;
+    "granite/granitemoe" => granitemoe_first_step_matches_the_oracle_wgpu, granitemoe_first_step_matches_the_oracle_rocm;
+    "gpt_oss" => gpt_oss_first_step_matches_the_oracle_wgpu, gpt_oss_first_step_matches_the_oracle_rocm;
+    "minimax_m2" => minimax_m2_first_step_matches_the_oracle_wgpu, minimax_m2_first_step_matches_the_oracle_rocm;
+    "deepseek2" => deepseek2_first_step_matches_the_oracle_wgpu, deepseek2_first_step_matches_the_oracle_rocm;
+    "deepseek3" => deepseek3_first_step_matches_the_oracle_wgpu, deepseek3_first_step_matches_the_oracle_rocm;
+    "deepseek32" => deepseek32_first_step_matches_the_oracle_wgpu, deepseek32_first_step_matches_the_oracle_rocm;
+    "nemotron_h" => nemotron_h_first_step_matches_the_oracle_wgpu, nemotron_h_first_step_matches_the_oracle_rocm;
+}

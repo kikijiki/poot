@@ -129,6 +129,10 @@ pub enum ConfigReason {
     /// A float that must be finite and positive (an epsilon, a RoPE base or factor).
     NotFinitePositive,
     Unsupported,
+    /// A per-layer list or string whose length is not the layer count.
+    Length {
+        expected: usize,
+    },
 }
 
 /// Why a family refuses a step shape.
@@ -149,6 +153,11 @@ pub enum ShapeReason {
     StateRowAxis {
         leading: usize,
         rows: usize,
+    },
+    /// A routed step whose `rows * tokens * top_k` expert rows exceed what the expert chain
+    /// indexes exactly.
+    RoutedRows {
+        max: usize,
     },
 }
 

@@ -26,7 +26,7 @@ pub(crate) struct DeepseekV4Config {
     /// SiLU-gate multiply.
     pub swiglu_limit: f32,
     /// `sliding_window` (real: 128) - local attention window of every `sliding_attention` layer, applied via
-    /// [`gemma4_local_window_floor`] on decode.
+    /// [`sliding_window_floor`] on decode.
     pub sliding_window: usize,
     /// `rms_norm_eps` (real: 1e-6) - shared by every weighted and unweighted RMSNorm (`q_b_norm` and mHC's
     /// `input_norm` are the unweighted ones).

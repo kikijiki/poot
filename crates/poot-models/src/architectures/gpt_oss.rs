@@ -1,1273 +1,1071 @@
-//! gpt-oss tracer (card 135d, `specs/263-gptoss-tracer/spec.md`) for `openai/gpt-oss-20b` and
-//! `openai/gpt-oss-120b`. Checked against the published `config.json`, `transformers`'
-//! `modeling_gpt_oss.py`, and the tensor names/shapes of the BF16 `tiny-random/gpt-oss` checkpoint.
-//!
-//! Differences from Mixtral/OlmoE:
-//!
-//! 1. **Attention sinks.** `GptOssAttention` has a per-query-head learned scalar `self.sinks`. Real
-//!    `eager_attention_forward`:
-//!    ```text
-//!    combined_logits = torch.cat([attn_weights, sinks_broadcast], dim=-1)
-//!    combined_logits -= combined_logits.max(dim=-1, keepdim=True).values
-//!    probs = softmax(combined_logits, dim=-1)
-//!    scores = probs[..., :-1]   # the sink's own probability mass is discarded
-//!    ```
-//!    The row max and softmax denominator include the sink logit, but the sink adds nothing to the V sum.
-//!    poot's IR has no concat op; folding the sink value into the max/sum over the real columns is
-//!    equivalent ([`poot_graph_ir::ops::attention_prefill_with_sink`],
-//!    [`poot_graph_ir::ops::attention_masked_with_sink`]).
-//! 2. **Alternating sliding-window / full attention layers.** The config's `layer_types` is an explicit
-//!    per-layer array (strictly alternating on the real 20b/120b, 24 layers, and the 2-layer tiny fixture, but
-//!    read from the array); `sliding_window: 128`. Prefill binds two mask step inputs (`mask.prefill` full,
-//!    `mask.prefill.local` windowed) and picks per layer. Decode reuses
-//!    [`crate::gemma4::gemma4_local_window_floor`] (an in-graph `-1e9 * max(0, (pos-w+1)-t)` floor added onto
-//!    the single shared `Slot::Mask`) with a `Vec<bool>` schedule filled from `layer_types`.
-//! 3. **YaRN RoPE scaling** (`rope_type: "yarn", factor: 32.0, beta_fast: 32.0, beta_slow: 1.0,
-//!    original_max_position_embeddings: 4096`, `rope_theta: 150000`). This is host-side rope-table
-//!    computation (`poot_llm::gguf::rope_tables`, shared by every arch's safetensors loader via
-//!    `hf.rope_scaling`), not a graph concern: `rope`/`rope_prefill` read whatever `cos`/`sin` the loader filled.
-//!
-//! **Router.** Real `GptOssTopKRouter.forward`:
-//! ```text
-//! router_logits = F.linear(hidden_states, self.weight, self.bias)   # with a router bias
-//! router_top_value, router_indices = torch.topk(router_logits, top_k, dim=-1)   # topk on raw logits first
-//! router_scores = softmax(router_top_value, dim=1)                  # softmax over the k selected values
-//! ```
-//! Top-k on raw logits picks the same experts as top-k on softmax probabilities, and softmax over the k
-//! selected raw logits is exactly what [`poot_graph_ir::ops::top_k_gate`] computes (the derivation
-//! `crate::mixtral` gives). So the router is [`linear`] with a bias feeding the shared `top_k_gate`; unlike
-//! OlmoE (`norm_topk_prob: false`) no new composition is needed.
-//!
-//! **Expert MLP** is a clamped swish-GLU, not SwiGLU (`GptOssExperts._apply_gate`, `self.alpha = 1.702`,
-//! `self.limit = config.swiglu_limit = 7.0`):
-//! ```text
-//! gate, up = gate_up[..., ::2], gate_up[..., 1::2]     # interleaved (even/odd), not first-half/second-half
-//! gate = gate.clamp(max=limit)                          # one-sided clamp
-//! up = up.clamp(min=-limit, max=limit)                  # two-sided clamp
-//! glu = gate * sigmoid(gate * alpha)
-//! gated_output = (up + 1) * glu                          # "+1", not plain up * glu
-//! ```
-//! Both expert projections have biases (`gate_up_proj_bias [E,2I]`, `down_proj_bias [E,H]`). [`gptoss_ffn`]
-//! composes this from the primitives `moe_dense` uses (`matmul`/`broadcast`/`binary`/`reduce`/[`sigmoid`])
-//! plus `Neg`+`Max` for clamp (`min(a,b) = -max(-a,-b)`); no new graph-IR primitive is added.
-//!
-//! **Config** (`openai/gpt-oss-20b`): `hidden_size: 2880`, `intermediate_size: 2880` (per-expert width; every
-//! layer routes), `num_hidden_layers: 24`, `num_attention_heads: 64`, `num_key_value_heads: 8`,
-//! `head_dim: 64` (explicit, not `hidden_size / num_attention_heads = 45`), `num_local_experts: 32`,
-//! `num_experts_per_tok: 4` (also given redundantly as `experts_per_token`), `attention_bias: true` (q/k/v/o),
-//! `rms_norm_eps: 1e-5`, `swiglu_limit: 7.0`, `sliding_window: 128`, `tie_word_embeddings: false` (the tiny
-//! fixture sets `true`). `router_aux_loss_coef` is training-only and not implemented.
-//!
-//! **Loader layout.** Experts ship already fused per layer into one 3D tensor in poot's `[in,out]` convention:
-//! `model.layers.{li}.mlp.experts.gate_up_proj` is `[E, hidden, 2*inter]` and `...down_proj` is
-//! `[E, inter, hidden]`. Neither name ends in `.weight`, so `build_weights`' `proj.weight` transpose rule leaves
-//! them alone. Only `mlp.router.weight` needs the per-layer transpose every arch's router gets.
-//!
-//! **Limit.** The real 20b/120b checkpoints ship expert weights MXFP4-quantized
-//! (`quantization_config: {quant_method: "mxfp4", modules_to_not_convert: [attn, router, embed, lm_head]}`).
-//! This module is verified against the un-quantized `tiny-random/gpt-oss`; a real checkpoint needs an MXFP4
-//! dequantizer (see the spec's "Out of scope").
-//!
-//! Rides on [`crate::qwen2::Qwen2Config`] for the shared attention/RoPE/norm dims (like `crate::mixtral`/
-//! `crate::olmoe`) plus [`GptOssParams`] for the MoE shape, sliding-window size, and `layer_types` schedule.
+//! gpt-oss behind [`Model`]: attention with per-head sink logits and biased projections,
+//! alternating sliding-window and full layers, and a routed block of biased clamped-GLU experts. The
+//! body is `standard_stack` over `standard_layer` with the shared attention and `components::moe`.
 
-use poot_graph_ir::ops::{
-    attention_masked_with_sink, attention_prefill_with_sink, linear, rmsnorm, rope, rope_prefill,
-    sigmoid, top_k_gate,
+use std::collections::BTreeSet;
+use std::num::NonZeroUsize;
+
+use poot_graph_ir::{Builder, Graph, ValidationOutputs};
+use poot_quant::weights::{ExpertProj, WeightMap, WeightStore};
+
+use crate::chat::ChatFormat;
+use crate::components::attention::{AttentionParams, AttentionWeights, attention};
+use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
+use crate::components::ffn::Glu;
+use crate::components::linear::WeightError;
+use crate::components::moe::{self, GateUpForm, MoeParams, MoeWeights, Orientation};
+use crate::components::router::{RouterBias, RouterKind};
+use crate::components::standard::{
+    BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
+    standard_layer, standard_stack,
 };
-use poot_graph_ir::{
-    BinOp, Builder, Graph, RedOp, Scalar, Slot, StateRole, TensorType, Traced, UnOp,
+use crate::model::{
+    ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, StepShape,
+    TraceError,
 };
-use poot_tensor::DType;
+use crate::names::gguf::{GGUF_BASE, GGUF_SINK_ATTENTION};
+use crate::names::{
+    ExpertNames, HF_BASE, HF_SINK_ATTENTION, MoeLayers, MoeNames, family_weights_routed,
+};
+use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
 
-use crate::gemma4::gemma4_local_window_floor;
-use crate::qwen2::Qwen2Config;
+pub const FAMILY: FamilyKey = FamilyKey::new("gpt_oss");
 
-/// `GptOssExperts._apply_gate`'s hardcoded sigmoid-gate rescale (`self.alpha = 1.702`); not a config field.
-pub const GPTOSS_SWIGLU_ALPHA: f32 = 1.702;
+pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
+    family: FAMILY,
+    keys: &[
+        (ConfigSource::HfModelType, "gpt_oss"),
+        (ConfigSource::GgufArchitecture, "gpt-oss"),
+    ],
+    build,
+    fixture,
+    variants: &[],
+};
 
-/// gpt-oss's MoE shape and sliding-window schedule, alongside a [`Qwen2Config`] (shared attention/RoPE/norm
-/// dims). Unlike Mixtral/OlmoE there is no `norm_topk_prob` flag (the router always matches [`top_k_gate`]),
-/// but there is a per-layer sliding-window schedule.
+/// gpt-oss's config facts: `GptOssConfig`'s defaults (the class declares no `eos_token_id`: a
+/// checkpoint names it) and the `rope_theta` both formats carry.
+const SPEC: DenseSpec = DenseSpec {
+    family: FAMILY,
+    gguf: dense_keys!("gpt-oss"),
+    hf_theta: 150_000.0,
+    gguf_theta: 150_000.0,
+    eps: 1e-5,
+    eos: None,
+};
+
+const EXPERTS: Field = Field::new("num_local_experts", "gpt-oss.expert_count");
+const TOP_K: Field = Field::new("num_experts_per_tok", "gpt-oss.expert_used_count");
+const WINDOW: Field = Field::new("sliding_window", "gpt-oss.attention.sliding_window");
+
+/// `GptOssExperts._apply_gate`'s hardcoded sigmoid-gate rescale; not a config field.
+const GLU_ALPHA: f32 = 1.702;
+/// `swiglu_limit`'s class default; llama.cpp hardcodes the same value, so a GGUF has no key.
+const DEFAULT_GLU_LIMIT: f32 = 7.0;
+/// `sliding_window`'s class default.
+const DEFAULT_WINDOW: usize = 128;
+
+const HF_MOE: MoeNames = MoeNames {
+    prefix: "model.layers.",
+    router: ".mlp.router",
+    router_bias: Some(".mlp.router.bias"),
+    shared: None,
+    experts: &[
+        ExpertNames {
+            proj: ExpertProj::GateUp,
+            stack: Some(".mlp.experts.gate_up_proj"),
+            each: None,
+            bias: Some(".mlp.experts.gate_up_proj_bias"),
+        },
+        ExpertNames {
+            proj: ExpertProj::Down,
+            stack: Some(".mlp.experts.down_proj"),
+            each: None,
+            bias: Some(".mlp.experts.down_proj_bias"),
+        },
+    ],
+};
+
+const GGUF_MOE: MoeNames = MoeNames {
+    prefix: "blk.",
+    router: ".ffn_gate_inp",
+    router_bias: Some(".ffn_gate_inp.bias"),
+    shared: None,
+    experts: &[
+        ExpertNames {
+            proj: ExpertProj::Gate,
+            stack: Some(".ffn_gate_exps.weight"),
+            each: None,
+            bias: Some(".ffn_gate_exps.bias"),
+        },
+        ExpertNames {
+            proj: ExpertProj::Up,
+            stack: Some(".ffn_up_exps.weight"),
+            each: None,
+            bias: Some(".ffn_up_exps.bias"),
+        },
+        ExpertNames {
+            proj: ExpertProj::Down,
+            stack: Some(".ffn_down_exps.weight"),
+            each: None,
+            bias: Some(".ffn_down_exps.bias"),
+        },
+    ],
+};
+
+/// gpt-oss's typed config: every value checked once, here, so tracing cannot fail on it.
 #[derive(Clone, Debug, PartialEq)]
-pub struct GptOssParams {
-    /// Total experts per layer (`num_local_experts`; `32` on the real models and the tiny fixture).
-    pub n_experts: usize,
-    /// Experts selected per token (`num_experts_per_tok`; `4`).
-    pub top_k: usize,
-    /// Per-expert FFN intermediate size (`intermediate_size`; `2880` real / `64` tiny fixture). There is no
-    /// separate dense-MLP width.
-    pub inter: usize,
-    /// Clamp bound of the clamped-GLU activation (`swiglu_limit`; `7.0`).
-    pub swiglu_limit: f32,
-    /// Window size for layers where `layer_is_sliding[li]` is true (`sliding_window`; `128`).
-    pub sliding_window: usize,
-    /// Per-layer window schedule, length `cfg.layers`, from the config `layer_types` array
-    /// (`"sliding_attention"` -> `true`, `"full_attention"` -> `false`). Not assumed to alternate.
-    pub layer_is_sliding: Vec<bool>,
+pub struct GptOssConfig {
+    vocab: usize,
+    width: usize,
+    layers: usize,
+    max_positions: usize,
+    /// Full attention and the sliding-window attention: the same parameters but the window.
+    full: AttentionParams,
+    sliding: AttentionParams,
+    /// Per layer: sliding window (`true`) or full attention.
+    layer_is_sliding: Vec<bool>,
+    layer: LayerParams,
+    stack: StackParams,
+    moe: MoeParams,
+    head_required: bool,
+    eos: BTreeSet<u32>,
+    bos: Option<u32>,
 }
 
-/// Trace a full-sequence gpt-oss prefill forward (the CPU-oracle path): embeddings, `cfg.layers` pre-norm blocks
-/// (biased Q/K/V, RoPE, causal-or-windowed GQA attention with per-head sink logits, biased `o_proj`, clamped-GLU
-/// MoE MLP, residuals), final `model.norm`, `lm_head.weight`.
-///
-/// Named constants bound at eval time: `model.embed_tokens.weight` `[vocab,hidden]`,
-/// `rope.cos`/`rope.sin` `[max_pos,head_dim]`, per-layer `model.layers.{li}.
-/// {input_layernorm,post_attention_layernorm}.weight`, `self_attn.{q,k,v,o}_proj.{weight,bias}`,
-/// `self_attn.sinks` `[n_heads]`, `mlp.router.{weight,bias}` `[hidden,n_experts]`/`[n_experts]`,
-/// `mlp.experts.gate_up_proj` `[n_experts,hidden,2*inter]` (already `[in,out]`, not `.weight`-suffixed),
-/// `mlp.experts.gate_up_proj_bias` `[n_experts,2*inter]`,
-/// `mlp.experts.down_proj` `[n_experts,inter,hidden]`, `mlp.experts.down_proj_bias` `[n_experts,hidden]`,
-/// `model.norm.weight`, and `lm_head.weight`; plus the `mask.prefill`/`mask.prefill.local` step inputs
-/// (card 550a) `[1,1,l,l]` (full / windowed by `mp.sliding_window`, selected per layer by
-/// `mp.layer_is_sliding`).
-pub fn trace_gptoss_prefill(cfg: Qwen2Config, mp: GptOssParams, seq_len: usize) -> Graph {
-    let b = Builder::new();
-    let (h, d, hq, hkv) = (cfg.hidden, cfg.head_dim, cfg.n_heads, cfg.n_kv_heads);
-    let n_rep = hq / hkv;
-    let q_dim = hq * d;
-    let kv_dim = hkv * d;
-    let scale = 1.0 / (d as f32).sqrt();
-    let l = seq_len;
+impl GptOssConfig {
+    pub fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
+        let fields = Fields::new(raw, FAMILY);
+        let dims = DenseDims::read(&fields, &SPEC)?;
+        // Every gpt-oss projection has a bias; a config that says otherwise describes another model.
+        if !fields.flag(Field::hf("attention_bias"), true)? {
+            return Err(fields.error("attention_bias", ConfigReason::Unsupported));
+        }
+        let param = |e: crate::components::standard::ParamError| e.for_family(FAMILY);
+        let norm = dims.norm(&fields, &SPEC)?;
+        let full = dims
+            .attention(&fields, &SPEC, true)?
+            .with_out_bias()
+            .with_sinks()
+            .map_err(param)?;
+        let window = match fields.opt_u64(WINDOW)? {
+            None => DEFAULT_WINDOW,
+            Some(n) => usize::try_from(n)
+                .map_err(|_| fields.error(fields.key(WINDOW), ConfigReason::WrongType))?,
+        };
+        let sliding = full.with_window(window).map_err(param)?;
+        let limit = fields.float(Field::hf("swiglu_limit"), DEFAULT_GLU_LIMIT)?;
+        let moe = MoeParams::new(
+            FAMILY,
+            dims.width,
+            dims.inter,
+            fields.count(EXPERTS, None)?,
+            fields.count(TOP_K, None)?,
+            RouterKind::TopKSoftmax,
+        )?
+        .with_glu(Glu::clamped(GLU_ALPHA, limit).map_err(param)?)
+        .with_router_bias(RouterBias::AddedToLogits)
+        .map_err(param)?
+        .with_expert_bias();
+        // The HF default alternates, sliding first; a GGUF has no key and llama.cpp's
+        // `swa_period` of 2 makes the same choice.
+        let layer_is_sliding = layer_schedule(&fields, dims.layers)?;
+        let moe = match raw {
+            RawConfig::HfJson { .. } => moe
+                .with_orientation(Orientation::InOut)
+                .with_gate_up(GateUpForm::FusedInterleaved),
+            RawConfig::Gguf(_) => moe,
+        };
+        Ok(Self {
+            full,
+            sliding,
+            layer_is_sliding,
+            layer: LayerParams::new(norm),
+            stack: StackParams::new(norm),
+            vocab: dims.vocab,
+            width: dims.width,
+            layers: dims.layers,
+            max_positions: dims.max_positions,
+            moe,
+            head_required: dims.head_required,
+            eos: dims.eos,
+            bos: dims.bos,
+        })
+    }
+}
 
-    let tokens = b.slot(Slot::Token, TensorType::new(vec![l], DType::I32));
-    let cos = b.constant(
-        "rope.cos",
-        TensorType::f32(vec![cfg.max_pos, cfg.rotary_dim]),
-    );
-    let sin = b.constant(
-        "rope.sin",
-        TensorType::f32(vec![cfg.max_pos, cfg.rotary_dim]),
-    );
-    let mask_full = b.slot_named(Slot::Mask, "prefill", TensorType::f32(vec![1, 1, l, l]));
-    let mask_local = b.slot_named(
-        Slot::Mask,
-        "prefill.local",
-        TensorType::f32(vec![1, 1, l, l]),
-    );
+/// Which layers slide: HF's `layer_types` (`sliding_attention` / `full_attention`), else every
+/// even layer.
+fn layer_schedule(fields: &Fields<'_>, layers: usize) -> Result<Vec<bool>, ModelError> {
+    let RawConfig::HfJson { config, .. } = fields.raw() else {
+        return Ok((0..layers).map(|l| l % 2 == 0).collect());
+    };
+    let key = "layer_types";
+    let wrong = || fields.error(key, ConfigReason::WrongType);
+    let types = match config.get(key) {
+        None | Some(serde_json::Value::Null) => {
+            return Ok((0..layers).map(|l| l % 2 == 0).collect());
+        }
+        Some(types) => types.as_array().ok_or_else(wrong)?,
+    };
+    if types.len() != layers {
+        return Err(fields.error(key, ConfigReason::WrongType));
+    }
+    types
+        .iter()
+        .map(|t| match t.as_str() {
+            Some("sliding_attention") => Ok(true),
+            Some("full_attention") => Ok(false),
+            Some(_) => Err(fields.error(key, ConfigReason::Unsupported)),
+            None => Err(wrong()),
+        })
+        .collect()
+}
 
-    let embed = b.constant(
-        "model.embed_tokens.weight",
-        TensorType::f32(vec![cfg.vocab, h]),
-    );
-    let emb = b.gather(embed, 0, tokens); // [L, hidden]
-    let mut x = b.reshape(emb, vec![1, l, h]);
+#[derive(Debug)]
+struct Layer {
+    norms: LayerNorms,
+    attn: AttentionWeights,
+    moe: MoeWeights,
+}
 
-    for li in 0..cfg.layers {
-        let p = |s: &str| format!("model.layers.{li}.{s}");
-        let is_local = mp.layer_is_sliding[li];
+#[derive(Debug)]
+pub struct GptOss {
+    params: GptOssConfig,
+    weights: WeightMap,
+    stack: StackWeights,
+    layers: Vec<Layer>,
+    config: ModelConfig,
+}
 
-        let ln1 = b.constant(&p("input_layernorm.weight"), TensorType::f32(vec![h]));
-        let normed = rmsnorm(&b, x, ln1, cfg.eps);
+fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+    let p = GptOssConfig::from_raw(raw)?;
+    let (tables, names): ([&[_]; 2], &MoeNames) = match raw.source() {
+        ConfigSource::HfModelType => ([HF_BASE, HF_SINK_ATTENTION], &HF_MOE),
+        ConfigSource::GgufArchitecture => ([GGUF_BASE, GGUF_SINK_ATTENTION], &GGUF_MOE),
+    };
+    let sparse = vec![true; p.layers];
+    let weights = family_weights_routed(
+        FAMILY,
+        store,
+        &tables,
+        p.layers,
+        p.head_required,
+        MoeLayers {
+            names,
+            sparse: &sparse,
+            experts: p.moe.experts(),
+        },
+    )?;
+    let weight_error = |e: WeightError| e.for_family(FAMILY);
+    let stack = StackWeights::new(&weights, p.vocab, p.width).map_err(weight_error)?;
+    let layers = (0..p.layers)
+        .map(|l| {
+            Ok(Layer {
+                norms: LayerNorms::new(&weights, l, p.width)?,
+                attn: AttentionWeights::new(&weights, l, p.width, &p.full)?,
+                moe: MoeWeights::new(&weights, l, &p.moe)?,
+            })
+        })
+        .collect::<Result<Vec<_>, WeightError>>()
+        .map_err(weight_error)?;
+    let config = ModelConfig {
+        family: FAMILY,
+        vocab: p.vocab,
+        max_positions: p.max_positions,
+        eos: p.eos.clone(),
+        bos: p.bos,
+        prompt_bos: None,
+        output: ModelOutput::Logits { vocab: p.vocab },
+        prefill_granule: NonZeroUsize::MIN,
+        chat: ChatFormat::ChatML,
+    };
+    Ok(Box::new(GptOss {
+        params: p,
+        weights,
+        stack,
+        layers,
+        config,
+    }))
+}
 
-        let wq = b.constant(
-            &p("self_attn.q_proj.weight"),
-            TensorType::f32(vec![h, q_dim]),
-        );
-        let bq = b.constant(&p("self_attn.q_proj.bias"), TensorType::f32(vec![q_dim]));
-        let wk = b.constant(
-            &p("self_attn.k_proj.weight"),
-            TensorType::f32(vec![h, kv_dim]),
-        );
-        let bk = b.constant(&p("self_attn.k_proj.bias"), TensorType::f32(vec![kv_dim]));
-        let wv = b.constant(
-            &p("self_attn.v_proj.weight"),
-            TensorType::f32(vec![h, kv_dim]),
-        );
-        let bv = b.constant(&p("self_attn.v_proj.bias"), TensorType::f32(vec![kv_dim]));
-        let wo = b.constant(
-            &p("self_attn.o_proj.weight"),
-            TensorType::f32(vec![q_dim, h]),
-        );
-        let bo = b.constant(&p("self_attn.o_proj.bias"), TensorType::f32(vec![h]));
-
-        let q = linear(&b, normed, wq, Some(bq));
-        let k = linear(&b, normed, wk, Some(bk));
-        let v = linear(&b, normed, wv, Some(bv));
-
-        let q = b.transpose(b.reshape(q, vec![1, l, hq, d]), vec![0, 2, 1, 3]);
-        let k = b.transpose(b.reshape(k, vec![1, l, hkv, d]), vec![0, 2, 1, 3]);
-        let v = b.transpose(b.reshape(v, vec![1, l, hkv, d]), vec![0, 2, 1, 3]);
-
-        let q = rope_prefill(&b, q, cos, sin, l);
-        let k = rope_prefill(&b, k, cos, sin, l);
-
-        let sinks = b.constant(&p("self_attn.sinks"), TensorType::f32(vec![hq]));
-        let mask = if is_local { mask_local } else { mask_full };
-        let attn = attention_prefill_with_sink(&b, q, k, v, n_rep, scale, mask, sinks, hq, l);
-        let attn = b.transpose(attn, vec![0, 2, 1, 3]);
-        let attn = b.reshape(attn, vec![1, l, q_dim]);
-        let attn = linear(&b, attn, wo, Some(bo));
-        x = b.binary(BinOp::Add, x, attn);
-
-        let ln2 = b.constant(
-            &p("post_attention_layernorm.weight"),
-            TensorType::f32(vec![h]),
-        );
-        let normed = rmsnorm(&b, x, ln2, cfg.eps);
-        let m = gptoss_ffn(&b, normed, h, &mp, li);
-        x = b.binary(BinOp::Add, x, m);
+impl Model for GptOss {
+    fn config(&self) -> &ModelConfig {
+        &self.config
     }
 
-    let norm = b.constant("model.norm.weight", TensorType::f32(vec![h]));
-    let x = rmsnorm(&b, x, norm, cfg.eps);
-    let last = b.slice(x, 1, l - 1, l);
-    let lm_head = b.constant("lm_head.weight", TensorType::f32(vec![h, cfg.vocab]));
-    let logits = linear(&b, last, lm_head, None);
-    b.finish(logits)
-}
-
-/// gpt-oss single-token fixed-KV masked decode, the decode analog of [`trace_gptoss_prefill`] on
-/// `crate::qwen2::trace_decode_kv_masked`'s skeleton. Reuses [`gemma4_local_window_floor`] for the window
-/// schedule: an in-graph floor added onto the single shared `Slot::Mask`.
-pub fn trace_gptoss_decode_kv_masked(cfg: Qwen2Config, mp: GptOssParams, cap: usize) -> Graph {
-    let b = Builder::new();
-    let (h, d, hq, hkv) = (cfg.hidden, cfg.head_dim, cfg.n_heads, cfg.n_kv_heads);
-    let n_rep = hq / hkv;
-    let q_dim = hq * d;
-    let kv_dim = hkv * d;
-    let scale = 1.0 / (d as f32).sqrt();
-
-    let token = b.slot(Slot::Token, TensorType::scalar(DType::I32));
-    let pos_slot = b.slot(Slot::Pos, TensorType::scalar(DType::I32));
-    let _seq_len = b.slot(Slot::SeqLen, TensorType::scalar(DType::I32));
-    let mask = b.slot(Slot::Mask, TensorType::f32(vec![cap]));
-    let mask = b.reshape(mask, vec![1, 1, 1, cap]);
-
-    // Window schedule via the same in-graph floor gemma4's decode tracer uses.
-    let iota_full = b.iota(cfg.max_pos);
-    let iota_cap = b.slice(iota_full, 0, 0, cap);
-    let pos_f = b.gather_scalar(iota_full, 0, pos_slot); // iota[pos] == pos, avoids an i32->f32 Cast
-    let local_mask =
-        gemma4_local_window_floor(&b, mask, pos_f, iota_cap, mp.sliding_window, 1, cap);
-
-    let cos = b.constant(
-        "rope.cos",
-        TensorType::f32(vec![cfg.max_pos, cfg.rotary_dim]),
-    );
-    let sin = b.constant(
-        "rope.sin",
-        TensorType::f32(vec![cfg.max_pos, cfg.rotary_dim]),
-    );
-
-    let embed = b.constant(
-        "model.embed_tokens.weight",
-        TensorType::f32(vec![cfg.vocab, h]),
-    );
-    let x0 = b.gather_scalar(embed, 0, token);
-    let mut x = b.reshape(x0, vec![1, 1, h]);
-
-    let mut state: Vec<(Traced, Traced)> = Vec::with_capacity(2 * cfg.layers);
-
-    for li in 0..cfg.layers {
-        let p = |s: &str| format!("model.layers.{li}.{s}");
-        let is_local = mp.layer_is_sliding[li];
-
-        let ln1 = b.constant(&p("input_layernorm.weight"), TensorType::f32(vec![h]));
-        let normed = rmsnorm(&b, x, ln1, cfg.eps);
-
-        let wq = b.constant(
-            &p("self_attn.q_proj.weight"),
-            TensorType::f32(vec![h, q_dim]),
-        );
-        let bq = b.constant(&p("self_attn.q_proj.bias"), TensorType::f32(vec![q_dim]));
-        let wk = b.constant(
-            &p("self_attn.k_proj.weight"),
-            TensorType::f32(vec![h, kv_dim]),
-        );
-        let bk = b.constant(&p("self_attn.k_proj.bias"), TensorType::f32(vec![kv_dim]));
-        let wv = b.constant(
-            &p("self_attn.v_proj.weight"),
-            TensorType::f32(vec![h, kv_dim]),
-        );
-        let bv = b.constant(&p("self_attn.v_proj.bias"), TensorType::f32(vec![kv_dim]));
-        let wo = b.constant(
-            &p("self_attn.o_proj.weight"),
-            TensorType::f32(vec![q_dim, h]),
-        );
-        let bo = b.constant(&p("self_attn.o_proj.bias"), TensorType::f32(vec![h]));
-
-        let q = linear(&b, normed, wq, Some(bq));
-        let k = linear(&b, normed, wk, Some(bk));
-        let v = linear(&b, normed, wv, Some(bv));
-
-        let q = b.transpose(b.reshape(q, vec![1, 1, hq, d]), vec![0, 2, 1, 3]);
-        let k = b.transpose(b.reshape(k, vec![1, 1, hkv, d]), vec![0, 2, 1, 3]);
-        let v = b.transpose(b.reshape(v, vec![1, 1, hkv, d]), vec![0, 2, 1, 3]);
-
-        let q = rope(&b, q, cos, sin, pos_slot);
-        let k = rope(&b, k, cos, sin, pos_slot);
-
-        let kcache = b.state_input(
-            &p("kv.k_cache"),
-            TensorType::f32(vec![1, hkv, cap, d]),
-            StateRole::Recurrent,
-        );
-        let vcache = b.state_input(
-            &p("kv.v_cache"),
-            TensorType::f32(vec![1, hkv, cap, d]),
-            StateRole::Recurrent,
-        );
-        let kcache_out = b.dynamic_update_slice_dyn(kcache, k, pos_slot, 2);
-        let vcache_out = b.dynamic_update_slice_dyn(vcache, v, pos_slot, 2);
-        state.push((kcache, kcache_out));
-        state.push((vcache, vcache_out));
-
-        let sinks = b.constant(&p("self_attn.sinks"), TensorType::f32(vec![hq]));
-        let m = if is_local { local_mask } else { mask };
-        let attn =
-            attention_masked_with_sink(&b, q, kcache_out, vcache_out, n_rep, scale, m, sinks, hq);
-        let attn = b.transpose(attn, vec![0, 2, 1, 3]);
-        let attn = b.reshape(attn, vec![1, 1, q_dim]);
-        let attn = linear(&b, attn, wo, Some(bo));
-        x = b.binary(BinOp::Add, x, attn);
-
-        let ln2 = b.constant(
-            &p("post_attention_layernorm.weight"),
-            TensorType::f32(vec![h]),
-        );
-        let normed = rmsnorm(&b, x, ln2, cfg.eps);
-        let mo = gptoss_ffn(&b, normed, h, &mp, li);
-        x = b.binary(BinOp::Add, x, mo);
+    fn weights(&self) -> &WeightMap {
+        &self.weights
     }
 
-    let norm = b.constant("model.norm.weight", TensorType::f32(vec![h]));
-    let x = rmsnorm(&b, x, norm, cfg.eps);
-    let lm_head = b.constant("lm_head.weight", TensorType::f32(vec![h, cfg.vocab]));
-    let logits = linear(&b, x, lm_head, None);
-    b.finish_with_state(logits, &state)
+    fn trace(
+        &self,
+        phase: Phase,
+        shape: StepShape,
+    ) -> Result<Graph<ValidationOutputs>, TraceError> {
+        let p = &self.params;
+        check_step(FAMILY, phase, shape, p.max_positions)?;
+        moe::check_step(FAMILY, shape, &p.moe)?;
+        let b = Builder::new();
+        let step = Step::new(&b, shape);
+        let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
+            let layer = &self.layers[l];
+            let attn = if p.layer_is_sliding[l] {
+                &p.sliding
+            } else {
+                &p.full
+            };
+            standard_layer(
+                b,
+                x,
+                &layer.norms,
+                &p.layer,
+                |b, h| attention(b, &step, l, h, &layer.attn, attn),
+                |b, BlockInput { block: h, .. }| moe::moe(b, &step, l, h, None, &layer.moe, &p.moe),
+            )
+        });
+        Ok(step.finish(b, logits))
+    }
 }
 
-/// One layer's MoE MLP. Every gpt-oss layer routes (no dense-layer branch). The router is [`top_k_gate`] on
-/// biased logits; the expert FFN is the clamped-GLU-with-bias composition. Dense form (every expert evaluated,
-/// non-selected zero-weighted) for prefill and decode.
-fn gptoss_ffn(b: &Builder, normed: Traced, h: usize, mp: &GptOssParams, li: usize) -> Traced {
-    let p = |s: &str| format!("model.layers.{li}.{s}");
-    let e = mp.n_experts;
-    let k = mp.top_k;
-    let inter = mp.inter;
-    let limit = mp.swiglu_limit;
+/// The fixture's config: a tiny gpt-oss of two layers (sliding then full, a window of 3 keys that
+/// a five-token prompt exceeds), 8 experts of which 2 route, biases everywhere, `head_dim` 32 and
+/// tied embeddings off. Widths are multiples of 32 so a Q8_0 copy of the expert stacks is valid.
+pub(crate) fn fixture_config() -> serde_json::Value {
+    serde_json::json!({
+        "model_type": "gpt_oss",
+        "vocab_size": 48,
+        "hidden_size": 64,
+        "intermediate_size": 64,
+        "num_local_experts": 8,
+        "num_experts_per_tok": 2,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 32,
+        "layer_types": ["sliding_attention", "full_attention"],
+        "sliding_window": 3,
+        "swiglu_limit": 7.0,
+        "attention_bias": true,
+        "rms_norm_eps": 1e-5,
+        "max_position_embeddings": 64,
+        "rope_theta": 150000.0,
+        "tie_word_embeddings": false,
+        "eos_token_id": 47,
+        "bos_token_id": 1,
+    })
+}
 
-    let router_w = b.constant(&p("mlp.router.weight"), TensorType::f32(vec![h, e]));
-    let router_b = b.constant(&p("mlp.router.bias"), TensorType::f32(vec![e]));
-    // Not `.weight`-suffixed and already [in,out]: no transpose in the loader.
-    let w_in = b.constant(
-        &p("mlp.experts.gate_up_proj"),
-        TensorType::f32(vec![e, h, 2 * inter]),
+fn fixture() -> Fixture {
+    let config = fixture_config();
+    let n = |f: &str| config[f].as_u64().unwrap() as usize;
+    let (h, d, inter, experts) = (
+        n("hidden_size"),
+        n("head_dim"),
+        n("intermediate_size"),
+        n("num_local_experts"),
     );
-    let w_in_b = b.constant(
-        &p("mlp.experts.gate_up_proj_bias"),
-        TensorType::f32(vec![e, 2 * inter]),
-    );
-    let w_out = b.constant(
-        &p("mlp.experts.down_proj"),
-        TensorType::f32(vec![e, inter, h]),
-    );
-    let w_out_b = b.constant(
-        &p("mlp.experts.down_proj_bias"),
-        TensorType::f32(vec![e, h]),
-    );
-
-    let shape = b.aval(normed).shape;
-    let l = shape[shape.len() - 2];
-    let xm = b.reshape(normed, vec![l, h]);
-
-    // route: topk-then-softmax over the selected logits equals `top_k_gate`'s selected-only normalization;
-    // the logits are biased (`Some(router_b)`).
-    let logits = linear(b, xm, router_w, Some(router_b));
-    let gate = top_k_gate(b, logits, k); // [L, E]
-
-    // Every expert's FFN, batched over the expert axis (same shape-static dense form as moe_dense).
-    let x_e = b.broadcast(b.reshape(xm, vec![1, l, h]), vec![e, l, h]); // [E,L,H]
-    let gu = b.matmul(x_e, w_in); // [E,L,2I]
-    let gu_b = b.broadcast(
-        b.reshape(w_in_b, vec![e, 1, 2 * inter]),
-        vec![e, l, 2 * inter],
-    );
-    let gu = b.binary(BinOp::Add, gu, gu_b);
-
-    // Deinterleave: `gate = gu[...,::2]`, `up = gu[...,1::2]`; reshape 2I -> [I,2] and slice index 0 vs 1.
-    let gu4 = b.reshape(gu, vec![e, l, inter, 2]);
-    let gate_h = b.reshape(b.slice(gu4, 3, 0, 1), vec![e, l, inter]);
-    let up_h = b.reshape(b.slice(gu4, 3, 1, 2), vec![e, l, inter]);
-
-    // clamp(gate, max=limit) = -max(-gate, -limit); clamp(up, -limit, limit) via two Max steps (no Min/Clamp
-    // IR op; min(a,b) = -max(-a,-b)).
-    let neg_gate = b.unary(UnOp::Neg, gate_h);
-    let neg_gate_c = b.binary_scalar(BinOp::Max, neg_gate, Scalar::F32(-limit));
-    let gate_c = b.unary(UnOp::Neg, neg_gate_c);
-    let up_lo = b.binary_scalar(BinOp::Max, up_h, Scalar::F32(-limit));
-    let neg_up_lo = b.unary(UnOp::Neg, up_lo);
-    let neg_up_c = b.binary_scalar(BinOp::Max, neg_up_lo, Scalar::F32(-limit));
-    let up_c = b.unary(UnOp::Neg, neg_up_c);
-
-    // glu = gate * sigmoid(gate * alpha) with alpha = GPTOSS_SWIGLU_ALPHA; gated = (up + 1) * glu.
-    let gate_alpha = b.binary_scalar(BinOp::Mul, gate_c, Scalar::F32(GPTOSS_SWIGLU_ALPHA));
-    let sig = sigmoid(b, gate_alpha);
-    let glu = b.binary(BinOp::Mul, gate_c, sig);
-    let up_plus1 = b.binary_scalar(BinOp::Add, up_c, Scalar::F32(1.0));
-    let gated = b.binary(BinOp::Mul, up_plus1, glu); // [E,L,I]
-
-    let out = b.matmul(gated, w_out); // [E,L,H]
-    let out_b = b.broadcast(b.reshape(w_out_b, vec![e, 1, h]), vec![e, l, h]);
-    let out = b.binary(BinOp::Add, out, out_b);
-
-    // Weight each expert's output by its gate value and sum over the expert axis (last-axis reduce only).
-    let gate_w = b.reshape(b.transpose(gate, vec![1, 0]), vec![e, l, 1]); // [E,L,1]
-    let weighted = b.binary(BinOp::Mul, out, gate_w); // [E,L,H]
-    let weighted_t = b.transpose(weighted, vec![1, 2, 0]); // [L,H,E]
-    let y = b.reduce(RedOp::Sum, weighted_t, 2, false); // [L,H]
-    b.reshape(y, vec![1, l, h])
+    let (q, kv) = (n("num_attention_heads") * d, n("num_key_value_heads") * d);
+    let mut shapes = vec![
+        (
+            "model.embed_tokens.weight".to_string(),
+            vec![n("vocab_size"), h],
+        ),
+        ("model.norm.weight".to_string(), vec![h]),
+        ("lm_head.weight".to_string(), vec![n("vocab_size"), h]),
+    ];
+    for l in 0..n("num_hidden_layers") {
+        let k = |s: &str| format!("model.layers.{l}.{s}");
+        shapes.extend([
+            (k("input_layernorm.weight"), vec![h]),
+            (k("post_attention_layernorm.weight"), vec![h]),
+            (k("self_attn.q_proj.weight"), vec![q, h]),
+            (k("self_attn.q_proj.bias"), vec![q]),
+            (k("self_attn.k_proj.weight"), vec![kv, h]),
+            (k("self_attn.k_proj.bias"), vec![kv]),
+            (k("self_attn.v_proj.weight"), vec![kv, h]),
+            (k("self_attn.v_proj.bias"), vec![kv]),
+            (k("self_attn.o_proj.weight"), vec![h, q]),
+            (k("self_attn.o_proj.bias"), vec![h]),
+            (k("self_attn.sinks"), vec![n("num_attention_heads")]),
+            (k("mlp.router.weight"), vec![experts, h]),
+            (k("mlp.router.bias"), vec![experts]),
+            (k("mlp.experts.gate_up_proj"), vec![experts, h, 2 * inter]),
+            (k("mlp.experts.gate_up_proj_bias"), vec![experts, 2 * inter]),
+            (k("mlp.experts.down_proj"), vec![experts, inter, h]),
+            (k("mlp.experts.down_proj_bias"), vec![experts, h]),
+        ]);
+    }
+    Fixture::bf16(config, shapes)
 }
 
 #[cfg(test)]
-mod tests {
+mod family_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use poot_quant::SourceRole;
+    use poot_quant::format::WeightFormat;
+    use poot_quant::weights::{HandleFormat, WeightStoreBuilder};
+    use serde_json::json;
+
     use super::*;
-    use poot_graph_ir::Storage;
+    use crate::components::standard::oracle::{assert_matches_f64, run_step};
+    use crate::components::testing::{
+        CAP, GGML_F32, GGML_Q8_0, assert_bf16_and_q8_0_trace_through_the_packed_transform,
+        assert_chunked_prefill_equals_decode, assert_missing_weight_is_named, build as built,
+        close, f32_entry, gguf_dense_kvs, read_back_owned, step_shape, values,
+    };
+    use crate::model::LogitRows;
+    use crate::registry::Registry;
+    use poot_load::gguf::{GgufIndex, GgufValue};
 
-    fn tiny_cfg() -> Qwen2Config {
-        // Small but non-degenerate dims: GQA, and head_dim decoupled from hidden/n_heads (4 * 6 = 24 != hidden 16,
-        // as in the real config). The bias is unconditional in this module, not gated by cfg.qkv_bias.
-        Qwen2Config {
-            vocab: 24,
-            hidden: 16,
-            inter: 16, // unused directly by gpt-oss (MoE inter comes from GptOssParams), kept non-zero
-            layers: 3,
-            n_heads: 4,
-            n_kv_heads: 2,
-            head_dim: 6,
-            rotary_dim: 6,
-            eps: 1e-5,
-            max_pos: 32,
-            qkv_bias: false,
-            qk_norm: false,
-            ..Default::default()
-        }
+    fn model_of(config: &serde_json::Value, store: &WeightStore) -> Box<dyn Model> {
+        let raw = RawConfig::HfJson {
+            config,
+            generation: None,
+        };
+        built(&ENTRY, &raw, store)
     }
 
-    /// `sliding_window` is smaller than the 5-7 token test sequences so the CPU-oracle tests exercise windowing.
-    fn tiny_mp(layer_is_sliding: Vec<bool>) -> GptOssParams {
-        GptOssParams {
-            n_experts: 6,
-            top_k: 2,
-            inter: 12,
-            swiglu_limit: 2.5, // deliberately small (vs the real 7.0) so the CPU-oracle test clamp fires
-            sliding_window: 2,
-            layer_is_sliding,
-        }
+    const PROMPT: [i32; 5] = [3, 17, 40, 8, 25];
+
+    /// Logits at every position of the whole prompt prefilled in one step.
+    fn prefill_logits(model: &dyn Model, store: &WeightStore) -> Vec<f32> {
+        run_step(model, store, Phase::Prefill, CAP, &PROMPT, 0, &[]).0
     }
 
-    #[test]
-    fn gptoss_prefill_validates_bias_everywhere_sinks_and_alternating_window() {
-        let cfg = tiny_cfg();
-        let mp = tiny_mp(vec![true, false, true]);
-        let g = trace_gptoss_prefill(cfg, mp, 5);
-        g.validate().expect("gpt-oss prefill graph should validate");
-        assert_eq!(g.aval(g.output).shape, vec![1, 1, cfg.vocab]);
-
-        // FR: bias constants ARE present on every q/k/v/o projection (unlike Mixtral/OlmoE).
-        for suf in ["q_proj.bias", "k_proj.bias", "v_proj.bias", "o_proj.bias"] {
-            let count = g
-                .inputs
-                .iter()
-                .filter(|id| {
-                    matches!(g.values[**id].storage, Storage::Const)
-                        && g.values[**id]
-                            .name
-                            .as_deref()
-                            .is_some_and(|n| n.ends_with(suf))
-                })
-                .count();
-            assert_eq!(count, cfg.layers, "{suf} must exist on every layer");
-        }
-        // sinks: one [n_heads] constant per layer.
-        let sinks_count = g
-            .inputs
-            .iter()
-            .filter(|id| {
-                matches!(g.values[**id].storage, Storage::Const)
-                    && g.values[**id]
-                        .name
-                        .as_deref()
-                        .is_some_and(|n| n.ends_with("self_attn.sinks"))
+    /// `x[k] . w[k, cols]` in f64, plus `bias`.
+    fn matmul(x: &[f64], w: &[f64], k: usize, cols: usize, bias: Option<&[f64]>) -> Vec<f64> {
+        (0..cols)
+            .map(|o| {
+                bias.map_or(0.0, |b| b[o]) + (0..k).map(|i| x[i] * w[i * cols + o]).sum::<f64>()
             })
-            .count();
-        assert_eq!(sinks_count, cfg.layers);
-        let sink_id = g
-            .inputs
-            .iter()
-            .find(|id| {
-                g.values[**id]
-                    .name
-                    .as_deref()
-                    .is_some_and(|n| n.ends_with("self_attn.sinks"))
-            })
-            .unwrap();
-        assert_eq!(g.values[*sink_id].aval.shape, vec![cfg.n_heads]);
-        // both mask step inputs present (alternating schedule needs both).
-        assert!(g.inputs.iter().any(|id| {
-            g.values[*id]
-                .name
-                .as_deref()
-                .is_some_and(|n| n == "mask.prefill")
-        }));
-        assert!(g.inputs.iter().any(|id| {
-            g.values[*id]
-                .name
-                .as_deref()
-                .is_some_and(|n| n == "mask.prefill.local")
-        }));
-        // every layer declares a router constant (MoE unconditional, no dense-layer branch).
-        let router_count = g
-            .inputs
-            .iter()
-            .filter(|id| {
-                matches!(g.values[**id].storage, Storage::Const)
-                    && g.values[**id]
-                        .name
-                        .as_deref()
-                        .is_some_and(|n| n.ends_with("mlp.router.weight"))
-            })
-            .count();
-        assert_eq!(router_count, cfg.layers, "one router per layer, no skips");
+            .collect()
     }
 
-    #[test]
-    fn gptoss_decode_kv_masked_validates_state_and_mask_shapes() {
-        let cfg = tiny_cfg();
-        let mp = tiny_mp(vec![true, false, true]);
-        let cap = 16;
-        let g = trace_gptoss_decode_kv_masked(cfg, mp, cap);
-        g.validate().expect("gpt-oss decode graph should validate");
-        assert_eq!(g.aval(g.output).shape, vec![1, 1, cfg.vocab]);
-        assert_eq!(g.state.len(), 2 * cfg.layers);
-        for (si, _so) in &g.state {
-            assert_eq!(
-                g.aval(*si).shape,
-                vec![1, cfg.n_kv_heads, cap, cfg.head_dim]
-            );
-            assert_eq!(g.values[*si].storage, Storage::State);
+    fn rmsnorm(x: &[f64], w: &[f64], eps: f64) -> Vec<f64> {
+        let ms = x.iter().map(|v| v * v).sum::<f64>() / x.len() as f64;
+        x.iter()
+            .zip(w)
+            .map(|(v, w)| v / (ms + eps).sqrt() * w)
+            .collect()
+    }
+
+    /// Plain half-split RoPE of one head at `pos`.
+    fn rope(head: &[f64], pos: usize, theta: f64) -> Vec<f64> {
+        let d = head.len();
+        let mut out = vec![0.0; d];
+        for i in 0..d / 2 {
+            let angle = pos as f64 * theta.powf(-((2 * i) as f64) / d as f64);
+            let (s, c) = angle.sin_cos();
+            out[i] = head[i] * c - head[i + d / 2] * s;
+            out[i + d / 2] = head[i + d / 2] * c + head[i] * s;
         }
-        let mask_id = g
-            .inputs
-            .iter()
-            .find(|id| matches!(g.values[**id].storage, Storage::Slot(Slot::Mask)))
-            .expect("Slot::Mask present");
-        assert_eq!(g.values[*mask_id].aval.shape, vec![cap]);
-        // the in-graph windowing floor's range dependency is an `Iota` equation (card 550a), not a
-        // bound constant.
-        assert!(
-            g.eqns
-                .iter()
-                .any(|eqn| matches!(eqn.op, poot_graph_ir::OpKind::Iota { .. })),
-            "decode graph must compute its causal range in-graph"
+        out
+    }
+
+    /// An independent f64 forward pass of the fixture family over `tokens`: direct loops over a
+    /// transposed copy of every projection, and over the selected experts only. Returns the
+    /// logits of every position.
+    fn reference(config: &serde_json::Value, store: &WeightStore, tokens: &[usize]) -> Vec<f64> {
+        let n = |f: &str| config[f].as_u64().unwrap() as usize;
+        let (h, d, hq, hkv) = (
+            n("hidden_size"),
+            n("head_dim"),
+            n("num_attention_heads"),
+            n("num_key_value_heads"),
         );
-        assert!(
-            g.inputs
-                .iter()
-                .all(|id| g.values[*id].name.as_deref() != Some("causal.iota")),
-            "causal.iota must be an in-graph iota, not a bound const"
+        let (experts, top_k, inter, vocab) = (
+            n("num_local_experts"),
+            n("num_experts_per_tok"),
+            n("intermediate_size"),
+            n("vocab_size"),
         );
-    }
-
-    // ---- CPU-oracle numerics: checked against an independent from-scratch Rust reference forward pass. ----
-
-    mod cpu_oracle {
-        use super::*;
-        use std::collections::HashMap;
-
-        use poot_test_util::fill;
-
-        use poot_test_util::seed_of;
-
-        fn weight(name: &str, n: usize, ln_gamma: bool) -> Vec<f32> {
-            let raw = fill(n, seed_of(name));
-            if ln_gamma {
-                raw.iter().map(|v| 1.0 + v * 0.05).collect()
-            } else {
-                raw.iter().map(|v| v * 0.1).collect()
-            }
-        }
-
-        /// Sink logits get a real-magnitude fill; near-zero sinks would be inert.
-        fn sink_weight(name: &str, n: usize) -> Vec<f32> {
-            fill(n, seed_of(name))
-        }
-
-        fn rope_tables(max_pos: usize, d: usize, theta: f32) -> (Vec<f32>, Vec<f32>) {
-            let mut cos = vec![0.0f32; max_pos * d];
-            let mut sin = vec![0.0f32; max_pos * d];
-            for pos in 0..max_pos {
-                for i in 0..d / 2 {
-                    let freq = 1.0 / theta.powf(2.0 * i as f32 / d as f32);
-                    let ang = pos as f32 * freq;
-                    let (s, c) = ang.sin_cos();
-                    cos[pos * d + i] = c;
-                    cos[pos * d + i + d / 2] = c;
-                    sin[pos * d + i] = s;
-                    sin[pos * d + i + d / 2] = s;
-                }
-            }
-            (cos, sin)
-        }
-
-        /// All named constants [`trace_gptoss_prefill`] declares, keyed by exact graph const name.
-        fn all_weights(cfg: &Qwen2Config, mp: &GptOssParams) -> HashMap<String, Vec<f32>> {
-            let (h, d, hq, hkv) = (cfg.hidden, cfg.head_dim, cfg.n_heads, cfg.n_kv_heads);
-            let (q_dim, kv_dim) = (hq * d, hkv * d);
-            let mut w = HashMap::new();
-            w.insert(
-                "model.embed_tokens.weight".to_string(),
-                weight("embed", cfg.vocab * h, false),
-            );
-            let (cos, sin) = rope_tables(cfg.max_pos, d, 150_000.0); // real rope_theta (plain, no YaRN)
-            w.insert("rope.cos".to_string(), cos);
-            w.insert("rope.sin".to_string(), sin);
-            for li in 0..cfg.layers {
-                let p = |s: &str| format!("model.layers.{li}.{s}");
-                w.insert(p("input_layernorm.weight"), weight(&p("ln1"), h, true));
-                w.insert(
-                    p("self_attn.q_proj.weight"),
-                    weight(&p("qw"), h * q_dim, false),
-                );
-                w.insert(p("self_attn.q_proj.bias"), weight(&p("qb"), q_dim, false));
-                w.insert(
-                    p("self_attn.k_proj.weight"),
-                    weight(&p("kw"), h * kv_dim, false),
-                );
-                w.insert(p("self_attn.k_proj.bias"), weight(&p("kb"), kv_dim, false));
-                w.insert(
-                    p("self_attn.v_proj.weight"),
-                    weight(&p("vw"), h * kv_dim, false),
-                );
-                w.insert(p("self_attn.v_proj.bias"), weight(&p("vb"), kv_dim, false));
-                w.insert(
-                    p("self_attn.o_proj.weight"),
-                    weight(&p("ow"), q_dim * h, false),
-                );
-                w.insert(p("self_attn.o_proj.bias"), weight(&p("ob"), h, false));
-                w.insert(p("self_attn.sinks"), sink_weight(&p("sinks"), hq));
-                w.insert(
-                    p("post_attention_layernorm.weight"),
-                    weight(&p("ln2"), h, true),
-                );
-                w.insert(
-                    p("mlp.router.weight"),
-                    weight(&p("router"), h * mp.n_experts, false),
-                );
-                w.insert(
-                    p("mlp.router.bias"),
-                    weight(&p("routerb"), mp.n_experts, false),
-                );
-                // gate_up_proj: [E, H, 2I], already [in,out]; gate/up interleaved (even=gate, odd=up).
-                let mut gate_up = vec![0.0f32; mp.n_experts * h * 2 * mp.inter];
-                let mut down = vec![0.0f32; mp.n_experts * mp.inter * h];
-                for e in 0..mp.n_experts {
-                    let g = weight(&p(&format!("e{e}.gate")), h * mp.inter, false);
-                    let u = weight(&p(&format!("e{e}.up")), h * mp.inter, false);
-                    let d_ = weight(&p(&format!("e{e}.down")), mp.inter * h, false);
-                    for row in 0..h {
-                        let dst = (e * h + row) * 2 * mp.inter;
-                        for i in 0..mp.inter {
-                            gate_up[dst + 2 * i] = g[row * mp.inter + i];
-                            gate_up[dst + 2 * i + 1] = u[row * mp.inter + i];
-                        }
-                    }
-                    let dst = e * mp.inter * h;
-                    down[dst..dst + mp.inter * h].copy_from_slice(&d_);
-                }
-                w.insert(p("mlp.experts.gate_up_proj"), gate_up);
-                w.insert(
-                    p("mlp.experts.gate_up_proj_bias"),
-                    weight(&p("gub"), mp.n_experts * 2 * mp.inter, false),
-                );
-                w.insert(p("mlp.experts.down_proj"), down);
-                w.insert(
-                    p("mlp.experts.down_proj_bias"),
-                    weight(&p("downb"), mp.n_experts * h, false),
-                );
-            }
-            w.insert("model.norm.weight".to_string(), weight("ln_f", h, true));
-            w.insert(
-                "lm_head.weight".to_string(),
-                weight("lm_head", h * cfg.vocab, false),
-            );
-            w
-        }
-
-        use poot_test_util::rmsnorm_ref;
-
-        fn sigmoid_ref(v: f32) -> f32 {
-            1.0 / (1.0 + (-v).exp())
-        }
-
-        fn clamp_ref(v: f32, lo: Option<f32>, hi: Option<f32>) -> f32 {
-            let mut x = v;
-            if let Some(lo) = lo {
-                x = x.max(lo);
-            }
-            if let Some(hi) = hi {
-                x = x.min(hi);
-            }
-            x
-        }
-
-        /// `y[out] = x @ w[in,out] (+ bias)`, flat row-major.
-        fn linear_ref(
-            x: &[f32],
-            w: &[f32],
-            in_dim: usize,
-            out_dim: usize,
-            bias: Option<&[f32]>,
-        ) -> Vec<f32> {
-            let mut y = vec![0.0f32; out_dim];
-            for o in 0..out_dim {
-                let mut acc = bias.map_or(0.0, |b| b[o]);
-                for i in 0..in_dim {
-                    acc += x[i] * w[i * out_dim + o];
-                }
-                y[o] = acc;
-            }
-            y
-        }
-
-        use poot_test_util::rope_ref;
-
-        /// Independent top-`top_k` router (topk on raw logits, then softmax over the selected). Weights sum to 1
-        /// over the selected experts; gpt-oss has no non-renormalized mode.
-        fn top_k_router_ref(logits: &[f32], top_k: usize) -> Vec<(usize, f32)> {
-            let mut idx: Vec<usize> = (0..logits.len()).collect();
-            idx.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
-            let sel = &idx[..top_k];
-            let m = sel.iter().map(|&i| logits[i]).fold(f32::MIN, f32::max);
-            let exp: Vec<f32> = sel.iter().map(|&i| (logits[i] - m).exp()).collect();
-            let denom: f32 = exp.iter().sum();
-            sel.iter()
-                .zip(exp.iter())
-                .map(|(&i, &e)| (i, e / denom))
+        let eps = config["rms_norm_eps"].as_f64().unwrap();
+        let theta = config["rope_theta"].as_f64().unwrap();
+        let limit = config["swiglu_limit"].as_f64().unwrap();
+        let window = n("sliding_window");
+        let w: HashMap<String, Vec<f64>> = store
+            .iter()
+            .map(|(k, e)| {
+                (
+                    k.to_string(),
+                    values(e).iter().map(|&v| f64::from(v)).collect(),
+                )
+            })
+            .collect();
+        // HF stores a linear `[out, in]`; the reference reads `[in, out]`.
+        let t = |name: &str, out: usize, inp: usize| -> Vec<f64> {
+            let m = &w[name];
+            (0..inp * out)
+                .map(|i| m[(i % out) * inp + i / out])
                 .collect()
-        }
-
-        /// Independent reference forward pass for [`trace_gptoss_prefill`] (last token only), written as direct
-        /// loops rather than a copy of `gptoss_ffn`'s decomposition.
-        fn gptoss_prefill_ref(
-            cfg: &Qwen2Config,
-            mp: &GptOssParams,
-            tokens: &[usize],
-            w: &HashMap<String, Vec<f32>>,
-        ) -> Vec<f32> {
-            let (h, d, hq, hkv, l) = (
-                cfg.hidden,
-                cfg.head_dim,
-                cfg.n_heads,
-                cfg.n_kv_heads,
-                tokens.len(),
-            );
-            let n_rep = hq / hkv;
-            let scale = 1.0 / (d as f32).sqrt();
-            let embed = &w["model.embed_tokens.weight"];
-            let cos = &w["rope.cos"];
-            let sin = &w["rope.sin"];
-
-            let mut x: Vec<Vec<f32>> = tokens
+        };
+        let layer_types = config["layer_types"].as_array().unwrap();
+        let mut x: Vec<Vec<f64>> = tokens
+            .iter()
+            .map(|&tok| w["model.embed_tokens.weight"][tok * h..(tok + 1) * h].to_vec())
+            .collect();
+        for (l, kind) in layer_types.iter().enumerate() {
+            let p = |s: &str| format!("model.layers.{l}.{s}");
+            let sliding = kind == "sliding_attention";
+            let normed: Vec<Vec<f64>> = x
                 .iter()
-                .map(|&t| embed[t * h..(t + 1) * h].to_vec())
+                .map(|row| rmsnorm(row, &w[&p("input_layernorm.weight")], eps))
                 .collect();
-
-            for li in 0..cfg.layers {
-                let p = |s: &str| format!("model.layers.{li}.{s}");
-                let is_local = mp.layer_is_sliding[li];
-                let ln1w = &w[&p("input_layernorm.weight")];
-                let normed: Vec<Vec<f32>> = x
-                    .iter()
-                    .map(|row| rmsnorm_ref(row, ln1w, h, cfg.eps))
-                    .collect();
-
-                let qw = &w[&p("self_attn.q_proj.weight")];
-                let qb = &w[&p("self_attn.q_proj.bias")];
-                let kw = &w[&p("self_attn.k_proj.weight")];
-                let kb = &w[&p("self_attn.k_proj.bias")];
-                let vw = &w[&p("self_attn.v_proj.weight")];
-                let vb = &w[&p("self_attn.v_proj.bias")];
-                let mut q: Vec<Vec<f32>> = normed
-                    .iter()
-                    .map(|row| linear_ref(row, qw, h, hq * d, Some(qb)))
-                    .collect();
-                let mut k: Vec<Vec<f32>> = normed
-                    .iter()
-                    .map(|row| linear_ref(row, kw, h, hkv * d, Some(kb)))
-                    .collect();
-                let v: Vec<Vec<f32>> = normed
-                    .iter()
-                    .map(|row| linear_ref(row, vw, h, hkv * d, Some(vb)))
-                    .collect();
-
-                for (pos, qrow) in q.iter_mut().enumerate() {
-                    for hh in 0..hq {
-                        let rotated = rope_ref(&qrow[hh * d..(hh + 1) * d], cos, sin, pos, d);
-                        qrow[hh * d..(hh + 1) * d].copy_from_slice(&rotated);
-                    }
-                }
-                for (pos, krow) in k.iter_mut().enumerate() {
-                    for hh in 0..hkv {
-                        let rotated = rope_ref(&krow[hh * d..(hh + 1) * d], cos, sin, pos, d);
-                        krow[hh * d..(hh + 1) * d].copy_from_slice(&rotated);
-                    }
-                }
-
-                let sinks = &w[&p("self_attn.sinks")];
-                let mut attn_out = vec![vec![0.0f32; hq * d]; l];
-                for qh in 0..hq {
-                    let kh = qh / n_rep;
-                    for i in 0..l {
-                        let start = if is_local {
-                            i.saturating_sub(mp.sliding_window - 1)
-                        } else {
-                            0
-                        };
-                        let mut scores = vec![0.0f32; i - start + 1];
-                        for (jj, sc) in scores.iter_mut().enumerate() {
-                            let j = start + jj;
-                            let mut s = 0.0f32;
-                            for dd in 0..d {
-                                s += q[i][qh * d + dd] * k[j][kh * d + dd];
-                            }
-                            *sc = s * scale;
-                        }
-                        let sink = sinks[qh];
-                        let m = scores.iter().cloned().fold(sink, f32::max);
-                        let mut denom = (sink - m).exp();
-                        let mut e = vec![0.0f32; scores.len()];
-                        for (jj, sc) in scores.iter().enumerate() {
-                            e[jj] = (sc - m).exp();
-                            denom += e[jj];
-                        }
-                        for dd in 0..d {
-                            let mut acc = 0.0f32;
-                            for (jj, ej) in e.iter().enumerate() {
-                                let j = start + jj;
-                                acc += (ej / denom) * v[j][kh * d + dd];
-                            }
-                            attn_out[i][qh * d + dd] = acc;
-                        }
-                    }
-                }
-
-                let ow = &w[&p("self_attn.o_proj.weight")];
-                let ob = &w[&p("self_attn.o_proj.bias")];
-                for i in 0..l {
-                    let proj = linear_ref(&attn_out[i], ow, hq * d, h, Some(ob));
-                    for c in 0..h {
-                        x[i][c] += proj[c];
-                    }
-                }
-
-                let ln2w = &w[&p("post_attention_layernorm.weight")];
-                let router_w = &w[&p("mlp.router.weight")];
-                let router_b = &w[&p("mlp.router.bias")];
-                let gate_up = &w[&p("mlp.experts.gate_up_proj")];
-                let gu_bias = &w[&p("mlp.experts.gate_up_proj_bias")];
-                let down = &w[&p("mlp.experts.down_proj")];
-                let down_bias = &w[&p("mlp.experts.down_proj_bias")];
-                for row in x.iter_mut().take(l) {
-                    let normed = rmsnorm_ref(row, ln2w, h, cfg.eps);
-                    let logits = linear_ref(&normed, router_w, h, mp.n_experts, Some(router_b));
-                    let selected = top_k_router_ref(&logits, mp.top_k);
-                    let mut moe_out = vec![0.0f32; h];
-                    for (e, gate_weight) in selected {
-                        let e_gate_up = &gate_up[e * h * 2 * mp.inter..(e + 1) * h * 2 * mp.inter];
-                        let e_gu_bias = &gu_bias[e * 2 * mp.inter..(e + 1) * 2 * mp.inter];
-                        let e_down = &down[e * mp.inter * h..(e + 1) * mp.inter * h];
-                        let e_down_bias = &down_bias[e * h..(e + 1) * h];
-
-                        // interleaved gate/up projection weights, de-interleaved into two [H,I] matrices.
-                        let mut gate_w = vec![0.0f32; h * mp.inter];
-                        let mut up_w = vec![0.0f32; h * mp.inter];
-                        for row_i in 0..h {
-                            for i in 0..mp.inter {
-                                gate_w[row_i * mp.inter + i] =
-                                    e_gate_up[row_i * 2 * mp.inter + 2 * i];
-                                up_w[row_i * mp.inter + i] =
-                                    e_gate_up[row_i * 2 * mp.inter + 2 * i + 1];
-                            }
-                        }
-                        let mut gate_b = vec![0.0f32; mp.inter];
-                        let mut up_b = vec![0.0f32; mp.inter];
-                        for i in 0..mp.inter {
-                            gate_b[i] = e_gu_bias[2 * i];
-                            up_b[i] = e_gu_bias[2 * i + 1];
-                        }
-
-                        let mut gate = linear_ref(&normed, &gate_w, h, mp.inter, Some(&gate_b));
-                        let mut up = linear_ref(&normed, &up_w, h, mp.inter, Some(&up_b));
-                        for gv in gate.iter_mut() {
-                            *gv = clamp_ref(*gv, None, Some(mp.swiglu_limit));
-                        }
-                        for uv in up.iter_mut() {
-                            *uv = clamp_ref(*uv, Some(-mp.swiglu_limit), Some(mp.swiglu_limit));
-                        }
-                        let act: Vec<f32> = gate
+            let proj = |name: &str, out: usize, inp: usize| {
+                let wt = t(&p(&format!("self_attn.{name}_proj.weight")), out, inp);
+                let bias = w[&p(&format!("self_attn.{name}_proj.bias"))].clone();
+                move |row: &[f64]| matmul(row, &wt, inp, out, Some(&bias))
+            };
+            let (qp, kp, vp) = (
+                proj("q", hq * d, h),
+                proj("k", hkv * d, h),
+                proj("v", hkv * d, h),
+            );
+            let rotate = |row: Vec<f64>, heads: usize, pos: usize| -> Vec<f64> {
+                (0..heads)
+                    .flat_map(|hh| rope(&row[hh * d..(hh + 1) * d], pos, theta))
+                    .collect()
+            };
+            let q: Vec<Vec<f64>> = normed
+                .iter()
+                .enumerate()
+                .map(|(i, r)| rotate(qp(r), hq, i))
+                .collect();
+            let k: Vec<Vec<f64>> = normed
+                .iter()
+                .enumerate()
+                .map(|(i, r)| rotate(kp(r), hkv, i))
+                .collect();
+            let v: Vec<Vec<f64>> = normed.iter().map(|r| vp(r)).collect();
+            let sinks = &w[&p("self_attn.sinks")];
+            let mut attn = vec![vec![0.0; hq * d]; tokens.len()];
+            for qh in 0..hq {
+                let kh = qh / (hq / hkv);
+                for i in 0..tokens.len() {
+                    let start = if sliding {
+                        (i + 1).saturating_sub(window)
+                    } else {
+                        0
+                    };
+                    let scores: Vec<f64> = (start..=i)
+                        .map(|j| {
+                            (0..d)
+                                .map(|e| q[i][qh * d + e] * k[j][kh * d + e])
+                                .sum::<f64>()
+                                / (d as f64).sqrt()
+                        })
+                        .collect();
+                    let m = scores.iter().copied().fold(sinks[qh], f64::max);
+                    let denom =
+                        (sinks[qh] - m).exp() + scores.iter().map(|s| (s - m).exp()).sum::<f64>();
+                    for e in 0..d {
+                        attn[i][qh * d + e] = scores
                             .iter()
-                            .zip(up.iter())
-                            .map(|(&g_, &u)| {
-                                let glu = g_ * sigmoid_ref(g_ * GPTOSS_SWIGLU_ALPHA);
-                                (u + 1.0) * glu
-                            })
-                            .collect();
-                        let expert_out = linear_ref(&act, e_down, mp.inter, h, Some(e_down_bias));
+                            .enumerate()
+                            .map(|(jj, s)| (s - m).exp() / denom * v[start + jj][kh * d + e])
+                            .sum();
+                    }
+                }
+            }
+            let o = t(&p("self_attn.o_proj.weight"), h, hq * d);
+            for i in 0..tokens.len() {
+                let y = matmul(
+                    &attn[i],
+                    &o,
+                    hq * d,
+                    h,
+                    Some(&w[&p("self_attn.o_proj.bias")]),
+                );
+                for c in 0..h {
+                    x[i][c] += y[c];
+                }
+            }
+            let router = t(&p("mlp.router.weight"), experts, h);
+            let gate_up = &w[&p("mlp.experts.gate_up_proj")];
+            let gu_bias = &w[&p("mlp.experts.gate_up_proj_bias")];
+            let down = &w[&p("mlp.experts.down_proj")];
+            let down_bias = &w[&p("mlp.experts.down_proj_bias")];
+            for row in &mut x {
+                let hn = rmsnorm(row, &w[&p("post_attention_layernorm.weight")], eps);
+                let logits = matmul(&hn, &router, h, experts, Some(&w[&p("mlp.router.bias")]));
+                let mut order: Vec<usize> = (0..experts).collect();
+                order.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]).then(a.cmp(&b)));
+                let chosen = &order[..top_k];
+                let top = logits[chosen[0]];
+                let denom: f64 = chosen.iter().map(|&e| (logits[e] - top).exp()).sum();
+                for &e in chosen {
+                    let weight = (logits[e] - top).exp() / denom;
+                    let gu = matmul(
+                        &hn,
+                        &gate_up[e * h * 2 * inter..(e + 1) * h * 2 * inter],
+                        h,
+                        2 * inter,
+                        Some(&gu_bias[e * 2 * inter..(e + 1) * 2 * inter]),
+                    );
+                    let act: Vec<f64> = (0..inter)
+                        .map(|i| {
+                            let g = gu[2 * i].min(limit);
+                            let u = gu[2 * i + 1].clamp(-limit, limit);
+                            (u + 1.0) * g / (1.0 + (-1.702 * g).exp())
+                        })
+                        .collect();
+                    let y = matmul(
+                        &act,
+                        &down[e * inter * h..(e + 1) * inter * h],
+                        inter,
+                        h,
+                        Some(&down_bias[e * h..(e + 1) * h]),
+                    );
+                    for c in 0..h {
+                        row[c] += weight * y[c];
+                    }
+                }
+            }
+        }
+        let head = t("lm_head.weight", vocab, h);
+        x.iter()
+            .flat_map(|row| {
+                matmul(
+                    &rmsnorm(row, &w["model.norm.weight"], eps),
+                    &head,
+                    h,
+                    vocab,
+                    None,
+                )
+            })
+            .collect()
+    }
+
+    /// `store` with the tensor `key` replaced by `change` of its values.
+    fn changed(store: &WeightStore, key: &str, change: impl Fn(usize, f32) -> f32) -> WeightStore {
+        let mut out = WeightStore::builder();
+        for (k, entry) in store.iter() {
+            let entry = if k.as_str() == key {
+                let v: Vec<f32> = values(entry)
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| change(i, v))
+                    .collect();
+                f32_entry(entry.shape(), &v)
+            } else {
+                entry.clone()
+            };
+            out.insert(k.clone(), entry).unwrap();
+        }
+        out.build()
+    }
+
+    /// SC-001/SC-002: the family's prefill logits at every position equal an independent f64
+    /// forward pass (biased attention with sinks, a window of 3 keys under a 5-token prompt on the
+    /// sliding layer, a biased router, interleaved clamped-GLU experts with biases). Mutation: drop
+    /// `with_sinks` from the attention parameters; red.
+    #[test]
+    fn prefill_matches_an_independent_f64_forward_pass() {
+        let fx = fixture();
+        let model = model_of(&fx.config, &fx.store);
+        let got = prefill_logits(&*model, &fx.store);
+        let tokens: Vec<usize> = PROMPT.iter().map(|&t| t as usize).collect();
+        let want = reference(&fx.config, &fx.store, &tokens);
+        assert_matches_f64(&got, &want, 1e-4);
+    }
+
+    /// Every sink, bias and router weight matters: perturbing each changes the logits.
+    #[test]
+    fn each_sink_bias_and_router_weight_changes_the_logits() {
+        let fx = fixture();
+        let base = prefill_logits(&*model_of(&fx.config, &fx.store), &fx.store);
+        for key in [
+            "model.layers.0.self_attn.sinks",
+            "model.layers.1.self_attn.sinks",
+            "model.layers.0.self_attn.o_proj.bias",
+            "model.layers.1.self_attn.q_proj.bias",
+            "model.layers.0.mlp.router.bias",
+            "model.layers.1.mlp.router.weight",
+            "model.layers.0.mlp.experts.gate_up_proj_bias",
+            "model.layers.1.mlp.experts.down_proj_bias",
+            "model.layers.0.mlp.experts.down_proj",
+        ] {
+            let store = changed(&fx.store, key, |i, v| v + 0.3 * ((i % 5) as f32 - 2.0));
+            let got = prefill_logits(&*model_of(&fx.config, &store), &store);
+            assert!(
+                got.iter().zip(&base).any(|(a, b)| (a - b).abs() > 1e-5),
+                "the logits do not depend on {key}"
+            );
+        }
+    }
+
+    /// The window and the layer schedule change the output: a window past the prompt, and the
+    /// schedule swapped, each differ from the fixture's; an absent `layer_types` is the fixture's
+    /// own alternation.
+    #[test]
+    fn the_window_and_the_layer_schedule_change_the_logits() {
+        let fx = fixture();
+        let run = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut config = fixture_config();
+            edit(&mut config);
+            prefill_logits(&*model_of(&config, &fx.store), &fx.store)
+        };
+        let base = run(&|_| {});
+        assert_ne!(run(&|c| c["sliding_window"] = json!(64)), base);
+        assert_ne!(
+            run(&|c| c["layer_types"] = json!(["full_attention", "sliding_attention"])),
+            base
+        );
+        assert_eq!(
+            run(&|c| {
+                c.as_object_mut().unwrap().remove("layer_types");
+            }),
+            base
+        );
+    }
+
+    #[test]
+    fn chunked_prefill_continuing_from_pos_equals_token_by_token_decode() {
+        let fx = fixture();
+        assert_chunked_prefill_equals_decode(&*model_of(&fx.config, &fx.store), &fx.store);
+    }
+
+    /// SC-004 (HF half): BF16 and Q8_0 attention projections trace through the one body.
+    #[test]
+    fn bf16_and_q8_0_stores_trace_through_the_one_body_and_the_packed_transform() {
+        assert_bf16_and_q8_0_trace_through_the_packed_transform(&ENTRY, &fixture(), |key| {
+            key.contains("self_attn.") && key.ends_with("_proj.weight")
+        });
+    }
+
+    /// SC-005: a store missing one required tensor fails `Registry::build` with the typed
+    /// missing-weight error naming it, before any trace. Mutation: skip the row check in
+    /// `names.rs`; red.
+    #[test]
+    fn a_missing_required_tensor_is_named_before_any_trace() {
+        let registry = Registry::builtin().unwrap();
+        let fx = fixture();
+        for removed in [
+            "model.layers.0.self_attn.sinks",
+            "model.layers.1.self_attn.o_proj.bias",
+            "model.layers.1.self_attn.k_proj.bias",
+            "model.layers.0.mlp.router.weight",
+            "model.layers.1.mlp.router.bias",
+            "model.layers.0.mlp.experts.gate_up_proj",
+            "model.layers.1.mlp.experts.gate_up_proj_bias",
+            "model.layers.0.mlp.experts.down_proj",
+            "model.layers.1.mlp.experts.down_proj_bias",
+            "model.layers.0.post_attention_layernorm.weight",
+            "lm_head.weight",
+        ] {
+            assert_missing_weight_is_named(&registry, &fx, removed);
+        }
+    }
+
+    fn config_error_of(config: &serde_json::Value) -> (&'static str, ConfigReason) {
+        let raw = RawConfig::HfJson {
+            config,
+            generation: None,
+        };
+        match build(&raw, &fixture().store) {
+            Err(ModelError::Config { field, reason, .. }) => (field, reason),
+            other => panic!("{config}: expected a config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_config_gpt_oss_cannot_trace_is_a_typed_error_naming_the_field() {
+        let cases: &[(&str, serde_json::Value, &str, ConfigReason)] = &[
+            (
+                "attention_bias",
+                json!(false),
+                "attention_bias",
+                ConfigReason::Unsupported,
+            ),
+            (
+                "layer_types",
+                json!(["sliding_attention"]),
+                "layer_types",
+                ConfigReason::WrongType,
+            ),
+            (
+                "layer_types",
+                json!(["sliding_attention", "chunked"]),
+                "layer_types",
+                ConfigReason::Unsupported,
+            ),
+            ("sliding_window", json!(0), "window", ConfigReason::Zero),
+            (
+                "swiglu_limit",
+                json!(0.0),
+                "glu_limit",
+                ConfigReason::NotFinitePositive,
+            ),
+            (
+                "num_experts_per_tok",
+                json!(9),
+                "top_k",
+                ConfigReason::Exceeds { max: 8 },
+            ),
+            (
+                "num_local_experts",
+                json!(0),
+                "num_local_experts",
+                ConfigReason::Zero,
+            ),
+        ];
+        for (key, value, field, reason) in cases {
+            let mut config = fixture_config();
+            config[*key] = value.clone();
+            assert_eq!(
+                config_error_of(&config),
+                (*field, *reason),
+                "{key} = {value}"
+            );
+        }
+    }
+
+    fn bytes_of(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    type GgufTensor = (String, Vec<u64>, u32, Vec<u8>);
+
+    /// A dense tensor of the fixture under its GGUF `name`, also kept (as F32) under its HF key.
+    fn carry(
+        fx: &Fixture,
+        key: &str,
+        name: String,
+        tensors: &mut Vec<GgufTensor>,
+        hf: &mut WeightStoreBuilder,
+    ) {
+        let entry = fx.store.get(key).unwrap();
+        let v = values(entry);
+        let dims = entry.shape().iter().rev().map(|&d| d as u64).collect();
+        tensors.push((name, dims, GGML_F32, bytes_of(&v)));
+        hf.insert(key, f32_entry(entry.shape(), &v)).unwrap();
+    }
+
+    /// The GGUF twin of the fixture: llama.cpp's names and layouts (split gate and up as
+    /// `[experts, out, K]`, `post_attention_norm` before the feed-forward block, untied head), the
+    /// experts `F32` or Q8_0 per-expert payloads. Returns the index, its store and the HF store
+    /// holding the same logical values (the Q8_0 case derives them from the decoded payloads).
+    fn gguf_case(q8_experts: bool) -> (GgufIndex, WeightStore, WeightStore) {
+        let fx = fixture();
+        let n = |f: &str| fx.config[f].as_u64().unwrap() as usize;
+        let (h, inter, e) = (
+            n("hidden_size"),
+            n("intermediate_size"),
+            n("num_local_experts"),
+        );
+        let mut tensors: Vec<GgufTensor> = Vec::new();
+        let mut hf = WeightStore::builder();
+        for (name, key) in [
+            ("token_embd.weight", "model.embed_tokens.weight"),
+            ("output_norm.weight", "model.norm.weight"),
+            ("output.weight", "lm_head.weight"),
+        ] {
+            carry(&fx, key, name.to_string(), &mut tensors, &mut hf);
+        }
+        for l in 0..n("num_hidden_layers") {
+            let k = |s: &str| format!("model.layers.{l}.{s}");
+            for (gguf, hf_key) in [
+                ("attn_norm.weight", "input_layernorm.weight"),
+                (
+                    "post_attention_norm.weight",
+                    "post_attention_layernorm.weight",
+                ),
+                ("attn_q.weight", "self_attn.q_proj.weight"),
+                ("attn_q.bias", "self_attn.q_proj.bias"),
+                ("attn_k.weight", "self_attn.k_proj.weight"),
+                ("attn_k.bias", "self_attn.k_proj.bias"),
+                ("attn_v.weight", "self_attn.v_proj.weight"),
+                ("attn_v.bias", "self_attn.v_proj.bias"),
+                ("attn_output.weight", "self_attn.o_proj.weight"),
+                ("attn_output.bias", "self_attn.o_proj.bias"),
+                ("attn_sinks.weight", "self_attn.sinks"),
+                ("ffn_gate_inp.weight", "mlp.router.weight"),
+                ("ffn_gate_inp.bias", "mlp.router.bias"),
+                ("ffn_down_exps.bias", "mlp.experts.down_proj_bias"),
+            ] {
+                carry(
+                    &fx,
+                    &k(hf_key),
+                    format!("blk.{l}.{gguf}"),
+                    &mut tensors,
+                    &mut hf,
+                );
+            }
+            // Split values: gate/up `[E, I, H]`, down `[E, H, I]`.
+            let mut gate = vec![0.0f32; e * inter * h];
+            let mut up = vec![0.0f32; e * inter * h];
+            let mut down = vec![0.0f32; e * h * inter];
+            let mut blocks: [Vec<u8>; 3] = Default::default();
+            if q8_experts {
+                for ex in 0..e {
+                    for (slot, buf, rows, kk) in [
+                        (0, &mut gate, inter, h),
+                        (1, &mut up, inter, h),
+                        (2, &mut down, h, inter),
+                    ] {
+                        let seed = (1000 * l + ex * 3 + slot) as u64;
+                        let payload = Arc::new(poot_test_util::packed::random_payload(
+                            WeightFormat::Q8_0,
+                            [rows, kk],
+                            seed,
+                        ));
+                        blocks[slot].extend_from_slice(payload.bytes(SourceRole::Blocks));
+                        for r in 0..rows {
+                            let at = (ex * rows + r) * kk;
+                            payload.decode_row(r, &mut buf[at..at + kk]).unwrap();
+                        }
+                    }
+                }
+            } else {
+                let gu = values(fx.store.get(&k("mlp.experts.gate_up_proj")).unwrap());
+                let dn = values(fx.store.get(&k("mlp.experts.down_proj")).unwrap());
+                for ex in 0..e {
+                    for i in 0..inter {
                         for c in 0..h {
-                            moe_out[c] += gate_weight * expert_out[c];
+                            gate[(ex * inter + i) * h + c] = gu[(ex * h + c) * 2 * inter + 2 * i];
+                            up[(ex * inter + i) * h + c] = gu[(ex * h + c) * 2 * inter + 2 * i + 1];
+                            down[(ex * h + c) * inter + i] = dn[(ex * inter + i) * h + c];
                         }
-                    }
-                    for (c, mv) in moe_out.iter().enumerate() {
-                        row[c] += mv;
                     }
                 }
             }
-
-            let ln_f_w = &w["model.norm.weight"];
-            let last = rmsnorm_ref(&x[l - 1], ln_f_w, h, cfg.eps);
-            let lm_head = &w["lm_head.weight"];
-            linear_ref(&last, lm_head, h, cfg.vocab, None)
-        }
-
-        fn eval_gptoss_prefill(
-            g: &Graph,
-            tokens: &[usize],
-            weights: &HashMap<String, Vec<f32>>,
-            sliding_window: usize,
-        ) -> poot_tensor::HostTensor {
-            let mut inputs: HashMap<poot_graph_ir::ValueId, poot_eval::Value> = HashMap::new();
-            for &id in &g.inputs {
-                let meta = g.meta(id);
-                let t = match &meta.storage {
-                    Storage::Slot(Slot::Token) => poot_tensor::HostTensor::i32(
-                        vec![tokens.len()],
-                        tokens.iter().map(|&t| t as i32).collect(),
-                    ),
-                    Storage::Slot(Slot::Mask) => {
-                        let name = meta.name.as_deref().expect("mask slot without a name");
-                        let l = meta.aval.shape[2];
-                        let mut m = vec![0.0f32; l * l];
-                        if name == "mask.prefill" {
-                            for i in 0..l {
-                                for j in 0..l {
-                                    m[i * l + j] = if j <= i { 0.0 } else { -1.0e30 };
-                                }
-                            }
-                        } else {
-                            assert_eq!(name, "mask.prefill.local", "unexpected mask slot {name}");
-                            for i in 0..l {
-                                let lo = i.saturating_sub(sliding_window - 1);
-                                for j in 0..l {
-                                    m[i * l + j] = if j <= i && j >= lo { 0.0 } else { -1.0e30 };
-                                }
-                            }
-                        }
-                        poot_tensor::HostTensor::f32(meta.aval.shape.clone(), m)
+            // The HF fused tensors from the split values.
+            let mut gu = vec![0.0f32; e * h * 2 * inter];
+            let mut dn = vec![0.0f32; e * inter * h];
+            for ex in 0..e {
+                for i in 0..inter {
+                    for c in 0..h {
+                        gu[(ex * h + c) * 2 * inter + 2 * i] = gate[(ex * inter + i) * h + c];
+                        gu[(ex * h + c) * 2 * inter + 2 * i + 1] = up[(ex * inter + i) * h + c];
+                        dn[(ex * inter + i) * h + c] = down[(ex * h + c) * inter + i];
                     }
-                    Storage::Const => {
-                        let name = meta.name.as_deref().expect("const without a name");
-                        let data = weights
-                            .get(name)
-                            .unwrap_or_else(|| panic!("no weight bound for {name}"));
-                        poot_tensor::HostTensor::f32(meta.aval.shape.clone(), data.clone())
-                    }
-                    other => panic!("unexpected storage {other:?} in a stateless prefill graph"),
-                };
-                inputs.insert(id, t.into());
+                }
             }
-            poot_eval::eval(
-                g,
-                &inputs,
-                poot_eval::EvalOptions::new(poot_eval::EvalBudget::UNBOUNDED),
+            hf.insert(
+                k("mlp.experts.gate_up_proj"),
+                f32_entry(vec![e, h, 2 * inter], &gu),
             )
-            .expect("cpu eval")
-            .output
-            .into_host()
-            .expect("dense output")
-        }
-
-        fn assert_matches(got: &poot_tensor::HostTensor, want: &[f32], vocab: usize) {
-            assert_eq!(got.shape(), vec![1, 1, vocab]);
-            poot_test_util::assert_close_rel(got.as_f32().unwrap(), want, 1e-4);
-            assert!(got.as_f32().unwrap().iter().all(|v| v.is_finite()));
-        }
-
-        /// `trace_gptoss_prefill` matches an independent hand-loop reference within f32 tolerance;
-        /// `sliding_window=2` on a 6-token sequence so the window schedule is exercised.
-        #[test]
-        fn gptoss_prefill_matches_hand_rolled_reference() {
-            let cfg = tiny_cfg();
-            let mp = tiny_mp(vec![true, false, true]);
-            let tokens = [3usize, 7, 1, 9, 15, 4];
-            let weights = all_weights(&cfg, &mp);
-
-            let g = trace_gptoss_prefill(cfg, mp.clone(), tokens.len());
-            let got = eval_gptoss_prefill(&g, &tokens, &weights, mp.sliding_window);
-            let want = gptoss_prefill_ref(&cfg, &mp, &tokens, &weights);
-            assert_matches(&got, &want, cfg.vocab);
-            assert!(
-                got.as_f32()
-                    .unwrap()
-                    .iter()
-                    .any(|&v| v != got.as_f32().unwrap()[0])
-            );
-        }
-
-        /// All-full-attention control (every layer `is_sliding=false`) with the same reference/graph pair.
-        #[test]
-        fn gptoss_prefill_matches_hand_rolled_reference_all_full_attention() {
-            let cfg = tiny_cfg();
-            let mp = tiny_mp(vec![false, false, false]);
-            let tokens = [2usize, 5, 8, 11];
-            let weights = all_weights(&cfg, &mp);
-
-            let g = trace_gptoss_prefill(cfg, mp.clone(), tokens.len());
-            let got = eval_gptoss_prefill(&g, &tokens, &weights, mp.sliding_window);
-            let want = gptoss_prefill_ref(&cfg, &mp, &tokens, &weights);
-            assert_matches(&got, &want, cfg.vocab);
-        }
-
-        /// Perturbing a layer's sink logit changes the output (a dropped sink term would still give finite output).
-        #[test]
-        fn gptoss_prefill_output_is_sensitive_to_a_perturbed_sink() {
-            let cfg = tiny_cfg();
-            let mp = tiny_mp(vec![true, false, true]);
-            let tokens = [2usize, 5, 8];
-            let mut weights = all_weights(&cfg, &mp);
-            let g = trace_gptoss_prefill(cfg, mp.clone(), tokens.len());
-            let base = eval_gptoss_prefill(&g, &tokens, &weights, mp.sliding_window);
-
-            let key = "model.layers.1.self_attn.sinks".to_string();
-            weights.get_mut(&key).unwrap()[0] += 5.0;
-            let perturbed = eval_gptoss_prefill(&g, &tokens, &weights, mp.sliding_window);
-
-            let max_diff =
-                poot_test_util::max_abs_error(base.as_f32().unwrap(), perturbed.as_f32().unwrap());
-            assert!(
-                max_diff > 1e-6,
-                "perturbing {key} should change the output; max_diff={max_diff:.2e}"
-            );
-        }
-
-        /// Perturbing the first weight of every expert's layer-1 down-projection changes the output: the
-        /// routing/expert chain is live. Every expert is perturbed because which experts three tokens route to
-        /// depends on the fixture's seeds; a routed one always moves the output.
-        #[test]
-        fn gptoss_prefill_output_is_sensitive_to_a_perturbed_expert_weight() {
-            let cfg = tiny_cfg();
-            let mp = tiny_mp(vec![true, false, true]);
-            let tokens = [2usize, 5, 8];
-            let mut weights = all_weights(&cfg, &mp);
-            let g = trace_gptoss_prefill(cfg, mp.clone(), tokens.len());
-            let base = eval_gptoss_prefill(&g, &tokens, &weights, mp.sliding_window);
-
-            let key = "model.layers.1.mlp.experts.down_proj".to_string();
-            let down = weights.get_mut(&key).unwrap();
-            let per_expert = down.len() / mp.n_experts;
-            for expert in 0..mp.n_experts {
-                down[expert * per_expert] += 5.0;
+            .unwrap();
+            hf.insert(
+                k("mlp.experts.down_proj"),
+                f32_entry(vec![e, inter, h], &dn),
+            )
+            .unwrap();
+            for (name, vals, shape, block) in [
+                ("ffn_gate_exps.weight", &gate, [e, inter, h], &blocks[0]),
+                ("ffn_up_exps.weight", &up, [e, inter, h], &blocks[1]),
+                ("ffn_down_exps.weight", &down, [e, h, inter], &blocks[2]),
+            ] {
+                let (ty, bytes) = if q8_experts {
+                    (GGML_Q8_0, block.clone())
+                } else {
+                    (GGML_F32, bytes_of(vals))
+                };
+                tensors.push((
+                    format!("blk.{l}.{name}"),
+                    shape.iter().rev().map(|&d| d as u64).collect(),
+                    ty,
+                    bytes,
+                ));
             }
-            let perturbed = eval_gptoss_prefill(&g, &tokens, &weights, mp.sliding_window);
-
-            let max_diff =
-                poot_test_util::max_abs_error(base.as_f32().unwrap(), perturbed.as_f32().unwrap());
-            assert!(
-                max_diff > 1e-4,
-                "perturbing {key} should change the output; max_diff={max_diff:.2e}"
-            );
-        }
-
-        // ---- real-checkpoint weight-layout crosswalk: tiny-random/gpt-oss. ----
-        //
-        // A randomly initialized BF16 `GptOssForCausalLM` export (2 layers, hidden 32, 2 heads/1 kv head,
-        // head_dim 32, 32 experts top-4, intermediate 64, swiglu_limit 7.0, sliding_window 128, layer_types
-        // [sliding, full], tied embeddings). It proves the loader crosswalk (router transpose, tied lm_head,
-        // direct-bind fused `[in,out]` expert tensors, biases) against real HF-shaped tensors. Loads via
-        // `poot_load` (poot-llm sits above this crate) and compares the traced graph's CPU eval to
-        // `gptoss_prefill_ref` fed the loaded weights.
-        //
-        // The rope table here is plain-theta (non-YaRN), read by both graph and reference; YaRN is exercised
-        // by the full `Runner::load` test in poot-llm. `sliding_window: 128` exceeds every test sequence, so
-        // windowing is inert here; the synthetic tests above (`sliding_window: 2`) exercise it.
-        #[test]
-        fn gptoss_tiny_random_checkpoint_matches_hand_rolled_reference() {
-            // Populate with `hf download tiny-random/gpt-oss --local-dir $POOT_MODELS_DIR/gptoss-tiny`.
-            let Some(dir) = poot_test_util::model_path(poot_test_util::checkpoint!("gptoss-tiny"))
-            else {
-                return;
-            };
-
-            let hf =
-                poot_load::Qwen2HfConfig::load(dir.join("config.json")).expect("load config.json");
-            assert!(hf.is_gpt_oss());
-            let st = poot_load::safetensors::load_weight_store(&dir).expect("load safetensors");
-
-            let cfg = Qwen2Config {
-                vocab: hf.vocab_size,
-                hidden: hf.hidden_size,
-                inter: hf.intermediate_size,
-                layers: hf.num_hidden_layers,
-                n_heads: hf.num_attention_heads,
-                n_kv_heads: hf.num_key_value_heads,
-                head_dim: hf.head_dim(),
-                rotary_dim: hf.rotary_dim(),
-                eps: hf.rms_norm_eps,
-                max_pos: 8, // only positions 0..4 are ever read; keep the rope table cheap.
-                qkv_bias: hf.qkv_bias(),
-                qk_norm: hf.qk_norm(),
-                ..Default::default()
-            };
-            let mp = GptOssParams {
-                n_experts: hf
-                    .num_local_experts
-                    .expect("gpt-oss carries num_local_experts"),
-                top_k: hf
-                    .num_experts_per_tok
-                    .expect("gpt-oss carries num_experts_per_tok"),
-                inter: hf.intermediate_size,
-                swiglu_limit: hf.swiglu_limit.expect("gpt-oss carries swiglu_limit"),
-                sliding_window: hf.sliding_window.expect("gpt-oss carries sliding_window"),
-                layer_is_sliding: hf
-                    .layer_types
-                    .clone()
-                    .expect("gpt-oss carries layer_types")
-                    .iter()
-                    .map(|s| s == "sliding_attention")
-                    .collect(),
-            };
-            assert_eq!(mp.n_experts, 32);
-            assert_eq!(mp.top_k, 4);
-            assert_eq!(mp.layer_is_sliding, vec![true, false]);
-
-            fn transpose2d(data: &[f32], r: usize, c: usize) -> Vec<f32> {
-                let mut out = vec![0.0f32; r * c];
-                for i in 0..r {
-                    for j in 0..c {
-                        out[j * r + i] = data[i * c + j];
-                    }
+            // Gate and up biases `[E, I]` de-interleave from the HF `[E, 2I]` bias.
+            let key = k("mlp.experts.gate_up_proj_bias");
+            let gub = values(fx.store.get(&key).unwrap());
+            let (mut gb, mut ub) = (vec![0.0f32; e * inter], vec![0.0f32; e * inter]);
+            for ex in 0..e {
+                for i in 0..inter {
+                    gb[ex * inter + i] = gub[ex * 2 * inter + 2 * i];
+                    ub[ex * inter + i] = gub[ex * 2 * inter + 2 * i + 1];
                 }
-                out
             }
-
-            let mut weights: HashMap<String, Vec<f32>> = HashMap::new();
-            let get2d = |name: &str| -> Vec<f32> {
-                let rt = poot_eval::materialize_dense(&st, name)
-                    .unwrap_or_else(|e| panic!("{name}: {e}"));
-                transpose2d(rt.as_f32().unwrap(), rt.shape()[0], rt.shape()[1])
-            };
-            let get_raw = |name: &str| -> Vec<f32> {
-                poot_eval::materialize_dense(&st, name)
-                    .unwrap_or_else(|e| panic!("{name}: {e}"))
-                    .as_f32()
-                    .unwrap()
-                    .to_vec()
-            };
-
-            weights.insert(
-                "model.embed_tokens.weight".to_string(),
-                get_raw("model.embed_tokens.weight"),
-            );
-            // tie_word_embeddings: true on this fixture: lm_head reuses the transposed embedding.
-            weights.insert(
-                "lm_head.weight".to_string(),
-                transpose2d(&get_raw("model.embed_tokens.weight"), cfg.vocab, cfg.hidden),
-            );
-            weights.insert(
-                "model.norm.weight".to_string(),
-                get_raw("model.norm.weight"),
-            );
-            let (cos, sin) = rope_tables(
-                cfg.max_pos,
-                cfg.head_dim,
-                hf.effective_rope_theta()
-                    .expect("config carries rope_theta"),
-            ); // plain theta, no YaRN
-            weights.insert("rope.cos".to_string(), cos);
-            weights.insert("rope.sin".to_string(), sin);
-
-            for li in 0..cfg.layers {
-                let p = |s: &str| format!("model.layers.{li}.{s}");
-                weights.insert(
-                    p("input_layernorm.weight"),
-                    get_raw(&p("input_layernorm.weight")),
-                );
-                weights.insert(
-                    p("post_attention_layernorm.weight"),
-                    get_raw(&p("post_attention_layernorm.weight")),
-                );
-                weights.insert(
-                    p("self_attn.q_proj.weight"),
-                    get2d(&p("self_attn.q_proj.weight")),
-                );
-                weights.insert(
-                    p("self_attn.q_proj.bias"),
-                    get_raw(&p("self_attn.q_proj.bias")),
-                );
-                weights.insert(
-                    p("self_attn.k_proj.weight"),
-                    get2d(&p("self_attn.k_proj.weight")),
-                );
-                weights.insert(
-                    p("self_attn.k_proj.bias"),
-                    get_raw(&p("self_attn.k_proj.bias")),
-                );
-                weights.insert(
-                    p("self_attn.v_proj.weight"),
-                    get2d(&p("self_attn.v_proj.weight")),
-                );
-                weights.insert(
-                    p("self_attn.v_proj.bias"),
-                    get_raw(&p("self_attn.v_proj.bias")),
-                );
-                weights.insert(
-                    p("self_attn.o_proj.weight"),
-                    get2d(&p("self_attn.o_proj.weight")),
-                );
-                weights.insert(
-                    p("self_attn.o_proj.bias"),
-                    get_raw(&p("self_attn.o_proj.bias")),
-                );
-                weights.insert(p("self_attn.sinks"), get_raw(&p("self_attn.sinks")));
-                // router: HF Linear [out,in]=[E,H] -> transpose to poot's [H,E].
-                weights.insert(p("mlp.router.weight"), get2d(&p("mlp.router.weight")));
-                weights.insert(p("mlp.router.bias"), get_raw(&p("mlp.router.bias")));
-                // experts: already [in,out], no transpose.
-                weights.insert(
-                    p("mlp.experts.gate_up_proj"),
-                    get_raw(&p("mlp.experts.gate_up_proj")),
-                );
-                weights.insert(
-                    p("mlp.experts.gate_up_proj_bias"),
-                    get_raw(&p("mlp.experts.gate_up_proj_bias")),
-                );
-                weights.insert(
-                    p("mlp.experts.down_proj"),
-                    get_raw(&p("mlp.experts.down_proj")),
-                );
-                weights.insert(
-                    p("mlp.experts.down_proj_bias"),
-                    get_raw(&p("mlp.experts.down_proj_bias")),
-                );
-            }
-
-            let tokens = [1usize, 2, 3, 4];
-            let g = trace_gptoss_prefill(cfg, mp.clone(), tokens.len());
-            let got = eval_gptoss_prefill(&g, &tokens, &weights, mp.sliding_window);
-            let want = gptoss_prefill_ref(&cfg, &mp, &tokens, &weights);
-
-            assert_eq!(got.shape(), vec![1, 1, cfg.vocab]);
-            assert!(got.as_f32().unwrap().iter().all(|v| v.is_finite()));
-            // Vocab is 201088 with a tiny hidden=32 embedding; a few logits sit near zero, where the plain relative
-            // check (`abs_diff / max(|a|,|b|,1e-6)`) amplifies f32 summation-order noise (max absolute diff
-            // ~6.7e-8 over all logits, vs ~0.1-0.2 logit magnitudes). A 1e-3 absolute floor, still far above the
-            // noise, absorbs that without weakening the check elsewhere.
-            for (i, (&a, &b)) in got.as_f32().unwrap().iter().zip(want.iter()).enumerate() {
-                let denom = a.abs().max(b.abs()).max(1e-3);
-                let rel = (a - b).abs() / denom;
-                assert!(rel <= 1e-4, "index {i}: {a} vs {b} (rel {rel} > 1e-4)");
-            }
+            let dims = vec![inter as u64, e as u64];
+            tensors.push((
+                format!("blk.{l}.ffn_gate_exps.bias"),
+                dims.clone(),
+                GGML_F32,
+                bytes_of(&gb),
+            ));
+            tensors.push((
+                format!("blk.{l}.ffn_up_exps.bias"),
+                dims,
+                GGML_F32,
+                bytes_of(&ub),
+            ));
+            hf.insert(key, f32_entry(vec![e, 2 * inter], &gub)).unwrap();
         }
+        let mut kvs = gguf_dense_kvs("gpt-oss", &fx.config);
+        kvs.extend([
+            ("gpt-oss.expert_count".to_string(), GgufValue::U32(e as u32)),
+            (
+                "gpt-oss.expert_used_count".to_string(),
+                GgufValue::U32(n("num_experts_per_tok") as u32),
+            ),
+            (
+                "gpt-oss.attention.sliding_window".to_string(),
+                GgufValue::U32(n("sliding_window") as u32),
+            ),
+        ]);
+        let (index, store) = read_back_owned(&kvs, &tensors);
+        (index, store, hf.build())
+    }
+
+    /// SC-001/SC-007 (GGUF half): a `gpt-oss` GGUF resolves by its architecture key and computes
+    /// what the HF body computes over the same values, with dense `F32` experts and with Q8_0
+    /// per-expert owners (the packed expert chain). Mutation: drop the GGUF key from
+    /// `ENTRY.keys`; `Unregistered`.
+    #[test]
+    fn a_gguf_resolves_by_architecture_and_equals_the_hf_body_dense_and_q8_0() {
+        let registry = Registry::builtin().unwrap();
+        for q8 in [false, true] {
+            let (index, store, hf_store) = gguf_case(q8);
+            let raw = RawConfig::Gguf(&index);
+            assert_eq!(registry.resolve(&raw).unwrap().family, FAMILY);
+            let model = registry.build(&raw, &store).unwrap();
+            let reference = model_of(&fixture_config(), &hf_store);
+            let (got, state) = run_step(&*model, &store, Phase::Prefill, CAP, &PROMPT, 0, &[]);
+            let (want, want_state) =
+                run_step(&*reference, &hf_store, Phase::Prefill, CAP, &PROMPT, 0, &[]);
+            close(&got, &want);
+            let (got, _) = run_step(&*model, &store, Phase::Decode, CAP, &[5], 5, &state);
+            let (want, _) = run_step(
+                &*reference,
+                &hf_store,
+                Phase::Decode,
+                CAP,
+                &[5],
+                5,
+                &want_state,
+            );
+            close(&got, &want);
+            let packed = model
+                .weights()
+                .iter()
+                .filter(|(_, _, handle)| matches!(handle.format, HandleFormat::Packed(_)))
+                .count();
+            assert_eq!(packed, if q8 { 2 * 3 * 8 } else { 0 }, "q8 = {q8}");
+        }
+    }
+
+    #[test]
+    fn a_shape_the_body_cannot_trace_is_a_typed_refusal() {
+        let fx = fixture();
+        let model = model_of(&fx.config, &fx.store);
+        let n = |v| NonZeroUsize::new(v).unwrap();
+        let shape = |rows, tokens, capacity| StepShape {
+            rows: n(rows),
+            tokens: n(tokens),
+            capacity: n(capacity),
+            ..step_shape(1, 1, LogitRows::Last)
+        };
+        assert!(matches!(
+            model.trace(Phase::Decode, shape(1, 2, 8)),
+            Err(TraceError::ShapeUnsupported { .. })
+        ));
+        assert!(matches!(
+            model.trace(Phase::Prefill, shape(1, 1, 65)),
+            Err(TraceError::ShapeUnsupported { .. })
+        ));
     }
 }

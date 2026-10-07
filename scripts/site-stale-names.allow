@@ -1,0 +1,35 @@
+# Names a public page cites although tracked code does not spell them. One per line; the reason goes above each group.
+
+# Positional arguments of `poot-serve`, placeholders in the configuration table.
+MODEL
+ADDR
+# Settings the batching and tensor-parallel pages say the server does not read yet.
+POOT_MAX_BATCHED_TOKENS
+POOT_TP_GPUS
+# A commit of an earlier benchmark snapshot.
+a39b146b
+# Other projects' and papers' names (models, libraries, venues, APIs, tools, ELF constants).
+NumPy
+OpenXLA
+NeurIPS
+RoFormer
+SmolVLM
+GeLU
+SiLU
+PagedAttention
+BlinkMacSystemFont
+donate_argnums
+cuStreamBeginCapture
+amdclang
+__ocml_exp_f32
+PT_AMDGPU_HSA_LOAD_GLOBAL_DATA
+PT_AMDGPU_HSA_LOAD_KERNEL_ARGUMENT
+# SPIR-V memory-semantics name the Vulkan post-process rewrites barriers to; the code spells it only in comments.
+AcquireRelease
+# A file the `pootc` build writes, not a tracked one.
+poot_cache.rs
+# Names of wgpu's and LLVM's own API and memory-ordering terms, cited when the pages describe the backend path.
+ComputePipeline
+SeqCst
+# The vendor's family name in prose; the code spells the family `minimax_m2` and `MiniMaxM2`.
+MiniMax

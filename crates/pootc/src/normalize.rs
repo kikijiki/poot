@@ -381,7 +381,6 @@ fn rewrite_rvalue(rv: &mut Rvalue, aliases: &HashMap<u32, Place>) {
         | Rvalue::IntScalarUnary(_, op)
         | Rvalue::Cast { operand: op, .. }
         | Rvalue::Bitcast { operand: op, .. }
-        | Rvalue::Fp8Decode { operand: op, .. }
         | Rvalue::Fp8Encode { operand: op, .. } => rewrite_operand(op, aliases),
         // Card 628: hand-built in kernelgen (like the vector ops below), never produced by MIR lowering;
         // rewritten for completeness.

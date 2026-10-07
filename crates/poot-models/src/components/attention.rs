@@ -47,6 +47,9 @@ pub struct AttentionParams {
     alibi: bool,
     fused_qkv: bool,
     out_bias: bool,
+    sinks: bool,
+    value_from_key: bool,
+    value_norm: Option<NormParams>,
 }
 
 impl AttentionParams {
@@ -58,6 +61,27 @@ impl AttentionParams {
         head_dim: usize,
         qkv_bias: bool,
         rope: RopeParams,
+    ) -> Result<Self, ParamError> {
+        let nope = Self::nope(heads, kv_heads, head_dim, qkv_bias)?;
+        if rope.rotary() > head_dim {
+            return Err(ParamError::new(
+                "rotary_dim",
+                ConfigReason::Exceeds { max: head_dim },
+            ));
+        }
+        Ok(Self {
+            rope: Some(rope),
+            ..nope
+        })
+    }
+
+    /// [`Self::new`] for an attention with no rotary embedding at all (a NoPE model: Nemotron-H's
+    /// attention layers), which needs no RoPE width.
+    pub fn nope(
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        qkv_bias: bool,
     ) -> Result<Self, ParamError> {
         for (field, value) in [
             ("heads", heads),
@@ -74,18 +98,12 @@ impl AttentionParams {
                 ConfigReason::NotDivisible { by: kv_heads },
             ));
         }
-        if rope.rotary() > head_dim {
-            return Err(ParamError::new(
-                "rotary_dim",
-                ConfigReason::Exceeds { max: head_dim },
-            ));
-        }
         Ok(Self {
             heads,
             kv_heads,
             head_dim,
             qkv_bias,
-            rope: Some(rope),
+            rope: None,
             scale: 1.0 / (head_dim as f32).sqrt(),
             qk_norm: None,
             window: None,
@@ -93,6 +111,9 @@ impl AttentionParams {
             alibi: false,
             fused_qkv: false,
             out_bias: false,
+            sinks: false,
+            value_from_key: false,
+            value_norm: None,
         })
     }
 
@@ -164,11 +185,27 @@ impl AttentionParams {
 
     /// `softcap * tanh(scores / softcap)` on the scaled scores before the mask.
     pub fn with_softcap(self, softcap: f32) -> Result<Self, ParamError> {
+        if self.sinks {
+            return Err(ParamError::new("softcap", ConfigReason::Unsupported));
+        }
         if !(softcap.is_finite() && softcap > 0.0) {
             return Err(ParamError::new("softcap", ConfigReason::NotFinitePositive));
         }
         Ok(Self {
             softcap: Some(softcap),
+            ..self
+        })
+    }
+
+    /// One learned logit per query head joins every row's softmax (gpt-oss): it counts in the row
+    /// maximum and the denominator but adds nothing to the weighted sum of V. Not combinable with
+    /// a softcap.
+    pub fn with_sinks(self) -> Result<Self, ParamError> {
+        if self.softcap.is_some() {
+            return Err(ParamError::new("sinks", ConfigReason::Unsupported));
+        }
+        Ok(Self {
+            sinks: true,
             ..self
         })
     }
@@ -181,12 +218,40 @@ impl AttentionParams {
         }
     }
 
+    /// V is the raw K projection (before K's norm and RoPE) instead of its own projection, so the
+    /// layer has no V weights (Gemma 4's global layers). Needs separate, unbiased projections.
+    pub fn with_value_from_key(self) -> Result<Self, ParamError> {
+        if self.fused_qkv || self.qkv_bias {
+            return Err(ParamError::new(
+                "attention_k_eq_v",
+                ConfigReason::Unsupported,
+            ));
+        }
+        Ok(Self {
+            value_from_key: true,
+            ..self
+        })
+    }
+
+    /// Normalize V over each head's `head_dim` dims with no learned scale (Gemma 4's V norm).
+    pub fn with_value_norm(self, norm: NormParams) -> Self {
+        Self {
+            value_norm: Some(norm),
+            ..self
+        }
+    }
+
     /// The score scale in place of `head_dim^-1/2`.
     pub fn with_scale(self, scale: f32) -> Result<Self, ParamError> {
         if !(scale.is_finite() && scale > 0.0) {
             return Err(ParamError::new("scale", ConfigReason::NotFinitePositive));
         }
         Ok(Self { scale, ..self })
+    }
+
+    /// Whether V is the K projection, so the layer has no V weights.
+    pub fn value_from_key(&self) -> bool {
+        self.value_from_key
     }
 
     pub fn heads(&self) -> usize {
@@ -207,7 +272,8 @@ impl AttentionParams {
 pub struct SeparateQkv {
     pub q: Weight,
     pub k: Weight,
-    pub v: Weight,
+    /// `None` when the parameters read V from the K projection.
+    pub v: Option<Weight>,
     pub bias: Option<[Weight; 3]>,
 }
 
@@ -228,6 +294,8 @@ pub struct AttentionWeights {
     pub o: Weight,
     pub o_bias: Option<Weight>,
     pub qk_norm: Option<[Weight; 2]>,
+    /// The per-head sink logits `[heads]`, when the parameters have sinks.
+    pub sinks: Option<Weight>,
 }
 
 impl AttentionWeights {
@@ -263,7 +331,11 @@ impl AttentionWeights {
             QkvWeights::Separate(Box::new(SeparateQkv {
                 q: w(AttnRole::Q, &[q, width])?,
                 k: w(AttnRole::K, &[kv, width])?,
-                v: w(AttnRole::V, &[kv, width])?,
+                v: if p.value_from_key {
+                    None
+                } else {
+                    Some(w(AttnRole::V, &[kv, width])?)
+                },
                 bias,
             }))
         };
@@ -286,6 +358,11 @@ impl AttentionWeights {
                 None
             },
             qk_norm,
+            sinks: if p.sinks {
+                Some(w(AttnRole::Sinks, &[p.heads])?)
+            } else {
+                None
+            },
         })
     }
 }
@@ -373,6 +450,50 @@ fn write_paged(
     ((input, output), b.transpose(gathered, vec![0, 2, 1, 3]))
 }
 
+/// Where each row of `step` writes its new positions: the first position of each row under the
+/// contiguous layout, nothing under a paged one (it writes through its slot maps).
+pub(crate) fn first_writes(b: &Builder, step: &Step) -> Vec<Traced> {
+    match step.paged() {
+        None => first_positions(b, step),
+        Some(_) => Vec::new(),
+    }
+}
+
+/// The step's cache `name` of `layer` (`[rows, hkv, capacity, d]` contiguous, or one
+/// `[pool_slots, hkv, d]` pool under a paged layout) with the new `[rows, hkv, tokens, d]` values
+/// written into it and carried to the next step; returns the `[rows, hkv, capacity, d]` cache
+/// attention reads, in logical order. A pool and a private cache are different buffers, so they
+/// carry different names: one executable can hold both without a schema clash.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn carried_cache(
+    b: &Builder,
+    step: &Step,
+    write_at: &[Traced],
+    layer: usize,
+    name: &str,
+    new: Traced,
+    hkv: usize,
+    d: usize,
+) -> Traced {
+    let ((input, output), read) = match step.paged() {
+        None => write_contiguous(
+            b,
+            step,
+            write_at,
+            &format!("kv.l{layer}.{name}"),
+            new,
+            hkv,
+            d,
+        ),
+        Some(maps) => {
+            let name = format!("kv.pool.l{layer}.{name}");
+            write_paged(b, step, maps, &name, new, hkv, d)
+        }
+    };
+    step.carry(input, output);
+    read
+}
+
 /// Self-attention of `x` (`[rows, tokens, width]`) at layer `layer`; returns `[rows, tokens, width]`.
 /// The layer's K/V caches (`kv.l{layer}.k`, `kv.l{layer}.v`) are carried by `step`.
 pub fn attention(
@@ -393,11 +514,13 @@ pub fn attention(
         QkvWeights::Separate(sep) => {
             let SeparateQkv { q, k, v, bias } = &**sep;
             let bias = |i: usize| bias.as_ref().map(|biases| &biases[i]);
-            (
-                linear(b, x, q, bias(0)),
-                linear(b, x, k, bias(1)),
-                linear(b, x, v, bias(2)),
-            )
+            let q = linear(b, x, q, bias(0));
+            let k = linear(b, x, k, bias(1));
+            let v = match v {
+                Some(v) => linear(b, x, v, bias(2)),
+                None => k,
+            };
+            (q, k, v)
         }
         QkvWeights::Fused { qkv, bias } => {
             // Rows are `[heads, 3, head_dim]`: split the 3-axis, then flatten each part back.
@@ -419,6 +542,10 @@ pub fn attention(
         _ => (q, k),
     };
     let v = heads_first(v, hkv);
+    let v = match p.value_norm {
+        Some(np) => ops::rmsnorm_no_weight(b, v, np.eps()),
+        None => v,
+    };
 
     let (q, k) = match p.rope {
         Some(rope) => {
@@ -428,40 +555,39 @@ pub fn attention(
         None => (q, k),
     };
 
-    // A paged step writes through its slot maps, not at a first position.
-    let write_at = match step.paged() {
-        None => first_positions(b, step),
-        Some(_) => Vec::new(),
-    };
-    let [k_cache, v_cache] = [("k", k), ("v", v)].map(|(name, new)| {
-        // A pool and a private cache are different buffers, so they carry different names: one
-        // executable can hold both without a schema clash.
-        let ((input, output), read) = match step.paged() {
-            None => write_contiguous(
-                b,
-                step,
-                &write_at,
-                &format!("kv.l{layer}.{name}"),
-                new,
-                hkv,
-                d,
-            ),
-            Some(maps) => {
-                let name = format!("kv.pool.l{layer}.{name}");
-                write_paged(b, step, maps, &name, new, hkv, d)
-            }
-        };
-        step.carry(input, output);
-        read
-    });
+    let write_at = first_writes(b, step);
+    let k_cache = carried_cache(b, step, &write_at, layer, "k", k, hkv, d);
+    let v_cache = carried_cache(b, step, &write_at, layer, "v", v, hkv, d);
     let mask = if p.alibi {
         let slopes = b.computed(ComputedConst::AlibiSlopes { heads: hq });
         ops::alibi_mask_from_pos(b, step.pos(), cap, p.window, slopes, hq)
     } else {
         ops::causal_mask_from_pos(b, step.pos(), cap, p.window)
     };
-    let out =
-        ops::attention_masked_softcap(b, q, k_cache, v_cache, hq / hkv, p.scale, mask, p.softcap);
+    let out = match &w.sinks {
+        Some(sinks) => ops::attention_prefill_with_sink(
+            b,
+            q,
+            k_cache,
+            v_cache,
+            hq / hkv,
+            p.scale,
+            mask,
+            sinks.declare_f32(b),
+            hq,
+            t,
+        ),
+        None => ops::attention_masked_softcap(
+            b,
+            q,
+            k_cache,
+            v_cache,
+            hq / hkv,
+            p.scale,
+            mask,
+            p.softcap,
+        ),
+    };
     let out = b.reshape(b.transpose(out, vec![0, 2, 1, 3]), vec![rows, t, hq * d]);
     linear(b, out, &w.o, w.o_bias.as_ref())
 }
@@ -502,6 +628,7 @@ mod tests {
         softcap: Option<f32>,
         scale: Option<f32>,
         positions: Positions,
+        sinks: bool,
     }
 
     const BASE: Opts = Opts {
@@ -510,6 +637,7 @@ mod tests {
         softcap: None,
         scale: None,
         positions: Positions::HalfSplit,
+        sinks: false,
     };
 
     fn params(o: Opts) -> AttentionParams {
@@ -536,6 +664,9 @@ mod tests {
         if let Some(s) = o.scale {
             p = p.with_scale(s).unwrap();
         }
+        if o.sinks {
+            p = p.with_sinks().unwrap();
+        }
         p
     }
 
@@ -553,13 +684,20 @@ mod tests {
         AttnRole::VBias,
     ];
 
+    /// The weights beyond [`ROLES`] a case adds: the Q/K norm scales and the sink logits.
     fn norm_roles(o: Opts) -> Vec<AttnRole> {
+        let mut roles = Vec::new();
         if o.qk_norm.is_some() {
-            vec![AttnRole::QNorm, AttnRole::KNorm]
-        } else {
-            Vec::new()
+            roles.extend([AttnRole::QNorm, AttnRole::KNorm]);
         }
+        if o.sinks {
+            roles.push(AttnRole::Sinks);
+        }
+        roles
     }
+
+    /// Sink logits large enough, against the scores of the random fixture, to take real softmax mass.
+    const SINKS: [f32; HEADS] = [1.5, -0.5, 2.0, 0.3];
 
     fn fixture(o: Opts) -> Fx {
         let (q, kv) = (HEADS * HEAD_DIM, KV_HEADS * HEAD_DIM);
@@ -579,6 +717,9 @@ mod tests {
             };
             fx.bf16(id(AttnRole::QNorm), &[qn]);
             fx.f32(id(AttnRole::KNorm), &[kn]);
+        }
+        if o.sinks {
+            fx.set(id(AttnRole::Sinks), &[HEADS], SINKS.to_vec());
         }
         fx
     }
@@ -754,9 +895,11 @@ mod tests {
                         s
                     })
                     .collect();
-                let max = scores.iter().cloned().fold(f64::MIN, f64::max);
+                // A sink logit joins the maximum and the denominator, never the weighted sum.
+                let sink = o.sinks.then(|| f64::from(vals(AttnRole::Sinks)[h]));
+                let max = scores.iter().cloned().chain(sink).fold(f64::MIN, f64::max);
                 let exps: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
-                let sum: f64 = exps.iter().sum();
+                let sum: f64 = exps.iter().sum::<f64>() + sink.map_or(0.0, |s| (s - max).exp());
                 for (j, e) in keys.zip(&exps) {
                     for c in 0..HEAD_DIM {
                         attn[h * HEAD_DIM + c] += e / sum * caches[1][(g * CAP + j) * HEAD_DIM + c];
@@ -832,6 +975,48 @@ mod tests {
             scale: Some(0.31),
             ..BASE
         });
+    }
+
+    /// SC-002: per-head sink logits (gpt-oss), alone and under a sliding window, match the f64
+    /// reference over a continued cache; the sink weight is in the perturbation list, so the
+    /// output depends on it. Mutation: leave the sink out of the softmax denominator; red.
+    #[test]
+    fn attention_sinks_match_the_reference() {
+        assert_matches_reference(Opts {
+            sinks: true,
+            ..BASE
+        });
+        assert_matches_reference(Opts {
+            sinks: true,
+            window: Some(3),
+            ..BASE
+        });
+    }
+
+    /// Sinks are a different attention from none, and they exclude a softcap in either order.
+    #[test]
+    fn sinks_change_the_output_and_exclude_a_softcap() {
+        let cache_len = KV_HEADS * CAP * HEAD_DIM;
+        let state = [oracle::random(cache_len, 41), oracle::random(cache_len, 42)];
+        let x = oracle::random(3 * WIDTH, 43);
+        let pos = [2, 3, 4];
+        let with = Opts {
+            sinks: true,
+            ..BASE
+        };
+        let base = run(&fixture(BASE), BASE, &x, &pos, &state).0;
+        assert_ne!(run(&fixture(with), with, &x, &pos, &state).0, base);
+
+        let rope = RopeParams::new(HEAD_DIM, THETA, &RopeFlavor::Plain).unwrap();
+        let plain = AttentionParams::new(HEADS, KV_HEADS, HEAD_DIM, true, rope).unwrap();
+        assert_eq!(
+            plain.with_softcap(1.0).unwrap().with_sinks(),
+            Err(ParamError::new("sinks", ConfigReason::Unsupported))
+        );
+        assert_eq!(
+            plain.with_sinks().unwrap().with_softcap(1.0),
+            Err(ParamError::new("softcap", ConfigReason::Unsupported))
+        );
     }
 
     /// SC-001: interleaved RoPE (a GGUF's permuted rows), NoPE (no rotation) and ALiBi.
@@ -1125,9 +1310,8 @@ mod tests {
     /// Two contiguous rows at different positions over different caches produce, for each row, what
     /// that row produces alone, and each row's cache write lands at its own first position.
     /// Mutation: write every row at row 0's first position; row 1 goes red.
-    #[test]
-    fn contiguous_rows_write_and_attend_at_their_own_positions() {
-        let fx = fixture(BASE);
+    fn assert_contiguous_rows_independent(o: Opts) {
+        let fx = fixture(o);
         let cache_len = KV_HEADS * CAP * HEAD_DIM;
         let (t, positions) = (2, [[1, 2], [4, 5]]);
         let caches: Vec<[Vec<f32>; 2]> = (0..2)
@@ -1144,11 +1328,11 @@ mod tests {
             [caches[0][0].clone(), caches[1][0].clone()].concat(),
             [caches[0][1].clone(), caches[1][1].clone()].concat(),
         ];
-        let (got, got_state) = run_rows(&fx, BASE, (2, t), &x, &pos, &both, None);
+        let (got, got_state) = run_rows(&fx, o, (2, t), &x, &pos, &both, None);
         for r in 0..2 {
             let (alone, alone_state) = run_rows(
                 &fx,
-                BASE,
+                o,
                 (1, t),
                 &x[r * t * WIDTH..(r + 1) * t * WIDTH],
                 &positions[r],
@@ -1171,6 +1355,20 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn contiguous_rows_write_and_attend_at_their_own_positions() {
+        assert_contiguous_rows_independent(BASE);
+    }
+
+    /// The same independence with sink logits (the sink broadcasts over rows).
+    #[test]
+    fn contiguous_rows_with_sinks_attend_independently() {
+        assert_contiguous_rows_independent(Opts {
+            sinks: true,
+            ..BASE
+        });
     }
 
     const POOL: usize = 40;

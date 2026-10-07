@@ -189,10 +189,17 @@ pub fn packed_grouped_linear(
     })?;
     // The two ranges are computed, not bound: `Iota` folds to a compiler-computed constant before
     // planning, so no named per-expert-range binder supplies them (card 558a).
-    let row_iota = plan.equation(crate::op::OpKind::Iota { len: m }, Vec::new())?;
+    let row_iota = plan.equation(
+        crate::op::OpKind::Iota {
+            len: m,
+            dtype: DType::F32,
+        },
+        Vec::new(),
+    )?;
     let expert_iota = plan.equation(
         crate::op::OpKind::Iota {
             len: expert_iota_len,
+            dtype: DType::F32,
         },
         Vec::new(),
     )?;

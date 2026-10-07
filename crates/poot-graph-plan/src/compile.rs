@@ -47,8 +47,6 @@ pub struct Target {
 pub struct CompileOptions {
     /// Executor submission mode. Compilation produces the same plans for either mode.
     pub execution: Submission,
-    /// Whether `compile`'s fusion-adjacent passes run (card 535a). See [`FusionPolicy`].
-    pub fusion: FusionPolicy,
     /// What compilation may construct and load. There is no default: every caller states its policy.
     pub limits: CompileLimits,
 }
@@ -118,29 +116,6 @@ pub struct ExpansionError {
     pub held: usize,
     pub attempted: usize,
     pub limit: usize,
-}
-
-/// Card 535a: a declared, typed policy `compile` consults while running its own fixed pass order (never a
-/// second pipeline or a bypass around `compile`). [`FusionPolicy::MoeHangGuard`] skips exactly
-/// `flash_attention_capped` and `fuse`, and is a planner input: the contraction choice keeps every
-/// `MatMul` off the generated tiled GEMM (Card 557). Every other pass (`legalize`, the bias epilogue, the
-/// BF16 folds, `lower_nonlast_reduces`, `widen_mismatched_matmul_dtypes`) still runs in `compile`'s one order.
-/// `Program::passes()` records which passes ran and `Program::kernel_choice` which kernel each equation
-/// took, so a caller or test can see the guard fire.
-///
-/// A MoE/Mixtral/DeepSeek-V3 routed-expert prefill graph has hung ROCm/AMDGCN under the guarded choices
-/// (cards 186/192): the generated tiled GEMM took the MoE router's bare `MatMul`, and flash-attention
-/// synthesis (`flash_attention_capped`, which feeds `fuse`'s pointwise fusion) was never pod-verified safe
-/// on PTX for this shape either. A guarded graph's quantized weights are packed carriers
-/// (`PackedDequant`/`PackedContraction`), which plan through their own imported-kernel path outside
-/// `plan_eqn` entirely, which is what makes these graphs plannable at all under the guard.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FusionPolicy {
-    /// Every pass in `compile`'s pipeline runs, and every kernel choice is open.
-    Full,
-    /// Cards 186/192's MoE-router-hang guard: `flash_attention_capped` and `fuse` are skipped, and no
-    /// `MatMul` takes the generated tiled GEMM.
-    MoeHangGuard,
 }
 
 /// Why [`compile`] produced no program. Each cause is boxed (spec 384), so a `Result` carrying one stays
@@ -337,7 +312,7 @@ impl<V: ValidationChannel> Program<V> {
     }
 
     /// The passes that changed the graph, in the order they ran (card 535a: a caller or test reads this
-    /// to see whether a declared [`CompileOptions`] choice, such as [`FusionPolicy::MoeHangGuard`],
+    /// to see whether the routed-expert hang guard
     /// actually took effect - never by re-deriving it locally).
     pub fn passes(&self) -> impl Iterator<Item = &'static str> + '_ {
         self.passes.iter().map(|declaration| declaration.pass)
@@ -349,7 +324,7 @@ impl<V: ValidationChannel> Program<V> {
 /// `PackedDequant` is claimed into a `PackedContraction`/`PackedRowGather`, is a W12 MoE branch, or
 /// the graph is refused), buffer-limit legalization, then the BF16-packed-weight recognition, non-last-axis reduce legalization
 /// and backend dtype retyping (Card 534a), then fusion, then `crate::plan_graph`, which makes every
-/// kernel choice (Card 557). The bias epilogue fuse rule runs right after the escape gate.
+/// kernel choice (Card 557). The contraction epilogue fuse rule runs right before `fuse`.
 ///
 /// Legalization (card 523a: `legalize`, reading `target.caps` to host or split a constant the target
 /// cannot allocate as one device buffer) and Card 534a's step (`poot_graph_plan::prepare_target_graph`'s
@@ -361,9 +336,10 @@ impl<V: ValidationChannel> Program<V> {
 /// hosted must not still look like one to it. Card 534a's step is the one preparation every target needs
 /// before planning: no executor sequences its own copy of it any more.
 ///
-/// `options.fusion` (card 535a) can skip `flash_attention_capped` and `fuse` and keep the planner off
-/// the generated tiled GEMM; see [`FusionPolicy`]. Every other pass, including `legalize`, still runs in
-/// this same fixed order regardless.
+/// A target with `KnownMiscompiles::routed_expert_tiling_hang` compiling a graph with a routed-expert site
+/// ([`routed_expert_sites`]) skips `flash_attention_capped` and the fuses and keeps the planner off the
+/// generated tiled GEMM: cards 186/192 recorded that shape hanging ROCm and PTX. Every other pass,
+/// including `legalize`, still runs in this same fixed order regardless.
 pub fn compile<V: ValidationChannel>(
     g: &Graph<V>,
     target: &Target,
@@ -376,8 +352,13 @@ pub fn compile<V: ValidationChannel>(
     // A flash prefill launches `Hq * L` workgroups on one grid axis; cap the rewrite at the target's grid so
     // the planner is never handed a launch the device cannot issue.
     let max_prefill_groups = target.caps.max_grid[0] as usize;
-    let guarded = options.fusion == FusionPolicy::MoeHangGuard;
-    let mut pipeline = PassPipeline::new(g, target, options.fusion, options.limits);
+    // The routed-expert hang guard (cards 186/192; the fact is POOT-575's to delete): where the target
+    // has the hang and the graph a routed-expert site, `flash_attention_capped`, the two contraction
+    // fuses and the widening-cast fuse are left out and no `MatMul` takes the generated tiled GEMM.
+    // Every other pass runs in `compile`'s one order, and `Program::passes()` records which did.
+    let guarded = target.caps.known_miscompiles.routed_expert_tiling_hang
+        && !routed_expert_sites(g).is_empty();
+    let mut pipeline = PassPipeline::new(g, target, guarded, options.limits);
     let (canonical, numerical_declines) = transform::canonicalize_with_declines(g);
     pipeline.after_apply("canonicalize", canonical)?;
     pipeline.run("cse", transform::cse)?;
@@ -403,7 +384,6 @@ pub fn compile<V: ValidationChannel>(
         transform::recognize_packed_row_gathers,
     )?);
     pipeline.reject_escapes(restored)?;
-    pipeline.run("fuse_bias_epilogues", transform::fuse_bias_epilogues)?;
     pipeline.try_run("legalize", |g| {
         transform::legalize(g, &target.caps, &options.limits)
     })?;
@@ -436,11 +416,21 @@ pub fn compile<V: ValidationChannel>(
     pipeline.try_run("decompose_large_vocab_greedy", |g| {
         transform::decompose_large_vocab_greedy(g, &options.limits)
     })?;
+    // The contraction epilogue rule runs on the typed, dtype-prepared graph, right before `fuse` would claim
+    // the same pointwise chains for a standalone region: a head fuses only where the planner's generated
+    // lowering carries an epilogue (`epilogue_head_lowers`), so no head trades a faster schedule for it. Like
+    // `fuse`, it is skipped under the guard, which keeps one kernel per equation.
     if !guarded {
+        pipeline.run("fuse_contraction_epilogues", |g| {
+            transform::fuse_contraction_epilogues(g, |graph, head| {
+                planner::epilogue_head_lowers(graph, head, target.backend, &target.caps)
+            })
+        })?;
         pipeline.run("fuse", transform::fuse)?;
+        pipeline.run("fuse_widening_casts", transform::fuse_widening_casts)?;
     }
     let (graph, baseline, passes) = pipeline.finish()?;
-    let planned = plan_graph(&graph, target, options.fusion, &options.limits.body())?;
+    let planned = plan_graph(&graph, target, guarded, &options.limits.body())?;
     let state_commit = state_commit_from_plans(&graph, &planned.plans)?;
     let validation = device_validation::validation_packet_plan(&graph)?;
     let buffer_plan = plan_buffers(
@@ -472,9 +462,9 @@ pub fn compile<V: ValidationChannel>(
 struct PassPipeline<'t, V: ValidationChannel> {
     graph: Graph<V>,
     target: &'t Target,
-    /// The compile's fusion policy, which the rewrite-legality probes plan with exactly as
-    /// `plan_graph` will.
-    fusion: FusionPolicy,
+    /// Whether the compile is guarded against the routed-expert hang, which the rewrite-legality
+    /// probes plan with exactly as `plan_graph` will.
+    guarded: bool,
     /// The numerics of the graph as traced: the unfused baseline every device run carries.
     baseline: NumericsProperty,
     passes: Vec<PassDeclaration>,
@@ -483,11 +473,11 @@ struct PassPipeline<'t, V: ValidationChannel> {
 }
 
 impl<'t, V: ValidationChannel> PassPipeline<'t, V> {
-    fn new(g: &Graph<V>, target: &'t Target, fusion: FusionPolicy, limits: CompileLimits) -> Self {
+    fn new(g: &Graph<V>, target: &'t Target, guarded: bool, limits: CompileLimits) -> Self {
         Self {
             graph: g.clone(),
             target,
-            fusion,
+            guarded,
             baseline: implied_numerics(g),
             passes: Vec::new(),
             limits,
@@ -553,7 +543,7 @@ impl<'t, V: ValidationChannel> PassPipeline<'t, V> {
             &self.graph,
             out,
             self.target,
-            self.fusion,
+            self.guarded,
             &self.limits.body(),
         )?;
         verify_pass_numerics(&declaration, &out)?;
@@ -631,12 +621,12 @@ fn lower_nonlast_growth<V: ValidationChannel>(g: &Graph<V>) -> Growth {
 }
 
 /// What `widen_mismatched_matmul_dtypes` can add: one cast per widened table of a `Gather`/`Slice`, and
-/// at most two (one per operand) for a `MatMul`, `MatMulBias` or `Binary`.
+/// at most two (one per operand) for a `MatMul` or `Binary`.
 fn widen_growth<V: ValidationChannel>(g: &Graph<V>) -> Growth {
     let casts = g.eqns.iter().fold(0usize, |casts, eqn| {
         casts.saturating_add(match eqn.op {
             OpKind::Gather { axis: 0 } | OpKind::Slice { .. } => 1,
-            OpKind::MatMul | OpKind::MatMulBias | OpKind::Binary(_) => 2,
+            OpKind::MatMul | OpKind::Binary(_) => 2,
             _ => 0,
         })
     });
@@ -731,7 +721,7 @@ fn revert_unplannable_rewrites<V: ValidationChannel>(
     before: &Graph<V>,
     after: Graph<V>,
     target: &Target,
-    fusion: FusionPolicy,
+    guarded: bool,
     limits: &poot_kernelgen::BodyLimits,
 ) -> Result<(Graph<V>, HashMap<ValueId, Refusal>), CompileError> {
     let before_at: HashMap<ValueId, usize> = before
@@ -751,7 +741,7 @@ fn revert_unplannable_rewrites<V: ValidationChannel>(
     let views = compute_views(&after, target.backend);
     let mut refused: Vec<(ValueId, Refusal)> = Vec::new();
     for eqn in rewritten {
-        match plan_eqn_compiled(&analysis, &after, eqn, target, &views, fusion, limits) {
+        match plan_eqn_compiled(&analysis, &after, eqn, target, &views, guarded, limits) {
             Ok(_) => {}
             Err(PlanError::Refused(refusal)) => refused.push((eqn.out, *refusal)),
             Err(error) => return Err(error.into()),
@@ -830,7 +820,6 @@ mod tests {
 
     const REPLAY: CompileOptions = CompileOptions {
         execution: Submission::Replay,
-        fusion: FusionPolicy::Full,
         limits: crate::CompileLimits::STANDARD,
     };
 
@@ -875,112 +864,274 @@ mod tests {
         assert_eq!(program.reassociation_class(), Tier2Class::Reassociating);
     }
 
-    /// Card 535a (cards 186/192's MoE-router-hang guard): `FusionPolicy::MoeHangGuard` skips `fuse`, so
-    /// the same pointwise chain the test above shows fusing under `FusionPolicy::Full` records no passes
-    /// (nothing else in the pipeline changes this graph) under the guard, and stays scalar-decomposed
-    /// (never one `Fused` region).
+    /// The routed-expert hang guard (cards 186/192) is decided by the target's fact and the graph's shape,
+    /// nothing else: the pointwise chain of the test above, carrying a routed-expert site, skips `fuse`
+    /// where the target has the hang; the same chain on a target without it, or on the same target with
+    /// no site in the graph, still fuses. The guard's planner half is
+    /// [`routed_prefill_keeps_the_router_off_the_tiled_gemm_under_the_hang_guard`].
     ///
-    /// Mutation (recorded here, never left in the tree): deleting `compile`'s `if !guarded` checks around
-    /// `flash_attention_capped`/`fuse` (i.e. always running them, ignoring `options.fusion`) failed this
-    /// test with `passes = ["fuse"]` (expected `[]`); restoring the guard made it green again. The guard's
-    /// planner half is [`moe_hang_guard_keeps_the_router_matmul_off_the_tiled_gemm`].
+    /// Mutation (observed red, restored): ignore the fact in `compile`
+    /// (`guarded = !routed_expert_sites(g).is_empty()`); the wgpu row fails with "a target without the
+    /// hang fuses a routed graph".
     #[test]
-    fn compile_moe_hang_guard_skips_fuse() {
-        let guarded = CompileOptions {
-            fusion: FusionPolicy::MoeHangGuard,
-            ..REPLAY
+    fn compile_skips_fuse_only_for_a_routed_site_on_a_target_with_the_hang() {
+        use poot_test_util::graph_fixtures::{with_routed_expert_hang, with_routed_expert_site};
+
+        let routed = with_routed_expert_site(pointwise_chain());
+        let hung = Target {
+            caps: with_routed_expert_hang(wgpu().caps),
+            ..wgpu()
         };
-        let program = compile(&pointwise_chain(), &wgpu(), &guarded)
-            .expect("the chain still compiles under the guard");
-        let passes: Vec<&str> = program.passes().collect();
-        assert_eq!(
-            passes,
-            Vec::<&str>::new(),
-            "fuse must not run under the guard"
+        let guarded = compile(&routed, &hung, &REPLAY).expect("the chain compiles under the guard");
+        let passes: Vec<&str> = guarded.passes().collect();
+        assert!(
+            !passes.contains(&"fuse"),
+            "fuse must not run on a routed graph where the target has the hang: {passes:?}"
         );
         assert!(
-            !program
+            !guarded
                 .graph()
                 .eqns
                 .iter()
                 .any(|eqn| matches!(eqn.op, OpKind::Fused(_))),
             "the chain must stay scalar-decomposed under the guard"
         );
+
+        let no_hang =
+            compile(&routed, &wgpu(), &REPLAY).expect("the routed chain compiles on wgpu");
+        assert!(
+            no_hang.passes().any(|pass| pass == "fuse"),
+            "a target without the hang fuses a routed graph"
+        );
+        let no_site = compile(&pointwise_chain(), &hung, &REPLAY).expect("the chain compiles");
+        assert!(
+            no_site.passes().any(|pass| pass == "fuse"),
+            "a graph with no routed-expert site fuses on a target that has the hang"
+        );
     }
 
-    /// The kernel `program` chose for the routed-expert router `x @ w_gate` (weight `[hidden,
-    /// n_experts]`) of every layer, and whether each is the generated tiled GEMM.
-    fn router_choices_are_tiled(program: &Program, hidden: usize, n_experts: usize) -> Vec<bool> {
+    /// The first `phase` step of the granitemoe registry fixture (two routed layers, four experts) at
+    /// `tokens` tokens: the production family's own trace, not a hand-built graph.
+    fn granitemoe_step(
+        phase: poot_models::model::Phase,
+        tokens: usize,
+    ) -> poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs> {
+        granitemoe_step_and_weights(phase, tokens).0
+    }
+
+    /// [`granitemoe_step`] with the model's weight map and the fixture store it binds.
+    fn granitemoe_step_and_weights(
+        phase: poot_models::model::Phase,
+        tokens: usize,
+    ) -> (
+        poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs>,
+        poot_quant::weights::WeightMap,
+        poot_quant::weights::WeightStore,
+    ) {
+        use poot_models::model::{KvLayout, LogitRows, StepShape};
+        use std::num::NonZeroUsize;
+
+        let registry = poot_models::registry::Registry::builtin().expect("the builtin registry");
+        let entry = registry
+            .entries()
+            .iter()
+            .find(|entry| entry.family.as_str() == "granite")
+            .expect("granite is registered");
+        let (_, granitemoe) = entry
+            .variants
+            .iter()
+            .find(|(name, _)| *name == "granitemoe")
+            .expect("granite ships a granitemoe fixture");
+        let fixture = granitemoe();
+        let model = (entry.build)(&fixture.raw(), &fixture.store).expect("the fixture builds");
+        let n = |v| NonZeroUsize::new(v).unwrap();
+        let graph = model
+            .trace(
+                phase,
+                StepShape {
+                    rows: n(1),
+                    tokens: n(tokens),
+                    capacity: n(8),
+                    kv: KvLayout::Contiguous,
+                    logits: LogitRows::Last,
+                },
+            )
+            .expect("the fixture traces");
+        (graph, model.weights().clone(), fixture.store)
+    }
+
+    /// The CPU oracle's output for `g` over the granitemoe fixture's weights and a fixed `tokens` prompt at
+    /// positions `0..` with zeroed caches.
+    fn oracle_logits(
+        g: &poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs>,
+        map: &poot_quant::weights::WeightMap,
+        store: &poot_quant::weights::WeightStore,
+        tokens: &[i32],
+    ) -> Vec<f32> {
+        use poot_graph_ir::{Slot, SlotKey};
+        let n = tokens.len();
+        let slots = [
+            (
+                SlotKey::new(Slot::Token, None),
+                poot_tensor::HostTensor::i32(vec![1, n], tokens.to_vec()),
+            ),
+            (
+                SlotKey::new(Slot::Pos, None),
+                poot_tensor::HostTensor::i32(vec![1, n], (0..n as i32).collect()),
+            ),
+        ];
+        let zeros: Vec<poot_tensor::HostTensor> = g
+            .state
+            .iter()
+            .map(|&(si, _)| poot_tensor::HostTensor::zeros(g.aval(si).shape.clone()))
+            .collect();
+        let (out, _) =
+            poot_test_util::weight_map_oracle::eval_mapped(g, store, map, &slots, &zeros);
+        out.as_f32().expect("f32 logits").to_vec()
+    }
+
+    /// Whether `program` ran the pass named `pass` (it changed the graph).
+    fn ran(program: &Program<poot_graph_ir::ValidationOutputs>, pass: &str) -> bool {
+        program.passes().any(|ran| ran == pass)
+    }
+
+    const HANG_PASSES: [&str; 3] = [
+        "flash_attention_capped",
+        "fuse_contraction_epilogues",
+        "fuse",
+    ];
+
+    /// SC-003 on the production presets (ruling XC2-05, no synthetic `Target`): the granitemoe prefill compiled
+    /// for the ROCm preset (hang fact set) omits the hang passes and for the wgpu preset (fact clear) runs
+    /// them, and the decode step, whose router has one row, runs them on both.
+    ///
+    /// Mutations (observed red, restored; see the card record): ignore the fact in `compile`; and match
+    /// every `ArgTopK` in `routed_expert_sites` (the decode program then loses `fuse` on ROCm).
+    #[test]
+    fn routed_expert_prefill_omits_the_hang_passes_where_the_target_has_the_hang() {
+        use poot_models::model::Phase;
+        use poot_target::AmdArch;
+
+        let rocm = Target {
+            backend: Backend::AmdGcn(AmdArch::gfx1151()),
+            caps: poot_target::DeviceCaps::rocm_default(),
+        };
+        let wgpu = Target {
+            backend: Backend::SpirvVulkan,
+            caps: poot_target::DeviceCaps::wgpu_rdna3_igpu(),
+        };
+        let (prefill, map, store) = granitemoe_step_and_weights(Phase::Prefill, 4);
+        let decode = granitemoe_step(Phase::Decode, 1);
+        assert!(
+            !crate::routed_expert_sites(&prefill).is_empty(),
+            "prefill has a site"
+        );
+
+        let on_rocm = compile(&prefill, &rocm, &REPLAY).expect("prefill compiles for ROCm");
+        for pass in HANG_PASSES {
+            assert!(!ran(&on_rocm, pass), "ROCm prefill ran {pass}");
+        }
+        let on_wgpu = compile(&prefill, &wgpu, &REPLAY).expect("prefill compiles for wgpu");
+        for pass in HANG_PASSES {
+            assert!(ran(&on_wgpu, pass), "wgpu prefill skipped {pass}");
+        }
+        // Both programs compute what the traced graph computes (ADR-0101 tier 2: every element within
+        // 1e-4 relative, NaN fails), the guarded one included.
+        let prompt = [3, 17, 40, 8];
+        let want = oracle_logits(&prefill, &map, &store, &prompt);
+        for (label, program) in [("ROCm", &on_rocm), ("wgpu", &on_wgpu)] {
+            let got = oracle_logits(program.graph(), &map, &store, &prompt);
+            assert_eq!(got.len(), want.len(), "{label}: logits length");
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    (g - w).abs() <= 1e-4 * (1.0 + w.abs()),
+                    "{label}: logit {i} is {g}, the traced graph gives {w}"
+                );
+            }
+        }
+        for (label, target) in [("ROCm", &rocm), ("wgpu", &wgpu)] {
+            let program = compile(&decode, target, &REPLAY).expect("decode compiles");
+            for pass in HANG_PASSES {
+                assert!(ran(&program, pass), "{label} decode skipped {pass}");
+            }
+        }
+        assert!(
+            crate::routed_expert_sites(&decode).is_empty(),
+            "a one-row router has no site"
+        );
+    }
+
+    /// Whether each eqn of `program` that produces the router's `[tokens, experts]` logits plans the
+    /// one-thread-per-output serial kernel (`true`) or something else, the generated tiled GEMM among them.
+    fn router_choices_are_serial(
+        program: &Program<poot_graph_ir::ValidationOutputs>,
+        tokens: usize,
+        experts: usize,
+    ) -> Vec<bool> {
         let g = program.graph();
         g.eqns
             .iter()
             .filter(|eqn| {
-                matches!(eqn.op, OpKind::MatMul)
-                    && matches!(eqn.inputs.get(1), Some(Operand::Value(w))
-                        if g.aval(*w).shape == [hidden, n_experts])
+                matches!(
+                    eqn.op,
+                    OpKind::MatMul
+                        | OpKind::DenseContraction { .. }
+                        | OpKind::ContractionEpilogue { .. }
+                ) && g.aval(eqn.out).shape == [tokens, experts]
             })
             .map(|eqn| {
                 matches!(
                     program.kernel_choice(eqn),
                     KernelChoice::Generated(KernelRequest::Contraction(
-                        poot_kernelgen::ContractionSpec::TiledRegion { .. }
+                        poot_kernelgen::ContractionSpec::Serial { .. }
+                            | poot_kernelgen::ContractionSpec::DenseSerial { .. }
                     ))
                 )
             })
             .collect()
     }
 
-    /// Card 557 SC-005 (cards 186/192's MoE-router-hang guard): the guard is a planner input to the
-    /// contraction choice. A routed-expert prefill (mixtral, two layers, four prompt tokens) compiled for
-    /// AMDGCN plans every router `MatMul` on the generated tiled GEMM under `FusionPolicy::Full` and
-    /// untiled under `FusionPolicy::MoeHangGuard`, GPU-free. Mutation: drop the guard input from the
-    /// contraction choice (`planner/matmul.rs`'s `fusion == FusionPolicy::Full` guard); the guarded
-    /// routers plan tiled and this row goes red.
+    /// Card 557 SC-005: the guard is a planner input to the contraction choice. The routed prefill
+    /// compiled for AMDGCN plans its router off the serial kernel (on the tiled schedule) when the
+    /// target has no hang, and on the one-thread-per-output serial kernel when it has. Mutation: drop the
+    /// guard input from the contraction choice (`planner/matmul.rs`'s `!guarded` test); the guarded
+    /// router plans tiled and this row goes red.
     #[test]
-    fn moe_hang_guard_keeps_the_router_matmul_off_the_tiled_gemm() {
-        use poot_models::mixtral::{MixtralParams, trace_mixtral_prefill};
-        use poot_models::qwen2::Qwen2Config;
+    fn routed_prefill_keeps_the_router_off_the_tiled_gemm_under_the_hang_guard() {
+        use poot_models::model::Phase;
         use poot_target::AmdArch;
 
-        let cfg = Qwen2Config {
-            vocab: 24,
-            hidden: 16,
-            inter: 16,
-            layers: 2,
-            n_heads: 4,
-            n_kv_heads: 2,
-            head_dim: 6,
-            rotary_dim: 6,
-            max_pos: 32,
-            ..Qwen2Config::default()
+        let guarded = Target {
+            backend: Backend::AmdGcn(AmdArch::gfx1151()),
+            caps: poot_target::DeviceCaps::rocm_default(),
         };
-        let n_experts = 6;
-        let params = MixtralParams {
-            n_experts,
-            top_k: 2,
-            inter: 12,
-        };
-        let g = trace_mixtral_prefill(cfg, params, 4);
-        let amd = target_for(Backend::AmdGcn(AmdArch::gfx1151()));
+        let mut open = guarded;
+        open.caps.known_miscompiles.routed_expert_tiling_hang = false;
+        let g = granitemoe_step(Phase::Prefill, 4);
 
-        let full = compile(&g, &amd, &REPLAY).expect("the routed prefill compiles under Full");
-        let tiled = router_choices_are_tiled(&full, cfg.hidden, n_experts);
-        assert_eq!(tiled.len(), cfg.layers, "one router matmul per layer");
-        assert!(
-            tiled.iter().all(|&tiled| tiled),
-            "Full plans every router on the generated tiled GEMM: {tiled:?}"
+        let serial = |target: &Target| {
+            let program = compile(&g, target, &REPLAY).expect("the routed prefill compiles");
+            router_choices_are_serial(&program, 4, 4)
+        };
+        let open_choices = serial(&open);
+        assert_eq!(
+            open_choices.len(),
+            2,
+            "one router in each of the two routed layers"
         );
-
-        let guarded = CompileOptions {
-            fusion: FusionPolicy::MoeHangGuard,
-            ..REPLAY
-        };
-        let program = compile(&g, &amd, &guarded).expect("the guard still compiles the prefill");
-        let tiled = router_choices_are_tiled(&program, cfg.hidden, n_experts);
-        assert_eq!(tiled.len(), cfg.layers, "one router matmul per layer");
         assert!(
-            tiled.iter().all(|&tiled| !tiled),
-            "the guard must keep every router off the generated tiled GEMM: {tiled:?}"
+            open_choices.iter().all(|&serial| !serial),
+            "without the hang the router takes the tiled schedule: {open_choices:?}"
+        );
+        let guarded_choices = serial(&guarded);
+        assert_eq!(
+            guarded_choices.len(),
+            2,
+            "one router in each of the two routed layers"
+        );
+        assert!(
+            guarded_choices.iter().all(|&serial| serial),
+            "the guard must keep the router off the generated tiled GEMM: {guarded_choices:?}"
         );
     }
 
@@ -1046,9 +1197,10 @@ mod tests {
                 .planned()
                 .find(|(eqn, _)| matches!(eqn.op, OpKind::FusedRow(_)))
                 .expect("the softmax fuses into one row region");
-            let Plan::Compute { body, grid, .. } = plan else {
-                panic!("{backend:?}: the row region plans as Plan::Compute");
+            let Some(Dispatch { body, launch, .. }) = plan.single() else {
+                panic!("{backend:?}: the row region plans as one dispatch");
             };
+            let grid = launch.grid;
             let width = body.workgroup_size[0] as usize;
             assert_eq!(
                 (grid[0] as usize / width, grid[1] as usize, grid[2] as usize),
@@ -1601,7 +1753,11 @@ mod tests {
                             "{what}: carrier out of role order"
                         );
                     }
-                    assert!(matches!(plan, Plan::ComputeMeta { .. }), "{what}: {plan:?}");
+                    assert!(
+                        plan.single()
+                            .is_some_and(|dispatch| !dispatch.launch.meta.is_empty()),
+                        "{what}: {plan:?}"
+                    );
                     assert!(
                         program
                             .passes()
@@ -1744,7 +1900,9 @@ mod tests {
                     .planned()
                     .filter(|(eqn, plan)| {
                         matches!(eqn.op, OpKind::PackedDequant { .. })
-                            && matches!(plan, Plan::ComputeMeta { .. })
+                            && plan
+                                .single()
+                                .is_some_and(|dispatch| !dispatch.launch.meta.is_empty())
                             && matches!(
                                 program.kernel_choice(eqn),
                                 KernelChoice::Generated(KernelRequest::Packed(request))
@@ -1824,64 +1982,70 @@ mod tests {
     }
 
     /// The reader-lane contract on the production entry: an exact-I32 component (a `GeU` observes it) whose
-    /// member is also a runtime DynamicUpdateSlice index, which the f32 DUS kernel reads through
-    /// `Slice<f32>`, while the component's Gather reads it through `Slice<i32>`. No single buffer serves
-    /// both, so `compile` refuses by value instead of producing a program that reads reinterpreted bits.
-    /// Mutation (never left in the tree): discarding `check_agreement`'s result in
-    /// `value_storage_of_plans` -> `compile` returns a `Program` and this test fails.
+    /// member is also a `ScatterUpdate` inverse map, while the component's Gather reads it as an index. Every
+    /// movement reads an index on its component's lane, so the scatter reads the slot as exact i32 beside the
+    /// Gather and `compile` plans one lane for the slot. Mutation (never left in the tree): type the
+    /// scatter's inverse map as `Ty::F32` whatever its component (`planner/movement.rs`) -> the scatter reads
+    /// the exact bytes as floats and `compile` refuses with `I32ReaderLaneConflict`.
     #[test]
-    fn compile_refuses_an_i32_value_read_on_both_lanes() {
+    fn compile_reads_an_exact_i32_slot_on_one_lane_for_gather_and_scatter_update() {
         let b = Builder::new();
-        let idx = b.slot(Slot::Pos, TensorType::new(vec![], DType::I32));
-        let table = b.constant("table", TensorType::f32(vec![16, 8]));
-        let row = b.gather(table, 0, idx);
-        let late = b.cast(b.binary_scalar(BinOp::GeU, idx, Scalar::I32(3)), DType::F32);
-        let update = b.binary(BinOp::Add, row, b.broadcast(late, vec![8]));
-        let cache = b.state_input("cache", TensorType::f32(vec![32, 8]), StateRole::Recurrent);
-        let written = b.dynamic_update_slice_dyn(cache, b.reshape(update, vec![1, 8]), idx, 0);
-        let g = b.finish_with_state(written, &[(cache, written)]);
-
-        let error = compile(&g, &wgpu(), &REPLAY).expect_err("the slot is read on both lanes");
-        assert!(
-            matches!(
-                &error,
-                CompileError::Plan(plan) if matches!(**plan, PlanError::I32ReaderLaneConflict { value, .. } if value == idx.id)
-            ),
-            "expected I32ReaderLaneConflict on v{}, got {error:?}",
-            idx.id
-        );
-    }
-
-    /// The same conflict reached through an alias: the exact-I32 `[1]` slot is the Gather's `Slice<i32>`
-    /// index, and its `Reshape` to `[]` (a `Plan::Alias` of the slot's buffer) is the f32 DUS kernel's
-    /// `Slice<f32>` index. Per value, each is read on one lane; per buffer, the slot is read on both, and
-    /// the check names the slot.
-    ///
-    /// Mutation (never left in the tree): recording reads under the read value instead of its alias root
-    /// in `I32ReadLanes::of_plans` -> `compile` returns a `Program` and this test fails.
-    #[test]
-    fn compile_refuses_an_i32_buffer_read_on_both_lanes_through_an_alias() {
-        let b = Builder::new();
-        let idx = b.slot(Slot::Pos, TensorType::new(vec![1], DType::I32));
+        let idx = b.slot(Slot::Pos, TensorType::new(vec![4], DType::I32));
         let table = b.constant("table", TensorType::f32(vec![16, 8]));
         let rows = b.gather(table, 0, idx);
         let late = b.cast(b.binary_scalar(BinOp::GeU, idx, Scalar::I32(3)), DType::F32);
-        let update = b.binary(BinOp::Add, rows, b.broadcast(late, vec![1, 8]));
-        let cache = b.state_input("cache", TensorType::f32(vec![32, 8]), StateRole::Recurrent);
-        let start = b.reshape(idx, vec![]);
-        let written = b.dynamic_update_slice_dyn(cache, update, start, 0);
+        let update = b.binary(
+            BinOp::Add,
+            rows,
+            b.broadcast(b.reshape(late, vec![4, 1]), vec![4, 8]),
+        );
+        let cache = b.state_input("cache", TensorType::f32(vec![4, 8]), StateRole::Recurrent);
+        let written = b.scatter_update(cache, update, idx);
         let g = b.finish_with_state(written, &[(cache, written)]);
 
-        let error =
-            compile(&g, &wgpu(), &REPLAY).expect_err("the slot's buffer is read on both lanes");
-        assert!(
-            matches!(
-                &error,
-                CompileError::Plan(plan) if matches!(**plan, PlanError::I32ReaderLaneConflict { value, .. } if value == idx.id)
-            ),
-            "expected I32ReaderLaneConflict on v{}, got {error:?}",
-            idx.id
+        let program = compile(&g, &wgpu(), &REPLAY).expect("every reader agrees on the exact lane");
+        let &(slot, _) = program
+            .graph()
+            .slots
+            .iter()
+            .find(|&&(_, kind)| kind == Slot::Pos)
+            .expect("the Pos slot survives compile");
+        assert!(!program.storage().storage(slot).is_f32_mirror());
+    }
+
+    /// The same agreement reached through an alias: the exact-I32 `[4]` slot is the Gather's index, and its
+    /// `Reshape` round trip (a `Plan::Alias` of the slot's buffer) is the scatter's inverse map. Per value
+    /// each is read on one lane; per buffer the slot is read on one lane too, and `compile` plans it as exact
+    /// i32 for both readers.
+    ///
+    /// Mutation (never left in the tree): record reads under the read value instead of its alias root in
+    /// `I32ReadLanes::of_plans` and type the inverse map as `Ty::F32` -> the conflict hides behind the alias
+    /// and `compile` returns a program whose scatter reads exact bytes as floats.
+    #[test]
+    fn compile_reads_an_exact_i32_buffer_on_one_lane_through_an_alias() {
+        let b = Builder::new();
+        let idx = b.slot(Slot::Pos, TensorType::new(vec![4], DType::I32));
+        let table = b.constant("table", TensorType::f32(vec![16, 8]));
+        let rows = b.gather(table, 0, idx);
+        let late = b.cast(b.binary_scalar(BinOp::GeU, idx, Scalar::I32(3)), DType::F32);
+        let update = b.binary(
+            BinOp::Add,
+            rows,
+            b.broadcast(b.reshape(late, vec![4, 1]), vec![4, 8]),
         );
+        let cache = b.state_input("cache", TensorType::f32(vec![4, 8]), StateRole::Recurrent);
+        let inverse = b.reshape(b.reshape(idx, vec![2, 2]), vec![4]);
+        let written = b.scatter_update(cache, update, inverse);
+        let g = b.finish_with_state(written, &[(cache, written)]);
+
+        let program = compile(&g, &wgpu(), &REPLAY).expect("the slot's buffer is read on one lane");
+        let &(slot, _) = program
+            .graph()
+            .slots
+            .iter()
+            .find(|&&(_, kind)| kind == Slot::Pos)
+            .expect("the Pos slot survives compile");
+        assert!(!program.storage().storage(slot).is_f32_mirror());
     }
 
     // mutants-m4 H5: the packed-chain recognizers' `consumers[x].len() != 1 || is_graph_escape(g, x)`
@@ -2386,7 +2550,9 @@ mod tests {
                     planned.iter().any(|(eqn, plan)| matches!(
                         eqn.op,
                         OpKind::PackedRowGather { .. }
-                    ) && matches!(plan, Plan::ComputeMeta { .. })
+                    ) && plan
+                        .single()
+                        .is_some_and(|dispatch| !dispatch.launch.meta.is_empty())
                         && matches!(
                             program.kernel_choice(eqn),
                             KernelChoice::Generated(KernelRequest::Packed(request))
@@ -2399,7 +2565,7 @@ mod tests {
     }
 
     /// A former region source built from primitives. Mirrored by the wgpu acceptance fixture.
-    /// MoeHangGuard leaves this chain visible to the planner; Full fuses it before planning.
+    /// The routed-expert hang guard leaves this chain visible to the planner; the full pipeline fuses it first.
     fn former_region_chain_fixture() -> Graph {
         let b = Builder::new();
         let x = b.constant("x", TensorType::f32(vec![2, 5]));
@@ -2445,8 +2611,9 @@ mod tests {
         b.finish(y)
     }
 
-    /// Submission mode does not affect the compiled plans. Both fusion policies matter: Full
-    /// hides the old region shape, whereas MoeHangGuard exposed the baseline capture refusal.
+    /// Submission mode does not affect the compiled plans. The full and the routed-expert-guarded pipelines
+    /// both matter: the full one hides the old region shape, whereas the guarded one exposed the baseline
+    /// capture refusal.
     #[test]
     fn compile_output_does_not_depend_on_submission_mode() {
         let fixtures: [(&str, Graph); 4] = [
@@ -2456,21 +2623,22 @@ mod tests {
             ("former_region_chain", former_region_chain_fixture()),
         ];
         for (name, graph) in &fixtures {
-            for fusion in [FusionPolicy::Full, FusionPolicy::MoeHangGuard] {
+            for guarded in [false, true] {
                 let replay = CompileOptions {
                     execution: Submission::Replay,
-                    fusion,
                     limits: crate::CompileLimits::STANDARD,
                 };
                 let uncached = CompileOptions {
                     execution: Submission::Eager,
-                    fusion,
                     limits: crate::CompileLimits::STANDARD,
                 };
-                let under_replay = compile(graph, &wgpu(), &replay)
-                    .unwrap_or_else(|error| panic!("{name}/{fusion:?}: CaptureReplay: {error}"));
-                let under_uncached = compile(graph, &wgpu(), &uncached)
-                    .unwrap_or_else(|error| panic!("{name}/{fusion:?}: UncachedResident: {error}"));
+                let (graph, caps) =
+                    poot_test_util::graph_fixtures::pipeline_input(graph, wgpu().caps, guarded);
+                let target = Target { caps, ..wgpu() };
+                let under_replay = compile(&graph, &target, &replay)
+                    .unwrap_or_else(|error| panic!("{name}/{guarded}: CaptureReplay: {error}"));
+                let under_uncached = compile(&graph, &target, &uncached)
+                    .unwrap_or_else(|error| panic!("{name}/{guarded}: UncachedResident: {error}"));
                 let replay_plans: Vec<String> = under_replay
                     .planned()
                     .map(|(_, plan)| format!("{plan:?}"))
@@ -2481,7 +2649,7 @@ mod tests {
                     .collect();
                 assert_eq!(
                     replay_plans, uncached_plans,
-                    "{name}/{fusion:?}: CaptureReplay and UncachedResident produced different plans"
+                    "{name}/{guarded}: CaptureReplay and UncachedResident produced different plans"
                 );
             }
         }

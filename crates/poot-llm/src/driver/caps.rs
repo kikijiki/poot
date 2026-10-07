@@ -17,9 +17,10 @@ use super::block_table::BLOCK_SIZE;
 use super::chunks::Piece;
 use super::error::{DriverError, InvalidOptions};
 use super::lora::{AdapterSet, GenerationId};
+use super::speculate::SpeculationCaps;
 use super::step::{Serving, serving_phase};
 use super::suffix::Head;
-use super::{Driver, EntryKey, Warm};
+use super::{Driver, EntryKey, ModelRole, Warm};
 
 /// The paged pool a driver serves from: sized once, because state avals pin one pool per driver.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,6 +126,8 @@ pub struct DriverCaps {
     /// Verify windows with prepared entries, per row count: a window is admitted only on the row
     /// counts a `prepare` call listed beside it.
     pub windows: Vec<WindowCap>,
+    /// The speculation the driver's draft policy serves; `None` under `DraftPolicy::Off`.
+    pub speculation: Option<SpeculationCaps>,
     pub inputs: InputSet,
 }
 
@@ -142,9 +145,7 @@ impl Driver {
             (Some(held), asked) if held != asked => {
                 return Err(InvalidOptions::LayoutChanged.into());
             }
-            (_, Layout::Contiguous)
-                if shapes.rows.iter().any(|rows| rows.get() != 1) || !shapes.windows.is_empty() =>
-            {
+            (_, Layout::Contiguous) if shapes.rows.iter().any(|rows| rows.get() != 1) => {
                 return Err(InvalidOptions::ContiguousServesOneRow.into());
             }
             _ => {}
@@ -162,6 +163,7 @@ impl Driver {
         if serves_one(self.residency) {
             return Err(InvalidOptions::RecurrentServesOneSequence.into());
         }
+        self.check_draft()?;
         let kv = match shapes.layout {
             Layout::Contiguous => KvLayout::Contiguous,
             Layout::Paged(pool) => pool.kv(),
@@ -179,19 +181,22 @@ impl Driver {
             for &rows in shapes.rows {
                 for &head in shapes.heads {
                     for &piece in &pieces {
-                        self.prepare_entry(kv, piece_key(piece), rows, head, adapters)?;
+                        let target = ModelRole::Target;
+                        self.prepare_entry(target, kv, piece_key(piece), rows, head, adapters)?;
                     }
                 }
                 for &width in shapes.windows {
                     let key = (width.get(), LogitRows::All);
-                    self.prepare_entry(kv, key, rows, Head::GREEDY, adapters)?;
+                    self.prepare_entry(ModelRole::Target, kv, key, rows, Head::GREEDY, adapters)?;
                 }
             }
         }
         // The residency of this model is known once an entry compiled.
+        self.check_speculation_state()?;
         if serves_one(self.residency) {
             return Err(InvalidOptions::RecurrentServesOneSequence.into());
         }
+        self.prepare_speculation(shapes, kv, &pieces)?;
         if self.serving.is_none() {
             self.serving = Some(Serving::new(shapes.layout));
         }
@@ -240,8 +245,8 @@ impl Driver {
         // executor no longer has.
         let mut outcome = Ok(());
         for key in dropped {
-            let id = self.entries[&key].id;
-            if let Err(error) = self.executor.remove_entry(self.exe, id) {
+            let (id, exe) = (self.entries[&key].id, self.entries[&key].exe);
+            if let Err(error) = self.executor.remove_entry(exe, id) {
                 outcome = Err(error.into());
                 break;
             }
@@ -273,8 +278,52 @@ impl Driver {
         self.stats.compiles
     }
 
+    /// Admit the speculation of the driver's draft policy: a verify-window entry per row count beside
+    /// decode, and under a draft model its own decode and prefill entries on a second executable.
+    /// The window carries the greedy suffix, and the logits head when a request samples.
+    fn prepare_speculation(
+        &mut self,
+        shapes: &ServingShapes<'_>,
+        kv: KvLayout,
+        pieces: &[Piece],
+    ) -> Result<(), DriverError> {
+        let Some(speculation) = self.speculation.policy.caps() else {
+            return Ok(());
+        };
+        let sampled = shapes.heads.iter().any(|&head| head != Head::GREEDY);
+        let heads: &[Head] = if sampled {
+            &[Head::GREEDY, Head::Logits]
+        } else {
+            &[Head::GREEDY]
+        };
+        let window = (speculation.window.get(), LogitRows::All);
+        for adapters in std::iter::once(None).chain(shapes.adapters.iter().copied().map(Some)) {
+            for &rows in shapes.rows {
+                for &head in heads {
+                    self.prepare_entry(ModelRole::Target, kv, window, rows, head, adapters)?;
+                }
+            }
+        }
+        self.load_draft()?;
+        if self.speculation.draft.is_some() {
+            // The draft's prompt pieces run unread and a proposal is one decode step: only that
+            // step needs the logits head of a sampled row.
+            for &rows in shapes.rows {
+                for &piece in pieces {
+                    let draft = ModelRole::Draft;
+                    self.prepare_entry(draft, kv, piece_key(piece), rows, Head::GREEDY, None)?;
+                    if sampled && piece == Piece::Decode {
+                        self.prepare_entry(draft, kv, piece_key(piece), rows, Head::Logits, None)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn prepare_entry(
         &mut self,
+        role: ModelRole,
         kv: KvLayout,
         (tokens, logits): (usize, LogitRows),
         rows: NonZeroUsize,
@@ -282,6 +331,7 @@ impl Driver {
         adapters: Option<GenerationId>,
     ) -> Result<(), DriverError> {
         let key = EntryKey {
+            role,
             phase: serving_phase(tokens, logits),
             shape: StepShape {
                 rows,
@@ -307,7 +357,11 @@ impl Driver {
         let mut heads = HeadSet::default();
         let mut windows = Vec::new();
         let mut generations = HashSet::new();
-        for key in self.entries.keys().filter(|key| key.shape.kv == kv) {
+        let target_entries = self
+            .entries
+            .keys()
+            .filter(|key| key.role == ModelRole::Target && key.shape.kv == kv);
+        for key in target_entries {
             let StepShape { rows, tokens, .. } = key.shape;
             if !row_counts.contains(&rows) {
                 row_counts.push(rows);
@@ -349,6 +403,7 @@ impl Driver {
                 generations: generations.len(),
             }),
             windows,
+            speculation: self.speculation.policy.caps(),
             inputs: InputSet { tokens: true },
         })
     }

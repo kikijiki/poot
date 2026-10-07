@@ -23,8 +23,7 @@ pub struct AlibiCase {
     /// `per_head` must differ from this fixture's: a row asserts it, which shows `per_head` can tell
     /// the two apart.
     pub head0_broadcast: Fixture,
-    /// The prefix of the planned op name this case runs as (`flash_attn_decode` or
-    /// `flash_attn_prefill`).
+    /// The prefix of the planned op name this case runs as (`attention`).
     pub flash_op: &'static str,
 }
 
@@ -43,10 +42,8 @@ fn centered(seed: u64, n: usize) -> Vec<f32> {
         .collect()
 }
 
-/// The three flash kernels the planner picks between: the synthesized region decode, the
-/// synthesized region prefill, and the imported flash prefill (chosen for a softcapped prefill,
-/// which the region prefill has no softcap for). The per-head mask is a real ALiBi mask:
-/// visibility plus `-slope[h] * (query - key)`.
+/// The three attention shapes the generated kernel serves: a decode, a prefill, and a softcapped
+/// prefill. The per-head mask is a real ALiBi mask: visibility plus `-slope[h] * (query - key)`.
 pub fn alibi_flash_cases() -> Vec<AlibiCase> {
     vec![
         alibi_decode_case(),
@@ -97,7 +94,7 @@ fn alibi_decode_case() -> AlibiCase {
     AlibiCase {
         head0_broadcast: build("alibi_flash_decode_head0", 1, mask[..cap].to_vec()),
         per_head: build("alibi_flash_decode", HQ, mask),
-        flash_op: "flash_attn_decode",
+        flash_op: "attention",
     }
 }
 
@@ -149,7 +146,7 @@ fn alibi_prefill_case(name: &'static str, softcap: Option<f32>) -> AlibiCase {
     AlibiCase {
         head0_broadcast: build("alibi_flash_prefill_head0", 1, mask[..l * l].to_vec()),
         per_head: build(name, HQ, mask),
-        flash_op: "flash_attn_prefill",
+        flash_op: "attention",
     }
 }
 

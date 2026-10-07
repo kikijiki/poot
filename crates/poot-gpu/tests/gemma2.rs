@@ -5,11 +5,9 @@
 //! random weights, a small vocab (softcap and flash prefill do not touch lm_head) and 2 layers (1 global,
 //! 1 SWA).
 //!
-//! The graph fuses through `OpKind::FlashAttentionPrefill`, and the planner chooses the imported kernel
-//! (`pootc/tests/kernels/flash_prefill.rs`) because the generated region prefill has no softcap (Card
-//! 557). `head_dim=256` equals `FLASH_LDS_CAP`, the imported kernel's limit. This is the only GPU test
-//! that runs the softcap branch (`if has_softcap_f > 0.5`) of that kernel; the other flash-prefill tests
-//! use `has_softcap_f == 0.0`.
+//! The graph fuses through `OpKind::Attention` with the real softcap, and the planner generates the one
+//! attention kernel with its softcap score transform. This is the GPU test that runs the softcap branch
+//! of that kernel at the real head width of 256.
 use poot_runtime_common::DeviceBackend;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,10 +19,11 @@ use poot_gpu::device::WgpuDevice;
 use poot_graph_ir::op::{FusedOp, FusedOperand, OpKind, UnOp};
 use poot_graph_ir::{Graph, Slot, SlotKey, Storage};
 use poot_graph_plan::{
-    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, FusionPolicy, ImportedKernel,
-    KernelChoice, Partition, StagedProgram, Submission, Target, TargetSet, compile_staged,
+    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, KernelChoice, Partition,
+    StagedProgram, Submission, Target, TargetSet, compile_staged,
 };
 use poot_graph_plan::{cse, fuse};
+use poot_kernelgen::{KernelRequest, ScoreTransform};
 use poot_models::model::{LogitRows, Phase};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::DType;
@@ -45,7 +44,6 @@ fn staged(g: &Graph, target: Target) -> StagedProgram<poot_graph_ir::ValidationO
         },
         &CompileOptions {
             execution: Submission::Replay,
-            fusion: FusionPolicy::Full,
             limits: poot_graph_plan::CompileLimits::STANDARD,
         },
     )
@@ -54,8 +52,10 @@ fn staged(g: &Graph, target: Target) -> StagedProgram<poot_graph_ir::ValidationO
 
 fn f32_bytes(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 
@@ -195,7 +195,7 @@ fn gpu_consts_and_slots(
     (builder.build(), slots)
 }
 
-/// Gemma2 attention-logit softcap (`Some(50.0)`, gemma2-2b's value) inside the imported flash-prefill
+/// Gemma2 attention-logit softcap (`Some(50.0)`, gemma2-2b's value) inside the generated attention
 /// kernel on a GPU, compared to the CPU reference (materialized softcap, unoptimized graph). Skips without a GPU.
 #[test]
 fn gemma2_softcap_flash_prefill_gpu_matches_cpu() {
@@ -223,7 +223,7 @@ fn gemma2_softcap_flash_prefill_gpu_matches_cpu() {
     assert_eq!(
         cfg.head_dim,
         Some(256),
-        "gemma2-2b's real head_dim must stay the FLASH_LDS_CAP boundary"
+        "gemma2-2b's real head_dim is the 256 this probe exists for"
     );
 
     let n = 24usize;
@@ -249,7 +249,7 @@ fn gemma2_softcap_flash_prefill_gpu_matches_cpu() {
     let flash_eqns: Vec<&poot_graph_ir::Eqn> = opt
         .eqns
         .iter()
-        .filter(|e| matches!(e.op, OpKind::FlashAttentionPrefill { .. }))
+        .filter(|e| matches!(e.op, OpKind::Attention(_)))
         .collect();
     assert_eq!(
         flash_eqns.len(),
@@ -257,22 +257,26 @@ fn gemma2_softcap_flash_prefill_gpu_matches_cpu() {
         "expected one fused flash-prefill op per layer"
     );
     for eqn in &flash_eqns {
-        let OpKind::FlashAttentionPrefill { softcap, .. } = eqn.op else {
+        let OpKind::Attention(attrs) = &eqn.op else {
             unreachable!()
         };
-        assert_eq!(softcap, Some(50.0), "fused op must carry the real softcap");
-        // Card 557: the planner records the kernel; the generated region prefill has no softcap, so
-        // a softcapped prefill takes the imported kernel card 198 edited.
+        assert_eq!(
+            attrs.softcap,
+            Some(50.0),
+            "fused op must carry the real softcap"
+        );
+        // The planner records the kernel: one generated attention request carrying the softcap.
+        let KernelChoice::Generated(KernelRequest::Attention(spec)) = stage.kernel_choice(eqn)
+        else {
+            panic!(
+                "a softcapped head_dim=256 prefill should plan the generated attention, got {:?}",
+                stage.kernel_choice(eqn)
+            );
+        };
         assert!(
-            matches!(
-                stage.kernel_choice(eqn),
-                KernelChoice::Imported {
-                    kernel: ImportedKernel::FlashPrefill,
-                    ..
-                }
-            ),
-            "a softcapped head_dim=256 prefill should plan the imported flash prefill, got {:?}",
-            stage.kernel_choice(eqn)
+            matches!(spec.score, ScoreTransform::ScaleSoftcap { cap_bits, .. } if cap_bits == 50.0f32.to_bits()),
+            "the request carries the real softcap: {:?}",
+            spec.score
         );
     }
 

@@ -1140,3 +1140,160 @@ fn sample_token_gumbel_topp_only_excludes_untruncated_winner_ptx_matches_cpu() {
 // `i32_slot_gather_variants_compiled_match_cpu_bit_exact` on wgpu/ROCm (`poot_test_util::
 // i32_slot_gather`, shared ground truth); only PTX's own row is missing until the contract gains a
 // seeding primitive or a priming-step pattern.
+
+/// Round an f32 to its BF16 bits, nearest even.
+fn bf16_bits(x: f32) -> u16 {
+    let bits = x.to_bits();
+    ((bits + 0x7fff + ((bits >> 16) & 1)) >> 16) as u16
+}
+
+/// POOT-1032 (PTX, the generated tiled GEMM): a dense head over an F32 and a packed-BF16 `[N, K]` weight at
+/// `M > 1` (a single partial row-tile at `M == 5`, many at `M == 160`) with a bias and a residual fuses into one
+/// `ContractionEpilogue { head: Dense }`, and the fused and unfused device results are bit-identical. The chain is
+/// two adds, which cannot contract, so the comparison is exact. Mutation: drop the epilogue from the tiled store in
+/// `tiled_region`; the nonzero inputs then differ and this row goes red. Runs on the PTX pod.
+#[test]
+fn a_dense_tiled_epilogue_equals_the_unfused_program_on_ptx() {
+    use poot_graph_plan::{CompileLimits, CompileOptions, Submission, Target, compile};
+    use poot_tensor::DType;
+    let Some(mut ptx) = try_ptx() else { return };
+    let target = Target {
+        backend: poot_target::Backend::Nvptx,
+        caps: poot_executor::Device::target(&ptx).caps,
+    };
+    let (k, n) = (37usize, 53usize);
+    for weight_dtype in [DType::F32, DType::BF16] {
+        for m in [5usize, 160] {
+            let label = format!("dense tiled epilogue {weight_dtype:?} M={m}");
+            let b = Builder::new();
+            let x = b.constant("x", TensorType::f32(vec![m, k]));
+            let w = b.constant("w", TensorType::new(vec![n, k], weight_dtype));
+            let bias = b.constant("bias", TensorType::f32(vec![n]));
+            let residual = b.constant("residual", TensorType::f32(vec![m, n]));
+            let head = b.matmul(x, b.transpose(w, vec![1, 0]));
+            let out = b.binary(BinOp::Add, b.binary(BinOp::Add, head, bias), residual);
+            let weight_values = fill(2, n * k);
+            let weight = match weight_dtype {
+                DType::BF16 => HostTensor::bf16(
+                    vec![n, k],
+                    weight_values.into_iter().map(bf16_bits).collect(),
+                ),
+                _ => HostTensor::f32(vec![n, k], weight_values),
+            };
+            let inputs: HashMap<ValueId, Value> = HashMap::from([
+                (x.id, HostTensor::f32(vec![m, k], fill(1, m * k)).into()),
+                (w.id, weight.into()),
+                (bias.id, HostTensor::f32(vec![n], fill(3, n)).into()),
+                (
+                    residual.id,
+                    HostTensor::f32(vec![m, n], fill(4, m * n)).into(),
+                ),
+            ]);
+            let g = b.finish(out);
+            let fused_graph = compile(
+                &g,
+                &target,
+                &CompileOptions {
+                    execution: Submission::Replay,
+                    limits: CompileLimits::STANDARD,
+                },
+            )
+            .expect("the graph compiles");
+            let heads: Vec<_> = fused_graph
+                .graph()
+                .eqns
+                .iter()
+                .filter_map(|eqn| match &eqn.op {
+                    poot_graph_ir::OpKind::ContractionEpilogue { head, .. } => Some(*head),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                heads,
+                [poot_graph_ir::op::ContractionHead::Dense {
+                    weight: weight_dtype
+                }],
+                "{label}: one fused dense contraction"
+            );
+            let fused = common::run_resident_with_fusion(&mut ptx, &g, &inputs, false);
+            let unfused = common::run_resident_with_fusion(&mut ptx, &g, &inputs, true);
+            let bits = |t: &HostTensor| -> Vec<u32> {
+                t.as_f32().unwrap().iter().map(|v| v.to_bits()).collect()
+            };
+            assert_eq!(
+                bits(&fused),
+                bits(&unfused),
+                "{label}: the fused device program must equal the unfused one bit for bit"
+            );
+        }
+    }
+}
+
+/// POOT-1036 (PTX, the generated tiled GEMM over an f32 `[K, N]` weight): a plain `MatMul` head at `M > 1` with a
+/// bias and a residual fuses into one `ContractionEpilogue { head: MatMul }` (a single partial row-tile at `M == 5`,
+/// many at `M == 160`), and the fused and unfused device results are bit-identical (two adds cannot contract).
+/// Mutation: drop the `Tileable` arm of `epilogue_head_lowers`; the head stays apart and this row goes red.
+/// Runs on the PTX pod.
+#[test]
+fn a_tiled_matmul_epilogue_equals_the_unfused_program_on_ptx() {
+    use poot_graph_plan::{CompileLimits, CompileOptions, Submission, Target, compile};
+    let Some(mut ptx) = try_ptx() else { return };
+    let target = Target {
+        backend: poot_target::Backend::Nvptx,
+        caps: poot_executor::Device::target(&ptx).caps,
+    };
+    let (k, n) = (37usize, 53usize);
+    for m in [5usize, 160] {
+        let label = format!("tiled matmul epilogue M={m}");
+        let b = Builder::new();
+        let x = b.constant("x", TensorType::f32(vec![m, k]));
+        let w = b.constant("w", TensorType::f32(vec![k, n]));
+        let bias = b.constant("bias", TensorType::f32(vec![n]));
+        let residual = b.constant("residual", TensorType::f32(vec![m, n]));
+        let head = b.matmul(x, w);
+        let out = b.binary(BinOp::Add, b.binary(BinOp::Add, head, bias), residual);
+        let inputs: HashMap<ValueId, Value> = HashMap::from([
+            (x.id, HostTensor::f32(vec![m, k], fill(1, m * k)).into()),
+            (w.id, HostTensor::f32(vec![k, n], fill(2, k * n)).into()),
+            (bias.id, HostTensor::f32(vec![n], fill(3, n)).into()),
+            (
+                residual.id,
+                HostTensor::f32(vec![m, n], fill(4, m * n)).into(),
+            ),
+        ]);
+        let g = b.finish(out);
+        let fused_graph = compile(
+            &g,
+            &target,
+            &CompileOptions {
+                execution: Submission::Replay,
+                limits: CompileLimits::STANDARD,
+            },
+        )
+        .expect("the graph compiles");
+        let heads: Vec<_> = fused_graph
+            .graph()
+            .eqns
+            .iter()
+            .filter_map(|eqn| match &eqn.op {
+                poot_graph_ir::OpKind::ContractionEpilogue { head, .. } => Some(*head),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            heads,
+            [poot_graph_ir::op::ContractionHead::MatMul],
+            "{label}: one fused matmul contraction"
+        );
+        let fused = common::run_resident_with_fusion(&mut ptx, &g, &inputs, false);
+        let unfused = common::run_resident_with_fusion(&mut ptx, &g, &inputs, true);
+        let bits = |t: &HostTensor| -> Vec<u32> {
+            t.as_f32().unwrap().iter().map(|v| v.to_bits()).collect()
+        };
+        assert_eq!(
+            bits(&fused),
+            bits(&unfused),
+            "{label}: the fused device program must equal the unfused one bit for bit"
+        );
+    }
+}

@@ -1,5 +1,7 @@
 use super::*;
-use poot_target::{FLASH_LDS_CAP, FLASH_PREFILL_LDS_CAP};
+use poot_graph_ir::{
+    AttentionAttrs, ComputedConst, KeyLayout, KvBound, recognize_index_bounds_guard,
+};
 
 /// Why the attention matcher did not fuse a candidate equation, in the order the checks run. The pass
 /// leaves the equation alone and records the first failing check (it never guesses); tests assert the
@@ -32,12 +34,18 @@ pub(super) enum AttentionDecline {
     KeyTranspose,
     /// The key or value GQA repeat chains disagree (`n_rep_k != n_rep_v`).
     GqaRepeatMismatch,
-    /// A decode-shaped (`M == 1`) match carries a softcap, which `FlashAttentionDecode` cannot express.
-    DecodeSoftcap,
+    /// The scores pass through a `Select` that is not the canonical live-bound score guard: `Select(active,
+    /// scores, -inf)` over the row's key positions, `active` the length comparison.
+    LiveScoreGuard,
+    /// A live-bound score guard without the matching guard on the keys and values: some source of the key (or
+    /// the value) is not `Select(active, x, 0)` over the same length, so inactive K or V could still reach a
+    /// matmul and the guarded semantics do not hold.
+    LiveKeyGuard,
+    /// The live length is not proved to lie in `1..=Lk`: it is not `guarded + 1` of a canonical index-bounds
+    /// guard over `Lk` whose witness the graph declares as a validation output.
+    LiveLengthUnproved,
     /// The fused op's own typing rule disagrees with the region it would replace (infer-and-compare).
     TypeMismatch,
-    /// A decode head dim exceeds the fused decode kernel's LDS cap.
-    HeadDimExceedsCap,
 }
 
 /// Why the rope matcher did not fuse a candidate equation. The same first-failing-check contract as
@@ -180,18 +188,237 @@ pub fn canonicalize_with_declines<V: ValidationChannel>(
 }
 /// A matched materialized softmax-attention subgraph (the operands of the fused op it collapses to).
 pub(super) struct AttnMatch {
-    q: ValueId,
-    k: ValueId, // pre-GQA-repeat key
-    v: ValueId, // pre-GQA-repeat value
-    mask: ValueId,
+    pub(super) q: ValueId,
+    pub(super) k: ValueId, // pre-GQA-repeat key (the per-head part of a split key)
+    /// The part of a split key shared by every key head, before its repeat chain.
+    pub(super) k_shared: Option<ValueId>,
+    pub(super) key: KeyLayout,
+    pub(super) v: ValueId, // pre-GQA-repeat value
+    pub(super) mask: ValueId,
+    /// The proved live length `[B]`, when the chain is the guarded live-capacity composite.
+    pub(super) len: Option<ValueId>,
+    pub(super) n_rep: usize,
+    pub(super) scale: f32,
+    pub(super) decode: bool, // M==1 (decode) vs M>1 (prefill)
+    /// `Some(c)` when the scaled `Q K^T` passes through a Gemma2/Grok attention-logit softcap
+    /// (`c * tanh(scores / c)`, [`poot_graph_ir::ops::softcap`]) before the mask-add.
+    pub(super) softcap: Option<f32>,
+}
+
+/// A key (or value) source as the live-bound composite guards it: the data and the condition that selects it.
+struct Guarded {
+    data: ValueId,
+    active: ValueId,
+}
+
+/// `value`'s producing equation and its three value operands when it is a `Select`.
+fn select_operands<V: ValidationChannel>(
+    g: &Graph<V>,
+    prod: &HashMap<ValueId, usize>,
+    value: ValueId,
+) -> Option<[ValueId; 3]> {
+    let eqn = prod.get(&value).map(|&i| &g.eqns[i])?;
+    if !matches!(eqn.op, OpKind::Select) {
+        return None;
+    }
+    match eqn.inputs.as_slice() {
+        [Operand::Value(cond), Operand::Value(t), Operand::Value(f)] => Some([*cond, *t, *f]),
+        _ => None,
+    }
+}
+
+/// `value` as the `[0, 1, .., len)` range of `dtype`, produced by an `Iota` equation or bound as the computed
+/// constant `fold_iota` leaves.
+fn iota_len<V: ValidationChannel>(
+    g: &Graph<V>,
+    prod: &HashMap<ValueId, usize>,
+    value: ValueId,
+    dtype: DType,
+) -> Option<usize> {
+    match prod.get(&value).map(|&i| &g.eqns[i].op) {
+        Some(OpKind::Iota { len, dtype: d }) if *d == dtype => Some(*len),
+        Some(_) => None,
+        None => match g.meta(value).storage {
+            Storage::Computed(ComputedConst::Iota { len, dtype: d }) if d == dtype => Some(len),
+            _ => None,
+        },
+    }
+}
+
+/// The key positions `1..=lk` of the live bound: `Add(iota_i32(lk), 1)`, exact I32 `[lk]`.
+fn is_key_ends<V: ValidationChannel>(
+    g: &Graph<V>,
+    prod: &HashMap<ValueId, usize>,
+    ends: ValueId,
+    lk: usize,
+) -> bool {
+    let Some(eqn) = prod.get(&ends).map(|&i| &g.eqns[i]) else {
+        return false;
+    };
+    matches!(eqn.op, OpKind::Binary(BinOp::Add))
+        && matches!(
+            value_and_scalar(&eqn.inputs),
+            Some((iota, Scalar::I32(1))) if iota_len(g, prod, iota, DType::I32) == Some(lk)
+        )
+}
+
+/// `value` as `reshape(source)` to exactly `shape`.
+fn reshaped_from<V: ValidationChannel>(
+    g: &Graph<V>,
+    prod: &HashMap<ValueId, usize>,
+    value: ValueId,
+    shape: &[usize],
+) -> Option<ValueId> {
+    let eqn = prod.get(&value).map(|&i| &g.eqns[i])?;
+    match (&eqn.op, eqn.inputs.as_slice()) {
+        (OpKind::Reshape { shape: target }, [Operand::Value(source)]) if target == shape => {
+            Some(*source)
+        }
+        _ => None,
+    }
+}
+
+/// The length behind a live-bound activity condition `Ge(reshape(len, [B,1,1,1]), reshape(ends, along))`,
+/// where `along` puts the `lk` key positions on the key-row axis (`[1,1,lk,1]`) or the score-row axis
+/// (`[1,1,1,lk]`). `None` for any other comparison: an off-by-one key range, another operand order, a
+/// different axis.
+fn live_active_len<V: ValidationChannel>(
+    g: &Graph<V>,
+    prod: &HashMap<ValueId, usize>,
+    active: ValueId,
+    lk: usize,
+    along: [usize; 4],
+) -> Option<ValueId> {
+    let eqn = prod.get(&active).map(|&i| &g.eqns[i])?;
+    let (OpKind::Binary(BinOp::Ge), [Operand::Value(len_view), Operand::Value(ends_view)]) =
+        (&eqn.op, eqn.inputs.as_slice())
+    else {
+        return None;
+    };
+    let len = reshaped_from(g, prod, *len_view, &[g.aval(*len_view).shape[0], 1, 1, 1])?;
+    let ends = reshaped_from(g, prod, *ends_view, &along)?;
+    is_key_ends(g, prod, ends, lk).then_some(len)
+}
+
+/// Which select fallback of the live bound a value must be.
+#[derive(Clone, Copy)]
+enum LiveFallback {
+    /// The K/V rows' `Mul(iota(lk), 0.0)`.
+    Zero,
+    /// The scores' `Add(Mul(iota(lk), 0.0), -inf)`.
+    NegInf,
+}
+
+/// `fallback` as the live bound's select fallback over key row `along`: `reshape` of the F32 zero range
+/// `Mul(iota(lk), 0.0)`, or of that range plus `-inf`.
+fn is_live_fallback<V: ValidationChannel>(
+    g: &Graph<V>,
+    prod: &HashMap<ValueId, usize>,
+    fallback: ValueId,
+    lk: usize,
+    along: [usize; 4],
+    which: LiveFallback,
+) -> bool {
+    let Some(product) = reshaped_from(g, prod, fallback, &along) else {
+        return false;
+    };
+    let zero_range = match which {
+        LiveFallback::Zero => product,
+        LiveFallback::NegInf => {
+            let Some(eqn) = prod.get(&product).map(|&i| &g.eqns[i]) else {
+                return false;
+            };
+            match (&eqn.op, value_and_scalar(&eqn.inputs)) {
+                (OpKind::Binary(BinOp::Add), Some((zero, Scalar::F32(inf))))
+                    if inf == f32::NEG_INFINITY =>
+                {
+                    zero
+                }
+                _ => return false,
+            }
+        }
+    };
+    let Some(eqn) = prod.get(&zero_range).map(|&i| &g.eqns[i]) else {
+        return false;
+    };
+    matches!(eqn.op, OpKind::Binary(BinOp::Mul))
+        && matches!(
+            value_and_scalar(&eqn.inputs),
+            Some((iota, Scalar::F32(zero)))
+                if zero.to_bits() == 0.0f32.to_bits()
+                    && iota_len(g, prod, iota, DType::F32) == Some(lk)
+        )
+}
+
+/// `source` as a guarded K or V source: `Select(active, data, zeros)` with the live bound's zero fallback.
+fn peel_live_rows<V: ValidationChannel>(
+    g: &Graph<V>,
+    prod: &HashMap<ValueId, usize>,
+    source: ValueId,
+    lk: usize,
+) -> Option<Guarded> {
+    let [active, data, zeros] = select_operands(g, prod, source)?;
+    is_live_fallback(g, prod, zeros, lk, [1, 1, lk, 1], LiveFallback::Zero)
+        .then_some(Guarded { data, active })
+}
+
+/// A key as the matcher recovers it: the per-head part, the optional shared part, the GQA repeat of the whole
+/// key, and the live-bound guards on its sources (empty for a capacity key).
+struct PeeledKey {
+    head: ValueId,
+    shared: Option<ValueId>,
     n_rep: usize,
-    scale: f32,
-    decode: bool, // M==1 (decode) vs M>1 (prefill)
-    /// Card 198: `Some(c)` when the scaled `Q K^T` passes through a Gemma2/Grok attention-logit softcap
-    /// (`c * tanh(scores / c)`, [`poot_graph_ir::ops::softcap`]) before the mask-add. Always `None` when `decode`
-    /// is true: `FlashAttentionDecode` has no softcap parameter, so [`match_attention`] refuses to match
-    /// a softcapped decode chain (falling back to the decomposition) rather than dropping the softcap.
-    softcap: Option<f32>,
+    guards: Vec<Guarded>,
+}
+
+/// Peel a key operand: its GQA repeat, then either a single source or the `concat(head, repeat(shared))` of a
+/// split key, with each source behind the live bound's select when `live`. `None` when `live` and a source is
+/// not guarded.
+fn peel_key<V: ValidationChannel>(
+    g: &Graph<V>,
+    prod: &HashMap<ValueId, usize>,
+    krep: ValueId,
+    live: bool,
+) -> Option<PeeledKey> {
+    let (k, n_rep) = peel_repeat_kv(g, prod, krep);
+    let lk = g.aval(k).shape.get(2).copied()?;
+    let unguard = |source: ValueId, guards: &mut Vec<Guarded>| -> Option<ValueId> {
+        if !live {
+            return Some(source);
+        }
+        let guarded = peel_live_rows(g, prod, source, lk)?;
+        let data = guarded.data;
+        guards.push(guarded);
+        Some(data)
+    };
+    let mut guards = Vec::new();
+    let split = prod.get(&k).map(|&i| &g.eqns[i]).and_then(|eqn| {
+        let OpKind::Concat { axis } = eqn.op else {
+            return None;
+        };
+        let [Operand::Value(head), Operand::Value(tail)] = eqn.inputs.as_slice() else {
+            return None;
+        };
+        let (shared, tail_rep) = peel_repeat_kv(g, prod, *tail);
+        // The shared part is one key head repeated across every head of the per-head part.
+        let heads = g.aval(*head).shape.get(1).copied()?;
+        let one_head = g.aval(shared).shape.get(1) == Some(&1);
+        (axis == 3 && one_head && tail_rep == heads).then_some((*head, shared))
+    });
+    match split {
+        Some((head, shared)) => Some(PeeledKey {
+            head: unguard(head, &mut guards)?,
+            shared: Some(unguard(shared, &mut guards)?),
+            n_rep,
+            guards,
+        }),
+        None => Some(PeeledKey {
+            head: unguard(k, &mut guards)?,
+            shared: None,
+            n_rep,
+            guards,
+        }),
+    }
 }
 
 /// Peel a `repeat_kv(x, n_rep)` chain (`reshape(broadcast(reshape(x)))`) back to `(x, n_rep)`. If `v` is not
@@ -403,9 +630,26 @@ pub(super) fn match_attention<V: ValidationChannel>(
         _ => return Err(AttentionDecline::RowMax),
     }
 
-    // scores = Add(pre_mask, mask). Either operand may be the additive mask (R467-005): the scaled
+    // The live bound's score guard: `scores = Select(active, added, -inf)`. Without it `scores` is the
+    // additive-mask add itself.
+    let lk = g.aval(scores).shape.last().copied().unwrap_or(0);
+    let live_scores = select_operands(g, prod, scores);
+    let live_len = match live_scores {
+        None => None,
+        Some([active, _, neg_inf]) => {
+            let len = live_active_len(g, prod, active, lk, [1, 1, 1, lk])
+                .ok_or(AttentionDecline::LiveScoreGuard)?;
+            if !is_live_fallback(g, prod, neg_inf, lk, [1, 1, 1, lk], LiveFallback::NegInf) {
+                return Err(AttentionDecline::LiveScoreGuard);
+            }
+            Some(len)
+        }
+    };
+    let added = live_scores.map_or(scores, |[_, added, _]| added);
+
+    // added = Add(pre_mask, mask). Either operand may be the additive mask (R467-005): the scaled
     // product is the one that decomposes to a `Q K^T`, the other is the mask.
-    let add = pe(scores).ok_or(AttentionDecline::ScoreAdd)?;
+    let add = pe(added).ok_or(AttentionDecline::ScoreAdd)?;
     if !matches!(add.op, OpKind::Binary(BinOp::Add)) {
         return Err(AttentionDecline::ScoreAdd);
     }
@@ -442,39 +686,47 @@ pub(super) fn match_attention<V: ValidationChannel>(
         .ok_or(AttentionDecline::KeyTranspose)?)
     .ok_or(AttentionDecline::KeyTranspose)?;
 
-    let (k, n_rep_k) = peel_repeat_kv(g, prod, krep);
-    let (v, n_rep_v) = peel_repeat_kv(g, prod, vrep);
-    if n_rep_k != n_rep_v {
+    let key = peel_key(g, prod, krep, live_len.is_some()).ok_or(AttentionDecline::LiveKeyGuard)?;
+    let (v_source, n_rep_v) = peel_repeat_kv(g, prod, vrep);
+    let (v, v_guard) = match live_len {
+        None => (v_source, None),
+        Some(_) => {
+            let guarded =
+                peel_live_rows(g, prod, v_source, lk).ok_or(AttentionDecline::LiveKeyGuard)?;
+            (guarded.data, Some(guarded))
+        }
+    };
+    if key.n_rep != n_rep_v {
         return Err(AttentionDecline::GqaRepeatMismatch);
+    }
+    // Every guarded source must be selected by this very length, and the length must be proved.
+    if let Some(len) = live_len {
+        let same_len = key.guards.iter().chain(&v_guard).all(|guarded| {
+            live_active_len(g, prod, guarded.active, lk, [1, 1, lk, 1]) == Some(len)
+        });
+        if !same_len {
+            return Err(AttentionDecline::LiveKeyGuard);
+        }
+        if !live_length_proved(g, prod, len, lk) {
+            return Err(AttentionDecline::LiveLengthUnproved);
+        }
     }
 
     let decode = g.aval(q).shape.get(2).copied() == Some(1);
-    // Card 198: `FlashAttentionDecode` has no softcap parameter (see `AttnMatch::softcap`'s doc). A
-    // softcapped decode-shaped chain must fall back to the decomposition rather than fuse with the
-    // softcap dropped.
-    if decode && softcap.is_some() {
-        return Err(AttentionDecline::DecodeSoftcap);
-    }
-    // Head-dim awareness (R480-009): the fused decode kernel's LDS scratch is sized to `FLASH_LDS_CAP`
-    // and the D>cap decode fallback is not portable, so a decode-shaped match wider than the cap stays
-    // the decomposition instead of producing an op the planner refuses (or a kernel that crashes) on
-    // some backend. Gemma4's per-layer shapes (local 256, global 512) then fuse where they fit.
-    let head_dim = g.aval(q).shape.get(3).copied().unwrap_or(0);
-    let head_cap = if decode {
-        FLASH_LDS_CAP
-    } else {
-        FLASH_PREFILL_LDS_CAP
-    };
-    if head_dim > head_cap {
-        return Err(AttentionDecline::HeadDimExceedsCap);
-    }
-
     let m = AttnMatch {
         q,
-        k,
+        k: key.head,
+        k_shared: key.shared,
+        key: match key.shared {
+            Some(shared) => KeyLayout::Split {
+                shared_dim: g.aval(shared).shape[3],
+            },
+            None => KeyLayout::Single,
+        },
         v,
         mask,
-        n_rep: n_rep_k,
+        len: live_len,
+        n_rep: key.n_rep,
         scale,
         decode,
         softcap,
@@ -486,38 +738,66 @@ pub(super) fn match_attention<V: ValidationChannel>(
     // differing from the QK width. The fused op indexes all of its operands densely, so it is only the
     // same computation when its own typing rule accepts the operands and reproduces the root's declared
     // type; anything else stays the decomposition.
-    let operands = [q, k, v, mask].map(|x| g.aval(x).clone());
+    let operands: Vec<_> = m.operands().iter().map(|&x| g.aval(x).clone()).collect();
     if m.op().infer(&operands).ok().as_ref() != Some(g.aval(root.out)) {
         return Err(AttentionDecline::TypeMismatch);
     }
     Ok(m)
 }
 
+/// Whether `len` is `guarded + 1` of a canonical index-bounds guard over `lk` whose witness the graph declares
+/// as a validation output: the length is then in `1..=lk` on every output an executor publishes.
+fn live_length_proved<V: ValidationChannel>(
+    g: &Graph<V>,
+    prod: &HashMap<ValueId, usize>,
+    len: ValueId,
+    lk: usize,
+) -> bool {
+    let Some(eqn) = prod.get(&len).map(|&i| &g.eqns[i]) else {
+        return false;
+    };
+    if !matches!(eqn.op, OpKind::Binary(BinOp::Add)) {
+        return false;
+    }
+    let Some((guarded, Scalar::I32(1))) = value_and_scalar(&eqn.inputs) else {
+        return false;
+    };
+    g.validation_outputs().iter().any(|validation| {
+        recognize_index_bounds_guard(g, guarded, validation.value)
+            .is_ok_and(|guard| usize::try_from(guard.upper_exclusive) == Ok(lk))
+    })
+}
+
 impl AttnMatch {
     /// The fused op this match collapses to.
-    fn op(&self) -> OpKind {
-        if self.decode {
-            OpKind::FlashAttentionDecode {
-                n_rep: self.n_rep,
-                scale: self.scale,
-            }
-        } else {
-            OpKind::FlashAttentionPrefill {
-                n_rep: self.n_rep,
-                scale: self.scale,
-                softcap: self.softcap,
-            }
-        }
+    pub(super) fn op(&self) -> OpKind {
+        OpKind::Attention(AttentionAttrs {
+            key: self.key,
+            bound: if self.len.is_some() {
+                KvBound::Live
+            } else {
+                KvBound::Capacity
+            },
+            ..AttentionAttrs::new(self.n_rep, self.scale, self.softcap)
+        })
+    }
+
+    /// The fused op's operands: `[q, k, v, mask]`, then the shared key part, then the live length.
+    pub(super) fn operands(&self) -> Vec<ValueId> {
+        [self.q, self.k, self.v, self.mask]
+            .into_iter()
+            .chain(self.k_shared)
+            .chain(self.len)
+            .collect()
     }
 }
 
 /// Flash-attention fusion (automatic fusion as a compiler pass), capped by `max_prefill_groups`: a
-/// `FlashAttentionPrefill` is emitted only when its `Hq*L` workgroup count is `<= max_prefill_groups`
-/// (decode, `Hq` workgroups, is always emitted); `None` means no cap. Pattern-match the materialized
+/// prefill-shaped `Attention` is emitted only when its `Hq*L` workgroup count is `<= max_prefill_groups`
+/// (decode, `B*Hq` workgroups, is always emitted); `None` means no cap. Pattern-match the materialized
 /// `softmax(scale * Q Kᵀ + mask) @ V` subgraph (with GQA repeat) that `ops::attention_masked` /
-/// `ops::attention_prefill` produce, and replace its root with the fused `FlashAttentionDecode` (M==1
-/// queries) or `FlashAttentionPrefill` (M>1) op, which the executor lowers to the imported flash kernel
-/// (online softmax, never materializing the `[.,.,L,L]` scores). The replaced intermediates become
+/// `ops::attention_prefill` produce, and replace its root with the fused `Attention` op, which the planner lowers to the generated
+/// attention kernel (online softmax, never materializing the `[.,.,L,L]` scores). The replaced intermediates become
 /// dead; run `dce` after. Conservative (only the exact chain matches) and result-preserving (one
 /// semantic definition shared by tracing, the oracle and every lowering), so every attention tracer
 /// gets flash without a separate `_flash` variant. Best run on a `cse`'d graph. `compile` passes its own
@@ -549,12 +829,7 @@ pub fn flash_attention_capped<V: ValidationChannel>(
         .map(|e| match match_attention(g, &prod, e) {
             Ok(m) if fits(&m) => Eqn {
                 op: m.op(),
-                inputs: vec![
-                    Operand::Value(m.q),
-                    Operand::Value(m.k),
-                    Operand::Value(m.v),
-                    Operand::Value(m.mask),
-                ],
+                inputs: m.operands().into_iter().map(Operand::Value).collect(),
                 out: e.out,
                 layer: e.layer,
             },

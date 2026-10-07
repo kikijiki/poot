@@ -4,7 +4,7 @@
 //! test); this crate already dev-depends on poot-eval, so an integration test here can drive both.
 //! (`masked_decode_matches_sliced`/`flash_prefill_tracer_matches_decomposed_prefill`/
 //! `flash_decode_op_matches_decomposed_masked` stayed behind in poot-eval: they exercise the
-//! `FlashAttentionDecode`/`FlashAttentionPrefill` ops directly through dedicated model tracers, never
+//! `Attention` ops directly through dedicated model tracers, never
 //! a poot-graph-plan pass.)
 
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
@@ -119,7 +119,7 @@ fn bind(
             }
             Storage::Slot(other) => panic!("unexpected slot {other:?}"),
             Storage::Const => weight(m.name.as_deref().unwrap(), &shape),
-            Storage::Computed(c) => HostTensor::f32(c.shape(), c.values_f32()),
+            Storage::Computed(c) => c.tensor(),
             Storage::State => continue,
             Storage::Device => unreachable!(),
         };
@@ -195,7 +195,7 @@ fn optimize_preserves_results_over_random_configs() {
         // --- decode: a single step, random weights + caches, raw vs optimize on identical inputs ---
         let gd = trace(&m, Phase::Decode, 1, 1, cap);
         let ogd = optimize(&gd);
-        assert!(count(&ogd, |op| matches!(op, OpKind::FlashAttentionDecode { .. })) > 0);
+        assert!(count(&ogd, |op| matches!(op, OpKind::Attention(_))) > 0);
         assert!(count(&ogd, |op| matches!(op, OpKind::Rope { .. })) > 0);
         assert!(
             count(&ogd, |op| matches!(
@@ -220,12 +220,7 @@ fn optimize_preserves_results_over_random_configs() {
         // --- prefill: a whole forward from empty caches, raw vs optimize on identical inputs ---
         let gp = trace(&m, Phase::Prefill, 1, l, l);
         let ogp = optimize(&gp);
-        assert!(
-            count(&ogp, |op| matches!(
-                op,
-                OpKind::FlashAttentionPrefill { .. }
-            )) > 0
-        );
+        assert!(count(&ogp, |op| matches!(op, OpKind::Attention(_))) > 0);
         let (raw_p, _) = run(&gp, &bind(&gp, &tokens, 0, &zeros));
         let (opt_p, _) = run(&ogp, &bind(&ogp, &tokens, 0, &zeros));
         assert_bits_equal(&opt_p, &raw_p, "prefill logits");
@@ -233,7 +228,7 @@ fn optimize_preserves_results_over_random_configs() {
 }
 
 /// Card 556 SC-001 (gemma2): the traced Gemma2 prefill, whose attention carries the
-/// `attn_logit_softcap`, fuses to `FlashAttentionPrefill { softcap: Some(_) }` in every layer, and
+/// `attn_logit_softcap`, fuses to `Attention { softcap: Some(_) }` in every layer, and
 /// the optimized graph's logits and carried caches equal the traced graph's bit for bit.
 #[test]
 fn optimize_is_bit_exact_on_traced_gemma2_softcap_prefill() {
@@ -252,19 +247,11 @@ fn optimize_is_bit_exact_on_traced_gemma2_softcap_prefill() {
     let n = 6usize;
     let g = trace(&m, Phase::Prefill, 1, n, n);
     let og = optimize(&g);
-    let softcapped = count(&og, |op| {
-        matches!(
-            op,
-            OpKind::FlashAttentionPrefill {
-                softcap: Some(_),
-                ..
-            }
-        )
-    });
-    assert_eq!(
-        softcapped, layers,
-        "one softcapped FlashAttentionPrefill per layer"
+    let softcapped = count(
+        &og,
+        |op| matches!(op, OpKind::Attention(attrs) if attrs.softcap.is_some()),
     );
+    assert_eq!(softcapped, layers, "one softcapped Attention per layer");
 
     let tokens: Vec<i32> = (0..n as i32).map(|i| (i * 7 + 3) % 64).collect();
     let (raw, raw_state) = run(&g, &bind(&g, &tokens, 0, &zeros));
@@ -307,7 +294,7 @@ fn optimize_matches_oracle_on_real_qwen2_decode_configs_real_dims() {
     // `optimize_preserves_results_over_random_configs` only exercises toy shapes (head_dim <= 8,
     // hidden <= 24), so a mis-fusion that appears at real width (row-region axis at hidden=896, GQA
     // repeat at n_rep=7) would pass. Run the full pass pipeline (canonicalize -> cse ->
-    // fold_iota -> rope_fusion -> flash_attention_capped -> dce -> fuse_bias_epilogues -> fuse; Card
+    // fold_iota -> rope_fusion -> flash_attention_capped -> dce -> fuse_contraction_epilogues -> fuse; Card
     // 557 moved the tiling and region-flash choices into the planner) against the CPU oracle on the
     // real configs of `real_configs`; eval(raw) must equal eval(optimize) bit for bit (Card 556:
     // the oracle evaluates the flash op from its decomposition, so nothing reassociates).
@@ -364,15 +351,18 @@ fn dispatch_count_regression_on_real_qwen2_decode_configs() {
     }
 }
 
-/// `optimize()` dispatch counts of the real-config decode graphs at capacity 64. The dense decode
-/// body plans more dispatches per layer than it should: POOT-1022 brings these pins down.
-const PIN_QWEN2: usize = 775;
-const PIN_QWEN3: usize = 791;
+/// `optimize()` dispatch counts of the real-config decode graphs at capacity 64, F32 weights, before the
+/// target-specific passes `compile` adds (the dense contraction fold, which is where the weight transposes go).
+/// The contraction epilogue moved them from 775 and 791: each bias and residual add folds into its projection;
+/// merging the computed constants of one payload (the per-layer RoPE tables) moved them to 537 and 681. The
+/// production dispatch counts are pinned through `compile` in `src/tests.rs`.
+const PIN_QWEN2: usize = 537;
+const PIN_QWEN3: usize = 681;
 
 #[test]
 fn flash_default_cuts_prefill_dispatch_count() {
     // card 030/038: flash also collapses each prefill layer's attention chain to one
-    // FlashAttentionPrefill op, so the prefill (TTFT) dispatch count drops. Validates the
+    // Attention op, so the prefill (TTFT) dispatch count drops. Validates the
     // Runner::prefill_graph_cost path at a representative seq_len.
     use poot_graph_ir::analysis::dispatch_count;
     use poot_graph_ir::op::OpKind;
@@ -382,9 +372,9 @@ fn flash_default_cuts_prefill_dispatch_count() {
     let n_flash = flash_attention_capped(&cse(&g), None)
         .eqns
         .iter()
-        .filter(|e| matches!(e.op, OpKind::FlashAttentionPrefill { .. }))
+        .filter(|e| matches!(e.op, OpKind::Attention(_)))
         .count();
-    assert_eq!(n_flash, layers, "one FlashAttentionPrefill per layer");
+    assert_eq!(n_flash, layers, "one Attention per layer");
     let no_flash = dispatch_count(&fuse(&cse(&g)));
     let with_flash = dispatch_count(&optimize(&g));
     assert!(
@@ -396,7 +386,7 @@ fn flash_default_cuts_prefill_dispatch_count() {
 #[test]
 fn flash_default_cuts_decode_dispatch_count() {
     // card 038: flash collapses each layer's ~10-op softmax-attention chain (transpose, QKᵀ, scale,
-    // mask-add, max/sub/exp/sum/div, PV) into one FlashAttentionDecode dispatch. Compare
+    // mask-add, max/sub/exp/sum/div, PV) into one Attention dispatch. Compare
     // dispatch_count for the optimized decode graph without flash (fuse(cse)) and with
     // (optimize = cse->flash->dce->fuse) and assert a per-layer reduction. No GPU.
     use poot_graph_ir::analysis::dispatch_count;
@@ -469,7 +459,7 @@ fn flash_attention_shrinks_prefill_peak_memory_quadratically() {
 #[test]
 fn flash_attention_pass_fuses_prefill_attention() {
     // card 038: the flash-attention pass pattern-matches the materialized
-    // softmax-attention subgraph in a raw prefill trace and rewrites it to FlashAttentionPrefill, once
+    // softmax-attention subgraph in a raw prefill trace and rewrites it to Attention, once
     // per layer, without changing the logits. cse -> flash_attention -> dce; tiny config, synthetic weights.
     use poot_graph_ir::op::OpKind;
     use poot_graph_plan::{cse, dce, flash_attention_capped};
@@ -481,9 +471,9 @@ fn flash_attention_pass_fuses_prefill_attention() {
     let n_flash = fused
         .eqns
         .iter()
-        .filter(|e| matches!(e.op, OpKind::FlashAttentionPrefill { .. }))
+        .filter(|e| matches!(e.op, OpKind::Attention(_)))
         .count();
-    assert_eq!(n_flash, layers, "one FlashAttentionPrefill per layer");
+    assert_eq!(n_flash, layers, "one Attention per layer");
     let (base, _) = run(&g, &bind(&g, &tokens, 0, &zeros));
     let (after, _) = run(&fused, &bind(&fused, &tokens, 0, &zeros));
     assert_eq!(base.shape(), after.shape());
@@ -492,7 +482,7 @@ fn flash_attention_pass_fuses_prefill_attention() {
 
 #[test]
 fn flash_attention_pass_fuses_batched_decode() {
-    // card 038: a batched decode trace (q [B,Hq,1,D], B>1) flashes too: FlashAttentionDecode carries the
+    // card 038: a batched decode trace (q [B,Hq,1,D], B>1) flashes too: Attention carries the
     // batch (one workgroup per (batch,head)). One op per layer.
     use poot_graph_ir::op::OpKind;
     use poot_graph_plan::{cse, flash_attention_capped};
@@ -504,14 +494,14 @@ fn flash_attention_pass_fuses_batched_decode() {
     let n_dec = g
         .eqns
         .iter()
-        .filter(|e| matches!(e.op, OpKind::FlashAttentionDecode { .. }))
+        .filter(|e| matches!(e.op, OpKind::Attention(_)))
         .count();
     assert_eq!(n_dec, layers, "batched decode flashes once per layer");
 }
 
 #[test]
 fn flash_attention_pass_fuses_decode_attention() {
-    // card 038: the same pass fires on a decode trace (M=1 -> FlashAttentionDecode), once per layer,
+    // card 038: the same pass fires on a decode trace (M=1 -> Attention), once per layer,
     // and the rewritten graph evals identically across a carried decode. The decode/prefill split is by
     // q's M dim (1 vs L).
     use poot_graph_ir::op::OpKind;
@@ -524,9 +514,9 @@ fn flash_attention_pass_fuses_decode_attention() {
     let n_flash = fused
         .eqns
         .iter()
-        .filter(|e| matches!(e.op, OpKind::FlashAttentionDecode { .. }))
+        .filter(|e| matches!(e.op, OpKind::Attention(_)))
         .count();
-    assert_eq!(n_flash, layers, "one FlashAttentionDecode per layer");
+    assert_eq!(n_flash, layers, "one Attention per layer");
 
     let mut base_caches: Vec<HostTensor> = g
         .state
