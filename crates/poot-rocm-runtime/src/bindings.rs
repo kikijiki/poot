@@ -119,8 +119,7 @@ pub const HSA_AMD_MEMORY_PROPERTY_AGENT_IS_APU: u32 = 1 << 0;
 /// "The amount of memory available in bytes across all global pools owned by the agent" (uint64_t),
 /// per `hsa_ext_amd.h`. The ROCm/HSA analogue of CUDA's `cuMemGetInfo` free component; present at
 /// slot 0xA015 in ROCm runtime headers 6.4.3, 7.2.3 and TheRock 7.13.0a20260515. There is no "used"
-/// attribute; `RocmContext::vram_used_bytes` derives it as `total - avail` against the cached total
-/// from `HSA_AMD_MEMORY_POOL_INFO_SIZE`.
+/// attribute; `RocmContext::vram_free_bytes` reads this value.
 pub const HSA_AMD_AGENT_INFO_MEMORY_AVAIL: u32 = 0xA015;
 
 // hsa_ext_amd.h memory pool info attribute ids

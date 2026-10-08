@@ -1,0 +1,439 @@
+//! The performance bank's measurement, shared by the backend examples (`performance_bank.rs` in poot-gpu,
+//! poot-rocm-gpu and poot-ptx-gpu include this file by path; each supplies only its device).
+//!
+//! One invocation measures one case of `cases.json` through the executor contract: it builds the case's
+//! graph and deterministic inputs, loads and compiles it for the device's target, adds one entry per weight
+//! copy, steps them in rotation (so a cold-weights case never finds its weights in cache), and writes the
+//! raw per-repeat times with the realized plan, the observed workload, memory counters and the comparison
+//! against an independent f64 reference. It decides no speed verdict and fills no identity: the bank's
+//! harness (`benchmarks/harness/performance_bank.py record`) completes the receipt from the case definition
+//! and refuses it when the observed workload differs.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
+
+use poot_executor::{Device, Engine, Executor, NoSync, StepInputs};
+use poot_graph_ir::{Builder, Graph, TensorType, ops};
+use poot_graph_plan::{
+    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram,
+    Submission, Target, TargetSet, compile_staged,
+};
+use poot_load::packed_safetensors::sha256_digest;
+use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
+use poot_tensor::HostTensor;
+use poot_test_util::const_weights::ConstWeights;
+use serde_json::{Value, json};
+
+/// Largest `|got - want|` allowed against the f64 reference, relative to `1 + |want|`: f32 accumulation
+/// over a few thousand terms, reassociated differently by each backend's schedule.
+const REFERENCE_TOLERANCE: f64 = 2e-3;
+
+struct Args {
+    bank: PathBuf,
+    case: String,
+    out: PathBuf,
+}
+
+fn parse_args() -> Result<Args, String> {
+    let (mut bank, mut case, mut out) = (None, None, None);
+    let mut args = std::env::args().skip(1);
+    while let Some(flag) = args.next() {
+        let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
+        match flag.as_str() {
+            "--bank" => bank = Some(PathBuf::from(value)),
+            "--case" => case = Some(value),
+            "--out" => out = Some(PathBuf::from(value)),
+            other => return Err(format!("unknown argument {other:?}")),
+        }
+    }
+    Ok(Args {
+        bank: bank.ok_or("--bank is required")?,
+        case: case.ok_or("--case is required")?,
+        out: out.ok_or("--out is required")?,
+    })
+}
+
+/// `splitmix64`, the bank's one token-fixture generator: uniform f32 in [-1, 1) from the top 24 bits.
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn next_unit(&mut self) -> f32 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        (z >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+    }
+
+    fn tensor(&mut self, len: usize) -> Vec<f32> {
+        (0..len).map(|_| self.next_unit()).collect()
+    }
+}
+
+fn dim(shape: &Value, name: &str) -> Result<usize, String> {
+    shape[name]
+        .as_u64()
+        .map(|v| v as usize)
+        .ok_or_else(|| format!("case shape has no integer {name:?}"))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// One case ready to run: graphs (one per weight copy), their consts, and the reference output per copy.
+struct Prepared {
+    graphs: Vec<Graph>,
+    consts: Vec<(String, HostTensor)>,
+    references: Vec<Vec<f64>>,
+    out_shape: Vec<usize>,
+    observed: Value,
+}
+
+fn weight_copies(bank: &Value, case: &Value, weight_bytes: usize) -> Result<usize, String> {
+    let condition = &bank["cache_conditions"][case["cache"].as_str().ok_or("case has no cache")?];
+    match condition["kind"].as_str() {
+        Some("weight-rotation") => {
+            let min = condition["min_rotation_bytes"]
+                .as_u64()
+                .ok_or("rotation condition has no min_rotation_bytes")?
+                as usize;
+            Ok(min.div_ceil(weight_bytes))
+        }
+        Some("single-copy") => Ok(1),
+        other => Err(format!("unknown cache condition kind {other:?}")),
+    }
+}
+
+fn dense_matmul(bank: &Value, case: &Value) -> Result<Prepared, String> {
+    let shape = &case["shape"];
+    let (m, k, n) = (dim(shape, "m")?, dim(shape, "k")?, dim(shape, "n")?);
+    let copies = weight_copies(bank, case, k * n * 4)?;
+    let mut stream = SplitMix64(
+        bank["token_fixtures"][case["token_fixture"].as_str().unwrap()]["seed"]
+            .as_u64()
+            .ok_or("fixture has no seed")?,
+    );
+    let x = stream.tensor(m * k);
+    let mut consts = vec![("x".to_string(), HostTensor::f32(vec![m, k], x.clone()))];
+    let (mut graphs, mut references) = (Vec::new(), Vec::new());
+    for copy in 0..copies {
+        let w = stream.tensor(k * n);
+        let mut want = vec![0.0f64; m * n];
+        for row in 0..m {
+            for kk in 0..k {
+                let a = f64::from(x[row * k + kk]);
+                for (col, acc) in want[row * n..(row + 1) * n].iter_mut().enumerate() {
+                    *acc += a * f64::from(w[kk * n + col]);
+                }
+            }
+        }
+        references.push(want);
+        let name = format!("w{copy}");
+        let b = Builder::new();
+        let xi = b.constant("x", TensorType::f32(vec![m, k]));
+        let wi = b.constant(&name, TensorType::f32(vec![k, n]));
+        let y = b.matmul(xi, wi);
+        graphs.push(b.finish(y));
+        consts.push((name, HostTensor::f32(vec![k, n], w)));
+    }
+    Ok(Prepared {
+        graphs,
+        consts,
+        references,
+        out_shape: vec![m, n],
+        observed: json!({
+            "shape": { "m": m, "k": k, "n": n },
+            "storage": "f32",
+            "layout": "kn",
+            "weight_copies": copies,
+            "weight_bytes_per_copy": k * n * 4,
+        }),
+    })
+}
+
+fn attention_decode(bank: &Value, case: &Value) -> Result<Prepared, String> {
+    let shape = &case["shape"];
+    let (hq, hkv, d, cap) = (
+        dim(shape, "hq")?,
+        dim(shape, "hkv")?,
+        dim(shape, "d")?,
+        dim(shape, "cap")?,
+    );
+    let copies = weight_copies(bank, case, 2 * hkv * cap * d * 4)?;
+    if copies != 1 {
+        return Err(
+            "attention_decode holds its KV resident: use a single-copy cache condition".into(),
+        );
+    }
+    let n_rep = hq / hkv;
+    let scale = 1.0 / (d as f32).sqrt();
+    let mut stream = SplitMix64(
+        bank["token_fixtures"][case["token_fixture"].as_str().unwrap()]["seed"]
+            .as_u64()
+            .ok_or("fixture has no seed")?,
+    );
+    let q = stream.tensor(hq * d);
+    let k = stream.tensor(hkv * cap * d);
+    let v = stream.tensor(hkv * cap * d);
+    let mut want = vec![0.0f64; hq * d];
+    for head in 0..hq {
+        let kv = head / n_rep;
+        let scores: Vec<f64> = (0..cap)
+            .map(|t| {
+                let dot: f64 = (0..d)
+                    .map(|i| f64::from(q[head * d + i]) * f64::from(k[(kv * cap + t) * d + i]))
+                    .sum();
+                dot * f64::from(scale)
+            })
+            .collect();
+        let peak = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let weights: Vec<f64> = scores.iter().map(|s| (s - peak).exp()).collect();
+        let total: f64 = weights.iter().sum();
+        for i in 0..d {
+            want[head * d + i] = (0..cap)
+                .map(|t| weights[t] * f64::from(v[(kv * cap + t) * d + i]))
+                .sum::<f64>()
+                / total;
+        }
+    }
+    let b = Builder::new();
+    let qi = b.constant("q", TensorType::f32(vec![1, hq, 1, d]));
+    let ki = b.constant("k", TensorType::f32(vec![1, hkv, cap, d]));
+    let vi = b.constant("v", TensorType::f32(vec![1, hkv, cap, d]));
+    let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
+    let y = ops::attention_masked(&b, qi, ki, vi, n_rep, scale, mask);
+    Ok(Prepared {
+        graphs: vec![b.finish(y)],
+        consts: vec![
+            ("q".into(), HostTensor::f32(vec![1, hq, 1, d], q)),
+            ("k".into(), HostTensor::f32(vec![1, hkv, cap, d], k)),
+            ("v".into(), HostTensor::f32(vec![1, hkv, cap, d], v)),
+            (
+                "mask".into(),
+                HostTensor::f32(vec![1, 1, 1, cap], vec![0.0; cap]),
+            ),
+        ],
+        references: vec![want],
+        out_shape: vec![1, hq, 1, d],
+        observed: json!({
+            "shape": { "hq": hq, "hkv": hkv, "d": d, "cap": cap },
+            "storage": "f32",
+            "layout": "bhsd",
+            "weight_copies": 1,
+            "weight_bytes_per_copy": 2 * hkv * cap * d * 4,
+        }),
+    })
+}
+
+fn prepare(bank: &Value, case: &Value) -> Result<Prepared, String> {
+    let generator = &bank["token_fixtures"][case["token_fixture"]
+        .as_str()
+        .ok_or("case has no token_fixture")?]["generator"];
+    if generator != "splitmix64" {
+        return Err(format!("unsupported token fixture generator {generator}"));
+    }
+    match case["producer"].as_str() {
+        Some("dense_matmul") => dense_matmul(bank, case),
+        Some("attention_decode") => attention_decode(bank, case),
+        other => Err(format!("no runner for producer {other:?}")),
+    }
+}
+
+fn staged(
+    g: &Graph,
+    target: Target,
+) -> Result<StagedProgram<poot_graph_ir::ValidationOutputs>, String> {
+    compile_staged(
+        &g.clone().with_validations(Vec::new()),
+        &TargetSet::single(DeviceId(0), target),
+        &Partition {
+            experts: ExpertPlacement::AllResident,
+            devices: DevicePlacement::Single(DeviceId(0)),
+        },
+        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+    )
+    .map_err(|e| format!("compile_staged: {e}"))
+}
+
+/// The kernels the planner chose, in plan order: label (family, schedule, shape) and plan key.
+fn plan_of(program: &StagedProgram<poot_graph_ir::ValidationOutputs>) -> Vec<String> {
+    program
+        .stages()
+        .flat_map(|(_, _, p)| p.planned())
+        .flat_map(|(_, plan)| {
+            plan.dispatches()
+                .iter()
+                .map(|d| format!("{} [{}]", d.label, d.key))
+        })
+        .collect()
+}
+
+fn reference_check(got: &[f32], want: &[f64]) -> (f64, bool) {
+    let mut worst = 0.0f64;
+    let mut agrees = got.len() == want.len();
+    for (g, w) in got.iter().zip(want) {
+        let err = (f64::from(*g) - w).abs() / (1.0 + w.abs());
+        // NaN never agrees (ADR-0101).
+        if err.is_nan() || err > REFERENCE_TOLERANCE {
+            agrees = false;
+        }
+        worst = worst.max(if err.is_nan() { f64::INFINITY } else { err });
+    }
+    (worst, agrees)
+}
+
+fn run_case<D>(backend: &str, device: D, bank: &Value, case: &Value) -> Result<Value, String>
+where
+    D: Device + 'static,
+{
+    let prepared = prepare(bank, case)?;
+    let target = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+
+    let mut builder = WeightStore::builder();
+    for (name, tensor) in &prepared.consts {
+        let dense = DenseWeight::try_new(
+            tensor.dtype(),
+            tensor.shape().to_vec(),
+            Arc::from(tensor.view().bytes()),
+        )
+        .map_err(|e| format!("const {name}: {e}"))?;
+        builder
+            .insert(name.as_str(), WeightEntry::Dense(dense))
+            .map_err(|e| format!("const {name}: {e}"))?;
+    }
+    let store = builder.build();
+    let mut weights = ConstWeights::new(&store);
+    let graphs: Vec<Graph> = prepared.graphs.iter().map(|g| weights.graph(g)).collect();
+    let exe = exec
+        .load_weights(Arc::new(store.clone()), Arc::new(weights.map()))
+        .map_err(|e| format!("load_weights: {e}"))?;
+    let mut entries = Vec::new();
+    let mut plan = Vec::new();
+    for g in &graphs {
+        let program = staged(g, target)?;
+        plan = plan_of(&program);
+        entries.push(
+            exec.add_entry(exe, &program)
+                .map_err(|e| format!("add_entry: {e}"))?,
+        );
+    }
+
+    let timing = &bank["timing_policy"];
+    let warmup = timing["warmup"].as_u64().ok_or("timing_policy.warmup")? as usize;
+    let repeats = timing["repeats"].as_u64().ok_or("timing_policy.repeats")? as usize;
+    let mut step = |index: usize| -> Result<(f64, HostTensor), String> {
+        let entry = entries[index % entries.len()];
+        let started = Instant::now();
+        let output = exec
+            .step(exe, entry, &StepInputs::new(), &mut NoSync)
+            .map_err(|e| format!("step: {e}"))?
+            .to_host()
+            .map_err(|e| format!("read: {e}"))?;
+        Ok((started.elapsed().as_secs_f64() * 1e6, output))
+    };
+
+    // The first pass over the copies records every entry and checks each copy's output against its own
+    // reference; those steps are warmup. Further warmup keeps the rotation going before the timed repeats.
+    let mut worst = 0.0f64;
+    let mut agrees = true;
+    for (copy, want) in prepared.references.iter().enumerate() {
+        let (_, output) = step(copy)?;
+        if output.shape() != prepared.out_shape.as_slice() {
+            return Err(format!(
+                "output shape {:?}, expected {:?}",
+                output.shape(),
+                prepared.out_shape
+            ));
+        }
+        let got = output.as_f32().ok_or("the output is not F32")?;
+        let (err, ok) = reference_check(got, want);
+        worst = worst.max(err);
+        agrees &= ok;
+    }
+    for index in 0..warmup {
+        step(prepared.references.len() + index)?;
+    }
+    let mut samples = Vec::with_capacity(repeats);
+    for index in 0..repeats {
+        let (micros, _) = step(prepared.references.len() + warmup + index)?;
+        samples.push(micros);
+    }
+
+    let stats = exec.stats();
+    let memory: Vec<Value> = stats
+        .memory
+        .iter()
+        .map(|(role, m)| json!({ "role": format!("{role:?}"), "live_bytes": m.live_bytes, "peak_bytes": m.peak_bytes }))
+        .collect();
+    let digest = sha256_digest(plan.join("\n").as_bytes()).as_bytes();
+    let exe_path = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    Ok(json!({
+        "schema": 1,
+        "case": case["id"],
+        "backend": backend,
+        "role": "baseline",
+        "hardware": {
+            "backend": backend,
+            "device": std::env::var("POOT_BANK_DEVICE").map_err(|_| "POOT_BANK_DEVICE names the measured device")?,
+            "driver": std::env::var("POOT_BANK_DRIVER").map_err(|_| "POOT_BANK_DRIVER names its driver")?,
+        },
+        "binary": exe_path.display().to_string(),
+        "observed": prepared.observed,
+        "plan": plan,
+        "plan_id": hex(&digest),
+        "reference": {
+            "provenance": "independent-golden",
+            "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
+            "max_relative_error": worst,
+            "tolerance": REFERENCE_TOLERANCE,
+            "agrees": agrees,
+        },
+        "memory": memory,
+        "recordings": stats.recordings,
+        "replays": stats.replays,
+        "cells": {
+            "kernel": {
+                "repeats": samples
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, micros)| json!({ "slot": slot, "status": "ok", "metrics": { "step_us": micros } }))
+                    .collect::<Vec<_>>()
+            }
+        },
+    }))
+}
+
+/// The example's whole `main`: measure the case `--case` of `--bank` on `device` and write `--out`.
+pub fn run<D>(backend: &str, device: D) -> Result<(), String>
+where
+    D: Device + 'static,
+{
+    let args = parse_args()?;
+    let bank: Value = serde_json::from_slice(
+        &std::fs::read(&args.bank).map_err(|e| format!("read {}: {e}", args.bank.display()))?,
+    )
+    .map_err(|e| format!("parse {}: {e}", args.bank.display()))?;
+    let case = bank["cases"]
+        .as_array()
+        .and_then(|cases| cases.iter().find(|c| c["id"] == args.case.as_str()))
+        .ok_or_else(|| format!("the bank has no case {:?}", args.case))?;
+    if case["status"] != "runnable" {
+        return Err(format!(
+            "case {:?} is {}, not runnable",
+            args.case, case["status"]
+        ));
+    }
+    let receipt = run_case(backend, device, &bank, case)?;
+    if let Some(dir) = Path::new(&args.out).parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    std::fs::write(
+        &args.out,
+        serde_json::to_string_pretty(&receipt).expect("receipt is JSON") + "\n",
+    )
+    .map_err(|e| format!("write {}: {e}", args.out.display()))
+}

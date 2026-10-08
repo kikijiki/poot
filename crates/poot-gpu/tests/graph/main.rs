@@ -16,7 +16,6 @@ mod plan_selection;
 mod prefill_qwen3next;
 mod ssm_linear_attn;
 mod tiled_dequant;
-mod vision;
 
 use poot_tensor::DType;
 use std::collections::HashMap;
@@ -32,6 +31,7 @@ use poot_graph_ir::ops::{attention_masked, rmsnorm};
 use poot_graph_ir::types::TensorType;
 use poot_graph_plan::Target;
 use poot_tensor::HostTensor;
+use poot_test_util::const_weights::ConstWeights;
 use poot_test_util::{assert_close, max_abs_error};
 
 /// The metadata buffer of a plan that launches exactly one kernel (empty when it binds none); `None` for
@@ -55,20 +55,6 @@ fn open_engine_or_skip() -> Option<(Engine<WgpuDevice>, Target)> {
     )?;
     let target = device.target();
     Some((Engine::new(device), target))
-}
-
-/// A second engine whose device reports the routed-expert hang, so programs compiled under the guard
-/// (one kernel per equation, no fusion, see [`staged_replay_with`]) load on it. Open it beside
-/// [`open_engine_or_skip`]'s engine when a row compares the fused program with the guarded one.
-fn open_hung_engine_or_skip()
--> Option<Engine<poot_executor_parity::hung::WithRoutedHang<WgpuDevice>>> {
-    let device = poot_test_util::device_skip::open_or_skip(
-        poot_runtime_common::DeviceBackend::Wgpu,
-        WgpuDevice::new(),
-    )?;
-    Some(Engine::new(poot_executor_parity::hung::WithRoutedHang(
-        device,
-    )))
 }
 
 /// Card 546b: `GpuExecutor::run`'s executor-contract replacement for this crate's hand-built test
@@ -137,21 +123,7 @@ fn staged_replay(
     g: &poot_graph_ir::Graph,
     target: Target,
 ) -> poot_graph_plan::StagedProgram<poot_graph_ir::ValidationOutputs> {
-    staged_replay_with(g, target, false)
-}
-
-/// [`staged_replay`] with `guarded` compiling under the routed-expert hang guard (Card 557: the guard
-/// keeps a matmul off the generated tiled GEMM, the one way to plan the imported tiled GEMM for a
-/// comparison). The graph then carries a dead routed-expert site and the target has the hang
-/// (`poot_test_util::graph_fixtures::pipeline_input`).
-fn staged_replay_with(
-    g: &poot_graph_ir::Graph,
-    target: Target,
-    guarded: bool,
-) -> poot_graph_plan::StagedProgram<poot_graph_ir::ValidationOutputs> {
-    let (gc, caps) = poot_test_util::graph_fixtures::pipeline_input(g, target.caps, guarded);
-    let target = Target { caps, ..target };
-    let gc = gc.with_validations(Vec::new());
+    let gc = g.clone().with_validations(Vec::new());
     poot_graph_plan::compile_staged(
         &gc,
         &poot_graph_plan::TargetSet::single(poot_graph_plan::DeviceId(0), target),
@@ -159,10 +131,10 @@ fn staged_replay_with(
             experts: poot_graph_plan::ExpertPlacement::AllResident,
             devices: poot_graph_plan::DevicePlacement::Single(poot_graph_plan::DeviceId(0)),
         },
-        &poot_graph_plan::CompileOptions {
-            execution: poot_graph_plan::Submission::Replay,
-            limits: poot_graph_plan::CompileLimits::STANDARD,
-        },
+        &poot_graph_plan::CompileOptions::new(
+            poot_graph_plan::Submission::Replay,
+            poot_graph_plan::CompileLimits::STANDARD,
+        ),
     )
     .unwrap()
 }
@@ -179,18 +151,6 @@ fn add_resident_entry(
     target: Target,
     g: &poot_graph_ir::Graph,
     inputs: &HashMap<poot_graph_ir::ValueId, HostTensor>,
-) -> (poot_executor::ExecutableId, poot_executor::EntryId) {
-    add_resident_entry_with(exec, target, g, inputs, false)
-}
-
-/// [`add_resident_entry`] compiled under the routed-expert hang guard when `guarded` (see
-/// [`staged_replay_with`]).
-fn add_resident_entry_with(
-    exec: &mut dyn Executor,
-    target: Target,
-    g: &poot_graph_ir::Graph,
-    inputs: &HashMap<poot_graph_ir::ValueId, HostTensor>,
-    guarded: bool,
 ) -> (poot_executor::ExecutableId, poot_executor::EntryId) {
     let mut builder = poot_quant::weights::WeightStore::builder();
     for (&id, t) in inputs {
@@ -216,13 +176,10 @@ fn add_resident_entry_with(
             .insert(name, poot_quant::weights::WeightEntry::Dense(dense))
             .unwrap();
     }
-    let exe = exec
-        .load_weights(
-            Arc::new(builder.build()),
-            poot_executor::WeightSource::ConstNames,
-        )
-        .unwrap();
-    let staged = staged_replay_with(g, target, guarded);
+    let store = builder.build();
+    let (bound, map) = ConstWeights::bind(g, &store);
+    let exe = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
+    let staged = staged_replay(&bound, target);
     let entry = exec.add_entry(exe, &staged).unwrap();
     (exe, entry)
 }
@@ -290,18 +247,6 @@ fn build_rope_decomposition(
     };
     let (xi, ci, si) = (x.id, cos.id, sin.id);
     (b.finish(out), xi, ci, si)
-}
-
-/// Declare an f32 constant and record `(id, shape)` so the test can fill its data afterwards.
-fn vconst(
-    b: &Builder,
-    binds: &mut Vec<(poot_graph_ir::ValueId, Vec<usize>)>,
-    name: &str,
-    shape: Vec<usize>,
-) -> poot_graph_ir::builder::Traced {
-    let t = b.constant(name, TensorType::f32(shape.clone()));
-    binds.push((t.id, shape));
-    t
 }
 
 // --- card 158: batched-prefill-only ops, GPU vs CPU, at the real chunk size C=64 ---
@@ -513,10 +458,10 @@ fn compile_full(g: &poot_graph_ir::Graph, target: &Target) -> poot_graph_plan::P
     poot_graph_plan::compile(
         g,
         target,
-        &poot_graph_plan::CompileOptions {
-            execution: poot_graph_plan::Submission::Replay,
-            limits: poot_graph_plan::CompileLimits::STANDARD,
-        },
+        &poot_graph_plan::CompileOptions::new(
+            poot_graph_plan::Submission::Replay,
+            poot_graph_plan::CompileLimits::STANDARD,
+        ),
     )
     .expect("the graph compiles")
 }

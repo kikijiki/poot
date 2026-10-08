@@ -25,8 +25,9 @@ load-path smoke tests without a GPU).
 
 A runnable, end-to-end GPU decode example is not available yet (poot is being refactored; planned to return). The GPU decode code paths are exercised only by `poot-llm`'s own test suite. Other
 examples under `crates/poot-llm/examples/` remain: graph tracing and fusion (`trace_and_fuse`,
-`flash_attention_fusion`), CPU-executor building blocks (`build_and_eval`), encoder embeddings and
-reranking (`embeddings`), and sampling (`sampling`); none of them dispatch on a GPU.
+`flash_attention_fusion`), CPU-executor building blocks (`build_and_eval`), sampling (`sampling`); none of them dispatch on a GPU. Encoder embeddings and reranking have a
+command line, `poot-embed` (`cargo run --release -p poot-llm --features cli --bin poot-embed -- embed /path/to/all-minilm "a cat" "a kitten"`),
+which opens a device and runs the encoder on it.
 
 ## Backends
 

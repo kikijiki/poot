@@ -4,6 +4,7 @@
 //! [`crate::ops`]). Each variant carries its by-value params (the jaxpr eqn `params`); tensor operands are passed
 //! separately to `infer`.
 
+use crate::error::ScanReason;
 use crate::error::ShapeError;
 use crate::types::{DType, DTypeClass, DTypeClassExt, Scalar, TensorType, broadcast_shapes};
 pub use poot_quant::format::{ScaleEncoding, WeightFormat};
@@ -390,6 +391,39 @@ pub enum OpClass {
     Composite,
 }
 
+/// How a [`OpKind::PackedContraction`] pairs activation rows with weight rows.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ContractionRows {
+    /// The weight's `out` axis is split into this many contiguous, equal-width blocks, each contracted only
+    /// against its own activation block (Card 385). `Blocks(1)` is the ordinary dense contraction: the activation
+    /// may be any rank ending in `K`, and operands are `[activation, carriers..]`.
+    Blocks(usize),
+    /// A stacked table of `experts` packed weights of one descriptor, output row `m` reading expert `ids[m]`:
+    /// `out[m, n] = sum over k of x[m, k] * decode(expert ids[m], n, k)`. Operands are `[x [M, K], ids [M],
+    /// carriers..]`, each carrier the expert-stacked, word-padded source `[experts, slab_bytes]`
+    /// ([`crate::packed_source::packed_stack_source_type`]). An id outside `0..experts`, or not an integer, makes
+    /// that row NaN (R-632-4), as for [`OpKind::IndexedMatMul`].
+    Indexed { experts: usize },
+}
+
+impl ContractionRows {
+    /// The operands before the carriers: the activation, and the row ids for an indexed table.
+    pub const fn leading_operands(self) -> usize {
+        match self {
+            Self::Blocks(_) => 1,
+            Self::Indexed { .. } => 2,
+        }
+    }
+
+    /// The block count of a block-diagonal contraction, `None` for an indexed one.
+    pub const fn blocks(self) -> Option<usize> {
+        match self {
+            Self::Blocks(blocks) => Some(blocks),
+            Self::Indexed { .. } => None,
+        }
+    }
+}
+
 /// The contraction an [`OpKind::ContractionEpilogue`] runs before its pointwise region: the heads the planner
 /// lowers with an epilogue. Each names the primitive op whose result local 0 of the region reads.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -399,10 +433,11 @@ pub enum ContractionHead {
     /// [`OpKind::DenseContraction`] over an activation and a `[N, K]` weight of dtype `weight`.
     Dense { weight: DType },
     /// [`OpKind::PackedContraction`] over an f32 activation and the carriers of the packed weight
-    /// `descriptor`. Its result is f32, so the head applies no narrowing before the region reads it.
+    /// `descriptor`, its rows selected as `rows` says. Its result is f32, so the head applies no
+    /// narrowing before the region reads it.
     Packed {
         descriptor: PackedWeight,
-        blocks: usize,
+        rows: ContractionRows,
     },
     /// [`OpKind::IndexedMatMul`] over an activation `x [M, K]`, a stacked weight `W [E, K, N]` and the per-row
     /// expert ids `idx [M]`: a routed expert matmul followed by its gate weighting.
@@ -416,7 +451,9 @@ impl ContractionHead {
         match self {
             Self::MatMul | Self::Dense { .. } => 2,
             Self::Indexed => 3,
-            Self::Packed { descriptor, .. } => 1 + descriptor.sources().len(),
+            Self::Packed { descriptor, rows } => {
+                rows.leading_operands() + descriptor.sources().len()
+            }
         }
     }
 
@@ -426,7 +463,7 @@ impl ContractionHead {
             Self::MatMul => OpKind::MatMul,
             Self::Dense { weight } => OpKind::DenseContraction { weight },
             Self::Indexed => OpKind::IndexedMatMul,
-            Self::Packed { descriptor, blocks } => OpKind::PackedContraction { descriptor, blocks },
+            Self::Packed { descriptor, rows } => OpKind::PackedContraction { descriptor, rows },
         }
     }
 }
@@ -579,16 +616,18 @@ pub enum OpKind {
     /// Compiler-only replacement for activation matmul against a packed weight. Builders do not expose it; Card 356
     /// lowers it to an imported kernel.
     ///
-    /// `blocks` partitions the weight's `out` axis into that many contiguous, equal-width blocks and restricts each
-    /// activation block to its own weight block (Card 385): `out[b, i, j] = sum over k of
-    /// activation[b, i, k] * decode(weight[b * (out / blocks) + j, k])`, `b` ranging over `blocks`. `blocks == 1` is
-    /// the ordinary dense contraction (the activation may be any rank ending in `K`); `blocks > 1` requires a
-    /// rank-3 `[blocks, M, K]` activation and produces `[blocks, M, out / blocks]`. One field, not a second
-    /// variant, because both are the same index map; see [`crate::ops::packed_linear`] (`blocks == 1`) and
-    /// [`crate::ops::packed_block_diagonal_linear`] (`blocks > 1`).
+    /// `rows` says how activation rows meet weight rows. [`ContractionRows::Blocks`] partitions the weight's `out`
+    /// axis into that many contiguous, equal-width blocks and restricts each activation block to its own weight
+    /// block (Card 385): `out[b, i, j] = sum over k of activation[b, i, k] * decode(weight[b * (out / blocks) + j,
+    /// k])`, `b` ranging over `blocks`. `Blocks(1)` is the ordinary dense contraction (the activation may be any
+    /// rank ending in `K`); `Blocks(n > 1)` requires a rank-3 `[n, M, K]` activation and produces `[n, M, out /
+    /// n]`. See [`crate::ops::packed_linear`] and [`crate::ops::packed_block_diagonal_linear`].
+    /// [`ContractionRows::Indexed`] contracts each row of `x [M, K]` against its own expert of a stacked table
+    /// (the routed MoE projection, [`crate::ops::packed_indexed_linear`]); one field, not a second variant,
+    /// because both are the same index map over the same descriptor-driven decode.
     PackedContraction {
         descriptor: PackedWeight,
-        blocks: usize,
+        rows: ContractionRows,
     },
     /// Compiler-only replacement for an axis-0 `Gather` of a packed weight's rows (card 642/545a,
     /// quantized GGUF token embeddings): `out[.., :] = decode(ids[..], :)`. Inputs are the
@@ -611,6 +650,20 @@ pub enum OpKind {
     /// [`DENSE_CONTRACTION_WEIGHT_DTYPES`] (BF16, F32 and F16).
     DenseContraction {
         weight: DType,
+    },
+    /// Compiler-only grouped sibling of [`OpKind::DenseContraction`]: `groups` independent contractions, each over
+    /// its own block of rows of one checkpoint-order weight. Inputs are the activation `[G, M, K]` (F32,
+    /// `G == groups`) and the weight `[G * N, K]` (`weight` dtype), whose rows `g * N .. (g + 1) * N` are group
+    /// `g`'s `[N, K]` block; the output is `[G, M, N]` F32:
+    /// `out[g, m, n] = sum over k of activation[g, m, k] * decode(weight[g * N + n, k])`.
+    ///
+    /// BF16 is the one admitted `weight` dtype ([`OpKind::infer`] rejects the rest): it is the only dtype with
+    /// grouped device rows, and any other dtype keeps the traced chain. `fold_dense_contractions` forms it from `MatMul(a, Transpose([0, 2, 1], Reshape([G, N, K], w)))`, the
+    /// spelling of a grouped projection (DeepSeek V4's `wo_a`), so the weight stays one resident const in its
+    /// checkpoint dtype instead of a widened F32 copy.
+    GroupedDenseContraction {
+        weight: DType,
+        groups: usize,
     },
     /// Gather rows from a dense narrow-float table along axis 0 and widen them to F32 in one equation:
     /// `out[s.., r] = decode(table[index[s..], r])`. Inputs are the table `[V, R]` (`source` dtype) and the index
@@ -707,6 +760,15 @@ pub enum OpKind {
     Rope {
         rot: usize,
     },
+    /// A bounded recurrence over the sequence axis (POOT-634): the gated delta rule (GDN) or the Mamba2
+    /// SSD, with ONE typed packed result `[1, H, L + S, W]`. Rows `..L` are the sequence output `y`, rows
+    /// `L..L + S` the carried state `s_out` ([`ScanLayout`] names the ranges; [`crate::Builder::scan`]
+    /// returns the two projections as a [`crate::ScanResult`]). The operands are [`ScanFamily::operands`]
+    /// long, in the order the family documents. Its definition is the family's chunked primitive chain
+    /// (`ops::scan_delta_rule_packed` / `ops::scan_ssd_packed`), one chunk body per chunk; the CPU oracle evaluates one chunk window at a time with the state carried; a planner
+    /// schedule runs the sequence in a loop of bounded dispatches instead. One source-admissible
+    /// recurrence carrier, not a fusion or schedule choice.
+    Scan(ScanAttrs),
     /// A cross-replica collective reduce (card 049a, tensor-parallel). Each rank holds a same-shaped partial tensor;
     /// the collective combines them with `op` and distributes the result back to every rank. The output type is
     /// identical to the input type.
@@ -847,8 +909,8 @@ pub(crate) fn check_binary_value_dtypes(a: &TensorType, b: &TensorType) -> Resul
 /// folds exactly that pair (behind a `Transpose`) into `DenseContraction` (its own `weight` dtype table is
 /// `DENSE_CONTRACTION_WEIGHT_DTYPES`); the planner's own
 /// `poot_graph_plan::widen_mismatched_matmul_dtypes` (card 273) either widens that exact pair with a Cast
-/// or, when `matmul_tensor_core_eligible`/`matmul_bf16_decode_gemv_eligible` says so, runs the mismatched
-/// pair directly on a WMMA/coopmat/decode-GEMV kernel built for it. Every other pairing (F16 x BF16, I32 x
+/// or, when `matmul_tensor_core_eligible` says so, runs the mismatched pair directly on a WMMA/coopmat
+/// kernel built for it (a BF16 `[K, N]` decode projection, `matmul_bf16_column_gemv`, stays mixed and is refused). Every other pairing (F16 x BF16, I32 x
 /// F32, a BF16 activation x F32 weight, two different storage/packed dtypes, ...) is rejected.
 fn matmul_operand_dtypes_allowed(a: DType, b: DType) -> bool {
     (a.class() == DTypeClass::Arithmetic && a == b)
@@ -913,12 +975,16 @@ impl OpKind {
                 region.output.hash(h);
             }
             OpKind::PackedDequant { descriptor } => descriptor.hash(h),
-            OpKind::PackedContraction { descriptor, blocks } => {
+            OpKind::PackedContraction { descriptor, rows } => {
                 descriptor.hash(h);
-                blocks.hash(h);
+                rows.hash(h);
             }
             OpKind::PackedRowGather { descriptor } => descriptor.hash(h),
             OpKind::DenseContraction { weight } => weight.hash(h),
+            OpKind::GroupedDenseContraction { weight, groups } => {
+                weight.hash(h);
+                groups.hash(h);
+            }
             OpKind::DenseRowGather { source } => source.hash(h),
             OpKind::ArgTopK { k } => k.hash(h),
             OpKind::DynamicUpdateSlice { axis } => axis.hash(h),
@@ -962,6 +1028,7 @@ impl OpKind {
                 attrs.bound.hash(h);
             }
             OpKind::Rope { rot } => rot.hash(h),
+            OpKind::Scan(attrs) => attrs.hash(h),
             OpKind::AllReduce { op, axis } => {
                 op.hash(h);
                 axis.hash(h);
@@ -1415,12 +1482,21 @@ impl OpKind {
                 }
                 Ok(TensorType::f32(descriptor.shape().to_vec()))
             }
-            OpKind::PackedContraction { descriptor, blocks } => {
-                arity(ins, 1 + descriptor.sources().len())?;
-                OpKind::PackedDequant {
-                    descriptor: *descriptor,
+            OpKind::PackedContraction { descriptor, rows } => {
+                let lead = rows.leading_operands();
+                arity(ins, lead + descriptor.sources().len())?;
+                let carriers = &ins[lead..];
+                match rows {
+                    ContractionRows::Blocks(_) => {
+                        OpKind::PackedDequant {
+                            descriptor: *descriptor,
+                        }
+                        .infer(carriers)?;
+                    }
+                    ContractionRows::Indexed { experts } => {
+                        check_packed_stack(*descriptor, *experts, carriers)?;
+                    }
                 }
-                .infer(&ins[1..])?;
                 let activation = &ins[0];
                 if activation.dtype != DType::F32 {
                     return Err(ShapeError::PackedContractionDtype {
@@ -1429,32 +1505,49 @@ impl OpKind {
                     });
                 }
                 let [out, k] = descriptor.shape();
-                if *blocks == 0 || out % blocks != 0 {
-                    return Err(ShapeError::PackedContractionBlocks {
-                        out,
-                        blocks: *blocks,
-                    });
-                }
-                let block_out = out / blocks;
-                if *blocks == 1 {
-                    if activation.rank() < 2 || activation.shape.last().copied() != Some(k) {
-                        return Err(ShapeError::PackedContractionActivation {
-                            expected_k: k,
-                            actual: activation.clone(),
-                        });
+                match *rows {
+                    ContractionRows::Blocks(blocks) => {
+                        if blocks == 0 || out % blocks != 0 {
+                            return Err(ShapeError::PackedContractionBlocks { out, blocks });
+                        }
+                        let block_out = out / blocks;
+                        if blocks == 1 {
+                            if activation.rank() < 2 || activation.shape.last().copied() != Some(k)
+                            {
+                                return Err(ShapeError::PackedContractionActivation {
+                                    expected_k: k,
+                                    actual: activation.clone(),
+                                });
+                            }
+                            let mut shape = activation.shape.clone();
+                            *shape.last_mut().expect("rank checked") = out;
+                            Ok(TensorType::f32(shape))
+                        } else {
+                            let shape = activation.shape.as_slice();
+                            if shape.len() != 3 || shape[0] != blocks || shape[2] != k {
+                                return Err(ShapeError::PackedContractionActivation {
+                                    expected_k: k,
+                                    actual: activation.clone(),
+                                });
+                            }
+                            Ok(TensorType::f32(vec![blocks, shape[1], block_out]))
+                        }
                     }
-                    let mut shape = activation.shape.clone();
-                    *shape.last_mut().expect("rank checked") = out;
-                    Ok(TensorType::f32(shape))
-                } else {
-                    let shape = activation.shape.as_slice();
-                    if shape.len() != 3 || shape[0] != *blocks || shape[2] != k {
-                        return Err(ShapeError::PackedContractionActivation {
-                            expected_k: k,
-                            actual: activation.clone(),
-                        });
+                    ContractionRows::Indexed { .. } => {
+                        let ids = &ins[1];
+                        check_index_dtype("PackedContraction", ids.dtype)?;
+                        if activation.rank() != 2
+                            || activation.shape[1] != k
+                            || ids.rank() != 1
+                            || ids.shape[0] != activation.shape[0]
+                        {
+                            return Err(ShapeError::PackedContractionActivation {
+                                expected_k: k,
+                                actual: activation.clone(),
+                            });
+                        }
+                        Ok(TensorType::f32(vec![activation.shape[0], out]))
                     }
-                    Ok(TensorType::f32(vec![*blocks, shape[1], block_out]))
                 }
             }
             OpKind::PackedRowGather { descriptor } => {
@@ -1510,6 +1603,52 @@ impl OpKind {
                 let mut shape = activation.shape.clone();
                 *shape.last_mut().expect("rank checked") = source.shape[0];
                 Ok(TensorType::f32(shape))
+            }
+            OpKind::GroupedDenseContraction { weight, groups } => {
+                // activation [G, M, K] F32 x weight [G * N, K] (BF16 only) -> [G, M, N] F32.
+                arity(ins, 2)?;
+                if *weight != DType::BF16 {
+                    return Err(ShapeError::DenseContractionWeightDtype { actual: *weight });
+                }
+                let (activation, source) = (&ins[0], &ins[1]);
+                if activation.dtype != DType::F32 {
+                    return Err(ShapeError::DenseContractionDtype {
+                        operand: "activation",
+                        actual: activation.dtype,
+                    });
+                }
+                if source.dtype != *weight {
+                    return Err(ShapeError::DenseContractionDtype {
+                        operand: "weight",
+                        actual: source.dtype,
+                    });
+                }
+                if source.rank() != 2 {
+                    return Err(ShapeError::DenseContractionWeightRank {
+                        actual: source.clone(),
+                    });
+                }
+                let (rows, k) = (source.shape[0], source.shape[1]);
+                if *groups == 0 || rows % groups != 0 {
+                    return Err(ShapeError::GroupedDenseContractionGroups {
+                        groups: *groups,
+                        rows,
+                    });
+                }
+                if activation.rank() != 3
+                    || activation.shape[0] != *groups
+                    || activation.shape[2] != k
+                {
+                    return Err(ShapeError::DenseContractionActivation {
+                        expected_k: k,
+                        actual: activation.clone(),
+                    });
+                }
+                Ok(TensorType::f32(vec![
+                    *groups,
+                    activation.shape[1],
+                    rows / groups,
+                ]))
             }
             OpKind::DenseRowGather { source: dtype } => {
                 // table [V, R] (`source` dtype) x index [S..] I32 -> [S.., R] F32. Same row selection as `Gather { axis: 0 }`
@@ -1624,6 +1763,7 @@ impl OpKind {
             OpKind::FusedRow(region) => reject_i32_region("FusedRow", region.infer(ins)?),
             OpKind::Attention(attrs) => infer_attention(ins, attrs),
             OpKind::Rope { rot } => infer_rope(ins, *rot),
+            OpKind::Scan(attrs) => infer_scan(ins, attrs),
             OpKind::AllReduce { .. } => {
                 // Shape-preserving: each rank holds a same-shaped partial; the collective combines across ranks and returns
                 // the full result in the same shape and dtype.
@@ -1711,12 +1851,21 @@ impl OpKind {
             | Self::IndexedMatMul
             | Self::RandomUniform { .. }
             | Self::SampleToken { .. }
-            | Self::PackedRowGather { .. } => OpClass::Primitive,
-            Self::PackedContraction { .. }
+            | Self::PackedRowGather { .. }
+            | Self::PackedContraction {
+                rows: ContractionRows::Indexed { .. },
+                ..
+            } => OpClass::Primitive,
+            Self::PackedContraction {
+                rows: ContractionRows::Blocks(_),
+                ..
+            }
             | Self::DenseContraction { .. }
+            | Self::GroupedDenseContraction { .. }
             | Self::DenseRowGather { .. }
             | Self::Attention(_)
             | Self::Rope { .. }
+            | Self::Scan(_)
             | Self::ContractionEpilogue { .. }
             | Self::Fused(_)
             | Self::FusedRow(_) => OpClass::Composite,
@@ -1724,11 +1873,12 @@ impl OpKind {
     }
 
     /// The weight dtype when this equation contracts an activation against a `[N, K]` dense weight: a
-    /// [`OpKind::DenseContraction`], or a [`OpKind::ContractionEpilogue`] over a dense head. The weight is
-    /// input 1 in both.
+    /// [`OpKind::DenseContraction`], a [`OpKind::GroupedDenseContraction`], or a
+    /// [`OpKind::ContractionEpilogue`] over a dense head. The weight is input 1 in all three.
     pub fn dense_weight(&self) -> Option<DType> {
         match self {
             Self::DenseContraction { weight }
+            | Self::GroupedDenseContraction { weight, .. }
             | Self::ContractionEpilogue {
                 head: ContractionHead::Dense { weight },
                 ..
@@ -1765,6 +1915,7 @@ impl OpKind {
             Self::PackedContraction { .. } => "packed_contraction",
             Self::PackedRowGather { .. } => "packed_row_gather",
             Self::DenseContraction { .. } => "dense_contraction",
+            Self::GroupedDenseContraction { .. } => "grouped_dense_contraction",
             Self::DenseRowGather { .. } => "dense_row_gather",
             Self::ContractionEpilogue { .. } => "contraction_epilogue",
             Self::ArgTopK { .. } => "arg_top_k",
@@ -1776,6 +1927,7 @@ impl OpKind {
             Self::FusedRow(_) => "fused_row",
             Self::Attention(_) => "attention",
             Self::Rope { .. } => "rope",
+            Self::Scan(_) => "scan",
             Self::AllReduce { .. } => "all_reduce",
             Self::AllGather { .. } => "all_gather",
             Self::RandomUniform { .. } => "random_uniform",
@@ -1812,12 +1964,12 @@ impl OpKind {
             OpKind::PackedDequant { descriptor } => {
                 format!("packed_dequant {:?}", descriptor.format()).to_lowercase()
             }
-            OpKind::PackedContraction { descriptor, blocks } => {
+            OpKind::PackedContraction { descriptor, rows } => {
                 let base = format!("packed_contraction {:?}", descriptor.format()).to_lowercase();
-                if *blocks == 1 {
-                    base
-                } else {
-                    format!("{base} blocks={blocks}")
+                match rows {
+                    ContractionRows::Blocks(1) => base,
+                    ContractionRows::Blocks(blocks) => format!("{base} blocks={blocks}"),
+                    ContractionRows::Indexed { experts } => format!("{base} experts={experts}"),
                 }
             }
             OpKind::PackedRowGather { descriptor } => {
@@ -1825,6 +1977,9 @@ impl OpKind {
             }
             OpKind::DenseContraction { weight } => {
                 format!("dense_contraction {weight:?}").to_lowercase()
+            }
+            OpKind::GroupedDenseContraction { weight, groups } => {
+                format!("grouped_dense_contraction {weight:?} groups={groups}").to_lowercase()
             }
             OpKind::DenseRowGather { source } => {
                 format!("dense_row_gather {source:?}").to_lowercase()
@@ -1843,6 +1998,7 @@ impl OpKind {
                 a.n_rep, a.scale, a.softcap, a.mask, a.key, a.bound
             ),
             OpKind::Rope { rot } => format!("rope rot={rot}"),
+            OpKind::Scan(attrs) => format!("scan {} chunk={}", attrs.family.name(), attrs.chunk),
             OpKind::AllReduce { op, axis } => {
                 format!("all_reduce.{} ax={axis}", format!("{op:?}").to_lowercase())
             }
@@ -1871,10 +2027,9 @@ fn reject_i32_region(op: &'static str, output: TensorType) -> Result<TensorType,
 /// and `mask[B,Hm,Lq,Lk]` with `Hm` either 1 (one plane shared by every head) or `Hq` (one per head, for ALiBi).
 /// The output is `[B,Hq,Lq,Dv]` in q's dtype. A K/V or mask that the decomposition would merely broadcast (a
 /// size-1 head or batch axis) is not this op. `Lq` and `Lk` are independent: decode (`Lq == 1`), a first prefill
-/// (`Lq == Lk`) and a prefill into a cache (`1 < Lq < Lk`) all type here. A live bound types over F32 only: its
-/// decomposition selects inactive keys with a float `Select`, and neither the oracle (a `Select` branch that is
-/// the result of a narrowing `Cast` carries F32 lanes) nor the planner (F32 and I32 branches only) lowers it for
-/// BF16/F16.
+/// (`Lq == Lk`) and a prefill into a cache (`1 < Lq < Lk`) all type here, at every float dtype and either
+/// bound: a live bound's decomposition selects inactive keys with a bit-moving `Select`, which every float width
+/// has.
 fn infer_attention(ins: &[TensorType], attrs: &AttentionAttrs) -> Result<TensorType, ShapeError> {
     let split = matches!(attrs.key, KeyLayout::Split { .. });
     let live = matches!(attrs.bound, KvBound::Live);
@@ -1883,7 +2038,7 @@ fn infer_attention(ins: &[TensorType], attrs: &AttentionAttrs) -> Result<TensorT
     let shared = split.then(|| &ins[4]);
     let len = live.then(|| &ins[ins.len() - 1]);
     // Float operands only: the decomposition's softmax (`Exp`, `Div`) does not type over I32.
-    if q.dtype.class() != DTypeClass::Arithmetic || (live && q.dtype != DType::F32) {
+    if q.dtype.class() != DTypeClass::Arithmetic {
         return Err(ShapeError::DtypeOp {
             op: "Attention",
             dtype: q.dtype,
@@ -1990,6 +2145,159 @@ fn infer_attention(ins: &[TensorType], attrs: &AttentionAttrs) -> Result<TensorT
         });
     }
     Ok(TensorType::new(vec![bsz, hq, lq, dv], q.dtype))
+}
+
+/// The recurrence a [`OpKind::Scan`] computes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum ScanFamily {
+    /// The gated delta rule. Operands `[q, k, v, g, beta, s_in]`: `q`, `k`, `v` `[1,H,L,D]` (already at
+    /// the value-head count, `q` unscaled), `g` and `beta` `[1,H,L,1]` (`g` log-domain), `s_in`
+    /// `[1,H,D,D]`. Result `[1,H,L+D,D]`.
+    DeltaRule,
+    /// The Mamba2 SSD. Operands `[x, b, c, delta, a, d, h_in]`: `x` `[1,H,L,P]`, `b` and `c` `[1,H,L,N]`
+    /// (already at the head count), `delta` `[1,H,L,1]`, `a` and `d` `[1,H,1,1]`, `h_in` `[1,H,N,P]`.
+    /// Result `[1,H,L+N,P]`.
+    Ssd,
+}
+
+impl ScanFamily {
+    /// How many operands the family takes.
+    pub const fn operands(self) -> usize {
+        match self {
+            Self::DeltaRule => 6,
+            Self::Ssd => 7,
+        }
+    }
+
+    /// The operands with a sequence axis (axis 2, length `L`), a prefix of the operand list: a chunk window of
+    /// the scan slices exactly these. The remaining operands are per-head parameters, then the carried state
+    /// (always the last operand).
+    pub const fn sequence_operands(self) -> std::ops::Range<usize> {
+        match self {
+            Self::DeltaRule => 0..5,
+            Self::Ssd => 0..4,
+        }
+    }
+
+    /// A stable lowercase name, for plan labels and summaries.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::DeltaRule => "delta_rule",
+            Self::Ssd => "ssd",
+        }
+    }
+}
+
+/// The attributes of [`OpKind::Scan`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub struct ScanAttrs {
+    pub family: ScanFamily,
+    /// The chunk length (a power of two) of the reference decomposition. A device schedule is free to
+    /// differ; the semantics do not depend on it beyond rounding.
+    pub chunk: usize,
+}
+
+/// The row layout of a scan's packed result `[1, heads, len + state_rows, width]`: the sequence output
+/// `y [1,heads,len,width]` first, then the carried state `s_out [1,heads,state_rows,width]`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub struct ScanLayout {
+    pub heads: usize,
+    pub len: usize,
+    pub state_rows: usize,
+    pub width: usize,
+}
+
+impl ScanAttrs {
+    /// The layout the operand types `ins` imply, or why they are not a scan of this family.
+    pub fn layout(&self, ins: &[TensorType]) -> Result<ScanLayout, ShapeError> {
+        let bad = ShapeError::Scan;
+        arity(ins, self.family.operands())?;
+        if ins.iter().any(|t| t.dtype != DType::F32) {
+            return Err(bad(ScanReason::NotF32));
+        }
+        let first = &ins[0];
+        if first.shape.len() != 4 || first.shape[0] != 1 {
+            return Err(bad(ScanReason::LeadOperand {
+                shape: first.shape.clone(),
+            }));
+        }
+        let (h, l, w) = (first.shape[1], first.shape[2], first.shape[3]);
+        if h == 0 || l == 0 || w == 0 || !self.chunk.is_power_of_two() {
+            return Err(bad(ScanReason::Extents {
+                shape: first.shape.clone(),
+                chunk: self.chunk,
+            }));
+        }
+        let (state_rows, expected): (usize, Vec<(&str, Vec<usize>)>) = match self.family {
+            ScanFamily::DeltaRule => (
+                w,
+                vec![
+                    ("k", vec![1, h, l, w]),
+                    ("v", vec![1, h, l, w]),
+                    ("g", vec![1, h, l, 1]),
+                    ("beta", vec![1, h, l, 1]),
+                    ("s_in", vec![1, h, w, w]),
+                ],
+            ),
+            ScanFamily::Ssd => {
+                let n = ins[1].shape.get(3).copied().unwrap_or(0);
+                (
+                    n,
+                    vec![
+                        ("b", vec![1, h, l, n]),
+                        ("c", vec![1, h, l, n]),
+                        ("delta", vec![1, h, l, 1]),
+                        ("a", vec![1, h, 1, 1]),
+                        ("d", vec![1, h, 1, 1]),
+                        ("h_in", vec![1, h, n, w]),
+                    ],
+                )
+            }
+        };
+        if state_rows == 0 {
+            return Err(bad(ScanReason::NoStateRows));
+        }
+        for (i, (name, want)) in expected.into_iter().enumerate() {
+            if ins[i + 1].shape != want {
+                return Err(bad(ScanReason::Operand {
+                    name,
+                    want,
+                    got: ins[i + 1].shape.clone(),
+                }));
+            }
+        }
+        Ok(ScanLayout {
+            heads: h,
+            len: l,
+            state_rows,
+            width: w,
+        })
+    }
+}
+
+impl ScanLayout {
+    /// The packed result's shape.
+    pub fn packed_shape(&self) -> Vec<usize> {
+        vec![1, self.heads, self.len + self.state_rows, self.width]
+    }
+
+    /// The packed rows holding the sequence output `y`.
+    pub fn y_rows(&self) -> std::ops::Range<usize> {
+        0..self.len
+    }
+
+    /// The packed rows holding the carried state `s_out`.
+    pub fn state_rows(&self) -> std::ops::Range<usize> {
+        self.len..self.len + self.state_rows
+    }
+}
+
+/// The typing rule of `Scan`: the packed result of the layout the operands imply.
+fn infer_scan(ins: &[TensorType], attrs: &ScanAttrs) -> Result<TensorType, ShapeError> {
+    Ok(TensorType::new(
+        attrs.layout(ins)?.packed_shape(),
+        DType::F32,
+    ))
 }
 
 /// The typing rule of `Rope { rot }`: inputs `[x, cos, sin]`, output x's type. `rot` is even and within
@@ -2124,6 +2432,29 @@ fn infer_sample_token(ins: &[TensorType], rule: SampleRule) -> Result<TensorType
     let mut out_shape = leading.to_vec();
     out_shape.push(2);
     Ok(TensorType::new(out_shape, DType::I32))
+}
+
+/// Check the carriers of an indexed packed contraction: one I8 `[experts, slab_bytes]` source per role of
+/// `descriptor`, in role order ([`crate::packed_source::packed_stack_source_type`]).
+fn check_packed_stack(
+    descriptor: PackedWeight,
+    experts: usize,
+    carriers: &[TensorType],
+) -> Result<(), ShapeError> {
+    if experts == 0 {
+        return Err(ShapeError::PackedStackExperts);
+    }
+    for (carrier, role) in carriers.iter().zip(descriptor.sources()) {
+        let expected = crate::packed_source::packed_stack_source_type(descriptor, experts, role);
+        if *carrier != expected {
+            return Err(ShapeError::PackedStackOperand {
+                role,
+                expected: Box::new(expected),
+                actual: Box::new(carrier.clone()),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn arity(ins: &[TensorType], expected: usize) -> Result<(), ShapeError> {
@@ -2375,6 +2706,70 @@ mod tests {
         ));
     }
 
+    /// POOT-1048. The grouped contraction types `[G, M, K] x [G * N, K] -> [G, M, N]`, and every malformed
+    /// operand is rejected by name, so a grouped chain that does not block the weight the way the activation
+    /// groups can never reach a planner or a kernel.
+    #[test]
+    fn grouped_dense_contraction_types_blocks_and_rejects_malformed_operands() {
+        let op = OpKind::GroupedDenseContraction {
+            weight: DType::BF16,
+            groups: 3,
+        };
+        let weight = TensorType::new(vec![12, 5], DType::BF16);
+        assert_eq!(
+            op.infer(&[f(&[3, 2, 5]), weight.clone()]),
+            Ok(f(&[3, 2, 4]))
+        );
+        // The activation groups differently from the op.
+        assert!(matches!(
+            op.infer(&[f(&[2, 2, 5]), weight.clone()]),
+            Err(ShapeError::DenseContractionActivation { expected_k: 5, .. })
+        ));
+        // Not a `[groups, M, K]` activation.
+        assert!(matches!(
+            op.infer(&[f(&[3, 5]), weight.clone()]),
+            Err(ShapeError::DenseContractionActivation { .. })
+        ));
+        // Weight rows that do not split into the groups.
+        assert!(matches!(
+            op.infer(&[f(&[3, 2, 5]), TensorType::new(vec![10, 5], DType::BF16)]),
+            Err(ShapeError::GroupedDenseContractionGroups {
+                groups: 3,
+                rows: 10
+            })
+        ));
+        // A weight already blocked: the op blocks it itself.
+        assert!(matches!(
+            op.infer(&[f(&[3, 2, 5]), TensorType::new(vec![3, 4, 5], DType::BF16)]),
+            Err(ShapeError::DenseContractionWeightRank { .. })
+        ));
+        // A weight dtype that is not the op's own table row.
+        assert!(matches!(
+            op.infer(&[f(&[3, 2, 5]), f(&[12, 5])]),
+            Err(ShapeError::DenseContractionDtype {
+                operand: "weight",
+                ..
+            })
+        ));
+        // Only BF16 has grouped device rows.
+        for dtype in [DType::F32, DType::F16] {
+            assert!(matches!(
+                OpKind::GroupedDenseContraction { weight: dtype, groups: 3 }
+                    .infer(&[f(&[3, 2, 5]), TensorType::new(vec![12, 5], dtype)]),
+                Err(ShapeError::DenseContractionWeightDtype { actual }) if actual == dtype
+            ));
+        }
+        // No groups at all.
+        assert!(matches!(
+            OpKind::GroupedDenseContraction {
+                weight: DType::BF16,
+                groups: 0
+            }
+            .infer(&[f(&[0, 2, 5]), weight]),
+            Err(ShapeError::GroupedDenseContractionGroups { groups: 0, .. })
+        ));
+    }
+
     /// Card 380 FR-001. Every other operand condition is rejected by name, so a malformed contraction can
     /// never reach a planner or a kernel.
     #[test]
@@ -2592,7 +2987,7 @@ mod tests {
         ];
         let operation = OpKind::PackedContraction {
             descriptor,
-            blocks: 1,
+            rows: ContractionRows::Blocks(1),
         };
         let output = operation
             .infer(&[
@@ -2636,7 +3031,7 @@ mod tests {
         ];
         let blocked = OpKind::PackedContraction {
             descriptor,
-            blocks: 4,
+            rows: ContractionRows::Blocks(4),
         };
         // out=8, blocks=4 -> block_out=2. A well-formed [blocks, m, k] activation infers
         // [blocks, m, block_out].
@@ -2670,7 +3065,7 @@ mod tests {
 
         let indivisible = OpKind::PackedContraction {
             descriptor,
-            blocks: 3,
+            rows: ContractionRows::Blocks(3),
         };
         assert_eq!(
             indivisible.infer(&[
@@ -2682,7 +3077,7 @@ mod tests {
         );
         let zero_blocks = OpKind::PackedContraction {
             descriptor,
-            blocks: 0,
+            rows: ContractionRows::Blocks(0),
         };
         assert_eq!(
             zero_blocks.infer(&[
@@ -2691,6 +3086,58 @@ mod tests {
                 carriers[1].clone(),
             ]),
             Err(ShapeError::PackedContractionBlocks { out: 8, blocks: 0 })
+        );
+    }
+
+    /// An indexed packed contraction (`rows: Indexed`) types `x [M, K]`, ids `[M]` and one expert-stacked,
+    /// word-padded carrier per source role to `[M, out]`; a carrier of the per-expert (unstacked) type, one
+    /// with the wrong expert count, or ids of the wrong length is refused by name.
+    #[test]
+    fn indexed_packed_contraction_types_stacked_carriers() {
+        // Q8_0, out=3, K=32: 102 bytes per expert, padded to 104.
+        let descriptor = PackedWeight::try_new(WeightFormat::Q8_0, [3, 32]).unwrap();
+        let experts = 3;
+        let slab = descriptor.slab_bytes(SourceRole::Blocks);
+        assert_eq!(slab, 104);
+        let stacked = TensorType::new(vec![experts, slab], DType::I8);
+        let operation = OpKind::PackedContraction {
+            descriptor,
+            rows: ContractionRows::Indexed { experts },
+        };
+        let x = TensorType::f32(vec![5, 32]);
+        let ids = TensorType::f32(vec![5]);
+        assert_eq!(
+            operation.infer(&[x.clone(), ids.clone(), stacked.clone()]),
+            Ok(TensorType::f32(vec![5, 3]))
+        );
+        let per_expert = TensorType::new(
+            descriptor.source_shape(SourceRole::Blocks).to_vec(),
+            DType::I8,
+        );
+        for (label, carrier) in [
+            ("per-expert shape", per_expert),
+            ("two experts", TensorType::new(vec![2, slab], DType::I8)),
+            ("unpadded", TensorType::new(vec![experts, 102], DType::I8)),
+        ] {
+            assert!(
+                matches!(
+                    operation.infer(&[x.clone(), ids.clone(), carrier]),
+                    Err(ShapeError::PackedStackOperand { .. })
+                ),
+                "{label}"
+            );
+        }
+        assert!(matches!(
+            operation.infer(&[x.clone(), TensorType::f32(vec![4]), stacked.clone()]),
+            Err(ShapeError::PackedContractionActivation { expected_k: 32, .. })
+        ));
+        assert_eq!(
+            OpKind::PackedContraction {
+                descriptor,
+                rows: ContractionRows::Indexed { experts: 0 },
+            }
+            .infer(&[x, ids, stacked]),
+            Err(ShapeError::PackedStackExperts)
         );
     }
 

@@ -271,7 +271,8 @@ impl PagedKvCache {
     }
 
     /// Tokens currently held by slot `s`.
-    pub fn seq_len(&self, s: usize) -> usize {
+    #[cfg(test)]
+    pub(crate) fn seq_len(&self, s: usize) -> usize {
         self.tables[s].len()
     }
 

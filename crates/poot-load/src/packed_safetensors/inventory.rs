@@ -879,19 +879,6 @@ pub struct ClassifiedInventoryRow {
     pub disposition: TensorDisposition,
 }
 
-/// One exact-source owner and its authenticated provenance, packaged for a *consumer's own*
-/// retained subset (e.g. [`poot_models`]'s per-model ownership plans, keyed by layer/role instead
-/// of tensor name). Not [`MixedLoadResult`]'s own field: the mixed loader's one load output is its
-/// [`WeightStore`] plus [`ExactSourceMetadata`], keyed by tensor name (card 540a); a
-/// consumer that wants a smaller, differently-keyed slice builds its own `Vec` of these from that
-/// store and metadata, rather than the loader keeping a second, parallel copy of every row.
-#[derive(Clone, Debug)]
-pub struct LoadedExactSource {
-    pub descriptor: AuthenticatedTensorDescriptor,
-    pub kind: ExactSourceKind,
-    pub owner: Arc<ExactSourceOwner>,
-}
-
 /// Checkpoint provenance for one packed linear's [`WeightStore`] entry (`WeightEntry::Packed`,
 /// keyed by linear id): the weight/scale tensor names and shard byte spans the payload's bytes
 /// were read from. Not on [`PackedPayload`] itself (card 540a): a payload only knows

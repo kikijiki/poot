@@ -30,8 +30,11 @@
 //! Card 735 as further key fields.
 
 pub mod block_table;
+pub mod capacity;
 mod caps;
 pub(crate) mod chunks;
+pub mod embeds;
+pub mod encode;
 pub mod error;
 pub mod handle;
 mod host_sample;
@@ -52,12 +55,15 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
-use poot_executor::{EntryId, ExecutableId, Executor, NoSync, StepInputs, WeightSource};
+use poot_executor::{EntryId, ExecutableId, Executor, NoSync, StepInputs};
 use poot_graph_ir::{Graph, Slot, SlotKey, StateRole, ValidationOutputs};
 use poot_graph_plan::{
     CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedCompileError,
     StagedProgram, Target, TargetSet, WeightFormats, bind_packed_weights, compile_staged,
 };
+use poot_models::bert::{ATTENTION_MASK_SLOT, TOKEN_TYPE_SLOT};
+use poot_models::components::embed::{EMBEDS_AT_SLOT, EMBEDS_SLOT};
+use poot_models::idefics3::PIXELS_SLOT;
 use poot_models::model::{KvLayout, Phase, ShapeReason, StepShape, TraceError};
 use poot_tensor::HostTensor;
 
@@ -67,6 +73,8 @@ pub use caps::{
     DriverCaps, HeadSet, InputSet, Layout, LoraCaps, PoolShape, ServingShapes, StateResidency,
 };
 use chunks::ChunkPolicy;
+pub use embeds::PromptEmbeds;
+pub use encode::{EncodeRequest, EncodeRow, Encoded};
 use error::{
     DriverError, InvalidOptions, InvalidRequest, PreparedSetRefusal, SpeculationRefusal,
     Unsupported,
@@ -278,6 +286,8 @@ struct Prepared {
     /// What the entry holds against the retention limit.
     held: Held,
     slots: Vec<SlotSpec>,
+    /// The shape of the program's output, as traced: `[rows, positions, width]` for an encode step.
+    output: Vec<usize>,
 }
 
 /// What one prepared entry holds: its own bytes, and the keys of the shared owners it references.
@@ -323,6 +333,16 @@ enum SlotRole {
     Seed,
     Params,
     TopK,
+    /// `Slot::Activation` `"embeds"`: the caller's embedding rows of a `PrefillEmbeds` step.
+    Embeds,
+    /// `Slot::Activation` `"embeds_at"`: which positions those rows replace.
+    EmbedsAt,
+    /// `Slot::Activation` `"token_type"`: every token's segment id (an encoder's).
+    TokenType,
+    /// `Slot::Activation` `"attention_mask"`: 1 for a real token, 0 for padding (an encoder's).
+    AttentionMask,
+    /// `Slot::Activation` `"pixels"`: the frames of a vision tower's step.
+    Pixels,
 }
 
 impl Prepared {
@@ -338,6 +358,14 @@ impl Prepared {
             (sampler_slot("seed"), SlotRole::Seed),
             (sampler_slot("params"), SlotRole::Params),
             (sampler_slot("top_k"), SlotRole::TopK),
+            (activation_slot(EMBEDS_SLOT), SlotRole::Embeds),
+            (activation_slot(EMBEDS_AT_SLOT), SlotRole::EmbedsAt),
+            (activation_slot(TOKEN_TYPE_SLOT), SlotRole::TokenType),
+            (
+                activation_slot(ATTENTION_MASK_SLOT),
+                SlotRole::AttentionMask,
+            ),
+            (activation_slot(PIXELS_SLOT), SlotRole::Pixels),
         ];
         let mut slots = Vec::new();
         for &(value, _) in &graph.slots {
@@ -374,6 +402,11 @@ struct StepData {
     seed: Vec<i32>,
     params: Vec<f32>,
     top_k: Vec<i32>,
+    embeds: Vec<f32>,
+    embeds_at: Vec<i32>,
+    token_type: Vec<i32>,
+    attention_mask: Vec<i32>,
+    pixels: Vec<f32>,
 }
 
 pub struct Driver {
@@ -394,6 +427,9 @@ pub struct Driver {
     /// Whether any prepared entry carries recurrent state; read from the traced graphs' state roles.
     residency: StateResidency,
     lora: lora::LoraRegistry,
+    /// The executable serving each captured adapter generation that has an entry: the base weights
+    /// shared with the base executable, plus the generation's stacked adapter tensors.
+    adapter_exes: HashMap<GenerationId, ExecutableId>,
     speculation: speculate::Speculation,
     /// The paged pool, the open sequences and the published caps; absent until `prepare`.
     serving: Option<step::Serving>,
@@ -412,6 +448,10 @@ fn pos_slot() -> SlotKey {
 
 fn sampler_slot(tag: &str) -> SlotKey {
     SlotKey::new(Slot::Sampler, Some(tag))
+}
+
+fn activation_slot(tag: &str) -> SlotKey {
+    SlotKey::new(Slot::Activation, Some(tag))
 }
 
 impl Driver {
@@ -444,8 +484,7 @@ impl Driver {
         )?;
         let formats = WeightFormats::from_weight_map(handle.model().weights());
         let weights = Arc::new(handle.model().weights().clone());
-        let exe =
-            executor.load_weights(handle.shared_store().clone(), WeightSource::Map(weights))?;
+        let exe = executor.load_weights(handle.shared_store().clone(), weights)?;
         let speculation = speculate::Speculation::new(options.draft.clone());
         Ok(Self {
             handle,
@@ -461,6 +500,7 @@ impl Driver {
             stats: DriverStats::default(),
             residency: StateResidency::KvOnly,
             lora: lora::LoraRegistry::default(),
+            adapter_exes: HashMap::new(),
             speculation,
             serving: None,
             layout: None,
@@ -489,8 +529,8 @@ impl Driver {
 
     fn options_for(&self, phase: Phase) -> CompileOptions {
         match phase {
-            Phase::Prefill => self.options.prefill,
-            Phase::Decode => self.options.decode,
+            Phase::Prefill | Phase::PrefillEmbeds | Phase::Encode => self.options.prefill.clone(),
+            Phase::Decode => self.options.decode.clone(),
         }
     }
 
@@ -534,7 +574,26 @@ impl Driver {
         let graph = bind_packed_weights(&graph, self.formats_of(key.role))
             .map_err(Unsupported::PackedBind)?;
         let (graph, _) = suffix::append_head(graph, key.head);
-        let slots = Prepared::slots_of(&graph)?;
+        let mut slots = Prepared::slots_of(&graph)?;
+        let output = graph.aval(graph.output).shape.clone();
+        let mut compile = self.options_for(key.phase);
+        let stack = key
+            .adapters
+            .map(|generation| {
+                self.lora
+                    .stack(generation)
+                    .ok_or(lora::LoraError::UnknownGeneration(generation))
+            })
+            .transpose()?;
+        if let Some(stack) = &stack {
+            // The LoRA pass adds the index slot to the program; the entry binds it every step.
+            compile = compile.with_lora(stack.plan(key.shape.rows));
+            slots.push(SlotSpec {
+                key: SlotKey::new(Slot::LoraIdx, None),
+                shape: vec![key.shape.rows.get()],
+                role: SlotRole::LoraIdx,
+            });
+        }
         let program = compile_staged(
             &graph,
             &TargetSet::single(DeviceId(0), self.target),
@@ -542,7 +601,7 @@ impl Driver {
                 experts: ExpertPlacement::AllResident,
                 devices: DevicePlacement::Single(DeviceId(0)),
             },
-            &self.options_for(key.phase),
+            &compile,
         )
         .map_err(|e| match e {
             StagedCompileError::Compile(poot_graph_plan::CompileError::Plan(plan)) => match *plan {
@@ -563,6 +622,10 @@ impl Driver {
             }
             .into());
         }
+        let exe = match key.adapters {
+            Some(generation) => self.adapter_exe(generation)?,
+            None => exe,
+        };
         let id = self.executor.add_entry(exe, &program)?;
         self.stats.entries_added += 1;
         self.hold(&reservation);
@@ -571,6 +634,7 @@ impl Driver {
             exe,
             held: reservation.held,
             slots,
+            output,
         };
         if key.role == ModelRole::Target && residency == StateResidency::Recurrent {
             self.residency = StateResidency::Recurrent;
@@ -686,6 +750,11 @@ impl Driver {
                     SlotRole::Seed => HostTensor::i32(shape, data.seed.clone()),
                     SlotRole::Params => HostTensor::f32(shape, data.params.clone()),
                     SlotRole::TopK => HostTensor::i32(shape, data.top_k.clone()),
+                    SlotRole::Embeds => HostTensor::f32(shape, data.embeds.clone()),
+                    SlotRole::EmbedsAt => HostTensor::i32(shape, data.embeds_at.clone()),
+                    SlotRole::TokenType => HostTensor::i32(shape, data.token_type.clone()),
+                    SlotRole::AttentionMask => HostTensor::i32(shape, data.attention_mask.clone()),
+                    SlotRole::Pixels => HostTensor::f32(shape, data.pixels.clone()),
                 };
                 (&spec.key, tensor)
             })
@@ -698,6 +767,23 @@ impl Driver {
         Ok(self
             .executor
             .step(entry.exe, entry.id, &inputs, &mut NoSync)?)
+    }
+
+    /// The executable serving `generation`, loaded on first use: the base store and map, extended with
+    /// the generation's stacked adapter tensors. A failed load leaves nothing registered.
+    fn adapter_exe(&mut self, generation: GenerationId) -> Result<ExecutableId, DriverError> {
+        if let Some(&exe) = self.adapter_exes.get(&generation) {
+            return Ok(exe);
+        }
+        let stack = self
+            .lora
+            .stack(generation)
+            .ok_or(lora::LoraError::UnknownGeneration(generation))?;
+        let (store, map) =
+            stack.weights(self.handle.shared_store(), self.handle.model().weights())?;
+        let exe = self.executor.load_weights(Arc::new(store), Arc::new(map))?;
+        self.adapter_exes.insert(generation, exe);
+        Ok(exe)
     }
 
     /// The model and executable `role`'s entries run: the served model's, or the loaded draft's.
@@ -733,6 +819,28 @@ impl Driver {
         request: GenerateRequest,
         sink: &mut dyn TokenSink,
     ) -> Result<Generation, DriverError> {
+        self.generate_with(request, None, sink)
+    }
+
+    /// [`Driver::generate`] for a prompt that supplies embedding rows in place of some tokens'
+    /// embeddings (a multimodal prompt's image rows): its prefill steps bind them
+    /// (`StepInput::TokensWithEmbeds`), so nothing of them is compiled into a program. Contiguous
+    /// layout only ([`Driver::open_with_embeds`]).
+    pub fn generate_with_embeds(
+        &mut self,
+        request: GenerateRequest,
+        embeds: PromptEmbeds,
+        sink: &mut dyn TokenSink,
+    ) -> Result<Generation, DriverError> {
+        self.generate_with(request, Some(embeds), sink)
+    }
+
+    fn generate_with(
+        &mut self,
+        request: GenerateRequest,
+        embeds: Option<PromptEmbeds>,
+        sink: &mut dyn TokenSink,
+    ) -> Result<Generation, DriverError> {
         let GenerateRequest {
             prompt,
             max_new,
@@ -763,19 +871,28 @@ impl Driver {
             Some(rule) => Head::Sample(rule),
             None => Head::Logits,
         };
-        self.prepare(&ServingShapes {
+        let shapes = ServingShapes {
             layout: self.layout.unwrap_or(Layout::Contiguous),
             rows: &[NonZeroUsize::MIN],
             heads: &[head],
             warm: Warm::Prompts(&[prompt.len()]),
             windows: &[],
             adapters: &[],
-        })?;
-        let seq = match self.open(SeqRequest {
+        };
+        self.prepare(&shapes)?;
+        let request_seq = SeqRequest {
             prompt,
             max_new,
             adapter: AdapterRef::Base,
-        })? {
+        };
+        let admission = match embeds {
+            Some(embeds) => {
+                self.prepare_embeds(&shapes)?;
+                self.open_with_embeds(request_seq, embeds)?
+            }
+            None => self.open(request_seq)?,
+        };
+        let seq = match admission {
             Admission::Opened { seq, .. } => seq,
             Admission::NoRoom { needed_blocks: 0 } => {
                 return Err(InvalidRequest::SlotsBusy.into());

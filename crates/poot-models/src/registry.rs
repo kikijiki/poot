@@ -337,6 +337,13 @@ pub(crate) enum Family {
     Deepseek3,
     Deepseek32,
     NemotronH,
+    DeepseekV4,
+    Bert,
+    Idefics3Vision,
+    Qwen3Next,
+    Qwen35,
+    Qwen4Exp,
+    Glm53Flash,
 }
 
 impl Family {
@@ -362,6 +369,13 @@ impl Family {
         Family::Deepseek3,
         Family::Deepseek32,
         Family::NemotronH,
+        Family::DeepseekV4,
+        Family::Bert,
+        Family::Idefics3Vision,
+        Family::Qwen3Next,
+        Family::Qwen35,
+        Family::Qwen4Exp,
+        Family::Glm53Flash,
     ];
 
     pub(crate) const fn entry(self) -> FamilyEntry {
@@ -386,6 +400,13 @@ impl Family {
             Family::Deepseek3 => crate::deepseek3::ENTRY,
             Family::Deepseek32 => crate::deepseek32::ENTRY,
             Family::NemotronH => crate::nemotron_h::ENTRY,
+            Family::DeepseekV4 => crate::deepseek4::ENTRY,
+            Family::Bert => crate::bert::ENTRY,
+            Family::Idefics3Vision => crate::idefics3::ENTRY,
+            Family::Qwen3Next => crate::qwen3next::ENTRY,
+            Family::Qwen35 => crate::qwen38_27b::ENTRY,
+            Family::Qwen4Exp => crate::qwen38::ENTRY,
+            Family::Glm53Flash => crate::glm53_flash::ENTRY,
         }
     }
 
@@ -414,6 +435,13 @@ impl Family {
             Family::Deepseek3 => 17,
             Family::Deepseek32 => 18,
             Family::NemotronH => 19,
+            Family::DeepseekV4 => 20,
+            Family::Bert => 21,
+            Family::Idefics3Vision => 22,
+            Family::Qwen3Next => 23,
+            Family::Qwen35 => 24,
+            Family::Qwen4Exp => 25,
+            Family::Glm53Flash => 26,
         }
     }
 }
@@ -462,12 +490,12 @@ mod tests {
     }
 
     /// Card 732 SC-007: every shipped family's fixture greedy-decodes a non-constant sequence on
-    /// the CPU oracle (a prefill of three tokens, then eight decode steps), so its rows cover more
+    /// the CPU oracle (the three-token prompt as the driver runs it, then eight decode steps), so its rows cover more
     /// than one argmax. Mutation: zero the fixture's head; the sequence is constant.
     #[test]
     fn every_fixture_greedy_decodes_a_non_constant_sequence() {
         use crate::components::standard::oracle::run_step;
-        use crate::model::Phase;
+        use crate::model::{ModelOutput, Phase};
 
         fn argmax(logits: &[f32]) -> i32 {
             let mut best = 0;
@@ -487,18 +515,15 @@ mod tests {
             let model = registry
                 .build(&fixture.raw(), &fixture.store)
                 .unwrap_or_else(|e| panic!("{}: {e}", entry.family));
-            let vocab = model.config().vocab;
+            // An encoder returns hidden states or scores, not logits: it has no decode to greedy
+            // through (its own tests cover its `Encode` step).
+            let ModelOutput::Logits { .. } = model.config().output else {
+                continue;
+            };
             let (capacity, prompt) = (16, [1, 2, 3]);
-            let (logits, mut state) = run_step(
-                &*model,
-                &fixture.store,
-                Phase::Prefill,
-                capacity,
-                &prompt,
-                0,
-                &[],
-            );
-            let mut token = argmax(&logits[(prompt.len() - 1) * vocab..]);
+            let (logits, mut state) =
+                crate::components::testing::run_prompt(&*model, &fixture.store, capacity, &prompt);
+            let mut token = argmax(&logits);
             let mut sequence = vec![token];
             for pos in prompt.len()..prompt.len() + 8 {
                 let (logits, next) = run_step(

@@ -8,8 +8,10 @@ Subcommands:
   report   Render a committed run directory to a markdown comparison table (pure stdlib, no GPU).
   compare  Diff a baseline against a candidate (each one or more run directories, ideally NOISE_REPEATS
            repeats of the same matrix), cell by cell. A cell is (model, scenario, framework, backend,
-           device). Exits 1 on a regression beyond the baseline's noise band, 2 when a cell has too few
-           repeats to say, 0 otherwise. Speed is recorded, never gated: the band guards a regression only.
+           device); each is judged on every required pair (headline and every curve point) by
+           performance_receipt, under the manifest's [performance] policy. Exits 1 on a regression, a failed
+           repeat or an incomparable cell, 2 when any cell is unverified, not run or has no baseline, 0 only
+           when every baseline cell compared without a regression.
 
 Design (spec 112): runners produce timing; the observer (observer.py) produces memory uniformly across
 engines; the manifest declares matched precision per cell and the known gaps of external tools, while poot
@@ -42,19 +44,23 @@ except ModuleNotFoundError:  # pragma: no cover
     import tomli as tomllib  # type: ignore
 
 try:
+    from . import performance_receipt as receipts
     from .result_contract import (
         BUILD_IDENTITY_FRAMEWORKS,
         CURVE_KIND,
         ResultValidationError,
         runner_refusal,
+        timing_claim,
         validate_runner_result,
     )
 except ImportError:  # direct `python harness/bench.py` execution
+    import performance_receipt as receipts
     from result_contract import (
         BUILD_IDENTITY_FRAMEWORKS,
         CURVE_KIND,
         ResultValidationError,
         runner_refusal,
+        timing_claim,
         validate_runner_result,
     )
 
@@ -286,8 +292,9 @@ def run_cell(model, scen, fw, fw_cfg, runners, models_dir, suite, interval_ms, o
         )
     if refusal is not None:
         row = {**base, "status": "unsupported", "reason": refusal, "caveats": caveats}
-        if "build_sha" in timing:
-            row["build_sha"] = timing["build_sha"]
+        for key in ("build_sha", "family"):
+            if key in timing:
+                row[key] = timing[key]
         return row
 
     try:
@@ -307,9 +314,10 @@ def run_cell(model, scen, fw, fw_cfg, runners, models_dir, suite, interval_ms, o
             caveats,
         )
 
-    row = {**base, "status": "ok"}
+    row = {**base, "status": "ok", "timing_claim": timing_claim(fw)}
     # Timing fields come from the runner; copy only the schema-known keys for this scenario.
-    timing_fields = ["framework_version", "build_sha", "backend", "self_reported_vram_bytes"]
+    timing_fields = ["framework_version", "build_sha", "family", "backend", "self_reported_vram_bytes",
+                     "preparation"]
     if not curve:
         timing_fields += [
             "prompt_tokens", "gen_tokens", "ttft_ms", "tpot_ms", "e2e_ms",
@@ -597,7 +605,7 @@ def cmd_index(args):
 def cmd_compare(args):
     rows_a = [row for run_dir in args.baseline for row in _load_rows(run_dir)]
     rows_b = [row for run_dir in args.candidate for row in _load_rows(run_dir)]
-    cells = compare_cells(rows_a, rows_b)
+    cells = compare_cells(rows_a, rows_b, receipts.load_policy(args.manifest))
     print(render_compare(args.baseline, args.candidate, cells))
     return compare_exit_code(cells)
 
@@ -611,20 +619,7 @@ def _load_rows(run_dir):
 # Compare: cells, the noise band and the exit code (pure stdlib)
 # --------------------------------------------------------------------------------------------------
 # Repeats of one cell (one runner invocation each, across as many run directories) that make a band.
-NOISE_REPEATS = 5
-
-REGRESSION = "regression"
-IMPROVEMENT = "improvement"
-WITHIN_NOISE = "within noise"
-UNVERIFIED = "unverified"
-INVALID = "invalid"
-CANDIDATE_FAILED = "candidate failed"
-NO_BASELINE = "no baseline"
-NEW = "new"
-NOT_RUN = "not run"
-
-_FAILING_VERDICTS = frozenset({REGRESSION, INVALID, CANDIDATE_FAILED})
-_COMPARED_VERDICTS = frozenset({REGRESSION, IMPROVEMENT, WITHIN_NOISE})
+NOISE_REPEATS = receipts.POLICY["min_trials"]
 
 
 def cell_key(row):
@@ -636,18 +631,17 @@ def cell_key(row):
 
 
 def _is_finite(value):
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    return receipts.is_finite(value)
 
 
-def compare_cells(rows_a, rows_b):
+def compare_cells(rows_a, rows_b, policy):
     """Compare a baseline against a candidate, one verdict per cell.
 
-    The noise model: the baseline's repeated runs of a cell give a median and a range (max - min); the band
-    is median +/- range. A candidate median more than one further range outside the band is a change
-    (median_b < median_a - 2 * range_a is a regression, above median_a + 2 * range_a an improvement); anything
-    closer is within noise. A baseline whose runs are all identical has range 0; the candidate's range is used
-    in its place, and when that is 0 too the cell is unverified. Only the headline decode tok/s is compared. A cell with fewer than NOISE_REPEATS
-    runs on either side, or whose runs mix binaries, has no honest band and is unverified.
+    Every verdict comes from `performance_receipt`, the one comparator: the headline (smallest context) and,
+    for a decode-curve cell, TPOT and TTFT at every context length the baseline measured. The cell's verdict
+    is the most serious of them, so a good headline never hides a slower long-context token, a context the
+    candidate did not run, or a failed repeat. A cell whose rows state different workloads (precision,
+    prompt length, output length) is incomparable. Runs that mix binaries have no honest band.
     """
     cells_a, cells_b = _rows_by_cell(rows_a), _rows_by_cell(rows_b)
 
@@ -655,7 +649,7 @@ def compare_cells(rows_a, rows_b):
         return tuple("" if part is None else part for part in key)
 
     return [
-        _compare_cell(key, cells_a.get(key), cells_b.get(key))
+        _compare_cell(key, cells_a.get(key), cells_b.get(key), policy)
         for key in sorted(set(cells_a) | set(cells_b), key=order)
     ]
 
@@ -671,10 +665,10 @@ def _distinct(rows, field):
     return sorted({row[field] for row in rows if row.get(field)})
 
 
-def _compare_cell(key, rows_a, rows_b):
+def _compare_cell(key, rows_a, rows_b, policy):
     cell = {"key": key, "verdict": None, "note": "", "n_a": 0, "n_b": 0,
             "median_a": None, "range_a": None, "median_b": None, "range_b": None,
-            "vram_a": None, "vram_b": None, "builds_a": [], "builds_b": []}
+            "vram_a": None, "vram_b": None, "builds_a": [], "builds_b": [], "entries": []}
     ok_a = [r for r in rows_a or [] if r.get("status") == "ok"]
     ok_b = [r for r in rows_b or [] if r.get("status") == "ok"]
     cell.update(n_a=len(ok_a), n_b=len(ok_b),
@@ -685,43 +679,39 @@ def _compare_cell(key, rows_a, rows_b):
         return cell
 
     if rows_b is None:
-        return settle(NOT_RUN, "cell is not in the candidate")
+        return settle(receipts.NOT_RUN, "cell is not in the candidate")
     if rows_a is None:
-        return settle(NEW, "cell is not in the baseline")
+        return settle(receipts.NEW, "cell is not in the baseline")
     bad = [side for side, ok in (("baseline", ok_a), ("candidate", ok_b))
-           if not all(_is_finite(r.get("decode_tok_s")) for r in ok)]
+           if not all(_is_finite(r.get(policy["headline_metric"])) for r in ok)]
     if bad:
-        return settle(INVALID, f"non-finite decode tok/s in the {' and '.join(bad)}")
+        return settle(receipts.INVALID, f"non-finite decode tok/s in the {' and '.join(bad)}")
     if not ok_a:
-        return settle(NO_BASELINE, "the baseline has no successful run of this cell")
+        return settle(receipts.NO_BASELINE, "the baseline has no successful run of this cell")
     if not ok_b:
         reasons = [r.get("reason", "") for r in rows_b if r.get("status") != "ok"]
-        return settle(CANDIDATE_FAILED, (reasons[0] if reasons else "no successful run")[:80])
+        return settle(receipts.CANDIDATE_FAILED, (reasons[0] if reasons else "no successful run")[:80])
 
-    samples_a = [r["decode_tok_s"] for r in ok_a]
-    samples_b = [r["decode_tok_s"] for r in ok_b]
-    cell.update(median_a=statistics.median(samples_a), range_a=max(samples_a) - min(samples_a),
-                median_b=statistics.median(samples_b), range_b=max(samples_b) - min(samples_b),
-                vram_a=_median_of(ok_a, "peak_vram_bytes"), vram_b=_median_of(ok_b, "peak_vram_bytes"))
-
-    if len(ok_a) < NOISE_REPEATS or len(ok_b) < NOISE_REPEATS:
-        return settle(UNVERIFIED, f"needs {NOISE_REPEATS} runs per side, have {len(ok_a)} and {len(ok_b)}")
+    cell.update(vram_a=_median_of(ok_a, "peak_vram_bytes"), vram_b=_median_of(ok_b, "peak_vram_bytes"))
     for side, ok in (("baseline", ok_a), ("candidate", ok_b)):
         if len({r.get("binary_sha256") for r in ok}) > 1:
-            return settle(UNVERIFIED, f"the {side} runs mix binaries")
+            return settle(receipts.UNVERIFIED, f"the {side} runs mix binaries")
 
-    # Identical baseline runs show no noise to size a band from (a real measurement is never that steady, so
-    # the values are quantized or the runner is not measuring); the candidate's spread is then the only
-    # observed noise. With neither, any difference would be judged against a zero-width band: unverified.
-    noise = cell["range_a"] or cell["range_b"]
-    if not noise:
-        return settle(UNVERIFIED, "the runs of both sides are identical, so no noise was observed")
-    margin = 2 * noise
-    if cell["median_b"] < cell["median_a"] - margin:
-        return settle(REGRESSION)
-    if cell["median_b"] > cell["median_a"] + margin:
-        return settle(IMPROVEMENT)
-    return settle(WITHIN_NOISE)
+    baseline, candidate = receipts.rows_receipt(rows_a, policy), receipts.rows_receipt(rows_b, policy)
+    report = receipts.compare_receipts(
+        baseline, candidate, receipts.rows_spec(baseline, policy), policy, fields=receipts.ROW_IDENTITY_FIELDS
+    )
+    if report["verdict"] == receipts.INCOMPARABLE:
+        fields = ", ".join(f"{field} ({why})" for field, why in report["identity_mismatches"])
+        return settle(receipts.INCOMPARABLE, f"the rows state different workloads: {fields}")
+    cell["entries"] = report["entries"]
+    headline = next(e for e in report["entries"] if e["cell"] == receipts.HEADLINE_CELL)
+    cell.update({field: headline[field] for field in ("median_a", "range_a", "median_b", "range_b")})
+    if report["verdict"] in (receipts.WITHIN_NOISE, receipts.IMPROVEMENT):
+        return settle(report["verdict"])
+    worst = next(e for e in report["entries"] if e["verdict"] == report["verdict"])
+    detail = f": {worst['note']}" if worst["note"] else ""
+    return settle(report["verdict"], f"{worst['cell']} {worst['metric']}{detail}")
 
 
 def _median_of(rows, field):
@@ -731,12 +721,12 @@ def _median_of(rows, field):
 
 def compare_exit_code(cells):
     """1 when a cell regressed, failed or is invalid; 2 when nothing failed but a cell (or the whole compare)
-    could not be verified; 0 when at least one cell was compared and none regressed."""
-    if any(cell["verdict"] in _FAILING_VERDICTS for cell in cells):
+    could not be verified, was not run or had no baseline; 0 when at least one cell was compared and every
+    cell the baseline measured was compared without a regression."""
+    verdicts = [cell["verdict"] for cell in cells if cell["verdict"] != receipts.NEW]
+    if any(v in receipts.FAILING_VERDICTS for v in verdicts):
         return 1
-    if any(cell["verdict"] == UNVERIFIED for cell in cells):
-        return 2
-    if not any(cell["verdict"] in _COMPARED_VERDICTS for cell in cells):
+    if not verdicts or any(v not in receipts.COMPARED_VERDICTS for v in verdicts):
         return 2
     return 0
 
@@ -849,9 +839,9 @@ def render_compare(baseline_dirs, candidate_dirs, cells):
              *(f"- baseline: `{d}`" for d in baseline_dirs),
              *(f"- candidate: `{d}`" for d in candidate_dirs), "",
              f"A cell is (model, scenario, framework, backend, device) and needs {NOISE_REPEATS} runs per "
-             "side. tok/s is the median +/- the range (max - min) over those runs. A candidate median more "
-             "than one range beyond the baseline's band (median +/- range) is a regression or an "
-             "improvement. Speed is recorded, not gated.", "",
+             "side. tok/s is the median +/- the range (max - min) over those runs. Every required pair (the "
+             "headline and each curve point's TPOT and TTFT) is judged against a band of twice the larger "
+             "range, within the manifest's uncertainty limits; the verdict is the most serious pair.", "",
              "| model | scenario | framework | backend | device | runs A/B | tok/s A | tok/s B | delta % | "
              "verdict | build A | build B | VRAM A GiB | VRAM B GiB |",
              "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]

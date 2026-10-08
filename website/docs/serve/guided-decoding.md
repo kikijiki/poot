@@ -89,4 +89,4 @@ Forcing applies to models that emit the ChatML `<tool_call>` markup (Qwen2.5, He
 other tool-call formats are left to the template as before. This takes precedence over the
 `guided_*` fields.
 
-Design notes: [Architecture: Serving design](../architecture/serving-design.mdx#the-design-the-scheduling-loop-builds-on).
+Design notes: [Architecture: Serving design](../architecture/serving-design.mdx#the-scheduling-loop).

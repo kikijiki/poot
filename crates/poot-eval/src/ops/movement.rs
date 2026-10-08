@@ -470,9 +470,11 @@ impl Value {
         match self {
             Value::Host(t) => Ok(reshape(t, &shape)?.into()),
             Value::Owner(value) => value.reshape(shape).map(Value::Owner),
-            Value::Packed(_) => Err(EvalError::Packed(PackedEvalError::WrongConsumer {
-                operation: "Reshape",
-            })),
+            Value::Packed(_) | Value::PackedStack(_) => {
+                Err(EvalError::Packed(PackedEvalError::WrongConsumer {
+                    operation: "Reshape",
+                }))
+            }
         }
     }
 
@@ -480,9 +482,11 @@ impl Value {
         match self {
             Value::Host(t) => Ok(transpose(t, perm)?.into()),
             Value::Owner(value) => value.transpose(perm),
-            Value::Packed(_) => Err(EvalError::Packed(PackedEvalError::WrongConsumer {
-                operation: "Transpose",
-            })),
+            Value::Packed(_) | Value::PackedStack(_) => {
+                Err(EvalError::Packed(PackedEvalError::WrongConsumer {
+                    operation: "Transpose",
+                }))
+            }
         }
     }
 
@@ -490,9 +494,11 @@ impl Value {
         match self {
             Value::Host(t) => Ok(slice(t, axis, start, end)?.into()),
             Value::Owner(value) => Err(value.unsupported("Slice")),
-            Value::Packed(_) => Err(EvalError::Packed(PackedEvalError::WrongConsumer {
-                operation: "Slice",
-            })),
+            Value::Packed(_) | Value::PackedStack(_) => {
+                Err(EvalError::Packed(PackedEvalError::WrongConsumer {
+                    operation: "Slice",
+                }))
+            }
         }
     }
 
@@ -502,9 +508,11 @@ impl Value {
             .map(|part| match part {
                 Value::Host(tensor) => Ok(tensor),
                 Value::Owner(value) => Err(value.unsupported("Concat")),
-                Value::Packed(_) => Err(EvalError::Packed(PackedEvalError::WrongConsumer {
-                    operation: "Concat",
-                })),
+                Value::Packed(_) | Value::PackedStack(_) => {
+                    Err(EvalError::Packed(PackedEvalError::WrongConsumer {
+                        operation: "Concat",
+                    }))
+                }
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(concat(&tensors, axis)?.into())
@@ -533,9 +541,11 @@ impl Value {
         match self {
             Value::Host(t) => Ok(broadcast_to(t, &shape)?.into()),
             Value::Owner(value) => Err(value.unsupported("Broadcast")),
-            Value::Packed(_) => Err(EvalError::Packed(PackedEvalError::WrongConsumer {
-                operation: "Broadcast",
-            })),
+            Value::Packed(_) | Value::PackedStack(_) => {
+                Err(EvalError::Packed(PackedEvalError::WrongConsumer {
+                    operation: "Broadcast",
+                }))
+            }
         }
     }
 

@@ -26,22 +26,26 @@ any work. poot answers with two mechanisms:
 
 ## The one pipeline
 
-The pipeline is one path for every model and backend: `compile` is the shared compiler entry and
-`poot-executor`'s `Engine<D>` is the shared executor. The diagram below shows that pipeline; the
-remaining gaps are listed under "Where the code is today".
+The pipeline is one path for every model and backend: the registry finds the family, the family's `Model`
+traces a step, `compile` is the shared compiler entry, `poot-executor`'s `Engine<D>` is the shared executor, and
+the driver runs the token loop over it. The diagram below shows that pipeline; the remaining gaps are listed
+under "Where the code is today".
 
 ```text
 checkpoint -> loader -> typed weights
-config     -> model tracer -> Graph (primitives and compositions)
+config     -> Registry -> Model (a family: config, weight map, tracer)
+Model::trace(phase, step shape) -> Graph (primitives and compositions)
 Graph + target + options -> compile -> Program, or a typed refusal
 program + weights -> executor: load, capture, replay per step
-driver: token loop, sampling, stops, KV slots  ->  serve: one scheduling loop
+Driver: token loop, sampling suffix, stops, KV slots  ->  serve: one scheduling loop
 ```
 
 <PipelineDiagram />
 
-1. **Tracing.** A model is plain Rust over a `Builder`, calling the composite helpers in
-   `poot_graph_ir::ops`. It runs once with data-free handles and produces a flat SSA graph.
+1. **Tracing.** A model family implements `Model`. Its `trace` is plain Rust over a `Builder`, calling the
+   composite helpers in `poot_graph_ir::ops` and the shared components, once per step shape, with data-free
+   handles. It produces a flat SSA graph. See [Tracing a Model](./tracing.mdx) and
+   [Models, Registry and the Driver](./driver.mdx).
 2. **Optimization.** Graph transforms (CSE, RoPE fusion, the flash-attention rewrite, pointwise and
    reduction fusion, matmul tiling) rewrite the graph without changing its meaning. See
    [Fusion](./fusion.mdx).
@@ -49,8 +53,8 @@ driver: token loop, sampling, stops, KV slots  ->  serve: one scheduling loop
    synthesized kernel, a view or alias, or a refusal. `compile` runs this planning as its last step.
 4. **Capture.** The executor allocates stable buffers for weights, intermediates and per-step inputs
    and records the dispatch sequence once per model and KV capacity.
-5. **Decode.** Per token the host writes the token id, position and mask into their slot buffers and
-   replays or re-encodes the dispatches; logits or the sampled id come back.
+5. **Decode.** The driver steps the executor. Per token the host writes the token id and position into their
+   slot buffers and replays or re-encodes the dispatches; logits or the sampled id come back.
 
 <ExecutionTimeline />
 
@@ -72,8 +76,9 @@ These rules describe the target architecture. The current state of the code is l
 - **Backend-neutral above the planner, family-neutral below the model.** Nothing above planning
   branches on a backend; nothing outside model definitions names a model family. A backend's limits
   are handled inside that backend's lowering.
-- **Adding a model is writing a graph.** A family is a config type, a weight-name table and plain
-  tracer functions over shared components. Nothing in the driver, planner, executors or server changes.
+- **Adding a model is writing a graph.** A family is a config type, a weight-name table, a fixture and a
+  tracer over shared components, registered in the model registry. Nothing in the driver, planner, executors
+  or server changes.
 - **Types carry invariants.** Ownership, residency, dtype, layout, launch geometry and capability are
   types, not comments, names or string matches.
 - **Verification proves behavior.** Tests exercise behavior and can fail. Device results match the
@@ -86,9 +91,9 @@ The code runs on one pipeline: a target descriptor, a single `compile` entry, an
 contract. Current state:
 
 - Tracing, optimization, planning, kernel import and codegen, and capture/replay work on wgpu, ROCm
-  and PTX. Generation runs through the `poot-llm` library driver.
-- `poot-serve` starts, bounds requests and serves encoder embeddings and reranking; it refuses a decoder
-  until it serves through the driver. **It serves no generation:** `/v1/completions` and `/v1/chat/completions` return a typed `503`.
+  and PTX. Generation runs through the `poot-llm` library driver, over any family the model registry holds.
+- `poot-serve` starts, bounds requests and loads any registered model; every route that runs it returns a
+  typed `503` until it serves through the driver. **It serves no generation:** `/v1/completions` and `/v1/chat/completions` return it too.
   See [Serving design](./serving-design.mdx).
 - `compile` owns the pass sequence and returns a `Program` with plans, storage, slots and numerics.
   Runtime `DeviceCaps` and typed planner refusals are implemented.
@@ -96,8 +101,8 @@ contract. Current state:
   `Device` trait (`WgpuDevice`, `RocmDevice`, `PtxDevice`, `VulkanDevice`). The driver drives it for every registered
   family; the first step on an entry records, later steps replay.
 - Packed projections keep their stored representation through loading. Dense BF16/F16 weights are kept
-  as stored words with no host f32 copy, and packed MoE execution can materialize expert tables on the
-  device.
+  as stored words with no host f32 copy, and packed MoE experts are read in place by an indexed packed
+  contraction, so no expert table is materialized on the device.
 - NPU offload was removed; the megakernel is a possible future
   execution strategy, not code.
 
@@ -109,6 +114,7 @@ For models and features by backend, use the [feature matrix](../reference/featur
 | ----------------------------------------------------- | ---------------------------------------------------- |
 | [The Graph IR](./graph-ir.mdx)                            | The flat SSA primitive graph                         |
 | [Tracing a Model](./tracing.mdx)                          | How a model definition becomes a graph               |
+| [Models, Registry and the Driver](./driver.mdx)           | `Model`, the family registry, the driver's token loop |
 | [Kernels from Rust](./kernel-import.mdx)                  | `#[kernel]` functions, pootc, Stable MIR, lowering   |
 | [Fusion and Planning](./fusion.mdx)                       | Optimization passes, imported vs synthesized kernels |
 | [Backends](./backends.mdx)                                | wgpu, ROCm, PTX and raw Vulkan codegen and dispatch              |

@@ -80,13 +80,16 @@ pub enum Tier2Class {
 /// an elementwise op is float arithmetic (a real-device tier-2 class) or an exact-integer op (tier 1).
 fn implied_op_numerics(op: &OpKind, out_dtype: DType) -> NumericsProperty {
     match op {
-        OpKind::Fused(_) | OpKind::FusedRow(_) | OpKind::Attention(_) | OpKind::Rope { .. } => {
-            NumericsProperty::Reassociating
-        }
+        OpKind::Fused(_)
+        | OpKind::FusedRow(_)
+        | OpKind::Attention(_)
+        | OpKind::Rope { .. }
+        | OpKind::Scan(_) => NumericsProperty::Reassociating,
         OpKind::PackedDequant { .. }
         | OpKind::PackedContraction { .. }
         | OpKind::PackedRowGather { .. }
         | OpKind::DenseContraction { .. }
+        | OpKind::GroupedDenseContraction { .. }
         | OpKind::DenseRowGather { .. }
         | OpKind::IndexedMatMul
         | OpKind::PackI8
@@ -157,7 +160,10 @@ fn produces_contraction_epilogue(op: &OpKind) -> bool {
 }
 
 fn produces_dense_contraction(op: &OpKind) -> bool {
-    matches!(op, OpKind::DenseContraction { .. })
+    matches!(
+        op,
+        OpKind::DenseContraction { .. } | OpKind::GroupedDenseContraction { .. }
+    )
 }
 
 fn produces_packed_contraction(op: &OpKind) -> bool {

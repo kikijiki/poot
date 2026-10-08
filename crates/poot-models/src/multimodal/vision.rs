@@ -1,11 +1,5 @@
-//! Vision-language (VLM) support: the image input path for idefics3 / SmolVLM (spec 049, card 054). Image
-//! preprocessing (a pure transform from a decoded RGB image to the channel-first pixel tensor) and the
-//! vision-encoder tracers. Connector serving is a later slice.
-
-use poot_graph_ir::builder::{Builder, Traced};
-use poot_graph_ir::op::BinOp;
-use poot_graph_ir::ops::{attention, gelu, layernorm, linear};
-use poot_graph_ir::types::TensorType;
+//! Image preprocessing for idefics3 / SmolVLM: a pure transform from a decoded RGB image to the
+//! channel-first frames the vision tower ([`super::idefics3`]) encodes.
 
 /// The image-preprocessing parameters poot reads from a model's `preprocessor_config.json` + `vision_config`.
 #[derive(Clone, Copy, Debug)]
@@ -21,19 +15,6 @@ pub struct PreprocessConfig {
     /// Per-channel normalization mean / std (`image_mean` / `image_std`, e.g. `0.5`).
     pub mean: [f32; 3],
     pub std: [f32; 3],
-}
-
-impl PreprocessConfig {
-    /// The smolvlm-256m / idefics3 defaults (rescale 1/255, mean/std 0.5, 512px tiles, 2048px longest edge).
-    pub fn smolvlm() -> Self {
-        PreprocessConfig {
-            image_size: 512,
-            longest_edge: 2048,
-            rescale_factor: 1.0 / 255.0,
-            mean: [0.5, 0.5, 0.5],
-            std: [0.5, 0.5, 0.5],
-        }
-    }
 }
 
 // --- idefics3 / SmolVLM image splitting (card vlm-image-preprocessing-fidelity) ---
@@ -333,323 +314,19 @@ fn preprocess_image(rgb: &[f32], h: usize, w: usize, cfg: &PreprocessConfig) -> 
     out
 }
 
-/// Patch-embed a `[channels, image_size, image_size]` pixel tensor into `[num_patches, hidden]` (spec 049
-/// slice 2b, the SigLIP patch embedding). The conv2d (kernel = stride = `patch_size`) is an im2col: split the
-/// image into `grid x grid` patches via reshape + transpose so each row is one patch flattened in `[c, i, j]`
-/// order (the PyTorch Conv2d weight layout), project through the linear patch-embed `weight [C*P*P, hidden]`
-/// (+ `bias`), then add the learned `pos_embed [num_patches, hidden]`. `num_patches = (image_size/patch_size)^2`.
-#[allow(clippy::too_many_arguments)]
-pub fn trace_patch_embed(
-    b: &Builder,
-    pixels: Traced,
-    weight: Traced,
-    bias: Traced,
-    pos_embed: Traced,
-    channels: usize,
-    image_size: usize,
-    patch_size: usize,
-) -> Traced {
-    let grid = image_size / patch_size;
-    // [C, gP, P, gP, P]: split each spatial axis into grid x patch.
-    let split = b.reshape(pixels, vec![channels, grid, patch_size, grid, patch_size]);
-    // -> [gridH, gridW, C, Pi, Pj]: bring the two patch-grid axes to the front, then [C, Pi, Pj] (the
-    // conv-weight flatten order) trailing.
-    let patches5 = b.transpose(split, vec![1, 3, 0, 2, 4]);
-    // [num_patches, C*P*P].
-    let patches = b.reshape(
-        patches5,
-        vec![grid * grid, channels * patch_size * patch_size],
-    );
-    let embedded = linear(b, patches, weight, Some(bias)); // [num_patches, hidden]
-    b.binary(BinOp::Add, embedded, pos_embed)
-}
-
-/// The SigLIP vision encoder's shape parameters (from `vision_config`).
-#[derive(Clone, Copy, Debug)]
-pub struct VisionConfig {
-    pub channels: usize,
-    pub image_size: usize,
-    pub patch_size: usize,
-    pub n_heads: usize,
-    pub head_dim: usize,
-    pub intermediate: usize,
-    pub layers: usize,
-    pub eps: f32,
-}
-
-impl VisionConfig {
-    /// The smolvlm-256m / idefics3 SigLIP vision config (768 hidden = 12 heads x 64, 512px, patch 16, MLP
-    /// intermediate 3072, 12 layers, eps 1e-6).
-    pub fn smolvlm() -> Self {
-        VisionConfig {
-            channels: 3,
-            image_size: 512,
-            patch_size: 16,
-            n_heads: 12,
-            head_dim: 64,
-            intermediate: 3072,
-            layers: 12,
-            eps: 1e-6,
-        }
-    }
-    pub fn hidden(&self) -> usize {
-        self.n_heads * self.head_dim
-    }
-    pub fn num_patches(&self) -> usize {
-        let g = self.image_size / self.patch_size;
-        g * g
-    }
-}
-
-/// Per-projection weight + bias for the vision multi-head self-attention (q/k/v/out), each `weight [H, H]`
-/// (`H = n_heads * head_dim`) and `bias [H]`.
-pub struct MhaWeights {
-    pub wq: Traced,
-    pub bq: Traced,
-    pub wk: Traced,
-    pub bk: Traced,
-    pub wv: Traced,
-    pub bv: Traced,
-    pub wo: Traced,
-    pub bo: Traced,
-}
-
-/// Multi-head self-attention for the SigLIP vision encoder (spec 049 slice 2c): full (non-causal,
-/// bidirectional) attention over a `[1, seq, H]` patch sequence. Projects q/k/v, splits into heads, runs the
-/// shared `ops::attention` (no GQA -> `n_rep = 1`), merges the heads, and applies the output projection.
-pub fn trace_vision_mha(
-    b: &Builder,
-    x: Traced,
-    w: &MhaWeights,
-    n_heads: usize,
-    head_dim: usize,
-) -> Traced {
-    let seq = b.aval(x).shape[1];
-    let hidden = n_heads * head_dim;
-    let scale = 1.0 / (head_dim as f32).sqrt();
-    // project + split into heads: [1, seq, H] -> [1, seq, n_heads, head_dim] -> [1, n_heads, seq, head_dim].
-    let head = |proj: Traced| {
-        let r = b.reshape(proj, vec![1, seq, n_heads, head_dim]);
-        b.transpose(r, vec![0, 2, 1, 3])
-    };
-    let q = head(linear(b, x, w.wq, Some(w.bq)));
-    let k = head(linear(b, x, w.wk, Some(w.bk)));
-    let v = head(linear(b, x, w.wv, Some(w.bv)));
-    let attn = attention(b, q, k, v, 1, scale); // [1, n_heads, seq, head_dim]
-    // merge heads back: -> [1, seq, n_heads, head_dim] -> [1, seq, H].
-    let merged = b.transpose(attn, vec![0, 2, 1, 3]);
-    let merged = b.reshape(merged, vec![1, seq, hidden]);
-    linear(b, merged, w.wo, Some(w.bo))
-}
-
-/// All weights for one SigLIP transformer block: two LayerNorms (pre-attention, pre-MLP), the MHA
-/// projections, and the MLP `fc1 [H, I]` / `fc2 [I, H]` (+ biases).
-pub struct VisionBlockWeights {
-    pub ln1_w: Traced,
-    pub ln1_b: Traced,
-    pub mha: MhaWeights,
-    pub ln2_w: Traced,
-    pub ln2_b: Traced,
-    pub fc1_w: Traced,
-    pub fc1_b: Traced,
-    pub fc2_w: Traced,
-    pub fc2_b: Traced,
-}
-
-/// One SigLIP transformer block (spec 049 slice 2d), pre-norm: `x += mha(LN1(x))`, then
-/// `x += fc2(gelu(fc1(LN2(x))))`. `gelu` is the `gelu_pytorch_tanh` form (`ops::activation::gelu`), SigLIP's
-/// MLP activation. Bidirectional (the block is the same for every patch position).
-pub fn trace_vision_block(
-    b: &Builder,
-    x: Traced,
-    w: &VisionBlockWeights,
-    n_heads: usize,
-    head_dim: usize,
-    eps: f32,
-) -> Traced {
-    let normed1 = layernorm(b, x, w.ln1_w, w.ln1_b, eps);
-    let attn = trace_vision_mha(b, normed1, &w.mha, n_heads, head_dim);
-    let x = b.binary(BinOp::Add, x, attn);
-    let normed2 = layernorm(b, x, w.ln2_w, w.ln2_b, eps);
-    let fc1 = linear(b, normed2, w.fc1_w, Some(w.fc1_b));
-    let act = gelu(b, fc1);
-    let fc2 = linear(b, act, w.fc2_w, Some(w.fc2_b));
-    b.binary(BinOp::Add, x, fc2)
-}
-
-/// Build the `ScatterUpdate` inverse map for the image splice (spec 049 slice 4): for each text position, the
-/// visual-token index to write there - the `k`-th `<image>` placeholder gets visual token `k` - or `-1` to
-/// keep the text embedding. `tokens` is the prompt's token ids; `image_token_id` (49190 for SmolVLM) marks the
-/// placeholders. The number of placeholders must equal the visual-token count.
-pub fn image_splice_inverse_map(tokens: &[u32], image_token_id: u32) -> Vec<f32> {
-    let mut inv = vec![-1.0f32; tokens.len()];
-    let mut k = 0usize;
-    for (p, &t) in tokens.iter().enumerate() {
-        if t == image_token_id {
-            inv[p] = k as f32;
-            k += 1;
-        }
-    }
-    inv
-}
-
-/// Splice visual tokens into the text embedding sequence (spec 049 slice 4): replace the `<image>` placeholder
-/// positions' embeddings with the connector's visual tokens (in order), keeping the text embeddings elsewhere.
-/// `text_embeds [seq, H]`, `visual [n_vis, H]`, `inv [seq]` (from [`image_splice_inverse_map`]). This is
-/// exactly `ScatterUpdate` (`out[p] = inv[p] >= 0 ? visual[inv[p]] : text_embeds[p]`).
-pub fn trace_image_splice(b: &Builder, text_embeds: Traced, visual: Traced, inv: Traced) -> Traced {
-    b.scatter_update(text_embeds, visual, inv)
-}
-
-/// idefics3 pixel shuffle (spec 049 slice 3): groups a `scale x scale` block of patches into the channel
-/// dimension, reducing `[1, seq, embed]` to `[1, seq/scale^2, embed*scale^2]` (`seq` a perfect square). The
-/// connector's spatial-to-channel rearrange before the linear projector, from `Idefics3Connector.pixel_shuffle`
-/// (view + permute + reshape), expressed as reshape/transpose. Gives the text decoder fewer, wider visual
-/// tokens (1024 -> 64 at scale 4).
-pub fn trace_pixel_shuffle(b: &Builder, x: Traced, embed: usize, scale: usize) -> Traced {
-    let seq = b.aval(x).shape[1];
-    let h = (seq as f64).sqrt() as usize; // h == w (square image grid).
-    let (w, s) = (h, scale);
-    // [1, seq, embed] -> [1, h, w/s, embed*s] (regroup the row's [w, embed] into [w/s, embed*s]).
-    let x = b.reshape(x, vec![1, h, w / s, embed * s]);
-    let x = b.transpose(x, vec![0, 2, 1, 3]); // [1, w/s, h, embed*s]
-    let x = b.reshape(x, vec![1, w / s, h / s, embed * s * s]); // regroup [h, embed*s]
-    let x = b.transpose(x, vec![0, 2, 1, 3]); // [1, h/s, w/s, embed*s*s]
-    b.reshape(x, vec![1, seq / (s * s), embed * s * s])
-}
-
-/// The idefics3 connector (spec 049 slice 3): pixel shuffle (`scale`) then a bias-free linear projection of the
-/// shuffled `embed*scale^2` features to the text hidden size. `proj_w` is `[embed*scale^2, text_hidden]`.
-pub fn trace_connector(
-    b: &Builder,
-    x: Traced,
-    proj_w: Traced,
-    embed: usize,
-    scale: usize,
-) -> Traced {
-    let shuffled = trace_pixel_shuffle(b, x, embed, scale);
-    linear(b, shuffled, proj_w, None)
-}
-
-/// All weights for the SigLIP vision encoder: the patch-embed linear (`weight [C*P*P, H]` + bias), the learned
-/// position embeddings `[num_patches, H]`, one [`VisionBlockWeights`] per layer, and the final post-LayerNorm.
-pub struct VisionEncoderWeights {
-    pub patch_w: Traced,
-    pub patch_b: Traced,
-    pub pos_embed: Traced,
-    pub blocks: Vec<VisionBlockWeights>,
-    pub post_ln_w: Traced,
-    pub post_ln_b: Traced,
-}
-
-/// Declare a named f32 graph constant and record its `(id, name)` for later binding from a loaded weight map.
-fn decl(
-    b: &Builder,
-    binds: &mut Vec<(poot_graph_ir::ValueId, String)>,
-    name: String,
-    shape: Vec<usize>,
-) -> Traced {
-    let t = b.constant(&name, TensorType::f32(shape));
-    binds.push((t.id, name));
-    t
-}
-
-/// Declare the full vision encoder's weights as named graph constants (spec 049 slice 4c), returning the
-/// weights struct + the `(id, name)` pairs to bind from a loaded weight map. The names match
-/// `poot_llm::vlm::load_vision_weights` so a real checkpoint binds directly.
-pub fn declare_vision_constants(
-    b: &Builder,
-    cfg: &VisionConfig,
-) -> (VisionEncoderWeights, Vec<(poot_graph_ir::ValueId, String)>) {
-    let mut bd = Vec::new();
-    let h = cfg.hidden();
-    let pd = cfg.channels * cfg.patch_size * cfg.patch_size;
-    let np = cfg.num_patches();
-    let i = cfg.intermediate;
-    let patch_w = decl(b, &mut bd, "patch_w".into(), vec![pd, h]);
-    let patch_b = decl(b, &mut bd, "patch_b".into(), vec![h]);
-    let pos_embed = decl(b, &mut bd, "pos_embed".into(), vec![np, h]);
-    let mut blocks = Vec::with_capacity(cfg.layers);
-    for l in 0..cfg.layers {
-        blocks.push(VisionBlockWeights {
-            ln1_w: decl(b, &mut bd, format!("l1w{l}"), vec![h]),
-            ln1_b: decl(b, &mut bd, format!("l1b{l}"), vec![h]),
-            mha: MhaWeights {
-                wq: decl(b, &mut bd, format!("wq{l}"), vec![h, h]),
-                bq: decl(b, &mut bd, format!("bq{l}"), vec![h]),
-                wk: decl(b, &mut bd, format!("wk{l}"), vec![h, h]),
-                bk: decl(b, &mut bd, format!("bk{l}"), vec![h]),
-                wv: decl(b, &mut bd, format!("wv{l}"), vec![h, h]),
-                bv: decl(b, &mut bd, format!("bv{l}"), vec![h]),
-                wo: decl(b, &mut bd, format!("wo{l}"), vec![h, h]),
-                bo: decl(b, &mut bd, format!("bo{l}"), vec![h]),
-            },
-            ln2_w: decl(b, &mut bd, format!("l2w{l}"), vec![h]),
-            ln2_b: decl(b, &mut bd, format!("l2b{l}"), vec![h]),
-            fc1_w: decl(b, &mut bd, format!("f1w{l}"), vec![h, i]),
-            fc1_b: decl(b, &mut bd, format!("f1b{l}"), vec![i]),
-            fc2_w: decl(b, &mut bd, format!("f2w{l}"), vec![i, h]),
-            fc2_b: decl(b, &mut bd, format!("f2b{l}"), vec![h]),
-        });
-    }
-    let post_ln_w = decl(b, &mut bd, "plw".into(), vec![h]);
-    let post_ln_b = decl(b, &mut bd, "plb".into(), vec![h]);
-    (
-        VisionEncoderWeights {
-            patch_w,
-            patch_b,
-            pos_embed,
-            blocks,
-            post_ln_w,
-            post_ln_b,
-        },
-        bd,
-    )
-}
-
-/// The full SigLIP vision encoder (spec 049 slice 2e): patch-embed the `[C, S, S]` image, run the `layers`
-/// transformer blocks over the `[1, num_patches, H]` patch sequence, and apply the final LayerNorm. Returns
-/// the patch features `[1, num_patches, H]` the connector consumes (slice 3).
-pub fn trace_vision_encoder(
-    b: &Builder,
-    pixels: Traced,
-    w: &VisionEncoderWeights,
-    cfg: &VisionConfig,
-) -> Traced {
-    let patch = trace_patch_embed(
-        b,
-        pixels,
-        w.patch_w,
-        w.patch_b,
-        w.pos_embed,
-        cfg.channels,
-        cfg.image_size,
-        cfg.patch_size,
-    );
-    // [num_patches, H] -> [1, num_patches, H] for the blocks' batched attention.
-    let mut x = b.reshape(patch, vec![1, cfg.num_patches(), cfg.hidden()]);
-    for blk in &w.blocks {
-        x = trace_vision_block(b, x, blk, cfg.n_heads, cfg.head_dim, cfg.eps);
-    }
-    layernorm(b, x, w.post_ln_w, w.post_ln_b, cfg.eps)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn image_splice_inverse_map_indexes_placeholders() {
-        // spec 049 slice 4: each <image> placeholder (id 9) maps to the next visual-token index in order;
-        // non-image positions map to -1 (keep the text embedding).
-        let tokens = [1u32, 9, 9, 5, 9, 2];
-        let inv = image_splice_inverse_map(&tokens, 9);
-        assert_eq!(inv, vec![-1.0, 0.0, 1.0, -1.0, 2.0, -1.0]);
-        // no placeholders -> all -1.
-        assert_eq!(
-            image_splice_inverse_map(&[1, 2, 3], 9),
-            vec![-1.0, -1.0, -1.0]
-        );
+    /// The smolvlm-256m / idefics3 defaults (rescale 1/255, mean/std 0.5, 512px tiles, 2048px longest edge).
+    fn smolvlm() -> PreprocessConfig {
+        PreprocessConfig {
+            image_size: 512,
+            longest_edge: 2048,
+            rescale_factor: 1.0 / 255.0,
+            mean: [0.5, 0.5, 0.5],
+            std: [0.5, 0.5, 0.5],
+        }
     }
 
     #[test]
@@ -730,7 +407,7 @@ mod tests {
         // Faithful to image_processing_idefics3.py: longest edge -> 2048 (upscaling small images too), each
         // edge rounded UP to a multiple of 512, then ceil(h/512) x ceil(w/512) tiles + 1 global thumbnail.
         // Expected (rows, cols, n_frames) hand-computed from the source arithmetic (h, w in that order):
-        let cfg = PreprocessConfig::smolvlm();
+        let cfg = smolvlm();
         let cases = [
             // even a tiny square upscales to 2048x2048 -> 4x4 tiles + global = 17 frames.
             ((64usize, 64usize), (4usize, 4usize, 17usize)),
@@ -754,7 +431,7 @@ mod tests {
     fn idefics3_geometry_preserves_aspect_not_squished() {
         // A non-square image is not forced to a square tile grid: a landscape image yields cols > rows and a portrait
         // rows > cols.
-        let cfg = PreprocessConfig::smolvlm();
+        let cfg = smolvlm();
         let (lr, lc, _) = idefics3_frame_geometry(512, 1536, &cfg); // wide landscape
         assert!(
             lc > lr,

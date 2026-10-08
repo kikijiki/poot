@@ -44,8 +44,8 @@ use poot_llm::driver::error::DriverError;
 #[cfg(test)]
 use poot_llm::driver::error::Unsupported;
 use poot_llm::driver::{
-    open_executor, BackendChoice, Driver, DriverOptions, GenerateRequest, Head, Layout,
-    ModelHandle, PreparedSetLimits, ServingShapes, Warm,
+    open_executor, BackendChoice, Driver, DriverOptions, DriverStats, GenerateRequest, Head,
+    Layout, ModelHandle, PreparedSetLimits, ServingShapes, Warm,
 };
 use poot_llm::{GenerationControl, Sampler};
 use poot_models::registry::Registry;
@@ -109,6 +109,54 @@ impl Mode {
     }
 }
 
+/// Which preparation state the invoker declares for this process (the receipt's label for what the
+/// preparation counters must show; the harness validates the counters against it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreparedState {
+    /// A fresh process over an empty artifact cache: every artifact is built.
+    ColdEmptyArtifacts,
+    /// A fresh process over a populated artifact cache: artifacts are served from it.
+    ColdPopulatedArtifacts,
+    /// A driver already prepared by a previous pass of the same declared set: preparing again does nothing.
+    ReusedPreparedDriver,
+}
+
+impl PreparedState {
+    const ALL: [PreparedState; 3] = [
+        PreparedState::ColdEmptyArtifacts,
+        PreparedState::ColdPopulatedArtifacts,
+        PreparedState::ReusedPreparedDriver,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            PreparedState::ColdEmptyArtifacts => "cold-process-empty-artifacts",
+            PreparedState::ColdPopulatedArtifacts => "cold-process-populated-artifacts",
+            PreparedState::ReusedPreparedDriver => "reused-prepared-driver",
+        }
+    }
+
+    fn parse(name: &str) -> anyhow::Result<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|state| state.label() == name)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown prepared state {name:?} (supported: {})",
+                    Self::ALL.map(Self::label).join(", ")
+                )
+            })
+    }
+
+    /// Warmup passes of the declared set: a reused driver is prepared once before the pass that is counted.
+    fn warmup_passes(self) -> usize {
+        match self {
+            PreparedState::ReusedPreparedDriver => 2,
+            _ => 1,
+        }
+    }
+}
+
 /// What generated a result: the driver's one loop. It is recorded, never chosen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Engine {
@@ -145,6 +193,9 @@ struct Config {
     mode: Mode,
     isl_list: Vec<usize>,
     osl: usize,
+    prepared_state: Option<PreparedState>,
+    /// Artifacts the cache directory held before this process opened anything (`None`: no directory named).
+    artifact_entries_at_start: Option<u64>,
 }
 
 enum Invocation {
@@ -155,7 +206,7 @@ enum Invocation {
 /// Options that take a value and switches that do not. Everything else is an error: a flag the runner
 /// ignores would report a measurement the caller did not ask for. `--synthetic` is part of the suite's
 /// runner contract (the harness passes it to every runner); decode-curve contexts are always synthetic.
-const VALUE_FLAGS: [&str; 11] = [
+const VALUE_FLAGS: [&str; 12] = [
     "--model-dir",
     "--gguf",
     "--prompt-file",
@@ -167,6 +218,7 @@ const VALUE_FLAGS: [&str; 11] = [
     "--mode",
     "--isl-list",
     "--osl",
+    "--prepared-state",
 ];
 const SWITCHES: [&str; 5] = [
     "--prefill",
@@ -240,6 +292,11 @@ fn parse_args(args: &[String]) -> anyhow::Result<Invocation> {
         mode: Mode::parse(values.get("--mode").copied().unwrap_or("single"))?,
         isl_list,
         osl: number("--osl", 128)?,
+        prepared_state: values
+            .get("--prepared-state")
+            .map(|name| PreparedState::parse(name))
+            .transpose()?,
+        artifact_entries_at_start: artifact_cache_entries(),
     };
 
     anyhow::ensure!(config.iters > 0, "--iters must be positive");
@@ -296,6 +353,21 @@ trait Generate {
         None
     }
 
+    /// Executor steps taken so far (prefill pieces and decode steps alike): the counter a request's cost in
+    /// steps is the difference of, so a token delivered without a step inside its request is visible.
+    fn steps(&self) -> u64;
+
+    /// What the engine counts per preparation layer; a layer it has no producer counter for is Unknown.
+    fn counters(&self) -> PreparationCounters {
+        PreparationCounters::default()
+    }
+
+    /// The counters of the fresh engine, before the declared set was prepared: where a cold process's
+    /// preparation count starts, since the engine prepares while it opens.
+    fn initial_counters(&self) -> PreparationCounters {
+        PreparationCounters::default()
+    }
+
     /// What generates.
     fn engine(&self) -> Engine;
 }
@@ -309,15 +381,30 @@ trait Generate {
 struct DriverCell {
     handle: Arc<ModelHandle>,
     driver: Driver,
+    /// The driver's counters before `Driver::prepare` ran.
+    initial: PreparationCounters,
+}
+
+/// The preparation layers the driver and its executor count.
+fn driver_counters(driver: &Driver) -> PreparationCounters {
+    counters_from(&driver.stats(), driver.executor_stats().recordings)
+}
+
+/// Each driver stat in its own layer: programs compiled are the plan, entries added are the entries, and
+/// the executor's recordings are the recordings. Every other layer has no producer counter.
+fn counters_from(stats: &DriverStats, recordings: u64) -> PreparationCounters {
+    PreparationCounters {
+        plan: Some(stats.compiles),
+        entries: Some(stats.entries_added),
+        recordings: Some(recordings),
+        ..PreparationCounters::default()
+    }
 }
 
 fn driver_options(capacity: NonZeroUsize, chunk: usize) -> anyhow::Result<DriverOptions> {
-    let compile = CompileOptions {
-        execution: Submission::Replay,
-        limits: poot_graph_plan::CompileLimits::STANDARD,
-    };
+    let compile = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
     Ok(DriverOptions {
-        prefill: compile,
+        prefill: compile.clone(),
         decode: compile,
         capacity,
         prefill_chunk: NonZeroUsize::new(chunk).context("a prefill chunk holds a token")?,
@@ -387,6 +474,18 @@ impl Generate for DriverCell {
 
     fn engine(&self) -> Engine {
         Engine::Driver
+    }
+
+    fn steps(&self) -> u64 {
+        self.driver.stats().steps
+    }
+
+    fn counters(&self) -> PreparationCounters {
+        driver_counters(&self.driver)
+    }
+
+    fn initial_counters(&self) -> PreparationCounters {
+        self.initial
     }
 
     fn engine_receipt(&self) -> Option<Value> {
@@ -463,6 +562,7 @@ fn open_driver(
         driver_options(capacity, chunk)?,
     )
     .context("open the driver")?;
+    let initial = driver_counters(&driver);
     // Every entry the cell's prompts plan to is compiled and added before the first timed token.
     driver
         .prepare(&ServingShapes {
@@ -474,20 +574,51 @@ fn open_driver(
             adapters: &[],
         })
         .context("prepare the driver")?;
-    Ok((Box::new(DriverCell { handle, driver }), precision))
+    Ok((
+        Box::new(DriverCell {
+            handle,
+            driver,
+            initial,
+        }),
+        precision,
+    ))
 }
 
-/// Load the model and open the backend's executor. Returns the engine and the precision to report: the
-/// requested one for a checkpoint, the dominant stored packed format for a GGUF.
-fn open(config: &Config) -> anyhow::Result<(Box<dyn Generate>, String)> {
+/// A cell that opened: the engine, the precision to report (the requested one for a checkpoint, the
+/// dominant stored packed format for a GGUF) and the registry family the checkpoint resolved to.
+struct Opened {
+    engine: Box<dyn Generate>,
+    precision: String,
+    family: String,
+}
+
+/// A cell that did not open. `family` is the registry family the checkpoint resolved to, `None` when
+/// the failure came before the registry resolved one (a precision the runner declines, an unregistered
+/// family, an unreadable config): a refusal row for a cell that did resolve joins the feature matrix.
+struct OpenFailure {
+    family: Option<String>,
+    error: anyhow::Error,
+}
+
+impl From<anyhow::Error> for OpenFailure {
+    fn from(error: anyhow::Error) -> Self {
+        Self {
+            family: None,
+            error,
+        }
+    }
+}
+
+/// Load the model and open the backend's executor.
+fn open(config: &Config) -> Result<Opened, OpenFailure> {
     // poot loads f32/bf16/f16 safetensors and computes in f32. Asking for another precision is asked
     // before any weight is read, so a 20B checkpoint is not loaded to be turned down.
     if !matches!(config.precision.as_str(), "f32" | "bf16" | "f16") {
-        return Err(Declined(format!(
+        return Err(anyhow::Error::from(Declined(format!(
             "poot bench runner loads f32/bf16/f16 checkpoints (computes f32); got {:?}. \
              Quantized formats (fp8/gptq/awq/mxfp4) are on the roadmap.",
             config.precision
-        ))
+        )))
         .into());
     }
     let path = match &config.weights {
@@ -495,13 +626,23 @@ fn open(config: &Config) -> anyhow::Result<(Box<dyn Generate>, String)> {
     };
     // One registry resolve decides: a registered family runs on the driver, any other is a refusal.
     let registry = Registry::builtin().context("build the family registry")?;
-    match ModelHandle::load(
+    let handle = ModelHandle::load(
         Path::new(path),
         &registry,
         &poot_llm::driver::LoadOptions::default(),
-    ) {
-        Ok(handle) => open_driver(config, handle),
-        Err(error) => Err(anyhow::Error::from(error).context(format!("load {path}"))),
+    )
+    .map_err(|error| anyhow::Error::from(error).context(format!("load {path}")))?;
+    let family = handle.config().family.to_string();
+    match open_driver(config, handle) {
+        Ok((engine, precision)) => Ok(Opened {
+            engine,
+            precision,
+            family,
+        }),
+        Err(error) => Err(OpenFailure {
+            family: Some(family),
+            error,
+        }),
     }
 }
 
@@ -515,25 +656,22 @@ struct Run {
     tokens: usize,
     itl_ms: Vec<f64>,
     token_pieces: Vec<String>,
+    /// Executor steps this request cost (set by the caller that owns the engine's counter).
+    steps: u64,
 }
 
 impl Run {
-    /// Decode time per token after the first.
-    fn tpot_ms(&self) -> f64 {
-        if self.tokens > 1 {
-            self.itl_ms.iter().sum::<f64>() / (self.tokens - 1) as f64
-        } else {
-            0.0
-        }
+    /// Decode time per token after the first: the mean ITL. Undefined (`None`) below two tokens, where
+    /// there is no token-to-token gap.
+    fn tpot_ms(&self) -> Option<f64> {
+        (self.tokens > 1).then(|| self.itl_ms.iter().sum::<f64>() / (self.tokens - 1) as f64)
     }
 
-    fn decode_tok_s(&self) -> f64 {
+    /// Decode rate over the gaps; undefined (`None`) below two tokens or with no elapsed decode time.
+    fn decode_tok_s(&self) -> Option<f64> {
         let decode_ms = self.itl_ms.iter().sum::<f64>();
-        if decode_ms > 0.0 && self.tokens > 1 {
-            (self.tokens - 1) as f64 / (decode_ms / 1000.0)
-        } else {
-            0.0
-        }
+        (decode_ms > 0.0 && self.tokens > 1)
+            .then(|| (self.tokens - 1) as f64 / (decode_ms / 1000.0))
     }
 }
 
@@ -567,6 +705,7 @@ fn timed_with_clock(
         token_pieces,
         tokens: stamps.len(),
         itl_ms: stamps.windows(2).map(|w| ms(w[1] - w[0])).collect(),
+        steps: 0,
     })
 }
 
@@ -581,6 +720,7 @@ impl Run {
             "ttft_ms": self.ttft_ms,
             "e2e_ms": self.e2e_ms,
             "finish_ms": self.finish_ms,
+            "steps": self.steps,
             "itl_ms": self.itl_ms,
             "first_gap_ms": self.itl_ms.first(),
             "tpot_ms": self.tpot_ms(),
@@ -589,19 +729,191 @@ impl Run {
     }
 }
 
+/// The preparation layers a receipt reports, in order. A layer no producer counter exposes is `None`
+/// (Unknown), never zero: the harness treats an Unknown layer as incomplete evidence.
+const PREPARATION_LAYERS: [&str; 8] = [
+    "plan",
+    "entries",
+    "generated_bodies",
+    "artifact_builds",
+    "artifact_hits",
+    "runtime_pipelines",
+    "recordings",
+    "graph_instantiations",
+];
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PreparationCounters {
+    /// Programs the driver compiled (trace and plan).
+    plan: Option<u64>,
+    /// Entries the driver added to the executor.
+    entries: Option<u64>,
+    generated_bodies: Option<u64>,
+    artifact_builds: Option<u64>,
+    artifact_hits: Option<u64>,
+    runtime_pipelines: Option<u64>,
+    recordings: Option<u64>,
+    graph_instantiations: Option<u64>,
+}
+
+impl PreparationCounters {
+    fn layers(self) -> [Option<u64>; 8] {
+        [
+            self.plan,
+            self.entries,
+            self.generated_bodies,
+            self.artifact_builds,
+            self.artifact_hits,
+            self.runtime_pipelines,
+            self.recordings,
+            self.graph_instantiations,
+        ]
+    }
+}
+
+/// Files under the artifact cache directory `POOT_KERNEL_CACHE_DIR` names: each built artifact is one file,
+/// so the count is the number of artifacts the cache holds. `None` when no directory is named.
+fn artifact_cache_entries() -> Option<u64> {
+    fn count(dir: &Path) -> u64 {
+        std::fs::read_dir(dir).map_or(0, |entries| {
+            entries
+                .flatten()
+                .map(|entry| match entry.file_type() {
+                    Ok(kind) if kind.is_dir() => count(&entry.path()),
+                    Ok(_) => 1,
+                    Err(_) => 0,
+                })
+                .sum()
+        })
+    }
+    std::env::var_os("POOT_KERNEL_CACHE_DIR").map(|dir| count(Path::new(&dir)))
+}
+
+/// The counters now: what the engine counts, plus the artifact builds the cache directory shows as
+/// files written since the process began (`since`).
+fn snapshot(engine: &dyn Generate, entries_at_start: Option<u64>) -> [Option<u64>; 8] {
+    let mut counters = engine.counters();
+    counters.artifact_builds = artifact_cache_entries()
+        .zip(entries_at_start)
+        .map(|(now, start)| now.saturating_sub(start));
+    counters.layers()
+}
+
+/// Preparation work per layer: what preparing the declared set cost (`prepare`) and what repeating it added
+/// (`repeat`). A layer is Unknown if any snapshot of it was.
+struct PreparationProbe {
+    state: Option<PreparedState>,
+    artifact_entries_at_start: Option<u64>,
+    mark: [Option<u64>; 8],
+    prepare: [Option<u64>; 8],
+    repeat: [Option<u64>; 8],
+    /// No window has begun: the first cold window starts from the engine's initial counters.
+    first: bool,
+}
+
+impl PreparationProbe {
+    fn new(state: Option<PreparedState>, artifact_entries_at_start: Option<u64>) -> Self {
+        Self {
+            state,
+            artifact_entries_at_start,
+            mark: [None; 8],
+            prepare: [Some(0); 8],
+            repeat: [Some(0); 8],
+            first: true,
+        }
+    }
+
+    fn passes(&self) -> usize {
+        self.state.map_or(1, PreparedState::warmup_passes)
+    }
+
+    /// Start counting a window. The first window of a cold process starts from the fresh engine's counters,
+    /// so the preparation the engine did while opening is counted; every other window starts from now.
+    fn begin(&mut self, engine: &dyn Generate) {
+        let cold_start = self.first && self.passes() == 1;
+        self.first = false;
+        self.mark = if cold_start {
+            let mut counters = engine.initial_counters();
+            counters.artifact_builds = self.artifact_entries_at_start.map(|_| 0);
+            counters.layers()
+        } else {
+            snapshot(engine, self.artifact_entries_at_start)
+        };
+    }
+
+    fn advance(total: &mut [Option<u64>; 8], mark: &mut [Option<u64>; 8], now: [Option<u64>; 8]) {
+        for ((total, mark), now) in total.iter_mut().zip(mark.iter_mut()).zip(now) {
+            *total = match (*total, *mark, now) {
+                (Some(total), Some(mark), Some(now)) => Some(total + now.saturating_sub(mark)),
+                _ => None,
+            };
+            *mark = now;
+        }
+    }
+
+    /// The declared set is prepared: work since `begin` is the preparation.
+    fn prepared(&mut self, engine: &dyn Generate) {
+        let now = snapshot(engine, self.artifact_entries_at_start);
+        Self::advance(&mut self.prepare, &mut self.mark, now);
+    }
+
+    /// The timed window ran: work since `prepared` is what repeating the set added.
+    fn repeated(&mut self, engine: &dyn Generate) {
+        let now = snapshot(engine, self.artifact_entries_at_start);
+        Self::advance(&mut self.repeat, &mut self.mark, now);
+    }
+
+    fn receipt(&self) -> Value {
+        let layers: serde_json::Map<String, Value> = PREPARATION_LAYERS
+            .iter()
+            .zip(self.prepare.iter().zip(&self.repeat))
+            .map(|(layer, (prepare, repeat))| {
+                (
+                    (*layer).to_string(),
+                    json!({ "prepare": prepare, "repeat": repeat }),
+                )
+            })
+            .collect();
+        json!({
+            "state": self.state.map(PreparedState::label),
+            "artifact_entries_at_start": self.artifact_entries_at_start,
+            "layers": layers,
+        })
+    }
+}
+
+/// One timed request on `engine`, with the executor steps it cost.
+fn timed_request(
+    engine: &mut dyn Generate,
+    generate: impl FnOnce(&mut dyn Generate, &mut dyn FnMut(&str)) -> anyhow::Result<()>,
+) -> anyhow::Result<Run> {
+    let before = engine.steps();
+    let mut run = timed(|on_token| generate(&mut *engine, on_token))?;
+    run.steps = engine.steps() - before;
+    Ok(run)
+}
+
 /// The one measure loop: run the configured mode on `engine` and return the result object.
-fn measure(config: &Config, engine: &mut dyn Generate, precision: &str) -> anyhow::Result<Value> {
+fn measure(
+    config: &Config,
+    engine: &mut dyn Generate,
+    precision: &str,
+    family: &str,
+) -> anyhow::Result<Value> {
+    let mut probe = PreparationProbe::new(config.prepared_state, config.artifact_entries_at_start);
     let body = match config.mode {
-        Mode::Single => measure_single(config, engine)?,
-        Mode::DecodeCurve => measure_curve(config, engine)?,
+        Mode::Single => measure_single(config, engine, &mut probe)?,
+        Mode::DecodeCurve => measure_curve(config, engine, &mut probe)?,
     };
     let mut line = identity(
         Some(engine.engine()),
+        Some(family),
         config.backend,
         config.mode,
         precision,
     );
     line["profiled"] = json!(config.profile);
+    line["preparation"] = probe.receipt();
     if let Some(receipt) = engine.engine_receipt() {
         line["driver"] = receipt;
     }
@@ -615,11 +927,19 @@ fn measure(config: &Config, engine: &mut dyn Generate, precision: &str) -> anyho
 
 /// What every result line carries: which build produced it, with which engine (when one was chosen), on
 /// which backend, in which mode. The harness checks `backend` against the one it requested and refuses a
-/// result with no `build_sha`.
-fn identity(engine: Option<Engine>, backend: Backend, mode: Mode, precision: &str) -> Value {
+/// result with no `build_sha`. `family` is the registry family the checkpoint resolved to, as the registry
+/// reports it (never a mapping from the manifest); `null` on a refusal that came before one resolved.
+fn identity(
+    engine: Option<Engine>,
+    family: Option<&str>,
+    backend: Backend,
+    mode: Mode,
+    precision: &str,
+) -> Value {
     let mut line = json!({
         "framework": "poot",
         "build_sha": BUILD_SHA,
+        "family": family,
         "backend": backend.label(),
         "mode": mode.label(),
         "precision": precision,
@@ -641,7 +961,11 @@ fn single_prompt(config: &Config) -> anyhow::Result<String> {
     })
 }
 
-fn measure_single(config: &Config, engine: &mut dyn Generate) -> anyhow::Result<Value> {
+fn measure_single(
+    config: &Config,
+    engine: &mut dyn Generate,
+    probe: &mut PreparationProbe,
+) -> anyhow::Result<Value> {
     let prompt = single_prompt(config)?;
     if !config.json {
         eprintln!(
@@ -655,18 +979,25 @@ fn measure_single(config: &Config, engine: &mut dyn Generate) -> anyhow::Result<
         );
     }
     let run_once = |engine: &mut dyn Generate| {
-        timed(|on_token| {
+        timed_request(engine, |engine, on_token| {
             engine.generate_prompt(&prompt, config.gen_tokens, config.prefill, on_token)
         })
     };
 
     let mut warmup_runs = Vec::new();
-    for w in 0..config.warmup {
-        warmup_runs.push(run_once(engine)?.receipt());
-        if !config.json {
-            eprintln!("poot-bench: warmup {}/{} done", w + 1, config.warmup);
+    let passes = probe.passes();
+    for pass in 0..passes {
+        if pass + 1 == passes {
+            probe.begin(&*engine);
+        }
+        for w in 0..config.warmup {
+            warmup_runs.push(run_once(engine)?.receipt());
+            if !config.json {
+                eprintln!("poot-bench: warmup {}/{} done", w + 1, config.warmup);
+            }
         }
     }
+    probe.prepared(&*engine);
     // Reset after warmup (compiles, cache fills) so the report covers only the timed iterations.
     if config.profile {
         engine.reset_profile();
@@ -678,26 +1009,31 @@ fn measure_single(config: &Config, engine: &mut dyn Generate) -> anyhow::Result<
         let run = run_once(engine)?;
         if !config.json {
             eprintln!(
-                "poot-bench: iter {}/{}  TTFT {:.0}ms  TPOT {:.1}ms  {:.1} tok/s",
+                "poot-bench: iter {}/{}  TTFT {:.0}ms  TPOT {}ms  {} tok/s",
                 it + 1,
                 config.iters,
                 run.ttft_ms,
-                run.tpot_ms(),
+                run.tpot_ms().map_or("-".to_string(), |v| format!("{v:.1}")),
                 run.decode_tok_s()
+                    .map_or("-".to_string(), |v| format!("{v:.1}"))
             );
         }
         runs.push(run);
     }
     let timed_wall = timed_start.elapsed();
+    probe.repeated(&*engine);
 
     if config.profile {
         let tokens = runs.iter().map(|run| run.tokens).sum();
         print_profile(engine.profile_report(tokens, timed_wall));
     }
 
-    let column = |value: fn(&Run) -> f64| runs.iter().map(value).collect::<Vec<f64>>();
-    let ttft = column(|run| run.ttft_ms);
-    let tok_s = column(|run| run.decode_tok_s());
+    // The summary medians are over the requests that define the metric; the result contract wants a number,
+    // so a cell where none does (fewer than two tokens) summarizes as 0 while every request says null.
+    let column =
+        |value: fn(&Run) -> Option<f64>| runs.iter().filter_map(value).collect::<Vec<f64>>();
+    let ttft = column(|run| Some(run.ttft_ms));
+    let tok_s = column(Run::decode_tok_s);
     Ok(json!({
         "warmup_runs": warmup_runs,
         "runs": runs.iter().map(Run::receipt).collect::<Vec<_>>(),
@@ -706,7 +1042,7 @@ fn measure_single(config: &Config, engine: &mut dyn Generate) -> anyhow::Result<
         "iterations": config.iters,
         "ttft_ms": round3(median(&ttft)),
         "tpot_ms": round3(median(&column(Run::tpot_ms))),
-        "e2e_ms": round3(median(&column(|run| run.e2e_ms))),
+        "e2e_ms": round3(median(&column(|run| Some(run.e2e_ms)))),
         "decode_tok_s": round3(median(&tok_s)),
         "ttft_ms_stdev": round3(stdev(&ttft)),
         "decode_tok_s_stdev": round3(stdev(&tok_s)),
@@ -720,15 +1056,25 @@ fn measure_isl(
     engine: &mut dyn Generate,
     base: &[u32],
     isl: usize,
+    probe: &mut PreparationProbe,
 ) -> anyhow::Result<Value> {
     let context: Vec<u32> = (0..isl).map(|i| base[i % base.len()]).collect();
     let run_once = |engine: &mut dyn Generate| {
-        timed(|on_token| engine.generate_context(&context, config.osl, on_token))
+        timed_request(engine, |engine, on_token| {
+            engine.generate_context(&context, config.osl, on_token)
+        })
     };
     let mut warmup_runs = Vec::new();
-    for _ in 0..config.warmup {
-        warmup_runs.push(run_once(engine)?.receipt());
+    let passes = probe.passes();
+    for pass in 0..passes {
+        if pass + 1 == passes {
+            probe.begin(&*engine);
+        }
+        for _ in 0..config.warmup {
+            warmup_runs.push(run_once(engine)?.receipt());
+        }
     }
+    probe.prepared(&*engine);
     // Card 552: a fresh mark after this ISL's own warmup (not once for the whole sweep), since each
     // ISL's prefill/warmup cost differs and must not leak into another ISL's window.
     if config.profile {
@@ -740,6 +1086,7 @@ fn measure_isl(
         let run = run_once(engine)?;
         iters.push(run.receipt());
     }
+    probe.repeated(&*engine);
     if config.profile {
         let tokens: usize = iters
             .iter()
@@ -757,7 +1104,11 @@ fn measure_isl(
 ///
 /// Batched prefill materializes the `[Hq,N,N]` attention scores, so a very large ISL on a large model can
 /// run out of memory in f32; that surfaces as such a caveat.
-fn measure_curve(config: &Config, engine: &mut dyn Generate) -> anyhow::Result<Value> {
+fn measure_curve(
+    config: &Config,
+    engine: &mut dyn Generate,
+    probe: &mut PreparationProbe,
+) -> anyhow::Result<Value> {
     let base = engine
         .encode(CURVE_BASE_PHRASE)
         .context("encode base context")?;
@@ -779,16 +1130,17 @@ fn measure_curve(config: &Config, engine: &mut dyn Generate) -> anyhow::Result<V
         // shape-contract violation that `poot-graph-ir::Builder::emit` panics on by design, and the ISL list
         // is not scoped per model. An uncaught panic would abort the process and discard every smaller
         // measured ISL, so it takes the same path as any per-ISL error.
-        let point =
-            std::panic::catch_unwind(AssertUnwindSafe(|| measure_isl(config, engine, &base, isl)))
-                .unwrap_or_else(|payload| {
-                    let message = payload
-                        .downcast_ref::<&str>()
-                        .map(|s| s.to_string())
-                        .or_else(|| payload.downcast_ref::<String>().cloned())
-                        .unwrap_or_else(|| "panic (non-string payload)".to_string());
-                    Err(anyhow::anyhow!("{message}"))
-                });
+        let point = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            measure_isl(config, engine, &base, isl, probe)
+        }))
+        .unwrap_or_else(|payload| {
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "panic (non-string payload)".to_string());
+            Err(anyhow::anyhow!("{message}"))
+        });
         match point {
             Ok(point) => {
                 curve.push(point);
@@ -842,8 +1194,7 @@ impl std::error::Error for Declined {}
 /// The refusal a failure carries, if it is one, as its own text. This is the runner's only classification
 /// of "poot does not run this": [`Declined`], or the driver's [`DriverError::Unsupported`]
 /// (a family the registry does not hold, a shape the family or the planner refuses), found anywhere in
-/// the error chain. Card 577's
-/// compile-generated support list adds its typed planner refusal as one more arm here.
+/// the error chain.
 fn refusal(error: &anyhow::Error) -> Option<(Option<Engine>, String)> {
     error.chain().find_map(|cause| {
         if let Some(DriverError::Unsupported(_)) = cause.downcast_ref::<DriverError>() {
@@ -857,11 +1208,21 @@ fn refusal(error: &anyhow::Error) -> Option<(Option<Engine>, String)> {
 
 /// The result line for `outcome`: the measurement, or the refusal recorded as `unsupported` with the
 /// refusal's own text. Any other failure is returned to `main` and exits non-zero.
-fn result_line(config: &Config, outcome: anyhow::Result<Value>) -> anyhow::Result<Value> {
+fn result_line(
+    config: &Config,
+    family: Option<&str>,
+    outcome: anyhow::Result<Value>,
+) -> anyhow::Result<Value> {
     match outcome {
         Err(error) => match refusal(&error) {
             Some((engine, reason)) => {
-                let mut line = identity(engine, config.backend, config.mode, &config.precision);
+                let mut line = identity(
+                    engine,
+                    family,
+                    config.backend,
+                    config.mode,
+                    &config.precision,
+                );
                 let fields = line.as_object_mut().expect("identity is an object");
                 fields.insert("status".to_string(), json!("unsupported"));
                 fields.insert("reason".to_string(), json!(reason));
@@ -873,6 +1234,31 @@ fn result_line(config: &Config, outcome: anyhow::Result<Value>) -> anyhow::Resul
     }
 }
 
+/// The cell's result line: open the model, measure it, and record a refusal as `unsupported` with the
+/// registry family the checkpoint resolved to (when it resolved one).
+fn run(config: &Config) -> anyhow::Result<Value> {
+    let open_start = Instant::now();
+    let (family, outcome) = match open(config) {
+        Ok(mut opened) => {
+            let open_ms = round3(ms(open_start.elapsed()));
+            let outcome = measure(
+                config,
+                opened.engine.as_mut(),
+                &opened.precision,
+                &opened.family,
+            )
+            .map(|mut line| {
+                // Loading is timed apart from every request: it happens before the first one.
+                line["preparation"]["open_ms"] = json!(open_ms);
+                line
+            });
+            (Some(opened.family), outcome)
+        }
+        Err(failure) => (failure.family, Err(failure.error)),
+    };
+    result_line(config, family.as_deref(), outcome)
+}
+
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let config = match parse_args(&args)? {
@@ -882,9 +1268,7 @@ fn main() -> anyhow::Result<()> {
         }
         Invocation::Run(config) => config,
     };
-    let outcome = open(&config)
-        .and_then(|(mut engine, precision)| measure(&config, engine.as_mut(), &precision));
-    println!("{}", result_line(&config, outcome)?);
+    println!("{}", run(&config)?);
     Ok(())
 }
 
@@ -959,6 +1343,10 @@ mod tests {
         /// Fail every prompt generation, with `error`.
         fail_prompt: bool,
         error: fn() -> anyhow::Error,
+        /// Executor steps the stub has "taken": one per generated token (prefill yields the first).
+        steps: std::cell::Cell<u64>,
+        /// What `counters` reports, advanced by `advance_counters`.
+        counters: std::cell::Cell<PreparationCounters>,
     }
 
     impl Stub {
@@ -968,6 +1356,8 @@ mod tests {
                 fail_at_isl: None,
                 fail_prompt: false,
                 error: || anyhow::anyhow!("stub failure"),
+                steps: std::cell::Cell::new(0),
+                counters: std::cell::Cell::new(PreparationCounters::default()),
             }
         }
 
@@ -998,6 +1388,7 @@ mod tests {
             if self.fail_at_isl == Some(context.len()) {
                 return Err((self.error)());
             }
+            self.steps.set(self.steps.get() + max_new as u64);
             Stub::emit(max_new, on_token);
             Ok(())
         }
@@ -1015,6 +1406,7 @@ mod tests {
             if self.fail_prompt {
                 return Err((self.error)());
             }
+            self.steps.set(self.steps.get() + max_new as u64);
             Stub::emit(max_new, on_token);
             Ok(())
         }
@@ -1032,6 +1424,14 @@ mod tests {
 
         fn engine(&self) -> Engine {
             Engine::Driver
+        }
+
+        fn steps(&self) -> u64 {
+            self.steps.get()
+        }
+
+        fn counters(&self) -> PreparationCounters {
+            self.counters.get()
         }
     }
 
@@ -1092,7 +1492,7 @@ mod tests {
             ]);
             single.backend = backend;
             let mut stub = Stub::new();
-            let line = measure(&single, &mut stub, "bf16").unwrap();
+            let line = measure(&single, &mut stub, "bf16", "stub_family").unwrap();
             let mut expected = prompt_events(3, 6, true);
             expected.push(Event::ResetProfile);
             expected.extend(prompt_events(4, 6, true));
@@ -1116,7 +1516,7 @@ mod tests {
             ]);
             curve.backend = backend;
             let mut stub = Stub::new();
-            let line = measure(&curve, &mut stub, "bf16").unwrap();
+            let line = measure(&curve, &mut stub, "bf16", "stub_family").unwrap();
             let mut expected = Vec::new();
             for isl in [8, 16, 32] {
                 expected.extend(context_events(2 + 3, isl, 5));
@@ -1194,13 +1594,14 @@ mod tests {
                 "6",
             ]);
             config.backend = Backend::Rocm;
-            let outcome = measure(&config, &mut Stub::new(), "bf16");
-            let line = result_line(&config, outcome).unwrap();
+            let outcome = measure(&config, &mut Stub::new(), "bf16", "stub_family");
+            let line = result_line(&config, None, outcome).unwrap();
             let text = line.to_string();
             assert!(!text.contains('\n'), "{mode:?}: the result is one line");
             assert_eq!(line["mode"], mode.label());
             assert_eq!(line["framework"], "poot");
             assert_eq!(line["build_sha"], BUILD_SHA);
+            assert_eq!(line["family"], "stub_family");
             harness_accepts(&line, mode == Mode::DecodeCurve, 6, Backend::Rocm);
         }
     }
@@ -1280,7 +1681,12 @@ mod tests {
         let mut stub = Stub::new();
         stub.fail_prompt = true;
         stub.error = refused;
-        let line = result_line(&config, measure(&config, &mut stub, "bf16")).unwrap();
+        let line = result_line(
+            &config,
+            Some("stub_family"),
+            measure(&config, &mut stub, "bf16", "stub_family"),
+        )
+        .unwrap();
         assert_eq!(line["status"], "unsupported");
         assert!(
             line["reason"].as_str().unwrap().contains("stub_backend"),
@@ -1291,7 +1697,12 @@ mod tests {
         assert_eq!(line["build_sha"], BUILD_SHA);
 
         stub.error = || anyhow::anyhow!("out of memory");
-        let error = result_line(&config, measure(&config, &mut stub, "bf16")).unwrap_err();
+        let error = result_line(
+            &config,
+            Some("stub_family"),
+            measure(&config, &mut stub, "bf16", "stub_family"),
+        )
+        .unwrap_err();
         assert_eq!(error.to_string(), "out of memory");
     }
 
@@ -1314,10 +1725,9 @@ mod tests {
         let mut config = config(&["--precision", "bf16"]);
         config.weights = Weights::Safetensors(dir.display().to_string());
         config.backend = Backend::Rocm;
-        let outcome = open(&config).map(|_| Value::Null);
+        let line = run(&config).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
 
-        let line = result_line(&config, outcome).unwrap();
         assert_eq!(line["status"], "unsupported");
         let reason = line["reason"].as_str().unwrap();
         assert!(
@@ -1325,15 +1735,15 @@ mod tests {
             "{reason}"
         );
         assert_eq!(harness_refusal(&line, Backend::Rocm), reason);
+        // The registry resolved no family, so the row names none.
+        assert_eq!(line["family"], Value::Null);
     }
 
     #[test]
     fn a_load_failure_that_is_not_a_refusal_stays_an_error() {
         let mut config = config(&[]);
         config.weights = Weights::Safetensors("/nonexistent/checkpoint".to_string());
-        let outcome = open(&config).map(|_| Value::Null);
-
-        let error = result_line(&config, outcome).unwrap_err();
+        let error = run(&config).unwrap_err();
         assert!(
             format!("{error:#}").contains("No such file or directory"),
             "{error:#}"
@@ -1345,9 +1755,7 @@ mod tests {
     #[test]
     fn an_unloadable_precision_is_a_refusal_before_the_model_is_read() {
         let config = config(&["--precision", "mxfp4"]);
-        let outcome = open(&config).map(|_| Value::Null);
-
-        let line = result_line(&config, outcome).unwrap();
+        let line = run(&config).unwrap();
         assert_eq!(line["status"], "unsupported");
         assert_eq!(line["precision"], "mxfp4");
         let reason = line["reason"].as_str().unwrap();
@@ -1376,7 +1784,7 @@ mod tests {
         let mut stub = Stub::new();
         stub.fail_at_isl = Some(16);
         stub.error = || anyhow::anyhow!("CUDA out of memory\nbacktrace");
-        let line = measure(&config, &mut stub, "bf16").unwrap();
+        let line = measure(&config, &mut stub, "bf16", "stub_family").unwrap();
         assert_eq!(line["curve"].as_array().unwrap().len(), 1);
         assert_eq!(
             line["caveats"],
@@ -1385,8 +1793,8 @@ mod tests {
 
         stub.fail_at_isl = Some(8);
         stub.error = refused;
-        let outcome = measure(&config, &mut stub, "bf16");
-        let line = result_line(&config, outcome).unwrap();
+        let outcome = measure(&config, &mut stub, "bf16", "stub_family");
+        let line = result_line(&config, None, outcome).unwrap();
         assert_eq!(line["status"], "unsupported");
     }
 
@@ -1426,6 +1834,9 @@ mod tests {
             fn engine(&self) -> Engine {
                 Engine::Driver
             }
+            fn steps(&self) -> u64 {
+                0
+            }
         }
         let config = config(&[
             "--mode",
@@ -1439,7 +1850,7 @@ mod tests {
             "--iters",
             "1",
         ]);
-        let line = measure(&config, &mut Panics, "bf16").unwrap();
+        let line = measure(&config, &mut Panics, "bf16", "stub_family").unwrap();
         assert_eq!(line["curve"].as_array().unwrap().len(), 1);
         let caveat = line["caveats"][0].as_str().unwrap();
         assert!(caveat.starts_with("isl 16+ omitted: "), "{caveat}");
@@ -1483,14 +1894,14 @@ mod tests {
     }
 
     /// The registry decides the engine: a registered family's checkpoint opens through the driver (here
-    /// the config-only qwen2 directory fails reading its weights, as `ModelHandle::load`, not as the
-    /// Runner's registered-family refusal), and the result line names the engine that generated.
+    /// the config-only qwen2 directory fails reading its weights, as `ModelHandle::load` does), and the
+    /// result line names the engine that generated.
     #[test]
     fn a_registered_family_opens_on_the_driver_and_the_line_names_the_engine() {
         let dir = config_only_checkpoint("registered", r#"{"model_type": "qwen2"}"#);
         let mut config = config(&["--precision", "bf16"]);
         config.weights = Weights::Safetensors(dir.display().to_string());
-        let error = open(&config).map(|_| ()).unwrap_err();
+        let error = open(&config).map(|_| ()).unwrap_err().error;
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(
             error.chain().any(|cause| matches!(
@@ -1500,15 +1911,22 @@ mod tests {
             "{error:#}"
         );
 
-        let line = identity(Some(Engine::Driver), Backend::Wgpu, Mode::Single, "bf16");
+        let line = identity(
+            Some(Engine::Driver),
+            Some("qwen2"),
+            Backend::Wgpu,
+            Mode::Single,
+            "bf16",
+        );
         assert_eq!(line["engine"], "driver");
-        assert!(identity(None, Backend::Wgpu, Mode::Single, "bf16")
-            .get("engine")
-            .is_none());
+        assert_eq!(line["family"], "qwen2");
+        let declined = identity(None, None, Backend::Wgpu, Mode::Single, "bf16");
+        assert!(declined.get("engine").is_none());
+        assert_eq!(declined["family"], Value::Null);
     }
 
-    /// A family or shape the driver cannot serve is a recorded refusal (`unsupported`), the same as the
-    /// Runner's own refusals; a load failure is still an error.
+    /// A family or shape the driver cannot serve is a recorded refusal (`unsupported`); a load failure
+    /// is still an error.
     #[test]
     fn a_driver_refusal_is_a_recorded_refusal() {
         let unregistered =
@@ -1519,6 +1937,13 @@ mod tests {
         assert!(refusal(&error).is_some_and(
             |(engine, reason)| engine == Some(Engine::Driver) && reason.contains("rocm")
         ));
+
+        // A refusal after the registry resolved the family records that family: the feature matrix joins
+        // the row to the family's compile cell.
+        let config = config(&["--precision", "bf16"]);
+        let line = result_line(&config, Some("qwen2"), Err(error)).unwrap();
+        assert_eq!(line["status"], "unsupported");
+        assert_eq!(line["family"], "qwen2");
     }
 
     #[test]
@@ -1561,12 +1986,22 @@ mod request_timing_tests {
             run.ttft_ms + run.itl_ms.iter().sum::<f64>() + run.finish_ms
         );
         let delayed = request(&[40, 50, 65], 172);
-        assert_eq!(delayed.tpot_ms(), 12.5);
-        assert_eq!(delayed.decode_tok_s(), 80.0);
+        assert_eq!(delayed.tpot_ms(), Some(12.5));
+        assert_eq!(delayed.decode_tok_s(), Some(80.0));
         assert_eq!(delayed.finish_ms, 107.0);
         assert_eq!(delayed.e2e_ms - run.e2e_ms, 100.0);
         let relocated = request(&[60, 70, 85], 92);
         assert_eq!(relocated.e2e_ms - run.e2e_ms, 20.0);
+    }
+
+    #[test]
+    fn a_delayed_token_changes_that_gap_and_only_that_gap() {
+        let run = request(&[40, 50, 65], 72);
+        let late = request(&[40, 50, 85], 92);
+        assert_eq!(run.itl_ms, [10.0, 15.0]);
+        assert_eq!(late.itl_ms, [10.0, 35.0]);
+        assert_eq!(late.finish_ms, run.finish_ms);
+        assert_eq!(late.e2e_ms - run.e2e_ms, 20.0);
     }
 
     #[test]
@@ -1580,8 +2015,326 @@ mod request_timing_tests {
         let one = request(&[10], 25);
         assert_eq!((one.ttft_ms, one.finish_ms, one.e2e_ms), (10.0, 15.0, 25.0));
         for run in [zero, one] {
-            assert_eq!((run.tpot_ms(), run.decode_tok_s()), (0.0, 0.0));
+            assert_eq!((run.tpot_ms(), run.decode_tok_s()), (None, None));
+            assert_eq!(run.receipt()["tpot_ms"], Value::Null);
             assert!(run.itl_ms.is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod preparation_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// An engine whose counters move the way a driver's do: `cold_work` on the first request, then
+    /// `late_work` on every request (a pipeline built, or a recording redone, inside the timed window).
+    struct Counting {
+        requests: Cell<u64>,
+        counters: Cell<PreparationCounters>,
+        cold_work: u64,
+        late_work: u64,
+        /// Recordings redone on every later request while the plan layer stays quiet.
+        late_recordings: u64,
+    }
+
+    impl Counting {
+        fn new(cold_work: u64, late_work: u64) -> Self {
+            Self {
+                requests: Cell::new(0),
+                counters: Cell::new(PreparationCounters {
+                    plan: Some(0),
+                    entries: Some(0),
+                    recordings: Some(0),
+                    ..PreparationCounters::default()
+                }),
+                cold_work,
+                late_work,
+                late_recordings: 0,
+            }
+        }
+
+        /// The engine prepared `work` units while opening, before any request (as a driver does).
+        fn prepared_while_opening(self, work: u64) -> Self {
+            let mut counters = self.counters.get();
+            counters.plan = Some(work);
+            counters.recordings = Some(work);
+            self.counters.set(counters);
+            self
+        }
+
+        fn redoing_recordings(mut self, per_request: u64) -> Self {
+            self.late_recordings = per_request;
+            self
+        }
+
+        fn request(&self, max_new: usize, on_token: &mut dyn FnMut(&str)) {
+            let first = self.requests.get() == 0;
+            self.requests.set(self.requests.get() + 1);
+            let work = if first {
+                self.cold_work
+            } else {
+                self.late_work
+            };
+            let mut counters = self.counters.get();
+            let redone = if first { 0 } else { self.late_recordings };
+            counters.plan = counters.plan.map(|n| n + work);
+            counters.recordings = counters.recordings.map(|n| n + work + redone);
+            self.counters.set(counters);
+            for _ in 0..max_new {
+                std::thread::sleep(Duration::from_millis(1));
+                on_token("t");
+            }
+        }
+    }
+
+    impl Generate for Counting {
+        fn encode(&self, text: &str) -> anyhow::Result<Vec<u32>> {
+            Ok((0..text.split_whitespace().count() as u32).collect())
+        }
+        fn generate_context(
+            &mut self,
+            _: &[u32],
+            max_new: usize,
+            on_token: &mut dyn FnMut(&str),
+        ) -> anyhow::Result<()> {
+            self.request(max_new, on_token);
+            Ok(())
+        }
+        fn generate_prompt(
+            &mut self,
+            _: &str,
+            max_new: usize,
+            _: bool,
+            on_token: &mut dyn FnMut(&str),
+        ) -> anyhow::Result<()> {
+            self.request(max_new, on_token);
+            Ok(())
+        }
+        fn reset_profile(&mut self) {}
+        fn profile_report(&self, _: usize, _: Duration) -> Option<String> {
+            None
+        }
+        fn engine(&self) -> Engine {
+            Engine::Driver
+        }
+        fn steps(&self) -> u64 {
+            self.requests.get() * 3
+        }
+        fn counters(&self) -> PreparationCounters {
+            self.counters.get()
+        }
+        fn initial_counters(&self) -> PreparationCounters {
+            PreparationCounters {
+                plan: Some(0),
+                entries: Some(0),
+                recordings: Some(0),
+                ..PreparationCounters::default()
+            }
+        }
+    }
+
+    fn config(extra: &[&str]) -> Config {
+        let mut args = vec!["poot-bench-runner", "--model-dir", "/nonexistent"];
+        args.extend_from_slice(extra);
+        let args: Vec<String> = args.into_iter().map(String::from).collect();
+        match parse_args(&args).expect("test arguments parse") {
+            Invocation::Run(config) => config,
+            Invocation::Version => unreachable!("no --version"),
+        }
+    }
+
+    fn layer(line: &Value, name: &str) -> (Value, Value) {
+        let entry = &line["preparation"]["layers"][name];
+        (entry["prepare"].clone(), entry["repeat"].clone())
+    }
+
+    #[test]
+    fn preparation_separates_what_the_set_cost_from_what_repeating_it_added() {
+        let config = config(&["--warmup", "2", "--iters", "3", "--gen-tokens", "3"]);
+        let line = measure(&config, &mut Counting::new(4, 0), "bf16", "f").unwrap();
+
+        assert_eq!(layer(&line, "plan"), (json!(4), json!(0)));
+        assert_eq!(layer(&line, "recordings"), (json!(4), json!(0)));
+        // No producer counts these: Unknown (null), never a zero.
+        for unknown in [
+            "generated_bodies",
+            "artifact_hits",
+            "runtime_pipelines",
+            "graph_instantiations",
+        ] {
+            assert_eq!(
+                layer(&line, unknown),
+                (Value::Null, Value::Null),
+                "{unknown}"
+            );
+        }
+    }
+
+    #[test]
+    fn work_inside_the_timed_window_is_counted_as_repeat_work() {
+        let config = config(&["--warmup", "1", "--iters", "3", "--gen-tokens", "3"]);
+        let line = measure(&config, &mut Counting::new(4, 1), "bf16", "f").unwrap();
+
+        // Three timed requests each redo one unit: the layer is not warm.
+        assert_eq!(layer(&line, "plan"), (json!(4), json!(3)));
+    }
+
+    #[test]
+    fn a_cold_process_counts_the_preparation_the_engine_did_while_opening() {
+        let args = ["--warmup", "1", "--iters", "2", "--gen-tokens", "3"];
+        let cold = config(&args);
+        let mut reused = config(&args);
+        reused.prepared_state = Some(PreparedState::ReusedPreparedDriver);
+
+        let cold_line = measure(
+            &cold,
+            &mut Counting::new(0, 0).prepared_while_opening(5),
+            "bf16",
+            "f",
+        )
+        .unwrap();
+        let reused_line = measure(
+            &reused,
+            &mut Counting::new(0, 0).prepared_while_opening(5),
+            "bf16",
+            "f",
+        )
+        .unwrap();
+
+        // Prepared during open: the cold process paid it; a reused driver, prepared already, adds none.
+        assert_eq!(layer(&cold_line, "plan"), (json!(5), json!(0)));
+        assert_eq!(layer(&reused_line, "plan"), (json!(0), json!(0)));
+    }
+
+    #[test]
+    fn each_driver_stat_lands_in_its_own_layer() {
+        let stats = DriverStats {
+            compiles: 7,
+            entries_added: 11,
+            steps: 17,
+            host_picks: 19,
+            ..DriverStats::default()
+        };
+        let counters = counters_from(&stats, 13);
+
+        assert_eq!(counters.plan, Some(7));
+        assert_eq!(counters.entries, Some(11));
+        assert_eq!(counters.recordings, Some(13));
+        // Steps and host picks are not preparation, and no producer counts the other layers.
+        assert_eq!(
+            counters
+                .layers()
+                .iter()
+                .filter(|layer| layer.is_some())
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn each_layer_is_held_to_its_own_counter() {
+        let config = config(&["--warmup", "1", "--iters", "3", "--gen-tokens", "3"]);
+        // Recordings are redone in every timed request while the plan layer does no work: a plan counter
+        // that stood for every layer would call this driver warm.
+        let line = measure(
+            &config,
+            &mut Counting::new(4, 0).redoing_recordings(1),
+            "bf16",
+            "f",
+        )
+        .unwrap();
+
+        assert_eq!(layer(&line, "plan"), (json!(4), json!(0)));
+        assert_eq!(layer(&line, "recordings"), (json!(4), json!(3)));
+    }
+
+    #[test]
+    fn a_reused_driver_is_prepared_before_the_counted_pass() {
+        let cold = config(&[
+            "--warmup",
+            "1",
+            "--iters",
+            "2",
+            "--gen-tokens",
+            "3",
+            "--prepared-state",
+            "cold-process-populated-artifacts",
+        ]);
+        let reused = config(&[
+            "--warmup",
+            "1",
+            "--iters",
+            "2",
+            "--gen-tokens",
+            "3",
+            "--prepared-state",
+            "reused-prepared-driver",
+        ]);
+
+        let cold_line = measure(&cold, &mut Counting::new(4, 0), "bf16", "f").unwrap();
+        let reused_line = measure(&reused, &mut Counting::new(4, 0), "bf16", "f").unwrap();
+
+        assert_eq!(layer(&cold_line, "plan").0, json!(4));
+        assert_eq!(layer(&reused_line, "plan").0, json!(0));
+        assert_eq!(
+            reused_line["preparation"]["state"],
+            "reused-prepared-driver"
+        );
+        assert_eq!(reused_line["runs"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn curve_preparation_sums_every_contexts_window() {
+        let config = config(&[
+            "--mode",
+            "decode-curve",
+            "--isl-list",
+            "4,8",
+            "--osl",
+            "3",
+            "--warmup",
+            "1",
+            "--iters",
+            "2",
+        ]);
+        // Each context's first request is cold in this engine only once; later requests add nothing.
+        let line = measure(&config, &mut Counting::new(2, 0), "bf16", "f").unwrap();
+        assert_eq!(layer(&line, "plan"), (json!(2), json!(0)));
+    }
+
+    #[test]
+    fn the_prepared_state_flag_takes_only_the_declared_states() {
+        for state in PreparedState::ALL {
+            assert_eq!(PreparedState::parse(state.label()).unwrap(), state);
+        }
+        let error = PreparedState::parse("warm-ish").unwrap_err().to_string();
+        assert!(error.contains("cold-process-empty-artifacts"), "{error}");
+        assert!(config(&[]).prepared_state.is_none());
+    }
+
+    /// The labels and layer names the runner prints are the ones the harness validates against.
+    #[test]
+    fn the_harness_and_the_runner_agree_on_states_and_layers() {
+        let harness = format!("{}/../../harness", env!("CARGO_MANIFEST_DIR"));
+        let script = format!(
+            "import json, sys\nsys.path.insert(0, {harness:?})\nimport performance_receipt as r\n\
+             print(json.dumps([list(r.PREPARATION_STATES), list(r.PREPARATION_LAYERS)]))\n"
+        );
+        let output = std::process::Command::new("python3")
+            .args(["-c", &script])
+            .output()
+            .expect("python3 is on PATH in the dev shell");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let harness: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            harness[0],
+            json!(PreparedState::ALL.map(PreparedState::label))
+        );
+        assert_eq!(harness[1], json!(PREPARATION_LAYERS));
     }
 }

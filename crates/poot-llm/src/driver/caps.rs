@@ -11,12 +11,14 @@ use std::collections::HashSet;
 use std::num::NonZeroUsize;
 
 use poot_graph_ir::op::SampleRule;
-use poot_models::model::{KvLayout, LogitRows, StepShape};
+use poot_models::model::{KvLayout, LogitRows, Phase, StepShape};
 
 use super::block_table::BLOCK_SIZE;
 use super::chunks::Piece;
-use super::error::{DriverError, InvalidOptions};
-use super::lora::{AdapterSet, GenerationId};
+use super::error::{DriverError, EmbedsError, InvalidOptions, InvalidRequest};
+use poot_load::lora::LoraAdapter;
+
+use super::lora::{AdapterSet, AdapterStack, GenerationId};
 use super::speculate::SpeculationCaps;
 use super::step::{Serving, serving_phase};
 use super::suffix::Head;
@@ -93,10 +95,16 @@ pub struct WindowCap {
     pub width: NonZeroUsize,
 }
 
-/// Which inputs a step accepts.
+/// Which inputs a driver accepts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InputSet {
+    /// Token prompts: always.
     pub tokens: bool,
+    /// Prompts with embedding rows in place of some tokens' ([`Driver::open_with_embeds`]): a
+    /// `PrefillEmbeds` entry is prepared.
+    pub embeds: bool,
+    /// [`Driver::encode`]: an `Encode` entry is prepared.
+    pub encode: bool,
 }
 
 /// What the compiled adapter entries cover.
@@ -204,8 +212,9 @@ impl Driver {
         Ok(self.refresh_caps(shapes.layout))
     }
 
-    /// Capture an adapter set: the generation already holding it, or a new one. Entries for it exist
-    /// once a `prepare` names it. The serve lifecycle's LoRA admin route is the caller.
+    /// Capture an adapter set: the generation already holding it, or a new one with `adapters` stacked
+    /// against the model's weights. Entries for it exist once a `prepare` names it. The serve
+    /// lifecycle's LoRA admin route is the caller.
     #[cfg_attr(
         not(test),
         expect(
@@ -216,8 +225,10 @@ impl Driver {
     pub(crate) fn capture_adapter_set(
         &mut self,
         set: AdapterSet,
+        adapters: &[LoraAdapter],
     ) -> Result<GenerationId, DriverError> {
-        Ok(self.lora.capture(set)?)
+        let stack = AdapterStack::build(adapters, self.handle.model().weights())?;
+        Ok(self.lora.capture(set, stack)?)
     }
 
     /// Unload `generation` and drop its prepared entries, returning their retained bytes. Refused
@@ -253,6 +264,18 @@ impl Driver {
             let entry = self.entries.remove(&key).expect("collected from the map");
             self.drop_holds(&entry.held);
         }
+        // The executable goes first: if it cannot unload, the generation stays registered and mapped, and a
+        // retry unloads it. Only then does the map forget it and the registry drop the generation.
+        if outcome.is_ok()
+            && let Some(&exe) = self.adapter_exes.get(&generation)
+        {
+            match self.executor.unload(exe) {
+                Ok(()) => {
+                    self.adapter_exes.remove(&generation);
+                }
+                Err(error) => outcome = Err(error.into()),
+            }
+        }
         if outcome.is_ok() {
             let identities = self.lora.identities_of(generation);
             self.lora.unload(generation)?;
@@ -271,9 +294,9 @@ impl Driver {
         self.caps.as_ref()
     }
 
-    /// Programs compiled so far: constant across steps drawn from the prepared set. Serve's
-    /// composition-change row reads it.
-    #[cfg_attr(not(test), expect(dead_code, reason = "held for POOT-753"))]
+    /// Programs compiled so far: constant across steps drawn from the prepared set. The serving rows read
+    /// it through [`Driver::stats`].
+    #[cfg(test)]
     pub(crate) fn compile_count(&self) -> u64 {
         self.stats.compiles
     }
@@ -346,6 +369,54 @@ impl Driver {
         self.prepared(key).map(|_| ())
     }
 
+    /// Admit the `PrefillEmbeds` entries a prompt with embedding rows runs, beside the entries
+    /// [`Driver::prepare`] admitted: one per prefill piece `shapes.warm` plans, per head and row
+    /// count. Only the contiguous layout takes embedding rows, so `shapes` must name it, and a
+    /// `prepare` of the same layout must already have published it.
+    pub fn prepare_embeds(
+        &mut self,
+        shapes: &ServingShapes<'_>,
+    ) -> Result<&DriverCaps, DriverError> {
+        if shapes.layout != Layout::Contiguous {
+            return Err(InvalidRequest::Embeds(EmbedsError::Paged).into());
+        }
+        if self.layout != Some(shapes.layout) {
+            return Err(InvalidRequest::NotPrepared.into());
+        }
+        let pieces: Vec<Piece> = match shapes.warm {
+            Warm::Admitted => self.chunks.admitted_pieces(),
+            Warm::Prompts(lens) => lens.iter().flat_map(|&len| self.chunks.plan(len)).collect(),
+        };
+        let mut seen = HashSet::new();
+        for piece in pieces {
+            let Piece::Prefill(tokens) = piece else {
+                continue;
+            };
+            if !seen.insert(tokens) {
+                continue;
+            }
+            for &rows in shapes.rows {
+                for &head in shapes.heads {
+                    let key = EntryKey {
+                        role: ModelRole::Target,
+                        phase: Phase::PrefillEmbeds,
+                        shape: StepShape {
+                            rows,
+                            tokens,
+                            capacity: self.options.capacity,
+                            kv: KvLayout::Contiguous,
+                            logits: LogitRows::Last,
+                        },
+                        head,
+                        adapters: None,
+                    };
+                    self.prepared(key)?;
+                }
+            }
+        }
+        Ok(self.refresh_caps(shapes.layout))
+    }
+
     /// Recompute the caps from the prepared entries of `layout`.
     fn refresh_caps(&mut self, layout: Layout) -> &DriverCaps {
         let kv = match layout {
@@ -357,10 +428,11 @@ impl Driver {
         let mut heads = HeadSet::default();
         let mut windows = Vec::new();
         let mut generations = HashSet::new();
-        let target_entries = self
-            .entries
-            .keys()
-            .filter(|key| key.role == ModelRole::Target && key.shape.kv == kv);
+        let target_entries = self.entries.keys().filter(|key| {
+            key.role == ModelRole::Target
+                && key.shape.kv == kv
+                && matches!(key.phase, Phase::Prefill | Phase::Decode)
+        });
         for key in target_entries {
             let StepShape { rows, tokens, .. } = key.shape;
             if !row_counts.contains(&rows) {
@@ -404,8 +476,26 @@ impl Driver {
             }),
             windows,
             speculation: self.speculation.policy.caps(),
-            inputs: InputSet { tokens: true },
+            inputs: InputSet {
+                tokens: true,
+                embeds: self
+                    .entries
+                    .keys()
+                    .any(|key| key.role == ModelRole::Target && key.phase == Phase::PrefillEmbeds),
+                encode: self
+                    .entries
+                    .keys()
+                    .any(|key| key.role == ModelRole::Target && key.phase == Phase::Encode),
+            },
         })
+    }
+
+    /// Republish the caps when a layout has been admitted: an entry prepared outside `prepare`
+    /// (an encode step's) changes what the driver accepts.
+    pub(super) fn refresh_caps_if_published(&mut self) {
+        if let Some(layout) = self.layout {
+            self.refresh_caps(layout);
+        }
     }
 
     /// Blocks free in the paged pool (cached prefix blocks count as held); `None` before a paged

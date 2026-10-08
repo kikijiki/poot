@@ -159,6 +159,7 @@ impl Device for FakeDevice {
 fn fixture() -> (
     poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs>,
     Arc<WeightStore>,
+    Arc<poot_quant::weights::WeightMap>,
 ) {
     use poot_quant::weights::{DenseWeight, WeightEntry};
     use poot_tensor::DType;
@@ -186,7 +187,11 @@ fn fixture() -> (
             ),
         )
         .unwrap();
-    (g, Arc::new(builder.build()))
+    let store = Arc::new(builder.build());
+    let mut names = poot_test_util::const_weights::ConstWeights::new(&store);
+    let g = names.graph(&g);
+    let map = Arc::new(names.map());
+    (g, store, map)
 }
 
 fn staged(
@@ -200,10 +205,7 @@ fn staged(
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions {
-            execution: Submission::Replay,
-            limits: poot_graph_plan::CompileLimits::STANDARD,
-        },
+        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect("fixture graph compiles for the fake target")
 }
@@ -224,16 +226,15 @@ fn load(engine: &mut Engine<FakeDevice>) -> (crate::ExecutableId, crate::EntryId
 
 fn load_with(
     engine: &mut Engine<FakeDevice>,
-    (g, store): (
+    (g, store, map): (
         poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs>,
         Arc<WeightStore>,
+        Arc<poot_quant::weights::WeightMap>,
     ),
 ) -> (crate::ExecutableId, crate::EntryId) {
     let target = engine.device().target();
     let program = staged(&g, target);
-    let exe = engine
-        .load_weights(store, crate::WeightSource::ConstNames)
-        .unwrap();
+    let exe = engine.load_weights(store, map).unwrap();
     let entry = engine.add_entry(exe, &program).unwrap();
     (exe, entry)
 }
@@ -245,6 +246,7 @@ fn load_with(
 fn fixture_shared_kind_different_keys() -> (
     poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs>,
     Arc<WeightStore>,
+    Arc<poot_quant::weights::WeightMap>,
 ) {
     use poot_quant::weights::{DenseWeight, WeightEntry};
     use poot_tensor::DType;
@@ -292,7 +294,11 @@ fn fixture_shared_kind_different_keys() -> (
             ),
         )
         .unwrap();
-    (g, Arc::new(builder.build()))
+    let store = Arc::new(builder.build());
+    let mut names = poot_test_util::const_weights::ConstWeights::new(&store);
+    let g = names.graph(&g);
+    let map = Arc::new(names.map());
+    (g, store, map)
 }
 
 fn measured(sum: Duration, span: Duration, dispatches: Vec<DispatchDeviceTime>) -> DeviceTime {

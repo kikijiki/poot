@@ -1,6 +1,5 @@
 use super::*;
 use poot_graph_ir::Builder;
-use poot_graph_ir::LayerIndex;
 use poot_graph_ir::analysis::{
     NumericsError, NumericsProperty, PASS_DECLARATIONS, PassDeclaration, Tier2Class,
     dispatch_count, implied_numerics, peak_transient_bytes, verify_pass_numerics,
@@ -9,6 +8,7 @@ use poot_graph_ir::op::{BinOp, RedOp};
 use poot_graph_ir::ops::{attention_masked, attention_masked_softcap};
 use poot_graph_ir::types::TensorType;
 use poot_graph_ir::{KeyLayout, KvBound};
+use poot_graph_ir::{LayerIndex, LayerTagError};
 use poot_quant::PackedWeight;
 use poot_quant::format::WeightFormat;
 
@@ -210,7 +210,10 @@ fn packed_block_diagonal_chain_is_recognized_as_one_contraction()
     assert_eq!(fused.eqns.len(), 1);
     assert!(matches!(
         fused.eqns[0].op,
-        OpKind::PackedContraction { blocks: 4, .. }
+        OpKind::PackedContraction {
+            rows: poot_graph_ir::ContractionRows::Blocks(4),
+            ..
+        }
     ));
     assert_eq!(fused.aval(fused.output).shape, vec![4, 5, 2]);
     Ok(())
@@ -2081,7 +2084,9 @@ fn adr0099_s2_layer_cut_errors_are_typed() {
     let _ = in_layer_zero;
     assert_eq!(
         StageAssignment::from_layer_cuts(&holey, &[0]),
-        Err(StageSplitError::UntaggedLayerEquation { equation: 1 })
+        Err(StageSplitError::LayerTags(LayerTagError::Untagged {
+            equation: 1
+        }))
     );
 
     // A skipped layer id: layer 2 appears where layer 1 should start.
@@ -2101,11 +2106,11 @@ fn adr0099_s2_layer_cut_errors_are_typed() {
     let skipped = b.finish(skipped);
     assert_eq!(
         StageAssignment::from_layer_cuts(&skipped, &[0]),
-        Err(StageSplitError::NonContiguousLayer {
+        Err(StageSplitError::LayerTags(LayerTagError::NonContiguous {
             equation: 1,
             layer: 2,
             expected: 1,
-        })
+        }))
     );
 
     // A graph whose first tagged equation is not layer 0 never had a layer 0.
@@ -2121,11 +2126,11 @@ fn adr0099_s2_layer_cut_errors_are_typed() {
     let started_at_one = b.finish(started_at_one);
     assert_eq!(
         StageAssignment::from_layer_cuts(&started_at_one, &[]),
-        Err(StageSplitError::NonContiguousLayer {
+        Err(StageSplitError::LayerTags(LayerTagError::NonContiguous {
             equation: 0,
             layer: 1,
             expected: 0,
-        })
+        }))
     );
 
     // A cut past the last layer would produce an empty stage, and a cut on an untagged graph has

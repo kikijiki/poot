@@ -19,10 +19,7 @@ pub fn precompile_graph(g: &Graph, caps: &DeviceCaps) -> Result<usize, PtxGpuErr
         backend: Backend::Nvptx,
         caps: *caps,
     };
-    let options = CompileOptions {
-        execution: Submission::Replay,
-        limits: poot_graph_plan::CompileLimits::STANDARD,
-    };
+    let options = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
     let program = compile(g, &target, &options)?;
     let cache = poot_codegen::KernelCache::open(poot_codegen::Target::Nvptx);
     let mut built = 0usize;

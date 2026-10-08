@@ -87,6 +87,13 @@ pub enum KernelGenError {
         leaf: usize,
         consumer: String,
     },
+    /// A two-byte float value feeds an op that would compute on it. Such a value is only moved: a `Select`'s
+    /// branch or the region output.
+    #[error("{generator}: a two-byte float value feeds {consumer}; it may only be a Select branch")]
+    NarrowOperand {
+        generator: &'static str,
+        consumer: String,
+    },
     /// The target cannot state this request at all (not a violated argument: the arguments are fine, no
     /// body exists for them on this backend). `request` names the generator, `reason` what is missing.
     /// The planner turns it into a typed refusal at claim time.
@@ -142,6 +149,7 @@ impl KernelGenError {
             | Self::AxisOutOfRange { generator, .. }
             | Self::CountMismatch { generator, .. }
             | Self::IndexLeafOperand { generator, .. }
+            | Self::NarrowOperand { generator, .. }
             | Self::ShapeMismatch { generator, .. } => generator,
             Self::UnsupportedDescriptor { .. } => "packed_kernel",
             Self::Unsupported { request, .. } => request,

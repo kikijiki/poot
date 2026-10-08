@@ -12,8 +12,8 @@ impl Context {
     /// and [`Context::drain_device_timing`] always reports nothing); any positive value turns
     /// collection on and bounds it.
     ///
-    /// Test-only until a typed timing mode constructs it in production: the bench runner's Runner
-    /// engines were its one production caller.
+    /// Test-only until a typed timing mode constructs it in production: the bench runner's
+    /// pre-driver engines were its one production caller.
     #[cfg(test)]
     pub(crate) fn new_with_device_timing(
         max_in_flight_queries: usize,
@@ -102,6 +102,7 @@ impl Context {
             tensor_core: self.tensor_core,
             known_miscompiles,
             compute_units: self.compute_units,
+            memory_budget_bytes: self.memory_budget_bytes,
         }
     }
 
@@ -244,7 +245,7 @@ impl Context {
                 panic!("[poot-wgpu-debug] uncaptured wgpu error (see diagnostics above): {err}");
             }));
         }
-        Ok(Context {
+        let mut context = Context {
             _instance: instance,
             _adapter: adapter,
             device,
@@ -261,6 +262,7 @@ impl Context {
             lds_bytes,
             tensor_core,
             compute_units,
+            memory_budget_bytes: None,
             is_amd_radv,
             pipelines: RefCell::new(HashMap::new()),
             pipeline_builds: Default::default(),
@@ -278,7 +280,9 @@ impl Context {
             memory: poot_runtime_common::MemoryCounters::new(),
             exec_counters: RefCell::new(poot_runtime_common::ExecutionCounters::default()),
             pending_faults: RefCell::new(Vec::new()),
-        })
+        };
+        context.memory_budget_bytes = context.vram_budget_bytes();
+        Ok(context)
     }
 
     /// G4: get (or build + cache) the compute pipeline + bind-group layout for `key`, from a

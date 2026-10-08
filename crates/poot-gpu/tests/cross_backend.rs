@@ -4,6 +4,7 @@
 //! exact ops, looser for transcendentals and reductions). Skips when no Vulkan adapter is available.
 
 use poot_runtime_common::DeviceBackend;
+use poot_test_util::const_weights::ConstWeights;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -45,10 +46,7 @@ fn staged(g: &Graph, target: Target) -> StagedProgram<poot_graph_ir::ValidationO
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions {
-            execution: Submission::Replay,
-            limits: poot_graph_plan::CompileLimits::STANDARD,
-        },
+        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect("compile the graph")
 }
@@ -151,11 +149,10 @@ fn run_once_contract(
     g: &Graph,
     inputs: &HashMap<ValueId, HostTensor>,
 ) -> Vec<f32> {
-    let program = staged(g, target);
     let (store, slot_binds) = split_consts_and_slots(g, inputs);
-    let exe = exec
-        .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (bound, map) = ConstWeights::bind(g, &store);
+    let program = staged(&bound, target);
+    let exe = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
     let entry = exec.add_entry(exe, &program).unwrap();
     let step_in = step_inputs(&slot_binds);
     let bytes = exec
@@ -174,11 +171,10 @@ fn run_once_contract_i32(
     g: &Graph,
     inputs: &HashMap<ValueId, HostTensor>,
 ) -> Vec<i32> {
-    let program = staged(g, target);
     let (store, slot_binds) = split_consts_and_slots(g, inputs);
-    let exe = exec
-        .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (bound, map) = ConstWeights::bind(g, &store);
+    let program = staged(&bound, target);
+    let exe = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
     let entry = exec.add_entry(exe, &program).unwrap();
     let step_in = step_inputs(&slot_binds);
     let bytes = exec
@@ -806,6 +802,61 @@ fn gather_axis0_cross_backend() {
     assert_close(&got, cpu.as_f32().unwrap(), "gather", 1e-6);
 }
 
+/// A `Gather` over an I32 const table whose words need all 32 bits ([`poot_test_util::i32_table_gather`])
+/// returns the table's words exactly: the table is stored as raw I32, not as its F32 mirror.
+///
+/// Mutation: pin the Gather-over-I32-data component to the mirror lane (drop the `pinned` pass of
+/// `ExactI32StorageAnalysis::new`); the output is the table rounded through F32 and this row goes red.
+#[test]
+fn i32_table_gather_is_exact_beyond_f32_cross_backend() {
+    use poot_test_util::i32_table_gather as fixture;
+
+    let _g = gpu_lock();
+    let Some((mut exec, target)) = try_gpu() else {
+        return;
+    };
+    let g = fixture::graph();
+    let mut builder = WeightStore::builder();
+    let words: Vec<u8> = fixture::table()
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    builder
+        .insert(
+            "table",
+            WeightEntry::Dense(
+                DenseWeight::try_new(DType::I32, vec![6, 4], Arc::from(words)).unwrap(),
+            ),
+        )
+        .unwrap();
+    let store = builder.build();
+    let (bound, map) = ConstWeights::bind(&g, &store);
+    let program = staged(&bound, target);
+    let exe = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
+    let entry = exec.add_entry(exe, &program).unwrap();
+    let tokens = SlotBind {
+        key: g
+            .inputs
+            .iter()
+            .find_map(|&id| g.meta(id).slot_key().cloned())
+            .expect("the token slot"),
+        shape: vec![fixture::tokens().len()],
+        dtype: DType::I32,
+        bytes: fixture::tokens()
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect(),
+    };
+    let bytes = exec
+        .step(exe, entry, &step_inputs(&[tokens]), &mut NoSync)
+        .unwrap()
+        .read()
+        .unwrap();
+    exec.remove_entry(exe, entry).unwrap();
+    exec.unload(exe).unwrap();
+    fixture::check("wgpu", &i32_bytes(&bytes)).unwrap();
+}
+
 // ── Sampling primitives (card 551a) ──
 
 /// Card 551a (SC-001, SC-002, SC-005, SC-007): `OpKind::SampleToken { rule: Greedy }` through the full
@@ -916,11 +967,10 @@ fn random_uniform_cross_backend() {
     .into_host()
     .unwrap();
 
-    let program = staged(&g, target);
     let store = WeightStore::builder().build();
-    let exe = exec
-        .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (bound, map) = ConstWeights::bind(&g, &store);
+    let program = staged(&bound, target);
+    let exe = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
     let entry = exec.add_entry(exe, &program).unwrap();
     let seed_bytes: Vec<u8> = seed_data.iter().flat_map(|v| v.to_le_bytes()).collect();
     let bind = SlotBind {
@@ -958,7 +1008,6 @@ fn run_gumbel_family_contract(
 ) -> Vec<i32> {
     use poot_graph_ir::Slot;
 
-    let program = staged(g, target);
     let mut builder = WeightStore::builder();
     for (id, shape, data) in [&logits, &noise, &params] {
         let name = g.meta(*id).name.clone().unwrap();
@@ -967,9 +1016,9 @@ fn run_gumbel_family_contract(
         builder.insert(name, WeightEntry::Dense(dense)).unwrap();
     }
     let store = builder.build();
-    let exe = exec
-        .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (bound, map) = ConstWeights::bind(g, &store);
+    let program = staged(&bound, target);
+    let exe = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
     let entry = exec.add_entry(exe, &program).unwrap();
     let mut binds = Vec::new();
     if let Some((_, shape, data)) = &top_k {

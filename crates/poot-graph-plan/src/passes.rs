@@ -33,6 +33,7 @@ mod dtype;
 mod fuse;
 mod iota;
 mod legalize;
+mod lora;
 mod packed;
 mod packed_bind;
 mod routed_experts;
@@ -41,7 +42,10 @@ mod stage_split;
 mod widen;
 
 pub(crate) use budget::GraphBudget;
+pub(crate) use legalize::refuse_oversized_constants;
 pub use legalize::{LegalizeError, legalize};
+pub(crate) use lora::apply_lora;
+pub use lora::{LoraError, LoraPlan};
 pub use sample_token_large_vocab::decompose_large_vocab_greedy;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -68,10 +72,11 @@ pub use packed::reject_packed_dequant_escapes;
 #[cfg(test)]
 pub(crate) use packed::reject_preexisting_packed_contractions;
 pub use packed_bind::{
-    PackedBindError, PackedConst, PackedLayout, WeightFormats, WeightFormatsError,
-    bind_packed_weights,
+    ExpertStackRefusal, PackedBindError, PackedConst, PackedLayout, WeightFormats,
+    WeightFormatsError, bind_packed_weights,
 };
-pub use routed_experts::{RoutedExpertSite, routed_expert_sites};
+#[cfg(test)]
+pub(crate) use routed_experts::routed_expert_sites;
 pub use stage_split::BoundaryDescriptor;
 #[cfg(test)]
 pub(crate) use stage_split::{

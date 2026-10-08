@@ -184,7 +184,7 @@ fn concat_family_rejects_zero_inputs() {
 
 /// POOT-1033: an I32 leaf of a float region is a select condition and nothing else. Reading it as a float
 /// operand (here the left operand of an `Add`) is the typed `IndexLeafOperand`, never a kernel that reads the
-/// condition word as float bits. Mutation: drop `check_float_leaf_tys` from `fused_views`; the body builds and
+/// condition word as float bits. Mutation: drop `check_float_region_tys` from `fused_views`; the body builds and
 /// this row goes red.
 #[test]
 fn float_region_rejects_an_i32_leaf_outside_a_select_condition() {
@@ -247,6 +247,69 @@ fn float_region_rejects_an_i32_leaf_outside_a_select_condition() {
                 ..
             }
         ),
+        "{err:?}"
+    );
+}
+
+/// POOT-1041: a two-byte float value is moved, never computed on. As a `Select` branch (and the region output)
+/// it generates; read by an arithmetic step, or as the two branches of different types, it is the typed
+/// `NarrowOperand` before any body exists. Mutation: drop the two-byte arm of `check_float_region_tys`; the
+/// arithmetic row would build a body that adds raw two-byte lanes as F32 and this row goes red.
+#[test]
+fn a_two_byte_float_is_only_ever_a_select_branch() {
+    use poot_kernelgen::{FusedInput, FusedKernel, FusedScalarOp, FusedStep, LeafTy};
+    let layouts = vec![poot_kernelgen::Layout::contiguous(&[4]); 3];
+    let shapes: [&[usize]; 3] = [&[4], &[4], &[4]];
+    let select = |leaf_tys: Vec<LeafTy>| FusedKernel {
+        leaf_tys,
+        steps: vec![FusedStep {
+            op: FusedScalarOp::Select,
+            inputs: vec![
+                FusedInput::Leaf(0),
+                FusedInput::Leaf(1),
+                FusedInput::Leaf(2),
+            ],
+        }],
+        output: FusedInput::Step(0),
+    };
+    for leaf in [LeafTy::BF16, LeafTy::F16] {
+        poot_kernelgen::fused_views(
+            "t",
+            &[4],
+            &shapes,
+            &layouts,
+            &select(vec![LeafTy::I32, leaf, leaf]),
+            None,
+        )
+        .expect("a select moves two-byte branches");
+    }
+    let mixed = select(vec![LeafTy::I32, LeafTy::BF16, LeafTy::F16]);
+    let err = poot_kernelgen::fused_views("t", &[4], &shapes, &layouts, &mixed, None)
+        .expect_err("branches of two types");
+    assert!(
+        matches!(err, KernelGenError::NarrowOperand { .. }),
+        "{err:?}"
+    );
+    let float_and_narrow = select(vec![LeafTy::I32, LeafTy::BF16, LeafTy::F32]);
+    let err = poot_kernelgen::fused_views("t", &[4], &shapes, &layouts, &float_and_narrow, None)
+        .expect_err("a two-byte and an F32 branch");
+    assert!(
+        matches!(err, KernelGenError::NarrowOperand { .. }),
+        "{err:?}"
+    );
+    let arithmetic = FusedKernel {
+        leaf_tys: vec![LeafTy::F32, LeafTy::BF16],
+        steps: vec![FusedStep {
+            op: FusedScalarOp::Binary(poot_kernel_ir::BinOp::Add),
+            inputs: vec![FusedInput::Leaf(0), FusedInput::Leaf(1)],
+        }],
+        output: FusedInput::Step(0),
+    };
+    let err =
+        poot_kernelgen::fused_views("t", &[4], &shapes[..2], &layouts[..2], &arithmetic, None)
+            .expect_err("a two-byte leaf feeds an Add");
+    assert!(
+        matches!(err, KernelGenError::NarrowOperand { .. }),
         "{err:?}"
     );
 }

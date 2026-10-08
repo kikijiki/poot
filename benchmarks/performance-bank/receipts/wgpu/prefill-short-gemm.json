@@ -1,0 +1,170 @@
+{
+  "backend": "wgpu",
+  "case": "prefill-short-gemm",
+  "cells": {
+    "kernel": {
+      "repeats": [
+        {
+          "metrics": {
+            "step_us": 792.1
+          },
+          "slot": 0,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 738.599
+          },
+          "slot": 1,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 703.1519999999999
+          },
+          "slot": 2,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 697.742
+          },
+          "slot": 3,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 803.382
+          },
+          "slot": 4,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 772.082
+          },
+          "slot": 5,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 779.8870000000001
+          },
+          "slot": 6,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 785.1270000000001
+          },
+          "slot": 7,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 714.143
+          },
+          "slot": 8,
+          "status": "ok"
+        }
+      ]
+    }
+  },
+  "memory": [
+    {
+      "live_bytes": 17825792,
+      "peak_bytes": 17825792,
+      "role": "Weight"
+    },
+    {
+      "live_bytes": 1048576,
+      "peak_bytes": 1048576,
+      "role": "Activation"
+    },
+    {
+      "live_bytes": 16,
+      "peak_bytes": 1048592,
+      "role": "Staging"
+    }
+  ],
+  "observed": {
+    "layout": "kn",
+    "shape": {
+      "k": 2048,
+      "m": 128,
+      "n": 2048
+    },
+    "storage": "f32",
+    "weight_bytes_per_copy": 16777216,
+    "weight_copies": 1
+  },
+  "plan": [
+    "contraction:tiled_region [3c6159b69d5dc1f6ebeba1bd94c33a739839ba5aa5e1c032601f2c1d608a9699]"
+  ],
+  "plan_id": "f9dde792f02ab2d4bc03d72c776de352ec8b29e82eda5af6ed57df0d54516fcc",
+  "recordings": 1,
+  "reference": {
+    "agrees": true,
+    "max_relative_error": 4.561565301886415e-05,
+    "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
+    "provenance": "independent-golden",
+    "tolerance": 0.002
+  },
+  "replays": 13,
+  "role": "baseline",
+  "schema": 1,
+  "command": [
+    "cargo",
+    "run",
+    "--release",
+    "-p",
+    "poot-gpu",
+    "--example",
+    "performance_bank",
+    "--",
+    "--bank",
+    "benchmarks/performance-bank/cases.json",
+    "--case",
+    "prefill-short-gemm",
+    "--out",
+    "benchmarks/performance-bank/receipts/wgpu/prefill-short-gemm.json"
+  ],
+  "parent_revision": "e178f51722183668cf2f554e21b0dca17d3b0caf",
+  "binary_sha256": "ac158d08f5360e51d7a612b83aca1e868a126f6da5fb7058acff3b679a8d76dc",
+  "identity": {
+    "checkpoint_digest": "synthetic-no-checkpoint",
+    "token_fixture": "splitmix64-seed0-unit:237900849bc67b83",
+    "precision": "f32",
+    "layout": "kn",
+    "dimensions": {
+      "m": 128,
+      "k": 2048,
+      "n": 2048
+    },
+    "prompt_tokens": 128,
+    "live_context": "n/a",
+    "max_context": "n/a",
+    "requested_output": "n/a",
+    "actual_output": "n/a",
+    "sampler": "n/a",
+    "template": "n/a",
+    "cache_state": {
+      "condition": "weights-resident-hot",
+      "id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb"
+    },
+    "prepared_set": [
+      "prefill-short-gemm"
+    ],
+    "timing_policy": {
+      "warmup": 3,
+      "repeats": 9,
+      "clock": "wall step plus readback",
+      "profiled": false
+    },
+    "backend": "wgpu",
+    "device": "AMD Radeon 8060S Graphics",
+    "driver": "host kernel 7.2.9"
+  },
+  "identity_digest": "020641a8fe55fee7ed27ea7c63d13eefebf6d1e5cf2e51a54626393ddcbec3dd",
+  "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77"
+}

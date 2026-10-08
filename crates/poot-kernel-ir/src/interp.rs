@@ -650,6 +650,18 @@ impl Workgroup<'_> {
                 let a = self.scalar_operand(lane, operand)?;
                 bitcast(to, a).map(Value::Scalar)
             }
+            Rvalue::Select {
+                condition,
+                if_true,
+                if_false,
+            } => {
+                let Scalar::Bool(chosen) = self.scalar_operand(lane, condition)? else {
+                    return Err(Fault::IllTyped("a select condition is a bool"));
+                };
+                // Only the chosen branch is read: the other never reaches the result.
+                let branch = if chosen { if_true } else { if_false };
+                self.scalar_operand(lane, branch).map(Value::Scalar)
+            }
             Rvalue::Fp8Encode { format, operand } => {
                 let Scalar::F32(value) = self.scalar_operand(lane, operand)? else {
                     return Err(Fault::IllTyped("fp8 encode reads an f32"));
@@ -1772,6 +1784,58 @@ mod tests {
         assert_eq!(
             bitcast(&Ty::F32, Scalar::U32(0x3f80_0000)).unwrap(),
             Scalar::F32(1.0)
+        );
+    }
+
+    /// POOT-1041: a `Select` evaluates only the branch its condition picks. The unpicked branch here reads far
+    /// past the end of the buffer, which would fault if it were evaluated; the picked one comes out whole, a
+    /// NaN payload included.
+    #[test]
+    fn a_select_reads_only_the_picked_branch() {
+        // _1 out, _2 element 0, _3 element 99 (past the end), _4 condition, _5 result
+        let nan = f32::from_bits(0x7FC0_1234);
+        let body = |condition: bool, picked: Operand, other: Operand| {
+            body_of(
+                1,
+                vec![buffer_ty(Ty::F32), Ty::Usize, Ty::Usize, Ty::Bool, Ty::F32],
+                vec![block(
+                    vec![
+                        assign(2, Rvalue::Use(cusize(0))),
+                        assign(3, Rvalue::Use(cusize(99))),
+                        assign(4, Rvalue::Use(Operand::Const(Constant::Bool(condition)))),
+                        assign(
+                            5,
+                            Rvalue::Select {
+                                condition: copy(4),
+                                if_true: picked,
+                                if_false: other,
+                            },
+                        ),
+                        Statement::Assign(element_of(1, 2), Rvalue::Use(copy(5))),
+                    ],
+                    Terminator::Return,
+                )],
+                [1, 1, 1],
+            )
+        };
+        let past_the_end = || Operand::Copy(element_of(1, 3));
+        let mut buffers = [Buffer::from_f32s(&[0.0])];
+        run(
+            &body(true, Operand::Const(Constant::F32(nan)), past_the_end()),
+            [1, 1, 1],
+            &mut buffers,
+        )
+        .expect("only the true branch is read");
+        assert_eq!(buffers[0].to_f32s().unwrap()[0].to_bits(), nan.to_bits());
+        let mut buffers = [Buffer::from_f32s(&[0.0])];
+        assert!(
+            run(
+                &body(false, Operand::Const(Constant::F32(nan)), past_the_end()),
+                [1, 1, 1],
+                &mut buffers,
+            )
+            .is_err(),
+            "the false branch is read, and it is out of bounds"
         );
     }
 

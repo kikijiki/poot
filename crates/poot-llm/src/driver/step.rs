@@ -29,12 +29,13 @@ use poot_models::model::{KvLayout, LogitRows, Phase, StepShape};
 use super::block_table::{BLOCK_SIZE, PagedKvCache, PoolExhausted};
 use super::caps::{Layout, PoolShape, StateResidency};
 use super::chunks::Piece;
-use super::error::{DriverError, InvalidRequest, PreparedSetRefusal};
+use super::embeds::PromptEmbeds;
+use super::error::{DriverError, EmbedsError, InvalidRequest, PreparedSetRefusal};
 use super::lora::AdapterRef;
 use super::prefix_cache::{PrefixIdentity, PrefixOutcome, PrefixSkip};
 use super::speculate::{self, NotSpeculated, Proposal, RowSpeculation, SpecRow};
 use super::suffix::{self, Head, SuffixRows};
-use super::{Driver, EntryKey, ModelRole, StepData, host_sample};
+use super::{Driver, EntryKey, ModelRole, SlotRole, StepData, host_sample};
 use crate::core::sampler::{Sampler, TokenLogprob};
 
 /// A driver-issued sequence id, never reused while the driver lives.
@@ -138,6 +139,9 @@ pub(super) struct Seq {
     seeded: bool,
     /// The last step's picks, until `commit` takes them.
     pending: Vec<u32>,
+    /// Rows the prompt supplies in place of its tokens' embeddings, bound on every prefill step
+    /// that covers one.
+    embeds: Option<PromptEmbeds>,
 }
 
 /// Where the open sequences keep their K/V.
@@ -214,6 +218,9 @@ pub(super) struct RowPlan {
     pub(super) picks: usize,
     /// A prefill piece (as opposed to a decode token).
     pub(super) prefill: bool,
+    /// The piece covers a position the sequence's embedding rows replace: the step runs the
+    /// `PrefillEmbeds` entry.
+    pub(super) embeds: bool,
     /// Set for a decode row under a draft policy: what the policy proposed for it.
     pub(super) spec: Option<SpecRow>,
     /// Set for a decode row under a draft policy that cannot speculate on it: the sampler is one
@@ -348,6 +355,7 @@ impl Driver {
                 identity,
                 seeded: false,
                 pending: Vec::new(),
+                embeds: None,
             },
         );
         if private || residency == StateResidency::Recurrent {
@@ -359,9 +367,37 @@ impl Driver {
                 self.executor
                     .reset_state(draft.exe, poot_executor::StateScope::All)?;
             }
+            for &exe in self.adapter_exes.values() {
+                self.executor
+                    .reset_state(exe, poot_executor::StateScope::All)?;
+            }
         }
         self.speculation.open(seq, reused);
         Ok(Admission::Opened { seq, reused })
+    }
+
+    /// [`Driver::open`] for a prompt that supplies embedding rows in place of some tokens'
+    /// embeddings (`embeds`). Its prefill steps run the `PrefillEmbeds` entries
+    /// ([`Driver::prepare_embeds`]); decode steps are ordinary. Only the contiguous layout takes them:
+    /// the paged prefix cache keys on tokens alone, which these rows change the meaning of.
+    pub fn open_with_embeds(
+        &mut self,
+        request: SeqRequest<'_>,
+        embeds: PromptEmbeds,
+    ) -> Result<Admission, DriverError> {
+        let serving = self.serving.as_ref().ok_or(InvalidRequest::NotPrepared)?;
+        if !matches!(serving.kv, KvStore::Contiguous) {
+            return Err(InvalidRequest::Embeds(EmbedsError::Paged).into());
+        }
+        embeds
+            .check_prompt(request.prompt.len())
+            .map_err(InvalidRequest::Embeds)?;
+        let admission = self.open(request)?;
+        if let Admission::Opened { seq, .. } = admission {
+            let serving = self.serving.as_mut().expect("open succeeded");
+            serving.seqs.get_mut(&seq).expect("just opened").embeds = Some(embeds);
+        }
+        Ok(admission)
     }
 
     /// Run one step over `rows`. Each row's sampler picks its token: the suffix entry when every
@@ -391,21 +427,27 @@ impl Driver {
                 row.sampler.seed_context(&seq.tokens[..seq.prompt_len]);
             }
         }
-        let adapter = rows
+        // A generation's entries run on their own executable, whose KV state holds only the sequences
+        // opened under that generation: one step cannot mix generations, nor base rows with adapter rows.
+        let mut generations = rows
             .iter()
-            .map(|row| serving.seqs[&row.seq].adapter.generation())
-            .try_fold(None, |held: Option<_>, generation| {
-                match (held, generation) {
-                    (held, None) => Ok(held),
-                    (None, generation) => Ok(generation),
-                    (Some(held), Some(generation)) if held == generation => Ok(Some(held)),
-                    _ => Err(InvalidRequest::MixedAdapters),
-                }
-            })?;
+            .map(|row| serving.seqs[&row.seq].adapter.generation());
+        let adapter = generations.next().expect("a step has a row");
+        if generations.any(|generation| generation != adapter) {
+            return Err(InvalidRequest::MixedAdapters.into());
+        }
         let window = plans.iter().any(|plan| plan.picks > 1);
         let tokens = plans.iter().map(|plan| plan.feed.len()).max().unwrap_or(1);
         let head = self.step_head(rows, &plans, window)?;
-        let key = self.step_entry(ModelRole::Target, rows.len(), tokens, window, head, adapter)?;
+        let embeds = plans.iter().any(|plan| plan.embeds);
+        let key = self.step_entry(
+            ModelRole::Target,
+            rows.len(),
+            tokens,
+            (window, embeds),
+            head,
+            adapter,
+        )?;
         let mut lanes: Vec<Lane<'_>> = rows
             .iter_mut()
             .map(|row| Lane {
@@ -515,10 +557,39 @@ impl Driver {
             data.read = vec![0; entry_rows * capacity];
             data.write = vec![-1; pool_slots.get()];
         }
+        let hidden = if key.phase == Phase::PrefillEmbeds {
+            let spec = entry
+                .slots
+                .iter()
+                .find(|spec| spec.role == SlotRole::Embeds)
+                .expect("a PrefillEmbeds program declares its embedding rows");
+            data.embeds = vec![0.0; spec.shape.iter().product()];
+            data.embeds_at = vec![0; entry_rows * width];
+            spec.shape[2]
+        } else {
+            0
+        };
         let serving = self.serving.as_ref().expect("a step is served");
         for (i, (lane, plan)) in lanes.iter().zip(plans).enumerate() {
             let seq = &serving.seqs[&lane.seq];
             let n = plan.feed.len();
+            if let Some(embeds) = seq.embeds.as_ref().filter(|_| plan.embeds) {
+                if embeds.width() != hidden {
+                    return Err(InvalidRequest::Embeds(EmbedsError::Width {
+                        got: embeds.width(),
+                        want: hidden,
+                    })
+                    .into());
+                }
+                for j in 0..n {
+                    // Left padding: the piece's tokens are the last `n` columns of the step.
+                    if let Some(row) = embeds.row_at(plan.start + j) {
+                        let column = i * width + (width - n) + j;
+                        data.embeds[column * hidden..(column + 1) * hidden].copy_from_slice(row);
+                        data.embeds_at[column] = 1;
+                    }
+                }
+            }
             let map = match &serving.kv {
                 KvStore::Paged { cache, .. } => {
                     let map = cache.slot_mapping(seq.slot, capacity);
@@ -734,6 +805,10 @@ impl Driver {
                         start: seq.done,
                         picks: usize::from(seq.done + n == seq.prompt_len),
                         prefill: true,
+                        embeds: seq
+                            .embeds
+                            .as_ref()
+                            .is_some_and(|embeds| embeds.covers(seq.done, seq.done + n)),
                         spec: None,
                         not_speculated: None,
                     }
@@ -789,6 +864,7 @@ impl Driver {
                         feed,
                         start,
                         prefill: false,
+                        embeds: false,
                         spec,
                         not_speculated,
                     }
@@ -829,9 +905,17 @@ impl Driver {
             .zip(plans)
             .filter(|(_, plan)| plan.picks > 0)
             .map(|(row, _)| suffix::rule_of(row.sampler));
-        // No row picks: the output is unread, so any prepared head of the shape serves.
+        // No row picks: the output is unread, so any prepared head of the shape serves. A rule the
+        // prepared set has no suffix entry for picks on the host from the logits head, as `HeadSet` says.
+        let prepared = |rule| {
+            self.caps
+                .as_ref()
+                .is_some_and(|caps| caps.heads.suffix.contains(&rule))
+        };
         Ok(rules.next().map(|first| match first {
-            Some(rule) if rules.all(|other| other == Some(rule)) => Head::Sample(rule),
+            Some(rule) if prepared(rule) && rules.all(|other| other == Some(rule)) => {
+                Head::Sample(rule)
+            }
             _ => Head::Logits,
         }))
     }
@@ -844,7 +928,7 @@ impl Driver {
         role: ModelRole,
         live: usize,
         width: usize,
-        window: bool,
+        (window, embeds): (bool, bool),
         head: Option<Head>,
         adapters: Option<super::lora::GenerationId>,
     ) -> Result<EntryKey, DriverError> {
@@ -854,7 +938,11 @@ impl Driver {
         } else {
             LogitRows::Last
         };
-        let phase = serving_phase(width, logits);
+        let phase = if embeds {
+            Phase::PrefillEmbeds
+        } else {
+            serving_phase(width, logits)
+        };
         let kv = serving.kv();
         let mut candidates: Vec<EntryKey> = self
             .entries

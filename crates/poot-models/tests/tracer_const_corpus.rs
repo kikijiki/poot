@@ -6,29 +6,16 @@
 //! with a different declared shape, is a call-dependent const the card exists to remove (the
 //! baked-store growth of). Per-model tables (`rope.cos`/`rope.sin`, weights) are fixed
 //! by the config and match across both calls; per-call tables must now be step inputs
-//! (`Slot::Mask`/`Slot::Activation`), in-graph `iota` computations, or absent.
+//! (`Slot::Activation`), in-graph `iota` computations, or absent.
 //!
 //! The corpus can only trace what this crate exposes (no `#[cfg(test)]` tracers): DeepSeek-V4,
-//! GLM-5.3, qwen38_27b's prefill arm and the qsa probe tracers are test-only and are counted by
-//! their in-crate tests' own assertions instead.
+//! GLM-5.3 is test-only and counted by its in-crate tests' own assertions instead.
 
 use std::collections::BTreeMap;
 
 use poot_executor_parity::dense::{Dense, Family, paged_step, plain, step};
 use poot_graph_ir::{Graph, Storage};
-use poot_models::bloom::{BloomConfig, trace_bloom_decode_kv_masked, trace_bloom_prefill};
 use poot_models::model::{LogitRows, Phase};
-use poot_models::mpt::{MptConfig, trace_mpt_decode_kv_masked, trace_mpt_prefill};
-use poot_models::qwen2::{
-    trace_prefill_kv_embeds, trace_prefill_mrope, trace_qwen2_5_vl_prefill_kv_embeds,
-};
-use poot_models::qwen3next::{Qwen3NextConfig, qwen3next_decode_trace};
-use poot_models::qwen38::{
-    QsaConfig, Qwen4ExpConfig, Qwen4ExpGdnConfig, Qwen4ExpModelConfig, Qwen4ExpPleConfig,
-    trace_qwen38_decode, trace_qwen38_prefill,
-};
-use poot_models::qwen38_27b::{Qwen35TextConfig, trace_qwen38_text_decode};
-use poot_models::smollm3::{Smollm3Config, trace_smollm3_decode_kv_masked, trace_smollm3_prefill};
 
 const LAYERS: usize = 2;
 
@@ -42,39 +29,6 @@ const CAP_B: usize = 12;
 struct Row {
     name: &'static str,
     build: fn(prompt: usize, cap: usize) -> Graph,
-}
-
-fn base_cfg() -> poot_models::qwen2::Qwen2Config {
-    poot_models::qwen2::Qwen2Config {
-        vocab: 24,
-        hidden: 16,
-        inter: 16,
-        layers: LAYERS,
-        n_heads: 4,
-        n_kv_heads: 2,
-        head_dim: 6,
-        rotary_dim: 6,
-        eps: 1e-5,
-        max_pos: 32,
-        qkv_bias: false,
-        qk_norm: false,
-        ..poot_models::qwen2::Qwen2Config::default()
-    }
-}
-
-fn qwen2_cfg() -> poot_models::qwen2::Qwen2Config {
-    poot_models::qwen2::Qwen2Config {
-        qkv_bias: true,
-        ..base_cfg()
-    }
-}
-
-fn qwen2_mrope_cfg() -> poot_models::qwen2::Qwen2Config {
-    poot_models::qwen2::Qwen2Config {
-        // section widths must sum to rotary_dim / 2 (= 3 for `base_cfg`).
-        mrope_section: Some([1, 1, 1]),
-        ..qwen2_cfg()
-    }
 }
 
 /// A dense family at the corpus dimensions, traced through `Model::trace` at `shape`.
@@ -97,116 +51,36 @@ fn dense_trace(family: Family, phase: Phase, shape: poot_models::model::StepShap
     )
 }
 
-fn bloom_cfg() -> BloomConfig {
-    BloomConfig {
-        vocab: 24,
-        hidden: 16,
-        n_heads: 4,
-        layers: LAYERS,
-        ffn_inter: 16,
-        eps: 1e-5,
-    }
-}
-
-fn mpt_cfg() -> MptConfig {
-    MptConfig {
-        vocab: 24,
-        hidden: 16,
-        n_heads: 4,
-        layers: LAYERS,
-        ffn_inter: 16,
-        eps: 1e-5,
-    }
-}
-
-fn smollm3_cfg() -> Smollm3Config {
-    Smollm3Config {
-        vocab: 24,
-        hidden: 16,
-        inter: 16,
-        layers: LAYERS,
-        n_heads: 4,
-        n_kv_heads: 2,
-        eps: 1e-6,
-        max_pos: 32,
-        use_rope: vec![true, false],
-    }
-}
-
-fn qwen38_cfg_with_ple(ple: Option<Qwen4ExpPleConfig>) -> Qwen4ExpModelConfig {
-    Qwen4ExpModelConfig {
-        cfg: Qwen4ExpConfig {
-            hidden: 8,
-            n_heads: 2,
-            n_kv_heads: 1,
-            head_dim: 4,
-            rotary_dim: 2,
-            eps: 1e-5,
-        },
-        qcfg: QsaConfig {
-            index_n_heads: 2,
-            index_kv_heads: 1,
-            index_head_dim: 3,
-            index_budget: 4,
-            index_compress_ratio: 2,
-        },
-        gdn: Qwen4ExpGdnConfig {
-            num_k_heads: 1,
-            num_v_heads: 2,
-            head_dim: 2,
-            conv_k: 4,
-        },
-        layer_is_full: vec![false, true],
-        vocab: 6,
-        max_pos: 16,
-        ffn_inter: 8,
-        moe_n_experts: 3,
-        moe_top_k: 2,
-        moe_inter: 4,
-        eps: 1e-5,
-        chunk: 4,
-        hc_count: 2,
-        hc_lowrank: 3,
-        ple,
-    }
-}
-
-/// The in-crate `tiny_ple` values (all fields are `pub`): real one-indexed layer id, tiny tables.
-fn tiny_ple() -> Qwen4ExpPleConfig {
-    Qwen4ExpPleConfig {
-        ple_layer_ids: vec![2],
-        ple_embed_dim: 8,
-        ple_conv_kernel_size: 3,
-        ngram_size: 3,
-        ngram_vocab_size_base: 17,
-        heads_per_ngram: 2,
-        make_ngram_vocab_size_divisible_by: 8,
-        seed: 1234,
-        eos_token_id: 5,
-        vocab_size: 11,
-    }
-}
-
-fn qwen3next_cfg() -> Qwen3NextConfig {
-    Qwen3NextConfig {
-        vocab: 6,
-        hidden: 12,
-        n_layers: 4,
-        full_attention_interval: 4,
-        eps: 1e-5,
-        max_pos: 32,
-        rotary_dim: 4,
-        n_heads: 2,
-        n_kv_heads: 1,
-        head_dim: 4,
-        gdn_num_k_heads: 2,
-        gdn_num_v_heads: 4,
-        gdn_head_dim: 4,
-        conv_k: 3,
-        n_experts: 4,
-        top_k: 2,
-        expert_inter: 8,
-        shared_inter: 8,
+/// `family`'s registry fixture, traced through `Model::trace` at `shape`.
+fn registered_trace(family: &str, phase: Phase, shape: poot_models::model::StepShape) -> Graph {
+    let registry = poot_models::registry::Registry::builtin().expect("the builtin registry");
+    let entry = registry
+        .entries()
+        .iter()
+        .find(|entry| entry.family.as_str() == family)
+        .unwrap_or_else(|| panic!("{family} is registered"));
+    let fixture = (entry.fixture)();
+    let model = (entry.build)(&fixture.raw(), &fixture.store).expect("the fixture builds");
+    // A routed family declares router witnesses; the corpus counts consts, which they do not touch.
+    let poot_graph_ir::Graph {
+        values,
+        inputs,
+        consts,
+        slots,
+        eqns,
+        output,
+        state,
+        validations: _,
+    } = model.trace(phase, shape).expect("the fixture traces");
+    Graph {
+        values,
+        inputs,
+        consts,
+        slots,
+        eqns,
+        output,
+        validations: poot_graph_ir::NoValidations,
+        state,
     }
 }
 
@@ -275,16 +149,14 @@ fn corpus() -> Vec<Row> {
             },
         },
         Row {
-            name: "qwen2.prefill_kv_embeds",
-            build: |prompt, cap| trace_prefill_kv_embeds(qwen2_cfg(), prompt, cap),
-        },
-        Row {
-            name: "qwen2.prefill_mrope",
-            build: |prompt, _| trace_prefill_mrope(qwen2_mrope_cfg(), prompt),
-        },
-        Row {
-            name: "qwen2.vl_prefill_kv_embeds",
-            build: |prompt, cap| trace_qwen2_5_vl_prefill_kv_embeds(qwen2_mrope_cfg(), prompt, cap),
+            name: "qwen2.prefill_embeds",
+            build: |prompt, cap| {
+                dense_trace(
+                    Family::Qwen2,
+                    Phase::PrefillEmbeds,
+                    step(1, prompt, cap, LogitRows::Last),
+                )
+            },
         },
         Row {
             name: "qwen3.prefill",
@@ -358,53 +230,115 @@ fn corpus() -> Vec<Row> {
         },
         Row {
             name: "bloom.prefill",
-            build: |prompt, _| trace_bloom_prefill(&bloom_cfg(), prompt),
+            build: |prompt, _| {
+                registered_trace(
+                    "bloom",
+                    Phase::Prefill,
+                    step(1, prompt, prompt, LogitRows::Last),
+                )
+            },
         },
         Row {
             name: "bloom.decode",
-            build: |_, cap| trace_bloom_decode_kv_masked(&bloom_cfg(), cap),
+            build: |_, cap| {
+                registered_trace("bloom", Phase::Decode, step(1, 1, cap, LogitRows::Last))
+            },
         },
         Row {
             name: "mpt.prefill",
-            build: |prompt, _| trace_mpt_prefill(&mpt_cfg(), prompt),
+            build: |prompt, _| {
+                registered_trace(
+                    "mpt",
+                    Phase::Prefill,
+                    step(1, prompt, prompt, LogitRows::Last),
+                )
+            },
         },
         Row {
             name: "mpt.decode",
-            build: |_, cap| trace_mpt_decode_kv_masked(&mpt_cfg(), cap),
+            build: |_, cap| {
+                registered_trace("mpt", Phase::Decode, step(1, 1, cap, LogitRows::Last))
+            },
         },
         Row {
             name: "smollm3.prefill",
-            build: |prompt, _| trace_smollm3_prefill(&smollm3_cfg(), prompt),
+            build: |prompt, _| {
+                registered_trace(
+                    "smollm3",
+                    Phase::Prefill,
+                    step(1, prompt, prompt, LogitRows::Last),
+                )
+            },
         },
         Row {
             name: "smollm3.decode",
-            build: |_, cap| trace_smollm3_decode_kv_masked(&smollm3_cfg(), cap),
-        },
-        Row {
-            name: "qwen38.prefill",
-            build: |prompt, _| trace_qwen38_prefill(&qwen38_cfg_with_ple(None), prompt),
-        },
-        Row {
-            name: "qwen38.prefill_ple",
-            build: |prompt, _| trace_qwen38_prefill(&qwen38_cfg_with_ple(Some(tiny_ple())), prompt),
-        },
-        Row {
-            name: "qwen38.decode",
-            build: |_, cap| trace_qwen38_decode(&qwen38_cfg_with_ple(None), cap),
-        },
-        Row {
-            name: "qwen38.decode_ple",
-            build: |_, cap| trace_qwen38_decode(&qwen38_cfg_with_ple(Some(tiny_ple())), cap),
+            build: |_, cap| {
+                registered_trace("smollm3", Phase::Decode, step(1, 1, cap, LogitRows::Last))
+            },
         },
         Row {
             name: "qwen3next.decode",
-            build: |_, cap| qwen3next_decode_trace(&qwen3next_cfg(), 1, cap),
+            build: |_, cap| {
+                registered_trace("qwen3next", Phase::Decode, step(1, 1, cap, LogitRows::Last))
+            },
         },
         Row {
-            name: "qwen38_27b.decode",
+            name: "qwen3next.prefill",
+            build: |prompt, cap| {
+                registered_trace(
+                    "qwen3next",
+                    Phase::Prefill,
+                    step(1, prompt, cap, LogitRows::All),
+                )
+            },
+        },
+        // The PLE sits on the fixture's second layer, so both rows count its consts.
+        Row {
+            name: "qwen4exp.decode",
             build: |_, cap| {
-                trace_qwen38_text_decode(&Qwen35TextConfig::pinned(), 1, cap)
-                    .expect("the pinned config traces")
+                registered_trace("qwen4exp", Phase::Decode, step(1, 1, cap, LogitRows::Last))
+            },
+        },
+        Row {
+            name: "qwen4exp.prefill",
+            build: |prompt, cap| {
+                registered_trace(
+                    "qwen4exp",
+                    Phase::Prefill,
+                    step(1, prompt, cap, LogitRows::All),
+                )
+            },
+        },
+        Row {
+            name: "qwen4exp.decode_batched",
+            build: |_, cap| {
+                registered_trace("qwen4exp", Phase::Decode, step(2, 1, cap, LogitRows::Last))
+            },
+        },
+        Row {
+            name: "qwen4exp.prefill_paged",
+            build: |prompt, cap| {
+                registered_trace(
+                    "qwen4exp",
+                    Phase::Prefill,
+                    paged_step(1, prompt, cap, cap, LogitRows::Last),
+                )
+            },
+        },
+        Row {
+            name: "qwen35.decode",
+            build: |_, cap| {
+                registered_trace("qwen35", Phase::Decode, step(1, 1, cap, LogitRows::Last))
+            },
+        },
+        Row {
+            name: "qwen35.prefill",
+            build: |prompt, cap| {
+                registered_trace(
+                    "qwen35",
+                    Phase::Prefill,
+                    step(1, prompt, cap, LogitRows::All),
+                )
             },
         },
     ]
@@ -456,7 +390,7 @@ fn call_dependent_consts(a: &Graph, b: &Graph) -> Vec<String> {
 fn traced_corpus_counts_zero_call_dependent_const_avals() {
     let rows = corpus();
     assert!(
-        rows.len() >= 28,
+        rows.len() >= 26,
         "the corpus must cover every family's tracers; got {} rows",
         rows.len()
     );
@@ -478,7 +412,7 @@ fn traced_corpus_counts_zero_call_dependent_const_avals() {
 
 /// Card 550's dense families, by this corpus's row names: every row card 550 converted to the new
 /// Pos/mask contract (`Slot::Pos` drives an in-graph `causal_mask_from_pos`/`alibi_mask_from_pos`
-/// instead of a host-built `Slot::Mask` step input or tracer-synthesized mask `Storage::Const`).
+/// instead of a tracer-synthesized mask `Storage::Const`).
 const CARD_550_DENSE_ROWS: &[&str] = &[
     "qwen2.decode",
     "qwen2.decode_batched",
@@ -486,9 +420,7 @@ const CARD_550_DENSE_ROWS: &[&str] = &[
     "qwen2.prefill",
     "qwen2.prefill_paged",
     "qwen2.prefill_batched_paged",
-    "qwen2.prefill_kv_embeds",
-    "qwen2.prefill_mrope",
-    "qwen2.vl_prefill_kv_embeds",
+    "qwen2.prefill_embeds",
     "qwen3.prefill",
     "olmo2.prefill",
     "olmo2.decode",
@@ -504,10 +436,10 @@ const CARD_550_DENSE_ROWS: &[&str] = &[
     "smollm3.decode",
 ];
 
-/// SC-005: over card 550's dense families' traced graphs, no mask is a step input any more: the
-/// count of `Slot::Mask` step inputs and tracer-synthesized mask `Storage::Const` inputs (named
-/// `mask.*`/`*.mask`/`causal.mask`, the pre-card convention) reads 0. Mutation: restore the `Slot::Mask`
-/// step input in one qwen2 prefill tracer; the count reads 1 and the row goes red.
+/// SC-005: over card 550's dense families' traced graphs, no mask is a graph input: the count of
+/// tracer-synthesized mask `Storage::Const` inputs (named `mask.*`/`*.mask`/`causal.mask`, the pre-card
+/// convention) reads 0. Mutation: declare a `causal.mask` const in one qwen2 prefill tracer; the count
+/// reads 1 and the row goes red.
 #[test]
 fn card_550_dense_corpus_counts_zero_mask_step_inputs_and_consts() {
     let rows = corpus();
@@ -527,12 +459,11 @@ fn card_550_dense_corpus_counts_zero_mask_step_inputs_and_consts() {
         let g = (row.build)(PROMPT_A, CAP_A);
         for &id in &g.inputs {
             let m = g.meta(id);
-            let is_mask_slot = matches!(m.storage, Storage::Slot(poot_graph_ir::Slot::Mask));
             let is_mask_const = m.storage == Storage::Const
                 && m.name
                     .as_deref()
                     .is_some_and(|n| n.contains("mask") || n == "causal.mask");
-            if is_mask_slot || is_mask_const {
+            if is_mask_const {
                 mask_count += 1;
                 offenders.push(format!("{}: {:?} (name={:?})", row.name, m.storage, m.name));
             }
@@ -541,7 +472,7 @@ fn card_550_dense_corpus_counts_zero_mask_step_inputs_and_consts() {
     assert_eq!(
         mask_count,
         0,
-        "card 550's dense families must have zero Mask step inputs/consts:\n{}",
+        "card 550's dense families must have zero mask consts:\n{}",
         offenders.join("\n")
     );
 }

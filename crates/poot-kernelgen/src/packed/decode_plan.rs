@@ -14,6 +14,7 @@ use poot_quant::format::{
 };
 
 use super::float_decode::emit_float_decode;
+use super::source::Source;
 use crate::KernelGenError;
 use crate::emit::{Emit, bin, c32, copy, cu, select_u32};
 
@@ -140,7 +141,7 @@ impl DecodePlan {
     fn emit_field_bits(
         &self,
         e: &mut Emit,
-        words: Local,
+        src: Source,
         block_bit: Local,
         field: &Field,
         i: Local,
@@ -151,12 +152,12 @@ impl DecodePlan {
         );
         let low_piece = &field.pieces[0];
         let low_bit = self.emit_bit_layout(e, block_bit, &low_piece.layout, i);
-        let low = crate::emit::emit_read_bits(e, words, low_bit, low_piece.width);
+        let low = src.read_bits(e, low_bit, low_piece.width);
         let Some(high_piece) = field.pieces.get(1) else {
             return low;
         };
         let high_bit = self.emit_bit_layout(e, block_bit, &high_piece.layout, i);
-        let high = crate::emit::emit_read_bits(e, words, high_bit, high_piece.width);
+        let high = src.read_bits(e, high_bit, high_piece.width);
         // Low bits first (`format::Field` docs): the high piece shifts up by the low piece's width.
         let shifted = bin(e, Ty::U32, BinOp::Shl, copy(high), c32(low_piece.width));
         bin(e, Ty::U32, BinOp::BitOr, copy(low), copy(shifted))
@@ -168,12 +169,12 @@ impl DecodePlan {
     fn emit_field_number(
         &self,
         e: &mut Emit,
-        words: Local,
+        src: Source,
         block_bit: Local,
         field: &Field,
         i: Local,
     ) -> Local {
-        let bits = self.emit_field_bits(e, words, block_bit, field, i);
+        let bits = self.emit_field_bits(e, src, block_bit, field, i);
         emit_encoded_number(e, field.encoding, field.width(), bits)
     }
 
@@ -187,7 +188,7 @@ impl DecodePlan {
     pub(crate) fn emit_factors(
         &self,
         e: &mut Emit,
-        words: Local,
+        src: Source,
         block: Local,
         i: Local,
     ) -> Factors {
@@ -195,20 +196,20 @@ impl DecodePlan {
         let scale_whole = self
             .scale
             .as_ref()
-            .map(|field| self.emit_field_number(e, words, block_bit, field, i));
+            .map(|field| self.emit_field_number(e, src, block_bit, field, i));
         let scale_sub = self
             .sub_scale
             .as_ref()
-            .map(|field| self.emit_field_number(e, words, block_bit, field, i));
+            .map(|field| self.emit_field_number(e, src, block_bit, field, i));
         let scale = combine_product(e, scale_whole, scale_sub);
         let min_whole = self
             .min
             .as_ref()
-            .map(|field| self.emit_field_number(e, words, block_bit, field, i));
+            .map(|field| self.emit_field_number(e, src, block_bit, field, i));
         let min_sub = self
             .sub_min
             .as_ref()
-            .map(|field| self.emit_field_number(e, words, block_bit, field, i));
+            .map(|field| self.emit_field_number(e, src, block_bit, field, i));
         let min = combine_product(e, min_whole, min_sub);
         Factors { scale, min }
     }
@@ -222,13 +223,13 @@ impl DecodePlan {
     pub(crate) fn emit_value(
         &self,
         e: &mut Emit,
-        words: Local,
+        src: Source,
         block: Local,
         i: Local,
         factors: &Factors,
     ) -> Local {
         let block_bit = self.block_base_bit(e, block);
-        let coded_bits = self.emit_field_bits(e, words, block_bit, &self.codes, i);
+        let coded_bits = self.emit_field_bits(e, src, block_bit, &self.codes, i);
         let value = match self.value {
             ValueMap::Integer => {
                 emit_encoded_number(e, self.codes.encoding, self.codes.width(), coded_bits)

@@ -127,8 +127,8 @@ pub struct RocmContext {
     /// `HSA_AMD_MEMORY_POOL_INFO_SIZE` of the GPU's coarse-grained pool, cached at construction
     /// (capacity is fixed for the process lifetime). A single pool's size, not a sum over every
     /// global pool the agent owns (see [`RocmContext::new`] on the double-counting pitfall). The
-    /// "total" half of the card 030 VRAM metric; see [`Self::vram_budget_bytes`] /
-    /// [`Self::vram_used_bytes`]. 0 if the SIZE query failed (both methods then report unavailable).
+    /// card 030 VRAM budget; see [`Self::vram_budget_bytes`]. 0 if the SIZE query failed (the budget then
+    /// reports unavailable).
     pub(crate) vram_total_bytes: u64,
     /// `HSA_AMD_AGENT_INFO_COMPUTE_UNIT_COUNT` of the GPU agent, cached at construction (card 653);
     /// `None` if the query failed ([`Self::device_caps`] then reports the ROCm default).
@@ -524,6 +524,8 @@ pub(crate) fn caps_from_agent(probe: &AgentProbe<'_>) -> poot_target::DeviceCaps
         },
         tensor_core: poot_target::TensorCoreSupport::from_device_name(probe.isa_name),
         compute_units: probe.compute_units.unwrap_or(defaults.compute_units),
+        // 0 is the failed one-time pool query: unknown, not an empty device.
+        memory_budget_bytes: (probe.vram_total_bytes != 0).then_some(probe.vram_total_bytes),
         ..defaults
     }
 }
@@ -571,6 +573,7 @@ mod caps_tests {
         );
         assert_eq!(caps.tensor_core, TensorCoreSupport::CdnaMfma);
         assert_eq!(caps.compute_units, 7);
+        assert_eq!(caps.memory_budget_bytes, Some(12_345), "the pool size");
         assert_eq!(
             caps.max_workgroup_size,
             [poot_target::AMDGPU_MAX_WORKGROUP_INVOCATIONS; 3]
@@ -621,6 +624,10 @@ mod caps_tests {
             compute_units: None,
         });
         assert_eq!(caps.subgroup, Queried::Unknown);
+        assert_eq!(
+            caps.memory_budget_bytes, None,
+            "a failed pool query is an unknown budget, not an empty device"
+        );
         assert_eq!(
             caps.max_buffer_bytes,
             DeviceCaps::rocm_default().max_buffer_bytes

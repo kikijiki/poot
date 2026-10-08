@@ -1,182 +1,332 @@
-/// Dims for a V4 model. Real reference values (`DeepSeek-V4-Flash-0731/config.json`) are noted per field;
-/// test fixtures use tiny analogs.
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct DeepseekV4Config {
-    pub vocab: usize,
-    pub hidden: usize,
-    pub layers: usize,
-    /// `num_attention_heads` (real: 64 Flash / 128 Pro).
-    pub num_heads: usize,
-    /// `head_dim` (real: 512) - shared by Q, the single K/V head, and the sink's own per-head axis.
-    pub head_dim: usize,
-    /// `qk_rope_head_dim` (real: 64) - width of the TRAILING rotated slice of each `head_dim`-wide head;
-    /// must be even and `<= head_dim` (the interleaved-pair convention's own constraint).
-    pub qk_rope_head_dim: usize,
-    /// `q_lora_rank` (real: 1024) - the low-rank query bottleneck width.
-    pub q_lora_rank: usize,
-    /// `o_groups` (real: 8 Flash / 16 Pro) - number of independent blocks the grouped output projection
-    /// splits `num_heads*head_dim` into. Must divide `num_heads*head_dim`.
-    pub o_groups: usize,
-    /// `o_lora_rank` (real: 1024) - per-group intermediate width of the grouped output projection.
-    pub o_lora_rank: usize,
-    /// MLP intermediate width (`intermediate_size`).
-    pub intermediate: usize,
-    /// `swiglu_limit` (real: 10.0) - `gate_proj`/`up_proj` pre-activations are clamped to this before the
-    /// SiLU-gate multiply.
-    pub swiglu_limit: f32,
-    /// `sliding_window` (real: 128) - local attention window of every `sliding_attention` layer, applied via
-    /// [`sliding_window_floor`] on decode.
-    pub sliding_window: usize,
-    /// `rms_norm_eps` (real: 1e-6) - shared by every weighted and unweighted RMSNorm (`q_b_norm` and mHC's
-    /// `input_norm` are the unweighted ones).
-    pub eps: f32,
-    pub max_pos: usize,
-    /// `rope_theta` (real: 10000) - RoPE base of `sliding_attention` layers (CSA/HCA layers use
-    /// `compress_rope_theta`).
-    pub rope_theta: f32,
-    /// `hc_mult` (real: 4) - `n_hc`, the number of parallel residual streams mHC widens to.
-    pub hc_mult: usize,
-    /// `hc_sinkhorn_iters` (real: 20) - Sinkhorn-Knopp round count for `comb`'s doubly-stochastic
-    /// projection (asymmetric round counting, see the module doc).
-    pub hc_sinkhorn_iters: usize,
-    /// `hc_eps` (real: 1e-6) - floor added after every Sinkhorn normalize division and after the `pre`/`comb`
-    /// sigmoid/softmax outputs.
-    pub hc_eps: f32,
-    /// `compress_rates["heavily_compressed_attention"]` (real: 128, `m'`) - HCA's non-overlapping pooling-window
-    /// width. [`trace_deepseek4_hca_decode`]'s `cap` must be an exact multiple of it. Prefill pads `seq_len`
-    /// internally instead (see [`deepseek4_prefill_pad_len`]).
-    pub hca_compress_rate: usize,
-    /// `compress_rope_theta` (real: 160000) - RoPE base CSA/HCA layers use for everything on that layer (Q,
-    /// local K/V, compressed entries, output derotation), replacing `rope_theta`.
-    pub compress_rope_theta: f32,
-    /// `compress_rates["compressed_sparse_attention"]` (real: 4, `m`) - CSA's overlapping-window pooling stride
-    /// (see [`csa_overlap_pool`]).
-    pub csa_compress_rate: usize,
-    /// `index_n_heads` (real: 64) - Lightning Indexer head count (CSA only, independent of `num_heads`).
-    pub index_n_heads: usize,
-    /// `index_head_dim` (real: 128) - per-indexer-head query/key width. The indexer runs its own overlapping-window
-    /// compressor at this width. Must be `>= qk_rope_head_dim` (the layer's trailing-slice RoPE is reused).
-    pub index_head_dim: usize,
-    /// `index_topk` (real: 512) - top-`k` compressed entries selected per query, clamped to
-    /// `min(index_topk, n_windows)` at trace time.
-    pub index_topk: usize,
-    /// `n_routed_experts` (real: 256) - routed experts per layer. Every V4 layer is MoE-routed.
-    pub routed_experts: usize,
-    /// `num_experts_per_tok` (real: 6) - selected routed experts per token, both layer rows.
-    pub experts_per_tok: usize,
-    /// `moe_intermediate_size` (real: 2048) - per-expert SwiGLU width, shared by routed and shared experts.
-    pub moe_intermediate: usize,
-    /// Layers `0..hash_router_layers` (real: 3) take expert ids from `ffn.gate.tid2eid`; the rest use a
-    /// `ffn.gate.bias`-selected top-k. The checkpoint manifest must yield the same partition.
-    pub hash_router_layers: usize,
-    /// Fixed multiplier applied to the normalized selected route weights (real: 1.5).
-    pub route_scale: f32,
-}
+//! DeepSeek-V4's typed config: every value checked once, here, so tracing cannot fail on it. Every
+//! dimension, count and the per-layer attention schedule comes from the checkpoint's `config.json`:
+//! a fine-tune with fewer layers, other compression rates or other expert counts is the same family.
 
-#[cfg(test)]
-impl DeepseekV4Config {
-    pub fn attn_scale(&self) -> f32 {
-        1.0 / (self.head_dim as f32).sqrt()
-    }
+use std::collections::BTreeSet;
+use std::num::NonZeroUsize;
 
-    #[cfg(test)]
-    pub(crate) fn in_per_group(&self) -> usize {
-        assert!(
-            (self.num_heads * self.head_dim).is_multiple_of(self.o_groups),
-            "o_groups must divide num_heads*head_dim"
-        );
-        (self.num_heads * self.head_dim) / self.o_groups
-    }
+use poot_graph_ir::rope_table::RopeFlavor;
 
-    #[cfg(test)]
-    pub(crate) fn hc_mix_dim(&self) -> usize {
-        (2 + self.hc_mult) * self.hc_mult
-    }
-}
+use super::FAMILY;
+use crate::components::dims::{Field, Fields};
+use crate::components::ffn::Glu;
+use crate::components::mhc::MhcParams;
+use crate::components::moe::MoeParams;
+use crate::components::norm::NormParams;
+use crate::components::rope::RopeParams;
+use crate::components::router::{RouterBias, RouterKind};
+use crate::components::standard::ParamError;
+use crate::model::{ConfigReason, ModelError};
+use crate::registry::RawConfig;
 
-/// One layer's `layer_types` entry, fixed at model-build time by `config.layer_types[layer_idx]`.
-#[cfg(test)]
+/// One layer's attention, from its `compress_ratios` entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum V4LayerKind {
-    /// `"sliding_attention"` - plain local window, no compressed branch.
+pub enum LayerKind {
+    /// Ratio `0`: the local sliding window only.
     Sliding,
-    /// `"compressed_sparse_attention"` (CSA) - overlapping-window pooling, Lightning-Indexer top-k selected.
+    /// The compressed-sparse-attention ratio: overlapping-window compression of the keys and a
+    /// lightning indexer that keeps the `index_topk` best compressed entries per query.
     Csa,
-    /// `"heavily_compressed_attention"` (HCA) - non-overlapping-window pooling, dense (no top-k).
+    /// The heavily-compressed-attention ratio: non-overlapping windows, every complete one attended.
     Hca,
 }
 
-/// Decode a per-layer `compress_ratios` schedule (`0`/`4`/`128` on `DeepSeek-V4-Flash-0731`) into one
-/// [`V4LayerKind`] per layer. `cfg`'s `csa_compress_rate`/`hca_compress_rate` supply the 4/128 mapping, so toy
-/// configs with other rates parse too. Panics on a ratio matching none of `0`, `csa_compress_rate`,
-/// `hca_compress_rate`.
-#[cfg(test)]
-pub(crate) fn parse_compress_ratios(cfg: &DeepseekV4Config, ratios: &[usize]) -> Vec<V4LayerKind> {
-    ratios
-        .iter()
-        .map(|&r| {
-            if r == 0 {
-                V4LayerKind::Sliding
-            } else if r == cfg.csa_compress_rate {
-                V4LayerKind::Csa
-            } else if r == cfg.hca_compress_rate {
-                V4LayerKind::Hca
+/// The attention dimensions every layer shares.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct AttentionDims {
+    pub heads: usize,
+    pub head_dim: usize,
+    /// The trailing `rope_dim` of each head rotate (interleaved pairs).
+    pub rope_dim: usize,
+    pub q_lora: usize,
+    pub o_groups: usize,
+    pub o_lora: usize,
+    pub window: usize,
+    /// `head_dim ** -0.5`.
+    pub scale: f32,
+}
+
+impl AttentionDims {
+    /// The width of one output group: `heads * head_dim / o_groups`.
+    pub fn in_per_group(&self) -> usize {
+        self.heads * self.head_dim / self.o_groups
+    }
+}
+
+/// The lightning indexer's dimensions, present when any layer is [`LayerKind::Csa`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct IndexerDims {
+    pub heads: usize,
+    pub head_dim: usize,
+    pub topk: usize,
+}
+
+/// DeepSeek-V4's config.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeepseekV4Config {
+    pub(super) vocab: usize,
+    pub(super) width: usize,
+    pub(super) max_positions: usize,
+    pub(super) kinds: Vec<LayerKind>,
+    pub(super) csa_rate: usize,
+    pub(super) hca_rate: usize,
+    pub(super) attn: AttentionDims,
+    pub(super) indexer: Option<IndexerDims>,
+    pub(super) norm: NormParams,
+    /// The rotation of the sliding layers and of the compressed layers (their own base).
+    pub(super) rope: RopeParams,
+    pub(super) compress_rope: RopeParams,
+    pub(super) mhc: MhcParams,
+    /// The routed block of a score-routed layer, and of a hash-routed one (no selection bias).
+    pub(super) score_moe: MoeParams,
+    pub(super) hash_moe: MoeParams,
+    /// Layers `0..hash_layers` take their experts from the token-to-experts table.
+    pub(super) hash_layers: usize,
+    pub(super) route_scale: f32,
+    pub(super) granule: NonZeroUsize,
+    pub(super) eos: BTreeSet<u32>,
+    pub(super) bos: Option<u32>,
+}
+
+impl DeepseekV4Config {
+    pub fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
+        // The family is HF-only: a GGUF never names it.
+        let RawConfig::HfJson { config, .. } = raw else {
+            return Err(ModelError::Config {
+                family: FAMILY,
+                field: "general.architecture",
+                reason: ConfigReason::Unsupported,
+            });
+        };
+        let fields = Fields::new(raw, FAMILY);
+        let param = |e: ParamError| e.for_family(FAMILY);
+        let count = |key: &'static str| fields.count(Field::hf(key), None);
+        let float = |key: &'static str, default: f32| fields.float(Field::hf(key), default);
+
+        // The router and the scaling this family traces: refuse a config that asks for another.
+        let scoring = config.get("scoring_func").filter(|v| !v.is_null());
+        if scoring.is_some_and(|v| v.as_str() != Some("sqrtsoftplus")) {
+            return Err(fields.error("scoring_func", ConfigReason::Unsupported));
+        }
+        let max_positions = count("max_position_embeddings")?;
+        if !matches!(fields.hf_rope_flavor(max_positions)?, RopeFlavor::Plain) {
+            return Err(fields.error("rope_scaling", ConfigReason::Unsupported));
+        }
+
+        let width = count("hidden_size")?;
+        let layers = count("num_hidden_layers")?;
+        let heads = count("num_attention_heads")?;
+        let head_dim = count("head_dim")?;
+        let rope_dim = count("qk_rope_head_dim")?;
+        if rope_dim > head_dim {
+            return Err(fields.error("qk_rope_head_dim", ConfigReason::Exceeds { max: head_dim }));
+        }
+        let o_groups = count("o_groups")?;
+        if !(heads * head_dim).is_multiple_of(o_groups) {
+            return Err(fields.error("o_groups", ConfigReason::NotDivisible { by: o_groups }));
+        }
+        let attn = AttentionDims {
+            heads,
+            head_dim,
+            rope_dim,
+            q_lora: count("q_lora_rank")?,
+            o_groups,
+            o_lora: count("o_lora_rank")?,
+            window: count("sliding_window")?,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+        };
+
+        let rates = config.get("compress_rates").filter(|v| !v.is_null());
+        let rate = |key: &'static str, default: usize| -> Result<usize, ModelError> {
+            match rates.and_then(|r| r.get(key)) {
+                None => Ok(default),
+                Some(v) => v
+                    .as_u64()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .filter(|&n| n > 0)
+                    .ok_or(fields.error("compress_rates", ConfigReason::WrongType)),
+            }
+        };
+        let csa_rate = rate("compressed_sparse_attention", 4)?;
+        let hca_rate = rate("heavily_compressed_attention", 128)?;
+        if csa_rate == hca_rate {
+            return Err(fields.error("compress_rates", ConfigReason::Unsupported));
+        }
+        let kinds = layer_kinds(&fields, layers, csa_rate, hca_rate)?;
+        let granule = granule(&fields, &kinds, csa_rate, hca_rate)?;
+        let indexer = kinds
+            .contains(&LayerKind::Csa)
+            .then(|| -> Result<IndexerDims, ModelError> {
+                let dims = IndexerDims {
+                    heads: count("index_n_heads")?,
+                    head_dim: count("index_head_dim")?,
+                    topk: count("index_topk")?,
+                };
+                if dims.head_dim < rope_dim {
+                    return Err(
+                        fields.error("index_head_dim", ConfigReason::Exceeds { max: rope_dim })
+                    );
+                }
+                Ok(dims)
+            })
+            .transpose()?;
+
+        let eps = float("rms_norm_eps", 1e-6)?;
+        let norm = NormParams::new(eps).map_err(param)?;
+        let rope = |theta: f32| {
+            RopeParams::new(rope_dim, theta, &RopeFlavor::Plain).map(RopeParams::interleaved)
+        };
+        let mhc = MhcParams::new(
+            count("hc_mult")?,
+            eps,
+            float("hc_eps", 1e-6)?,
+            count("hc_sinkhorn_iters")?,
+        )
+        .map_err(param)?;
+
+        let hash_layers = fields
+            .opt_u64(Field::hf("num_hash_layers"))?
+            .map_or(Ok(0), |n| {
+                usize::try_from(n)
+                    .ok()
+                    .filter(|&n| n <= layers)
+                    .ok_or(fields.error("num_hash_layers", ConfigReason::Exceeds { max: layers }))
+            })?;
+        let route_scale = float("routed_scaling_factor", 1.0)?;
+        let moe_inter = count("moe_intermediate_size")?;
+        let shared = fields.count(Field::hf("n_shared_experts"), Some(1))?;
+        let glu = Glu::clamped_silu(float("swiglu_limit", 10.0)?).map_err(param)?;
+        let moe = |selection_bias: bool| -> Result<MoeParams, ModelError> {
+            let params = MoeParams::new(
+                FAMILY,
+                width,
+                moe_inter,
+                count("n_routed_experts")?,
+                count("num_experts_per_tok")?,
+                RouterKind::SqrtSoftplusBiasedTopK,
+            )?
+            .with_shared(moe_inter * shared)
+            .map_err(param)?
+            .with_routed_scale(route_scale)
+            .map_err(param)?
+            .with_glu(glu);
+            if selection_bias {
+                params
+                    .with_router_bias(RouterBias::SelectionOnly)
+                    .map_err(param)
             } else {
-                panic!(
-                    "parse_compress_ratios: ratio {r} matches neither 0, csa_compress_rate ({}), \
-nor hca_compress_rate ({})",
-                    cfg.csa_compress_rate, cfg.hca_compress_rate
-                )
+                Ok(params)
+            }
+        };
+
+        Ok(Self {
+            vocab: fields.vocab()?,
+            width,
+            max_positions,
+            kinds,
+            csa_rate,
+            hca_rate,
+            attn,
+            indexer,
+            norm,
+            rope: rope(float("rope_theta", 10_000.0)?).map_err(param)?,
+            compress_rope: rope(float("compress_rope_theta", 160_000.0)?).map_err(param)?,
+            mhc,
+            score_moe: moe(true)?,
+            hash_moe: moe(false)?,
+            hash_layers,
+            route_scale,
+            granule,
+            eos: fields.eos(None)?,
+            bos: fields.bos()?,
+        })
+    }
+
+    /// Whether layer `layer` routes by the token-to-experts table.
+    pub(super) fn is_hash_routed(&self, layer: usize) -> bool {
+        layer < self.hash_layers
+    }
+
+    /// The compression rate of a layer of `kind`; `None` for a sliding layer.
+    pub(super) fn rate(&self, kind: LayerKind) -> Option<usize> {
+        match kind {
+            LayerKind::Sliding => None,
+            LayerKind::Csa => Some(self.csa_rate),
+            LayerKind::Hca => Some(self.hca_rate),
+        }
+    }
+
+    /// The rotation of a layer of `kind`: the compressed layers use their own base for everything
+    /// on the layer.
+    pub(super) fn rope_of(&self, kind: LayerKind) -> RopeParams {
+        match kind {
+            LayerKind::Sliding => self.rope,
+            LayerKind::Csa | LayerKind::Hca => self.compress_rope,
+        }
+    }
+}
+
+/// The kind of each layer, from the first `layers` entries of `compress_ratios` (the rest of the
+/// list covers the checkpoint's separate multi-token-prediction modules): `0` is a sliding layer, a
+/// ratio equal to a compression rate that rate's kind. Any other ratio, or a list shorter than the
+/// layer count, is refused.
+fn layer_kinds(
+    fields: &Fields<'_>,
+    layers: usize,
+    csa_rate: usize,
+    hca_rate: usize,
+) -> Result<Vec<LayerKind>, ModelError> {
+    const KEY: &str = "compress_ratios";
+    let RawConfig::HfJson { config, .. } = fields.raw() else {
+        unreachable!("from_raw reads only an HF config")
+    };
+    let ratios = config
+        .get(KEY)
+        .filter(|v| !v.is_null())
+        .ok_or(fields.error(KEY, ConfigReason::Missing))?
+        .as_array()
+        .ok_or(fields.error(KEY, ConfigReason::WrongType))?;
+    if ratios.len() < layers {
+        return Err(fields.error(KEY, ConfigReason::Length { expected: layers }));
+    }
+    ratios[..layers]
+        .iter()
+        .map(|ratio| {
+            let ratio = ratio
+                .as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or(fields.error(KEY, ConfigReason::WrongType))?;
+            match ratio {
+                0 => Ok(LayerKind::Sliding),
+                r if r == csa_rate => Ok(LayerKind::Csa),
+                r if r == hca_rate => Ok(LayerKind::Hca),
+                _ => Err(fields.error(KEY, ConfigReason::Unsupported)),
             }
         })
         .collect()
 }
 
-#[cfg(test)]
-pub(crate) fn gcd(a: usize, b: usize) -> usize {
+/// The least common multiple of the compression rates a schedule uses (one when it has none): a
+/// prefill step covers whole compression windows of every layer, and the tokens after the last
+/// whole window of a prompt run as decode steps.
+fn granule(
+    fields: &Fields<'_>,
+    kinds: &[LayerKind],
+    csa_rate: usize,
+    hca_rate: usize,
+) -> Result<NonZeroUsize, ModelError> {
+    let overflow = || fields.error("compress_rates", ConfigReason::Exceeds { max: usize::MAX });
+    let mut granule = 1usize;
+    for rate in [(LayerKind::Csa, csa_rate), (LayerKind::Hca, hca_rate)]
+        .into_iter()
+        .filter_map(|(kind, rate)| kinds.contains(&kind).then_some(rate))
+    {
+        let gcd = gcd(granule, rate);
+        granule = (granule / gcd).checked_mul(rate).ok_or_else(overflow)?;
+    }
+    Ok(NonZeroUsize::new(granule).expect("a product of nonzero rates"))
+}
+
+fn gcd(a: usize, b: usize) -> usize {
     if b == 0 { a } else { gcd(b, a % b) }
-}
-
-#[cfg(test)]
-pub(crate) fn lcm(a: usize, b: usize) -> usize {
-    a / gcd(a, b) * b
-}
-
-/// Smallest length `>= seq_len` that is a valid PREFILL length for a schedule whose active compressed-
-/// attention kinds are `has_hca`/`has_csa`: `seq_len` rounded up to a multiple of `lcm` of the active compress
-/// rates. The prefill tracers build the graph at this padded length and slice the final logits at
-/// `seq_len - 1`.
-///
-/// # Why padding is inert for every real query position
-///
-/// 1. The local/sliding branch (the `mask.prefill` step input) is strictly causal, so a real query never sees an
-///    appended trailing position.
-/// 2. In the compressed branch, padding tokens only enter the last window, and that window is masked out for
-///    every real query. Windows are aligned in blocks of `rate` from 0, and `padded_len < seq_len + rate`, so
-///    every earlier window is built from real tokens only. The last window's causal-completeness threshold
-///    (`[hca,csa].block_bias`) is its last source position `padded_len - 1 >= seq_len > i` for every real
-///    query `i`. That `-1e30` bias is in the final combined mask of every layer kind (HCA's `combined_mask`,
-///    CSA's `csa_topk_mask`, which re-adds the causal term after top-k, so a top-k tie cannot unmask it).
-///    The last window's pooled value may be anything finite.
-///
-/// See `deepseek4_prefill_pad_len_is_inert_for_real_prefix`.
-#[cfg(test)]
-pub(crate) fn deepseek4_prefill_pad_len(
-    seq_len: usize,
-    cfg: &DeepseekV4Config,
-    has_hca: bool,
-    has_csa: bool,
-) -> usize {
-    let rate = match (has_hca, has_csa) {
-        (true, true) => lcm(cfg.hca_compress_rate, cfg.csa_compress_rate),
-        (true, false) => cfg.hca_compress_rate,
-        (false, true) => cfg.csa_compress_rate,
-        (false, false) => return seq_len,
-    };
-    assert!(
-        rate > 0,
-        "deepseek4_prefill_pad_len: an active compress rate must be nonzero"
-    );
-    seq_len.div_ceil(rate) * rate
 }

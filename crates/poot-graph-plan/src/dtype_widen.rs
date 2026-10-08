@@ -4,7 +4,7 @@
 //! match the output dtype unless a tensor-core arm (`amd_tc` on AmdGcn/RDNA3, `tc` on Nvptx) fires;
 //! both require bf16 operands with 16-aligned M/N/K and no batch dims. Decode is always a GEMV
 //! (`M == 1`), never 16-aligned, so a decode-time mixed-dtype matmul can never take the tensor-core
-//! path. `Runner::load` types every projection weight `DType::BF16` for any natively-bf16 safetensors
+//! path. The loader types every projection weight `DType::BF16` for any natively-bf16 safetensors
 //! checkpoint (independent of `to_mixed_bf16`), so a decode matmul's weight is BF16 while the
 //! activation/output stay F32, and the planner's guard panics on every backend for such a checkpoint.
 //!
@@ -28,10 +28,10 @@ use poot_graph_ir::graph::{Storage, ValueMeta};
 use poot_graph_ir::op::{ContractionHead, OpKind};
 use poot_graph_ir::types::TensorType;
 use poot_graph_ir::{Eqn, Graph, Operand, ValidationChannel, ValueId};
-use poot_target::{Backend, DECODE_GEMV_CHUNK_TRIGGER, DeviceCaps, TensorCoreSupport};
+use poot_target::{Backend, TensorCoreSupport};
 use poot_tensor::DType;
 
-use crate::{GEMV_TILE, Layout, numel};
+use crate::Layout;
 use std::collections::{HashMap, HashSet};
 
 /// Whether `OpKind::MatMul`'s AMD WMMA tensor-core arm (`plan_eqn`'s local `amd_tc`)
@@ -121,8 +121,8 @@ pub fn matmul_tensor_core_eligible(
 ///
 /// - `SpirvVulkan`: always packed. SPIR-V has no scalar bf16, so a packed reader is the only reader; an
 ///   operation with no packed reader refuses at planning (the planner's typed `DtypeLowering`).
-/// - `AmdGcn`: packed when [`bf16_const_feeds_decode_bf16_gemv`] or [`bf16_const_feeds_only_packed_readers`]
-///   holds; otherwise native, the lane the scalar-bf16 matmul bodies read.
+/// - `AmdGcn`: packed when [`bf16_const_feeds_only_packed_readers`] holds; otherwise native, the lane the
+///   scalar-bf16 matmul bodies read.
 /// - `Nvptx`: packed exactly when [`bf16_const_feeds_only_packed_readers`] holds; otherwise native.
 ///
 /// The one decision the storage plan (`value_storage_kind`) and the cast planner share, so the lane a
@@ -132,149 +132,41 @@ pub(crate) fn bf16_const_is_packed<V: ValidationChannel>(
     views: &HashMap<ValueId, Layout>,
     id: ValueId,
     backend: Backend,
-    caps: &DeviceCaps,
 ) -> bool {
     match backend {
         Backend::SpirvVulkan => true,
-        Backend::AmdGcn(_) => {
-            bf16_const_feeds_decode_bf16_gemv(g, id, backend, caps)
-                || bf16_const_feeds_only_packed_readers(g, views, id)
-        }
+        Backend::AmdGcn(_) => bf16_const_feeds_only_packed_readers(g, views, id),
         Backend::Nvptx => bf16_const_feeds_only_packed_readers(g, views, id),
     }
 }
 
-/// Whether the decode-GEMV body takes its BF16-weight (packed-u32, in-kernel widen) variant for this
-/// matmul, the dtype-driven sibling of [`matmul_tensor_core_eligible`]. Shared by `plan_eqn`'s
-/// mixed-dtype guard and GEMV body selection, [`bf16_const_is_packed`] (the weight's packed lane) and
-/// [`widen_mismatched_matmul_dtypes`] (skip the widening `Cast`).
+/// Whether this matmul is a decode projection over a BF16 `[K, N]` weight on a backend whose BF16 lane is packed
+/// (`SpirvVulkan`, `AmdGcn`): `F32 act x BF16 weight -> F32 out`, `M == 1`, a rank-2 weight.
 ///
-/// True iff:
-/// - `backend` is `SpirvVulkan` or `AmdGcn` (NVPTX keeps the cast path; PTX has two-byte bf16
-///   storage),
-/// - the operands are the decode projection shape `F32 act x BF16 weight -> F32 out`,
-/// - the shape is a decode GEMV (`M == 1`, rank-2 `[K, N]` weight, the tiled grid fits a
-///   conservative real-hardware-sized bound; see the body comment),
-/// - and on `SpirvVulkan` the output is at or under [`DECODE_GEMV_CHUNK_TRIGGER`], because the
-///   over-trigger chunk arm is still `kg::gemv_lds` (f32 weight only).
+/// Such a projection has no lowering. A one-workgroup-per-column Gemv over `[K, N]` reads the weight at a stride
+/// of `N` elements per lane (card 035), and the column-tile body that used to avoid that is retired; the
+/// supported orientation is the checkpoint's `[N, K]` read through a `Transpose`, which `compile` folds into the
+/// dense Gemv. [`widen_mismatched_matmul_dtypes`] leaves the mixed-dtype matmul in the graph so that `plan_eqn`
+/// refuses it with `Capability::DtypeLowering`, rather than materializing a widened F32 copy of the weight.
 ///
-/// Ten scalar/caps arguments mirror [`matmul_tensor_core_eligible`]'s shape-of-call style; splitting a
-/// struct would not remove any field the three call sites (plan, storage, widen) each already have.
-#[allow(clippy::too_many_arguments)]
-pub fn matmul_bf16_decode_gemv_eligible(
+/// NVPTX is a deliberate asymmetry: it keeps the widening cast (it has two-byte BF16 storage and no packed lane),
+/// so a `[K, N]` BF16 decode weight is materialized as an F32 copy there, doubling its bytes. That is a backend
+/// capability difference, not a bug, and there is no PTX hardware row for `[K, N]` BF16 decode (the supported
+/// `[N, K]` orientation is the dense Gemv on every backend).
+pub fn matmul_bf16_column_gemv(
     backend: Backend,
     a_dtype: DType,
     b_dtype: DType,
     odt: DType,
     m: usize,
-    n: usize,
-    k: usize,
     weight_rank: usize,
-    out_numel: usize,
-    caps: &DeviceCaps,
 ) -> bool {
-    if !matches!(backend, Backend::SpirvVulkan | Backend::AmdGcn(_)) {
-        return false;
-    }
-    if a_dtype != DType::F32 || b_dtype != DType::BF16 || odt != DType::F32 {
-        return false;
-    }
-    if m != 1 || n == 0 || k == 0 || weight_rank != 2 || out_numel == 0 {
-        return false;
-    }
-    // This is a pure graph rewrite deciding only whether the BF16-weight decode GEMV is eligible at
-    // all; the real, target-aware dispatch bound is `decode_gemv_plan`'s own `caps.max_grid` split,
-    // which runs later and is authoritative regardless of this guess. Reading the same measured
-    // `caps.max_grid[0]` here (no baked `65_535` literal survives in planning) keeps this
-    // eligibility check from diverging wildly from what `decode_gemv_plan` will actually do on this
-    // device.
-    let grid_cap = caps.max_grid[0] as usize;
-    let nwg = out_numel.div_ceil(GEMV_TILE).max(1);
-    let x = nwg.clamp(1, grid_cap);
-    if nwg.div_ceil(x) > grid_cap {
-        return false;
-    }
-    if backend == Backend::SpirvVulkan && out_numel as u64 > DECODE_GEMV_CHUNK_TRIGGER {
-        return false;
-    }
-    true
-}
-
-/// Shape/dtype projection of [`matmul_bf16_decode_gemv_eligible`] for one eqn of `g` (the weight is
-/// `inputs[1]`). `None` when the eqn is not a `MatMul` with the shape the predicate needs.
-fn matmul_bf16_decode_gemv_eligible_in<V: ValidationChannel>(
-    g: &Graph<V>,
-    backend: Backend,
-    eqn: &Eqn,
-    caps: &DeviceCaps,
-) -> Option<bool> {
-    if !matches!(eqn.op, OpKind::MatMul) || eqn.inputs.len() < 2 {
-        return None;
-    }
-    let (Operand::Value(a), Operand::Value(b)) = (&eqn.inputs[0], &eqn.inputs[1]) else {
-        return None;
-    };
-    let out_shape = &g.aval(eqn.out).shape;
-    let r = out_shape.len();
-    if r < 2 {
-        return None;
-    }
-    let (m, n) = (out_shape[r - 2], out_shape[r - 1]);
-    let k = g.aval(*a).shape.last().copied().unwrap_or(0);
-    Some(matmul_bf16_decode_gemv_eligible(
-        backend,
-        g.aval(*a).dtype,
-        g.aval(*b).dtype,
-        g.aval(eqn.out).dtype,
-        m,
-        n,
-        k,
-        g.aval(*b).shape.len(),
-        numel(out_shape),
-        caps,
-    ))
-}
-
-/// True if `id` is the weight (`inputs[1]`) of every consumer, and each of those consumers is a
-/// decode GEMV that [`matmul_bf16_decode_gemv_eligible`] selects the packed-BF16 body for. A value
-/// with no consumer is not eligible (same vacuous-truth rule as
-/// [`bf16_const_feeds_only_packed_readers`]).
-///
-/// The decode GEMV weight is read as raw checkpoint bytes packed two-per-u32 and the bf16 GEMV body widens
-/// in-register. Lives here so storage, widen and `plan_eqn` cannot disagree about which consts are
-/// physically narrow.
-pub fn bf16_const_feeds_decode_bf16_gemv<V: ValidationChannel>(
-    g: &Graph<V>,
-    id: ValueId,
-    backend: Backend,
-    caps: &DeviceCaps,
-) -> bool {
-    if g.liveness_roots().any(|root| root == id) {
-        return false;
-    }
-    let mut consumed = false;
-    for eqn in &g.eqns {
-        let mut hits = 0usize;
-        for operand in &eqn.inputs {
-            if matches!(operand, Operand::Value(v) if *v == id) {
-                hits += 1;
-            }
-        }
-        if hits == 0 {
-            continue;
-        }
-        consumed = true;
-        // The weight must be inputs[1] and the only use of `id` in this eqn (an activation or bias
-        // position would need a different upload contract).
-        if hits != 1 || !matches!(eqn.inputs.get(1), Some(Operand::Value(v)) if *v == id) {
-            return false;
-        }
-        match matmul_bf16_decode_gemv_eligible_in(g, backend, eqn, caps) {
-            Some(true) => {}
-            _ => return false,
-        }
-    }
-    consumed
+    matches!(backend, Backend::SpirvVulkan | Backend::AmdGcn(_))
+        && a_dtype == DType::F32
+        && b_dtype == DType::BF16
+        && odt == DType::F32
+        && m == 1
+        && weight_rank == 2
 }
 
 /// Whether `op` reads its operand `position` as packed BF16 lanes on a typed value walk. One row per kernel
@@ -366,15 +258,11 @@ pub fn bf16_const_feeds_only_packed_readers<V: ValidationChannel>(
 /// bit-exact arithmetic that walk's contract requires. One function for every caller closes the R481-003
 /// drift: wgpu's copy ran `lower_nonlast_reduces`, ROCm's and PTX's did not, so a MiniMax-M2 decode graph
 /// planned on wgpu and refused on ROCm and PTX for a pass gap, not a real capability difference.
-pub fn prepare_target_graph<V: ValidationChannel>(
-    g: &Graph<V>,
-    backend: Backend,
-    caps: &DeviceCaps,
-) -> Graph<V> {
+pub fn prepare_target_graph<V: ValidationChannel>(g: &Graph<V>, backend: Backend) -> Graph<V> {
     let folded = fold_dense_contractions(g);
     let folded = fold_dense_bf16_row_gathers(&folded);
     let folded = lower_nonlast_reduces(&folded);
-    widen_mismatched_matmul_dtypes(&folded, backend, caps)
+    widen_mismatched_matmul_dtypes(&folded, backend)
 }
 
 /// A rewritten equation's operand map, keyed by the `ValueId` it reads: which equation index
@@ -419,6 +307,10 @@ fn value_input(eqn: &Eqn, position: usize) -> Option<ValueId> {
 /// - and, for an F16 weight (Card 1007), the weight is a non-escaping const every consumer of which is a
 ///   transpose this pass folds, so its one packed storage serves every reader.
 ///
+/// The grouped spelling `MatMul(a, Transpose([0, 2, 1], Reshape([G, N, K], w)))` over a rank-2 `[G * N, K]`
+/// weight folds the same way into one [`poot_graph_ir::OpKind::GroupedDenseContraction`], the reshape being
+/// dropped with the transpose (the reshape's value is single-use and not an escape, like the transpose's).
+///
 /// Value ids are preserved: the contraction keeps the matmul's own `out` and only the dead transpose
 /// equation is dropped, so input, state, and validation bindings stay valid. Idempotent: a folded
 /// graph has no `Transpose` left to match.
@@ -453,25 +345,72 @@ pub(crate) fn fold_dense_contractions<V: ValidationChannel>(g: &Graph<V>) -> Gra
         let OpKind::Transpose { perm } = &g.eqns[transpose_index].op else {
             continue;
         };
-        if perm.as_slice() != [1, 0]
-            || consumers[transposed].len() != 1
-            || is_graph_escape(g, transposed)
-        {
+        if consumers[transposed].len() != 1 || is_graph_escape(g, transposed) {
             continue;
         }
-        let Some(weight) = value_input(&g.eqns[transpose_index], 0) else {
+        let Some(source) = value_input(&g.eqns[transpose_index], 0) else {
             continue;
+        };
+        // The folded equations: the transpose, and for a grouped weight the reshape that blocks it.
+        let (candidate, weight, folded) = match perm.as_slice() {
+            [1, 0] => {
+                let dtype = g.aval(source).dtype;
+                (
+                    OpKind::DenseContraction { weight: dtype },
+                    source,
+                    vec![transpose_index],
+                )
+            }
+            [0, 2, 1] => {
+                let Some(&reshape_index) = producer.get(&source) else {
+                    continue;
+                };
+                let OpKind::Reshape { .. } = &g.eqns[reshape_index].op else {
+                    continue;
+                };
+                if consumers[source].len() != 1 || is_graph_escape(g, source) {
+                    continue;
+                }
+                let Some(weight) = value_input(&g.eqns[reshape_index], 0) else {
+                    continue;
+                };
+                let (blocks, stored) = (g.aval(source), g.aval(weight));
+                let &[groups, ..] = blocks.shape.as_slice() else {
+                    continue;
+                };
+                if groups == 0 {
+                    continue;
+                }
+                // Only a BF16 weight has grouped device rows; any other dtype keeps the traced chain.
+                if stored.dtype != DType::BF16 {
+                    continue;
+                }
+                // The reshape must only block the stored `[groups * N, K]` rows into `[groups, N, K]`.
+                if stored.rank() != 2
+                    || blocks.shape != [groups, stored.shape[0] / groups, stored.shape[1]]
+                {
+                    continue;
+                }
+                (
+                    OpKind::GroupedDenseContraction {
+                        weight: stored.dtype,
+                        groups,
+                    },
+                    weight,
+                    vec![transpose_index, reshape_index],
+                )
+            }
+            _ => continue,
         };
         let dtype = g.aval(weight).dtype;
         if !poot_graph_ir::DENSE_CONTRACTION_WEIGHT_DTYPES.contains(&dtype) {
             continue;
         }
-        let candidate = OpKind::DenseContraction { weight: dtype };
         let candidate_inputs = [g.aval(activation).clone(), g.aval(weight).clone()];
         if candidate.infer(&candidate_inputs).ok().as_ref() != Some(g.aval(matmul.out)) {
             continue;
         }
-        removed.insert(transpose_index);
+        removed.extend(folded.iter().copied());
         replacements.insert(
             matmul_index,
             Eqn {
@@ -482,7 +421,7 @@ pub(crate) fn fold_dense_contractions<V: ValidationChannel>(g: &Graph<V>) -> Gra
             },
         );
         if dtype == DType::F16 {
-            f16_folds.push((matmul_index, transpose_index, weight));
+            f16_folds.push((matmul_index, folded, weight));
         }
     }
 
@@ -502,10 +441,12 @@ pub(crate) fn fold_dense_contractions<V: ValidationChannel>(g: &Graph<V>) -> Gra
                     .any(|consumer| !removed.contains(consumer))
         })
         .collect();
-    for &(matmul_index, transpose_index, weight) in &f16_folds {
-        if unpackable.contains(&weight) {
-            replacements.remove(&matmul_index);
-            removed.remove(&transpose_index);
+    for (matmul_index, folded, weight) in &f16_folds {
+        if unpackable.contains(weight) {
+            replacements.remove(matmul_index);
+            for index in folded {
+                removed.remove(index);
+            }
         }
     }
 
@@ -858,7 +799,7 @@ pub(crate) fn lower_nonlast_reduces<V: ValidationChannel>(g: &Graph<V>) -> Graph
 ///
 /// `Slice` is covered the same way (evidence: `ptx_prefill_check_bf16`'s per-eqn scan): RoPE's
 /// `cos`/`sin` tables are `TensorType::f32(...)` unconditionally at trace (like every norm gamma and
-/// bias; see `Qwen2Config::proj_dtype`), and `rope_prefill`'s `cos[0..n]`/`sin[0..n]` is a direct
+/// bias), and `rope_prefill`'s `cos[0..n]`/`sin[0..n]` is a direct
 /// `Slice` of that raw Const. `plan_eqn`'s `Slice` arm has the same no-guard shape as `Gather`'s (a
 /// zero-cost `Plan::View` or an imported kernel, both keyed off `fty(odt)` alone), with the same
 /// silent corruption (`slice ax=0 0..5 ... maxabs=2.59e38 nonfinite=20/320`). The non-axis-0 general
@@ -869,7 +810,6 @@ pub(crate) fn lower_nonlast_reduces<V: ValidationChannel>(g: &Graph<V>) -> Graph
 pub fn widen_mismatched_matmul_dtypes<V: ValidationChannel>(
     g: &Graph<V>,
     backend: Backend,
-    caps: &DeviceCaps,
 ) -> Graph<V> {
     // Card 273: widen a single-value-operand movement op (`Gather{axis:0}`, `Slice`) whose one operand
     // is directly a mismatched-dtype `Storage::Const`: inserts a Cast on that operand only, so the
@@ -946,21 +886,9 @@ pub fn widen_mismatched_matmul_dtypes<V: ValidationChannel>(
                 out.eqns.push(eqn.clone());
                 continue;
             }
-            // The decode bf16 GEMV reads the weight as packed u32 lanes and widens in-register; a
-            // widening Cast would materialize an F32 copy and defeat the residency. Same skip shape
-            // as the tensor-core arm above (eligibility is the single source of truth with plan_eqn).
-            if matmul_bf16_decode_gemv_eligible(
-                backend,
-                a_dt,
-                b_dt,
-                g.aval(eqn.out).dtype,
-                m,
-                n,
-                k,
-                g.aval(b_id).shape.len(),
-                numel(out_shape),
-                caps,
-            ) {
+            // A BF16 `[K, N]` decode projection has no lowering: a widening Cast would materialize an F32
+            // copy of the weight, so it stays mixed and `plan_eqn` refuses it by name.
+            if matmul_bf16_column_gemv(backend, a_dt, b_dt, odt, m, g.aval(b_id).shape.len()) {
                 out.eqns.push(eqn.clone());
                 continue;
             }
@@ -1058,8 +986,7 @@ mod tests {
         ];
         for backend in backends {
             for (label, g) in &graphs {
-                let caps = poot_test_util::device_caps::default_caps_for(backend);
-                let prepared = prepare_target_graph(g, backend, &caps);
+                let prepared = prepare_target_graph(g, backend);
                 for id in (0..g.values.len()).filter(|&id| g.meta(id).storage == Storage::Const) {
                     assert_eq!(
                         prepared.aval(id).dtype,
@@ -1091,8 +1018,7 @@ mod tensor_core_weight_tests {
         let out = b.matmul(x, weight);
         let g = b.finish(out);
 
-        let caps = poot_test_util::device_caps::default_caps_for(Backend::Nvptx);
-        let widened = widen_mismatched_matmul_dtypes(&g, Backend::Nvptx, &caps);
+        let widened = widen_mismatched_matmul_dtypes(&g, Backend::Nvptx);
         assert_eq!(widened.aval(weight.id).dtype, DType::BF16);
         assert!(
             !widened
@@ -1158,8 +1084,7 @@ mod prepare_target_graph_tests {
             Backend::Nvptx,
             Backend::AmdGcn(AmdArch::gfx1151()),
         ] {
-            let caps = poot_test_util::device_caps::default_caps_for(backend);
-            let prepared = prepare_target_graph(&moe_gate_reduce_graph(), backend, &caps);
+            let prepared = prepare_target_graph(&moe_gate_reduce_graph(), backend);
             assert!(
                 !prepared
                     .eqns
@@ -1189,8 +1114,7 @@ mod prepare_target_graph_tests {
         let g = b.finish(out);
 
         for backend in [Backend::SpirvVulkan, Backend::Nvptx] {
-            let caps = poot_test_util::device_caps::default_caps_for(backend);
-            let prepared = prepare_target_graph(&g, backend, &caps);
+            let prepared = prepare_target_graph(&g, backend);
             assert_eq!(prepared.aval(weight.id).dtype, DType::BF16, "{backend:?}");
             assert!(
                 prepared.eqns.iter().any(|eqn| matches!(
@@ -1248,6 +1172,44 @@ mod fold_dense_bf16_tests {
                 (eqn.op.name(), inputs, eqn.out)
             })
             .collect()
+    }
+
+    /// `matmul(x [3, 2, 5], transpose(reshape(w [12, 5], [3, 4, 5]), [0, 2, 1]))`: a grouped projection.
+    fn grouped_graph(weight_dtype: DType) -> Graph {
+        let b = Builder::new();
+        let x = b.constant("activation", TensorType::f32(vec![3, 2, 5]));
+        let w = b.constant("w", TensorType::new(vec![12, 5], weight_dtype));
+        let blocks = b.reshape(w, vec![3, 4, 5]);
+        let out = b.matmul(x, b.transpose(blocks, vec![0, 2, 1]));
+        b.finish(out)
+    }
+
+    /// POOT-1048. Only a BF16 grouped weight folds (into one `GroupedDenseContraction` keeping the matmul's
+    /// output id); an F32 or F16 one has no grouped device row and is left exactly as traced.
+    ///
+    /// Mutation: drop the BF16 check in the fold's `[0, 2, 1]` arm and in the op's `infer`; the F32 chain folds
+    /// and this row goes red.
+    #[test]
+    fn a_grouped_weight_folds_only_when_it_is_bf16() {
+        let graph = grouped_graph(DType::BF16);
+        let folded = fold_dense_contractions(&graph);
+        assert_eq!(folded.eqns.len(), 1, "{:?}", eqn_summary(&folded));
+        assert_eq!(
+            folded.eqns[0].op,
+            OpKind::GroupedDenseContraction {
+                weight: DType::BF16,
+                groups: 3
+            }
+        );
+        assert_eq!(folded.eqns[0].out, graph.output);
+        for dtype in [DType::F32, DType::F16] {
+            let graph = grouped_graph(dtype);
+            assert_eq!(
+                eqn_summary(&fold_dense_contractions(&graph)),
+                eqn_summary(&graph),
+                "{dtype:?}"
+            );
+        }
     }
 
     /// Card 380 FR-004. The fold replaces the matmul and drops the transpose, keeps the matmul's own output
@@ -1866,7 +1828,7 @@ mod lower_nonlast_reduces_tests {
 mod tied_head_tests {
     use poot_executor_parity::dense::{Dense, Family, plain, step};
     use poot_graph_ir::{OpKind, Operand, Storage};
-    use poot_kernelgen::{ContractionSpec, KernelRequest, WeightLayout};
+    use poot_kernelgen::{ContractionSpec, KernelRequest};
     use poot_models::model::{LogitRows, Phase};
     use poot_target::{AmdArch, Backend, BufferStorage};
     use poot_tensor::DType;
@@ -1905,10 +1867,7 @@ mod tied_head_tests {
     #[test]
     fn the_tied_head_decode_runs_the_bf16_gemv_over_bf16_resident_weight() {
         let graph = qwen2_5_0_5b_decode();
-        let options = CompileOptions {
-            execution: Submission::Replay,
-            limits: CompileLimits::STANDARD,
-        };
+        let options = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
         for backend in [Backend::SpirvVulkan, Backend::AmdGcn(AmdArch::gfx1151())] {
             let target = Target {
                 backend,
@@ -1928,7 +1887,6 @@ mod tied_head_tests {
             );
             let KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::DenseGemv {
                 weight,
-                layout,
                 n,
                 ..
             })) = program.kernel_choice(eqn)
@@ -1938,7 +1896,7 @@ mod tied_head_tests {
                     program.kernel_choice(eqn)
                 );
             };
-            assert_eq!((*layout, *n), (WeightLayout::Nk, VOCAB), "{backend:?}");
+            assert_eq!(*n, VOCAB, "{backend:?}");
             assert_eq!(*weight, BufferStorage::bf16_packed(), "{backend:?}");
 
             let Operand::Value(head) = eqn.inputs[1] else {

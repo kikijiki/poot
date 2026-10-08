@@ -119,7 +119,7 @@ mod tests {
         assert_eq!(run(32), run(64));
     }
 
-    /// SC-001 (tier 3 on the oracle): the Runner's recorded tokens.
+    /// SC-001 (tier 3 on the oracle): the pre-driver engine's recorded tokens.
     #[test]
     fn the_fixture_generates_the_tokens_the_runner_recorded() {
         assert_generates_the_recorded_tokens(

@@ -544,7 +544,7 @@ impl Builder {
 
     /// Reopen a finished graph for one more append (card 551a): `finish`/
     /// `finish_with_state` consume `self`, so extending an already-finished graph (card 551b appends a
-    /// sampler suffix after the Runner's per-step graph) needs a fresh `Builder` over `g`'s own live
+    /// sampler suffix after the driver's per-step graph) needs a fresh `Builder` over `g`'s own live
     /// values/eqns. The returned builder is a new identity (never aliasing whatever builder produced
     /// `g`), so [`Builder::append_plan`]/[`Builder::preflight_append`] work unchanged on it; `out` and
     /// `state` rehydrate `g`'s old output and state pairs as [`Traced`] so new equations can read them
@@ -962,7 +962,7 @@ impl Builder {
     /// the same [`Slot`] kind with different per-call content (spec 266: one expert-pool assignment table per MoE
     /// layer; spec 149: a named standalone activation). [`Builder::slot`] names every occurrence of a kind
     /// identically ([`Slot::key_label`], R466-013: a hand-written label, never `Debug`), which model-engine binders
-    /// rely on to resolve a whole `Slot` kind from one caller-supplied buffer (see [`Slot::GdnSlotMap`]). A named
+    /// rely on to resolve a whole `Slot` kind from one caller-supplied buffer (see [`Slot::ExpertPoolMap`]). A named
     /// input has no such implicit buffer. The name is `"{kind}.{tag}"` (built by [`crate::graph::SlotKey`]), and its
     /// binder must dispatch on [`crate::graph::ValueMeta::name`] as the `Const` path does, not on the kind alone.
     ///
@@ -1160,6 +1160,23 @@ impl Builder {
             Vec::new(),
             &[],
         )
+    }
+
+    /// A recurrence scan (POOT-634): ONE `OpKind::Scan` equation over `operands` (the family's operand
+    /// order), returned as its three typed values. The two projections are slices of the packed result
+    /// at the rows its [`crate::ScanLayout`] names.
+    pub fn scan(&self, attrs: crate::op::ScanAttrs, operands: &[Traced]) -> ScanResult {
+        let in_types: Vec<TensorType> = operands.iter().map(|t| self.aval(*t)).collect();
+        let layout = attrs
+            .layout(&in_types)
+            .unwrap_or_else(|e| panic!("trace-time shape error in scan: {e}"));
+        let packed = self.emit(
+            OpKind::Scan(attrs),
+            operands.iter().map(|t| Operand::Value(t.id)).collect(),
+            &in_types,
+        );
+        let (y, s_out) = project_scan(self, packed, &layout);
+        ScanResult { packed, y, s_out }
     }
 
     pub fn reshape(&self, x: Traced, shape: Vec<usize>) -> Traced {
@@ -1405,6 +1422,31 @@ impl Default for Builder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The three values of a traced scan: the packed result its one equation defines and the two
+/// projections of it.
+#[derive(Clone, Copy, Debug)]
+pub struct ScanResult {
+    /// The packed `[1, H, L + S, W]` result.
+    pub packed: Traced,
+    /// The sequence output `[1, H, L, W]`.
+    pub y: Traced,
+    /// The carried state `[1, H, S, W]`.
+    pub s_out: Traced,
+}
+
+/// `(y, s_out)` as the slices of `packed` at the layout's rows.
+pub(crate) fn project_scan(
+    b: &Builder,
+    packed: Traced,
+    layout: &crate::op::ScanLayout,
+) -> (Traced, Traced) {
+    let (y, s) = (layout.y_rows(), layout.state_rows());
+    (
+        b.slice(packed, 2, y.start, y.end),
+        b.slice(packed, 2, s.start, s.end),
+    )
 }
 
 #[cfg(test)]

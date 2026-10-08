@@ -2,8 +2,7 @@
 //! threshold, and boxing their causes changed neither what an error prints nor what
 //! `Error::source` reports.
 //!
-//! Lives in `poot-llm` because it transitively returns all six (`RunnerError` wraps the other
-//! five). The size table diagnoses which type grew; the guarantee is the clippy gate
+//! Lives in `poot-llm` because `DriverError` wraps the device errors. The size table diagnoses which type grew; the guarantee is the clippy gate
 //! (`cargo clippy -p <crate> --all-targets -- -D warnings`).
 
 use std::error::Error;
@@ -15,7 +14,11 @@ const LARGE_ERROR_THRESHOLD: usize = 128;
 
 fn error_sizes() -> Vec<(&'static str, usize)> {
     let mut rows = vec![
-        ("poot_llm::RunnerError", size_of::<poot_llm::RunnerError>()),
+        (
+            "poot_llm::driver::error::DriverError",
+            size_of::<poot_llm::driver::error::DriverError>(),
+        ),
+        ("poot_llm::TextError", size_of::<poot_llm::TextError>()),
         (
             "poot_ptx_gpu::PtxGpuError",
             size_of::<poot_ptx_gpu::PtxGpuError>(),
@@ -91,12 +94,7 @@ fn boxing_a_cause_does_not_change_what_an_error_prints() {
 /// corresponding link goes `None`.
 #[test]
 fn boxing_a_cause_does_not_cut_the_source_chain() {
-    let runner = poot_llm::RunnerError::from(poot_ptx_gpu::PtxGpuError::from(plan_cause()));
-
-    // RunnerError::Ptx prints its cause verbatim, so the outermost Display is the innermost text.
-    assert_eq!(runner.to_string(), format!("plan: {PLAN_CAUSE_TEXT}"));
-
-    let ptx = runner.source().expect("RunnerError::Ptx keeps its cause");
+    let ptx = poot_ptx_gpu::PtxGpuError::from(plan_cause());
     assert_eq!(ptx.to_string(), format!("plan: {PLAN_CAUSE_TEXT}"));
 
     let plan = ptx.source().expect("PtxGpuError::Plan keeps its cause");
@@ -119,17 +117,12 @@ fn every_boxed_cause_still_converts_through_a_single_question_mark() {
         planner_fails()?;
         Ok(())
     }
-    fn runner() -> poot_llm::Result<()> {
-        ptx()?;
-        Ok(())
-    }
 
-    assert!(ptx().is_err());
-    assert!(matches!(runner(), Err(poot_llm::RunnerError::Ptx(_))));
+    assert!(matches!(ptx(), Err(poot_ptx_gpu::PtxGpuError::Plan(_))));
 }
 
 /// Covers every one of the boxed-cause links (`boxing_a_cause_does_not_cut_the_source_chain`
-/// covers only `RunnerError -> PtxGpuError -> PlanError`): each row's parent has an explicit
+/// covers only `PtxGpuError -> PlanError`): each row's parent has an explicit
 /// `#[source]` field (or a field named `source`, as in `PtxGpuError::EqnFault`), so `source()`
 /// returns the cause one hop away, compared by `Display` so a substituted or truncated cause is
 /// also caught. Most links go through the crate's `From` impl; `PtxGpuError::EqnFault` constructs
@@ -150,30 +143,6 @@ where
 
 fn non_rocm_chain_links() -> Vec<(&'static str, Box<dyn Error>, Option<String>)> {
     vec![
-        // RunnerError (poot-llm/src/error.rs): 5 links, 4 here + Rocm gated below. All
-        // explicit `#[source]`.
-        source_row(
-            "RunnerError::Load -> poot_load::LoadError",
-            poot_load::LoadError::UnknownCheckpointDtype {
-                name: "t".to_string(),
-            },
-            poot_llm::RunnerError::from,
-        ),
-        source_row(
-            "RunnerError::Eval -> poot_eval::EvalError",
-            poot_eval::EvalError::MissingInput(0),
-            poot_llm::RunnerError::from,
-        ),
-        source_row(
-            "RunnerError::Ptx -> poot_ptx_gpu::PtxGpuError",
-            poot_ptx_gpu::PtxGpuError::UseBeforeDef(0),
-            poot_llm::RunnerError::from,
-        ),
-        source_row(
-            "RunnerError::Mrope -> poot_llm::MropeBindError",
-            poot_llm::MropeBindError::MissingSlot,
-            poot_llm::RunnerError::from,
-        ),
         // poot_ptx_gpu::PtxGpuError (crates/poot-ptx-gpu/src/lib.rs): 4 links, all explicit `#[source]`.
         source_row(
             "poot_ptx_gpu::PtxGpuError::Ptx -> poot_ptx_runtime::PtxError",
@@ -198,7 +167,7 @@ fn non_rocm_chain_links() -> Vec<(&'static str, Box<dyn Error>, Option<String>)>
     ]
 }
 
-/// The ROCm-gated links: `RunnerError::Rocm` (1), `RocmGpuError` (2). Card 548: `RocmGpuError`
+/// The ROCm-gated links: `RocmGpuError` (2). Card 548: `RocmGpuError`
 /// shrank to a thin wrapper over `RocmError`/`CompileError` (the graph-walking executor's own
 /// `Plan`/`Eval`/`UseBeforeDef` variants it used to carry moved to the generic
 /// `poot_executor::LoadError`/`ExecError`, which this file does not track - `RocmDevice` never
@@ -207,11 +176,6 @@ fn non_rocm_chain_links() -> Vec<(&'static str, Box<dyn Error>, Option<String>)>
 #[cfg(feature = "rocm")]
 fn rocm_chain_links() -> Vec<(&'static str, Box<dyn Error>, Option<String>)> {
     vec![
-        source_row(
-            "RunnerError::Rocm -> poot_rocm_gpu::RocmGpuError",
-            poot_rocm_gpu::RocmGpuError::Graph("test cause".to_string()),
-            poot_llm::RunnerError::from,
-        ),
         // poot_rocm_gpu::RocmGpuError (crates/poot-rocm-gpu/src/error.rs): 2 links, both
         // explicit `#[source]`.
         source_row(
@@ -236,13 +200,13 @@ fn rocm_chain_links() -> Vec<(&'static str, Box<dyn Error>, Option<String>)> {
 /// chain is `boxing_a_cause_does_not_cut_the_source_chain`). Dropping `#[source]` from any one
 /// `source_row` field, e.g. `RocmGpuError::Eval`, sends only that row's `source()` to `None`.
 #[test]
-fn every_boxed_cause_across_all_seven_enums_preserves_its_source() {
+fn every_boxed_cause_across_the_device_error_enums_preserves_its_source() {
     let mut links = non_rocm_chain_links();
     links.extend(rocm_chain_links());
 
     assert_eq!(
         links.len(),
-        if cfg!(feature = "rocm") { 11 } else { 8 },
+        if cfg!(feature = "rocm") { 6 } else { 4 },
         "a link was added or removed without updating this count"
     );
 

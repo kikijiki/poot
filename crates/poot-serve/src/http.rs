@@ -10,17 +10,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
-use crate::admin::{
-    LoraAdminBackendResolver, LoraAdminPolicy, handle_lora_admin_with_backend,
-    respond_lora_admin_denial,
-};
+use crate::admin::{LoraAdminPolicy, handle_lora_admin, respond_lora_admin_denial};
 use crate::api::{ChatReq, CompletionReq, classify_handler_error};
-use crate::handlers::{
-    handle_chat, handle_completion, handle_embeddings_encoder, handle_rerank_cross,
-    handle_rerank_encoder, stream_chat, stream_completion,
-};
+use crate::engine_plan::{EngineHealth, EngineState};
+use crate::handlers::{handle_chat, handle_completion, stream_chat, stream_completion};
 use crate::metrics::Metrics;
-use crate::types::{Backend, Job};
+use crate::types::{Backend, GenerationError, Job};
 
 /// Per-key request-rate limiter (card 058). Fixed 60-second window per key: the first request starts the
 /// window, later ones increment until `rpm` is reached, then the window rejects until it rolls over.
@@ -366,10 +361,9 @@ pub(crate) fn is_lora_admin_target(target: &str) -> bool {
 }
 
 /// Production request staging. A protected target is identified from the URI path and authorized after
-/// the bounded head, before any body handling or lazy backend resolution.
+/// the bounded head, before any body handling.
 pub(crate) fn read_request_for_routing(
     stream: &mut TcpStream,
-    backend: &dyn LoraAdminBackendResolver,
     policy: &LoraAdminPolicy,
 ) -> Result<Option<ParsedRequest>> {
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -391,7 +385,7 @@ pub(crate) fn read_request_for_routing(
             respond_lora_admin_denial(stream, denial)?;
             return Ok(None);
         }
-        let Some(body) = read_request_body_from(&mut reader, head.content_length)? else {
+        if read_request_body_from(&mut reader, head.content_length)?.is_none() {
             respond_error(
                 stream,
                 413,
@@ -399,9 +393,8 @@ pub(crate) fn read_request_for_routing(
                 "invalid_request_error",
             )?;
             return Ok(None);
-        };
-        let admin = backend.resolve_lora_admin_backend();
-        handle_lora_admin_with_backend(stream, admin, &head.method, &head.path, &body)?;
+        }
+        handle_lora_admin(stream, &head.method, &head.path)?;
         return Ok(None);
     }
 
@@ -423,12 +416,55 @@ pub(crate) fn read_request_for_routing(
     }))
 }
 
+/// The `/health` answer for the engine's state: 200 `serving` with the backend, rows and positions of the
+/// engine plan once it is `Serving`, else 503 with the state's name. Reads the state the plan publishes;
+/// it never answers from a constant.
+fn health_response(health: &EngineHealth) -> (u16, String) {
+    let engine_loaded = health.engine_loaded();
+    match health.state() {
+        EngineState::Serving {
+            backend,
+            rows,
+            max_seq,
+        } => (
+            200,
+            serde_json::json!({
+                "status": "serving",
+                "backend": backend,
+                "rows": rows,
+                "max_seq": max_seq,
+                "engine_loaded": engine_loaded,
+            })
+            .to_string(),
+        ),
+        EngineState::Starting => (
+            503,
+            serde_json::json!({ "status": "starting", "engine_loaded": engine_loaded }).to_string(),
+        ),
+        EngineState::Draining => (
+            503,
+            serde_json::json!({ "status": "draining", "engine_loaded": engine_loaded }).to_string(),
+        ),
+        EngineState::Dead(death) => (
+            503,
+            serde_json::json!({
+                "status": "dead",
+                "cause": death.kind(),
+                "reason": death.reason(),
+                "engine_loaded": engine_loaded,
+            })
+            .to_string(),
+        ),
+    }
+}
+
 /// Read one HTTP request, route it, and write the response. Runs on a per-connection thread; generation
-/// is submitted to the engine's job queue when there is one. `engine` is `None` while no serving loop
-/// exists: a valid generation request is then refused with a typed 503.
+/// is submitted to the engine's job queue when there is one. `engine` is `None` only where no engine was
+/// started: a valid generation request is then refused with a typed 503.
 pub(crate) fn handle(
     mut stream: TcpStream,
     engine: Option<&Sender<Job>>,
+    health: &EngineHealth,
     backend: &Backend,
     metrics: &Metrics,
     limiter: &RateLimiter,
@@ -436,14 +472,14 @@ pub(crate) fn handle(
 ) -> Result<()> {
     let Some(ParsedRequest {
         method, path, body, ..
-    }) = read_request_for_routing(&mut stream, backend, lora_admin_policy)?
+    }) = read_request_for_routing(&mut stream, lora_admin_policy)?
     else {
         return Ok(());
     };
 
     if method == "GET" && path.starts_with("/health") {
-        let body = serde_json::json!({ "status": "ok", "engine_loaded": engine.is_some() });
-        return respond(&mut stream, 200, &body.to_string());
+        let (status, body) = health_response(health);
+        return respond(&mut stream, status, &body);
     }
     // OpenAI /v1/models: list and retrieve (`GET /v1/models/{id}`). The path may carry a query string.
     if method == "GET" {
@@ -509,10 +545,11 @@ pub(crate) fn handle(
     }
 
     // /v1/embeddings: a BERT encoder. A cross-encoder cannot produce sentence embeddings (it scores
-    // pairs), and a causal decoder serves none.
+    // pairs), and a causal decoder serves none. The encoder runs on the driver's `Encode` step, which
+    // this server has no engine for yet: the typed 503 until POOT-589 restores it.
     if path.starts_with("/v1/embeddings") {
         return match backend {
-            Backend::Encoder(enc) => handle_embeddings_encoder(&mut stream, enc, metrics, &body),
+            Backend::Encoder(_) => respond_no_driver_route(&mut stream, "/v1/embeddings"),
             Backend::Decoder(_) => respond_unsupported(
                 &mut stream,
                 "this model is a causal decoder; embeddings come from an encoder model.",
@@ -524,11 +561,13 @@ pub(crate) fn handle(
         };
     }
     // /v1/rerank (Cohere/Jina-shaped): a cross-encoder scores pairs jointly; an encoder ranks by
-    // bi-encoder cosine; a causal decoder serves none.
+    // bi-encoder cosine; a causal decoder serves none. Both encoder kinds are the driver's `Encode`
+    // step: the typed 503 until POOT-589 restores them.
     if path.starts_with("/v1/rerank") {
         return match backend {
-            Backend::CrossEncoder(ce) => handle_rerank_cross(&mut stream, ce, &body),
-            Backend::Encoder(enc) => handle_rerank_encoder(&mut stream, enc, &body),
+            Backend::CrossEncoder(_) | Backend::Encoder(_) => {
+                respond_no_driver_route(&mut stream, "/v1/rerank")
+            }
             Backend::Decoder(_) => respond_unsupported(
                 &mut stream,
                 "this model is a causal decoder; reranking comes from an encoder or cross-encoder model.",
@@ -537,8 +576,8 @@ pub(crate) fn handle(
     }
 
     // Generation endpoints below need a causal decoder. An encoder / cross-encoder has no LM head.
-    let runner = match backend {
-        Backend::Decoder(runner) => runner.as_ref(),
+    let handle = match backend {
+        Backend::Decoder(handle) => handle.as_ref(),
         Backend::Encoder(_) | Backend::CrossEncoder(_) => {
             return respond_unsupported(
                 &mut stream,
@@ -548,6 +587,10 @@ pub(crate) fn handle(
         }
     };
 
+    // A second handle on the socket for the hang-up probe: a non-streaming response writes nothing until
+    // the request ends, so only a read tells the engine the client left.
+    let probe = stream.try_clone().ok();
+    let client_gone = || probe.as_ref().is_some_and(crate::lifecycle::peer_closed);
     let result = if path.starts_with("/v1/completions") {
         let req: CompletionReq = match serde_json::from_str(&body) {
             Ok(r) => r,
@@ -557,9 +600,9 @@ pub(crate) fn handle(
         };
         if req.stream {
             // SSE: one chunk per token, then a throughput receipt and [DONE].
-            return stream_completion(&mut stream, engine, runner, metrics, &req);
+            return stream_completion(&mut stream, engine, handle, metrics, &req);
         }
-        handle_completion(engine, runner, metrics, &req)
+        handle_completion(engine, handle, metrics, &req, &client_gone)
     } else if path.starts_with("/v1/chat/completions") {
         let req: ChatReq = match serde_json::from_str(&body) {
             Ok(r) => r,
@@ -569,9 +612,9 @@ pub(crate) fn handle(
         };
         if req.stream {
             // SSE chat: a chat.completion.chunk delta per token, then finish, receipt and [DONE].
-            return stream_chat(&mut stream, engine, runner, metrics, &req);
+            return stream_chat(&mut stream, engine, handle, metrics, &req);
         }
-        handle_chat(engine, runner, metrics, &req)
+        handle_chat(engine, handle, metrics, &req, &client_gone)
     } else {
         return respond_error(&mut stream, 404, "unknown path", "invalid_request_error");
     };
@@ -621,6 +664,14 @@ pub(crate) fn error_body(status: u16, message: impl std::fmt::Display, type_: &s
 /// what to use instead.
 pub(crate) fn respond_unsupported(stream: &mut TcpStream, message: &str) -> Result<()> {
     respond_error(stream, 400, message, "invalid_request_error")
+}
+
+/// 503 for a route the loaded model could serve but this server has no driver path for yet: the
+/// route runs the model on the driver, and POOT-589 restores it. Its typed refusal is
+/// [`GenerationError::NotServed`].
+pub(crate) fn respond_no_driver_route(stream: &mut TcpStream, route: &'static str) -> Result<()> {
+    let refusal = GenerationError::NotServed { route };
+    respond_error(stream, refusal.stream_status(), refusal, "server_error")
 }
 
 /// Write an HTTP response with an explicit Content-Type (JSON for the API, `text/plain` for Prometheus).

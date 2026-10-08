@@ -3,7 +3,7 @@
 
 use crate::builder::{Builder, BuilderAppendPlan, Traced};
 
-use crate::error::{BuilderAppendError, BuilderCollection};
+use crate::error::BuilderAppendError;
 
 use crate::graph::{Operand, Storage};
 

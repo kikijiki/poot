@@ -10,7 +10,19 @@ sidebar_position: 3
 poot is being refactored. This is not available yet and is planned to return.
 :::
 
-Today `poot-serve` has no `--backend` option and refuses it as an unknown option.
+`poot-serve --backend wgpu|rocm|ptx|vulkan|auto` (default `auto`) picks the device. The choice is made once, at
+startup, before the server listens:
+
+- `auto` opens the first device that is present, in one fixed order: **ptx** if a CUDA device opens, else
+  **rocm** if an HSA GPU agent opens, else **wgpu**. It decides by device presence only. It never picks
+  **vulkan**.
+- A named backend that cannot open, or a model the chosen backend refuses (an operation the device lacks a
+  capability for), stops startup with the refusal. `poot-serve` never tries another backend after a refusal:
+  a model that does not run on the device you chose is an error you can read, not a silent move to different
+  hardware.
+- Before it serves, the server fits the workload to the device memory: it computes the exact footprint of each
+  candidate (weights once, every retained arena, state) and takes the largest candidate that fits, then checks
+  what the device actually allocated before `/health` reports `serving`.
 
 The backends are libraries. **wgpu** (Vulkan/SPIR-V, the default), **rocm** (AMD raw HSA, `--features rocm`)
 and **ptx** (NVIDIA CUDA) share the graph IR and model definitions, and so does **vulkan**: the same SPIR-V

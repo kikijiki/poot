@@ -21,12 +21,18 @@ pub struct ChatTemplate {
     pub eos_token: Option<String>,
 }
 
+/// One encoder row's tokens: the ids and each token's segment id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EncoderTokens {
+    pub ids: Vec<u32>,
+    pub types: Vec<u32>,
+}
+
 /// Compiled guided-decoding DFAs, keyed by regex pattern.
 pub(crate) type DfaCache = HashMap<String, Arc<dense::DFA<Vec<u32>>>>;
 
 /// Everything text-side a checkpoint ships: tokenization, chat rendering and the guided constraint
-/// builders. Held by `ModelHandle` and by the Runner until Card 739 deletes it. The
-/// services are `impl TextCodec` blocks in this directory's files; none needs a model or a device.
+/// builders. Held by `ModelHandle`. The services are `impl TextCodec` blocks in this directory's files; none needs a model or a device.
 pub struct TextCodec {
     pub(crate) tokenizer: Tokenizer,
     /// For SentencePiece GGUFs (`tokenizer.ggml.model = "llama"|"gemma4"`), the SP-BPE encoder
@@ -193,6 +199,24 @@ impl TextCodec {
             ids.push(eos);
         }
         Ok(ids)
+    }
+
+    /// `first` (and `second`, a cross-encoder's document) as an encoder takes it: the tokenizer's own
+    /// special tokens (`[CLS]`, `[SEP]`) added, and each token's segment id (0 for the first sentence,
+    /// 1 for the second). A checkpoint's tokenizer may ship fixed padding; only the real tokens are
+    /// kept, so a row's length is its own and the encoder's mask does the padding.
+    pub fn encode_for_encoder(&self, first: &str, second: Option<&str>) -> Result<EncoderTokens> {
+        let encoded = match second {
+            Some(second) => self.tokenizer.encode((first, second), true),
+            None => self.tokenizer.encode(first, true),
+        }
+        .map_err(|e| err!("encode: {e}"))?;
+        let real = |i: &usize| encoded.get_attention_mask()[*i] == 1;
+        let keep: Vec<usize> = (0..encoded.get_ids().len()).filter(real).collect();
+        Ok(EncoderTokens {
+            ids: keep.iter().map(|&i| encoded.get_ids()[i]).collect(),
+            types: keep.iter().map(|&i| encoded.get_type_ids()[i]).collect(),
+        })
     }
 
     /// Number of tokens in `text` with no special tokens added (no BOS), for usage accounting when the
@@ -793,7 +817,7 @@ fn gguf_tokenizer_spm_bpe(g: &GgufIndex) -> Result<Tokenizer> {
 }
 
 /// Unit tests of the shared `stream_piece_delta` diff primitive, the one place the U+FFFD-trim logic
-/// lives (called by `TextCodec::stream_piece` and `VlmRunner::caption_streaming`). They call the pure function
+/// lives (called by `TextCodec::stream_piece`). They call the pure function
 /// directly, simulating `tokenizers`' lossy-UTF-8 decode (`String::from_utf8_lossy`) over a byte buffer growing one byte at a time.
 #[cfg(test)]
 mod stream_piece_delta_tests {

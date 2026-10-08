@@ -32,7 +32,7 @@ v_exp = repeat_kv(v_cache, n_rep)
 scores = MatMul(q, Transpose(k_exp))       # [1, H_q, 1, cap]
 scores = Mul(scores, scale)                # scale, usually 1/sqrt(D)
 scores = Add(scores, mask)                 # large negative past `pos`; a graph computation over
-                                            # Slot::Pos for the dense families, Slot::Mask elsewhere
+                                            # Slot::Pos
 
 # Numerically stable softmax (max-subtract, then normalize); binary ops broadcast implicitly
 m   = Reduce(Max, scores, axis=-1, keepdim=True)
@@ -78,7 +78,7 @@ one lane (`AttentionLds`, naming the value width and the device's bytes).
 
 Models compose attention with `ops::attention_masked` or `ops::attention_prefill`. The compiler
 selects the fused op when the shape and target satisfy the matcher checks. Unsupported patterns
-keep their primitive decomposition; a routed-expert prefill on a target with the recorded routed-expert hang also skips this rewrite.
+keep their primitive decomposition.
 
 ## The streaming schedule
 
@@ -138,7 +138,9 @@ it) and selects the inactive scores to `-inf` before the softmax. The rewrite em
 only for a graph that already has that shape and declares the length witness as a validation output.
 A graph with only a score mask (the in-graph causal mask of the dense families), a guard on some
 operands, or a length no validation bounds keeps its capacity form or its primitive decomposition,
-and its results do not change. That primitive form runs on every device: the key positions it
+and its results do not change. The live bound types at every float dtype, but the generated kernel is F32 only: a
+BF16 or F16 chain (live or not) stays the primitive decomposition, with the same selects at its own dtype, and runs on
+ROCm and PTX (a SPIR-V target refuses the two-byte select with a typed `DtypeLowering`). That primitive form runs on every device: the key positions it
 compares against `len` are an exact `I32` range, with no round trip through `F32`. A generated
 kernel clamps `len` into `0..=Lk` before it bounds the loop, so no length can read outside the
 buffers.
@@ -158,9 +160,8 @@ poot supports two KV allocation schemes:
 **Fixed-capacity with causal masking:** K and V are `Storage::State` buffers pre-allocated to
 `cap` positions per layer. Per token, new K/V are written at position `pos` (a
 `DynamicUpdateSlice`). The attention kernel sweeps the full `[cap]` allocation; a mask hides
-positions after `pos` with a large negative value. For the dense families (qwen2 and its
-relatives, bloom, granite, mpt, smollm3, gemma2) that mask is built in-graph from `Slot::Pos`
-against an `Iota`; other families still carry it as a host-built `Slot::Mask` input. The grid is
+positions after `pos` with a large negative value. That mask is built in-graph from `Slot::Pos`
+against an `Iota`; no slot carries it. The grid is
 constant every token, capturable as a CUDA graph. Memory usage = capacity regardless of actual
 sequence length.
 

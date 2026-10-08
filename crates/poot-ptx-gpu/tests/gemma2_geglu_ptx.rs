@@ -1,27 +1,13 @@
 //! Card 536b (R481-007) SC-003, PTX half: Gemma2's GeGLU MLP (`Gelu(gate) * up`, `ops::geglu`) is
 //! exactly the pointwise chain this card's fusion-legality fix newly admits into one region -
 //! `is_fusable` refused `Gelu` before, so every GeGLU MLP paid for two dispatches (the `Gelu` and the
-//! `Mul`) instead of one. Real device regression: compile the decode graph twice against the real PTX
-//! device caps - once through the full pipeline, once under the routed-expert hang guard - confirm the
-//! full compile actually carries a `Fused` region with the `Gelu` step per layer and the guarded
-//! compile carries none (so this row proves the fix, not merely "fusion happens somewhere"), then run
-//! both compiled graphs on PTX/NVIDIA through the executor contract's resident path
-//! (`tests/common::run_resident_with_fusion`, real carried KV cache, zero seeded) and compare dense-decode
-//! logits against each other and against the CPU oracle, within tier 2. PTX twin of
+//! `Mul`) instead of one. Real device regression: compile the decode graph against the real PTX device
+//! caps, confirm the compile actually carries a `Fused` region with the `Gelu` step per layer (so this
+//! row proves the fix, not merely "fusion happens somewhere"), then run the compiled graph on PTX/NVIDIA
+//! through the executor contract's resident path (`tests/common::run_resident`, real carried KV cache,
+//! zero seeded) and compare dense-decode logits against the CPU oracle, within tier 2. PTX twin of
 //! `poot-gpu/tests/gemma2.rs`'s `gemma2_geglu_fused_decode_matches_unfused_and_cpu_on_gpu` and
 //! `poot-rocm-gpu/src/tests/decode.rs`'s `gemma2_geglu_fused_decode_matches_unfused_and_cpu_oracle_rocm`.
-//!
-//! Card 535a/535b: no caller composes passes itself any more (`compile` owns the one fixed pass order;
-//! card 626 deletes the bare `cse`/`fuse` pattern this test used to follow). The routed-expert hang guard
-//! (cards 186/192) is the clean unfused baseline here, reached by giving the graph a dead routed-expert
-//! site (`poot_test_util::graph_fixtures::with_routed_expert_site`) on the PTX target, which has the
-//! hang: it skips exactly
-//! `flash_attention_capped` and `fuse` and keeps matmuls off the tiled GEMM (so the compiled graph
-//! can carry no `Fused` region), while `canonicalize`, `cse`, `legalize`, the BF16 folds,
-//! `lower_nonlast_reduces` and
-//! `widen_mismatched_matmul_dtypes` still run identically in the full pipeline - the two compiles diverge only
-//! in the fusion-adjacent passes, not in dtype/legality handling, so the comparison below isolates
-//! fusion's effect the same way the wgpu/ROCm siblings' `cse`-only-vs-`cse`+`fuse` pair did.
 //!
 //! Skips cleanly with no NVIDIA GPU; `POOT_REQUIRE_PTX=1` (this crate's require/skip convention, see
 //! `poot_runtime_common::DeviceBackend::open_or_skip`) turns that skip into a failure instead.
@@ -88,7 +74,7 @@ fn geglu_region_count(g: &poot_graph_ir::Graph) -> usize {
 }
 
 #[test]
-fn gemma2_geglu_fused_decode_matches_unfused_and_cpu_oracle_ptx() {
+fn gemma2_geglu_fused_decode_matches_the_cpu_oracle_ptx() {
     let Some(mut ptx) =
         poot_test_util::device_skip::open_or_skip(DeviceBackend::Ptx, PtxDevice::new())
     else {
@@ -151,10 +137,7 @@ fn gemma2_geglu_fused_decode_matches_unfused_and_cpu_oracle_ptx() {
     let fused = compile(
         &g,
         &target,
-        &CompileOptions {
-            execution: Submission::Replay,
-            limits: poot_graph_plan::CompileLimits::STANDARD,
-        },
+        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect("compile the gemma2 GeGLU decode graph, full pipeline");
     assert!(
@@ -175,46 +158,14 @@ fn gemma2_geglu_fused_decode_matches_unfused_and_cpu_oracle_ptx() {
             .collect::<Vec<_>>()
     );
 
-    let (guarded_graph, guarded_caps) =
-        poot_test_util::graph_fixtures::pipeline_input(&g, target.caps, true);
-    let unfused = compile(
-        &guarded_graph,
-        &Target {
-            caps: guarded_caps,
-            ..target
-        },
-        &CompileOptions {
-            execution: Submission::Replay,
-            limits: poot_graph_plan::CompileLimits::STANDARD,
-        },
-    )
-    .expect("compile the gemma2 GeGLU decode graph, hang guard (unfused baseline)");
-    assert!(
-        !unfused.passes().any(|p| p == "fuse"),
-        "the hang guard must skip fuse"
-    );
-    assert_eq!(
-        geglu_region_count(unfused.graph()),
-        0,
-        "the hang-guard baseline must carry no Fused region"
-    );
-    assert!(
-        fused.graph().eqns.len() < unfused.graph().eqns.len(),
-        "fewer dispatches after fusion: {} -> {}",
-        unfused.graph().eqns.len(),
-        fused.graph().eqns.len()
-    );
-
-    // `compile`'s own `Program`s are only needed for the structural assertions above; the device run
-    // goes through the executor contract's own staging (Card 549), from the raw traced graph, with the
-    // matching fusion policy for each side.
-    drop(unfused);
+    // `compile`'s own `Program` is only needed for the structural assertions above; the device run
+    // goes through the executor contract's own staging (Card 549), from the raw traced graph.
     drop(fused);
 
     // Real carried KV cache, zero-seeded (this is the graph's first decode step in isolation - `pos`
     // names where in the RoPE table/valid-prefix slice the step reads, not how many prior steps ran).
     // The executor contract's own state buffers are always zero at first declaration (Z5), so this
-    // matches `common::run_resident_with_fusion`'s state exactly with no seeding of its own.
+    // matches `common::run_resident`'s state exactly with no seeding of its own.
     let zero_state: Vec<HostTensor> = g
         .state
         .iter()
@@ -239,24 +190,13 @@ fn gemma2_geglu_fused_decode_matches_unfused_and_cpu_oracle_ptx() {
         .map(Value::into_host)
         .collect::<Result<Vec<_>, _>>()
         .expect("dense state");
-    let unfused_ptx = common::run_resident_with_fusion(&mut ptx, &g, &inputs, true);
-    let fused_ptx = common::run_resident_with_fusion(&mut ptx, &g, &inputs, false);
+    let fused_ptx = common::run_resident(&mut ptx, &g, &inputs);
 
-    assert_eq!(fused_ptx.shape(), unfused_ptx.shape());
     assert_eq!(fused_ptx.shape(), cpu.shape());
-    // Fusion moves region intermediates from f32 global buffers to registers, so fused vs un-fused is a
-    // tight fp rounding difference (tier 1 territory), while GPU vs CPU is the ordinary tier-2 gap.
-    let fused_vs_unfused =
-        max_abs_error(fused_ptx.as_f32().unwrap(), unfused_ptx.as_f32().unwrap());
-    assert!(
-        fused_vs_unfused <= 1e-4,
-        "fused PTX decode must match un-fused within fp tolerance: max_abs={fused_vs_unfused:.3e}"
-    );
+    // GPU vs CPU is the ordinary tier-2 gap.
     assert_close_rel(fused_ptx.as_f32().unwrap(), cpu.as_f32().unwrap(), 5e-3);
     eprintln!(
-        "gemma2_geglu_fused_decode_matches_unfused_and_cpu_oracle_ptx: fused/unfused max_abs={:.3e}, \
-         fused/cpu max_abs={:.3e}",
-        fused_vs_unfused,
+        "gemma2_geglu_fused_decode_matches_the_cpu_oracle_ptx: fused/cpu max_abs={:.3e}",
         max_abs_error(fused_ptx.as_f32().unwrap(), cpu.as_f32().unwrap())
     );
 }

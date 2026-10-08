@@ -7,6 +7,15 @@ use poot_quant::weights::{WeightId, WeightMap, WeightRole};
 
 use super::linear::{Weight, WeightError, linear};
 
+/// What a stack's graph returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadKind {
+    /// The vocabulary logits.
+    Logits,
+    /// The final hidden states (the head's input), for the host to pool or score.
+    Hidden,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Head {
     weight: Weight,

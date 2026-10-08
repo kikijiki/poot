@@ -157,13 +157,11 @@ fn parse_tensor_header_entry(
 
 /// Every non-metadata header entry's stored bytes, inserted as a [`WeightEntry::Dense`] keyed by
 /// its checkpoint tensor name; `read_range` supplies the raw bytes exactly as the checkpoint
-/// stored them (ADR-0103 decision 1: no widening, no decode). `I64` entries (index/position
-/// buffers, e.g. BERT's `embeddings.position_ids`) are skipped: no consumer reads them and they
-/// are never a weight (matches the reader's historical behavior).
+/// stored them (ADR-0103 decision 1: no widening, no decode). Every dtype is kept, `I64` index
+/// tables included (DeepSeek-V4's `tid2eid` is one, read through `WeightView::IndexNarrow`); a
+/// tensor no family claims is just an unused entry.
 /// `insert_header_entries`'s cross-call duplicate-name tracking: every non-metadata header key seen
-/// so far, regardless of dtype (an I64 name never becomes a store entry, but a second file naming
-/// it is still the same real-world duplicate-tensor bug the store-keyed check below catches for
-/// every other dtype).
+/// so far, the same real-world duplicate-tensor bug the store-keyed check below also catches.
 fn insert_header_entries<'a>(
     header_bytes: &[u8],
     data_len: usize,
@@ -188,9 +186,6 @@ fn insert_header_entries<'a>(
             start,
             end,
         } = parse_tensor_header_entry(name, meta, data_len)?;
-        if dtype == DType::I64 {
-            continue;
-        }
         let raw = read_range(start, end)?;
         let bytes: Arc<[u8]> = Arc::from(raw.into_owned());
         let dense = DenseWeight::try_new(dtype, shape, bytes)
@@ -241,7 +236,7 @@ fn insert_file(
     )
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 fn insert_bytes(bytes: &[u8], builder: &mut WeightStoreBuilder) -> Result<(), LoadError> {
     if bytes.len() < 8 {
         return Err(LoadError::SafeTensors("file too small".into()));
@@ -307,6 +302,22 @@ pub fn load_weight_store(dir: impl AsRef<Path>) -> Result<WeightStore, LoadError
         insert_file(&dir.join(shard), &mut builder, &mut seen_names)?;
     }
     Ok(builder.build())
+}
+
+/// Whether `prefix` (a `.weight` tensor's name without that suffix) names one numbered shard of a
+/// Qwen4Exp n-gram PLE table: `<table>.shard_<ordinal>` where the checkpoint stores one
+/// `<table>.weight_scale` for the whole table, not one per shard. The shards are E4M3 lookup rows
+/// the model dequantizes with that shared scale, never packed linears; without the shared scale a
+/// shard is an unscaled E4M3 tensor like any other and stays refused.
+fn is_ple_table_shard(store: &WeightStore, prefix: &str) -> bool {
+    prefix
+        .rsplit_once(".shard_")
+        .is_some_and(|(table, ordinal)| {
+            !ordinal.is_empty()
+                && ordinal.bytes().all(|b| b.is_ascii_digit())
+                && table.ends_with(".ngram_embedding")
+                && store.contains(&format!("{table}.weight_scale"))
+        })
 }
 
 /// Card 545a: `store` with every quantized linear of a `scheme`
@@ -396,8 +407,10 @@ pub fn pack_quantized_linears(
         let WeightEntry::Dense(dense) = entry else {
             return None;
         };
-        (dense.dtype() == DType::E4M3FN && !prefixes.contains(prefix))
-            .then(|| key.as_str().to_string())
+        (dense.dtype() == DType::E4M3FN
+            && !prefixes.contains(prefix)
+            && !is_ple_table_shard(store, prefix))
+        .then(|| key.as_str().to_string())
     }) {
         return Err(layout(
             unscaled,
@@ -607,16 +620,10 @@ pub fn pack_quantized_linears(
     Ok(builder.build())
 }
 
-/// Parse a SafeTensors archive from bytes in memory (same format as a file; used by tests) into a
-/// [`WeightStore`]. See [`load_weight_store`].
-///
-/// Card 671: no production caller anywhere in the workspace loads a SafeTensors archive straight from an
-/// in-memory byte slice - every non-test reference is poot-test-util's forwarder (reached only as a
-/// dev-dependency); this crate's own tests use it directly too. Gated so a default build never has it,
-/// instead of leaving it unconditionally `pub` with poot-test-util as the only non-test "caller" keeping it
-/// off the dead-pub scanner.
-#[cfg(any(test, feature = "test-support"))]
-pub fn load_weight_store_bytes(bytes: &[u8]) -> Result<WeightStore, LoadError> {
+/// Parse a SafeTensors archive from bytes in memory (same format as a file) into a [`WeightStore`]. See
+/// [`load_weight_store`]. Only this crate's tests build an archive in memory.
+#[cfg(test)]
+pub(crate) fn load_weight_store_bytes(bytes: &[u8]) -> Result<WeightStore, LoadError> {
     let mut builder = WeightStore::builder();
     insert_bytes(bytes, &mut builder)?;
     Ok(builder.build())

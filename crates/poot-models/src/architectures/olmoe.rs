@@ -372,9 +372,33 @@ pub(crate) mod moe_support {
                 .iter()
                 .filter(|e| matches!(e.op, OpKind::PackedDequant { .. }))
                 .count();
+            let indexed = bound
+                .eqns
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e.op,
+                        OpKind::PackedContraction {
+                            rows: poot_graph_ir::ContractionRows::Indexed { .. },
+                            ..
+                        }
+                    )
+                })
+                .count();
             if label == "q8_0" {
                 assert!(packed > 0, "{label}: nothing packed");
-                assert_eq!(dequants, packed, "{label}: one decode per packed weight");
+                let stacks = model
+                    .weights()
+                    .iter()
+                    .filter(|(_, _, h)| {
+                        matches!(h.format, HandleFormat::Packed(_)) && h.shape.len() == 3
+                    })
+                    .count();
+                assert_eq!(
+                    (dequants + stacks, indexed),
+                    (packed, stacks),
+                    "{label}: one decode per packed projection, one indexed contraction per packed stack"
+                );
             } else {
                 assert_eq!((packed, dequants), (0, 0), "{label}");
                 let stacks: Vec<_> = model
@@ -641,10 +665,7 @@ mod family_tests {
                     Backend::AmdGcn(_) => DeviceCaps::rocm_default(),
                 },
             };
-            let options = CompileOptions {
-                execution: Submission::Replay,
-                limits: CompileLimits::STANDARD,
-            };
+            let options = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
             let program = compile(&graph, &target, &options).unwrap();
             let launched: Vec<String> = program
                 .planned()
@@ -738,14 +759,18 @@ mod family_tests {
             let raw = RawConfig::Gguf(&index);
             assert_eq!(registry.resolve(&raw).unwrap().family, FAMILY);
             let model = registry.build(&raw, &store).unwrap();
-            let experts: Vec<_> = model
+            let stacks: Vec<_> = model
                 .weights()
                 .iter()
-                .filter(|(id, _, _)| matches!(id.role, WeightRole::Moe(MoeRole::Expert(..))))
+                .filter(|(id, _, handle)| {
+                    matches!(id.role, WeightRole::Moe(MoeRole::Stack(..)))
+                        && matches!(handle.format, poot_quant::weights::HandleFormat::Packed(_))
+                })
                 .collect();
-            assert_eq!(experts.is_empty(), !q8, "q8={q8}: per-expert packed owners");
+            assert_eq!(stacks.is_empty(), !q8, "q8={q8}: packed expert stacks");
             if q8 {
-                assert_eq!(experts.len(), 2 * 3 * 8);
+                assert_eq!(stacks.len(), 2 * 3);
+                assert!(stacks.iter().all(|(_, _, handle)| handle.shape[0] == 8));
             }
             let reference = model_of(&fixture_config(), &reference_store);
             let prompt = [3, 17, 40, 8];

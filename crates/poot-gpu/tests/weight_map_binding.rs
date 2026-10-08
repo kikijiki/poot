@@ -1,4 +1,4 @@
-//! Card 564 on wgpu: qwen2's one body behind `Model`, bound through `WeightSource::Map` (SC-001), its
+//! Card 564 on wgpu: qwen2's one body behind `Model`, bound through the weight map (SC-001), its
 //! fused and stacked views (SC-004), and a hosted embed gather the binder fills (SC-006). Skips
 //! without a Vulkan adapter.
 

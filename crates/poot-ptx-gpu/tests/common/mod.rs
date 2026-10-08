@@ -1,8 +1,8 @@
 //! Shared test support for the PTX device-contract tests (Card 549): one-shot and decode-entry
 //! helpers over `Engine<PtxDevice>`, replacing `PtxGraphExecutor::run_resident[_kv]`/`capture_decode`/
 //! `decode_step`. Every graph here is bound by name through a [`poot_quant::weights::WeightStore`]
-//! built from the caller's `HashMap<ValueId, Value>` (Card 546a's Z8 name-equality binding), since
-//! these fixtures have no `Runner` to supply one.
+//! built from the caller's `HashMap<ValueId, Value>` through a `ConstWeights` map, since
+//! these fixtures have no driver to supply one.
 //!
 //! `tests/common/mod.rs` compiles once per test binary that declares `mod common;`; each binary uses a
 //! different subset (some only `run_resident`, some only `DecodeEntry`), so dead-code warnings here are
@@ -22,16 +22,14 @@ use poot_graph_plan::{
 use poot_ptx_gpu::PtxDevice;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::HostTensor;
+use poot_test_util::const_weights::ConstWeights;
 
 /// `g` staged for the executor contract against `target` (Card 546a: `Submission::Replay` only).
 pub fn staged_program(
     g: &Graph,
     target: Target,
-    guarded: bool,
 ) -> StagedProgram<poot_graph_ir::ValidationOutputs> {
-    let (g, caps) = poot_test_util::graph_fixtures::pipeline_input(g, target.caps, guarded);
-    let target = Target { caps, ..target };
-    let g = g.with_validations(Vec::new());
+    let g = g.clone().with_validations(Vec::new());
     compile_staged(
         &g,
         &TargetSet::single(DeviceId(0), target),
@@ -39,10 +37,7 @@ pub fn staged_program(
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions {
-            execution: Submission::Replay,
-            limits: poot_graph_plan::CompileLimits::STANDARD,
-        },
+        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect("stage ptx graph")
 }
@@ -52,7 +47,7 @@ pub fn staged_program(
 /// `WeightEntry::Packed` keyed by its [`PackedSourceName`]'s `linear_id` (card 642's const naming),
 /// where every role-component of one packed linear shares its owner's identical
 /// `Arc<PackedPayload>`, so the first role seen for a `linear_id` inserts it and later roles are a
-/// no-op, exactly mirroring `poot-llm`'s `Runner::load_on`/`weight_store`.
+/// no-op, exactly mirroring `poot-llm`'s driver weight store.
 fn const_store(g: &Graph, inputs: &HashMap<ValueId, Value>) -> WeightStore {
     let mut builder = WeightStore::builder();
     let mut packed_linear_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -75,6 +70,10 @@ fn const_store(g: &Graph, inputs: &HashMap<ValueId, Value>) -> WeightStore {
                     poot_tensor::DType::BF16 => (
                         poot_tensor::DType::BF16,
                         Arc::from(bytemuck::cast_slice::<u16, u8>(dense.as_half().unwrap())),
+                    ),
+                    poot_tensor::DType::I32 => (
+                        poot_tensor::DType::I32,
+                        Arc::from(bytemuck::cast_slice::<i32, u8>(dense.as_i32().unwrap())),
                     ),
                     other => panic!(
                         "{name}: dense const dtype {other:?} is not supported by this test helper"
@@ -99,12 +98,47 @@ fn const_store(g: &Graph, inputs: &HashMap<ValueId, Value>) -> WeightStore {
                         .unwrap_or_else(|e| panic!("{}: {e}", parsed.linear_id()));
                 }
             }
+            // An expert stack: its experts are the store entries `{stack id}.{expert}`, which
+            // `ConstWeights` views as one `ExpertStack`.
+            Value::PackedStack(component) => {
+                let parsed = PackedSourceName::parse(&name).unwrap_or_else(|| {
+                    panic!("{name}: packed value with a non-packed-source name")
+                });
+                if packed_linear_ids.insert(parsed.linear_id().to_string()) {
+                    let stack = component.stack();
+                    for expert in 0..stack.experts() {
+                        let key = format!("{}.{expert}", parsed.linear_id());
+                        builder
+                            .insert(
+                                key.clone(),
+                                WeightEntry::Packed(Arc::clone(stack.owner(expert))),
+                            )
+                            .unwrap_or_else(|e| panic!("{key}: {e}"));
+                    }
+                }
+            }
             other => {
                 panic!("{name}: const value kind {other:?} is not supported by this test helper")
             }
         }
     }
     builder.build()
+}
+
+/// Load `inputs`'s consts as one executable bound through a weight map, and return `g` with its
+/// consts named by the ids the map holds: stage that graph, not `g`.
+fn load_consts(
+    engine: &mut poot_executor::Engine<PtxDeviceProxy<'_>>,
+    g: &Graph,
+    inputs: &HashMap<ValueId, Value>,
+) -> (ExecutableId, Graph) {
+    let store = const_store(g, inputs);
+    let mut weights = ConstWeights::new(&store);
+    let named = weights.graph(g);
+    let exe = engine
+        .load_weights(Arc::new(store.clone()), Arc::new(weights.map()))
+        .expect("load_weights");
+    (exe, named)
 }
 
 /// `inputs`'s `Storage::Slot` entries only, as the `SlotKey`-keyed [`StepInputs`] `step` takes.
@@ -136,25 +170,20 @@ pub fn run_resident(
     g: &Graph,
     inputs: &HashMap<ValueId, Value>,
 ) -> HostTensor {
-    run_resident_with_fusion(device, g, inputs, false)
+    run_resident_prepared(device, g, inputs, Graph::clone)
 }
 
-/// Like [`run_resident`], but `guarded` compiles under the routed-expert hang guard (for a test that compares the two programs.
-/// output, e.g. a fused-vs-unfused regression).
-pub fn run_resident_with_fusion(
+/// [`run_resident`] over `prepare(named)`: the graph with its consts named by the weight map, rewritten by
+/// `prepare` (a legalization for a smaller buffer limit than the device's) before it is compiled for the device.
+pub fn run_resident_prepared(
     device: &mut PtxDevice,
     g: &Graph,
     inputs: &HashMap<ValueId, Value>,
-    guarded: bool,
+    prepare: impl FnOnce(&Graph) -> Graph,
 ) -> HostTensor {
     let mut engine = poot_executor::Engine::new(PtxDeviceProxy(device));
-    let exe = engine
-        .load_weights(
-            Arc::new(const_store(g, inputs)),
-            poot_executor::WeightSource::ConstNames,
-        )
-        .expect("load_weights");
-    let staged = staged_program(g, Device::target(engine.device()), guarded);
+    let (exe, named) = load_consts(&mut engine, g, inputs);
+    let staged = staged_program(&prepare(&named), Device::target(engine.device()));
     let entry = engine.add_entry(exe, &staged).expect("add_entry");
     let bytes = engine
         .step(exe, entry, &slot_inputs(g, inputs), &mut NoSync)
@@ -177,13 +206,8 @@ pub fn run_resident_i32(
     inputs: &HashMap<ValueId, Value>,
 ) -> Vec<i32> {
     let mut engine = poot_executor::Engine::new(PtxDeviceProxy(device));
-    let exe = engine
-        .load_weights(
-            Arc::new(const_store(g, inputs)),
-            poot_executor::WeightSource::ConstNames,
-        )
-        .expect("load_weights");
-    let staged = staged_program(g, Device::target(engine.device()), false);
+    let (exe, named) = load_consts(&mut engine, g, inputs);
+    let staged = staged_program(&named, Device::target(engine.device()));
     let entry = engine.add_entry(exe, &staged).expect("add_entry");
     let bytes = engine
         .step(exe, entry, &slot_inputs(g, inputs), &mut NoSync)
@@ -206,20 +230,10 @@ pub struct DecodeEntry<'d> {
 }
 
 impl<'d> DecodeEntry<'d> {
-    pub fn capture(
-        device: &'d mut PtxDevice,
-        g: &Graph,
-        inputs: &HashMap<ValueId, Value>,
-        guarded: bool,
-    ) -> Self {
+    pub fn capture(device: &'d mut PtxDevice, g: &Graph, inputs: &HashMap<ValueId, Value>) -> Self {
         let mut engine = poot_executor::Engine::new(PtxDeviceProxy(device));
-        let exe = engine
-            .load_weights(
-                Arc::new(const_store(g, inputs)),
-                poot_executor::WeightSource::ConstNames,
-            )
-            .expect("load_weights");
-        let staged = staged_program(g, Device::target(engine.device()), guarded);
+        let (exe, named) = load_consts(&mut engine, g, inputs);
+        let staged = staged_program(&named, Device::target(engine.device()));
         let entry = engine.add_entry(exe, &staged).expect("add_entry");
         Self {
             engine,
@@ -266,7 +280,7 @@ impl<'d> DecodeEntry<'d> {
             poot_graph_ir::StateRole::Recurrent,
         );
         let probe = b.finish(state);
-        let staged = staged_program(&probe, Device::target(self.engine.device()), false);
+        let staged = staged_program(&probe, Device::target(self.engine.device()));
         let probe_entry = self
             .engine
             .add_entry(self.exe, &staged)

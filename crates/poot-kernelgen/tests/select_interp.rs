@@ -147,7 +147,7 @@ fn expected(numel: usize) -> Vec<u32> {
 
 /// An F32 select over poisoned branches equals the hand-written words: both the NaN/Inf stay-out lanes and the
 /// payload passthrough lanes, and a condition of 2 and -1 picks `if_true`. Mutation: change the emitter's
-/// `Ne 0` to `Eq 1` in `emit_bitwise_select`; the cond 2 and -1 lanes select `if_false` and this row goes red.
+/// `Ne 0` to `Eq 1` in `emit_select`; the cond 2 and -1 lanes select `if_false` and this row goes red.
 #[test]
 fn float_select_equals_the_hand_written_words() {
     let (got, _) = run_select(6, &DeviceCaps::wgpu_rdna3_igpu(), true, flat(6));

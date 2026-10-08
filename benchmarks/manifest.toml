@@ -52,6 +52,62 @@ osl = 128                       # decode tokens timed at each ISL (per-token TPO
 synthetic = true                # exactly-ISL random in-vocab tokens: tokenizer-neutral + defeats prefix cache
 
 # ----------------------------------------------------------------------------------------------
+# Performance evidence policy (spec 1003): what `bench compare` and the performance bank judge a speed
+# change by. Declared here, read by harness/performance_receipt.py; nothing else holds a threshold.
+#
+# Trials are bounded and interleaved by the invoker: at least `min_trials` repeats per side before any
+# verdict, at most `max_trials` before the cell is reported unverified with its budget exhausted. Per metric:
+# `direction` says which way is worse (latency worse higher, throughput worse lower), `practical_threshold`
+# is the relative loss a change must be able to exclude, and `max_uncertainty` the widest relative band
+# (twice the larger observed range over the baseline median) a "within noise" verdict may rest on. A band too
+# wide to exclude a practical loss is unverified, never success.
+#
+# A decode-curve cell is compared at its smallest context (`headline_metric`) and at every context the
+# baseline measured (`curve_point_metrics`), so a good headline cannot hide a slower long-context token.
+# ----------------------------------------------------------------------------------------------
+[performance]
+min_trials = 5
+max_trials = 15
+headline_metric = "decode_tok_s"
+curve_point_metrics = ["tpot_ms", "ttft_ms"]
+
+[performance.metrics.ttft_ms]
+direction = "lower"
+practical_threshold = 0.20
+max_uncertainty = 0.10
+
+[performance.metrics.tpot_ms]
+direction = "lower"
+practical_threshold = 0.20
+max_uncertainty = 0.10
+
+[performance.metrics.itl_ms]
+direction = "lower"
+practical_threshold = 0.20
+max_uncertainty = 0.10
+
+[performance.metrics.e2e_ms]
+direction = "lower"
+practical_threshold = 0.20
+max_uncertainty = 0.10
+
+[performance.metrics.decode_tok_s]
+direction = "higher"
+practical_threshold = 0.20
+max_uncertainty = 0.10
+
+[performance.metrics.prefill_tok_s]
+direction = "higher"
+practical_threshold = 0.20
+max_uncertainty = 0.10
+
+# Kernel-level wall time of one bank step (the performance bank's metric).
+[performance.metrics.step_us]
+direction = "lower"
+practical_threshold = 0.20
+max_uncertainty = 0.10
+
+# ----------------------------------------------------------------------------------------------
 # Models. size_class picks which pods can run them (small = Arc + cheap pod; xl = RunPod only).
 # Each [model.frameworks.<fw>] = { precision, caveat? } for poot; { support, precision, reason?, caveat? }
 # for the other frameworks.

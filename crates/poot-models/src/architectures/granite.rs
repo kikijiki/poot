@@ -443,9 +443,23 @@ mod legacy {
     use poot_graph_ir::{BinOp, Builder, Graph, Slot, StateRole, TensorType};
     use poot_tensor::DType;
 
-    use crate::qwen2::Qwen2Config;
+    /// The dense decoder dimensions the legacy tracers read.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct LegacyConfig {
+        pub vocab: usize,
+        pub hidden: usize,
+        pub inter: usize,
+        pub layers: usize,
+        pub n_heads: usize,
+        pub n_kv_heads: usize,
+        pub head_dim: usize,
+        pub rotary_dim: usize,
+        pub eps: f32,
+        pub max_pos: usize,
+        pub sliding_window: Option<usize>,
+    }
 
-    /// Granite parameters alongside a [`Qwen2Config`]: the four scalar multipliers plus the MLP kind.
+    /// Granite parameters alongside a [`LegacyConfig`]: the four scalar multipliers plus the MLP kind.
     #[derive(Clone, Copy, Debug)]
     pub struct GraniteParams {
         /// Token embeddings are multiplied by this (`embedding_multiplier`) in-graph: the embed table is tied to the
@@ -464,7 +478,7 @@ mod legacy {
     /// positions [0,N) (a `dynamic_update_slice` of the `[1,Hkv,N,D]` block at slot 0, axis 2), with the state
     /// names/order of [`trace_granite_decode_kv_masked`] so the caches feed the decode loop from pos=N.
     pub fn trace_granite_prefill_kv(
-        cfg: Qwen2Config,
+        cfg: LegacyConfig,
         gp: GraniteParams,
         n: usize,
         cap: usize,
@@ -602,7 +616,7 @@ mod legacy {
     /// `residual_mult` on each sublayer output, dense-swiglu MLP, final logits / `logits_scale`.
     /// No qk-norm, no qkv bias, two norms (input + post_attention), single rope base.
     pub fn trace_granite_decode_kv_masked(
-        cfg: Qwen2Config,
+        cfg: LegacyConfig,
         gp: GraniteParams,
         cap: usize,
     ) -> Graph {
@@ -736,7 +750,9 @@ mod family_tests {
     use poot_load::gguf::GgufValue;
     use serde_json::json;
 
-    use super::legacy::{GraniteParams, trace_granite_decode_kv_masked, trace_granite_prefill_kv};
+    use super::legacy::{
+        GraniteParams, LegacyConfig, trace_granite_decode_kv_masked, trace_granite_prefill_kv,
+    };
     use super::*;
     use crate::components::standard::oracle::run_step;
     use crate::components::testing::{
@@ -746,7 +762,6 @@ mod family_tests {
         f32_entry, gguf_dense_kvs, gguf_name_with_head, gguf_tensor, legacy_eval, q8_0_store,
         read_back_owned, values,
     };
-    use crate::qwen2::Qwen2Config;
     use crate::registry::Registry;
 
     const VOCAB: usize = 48;
@@ -755,8 +770,8 @@ mod family_tests {
         key.ends_with("_proj.weight")
     }
 
-    fn legacy_cfg() -> Qwen2Config {
-        Qwen2Config {
+    fn legacy_cfg() -> LegacyConfig {
+        LegacyConfig {
             vocab: VOCAB,
             hidden: 64,
             inter: 96,
@@ -767,7 +782,6 @@ mod family_tests {
             rotary_dim: 16,
             eps: 1e-6,
             max_pos: 64,
-            qkv_bias: false,
             ..Default::default()
         }
     }
@@ -1280,16 +1294,30 @@ mod moe_tests {
         let raw = RawConfig::Gguf(&index);
         assert_eq!(registry.resolve(&raw).unwrap().family, FAMILY);
         let model = registry.build(&raw, &store).unwrap();
-        let experts = model
+        let stacks: Vec<_> = model
             .weights()
             .iter()
-            .filter(|(id, _, _)| matches!(id.role, WeightRole::Moe(MoeRole::Expert(..))))
-            .count();
+            .filter(|(id, _, _)| matches!(id.role, WeightRole::Moe(MoeRole::Stack(..))))
+            .collect();
         assert_eq!(
-            experts,
-            2 * 3 * EXPERTS,
-            "one packed owner per expert projection"
+            stacks.len(),
+            2 * 3,
+            "one stack per layer and expert projection"
         );
+        for (id, view, handle) in stacks {
+            assert!(
+                matches!(handle.format, poot_quant::weights::HandleFormat::Packed(_)),
+                "{id}: a packed stack"
+            );
+            assert_eq!(
+                handle.shape[0], EXPERTS,
+                "{id}: one packed owner per expert"
+            );
+            assert!(
+                matches!(view, poot_quant::weights::WeightView::ExpertStack(keys) if keys.len() == EXPERTS),
+                "{id}: the experts viewed as one stack"
+            );
+        }
         let reference = built(
             &ENTRY,
             &RawConfig::HfJson {

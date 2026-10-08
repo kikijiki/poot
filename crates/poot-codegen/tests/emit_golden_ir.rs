@@ -863,3 +863,60 @@ fn compile_rejects_a_malformed_body_before_running_a_tool() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// POOT-1041: a `Select` over BF16 or F16 branches is one LLVM `select` over the two-byte type, loaded and
+/// stored as stored: no widening to `float`, no bit-twiddling through an integer, nothing that could quiet a
+/// NaN payload. Mutation: declare the region's output lane F32 instead of the select's own type
+/// (`slice_dtype(region_tys.output ..)` in `fused_views`); the body no longer verifies (`assigned value:
+/// expected F32, found BF16`). A select emitted through a `Cast` to F32 and back would add `fpext`/`fptrunc`
+/// and fail the word assertions.
+#[test]
+fn a_two_byte_select_is_one_llvm_select_over_the_stored_type() {
+    use poot_kernelgen as kg;
+    for (leaf, llvm_ty) in [(kg::LeafTy::BF16, "bfloat"), (kg::LeafTy::F16, "half")] {
+        let body = kg::fused_views(
+            "narrow_select",
+            &[4],
+            &[&[4], &[4], &[4]],
+            &[
+                kg::Layout::contiguous(&[4]),
+                kg::Layout::contiguous(&[4]),
+                kg::Layout::contiguous(&[4]),
+            ],
+            &kg::FusedKernel {
+                leaf_tys: vec![kg::LeafTy::I32, leaf, leaf],
+                steps: vec![kg::FusedStep {
+                    op: kg::FusedScalarOp::Select,
+                    inputs: vec![
+                        kg::FusedInput::Leaf(0),
+                        kg::FusedInput::Leaf(1),
+                        kg::FusedInput::Leaf(2),
+                    ],
+                }],
+                output: kg::FusedInput::Step(0),
+            },
+            None,
+        )
+        .expect("a narrow select region generates");
+        for target in [Target::Nvptx, Target::AmdGcn(AmdArch::gfx1151())] {
+            let ir = emit_llvm_ir(&body, target).unwrap();
+            assert!(
+                ir.contains("select i1 %")
+                    && ir.contains(&format!(", {llvm_ty} %"))
+                    && ir.contains(&format!("load {llvm_ty}"))
+                    && ir.contains(&format!("store {llvm_ty}")),
+                "{llvm_ty} {target:?}: one select over the stored type\n{ir}"
+            );
+            let words: Vec<&str> = ir
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|word| !word.is_empty())
+                .collect();
+            for widened in ["fpext", "fptrunc", "float"] {
+                assert!(
+                    !words.contains(&widened),
+                    "{llvm_ty} {target:?}: no `{widened}` in a move\n{ir}"
+                );
+            }
+        }
+    }
+}

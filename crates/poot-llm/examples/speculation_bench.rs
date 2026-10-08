@@ -128,12 +128,9 @@ fn main() -> Result<()> {
 
     let granule = target.config().prefill_granule.get();
     let chunk = NonZeroUsize::new(128usize.div_ceil(granule) * granule).expect("nonzero");
-    let compile = CompileOptions {
-        execution: Submission::Replay,
-        limits: CompileLimits::STANDARD,
-    };
+    let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
     let options = DriverOptions {
-        prefill: compile,
+        prefill: compile.clone(),
         decode: compile,
         capacity: NonZeroUsize::new(prompt_tokens.len() + new).expect("nonzero"),
         prefill_chunk: chunk,

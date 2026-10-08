@@ -6,17 +6,16 @@
 //! asks `Device::allocate`/`Device::dispatch` for), not a backend's numeric result (that half is
 //! `poot-gpu/tests/buffer_plan.rs`, on real wgpu hardware).
 //!
-//! Fixture (same shape as `poot-gpu`'s, compiled under the routed-expert hang guard so it stays five
-//! dispatches: the graph carries a dead routed-expert site and the fake target has the hang):
+//! Fixture (same shape as `poot-gpu`'s, compiled through the full pipeline: `fuse` folds `c + c` into
+//! the reduce that reads it, so the program is four dispatches):
 //!
 //! ```text
 //! a, b: const [K]            K = 64
 //! v1  = a + b                 // eqn 0: [K]
 //! s1  = reduce_sum(v1, axis0) // eqn 1: [1]; v1 dies
 //! c:    const [1]
-//! v2  = c + c                 // eqn 2: [1]; reuses v1's freed [K] arena slot
-//! s2  = reduce_sum(v2, axis0) // eqn 3: [1]
-//! out = s1 + s2                // eqn 4
+//! s2  = reduce_sum(c + c)     // eqn 2: one FusedRow, [1]; reuses v1's freed [K] arena slot
+//! out = s1 + s2                // eqn 3
 //! ```
 
 use std::cell::RefCell;
@@ -38,12 +37,10 @@ type Graph = poot_graph_ir::Graph<ValidationOutputs>;
 
 const K: usize = 64;
 
-const UNFUSED_REPLAY: CompileOptions = CompileOptions {
-    execution: Submission::Replay,
-    limits: poot_graph_plan::CompileLimits::STANDARD,
-};
+const REPLAY: CompileOptions =
+    CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
 
-fn fixture() -> (Graph, Arc<WeightStore>) {
+fn fixture() -> (Graph, Arc<WeightStore>, Arc<poot_quant::weights::WeightMap>) {
     let b = Builder::new();
     let ta = b.constant("a", TensorType::f32(vec![K]));
     let tb = b.constant("b", TensorType::f32(vec![K]));
@@ -53,8 +50,7 @@ fn fixture() -> (Graph, Arc<WeightStore>) {
     let v2 = b.binary(BinOp::Add, tc, tc);
     let s2 = b.reduce(RedOp::Sum, v2, 0, true);
     let out = b.binary(BinOp::Add, s1, s2);
-    let g = poot_test_util::graph_fixtures::with_routed_expert_site(b.finish(out))
-        .with_validations(Vec::new());
+    let g = b.finish(out).with_validations(Vec::new());
 
     let mut wb = WeightStore::builder();
     for (name, n) in [("a", K), ("b", K), ("c", 1)] {
@@ -67,7 +63,11 @@ fn fixture() -> (Graph, Arc<WeightStore>) {
         )
         .unwrap();
     }
-    (g, Arc::new(wb.build()))
+    let store = Arc::new(wb.build());
+    let mut names = poot_test_util::const_weights::ConstWeights::new(&store);
+    let g = names.graph(&g);
+    let map = Arc::new(names.map());
+    (g, store, map)
 }
 
 fn staged(g: &Graph, target: Target) -> StagedProgram<ValidationOutputs> {
@@ -78,15 +78,15 @@ fn staged(g: &Graph, target: Target) -> StagedProgram<ValidationOutputs> {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &UNFUSED_REPLAY,
+        &REPLAY,
     )
-    .expect("the fixture compiles unfused")
+    .expect("the fixture compiles")
 }
 
 fn fake_target() -> Target {
     Target {
         backend: Backend::SpirvVulkan,
-        caps: poot_test_util::graph_fixtures::with_routed_expert_hang(DeviceCaps::wgpu_rdna3_igpu()),
+        caps: DeviceCaps::wgpu_rdna3_igpu(),
     }
 }
 
@@ -197,9 +197,9 @@ impl Device for RecordingDevice {
 }
 
 /// SC-002 (the engine's own half of the decoupled-length contract): every dispatch's `Arg::elems`
-/// is the operand's own logical element count - `v1` [64], `s1`/`v2`/`s2`/`out` [1] - never a slot's
-/// shared capacity, in particular at eqn 2 (`v2 = c + c`), whose output shares `v1`'s freed [64]
-/// arena slot but must still publish length 1.
+/// is the operand's own logical element count - `v1` [64], `s1`/`c`/`s2`/`out` [1] - never a slot's
+/// shared capacity, in particular at eqn 2 (`s2 = reduce_sum(c + c)`), whose output shares `v1`'s freed
+/// [64] arena slot but must still publish length 1.
 ///
 /// Mutation (card 547b, applied by hand, reverted, never left in the tree): in
 /// `crates/poot-executor/src/engine.rs`'s `walk`, build every `Arg` with `elems: 0` again (the
@@ -208,15 +208,13 @@ impl Device for RecordingDevice {
 /// stored `(Loc, u32)` pairs made every one green again.
 #[test]
 fn dispatch_args_carry_the_values_own_length_never_the_slots_capacity() {
-    let (g, store) = fixture();
+    let (g, store, map) = fixture();
     let target = fake_target();
     let recorder = Recorder::default();
     let mut engine = Engine::new(RecordingDevice {
         recorder: recorder.clone(),
     });
-    let exe = engine
-        .load_weights(store, poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let exe = engine.load_weights(store, map).unwrap();
     let entry = engine.add_entry(exe, &staged(&g, target)).unwrap();
     engine
         .step(exe, entry, &StepInputs::new(), &mut NoSync)
@@ -225,15 +223,14 @@ fn dispatch_args_carry_the_values_own_length_never_the_slots_capacity() {
     let dispatches = recorder.dispatches.borrow();
     assert_eq!(
         dispatches.len(),
-        5,
-        "five unfused equations, five dispatches"
+        4,
+        "four equations (`c + c` is folded into its reduce), four dispatches"
     );
-    let expected: [(&[u32], u32); 5] = [
+    let expected: [(&[u32], u32); 4] = [
         (&[64, 64], 64), // eqn 0: v1 = a + b
         (&[64], 1),      // eqn 1: s1 = reduce_sum(v1)
-        (&[1, 1], 1),    // eqn 2: v2 = c + c (output shares v1's freed [64] slot)
-        (&[1], 1),       // eqn 3: s2 = reduce_sum(v2)
-        (&[1, 1], 1),    // eqn 4: out = s1 + s2
+        (&[1], 1),       // eqn 2: s2 = reduce_sum(c + c) (output shares v1's freed [64] slot)
+        (&[1, 1], 1),    // eqn 3: out = s1 + s2
     ];
     for (i, (record, (want_inputs, want_output))) in dispatches.iter().zip(expected).enumerate() {
         assert_eq!(
@@ -258,16 +255,15 @@ fn dispatch_args_carry_the_values_own_length_never_the_slots_capacity() {
 /// reverting to the single sum restored equality.
 #[test]
 fn program_arena_bytes_equals_what_the_engine_allocates() {
-    let (g, store) = fixture();
+    let (g, store, map) = fixture();
     let target = fake_target();
-    let program = poot_graph_plan::compile(&g, &target, &UNFUSED_REPLAY).unwrap();
+    let program = poot_graph_plan::compile(&g, &target, &REPLAY).unwrap();
+
     let recorder = Recorder::default();
     let mut engine = Engine::new(RecordingDevice {
         recorder: recorder.clone(),
     });
-    let exe = engine
-        .load_weights(store, poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let exe = engine.load_weights(store, map).unwrap();
     engine.add_entry(exe, &staged(&g, target)).unwrap();
 
     let activation_bytes = engine
@@ -282,17 +278,17 @@ fn program_arena_bytes_equals_what_the_engine_allocates() {
         program.buffer_plan().arena_bytes() as u64,
         "Program::buffer_plan().arena_bytes() must equal the engine's own Activation allocation"
     );
-    // The reused layout from `dispatch_args_carry_...` above: one [64] slot (v1/v2), three [1]
-    // slots (s1, s2, out) - 67 f32 elements, never the naive 68 (v1, s1, v2, s2, out unshared).
-    assert_eq!(activation_bytes, 67 * 4);
+    // The reused layout from `dispatch_args_carry_...` above: one [64] slot (v1/s2), two [1]
+    // slots (s1, out) - 66 f32 elements, never the naive 67 (v1, s1, s2, out unshared).
+    assert_eq!(activation_bytes, 66 * 4);
 }
 
 /// SC-004 (accounting half): two simultaneously retained entries with distinct scratch allocations
 /// (the fixture compiled twice, once per `add_entry`, into the same executable) have a planned
 /// aggregate equal to the engine's actual retained `Activation` bytes. The expected aggregate is
-/// `2 * 67 * 4` - the same independently hand-traced per-entry byte count
+/// `2 * 66 * 4` - the same independently hand-traced per-entry byte count
 /// [`program_arena_bytes_equals_what_the_engine_allocates`] (SC-003) already names (one `[64]` slot,
-/// three `[1]` slots), never `program.buffer_plan().arena_bytes()` itself (review F2: `Engine::
+/// two `[1]` slots), never `program.buffer_plan().arena_bytes()` itself (review F2: `Engine::
 /// load_entry` allocates from that exact same `BufferPlan` object, so comparing the engine's bytes
 /// against the plan's own accessor is true by construction for any plan, correct or not - a
 /// `BufferPlan::arena_bytes` double-count bug, or any other wrong plan, would pass this assertion as
@@ -302,15 +298,13 @@ fn program_arena_bytes_equals_what_the_engine_allocates() {
 /// the fixture repeating.
 #[test]
 fn two_retained_entries_have_a_planned_aggregate_equal_to_actual_retained_bytes() {
-    let (g, store) = fixture();
+    let (g, store, map) = fixture();
     let target = fake_target();
     let recorder = Recorder::default();
     let mut engine = Engine::new(RecordingDevice {
         recorder: recorder.clone(),
     });
-    let exe = engine
-        .load_weights(store, poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let exe = engine.load_weights(store, map).unwrap();
     engine.add_entry(exe, &staged(&g, target)).unwrap();
     engine.add_entry(exe, &staged(&g, target)).unwrap();
 
@@ -321,7 +315,7 @@ fn two_retained_entries_have_a_planned_aggregate_equal_to_actual_retained_bytes(
         .find(|&(role, _)| role == BufferRole::Activation)
         .map(|(_, snap)| snap.live_bytes)
         .unwrap_or(0);
-    const EXPECTED_PER_ENTRY_BYTES: u64 = 67 * 4;
+    const EXPECTED_PER_ENTRY_BYTES: u64 = 66 * 4;
     assert_eq!(
         activation_bytes,
         2 * EXPECTED_PER_ENTRY_BYTES,
@@ -337,33 +331,28 @@ fn two_retained_entries_have_a_planned_aggregate_equal_to_actual_retained_bytes(
 /// ```text
 /// a, s: state inputs                  // not locally computed, no slot
 /// bias: const
-/// v1    = a + bias      // eqn0: born 0, read by eqn2 -> dies 2
-/// new_a = s + bias      // eqn1: born 1, state-commit source for "a", read by nothing else
-/// junk  = v1 + v1       // eqn2: born 2, read by eqn4 -> dies 4
-/// new_s = a + bias      // eqn3: donated in place into state "s"'s own buffer (its last read of
-///                       // `s` is eqn1, before this write) - never an arena slot at all
-/// result = junk + new_s // eqn4: born 4, graph output
+/// v1    = a + bias      // traced twice (`v1` and `new_s`); `cse` merges them into one value
+/// new_a = s + bias      // state-commit source for "a", read by nothing else
+/// junk  = v1 + v1
+/// result = junk + new_s // graph output; `fuse` folds junk and result into one region over v1
 /// ```
 ///
-/// Only `v1`, `new_a`, `junk` and `result` ever reach the arena (`new_s` writes straight into state
-/// "s", verified below by slot count, not assumed). Hand-traced coloring with `new_a` and `result`
-/// correctly forced live through the epilogue (`death = n = 5`, never handed back to the free list):
-/// `v1` dies at 2, but `junk` is born at 2 too (`<`, not `<=`, in the free-list scan - a value born the
-/// same equation its predecessor last reads is live at once with it, never shares its slot), so `v1`
-/// keeps its own slot; `new_a` is forced to a fresh slot (export); `junk` then finds no slot free
-/// either and gets its own; `result` is forced to a fresh slot (export) too - four distinct
-/// one-occupant slots, each 2 elements: `4 * 2 * 4 = 32` bytes.
+/// After `cse` and `fuse` the program is three equations: `e0: v1`, `e1: new_a`, `e2: result` (the fused
+/// region, reading `v1`). `v1` is also the state-commit source for "s", and it cannot write into "s"'s own
+/// buffer in place because `e1` still reads `s`, so it takes an arena slot like the others. Hand-traced
+/// coloring with `v1`, `new_a` and `result` correctly forced live through the epilogue (`death = n = 3`,
+/// never handed back to the free list): three distinct one-occupant slots, each 2 elements:
+/// `3 * 2 * 4 = 24` bytes.
 ///
-/// Without the export guard (mutation below), `new_a` (birth 1, nothing else reads it) dies at its
-/// own birth 1, freeing before `junk`'s birth 2 - `junk` reuses `new_a`'s slot, exactly the corruption
-/// the guard exists to prevent: `junk`'s dispatch would overwrite the buffer the state-commit epilogue
-/// later copies out as the new value of state "a". `v1` (now dead at 2, before `result`'s birth 4)
-/// then frees for `result` too, collapsing the group to two slots - `2 * 2 * 4 = 16` bytes - a
+/// Without the export guard (mutation below), `new_a` (birth 1, nothing else reads it) dies at its own
+/// birth 1, freeing before `result`'s birth 2 - `result` reuses `new_a`'s slot, exactly the corruption the
+/// guard exists to prevent: `result`'s dispatch would overwrite the buffer the state-commit epilogue later
+/// copies out as the new value of state "a". The group collapses to two slots - `2 * 2 * 4 = 16` bytes - a
 /// different, independently wrong number, never a value this test derives from `BufferPlan` itself.
 ///
 /// Mutation (applied by hand, reverted, never left in the tree): in
 /// `crates/poot-graph-plan/src/buffer_plan.rs`'s `plan_buffers`, make the `export` closure a no-op.
-/// Observed: `activation_allocs` becomes `[2, 2]` (16 bytes) instead of `[2, 2, 2, 2]` (32 bytes);
+/// Observed: `activation_allocs` becomes `[2, 2]` (16 bytes) instead of `[2, 2, 2]` (24 bytes);
 /// restoring the closure's body made both green again.
 #[test]
 fn state_commit_export_keeps_its_own_slot_through_the_epilogue() {
@@ -385,10 +374,9 @@ fn state_commit_export_keeps_its_own_slot_through_the_epilogue() {
     let junk = b.binary(BinOp::Add, v1, v1);
     let new_s = b.binary(BinOp::Add, a, bias);
     let result = b.binary(BinOp::Add, junk, new_s);
-    let g = poot_test_util::graph_fixtures::with_routed_expert_site(
-        b.finish_with_state(result, &[(a, new_a), (s, new_s)]),
-    )
-    .with_validations(Vec::new());
+    let g = b
+        .finish_with_state(result, &[(a, new_a), (s, new_s)])
+        .with_validations(Vec::new());
 
     let mut wb = WeightStore::builder();
     let bias_bytes: Vec<u8> = (0..K).flat_map(|_| 1.0f32.to_le_bytes()).collect();
@@ -400,24 +388,24 @@ fn state_commit_export_keeps_its_own_slot_through_the_epilogue() {
     )
     .unwrap();
     let store = Arc::new(wb.build());
+    let mut names = poot_test_util::const_weights::ConstWeights::new(&store);
+    let g = names.graph(&g);
+    let map = Arc::new(names.map());
 
     let target = fake_target();
     let recorder = Recorder::default();
     let mut engine = Engine::new(RecordingDevice {
         recorder: recorder.clone(),
     });
-    let exe = engine
-        .load_weights(store, poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let exe = engine.load_weights(store, map).unwrap();
     engine.add_entry(exe, &staged(&g, target)).unwrap();
 
     let activation_allocs = recorder.activation_allocs.borrow().clone();
     assert_eq!(
         activation_allocs,
-        vec![K, K, K, K],
-        "v1/new_a/junk/result must each get their own arena slot (hand-traced above; new_s donates \
-         in place and never reaches the arena at all); a shorter list means an export's slot was \
-         handed to a later value"
+        vec![K, K, K],
+        "v1/new_a/result must each get their own arena slot (hand-traced above); a shorter list \
+         means an export's slot was handed to a later value"
     );
     let activation_bytes: u64 = engine
         .stats()
@@ -428,7 +416,7 @@ fn state_commit_export_keeps_its_own_slot_through_the_epilogue() {
         .unwrap_or(0);
     assert_eq!(
         activation_bytes,
-        (4 * K * 4) as u64,
-        "independently hand-traced arena bytes for this fixture (four never-reused [K=2] f32 slots)"
+        (3 * K * 4) as u64,
+        "independently hand-traced arena bytes for this fixture (three never-reused [K=2] f32 slots)"
     );
 }

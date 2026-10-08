@@ -136,6 +136,14 @@ pub enum PackedWeightError {
         row: usize,
         rows: usize,
     },
+    /// [`PackedStack::try_new`] was given no experts: there is no table to build.
+    StackEmpty,
+    /// [`PackedStack::try_new`] experts that do not share one format and shape: a stacked table has
+    /// one descriptor, so the experts' slabs are all alike.
+    StackParts {
+        first: PackedWeight,
+        other: PackedWeight,
+    },
 }
 
 impl From<DecodeError> for PackedWeightError {
@@ -228,6 +236,11 @@ impl fmt::Display for PackedWeightError {
             Self::RowOutOfRange { row, rows } => {
                 write!(f, "row {row} is past the parts' {rows} stacked rows")
             }
+            Self::StackEmpty => write!(f, "an expert stack needs at least one expert, got none"),
+            Self::StackParts { first, other } => write!(
+                f,
+                "expert stack parts must share one format and shape: {first:?} vs {other:?}"
+            ),
         }
     }
 }
@@ -351,6 +364,30 @@ impl PackedWeight {
     pub fn source_bytes(self, role: SourceRole) -> usize {
         let [rows, row_bytes] = self.source_shape(role);
         rows * row_bytes
+    }
+
+    /// The bytes one expert of a stacked table holds of `role`: [`Self::source_bytes`] padded up to
+    /// whole `u32` words, so every expert's slab starts on a word boundary and a kernel finds expert
+    /// `e`'s source at word `e * slab_words(role)`.
+    pub fn slab_bytes(self, role: SourceRole) -> usize {
+        self.source_bytes(role).next_multiple_of(4)
+    }
+
+    /// [`Self::slab_bytes`] in `u32` words: the per-expert stride of a stacked table's `role` source.
+    pub fn slab_words(self, role: SourceRole) -> usize {
+        self.slab_bytes(role) / 4
+    }
+
+    /// The most experts one stacked table of this weight holds with every source addressable: the indexed kernels
+    /// reach expert `e`'s slab at bit offset `e * slab_words(role) * 32` held in 32 bits, so a table of `E` experts
+    /// needs `E * slab_words(role) * 32 <= u32::MAX` for every [`Self::sources`] role (512 MiB of one source). A
+    /// larger stack is split into expert ranges, each its own table.
+    pub fn max_stack_experts(self) -> usize {
+        self.sources()
+            .into_iter()
+            .map(|role| u32::MAX as usize / (self.slab_words(role) * 32).max(1))
+            .min()
+            .unwrap_or(0)
     }
 
     /// `source_bytes` summed over every [`Self::sources`]: the total authoritative byte footprint
@@ -509,6 +546,129 @@ impl PackedComponentRef {
         self.owner.source_fingerprint(self.role)
     }
 }
+
+/// The experts of one routed projection as one table: `experts` packed weights of one format and shape,
+/// held as their own payloads and read together as a stacked `[experts, out, K]` weight. A stacked
+/// table is never one payload: each expert keeps its own source bytes (ADR-0109), and the device
+/// upload lays them back to back at [`PackedWeight::slab_bytes`] strides.
+///
+/// Key convention: the GGUF loader stores a rank-3 expert tensor `key` as one entry per expert named
+/// `{key}.{expert}`, and a stack's [`weights::WeightView::ExpertStack`] lists those keys in expert order. Test
+/// fixtures that name a stack `S` hold its experts as `S.0`, `S.1`, .. (`poot_test_util::const_weights::ConstWeights`
+/// and `weight_map_oracle::expert_owners` read that spelling).
+#[derive(Clone, Debug)]
+pub struct PackedStack {
+    weight: PackedWeight,
+    owners: Vec<Arc<PackedPayload>>,
+}
+
+impl PackedStack {
+    /// Stack `owners` in order: refused when empty or when the experts differ in format or shape.
+    pub fn try_new(owners: Vec<Arc<PackedPayload>>) -> Result<Self, PackedWeightError> {
+        let first = owners.first().ok_or(PackedWeightError::StackEmpty)?.weight;
+        if let Some(other) = owners
+            .iter()
+            .map(|owner| owner.weight)
+            .find(|&w| w != first)
+        {
+            return Err(PackedWeightError::StackParts { first, other });
+        }
+        Ok(Self {
+            weight: first,
+            owners,
+        })
+    }
+
+    /// The one descriptor every expert shares.
+    pub const fn weight(&self) -> PackedWeight {
+        self.weight
+    }
+
+    pub fn experts(&self) -> usize {
+        self.owners.len()
+    }
+
+    /// Expert `expert`'s own payload. Panics when `expert >= experts()`.
+    pub fn owner(&self, expert: usize) -> &Arc<PackedPayload> {
+        &self.owners[expert]
+    }
+
+    /// Decode logical row `row` of expert `expert` into `out` ([`PackedPayload::decode_row`]).
+    pub fn decode_row(
+        &self,
+        expert: usize,
+        row: usize,
+        out: &mut [f32],
+    ) -> Result<(), DecodeError> {
+        self.owners[expert].decode_row(row, out)
+    }
+}
+
+impl PartialEq for PackedStack {
+    fn eq(&self, other: &Self) -> bool {
+        self.owners.len() == other.owners.len()
+            && self
+                .owners
+                .iter()
+                .zip(&other.owners)
+                .all(|(a, b)| Arc::ptr_eq(a, b) || a == b)
+    }
+}
+
+impl Eq for PackedStack {}
+
+/// A no-copy runtime binding for one source role of a [`PackedStack`] (the stacked counterpart of
+/// [`PackedComponentRef`]): cloning clones only the outer [`Arc`].
+#[derive(Clone, Debug)]
+pub struct PackedStackComponentRef {
+    stack: Arc<PackedStack>,
+    role: SourceRole,
+}
+
+impl PackedStackComponentRef {
+    pub fn new(stack: Arc<PackedStack>, role: SourceRole) -> Self {
+        Self { stack, role }
+    }
+
+    pub const fn role(&self) -> SourceRole {
+        self.role
+    }
+
+    pub fn stack(&self) -> &Arc<PackedStack> {
+        &self.stack
+    }
+
+    pub fn weight(&self) -> PackedWeight {
+        self.stack.weight()
+    }
+
+    pub fn same_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.stack, &other.stack)
+    }
+
+    /// The stacked table's `role` bytes as the device holds them: every expert's source padded to
+    /// [`PackedWeight::slab_bytes`], back to back (the one definition of that layout; the executor
+    /// binder pads a mapped stack the same way from its stored runs).
+    pub fn slab_bytes(&self) -> Vec<u8> {
+        let weight = self.stack.weight();
+        let slab = weight.slab_bytes(self.role);
+        let mut bytes = Vec::with_capacity(slab * self.stack.experts());
+        for expert in 0..self.stack.experts() {
+            let source = self.stack.owner(expert).bytes(self.role);
+            bytes.extend_from_slice(source);
+            bytes.resize((expert + 1) * slab, 0);
+        }
+        bytes
+    }
+}
+
+impl PartialEq for PackedStackComponentRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.role == other.role && self.same_owner(other)
+    }
+}
+
+impl Eq for PackedStackComponentRef {}
 
 /// The device transport of one packed source's bytes (dquant.md D9): its native bytes, unchanged,
 /// as zero-filled little-endian `u32` words plus one zero guard word, so a generated kernel's

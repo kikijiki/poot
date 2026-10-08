@@ -13,8 +13,8 @@ use poot_graph_ir::{
     TensorType, ValidationOutputs, ValueId,
 };
 use poot_graph_plan::{
-    CompileOptions, KernelChoice, Plan, Submission, Target, compile,
-    passes_without_target as optimize,
+    Capability, CompileError, CompileOptions, KernelChoice, Plan, PlanError, Submission, Target,
+    compile, passes_without_target as optimize,
 };
 use poot_kernelgen::{AttentionSchedule, AttentionSpec, KernelRequest, ScoreTransform};
 use poot_target::{AmdArch, Backend};
@@ -62,6 +62,7 @@ fn single_key() -> LiveAttentionFixture {
         dv: 8,
         shared_dim: None,
         softcap: Some(30.0),
+        dtype: poot_tensor::DType::F32,
     }
 }
 
@@ -233,6 +234,7 @@ fn a_poisoned_tail_past_the_live_length_never_reaches_the_output() {
         dv: 8,
         shared_dim: None,
         softcap: None,
+        dtype: poot_tensor::DType::F32,
     };
     let built = fixture.build(true);
     let inputs = fixture.inputs(&built, &[64], true);
@@ -336,10 +338,7 @@ fn planned_attention(graph: &Graph<ValidationOutputs>, target: &Target) -> (Atte
     let program = compile(
         graph,
         target,
-        &CompileOptions {
-            execution: Submission::Replay,
-            limits: poot_graph_plan::CompileLimits::STANDARD,
-        },
+        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect("the fixture compiles");
     let mut found = program
@@ -440,6 +439,7 @@ fn the_compiled_live_decode_plans_a_live_bound_and_a_length_independent_launch()
         dv: 8,
         shared_dim: None,
         softcap: None,
+        dtype: poot_tensor::DType::F32,
     };
     let built = fixture.build(true);
     for (name, target) in targets() {
@@ -511,10 +511,7 @@ fn a_declined_live_graph_plans_on_every_target() {
         let program = compile(
             &built.graph,
             &target,
-            &CompileOptions {
-                execution: Submission::Replay,
-                limits: poot_graph_plan::CompileLimits::STANDARD,
-            },
+            &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
         )
         .unwrap_or_else(|e| panic!("{name}: the declined live graph must plan: {e}"));
         assert!(
@@ -560,6 +557,126 @@ fn a_declined_live_graph_treats_an_out_of_range_length_as_length_one() {
         assert!(
             matches!(outcome, Err(EvalError::Cast(_))),
             "len {len}: expected a typed cast fault, got {outcome:?}"
+        );
+    }
+}
+
+/// The two-byte float dtypes the live bound runs in.
+const NARROW: [poot_tensor::DType; 2] = [poot_tensor::DType::BF16, poot_tensor::DType::F16];
+
+fn narrow(fixture: LiveAttentionFixture, dtype: poot_tensor::DType) -> LiveAttentionFixture {
+    LiveAttentionFixture { dtype, ..fixture }
+}
+
+/// POOT-1041, the oracle: the guarded live composite over BF16 and F16 operands (dense and split key, NaN in
+/// every inactive key and value) evaluates to the first-`len` keys' plain attention at the same dtype, bit
+/// for bit: the bit-moving `Select` lets nothing of the tail through, and the same-dtype arithmetic matches.
+/// Mutation: drop the V guard (`guard_rows(v)` in `ops::attention_over_keys`); `0 * NaN` reaches the value
+/// matmul and the finiteness assertion fails.
+#[test]
+fn a_narrow_live_composite_evaluates_to_the_first_keys_oracle_with_a_poisoned_tail() {
+    let len = [4, 13, 1];
+    for dtype in NARROW {
+        for fixture in [single_key(), split_key()] {
+            let fixture = narrow(fixture, dtype);
+            let built = fixture.build(true);
+            let inputs = fixture.inputs(&built, &len, true);
+            let got =
+                evaluate(&built.graph, &inputs.values()).expect("the guarded graph evaluates");
+            assert!(
+                got.iter().all(|x| x.is_finite()),
+                "{dtype:?}: poison reached {got:?}"
+            );
+            assert_same_words(
+                &format!("{dtype:?} guarded graph vs first-keys oracle"),
+                &got,
+                &fixture.oracle(&inputs, &built, &len),
+            );
+        }
+    }
+}
+
+/// POOT-1041, the planner: a BF16 or F16 live graph never fuses into the F32 attention kernel (the guarded
+/// graph keeps its primitives), and its float selects plan as pointwise kernels over native two-byte branch
+/// leaves on ROCm and PTX. SPIR-V has no native two-byte lane, so the same graph is refused there with the
+/// typed `DtypeLowering` on the select. Mutations: drop the `NotF32` decline in `match_attention` (the BF16
+/// capacity row fuses to an `Attention` op); drop the BF16/F16 arm of the `Select` planning in
+/// `planner/elementwise.rs` (the ROCm and PTX plans fail `DtypeLowering`, and the SPIR-V refusal row stays).
+#[test]
+fn a_narrow_live_graph_plans_its_selects_natively_and_spirv_refuses_them() {
+    for dtype in NARROW {
+        let built = narrow(single_key(), dtype).build(true);
+        assert!(
+            attentions(&optimize(&built.graph)).is_empty(),
+            "{dtype:?}: the F32 attention kernel must not claim a narrow chain"
+        );
+        let leaf = match dtype {
+            poot_tensor::DType::BF16 => poot_kernelgen::LeafTy::BF16,
+            _ => poot_kernelgen::LeafTy::F16,
+        };
+        for (name, target) in targets() {
+            let result = compile(
+                &built.graph,
+                &target,
+                &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+            );
+            if name == "spirv" {
+                let Err(CompileError::Plan(error)) = result else {
+                    panic!("{dtype:?} {name}: the narrow select must be refused, got {result:?}");
+                };
+                let PlanError::Refused(refusal) = *error else {
+                    panic!("{dtype:?} {name}: expected a typed refusal, got {error:?}");
+                };
+                assert_eq!(refusal.missing, Capability::DtypeLowering, "{dtype:?}");
+                assert!(
+                    matches!(refusal.op, OpKind::Select),
+                    "{dtype:?}: {refusal:?}"
+                );
+                continue;
+            }
+            let program = result.unwrap_or_else(|e| panic!("{dtype:?} {name}: must plan: {e}"));
+            let selects: Vec<_> = program
+                .planned()
+                .filter(|(eqn, _)| {
+                    matches!(eqn.op, OpKind::Select) && program.graph().aval(eqn.out).dtype == dtype
+                })
+                .collect();
+            // The K and V row guards, then the score guard.
+            assert_eq!(selects.len(), 3, "{dtype:?} {name}");
+            for (eqn, _) in selects {
+                let KernelChoice::Generated(KernelRequest::Pointwise(spec)) =
+                    program.kernel_choice(eqn)
+                else {
+                    panic!("{dtype:?} {name}: a select is a generated pointwise kernel");
+                };
+                assert_eq!(
+                    spec.kernel.leaf_tys,
+                    [poot_kernelgen::LeafTy::I32, leaf, leaf],
+                    "{dtype:?} {name}"
+                );
+            }
+        }
+    }
+}
+
+/// POOT-1041: the generated attention kernel is F32 only, so a BF16 capacity chain (no live bound) stays the
+/// decomposition too instead of fusing to an `Attention` op the planner would refuse. Mutation: drop the
+/// `NotF32` decline in `match_attention`; the chain fuses.
+#[test]
+fn a_narrow_capacity_attention_chain_stays_the_decomposition() {
+    for dtype in NARROW {
+        let b = Builder::new();
+        let (hq, cap, d) = (2usize, 6usize, 4usize);
+        let input = |name, shape: Vec<usize>| b.constant(name, TensorType::new(shape, dtype));
+        let q = input("q", vec![1, hq, 1, d]);
+        let k = input("k", vec![1, hq, cap, d]);
+        let v = input("v", vec![1, hq, cap, d]);
+        let mask = input("mask", vec![1, 1, 1, cap]);
+        let out = attention_masked_softcap(&b, q, k, v, 1, 0.5, mask, None);
+        let graph = b.finish(out).with_validations(Vec::new());
+        assert!(
+            attentions(&optimize(&graph)).is_empty(),
+            "{dtype:?}: the chain must stay generic"
         );
     }
 }

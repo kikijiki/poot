@@ -7,6 +7,7 @@
 //! inputs `"read"` and `"write"`.
 
 use poot_runtime_common::DeviceBackend;
+use poot_test_util::const_weights::ConstWeights;
 use poot_test_util::device_skip::open_or_skip;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,10 +39,7 @@ fn staged(g: &Graph, target: Target) -> StagedProgram<poot_graph_ir::ValidationO
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions {
-            execution: Submission::Replay,
-            limits: poot_graph_plan::CompileLimits::STANDARD,
-        },
+        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect("compile the qwen2 graph")
 }
@@ -143,11 +141,10 @@ fn run_once_contract_v(
     g: &Graph,
     inputs: &HashMap<usize, Value>,
 ) -> Vec<f32> {
-    let program = staged(g, target);
     let (store, slot_binds) = split_consts_and_slots_v(g, inputs);
-    let exe = exec
-        .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (bound, map) = ConstWeights::bind(g, &store);
+    let program = staged(&bound, target);
+    let exe = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
     let entry = exec.add_entry(exe, &program).unwrap();
     let step_in = step_inputs(&slot_binds);
     let bytes = exec
@@ -319,17 +316,20 @@ fn assert_replay_matches_cpu(g: &Graph, feeds: &[Feed], label: &str) {
     };
     let target = device.target();
     let mut exec: Box<dyn Executor> = Box::new(poot_executor::Engine::new(device));
-    let program = staged(g, target);
+    let (store, _) = split_consts_and_slots_v(g, &bind(g, &feeds[0], false));
+    let (bound, map) = ConstWeights::bind(g, &store);
+    let (store, map) = (Arc::new(store), Arc::new(map));
+    let program = staged(&bound, target);
     let mut cpu_state: Vec<HostTensor> = Vec::new();
     let mut loaded: Option<(poot_executor::ExecutableId, poot_executor::EntryId)> = None;
     for (i, feed) in feeds.iter().enumerate() {
         let inputs = bind(g, feed, false);
         let (cpu_logits, next) = cpu_step(g, &inputs, &cpu_state);
         cpu_state = next;
-        let (store, slot_binds) = split_consts_and_slots_v(g, &inputs);
+        let (_, slot_binds) = split_consts_and_slots_v(g, &inputs);
         let (exe, entry) = *loaded.get_or_insert_with(|| {
             let exe = exec
-                .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
+                .load_weights(Arc::clone(&store), Arc::clone(&map))
                 .unwrap();
             (exe, exec.add_entry(exe, &program).unwrap())
         });
@@ -531,11 +531,10 @@ fn assert_paged_prefill_matches_contiguous(slot_map: &[usize], cap: usize, pool:
     let mut exec: Box<dyn Executor> = Box::new(poot_executor::Engine::new(device));
     let cont = run_once_contract_v(&mut *exec, target, &g_cont, &bind(&g_cont, &feed_c, false));
     let inputs = bind(&g_paged, &feed_p, false);
-    let program = staged(&g_paged, target);
     let (store, slot_binds) = split_consts_and_slots_v(&g_paged, &inputs);
-    let exe = exec
-        .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (bound, map) = ConstWeights::bind(&g_paged, &store);
+    let program = staged(&bound, target);
+    let exe = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
     let entry = exec.add_entry(exe, &program).unwrap();
     let paged = f32_bytes(
         &exec
@@ -952,11 +951,10 @@ fn fusion_decode_latency_on_gpu() {
         iters: usize,
     ) -> f64 {
         let inputs = bind(gr, feed, false);
-        let program = staged(gr, target);
         let (store, slot_binds) = split_consts_and_slots_v(gr, &inputs);
-        let exe = exec
-            .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
-            .unwrap();
+        let (bound, map) = ConstWeights::bind(gr, &store);
+        let program = staged(&bound, target);
+        let exe = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
         let entry = exec.add_entry(exe, &program).unwrap();
         let step_in = step_inputs(&slot_binds);
         let _ = exec
@@ -1041,9 +1039,6 @@ fn chunked_prefill_at_nonzero_start_matches_stepped_decode_gpu() {
         Phase::Decode,
         paged_step(1, 1, cap, pool_slots, LogitRows::Last),
     );
-    let staged_prefill = staged(&g_prefill, target);
-    let staged_decode = staged(&g_decode, target);
-
     // One merged store (by const name) for both graphs, loaded fresh per path below so each path
     // starts from independent zero state.
     let merged_store = || -> WeightStore {
@@ -1069,14 +1064,17 @@ fn chunked_prefill_at_nonzero_start_matches_stepped_decode_gpu() {
         }
         builder.build()
     };
+    let merged = merged_store();
+    let mut weights = ConstWeights::new(&merged);
+    let (named_prefill, named_decode) = (weights.graph(&g_prefill), weights.graph(&g_decode));
+    let weight_map = Arc::new(weights.map());
+    let staged_prefill = staged(&named_prefill, target);
+    let staged_decode = staged(&named_decode, target);
     let slots_of = |g: &Graph, feed: &Feed| split_consts_and_slots_v(g, &bind(g, feed, false)).1;
 
     // --- path A: fill [0,s), then a second chunk-prefill replay fills [s, s+l) - logits_chunk. ---
     let exe_a = exec
-        .load_weights(
-            Arc::new(merged_store()),
-            poot_executor::WeightSource::ConstNames,
-        )
+        .load_weights(Arc::new(merged_store()), Arc::clone(&weight_map))
         .unwrap();
     let entry_a = exec.add_entry(exe_a, &staged_prefill).unwrap();
     exec.step(
@@ -1106,10 +1104,7 @@ fn chunked_prefill_at_nonzero_start_matches_stepped_decode_gpu() {
     // --- path B: fill [0,s) the same way, then step a paged decode entry l times over [s, s+l),
     // sharing the pool by name with the SAME executable's prefill entry. ---
     let exe_b = exec
-        .load_weights(
-            Arc::new(merged_store()),
-            poot_executor::WeightSource::ConstNames,
-        )
+        .load_weights(Arc::new(merged_store()), Arc::clone(&weight_map))
         .unwrap();
     let entry_b_prefill = exec.add_entry(exe_b, &staged_prefill).unwrap();
     exec.step(

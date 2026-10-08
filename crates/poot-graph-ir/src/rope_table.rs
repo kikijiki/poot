@@ -1,4 +1,4 @@
-//! RoPE cos/sin tables: the one formula behind the Runner's host `rope.cos`/`rope.sin` constants and
+//! RoPE cos/sin tables: the one formula behind the driver's host `rope.cos`/`rope.sin` constants and
 //! [`ComputedConst::Rope`](crate::ComputedConst::Rope) (Card 562a, R-562-2).
 //!
 //! A table is `[positions, dim]` row-major with its two halves duplicated (the half-split rotary

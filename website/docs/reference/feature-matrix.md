@@ -10,13 +10,11 @@ The `poot-llm` library selects a GPU runtime with `--backend`. **Three productio
 same graph IR today: **wgpu** (Vulkan/SPIR-V, default), **rocm** (AMD raw HSA), and **ptx** (NVIDIA).
 They are not at parity. A fourth backend, raw Vulkan, has its own section below and is not a column in
 these tables.
-This page answers "does X work on backend Y?". Each row is backed by a test or a code path checked when
-the page was written.
+This page answers "does X work on backend Y?". The model and weight-format tables are generated from what the
+planner says; the other tables are written by hand.
 
 NPU offload was removed; it is not listed as a column here. See
 [NPU offload](../architecture/npu.mdx).
-
-_Last reviewed: September 2026. Synced with backend capability claims on this site._
 
 For lower-level kernel/dispatch capability (elementwise, GEMV, flash attention, capture/replay, ...), see
 the [Backends](../architecture/backends.mdx#capability-comparison) architecture page, this page is the
@@ -32,118 +30,152 @@ Legend: colored badges use the same vocabulary on this page and on
 poot is being refactored. This is not available yet and is planned to return.
 :::
 
-Today `poot-serve` serves encoder embeddings and reranking. `/v1/completions` and `/v1/chat/completions` return a typed `503`, and `/health` reports `"engine_loaded": false`. See [Serving](../serve/index.md).
+Today `poot-serve` serves generation (`/v1/completions`, `/v1/chat/completions`) from one scheduling loop over the driver on wgpu and ROCm; embeddings, reranking and LoRA administration answer a typed `503`. See [Serving](../serve/index.md).
 
-## Models
+## Models and weight formats
 
-|                                                                                                  | wgpu                                                                             | ROCm                                                                                                                      | PTX                                                                                                                       |
-| ------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| Dense decoders (Qwen2/3, Llama, Mistral, Gemma 2/3, Granite, OLMo 2, Phi-3/4, SmolLM3, BLOOM, MPT)[^dense-driver] | <span class="matrix-status matrix-status--yes">Yes</span>                        | <span class="matrix-status matrix-status--yes">Yes</span>                                                                 | <span class="matrix-status matrix-status--yes">Yes</span>                                                                 |
-| Mixture-of-experts (Qwen3-MoE, Granite MoE, Mixtral, OLMoE, gpt-oss)                              | <span class="matrix-status matrix-status--yes">Yes</span>                        | <span class="matrix-status matrix-status--yes">Yes</span>[^moe-rocm-ptx]                                                  | <span class="matrix-status matrix-status--yes">Yes</span>[^moe-rocm-ptx]                                                  |
-| DeepSeek-V2/V3 (multi-head latent attention)                                                     | <span class="matrix-status matrix-status--yes">Yes</span> | <span class="matrix-status matrix-status--yes">Yes</span> | <span class="matrix-status matrix-status--yes">Yes</span> |
-| Qwen3-Next (hybrid linear-attention + MoE)                                                       | <span class="matrix-status matrix-status--no">No</span> (being restored)[^not-loadable]           | <span class="matrix-status matrix-status--no">No</span> (being restored)                                                                   | <span class="matrix-status matrix-status--no">No</span> (being restored)                                                                   |
-| Gemma 4 (dense and MoE text)                                                                     | <span class="matrix-status matrix-status--yes">Yes</span>                        | <span class="matrix-status matrix-status--partial">Partial</span>[^gemma4-moe] | <span class="matrix-status matrix-status--partial">Partial</span>[^gemma4-moe] |
-| BERT-class embeddings and cross-encoder reranking                                                | <span class="matrix-status matrix-status--yes">Yes</span>[^encoder-cpu]          | <span class="matrix-status matrix-status--yes">Yes</span>[^encoder-cpu]                                                   | <span class="matrix-status matrix-status--yes">Yes</span>[^encoder-cpu]                                                   |
-| SmolVLM / idefics3 (vision-language)                                                             | <span class="matrix-status matrix-status--yes">Yes</span>                        | <span class="matrix-status matrix-status--partial">Partial</span> (wgpu-verified; ROCm/PTX hardware verification pending) | <span class="matrix-status matrix-status--partial">Partial</span> (wgpu-verified; ROCm/PTX hardware verification pending) |
-| DeepSeek-V3.2 Sparse Attention (DSA)                                                             | <span class="matrix-status matrix-status--yes">Yes</span> | <span class="matrix-status matrix-status--yes">Yes</span> | <span class="matrix-status matrix-status--yes">Yes</span> |
-| Nemotron-H (hybrid Mamba2 + attention)                                                           | <span class="matrix-status matrix-status--yes">Yes</span> | <span class="matrix-status matrix-status--yes">Yes</span> | <span class="matrix-status matrix-status--yes">Yes</span> |
-| Qwen3.8 QSA                                                                                      | <span class="matrix-status matrix-status--no">No</span> (being restored)[^not-loadable]           | <span class="matrix-status matrix-status--no">No</span> (being restored)                                                                   | <span class="matrix-status matrix-status--no">No</span> (being restored)                                                                   |
-| DeepSeek-V4-Flash-0731 (routed MoE)                                                              | <span class="matrix-status matrix-status--no">No</span> (being restored)[^not-loadable]           | <span class="matrix-status matrix-status--no">No</span> (being restored)                                                                   | <span class="matrix-status matrix-status--no">No</span> (being restored)                                                                   |
-| MiniMax-M2 (sigmoid-router MoE)                                                                  | <span class="matrix-status matrix-status--partial">Partial</span>[^minimax-synth] | <span class="matrix-status matrix-status--partial">Partial</span>[^minimax-synth] | <span class="matrix-status matrix-status--partial">Partial</span>[^minimax-synth] |
-| GLM-5.3-Flash                                                                                    | <span class="matrix-status matrix-status--no">No</span> (being restored)[^not-loadable]           | <span class="matrix-status matrix-status--no">No</span> (being restored)                                                                   | <span class="matrix-status matrix-status--no">No</span> (being restored)                                                                   |
-| Qwen3.8-27B-FP8 (`qwen3_5` text tower)                                                           | <span class="matrix-status matrix-status--no">No</span> (being restored)[^not-loadable]           | <span class="matrix-status matrix-status--no">No</span> (being restored)                                                                   | <span class="matrix-status matrix-status--no">No</span> (being restored)                                                                   |
+Whether a model runs on a backend is decided by planning: a model runs when compiling its graph for that backend
+succeeds, and a refusal is a typed error naming the op and the capability the backend lacks. So these tables are not
+written by hand. A test compiles the fixture graphs of every registered model family, and a dense model whose
+projections are stored in every weight format, for each backend, and writes the result between the markers below.
 
-[^dense-driver]:
-    The dense, mixture-of-experts, MLA (DeepSeek-V2/V3/V3.2) and hybrid (Nemotron-H) families load through
-    the model registry (`ModelHandle::load`) and generate through the driver. A Mixtral GGUF names the
-    `llama` architecture and is the llama family with experts when its metadata has
-    `llama.expert_count`; a DeepSeek-V3 GGUF names `deepseek2` and loads as that family with sigmoid gating.
+<!-- generated:feature-matrix:begin -->
 
-[^encoder-cpu]:
-    Embedding and cross-encoder reranking requests always run on the CPU evaluator, not on the selected
-    GPU backend. The per-backend cells mean the `poot-serve` route is available regardless of backend,
-    not that the encoder runs on that backend.
+This region is generated by `just feature-matrix-regen` from what `compile` says about each fixture graph, never edited by hand. See [Reading the matrix](#reading-the-matrix).
 
-[^moe-rocm-ptx]:
-    Mixtral and Qwen3-MoE have ROCm and PTX library decode tests. gpt-oss and OLMoE
-    are traced, loaded, and CPU-oracle verified on all backends, but their GPU decode coverage is thinner than
-    Mixtral/Qwen3-MoE's, test the specific architecture + backend combination you plan to run. Serving is
-    being restored (see the caution above).
+### Model families
 
-[^gemma4-moe]:
-    The dense Gemma 4 text model generates the oracle's tokens through the driver on ROCm and PTX. On those two
-    backends a routed (MoE) graph compiles without the fused attention kernel, because of the routed-expert
-    guard the planner applies there; the Gemma 4 MoE tokens match the oracle, but the attention is not fused.
+Every registered family's fixture graphs (decode and prefill for a decoder, one forward for an encoder) compiled for each target. A family joins this table by being registered with a fixture.
 
-[^minimax-synth]:
-    A synthetic MiniMax-M2 fixture loads through `ModelHandle::load` and generates through `Driver` on wgpu, ROCm and PTX, matching an
-    independent f64 reference (greedy tokens, first-step log-probabilities, the cached keys and values). No real public checkpoint has run, and
-    `poot-serve` continuous batching is not available for it.
+| Family | wgpu | ROCm | PTX |
+| --- | --- | --- | --- |
+| `bert` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `bert/cross_encoder` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `bloom` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `deepseek2` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `deepseek3` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `deepseek32` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `deepseek4` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `deepseek4/finetune` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `gemma2` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `gemma3` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `gemma4` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `gemma4/moe` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `glm53_flash` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `glm53_flash/finetune` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `gpt_oss` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `granite` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `granite/granitemoe` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `idefics3_vision` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `llama` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `llama/mixtral` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `minimax_m2` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `minimax_m2/finetune` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `mpt` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `nemotron_h` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `olmo2` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `olmoe` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `phi3` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `qwen2` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `qwen3` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `qwen35` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `qwen35/finetune` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `qwen35/fp8` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `qwen35/text` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `qwen3moe` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `qwen3next` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `qwen4exp` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `qwen4exp/finetune` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `qwen4exp/packed` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `smollm3` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
 
-[^not-loadable]:
-    `Runner::load` refuses this family with an unsupported-model error naming its architecture string. It is
-    not available yet (poot is being refactored; planned to return); until then no backend runs it.
+### Weight formats
+
+A one-layer dense decoder whose projections are stored in each format (a random admitted payload, bound as the stored bytes), compiled for each target.
+
+| Format | wgpu | ROCm | PTX |
+| --- | --- | --- | --- |
+| AWQ int4 | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| BF16 (dense) | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| E2M1 (FP4), per-32 E8M0 scale | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| FP8 E4M3, 128x128 block BF16 scale | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| FP8 E4M3, 128x128 block F32 scale | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| FP8 E4M3, per-channel BF16 scale | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| FP8 E4M3, per-channel F32 scale | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| GGUF IQ4_NL | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| GGUF IQ4_XS | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| GGUF MXFP4 | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| GGUF Q2_K | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| GGUF Q3_K | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| GGUF Q4_0 | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| GGUF Q4_1 | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| GGUF Q4_K | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| GGUF Q5_0 | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| GGUF Q5_1 | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| GGUF Q5_K | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| GGUF Q6_K | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| GGUF Q8_0 | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| GPTQ int4 | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| GPTQ int4, act-order | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+
+### Measured
+
+No stored benchmark row names a resolved family yet. A row appears here once a benchmark run records one.
+<!-- generated:feature-matrix:end -->
+
+## Reading the matrix
+
+- **Plans** means every fixture graph of the row compiled for that backend: decode and prefill for a decoder, the one
+  forward for an encoder. It says the planner can lower the graph. It does not say a real checkpoint of that family
+  has run there; the Measured table lists the stored benchmark rows that did.
+- **Refused** carries the shape being compiled, the op, and the capability the backend lacks, exactly as the planner
+  reports it. A row is a family key, or `family/variant` for one of the family's option fixtures (a Mixtral or
+  Granite MoE checkpoint is the llama or granite family with experts).
+- **Rejected** is a compile failure that is not a missing capability, for example a graph over the compile limits.
+- The weight-format table binds a random admitted payload of each format as the stored bytes; it checks the
+  lowering, not the numbers. A GGUF Mixtral names the `llama` architecture and loads as the llama family with experts
+  when its metadata has `llama.expert_count`; a DeepSeek-V3 GGUF names `deepseek2`.
+- MXFP4 weights stay packed at load time. The routed-expert projection is one indexed packed contraction that reads
+  only the selected experts' blocks; no expert table is materialized. Dense BF16 and F16 weights are kept as stored
+  words with no host f32 copy. Packed checkpoint size is not a bound on total peak memory.
+- Real checkpoints: Qwen3.8-27B-FP8 ran on PTX (one H100 80 GB) and generates "Paris" for "The capital of France is",
+  with the first token's top-five log-probabilities equal to the CPU oracle's within 1e-3; it has not run on wgpu or
+  ROCm. DeepSeek-V4, MiniMax-M2, GLM-5.3-Flash and Qwen3.8-Flash-Next have only synthetic fixtures that match an
+  independent f64 reference; no real public checkpoint of them has run.
+- The `bert` family runs on the driver's `Encode` step (`poot_llm::encoders`). The `poot-serve` embeddings and reranking
+  routes return `503` until they are restored, whatever the backend.
+- Per-channel E4M3 `compressed-tensors` projections load packed and use the shared generated lowering. See
+  [Using quantized checkpoints](../serve/quantized-checkpoints.md).
 
 ## Expert pooling
 
 Expert pooling (a fixed-capacity expert pool per MoE layer with a runtime residency manager) is not available yet (poot is being refactored; planned to return).
-The MoE models above run through their ordinary, unpooled decode paths, with every expert's
+The mixture-of-experts models in the matrix run through their ordinary, unpooled decode paths, with every expert's
 weights resident.
 
-The former pooled-decode rows for DeepSeek-V3 and Gemma 4 MoE are removed from the Models table. DeepSeek-V3
-is covered by the DeepSeek-V2/V3 row, which is the unpooled decode path. Gemma 4 is covered by its own row (its
-vision and audio towers are not loaded). Qwen3-Next has a row that says it is being restored.
-
 [^serve-removed]:
-    Generation serving is not available yet (poot is being refactored; planned to return). `/v1/completions` and `/v1/chat/completions` return a typed `503`
-    naming the missing engine. See [Serving](../serve/index.md).
-
-## Quantization
-
-|                                                 | wgpu                                                                                                 | ROCm                                                                                              | PTX                                                                                                         |
-| ----------------------------------------------- | ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| GGUF Q4_0/Q4_1/Q5_0/Q5_1/Q8_0                   | <span class="matrix-status matrix-status--yes">Yes</span>                                            | <span class="matrix-status matrix-status--yes">Yes</span>                                         | <span class="matrix-status matrix-status--yes">Yes</span>                                                   |
-| GGUF K-quants (Q2_K-Q6_K, IQ4_NL, IQ4_XS)       | <span class="matrix-status matrix-status--yes">Yes</span>                                            | <span class="matrix-status matrix-status--yes">Yes</span>                                         | <span class="matrix-status matrix-status--yes">Yes</span>                                                   |
-| GGUF MXFP4 (gpt-oss routed experts)[^mxfp4]     | <span class="matrix-status matrix-status--yes">Yes</span>                                            | <span class="matrix-status matrix-status--yes">Yes</span>                                         | <span class="matrix-status matrix-status--partial">Partial</span> (masked decode; synthetic packed prefill) |
-| Safetensors GPTQ (4-bit, symmetric)             | <span class="matrix-status matrix-status--yes">Yes</span>                                            | <span class="matrix-status matrix-status--yes">Yes</span>                                         | <span class="matrix-status matrix-status--yes">Yes</span>                                                   |
-| Safetensors AWQ (4-bit, GEMM)                   | <span class="matrix-status matrix-status--yes">Yes</span>                                            | <span class="matrix-status matrix-status--yes">Yes</span>                                         | <span class="matrix-status matrix-status--yes">Yes</span>                                                   |
-| Safetensors FP8 (`compressed-tensors`)          | <span class="matrix-status matrix-status--partial">Partial</span> (packed Qwen projections[^fp8])    | <span class="matrix-status matrix-status--partial">Partial</span> (packed Qwen projections[^fp8]) | <span class="matrix-status matrix-status--partial">Partial</span> (packed Qwen projections[^fp8])           |
-| Packed projection storage[^packed-memory] | <span class="matrix-status matrix-status--yes">Yes</span> (dense packed projections) | <span class="matrix-status matrix-status--yes">Yes</span>                                         | <span class="matrix-status matrix-status--yes">Yes</span>                                                   |
-
-[^mxfp4]:
-    MXFP4 weights remain packed at load time. The current routed-expert graph decodes and stacks expert
-    tables before `IndexedMatMul`; it is not a direct packed indexed contraction. Format-level kernel
-    coverage does not imply real-checkpoint coverage for every gpt-oss execution path.
-
-[^fp8]:
-    The supported Qwen `compressed-tensors` per-channel E4M3 projection path loads packed and uses the
-    shared generated lowering. DeepSeek-V3.2 block-FP8 loading is also covered by synthetic fixtures;
-    it is not a real-checkpoint generation claim. See [Using quantized checkpoints](../serve/quantized-checkpoints.md).
-
-[^packed-memory]:
-    Dense packed projections and packed embedding gathers avoid full weight materialization. Packed MoE
-    paths currently materialize expert tables during execution. Dense BF16/F16 weights are kept as
-    stored words with no host f32 copy. Packed checkpoint size is not a bound on total peak memory.
+    Not available yet on this backend or for this feature (poot is being refactored; planned to return). `/v1/completions` and `/v1/chat/completions`
+    are served on wgpu and ROCm. See [Serving](../serve/index.md).
 
 ## Serving features
 
-|                                                                                                      | wgpu                                                                    | ROCm                                                                                  | PTX                                                                     |
-| ---------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
-| OpenAI-compatible HTTP server (`poot-serve`)                                                         | <span class="matrix-status matrix-status--yes">Yes</span>               | <span class="matrix-status matrix-status--yes">Yes</span>                             | <span class="matrix-status matrix-status--yes">Yes</span>               |
-| Continuous (in-flight) batching                                                                      | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed]               | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] |
-| Paged KV cache                                                                                       | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed]               | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] |
-| Prefix caching (reuse across requests)                                                               | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed]               | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] |
-| Fast one-shot prefill for the batched path                                                           | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed]               | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] |
-| KV preemption / swap on eviction                                                                     | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed]               | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] |
-| Speculative decoding, single-sequence (prompt-lookup + draft-model, greedy + sampled)                | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed]               | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] |
-| Speculative decoding, inside continuous batching (prompt-lookup and draft-model, greedy and sampled) | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed]               | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] |
-| On-device sampling: greedy                                                                           | <span class="matrix-status matrix-status--yes">Yes</span>[^device-sample] | <span class="matrix-status matrix-status--yes">Yes</span>[^device-sample]             | <span class="matrix-status matrix-status--yes">Yes</span>[^device-sample] |
-| On-device sampling: temperature/top-k/top-p/min-p                                                    | <span class="matrix-status matrix-status--yes">Yes</span>[^device-sample] | <span class="matrix-status matrix-status--yes">Yes</span>[^device-sample]             | <span class="matrix-status matrix-status--yes">Yes</span>[^device-sample] |
-| LoRA adapter serving (hot-load, per-request selection)                                               | <span class="matrix-status matrix-status--no">No</span> (being restored)[^lora-scope]    | <span class="matrix-status matrix-status--no">No</span> (being restored)[^lora-scope]                  | <span class="matrix-status matrix-status--no">No</span> (being restored)[^lora-scope]    |
-| Tensor parallelism (multi-GPU)                                                                       | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed]               | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] |
-| Structured/guided decoding (regex, JSON schema, grammar, choice, forced tool calls)                  | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed]               | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] |
-| Embeddings (`/v1/embeddings`) and reranking (`/v1/rerank`)                                           | <span class="matrix-status matrix-status--yes">Yes</span>[^encoder-cpu] | <span class="matrix-status matrix-status--yes">Yes</span>[^encoder-cpu]               | <span class="matrix-status matrix-status--yes">Yes</span>[^encoder-cpu] |
-| Prometheus metrics (`/metrics/prometheus`)                                                           | <span class="matrix-status matrix-status--yes">Yes</span>               | <span class="matrix-status matrix-status--yes">Yes</span>                             | <span class="matrix-status matrix-status--yes">Yes</span>               |
+|                                                                                                      | wgpu                                                                                     | ROCm                                                                                     | PTX                                                                                      |
+| ---------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| OpenAI-compatible HTTP server (`poot-serve`)                                                         | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                |
+| Continuous (in-flight) batching                                                                      | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] |
+| Paged KV cache                                                                                       | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] |
+| Prefix caching (reuse across requests)                                                               | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] |
+| Fast one-shot prefill for the batched path                                                           | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] |
+| KV preemption / swap on eviction                                                                     | Not needed: a request's blocks are reserved at open; a request that finds no room waits | Not needed: a request's blocks are reserved at open; a request that finds no room waits | Not needed: a request's blocks are reserved at open; a request that finds no room waits |
+| Speculative decoding, single-sequence (prompt-lookup + draft-model, greedy + sampled)                | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] |
+| Speculative decoding, inside continuous batching (prompt-lookup and draft-model, greedy and sampled) | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] |
+| On-device sampling: greedy                                                                           | <span class="matrix-status matrix-status--yes">Yes</span>[^device-sample]                | <span class="matrix-status matrix-status--yes">Yes</span>[^device-sample]                | <span class="matrix-status matrix-status--yes">Yes</span>[^device-sample]                |
+| On-device sampling: temperature/top-k/top-p/min-p                                                    | <span class="matrix-status matrix-status--yes">Yes</span>[^device-sample]                | <span class="matrix-status matrix-status--yes">Yes</span>[^device-sample]                | <span class="matrix-status matrix-status--yes">Yes</span>[^device-sample]                |
+| LoRA adapter serving (hot-load, per-request selection)                                               | <span class="matrix-status matrix-status--no">No</span> (being restored)[^lora-scope]    | <span class="matrix-status matrix-status--no">No</span> (being restored)[^lora-scope]    | <span class="matrix-status matrix-status--no">No</span> (being restored)[^lora-scope]    |
+| Tensor parallelism (multi-GPU)                                                                       | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] |
+| Structured/guided decoding (regex, JSON schema, grammar, choice, forced tool calls)                  | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] |
+| Embeddings (`/v1/embeddings`) and reranking (`/v1/rerank`)                                           | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] |
+| Prometheus metrics (`/metrics/prometheus`)                                                           | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                |
 
 [^device-sample]:
     A `poot-llm` library capability (the driver), verified by
@@ -185,15 +217,15 @@ same executor contract as the other backends: a program is recorded once as nati
 replayed, so a step costs a submit and a fence wait. It is lower priority than PTX and ROCm and is verified on
 one device family.
 
-| Item                                    | Status                                                                                               |
-| --------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| Executor parity table                   | <span class="matrix-status matrix-status--yes">Yes</span> (the parity table and the backend-neutral coverage fixtures) |
-| Dense decoder, greedy decode            | <span class="matrix-status matrix-status--yes">Yes</span> (the registry's qwen2 fixture generates the same tokens as wgpu) |
+| Item                                    | Status                                                                                                                                    |
+| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| Executor parity table                   | <span class="matrix-status matrix-status--yes">Yes</span> (the parity table and the backend-neutral coverage fixtures)                    |
+| Dense decoder, greedy decode            | <span class="matrix-status matrix-status--yes">Yes</span> (the registry's qwen2 fixture generates the same tokens as wgpu)                |
 | Tensor-core matmul (cooperative matrix) | <span class="matrix-status matrix-status--yes">Yes</span> (needs `VK_KHR_cooperative_matrix` and subgroup-size control; verified RDNA3.5) |
-| Device-time profiling                   | <span class="matrix-status matrix-status--no">No</span> (no typed timing mode constructs a raw Vulkan device yet) |
-| Multi-GPU / collectives                 | <span class="matrix-status matrix-status--no">No</span>                                            |
-| Serving                                 | <span class="matrix-status matrix-status--no">No</span> (being restored, see the caution above) |
-| Hardware verified                       | AMD Strix Halo iGPU under RADV only. NVIDIA and Intel Vulkan drivers are untested.                 |
+| Device-time profiling                   | <span class="matrix-status matrix-status--no">No</span> (no typed timing mode constructs a raw Vulkan device yet)                         |
+| Multi-GPU / collectives                 | <span class="matrix-status matrix-status--no">No</span>                                                                                   |
+| Serving                                 | <span class="matrix-status matrix-status--no">No</span> (being restored, see the caution above)                                           |
+| Hardware verified                       | AMD Strix Halo iGPU under RADV only. NVIDIA and Intel Vulkan drivers are untested.                                                        |
 
 The device reports its own limits (largest buffer, grid, workgroup memory, subgroup sizes and matrix hardware)
 from the physical device, and the planner refuses what they rule out with a typed error instead of failing in the

@@ -55,7 +55,7 @@ impl TinyModel {
             "poot-card327-production-drain-{}.gguf",
             unique_suffix()
         ));
-        // A deepseek2 GGUF: a family the production binary still loads on the Runner.
+        // A deepseek2 GGUF: a registered family the production binary loads as a `ModelHandle`.
         tiny_gguf::write_tiny_deepseek2_gguf(&path, 65_536);
         Self(path)
     }
@@ -138,26 +138,22 @@ impl ProductionServer {
             listener
         });
         let mut command = Command::new(poot_serve_bin());
+        // The server opens a device before it listens (the engine plan prepares the model on it), so the
+        // production binary runs on the wgpu device lane, named explicitly.
         command
             .arg(model.path())
             .arg(addr.to_string())
+            .args(["--backend", "wgpu"])
             .env("POOT_DRAIN_TIMEOUT_SECS", drain_secs.to_string())
             .env("POOT_READ_TIMEOUT_SECS", "30")
-            .env("POOT_WRITE_TIMEOUT_SECS", "30")
-            .env("POOT_SLOTS", "1")
-            .env("POOT_CAP", "65536");
+            .env("POOT_WRITE_TIMEOUT_SECS", "30");
         if let Some(listener) = &accept_barrier_listener {
             command.env(
                 "POOT_CARD327_TEST_ACCEPT_BARRIER_ADDR",
                 listener.local_addr().unwrap().to_string(),
             );
         }
-        // Keep this always-run test hardware-free: wgpu honors this backend selector, and an
-        // unavailable Vulkan ICD selects the server's CPU fallback.
         let mut child = command
-            .env("WGPU_BACKEND", "vulkan")
-            .env("VK_DRIVER_FILES", "/nonexistent/poot-card327-vulkan.json")
-            .env("VK_ICD_FILENAMES", "/nonexistent/poot-card327-vulkan.json")
             .env("RUST_LOG", "info")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -243,10 +239,7 @@ impl ProductionServer {
             if http_get(self.addr, "/health", Duration::from_millis(250))
                 .is_ok_and(|response| response.contains("200 OK"))
             {
-                self.wait_log(
-                    "decoder loaded (no generation engine",
-                    Duration::from_secs(1),
-                );
+                self.wait_log("poot-serve listening", Duration::from_secs(1));
                 return;
             }
             assert!(
@@ -364,7 +357,6 @@ fn accepted_request_barrier(server: &ProductionServer) -> TcpStream {
 
 #[cfg(debug_assertions)]
 #[test]
-#[ignore = "starts the production binary on a deepseek2 GGUF and no family loads on the Runner (POOT-740); POOT-739 retypes serve onto ModelHandle and re-enables this row"]
 fn bounded_drain_production_completes_accepted_barrier_before_exit() {
     let mut server = ProductionServer::spawn_with_accept_barrier(3);
     let mut barrier = accepted_request_barrier(&server);
@@ -395,8 +387,9 @@ fn bounded_drain_production_completes_accepted_barrier_before_exit() {
     let mut response = String::new();
     barrier.read_to_string(&mut response).unwrap();
     assert!(
-        response.contains("200 OK")
-            && response.ends_with(r#"{"engine_loaded":false,"status":"ok"}"#),
+        response.contains("503 Service Unavailable")
+            && response.contains(r#""engine_loaded":true"#)
+            && response.contains(r#""status":"draining""#),
         "barrier response did not complete: {response:?}"
     );
     server.wait_success(PROCESS_EXIT_TIMEOUT);
@@ -404,7 +397,6 @@ fn bounded_drain_production_completes_accepted_barrier_before_exit() {
 }
 
 #[test]
-#[ignore = "starts the production binary on a deepseek2 GGUF and no family loads on the Runner (POOT-740); POOT-739 retypes serve onto ModelHandle and re-enables this row"]
 fn bounded_drain_production_timeout_closes_accepted_barrier() {
     let mut server = ProductionServer::spawn(1);
     let mut barrier = accepted_request_barrier(&server);

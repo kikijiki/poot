@@ -20,5 +20,10 @@ The `poot-caption` binary of `poot-llm` captions an image from the command line 
 server:
 
 ```bash
-cargo run --release -p poot-llm --features cli --bin poot-caption -- /path/to/smolvlm image.jpg "Describe this image."
+cargo run --release -p poot-llm --features cli --bin poot-caption -- /path/to/smolvlm image.jpg "Describe this image." --backend wgpu
 ```
+
+It loads the checkpoint as two registered families, the vision tower and the text decoder, each on its own driver
+(`--backend` is `wgpu`, `rocm`, `ptx`, `vulkan` or `auto`, the default). The image is split into frames, each frame
+runs through the vision tower, and the text decoder generates with the frames' embedding rows scattered over the
+prompt's `<image>` placeholders. The library path is `poot_llm::front_end::Idefics3`.

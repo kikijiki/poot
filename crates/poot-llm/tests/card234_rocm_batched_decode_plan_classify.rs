@@ -2,7 +2,7 @@
 //! decode graph via `plan_eqn` at `n_slots = 2`. Every eqn planning
 //! (the planner has no host plan: an unplannable eqn is a typed refusal, Card 626) is what makes the
 //! executor contract's capture-on-first-step default (Card 548: `Engine::step` records once, replays every step after) safe for this graph
-//! on ROCm (see `card209_batched_decode_plan_classify.rs` for qwen3next).
+//! on ROCm.
 //!
 //! Builds the graph with `Model::trace` of the qwen2 family (a paged decode step over a checkpoint of zeros) and applies the pre-`compile` pass chain locally, which classifies the fused equations
 //! `compile` plans.
@@ -10,7 +10,7 @@
 #![cfg(feature = "rocm")]
 
 use poot_executor_parity::dense::{Dense, Family, paged_step, plain};
-use poot_graph_plan::{Plan, widen_mismatched_matmul_dtypes};
+use poot_graph_plan::{Plan, prepare_target_graph};
 use poot_llm::driver::block_table::BLOCK_SIZE;
 use poot_models::model::{LogitRows, Phase};
 use poot_target::AmdArch;
@@ -64,12 +64,8 @@ fn card234_rocm_batched_decode_plan_classify_qwen2_n_slots_2() {
     );
     let backend = Backend::AmdGcn(AmdArch::gfx1151());
     // The pre-`compile` passes, so the equations classified are the fused ones `compile` plans: the
-    // BF16 checkpoint's mixed-dtype matmuls are widened as `compile` widens them.
-    let g = widen_mismatched_matmul_dtypes(
-        &optimize(&g),
-        backend,
-        &poot_test_util::device_caps::default_caps_for(backend),
-    );
+    // BF16 checkpoint's dense contractions are folded and its mixed-dtype matmuls widened as `compile` does.
+    let g = prepare_target_graph(&optimize(&g), backend);
     let mut tally: BTreeMap<&'static str, usize> = BTreeMap::new();
     for eqn in &g.eqns {
         let plan = plan_eqn(

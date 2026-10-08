@@ -64,10 +64,7 @@ fn attention_dispatches(
         backend,
         caps: poot_test_util::device_caps::default_caps_for(backend),
     };
-    let options = CompileOptions {
-        execution: Submission::Replay,
-        limits: poot_graph_plan::CompileLimits::STANDARD,
-    };
+    let options = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
     let program = compile(&graph, &target, &options).unwrap();
     program
         .planned()
@@ -79,15 +76,9 @@ fn attention_dispatches(
         .collect()
 }
 
-/// The routed fixture too where the target has no routed-expert hang guard: a target that has one
-/// (ROCm and PTX, cards 186/192) compiles a routed graph without the flash rewrite by design.
-fn assert_every_layer_is_flash(backend: Backend, label: &str, routed_too: bool) {
-    let variants: &[Option<&str>] = if routed_too {
-        &[None, Some("moe")]
-    } else {
-        &[None]
-    };
-    for &variant in variants {
+/// Both the dense and the routed (`moe`) fixture: every target runs the flash rewrite on a routed graph.
+fn assert_every_layer_is_flash(backend: Backend, label: &str) {
+    for variant in [None, Some("moe")] {
         assert_every_layer_of_is_flash(&*gemma4(variant), backend, &format!("{label} {variant:?}"));
     }
 }
@@ -105,15 +96,15 @@ fn assert_every_layer_of_is_flash(model: &dyn Model, backend: Backend, label: &s
 
 #[test]
 fn gemma4_attention_layers_plan_as_flash_on_wgpu_and_vulkan() {
-    assert_every_layer_is_flash(Backend::SpirvVulkan, "spirv", true);
+    assert_every_layer_is_flash(Backend::SpirvVulkan, "spirv");
 }
 
 #[test]
 fn gemma4_attention_layers_plan_as_flash_on_amd_gcn() {
-    assert_every_layer_is_flash(Backend::AmdGcn(AmdArch::gfx1151()), "amd_gcn", false);
+    assert_every_layer_is_flash(Backend::AmdGcn(AmdArch::gfx1151()), "amd_gcn");
 }
 
 #[test]
 fn gemma4_attention_layers_plan_as_flash_on_nvptx() {
-    assert_every_layer_is_flash(Backend::Nvptx, "nvptx", false);
+    assert_every_layer_is_flash(Backend::Nvptx, "nvptx");
 }

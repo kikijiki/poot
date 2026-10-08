@@ -10,14 +10,14 @@ sidebar_position: 11
 poot is being refactored. This is not available yet and is planned to return.
 :::
 
-Today registering an adapter is refused, at startup (`--lora-adapter`) and by hot-load (`POST /v1/lora_adapters`).
+Today no adapter can be registered: the server has no adapter flags and no administration route that works.
 
 ## What the server does today
 
-- `--lora-adapter NAME=DIR` and `--lora-pool-capacity N` are still parsed, so a startup command that
-  passes them fails with the registration refusal instead of an unknown-option error.
-- `GET /v1/lora_adapters` lists no adapters. `POST /v1/lora_adapters` is refused, and
-  `DELETE /v1/lora_adapters/NAME` finds no registered adapter to unload.
+- There are no adapter options: like any other unknown `--` option, passing one
+  fails startup with an `unknown option` error.
+- Every `/v1/lora_adapters` route (`GET`, `POST`, `DELETE`) answers a typed `503` once a request passes the
+  trust policy below; none lists, registers or unloads an adapter.
 - A completion request that names a `lora_adapter` is a `400` error (no adapter is registered).
 - The administration routes keep their trust policy: on a non-loopback listener they are disabled unless
   `POOT_LORA_ADMIN_KEY` is set, and then every request under `/v1/lora_adapters` needs that bearer token.

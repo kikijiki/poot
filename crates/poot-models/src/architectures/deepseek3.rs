@@ -85,11 +85,11 @@ fn fixture() -> Fixture {
 }
 
 // ---- test references ---------------------------------------------------------------------------
-// The GLM-5.3 tests compare their router against this one.
 
 /// DeepSeek-V3's routed-expert gate (`topk_method: "noaux_tc"`, `scoring_func: "sigmoid"`, with
-/// group-limited routing) and the rank-ordered expert ids: the independent reference the GLM-5.3
-/// tests compare their router against. The family itself routes through `components::router`.
+/// group-limited routing) and the rank-ordered expert ids: the independent reference the router
+/// component's sigmoid arm is compared against. The family itself routes through
+/// `components::router`.
 #[cfg(test)]
 pub(crate) fn deepseek3_router_gate_and_ids(
     b: &Builder,
@@ -235,7 +235,7 @@ mod tests {
         assert_the_routing_scale_reaches_the_logits(&ENTRY, &fixture());
     }
 
-    /// SC-001 (tier 3 on the oracle): the Runner's recorded tokens.
+    /// SC-001 (tier 3 on the oracle): the pre-driver engine's recorded tokens.
     #[test]
     fn the_fixture_generates_the_tokens_the_runner_recorded() {
         assert_generates_the_recorded_tokens(

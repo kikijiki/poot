@@ -2,8 +2,22 @@
 
 use std::collections::HashMap;
 
-use crate::core::generate::argmax;
 use crate::text::guided::Constraint;
+
+/// The index of the largest logit (the first on a tie). A [`SamplerFault`] when `v` holds a NaN or `+inf`, or no
+/// finite element: an unchecked maximum turns an all-NaN row into token 0.
+pub(crate) fn argmax(v: &[f32]) -> Result<usize, SamplerFault> {
+    check_pickable(v)?;
+    let mut best = 0;
+    let mut best_v = f32::NEG_INFINITY;
+    for (i, &x) in v.iter().enumerate() {
+        if x > best_v {
+            best_v = x;
+            best = i;
+        }
+    }
+    Ok(best)
+}
 
 /// The logits the sampler was given cannot yield a token: a numerical fault upstream, reported instead of
 /// served as a completion (ADR-0101 decision 4). NaN and `+inf` are faults wherever they sit in the row.
@@ -542,8 +556,8 @@ impl Sampler {
 
 #[cfg(test)]
 mod sampler_tests {
+    use super::argmax;
     use super::{Constraint, Sampler, SamplerFault};
-    use crate::core::generate::argmax;
     use crate::text::guided::{int_bound_regex, json_schema_to_regex};
 
     /// `result` is the NaN fault at `index`.
@@ -1022,7 +1036,7 @@ mod sampler_tests {
         // Exercises the regex branch of `Constraint::allowed_next`/`advance` directly: poot's own byte-by-byte
         // DFA walk that masks tokens during guided regex/JSON decoding.
         // `json_schema_to_regex_accepts_and_rejects` only validates the generated regex string via a different
-        // engine (meta::Regex). Builds the anchored whole-match DFA as `Runner::build_regex_constraint` /
+        // engine (meta::Regex). Builds the anchored whole-match DFA as `TextCodec::build_regex_constraint` /
         // `guided_dfa` do: `(?:pattern)$`, `StartKind::Anchored`.
         let dfa = Arc::new(
             dense::Builder::new()

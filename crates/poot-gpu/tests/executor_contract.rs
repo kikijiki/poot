@@ -9,6 +9,7 @@
 //! storage so it shares the real entries' buffer, whose own graph output IS the state
 //! value - an ordinary production entry, not a test-only accessor.
 
+use poot_test_util::const_weights::ConstWeights;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -27,7 +28,7 @@ use poot_graph_plan::{
 use poot_models::model::{LogitRows, Phase};
 use poot_quant::PackedComponentRef;
 use poot_quant::format::{GroupMap, WeightFormat};
-use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
+use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
 use poot_tensor::HostTensor;
 use poot_tensor::{DType, HostView};
 use poot_test_util::assert_close_rel;
@@ -115,6 +116,13 @@ fn store_for(graphs: &[&Graph]) -> WeightStore {
     builder.build()
 }
 
+/// `graphs` renamed for one executable's weight map over `store` (see [`ConstWeights`]), and that map.
+fn bind_graphs(store: &WeightStore, graphs: &[&Graph]) -> (Vec<Graph>, Arc<WeightMap>) {
+    let mut weights = ConstWeights::new(store);
+    let named = graphs.iter().map(|g| weights.graph(g)).collect();
+    (named, Arc::new(weights.map()))
+}
+
 fn wgpu_target(device: &WgpuDevice) -> Target {
     use poot_executor::Device;
     device.target()
@@ -133,10 +141,7 @@ fn staged(
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions {
-            execution: submission,
-            limits: poot_graph_plan::CompileLimits::STANDARD,
-        },
+        &CompileOptions::new(submission, poot_graph_plan::CompileLimits::STANDARD),
     )
     .unwrap()
 }
@@ -278,6 +283,35 @@ fn require_wgpu() -> Option<WgpuDevice> {
     WgpuDevice::new().ok()
 }
 
+/// POOT-1065: the wgpu device reports what it could still allocate right now, read from
+/// `VK_EXT_memory_budget`, and the figure is a part of the open-time ceiling, not the ceiling repeated.
+/// Mutation: `free_memory_bytes` returns `None` (Unknown) and the first assertion goes red; returns
+/// `u64::MAX` and the ceiling assertion goes red.
+#[test]
+fn the_wgpu_device_reports_live_free_memory_within_its_open_time_ceiling() {
+    use poot_executor::Device;
+    let Some(device) = require_wgpu() else {
+        eprintln!("skip: no wgpu adapter");
+        return;
+    };
+    let ceiling = device
+        .target()
+        .caps
+        .memory_budget_bytes
+        .expect("the wgpu device queried its heap budget at open");
+    let free = device
+        .free_memory_bytes()
+        .expect("the wgpu device reports live free memory");
+    assert!(
+        free > 0,
+        "a device with no free memory cannot run this test"
+    );
+    assert!(
+        free <= ceiling,
+        "free {free} is over the open-time ceiling {ceiling}"
+    );
+}
+
 /// SC-001 (fix: wgpu only): a qwen2 decode entry on `Box<dyn Executor>` matches the CPU oracle for
 /// every step of a full cache, and capture is the default: one recording after `CAP` replayed steps.
 #[test]
@@ -290,14 +324,10 @@ fn qwen2_decode_on_the_contract_matches_the_oracle_and_records_once() {
     let mut exec: Box<dyn Executor> = Box::new(poot_executor::Engine::new(device));
     let g = decode_graph(&dense(), CAP);
     let store = store_for(&[&g]);
-    let exe = exec
-        .load_weights(
-            Arc::new(store.clone()),
-            poot_executor::WeightSource::ConstNames,
-        )
-        .unwrap();
+    let (named, map) = bind_graphs(&store, &[&g]);
+    let exe = exec.load_weights(Arc::new(store.clone()), map).unwrap();
     let decode = exec
-        .add_entry(exe, &staged(&g, target, Submission::Replay))
+        .add_entry(exe, &staged(&named[0], target, Submission::Replay))
         .unwrap();
     let mut oracle_state = HashMap::new();
     for pos in 0..CAP {
@@ -332,12 +362,11 @@ fn eager_submission_is_refused_at_add_entry_before_any_allocation() {
     let mut engine = poot_executor::Engine::new(device);
     let g = decode_graph(&dense(), CAP);
     let store = Arc::new(store_for(&[&g]));
-    let exe = engine
-        .load_weights(store, poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (named, map) = bind_graphs(&store, &[&g]);
+    let exe = engine.load_weights(store, map).unwrap();
     let before = engine.stats();
     let error = engine
-        .add_entry(exe, &staged(&g, target, Submission::Eager))
+        .add_entry(exe, &staged(&named[0], target, Submission::Eager))
         .expect_err("a Submission::Eager program must be refused at add_entry");
     assert!(
         matches!(error, poot_executor::ExecError::Load(ref e) if matches!(**e, poot_executor::LoadError::Unimplemented(_))),
@@ -366,14 +395,13 @@ fn prefill_and_decode_entries_share_state_and_reset_without_rerecording() {
     let prefill_g = prefill_graph(&dense(), n, CAP);
     let decode_g = decode_graph(&dense(), CAP);
     let store = Arc::new(store_for(&[&prefill_g, &decode_g]));
-    let exe = engine
-        .load_weights(store.clone(), poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (named, map) = bind_graphs(&store, &[&prefill_g, &decode_g]);
+    let exe = engine.load_weights(store.clone(), map).unwrap();
     let prefill = engine
-        .add_entry(exe, &staged(&prefill_g, target, Submission::Replay))
+        .add_entry(exe, &staged(&named[0], target, Submission::Replay))
         .unwrap();
     let decode = engine
-        .add_entry(exe, &staged(&decode_g, target, Submission::Replay))
+        .add_entry(exe, &staged(&named[1], target, Submission::Replay))
         .unwrap();
 
     // One state-probe entry per KV state name, sharing the real entries' buffers.
@@ -459,14 +487,13 @@ fn remove_entry_frees_its_arena_and_leaves_the_other_entry_unaffected() {
     let prefill_g = prefill_graph(&dense(), n, CAP);
     let decode_g = decode_graph(&dense(), CAP);
     let store = Arc::new(store_for(&[&prefill_g, &decode_g]));
-    let exe = engine
-        .load_weights(store.clone(), poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (named, map) = bind_graphs(&store, &[&prefill_g, &decode_g]);
+    let exe = engine.load_weights(store.clone(), map).unwrap();
     let prefill = engine
-        .add_entry(exe, &staged(&prefill_g, target, Submission::Replay))
+        .add_entry(exe, &staged(&named[0], target, Submission::Replay))
         .unwrap();
     let decode = engine
-        .add_entry(exe, &staged(&decode_g, target, Submission::Replay))
+        .add_entry(exe, &staged(&named[1], target, Submission::Replay))
         .unwrap();
 
     // Step both so each records once (recordings is otherwise 0 and the "unchanged" assertion below
@@ -543,14 +570,13 @@ fn unload_on_the_wgpu_engine_reads_zero_memory() {
     let prefill_g = prefill_graph(&dense(), n, CAP);
     let decode_g = decode_graph(&dense(), CAP);
     let store = Arc::new(store_for(&[&prefill_g, &decode_g]));
-    let exe = engine
-        .load_weights(store.clone(), poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (named, map) = bind_graphs(&store, &[&prefill_g, &decode_g]);
+    let exe = engine.load_weights(store.clone(), map).unwrap();
     let prefill = engine
-        .add_entry(exe, &staged(&prefill_g, target, Submission::Replay))
+        .add_entry(exe, &staged(&named[0], target, Submission::Replay))
         .unwrap();
     let decode = engine
-        .add_entry(exe, &staged(&decode_g, target, Submission::Replay))
+        .add_entry(exe, &staged(&named[1], target, Submission::Replay))
         .unwrap();
     let prompt: Vec<u32> = (0..n as u32).collect();
     let values = slot_values(&prefill_g, &prompt, 0);
@@ -597,14 +623,13 @@ fn state_with_same_name_and_other_aval_is_refused() {
     let g = decode_graph(&dense(), CAP);
     let other = decode_graph(&dense(), CAP + 4);
     let store = Arc::new(store_for(&[&g, &other]));
-    let exe = engine
-        .load_weights(store, poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (named, map) = bind_graphs(&store, &[&g, &other]);
+    let exe = engine.load_weights(store, map).unwrap();
     engine
-        .add_entry(exe, &staged(&g, target, Submission::Replay))
+        .add_entry(exe, &staged(&named[0], target, Submission::Replay))
         .unwrap();
     let err = engine
-        .add_entry(exe, &staged(&other, target, Submission::Replay))
+        .add_entry(exe, &staged(&named[1], target, Submission::Replay))
         .unwrap_err();
     assert!(
         matches!(&err, poot_executor::ExecError::Bind(b) if matches!(**b, BindError::StateSchema { .. })),
@@ -646,11 +671,10 @@ fn mid_load_refusal_rolls_back_a_newly_allocated_state_and_leaves_the_existing_e
     let g2 = b2.finish_with_state(c2, &[(c2, c2), (b2_state, b2_state)]);
 
     let store = Arc::new(WeightStore::builder().build());
-    let exe = engine
-        .load_weights(store, poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (named, map) = bind_graphs(&store, &[&g1, &g2]);
+    let exe = engine.load_weights(store, map).unwrap();
     let entry = engine
-        .add_entry(exe, &staged(&g1, target, Submission::Replay))
+        .add_entry(exe, &staged(&named[0], target, Submission::Replay))
         .unwrap();
     engine
         .step(exe, entry, &StepInputs::new(), &mut NoSync)
@@ -661,7 +685,7 @@ fn mid_load_refusal_rolls_back_a_newly_allocated_state_and_leaves_the_existing_e
     assert_eq!(before.recordings, 1, "the first step records once");
 
     let err = engine
-        .add_entry(exe, &staged(&g2, target, Submission::Replay))
+        .add_entry(exe, &staged(&named[1], target, Submission::Replay))
         .unwrap_err();
     assert!(
         matches!(&err, poot_executor::ExecError::Bind(b) if matches!(**b, BindError::StateSchema { .. })),
@@ -713,11 +737,10 @@ fn binder_and_target_refusals_are_typed() {
     let mut engine = poot_executor::Engine::new(device);
     let g = decode_graph(&dense(), CAP);
     let store = Arc::new(store_for(&[&g]));
-    let exe = engine
-        .load_weights(store, poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (named, map) = bind_graphs(&store, &[&g]);
+    let exe = engine.load_weights(store, map).unwrap();
     let decode = engine
-        .add_entry(exe, &staged(&g, target, Submission::Replay))
+        .add_entry(exe, &staged(&named[0], target, Submission::Replay))
         .unwrap();
     let values = slot_values(&g, &[1], 0);
 
@@ -747,8 +770,7 @@ fn binder_and_target_refusals_are_typed() {
         "{err}"
     );
 
-    // Card 550 deleted the decode graph's `Slot::Mask`; `Slot::Pos` (`[1,1]`) is the shape-mismatch
-    // target instead - a `[1]` shape still carries one element, so a check that only compared
+    // `Slot::Pos` (`[1,1]`) is the shape-mismatch target - a `[1]` shape still carries one element, so a check that only compared
     // element count (not shape) would miss it (the SC-011 concern this row guards).
     let mut short = StepInputs::new();
     let short_shape = [1usize];
@@ -769,13 +791,13 @@ fn binder_and_target_refusals_are_typed() {
         "{err}"
     );
 
-    // SC-006: an f32 value bound to a declared-I32 scalar slot (Pos/SeqLen/
-    // Token are all I32), same shape and element count, must be refused by dtype lane rather than
+    // SC-006: an f32 value bound to a declared-I32 scalar slot (Pos and
+    // Token are both I32), same shape and element count, must be refused by dtype lane rather than
     // silently converted by the binder.
     let i32_slot = values
         .iter()
         .find(|v| v.dtype == DType::I32)
-        .expect("qwen2 decode graph has an I32 slot (Token/Pos/SeqLen)")
+        .expect("qwen2 decode graph has an I32 slot (Token/Pos)")
         .key
         .clone();
     let others: Vec<&SlotValue> = values.iter().filter(|v| v.key != i32_slot).collect();
@@ -825,7 +847,7 @@ fn binder_and_target_refusals_are_typed() {
     let mut other = target;
     other.caps.max_grid[0] -= 1;
     let err = engine
-        .add_entry(exe, &staged(&g, other, Submission::Replay))
+        .add_entry(exe, &staged(&named[0], other, Submission::Replay))
         .unwrap_err();
     assert!(
         matches!(&err, poot_executor::ExecError::Load(l) if matches!(**l, LoadError::TargetMismatch { .. })),
@@ -884,11 +906,10 @@ fn two_phase_state_commit_matches_the_oracle_after_four_steps() {
         )
         .unwrap();
     let store = Arc::new(builder.build());
-    let exe = engine
-        .load_weights(store, poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (named, map) = bind_graphs(&store, &[&g]);
+    let exe = engine.load_weights(store, map).unwrap();
     let entry = engine
-        .add_entry(exe, &staged(&g, target, Submission::Replay))
+        .add_entry(exe, &staged(&named[0], target, Submission::Replay))
         .unwrap();
 
     let mut oracle_a = vec![0.0f32; 4];
@@ -943,14 +964,10 @@ fn many_layer_prefill_splits_submits_by_dispatch_count_and_matches_the_oracle() 
     let cap = n;
     let prefill_g = prefill_graph(&cfg, n, cap);
     let store = store_for(&[&prefill_g]);
-    let exe = engine
-        .load_weights(
-            Arc::new(store.clone()),
-            poot_executor::WeightSource::ConstNames,
-        )
-        .unwrap();
+    let (named, map) = bind_graphs(&store, &[&prefill_g]);
+    let exe = engine.load_weights(Arc::new(store.clone()), map).unwrap();
     let prefill = engine
-        .add_entry(exe, &staged(&prefill_g, target, Submission::Replay))
+        .add_entry(exe, &staged(&named[0], target, Submission::Replay))
         .unwrap();
     let prompt: Vec<u32> = (0..n as u32).map(|t| t % 32).collect();
     let values = slot_values(&prefill_g, &prompt, 0);
@@ -991,14 +1008,10 @@ fn single_decode_step_crosses_flush_work_by_summed_work_and_matches_the_oracle()
     let cfg = dense().vocab(4_300_000).dims(16, 32, 1);
     let g = decode_graph(&cfg, CAP);
     let store = store_for(&[&g]);
-    let exe = engine
-        .load_weights(
-            Arc::new(store.clone()),
-            poot_executor::WeightSource::ConstNames,
-        )
-        .unwrap();
+    let (named, map) = bind_graphs(&store, &[&g]);
+    let exe = engine.load_weights(Arc::new(store.clone()), map).unwrap();
     let decode = engine
-        .add_entry(exe, &staged(&g, target, Submission::Replay))
+        .add_entry(exe, &staged(&named[0], target, Submission::Replay))
         .unwrap();
     let values = slot_values(&g, &[0], 0);
     let mut oracle_state = HashMap::new();
@@ -1061,11 +1074,10 @@ fn packed_linear_matches_the_oracle(format: WeightFormat, out: usize, k: usize) 
         builder.build()
     };
 
-    let exe = engine
-        .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (named, map) = bind_graphs(&store, &[&g]);
+    let exe = engine.load_weights(Arc::new(store), map).unwrap();
     let entry = engine
-        .add_entry(exe, &staged(&g, target, Submission::Replay))
+        .add_entry(exe, &staged(&named[0], target, Submission::Replay))
         .unwrap();
 
     let x_values = fill(k, 0xA5);
@@ -1306,6 +1318,7 @@ fn planted_bad_validation_packet_fails_before_any_output_readback() {
         builder.build()
     };
 
+    let (g, map) = ConstWeights::bind(&g, &store);
     let staged_program = poot_graph_plan::compile_staged(
         &g,
         &poot_graph_plan::TargetSet::single(poot_graph_plan::DeviceId(0), target),
@@ -1313,16 +1326,14 @@ fn planted_bad_validation_packet_fails_before_any_output_readback() {
             experts: poot_graph_plan::ExpertPlacement::AllResident,
             devices: poot_graph_plan::DevicePlacement::Single(poot_graph_plan::DeviceId(0)),
         },
-        &poot_graph_plan::CompileOptions {
-            execution: Submission::Replay,
-            limits: poot_graph_plan::CompileLimits::STANDARD,
-        },
+        &poot_graph_plan::CompileOptions::new(
+            Submission::Replay,
+            poot_graph_plan::CompileLimits::STANDARD,
+        ),
     )
     .unwrap();
 
-    let exe = engine
-        .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let exe = engine.load_weights(Arc::new(store), Arc::new(map)).unwrap();
     let entry = engine.add_entry(exe, &staged_program).unwrap();
     let inputs = StepInputs::new();
     let error = match engine.step(exe, entry, &inputs, &mut NoSync) {
@@ -1385,11 +1396,10 @@ fn bf16_embed_weight_feeds_gather_and_decode_gemv_with_no_host_f32_copy() {
         builder.build()
     };
 
-    let exe = engine
-        .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (named, map) = bind_graphs(&store, &[&g]);
+    let exe = engine.load_weights(Arc::new(store), map).unwrap();
     let entry = engine
-        .add_entry(exe, &staged(&g, target, Submission::Replay))
+        .add_entry(exe, &staged(&named[0], target, Submission::Replay))
         .unwrap();
 
     let idx_value: i32 = 2;

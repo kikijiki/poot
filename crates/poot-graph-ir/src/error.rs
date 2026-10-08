@@ -103,32 +103,10 @@ pub enum BuilderAppendError {
     ElementCountOverflow { name: String, shape: Vec<usize> },
     #[error("exact I32 slot {slot:?} tag must not be empty")]
     EmptySlotTag { slot: Slot },
-    #[error("packed expert row table must not be empty")]
-    EmptyPackedRows,
-    #[error("packed row at index {index} has ordinal {actual}, expected {expected}")]
-    PackedRowOrdinal {
-        index: usize,
-        expected: usize,
-        actual: usize,
-    },
     #[error("packed linear id at row {index} must not be empty")]
     EmptyPackedLinearId { index: usize },
-    #[error("duplicate packed linear id {linear_id:?} at rows {first} and {second}")]
-    DuplicatePackedLinearId {
-        linear_id: String,
-        first: usize,
-        second: usize,
-    },
-    #[error("packed row {index} descriptor differs from row zero")]
-    PackedDescriptorMismatch { index: usize },
     #[error("packed block-diagonal out={out} is not divisible by blocks={blocks}")]
     PackedBlockDiagonalBlocks { out: usize, blocks: usize },
-    #[error("{field}={value} exceeds the inclusive exact-f32 integer bound {max}")]
-    F32ExactIntegerRange {
-        field: &'static str,
-        value: usize,
-        max: usize,
-    },
     #[error("operand v{value} has type {actual}, expected {expected}")]
     OperandType {
         value: ValueId,
@@ -373,6 +351,16 @@ pub enum ShapeError {
         actual: Box<TensorType>,
     },
 
+    #[error("packed stack {role:?} operand must be {expected:?}, got {actual:?}")]
+    PackedStackOperand {
+        role: SourceRole,
+        expected: Box<TensorType>,
+        actual: Box<TensorType>,
+    },
+
+    #[error("an indexed packed contraction needs at least one expert")]
+    PackedStackExperts,
+
     #[error("packed contraction activation must end in K={expected_k}, got {actual:?}")]
     PackedContractionActivation {
         expected_k: usize,
@@ -406,6 +394,9 @@ pub enum ShapeError {
 
     #[error("dense contraction weight must be rank-2 [N, K] in checkpoint order, got {actual:?}")]
     DenseContractionWeightRank { actual: TensorType },
+
+    #[error("grouped dense contraction: {rows} weight rows do not divide into {groups} groups")]
+    GroupedDenseContractionGroups { groups: usize, rows: usize },
 
     #[error("dense contraction activation must end in K={expected_k}, got {actual:?}")]
     DenseContractionActivation {
@@ -449,6 +440,9 @@ pub enum ShapeError {
         actual: DType,
     },
 
+    #[error("scan: {0}")]
+    Scan(ScanReason),
+
     #[error("rope rot={rot} must be even and within 1..=D for x {x:?}")]
     RopeWidth { rot: usize, x: Vec<usize> },
 
@@ -483,5 +477,24 @@ pub enum ShapeError {
         operand: &'static str,
         expected: Vec<usize>,
         actual: Vec<usize>,
+    },
+}
+
+/// Why operands are not a scan of their family ([`ShapeError::Scan`]).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ScanReason {
+    #[error("every operand is F32")]
+    NotF32,
+    #[error("operand 0 must be [1,H,L,W], got {shape:?}")]
+    LeadOperand { shape: Vec<usize> },
+    #[error("extents {shape:?} must be nonzero and chunk {chunk} a power of two")]
+    Extents { shape: Vec<usize>, chunk: usize },
+    #[error("the state has no rows")]
+    NoStateRows,
+    #[error("{name} must be {want:?}, got {got:?}")]
+    Operand {
+        name: &'static str,
+        want: Vec<usize>,
+        got: Vec<usize>,
     },
 }

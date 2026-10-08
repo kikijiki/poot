@@ -9,15 +9,15 @@
 //! (`0, 0, .., 1, 1, .., 2, ..`), and every stage id is used.
 //!
 //! [`split_stages_after_layers`] is the placement-facing entry: it takes `after_layer` cut indices -
-//! exactly what `poot_llm::components::exact_partition::StageBoundary::after_layer` records - and
+//! exactly what a layer-pipeline placement's `after_layer` boundaries record - and
 //! maps each cut onto the first equation tagged with the next layer. The tags come from
 //! [`poot_graph_ir::Builder::layer_scope`], which tracers wrap around their layer loop, so the cut list
 //! needs no name inference and no per-family equation index. What a family supplies is the placement
 //! it already supplied; the tracer's own loop reports where its layers are.
 //!
-//! Layer tags are checked, not trusted: an untagged equation between the first and last tagged one
-//! is [`StageSplitError::UntaggedLayerEquation`], layer ids that are not one run per layer in order
-//! are [`StageSplitError::NonContiguousLayer`], and a cut with no layer after it is
+//! Layer tags are checked, not trusted: [`Graph::layer_runs`] refuses an untagged equation between the
+//! first and last tagged one and layer ids that are not one run per layer in order (both reach the
+//! caller as [`StageSplitError::LayerTags`]), and a cut with no layer after it is
 //! [`StageSplitError::LayerCutOutOfRange`]. Untagged equations *outside* the layer region - the
 //! graph-wide preamble and the head - are expected and belong to the first and last stage.
 //!
@@ -58,7 +58,7 @@ use poot_graph_ir::Operand;
 use poot_graph_ir::error::GraphValidationError;
 use poot_graph_ir::graph::ValueId;
 use poot_graph_ir::graph::{
-    Eqn, Graph, LayerIndex, NoValidations, Slot, Storage, ValidationChannel,
+    Eqn, Graph, LayerIndex, LayerTagError, NoValidations, Slot, Storage, ValidationChannel,
 };
 use poot_graph_ir::types::TensorType;
 
@@ -118,7 +118,7 @@ impl StageAssignment {
     /// Cut at a placement's layer boundaries: `after_layers` holds one `StageBoundary::after_layer`
     /// per boundary, and each cut lands on the first equation tagged with the next layer.
     ///
-    /// This is the entry a caller holding `exact_partition`'s plan uses:
+    /// This is the entry a caller holding a placement plan uses:
     ///
     /// ```ignore
     /// let assignment = StageAssignment::from_layer_cuts(&graph, &plan.after_layer_cuts())?;
@@ -134,49 +134,7 @@ impl StageAssignment {
     ) -> Result<Self, StageSplitError> {
         let layer_of_eqn: Vec<Option<LayerIndex>> = g.eqns.iter().map(|eqn| eqn.layer).collect();
         let first_tagged = layer_of_eqn.iter().position(Option::is_some);
-        let last_tagged = layer_of_eqn.iter().rposition(Option::is_some);
-
-        // One contiguous tagged region, one run per layer id in ascending order starting at 0.
-        let mut layers = 0usize;
-        if let (Some(first), Some(last)) = (first_tagged, last_tagged) {
-            for (offset, tag) in layer_of_eqn[first..=last].iter().enumerate() {
-                if tag.is_none() {
-                    return Err(StageSplitError::UntaggedLayerEquation {
-                        equation: first + offset,
-                    });
-                }
-            }
-            let first_layer = layer_of_eqn[first]
-                .expect("the first tagged equation is tagged")
-                .0;
-            if first_layer != 0 {
-                return Err(StageSplitError::NonContiguousLayer {
-                    equation: first,
-                    layer: first_layer,
-                    expected: 0,
-                });
-            }
-            let mut current = 0usize;
-            for (offset, tag) in layer_of_eqn[first..=last].iter().enumerate() {
-                let layer = tag.expect("the tagged region has no hole").0;
-                if layer == current {
-                    continue;
-                }
-                if layer != current + 1 {
-                    return Err(StageSplitError::NonContiguousLayer {
-                        equation: first + offset,
-                        layer,
-                        expected: if layer < current {
-                            current
-                        } else {
-                            current + 1
-                        },
-                    });
-                }
-                current = layer;
-            }
-            layers = current + 1;
-        }
+        let layers = g.layer_runs()?.layers;
 
         let mut previous_cut: Option<usize> = None;
         for (index, &cut) in after_layers.iter().enumerate() {
@@ -623,20 +581,8 @@ pub(crate) enum StageSplitError {
         cut: usize,
         previous: usize,
     },
-    #[error(
-        "equation {equation} is untagged between the first and last layer-tagged equation; a \
-         layer-cut split will not guess which side it belongs to"
-    )]
-    UntaggedLayerEquation { equation: usize },
-    #[error(
-        "equation {equation} is tagged layer {layer}, breaking the one-run-per-layer order the \
-         layer cuts map onto (expected layer {expected})"
-    )]
-    NonContiguousLayer {
-        equation: usize,
-        layer: usize,
-        expected: usize,
-    },
+    #[error(transparent)]
+    LayerTags(#[from] LayerTagError),
     #[error(
         "after_layer cut {cut} has no layer after it: the graph tags {layers} layer(s), so a cut \
          past the last layer would produce an empty stage"
@@ -667,4 +613,194 @@ pub(crate) enum StageSplitError {
         #[source]
         source: GraphValidationError,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    //! POOT-578 SC-002: a real qwen2 decode step (carried KV state) cut after every layer `k`.
+
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::split_stages_after_layers;
+    use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+    use poot_executor_parity::dense::{Dense, Family, plain, step};
+    use poot_models::model::{LogitRows, Phase};
+    use poot_tensor::HostTensor;
+
+    /// Deterministic pseudo-random fill in [-1, 1) (xorshift, no rng dependency).
+    fn fill(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    const LAYERS: usize = 3;
+
+    /// The tiny qwen2 decode graph (GQA 4 over 2, three layers) over a six-position cache.
+    fn qwen2_decode() -> Graph {
+        let model = Dense::new(Family::Qwen2)
+            .vocab(32)
+            .dims(16, 32, LAYERS)
+            .heads(4, 2)
+            .head_dim(4)
+            .max_positions(32)
+            .f32_model();
+        plain(
+            model
+                .model
+                .trace(Phase::Decode, step(1, 1, 6, LogitRows::Last))
+                .expect("the qwen2 fixture traces a decode step"),
+        )
+    }
+
+    /// Every input binder of `g` bound: token 5 at position 3, name-seeded weights, and a nonzero
+    /// KV cache per state pair (a zero cache would let a lost state input cancel).
+    fn bind(g: &Graph) -> HashMap<ValueId, Value> {
+        let mut inputs = HashMap::new();
+        for &id in &g.inputs {
+            let meta = g.meta(id);
+            let shape = meta.aval.shape.clone();
+            let numel = shape.iter().product::<usize>().max(1);
+            let tensor = match meta.storage {
+                Storage::Slot(Slot::Token) => HostTensor::i32(shape, vec![5; numel]),
+                Storage::Slot(Slot::Pos) => HostTensor::i32(shape, vec![3; numel]),
+                Storage::Slot(other) => panic!("unexpected slot {other:?}"),
+                Storage::Const => {
+                    let name = meta.name.as_deref().expect("a constant is named");
+                    let seed = name.bytes().fold(1469598103934665603u64, |h, c| {
+                        (h ^ u64::from(c)).wrapping_mul(1099511628211)
+                    });
+                    let data = fill(numel, seed).iter().map(|v| v * 0.1).collect();
+                    HostTensor::f32(shape, data)
+                }
+                Storage::Computed(computed) => computed.tensor(),
+                Storage::State => continue,
+                Storage::Device => unreachable!("an input binder is never a device value"),
+            };
+            inputs.insert(id, Value::from(tensor));
+        }
+        for (pair, &(state_input, _)) in g.state.iter().enumerate() {
+            let shape = g.aval(state_input).shape.clone();
+            let numel = shape.iter().product::<usize>().max(1);
+            inputs.insert(
+                state_input,
+                Value::from(HostTensor::f32(shape, fill(numel, 7000 + pair as u64))),
+            );
+        }
+        inputs
+    }
+
+    fn bits(value: &Value) -> Vec<u32> {
+        value
+            .as_host()
+            .expect("a dense value")
+            .as_f32()
+            .expect("an f32 value")
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    }
+
+    /// Splitting after layer `k` and chaining the stages (each stage bound to the original inputs it
+    /// reads plus the boundary values the earlier stages produced) reproduces every logit and every
+    /// carried-state output of the whole graph bit for bit.
+    #[test]
+    fn qwen2_decode_split_after_every_layer_chains_to_the_whole_graph() {
+        let graph = qwen2_decode();
+        let runs = graph
+            .layer_runs()
+            .expect("the qwen2 tracer tags its layers");
+        assert_eq!(runs.layers, LAYERS);
+        let lengths: Vec<usize> = runs.runs.iter().map(|run| run.len()).collect();
+        assert!(
+            lengths.windows(2).all(|pair| pair[0] == pair[1]),
+            "qwen2's layers are identical, so each owns the same number of equations: {lengths:?}"
+        );
+
+        let inputs = bind(&graph);
+        let whole = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+            .expect("the whole graph evaluates");
+        assert!(
+            !graph.state.is_empty(),
+            "a decode step carries its KV cache"
+        );
+        assert!(
+            bits(&whole.output)
+                .iter()
+                .all(|b| f32::from_bits(*b).is_finite()),
+            "the reference logits are finite, or equality proves nothing"
+        );
+
+        for k in 0..LAYERS - 1 {
+            let split = split_stages_after_layers(&graph, &[k])
+                .unwrap_or_else(|error| panic!("cut after layer {k}: {error}"));
+            assert_eq!(split.stages.len(), 2);
+            assert!(!split.boundaries.is_empty(), "cut {k} crosses a value");
+
+            let mut bound = inputs.clone();
+            let mut logits = None;
+            let mut states: HashMap<(ValueId, ValueId), Value> = HashMap::new();
+            for (index, stage) in split.stages.iter().enumerate() {
+                let stage_inputs: HashMap<ValueId, Value> = stage
+                    .graph
+                    .inputs
+                    .iter()
+                    .map(|id| {
+                        let value = bound
+                            .get(id)
+                            .unwrap_or_else(|| panic!("cut {k} stage {index}: v{id} is unbound"));
+                        (*id, value.clone())
+                    })
+                    .collect();
+                let result = eval(
+                    &stage.graph,
+                    &stage_inputs,
+                    EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
+                )
+                .unwrap_or_else(|error| panic!("cut {k} stage {index} did not evaluate: {error}"));
+                let environment = result.environment.expect("the environment was kept");
+                for &value in &stage.outputs {
+                    bound.insert(
+                        value,
+                        environment[value]
+                            .clone()
+                            .unwrap_or_else(|| panic!("stage {index} lacks boundary v{value}")),
+                    );
+                }
+                for (&pair, value) in stage.graph.state.iter().zip(result.state) {
+                    states.insert(pair, value);
+                }
+                if index + 1 == split.stages.len() {
+                    logits = Some(result.output);
+                }
+            }
+
+            assert_eq!(
+                bits(&logits.expect("the final stage ran")),
+                bits(&whole.output),
+                "cut {k}: the chained logits differ from the whole graph's"
+            );
+            assert_eq!(
+                states.len(),
+                graph.state.len(),
+                "cut {k}: every pair is owned"
+            );
+            for (pair, expected) in graph.state.iter().zip(&whole.state) {
+                assert_eq!(
+                    bits(&states[pair]),
+                    bits(expected),
+                    "cut {k}: carried state v{} -> v{} differs",
+                    pair.0,
+                    pair.1
+                );
+            }
+        }
+    }
 }

@@ -1,8 +1,6 @@
 //! Contraction epilogue rows on wgpu: a bias, a pointwise activation and a residual add fuse into the
-//! contraction that feeds them (`OpKind::ContractionEpilogue`), and the fused device program equals the same
-//! graph compiled with no fusion bit for bit, with target, schedule, accumulation order and contraction
-//! policy held fixed. The routed-expert hang guard gives the unfused program: it plans one kernel per
-//! equation, a contraction on the same schedule the fused plan picks for its head.
+//! contraction that feeds them (`OpKind::ContractionEpilogue`), and the fused device program meets the CPU
+//! oracle of the unfused graph.
 
 use super::*;
 
@@ -47,13 +45,12 @@ fn bf16_bits(x: f32) -> u16 {
     ((bits + 0x7fff + ((bits >> 16) & 1)) >> 16) as u16
 }
 
-/// `g` run once on `gpu` (under the routed-expert hang guard when `guarded`), every input a named const.
+/// `g` run once on `gpu`, every input a named const.
 fn run_under(
     gpu: &mut dyn Executor,
     target: Target,
     g: &poot_graph_ir::Graph,
     inputs: &HashMap<poot_graph_ir::ValueId, HostTensor>,
-    guarded: bool,
 ) -> HostTensor {
     let mut builder = WeightStore::builder();
     for (&id, tensor) in inputs {
@@ -69,13 +66,10 @@ fn run_under(
             .insert(meta.name.clone().unwrap(), WeightEntry::Dense(dense))
             .unwrap();
     }
-    let exe = gpu
-        .load_weights(
-            Arc::new(builder.build()),
-            poot_executor::WeightSource::ConstNames,
-        )
-        .unwrap();
-    let staged = staged_replay_with(g, target, guarded);
+    let store = builder.build();
+    let (bound, map) = ConstWeights::bind(g, &store);
+    let exe = gpu.load_weights(Arc::new(store), Arc::new(map)).unwrap();
+    let staged = staged_replay(&bound, target);
     let entry = gpu.add_entry(exe, &staged).unwrap();
     let bytes = gpu
         .step(exe, entry, &StepInputs::new(), &mut poot_executor::NoSync)
@@ -97,23 +91,19 @@ fn run_under(
     )
 }
 
-fn compiled(g: &poot_graph_ir::Graph, target: &Target, guarded: bool) -> poot_graph_plan::Program {
-    let (g, caps) = poot_test_util::graph_fixtures::pipeline_input(g, target.caps, guarded);
+fn compiled(g: &poot_graph_ir::Graph, target: &Target) -> poot_graph_plan::Program {
     compile(
-        &g,
-        &Target { caps, ..*target },
-        &CompileOptions {
-            execution: Submission::Replay,
-            limits: poot_graph_plan::CompileLimits::STANDARD,
-        },
+        g,
+        target,
+        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect("the graph compiles")
 }
 
-/// The one `ContractionEpilogue` of the fully fused program and its head, with the dispatches fusion removed.
-fn epilogue_head(g: &poot_graph_ir::Graph, target: &Target) -> (ContractionHead, usize) {
-    let fused = compiled(g, target, false);
-    let unfused = compiled(g, target, true);
+/// The head of the one `ContractionEpilogue` in the compiled program; the chain, its bias and residual leaves
+/// and the head are that one dispatch.
+fn epilogue_head(g: &poot_graph_ir::Graph, target: &Target) -> ContractionHead {
+    let fused = compiled(g, target);
     let heads: Vec<ContractionHead> = fused
         .graph()
         .eqns
@@ -129,49 +119,24 @@ fn epilogue_head(g: &poot_graph_ir::Graph, target: &Target) -> (ContractionHead,
         "one fused contraction: {:?}",
         fused.graph().eqns
     );
-    assert!(
-        unfused
-            .graph()
-            .eqns
-            .iter()
-            .all(|eqn| !matches!(eqn.op, OpKind::ContractionEpilogue { .. })),
-        "the guard keeps one kernel per equation"
+    assert_eq!(
+        dispatch_count(fused.graph()),
+        1,
+        "the head and its whole chain are one dispatch"
     );
-    (
-        heads[0],
-        dispatch_count(unfused.graph()) - dispatch_count(fused.graph()),
-    )
+    heads[0]
 }
 
-/// Run the fused program on `gpu` and the unfused one on `hung` (an engine whose device reports the routed-expert
-/// hang, which the guarded program is compiled for) and the CPU oracle; the two device results are equal bit
-/// for bit and both meet the oracle's tier-2 tolerance.
-fn assert_fused_equals_unfused(
+/// Run the fused program on `gpu` and the CPU oracle of the graph; the device result meets the oracle's tier-2
+/// tolerance.
+fn assert_fused_matches_oracle(
     gpu: &mut dyn Executor,
-    hung: &mut dyn Executor,
     target: Target,
     g: &poot_graph_ir::Graph,
     inputs: &HashMap<poot_graph_ir::ValueId, HostTensor>,
     label: &str,
 ) {
-    let fused = run_under(gpu, target, g, inputs, false);
-    let unfused = run_under(hung, target, g, inputs, true);
-    let fused_bits: Vec<u32> = fused
-        .as_f32()
-        .unwrap()
-        .iter()
-        .map(|v| v.to_bits())
-        .collect();
-    let unfused_bits: Vec<u32> = unfused
-        .as_f32()
-        .unwrap()
-        .iter()
-        .map(|v| v.to_bits())
-        .collect();
-    assert_eq!(
-        fused_bits, unfused_bits,
-        "{label}: the fused device program must equal the unfused one bit for bit"
-    );
+    let fused = run_under(gpu, target, g, inputs);
     let oracle_inputs: HashMap<_, Value> = inputs
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
@@ -191,16 +156,13 @@ fn assert_fused_equals_unfused(
 }
 
 /// SC-001 (wgpu, the decode Gemv): an F32 `[N, K]` projection at `M == 1` with a bias, an activation, a scale
-/// and a residual fuses into one `ContractionEpilogue { head: Dense }` that removes four dispatches, and the
-/// fused and unfused device results are bit-identical. Mutation: omit the residual or the bias leaf in
+/// and a residual fuses into one `ContractionEpilogue { head: Dense }` dispatch whose device result meets the
+/// oracle. Mutation: omit the residual or the bias leaf in
 /// `emit_epilogue` (`read_leaf` returns zero); the fixture's nonzero inputs then differ and this row goes red.
 #[test]
-fn a_dense_gemv_epilogue_equals_the_unfused_program_on_wgpu() {
+fn a_dense_gemv_epilogue_matches_the_oracle_on_wgpu() {
     let _gpu_guard = gpu_lock();
     let Some((mut gpu, target)) = open_engine_or_skip() else {
-        return;
-    };
-    let Some(mut hung) = open_hung_engine_or_skip() else {
         return;
     };
     let (k, n) = (37usize, 53usize);
@@ -218,36 +180,22 @@ fn a_dense_gemv_epilogue_equals_the_unfused_program_on_wgpu() {
         (residual.id, HostTensor::f32(vec![1, 1, n], fill(4, n))),
     ]);
     let g = b.finish(out);
-    let (head, removed) = epilogue_head(&g, &target);
+    let head = epilogue_head(&g, &target);
     assert!(matches!(
         head,
         ContractionHead::Dense { weight: DType::F32 }
     ));
-    assert_eq!(
-        removed, 4,
-        "the bias, tanh, scale and residual steps leave the plan"
-    );
-    assert_fused_equals_unfused(
-        &mut gpu,
-        &mut hung,
-        target,
-        &g,
-        &inputs,
-        "dense gemv epilogue",
-    );
+    assert_fused_matches_oracle(&mut gpu, target, &g, &inputs, "dense gemv epilogue");
 }
 
 /// SC-001 (wgpu, the one-thread-per-output body): a batched `MatMul` the planner lowers serially, with the
-/// same chain, fuses into `ContractionEpilogue { head: MatMul }` and equals the unfused program bit for bit.
+/// same chain, fuses into `ContractionEpilogue { head: MatMul }` and meets the oracle.
 /// The weight's size-1 batch axis makes the shapes ineligible for the tiled and decode routes, so the serial
-/// body is the unfused plan's schedule too. Mutation as above.
+/// body is the head's schedule. Mutation as above.
 #[test]
-fn a_serial_matmul_epilogue_equals_the_unfused_program_on_wgpu() {
+fn a_serial_matmul_epilogue_matches_the_oracle_on_wgpu() {
     let _gpu_guard = gpu_lock();
     let Some((mut gpu, target)) = open_engine_or_skip() else {
-        return;
-    };
-    let Some(mut hung) = open_hung_engine_or_skip() else {
         return;
     };
     let b = Builder::new();
@@ -264,32 +212,21 @@ fn a_serial_matmul_epilogue_equals_the_unfused_program_on_wgpu() {
         (residual.id, HostTensor::f32(vec![1, 2, 3, 5], fill(14, 30))),
     ]);
     let g = b.finish(out);
-    let (head, removed) = epilogue_head(&g, &spirv_fixture_target());
+    let head = epilogue_head(&g, &spirv_fixture_target());
     assert!(matches!(head, ContractionHead::MatMul));
-    assert_eq!(removed, 4);
-    assert_fused_equals_unfused(
-        &mut gpu,
-        &mut hung,
-        target,
-        &g,
-        &inputs,
-        "serial matmul epilogue",
-    );
+    assert_fused_matches_oracle(&mut gpu, target, &g, &inputs, "serial matmul epilogue");
 }
 
 /// POOT-1036 (wgpu, the generated tiled GEMM over an f32 `[K, N]` weight): a plain `MatMul` head at `M > 1`, the
 /// non-checkpoint route (`is_tileable_matmul_in`), with the same four-step chain fuses into one
-/// `ContractionEpilogue { head: MatMul }` that removes four dispatches, at a single partial row-tile (`M == 5`)
-/// and at many (`M == 160`); the fused and unfused device results are bit-identical and meet the oracle.
+/// `ContractionEpilogue { head: MatMul }` dispatch, at a single partial row-tile (`M == 5`) and at many
+/// (`M == 160`); the device result meets the oracle.
 /// Mutation: drop the `is_tileable_matmul_in` arm of `epilogue_head_lowers` (`Tileable` no longer lowers); the head
 /// and its chain stay apart and this row goes red.
 #[test]
-fn a_tiled_matmul_epilogue_equals_the_unfused_program_on_wgpu() {
+fn a_tiled_matmul_epilogue_matches_the_oracle_on_wgpu() {
     let _gpu_guard = gpu_lock();
     let Some((mut gpu, target)) = open_engine_or_skip() else {
-        return;
-    };
-    let Some(mut hung) = open_hung_engine_or_skip() else {
         return;
     };
     let (k, n) = (37usize, 53usize);
@@ -308,12 +245,10 @@ fn a_tiled_matmul_epilogue_equals_the_unfused_program_on_wgpu() {
             (residual.id, HostTensor::f32(vec![m, n], fill(4, m * n))),
         ]);
         let g = b.finish(out);
-        let (head, removed) = epilogue_head(&g, &target);
+        let head = epilogue_head(&g, &target);
         assert!(matches!(head, ContractionHead::MatMul), "M={m}");
-        assert_eq!(removed, 4, "M={m}: the chain's four steps leave the plan");
-        assert_fused_equals_unfused(
+        assert_fused_matches_oracle(
             &mut gpu,
-            &mut hung,
             target,
             &g,
             &inputs,
@@ -324,16 +259,13 @@ fn a_tiled_matmul_epilogue_equals_the_unfused_program_on_wgpu() {
 
 /// SC-001 (wgpu, a packed-BF16 weight): the dense head over a checkpoint BF16 `[N, K]` weight read as packed
 /// `u32` lanes at `M == 1`, the decode Gemv, with the same chain (`M > 1` is
-/// `a_dense_tiled_epilogue_equals_the_unfused_program_on_wgpu`). The activation, bias and
+/// `a_dense_tiled_epilogue_matches_the_oracle_on_wgpu`). The activation, bias and
 /// residual are f32; the head result is f32 (the weight is the only narrow operand), so no head rounding applies
-/// and the fused result equals the unfused one bit for bit.
+/// and the fused result meets the oracle.
 #[test]
-fn a_dense_bf16_weight_epilogue_equals_the_unfused_program_on_wgpu() {
+fn a_dense_bf16_weight_epilogue_matches_the_oracle_on_wgpu() {
     let _gpu_guard = gpu_lock();
     let Some((mut gpu, target)) = open_engine_or_skip() else {
-        return;
-    };
-    let Some(mut hung) = open_hung_engine_or_skip() else {
         return;
     };
     let (m, k, n) = (1usize, 18usize, 9usize);
@@ -352,36 +284,24 @@ fn a_dense_bf16_weight_epilogue_equals_the_unfused_program_on_wgpu() {
         (residual.id, HostTensor::f32(vec![m, n], fill(24, m * n))),
     ]);
     let g = b.finish(out);
-    let (head, removed) = epilogue_head(&g, &target);
+    let head = epilogue_head(&g, &target);
     assert!(matches!(
         head,
         ContractionHead::Dense {
             weight: DType::BF16
         }
     ));
-    assert_eq!(removed, 4);
-    assert_fused_equals_unfused(
-        &mut gpu,
-        &mut hung,
-        target,
-        &g,
-        &inputs,
-        "dense bf16 epilogue",
-    );
+    assert_fused_matches_oracle(&mut gpu, target, &g, &inputs, "dense bf16 epilogue");
 }
 
 /// POOT-1032 (wgpu, the generated tiled GEMM): the dense head at `M > 1` over an F32 and a packed-BF16 `[N, K]`
-/// weight, with the same four-step chain, fuses into one `ContractionEpilogue { head: Dense }` that removes four
-/// dispatches, at a single partial row-tile (`M == 5`) and at many (`M == 160`); the fused and unfused device
-/// results are bit-identical and meet the oracle. Mutation: omit the residual or the bias leaf in `emit_epilogue`,
+/// weight, with the same four-step chain, fuses into one `ContractionEpilogue { head: Dense }` dispatch, at a
+/// single partial row-tile (`M == 5`) and at many (`M == 160`); the device result meets the oracle. Mutation: omit the residual or the bias leaf in `emit_epilogue`,
 /// or drop the epilogue from the tiled store in `tiled_region`; the nonzero inputs then differ and this row goes red.
 #[test]
-fn a_dense_tiled_epilogue_equals_the_unfused_program_on_wgpu() {
+fn a_dense_tiled_epilogue_matches_the_oracle_on_wgpu() {
     let _gpu_guard = gpu_lock();
     let Some((mut gpu, target)) = open_engine_or_skip() else {
-        return;
-    };
-    let Some(mut hung) = open_hung_engine_or_skip() else {
         return;
     };
     let (k, n) = (37usize, 53usize);
@@ -409,20 +329,15 @@ fn a_dense_tiled_epilogue_equals_the_unfused_program_on_wgpu() {
                 (residual.id, HostTensor::f32(vec![m, n], fill(4, m * n))),
             ]);
             let g = b.finish(out);
-            let (head, removed) = epilogue_head(&g, &target);
+            let head = epilogue_head(&g, &target);
             assert_eq!(
                 head,
                 ContractionHead::Dense {
                     weight: weight_dtype
                 }
             );
-            assert_eq!(
-                removed, 4,
-                "{weight_dtype:?} M={m}: the bias, tanh, scale and residual steps leave the plan"
-            );
-            assert_fused_equals_unfused(
+            assert_fused_matches_oracle(
                 &mut gpu,
-                &mut hung,
                 target,
                 &g,
                 &inputs,
@@ -432,13 +347,12 @@ fn a_dense_tiled_epilogue_equals_the_unfused_program_on_wgpu() {
     }
 }
 
-/// SC-006 (wgpu): SPIR-V has no scalar bf16, so no narrow-head contraction schedule is admitted on wgpu, fused or
-/// not. The narrow rows (BF16 and F16 heads, multistage narrow chains) therefore run on ROCm (and PTX in the pod
-/// batch); here the planner refuses the narrow head by name under both policies, so a narrow epilogue can never
-/// reach a wgpu kernel with its rounding dropped. The refusal is the same equation-and-capability value either way:
-/// `DtypeLowering` on the `bf16` result.
+/// SC-006 (wgpu): SPIR-V has no scalar bf16, so no narrow-head contraction schedule is admitted on wgpu. The
+/// narrow rows (BF16 and F16 heads, multistage narrow chains) therefore run on ROCm (and PTX in the pod batch);
+/// here the planner refuses the narrow head by name, so a narrow epilogue can never reach a wgpu kernel with its
+/// rounding dropped: `DtypeLowering` on the `bf16` result.
 #[test]
-fn a_narrow_head_is_refused_by_name_on_wgpu_fused_or_not() {
+fn a_narrow_head_is_refused_by_name_on_wgpu() {
     use poot_graph_plan::{Capability, CompileError, PlanError};
 
     let b = Builder::new();
@@ -447,26 +361,19 @@ fn a_narrow_head_is_refused_by_name_on_wgpu_fused_or_not() {
     let residual = b.constant("residual", TensorType::new(vec![1, 1], DType::BF16));
     let out = b.binary(BinOp::Add, b.matmul(a, w), residual);
     let g = b.finish(out);
-    for guarded in [false, true] {
-        let target = spirv_fixture_target();
-        let (g, caps) = poot_test_util::graph_fixtures::pipeline_input(&g, target.caps, guarded);
-        let error = poot_graph_plan::compile(
-            &g,
-            &Target { caps, ..target },
-            &CompileOptions {
-                execution: Submission::Replay,
-                limits: poot_graph_plan::CompileLimits::STANDARD,
-            },
-        )
-        .err()
-        .unwrap_or_else(|| panic!("{guarded}: a bf16 head must not plan on wgpu"));
-        let CompileError::Plan(plan) = error else {
-            panic!("{guarded}: a planner refusal, got {error}");
-        };
-        let PlanError::Refused(refusal) = *plan else {
-            panic!("{guarded}: a typed refusal, got {plan}");
-        };
-        assert_eq!(refusal.missing, Capability::DtypeLowering, "{guarded}");
-        assert_eq!(refusal.dtypes.output, DType::BF16, "{guarded}");
-    }
+    let Err(error) = poot_graph_plan::compile(
+        &g,
+        &spirv_fixture_target(),
+        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+    ) else {
+        panic!("a bf16 head must not plan on wgpu");
+    };
+    let CompileError::Plan(plan) = error else {
+        panic!("a planner refusal, got {error}");
+    };
+    let PlanError::Refused(refusal) = *plan else {
+        panic!("a typed refusal, got {plan}");
+    };
+    assert_eq!(refusal.missing, Capability::DtypeLowering);
+    assert_eq!(refusal.dtypes.output, DType::BF16);
 }

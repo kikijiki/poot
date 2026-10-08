@@ -14,7 +14,9 @@ use poot_graph_ir::{Graph, NoValidations, Storage, ValidationChannel, Validation
 use poot_models::model::{KvLayout, LogitRows, StepShape};
 use poot_models::registry::{RawConfig, Registry};
 use poot_quant::format::WeightFormat;
-use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
+use poot_quant::weights::{
+    DenseWeight, WeightEntry, WeightKey, WeightMap, WeightStore, WeightView,
+};
 use poot_tensor::DType;
 
 use crate::weight_map::{MappedModel, Projections};
@@ -365,17 +367,22 @@ fn dense(dtype: DType, shape: Vec<usize>, values: &[f32]) -> WeightEntry {
     WeightEntry::Dense(DenseWeight::try_new(dtype, shape, Arc::from(bytes)).unwrap())
 }
 
-/// The weights `g` reads, as a store keyed by the const names `g` declares (the form
-/// [`poot_executor::WeightSource::ConstNames`] binds and the CPU oracle reads): each dense const
-/// the model's map names, materialized from `m`'s checkpoint. A const the map does not name is a
+/// The weights `g` reads, as a store keyed by the const names `g` declares (what the CPU oracle
+/// reads) and the map that binds them: each dense const the model's map names, materialized from
+/// `m`'s checkpoint, and its id viewing that entry. Load the store with
+/// the map (`Executor::load_weights`). A const the model's map does not name is a
 /// panic, not a silent zero.
-pub fn const_named_store<V: ValidationChannel>(m: &MappedModel, g: &Graph<V>) -> WeightStore {
+pub fn const_named_weights<V: ValidationChannel>(
+    m: &MappedModel,
+    g: &Graph<V>,
+) -> (WeightStore, WeightMap) {
     let ids: std::collections::HashMap<String, _> = m
         .map
         .iter()
         .map(|(id, _, _)| (id.const_name(), id))
         .collect();
     let mut store = WeightStore::builder();
+    let mut named = Vec::new();
     for &input in &g.inputs {
         let meta = g.meta(input);
         if meta.storage != Storage::Const {
@@ -388,8 +395,16 @@ pub fn const_named_store<V: ValidationChannel>(m: &MappedModel, g: &Graph<V>) ->
         store
             .insert(name, m.map.materialize(id, &m.store).unwrap())
             .unwrap();
+        named.push((id, name));
     }
-    store.build()
+    let store = store.build();
+    let mut map = WeightMap::builder(&store);
+    for (id, name) in named {
+        map.map(id, WeightView::Stored(WeightKey::from(name)))
+            .unwrap();
+    }
+    let map = map.build();
+    (store, map)
 }
 
 /// `g` as an ordinary [`Graph`], for the fixtures and passes that take one. A dense family declares

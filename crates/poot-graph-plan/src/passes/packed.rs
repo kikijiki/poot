@@ -1,4 +1,5 @@
 use super::*;
+use poot_graph_ir::ContractionRows;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PackedDequantErrorContext {
     pub value: ValueId,
@@ -95,7 +96,7 @@ pub enum PackedDequantProductionError {
     Unmatched { context: PackedDequantErrorContext },
 }
 
-fn packed_consumer_map<V: ValidationChannel>(g: &Graph<V>) -> Vec<Vec<usize>> {
+pub(super) fn packed_consumer_map<V: ValidationChannel>(g: &Graph<V>) -> Vec<Vec<usize>> {
     let mut consumers = vec![Vec::new(); g.values.len()];
     for (equation, eqn) in g.eqns.iter().enumerate() {
         for operand in &eqn.inputs {
@@ -127,7 +128,7 @@ pub(crate) fn reject_preexisting_packed_contractions<V: ValidationChannel>(
     Ok(())
 }
 
-fn value_input(eqn: &Eqn, position: usize) -> Option<ValueId> {
+pub(super) fn value_input(eqn: &Eqn, position: usize) -> Option<ValueId> {
     match eqn.inputs.get(position) {
         Some(Operand::Value(value)) => Some(*value),
         _ => None,
@@ -138,8 +139,8 @@ fn value_input(eqn: &Eqn, position: usize) -> Option<ValueId> {
 /// `descriptor.sources()` order.
 ///
 /// The typed contract is the op itself: both `PackedDequant::infer` and `PackedContraction::infer`
-/// (which delegates to it over `ins[1..]`) already tie operand `i` to
-/// `descriptor.sources()[i]`'s `source_shape`, checked at `graph.validate()` before any recognizer
+/// (which checks the carriers after its leading operands) already tie operand `i` to
+/// `descriptor.sources()[i]`'s `source_shape` (an expert-stacked carrier's `[experts, slab_bytes]`), checked at `graph.validate()` before any recognizer
 /// runs - so `carrier_inputs` is already the right length and dtype/shape per role; this function
 /// checks the graph-structural facts `infer` cannot see (constant storage, no escape, exactly one
 /// consumer, no two roles aliasing the same value). R469-007: identity is checked by graph structure,
@@ -431,7 +432,7 @@ pub fn recognize_packed_contractions<V: ValidationChannel>(g: &Graph<V>) -> Grap
         };
         let candidate_op = OpKind::PackedContraction {
             descriptor: candidate.descriptor,
-            blocks: candidate.blocks,
+            rows: ContractionRows::Blocks(candidate.blocks),
         };
         let candidate_inputs: Vec<poot_graph_ir::types::TensorType> =
             std::iter::once(g.aval(activation).clone())
@@ -506,7 +507,7 @@ pub fn recognize_packed_contractions<V: ValidationChannel>(g: &Graph<V>) -> Grap
         };
         let candidate_op = OpKind::PackedContraction {
             descriptor: candidate.descriptor,
-            blocks: candidate.blocks,
+            rows: ContractionRows::Blocks(candidate.blocks),
         };
         let candidate_inputs: Vec<poot_graph_ir::types::TensorType> =
             std::iter::once(g.aval(activation).clone())
@@ -629,101 +630,19 @@ pub fn recognize_packed_row_gathers<V: ValidationChannel>(g: &Graph<V>) -> Graph
     Graph { eqns, ..g.clone() }
 }
 
-/// Card 642: the one packed MoE shape the escape gate admits until Card 632 replaces it
-/// with `RowSelect` contractions - the branch `ops::packed_indexed_linear`/`packed_grouped_linear`
-/// stage per expert (`stage_packed_indexed_linear`): `PackedDequant -> Transpose([1, 0]) ->
-/// Reshape([1, K, out]) -> Concat(axis 0) -> IndexedMatMul` (the concatenated table is the
-/// contraction's weight operand), every `Concat` operand being such a branch of the same `[out, K]`.
-/// Each dequant is then planned as `Materialize` and the table runs the dense `IndexedMatMul` kernel,
-/// every member single-consumer and none a graph escape. Anything else stays refused.
-fn is_canonical_indexed_branch<V: ValidationChannel>(
-    g: &Graph<V>,
-    dequant: usize,
-    consumers: &[Vec<usize>],
-    producer: &HashMap<ValueId, usize>,
-) -> bool {
-    let OpKind::PackedDequant { descriptor } = g.eqns[dequant].op else {
-        return false;
-    };
-    let [out, k] = descriptor.shape();
-    let sole_consumer = |value: ValueId| {
-        (consumers[value].len() == 1 && !is_graph_escape(g, value))
-            .then(|| &g.eqns[consumers[value][0]])
-    };
-    // The branch rooted at `reshape_out`'s producer chain, walked upward: Reshape <- Transpose <-
-    // PackedDequant of this `[out, K]`, each member single-consumer and not an escape.
-    let is_branch = |reshape_out: ValueId| -> bool {
-        let Some(&reshape) = producer.get(&reshape_out) else {
-            return false;
-        };
-        let reshape = &g.eqns[reshape];
-        if !matches!(&reshape.op, OpKind::Reshape { shape } if shape.as_slice() == [1, k, out]) {
-            return false;
-        }
-        let Some(transpose_out) = value_input(reshape, 0) else {
-            return false;
-        };
-        let Some(&transpose) = producer.get(&transpose_out) else {
-            return false;
-        };
-        let transpose = &g.eqns[transpose];
-        if !matches!(&transpose.op, OpKind::Transpose { perm } if perm.as_slice() == [1, 0]) {
-            return false;
-        }
-        let Some(dequant_out) = value_input(transpose, 0) else {
-            return false;
-        };
-        let Some(&root) = producer.get(&dequant_out) else {
-            return false;
-        };
-        matches!(g.eqns[root].op, OpKind::PackedDequant { descriptor } if descriptor.shape() == [out, k])
-            && [dequant_out, transpose_out, reshape_out]
-                .iter()
-                .all(|&value| consumers[value].len() == 1 && !is_graph_escape(g, value))
-    };
-    let Some(transpose) = sole_consumer(g.eqns[dequant].out) else {
-        return false;
-    };
-    let Some(reshape) = sole_consumer(transpose.out) else {
-        return false;
-    };
-    let Some(concat) = sole_consumer(reshape.out) else {
-        return false;
-    };
-    if !matches!(concat.op, OpKind::Concat { axis: 0 }) {
-        return false;
-    }
-    let Some(contraction) = sole_consumer(concat.out) else {
-        return false;
-    };
-    matches!(contraction.op, OpKind::IndexedMatMul)
-        && value_input(contraction, 1) == Some(concat.out)
-        && value_input(contraction, 0) != Some(concat.out)
-        && value_input(contraction, 2) != Some(concat.out)
-        && concat.inputs.iter().all(|operand| match operand {
-            Operand::Value(value) => is_branch(*value),
-            Operand::Lit(_) => false,
-        })
-}
-
 /// Card 355's final production policy gate. It scans live equations only, after DCE.
 pub fn reject_packed_dequant_escapes<V: ValidationChannel>(
     g: &Graph<V>,
 ) -> Result<(), PackedDequantProductionError> {
     let consumers = packed_consumer_map(g);
-    let producer: HashMap<ValueId, usize> = g
-        .eqns
-        .iter()
-        .enumerate()
-        .map(|(index, eqn)| (eqn.out, index))
-        .collect();
     for (equation, eqn) in g.eqns.iter().enumerate() {
         if let OpKind::PackedRowGather { descriptor } = eqn.op {
             let carriers = &eqn.inputs[..eqn.inputs.len().saturating_sub(1)];
             validate_packed_carriers(g, equation, descriptor, carriers, &consumers)?;
         }
-        if let OpKind::PackedContraction { descriptor, .. } = eqn.op {
-            validate_packed_carriers(g, equation, descriptor, &eqn.inputs[1..], &consumers)?;
+        if let OpKind::PackedContraction { descriptor, rows } = eqn.op {
+            let carriers = &eqn.inputs[rows.leading_operands()..];
+            validate_packed_carriers(g, equation, descriptor, carriers, &consumers)?;
             if g.state.iter().any(|&(_, state_out)| state_out == eqn.out) {
                 return Err(PackedDequantProductionError::StateOutput {
                     context: PackedDequantErrorContext::new(eqn.out, descriptor),
@@ -758,9 +677,6 @@ pub fn reject_packed_dequant_escapes<V: ValidationChannel>(
                 internal: eqn.out,
                 consumers: consumers[eqn.out].len(),
             });
-        }
-        if is_canonical_indexed_branch(g, equation, &consumers, &producer) {
-            continue;
         }
         let next = &g.eqns[consumers[eqn.out][0]];
         match &next.op {
@@ -908,10 +824,10 @@ mod tests {
         match &recognized.eqns[0].op {
             OpKind::PackedContraction {
                 descriptor: d,
-                blocks,
+                rows,
             } => {
                 assert_eq!(*d, descriptor());
-                assert_eq!(*blocks, 1);
+                assert_eq!(*rows, ContractionRows::Blocks(1));
             }
             other => panic!("expected PackedContraction, got {other:?}"),
         }
@@ -969,10 +885,10 @@ mod tests {
         match &recognized.eqns[0].op {
             OpKind::PackedContraction {
                 descriptor: d,
-                blocks,
+                rows,
             } => {
                 assert_eq!(*d, descriptor());
-                assert_eq!(*blocks, 1);
+                assert_eq!(*rows, ContractionRows::Blocks(1));
             }
             other => panic!("expected PackedContraction, got {other:?}"),
         }
@@ -1041,10 +957,10 @@ mod tests {
         match &recognized.eqns[0].op {
             OpKind::PackedContraction {
                 descriptor: d,
-                blocks,
+                rows,
             } => {
                 assert_eq!(*d, descriptor);
-                assert_eq!(*blocks, 1);
+                assert_eq!(*rows, ContractionRows::Blocks(1));
             }
             other => panic!("expected PackedContraction, got {other:?}"),
         }

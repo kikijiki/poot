@@ -1130,6 +1130,23 @@ fn sample_token_gumbel_topp_only_excludes_untruncated_winner_ptx_matches_cpu() {
     assert_eq!(got, vec![3, -1]);
 }
 
+/// A `Gather` over an I32 const table whose words need all 32 bits ([`poot_test_util::i32_table_gather`])
+/// returns the table's words exactly on PTX: the table is stored as raw I32, not as its F32 mirror.
+///
+/// Mutation: pin the Gather-over-I32-data component to the mirror lane (drop the `pinned` pass of
+/// `ExactI32StorageAnalysis::new`); the output is the table rounded through F32 and this row goes red.
+#[test]
+fn i32_table_gather_is_exact_beyond_f32_ptx() {
+    use poot_test_util::i32_table_gather as fixture;
+
+    let Some(mut ptx) = try_ptx() else {
+        return;
+    };
+    let g = fixture::graph();
+    let got = common::run_resident_i32(&mut ptx, &g, &fixture::inputs(&g));
+    fixture::check("ptx", &got).unwrap();
+}
+
 // `i32_slot_gather_variants_compiled_match_cpu_bit_exact_ptx` (spike 562 F-9, card 643) is not ported to
 // the executor contract: its Dus/CastDus variants seed carried state with specific non-zero bytes
 // before the one run (`I32SlotGatherVariant::state()`), but `poot_executor::Device`/`Executor` has no
@@ -1149,11 +1166,10 @@ fn bf16_bits(x: f32) -> u16 {
 
 /// POOT-1032 (PTX, the generated tiled GEMM): a dense head over an F32 and a packed-BF16 `[N, K]` weight at
 /// `M > 1` (a single partial row-tile at `M == 5`, many at `M == 160`) with a bias and a residual fuses into one
-/// `ContractionEpilogue { head: Dense }`, and the fused and unfused device results are bit-identical. The chain is
-/// two adds, which cannot contract, so the comparison is exact. Mutation: drop the epilogue from the tiled store in
+/// `ContractionEpilogue { head: Dense }`, and the device result meets the CPU oracle. Mutation: drop the epilogue from the tiled store in
 /// `tiled_region`; the nonzero inputs then differ and this row goes red. Runs on the PTX pod.
 #[test]
-fn a_dense_tiled_epilogue_equals_the_unfused_program_on_ptx() {
+fn a_dense_tiled_epilogue_matches_the_oracle_on_ptx() {
     use poot_graph_plan::{CompileLimits, CompileOptions, Submission, Target, compile};
     use poot_tensor::DType;
     let Some(mut ptx) = try_ptx() else { return };
@@ -1193,10 +1209,7 @@ fn a_dense_tiled_epilogue_equals_the_unfused_program_on_ptx() {
             let fused_graph = compile(
                 &g,
                 &target,
-                &CompileOptions {
-                    execution: Submission::Replay,
-                    limits: CompileLimits::STANDARD,
-                },
+                &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
             )
             .expect("the graph compiles");
             let heads: Vec<_> = fused_graph
@@ -1215,15 +1228,18 @@ fn a_dense_tiled_epilogue_equals_the_unfused_program_on_ptx() {
                 }],
                 "{label}: one fused dense contraction"
             );
-            let fused = common::run_resident_with_fusion(&mut ptx, &g, &inputs, false);
-            let unfused = common::run_resident_with_fusion(&mut ptx, &g, &inputs, true);
-            let bits = |t: &HostTensor| -> Vec<u32> {
-                t.as_f32().unwrap().iter().map(|v| v.to_bits()).collect()
-            };
-            assert_eq!(
-                bits(&fused),
-                bits(&unfused),
-                "{label}: the fused device program must equal the unfused one bit for bit"
+            let fused = common::run_resident(&mut ptx, &g, &inputs);
+            let want = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+                .unwrap()
+                .output
+                .into_host()
+                .unwrap();
+            assert_eq!(fused.shape(), want.shape(), "{label}: shape");
+            poot_executor_parity::weight_map::assert_close(
+                fused.as_f32().unwrap(),
+                want.as_f32().unwrap(),
+                poot_executor_parity::weight_map::TIER2,
+                &label,
             );
         }
     }
@@ -1231,11 +1247,11 @@ fn a_dense_tiled_epilogue_equals_the_unfused_program_on_ptx() {
 
 /// POOT-1036 (PTX, the generated tiled GEMM over an f32 `[K, N]` weight): a plain `MatMul` head at `M > 1` with a
 /// bias and a residual fuses into one `ContractionEpilogue { head: MatMul }` (a single partial row-tile at `M == 5`,
-/// many at `M == 160`), and the fused and unfused device results are bit-identical (two adds cannot contract).
+/// many at `M == 160`), and the device result meets the CPU oracle.
 /// Mutation: drop the `Tileable` arm of `epilogue_head_lowers`; the head stays apart and this row goes red.
 /// Runs on the PTX pod.
 #[test]
-fn a_tiled_matmul_epilogue_equals_the_unfused_program_on_ptx() {
+fn a_tiled_matmul_epilogue_matches_the_oracle_on_ptx() {
     use poot_graph_plan::{CompileLimits, CompileOptions, Submission, Target, compile};
     let Some(mut ptx) = try_ptx() else { return };
     let target = Target {
@@ -1265,10 +1281,7 @@ fn a_tiled_matmul_epilogue_equals_the_unfused_program_on_ptx() {
         let fused_graph = compile(
             &g,
             &target,
-            &CompileOptions {
-                execution: Submission::Replay,
-                limits: CompileLimits::STANDARD,
-            },
+            &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
         )
         .expect("the graph compiles");
         let heads: Vec<_> = fused_graph
@@ -1285,15 +1298,18 @@ fn a_tiled_matmul_epilogue_equals_the_unfused_program_on_ptx() {
             [poot_graph_ir::op::ContractionHead::MatMul],
             "{label}: one fused matmul contraction"
         );
-        let fused = common::run_resident_with_fusion(&mut ptx, &g, &inputs, false);
-        let unfused = common::run_resident_with_fusion(&mut ptx, &g, &inputs, true);
-        let bits = |t: &HostTensor| -> Vec<u32> {
-            t.as_f32().unwrap().iter().map(|v| v.to_bits()).collect()
-        };
-        assert_eq!(
-            bits(&fused),
-            bits(&unfused),
-            "{label}: the fused device program must equal the unfused one bit for bit"
+        let fused = common::run_resident(&mut ptx, &g, &inputs);
+        let want = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+            .unwrap()
+            .output
+            .into_host()
+            .unwrap();
+        assert_eq!(fused.shape(), want.shape(), "{label}: shape");
+        poot_executor_parity::weight_map::assert_close(
+            fused.as_f32().unwrap(),
+            want.as_f32().unwrap(),
+            poot_executor_parity::weight_map::TIER2,
+            &label,
         );
     }
 }

@@ -149,31 +149,15 @@ fn igpu_matmul_latency_vs_npu() {
 }
 
 #[test]
-fn vram_used_bytes_reports_a_plausible_value() {
-    // Device VRAM via the Vulkan runtime (VK_EXT_memory_budget): engine-queried, vendor/OS-agnostic, no sysfs/CLI. Device-wide,
-    // so on this box (a co-resident llama.cpp holds ~30 GB) it is well above a MiB and below the carveout. Sanity bound only;
-    // verifies the wgpu-hal/ash interop works. Tests `poot_runtime::Context` directly (card 546b: the
-    // `GpuExecutor` pass-throughs are gone with the rest of the pre-contract executor).
+fn vram_budget_bytes_reports_a_plausible_value() {
+    // The device VRAM budget via the Vulkan runtime (VK_EXT_memory_budget heap_budget): engine-queried,
+    // vendor/OS-agnostic, no sysfs/CLI. Sanity bound only; verifies the wgpu-hal/ash interop works. Tests
+    // `poot_runtime::Context` directly (card 546b: the `GpuExecutor` pass-throughs are gone with the rest
+    // of the pre-contract executor).
     let _gpu_guard = gpu_lock();
     let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, poot_runtime::Context::new()) else {
         return;
     };
-    let used = ctx
-        .vram_used_bytes()
-        .expect("VK_EXT_memory_budget query should return a value on the RADV Vulkan backend");
-    eprintln!(
-        "device VRAM used: {:.1} MiB",
-        used as f64 / (1024.0 * 1024.0)
-    );
-    assert!(
-        used > 1024 * 1024,
-        "device VRAM used implausibly low: {used} bytes"
-    );
-    assert!(
-        used < 256u64 * 1024 * 1024 * 1024,
-        "device VRAM used implausibly high: {used} bytes"
-    );
-    // cards 030/051: total VRAM budget (heap_budget). Must be >= used and a plausible device size.
     let total = ctx.vram_budget_bytes().expect(
         "VK_EXT_memory_budget heap_budget should return a value on the RADV Vulkan backend",
     );
@@ -181,7 +165,6 @@ fn vram_used_bytes_reports_a_plausible_value() {
         "device VRAM budget: {:.1} MiB",
         total as f64 / (1024.0 * 1024.0)
     );
-    assert!(total >= used, "VRAM budget {total} < used {used}");
     assert!(
         total > 256 * 1024 * 1024 && total < 256u64 * 1024 * 1024 * 1024,
         "device VRAM budget implausible: {total} bytes"

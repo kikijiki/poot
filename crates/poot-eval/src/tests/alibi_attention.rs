@@ -2,8 +2,8 @@
 //!
 //! Two levels: (1) the `attention_masked` op fed a hand-built per-head ALiBi bias matches an
 //! independently hand-rolled reference forward pass bit-for-bit (decomposition correctness); (2) the
-//! BLOOM family's `Model::trace` decode (ALiBi attention) produces the right graph structure (no RoPE, no
-//! `Slot::Mask`) and a finite output.
+//! BLOOM family's `Model::trace` decode (ALiBi attention) produces the right graph structure (no RoPE, the bias
+//! an in-graph computation) and a finite output.
 //!
 //! Card 557: tracers no longer emit the flash ops, so the tracer-level "flash-fused trace equals the
 //! decomposed trace" checks live with the pass that forms the op (`poot-graph-plan`'s
@@ -15,7 +15,7 @@ use poot_graph_ir::builder::{Builder, Traced};
 use poot_graph_ir::op::OpKind;
 use poot_graph_ir::ops::attention_masked;
 use poot_graph_ir::types::TensorType;
-use poot_graph_ir::{ComputedConst, Operand, Slot, Storage};
+use poot_graph_ir::{ComputedConst, Operand, Storage};
 use poot_models::model::{LogitRows, Model, Phase};
 use poot_models::registry::Registry;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
@@ -187,11 +187,11 @@ fn attention_masked_with_alibi_bias_matches_hand_rolled_reference() {
     );
 }
 
-/// The BLOOM family's decode (ALiBi attention, no RoPE): it declares no RoPE table and no `Slot::Mask` input (card 550:
+/// The BLOOM family's decode (ALiBi attention, no RoPE): it declares no RoPE table (card 550:
 /// the per-head bias is a graph computation, `alibi_mask_from_pos`, over `Slot::Pos` and the family's `AlibiSlopes`
 /// computed constant), and it evaluates to finite logits of the vocabulary's shape.
 #[test]
-fn bloom_alibi_decode_skips_rope_and_has_no_mask_slot() {
+fn bloom_alibi_decode_skips_rope() {
     let (model, cap) = (bloom_f32_model(), 8usize);
     let vocab = model.config().vocab;
     let g = trace_step(&*model, Phase::Decode, (1, 1, cap), None, LogitRows::Last);
@@ -208,14 +208,7 @@ fn bloom_alibi_decode_skips_rope_and_has_no_mask_slot() {
         }
     }
 
-    // Card 550: no Slot::Mask input at all; the widened per-head bias is a graph computation over
-    // Slot::Pos ([1,1]) and the slopes.
-    assert!(
-        !g.inputs
-            .iter()
-            .any(|id| matches!(g.values[*id].storage, Storage::Slot(Slot::Mask))),
-        "an ALiBi decode graph must declare no Slot::Mask input"
-    );
+    // The widened per-head bias is a graph computation over Slot::Pos ([1,1]) and the slopes.
     assert!(
         g.inputs.iter().any(|id| matches!(
             g.values[*id].storage,

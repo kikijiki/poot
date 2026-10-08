@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use poot_graph_ir::decompose::{Decomposition, decompose};
 use poot_graph_ir::{
-    ComputedConst, Eqn, Graph, OpClass, OpKind, Operand as IrOperand, TensorType,
+    ComputedConst, Eqn, Graph, OpClass, OpKind, Operand as IrOperand, ScanAttrs, TensorType,
     ValidationChannel, ValueId,
 };
 
@@ -286,7 +286,7 @@ fn check_state_storage<V: ValidationChannel>(
     let carrier_matches = match value {
         Value::Host(tensor) => tensor.dtype() == expected.dtype,
         Value::Owner(ExactValue::Bf16(_)) => expected.dtype == DType::BF16,
-        Value::Owner(_) | Value::Packed(_) => false,
+        Value::Owner(_) | Value::Packed(_) | Value::PackedStack(_) => false,
     };
     if !carrier_matches || value.shape().as_ref() != expected.shape.as_slice() {
         return Err(EvalError::Input {
@@ -327,7 +327,7 @@ fn check_published<V: ValidationChannel>(
         Value::Owner(ExactValue::Dense(_)) => {
             matches!(expected.dtype, DType::BF16 | DType::F32)
         }
-        Value::Packed(_) => false,
+        Value::Packed(_) | Value::PackedStack(_) => false,
     };
     debug_assert!(
         shape_ok && class_ok,
@@ -385,7 +385,7 @@ fn preflight_bindings<V: ValidationChannel>(
                 if view.dtype() == aval.dtype => {}
             (DType::BF16, Value::Owner(ExactValue::Bf16(_))) => {}
             (DType::I32, Value::Owner(ExactValue::I32(_))) => {}
-            (DType::I8, Value::Packed(_)) => {}
+            (DType::I8, Value::Packed(_) | Value::PackedStack(_)) => {}
             (_, other) => {
                 return Err(EvalError::Input {
                     value: id,
@@ -449,6 +449,33 @@ fn evaluate_equation<V: ValidationChannel>(
             opts.charge(eqn.out, idx, DType::F32, out * k, out * k * 4)?;
             Ok(Value::Host(ops::evaluate_packed_dequant(
                 owner, descriptor,
+            )?))
+        }
+        OpKind::PackedContraction {
+            descriptor,
+            rows: poot_graph_ir::ContractionRows::Indexed { experts },
+        } => {
+            let [x, ids] = [&eqn.inputs[0], &eqn.inputs[1]].map(|operand| match operand {
+                IrOperand::Value(id) => *id,
+                IrOperand::Lit(_) => unreachable!("infer admits value operands only"),
+            });
+            let (x, ids) = (
+                dense_tensor_or_materialize(x, env)?,
+                dense_tensor_or_materialize(ids, env)?,
+            );
+            let stack = ops::packed_stack_components(g, eqn, env, descriptor, experts)?;
+            let [out, k] = descriptor.shape();
+            let out_shape = g.aval(eqn.out).shape.clone();
+            let outputs: usize = out_shape.iter().product();
+            opts.charge(eqn.out, idx, DType::F32, outputs, outputs * 4)?;
+            Ok(Value::Host(ops::evaluate_packed_indexed(
+                &x,
+                &ids,
+                stack,
+                &out_shape,
+                eqn.out,
+                // One decoded `[out, K]` expert at a time: charged per expert actually read.
+                || opts.charge(eqn.out, idx, DType::F32, out * k, out * k * 4),
             )?))
         }
         OpKind::PackedRowGather { descriptor } => {
@@ -516,7 +543,7 @@ fn evaluate_composite<V: ValidationChannel>(
     opts: &mut EvalOptions<'_>,
     decompositions: &mut Decompositions,
 ) -> Result<Value, EvalError> {
-    let operand_types = eqn
+    let operand_types: Vec<TensorType> = eqn
         .inputs
         .iter()
         .map(|operand| match operand {
@@ -524,67 +551,149 @@ fn evaluate_composite<V: ValidationChannel>(
             IrOperand::Lit(scalar) => scalar.ty(),
         })
         .collect();
-    let decomposition =
-        decompositions
-            .get(&eqn.op, operand_types)
-            .ok_or_else(|| EvalError::Unsupported {
-                eqn: eqn.out,
-                op: resolve::op_label(&eqn.op),
-                detail: "the composite has no decomposition for its operand types".into(),
-            })?;
-    let inner = &decomposition.graph;
-    let mut inner_env: Vec<Option<Value>> = vec![None; inner.values.len()];
-    for (&placeholder, operand) in decomposition.operands.iter().zip(&eqn.inputs) {
-        inner_env[placeholder] = Some(match operand {
-            IrOperand::Value(id) => env_value(env, *id)?.clone(),
-            IrOperand::Lit(poot_graph_ir::Scalar::F32(v)) => Value::Host(HostTensor::scalar(*v)),
-            IrOperand::Lit(poot_graph_ir::Scalar::I32(v)) => {
-                Value::Host(HostTensor::i32(Vec::new(), vec![*v]))
-            }
-        });
-    }
-    let inner_producers = producers(inner);
+    let bound = eqn
+        .inputs
+        .iter()
+        .map(|operand| {
+            Ok(match operand {
+                IrOperand::Value(id) => env_value(env, *id)?.clone(),
+                IrOperand::Lit(poot_graph_ir::Scalar::F32(v)) => {
+                    Value::Host(HostTensor::scalar(*v))
+                }
+                IrOperand::Lit(poot_graph_ir::Scalar::I32(v)) => {
+                    Value::Host(HostTensor::i32(Vec::new(), vec![*v]))
+                }
+            })
+        })
+        .collect::<Result<Vec<_>, EvalError>>()?;
     let outermost = opts.composite.is_none();
     if outermost {
         opts.composite = Some(eqn.out);
     }
-    let result = (|| {
-        for inner_eqn in &inner.eqns {
-            let declared = inner.aval(inner_eqn.out);
-            // Every dense equation computes into a 4-byte-per-element F32 or I32 buffer before the
-            // declared-dtype store.
-            let elements = ops::element_count(&declared.shape)?;
-            opts.charge(
-                inner_eqn.out,
-                idx,
-                declared.dtype,
-                elements,
-                elements.saturating_mul(4),
-            )?;
-            opts.charged_by_composite = true;
-            let value = evaluate_equation(
-                inner,
-                inner_eqn,
-                &inner_env,
-                &inner_producers,
-                idx,
-                opts,
-                decompositions,
-            );
-            opts.charged_by_composite = false;
-            let value = value?;
-            let value = store_as_declared(value, declared.dtype)?;
-            check_published(inner, inner_eqn, &value)?;
-            inner_env[inner_eqn.out] = Some(value);
+    let result = match &eqn.op {
+        OpKind::Scan(attrs) => {
+            evaluate_scan(attrs, eqn, &operand_types, bound, idx, opts, decompositions)
         }
-        inner_env[inner.output]
-            .take()
-            .ok_or(EvalError::UseBeforeDef(inner.output))
-    })();
+        op => decompositions
+            .get(op, operand_types)
+            .ok_or_else(|| EvalError::Unsupported {
+                eqn: eqn.out,
+                op: resolve::op_label(op),
+                detail: "the composite has no decomposition for its operand types".into(),
+            })
+            .and_then(|decomposition| {
+                run_decomposition(&decomposition, bound, idx, opts, decompositions)
+            }),
+    };
     if outermost {
         opts.composite = None;
     }
     result.map_err(|error| attributed_to(eqn, error))
+}
+
+/// Evaluate `decomposition` over `bound`, the values of its operand placeholders in operand order: every
+/// primitive equation in order, each intermediate charged to the budget, the decomposition's output
+/// returned.
+fn run_decomposition(
+    decomposition: &Decomposition,
+    bound: Vec<Value>,
+    idx: usize,
+    opts: &mut EvalOptions<'_>,
+    decompositions: &mut Decompositions,
+) -> Result<Value, EvalError> {
+    let inner = &decomposition.graph;
+    let mut inner_env: Vec<Option<Value>> = vec![None; inner.values.len()];
+    for (&placeholder, value) in decomposition.operands.iter().zip(bound) {
+        inner_env[placeholder] = Some(value);
+    }
+    let inner_producers = producers(inner);
+    for inner_eqn in &inner.eqns {
+        let declared = inner.aval(inner_eqn.out);
+        // Every dense equation computes into a 4-byte-per-element F32 or I32 buffer before the
+        // declared-dtype store.
+        let elements = ops::element_count(&declared.shape)?;
+        opts.charge(
+            inner_eqn.out,
+            idx,
+            declared.dtype,
+            elements,
+            elements.saturating_mul(4),
+        )?;
+        opts.charged_by_composite = true;
+        let value = evaluate_equation(
+            inner,
+            inner_eqn,
+            &inner_env,
+            &inner_producers,
+            idx,
+            opts,
+            decompositions,
+        );
+        opts.charged_by_composite = false;
+        let value = value?;
+        let value = store_as_declared(value, declared.dtype)?;
+        check_published(inner, inner_eqn, &value)?;
+        inner_env[inner_eqn.out] = Some(value);
+    }
+    inner_env[inner.output]
+        .take()
+        .ok_or(EvalError::UseBeforeDef(inner.output))
+}
+
+/// Evaluate a `Scan` one chunk at a time with the state carried between chunks: each window of
+/// `attrs.chunk` positions (the last one shorter) is the same scan over that window, seeded with the
+/// previous window's `s_out`, through its own decomposition. The oracle holds one chunk body at a
+/// time, so it has no sequence-length ceiling and the working set does not grow with the sequence; the
+/// packed result is `y` windows followed by the final state, the layout the full scan declares.
+fn evaluate_scan(
+    attrs: &ScanAttrs,
+    eqn: &Eqn,
+    types: &[TensorType],
+    operands: Vec<Value>,
+    idx: usize,
+    opts: &mut EvalOptions<'_>,
+    decompositions: &mut Decompositions,
+) -> Result<Value, EvalError> {
+    let layout = attrs
+        .layout(types)
+        .map_err(|error| EvalError::Unsupported {
+            eqn: eqn.out,
+            op: "scan",
+            detail: error.to_string(),
+        })?;
+    let sequence = attrs.family.sequence_operands();
+    let state_at = attrs.family.operands() - 1;
+    let mut state = operands[state_at].clone();
+    let mut parts = Vec::with_capacity(layout.len.div_ceil(attrs.chunk) + 1);
+    for start in (0..layout.len).step_by(attrs.chunk) {
+        let end = (start + attrs.chunk).min(layout.len);
+        let mut window_types = types.to_vec();
+        let mut window = Vec::with_capacity(operands.len());
+        for (position, value) in operands.iter().enumerate() {
+            window.push(if sequence.contains(&position) {
+                window_types[position].shape[2] = end - start;
+                value.slice(2, start, end)?
+            } else if position == state_at {
+                state.clone()
+            } else {
+                value.clone()
+            });
+        }
+        let decomposition =
+            decompositions
+                .get(&eqn.op, window_types)
+                .ok_or_else(|| EvalError::Unsupported {
+                    eqn: eqn.out,
+                    op: "scan",
+                    detail: "the scan has no decomposition for its chunk window".into(),
+                })?;
+        let packed = run_decomposition(&decomposition, window, idx, opts, decompositions)?;
+        let len = end - start;
+        parts.push(packed.slice(2, 0, len)?);
+        state = packed.slice(2, len, len + layout.state_rows)?;
+    }
+    parts.push(state);
+    Value::concat(&parts.iter().collect::<Vec<_>>(), 2)
 }
 
 /// `error`, raised inside `composite`'s decomposition, with every equation or value id it carries
@@ -948,9 +1057,11 @@ fn evaluate_gather<V: ValidationChannel>(
             )?;
             Ok(Value::Host(HostTensor::f32_arc(out_shape, out)))
         }
-        Value::Packed(_) => Err(EvalError::Packed(crate::PackedEvalError::WrongConsumer {
-            operation: "Gather",
-        })),
+        Value::Packed(_) | Value::PackedStack(_) => {
+            Err(EvalError::Packed(crate::PackedEvalError::WrongConsumer {
+                operation: "Gather",
+            }))
+        }
     }
 }
 
@@ -1188,6 +1299,15 @@ fn evaluate_dense<V: ValidationChannel>(
             }
         }
     };
+    // The operand a site that only moves elements reads: an owner-backed BF16 view (what a reshape or
+    // transpose of a BF16 value is) materializes as its own two-byte words, never as the F32 values
+    // arithmetic reads, so a NaN payload reaches the output unchanged and the parts of a concat agree.
+    let stored = |operand: &IrOperand| match operand {
+        IrOperand::Value(id) if g.aval(*id).dtype != DType::I32 => {
+            stored_tensor_or_materialize(*id, env)
+        }
+        other => get(other),
+    };
     let result = match &eqn.op {
         OpKind::Unary(u) => {
             let x = get(&eqn.inputs[0])?;
@@ -1204,8 +1324,8 @@ fn evaluate_dense<V: ValidationChannel>(
         OpKind::Select => {
             let operands = [
                 get(&eqn.inputs[0])?,
-                get(&eqn.inputs[1])?,
-                get(&eqn.inputs[2])?,
+                stored(&eqn.inputs[1])?,
+                stored(&eqn.inputs[2])?,
             ];
             let condition = I32Operand {
                 shape: operands[0].shape(),
@@ -1275,14 +1395,20 @@ fn evaluate_dense<V: ValidationChannel>(
         OpKind::Reduce { op, axis, keepdim } => {
             ops::reduce::reduce(*op, &get(&eqn.inputs[0])?, *axis, *keepdim)?
         }
-        OpKind::Broadcast { shape } => ops::movement::broadcast_to(&get(&eqn.inputs[0])?, shape)?,
-        OpKind::Reshape { shape } => ops::movement::reshape(&get(&eqn.inputs[0])?, shape)?,
-        OpKind::Transpose { perm } => ops::movement::transpose(&get(&eqn.inputs[0])?, perm)?,
+        OpKind::Broadcast { shape } => {
+            ops::movement::broadcast_to(&stored(&eqn.inputs[0])?, shape)?
+        }
+        OpKind::Reshape { shape } => ops::movement::reshape(&stored(&eqn.inputs[0])?, shape)?,
+        OpKind::Transpose { perm } => ops::movement::transpose(&stored(&eqn.inputs[0])?, perm)?,
         OpKind::Slice { axis, start, end } => {
-            ops::movement::slice(&get(&eqn.inputs[0])?, *axis, *start, *end)?
+            ops::movement::slice(&stored(&eqn.inputs[0])?, *axis, *start, *end)?
         }
         OpKind::Concat { axis } => {
-            let parts = eqn.inputs.iter().map(get).collect::<Result<Vec<_>, _>>()?;
+            let parts = eqn
+                .inputs
+                .iter()
+                .map(stored)
+                .collect::<Result<Vec<_>, _>>()?;
             let refs: Vec<&HostTensor> = parts.iter().collect();
             ops::movement::concat(&refs, *axis)?
         }
@@ -1371,17 +1497,26 @@ fn evaluate_dense<V: ValidationChannel>(
         OpKind::Cast { .. }
         | OpKind::Gather { .. }
         | OpKind::PackedDequant { .. }
-        | OpKind::PackedRowGather { .. } => {
+        | OpKind::PackedRowGather { .. }
+        | OpKind::PackedContraction {
+            rows: poot_graph_ir::ContractionRows::Indexed { .. },
+            ..
+        } => {
             unreachable!("handled before evaluate_dense in evaluate_equation")
         }
-        OpKind::PackedContraction { .. }
+        OpKind::PackedContraction {
+            rows: poot_graph_ir::ContractionRows::Blocks(_),
+            ..
+        }
         | OpKind::DenseContraction { .. }
+        | OpKind::GroupedDenseContraction { .. }
         | OpKind::DenseRowGather { .. }
         | OpKind::ContractionEpilogue { .. }
         | OpKind::Fused(_)
         | OpKind::FusedRow(_)
         | OpKind::Attention(_)
-        | OpKind::Rope { .. } => {
+        | OpKind::Rope { .. }
+        | OpKind::Scan(_) => {
             unreachable!("a composite evaluates through its decomposition (evaluate_composite)")
         }
     };
@@ -1410,6 +1545,20 @@ fn dense_tensor_or_materialize(
             expected: poot_graph_ir::TensorType::new(Vec::new(), DType::F32),
             got: other.carrier_name(),
         }),
+    }
+}
+
+/// [`dense_tensor_or_materialize`] keeping the value's stored dtype and bits: an owner-backed BF16 view
+/// materializes as BF16 words.
+fn stored_tensor_or_materialize(
+    id: ValueId,
+    env: &[Option<Value>],
+) -> Result<HostTensor, EvalError> {
+    match env_value(env, id)? {
+        Value::Owner(exact @ (ExactValue::Dense(_) | ExactValue::Bf16(_))) => {
+            Ok(exact.materialize_stored())
+        }
+        _ => dense_tensor_or_materialize(id, env),
     }
 }
 

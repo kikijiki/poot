@@ -1,9 +1,7 @@
-//! The scheduling pieces of the batched serving loop: slots, admit/evict decisions, KV-fit budgeting,
-//! preemption and token commit. No engine loop runs on them at this commit, so nothing outside their
-//! own tests calls them; the one scheduling loop over the driver builds on them.
+//! The batched serving loop: one scheduling loop over the driver's `step` (`engine`), the slot a
+//! request occupies (`slot`), the token commit (`commit`) and the per-step prefill budget (`schedule`).
 
 pub(crate) mod commit;
-pub(crate) mod kv_budget;
-pub(crate) mod preempt;
+pub(crate) mod engine;
 pub(crate) mod schedule;
 pub(crate) mod slot;

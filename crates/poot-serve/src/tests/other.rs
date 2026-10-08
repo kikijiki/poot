@@ -50,31 +50,6 @@ fn error_body_is_openai_shaped() {
 }
 
 #[test]
-fn embedding_value_float_and_base64() {
-    let emb = [1.0f32, -2.5, 0.0, 3.25];
-    // float -> a JSON number array.
-    assert_eq!(
-        embedding_value(&emb, false),
-        serde_json::json!([1.0, -2.5, 0.0, 3.25])
-    );
-    // base64 -> a string that decodes back to the little-endian f32 bytes (openai-python's path).
-    let v = embedding_value(&emb, true);
-    let s = v.as_str().expect("base64 embedding is a string");
-    use base64::Engine;
-    let bytes = base64::engine::general_purpose::STANDARD.decode(s).unwrap();
-    let back: Vec<f32> = bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
-    assert_eq!(
-        back, emb,
-        "base64 must round-trip to the original f32 vector"
-    );
-}
-
-#[test]
 fn chat_max_completion_tokens_supersedes_max_tokens() {
     let eff = |body: &str| {
         serde_json::from_str::<ChatReq>(body)
@@ -149,11 +124,11 @@ fn completions_effective_max_tokens_is_clamped() {
 /// engine behind it; the test plays the engine, reads the queued `Job`, and answers `Done`. The tiny
 /// dense fixture is only the tokenizer/encode surface the handlers need before they submit.
 #[test]
-#[ignore = "constructs a Runner and no family loads on it (POOT-740); POOT-739 retypes serve onto ModelHandle and re-enables this row"]
 fn completions_handlers_submit_bounded_max_new() {
     use crate::handlers::handle_completion;
-    let runner = Runner::load_gguf(write_tiny_runner_gguf().to_str().expect("temp path utf-8"))
-        .expect("tiny dense gguf loads");
+    let model_path = write_tiny_gguf();
+    let runner = load_handle(&model_path);
+    let _ = std::fs::remove_file(&model_path);
     let cases = [
         (usize::MAX.to_string(), MAX_NEW_TOKENS_CAP),
         ("999999999999".to_string(), MAX_NEW_TOKENS_CAP),
@@ -175,7 +150,7 @@ fn completions_handlers_submit_bounded_max_new() {
                     if streaming {
                         stream_completion(&mut server, Some(&tx), &runner, &metrics, &req).map(drop)
                     } else {
-                        handle_completion(Some(&tx), &runner, &metrics, &req).map(drop)
+                        handle_completion(Some(&tx), &runner, &metrics, &req, &|| false).map(drop)
                     }
                 });
                 let job = engine_rx
@@ -203,139 +178,6 @@ fn completions_handlers_submit_bounded_max_new() {
 }
 
 #[test]
-fn mrope_identical_tokens_with_distinct_axes_never_query_register_or_reuse_prefix() {
-    let tokens = preempt_toks(10, 20);
-    let (first_positions, second_positions) = distinct_mrope_layouts();
-    let mut paged = PagedKvCache::new(2, 6);
-    let cache_metrics = CacheMetrics::default();
-    let mut first = preempt_test_slot(tokens.clone(), 16, 0, 2);
-    first.mrope = Some(MropeDecodeState::new(first_positions, 20, 16).unwrap());
-    let mut slots = vec![None, None];
-    let (admitted, victims) = reserve_without_prefix_with_preemption(&mut slots, &mut paged, 0, 22);
-    admitted.unwrap();
-    assert!(victims.is_empty());
-    slots[0] = Some(first);
-    let parked = preempt_slot(&mut slots, &mut paged, 0);
-
-    // Preemption did not register the first request. A diagnostic token-only lookup therefore sees no
-    // reusable prefix even though the second request has identical tokens and distinct rotary axes.
-    assert_eq!(
-        paged
-            .admit_prefix_for(1, &tokens, 2, PrefixIdentity::BASE)
-            .unwrap(),
-        0
-    );
-    paged.reset(1);
-
-    // The real mRoPE resume path uses fresh append, not admit_prefix, and rewinds both cursors to zero.
-    let resumed = match resume_preempted(&mut paged, 0, parked) {
-        Ok(slot) => slot,
-        Err(_) => panic!("mRoPE resume should reserve a fresh slot"),
-    };
-    assert_eq!(resumed.pos, 0);
-    assert_eq!(resumed.mrope.as_ref().unwrap().token_index(), 0);
-
-    // Completion also resets without registering. A later request with the same tokens and other axes
-    // still cannot reuse the first request's KV.
-    release_slot_kv(&mut paged, 0, &resumed);
-    assert_eq!(
-        paged
-            .admit_prefix_for(1, &tokens, 2, PrefixIdentity::BASE)
-            .unwrap(),
-        0
-    );
-    paged.reset(1);
-    let second = MropeDecodeState::new(second_positions, 20, 0).unwrap();
-    assert_eq!(second.token_index(), 0);
-
-    // FR-036: successful mRoPE admission records neither a query nor a hit because it never called the
-    // token-only cache. The helper is the admission closure's sole metric update point.
-    record_non_mrope_prefix_cache_admission(&cache_metrics, tokens.len(), 0, true);
-    assert_eq!(cache_metrics.prefix_query_tokens.load(Ordering::Relaxed), 0);
-    assert_eq!(cache_metrics.prefix_hit_tokens.load(Ordering::Relaxed), 0);
-
-    // Ordinary requests retain the established token-only cache behavior.
-    let ordinary = preempt_test_slot(tokens.clone(), 16, 0, 2);
-    paged.append(0, 22).unwrap();
-    slots[0] = Some(ordinary);
-    let _parked = preempt_slot(&mut slots, &mut paged, 0);
-    assert_eq!(
-        paged
-            .admit_prefix_for(1, &tokens, 2, PrefixIdentity::BASE)
-            .unwrap(),
-        BLOCK_SIZE
-    );
-    record_non_mrope_prefix_cache_admission(&cache_metrics, tokens.len(), BLOCK_SIZE, false);
-    assert_eq!(
-        cache_metrics.prefix_query_tokens.load(Ordering::Relaxed),
-        tokens.len() as u64
-    );
-    assert_eq!(
-        cache_metrics.prefix_hit_tokens.load(Ordering::Relaxed),
-        BLOCK_SIZE as u64
-    );
-}
-
-#[test]
-fn mrope_rows_hold_resume_and_slot_reuse_without_state_leak() {
-    let tokens = preempt_toks(30, 20);
-    let (first_positions, replacement_positions) = distinct_mrope_layouts();
-    let mut first = preempt_test_slot(tokens.clone(), 7, 0, 4);
-    first.mrope = Some(MropeDecodeState::new(first_positions.clone(), 20, 7).unwrap());
-    let mut held = preempt_test_slot(tokens.clone(), 3, 0, 4);
-    held.mrope = Some(MropeDecodeState::new(first_positions, 20, 3).unwrap());
-    let mut slots = vec![Some(first), Some(held), None];
-
-    let before = build_mrope_rows(&slots, true).unwrap().unwrap();
-    let active_pos = slots[0].as_ref().unwrap().pos;
-    let held_pos = slots[1].as_ref().unwrap().pos;
-    advance_slot_position(slots[0].as_mut().unwrap()).unwrap();
-    let after = build_mrope_rows(&slots, true).unwrap().unwrap();
-    assert_eq!(slots[0].as_ref().unwrap().pos, active_pos + 1);
-    assert_eq!(
-        slots[0]
-            .as_ref()
-            .unwrap()
-            .mrope
-            .as_ref()
-            .unwrap()
-            .token_index(),
-        active_pos + 1
-    );
-    assert_ne!(after[0], before[0]);
-    assert_eq!(slots[1].as_ref().unwrap().pos, held_pos);
-    assert_eq!(
-        slots[1]
-            .as_ref()
-            .unwrap()
-            .mrope
-            .as_ref()
-            .unwrap()
-            .token_index(),
-        held_pos
-    );
-    assert_eq!(after[1], before[1], "held row keeps its rotary cursor");
-    assert_eq!(after[2], MropePosition::collapsed(0));
-
-    let mut paged = PagedKvCache::new(3, 8);
-    paged.append(0, 24).unwrap();
-    let parked = preempt_slot(&mut slots, &mut paged, 0);
-    let resumed = match resume_preempted(&mut paged, 0, parked) {
-        Ok(slot) => slot,
-        Err(_) => panic!("mRoPE resume should reserve a fresh slot"),
-    };
-    assert_eq!(resumed.pos, 0);
-    assert_eq!(resumed.mrope.as_ref().unwrap().token_index(), 0);
-
-    // Reusing physical row 1 replaces the old request-owned source rather than retaining held state.
-    let replacement = MropeDecodeState::new(replacement_positions.clone(), 20, 0).unwrap();
-    slots[1].as_mut().unwrap().pos = 0;
-    slots[1].as_mut().unwrap().mrope = Some(replacement);
-    let rows = build_mrope_rows(&slots, true).unwrap().unwrap();
-    assert_eq!(rows[1], replacement_positions.position(0).unwrap());
-}
-
-#[test]
 fn cache_metric_ratios_handle_the_empty_case() {
     // before any paged pool exists / any request arrives, the ratios are a well-defined 0 (no div-by-0).
     let m = Metrics {
@@ -346,7 +188,6 @@ fn cache_metric_ratios_handle_the_empty_case() {
         requests_completed: AtomicU64::new(0),
         requests_cancelled: AtomicU64::new(0),
         requests_errored: AtomicU64::new(0),
-        requests_preempted: AtomicU64::new(0),
         inflight: AtomicU64::new(0),
         ttft: Histogram::new(),
         itl: Histogram::new(),
@@ -354,8 +195,7 @@ fn cache_metric_ratios_handle_the_empty_case() {
         queue_wait: Histogram::new(),
         batch_size: AtomicU64::new(0),
         slot_capacity: 1,
-        on_gpu: false,
-        profile: false,
+        backend: "spirv-vulkan".to_string(),
         model: "test-model".into(),
         sys: Mutex::new(sysinfo::System::new()),
         cache: CacheMetrics::default(),
@@ -377,19 +217,6 @@ fn cache_metric_ratios_handle_the_empty_case() {
     assert_eq!(m.gpu_active_ratio(), 0.75);
     m.cache.decode_gpu_ns.store(1200, Ordering::Relaxed);
     assert_eq!(m.gpu_active_ratio(), 1.0);
-}
-
-#[test]
-fn encoder_pooling_override_resolves() {
-    // card 091: the /v1/embeddings `pooling` override - "mean"/"cls" (case-insensitive) pick that mode;
-    // absent or unrecognized falls back to the model's configured 1_Pooling default.
-    use super::EncoderPooling::{Cls, Mean};
-    assert_eq!(encoder_pooling_override(Some("cls"), Mean), Cls);
-    assert_eq!(encoder_pooling_override(Some("CLS"), Mean), Cls);
-    assert_eq!(encoder_pooling_override(Some("mean"), Cls), Mean);
-    assert_eq!(encoder_pooling_override(None, Cls), Cls); // model default (CLS model)
-    assert_eq!(encoder_pooling_override(None, Mean), Mean); // model default (mean model)
-    assert_eq!(encoder_pooling_override(Some("bogus"), Mean), Mean); // unrecognized -> default
 }
 
 #[test]
@@ -532,11 +359,11 @@ fn guided_decode_error_classifies_400_other_errors_stay_500() {
     assert_eq!(ty, "server_error");
 }
 
-fn tiny_text_only_runner() -> Arc<Runner> {
-    let model_path = write_tiny_runner_gguf();
-    let runner = Runner::load_gguf(&model_path).expect("tiny dense gguf loads");
+fn tiny_text_only_runner() -> Arc<ModelHandle> {
+    let model_path = write_tiny_gguf();
+    let handle = load_handle(&model_path);
     let _ = std::fs::remove_file(&model_path);
-    Arc::new(runner)
+    handle
 }
 
 fn chat_req_with_part(part: &str) -> ChatReq {
@@ -549,9 +376,8 @@ fn chat_req_with_part(part: &str) -> ChatReq {
 /// Card 573: a request part whose modality the loaded model has no front end for is refused with a typed
 /// error naming the modality, before any job reaches the engine. Without the check the part is dropped and
 /// the model answers a different request than the one sent. The decision is the model's capability
-/// (`Runner::accepts_modality`), so the same tiny text decoder refuses each of these.
+/// (`ModelHandle::accepts_modality`), so the same tiny text decoder refuses each of these.
 #[test]
-#[ignore = "constructs a Runner and no family loads on it (POOT-740); POOT-739 retypes serve onto ModelHandle and re-enables this row"]
 fn text_only_model_refuses_an_image_audio_video_or_unknown_part_with_a_typed_error() {
     let runner = tiny_text_only_runner();
     assert!(runner.accepts_modality(poot_llm::Modality::Text));
@@ -572,7 +398,7 @@ fn text_only_model_refuses_an_image_audio_video_or_unknown_part_with_a_typed_err
         // No engine listens: a request that got past the refusal fails at the send instead of hanging.
         let (job_tx, job_rx) = mpsc::channel::<Job>();
         drop(job_rx);
-        let error = handle_chat(Some(&job_tx), &runner, &metrics, &req)
+        let error = handle_chat(Some(&job_tx), &runner, &metrics, &req, &|| false)
             .expect_err("a part the model cannot take must be refused, not ignored");
         let refusal = error
             .downcast_ref::<UnsupportedCapabilityError>()
@@ -591,7 +417,6 @@ fn text_only_model_refuses_an_image_audio_video_or_unknown_part_with_a_typed_err
 }
 
 #[test]
-#[ignore = "constructs a Runner and no family loads on it (POOT-740); POOT-739 retypes serve onto ModelHandle and re-enables this row"]
 fn text_only_model_still_takes_a_text_only_part_array() {
     let runner = tiny_text_only_runner();
     let req: ChatReq = serde_json::from_str(
@@ -603,7 +428,6 @@ fn text_only_model_still_takes_a_text_only_part_array() {
 
 /// The streaming route refuses before it sends the 200 headers.
 #[test]
-#[ignore = "constructs a Runner and no family loads on it (POOT-740); POOT-739 retypes serve onto ModelHandle and re-enables this row"]
 fn streaming_chat_refuses_an_unsupported_part_before_the_200_headers() {
     let runner = tiny_text_only_runner();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");

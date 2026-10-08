@@ -33,7 +33,7 @@ const OPS: Op[] = [
     inputs: "cond, if_true, if_false",
     outputShape: "[...] (same)",
     notes:
-      "cond is I32, nonzero picks if_true; branches share one dtype. A bitwise select, so a NaN or Inf in the unselected branch never reaches the output. The IR and the oracle accept I32, F32, F16 and BF16; the device lowering is I32 and F32 only (F16/BF16 are a typed DtypeLowering refusal)",
+      "cond is I32, nonzero picks if_true; branches share one dtype. A native hardware select that moves the chosen element bit for bit, so a NaN or Inf in the unselected branch never reaches the output. I32, F32, F16 and BF16 branches; ROCm and PTX lower all four, while SPIR-V (wgpu, Vulkan) refuses F16 and BF16 with a typed DtypeLowering",
   },
   {
     name: "Cast(to)",
@@ -159,6 +159,14 @@ const OPS: Op[] = [
     outputShape: "f32",
     notes:
       "Compiler-only; contract a weight in checkpoint [N, K] order (bf16, f32, or f16 stored as two-byte words packed in u32) and gather rows of a bf16 table, with no transpose or widened copy",
+  },
+  {
+    name: "GroupedDenseContraction",
+    category: "compute",
+    inputs: "activation [G, M, K] f32, bf16 weight [G*N, K]",
+    outputShape: "[G, M, N] f32",
+    notes:
+      "Compiler-only; contract a checkpoint [G*N, K] weight read as G blocks of N rows against a [G, M, K] activation, so a grouped projection keeps its bf16 weight resident with no transpose or widened copy",
   },
   {
     name: "PackI8 / UnpackI8",

@@ -10,8 +10,11 @@ use poot_kernel_ir::{
 use poot_quant::format::{Storage, WeightFormat};
 
 use super::decode_plan::DecodePlan;
+use super::indexed::ExpertRows;
 use super::planar::PlanarPlan;
+use super::source::Source;
 use crate::KernelGenError;
+use crate::PackedRows;
 use crate::contraction::{Epilogue, GemvEpilogue, GemvLaunch, Schedule, TileSize, gemv_body};
 use crate::emit::{Emit, bin, copy, cu, emit_read_meta};
 use crate::helpers::{Alloc, elem, guard, ld, local, slice_dtype, slice_f32};
@@ -25,8 +28,6 @@ pub struct PackedKernelSpec {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PackedKernelOp {
-    /// `out[o, k] = decode(o, k)`: a standalone `PackedDequant`. The tier-1 device receipt.
-    Materialize,
     /// `out[r, :] = decode(ids[r], :)`: `Gather(axis 0)` over `PackedDequant`.
     RowGather,
 }
@@ -37,20 +38,22 @@ const META_K: usize = 0;
 
 pub fn packed_kernel(name: &str, spec: PackedKernelSpec) -> Result<Body, KernelGenError> {
     match spec.op {
-        PackedKernelOp::Materialize => materialize(name, spec.format),
         PackedKernelOp::RowGather => row_gather(name, spec.format),
     }
 }
 
 /// The packed operand load of a [`crate::ContractionSpec`]: `format`'s descriptor-driven decode served to
 /// `schedule`'s loop nest, with `epilogue` applied to each column's sum before its store. The Gemv carries an
-/// epilogue (its leaves ride between the weight sources and the metadata); the tiled schedule has none yet,
-/// so an epilogue on it is a typed refusal.
+/// epilogue (its leaves ride between the weight sources and the metadata); the block-diagonal tiled schedule has
+/// none yet, so an epilogue on it is a typed refusal. `rows` says how output rows meet weight rows: an
+/// [`PackedRows::Indexed`] table is a Gemv (decode) or the segmented Tiled schedule (prefill), both with an
+/// epilogue.
 pub(crate) fn packed_contraction(
     name: &str,
     format: WeightFormat,
     schedule: Schedule,
     epilogue: Option<&Epilogue>,
+    rows: PackedRows,
 ) -> Result<Body, KernelGenError> {
     if let Some(epilogue) = epilogue {
         epilogue.require_f32("packed_contraction")?;
@@ -65,7 +68,11 @@ pub(crate) fn packed_contraction(
             format,
             GemvLaunch::new(width, cols, unroll)?,
             epilogue,
+            rows,
         ),
+        Schedule::Tiled { tile } if rows == PackedRows::Indexed => {
+            super::indexed::indexed_tiled(name, format, tile, epilogue)
+        }
         Schedule::Tiled { .. } if epilogue.is_some() => Err(KernelGenError::Unsupported {
             request: "packed_contraction",
             reason: "a packed Tiled contraction has no epilogue",
@@ -76,10 +83,10 @@ pub(crate) fn packed_contraction(
 
 /// `block = row*(k/values) + k_index/values`, `i_in_block = k_index % values`: the block-32 address
 /// of logical `(row, k_index)` for a weight whose row holds `k` (total) logical values in blocks of
-/// `values` (`DecodePlan::values`). Shared by every op ([`materialize`], [`row_gather`],
+/// `values` (`DecodePlan::values`). Shared by every op ([`row_gather`],
 /// [`contraction_gemv`], `contraction_tiled`) so the row-major block layout has one KIR
 /// implementation, matching [`poot_quant::PackedWeight::source_shape`]'s host-side accounting.
-fn emit_block_address(
+pub(super) fn emit_block_address(
     e: &mut Emit,
     values: usize,
     row: Local,
@@ -94,150 +101,17 @@ fn emit_block_address(
     (block, i_in_block)
 }
 
-/// `out[o, k] = decode(o, k)` for every element of a `[out_rows, K]` weight: one thread per output
-/// element, params `(words, metadata, out)`. `metadata[META_K]` is `K`; `out.len()` gives the launch
-/// extent and (with `K`) `out_rows`, so nothing about the shape is baked into the body.
-fn materialize(name: &str, format: WeightFormat) -> Result<Body, KernelGenError> {
-    let descriptor = format.descriptor();
-    if let Storage::Planar(_) = descriptor.storage {
-        return materialize_planar(name, format);
-    }
-    let plan = DecodePlan::of(&descriptor)?;
-    let values = plan.values();
-
-    let mut al = Alloc::new(vec![
-        ld(Ty::Unit, false),
-        ld(slice_dtype(Ty::U32, false), false),
-        ld(slice_dtype(Ty::U32, false), false),
-        ld(slice_f32(true), true),
-    ]);
-    let (words, metadata, out) = (local(1), local(2), local(3));
-    let i = al.add(Ty::Usize, false);
-    let len = al.add(Ty::Usize, false);
-    let cmp = al.add(Ty::Bool, false);
-
-    let bb0 = BasicBlock {
-        statements: vec![],
-        terminator: Terminator::ThreadIndexCall {
-            destination: Place::local(i),
-            dim: IndexAxis::X,
-            target: BlockId { index: 1 },
-        },
-    };
-    let bb1 = BasicBlock {
-        statements: vec![
-            Statement::Assign(Place::local(len), Rvalue::Len(Place::local(out))),
-            Statement::Assign(
-                Place::local(cmp),
-                Rvalue::BinaryOp(BinOp::Lt, copy(i), copy(len)),
-            ),
-        ],
-        terminator: guard(cmp, 3, 2),
-    };
-
-    let mut emit = Emit::new(&mut al);
-    let k = emit_read_meta(&mut emit, metadata, META_K);
-    let row = emit.let_(Ty::Usize, Rvalue::BinaryOp(BinOp::Div, copy(i), copy(k)));
-    let kk = emit.let_(Ty::Usize, Rvalue::BinaryOp(BinOp::Rem, copy(i), copy(k)));
-    let (block, i_in_block) = emit_block_address(&mut emit, values, row, kk, k);
-
-    let factors = plan.emit_factors(&mut emit, words, block, i_in_block);
-    let value = plan.emit_value(&mut emit, words, block, i_in_block, &factors);
-    emit.assign(elem(out, i), Rvalue::Use(copy(value)));
-
-    let bb2 = BasicBlock {
-        statements: emit.take(),
-        terminator: Terminator::Return,
-    };
-    let bb3 = BasicBlock {
-        statements: vec![],
-        terminator: Terminator::Return,
-    };
-    Ok(Body::new(name, 3, al.locals, vec![bb0, bb1, bb2, bb3]))
-}
-
-/// [`materialize`]'s planar front end (card 542c, dquant.md 3.3): the same `out[o, k] = decode(o,
-/// k)` shape, but `words` becomes one `&[u32]` parameter per `PlanarPlan::source_count()` (in
-/// `PackedWeight::sources()` order), and the address comes from `PlanarPlan::emit_factors`/
-/// `emit_value` directly off `(o, k)` rather than a block/in-block-index pair. `out_total` (a
-/// planar operand's `out`-axis stored extent needs it; a block format never does) is `len(out) /
-/// K`, since `out`'s shape is `[out_total, K]` flattened, the same fact `contraction_tiled`
-/// already derives from its own output buffer's length.
-fn materialize_planar(name: &str, format: WeightFormat) -> Result<Body, KernelGenError> {
-    let descriptor = format.descriptor();
-    let plan = PlanarPlan::of(&descriptor)?;
-    let n = plan.source_count();
-
-    let mut params = vec![ld(Ty::Unit, false)];
-    for _ in 0..n {
-        params.push(ld(slice_dtype(Ty::U32, false), false));
-    }
-    params.push(ld(slice_dtype(Ty::U32, false), false));
-    params.push(ld(slice_f32(true), true));
-    let mut al = Alloc::new(params);
-    let sources: Vec<Local> = (0..n as u32).map(|idx| local(1 + idx)).collect();
-    let metadata = local(1 + n as u32);
-    let out = local(2 + n as u32);
-    let i = al.add(Ty::Usize, false);
-    let len = al.add(Ty::Usize, false);
-    let cmp = al.add(Ty::Bool, false);
-
-    let bb0 = BasicBlock {
-        statements: vec![],
-        terminator: Terminator::ThreadIndexCall {
-            destination: Place::local(i),
-            dim: IndexAxis::X,
-            target: BlockId { index: 1 },
-        },
-    };
-    let bb1 = BasicBlock {
-        statements: vec![
-            Statement::Assign(Place::local(len), Rvalue::Len(Place::local(out))),
-            Statement::Assign(
-                Place::local(cmp),
-                Rvalue::BinaryOp(BinOp::Lt, copy(i), copy(len)),
-            ),
-        ],
-        terminator: guard(cmp, 3, 2),
-    };
-
-    let mut emit = Emit::new(&mut al);
-    let k = emit_read_meta(&mut emit, metadata, META_K);
-    let row = emit.let_(Ty::Usize, Rvalue::BinaryOp(BinOp::Div, copy(i), copy(k)));
-    let kk = emit.let_(Ty::Usize, Rvalue::BinaryOp(BinOp::Rem, copy(i), copy(k)));
-    let out_total = bin(&mut emit, Ty::Usize, BinOp::Div, copy(len), copy(k));
-
-    let factors = plan.emit_factors(&mut emit, &sources, row, kk, k, out_total);
-    let value = plan.emit_value(&mut emit, &sources, row, kk, k, out_total, &factors);
-    emit.assign(elem(out, i), Rvalue::Use(copy(value)));
-
-    let bb2 = BasicBlock {
-        statements: emit.take(),
-        terminator: Terminator::Return,
-    };
-    let bb3 = BasicBlock {
-        statements: vec![],
-        terminator: Terminator::Return,
-    };
-    Ok(Body::new(
-        name,
-        2 + n as u32,
-        al.locals,
-        vec![bb0, bb1, bb2, bb3],
-    ))
-}
-
 /// `out[r, :] = decode(ids[r], :)` for a `[R, K]` output, `ids` an `R`-length row index (`f32`, the
 /// executors' index-param convention: token ids are bound as f32 and cast in-kernel):
 /// [`PackedKernelOp::RowGather`], the axis-0 `Gather` fused directly onto a `PackedDequant` producer
 /// (GGUF token embeddings). Params `(words, ids, metadata, out)`, one thread per output
-/// element; identical to [`materialize`] except the row comes from `ids[r]` instead of the flat index.
+/// element; the row comes from `ids[r]`.
 fn row_gather(name: &str, format: WeightFormat) -> Result<Body, KernelGenError> {
     let descriptor = format.descriptor();
     if let Storage::Planar(_) = descriptor.storage {
         return Err(KernelGenError::UnsupportedDescriptor {
             format,
-            reason: "planar RowGather (542c's table admits planar Materialize/Contraction only; \
+            reason: "planar RowGather (only Contraction is admitted for planar storage; \
                      no production consumer gathers planar-format rows today)",
         });
     }
@@ -289,8 +163,8 @@ fn row_gather(name: &str, format: WeightFormat) -> Result<Body, KernelGenError> 
     );
     let (block, i_in_block) = emit_block_address(&mut emit, values, row, kk, k);
 
-    let factors = plan.emit_factors(&mut emit, words, block, i_in_block);
-    let value = plan.emit_value(&mut emit, words, block, i_in_block, &factors);
+    let factors = plan.emit_factors(&mut emit, Source::plain(words), block, i_in_block);
+    let value = plan.emit_value(&mut emit, Source::plain(words), block, i_in_block, &factors);
     emit.assign(elem(out, i), Rvalue::Use(copy(value)));
 
     let bb2 = BasicBlock {
@@ -312,15 +186,20 @@ fn row_gather(name: &str, format: WeightFormat) -> Result<Body, KernelGenError> 
 /// own operand order (card 542a production wiring, D9). `metadata` is `[K, out_per_block]`;
 /// `activation` is `[blocks, K]` (one row per block, `M == 1`). With an `epilogue` its leaves are
 /// parameters between `words` and `metadata`, and it runs over each column's sum before the store.
+///
+/// [`PackedRows::Indexed`] is the same loop over a stacked table: params `(activation, ids, words, ..)`,
+/// flat column `m * N + n` (`N = out_per_block`) reads weight row `n` of the slab of expert `ids[m]`
+/// ([`ExpertRows`]), and `metadata` is `[K, N, E, slab_words]`.
 fn contraction_gemv(
     name: &str,
     format: WeightFormat,
     launch: GemvLaunch,
     epilogue: Option<&Epilogue>,
+    rows: PackedRows,
 ) -> Result<Body, KernelGenError> {
     let descriptor = format.descriptor();
     if let Storage::Planar(_) = descriptor.storage {
-        return contraction_gemv_planar(name, format, launch, epilogue);
+        return contraction_gemv_planar(name, format, launch, epilogue, rows);
     }
     let plan = DecodePlan::of(&descriptor)?;
     let values = plan.values();
@@ -329,33 +208,55 @@ fn contraction_gemv(
         Some(epilogue) => epilogue.lanes("packed_contraction")?,
         None => Vec::new(),
     };
-    let mut params = vec![
-        ld(Ty::Unit, false),
-        ld(slice_f32(false), false),
-        ld(slice_dtype(Ty::U32, false), false),
-    ];
+    let lead = rows.leading_params();
+    let mut params = vec![ld(Ty::Unit, false), ld(slice_f32(false), false)];
+    if rows == PackedRows::Indexed {
+        params.push(ld(slice_f32(false), false));
+    }
+    params.push(ld(slice_dtype(Ty::U32, false), false));
     if let Some(epilogue) = epilogue {
         params.extend(lanes.iter().map(|&lane| epilogue.leaf_param(lane)));
     }
     params.push(ld(slice_dtype(Ty::U32, false), false));
     params.push(ld(slice_f32(true), true));
     let al = Alloc::new(params);
-    let (activation, words) = (local(1), local(2));
-    let leaves: Vec<Local> = (0..leaf_count).map(|j| local(3 + j as u32)).collect();
-    let (metadata, out) = (local(3 + leaf_count as u32), local(4 + leaf_count as u32));
+    let activation = local(1);
+    let words = local(lead);
+    let leaves: Vec<Local> = (0..leaf_count)
+        .map(|j| local(lead + 1 + j as u32))
+        .collect();
+    let (metadata, out) = (
+        local(lead + 1 + leaf_count as u32),
+        local(lead + 2 + leaf_count as u32),
+    );
+    let selection = (rows == PackedRows::Indexed).then(|| ExpertRows {
+        ids: local(2),
+        metadata,
+    });
     // A run of `count` elements starting at a multiple of `count` stays inside one block when
     // `count` divides the block, so the block is addressed once; when `count` also divides the
     // factor run, the run's factors are decoded once and shared by all its elements. Otherwise each
     // element addresses its own block and decodes its own factors.
     let factor_run = plan.factor_run();
     let decode_run = |e: &mut Emit, row: Local, k0: Local, count: usize, k: Local, _: Local| {
+        let (row, src, poison) = match selection {
+            Some(selection) => {
+                let selected = selection.select(e, row, 1);
+                (
+                    selected.weight_row,
+                    selected.source(0, words),
+                    Some(selected.poison),
+                )
+            }
+            None => (row, Source::plain(words), None),
+        };
         let run_block = values
             .is_multiple_of(count)
             .then(|| emit_block_address(e, values, row, k0, k));
         let run_factors = run_block
             .filter(|_| factor_run.is_multiple_of(count))
-            .map(|(block, first)| plan.emit_factors(e, words, block, first));
-        (0..count)
+            .map(|(block, first)| plan.emit_factors(e, src, block, first));
+        let decoded: Vec<Local> = (0..count)
             .map(|j| {
                 let (block, i_in_block) = match run_block {
                     Some((block, first)) => {
@@ -370,18 +271,19 @@ fn contraction_gemv(
                 let factors = match &run_factors {
                     Some(factors) => factors,
                     None => {
-                        own_factors = plan.emit_factors(e, words, block, i_in_block);
+                        own_factors = plan.emit_factors(e, src, block, i_in_block);
                         &own_factors
                     }
                 };
-                plan.emit_value(e, words, block, i_in_block, factors)
+                plan.emit_value(e, src, block, i_in_block, factors)
             })
-            .collect()
+            .collect();
+        poisoned(e, decoded, poison)
     };
     Ok(gemv_body(
         name,
         al,
-        4 + leaf_count as u32,
+        lead + 2 + leaf_count as u32,
         [activation, metadata, out],
         launch,
         epilogue.map(|epilogue| GemvEpilogue {
@@ -393,15 +295,27 @@ fn contraction_gemv(
     ))
 }
 
+/// `values` with `poison` (`0.0` or NaN, [`ExpertRows`]) added to the first, so an invalid expert id makes the
+/// whole column NaN; `values` unchanged for a contraction with no row selection.
+fn poisoned(e: &mut Emit, mut values: Vec<Local>, poison: Option<Local>) -> Vec<Local> {
+    if let (Some(poison), Some(first)) = (poison, values.first_mut()) {
+        *first = bin(e, Ty::F32, BinOp::Add, copy(*first), copy(poison));
+    }
+    values
+}
+
 /// [`contraction_gemv`]'s planar front end (card 542c): the same schedule, `words` becomes
 /// `PlanarPlan::source_count()` parameters, the per-element decode reads `PlanarPlan` off
 /// `(weight_row, k)`. `out_total` is `len(out)` (`M == 1` gives `rows == blocks`, so `out`'s
-/// `[blocks, out_per_block]` flattens to exactly the weight's true row count).
+/// `[blocks, out_per_block]` flattens to exactly the weight's true row count); an indexed table's `out`
+/// is `[M, N]`, so its decode reads `N` from the metadata instead, and each source is read relative to the
+/// selected expert's slab.
 fn contraction_gemv_planar(
     name: &str,
     format: WeightFormat,
     launch: GemvLaunch,
     epilogue: Option<&Epilogue>,
+    rows: PackedRows,
 ) -> Result<Body, KernelGenError> {
     let descriptor = format.descriptor();
     let plan = PlanarPlan::of(&descriptor)?;
@@ -411,7 +325,11 @@ fn contraction_gemv_planar(
         Some(epilogue) => epilogue.lanes("packed_contraction")?,
         None => Vec::new(),
     };
+    let lead = rows.leading_params();
     let mut params = vec![ld(Ty::Unit, false), ld(slice_f32(false), false)];
+    if rows == PackedRows::Indexed {
+        params.push(ld(slice_f32(false), false));
+    }
     for _ in 0..n {
         params.push(ld(slice_dtype(Ty::U32, false), false));
     }
@@ -422,26 +340,53 @@ fn contraction_gemv_planar(
     params.push(ld(slice_f32(true), true));
     let al = Alloc::new(params);
     let activation = local(1);
-    let sources: Vec<Local> = (0..n as u32).map(|idx| local(2 + idx)).collect();
+    let words: Vec<Local> = (0..n as u32).map(|idx| local(lead + idx)).collect();
     let leaves: Vec<Local> = (0..leaf_count)
-        .map(|j| local(2 + n as u32 + j as u32))
+        .map(|j| local(lead + (n + j) as u32))
         .collect();
-    let metadata = local(2 + (n + leaf_count) as u32);
-    let out = local(3 + (n + leaf_count) as u32);
+    let metadata = local(lead + (n + leaf_count) as u32);
+    let out = local(lead + 1 + (n + leaf_count) as u32);
+    let selection = (rows == PackedRows::Indexed).then(|| ExpertRows {
+        ids: local(2),
+        metadata,
+    });
     let decode_run =
         |e: &mut Emit, row: Local, k0: Local, count: usize, k: Local, out_total: Local| {
-            (0..count)
+            let (row, out_total, sources, poison) = match selection {
+                Some(selection) => {
+                    let selected = selection.select(e, row, n);
+                    let sources: Vec<Source> = words
+                        .iter()
+                        .enumerate()
+                        .map(|(index, &words)| selected.source(index, words))
+                        .collect();
+                    (
+                        selected.weight_row,
+                        selected.out_rows,
+                        sources,
+                        Some(selected.poison),
+                    )
+                }
+                None => (
+                    row,
+                    out_total,
+                    words.iter().copied().map(Source::plain).collect(),
+                    None,
+                ),
+            };
+            let decoded: Vec<Local> = (0..count)
                 .map(|j| {
                     let k_index = bin(e, Ty::Usize, BinOp::Add, copy(k0), cu(j));
                     let factors = plan.emit_factors(e, &sources, row, k_index, k, out_total);
                     plan.emit_value(e, &sources, row, k_index, k, out_total, &factors)
                 })
-                .collect()
+                .collect();
+            poisoned(e, decoded, poison)
         };
     Ok(gemv_body(
         name,
         al,
-        3 + (n + leaf_count) as u32,
+        lead + 1 + (n + leaf_count) as u32,
         [activation, metadata, out],
         launch,
         epilogue.map(|epilogue| GemvEpilogue {
@@ -844,8 +789,8 @@ fn contraction_tiled(
 
     let b_k_clamped = bin(&mut load, Ty::Usize, BinOp::Min, copy(b_k), copy(k_minus_1));
     let (block, i_in_block) = emit_block_address(&mut load, values, weight_row, b_k_clamped, k);
-    let factors = plan.emit_factors(&mut load, words, block, i_in_block);
-    let value = plan.emit_value(&mut load, words, block, i_in_block, &factors);
+    let factors = plan.emit_factors(&mut load, Source::plain(words), block, i_in_block);
+    let value = plan.emit_value(&mut load, Source::plain(words), block, i_in_block, &factors);
     let b_masked1 = bin(&mut load, Ty::F32, BinOp::Mul, copy(value), copy(col_mask));
     let b_val = bin(
         &mut load,
@@ -1022,7 +967,9 @@ fn contraction_tiled_planar(
     params.push(ld(slice_f32(true), true));
     let mut al = Alloc::new(params);
     let activation = local(1);
-    let sources: Vec<Local> = (0..n as u32).map(|idx| local(2 + idx)).collect();
+    let sources: Vec<Source> = (0..n as u32)
+        .map(|idx| Source::plain(local(2 + idx)))
+        .collect();
     let metadata = local(2 + n as u32);
     let out = local(3 + n as u32);
     let gx = al.add(Ty::Usize, false);

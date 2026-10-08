@@ -1,10 +1,9 @@
-//! poot LLM runner: load a checkpoint and generate on the CPU eager executor and the wgpu, ROCm and
-//! PTX device executors.
+//! poot LLM runner: load a checkpoint and generate on the wgpu, ROCm and PTX device executors.
 //!
-//! A registered family loads as a [`driver::ModelHandle`] and generates through [`driver::Driver`]. The
-//! families not yet registered (MLA and hybrid) load as a `Runner`, which owns their weights
-//! and tracer selection and runs their generate loops; the CPU eager path is the oracle that validates
-//! the graph IR, decompositions and executors.
+//! A checkpoint loads as a [`driver::ModelHandle`] (its family from the registry, its weights as
+//! stored, its text services) and generates through [`driver::Driver`], which also runs `Encode`
+//! steps (encoder embeddings and reranking, a vision tower) and prompts with embedding rows in place
+//! of tokens' own. A multimodal checkpoint's front end ([`front_end`]) drives the towers' drivers.
 //!
 //! # The graph passes are sealed behind `compile` (Card 626, SC-001)
 //!
@@ -20,20 +19,29 @@
 //! let g = poot_graph_ir::Graph::default();
 //! poot_graph_ir::transform::cse(&g);
 //! ```
+//!
+//! # There is no `Runner`
+//!
+//! The per-family `Runner` that owned weights and tracer selection is gone: every family is a
+//! registered `Model` on the driver.
+//!
+//! ```compile_fail,E0432
+//! use poot_llm::Runner;
+//! ```
 
-/// `RunnerError::Msg(format!(...))`. Same argument shape as `anyhow::anyhow!(...)`. Defined at the
-/// crate root so it is textually in scope for the child modules (encoder, paged, vlm) declared below.
+/// `TextError::Msg(format!(...))`. Same argument shape as `anyhow::anyhow!(...)`. Defined at the
+/// crate root so it is textually in scope for the child modules declared below.
 macro_rules! err {
-    ($($arg:tt)*) => { $crate::RunnerError::Msg(format!($($arg)*)) };
+    ($($arg:tt)*) => { $crate::TextError::Msg(format!($($arg)*)) };
 }
 
-/// `return Err(RunnerError::Msg(format!(...)))`. Same argument shape as `bail!(...)`.
+/// `return Err(TextError::Msg(format!(...)))`. Same argument shape as `bail!(...)`.
 macro_rules! bail {
-    ($($arg:tt)*) => { return Err($crate::RunnerError::Msg(format!($($arg)*))) };
+    ($($arg:tt)*) => { return Err($crate::TextError::Msg(format!($($arg)*))) };
 }
 
 mod error;
-pub use error::{OptionExt, Result, ResultExt, RunnerError};
+pub use error::{OptionExt, Result, TextError};
 
 /// Shared control result for every single-sequence text-piece callback.
 ///
@@ -42,22 +50,16 @@ pub use error::{OptionExt, Result, ResultExt, RunnerError};
 /// tokens produced so far rather than an error.
 pub type GenerationControl = std::ops::ControlFlow<()>;
 
-mod architectures;
-mod backends;
-mod checkpoint;
 mod core;
 pub mod driver;
 mod multimodal;
 mod text;
 
-pub use multimodal::{encoder, vlm};
+pub use multimodal::{encoders, front_end};
 pub use text::grammar;
 
-pub use checkpoint::lora::LoraAdapterLease;
 pub use core::modality::Modality;
-pub use core::runner::Runner;
 pub use core::sampler::{Sampler, SamplerFault, TokenLogprob};
-pub use multimodal::mrope::{MropeBindError, MropeDecodeState, bind_mrope_prefill_positions};
 pub use multimodal::qwen_vl_chat::{
     QWEN2_5_VL_MAX_REMOTE_IMAGE_BYTES, Qwen25VlChatContent, Qwen25VlChatFileUrlError,
     Qwen25VlChatImageDataUrlError, Qwen25VlChatImageFileError, Qwen25VlChatMessage,
@@ -80,17 +82,13 @@ pub use multimodal::qwen_vl_image::{
 };
 pub use multimodal::qwen_vl_mrope::{
     Qwen25VlMropeModelInput, Qwen25VlMropeModelInputError, Qwen25VlMropeModelInputView,
-    Qwen25VlPrefillKvEmbedsBindError, Qwen25VlProcessorMedia, Qwen25VlProcessorMediaError,
-    Qwen25VlProcessorMediaKind, Qwen25VlProcessorMediaMropeModelInput,
-    Qwen25VlProcessorMediaMropeModelInputError, Qwen25VlProcessorMediaMropeModelInputRequest,
-    Qwen25VlRenderedPromptMropeModelInput, Qwen25VlRenderedPromptMropeModelInputError,
-    Qwen25VlRenderedPromptMropeModelInputRequest, Qwen25VlTextTowerConfigError,
-    Qwen25VlVisualEmbedsPrefillBindError, Qwen25VlVisualSpliceMapError, QwenVlMropeMetadata,
-    QwenVlMropeMetadataLoadError, QwenVlMropeSourceMetadata, load_qwen_vl_mrope_source_metadata,
+    Qwen25VlProcessorMedia, Qwen25VlProcessorMediaError, Qwen25VlProcessorMediaKind,
+    Qwen25VlProcessorMediaMropeModelInput, Qwen25VlProcessorMediaMropeModelInputError,
+    Qwen25VlProcessorMediaMropeModelInputRequest, Qwen25VlRenderedPromptMropeModelInput,
+    Qwen25VlRenderedPromptMropeModelInputError, Qwen25VlRenderedPromptMropeModelInputRequest,
+    Qwen25VlVisualSpliceMapError, QwenVlMropeMetadata, QwenVlMropeMetadataLoadError,
+    QwenVlMropeSourceMetadata, load_qwen_vl_mrope_source_metadata,
 };
-/// Re-exported so `poot-serve` can resolve an adapter name to a pool index via
-/// `LoraAdapterPool::index_of`.
-pub use poot_load::lora::LoraAdapterPool;
 pub use poot_load::qwen_vl::QwenVlModelType;
 pub use poot_models::mrope::{
     MropeConfigMetadata, MropeConfigMetadataError, MropeGrid, MropePosition,
@@ -105,12 +103,6 @@ pub use poot_models::mrope::{
     assemble_qwen2_5_vl_video_timings, assemble_qwen2_5_vl_video_timings_with_default,
     build_mrope_position_ids, discover_mrope_segments, reconcile_mrope_special_token_ids,
 };
-/// Re-exported so `poot-serve`'s `BatchDecodable` can name the type without depending on `poot-models`.
-pub use poot_models::qwen2::LoraBatchedSpec;
 pub use text::chat::{RenderedChat, derive_jinja_stops, render_jinja_value};
 pub use text::guided::{Constraint, JsonAcceptor, json_schema_to_regex, tool_call_regex};
 pub use text::tokenize::{ChatTemplate, TextCodec};
-
-#[cfg(test)]
-#[path = "tests/validation_mapping.rs"]
-mod validation_mapping_tests;

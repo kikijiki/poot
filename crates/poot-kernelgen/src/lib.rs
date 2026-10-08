@@ -20,6 +20,7 @@ mod matmul;
 mod packed;
 mod reduce;
 mod request;
+mod scan;
 mod synchronization;
 mod tiled_region;
 mod wmma;
@@ -34,9 +35,10 @@ pub use error::{BodyResource, BodyStage, KernelGenError};
 pub use request::{
     BodyUse, CastSpec, ContractionSpec, ElementwiseSpec, Fold, FragmentUse, Generated, I32Binary,
     IndexedContraction, KernelRequest, KernelRequirements, Launch, MatmulShapes, PackedContraction,
-    PackedRequest, PointwiseForm, PointwiseSpec, RopeSpec, RowSpec, SerialWork, TopKSpec, UnaryOp,
-    UnmeasurableLds, ValueBinary, ViewOperand, fold_groups, generate,
+    PackedRequest, PackedRows, PointwiseForm, PointwiseSpec, RopeSpec, RowSpec, SerialWork,
+    TopKSpec, UnaryOp, UnmeasurableLds, ValueBinary, ViewOperand, fold_groups, generate,
 };
+pub use scan::{ScanKernel, ScanPhase, ScanSpec};
 
 // The types a request carries (the planner builds them), and `view_eff_strides`, the planner's strided-view
 // legality predicate shares with the generators.

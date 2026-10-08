@@ -25,7 +25,7 @@ pub use exact_bf16::ExactBf16Error;
 use std::borrow::Cow;
 
 use poot_graph_ir::PackedSourceName;
-use poot_quant::PackedComponentRef;
+use poot_quant::{PackedComponentRef, PackedStackComponentRef};
 
 pub(crate) use geometry::{broadcast_flat, gather_source_flat, strides, unravel};
 

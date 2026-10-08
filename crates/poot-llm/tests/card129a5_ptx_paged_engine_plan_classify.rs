@@ -66,11 +66,7 @@ fn card129a5_ptx_paged_engine_plan_classify_qwen2_n_slots_2() {
     let backend = Backend::Nvptx;
     // The pre-`compile` passes, so the equations classified are the fused ones `compile` plans: the
     // BF16 checkpoint's mixed-dtype matmuls are widened as `compile` widens them.
-    let g = widen_mismatched_matmul_dtypes(
-        &optimize(&g),
-        backend,
-        &poot_test_util::device_caps::default_caps_for(backend),
-    );
+    let g = widen_mismatched_matmul_dtypes(&optimize(&g), backend);
     let mut tally: BTreeMap<&'static str, usize> = BTreeMap::new();
     for eqn in &g.eqns {
         let plan = plan_eqn(

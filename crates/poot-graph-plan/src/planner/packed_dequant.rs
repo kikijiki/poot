@@ -1,22 +1,24 @@
-//! Card 542a: planning for `PackedDequant`/`PackedContraction` when the descriptor-driven table
+//! Card 542a: planning for `PackedRowGather`/`PackedContraction` when the descriptor-driven table
 //! (`packed_block_float::PACKED_LOWERING`) admits the descriptor's format - the block-32 GGUF schemes
 //! today (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL, MXFP4). A format the table does not admit for this op
 //! is not planned here, so `try_plan` below returns `Ok(None)` for it and the caller falls back to
 //! today's unconditional refusal.
 //!
-//! `OpKind::PackedDequant`/`PackedContraction` carry their carrier operands in
+//! `OpKind::PackedRowGather`/`PackedContraction` carry their carrier operands in
 //! `descriptor.sources()`'s role order (`op.rs`'s shape inference proves this at graph-build time), so
 //! the ordinary metadata-launch consumer (`value_ids(eqn)` bound to kernel params 1..=n, in every
 //! executor's typed-value walk and its own `run()`) already binds every source in role order: D9's
 //! "role-ordered source binding" is this convention, not new per-executor code. The one place role
 //! order has to be threaded by hand is the generated kernel's own declared parameter order
-//! (`poot_kernelgen::packed_kernel`), which must match `eqn.inputs`'s order exactly - `PackedDequant`
-//! declares `(words, metadata, out)` (its one `Blocks` source), `PackedContraction` declares
-//! `(activation, words, metadata, out)` (activation is `eqn.inputs[0]`, the carrier is
-//! `eqn.inputs[1]`).
+//! (`poot_kernelgen::packed_kernel`), which must match `eqn.inputs`'s order exactly - `PackedRowGather`
+//! declares `(words, ids, metadata, out)`, `PackedContraction` declares `(activation, words, metadata,
+//! out)` (activation is `eqn.inputs[0]`, the carrier is `eqn.inputs[1]`). A standalone `PackedDequant`
+//! has no kernel: nothing materializes a packed weight.
 
+use super::matmul::{FoldedTileGrid, folded_tile_grid};
 use super::*;
-use poot_kernelgen::{PackedContraction, PackedKernelOp, Schedule};
+use poot_graph_ir::ContractionRows;
+use poot_kernelgen::{PackedContraction, PackedKernelOp, PackedRows, Schedule};
 use poot_target::{Backend, DeviceCaps};
 
 /// `Ok(None)` when card 542a's table does not admit this equation's descriptor for this op: the
@@ -35,7 +37,10 @@ pub(super) fn try_plan(
     packed_operands: &[bool],
 ) -> Result<Option<Planned>, PlanError> {
     match &eqn.op {
-        OpKind::PackedDequant { descriptor } => try_plan_materialize(
+        // No standalone dequantize kernel exists: a `PackedDequant` that no contraction or row gather claims is
+        // refused by `compile`'s escape gate, and one that reaches planning is the same by-name refusal.
+        OpKind::PackedDequant { .. } => Ok(None),
+        OpKind::PackedContraction { descriptor, rows } => try_plan_contraction(
             g,
             eqn,
             out_shape,
@@ -45,25 +50,14 @@ pub(super) fn try_plan(
             caps,
             limits,
             *descriptor,
-        ),
-        OpKind::PackedContraction { descriptor, blocks } => try_plan_contraction(
-            g,
-            eqn,
-            out_shape,
-            out_numel,
-            backend,
-            odt,
-            caps,
-            limits,
-            *descriptor,
-            *blocks,
+            *rows,
             None,
             packed_operands,
         ),
         // A packed contraction followed by its pointwise epilogue (`fuse_contraction_epilogues`): the same
         // Gemv as above with the epilogue applied to each column's sum before its store.
         OpKind::ContractionEpilogue {
-            head: ContractionHead::Packed { descriptor, blocks },
+            head: ContractionHead::Packed { descriptor, rows },
             region,
         } => try_plan_contraction(
             g,
@@ -75,7 +69,7 @@ pub(super) fn try_plan(
             caps,
             limits,
             *descriptor,
-            *blocks,
+            *rows,
             Some(region),
             packed_operands,
         ),
@@ -92,57 +86,6 @@ pub(super) fn try_plan(
         ),
         _ => unreachable!("try_plan is called only for imported_ops!()"),
     }
-}
-
-/// `out[o, k] = decode(o, k)`: the standalone `PackedDequant` equation. Params `(words, metadata,
-/// out)` - `descriptor.sources()` is `PackedDequant`'s whole operand list (`eqn.inputs`), so there is
-/// nothing else to bind in front of the metadata word.
-#[allow(clippy::too_many_arguments)]
-fn try_plan_materialize(
-    g: GraphTables<'_>,
-    eqn: &Eqn,
-    out_shape: &[usize],
-    out_numel: usize,
-    backend: Backend,
-    odt: DType,
-    caps: &DeviceCaps,
-    limits: BodyLimits,
-    descriptor: poot_quant::PackedWeight,
-) -> Result<Option<Planned>, PlanError> {
-    let site = Site::new(g, eqn, backend, limits);
-    let op = PackedKernelOp::Materialize;
-    let spec = match crate::packed_block_float::select_packed_kernel(
-        crate::packed_block_float::PACKED_LOWERING,
-        descriptor,
-        op,
-        backend,
-    ) {
-        Ok(spec) => spec,
-        Err(_) => return Ok(None),
-    };
-    let k = descriptor.shape()[1];
-    let mut planned = Planned::generated(
-        site,
-        KernelRequest::Packed(PackedRequest {
-            name: "packed_materialize",
-            spec,
-            grid: [out_numel as u32, 1, 1],
-            meta: vec![k as u32],
-        }),
-        backend,
-        caps,
-    )?;
-    finalize(
-        &mut planned,
-        g,
-        eqn,
-        out_shape,
-        out_numel,
-        backend,
-        odt,
-        caps,
-    )?;
-    Ok(Some(planned))
 }
 
 /// `out[.., :] = decode(ids[..], :)`: the `PackedRowGather` equation (quantized token
@@ -234,55 +177,43 @@ fn try_plan_contraction(
     caps: &DeviceCaps,
     limits: BodyLimits,
     descriptor: poot_quant::PackedWeight,
-    blocks: usize,
+    rows: ContractionRows,
     epilogue: Option<&FusedRegion>,
     packed_operands: &[bool],
 ) -> Result<Option<Planned>, PlanError> {
     let site = Site::new(g, eqn, backend, limits);
     let k = descriptor.shape()[1];
     let out = descriptor.shape()[0];
-    let out_per_block = out / blocks;
-    let m_per_block = packed_contraction_m_per_block(g, eqn, descriptor, blocks);
-    let rows = blocks * m_per_block;
-    let (schedule, meta, grid) = if m_per_block == 1 {
-        let schedule = gemv_schedule(rows * out_per_block, caps.compute_units);
-        let grid = [
-            schedule.grid_threads(blocks, m_per_block, out_per_block) as u32,
-            1,
-            1,
-        ];
-        (schedule, vec![k as u32, out_per_block as u32], grid)
-    } else {
-        let tile = poot_kernelgen::TileSize::new(GEMM_TILE as u32)
-            .map_err(|error| site.refuse(Capability::KernelGen(error)))?;
-        let schedule = Schedule::Tiled { tile };
-        let ts = tile.get() as usize;
-        let tiles = blocks
-            .checked_mul(m_per_block.div_ceil(ts))
-            .and_then(|v| v.checked_mul(out_per_block.div_ceil(ts)))
-            .ok_or_else(|| site.refuse(Capability::DispatchSizeOverflow))?;
-        let tiles_u32 =
-            u32::try_from(tiles).map_err(|_| site.refuse(Capability::DispatchSizeOverflow))?;
-        let limit_x = caps.max_grid[0].max(1);
-        let (x_groups, y_groups) = if tiles_u32 <= limit_x {
-            (tiles_u32, 1u32)
-        } else {
-            let y_groups = tiles_u32.div_ceil(limit_x);
-            if y_groups > caps.max_grid[1] {
-                return Err(site.refuse(Capability::DispatchGridLimit {
-                    threads: tiles,
-                    workgroups_x: tiles,
-                    workgroup_width: ts * ts,
-                    limit: limit_x as usize,
-                }));
+    let (schedule, meta, grid) = match rows {
+        ContractionRows::Blocks(blocks) => {
+            let out_per_block = out / blocks;
+            let m_per_block = packed_contraction_m_per_block(g, eqn, descriptor, blocks);
+            let rows = blocks * m_per_block;
+            if m_per_block == 1 {
+                let schedule = gemv_schedule(rows * out_per_block, caps.compute_units);
+                let grid = [
+                    schedule.grid_threads(blocks, m_per_block, out_per_block) as u32,
+                    1,
+                    1,
+                ];
+                (schedule, vec![k as u32, out_per_block as u32], grid)
+            } else {
+                let tile = poot_kernelgen::TileSize::new(GEMM_TILE as u32)
+                    .map_err(|error| site.refuse(Capability::KernelGen(error)))?;
+                let schedule = Schedule::Tiled { tile };
+                let ts = tile.get() as usize;
+                let tiles = blocks
+                    .checked_mul(m_per_block.div_ceil(ts))
+                    .and_then(|v| v.checked_mul(out_per_block.div_ceil(ts)))
+                    .ok_or_else(|| site.refuse(Capability::DispatchSizeOverflow))?;
+                let FoldedTileGrid { x_groups, grid } = folded_tile_grid(site, tiles, ts, caps)?;
+                let meta = vec![k as u32, out_per_block as u32, m_per_block as u32, x_groups];
+                (schedule, meta, grid)
             }
-            (limit_x, y_groups)
-        };
-        let threads_x = x_groups
-            .checked_mul((ts * ts) as u32)
-            .ok_or_else(|| site.refuse(Capability::DispatchSizeOverflow))?;
-        let meta = vec![k as u32, out_per_block as u32, m_per_block as u32, x_groups];
-        (schedule, meta, [threads_x, y_groups, 1])
+        }
+        ContractionRows::Indexed { experts } => {
+            plan_indexed(site, g, eqn, descriptor, experts, caps)?
+        }
     };
     let Ok(format) = crate::packed_block_float::admit_packed(
         crate::packed_block_float::PACKED_LOWERING,
@@ -299,7 +230,7 @@ fn try_plan_contraction(
             site,
             g,
             eqn,
-            ContractionHead::Packed { descriptor, blocks }.operands(),
+            ContractionHead::Packed { descriptor, rows }.operands(),
             region,
             out_shape,
             odt,
@@ -311,6 +242,10 @@ fn try_plan_contraction(
         site,
         KernelRequest::Contraction(ContractionSpec::Packed(PackedContraction {
             format,
+            rows: match rows {
+                ContractionRows::Blocks(_) => PackedRows::Blocks,
+                ContractionRows::Indexed { .. } => PackedRows::Indexed,
+            },
             schedule,
             epilogue,
             grid,
@@ -353,6 +288,98 @@ fn gemv_schedule(outputs: usize, compute_units: u32) -> Schedule {
         cols: cols as u32,
         unroll: 8,
     }
+}
+
+/// The launch of an indexed packed contraction, chosen from shapes and the device alone, as the dense indexed
+/// contraction's is ([`indexed_gemv_in`]): the packed Gemv over `M * N` flat output columns at decode row counts
+/// (flat column `m * N + n` reads weight row `n` of expert `ids[m]`), else the segmented Tiled schedule, whose
+/// tiles share each expert's decoded weight tile across the rows that selected it and whose grid is folded onto
+/// `GroupY` above the device's X extent and refused with a typed error beyond that too. Metadata: `[K, N, E, M,
+/// x_groups]`, then each source's per-expert slab stride in words ([`poot_quant::PackedWeight::slab_words`]).
+///
+/// The decode/prefill threshold ([`INDEXED_GEMV_MAX_ROWS`]) is shared with the dense indexed contraction and is
+/// UNTUNED for packed weights. Measured on wgpu (gfx1151, `[rows, 2048, 256]`, a noisy box, ms per step, Tiled vs
+/// Gemv): Q8_0 0.74 vs 1.31 at 64 rows, 3.07 vs 3.92 at 1024; Q4_K 0.92 vs 0.96 at 64, 5.73 vs 4.35 at 1024 (Tiled
+/// slower). ROCm and PTX are unmeasured.
+fn plan_indexed(
+    site: Site<'_>,
+    g: GraphTables<'_>,
+    eqn: &Eqn,
+    descriptor: poot_quant::PackedWeight,
+    experts: usize,
+    caps: &DeviceCaps,
+) -> Result<(Schedule, Vec<u32>, [u32; 3]), PlanError> {
+    let ids = value_ids(eqn);
+    if g.aval(ids[1]).dtype != DType::F32 {
+        return Err(site.refuse(Capability::IndexOperand));
+    }
+    let [out, k] = descriptor.shape();
+    let m = g.aval(ids[0]).shape[0];
+    let overflow = || site.refuse(Capability::DispatchSizeOverflow);
+    // The kernel addresses a source by 32-bit bit offsets (`expert * slab_words * 32` plus the in-slab bit): a
+    // source of more than 2^32 bits (512 MiB) cannot be addressed, so it is refused, never wrapped. `legalize`
+    // splits a larger stack into expert ranges that each pass this; what reaches here over the bound is a single
+    // expert's slab beyond it.
+    if experts > descriptor.max_stack_experts() {
+        return Err(overflow());
+    }
+    let (schedule, x_groups, grid) = match packed_indexed_gemv(m, out, caps) {
+        Some(schedule) => {
+            let threads =
+                u32::try_from(schedule.grid_threads(1, m, out)).map_err(|_| overflow())?;
+            (schedule, 0, [threads, 1, 1])
+        }
+        None => {
+            let tile = poot_kernelgen::TileSize::new(GEMM_TILE as u32)
+                .map_err(|error| site.refuse(Capability::KernelGen(error)))?;
+            let ts = tile.get() as usize;
+            let tiles = m
+                .div_ceil(ts)
+                .checked_mul(out.div_ceil(ts))
+                .ok_or_else(overflow)?;
+            let FoldedTileGrid { x_groups, grid } = folded_tile_grid(site, tiles, ts, caps)?;
+            (Schedule::Tiled { tile }, x_groups, grid)
+        }
+    };
+    let meta = [k, out, experts, m]
+        .into_iter()
+        .map(|extent| u32::try_from(extent).map_err(|_| overflow()))
+        .chain([Ok(x_groups)])
+        .chain(
+            descriptor
+                .sources()
+                .into_iter()
+                .map(|role| u32::try_from(descriptor.slab_words(role)).map_err(|_| overflow())),
+        )
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((schedule, meta, grid))
+}
+
+/// The packed Gemv of an indexed contraction of `m` rows and `n` columns, or `None` when it is not a decode shape
+/// ([`INDEXED_GEMV_MAX_ROWS`]) or its launch would not fit the device's X grid even at one lane per column:
+/// [`gemv_schedule`]'s table, widening `cols` (columns per workgroup) until the workgroup count fits.
+fn packed_indexed_gemv(m: usize, n: usize, caps: &DeviceCaps) -> Option<Schedule> {
+    if m == 0 || n == 0 || m > INDEXED_GEMV_MAX_ROWS {
+        return None;
+    }
+    let outputs = m.checked_mul(n)?;
+    let Schedule::Gemv {
+        width,
+        cols,
+        unroll,
+    } = gemv_schedule(outputs, caps.compute_units)
+    else {
+        unreachable!("gemv_schedule returns a Gemv")
+    };
+    let limit = caps.max_grid[0].max(1) as usize;
+    std::iter::successors(Some(cols), |&cols| cols.checked_mul(2))
+        .take_while(|&cols| cols <= width)
+        .find(|&cols| outputs.div_ceil(cols as usize) <= limit)
+        .map(|cols| Schedule::Gemv {
+            width,
+            cols,
+            unroll,
+        })
 }
 
 #[cfg(test)]
@@ -398,13 +425,11 @@ mod tests {
                 backend: Backend::SpirvVulkan,
                 caps: DeviceCaps {
                     compute_units,
+                    memory_budget_bytes: None,
                     ..DeviceCaps::wgpu_rdna3_igpu()
                 },
             };
-            let options = CompileOptions {
-                execution: Submission::Replay,
-                limits: crate::CompileLimits::STANDARD,
-            };
+            let options = CompileOptions::new(Submission::Replay, crate::CompileLimits::STANDARD);
             let program = compile(&builder.finish(out), &target, &options)
                 .unwrap_or_else(|error| panic!("{what}: {error}"));
             let (eqn, plan) = program
@@ -474,10 +499,7 @@ mod tests {
             backend: Backend::SpirvVulkan,
             caps: DeviceCaps::wgpu_rdna3_igpu(),
         };
-        let options = CompileOptions {
-            execution: Submission::Replay,
-            limits: crate::CompileLimits::STANDARD,
-        };
+        let options = CompileOptions::new(Submission::Replay, crate::CompileLimits::STANDARD);
         let program = compile(&builder.finish(out_value), &target, &options).unwrap();
         let (eqn, plan) = program
             .planned()
@@ -676,10 +698,7 @@ mod tests {
             backend: Backend::SpirvVulkan,
             caps: tiny_grid_caps(),
         };
-        let options = CompileOptions {
-            execution: Submission::Replay,
-            limits: crate::CompileLimits::STANDARD,
-        };
+        let options = CompileOptions::new(Submission::Replay, crate::CompileLimits::STANDARD);
         let Err(error) = compile(&graph, &target, &options) else {
             panic!("the over-cap contraction must not compile");
         };
@@ -707,6 +726,116 @@ mod tests {
                 "expected the typed planner refusal behind the reverted claim, got {other:?}"
             ),
         }
+    }
+
+    /// The graph and equation index of one claimed indexed packed contraction: `rows` rows of an `experts`-expert
+    /// stacked Q8_0 table of `out` outputs over `k` inputs.
+    fn indexed_eqn(
+        rows: usize,
+        experts: usize,
+        out: usize,
+        k: usize,
+    ) -> (poot_graph_ir::Graph, usize) {
+        let descriptor = PackedWeight::try_new(WeightFormat::Q8_0, [out, k]).unwrap();
+        let table = poot_graph_ir::ops::PackedExpertStack {
+            stack_id: "experts".to_string(),
+            descriptor,
+            experts,
+        };
+        let builder = Builder::new();
+        let x = builder.slot_named(Slot::Activation, "x", TensorType::f32(vec![rows, k]));
+        let ids = builder.slot_named(Slot::Activation, "ids", TensorType::f32(vec![rows]));
+        let y = poot_graph_ir::ops::packed_indexed_linear(&builder, x, ids, &table).unwrap();
+        let graph = builder.finish(y);
+        let index = graph
+            .eqns
+            .iter()
+            .position(|eqn| matches!(eqn.op, OpKind::PackedContraction { .. }))
+            .expect("the builder emits the claimed contraction");
+        (graph, index)
+    }
+
+    fn plan_indexed(
+        graph: &poot_graph_ir::Graph,
+        index: usize,
+        caps: &DeviceCaps,
+    ) -> Result<crate::Plan, PlanError> {
+        crate::plan_eqn_analyzed(
+            &crate::ExactI32StorageAnalysis::new(graph),
+            graph,
+            &graph.eqns[index],
+            Backend::SpirvVulkan,
+            caps,
+            &poot_test_util::graph_fixtures::roomy_body_limits(),
+        )
+    }
+
+    /// A decode-sized indexed packed contraction (`M <= INDEXED_GEMV_MAX_ROWS`) is the Gemv. Its metadata is `[K,
+    /// N, E, M, x_groups, slab_words..]` (the planner's stride is the descriptor's word-padded slab), and a row
+    /// count whose workgroups exceed the device's X extent widens `cols` (columns per workgroup) until the grid
+    /// fits, rather than folding or refusing. Mutation: leave `cols` at the occupancy choice (`find(|_| true)`);
+    /// the grid exceeds the fixture limit of 4 and this row goes red.
+    #[test]
+    fn an_indexed_contraction_widens_its_gemv_columns_to_fit_the_grid() {
+        let (graph, index) = indexed_eqn(5, 4, 8, 64);
+        let plan = plan_indexed(&graph, index, &tiny_grid_caps()).unwrap();
+        let Some(Dispatch {
+            launch: Launch { grid, meta },
+            ..
+        }) = plan.single()
+        else {
+            panic!("expected a single dispatch, got {plan:?}");
+        };
+        let descriptor = PackedWeight::try_new(WeightFormat::Q8_0, [8, 64]).unwrap();
+        let slab = descriptor.slab_words(poot_quant::SourceRole::Blocks) as u32;
+        assert_eq!(
+            meta.as_slice(),
+            [64, 8, 4, 5, 0, slab],
+            "[K, N, E, M, x_groups, slab_words]"
+        );
+        let workgroups = grid[0] / 256;
+        assert!(
+            (1..=4).contains(&workgroups) && grid[1] == 1,
+            "40 outputs fit the 4-workgroup X extent: {grid:?}"
+        );
+    }
+
+    /// Tiles past what the folded grid can address (here 32 tiles against a 4 x 4 fixture grid) are a typed
+    /// `DispatchGridLimit` refusal naming the equation, never a truncated launch; a source whose expert slabs
+    /// exceed 32-bit bit offsets is a typed `DispatchSizeOverflow`, never wrapped offsets. Mutation: drop the
+    /// bit-offset check in `plan_indexed`; the 570 MB table plans and this row goes red.
+    #[test]
+    fn an_indexed_contraction_beyond_the_grid_or_the_bit_range_is_a_typed_refusal() {
+        let refusal =
+            |graph: &poot_graph_ir::Graph, index: usize, caps: &DeviceCaps| match plan_indexed(
+                graph, index, caps,
+            ) {
+                Err(PlanError::Refused(refusal)) => {
+                    assert!(
+                        matches!(refusal.op, OpKind::PackedContraction { .. }),
+                        "{:?}",
+                        refusal.op
+                    );
+                    refusal.missing
+                }
+                other => panic!("expected a refusal, got {other:?}"),
+            };
+        let (graph, index) = indexed_eqn(250, 4, 8, 64);
+        assert!(matches!(
+            refusal(&graph, index, &tiny_grid_caps()),
+            Capability::DispatchGridLimit { .. }
+        ));
+        // 16 experts of Q8_0 `[4096, 8192]`: 35.6 MB each, 570 MB as one source, past 2^32 bits.
+        let (graph, index) = indexed_eqn(1, 16, 4096, 8192);
+        let descriptor = PackedWeight::try_new(WeightFormat::Q8_0, [4096, 8192]).unwrap();
+        assert!(
+            16 * descriptor.slab_words(poot_quant::SourceRole::Blocks) * 32 > u32::MAX as usize,
+            "the fixture is past 2^32 bits"
+        );
+        assert!(matches!(
+            refusal(&graph, index, &DeviceCaps::wgpu_rdna3_igpu()),
+            Capability::DispatchSizeOverflow
+        ));
     }
 
     /// SC-001 (card 658, GPU-free): the real `wgpu_rdna3_igpu` grid cap, not a
@@ -766,5 +895,71 @@ mod tests {
             Some(&65_535),
             "metadata[3] carries the folded x_groups"
         );
+    }
+
+    /// An indexed packed contraction above the decode row count is the segmented Tiled schedule, and above the
+    /// device's X extent its grid folds onto `GroupY` (the wgpu Gemv-body route refused such a prefill as
+    /// `DispatchGridLimit` once it passed 16.7M outputs): `M = 4096` rows of an `N = 8192` Q8_0 table at the real
+    /// wgpu caps is 33.5M outputs and 524,288 tiles, folded to `(65_535, 9)`, the workgroup staying the baked
+    /// 64 lanes and the metadata carrying `M` and `x_groups`. Mutation: in `plan_indexed` drop the Tiled arm
+    /// (`packed_indexed_gemv` answering `Some` for every `m`); the plan is a Gemv whose grid is refused or
+    /// whose schedule is not `Tiled`, and this row goes red.
+    #[test]
+    fn a_prefill_indexed_contraction_above_the_gemv_grid_plans_a_folded_tiled_schedule() {
+        let (rows, out) = (4096usize, 8192usize);
+        let (graph, index) = indexed_eqn(rows, 4, out, 64);
+        let caps = DeviceCaps::wgpu_rdna3_igpu();
+        assert!(
+            rows * out > 65_535 * 256,
+            "the fixture is past the Gemv-body route's {} outputs",
+            65_535 * 256
+        );
+        let plan = plan_indexed(&graph, index, &caps).unwrap_or_else(|error| panic!("{error}"));
+        let Some(Dispatch {
+            body,
+            launch: Launch { grid, meta },
+            ..
+        }) = plan.single()
+        else {
+            panic!("expected a single dispatch, got {plan:?}");
+        };
+        let tiles = rows.div_ceil(8) * out.div_ceil(8);
+        let y_groups = tiles.div_ceil(65_535) as u32;
+        assert_eq!(grid, &[65_535 * 64, y_groups, 1], "folded grid");
+        assert_eq!(body.workgroup_size, [64, 1, 1], "the baked tile workgroup");
+        let descriptor = PackedWeight::try_new(WeightFormat::Q8_0, [out, 64]).unwrap();
+        let slab = descriptor.slab_words(poot_quant::SourceRole::Blocks) as u32;
+        assert_eq!(
+            meta.as_slice(),
+            [64, out as u32, 4, rows as u32, 65_535, slab],
+            "[K, N, E, M, x_groups, slab_words]"
+        );
+    }
+
+    /// The decode/prefill split follows the row count: `INDEXED_GEMV_MAX_ROWS` rows is the Gemv and one row more is
+    /// the segmented Tiled schedule, unfolded while its tiles fit the X extent (`x_groups` is the tile count,
+    /// `ceil(33/8) * ceil(11/8) = 10`). Mutation: compare `m >= INDEXED_GEMV_MAX_ROWS` in `packed_indexed_gemv`;
+    /// the 32-row Gemv becomes Tiled and this row goes red.
+    #[test]
+    fn an_indexed_contraction_is_a_gemv_up_to_the_decode_row_count_and_tiled_above_it() {
+        let caps = DeviceCaps::wgpu_rdna3_igpu();
+        let schedule_of = |rows: usize| {
+            let (graph, index) = indexed_eqn(rows, 4, 11, 64);
+            let plan = plan_indexed(&graph, index, &caps).unwrap();
+            let Some(Dispatch {
+                launch: Launch { grid, meta },
+                ..
+            }) = plan.single()
+            else {
+                panic!("expected a single dispatch, got {plan:?}");
+            };
+            (grid.to_vec(), meta.clone())
+        };
+        let (gemv_grid, gemv_meta) = schedule_of(crate::predicates::INDEXED_GEMV_MAX_ROWS);
+        assert_eq!(gemv_meta[4], 0, "a Gemv carries no x_groups: {gemv_meta:?}");
+        assert_eq!(gemv_grid[1], 1);
+        let (tiled_grid, tiled_meta) = schedule_of(crate::predicates::INDEXED_GEMV_MAX_ROWS + 1);
+        assert_eq!(tiled_meta[3..5], [33, 10], "[M, x_groups]: {tiled_meta:?}");
+        assert_eq!(tiled_grid, [10 * 64, 1, 1]);
     }
 }

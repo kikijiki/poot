@@ -106,13 +106,10 @@ fn fixture_checkpoint() -> poot_test_util::UniqueTempPath {
 }
 
 fn options(chunk: usize, capacity: usize) -> DriverOptions {
-    let compile = CompileOptions {
-        execution: Submission::Replay,
-        limits: CompileLimits::STANDARD,
-    };
+    let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
     let nz = |n| NonZeroUsize::new(n).unwrap();
     DriverOptions {
-        prefill: compile,
+        prefill: compile.clone(),
         decode: compile,
         capacity: nz(capacity),
         prefill_chunk: nz(chunk),

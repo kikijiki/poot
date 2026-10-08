@@ -22,7 +22,7 @@ use crate::components::moe::{self, MoeParams, MoeWeights};
 use crate::components::rope::{GGUF_ROPE_FREQS, rope_freq_factors};
 use crate::components::router::RouterKind;
 use crate::components::standard::{
-    BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
+    BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_embeddable_step,
     standard_layer, standard_stack,
 };
 use crate::model::{
@@ -312,12 +312,16 @@ impl Model for Llama {
         shape: StepShape,
     ) -> Result<Graph<ValidationOutputs>, TraceError> {
         let p = &self.params;
-        check_step(FAMILY, phase, shape, p.max_positions)?;
+        check_embeddable_step(FAMILY, phase, shape, p.max_positions)?;
         if let Some(params) = &p.moe {
             moe::check_step(FAMILY, shape, params)?;
         }
         let b = Builder::new();
-        let step = Step::new(&b, shape);
+        let step = match phase {
+            Phase::Prefill | Phase::Decode => Step::new(&b, shape),
+            Phase::PrefillEmbeds => Step::with_embeds(&b, shape, p.width),
+            Phase::Encode => Step::new(&b, shape).returning_hidden(),
+        };
         let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
             let layer = &self.layers[l];
             standard_layer(

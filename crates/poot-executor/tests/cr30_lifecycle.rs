@@ -178,6 +178,7 @@ impl Device for FaultyDevice {
 fn fixture() -> (
     poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs>,
     Arc<WeightStore>,
+    Arc<poot_quant::weights::WeightMap>,
 ) {
     let b = Builder::new();
     let a = b.state_input("a", TensorType::f32(vec![2]), StateRole::Recurrent);
@@ -204,7 +205,11 @@ fn fixture() -> (
             ),
         )
         .unwrap();
-    (g, Arc::new(builder.build()))
+    let store = Arc::new(builder.build());
+    let mut names = poot_test_util::const_weights::ConstWeights::new(&store);
+    let g = names.graph(&g);
+    let map = Arc::new(names.map());
+    (g, store, map)
 }
 
 fn staged(
@@ -219,10 +224,7 @@ fn staged(
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions {
-            execution: submission,
-            limits: poot_graph_plan::CompileLimits::STANDARD,
-        },
+        &CompileOptions::new(submission, poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect("fixture graph compiles for the fake target")
 }
@@ -257,10 +259,8 @@ fn step_err(
 #[test]
 fn begin_failure_aborts_exactly_once_and_leaves_no_open_recording() {
     let (mut engine, control) = new_engine();
-    let (g, store) = fixture();
-    let exe = engine
-        .load_weights(store, poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (g, store, map) = fixture();
+    let exe = engine.load_weights(store, map).unwrap();
     let target = engine.device().target();
     let entry = engine
         .add_entry(exe, &staged(&g, target, Submission::Replay))
@@ -293,10 +293,8 @@ fn begin_failure_aborts_exactly_once_and_leaves_no_open_recording() {
 #[test]
 fn dispatch_failure_during_recording_aborts_once_and_does_not_mark_needs_reset() {
     let (mut engine, control) = new_engine();
-    let (g, store) = fixture();
-    let exe = engine
-        .load_weights(store, poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (g, store, map) = fixture();
+    let exe = engine.load_weights(store, map).unwrap();
     let target = engine.device().target();
     let entry = engine
         .add_entry(exe, &staged(&g, target, Submission::Replay))
@@ -325,10 +323,8 @@ fn dispatch_failure_during_recording_aborts_once_and_does_not_mark_needs_reset()
 #[test]
 fn copy_failure_during_recording_aborts_once_and_does_not_mark_needs_reset() {
     let (mut engine, control) = new_engine();
-    let (g, store) = fixture();
-    let exe = engine
-        .load_weights(store, poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (g, store, map) = fixture();
+    let exe = engine.load_weights(store, map).unwrap();
     let target = engine.device().target();
     let entry = engine
         .add_entry(exe, &staged(&g, target, Submission::Replay))
@@ -356,10 +352,8 @@ fn copy_failure_during_recording_aborts_once_and_does_not_mark_needs_reset() {
 #[test]
 fn finish_failure_during_recording_aborts_once_and_does_not_mark_needs_reset() {
     let (mut engine, control) = new_engine();
-    let (g, store) = fixture();
-    let exe = engine
-        .load_weights(store, poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (g, store, map) = fixture();
+    let exe = engine.load_weights(store, map).unwrap();
     let target = engine.device().target();
     let entry = engine
         .add_entry(exe, &staged(&g, target, Submission::Replay))
@@ -389,10 +383,8 @@ fn finish_failure_during_recording_aborts_once_and_does_not_mark_needs_reset() {
 #[test]
 fn replay_failure_aborts_once_and_marks_needs_reset() {
     let (mut engine, control) = new_engine();
-    let (g, store) = fixture();
-    let exe = engine
-        .load_weights(store, poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (g, store, map) = fixture();
+    let exe = engine.load_weights(store, map).unwrap();
     let target = engine.device().target();
     let entry = engine
         .add_entry(exe, &staged(&g, target, Submission::Replay))
@@ -435,10 +427,8 @@ fn replay_failure_aborts_once_and_marks_needs_reset() {
 #[test]
 fn synchronize_fault_surfaces_as_exec_error_fault_from_step_with_no_output_read() {
     let (mut engine, control) = new_engine();
-    let (g, store) = fixture();
-    let exe = engine
-        .load_weights(store, poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (g, store, map) = fixture();
+    let exe = engine.load_weights(store, map).unwrap();
     let target = engine.device().target();
     let entry = engine
         .add_entry(exe, &staged(&g, target, Submission::Replay))
@@ -477,10 +467,8 @@ fn synchronize_fault_surfaces_as_exec_error_fault_from_step_with_no_output_read(
 #[test]
 fn non_fault_synchronize_failure_aborts_and_marks_needs_reset() {
     let (mut engine, control) = new_engine();
-    let (g, store) = fixture();
-    let exe = engine
-        .load_weights(store, poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (g, store, map) = fixture();
+    let exe = engine.load_weights(store, map).unwrap();
     let target = engine.device().target();
     let entry = engine
         .add_entry(exe, &staged(&g, target, Submission::Replay))
@@ -512,10 +500,8 @@ fn non_fault_synchronize_failure_aborts_and_marks_needs_reset() {
 #[test]
 fn failed_abort_poisons_the_device_and_reset_cannot_clear_it() {
     let (mut engine, control) = new_engine();
-    let (g, store) = fixture();
-    let exe = engine
-        .load_weights(store, poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (g, store, map) = fixture();
+    let exe = engine.load_weights(store, map).unwrap();
     let target = engine.device().target();
     let entry = engine
         .add_entry(exe, &staged(&g, target, Submission::Replay))
@@ -555,10 +541,8 @@ fn failed_abort_poisons_the_device_and_reset_cannot_clear_it() {
 #[test]
 fn carried_state_has_no_ping_pong_pair() {
     let (mut engine, _control) = new_engine();
-    let (g, store) = fixture();
-    let exe = engine
-        .load_weights(store, poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (g, store, map) = fixture();
+    let exe = engine.load_weights(store, map).unwrap();
     let target = engine.device().target();
     let entry = engine
         .add_entry(exe, &staged(&g, target, Submission::Replay))

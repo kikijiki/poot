@@ -424,7 +424,13 @@ fn packed_contraction(
         operands.push(Operand::Value(input.id));
     }
     let output = plan
-        .equation(OpKind::PackedContraction { descriptor, blocks }, operands)
+        .equation(
+            OpKind::PackedContraction {
+                descriptor,
+                rows: poot_graph_ir::ContractionRows::Blocks(blocks),
+            },
+            operands,
+        )
         .expect("emit PackedContraction");
     plan.declare_result(output).expect("declare the result");
     let mut prepared = b.preflight_append(plan).expect("preflight the append");
@@ -927,4 +933,58 @@ fn a_decomposition_reports_one_allocation_per_intermediate() {
     )
     .unwrap();
     assert_eq!(seen.0, [8 * 35 * 4, 35 * 8 * 4, 2 * 8 * 4]);
+}
+
+/// POOT-1048: `GroupedDenseContraction` over a BF16 `[G * N, K]` weight evaluates, bit for bit, to the product
+/// each group's own `[N, K]` row block makes with that group's activation rows, computed here by hand in f64
+/// (every term is exact in f32, so the sum is order-free). Group `g` reads rows `g * N ..`, not the first block.
+///
+/// Mutation: in `decompose`, reshape the weight to `[N, groups, K]` (rows interleaved across groups); every
+/// group but the first reads another group's rows and this row goes red.
+#[test]
+fn a_grouped_dense_contraction_equals_each_groups_own_block_product() {
+    let (groups, m, n, k) = (3usize, 2usize, 4usize, 5usize);
+    let weight: Vec<f32> = (0..groups * n * k)
+        .map(|i| ((i * 7 + 3) % 13) as f32 / 4.0 - 1.5)
+        .collect();
+    let x = activation(&[groups, m, k]);
+    let b = Builder::new();
+    let xs = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![groups, m, k]));
+    let w = b.constant("w", TensorType::new(vec![groups * n, k], DType::BF16));
+    let mut plan = b.append_plan(0);
+    let output = plan
+        .equation(
+            OpKind::GroupedDenseContraction {
+                weight: DType::BF16,
+                groups,
+            },
+            vec![Operand::Value(xs.id), Operand::Value(w.id)],
+        )
+        .expect("emit GroupedDenseContraction");
+    plan.declare_result(output).expect("declare the result");
+    let mut prepared = b.preflight_append(plan).expect("preflight the append");
+    let id = b.commit_append(&mut prepared).expect("commit the append");
+    let graph = b.finish(Traced { id });
+    let inputs = HashMap::from([
+        (xs.id, Value::Host(x.clone())),
+        (
+            w.id,
+            Value::Host(HostTensor::bf16(vec![groups * n, k], bf16_words(&weight))),
+        ),
+    ]);
+    let got = evaluate(&graph, &inputs).unwrap();
+    let activations = x.as_f32().expect("an F32 activation");
+    let want: Vec<u32> = (0..groups)
+        .flat_map(|g| (0..m).flat_map(move |row| (0..n).map(move |col| (g, row, col))))
+        .map(|(g, row, col)| {
+            let dot: f64 = (0..k)
+                .map(|kk| {
+                    f64::from(activations[(g * m + row) * k + kk])
+                        * f64::from(weight[(g * n + col) * k + kk])
+                })
+                .sum();
+            (dot as f32).to_bits()
+        })
+        .collect();
+    assert_eq!(got, want);
 }

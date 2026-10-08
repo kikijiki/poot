@@ -1,5 +1,5 @@
 //! A tiny all-F32 deepseek2-architecture GGUF (two layers: one dense, one routed with a shared
-//! expert; a 4-token vocabulary): a decoder the `Runner` still loads. Shared by the unit tests
+//! expert; a 4-token vocabulary): a decoder the family registry loads as a `ModelHandle`. Shared by the unit tests
 //! and the production-binary test through `#[path]`, so there is one writer.
 
 use poot_load::gguf::{GgufValue, write_gguf};
@@ -16,7 +16,7 @@ pub fn write_tiny_deepseek2_gguf(path: &std::path::Path, context_length: u32) {
         (6usize, 2usize, 3usize, 1usize, 4usize, 1usize);
     let shared_inter = moe_inter * shared;
 
-    // The xorshift fill of the Runner's own deepseek load tests: non-degenerate magnitudes.
+    // A xorshift fill: non-degenerate magnitudes.
     fn fill(seed: u64, n: usize) -> Vec<f32> {
         let mut s = seed ^ 0x9E37_79B9_7F4A_7C15;
         (0..n)

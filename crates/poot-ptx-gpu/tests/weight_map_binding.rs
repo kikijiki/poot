@@ -1,4 +1,4 @@
-//! Card 564 on PTX: qwen2's one body behind `Model`, bound through `WeightSource::Map` (SC-001),
+//! Card 564 on PTX: qwen2's one body behind `Model`, bound through the weight map (SC-001),
 //! and its fused and stacked views (SC-004). Skips without a device unless the lane requires it.
 
 use poot_executor::{Device, Engine, Executor};

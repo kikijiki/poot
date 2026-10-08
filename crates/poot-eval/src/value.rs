@@ -37,6 +37,8 @@ pub enum Value {
     /// An owner-backed exact value (checkpoint-derived BF16/F32 views, exact I32 words).
     Owner(ExactValue),
     Packed(PackedComponentRef),
+    /// One source role of an expert-stacked packed table (an indexed packed contraction's carrier).
+    PackedStack(PackedStackComponentRef),
 }
 
 impl Value {
@@ -47,6 +49,10 @@ impl Value {
             Value::Packed(component) => {
                 Cow::Owned(component.weight().source_shape(component.role()).to_vec())
             }
+            Value::PackedStack(component) => Cow::Owned(vec![
+                component.stack().experts(),
+                component.weight().slab_bytes(component.role()),
+            ]),
         }
     }
 
@@ -56,7 +62,7 @@ impl Value {
     pub fn as_host(&self) -> Option<&HostTensor> {
         match self {
             Value::Host(tensor) => Some(tensor),
-            Value::Owner(_) | Value::Packed(_) => None,
+            Value::Owner(_) | Value::Packed(_) | Value::PackedStack(_) => None,
         }
     }
 
@@ -70,6 +76,9 @@ impl Value {
             }),
             Value::Packed(_) => Err(EvalError::NotHost {
                 what: "packed component",
+            }),
+            Value::PackedStack(_) => Err(EvalError::NotHost {
+                what: "packed stack component",
             }),
         }
     }
@@ -91,6 +100,9 @@ impl Value {
             Value::Host(t) => t.data().byte_len(),
             Value::Owner(value) => value.physical_bytes(),
             Value::Packed(component) => component.bytes().len(),
+            Value::PackedStack(component) => {
+                component.stack().experts() * component.weight().slab_bytes(component.role())
+            }
         }
     }
 }
@@ -116,6 +128,12 @@ impl From<ExactValue> for Value {
 impl From<ExactI32TensorView> for Value {
     fn from(value: ExactI32TensorView) -> Self {
         Value::Owner(ExactValue::I32(value))
+    }
+}
+
+impl From<PackedStackComponentRef> for Value {
+    fn from(value: PackedStackComponentRef) -> Self {
+        Value::PackedStack(value)
     }
 }
 

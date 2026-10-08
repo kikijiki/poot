@@ -76,6 +76,7 @@ fn caps_hosting_only_the_tiny_embed() -> poot_target::DeviceCaps {
         tensor_core: poot_target::TensorCoreSupport::None,
         known_miscompiles: poot_target::KnownMiscompiles::default(),
         compute_units: poot_target::STRIX_HALO_COMPUTE_UNITS,
+        memory_budget_bytes: None,
         ..poot_target::DeviceCaps::rocm_default()
     }
 }
@@ -190,10 +191,7 @@ fn compile_hosts_the_decode_embed_gather_without_changing_hidden_state() {
         backend: Backend::SpirvVulkan,
         caps: caps_hosting_only_the_tiny_embed(),
     };
-    let options = CompileOptions {
-        execution: Submission::Replay,
-        limits: poot_graph_plan::CompileLimits::STANDARD,
-    };
+    let options = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
     let program = compile(&gd, &target, &options)
         .expect("the embed table hosts; nothing else in this fixture is oversized");
     let gh = program.graph();
@@ -315,10 +313,7 @@ fn compile_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
         backend: Backend::SpirvVulkan,
         caps: caps_hosting_only_the_tiny_embed(),
     };
-    let options = CompileOptions {
-        execution: Submission::Replay,
-        limits: poot_graph_plan::CompileLimits::STANDARD,
-    };
+    let options = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
     let program = compile(&gd, &target, &options)
         .expect("the embed table hosts; nothing else in this fixture is oversized");
     let gh = program.graph();

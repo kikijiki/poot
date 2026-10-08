@@ -5,7 +5,7 @@
 //! (K-1) * dilation, C]` that the step carries as recurrent state (the previous inputs, oldest
 //! first), so a chunk of tokens continues the previous chunk exactly and one token is a decode
 //! step: one body for every phase, and no zero pad after the first chunk. The kernel is stored as
-//! PyTorch stores a depthwise `nn.Conv1d`, `[C, 1, K]`.
+//! PyTorch stores a depthwise `nn.Conv1d`, `[C, 1, K]`, or as a GGUF stores it, `[C, K]`.
 
 use poot_graph_ir::{BinOp, Builder, StateRole, TensorType, Traced, ops};
 use poot_quant::weights::{WeightId, WeightMap};
@@ -59,7 +59,8 @@ pub struct ConvWeights {
 }
 
 impl ConvWeights {
-    /// The kernel stored under `kernel` and the bias under `bias`, shape-checked against `p`.
+    /// The kernel stored under `kernel` (`[C, 1, K]`, or `[C, K]` as a GGUF stores it) and the bias
+    /// under `bias`, shape-checked against `p`.
     pub fn new(
         map: &WeightMap,
         kernel: WeightId,
@@ -67,7 +68,14 @@ impl ConvWeights {
         p: &ConvParams,
     ) -> Result<Self, WeightError> {
         Ok(Self {
-            kernel: Weight::new(map, kernel, &[p.channels, 1, p.kernel])?,
+            kernel: Weight::new(map, kernel, &[p.channels, 1, p.kernel]).or_else(|first| {
+                // Only a shape mismatch has another spelling to try; report the PyTorch one when
+                // neither fits.
+                Weight::new(map, kernel, &[p.channels, p.kernel]).map_err(|second| match second {
+                    WeightError::Shape { .. } => first,
+                    other => other,
+                })
+            })?,
             bias: bias
                 .map(|id| Weight::new(map, id, &[p.channels]))
                 .transpose()?,

@@ -65,6 +65,25 @@ impl Weight {
     /// `id`'s handle from `map`, which must have `shape` and be a float weight: a dense F32, BF16 or
     /// F16 entry, or a packed one (whose logical decode is F32).
     pub fn new(map: &WeightMap, id: WeightId, shape: &[usize]) -> Result<Self, WeightError> {
+        Self::checked(map, id, shape, false)
+    }
+
+    /// A row table a component only gathers from: [`Self::new`] plus a dense E4M3FN entry, which a
+    /// gather reads row by row and widens (a contraction over it is not defined).
+    pub fn lookup_table(
+        map: &WeightMap,
+        id: WeightId,
+        shape: &[usize],
+    ) -> Result<Self, WeightError> {
+        Self::checked(map, id, shape, true)
+    }
+
+    fn checked(
+        map: &WeightMap,
+        id: WeightId,
+        shape: &[usize],
+        gathered: bool,
+    ) -> Result<Self, WeightError> {
         let handle = map.handle(id).ok_or(WeightError::Unmapped { id })?;
         if handle.shape != shape {
             return Err(WeightError::Shape {
@@ -76,6 +95,7 @@ impl Weight {
         match handle.format {
             HandleFormat::Dense(DType::F32 | DType::BF16 | DType::F16)
             | HandleFormat::Packed(_) => {}
+            HandleFormat::Dense(DType::E4M3FN) if gathered => {}
             format => return Err(WeightError::Format { id, format }),
         }
         Ok(Self {

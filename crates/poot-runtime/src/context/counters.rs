@@ -34,13 +34,10 @@ impl Context {
         self.submits.get()
     }
 
-    /// Total device-local VRAM in use (bytes), read from the Vulkan runtime via
-    /// `VK_EXT_memory_budget`: an engine-queried, vendor- and OS-agnostic metric (a runtime GPU API, not
-    /// sysfs or a vendor CLI). Device-wide, so it includes other processes' allocations (e.g. a
-    /// co-resident llama.cpp) and reflects memory pressure/headroom rather than poot's own allocation
-    /// gauges. `None` if the backend is not Vulkan or the query is unavailable. Cheap (a
-    /// physical-device property query), safe to call per scrape.
-    pub fn vram_used_bytes(&self) -> Option<u64> {
+    /// Device-local VRAM this process may still allocate (bytes): the OS-arbitrated heap budget less
+    /// the heap usage, from one `VK_EXT_memory_budget` read, so memory other processes took since the
+    /// device opened is already out of it. `None` off Vulkan or if the query is unavailable.
+    pub fn vram_free_bytes(&self) -> Option<u64> {
         use ash::vk;
         // SAFETY: as_hal yields the live wgpu-hal Vulkan adapter for the lifetime of the guard; the
         // physical device + instance are valid for that borrow, and the property query only reads.
@@ -51,29 +48,26 @@ impl Context {
             let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
             let mut props2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
             instance.get_physical_device_memory_properties2(phys, &mut props2);
-            // Read out the heap table; this is `props2`'s last use, so its `&mut budget` borrow ends here and
-            // `budget.heap_usage` below can be read.
             let mem = props2.memory_properties;
-            let used: u64 = (0..mem.memory_heap_count as usize)
+            let free: u64 = (0..mem.memory_heap_count as usize)
                 .filter(|&i| {
                     mem.memory_heaps[i]
                         .flags
                         .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
                 })
-                .map(|i| budget.heap_usage[i])
+                .map(|i| budget.heap_budget[i].saturating_sub(budget.heap_usage[i]))
                 .sum();
-            Some(used)
+            Some(free)
         }
     }
 
     /// Total device-local VRAM available to this process (bytes), from `VK_EXT_memory_budget`
     /// (`heap_budget`, the OS-arbitrated budget: can be below the physical heap size and shrinks when
-    /// other processes hold memory). Same source as [`Self::vram_used_bytes`]; `free = budget - used` is
-    /// the headroom for new allocations. `None` off Vulkan or if the query is unavailable.
+    /// other processes hold memory). `None` off Vulkan or if the query is unavailable.
     pub fn vram_budget_bytes(&self) -> Option<u64> {
         use ash::vk;
-        // SAFETY: same contract as `vram_used_bytes`: a read-only physical-device property query over the
-        // live wgpu-hal Vulkan adapter.
+        // SAFETY: as_hal yields the live wgpu-hal Vulkan adapter for the lifetime of the guard; the
+        // physical device + instance are valid for that borrow, and the property query only reads.
         unsafe {
             let hal = self._adapter.as_hal::<wgpu_hal::vulkan::Api>()?;
             let phys = hal.raw_physical_device();
@@ -136,7 +130,7 @@ impl Context {
     /// Independent of the diagnostic gauges above (`submits`, `pipeline_builds`, ...), and never
     /// reset by a profiler reset - this is the cumulative cross-backend contract.
     ///
-    /// Read by this crate's reconciliation tests only: the bench runner's Runner engines were its
+    /// Read by this crate's reconciliation tests only: the bench runner's pre-driver engines were its
     /// one production reader.
     #[cfg(test)]
     pub(crate) fn execution_counters(&self) -> poot_runtime_common::ExecutionCounters {

@@ -6,8 +6,8 @@ use poot_graph_ir::builder::{Builder, Traced};
 use poot_graph_ir::graph::{Operand, StateRole};
 use poot_graph_ir::op::{BinOp, OpKind};
 use poot_graph_ir::ops::{
-    attention, attention_prefill, causal_conv1d_decode, linear, linear_attention_decode,
-    linear_attention_prefill, rmsnorm,
+    attention, attention_prefill, causal_conv1d_decode, linear, linear_attention_prefill,
+    repeat_kv, rmsnorm,
 };
 use poot_graph_ir::types::TensorType;
 use poot_tensor::HostTensor;
@@ -15,6 +15,29 @@ use std::collections::HashMap;
 
 use super::helpers::*;
 use poot_test_util::{assert_close_rel, max_abs_error, max_abs_error_f64};
+
+/// One linear-attention decode step with the same scalar `decay` on every key channel,
+/// `S_t = decay * S_{t-1} + k_t^T v_t` and `o_t = q_t @ S_t`, composed from primitives: the loop tests
+/// below compare it with the prefill form.
+fn scalar_decay_decode(
+    b: &Builder,
+    q: Traced,
+    k: Traced,
+    v: Traced,
+    n_rep: usize,
+    decay: f32,
+    s_in: Traced,
+) -> (Traced, Traced) {
+    let k = repeat_kv(b, k, n_rep);
+    let v = repeat_kv(b, v, n_rep);
+    let outer = b.matmul(b.transpose(k, vec![0, 1, 3, 2]), v);
+    let s_out = b.binary(
+        BinOp::Add,
+        b.binary_scalar(BinOp::Mul, s_in, poot_graph_ir::types::Scalar::F32(decay)),
+        outer,
+    );
+    (b.matmul(q, s_out), s_out)
+}
 
 /// Stage one `Attention { softcap: None }` over `[q, k, v, mask]`. Card 557: `Builder` has no
 /// method for a composite (`compile`'s `flash_attention_capped` forms it from the traced chain), so a test
@@ -44,12 +67,12 @@ fn stage_flash_prefill(
 }
 
 #[test]
-fn linear_attention_decode_fuzz_matches_recurrence() {
-    // card 035: independent-oracle shape fuzzer for the linear-attention decode family (scalar + gated). Sweeps random
+fn linear_attention_decode_gated_fuzz_matches_recurrence() {
+    // card 035: independent-oracle shape fuzzer for the gated linear-attention decode. Sweeps random
     // Hkv / n_rep / D_k / D_v / L (rectangular state, GQA repeat) and runs the multi-step decode loop carrying S against
     // a from-scratch recurrence. GPU==CPU cannot catch a state-shape derivation bug (same decomposition); an independent
     // reference can. 40 seeds.
-    use poot_graph_ir::ops::{linear_attention_decode, linear_attention_decode_gated};
+    use poot_graph_ir::ops::linear_attention_decode_gated;
     let mut s: u64 = 0xA17F_C0DE_1234_5678;
     let mut rng = || {
         s ^= s << 13;
@@ -57,7 +80,6 @@ fn linear_attention_decode_fuzz_matches_recurrence() {
         s ^= s << 17;
         s
     };
-    let mut covered = (0, 0); // (scalar, gated) seeds run
     for _seed in 0..40u32 {
         let hkv = 1 + (rng() % 2) as usize; // 1..=2
         let n_rep = 1 + (rng() % 3) as usize; // 1..=3
@@ -65,10 +87,8 @@ fn linear_attention_decode_fuzz_matches_recurrence() {
         let dk = 2 + (rng() % 5) as usize; // 2..=6
         let dv = 2 + (rng() % 5) as usize; // 2..=6
         let l = 2 + (rng() % 4) as usize; // 2..=5
-        let gated = rng() % 2 == 0;
-        let decay = 0.7 + 0.1 * (rng() % 3) as f32; // scalar variant: 0.7 / 0.8 / 0.9
         let rf = |r: &mut dyn FnMut() -> u64| ((r() % 1000) as f32 / 1000.0) * 1.6 - 0.8; // value in (-0.8, 0.8)
-        // per-step random q/k/v; per-head/D_k gate (gated variant), in (0.3, 0.95).
+        // per-step random q/k/v; per-head/D_k gate, in (0.3, 0.95).
         let mut q = vec![vec![0.0f32; hq * dk]; l];
         let mut k = vec![vec![0.0f32; hkv * dk]; l];
         let mut v = vec![vec![0.0f32; hkv * dv]; l];
@@ -99,11 +119,7 @@ fn linear_attention_decode_fuzz_matches_recurrence() {
             StateRole::Recurrent,
         );
         let gc = b.constant("g", TensorType::f32(vec![1, hq, dk, 1]));
-        let (o, s_out) = if gated {
-            linear_attention_decode_gated(&b, qc, kc, vc, n_rep, gc, s_in)
-        } else {
-            linear_attention_decode(&b, qc, kc, vc, n_rep, decay, s_in)
-        };
+        let (o, s_out) = linear_attention_decode_gated(&b, qc, kc, vc, n_rep, gc, s_in);
         let g = b.finish_with_state(o, &[(s_in, s_out)]);
 
         let mut state = HostTensor::f32(vec![1, hq, dk, dv], vec![0.0f32; hq * dk * dv]);
@@ -122,16 +138,9 @@ fn linear_attention_decode_fuzz_matches_recurrence() {
                 vc.id,
                 Value::from(HostTensor::f32(vec![1, hkv, 1, dv], v[t].clone())),
             );
-            if gated {
-                // gate broadcasts over D_v: shape [1,Hq,D_k,1].
-                let gv: Vec<f32> = (0..hq * dk).map(|i| gate[t][i]).collect();
-                inp.insert(gc.id, Value::from(HostTensor::f32(vec![1, hq, dk, 1], gv)));
-            } else {
-                inp.insert(
-                    gc.id,
-                    Value::from(HostTensor::f32(vec![1, hq, dk, 1], vec![0.0f32; hq * dk])),
-                );
-            }
+            // gate broadcasts over D_v: shape [1,Hq,D_k,1].
+            let gv: Vec<f32> = (0..hq * dk).map(|i| gate[t][i]).collect();
+            inp.insert(gc.id, Value::from(HostTensor::f32(vec![1, hq, dk, 1], gv)));
             inp.insert(s_in.id, Value::from(state.clone()));
             let (ot, new) = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
                 .map(|r| {
@@ -155,14 +164,14 @@ fn linear_attention_decode_fuzz_matches_recurrence() {
             got[t * hq * dv..(t + 1) * hq * dv].copy_from_slice(ot.as_f32().unwrap());
         }
 
-        // reference recurrence: S[h][i][j] = gate_or_decay * S + k[kv][i]*v[kv][j]; o[h][j] = sum_i q[h][i]*S[h][i][j].
+        // reference recurrence: S[h][i][j] = gate * S + k[kv][i]*v[kv][j]; o[h][j] = sum_i q[h][i]*S[h][i][j].
         let mut want = vec![0.0f32; l * hq * dv];
         let mut sref = vec![0.0f32; hq * dk * dv];
         for t in 0..l {
             for h in 0..hq {
                 let kv = h / n_rep;
                 for i in 0..dk {
-                    let decw = if gated { gate[t][h * dk + i] } else { decay };
+                    let decw = gate[t][h * dk + i];
                     for j in 0..dv {
                         let idx = (h * dk + i) * dv + j;
                         sref[idx] = decw * sref[idx] + k[t][kv * dk + i] * v[t][kv * dv + j];
@@ -178,16 +187,7 @@ fn linear_attention_decode_fuzz_matches_recurrence() {
             }
         }
         assert_close_rel(&got, &want, 1e-4);
-        if gated {
-            covered.1 += 1;
-        } else {
-            covered.0 += 1;
-        }
     }
-    assert!(
-        covered.0 > 0 && covered.1 > 0,
-        "both variants exercised: {covered:?}"
-    );
 }
 
 #[test]
@@ -856,45 +856,6 @@ fn decay_mask_from_gates_fuzz_matches_cumprod() {
     }
 }
 
-// Exact per-channel gated linear-attention recurrence, the independent oracle for both prefill fuzzers:
-// state[a][c] = g[t][a]*state[a][c] + k[kv][t][a]*v[kv][t][c]; o[t][c] = sum_a q[t][a]*state[a][c]. GQA via
-// kv = h/n_rep. q/k/v/g are flat [head, L, D]; returns [Hq, L, D_v].
-#[allow(clippy::too_many_arguments)]
-fn gated_linattn_recurrence(
-    q: &[f32],
-    k: &[f32],
-    v: &[f32],
-    g: &[f32],
-    hq: usize,
-    n_rep: usize,
-    l: usize,
-    dk: usize,
-    dv: usize,
-) -> Vec<f32> {
-    let mut out = vec![0.0f32; hq * l * dv];
-    for h in 0..hq {
-        let kv = h / n_rep;
-        let mut state = vec![0.0f32; dk * dv];
-        for t in 0..l {
-            for a in 0..dk {
-                let gta = g[(h * l + t) * dk + a];
-                for c in 0..dv {
-                    state[a * dv + c] = gta * state[a * dv + c]
-                        + k[(kv * l + t) * dk + a] * v[(kv * l + t) * dv + c];
-                }
-            }
-            for c in 0..dv {
-                let mut acc = 0.0f32;
-                for a in 0..dk {
-                    acc += q[(h * l + t) * dk + a] * state[a * dv + c];
-                }
-                out[(h * l + t) * dv + c] = acc;
-            }
-        }
-    }
-    out
-}
-
 #[test]
 fn flash_prefill_matches_materialized_attention_prefill() {
     // card 038: the fused flash-prefill op (Attention, online softmax, never materializing [1,Hq,L,L])
@@ -1083,175 +1044,6 @@ fn flash_attention_matches_f64_reference_at_real_head_dim_and_sink_outlier() {
 }
 
 #[test]
-fn linear_attention_prefill_chunked_fuzz_matches_recurrence() {
-    // card 035: independent-oracle shape fuzzer for the chunked gated linear-attention prefill (per-chunk slice/state-carry/
-    // concat, the Lambda gated carry, Q'/K' beta scaling). Sweeps random chunk size / count / Hkv / n_rep / D_k / D_v
-    // with a data-dependent per-channel gate; beta is the within-chunk cumulative gate product; compared against the
-    // exact recurrence. Gates are mild (0.6..0.95, <=4 chunks) so K/beta stays well-conditioned. 36 seeds.
-    use poot_graph_ir::ops::linear_attention_prefill_chunked;
-    let mut s: u64 = 0x9111_2233_4455_6677;
-    let mut rng = || {
-        s ^= s << 13;
-        s ^= s >> 7;
-        s ^= s << 17;
-        s
-    };
-    let rf = |r: &mut dyn FnMut() -> u64| ((r() % 1000) as f32 / 1000.0) * 1.2 - 0.6;
-    for _seed in 0..36u32 {
-        let c = 2 + (rng() % 3) as usize; // chunk size 2..=4
-        let n_chunks = 2 + (rng() % 3) as usize; // 2..=4 chunks
-        let l = c * n_chunks;
-        let hkv = 1 + (rng() % 2) as usize;
-        let n_rep = 1 + (rng() % 2) as usize;
-        let hq = hkv * n_rep;
-        let dk = 2 + (rng() % 4) as usize; // 2..=5
-        let dv = 2 + (rng() % 4) as usize;
-        let qd: Vec<f32> = (0..hq * l * dk).map(|_| rf(&mut rng)).collect();
-        let kd: Vec<f32> = (0..hkv * l * dk).map(|_| rf(&mut rng)).collect();
-        let vd: Vec<f32> = (0..hkv * l * dv).map(|_| rf(&mut rng)).collect();
-        // per (head, position, channel) gate in (0.6, 0.95).
-        let gd: Vec<f32> = (0..hq * l * dk)
-            .map(|_| 0.6 + 0.35 * (rng() % 1000) as f32 / 1000.0)
-            .collect();
-        // beta = within-chunk cumulative product of the gate (chunk start = (t/c)*c, inclusive of t).
-        let mut beta = vec![0.0f32; hq * l * dk];
-        for h in 0..hq {
-            for a in 0..dk {
-                for t in 0..l {
-                    let cs = (t / c) * c;
-                    let mut pb = 1.0f32;
-                    for sidx in cs..=t {
-                        pb *= gd[(h * l + sidx) * dk + a];
-                    }
-                    beta[(h * l + t) * dk + a] = pb;
-                }
-            }
-        }
-        let causal_chunk: Vec<f32> = (0..c * c)
-            .map(|i| if i % c <= i / c { 1.0 } else { 0.0 })
-            .collect();
-
-        let b = Builder::new();
-        let q = b.constant("q", TensorType::f32(vec![1, hq, l, dk]));
-        let k = b.constant("k", TensorType::f32(vec![1, hkv, l, dk]));
-        let v = b.constant("v", TensorType::f32(vec![1, hkv, l, dv]));
-        let be = b.constant("be", TensorType::f32(vec![1, hq, l, dk]));
-        let ca = b.constant("ca", TensorType::f32(vec![1, 1, c, c]));
-        let o = linear_attention_prefill_chunked(&b, q, k, v, n_rep, be, ca, c);
-        let g = b.finish(o);
-        let mut inp = HashMap::new();
-        inp.insert(
-            q.id,
-            Value::from(HostTensor::f32(vec![1, hq, l, dk], qd.clone())),
-        );
-        inp.insert(
-            k.id,
-            Value::from(HostTensor::f32(vec![1, hkv, l, dk], kd.clone())),
-        );
-        inp.insert(
-            v.id,
-            Value::from(HostTensor::f32(vec![1, hkv, l, dv], vd.clone())),
-        );
-        inp.insert(
-            be.id,
-            Value::from(HostTensor::f32(vec![1, hq, l, dk], beta)),
-        );
-        inp.insert(
-            ca.id,
-            Value::from(HostTensor::f32(vec![1, 1, c, c], causal_chunk)),
-        );
-        let got = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
-            .unwrap()
-            .output
-            .into_host()
-            .expect("linear_attention_hybrid tests evaluate dense graphs");
-
-        let want = gated_linattn_recurrence(&qd, &kd, &vd, &gd, hq, n_rep, l, dk, dv);
-        assert_close_rel(got.as_f32().unwrap(), &want, 5e-3);
-    }
-}
-
-#[test]
-fn linear_attention_prefill_gated_fuzz_matches_recurrence() {
-    // card 035: independent-oracle shape fuzzer for the non-chunked gated quadratic prefill (Q'=Q*A, K'=K/A, A =
-    // whole-sequence cumulative gate, full causal mask) vs the same exact recurrence. L and gate are kept so A does not
-    // underflow (the chunked form covers that). 36 seeds.
-    use poot_graph_ir::ops::linear_attention_prefill_gated;
-    let mut s: u64 = 0x1A2B_3C4D_5E6F_7081;
-    let mut rng = || {
-        s ^= s << 13;
-        s ^= s >> 7;
-        s ^= s << 17;
-        s
-    };
-    let rf = |r: &mut dyn FnMut() -> u64| ((r() % 1000) as f32 / 1000.0) * 1.2 - 0.6;
-    for _seed in 0..36u32 {
-        let l = 3 + (rng() % 8) as usize; // 3..=10
-        let hkv = 1 + (rng() % 2) as usize;
-        let n_rep = 1 + (rng() % 2) as usize;
-        let hq = hkv * n_rep;
-        let dk = 2 + (rng() % 4) as usize;
-        let dv = 2 + (rng() % 4) as usize;
-        let qd: Vec<f32> = (0..hq * l * dk).map(|_| rf(&mut rng)).collect();
-        let kd: Vec<f32> = (0..hkv * l * dk).map(|_| rf(&mut rng)).collect();
-        let vd: Vec<f32> = (0..hkv * l * dv).map(|_| rf(&mut rng)).collect();
-        // mild gate (0.75, 0.97) so A = prod over up to 10 steps stays a normal f32 (>= 0.75^10 ~ 0.056).
-        let gd: Vec<f32> = (0..hq * l * dk)
-            .map(|_| 0.75 + 0.22 * (rng() % 1000) as f32 / 1000.0)
-            .collect();
-        // A = whole-sequence cumulative product of the gate (inclusive of t).
-        let mut a_cum = vec![0.0f32; hq * l * dk];
-        for h in 0..hq {
-            for aa in 0..dk {
-                let mut pa = 1.0f32;
-                for t in 0..l {
-                    pa *= gd[(h * l + t) * dk + aa];
-                    a_cum[(h * l + t) * dk + aa] = pa;
-                }
-            }
-        }
-        let causal: Vec<f32> = (0..l * l)
-            .map(|i| if i % l <= i / l { 1.0 } else { 0.0 })
-            .collect();
-
-        let b = Builder::new();
-        let q = b.constant("q", TensorType::f32(vec![1, hq, l, dk]));
-        let k = b.constant("k", TensorType::f32(vec![1, hkv, l, dk]));
-        let v = b.constant("v", TensorType::f32(vec![1, hkv, l, dv]));
-        let cg = b.constant("cg", TensorType::f32(vec![1, hq, l, dk]));
-        let m = b.constant("m", TensorType::f32(vec![1, 1, l, l]));
-        let o = linear_attention_prefill_gated(&b, q, k, v, n_rep, cg, m);
-        let g = b.finish(o);
-        let mut inp = HashMap::new();
-        inp.insert(
-            q.id,
-            Value::from(HostTensor::f32(vec![1, hq, l, dk], qd.clone())),
-        );
-        inp.insert(
-            k.id,
-            Value::from(HostTensor::f32(vec![1, hkv, l, dk], kd.clone())),
-        );
-        inp.insert(
-            v.id,
-            Value::from(HostTensor::f32(vec![1, hkv, l, dv], vd.clone())),
-        );
-        inp.insert(
-            cg.id,
-            Value::from(HostTensor::f32(vec![1, hq, l, dk], a_cum)),
-        );
-        inp.insert(m.id, Value::from(HostTensor::f32(vec![1, 1, l, l], causal)));
-        let got = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
-            .unwrap()
-            .output
-            .into_host()
-            .expect("linear_attention_hybrid tests evaluate dense graphs");
-
-        let want = gated_linattn_recurrence(&qd, &kd, &vd, &gd, hq, n_rep, l, dk, dv);
-        assert_close_rel(got.as_f32().unwrap(), &want, 5e-3);
-    }
-}
-
-#[test]
 fn hybrid_model_decode_loop_matches_prefill() {
     // card 038: 2-layer hybrid model (layer 0 linear attention with matrix state S, layer 1 softmax attention with KV cache)
     // end to end. The mixed-state decode loop (carrying S + K/V caches) must equal the prefill of the same model over the
@@ -1400,7 +1192,7 @@ fn hybrid_model_decode_loop_matches_prefill() {
         let q0 = to_heads(&b, linear(&b, n0, w0d[1], None), hq, 1);
         let k0 = to_heads(&b, linear(&b, n0, w0d[2], None), hkv, 1);
         let v0 = to_heads(&b, linear(&b, n0, w0d[3], None), hkv, 1);
-        let (o0, s_out) = linear_attention_decode(&b, q0, k0, v0, n_rep, decay, s_in);
+        let (o0, s_out) = scalar_decay_decode(&b, q0, k0, v0, n_rep, decay, s_in);
         let x1 = b.binary(
             BinOp::Add,
             xt,
@@ -1920,7 +1712,7 @@ fn linear_attention_layer_decode_loop_matches_prefill() {
     let qd_ = to_heads(&bd, linear(&bd, nd, dwq, None), hq, 1);
     let kd_ = to_heads(&bd, linear(&bd, nd, dwk, None), hkv, 1);
     let vd_ = to_heads(&bd, linear(&bd, nd, dwv, None), hkv, 1);
-    let (od, s_out) = linear_attention_decode(&bd, qd_, kd_, vd_, n_rep, decay, s_in);
+    let (od, s_out) = scalar_decay_decode(&bd, qd_, kd_, vd_, n_rep, decay, s_in);
     let attnd = linear(&bd, from_heads(&bd, od, 1), dwo, None);
     let xout_d = bd.binary(BinOp::Add, xt, attnd);
     let gd = bd.finish_with_state(xout_d, &[(s_in, s_out)]);
@@ -1986,7 +1778,7 @@ fn linear_attention_decode_loop_matches_prefill() {
         TensorType::f32(vec![1, hq, dk, dv]),
         StateRole::Recurrent,
     );
-    let (o, s_out) = linear_attention_decode(&b, q, k, v, n_rep, decay, s_in);
+    let (o, s_out) = scalar_decay_decode(&b, q, k, v, n_rep, decay, s_in);
     let (qi, ki, vi) = (q.id, k.id, v.id);
     let gd = b.finish_with_state(o, &[(s_in, s_out)]);
 

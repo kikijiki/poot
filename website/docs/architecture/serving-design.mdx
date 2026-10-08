@@ -8,10 +8,10 @@ import ContinuousBatchingDiagram from "@site/src/components/architecture/Continu
 
 # Serving design
 
-`poot-serve` is an OpenAI-compatible HTTP server. **It serves no generation.** It starts, parses
-and bounds requests, serves encoder embeddings and reranking, and returns a typed `503` for
-`/v1/completions` and `/v1/chat/completions`. It refuses a dense decoder at startup until it serves
-through the driver, and registers no LoRA adapter. Operator guides live under
+`poot-serve` is an OpenAI-compatible HTTP server. It parses and bounds requests, loads any registered
+model as a `ModelHandle`, and serves `/v1/completions` and `/v1/chat/completions` from one scheduling loop
+over the driver's `step`. `/v1/embeddings`, `/v1/rerank` and the LoRA administration routes return a typed
+`503` until they are restored. It registers no LoRA adapter. Operator guides live under
 [Serving](../serve/index.md).
 
 ## API
@@ -20,27 +20,29 @@ through the driver, and registers no LoRA adapter. Operator guides live under
 | --------------------------- | ------------------------------------------------- |
 | `POST /v1/chat/completions` | Chat completion, streaming (SSE) or buffered JSON |
 | `POST /v1/completions`      | Raw text completion                               |
-| `POST /v1/embeddings`       | Embedding vectors (BERT-class models)             |
-| `POST /v1/rerank`           | Reranking scores (BERT-class models)              |
+| `POST /v1/embeddings`       | Embedding vectors (BERT-class models; `503` today) |
+| `POST /v1/rerank`           | Reranking scores (BERT-class models; `503` today) |
 | `GET /v1/models`            | List the served model(s)                          |
 | `GET /v1/models/{id}`       | Describe one served model                         |
-| `/v1/lora_adapters`         | LoRA administration (registers nothing yet)       |
+| `/v1/lora_adapters`         | LoRA administration (`503`: registers nothing yet) |
 | `GET /metrics`              | Server metrics as JSON                            |
 | `GET /metrics/prometheus`   | Server metrics in Prometheus exposition format    |
 | `GET /health`               | Liveness probe                                    |
 
-## The design the scheduling loop builds on
+## The scheduling loop
 
 **Continuous batching** [^orca] [^vllm]. In-flight requests share one batch per token; when one
 finishes, a waiting request takes its slot before the next step, so the batch never drains.
 
 <ContinuousBatchingDiagram />
 
-Because the graph has static shapes, the batched decode graph is sized to a fixed slot count with a
-fixed per-slot KV capacity and runs at that width every step, with empty slots masked out. Each
-request draws paged KV blocks from a shared pool as it grows; the host flattens its block table into
-the `Slot::SlotMap` input. The scheduling pieces (slot admission, KV-fit budgeting, preemption, token
-commit and terminal delivery) exist with their unit tests; the running server does not call them.
+Because the graph has static shapes, the prepared entries are sized to the engine's row capacity and
+every step runs at that width, with empty rows masked out, so a changing batch composition compiles
+nothing. The driver reserves a request's paged KV blocks for its whole `max_tokens` when the loop opens
+the sequence, so a running request is never starved and none is preempted; a request that finds no room
+waits for a running one to finish. The loop (`batch/engine.rs`) is the only scheduler: admission, the
+per-step prefill token budget, token commit (end-of-sequence, stop strings, `max_tokens`) and terminal
+delivery; see [Continuous batching](../serve/continuous-batching.md).
 
 **Streaming.** Tokens are emitted as SSE events through a bounded channel, so a slow client applies
 back-pressure.
@@ -60,12 +62,12 @@ disallowed tokens, which requires the host-readback sampling path.
 
 **Quantized checkpoints.** The library loads a single GGUF file or a safetensors directory. Packed
 projections stay packed at load time. Dense packed contractions and embedding gathers decode as they
-consume the weight. Packed MoE paths still materialize expert tables before indexed matmul.
+consume the weight, and a packed MoE expert stack is read by one indexed packed contraction that decodes only the selected experts' blocks; no expert table is materialized.
 
 | Format                                  | Packed on GPU                                                         |
 | --------------------------------------- | --------------------------------------------------------------------- |
 | GGUF K-quants and legacy quants [^gguf] | Yes, by default                                                       |
-| MXFP4 (gpt-oss routed experts)          | Packed at load; expert tables materialized during execution           |
+| MXFP4 (gpt-oss routed experts)          | Packed at load; read in place by the indexed packed contraction       |
 | GPTQ [^gptq], AWQ [^awq]                | Packed 4-bit projections by default                                   |
 | FP8 (`compressed-tensors`)              | Packed E4M3 per-channel projections on the supported Qwen loader path |
 
@@ -81,9 +83,9 @@ captured multi-device executor exists in `poot-ptx-gpu` as a building block. See
 
 ## Metrics
 
-Every value is produced by poot itself, never read from sysfs or a vendor CLI. The server runs no
-generation engine, so the generation counters stay at zero and the batching and KV-pool gauges have
-no data.
+Every value is produced by poot itself, never read from sysfs or a vendor CLI. The
+generation counters, the batching and KV-pool gauges and the device-bytes gauge
+(the executor's live accounting of weights, KV pool and workspace) come from its loop.
 
 | Metric                                 | Type      | Description                                                              |
 | -------------------------------------- | --------- | ------------------------------------------------------------------------ |
@@ -111,8 +113,8 @@ no data.
 | `poot_gpu_weight_bytes`                | Gauge     | Model weight bytes resident in GPU memory                                |
 | `poot_gpu_kv_cache_bytes`              | Gauge     | KV-pool bytes resident in GPU memory                                     |
 | `poot_gpu_resident_bytes`              | Gauge     | Resident GPU memory the engine tracks (weights + KV pool)                |
-| `poot_gpu_vram_used_bytes`             | Gauge     | Device-wide VRAM in use, via the Vulkan runtime (`VK_EXT_memory_budget`) |
-| `poot_gpu_vram_total_bytes`            | Gauge     | Total device-local VRAM budget, via the Vulkan runtime                   |
+| `poot_gpu_vram_used_bytes`             | Gauge     | Device bytes the engine holds (weights, KV pool, workspace), from the executor's live accounting |
+| `poot_gpu_vram_total_bytes`            | Gauge     | Device memory the engine plan found available at start                   |
 | `poot_decode_dispatch_count`           | Gauge     | Per-token GPU dispatch count of the optimized decode graph               |
 | `poot_decode_activation_peak_bytes`    | Gauge     | Peak transient activation bytes of the decode graph                      |
 | `poot_prefill_dispatch_count`          | Gauge     | GPU dispatch count of the optimized prefill (TTFT) graph                 |

@@ -72,9 +72,8 @@ Bound from the input map and uploaded for execution. Weight caches use payload i
 representation, so reusing a name for different bytes does not reuse the previous weight. `Graph.consts` lists the const binders.
 
 **`Slot(Slot)`**. A per-step input routed through a stable device buffer that the host
-rewrites in place. The `Slot` kind says what it carries: `Token`, `Pos`, `SeqLen`, `Mask`
-(additive attention mask over the fixed-capacity cache), `SlotMap` (paged KV), `LoraIdx`, and
-others.
+rewrites in place. The `Slot` kind says what it carries: `Token`, `Pos`, `SlotMap` (paged KV),
+`LoraIdx`, and others. The attention mask is not a slot: it is computed in-graph from `Pos`.
 
 **`State`**. A persistent buffer carried across decode steps: the KV cache. Pre-allocated to
 `cap` capacity per layer. `Graph.state` pairs each `state_in` binder with a `state_out`
@@ -158,9 +157,8 @@ specializations (GEMV vs GEMM, the attention schedule) at compile time rather th
 conditionally at runtime.
 
 The exception: per-step inputs (token id, position) are `Storage::Slot` inputs (`Slot::Token`, `Slot::Pos`), small
-device buffers at stable addresses written by the host each token. The dense families (qwen2 and its
-relatives, bloom, granite, mpt, smollm3, gemma2) build their causal/windowed mask in-graph from `Slot::Pos`
-against an `Iota`; other families still carry a host-built `Slot::Mask`. Output shapes
+device buffers at stable addresses written by the host each token. The causal/windowed mask is built
+in-graph from `Slot::Pos` against an `Iota`; no slot carries it. Output shapes
 do not depend on slot values (the KV capacity is pre-fixed), so the captured graph remains valid
 across all positions.
 
@@ -173,8 +171,8 @@ weight values they consume.
 
 The old per-scheme dequant-matmul op family is removed. GPTQ, AWQ, supported GGUF quants and the
 registered FP8/E2M1 layouts use the descriptor-driven lowering. Support still depends on the consuming
-graph: the current packed MoE chain materializes its expert table before `IndexedMatMul` during
-execution; the packed loader itself keeps the weights packed.
+graph: a packed MoE expert stack is rewritten when its weights are bound into one indexed packed
+contraction that decodes only the selected experts' blocks, and the packed loader keeps the weights packed.
 
 ---
 

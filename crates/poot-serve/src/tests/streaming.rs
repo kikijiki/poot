@@ -24,7 +24,8 @@ fn submit_propagates_natural_stop() {
             Sampler::greedy(),
             vec![],
             false,
-            LoraAdapterLease::none(),
+            AdapterRef::Base,
+            &|| false,
             |_, _| std::ops::ControlFlow::Continue(()),
         )
         .unwrap();
@@ -163,7 +164,8 @@ fn submit_stops_forwarding_when_client_disconnects() {
         Sampler::greedy(),
         vec![],
         true,
-        LoraAdapterLease::none(),
+        AdapterRef::Base,
+        &|| false,
         |_, _| {
             forwarded += 1;
             if forwarded < 2 {
@@ -260,7 +262,7 @@ fn streaming_rejects_bad_guided_with_400_before_headers() {
     let Some(dir) = poot_test_util::model_path(poot_test_util::checkpoint!("qwen2.5-0.5b")) else {
         return;
     };
-    let runner = Runner::load(&dir).expect("load model");
+    let runner = load_handle(&dir);
     let metrics = Metrics {
         started: Instant::now(),
         requests: AtomicU64::new(0),
@@ -269,7 +271,6 @@ fn streaming_rejects_bad_guided_with_400_before_headers() {
         requests_completed: AtomicU64::new(0),
         requests_cancelled: AtomicU64::new(0),
         requests_errored: AtomicU64::new(0),
-        requests_preempted: AtomicU64::new(0),
         inflight: AtomicU64::new(0),
         ttft: Histogram::new(),
         itl: Histogram::new(),
@@ -277,8 +278,7 @@ fn streaming_rejects_bad_guided_with_400_before_headers() {
         queue_wait: Histogram::new(),
         batch_size: AtomicU64::new(0),
         slot_capacity: 1,
-        on_gpu: false,
-        profile: false,
+        backend: "spirv-vulkan".to_string(),
         model: "qwen2.5-0.5b".into(),
         sys: Mutex::new(sysinfo::System::new()),
         cache: CacheMetrics::default(),
@@ -311,4 +311,131 @@ fn streaming_rejects_bad_guided_with_400_before_headers() {
         !resp.contains("text/event-stream"),
         "must NOT have begun an SSE stream before validating"
     );
+}
+
+/// SC-008: `commit_tokens` over the fake engine. A multi-token result whose second token is EOS keeps
+/// one token and ends the request at EOS: the engine is told `kept = 1`, the sequence holds the prompt and
+/// that token, and the token after EOS never enters either. Mutation: commit `result.tokens.len()`; the
+/// engine is told 3 and the row goes red.
+#[test]
+fn commit_tokens_keeps_the_tokens_before_an_eos_inside_a_multi_token_result() {
+    let mut engine = RecordingEngine::new(1);
+    let (job, _submitted) = JobSpec::new("ab", 10).build();
+    let mut slot = Slot::new(
+        FakeSeq(1),
+        Waiting {
+            job,
+            prompt: vec![97, 98],
+        },
+        0,
+        10,
+    );
+    let result = RowResult {
+        seq: FakeSeq(1),
+        consumed: 0,
+        tokens: vec![5, 99, 7],
+        logprobs: Vec::new(),
+    };
+    let metrics = test_metrics("commit-eos");
+    let fate = commit_tokens(&mut engine, &metrics, &mut slot, &result).unwrap();
+    assert_eq!(fate, SlotFate::Finished { natural: true });
+    assert_eq!(engine.events(), vec![Event::Commit { seq: 1, kept: 1 }]);
+    assert_eq!(slot.tokens, vec![97, 98, 5]);
+    assert_eq!(metrics.completion_tokens.load(Ordering::Relaxed), 1);
+}
+
+/// SC-006 (R477-014): a request with a stop string ends at the stop. The first result carries four
+/// tokens and the stop string is the second one's piece, so two are kept and committed, the stream ends
+/// there, and the loop runs no further step. Mutation: skip the stop check in the commit step (ignore
+/// `StopScanner::push`'s answer); the request runs on to `max_new` and the row goes red.
+#[test]
+fn a_stop_string_ends_the_request_at_the_stop_and_no_token_is_decoded_past_it() {
+    let mut engine = RecordingEngine::new(1).picking(|_, committed| {
+        if committed == 0 {
+            vec![1, 2, 3, 4]
+        } else {
+            vec![5]
+        }
+    });
+    let (_exit, _metrics, submitted) = serve(
+        &mut engine,
+        vec![JobSpec::new("ab", 50).stop("<2>").streaming()],
+    );
+    let (pieces, terminal) = outcome(&submitted[0]);
+    let GenEvent::Done(tokens, _, natural) = terminal else {
+        panic!("the request ends with a Done");
+    };
+    assert_eq!(
+        tokens,
+        vec![97, 98, 1, 2],
+        "the output ends at the stop token"
+    );
+    assert!(natural, "a stop string is a natural stop");
+    assert_eq!(
+        pieces,
+        vec!["<1>", "<2>"],
+        "no piece is streamed past the stop"
+    );
+    let events = engine.events();
+    assert!(
+        events.contains(&Event::Commit { seq: 1, kept: 2 }),
+        "{events:?}"
+    );
+    let steps = events
+        .iter()
+        .filter(|event| matches!(event, Event::Step(_)))
+        .count();
+    assert_eq!(steps, 1, "no step runs after the stop: {events:?}");
+}
+
+/// A stop string that straddles two decode steps ends the request when its last piece lands, and not
+/// before.
+#[test]
+fn a_stop_string_straddling_two_steps_ends_the_request_on_the_second() {
+    let mut engine = RecordingEngine::new(1).picking(|_, committed| vec![committed as u32 + 1]);
+    let (_exit, _metrics, submitted) =
+        serve(&mut engine, vec![JobSpec::new("ab", 50).stop("<2><3>")]);
+    let GenEvent::Done(tokens, _, natural) = outcome(&submitted[0]).1 else {
+        panic!("the request ends with a Done");
+    };
+    assert_eq!(tokens, vec![97, 98, 1, 2, 3]);
+    assert!(natural);
+}
+
+/// Streamed tokens carry the engine-produced position and pool usage, one per kept token.
+#[test]
+fn streamed_tokens_carry_their_index_and_the_pool_usage() {
+    let mut engine = RecordingEngine::new(1).picking(|_, committed| vec![committed as u32 + 1]);
+    let (_exit, _metrics, submitted) = serve(&mut engine, vec![JobSpec::new("ab", 3).streaming()]);
+    let mut indices = Vec::new();
+    for event in submitted[0].replies.try_iter() {
+        if let GenEvent::Token(_, info) = event {
+            assert_eq!(info.kv_used_ratio, 1.0 / 8.0, "one of eight blocks held");
+            indices.push(info.token_idx);
+        }
+    }
+    assert_eq!(indices, vec![0, 1, 2]);
+}
+
+/// A streamed piece with no receiver is a cancellation: the request is released (registering the prompt
+/// it filled), counted as cancelled, and gets no terminal event.
+#[test]
+fn a_streamed_piece_with_no_receiver_cancels_and_releases_the_request() {
+    let mut engine = RecordingEngine::new(1);
+    let (job, submitted) = JobSpec::new("ab", 10).streaming().build();
+    drop(submitted);
+    let (tx, rx) = mpsc::channel();
+    tx.send(job).unwrap();
+    drop(tx);
+    let metrics = test_metrics("stream-cancel");
+    run_engine(&mut engine, &rx, &metrics);
+    assert!(matches!(
+        engine.events().last(),
+        Some(Event::Release {
+            mode: poot_llm::driver::Release::Finished,
+            ..
+        })
+    ));
+    assert_eq!(metrics.requests_cancelled.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.requests_completed.load(Ordering::Relaxed), 0);
 }

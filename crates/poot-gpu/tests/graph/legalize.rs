@@ -2,7 +2,7 @@
 //! through `compile` (the real graph-to-program entry point) and executed on real wgpu hardware, not a
 //! bare `legalize` call and not a CPU-only check. The host outcome's real-hardware evidence is
 //! `poot-llm/tests/coherence.rs`'s `qwen2_7b_host_embed_serves_on_wgpu` (a real qwen2.5-7b model through
-//! the actual production path, `Runner::generate_kv_gpu_packed`); split has no production model yet
+//! the actual production path, the driver's packed device generate); split has no production model yet
 //! (a restored capability, same as before this card touched it), so this drives
 //! `compile` directly on a small synthetic oversized weight instead.
 
@@ -38,10 +38,7 @@ fn compile_split_matmul_matches_cpu_on_real_wgpu_hardware() {
             ..target.caps
         },
     };
-    let options = CompileOptions {
-        execution: Submission::Replay,
-        limits: poot_graph_plan::CompileLimits::STANDARD,
-    };
+    let options = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
     let program =
         compile(&g, &split_target, &options).expect("an oversized matmul weight always splits");
     let gh = program.graph();

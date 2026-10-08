@@ -13,7 +13,8 @@ use poot_graph_ir::ops::{
     AttentionKeys, attention_live, attention_masked_softcap, causal_mask_from_pos,
 };
 use poot_graph_ir::{
-    Builder, Graph, Slot, TensorType, ValidationId, ValidationOutput, ValidationOutputs, ValueId,
+    Builder, Graph, Slot, TensorType, Traced, ValidationId, ValidationOutput, ValidationOutputs,
+    ValueId,
 };
 use poot_tensor::{DType, HostTensor};
 
@@ -32,6 +33,19 @@ pub struct LiveAttentionFixture {
     /// `Some(s)`: the key is `k_head [.., dk - s]` plus `k_shared [B,1,Lk,s]`.
     pub shared_dim: Option<usize>,
     pub softcap: Option<f32>,
+    /// The dtype the attention computes in. The operands and the output stay F32 so every executor binds and
+    /// reads them the same way: a narrow fixture narrows each operand (and the mask) with a `Cast` first and
+    /// widens the output back, so the composite itself runs at `dtype`.
+    pub dtype: DType,
+}
+
+/// `x` at `dtype`: itself when it already is, else a `Cast`.
+fn cast_to(b: &Builder, x: Traced, dtype: DType) -> Traced {
+    if b.aval(x).dtype == dtype {
+        x
+    } else {
+        b.cast(x, dtype)
+    }
 }
 
 /// The built graph and the value ids its operands bind to.
@@ -61,6 +75,7 @@ impl LiveAttentionFixture {
             dv,
             shared_dim,
             softcap,
+            dtype,
         } = *self;
         let b = Builder::new();
         let q = b.constant("q", TensorType::f32(vec![batch, hq, 1, dk]));
@@ -70,18 +85,32 @@ impl LiveAttentionFixture {
         let k = b.constant("k", TensorType::f32(vec![batch, hkv, cap, head_dim]));
         let shared = shared_dim
             .map(|width| b.constant("k_shared", TensorType::f32(vec![batch, 1, cap, width])));
+        let narrow = |x| cast_to(&b, x, dtype);
         let keys = match shared {
-            Some(shared) => AttentionKeys::Split { head: k, shared },
-            None => AttentionKeys::Single(k),
+            Some(shared) => AttentionKeys::Split {
+                head: narrow(k),
+                shared: narrow(shared),
+            },
+            None => AttentionKeys::Single(narrow(k)),
         };
-        let mask = causal_mask_from_pos(&b, pos, cap, None);
+        let mask = narrow(causal_mask_from_pos(&b, pos, cap, None));
         let len = b.binary_scalar(
             poot_graph_ir::BinOp::Add,
             b.reshape(pos, vec![batch]),
             poot_graph_ir::Scalar::I32(1),
         );
-        let live = attention_live(&b, q, keys, v, hq / hkv, self.scale(), mask, softcap, len)
-            .expect("the live composite builds");
+        let live = attention_live(
+            &b,
+            narrow(q),
+            keys,
+            narrow(v),
+            hq / hkv,
+            self.scale(),
+            mask,
+            softcap,
+            len,
+        )
+        .expect("the live composite builds");
         let validations = if validated {
             vec![ValidationOutput {
                 id: ValidationId(1),
@@ -91,7 +120,8 @@ impl LiveAttentionFixture {
         } else {
             Vec::new()
         };
-        let graph = b.finish(live.out).with_validations(validations);
+        let out = cast_to(&b, live.out, DType::F32);
+        let graph = b.finish(out).with_validations(validations);
         graph
             .validate()
             .expect("the live composite is a valid graph");
@@ -169,6 +199,7 @@ impl LiveAttentionFixture {
             dv,
             shared_dim,
             softcap,
+            dtype,
             ..
         } = *self;
         let head_dim = dk - shared_dim.unwrap_or(0);
@@ -197,8 +228,17 @@ impl LiveAttentionFixture {
             let ki = g.constant("k", TensorType::f32(vec![1, hkv, n, dk]));
             let vi = g.constant("v", TensorType::f32(vec![1, hkv, n, dv]));
             let mi = g.constant("mask", TensorType::f32(vec![1, 1, 1, n]));
-            let attended =
-                attention_masked_softcap(&g, qi, ki, vi, hq / hkv, self.scale(), mi, softcap);
+            let attended = attention_masked_softcap(
+                &g,
+                cast_to(&g, qi, dtype),
+                cast_to(&g, ki, dtype),
+                cast_to(&g, vi, dtype),
+                hq / hkv,
+                self.scale(),
+                cast_to(&g, mi, dtype),
+                softcap,
+            );
+            let attended = cast_to(&g, attended, DType::F32);
             let graph = g.finish(attended);
             let bound = HashMap::from([
                 (

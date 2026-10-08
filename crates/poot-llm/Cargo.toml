@@ -31,8 +31,8 @@ base64.workspace = true
 # Blocking HTTP(S) image loading for the Qwen2.5-VL chat constructor. Rustls avoids a platform TLS
 # dependency; response bytes are bounded before decode.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
-# Binaries only: the `cli` feature turns it on and the two bins that use it require that feature.
-# The library's own API is `thiserror` types throughout (`RunnerError`, `driver::error::DriverError`).
+# Binaries only: the `cli` feature turns it on and the three bins that use it require that feature.
+# The library's own API is `thiserror` types throughout (`TextError`, `driver::error::DriverError`).
 anyhow = { workspace = true, optional = true }
 thiserror.workspace = true
 tracing.workspace = true
@@ -40,11 +40,12 @@ tracing-subscriber = { workspace = true, optional = true }
 # Production code (`components/exact_partition.rs`) builds Card 360 placement/communication rows, so this
 # is a regular dependency.
 poot-graph-plan.workspace = true
-# Card 540b: the Runner's loader reads checkpoints into a `poot_quant::weights::WeightStore` (bytes as
-# stored, ADR-0103) instead of a widened f32 `SafeTensors` decode.
+# The checkpoint's weights as stored (ADR-0103): a `poot_quant::weights::WeightStore`, never a widened f32 decode.
 poot-quant.workspace = true
-# Card 546a: the Runner's consumer of the backend-neutral executor contract (`Runner::load_on`).
+# The backend-neutral executor contract the driver runs on.
 poot-executor.workspace = true
+# The planning device (`driver::capacity`) implements `Device` over the runtime memory counters.
+poot-runtime-common.workspace = true
 bytemuck.workspace = true
 # bin/ptx-graph-check's --precompile mode (card 549): compiles graphs through the shared
 # poot_graph_plan::compile plus one poot_codegen::KernelCache, with no CUDA context.
@@ -56,12 +57,6 @@ poot-kernel-ir.workspace = true
 # The examples (`examples/`) are binaries and use it directly.
 anyhow.workspace = true
 poot-test-util = { workspace = true, features = ["graph-fixtures"] }
-# ADR-0113: this crate's own loader tests (`architectures/{nemotron_h,deepseek32}_load.rs`'s
-# `#[cfg(test)]` modules, `checkpoint/gguf/tests/{bf16,f16}_loader_tests.rs`,
-# `core/runner/tests/lm_head_drain_tests.rs`) call `poot_load::safetensors::load_weight_store_bytes`
-# directly, gated behind `test-support` in poot-load.
-poot-load = { workspace = true, features = ["test-support"] }
-poot-runtime-common.workspace = true
 # The dense family fixtures (`poot_executor_parity::dense`): the graphs the plan and equivalence tests trace.
 poot-executor-parity.workspace = true
 # `AmdArch` (poot-codegen) for a CPU-only `#[cfg(feature = "rocm")]` test that classifies prefill-graph
@@ -78,7 +73,7 @@ poot-rocm-runtime.workspace = true
 poot-profile.workspace = true
 
 [features]
-# `anyhow` and `tracing-subscriber` for the `qwen2-generate` and `poot-caption` binaries (a bin cannot carry its
+# `anyhow` and `tracing-subscriber` for the `qwen2-generate`, `poot-caption` and `poot-embed` binaries (a bin cannot carry its
 # own dependency).
 cli = ["dep:anyhow", "dep:tracing-subscriber"]
 # ROCm/HSA GPU path.
@@ -96,6 +91,11 @@ required-features = ["cli"]
 [[bin]]
 name = "poot-caption"
 path = "src/bin/caption.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "poot-embed"
+path = "src/bin/embed.rs"
 required-features = ["cli"]
 
 [[bin]]

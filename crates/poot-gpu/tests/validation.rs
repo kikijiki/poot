@@ -22,6 +22,7 @@ use poot_graph_plan::{
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::DType;
 use poot_tensor::HostTensor;
+use poot_test_util::const_weights::ConstWeights;
 
 fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
     static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -40,10 +41,7 @@ fn staged(g: &Graph<ValidationOutputs>, target: Target) -> StagedProgram<Validat
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions {
-            execution: Submission::Replay,
-            limits: poot_graph_plan::CompileLimits::STANDARD,
-        },
+        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect("compile the validation graph")
 }
@@ -227,11 +225,10 @@ fn wgpu_validation_ge_ieee_edges_match_cpu() {
         .output
         .into_host()
         .unwrap();
-    let program = staged(&passing, target);
     let (store, slot_binds) = split_consts_and_slots(&passing, &inputs);
-    let exe = exec
-        .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (bound, map) = ConstWeights::bind(&passing, &store);
+    let program = staged(&bound, target);
+    let exe = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
     let entry = exec.add_entry(exe, &program).unwrap();
     let step_in = step_inputs(&slot_binds);
     let observed = f32_bytes(
@@ -265,11 +262,10 @@ fn wgpu_validation_ge_ieee_edges_match_cpu() {
     .unwrap();
     let inputs: HashMap<ValueId, Value> =
         HashMap::from([(x.id, HostTensor::f32(vec![8], edges).into())]);
-    let program = staged(&failing, target);
     let (store, slot_binds) = split_consts_and_slots(&failing, &inputs);
-    let exe = exec
-        .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (bound, map) = ConstWeights::bind(&failing, &store);
+    let program = staged(&bound, target);
+    let exe = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
     let entry = exec.add_entry(exe, &program).unwrap();
     let step_in = step_inputs(&slot_binds);
     let result = exec.step(exe, entry, &step_in, &mut NoSync);
@@ -306,11 +302,10 @@ fn wgpu_validation_view_source_is_materialized() {
         HashMap::from([(x.id, HostTensor::f32(vec![2, 4], data).into())]);
     let expected = cpu_failure(&graph, &inputs);
     assert_eq!(expected.lane, 2, "flags[0][1] is transposed[1][0]");
-    let program = staged(&graph, target);
     let (store, slot_binds) = split_consts_and_slots(&graph, &inputs);
-    let exe = exec
-        .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (bound, map) = ConstWeights::bind(&graph, &store);
+    let program = staged(&bound, target);
+    let exe = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
     let entry = exec.add_entry(exe, &program).unwrap();
     let step_in = step_inputs(&slot_binds);
     let result = exec.step(exe, entry, &step_in, &mut NoSync);
@@ -358,10 +353,7 @@ fn wgpu_validation_prefill_refuses_noncanonical_witness_at_compile_staged() {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions {
-            execution: Submission::Replay,
-            limits: poot_graph_plan::CompileLimits::STANDARD,
-        },
+        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect_err("a noncanonical witness must be refused at compile_staged");
     match error {
@@ -432,8 +424,6 @@ fn wgpu_validation_prefill_rejects_a_failing_witness() {
     )
     .unwrap();
 
-    let program = staged(&graph, target);
-
     // Executable 1: seeded from zero, finite input, must publish and must let the state probe read
     // back the advanced state.
     let step: HashMap<ValueId, Value> = HashMap::from([(
@@ -441,9 +431,9 @@ fn wgpu_validation_prefill_rejects_a_failing_witness() {
         HostTensor::f32(vec![4], vec![1.0, 2.0, 3.0, 4.0]).into(),
     )]);
     let (store, slot_binds) = split_consts_and_slots(&graph, &step);
-    let exe1 = exec
-        .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (bound, map) = ConstWeights::bind(&graph, &store);
+    let program = staged(&bound, target);
+    let exe1 = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
     let entry1 = exec.add_entry(exe1, &program).unwrap();
     let step_in = step_inputs(&slot_binds);
     let published = f32_bytes(
@@ -476,9 +466,8 @@ fn wgpu_validation_prefill_rejects_a_failing_witness() {
         HostTensor::f32(vec![4], vec![0.0, 0.0, f32::NAN, 0.0]).into(),
     )]);
     let (store, slot_binds) = split_consts_and_slots(&graph, &poisoned);
-    let exe2 = exec
-        .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (_, map) = ConstWeights::bind(&graph, &store);
+    let exe2 = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
     let entry2 = exec.add_entry(exe2, &program).unwrap();
     let step_in = step_inputs(&slot_binds);
     let result = exec.step(exe2, entry2, &step_in, &mut NoSync);
@@ -518,11 +507,10 @@ fn wgpu_validation_plan_uses_prepared_graph_ids() {
     data[4] = f32::NAN;
     let inputs: HashMap<ValueId, Value> =
         HashMap::from([(x.id, HostTensor::f32(vec![8], data).into())]);
-    let program = staged(&graph, target);
     let (store, slot_binds) = split_consts_and_slots(&graph, &inputs);
-    let exe = exec
-        .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (bound, map) = ConstWeights::bind(&graph, &store);
+    let program = staged(&bound, target);
+    let exe = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
     let entry = exec.add_entry(exe, &program).unwrap();
     let step_in = step_inputs(&slot_binds);
     let result = exec.step(exe, entry, &step_in, &mut NoSync);
@@ -531,30 +519,8 @@ fn wgpu_validation_plan_uses_prepared_graph_ids() {
 
 // ---- live-capacity attention (POOT-730) ------------------------------------------------------------
 
-use poot_test_util::live_attention::{Inputs, LiveAttentionFixture, LiveAttentionGraph};
-
-/// One step of the live-attention decode through the executor contract, validation channel included: the
-/// output when the packet passes, the contract's error when it does not.
-fn live_attention_step(
-    exec: &mut dyn Executor,
-    target: Target,
-    built: &LiveAttentionGraph,
-    inputs: &Inputs,
-) -> Result<Vec<f32>, ExecError> {
-    let program = staged(&built.graph, target);
-    let (store, slot_binds) = split_consts_and_slots(&built.graph, &inputs.values());
-    let exe = exec
-        .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
-        .unwrap();
-    let entry = exec.add_entry(exe, &program).unwrap();
-    let step_in = step_inputs(&slot_binds);
-    let result = exec
-        .step(exe, entry, &step_in, &mut NoSync)
-        .map(|mut output| f32_bytes(&output.read().unwrap()));
-    exec.remove_entry(exe, entry).unwrap();
-    exec.unload(exe).unwrap();
-    result
-}
+use poot_executor_parity::live_attention::live_step;
+use poot_test_util::live_attention::LiveAttentionFixture;
 
 fn assert_within(label: &str, got: &[f32], want: &[f32], tolerance: f32) {
     assert_eq!(got.len(), want.len(), "{label}");
@@ -590,6 +556,7 @@ fn wgpu_live_attention_never_reads_the_poisoned_tail() {
         dv: 64,
         shared_dim: None,
         softcap: None,
+        dtype: DType::F32,
     };
     let built = fixture.build(true);
     let inputs = fixture.inputs(&built, &[64], true);
@@ -605,8 +572,7 @@ fn wgpu_live_attention_never_reads_the_poisoned_tail() {
         planned_live,
         "the plan bounds the attention loop by the live length"
     );
-    let got =
-        live_attention_step(&mut *exec, target, &built, &inputs).expect("a valid length publishes");
+    let got = live_step(&mut *exec, target, &built, &inputs).expect("a valid length publishes");
     assert!(
         got.iter().all(|x| x.is_finite()),
         "poison reached the output: {got:?}"
@@ -627,6 +593,60 @@ fn wgpu_live_attention_never_reads_the_poisoned_tail() {
         &fixture.oracle(&inputs, &built, &[64]),
         1e-4,
     );
+}
+
+/// POOT-1041 on wgpu: a BF16 or F16 live-attention graph is refused at planning with the typed `DtypeLowering`
+/// on its `Select`, never run through a kernel that reads the two-byte lanes as something else: SPIR-V has no
+/// native two-byte lane to move. The compile happens against the real device's target. Mutation: drop the
+/// SPIR-V exclusion from the two-byte arm of the `Select` planning (`planner/elementwise.rs`); the plan
+/// succeeds and this row goes red.
+#[test]
+fn wgpu_live_attention_two_byte_branches_are_a_typed_refusal() {
+    let _gpu_guard = gpu_lock();
+    let Some(device) =
+        poot_test_util::device_skip::open_or_skip(DeviceBackend::Wgpu, WgpuDevice::new())
+    else {
+        return;
+    };
+    let target = device.target();
+    for dtype in [DType::BF16, DType::F16] {
+        let fixture = LiveAttentionFixture {
+            batch: 1,
+            hq: 2,
+            hkv: 1,
+            cap: 9,
+            dk: 8,
+            dv: 8,
+            shared_dim: None,
+            softcap: None,
+            dtype,
+        };
+        let built = fixture.build(true);
+        let refused = compile_staged(
+            &built.graph,
+            &TargetSet::single(DeviceId(0), target),
+            &Partition {
+                experts: ExpertPlacement::AllResident,
+                devices: DevicePlacement::Single(DeviceId(0)),
+            },
+            &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+        );
+        let Err(StagedCompileError::Compile(CompileError::Plan(error))) = refused else {
+            panic!("{dtype:?}: the two-byte select must be refused, got {refused:?}");
+        };
+        let PlanError::Refused(refusal) = *error else {
+            panic!("{dtype:?}: expected a typed refusal, got {error:?}");
+        };
+        assert_eq!(
+            refusal.missing,
+            poot_graph_plan::Capability::DtypeLowering,
+            "{dtype:?}"
+        );
+        assert!(
+            matches!(refusal.op, poot_graph_ir::OpKind::Select),
+            "{dtype:?}: {refusal:?}"
+        );
+    }
 }
 
 /// SC-004 on wgpu: lengths 0, -1 and capacity + 1 fail through the validation packet exactly as the CPU oracle
@@ -651,11 +671,12 @@ fn wgpu_live_attention_rejects_an_out_of_range_length_and_runs_the_endpoints() {
         dv: 8,
         shared_dim: None,
         softcap: Some(30.0),
+        dtype: DType::F32,
     };
     let built = fixture.build(true);
     for len in [0, -1, 10] {
         let inputs = fixture.inputs(&built, &[len], false);
-        let result = live_attention_step(&mut *exec, target, &built, &inputs);
+        let result = live_step(&mut *exec, target, &built, &inputs);
         assert_eq!(
             contract_failure(result),
             cpu_failure(&built.graph, &inputs.values()),
@@ -664,7 +685,7 @@ fn wgpu_live_attention_rejects_an_out_of_range_length_and_runs_the_endpoints() {
     }
     for len in [1, 9] {
         let inputs = fixture.inputs(&built, &[len], true);
-        let got = live_attention_step(&mut *exec, target, &built, &inputs)
+        let got = live_step(&mut *exec, target, &built, &inputs)
             .unwrap_or_else(|e| panic!("len {len}: {e:?}"));
         assert_within(
             &format!("len {len}"),
@@ -699,6 +720,7 @@ fn wgpu_live_attention_declined_graph_runs_as_primitives() {
         dv: 8,
         shared_dim: None,
         softcap: None,
+        dtype: DType::F32,
     };
     let built = fixture.build(false);
     let inputs = fixture.inputs(&built, &[5], true);
@@ -717,7 +739,7 @@ fn wgpu_live_attention_declined_graph_runs_as_primitives() {
         !planned_attention,
         "the unproved graph stays generic primitives"
     );
-    let got = live_attention_step(&mut *exec, target, &built, &inputs)
+    let got = live_step(&mut *exec, target, &built, &inputs)
         .expect("a declined graph runs on the device");
     assert!(
         got.iter().all(|x| x.is_finite()),

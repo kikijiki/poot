@@ -1,7 +1,54 @@
 //! Matmul and contraction-epilogue matmul planning, including the choice of the synthesized tiled GEMM.
 
 use super::*;
+use poot_graph_ir::ContractionRows;
 use poot_target::{Backend, DeviceCaps};
+
+/// The launch of a `Tiled` contraction of `tiles` workgroups of `tile * tile` threads: the tiles laid out on the X
+/// extent, or, above `caps.max_grid[0]`, folded onto a 2-D `(x_groups, y_groups)` grid the body reconstructs as
+/// `gy * x_groups + gx` (`x_groups` rides in the kernel's metadata). Beyond `caps.max_grid[1]` too, or on any
+/// `usize -> u32` overflow, a typed refusal naming the equation, before any dispatch: `finalize`'s generic
+/// workgroup bump never touches a tiled body (it would corrupt the fixed-size LDS tile).
+pub(super) struct FoldedTileGrid {
+    /// The X extent in tiles; the metadata word the body reads.
+    pub(super) x_groups: u32,
+    /// The dispatch grid in threads.
+    pub(super) grid: [u32; 3],
+}
+
+pub(super) fn folded_tile_grid(
+    site: Site<'_>,
+    tiles: usize,
+    tile: usize,
+    caps: &DeviceCaps,
+) -> Result<FoldedTileGrid, PlanError> {
+    let overflow = || site.refuse(Capability::DispatchSizeOverflow);
+    let width = tile * tile;
+    let tiles_u32 = u32::try_from(tiles).map_err(|_| overflow())?;
+    let limit_x = caps.max_grid[0].max(1);
+    let (x_groups, y_groups) = if tiles_u32 <= limit_x {
+        (tiles_u32, 1)
+    } else {
+        let y_groups = tiles_u32.div_ceil(limit_x);
+        if y_groups > caps.max_grid[1] {
+            return Err(site.refuse(Capability::DispatchGridLimit {
+                threads: tiles.saturating_mul(width),
+                workgroups_x: tiles,
+                workgroup_width: width,
+                limit: limit_x as usize,
+            }));
+        }
+        (limit_x, y_groups)
+    };
+    let threads_x = u32::try_from(width)
+        .ok()
+        .and_then(|width| x_groups.checked_mul(width))
+        .ok_or_else(overflow)?;
+    Ok(FoldedTileGrid {
+        x_groups,
+        grid: [threads_x, y_groups, 1],
+    })
+}
 
 /// How a plain `MatMul` is lowered. The one decision [`plan`] and the contraction-epilogue fuse rule
 /// ([`epilogue_head_lowers`]) share, so a head fuses exactly when the serial kernel is its plan anyway.
@@ -9,8 +56,9 @@ use poot_target::{Backend, DeviceCaps};
 pub(super) enum MatMulRoute {
     /// The generated tiled GEMM (`kg::tiled_region`) over an f32 `[K, N]` weight.
     Tileable,
-    /// The decode GEMV (`M == 1`, rank-2 `[K, N]` weight); `bf16_weight` selects the packed-BF16 body.
-    DecodeGemv { bf16_weight: bool },
+    /// The decode GEMV (`M == 1`, rank-2 `[K, N]` f32 weight). A BF16 `[K, N]` weight lands here too and is
+    /// refused by the mixed-dtype guard in `plan_eqn`: its only lowering is the dense Gemv over `[N, K]`.
+    DecodeGemv,
     /// RDNA3 WMMA tensor cores (bf16 operands, 16-aligned dims).
     AmdTensorCore,
     /// NVPTX WMMA tensor cores.
@@ -31,14 +79,12 @@ pub(super) enum MatMulRoute {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct RoutedMatMul {
     pub(super) route: MatMulRoute,
-    /// A mixed operand and output dtype pairing lowers only through the tensor-core kernels, the coopmat
-    /// kernel and the BF16 decode GEMV.
+    /// A mixed operand and output dtype pairing lowers only through the tensor-core kernels and the coopmat
+    /// kernel.
     pub(super) lowers_mixed_dtypes: bool,
 }
 
-/// Choose `eqn`'s `MatMul` route. Reads whether the compile is `guarded` (the target has the routed-expert
-/// hang and the graph a routed-expert site): a guarded compile keeps a matmul off the generated tiled GEMM (cards 186/192: the tiled GEMM hung ROCm/AMDGCN on a routed-expert
-/// router `MatMul`).
+/// Choose `eqn`'s `MatMul` route.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn matmul_route(
     g: GraphTables<'_>,
@@ -48,14 +94,13 @@ pub(super) fn matmul_route(
     backend: Backend,
     odt: DType,
     caps: &DeviceCaps,
-    guarded: bool,
 ) -> RoutedMatMul {
     let ids = value_ids(eqn);
     let tileable = RoutedMatMul {
         route: MatMulRoute::Tileable,
         lowers_mixed_dtypes: false,
     };
-    if !guarded && is_tileable_matmul_in(g, eqn) {
+    if is_tileable_matmul_in(g, eqn) {
         return tileable;
     }
     let a = g.aval(ids[0]).shape.clone();
@@ -87,25 +132,9 @@ pub(super) fn matmul_route(
     // output only (config 13 has no f16-accumulate variant).
     let coopmat =
         odt == DType::F32 && matmul_spirv_coopmat_eligible(backend, a_dt, b_dt, mm, nn, kk);
-    // Decode bf16 GEMV (dtype-driven, sibling of the tensor-core arms): F32 act x BF16 weight
-    // at M==1 plans the packed-u32 in-kernel-widen body instead of being rejected or cast.
-    let bf16_gemv = matmul_bf16_decode_gemv_eligible(
-        backend,
-        a_dt,
-        b_dt,
-        odt,
-        mm,
-        nn,
-        kk,
-        g.aval(ids[1]).shape.len(),
-        out_numel,
-        caps,
-    );
-    let lowers_mixed_dtypes = amd_tc || tc || coopmat || bf16_gemv;
+    let lowers_mixed_dtypes = amd_tc || tc || coopmat;
     let route = if is_decode_gemv_in(g, backend, eqn, out_shape, out_numel, caps) {
-        MatMulRoute::DecodeGemv {
-            bf16_weight: bf16_gemv,
-        }
+        MatMulRoute::DecodeGemv
     } else if amd_tc {
         MatMulRoute::AmdTensorCore
     } else if tc {
@@ -127,9 +156,8 @@ pub(super) fn matmul_route(
     }
 }
 
-/// Whether `eqn`, a contraction head, has an epilogue lowering that is also the plan it would get without one,
-/// in a compile that is not guarded (the only one that fuses): the epilogue fuse rule forms a
-/// [`OpKind::ContractionEpilogue`] only over such a head, so no head loses a faster schedule (a tensor-core,
+/// Whether `eqn`, a contraction head, has an epilogue lowering that is also the plan it would get without one:
+/// the epilogue fuse rule forms a [`OpKind::ContractionEpilogue`] only over such a head, so no head loses a faster schedule (a tensor-core,
 /// tiled or decode-GEMV `MatMul`) to gain a fused store. The generated Gemv, serial and tiled bodies carry an
 /// epilogue; a `MatMul` head's fragment, GEMV and imported schedules do not.
 pub(crate) fn epilogue_head_lowers<V: ValidationChannel>(
@@ -153,7 +181,6 @@ pub(crate) fn epilogue_head_lowers<V: ValidationChannel>(
                         backend,
                         g.aval(eqn.out).dtype,
                         caps,
-                        false,
                     )
                     .route,
                     MatMulRoute::Tileable | MatMulRoute::Serial
@@ -164,8 +191,8 @@ pub(crate) fn epilogue_head_lowers<V: ValidationChannel>(
         OpKind::DenseContraction { .. } => true,
         // Every indexed schedule (Gemv and segmented Tiled) carries an epilogue.
         OpKind::IndexedMatMul => indexed_matmul_lowers(tables, eqn),
-        // The packed Gemv (one activation row per block) carries an epilogue; the tiled schedule does not.
-        OpKind::PackedContraction { descriptor, blocks } => {
+        // The packed Gemv (one activation row per block) carries an epilogue; the block-diagonal tiled schedule does not.
+        OpKind::PackedContraction { descriptor, rows } => {
             crate::packed_block_float::admit_packed(
                 crate::packed_block_float::PACKED_LOWERING,
                 *descriptor,
@@ -173,7 +200,13 @@ pub(crate) fn epilogue_head_lowers<V: ValidationChannel>(
                 backend,
             )
             .is_ok()
-                && packed_contraction_m_per_block(tables, eqn, *descriptor, *blocks) == 1
+                && match rows {
+                    ContractionRows::Blocks(blocks) => {
+                        packed_contraction_m_per_block(tables, eqn, *descriptor, *blocks) == 1
+                    }
+                    // An indexed table carries an epilogue on both its schedules (Gemv and segmented Tiled).
+                    ContractionRows::Indexed { .. } => true,
+                }
         }
         _ => false,
     }
@@ -269,7 +302,6 @@ pub(super) fn plan(
     odt: DType,
     caps: &DeviceCaps,
     limits: BodyLimits,
-    guarded: bool,
     packed_operands: &[bool],
 ) -> Result<Planned, PlanError> {
     let site = Site::new(g, eqn, backend, limits);
@@ -282,7 +314,7 @@ pub(super) fn plan(
             let (a, b) = (shape(ids[0]), shape(ids[1]));
             let r = out_shape.len();
             let (nn, kk) = (out_shape[r - 1], a[a.len() - 1]);
-            let routed = matmul_route(g, eqn, out_shape, out_numel, backend, odt, caps, guarded);
+            let routed = matmul_route(g, eqn, out_shape, out_numel, backend, odt, caps);
             let shapes = || MatmulShapes {
                 out_shape: out_shape.to_vec(),
                 a_shape: a.clone(),
@@ -314,8 +346,7 @@ pub(super) fn plan(
             {
                 // Mixed operand and output dtypes lower only through the tensor-core kernels (bf16
                 // operands, 16-aligned M/N/K, RDNA3 or NVPTX), the SPIR-V coopmat kernel (f16 operands,
-                // 16-aligned M/N/K) or the BF16 decode GEMV (F32xB16 -> F32 at M == 1 under the
-                // chunk trigger).
+                // 16-aligned M/N/K). A BF16 `[K, N]` decode projection has no lowering and lands here.
                 return Err(site.refuse(Capability::DtypeLowering));
             }
             match routed.route {
@@ -340,7 +371,7 @@ pub(super) fn plan(
                         caps,
                     )?
                 }
-                MatMulRoute::DecodeGemv { bf16_weight } => {
+                MatMulRoute::DecodeGemv => {
                     // wgpu decode GEMV (M=1 shared-weight matmul, single-seq or batched): the coalesced
                     // imported body - one workgroup owns GEMV_TILE output columns and reads
                     // W[k, col0:col0+TILE] contiguously per k (card 035 raised occupancy with a strided
@@ -357,7 +388,7 @@ pub(super) fn plan(
                     // (SpirvVulkan only); see its doc comment - that arm still generates a `GemvChunk`
                     // (one workgroup per output element), the shape gate that keeps the old stride-N
                     // access pattern.
-                    decode_gemv_plan(site, backend, kk, nn, out_numel, bf16_weight, caps)?
+                    decode_gemv_plan(site, backend, kk, nn, out_numel, caps)?
                 }
                 MatMulRoute::AmdTensorCore => {
                     // The tensor-core body bakes one block (8 warps, 256 threads) per 16x16 output tile.
@@ -459,7 +490,7 @@ pub(super) fn plan(
                 odt,
                 packed_operands,
             )?;
-            if !guarded && is_tileable_matmul_in(g, eqn) {
+            if is_tileable_matmul_in(g, eqn) {
                 // The route `matmul_route` gives the unfused head: the generated tiled GEMM, storing the
                 // epilogue's result per output element.
                 let (a, nn) = (shape(ids[0]), out_shape[out_shape.len() - 1]);
@@ -496,6 +527,7 @@ pub(super) fn plan(
         | moe_ops!()
         | elementwise_ops!()
         | attention_ops!()
+        | scan_ops!()
         | cast_ops!()
         | movement_ops!()
         | sampling_ops!() => unreachable!("plan_eqn routes only matmul ops here"),

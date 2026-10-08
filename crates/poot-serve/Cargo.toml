@@ -1,6 +1,6 @@
 [package]
 name = "poot-serve"
-description = "A minimal OpenAI-compatible HTTP server over the poot Runner (the inference engine, end to end)"
+description = "A minimal OpenAI-compatible HTTP server over the poot driver"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -12,13 +12,14 @@ rust-version.workspace = true
 poot-llm.workspace = true
 # `ChatFormat` (the fallback chat format) lives with the model families.
 poot-models.workspace = true
-# Spec 248 phase 2 (epic 129 B8): `Slot::lora_adapter`'s `NO_ADAPTER` sentinel and the startup
-# adapter-registration path need `poot_load::lora` in production code.
-poot-load.workspace = true
+# The engine plan opens an executor, reads its targets and fits the workload to their memory.
+poot-executor.workspace = true
+poot-graph-plan.workspace = true
+poot-target.workspace = true
+clap.workspace = true
 anyhow.workspace = true
 ring.workspace = true
 subtle.workspace = true
-base64.workspace = true
 libc = "0.2"
 serde.workspace = true
 serde_json.workspace = true
@@ -29,6 +30,12 @@ thiserror.workspace = true
 
 [dev-dependencies]
 poot-test-util = { path = "../poot-test-util" }
+# The synthetic GGUF writer of the startup and handler fixtures (`tests/support/tiny_gguf.rs`).
+poot-load.workspace = true
+# The fixture device of the engine-plan rows counts allocations the way a runtime does.
+poot-runtime-common.workspace = true
+poot-quant.workspace = true
+poot-graph-ir.workspace = true
 
 [lints]
 workspace = true

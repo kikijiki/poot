@@ -9,7 +9,7 @@ use poot_kernelgen::{KernelRequirements, SerialWork};
 use poot_target::{Backend, BufferStorage, DeviceCaps};
 
 use crate::device_validation::validate_kernel_resources;
-use crate::imported::SerialLoop;
+use crate::imported::{SAMPLER_LANES, SerialLoop};
 use crate::*;
 
 /// A region-local id -> a fused-kernel operand: `< n_inputs` is a leaf, otherwise a prior step.
@@ -221,6 +221,11 @@ fn choice_requirements(
             let serial_work = match needs.serial {
                 SerialLoop::None => None,
                 SerialLoop::ContractionDepth => dim(0, 1).map(|k| (out_numel, k as u64)),
+                SerialLoop::RowVocab { passes } => dim(0, 1).map(|vocab| {
+                    // `[rows, 2]` output: one workgroup of lanes per row.
+                    let lanes = (out_numel / 2) * SAMPLER_LANES;
+                    (lanes, passes * (vocab as u64).div_ceil(SAMPLER_LANES))
+                }),
             };
             KernelRequirements {
                 subgroup_lanes: needs.subgroup_lanes,
@@ -306,6 +311,7 @@ fn shape_launch(
             eqn.op,
             OpKind::FusedRow(_)
             | OpKind::Attention(_)
+            | OpKind::Scan(_)
             // Card 551a: every SampleToken body is one fixed-64-lane workgroup per row (the LDS
             // reduce arrays are sized for exactly 64 lanes); the generic bump below would silently
             // corrupt that reduction by redispatching at workgroup_size[0] = 256.

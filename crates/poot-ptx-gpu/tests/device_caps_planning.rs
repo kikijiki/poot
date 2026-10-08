@@ -53,10 +53,7 @@ fn a_live_device_reports_caps_the_fragment_kernel_plans_against() {
     let mut graph = b.finish(out);
     let out = graph.output;
     graph.values[out].aval.dtype = DType::F32;
-    let options = CompileOptions {
-        execution: Submission::Replay,
-        limits: CompileLimits::STANDARD,
-    };
+    let options = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
     let program = compile(&graph, &target, &options)
         .unwrap_or_else(|error| panic!("the live caps must admit the fragment kernel: {error}"));
     let (eqn, _) = program
@@ -75,46 +72,28 @@ fn a_live_device_reports_caps_the_fragment_kernel_plans_against() {
     );
 }
 
-/// The routed-expert hang guard follows the live device's own caps: a graph with a routed-expert site
-/// compiled for `PtxDevice::target()` skips `fuse` (the device reports the hang through its caps, not a
-/// family test), and the same pointwise chain with no site still fuses. Runs on the PTX pod.
-///
-/// Mutation: build the live caps with `KnownMiscompiles::default()` in `poot-ptx-runtime`
-/// (`caps_from_attributes`); the guarded half fuses and this row goes red.
+/// POOT-1065: the PTX device reports the driver's live free memory (`cuMemGetInfo`), within the total it
+/// reported when it opened. Mutation: `free_memory_bytes` returns `None` and the first assertion goes
+/// red; returns `u64::MAX` and the ceiling assertion goes red.
 #[test]
-fn a_live_ptx_device_guards_a_routed_expert_graph() {
-    use poot_graph_ir::{BinOp, Builder, TensorType};
-    use poot_test_util::graph_fixtures::with_routed_expert_site;
-
+fn the_ptx_device_reports_live_free_memory_within_its_open_time_ceiling() {
     let Some(device) = open_or_skip(DeviceBackend::Ptx, PtxDevice::new()) else {
         return;
     };
-    let target = device.target();
+    let ceiling = device
+        .target()
+        .caps
+        .memory_budget_bytes
+        .expect("the PTX device queried its total memory at open");
+    let free = device
+        .free_memory_bytes()
+        .expect("the PTX device reports live free memory");
     assert!(
-        target.caps.known_miscompiles.routed_expert_tiling_hang,
-        "a live PTX device reports the routed-expert hang"
+        free > 0,
+        "a device with no free memory cannot run this test"
     );
-    let chain = || {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![4, 8]));
-        let y = b.constant("y", TensorType::f32(vec![4, 8]));
-        let sum = b.binary(BinOp::Add, x, y);
-        let out = b.binary(BinOp::Mul, sum, y);
-        b.finish(out)
-    };
-    let options = CompileOptions {
-        execution: Submission::Replay,
-        limits: CompileLimits::STANDARD,
-    };
-    let ran_fuse = |graph: &poot_graph_ir::Graph| {
-        compile(graph, &target, &options)
-            .expect("the chain compiles")
-            .passes()
-            .any(|pass| pass == "fuse")
-    };
     assert!(
-        !ran_fuse(&with_routed_expert_site(chain())),
-        "a routed-expert graph must not fuse on the live PTX device"
+        free <= ceiling,
+        "free {free} is over the open-time ceiling {ceiling}"
     );
-    assert!(ran_fuse(&chain()), "a graph with no site fuses");
 }

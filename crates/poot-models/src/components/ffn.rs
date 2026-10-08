@@ -58,6 +58,8 @@ pub enum Glu {
     /// gpt-oss's clamped swish GLU: `gate` clamped above at `limit`, `up` clamped to
     /// `[-limit, limit]`, then `gate * sigmoid(alpha * gate) * (up + 1)`.
     Clamped { alpha: f32, limit: f32 },
+    /// DeepSeek-V4's clamped SwiGLU: `silu(min(gate, limit)) * clamp(up, -limit, limit)`.
+    ClampedSilu { limit: f32 },
 }
 
 impl Glu {
@@ -70,6 +72,24 @@ impl Glu {
         }
         Ok(Self::Clamped { alpha, limit })
     }
+
+    /// The clamped SwiGLU with its `limit`, finite and positive.
+    pub fn clamped_silu(limit: f32) -> Result<Self, ParamError> {
+        if !limit.is_finite() || limit <= 0.0 {
+            return Err(ParamError::new(
+                "swiglu_limit",
+                ConfigReason::NotFinitePositive,
+            ));
+        }
+        Ok(Self::ClampedSilu { limit })
+    }
+}
+
+/// `min(x, limit)`: there is no Min or Clamp primitive, so `-max(-x, -limit)`.
+fn clamp_above(b: &Builder, x: Traced, limit: f32) -> Traced {
+    let negated = b.unary(UnOp::Neg, x);
+    let capped = b.binary_scalar(BinOp::Max, negated, Scalar::F32(-limit));
+    b.unary(UnOp::Neg, capped)
 }
 
 /// `gate` and `up` (same shape) combined by `glu`.
@@ -77,15 +97,22 @@ pub fn glu(b: &Builder, gate: Traced, up: Traced, glu: &Glu) -> Traced {
     match *glu {
         Glu::Silu => ops::swiglu(b, gate, up),
         Glu::Gelu => ops::geglu(b, gate, up),
+        Glu::ClampedSilu { limit } => {
+            let gate = clamp_above(b, gate, limit);
+            let up = clamp_above(
+                b,
+                b.binary_scalar(BinOp::Max, up, Scalar::F32(-limit)),
+                limit,
+            );
+            ops::swiglu(b, gate, up)
+        }
         Glu::Clamped { alpha, limit } => {
-            // `min(x, c) = -max(-x, -c)`: there is no Min or Clamp primitive.
-            let below = |x: Traced| {
-                let negated = b.unary(UnOp::Neg, x);
-                let capped = b.binary_scalar(BinOp::Max, negated, Scalar::F32(-limit));
-                b.unary(UnOp::Neg, capped)
-            };
-            let gate = below(gate);
-            let up = below(b.binary_scalar(BinOp::Max, up, Scalar::F32(-limit)));
+            let gate = clamp_above(b, gate, limit);
+            let up = clamp_above(
+                b,
+                b.binary_scalar(BinOp::Max, up, Scalar::F32(-limit)),
+                limit,
+            );
             let swish = b.binary(
                 BinOp::Mul,
                 gate,
@@ -492,5 +519,55 @@ mod tests {
             p.perturb(id(role));
             oracle::assert_differs(&run(&p), &got, id(role));
         }
+    }
+
+    /// DeepSeek-V4's clamped SwiGLU against an f64 `silu(min(gate, limit)) * clamp(up, -limit,
+    /// limit)` over inputs reaching past the limit on both sides: the gate is clamped from above
+    /// only (a very negative gate is not clamped) and the up projection from both sides. Mutation:
+    /// clamp the gate on both sides, or the up projection from above only; red.
+    #[test]
+    fn clamped_silu_glu_matches_an_f64_reference() {
+        let limit = 3.0f32;
+        let n = 24;
+        let scaled = |seed| -> Vec<f32> {
+            oracle::random(n, seed)
+                .into_iter()
+                .map(|v| 16.0 * v)
+                .collect()
+        };
+        let (gate, up) = (scaled(31), scaled(32));
+        let run = |gate: &[f32], up: &[f32]| {
+            let b = Builder::new();
+            let g = b.constant("gate", TensorType::f32(vec![n]));
+            let u = b.constant("up", TensorType::f32(vec![n]));
+            let y = glu(&b, g, u, &Glu::clamped_silu(limit).unwrap());
+            Fx::new(1)
+                .eval(&b.finish(y), &[("gate", gate), ("up", up)], &[], &[])
+                .0
+        };
+        let limit = f64::from(limit);
+        let want: Vec<f64> = gate
+            .iter()
+            .zip(&up)
+            .map(|(&g, &u)| {
+                let g = f64::from(g).min(limit);
+                g / (1.0 + (-g).exp()) * f64::from(u).clamp(-limit, limit)
+            })
+            .collect();
+        oracle::assert_matches_f64(&run(&gate, &up), &want, 1e-5);
+        assert!(
+            gate.iter().any(|&g| f64::from(g) > limit)
+                && gate.iter().any(|&g| f64::from(g) < -limit)
+                && up.iter().any(|&u| f64::from(u) > limit)
+                && up.iter().any(|&u| f64::from(u) < -limit),
+            "the inputs must reach past the limit on both sides"
+        );
+        assert_eq!(
+            Glu::clamped_silu(0.0),
+            Err(ParamError::new(
+                "swiglu_limit",
+                ConfigReason::NotFinitePositive
+            ))
+        );
     }
 }

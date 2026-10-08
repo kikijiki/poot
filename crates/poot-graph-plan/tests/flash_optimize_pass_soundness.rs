@@ -363,7 +363,7 @@ const PIN_QWEN3: usize = 681;
 fn flash_default_cuts_prefill_dispatch_count() {
     // card 030/038: flash also collapses each prefill layer's attention chain to one
     // Attention op, so the prefill (TTFT) dispatch count drops. Validates the
-    // Runner::prefill_graph_cost path at a representative seq_len.
+    // driver's prefill graph cost path at a representative seq_len.
     use poot_graph_ir::analysis::dispatch_count;
     use poot_graph_ir::op::OpKind;
     use poot_graph_plan::{cse, flash_attention_capped, fuse};

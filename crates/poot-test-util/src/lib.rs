@@ -2,6 +2,7 @@
 //! fills and name-derived seeds, plain-Rust reference kernels, and small comparison helpers. Dev-dependency only.
 
 pub mod checkpoints;
+pub mod const_weights;
 pub mod device_caps;
 pub mod device_skip;
 #[cfg(feature = "graph-fixtures")]
@@ -9,12 +10,15 @@ pub mod graph_fixtures;
 mod hang_guard;
 #[cfg(feature = "graph-fixtures")]
 pub mod i32_slot_gather;
+#[cfg(feature = "graph-fixtures")]
+pub mod i32_table_gather;
 #[cfg(feature = "kernel-fixtures")]
 pub mod kernel_fixtures;
 #[cfg(feature = "graph-fixtures")]
 pub mod live_attention;
 pub mod packed;
 pub mod safetensors;
+pub mod scan;
 #[cfg(feature = "graph-fixtures")]
 pub mod weight_map_oracle;
 
@@ -372,10 +376,6 @@ pub fn seed_of(name: &str) -> u64 {
     name.bytes().fold(OFFSET_BASIS, |hash, byte| {
         (hash ^ u64::from(byte)).wrapping_mul(PRIME)
     })
-}
-
-pub fn silu_ref(v: f32) -> f32 {
-    v / (1.0 + (-v).exp())
 }
 
 pub fn http_request(

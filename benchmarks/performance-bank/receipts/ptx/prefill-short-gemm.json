@@ -1,0 +1,165 @@
+{
+  "backend": "ptx",
+  "case": "prefill-short-gemm",
+  "cells": {
+    "kernel": {
+      "repeats": [
+        {
+          "metrics": {
+            "step_us": 513.008
+          },
+          "slot": 0,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 514.528
+          },
+          "slot": 1,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 510.908
+          },
+          "slot": 2,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 518.418
+          },
+          "slot": 3,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 510.86800000000005
+          },
+          "slot": 4,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 517.798
+          },
+          "slot": 5,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 509.29800000000006
+          },
+          "slot": 6,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 511.8879999999999
+          },
+          "slot": 7,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 511.118
+          },
+          "slot": 8,
+          "status": "ok"
+        }
+      ]
+    }
+  },
+  "memory": [
+    {
+      "live_bytes": 17825792,
+      "peak_bytes": 17825792,
+      "role": "Weight"
+    },
+    {
+      "live_bytes": 1048576,
+      "peak_bytes": 1048576,
+      "role": "Activation"
+    }
+  ],
+  "observed": {
+    "layout": "kn",
+    "shape": {
+      "k": 2048,
+      "m": 128,
+      "n": 2048
+    },
+    "storage": "f32",
+    "weight_bytes_per_copy": 16777216,
+    "weight_copies": 1
+  },
+  "plan": [
+    "contraction:tiled_region [762749ac7ae466f1475fdf76aceb2a475e089e6ac2190aeaf7b89a5285adbbfc]"
+  ],
+  "plan_id": "e03e377a76b91fdb3fa894ac1a313e6673b3f571d79eea09e8978fb159b54b6a",
+  "recordings": 1,
+  "reference": {
+    "agrees": true,
+    "max_relative_error": 4.594810366423933e-05,
+    "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
+    "provenance": "independent-golden",
+    "tolerance": 0.002
+  },
+  "replays": 13,
+  "role": "baseline",
+  "schema": 1,
+  "command": [
+    "cargo",
+    "run",
+    "--release",
+    "-p",
+    "poot-ptx-gpu",
+    "--example",
+    "performance_bank",
+    "--",
+    "--bank",
+    "benchmarks/performance-bank/cases.json",
+    "--case",
+    "prefill-short-gemm",
+    "--out",
+    "benchmarks/performance-bank/receipts/ptx/prefill-short-gemm.json"
+  ],
+  "parent_revision": "e178f51722183668cf2f554e21b0dca17d3b0caf",
+  "binary_sha256": "f03b4e410ae08055bb6182e107411087d132ac4ff8db8e61de347c3bb4c3eec1",
+  "identity": {
+    "checkpoint_digest": "synthetic-no-checkpoint",
+    "token_fixture": "splitmix64-seed0-unit:237900849bc67b83",
+    "precision": "f32",
+    "layout": "kn",
+    "dimensions": {
+      "m": 128,
+      "k": 2048,
+      "n": 2048
+    },
+    "prompt_tokens": 128,
+    "live_context": "n/a",
+    "max_context": "n/a",
+    "requested_output": "n/a",
+    "actual_output": "n/a",
+    "sampler": "n/a",
+    "template": "n/a",
+    "cache_state": {
+      "condition": "weights-resident-hot",
+      "id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb"
+    },
+    "prepared_set": [
+      "prefill-short-gemm"
+    ],
+    "timing_policy": {
+      "warmup": 3,
+      "repeats": 9,
+      "clock": "wall step plus readback",
+      "profiled": false
+    },
+    "backend": "ptx",
+    "device": "NVIDIA GeForce RTX 3090",
+    "driver": "driver 580.65.06"
+  },
+  "identity_digest": "020641a8fe55fee7ed27ea7c63d13eefebf6d1e5cf2e51a54626393ddcbec3dd",
+  "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77"
+}

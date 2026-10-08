@@ -172,6 +172,7 @@ impl Value {
             Value::Owner(ExactValue::Bf16(_)) => "Value::Owner(ExactValue::Bf16)",
             Value::Owner(ExactValue::I32(_)) => "Value::Owner(ExactValue::I32)",
             Value::Packed(_) => "Value::Packed",
+            Value::PackedStack(_) => "Value::PackedStack",
         }
     }
 }

@@ -2,25 +2,32 @@
 //!
 //! Tracers are storage-agnostic: they declare every weight as a logical dense constant (a projection
 //! `[K, out]` read by a matmul, an embedding table `[rows, K]` read by a gather, an expert stack
-//! `[E, K, out]` read by an indexed matmul). A checkpoint that stores some of those weights packed
-//! records, per constant name, which packed owners hold it ([`WeightFormats`]: from a `Model`'s
-//! `WeightMap` handles on the driver path ([`WeightFormats::from_weight_map`]), or
-//! derived by the Runner's loader from the payload descriptors it reads until the Runner is
-//! deleted). [`bind_packed_weights`] rewrites each such constant into the
-//! decode of its owners - `PackedDequant` over `descriptor.sources()` carrier constants named by
-//! [`PackedSourceName`], transposed for a projection, stacked for experts - producing the very value id
-//! the tracer declared, so every consumer is untouched (a biased projection is already `ops::linear`'s
-//! matmul then add, so the claim sees the product). Binding only places storage: the claims
-//! (`PackedContraction`, `PackedRowGather`, the W12 MoE chain) and the escape gate are `compile`'s
-//! (the CPU oracle claims explicitly in `poot-llm`'s `cpu_oracle`). A mismatch between what
-//! a tracer declared and what the checkpoint stores is a typed refusal, never a reinterpretation.
+//! `[E, out, K]` read through `Transpose([0, 2, 1])` by an indexed matmul). A checkpoint that stores some of
+//! those weights packed records, per constant name, which packed owner holds it ([`WeightFormats`], from a
+//! `Model`'s `WeightMap` handles on the driver path ([`WeightFormats::from_weight_map`])).
+//! [`bind_packed_weights`] rewrites each such constant into the decode of its owner - `PackedDequant` over
+//! `descriptor.sources()` carrier constants named by [`PackedSourceName`], transposed for a projection -
+//! producing the very value id the tracer declared, so every consumer is untouched (a biased projection is
+//! already `ops::linear`'s matmul then add, so the claim sees the product). Binding only places storage: the
+//! claims (`PackedContraction`, `PackedRowGather`) and the escape gate are `compile`'s (the CPU oracle claims
+//! explicitly in `poot-llm`'s `cpu_oracle`).
+//!
+//! An expert stack has no logical dense value to decode into (a decoded `[E, K, out]` table is exactly what
+//! packed serving must never build), so its consumer is rewritten instead: the one `IndexedMatMul` reading it
+//! through the transpose becomes one `PackedContraction { rows: Indexed }` over one stacked carrier per source
+//! role, and any other use of the stack is a typed refusal. A mismatch between what a tracer declared and what
+//! the checkpoint stores is a typed refusal, never a reinterpretation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
+use super::packed::packed_consumer_map;
 use super::*;
-use poot_graph_ir::packed_source::{PackedSourceName, packed_source_type};
+use poot_graph_ir::ContractionRows;
+use poot_graph_ir::packed_source::{
+    PackedSourceName, packed_source_type, packed_stack_source_constants,
+};
 use poot_graph_ir::types::TensorType;
-use poot_quant::weights::{HandleFormat, WeightMap};
+use poot_quant::weights::{HandleFormat, WeightMap, WeightView};
 use poot_tensor::DType;
 
 /// How a packed owner's logical `[out, K]` decode maps onto the constant a tracer declares.
@@ -30,20 +37,19 @@ pub enum PackedLayout {
     Rows,
     /// The constant is the decode transposed, `[K, out]` (a projection read by `x @ W`).
     Columns,
-    /// The constant is an expert stack `[E, K, out]`: one owner per expert, each decode transposed
-    /// and stacked along a new leading axis (read by an indexed/grouped matmul). One owner is a
-    /// one-expert stack, `[1, K, out]`.
-    StackedColumns,
+    /// The constant is an expert stack `[experts, out, K]` in checkpoint order: `experts` packed weights of
+    /// one descriptor, read by an indexed matmul through `Transpose([0, 2, 1])`. One expert is a one-expert
+    /// stack, `[1, out, K]`.
+    ExpertRows { experts: usize },
 }
 
 /// The packed storage of one dense constant a tracer declares.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackedConst {
-    /// The packed owners holding it, by linear id (the name their source carriers are staged
-    /// under): exactly one for [`PackedLayout::Rows`]/[`PackedLayout::Columns`], one per expert for
-    /// [`PackedLayout::StackedColumns`].
-    pub linear_ids: Vec<String>,
-    /// Every owner's descriptor (one shape and format for the whole stack).
+    /// The linear id its source carriers are staged under (see [`PackedSourceName`]); for an expert stack
+    /// the stack's own const name, one stacked carrier per source role.
+    pub linear_id: String,
+    /// The owner's descriptor (for a stack, each expert's: one shape and format for the whole stack).
     pub weight: poot_quant::PackedWeight,
     pub layout: PackedLayout,
 }
@@ -55,7 +61,7 @@ impl PackedConst {
         match self.layout {
             PackedLayout::Rows => vec![out, k],
             PackedLayout::Columns => vec![k, out],
-            PackedLayout::StackedColumns => vec![self.linear_ids.len(), k, out],
+            PackedLayout::ExpertRows { experts } => vec![experts, out, k],
         }
     }
 }
@@ -67,39 +73,37 @@ pub struct WeightFormats {
     consts: BTreeMap<String, PackedConst>,
 }
 
-/// A packed-storage record that contradicts another or itself.
+/// A packed-storage record that contradicts another.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WeightFormatsError {
     #[error("constant {name} is recorded packed twice")]
     Duplicate { name: String },
-    #[error("constant {name} names no packed owner")]
-    NoOwner { name: String },
-    #[error("constant {name} is laid out {layout:?}, which holds one owner, but names {owners}")]
-    OwnerCount {
-        name: String,
-        layout: PackedLayout,
-        owners: usize,
-    },
 }
 
 impl WeightFormats {
     /// The packed weights of a model's [`WeightMap`] (the driver path reads formats
     /// from the map, never from a tracer). Each mapped weight whose handle is
     /// [`HandleFormat::Packed`] is recorded under its [`WeightId::const_name`], with its carriers
-    /// staged under the same name, laid out [`PackedLayout::Rows`]: a `Model` tracer declares every
-    /// weight in checkpoint `[out, K]` orientation and spells a projection's transpose itself.
+    /// staged under the same name: laid out [`PackedLayout::Rows`] (a `Model` tracer declares every
+    /// weight in checkpoint `[out, K]` orientation and spells a projection's transpose itself), or
+    /// [`PackedLayout::ExpertRows`] when its view is an [`WeightView::ExpertStack`].
     ///
     /// [`WeightId::const_name`]: poot_quant::weights::WeightId::const_name
     pub fn from_weight_map(map: &WeightMap) -> Self {
         let consts = map
             .iter()
-            .filter_map(|(id, _, handle)| match handle.format {
+            .filter_map(|(id, view, handle)| match handle.format {
                 HandleFormat::Packed(weight) => Some((
                     id.const_name(),
                     PackedConst {
-                        linear_ids: vec![id.const_name()],
+                        linear_id: id.const_name(),
                         weight,
-                        layout: PackedLayout::Rows,
+                        layout: match view {
+                            WeightView::ExpertStack(parts) => PackedLayout::ExpertRows {
+                                experts: parts.len(),
+                            },
+                            _ => PackedLayout::Rows,
+                        },
                     },
                 )),
                 HandleFormat::Dense(_) => None,
@@ -110,16 +114,6 @@ impl WeightFormats {
 
     /// Record that constant `name` is stored as `packed`.
     pub fn insert(&mut self, name: String, packed: PackedConst) -> Result<(), WeightFormatsError> {
-        if packed.linear_ids.is_empty() {
-            return Err(WeightFormatsError::NoOwner { name });
-        }
-        if packed.layout != PackedLayout::StackedColumns && packed.linear_ids.len() != 1 {
-            return Err(WeightFormatsError::OwnerCount {
-                name,
-                layout: packed.layout,
-                owners: packed.linear_ids.len(),
-            });
-        }
         if self.consts.contains_key(&name) {
             return Err(WeightFormatsError::Duplicate { name });
         }
@@ -163,12 +157,34 @@ pub enum PackedBindError {
         declared: Vec<usize>,
         expected: Vec<usize>,
     },
+    #[error("constant {name} is a packed expert stack, but {reason}")]
+    ExpertStack {
+        name: String,
+        reason: ExpertStackRefusal,
+    },
     #[error("binding packed constant {name} produced an invalid graph: {source}")]
     Graph {
         name: String,
         #[source]
         source: Box<GraphValidationError>,
     },
+}
+
+/// Why a packed expert stack's use cannot become one indexed packed contraction.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ExpertStackRefusal {
+    #[error(
+        "it has {consumers} consumers; a stack is read by exactly one transposed indexed matmul"
+    )]
+    Consumers { consumers: usize },
+    #[error("its consumer is `{op}`, not Transpose([0, 2, 1]) into an indexed matmul")]
+    NotTransposed { op: String },
+    #[error("its transpose has {consumers} consumers; the table is read by one indexed matmul")]
+    TransposeConsumers { consumers: usize },
+    #[error("its transpose feeds `{op}`, not an indexed matmul")]
+    NotIndexed { op: String },
+    #[error("it, or its transpose, is a graph output, validation output or carried state")]
+    Escapes,
 }
 
 /// Rewrite every constant of `g` that `formats` records packed into the decode of its owners (see
@@ -181,9 +197,12 @@ pub fn bind_packed_weights<V: ValidationChannel>(
     if formats.is_empty() {
         return Ok(g.clone());
     }
+    let consumers = packed_consumer_map(g);
     let mut out = g.clone();
     let mut decode: Vec<Eqn> = Vec::new();
     let mut bound: Vec<ValueId> = Vec::new();
+    let mut removed: HashSet<usize> = HashSet::new();
+    let mut claimed: HashMap<usize, Eqn> = HashMap::new();
     let mut last_name = None;
     for &id in &g.inputs {
         let meta = g.meta(id);
@@ -214,78 +233,81 @@ pub fn bind_packed_weights<V: ValidationChannel>(
             });
         }
         let [rows, k] = packed.weight.shape();
-        let stacked = packed.layout == PackedLayout::StackedColumns;
-        fn push_value<V: ValidationChannel>(out: &mut Graph<V>, aval: TensorType) -> ValueId {
-            out.values.push(ValueMeta::new(aval, Storage::Device, None));
-            out.values.len() - 1
-        }
-        let mut branches = Vec::with_capacity(packed.linear_ids.len());
-        for linear_id in &packed.linear_ids {
-            let mut carriers = Vec::new();
-            for role in packed.weight.sources() {
+        if let PackedLayout::ExpertRows { experts } = packed.layout {
+            let refuse = |reason| PackedBindError::ExpertStack {
+                name: name.to_string(),
+                reason,
+            };
+            let (transpose, indexed) = expert_stack_use(g, id, &consumers).map_err(refuse)?;
+            let mut inputs = vec![g.eqns[indexed].inputs[0], g.eqns[indexed].inputs[2]];
+            for (carrier_name, carrier_type) in
+                packed_stack_source_constants(&packed.linear_id, packed.weight, experts)
+            {
                 out.values.push(ValueMeta::new(
-                    packed_source_type(packed.weight, role),
+                    carrier_type,
                     Storage::Const,
-                    Some(PackedSourceName::new(linear_id, role).into()),
+                    Some(carrier_name.into()),
                 ));
                 let carrier = out.values.len() - 1;
                 out.inputs.push(carrier);
                 out.consts.push(carrier);
-                carriers.push(Operand::Value(carrier));
+                inputs.push(Operand::Value(carrier));
             }
-            // The decoded owner, then (projection) its transpose, then (expert stack) a leading
-            // unit axis; a single weight's last step writes the declared value id itself.
-            let mut steps: Vec<(OpKind, TensorType)> = vec![(
-                OpKind::PackedDequant {
-                    descriptor: packed.weight,
-                },
-                TensorType::f32(vec![rows, k]),
-            )];
-            let slice_shape = match packed.layout {
-                PackedLayout::Rows => vec![rows, k],
-                PackedLayout::Columns | PackedLayout::StackedColumns => {
-                    steps.push((
-                        OpKind::Transpose { perm: vec![1, 0] },
-                        TensorType::f32(vec![k, rows]),
-                    ));
-                    vec![k, rows]
-                }
-            };
-            if stacked {
-                let mut unit = vec![1];
-                unit.extend_from_slice(&slice_shape);
-                steps.push((
-                    OpKind::Reshape {
-                        shape: unit.clone(),
+            removed.insert(transpose);
+            claimed.insert(
+                indexed,
+                Eqn {
+                    op: OpKind::PackedContraction {
+                        descriptor: packed.weight,
+                        rows: ContractionRows::Indexed { experts },
                     },
-                    TensorType::f32(unit),
-                ));
-            }
-            let mut inputs = carriers;
-            let last = steps.len() - 1;
-            for (index, (op, aval)) in steps.into_iter().enumerate() {
-                let value = if index == last && !stacked {
-                    id
-                } else {
-                    push_value(&mut out, aval)
-                };
-                decode.push(Eqn {
-                    op,
                     inputs,
-                    out: value,
-                    layer: None,
-                });
-                inputs = vec![Operand::Value(value)];
-            }
-            let Operand::Value(branch) = inputs[0] else {
-                unreachable!("every decode step produces a value")
-            };
-            branches.push(Operand::Value(branch));
+                    out: g.eqns[indexed].out,
+                    layer: g.eqns[indexed].layer,
+                },
+            );
+            bound.push(id);
+            last_name = Some(name.to_string());
+            continue;
         }
-        if stacked {
+        let mut carriers = Vec::new();
+        for role in packed.weight.sources() {
+            out.values.push(ValueMeta::new(
+                packed_source_type(packed.weight, role),
+                Storage::Const,
+                Some(PackedSourceName::new(&packed.linear_id, role).into()),
+            ));
+            let carrier = out.values.len() - 1;
+            out.inputs.push(carrier);
+            out.consts.push(carrier);
+            carriers.push(Operand::Value(carrier));
+        }
+        // The decoded owner, then (projection) its transpose; the last step writes the declared value id
+        // itself.
+        let dequant_out = match packed.layout {
+            PackedLayout::Rows => id,
+            PackedLayout::Columns => {
+                out.values.push(ValueMeta::new(
+                    TensorType::f32(vec![rows, k]),
+                    Storage::Device,
+                    None,
+                ));
+                out.values.len() - 1
+            }
+            PackedLayout::ExpertRows { .. } => unreachable!("expert stacks continue above"),
+        };
+        decode.push(Eqn {
+            op: OpKind::PackedDequant {
+                descriptor: packed.weight,
+            },
+            inputs: carriers,
+            out: dequant_out,
+            layer: None,
+        });
+        if packed.layout == PackedLayout::Columns {
             decode.push(Eqn {
-                op: OpKind::Concat { axis: 0 },
-                inputs: branches,
+                op: OpKind::Transpose { perm: vec![1, 0] },
+                inputs: vec![Operand::Value(dequant_out)],
                 out: id,
                 layer: None,
             });
@@ -300,7 +322,12 @@ pub fn bind_packed_weights<V: ValidationChannel>(
     }
     out.inputs.retain(|id| !bound.contains(id));
     out.consts.retain(|id| !bound.contains(id));
-    decode.append(&mut out.eqns);
+    let kept = std::mem::take(&mut out.eqns)
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| !removed.contains(index))
+        .map(|(index, eqn)| claimed.remove(&index).unwrap_or(eqn));
+    decode.extend(kept);
     out.eqns = decode;
     out.validate().map_err(|source| PackedBindError::Graph {
         name: last_name.unwrap_or_default(),
@@ -309,14 +336,55 @@ pub fn bind_packed_weights<V: ValidationChannel>(
     Ok(out)
 }
 
+/// The two equations that read expert stack `stack`: the `Transpose([0, 2, 1])` that is its only consumer and
+/// the `IndexedMatMul` that is the transpose's only consumer (the typing rule makes the rank-3 table its weight
+/// operand). Anything else is the
+/// stack's refusal.
+fn expert_stack_use<V: ValidationChannel>(
+    g: &Graph<V>,
+    stack: ValueId,
+    consumers: &[Vec<usize>],
+) -> Result<(usize, usize), ExpertStackRefusal> {
+    let escapes = |value: ValueId| {
+        g.liveness_roots().any(|root| root == value)
+            || g.state.iter().any(|&(_, state_out)| state_out == value)
+    };
+    let &[transpose] = consumers[stack].as_slice() else {
+        return Err(ExpertStackRefusal::Consumers {
+            consumers: consumers[stack].len(),
+        });
+    };
+    let transpose_eqn = &g.eqns[transpose];
+    if !matches!(&transpose_eqn.op, OpKind::Transpose { perm } if perm.as_slice() == [0, 2, 1]) {
+        return Err(ExpertStackRefusal::NotTransposed {
+            op: transpose_eqn.op.name(),
+        });
+    }
+    if escapes(stack) || escapes(transpose_eqn.out) {
+        return Err(ExpertStackRefusal::Escapes);
+    }
+    let &[indexed] = consumers[transpose_eqn.out].as_slice() else {
+        return Err(ExpertStackRefusal::TransposeConsumers {
+            consumers: consumers[transpose_eqn.out].len(),
+        });
+    };
+    let indexed_eqn = &g.eqns[indexed];
+    if !matches!(indexed_eqn.op, OpKind::IndexedMatMul) {
+        return Err(ExpertStackRefusal::NotIndexed {
+            op: indexed_eqn.op.name(),
+        });
+    }
+    Ok((transpose, indexed))
+}
+
 #[cfg(test)]
 mod tests {
-    use poot_quant::PackedWeight;
     use poot_quant::format::WeightFormat;
+    use poot_quant::{PackedWeight, SourceRole};
 
     use super::*;
-    use poot_graph_ir::Builder;
     use poot_graph_ir::types::TensorType;
+    use poot_graph_ir::{Builder, RedOp, Traced};
 
     fn q8(out: usize, k: usize) -> PackedWeight {
         PackedWeight::try_new(WeightFormat::Q8_0, [out, k]).unwrap()
@@ -332,7 +400,7 @@ mod tests {
 
     fn column(out: usize, k: usize) -> PackedConst {
         PackedConst {
-            linear_ids: vec!["layer".into()],
+            linear_id: "layer".into(),
             weight: q8(out, k),
             layout: PackedLayout::Columns,
         }
@@ -492,7 +560,7 @@ mod tests {
             &formats(&[(
                 "embed.weight",
                 PackedConst {
-                    linear_ids: vec!["embed".into()],
+                    linear_id: "embed".into(),
                     weight: q8(16, 64),
                     layout: PackedLayout::Rows,
                 },
@@ -509,41 +577,124 @@ mod tests {
         ));
     }
 
-    /// An expert stack binds as one decode branch per owner, stacked: the W12 canonical chain the
-    /// escape gate admits in front of an `IndexedMatMul`. A one-expert stack keeps its `E` axis
-    /// (`StackedColumns` states stacked-ness; the owner count does not).
+    /// An expert stack binds to its one consumer, rewritten: the transpose and the `IndexedMatMul` become one
+    /// `PackedContraction { rows: Indexed }` over one stacked carrier per source role, with the activation and
+    /// ids operands kept and the output value untouched; no `PackedDequant` (no decoded table) remains. A
+    /// one-expert stack keeps its `E` axis. Mutation: bind the stack as per-expert `PackedDequant` branches
+    /// (the removed W12 chain); the dequant count and the missing contraction fail this row.
     #[test]
-    fn a_packed_expert_stack_binds_to_the_canonical_moe_chain() {
+    fn a_packed_expert_stack_binds_to_one_indexed_contraction() {
         for experts in [1usize, 2] {
             let b = Builder::new();
             let x = b.constant("x", TensorType::f32(vec![3, 64]));
             let sel = b.constant("sel", TensorType::f32(vec![3]));
-            let w = b.constant("experts.weight", TensorType::f32(vec![experts, 64, 8]));
-            let y = b.indexed_matmul(x, w, sel);
+            let w = b.constant("experts.weight", TensorType::f32(vec![experts, 8, 64]));
+            let y = b.indexed_matmul(x, b.transpose(w, vec![0, 2, 1]), sel);
             let g = b.finish(y);
-            let bound = bind_packed_weights(
-                &g,
-                &formats(&[(
-                    "experts.weight",
-                    PackedConst {
-                        linear_ids: (0..experts).map(|e| format!("experts.{e}")).collect(),
-                        weight: q8(8, 64),
-                        layout: PackedLayout::StackedColumns,
-                    },
-                )]),
-            )
-            .unwrap_or_else(|error| panic!("{experts} experts: {error}"));
+            let bound = bind_packed_weights(&g, &formats(&[("experts.weight", stack(experts))]))
+                .unwrap_or_else(|error| panic!("{experts} experts: {error}"));
             reject_packed_dequant_escapes(&bound)
                 .unwrap_or_else(|error| panic!("{experts} experts: {error}"));
+            assert_eq!(bound.output, g.output);
+            let [eqn] = bound.eqns.as_slice() else {
+                panic!("{experts} experts: {:?}", ops(&bound));
+            };
             assert_eq!(
-                bound
-                    .eqns
-                    .iter()
-                    .filter(|eqn| matches!(eqn.op, OpKind::PackedDequant { .. }))
-                    .count(),
-                experts
+                eqn.op,
+                OpKind::PackedContraction {
+                    descriptor: q8(8, 64),
+                    rows: ContractionRows::Indexed { experts },
+                }
+            );
+            let names: Vec<&str> = bound
+                .inputs
+                .iter()
+                .filter_map(|&id| bound.meta(id).name.as_deref())
+                .collect();
+            assert_eq!(names, ["x", "sel", "experts.weight.packed_blocks_source"]);
+            let carrier = bound.inputs[2];
+            assert_eq!(
+                bound.aval(carrier),
+                &TensorType::new(
+                    vec![experts, q8(8, 64).slab_bytes(SourceRole::Blocks)],
+                    DType::I8
+                )
             );
         }
+    }
+
+    fn stack(experts: usize) -> PackedConst {
+        PackedConst {
+            linear_id: "experts.weight".into(),
+            weight: q8(8, 64),
+            layout: PackedLayout::ExpertRows { experts },
+        }
+    }
+
+    /// A square stack (`out == K`), so a transpose with another permutation still types.
+    fn square_stack() -> PackedConst {
+        PackedConst {
+            linear_id: "experts.weight".into(),
+            weight: q8(64, 64),
+            layout: PackedLayout::ExpertRows { experts: 2 },
+        }
+    }
+
+    /// SC-003 (bind half): an expert stack that is not read by exactly one `Transpose([0, 2, 1])` into the weight
+    /// operand of exactly one `IndexedMatMul` is a typed refusal naming the constant and the offending use,
+    /// never a fallback to decoding the table. The rows: a transpose with another permutation, a second
+    /// consumer of the stack, a second consumer of the transpose, and a transposed table read by something that
+    /// is not an indexed matmul. (The table as the matmul's activation or id operand cannot be built: the
+    /// typing rule gives only the weight operand rank 3.) Mutation: accept any transpose permutation in the
+    /// rewrite; the `perm [0, 1, 2]` row binds and goes red.
+    #[test]
+    fn a_packed_expert_stack_with_any_other_use_is_refused_by_name() {
+        let refusal = |g: &Graph| match bind_packed_weights(
+            g,
+            &formats(&[("experts.weight", square_stack())]),
+        ) {
+            Err(PackedBindError::ExpertStack { name, reason }) => {
+                assert_eq!(name, "experts.weight");
+                reason
+            }
+            other => panic!(
+                "expected an expert-stack refusal, got {:?}",
+                other.map(|g| ops(&g))
+            ),
+        };
+        let build = |f: &dyn Fn(&Builder, Traced, Traced, Traced) -> Traced| {
+            let b = Builder::new();
+            let x = b.constant("x", TensorType::f32(vec![3, 64]));
+            let sel = b.constant("sel", TensorType::f32(vec![3]));
+            let w = b.constant("experts.weight", TensorType::f32(vec![2, 64, 64]));
+            let y = f(&b, x, sel, w);
+            b.finish(y)
+        };
+        // No transpose: the stack `[E, out, K]` read where the matmul wants `[E, K, out]`.
+        let g = build(&|b, x, sel, w| b.indexed_matmul(x, b.transpose(w, vec![0, 1, 2]), sel));
+        assert!(matches!(
+            refusal(&g),
+            ExpertStackRefusal::NotTransposed { .. }
+        ));
+        // A second consumer of the stack.
+        let g = build(&|b, x, sel, w| {
+            let y = b.indexed_matmul(x, b.transpose(w, vec![0, 2, 1]), sel);
+            b.concat(0, &[y, b.reduce(RedOp::Sum, w, 0, false)])
+        });
+        assert_eq!(refusal(&g), ExpertStackRefusal::Consumers { consumers: 2 });
+        // A second consumer of the transposed table.
+        let g = build(&|b, x, sel, w| {
+            let wt = b.transpose(w, vec![0, 2, 1]);
+            let y = b.indexed_matmul(x, wt, sel);
+            b.concat(0, &[y, b.reduce(RedOp::Sum, wt, 0, false)])
+        });
+        assert_eq!(
+            refusal(&g),
+            ExpertStackRefusal::TransposeConsumers { consumers: 2 }
+        );
+        // A transposed table read by something that is not an indexed matmul.
+        let g = build(&|b, _, _, w| b.reduce(RedOp::Sum, b.transpose(w, vec![0, 2, 1]), 1, false));
+        assert!(matches!(refusal(&g), ExpertStackRefusal::NotIndexed { .. }));
     }
 
     /// A declared shape or dtype the stored weight cannot produce is a typed refusal naming the
@@ -551,7 +702,7 @@ mod tests {
     #[test]
     fn a_mismatched_declaration_is_refused_by_name() {
         let packed = PackedConst {
-            linear_ids: vec!["layer".into()],
+            linear_id: "layer".into(),
             weight: q8(8, 64),
             layout: PackedLayout::Columns,
         };
@@ -575,7 +726,7 @@ mod tests {
         ));
         let mut dup = WeightFormats::default();
         let one = PackedConst {
-            linear_ids: vec!["a".into()],
+            linear_id: "a".into(),
             weight: q8(8, 64),
             layout: PackedLayout::Rows,
         };
@@ -583,16 +734,6 @@ mod tests {
         assert!(matches!(
             dup.insert("a.weight".into(), one),
             Err(WeightFormatsError::Duplicate { .. })
-        ));
-        // A single-owner layout naming two owners is refused (stacked-ness is the layout's).
-        let two = PackedConst {
-            linear_ids: vec!["b.0".into(), "b.1".into()],
-            weight: q8(8, 64),
-            layout: PackedLayout::Columns,
-        };
-        assert!(matches!(
-            WeightFormats::default().insert("b.weight".into(), two),
-            Err(WeightFormatsError::OwnerCount { owners: 2, .. })
         ));
     }
 }

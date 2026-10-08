@@ -1,13 +1,13 @@
 //! Routed-expert sites: the graph shape cards 186 and 192 recorded as hanging ROCm and PTX under
-//! flash-attention synthesis, fusion and the generated tiled GEMM.
+//! flash-attention synthesis, fusion and the generated tiled GEMM (POOT-1038 measured it completing on both
+//! with every pass on, so no compile reads a site to skip one).
 //!
 //! A site is a router-logits contraction over more than one row whose `ArgTopK` expert ids feed an
 //! indexed contraction. The shape is what decides, not the family: a one-row decode has no site, a
 //! `ArgTopK` that feeds nothing indexed (a sampler's top-k) has none, and every routed family has one
 //! at prefill, however it spells its router.
 //!
-//! [`compile`](crate::compile) asks for the sites only when the target carries
-//! `KnownMiscompiles::routed_expert_tiling_hang`; POOT-575 deletes both the fact and this walk.
+//! The walk is held for POOT-746's pool transform, its production caller.
 
 use std::collections::HashMap;
 
@@ -16,7 +16,7 @@ use poot_graph_ir::op::OpKind;
 
 /// One routed-expert site, as equation indices into the graph's `eqns`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RoutedExpertSite {
+pub(crate) struct RoutedExpertSite {
     /// The router-logits contraction (`MatMul`) over more than one row.
     pub router: usize,
     /// The `ArgTopK` selecting each row's experts from the router's scores.
@@ -33,7 +33,8 @@ fn value_inputs(inputs: &[Operand]) -> impl Iterator<Item = ValueId> + '_ {
 }
 
 /// Every routed-expert site of `g`.
-pub fn routed_expert_sites<V: ValidationChannel>(g: &Graph<V>) -> Vec<RoutedExpertSite> {
+#[cfg_attr(not(test), expect(dead_code, reason = "held for POOT-746"))]
+pub(crate) fn routed_expert_sites<V: ValidationChannel>(g: &Graph<V>) -> Vec<RoutedExpertSite> {
     let producer: HashMap<ValueId, usize> = g
         .eqns
         .iter()

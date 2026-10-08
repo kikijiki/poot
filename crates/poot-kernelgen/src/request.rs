@@ -21,7 +21,7 @@ use poot_target::{BufferStorage, DeviceCaps};
 
 use crate::KernelGenError;
 use crate::attention::{AttentionSchedule, AttentionSpec, attention_body};
-use crate::contraction::{DenseLoad, Epilogue, Schedule, dense_contraction, indexed_contraction};
+use crate::contraction::{Epilogue, Schedule, dense_contraction, indexed_contraction};
 use crate::data_movement::{MovementSpec, Storage, arg_top_k_dt, movement_body, rope_dt};
 use crate::elementwise::{
     binary_broadcast_dt_views_grid, binary_broadcast_i32_geu_views_grid,
@@ -44,6 +44,7 @@ use crate::matmul::{
 };
 use crate::packed::{PackedKernelSpec, packed_contraction, packed_kernel};
 use crate::reduce::reduce_last_dt;
+use crate::scan::{ScanSpec, scan_body};
 use crate::tiled_region::tiled_region;
 use crate::wmma::{matmul_tensorcore, matmul_tensorcore_coopmat};
 use poot_quant::format::WeightFormat;
@@ -247,6 +248,7 @@ pub enum KernelRequest {
     Row(RowSpec),
     Contraction(ContractionSpec),
     Attention(AttentionSpec),
+    Scan(ScanSpec),
     Movement(MovementSpec),
     Packed(PackedRequest),
     Rope(RopeSpec),
@@ -281,6 +283,10 @@ impl KernelRequest {
                 subgroup_lanes: None,
                 serial_work: Some(spec.serial_work()),
             },
+            Self::Scan(spec) => KernelRequirements {
+                subgroup_lanes: None,
+                serial_work: Some(spec.serial_work()),
+            },
             _ => KernelRequirements::default(),
         }
     }
@@ -292,7 +298,6 @@ impl KernelRequest {
         match self {
             Self::Contraction(ContractionSpec::DenseGemv {
                 weight,
-                layout,
                 schedule,
                 k,
                 n,
@@ -309,7 +314,7 @@ impl KernelRequest {
                 let epilogue = epilogue.as_ref().map_or_else(String::new, |epilogue| {
                     format!(":epilogue{}", epilogue.steps.len())
                 });
-                format!("contraction:dense_gemv:{weight}:{layout:?}:{launch}:{k}x{n}{epilogue}")
+                format!("contraction:dense_gemv:{weight}:{launch}:{k}x{n}{epilogue}")
             }
             Self::Contraction(spec) => format!("contraction:{}", spec.form()),
             other => other.family().to_string(),
@@ -324,6 +329,7 @@ impl KernelRequest {
             Self::Row(_) => "row",
             Self::Contraction(_) => "contraction",
             Self::Attention(_) => "attention",
+            Self::Scan(_) => "scan",
             Self::Movement(_) => "movement",
             Self::Packed(_) => "packed",
             Self::Rope(_) => "rope",
@@ -503,14 +509,44 @@ pub enum ContractionSpec {
         elems: usize,
         offset: usize,
     },
-    /// The `DenseContraction` decode GEMV (`M == 1`): `schedule` (a [`Schedule::Gemv`]) over a weight read in
-    /// `layout` from `weight` storage (`BufferStorage::f32()`, `f16_packed()` or `bf16_packed()`), the shared Gemv
-    /// loop nest with the dense operand load, `epilogue` (f32) applied to each column's sum before its store. The
-    /// body is shape-generic: `K` and `N` ride in its `[K, N]` metadata; `k` also fixes whether a packed weight
-    /// row starts on a word boundary. A Gemv over a `[K, N]` layout is refused.
+    /// The `DenseContraction` decode GEMV (`M == 1`): `schedule` (a [`Schedule::Gemv`]) over an `[N, K]` weight
+    /// in `weight` storage (`BufferStorage::f32()`, `f16_packed()` or `bf16_packed()`), the shared Gemv loop nest
+    /// with the dense operand load, `epilogue` (f32) applied to each column's sum before its store. The body is
+    /// shape-generic: `K` and `N` ride in its `[K, N]` metadata; `k` also fixes whether a packed weight row
+    /// starts on a word boundary.
+    ///
+    /// The weight is `[N, K]` by construction: one workgroup per output column over a `[K, N]` weight would read
+    /// it at a stride of `N` elements per lane (the pattern card 035 removed), so the variant has no orientation
+    /// field and a `[K, N]` Gemv cannot be written down.
+    ///
+    /// ```
+    /// use poot_kernelgen::{ContractionSpec, Schedule};
+    /// use poot_target::BufferStorage;
+    ///
+    /// let _gemv_over_n_by_k = ContractionSpec::DenseGemv {
+    ///     weight: BufferStorage::f32(),
+    ///     schedule: Schedule::Gemv { width: 256, cols: 4, unroll: 4 },
+    ///     k: 896,
+    ///     n: 4864,
+    ///     epilogue: None,
+    /// };
+    /// ```
+    ///
+    /// ```compile_fail,E0559
+    /// use poot_kernelgen::{ContractionSpec, Schedule, WeightLayout};
+    /// use poot_target::BufferStorage;
+    ///
+    /// let _gemv_over_k_by_n = ContractionSpec::DenseGemv {
+    ///     weight: BufferStorage::f32(),
+    ///     layout: WeightLayout::Kn,
+    ///     schedule: Schedule::Gemv { width: 256, cols: 4, unroll: 4 },
+    ///     k: 896,
+    ///     n: 4864,
+    ///     epilogue: None,
+    /// };
+    /// ```
     DenseGemv {
         weight: BufferStorage,
-        layout: WeightLayout,
         schedule: Schedule,
         k: usize,
         n: usize,
@@ -580,10 +616,34 @@ impl ContractionSpec {
 #[derive(Clone, Debug)]
 pub struct PackedContraction {
     pub format: WeightFormat,
+    /// How output rows meet weight rows: one weight (block-diagonal or dense), or an expert-stacked table.
+    pub rows: PackedRows,
     pub schedule: Schedule,
     pub epilogue: Option<Epilogue>,
     pub grid: [u32; 3],
     pub meta: Vec<u32>,
+}
+
+/// How a [`PackedContraction`]'s output rows meet the packed weight's rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PackedRows {
+    /// One weight: the output column is the weight row (`blocks` of them side by side). Params
+    /// `(activation, sources.., [epilogue leaves..], metadata, out)`.
+    Blocks,
+    /// An expert-stacked table: output row `m` reads the slab of expert `ids[m]` in every source, and an id
+    /// outside `0..E` or not an integer makes that row NaN. Params `(activation, ids, sources.., [epilogue
+    /// leaves..], metadata, out)`, metadata `[K, N, E, slab_words per source..]`. A [`Schedule::Gemv`] only.
+    Indexed,
+}
+
+impl PackedRows {
+    /// The index of the first source parameter: after the unit param, the activation, and (indexed) the ids.
+    pub(crate) const fn leading_params(self) -> u32 {
+        match self {
+            Self::Blocks => 2,
+            Self::Indexed => 3,
+        }
+    }
 }
 
 /// A contraction over a stacked `[E, K, N]` weight, `out[m, n] = sum over k of x[m, k] * W[ids[m], k, n]`: output
@@ -705,6 +765,7 @@ fn build(req: &KernelRequest, caps: &DeviceCaps) -> Result<Generated, KernelGenE
         KernelRequest::Row(spec) => row(spec, caps),
         KernelRequest::Contraction(spec) => contraction(spec, caps),
         KernelRequest::Attention(spec) => attention(spec, caps),
+        KernelRequest::Scan(spec) => scan(spec, caps),
         KernelRequest::Movement(spec) => movement(spec, caps),
         KernelRequest::Packed(spec) => {
             let body = packed_kernel(spec.name, spec.spec)?;
@@ -1010,17 +1071,12 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
         ),
         ContractionSpec::DenseGemv {
             weight,
-            layout,
             schedule,
             k,
             n,
             epilogue,
         } => {
-            let load = DenseLoad {
-                weight: *weight,
-                layout: *layout,
-            };
-            let body = dense_contraction(ENTRY, load, *schedule, *k, epilogue.as_ref())?;
+            let body = dense_contraction(ENTRY, *weight, *schedule, *k, epilogue.as_ref())?;
             let threads = schedule.grid_threads(1, 1, *n);
             with(
                 body,
@@ -1032,13 +1088,19 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
         }
         ContractionSpec::Packed(PackedContraction {
             format,
+            rows,
             schedule,
             epilogue,
             grid,
             meta,
         }) => {
-            let body =
-                packed_contraction("packed_contraction", *format, *schedule, epilogue.as_ref())?;
+            let body = packed_contraction(
+                "packed_contraction",
+                *format,
+                *schedule,
+                epilogue.as_ref(),
+                *rows,
+            )?;
             with(
                 body,
                 Launch {
@@ -1131,6 +1193,14 @@ fn attention(spec: &AttentionSpec, caps: &DeviceCaps) -> Result<Generated, Kerne
     )
 }
 
+fn scan(spec: &ScanSpec, caps: &DeviceCaps) -> Result<Generated, KernelGenError> {
+    let (x, y) = fold_groups(spec.workgroups(), caps.max_grid[0]);
+    with(
+        scan_body(ENTRY, spec, x)?,
+        Launch::grid([(x * spec.cols) as u32, y as u32, 1]),
+    )
+}
+
 fn movement(spec: &MovementSpec, caps: &DeviceCaps) -> Result<Generated, KernelGenError> {
     with(
         movement_body(ENTRY, spec, spec.fold.x_groups(caps))?,
@@ -1169,7 +1239,6 @@ mod tests {
             (
                 KernelRequest::Contraction(ContractionSpec::DenseGemv {
                     weight: BufferStorage::bf16_packed(),
-                    layout: WeightLayout::Nk,
                     schedule: Schedule::Gemv {
                         width: 256,
                         cols: 4,
@@ -1180,7 +1249,7 @@ mod tests {
                     epilogue: None,
                 }),
                 format!(
-                    "contraction:dense_gemv:{}:Nk:w256c4u4:896x4864",
+                    "contraction:dense_gemv:{}:w256c4u4:896x4864",
                     BufferStorage::bf16_packed()
                 ),
             ),
@@ -1363,7 +1432,6 @@ mod tests {
                 (
                     ContractionSpec::DenseGemv {
                         weight: BufferStorage::f32(),
-                        layout: WeightLayout::Nk,
                         schedule: Schedule::Gemv {
                             width: 16,
                             cols: 2,
@@ -1514,7 +1582,6 @@ mod tests {
                 KernelRequest::Contraction(match (m, k) {
                     (1, _) => ContractionSpec::DenseGemv {
                         weight,
-                        layout: WeightLayout::Nk,
                         schedule: Schedule::Gemv {
                             width: 16,
                             cols: 2,
@@ -1594,7 +1661,6 @@ mod tests {
         for weight in [BufferStorage::f16(), BufferStorage::i32()] {
             let request = KernelRequest::Contraction(ContractionSpec::DenseGemv {
                 weight,
-                layout: WeightLayout::Nk,
                 schedule: Schedule::Gemv {
                     width: 16,
                     cols: 2,
@@ -1611,51 +1677,6 @@ mod tests {
                 Err(other) => panic!("{weight}: expected Unsupported, got {other}"),
                 Ok(_) => panic!("{weight}: expected Unsupported, got a generated body"),
             }
-        }
-    }
-
-    /// Card 727 SC-004: the one-workgroup-per-column Gemv over a `[K, N]` dense weight is
-    /// refused when it is generated, for every weight storage, so no plan can carry the stride-`N` body. The
-    /// same request over the `[N, K]` weight generates. Mutation: admit the `[K, N]` arm in
-    /// `contraction::dense_contraction` (route it to the `[N, K]` body); a body comes back and this row goes red.
-    #[test]
-    fn a_gemv_over_a_k_by_n_dense_weight_is_refused() {
-        let caps = DeviceCaps::wgpu_rdna3_igpu();
-        let request = |weight, layout| {
-            KernelRequest::Contraction(ContractionSpec::DenseGemv {
-                weight,
-                layout,
-                schedule: Schedule::Gemv {
-                    width: 256,
-                    cols: 16,
-                    unroll: 4,
-                },
-                k: 896,
-                n: 4864,
-                epilogue: None,
-            })
-        };
-        for weight in [
-            BufferStorage::f32(),
-            BufferStorage::f16_packed(),
-            BufferStorage::bf16_packed(),
-        ] {
-            match generate(&request(weight, WeightLayout::Kn), &caps, &roomy()) {
-                Err(KernelGenError::Unsupported { request, reason }) => {
-                    assert_eq!(request, "dense_contraction", "{weight}");
-                    assert!(
-                        reason.contains("stride of N elements"),
-                        "{weight}: {reason}"
-                    );
-                }
-                Err(other) => panic!("{weight}: expected the Gemv refusal, got {other}"),
-                Ok(generated) => panic!(
-                    "{weight}: a [K, N] Gemv generated `{}` instead of being refused",
-                    generated.body.name
-                ),
-            }
-            generate(&request(weight, WeightLayout::Nk), &caps, &roomy())
-                .unwrap_or_else(|e| panic!("{weight}: the [N, K] Gemv must generate: {e}"));
         }
     }
 
@@ -1719,7 +1740,6 @@ mod tests {
                     };
                     let request = KernelRequest::Contraction(ContractionSpec::DenseGemv {
                         weight,
-                        layout: WeightLayout::Nk,
                         schedule: Schedule::Gemv {
                             width,
                             cols,

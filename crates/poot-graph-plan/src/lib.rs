@@ -97,10 +97,9 @@ pub(crate) use buffer_plan::plan_buffers;
 pub use device_validation::{DEVICE_WITNESS_MAGNITUDE_BOUND, DeviceWitnessRejection};
 
 pub use dtype_widen::{
-    bf16_const_feeds_decode_bf16_gemv, bf16_const_feeds_only_packed_readers,
-    matmul_amd_tc_eligible, matmul_bf16_decode_gemv_eligible, matmul_nvptx_tc_eligible,
-    matmul_spirv_coopmat_eligible, matmul_tensor_core_eligible, prepare_target_graph,
-    widen_mismatched_matmul_dtypes,
+    bf16_const_feeds_only_packed_readers, matmul_amd_tc_eligible, matmul_bf16_column_gemv,
+    matmul_nvptx_tc_eligible, matmul_spirv_coopmat_eligible, matmul_tensor_core_eligible,
+    prepare_target_graph, widen_mismatched_matmul_dtypes,
 };
 // `compile.rs`'s pipeline runs these directly (Card 534a): `pub(crate)`, not `pub`,
 // so no crate outside `poot-graph-plan` - `poot-gpu`/`poot-rocm-gpu`/`poot-ptx-gpu` included - can name
@@ -142,8 +141,8 @@ pub use compile::*;
 pub use graph_validation::*;
 pub(crate) use kernel_mapping::*;
 pub use passes::{
-    BoundaryDescriptor, PackedBindError, PackedConst, PackedLayout, RoutedExpertSite,
-    WeightFormats, WeightFormatsError, bind_packed_weights, routed_expert_sites,
+    BoundaryDescriptor, ExpertStackRefusal, PackedBindError, PackedConst, PackedLayout,
+    WeightFormats, WeightFormatsError, bind_packed_weights,
 };
 // `poot-llm`'s CPU oracle (`core/cpu_oracle.rs`) claims a traced graph's packed contractions/row
 // gathers the same way `compile` does, so its eval matches what the device plans - a real production

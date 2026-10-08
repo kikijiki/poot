@@ -32,9 +32,12 @@ and PTX; those receipts do not establish every family/format combination.
 `Q8_K` and the IQ2/IQ3 grid formats are unsupported and refused by name.
 
 A mixed format such as `Q4_K_M` uses a higher bit width for some tensors. The loader preserves each
-tensor's stored format. Packed MoE expert paths currently materialize the expert table on the device
-before indexed matmul, so their peak device memory can exceed the packed checkpoint size. Dense
-packed projections and packed embedding gathers avoid that full-table materialization.
+tensor's stored format. Packed MoE experts stay packed too: the routed projection is one indexed packed
+contraction that reads only the blocks of the expert each row selects, so no expert table is ever
+decoded on the device. Packed projections and packed embedding gathers avoid full-table
+materialization the same way. Each indexed launch covers one projection's rows at a time; a very large
+row count (the experts of a long prompt chunk) is refused with a typed grid-limit error naming the
+equation, so long prompts run in smaller chunks.
 
 ## GPTQ and AWQ (safetensors, 4-bit)
 
@@ -54,12 +57,11 @@ compiler lowering as other quantized projections. It no longer expands those pro
 load time or requires a separate resident-E4M3 executor route. Generated kernels decode the stored
 values and apply their scales; this does not require native FP8 tensor-core instructions.
 
-Packed MoE table materialization also applies here.
-
 ## Memory expectations
 
-- Packed loading reduces weight storage; activations, KV capacity, upload buffers and temporary expert
-  tables still consume memory.
+- Packed loading reduces weight storage; activations, KV capacity and upload buffers still consume
+  memory. A routed expert table is uploaded once, one buffer per source role, with each expert padded
+  to a whole number of 32-bit words.
 - Dense BF16/F16 weights stay BF16/F16 in host memory after loading. The CPU reference reads them
   through explicit casts in the graph each time it runs a step, which costs time rather than resident
   memory. Keeping them stored is not a claim of full BF16/F16 arithmetic on every backend.

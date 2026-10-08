@@ -7,22 +7,21 @@
 //! `t * top_k + r` being token `t` at slot `r`, so every projection is one indexed contraction over
 //! all rows and no expert is evaluated for a token that did not select it.
 //!
-//! Experts bind as stored (ADR-0103). A dense checkpoint holds one projection of every expert as a
-//! stack, read in place by [`poot_graph_ir::Builder::indexed_matmul`] (a `[experts, out, K]` stack is
-//! read through a transposed view that `compile` folds, never a copy). A packed checkpoint holds one
-//! `[out, K]` weight per expert, and the packed expert chain reads those
-//! ([`poot_graph_ir::ops::packed_indexed_linear`] for one row, `packed_grouped_linear` for more).
+//! Experts bind as stored (ADR-0103). A checkpoint holds one projection of every expert as a stack, mapped
+//! as one [`MoeRole::Stack`] weight (a stored `[experts, out, K]` tensor, or the per-expert tensors, dense or
+//! packed, viewed as one stack), and every projection is the logical dense
+//! [`poot_graph_ir::Builder::indexed_matmul`] over it: a `[experts, out, K]` stack is read through a
+//! transposed view that `compile` folds, never a copy. A packed stack is rewritten by the one packed-weight
+//! transform (`poot_graph_plan::bind_packed_weights`) into one indexed packed contraction over the stored
+//! blocks, so there is no packed arm here.
 
-use poot_graph_ir::ops::{self, PackedLinearGraphRow};
-use poot_graph_ir::{BinOp, Builder, RedOp, Scalar, Traced};
-use poot_quant::weights::{
-    ExpertProj, HandleFormat, MoeRole, WeightHandle, WeightId, WeightMap, WeightRole,
-};
+use poot_graph_ir::{BinOp, Builder, RedOp, Scalar, Traced, ops};
+use poot_quant::weights::{ExpertProj, MoeRole, WeightId, WeightMap, WeightRole};
 
 use super::ffn::{Glu, glu};
 use super::linear::{Weight, WeightError, linear};
 use super::norm::NormParams;
-use super::router::{RouterBias, RouterKind, RouterParams, RouterWeights, route};
+use super::router::{RouterBias, RouterKind, RouterParams, RouterWeights, Routes, route};
 use super::standard::{ParamError, Step};
 use crate::model::{FamilyKey, ModelError, ShapeReason, StepShape, TraceError};
 
@@ -57,6 +56,7 @@ pub struct MoeParams {
     gate_up: GateUpForm,
     expert_bias: bool,
     shared: Option<usize>,
+    shared_gate: bool,
 }
 
 impl MoeParams {
@@ -88,6 +88,7 @@ impl MoeParams {
             gate_up: GateUpForm::Split,
             expert_bias: false,
             shared: None,
+            shared_gate: false,
         })
     }
 
@@ -102,6 +103,21 @@ impl MoeParams {
         }
         Ok(Self {
             shared: Some(inter),
+            ..self
+        })
+    }
+
+    /// The shared expert's output is multiplied by `sigmoid(gate . x)`, one scalar per token from the
+    /// layer's shared-gate weight (Qwen3-Next). Refused without a shared expert.
+    pub fn with_shared_gate(self) -> Result<Self, ParamError> {
+        if self.shared.is_none() {
+            return Err(ParamError::new(
+                "shared_expert_gate",
+                crate::model::ConfigReason::Unsupported,
+            ));
+        }
+        Ok(Self {
+            shared_gate: true,
             ..self
         })
     }
@@ -188,11 +204,10 @@ impl MoeParams {
     }
 }
 
-/// The largest row count the packed grouped chain orders exactly: its expert ids and row
-/// indices are carried in F32.
+/// The largest count the routing carries exactly: expert ids ride in F32.
 const MAX_EXACT_ROWS: usize = 1 << 24;
 
-/// Refuse a step whose `tokens * top_k` routed rows exceed what the expert chain indexes exactly.
+/// Refuse a step whose `tokens * top_k` routed rows, or whose expert count, exceed what F32 ids index exactly.
 pub fn check_step(
     family: FamilyKey,
     shape: StepShape,
@@ -215,32 +230,19 @@ pub fn check_step(
     Ok(())
 }
 
-/// A dense expert stack: one weight holding the projection of every expert.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct DenseStack {
-    weight: Weight,
-    orientation: Orientation,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Table {
-    Dense(DenseStack),
-    /// One packed `[out, K]` weight per expert, in expert order.
-    Packed(Vec<PackedLinearGraphRow>),
-}
-
-/// One projection of every expert of a layer, dense or packed, with its optional bias stack
+/// One projection of every expert of a layer as one stack weight `[experts, out, K]` (or `[experts, K, out]`
+/// for a dense [`Orientation::InOut`] checkpoint), dense or packed, with its optional bias stack
 /// `[experts, out]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExpertProjection {
-    table: Table,
+    weight: Weight,
+    orientation: Orientation,
     bias: Option<Weight>,
     out: usize,
 }
 
 impl ExpertProjection {
-    /// `proj` of every expert of `layer`: the mapped [`MoeRole::Stack`] when the checkpoint holds the
-    /// experts dense, else the [`MoeRole::Expert`] weight of each expert (all packed alike).
+    /// `proj` of every expert of `layer`: the mapped [`MoeRole::Stack`] weight.
     fn new(
         map: &WeightMap,
         layer: usize,
@@ -251,82 +253,31 @@ impl ExpertProjection {
     ) -> Result<Self, WeightError> {
         let experts = p.experts();
         let id = |role| WeightId::layer(layer, WeightRole::Moe(role));
-        let stack = id(MoeRole::Stack(proj));
-        let table = if map.handle(stack).is_some() {
-            // A stack is the stored `[experts, ..]` tensor, or the per-expert tensors stacked into
-            // `[experts, out, K]`: always one 3-D weight, read in place.
-            let shape = match p.orientation {
-                Orientation::OutIn => vec![experts, out, k],
-                Orientation::InOut => vec![experts, k, out],
-            };
-            Table::Dense(DenseStack {
-                weight: Weight::new(map, stack, &shape)?,
-                orientation: p.orientation,
-            })
-        } else {
-            let mut rows: Vec<PackedLinearGraphRow> = Vec::with_capacity(experts);
-            for expert in 0..experts {
-                let id = id(MoeRole::Expert(proj, expert as u32));
-                Weight::new(map, id, &[out, k]).map_err(|e| match e {
-                    // No expert stack and no first expert: the stack is what is missing.
-                    WeightError::Unmapped { .. } if expert == 0 => {
-                        WeightError::Unmapped { id: stack }
-                    }
-                    other => other,
-                })?;
-                let WeightHandle {
-                    format: HandleFormat::Packed(descriptor),
-                    ..
-                } = map.handle(id).expect("checked by Weight::new").clone()
-                else {
-                    return Err(WeightError::Format {
-                        id,
-                        format: map.handle(id).expect("checked by Weight::new").format,
-                    });
-                };
-                if rows.first().is_some_and(|r| r.descriptor != descriptor) {
-                    return Err(WeightError::Format {
-                        id,
-                        format: HandleFormat::Packed(descriptor),
-                    });
-                }
-                rows.push(PackedLinearGraphRow {
-                    ordinal: expert,
-                    linear_id: id.const_name(),
-                    descriptor,
-                });
-            }
-            Table::Packed(rows)
+        let shape = match p.orientation {
+            Orientation::OutIn => vec![experts, out, k],
+            Orientation::InOut => vec![experts, k, out],
         };
+        let weight = Weight::new(map, id(MoeRole::Stack(proj)), &shape)?;
         let bias = p
             .expert_bias
             .then(|| Weight::new(map, id(MoeRole::StackBias(proj)), &[experts, out]))
             .transpose()?;
-        Ok(Self { table, bias, out })
+        Ok(Self {
+            weight,
+            orientation: p.orientation,
+            bias,
+            out,
+        })
     }
 
     /// `x[M, K]` through each row's expert (`ids[M]`): `[M, out]`.
-    fn project(&self, b: &Builder, x: Traced, ids: Traced, grouped: bool) -> Traced {
-        let y = match &self.table {
-            Table::Dense(stack) => {
-                let w = stack.weight.declare(b);
-                let w = match stack.orientation {
-                    Orientation::OutIn => b.transpose(w, vec![0, 2, 1]),
-                    Orientation::InOut => w,
-                };
-                b.indexed_matmul(x, w, ids)
-            }
-            Table::Packed(rows) => {
-                let packed = if grouped {
-                    ops::packed_grouped_linear(b, x, ids, rows)
-                } else {
-                    ops::packed_indexed_linear(b, x, ids, rows)
-                };
-                packed.expect(
-                    "expert rows are checked at construction and the row count by check_step",
-                )
-            }
+    fn project(&self, b: &Builder, x: Traced, ids: Traced) -> Traced {
+        let w = self.weight.declare(b);
+        let w = match self.orientation {
+            Orientation::OutIn => b.transpose(w, vec![0, 2, 1]),
+            Orientation::InOut => w,
         };
+        let y = b.indexed_matmul(x, w, ids);
         match &self.bias {
             Some(bias) => b.binary(BinOp::Add, y, expert_rows(b, bias, ids, self.out)),
             None => y,
@@ -360,12 +311,16 @@ enum GateUp {
     Fused(ExpertProjection),
 }
 
-/// The shared expert's gate and up `[inter, width]` and down `[width, inter]` projections.
+/// The shared expert's gate and up `[inter, width]` and down `[width, inter]` projections, and its
+/// scalar gate when the parameters have one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SharedExpert {
     gate: Weight,
     up: Weight,
     down: Weight,
+    /// The gate's one row over the width: `[1, width]` as `nn.Linear(width, 1)` stores it, or
+    /// `[width]` as a GGUF stores it.
+    scalar: Option<Weight>,
 }
 
 /// A layer's router and expert projections, and its shared expert when the parameters have one.
@@ -378,6 +333,11 @@ pub struct MoeWeights {
 }
 
 impl MoeWeights {
+    /// The router's weights, for a family that routes some layers itself.
+    pub fn router(&self) -> &RouterWeights {
+        &self.router
+    }
+
     pub fn new(map: &WeightMap, layer: usize, p: &MoeParams) -> Result<Self, WeightError> {
         let (width, inter) = (p.width, p.inter);
         let projection = |proj, out, k| ExpertProjection::new(map, layer, proj, p, out, k);
@@ -400,10 +360,19 @@ impl MoeWeights {
                         &shape,
                     )
                 };
+                let scalar = p
+                    .shared_gate
+                    .then(|| {
+                        let id = WeightId::layer(layer, WeightRole::Moe(MoeRole::SharedGate));
+                        Weight::new(map, id, &[1, width])
+                            .or_else(|_| Weight::new(map, id, &[width]))
+                    })
+                    .transpose()?;
                 Ok(SharedExpert {
                     gate: w(ExpertProj::Gate, [shared_inter, width])?,
                     up: w(ExpertProj::Up, [shared_inter, width])?,
                     down: w(ExpertProj::Down, [width, shared_inter])?,
+                    scalar,
                 })
             })
             .transpose()?;
@@ -435,13 +404,35 @@ pub fn moe(
     );
     let width = p.width;
     let tokens = shape.iter().product::<usize>() / width;
+
+    let flat = b.reshape(x, vec![tokens, width]);
+    let route_x = route_x.map_or(flat, |r| b.reshape(r, vec![tokens, width]));
+    let routes = route(b, step, layer, route_x, &w.router, &p.router);
+    experts_of(b, flat, shape, routes, w, p)
+}
+
+/// The experts of a routed block over `x[.., width]`, given the `routes` of its tokens (`T` rows
+/// of `top_k` ids and weights): the same shape back. A family that chooses its experts itself (a
+/// hash router) calls this with its own routes; [`moe`] calls it with [`route`]'s.
+pub fn experts(b: &Builder, x: Traced, routes: Routes, w: &MoeWeights, p: &MoeParams) -> Traced {
+    let shape = b.aval(x).shape;
+    let tokens = shape.iter().product::<usize>() / p.width;
+    experts_of(b, b.reshape(x, vec![tokens, p.width]), shape, routes, w, p)
+}
+
+/// [`experts`] over `x` already flattened to `[tokens, width]`, returning the original `shape`.
+fn experts_of(
+    b: &Builder,
+    x: Traced,
+    shape: Vec<usize>,
+    routes: Routes,
+    w: &MoeWeights,
+    p: &MoeParams,
+) -> Traced {
+    let (width, tokens) = (p.width, b.aval(x).shape[0]);
     let k = p.top_k();
     let rows = tokens * k;
-    let grouped = tokens > 1;
 
-    let x = b.reshape(x, vec![tokens, width]);
-    let route_x = route_x.map_or(x, |r| b.reshape(r, vec![tokens, width]));
-    let routes = route(b, step, layer, route_x, &w.router, &p.router);
     let ids = b.reshape(routes.ids, vec![rows]);
     // Row `t * k + r` is token `t` at its slot `r`.
     let x_rows = b.reshape(
@@ -450,12 +441,9 @@ pub fn moe(
     );
 
     let (gate, up) = match &w.gate_up {
-        GateUp::Split { gate, up } => (
-            gate.project(b, x_rows, ids, grouped),
-            up.project(b, x_rows, ids, grouped),
-        ),
+        GateUp::Split { gate, up } => (gate.project(b, x_rows, ids), up.project(b, x_rows, ids)),
         GateUp::Fused(both) => {
-            let fused = both.project(b, x_rows, ids, grouped);
+            let fused = both.project(b, x_rows, ids);
             let inter = p.inter;
             match p.gate_up {
                 GateUpForm::FusedInterleaved => {
@@ -471,7 +459,7 @@ pub fn moe(
         }
     };
     let hidden = glu(b, gate, up, &p.glu);
-    let out = w.down.project(b, hidden, ids, grouped);
+    let out = w.down.project(b, hidden, ids);
 
     // Weight each row, then sum each token's `k` rows (the executors reduce the last axis only).
     let weighted = b.binary(BinOp::Mul, out, b.reshape(routes.weights, vec![rows, 1]));
@@ -481,8 +469,16 @@ pub fn moe(
         Some(shared) => {
             let gate = linear(b, x, &shared.gate, None);
             let up = linear(b, x, &shared.up, None);
-            let shared = linear(b, glu(b, gate, up, &p.glu), &shared.down, None);
-            b.binary(BinOp::Add, y, b.reshape(shared, shape))
+            let out = linear(b, glu(b, gate, up, &p.glu), &shared.down, None);
+            let out = match &shared.scalar {
+                Some(scalar) => {
+                    let row = b.reshape(scalar.declare_f32(b), vec![1, width]);
+                    let logit = b.matmul(x, b.transpose(row, vec![1, 0])); // [tokens, 1]
+                    b.binary(BinOp::Mul, out, ops::sigmoid(b, logit))
+                }
+                None => out,
+            };
+            b.binary(BinOp::Add, y, b.reshape(out, shape))
         }
         None => y,
     }
@@ -545,18 +541,18 @@ mod tests {
             match storage {
                 Storage::Stack3 => fx.bf16(id(MoeRole::Stack(proj)), &[EXPERTS, out, k]),
                 Storage::StackInOut => fx.bf16(id(MoeRole::Stack(proj)), &[EXPERTS, k, out]),
-                Storage::Packed => {
-                    for e in 0..EXPERTS {
-                        fx.packed(
-                            id(MoeRole::Expert(proj, e as u32)),
+                Storage::Packed => fx.packed_stack(
+                    id(MoeRole::Stack(proj)),
+                    (0..EXPERTS)
+                        .map(|e| {
                             poot_test_util::packed::random_payload(
                                 WeightFormat::Q8_0,
                                 [out, k],
                                 100 * (proj as u64 + 1) + e as u64,
-                            ),
-                        );
-                    }
-                }
+                            )
+                        })
+                        .collect(),
+                ),
             }
         }
         fx
@@ -600,8 +596,7 @@ mod tests {
         let expert = |proj: ExpertProj, out: usize, k: usize| -> Vec<Vec<f32>> {
             (0..EXPERTS)
                 .map(|e| match storage {
-                    Storage::Packed => fx.values(id(MoeRole::Expert(proj, e as u32))),
-                    Storage::Stack3 => {
+                    Storage::Packed | Storage::Stack3 => {
                         fx.values(id(MoeRole::Stack(proj)))[e * out * k..(e + 1) * out * k].to_vec()
                     }
                     Storage::StackInOut => {
@@ -655,8 +650,8 @@ mod tests {
     }
 
     /// SC-002: the block over each expert storage (a stored
-    /// `[E, out, K]` stack, a stored `[E, K, out]` stack, and per-expert packed weights) matches an
-    /// independent f64 reference, for a prefill-shaped step (the grouped packed chain) and a
+    /// `[E, out, K]` stack, a stored `[E, K, out]` stack, and a stack of per-expert packed weights) matches an
+    /// independent f64 reference, for a prefill-shaped step and a
     /// decode-shaped one.
     #[test]
     fn the_block_matches_an_f64_reference_over_every_expert_storage() {
@@ -686,14 +681,7 @@ mod tests {
             let x = input();
             let base = run(&fx, storage, TOKENS, &x);
             let mut ids = vec![id(MoeRole::Router)];
-            for (proj, ..) in PROJECTIONS {
-                match storage {
-                    Storage::Packed => {
-                        ids.extend((0..EXPERTS).map(|e| id(MoeRole::Expert(proj, e as u32))));
-                    }
-                    _ => ids.push(id(MoeRole::Stack(proj))),
-                }
-            }
+            ids.extend(PROJECTIONS.map(|(proj, ..)| id(MoeRole::Stack(proj))));
             for weight in ids {
                 if matches!(storage, Storage::Packed) && weight != id(MoeRole::Router) {
                     continue; // a packed weight cannot be perturbed in place; see the packed row below
@@ -717,13 +705,23 @@ mod tests {
             let mut any = false;
             for e in 0..EXPERTS {
                 let mut changed = fx.clone();
-                changed.packed(
-                    id(MoeRole::Expert(proj, e as u32)),
-                    poot_test_util::packed::random_payload(
-                        WeightFormat::Q8_0,
-                        [out, k],
-                        9_000 + e as u64,
-                    ),
+                changed.packed_stack(
+                    id(MoeRole::Stack(proj)),
+                    (0..EXPERTS)
+                        .map(|other| {
+                            // Expert `e` replaced, every other expert as it was.
+                            let seed = if other == e {
+                                9_000 + e as u64
+                            } else {
+                                100 * (proj as u64 + 1) + other as u64
+                            };
+                            poot_test_util::packed::random_payload(
+                                WeightFormat::Q8_0,
+                                [out, k],
+                                seed,
+                            )
+                        })
+                        .collect(),
                 );
                 any |= run(&changed, Storage::Packed, TOKENS, &x)
                     .iter()
@@ -788,7 +786,13 @@ mod layout_tests {
         /// Gemma 4's router: it reads its own input, scaled and normalized, and each expert's
         /// gate has a learned scale.
         scaled_router: bool,
+        /// An always-active shared expert, with (`shared_gate`) or without a sigmoid scalar gate
+        /// (Qwen3-Next; DeepSeek).
+        shared: bool,
+        shared_gate: bool,
     }
+
+    const SHARED_INTER: usize = 4;
 
     const BASE: Case = Case {
         orientation: Orientation::OutIn,
@@ -798,6 +802,8 @@ mod layout_tests {
         router_bias: false,
         expert_bias: false,
         scaled_router: false,
+        shared: false,
+        shared_gate: false,
     };
 
     fn params(c: Case) -> MoeParams {
@@ -817,6 +823,12 @@ mod layout_tests {
                 .with_scaled_router_input(NormParams::new(1e-6).unwrap())
                 .with_expert_scale()
                 .unwrap();
+        }
+        if c.shared {
+            p = p.with_shared(SHARED_INTER).unwrap();
+        }
+        if c.shared_gate {
+            p = p.with_shared_gate().unwrap();
         }
         p
     }
@@ -854,6 +866,14 @@ mod layout_tests {
             if c.expert_bias {
                 r.push((MoeRole::StackBias(proj), vec![EXPERTS, out]));
             }
+        }
+        if c.shared {
+            r.push((MoeRole::Shared(ExpertProj::Gate), vec![SHARED_INTER, WIDTH]));
+            r.push((MoeRole::Shared(ExpertProj::Up), vec![SHARED_INTER, WIDTH]));
+            r.push((MoeRole::Shared(ExpertProj::Down), vec![WIDTH, SHARED_INTER]));
+        }
+        if c.shared_gate {
+            r.push((MoeRole::SharedGate, vec![1, WIDTH]));
         }
         r
     }
@@ -960,6 +980,10 @@ mod layout_tests {
                 let g = g.min(limit);
                 (u.clamp(-limit, limit) + 1.0) * g / (1.0 + (-alpha * g).exp())
             }
+            Glu::ClampedSilu { limit } => {
+                let g = g.min(f64::from(limit));
+                g / (1.0 + (-g).exp()) * u.clamp(-f64::from(limit), f64::from(limit))
+            }
             Glu::Silu => g / (1.0 + (-g).exp()) * u,
             Glu::Gelu => gelu_tanh(g) * u,
         };
@@ -1041,6 +1065,32 @@ mod layout_tests {
                     *acc += weight * d;
                 }
             }
+            if c.shared {
+                let shared = |role, rows: usize, k: usize, v: &[f64]| -> Vec<f64> {
+                    let w = vals(role);
+                    (0..rows)
+                        .map(|o| (0..k).map(|i| v[i] * w[o * k + i]).sum::<f64>())
+                        .collect()
+                };
+                let g = shared(MoeRole::Shared(ExpertProj::Gate), SHARED_INTER, WIDTH, &v);
+                let u = shared(MoeRole::Shared(ExpertProj::Up), SHARED_INTER, WIDTH, &v);
+                let hidden: Vec<f64> = g.iter().zip(&u).map(|(&g, &u)| activation(g, u)).collect();
+                let down = shared(
+                    MoeRole::Shared(ExpertProj::Down),
+                    WIDTH,
+                    SHARED_INTER,
+                    &hidden,
+                );
+                let scale = if c.shared_gate {
+                    let logit: f64 = shared(MoeRole::SharedGate, 1, WIDTH, &v)[0];
+                    1.0 / (1.0 + (-logit).exp())
+                } else {
+                    1.0
+                };
+                for (acc, d) in y.iter_mut().zip(down) {
+                    *acc += scale * d;
+                }
+            }
             out.extend(y);
         }
         out
@@ -1095,6 +1145,8 @@ mod layout_tests {
             router_bias: true,
             expert_bias: true,
             scaled_router: false,
+            shared: false,
+            shared_gate: false,
         });
         // The same biased experts with separate gate and up, `[E, out, K]`.
         assert_case(Case {
@@ -1117,6 +1169,55 @@ mod layout_tests {
             scaled_router: true,
             ..BASE
         });
+    }
+
+    /// The shared expert (DeepSeek's, ungated) and Qwen3-Next's (a sigmoid scalar gate per token
+    /// over the shared output) match the reference; the gate weight is among the perturbed ones.
+    /// Mutation: apply the gate to the routed output instead of the shared one; red.
+    #[test]
+    fn a_shared_expert_with_and_without_a_sigmoid_gate_matches_the_reference() {
+        assert_case(Case {
+            shared: true,
+            ..BASE
+        });
+        assert_case(Case {
+            shared: true,
+            shared_gate: true,
+            ..BASE
+        });
+    }
+
+    /// The gate is stored `[1, width]` (an `nn.Linear(width, 1)`) or `[width]` (a GGUF vector), and a
+    /// gate needs a shared expert to gate.
+    #[test]
+    fn the_shared_gate_reads_either_stored_shape_and_needs_a_shared_expert() {
+        let c = Case {
+            shared: true,
+            shared_gate: true,
+            ..BASE
+        };
+        let fx = fixture(c);
+        let x = inputs();
+        let want = run(&fx, c, &x);
+        let mut flat = fx.clone();
+        flat.set(
+            id(MoeRole::SharedGate),
+            &[WIDTH],
+            fx.values(id(MoeRole::SharedGate)),
+        );
+        assert_eq!(run(&flat, c, &x), want);
+        let mut wrong = fx.clone();
+        wrong.set(id(MoeRole::SharedGate), &[2, WIDTH], vec![0.5; 2 * WIDTH]);
+        assert!(MoeWeights::new(&wrong.map(), LAYER, &params(c)).is_err());
+        assert_eq!(
+            MoeParams::new(FAMILY, WIDTH, INTER, EXPERTS, TOP_K, BASE.kind)
+                .unwrap()
+                .with_shared_gate(),
+            Err(ParamError::new(
+                "shared_expert_gate",
+                ConfigReason::Unsupported
+            ))
+        );
     }
 
     /// `MoeParams::new` refuses each extent no block can use, naming the field.

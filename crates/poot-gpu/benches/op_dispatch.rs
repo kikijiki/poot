@@ -11,6 +11,7 @@
 //!
 //! Skips silently when no Vulkan adapter is available.
 
+use poot_test_util::const_weights::ConstWeights;
 use std::sync::Arc;
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
@@ -54,13 +55,10 @@ fn setup(
         let dense = DenseWeight::try_new(DType::F32, shape.clone(), Arc::from(bytes)).ok()?;
         builder.insert(*name, WeightEntry::Dense(dense)).ok()?;
     }
-    let exe = engine
-        .load_weights(
-            Arc::new(builder.build()),
-            poot_executor::WeightSource::ConstNames,
-        )
-        .ok()?;
-    let g = g.clone().with_validations(Vec::new());
+    let store = builder.build();
+    let (g, map) = ConstWeights::bind(g, &store);
+    let exe = engine.load_weights(Arc::new(store), Arc::new(map)).ok()?;
+    let g = g.with_validations(Vec::new());
     let staged = compile_staged(
         &g,
         &TargetSet::single(DeviceId(0), target),
@@ -68,10 +66,7 @@ fn setup(
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions {
-            execution: Submission::Replay,
-            limits: poot_graph_plan::CompileLimits::STANDARD,
-        },
+        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
     )
     .ok()?;
     let entry = engine.add_entry(exe, &staged).ok()?;

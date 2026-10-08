@@ -154,6 +154,11 @@ pub struct Context {
     /// Active compute units, probed from AMD's Vulkan shader-core properties at init (card 653); the
     /// RDNA3 default where the driver exposes no such query. Feeds [`Context::device_caps`].
     compute_units: u32,
+    /// The device-local memory budget the process had when the context opened
+    /// ([`Context::vram_budget_bytes`], `VK_EXT_memory_budget`). Fixed at open: it is part of the
+    /// planner's [`poot_target::Target`] identity, which a later query must not change under a program
+    /// compiled for it. Feeds [`Context::device_caps`].
+    memory_budget_bytes: Option<u64>,
     /// Same condition as [`Context::effective_max_buffer_size`]'s RADV scoping: the adapter is AMD
     /// (vendor `0x1002`) over Vulkan. The iGPU display watchdog and the card-095 tiled-GEMM miscompile
     /// are calibrated facts about that driver stack, not something a device query answers, so

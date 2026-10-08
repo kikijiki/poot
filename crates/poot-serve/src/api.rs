@@ -1,7 +1,8 @@
 //! OpenAI-compatible API types (request/response structs, serde) and request-shaping helpers.
 
 use anyhow::{Context, Result, bail};
-use poot_llm::{LoraAdapterLease, Modality, Runner, Sampler, TokenLogprob};
+use poot_llm::driver::{AdapterRef, ModelHandle};
+use poot_llm::{Modality, Sampler, TokenLogprob};
 use serde::{Deserialize, Serialize};
 
 use crate::types::GenerationError;
@@ -56,20 +57,21 @@ pub(crate) fn sampler_of(p: &SamplingParams) -> Sampler {
 }
 
 /// Resolve a request's `lora_adapter` extension field (see [`CompletionReq::lora_adapter`]/
-/// [`ChatReq::lora_adapter`]) and acquire its request-owned lease at the HTTP layer, before the `Job`
-/// reaches the engine. Resolution and acquisition are atomic under the Runner's pool lock, so an
-/// unload cannot reuse the selected slot while the request waits for admission. `None` (absent or
-/// `null`) is an inert no-adapter lease with no pool lookup, so such a request behaves the same
-/// whether or not the server was started with `--lora-adapter` flags. A named adapter that is not
-/// registered is a hard error (as in `poot_load::lora::LoraAdapterConfig::unsupported_targets`): a
-/// typo must not silently serve the un-adapted model.
+/// [`ChatReq::lora_adapter`]) at the HTTP layer, before the `Job` reaches the engine. `None` (absent or
+/// `null`) is [`AdapterRef::Base`], so such a request behaves the same whether or not adapters are
+/// loaded. A named adapter is a hard error while no adapter set is loaded: a typo must not silently serve
+/// the un-adapted model, and adapter sets load through the driver, which this server does not run yet.
 pub(crate) fn resolve_lora_adapter(
-    runner: &Runner,
+    _handle: &ModelHandle,
     name: &Option<String>,
-) -> Result<LoraAdapterLease> {
-    runner
-        .acquire_lora_adapter(name.as_deref())
-        .map_err(anyhow::Error::from)
+) -> Result<AdapterRef> {
+    match name.as_deref() {
+        None => Ok(AdapterRef::Base),
+        Some(name) => bail!(
+            "unknown lora_adapter {name:?}: no adapter is loaded (adapter sets load on the driver, \
+             which this server does not serve yet)"
+        ),
+    }
 }
 
 /// Build the OpenAI-style `logprobs` object from the per-token records, decoding each token id to
@@ -77,12 +79,12 @@ pub(crate) fn resolve_lora_adapter(
 /// endpoints. Records are truncated to `limit` so they align with the returned (possibly
 /// stop-trimmed) text.
 pub(crate) fn logprobs_json(
-    runner: &Runner,
+    handle: &ModelHandle,
     records: &[TokenLogprob],
     limit: usize,
 ) -> serde_json::Value {
     let entry = |id: u32, logprob: f32| -> serde_json::Value {
-        let piece = runner.decode(&[id]).unwrap_or_default();
+        let piece = handle.text().decode(&[id]).unwrap_or_default();
         serde_json::json!({ "token": piece, "logprob": logprob, "bytes": piece.as_bytes() })
     };
     let content: Vec<serde_json::Value> = records
@@ -140,7 +142,7 @@ impl std::error::Error for LoraAdapterError {
 }
 
 /// A content part the loaded model cannot take: a modality it has no front end for (see
-/// [`Runner::accepts_modality`]) or a part type this server does not know. An explicit refusal, not a
+/// [`ModelHandle::accepts_modality`]) or a part type this server does not know. An explicit refusal, not a
 /// silent ignore: the part would otherwise be dropped and the model would answer a different request than
 /// the one sent.
 #[derive(Debug)]
@@ -174,12 +176,15 @@ fn part_modality(part_type: &str) -> Option<Modality> {
 }
 
 /// Refuse a chat request that carries a content part the loaded model cannot take, before any generation
-/// work. The decision is the model's capability ([`Runner::accepts_modality`]), never its family; a part
+/// work. The decision is the model's capability ([`ModelHandle::accepts_modality`]), never its family; a part
 /// type nothing can take is refused for every model.
-pub(crate) fn reject_unsupported_modality(runner: &Runner, req: &ChatReq) -> anyhow::Result<()> {
+pub(crate) fn reject_unsupported_modality(
+    handle: &ModelHandle,
+    req: &ChatReq,
+) -> anyhow::Result<()> {
     for part_type in req.messages.iter().flat_map(|msg| &msg.non_text_parts) {
         let modality = part_modality(part_type);
-        if modality.is_some_and(|modality| runner.accepts_modality(modality)) {
+        if modality.is_some_and(|modality| handle.accepts_modality(modality)) {
             continue;
         }
         return Err(anyhow::Error::new(UnsupportedCapabilityError {
@@ -218,7 +223,7 @@ pub(crate) fn classify_handler_error(e: &anyhow::Error) -> (u16, &'static str) {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_guided(
     sampler: Sampler,
-    runner: &Runner,
+    handle: &ModelHandle,
     guided_choice: &Option<Vec<String>>,
     guided_regex: &Option<String>,
     guided_grammar: &Option<String>,
@@ -233,32 +238,32 @@ pub(crate) fn apply_guided(
     // the model + template.
     if let Some(forced) = resolve_forced_tools(tools, tool_choice)?
         && matches!(
-            runner.chat_format(),
+            handle.text().chat_format(),
             poot_models::chat::ChatFormat::ChatML | poot_models::chat::ChatFormat::Granite
         )
     {
-        return Ok(sampler.with_constraint(runner.build_tool_call_constraint(&forced)?));
+        return Ok(sampler.with_constraint(handle.text().build_tool_call_constraint(&forced)?));
     }
     if let Some(choices) = guided_choice.as_ref().filter(|c| !c.is_empty()) {
-        return Ok(sampler.with_constraint(runner.build_choice_constraint(choices)?));
+        return Ok(sampler.with_constraint(handle.text().build_choice_constraint(choices)?));
     }
     if let Some(pattern) = guided_regex.as_ref().filter(|p| !p.is_empty()) {
-        return Ok(sampler.with_constraint(runner.build_regex_constraint(pattern)?));
+        return Ok(sampler.with_constraint(handle.text().build_regex_constraint(pattern)?));
     }
     if let Some(gbnf) = guided_grammar.as_ref().filter(|g| !g.is_empty()) {
-        return Ok(sampler.with_constraint(runner.build_grammar_constraint(gbnf)?));
+        return Ok(sampler.with_constraint(handle.text().build_grammar_constraint(gbnf)?));
     }
     if let Some(schema) = guided_json {
-        return Ok(sampler.with_constraint(runner.build_json_constraint(schema)?));
+        return Ok(sampler.with_constraint(handle.text().build_json_constraint(schema)?));
     }
     // OpenAI structured outputs (the standard field clients send, vs poot's `guided_json` extension).
     if let Some(rf) = response_format {
         match response_format_constraint(rf)? {
             ResponseFormatConstraint::Schema(schema) => {
-                return Ok(sampler.with_constraint(runner.build_json_constraint(schema)?));
+                return Ok(sampler.with_constraint(handle.text().build_json_constraint(schema)?));
             }
             ResponseFormatConstraint::JsonObject => {
-                return Ok(sampler.with_constraint(runner.build_json_object_constraint()?));
+                return Ok(sampler.with_constraint(handle.text().build_json_object_constraint()?));
             }
             ResponseFormatConstraint::Unconstrained => {}
         }
@@ -487,11 +492,10 @@ pub(crate) struct CompletionReq {
     /// OpenAI `n`: how many independent completions to return (default 1).
     #[serde(default = "default_n")]
     pub(crate) n: usize,
-    /// poot extension (spec 248, epic 129 B8): select a LoRA adapter registered at startup via
-    /// `--lora-adapter name=path` (see `main.rs`), by name. Resolved to a
-    /// `poot_load::lora::LoraAdapterPool` index by [`resolve_lora_adapter`] before the job reaches the
-    /// engine; an unknown name is a 400, not a fallback to the un-adapted base. Absent or `null` means
-    /// no adapter.
+    /// poot extension (spec 248, epic 129 B8): select a loaded LoRA adapter by name. Resolved to an
+    /// adapter selection by [`resolve_lora_adapter`] before the job reaches the engine; an unknown name
+    /// is a 400, not a fallback to the un-adapted base (and no adapter is loaded yet). Absent or `null`
+    /// means no adapter.
     #[serde(default)]
     pub(crate) lora_adapter: Option<String>,
 }

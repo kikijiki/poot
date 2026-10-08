@@ -9,8 +9,10 @@ mod decode_plan;
 // `crate::helpers::WeightLane` (Card 1007) reads a packed F16 dense weight through the same float
 // decode every packed body uses, rather than restating the binary16 layout.
 pub(crate) mod float_decode;
+mod indexed;
 mod kernel;
 mod planar;
+mod source;
 
 pub(crate) use kernel::packed_contraction;
 pub use kernel::{PackedKernelOp, PackedKernelSpec, packed_kernel};
@@ -575,303 +577,6 @@ mod planar_fixtures {
 }
 
 #[cfg(test)]
-mod materialize_tests {
-    //! SC-001 (card 542a): `packed_kernel(Materialize)` run in the KIR interpreter equals
-    //! `poot_quant::plan::decode_blocks`'s `to_bits` on every element, for every block-32 format
-    //! (tier 1, GPU-free).
-
-    use poot_kernel_ir::interp::{Buffer, run};
-    use poot_test_util::kernel_fixtures::workgroups_covering;
-
-    use super::fixtures::{BLOCK32, KQUANT, fixture, pack_words};
-    use super::kernel::{PackedKernelOp, PackedKernelSpec, packed_kernel};
-
-    /// SC-001 (card 542b): `packed_kernel(Materialize)` run in the KIR interpreter equals
-    /// `poot_quant::plan::decode_blocks`'s `to_bits` on every element, for every K-quant super-block
-    /// format (tier 1, GPU-free). The two-piece `SubScale`/`SubMin` sub-factors are exercised here for
-    /// the first time (542a's block-32 formats have none). Mutation: drop `SubMin`'s high piece in
-    /// `DecodePlan::emit_factors` (`Field { pieces: &field.pieces[..1], .. }`); the Q4_K and Q5_K rows
-    /// go red (their `dmin*m` term reads only the low nibble of an 8-value range, decoding a wrong
-    /// min for every sub-block whose true `m` needs the high two bits).
-    #[test]
-    fn materialize_matches_decode_blocks_for_every_kquant_format() {
-        let out_rows = 3;
-        let blocks_per_row = 2;
-        for (seed, format) in KQUANT.into_iter().enumerate() {
-            let (k, bytes, expected) = fixture(format, out_rows, blocks_per_row, seed as u64);
-
-            let spec = PackedKernelSpec {
-                format,
-                op: PackedKernelOp::Materialize,
-            };
-            let body = packed_kernel(&format!("materialize_kquant_{format:?}"), spec)
-                .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
-
-            let words = pack_words(&bytes);
-            let mut buffers = [
-                Buffer::from_u32s(&words),
-                Buffer::from_u32s(&[k as u32]),
-                Buffer::from_f32s(&vec![0.0; out_rows * k]),
-            ];
-            run(
-                &body,
-                workgroups_covering(&body, out_rows * k),
-                &mut buffers,
-            )
-            .unwrap_or_else(|error| panic!("{format:?}: interpreter: {error}"));
-            let got = buffers[2].to_f32s().unwrap();
-
-            let got_bits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
-            let want_bits: Vec<u32> = expected.iter().map(|v| v.to_bits()).collect();
-            assert_eq!(
-                got_bits, want_bits,
-                "{format:?}: Materialize vs decode_blocks"
-            );
-        }
-    }
-
-    /// Sanity only (not acceptance, as the block-32 sibling above): every K-quant `Materialize` body
-    /// compiles for SPIR-V and NVPTX.
-    #[test]
-    fn materialize_bodies_compile_for_kquant_spirv_and_nvptx() {
-        for format in KQUANT {
-            let spec = PackedKernelSpec {
-                format,
-                op: PackedKernelOp::Materialize,
-            };
-            let body = packed_kernel(&format!("materialize_kquant_{format:?}"), spec).unwrap();
-            let _ = crate::test_support::spv(&body, &format!("materialize_kquant_{format:?}_spv"));
-            let _ = crate::test_support::ptx(&body, &format!("materialize_kquant_{format:?}_ptx"));
-        }
-    }
-
-    #[test]
-    fn materialize_bodies_compile_for_kquant_amdgcn() {
-        use poot_codegen::{Target, artifact_path, compile};
-        let arch = poot_target::AmdArch::gfx1151();
-        for format in KQUANT {
-            let spec = PackedKernelSpec {
-                format,
-                op: PackedKernelOp::Materialize,
-            };
-            let name = format!("materialize_kquant_{format:?}_amdgcn");
-            let body = packed_kernel(&name, spec).unwrap();
-            let dir = std::env::temp_dir()
-                .join("poot-kernelgen-unit-test")
-                .join(&name);
-            std::fs::create_dir_all(&dir).unwrap();
-            let out = artifact_path(&dir, &name, Target::AmdGcn(arch));
-            compile(&body, Target::AmdGcn(arch), &out)
-                .unwrap_or_else(|error| panic!("{format:?}: AMDGCN compile: {error}"));
-        }
-    }
-
-    /// SC-002 (card 542b, device tier 1): `Materialize` for every K-quant format equals the oracle's
-    /// `to_bits` on the local wgpu (SPIR-V/RADV) device (the block-32 `materialize_matches_decode_blocks_on_wgpu`
-    /// row's K-quant sibling).
-    #[test]
-    fn materialize_matches_decode_blocks_on_wgpu_kquant() {
-        use poot_codegen::{Target, artifact_path, compile, kernel_handle};
-        use poot_runtime::{Context, KernelBuffer};
-
-        let ctx = match Context::new() {
-            Ok(ctx) => ctx,
-            Err(error) => {
-                eprintln!("no GPU ({error}); skipping");
-                return;
-            }
-        };
-
-        let out_rows = 3;
-        let blocks_per_row = 2;
-        for (seed, format) in KQUANT.into_iter().enumerate() {
-            let (k, bytes, expected) = fixture(format, out_rows, blocks_per_row, seed as u64);
-
-            let spec = PackedKernelSpec {
-                format,
-                op: PackedKernelOp::Materialize,
-            };
-            let name = format!("materialize_wgpu_kquant_{format:?}");
-            let body = packed_kernel(&name, spec)
-                .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
-            let dir = std::env::temp_dir()
-                .join("poot-kernelgen-sc004")
-                .join(&name);
-            std::fs::create_dir_all(&dir).unwrap();
-            let out_path = artifact_path(&dir, &name, Target::SpirvVulkan);
-            compile(&body, Target::SpirvVulkan, &out_path)
-                .unwrap_or_else(|error| panic!("{format:?}: compile: {error}"));
-            let spirv_bytes = std::fs::read(&out_path).unwrap();
-            let kernel = kernel_handle(&body, Target::SpirvVulkan, spirv_bytes);
-
-            let words = pack_words(&bytes);
-            let mut buffers = [
-                KernelBuffer::read_only_u32(&words),
-                KernelBuffer::read_only_u32(&[k as u32]),
-                KernelBuffer::write_f32(out_rows * k),
-            ];
-            ctx.dispatch(
-                &name,
-                &kernel,
-                body.workgroup_size,
-                [(out_rows * k) as u32, 1, 1],
-                &mut buffers,
-            )
-            .unwrap_or_else(|error| panic!("{format:?}: dispatch: {error}"));
-            let got = buffers[2].as_f32();
-
-            let got_bits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
-            let want_bits: Vec<u32> = expected.iter().map(|v| v.to_bits()).collect();
-            assert_eq!(
-                got_bits, want_bits,
-                "{format:?}: Materialize (wgpu) vs decode_blocks"
-            );
-        }
-    }
-
-    #[test]
-    fn materialize_matches_decode_blocks_for_every_block32_format() {
-        let out_rows = 3;
-        let blocks_per_row = 2;
-        for (seed, format) in BLOCK32.into_iter().enumerate() {
-            let (k, bytes, expected) = fixture(format, out_rows, blocks_per_row, seed as u64);
-
-            let spec = PackedKernelSpec {
-                format,
-                op: PackedKernelOp::Materialize,
-            };
-            let body = packed_kernel(&format!("materialize_{format:?}"), spec)
-                .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
-
-            let words = pack_words(&bytes);
-            let mut buffers = [
-                Buffer::from_u32s(&words),
-                Buffer::from_u32s(&[k as u32]),
-                Buffer::from_f32s(&vec![0.0; out_rows * k]),
-            ];
-            run(
-                &body,
-                workgroups_covering(&body, out_rows * k),
-                &mut buffers,
-            )
-            .unwrap_or_else(|error| panic!("{format:?}: interpreter: {error}"));
-            let got = buffers[2].to_f32s().unwrap();
-
-            let got_bits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
-            let want_bits: Vec<u32> = expected.iter().map(|v| v.to_bits()).collect();
-            assert_eq!(
-                got_bits, want_bits,
-                "{format:?}: Materialize vs decode_blocks"
-            );
-        }
-    }
-
-    /// Sanity only (not acceptance): every block-32 `Materialize` body actually lowers through
-    /// `poot-codegen` to SPIR-V and NVPTX, so a KIR construct this module relies on (`Ty::U32`
-    /// arithmetic, `Bitcast`, the branchless `select_u32` pattern) is not accidentally
-    /// interpreter-only. Device execution (SC-004) is separate, GPU/pod evidence.
-    #[test]
-    fn materialize_bodies_compile_for_spirv_and_nvptx() {
-        for format in BLOCK32 {
-            let spec = PackedKernelSpec {
-                format,
-                op: PackedKernelOp::Materialize,
-            };
-            let body = packed_kernel(&format!("materialize_{format:?}"), spec).unwrap();
-            let _ = crate::test_support::spv(&body, &format!("materialize_{format:?}_spv"));
-            let _ = crate::test_support::ptx(&body, &format!("materialize_{format:?}_ptx"));
-        }
-    }
-
-    /// Sanity only (as above): every block-32 `Materialize` body also lowers to AMDGCN (HSACO), the
-    /// third backend the card's device rows (SC-004) run on.
-    #[test]
-    fn materialize_bodies_compile_for_amdgcn() {
-        use poot_codegen::{Target, artifact_path, compile};
-        let arch = poot_target::AmdArch::gfx1151();
-        for format in BLOCK32 {
-            let spec = PackedKernelSpec {
-                format,
-                op: PackedKernelOp::Materialize,
-            };
-            let name = format!("materialize_{format:?}_amdgcn");
-            let body = packed_kernel(&name, spec).unwrap();
-            let dir = std::env::temp_dir()
-                .join("poot-kernelgen-unit-test")
-                .join(&name);
-            std::fs::create_dir_all(&dir).unwrap();
-            let out = artifact_path(&dir, &name, Target::AmdGcn(arch));
-            compile(&body, Target::AmdGcn(arch), &out)
-                .unwrap_or_else(|error| panic!("{format:?}: AMDGCN compile: {error}"));
-        }
-    }
-
-    /// SC-004 (card 542a, device tier 1): `Materialize` for every block-32 format equals the oracle's
-    /// `to_bits` on the local wgpu (SPIR-V/RADV) device. Skips (does not fail) with no Vulkan adapter,
-    /// matching every other GPU test in this crate (`nix develop` required; run serial under
-    /// `/tmp/poot-gpu.lock`).
-    #[test]
-    fn materialize_matches_decode_blocks_on_wgpu() {
-        use poot_codegen::{Target, artifact_path, compile, kernel_handle};
-        use poot_runtime::{Context, KernelBuffer};
-
-        let ctx = match Context::new() {
-            Ok(ctx) => ctx,
-            Err(error) => {
-                eprintln!("no GPU ({error}); skipping");
-                return;
-            }
-        };
-
-        let out_rows = 3;
-        let blocks_per_row = 2;
-        for (seed, format) in BLOCK32.into_iter().enumerate() {
-            let (k, bytes, expected) = fixture(format, out_rows, blocks_per_row, seed as u64);
-
-            let spec = PackedKernelSpec {
-                format,
-                op: PackedKernelOp::Materialize,
-            };
-            let name = format!("materialize_wgpu_{format:?}");
-            let body = packed_kernel(&name, spec)
-                .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
-            let dir = std::env::temp_dir()
-                .join("poot-kernelgen-sc004")
-                .join(&name);
-            std::fs::create_dir_all(&dir).unwrap();
-            let out_path = artifact_path(&dir, &name, Target::SpirvVulkan);
-            compile(&body, Target::SpirvVulkan, &out_path)
-                .unwrap_or_else(|error| panic!("{format:?}: compile: {error}"));
-            let spirv_bytes = std::fs::read(&out_path).unwrap();
-            let kernel = kernel_handle(&body, Target::SpirvVulkan, spirv_bytes);
-
-            let words = pack_words(&bytes);
-            let mut buffers = [
-                KernelBuffer::read_only_u32(&words),
-                KernelBuffer::read_only_u32(&[k as u32]),
-                KernelBuffer::write_f32(out_rows * k),
-            ];
-            ctx.dispatch(
-                &name,
-                &kernel,
-                body.workgroup_size,
-                [(out_rows * k) as u32, 1, 1],
-                &mut buffers,
-            )
-            .unwrap_or_else(|error| panic!("{format:?}: dispatch: {error}"));
-            let got = buffers[2].as_f32();
-
-            let got_bits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
-            let want_bits: Vec<u32> = expected.iter().map(|v| v.to_bits()).collect();
-            assert_eq!(
-                got_bits, want_bits,
-                "{format:?}: Materialize (wgpu) vs decode_blocks"
-            );
-        }
-    }
-}
-
-#[cfg(test)]
 mod row_gather_tests {
     //! SC-001 (card 542a, RowGather row): `packed_kernel(RowGather)` run in the KIR interpreter
     //! selects the same rows `poot_quant::plan::decode_blocks` decodes (tier 1, GPU-free).
@@ -883,8 +588,7 @@ mod row_gather_tests {
     use super::kernel::{PackedKernelOp, PackedKernelSpec, packed_kernel};
 
     /// The K-quant sibling of `row_gather_matches_decode_blocks_rows_for_every_block32_format`
-    /// (card 542b): exercises `DecodePlan`'s `SubScale`/`SubMin` path through `RowGather` too, not
-    /// only `Materialize`.
+    /// (card 542b): exercises `DecodePlan`'s `SubScale`/`SubMin` path through `RowGather` too.
     #[test]
     fn row_gather_matches_decode_blocks_rows_for_every_kquant_format() {
         let out_rows = 5;
@@ -1086,7 +790,7 @@ mod row_gather_tests {
         }
     }
 
-    /// Sanity only (not acceptance, as `materialize_bodies_compile_for_spirv_and_nvptx`): every
+    /// Sanity only (not acceptance): every
     /// block-32 `RowGather` body lowers to SPIR-V, NVPTX and AMDGCN. Names the SPIR-V/NVPTX artifacts
     /// (`row_gather_<format>_spv`/`_ptx`) for the PTX pod batch (SC-004).
     #[test]
@@ -1124,8 +828,7 @@ mod row_gather_tests {
     }
 
     /// SC-004 (card 542a, device tier 1): `RowGather` for every block-32 format equals the oracle's
-    /// rows on the local wgpu (SPIR-V/RADV) device (the `materialize_matches_decode_blocks_on_wgpu`
-    /// row's sibling).
+    /// rows on the local wgpu (SPIR-V/RADV) device.
     #[test]
     fn row_gather_matches_decode_blocks_rows_on_wgpu() {
         use poot_codegen::{Target, artifact_path, compile, kernel_handle};
@@ -1231,6 +934,7 @@ mod contraction_tests {
             format,
             schedule,
             None,
+            crate::PackedRows::Blocks,
         )
         .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
 
@@ -1356,6 +1060,7 @@ mod contraction_tests {
                     format,
                     schedule,
                     Some(&epilogue),
+                    crate::PackedRows::Blocks,
                 )
                 .unwrap_or_else(|error| panic!("{format:?}: {error}"));
                 body.verify().expect("the epilogue body verifies");
@@ -1395,6 +1100,7 @@ mod contraction_tests {
                 tile: TileSize::new(4).unwrap(),
             },
             Some(&epilogue),
+            crate::PackedRows::Blocks,
         )
         .expect_err("a packed Tiled contraction has no epilogue");
         assert_eq!(
@@ -1528,6 +1234,7 @@ mod contraction_tests {
                 format,
                 schedule,
                 None,
+                crate::PackedRows::Blocks,
             )
             .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
 
@@ -1554,7 +1261,7 @@ mod contraction_tests {
         }
     }
 
-    /// Sanity only (not acceptance, as `materialize_bodies_compile_for_spirv_and_nvptx`): every
+    /// Sanity only (not acceptance): every
     /// block-32 `Contraction` (Gemv) body lowers to SPIR-V, NVPTX and AMDGCN. Names the SPIR-V/NVPTX
     /// artifacts for the PTX pod batch (SC-005).
     #[test]
@@ -1564,7 +1271,9 @@ mod contraction_tests {
         for format in BLOCK32 {
             for schedule in GEMV_SCHEDULES {
                 let name = format!("contraction_{format:?}_{}", schedule_tag(schedule));
-                let body = packed_contraction(&name, format, schedule, None).unwrap();
+                let body =
+                    packed_contraction(&name, format, schedule, None, crate::PackedRows::Blocks)
+                        .unwrap();
                 let _ = crate::test_support::spv(&body, &format!("{name}_spv"));
                 let _ = crate::test_support::ptx(&body, &format!("{name}_ptx"));
                 let dir = std::env::temp_dir()
@@ -1589,7 +1298,9 @@ mod contraction_tests {
         for format in KQUANT {
             for schedule in GEMV_SCHEDULES {
                 let name = format!("contraction_kquant_{format:?}_{}", schedule_tag(schedule));
-                let body = packed_contraction(&name, format, schedule, None).unwrap();
+                let body =
+                    packed_contraction(&name, format, schedule, None, crate::PackedRows::Blocks)
+                        .unwrap();
                 let _ = crate::test_support::spv(&body, &format!("{name}_spv"));
                 let _ = crate::test_support::ptx(&body, &format!("{name}_ptx"));
                 let dir = std::env::temp_dir()
@@ -1607,7 +1318,8 @@ mod contraction_tests {
                 tile: TileSize::new(4).unwrap(),
             };
             let name = format!("contraction_{format:?}_{}", schedule_tag(schedule));
-            let body = packed_contraction(&name, format, schedule, None).unwrap();
+            let body = packed_contraction(&name, format, schedule, None, crate::PackedRows::Blocks)
+                .unwrap();
             let _ = crate::test_support::spv(&body, &format!("{name}_spv"));
             let _ = crate::test_support::ptx(&body, &format!("{name}_ptx"));
             let dir = std::env::temp_dir()
@@ -1621,8 +1333,7 @@ mod contraction_tests {
     }
 
     /// SC-005 (card 542a, device tier 2): `Contraction` (Gemv, blocks
-    /// 1 and 2) is within tier-2 tolerance of the reference on the local wgpu (SPIR-V/RADV) device
-    /// (the `materialize_matches_decode_blocks_on_wgpu` row's sibling).
+    /// 1 and 2) is within tier-2 tolerance of the reference on the local wgpu (SPIR-V/RADV) device.
     fn run_wgpu_case(
         ctx: &poot_runtime::Context,
         format: poot_quant::format::WeightFormat,
@@ -1641,7 +1352,7 @@ mod contraction_tests {
             "contraction_wgpu_{format:?}_{}_{blocks}",
             schedule_tag(schedule)
         );
-        let body = packed_contraction(&name, format, schedule, None)
+        let body = packed_contraction(&name, format, schedule, None, crate::PackedRows::Blocks)
             .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
         let dir = std::env::temp_dir()
             .join("poot-kernelgen-sc004")
@@ -1823,7 +1534,7 @@ mod contraction_tests {
                 tile: TileSize::new(tile).unwrap(),
             };
             let name = format!("contraction_wgpu_folded_{format:?}");
-            let body = packed_contraction(&name, format, schedule, None)
+            let body = packed_contraction(&name, format, schedule, None, crate::PackedRows::Blocks)
                 .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
             let dir = std::env::temp_dir()
                 .join("poot-kernelgen-card658-fold")
@@ -1862,167 +1573,6 @@ mod contraction_tests {
                 &format!("Contraction {schedule:?} folded grid=[{threads_x},{y_groups},1] (wgpu)"),
                 got,
                 &expected,
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod planar_materialize_tests {
-    //! SC-001 (card 542c): `packed_kernel(Materialize)` run in the KIR interpreter equals
-    //! `decode_planar_value` for the six E4M3 variants, E2M1 row-32 (odd K), GPTQ (contiguous and
-    //! act-order) and AWQ (tier 1, GPU-free) - the planar counterpart of `materialize_tests`.
-
-    use poot_kernel_ir::interp::{Buffer, run};
-    use poot_test_util::kernel_fixtures::workgroups_covering;
-
-    use super::kernel::{PackedKernelOp, PackedKernelSpec, packed_kernel};
-    use super::planar_fixtures::{fixture, pack_words};
-
-    /// `k = 17`: odd (E2M1's packed `Codes` byte holds two K values, so an odd `K` leaves one K
-    /// value alone in the last byte - dquant.md 3.3/SC-001's named case), and not a whole multiple
-    /// of GPTQ/AWQ's group size (8) or E4M3 block128's block size (128), so every format's ragged
-    /// grid edge is exercised by the same fixture shape.
-    const K: usize = 17;
-
-    #[test]
-    fn materialize_matches_decode_planar_value_for_every_planar_format() {
-        let out_rows = 3;
-        for (seed, format) in super::planar_fixtures::every_planar_format()
-            .into_iter()
-            .enumerate()
-        {
-            let (sources, expected) = fixture(format, out_rows, K, seed as u64);
-            let word_bufs = pack_words(&sources);
-
-            let spec = PackedKernelSpec {
-                format,
-                op: PackedKernelOp::Materialize,
-            };
-            let body = packed_kernel(
-                &format!(
-                    "materialize_planar_{}",
-                    super::planar_fixtures::format_tag(format)
-                ),
-                spec,
-            )
-            .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
-
-            let mut buffers: Vec<Buffer> = word_bufs
-                .iter()
-                .map(|words| Buffer::from_u32s(words))
-                .collect();
-            buffers.push(Buffer::from_u32s(&[K as u32]));
-            buffers.push(Buffer::from_f32s(&vec![0.0; out_rows * K]));
-            run(
-                &body,
-                workgroups_covering(&body, out_rows * K),
-                &mut buffers,
-            )
-            .unwrap_or_else(|error| panic!("{format:?}: interpreter: {error}"));
-            let got = buffers.last().unwrap().to_f32s().unwrap();
-
-            let got_bits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
-            let want_bits: Vec<u32> = expected.iter().map(|v| v.to_bits()).collect();
-            assert_eq!(
-                got_bits, want_bits,
-                "{format:?}: Materialize vs decode_planar_value"
-            );
-        }
-    }
-
-    /// Sanity only (not acceptance, as `materialize_bodies_compile_for_spirv_and_nvptx`): every
-    /// planar `Materialize` body lowers to SPIR-V, NVPTX and AMDGCN.
-    #[test]
-    fn materialize_bodies_compile_for_every_planar_backend() {
-        use poot_codegen::{Target, artifact_path, compile};
-        let arch = poot_target::AmdArch::gfx1151();
-        for format in super::planar_fixtures::every_planar_format() {
-            let spec = PackedKernelSpec {
-                format,
-                op: PackedKernelOp::Materialize,
-            };
-            let name = format!(
-                "materialize_planar_{}",
-                super::planar_fixtures::format_tag(format)
-            );
-            let body = packed_kernel(&name, spec).unwrap();
-            let _ = crate::test_support::spv(&body, &format!("{name}_spv"));
-            let _ = crate::test_support::ptx(&body, &format!("{name}_ptx"));
-            let dir = std::env::temp_dir()
-                .join("poot-kernelgen-unit-test")
-                .join(format!("{name}_amdgcn"));
-            std::fs::create_dir_all(&dir).unwrap();
-            let out = artifact_path(&dir, &name, Target::AmdGcn(arch));
-            compile(&body, Target::AmdGcn(arch), &out)
-                .unwrap_or_else(|error| panic!("{format:?}: AMDGCN compile: {error}"));
-        }
-    }
-
-    /// SC-002 (card 542c, device tier 1): `Materialize` for every planar format equals the oracle's
-    /// `to_bits` on the local wgpu (SPIR-V/RADV) device.
-    #[test]
-    fn materialize_matches_decode_planar_value_on_wgpu() {
-        use poot_codegen::{Target, artifact_path, compile, kernel_handle};
-        use poot_runtime::{Context, KernelBuffer};
-
-        let ctx = match Context::new() {
-            Ok(ctx) => ctx,
-            Err(error) => {
-                eprintln!("no GPU ({error}); skipping");
-                return;
-            }
-        };
-
-        let out_rows = 3;
-        for (seed, format) in super::planar_fixtures::every_planar_format()
-            .into_iter()
-            .enumerate()
-        {
-            let (sources, expected) = fixture(format, out_rows, K, seed as u64);
-            let word_bufs = pack_words(&sources);
-
-            let spec = PackedKernelSpec {
-                format,
-                op: PackedKernelOp::Materialize,
-            };
-            let name = format!(
-                "materialize_planar_wgpu_{}",
-                super::planar_fixtures::format_tag(format)
-            );
-            let body = packed_kernel(&name, spec)
-                .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
-            let dir = std::env::temp_dir()
-                .join("poot-kernelgen-sc004")
-                .join(&name);
-            std::fs::create_dir_all(&dir).unwrap();
-            let out_path = artifact_path(&dir, &name, Target::SpirvVulkan);
-            compile(&body, Target::SpirvVulkan, &out_path)
-                .unwrap_or_else(|error| panic!("{format:?}: compile: {error}"));
-            let spirv_bytes = std::fs::read(&out_path).unwrap();
-            let kernel = kernel_handle(&body, Target::SpirvVulkan, spirv_bytes);
-
-            let mut buffers: Vec<KernelBuffer> = word_bufs
-                .iter()
-                .map(|words| KernelBuffer::read_only_u32(words))
-                .collect();
-            buffers.push(KernelBuffer::read_only_u32(&[K as u32]));
-            buffers.push(KernelBuffer::write_f32(out_rows * K));
-            ctx.dispatch(
-                &name,
-                &kernel,
-                body.workgroup_size,
-                [(out_rows * K) as u32, 1, 1],
-                &mut buffers,
-            )
-            .unwrap_or_else(|error| panic!("{format:?}: dispatch: {error}"));
-            let got = buffers.last().unwrap().as_f32();
-
-            let got_bits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
-            let want_bits: Vec<u32> = expected.iter().map(|v| v.to_bits()).collect();
-            assert_eq!(
-                got_bits, want_bits,
-                "{format:?}: Materialize (wgpu) vs decode_planar_value"
             );
         }
     }
@@ -2090,6 +1640,7 @@ mod planar_contraction_tests {
             format,
             schedule,
             None,
+            crate::PackedRows::Blocks,
         )
         .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
 
@@ -2202,6 +1753,7 @@ mod planar_contraction_tests {
                 format,
                 schedule,
                 None,
+                crate::PackedRows::Blocks,
             )
             .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
 
@@ -2232,7 +1784,7 @@ mod planar_contraction_tests {
 
 #[cfg(test)]
 mod rocm_tests {
-    //! SC-004/SC-005 (card 542a, device tier 1/2): Materialize, RowGather and Contraction (Gemv,
+    //! SC-004/SC-005 (card 542a, device tier 1/2): RowGather and Contraction (Gemv,
     //! blocks 1 and 2) for every block-32 format, dispatched on real
     //! ROCm/HSA hardware (gfx1151) - the AMDGCN counterpart of the wgpu row above, through the same
     //! production path every real caller uses (`poot_codegen::compile` + `kernel_handle`, card 628's
@@ -2324,7 +1876,7 @@ mod rocm_tests {
         Out(usize),
     }
 
-    /// `(grid, block)` for a "one thread per element" body (`Materialize`, `RowGather`): `block` must
+    /// `(grid, block)` for a "one thread per element" body (`RowGather`): `block` must
     /// be the body's own compiled `workgroup_size` (AMDGCN, like SPIR-V, bakes it into the compiled
     /// kernel; a dispatch with a different block size silently changes what `ThreadIndexCall`'s
     /// global-index formula computes, not just the physical launch shape - card 542a ROCm device rows,
@@ -2395,45 +1947,6 @@ mod rocm_tests {
     }
 
     #[test]
-    fn materialize_matches_decode_blocks_on_rocm() {
-        let Some(ctx) = open_or_skip("materialize_matches_decode_blocks_on_rocm") else {
-            return;
-        };
-        let out_rows = 3;
-        let blocks_per_row = 2;
-        for (seed, format) in BLOCK32.into_iter().enumerate() {
-            let (k, bytes, expected) = fixture(format, out_rows, blocks_per_row, seed as u64);
-            let spec = PackedKernelSpec {
-                format,
-                op: PackedKernelOp::Materialize,
-            };
-            let name = format!("materialize_rocm_{format:?}");
-            let body = packed_kernel(&name, spec)
-                .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
-            let words = pack_words(&bytes);
-            let (grid, block) = one_thread_per_element_launch(&body, out_rows * k);
-            let got = dispatch_and_download(
-                &ctx,
-                &name,
-                &body,
-                &[
-                    Arg::U32(&words),
-                    Arg::U32(&[k as u32]),
-                    Arg::Out(out_rows * k),
-                ],
-                grid,
-                block,
-            );
-            let got_bits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
-            let want_bits: Vec<u32> = expected.iter().map(|v| v.to_bits()).collect();
-            assert_eq!(
-                got_bits, want_bits,
-                "{format:?}: Materialize (ROCm) vs decode_blocks"
-            );
-        }
-    }
-
-    #[test]
     fn row_gather_matches_decode_blocks_rows_on_rocm() {
         let Some(ctx) = open_or_skip("row_gather_matches_decode_blocks_rows_on_rocm") else {
             return;
@@ -2498,7 +2011,7 @@ mod rocm_tests {
             "contraction_rocm_{format:?}_{}_{blocks}",
             schedule_tag(schedule)
         );
-        let body = packed_contraction(&name, format, schedule, None)
+        let body = packed_contraction(&name, format, schedule, None, crate::PackedRows::Blocks)
             .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
         let words = pack_words(&bytes);
         // metadata[3] (x_groups): 0 is fine here - every dispatch below is `[threads, 1, 1]`
@@ -2545,47 +2058,6 @@ mod rocm_tests {
                 run_contraction_case(&ctx, format, schedule, 1, 1, 11);
                 run_contraction_case(&ctx, format, schedule, 2, 1, 5);
             }
-        }
-    }
-
-    /// SC-002 (card 542b, device tier 1/2): Materialize/RowGather/Contraction (Gemv) for every
-    /// K-quant format on real ROCm/HSA hardware.
-    #[test]
-    fn materialize_matches_decode_blocks_on_rocm_kquant() {
-        let Some(ctx) = open_or_skip("materialize_matches_decode_blocks_on_rocm_kquant") else {
-            return;
-        };
-        let out_rows = 3;
-        let blocks_per_row = 2;
-        for (seed, format) in KQUANT.into_iter().enumerate() {
-            let (k, bytes, expected) = fixture(format, out_rows, blocks_per_row, seed as u64);
-            let spec = PackedKernelSpec {
-                format,
-                op: PackedKernelOp::Materialize,
-            };
-            let name = format!("materialize_rocm_kquant_{format:?}");
-            let body = packed_kernel(&name, spec)
-                .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
-            let words = pack_words(&bytes);
-            let (grid, block) = one_thread_per_element_launch(&body, out_rows * k);
-            let got = dispatch_and_download(
-                &ctx,
-                &name,
-                &body,
-                &[
-                    Arg::U32(&words),
-                    Arg::U32(&[k as u32]),
-                    Arg::Out(out_rows * k),
-                ],
-                grid,
-                block,
-            );
-            let got_bits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
-            let want_bits: Vec<u32> = expected.iter().map(|v| v.to_bits()).collect();
-            assert_eq!(
-                got_bits, want_bits,
-                "{format:?}: Materialize (ROCm) vs decode_blocks"
-            );
         }
     }
 
@@ -2712,49 +2184,6 @@ mod rocm_tests {
         }
     }
 
-    /// SC-002 (card 542c, device tier 1): `Materialize` for every planar format equals the oracle's
-    /// `to_bits` on real ROCm/HSA hardware - the planar counterpart of
-    /// `materialize_matches_decode_blocks_on_rocm`. `dispatch_and_download`'s `args` is a plain
-    /// slice, so a planar format's variable source count needs no new harness.
-    #[test]
-    fn materialize_matches_decode_planar_value_on_rocm() {
-        let Some(ctx) = open_or_skip("materialize_matches_decode_planar_value_on_rocm") else {
-            return;
-        };
-        let out_rows = 3;
-        let k = 17;
-        for (seed, format) in super::planar_fixtures::every_planar_format()
-            .into_iter()
-            .enumerate()
-        {
-            let (sources, expected) =
-                super::planar_fixtures::fixture(format, out_rows, k, seed as u64);
-            let word_bufs = super::planar_fixtures::pack_words(&sources);
-            let spec = PackedKernelSpec {
-                format,
-                op: PackedKernelOp::Materialize,
-            };
-            let name = format!(
-                "materialize_planar_rocm_{}",
-                super::planar_fixtures::format_tag(format)
-            );
-            let body = packed_kernel(&name, spec)
-                .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
-            let (grid, block) = one_thread_per_element_launch(&body, out_rows * k);
-            let k_meta = [k as u32];
-            let mut args: Vec<Arg<'_>> = word_bufs.iter().map(|w| Arg::U32(w)).collect();
-            args.push(Arg::U32(&k_meta));
-            args.push(Arg::Out(out_rows * k));
-            let got = dispatch_and_download(&ctx, &name, &body, &args, grid, block);
-            let got_bits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
-            let want_bits: Vec<u32> = expected.iter().map(|v| v.to_bits()).collect();
-            assert_eq!(
-                got_bits, want_bits,
-                "{format:?}: Materialize (ROCm) vs decode_planar_value"
-            );
-        }
-    }
-
     /// SC-002 (card 542c, device tier 2): `Contraction` (Gemv, Tiled) for every planar format is
     /// within tier-2 tolerance of the reference on real ROCm/HSA hardware.
     #[test]
@@ -2800,8 +2229,9 @@ mod rocm_tests {
                     super::planar_fixtures::format_tag(format),
                     schedule_tag(schedule)
                 );
-                let body = packed_contraction(&name, format, schedule, None)
-                    .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
+                let body =
+                    packed_contraction(&name, format, schedule, None, crate::PackedRows::Blocks)
+                        .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
                 let metadata = [k as u32, out_rows as u32, m as u32, 0]; // metadata[3] (x_groups): unused, unfolded grid
                 let out_len = m * out_rows;
                 let grid = (schedule.grid_threads(1, m, out_rows) as u32, 1, 1);
@@ -2824,7 +2254,7 @@ mod rocm_tests {
 
 #[cfg(test)]
 mod ptx_tests {
-    //! SC-004/SC-005 (card 542a, device tier 1/2, M4 pod batch): Materialize, RowGather and
+    //! SC-004/SC-005 (card 542a, device tier 1/2, M4 pod batch): RowGather and
     //! Contraction (Gemv, blocks 1 and 2) for every block-32 format,
     //! dispatched on real NVIDIA/PTX hardware, the NVPTX counterpart of `rocm_tests` (same fixtures,
     //! same tier-1/tier-2 comparisons). `PtxContext::new()` implements the project's device-skip
@@ -2880,48 +2310,6 @@ mod ptx_tests {
     fn upload_u32(ctx: &PtxContext, data: &[u32]) -> PtxBuffer {
         let as_i32: Vec<i32> = data.iter().map(|&word| word as i32).collect();
         ctx.upload_i32(&as_i32).expect("upload u32 buffer")
-    }
-
-    #[test]
-    fn materialize_matches_decode_blocks_on_ptx() {
-        let Some(ctx) = open_or_skip("materialize_matches_decode_blocks_on_ptx") else {
-            return;
-        };
-        let out_rows = 3;
-        let blocks_per_row = 2;
-        for (seed, format) in BLOCK32.into_iter().enumerate() {
-            let (k, bytes, expected) = fixture(format, out_rows, blocks_per_row, seed as u64);
-            let spec = PackedKernelSpec {
-                format,
-                op: PackedKernelOp::Materialize,
-            };
-            let name = format!("materialize_ptx_{format:?}");
-            let body = packed_kernel(&name, spec)
-                .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
-            let kernel = compile_and_load(&name, &body);
-            let words = pack_words(&bytes);
-            let words_buf = upload_u32(&ctx, &words);
-            let metadata_buf = upload_u32(&ctx, &[k as u32]);
-            let out_buf = ctx.alloc_f32(out_rows * k).expect("allocate out");
-            ctx.dispatch_dev(
-                &name,
-                &kernel,
-                body.workgroup_size,
-                [(out_rows * k) as u32, 1, 1],
-                &[&words_buf, &metadata_buf],
-                &[words_buf.elem_count(), metadata_buf.elem_count()],
-                &out_buf,
-                out_buf.elem_count(),
-            )
-            .unwrap_or_else(|error| panic!("{format:?}: dispatch: {error}"));
-            let got = ctx.download_f32(&out_buf).expect("download out");
-            let got_bits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
-            let want_bits: Vec<u32> = expected.iter().map(|v| v.to_bits()).collect();
-            assert_eq!(
-                got_bits, want_bits,
-                "{format:?}: Materialize (PTX) vs decode_blocks"
-            );
-        }
     }
 
     #[test]
@@ -2996,7 +2384,7 @@ mod ptx_tests {
             "contraction_ptx_{format:?}_{}_{blocks}",
             schedule_tag(schedule)
         );
-        let body = packed_contraction(&name, format, schedule, None)
+        let body = packed_contraction(&name, format, schedule, None, crate::PackedRows::Blocks)
             .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
         let kernel = compile_and_load(&name, &body);
         let words = pack_words(&bytes);
@@ -3050,51 +2438,6 @@ mod ptx_tests {
                 run_contraction_case(&ctx, format, schedule, 1, 1, 11);
                 run_contraction_case(&ctx, format, schedule, 2, 1, 5);
             }
-        }
-    }
-
-    /// SC-002 (card 542b, device tier 1/2, M4 pod batch): Materialize/RowGather/Contraction (Gemv)
-    /// for every K-quant format, named for the PTX pod - unexercised locally
-    /// (no NVIDIA device on this box), like every other row in this module.
-    #[test]
-    fn materialize_matches_decode_blocks_on_ptx_kquant() {
-        let Some(ctx) = open_or_skip("materialize_matches_decode_blocks_on_ptx_kquant") else {
-            return;
-        };
-        let out_rows = 3;
-        let blocks_per_row = 2;
-        for (seed, format) in KQUANT.into_iter().enumerate() {
-            let (k, bytes, expected) = fixture(format, out_rows, blocks_per_row, seed as u64);
-            let spec = PackedKernelSpec {
-                format,
-                op: PackedKernelOp::Materialize,
-            };
-            let name = format!("materialize_ptx_kquant_{format:?}");
-            let body = packed_kernel(&name, spec)
-                .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
-            let kernel = compile_and_load(&name, &body);
-            let words = pack_words(&bytes);
-            let words_buf = upload_u32(&ctx, &words);
-            let metadata_buf = upload_u32(&ctx, &[k as u32]);
-            let out_buf = ctx.alloc_f32(out_rows * k).expect("allocate out");
-            ctx.dispatch_dev(
-                &name,
-                &kernel,
-                body.workgroup_size,
-                [(out_rows * k) as u32, 1, 1],
-                &[&words_buf, &metadata_buf],
-                &[words_buf.elem_count(), metadata_buf.elem_count()],
-                &out_buf,
-                out_buf.elem_count(),
-            )
-            .unwrap_or_else(|error| panic!("{format:?}: dispatch: {error}"));
-            let got = ctx.download_f32(&out_buf).expect("download out");
-            let got_bits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
-            let want_bits: Vec<u32> = expected.iter().map(|v| v.to_bits()).collect();
-            assert_eq!(
-                got_bits, want_bits,
-                "{format:?}: Materialize (PTX) vs decode_blocks"
-            );
         }
     }
 
@@ -3236,7 +2579,7 @@ mod ptx_tests {
 
 #[cfg(test)]
 mod planar_ptx_tests {
-    //! SC-002 (card 542c, device tier 1/2, M4 pod batch): Materialize and Contraction (Gemv,
+    //! SC-002 (card 542c, device tier 1/2, M4 pod batch): Contraction (Gemv,
     //! Tiled) for every planar format, dispatched on real NVIDIA/PTX hardware - the planar
     //! counterpart of `ptx_tests` (same skip/require convention, same `PtxContext` harness;
     //! `dispatch_dev`'s source-buffer slice is plain `&[&PtxBuffer]`, so a planar format's variable
@@ -3248,7 +2591,7 @@ mod planar_ptx_tests {
     use poot_ptx_runtime::{PtxBuffer, PtxContext};
 
     use super::fixtures::{GEMV_SCHEDULES, schedule_tag};
-    use super::kernel::{PackedKernelOp, PackedKernelSpec, packed_contraction, packed_kernel};
+    use super::kernel::packed_contraction;
     use super::planar_fixtures::{every_planar_format, fixture, format_tag, pack_words};
     use crate::contraction::{Schedule, TileSize};
 
@@ -3279,53 +2622,6 @@ mod planar_ptx_tests {
     fn upload_u32(ctx: &PtxContext, data: &[u32]) -> PtxBuffer {
         let as_i32: Vec<i32> = data.iter().map(|&word| word as i32).collect();
         ctx.upload_i32(&as_i32).expect("upload u32 buffer")
-    }
-
-    #[test]
-    fn materialize_matches_decode_planar_value_on_ptx() {
-        let Some(ctx) = open_or_skip("materialize_matches_decode_planar_value_on_ptx") else {
-            return;
-        };
-        let out_rows = 3;
-        for (seed, format) in every_planar_format().into_iter().enumerate() {
-            let (sources, expected) = fixture(format, out_rows, K, seed as u64);
-            let word_bufs = pack_words(&sources);
-            let spec = PackedKernelSpec {
-                format,
-                op: PackedKernelOp::Materialize,
-            };
-            let name = format!("materialize_planar_ptx_{}", format_tag(format));
-            let body = packed_kernel(&name, spec)
-                .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
-            let kernel = compile_and_load(&name, &body);
-            let source_bufs: Vec<PtxBuffer> = word_bufs
-                .iter()
-                .map(|words| upload_u32(&ctx, words))
-                .collect();
-            let metadata_buf = upload_u32(&ctx, &[K as u32]);
-            let mut arg_refs: Vec<&PtxBuffer> = source_bufs.iter().collect();
-            arg_refs.push(&metadata_buf);
-            let arg_lens: Vec<u32> = arg_refs.iter().map(|b| b.elem_count()).collect();
-            let out_buf = ctx.alloc_f32(out_rows * K).expect("allocate out");
-            ctx.dispatch_dev(
-                &name,
-                &kernel,
-                body.workgroup_size,
-                [(out_rows * K) as u32, 1, 1],
-                &arg_refs,
-                &arg_lens,
-                &out_buf,
-                out_buf.elem_count(),
-            )
-            .unwrap_or_else(|error| panic!("{format:?}: dispatch: {error}"));
-            let got = ctx.download_f32(&out_buf).expect("download out");
-            let got_bits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
-            let want_bits: Vec<u32> = expected.iter().map(|v| v.to_bits()).collect();
-            assert_eq!(
-                got_bits, want_bits,
-                "{format:?}: Materialize (PTX) vs decode_planar_value"
-            );
-        }
     }
 
     fn reference_contraction(
@@ -3374,7 +2670,7 @@ mod planar_ptx_tests {
             format_tag(format),
             schedule_tag(schedule)
         );
-        let body = packed_contraction(&name, format, schedule, None)
+        let body = packed_contraction(&name, format, schedule, None, crate::PackedRows::Blocks)
             .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
         let kernel = compile_and_load(&name, &body);
         let source_bufs: Vec<PtxBuffer> = word_bufs

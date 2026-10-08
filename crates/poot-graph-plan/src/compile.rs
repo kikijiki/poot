@@ -32,6 +32,7 @@ use poot_graph_ir::{Eqn, Graph, NoValidations, OpKind, Operand, Slot, Validation
 use poot_target::{Backend, DeviceCaps};
 
 use crate::passes::{self as transform, GraphBudget, LegalizeError, PackedDequantProductionError};
+pub use crate::passes::{LoraError, LoraPlan};
 use crate::*;
 
 /// What a graph is compiled for: the backend and the device's measured capabilities (card 522). Passes and
@@ -43,12 +44,32 @@ pub struct Target {
 }
 
 /// Typed execution choices a caller makes for one compile. Never an environment variable.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompileOptions {
     /// Executor submission mode. Compilation produces the same plans for either mode.
     pub execution: Submission,
     /// What compilation may construct and load. There is no default: every caller states its policy.
     pub limits: CompileLimits,
+    /// The LoRA mode transform, applied to the traced graph before any other pass (POOT-579). `None`
+    /// compiles the graph as traced.
+    pub lora: Option<LoraPlan>,
+}
+
+impl CompileOptions {
+    /// Options for `execution` under `limits`, with no mode transform.
+    pub const fn new(execution: Submission, limits: CompileLimits) -> Self {
+        Self {
+            execution,
+            limits,
+            lora: None,
+        }
+    }
+
+    /// These options with the LoRA transform of `plan`.
+    pub fn with_lora(mut self, plan: LoraPlan) -> Self {
+        self.lora = Some(plan);
+        self
+    }
 }
 
 /// What one compile may construct, and the largest artifact it may load: every field is a finite, nonzero
@@ -133,6 +154,10 @@ pub enum CompileError {
     /// neither the host nor the split rewrite can bring under it (SC-002).
     #[error(transparent)]
     Legalize(Box<LegalizeError>),
+    /// The LoRA transform could not adapt the graph (POOT-579): a projection the plan names is absent,
+    /// or a contraction the correction cannot be inserted after.
+    #[error(transparent)]
+    Lora(Box<LoraError>),
     /// A `PackedDequant` the contraction claim could not take escapes into ordinary execution (Card
     /// 355's gate, run by `compile` since card 642): no target materializes a packed weight outside a
     /// claimed contraction.
@@ -159,6 +184,12 @@ impl From<NumericsError> for CompileError {
 impl From<LegalizeError> for CompileError {
     fn from(error: LegalizeError) -> Self {
         CompileError::Legalize(Box::new(error))
+    }
+}
+
+impl From<LoraError> for CompileError {
+    fn from(error: LoraError) -> Self {
+        CompileError::Lora(Box::new(error))
     }
 }
 
@@ -312,8 +343,7 @@ impl<V: ValidationChannel> Program<V> {
     }
 
     /// The passes that changed the graph, in the order they ran (card 535a: a caller or test reads this
-    /// to see whether the routed-expert hang guard
-    /// actually took effect - never by re-deriving it locally).
+    /// to see whether a pass actually took effect - never by re-deriving it locally).
     pub fn passes(&self) -> impl Iterator<Item = &'static str> + '_ {
         self.passes.iter().map(|declaration| declaration.pass)
     }
@@ -321,8 +351,7 @@ impl<V: ValidationChannel> Program<V> {
 
 /// Compile `g` for `target`: canonicalize, CSE and iota folding, rope and flash-attention recognition, DCE,
 /// the packed-contraction and row-gather claims and their escape gate (cards 642/545a: every
-/// `PackedDequant` is claimed into a `PackedContraction`/`PackedRowGather`, is a W12 MoE branch, or
-/// the graph is refused), buffer-limit legalization, then the BF16-packed-weight recognition, non-last-axis reduce legalization
+/// `PackedDequant` is claimed into a `PackedContraction`/`PackedRowGather`, or the graph is refused), buffer-limit legalization, then the BF16-packed-weight recognition, non-last-axis reduce legalization
 /// and backend dtype retyping (Card 534a), then fusion, then `crate::plan_graph`, which makes every
 /// kernel choice (Card 557). The contraction epilogue fuse rule runs right before `fuse`.
 ///
@@ -331,15 +360,14 @@ impl<V: ValidationChannel> Program<V> {
 /// guts, inlined here so every sub-pass is individually tracked and numerics-checked) join the pipeline
 /// between DCE and fusion, each its own `PassDeclaration` row like every other pass here
 /// (`PASS_DECLARATIONS`), checked by `revert_unplannable_rewrites`/`verify_pass_numerics` the same way.
-/// `legalize` runs first: it can retag a `Gather` into a `Slot::TokenEmbed` input, and Card 534a's
-/// `fold_dense_bf16_row_gathers` pattern-matches a `Gather` specifically, so a table `legalize` already
-/// hosted must not still look like one to it. Card 534a's step is the one preparation every target needs
-/// before planning: no executor sequences its own copy of it any more.
+/// `fold_dense_contractions` runs before `legalize`: an oversized weight is split as the `DenseContraction`
+/// that reads it, so each chunk is the contraction the planner lowers (a BF16 `[K, N]` matmul over a
+/// transposed chunk has no lowering to probe). `legalize` runs before `fold_dense_bf16_row_gathers`: it can
+/// retag a `Gather` into a `Slot::TokenEmbed` input, and that fold pattern-matches a `Gather` specifically,
+/// so a table `legalize` already hosted must not still look like one to it. Card 534a's step is the one
+/// preparation every target needs before planning: no executor sequences its own copy of it any more.
 ///
-/// A target with `KnownMiscompiles::routed_expert_tiling_hang` compiling a graph with a routed-expert site
-/// ([`routed_expert_sites`]) skips `flash_attention_capped` and the fuses and keeps the planner off the
-/// generated tiled GEMM: cards 186/192 recorded that shape hanging ROCm and PTX. Every other pass,
-/// including `legalize`, still runs in this same fixed order regardless.
+/// Every target runs every pass, in this one order, on every graph.
 pub fn compile<V: ValidationChannel>(
     g: &Graph<V>,
     target: &Target,
@@ -348,27 +376,31 @@ pub fn compile<V: ValidationChannel>(
     g.validate().map_err(PlanError::from)?;
     let budget = GraphBudget::of(&options.limits);
     budget.admit("compile input", g)?;
+    // The LoRA mode transform comes first: it rewrites the traced graph, and everything after it
+    // (the baseline numerics included) sees the adapted graph as the one it was handed.
+    let adapted;
+    let g = match &options.lora {
+        Some(plan) => {
+            adapted = transform::apply_lora(g, plan, &budget)?;
+            adapted.validate().map_err(PlanError::from)?;
+            budget.admit("apply_lora", &adapted)?;
+            &adapted
+        }
+        None => g,
+    };
     let _scope = CompileScope::enter();
     // A flash prefill launches `Hq * L` workgroups on one grid axis; cap the rewrite at the target's grid so
     // the planner is never handed a launch the device cannot issue.
     let max_prefill_groups = target.caps.max_grid[0] as usize;
-    // The routed-expert hang guard (cards 186/192; the fact is POOT-575's to delete): where the target
-    // has the hang and the graph a routed-expert site, `flash_attention_capped`, the two contraction
-    // fuses and the widening-cast fuse are left out and no `MatMul` takes the generated tiled GEMM.
-    // Every other pass runs in `compile`'s one order, and `Program::passes()` records which did.
-    let guarded = target.caps.known_miscompiles.routed_expert_tiling_hang
-        && !routed_expert_sites(g).is_empty();
-    let mut pipeline = PassPipeline::new(g, target, guarded, options.limits);
+    let mut pipeline = PassPipeline::new(g, target, options.limits);
     let (canonical, numerical_declines) = transform::canonicalize_with_declines(g);
     pipeline.after_apply("canonicalize", canonical)?;
     pipeline.run("cse", transform::cse)?;
     pipeline.run("fold_iota", transform::fold_iota)?;
     pipeline.run("rope_fusion", transform::rope_fusion)?;
-    if !guarded {
-        pipeline.run("flash_attention_capped", |g| {
-            transform::flash_attention_capped(g, Some(max_prefill_groups))
-        })?;
-    }
+    pipeline.run("flash_attention_capped", |g| {
+        transform::flash_attention_capped(g, Some(max_prefill_groups))
+    })?;
     pipeline.run("dce", transform::dce)?;
     // The two claiming passes are the only rewrites whose refusals the escape gate can mask: their
     // reverts put the packed decomposition back, and the gate is what then refuses that
@@ -384,10 +416,10 @@ pub fn compile<V: ValidationChannel>(
         transform::recognize_packed_row_gathers,
     )?);
     pipeline.reject_escapes(restored)?;
+    pipeline.run("fold_dense_contractions", fold_dense_contractions)?;
     pipeline.try_run("legalize", |g| {
         transform::legalize(g, &target.caps, &options.limits)
     })?;
-    pipeline.run("fold_dense_contractions", fold_dense_contractions)?;
     pipeline.run("fold_dense_bf16_row_gathers", fold_dense_bf16_row_gathers)?;
     pipeline.reserve(
         "lower_nonlast_reduces",
@@ -399,7 +431,7 @@ pub fn compile<V: ValidationChannel>(
         widen_growth(pipeline.graph()),
     )?;
     pipeline.run("widen_mismatched_matmul_dtypes", |g| {
-        widen_mismatched_matmul_dtypes(g, target.backend, &target.caps)
+        widen_mismatched_matmul_dtypes(g, target.backend)
     })?;
     // Card 673: admit every validation witness here, on the unfused graph. `fuse` folds a witness
     // producer chain into one `OpKind::Fused` region the structural classifier does not see through,
@@ -419,18 +451,19 @@ pub fn compile<V: ValidationChannel>(
     // The contraction epilogue rule runs on the typed, dtype-prepared graph, right before `fuse` would claim
     // the same pointwise chains for a standalone region: a head fuses only where the planner's generated
     // lowering carries an epilogue (`epilogue_head_lowers`), so no head trades a faster schedule for it. Like
-    // `fuse`, it is skipped under the guard, which keeps one kernel per equation.
-    if !guarded {
-        pipeline.run("fuse_contraction_epilogues", |g| {
-            transform::fuse_contraction_epilogues(g, |graph, head| {
-                planner::epilogue_head_lowers(graph, head, target.backend, &target.caps)
-            })
-        })?;
-        pipeline.run("fuse", transform::fuse)?;
-        pipeline.run("fuse_widening_casts", transform::fuse_widening_casts)?;
-    }
+    // `fuse`.
+    pipeline.run("fuse_contraction_epilogues", |g| {
+        transform::fuse_contraction_epilogues(g, |graph, head| {
+            planner::epilogue_head_lowers(graph, head, target.backend, &target.caps)
+        })
+    })?;
+    pipeline.run("fuse", transform::fuse)?;
+    pipeline.run("fuse_widening_casts", transform::fuse_widening_casts)?;
     let (graph, baseline, passes) = pipeline.finish()?;
-    let planned = plan_graph(&graph, target, guarded, &options.limits.body())?;
+    // `legalize` fitted every constant, but a later pass's revert of an unplannable split (`after_apply`) can
+    // put an oversized one back: re-check the graph the planner receives, never trust the pass's own result.
+    transform::refuse_oversized_constants(&graph, target.caps.max_buffer_bytes)?;
+    let planned = plan_graph(&graph, target, &options.limits.body())?;
     let state_commit = state_commit_from_plans(&graph, &planned.plans)?;
     let validation = device_validation::validation_packet_plan(&graph)?;
     let buffer_plan = plan_buffers(
@@ -462,9 +495,6 @@ pub fn compile<V: ValidationChannel>(
 struct PassPipeline<'t, V: ValidationChannel> {
     graph: Graph<V>,
     target: &'t Target,
-    /// Whether the compile is guarded against the routed-expert hang, which the rewrite-legality
-    /// probes plan with exactly as `plan_graph` will.
-    guarded: bool,
     /// The numerics of the graph as traced: the unfused baseline every device run carries.
     baseline: NumericsProperty,
     passes: Vec<PassDeclaration>,
@@ -473,11 +503,10 @@ struct PassPipeline<'t, V: ValidationChannel> {
 }
 
 impl<'t, V: ValidationChannel> PassPipeline<'t, V> {
-    fn new(g: &Graph<V>, target: &'t Target, guarded: bool, limits: CompileLimits) -> Self {
+    fn new(g: &Graph<V>, target: &'t Target, limits: CompileLimits) -> Self {
         Self {
             graph: g.clone(),
             target,
-            guarded,
             baseline: implied_numerics(g),
             passes: Vec::new(),
             limits,
@@ -539,13 +568,8 @@ impl<'t, V: ValidationChannel> PassPipeline<'t, V> {
     ) -> Result<HashMap<ValueId, Refusal>, CompileError> {
         let declaration = declaration(pass);
         self.budget.admit(pass, &out)?;
-        let (out, restored) = revert_unplannable_rewrites(
-            &self.graph,
-            out,
-            self.target,
-            self.guarded,
-            &self.limits.body(),
-        )?;
+        let (out, restored) =
+            revert_unplannable_rewrites(&self.graph, out, self.target, &self.limits.body())?;
         verify_pass_numerics(&declaration, &out)?;
         if changed(&self.graph, &out) {
             self.passes.push(declaration);
@@ -721,7 +745,6 @@ fn revert_unplannable_rewrites<V: ValidationChannel>(
     before: &Graph<V>,
     after: Graph<V>,
     target: &Target,
-    guarded: bool,
     limits: &poot_kernelgen::BodyLimits,
 ) -> Result<(Graph<V>, HashMap<ValueId, Refusal>), CompileError> {
     let before_at: HashMap<ValueId, usize> = before
@@ -741,7 +764,7 @@ fn revert_unplannable_rewrites<V: ValidationChannel>(
     let views = compute_views(&after, target.backend);
     let mut refused: Vec<(ValueId, Refusal)> = Vec::new();
     for eqn in rewritten {
-        match plan_eqn_compiled(&analysis, &after, eqn, target, &views, guarded, limits) {
+        match plan_eqn_compiled(&analysis, &after, eqn, target, &views, limits) {
             Ok(_) => {}
             Err(PlanError::Refused(refusal)) => refused.push((eqn.out, *refusal)),
             Err(error) => return Err(error.into()),
@@ -818,10 +841,8 @@ mod tests {
         }
     }
 
-    const REPLAY: CompileOptions = CompileOptions {
-        execution: Submission::Replay,
-        limits: crate::CompileLimits::STANDARD,
-    };
+    const REPLAY: CompileOptions =
+        CompileOptions::new(Submission::Replay, crate::CompileLimits::STANDARD);
 
     fn refusal(result: Result<Program, CompileError>, what: &str) -> Refusal {
         match result {
@@ -864,52 +885,6 @@ mod tests {
         assert_eq!(program.reassociation_class(), Tier2Class::Reassociating);
     }
 
-    /// The routed-expert hang guard (cards 186/192) is decided by the target's fact and the graph's shape,
-    /// nothing else: the pointwise chain of the test above, carrying a routed-expert site, skips `fuse`
-    /// where the target has the hang; the same chain on a target without it, or on the same target with
-    /// no site in the graph, still fuses. The guard's planner half is
-    /// [`routed_prefill_keeps_the_router_off_the_tiled_gemm_under_the_hang_guard`].
-    ///
-    /// Mutation (observed red, restored): ignore the fact in `compile`
-    /// (`guarded = !routed_expert_sites(g).is_empty()`); the wgpu row fails with "a target without the
-    /// hang fuses a routed graph".
-    #[test]
-    fn compile_skips_fuse_only_for_a_routed_site_on_a_target_with_the_hang() {
-        use poot_test_util::graph_fixtures::{with_routed_expert_hang, with_routed_expert_site};
-
-        let routed = with_routed_expert_site(pointwise_chain());
-        let hung = Target {
-            caps: with_routed_expert_hang(wgpu().caps),
-            ..wgpu()
-        };
-        let guarded = compile(&routed, &hung, &REPLAY).expect("the chain compiles under the guard");
-        let passes: Vec<&str> = guarded.passes().collect();
-        assert!(
-            !passes.contains(&"fuse"),
-            "fuse must not run on a routed graph where the target has the hang: {passes:?}"
-        );
-        assert!(
-            !guarded
-                .graph()
-                .eqns
-                .iter()
-                .any(|eqn| matches!(eqn.op, OpKind::Fused(_))),
-            "the chain must stay scalar-decomposed under the guard"
-        );
-
-        let no_hang =
-            compile(&routed, &wgpu(), &REPLAY).expect("the routed chain compiles on wgpu");
-        assert!(
-            no_hang.passes().any(|pass| pass == "fuse"),
-            "a target without the hang fuses a routed graph"
-        );
-        let no_site = compile(&pointwise_chain(), &hung, &REPLAY).expect("the chain compiles");
-        assert!(
-            no_site.passes().any(|pass| pass == "fuse"),
-            "a graph with no routed-expert site fuses on a target that has the hang"
-        );
-    }
-
     /// The first `phase` step of the granitemoe registry fixture (two routed layers, four experts) at
     /// `tokens` tokens: the production family's own trace, not a hand-built graph.
     fn granitemoe_step(
@@ -928,6 +903,21 @@ mod tests {
         poot_quant::weights::WeightMap,
         poot_quant::weights::WeightStore,
     ) {
+        registered_step_and_weights("granite", Some("granitemoe"), phase, tokens)
+    }
+
+    /// The first `phase` step of a registered family's fixture (its `variant` fixture when named) at
+    /// `tokens` tokens, with the model's weight map and the store it binds.
+    fn registered_step_and_weights(
+        family: &str,
+        variant: Option<&str>,
+        phase: poot_models::model::Phase,
+        tokens: usize,
+    ) -> (
+        poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs>,
+        poot_quant::weights::WeightMap,
+        poot_quant::weights::WeightStore,
+    ) {
         use poot_models::model::{KvLayout, LogitRows, StepShape};
         use std::num::NonZeroUsize;
 
@@ -935,14 +925,19 @@ mod tests {
         let entry = registry
             .entries()
             .iter()
-            .find(|entry| entry.family.as_str() == "granite")
-            .expect("granite is registered");
-        let (_, granitemoe) = entry
-            .variants
-            .iter()
-            .find(|(name, _)| *name == "granitemoe")
-            .expect("granite ships a granitemoe fixture");
-        let fixture = granitemoe();
+            .find(|entry| entry.family.as_str() == family)
+            .unwrap_or_else(|| panic!("{family} is registered"));
+        let fixture = match variant {
+            None => (entry.fixture)(),
+            Some(variant) => {
+                let (_, make) = entry
+                    .variants
+                    .iter()
+                    .find(|(name, _)| *name == variant)
+                    .unwrap_or_else(|| panic!("{family} ships a {variant} fixture"));
+                make()
+            }
+        };
         let model = (entry.build)(&fixture.raw(), &fixture.store).expect("the fixture builds");
         let n = |v| NonZeroUsize::new(v).unwrap();
         let graph = model
@@ -995,51 +990,60 @@ mod tests {
         program.passes().any(|ran| ran == pass)
     }
 
-    const HANG_PASSES: [&str; 3] = [
+    const PIPELINE_PASSES: [&str; 3] = [
         "flash_attention_capped",
         "fuse_contraction_epilogues",
         "fuse",
     ];
 
-    /// SC-003 on the production presets (ruling XC2-05, no synthetic `Target`): the granitemoe prefill compiled
-    /// for the ROCm preset (hang fact set) omits the hang passes and for the wgpu preset (fact clear) runs
-    /// them, and the decode step, whose router has one row, runs them on both.
+    /// SC-002 (ruling XC2-05, production presets, no synthetic `Target`): the granitemoe prefill, whose two
+    /// routers contract more than one row, runs the whole pipeline on the ROCm, PTX and wgpu presets exactly as
+    /// the decode step does, and each program computes what the traced graph computes (ADR-0101 tier 2: every
+    /// element within 1e-4 relative, NaN fails).
     ///
-    /// Mutations (observed red, restored; see the card record): ignore the fact in `compile`; and match
-    /// every `ArgTopK` in `routed_expert_sites` (the decode program then loses `fuse` on ROCm).
+    /// Mutation (observed red, restored; see the card record): skip the three passes in `compile` whenever
+    /// `routed_expert_sites(g)` is non-empty; the prefill program loses them on every preset and this row goes
+    /// red, while the decode step (a one-row router, no site) keeps them.
     #[test]
-    fn routed_expert_prefill_omits_the_hang_passes_where_the_target_has_the_hang() {
+    fn routed_expert_prefill_runs_the_full_pipeline_on_every_preset() {
         use poot_models::model::Phase;
-        use poot_target::AmdArch;
+        use poot_target::{AmdArch, DeviceCaps};
 
-        let rocm = Target {
-            backend: Backend::AmdGcn(AmdArch::gfx1151()),
-            caps: poot_target::DeviceCaps::rocm_default(),
-        };
-        let wgpu = Target {
-            backend: Backend::SpirvVulkan,
-            caps: poot_target::DeviceCaps::wgpu_rdna3_igpu(),
-        };
+        let presets = [
+            (
+                "ROCm",
+                Target {
+                    backend: Backend::AmdGcn(AmdArch::gfx1151()),
+                    caps: DeviceCaps::rocm_default(),
+                },
+            ),
+            (
+                "PTX",
+                Target {
+                    backend: Backend::Nvptx,
+                    caps: DeviceCaps::ptx_default(),
+                },
+            ),
+            ("wgpu", wgpu()),
+        ];
         let (prefill, map, store) = granitemoe_step_and_weights(Phase::Prefill, 4);
         let decode = granitemoe_step(Phase::Decode, 1);
         assert!(
-            !crate::routed_expert_sites(&prefill).is_empty(),
+            !crate::passes::routed_expert_sites(&prefill).is_empty(),
             "prefill has a site"
         );
+        assert!(
+            crate::passes::routed_expert_sites(&decode).is_empty(),
+            "a one-row router has no site"
+        );
 
-        let on_rocm = compile(&prefill, &rocm, &REPLAY).expect("prefill compiles for ROCm");
-        for pass in HANG_PASSES {
-            assert!(!ran(&on_rocm, pass), "ROCm prefill ran {pass}");
-        }
-        let on_wgpu = compile(&prefill, &wgpu, &REPLAY).expect("prefill compiles for wgpu");
-        for pass in HANG_PASSES {
-            assert!(ran(&on_wgpu, pass), "wgpu prefill skipped {pass}");
-        }
-        // Both programs compute what the traced graph computes (ADR-0101 tier 2: every element within
-        // 1e-4 relative, NaN fails), the guarded one included.
         let prompt = [3, 17, 40, 8];
         let want = oracle_logits(&prefill, &map, &store, &prompt);
-        for (label, program) in [("ROCm", &on_rocm), ("wgpu", &on_wgpu)] {
+        for (label, target) in &presets {
+            let program = compile(&prefill, target, &REPLAY).expect("prefill compiles");
+            for pass in PIPELINE_PASSES {
+                assert!(ran(&program, pass), "{label} prefill skipped {pass}");
+            }
             let got = oracle_logits(program.graph(), &map, &store, &prompt);
             assert_eq!(got.len(), want.len(), "{label}: logits length");
             for (i, (g, w)) in got.iter().zip(&want).enumerate() {
@@ -1048,17 +1052,81 @@ mod tests {
                     "{label}: logit {i} is {g}, the traced graph gives {w}"
                 );
             }
-        }
-        for (label, target) in [("ROCm", &rocm), ("wgpu", &wgpu)] {
             let program = compile(&decode, target, &REPLAY).expect("decode compiles");
-            for pass in HANG_PASSES {
+            for pass in PIPELINE_PASSES {
                 assert!(ran(&program, pass), "{label} decode skipped {pass}");
             }
         }
+    }
+
+    /// SC-001 (POOT-575, ruling XC2-05): the Qwen3-Next prefill, whose four routers contract eight rows, compiles
+    /// for the ROCm, PTX and wgpu presets with every pass (`flash_attention_capped`, both fuses) and plans each
+    /// router contraction on a generated tiled schedule, never the one-thread-per-output serial kernel; each
+    /// compiled program computes what the traced graph computes (ADR-0101 tier 2). The decode step, whose
+    /// router has one row, runs the same passes.
+    ///
+    /// Mutation (observed red, restored; see the card record): skip the three passes in `compile` whenever
+    /// `routed_expert_sites(g)` is non-empty; the pass check fails with "ROCm prefill skipped
+    /// flash_attention_capped". The router contraction's own schedule is guarded by the serial-kernel
+    /// assertion: planning it on the one-thread-per-output kernel instead of a generated tiled schedule
+    /// fails the `routers` check.
+    #[test]
+    fn qwen3next_prefill_tiles_its_routers_and_runs_every_pass_on_every_preset() {
+        use poot_models::model::Phase;
+        use poot_target::{AmdArch, DeviceCaps};
+
+        const TOKENS: usize = 8;
+        const EXPERTS: usize = 4;
+        let presets = [
+            (
+                "ROCm",
+                Target {
+                    backend: Backend::AmdGcn(AmdArch::gfx1151()),
+                    caps: DeviceCaps::rocm_default(),
+                },
+            ),
+            (
+                "PTX",
+                Target {
+                    backend: Backend::Nvptx,
+                    caps: DeviceCaps::ptx_default(),
+                },
+            ),
+            ("wgpu", wgpu()),
+        ];
+        let (prefill, map, store) =
+            registered_step_and_weights("qwen3next", None, Phase::Prefill, TOKENS);
         assert!(
-            crate::routed_expert_sites(&decode).is_empty(),
-            "a one-row router has no site"
+            !crate::passes::routed_expert_sites(&prefill).is_empty(),
+            "the prefill's routers contract several rows"
         );
+        let decode = registered_step_and_weights("qwen3next", None, Phase::Decode, 1).0;
+        let prompt: Vec<i32> = (0..TOKENS as i32).map(|t| (3 * t + 1) % 48).collect();
+        let want = oracle_logits(&prefill, &map, &store, &prompt);
+        for (label, target) in &presets {
+            let program = compile(&prefill, target, &REPLAY).expect("prefill compiles");
+            for pass in PIPELINE_PASSES {
+                assert!(ran(&program, pass), "{label} prefill skipped {pass}");
+            }
+            let routers = router_choices_are_serial(&program, TOKENS, EXPERTS);
+            assert_eq!(routers.len(), 4, "{label}: one router per layer");
+            assert!(
+                routers.iter().all(|&serial| !serial),
+                "{label}: the routers take the tiled schedule: {routers:?}"
+            );
+            let got = oracle_logits(program.graph(), &map, &store, &prompt);
+            assert_eq!(got.len(), want.len(), "{label}: logits length");
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    (g - w).abs() <= 1e-4 * (1.0 + w.abs()),
+                    "{label}: logit {i} is {g}, the traced graph gives {w}"
+                );
+            }
+            let program = compile(&decode, target, &REPLAY).expect("decode compiles");
+            for pass in PIPELINE_PASSES {
+                assert!(ran(&program, pass), "{label} decode skipped {pass}");
+            }
+        }
     }
 
     /// Whether each eqn of `program` that produces the router's `[tokens, experts]` logits plans the
@@ -1091,48 +1159,44 @@ mod tests {
             .collect()
     }
 
-    /// Card 557 SC-005: the guard is a planner input to the contraction choice. The routed prefill
-    /// compiled for AMDGCN plans its router off the serial kernel (on the tiled schedule) when the
-    /// target has no hang, and on the one-thread-per-output serial kernel when it has. Mutation: drop the
-    /// guard input from the contraction choice (`planner/matmul.rs`'s `!guarded` test); the guarded
-    /// router plans tiled and this row goes red.
+    /// Card 557 SC-005 and the card-575 router row: the routed prefill's router contraction takes the generated
+    /// tiled schedule on the ROCm and PTX presets as on wgpu, never the one-thread-per-output serial kernel.
+    /// Mutation: route a router `MatMul` with `L > 1` to the serial kernel in `planner/matmul.rs`; the
+    /// router plans serial and this row goes red.
     #[test]
-    fn routed_prefill_keeps_the_router_off_the_tiled_gemm_under_the_hang_guard() {
+    fn routed_prefill_router_takes_the_tiled_schedule_on_every_preset() {
         use poot_models::model::Phase;
-        use poot_target::AmdArch;
+        use poot_target::{AmdArch, DeviceCaps};
 
-        let guarded = Target {
-            backend: Backend::AmdGcn(AmdArch::gfx1151()),
-            caps: poot_target::DeviceCaps::rocm_default(),
-        };
-        let mut open = guarded;
-        open.caps.known_miscompiles.routed_expert_tiling_hang = false;
         let g = granitemoe_step(Phase::Prefill, 4);
-
-        let serial = |target: &Target| {
-            let program = compile(&g, target, &REPLAY).expect("the routed prefill compiles");
-            router_choices_are_serial(&program, 4, 4)
-        };
-        let open_choices = serial(&open);
-        assert_eq!(
-            open_choices.len(),
-            2,
-            "one router in each of the two routed layers"
-        );
-        assert!(
-            open_choices.iter().all(|&serial| !serial),
-            "without the hang the router takes the tiled schedule: {open_choices:?}"
-        );
-        let guarded_choices = serial(&guarded);
-        assert_eq!(
-            guarded_choices.len(),
-            2,
-            "one router in each of the two routed layers"
-        );
-        assert!(
-            guarded_choices.iter().all(|&serial| serial),
-            "the guard must keep the router off the generated tiled GEMM: {guarded_choices:?}"
-        );
+        for (label, target) in [
+            (
+                "ROCm",
+                Target {
+                    backend: Backend::AmdGcn(AmdArch::gfx1151()),
+                    caps: DeviceCaps::rocm_default(),
+                },
+            ),
+            (
+                "PTX",
+                Target {
+                    backend: Backend::Nvptx,
+                    caps: DeviceCaps::ptx_default(),
+                },
+            ),
+        ] {
+            let program = compile(&g, &target, &REPLAY).expect("the routed prefill compiles");
+            let choices = router_choices_are_serial(&program, 4, 4);
+            assert_eq!(
+                choices.len(),
+                2,
+                "{label}: one router in each of the two routed layers"
+            );
+            assert!(
+                choices.iter().all(|&serial| !serial),
+                "{label}: the router takes the tiled schedule: {choices:?}"
+            );
+        }
     }
 
     /// SC-002: a graph no pass changes publishes its own baseline. A pure reshape moves no float value, so
@@ -1674,6 +1738,59 @@ mod tests {
         );
     }
 
+    /// A TIED F16 head: one `[vocab, hidden]` F16 weight read both by the token gather (so the
+    /// sole-reader gate leaves it unhosted) and, through a transpose, by the head matmul. `legalize`
+    /// splits the head; the planner cannot plan the F16 chunks, so `revert_unplannable_rewrites` undoes
+    /// the split and the weight is whole again after the pass pipeline.
+    fn tied_f16_head_graph(vocab: usize, hidden: usize) -> Graph {
+        let b = Builder::new();
+        let token = b.slot(Slot::Token, TensorType::scalar(DType::I32));
+        let w = b.constant(
+            "tied.weight",
+            TensorType::new(vec![vocab, hidden], DType::F16),
+        );
+        let embedded = b.cast(b.gather_scalar(w, 0, token), DType::F32);
+        let x = b.reshape(embedded, vec![1, hidden]);
+        let head = b.matmul(x, b.transpose(w, vec![1, 0]));
+        b.finish(head)
+    }
+
+    /// POOT-1050: `compile` never returns a program holding a constant over `max_buffer_bytes`, whether
+    /// or not a pass split survived the unplannable-rewrite revert: it is a typed `OversizedConstant`
+    /// or every constant fits. Driven on all three backends through `compile`.
+    #[test]
+    fn compile_never_succeeds_with_an_oversized_tied_f16_head() {
+        let limit = 174_762;
+        for backend in [
+            Backend::SpirvVulkan,
+            Backend::AmdGcn(poot_target::AmdArch::gfx1151()),
+            Backend::Nvptx,
+        ] {
+            let mut target = target_for(backend);
+            target.caps.max_buffer_bytes = limit;
+            let g = tied_f16_head_graph(4096, 64);
+            match compile(&g, &target, &REPLAY) {
+                Err(CompileError::Legalize(error)) => assert!(
+                    matches!(*error, LegalizeError::OversizedConstant { limit: l, .. } if l == limit),
+                    "{backend:?}: {error:?}"
+                ),
+                Ok(program) => {
+                    let graph = program.graph();
+                    for &id in &graph.consts {
+                        let aval = graph.aval(id);
+                        let bytes = aval.numel() as u64 * aval.dtype.byte_size() as u64;
+                        assert!(
+                            bytes <= limit,
+                            "{backend:?}: compiled with a {bytes}-byte const {:?} over {limit}",
+                            graph.meta(id).name
+                        );
+                    }
+                }
+                Err(other) => panic!("{backend:?}: unexpected error {other:?}"),
+            }
+        }
+    }
+
     // Card 642: the packed-contraction claim and Card 355's escape gate run inside
     // `compile`'s own pipeline, driven through `compile` itself.
 
@@ -1794,39 +1911,15 @@ mod tests {
         }
     }
 
-    // Card 642: the one packed MoE shape the escape gate admits until Card 632.
-
-    const MOE_EXPERTS: usize = 2;
+    const MOE_EXPERTS: usize = 3;
     const MOE_OUT: usize = 8;
     const MOE_K: usize = 64;
+    /// The contraction length of the stacked-table rows: a whole K-quant super-block.
+    const STACK_K: usize = 256;
 
     fn moe_descriptor() -> poot_quant::PackedWeight {
         poot_quant::PackedWeight::try_new(poot_quant::format::WeightFormat::Q8_0, [MOE_OUT, MOE_K])
             .unwrap()
-    }
-
-    fn moe_rows() -> Vec<poot_graph_ir::ops::PackedLinearGraphRow> {
-        (0..MOE_EXPERTS)
-            .map(|ordinal| poot_graph_ir::ops::PackedLinearGraphRow {
-                ordinal,
-                linear_id: format!("expert.{ordinal}"),
-                descriptor: moe_descriptor(),
-            })
-            .collect()
-    }
-
-    /// `packed_indexed_linear` (`grouped == false`) or `packed_grouped_linear` over two packed experts.
-    fn packed_moe_graph(grouped: bool) -> Graph {
-        let b = Builder::new();
-        let x = b.slot_named(Slot::Activation, "moe-x", TensorType::f32(vec![3, MOE_K]));
-        let selector = b.slot_named(Slot::Activation, "moe-ids", TensorType::f32(vec![3]));
-        let out = if grouped {
-            poot_graph_ir::ops::packed_grouped_linear(&b, x, selector, &moe_rows())
-        } else {
-            poot_graph_ir::ops::packed_indexed_linear(&b, x, selector, &moe_rows())
-        }
-        .unwrap();
-        b.finish(out)
     }
 
     /// One expert's staged `PackedDequant`, as the builders stage it.
@@ -1839,105 +1932,119 @@ mod tests {
         b.packed_dequant(&sources, moe_descriptor())
     }
 
-    /// A near miss of the canonical chain, built by hand: `Consumer` swaps the table's consumer for a
-    /// reduce, `NoTranspose` drops the transpose (reshaping the `[out, K]` rows directly), `DenseBranch`
-    /// concatenates a dense table next to a packed branch.
-    enum NearMiss {
-        Consumer,
-        NoTranspose,
-        DenseBranch,
+    /// Every packed layout the engine serves a routed projection in: a plain block format, a K-quant
+    /// super-block, the two planar integer formats, and a codebook-scaled 4-bit block format.
+    fn moe_formats() -> Vec<poot_quant::format::WeightFormat> {
+        use poot_quant::format::{GroupMap, WeightFormat};
+        use std::num::NonZeroUsize;
+        vec![
+            WeightFormat::Q8_0,
+            WeightFormat::Q4_K,
+            WeightFormat::Awq {
+                group_size: NonZeroUsize::new(64).unwrap(),
+            },
+            WeightFormat::Gptq {
+                groups: GroupMap::Indexed {
+                    groups: NonZeroUsize::new(4).unwrap(),
+                },
+            },
+            WeightFormat::Mxfp4,
+        ]
     }
 
-    fn near_miss_graph(kind: NearMiss) -> Graph {
+    fn stack_descriptor(format: poot_quant::format::WeightFormat) -> poot_quant::PackedWeight {
+        poot_quant::PackedWeight::try_new(format, [MOE_OUT, STACK_K]).unwrap()
+    }
+
+    /// `packed_indexed_linear` over `MOE_EXPERTS` stacked experts of `format`.
+    fn packed_moe_graph(format: poot_quant::format::WeightFormat) -> Graph {
         let b = Builder::new();
-        let x_k = match kind {
-            NearMiss::NoTranspose => MOE_OUT,
-            _ => MOE_K,
-        };
-        let x = b.slot_named(Slot::Activation, "moe-x", TensorType::f32(vec![3, x_k]));
+        let x = b.slot_named(Slot::Activation, "moe-x", TensorType::f32(vec![3, STACK_K]));
         let selector = b.slot_named(Slot::Activation, "moe-ids", TensorType::f32(vec![3]));
-        let branch = |id: &str| {
-            let dequant = staged_dequant(&b, id);
-            match kind {
-                NearMiss::NoTranspose => b.reshape(dequant, vec![1, MOE_OUT, MOE_K]),
-                _ => {
-                    let t = b.transpose(dequant, vec![1, 0]);
-                    b.reshape(t, vec![1, MOE_K, MOE_OUT])
-                }
-            }
+        let table = poot_graph_ir::ops::PackedExpertStack {
+            stack_id: "moe.experts".to_string(),
+            descriptor: stack_descriptor(format),
+            experts: MOE_EXPERTS,
         };
-        let first = branch("expert.0");
-        let second = match kind {
-            NearMiss::DenseBranch => {
-                b.constant("dense.expert", TensorType::f32(vec![1, MOE_K, MOE_OUT]))
-            }
-            _ => branch("expert.1"),
-        };
-        let table = b.concat(0, &[first, second]);
-        let out = match kind {
-            NearMiss::Consumer => b.reduce(RedOp::Sum, table, 0, false),
-            _ => b.indexed_matmul(x, table, selector),
-        };
+        let out = poot_graph_ir::ops::packed_indexed_linear(&b, x, selector, &table).unwrap();
         b.finish(out)
     }
 
-    /// W12: the canonical indexed and grouped packed MoE chains compile on every backend, each expert
-    /// dequant planned as `Materialize` and the table as the dense `IndexedMatMul`. Mutation: drop the
-    /// `is_canonical_indexed_branch` admission from `reject_packed_dequant_escapes`; every row is
-    /// refused (`Unmatched`).
+    /// SC-001 (compile half): a routed packed projection over a stacked table of every layout the engine
+    /// serves compiles on every backend to exactly one planned `PackedContraction { rows: Indexed }` - one
+    /// generated packed Gemv - and to no `PackedDequant`, `Materialize` or dense `IndexedMatMul`.
+    /// Mutation: plan the indexed contraction as the block-diagonal form (`PackedRows::Blocks`); the request
+    /// check fails.
     #[test]
-    fn compile_admits_the_canonical_packed_moe_chain() {
+    fn compile_plans_the_indexed_packed_contraction_on_every_backend() {
         for backend in [
             Backend::SpirvVulkan,
             Backend::AmdGcn(poot_target::AmdArch::gfx1151()),
             Backend::Nvptx,
         ] {
-            for grouped in [false, true] {
-                let what = format!("{backend:?} grouped={grouped}");
-                let program = compile(&packed_moe_graph(grouped), &target_for(backend), &REPLAY)
+            for format in moe_formats() {
+                let what = format!("{backend:?} {format:?}");
+                let program = compile(&packed_moe_graph(format), &target_for(backend), &REPLAY)
                     .unwrap_or_else(|error| panic!("{what}: {error}"));
-                let dequants = program
-                    .planned()
-                    .filter(|(eqn, plan)| {
-                        matches!(eqn.op, OpKind::PackedDequant { .. })
-                            && plan
-                                .single()
-                                .is_some_and(|dispatch| !dispatch.launch.meta.is_empty())
-                            && matches!(
-                                program.kernel_choice(eqn),
-                                KernelChoice::Generated(KernelRequest::Packed(request))
-                                    if request.name == "packed_materialize"
-                            )
-                    })
-                    .count();
-                assert_eq!(dequants, MOE_EXPERTS, "{what}: one Materialize per expert");
+                let planned: Vec<_> = program.planned().collect();
+                let [(contraction, _)] = planned.as_slice() else {
+                    panic!(
+                        "{what}: expected one planned equation, got {:?}",
+                        planned
+                            .iter()
+                            .map(|(eqn, _)| eqn.op.name())
+                            .collect::<Vec<_>>()
+                    );
+                };
                 assert!(
-                    program
-                        .planned()
-                        .any(|(eqn, _)| matches!(eqn.op, OpKind::IndexedMatMul)),
-                    "{what}: the table runs the dense IndexedMatMul"
+                    matches!(
+                        contraction.op,
+                        OpKind::PackedContraction {
+                            rows: poot_graph_ir::ContractionRows::Indexed {
+                                experts: MOE_EXPERTS
+                            },
+                            ..
+                        }
+                    ),
+                    "{what}: {:?}",
+                    contraction.op
+                );
+                assert!(
+                    matches!(
+                        program.kernel_choice(contraction),
+                        KernelChoice::Generated(KernelRequest::Contraction(
+                            ContractionSpec::Packed(request)
+                        )) if request.rows == poot_kernelgen::PackedRows::Indexed
+                    ),
+                    "{what}: {:?}",
+                    program.kernel_choice(contraction)
                 );
             }
         }
     }
 
-    /// W12: a near miss of the canonical chain is still refused by the escape gate. Mutation: admit
-    /// any `Transpose`/`Reshape`/`Concat` chain (drop the `IndexedMatMul` and dense-branch checks in
-    /// `is_canonical_indexed_branch`); the `Consumer` and `DenseBranch` rows compile.
+    /// The W12 spelling of a packed expert table - one `PackedDequant -> Transpose -> Reshape` branch per
+    /// expert, concatenated into `[E, K, out]` for a dense `IndexedMatMul` - is refused by the escape gate:
+    /// there is no admitted chain that materializes an expert, whatever consumes the table. Mutation:
+    /// re-admit a `Concat`-fed `IndexedMatMul` in `reject_packed_dequant_escapes`; this graph compiles.
     #[test]
-    fn compile_refuses_a_near_miss_packed_moe_chain() {
-        for (what, kind) in [
-            ("consumer", NearMiss::Consumer),
-            ("no transpose", NearMiss::NoTranspose),
-            ("dense branch", NearMiss::DenseBranch),
-        ] {
-            match compile(&near_miss_graph(kind), &wgpu(), &REPLAY) {
-                Err(CompileError::PackedDequant(_)) => {}
-                other => panic!(
-                    "{what}: expected the escape gate's refusal, got {:?}",
-                    other.map(|_| ())
-                ),
-            }
+    fn compile_refuses_the_materializing_packed_moe_chain() {
+        let b = Builder::new();
+        let x = b.slot_named(Slot::Activation, "moe-x", TensorType::f32(vec![3, MOE_K]));
+        let selector = b.slot_named(Slot::Activation, "moe-ids", TensorType::f32(vec![3]));
+        let branch = |id: &str| {
+            let dequant = staged_dequant(&b, id);
+            let t = b.transpose(dequant, vec![1, 0]);
+            b.reshape(t, vec![1, MOE_K, MOE_OUT])
+        };
+        let table = b.concat(0, &[branch("expert.0"), branch("expert.1")]);
+        let out = b.indexed_matmul(x, table, selector);
+        match compile(&b.finish(out), &wgpu(), &REPLAY) {
+            Err(CompileError::PackedDequant(_)) => {}
+            other => panic!(
+                "expected the escape gate's refusal, got {:?}",
+                other.map(|_| ())
+            ),
         }
     }
 
@@ -2565,7 +2672,6 @@ mod tests {
     }
 
     /// A former region source built from primitives. Mirrored by the wgpu acceptance fixture.
-    /// The routed-expert hang guard leaves this chain visible to the planner; the full pipeline fuses it first.
     fn former_region_chain_fixture() -> Graph {
         let b = Builder::new();
         let x = b.constant("x", TensorType::f32(vec![2, 5]));
@@ -2611,9 +2717,7 @@ mod tests {
         b.finish(y)
     }
 
-    /// Submission mode does not affect the compiled plans. The full and the routed-expert-guarded pipelines
-    /// both matter: the full one hides the old region shape, whereas the guarded one exposed the baseline
-    /// capture refusal.
+    /// Submission mode does not affect the compiled plans.
     #[test]
     fn compile_output_does_not_depend_on_submission_mode() {
         let fixtures: [(&str, Graph); 4] = [
@@ -2623,35 +2727,24 @@ mod tests {
             ("former_region_chain", former_region_chain_fixture()),
         ];
         for (name, graph) in &fixtures {
-            for guarded in [false, true] {
-                let replay = CompileOptions {
-                    execution: Submission::Replay,
-                    limits: crate::CompileLimits::STANDARD,
-                };
-                let uncached = CompileOptions {
-                    execution: Submission::Eager,
-                    limits: crate::CompileLimits::STANDARD,
-                };
-                let (graph, caps) =
-                    poot_test_util::graph_fixtures::pipeline_input(graph, wgpu().caps, guarded);
-                let target = Target { caps, ..wgpu() };
-                let under_replay = compile(&graph, &target, &replay)
-                    .unwrap_or_else(|error| panic!("{name}/{guarded}: CaptureReplay: {error}"));
-                let under_uncached = compile(&graph, &target, &uncached)
-                    .unwrap_or_else(|error| panic!("{name}/{guarded}: UncachedResident: {error}"));
-                let replay_plans: Vec<String> = under_replay
-                    .planned()
-                    .map(|(_, plan)| format!("{plan:?}"))
-                    .collect();
-                let uncached_plans: Vec<String> = under_uncached
-                    .planned()
-                    .map(|(_, plan)| format!("{plan:?}"))
-                    .collect();
-                assert_eq!(
-                    replay_plans, uncached_plans,
-                    "{name}/{guarded}: CaptureReplay and UncachedResident produced different plans"
-                );
-            }
+            let replay = CompileOptions::new(Submission::Replay, crate::CompileLimits::STANDARD);
+            let uncached = CompileOptions::new(Submission::Eager, crate::CompileLimits::STANDARD);
+            let under_replay = compile(graph, &wgpu(), &replay)
+                .unwrap_or_else(|error| panic!("{name}: CaptureReplay: {error}"));
+            let under_uncached = compile(graph, &wgpu(), &uncached)
+                .unwrap_or_else(|error| panic!("{name}: UncachedResident: {error}"));
+            let replay_plans: Vec<String> = under_replay
+                .planned()
+                .map(|(_, plan)| format!("{plan:?}"))
+                .collect();
+            let uncached_plans: Vec<String> = under_uncached
+                .planned()
+                .map(|(_, plan)| format!("{plan:?}"))
+                .collect();
+            assert_eq!(
+                replay_plans, uncached_plans,
+                "{name}: CaptureReplay and UncachedResident produced different plans"
+            );
         }
     }
 
@@ -2673,6 +2766,274 @@ mod tests {
                 "expected the escape gate's refusal, got {:?}",
                 other.map(|_| ())
             ),
+        }
+    }
+
+    /// SC-001 (card 1067), model-free, through `compile`: a stacked expert table over the target's buffer limit
+    /// splits into expert ranges whose carriers each fit, and the recombined output equals the unsplit
+    /// contraction on the CPU oracle (zero signs aside) for rows routed to every expert, the last (alone in its range)
+    /// included, in an order that crosses the range boundaries. The limit is 544 bytes: two experts per piece,
+    /// ranges 0..2, 2..4, 4..5.
+    /// Mutation: in `split_oversized_expert_stacks` shift the ids of every piece after the first by one less than
+    /// `range.start`. Red: `Index(IndexFault { eqn: 27, position: 3, value: F32(2.0), len: 2, kind: OutOfRange })`
+    /// (the row routed to expert 3 reads local expert 2 of a two-expert piece).
+    #[test]
+    fn compile_splits_an_oversized_expert_stack_and_matches_the_unsplit_contraction() {
+        let fixture = SplitStack::new();
+        let routed = [0.0, 1.0, 2.0, 3.0, 4.0, 4.0, 0.0, 3.0, 2.0, 1.0, 4.0];
+        let unsplit = fixture
+            .run(&fixture.graph, &routed, &fixture.unsplit_stacks())
+            .unwrap();
+        let program = fixture.compile();
+        assert_eq!(
+            program.graph().consts.len(),
+            3,
+            "5 experts at 2 per buffer: ranges 0..2, 2..4, 4..5, one Q8_0 carrier each"
+        );
+        // The oracle runs the legalized graph: `fuse` turns the pieces' sum into one contraction epilogue, which
+        // the oracle decomposes into unnamed values.
+        let (split_graph, split_stacks) = fixture.oracle_split(&fixture.legalize());
+        let split = fixture.run(&split_graph, &routed, &split_stacks).unwrap();
+        let (split, unsplit) = (split.as_f32().unwrap(), unsplit.as_f32().unwrap());
+        assert_eq!(split.len(), unsplit.len());
+        for (index, (got, want)) in split.iter().zip(unsplit).enumerate() {
+            assert_eq!(
+                got,
+                want,
+                "element {index} (row {}, expert {}): split {got} vs unsplit {want}",
+                index / 4,
+                routed[index / 4]
+            );
+        }
+        assert!(
+            unsplit.iter().any(|v| *v != 0.0),
+            "the fixture's outputs are not all zero"
+        );
+    }
+
+    /// SC-002 (card 1067), model-free, through `compile`: an id no expert of the stack holds - past the last
+    /// expert, negative, NaN, fractional - is the same typed index fault from the split graph as from the unsplit
+    /// one (the same row): a split never turns an invalid id into a valid row.
+    /// Mutation: in `split_oversized_expert_stacks` drop the invalid-row offset (`-UNHELD_ID * 0.0`). Red: `split
+    /// graph, id 5: HostTensor { .. }` - the invalid id reads expert 0 in every piece and the split graph evaluates.
+    #[test]
+    fn a_split_expert_stack_keeps_invalid_ids_invalid() {
+        let fixture = SplitStack::new();
+        let (split_graph, split_stacks) = fixture.oracle_split(&fixture.legalize());
+        for invalid in [5.0, 9.0, -1.0, f32::NAN, 1.5, 3.5] {
+            let routed = [0.0, 3.0, invalid, 4.0, 1.0, 0.0, 2.0, 2.0, 3.0, 1.0, 4.0];
+            let unsplit = fixture
+                .run(&fixture.graph, &routed, &fixture.unsplit_stacks())
+                .expect_err("the unsplit oracle refuses an invalid id");
+            let split = fixture
+                .run(&split_graph, &routed, &split_stacks)
+                .expect_err(&format!("split graph, id {invalid}"));
+            let (poot_eval::EvalError::Index(want), poot_eval::EvalError::Index(got)) =
+                (&unsplit, &split)
+            else {
+                panic!("both refuse with an index fault: {unsplit:?} vs {split:?}");
+            };
+            assert_eq!(
+                got.position, want.position,
+                "id {invalid}: {got:?} vs {want:?}"
+            );
+            assert_eq!(got.position, 2);
+        }
+    }
+
+    /// The routed projection of a Q8_0 `[out, k]` stack of `experts` experts for one decode row.
+    fn decode_stack_graph(experts: usize, out: usize, k: usize) -> Graph {
+        use poot_graph_ir::ops::PackedExpertStack;
+        let descriptor =
+            poot_quant::PackedWeight::try_new(poot_quant::format::WeightFormat::Q8_0, [out, k])
+                .unwrap();
+        let table = PackedExpertStack {
+            stack_id: "experts".to_string(),
+            descriptor,
+            experts,
+        };
+        let b = Builder::new();
+        let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![1, k]));
+        let ids = b.slot_named(Slot::Activation, "ids", TensorType::f32(vec![1]));
+        let y = poot_graph_ir::ops::packed_indexed_linear(&b, x, ids, &table).unwrap();
+        b.finish(y)
+    }
+
+    /// SC-003 (card 1067), through `compile` at the real wgpu caps: 16 Q8_0 `[4096, 8192]` experts are 570 MB
+    /// of one source, past the 2^32 bit offsets the kernels address (15 experts at most), yet under the 2 GiB
+    /// buffer limit. The stack compiles to two pieces (15 + 1 experts) instead of the planner's
+    /// `DispatchSizeOverflow`; one expert past the address range (`[32768, 16384]`, 570 MB alone) stays that
+    /// typed refusal, since no split of a single expert helps.
+    /// Mutation: drop `max_stack_experts` from `expert_ranges`' bound (start `per_chunk` at `usize::MAX`); the
+    /// 570 MB stack is no longer split and compiles to the typed `DispatchSizeOverflow` refusal.
+    #[test]
+    fn compile_splits_a_stack_past_the_bit_offset_range_and_refuses_one_expert_past_it() {
+        let program = compile(&decode_stack_graph(16, 4096, 8192), &wgpu(), &REPLAY)
+            .expect("570 MB of experts splits");
+        assert_eq!(program.graph().consts.len(), 2, "15 + 1 experts");
+        let heights: Vec<usize> = program
+            .graph()
+            .consts
+            .iter()
+            .map(|&id| program.graph().aval(id).shape[0])
+            .collect();
+        assert_eq!(heights, [15, 1]);
+
+        let refused = refusal(
+            compile(&decode_stack_graph(2, 32768, 16384), &wgpu(), &REPLAY),
+            "one expert past the address range",
+        );
+        assert_eq!(refused.missing, Capability::DispatchSizeOverflow);
+    }
+
+    /// A Q8_0 `[4, 64]` stack of `SPLIT_EXPERTS` random experts routed from 11 rows: the unsplit routed
+    /// projection, its split compile on a target whose buffer limit holds two experts, and the oracle inputs of both.
+    struct SplitStack {
+        graph: Graph,
+        x: ValueId,
+        ids: ValueId,
+        descriptor: poot_quant::PackedWeight,
+        owners: Vec<std::sync::Arc<poot_quant::PackedPayload>>,
+    }
+
+    const SPLIT_EXPERTS: usize = 5;
+
+    impl SplitStack {
+        fn new() -> Self {
+            use poot_graph_ir::ops::PackedExpertStack;
+            let format = poot_quant::format::WeightFormat::Q8_0;
+            let descriptor = poot_quant::PackedWeight::try_new(format, [4, 64]).unwrap();
+            let table = PackedExpertStack {
+                stack_id: "experts".to_string(),
+                descriptor,
+                experts: SPLIT_EXPERTS,
+            };
+            let b = Builder::new();
+            let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![11, 64]));
+            let ids = b.slot_named(Slot::Activation, "ids", TensorType::f32(vec![11]));
+            let y = poot_graph_ir::ops::packed_indexed_linear(&b, x, ids, &table).unwrap();
+            Self {
+                graph: b.finish(y),
+                x: x.id,
+                ids: ids.id,
+                descriptor,
+                owners: (0..SPLIT_EXPERTS)
+                    .map(|e| {
+                        std::sync::Arc::new(poot_test_util::packed::random_payload(
+                            format,
+                            [4, 64],
+                            e as u64 * 7 + 3,
+                        ))
+                    })
+                    .collect(),
+            }
+        }
+
+        /// The buffer limit that holds two experts of the one Q8_0 source.
+        fn two_experts(&self) -> Target {
+            let slab = self.descriptor.slab_bytes(poot_quant::SourceRole::Blocks) as u64;
+            wgpu_with_limit(2 * slab)
+        }
+
+        fn compile(&self) -> Program {
+            compile(&self.graph, &self.two_experts(), &REPLAY).expect("splits the stack")
+        }
+
+        fn legalize(&self) -> Graph {
+            crate::passes::legalize(
+                &self.graph,
+                &self.two_experts().caps,
+                &CompileLimits::STANDARD,
+            )
+            .expect("splits the stack")
+        }
+
+        fn unsplit_stacks(&self) -> impl Fn(&str) -> poot_quant::PackedStackComponentRef {
+            let whole =
+                std::sync::Arc::new(poot_quant::PackedStack::try_new(self.owners.clone()).unwrap());
+            move |name| {
+                let role = poot_graph_ir::PackedSourceName::parse(name).unwrap().role();
+                poot_quant::PackedStackComponentRef::new(std::sync::Arc::clone(&whole), role)
+            }
+        }
+
+        /// `split` as the oracle binds it, and the stack of each carrier. The oracle reads a carrier's role and
+        /// stack id off a [`PackedSourceName`], which has no spelling for `{carrier}.chunkN`, so each chunk is
+        /// renamed to the packed name of stack `{id}.chunkN`; its stack is the experts the chunks before it
+        /// leave off, as the executor binder places them.
+        fn oracle_split(
+            &self,
+            split: &Graph,
+        ) -> (
+            Graph,
+            impl Fn(&str) -> poot_quant::PackedStackComponentRef + use<>,
+        ) {
+            use poot_graph_ir::PackedSourceName;
+            let mut graph = split.clone();
+            let mut start = 0;
+            let mut runs: HashMap<String, std::ops::Range<usize>> = HashMap::new();
+            for &id in &split.consts {
+                let meta = split.meta(id);
+                let name = meta.name.clone().expect("a named carrier");
+                let (carrier, index) = name
+                    .rsplit_once(".chunk")
+                    .expect("only chunk carriers remain");
+                if index == "0" {
+                    start = 0;
+                }
+                let source = PackedSourceName::parse(carrier).expect("a packed carrier");
+                let renamed = PackedSourceName::new(
+                    &format!("{}.chunk{index}", source.linear_id()),
+                    source.role(),
+                )
+                .to_string();
+                let end = start + meta.aval.shape[0];
+                runs.insert(renamed.clone(), start..end);
+                graph.values[id].name = Some(renamed);
+                start = end;
+            }
+            let owners = self.owners.clone();
+            (graph, move |name: &str| {
+                let role = PackedSourceName::parse(name).unwrap().role();
+                let part = std::sync::Arc::new(
+                    poot_quant::PackedStack::try_new(owners[runs[name].clone()].to_vec()).unwrap(),
+                );
+                poot_quant::PackedStackComponentRef::new(part, role)
+            })
+        }
+
+        fn run(
+            &self,
+            graph: &Graph,
+            routed: &[f32],
+            stacks: &dyn Fn(&str) -> poot_quant::PackedStackComponentRef,
+        ) -> Result<poot_tensor::HostTensor, poot_eval::EvalError> {
+            use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+            let activation: Vec<f32> = (0..11 * 64)
+                .map(|i| ((i % 17) as f32 - 8.0) * 0.125)
+                .collect();
+            let mut inputs: HashMap<ValueId, Value> = HashMap::new();
+            for &id in &graph.inputs {
+                let value = if id == self.x {
+                    Value::from(poot_tensor::HostTensor::f32(
+                        vec![11, 64],
+                        activation.clone(),
+                    ))
+                } else if id == self.ids {
+                    Value::from(poot_tensor::HostTensor::f32(vec![11], routed.to_vec()))
+                } else {
+                    Value::from(stacks(
+                        graph.meta(id).name.as_deref().expect("a named carrier"),
+                    ))
+                };
+                inputs.insert(id, value);
+            }
+            Ok(
+                eval(graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))?
+                    .output
+                    .into_host()
+                    .unwrap(),
+            )
         }
     }
 }

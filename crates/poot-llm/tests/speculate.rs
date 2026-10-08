@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use poot_executor::{
     BufferRole, Device, Dispatch, Engine, EntryId, ExecError, ExecutableId, Executor,
-    ExecutorStats, HostSync, StateScope, StepInputs, StepOutputs, WeightSource,
+    ExecutorStats, HostSync, StateScope, StepInputs, StepOutputs,
 };
 use poot_graph_ir::{
     BinOp, Builder, Graph, Slot, SlotKey, StateRole, TensorType, ValidationOutputs,
@@ -351,10 +351,13 @@ impl Executor for Counting {
     fn target_set(&self) -> TargetSet {
         self.inner.target_set()
     }
+    fn free_memory_bytes(&self) -> Option<u64> {
+        self.inner.free_memory_bytes()
+    }
     fn load_weights(
         &mut self,
         store: Arc<WeightStore>,
-        weights: WeightSource,
+        weights: Arc<WeightMap>,
     ) -> Result<ExecutableId, ExecError> {
         self.loads.set(self.loads.get() + 1);
         self.inner.load_weights(store, weights)
@@ -390,12 +393,9 @@ impl Executor for Counting {
 }
 
 fn options(draft: DraftPolicy) -> DriverOptions {
-    let compile = CompileOptions {
-        execution: Submission::Replay,
-        limits: CompileLimits::STANDARD,
-    };
+    let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
     DriverOptions {
-        prefill: compile,
+        prefill: compile.clone(),
         decode: compile,
         capacity: nz(CAPACITY),
         prefill_chunk: nz(8),

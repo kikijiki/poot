@@ -268,7 +268,8 @@ fn gather_nonaxis0_gpu_matches_cpu() {
 #[test]
 fn gather_nonaxis0_plan_selection() {
     // A non-axis-0 gather is the one generated movement kernel on every backend and dtype: the request
-    // names the table's storage and the gather axis, and the dispatch binds no metadata buffer. No GPU.
+    // names the table's storage (an I32 table moves its words as I32) and the gather axis, and the
+    // dispatch binds no metadata buffer. No GPU.
     use poot_graph_ir::op::OpKind;
     use poot_target::Backend;
     use poot_tensor::DType;
@@ -291,18 +292,16 @@ fn gather_nonaxis0_plan_selection() {
         )
         .unwrap()
     };
-    for (dt, backend) in [
-        (DType::F32, Backend::SpirvVulkan),
-        (DType::F32, Backend::Nvptx),
-        (DType::I32, Backend::SpirvVulkan),
+    for (dt, backend, carrier) in [
+        (DType::F32, Backend::SpirvVulkan, poot_kernel_ir::Ty::F32),
+        (DType::F32, Backend::Nvptx, poot_kernel_ir::Ty::F32),
+        (DType::I32, Backend::SpirvVulkan, poot_kernel_ir::Ty::I32),
     ] {
         let (plan_, choice_) = plan_for(dt, backend);
         let spec = movement_of(&plan_, &choice_);
         assert_eq!(
             spec.storage,
-            poot_kernelgen::Storage::Elements {
-                carrier: poot_kernel_ir::Ty::F32
-            },
+            poot_kernelgen::Storage::Elements { carrier },
             "{dt:?} {backend:?}"
         );
         assert!(
@@ -954,6 +953,7 @@ fn i32_slot_gather_variants_compiled_match_cpu_bit_exact() {
     use poot_executor::StepInputs;
     use poot_graph_ir::StateRole;
     use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
+    use poot_test_util::const_weights::ConstWeights;
     use poot_test_util::i32_slot_gather::run_all;
 
     let _gpu_guard = gpu_lock();
@@ -975,15 +975,14 @@ fn i32_slot_gather_variants_compiled_match_cpu_bit_exact() {
         // matching `variant.inputs`'s signature; `staged_replay` below compiles it a second time into a
         // `StagedProgram` for the engine, mirroring `legalize.rs`'s already-landed split test (compile
         // once to inspect/bind, `run_via_contract`/`staged_replay` compiles again to execute).
-        let options = poot_graph_plan::CompileOptions {
-            execution: poot_graph_plan::Submission::Replay,
-            limits: poot_graph_plan::CompileLimits::STANDARD,
-        };
+        let options = poot_graph_plan::CompileOptions::new(
+            poot_graph_plan::Submission::Replay,
+            poot_graph_plan::CompileLimits::STANDARD,
+        );
         let program = poot_graph_plan::compile(&variant.graph, &target, &options)
             .map_err(|e| format!("compile: {e}"))?;
         let graph = program.graph().clone();
         let bound = variant.inputs(&graph);
-        let staged = staged_replay(&graph, target);
 
         let mut store = WeightStore::builder();
         let mut slots = StepInputs::new();
@@ -1054,19 +1053,22 @@ fn i32_slot_gather_variants_compiled_match_cpu_bit_exact() {
             slots.push(key.clone(), shape, view);
         }
 
-        let exe = gpu
-            .load_weights(
-                Arc::new(store.build()),
-                poot_executor::WeightSource::ConstNames,
-            )
-            .map_err(|e| e.to_string())?;
-
-        if let Some((name, shape)) = &state_seed {
+        let store = store.build();
+        let mut weights = ConstWeights::new(&store);
+        let staged = staged_replay(&weights.graph(&graph), target);
+        let prime = state_seed.as_ref().map(|(name, shape)| {
             let b = Builder::new();
             let seed = b.constant(&format!("{name}.seed"), TensorType::f32(shape.clone()));
             let cache = b.state_input(name, TensorType::f32(shape.clone()), StateRole::Recurrent);
-            let prime = b.finish_with_state(seed, &[(cache, seed)]);
-            let prime_staged = staged_replay(&prime, target);
+            weights.graph(&b.finish_with_state(seed, &[(cache, seed)]))
+        });
+        let map = Arc::new(weights.map());
+        let exe = gpu
+            .load_weights(Arc::new(store), map)
+            .map_err(|e| e.to_string())?;
+
+        if let Some(prime) = &prime {
+            let prime_staged = staged_replay(prime, target);
             let prime_entry = gpu
                 .add_entry(exe, &prime_staged)
                 .map_err(|e| format!("prime add_entry: {e}"))?;

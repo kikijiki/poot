@@ -2,7 +2,7 @@ use super::*;
 use crate::op::OpKind;
 use crate::packed_source::PackedSourceName;
 use poot_quant::PackedWeight;
-use poot_quant::format::{ScaleEncoding, WeightFormat};
+use poot_quant::format::WeightFormat;
 
 /// The equation kinds `f` emits over one `[2, 3]` input, in trace order.
 fn trace_kinds(f: fn(&Builder, Traced) -> Traced) -> Vec<OpKind> {
@@ -275,16 +275,6 @@ fn packed_block_diagonal_linear_rejects_indivisible_blocks() {
     assert!(graph.eqns.is_empty(), "no packed equations were staged");
 }
 
-fn packed_rows(descriptor: PackedWeight) -> Vec<PackedLinearGraphRow> {
-    (0..2)
-        .map(|ordinal| PackedLinearGraphRow {
-            ordinal,
-            linear_id: format!("layer.expert.{ordinal}"),
-            descriptor,
-        })
-        .collect()
-}
-
 fn operand_value(eqn: &crate::Eqn, position: usize) -> crate::ValueId {
     match eqn.inputs[position] {
         Operand::Value(value) => value,
@@ -292,276 +282,115 @@ fn operand_value(eqn: &crate::Eqn, position: usize) -> crate::ValueId {
     }
 }
 
+/// SC-001 (IR half): `packed_indexed_linear` over every packed layout the engine serves builds exactly one
+/// claimed `PackedContraction { rows: Indexed }`, no `PackedDequant`, no `Materialize`-shaped chain and no
+/// sort, whose operands are `[x, ids, carriers..]`, each carrier one stacked, word-padded constant named
+/// after the stack id. Mutation: stage one carrier per expert (the removed W12 spelling); the equation count
+/// and the carrier shapes go red.
 #[test]
-fn packed_indexed_linear_is_card356_canonical() -> Result<(), BuilderAppendError> {
-    let descriptor = PackedWeight::try_new(
-        WeightFormat::E4m3Block128 {
-            scale: ScaleEncoding::E8m0,
+fn packed_indexed_linear_is_one_claimed_contraction_over_stacked_carriers()
+-> Result<(), BuilderAppendError> {
+    use poot_quant::format::GroupMap;
+    use std::num::NonZeroUsize;
+    let formats = [
+        WeightFormat::Q8_0,
+        WeightFormat::Q4_K,
+        WeightFormat::Awq {
+            group_size: NonZeroUsize::new(32).unwrap(),
         },
-        [3, 5],
-    )
-    .unwrap();
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![4, 5]));
-    let selector = b.constant("selector", TensorType::f32(vec![4]));
-    let output = packed_indexed_linear(&b, x, selector, &packed_rows(descriptor))?;
-    let graph = b.finish(output);
-
-    assert_eq!(graph.eqns.len(), 8);
-    assert!(matches!(
-        graph.eqns.iter().map(|eqn| &eqn.op).collect::<Vec<_>>().as_slice(),
-        [
-            OpKind::PackedDequant { descriptor: first },
-            OpKind::Transpose { perm: first_perm },
-            OpKind::Reshape { shape: first_shape },
-            OpKind::PackedDequant { descriptor: second },
-            OpKind::Transpose { perm: second_perm },
-            OpKind::Reshape { shape: second_shape },
-            OpKind::Concat { axis: 0 },
-            OpKind::IndexedMatMul,
-        ] if *first == descriptor
-            && *second == descriptor
-            && first_perm == &[1, 0]
-            && second_perm == &[1, 0]
-            && first_shape == &[1, 5, 3]
-            && second_shape == &[1, 5, 3]
-    ));
-    let first_carriers = [
-        operand_value(&graph.eqns[0], 0),
-        operand_value(&graph.eqns[0], 1),
-    ];
-    let second_carriers = [
-        operand_value(&graph.eqns[3], 0),
-        operand_value(&graph.eqns[3], 1),
-    ];
-    let [first_weight, first_scale] = PackedSourceName::pair("layer.expert.0");
-    let [second_weight, second_scale] = PackedSourceName::pair("layer.expert.1");
-    assert_eq!(
-        first_carriers.map(|value| graph.meta(value).name.as_deref()),
-        [Some(first_weight.as_str()), Some(first_scale.as_str())]
-    );
-    assert_eq!(
-        second_carriers.map(|value| graph.meta(value).name.as_deref()),
-        [Some(second_weight.as_str()), Some(second_scale.as_str())]
-    );
-    assert_eq!(
-        graph.eqns[6]
-            .inputs
-            .iter()
-            .map(|operand| match operand {
-                Operand::Value(value) => *value,
-                Operand::Lit(_) => usize::MAX,
-            })
-            .collect::<Vec<_>>(),
-        vec![graph.eqns[2].out, graph.eqns[5].out]
-    );
-    assert_eq!(
-        graph.eqns[7]
-            .inputs
-            .iter()
-            .map(|operand| match operand {
-                Operand::Value(value) => *value,
-                Operand::Lit(_) => usize::MAX,
-            })
-            .collect::<Vec<_>>(),
-        vec![x.id, graph.eqns[6].out, selector.id]
-    );
-    assert_eq!(graph.output, graph.eqns[7].out);
-    Ok(())
-}
-
-#[test]
-fn packed_grouped_linear_is_card356_canonical() -> Result<(), BuilderAppendError> {
-    let descriptor = PackedWeight::try_new(
-        WeightFormat::E4m3Block128 {
-            scale: ScaleEncoding::E8m0,
+        WeightFormat::Gptq {
+            groups: GroupMap::Indexed {
+                groups: NonZeroUsize::new(2).unwrap(),
+            },
         },
-        [3, 5],
-    )
-    .unwrap();
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![4, 5]));
-    let selector = b.constant("selector", TensorType::f32(vec![4]));
-    let output = packed_grouped_linear(&b, x, selector, &packed_rows(descriptor))?;
-    let graph = b.finish(output);
+        WeightFormat::Mxfp4,
+    ];
+    for format in formats {
+        let k = match format {
+            WeightFormat::Q4_K => 256,
+            _ => 64,
+        };
+        let descriptor = PackedWeight::try_new(format, [3, k]).unwrap();
+        let table = PackedExpertStack {
+            stack_id: "layer.experts".to_string(),
+            descriptor,
+            experts: 3,
+        };
+        let b = Builder::new();
+        let x = b.constant("x", TensorType::f32(vec![4, k]));
+        let selector = b.constant("selector", TensorType::f32(vec![4]));
+        let output = packed_indexed_linear(&b, x, selector, &table)?;
+        let graph = b.finish(output);
 
-    // The leading two equations are the computed row/expert iotas.
-    assert!(matches!(graph.eqns[0].op, OpKind::Iota { len: 4, .. }));
-    assert!(matches!(graph.eqns[1].op, OpKind::Iota { len: 3, .. }));
-    let expert_iota = graph.eqns[1].out;
-    assert_eq!(graph.eqns.len(), 40);
-    let perm = graph.eqns[20].out;
-    assert!(matches!(
-        graph.eqns[20].op,
-        OpKind::Reduce {
-            op: RedOp::Sum,
-            axis: 1,
-            keepdim: false
-        }
-    ));
-    assert_eq!(
-        [
-            operand_value(&graph.eqns[6], 0),
-            operand_value(&graph.eqns[6], 1)
-        ],
-        [graph.eqns[5].out, graph.eqns[3].out]
-    );
-    assert_eq!(
-        [
-            operand_value(&graph.eqns[9], 0),
-            operand_value(&graph.eqns[9], 1)
-        ],
-        [graph.eqns[3].out, graph.eqns[5].out]
-    );
-    assert_eq!(
-        [
-            operand_value(&graph.eqns[15], 0),
-            operand_value(&graph.eqns[15], 1)
-        ],
-        [graph.eqns[14].out, graph.eqns[12].out]
-    );
-    for (equation, source) in [(21, x.id), (22, selector.id)] {
-        assert!(matches!(
-            graph.eqns[equation].op,
-            OpKind::Scatter { axis: 0 }
-        ));
+        let [eqn] = graph.eqns.as_slice() else {
+            panic!("{format:?}: expected one equation, got {:?}", graph.eqns);
+        };
         assert_eq!(
-            [
-                operand_value(&graph.eqns[equation], 0),
-                operand_value(&graph.eqns[equation], 1)
-            ],
-            [source, perm]
+            eqn.op,
+            OpKind::PackedContraction {
+                descriptor,
+                rows: crate::op::ContractionRows::Indexed { experts: 3 },
+            },
+            "{format:?}"
         );
-    }
-    assert_eq!(operand_value(&graph.eqns[23], 0), selector.id);
-    assert_eq!(operand_value(&graph.eqns[25], 0), expert_iota);
-    assert!(matches!(
-        graph.eqns[30].op,
-        OpKind::Reduce {
-            op: RedOp::Sum,
-            axis: 1,
-            keepdim: false
+        assert_eq!(
+            eqn.inputs.len(),
+            2 + descriptor.sources().len(),
+            "{format:?}"
+        );
+        assert_eq!(
+            [operand_value(eqn, 0), operand_value(eqn, 1)],
+            [x.id, selector.id]
+        );
+        for (position, role) in descriptor.sources().into_iter().enumerate() {
+            let carrier = operand_value(eqn, 2 + position);
+            let expected = PackedSourceName::new("layer.experts", role);
+            assert_eq!(graph.meta(carrier).name.as_deref(), Some(expected.as_str()));
+            assert_eq!(
+                graph.aval(carrier),
+                &TensorType::new(vec![3, descriptor.slab_bytes(role)], DType::I8),
+                "{format:?} {role:?}"
+            );
         }
-    ));
-    assert!(matches!(graph.eqns[37].op, OpKind::Concat { axis: 0 }));
-    assert!(matches!(graph.eqns[38].op, OpKind::IndexedMatMul));
-    assert_eq!(
-        [
-            operand_value(&graph.eqns[38], 0),
-            operand_value(&graph.eqns[38], 1),
-            operand_value(&graph.eqns[38], 2),
-        ],
-        [graph.eqns[21].out, graph.eqns[37].out, graph.eqns[22].out]
-    );
-    assert!(matches!(graph.eqns[39].op, OpKind::Gather { axis: 0 }));
-    assert_eq!(
-        [
-            operand_value(&graph.eqns[39], 0),
-            operand_value(&graph.eqns[39], 1)
-        ],
-        [graph.eqns[38].out, perm]
-    );
-    assert_eq!(graph.output, graph.eqns[39].out);
+        assert_eq!(graph.output, eqn.out);
+    }
     Ok(())
 }
 
+/// A stack with no id, no experts, or operands of the wrong type is refused without touching the builder.
+/// Each operand case has exactly one operand wrong and is refused as that operand's `OperandType`.
 #[test]
-fn packed_expert_builders_reject_invalid_tables_without_mutation() {
-    let descriptor = PackedWeight::try_new(
-        WeightFormat::E4m3Block128 {
-            scale: ScaleEncoding::E8m0,
-        },
-        [3, 5],
-    )
-    .unwrap();
-    let other = PackedWeight::try_new(
-        WeightFormat::E4m3Block128 {
-            scale: ScaleEncoding::F32,
-        },
-        [3, 5],
-    )
-    .unwrap();
-    let builder = Builder::new();
-    let x = builder.constant("x", TensorType::f32(vec![4, 5]));
-    let selector = builder.constant("selector", TensorType::f32(vec![4]));
-    let before = builder.generation();
-    let cases = [
-        (
-            vec![PackedLinearGraphRow {
-                ordinal: 1,
-                linear_id: "expert.0".to_string(),
-                descriptor,
-            }],
-            "ordinal",
-        ),
-        (
-            vec![PackedLinearGraphRow {
-                ordinal: 0,
-                linear_id: String::new(),
-                descriptor,
-            }],
-            "empty id",
-        ),
-        (
-            vec![
-                PackedLinearGraphRow {
-                    ordinal: 0,
-                    linear_id: "duplicate".to_string(),
-                    descriptor,
-                },
-                PackedLinearGraphRow {
-                    ordinal: 1,
-                    linear_id: "duplicate".to_string(),
-                    descriptor,
-                },
-            ],
-            "duplicate id",
-        ),
-        (
-            vec![
-                PackedLinearGraphRow {
-                    ordinal: 0,
-                    linear_id: "expert.0".to_string(),
-                    descriptor,
-                },
-                PackedLinearGraphRow {
-                    ordinal: 1,
-                    linear_id: "expert.1".to_string(),
-                    descriptor: other,
-                },
-            ],
-            "descriptor",
-        ),
-    ];
+fn packed_indexed_linear_refuses_a_bad_table_or_operand_without_mutation() {
+    let descriptor = PackedWeight::try_new(WeightFormat::Q8_0, [3, 32]).unwrap();
+    let table = PackedExpertStack {
+        stack_id: "experts".to_string(),
+        descriptor,
+        experts: 2,
+    };
+    let (m, k) = (4, 32);
+    let b = Builder::new();
+    let x = b.constant("x", TensorType::f32(vec![m, k]));
+    let selector = b.constant("selector", TensorType::f32(vec![m]));
+    let before = b.generation();
+    let unnamed = PackedExpertStack {
+        stack_id: String::new(),
+        ..table.clone()
+    };
     assert!(matches!(
-        packed_indexed_linear(&builder, x, selector, &[]),
-        Err(BuilderAppendError::EmptyPackedRows)
+        packed_indexed_linear(&b, x, selector, &unnamed),
+        Err(BuilderAppendError::EmptyPackedLinearId { index: 0 })
     ));
-    for (rows, label) in cases {
-        let error = packed_indexed_linear(&builder, x, selector, &rows);
-        assert!(error.is_err(), "{label} must be rejected");
-        assert_eq!(builder.generation(), before, "{label} mutated the builder");
-    }
-    let graph = builder.finish(x);
-    assert_eq!(graph.values.len(), 2);
-    assert!(graph.eqns.is_empty());
-}
+    let empty = PackedExpertStack {
+        experts: 0,
+        ..table.clone()
+    };
+    assert!(packed_indexed_linear(&b, x, selector, &empty).is_err());
+    assert_eq!(
+        b.generation(),
+        before,
+        "a rejected table mutated the builder"
+    );
 
-/// Mutant M7 (mutants-m4.md): `validate_indexed_inputs`'s `x` check (`dtype != F32 || rank != 2
-/// || K != k`, either `||` made `&&`) and `require_operand_type -> Ok(())` were never tested one
-/// condition at a time. Each row has exactly one operand wrong and must be refused as that
-/// operand's `OperandType`, by both the indexed and the grouped builder.
-#[test]
-fn packed_indexed_inputs_refuse_one_wrong_operand_at_a_time() {
-    let descriptor = PackedWeight::try_new(
-        WeightFormat::E4m3Block128 {
-            scale: ScaleEncoding::E8m0,
-        },
-        [3, 5],
-    )
-    .unwrap();
-    let rows = packed_rows(descriptor);
-    let (m, k) = (4, 5);
     let cases = [
         (
             "x f16",
@@ -594,59 +423,16 @@ fn packed_indexed_inputs_refuse_one_wrong_operand_at_a_time() {
             false,
         ),
     ];
-    type Build =
-        fn(&Builder, Traced, Traced, &[PackedLinearGraphRow]) -> Result<Traced, BuilderAppendError>;
-    let builders: [(&str, Build); 2] = [
-        ("packed_indexed_linear", packed_indexed_linear),
-        ("packed_grouped_linear", packed_grouped_linear),
-    ];
-    for (name, build) in builders {
-        for (label, x_type, selector_type, x_is_wrong) in &cases {
-            let b = Builder::new();
-            let x = b.constant("x", x_type.clone());
-            let selector = b.constant("selector", selector_type.clone());
-            let wrong = if *x_is_wrong { x.id } else { selector.id };
-            match build(&b, x, selector, &rows) {
-                Err(BuilderAppendError::OperandType { value, .. }) if value == wrong => {}
-                other => panic!("{name} {label}: expected OperandType on {wrong}, got {other:?}"),
-            }
+    for (label, x_type, selector_type, x_is_wrong) in &cases {
+        let b = Builder::new();
+        let x = b.constant("x", x_type.clone());
+        let selector = b.constant("selector", selector_type.clone());
+        let wrong = if *x_is_wrong { x.id } else { selector.id };
+        match packed_indexed_linear(&b, x, selector, &table) {
+            Err(BuilderAppendError::OperandType { value, .. }) if value == wrong => {}
+            other => panic!("{label}: expected OperandType on {wrong}, got {other:?}"),
         }
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![m, k]));
-        let selector = b.constant("selector", TensorType::f32(vec![m]));
-        build(&b, x, selector, &rows)
-            .unwrap_or_else(|error| panic!("{name}: the well-typed operands build: {error}"));
     }
-}
-
-/// Mutant M8 (mutants-m4.md): `packed_grouped_linear`'s row-count guard `value > F32_EXACT_INT_MAX`
-/// made `>=` or `==` moves the boundary. The sort computes row indices in f32, exact up to `2^24`:
-/// `m = 2^24` builds and `m = 2^24 + 1` is refused. Builder-only: no value is allocated.
-#[test]
-fn packed_grouped_linear_row_count_boundary_is_f32_exact() {
-    let descriptor = PackedWeight::try_new(
-        WeightFormat::E4m3Block128 {
-            scale: ScaleEncoding::E8m0,
-        },
-        [3, 5],
-    )
-    .unwrap();
-    let rows = packed_rows(descriptor);
-    let build = |m: usize| {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![m, 5]));
-        let selector = b.constant("selector", TensorType::f32(vec![m]));
-        packed_grouped_linear(&b, x, selector, &rows)
-    };
-    build(1 << 24).unwrap_or_else(|error| panic!("m = 2^24 must build: {error}"));
-    assert!(matches!(
-        build((1 << 24) + 1),
-        Err(BuilderAppendError::F32ExactIntegerRange {
-            field: "row count",
-            value,
-            max,
-        }) if value == (1 << 24) + 1 && max == 1 << 24
-    ));
 }
 
 /// Test-only alternative UT-transform via block-recursive 2x2 halving (spec 139 review C6).
@@ -708,12 +494,12 @@ fn ut_transform_neumann_doubling_is_log_op_count() {
     );
 }
 
-/// POOT-1040: a live bound types over F32 only (the decomposition's float `Select` has no BF16/F16 lowering in
-/// the oracle or the planner). BF16 and F16 queries are a typed `DtypeOp` error for `Live`, while the same
-/// operands type under `Capacity`. Mutation: drop `(live && q.dtype != DType::F32)` in `infer_attention`; the
-/// BF16/F16 live rows type and the rejection assertion fails.
+/// POOT-1041: a live bound types at every float dtype the capacity bound does: its decomposition selects inactive
+/// keys with the bit-moving `Select`, which has a BF16 and an F16 form. BF16 and F16 queries type as `Live`
+/// with the operands' dtype, and an I32 query is still the typed `DtypeOp` error under both bounds. Mutation:
+/// reinstate `(live && q.dtype != DType::F32)` in `infer_attention`; the BF16 and F16 live rows fail to type.
 #[test]
-fn a_live_attention_bound_is_typed_for_f32_only() {
+fn a_live_attention_bound_types_at_every_float_dtype() {
     use crate::error::ShapeError;
     use crate::op::{AttentionAttrs, KvBound};
     use crate::types::DType;
@@ -731,7 +517,7 @@ fn a_live_attention_bound_is_typed_for_f32_only() {
         ..AttentionAttrs::new(1, 0.5, None)
     };
     let len = TensorType::new(vec![1], DType::I32);
-    for dtype in [DType::BF16, DType::F16] {
+    for dtype in [DType::F32, DType::BF16, DType::F16] {
         let capacity = OpKind::Attention(attrs(KvBound::Capacity)).infer(&operands(dtype));
         assert_eq!(
             capacity.unwrap().dtype,
@@ -741,18 +527,28 @@ fn a_live_attention_bound_is_typed_for_f32_only() {
         let mut live_operands = operands(dtype);
         live_operands.push(len.clone());
         let live = OpKind::Attention(attrs(KvBound::Live)).infer(&live_operands);
-        assert!(
-            matches!(live, Err(ShapeError::DtypeOp { op: "Attention", dtype: d }) if d == dtype),
-            "{dtype:?} live must be a typed shape error, got {live:?}"
+        assert_eq!(
+            live.unwrap().dtype,
+            dtype,
+            "{dtype:?} types as a live bound"
         );
     }
-    let mut f32_live = operands(DType::F32);
-    f32_live.push(len);
-    assert_eq!(
-        OpKind::Attention(attrs(KvBound::Live))
-            .infer(&f32_live)
-            .unwrap()
-            .dtype,
-        DType::F32
-    );
+    let mut integer_live = operands(DType::I32);
+    integer_live.push(len);
+    for (bound, operands) in [
+        (KvBound::Capacity, operands(DType::I32)),
+        (KvBound::Live, integer_live),
+    ] {
+        let typed = OpKind::Attention(attrs(bound)).infer(&operands);
+        assert!(
+            matches!(
+                typed,
+                Err(ShapeError::DtypeOp {
+                    op: "Attention",
+                    dtype: DType::I32
+                })
+            ),
+            "an I32 query is a typed error under {bound:?}, got {typed:?}"
+        );
+    }
 }

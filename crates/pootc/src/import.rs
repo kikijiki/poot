@@ -353,6 +353,11 @@ fn rewrite_slice_reads(blocks: &mut [kir::BasicBlock], loopvar: kir::Local, slic
                 fix_operand(b, loopvar, slice);
             }
             kir::Rvalue::Len(p) => fix_place(p, loopvar, slice),
+            // Hand-built by kernelgen only (never produced by MIR lowering): a select in an imported body
+            // would be a lowering bug, and skipping its operands would leave them unfixed.
+            kir::Rvalue::Select { .. } => {
+                unreachable!("MIR lowering never produces a kernel-IR Select")
+            }
             _ => {}
         }
     }

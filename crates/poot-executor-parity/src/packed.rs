@@ -1,5 +1,5 @@
 //! Packed-linear fixtures at real weight magnitude: one projection per quantization scheme (Q4_0,
-//! Q8_0, AWQ, GPTQ), and the canonical indexed and grouped expert chain over each.
+//! Q8_0, AWQ, GPTQ), and the indexed expert contraction over a stacked table of each.
 //!
 //! The codes are every bit pattern, but each stored scale is a plausible magnitude, so a decoded
 //! weight is of the order of a trained one (`|w| <= 0.25`) and the activation is of unit order: a
@@ -10,7 +10,7 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use poot_graph_ir::ops::{PackedLinearGraphRow, packed_grouped_linear, packed_indexed_linear};
+use poot_graph_ir::ops::{PackedExpertStack, packed_indexed_linear};
 use poot_graph_ir::{Builder, Slot, TensorType, ops};
 use poot_quant::format::{
     FieldEncoding, FloatFormat, GroupMap, OperandRole, Storage as FormatStorage, WeightFormat,
@@ -36,14 +36,13 @@ const ROWS: usize = 5;
 
 /// One quantization scheme: its format, the largest code magnitude its decode multiplies a scale by
 /// (so a scale of `PEAK / max_code` keeps the decoded weight within `PEAK`), and the fixture names of
-/// its decode (`M = 1`) and few-row (`M = 4`) linears, and of its indexed and grouped chains.
+/// its decode (`M = 1`) and few-row (`M = 4`) linears, and of its indexed expert contraction.
 struct Scheme {
     format: fn() -> WeightFormat,
     max_code: f32,
     linear_m1: &'static str,
     linear_m4: &'static str,
-    chain_indexed: &'static str,
-    chain_grouped: &'static str,
+    experts: &'static str,
 }
 
 const SCHEMES: [Scheme; 4] = [
@@ -52,16 +51,14 @@ const SCHEMES: [Scheme; 4] = [
         max_code: 8.0,
         linear_m1: "packed_linear_q4_0_m1",
         linear_m4: "packed_linear_q4_0_m4",
-        chain_indexed: "packed_chain_q4_0_indexed",
-        chain_grouped: "packed_chain_q4_0_grouped",
+        experts: "packed_experts_q4_0",
     },
     Scheme {
         format: || WeightFormat::Q8_0,
         max_code: 127.0,
         linear_m1: "packed_linear_q8_0_m1",
         linear_m4: "packed_linear_q8_0_m4",
-        chain_indexed: "packed_chain_q8_0_indexed",
-        chain_grouped: "packed_chain_q8_0_grouped",
+        experts: "packed_experts_q8_0",
     },
     Scheme {
         format: || WeightFormat::Awq {
@@ -70,8 +67,7 @@ const SCHEMES: [Scheme; 4] = [
         max_code: 15.0,
         linear_m1: "packed_linear_awq_m1",
         linear_m4: "packed_linear_awq_m4",
-        chain_indexed: "packed_chain_awq_indexed",
-        chain_grouped: "packed_chain_awq_grouped",
+        experts: "packed_experts_awq",
     },
     Scheme {
         format: || WeightFormat::Gptq {
@@ -82,8 +78,7 @@ const SCHEMES: [Scheme; 4] = [
         max_code: 16.0,
         linear_m1: "packed_linear_gptq_m1",
         linear_m4: "packed_linear_gptq_m4",
-        chain_indexed: "packed_chain_gptq_indexed",
-        chain_grouped: "packed_chain_gptq_grouped",
+        experts: "packed_experts_gptq",
     },
 ];
 
@@ -243,77 +238,63 @@ pub fn packed_linear_fixtures() -> Vec<Fixture> {
                 graph,
                 store: packed_store(&[("layer".to_string(), Arc::clone(&payload))]),
                 steps,
-                guarded: false,
             });
         }
     }
     fixtures
 }
 
-/// The canonical packed expert chain per scheme, indexed (`PackedDequant -> Transpose ->
-/// Reshape -> Concat -> IndexedMatMul`) and grouped: `EXPERTS` distinct packed experts, `ROWS`
-/// activations, row `m` contracting against expert `ids[m]`. Two steps with different activations
-/// and different routes.
-pub fn packed_chain_fixtures() -> Vec<Fixture> {
+/// The indexed packed expert contraction per scheme: `EXPERTS` distinct packed experts stacked under the id
+/// `experts` (the store holds them as `experts.0`, `experts.1`, ..), `ROWS` activations, row `m` contracting
+/// against expert `ids[m]`. Two steps with different activations and different routes.
+pub fn packed_expert_fixtures() -> Vec<Fixture> {
     let mut fixtures = Vec::new();
     for (index, scheme) in SCHEMES.iter().enumerate() {
         let payloads: Vec<Arc<PackedPayload>> = (0..EXPERTS)
             .map(|e| real_magnitude_payload(scheme, 101 + 7 * e as u64 + index as u64))
             .collect();
-        let rows: Vec<PackedLinearGraphRow> = payloads
+        let table = PackedExpertStack {
+            stack_id: "experts".to_string(),
+            descriptor: payloads[0].weight(),
+            experts: EXPERTS,
+        };
+        let entries: Vec<(String, Arc<PackedPayload>)> = payloads
             .iter()
             .enumerate()
-            .map(|(ordinal, payload)| PackedLinearGraphRow {
-                ordinal,
-                linear_id: format!("expert.{ordinal}"),
-                descriptor: payload.weight(),
+            .map(|(expert, payload)| (format!("experts.{expert}"), Arc::clone(payload)))
+            .collect();
+        let b = Builder::new();
+        let x = b.slot_named(Slot::Activation, "moe-x", TensorType::f32(vec![ROWS, K]));
+        let ids = b.slot_named(Slot::Activation, "moe-ids", TensorType::f32(vec![ROWS]));
+        let y = packed_indexed_linear(&b, x, ids, &table).unwrap();
+        let graph = b.finish(y);
+        let (kx, ki) = (
+            graph.meta(x.id).slot_key().unwrap().clone(),
+            graph.meta(ids.id).slot_key().unwrap().clone(),
+        );
+        let steps = (0..2usize)
+            .map(|step| {
+                let routed: Vec<f32> = (0..ROWS)
+                    .map(|m| ((m * 2 + 1 + step) % EXPERTS) as f32)
+                    .collect();
+                vec![
+                    StepFixture {
+                        key: kx.clone(),
+                        tensor: activations(ROWS, K, step as u64),
+                    },
+                    StepFixture {
+                        key: ki.clone(),
+                        tensor: HostTensor::f32(vec![ROWS], routed),
+                    },
+                ]
             })
             .collect();
-        let entries: Vec<(String, Arc<PackedPayload>)> = rows
-            .iter()
-            .zip(&payloads)
-            .map(|(row, payload)| (row.linear_id.clone(), Arc::clone(payload)))
-            .collect();
-        for (name, grouped) in [(scheme.chain_indexed, false), (scheme.chain_grouped, true)] {
-            let b = Builder::new();
-            let x = b.slot_named(Slot::Activation, "moe-x", TensorType::f32(vec![ROWS, K]));
-            let ids = b.slot_named(Slot::Activation, "moe-ids", TensorType::f32(vec![ROWS]));
-            let y = if grouped {
-                packed_grouped_linear(&b, x, ids, &rows)
-            } else {
-                packed_indexed_linear(&b, x, ids, &rows)
-            }
-            .unwrap();
-            let graph = b.finish(y);
-            let (kx, ki) = (
-                graph.meta(x.id).slot_key().unwrap().clone(),
-                graph.meta(ids.id).slot_key().unwrap().clone(),
-            );
-            let steps = (0..2usize)
-                .map(|step| {
-                    let routed: Vec<f32> = (0..ROWS)
-                        .map(|m| ((m * 2 + 1 + step) % EXPERTS) as f32)
-                        .collect();
-                    vec![
-                        StepFixture {
-                            key: kx.clone(),
-                            tensor: activations(ROWS, K, step as u64),
-                        },
-                        StepFixture {
-                            key: ki.clone(),
-                            tensor: HostTensor::f32(vec![ROWS], routed),
-                        },
-                    ]
-                })
-                .collect();
-            fixtures.push(Fixture {
-                name,
-                graph,
-                store: packed_store(&entries),
-                steps,
-                guarded: false,
-            });
-        }
+        fixtures.push(Fixture {
+            name: scheme.experts,
+            graph,
+            store: packed_store(&entries),
+            steps,
+        });
     }
     fixtures
 }

@@ -3,12 +3,12 @@
 //! Content-part order is the media order. Vision parts are flattened with existing processor markers, then
 //! the checkpoint chat template is rendered through the existing minijinja path. Local PNG/JPEG paths and
 //! `file:` URLs and bounded remote HTTP(S) URLs are decoded here. After render, the public raw assembler expands
-//! each pad from merged-grid counts. Codec/container video work, vision, Runner/HTTP, and GPU stay out of this
+//! each pad from merged-grid counts. Codec/container video work, vision, driver/HTTP, and GPU stay out of this
 //! boundary.
 //!
 //! Held for Card 566b (the VLM front end on the driver): the `pub(crate)` chat-request entry points below have no
 //! production caller yet, and the front end consumes them. Where rustc reports one as dead it carries
-//! `#[expect(dead_code, reason = "held for POOT-739 (formerly 566b)")]`.
+//! `#[expect(dead_code, reason = "held for POOT-650")]`.
 
 use std::fs;
 use std::io::Read;
@@ -257,10 +257,7 @@ enum OwnedOpenAiPart {
 }
 
 /// Construct the existing raw rendered request from typed chat messages.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "held for POOT-739 (formerly 566b)")
-)]
+#[cfg_attr(not(test), expect(dead_code, reason = "held for POOT-650"))]
 pub(crate) fn assemble_qwen2_5_vl_chat_request_mrope_model_input<S>(
     input: Qwen25VlChatRequestMropeModelInputRequest<'_, '_, '_, '_, S>,
 ) -> Result<Qwen25VlRawRequestMropeModelInput, Qwen25VlChatRequestError<S::Error>>
@@ -283,10 +280,7 @@ where
 ///
 /// Video parts are rejected. Images are accepted as PNG/JPEG data URLs, local filesystem paths, local `file:`
 /// URLs, and bounded remote HTTP(S) URLs.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "held for POOT-739 (formerly 566b)")
-)]
+#[cfg_attr(not(test), expect(dead_code, reason = "held for POOT-650"))]
 pub(crate) fn assemble_qwen2_5_vl_chat_request_mrope_model_input_from_openai_json<S>(
     model_dir: &Path,
     body: &str,

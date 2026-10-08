@@ -334,35 +334,22 @@ impl RocmContext {
         })
     }
 
-    /// Device-wide VRAM in use (bytes): `HSA_AMD_MEMORY_POOL_INFO_SIZE` (cached total) minus a live
-    /// `hsa_agent_get_info(HSA_AMD_AGENT_INFO_MEMORY_AVAIL)` read. The ROCm/HSA analogue of
-    /// `poot-runtime::Context::vram_used_bytes` (Vulkan `VK_EXT_memory_budget`) and
-    /// `PtxContext::vram_used_bytes` (CUDA `cuMemGetInfo`) (card 030). Engine-queried, no sysfs or
-    /// rocm-smi. HSA has no "used" attribute, so it is derived from the two queries. `None` if the
-    /// driver call fails.
-    ///
-    /// Card 268 measurement: unlike Vulkan's `VK_EXT_memory_budget` (which accounts for other
-    /// processes), HSA's `MEMORY_AVAIL` covers only memory allocated through HSA/KFD's own pool
-    /// accounting. With ~79 GiB held by co-resident non-HSA GPU clients (`free -h` available ~45 GiB) it
-    /// still reported ~94.6 GiB "available". Do not use it as a system-wide free-memory signal on a
-    /// shared unified-memory box.
-    pub fn vram_used_bytes(&self) -> Option<u64> {
+    /// Device memory the HSA pool accounting says is still available (bytes): a live
+    /// `HSA_AMD_AGENT_INFO_MEMORY_AVAIL` read, so other HSA processes' allocations since the device
+    /// opened are out of it. Card 268: it covers only memory allocated through HSA/KFD's own pool
+    /// accounting and does not see non-HSA GPU clients, so on a shared unified-memory box it can overstate
+    /// the headroom. `None` if the query fails.
+    pub fn vram_free_bytes(&self) -> Option<u64> {
         if self.vram_total_bytes == 0 {
-            return None; // the one-time SIZE query at construction failed - no total to subtract from.
+            return None;
         }
         // SAFETY: discovery contract: the context keeps its runtime initialized.
-        let avail = unsafe { amd_agent_memory_avail(&self.hsa.funcs, self.gpu_agent) }.ok()?;
-        Some(self.vram_total_bytes.saturating_sub(avail))
+        unsafe { amd_agent_memory_avail(&self.hsa.funcs, self.gpu_agent) }.ok()
     }
 
     /// Total memory of the GPU agent's device pool (bytes): the coarse-grained pool's
     /// `HSA_AMD_MEMORY_POOL_INFO_SIZE`, cached at construction (capacity is fixed for the process
-    /// lifetime). `free = vram_budget_bytes - vram_used_bytes` is the headroom. `None` if the one-time
-    /// SIZE query failed.
-    ///
-    /// Card 268: `free` is not a usable live-headroom signal for VRAM auto-fit on a shared unified-memory
-    /// box, because `vram_used_bytes`'s `MEMORY_AVAIL` does not see co-resident non-HSA GPU clients (see
-    /// that method). No auto-fit call site should treat this pair as a contention signal.
+    /// lifetime). `None` if the one-time SIZE query failed.
     pub fn vram_budget_bytes(&self) -> Option<u64> {
         if self.vram_total_bytes == 0 {
             None
@@ -662,7 +649,7 @@ impl RocmContext {
     /// so a later write bridges through a staged DMA ([`Self::dma_upload`]); `Input`/`Output`/`Meta`/
     /// `Staging` resolve to the fine-grained system pool, so a later write on Strix Halo (APU, HMM) is
     /// a plain host `ptr::copy_nonoverlapping`. Callers on the hot per-token path (`poot-rocm-gpu`'s
-    /// per-step Token/Pos/Mask/SlotMap/GdnSlotMap/TokenEmbed slots) must pass `BufferRole::Input` to
+    /// per-step Token/Pos/Mask/SlotMap/TokenEmbed slots) must pass `BufferRole::Input` to
     /// get that plain write; passing `Activation` there pays a staged-DMA per token instead.
     pub fn allocate_f32(&self, elems: usize, role: BufferRole) -> Result<RocmBuffer, RocmError> {
         self.allocate_zeroed("allocate_f32", elems, BufferStorage::f32(), role)

@@ -1,4 +1,4 @@
-use super::*;
+use poot_graph_ir::Slot;
 use poot_graph_ir::{Graph, OpKind, Storage, ValidationOutputs};
 use std::num::NonZeroUsize;
 
@@ -331,55 +331,36 @@ fn optimize_fuses_flash_prefill_no_materialized_scores() {
     assert_flash_fused_prefill("qwen2", KvLayout::Contiguous);
 }
 
-/// `VlmRunner::caption_streaming` (crates/poot-llm/src/vlm.rs) prefills from `trace_prefill_kv_embeds`,
-/// not plain `trace_prefill_kv` (card 189). That tracer delegates to the same `trace_prefill_kv_impl`
-/// body (only the token-slot-vs-embeds-constant input differs), so this proves the flash-fusion
-/// guarantee of `optimize_fuses_flash_prefill_no_materialized_scores` for the tracer the VLM path uses.
-///
-/// `L=2048` is far from every config dimension below (`vocab=49280`, `hidden=576`, `inter=1536`,
-/// `head_dim=64`, `q_dim=576`, `kv_dim=192`), avoiding a false positive where a per-row weight matmul
-/// or attention reshape collides with `L` on some axis and is miscounted as a score matrix.
+/// A VLM prompt prefills through `Phase::PrefillEmbeds` (the caller's rows scattered over the
+/// embedded tokens), not plain `Prefill` (card 189). The embeds are a select ahead of the layers, so
+/// this proves the flash-fusion guarantee of `optimize_fuses_flash_prefill_no_materialized_scores`
+/// for the phase the VLM text tower runs. `L=2048` is far from every fixture dimension, avoiding a
+/// false positive where a per-row weight matmul or attention reshape collides with `L` on some axis
+/// and is miscounted as a score matrix.
 #[test]
 fn optimize_fuses_flash_prefill_vlm_embeds_no_materialized_scores() {
-    // SmolVLM-256m text config (`crate::vlm::TextConfig::smolvlm` via `poot_models::qwen2::Qwen2Config`,
-    // mirrored here since poot-models does not depend on poot-llm), with `layers` shrunk from 30 to 2
-    // for a fast host-only trace.
-    let cfg = Qwen2Config {
-        vocab: 49280,
-        hidden: 576,
-        inter: 1536,
-        layers: 2,
-        n_heads: 9,
-        n_kv_heads: 3,
-        head_dim: 64,
-        rotary_dim: 64,
-        eps: 1e-5,
-        max_pos: 8192,
-        qkv_bias: false,
-        qk_norm: false,
-        ..Default::default()
-    };
     let n = 2048usize;
-    let g = trace_prefill_kv_embeds(cfg, n, n);
+    let m = model("qwen2", |c| c["max_position_embeddings"] = 4096.into());
+    let (layers, ..) = dims(&*m, "qwen2");
+    let g = m
+        .trace(
+            Phase::PrefillEmbeds,
+            shape(1, n, n, KvLayout::Contiguous, LogitRows::Last),
+        )
+        .unwrap();
     let opt = crate::test_support::optimize(&g);
 
     let flash_prefill = opt
         .eqns
         .iter()
-        .filter(|e| matches!(e.op, poot_graph_ir::OpKind::Attention(_)))
+        .filter(|e| matches!(e.op, OpKind::Attention(_)))
         .count();
     assert_eq!(
-        flash_prefill, cfg.layers,
+        flash_prefill, layers,
         "expected one fused flash-prefill op per layer"
     );
-
-    // no MatMul should produce a full [.,Hq,L,L] (or larger) score-matrix-shaped output; flash
-    // attention never materializes it.
     for e in &opt.eqns {
-        if matches!(e.op, poot_graph_ir::OpKind::MatMul) {
-            // Shape-aware, not a size threshold (Card 557: the projections are plain `MatMul`s too
-            // now, and an `[1,L,inter]` MLP output can exceed L*L elements): a rank-4 `[.,Hq,L,L']`
-            // output with both trailing dims >= n is the materialized softmax(QK^T) score matrix.
+        if matches!(e.op, OpKind::MatMul) {
             let shape = &opt.aval(e.out).shape;
             let r = shape.len();
             assert!(

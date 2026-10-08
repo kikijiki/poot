@@ -1,0 +1,170 @@
+{
+  "backend": "rocm",
+  "case": "dense-decode-gemv",
+  "cells": {
+    "kernel": {
+      "repeats": [
+        {
+          "metrics": {
+            "step_us": 2371.099
+          },
+          "slot": 0,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 2357.294
+          },
+          "slot": 1,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 2341.764
+          },
+          "slot": 2,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 2361.201
+          },
+          "slot": 3,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 2372.442
+          },
+          "slot": 4,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 2355.811
+          },
+          "slot": 5,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 2507.676
+          },
+          "slot": 6,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 2331.596
+          },
+          "slot": 7,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 2370.558
+          },
+          "slot": 8,
+          "status": "ok"
+        }
+      ]
+    }
+  },
+  "memory": [
+    {
+      "live_bytes": 268443648,
+      "peak_bytes": 268443648,
+      "role": "Weight"
+    },
+    {
+      "live_bytes": 131072,
+      "peak_bytes": 131072,
+      "role": "Activation"
+    },
+    {
+      "live_bytes": 768,
+      "peak_bytes": 768,
+      "role": "Meta"
+    }
+  ],
+  "observed": {
+    "layout": "kn",
+    "shape": {
+      "k": 2048,
+      "m": 1,
+      "n": 2048
+    },
+    "storage": "f32",
+    "weight_bytes_per_copy": 16777216,
+    "weight_copies": 16
+  },
+  "plan": [
+    "imported:gemvcoalesced [0dca0862148b7aa9025b6c35c312b63e8b982b6b16362aec95c4dbcb3f5a4e17]"
+  ],
+  "plan_id": "2d60ca76dad0c3c691e98637dc9f674d76b03dad90d1b849dd3c5b89abe293cd",
+  "recordings": 16,
+  "reference": {
+    "agrees": true,
+    "max_relative_error": 1.5774541433770534e-05,
+    "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
+    "provenance": "independent-golden",
+    "tolerance": 0.002
+  },
+  "replays": 28,
+  "role": "baseline",
+  "schema": 1,
+  "command": [
+    "cargo",
+    "run",
+    "--release",
+    "-p",
+    "poot-rocm-gpu",
+    "--example",
+    "performance_bank",
+    "--",
+    "--bank",
+    "benchmarks/performance-bank/cases.json",
+    "--case",
+    "dense-decode-gemv",
+    "--out",
+    "benchmarks/performance-bank/receipts/rocm/dense-decode-gemv.json"
+  ],
+  "parent_revision": "e178f51722183668cf2f554e21b0dca17d3b0caf",
+  "binary_sha256": "7a8e978a9087ff303dd4f147cc5d1bb86a841f8b46790086293ff7e5c02f0928",
+  "identity": {
+    "checkpoint_digest": "synthetic-no-checkpoint",
+    "token_fixture": "splitmix64-seed0-unit:237900849bc67b83",
+    "precision": "f32",
+    "layout": "kn",
+    "dimensions": {
+      "m": 1,
+      "k": 2048,
+      "n": 2048
+    },
+    "prompt_tokens": 1,
+    "live_context": "n/a",
+    "max_context": "n/a",
+    "requested_output": "n/a",
+    "actual_output": "n/a",
+    "sampler": "n/a",
+    "template": "n/a",
+    "cache_state": {
+      "condition": "weights-rotated-beyond-cache",
+      "id": "6f9c88e074c47ba8a55bcb66180a49c8d849dec363867775261398cb2d0fecd1"
+    },
+    "prepared_set": [
+      "dense-decode-gemv"
+    ],
+    "timing_policy": {
+      "warmup": 3,
+      "repeats": 9,
+      "clock": "wall step plus readback",
+      "profiled": false
+    },
+    "backend": "rocm",
+    "device": "AMD Radeon 8060S Graphics",
+    "driver": "host kernel 7.2.9"
+  },
+  "identity_digest": "ddf91990536c590e6c03a698de2f57569f07b1e6cb7ef9307e494694d835d35f",
+  "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77"
+}

@@ -9,7 +9,6 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 pub mod gguf;
-pub mod glm53_flash;
 pub mod lora;
 pub mod packed_safetensors;
 pub mod qwen_vl;
@@ -21,7 +20,7 @@ pub mod error;
 pub mod safetensors;
 
 // Re-export main types from each module for convenience
-pub use config::{QuantConfig, QuantKind, QuantScheme, Qwen2HfConfig, RopeParameters, RopeScaling};
+pub use config::{QuantConfig, QuantKind, QuantScheme};
 pub use error::LoadError;
 
 // Re-export helper functions from dtype for internal use

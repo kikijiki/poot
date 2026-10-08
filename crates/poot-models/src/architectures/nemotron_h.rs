@@ -591,7 +591,7 @@ mod tests {
     }
 
     /// SC-003 (tier 3): the fixture's 24 greedy tokens after the 7-token prompt equal the literals
-    /// recorded from the Runner's CPU `generate` at the base commit (`64602bced`). Mutation: swap
+    /// recorded from the pre-driver engine's CPU generate at the base commit (`64602bced`). Mutation: swap
     /// the carried conv window for zeros in a continued step (the decode steps); the tokens change.
     #[test]
     fn the_fixture_generates_the_tokens_the_runner_recorded() {

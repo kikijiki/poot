@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use poot_executor::{
     BufferRole, Device, DeviceError, Dispatch, Engine, EntryId, ExecError, ExecutableId, Executor,
-    ExecutorStats, HostSync, LoadError, StateScope, StepInputs, StepOutputs, WeightSource,
+    ExecutorStats, HostSync, LoadError, StateScope, StepInputs, StepOutputs,
 };
 use poot_graph_ir::{BinOp, Builder, Graph, Slot, StateRole, TensorType, ValidationOutputs};
 use poot_graph_plan::{
@@ -309,10 +309,13 @@ impl Executor for Wrapped {
     fn target_set(&self) -> TargetSet {
         self.inner.target_set()
     }
+    fn free_memory_bytes(&self) -> Option<u64> {
+        self.inner.free_memory_bytes()
+    }
     fn load_weights(
         &mut self,
         store: Arc<WeightStore>,
-        weights: WeightSource,
+        weights: Arc<WeightMap>,
     ) -> Result<ExecutableId, ExecError> {
         self.inner.load_weights(store, weights)
     }
@@ -427,15 +430,12 @@ fn rig(options: RigOptions) -> Rig {
         asked: asked.clone(),
         log: log.clone(),
     };
-    let compile = CompileOptions {
-        execution: Submission::Replay,
-        limits: options.limits,
-    };
+    let compile = CompileOptions::new(Submission::Replay, options.limits);
     let driver = Driver::new(
         Arc::new(handle),
         Box::new(executor),
         DriverOptions {
-            prefill: compile,
+            prefill: compile.clone(),
             decode: compile,
             capacity: nz(32),
             prefill_chunk: nz(options.chunk),

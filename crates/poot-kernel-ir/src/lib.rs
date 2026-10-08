@@ -263,6 +263,16 @@ ir_node! {
         Cast { to: Ty, operand: Operand },
         /// Bit reinterpret (`f32::from_bits`), no value conversion.
         Bitcast { to: Ty, operand: Operand },
+        /// `if condition { if_true } else { if_false }` over a scalar of any type, as a hardware select: the
+        /// chosen operand moves to the result bit for bit and the other is never read as a number, so a NaN
+        /// payload, an infinity or `-0.0` passes through (or stays out) unchanged at every width, including
+        /// the two-byte floats that have no integer type here to mask through. `condition` is a `Bool`; the
+        /// two branches have one scalar type, which is the result's.
+        Select {
+            condition: Operand,
+            if_true: Operand,
+            if_false: Operand,
+        },
         /// Encode an f32 to the low 8 bits of a `U32` byte carrier using `format` semantics. Packed-word
         /// lane insertion happens outside this rvalue. FP8 is never a scalar `Ty`.
         Fp8Encode { format: Fp8Format, operand: Operand },
@@ -1193,6 +1203,16 @@ mod verify {
                         })
                     }
                 }
+                Rvalue::Select {
+                    condition,
+                    if_true,
+                    if_false,
+                } => {
+                    expect_ty("select condition", &Ty::Bool, &self.operand_ty(condition)?)?;
+                    let branch = self.scalar_operand_ty("select branch", if_true)?;
+                    expect_ty("select branch", &branch, &self.operand_ty(if_false)?)?;
+                    Ok(branch)
+                }
                 Rvalue::Fp8Encode { operand, .. } => {
                     expect_ty("fp8 encode operand", &Ty::F32, &self.operand_ty(operand)?)?;
                     Ok(Ty::U32)
@@ -1800,6 +1820,14 @@ mod verify {
             Rvalue::Cast { operand, .. }
             | Rvalue::Bitcast { operand, .. }
             | Rvalue::Fp8Encode { operand, .. } => operand_class(operand, flow).opaque(),
+            Rvalue::Select {
+                condition,
+                if_true,
+                if_false,
+            } => operand_class(condition, flow)
+                .opaque()
+                .join(operand_class(if_true, flow).opaque())
+                .join(operand_class(if_false, flow).opaque()),
             Rvalue::Len(_) => LaneClass::Uniform,
             Rvalue::WorkgroupLocalRead { .. }
             | Rvalue::WorkgroupLocalAtomic { .. }
@@ -1949,6 +1977,15 @@ mod verify {
             Rvalue::BinaryOp(_, a, b) | Rvalue::BinaryOpNoContract(_, a, b) => {
                 operand_reads(a, f);
                 operand_reads(b, f);
+            }
+            Rvalue::Select {
+                condition,
+                if_true,
+                if_false,
+            } => {
+                operand_reads(condition, f);
+                operand_reads(if_true, f);
+                operand_reads(if_false, f);
             }
             Rvalue::Len(place) | Rvalue::VectorLoad { place } => place_reads(place, f),
             Rvalue::WorkgroupLocalRead { idx, .. } => operand_reads(idx, f),
@@ -2299,6 +2336,59 @@ mod tests {
         assert_eq!(
             kind,
             VerifyErrorKind::UnsupportedWmmaShape { shape: bad_shape }
+        );
+    }
+
+    /// POOT-1041: a `Select` moves one of two same-typed scalars on a `Bool` condition. A condition of any other
+    /// type, or branches of two types, is rejected with the offending operand named.
+    #[test]
+    fn a_select_needs_a_bool_condition_and_two_branches_of_one_type() {
+        let cast_of = |to| Rvalue::Cast {
+            to,
+            operand: Operand::Const(Constant::F32(1.0)),
+        };
+        let select = |condition: u32, if_true: u32, if_false: u32| {
+            straight_line(
+                vec![Ty::Bool, Ty::BF16, Ty::BF16, Ty::F16, Ty::I32, Ty::BF16],
+                // _2 bool, _3/_4 BF16, _5 F16, _6 I32 and _7 the result, every one defined before the select.
+                vec![
+                    Statement::Assign(Place::local(l(2)), constant(Constant::Bool(true))),
+                    Statement::Assign(Place::local(l(3)), cast_of(Ty::BF16)),
+                    Statement::Assign(Place::local(l(4)), cast_of(Ty::BF16)),
+                    Statement::Assign(Place::local(l(5)), cast_of(Ty::F16)),
+                    Statement::Assign(Place::local(l(6)), constant(Constant::I32(1))),
+                    Statement::Assign(
+                        Place::local(l(7)),
+                        Rvalue::Select {
+                            condition: copy(condition),
+                            if_true: copy(if_true),
+                            if_false: copy(if_false),
+                        },
+                    ),
+                ],
+            )
+        };
+        select(2, 3, 4)
+            .verify()
+            .expect("a bool picks between two BF16 values");
+        let (site, kind) = rejection(&select(2, 3, 5));
+        assert_eq!(site, at_statement(0, 5));
+        assert_eq!(
+            kind,
+            VerifyErrorKind::TypeMismatch {
+                what: "select branch",
+                expected: Ty::BF16,
+                found: Ty::F16,
+            }
+        );
+        let (_, kind) = rejection(&select(6, 3, 4));
+        assert_eq!(
+            kind,
+            VerifyErrorKind::TypeMismatch {
+                what: "select condition",
+                expected: Ty::Bool,
+                found: Ty::I32,
+            }
         );
     }
 

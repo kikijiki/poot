@@ -19,7 +19,7 @@ Inference is **10-50x slower** in debug. Always use `--release` for model runs a
 Packed GGUF, GPTQ/AWQ and supported FP8 projections remain packed at load time. Memory also includes
 activations, KV capacity, staging and temporary tensors; a packed checkpoint's size is not its peak VRAM.
 
-- Packed MoE paths currently materialize expert tables before indexed matmul.
+- Packed MoE experts are read by an indexed packed contraction; no expert table is materialized.
 - Dense BF16/F16 weights are kept as stored words after loading; there is no host f32 copy. The CPU
   reference reads them through explicit casts in the graph on each step.
 - The serving settings that tuned the wgpu batch (`POOT_SLOTS` / `POOT_CAP`) are not available yet (poot is being refactored; planned to return). Library callers
@@ -27,7 +27,7 @@ activations, KV capacity, staging and temporary tensors; a packed checkpoint's s
 
 FP8 projection storage and model support are separate questions. See
 [Using quantized checkpoints](../serve/quantized-checkpoints.md) for the supported layouts and current
-materialization limits.
+memory limits.
 
 ## Why was a graph, kernel or prepared entry refused with a limit error?
 
@@ -47,9 +47,9 @@ Neither is available yet (poot is being refactored; planned to return). See [Ser
 ## Where are prefix caching and fast batched prefill available?
 
 They are library-level features, not served yet (being restored). wgpu has the broadest library coverage. PTX and
-ROCm generic decoders both reuse completed prompt prefixes. ROCm also has a hardware-verified one-shot path
-for fresh, f32-KV Qwen2-family requests, both unadapted and with one selected LoRA adapter. Other ROCm cells
-and all PTX prompts retain their existing prefill paths; PTX has no fast one-shot prefill yet.
+ROCm generic decoders both reuse completed prompt prefixes. The pre-driver one-shot ROCm prefill path
+(fresh, f32-KV Qwen2-family requests, with or without one LoRA adapter) went with the old engine; ROCm and PTX
+prompts use the driver's prefill paths.
 
 ## Why is sampled decoding slower on ROCm?
 

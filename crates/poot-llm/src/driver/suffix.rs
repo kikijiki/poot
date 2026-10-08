@@ -1,4 +1,4 @@
-//! Card 551b: the sampling suffix the Runner appends after a dense decode
+//! Card 551b: the sampling suffix the driver appends after a decode
 //! graph's raw logits, so every backend samples through the same `OpKind::SampleToken` contract path
 //! (R472-007) instead of a per-backend fused entry point. Card 734 moved this file here from `core/`.
 //!
@@ -21,7 +21,6 @@ use poot_tensor::DType;
 use poot_tensor::HostTensor;
 
 use crate::core::sampler::{Sampler, SamplerFault};
-use crate::error::Result;
 
 /// Which suffix (if any) a compiled entry carries after its raw logits. `Logits` is the raw graph:
 /// the host sampling path, a sampled speculative window's verification and the VLM caption path,
@@ -236,7 +235,7 @@ pub(crate) fn read_tokens(bytes: &[u8]) -> std::result::Result<u32, SamplerFault
 /// token either way. `seed` is this row's [`Sampler::next_device_seed`] draw.
 ///
 /// `rule` must not be [`SampleRule::Greedy`] (greedy has a closed-form host answer,
-/// [`crate::core::generate::argmax`], and needs no noise/params graph).
+/// the sampler's greedy pick, and needs no noise/params graph).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn eval_sample_token(
     rule: SampleRule,
@@ -246,7 +245,7 @@ pub(crate) fn eval_sample_token(
     min_p: f32,
     top_k: usize,
     top_p: f32,
-) -> Result<(i32, i32)> {
+) -> Result<(i32, i32), poot_eval::EvalError> {
     debug_assert_ne!(
         rule,
         SampleRule::Greedy,

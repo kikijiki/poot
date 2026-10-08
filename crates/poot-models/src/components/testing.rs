@@ -650,8 +650,49 @@ pub(crate) fn assert_same_graph<V: ValidationChannel, W: ValidationChannel>(
     );
 }
 
+/// `prompt` through `model` on the oracle as the driver runs it: one prefill of the whole prompt
+/// when its length is a multiple of the model's prefill granule, else a prefill of the largest
+/// multiple (none when the prompt is shorter than the granule) and a decode step per remaining
+/// token. Returns the logits of the last prompt position and the carried state.
+pub(crate) fn run_prompt(
+    model: &dyn Model,
+    store: &WeightStore,
+    capacity: usize,
+    prompt: &[i32],
+) -> (Vec<f32>, Vec<Vec<f32>>) {
+    let vocab = model.config().vocab;
+    let granule = model.config().prefill_granule.get();
+    let aligned = prompt.len() / granule * granule;
+    let (mut last, mut state) = (Vec::new(), Vec::new());
+    if aligned > 0 {
+        let (logits, next) = run_step(
+            model,
+            store,
+            Phase::Prefill,
+            capacity,
+            &prompt[..aligned],
+            0,
+            &[],
+        );
+        last = logits[(aligned - 1) * vocab..].to_vec();
+        state = next;
+    }
+    for (pos, &token) in prompt.iter().enumerate().skip(aligned) {
+        (last, state) = run_step(
+            model,
+            store,
+            Phase::Decode,
+            capacity,
+            &[token],
+            pos as i32,
+            &state,
+        );
+    }
+    (last, state)
+}
+
 /// Tier 3 on the oracle (ADR-0101): the `new` greedy tokens `model` generates over `store` after
-/// `prompt`, one prefill and then one decode step per token, over a cache of `capacity` positions.
+/// `prompt` ([`run_prompt`]) and then one decode step per token, over a cache of `capacity` positions.
 pub(crate) fn greedy_tokens(
     model: &dyn Model,
     store: &WeightStore,
@@ -669,9 +710,8 @@ pub(crate) fn greedy_tokens(
         }
         best as i32
     }
-    let vocab = model.config().vocab;
-    let (logits, mut state) = run_step(model, store, Phase::Prefill, capacity, prompt, 0, &[]);
-    let mut token = argmax(&logits[(prompt.len() - 1) * vocab..]);
+    let (logits, mut state) = run_prompt(model, store, capacity, prompt);
+    let mut token = argmax(&logits);
     let mut tokens = vec![token as u32];
     for pos in prompt.len()..prompt.len() + new - 1 {
         let (logits, next) = run_step(

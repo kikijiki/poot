@@ -34,8 +34,18 @@ impl fmt::Display for FamilyKey {
 /// What a traced step returns per row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelOutput {
-    Logits { vocab: usize },
-    Hidden { width: usize },
+    Logits {
+        vocab: usize,
+    },
+    /// The final hidden state of every position, `width` wide ([`Phase::Encode`]).
+    Hidden {
+        width: usize,
+    },
+    /// One `labels`-wide score vector per row, read at the first position: a cross-encoder's
+    /// classifier ([`Phase::Encode`]).
+    Scores {
+        labels: usize,
+    },
 }
 
 /// The family-neutral facts the driver needs about a model.
@@ -67,6 +77,14 @@ pub struct ModelConfig {
 pub enum Phase {
     Prefill,
     Decode,
+    /// A prefill whose step inputs are the prompt's tokens with caller-computed embedding rows
+    /// scattered over some positions (`StepInput::TokensWithEmbeds`): a multimodal prompt's image
+    /// rows. A family that takes them traces it as [`Phase::Prefill`] over the embedded inputs.
+    PrefillEmbeds,
+    /// The whole input in one step, returning the final hidden states of every position
+    /// (`HeadKind::Hidden`; [`ModelOutput::Hidden`]) for the host to pool or score: an encoder's
+    /// forward, or a decoder's embedding pass. A step carries no cache a later step reads.
+    Encode,
 }
 
 /// How the traced step's KV cache is laid out.
@@ -187,6 +205,15 @@ pub enum ModelError {
         family: FamilyKey,
         id: WeightId,
         format: HandleFormat,
+    },
+    /// A stored value the family cannot read: element `index` (row-major) of the index table `id`
+    /// is `value`, outside the I32 range its tracer indexes with.
+    #[error("{family}: weight {id} element {index} is {value}, outside the I32 range")]
+    WeightValue {
+        family: FamilyKey,
+        id: WeightId,
+        index: usize,
+        value: i64,
     },
 }
 

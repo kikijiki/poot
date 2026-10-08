@@ -35,6 +35,7 @@ macro_rules! imported_ops {
 macro_rules! packed_ops {
     () => {
         OpKind::DenseContraction { .. }
+            | OpKind::GroupedDenseContraction { .. }
             | OpKind::ContractionEpilogue {
                 head: ContractionHead::Dense { .. },
                 ..
@@ -88,6 +89,13 @@ macro_rules! attention_ops {
     };
 }
 
+/// Ops planned by `planner::scan`.
+macro_rules! scan_ops {
+    () => {
+        OpKind::Scan(_)
+    };
+}
+
 /// Ops planned by `planner::cast`.
 macro_rules! cast_ops {
     () => {
@@ -129,6 +137,7 @@ mod movement;
 mod packed;
 mod packed_dequant;
 mod sampling;
+mod scan;
 
 pub use choice::Planned;
 pub use choice::{KernelChoice, NoDispatch};
@@ -158,26 +167,24 @@ pub(crate) struct PlannedGraph {
 pub(crate) fn plan_graph<V: ValidationChannel>(
     g: &Graph<V>,
     target: &Target,
-    guarded: bool,
     limits: &BodyLimits,
 ) -> Result<PlannedGraph, CompileError> {
     let _scope = CompileScope::enter();
     let backend = target.backend;
-    let caps = &target.caps;
     let views = compute_views(g, backend);
     let analysis = ExactI32StorageAnalysis::new(g);
     let (plans, choices): (Vec<_>, Vec<_>) = g
         .eqns
         .iter()
         .map(|eqn| {
-            plan_eqn_compiled(&analysis, g, eqn, target, &views, guarded, limits)
+            plan_eqn_compiled(&analysis, g, eqn, target, &views, limits)
                 .map(|Planned { plan, choice }| (plan, choice))
         })
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .unzip();
     // Storage reads the plans just made: no equation is planned a second time.
-    let storage = value_storage_of_plans(g, backend, caps, plans.iter().map(Some))?;
+    let storage = value_storage_of_plans(g, backend, plans.iter().map(Some))?;
     let slots = g
         .slots
         .iter()
@@ -355,8 +362,7 @@ pub fn plan_eqn_views_analyzed<V: ValidationChannel>(
 }
 
 /// [`plan_eqn_views_analyzed`], keeping the [`KernelChoice`] the plan was built from. A planner test that
-/// asserts on the choice calls it directly. It plans as [`crate::compile`] does for a graph with no
-/// routed-expert hang guard; `compile` itself plans through `plan_eqn_compiled` with the guard it decided.
+/// asserts on the choice calls it directly.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_eqn_choice_analyzed<V: ValidationChannel>(
     analysis: &ExactI32StorageAnalysis<'_, V>,
@@ -368,22 +374,17 @@ pub fn plan_eqn_choice_analyzed<V: ValidationChannel>(
     caps: &DeviceCaps,
     limits: &BodyLimits,
 ) -> Result<Planned, PlanError> {
-    plan_eqn_policy(
-        analysis, g, eqn, backend, world_size, views, caps, false, limits,
-    )
+    plan_eqn_policy(analysis, g, eqn, backend, world_size, views, caps, limits)
 }
 
 /// The single-device per-equation plan [`crate::compile`] makes, in [`plan_graph`] and in its rewrite
-/// legality probes: `target`'s backend and caps, the graph's strided `views`, and whether the compile
-/// `guarded` the routed-expert hang, which the contraction choice reads (Card 557: a guarded compile
-/// keeps a matmul off the generated tiled GEMM).
+/// legality probes: `target`'s backend and caps and the graph's strided `views`.
 pub(crate) fn plan_eqn_compiled<V: ValidationChannel>(
     analysis: &ExactI32StorageAnalysis<'_, V>,
     g: &Graph<V>,
     eqn: &Eqn,
     target: &Target,
     views: &HashMap<ValueId, Layout>,
-    guarded: bool,
     limits: &BodyLimits,
 ) -> Result<Planned, PlanError> {
     plan_eqn_policy(
@@ -394,7 +395,6 @@ pub(crate) fn plan_eqn_compiled<V: ValidationChannel>(
         1,
         views,
         &target.caps,
-        guarded,
         limits,
     )
 }
@@ -417,7 +417,6 @@ fn plan_eqn_policy<V: ValidationChannel>(
     world_size: usize,
     views: &HashMap<ValueId, Layout>,
     caps: &DeviceCaps,
-    guarded: bool,
     limits: &BodyLimits,
 ) -> Result<Planned, PlanError> {
     analysis.ensure_graph(g)?;
@@ -436,7 +435,7 @@ fn plan_eqn_policy<V: ValidationChannel>(
                     Operand::Value(src)
                         if g.meta(*src).storage == Storage::Const
                             && g.aval(*src).dtype == DType::BF16
-                            && bf16_const_is_packed(g, views, *src, backend, caps)
+                            && bf16_const_is_packed(g, views, *src, backend)
                 )
             })
             .collect()
@@ -453,7 +452,6 @@ fn plan_eqn_policy<V: ValidationChannel>(
         world_size,
         views,
         caps,
-        guarded,
         &packed_operands,
         *limits,
     )
@@ -487,7 +485,6 @@ pub(crate) fn plan_eqn_views_impl(
     world_size: usize,
     views: &HashMap<ValueId, Layout>,
     caps: &DeviceCaps,
-    guarded: bool,
     packed_operands: &[bool],
     limits: BodyLimits,
 ) -> Result<Planned, PlanError> {
@@ -550,7 +547,15 @@ pub(crate) fn plan_eqn_views_impl(
                 return Err(site.refuse(Capability::DtypeLowering));
             }
         }
-        if !matches!(backend, Backend::SpirvVulkan | Backend::Nvptx) {
+        // AmdGcn has no E4M3FN tensor storage, but the packed-lane row gather reads the table as
+        // row-padded u32 words like the BF16 one, so it alone is admitted there.
+        let admitted_row_gather = matches!(
+            eqn.op,
+            OpKind::DenseRowGather {
+                source: DType::E4M3FN
+            }
+        );
+        if !matches!(backend, Backend::SpirvVulkan | Backend::Nvptx) && !admitted_row_gather {
             return Err(site.refuse(Capability::E4m3Storage));
         }
         if matches!(eqn.op, OpKind::Concat { .. })
@@ -573,8 +578,8 @@ pub(crate) fn plan_eqn_views_impl(
                 // Card 449 D1: the PLE sharded E4M3FN table lookup `fold_dense_bf16_row_gathers`
                 // rewrites into one equation (the Card 381 BF16 row's second source dtype). The
                 // table is the only E4M3FN operand - the index is exact I32 and the output F32 -
-                // and `validate_typed_plan_storage` proves each operand's lane before allocation,
-                // so no dtype rule beyond "this op may read E4M3FN" is needed here.
+                // and the storage analysis gives the table its packed lane (`StorageKind::E4m3Packed`, or
+                // refuses it by name), so no dtype rule beyond "this op may read E4M3FN" is needed here.
                 | OpKind::DenseRowGather { source: DType::E4M3FN }
         ) {
             return Err(site.refuse(Capability::E4m3Storage));
@@ -623,6 +628,7 @@ pub(crate) fn plan_eqn_views_impl(
                 | OpKind::Broadcast { .. }
                 | OpKind::Binary(_)
                 | OpKind::Unary(_)
+                | OpKind::Select
                 | OpKind::Gather { .. }
                 | OpKind::Concat { .. }
                 | OpKind::DynamicUpdateSlice { .. }
@@ -654,7 +660,6 @@ pub(crate) fn plan_eqn_views_impl(
                 odt,
                 caps,
                 limits,
-                guarded,
                 packed_operands,
             );
         }
@@ -694,10 +699,10 @@ pub(crate) fn plan_eqn_views_impl(
             odt,
             caps,
             limits,
-            guarded,
             packed_operands,
         )?,
         attention_ops!() => attention::plan(g, eqn, backend, caps, limits)?,
+        scan_ops!() => scan::plan(g, eqn, backend, caps, limits)?,
         cast_ops!() => cast::plan(
             analysis,
             g,

@@ -15,7 +15,6 @@ pub(super) fn plan(
     odt: DType,
     caps: &DeviceCaps,
     limits: BodyLimits,
-    guarded: bool,
     packed_operands: &[bool],
 ) -> Result<Planned, PlanError> {
     let site = Site::new(g, eqn, backend, limits);
@@ -28,9 +27,7 @@ pub(super) fn plan(
         //
         // - M == 1: the generated dense Gemv (Card 727). A column's
         //   lanes read contiguous runs of its weight row (the `[N, K]` layout is already the coalesced one).
-        // - M > 1: the generated tiled GEMM reading B through `[N, K]` strides, unless the compile is guarded
-        //   (the target has the routed-expert hang and the graph a site) and keeps a matmul off it (the MoE router hang, cards 186/192); then the one-thread-per-output
-        //   kernel.
+        // - M > 1: the generated tiled GEMM reading B through `[N, K]` strides.
         //
         // Every body is generated from a request that records the weight layout, so no key is shared with the
         // `[K, N]` matmul bodies. No tensor-core `[N, K]` body exists here (Card 727).
@@ -60,7 +57,7 @@ pub(super) fn plan(
             let k = shape(ids[1])[1];
             if let Some(schedule) = dense_decode_gemv_in(eqn, out_shape, out_numel, caps) {
                 dense_gemv(site, backend, weight, schedule, k, n, None, caps)?
-            } else if !guarded {
+            } else {
                 matmul::tiled_region_plan(
                     site,
                     backend,
@@ -74,28 +71,11 @@ pub(super) fn plan(
                     None,
                     caps,
                 )?
-            } else {
-                Planned::generated(
-                    site,
-                    KernelRequest::Contraction(ContractionSpec::DenseSerial {
-                        weight,
-                        shapes: MatmulShapes {
-                            out_shape: out_shape.to_vec(),
-                            a_shape: shape(ids[0]),
-                            b_shape: shape(ids[1]),
-                        },
-                        fold: elementwise_fold(g, backend, eqn, out_shape, out_numel, caps),
-                    }),
-                    backend,
-                    caps,
-                )?
             }
         }
         // A dense contraction followed by its pointwise epilogue (`fuse_contraction_epilogues`): the same
         // weight storage (BF16 included) and Gemv as above at `M == 1`, else the generated tiled GEMM, each applying
-        // the epilogue to the head's f32 result before the store. The fuse rule forms this only where
-        // the routed-expert hang guard is off (the guard keeps one kernel per equation), the case in which the
-        // dense head takes the tiled GEMM.
+        // the epilogue to the head's f32 result before the store.
         OpKind::ContractionEpilogue {
             head: ContractionHead::Dense { weight: dtype },
             region,
@@ -136,12 +116,37 @@ pub(super) fn plan(
                 )?
             }
         }
+        // The grouped contraction (`fold_dense_contractions`' `[0, 2, 1]` spelling): `groups` independent
+        // `[M, K] x [N, K]^T` products over row blocks of one `[groups * N, K]` weight. No gemv or tiled body
+        // batches over a weight, so it takes the one-thread-per-output dense body, which reads the weight as the
+        // `[groups, N, K]` batch of blocks it is, in packed-BF16 storage (the only dtype with grouped rows).
+        OpKind::GroupedDenseContraction {
+            weight: DType::BF16,
+            groups,
+        } => {
+            let weight_shape = shape(ids[1]);
+            let (k, n) = (weight_shape[1], out_shape[2]);
+            Planned::generated(
+                site,
+                KernelRequest::Contraction(ContractionSpec::DenseSerial {
+                    weight: ValueStorage::new(StorageKind::Bf16Packed).buffer_storage(),
+                    shapes: MatmulShapes {
+                        out_shape: out_shape.to_vec(),
+                        a_shape: shape(ids[0]),
+                        b_shape: vec![*groups, n, k],
+                    },
+                    fold: elementwise_fold(g, backend, eqn, out_shape, out_numel, caps),
+                }),
+                backend,
+                caps,
+            )?
+        }
         // PTX has actual two-byte BF16 storage, but its typed packed walk reads the checkpoint bytes as
         // packed u32 lanes like wgpu's and ROCm's, so it lowers through the same generated bodies above
         // rather than a second native-BF16 kernel. This arm stays as the named fallback for a weight
         // dtype no backend lowers; a `DenseContraction` reaching it is a bug, not a silent fallback to
         // a kernel that would read the weight at the wrong element width.
-        OpKind::DenseContraction { .. } => {
+        OpKind::DenseContraction { .. } | OpKind::GroupedDenseContraction { .. } => {
             return Err(site.refuse(Capability::DtypeLowering));
         }
         // Card 381: the embedding gather over a packed-BF16 table, widened to F32 in the same kernel.
@@ -174,21 +179,19 @@ pub(super) fn plan(
         // (E4M3FN instead of BF16). The index is the exact-I32 one `fold_dense_bf16_row_gathers`
         // pinned, which is what keeps n-gram ids above `2^24` from rounding through f32.
         //
-        // Scoped to SpirvVulkan by name: wgpu is the only typed packed walk with a
-        // Qwen4Exp route today, so no ROCm or PTX receipt exists for this body yet. Nvptx and
-        // AmdGcn keep the named refusal below rather than claiming an untested kernel.
+        // All three typed packed walks (SpirvVulkan, AmdGcn, Nvptx) upload the table as the same
+        // row-padded u32 lanes, so the identical body and key run on each.
         OpKind::DenseRowGather {
             source: DType::E4M3FN,
-        } if backend == Backend::SpirvVulkan => Planned::imported(
+        } => Planned::imported(
             ImportedKernel::PackedE4m3RowGather,
             backend,
             None,
             [out_numel as u32, 1, 1],
         ),
-        // Scoped to the backends that have a kernel, by name, like the contraction above.
-        // The BF16 row lowers on all three backends and the E4M3FN row on SpirvVulkan; an admitted
-        // source dtype with no packed-lane kernel on this backend still refuses by name rather than
-        // falling back to a gather kernel that would read the table at the wrong element width.
+        // The BF16 and E4M3FN rows lower on every backend; an admitted source dtype with no
+        // packed-lane kernel refuses by name rather than falling back to a gather kernel that would
+        // read the table at the wrong element width.
         OpKind::DenseRowGather { .. } => {
             return Err(site.refuse(Capability::DtypeLowering));
         }
@@ -228,6 +231,7 @@ pub(super) fn plan(
         | elementwise_ops!()
         | matmul_ops!()
         | attention_ops!()
+        | scan_ops!()
         | cast_ops!()
         | movement_ops!()
         | sampling_ops!() => unreachable!("plan_eqn routes only packed-reader ops here"),
@@ -263,7 +267,6 @@ fn dense_gemv(
         site,
         KernelRequest::Contraction(ContractionSpec::DenseGemv {
             weight,
-            layout: WeightLayout::Nk,
             schedule,
             k,
             n,

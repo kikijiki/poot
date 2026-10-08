@@ -184,7 +184,7 @@ fn alibi_slopes_attention_matches_the_oracle_and_the_reference_on_vulkan() {
 }
 
 /// Card 1007 acceptance row 1: `matmul(x, transpose(w))` over an F16 `[N, K]` const, at `M = 1` (the decode GEMV),
-/// `4` and `33` (the tiled GEMM) and under the MoE hang guard (the serial kernel), compiled for raw Vulkan: the program
+/// `4` and `33` (the tiled GEMM), compiled for raw Vulkan: the program
 /// holds one `DenseContraction` and no `Transpose`, and every replayed step matches `eval(g)` of the traced graph
 /// within the parity tolerance (ADR-0101 tier 2). The weight lives on the device as packed binary16 words.
 /// Mutation: remove `DType::F16` from `DENSE_CONTRACTION_WEIGHT_DTYPES`; a `Transpose` is planned and this row goes
@@ -208,7 +208,7 @@ fn f16_checkpoint_orientation_projection_matches_the_oracle_on_vulkan() {
 /// poisoned branches and an I32 select over nonzero condition words each equal the hand-written select words
 /// and the oracle's, bit for bit: a NaN or an infinity in the unselected branch stays out, and a NaN payload,
 /// an infinity or `-0.0` in the selected one passes through.
-/// Mutation: emit the arithmetic form `if_false + cond * (if_true - if_false)` in `emit_bitwise_select`
+/// Mutation: emit the arithmetic form `if_false + cond * (if_true - if_false)` in `emit_select`
 /// (`poot-kernelgen`'s `fused.rs`), with a fresh `POOT_KERNEL_CACHE_DIR`; every row goes red.
 #[test]
 fn select_is_bitwise_on_vulkan() {
@@ -437,13 +437,13 @@ fn a_one_dispatch_grid_past_255_workgroups_matches_the_oracle_on_vulkan() {
 /// the activations of unit order, so a role or group fault moves the output far past the tolerance; the row
 /// also requires each oracle output to be of order one.
 #[test]
-fn packed_linears_and_the_canonical_expert_chain_match_the_oracle_on_vulkan() {
+fn packed_linears_and_the_indexed_expert_contraction_match_the_oracle_on_vulkan() {
     let Some((mut exec, target)) = vulkan() else {
         return;
     };
     let fixtures = poot_executor_parity::packed::packed_linear_fixtures()
         .into_iter()
-        .chain(poot_executor_parity::packed::packed_chain_fixtures());
+        .chain(poot_executor_parity::packed::packed_expert_fixtures());
     for fixture in fixtures {
         let expected = oracle_for(&fixture.graph, &fixture.store)(&fixture.steps[0]);
         let largest = expected

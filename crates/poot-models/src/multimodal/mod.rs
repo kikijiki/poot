@@ -1,5 +1,5 @@
-//! Model-neutral text/vision bridge and multimodal position machinery.
+//! Multimodal front-end families and the position machinery their text towers share.
 
-pub mod encoder;
+pub mod idefics3;
 pub mod mrope;
 pub mod vision;

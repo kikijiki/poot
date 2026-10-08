@@ -67,6 +67,10 @@
       "pattern": "[0-9a-f]{64}",
       "description": "SHA-256 of the runner executable that was asked to run, read from the file by the harness; null when the runner path names no file. Names the binary; build_sha names the source it was built from."
     },
+    "family": {
+      "type": ["string", "null"],
+      "description": "The model family the poot registry resolved the checkpoint to, as the runner reports it (never a mapping from the manifest). Required on every poot 'ok' and 'unsupported' row: a string on 'ok', and on a refusal that came after the registry resolved a family; null on a refusal that came before one did (an unregistered family, a declined precision). The feature matrix joins refusals to its family rows on it."
+    },
     "backend": {
       "type": "string",
       "description": "The backend the cell ran on (poot: ptx, rocm or wgpu, as requested through POOT_BENCH_BACKEND and reported back by the runner; other engines: what they report, e.g. vulkan)."
@@ -118,6 +122,33 @@
         }
       }
     },
+    "timing_claim": {
+      "type": "string",
+      "enum": ["request-window", "row-level"],
+      "description": "The timing capability the runner claims. request-window: every request reports its raw boundaries (tokens, first/last token, finish, steps) and TPOT is the mean inter-token gap; row-level: only ttft/e2e/per-token gaps are reported, TPOT is (e2e - ttft)/(osl - 1), and rows compare on the row-level identity subset only. Declared once, in harness/result_contract.py."
+    },
+    "preparation": {
+      "type": "object",
+      "required": ["layers"],
+      "description": "poot rows: the preparation work behind the timed window, per layer. `state` labels what the invoker declared (null when it declared none); `layers.<layer>.prepare` is the work the declared prepared set cost and `.repeat` the work repeating it added, null where no producer counts that layer (Unknown, never zero). Repeating the declared set must add no work to any layer; `open_ms` is the model load, timed apart from every request.",
+      "properties": {
+        "state": { "type": ["string", "null"], "enum": ["cold-process-empty-artifacts", "cold-process-populated-artifacts", "reused-prepared-driver", null] },
+        "artifact_entries_at_start": { "type": ["integer", "null"], "minimum": 0, "description": "Artifacts the cache directory held before the process opened anything; null when no directory was named." },
+        "open_ms": { "type": "number", "minimum": 0 },
+        "layers": {
+          "type": "object",
+          "required": ["plan", "entries", "generated_bodies", "artifact_builds", "artifact_hits", "runtime_pipelines", "recordings", "graph_instantiations"],
+          "additionalProperties": {
+            "type": "object",
+            "required": ["prepare", "repeat"],
+            "properties": {
+              "prepare": { "type": ["integer", "null"], "minimum": 0 },
+              "repeat": { "type": ["integer", "null"], "minimum": 0 }
+            }
+          }
+        }
+      }
+    },
     "caveats": {
       "type": "array",
       "items": { "type": "string" },
@@ -134,14 +165,17 @@
         "properties": { "framework": { "enum": ["poot"] }, "status": { "enum": ["ok"] } },
         "required": ["framework", "status"]
       },
-      "then": { "required": ["build_sha", "binary_sha256", "backend"] }
+      "then": {
+        "required": ["build_sha", "binary_sha256", "backend", "family"],
+        "properties": { "family": { "type": "string" } }
+      }
     },
     {
       "if": {
         "properties": { "framework": { "enum": ["poot"] }, "status": { "enum": ["unsupported"] } },
         "required": ["framework", "status"]
       },
-      "then": { "required": ["build_sha", "backend"] }
+      "then": { "required": ["build_sha", "backend", "family"] }
     }
   ],
   "additionalProperties": true

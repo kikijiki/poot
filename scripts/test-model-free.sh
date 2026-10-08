@@ -3,13 +3,23 @@ set -euo pipefail
 
 mode=${1:-run}
 case "$mode" in
-  check | run | run-real-dims | regen | self-test) ;;
+  check | run | run-real-dims | run-isolated | regen | self-test) ;;
   *)
-    echo "usage: $0 [check|run|run-real-dims|regen|self-test] [nextest args for run-real-dims]" >&2
+    echo "usage: $0 [check|run|run-real-dims|run-isolated <package>|regen|self-test] [nextest args for run-real-dims]" >&2
     exit 2
     ;;
 esac
 shift || true
+
+# Re-entry guard. This script runs cargo and nextest, and a recipe or a test it starts must never come back
+# into it: a recursion here forks until the box runs out of memory (2026-10-08, from a backtick in a
+# double-quoted string that the shell executed as `just ...`). Every mode sets the marker and refuses to run
+# when it is already set.
+if [[ -n "${POOT_MODEL_FREE_ACTIVE:-}" ]]; then
+  echo "$0 $mode re-entered itself (POOT_MODEL_FREE_ACTIVE=$POOT_MODEL_FREE_ACTIVE): refusing to recurse" >&2
+  exit 3
+fi
+export POOT_MODEL_FREE_ACTIVE=$mode
 
 # The model-free gate covers every workspace member. `gate_policy` is the only place a package is placed in
 # or out of it, and `check` fails when a workspace member is missing from it or a row names a package that is
@@ -17,11 +27,15 @@ shift || true
 #
 #   host      every active test needs no model and no device, so the inventory derives its class: model-free.
 #   reviewed  the package holds tests that need a device or a checkpoint next to host-only ones, so each test's
-#             class (model-free or checkpoint-device) is chosen by hand in the inventory and a new test has no
-#             default class. Nothing trusts that choice for devices: the lane runs with every device required
-#             and hidden, so a device test classed model-free fails the lane (see `lane_environment`).
+#             class is chosen by hand in the inventory and a new test has no default class: model-free; checkpoint
+#             (loads a model, runs in `just test-optional`); or device (dispatches, and `just test-lane-coverage`
+#             requires a device lane to select it). Nothing trusts that choice for devices: the lane runs with
+#             every device required and hidden, so a device test classed model-free fails the lane (see
+#             `lane_environment`).
 #   excluded  not in the default lane, for the reason given: the package's tests dispatch on a device and run
-#             in the `just test-device-*` lanes, or it holds no test and would only change feature unification.
+#             in the `just test-device-*` lanes, or its dependencies change feature unification and it runs in its
+#             own invocation (`run-isolated`). `just test-lane-coverage` requires every test of an excluded package
+#             to match a lane selection.
 #
 # `real_dims_pattern` is a naming contract, not detection: a test that builds real model dimensions is named
 # `*_real_dims`, and a test so named is class real-dims, never model-free; it runs in the release-profile lane
@@ -31,7 +45,7 @@ shift || true
 readonly test_targets=(--lib --bins --tests)
 
 readonly gate_policy=(
-  "poot-bench-runner|excluded|no tests; enables poot-llm rocm, which would unify into the lane builds"
+  "poot-bench-runner|excluded|host-only tests, run by just test-bench-runner: it enables poot-llm rocm, which would unify into the lane builds"
   "poot-codegen|host|"
   "poot-eval|host|"
   "poot-executor|host|"
@@ -149,7 +163,7 @@ derive_inventory() {
         }
         while ((getline line < previous_file) > 0) {
           split(line, f, "\t")
-          if (f[3] == "model-free" || f[3] == "checkpoint-device") kept[f[1] "\t" f[2] "\t" f[4]] = f[3]
+          if (f[3] == "model-free" || f[3] == "checkpoint" || f[3] == "device") kept[f[1] "\t" f[2] "\t" f[4]] = f[3]
         }
       }
       $3 != "active" { next }
@@ -202,7 +216,7 @@ validate_inventory() {
         print "inventory target mismatch at line " NR ": " target_key
         bad = 1
       }
-      if ($3 != "model-free" && $3 != "checkpoint-device" && $3 != "real-dims") {
+      if ($3 != "model-free" && $3 != "checkpoint" && $3 != "device" && $3 != "real-dims") {
         print "inventory class mismatch at line " NR ": " $3 " for " $1 "\t" $2 "\t" $4
         bad = 1
       }
@@ -294,7 +308,7 @@ compare_classes() {
   {
     echo "inventory class mismatch: the class of a test must be the one its package policy or the real-dims rule derives."
     echo "  a test that builds real dimensions is real-dims and stays out of the default lane;"
-    echo "  an unclassified test in a reviewed package needs model-free or checkpoint-device."
+    echo "  an unclassified test in a reviewed package needs model-free, checkpoint or device."
     sed 's/^/  want: /' "$changed"
   } >&2
   return 1
@@ -306,7 +320,7 @@ print_summary() {
   while IFS= read -r package; do
     local free optional slow ignored targets
     free=$(awk -F '\t' -v p="$package" '$1 == p && $3 == "model-free" { n++ } END { print n + 0 }' "$inventory")
-    optional=$(awk -F '\t' -v p="$package" '$1 == p && $3 == "checkpoint-device" { n++ } END { print n + 0 }' "$inventory")
+    optional=$(awk -F '\t' -v p="$package" '$1 == p && ($3 == "checkpoint" || $3 == "device") { n++ } END { print n + 0 }' "$inventory")
     slow=$(awk -F '\t' -v p="$package" '$1 == p && $3 == "real-dims" { n++ } END { print n + 0 }' "$inventory")
     ignored=$(awk -F '\t' -v p="$package" '$1 == p && $3 == "ignored" { n++ } END { print n + 0 }' "$discovered_inventory")
     targets=$(tail -n +2 "$inventory" | awk -F '\t' -v p="$package" '$1 == p { print $2 }' | LC_ALL=C sort -u | wc -l)
@@ -390,6 +404,18 @@ run_real_dims() {
   cargo nextest run --no-tests=fail --no-fail-fast "${test_targets[@]}" "${package_args[@]}" -E "$selected" "$@"
 }
 
+# The tests of an `excluded` package that is host-only, in the lane's environment but its own cargo invocation: the
+# package's dependencies turn on a feature (poot-bench-runner enables poot-llm/rocm) that must not unify into the
+# lane's builds. The package must be one `gate_policy` excludes. The package is bin-only (`--lib` is an error for it), so this selects `--bins`.
+run_isolated() {
+  local package=$1
+  awk -F '\t' -v p="$package" '$1 == p && $2 == "excluded" { found = 1 } END { exit !found }' "$policy_table" || {
+    echo "$package is not an excluded package in gate_policy" >&2
+    return 1
+  }
+  lane_environment cargo nextest run --no-tests=fail --no-fail-fast --bins -p "$package"
+}
+
 expect_mutation_failure() {
   local label=$1
   local needle=$2
@@ -449,7 +475,7 @@ run_self_test() {
   awk -v drop="$host_row" 'NR == 1 || $0 != drop' "$checked_inventory" >"$remove"
   { cat "$checked_inventory"; printf '%s\n' "$host_row"; } | sorted_with_header >"$duplicate"
   sed "s/${host_test}/${host_test}_renamed/" "$checked_inventory" | sorted_with_header >"$rename"
-  awk -F '\t' -v OFS='\t' -v row="$host_row" '$0 == row { $3 = "checkpoint-device" } { print }' "$checked_inventory" \
+  awk -F '\t' -v OFS='\t' -v row="$host_row" '$0 == row { $3 = "device" } { print }' "$checked_inventory" \
     | sorted_with_header >"$reclassify_host"
   awk -F '\t' -v OFS='\t' -v row="$real_dims_row" '$0 == row { $3 = "model-free" } { print }' "$checked_inventory" \
     | sorted_with_header >"$real_dims_as_model_free"
@@ -502,10 +528,10 @@ EOF
   local gate_target=poot-runtime::run_add gate_test=add_runs_on_gpu
   local gate_row
   gate_row=$(awk -F '\t' -v target="$gate_target" -v test="$gate_test" '
-    NR > 1 && $2 == target && $4 == test && $3 == "checkpoint-device" { print; exit }
+    NR > 1 && $2 == target && $4 == test && $3 == "device" { print; exit }
   ' "$checked_inventory")
   if [[ -z "$gate_row" ]]; then
-    echo "self-test needs the checkpoint-device row for $gate_target $gate_test" >&2
+    echo "self-test needs the device row for $gate_target $gate_test" >&2
     return 1
   fi
   local device_as_model_free="$tmp_dir/mutation-device-as-model-free.tsv"
@@ -581,7 +607,7 @@ if [[ "$mode" == "regen" ]]; then
   cp "$tmp_dir/regenerated.tsv" "$checked_inventory"
   echo "regenerated $checked_inventory: $(($(wc -l <"$checked_inventory") - 1)) rows"
   if grep -n $'\tunclassified\t' "$checked_inventory"; then
-    echo "set the class of each unclassified test above (model-free or checkpoint-device) by reading it" >&2
+    echo "set the class of each unclassified test above (model-free, checkpoint or device) by reading it" >&2
     exit 1
   fi
   exit 0
@@ -595,4 +621,6 @@ elif [[ "$mode" == "run" ]]; then
   run_model_free "$checked_inventory"
 elif [[ "$mode" == "run-real-dims" ]]; then
   run_real_dims "$checked_inventory" "$@"
+elif [[ "$mode" == "run-isolated" ]]; then
+  run_isolated "$1"
 fi

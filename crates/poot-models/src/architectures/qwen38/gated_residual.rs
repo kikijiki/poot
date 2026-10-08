@@ -1,202 +1,181 @@
-use super::*;
-use poot_graph_ir::ops::silu;
+//! Hyper-Connections (`Qwen4ExpTextGatedResidual`): the residual stream is `streams` parallel copies
+//! of the hidden state, `[.., streams * width]`, and every block reads a gated mean of them and
+//! writes back into each stream with its own weight.
+//!
+//! ```text
+//! normed = grouped_norm(x)                                  // [.., streams * width]
+//! gate   = sigmoid(up(silu(down(normed) / streams)))        // low-rank gate, [.., streams * width]
+//! mixed  = mean_streams(gate * normed)                      // [.., width]: the block's input
+//! inject = 2 * sigmoid(inject_proj(normed) / streams)       // [.., streams]
+//! x'     = x + block(mixed)[stream] * inject[stream]        // every stream, from the raw x
+//! ```
+//!
+//! The residual add reads the raw stream, not the normed one. There is no plain pre-norm in the
+//! layer: this grouped norm is the block's normalization, and no norm follows the last layer either:
+//! the model-level mixer (the same gate without the injection) collapses the streams straight into
+//! the head.
 
-/// Widen a single-stream `[.., H]` tensor to the `[.., hc_count*H]` Hyper-Connections stream by tiling the
-/// same `H`-sized vector `hc_count` times along the feature axis, as the real
-/// `hidden_states.repeat(1, 1, hc_count)` (`Qwen4ExpTextModel.forward`, `modeling_qwen4_exp.py` line 1491).
-/// Composed from existing primitives: insert a size-1 axis before the last axis (`Reshape`), expand it to
-/// `hc_count` (`Broadcast`), then flatten the last two axes (`Reshape`).
-pub(crate) fn qwen38_widen_embedding(b: &Builder, x: Traced, hc_count: usize) -> Traced {
-    let shape = b.aval(x).shape; // [.., H]
-    let h = *shape.last().expect("embedding must have at least one axis");
-    let insert_at = shape.len() - 1;
-    let mut unsq = shape.clone();
-    unsq.insert(insert_at, 1); // [.., 1, H]
-    let mut wide = unsq.clone();
-    wide[insert_at] = hc_count; // [.., hc_count, H]
-    let mut flat = shape.clone();
-    let last = flat.len() - 1;
-    flat[last] = hc_count * h; // [.., hc_count*H]
+use poot_graph_ir::ops::{sigmoid, silu};
+use poot_graph_ir::{BinOp, Builder, RedOp, Scalar, Traced};
+use poot_quant::weights::{HyperRole, WeightId, WeightMap};
 
-    let x1 = b.reshape(x, unsq);
-    let x2 = b.broadcast(x1, wide);
-    b.reshape(x2, flat)
+use crate::components::linear::{Weight, WeightError, linear};
+use crate::components::ple::grouped_norm;
+use crate::components::standard::ParamError;
+use crate::model::ConfigReason;
+
+/// Checked Hyper-Connections parameters: the stream width, the stream count, the gate's low rank
+/// and the norm epsilon.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HyperParams {
+    width: usize,
+    streams: usize,
+    rank: usize,
+    eps: f32,
 }
 
-/// Grouped RMSNorm over a widened `[.., hc_count*H]` Hyper-Connections stream: the real
-/// `Qwen4ExpTextRMSNorm(dim=hc_count*H, group_size=H)` (also used ungrouped for `q_norm`/`k_norm`/the
-/// indexer norms; see [`trace_qwen38_prefill`] on the shared `+1.0` loader convention). Reshape to
-/// `[.., hc_count, H]`, normalize each `H`-sized group by its own mean-square, reshape back, then
-/// multiply by the full-length `[hc_count*H]` weight (the weight has no group structure; see
-/// `modeling_qwen4_exp.py` lines 173-184). Plain multiply, as [`poot_graph_ir::ops::rmsnorm`]: the `+1.0`
-/// offset is the loader's job, as for `q_norm`/`k_norm`.
-pub(crate) fn qwen38_grouped_rmsnorm(
-    b: &Builder,
-    x: Traced,
-    w: Traced,
-    hc_count: usize,
-    h: usize,
-    eps: f32,
-) -> Traced {
-    let shape = b.aval(x).shape; // [.., hc_count*H]
-    let mut grouped = shape.clone();
-    let last = grouped.len() - 1;
-    grouped[last] = hc_count;
-    grouped.push(h); // [.., hc_count, H]
-    let gaxis = grouped.len() - 1;
+impl HyperParams {
+    pub fn new(width: usize, streams: usize, rank: usize, eps: f32) -> Result<Self, ParamError> {
+        for (field, value) in [
+            ("hidden_size", width),
+            ("hc_count", streams),
+            ("hc_lowrank", rank),
+        ] {
+            if value == 0 {
+                return Err(ParamError::new(field, ConfigReason::Zero));
+            }
+        }
+        if !(eps.is_finite() && eps > 0.0) {
+            return Err(ParamError::new(
+                "rms_norm_eps",
+                ConfigReason::NotFinitePositive,
+            ));
+        }
+        Ok(Self {
+            width,
+            streams,
+            rank,
+            eps,
+        })
+    }
 
-    let xg = b.reshape(x, grouped);
-    let sq = b.binary(BinOp::Mul, xg, xg);
-    let ss = b.reduce(RedOp::Sum, sq, gaxis, true);
-    let ms = b.binary_scalar(BinOp::Mul, ss, Scalar::F32(1.0 / h as f32));
-    let mse = b.binary_scalar(BinOp::Add, ms, Scalar::F32(eps));
-    let den = b.unary(UnOp::Sqrt, mse);
-    let normed_g = b.binary(BinOp::Div, xg, den);
-    let normed = b.reshape(normed_g, shape);
-    b.binary(BinOp::Mul, normed, w)
+    pub fn streams(&self) -> usize {
+        self.streams
+    }
+
+    fn stream_width(&self) -> usize {
+        self.streams * self.width
+    }
+
+    /// The embedding widened to every stream: `[.., width]` tiled `streams` times along the last
+    /// axis.
+    pub fn widen(&self, b: &Builder, x: Traced) -> Traced {
+        let shape = b.aval(x).shape;
+        let n = shape.len();
+        let mut single = shape.clone();
+        single.insert(n - 1, 1);
+        let mut wide = shape.clone();
+        wide.insert(n - 1, self.streams);
+        let mut flat = shape;
+        flat[n - 1] = self.stream_width();
+        b.reshape(b.broadcast(b.reshape(x, single), wide), flat)
+    }
+
+    /// `[.., streams * width]` as `[.., streams, width]`.
+    fn grouped(&self, b: &Builder, x: Traced) -> Traced {
+        let mut shape = b.aval(x).shape;
+        let n = shape.len();
+        shape[n - 1] = self.streams;
+        shape.push(self.width);
+        b.reshape(x, shape)
+    }
 }
 
-/// Shared core of [`qwen38_gated_residual`] (`use_combine=True`) and [`qwen38_gated_residual_mixer`]
-/// (`use_combine=False`): the `Qwen4ExpTextGatedResidual.forward` prefix "grouped-norm, low-rank gate,
-/// weighted mean-pool over the `hc_count` axis" (`modeling_qwen4_exp.py` lines 1033-1039):
-///
-/// ```text
-/// hyper_input_normed = hc_norm(hyper_input)                                     // grouped RMSNorm
-/// gate = sigmoid(up(silu(down(hyper_input_normed) / hc_count)))                 // low-rank bottleneck
-/// mixed_input = mean_over_hc_count(gate.reshape(..,hc_count,H) * hyper_input_normed.reshape(..,hc_count,H))
-/// ```
-///
-/// Returns `(hyper_input_normed [.., hc_count*H], mixed_input [.., H])`; [`qwen38_gated_residual`] needs
-/// the normed value again for its `block_inject_weight` projection.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn qwen38_gated_residual_core(
-    b: &Builder,
-    hyper_input: Traced,
-    p: &str,
-    hc_count: usize,
-    h: usize,
-    lowrank: usize,
-    eps: f32,
-) -> (Traced, Traced) {
-    let hc_h = hc_count * h;
-    let norm_w = b.constant(&format!("{p}.hc_norm.weight"), TensorType::f32(vec![hc_h]));
-    let normed = qwen38_grouped_rmsnorm(b, hyper_input, norm_w, hc_count, h, eps);
+/// One gate's weights: the grouped norm scale `[streams * width]`, the low-rank gate projections
+/// `[rank, streams * width]` and `[streams * width, rank]`, and for a layer's gate the injection
+/// projection `[streams, streams * width]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HyperWeights {
+    norm: Weight,
+    down: Weight,
+    up: Weight,
+    inject: Option<Weight>,
+}
 
-    let w_down = b.constant(
-        &format!("{p}.input_mix_weight_down.weight"),
-        TensorType::f32(vec![hc_h, lowrank]),
+impl HyperWeights {
+    pub fn new(
+        map: &WeightMap,
+        id: impl Fn(HyperRole) -> WeightId,
+        p: &HyperParams,
+        inject: bool,
+    ) -> Result<Self, WeightError> {
+        let stream = p.stream_width();
+        let w = |role, shape: &[usize]| Weight::new(map, id(role), shape);
+        Ok(Self {
+            norm: w(HyperRole::Norm, &[stream])?,
+            down: w(HyperRole::MixDown, &[p.rank, stream])?,
+            up: w(HyperRole::MixUp, &[stream, p.rank])?,
+            inject: inject
+                .then(|| w(HyperRole::Inject, &[p.streams, stream]))
+                .transpose()?,
+        })
+    }
+}
+
+/// The normed stream and the gated mean of it: `([.., streams * width], [.., width])`.
+fn mixed(b: &Builder, x: Traced, w: &HyperWeights, p: &HyperParams) -> (Traced, Traced) {
+    let normed = grouped_norm(b, x, &w.norm, p.streams, p.eps);
+    let down = b.binary_scalar(
+        BinOp::Mul,
+        linear(b, normed, &w.down, None),
+        Scalar::F32(1.0 / p.streams as f32),
     );
-    let w_up = b.constant(
-        &format!("{p}.input_mix_weight_up.weight"),
-        TensorType::f32(vec![lowrank, hc_h]),
+    let gate = sigmoid(b, linear(b, silu(b, down), &w.up, None));
+    let weighted = b.binary(BinOp::Mul, p.grouped(b, gate), p.grouped(b, normed));
+    let axis = b.aval(weighted).shape.len() - 2;
+    let mean = b.binary_scalar(
+        BinOp::Mul,
+        b.reduce(RedOp::Sum, weighted, axis, false),
+        Scalar::F32(1.0 / p.streams as f32),
     );
-    let down = linear(b, normed, w_down, None); // [.., lowrank]
-    let down_scaled = b.binary_scalar(BinOp::Mul, down, Scalar::F32(1.0 / hc_count as f32));
-    let down_act = silu(b, down_scaled);
-    let up = linear(b, down_act, w_up, None); // [.., hc_h]
-    let gate = sigmoid(b, up);
-
-    let shape = b.aval(hyper_input).shape;
-    let mut grouped = shape.clone();
-    let last = grouped.len() - 1;
-    grouped[last] = hc_count;
-    grouped.push(h); // [.., hc_count, H]
-    let gaxis = grouped.len() - 2; // the hc_count axis (H stays last)
-
-    let gate_g = b.reshape(gate, grouped.clone());
-    let normed_g = b.reshape(normed, grouped);
-    let weighted = b.binary(BinOp::Mul, gate_g, normed_g);
-    let summed = b.reduce(RedOp::Sum, weighted, gaxis, false); // [.., H]
-    let mixed_input = b.binary_scalar(BinOp::Mul, summed, Scalar::F32(1.0 / hc_count as f32));
-
-    (normed, mixed_input)
+    (normed, mean)
 }
 
-/// `Qwen4ExpTextGatedResidual.forward` with `use_combine=True` (the per-layer `attn_hyper_connection`/
-/// `mlp_hyper_connection`, tensor prefix `{p}.{attn,mlp}_hyper_connection`, `modeling_qwen4_exp.py` lines
-/// 1015-1043). `hyper_input` is the caller's widened `[.., hc_count*H]` stream. Returns
-/// `(mixed_input [.., H], injection_weights [.., hc_count])`: the caller runs its sub-layer
-/// (attention/GDN/MLP) on `mixed_input`, then combines the `[.., H]` output with `injection_weights` via
-/// [`qwen38_gated_residual_inject`].
-///
-/// The residual add uses the raw pre-norm stream, not the normed one. `Qwen4ExpTextGatedResidual.forward`
-/// returns `mixed_input, hyper_input, injection_weights` (line 1043), where `hyper_input` is its own raw
-/// parameter, not the local `hyper_input_normed` from line 1033, and `hidden_states = hyper_input +
-/// injection.flatten(-2)` (lines 1311/1317) adds it back. So this function returns no normed value, and
-/// the caller combines [`qwen38_gated_residual_inject`]'s result with the same `hyper_input` it already
-/// holds.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn qwen38_gated_residual(
-    b: &Builder,
-    hyper_input: Traced,
-    p: &str,
-    hc_count: usize,
-    h: usize,
-    lowrank: usize,
-    eps: f32,
-) -> (Traced, Traced) {
-    let hc_h = hc_count * h;
-    let (normed, mixed_input) =
-        qwen38_gated_residual_core(b, hyper_input, p, hc_count, h, lowrank, eps);
-
-    let w_inject = b.constant(
-        &format!("{p}.block_inject_weight.weight"),
-        TensorType::f32(vec![hc_h, hc_count]),
+/// A layer block's input `[.., width]` from the stream `x`, and the per-stream injection weights
+/// `[.., streams]` to hand to [`inject`] with the block's output.
+pub fn input(b: &Builder, x: Traced, w: &HyperWeights, p: &HyperParams) -> (Traced, Traced) {
+    let (normed, mean) = mixed(b, x, w, p);
+    let inject = w
+        .inject
+        .as_ref()
+        .expect("a layer's gate is built with its injection weights");
+    let logit = b.binary_scalar(
+        BinOp::Mul,
+        linear(b, normed, inject, None),
+        Scalar::F32(1.0 / p.streams as f32),
     );
-    let inject_logit = linear(b, normed, w_inject, None); // [.., hc_count]
-    let inject_scaled =
-        b.binary_scalar(BinOp::Mul, inject_logit, Scalar::F32(1.0 / hc_count as f32));
-    let inject_sig = sigmoid(b, inject_scaled);
-    let injection_weights = b.binary_scalar(BinOp::Mul, inject_sig, Scalar::F32(2.0));
-
-    (mixed_input, injection_weights)
+    (
+        mean,
+        b.binary_scalar(BinOp::Mul, sigmoid(b, logit), Scalar::F32(2.0)),
+    )
 }
 
-/// Combine a sub-layer's `[.., H]` output with [`qwen38_gated_residual`]'s `injection_weights
-/// [.., hc_count]` into an additive update to the original widened stream `hyper_input` (the value passed
-/// to that call; see its doc comment): real source lines 1310-1311/1316-1317,
-/// `injection = sublayer_out.unsqueeze(-2) * injection_weights.unsqueeze(-1)` then
-/// `hidden_states = hyper_input + injection.flatten(-2)`. The `unsqueeze`/`flatten` pair is a `Reshape`
-/// on each side of a broadcasting `Binary::Mul`.
-pub(crate) fn qwen38_gated_residual_inject(
-    b: &Builder,
-    hyper_input: Traced,
-    sublayer_out: Traced,
-    injection_weights: Traced,
-) -> Traced {
-    let out_shape = b.aval(sublayer_out).shape; // [.., H]
-    let mut sub_row = out_shape.clone();
-    let n = sub_row.len();
-    sub_row.insert(n - 1, 1); // [.., 1, H]
-    let sub_r = b.reshape(sublayer_out, sub_row);
-
-    let w_shape = b.aval(injection_weights).shape; // [.., hc_count]
-    let mut w_col = w_shape.clone();
-    w_col.push(1); // [.., hc_count, 1]
-    let w_c = b.reshape(injection_weights, w_col);
-
-    let injection = b.binary(BinOp::Mul, sub_r, w_c); // [.., hc_count, H], broadcast
-    let hyper_shape = b.aval(hyper_input).shape;
-    let injection_flat = b.reshape(injection, hyper_shape);
-    b.binary(BinOp::Add, hyper_input, injection_flat)
+/// The stream `x` plus a block's output `[.., width]` written into every stream by its injection
+/// weights.
+pub fn inject(b: &Builder, x: Traced, block: Traced, weights: Traced) -> Traced {
+    let mut row = b.aval(block).shape;
+    row.insert(row.len() - 1, 1); // [.., 1, width]
+    let mut column = b.aval(weights).shape;
+    column.push(1); // [.., streams, 1]
+    let injection = b.binary(
+        BinOp::Mul,
+        b.reshape(block, row),
+        b.reshape(weights, column),
+    );
+    b.binary(BinOp::Add, x, b.reshape(injection, b.aval(x).shape))
 }
 
-/// `Qwen4ExpTextGatedResidual.forward` with `use_combine=False` (the model-level
-/// `hyper_connection_mixer`, tensor prefix `hyper_connection_mixer`, no `block_inject_weight`;
-/// `modeling_qwen4_exp.py` lines 1024/1040-1041). Collapses the final widened `[.., hc_count*H]` stream to
-/// one `[.., H]` stream, applied once after the last decoder layer, before `lm_head`
-/// (`Qwen4ExpTextModel.forward`, lines 1404/1504). Shares [`qwen38_gated_residual_core`] with
-/// [`qwen38_gated_residual`], with no injection step.
-pub(crate) fn qwen38_gated_residual_mixer(
-    b: &Builder,
-    hyper_input: Traced,
-    p: &str,
-    hc_count: usize,
-    h: usize,
-    lowrank: usize,
-    eps: f32,
-) -> Traced {
-    let (_normed, mixed_input) =
-        qwen38_gated_residual_core(b, hyper_input, p, hc_count, h, lowrank, eps);
-    mixed_input
+/// The model-level mixer: the streams collapsed to one `[.., width]` before the head.
+pub fn collapse(b: &Builder, x: Traced, w: &HyperWeights, p: &HyperParams) -> Traced {
+    mixed(b, x, w, p).1
 }

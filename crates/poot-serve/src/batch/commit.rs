@@ -1,146 +1,157 @@
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use poot_llm::Runner;
-use poot_llm::driver::block_table::PagedKvCache;
+use poot_llm::driver::PrefixOutcome;
 
+use crate::batch::engine::{EngineError, RowResult, ServeEngine};
 use crate::batch::slot::Slot;
 use crate::metrics::{CacheMetrics, Metrics};
 use crate::types::{GenEvent, PerTokenInfo};
 
-/// Free slot `j`'s KV blocks, registering its filled prompt prefix for reuse first. An mRoPE request
-/// bypasses the token-only prefix cache, so it only frees.
-pub(crate) fn release_slot_kv(paged_cache: &mut PagedKvCache, j: usize, slot: &Slot) {
-    if slot.mrope.is_some() {
-        paged_cache.reset(j);
-    } else {
-        // Register under this request's effective-weights identity (base, or its adapter): a later
-        // request only reuses the prefix under the same weights (spec 248, ADR-0030).
-        paged_cache.register_and_reset_for(
-            j,
-            &slot.tokens[..slot.prompt_len],
-            slot.lora_adapter.prefix_identity(),
-        );
+/// What a request's commit decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SlotFate {
+    /// The request goes on to its next step.
+    Continue,
+    /// The request ended: `natural` is an EOS or a stop string (OpenAI `"stop"`), else `max_new` ("length").
+    Finished { natural: bool },
+    /// The client is gone: a streamed piece found no receiver.
+    Cancelled,
+}
+
+/// The stop strings of one request, matched against the generated text as it grows. Only a bounded tail
+/// is kept: the last `longest - 1` bytes (moved back to a char boundary), which is all a match that
+/// straddles into the next piece can need.
+#[derive(Debug)]
+pub(crate) struct StopScanner {
+    strings: Vec<String>,
+    longest: usize,
+    tail: String,
+}
+
+impl StopScanner {
+    pub(crate) fn new(strings: Vec<String>) -> Self {
+        let strings: Vec<String> = strings.into_iter().filter(|s| !s.is_empty()).collect();
+        let longest = strings.iter().map(String::len).max().unwrap_or(0);
+        Self {
+            strings,
+            longest,
+            tail: String::new(),
+        }
+    }
+
+    /// Whether the request has any stop string to scan for.
+    pub(crate) fn active(&self) -> bool {
+        self.longest > 0
+    }
+
+    /// Record `piece`, the text the latest token added; whether a stop string is now complete.
+    pub(crate) fn push(&mut self, piece: &str) -> bool {
+        if self.longest == 0 {
+            return false;
+        }
+        self.tail.push_str(piece);
+        if self.strings.iter().any(|s| self.tail.contains(s.as_str())) {
+            return true;
+        }
+        let mut from = self.tail.len().saturating_sub(self.longest - 1);
+        while !self.tail.is_char_boundary(from) {
+            from -= 1;
+        }
+        self.tail.drain(..from);
+        false
     }
 }
 
-/// Prefix-cache telemetry for every non-mRoPE admission, including drivers whose extra state forced a
-/// fresh reservation. mRoPE bypasses the token-only cache, so neither side of the hit-rate fraction moves.
-pub(crate) fn record_non_mrope_prefix_cache_admission(
-    cache: &CacheMetrics,
-    prompt_len: usize,
-    skip: usize,
-    is_mrope: bool,
-) {
-    if !is_mrope {
-        cache
-            .prefix_query_tokens
-            .fetch_add(prompt_len as u64, Ordering::Relaxed);
-        cache
-            .prefix_hit_tokens
-            .fetch_add(skip as u64, Ordering::Relaxed);
+/// Route what a release did with a finished prompt's prefix into the cache telemetry.
+pub(crate) fn record_prefix_outcome(cache: &CacheMetrics, outcome: PrefixOutcome) {
+    match outcome {
+        PrefixOutcome::Registered { tokens } => {
+            cache
+                .prefix_registered_tokens
+                .fetch_add(tokens as u64, Ordering::Relaxed);
+        }
+        PrefixOutcome::Skipped(_) => {
+            cache
+                .prefix_skipped_releases
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
-/// Commit one newly decided token `next` to slot `j`: EOS check, push and stream (with `PerTokenInfo`),
-/// stop-sequence/`max_new` check, and prefix-cache registration plus slot eviction on any terminal
-/// condition (EOS, stop, max_new, client cancellation), under one telemetry/cancellation/prefix-cache
-/// contract. Returns `false` when the slot was evicted; the caller must stop feeding tokens to slot `j`.
-pub(crate) fn commit_token(
-    runner: &Runner,
+/// Prefix-cache telemetry for one admission: the prompt tokens looked up and the leading ones found
+/// resident.
+pub(crate) fn record_prefix_admission(cache: &CacheMetrics, prompt_len: usize, reused: usize) {
+    cache
+        .prefix_query_tokens
+        .fetch_add(prompt_len as u64, Ordering::Relaxed);
+    cache
+        .prefix_hit_tokens
+        .fetch_add(reused as u64, Ordering::Relaxed);
+}
+
+/// Commit one step's picks for `slot`: keep tokens until one ends the request (an EOS from the model's
+/// set, a stop string, `max_new`, a gone client), stream each kept token, then commit exactly the kept
+/// prefix with the engine. A token after the ending one is never kept, so it enters neither the
+/// sequence nor the sampler's history.
+pub(crate) fn commit_tokens<E: ServeEngine>(
+    engine: &mut E,
     metrics: &Metrics,
-    paged_cache: &mut PagedKvCache,
-    num_blocks: usize,
-    slots: &mut [Option<Slot>],
-    j: usize,
-    next: u32,
-) -> bool {
-    if next == runner.eos() {
-        let mut slot = slots[j].take().unwrap();
-        tracing::debug!(
-            slot = j,
-            generated = slot.generated,
-            finish = "eos",
-            "slot done"
-        );
-        // Register the filled prompt prefix for reuse, then free the blocks.
-        release_slot_kv(paged_cache, j, &slot);
-        let lp = slot.sampler.take_logprobs();
-        // EOS -> natural stop ("stop"). `deliver_done` publishes the outcome count before the event
-        // can be observed, as every terminal `Done` in the server does.
-        GenEvent::deliver_done(metrics, &slot.reply, slot.tokens, lp, true);
-        return false;
-    }
-    {
-        let sl = slots[j].as_mut().unwrap();
-        // push BEFORE streaming so the incremental detokenizer sees `next` with its left context - per-
-        // token `decode(&[next])` strips leading spaces on SentencePiece models (update 0102).
-        sl.tokens.push(next);
-        if sl.stream
-            && let Ok(piece) = runner.stream_piece(&sl.tokens, sl.prompt_len)
-        {
-            // card 030: engine-produced per-token timing. kv_used_ratio is the CURRENT global pool
-            // occupancy (used / total blocks), read here on the engine thread.
+    slot: &mut Slot<E::Seq>,
+    result: &RowResult<E::Seq>,
+) -> Result<SlotFate, EngineError> {
+    let mut fate = SlotFate::Continue;
+    let mut kept = 0;
+    for &next in &result.tokens {
+        if engine.eos().contains(&next) {
+            fate = SlotFate::Finished { natural: true };
+            break;
+        }
+        kept += 1;
+        // Push BEFORE decoding the piece: the incremental detokenizer needs `next` with its left context
+        // (a per-token decode strips leading spaces on SentencePiece models).
+        slot.tokens.push(next);
+        let piece = if slot.stream || slot.stops.active() {
+            engine
+                .piece(&slot.tokens, slot.prompt_len)
+                .unwrap_or_else(|error| {
+                    tracing::warn!(error = %error, "detokenize a generated token");
+                    String::new()
+                })
+        } else {
+            String::new()
+        };
+        let stopped = slot.stops.push(&piece);
+        slot.generated += 1;
+        metrics.completion_tokens.fetch_add(1, Ordering::Relaxed);
+        if slot.stream {
             let now = Instant::now();
-            let since_prev_ms = sl
-                .last_token
-                .map(|t| (now - t).as_secs_f64() * 1000.0)
-                .unwrap_or(0.0);
-            let decode_start = sl.decode_start.get_or_insert(now);
-            let cumulative_ms = (now - *decode_start).as_secs_f64() * 1000.0;
-            let kv_used_ratio = if num_blocks > 0 {
-                (num_blocks - paged_cache.free_blocks()) as f64 / num_blocks as f64
-            } else {
-                0.0
-            };
+            let decode_start = *slot.decode_start.get_or_insert(now);
             let info = PerTokenInfo {
-                token_idx: sl.generated,
-                since_prev_ms,
-                cumulative_ms,
-                kv_used_ratio,
+                token_idx: slot.generated - 1,
+                since_prev_ms: slot
+                    .last_token
+                    .map_or(0.0, |t| (now - t).as_secs_f64() * 1000.0),
+                cumulative_ms: (now - decode_start).as_secs_f64() * 1000.0,
+                kv_used_ratio: engine.kv_used_ratio(),
             };
-            sl.last_token = Some(now);
-            // a failed send means the connection thread dropped its receiver (the client
-            // disconnected): evict the slot to stop generating and free it (cancellation).
-            if sl.reply.send(GenEvent::Token(piece, info)).is_err() {
-                // client gone: register the filled prompt prefix, then free the slot.
-                metrics.requests_cancelled.fetch_add(1, Ordering::Relaxed);
-                let slot = slots[j].take().unwrap();
-                release_slot_kv(paged_cache, j, &slot);
-                return false;
+            slot.last_token = Some(now);
+            if slot.reply.send(GenEvent::Token(piece, info)).is_err() {
+                fate = SlotFate::Cancelled;
+                break;
             }
         }
-        // advance the sampler's per-token state: the guided-decoding constraint trie and the generated-
-        // history penalties (the sequential paths call this inside their loops).
-        sl.sampler.observe(next);
-        sl.generated += 1;
+        if stopped {
+            fate = SlotFate::Finished { natural: true };
+            break;
+        }
+        if slot.generated >= slot.max_new {
+            fate = SlotFate::Finished { natural: false };
+            break;
+        }
     }
-    metrics.completion_tokens.fetch_add(1, Ordering::Relaxed);
-    // Halt on max_new or a stop sequence in the generated text (early stop; the connection thread trims
-    // the stop string from the returned text).
-    let sl = slots[j].as_ref().unwrap();
-    let hit_stop = !sl.stop.is_empty()
-        && runner
-            .decode(&sl.tokens[sl.prompt_len..])
-            .map(|t| {
-                sl.stop
-                    .iter()
-                    .any(|s| !s.is_empty() && t.contains(s.as_str()))
-            })
-            .unwrap_or(false);
-    if sl.generated >= sl.max_new || hit_stop {
-        let mut slot = slots[j].take().unwrap();
-        tracing::debug!(
-            slot = j,
-            generated = slot.generated,
-            finish = if hit_stop { "stop" } else { "max_new" },
-            "slot done"
-        );
-        release_slot_kv(paged_cache, j, &slot);
-        let lp = slot.sampler.take_logprobs();
-        // a stop sequence is a natural stop ("stop"); hitting max_new is "length".
-        GenEvent::deliver_done(metrics, &slot.reply, slot.tokens, lp, hit_stop);
-        return false;
-    }
-    true
+    slot.logprobs
+        .extend(result.logprobs.iter().take(kept).cloned());
+    engine.commit(slot.seq, kept, &mut slot.sampler)?;
+    Ok(fate)
 }

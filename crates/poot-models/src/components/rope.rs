@@ -372,6 +372,52 @@ pub fn rope_rows(b: &Builder, p: RopeParams, pos: Traced, capacity: usize) -> Ro
     }
 }
 
+/// The rows of `p`'s tables at positions `0, stride, 2 * stride, ..`, `count` of them, for `rows`
+/// sequences: `[rows, 1, count, rotary]`, rows of compressed windows that start at every `stride`th
+/// position (known at trace time, so a view of the table and no gather). `count * stride` must not
+/// exceed `capacity`.
+pub fn rope_strided_rows(
+    b: &Builder,
+    p: RopeParams,
+    capacity: usize,
+    stride: usize,
+    count: usize,
+    rows: usize,
+) -> RopeRows {
+    let rotary = p.rotary();
+    let table = |table| {
+        let computed = p
+            .spec
+            .computed(table, capacity)
+            .expect("a step's capacity fits a u32: StepShape capacities are checked by the model");
+        let full = b.computed(computed);
+        let tiles = b.reshape(
+            b.slice(full, 0, 0, count * stride),
+            vec![count, stride, rotary],
+        );
+        let starts = b.reshape(b.slice(tiles, 1, 0, 1), vec![1, 1, count, rotary]);
+        b.broadcast(starts, vec![rows, 1, count, rotary])
+    };
+    RopeRows {
+        cos: table(RopeTable::Cos),
+        sin: table(RopeTable::Sin),
+        rotary,
+        pairing: p.pairing,
+    }
+}
+
+impl RopeRows {
+    /// The inverse rotation: the same rows with `sin` negated, so [`apply_rope`] undoes the
+    /// rotation by the same positions (DeepSeek-V4 derotates its attention output, which picked up
+    /// the rotation of the shared key it reads as a value).
+    pub fn inverse(self, b: &Builder) -> Self {
+        Self {
+            sin: b.unary(UnOp::Neg, self.sin),
+            ..self
+        }
+    }
+}
+
 /// Rotate the leading `rotary` dims of `x` (`[rows, heads, tokens, head_dim]`): half-split,
 /// `x * cos + concat(-x2, x1) * sin`, or interleaved, each adjacent pair `(a, b)` to
 /// `(a cos - b sin, b cos + a sin)`; the trailing dims pass through.
@@ -718,5 +764,57 @@ mod tests {
             ConfigReason::Missing,
         );
         refused(json!(3), "rope_scaling", ConfigReason::WrongType);
+    }
+
+    /// `rope_strided_rows` is the rows of `rope_rows` at positions `0, stride, 2 * stride, ..`
+    /// (compressed windows' first positions), for both pairings and broadcast over the rows of the
+    /// step; `inverse` undoes `apply_rope` at the same positions. Mutation: stride the table by
+    /// `stride + 1`; the first window past the first goes red.
+    #[test]
+    fn strided_rows_are_the_strided_positions_and_inverse_undoes_the_rotation() {
+        let (heads, d, cap, stride, count, rows) = (2, 8, 16, 4, 3, 2);
+        for p in [
+            RopeParams::new(d, 10_000.0, &RopeFlavor::Plain).unwrap(),
+            RopeParams::new(d, 10_000.0, &RopeFlavor::Plain)
+                .unwrap()
+                .interleaved(),
+        ] {
+            let x = oracle::random(rows * heads * count * d, 41);
+            let positions: Vec<i32> = (0..count).map(|w| (w * stride) as i32).collect();
+            // `which`: 0 rows at the strided positions, 1 rows gathered at those positions, 2
+            // the strided rotation undone by its inverse.
+            let run = |which: u8| {
+                let b = Builder::new();
+                let xs = b.constant("x", TensorType::f32(vec![rows, heads, count, d]));
+                let r = if which == 1 {
+                    let ps = b.slot(Slot::Pos, TensorType::new(vec![rows, count], DType::I32));
+                    rope_rows(&b, p, ps, cap)
+                } else {
+                    rope_strided_rows(&b, p, cap, stride, count, rows)
+                };
+                let y = apply_rope(&b, xs, &r);
+                let out = if which == 2 {
+                    apply_rope(&b, y, &r.inverse(&b))
+                } else {
+                    y
+                };
+                let pos: Vec<i32> = positions.iter().chain(&positions).copied().collect();
+                Fx::new(0)
+                    .eval(&b.finish(out), &[("x", &x)], &[(Slot::Pos, &pos)], &[])
+                    .0
+            };
+            let (strided, by_pos, back) = (run(0), run(1), run(2));
+            oracle::assert_matches_f64(
+                &strided,
+                &by_pos.iter().map(|&v| f64::from(v)).collect::<Vec<_>>(),
+                1e-6,
+            );
+            assert_ne!(strided, x, "the rotation moves the values");
+            oracle::assert_matches_f64(
+                &back,
+                &x.iter().map(|&v| f64::from(v)).collect::<Vec<_>>(),
+                1e-5,
+            );
+        }
     }
 }

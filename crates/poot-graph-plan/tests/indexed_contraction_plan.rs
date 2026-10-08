@@ -37,18 +37,12 @@ fn target(backend: Backend) -> Target {
 }
 
 fn options() -> CompileOptions {
-    CompileOptions {
-        execution: Submission::Replay,
-        limits: CompileLimits::STANDARD,
-    }
+    CompileOptions::new(Submission::Replay, CompileLimits::STANDARD)
 }
 
-/// `g` compiled for `backend`: the full pipeline, or with `guarded` the routed-expert hang guard (the graph
-/// then carries a routed-expert site and the target has the hang).
-fn program(g: &Graph, backend: Backend, guarded: bool) -> Program {
-    let base = target(backend);
-    let (g, caps) = poot_test_util::graph_fixtures::pipeline_input(g, base.caps, guarded);
-    compile(&g, &Target { caps, ..base }, &options()).expect("the graph compiles")
+/// `g` compiled for `backend` through the full pipeline.
+fn program(g: &Graph, backend: Backend) -> Program {
+    compile(g, &target(backend), &options()).expect("the graph compiles")
 }
 
 /// `IndexedMatMul(x [m, K], w [E, K, N], ids [m])`, all f32; with `gate`, the product times `gate[m]` (`[m, 1]`
@@ -105,7 +99,7 @@ fn decode_shape_plans_the_gemv_on_every_backend_and_prefill_the_segmented_tiled(
     for backend in backends() {
         for (m, gemv) in [(5, true), (160, false)] {
             let label = format!("{backend:?} M={m}");
-            let program = program(&indexed(m, false), backend, false);
+            let program = program(&indexed(m, false), backend);
             let request = indexed_request(&program);
             assert!(
                 match request.schedule {
@@ -125,8 +119,7 @@ fn decode_shape_plans_the_gemv_on_every_backend_and_prefill_the_segmented_tiled(
 }
 
 /// SC-005 (plan half): the routed gate weighting compiles to exactly one `ContractionEpilogue { head: Indexed }`,
-/// with no standalone `IndexedMatMul` or `Mul` left, and its request carries the epilogue; under
-/// `true` the same graph stays two equations.
+/// with no standalone `IndexedMatMul` or `Mul` left, and its request carries the epilogue.
 ///
 /// Mutation: remove the `IndexedMatMul` arm of `epilogue_head`; the fused count falls to zero and this row goes red.
 #[test]
@@ -135,7 +128,7 @@ fn routed_gate_weighting_compiles_to_one_indexed_contraction_epilogue() {
         for m in [5, 160] {
             let label = format!("{backend:?} M={m}");
             let g = indexed(m, true);
-            let fused = program(&g, backend, false);
+            let fused = program(&g, backend);
             assert_eq!(
                 count(&fused, |op| matches!(
                     op,
@@ -158,19 +151,6 @@ fn routed_gate_weighting_compiles_to_one_indexed_contraction_epilogue() {
                 "{label}"
             );
             assert!(indexed_request(&fused).epilogue.is_some(), "{label}");
-
-            let unfused = program(&g, backend, true);
-            assert_eq!(
-                count(&unfused, |op| matches!(op, OpKind::IndexedMatMul)),
-                1,
-                "{label}"
-            );
-            assert_eq!(
-                count(&unfused, |op| matches!(op, OpKind::Binary(BinOp::Mul))),
-                1,
-                "{label}"
-            );
-            assert!(indexed_request(&unfused).epilogue.is_none(), "{label}");
         }
     }
 }
@@ -236,7 +216,7 @@ fn checkpoint_order_experts_plan_one_contraction_and_no_transpose() {
     for backend in backends() {
         for m in [1, 5, 160] {
             let label = format!("{backend:?} M={m}");
-            let program = program(&checkpoint_order(m, false), backend, false);
+            let program = program(&checkpoint_order(m, false), backend);
             assert_eq!(count(&program, is_indexed_head), 1, "{label}");
             assert_eq!(transposes(&program), 0, "{label}: a transpose dispatch ran");
             assert_eq!(
@@ -257,7 +237,7 @@ fn checkpoint_order_experts_plan_one_contraction_and_no_transpose() {
 #[test]
 fn a_transposed_weight_with_a_second_consumer_keeps_its_transpose() {
     for backend in backends() {
-        let program = program(&checkpoint_order(5, true), backend, false);
+        let program = program(&checkpoint_order(5, true), backend);
         assert_eq!(transposes(&program), 1, "{backend:?}");
         assert_eq!(
             indexed_request(&program).layout,
@@ -274,7 +254,7 @@ fn a_transposed_weight_with_a_second_consumer_keeps_its_transpose() {
 fn the_ekn_orientation_plans_the_plain_layout() {
     for backend in backends() {
         for m in [1, 5, 160] {
-            let program = program(&indexed(m, false), backend, false);
+            let program = program(&indexed(m, false), backend);
             assert_eq!(
                 indexed_request(&program).layout,
                 WeightLayout::Kn,
@@ -326,7 +306,7 @@ fn a_checkpoint_order_weight_under_the_gate_epilogue_plans_no_transpose() {
             let gate = b.constant("gate", TensorType::f32(vec![m]));
             let product = b.indexed_matmul(x, b.transpose(w, vec![0, 2, 1]), ids);
             let out = b.binary(BinOp::Mul, product, b.reshape(gate, vec![m, 1]));
-            let program = program(&b.finish(out), backend, false);
+            let program = program(&b.finish(out), backend);
             let label = format!("{backend:?} M={m}");
             assert_eq!(
                 count(&program, |op| matches!(
@@ -385,7 +365,7 @@ fn a_bf16_expert_stack_plans_the_packed_lane_without_a_widened_copy() {
                 [(false, false), (true, false), (true, true), (false, true)]
             {
                 let label = format!("{backend:?} M={m} nk={checkpoint_order} gate={gate}");
-                let program = program(&bf16_experts(m, checkpoint_order, gate), backend, false);
+                let program = program(&bf16_experts(m, checkpoint_order, gate), backend);
                 assert_eq!(count(&program, is_indexed_head), 1, "{label}");
                 assert_eq!(transposes(&program), 0, "{label}: a transpose dispatch ran");
                 assert_eq!(

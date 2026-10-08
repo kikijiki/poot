@@ -1,0 +1,140 @@
+---
+id: driver
+title: Models, Registry and the Driver
+sidebar_position: 3.5
+---
+
+# Models, Registry and the Driver
+
+Between a checkpoint on disk and the executor sit three pieces: the `Model` that traces a step, the
+`Registry` that names which families exist, and the `Driver` that turns a model and an executor into
+generation. None of them knows a backend, and the driver and the executor know no family.
+
+```text
+checkpoint dir or GGUF
+  -> Registry::resolve(config)        which family?   (before any weight is read)
+  -> FamilyEntry::build(config, weights) -> Box<dyn Model>
+  -> ModelHandle { model, weights, text codec }
+  -> Driver::new(handle, executor, options)
+       Model::trace(phase, step shape) -> Graph
+       + sampling suffix -> compile -> one executable, one entry per specialization
+       -> Executor::step per token
+```
+
+## The Model
+
+A family implements `poot_models::model::Model`:
+
+```rust
+pub trait Model: Send + Sync {
+    fn config(&self) -> &ModelConfig;     // vocab, eos ids, output kind, chat format
+    fn weights(&self) -> &WeightMap;      // which checkpoint tensors feed which typed role
+    fn trace(&self, phase: Phase, shape: StepShape)
+        -> Result<Graph<ValidationOutputs>, TraceError>;
+}
+```
+
+- `trace` builds the graph of one step. A `StepShape` is the semantic shape of that step: `rows`
+  sequences of `tokens` new tokens each over a cache of `capacity` positions, a KV layout (contiguous, or
+  paged over a pool of slots) and whether logits come back for the last token or all of them.
+- A `Phase` is `Prefill`, `Decode`, `PrefillEmbeds` (a prefill whose prompt carries caller-computed
+  embedding rows, for example image rows) or `Encode` (the whole input in one step, returning hidden states
+  or scores, for an embedding model, a reranker or a vision tower). Prefill and decode are one body: token
+  and position inputs are typed slots and positions are absolute, so a prefill is a step that continues from
+  a position.
+- A shape or phase a family cannot trace is a typed `TraceError`, never a panic. A routed model's graph also
+  declares its router witnesses as validation outputs, which the executor checks before any readback.
+- The graph holds consts named by the weight map, not by checkpoint tensor names. The checkpoint's spelling
+  lives in the family's name table; KV layout, batching and weight format are not the tracer's business.
+
+## Shared components
+
+Families are short because they share the pieces that are really shared (`poot_models::components`):
+embedding and head, norms, rotary embeddings, linear and packed projections, attention, gated and plain
+feed-forwards, the MoE router and experts, multi-head latent attention (MLA), Mamba2, linear-attention
+(GDN, KDA) and sparse-attention (DSA) mixers, and per-layer embeddings.
+
+`standard_stack` and `standard_layer` are the residual pair almost every decoder repeats: embed the tokens,
+run one `layer_scope` per layer, apply the final norm and the head; and per layer
+`x += mixer(norm(x)); x += ffn(norm(x))`. A family passes its own mixer and feed-forward as closures, so the
+tracer of a dense decoder is a call of these two functions plus its attention parameters. A norm placed after
+the block, sandwich norms, residual scales and a softcap are options of the component, not copies of it.
+
+Families fall into three groups by how much of their own they need:
+
+- **Dense decoders** are a `standard_stack` over the shared attention and feed-forward with their own options
+  (Qwen2/3, Llama, Mistral, Gemma 2/3, Granite, OLMo 2, Phi-3, SmolLM3, BLOOM, MPT).
+- **Mixture-of-experts and hybrids** pass a different mixer or feed-forward to `standard_layer`: the router and
+  experts, MLA, Mamba2, or a per-layer kind that chooses the mixer. Mamba2 and convolution state are ordinary
+  state pairs, so the driver carries them exactly like KV.
+- **Family-local topology** is a family's own layer or stack function over the same components, where the
+  structure is not shared with anyone else (DeepSeek-V4's compressed-attention stack, the Qwen3.8 sparse-attention
+  layer).
+
+Adding a model touches only the model: its config, its name table, its tracer, its fixture. If a family
+needs a change in the driver, the planner or an executor, that is a missing general capability, not a
+family-specific edit.
+
+## The Registry
+
+`Registry::builtin()` holds every shipped family. A `FamilyEntry` is data:
+
+```rust
+pub struct FamilyEntry {
+    pub family: FamilyKey,
+    pub keys: &'static [(ConfigSource, &'static str)],   // HF model_type, GGUF architecture
+    pub build: fn(&RawConfig, &WeightStore) -> Result<Box<dyn Model>, ModelError>,
+    pub fixture: fn() -> Fixture,                         // a tiny deterministic checkpoint
+    pub variants: &'static [FixtureVariant],              // option fixtures (an MoE, a packed form)
+}
+```
+
+`resolve` reads the config key (`model_type` for a Hugging Face directory, `general.architecture` for a GGUF)
+and finds the one family registered for it; every key resolves to exactly one family, and registering a
+duplicate is an error. A key no family holds is a typed `Unregistered` error, and the driver reports it as an
+unsupported model. The family is resolved before any weight is read, so a checkpoint nobody can run is turned
+down without loading its tensors.
+
+Every entry carries a fixture. That is what makes "support is the plan" computable for every family: the
+[feature matrix](../reference/feature-matrix.md) compiles each registered fixture's graphs for each backend,
+so a registered family appears there with no edit to the generator.
+
+## ModelHandle
+
+`ModelHandle::load(path, &registry, &options)` loads a checkpoint: it resolves the family, reads the
+safetensors or the GGUF into a `WeightStore`, builds the model, and builds the text services (tokenizer, chat
+template) from the model's own config. GPTQ, AWQ and FP8 linears are packed straight from their stored bytes
+and never decoded. The handle is shared by reference: one handle can back several drivers.
+
+## The Driver
+
+`Driver::new(handle, executor, options)` binds a handle to one executor. The options fix, for the driver's
+life, the two compile options (prefill and decode), the KV capacity, the prefill chunk size and the bound on
+what the driver may retain.
+
+- **One executable, several entries.** The driver loads the handle's weights into the executor once, as one
+  executable. Each specialization it needs is an entry on that executable, keyed by
+  `(Phase, StepShape, Head)`. Token ids, absolute positions, seeds and sampler parameters are bound inputs and
+  never specialize an entry; capacity sizes buffers and is part of the shape.
+- **Compile through the one entry point.** A step's graph comes from `Model::trace`, gets its sampling suffix
+  appended, and compiles through the shared compiler for the executor's own target. The driver does not branch
+  on a backend.
+- **A finite, bounded set of entries.** An entry once prepared is never replaced, a new entry over the entry
+  or retained-byte limit is a typed refusal before it is published, and `Driver::prepare` enumerates and warms
+  the admitted set up front, so a serving step compiles nothing.
+- **The sampling suffix.** Greedy and plain-temperature requests (including top-k, top-p and min-p) append a
+  sampling step to the decode graph itself (`Head::Sample`), so the host reads back a token id and a non-finite
+  flag, not the logits. A request with a logit bias or penalty, logprob recording, or a guided-decoding
+  constraint needs the full logits and takes the one host sampling path (`Head::Logits`).
+- **The serving surface.** The loop is `open`, `step`, `commit`, `release` over sequences and rows; `generate`
+  is that surface driven for one row with a sink for the tokens, and holds no feed, pick or layout logic of
+  its own. `encode` runs an `Encode` step, and `generate_with_embeds` scatters caller-computed rows into a
+  prompt (the vision-language path). Rows, frames and embeddings are bound by value every step, never baked
+  into a program.
+
+The CPU oracle is a test-side reference: tests evaluate a model's traced graph with `poot-eval` directly. It
+is not an executor the driver can choose.
+
+See [Tracing a model](./tracing.mdx) for how a step becomes a graph, [Execution](./execution.mdx) for the
+executor contract the driver drives, and the [feature matrix](../reference/feature-matrix.md) for what each
+family and weight format compiles to on each backend.

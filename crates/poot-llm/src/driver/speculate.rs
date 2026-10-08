@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use poot_executor::{ExecutableId, WeightSource};
+use poot_executor::ExecutableId;
 use poot_graph_plan::WeightFormats;
 
 use super::error::{DraftMismatch, DriverError, SpeculationRefusal, Unsupported};
@@ -260,7 +260,7 @@ impl Driver {
         let weights = Arc::new(handle.model().weights().clone());
         let exe = self
             .executor
-            .load_weights(handle.shared_store().clone(), WeightSource::Map(weights))?;
+            .load_weights(handle.shared_store().clone(), weights)?;
         self.speculation.draft = Some(DraftScope {
             handle,
             exe,
@@ -420,10 +420,11 @@ impl Driver {
             start: position,
             picks: usize::from(pick.is_some()),
             prefill: false,
+            embeds: false,
             spec: None,
             not_speculated: None,
         };
-        let key = self.step_entry(ModelRole::Draft, 1, 1, false, Some(head), None)?;
+        let key = self.step_entry(ModelRole::Draft, 1, 1, (false, false), Some(head), None)?;
         let mut idle = Sampler::greedy();
         let mut lanes = [Lane {
             seq,
@@ -457,7 +458,7 @@ impl Driver {
             ModelRole::Draft,
             prefilled.len(),
             width,
-            false,
+            (false, false),
             Some(Head::GREEDY),
             None,
         )?;
@@ -477,6 +478,7 @@ impl Driver {
                 start: plans[i].start,
                 picks: 0,
                 prefill: true,
+                embeds: false,
                 spec: None,
                 not_speculated: None,
             })

@@ -1,5 +1,6 @@
 //! Complete model-family graph compositions.
 
+pub mod bert;
 pub mod bloom;
 pub mod deepseek2;
 pub mod deepseek3;

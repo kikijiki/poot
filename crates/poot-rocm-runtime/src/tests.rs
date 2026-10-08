@@ -1,6 +1,7 @@
 use std::cell::Cell;
 
 use super::*;
+use crate::hsaco::await_below_one;
 
 #[test]
 fn hsa_queue_constants_match_the_public_abi() {
@@ -886,29 +887,27 @@ fn agent_enumeration_works() {
     }
 }
 
-/// Card 030: `vram_used_bytes`/`vram_budget_bytes` return plausible values on real gfx1151. Mirrors
-/// the wgpu receipt (`vram_used_bytes_reports_a_plausible_value`, `crates/poot-gpu/tests/graph.rs`)
-/// and the PTX receipt: budget >= used, both within a device-scale range for this box's ~96 GB-class
-/// unified-memory budget (generous bounds; the carveout varies by BIOS/GTT config). Skips cleanly if
-/// ROCm is not installed.
+/// Card 030: `vram_budget_bytes` returns a plausible value on real gfx1151: within a device-scale range
+/// for this box's ~96 GB-class unified-memory budget (generous bounds; the carveout varies by BIOS/GTT
+/// config). Skips cleanly if ROCm is not installed.
 #[test]
-fn vram_used_bytes_reports_a_plausible_value() {
+fn vram_budget_bytes_reports_a_plausible_value() {
     let ctx = match RocmContext::new() {
         Ok(ctx) => ctx,
         Err(RocmError::LibraryNotFound(msg)) => {
             tracing::info!(
-                "poot-rocm-runtime: SKIP vram_used_bytes_reports_a_plausible_value (no HSA \
+                "poot-rocm-runtime: SKIP vram_budget_bytes_reports_a_plausible_value (no HSA \
                  library): {msg}"
             );
             return;
         }
         Err(RocmError::NoGpuAgent) => {
             tracing::info!(
-                "poot-rocm-runtime: SKIP vram_used_bytes_reports_a_plausible_value (no GPU agent)"
+                "poot-rocm-runtime: SKIP vram_budget_bytes_reports_a_plausible_value (no GPU agent)"
             );
             return;
         }
-        Err(e) => panic!("vram_used_bytes_reports_a_plausible_value failed: {e}"),
+        Err(e) => panic!("vram_budget_bytes_reports_a_plausible_value failed: {e}"),
     };
 
     let budget = ctx
@@ -921,38 +920,6 @@ fn vram_used_bytes_reports_a_plausible_value() {
     assert!(
         budget > 256 * 1024 * 1024 && budget < 256u64 * 1024 * 1024 * 1024,
         "device VRAM budget implausible: {budget} bytes"
-    );
-
-    let used = ctx
-        .vram_used_bytes()
-        .expect("HSA_AMD_AGENT_INFO_MEMORY_AVAIL query should return a value on this device");
-    eprintln!(
-        "ROCm device VRAM used (budget - MEMORY_AVAIL): {:.1} MiB",
-        used as f64 / (1024.0 * 1024.0)
-    );
-    assert!(used <= budget, "VRAM used {used} > budget {budget}");
-
-    // Allocate a 64 MiB buffer and confirm `used` moves plausibly. On an APU the fine-grained system
-    // pool allocated from here is the same pool `HSA_AMD_AGENT_INFO_MEMORY_AVAIL` reports over. Other
-    // system activity also moves it, so this only checks the query is live, not an exact delta.
-    let before = used;
-    let elems = 16 * 1024 * 1024; // 16M f32 = 64 MiB
-    let _buf = ctx
-        .allocate_f32(elems, BufferRole::Activation)
-        .expect("allocate_f32(64 MiB) should succeed");
-    let after = ctx
-        .vram_used_bytes()
-        .expect("vram_used_bytes should still succeed after an allocation");
-    eprintln!(
-        "ROCm device VRAM used after a 64 MiB allocation: {:.1} MiB (was {:.1} MiB)",
-        after as f64 / (1024.0 * 1024.0),
-        before as f64 / (1024.0 * 1024.0)
-    );
-    // Not a strict >: a 96 GB-class shared pool absorbs 64 MiB within noise from co-resident
-    // activity, but the value must stay in the same plausible envelope.
-    assert!(
-        after <= budget,
-        "VRAM used {after} > budget {budget} after allocation"
     );
 }
 
@@ -1457,6 +1424,104 @@ fn wait_completion_bounded_wakes_when_signal_drops() {
         "wait returned after {elapsed:?}; expected to wake when the signal dropped (~{drop_after:?}), \
          not after a full 1s timeout_hint (blocked-wait regression)"
     );
+}
+
+/// A tiny completed DMA readback must not cost a blocked-wait hint. `hsa_signal_wait_scacquire` on
+/// this stack sleeps the full `timeout_hint` (1ms) even for a copy that finishes in microseconds, so
+/// the 72 validation-lane reads of a granite-3.0-1b-a400m decode step cost ~75ms of sleeping
+/// (POOT-1064). 200 four-byte downloads take >= 200ms through blocked waits; spinning on the signal
+/// finishes them in a few ms. Setting `COMPLETION_SPIN_WINDOW` to zero makes this assert fail.
+#[test]
+fn small_dma_readbacks_do_not_pay_the_blocked_wait_hint() {
+    let Some(ctx) = open_context_or_skip("small_dma_readbacks_do_not_pay_the_blocked_wait_hint")
+    else {
+        return;
+    };
+    let buffer = ctx.allocate_kernarg(4).expect("allocate");
+    let mut word = [0u8; 4];
+    const READS: u32 = 200;
+    let start = std::time::Instant::now();
+    for _ in 0..READS {
+        // SAFETY: `buffer` holds 4 bytes and `word` is writable for 4.
+        unsafe { ctx.dma_download(buffer.alloc.as_ptr(), word.as_mut_ptr(), word.len(), &[]) }
+            .expect("dma_download");
+    }
+    let per_read = start.elapsed() / READS;
+    assert!(
+        per_read < std::time::Duration::from_micros(500),
+        "a 4-byte DMA readback took {per_read:?} on average; a blocked wait sleeps its 1ms hint \
+         even when the copy has already finished"
+    );
+}
+
+/// The wait policy never reaches the blocked wait (which sleeps its whole hint on this stack) for a
+/// signal that completes inside the spin window, and does fall back to it, and time out, past it.
+/// Mutating `await_below_one` to call `blocked()` before polling makes the first assert fail.
+#[test]
+fn completion_wait_policy_spins_before_it_blocks() {
+    let window = std::time::Duration::from_millis(50);
+    let mut polls = 0;
+    let done = await_below_one(
+        std::time::Duration::from_secs(5),
+        window,
+        || {
+            polls += 1;
+            if polls < 4 { 1 } else { 0 }
+        },
+        || panic!("a signal that dropped inside the spin window must not reach the blocked wait"),
+    );
+    assert!(done);
+    assert_eq!(polls, 4);
+
+    // Past the window (zero here) the blocked wait is used, and its value decides.
+    let mut blocked_calls = 0;
+    let done = await_below_one(
+        std::time::Duration::from_secs(5),
+        std::time::Duration::ZERO,
+        || panic!("an expired spin window must not poll"),
+        || {
+            blocked_calls += 1;
+            if blocked_calls < 3 { 1 } else { 0 }
+        },
+    );
+    assert!(done);
+    assert_eq!(blocked_calls, 3);
+}
+
+/// A signal that never drops reports the timeout after the spin window and a few blocked waits, and a
+/// zero timeout does not spin. The blocked wait aborts the test past a call bound, so deleting the
+/// timeout check fails with this message instead of hanging.
+#[test]
+fn completion_wait_policy_times_out_on_a_signal_that_never_drops() {
+    let mut blocked_calls = 0u32;
+    let done = await_below_one(
+        std::time::Duration::from_millis(30),
+        std::time::Duration::from_millis(5),
+        || 1,
+        || {
+            blocked_calls += 1;
+            assert!(
+                blocked_calls < 2_000,
+                "the wait never timed out on a signal that does not drop"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            1
+        },
+    );
+    assert!(!done);
+    assert!(
+        blocked_calls >= 1,
+        "the blocked wait must run after the spin window"
+    );
+
+    // The window is clamped by the timeout: a zero timeout reads the signal zero times.
+    let done = await_below_one(
+        std::time::Duration::ZERO,
+        std::time::Duration::from_secs(60),
+        || panic!("a zero timeout must not spin"),
+        || 1,
+    );
+    assert!(!done);
 }
 
 /// Card 252 round 8: logs this box's `HSA_AGENT_INFO_QUEUE_MAX_SIZE` and whether
@@ -2315,13 +2380,12 @@ fn no_contract_unmarked_probe_matches_the_unfused_reference_on_amdgcn_today() {
 /// level - `RocmBuffer::pool()`, the per-allocation record `Pool::for_role` set at allocation time and
 /// every role-aware write/read (`upload_bytes_role_aware`/`download_bytes_role_aware`) dispatches on.
 ///
-/// An independent hardware cross-check was tried first (`vram_used_bytes`, HSA's device-wide
-/// `MEMORY_AVAIL` query) and found non-discriminating on this box: Strix Halo is a unified-memory APU
-/// where both pools alias the same physical GTT, so a `Fine`-pool allocation moves `MEMORY_AVAIL` by
-/// the same amount a `Coarse`-pool one would (measured: a 64 MiB `Activation` allocation moved it by
-/// the full 64 MiB even with the mutation below applied, routing `Activation` to `Fine`) - consistent
-/// with `RocmContext::vram_used_bytes`'s own doc ("do not use it as a system-wide free-memory signal
-/// on a shared unified-memory box"). `pool()` is this crate's own runtime-level record of which
+/// An independent hardware cross-check was tried first (HSA's device-wide `MEMORY_AVAIL` query) and
+/// found non-discriminating on this box: Strix Halo is a unified-memory APU where both pools alias the
+/// same physical GTT, so a `Fine`-pool allocation moves `MEMORY_AVAIL` by the same amount a
+/// `Coarse`-pool one would (measured: a 64 MiB `Activation` allocation moved it by the full 64 MiB even
+/// with the mutation below applied, routing `Activation` to `Fine`), which is why no live "used" query
+/// survives. `pool()` is this crate's own runtime-level record of which
 /// allocator a buffer actually used, independent of `BufferRole`'s pool-agnostic byte counter in
 /// `MemoryCounters` (SC-004/SC-005's counters stay correct regardless of pool).
 ///

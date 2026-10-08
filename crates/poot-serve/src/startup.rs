@@ -1,16 +1,21 @@
 //! Process configuration, model startup, listener orchestration, and graceful shutdown.
 
-use std::collections::HashMap;
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
-use poot_llm::Runner;
-use poot_llm::encoder::{BertKind, CrossEncoderRunner, EncoderRunner, bert_kind};
+use anyhow::{Context, Result};
+use clap::Parser;
+use poot_llm::driver::{BackendChoice, LoadOptions, ModelHandle, open_executor};
+use poot_models::registry::Registry;
 
 use crate::admin::{LoraAdminPolicy, LoraAdminPolicyMode};
+use crate::batch::engine::{DriverEngine, run_engine_thread};
+use crate::engine_plan::{
+    EngineArgs, EngineHealth, EnginePlan, EngineState, Started, StartupError, device_budget,
+};
 use crate::http::{
     ConnGuard, RateLimiter, configure_response_writes, handle, max_connections,
     request_read_timeout, response_write_timeout,
@@ -20,10 +25,7 @@ use crate::lifecycle::{
     reset_drain_cancellation, server_drain_timeout,
 };
 use crate::metrics::{CacheMetrics, Histogram, Metrics, SpeculativeMetrics};
-use crate::types::{Backend, SHUTDOWN};
-
-/// The options `poot-serve` takes; each is followed by a value.
-const KNOWN_FLAGS: [&str; 2] = ["--lora-adapter", "--lora-pool-capacity"];
+use crate::types::{Backend, Job, SHUTDOWN};
 
 /// No model path was given and `POOT_MODELS_DIR` is unset or empty.
 #[derive(Debug, thiserror::Error)]
@@ -34,6 +36,39 @@ pub(crate) struct ModelDirUnset;
 
 /// The model directory under `POOT_MODELS_DIR` used when no path is given.
 const DEFAULT_MODEL: &str = "qwen2.5-0.5b";
+
+/// The command line. The LoRA flags of the earlier serve modes stay refused (clap rejects an unknown
+/// option) until the typed serve configuration (POOT-590) replaces this parser.
+#[derive(Debug, Parser)]
+#[command(
+    name = "poot-serve",
+    about = "An OpenAI-compatible server over the poot driver"
+)]
+struct Cli {
+    /// Model directory or GGUF file; default: `qwen2.5-0.5b` under `POOT_MODELS_DIR`.
+    model: Option<String>,
+    /// Listen address.
+    #[arg(default_value = "127.0.0.1:8080")]
+    addr: String,
+    /// The device backend: wgpu, rocm, ptx, vulkan, or auto (PTX if a CUDA device opens, else ROCm if an
+    /// HSA GPU agent opens, else wgpu). A model the chosen backend refuses fails startup; no other
+    /// backend is tried.
+    #[arg(long, default_value = "auto", value_parser = parse_backend)]
+    backend: BackendChoice,
+}
+
+fn parse_backend(name: &str) -> Result<BackendChoice, String> {
+    match name {
+        "wgpu" => Ok(BackendChoice::Wgpu),
+        "rocm" => Ok(BackendChoice::Rocm),
+        "ptx" => Ok(BackendChoice::Ptx),
+        "vulkan" => Ok(BackendChoice::Vulkan),
+        "auto" => Ok(BackendChoice::Auto),
+        other => Err(format!(
+            "unknown backend {other:?}: expected wgpu, rocm, ptx, vulkan or auto"
+        )),
+    }
+}
 
 /// The model path: the first positional argument, else `DEFAULT_MODEL` under `POOT_MODELS_DIR`.
 fn model_dir_or_env(positional: Option<&String>) -> Result<String, ModelDirUnset> {
@@ -54,55 +89,29 @@ pub(crate) extern "C" fn sigint_handler(_: libc::c_int) {
     SHUTDOWN.store(true, Ordering::SeqCst);
 }
 
-/// Parse one `--lora-adapter NAME=DIR` flag value into `(name, dir)`. `NAME` is the pool name a request's
-/// `lora_adapter` field selects; `DIR` is a PEFT adapter directory. Splits on the first `=` only.
-pub(crate) fn parse_lora_adapter_flag(raw: &str) -> Result<(String, String)> {
-    let (name, dir) = raw
-        .split_once('=')
-        .ok_or_else(|| anyhow!("--lora-adapter {raw:?}: expected NAME=DIR"))?;
-    if name.is_empty() || dir.is_empty() {
-        bail!("--lora-adapter {raw:?}: NAME and DIR must both be non-empty");
-    }
-    Ok((name.to_string(), dir.to_string()))
+/// Served model name: the model-dir basename, or the GGUF file stem; echoed in responses and /v1/models.
+fn served_model_name(model_dir: &str) -> String {
+    std::path::Path::new(model_dir)
+        .file_stem()
+        .filter(|_| model_dir.ends_with(".gguf"))
+        .or_else(|| std::path::Path::new(model_dir).file_name())
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "poot-model".to_string())
 }
 
-/// Parse `--lora-pool-capacity N`: the total number of pool slots to provision at startup, including the
-/// `--lora-adapter` flags. Extra slots are registered as empty placeholders so a later
-/// `Runner::hot_load_lora_adapter*` can take one over without re-tracing the serving graph (its stacked-const
-/// slot count is fixed at trace time). `None` means no headroom: hot-load can replace an existing adapter's
-/// weights but cannot add a new name. `N` must be at least the number of `--lora-adapter` flags.
-pub(crate) fn parse_lora_pool_capacity_flag(all_args: &[String]) -> Result<Option<usize>> {
-    let Some(raw) = all_args.windows(2).find_map(|w| {
-        if w[0] == "--lora-pool-capacity" {
-            Some(w[1].clone())
-        } else {
-            None
-        }
-    }) else {
-        return Ok(None);
-    };
-    let n: usize = raw
-        .parse()
-        .map_err(|_| anyhow!("--lora-pool-capacity {raw:?}: expected a non-negative integer"))?;
-    Ok(Some(n))
-}
-
-pub(crate) fn run() -> Result<()> {
-    reset_drain_cancellation();
-    SHUTDOWN.store(false, Ordering::SeqCst);
-    // RUST_LOG controls verbosity (default "info"). ANSI colors only when stdout is a terminal, so piped
-    // logs (supervisors, containers, test harnesses) stay greppable.
+/// RUST_LOG controls verbosity (default "info"). ANSI colors only when stdout is a terminal, so piped
+/// logs (supervisors, containers, test harnesses) stay greppable.
+fn init_logging() {
     tracing_subscriber::fmt()
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+}
 
-    // Validate transport config before model detection or any loader call, so a bad value fails fast.
-    let write_timeout = response_write_timeout()?;
-
-    // SIGINT/SIGTERM set SHUTDOWN so the accept loop exits.
+/// SIGINT/SIGTERM set SHUTDOWN so the accept loop exits.
+fn install_signal_handlers() {
     unsafe {
         libc::signal(
             libc::SIGINT,
@@ -113,163 +122,109 @@ pub(crate) fn run() -> Result<()> {
             sigint_handler as *const () as libc::sighandler_t,
         );
     }
+}
 
-    let all_args: Vec<String> = std::env::args().collect();
-    // The only options are the LoRA pool flags. A flag of a removed serve mode (`--backend`,
-    // `--tensor-parallel`, `--profile`) is refused by name: a valued one would otherwise leave its
-    // value behind as the model directory.
-    if let Some(flag) = all_args
-        .iter()
-        .skip(1)
-        .find(|a| a.starts_with("--") && !KNOWN_FLAGS.contains(&a.as_str()))
-    {
-        bail!(
-            "unknown option {flag}: the options are {}",
-            KNOWN_FLAGS.join(", ")
-        );
-    }
-    // Repeatable `--lora-adapter NAME=DIR` flags, validated before any model loads.
-    let lora_adapter_flags: Vec<(String, String)> = all_args
-        .windows(2)
-        .filter(|w| w[0] == "--lora-adapter")
-        .map(|w| parse_lora_adapter_flag(&w[1]))
-        .collect::<Result<Vec<_>>>()?;
-    // Optional reserved pool capacity for later `hot_load_lora_adapter*` calls.
-    let lora_pool_capacity_flag = parse_lora_pool_capacity_flag(&all_args)?;
-    if let Some(cap) = lora_pool_capacity_flag
-        && cap < lora_adapter_flags.len()
-    {
-        bail!(
-            "--lora-pool-capacity {cap} is smaller than the {} --lora-adapter flag(s) given - it \
-             must be at least that many",
-            lora_adapter_flags.len()
-        );
-    }
-    // Positional args (model dir, then addr) plus flags anywhere. Valued flags consume the following argv
-    // entry, which must be skipped or it leaks into `positional`.
-    let positional: Vec<String> = {
-        let mut out = Vec::new();
-        let mut skip = false;
-        for a in all_args.into_iter().skip(1) {
-            if skip {
-                skip = false;
-                continue;
-            }
-            if a.starts_with("--") {
-                skip = true;
-                continue;
-            }
-            out.push(a);
-        }
-        out
-    };
+/// Load the checkpoint. Every failure is a startup error, and `run` has not bound the listener yet.
+fn load_model(model_dir: &str) -> Result<Arc<ModelHandle>> {
+    tracing::info!(model_dir, "loading model");
+    let model = Arc::new(
+        ModelHandle::load(
+            std::path::Path::new(model_dir),
+            &Registry::builtin().context("build the family registry")?,
+            &LoadOptions::default(),
+        )
+        .context("load model")?,
+    );
+    let config = model.config();
+    tracing::info!(
+        family = %config.family,
+        vocab = config.vocab,
+        max_positions = config.max_positions,
+        "model config"
+    );
+    Ok(model)
+}
 
-    let model_dir = model_dir_or_env(positional.first())?;
-    let addr = positional
-        .get(1)
-        .cloned()
-        .unwrap_or_else(|| "127.0.0.1:8080".to_string());
-
-    // Served model name: the model-dir basename, or the GGUF file stem; echoed in responses and /v1/models.
-    let model_name = std::path::Path::new(&model_dir)
-        .file_stem()
-        .filter(|_| model_dir.ends_with(".gguf"))
-        .or_else(|| std::path::Path::new(&model_dir).file_name())
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "poot-model".to_string());
-
-    // Auto-detect the model kind from config.json: BERT encoder and cross-encoder on CPU eval; anything
-    // else loads as a causal decoder `Runner`. No generation engine is started for a decoder: the
-    // generation routes refuse with a typed 503 until the one serving loop over the driver lands
-    // (POOT-753). A registered family runs only on the driver, so `Runner::load*` refuses it with the
-    // typed `RunnerError::RegisteredFamily` and the server does not start.
-    let mut gpu_weight_bytes_at_load: u64 = 0;
-    let backend: Backend = match bert_kind(&model_dir) {
-        Some(BertKind::CrossEncoder) => {
-            tracing::info!(
-                model_dir,
-                "loading cross-encoder reranker (BertForSequenceClassification)"
+/// Start the engine thread and wait for it to report its plan. The device is opened, the workload fitted
+/// and prepared, and the loop run on that one thread: an executor is not `Send`, so the driver cannot be
+/// built elsewhere and moved in. A startup failure comes back here as the error, before the listener
+/// binds; a started engine returns its plan and the metrics its loop updates.
+fn spawn_engine(
+    workers: &mut WorkerRegistry,
+    model: Arc<ModelHandle>,
+    backend: BackendChoice,
+    model_name: String,
+    health: &EngineHealth,
+    jobs: mpsc::Receiver<Job>,
+) -> Result<(EnginePlan, Arc<Metrics>)> {
+    type Startup = Result<(EnginePlan, Arc<Metrics>), StartupError>;
+    let (started_tx, started_rx) = mpsc::channel::<Startup>();
+    let health = health.clone();
+    workers
+        .spawn("poot-engine", move || {
+            let started = EnginePlan::build(
+                &EngineArgs::new(backend),
+                &model,
+                open_executor,
+                device_budget,
+                &health,
             );
-            let ce = CrossEncoderRunner::load(&model_dir).context("load cross-encoder model")?;
-            tracing::info!(
-                "cross-encoder loaded (/v1/rerank only; embeddings + generation return 400)"
-            );
-            Backend::CrossEncoder(Arc::new(ce))
-        }
-        Some(BertKind::Embedding) => {
-            tracing::info!(model_dir, "loading encoder embedding model (BERT-class)");
-            let enc = EncoderRunner::load(&model_dir).context("load encoder model")?;
-            tracing::info!(
-                dim = enc.dim(),
-                "encoder model loaded (embeddings + rerank only; generation endpoints return 400)"
-            );
-            Backend::Encoder(Arc::new(enc))
-        }
-        None => {
-            // A `.gguf` path loads a self-contained GGUF (config, quantized weights, tokenizer); otherwise the path is
-            // a safetensors model directory.
-            let mut runner = if model_dir.ends_with(".gguf") {
-                tracing::info!(model_dir, "loading model (GGUF)");
-                Runner::load_gguf(&model_dir).context("load gguf model")?
-            } else {
-                tracing::info!(model_dir, "loading model (safetensors)");
-                Runner::load(&model_dir).context("load model")?
+            let Started { plan, driver } = match started {
+                Ok(started) => started,
+                Err(error) => {
+                    let _ = started_tx.send(Err(error));
+                    return;
+                }
             };
             tracing::info!(
-                hidden = runner.config().hidden,
-                layers = runner.config().layers,
-                vocab = runner.config().vocab,
-                "model config"
+                backend = plan.backend_label(),
+                device = ?plan.device,
+                model = plan.model,
+                rows = plan.rows(),
+                workload = ?plan.workload,
+                planned_bytes = ?plan.budget.planned_bytes,
+                discovered_bytes = ?plan.budget.discovered_bytes,
+                available_bytes = ?plan.budget.available_bytes,
+                "engine plan"
             );
-            // Register every `--lora-adapter NAME=DIR` flag into the Runner's multi-adapter pool, then rebind once: the
-            // tracer's stacked constants need real values in `Runner::weights` before `batch_engine_loop` traces the
-            // LoRA-batched graph (see `Runner::rebind_lora_pool`). `register_lora_adapter_dir` enforces the q_proj/v_proj
-            // and architecture gate, so a bad adapter fails at startup.
-            for (name, dir) in &lora_adapter_flags {
-                runner
-                    .register_lora_adapter_dir(name, dir)
-                    .with_context(|| format!("register --lora-adapter {name}={dir}"))?;
-                tracing::info!(name, dir, "registered lora adapter");
+            let metrics = Arc::new(new_metrics(model_name, &plan, &driver.live_role_bytes()));
+            if started_tx.send(Ok((plan, Arc::clone(&metrics)))).is_err() {
+                return;
             }
-            // Reserve empty (all-zero, target-nothing) placeholder slots up to `--lora-pool-capacity` via
-            // `register_lora_adapter`. They occupy real pool slots from the start, so the batched-pool graph traces with
-            // room to spare and a later `Runner::hot_load_lora_adapter*` can take one over without a re-trace.
-            if let Some(cap) = lora_pool_capacity_flag {
-                for i in lora_adapter_flags.len()..cap {
-                    let placeholder = poot_load::lora::LoraAdapter {
-                        config: poot_load::lora::LoraAdapterConfig {
-                            r: 0,
-                            lora_alpha: 0.0,
-                            target_modules: Vec::new(),
-                            use_rslora: false,
-                        },
-                        weights: HashMap::new(),
-                    };
-                    runner
-                        .register_lora_adapter(format!("__reserved_{i}"), placeholder)
-                        .context("register reserved lora pool placeholder slot")?;
-                }
-                tracing::info!(
-                    capacity = cap,
-                    startup_adapters = lora_adapter_flags.len(),
-                    "reserved lora pool capacity for future hot-loads"
-                );
-            }
-            if !lora_adapter_flags.is_empty() {
-                runner
-                    .rebind_lora_pool()
-                    .context("rebind lora adapter pool")?;
-            }
-            tracing::info!(
-                "decoder loaded (no generation engine: /v1/completions and /v1/chat/completions \
-                 return 503; embeddings, rerank and LoRA administration are served)"
-            );
-            gpu_weight_bytes_at_load = runner.weight_bytes() as u64;
-            Backend::Decoder(Arc::new(runner))
-        }
-    };
+            let engine =
+                run_engine_thread(DriverEngine::new(driver, model), jobs, &metrics, &health);
+            retain_dead_engine(engine, &health);
+        })
+        .context("spawn the engine thread")?;
+    started_rx
+        .recv()
+        .context("the engine thread ended during startup")?
+        .context("start the engine")
+}
 
-    let metrics = Arc::new(Metrics {
+/// A dead engine's device buffers stay owned until the process shuts down: the device may still be
+/// executing work whose owners a drop would free.
+fn retain_dead_engine(engine: DriverEngine, health: &EngineHealth) {
+    if matches!(health.state(), EngineState::Dead(_)) {
+        while !SHUTDOWN.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    drop(engine);
+}
+
+fn new_metrics(
+    model_name: String,
+    plan: &EnginePlan,
+    driver_bytes: &[(poot_executor::BufferRole, u64)],
+) -> Metrics {
+    let live = |role| {
+        driver_bytes
+            .iter()
+            .find(|(candidate, _)| *candidate == role)
+            .map_or(0, |&(_, bytes)| bytes)
+    };
+    Metrics {
         started: Instant::now(),
         requests: AtomicU64::new(0),
         completion_tokens: AtomicU64::new(0),
@@ -277,28 +232,60 @@ pub(crate) fn run() -> Result<()> {
         requests_completed: AtomicU64::new(0),
         requests_cancelled: AtomicU64::new(0),
         requests_errored: AtomicU64::new(0),
-        requests_preempted: AtomicU64::new(0),
         inflight: AtomicU64::new(0),
         ttft: Histogram::new(),
         itl: Histogram::new(),
         e2e: Histogram::new(),
         queue_wait: Histogram::new(),
         batch_size: AtomicU64::new(0),
-        // No engine: no decode slots and no device.
-        slot_capacity: 0,
-        on_gpu: false,
-        profile: false,
+        slot_capacity: plan.rows() as u64,
+        backend: plan.backend_label(),
         model: model_name,
         sys: Mutex::new(sysinfo::System::new()),
         cache: CacheMetrics {
-            gpu_weight_bytes: AtomicU64::new(gpu_weight_bytes_at_load),
+            gpu_weight_bytes: AtomicU64::new(live(poot_executor::BufferRole::Weight)),
+            gpu_kv_bytes: AtomicU64::new(live(poot_executor::BufferRole::State)),
+            kv_total_blocks: AtomicU64::new(
+                plan.caps.as_ref().map_or(0, |caps| caps.kv_blocks as u64),
+            ),
+            gpu_vram_total_bytes: AtomicU64::new(plan.budget.available_bytes.unwrap_or(0)),
             ..CacheMetrics::default()
         },
         speculative: SpeculativeMetrics::default(),
-    });
+    }
+}
 
-    let backend = Arc::new(backend);
+pub(crate) fn run() -> Result<()> {
+    reset_drain_cancellation();
+    SHUTDOWN.store(false, Ordering::SeqCst);
+    init_logging();
+
+    // Validate transport config before model detection or any loader call, so a bad value fails fast.
+    let write_timeout = response_write_timeout()?;
+    install_signal_handlers();
+
+    let cli = Cli::parse();
+    let model_dir = model_dir_or_env(cli.model.as_ref())?;
+    let addr = cli.addr;
+    let model_name = served_model_name(&model_dir);
+
+    // The engine plan decides the backend, fits the workload to the device and prepares it. A refused
+    // model or an unopenable device is a typed startup error and the listener never binds. The prepared
+    // driver moves to the engine thread, which runs the one scheduling loop over it; the embeddings,
+    // rerank and LoRA routes refuse with a typed 503 until POOT-589.
+    let health = EngineHealth::starting();
+    let model = load_model(&model_dir)?;
     let mut workers = WorkerRegistry::new();
+    let (job_tx, job_rx) = mpsc::channel::<Job>();
+    let (plan, metrics) = spawn_engine(
+        &mut workers,
+        Arc::clone(&model),
+        cli.backend,
+        model_name,
+        &health,
+        job_rx,
+    )?;
+    let backend = Arc::new(Backend::for_workload(model, &plan.workload));
 
     let limiter = Arc::new(RateLimiter::from_env());
     if limiter.rpm > 0 {
@@ -334,6 +321,7 @@ pub(crate) fn run() -> Result<()> {
         workers.reap_ready();
         if SHUTDOWN.load(Ordering::SeqCst) {
             tracing::info!("shutting down (signal received)");
+            health.begin_draining();
             break;
         }
         match listener.accept() {
@@ -344,6 +332,7 @@ pub(crate) fn run() -> Result<()> {
                 if SHUTDOWN.load(Ordering::SeqCst) {
                     drop(s);
                     tracing::info!("shutting down (signal received during accept)");
+                    health.begin_draining();
                     break;
                 }
                 // Cap live connections: one thread per connection with no cap lets a client exhaust thread/memory limits
@@ -363,6 +352,8 @@ pub(crate) fn run() -> Result<()> {
                     continue;
                 }
                 let backend = Arc::clone(&backend);
+                let job_tx = job_tx.clone();
+                let health = health.clone();
                 let metrics = Arc::clone(&metrics);
                 let limiter = Arc::clone(&limiter);
                 let lora_admin_policy = Arc::clone(&lora_admin_policy);
@@ -371,9 +362,15 @@ pub(crate) fn run() -> Result<()> {
                 // One thread per connection: parse and shape concurrently.
                 if let Err(e) = workers.spawn_connection("poot-conn", s, move |s| {
                     let _guard = ConnGuard(conn_counter);
-                    if let Err(e) =
-                        handle(s, None, &backend, &metrics, &limiter, &lora_admin_policy)
-                    {
+                    if let Err(e) = handle(
+                        s,
+                        Some(&job_tx),
+                        &health,
+                        &backend,
+                        &metrics,
+                        &limiter,
+                        &lora_admin_policy,
+                    ) {
                         tracing::error!(error = format!("{e:#}"), "request error");
                     }
                 }) {
@@ -403,8 +400,10 @@ pub(crate) fn run() -> Result<()> {
         );
     }
 
-    // Connection-owned Backend clones are gone after graceful completion or cancellation; drop main's owner.
+    // Connection-owned Backend and job-queue clones are gone after graceful completion or cancellation;
+    // dropping main's owners closes the queue, and the engine thread ends once its work is done.
     drop(backend);
+    drop(job_tx);
 
     if graceful {
         graceful = workers.wait_for_all_until(graceful_deadline);
@@ -429,4 +428,25 @@ pub(crate) fn run() -> Result<()> {
     }
     tracing::info!(graceful, "server stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every backend name the flag documents parses to its choice, and nothing else does.
+    #[test]
+    fn parse_backend_accepts_each_documented_name_and_rejects_others() {
+        for (name, choice) in [
+            ("wgpu", BackendChoice::Wgpu),
+            ("rocm", BackendChoice::Rocm),
+            ("ptx", BackendChoice::Ptx),
+            ("vulkan", BackendChoice::Vulkan),
+            ("auto", BackendChoice::Auto),
+        ] {
+            assert_eq!(parse_backend(name), Ok(choice));
+        }
+        assert!(parse_backend("cuda").is_err());
+        assert!(parse_backend("Rocm").is_err());
+    }
 }

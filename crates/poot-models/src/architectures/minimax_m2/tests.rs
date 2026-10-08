@@ -530,10 +530,7 @@ fn bound_step(
     .unwrap()
 }
 
-const REPLAY: CompileOptions = CompileOptions {
-    execution: Submission::Replay,
-    limits: CompileLimits::STANDARD,
-};
+const REPLAY: CompileOptions = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
 
 /// SC-006 (compile half): the decode and the prefill graphs compile for the wgpu, PTX and ROCm
 /// targets. Mutation: skip the BF16-retyping step `compile` runs for the target
@@ -601,14 +598,19 @@ fn a_packed_store_maps_every_expert_as_its_own_weight() {
     let packed = model
         .weights()
         .iter()
-        .filter(|(id, _, _)| {
+        .filter(|(id, _, handle)| {
             matches!(
                 id.role,
-                poot_quant::weights::WeightRole::Moe(poot_quant::weights::MoeRole::Expert(..))
-            )
+                poot_quant::weights::WeightRole::Moe(poot_quant::weights::MoeRole::Stack(..))
+            ) && matches!(handle.format, poot_quant::weights::HandleFormat::Packed(_))
+                && handle.shape[0] == 8
         })
         .count();
-    assert_eq!(packed, 2 * 3 * 8, "layers x projections x experts");
+    assert_eq!(
+        packed,
+        2 * 3,
+        "layers x projections: one packed stack of 8 experts each"
+    );
 }
 
 /// The reference's greedy decode of `prompt`: `new` tokens, each with its log-probability and the

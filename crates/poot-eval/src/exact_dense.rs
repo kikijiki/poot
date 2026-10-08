@@ -166,6 +166,9 @@ fn reads_bf16_view<V: ValidationChannel>(g: &Graph<V>, eqn: &poot_graph_ir::Eqn)
             eqn.op,
             OpKind::DenseContraction {
                 weight: DType::BF16
+            } | OpKind::GroupedDenseContraction {
+                weight: DType::BF16,
+                ..
             } | OpKind::DenseRowGather {
                 source: DType::BF16
             }

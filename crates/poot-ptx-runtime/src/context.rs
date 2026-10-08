@@ -126,6 +126,7 @@ fn caps_from_attributes(total_memory: u64, attrs: &CudaAttributes) -> poot_targe
         // A device's miscompiles are the target family's known facts, not something CUDA reports.
         known_miscompiles: poot_target::DeviceCaps::ptx_default().known_miscompiles,
         compute_units: attrs.multiprocessor_count,
+        memory_budget_bytes: Some(total_memory),
     }
 }
 
@@ -358,18 +359,14 @@ impl PtxContext {
         Ok(result::mem_get_info()?)
     }
 
-    /// Device-wide VRAM in use (bytes): `total - free` from `cuMemGetInfo`, a driver-only device metric (no
-    /// NVML/nvidia-smi), the CUDA analogue of `poot-runtime::Context::vram_used_bytes`'s Vulkan
-    /// `VK_EXT_memory_budget` query (card 030). Device-wide, not per-process, so it reflects memory pressure
-    /// rather than poot's own allocation gauges. `None` if the driver call fails (e.g. no context bound). One
-    /// driver call, cheap enough per scrape.
-    pub fn vram_used_bytes(&self) -> Option<u64> {
-        let (free, total) = self.mem_info().ok()?;
-        Some(total.saturating_sub(free) as u64)
+    /// Device memory the driver reports free right now (bytes), `cuMemGetInfo`'s `free`: other
+    /// processes' allocations since the context opened are out of it. `None` if the driver call fails.
+    pub fn vram_free_bytes(&self) -> Option<u64> {
+        let (free, _) = self.mem_info().ok()?;
+        Some(free as u64)
     }
 
-    /// Total device memory visible to this context (bytes), from `cuMemGetInfo`. Headroom is
-    /// `vram_budget_bytes - vram_used_bytes` ([`Self::vram_used_bytes`]). `None` if the driver call fails.
+    /// Total device memory visible to this context (bytes), from `cuMemGetInfo`. `None` if the driver call fails.
     pub fn vram_budget_bytes(&self) -> Option<u64> {
         let (_, total) = self.mem_info().ok()?;
         Some(total as u64)
@@ -797,20 +794,12 @@ mod caps_tests {
             })
         );
         assert_eq!(caps.compute_units, 99);
-        assert_eq!(caps.tensor_core, TensorCoreSupport::NvidiaWmma16x16x16Sm80);
-    }
-
-    /// The routed-expert hang is a known miscompile of the PTX target family, so a live device's caps
-    /// carry it for `compile` to read (the family test that chose the guard is gone). Mutation: build
-    /// the caps with `KnownMiscompiles::default()`; this row goes red.
-    #[test]
-    fn a_live_device_carries_the_ptx_target_miscompile_facts() {
-        let caps = caps_from_attributes(1, &sentinel(9));
         assert_eq!(
-            caps.known_miscompiles,
-            poot_target::DeviceCaps::ptx_default().known_miscompiles
+            caps.memory_budget_bytes,
+            Some(123_456),
+            "the device's total memory"
         );
-        assert!(caps.known_miscompiles.routed_expert_tiling_hang);
+        assert_eq!(caps.tensor_core, TensorCoreSupport::NvidiaWmma16x16x16Sm80);
     }
 
     /// A pre-Ampere device is a confirmed absence of the bf16 fragments poot's kernels use.

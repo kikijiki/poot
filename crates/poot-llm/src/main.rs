@@ -16,11 +16,11 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use poot_graph_plan::{CompileLimits, CompileOptions, Submission};
-use poot_llm::GenerationControl;
 use poot_llm::driver::{
     BackendChoice, Driver, DriverOptions, GenerateRequest, ModelHandle, PreparedSetLimits,
     open_executor,
 };
+use poot_llm::{GenerationControl, Sampler};
 use poot_models::registry::Registry;
 
 /// The value after a `--name` flag, if present (e.g. `--backend rocm`).
@@ -67,12 +67,9 @@ fn generate_on_driver(
         ?choice,
         "model config (driver)"
     );
-    let compile = CompileOptions {
-        execution: Submission::Replay,
-        limits: CompileLimits::STANDARD,
-    };
+    let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
     let options = DriverOptions {
-        prefill: compile,
+        prefill: compile.clone(),
         decode: compile,
         capacity,
         prefill_chunk: NonZeroUsize::new(chunk).expect("a granule multiple is nonzero"),

@@ -208,8 +208,8 @@ fn emit_e2m1(e: &mut Emit, bits: Local) -> Local {
 }
 
 /// OCP E8M0 to f32 (`scalar::e8m0_to_f32`): `2^(byte-127)`, `0x00` the one subnormal case. No `0xff`
-/// (NaN) branch: the admitted domain is `0..=254` (dquant.md D2/D4; the NaN detector is
-/// `Materialize`, not this decoder).
+/// (NaN) branch: the admitted domain is `0..=254` (dquant.md D2/D4; the NaN detector is the
+/// payload check at load, not this decoder).
 fn emit_e8m0(e: &mut Emit, bits: Local) -> Local {
     let is_zero = bin(e, Ty::Bool, BinOp::Eq, copy(bits), c32(0));
     let normal_bits = bin(e, Ty::U32, BinOp::Shl, copy(bits), c32(23));

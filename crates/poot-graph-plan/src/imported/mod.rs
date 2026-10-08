@@ -213,8 +213,6 @@ pub enum ImportedKernel {
     // contraction.rs
     GemvCoalesced,
     GemvBatchedCoalesced,
-    GemvCoalescedBf16,
-    GemvBatchedCoalescedBf16,
     TiledGemm,
     TiledGemmBatched,
     // packed.rs
@@ -258,7 +256,26 @@ pub(crate) enum SerialLoop {
     /// One thread per output element loops over the contraction depth K, the first operand's last
     /// dimension.
     ContractionDepth,
+    /// One workgroup of [`SAMPLER_LANES`] lanes per row of a `[rows, vocab]` logits operand; each lane
+    /// strides the row's vocabulary `passes` times (a reduction pass, a bisection iteration, the final
+    /// perturbed argmax), so a lane runs `passes * ceil(vocab / SAMPLER_LANES)` dependent steps. The
+    /// output is `[rows, 2]`: `rows` is half its element count. The formula omits lane 0's cross-lane
+    /// reduce (`SAMPLER_LANES` steps per pass), negligible against `ceil(vocab / SAMPLER_LANES)`.
+    RowVocab { passes: u64 },
 }
+
+/// The lanes of the one workgroup each sampler body runs per row (`W` in `pootc/kernels/sampling/*.rs`).
+pub(crate) const SAMPLER_LANES: u64 = 64;
+
+/// Vocabulary passes of each `SampleToken` body: the greedy argmax scans once; Gumbel scans for the finite
+/// range, then for the perturbed argmax; the truncated rule adds a 30-step top-k bisection, each step a
+/// scan; top-p adds a sum scan and a second 30-step bisection. `a_sampling_declaration_matches_the_loops_of_its_body`
+/// derives the count from each body's control flow and fails when a declaration drifts from it.
+const BISECTION_STEPS: u64 = 30;
+const ARGMAX_PASSES: u64 = 1;
+const GUMBEL_PASSES: u64 = 2;
+const TRUNCATED_GUMBEL_PASSES: u64 = GUMBEL_PASSES + BISECTION_STEPS;
+const TOPP_GUMBEL_PASSES: u64 = TRUNCATED_GUMBEL_PASSES + 1 + BISECTION_STEPS;
 
 impl ImportedNeeds {
     const NONE: Self = Self::serial(SerialLoop::None);
@@ -279,14 +296,30 @@ impl ImportedKernel {
             // GEMMs per output tile element).
             ImportedKernel::GemvCoalesced
             | ImportedKernel::GemvBatchedCoalesced
-            | ImportedKernel::GemvCoalescedBf16
-            | ImportedKernel::GemvBatchedCoalescedBf16
             | ImportedKernel::TiledGemm
             | ImportedKernel::TiledGemmBatched => {
                 ImportedNeeds::serial(SerialLoop::ContractionDepth)
             }
-            // Packing loops are bounded by rank or a constant; sampling's per-row
-            // vocabulary loops are not modeled yet (POOT-634). The probes are test kernels no planner
+            ImportedKernel::ArgmaxBatched => ImportedNeeds::serial(SerialLoop::RowVocab {
+                passes: ARGMAX_PASSES,
+            }),
+            ImportedKernel::SampleGumbelArgmaxBatched => {
+                ImportedNeeds::serial(SerialLoop::RowVocab {
+                    passes: GUMBEL_PASSES,
+                })
+            }
+            ImportedKernel::SampleTruncatedGumbelArgmaxBatched => {
+                ImportedNeeds::serial(SerialLoop::RowVocab {
+                    passes: TRUNCATED_GUMBEL_PASSES,
+                })
+            }
+            ImportedKernel::SampleToppGumbelArgmaxBatched => {
+                ImportedNeeds::serial(SerialLoop::RowVocab {
+                    passes: TOPP_GUMBEL_PASSES,
+                })
+            }
+            // Packing loops are bounded by rank or a constant; `RandomUniform` is one thread per
+            // element. The probes are test kernels no planner
             // route selects, so none is bounded here (`RmsnormDyn` loops over its row width; `RowsumFor`
             // over a constant). None uses a subgroup collective or a matrix fragment
             // (`a_declared_subgroup_matches_the_fragments_the_body_uses` pins that against the bodies).
@@ -295,10 +328,6 @@ impl ImportedKernel {
             | ImportedKernel::PackedBf16RowGather
             | ImportedKernel::PackedBf16ToF32
             | ImportedKernel::PackedE4m3RowGather
-            | ImportedKernel::ArgmaxBatched
-            | ImportedKernel::SampleGumbelArgmaxBatched
-            | ImportedKernel::SampleTruncatedGumbelArgmaxBatched
-            | ImportedKernel::SampleToppGumbelArgmaxBatched
             | ImportedKernel::RandomUniform
             | ImportedKernel::AssertTrap
             | ImportedKernel::AtomicAddSumSmoke
@@ -336,7 +365,7 @@ pub const MANIFEST: &[&[AssetEntry]] = &[
 mod needs_tests {
     use std::collections::HashMap;
 
-    use poot_graph_ir::op::OpKind;
+    use poot_graph_ir::op::{OpKind, SampleRule};
     use poot_graph_ir::{Builder, Graph, TensorType};
     use poot_kernelgen::BodyUse;
     use poot_target::{Backend, DeviceCaps, Queried};
@@ -362,6 +391,140 @@ mod needs_tests {
         }
     }
 
+    /// The vocabulary passes a sampler body runs, read from its control flow: every natural loop whose
+    /// bound is not a constant scans the row (`while j < vocab`), and counts once per trip of the
+    /// constant-bound loops around it (a bisection's `iter < 30`). Loops bounded by a constant that
+    /// enclose no scan (the cross-lane reduce over the 64 lanes) add nothing. A scan inside a loop whose
+    /// bound is not a constant has no static count and panics.
+    fn vocabulary_passes(body: &Body) -> u64 {
+        use poot_kernel_ir::{BinOp, Constant, Operand, Rvalue, Statement, Terminator};
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let successors = |block: usize| -> Vec<usize> {
+            match &body.blocks[block].terminator {
+                Terminator::Goto { target }
+                | Terminator::Barrier { target }
+                | Terminator::ThreadIndexCall { target, .. } => vec![target.index as usize],
+                Terminator::SwitchInt { targets, .. } => targets
+                    .branches
+                    .iter()
+                    .map(|(_, target)| target.index as usize)
+                    .chain([targets.otherwise.index as usize])
+                    .collect(),
+                Terminator::Return | Terminator::Trap { .. } => Vec::new(),
+            }
+        };
+        let mut predecessors = vec![Vec::new(); body.blocks.len()];
+        for block in 0..body.blocks.len() {
+            for next in successors(block) {
+                predecessors[next].push(block);
+            }
+        }
+        // Back edges of a depth-first walk from the entry; each header's loop is every block that reaches
+        // the edge's tail without passing the header.
+        let mut state = vec![0u8; body.blocks.len()];
+        let mut back_edges = Vec::new();
+        let mut stack = vec![(0usize, successors(0))];
+        state[0] = 1;
+        while let Some((block, pending)) = stack.last_mut() {
+            let block = *block;
+            match pending.pop() {
+                Some(next) if state[next] == 1 => back_edges.push((block, next)),
+                Some(next) if state[next] == 0 => {
+                    state[next] = 1;
+                    stack.push((next, successors(next)));
+                }
+                Some(_) => {}
+                None => {
+                    state[block] = 2;
+                    stack.pop();
+                }
+            }
+        }
+        let mut loops: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+        for (tail, header) in back_edges {
+            let members = loops.entry(header).or_default();
+            members.extend([header, tail]);
+            let mut work = vec![tail];
+            while let Some(block) = work.pop() {
+                if block == header {
+                    continue;
+                }
+                for &pred in &predecessors[block] {
+                    if members.insert(pred) {
+                        work.push(pred);
+                    }
+                }
+            }
+        }
+        // `Some(n)`: the header tests `i < n` against a constant; `None`: against anything else.
+        let constant_trip = |header: usize| -> Option<u64> {
+            let block = &body.blocks[header];
+            let Terminator::SwitchInt {
+                discr: Operand::Move(cond) | Operand::Copy(cond),
+                ..
+            } = &block.terminator
+            else {
+                return None;
+            };
+            block
+                .statements
+                .iter()
+                .find_map(|statement| match statement {
+                    Statement::Assign(
+                        dst,
+                        Rvalue::BinaryOp(BinOp::Lt, _, Operand::Const(bound)),
+                    ) if dst == cond => match bound {
+                        Constant::Usize(n) => Some(*n),
+                        Constant::U32(n) => Some(u64::from(*n)),
+                        Constant::I32(n) => u64::try_from(*n).ok(),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+        };
+        let mut passes = 0;
+        for (&header, members) in &loops {
+            if constant_trip(header).is_some() {
+                continue;
+            }
+            let mut trips = 1u64;
+            for (&outer, outer_members) in &loops {
+                if outer != header
+                    && outer_members.contains(&header)
+                    && outer_members.is_superset(members)
+                {
+                    trips *= constant_trip(outer).unwrap_or_else(|| {
+                        panic!(
+                            "{}: a scan loop sits in the non-constant loop at block {outer}",
+                            body.name
+                        )
+                    });
+                }
+            }
+            passes += trips;
+        }
+        passes
+    }
+
+    /// A sampler's declared pass count is the one its body's control flow has. Mutation: change a
+    /// bisection's trip count (`while iter < 30`) or add or remove a `while j < vocab` scan in a
+    /// `pootc/kernels/sampling/*.rs` body and regenerate its asset; the declaration for that kernel no
+    /// longer matches and this fails naming it.
+    #[test]
+    fn a_sampling_declaration_matches_the_loops_of_its_body() {
+        for kernel in sampling::VARIANTS {
+            let SerialLoop::RowVocab { passes } = kernel.needs().serial else {
+                continue;
+            };
+            assert_eq!(
+                passes,
+                vocabulary_passes(kernel.body()),
+                "{kernel:?}: declared vocabulary passes vs the body's loops"
+            );
+        }
+    }
+
     fn all_kernels() -> impl Iterator<Item = ImportedKernel> {
         [
             contraction::VARIANTS,
@@ -380,9 +543,6 @@ mod needs_tests {
         backend: Backend,
         graph: Graph,
         is_eqn: fn(&OpKind) -> bool,
-        /// Whether the compile is guarded against the routed-expert hang, which keeps a matmul off the
-        /// generated tiled GEMM and so on the shipped one.
-        guarded: bool,
     }
 
     fn matmul_graph(batch: usize, m: usize, k: usize, n: usize, weight: DType) -> Graph {
@@ -397,22 +557,117 @@ mod needs_tests {
         matches!(op, OpKind::MatMul)
     }
 
+    fn is_sample_token(op: &OpKind) -> bool {
+        matches!(op, OpKind::SampleToken { .. })
+    }
+
+    const SAMPLE_ROWS: usize = 2;
+    const SAMPLE_VOCAB: usize = 1000;
+
+    /// A `[SAMPLE_ROWS, SAMPLE_VOCAB]` sampling equation of `rule`, with the operands the rule takes.
+    fn sample_graph(rule: SampleRule) -> Graph {
+        let b = Builder::new();
+        let logits = b.constant(
+            "logits",
+            TensorType::new(vec![SAMPLE_ROWS, SAMPLE_VOCAB], DType::F32),
+        );
+        let out = if rule == SampleRule::Greedy {
+            b.sample_token(rule, logits, None, None, None)
+        } else {
+            let noise = b.constant(
+                "noise",
+                TensorType::new(vec![SAMPLE_ROWS, SAMPLE_VOCAB], DType::F32),
+            );
+            let param_cols = if rule == SampleRule::GumbelTopKTopP {
+                4
+            } else {
+                3
+            };
+            let params = b.constant(
+                "params",
+                TensorType::new(vec![SAMPLE_ROWS, param_cols], DType::F32),
+            );
+            let top_k = (rule != SampleRule::Gumbel)
+                .then(|| b.constant("top_k", TensorType::new(vec![SAMPLE_ROWS], DType::I32)));
+            b.sample_token(rule, logits, Some(noise), Some(params), top_k)
+        };
+        b.finish(out)
+    }
+
+    /// Each sampler's declared vocabulary work is `rows * lanes` threads of `passes * ceil(vocab / lanes)`
+    /// steps: a budget of exactly that admits the dispatch, one step less refuses it with `DispatchWork`
+    /// naming it. Splitting is not available (a row's reduction cannot cross launches), so the bound is a
+    /// typed refusal, not a split.
+    ///
+    /// Mutation: make `SerialLoop::RowVocab` evaluate to no work (`None`) in `choice_requirements`, or change
+    /// a rule's pass count in `ImportedKernel::needs`; the exact-budget or one-step-less row fails.
+    #[test]
+    fn a_sampling_dispatch_is_bounded_by_its_vocabulary_passes() {
+        use ImportedKernel::*;
+        let backend = Backend::SpirvVulkan;
+        let lane_steps = (SAMPLE_VOCAB as u64).div_ceil(SAMPLER_LANES);
+        for (rule, kernel) in [
+            (SampleRule::Greedy, ArgmaxBatched),
+            (SampleRule::Gumbel, SampleGumbelArgmaxBatched),
+            (SampleRule::GumbelTopK, SampleTruncatedGumbelArgmaxBatched),
+            (SampleRule::GumbelTopKTopP, SampleToppGumbelArgmaxBatched),
+        ] {
+            // The pass count is the kernel's declaration; the body is pinned to it by
+            // `a_sampling_declaration_matches_the_loops_of_its_body`.
+            let SerialLoop::RowVocab { passes } = kernel.needs().serial else {
+                panic!("{kernel:?} declares no vocabulary loop");
+            };
+            let graph = sample_graph(rule);
+            let eqn = graph
+                .eqns
+                .iter()
+                .find(|e| is_sample_token(&e.op))
+                .expect("fixture has a SampleToken equation");
+            let plan = |budget: u64| {
+                let mut caps = default_caps_for(backend);
+                caps.max_dispatch_work = Queried::Known(budget);
+                crate::plan_eqn_compiled(
+                    &crate::ExactI32StorageAnalysis::new(&graph),
+                    &graph,
+                    eqn,
+                    &Target { backend, caps },
+                    &HashMap::new(),
+                    &poot_test_util::graph_fixtures::roomy_body_limits(),
+                )
+            };
+            let work = SAMPLE_ROWS as u64 * SAMPLER_LANES * passes * lane_steps;
+            let admitted = plan(work).unwrap_or_else(|e| panic!("{rule:?}: {e}"));
+            assert!(
+                matches!(admitted.choice, KernelChoice::Imported { kernel: k, .. } if k == kernel),
+                "{rule:?}: lowers to {:?}",
+                admitted.choice
+            );
+            match plan(work - 1) {
+                Err(PlanError::Refused(refusal)) => assert!(
+                    matches!(
+                        refusal.missing,
+                        Capability::KernelResources(ResourceRefusal::DispatchWork { work: w, budget })
+                            if w == work && budget == work - 1
+                    ),
+                    "{rule:?}: wrong refusal {:?}",
+                    refusal.missing
+                ),
+                other => panic!(
+                    "{rule:?}: expected DispatchWork {{ work: {work} }}, got {:?}",
+                    other.map(|p| p.choice)
+                ),
+            }
+        }
+    }
+
     fn fixtures() -> Vec<Fixture> {
         use ImportedKernel::*;
         let wgpu = Backend::SpirvVulkan;
         let f32w = DType::F32;
-        let bf16w = DType::BF16;
         let mut all = vec![
-            // Decode GEMVs: single sequence and batched, F32 and BF16 weights.
+            // Decode GEMVs: single sequence and batched, F32 weights.
             (GemvCoalesced, matmul_graph(1, 1, 256, 512, f32w)),
             (GemvBatchedCoalesced, matmul_graph(4, 1, 256, 512, f32w)),
-            (GemvCoalescedBf16, matmul_graph(1, 1, 256, 512, bf16w)),
-            (
-                GemvBatchedCoalescedBf16,
-                matmul_graph(4, 1, 256, 512, bf16w),
-            ),
-            // Prefill tiled GEMM: shared weight, and the per-batch attention matmul below.
-            (TiledGemm, matmul_graph(1, 64, 256, 512, f32w)),
         ]
         .into_iter()
         .map(|(kernel, graph)| Fixture {
@@ -420,9 +675,22 @@ mod needs_tests {
             backend: wgpu,
             graph,
             is_eqn: is_matmul,
-            guarded: matches!(kernel, TiledGemm),
         })
         .collect::<Vec<_>>();
+        all.extend(
+            [
+                (ArgmaxBatched, SampleRule::Greedy),
+                (SampleGumbelArgmaxBatched, SampleRule::Gumbel),
+                (SampleTruncatedGumbelArgmaxBatched, SampleRule::GumbelTopK),
+                (SampleToppGumbelArgmaxBatched, SampleRule::GumbelTopKTopP),
+            ]
+            .map(|(kernel, rule)| Fixture {
+                kernel,
+                backend: wgpu,
+                graph: sample_graph(rule),
+                is_eqn: is_sample_token,
+            }),
+        );
         let attention_scores = {
             let b = Builder::new();
             let q = b.constant("q", TensorType::new(vec![1, 14, 64, 64], DType::F32));
@@ -430,12 +698,20 @@ mod needs_tests {
             let out = b.matmul(q, kt);
             b.finish(out)
         };
+        // A batched decode projection past the NVPTX GEMV's width gate: not a decode GEMV, and its
+        // `[B, 1, N]` output has no tileable M, so the shipped tiled GEMM plans it.
+        all.push(Fixture {
+            kernel: TiledGemm,
+            backend: Backend::Nvptx,
+            graph: matmul_graph(4, 1, 256, 512, f32w),
+            is_eqn: is_matmul,
+        });
+        // The per-batch attention matmul.
         all.push(Fixture {
             kernel: TiledGemmBatched,
             backend: wgpu,
             graph: attention_scores,
             is_eqn: is_matmul,
-            guarded: false,
         });
         all
     }
@@ -463,7 +739,6 @@ mod needs_tests {
             backend,
             graph,
             is_eqn,
-            guarded,
         } in fixtures
         {
             let eqn = graph
@@ -478,7 +753,6 @@ mod needs_tests {
                     eqn,
                     &Target { backend, caps },
                     &HashMap::new(),
-                    guarded,
                     &poot_test_util::graph_fixtures::roomy_body_limits(),
                 )
             };

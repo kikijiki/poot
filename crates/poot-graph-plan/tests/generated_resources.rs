@@ -21,10 +21,7 @@ use poot_tensor::DType;
 use poot_test_util::device_caps::default_caps_for;
 
 fn options() -> CompileOptions {
-    CompileOptions {
-        execution: Submission::Replay,
-        limits: CompileLimits::STANDARD,
-    }
+    CompileOptions::new(Submission::Replay, CompileLimits::STANDARD)
 }
 
 fn target(backend: Backend, caps: DeviceCaps) -> Target {

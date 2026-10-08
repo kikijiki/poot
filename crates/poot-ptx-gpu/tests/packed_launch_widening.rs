@@ -21,7 +21,7 @@ use poot_graph_ir::{Builder, Graph, PackedSourceName, Slot, TensorType, ValueId}
 use poot_graph_plan::{CompileOptions, Submission, Target, compile};
 use poot_ptx_gpu::PtxDevice;
 use poot_quant::format::WeightFormat;
-use poot_quant::{PackedComponentRef, PackedPayload};
+use poot_quant::{PackedComponentRef, PackedPayload, PackedStack, PackedStackComponentRef};
 use poot_runtime_common::DeviceBackend;
 use poot_target::Backend;
 use poot_tensor::HostTensor;
@@ -38,10 +38,7 @@ fn compiled(gpu: &PtxDevice, graph: &Graph) -> Graph {
             backend: Backend::Nvptx,
             caps: Device::target(gpu).caps,
         },
-        &CompileOptions {
-            execution: Submission::Replay,
-            limits: poot_graph_plan::CompileLimits::STANDARD,
-        },
+        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect("compile the packed graph")
     .graph()
@@ -75,8 +72,8 @@ fn mismatches(got: &[f32], want: &[f32]) -> Option<(usize, usize, f32, f32)> {
     bad.first().map(|&i| (bad.len(), i, got[i], want[i]))
 }
 
-/// The canonical packed MoE chain (`packed_indexed_linear`: every expert a `PackedDequant` that
-/// `compile` plans as a standalone `Materialize`) at `[out, k]` Q4_K experts, run through
+/// The indexed packed contraction (`packed_indexed_linear`: one `PackedContraction` over a stacked
+/// table, no `Materialize`) at `[out, k]` Q4_K experts, run through
 /// `run_resident`; returns the output and the oracle's. Row `m` reads expert `m % 2` at column
 /// `(m * 37 + 11) % k` through a one-hot activation, so every output is one decoded weight value.
 fn run_moe(gpu: &mut PtxDevice, out: usize, k: usize) -> (Vec<f32>, Vec<f32>) {
@@ -91,30 +88,43 @@ fn run_moe(gpu: &mut PtxDevice, out: usize, k: usize) -> (Vec<f32>, Vec<f32>) {
             ))
         })
         .collect();
-    let rows: Vec<poot_graph_ir::ops::PackedLinearGraphRow> = (0..EXPERTS)
-        .map(|ordinal| poot_graph_ir::ops::PackedLinearGraphRow {
-            ordinal,
-            linear_id: format!("expert.{ordinal}"),
-            descriptor: owners[ordinal].weight(),
-        })
-        .collect();
+    let table = poot_graph_ir::ops::PackedExpertStack {
+        stack_id: "experts".to_string(),
+        descriptor: owners[0].weight(),
+        experts: EXPERTS,
+    };
+    let stack = Arc::new(PackedStack::try_new(owners.clone()).unwrap());
     let column = |m: usize| (m * 37 + 11) % k;
     let b = Builder::new();
     let x = b.slot_named(Slot::Activation, "moe-x", TensorType::f32(vec![ROWS, k]));
     let ids = b.slot_named(Slot::Activation, "moe-ids", TensorType::f32(vec![ROWS]));
-    let y = poot_graph_ir::ops::packed_indexed_linear(&b, x, ids, &rows).unwrap();
+    let y = poot_graph_ir::ops::packed_indexed_linear(&b, x, ids, &table).unwrap();
     let graph = compiled(gpu, &b.finish(y));
     assert!(
-        graph
-            .eqns
-            .iter()
-            .any(|eqn| matches!(eqn.op, poot_graph_ir::OpKind::PackedDequant { .. })),
-        "[{out}, {k}]: the canonical chain keeps its standalone Materialize"
+        matches!(
+            graph.eqns.as_slice(),
+            [poot_graph_ir::Eqn {
+                op: poot_graph_ir::OpKind::PackedContraction {
+                    rows: poot_graph_ir::ContractionRows::Indexed { .. },
+                    ..
+                },
+                ..
+            }]
+        ),
+        "[{out}, {k}]: one indexed packed contraction, got {:?}",
+        graph.eqns
     );
-    let mut inputs = carriers(&graph, |linear| {
-        let expert: usize = linear.strip_prefix("expert.").unwrap().parse().unwrap();
-        Arc::clone(&owners[expert])
-    });
+    let mut inputs: HashMap<ValueId, Value> = graph
+        .inputs
+        .iter()
+        .filter_map(|&id| {
+            let name = PackedSourceName::parse(graph.meta(id).name.as_deref()?)?;
+            Some((
+                id,
+                PackedStackComponentRef::new(Arc::clone(&stack), name.role()).into(),
+            ))
+        })
+        .collect();
     let mut one_hot = vec![0.0f32; ROWS * k];
     for m in 0..ROWS {
         one_hot[m * k + column(m)] = 1.0;
@@ -137,11 +147,10 @@ fn run_moe(gpu: &mut PtxDevice, out: usize, k: usize) -> (Vec<f32>, Vec<f32>) {
     (got, want)
 }
 
-/// SC-004 (Materialize): the canonical MoE chain at `[8, 256]` experts, then at `[2816, 1536]`
-/// (4.3M elements per Materialize, past the 64-lane grid cap, so the planner widens the body), is
-/// bit-exact at both sizes in one executor.
+/// SC-004 (indexed contraction): the stacked-expert contraction at `[8, 256]` experts, then at
+/// `[2816, 1536]` (a different Gemv launch over a larger table), is bit-exact at both sizes in one executor.
 #[test]
-fn a_widened_materialize_after_a_narrow_one_is_bit_exact() {
+fn a_wide_indexed_contraction_after_a_narrow_one_is_bit_exact() {
     let Some(mut gpu) =
         poot_test_util::device_skip::open_or_skip(DeviceBackend::Ptx, PtxDevice::new())
     else {

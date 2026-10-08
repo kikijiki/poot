@@ -22,10 +22,7 @@ fn is_decode_gemv_kernel(choice: &KernelChoice) -> bool {
     matches!(
         choice,
         KernelChoice::Imported {
-            kernel: ImportedKernel::GemvCoalesced
-                | ImportedKernel::GemvBatchedCoalesced
-                | ImportedKernel::GemvCoalescedBf16
-                | ImportedKernel::GemvBatchedCoalescedBf16,
+            kernel: ImportedKernel::GemvCoalesced | ImportedKernel::GemvBatchedCoalesced,
             ..
         } | KernelChoice::Generated(KernelRequest::Contraction(
             ContractionSpec::GemvChunk { .. }
@@ -778,18 +775,14 @@ fn indexed_matmul_invalid_ids_write_nan_rows_and_the_oracle_refuses_them() {
 }
 
 /// SC-005: a routed gate weighting runs as one `ContractionEpilogue` over the indexed contraction and its output
-/// equals the unfused program's (the routed-expert hang guard, one kernel per equation) bit for bit, and the
-/// oracle's, at a decode and a prefill shape.
+/// equals the oracle's bit for bit, at a decode and a prefill shape.
 ///
 /// Mutation (the epilogue's store index): index the epilogue by column instead of the flat output index; the
-/// per-row gate is read at the wrong row and the fused output goes red against the unfused one.
+/// per-row gate is read at the wrong row and the fused output goes red against the oracle.
 #[test]
-fn routed_gate_weighting_fused_equals_unfused_bit_for_bit() {
+fn routed_gate_weighting_fused_equals_the_oracle_bit_for_bit() {
     let _gpu_guard = gpu_lock();
     let Some((mut gpu, target)) = open_engine_or_skip() else {
-        return;
-    };
-    let Some(mut hung) = open_hung_engine_or_skip() else {
         return;
     };
     for case in indexed_cases().into_iter().take(3) {
@@ -798,21 +791,9 @@ fn routed_gate_weighting_fused_equals_unfused_bit_for_bit() {
             .map(|r| [0.5, -2.0, 1.25, 3.0, -0.75][r % 5])
             .collect();
         let program = indexed_program(&case, Some(gate));
-        let run = |gpu: &mut dyn Executor, guarded| {
-            let (exe, entry) =
-                add_resident_entry_with(gpu, target, &program.graph, &program.inputs, guarded);
-            step_resident(gpu, exe, entry, &program.graph)
-        };
-        let fused = run(&mut gpu, false);
-        // The guarded program loads on an engine whose device reports the routed-expert hang.
-        let unfused = run(&mut hung, true);
+        let (exe, entry) = add_resident_entry(&mut gpu, target, &program.graph, &program.inputs);
+        let fused = step_resident(&mut gpu, exe, entry, &program.graph);
         let want = indexed_oracle(&program).unwrap();
-        assert_eq!(
-            bits(&fused),
-            bits(&unfused),
-            "{}: fused vs unfused",
-            case.name
-        );
         assert_eq!(bits(&fused), bits(&want), "{}: fused vs oracle", case.name);
     }
 }
@@ -1060,10 +1041,7 @@ fn tiled_gemm_random_shapes_gpu_matches_cpu() {
         let program = compile(
             &g,
             &spirv_fixture_target(),
-            &CompileOptions {
-                execution: Submission::Replay,
-                limits: poot_graph_plan::CompileLimits::STANDARD,
-            },
+            &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
         )
         .unwrap();
         let (eqn, _) = program

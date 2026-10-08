@@ -27,6 +27,7 @@ poot-runtime-common.workspace = true
 # reachable only through prepare_target_graph. Test-only and acyclic: poot-graph-plan's own
 # dependency on poot-models is dev-only, so building this crate's tests never needs poot-models.
 poot-graph-plan.workspace = true
+poot-kernelgen.workspace = true
 poot-target.workspace = true
 
 [lints]

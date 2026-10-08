@@ -8,14 +8,14 @@ sidebar_position: 7
 
 poot traces model forwards into a primitive graph and runs them on its own kernels. This page lists
 families by architecture shape. It does not duplicate the full backend tables; use the [feature
-matrix](../reference/feature-matrix.md) for verified wgpu, ROCm, PTX, and NPU coverage.
+matrix](../reference/feature-matrix.md) for what compiles on wgpu, ROCm and PTX.
 
 Checkpoint formats: **safetensors** (including GPTQ, AWQ, and FP8 layouts) and **GGUF** (single file with
 embedded config and tokenizer). Both work from the library (`poot-llm`). A dense decoder loads as a
 `driver::ModelHandle` and generates through the driver, and so do the mixture-of-experts families Qwen3-MoE,
-Granite MoE, Mixtral, OLMoE, gpt-oss, MiniMax-M2 and Gemma 4, the MLA families (DeepSeek-V2/V3/V3.2) and the hybrid Nemotron-H. The
+Granite MoE, Mixtral, OLMoE, gpt-oss, MiniMax-M2 and Gemma 4, the MLA families (DeepSeek-V2/V3/V3.2) and the hybrids Nemotron-H, Qwen3-Next, Qwen3.8-Flash-Next and Qwen3.5 (the Qwen3.8-27B-FP8 text tower). The
 checkpoint's config decides which: the families that load through the driver are the ones the model registry knows.
-Generation serving in `poot-serve` is not available yet (poot is being refactored; planned to return). Qwen3-Next is also not available yet (poot is being refactored; planned to return). Both loaders refuse it with an unsupported-model error naming the architecture.
+Generation serving in `poot-serve` is not available yet (poot is being refactored; planned to return).
 
 ## Dense decoders
 
@@ -54,38 +54,89 @@ attention keeps its compressed latent and rope key as the cache; a GGUF stores t
 split per head, a safetensors checkpoint stores them fused, and both load. DeepSeek-V2 routes with a softmax
 and a group limit, DeepSeek-V3 with a biased sigmoid; the routed scaling factor is applied to the selected
 weights. Nemotron-H carries each Mamba2 layer's convolution window and state, so a prompt prefilled in chunks
-continues exactly. Qwen3-Next (hybrid linear-attention plus MoE) is not available yet (poot is being refactored; planned to return). Backend wiring differs by model; the matrix is authoritative.
+continues exactly. Qwen3-Next (hybrid) carries each gated delta rule (GDN) layer's convolution window and recurrent state next to the attention layers' caches, so a chunked prefill continues exactly; its gated attention, gated delta rule and sigmoid-gated shared expert are components other models can reuse. Qwen3.5 (HF `qwen3_5`) is the same hybrid with a dense gated feed-forward; its BF16 and block-scaled FP8 checkpoints both load, the FP8 projections staying packed as stored. Backend wiring differs by model; the matrix is authoritative.
+
+## Qwen3.8-Flash-Next
+
+An HF `qwen4_exp` checkpoint, read from its `text_config`. Most layers are gated delta rule (GDN) linear attention; the
+rest are gated attention that reads only the blocks of cached positions a small indexer selects (Qwen Sparse
+Attention). The residual is several parallel streams gated by Hyper-Connections, the layers the config names
+start with a per-layer n-gram embedding, and every layer ends in routed experts with a gated shared expert.
+It loads with `ModelHandle::load` and generates with `Driver`. Its layer, expert, head and stream counts come
+from the checkpoint's config, so a fine-tune with other counts loads the same way. A prompt is prefilled in whole
+blocks of `indexer_compress_ratio` tokens and its tail runs as decode steps. Routed experts are read as the
+checkpoint stores them: dense stacks, or packed E4M3 tensors per expert. The vision tower is not loaded. A token
+outside the vocabulary stops the step with a validation error naming the n-gram embedding's layer. The official
+checkpoint stores the n-gram table as 128 E4M3 row-range shards under one scale; each shard stays a resident weight
+and a lookup reads the shard that owns the row, with exact integer ids. The shard layout is checked on small fixtures on
+the CPU oracle and the wgpu, ROCm and PTX executors. The E4M3 shard lookup is gathered bit-exactly against the
+reference decode on all three executors on small fixtures; no real checkpoint has run.
+
+## DeepSeek-V4
+
+DeepSeek-V4, from an HF `deepseek_v4` safetensors checkpoint (the Flash-0731 layout).
+
+The residual stream is several parallel streams per token (`hc_mult`), mixed around the attention block and
+the feed-forward block of every layer by learned doubly stochastic mixing weights, and collapsed to one stream
+before the closing norm. Each layer's attention is chosen by the config's `compress_ratios`: a sliding window
+over a cache of keys that are also the values, plus (for a compressed layer) entries that pool every `rate`
+positions into one. Heavily compressed layers attend every complete entry. Sparse layers pool overlapping
+windows and keep the best `index_topk` entries per token, chosen by a small indexer. Queries are low rank,
+attention has a learned sink per head, the last `qk_rope_head_dim` dimensions of each head rotate (and rotate
+back on the output), and the output projection is grouped. Every layer routes through a mixture of experts
+scored by `sqrt(softplus(logit))`; the first `num_hash_layers` layers take their experts from a table indexed
+by the token id instead. The routed experts (4-bit E2M1) and the projections (E4M3) are read packed, as stored.
+
+This family loads with `ModelHandle::load` and generates with `Driver`. Its prefill step covers whole
+compression windows: the driver's prefill granule is the least common multiple of the layers' rates, and the
+tokens of a prompt after the last whole window run as decode steps. Layer, expert and head counts, the
+compression rates and the schedule come from the checkpoint's config, so a fine-tune with other values loads
+the same way. YaRN rope scaling is refused with an unsupported-config error. No real public checkpoint has
+run; the matrix says what is verified.
+
+## GLM-5.3-Flash
+
+GLM-5.3-Flash, from an HF `glm5_next` safetensors checkpoint (the multimodal wrapper: the text tower loads
+from `text_config`, and the vision and multi-token-prediction tensors are not read).
+
+The residual stream is several parallel streams per token (`hc_mult`), mixed around every block by learned
+doubly stochastic weights as in DeepSeek-V4, and collapsed by their mean before the closing norm. The config's
+`layer_types` choose each layer's mixer. A linear-attention layer is Kimi Delta Attention: a causal conv over the
+query, key and value channels, then a gated delta rule over a matrix state per head with a decay per key
+channel. A sparse-attention layer is latent attention without rotary embedding whose queries read only the
+positions a pooled indexer keeps: the indexer pools every `index_kpool` cached keys into one, scores the
+complete pools, keeps the best `index_topk / index_kpool` of them and always keeps the positions after the last
+complete pool. The first layers' feed-forward is dense, the rest a shared expert plus routed experts chosen by a
+sigmoid router with a selection-only bias; both use a clamped SwiGLU.
+
+This family loads with `ModelHandle::load` and generates with `Driver`. It has no prefill granule. The Kimi
+Delta Attention recurrence is traced token by token, so a prefill step costs graph size in proportion to its
+tokens: use a modest prefill chunk. Layer, expert and head counts and the mixer schedule come from the
+checkpoint's config, so a fine-tune with other values loads the same way. Indexers other than the full pooled
+one, and rotary attention layers, are refused with an unsupported-config error. No real public checkpoint has
+run; the matrix says what is verified.
 
 ## Embeddings and reranking
 
-BERT-class encoder models for `/v1/embeddings` and cross-encoder reranking.
+BERT-class encoder models for sentence embeddings and cross-encoder reranking.
 
-Safetensors is the usual format for HF-style encoder checkpoints. In `poot-serve`, encoders and cross-encoders
-run on the CPU evaluator, not a GPU backend.
+Safetensors is the usual format for HF-style encoder checkpoints. The `bert` family (an embedding encoder, or
+with the classifier head a cross-encoder) loads with `ModelHandle::load` and runs on the driver's `Encode` step on
+wgpu, ROCm and PTX; `poot_llm::encoders` is the library path. `/v1/embeddings` and `/v1/rerank` on `poot-serve`
+return `503` until they are restored.
 
 ## Vision-language
 
 SmolVLM, idefics3.
 
-Multimodal chat: vision tower plus text decoder, library path only (the `poot-caption` binary). Vision-language serving is not available yet (poot is being refactored; planned to return). ROCm and
+Multimodal chat: the vision tower (an `Encode`-only model) and the text decoder (the `llama` family read from the
+checkpoint's `text_config`) are two registered families over one checkpoint, each on its own driver. The library
+path is `poot_llm::front_end::Idefics3` and the `poot-caption` binary. Vision-language serving is not available yet (poot is being refactored; planned to return). ROCm and
 PTX GPU verification is thinner than wgpu for some modalities; see the matrix before relying on it.
-
-## Families that do not load yet
-
-Loading refuses these families with an unsupported-model error that names the architecture string
-(`deepseek_v4`, `glm5_next`, `qwen3_5`, `qwen4_exp`):
-
-- **DeepSeek-V4-Flash-0731**
-- **GLM-5.3-Flash**
-- **Qwen3.8-27B-FP8** (`qwen3_5` text tower)
-- **Qwen3.8 QSA** (`qwen4_exp`)
-
-These families are being restored (poot is being refactored; planned to return). Until then no backend runs them, and the cells for them in the
-[feature matrix](../reference/feature-matrix.md) are **No (being restored)**.
 
 ## Adding a model
 
-A new family touches only its own code. The runner, planner, executors and serve code do not change. The
+A new family touches only its own code. The driver, planner, executors and serve code do not change. The
 repository checks this with a test (`crates/poot-llm/tests/add_a_model/`) that defines a small decoder family
 inside the test, outside every production crate, and serves it through the public API. Its `family.rs`
 is the worked example. A family is four things, plus a checkpoint to load:

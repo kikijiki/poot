@@ -39,10 +39,7 @@ fn caps(max_buffer_bytes: u64) -> DeviceCaps {
 }
 
 fn options() -> CompileOptions {
-    CompileOptions {
-        execution: Submission::Replay,
-        limits: CompileLimits::STANDARD,
-    }
+    CompileOptions::new(Submission::Replay, CompileLimits::STANDARD)
 }
 
 struct Driver {

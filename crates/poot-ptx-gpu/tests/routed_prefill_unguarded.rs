@@ -1,299 +1,142 @@
-//! POOT-1038 acceptance on PTX: the qwen38 routed-expert prefill runs on the live device UNGUARDED (the
-//! `routed_expert_tiling_hang` fact cleared, so `flash_attention_capped`, `fuse` and `tile_matmuls` all run)
-//! and completes, with the same logits as the guarded program and far fewer launches.
+//! POOT-1038 acceptance on PTX, kept as the standing proof that a routed-expert prefill needs no guard: the
+//! qwen38 routed-expert prefill compiles through the full pipeline (`flash_attention_capped` and `fuse` run, the
+//! router contraction plans a generated tiled schedule) and completes on the live device, with the CPU
+//! oracle's logits.
 //!
-//! The graph is the whole-model `trace_qwen38_prefill` (hyper-connections, gated delta net and QSA layers, a
-//! routed-expert FFN with `arg_top_k` feeding `indexed_matmul`), at a small config; weights are deterministic
-//! fills. Cards 186 and 192 recorded the hang this guard exists for; 186's root cause was ROCm HSA signal
-//! churn (cured), and no PTX hang was ever observed. A hang is a red row, not a skip: a watchdog thread
-//! aborts the process after [`DEADLINE`].
+//! The graph is the registered Qwen4Exp fixture's prefill through `Model::trace` (hyper-connections, gated delta
+//! net and QSA layers, a routed-expert FFN with `arg_top_k` feeding `indexed_matmul`), over the fixture's own
+//! weights bound through its weight map. Cards 186 and 192 recorded the hang a guard was added for; 186's root
+//! cause was ROCm HSA signal churn (cured), and no PTX hang was ever observed. A hang is a red row, not a skip:
+//! a watchdog thread aborts the process after [`DEADLINE`].
 //!
-//! Mutations (observed red): `let guarded = true` in `poot-graph-plan/src/compile.rs`'s `compile` fails the plan
-//! row before any launch ("flash_attention_capped: the unguarded program runs it and the guarded one skips
-//! it"); `DEADLINE` of 1 ms aborts the process with "HANG: guarded prefill did not complete within 1ms".
+//! Mutations (observed red): skipping `flash_attention_capped` in `poot-graph-plan/src/compile.rs`'s `compile`
+//! fails the plan row before any launch ("flash_attention_capped: the program runs it"); `DEADLINE` of 1 ms
+//! aborts the process with "HANG: routed prefill did not complete within 1ms".
 
-use std::cell::Cell;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use poot_executor::{
-    Arg, BufferRole, Device, DeviceTime, Dispatch, Engine, Executor, MemoryCounterSnapshot, NoSync,
-    StepInputs, WeightSource,
-};
-use poot_graph_ir::{Graph, Slot, Storage};
-use poot_graph_plan::{
-    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, KernelChoice, Partition,
-    Submission, Target, TargetSet, compile, compile_staged,
-};
+use poot_executor::{Device, Engine, Executor, NoSync};
+use poot_executor_parity::weight_map::{self, Step};
+use poot_graph_ir::{Graph, ValidationOutputs};
+use poot_graph_plan::{KernelChoice, Target};
 use poot_kernelgen::{ContractionSpec, KernelRequest};
-use poot_models::qwen38::{
-    QsaConfig, Qwen4ExpConfig, Qwen4ExpGdnConfig, Qwen4ExpModelConfig, trace_qwen38_prefill,
-};
+use poot_models::model::{Model, Phase};
+use poot_models::registry::Registry;
 use poot_ptx_gpu::PtxDevice;
-use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
-use poot_runtime_common::{CompiledKernel, DeviceBackend};
-use poot_target::BufferStorage;
-use poot_tensor::{DType, HostTensor};
+use poot_quant::weights::{WeightMap, WeightStore};
+use poot_runtime_common::DeviceBackend;
+use poot_tensor::HostTensor;
 use poot_test_util::device_skip::open_or_skip;
 
 /// A hang past this aborts the process: the row is red, never a skip.
 const DEADLINE: Duration = Duration::from_secs(120);
-const PROMPT: usize = 8;
+/// The prompt is a whole number of the fixture's blocks of two, and fills its cache.
+const PROMPT: usize = weight_map::CAPACITY;
 
-/// The plan-summary qwen38 fixture's config: a mixed GDN then QSA schedule with a routed MoE FFN.
-fn qwen38_config() -> Qwen4ExpModelConfig {
-    Qwen4ExpModelConfig {
-        cfg: Qwen4ExpConfig {
-            hidden: 8,
-            n_heads: 2,
-            n_kv_heads: 1,
-            head_dim: 4,
-            rotary_dim: 2,
-            eps: 1e-5,
-        },
-        qcfg: QsaConfig {
-            index_n_heads: 2,
-            index_kv_heads: 1,
-            index_head_dim: 3,
-            index_budget: 4,
-            index_compress_ratio: 2,
-        },
-        gdn: Qwen4ExpGdnConfig {
-            num_k_heads: 1,
-            num_v_heads: 2,
-            head_dim: 2,
-            conv_k: 4,
-        },
-        layer_is_full: vec![false, true],
-        vocab: 6,
-        max_pos: 16,
-        ffn_inter: 8,
-        moe_n_experts: 3,
-        moe_top_k: 2,
-        moe_inter: 4,
-        eps: 1e-5,
-        chunk: 4,
-        hc_count: 2,
-        hc_lowrank: 3,
-        ple: None,
-    }
+/// The registered Qwen4Exp fixture: its model, its store and its weight map.
+struct Fixture {
+    model: Box<dyn Model>,
+    store: Arc<WeightStore>,
+    map: Arc<WeightMap>,
 }
 
-/// Deterministic fill in `[-0.25, 0.25)`.
-fn fill(seed: usize, count: usize) -> Vec<f32> {
-    let mut s = (seed as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-    (0..count)
-        .map(|_| {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            ((s >> 40) % 1000) as f32 / 2000.0 - 0.25
-        })
-        .collect()
-}
-
-/// The live device, reporting the routed-expert hang only while `guarded` is set. The engine refuses a program
-/// whose target differs from the device's, so an unguarded program can only run on a device that reports no hang:
-/// this decorator is that device, with every other method the live device's own.
-struct HangFact<D> {
-    device: D,
-    guarded: Rc<Cell<bool>>,
-}
-
-impl<D: Device> Device for HangFact<D> {
-    type Buffer = D::Buffer;
-    type Kernel = D::Kernel;
-    type Recording = D::Recording;
-    type Error = D::Error;
-
-    fn target(&self) -> Target {
-        let mut target = self.device.target();
-        target.caps.known_miscompiles.routed_expert_tiling_hang = self.guarded.get();
-        target
-    }
-    fn memory(&self) -> Vec<(BufferRole, MemoryCounterSnapshot)> {
-        self.device.memory()
-    }
-    fn allocate(
-        &mut self,
-        role: BufferRole,
-        storage: BufferStorage,
-        elems: usize,
-    ) -> Result<Self::Buffer, Self::Error> {
-        self.device.allocate(role, storage, elems)
-    }
-    fn load_kernel(
-        &mut self,
-        key: &str,
-        kernel: CompiledKernel,
-    ) -> Result<Self::Kernel, Self::Error> {
-        self.device.load_kernel(key, kernel)
-    }
-    fn begin(&mut self, submission: Submission) -> Result<(), Self::Error> {
-        self.device.begin(submission)
-    }
-    fn dispatch(&mut self, dispatch: Dispatch<'_, Self>) -> Result<(), Self::Error> {
-        let inputs: Vec<Arg<'_, D>> = dispatch
-            .inputs
-            .iter()
-            .map(|arg| Arg {
-                buffer: arg.buffer,
-                elems: arg.elems,
-            })
-            .collect();
-        self.device.dispatch(Dispatch {
-            kernel: dispatch.kernel,
-            inputs: &inputs,
-            output: Arg {
-                buffer: dispatch.output.buffer,
-                elems: dispatch.output.elems,
-            },
-            threads: dispatch.threads,
-            workgroup: dispatch.workgroup,
-            work: dispatch.work,
-        })
-    }
-    fn copy(&mut self, src: &Self::Buffer, dst: &Self::Buffer) -> Result<(), Self::Error> {
-        self.device.copy(src, dst)
-    }
-    fn finish(&mut self) -> Result<Option<Self::Recording>, Self::Error> {
-        self.device.finish()
-    }
-    fn replay(&mut self, recording: &Self::Recording) -> Result<(), Self::Error> {
-        self.device.replay(recording)
-    }
-    fn write(&mut self, dst: &Self::Buffer, bytes: &[u8]) -> Result<(), Self::Error> {
-        self.device.write(dst, bytes)
-    }
-    fn read(&mut self, src: &Self::Buffer, out: &mut [u8]) -> Result<(), Self::Error> {
-        self.device.read(src, out)
-    }
-    fn synchronize(&mut self) -> Result<(), Self::Error> {
-        self.device.synchronize()
-    }
-    fn device_time(&self) -> DeviceTime {
-        self.device.device_time()
-    }
-    fn abort(&mut self) -> Result<(), Self::Error> {
-        self.device.abort()
-    }
-    fn classify_fault(&self, error: &Self::Error) -> Option<(String, u32)> {
-        self.device.classify_fault(error)
-    }
-}
-
-fn weights(graph: &Graph) -> Arc<WeightStore> {
-    let mut builder = WeightStore::builder();
-    for (index, meta) in graph.values.iter().enumerate() {
-        if !matches!(meta.storage, Storage::Const) {
-            continue;
-        }
-        let name = meta.name.as_deref().expect("a const is named");
-        let shape = graph
-            .aval(poot_graph_ir::ValueId::from(index))
-            .shape
-            .clone();
-        let tensor = HostTensor::f32(shape.clone(), fill(index, shape.iter().product()));
-        let dense =
-            DenseWeight::try_new(DType::F32, shape, Arc::from(tensor.view().bytes())).unwrap();
-        builder.insert(name, WeightEntry::Dense(dense)).unwrap();
-    }
-    Arc::new(builder.build())
-}
-
-/// Token ids, the causal mask (`0` visible, `-1e4` hidden), the QSA block-eligibility and tail masks.
-fn step_inputs(graph: &Graph) -> Vec<poot_test_util::StepFixture> {
-    graph
-        .values
+fn fixture() -> Fixture {
+    let registry = Registry::builtin().expect("the builtin registry");
+    let entry = registry
+        .entries()
         .iter()
-        .enumerate()
-        .filter_map(|(index, meta)| {
-            let Storage::Slot(slot) = &meta.storage else {
-                return None;
-            };
-            let shape = graph
-                .aval(poot_graph_ir::ValueId::from(index))
-                .shape
-                .clone();
-            let name = meta.name.clone().unwrap_or_default();
-            let tensor = match slot {
-                Slot::Token => HostTensor::i32(shape, (0..PROMPT as i32).map(|t| t % 6).collect()),
-                Slot::Mask => {
-                    HostTensor::f32(shape.clone(), causal(shape[2], shape[3], 0.0, -1.0e4))
-                }
-                Slot::Activation if name.contains("block_eligible") => HostTensor::f32(
-                    shape.clone(),
-                    // Block `c` (two tokens) is visible to the rows after it.
-                    (0..shape[2])
-                        .flat_map(|row| {
-                            (0..shape[3]).map(move |block| f32::from(2 * block + 1 < row))
-                        })
-                        .collect(),
-                ),
-                Slot::Activation => {
-                    HostTensor::f32(shape.clone(), causal(shape[2], shape[3], 0.0, -1.0e4))
-                }
-                other => panic!("unexpected slot {other:?}"),
-            };
-            Some(poot_test_util::StepFixture {
-                key: meta.slot_key().expect("a slot has a key").clone(),
-                tensor,
-            })
-        })
-        .collect()
-}
-
-fn causal(rows: usize, cols: usize, visible: f32, hidden: f32) -> Vec<f32> {
-    (0..rows)
-        .flat_map(|row| (0..cols).map(move |col| if col <= row { visible } else { hidden }))
-        .collect()
-}
-
-/// What `compile` planned for the prefill on one target.
-struct PlanFacts {
-    launches: usize,
-    passes: Vec<&'static str>,
-    /// Contractions planned on a generated tiled schedule, and on the one-thread-per-output serial kernel.
-    tiled: usize,
-    serial: usize,
-}
-
-fn options() -> CompileOptions {
-    CompileOptions {
-        execution: Submission::Replay,
-        limits: poot_graph_plan::CompileLimits::STANDARD,
+        .find(|entry| entry.family.as_str() == "qwen4exp")
+        .expect("qwen4exp is registered");
+    let fixture = (entry.fixture)();
+    let model = (entry.build)(&fixture.raw(), &fixture.store).expect("the fixture builds");
+    let map = Arc::new(model.weights().clone());
+    Fixture {
+        model,
+        store: Arc::new(fixture.store),
+        map,
     }
 }
 
-fn plan(graph: &Graph, target: &Target) -> PlanFacts {
-    let program = compile(graph, target, &options()).expect("the prefill compiles");
-    let launches = program
-        .planned()
-        .map(|(_, plan)| plan.dispatches().len())
-        .sum();
-    let (mut tiled, mut serial) = (0, 0);
-    for eqn in &program.graph().eqns {
-        match program.kernel_choice(eqn) {
-            KernelChoice::Generated(KernelRequest::Contraction(
-                ContractionSpec::Serial { .. } | ContractionSpec::DenseSerial { .. },
-            )) => serial += 1,
-            KernelChoice::Generated(KernelRequest::Contraction(
-                ContractionSpec::TiledRegion { .. }
+/// The prefill of the whole prompt: tokens inside the vocabulary and away from its end-of-sequence id.
+fn prompt() -> Step {
+    let ids: Vec<i32> = (0..PROMPT as i32).map(|t| (3 * t + 1) % 40).collect();
+    Step::new(Phase::Prefill, &ids, 0)
+}
+
+fn is_tiled(choice: &KernelChoice) -> bool {
+    matches!(
+        choice,
+        KernelChoice::Generated(KernelRequest::Contraction(
+            ContractionSpec::TiledRegion { .. }
                 | ContractionSpec::DenseTiled { .. }
                 | ContractionSpec::TensorCore { .. }
                 | ContractionSpec::Coopmat { .. },
-            )) => tiled += 1,
-            _ => {}
+        ))
+    )
+}
+
+/// What `compile` planned for the prefill.
+struct PlanFacts {
+    passes: Vec<&'static str>,
+    /// Contractions planned on a generated tiled schedule.
+    tiled: usize,
+    /// Router-logits contractions (`[PROMPT, experts]`) planned on a generated tiled schedule.
+    tiled_routers: usize,
+}
+
+fn plan(graph: &Graph<ValidationOutputs>, target: &Target, experts: usize) -> PlanFacts {
+    let program = poot_graph_plan::compile(
+        graph,
+        target,
+        &poot_graph_plan::CompileOptions::new(
+            poot_graph_plan::Submission::Replay,
+            poot_graph_plan::CompileLimits::STANDARD,
+        ),
+    )
+    .expect("the prefill compiles");
+    let router_shape = [PROMPT, experts];
+    let (mut tiled, mut tiled_routers) = (0, 0);
+    for eqn in &program.graph().eqns {
+        if is_tiled(program.kernel_choice(eqn)) {
+            tiled += 1;
+            if program.graph().aval(eqn.out).shape == router_shape {
+                tiled_routers += 1;
+            }
         }
     }
     PlanFacts {
-        launches,
         passes: program.passes().collect(),
         tiled,
-        serial,
+        tiled_routers,
     }
+}
+
+/// The CPU oracle's logits for `graph`: the fixture's weights through its map, every slot its step
+/// input, every state zero (at its own dtype).
+fn oracle_logits(fixture: &Fixture, graph: &Graph<ValidationOutputs>, step: &Step) -> HostTensor {
+    let zeros: Vec<HostTensor> = graph
+        .state
+        .iter()
+        .map(|&(state, _)| {
+            let aval = graph.aval(state);
+            match aval.dtype {
+                poot_tensor::DType::I32 => {
+                    HostTensor::i32(aval.shape.clone(), vec![0; aval.numel()])
+                }
+                _ => HostTensor::zeros(aval.shape.clone()),
+            }
+        })
+        .collect();
+    poot_test_util::weight_map_oracle::eval_mapped(
+        graph,
+        &fixture.store,
+        &fixture.map,
+        &step.slots(),
+        &zeros,
+    )
+    .0
 }
 
 struct Run {
@@ -303,53 +146,30 @@ struct Run {
     engine_wall: Duration,
 }
 
-/// Loads, records and replays the prefill compiled for `target` on `engine` (the device reports its hang fact
-/// through `guarded`).
+/// Loads, records and replays the prefill compiled for `target` on `engine`.
 fn run(
-    engine: &mut Engine<HangFact<PtxDevice>>,
-    guarded: &Cell<bool>,
+    engine: &mut Engine<PtxDevice>,
     target: Target,
-    graph: &Graph,
+    fixture: &Fixture,
+    graph: &Graph<ValidationOutputs>,
+    step: &Step,
 ) -> Run {
-    guarded.set(target.caps.known_miscompiles.routed_expert_tiling_hang);
-    let options = options();
-    let staged = compile_staged(
-        &graph.clone().with_validations(Vec::new()),
-        &TargetSet::single(DeviceId(0), target),
-        &Partition {
-            experts: ExpertPlacement::AllResident,
-            devices: DevicePlacement::Single(DeviceId(0)),
-        },
-        &options,
-    )
-    .expect("the prefill stages");
+    let staged = weight_map::compile(graph, target);
     let exe = engine
-        .load_weights(weights(graph), WeightSource::ConstNames)
+        .load_weights(Arc::clone(&fixture.store), Arc::clone(&fixture.map))
         .expect("weights load");
     let entry = engine.add_entry(exe, &staged).expect("the entry loads");
-    let step = step_inputs(graph);
-    let inputs = || {
-        let mut inputs = StepInputs::new();
-        for fixture in &step {
-            inputs.push(
-                fixture.key.clone(),
-                fixture.tensor.shape(),
-                fixture.tensor.view(),
-            );
-        }
-        inputs
-    };
     let mark = engine.stats().timing.mark();
     let started = Instant::now();
     let logits = engine
-        .step(exe, entry, &inputs(), &mut NoSync)
+        .step(exe, entry, &step.inputs(), &mut NoSync)
         .expect("the recording step")
         .to_host()
         .expect("logits read back");
     let recording = started.elapsed();
     let started = Instant::now();
     let replayed = engine
-        .step(exe, entry, &inputs(), &mut NoSync)
+        .step(exe, entry, &step.inputs(), &mut NoSync)
         .expect("the replay step")
         .to_host()
         .expect("replayed logits read back");
@@ -402,85 +222,54 @@ fn within_deadline<T>(what: &str, work: impl FnOnce() -> T) -> T {
     out
 }
 
-/// The unguarded program runs the passes the guard skips and plans tiled contractions, launches fewer
-/// kernels, completes within the deadline and matches the guarded program's logits.
+/// The prefill runs every pass and plans tiled contractions (the router's among them), completes within the
+/// deadline and matches the CPU oracle.
 #[test]
 fn routed_prefill_unguarded_ptx() {
     let Some(device) = open_or_skip(DeviceBackend::Ptx, PtxDevice::new()) else {
         return;
     };
-    let guarded_target = device.target();
-    assert!(
-        guarded_target
-            .caps
-            .known_miscompiles
-            .routed_expert_tiling_hang,
-        "the live PTX device reports the routed-expert hang"
+    let target = device.target();
+    let fixture = fixture();
+    let step = prompt();
+    let graph = weight_map::trace(
+        &*fixture.model,
+        &fixture.map,
+        Phase::Prefill,
+        PROMPT,
+        weight_map::CAPACITY,
     );
-    let mut unguarded_target = guarded_target;
-    unguarded_target
-        .caps
-        .known_miscompiles
-        .routed_expert_tiling_hang = false;
-    let graph = trace_qwen38_prefill(&qwen38_config(), PROMPT);
-    // The plan rows run before anything executes: a plan that does not differ is a red row without a launch.
-    let (guarded_plan, unguarded_plan) = (
-        plan(&graph, &guarded_target),
-        plan(&graph, &unguarded_target),
-    );
+    // The plan rows run before anything executes: a plan without the passes is a red row without a launch.
+    let facts = plan(&graph, &target, 4);
     for pass in ["flash_attention_capped", "fuse"] {
-        assert!(
-            unguarded_plan.passes.contains(&pass) && !guarded_plan.passes.contains(&pass),
-            "{pass}: the unguarded program runs it and the guarded one skips it"
-        );
+        assert!(facts.passes.contains(&pass), "{pass}: the program runs it");
     }
-    assert_eq!(
-        guarded_plan.tiled, 0,
-        "the guard keeps every contraction off the generated tiled GEMM"
-    );
     assert!(
-        unguarded_plan.tiled > 0,
-        "the unguarded program plans a generated tiled contraction"
-    );
-    assert!(
-        unguarded_plan.launches < guarded_plan.launches,
-        "unguarded {} launches, guarded {}",
-        unguarded_plan.launches,
-        guarded_plan.launches
+        facts.tiled_routers > 0,
+        "the router-logits contraction plans a generated tiled schedule"
     );
 
-    let guarded_flag = Rc::new(Cell::new(true));
-    let mut engine = Engine::new(HangFact {
-        device,
-        guarded: Rc::clone(&guarded_flag),
+    let mut engine = Engine::new(device);
+    let result = within_deadline("routed prefill", || {
+        run(&mut engine, target, &fixture, &graph, &step)
     });
-    let guarded = within_deadline("guarded prefill", || {
-        run(&mut engine, &guarded_flag, guarded_target, &graph)
-    });
-    let unguarded = within_deadline("unguarded prefill", || {
-        run(&mut engine, &guarded_flag, unguarded_target, &graph)
-    });
-    for (name, plan, run) in [
-        ("guarded", &guarded_plan, &guarded),
-        ("unguarded", &unguarded_plan, &unguarded),
-    ] {
-        eprintln!(
-            "POOT-1038 ptx {name}: launches={} tiled={} serial={} recording={:?} replay={:?} engine_wall={:?}",
-            plan.launches, plan.tiled, plan.serial, run.recording, run.replay, run.engine_wall
-        );
-    }
+    eprintln!(
+        "POOT-1038 ptx: tiled={} routers={} recording={:?} replay={:?} engine_wall={:?}",
+        facts.tiled, facts.tiled_routers, result.recording, result.replay, result.engine_wall
+    );
     let (got, want) = (
-        unguarded.logits.as_f32().unwrap(),
-        guarded.logits.as_f32().unwrap(),
+        result.logits.as_f32().unwrap(),
+        oracle_logits(&fixture, &graph, &step)
+            .as_f32()
+            .unwrap()
+            .to_vec(),
     );
-    assert!(
-        got.iter().all(|v| v.is_finite()),
-        "unguarded logits {got:?}"
-    );
-    for (index, (g, w)) in got.iter().zip(want).enumerate() {
+    assert!(got.iter().all(|v| v.is_finite()), "logits {got:?}");
+    assert_eq!(got.len(), want.len(), "logits length");
+    for (index, (g, w)) in got.iter().zip(&want).enumerate() {
         assert!(
             (g - w).abs() <= 1e-3 * (1.0 + w.abs()),
-            "logit {index}: unguarded {g}, guarded {w}"
+            "logit {index}: device {g}, oracle {w}"
         );
     }
 }

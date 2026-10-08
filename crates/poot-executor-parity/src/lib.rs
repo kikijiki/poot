@@ -34,10 +34,12 @@ pub mod bf16_cast;
 pub mod capture;
 pub mod dense;
 pub mod gdn;
-pub mod hung;
 pub mod launch;
+pub mod live_attention;
+pub mod lora;
 pub mod packed;
 pub mod routing;
+pub mod scan;
 pub mod select;
 pub mod weight_map;
 
@@ -55,6 +57,7 @@ use poot_models::model::{LogitRows, Phase};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::{DType, HostTensor};
 use poot_test_util::StepFixture;
+use poot_test_util::const_weights::ConstWeights;
 
 /// One parity fixture: a graph, the weight store it binds, and the input values for its first few
 /// steps (enough to exercise the record-then-replay boundary at least twice).
@@ -63,11 +66,6 @@ pub struct Fixture {
     pub graph: Graph,
     pub store: WeightStore,
     pub steps: Vec<Vec<StepFixture>>,
-    /// Whether the fixture compiles under the routed-expert hang guard: its graph carries a routed-expert
-    /// site and its target has the hang, so the program is the guarded one (one kernel per equation, no
-    /// tiled GEMM). Most fixtures run the full pipeline; a fixture for a kernel choice the guard changes
-    /// says so.
-    pub guarded: bool,
 }
 
 fn fill(n: usize, seed: u64) -> Vec<f32> {
@@ -121,7 +119,6 @@ fn store_with(g: &Graph, adjust: impl Fn(&str, &mut [f32])) -> WeightStore {
 }
 
 fn step_fixtures(g: &Graph, tokens: &[u32], start: usize) -> Vec<StepFixture> {
-    let pos = start + tokens.len() - 1;
     g.inputs
         .iter()
         .filter_map(|&id| {
@@ -139,7 +136,6 @@ fn step_fixtures(g: &Graph, tokens: &[u32], start: usize) -> Vec<StepFixture> {
                     let tokens_axis = *shape.last().unwrap_or(&1);
                     (0..tokens_axis).map(|i| (start + i) as f64).collect()
                 }
-                Slot::SeqLen => vec![(pos + 1) as f64],
                 other => panic!("fixture graph has no {other:?} slot"),
             };
             let tensor = match dtype {
@@ -198,7 +194,6 @@ pub(crate) fn decode_fixture(
         graph: g,
         store,
         steps,
-        guarded: false,
     }
 }
 
@@ -224,7 +219,6 @@ fn prefill_fixture(
         graph: g,
         store,
         steps,
-        guarded: false,
     }
 }
 
@@ -307,18 +301,12 @@ fn checkpoint_projection_fixture(
     k: usize,
     n: usize,
     weight: DType,
-    guarded: bool,
 ) -> Fixture {
     let b = poot_graph_ir::Builder::new();
     let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![m, k]));
     let w = b.constant("w", TensorType::new(vec![n, k], weight));
     let out = b.matmul(x, b.transpose(w, vec![1, 0]));
     let graph = b.finish(out);
-    let graph = if guarded {
-        poot_test_util::graph_fixtures::with_routed_expert_site(graph)
-    } else {
-        graph
-    };
     let key = graph.meta(x.id).slot_key().unwrap().clone();
     let steps = (0..2u64)
         .map(|step| {
@@ -337,7 +325,6 @@ fn checkpoint_projection_fixture(
         graph,
         store,
         steps,
-        guarded,
     }
 }
 
@@ -377,8 +364,7 @@ fn narrow_weight_store(name: &str, shape: Vec<usize>, dtype: DType) -> WeightSto
 /// Card 645 SC-001: [`checkpoint_projection_fixture`] at the decode GEMV (`M = 1`), a few rows (`M = 4`) and a
 /// prefill (`M = 33`, not a multiple of the 16-row tile), with `K = 200` (past one 128-lane workgroup and
 /// not a multiple of the K-unroll) and `N = 37` (not a multiple of the 8-column tile); plus a `K` that is a
-/// multiple of the K-unroll, and one prefill under the routed-expert hang guard, which keeps a matmul off the
-/// generated tiled GEMM and so runs the one-thread-per-output `[N, K]` kernel.
+/// multiple of the K-unroll.
 pub fn checkpoint_projection_fixtures() -> Vec<Fixture> {
     checkpoint_projection_set(
         [
@@ -386,15 +372,13 @@ pub fn checkpoint_projection_fixtures() -> Vec<Fixture> {
             "checkpoint_projection_m4",
             "checkpoint_projection_m33",
             "checkpoint_projection_m33_k64",
-            "checkpoint_projection_m33_moe_hang_guard",
         ],
         DType::F32,
     )
 }
 
 /// Card 1007: the same table over an F16 `[N, K]` weight: the decode GEMV (`M = 1`), the tiled GEMM (`M = 4`,
-/// `33`, and a `K` that is a multiple of the K-unroll), and the one-thread-per-output kernel under
-/// the routed-expert hang guard, each reading the weight's packed binary16 words. `N * K` is odd in the
+/// `33`, and a `K` that is a multiple of the K-unroll), each reading the weight's packed binary16 words. `N * K` is odd in the
 /// `K = 200, N = 37` rows, so the last packed word carries one element and a zero pad.
 pub fn checkpoint_projection_f16_fixtures() -> Vec<Fixture> {
     checkpoint_projection_set(
@@ -403,15 +387,13 @@ pub fn checkpoint_projection_f16_fixtures() -> Vec<Fixture> {
             "checkpoint_projection_f16_m4",
             "checkpoint_projection_f16_m33",
             "checkpoint_projection_f16_m33_k64",
-            "checkpoint_projection_f16_m33_moe_hang_guard",
         ],
         DType::F16,
     )
 }
 
 /// Card 1024: the same table over a BF16 `[N, K]` weight: the decode GEMV (`M = 1`), the generated tiled GEMM
-/// (`M = 4`, `33`, and a `K` that is a multiple of the K-unroll) and the one-thread-per-output kernel under
-/// the routed-expert hang guard, each reading the weight's packed bfloat16 words. `N * K` is odd in the
+/// (`M = 4`, `33`, and a `K` that is a multiple of the K-unroll), each reading the weight's packed bfloat16 words. `N * K` is odd in the
 /// `K = 200, N = 37` rows, so the last packed word carries one element and a zero pad.
 pub fn checkpoint_projection_bf16_fixtures() -> Vec<Fixture> {
     checkpoint_projection_set(
@@ -420,21 +402,85 @@ pub fn checkpoint_projection_bf16_fixtures() -> Vec<Fixture> {
             "checkpoint_projection_bf16_m4",
             "checkpoint_projection_bf16_m33",
             "checkpoint_projection_bf16_m33_k64",
-            "checkpoint_projection_bf16_m33_moe_hang_guard",
         ],
         DType::BF16,
     )
 }
 
-/// The shared projection table, named `[m1, m4, m33, m33_k64, m33_moe_hang_guard]`.
-fn checkpoint_projection_set(names: [&'static str; 5], weight: DType) -> Vec<Fixture> {
-    let [m1, m4, m33, m33_k64, moe] = names;
+/// POOT-1048: a grouped projection against a BF16 weight held as one checkpoint `[groups * N, K]` matrix, read as
+/// `groups` blocks of rows: `matmul(x, transpose(reshape(w, [groups, N, K]), [0, 2, 1]))` with `x` a
+/// `[groups, m, k]` activation slot (DeepSeek V4's `wo_a`). `compile` folds the chain into one
+/// `GroupedDenseContraction` that reads `w` as stored, so no device `transpose` runs and the weight stays BF16
+/// resident. Two steps with different activations, so the replayed step is checked against the oracle too.
+fn grouped_projection_fixture(
+    name: &'static str,
+    groups: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Fixture {
+    let b = poot_graph_ir::Builder::new();
+    let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![groups, m, k]));
+    let w = b.constant("w", TensorType::new(vec![groups * n, k], DType::BF16));
+    let blocks = b.reshape(w, vec![groups, n, k]);
+    let out = b.matmul(x, b.transpose(blocks, vec![0, 2, 1]));
+    let graph = b.finish(out);
+    let key = graph.meta(x.id).slot_key().unwrap().clone();
+    let steps = (0..2u64)
+        .map(|step| {
+            vec![StepFixture {
+                key: key.clone(),
+                tensor: HostTensor::f32(vec![groups, m, k], fill(groups * m * k, 0x6A0B + step)),
+            }]
+        })
+        .collect();
+    Fixture {
+        name,
+        graph,
+        store: narrow_weight_store("w", vec![groups * n, k], DType::BF16),
+        steps,
+    }
+}
+
+/// POOT-1048: [`grouped_projection_fixture`] with three groups at a decode row (`M = 1`), a few rows (`M = 5`) and a
+/// prefill (`M = 33`), `K = 71` (past one 64-lane run and odd) and `N = 37`, so `groups * N * K` is odd and the
+/// weight's last packed bfloat16 word carries one element and a zero pad; plus a single group, which the
+/// grouped body must read as the ungrouped one.
+pub fn grouped_projection_bf16_fixtures() -> Vec<Fixture> {
     vec![
-        checkpoint_projection_fixture(m1, 1, 200, 37, weight, false),
-        checkpoint_projection_fixture(m4, 4, 200, 37, weight, false),
-        checkpoint_projection_fixture(m33, 33, 200, 37, weight, false),
-        checkpoint_projection_fixture(m33_k64, 33, 64, 40, weight, false),
-        checkpoint_projection_fixture(moe, 33, 200, 37, weight, true),
+        grouped_projection_fixture("grouped_projection_bf16_g3_m1", 3, 1, 71, 37),
+        grouped_projection_fixture("grouped_projection_bf16_g3_m5", 3, 5, 71, 37),
+        grouped_projection_fixture("grouped_projection_bf16_g3_m33", 3, 33, 71, 37),
+        grouped_projection_fixture("grouped_projection_bf16_g1_m5", 1, 5, 71, 37),
+    ]
+}
+
+/// POOT-1048: `fixture`'s program, as compiled for `target`, holds exactly one `GroupedDenseContraction` and
+/// neither a `Transpose` nor a `Cast`, so a device row shows the contraction it ran is the one the fold made and
+/// that the weight was read as stored (an unfolded chain computes the same values).
+pub fn assert_one_grouped_dense_contraction(fixture: &Fixture, target: Target) {
+    let ops = planned_ops(fixture, target);
+    let count = |prefix: &str| ops.iter().filter(|op| op.starts_with(prefix)).count();
+    assert_eq!(
+        (
+            count("grouped_dense_contraction"),
+            count("transpose"),
+            count("cast")
+        ),
+        (1, 0, 0),
+        "{}: {ops:?}",
+        fixture.name
+    );
+}
+
+/// The shared projection table, named `[m1, m4, m33, m33_k64]`.
+fn checkpoint_projection_set(names: [&'static str; 4], weight: DType) -> Vec<Fixture> {
+    let [m1, m4, m33, m33_k64] = names;
+    vec![
+        checkpoint_projection_fixture(m1, 1, 200, 37, weight),
+        checkpoint_projection_fixture(m4, 4, 200, 37, weight),
+        checkpoint_projection_fixture(m33, 33, 200, 37, weight),
+        checkpoint_projection_fixture(m33_k64, 33, 64, 40, weight),
     ]
 }
 
@@ -494,7 +540,6 @@ fn const_fixture(
         graph,
         store: store_from_tensors(consts),
         steps: (0..steps).map(|_| Vec::new()).collect(),
-        guarded: false,
     }
 }
 
@@ -506,6 +551,21 @@ fn view(step: &[StepFixture]) -> StepInputs<'_> {
     inputs
 }
 
+/// `fixture`'s graph with each const named by a weight id, and the map over `fixture.store` that
+/// binds those names (see [`poot_test_util::const_weights::ConstWeights`]). Deterministic: every
+/// call names the same consts the same way, so [`staged`] and [`fixture_weights`] agree.
+fn bound(fixture: &Fixture) -> (Graph, poot_quant::weights::WeightMap) {
+    let mut weights = ConstWeights::new(&fixture.store);
+    let graph = weights.graph(&fixture.graph);
+    (graph, weights.map())
+}
+
+/// How `fixture`'s executable binds its store: load `Arc::new(fixture.store.clone())` with this and
+/// add the entry [`staged`] compiles. The oracle keeps reading `fixture.graph` and `fixture.store`.
+pub fn fixture_weights(fixture: &Fixture) -> Arc<poot_quant::weights::WeightMap> {
+    Arc::new(bound(fixture).1)
+}
+
 /// Compile `fixture.graph` for `target` under `submission`, single-stage, single-device (Card
 /// 546a's only shape).
 pub fn staged(
@@ -513,15 +573,7 @@ pub fn staged(
     target: Target,
     submission: Submission,
 ) -> StagedProgram<poot_graph_ir::ValidationOutputs> {
-    let g = fixture.graph.clone().with_validations(Vec::new());
-    let target = Target {
-        caps: if fixture.guarded {
-            poot_test_util::graph_fixtures::with_routed_expert_hang(target.caps)
-        } else {
-            target.caps
-        },
-        ..target
-    };
+    let g = bound(fixture).0.with_validations(Vec::new());
     compile_staged(
         &g,
         &TargetSet::single(DeviceId(0), target),
@@ -529,10 +581,7 @@ pub fn staged(
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions {
-            execution: submission,
-            limits: poot_graph_plan::CompileLimits::STANDARD,
-        },
+        &CompileOptions::new(submission, poot_graph_plan::CompileLimits::STANDARD),
     )
     .unwrap()
 }
@@ -615,13 +664,12 @@ pub fn run_once(
             .insert(c.name, WeightEntry::Dense(dense))
             .map_err(|e| format!("run_once: const `{}`: {e}", c.name))?;
     }
+    let store = builder.build();
+    let mut weights = ConstWeights::new(&store);
+    let g = weights.graph(g).with_validations(Vec::new());
     let exe = exec
-        .load_weights(
-            Arc::new(builder.build()),
-            poot_executor::WeightSource::ConstNames,
-        )
+        .load_weights(Arc::new(store.clone()), Arc::new(weights.map()))
         .map_err(|e| format!("run_once: load_weights: {e}"))?;
-    let g = g.clone().with_validations(Vec::new());
     let staged = compile_staged(
         &g,
         &TargetSet::single(DeviceId(0), target),
@@ -629,10 +677,7 @@ pub fn run_once(
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions {
-            execution: Submission::Replay,
-            limits: poot_graph_plan::CompileLimits::STANDARD,
-        },
+        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
     )
     .map_err(|e| format!("run_once: compile_staged: {e}"))?;
     let entry = exec
@@ -662,10 +707,7 @@ pub fn run_parity(
     oracle: &mut Oracle<'_>,
 ) -> Result<(), String> {
     let exe = exec
-        .load_weights(
-            Arc::new(fixture.store.clone()),
-            poot_executor::WeightSource::ConstNames,
-        )
+        .load_weights(Arc::new(fixture.store.clone()), fixture_weights(fixture))
         .map_err(|e| format!("{}: load_weights: {e}", fixture.name))?;
     let entry = exec
         .add_entry(exe, &staged(fixture, target, Submission::Replay))
@@ -719,10 +761,7 @@ pub fn run_outputs(
     fixture: &Fixture,
 ) -> Result<Vec<HostTensor>, String> {
     let exe = exec
-        .load_weights(
-            Arc::new(fixture.store.clone()),
-            poot_executor::WeightSource::ConstNames,
-        )
+        .load_weights(Arc::new(fixture.store.clone()), fixture_weights(fixture))
         .map_err(|e| format!("{}: load_weights: {e}", fixture.name))?;
     let entry = exec
         .add_entry(exe, &staged(fixture, target, Submission::Replay))
@@ -755,10 +794,7 @@ pub fn run_capture_replay(
     oracle: &mut Oracle<'_>,
 ) -> Result<(), String> {
     let exe = exec
-        .load_weights(
-            Arc::new(fixture.store.clone()),
-            poot_executor::WeightSource::ConstNames,
-        )
+        .load_weights(Arc::new(fixture.store.clone()), fixture_weights(fixture))
         .map_err(|e| format!("{}: load_weights: {e}", fixture.name))?;
     let entry = exec
         .add_entry(exe, &staged(fixture, target, Submission::Replay))
