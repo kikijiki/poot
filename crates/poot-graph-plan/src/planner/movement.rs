@@ -116,7 +116,6 @@ pub(super) fn plan(
             let data = shape(ids[0]);
             let index_shape = shape(ids[1]);
             let exact_index = analysis.required(ids[1]);
-            exact_i32_gather_data(analysis, eqn, ids[0])?;
             refuse_zero(out_shape.contains(&0) || data[*axis] == 0)?;
             // An E4M3FN gather indexes by the graph's f32 index convention.
             if packed && g.aval(ids[1]).dtype != DType::F32 {
@@ -277,6 +276,7 @@ pub(super) fn plan(
         | elementwise_ops!()
         | matmul_ops!()
         | attention_ops!()
+        | scan_ops!()
         | cast_ops!()
         | sampling_ops!() => unreachable!("plan_eqn routes only data-movement ops here"),
     };

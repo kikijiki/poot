@@ -342,6 +342,7 @@ fn mock_context(fail_at: Option<FailPoint>) -> (Context, Arc<MockDispatch>) {
                 tensor_core: poot_target::TensorCoreSupport::UnknownNotExposedByApi,
                 known_miscompiles: poot_target::KnownMiscompiles::default(),
                 compute_units: poot_target::STRIX_HALO_COMPUTE_UNITS,
+                memory_budget_bytes: None,
             },
             pipeline_cache: HashMap::new(),
             pipeline_builds: 0,

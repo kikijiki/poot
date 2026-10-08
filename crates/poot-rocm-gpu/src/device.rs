@@ -221,6 +221,10 @@ impl Device for RocmDevice {
         self.ctx.memory()
     }
 
+    fn free_memory_bytes(&self) -> Option<u64> {
+        self.ctx.vram_free_bytes()
+    }
+
     fn allocate(
         &mut self,
         role: BufferRole,

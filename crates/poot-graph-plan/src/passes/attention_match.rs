@@ -10,6 +10,9 @@ use poot_graph_ir::{
 pub(super) enum AttentionDecline {
     /// The root is not `MatMul(p, V)`.
     RootNotMatmul,
+    /// The chain is not F32: the generated attention kernel reads and writes F32 only, so a BF16 or F16
+    /// chain stays the decomposition (every primitive of it has a lowering at its own dtype).
+    NotF32,
     /// `p` is not `Div(e, denom)` (the two-pass softmax normalizer).
     NotDiv,
     /// `denom` is not a keepdim `Sum` over the same `e` on the last axis.
@@ -574,6 +577,9 @@ pub(super) fn match_attention<V: ValidationChannel>(
     // root: out = MatMul(p, v_rep)
     if !matches!(root.op, OpKind::MatMul) {
         return Err(AttentionDecline::RootNotMatmul);
+    }
+    if g.aval(root.out).dtype != DType::F32 {
+        return Err(AttentionDecline::NotF32);
     }
     let p = val(root.inputs.first().ok_or(AttentionDecline::RootNotMatmul)?)
         .ok_or(AttentionDecline::RootNotMatmul)?;

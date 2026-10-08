@@ -271,6 +271,40 @@ fn set(source: u64) -> AdapterSet {
     }
 }
 
+/// Two adapters ("a", "b") of rank 2 over the fake family's one projection (`in = 4`, `out = VOCAB`),
+/// deterministic from `seed`.
+fn adapters(seed: u32) -> Vec<poot_load::lora::LoraAdapter> {
+    ["a", "b"]
+        .into_iter()
+        .enumerate()
+        .map(|(i, _)| {
+            let fill = |n: usize, salt: u32| -> Vec<f32> {
+                (0..n)
+                    .map(|k| {
+                        (((k as u32 + 1) * (seed * 31 + i as u32 * 7 + salt)) % 13) as f32 / 13.0
+                            - 0.5
+                    })
+                    .collect()
+            };
+            poot_load::lora::LoraAdapter {
+                config: poot_load::lora::LoraAdapterConfig {
+                    r: 2,
+                    lora_alpha: 4.0,
+                    target_modules: vec!["q_proj".to_string()],
+                    use_rslora: false,
+                },
+                weights: std::collections::HashMap::from([(
+                    "model.layers.0.self_attn.q_proj".to_string(),
+                    poot_load::lora::LoraWeight {
+                        a: poot_tensor::HostTensor::f32(vec![4, 2], fill(8, 1)),
+                        b: poot_tensor::HostTensor::f32(vec![2, 12], fill(24, 2)),
+                    },
+                )]),
+            }
+        })
+        .collect()
+}
+
 fn lora_rig(options: RigOptions) -> Rig {
     paged_rig(RigOptions {
         variant: Variant::Lora,
@@ -299,13 +333,21 @@ fn last_step_bound(rig: &Rig, expected: &[f32]) -> bool {
 #[test]
 fn adapter_generations_have_their_own_entries_and_indices_do_not() {
     let mut rig = lora_rig(RigOptions::default());
-    let g1 = rig.driver.capture_adapter_set(set(1)).unwrap();
+    let g1 = rig
+        .driver
+        .capture_adapter_set(set(1), &adapters(1))
+        .unwrap();
     assert_eq!(
-        rig.driver.capture_adapter_set(set(1)).unwrap(),
+        rig.driver
+            .capture_adapter_set(set(1), &adapters(1))
+            .unwrap(),
         g1,
         "the same set"
     );
-    let g2 = rig.driver.capture_adapter_set(set(2)).unwrap();
+    let g2 = rig
+        .driver
+        .capture_adapter_set(set(2), &adapters(2))
+        .unwrap();
     assert_ne!(g1, g2, "a different source is a different generation");
 
     let heads = [Head::GREEDY];
@@ -398,8 +440,14 @@ fn a_new_adapter_generation_over_the_byte_budget_leaves_the_old_ones_running() {
         charge: |_| crate::driver::Retention::private(32),
         ..RigOptions::default()
     });
-    let g1 = rig.driver.capture_adapter_set(set(1)).unwrap();
-    let g2 = rig.driver.capture_adapter_set(set(2)).unwrap();
+    let g1 = rig
+        .driver
+        .capture_adapter_set(set(1), &adapters(1))
+        .unwrap();
+    let g2 = rig
+        .driver
+        .capture_adapter_set(set(2), &adapters(2))
+        .unwrap();
     let heads = [Head::GREEDY];
     rig.driver
         .prepare(&shapes(pool(4, 2), &[nz(1)], &heads, &[g1]))
@@ -926,7 +974,10 @@ fn a_failed_unload_leaves_the_generation_and_a_retry_frees_its_blocks() {
         capacity: 64,
         ..RigOptions::default()
     });
-    let g = rig.driver.capture_adapter_set(set(1)).unwrap();
+    let g = rig
+        .driver
+        .capture_adapter_set(set(1), &adapters(1))
+        .unwrap();
     rig.driver
         .prepare(&ServingShapes {
             warm: Warm::Admitted,
@@ -961,6 +1012,66 @@ fn a_failed_unload_leaves_the_generation_and_a_retry_frees_its_blocks() {
         rig.driver.free_blocks(),
         Some(4),
         "the unloaded generation's cached prefix blocks are freed"
+    );
+}
+
+/// An executable that cannot unload leaves the generation registered, mapped and retryable: the entries
+/// are gone, the generation still lists, capturing the same set returns it, and the retry frees it.
+/// Mutation: drop the map entry and the registry generation before `executor.unload`; the failed attempt
+/// strands the executable's weights and the retry finds no generation (`UnknownGeneration`).
+#[test]
+fn a_failed_executable_unload_leaves_the_generation_for_a_retry() {
+    let mut rig = lora_rig(RigOptions {
+        ..RigOptions::default()
+    });
+    let g = rig
+        .driver
+        .capture_adapter_set(set(1), &adapters(1))
+        .unwrap();
+    rig.driver
+        .prepare(&ServingShapes {
+            warm: Warm::Admitted,
+            ..shapes(pool(4, 1), &[nz(1)], &[Head::GREEDY], &[g])
+        })
+        .unwrap();
+    rig.world.borrow_mut().fail_unload = true;
+    let err = rig.driver.unload_adapter_set(g).unwrap_err();
+    assert!(matches!(err, DriverError::Device(_)), "{err:?}");
+    assert_eq!(
+        rig.driver
+            .capture_adapter_set(set(1), &adapters(1))
+            .unwrap(),
+        g,
+        "the generation is still registered: the same set is the same generation"
+    );
+    rig.world.borrow_mut().fail_unload = false;
+    rig.driver.unload_adapter_set(g).unwrap();
+    assert!(rig.driver.caps().unwrap().lora.is_none());
+}
+
+/// Two module paths that name one (layer, projection) are refused, not overwritten.
+#[test]
+fn an_adapter_naming_one_projection_twice_is_a_typed_refusal() {
+    let mut rig = lora_rig(RigOptions::default());
+    let mut twice = adapters(1);
+    let weight = twice[0].weights["model.layers.0.self_attn.q_proj"].clone();
+    // Leading zeros parse to the same layer index.
+    twice[0]
+        .weights
+        .insert("model.layers.00.self_attn.q_proj".to_string(), weight);
+    let err = rig.driver.capture_adapter_set(set(1), &twice).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            DriverError::Unsupported(crate::driver::error::Unsupported::Adapter(
+                crate::driver::lora::AdapterError::DuplicateModule {
+                    adapter: 0,
+                    layer: 0,
+                    ..
+                }
+            ))
+        ),
+        "{err:?}"
     );
 }
 

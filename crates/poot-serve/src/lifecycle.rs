@@ -3,12 +3,15 @@
 #[cfg(debug_assertions)]
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
+use std::os::fd::AsRawFd;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use poot_llm::{GenerationControl, LoraAdapterLease, Sampler, TokenLogprob};
+use poot_llm::driver::AdapterRef;
+use poot_llm::{GenerationControl, Sampler, TokenLogprob};
 
 use crate::types::{GenEvent, GenerationError, Job, PerTokenInfo, SHUTDOWN};
 
@@ -151,12 +154,7 @@ pub(crate) fn drain_cancellation_requested() -> bool {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkerKind {
-    /// A thread the server itself starts, such as the engine thread. None runs until the serving loop
-    /// lands; the registry's join and drain rules for it stay tested.
-    #[allow(
-        dead_code,
-        reason = "no server worker is started while there is no engine"
-    )]
+    /// A thread the server itself starts, such as the engine thread.
     Server,
     Connection,
 }
@@ -232,10 +230,6 @@ impl WorkerRegistry {
         }
     }
 
-    #[allow(
-        dead_code,
-        reason = "no server worker is started while there is no engine"
-    )]
     pub(crate) fn spawn(
         &mut self,
         name: impl Into<String>,
@@ -403,10 +397,48 @@ pub(crate) fn require_engine(
     engine.ok_or(GenerationError::NoEngine)
 }
 
+/// Whether the peer of `stream` has closed its end: an end-of-file read that consumes nothing. The
+/// request has been read in full by now, so a readable socket with no byte is a client that hung up (or
+/// half-closed, which an HTTP client does not do while it waits for a response).
+pub(crate) fn peer_closed(stream: &TcpStream) -> bool {
+    let mut byte = 0u8;
+    // SAFETY: `recv` writes at most one byte into `byte`, which outlives the call; the descriptor is
+    // owned by `stream`, and MSG_DONTWAIT keeps the shared socket's blocking mode untouched.
+    let read = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            (&raw mut byte).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    read == 0
+}
+
+/// Sets a job's `cancel` flag when the connection stops waiting for it, however it stops: a result, an
+/// error, a client that hung up or a write that failed. The engine releases the request at its next step
+/// boundary.
+pub(crate) struct JobGuard(Arc<AtomicBool>);
+
+impl JobGuard {
+    pub(crate) fn new() -> (Self, Arc<AtomicBool>) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        (Self(Arc::clone(&cancel)), cancel)
+    }
+}
+
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 /// Submit a job and block until it finishes, returning the token sequence and any per-token logprobs.
 /// `on_token` receives each streamed piece with its [`PerTokenInfo`]; non-streaming callers return
 /// `GenerationControl::Continue(())`. `Break(())` (e.g. after a client socket write fails) makes `submit`
-/// return early and drop the reply receiver, which the engine detects on its next send.
+/// return early. `client_gone` is polled while the job waits, so a client that hangs up on a request
+/// that streams nothing is noticed too. However `submit` returns, the job's [`JobGuard`] drops and the
+/// engine releases the request within one step.
 ///
 /// `lora_adapter` is the request-owned selection from `resolve_lora_adapter`; moving it into `Job` keeps
 /// the adapter unload-blocked while queued.
@@ -418,10 +450,12 @@ pub(crate) fn submit(
     sampler: Sampler,
     stop: Vec<String>,
     stream: bool,
-    lora_adapter: LoraAdapterLease,
+    lora_adapter: AdapterRef,
+    client_gone: &dyn Fn() -> bool,
     mut on_token: impl FnMut(&str, PerTokenInfo) -> GenerationControl,
 ) -> std::result::Result<(Vec<u32>, Vec<TokenLogprob>, bool), GenerationError> {
     let (reply, rx) = mpsc::channel();
+    let (_guard, cancel) = JobGuard::new();
     tx.send(Job {
         prompt: prompt.to_string(),
         max_new,
@@ -431,7 +465,7 @@ pub(crate) fn submit(
         reply,
         submitted: Instant::now(),
         lora_adapter,
-        mrope_positions: None,
+        cancel,
     })
     .map_err(|_| GenerationError::EngineUnavailable)?;
     loop {
@@ -440,7 +474,12 @@ pub(crate) fn submit(
         }
         let ev = match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(event) => event,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if client_gone() {
+                    return Err(GenerationError::ClientCancelled);
+                }
+                continue;
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(GenerationError::ReplyChannelClosed);
             }
@@ -448,7 +487,6 @@ pub(crate) fn submit(
         match ev {
             GenEvent::Token(piece, info) => {
                 if on_token(&piece, info).is_break() {
-                    // Client is gone: drop `rx` so the engine evicts the slot.
                     return Err(GenerationError::ClientCancelled);
                 }
             }

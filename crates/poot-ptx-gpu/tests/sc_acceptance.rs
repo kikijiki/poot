@@ -31,6 +31,7 @@ use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_runtime_common::DeviceBackend;
 use poot_tensor::HostTensor;
 use poot_tensor::{DType, HostView};
+use poot_test_util::const_weights::ConstWeights;
 use poot_test_util::{assert_close_rel, device_skip};
 
 const CAP: usize = 8;
@@ -111,6 +112,11 @@ fn store_for(graphs: &[&Graph]) -> WeightStore {
     builder.build()
 }
 
+/// How the executable binds `weights`' store: through the map naming each const by its weight id.
+fn map_source(weights: ConstWeights<'_>) -> Arc<poot_quant::weights::WeightMap> {
+    Arc::new(weights.map())
+}
+
 fn staged(
     g: &Graph,
     target: Target,
@@ -124,10 +130,7 @@ fn staged(
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions {
-            execution: submission,
-            limits: poot_graph_plan::CompileLimits::STANDARD,
-        },
+        &CompileOptions::new(submission, poot_graph_plan::CompileLimits::STANDARD),
     )
     .unwrap()
 }
@@ -141,7 +144,6 @@ struct SlotValue {
 }
 
 fn slot_values(g: &Graph, tokens: &[u32], start: usize) -> Vec<SlotValue> {
-    let pos = start + tokens.len() - 1;
     g.inputs
         .iter()
         .filter_map(|&id| {
@@ -159,7 +161,6 @@ fn slot_values(g: &Graph, tokens: &[u32], start: usize) -> Vec<SlotValue> {
                     let tokens_axis = *shape.last().unwrap_or(&1);
                     (0..tokens_axis).map(|i| (start + i) as f64).collect()
                 }
-                Slot::SeqLen => vec![(pos + 1) as f64],
                 other => panic!("qwen2 test graph has no {other:?} slot"),
             };
             Some(SlotValue {
@@ -300,14 +301,16 @@ fn sc001_dense_decode_golden_records_each_entry_once_ptx() {
     let decode_g = decode_graph();
     let store = Arc::new(store_for(&[&prefill_g, &decode_g]));
     let mut engine = Engine::new(ptx);
+    let mut weights = ConstWeights::new(&store);
+    let (prefill_named, decode_named) = (weights.graph(&prefill_g), weights.graph(&decode_g));
     let exe = engine
-        .load_weights(Arc::clone(&store), poot_executor::WeightSource::ConstNames)
+        .load_weights(Arc::clone(&store), map_source(weights))
         .unwrap();
     let prefill = engine
-        .add_entry(exe, &staged(&prefill_g, target, Submission::Replay))
+        .add_entry(exe, &staged(&prefill_named, target, Submission::Replay))
         .unwrap();
     let decode = engine
-        .add_entry(exe, &staged(&decode_g, target, Submission::Replay))
+        .add_entry(exe, &staged(&decode_named, target, Submission::Replay))
         .unwrap();
 
     let mut oracle_state = HashMap::new();
@@ -450,11 +453,13 @@ fn sc007_memory_counters_track_each_role_ptx() {
     let g = decode_graph();
     let store = Arc::new(store_for(&[&g]));
     let mut engine = Engine::new(ptx);
+    let mut weights = ConstWeights::new(&store);
+    let named = weights.graph(&g);
     let exe = engine
-        .load_weights(store, poot_executor::WeightSource::ConstNames)
+        .load_weights(Arc::clone(&store), map_source(weights))
         .unwrap();
     let decode = engine
-        .add_entry(exe, &staged(&g, target, Submission::Replay))
+        .add_entry(exe, &staged(&named, target, Submission::Replay))
         .unwrap();
     let values = slot_values(&g, &[5], 0);
     let _ = engine
@@ -590,17 +595,20 @@ fn sc009_failure_injection_aborts_once_and_retains_other_executables_ptx() {
     let store = Arc::new(store_for(&[&g]));
 
     let mut engine = Engine::new(FaultyOnceDevice { inner, armed: true });
+    let mut weights = ConstWeights::new(&store);
+    let named = weights.graph(&g);
+    let source = map_source(weights);
     let exe_bad = engine
-        .load_weights(Arc::clone(&store), poot_executor::WeightSource::ConstNames)
+        .load_weights(Arc::clone(&store), source.clone())
         .unwrap();
     let decode_bad = engine
-        .add_entry(exe_bad, &staged(&g, target, Submission::Replay))
+        .add_entry(exe_bad, &staged(&named, target, Submission::Replay))
         .unwrap();
     let exe_ok = engine
-        .load_weights(Arc::clone(&store), poot_executor::WeightSource::ConstNames)
+        .load_weights(Arc::clone(&store), source.clone())
         .unwrap();
     let decode_ok = engine
-        .add_entry(exe_ok, &staged(&g, target, Submission::Replay))
+        .add_entry(exe_ok, &staged(&named, target, Submission::Replay))
         .unwrap();
 
     let values = slot_values(&g, &[5], 0);
@@ -759,17 +767,20 @@ fn sc010_sc011_fixture() -> Option<(
         inner,
         armed: Rc::clone(&armed),
     });
+    let mut weights = ConstWeights::new(&store);
+    let named = weights.graph(&g);
+    let source = map_source(weights);
     let exe_bad = engine
-        .load_weights(Arc::clone(&store), poot_executor::WeightSource::ConstNames)
+        .load_weights(Arc::clone(&store), source.clone())
         .unwrap();
     let decode_bad = engine
-        .add_entry(exe_bad, &staged(&g, target, Submission::Replay))
+        .add_entry(exe_bad, &staged(&named, target, Submission::Replay))
         .unwrap();
     let exe_ok = engine
-        .load_weights(store, poot_executor::WeightSource::ConstNames)
+        .load_weights(Arc::clone(&store), source.clone())
         .unwrap();
     let decode_ok = engine
-        .add_entry(exe_ok, &staged(&g, target, Submission::Replay))
+        .add_entry(exe_ok, &staged(&named, target, Submission::Replay))
         .unwrap();
 
     let values = slot_values(&g, &[5], 0);
@@ -860,7 +871,7 @@ fn sc011_engine_drains_pending_release_once_synchronize_proves_completion_ptx() 
 /// Card 551b's sampling suffix (`poot_graph_ir::ops::sampling::sample_head`, appended via
 /// `Builder::resume` after a finished dense decode graph's raw logits - the same mechanism
 /// `poot-llm`'s `driver::suffix::with_head` uses, exercised here directly at the IR/executor
-/// level since `poot-ptx-gpu` cannot depend on `poot-llm`'s `Runner`) on real PTX hardware,
+/// level since `poot-ptx-gpu` cannot depend on `poot-llm`'s driver) on real PTX hardware,
 /// verified the same way the wgpu/ROCm legs are (`poot-llm`'s
 /// `tests/card551b_sampling_suffix.rs`): a device suffix row and the CPU oracle (`poot_eval::eval`
 /// on the identical suffix graph) must agree step by step given the same per-step seed/params and
@@ -936,11 +947,13 @@ fn card551b_sc001_device_suffix_matches_host_oracle_ptx() {
     let (base_g, suffix_g, seed_id, params_id) = card551b_suffix_graph(SampleRule::Gumbel);
     let store = Arc::new(store_for(&[&suffix_g]));
     let mut engine = Engine::new(ptx);
+    let mut weights = ConstWeights::new(&store);
+    let named = weights.graph(&suffix_g);
     let exe = engine
-        .load_weights(Arc::clone(&store), poot_executor::WeightSource::ConstNames)
+        .load_weights(Arc::clone(&store), map_source(weights))
         .unwrap();
     let entry = engine
-        .add_entry(exe, &staged(&suffix_g, target, Submission::Replay))
+        .add_entry(exe, &staged(&named, target, Submission::Replay))
         .unwrap();
 
     let mut oracle_state = HashMap::new();
@@ -1024,11 +1037,13 @@ fn card551b_sc003_nan_logits_are_a_typed_fault_ptx() {
         let store = Arc::new(builder.build());
 
         let mut engine = Engine::new(PtxDevice::new().expect("just verified PTX is available"));
+        let mut weights = ConstWeights::new(&store);
+        let named = weights.graph(&suffix_g);
         let exe = engine
-            .load_weights(Arc::clone(&store), poot_executor::WeightSource::ConstNames)
+            .load_weights(Arc::clone(&store), map_source(weights))
             .unwrap();
         let entry = engine
-            .add_entry(exe, &staged(&suffix_g, target, Submission::Replay))
+            .add_entry(exe, &staged(&named, target, Submission::Replay))
             .unwrap();
 
         let mut values = slot_values(&base_for_slots, &[poisoned_token], 0);

@@ -127,7 +127,7 @@ impl TextCodec {
 /// advances as each generated token is observed.
 ///
 /// - `Choices`: the completion must be one of a fixed set of strings (token-level). Built by
-///   [`Runner::build_choice_constraint`].
+///   [`TextCodec::build_choice_constraint`].
 /// - `Regex`: the completion must match a regex (byte-level DFA; a token is allowed if its bytes avoid
 ///   the dead state, and EOS is allowed in a match state). Built by [`TextCodec::build_regex_constraint`].
 #[derive(Clone)]
@@ -1142,18 +1142,20 @@ pub fn json_schema_to_regex(schema: &serde_json::Value) -> Result<String> {
 
 #[cfg(test)]
 mod guided_byte_table_cache {
-    use crate::core::runner::Runner;
+    use crate::text::tokenize::TextCodec;
+    use poot_models::chat::ChatFormat;
     use std::sync::Arc;
 
     #[test]
     fn byte_table_is_built_once_and_reused() {
-        // The per-token byte table is cached on the Runner: repeated builds return the same Arc.
+        // The per-token byte table is cached on the codec: repeated builds return the same Arc.
         // Skipped if the tokenizer model is absent.
         let Some(dir) = poot_test_util::model_path(poot_test_util::checkpoint!("qwen2.5-0.5b"))
         else {
             return;
         };
-        let r = Runner::load(&dir).expect("load qwen2.5-0.5b");
+        let r = TextCodec::from_hf_dir(&dir, 0, None, ChatFormat::ChatML)
+            .expect("load the qwen2.5-0.5b tokenizer");
         let a = r.token_byte_table();
         let b = r.token_byte_table();
         assert!(
@@ -1186,7 +1188,8 @@ mod guided_byte_table_cache {
         else {
             return;
         };
-        let r = Runner::load(&dir).expect("load qwen2.5-0.5b");
+        let r = TextCodec::from_hf_dir(&dir, 0, None, ChatFormat::ChatML)
+            .expect("load the qwen2.5-0.5b tokenizer");
         let d1 = r.guided_dfa("[0-9]{3}").unwrap();
         let d2 = r.guided_dfa("[0-9]{3}").unwrap();
         assert!(
@@ -1312,7 +1315,7 @@ mod guided_mask_fuzz {
             };
             let match_set: HashSet<Vec<u8>> = matches.iter().cloned().collect();
 
-            // the DFA-under-test, built exactly as Runner::build_regex_constraint does.
+            // the DFA-under-test, built exactly as TextCodec::build_regex_constraint does.
             let whole = format!("(?:{r})$");
             let dfa = match dense::Builder::new()
                 .configure(dense::Config::new().start_kind(StartKind::Anchored))

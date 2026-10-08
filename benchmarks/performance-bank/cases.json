@@ -1,0 +1,347 @@
+{
+  "schema": 1,
+  "description": "The small performance bank. Each case is one shape/storage/numerics point a backend runner (examples/performance_bank.rs in poot-gpu, poot-rocm-gpu, poot-ptx-gpu) measures through the executor contract. Identities are stamped by `python3 benchmarks/harness/performance_bank.py --stamp` and verified by `python3 benchmarks/harness/performance_bank.py`.",
+  "timing_policy": {
+    "warmup": 3,
+    "repeats": 9,
+    "clock": "wall step plus readback",
+    "profiled": false
+  },
+  "token_fixtures": {
+    "splitmix64-seed0-unit": {
+      "generator": "splitmix64",
+      "seed": 0,
+      "distribution": "uniform f32 in [-1, 1) from the top 24 bits of each draw",
+      "streams": "activation x, then weight w, then (attention) k and v, in that order"
+    }
+  },
+  "cache_conditions": {
+    "weights-rotated-beyond-cache": {
+      "kind": "weight-rotation",
+      "min_rotation_bytes": 268435456,
+      "rule": "weights are held as ceil(min_rotation_bytes / weight_bytes) distinct copies and consecutive steps use consecutive copies, so a step never finds its weights in the last-level cache"
+    },
+    "weights-resident-hot": {
+      "kind": "single-copy",
+      "rule": "one weight copy reused by every step; the working set fits the last-level cache whenever the device has one that large"
+    }
+  },
+  "cases": [
+    {
+      "id": "dense-decode-gemv",
+      "regime": "dense bandwidth decode",
+      "level": "kernel",
+      "producer": "dense_matmul",
+      "shape": {
+        "m": 1,
+        "k": 2048,
+        "n": 2048
+      },
+      "storage": "f32",
+      "layout": "kn",
+      "numerics": {
+        "accumulate": "f32",
+        "reference": "f64 loop"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-rotated-beyond-cache",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": null
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "runnable",
+      "fixture_id": "0ad1a71c6d24f3bc2392159466a45ddc4917660abc8a0641d8d737ae0564212f",
+      "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
+      "cache_id": "6f9c88e074c47ba8a55bcb66180a49c8d849dec363867775261398cb2d0fecd1",
+      "identity_digest": "ddf91990536c590e6c03a698de2f57569f07b1e6cb7ef9307e494694d835d35f"
+    },
+    {
+      "id": "batched-decode-gemm",
+      "regime": "batched decode",
+      "level": "kernel",
+      "producer": "dense_matmul",
+      "shape": {
+        "m": 8,
+        "k": 2048,
+        "n": 2048
+      },
+      "storage": "f32",
+      "layout": "kn",
+      "numerics": {
+        "accumulate": "f32",
+        "reference": "f64 loop"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-rotated-beyond-cache",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": null
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "runnable",
+      "fixture_id": "228393767282efe83de7a7b00e72f1b8eaf0ea5beb958944d3460b6c8c801703",
+      "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
+      "cache_id": "6f9c88e074c47ba8a55bcb66180a49c8d849dec363867775261398cb2d0fecd1",
+      "identity_digest": "f3f5253f9609272ca971cc3f5f97383f79217d3c74c17be0284c97cc08ec5dd6"
+    },
+    {
+      "id": "prefill-short-gemm",
+      "regime": "compute-heavy short prefill",
+      "level": "kernel",
+      "producer": "dense_matmul",
+      "shape": {
+        "m": 128,
+        "k": 2048,
+        "n": 2048
+      },
+      "storage": "f32",
+      "layout": "kn",
+      "numerics": {
+        "accumulate": "f32",
+        "reference": "f64 loop"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-resident-hot",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": null
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "runnable",
+      "fixture_id": "549c89c402368a7712b106156b068a98619f77aed62adcb8961a61f5c01d3675",
+      "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
+      "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
+      "identity_digest": "020641a8fe55fee7ed27ea7c63d13eefebf6d1e5cf2e51a54626393ddcbec3dd"
+    },
+    {
+      "id": "prefill-long-gemm",
+      "regime": "compute-heavy long prefill",
+      "level": "kernel",
+      "producer": "dense_matmul",
+      "shape": {
+        "m": 1024,
+        "k": 2048,
+        "n": 2048
+      },
+      "storage": "f32",
+      "layout": "kn",
+      "numerics": {
+        "accumulate": "f32",
+        "reference": "f64 loop"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-resident-hot",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": null
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "runnable",
+      "fixture_id": "2d68b9867ecf5cdd44b5ef0d9774ae489861a411d8921a58af7eb77ae9935f89",
+      "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
+      "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
+      "identity_digest": "40def952a68362d5cdbd199e077107c5c459107cbb019d8ebbabc12049da9685"
+    },
+    {
+      "id": "attention-low-head-decode",
+      "regime": "low-head low-occupancy attention",
+      "level": "kernel",
+      "producer": "attention_decode",
+      "shape": {
+        "hq": 2,
+        "hkv": 1,
+        "d": 128,
+        "cap": 4096
+      },
+      "storage": "f32",
+      "layout": "bhsd",
+      "numerics": {
+        "accumulate": "f32",
+        "scale": "1/sqrt(d)",
+        "reference": "f64 loop"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-resident-hot",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": null
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "runnable",
+      "fixture_id": "a16d4f12b40ee65b01efbf5668ef084b892cc3f79447350e2c6fb339c6937ab5",
+      "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
+      "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
+      "identity_digest": "199253cbba3a85b4fe014043d3d0db8d73a3ddf52869559a1716520b05811001"
+    },
+    {
+      "id": "packed-decode-gemv",
+      "regime": "packed bandwidth decode",
+      "level": "kernel",
+      "producer": "packed_linear",
+      "shape": {
+        "m": 1,
+        "k": 2048,
+        "n": 2048
+      },
+      "storage": "q8_0",
+      "layout": "nk",
+      "numerics": {
+        "accumulate": "f32",
+        "reference": "f64 loop over decoded weights"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-rotated-beyond-cache",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": null
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "planned",
+      "planned_reason": "no packed-weight bank producer in the backend runners yet; the packed gemv is measured by the request-level decode curve until then",
+      "fixture_id": "d1539fe2046fba85178e2d500ebc62aaeec4e8841d68c94230d3ccd411912ed4",
+      "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
+      "cache_id": "6f9c88e074c47ba8a55bcb66180a49c8d849dec363867775261398cb2d0fecd1",
+      "identity_digest": "2f2ed3bf0afcad8c113bc0821752baf53f270c5b16fceaadf9cc50bfaca9a233"
+    },
+    {
+      "id": "long-recurrence-scan",
+      "regime": "long recurrence",
+      "level": "kernel",
+      "producer": "recurrence_scan",
+      "shape": {
+        "heads": 4,
+        "d": 128,
+        "steps": 4096
+      },
+      "storage": "f32",
+      "layout": "bhsd",
+      "numerics": {
+        "accumulate": "f32",
+        "reference": "f64 loop"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-resident-hot",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": null
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "planned",
+      "planned_reason": "the recurrence producer card has not landed; card 667 activates this comparison after it does",
+      "fixture_id": "b70f2704cfb0f18871ef731629afdf80c560c65df485f4b4a5d731660c70177e",
+      "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
+      "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
+      "identity_digest": "dba518593fec4bb54cf5f501f455252efa9f54a09b2b45b109ef1360f0389b50"
+    },
+    {
+      "id": "expert-routing-sorted",
+      "regime": "sorted expert routing",
+      "level": "kernel",
+      "producer": "grouped_experts",
+      "shape": {
+        "tokens": 256,
+        "experts": 8,
+        "k": 1024,
+        "n": 1024,
+        "order": "sorted"
+      },
+      "storage": "f32",
+      "layout": "kn",
+      "numerics": {
+        "accumulate": "f32",
+        "reference": "f64 loop"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-rotated-beyond-cache",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": null
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "planned",
+      "planned_reason": "the grouped-expert bank producer is not in the backend runners yet",
+      "fixture_id": "002580dc406bf89b90ac095e27e11c8ad028aac9575049016f4f6741e6d8b41c",
+      "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
+      "cache_id": "6f9c88e074c47ba8a55bcb66180a49c8d849dec363867775261398cb2d0fecd1",
+      "identity_digest": "c21fb8b6389e4e4995428ab9ce5d3b5b3210949605caaaab189166facd9208c4"
+    },
+    {
+      "id": "expert-routing-shuffled",
+      "regime": "shuffled expert routing",
+      "level": "kernel",
+      "producer": "grouped_experts",
+      "shape": {
+        "tokens": 256,
+        "experts": 8,
+        "k": 1024,
+        "n": 1024,
+        "order": "shuffled"
+      },
+      "storage": "f32",
+      "layout": "kn",
+      "numerics": {
+        "accumulate": "f32",
+        "reference": "f64 loop"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-rotated-beyond-cache",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": null
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "planned",
+      "planned_reason": "the grouped-expert bank producer is not in the backend runners yet",
+      "fixture_id": "708d6ef3e5ed3a011dae1bf8d88c8b47b089a8d2d790da3154be34e5936846ec",
+      "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
+      "cache_id": "6f9c88e074c47ba8a55bcb66180a49c8d849dec363867775261398cb2d0fecd1",
+      "identity_digest": "fbcc9e47f31f99fa7a7c20631f84b79490e213d09e0f0e335471e429607db1c9"
+    }
+  ]
+}

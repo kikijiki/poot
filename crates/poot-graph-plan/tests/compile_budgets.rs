@@ -30,10 +30,7 @@ fn wgpu() -> Target {
 }
 
 fn options(limits: CompileLimits) -> CompileOptions {
-    CompileOptions {
-        execution: Submission::Replay,
-        limits,
-    }
+    CompileOptions::new(Submission::Replay, limits)
 }
 
 fn nz(n: usize) -> NonZeroUsize {

@@ -12,7 +12,11 @@ sys.path.insert(0, str(HARNESS_DIR))
 import bench  # noqa: E402
 import observer  # noqa: E402
 from runner_fixtures import (  # noqa: E402
+    timed_request,
     OPTIONAL_OBSERVER_FIELDS,
+    ROW_LEVEL_FRAMEWORKS,
+    row_level_curve,
+    row_level_single,
     curve_point,
     observation,
     run_fixture_runner,
@@ -91,6 +95,42 @@ class BenchmarkResultContractTests(unittest.TestCase):
         self.assertEqual(row["caveats"], ["manifest caveat", "runner caveat"])
         self.assert_schema_valid(row)
 
+    def test_each_non_claiming_framework_is_accepted_on_row_level_timing(self):
+        for framework in ROW_LEVEL_FRAMEWORKS:
+            for name, payload, scenario in (
+                ("single", row_level_single(framework), self.single_scenario),
+                ("curve", row_level_curve(framework), self.curve_scenario),
+            ):
+                with self.subTest(framework=framework, shape=name):
+                    row, _ = self.run_payload(payload, scenario=scenario, framework=framework)
+                    self.assertEqual(row["status"], "ok", row.get("reason"))
+                    self.assertEqual(row["timing_claim"], "row-level")
+                    self.assert_schema_valid(row)
+
+    def test_poot_claims_the_request_window_and_is_refused_without_it(self):
+        row, _ = self.run_payload(valid_single())
+        self.assertEqual((row["status"], row["timing_claim"]), ("ok", "request-window"))
+        curve, _ = self.run_payload(valid_curve(), scenario=self.curve_scenario)
+        self.assertEqual(curve["timing_claim"], "request-window")
+        # The same row-level payloads a non-claiming framework passes are refused for poot.
+        for payload, scenario, fragment in (
+            (row_level_single("poot") | {"build_sha": valid_single()["build_sha"], "family": "qwen2",
+                                          "backend": "ptx"}, self.single_scenario, "runs must be a non-empty array"),
+            (row_level_curve("poot") | {"build_sha": valid_single()["build_sha"], "family": "qwen2",
+                                         "backend": "ptx"}, self.curve_scenario, "missing required field"),
+        ):
+            with self.subTest(fragment=fragment):
+                refused, _ = self.run_payload(payload, scenario=scenario)
+                self.assertEqual(refused["status"], "error")
+                self.assertIn(fragment, refused["reason"])
+
+    def test_a_row_level_curve_still_checks_its_own_gaps(self):
+        payload = row_level_curve("vllm")
+        payload["curve"][0]["iters"][0]["itl_ms"] = [2.0]
+        row, _ = self.run_payload(payload, scenario=self.curve_scenario, framework="vllm")
+        self.assertEqual(row["status"], "error")
+        self.assertIn("must contain 2 samples", row["reason"])
+
     def test_invalid_single_results_are_error_rows(self):
         cases = (
             (
@@ -152,6 +192,16 @@ class BenchmarkResultContractTests(unittest.TestCase):
                 "reversed timing",
                 lambda row: row.update(e2e_ms=0.5),
                 "greater than or equal",
+            ),
+            (
+                "request window inconsistent",
+                lambda row: row["runs"][0].update(e2e_ms=0.5),
+                "runs[0].e2e_ms",
+            ),
+            (
+                "no per-request runs",
+                lambda row: row.pop("runs"),
+                "runs must be a non-empty array",
             ),
         )
         for name, mutate, expected in cases:
@@ -267,7 +317,7 @@ class BenchmarkResultContractTests(unittest.TestCase):
 
         def mutate_overflowing_throughput(row):
             for iteration in row["curve"][0]["iters"]:
-                iteration.update(ttft_ms=0.0, e2e_ms=1e-323)
+                iteration.update(timed_request([0.0, 1e-323, 2e-323], 2e-323))
 
         cases = (
             ("empty", lambda row: row.update(curve=[]), "non-empty array"),
@@ -287,7 +337,7 @@ class BenchmarkResultContractTests(unittest.TestCase):
             (
                 "short ITL samples",
                 lambda row: row["curve"][0]["iters"][0].update(itl_ms=[2.0]),
-                "must contain 2 samples",
+                "first gap may not be omitted",
             ),
             (
                 "nan sample",
@@ -304,19 +354,31 @@ class BenchmarkResultContractTests(unittest.TestCase):
             (
                 "reversed iteration timing",
                 lambda row: row["curve"][0]["iters"][0].update(e2e_ms=1.0),
-                "greater than",
+                "must equal TTFT + sum(ITL) + finish",
             ),
             (
-                "zero derived TPOT",
-                lambda row: row["curve"][0]["iters"][0].update(e2e_ms=4.0),
-                "greater than",
-            ),
-            (
-                "underflowing derived TPOT",
+                "zero TPOT",
                 lambda row: row["curve"][0]["iters"][0].update(
-                    ttft_ms=0.0, e2e_ms=5e-324
+                    timed_request([4.0, 4.0, 4.0], 10.0)
                 ),
-                "derived TPOT must be a finite positive",
+                "TPOT must be a finite positive",
+            ),
+            (
+                "early stop",
+                lambda row: row["curve"][0]["iters"][0].update(
+                    timed_request([4.0, 6.0], 8.0)
+                ),
+                "early stop: 2 of 3 requested tokens",
+            ),
+            (
+                "token computed outside the window",
+                lambda row: row["curve"][0]["iters"][0].update(steps=2),
+                "hidden outside the request window",
+            ),
+            (
+                "completion as last token",
+                lambda row: row["curve"][0]["iters"][0].update(last_token_ms=10.0, finish_ms=0.0),
+                "completion is not last-token delivery",
             ),
             (
                 "overflowing derived throughput",

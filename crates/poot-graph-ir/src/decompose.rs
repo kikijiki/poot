@@ -11,8 +11,8 @@ use crate::builder::{Builder, BuilderAppendPlan, Traced};
 use crate::error::BuilderAppendError;
 use crate::graph::{Graph, Operand, ValueId};
 use crate::op::{
-    ContractionHead, FusedOperand, FusedRegion, KeyLayout, KvBound, OpKind, PackedWeight,
-    RowRegion, RowStep,
+    ContractionHead, ContractionRows, FusedOperand, FusedRegion, KeyLayout, KvBound, OpKind,
+    PackedWeight, RowRegion, RowStep, ScanFamily,
 };
 use crate::ops;
 use crate::packed_source::packed_source_constants;
@@ -38,9 +38,12 @@ pub struct Decomposition {
 /// - `Rope { rot }`: [`ops::rope_partial`] over `x`'s last axis.
 /// - `ContractionEpilogue { head, region }`: the head op over its two operands, then the region's steps with
 ///   local 0 the head's result (the dtype the head declares: a narrow head has already rounded).
-/// - `PackedContraction { descriptor, blocks }`: `PackedDequant` of the carriers, then the `MatMul` of
-///   `ops::packed_linear` (`blocks == 1`) or `ops::packed_block_diagonal_linear` (`blocks > 1`).
+/// - `PackedContraction { descriptor, rows: Blocks(blocks) }`: `PackedDequant` of the carriers, then the `MatMul`
+///   of `ops::packed_linear` (`blocks == 1`) or `ops::packed_block_diagonal_linear` (`blocks > 1`). An
+///   `Indexed` one is a primitive: the oracle decodes only the experts the row ids select.
 /// - `DenseContraction { .. }`: `MatMul(activation, Transpose([1, 0], w))`, the chain the dense fold replaces.
+/// - `GroupedDenseContraction { groups, .. }`: `MatMul(activation, Transpose([0, 2, 1], Reshape([groups, N, K], w)))`,
+///   the chain the grouped fold replaces.
 /// - `DenseRowGather { .. }`: `Cast { to: F32 }` of `Gather { axis: 0 }`, the pair the row-gather fold
 ///   replaces.
 /// - `Fused(region)` / `FusedRow(region)`: the region's steps as equations, operands in place (a
@@ -105,23 +108,54 @@ pub fn decompose(op: &OpKind, operands: &[TensorType]) -> Option<Decomposition> 
             let last = shape.len() - 1;
             ops::rope_partial(&b, x, cos, sin, shape[last], *rot, last)
         }
+        OpKind::Scan(attrs) => {
+            // The definition unrolls one chunk body per chunk; the CPU oracle never evaluates it whole but one
+            // chunk window at a time (`poot_eval`), so the sequence length has no ceiling there.
+            attrs.layout(operands).ok()?;
+            match (attrs.family, inputs.as_slice()) {
+                (ScanFamily::DeltaRule, &[q, k, v, g, beta, s_in]) => {
+                    ops::scan_delta_rule_packed(&b, q, k, v, g, beta, s_in, attrs.chunk)
+                }
+                (ScanFamily::Ssd, &[x, b_in, c_in, delta, a, d, h_in]) => {
+                    ops::scan_ssd_packed(&b, x, b_in, c_in, delta, a, d, h_in, attrs.chunk)
+                }
+                _ => return None,
+            }
+        }
         OpKind::ContractionEpilogue { head, region } => {
             let (head_operands, extras) = inputs.split_at(head.operands());
             contraction_epilogue(&b, *head, region, head_operands, extras).ok()??
         }
         OpKind::Fused(region) => fused(&b, region, &inputs).ok()??,
         OpKind::FusedRow(region) => fused_row(&b, region, &inputs).ok()??,
-        OpKind::PackedContraction { descriptor, blocks } => {
+        OpKind::PackedContraction {
+            descriptor,
+            rows: ContractionRows::Blocks(blocks),
+        } => {
             let [activation, carriers @ ..] = inputs.as_slice() else {
                 return None;
             };
             packed_contraction(&b, *descriptor, *blocks, *activation, carriers)
         }
+        OpKind::PackedContraction {
+            rows: ContractionRows::Indexed { .. },
+            ..
+        } => return None,
         OpKind::DenseContraction { .. } => {
             let &[activation, weight] = inputs.as_slice() else {
                 return None;
             };
             b.matmul(activation, b.transpose(weight, vec![1, 0]))
+        }
+        OpKind::GroupedDenseContraction { groups, .. } => {
+            let &[activation, weight] = inputs.as_slice() else {
+                return None;
+            };
+            let [rows, k] = b.aval(weight).shape[..] else {
+                return None;
+            };
+            let blocks = b.reshape(weight, vec![*groups, rows / groups, k]);
+            b.matmul(activation, b.transpose(blocks, vec![0, 2, 1]))
         }
         OpKind::DenseRowGather { .. } => {
             let &[table, index] = inputs.as_slice() else {
@@ -406,6 +440,8 @@ mod tests {
             OpKind::FusedRow(_) => 27,
             OpKind::Attention(_) => 28,
             OpKind::Rope { .. } => 29,
+            OpKind::Scan(_) => 34,
+            OpKind::GroupedDenseContraction { .. } => 35,
             OpKind::AllReduce { .. } => 30,
             OpKind::AllGather { .. } => 31,
             OpKind::RandomUniform { .. } => 32,
@@ -413,7 +449,7 @@ mod tests {
         }
     }
 
-    const VARIANTS: usize = 34;
+    const VARIANTS: usize = 36;
 
     /// The epilogue region `(head + bias) + residual`: local 0 the head result, 1 the bias, 2 the residual.
     fn bias_residual_region() -> FusedRegion {
@@ -572,14 +608,14 @@ mod tests {
             (
                 OpKind::PackedContraction {
                     descriptor: packed,
-                    blocks: 1,
+                    rows: ContractionRows::Blocks(1),
                 },
                 with_sources(vec![f32(&[2, 32])], false),
             ),
             (
                 OpKind::PackedContraction {
                     descriptor: packed,
-                    blocks: 2,
+                    rows: ContractionRows::Blocks(2),
                 },
                 with_sources(vec![f32(&[2, 3, 32])], false),
             ),
@@ -600,6 +636,13 @@ mod tests {
             (
                 OpKind::DenseContraction { weight: DType::F16 },
                 vec![f32(&[2, 4]), typed(&[3, 4], DType::F16)],
+            ),
+            (
+                OpKind::GroupedDenseContraction {
+                    weight: DType::BF16,
+                    groups: 2,
+                },
+                vec![f32(&[2, 3, 4]), typed(&[10, 4], DType::BF16)],
             ),
             (
                 OpKind::DenseRowGather {
@@ -650,6 +693,35 @@ mod tests {
             (
                 OpKind::Rope { rot: 4 },
                 vec![f32(&[1, 2, 3, 8]), f32(&[3, 4]), f32(&[3, 4])],
+            ),
+            (
+                OpKind::Scan(crate::op::ScanAttrs {
+                    family: ScanFamily::DeltaRule,
+                    chunk: 4,
+                }),
+                vec![
+                    f32(&[1, 2, 6, 3]),
+                    f32(&[1, 2, 6, 3]),
+                    f32(&[1, 2, 6, 3]),
+                    f32(&[1, 2, 6, 1]),
+                    f32(&[1, 2, 6, 1]),
+                    f32(&[1, 2, 3, 3]),
+                ],
+            ),
+            (
+                OpKind::Scan(crate::op::ScanAttrs {
+                    family: ScanFamily::Ssd,
+                    chunk: 4,
+                }),
+                vec![
+                    f32(&[1, 2, 7, 3]),
+                    f32(&[1, 2, 7, 5]),
+                    f32(&[1, 2, 7, 5]),
+                    f32(&[1, 2, 7, 1]),
+                    f32(&[1, 2, 1, 1]),
+                    f32(&[1, 2, 1, 1]),
+                    f32(&[1, 2, 5, 3]),
+                ],
             ),
             (
                 OpKind::AllReduce {

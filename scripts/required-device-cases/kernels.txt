@@ -8,7 +8,6 @@
 # packed i32 lanes) the lane must compile and run on every kernels run, plus one ROCm dispatch of
 # the packed suites: it guards on its own context (not the lane's required wgpu backend), so a
 # hidden ROCm device turns it into a skip - and a skipped required case fails the gate.
-poot-kernelgen	packed::rocm_tests::materialize_matches_decode_blocks_on_rocm
 poot-kernelgen::exact_i32	exact_i32_fused_body_keeps_i32_locals_and_literals
 poot-kernelgen::exact_i32	exact_i32_scalar_body_keeps_i32_buffers_literals_and_arithmetic
 poot-kernelgen::exact_i32	exact_i32_shift_masks_the_amount

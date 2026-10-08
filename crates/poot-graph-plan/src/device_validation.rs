@@ -138,6 +138,7 @@ fn witness_op(op: &OpKind) -> WitnessOp {
         | OpKind::PackedContraction { .. }
         | OpKind::PackedRowGather { .. }
         | OpKind::DenseContraction { .. }
+        | OpKind::GroupedDenseContraction { .. }
         | OpKind::DenseRowGather { .. }
         | OpKind::ContractionEpilogue { .. }
         | OpKind::ArgTopK { .. }
@@ -149,6 +150,7 @@ fn witness_op(op: &OpKind) -> WitnessOp {
         | OpKind::FusedRow(_)
         | OpKind::Attention(_)
         | OpKind::Rope { .. }
+        | OpKind::Scan(_)
         | OpKind::AllReduce { .. }
         | OpKind::AllGather { .. }
         | OpKind::Iota { .. }

@@ -340,7 +340,7 @@ pub(crate) unsafe fn amd_cooperative_queues(funcs: &Funcs, agent: hsa_agent_t) -
 
 /// `HSA_AMD_AGENT_INFO_MEMORY_AVAIL` (0xA015): "the amount of memory available in bytes across all
 /// global pools owned by the agent" (`hsa_ext_amd.h`), a live driver query. The "free" half of the
-/// card 030 VRAM metric; see [`RocmContext::vram_used_bytes`].
+/// card 030 VRAM metric; see [`RocmContext::vram_free_bytes`].
 pub(crate) unsafe fn amd_agent_memory_avail(
     funcs: &Funcs,
     agent: hsa_agent_t,

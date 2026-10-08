@@ -17,8 +17,8 @@ use poot_graph_ir::{
 use poot_quant::weights::{NormRole, WeightId, WeightMap, WeightRole};
 use poot_tensor::DType;
 
-use super::embed::Embedding;
-use super::head::Head;
+use super::embed::{EmbedInputs, Embedding};
+use super::head::{Head, HeadKind};
 use super::linear::{Weight, WeightError};
 use super::norm::{NormParams, NormWeights, norm, norm_with};
 use crate::model::{
@@ -57,6 +57,8 @@ pub struct Step {
     shape: StepShape,
     tokens: Traced,
     pos: Traced,
+    embeds: Option<EmbedInputs>,
+    head: HeadKind,
     paged: Option<PagedMaps>,
     state: RefCell<Vec<(Traced, Traced)>>,
     validations: RefCell<Vec<ValidationOutput>>,
@@ -96,10 +98,42 @@ impl Step {
             shape,
             tokens: b.slot(Slot::Token, ids.clone()),
             pos: b.slot(Slot::Pos, ids),
+            embeds: None,
+            head: HeadKind::Logits,
             paged,
             state: RefCell::new(Vec::new()),
             validations: RefCell::new(Vec::new()),
         }
+    }
+
+    /// A step whose inputs are tokens with caller-computed embedding rows over some positions
+    /// ([`EmbedInputs`]): the two extra inputs are declared after the token and position inputs.
+    /// `width` is the model's embedding width.
+    pub fn with_embeds(b: &Builder, shape: StepShape, width: usize) -> Self {
+        let mut step = Self::new(b, shape);
+        step.embeds = Some(EmbedInputs::declare(
+            b,
+            shape.rows.get(),
+            shape.tokens.get(),
+            width,
+        ));
+        step
+    }
+
+    /// A step that returns the final hidden states instead of logits ([`HeadKind::Hidden`]).
+    pub fn returning_hidden(mut self) -> Self {
+        self.head = HeadKind::Hidden;
+        self
+    }
+
+    /// What the step returns.
+    pub fn head(&self) -> HeadKind {
+        self.head
+    }
+
+    /// The embedding rows scattered over the token embeddings; `None` for a plain token step.
+    pub fn embeds(&self) -> Option<EmbedInputs> {
+        self.embeds
     }
 
     /// The slot maps of a paged step; `None` under [`KvLayout::Contiguous`].
@@ -448,6 +482,11 @@ pub fn standard_stack(
     if let Some(embed_norm) = &w.embed_norm {
         x = norm_with(b, x, embed_norm, p.norm);
     }
+    // The caller's rows are the layer input itself: they replace the embedded tokens, after the
+    // embedding's own scale and norm.
+    if let Some(embeds) = step.embeds() {
+        x = embeds.scatter(b, x);
+    }
     for l in 0..layers {
         let _scope = b.layer_scope(l);
         x = layer(b, l, x);
@@ -457,6 +496,9 @@ pub fn standard_stack(
         x = b.slice(x, 1, tokens - 1, tokens);
     }
     let x = norm_with(b, x, &w.final_norm, p.norm);
+    if step.head() == HeadKind::Hidden {
+        return x;
+    }
     let logits = w.head.logits(b, x);
     let logits = match p.logit_divisor {
         Some(divisor) => b.binary_scalar(BinOp::Div, logits, Builder::f32(divisor)),
@@ -468,13 +510,16 @@ pub fn standard_stack(
     }
 }
 
-/// Refuse a step shape the dense decoder body cannot trace: a multi-token decode, a capacity above the model's maximum positions or more new tokens than the cache holds.
+/// Refuse a step shape the dense decoder body cannot trace: a multi-token decode, a capacity above the model's maximum positions or more new tokens than the cache holds. The two phases that change a step's inputs and output ([`Phase::PrefillEmbeds`] and [`Phase::Encode`]) are refused: a family that traces them calls [`check_embeddable_step`].
 pub fn check_step(
     family: FamilyKey,
     phase: Phase,
     shape: StepShape,
     max_positions: usize,
 ) -> Result<(), TraceError> {
+    if matches!(phase, Phase::PrefillEmbeds | Phase::Encode) {
+        return Err(TraceError::PhaseUnsupported { family, phase });
+    }
     let refuse = |reason| {
         Err(TraceError::ShapeUnsupported {
             family,
@@ -494,6 +539,21 @@ pub fn check_step(
     Ok(())
 }
 
+/// [`check_step`] for a family whose body also traces [`Phase::PrefillEmbeds`] and [`Phase::Encode`]:
+/// each is a prefill over the same cache shape, so each checks as one.
+pub fn check_embeddable_step(
+    family: FamilyKey,
+    phase: Phase,
+    shape: StepShape,
+    max_positions: usize,
+) -> Result<(), TraceError> {
+    let phase = match phase {
+        Phase::PrefillEmbeds | Phase::Encode => Phase::Prefill,
+        phase @ (Phase::Prefill | Phase::Decode) => phase,
+    };
+    check_step(family, phase, shape, max_positions)
+}
+
 /// The CPU-oracle harness the component tests share: a fixture weight store keyed by
 /// [`WeightId::const_name`], a binder from graph consts to its entries, and f64 comparisons.
 #[cfg(test)]
@@ -506,7 +566,7 @@ pub(crate) mod oracle {
     use poot_quant::weights::{
         DenseWeight, WeightEntry, WeightId, WeightKey, WeightMap, WeightStore, WeightView,
     };
-    use poot_quant::{PackedComponentRef, PackedPayload};
+    use poot_quant::{PackedComponentRef, PackedPayload, PackedStack, PackedStackComponentRef};
     use poot_tensor::DType;
     use poot_tensor::HostTensor;
 
@@ -527,11 +587,24 @@ pub(crate) mod oracle {
         (v.to_bits() >> 16) as u16
     }
 
+    /// A packed payload's logical `[rows, K]` values.
+    fn decoded(payload: &PackedPayload) -> Vec<f32> {
+        let [rows, k] = payload.weight().shape();
+        let mut out = vec![0.0; rows * k];
+        for (row, chunk) in out.chunks_mut(k).enumerate() {
+            payload.decode_row(row, chunk).unwrap();
+        }
+        out
+    }
+
     #[derive(Clone, Debug)]
     enum Stored {
         F32(Vec<f32>),
         Bf16(Vec<u16>),
+        E4m3(Vec<u8>),
         Packed(Arc<PackedPayload>),
+        /// The experts of one projection, each its own packed payload, viewed as one stack.
+        PackedStack(Vec<Arc<PackedPayload>>),
     }
 
     /// A fixture's weights: each id stored under its const name, or tied to another id's entry.
@@ -574,6 +647,14 @@ pub(crate) mod oracle {
                 .insert(id, (shape.to_vec(), Stored::Bf16(bits)));
         }
 
+        /// An E4M3FN weight with the given codes (finite ones: `0x7f` and `0xff` are NaN).
+        pub(crate) fn e4m3(&mut self, id: WeightId, shape: &[usize], codes: Vec<u8>) {
+            assert_eq!(codes.len(), shape.iter().product::<usize>());
+            assert!(codes.iter().all(|code| code & 0x7f != 0x7f), "finite codes");
+            self.entries
+                .insert(id, (shape.to_vec(), Stored::E4m3(codes)));
+        }
+
         /// An F32 weight with the given values.
         pub(crate) fn set(&mut self, id: WeightId, shape: &[usize], values: Vec<f32>) {
             assert_eq!(values.len(), shape.iter().product::<usize>());
@@ -586,6 +667,15 @@ pub(crate) mod oracle {
             let shape = payload.weight().shape().to_vec();
             self.entries
                 .insert(id, (shape, Stored::Packed(Arc::new(payload))));
+        }
+
+        /// A stack of packed experts (one payload per expert, in expert order) as the one weight `id`.
+        pub(crate) fn packed_stack(&mut self, id: WeightId, experts: Vec<PackedPayload>) {
+            let [out, k] = experts[0].weight().shape();
+            let shape = vec![experts.len(), out, k];
+            let owners = experts.into_iter().map(Arc::new).collect();
+            self.entries
+                .insert(id, (shape, Stored::PackedStack(owners)));
         }
 
         /// Map `id` onto `target`'s stored entry (a tied head).
@@ -602,14 +692,12 @@ pub(crate) mod oracle {
                     .iter()
                     .map(|&b| f32::from_bits(u32::from(b) << 16))
                     .collect(),
-                Stored::Packed(payload) => {
-                    let [rows, k] = payload.weight().shape();
-                    let mut out = vec![0.0; rows * k];
-                    for (row, chunk) in out.chunks_mut(k).enumerate() {
-                        payload.decode_row(row, chunk).unwrap();
-                    }
-                    out
-                }
+                Stored::E4m3(codes) => codes
+                    .iter()
+                    .map(|&code| poot_quant::scalar::e4m3fn_to_f32(code))
+                    .collect(),
+                Stored::Packed(payload) => decoded(payload),
+                Stored::PackedStack(experts) => experts.iter().flat_map(|e| decoded(e)).collect(),
             }
         }
 
@@ -626,7 +714,9 @@ pub(crate) mod oracle {
             let stored = match self.entries[&id].1 {
                 Stored::Bf16(_) => Stored::Bf16(values.into_iter().map(bf16_bits).collect()),
                 Stored::F32(_) => Stored::F32(values),
-                Stored::Packed(_) => panic!("perturb a dense weight"),
+                Stored::E4m3(_) | Stored::Packed(_) | Stored::PackedStack(_) => {
+                    panic!("perturb an F32 or BF16 weight")
+                }
             };
             self.entries.insert(id, (shape, stored));
         }
@@ -658,7 +748,21 @@ pub(crate) mod oracle {
                         )
                         .unwrap(),
                     ),
+                    Stored::E4m3(codes) => WeightEntry::Dense(
+                        DenseWeight::try_new(DType::E4M3FN, shape.clone(), codes.clone().into())
+                            .unwrap(),
+                    ),
                     Stored::Packed(payload) => WeightEntry::Packed(Arc::clone(payload)),
+                    Stored::PackedStack(experts) => {
+                        for (expert, payload) in experts.iter().enumerate() {
+                            sb.insert(
+                                format!("{}.{expert}", id.const_name()),
+                                WeightEntry::Packed(Arc::clone(payload)),
+                            )
+                            .unwrap();
+                        }
+                        continue;
+                    }
                 };
                 sb.insert(id.const_name(), entry).unwrap();
             }
@@ -668,9 +772,16 @@ pub(crate) mod oracle {
         pub(crate) fn map(&self) -> WeightMap {
             let store = self.store();
             let mut map = WeightMap::builder(&store);
-            for id in self.entries.keys() {
-                map.map(*id, WeightView::Stored(WeightKey::new(id.const_name())))
-                    .unwrap();
+            for (id, (_, stored)) in &self.entries {
+                let view = match stored {
+                    Stored::PackedStack(experts) => WeightView::ExpertStack(
+                        (0..experts.len())
+                            .map(|e| WeightKey::new(format!("{}.{e}", id.const_name())))
+                            .collect(),
+                    ),
+                    _ => WeightView::Stored(WeightKey::new(id.const_name())),
+                };
+                map.map(*id, view).unwrap();
             }
             for (id, target) in &self.ties {
                 map.map(*id, WeightView::Stored(WeightKey::new(target.const_name())))
@@ -730,6 +841,23 @@ pub(crate) mod oracle {
         named: &[(&str, &[i32])],
         state: &[&[f32]],
     ) -> (Vec<f32>, Vec<Vec<f32>>) {
+        eval_slots(g, store, map, consts, slots, (named, &[]), state)
+    }
+
+    /// Named slots by key spelling: I32 ones (a [`Slot::SlotMap`]'s tags) and F32 ones (a
+    /// `Slot::Activation` of pixels or embedding rows).
+    pub(crate) type NamedSlots<'a> = (&'a [(&'a str, &'a [i32])], &'a [(&'a str, &'a [f32])]);
+
+    /// [`eval_named`] with F32 named slots as well, bound by the same key spelling.
+    pub(crate) fn eval_slots<V: ValidationChannel>(
+        g: &Graph<V>,
+        store: &WeightStore,
+        map: &WeightMap,
+        consts: &[(&str, &[f32])],
+        slots: &[(Slot, &[i32])],
+        (named, floats): NamedSlots<'_>,
+        state: &[&[f32]],
+    ) -> (Vec<f32>, Vec<Vec<f32>>) {
         let ids: HashMap<String, WeightId> =
             map.iter().map(|(id, _, _)| (id.const_name(), id)).collect();
         // The weight's own entry: the stored one, or the rows of a fused or stacked view cut from
@@ -739,16 +867,36 @@ pub(crate) mod oracle {
                 .unwrap_or_else(|e| panic!("{id}: {e}"))
         };
         assert_eq!(state.len(), g.state.len(), "one value per state input");
+        // One stack per packed expert-stack id, shared by every source role that names it.
+        let mut stacks: HashMap<WeightId, Arc<PackedStack>> = HashMap::new();
         let mut inputs: HashMap<usize, Value> = HashMap::new();
+        // The harness carries every state as f32; an integer state (a token history) is exact
+        // below 2^24 and is bound at its own dtype.
         for (i, &(si, _)) in g.state.iter().enumerate() {
-            let shape = g.aval(si).shape.clone();
-            inputs.insert(si, HostTensor::f32(shape, state[i].to_vec()).into());
+            let aval = g.aval(si);
+            let tensor = match aval.dtype {
+                DType::I32 => HostTensor::i32(
+                    aval.shape.clone(),
+                    state[i].iter().map(|&v| v as i32).collect(),
+                ),
+                _ => HostTensor::f32(aval.shape.clone(), state[i].to_vec()),
+            };
+            inputs.insert(si, tensor.into());
         }
         for &id in &g.inputs {
             let meta = g.meta(id);
             let shape = meta.aval.shape.clone();
             let value: Value = match &meta.storage {
                 Storage::State | Storage::Computed(_) => continue,
+                Storage::Slot(_)
+                    if floats.iter().any(|(n, _)| Some(*n) == meta.name.as_deref()) =>
+                {
+                    let (_, values) = floats
+                        .iter()
+                        .find(|(n, _)| Some(*n) == meta.name.as_deref())
+                        .expect("matched above");
+                    HostTensor::f32(shape, values.to_vec()).into()
+                }
                 Storage::Slot(slot) => {
                     let by_name = named
                         .iter()
@@ -769,6 +917,28 @@ pub(crate) mod oracle {
                         HostTensor::f32(shape, values.to_vec()).into()
                     } else if let Some(&wid) = ids.get(name) {
                         match entry(wid) {
+                            // An index table (a hash router's): its words as they are stored.
+                            WeightEntry::Dense(dense) if dense.dtype() == DType::I32 => {
+                                let words = dense
+                                    .bytes()
+                                    .as_slice()
+                                    .as_chunks::<4>()
+                                    .0
+                                    .iter()
+                                    .map(|w| i32::from_le_bytes(*w))
+                                    .collect();
+                                HostTensor::i32(shape, words).into()
+                            }
+                            // E4M3FN codes: the oracle's carrier keeps them packed, not widened.
+                            WeightEntry::Dense(dense) if dense.dtype() == DType::E4M3FN => {
+                                Value::Host(
+                                    poot_eval::fp8::e4m3fn_tensor(
+                                        dense.shape().to_vec(),
+                                        dense.bytes().as_slice().to_vec(),
+                                    )
+                                    .unwrap(),
+                                )
+                            }
                             WeightEntry::Dense(dense) => {
                                 let mut one = WeightStore::builder();
                                 one.insert("w", WeightEntry::Dense(dense)).unwrap();
@@ -782,16 +952,31 @@ pub(crate) mod oracle {
                         }
                     } else if let Some(source) = PackedSourceName::parse(name) {
                         let wid = ids[source.linear_id()];
-                        let WeightEntry::Packed(payload) = entry(wid) else {
-                            panic!("{name} names a dense weight")
-                        };
-                        let role = payload
-                            .weight()
-                            .sources()
-                            .into_iter()
-                            .find(|&role| PackedSourceName::new(source.linear_id(), role) == source)
-                            .unwrap();
-                        Value::Packed(PackedComponentRef::new(Arc::clone(&payload), role))
+                        if matches!(map.view(wid), Some(WeightView::ExpertStack(_))) {
+                            let stack = stacks.entry(wid).or_insert_with(|| {
+                                Arc::new(
+                                    map.materialize_stack(wid, store)
+                                        .unwrap_or_else(|e| panic!("{wid}: {e}")),
+                                )
+                            });
+                            Value::PackedStack(PackedStackComponentRef::new(
+                                Arc::clone(stack),
+                                source.role(),
+                            ))
+                        } else {
+                            let WeightEntry::Packed(payload) = entry(wid) else {
+                                panic!("{name} names a dense weight")
+                            };
+                            let role = payload
+                                .weight()
+                                .sources()
+                                .into_iter()
+                                .find(|&role| {
+                                    PackedSourceName::new(source.linear_id(), role) == source
+                                })
+                                .unwrap();
+                            Value::Packed(PackedComponentRef::new(Arc::clone(&payload), role))
+                        }
                     } else {
                         panic!("no value for const {name}")
                     }
@@ -802,7 +987,13 @@ pub(crate) mod oracle {
         }
         let eval = poot_eval::eval(g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
             .unwrap_or_else(|e| panic!("oracle: {e}"));
-        let dense = |v: Value| v.into_host().unwrap().as_f32().unwrap().to_vec();
+        let dense = |v: Value| {
+            let host = v.into_host().unwrap();
+            match host.as_i32() {
+                Some(words) => words.iter().map(|&w| w as f32).collect(),
+                None => host.as_f32().unwrap().to_vec(),
+            }
+        };
         (
             dense(eval.output),
             eval.state.into_iter().map(dense).collect(),

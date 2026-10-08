@@ -11,6 +11,7 @@ HARNESS_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HARNESS_DIR))
 
 import bench  # noqa: E402
+import performance_receipt as receipts  # noqa: E402
 import observer  # noqa: E402
 from runner_fixtures import run_fixture_runner, valid_single  # noqa: E402
 
@@ -96,7 +97,7 @@ class RepeatsTests(unittest.TestCase):
                 self.assertTrue((results / run / "env.json").is_file(), run)
                 self.assertTrue((results / run / "report.md").is_file(), run)
             rows = [row for run in runs for row in bench._load_rows(results / run)]
-            (cell,) = bench.compare_cells(rows, rows)
+            (cell,) = bench.compare_cells(rows, rows, receipts.POLICY)
 
         self.assertEqual((cell["n_a"], cell["n_b"]), (3, 3))
         self.assertEqual(cell["key"][:3], ("fixture", "single", "poot"))
@@ -112,7 +113,7 @@ class RepeatsTests(unittest.TestCase):
             done = compare_cli(baseline, candidate)
 
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
-        self.assertIn(bench.WITHIN_NOISE, done.stdout)
+        self.assertIn(receipts.WITHIN_NOISE, done.stdout)
 
     def test_one_repeat_is_the_run_itself(self):
         with tempfile.TemporaryDirectory() as tmp:

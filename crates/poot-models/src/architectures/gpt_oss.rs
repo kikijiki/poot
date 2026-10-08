@@ -1044,7 +1044,11 @@ mod family_tests {
                 .iter()
                 .filter(|(_, _, handle)| matches!(handle.format, HandleFormat::Packed(_)))
                 .count();
-            assert_eq!(packed, if q8 { 2 * 3 * 8 } else { 0 }, "q8 = {q8}");
+            assert_eq!(
+                packed,
+                if q8 { 2 * 3 } else { 0 },
+                "q8 = {q8}: one packed stack per layer and projection"
+            );
         }
     }
 

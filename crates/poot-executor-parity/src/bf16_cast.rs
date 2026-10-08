@@ -64,7 +64,6 @@ pub fn bf16_const_cast_fixtures() -> Vec<Fixture> {
                 graph,
                 store: store.build(),
                 steps: vec![Vec::<StepFixture>::new()],
-                guarded: false,
             }
         })
         .collect()

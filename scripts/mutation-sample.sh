@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Recurring mutation sampling (card 538): cargo-mutants over a seeded sample of the modules
 # where 486's hand mutation sample left a live survivor (matcher legality, planner launch geometry and
-# device limits, oracle corners, the Runner's generation loops and sampler boundaries). It reports
+# device limits, oracle corners and sampler boundaries). It reports
 # survivors; it does not make them die (each stage card owns its own modules' tests, R486-015 out of
 # scope). A stage card that adds a seam over a high-survival cluster adds its own row to `modules` below.
 #
@@ -40,14 +40,14 @@ readonly modules=(
   "matcher|poot-graph-plan|crates/poot-graph-plan/src/passes/attention_match.rs|match_attention|match_pre_mask|peel_repeat_kv"
   "planner|poot-graph-plan|crates/poot-graph-plan/src/predicates.rs|is_movement_view_candidate|gemv_grid|attention_lanes|is_tiled_gemm_in|tiled_gemm_plan"
   "eval|poot-eval|crates/poot-eval/src/ops/cast.rs crates/poot-eval/src/walk.rs|narrow_f32|store_as|evaluate_composite"
-  "runner|poot-llm|crates/poot-llm/src/core/sampler.rs crates/poot-llm/src/core/generate.rs|Sampler::adjust|Sampler::apply_constraint_mask|Sampler::truncated_candidates|Sampler::pick|Runner::generate_sampled|Runner::generate_kv_masked_tokens|Runner::hit_stop"
+  "sampler|poot-llm|crates/poot-llm/src/core/sampler.rs|Sampler::adjust|Sampler::apply_constraint_mask|Sampler::truncated_candidates|Sampler::pick"
   # Epic 493's M4 packed-weight sample (designs/mutants-m4.md). These seeds name the function, not
   # `in <fn>$`: a whole-body replacement mutant ("replace check_blocks -> ... with Ok(())") carries no
   # ` in <fn>` suffix, so an `in`-anchored seed would drop exactly the mutants M4 found alive.
   "quant|poot-quant|crates/poot-quant/src/lib.rs crates/poot-quant/src/plan.rs|PackedPayload::decode_row|check_blocks|decode_blocks|scale_and_min|decode_dense"
   "packed-kernelgen|poot-kernelgen|crates/poot-kernelgen/src/packed/kernel.rs|contraction_tiled"
   "packed-load|poot-load|crates/poot-load/src/packed_safetensors/validation.rs crates/poot-load/src/gguf/quantization.rs|validate_index_header_bijection|verify_file|update_identity_usize|f32_to_f16"
-  "packed-builders|poot-graph-ir|crates/poot-graph-ir/src/ops/linear.rs|validate_indexed_inputs|require_operand_type|packed_grouped_linear"
+  "packed-builders|poot-graph-ir|crates/poot-graph-ir/src/ops/linear.rs|packed_indexed_linear|require_operand_type"
   "packed-recognizer|poot-graph-plan|crates/poot-graph-plan/src/passes/packed.rs|recognize_|validate_packed_carriers|reject_packed_dequant_escapes"
 )
 
@@ -78,20 +78,17 @@ module_names() {
 # numerics suite is genuinely slow, the same exclusion `scripts/test-model-free.sh` uses for the default
 # lane (that suffix is a project-wide naming CONTRACT for exactly this purpose, unlike the reverted regex).
 #
-# poot-llm ("runner") is NOT host-only: it is "reviewed" in gate_policy, meaning it mixes model-free tests
+# poot-llm ("sampler") is NOT host-only: it is "reviewed" in gate_policy, meaning it mixes model-free tests
 # with checkpoint/device tests classed by hand, and its `architectures::*_load` tests skip only when
 # POOT_MODELS_DIR is unset - if it were set (this box's ~/models is populated with ~178G of real
 # checkpoints), cargo-mutants' default `cargo test -p poot-llm` would load one for real, once per mutant,
-# the exact incident class that has OOM'd this box twice. So `runner` uses a positive include list instead
-# of an exclude list: only the three in-crate test modules verified (by reading their bodies) to exercise
-# sampler.rs/generate.rs with synthetic weights and no model/device reference -
-# `core::sampler::sampler_tests`, `core::generate::alibi_runner_wiring_tests`,
-# `core::generate::non_finite_logits_tests` - with `alibi_runner_wiring_tests`'s one GPU-dispatching test
-# (`gpu_prefill_alibi_mask_does_not_hang`) excluded by name.
+# the exact incident class that has OOM'd this box twice. So `sampler` uses a positive include list instead
+# of an exclude list: only the in-crate `core::sampler::sampler_tests` module, verified (by reading its
+# body) to exercise sampler.rs with synthetic logits and no model/device reference.
 #
 # The M4 rows (Epic 493). `quant` is a host package; its own tests now pin every M4 survivor, so it
 # needs no downstream package. `packed-builders` mutates poot-graph-ir but its numeric row
-# (`packed_grouped_linear_matches_the_per_row_expert_product`) lives in poot-eval, so the extra
+# (`packed_indexed_linear_matches_the_per_row_expert_product`) lives in poot-eval, so the extra
 # `-p poot-eval` after `--` reaches `nextest run` (cargo-mutants ignores `--test-package` next to
 # `-p`); both are host packages, and poot-eval keeps its `real_dims` exclusion. `packed-kernelgen` and
 # `packed-load` are `reviewed` packages, so each takes a positive include list of test modules read to
@@ -119,9 +116,8 @@ module_fixed_args() {
     eval)
       printf '%s\n' --test-tool nextest -- -E 'not test(/real_dims/)'
       ;;
-    runner)
-      printf '%s\n' --test-tool nextest -- -E \
-        '(test(/^core::sampler::sampler_tests::/) | test(/^core::generate::alibi_runner_wiring_tests::/) | test(/^core::generate::non_finite_logits_tests::/)) & not test(/gpu_prefill_alibi_mask_does_not_hang/)'
+    sampler)
+      printf '%s\n' --test-tool nextest -- -E 'test(/^core::sampler::sampler_tests::/)'
       ;;
     *) ;;
   esac

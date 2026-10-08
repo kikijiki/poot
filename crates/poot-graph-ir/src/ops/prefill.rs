@@ -105,7 +105,7 @@ pub fn causal_mask_from_pos(b: &Builder, pos: Traced, cap: usize, window: Option
 /// [`causal_mask_from_pos`] plus a per-head ALiBi (Press et al.) linear-distance bias, for the
 /// architectures whose attention bias replaces rotary position embedding (BLOOM, MPT; spec 254).
 /// `slopes` is the model's fixed `[n_heads]` per-head slope constant (a per-model, not per-call, value:
-/// a pure function of `n_heads` that the Runner still binds as a named constant, same as `rope.cos`).
+/// a pure function of `n_heads` that the driver still binds as a named constant, same as `rope.cos`).
 /// Returns `[rows, n_heads, tokens, cap]`: masked pairs keep the plain causal bias unmodified (the
 /// ALiBi term is multiplied by `visible` before it is added, so it is exactly `0.0` wherever the causal
 /// term is `-1.0e9`); visible pairs add `-slope[h] * (pos[r,i] - j)`.
@@ -165,7 +165,7 @@ fn mask_visibility(
 }
 
 /// Prefill (whole-prompt) linear attention (card 038), the parallel quadratic form of the decode
-/// recurrence [`linear_attention_decode`]. The recurrence `o_t = q_t @ sum_{j<=t} decay^(t-j) k_j^T v_j`
+/// recurrence [`linear_attention_decode_gated`]. The recurrence `o_t = q_t @ sum_{j<=t} decay^(t-j) k_j^T v_j`
 /// equals `o_t = sum_{j<=t} decay^(t-j) (q_t . k_j) v_j`, a causal, decay-weighted `(Q K^T) V` with no
 /// softmax:
 ///
@@ -196,45 +196,6 @@ pub fn linear_attention_prefill(
     let kt = b.transpose(k, vec![0, 1, 3, 2]); // [1,Hq,D_k,L]
     let scores = b.matmul(q, kt); // [1,Hq,L,L] = Q K^T
     let weighted = b.binary(BinOp::Mul, scores, mask); // multiplicative decay-causal mask, broadcast over Hq
-    b.matmul(weighted, v) // [1,Hq,L,D_v]
-}
-
-/// Prefill linear attention with per-channel data-dependent gating (GLA / gated-delta), card 038. The
-/// gate `g_t[a]` lives inside the key dimension `D_k`, so it does not fold into a scalar `(h,t,j)`
-/// mask. The cumulative per-channel gate product `A_t[a] = prod_{i<=t} g_i[a]` is factored out of the
-/// pairwise term:
-///
-/// ```text
-/// o_t[c] = sum_{j<=t} sum_a q_t[a] (A_t[a]/A_j[a]) k_j[a] v_j[c]
-///        = sum_{j<=t} ( (q_t (.) A_t) . (k_j (/) A_j) ) v_j[c]
-/// ```
-///
-/// so it is again a causal `(Q' K'^T) V` with a binary lower-triangular mask, where `Q' = Q (.) A` and
-/// `K' = K (/) A`. The caller precomputes `cumgate = A [1,Hq,L,D_k]` and a binary causal
-/// `mask[1,1,L,L]` (1 for `j<=t`, else 0). Pure primitives, exact, fully parallel.
-///
-/// Numerical range: `K' = K / A` divides by the whole-sequence cumulative product. f32's wide exponent
-/// (plus denormals) keeps this stable even at `A ~ 1e-39`, but with strong decay over a long sequence
-/// `A` underflows to zero and `K/A` becomes inf/NaN (e.g. `decay=0.1`, `L=64`: `A=1e-64 -> 0`). For
-/// that regime use [`linear_attention_prefill_chunked`], which keeps the gate cumulative only within a
-/// chunk and carries state across chunks. This O(L^2) form is the building block chunked-scan
-/// composes.
-pub fn linear_attention_prefill_gated(
-    b: &Builder,
-    q: Traced,
-    k: Traced,
-    v: Traced,
-    n_rep: usize,
-    cumgate: Traced,
-    mask: Traced,
-) -> Traced {
-    let k = repeat_kv(b, k, n_rep); // [1,Hq,L,D_k]
-    let v = repeat_kv(b, v, n_rep);
-    let q2 = b.binary(BinOp::Mul, q, cumgate); // Q' = Q (.) A
-    let k2 = b.binary(BinOp::Div, k, cumgate); // K' = K (/) A
-    let kt = b.transpose(k2, vec![0, 1, 3, 2]); // [1,Hq,D_k,L]
-    let scores = b.matmul(q2, kt); // [1,Hq,L,L] = Q' K'^T
-    let weighted = b.binary(BinOp::Mul, scores, mask); // binary causal mask (the gate is already in Q'/K')
     b.matmul(weighted, v) // [1,Hq,L,D_v]
 }
 
@@ -356,73 +317,6 @@ pub(crate) fn identity_like(b: &Builder, like: Traced, c: usize, rank: usize) ->
     ident
 }
 
-/// Chunked-scan prefill for per-channel gated linear attention (card 038): the numerically stable
-/// form of [`linear_attention_prefill_gated`]. The naive form divides by the cumulative gate over the
-/// whole sequence (`K/A`), which underflows; this splits the sequence into chunks of `chunk`
-/// positions and keeps the gate cumulative only within a chunk (so `k/beta` stays bounded), carrying
-/// the recurrent state `S [1,Hq,D_k,D_v]` across chunks. For each chunk `r` (with `beta` = the
-/// per-channel gate product from the chunk start, and `Lambda_r` = `beta` at the chunk end):
-/// ```text
-/// Q' = Q (.) beta ;  K' = K (/) beta
-/// o_chunk = (causal_mask (.) (Q' K'^T)) @ V    +    Q' @ S_r        (intra-chunk + carried state)
-/// S_{r+1} = Lambda_r (.) (S_r + K'^T @ V)                          (state carry, gated)
-/// ```
-///
-/// `q[1,Hq,L,D_k]`, `k`/`v[1,Hkv,L,D_k|D_v]` (GQA), `chunk_beta[1,Hq,L,D_k]` (the caller's per-chunk
-/// cumulative gate product), `causal[1,1,chunk,chunk]` (binary lower-triangular for one chunk). `L`
-/// must be a multiple of `chunk`. Returns `[1,Hq,L,D_v]`, equal to [`linear_attention_prefill_gated`]
-/// but stable for long sequences. The chunk loop is unrolled at trace time (L is static).
-#[allow(clippy::too_many_arguments)]
-pub fn linear_attention_prefill_chunked(
-    b: &Builder,
-    q: Traced,
-    k: Traced,
-    v: Traced,
-    n_rep: usize,
-    chunk_beta: Traced,
-    causal: Traced,
-    chunk: usize,
-) -> Traced {
-    let k = repeat_kv(b, k, n_rep); // [1,Hq,L,D_k]
-    let v = repeat_kv(b, v, n_rep); // [1,Hq,L,D_v]
-    let qp = b.binary(BinOp::Mul, q, chunk_beta); // Q' = Q (.) beta
-    let kp = b.binary(BinOp::Div, k, chunk_beta); // K' = K (/) beta
-    let l = b.aval(q).shape[2];
-    let n_chunks = l / chunk;
-    let mut s: Option<Traced> = None; // carried state [1,Hq,D_k,D_v]; None before the first chunk (S_0 = 0)
-    let mut outs: Vec<Traced> = Vec::with_capacity(n_chunks);
-    for r in 0..n_chunks {
-        let (lo, hi) = (r * chunk, (r + 1) * chunk);
-        let qr = b.slice(qp, 2, lo, hi); // [1,Hq,chunk,D_k]
-        let kr = b.slice(kp, 2, lo, hi);
-        let vr = b.slice(v, 2, lo, hi); // [1,Hq,chunk,D_v]
-        // intra-chunk: causal (Q' K'^T) V within the chunk (beta is small here, so K' is well-scaled).
-        let krt = b.transpose(kr, vec![0, 1, 3, 2]); // [1,Hq,D_k,chunk]
-        let scores = b.matmul(qr, krt); // [1,Hq,chunk,chunk]
-        let masked = b.binary(BinOp::Mul, scores, causal);
-        let intra = b.matmul(masked, vr); // [1,Hq,chunk,D_v]
-        // inter-chunk: the carried state contributes Q' @ S_r (zero for the first chunk).
-        let o_r = match &s {
-            Some(state) => {
-                let inter = b.matmul(qr, *state); // [1,Hq,chunk,D_v]
-                b.binary(BinOp::Add, intra, inter)
-            }
-            None => intra,
-        };
-        outs.push(o_r);
-        // state carry: S_{r+1} = Lambda_r (.) (S_r + K'^T V), Lambda_r = beta at the chunk's last position.
-        let krt_v = b.matmul(krt, vr); // K'^T @ V = [1,Hq,D_k,D_v]
-        let s_pre = match &s {
-            Some(state) => b.binary(BinOp::Add, *state, krt_v),
-            None => krt_v,
-        };
-        let lam = b.slice(chunk_beta, 2, hi - 1, hi); // beta at chunk end [1,Hq,1,D_k]
-        let lam = b.transpose(lam, vec![0, 1, 3, 2]); // [1,Hq,D_k,1] (broadcasts over D_v)
-        s = Some(b.binary(BinOp::Mul, lam, s_pre)); // gated carry
-    }
-    b.concat(2, &outs) // [1,Hq,L,D_v]
-}
-
 /// Zero-pad `x` along `axis` by `pad` positions (FR-005 / spec 139 review C9). There is no `Pad`
 /// primitive, so this builds an exact zero block via the sub-self trick (as in
 /// [`unit_lower_triangular_inverse`]'s base case): slice one position of `x`, subtract it from
@@ -480,10 +374,10 @@ pub fn cumulative_log_decay_scan(b: &Builder, g: Traced, chunk: usize) -> Traced
 /// Chunked prefill for Qwen3-Next's Gated-DeltaNet (GDN) delta-rule recurrence (spec 139 / card 153
 /// P2). Reproduces [`gated_delta_net_decode`]'s per-position recurrence over all `L` positions; that
 /// decode op is the llama.cpp-validated oracle (`gdn_prefill_chunked_matches_decode_recurrence`,
-/// spec 139 SC-001/002). Unlike the additive GLA in [`linear_attention_prefill_chunked`], the delta
+/// spec 139 SC-001/002). Unlike an additive GLA, the delta
 /// rule's `- k_t @ S_{t-1}` correction couples every position in a chunk to the running state, so the
 /// intra-chunk term needs the UT-transform ([`unit_lower_triangular_inverse`], P1). Only the outer
-/// chunk-loop/state-carry shape is shared with `linear_attention_prefill_chunked`.
+/// chunk-loop/state-carry shape is the usual one.
 ///
 /// Derivation (matches `gated_delta_net_decode`'s recurrence
 /// `S_i = decay_i*(I - beta_i k_i k_i^T) @ S_{i-1} + beta_i k_i^T v_i`, unrolled and solved in closed
@@ -634,4 +528,43 @@ pub fn gdn_prefill_chunked(
     let o_full = b.concat(2, &outs); // [1,H_v,Lp,D]
     let o = b.slice(o_full, 2, 0, l); // FR-005: truncate the padded tail back to L
     (o, s_state)
+}
+
+/// The packed definition of `OpKind::Scan` over [`ScanFamily::DeltaRule`](crate::ScanFamily): the result is
+/// `concat(o, s_out)` along the sequence axis, `[1, H, L + D, D]` (one value, so the single-result `Eqn` and
+/// `Decomposition` carry it; `crate::ScanLayout` names the rows). The chain is [`gdn_prefill_chunked`]
+/// itself with its triangular tables computed in-graph, so there is one semantic definition.
+#[allow(clippy::too_many_arguments)]
+pub fn scan_delta_rule_packed(
+    b: &Builder,
+    q: Traced,
+    k: Traced,
+    v: Traced,
+    g: Traced,
+    beta: Traced,
+    s_in: Traced,
+    chunk: usize,
+) -> Traced {
+    let (o, s_out) = gdn_prefill_chunked(
+        b,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        s_in,
+        lower_triangle(b, chunk, 0.0),
+        lower_triangle(b, chunk, 1.0),
+        chunk,
+    );
+    b.concat(2, &[o, s_out])
+}
+
+/// The lower triangle (`row >= col + shift`, as F32 ones) as `[1, 1, c, c]`, computed from `Iota`.
+pub fn lower_triangle(b: &Builder, c: usize, shift: f32) -> Traced {
+    let ramp = b.iota(c);
+    let row = b.broadcast(b.reshape(ramp, vec![c, 1]), vec![c, c]);
+    let col = b.broadcast(b.reshape(ramp, vec![1, c]), vec![c, c]);
+    let col = b.binary_scalar(BinOp::Add, col, Scalar::F32(shift));
+    b.reshape(b.binary(BinOp::Ge, row, col), vec![1, 1, c, c])
 }

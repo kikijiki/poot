@@ -23,11 +23,11 @@ const GENERATION_ROUTES: [(&str, &str, bool); 4] = [
     ),
 ];
 
-fn tiny_decoder_backend() -> Backend {
-    let model_path = write_tiny_runner_gguf();
-    let runner = Runner::load_gguf(&model_path).expect("load no-engine fixture runner");
+pub(super) fn tiny_decoder_backend() -> Backend {
+    let model_path = write_tiny_gguf();
+    let handle = load_handle(&model_path);
     let _ = std::fs::remove_file(&model_path);
-    Backend::Decoder(Arc::new(runner))
+    Backend::Decoder(handle)
 }
 
 fn generation_body(fields: &str, max_tokens: Option<&str>, stream: bool) -> String {
@@ -39,7 +39,7 @@ fn generation_body(fields: &str, max_tokens: Option<&str>, stream: bool) -> Stri
 
 /// Send one request through `handle` and return the full response text. `engine_side` runs on its own
 /// thread beside the handler and owns the receiving end of the job channel, when a row gave one.
-fn roundtrip(
+pub(super) fn roundtrip(
     backend: &Backend,
     engine: Option<&mpsc::Sender<Job>>,
     method: &str,
@@ -54,6 +54,7 @@ fn roundtrip(
         .expect("bound the response read");
     let (server, _) = listener.accept().expect("accept client");
     let metrics = test_metrics("no-engine");
+    let health = EngineHealth::serving_for_test("spirv-vulkan", 4, 1024);
     let limiter = RateLimiter {
         rpm: 0,
         windows: Mutex::new(HashMap::new()),
@@ -68,7 +69,11 @@ fn roundtrip(
     .expect("write request");
     client.flush().expect("flush request");
     std::thread::scope(|scope| {
-        let handler = scope.spawn(|| handle(server, engine, backend, &metrics, &limiter, &policy));
+        let handler = scope.spawn(|| {
+            handle(
+                server, engine, &health, backend, &metrics, &limiter, &policy,
+            )
+        });
         scope.spawn(engine_side);
         handler
             .join()
@@ -82,11 +87,11 @@ fn roundtrip(
     response
 }
 
-fn status_line(response: &str) -> &str {
+pub(super) fn status_line(response: &str) -> &str {
     response.lines().next().unwrap_or_default()
 }
 
-fn json_body(response: &str) -> serde_json::Value {
+pub(super) fn json_body(response: &str) -> serde_json::Value {
     let (_, body) = response
         .split_once("\r\n\r\n")
         .unwrap_or_else(|| panic!("no header/body split in {response:?}"));
@@ -98,7 +103,6 @@ fn json_body(response: &str) -> serde_json::Value {
 /// for both routes, streaming and not. It is never a 200, never an event stream, and never carries a
 /// `finish_reason` (the failure class of R477-002: a completion fabricated for a request nothing ran).
 #[test]
-#[ignore = "constructs a Runner and no family loads on it (POOT-740); POOT-739 retypes serve onto ModelHandle and re-enables this row"]
 fn generation_without_an_engine_is_a_typed_503_naming_the_missing_engine() {
     let backend = tiny_decoder_backend();
     for (path, fields, stream) in GENERATION_ROUTES {
@@ -129,7 +133,6 @@ fn generation_without_an_engine_is_a_typed_503_naming_the_missing_engine() {
 /// SC-001, the counter side: a refusal is not a request that ran, so it starts no generation, counts
 /// no completion and leaves no request in flight.
 #[test]
-#[ignore = "constructs a Runner and no family loads on it (POOT-740); POOT-739 retypes serve onto ModelHandle and re-enables this row"]
 fn a_refused_generation_request_counts_no_completion_and_leaves_nothing_in_flight() {
     let backend = tiny_decoder_backend();
     let metrics = test_metrics("no-engine-counters");
@@ -150,7 +153,16 @@ fn a_refused_generation_request_counts_no_completion_and_leaves_nothing_in_fligh
             body.len()
         )
         .unwrap();
-        handle(server, None, &backend, &metrics, &limiter, &policy).expect("handled");
+        handle(
+            server,
+            None,
+            &EngineHealth::serving_for_test("spirv-vulkan", 4, 1024),
+            &backend,
+            &metrics,
+            &limiter,
+            &policy,
+        )
+        .expect("handled");
         let mut sink = String::new();
         client.read_to_string(&mut sink).unwrap();
     }
@@ -163,7 +175,6 @@ fn a_refused_generation_request_counts_no_completion_and_leaves_nothing_in_fligh
 /// is the 400 it always was, not the 503. Each case names a different validation stage: the JSON
 /// parse, `max_tokens` typing, an unknown LoRA adapter, and an unsatisfiable guided-decoding regex.
 #[test]
-#[ignore = "constructs a Runner and no family loads on it (POOT-740); POOT-739 retypes serve onto ModelHandle and re-enables this row"]
 fn a_request_invalid_on_its_face_is_a_400_before_the_engine_lookup() {
     let backend = tiny_decoder_backend();
     for (path, fields, stream) in GENERATION_ROUTES {
@@ -199,7 +210,6 @@ fn a_request_invalid_on_its_face_is_a_400_before_the_engine_lookup() {
 /// not: a value far above the cap and `usize::MAX` both arrive as `MAX_NEW_TOKENS_CAP`, a small value
 /// arrives untouched, and the chat route's `max_completion_tokens` wins over `max_tokens`.
 #[test]
-#[ignore = "constructs a Runner and no family loads on it (POOT-740); POOT-739 retypes serve onto ModelHandle and re-enables this row"]
 fn an_oversized_max_tokens_reaches_the_engine_clamped_on_every_generation_route() {
     let backend = tiny_decoder_backend();
     let cases = [
@@ -258,7 +268,6 @@ fn an_oversized_max_tokens_reaches_the_engine_clamped_on_every_generation_route(
 /// SC-002, no engine: an oversized `max_tokens` is bounded, not fatal. The request that used to size a
 /// multi-TB allocation is the same typed 503 as any other valid request.
 #[test]
-#[ignore = "constructs a Runner and no family loads on it (POOT-740); POOT-739 retypes serve onto ModelHandle and re-enables this row"]
 fn an_oversized_max_tokens_without_an_engine_is_the_same_typed_503() {
     let backend = tiny_decoder_backend();
     for (path, fields, stream) in GENERATION_ROUTES {
@@ -272,19 +281,41 @@ fn an_oversized_max_tokens_without_an_engine_is_the_same_typed_503() {
     }
 }
 
-/// `/health` reports whether an engine is loaded: `false` in production today, `true` once a job
-/// queue exists.
+/// `/health` derives `engine_loaded` from the engine's state, not from whether a job queue was passed:
+/// `Starting` and `Dead` have no engine thread, `Serving` and `Draining` do. Mutation: derive it from
+/// `engine.is_some()` again; the `Serving` row (no queue passed) reads `false` and goes red.
 #[test]
-#[ignore = "constructs a Runner and no family loads on it (POOT-740); POOT-739 retypes serve onto ModelHandle and re-enables this row"]
 fn health_reports_whether_an_engine_is_loaded() {
-    let backend = tiny_decoder_backend();
-    let (tx, _engine_rx) = mpsc::channel::<Job>();
-    for (engine, loaded) in [(None, false), (Some(&tx), true)] {
-        let response = roundtrip(&backend, engine, "GET", "/health", "", || {});
-        assert_eq!(status_line(&response), "HTTP/1.1 200 OK", "{response}");
-        let body = json_body(&response);
-        assert_eq!(body["status"], "ok");
-        assert_eq!(body["engine_loaded"], loaded, "{response}");
+    use crate::engine_plan::Death;
+    let draining = EngineHealth::serving_for_test("spirv-vulkan", 4, 1024);
+    draining.begin_draining();
+    let dead = EngineHealth::serving_for_test("spirv-vulkan", 4, 1024);
+    dead.die(Death::Fault("device lost".into()));
+    for (health, status_line, status, loaded) in [
+        (
+            EngineHealth::starting(),
+            "HTTP/1.1 503 Service Unavailable",
+            "starting",
+            false,
+        ),
+        (
+            EngineHealth::serving_for_test("spirv-vulkan", 4, 1024),
+            "HTTP/1.1 200 OK",
+            "serving",
+            true,
+        ),
+        (
+            draining,
+            "HTTP/1.1 503 Service Unavailable",
+            "draining",
+            true,
+        ),
+        (dead, "HTTP/1.1 503 Service Unavailable", "dead", false),
+    ] {
+        let (line, body) = super::engine_loop::health_over_http(&health);
+        assert_eq!(line, status_line, "{status}: {body}");
+        assert_eq!(body["status"], status, "{body}");
+        assert_eq!(body["engine_loaded"], loaded, "{status}: {body}");
     }
 }
 
@@ -293,7 +324,6 @@ fn health_reports_whether_an_engine_is_loaded() {
 /// skip the `/v1/rerank` branch so a decoder falls through to the generation routes (a 404), or change
 /// the embeddings refusal text; the row goes red on that path.
 #[test]
-#[ignore = "constructs a Runner and no family loads on it (POOT-740); POOT-739 retypes serve onto ModelHandle and re-enables this row"]
 fn a_decoder_refuses_embeddings_and_rerank_with_a_typed_400() {
     let backend = tiny_decoder_backend();
     for (path, body, names) in [
@@ -339,7 +369,8 @@ fn a_job_for_a_gone_engine_is_engine_unavailable() {
         Sampler::greedy(),
         vec![],
         false,
-        LoraAdapterLease::none(),
+        AdapterRef::Base,
+        &|| false,
         |_, _| std::ops::ControlFlow::Continue(()),
     )
     .expect_err("a closed engine queue accepts no job");

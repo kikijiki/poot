@@ -1,9 +1,7 @@
 //! Pure loading of the mRoPE metadata stored in Qwen2-VL and Qwen2.5-VL HF `config.json` files.
 //!
-//! This is a validated view over [`crate::Qwen2HfConfig`], the repository's existing HF config schema.
-//! Released VL configs add their marker IDs and vision metadata at the top level. A closed second serde
-//! projection reads only those fields after the shared parse succeeds; every ordinary Qwen2/Qwen3 conversion
-//! and Runner path remains unchanged.
+//! Released VL configs carry their marker IDs and vision metadata at the top level; a closed serde
+//! projection reads only those fields.
 
 use std::path::{Path, PathBuf};
 
@@ -44,46 +42,8 @@ pub struct QwenVlHfMetadata {
     temporal_tokens_per_second: Option<f64>,
 }
 
-/// One authoritative `config.json` snapshot for callers that need both the ordinary text config and the
-/// Qwen-VL metadata projection.
-#[derive(Clone, Debug)]
-pub struct QwenVlHfConfig {
-    pub hf: crate::Qwen2HfConfig,
-    pub metadata: QwenVlHfMetadata,
-}
-
-impl QwenVlHfConfig {
-    pub fn from_slice(json: &[u8]) -> Result<Self, QwenVlHfMetadataError> {
-        let hf: crate::Qwen2HfConfig = serde_json::from_slice(json)?;
-        let metadata = QwenVlHfMetadata::from_parsed_qwen2_config_and_slice(&hf, json)?;
-        Ok(Self { hf, metadata })
-    }
-
-    pub fn load(path: impl AsRef<Path>) -> Result<Self, QwenVlHfMetadataError> {
-        let path = path.as_ref();
-        let bytes = std::fs::read(path).map_err(|source| QwenVlHfMetadataError::ReadConfig {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        Self::from_slice(&bytes).map_err(|err| match err {
-            QwenVlHfMetadataError::Json(source) => QwenVlHfMetadataError::ParseConfig {
-                path: path.to_path_buf(),
-                source,
-            },
-            err => err,
-        })
-    }
-}
-
 impl QwenVlHfMetadata {
     pub fn from_slice(json: &[u8]) -> Result<Self, QwenVlHfMetadataError> {
-        Ok(QwenVlHfConfig::from_slice(json)?.metadata)
-    }
-
-    pub fn from_parsed_qwen2_config_and_slice(
-        _hf: &crate::Qwen2HfConfig,
-        json: &[u8],
-    ) -> Result<Self, QwenVlHfMetadataError> {
         let metadata: QwenVlConfigJson = serde_json::from_slice(json)?;
         metadata.try_into()
     }

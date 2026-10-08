@@ -329,10 +329,8 @@ mod tests {
         b.finish(out)
     }
 
-    const OPTIONS: CompileOptions = CompileOptions {
-        execution: Submission::Replay,
-        limits: crate::CompileLimits::STANDARD,
-    };
+    const OPTIONS: CompileOptions =
+        CompileOptions::new(Submission::Replay, crate::CompileLimits::STANDARD);
 
     fn target(backend: Backend) -> Target {
         Target {
@@ -562,10 +560,10 @@ mod tests {
         };
         let packed = |grid_x: u32| {
             KernelRequest::Packed(PackedRequest {
-                name: "packed_materialize",
+                name: "packed_row_gather",
                 spec: PackedKernelSpec {
                     format: WeightFormat::Q8_0,
-                    op: PackedKernelOp::Materialize,
+                    op: PackedKernelOp::RowGather,
                 },
                 grid: [grid_x, 1, 1],
                 meta: vec![32],
@@ -574,6 +572,7 @@ mod tests {
         let packed_contraction = |schedule: Schedule| {
             KernelRequest::Contraction(ContractionSpec::Packed(PackedContraction {
                 format: WeightFormat::Q8_0,
+                rows: poot_kernelgen::PackedRows::Blocks,
                 schedule,
                 epilogue: None,
                 grid: [64, 1, 1],

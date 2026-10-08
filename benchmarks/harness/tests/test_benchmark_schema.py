@@ -23,6 +23,7 @@ def poot_row(**overrides):
         "status": "ok",
         "build_sha": BUILD_SHA,
         "binary_sha256": "ab" * 32,
+        "family": "qwen2",
         "backend": "rocm",
         "device": "AMD Radeon 8060S Graphics",
     }
@@ -51,18 +52,24 @@ class ResultSchemaTests(unittest.TestCase):
 
         self.assertEqual(self.errors(without(poot_row(), "build_sha")), ["$ is missing 'build_sha'"])
 
-    def test_an_ok_poot_row_names_its_binary_and_backend(self):
-        for field in ("binary_sha256", "backend"):
+    def test_an_ok_poot_row_names_its_binary_backend_and_family(self):
+        for field in ("binary_sha256", "backend", "family"):
             with self.subTest(field=field):
                 self.assertEqual(self.errors(without(poot_row(), field)), [f"$ is missing {field!r}"])
 
-    def test_a_poot_refusal_names_the_build_and_backend_that_refused(self):
+    def test_a_poot_refusal_names_the_build_backend_and_family_that_refused(self):
         refusal = poot_row(status="unsupported", reason="no such architecture")
 
         self.assertEqual(self.errors(refusal), [])
-        for field in ("build_sha", "backend"):
+        for field in ("build_sha", "backend", "family"):
             with self.subTest(field=field):
                 self.assertEqual(self.errors(without(refusal, field)), [f"$ is missing {field!r}"])
+
+    def test_the_family_is_null_only_on_a_refusal_that_came_before_one_resolved(self):
+        before_resolution = poot_row(status="unsupported", reason="no family is registered", family=None)
+
+        self.assertEqual(self.errors(before_resolution), [])
+        self.assertEqual(self.errors(poot_row(family=None)), ["$.family is not a schema string"])
 
     def test_a_binary_that_names_no_file_has_no_digest(self):
         self.assertEqual(self.errors(poot_row(binary_sha256=None)), [])

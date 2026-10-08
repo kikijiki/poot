@@ -4,8 +4,6 @@ title: Backends
 sidebar_position: 6
 ---
 
-import BackendTable from "@site/src/components/architecture/BackendTable";
-
 # Backends
 
 poot has three first-class backends built from one kernel source: **wgpu** (Vulkan/SPIR-V, the
@@ -85,10 +83,13 @@ Verified on AMD Radeon 8060S (gfx1151) and gfx1100.
 
 ## Capability comparison
 
-Kernel- and dispatch-level differences. For models and features, see the
-[feature matrix](../reference/feature-matrix.md).
-
-<BackendTable />
+What a backend can run is decided by planning, not by a list kept here: a graph runs on a backend when
+`compile` succeeds for that target, and a refusal is a typed error naming the op and the capability the
+backend lacks. The [feature matrix](../reference/feature-matrix.md#models-and-weight-formats) is generated
+from those compile results for every model family and weight format on wgpu, ROCm and PTX, and joins the
+stored benchmark refusals. The per-backend differences that are not about support (graph capture, cooperative
+grids, tensor-core matmul, compute dtype) are in its
+[precision and execution model](../reference/feature-matrix.md#precision-and-execution-model) table.
 
 ## Correctness across backends
 

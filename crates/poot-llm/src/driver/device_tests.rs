@@ -91,6 +91,39 @@ fn zero_head(store: &WeightStore) -> WeightStore {
     builder.build()
 }
 
+/// The BF16 store with every tensor but the norm scales multiplied by `factor`. The registry's
+/// fixtures are small enough that a tiny tower's greedy decode falls into one repeated token whatever
+/// its prompt rows are; a larger scale makes the continuation depend on them.
+fn scaled(store: &WeightStore, factor: f32) -> WeightStore {
+    let mut builder = WeightStore::builder();
+    for (key, entry) in store.iter() {
+        let WeightEntry::Dense(dense) = entry else {
+            panic!("the fixture is dense")
+        };
+        let bytes: Vec<u8> = if key.as_str().contains("norm") {
+            dense.bytes().as_slice().to_vec()
+        } else {
+            dense
+                .bytes()
+                .as_slice()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .flat_map(|&pair| {
+                    let value = f32::from_bits(u32::from(u16::from_le_bytes(pair)) << 16);
+                    (((value * factor).to_bits() >> 16) as u16).to_le_bytes()
+                })
+                .collect()
+        };
+        let dense =
+            DenseWeight::try_new(dense.dtype(), dense.shape().to_vec(), bytes.into()).unwrap();
+        builder
+            .insert(key.clone(), WeightEntry::Dense(dense))
+            .unwrap();
+    }
+    builder.build()
+}
+
 #[derive(Clone, Copy)]
 enum Weights {
     Random,
@@ -114,12 +147,9 @@ fn handle(weights: Weights, eos: u32) -> Arc<ModelHandle> {
 }
 
 pub(super) fn options(chunk: usize, capacity: usize) -> DriverOptions {
-    let compile = CompileOptions {
-        execution: Submission::Replay,
-        limits: poot_graph_plan::CompileLimits::STANDARD,
-    };
+    let compile = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
     DriverOptions {
-        prefill: compile,
+        prefill: compile.clone(),
         decode: compile,
         capacity: nz(capacity),
         prefill_chunk: nz(chunk),
@@ -347,6 +377,128 @@ per_backend!(
     sampled_differs_from_greedy_ptx
 );
 
+/// POOT-575 SC-004 (R477-006 on a hybrid family's path; POOT-572 for Qwen3.5): the `family` fixture
+/// with its head zeroed (every logit exactly 0, so the distribution is uniform) answers a seeded
+/// temperature request with the sampler's tokens, not the greedy ones: a sampled run equal to the greedy
+/// one has probability 48^-24 < 2^-96. Mutation: ignore the sampler in the head (`rule_of` always answers
+/// `Greedy`); the draw becomes the greedy run and the row fails.
+fn family_sampled_differs_from_greedy(family: &str, choice: BackendChoice) {
+    let registry = Registry::builtin().unwrap();
+    let entry = registry
+        .entries()
+        .iter()
+        .find(|entry| entry.family.as_str() == family)
+        .unwrap();
+    let fixture = (entry.fixture)();
+    let mut config = fixture.config.clone();
+    config["eos_token_id"] = serde_json::json!(NO_EOS);
+    let raw = RawConfig::HfJson {
+        config: &config,
+        generation: None,
+    };
+    let handle = Arc::new(
+        ModelHandle::from_checkpoint(&raw, zero_head(&fixture.store), &registry, |_| {
+            Ok(fixture_text())
+        })
+        .unwrap(),
+    );
+    let Some(mut driver) = driver(choice, &handle, 4, CAPACITY) else {
+        return;
+    };
+    let greedy = generate(&mut driver, &PROMPT, 24, Sampler::greedy());
+    let sampled = generate(&mut driver, &PROMPT, 24, Sampler::new(1.0, 0, 1.0, 42));
+    let again = generate(&mut driver, &PROMPT, 24, Sampler::new(1.0, 0, 1.0, 42));
+    assert_eq!(greedy, [0; 24], "a tie takes the first index on every step");
+    assert_ne!(sampled, greedy, "the sampler's tokens, not greedy ones");
+    assert_eq!(sampled, again, "the same seed draws the same tokens");
+}
+
+/// POOT-578 SC-003 (R488-002): decode takes its position from the step's `Slot::Pos`, so one compiled
+/// program serves every position. The `family` fixture decodes at position 3 (a three-token prompt, one
+/// new token after the prefill's) and then at positions 3..=7 (the same prompt, five decode steps);
+/// `Driver::compile_count()` does not move between the two runs, and the tokens equal `expected`
+/// (recorded at this card's base on wgpu, the same on every backend). Mutation: key the compiled
+/// entry on the step's start position; the second run compiles at position 4 and the counter moves.
+fn family_decode_reuses_one_program_across_positions(
+    family: &str,
+    choice: BackendChoice,
+    expected: [u32; 6],
+) {
+    let registry = Registry::builtin().unwrap();
+    let entry = registry
+        .entries()
+        .iter()
+        .find(|entry| entry.family.as_str() == family)
+        .unwrap();
+    let fixture = (entry.fixture)();
+    let mut config = fixture.config.clone();
+    config["eos_token_id"] = serde_json::json!(NO_EOS);
+    let raw = RawConfig::HfJson {
+        config: &config,
+        generation: None,
+    };
+    let handle = Arc::new(
+        ModelHandle::from_checkpoint(&raw, scaled(&fixture.store, 4.0), &registry, |_| {
+            Ok(fixture_text())
+        })
+        .unwrap(),
+    );
+    let Some(mut driver) = driver(choice, &handle, 4, CAPACITY) else {
+        return;
+    };
+    let prompt = &PROMPT[..3];
+    let at_three = generate(&mut driver, prompt, 2, Sampler::greedy());
+    let compiled = driver.compile_count();
+    let through_seven = generate(&mut driver, prompt, 6, Sampler::greedy());
+    assert_eq!(
+        driver.compile_count(),
+        compiled,
+        "{family}: decoding at positions 4..=7 compiled a program"
+    );
+    assert_eq!(through_seven, expected, "{family}: the decoded tokens");
+    assert_eq!(at_three, through_seven[..2], "{family}: position 3's token");
+}
+
+fn qwen35_decode_reuses_one_program_across_positions(choice: BackendChoice) {
+    family_decode_reuses_one_program_across_positions("qwen35", choice, [14, 28, 25, 3, 11, 6]);
+}
+per_backend!(
+    qwen35_decode_reuses_one_program_across_positions,
+    qwen35_decode_reuses_one_program_across_positions_wgpu,
+    qwen35_decode_reuses_one_program_across_positions_rocm,
+    qwen35_decode_reuses_one_program_across_positions_ptx
+);
+
+fn qwen3next_decode_reuses_one_program_across_positions(choice: BackendChoice) {
+    family_decode_reuses_one_program_across_positions("qwen3next", choice, [45, 10, 8, 28, 34, 22]);
+}
+per_backend!(
+    qwen3next_decode_reuses_one_program_across_positions,
+    qwen3next_decode_reuses_one_program_across_positions_wgpu,
+    qwen3next_decode_reuses_one_program_across_positions_rocm,
+    qwen3next_decode_reuses_one_program_across_positions_ptx
+);
+
+fn qwen3next_sampled_differs_from_greedy(choice: BackendChoice) {
+    family_sampled_differs_from_greedy("qwen3next", choice);
+}
+per_backend!(
+    qwen3next_sampled_differs_from_greedy,
+    qwen3next_sampled_differs_from_greedy_wgpu,
+    qwen3next_sampled_differs_from_greedy_rocm,
+    qwen3next_sampled_differs_from_greedy_ptx
+);
+
+fn qwen35_sampled_differs_from_greedy(choice: BackendChoice) {
+    family_sampled_differs_from_greedy("qwen35", choice);
+}
+per_backend!(
+    qwen35_sampled_differs_from_greedy,
+    qwen35_sampled_differs_from_greedy_wgpu,
+    qwen35_sampled_differs_from_greedy_rocm,
+    qwen35_sampled_differs_from_greedy_ptx
+);
+
 /// The regex naming the 16 tokens `a`..`p`, 25 times over: a mask the sampling suffix cannot express,
 /// that no 24-token run completes (so EOS is never allowed).
 pub(super) const SIXTEEN: &str = "[a-p]{25}";
@@ -528,13 +680,13 @@ per_backend!(
 
 // ---------------------------------------------------------------------------------------------
 // POOT-737 SC-001: every dense family's builtin fixture generates through the driver with the tokens
-// the Runner generated for it before the dense families left the Runner (recorded on the base commit
-// `2ef7ea834` with the Runner's `generate_kv_gpu_cached` on wgpu and ROCm, and its CPU `generate`:
+// the pre-driver engine generated for it before the dense families moved to the driver (recorded on the
+// base commit `2ef7ea834` with its cached device generate on wgpu and ROCm, and its CPU generate:
 // all three agreed, and the driver agreed with them). Literals, never recomputed (ADR-0101, tier 3).
 // ---------------------------------------------------------------------------------------------
 
-/// What the Runner was fed for a family's fixture: its prompt, and whether its head is tied. The
-/// Runner always tied BLOOM's and MPT's head to the embedding, so their rows drop the fixture's
+/// What the pre-driver engine was fed for a family's fixture: its prompt, and whether its head is tied. The
+/// pre-driver engine always tied BLOOM's and MPT's head to the embedding, so their rows drop the fixture's
 /// explicit `lm_head.weight` (the driver then ties it too); gemma3's tokenizer prepended BOS (1).
 struct RecordedFamily {
     family: &'static str,
@@ -653,13 +805,13 @@ const RECORDED: &[RecordedFamily] = &[
             33,
         ],
     },
-    // The five MoE rows below (POOT-738) were recorded with the Runner's CPU `generate` on each family's
+    // The five MoE rows below (POOT-738) were recorded with the pre-driver engine's CPU generate on each family's
     // fixture at the base commit. All 24 tokens agreed: the driver on wgpu and on ROCm produce exactly the
     // recorded ids, in one whole-prompt prefill and in chunks of four, so no row has a divergence index or
     // a tier-3 top-two margin to record. (A token flip on a tiny random fixture would be judged by the
     // reference's top-two logit margin, ADR-0101.) The first-token figures of the router-id-swap mutation
     // (qwen3moe 10 vs 28, Mixtral 38 vs 40, granitemoe 43 vs 40, gpt-oss 6 vs 11, olmoe 11 vs 11 with a
-    // later split) are the red outcome of that mutation, not Runner disagreements.
+    // later split) are the red outcome of that mutation, not disagreements with the pre-driver engine.
     RecordedFamily {
         family: "qwen3moe",
         prompt: &PROMPT,
@@ -705,7 +857,7 @@ const RECORDED: &[RecordedFamily] = &[
             47, 3,
         ],
     },
-    // minimax_m2 (POOT-570) has no Runner recording: its tokens are the independent f64 reference's greedy
+    // minimax_m2 (POOT-570) has no pre-driver recording: its tokens are the independent f64 reference's greedy
     // decode (`minimax_m2::tests::the_driver_literals_are_the_references_greedy_decode`, smallest top-two
     // logit margin 1.2e-4), so the device is compared with the reference, not with an earlier run.
     RecordedFamily {
@@ -717,7 +869,7 @@ const RECORDED: &[RecordedFamily] = &[
             46, 21,
         ],
     },
-    // The four group-B rows below (POOT-740) were recorded with the Runner's CPU `generate` on each
+    // The four group-B rows below (POOT-740) were recorded with the pre-driver engine's CPU generate on each
     // family's fixture at the base commit `64602bced`, over the HF checkpoint the fixture writes (eos
     // unreachable): MLA (deepseek2 with YaRN, group-limited softmax routing and two shared experts;
     // deepseek3 with the sigmoid router; deepseek32 with the sparse-attention indexer keeping three
@@ -756,11 +908,116 @@ const RECORDED: &[RecordedFamily] = &[
             28, 31, 1, 1, 1, 27, 2, 0, 36, 25, 22, 25, 28, 31, 1, 1, 1, 27, 32, 34, 31, 1, 25, 28,
         ],
     },
+    // deepseek4 (POOT-568) has no Runner recording: its tokens are the independent f64 reference's
+    // greedy decode (`deepseek4::tests::the_driver_literals_are_the_references_greedy_decode`,
+    // smallest top-two logit margin 1.5e-2). The 7-token prompt is not a multiple of the family's
+    // prefill granule (4), so each run is a prefill of four tokens and three decode steps.
+    RecordedFamily {
+        family: "deepseek4",
+        prompt: &PROMPT,
+        tied_head: false,
+        tokens: [
+            28, 31, 6, 41, 20, 26, 15, 17, 9, 32, 33, 13, 40, 26, 9, 41, 42, 30, 11, 15, 32, 32,
+            31, 7,
+        ],
+    },
+    // glm53_flash (POOT-569) has no Runner recording: its tokens are the independent f64 reference's
+    // greedy decode (`glm53_flash::tests::the_driver_literals_are_the_references_greedy_decode`,
+    // smallest top-two logit margin 5.7e-3). The family has no prefill granule, so the 7-token prompt
+    // runs as prefill pieces (8 or 4 tokens per chunk) and decode steps for no remainder.
+    RecordedFamily {
+        family: "glm53_flash",
+        prompt: &PROMPT,
+        tied_head: false,
+        tokens: [
+            29, 46, 25, 32, 34, 21, 17, 7, 2, 31, 37, 12, 30, 0, 4, 8, 4, 24, 21, 43, 9, 31, 24, 21,
+        ],
+    },
+    // qwen3next (POOT-575) has no Runner recording: its tokens are the CPU oracle's greedy decode over the
+    // fixture (`qwen3next::tests::the_fixture_generates_the_recorded_tokens`; the GDN, gated attention and
+    // gated shared expert are pinned against f64 references in their own modules, tier 3).
+    RecordedFamily {
+        family: "qwen3next",
+        prompt: &PROMPT,
+        tied_head: false,
+        tokens: [
+            20, 2, 20, 3, 6, 27, 25, 17, 18, 24, 20, 18, 45, 34, 45, 5, 45, 12, 35, 40, 5, 46, 35,
+            29,
+        ],
+    },
+    // The three Qwen4Exp rows (POOT-571) are the independent reference's greedy tokens
+    // (`qwen38::tests::the_fixtures_generate_the_recorded_tokens`: the plain-loop f64 reference over the
+    // checkpoint bytes, re-run over the whole sequence per token), which the CPU oracle's token-by-token
+    // decode reproduces. The 7-token prompt is not a whole number of the family's blocks (two for the
+    // fixtures, four for the finetune-sized one), so each driver run is whole-granule prefill plus decode
+    // steps and equals the token-by-token run (SC-008).
+    RecordedFamily {
+        family: "qwen4exp",
+        prompt: &PROMPT,
+        tied_head: false,
+        tokens: [
+            38, 45, 2, 44, 16, 27, 35, 25, 34, 10, 28, 16, 14, 10, 15, 35, 36, 3, 38, 30, 4, 39,
+            18, 21,
+        ],
+    },
+    RecordedFamily {
+        family: "qwen4exp/packed",
+        prompt: &PROMPT,
+        tied_head: false,
+        tokens: [
+            22, 22, 46, 11, 6, 18, 7, 22, 26, 28, 45, 9, 11, 13, 30, 33, 28, 30, 12, 31, 11, 5, 11,
+            11,
+        ],
+    },
+    RecordedFamily {
+        family: "qwen4exp/finetune",
+        prompt: &PROMPT,
+        tied_head: false,
+        tokens: [
+            12, 6, 34, 37, 30, 7, 38, 40, 18, 38, 7, 40, 7, 6, 34, 21, 38, 46, 27, 7, 43, 31, 28,
+            28,
+        ],
+    },
+    // qwen35 (POOT-572) has no Runner recording: its tokens are the CPU oracle's greedy decode over the
+    // fixture (`qwen38_27b::tests::the_fixture_generates_the_recorded_tokens`; its logits and every
+    // carried state element are pinned against the independent plain-loop reference in the same module,
+    // tier 2).
+    RecordedFamily {
+        family: "qwen35",
+        prompt: &PROMPT,
+        tied_head: false,
+        tokens: [
+            4, 11, 45, 13, 11, 14, 33, 6, 28, 2, 39, 25, 1, 2, 35, 35, 29, 37, 26, 40, 23, 10, 27,
+            24,
+        ],
+    },
+    // The same family stored as `Qwen/Qwen3.8-27B-FP8` stores it: every projection a packed block-scaled
+    // E4M3 payload. The tokens are the CPU oracle's over the packed store
+    // (`qwen38_27b::tests::the_fp8_fixture_generates_the_recorded_tokens`).
+    RecordedFamily {
+        family: "qwen35/fp8",
+        prompt: &PROMPT,
+        tied_head: false,
+        tokens: [
+            31, 6, 9, 22, 7, 12, 6, 6, 30, 9, 12, 9, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+        ],
+    },
 ];
 
-/// `family`'s builtin fixture as the Runner was fed it (see [`RecordedFamily`]), with no reachable
+/// `family`'s builtin fixture as the pre-driver engine was fed it (see [`RecordedFamily`]), with no reachable
 /// end-of-sequence id.
 fn recorded_family_handle(recorded: &RecordedFamily) -> Arc<ModelHandle> {
+    recorded_family_handle_with(recorded, &|key, weight| {
+        vec![(key.to_string(), weight.clone())]
+    })
+}
+
+/// How a checkpoint stores a tensor: the named tensors that replace the one the fixture holds.
+type Restore = dyn Fn(&str, &WeightEntry) -> Vec<(String, WeightEntry)>;
+
+/// [`recorded_family_handle`] with each stored tensor replaced by the tensors `restore` returns for it
+/// (a checkpoint that stores a weight another way).
+fn recorded_family_handle_with(recorded: &RecordedFamily, restore: &Restore) -> Arc<ModelHandle> {
     let registry = Registry::builtin().unwrap();
     // `family/variant` names one of the family's option fixtures (llama's Mixtral).
     let (name, variant) = recorded
@@ -788,7 +1045,9 @@ fn recorded_family_handle(recorded: &RecordedFamily) -> Arc<ModelHandle> {
     let mut store = WeightStore::builder();
     for (key, weight) in fixture.store.iter() {
         if !(recorded.tied_head && key.as_str() == "lm_head.weight") {
-            store.insert(key.clone(), weight.clone()).unwrap();
+            for (key, weight) in restore(key.as_str(), weight) {
+                store.insert(key, weight).unwrap();
+            }
         }
     }
     let raw = RawConfig::HfJson {
@@ -873,6 +1132,14 @@ recorded_family_rows! {
     "deepseek3" => recorded_deepseek3_tokens_wgpu, recorded_deepseek3_tokens_rocm, recorded_deepseek3_tokens_ptx;
     "deepseek32" => recorded_deepseek32_tokens_wgpu, recorded_deepseek32_tokens_rocm, recorded_deepseek32_tokens_ptx;
     "nemotron_h" => recorded_nemotron_h_tokens_wgpu, recorded_nemotron_h_tokens_rocm, recorded_nemotron_h_tokens_ptx;
+    "deepseek4" => recorded_deepseek4_tokens_wgpu, recorded_deepseek4_tokens_rocm, recorded_deepseek4_tokens_ptx;
+    "qwen3next" => recorded_qwen3next_tokens_wgpu, recorded_qwen3next_tokens_rocm, recorded_qwen3next_tokens_ptx;
+    "qwen4exp" => recorded_qwen4exp_tokens_wgpu, recorded_qwen4exp_tokens_rocm, recorded_qwen4exp_tokens_ptx;
+    "qwen4exp/packed" => recorded_qwen4exp_packed_tokens_wgpu, recorded_qwen4exp_packed_tokens_rocm, recorded_qwen4exp_packed_tokens_ptx;
+    "qwen4exp/finetune" => recorded_qwen4exp_finetune_tokens_wgpu, recorded_qwen4exp_finetune_tokens_rocm, recorded_qwen4exp_finetune_tokens_ptx;
+    "qwen35" => recorded_qwen35_tokens_wgpu, recorded_qwen35_tokens_rocm, recorded_qwen35_tokens_ptx;
+    "qwen35/fp8" => recorded_qwen35_fp8_tokens_wgpu, recorded_qwen35_fp8_tokens_rocm, recorded_qwen35_fp8_tokens_ptx;
+    "glm53_flash" => recorded_glm53_flash_tokens_wgpu, recorded_glm53_flash_tokens_rocm, recorded_glm53_flash_tokens_ptx;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1036,7 +1303,12 @@ fn fixture_dir(
             };
             ArchiveTensor {
                 name: key.as_str().to_string(),
-                dtype: "BF16",
+                dtype: match dense.dtype() {
+                    poot_tensor::DType::BF16 => "BF16",
+                    poot_tensor::DType::F32 => "F32",
+                    poot_tensor::DType::I64 => "I64",
+                    other => panic!("the fixture stores {other:?}"),
+                },
                 shape: dense.shape().to_vec(),
                 bytes: dense.bytes().as_slice().to_vec(),
             }
@@ -1106,8 +1378,134 @@ fn a_finetune_like_minimax_checkpoint_loads_through_model_handle_load() {
     assert_eq!(handle.config().vocab, VOCAB);
 }
 
+/// POOT-572 SC-002: a Qwen3.5 checkpoint directory whose config the old pinned counts refused (two
+/// layers, other widths and head counts, no manifest anywhere) loads through `ModelHandle::load`,
+/// resolves to the `qwen35` family and keeps the config's own counts. Its numerics are the in-crate
+/// row's (`qwen38_27b::tests::a_finetune_shaped_config_builds_and_matches_its_reference`). Mutation:
+/// reinstate a pinned layer count in `Qwen35Params::from_raw`; the load is refused and the row goes red.
+#[test]
+fn a_finetune_like_qwen35_checkpoint_loads_through_model_handle_load() {
+    let registry = Registry::builtin().unwrap();
+    let entry = registry
+        .entries()
+        .iter()
+        .find(|entry| entry.family.as_str() == "qwen35")
+        .unwrap();
+    let (_, finetune) = entry
+        .variants
+        .iter()
+        .find(|(name, _)| *name == "finetune")
+        .expect("qwen35 ships a finetune-like fixture");
+    let fixture = finetune();
+    assert_eq!(fixture.config["text_config"]["num_hidden_layers"], 2);
+    let dir = fixture_dir("qwen35_finetune", &fixture);
+    let handle =
+        ModelHandle::load(&dir, &registry, &crate::driver::LoadOptions::default()).unwrap();
+    assert_eq!(handle.config().family, entry.family);
+    assert_eq!(handle.config().vocab, VOCAB);
+}
+
+/// POOT-572 SC-007, the loading half on a fixture: the Qwen3.5 fixture written the way
+/// `Qwen/Qwen3.8-27B-FP8` stores it (E4M3 `weight` and a BF16 `weight_scale_inv` per 128x128 block for
+/// every text projection, a `quantization_config` naming `quant_method: "fp8"`, the rest BF16) loads
+/// through `ModelHandle::load` with its projections packed as stored: the payload bytes equal the
+/// written ones, none decoded. Mutation: drop the `"fp8"` arm of `QuantConfig::scheme`; the load is
+/// refused as an unknown `quant_method` and the row goes red.
+#[test]
+fn a_block_fp8_qwen35_checkpoint_loads_packed_through_model_handle_load() {
+    use poot_quant::format::{ScaleEncoding, WeightFormat};
+    use poot_quant::weights::{HandleFormat, WeightEntry};
+    use poot_quant::{OperandRole, SourceRole};
+    let registry = Registry::builtin().unwrap();
+    let entry = registry
+        .entries()
+        .iter()
+        .find(|entry| entry.family.as_str() == "qwen35")
+        .unwrap();
+    let (_, fp8) = entry
+        .variants
+        .iter()
+        .find(|(name, _)| *name == "fp8")
+        .expect("qwen35 ships an FP8 fixture");
+    let fixture = fp8();
+    let mut config = fixture.config.clone();
+    config["quantization_config"] = serde_json::json!({
+        "quant_method": "fp8",
+        "fmt": "e4m3",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [128, 128],
+    });
+    let mut tensors = Vec::new();
+    for (key, weight) in fixture.store.iter() {
+        match weight {
+            WeightEntry::Dense(dense) => tensors.push(ArchiveTensor {
+                name: key.as_str().to_string(),
+                dtype: "BF16",
+                shape: dense.shape().to_vec(),
+                bytes: dense.bytes().as_slice().to_vec(),
+            }),
+            WeightEntry::Packed(payload) => {
+                let [rows, k] = payload.weight().shape();
+                let stem = key.as_str().strip_suffix(".weight").unwrap();
+                tensors.push(ArchiveTensor {
+                    name: key.as_str().to_string(),
+                    dtype: "F8_E4M3",
+                    shape: vec![rows, k],
+                    bytes: payload
+                        .bytes(SourceRole::Planar(OperandRole::Codes))
+                        .to_vec(),
+                });
+                tensors.push(ArchiveTensor {
+                    name: format!("{stem}.weight_scale_inv"),
+                    dtype: "BF16",
+                    shape: vec![rows.div_ceil(128), k.div_ceil(128)],
+                    bytes: payload
+                        .bytes(SourceRole::Planar(OperandRole::Scale))
+                        .to_vec(),
+                });
+            }
+        }
+    }
+    let dir = write_hf_checkpoint("qwen35_fp8", &config, &tensors);
+    let handle =
+        ModelHandle::load(&dir, &registry, &crate::driver::LoadOptions::default()).unwrap();
+    assert_eq!(handle.config().family, entry.family);
+    let mut packed = 0;
+    for (key, want) in fixture.store.iter() {
+        let WeightEntry::Packed(want) = want else {
+            continue;
+        };
+        let Some(WeightEntry::Packed(got)) = handle.store().get(key.as_str()) else {
+            panic!("{key} did not load packed");
+        };
+        assert_eq!(
+            got.weight().format(),
+            WeightFormat::E4m3Block128 {
+                scale: ScaleEncoding::Bf16
+            }
+        );
+        for role in [OperandRole::Codes, OperandRole::Scale] {
+            assert_eq!(
+                got.bytes(SourceRole::Planar(role)),
+                want.bytes(SourceRole::Planar(role)),
+                "{key}: {role:?} is stored as written"
+            );
+        }
+        packed += 1;
+    }
+    // Three GDN layers' qkv, z and out, the attention layer's four projections, every layer's MLP.
+    assert_eq!(packed, 3 * 3 + 4 + 4 * 3);
+    let handles = handle
+        .model()
+        .weights()
+        .iter()
+        .filter(|(_, _, h)| matches!(h.format, HandleFormat::Packed(_)))
+        .count();
+    assert_eq!(handles, packed, "every packed projection is mapped packed");
+}
+
 /// Gemma is trained with a mandatory BOS: an HF gemma3 checkpoint's prompts encode with its BOS id
-/// first (the fixture config names 1), as the Runner's loader did; a family without one (qwen2) encodes
+/// first (the fixture config names 1), as the pre-driver loader did; a family without one (qwen2) encodes
 /// the prompt as the tokenizer does. Mutation: drop gemma3's `prompt_bos` (`None`); the gemma3 encode
 /// loses its BOS and the row goes red.
 #[test]
@@ -1559,8 +1957,8 @@ per_backend!(
     packed_checkpoints_load_as_stored_through_the_registry_ptx
 );
 
-/// Card 1018 (the Runner's `a_packed_gguf_prefills_like_its_dense_twin` and
-/// `a_packed_gguf_decodes_on_wgpu_through_compile_like_its_dense_twin`): a qwen2 and a llama GGUF whose
+/// Card 1018 (the pre-driver engine's packed-GGUF prefill and wgpu compiled-decode rows, each against its
+/// dense twin): a qwen2 and a llama GGUF whose
 /// projections, embedding and tied head are packed `format` payloads load with every one of them a
 /// packed handle (the dense twin has none), and the driver generates the twin's tokens: alone with a
 /// chunked prefill (the contiguous entry), and through the serving surface, two sequences stepping
@@ -1703,8 +2101,8 @@ per_backend!(
 );
 
 /// Real checkpoints through `Registry::builtin()` -> `ModelHandle::load` -> `Driver::generate`, against
-/// the tokens the Runner generated for them before this card (recorded on the base commit `2ef7ea834`
-/// with `generate_kv_gpu_prefilled`, identical on wgpu and ROCm; the driver equalled them there), and
+/// the tokens the pre-driver engine generated for them before this card (recorded on the base commit
+/// `2ef7ea834` with its prefilled device generate, identical on wgpu and ROCm; the driver equalled them there), and
 /// rule 18's coherence references. Checkpoint-device rows under rule 18's memory gates, `#[ignore]`d.
 mod checkpoint {
     use super::*;
@@ -1895,7 +2293,7 @@ mod checkpoint {
         Some(text)
     }
 
-    /// The old Runner coherence rows: the greedy continuation of `prompt` names `needle`, which the
+    /// The old pre-driver coherence rows: the greedy continuation of `prompt` names `needle`, which the
     /// garbled output of a wrong norm, scale, mask or placement does not.
     fn continues_with(
         path: &std::path::Path,
@@ -2017,7 +2415,7 @@ mod checkpoint {
 
     /// Card 1018 (`post_prefill_prepare_real_gguf_matches_cpu_gpu`): a real qwen2 GGUF answers a chat
     /// prompt, cold and again on the warm driver, with the same tokens, and the answer names Paris. The
-    /// Runner compared against its CPU eager path; the driver has no CPU path, so the independent claim
+    /// pre-driver engine compared against its CPU eager path; the driver has no CPU path, so the independent claim
     /// is the answer and the repeat is the prepare-then-reuse claim.
     fn chat_answer_repeats(path: &std::path::Path, choice: BackendChoice) {
         let handle = load(path);
@@ -2218,10 +2616,10 @@ mod checkpoint {
         }
     }
 
-    /// The old Runner MoE coherence rows (qwen3-moe, mixtral, olmoe, gpt-oss, granitemoe tiny checkpoints):
+    /// The old pre-driver MoE coherence rows (qwen3-moe, mixtral, olmoe, gpt-oss, granitemoe tiny checkpoints):
     /// the checkpoint loads through the registry and decodes through the driver, a prefill split into
     /// chunks of four generates the tokens a whole-prompt prefill does, and the continuation is not empty.
-    /// The Runner compared the device with its CPU re-prefill; the driver has no CPU path, so the
+    /// The pre-driver engine compared the device with its CPU re-prefill; the driver has no CPU path, so the
     /// independent claim is the chunking invariance of the routed prefill.
     fn moe_generates(path: &std::path::Path, choice: BackendChoice) {
         let handle = load(path);
@@ -2239,6 +2637,66 @@ mod checkpoint {
         eprintln!("{}: {text:?}", path.display());
         assert!(!tokens.is_empty(), "{}: nothing generated", path.display());
         assert_eq!(tokens, split, "{}: prefill chunking", path.display());
+    }
+
+    /// POOT-572 SC-007 (M5's one real-dimensions receipt): the real `Qwen/Qwen3.8-27B-FP8` checkpoint
+    /// loads through the registry (its block-scaled FP8 projections packed as stored), generates through
+    /// the driver on one 80 GB-class GPU, and its first token's top-five log-probabilities equal the CPU
+    /// oracle's over the same traced graph and weight map (token ids exact, log-probabilities within
+    /// `1e-3`, ADR-0101 tier 2). The first token is also the documented answer to the prompt: a wrong
+    /// weight-name mapping shared by the device and the oracle (they read one name table) cannot pass
+    /// it. Prints the receipt lines a pod run records. Never runs on the dev box: the row is `#[ignore]`d
+    /// and a checkpoint of this size is a pod's.
+    fn qwen35_27b_generates_and_matches_the_oracle(path: &std::path::Path, choice: BackendChoice) {
+        let handle = load(path);
+        let ids = handle.text().encode(CAPITAL).unwrap();
+        let capacity = 64;
+        let Some(executor) = open(choice) else {
+            return;
+        };
+        let mut limits = options(8, capacity);
+        limits.prepared.max_retained_bytes = NonZeroU64::new(1 << 38).unwrap();
+        let mut driver = Driver::new(Arc::clone(&handle), executor, limits).unwrap();
+        let generated = driver
+            .generate(
+                GenerateRequest {
+                    prompt: ids.clone(),
+                    max_new: 8,
+                    sampler: Sampler::greedy().with_logprobs(5),
+                    stops: Vec::new(),
+                    ignore_eos: false,
+                },
+                &mut |_: u32, _: &str| GenerationControl::Continue(()),
+            )
+            .unwrap();
+        let text = handle.text().decode(&generated.tokens).unwrap();
+        eprintln!("RECEIPT prompt {CAPITAL:?} ids {ids:?}");
+        eprintln!("RECEIPT generated {:?} text {text:?}", generated.tokens);
+        let got = &generated.logprobs[0].top;
+        eprintln!("RECEIPT device first-token top5 {got:?}");
+        let first = handle.text().decode(&generated.tokens[..1]).unwrap();
+        assert_eq!(
+            first, " Paris",
+            "the documented answer; the text was {text:?}"
+        );
+        let want = oracle_top5(&handle, &ids, capacity);
+        eprintln!("RECEIPT oracle first-token top5 {want:?}");
+        assert_eq!(generated.tokens[0], want[0].0, "first token");
+        assert_eq!(
+            got.iter().map(|&(t, _)| t).collect::<Vec<_>>(),
+            want.iter().map(|&(t, _)| t).collect::<Vec<_>>(),
+            "the five most likely tokens"
+        );
+        for ((token, got), (_, want)) in got.iter().zip(&want) {
+            assert!(
+                (f64::from(*got) - want).abs() <= 1e-3,
+                "token {token} has log-probability {got}, the oracle gives {want}"
+            );
+        }
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        for line in status.lines().filter(|l| l.starts_with("VmHWM")) {
+            eprintln!("RECEIPT peak host memory ({line})");
+        }
     }
 
     /// One `#[ignore]`d row per checkpoint and backend (each its own test and process: the ROCm runtime
@@ -2284,6 +2742,8 @@ mod checkpoint {
     }
 
     rows! {
+        qwen35_27b_fp8_receipt: "qwen3.8-27b-fp8", qwen35_27b_generates_and_matches_the_oracle,
+            "loads the real Qwen3.8-27B-FP8 checkpoint (about 28 GB) and runs the CPU oracle over it: an 80 GB-class pod only, never the dev box";
         qwen2_bf16_recorded: "qwen2.5-0.5b",
             |path, choice| recorded(path, &QWEN2_5_0_5B_PROMPT, &QWEN2_5_0_5B, choice),
             "loads the real qwen2.5-0.5b bf16 checkpoint onto the GPU; needs >= 40Gi available";
@@ -2953,13 +3413,17 @@ fn a_nan_router_weight_is_a_typed_validation_fault(choice: BackendChoice) {
         choice,
         "qwen3moe",
         "model.layers.1.mlp.gate.weight",
+        1,
     );
 }
 
+/// `family`'s fixture with NaN in the router tensor `router` of layer `layer` stops generation with
+/// the `RouterLogitsFinite` witness of that layer.
 fn a_nan_router_weight_is_a_typed_validation_fault_of(
     choice: BackendChoice,
     family: &str,
     router: &str,
+    layer: usize,
 ) {
     use poot_executor::ExecError;
     use poot_graph_ir::ValidationPacketError;
@@ -2988,7 +3452,7 @@ fn a_nan_router_weight_is_a_typed_validation_fault_of(
     };
     assert_eq!(
         WitnessKind::decode(failure.id),
-        Some((1, WitnessKind::RouterLogitsFinite)),
+        Some((layer, WitnessKind::RouterLogitsFinite)),
         "{failure}"
     );
 }
@@ -3007,6 +3471,7 @@ fn a_nan_minimax_router_weight_is_a_typed_validation_fault(choice: BackendChoice
         choice,
         "minimax_m2",
         "model.layers.1.block_sparse_moe.gate.weight",
+        1,
     );
 }
 per_backend!(
@@ -3014,6 +3479,261 @@ per_backend!(
     a_nan_minimax_router_weight_is_a_typed_validation_fault_wgpu,
     a_nan_minimax_router_weight_is_a_typed_validation_fault_rocm,
     a_nan_minimax_router_weight_is_a_typed_validation_fault_ptx
+);
+
+/// POOT-568 SC-006 (F4): a NaN in the router of a score-routed layer (layer 1, the first CSA layer) and in
+/// the router of the hash-routed layer 0 is `RouterLogitsFinite` naming that layer through the driver, not a
+/// published token: the hash layer declares the same three witnesses as the shared router. Mutation: drop
+/// the witness emission from `hash_routes` (layer 0 row) or from `components::router` (layer 1 row); the NaN
+/// publishes tokens and the row goes red.
+fn a_nan_deepseek4_router_weight_is_a_typed_validation_fault(choice: BackendChoice) {
+    a_nan_router_weight_is_a_typed_validation_fault_of(
+        choice,
+        "deepseek4",
+        "layers.1.ffn.gate.weight",
+        1,
+    );
+}
+per_backend!(
+    a_nan_deepseek4_router_weight_is_a_typed_validation_fault,
+    a_nan_deepseek4_router_weight_is_a_typed_validation_fault_wgpu,
+    a_nan_deepseek4_router_weight_is_a_typed_validation_fault_rocm,
+    a_nan_deepseek4_router_weight_is_a_typed_validation_fault_ptx
+);
+
+fn a_nan_deepseek4_hash_router_weight_is_a_typed_validation_fault(choice: BackendChoice) {
+    a_nan_router_weight_is_a_typed_validation_fault_of(
+        choice,
+        "deepseek4",
+        "layers.0.ffn.gate.weight",
+        0,
+    );
+}
+per_backend!(
+    a_nan_deepseek4_hash_router_weight_is_a_typed_validation_fault,
+    a_nan_deepseek4_hash_router_weight_is_a_typed_validation_fault_wgpu,
+    a_nan_deepseek4_hash_router_weight_is_a_typed_validation_fault_rocm,
+    a_nan_deepseek4_hash_router_weight_is_a_typed_validation_fault_ptx
+);
+
+/// POOT-568 SC-007 (F3): the DeepSeek-V4 fixture's prefill granule is 4 (compression rates 2 and 4). A
+/// ten-token prompt runs as one prefill of eight tokens and two decode steps, and the eight tokens it then
+/// generates are the independent reference's token-by-token decode (the reference reads no prefill at all):
+/// the family's trace refuses a prefill that is not a multiple of four, so a driver that chunked at six
+/// would fail the run instead. Literals: `deepseek4::tests::a_granule_four_prompt_decodes_as_the_reference`.
+/// Mutation: chunk at 6 in the driver (`ChunkPolicy::new` accepting a chunk that is no multiple of the
+/// granule); the run is refused and the row goes red.
+fn a_deepseek4_prompt_of_ten_runs_as_prefill_eight_and_two_decode_steps(choice: BackendChoice) {
+    const PROMPT10: [u32; 10] = [3, 17, 40, 8, 25, 9, 31, 2, 44, 12];
+    const TOKENS: [u32; 8] = [36, 13, 21, 9, 32, 15, 32, 2];
+    let recorded = RECORDED
+        .iter()
+        .find(|recorded| recorded.family == "deepseek4")
+        .unwrap();
+    let handle = recorded_family_handle(recorded);
+    assert_eq!(handle.config().prefill_granule.get(), 4);
+    let Some(mut driver) = driver(choice, &handle, 8, CAPACITY) else {
+        return;
+    };
+    assert_eq!(
+        generate(&mut driver, &PROMPT10, 8, Sampler::greedy()),
+        TOKENS,
+        "deepseek4 on {choice:?}"
+    );
+}
+per_backend!(
+    a_deepseek4_prompt_of_ten_runs_as_prefill_eight_and_two_decode_steps,
+    a_deepseek4_prompt_of_ten_runs_as_prefill_eight_and_two_decode_steps_wgpu,
+    a_deepseek4_prompt_of_ten_runs_as_prefill_eight_and_two_decode_steps_rocm,
+    a_deepseek4_prompt_of_ten_runs_as_prefill_eight_and_two_decode_steps_ptx
+);
+
+/// POOT-568 SC-007: a prefill chunk of six is not a multiple of the family's granule: the driver refuses
+/// it with the typed option error before it loads any executable (the chunk is the number of new tokens of
+/// a step, so the six-token step the trace refuses is never built). Mutation: drop the granule check from
+/// `ChunkPolicy::new`; the driver constructs and the row goes red.
+fn a_deepseek4_chunk_that_is_not_a_granule_multiple_is_refused_before_any_executable(
+    choice: BackendChoice,
+) {
+    use crate::driver::error::InvalidOptions;
+    let handle = recorded_family_handle(
+        RECORDED
+            .iter()
+            .find(|recorded| recorded.family == "deepseek4")
+            .unwrap(),
+    );
+    let Some(executor) = open(choice) else {
+        return;
+    };
+    match Driver::new(handle, executor, options(6, CAPACITY)) {
+        Err(DriverError::InvalidOptions(InvalidOptions::ChunkNotGranuleAligned {
+            chunk: 6,
+            granule: 4,
+        })) => {}
+        other => panic!("expected the granule refusal, got {:?}", other.map(|_| ())),
+    }
+}
+per_backend!(
+    a_deepseek4_chunk_that_is_not_a_granule_multiple_is_refused_before_any_executable,
+    a_deepseek4_chunk_that_is_not_a_granule_multiple_is_refused_before_any_executable_wgpu,
+    a_deepseek4_chunk_that_is_not_a_granule_multiple_is_refused_before_any_executable_rocm,
+    a_deepseek4_chunk_that_is_not_a_granule_multiple_is_refused_before_any_executable_ptx
+);
+
+/// POOT-568 SC-002 (F5): a DeepSeek-V4 checkpoint directory a pinned config refused (three layers in
+/// another order, other compression rates, two hash layers, six experts) and no manifest anywhere loads
+/// through `ModelHandle::load`, resolves to the `deepseek4` family and keeps the config's own counts.
+/// Mutation: reinstate a pinned layer count in `DeepseekV4Config::from_raw`; the load is refused and the
+/// row goes red.
+#[test]
+fn a_finetune_like_deepseek4_checkpoint_loads_through_model_handle_load() {
+    let registry = Registry::builtin().unwrap();
+    let entry = registry
+        .entries()
+        .iter()
+        .find(|entry| entry.family.as_str() == "deepseek4")
+        .unwrap();
+    let (_, finetune) = entry
+        .variants
+        .iter()
+        .find(|(name, _)| *name == "finetune")
+        .expect("deepseek4 ships a finetune-like fixture");
+    let fixture = finetune();
+    let dir = fixture_dir("deepseek4_finetune", &fixture);
+    let handle =
+        ModelHandle::load(&dir, &registry, &crate::driver::LoadOptions::default()).unwrap();
+    assert_eq!(handle.config().family, entry.family);
+    assert_eq!(handle.config().vocab, VOCAB);
+    assert_eq!(handle.config().prefill_granule.get(), 4);
+}
+
+/// POOT-569 SC-002 (F5): a GLM-5.3-Flash checkpoint directory a pinned config refused (three layers in
+/// another order, four experts, other heads and pool size, no multi-token-prediction layer) and no
+/// manifest anywhere loads through `ModelHandle::load`, resolves to the `glm53_flash` family and keeps
+/// the config's own counts. Mutation: reinstate a pinned layer count in `Glm53Config::from_raw`; the
+/// load is refused and the row goes red.
+#[test]
+fn a_finetune_like_glm53_flash_checkpoint_loads_through_model_handle_load() {
+    let registry = Registry::builtin().unwrap();
+    let entry = registry
+        .entries()
+        .iter()
+        .find(|entry| entry.family.as_str() == "glm53_flash")
+        .unwrap();
+    let (_, finetune) = entry
+        .variants
+        .iter()
+        .find(|(name, _)| *name == "finetune")
+        .expect("glm53_flash ships a finetune-like fixture");
+    let fixture = finetune();
+    let dir = fixture_dir("glm53_flash_finetune", &fixture);
+    let handle =
+        ModelHandle::load(&dir, &registry, &crate::driver::LoadOptions::default()).unwrap();
+    assert_eq!(handle.config().family, entry.family);
+    assert_eq!(handle.config().vocab, VOCAB);
+    assert_eq!(handle.config().prefill_granule.get(), 1);
+}
+
+/// POOT-569 SC-001: a NaN in layer 1's router (the first routed layer) is `RouterLogitsFinite` naming
+/// layer 1 through the driver, not a published token. Mutation: drop the router's witness emission in
+/// `components::router`; the NaN publishes tokens and the row goes red.
+fn a_nan_glm53_flash_router_weight_is_a_typed_validation_fault(choice: BackendChoice) {
+    a_nan_router_weight_is_a_typed_validation_fault_of(
+        choice,
+        "glm53_flash",
+        "model.language_model.layers.1.mlp.gate.weight",
+        1,
+    );
+}
+per_backend!(
+    a_nan_glm53_flash_router_weight_is_a_typed_validation_fault,
+    a_nan_glm53_flash_router_weight_is_a_typed_validation_fault_wgpu,
+    a_nan_glm53_flash_router_weight_is_a_typed_validation_fault_rocm,
+    a_nan_glm53_flash_router_weight_is_a_typed_validation_fault_ptx
+);
+
+/// The independent f64 reference's log-probabilities over the GLM-5.3-Flash fixture's whole vocabulary
+/// at the 24 positions the recorded tokens are sampled at, one line per position
+/// (`glm53_flash::tests::the_device_logprob_literals_are_the_references` pins the file to the reference).
+const GLM53_FLASH_REFERENCE_LOGPROBS: &str =
+    include_str!("device_tests/glm53_flash_reference_logprobs.txt");
+
+/// POOT-1056 (POOT-569 SC-001/005/006, device half, tier 3): the GLM-5.3-Flash fixture's whole
+/// distribution at every generated position through the driver equals the independent f64 reference's
+/// (each of the 48 log-probabilities within `1e-3`), whether the 7-token prompt prefills in one piece
+/// (`chunk` 8) or in pieces of two: the KDA recurrence and the DSA pool state carry across the pieces and then across 23
+/// decode steps. The device exposes no state readback, so a wrong carried KDA or DSA element is
+/// observed in every later position's distribution. Mutation: zero the carried KDA state
+/// (`step.carry(state, s)` in `components::kda` carries `s * 0`); the second position's distribution
+/// moves and the row goes red.
+fn glm53_flash_every_position_matches_the_reference_with(choice: BackendChoice, chunk: usize) {
+    let recorded = RECORDED
+        .iter()
+        .find(|recorded| recorded.family == "glm53_flash")
+        .unwrap();
+    let handle = recorded_family_handle(recorded);
+    let vocab = handle.config().vocab;
+    let want: Vec<Vec<f64>> = GLM53_FLASH_REFERENCE_LOGPROBS
+        .lines()
+        .map(|line| line.split(' ').map(|v| v.parse().unwrap()).collect())
+        .collect();
+    assert_eq!(want.len(), recorded.tokens.len());
+    let Some(mut driver) = driver(choice, &handle, chunk, CAPACITY) else {
+        return;
+    };
+    let generated = driver
+        .generate(
+            GenerateRequest {
+                prompt: recorded.prompt.to_vec(),
+                max_new: recorded.tokens.len(),
+                sampler: Sampler::greedy().with_logprobs(vocab),
+                stops: Vec::new(),
+                ignore_eos: false,
+            },
+            &mut |_: u32, _: &str| GenerationControl::Continue(()),
+        )
+        .unwrap();
+    assert_eq!(
+        generated.tokens, recorded.tokens,
+        "glm53_flash on {choice:?}, prefill pieces of {chunk}: tokens"
+    );
+    assert_eq!(generated.logprobs.len(), want.len());
+    for (position, (got, want)) in generated.logprobs.iter().zip(&want).enumerate() {
+        assert_eq!(
+            got.top.len(),
+            vocab,
+            "position {position}: the whole vocabulary is recorded"
+        );
+        for &(token, got) in &got.top {
+            let want = want[token as usize];
+            assert!(
+                (f64::from(got) - want).abs() <= 1e-3,
+                "glm53_flash on {choice:?}, prefill pieces of {chunk}, generated position \
+                 {position}: token {token} has log-probability {got}, the reference gives {want}"
+            );
+        }
+    }
+}
+fn glm53_flash_every_position_matches_the_reference(choice: BackendChoice) {
+    glm53_flash_every_position_matches_the_reference_with(choice, 8);
+}
+per_backend!(
+    glm53_flash_every_position_matches_the_reference,
+    glm53_flash_every_position_matches_the_reference_wgpu,
+    glm53_flash_every_position_matches_the_reference_rocm,
+    glm53_flash_every_position_matches_the_reference_ptx
+);
+
+/// The same row with the prompt prefilled in pieces of two (a driver per row: a ROCm executor cannot
+/// be reopened in one process after a drop).
+fn glm53_flash_every_position_matches_the_reference_in_pieces_of_two(choice: BackendChoice) {
+    glm53_flash_every_position_matches_the_reference_with(choice, 2);
+}
+per_backend!(
+    glm53_flash_every_position_matches_the_reference_in_pieces_of_two,
+    glm53_flash_every_position_matches_the_reference_in_pieces_of_two_wgpu,
+    glm53_flash_every_position_matches_the_reference_in_pieces_of_two_rocm,
+    glm53_flash_every_position_matches_the_reference_in_pieces_of_two_ptx
 );
 
 /// POOT-570 SC-005: three positions of the MiniMax-M2 fixture through the driver against the reference:
@@ -3054,58 +3774,105 @@ per_backend!(
 // oracle on the same traced graph.
 // ---------------------------------------------------------------------------------------------
 
-/// The oracle's top five `(token, log-probability)` for the last prompt position of `handle`'s model,
-/// over its own traced prefill graph and weight map.
-fn oracle_top5(handle: &ModelHandle) -> Vec<(u32, f64)> {
-    use poot_graph_ir::{Slot, SlotKey};
-    use poot_models::model::{KvLayout, LogitRows, Phase, StepShape};
-    let n = PROMPT.len();
-    let shape = StepShape {
-        rows: nz(1),
-        tokens: nz(n),
-        capacity: nz(CAPACITY),
-        kv: KvLayout::Contiguous,
-        logits: LogitRows::Last,
-    };
+/// The oracle's last-position logits after each step of `steps` (phase, first position, length) over
+/// `tokens`, on `handle`'s model, its own traced graph (a cache of `capacity` positions) and weight
+/// map; the carried state flows from step to step. One row per step.
+fn oracle_step_logits(
+    handle: &ModelHandle,
+    tokens: &[u32],
+    steps: &[(Phase, usize, usize)],
+    capacity: usize,
+) -> Vec<Vec<f64>> {
     let model = handle.model();
-    let graph = model.trace(Phase::Prefill, shape).unwrap();
-    let formats = poot_graph_plan::WeightFormats::from_weight_map(model.weights());
-    let graph = poot_graph_plan::bind_packed_weights(&graph, &formats).unwrap();
-    let ids: Vec<i32> = PROMPT.iter().map(|&t| t as i32).collect();
-    let slots = [
-        (
-            SlotKey::new(Slot::Token, None),
-            poot_tensor::HostTensor::i32(vec![1, n], ids),
-        ),
-        (
-            SlotKey::new(Slot::Pos, None),
-            poot_tensor::HostTensor::i32(vec![1, n], (0..n as i32).collect()),
-        ),
-    ];
-    let zeros: Vec<poot_tensor::HostTensor> = graph
-        .state
-        .iter()
-        .map(|&(si, _)| poot_tensor::HostTensor::zeros(graph.aval(si).shape.clone()))
-        .collect();
-    let (out, _) = poot_test_util::weight_map_oracle::eval_mapped(
-        &graph,
-        handle.store(),
-        model.weights(),
-        &slots,
-        &zeros,
-    );
-    let logits: Vec<f64> = out
-        .as_f32()
-        .unwrap()
-        .iter()
-        .map(|&v| f64::from(v))
-        .collect();
+    let mut state: Vec<poot_tensor::HostTensor> = Vec::new();
+    let mut rows = Vec::new();
+    for &(phase, start, len) in steps {
+        let shape = StepShape {
+            rows: nz(1),
+            tokens: nz(len),
+            capacity: nz(capacity),
+            kv: KvLayout::Contiguous,
+            logits: LogitRows::Last,
+        };
+        let graph = model.trace(phase, shape).unwrap();
+        let formats = poot_graph_plan::WeightFormats::from_weight_map(model.weights());
+        let graph = poot_graph_plan::bind_packed_weights(&graph, &formats).unwrap();
+        let ids: Vec<i32> = tokens[start..start + len]
+            .iter()
+            .map(|&t| t as i32)
+            .collect();
+        let slots = [
+            (
+                SlotKey::new(Slot::Token, None),
+                poot_tensor::HostTensor::i32(vec![1, len], ids),
+            ),
+            (
+                SlotKey::new(Slot::Pos, None),
+                poot_tensor::HostTensor::i32(vec![1, len], (start as i32..).take(len).collect()),
+            ),
+        ];
+        if state.is_empty() {
+            // A carried token history is I32; every other state starts as zeros.
+            state = graph
+                .state
+                .iter()
+                .map(|&(si, _)| {
+                    let aval = graph.aval(si);
+                    match aval.dtype {
+                        poot_tensor::DType::I32 => {
+                            poot_tensor::HostTensor::i32(aval.shape.clone(), vec![0; aval.numel()])
+                        }
+                        _ => poot_tensor::HostTensor::zeros(aval.shape.clone()),
+                    }
+                })
+                .collect();
+        }
+        let (logits, next) = poot_test_util::weight_map_oracle::eval_mapped(
+            &graph,
+            handle.store(),
+            model.weights(),
+            &slots,
+            &state,
+        );
+        state = next;
+        rows.push(
+            logits
+                .as_f32()
+                .unwrap()
+                .iter()
+                .map(|&v| f64::from(v))
+                .collect(),
+        );
+    }
+    rows
+}
+
+/// `logits` as log-probabilities.
+fn log_softmax(logits: &[f64]) -> Vec<f64> {
     let max = logits.iter().copied().fold(f64::MIN, f64::max);
     let log_sum = logits.iter().map(|l| (l - max).exp()).sum::<f64>().ln() + max;
-    let mut ranked: Vec<(u32, f64)> = logits
-        .iter()
+    logits.iter().map(|l| l - log_sum).collect()
+}
+
+/// The oracle's top five `(token, log-probability)` for the last position of `prompt` on `handle`'s
+/// model, over its own traced prefill graph (a cache of `capacity` positions) and weight map.
+fn oracle_top5(handle: &ModelHandle, prompt: &[u32], capacity: usize) -> Vec<(u32, f64)> {
+    let n = prompt.len();
+    // The prompt as the driver runs it: one prefill of the largest multiple of the model's granule
+    // (none when the prompt is shorter than it) and a decode step for each remaining token.
+    let granule = handle.model().config().prefill_granule.get();
+    let aligned = n / granule * granule;
+    let steps: Vec<(Phase, usize, usize)> = (aligned > 0)
+        .then_some((Phase::Prefill, 0, aligned))
+        .into_iter()
+        .chain((aligned..n).map(|at| (Phase::Decode, at, 1)))
+        .collect();
+    let rows = oracle_step_logits(handle, prompt, &steps, capacity);
+    let last = rows.last().expect("a prompt has at least one step");
+    let mut ranked: Vec<(u32, f64)> = log_softmax(last)
+        .into_iter()
         .enumerate()
-        .map(|(t, l)| (t as u32, l - log_sum))
+        .map(|(t, l)| (t as u32, l))
         .collect();
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
     ranked.truncate(5);
@@ -3122,7 +3889,7 @@ fn moe_first_step_matches_the_oracle(family: &str, choice: BackendChoice) {
         .find(|recorded| recorded.family == family)
         .unwrap_or_else(|| panic!("no recorded row for {family}"));
     let handle = recorded_family_handle(recorded);
-    let want = oracle_top5(&handle);
+    let want = oracle_top5(&handle, recorded.prompt, CAPACITY);
     let Some(mut driver) = driver(choice, &handle, 8, CAPACITY) else {
         return;
     };
@@ -3185,4 +3952,1604 @@ moe_oracle_rows! {
     "deepseek3" => deepseek3_first_step_matches_the_oracle_wgpu, deepseek3_first_step_matches_the_oracle_rocm;
     "deepseek32" => deepseek32_first_step_matches_the_oracle_wgpu, deepseek32_first_step_matches_the_oracle_rocm;
     "nemotron_h" => nemotron_h_first_step_matches_the_oracle_wgpu, nemotron_h_first_step_matches_the_oracle_rocm;
+    "deepseek4" => deepseek4_first_step_matches_the_oracle_wgpu, deepseek4_first_step_matches_the_oracle_rocm;
+    "qwen3next" => qwen3next_first_step_matches_the_oracle_wgpu, qwen3next_first_step_matches_the_oracle_rocm;
+    "qwen4exp" => qwen4exp_first_step_matches_the_oracle_wgpu, qwen4exp_first_step_matches_the_oracle_rocm;
+    "qwen4exp/packed" => qwen4exp_packed_first_step_matches_the_oracle_wgpu, qwen4exp_packed_first_step_matches_the_oracle_rocm;
+    "qwen4exp/finetune" => qwen4exp_finetune_first_step_matches_the_oracle_wgpu, qwen4exp_finetune_first_step_matches_the_oracle_rocm;
+    "qwen35" => qwen35_first_step_matches_the_oracle_wgpu, qwen35_first_step_matches_the_oracle_rocm;
+    "glm53_flash" => glm53_flash_first_step_matches_the_oracle_wgpu, glm53_flash_first_step_matches_the_oracle_rocm;
 }
+
+// ---------------------------------------------------------------------------------------------
+// POOT-739: `Driver::encode` and prompts with embedding rows, on a device against the CPU oracle.
+// ---------------------------------------------------------------------------------------------
+
+use poot_graph_ir::{Slot, SlotKey};
+use poot_models::model::{KvLayout, LogitRows, Phase, StepShape};
+use poot_models::registry::Fixture;
+use poot_tensor::HostTensor;
+use poot_test_util::weight_map_oracle::eval_mapped;
+
+use crate::driver::{EncodeRequest, EncodeRow, PromptEmbeds};
+
+/// The model of `family`'s fixture (or its named variant) as a handle, with the fixture's text
+/// services (ids are fed directly).
+fn encoder_family_handle(family: &str, variant: Option<&str>) -> (Arc<ModelHandle>, Fixture) {
+    let registry = Registry::builtin().unwrap();
+    let entry = registry
+        .entries()
+        .iter()
+        .find(|entry| entry.family.as_str() == family)
+        .unwrap();
+    let fixture = match variant {
+        None => (entry.fixture)(),
+        Some(name) => entry
+            .variants
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, f)| f())
+            .unwrap(),
+    };
+    let handle =
+        ModelHandle::from_checkpoint(&fixture.raw(), fixture.store.clone(), &registry, |_| {
+            Ok(fixture_text())
+        })
+        .unwrap();
+    (Arc::new(handle), fixture)
+}
+
+/// The oracle's output of `phase` over `slots`, from the handle's own weights.
+fn oracle(
+    handle: &ModelHandle,
+    phase: Phase,
+    shape: StepShape,
+    slots: &[(SlotKey, HostTensor)],
+) -> Vec<f32> {
+    let model = handle.model();
+    let graph = model.trace(phase, shape).unwrap();
+    let state: Vec<HostTensor> = graph
+        .state
+        .iter()
+        .map(|&(input, _)| HostTensor::zeros(graph.aval(input).shape.clone()))
+        .collect();
+    eval_mapped(&graph, handle.store(), model.weights(), slots, &state)
+        .0
+        .as_f32()
+        .unwrap()
+        .to_vec()
+}
+
+fn encode_shape(rows: usize, tokens: usize) -> StepShape {
+    StepShape {
+        rows: nz(rows),
+        tokens: nz(tokens),
+        capacity: nz(tokens),
+        kv: KvLayout::Contiguous,
+        logits: LogitRows::All,
+    }
+}
+
+fn named(tag: &str) -> SlotKey {
+    SlotKey::new(Slot::Activation, Some(tag))
+}
+
+/// The oracle's BERT output for one unpadded row: `[tokens, width]` (or the score).
+fn oracle_bert(handle: &ModelHandle, ids: &[i32], types: &[i32]) -> Vec<f32> {
+    let n = ids.len();
+    let ints = |values: &[i32]| HostTensor::i32(vec![1, n], values.to_vec());
+    oracle(
+        handle,
+        Phase::Encode,
+        encode_shape(1, n),
+        &[
+            (SlotKey::new(Slot::Token, None), ints(ids)),
+            (
+                SlotKey::new(Slot::Pos, None),
+                ints(&(0..n as i32).collect::<Vec<_>>()),
+            ),
+            (named("token_type"), ints(types)),
+            (named("attention_mask"), ints(&vec![1; n])),
+        ],
+    )
+}
+
+/// Tier 2 (ADR-0101): every element within `1e-4 * (1 + |want|)`; NaN fails.
+fn close(label: &str, got: &[f32], want: &[f32]) {
+    assert_eq!(got.len(), want.len(), "{label}: element count");
+    for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+        assert!(
+            (g - w).abs() <= 1e-4 * (1.0 + w.abs()),
+            "{label}: element {i}: device {g}, oracle {w}"
+        );
+    }
+}
+
+const ENCODE_SHORT: [u32; 3] = [5, 17, 3];
+const ENCODE_LONG: [u32; 7] = [9, 2, 31, 4, 12, 6, 1];
+
+fn encode(driver: &mut Driver, rows: &[EncodeRow<'_>]) -> crate::driver::Encoded {
+    driver.encode(&EncodeRequest { rows }).unwrap()
+}
+
+fn as_i32(ids: &[u32]) -> Vec<i32> {
+    ids.iter().map(|&t| t as i32).collect()
+}
+
+/// SC-003 (device half): sentence embeddings of the `bert` fixture through `Driver::encode` equal
+/// the CPU oracle's (tier 2), and padding does not matter: a short row batched beside a long one
+/// (both padded to eight positions) equals the same row encoded alone (padded to four) and the
+/// oracle's unpadded forward. Mutation: skip the attention mask in `bert`; the padded rows differ
+/// by how far they are padded and the row goes red.
+fn bert_encode_matches_the_oracle_whatever_the_padding(choice: BackendChoice) {
+    let (handle, _) = encoder_family_handle("bert", None);
+    let Some(mut driver) = driver(choice, &handle, 16, 16) else {
+        return;
+    };
+    let width = 32;
+    let batch = encode(
+        &mut driver,
+        &[
+            EncodeRow::Tokens {
+                ids: &ENCODE_SHORT,
+                types: &[],
+            },
+            EncodeRow::Tokens {
+                ids: &ENCODE_LONG,
+                types: &[],
+            },
+        ],
+    );
+    let alone = encode(
+        &mut driver,
+        &[EncodeRow::Tokens {
+            ids: &ENCODE_SHORT,
+            types: &[],
+        }],
+    );
+    assert_eq!(batch.width, width);
+    assert_eq!(batch.rows[0].len(), ENCODE_SHORT.len() * width);
+    assert_eq!(batch.rows[1].len(), ENCODE_LONG.len() * width);
+    let short = oracle_bert(&handle, &as_i32(&ENCODE_SHORT), &[0; 3]);
+    let long = oracle_bert(&handle, &as_i32(&ENCODE_LONG), &[0; 7]);
+    close("short row in a batch", &batch.rows[0], &short);
+    close("long row in a batch", &batch.rows[1], &long);
+    close("short row alone", &alone.rows[0], &short);
+    let caps = driver.caps();
+    assert!(
+        caps.is_none(),
+        "an encode-only driver publishes no serving caps"
+    );
+}
+per_backend!(
+    bert_encode_matches_the_oracle_whatever_the_padding,
+    bert_encode_matches_the_oracle_whatever_the_padding_wgpu,
+    bert_encode_matches_the_oracle_whatever_the_padding_rocm,
+    bert_encode_matches_the_oracle_whatever_the_padding_ptx
+);
+
+/// SC-003 (rerank half): the cross-encoder fixture scores three (query, document) pairs in one
+/// batched `Encode` step, each equal to the oracle's score of that pair alone (tier 2), and the
+/// ranking they give is the oracle's.
+fn cross_encoder_scores_pairs_in_the_oracles_order(choice: BackendChoice) {
+    let (handle, _) = encoder_family_handle("bert", Some("cross_encoder"));
+    let Some(mut driver) = driver(choice, &handle, 16, 16) else {
+        return;
+    };
+    let pairs: [(&[u32], &[u32]); 3] = [
+        (&[5, 17, 3, 9], &[0, 0, 0, 1]),
+        (&[9, 2, 31, 4, 12], &[0, 0, 1, 1, 1]),
+        (&[1, 6], &[0, 1]),
+    ];
+    let rows: Vec<EncodeRow<'_>> = pairs
+        .iter()
+        .map(|&(ids, types)| EncodeRow::Tokens { ids, types })
+        .collect();
+    let encoded = encode(&mut driver, &rows);
+    let got: Vec<f32> = encoded.rows.iter().map(|row| row[0]).collect();
+    let want: Vec<f32> = pairs
+        .iter()
+        .map(|&(ids, types)| oracle_bert(&handle, &as_i32(ids), &as_i32(types))[0])
+        .collect();
+    close("pair scores", &got, &want);
+    let order = |scores: &[f32]| {
+        let mut idx: Vec<usize> = (0..scores.len()).collect();
+        idx.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
+        idx
+    };
+    assert_eq!(order(&got), order(&want), "the ranking");
+    assert!(
+        want.windows(2).any(|w| (w[0] - w[1]).abs() > 1e-3),
+        "the pair scores differ: {want:?}"
+    );
+}
+per_backend!(
+    cross_encoder_scores_pairs_in_the_oracles_order,
+    cross_encoder_scores_pairs_in_the_oracles_order_wgpu,
+    cross_encoder_scores_pairs_in_the_oracles_order_rocm,
+    cross_encoder_scores_pairs_in_the_oracles_order_ptx
+);
+
+/// The first four dimensions of the mean over `PROMPT`'s hidden states of the qwen2 fixture: the
+/// sentence vector before normalization (recorded from the model's own `Encode` graph on the
+/// oracle; `qwen2::model::tests`).
+const RECORDED_MEAN: [f32; 4] = [-0.6346052, 0.3129701, 0.27594122, -0.24472162];
+
+/// SC-004 (device half): a decoder's `Encode` phase through `Driver::encode` returns the hidden
+/// state the oracle computes (tier 2), and its host mean is the recorded sentence vector.
+/// Mutation: take the head input one layer early; the hidden states and the mean differ and the
+/// row goes red.
+fn decoder_encode_matches_the_oracle_and_its_recorded_mean(choice: BackendChoice) {
+    let (handle, _) = encoder_family_handle("qwen2", None);
+    let Some(mut driver) = driver(choice, &handle, 4, CAPACITY) else {
+        return;
+    };
+    let ids = [3u32, 17, 40, 8, 25];
+    let encoded = encode(
+        &mut driver,
+        &[EncodeRow::Tokens {
+            ids: &ids,
+            types: &[],
+        }],
+    );
+    let tokens = HostTensor::i32(vec![1, 5], as_i32(&ids));
+    let pos = HostTensor::i32(vec![1, 5], (0..5).collect());
+    let want = oracle(
+        &handle,
+        Phase::Encode,
+        StepShape {
+            rows: nz(1),
+            tokens: nz(5),
+            capacity: nz(5),
+            kv: KvLayout::Contiguous,
+            logits: LogitRows::All,
+        },
+        &[
+            (SlotKey::new(Slot::Token, None), tokens),
+            (SlotKey::new(Slot::Pos, None), pos),
+        ],
+    );
+    assert_eq!(encoded.width, 64);
+    close("hidden states", &encoded.rows[0], &want);
+    let mean: Vec<f32> = (0..4)
+        .map(|j| (0..5).map(|i| encoded.rows[0][i * 64 + j]).sum::<f32>() / 5.0)
+        .collect();
+    close("host mean pooling", &mean, &RECORDED_MEAN);
+}
+per_backend!(
+    decoder_encode_matches_the_oracle_and_its_recorded_mean,
+    decoder_encode_matches_the_oracle_and_its_recorded_mean_wgpu,
+    decoder_encode_matches_the_oracle_and_its_recorded_mean_rocm,
+    decoder_encode_matches_the_oracle_and_its_recorded_mean_ptx
+);
+
+/// SC-001 (device half, plumbing): a prompt whose embedding rows are the table rows of the tokens
+/// they replace generates the plain prompt's tokens; a row that is another token's embedding
+/// generates that token's continuation; and the rows are step inputs, so a second prompt of the
+/// same shape with different rows runs on the entries the first prepared. Mutation: feed zeroed
+/// rows; the tokens change and the row goes red.
+fn prompt_embeds_replace_the_tokens_they_stand_for(choice: BackendChoice) {
+    let (handle, fixture) = encoder_family_handle("qwen2", None);
+    let Some(mut driver) = driver(choice, &handle, 4, CAPACITY) else {
+        return;
+    };
+    let w = 64;
+    let table: Vec<f32> = {
+        let entry = fixture.store.get("model.embed_tokens.weight").unwrap();
+        let mut one = WeightStore::builder();
+        one.insert("w", entry.clone()).unwrap();
+        poot_eval::materialize_dense(&one.build(), "w")
+            .unwrap()
+            .to_f32()
+            .unwrap()
+            .into_owned()
+    };
+    let rows_of = |tokens: &[u32]| -> Vec<f32> {
+        tokens
+            .iter()
+            .flat_map(|&t| table[t as usize * w..(t as usize + 1) * w].to_vec())
+            .collect()
+    };
+    let with_embeds = |driver: &mut Driver, prompt: &[u32], positions: Vec<usize>, rows| {
+        driver
+            .generate_with_embeds(
+                GenerateRequest {
+                    prompt: prompt.to_vec(),
+                    max_new: 8,
+                    sampler: Sampler::greedy(),
+                    stops: Vec::new(),
+                    ignore_eos: false,
+                },
+                PromptEmbeds::new(w, positions, rows).unwrap(),
+                &mut |_: u32, _: &str| GenerationControl::Continue(()),
+            )
+            .unwrap()
+            .tokens
+    };
+    // Placeholders (token 0) at positions 1 and 3, replaced by the rows of tokens 17 and 8.
+    let plain = [3, 17, 40, 8, 25, 11, 2];
+    let placeholders = [3, 0, 40, 0, 25, 11, 2];
+    let want = generate(&mut driver, &plain, 8, Sampler::greedy());
+    let got = with_embeds(&mut driver, &placeholders, vec![1, 3], rows_of(&[17, 8]));
+    assert_eq!(got, want, "the table rows of the replaced tokens");
+    let compiles = driver.stats().compiles;
+
+    // Different rows, same shape: another continuation, and no new program.
+    let swapped_prompt = [3, 9, 40, 30, 25, 11, 2];
+    let swapped_want = generate(&mut driver, &swapped_prompt, 8, Sampler::greedy());
+    let compiles_after_plain = driver.stats().compiles;
+    let swapped = with_embeds(&mut driver, &placeholders, vec![1, 3], rows_of(&[9, 30]));
+    assert_eq!(swapped, swapped_want, "another token's rows");
+    assert_ne!(swapped, got, "the rows reach the logits");
+    assert_eq!(
+        driver.stats().compiles,
+        compiles_after_plain,
+        "different rows of the same shape compile nothing"
+    );
+    assert!(compiles >= 1);
+}
+per_backend!(
+    prompt_embeds_replace_the_tokens_they_stand_for,
+    prompt_embeds_replace_the_tokens_they_stand_for_wgpu,
+    prompt_embeds_replace_the_tokens_they_stand_for_rocm,
+    prompt_embeds_replace_the_tokens_they_stand_for_ptx
+);
+
+/// SC-002 (device half): two frames of equal numel and different content through one vision
+/// driver give different embedding rows, each the oracle's (tier 2): the frame is a bound input,
+/// so the second encode never reuses the first's pixels, and nothing is evicted between them.
+/// Both frames in one two-row step equal the two single-frame steps. Mutation: bind `pixels` as a
+/// const again; the second frame reads the first's and the row goes red.
+fn two_frames_of_one_size_embed_differently(choice: BackendChoice) {
+    let (handle, _) = encoder_family_handle("idefics3_vision", None);
+    let Some(mut driver) = driver(choice, &handle, 16, 16) else {
+        return;
+    };
+    let frame = |seed: u64| -> Vec<f32> {
+        (0..3 * 8 * 8)
+            .map(|i| (((i as u64 * 7 + seed * 13) % 17) as f32 - 8.0) / 8.0)
+            .collect()
+    };
+    let (first, second) = (frame(1), frame(2));
+    fn row(pixels: &[f32]) -> EncodeRow<'_> {
+        EncodeRow::Frame {
+            pixels,
+            positions: 16,
+        }
+    }
+    let one = |driver: &mut Driver, pixels: &[f32]| encode(driver, &[row(pixels)]).rows.remove(0);
+    let (a, b) = (one(&mut driver, &first), one(&mut driver, &second));
+    let model = |pixels: &[f32]| {
+        oracle(
+            &handle,
+            Phase::Encode,
+            encode_shape(1, 16),
+            &[(
+                named("pixels"),
+                HostTensor::f32(vec![1, 3, 8, 8], pixels.to_vec()),
+            )],
+        )
+    };
+    assert_eq!(a.len(), 4 * 24, "four visual rows of the text width");
+    close("first frame", &a, &model(&first));
+    close("second frame", &b, &model(&second));
+    assert_ne!(a, b, "two different frames embed alike");
+    let both = encode(&mut driver, &[row(&first), row(&second)]);
+    close("first frame in a two-row step", &both.rows[0], &a);
+    close("second frame in a two-row step", &both.rows[1], &b);
+}
+per_backend!(
+    two_frames_of_one_size_embed_differently,
+    two_frames_of_one_size_embed_differently_wgpu,
+    two_frames_of_one_size_embed_differently_rocm,
+    two_frames_of_one_size_embed_differently_ptx
+);
+
+/// The ids of the SmolVLM fixture tokenizer: letters and digits first (`b c d` is the question),
+/// then the idefics3 markers the front end's prompt names, then a filler up to the vocabulary.
+mod smolvlm_ids {
+    pub const QUESTION: [u32; 3] = [1, 2, 3];
+    pub const USER: u32 = 36;
+    pub const ASSISTANT: u32 = 37;
+    pub const IM_START: u32 = 38;
+    pub const END_OF_UTTERANCE: u32 = 39;
+    pub const FAKE: u32 = 40;
+    pub const GLOBAL: u32 = 41;
+    pub const IMAGE: u32 = 42;
+    /// `<row_1_col_1>`, `<row_1_col_2>`, `<row_2_col_1>`, `<row_2_col_2>`: a 2x2 tile grid.
+    pub const fn tile(row: usize, col: usize) -> u32 {
+        43 + (row * 2 + col) as u32
+    }
+    pub const VOCAB: usize = 48;
+}
+
+/// The SmolVLM fixture tokenizer: [`smolvlm_ids`]' words, with every marker a special token so the
+/// prompt's `<image>` runs split out of the surrounding text.
+fn smolvlm_tokenizer() -> Tokenizer {
+    use smolvlm_ids as ids;
+    let mut words: Vec<String> = ('a'..='z').map(String::from).collect();
+    words.extend(('0'..='9').map(String::from));
+    let markers = [
+        "User:",
+        "Assistant:",
+        "<|im_start|>",
+        "<end_of_utterance>",
+        "<fake_token_around_image>",
+        "<global-img>",
+        "<image>",
+        "<row_1_col_1>",
+        "<row_1_col_2>",
+        "<row_2_col_1>",
+        "<row_2_col_2>",
+    ];
+    words.extend(markers.map(String::from));
+    words.push("filler".to_string());
+    assert_eq!(words.len(), ids::VOCAB);
+    assert_eq!(words[ids::IMAGE as usize], "<image>");
+    let vocab: HashMap<String, u32> = words
+        .into_iter()
+        .enumerate()
+        .map(|(i, w)| (w, i as u32))
+        .collect();
+    let model = WordLevel::builder()
+        .vocab(vocab)
+        .unk_token("a".to_string())
+        .build()
+        .unwrap();
+    let mut tokenizer = Tokenizer::new(model);
+    tokenizer.with_pre_tokenizer(Some(WhitespaceSplit));
+    let specials: Vec<tokenizers::AddedToken> = markers[2..]
+        .iter()
+        .map(|marker| tokenizers::AddedToken::from(*marker, true))
+        .collect();
+    tokenizer.add_special_tokens(&specials);
+    tokenizer
+}
+
+/// The SmolVLM fixture: the registry's `idefics3_vision` weights (8-pixel frames, 16 patches, 4 visual
+/// tokens of the 24-wide text tower) beside a 24-wide llama text tower, in one HF directory with the
+/// checkpoint's `config.json`, `preprocessor_config.json` and tokenizer. Returns the directory and the
+/// text tower's own fixture (for the oracle's expectation).
+fn smolvlm_fixture_dir() -> (poot_test_util::UniqueTempPath, Fixture) {
+    let registry = Registry::builtin().unwrap();
+    let vision = (registry
+        .entries()
+        .iter()
+        .find(|entry| entry.family.as_str() == "idefics3_vision")
+        .unwrap()
+        .fixture)();
+    let text_config = serde_json::json!({
+        "model_type": "llama",
+        "vocab_size": smolvlm_ids::VOCAB,
+        "hidden_size": 24,
+        "intermediate_size": 48,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "rms_norm_eps": 1e-6,
+        "max_position_embeddings": 128,
+        "rope_theta": 10000.0,
+        "tie_word_embeddings": false,
+        "eos_token_id": NO_EOS,
+    });
+    let (h, inter, vocab) = (24, 48, smolvlm_ids::VOCAB);
+    let mut shapes = vec![
+        ("model.embed_tokens.weight".to_string(), vec![vocab, h]),
+        ("model.norm.weight".to_string(), vec![h]),
+        ("lm_head.weight".to_string(), vec![vocab, h]),
+    ];
+    for l in 0..2 {
+        let k = |s: &str| format!("model.layers.{l}.{s}");
+        shapes.extend([
+            (k("input_layernorm.weight"), vec![h]),
+            (k("post_attention_layernorm.weight"), vec![h]),
+            (k("self_attn.q_proj.weight"), vec![h, h]),
+            (k("self_attn.k_proj.weight"), vec![h, h]),
+            (k("self_attn.v_proj.weight"), vec![h, h]),
+            (k("self_attn.o_proj.weight"), vec![h, h]),
+            (k("mlp.gate_proj.weight"), vec![inter, h]),
+            (k("mlp.up_proj.weight"), vec![inter, h]),
+            (k("mlp.down_proj.weight"), vec![h, inter]),
+        ]);
+    }
+    let text = Fixture::bf16(text_config.clone(), shapes);
+    let text = Fixture {
+        store: scaled(&text.store, 8.0),
+        ..text
+    };
+    let tensor = |name: String, weight: &WeightEntry| {
+        let WeightEntry::Dense(dense) = weight else {
+            panic!("the fixture is dense")
+        };
+        ArchiveTensor {
+            name,
+            dtype: "BF16",
+            shape: dense.shape().to_vec(),
+            bytes: dense.bytes().as_slice().to_vec(),
+        }
+    };
+    let mut tensors: Vec<ArchiveTensor> = vision
+        .store
+        .iter()
+        .map(|(key, weight)| tensor(key.as_str().to_string(), weight))
+        .collect();
+    tensors.extend(text.store.iter().map(|(key, weight)| {
+        let name = key.as_str();
+        let name = name.strip_prefix("model.").map_or_else(
+            || name.to_string(),
+            |rest| format!("model.text_model.{rest}"),
+        );
+        tensor(name, weight)
+    }));
+    let config = serde_json::json!({
+        "model_type": "idefics3",
+        "vision_config": vision.config,
+        "text_config": text_config,
+        "scale_factor": 2,
+        "image_token_id": smolvlm_ids::IMAGE,
+    });
+    let dir = write_hf_checkpoint("smolvlm", &config, &tensors);
+    smolvlm_tokenizer()
+        .save(dir.join("tokenizer.json"), false)
+        .unwrap();
+    std::fs::write(
+        dir.join("preprocessor_config.json"),
+        serde_json::json!({
+            "size": { "longest_edge": 16 },
+            "rescale_factor": 1.0 / 255.0,
+            "image_mean": [0.5, 0.5, 0.5],
+            "image_std": [0.5, 0.5, 0.5],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    (dir, text)
+}
+
+/// POOT-1046 (the SmolVLM front end on the required lanes): `Idefics3::caption` over a fixture
+/// checkpoint on disk equals the same text tower run on a prompt built by hand from token ids with the
+/// vision oracle's rows for the frames (tier 2): the front end's prompt, placeholder positions, per-frame
+/// encode and scatter all have to agree. A different image captions differently (the rows reach the
+/// logits). Mutation: scatter zeroed embeddings in `driver/step.rs`; both captions collapse to the
+/// zero-row continuation and the row goes red.
+fn smolvlm_caption_matches_the_oracle_rows(choice: BackendChoice) {
+    use crate::multimodal::front_end::{CaptionRequest, Idefics3, Image};
+    use poot_models::vision::{PreprocessConfig, idefics3_preprocess};
+    use smolvlm_ids as ids;
+
+    let (dir, text) = smolvlm_fixture_dir();
+    let (Some(vision_executor), Some(text_executor)) = (open(choice), open(choice)) else {
+        return;
+    };
+    let registry = Registry::builtin().unwrap();
+    let mut vlm = Idefics3::load(
+        &dir,
+        &registry,
+        (vision_executor, options(16, 16)),
+        (text_executor, options(64, 128)),
+    )
+    .expect("load the fixture SmolVLM");
+    assert_eq!(vlm.visual_tokens(), 4);
+
+    let (vision_handle, _) = encoder_family_handle("idefics3_vision", None);
+    let text_handle = Arc::new(
+        ModelHandle::from_checkpoint(&text.raw(), text.store.clone(), &registry, |_| {
+            Ok(fixture_text())
+        })
+        .unwrap(),
+    );
+    let Some(mut text_driver) = driver(choice, &text_handle, 64, 128) else {
+        return;
+    };
+    let preprocess = PreprocessConfig {
+        image_size: 8,
+        longest_edge: 16,
+        rescale_factor: 1.0 / 255.0,
+        mean: [0.5; 3],
+        std: [0.5; 3],
+    };
+    let max_new = 8;
+    // A 16x16 image splits into a 2x2 tile grid and a global frame. The two images are the extremes
+    // of the pixel range, so their rows differ as much as the fixture's weights let them.
+    let rgb_of = |value: f32| -> Vec<f32> { vec![value; 16 * 16 * 3] };
+    let expected = |driver: &mut Driver, rgb: &[f32]| -> Vec<u32> {
+        let split = idefics3_preprocess(rgb, 16, 16, &preprocess);
+        assert_eq!(
+            (split.rows, split.cols),
+            (2, 2),
+            "the fixture image tiles 2x2"
+        );
+        assert_eq!(split.frames.len(), 5, "four tiles and the global frame");
+        let mut prompt = vec![ids::IM_START, ids::USER];
+        let mut positions = Vec::new();
+        let mut placeholders = |prompt: &mut Vec<u32>| {
+            for _ in 0..4 {
+                positions.push(prompt.len());
+                prompt.push(ids::IMAGE);
+            }
+        };
+        for row in 0..2 {
+            for col in 0..2 {
+                prompt.extend([ids::FAKE, ids::tile(row, col)]);
+                placeholders(&mut prompt);
+            }
+        }
+        prompt.extend([ids::FAKE, ids::GLOBAL]);
+        placeholders(&mut prompt);
+        prompt.push(ids::FAKE);
+        prompt.extend(ids::QUESTION);
+        prompt.extend([ids::END_OF_UTTERANCE, ids::ASSISTANT]);
+        let rows: Vec<f32> = split
+            .frames
+            .iter()
+            .flat_map(|frame| {
+                oracle(
+                    &vision_handle,
+                    Phase::Encode,
+                    encode_shape(1, 16),
+                    &[(
+                        named("pixels"),
+                        HostTensor::f32(vec![1, 3, 8, 8], frame.clone()),
+                    )],
+                )
+            })
+            .collect();
+        driver
+            .generate_with_embeds(
+                GenerateRequest {
+                    prompt,
+                    max_new,
+                    sampler: Sampler::greedy(),
+                    stops: Vec::new(),
+                    ignore_eos: false,
+                },
+                PromptEmbeds::new(24, positions, rows).unwrap(),
+                &mut |_: u32, _: &str| GenerationControl::Continue(()),
+            )
+            .unwrap()
+            .tokens
+    };
+    let mut caption = |rgb: &[f32]| -> Vec<u32> {
+        vlm.caption(
+            &CaptionRequest {
+                images: &[Image {
+                    rgb,
+                    height: 16,
+                    width: 16,
+                }],
+                question: "b c d",
+                max_new,
+            },
+            &mut |_: u32, _: &str| GenerationControl::Continue(()),
+        )
+        .expect("caption")
+        .tokens
+    };
+    let (first, second) = (rgb_of(0.0), rgb_of(255.0));
+    let (got_first, got_second) = (caption(&first), caption(&second));
+    assert_eq!(got_first, expected(&mut text_driver, &first), "first image");
+    assert_eq!(
+        got_second,
+        expected(&mut text_driver, &second),
+        "second image on the same front end"
+    );
+    assert_ne!(got_first, got_second, "the image rows reach the logits");
+    // Solid images give every tile the same rows; an image with one black quadrant gives that tile
+    // its own, so the order the frames go into the prompt is part of the caption.
+    for quadrant in 0..4 {
+        let image: Vec<f32> = (0..16 * 16)
+            .flat_map(|p| {
+                let (y, x) = (p / 16, p % 16);
+                let v = if (y / 8) * 2 + x / 8 == quadrant {
+                    0.0
+                } else {
+                    255.0
+                };
+                [v, v, v]
+            })
+            .collect();
+        assert_eq!(
+            caption(&image),
+            expected(&mut text_driver, &image),
+            "an image whose tile {quadrant} differs"
+        );
+    }
+}
+per_backend!(
+    smolvlm_caption_matches_the_oracle_rows,
+    smolvlm_caption_matches_the_oracle_rows_wgpu,
+    smolvlm_caption_matches_the_oracle_rows_rocm,
+    smolvlm_caption_matches_the_oracle_rows_ptx
+);
+
+/// An encode request is refused while a sequence is open (its cache would alias the sequence's),
+/// and a request of mixed kinds or an empty row is a typed refusal.
+fn encode_refuses_what_it_cannot_batch(choice: BackendChoice) {
+    let (handle, _) = encoder_family_handle("bert", None);
+    let Some(mut driver) = driver(choice, &handle, 16, 16) else {
+        return;
+    };
+    let refusal = |error: DriverError| match error {
+        DriverError::InvalidRequest(request) => request,
+        other => panic!("{other:?}"),
+    };
+    let mixed = driver.encode(&EncodeRequest {
+        rows: &[
+            EncodeRow::Tokens {
+                ids: &ENCODE_SHORT,
+                types: &[],
+            },
+            EncodeRow::Frame {
+                pixels: &[0.0],
+                positions: 1,
+            },
+        ],
+    });
+    assert_eq!(
+        refusal(mixed.unwrap_err()),
+        InvalidRequest::Encode(crate::driver::error::EncodeError::Mixed)
+    );
+    let empty = driver.encode(&EncodeRequest {
+        rows: &[EncodeRow::Tokens {
+            ids: &[],
+            types: &[],
+        }],
+    });
+    assert_eq!(
+        refusal(empty.unwrap_err()),
+        InvalidRequest::Encode(crate::driver::error::EncodeError::EmptyRow { row: 0 })
+    );
+    let too_long = driver.encode(&EncodeRequest {
+        rows: &[EncodeRow::Tokens {
+            ids: &[1; 17],
+            types: &[],
+        }],
+    });
+    assert!(
+        matches!(too_long.unwrap_err(), DriverError::Unsupported(_)),
+        "a row past the model's positions is the family's typed refusal"
+    );
+}
+per_backend!(
+    encode_refuses_what_it_cannot_batch,
+    encode_refuses_what_it_cannot_batch_wgpu,
+    encode_refuses_what_it_cannot_batch_rocm,
+    encode_refuses_what_it_cannot_batch_ptx
+);
+
+// ---------------------------------------------------------------------------------------------
+// POOT-571: Qwen4Exp through the driver. The recorded-token and first-step rows above cover the
+// fixtures (dense experts, packed E4M3 experts, the finetune-sized config) and SC-008's granule row
+// (the 7-token prompt is whole-granule prefill plus decode steps); the rows below are the PLE
+// histories (SC-006), the weights' residency (SC-007) and the PLE token guard (SC-009).
+// ---------------------------------------------------------------------------------------------
+
+fn qwen4exp_handle() -> Arc<ModelHandle> {
+    let recorded = RECORDED
+        .iter()
+        .find(|recorded| recorded.family == "qwen4exp")
+        .unwrap();
+    recorded_family_handle(recorded)
+}
+
+/// Three six-token prompts with different histories for the PLE (a plain one, one with the
+/// end-of-sequence id inside its window, one opening with two), and the independent reference's
+/// first-step top five for each (`qwen38::tests::the_ple_history_literals_are_the_references_first_step`
+/// pins these same numbers to the plain-loop f64 reference, which shares no code with the tracer).
+const PLE_HISTORIES: [[u32; 6]; 3] = [
+    [3, 17, 40, 8, 25, 11],
+    [8, 40, 5, 22, 47, 9],
+    [47, 47, 3, 9, 22, 31],
+];
+const PLE_HISTORIES_TOP5: [[(u32, f64); 5]; 3] = [
+    [
+        (25, -1.903_203_6),
+        (33, -2.256_853_4),
+        (15, -3.129_722),
+        (21, -3.237_417),
+        (1, -3.352_075_7),
+    ],
+    [
+        (35, -2.689_749_4),
+        (25, -2.868_450_9),
+        (30, -2.914_160_6),
+        (26, -2.922_117_3),
+        (2, -3.010_46),
+    ],
+    [
+        (32, -2.643_691_5),
+        (21, -2.647_688_7),
+        (38, -2.836_676_7),
+        (23, -2.846_178_8),
+        (29, -2.876_545),
+    ],
+];
+
+/// SC-006: the three histories go through the one binder (the family's state, the PLE's carried
+/// history and conv window among it) on the device, each giving the reference's first token and
+/// top-five log-probabilities (within `1e-3`), and the three differ. Mutation: index the
+/// per-layer-embedding table with the previous step's id (`components::ple` hashes the carried
+/// history as this step's ids); the first prompt's top five leaves the reference's and the row goes
+/// red.
+fn qwen4exp_ple_histories_match_the_reference(choice: BackendChoice) {
+    ple_histories_match_the_reference(choice, &qwen4exp_handle());
+}
+
+/// `handle`'s first-step top five on the three [`PLE_HISTORIES`] prompts against the reference's.
+fn ple_histories_match_the_reference(choice: BackendChoice, handle: &Arc<ModelHandle>) {
+    let Some(mut driver) = driver(choice, handle, 8, CAPACITY) else {
+        return;
+    };
+    for (prompt, want) in PLE_HISTORIES.iter().zip(PLE_HISTORIES_TOP5) {
+        let generated = driver
+            .generate(
+                GenerateRequest {
+                    prompt: prompt.to_vec(),
+                    max_new: 1,
+                    sampler: Sampler::greedy().with_logprobs(5),
+                    stops: Vec::new(),
+                    ignore_eos: false,
+                },
+                &mut |_: u32, _: &str| GenerationControl::Continue(()),
+            )
+            .unwrap();
+        assert_eq!(generated.tokens, [want[0].0], "{prompt:?} on {choice:?}");
+        let got = &generated.logprobs[0].top;
+        assert_eq!(
+            got.iter().map(|&(t, _)| t).collect::<Vec<_>>(),
+            want.iter().map(|&(t, _)| t).collect::<Vec<_>>(),
+            "{prompt:?} on {choice:?}: the five most likely tokens"
+        );
+        for ((token, got), (_, want)) in got.iter().zip(want) {
+            assert!(
+                (f64::from(*got) - want).abs() <= 1e-3,
+                "{prompt:?} on {choice:?}: token {token} has log-probability {got}, the reference gives {want}"
+            );
+        }
+    }
+}
+per_backend!(
+    qwen4exp_ple_histories_match_the_reference,
+    qwen4exp_ple_histories_match_the_reference_wgpu,
+    qwen4exp_ple_histories_match_the_reference_rocm,
+    qwen4exp_ple_histories_match_the_reference_ptx
+);
+
+/// The qwen4exp checkpoint with its n-gram table stored the way the official release does: three
+/// row-range shards of different sizes under a scale of one.
+fn qwen4exp_sharded_handle() -> Arc<ModelHandle> {
+    const TABLE: &str = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding";
+    let recorded = RECORDED
+        .iter()
+        .find(|recorded| recorded.family == "qwen4exp")
+        .unwrap();
+    recorded_family_handle_with(recorded, &|key, weight| {
+        if key != format!("{TABLE}.weight") {
+            return vec![(key.to_string(), weight.clone())];
+        }
+        let WeightEntry::Dense(dense) = weight else {
+            panic!("the fixture's n-gram table is dense");
+        };
+        let (rows, width) = (dense.shape()[0], dense.shape()[1]);
+        let bytes = dense.bytes().as_slice();
+        let row_bytes = bytes.len() / rows;
+        let counts = [rows / 4, rows / 2, rows - rows / 4 - rows / 2];
+        let mut at = 0;
+        let mut out = Vec::new();
+        for (ordinal, count) in counts.into_iter().enumerate() {
+            let cut = bytes[at * row_bytes..(at + count) * row_bytes].to_vec();
+            let shard = DenseWeight::try_new(dense.dtype(), vec![count, width], cut.into());
+            out.push((
+                format!("{TABLE}.shard_{ordinal}.weight"),
+                WeightEntry::Dense(shard.unwrap()),
+            ));
+            at += count;
+        }
+        let one = DenseWeight::try_new(
+            poot_tensor::DType::F32,
+            vec![],
+            1.0f32.to_le_bytes().to_vec().into(),
+        );
+        out.push((
+            format!("{TABLE}.weight_scale"),
+            WeightEntry::Dense(one.unwrap()),
+        ));
+        out
+    })
+}
+
+/// A PLE table stored as shards (three row ranges of different sizes under a scale of one) gives the
+/// reference's first-step top five on the device, the literals the single table is held to: the
+/// per-shard masked gather keeps the ids I32 and selects the owning shard's row. (The single table's
+/// run stays in `qwen4exp_ple_histories_match_the_reference`: ROCm cannot reopen an executor in one
+/// process, so both layouts are not run in one row; their bit-for-bit equality is the component row
+/// `a_sharded_f32_table_equals_the_single_table_bit_for_bit`.) Mutation: offset a shard's local row by
+/// one in `components::ple`'s `Table::lookup`; the rows on the shard edges read their neighbours and
+/// the top five leaves the reference's.
+fn qwen4exp_sharded_ple_table_matches_the_reference(choice: BackendChoice) {
+    ple_histories_match_the_reference(choice, &qwen4exp_sharded_handle());
+}
+per_backend!(
+    qwen4exp_sharded_ple_table_matches_the_reference,
+    qwen4exp_sharded_ple_table_matches_the_reference_wgpu,
+    qwen4exp_sharded_ple_table_matches_the_reference_rocm,
+    qwen4exp_sharded_ple_table_matches_the_reference_ptx
+);
+
+/// SC-006, with no device: the CPU oracle over the family's traced graph gives the same literals, so
+/// a tracer that reads the PLE's history wrongly leaves them on every machine.
+#[test]
+fn qwen4exp_ple_histories_match_the_reference_on_the_cpu_oracle() {
+    let handle = qwen4exp_handle();
+    for (prompt, want) in PLE_HISTORIES.iter().zip(PLE_HISTORIES_TOP5) {
+        let got = oracle_top5(&handle, prompt, CAPACITY);
+        for ((token, got), (want_token, want)) in got.iter().zip(want) {
+            assert_eq!(
+                *token, want_token,
+                "{prompt:?}: the five most likely tokens"
+            );
+            assert!(
+                (got - want).abs() <= 1e-3,
+                "{prompt:?}: token {token} has log-probability {got}, the reference gives {want}"
+            );
+        }
+    }
+}
+
+/// The weight allocations and live weight bytes the executor holds.
+fn resident_weights(driver: &Driver) -> (u64, u64) {
+    driver
+        .executor_stats()
+        .memory
+        .iter()
+        .find(|(role, _)| *role == poot_executor::BufferRole::Weight)
+        .map(|(_, snapshot)| (snapshot.allocations, snapshot.live_bytes))
+        .unwrap()
+}
+
+/// SC-007 (R475-002): the BF16 owners stay resident as stored and are not re-widened per step.
+/// After the admitted entries are prepared (the load), eight decode steps through the driver leave
+/// the executor's weight allocations and live bytes as they were, and the live bytes are those of the
+/// stored owners (never more: an F32 copy of a BF16 owner is twice its bytes), and more than the
+/// stored bytes minus the embedding table (which a backend may keep on the host). Mutation: rebind
+/// every BF16 owner as F32 in the body (`Weight::declare` casts a dense BF16 const to F32 when it
+/// declares it); the resident bytes pass the stored bytes and the row goes red.
+fn qwen4exp_bf16_owners_are_not_widened_per_step(choice: BackendChoice) {
+    use poot_quant::weights::HandleFormat;
+    let handle = qwen4exp_handle();
+    let stored: u64 = handle
+        .model()
+        .weights()
+        .iter()
+        .map(|(_, _, h)| match h.format {
+            HandleFormat::Dense(dtype) => {
+                (h.shape.iter().product::<usize>() * dtype.byte_size()) as u64
+            }
+            HandleFormat::Packed(_) => panic!("the fixture is dense"),
+        })
+        .sum();
+    let embedding = (VOCAB * 32 * 2) as u64;
+    let Some(mut driver) = driver(choice, &handle, 8, CAPACITY) else {
+        return;
+    };
+    prepare_admitted(&mut driver).unwrap();
+    let loaded = resident_weights(&driver);
+    assert!(
+        loaded.1 <= stored,
+        "{choice:?}: {} resident weight bytes exceed the {stored} bytes the owners are stored in",
+        loaded.1
+    );
+    assert!(
+        loaded.1 >= stored - embedding,
+        "{choice:?}: {} resident weight bytes, the owners are {stored} stored",
+        loaded.1
+    );
+    let tokens = generate(&mut driver, &PROMPT[..6], 8, Sampler::greedy());
+    assert_eq!(tokens.len(), 8);
+    assert_eq!(
+        resident_weights(&driver),
+        loaded,
+        "{choice:?}: eight decode steps upload nothing"
+    );
+}
+per_backend!(
+    qwen4exp_bf16_owners_are_not_widened_per_step,
+    qwen4exp_bf16_owners_are_not_widened_per_step_wgpu,
+    qwen4exp_bf16_owners_are_not_widened_per_step_rocm,
+    qwen4exp_bf16_owners_are_not_widened_per_step_ptx
+);
+
+/// SC-009 (dfamily.md F4): a token outside the vocabulary reaches the PLE's guard as a typed
+/// validation fault naming the PLE's layer, not as published tokens. Mutation: discard the guard
+/// witness in `components::ple::ngram_ids`; the fault disappears, the run publishes tokens and the
+/// row goes red.
+fn qwen4exp_out_of_vocab_token_is_a_typed_validation_fault(choice: BackendChoice) {
+    use poot_executor::ExecError;
+    use poot_graph_ir::ValidationPacketError;
+    use poot_models::components::ple::PleWitness;
+    let handle = qwen4exp_handle();
+    let Some(mut driver) = driver(choice, &handle, 8, CAPACITY) else {
+        return;
+    };
+    let error = driver
+        .generate(
+            GenerateRequest {
+                // One id past the 48-token vocabulary.
+                prompt: vec![3, 48],
+                max_new: 2,
+                sampler: Sampler::greedy(),
+                stops: Vec::new(),
+                ignore_eos: false,
+            },
+            &mut |_: u32, _: &str| GenerationControl::Continue(()),
+        )
+        .expect_err("a token outside the vocabulary must not publish tokens");
+    let DriverError::Device(ExecError::Validation(failure)) = error else {
+        panic!("expected a validation fault, got {error:?}");
+    };
+    let ValidationPacketError::Failure(failure) = *failure else {
+        panic!("expected one failing lane, got {failure:?}");
+    };
+    assert_eq!(PleWitness::decode(failure.id), Some(1), "{failure}");
+}
+per_backend!(
+    qwen4exp_out_of_vocab_token_is_a_typed_validation_fault,
+    qwen4exp_out_of_vocab_token_is_a_typed_validation_fault_wgpu,
+    qwen4exp_out_of_vocab_token_is_a_typed_validation_fault_rocm,
+    qwen4exp_out_of_vocab_token_is_a_typed_validation_fault_ptx
+);
+
+/// SC-008 (the driver's half): a prefill chunk the family's granule does not divide is a typed
+/// option error before anything is traced, compiled or dispatched. Mutation: drop the granule check
+/// from the options; the driver is built and the first generate asks the model for an off-granule
+/// prefill, which the model refuses, so the assertion on the construction error goes red.
+#[test]
+fn qwen4exp_chunk_off_the_granule_is_a_typed_option_error_wgpu() {
+    use crate::driver::error::InvalidOptions;
+    let handle = qwen4exp_handle();
+    let Some(executor) = open(BackendChoice::Wgpu) else {
+        return;
+    };
+    let error = Driver::new(handle, executor, options(3, CAPACITY))
+        .map(|_| ())
+        .expect_err("a chunk of three is not a whole number of two-position blocks");
+    assert!(
+        matches!(
+            error,
+            DriverError::InvalidOptions(InvalidOptions::ChunkNotGranuleAligned {
+                chunk: 3,
+                granule: 2
+            })
+        ),
+        "{error:?}"
+    );
+}
+
+/// The greedy tokens of four distinct prompts on qwen2, 24 new each, from single-row `Driver::generate`
+/// runs (the `PROMPT` row is `FIXTURE_GREEDY`, recorded when POOT-734 landed; the other three were
+/// recorded from the same single-row path when POOT-579 added the four-row row).
+const FOUR_ROW_GREEDY: [[u32; 24]; 4] = [
+    [
+        23, 41, 2, 32, 3, 2, 41, 41, 25, 41, 36, 23, 35, 19, 5, 36, 3, 23, 35, 18, 44, 44, 2, 32,
+    ],
+    [
+        24, 5, 1, 14, 42, 32, 45, 35, 41, 25, 35, 33, 2, 26, 35, 12, 35, 25, 35, 20, 45, 37, 10, 10,
+    ],
+    [
+        20, 38, 20, 19, 10, 19, 30, 22, 0, 5, 22, 0, 5, 6, 6, 28, 19, 0, 24, 6, 28, 19, 30, 6,
+    ],
+    FIXTURE_GREEDY,
+];
+
+/// POOT-579 SC-002: qwen2's four rows decode paged through the driver in one step per round (the
+/// 13-token prompt prefills in pieces beside rows already decoding) and produce the recorded literals
+/// of their single-row runs. Distinct prompts, so a row reading another row's block table reads K/V that
+/// is not its own. Mutation: swap two rows' block tables in the bind (`read` map); the tokens differ.
+fn paged_four_rows_equal_the_recorded_literals(choice: BackendChoice) {
+    let handle = family_handle("qwen2", NO_EOS);
+    let Some(mut driver) = serving_driver(choice, &handle) else {
+        return;
+    };
+    prepare_serving(&mut driver, pool_shape(16, 4), &[4], &[Head::GREEDY], &[]);
+    let prompts: [&[u32]; 4] = [&LONG, &MEDIUM, &SHORT, &PROMPT];
+    let mut lanes: Vec<Lane> = prompts
+        .iter()
+        .map(|p| Lane::open(&mut driver, p, 24, Sampler::greedy()).0)
+        .collect();
+    run_to_end(&mut driver, &mut lanes);
+    for (i, lane) in lanes.iter().enumerate() {
+        assert_eq!(lane.out, FOUR_ROW_GREEDY[i], "row {i}");
+    }
+    for lane in &lanes {
+        driver.release(lane.seq, Release::Finished).unwrap();
+    }
+}
+per_backend!(
+    paged_four_rows_equal_the_recorded_literals,
+    paged_four_rows_equal_the_recorded_literals_wgpu,
+    paged_four_rows_equal_the_recorded_literals_rocm,
+    paged_four_rows_equal_the_recorded_literals_ptx
+);
+
+// ---------------------------------------------------------------------------------------------
+// LoRA generations (POOT-579 SC-005): a same-named adapter replaced by new weights while the old
+// generation's entries and sequence stay live, each generation's logits equal to its own merged-weight
+// reference, and the old generation's unique allocations returned once it completes.
+// ---------------------------------------------------------------------------------------------
+
+use poot_load::lora::{LoraAdapter, LoraAdapterConfig, LoraWeight};
+use poot_quant::weights::{LoraTarget, WeightKey, WeightView};
+
+const LORA_RANK: usize = 2;
+
+fn lora_module(layer: usize, target: LoraTarget) -> String {
+    let (block, name) = match target {
+        LoraTarget::AttnQ => ("self_attn", "q_proj"),
+        LoraTarget::AttnK => ("self_attn", "k_proj"),
+        LoraTarget::AttnV => ("self_attn", "v_proj"),
+        LoraTarget::AttnO => ("self_attn", "o_proj"),
+        LoraTarget::FfnGate => ("mlp", "gate_proj"),
+        LoraTarget::FfnUp => ("mlp", "up_proj"),
+        LoraTarget::FfnDown => ("mlp", "down_proj"),
+    };
+    format!("model.layers.{layer}.{block}.{name}")
+}
+
+fn lora_fill(n: usize, seed: u64) -> Vec<f32> {
+    let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    (0..n)
+        .map(|_| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+        })
+        .collect()
+}
+
+/// An adapter over every targetable projection of every layer of `handle`'s model, `alpha / rank`
+/// scaled, deterministic from `seed`.
+fn fixture_adapter(handle: &ModelHandle, seed: u64, alpha: f32) -> LoraAdapter {
+    let mut weights = HashMap::new();
+    for (id, _, shape) in handle.model().weights().iter() {
+        let (Some(layer), Some(target)) = (id.layer, LoraTarget::of(id.role)) else {
+            continue;
+        };
+        let &[out_dim, in_dim] = shape.shape.as_slice() else {
+            continue;
+        };
+        let s = seed + (layer * 16) as u64 + target as u64;
+        weights.insert(
+            lora_module(layer, target),
+            LoraWeight {
+                a: HostTensor::f32(vec![in_dim, LORA_RANK], lora_fill(in_dim * LORA_RANK, s)),
+                b: HostTensor::f32(
+                    vec![LORA_RANK, out_dim],
+                    lora_fill(LORA_RANK * out_dim, s + 1000),
+                ),
+            },
+        );
+    }
+    LoraAdapter {
+        config: LoraAdapterConfig {
+            r: LORA_RANK,
+            lora_alpha: alpha,
+            target_modules: Vec::new(),
+            use_rslora: false,
+        },
+        weights,
+    }
+}
+
+/// `handle`'s checkpoint with `adapter` merged into every adapted projection: `W + scale * (A B)^T`, as an
+/// F32 entry (the stored `[out, in]` layout; BF16 values widen exactly).
+fn merged_store(handle: &ModelHandle, adapter: &LoraAdapter) -> WeightStore {
+    let base = handle.shared_store();
+    let scale = adapter.config.scaling();
+    let mut merged: HashMap<WeightKey, (Vec<usize>, Vec<f32>)> = HashMap::new();
+    for (id, view, _) in handle.model().weights().iter() {
+        let (Some(layer), Some(target)) = (id.layer, LoraTarget::of(id.role)) else {
+            continue;
+        };
+        let WeightView::Stored(key) = view else {
+            panic!("{id} is not one stored tensor");
+        };
+        let WeightEntry::Dense(dense) = base.get(key.as_str()).expect("the store holds the key")
+        else {
+            panic!("the fixture is dense");
+        };
+        let (shape, bytes) = (dense.shape().to_vec(), dense.bytes().as_slice());
+        let mut w: Vec<f32> = match dense.dtype() {
+            poot_tensor::DType::F32 => bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&word| f32::from_le_bytes(word))
+                .collect(),
+            poot_tensor::DType::BF16 => bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&pair| f32::from_bits(u32::from(u16::from_le_bytes(pair)) << 16))
+                .collect(),
+            other => panic!("the fixture is F32 or BF16, not {other:?}"),
+        };
+        let weight = &adapter.weights[&lora_module(layer, target)];
+        let (a, b) = (weight.a.as_f32().unwrap(), weight.b.as_f32().unwrap());
+        let (out_dim, in_dim) = (shape[0], shape[1]);
+        for o in 0..out_dim {
+            for i in 0..in_dim {
+                let delta: f32 = (0..LORA_RANK)
+                    .map(|k| a[i * LORA_RANK + k] * b[k * out_dim + o])
+                    .sum();
+                w[o * in_dim + i] += scale * delta;
+            }
+        }
+        merged.insert(key.clone(), (shape, w));
+    }
+    let mut out = WeightStore::builder();
+    for (key, entry) in base.iter() {
+        let entry = match merged.remove(key) {
+            Some((shape, values)) => {
+                let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+                WeightEntry::Dense(
+                    DenseWeight::try_new(poot_tensor::DType::F32, shape, bytes.into()).unwrap(),
+                )
+            }
+            None => entry.clone(),
+        };
+        out.insert(key.clone(), entry).unwrap();
+    }
+    out.build()
+}
+
+fn family_handle_over(family: &str, eos: u32, store: WeightStore) -> Arc<ModelHandle> {
+    let registry = Registry::builtin().unwrap();
+    let entry = registry
+        .entries()
+        .iter()
+        .find(|entry| entry.family.as_str() == family)
+        .unwrap_or_else(|| panic!("no builtin family {family}"));
+    let mut config = (entry.fixture)().config.clone();
+    config["eos_token_id"] = serde_json::json!(eos);
+    let raw = RawConfig::HfJson {
+        config: &config,
+        generation: None,
+    };
+    Arc::new(ModelHandle::from_checkpoint(&raw, store, &registry, |_| Ok(fixture_text())).unwrap())
+}
+
+/// The bytes the live weight allocations hold, and how many allocations were ever made.
+fn weight_counters(driver: &Driver) -> (u64, u64) {
+    let stats = driver.executor_stats();
+    let (_, weights) = stats
+        .memory
+        .iter()
+        .find(|(role, _)| *role == poot_executor::BufferRole::Weight)
+        .expect("the executor counts weights");
+    (weights.live_bytes, weights.allocations)
+}
+
+/// What a sequence produced with `RowWork` steps: its tokens and the log-probabilities (chosen and the
+/// top five) the host-path head gave each.
+struct Traced {
+    tokens: Vec<u32>,
+    logprobs: Vec<crate::core::sampler::TokenLogprob>,
+}
+
+/// Drive `seq` for up to `steps` steps (prefill pieces included), committing every pick.
+fn drive(
+    driver: &mut Driver,
+    seq: SeqId,
+    prompt_len: usize,
+    prefilled: &mut usize,
+    steps: usize,
+    out: &mut Traced,
+    max_new: usize,
+) {
+    let mut sampler = Sampler::greedy().with_logprobs(5);
+    for _ in 0..steps {
+        if out.tokens.len() == max_new {
+            return;
+        }
+        let work = if *prefilled < prompt_len {
+            RowWork::Prefill { upto: prompt_len }
+        } else {
+            RowWork::Decode {
+                ahead: &[],
+                pick: PickPolicy::Greedy,
+            }
+        };
+        let result = {
+            let mut rows = [StepRow {
+                seq,
+                work,
+                sampler: &mut sampler,
+            }];
+            driver.step(&mut rows).unwrap().remove(0)
+        };
+        *prefilled += result.consumed;
+        let kept = result.tokens.len();
+        out.tokens.extend(&result.tokens);
+        out.logprobs.extend(result.logprobs);
+        driver.commit(seq, kept, &mut sampler).unwrap();
+    }
+}
+
+fn assert_traced_matches(label: &str, got: &Traced, want: &Traced) {
+    assert_eq!(got.tokens, want.tokens, "{label}: tokens");
+    assert_eq!(
+        got.logprobs.len(),
+        want.logprobs.len(),
+        "{label}: logprob records"
+    );
+    for (step, (got, want)) in got.logprobs.iter().zip(&want.logprobs).enumerate() {
+        assert_eq!(got.token, want.token, "{label} step {step}: token");
+        assert!(
+            (got.logprob - want.logprob).abs() <= 2e-3,
+            "{label} step {step}: logprob {} vs reference {}",
+            got.logprob,
+            want.logprob
+        );
+        for ((gt, gl), (wt, wl)) in got.top.iter().zip(&want.top) {
+            assert_eq!(gt, wt, "{label} step {step}: top-5 order");
+            assert!(
+                (gl - wl).abs() <= 2e-3,
+                "{label} step {step}: top-5 logprob {gl} vs reference {wl}"
+            );
+        }
+    }
+}
+
+/// POOT-579 SC-005: capture adapter set A, prepare it, then capture B - the same adapter name and
+/// shapes, other source and weights - and prepare it beside A. Both generations run (A mid-generation
+/// while B is admitted), and every step's chosen and top-five log-probabilities equal the run of a model
+/// with that generation's adapter merged into its weights. Unloading A while its sequence is live is a
+/// typed refusal and leaves its run correct; once A's sequence is released, unloading A returns exactly
+/// A's own stacked tensors and moves no base upload (live weight bytes and the count of weight
+/// allocations stay the base's plus the live generations'). Mutation: serve B from A's executable (the
+/// adapter bytes resident under the logical name alone); B's run equals A's reference, not its own.
+/// Mutation: unload A's executable before the in-use check; A's remaining steps fail.
+fn adapter_generation_replacement_is_isolated_and_freed(choice: BackendChoice) {
+    let handle = family_handle("qwen2", NO_EOS);
+    let (adapter_a, adapter_b) = (
+        fixture_adapter(&handle, 11, 4.0),
+        fixture_adapter(&handle, 77, 6.0),
+    );
+    let prompt: Vec<u32> = PROMPT.to_vec();
+    let max_new = 6;
+
+    // Every executor opens before any runs (the ROCm runtime does not survive a second open after a drop).
+    let Some(mut served) = serving_driver(choice, &handle) else {
+        return;
+    };
+    let reference = |adapter: &LoraAdapter| {
+        let store = merged_store(&handle, adapter);
+        let merged = family_handle_over("qwen2", NO_EOS, store);
+        serving_driver(choice, &merged).map(|driver| (driver, merged))
+    };
+    let Some((mut ref_a, _keep_a)) = reference(&adapter_a) else {
+        return;
+    };
+    let Some((mut ref_b, _keep_b)) = reference(&adapter_b) else {
+        return;
+    };
+    let record = |driver: &mut Driver| {
+        let generated = driver
+            .generate(
+                GenerateRequest {
+                    prompt: prompt.clone(),
+                    max_new,
+                    sampler: Sampler::greedy().with_logprobs(5),
+                    stops: Vec::new(),
+                    ignore_eos: false,
+                },
+                &mut |_: u32, _: &str| GenerationControl::Continue(()),
+            )
+            .unwrap();
+        Traced {
+            tokens: generated.tokens,
+            logprobs: generated.logprobs,
+        }
+    };
+    let (want_a, want_b) = (record(&mut ref_a), record(&mut ref_b));
+    assert_ne!(
+        want_a.tokens, want_b.tokens,
+        "the two adapters must change the run, or the rows below prove nothing"
+    );
+
+    let shapes = |adapters: &[crate::driver::GenerationId]| {
+        let pool = pool_shape(8, 4);
+        let (rows, heads) = ([nz(1)], [Head::GREEDY, Head::Logits]);
+        (pool, rows, heads, adapters.to_vec())
+    };
+    let prepare = |driver: &mut Driver, adapters: &[crate::driver::GenerationId]| {
+        let (pool, rows, heads, adapters) = shapes(adapters);
+        driver
+            .prepare(&ServingShapes {
+                layout: Layout::Paged(pool),
+                rows: &rows,
+                heads: &heads,
+                warm: Warm::Prompts(&[prompt.len()]),
+                windows: &[],
+                adapters: &adapters,
+            })
+            .unwrap();
+    };
+
+    // The base alone.
+    prepare(&mut served, &[]);
+    let (base_bytes, base_allocations) = weight_counters(&served);
+    assert!(base_bytes > 0, "the base entries uploaded their weights");
+
+    // A tensor's worth of stack: per adapted projection `(adapters + 1)` entries of `A [in, r]` and
+    // `B [r, out]` in F32, plus the model-level scale.
+    let stack_bytes = |adapters: usize| -> u64 {
+        let mut bytes = 4 * (adapters as u64 + 1);
+        for (id, _, shape) in handle.model().weights().iter() {
+            if id.layer.is_some() && LoraTarget::of(id.role).is_some() {
+                let &[out_dim, in_dim] = shape.shape.as_slice() else {
+                    continue;
+                };
+                bytes +=
+                    4 * (adapters as u64 + 1) * (in_dim * LORA_RANK + LORA_RANK * out_dim) as u64;
+            }
+        }
+        bytes
+    };
+    let tensor_count = {
+        let adapted = handle
+            .model()
+            .weights()
+            .iter()
+            .filter(|(id, _, _)| id.layer.is_some() && LoraTarget::of(id.role).is_some())
+            .count() as u64;
+        2 * adapted + 1
+    };
+
+    let source = |n: u64| crate::driver::AdapterSource(std::num::NonZeroU64::new(n).unwrap());
+    let set = |n: u64| crate::driver::AdapterSet {
+        adapters: vec![crate::driver::AdapterSpec {
+            name: "style".to_string(),
+            shape: vec![LORA_RANK],
+        }],
+        source: source(n),
+    };
+    let generation_a = served
+        .capture_adapter_set(set(1), std::slice::from_ref(&adapter_a))
+        .unwrap();
+    prepare(&mut served, &[generation_a]);
+    let (bytes_a, allocations_a) = weight_counters(&served);
+    assert_eq!(
+        bytes_a - base_bytes,
+        stack_bytes(1),
+        "generation A uploaded its own stacked tensors and no base weight"
+    );
+    assert_eq!(allocations_a - base_allocations, tensor_count);
+
+    // A's sequence starts, then B replaces the adapter while A is mid-generation.
+    let on = |generation| AdapterRef::Adapter {
+        generation,
+        index: crate::driver::LoraIdx::new(1).unwrap(),
+    };
+    let open = |driver: &mut Driver, adapter| {
+        let Admission::Opened { seq, .. } = driver
+            .open(SeqRequest {
+                prompt: &prompt,
+                max_new,
+                adapter,
+            })
+            .unwrap()
+        else {
+            panic!("no room");
+        };
+        seq
+    };
+    let seq_a = open(&mut served, on(generation_a));
+    let (mut done_a, mut traced_a) = (
+        0usize,
+        Traced {
+            tokens: Vec::new(),
+            logprobs: Vec::new(),
+        },
+    );
+    drive(
+        &mut served,
+        seq_a,
+        prompt.len(),
+        &mut done_a,
+        3,
+        &mut traced_a,
+        max_new,
+    );
+
+    let generation_b = served
+        .capture_adapter_set(set(2), std::slice::from_ref(&adapter_b))
+        .unwrap();
+    assert_ne!(
+        generation_a, generation_b,
+        "a new source is a new generation"
+    );
+    prepare(&mut served, &[generation_a, generation_b]);
+    let (bytes_b, allocations_b) = weight_counters(&served);
+    assert_eq!(
+        bytes_b - bytes_a,
+        stack_bytes(1),
+        "generation B uploaded only its own stack beside A's"
+    );
+    assert_eq!(allocations_b - allocations_a, tensor_count);
+
+    // A cannot be unloaded while its sequence runs, and B (its own sequence, run to the end) matches
+    // its own reference.
+    let refused = served.unload_adapter_set(generation_a).unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            DriverError::InvalidRequest(InvalidRequest::Adapter(
+                crate::driver::lora::LoraError::InUse { .. }
+            ))
+        ),
+        "{refused:?}"
+    );
+    let seq_b = open(&mut served, on(generation_b));
+    let (mut done_b, mut traced_b) = (
+        0usize,
+        Traced {
+            tokens: Vec::new(),
+            logprobs: Vec::new(),
+        },
+    );
+    drive(
+        &mut served,
+        seq_b,
+        prompt.len(),
+        &mut done_b,
+        32,
+        &mut traced_b,
+        max_new,
+    );
+    assert_traced_matches("generation B", &traced_b, &want_b);
+
+    // A finishes after B ran, and still matches its own reference.
+    drive(
+        &mut served,
+        seq_a,
+        prompt.len(),
+        &mut done_a,
+        32,
+        &mut traced_a,
+        max_new,
+    );
+    assert_traced_matches("generation A", &traced_a, &want_a);
+
+    served.release(seq_a, Release::Finished).unwrap();
+    served.release(seq_b, Release::Finished).unwrap();
+    served.unload_adapter_set(generation_a).unwrap();
+    let (bytes_after, allocations_after) = weight_counters(&served);
+    assert_eq!(
+        bytes_after,
+        bytes_b - stack_bytes(1),
+        "unloading A returned exactly A's unique tensors"
+    );
+    assert_eq!(
+        allocations_after, allocations_b,
+        "allocations are monotonic: nothing was re-uploaded"
+    );
+    assert_eq!(
+        bytes_after - base_bytes,
+        stack_bytes(1),
+        "base weights and B remain"
+    );
+    served.unload_adapter_set(generation_b).unwrap();
+    assert_eq!(
+        weight_counters(&served).0,
+        base_bytes,
+        "only the base weights remain"
+    );
+}
+per_backend!(
+    adapter_generation_replacement_is_isolated_and_freed,
+    adapter_generation_replacement_is_isolated_and_freed_wgpu,
+    adapter_generation_replacement_is_isolated_and_freed_rocm,
+    adapter_generation_replacement_is_isolated_and_freed_ptx
+);

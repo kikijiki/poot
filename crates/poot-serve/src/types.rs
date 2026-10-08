@@ -5,20 +5,16 @@ use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Sender;
 use std::time::Instant;
 
-use poot_llm::encoder::{CrossEncoderRunner, EncoderRunner};
-use poot_llm::{LoraAdapterLease, MropePositionIds, Runner, Sampler, TokenLogprob};
+use poot_llm::driver::{AdapterRef, ModelHandle};
+use poot_llm::{Sampler, TokenLogprob};
 
-#[cfg(test)]
+use crate::engine_plan::Workload;
 use crate::metrics::Metrics;
 
 /// Global shutdown flag: set by the SIGINT/SIGTERM handler so the accept loop exits cleanly.
 pub(crate) static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 /// A generation job submitted to the engine: the spec plus a reply channel the engine streams events back on.
-#[allow(
-    dead_code,
-    reason = "the fields are the engine's input; no engine reads them yet"
-)]
 pub(crate) struct Job {
     pub(crate) prompt: String,
     pub(crate) max_new: usize,
@@ -30,13 +26,13 @@ pub(crate) struct Job {
     pub(crate) reply: Sender<GenEvent>,
     /// Enqueue time, for the queue-wait histogram (`now - submitted` at admit).
     pub(crate) submitted: Instant,
-    /// This request's LoRA adapter lease, acquired by the HTTP layer before enqueueing. Held through
-    /// queue, slot, and preemption state so the adapter cannot be unloaded or reused until dropped.
-    /// The inert form means "no adapter".
-    pub(crate) lora_adapter: LoraAdapterLease,
-    /// Prompt positions for an mRoPE Runner. The HTTP layer cannot build these yet; `None` gets a named
-    /// admission rejection if the selected graph requires mRoPE.
-    pub(crate) mrope_positions: Option<MropePositionIds>,
+    /// This request's adapter selection, resolved by the HTTP layer before enqueueing: the base weights
+    /// or a captured adapter set's row. [`AdapterRef::Base`] means "no adapter".
+    pub(crate) lora_adapter: AdapterRef,
+    /// Set by the submitting connection when it stops waiting (its [`crate::lifecycle::JobGuard`] drops):
+    /// the client disconnected or the drain expired. The engine releases the request at its next step
+    /// boundary, streaming or not.
+    pub(crate) cancel: Arc<AtomicBool>,
 }
 
 /// Engine-produced per-token data sent with each streamed token. Timing is measured inside the engine
@@ -57,30 +53,17 @@ pub(crate) struct PerTokenInfo {
 /// sequence plus any recorded per-token logprobs) or `Failed`.
 pub(crate) enum GenEvent {
     /// A generated token piece plus engine-produced per-token timing/state data.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "produced by the scheduling loop (card 588a)")
-    )]
     Token(String, PerTokenInfo),
     /// The full token sequence + per-token logprobs, and `natural_stop`: true if generation ended on EOS
     /// or a stop sequence (OpenAI `"stop"`), false if it hit max_tokens / the KV cap (`"length"`).
     /// EOS is not appended to the sequence, so handlers cannot infer this from the tokens.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "produced by the scheduling loop (card 588a)")
-    )]
     Done(Vec<u32>, Vec<TokenLogprob>, bool),
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "produced by the scheduling loop (card 588a)")
-    )]
     Failed(AccountedGenerationFailure),
 }
 
 impl GenEvent {
     /// The only production constructor of a failure event. Building the `AccountedGenerationFailure`
     /// records the producer-side terminal error first, even if the receiver is gone.
-    #[cfg(test)]
     pub(crate) fn failed(metrics: &Metrics, message: impl Into<String>) -> Self {
         metrics.record_terminal_failure();
         GenEvent::Failed(AccountedGenerationFailure {
@@ -91,7 +74,6 @@ impl GenEvent {
     /// The `GenEvent`-typed wrapper over [`deliver_terminal`]: build the `Done`, publish its outcome
     /// count, then deliver it, so a consumer that reads `Done` and then scrapes `/metrics` never sees
     /// a stale count. Every commit path calls this.
-    #[cfg(test)]
     pub(crate) fn deliver_done(
         metrics: &Metrics,
         reply: &Sender<GenEvent>,
@@ -111,7 +93,6 @@ impl GenEvent {
 /// and the send - cannot be retracted from a monotonic counter, so it stays a completion and is logged.
 /// Returns whether the event was delivered. Every terminal `Done` send in the server goes through this,
 /// so the ordering and card 051's classification exist once instead of per call site.
-#[cfg(test)]
 pub(crate) fn deliver_terminal<T>(metrics: &Metrics, reply: &Sender<T>, event: T) -> bool {
     let predicted = !reply.is_disconnected();
     metrics.record_terminal(predicted);
@@ -146,11 +127,13 @@ impl std::fmt::Display for AccountedGenerationFailure {
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum GenerationError {
     /// No generation engine is loaded. The request was valid and is refused; nothing was queued.
-    #[error(
-        "no generation engine is loaded: this server parses and bounds requests but cannot generate \
-         until the serving loop lands"
-    )]
+    #[error("no generation engine is loaded: this server was started without one")]
     NoEngine,
+    /// A route the loaded model could serve, but whose driver path the server has not restored yet
+    /// (embeddings, rerank, LoRA administration; POOT-589). The request was valid and is refused;
+    /// nothing ran.
+    #[error("{route} is not served yet: it runs the model on the driver, and POOT-589 restores it")]
+    NotServed { route: &'static str },
     #[error("engine thread is gone")]
     EngineUnavailable,
     #[error("{0}")]
@@ -178,6 +161,7 @@ impl GenerationError {
     pub(crate) fn stream_status(&self) -> u16 {
         match self {
             GenerationError::NoEngine
+            | GenerationError::NotServed { .. }
             | GenerationError::EngineUnavailable
             | GenerationError::ReplyChannelClosed => 503,
             GenerationError::EngineFailed(_) => 500,
@@ -189,6 +173,7 @@ impl GenerationError {
     pub(crate) fn kind(&self) -> &'static str {
         match self {
             GenerationError::NoEngine => "no_engine",
+            GenerationError::NotServed { .. } => "not_served",
             GenerationError::EngineUnavailable => "engine_unavailable",
             GenerationError::EngineFailed(_) => "engine_failed",
             GenerationError::ReplyChannelClosed => "reply_channel_closed",
@@ -198,15 +183,33 @@ impl GenerationError {
     }
 }
 
-/// The model being served, auto-detected from `config.json` at startup (card 057). A causal
-/// `Decoder` does decoder-pooling embeddings/rerank and, once an engine is loaded, generation; a BERT
-/// `Encoder` does embeddings and bi-encoder rerank; a `CrossEncoder` does cross-encoder rerank only.
-/// Exactly one is loaded (the checkpoints have disjoint heads). Endpoints a model cannot serve
-/// return 400.
+/// The model being served, a loaded checkpoint told apart by what its family's step returns
+/// ([`poot_llm::driver::ModelHandle::config`]'s `output`): logits make a causal `Decoder`, hidden
+/// states a BERT-class `Encoder` (embeddings and bi-encoder rerank), classifier scores a
+/// `CrossEncoder` (cross-encoder rerank only). Exactly one is loaded. Endpoints a model cannot serve
+/// return 400; the routes the model could serve but this server has no driver path for yet (generation,
+/// embeddings, rerank, LoRA administration) return the typed 503.
 pub(crate) enum Backend {
-    Decoder(Arc<Runner>),
-    Encoder(Arc<EncoderRunner>),
-    CrossEncoder(Arc<CrossEncoderRunner>),
+    Decoder(Arc<ModelHandle>),
+    #[expect(
+        dead_code,
+        reason = "held for POOT-589 (the encoder routes run it on the driver)"
+    )]
+    Encoder(Arc<ModelHandle>),
+    #[expect(
+        dead_code,
+        reason = "held for POOT-589 (the encoder routes run it on the driver)"
+    )]
+    CrossEncoder(Arc<ModelHandle>),
+}
+
+impl Backend {
+    /// The served model told apart by the engine plan's workload.
+    pub(crate) fn for_workload(model: Arc<ModelHandle>, workload: &Workload) -> Self {
+        match workload {
+            Workload::Generate { .. } => Backend::Decoder(model),
+        }
+    }
 }
 
 /// Test-only record of what `/metrics` would report at the instant [`deliver_terminal`] publishes a

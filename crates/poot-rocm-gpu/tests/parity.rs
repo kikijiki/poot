@@ -138,7 +138,7 @@ fn alibi_slopes_attention_matches_the_oracle_and_the_reference_on_rocm() {
 }
 
 /// Card 1007 acceptance row 1: `matmul(x, transpose(w))` over an F16 `[N, K]` const, at `M = 1` (the decode GEMV),
-/// `4` and `33` (the tiled GEMM) and under the MoE hang guard (the serial kernel), compiled for ROCm: the program
+/// `4` and `33` (the tiled GEMM), compiled for ROCm: the program
 /// holds one `DenseContraction` and no `Transpose`, and every replayed step matches `eval(g)` of the traced graph
 /// within the parity tolerance (ADR-0101 tier 2). The weight lives on the device as packed binary16 words.
 /// Mutation: remove `DType::F16` from `DENSE_CONTRACTION_WEIGHT_DTYPES`; a `Transpose` is planned and this row goes
@@ -159,7 +159,7 @@ fn f16_checkpoint_orientation_projection_matches_the_oracle_on_rocm() {
 }
 
 /// Card 1024: `matmul(x, transpose(w))` over a BF16 `[N, K]` const, at `M = 1` (the decode GEMV), `4` and `33`
-/// (the generated tiled GEMM) and under the MoE hang guard (the serial kernel), compiled for rocm: the program
+/// (the generated tiled GEMM), compiled for rocm: the program
 /// holds one `DenseContraction` and no `Transpose`, and every replayed step matches `eval(g)` of the traced graph
 /// within the parity tolerance (ADR-0101 tier 2). The weight lives on the device as packed bfloat16 words.
 /// Mutation: in `tiled_region`'s `WeightLayout::Nk` arm index the weight as `[K, N]`; the `M = 4` and `M = 33`
@@ -179,11 +179,33 @@ fn bf16_checkpoint_orientation_projection_matches_the_oracle_on_rocm() {
     }
 }
 
+/// POOT-1048: a grouped projection `matmul(x, transpose(reshape(w, [G, N, K]), [0, 2, 1]))` over a BF16 `[G * N, K]`
+/// const (DeepSeek V4's `wo_a`), at `M = 1`, `5` and `33` with three groups and at one group, compiled for rocm: the
+/// program holds one `GroupedDenseContraction` and neither a `Transpose` nor a `Cast`, and every replayed step
+/// matches `eval(g)` of the traced graph within the parity tolerance (ADR-0101 tier 2). The weight lives on the
+/// device as packed bfloat16 words.
+/// Mutation: in `matmul_batched_impl` give the weight no per-group batch offset (zero its `b_beff`); the three-group
+/// rows go red.
+#[test]
+fn bf16_grouped_projection_matches_the_oracle_on_rocm() {
+    let Some(device) = open_or_skip(DeviceBackend::Rocm, RocmDevice::new()) else {
+        return;
+    };
+    let t = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    for fixture in &poot_executor_parity::grouped_projection_bf16_fixtures() {
+        poot_executor_parity::assert_one_grouped_dense_contraction(fixture, t);
+        let mut oracle = oracle_for(&fixture.graph, &fixture.store);
+        poot_executor_parity::run_parity(exec.as_mut(), t, fixture, &mut oracle)
+            .unwrap_or_else(|e| panic!("{e}"));
+    }
+}
+
 /// POOT-1033: `Select` is a bitwise select. An F32 select (standalone, and inside a fused float region) over
 /// poisoned branches and an I32 select over nonzero condition words each equal the hand-written select words
 /// and the oracle's, bit for bit: a NaN or an infinity in the unselected branch stays out, and a NaN payload,
 /// an infinity or `-0.0` in the selected one passes through.
-/// Mutation: emit the arithmetic form `if_false + cond * (if_true - if_false)` in `emit_bitwise_select`
+/// Mutation: emit the arithmetic form `if_false + cond * (if_true - if_false)` in `emit_select`
 /// (`poot-kernelgen`'s `fused.rs`), with a fresh `POOT_KERNEL_CACHE_DIR`; every row goes red.
 #[test]
 fn select_is_bitwise_on_rocm() {
@@ -193,6 +215,21 @@ fn select_is_bitwise_on_rocm() {
     let t = device.target();
     let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
     poot_executor_parity::select::assert_select_is_bitwise(exec.as_mut(), t);
+}
+
+/// POOT-1041: a BF16 and an F16 `Select` equal the hand-written words and the oracle's, bit for bit: a signaling
+/// NaN, NaN payloads, infinities and `-0.0` in the selected branch pass through unquieted, the same values in the
+/// unselected one stay out.
+/// Mutation (each with a fresh `POOT_KERNEL_CACHE_DIR`): make the `Select` always take `if_true` in `emit_select`
+/// (`poot-kernelgen`'s `fused.rs`), or widen each branch through F32 and narrow back; the rows go red.
+#[test]
+fn two_byte_select_is_bitwise_on_rocm() {
+    let Some(device) = open_or_skip(DeviceBackend::Rocm, RocmDevice::new()) else {
+        return;
+    };
+    let t = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    poot_executor_parity::select::assert_two_byte_select_is_bitwise(exec.as_mut(), t);
 }
 
 /// Card 1011: a BF16 const cast to F32 is read from its packed `u32` lanes by the imported

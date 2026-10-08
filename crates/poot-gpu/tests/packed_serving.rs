@@ -17,6 +17,7 @@
 //! first two source roles exchanged; the AWQ and GPTQ rows go red.
 
 use poot_tensor::DType;
+use poot_test_util::const_weights::ConstWeights;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -32,26 +33,14 @@ use poot_graph_plan::{
 };
 use poot_quant::format::{GroupMap, WeightFormat};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
-use poot_quant::{PackedComponentRef, PackedPayload};
+use poot_quant::{PackedComponentRef, PackedPayload, PackedStack, PackedStackComponentRef};
 use poot_runtime_common::DeviceBackend;
 use poot_tensor::HostTensor;
 
 /// Compile `g` for `target` with `Submission::Replay` (Card 546b: the contract admits no other
 /// submission).
 fn staged(g: &Graph, target: Target) -> StagedProgram<poot_graph_ir::ValidationOutputs> {
-    staged_under(g, target, false)
-}
-
-/// [`staged`], with `guarded` under the routed-expert hang guard: the unfused program, one kernel per
-/// equation (the graph carries a dead routed-expert site and the target has the hang).
-fn staged_under(
-    g: &Graph,
-    target: Target,
-    guarded: bool,
-) -> StagedProgram<poot_graph_ir::ValidationOutputs> {
-    let (g, caps) = poot_test_util::graph_fixtures::pipeline_input(g, target.caps, guarded);
-    let target = Target { caps, ..target };
-    let g = g.with_validations(Vec::new());
+    let g = g.clone().with_validations(Vec::new());
     compile_staged(
         &g,
         &TargetSet::single(DeviceId(0), target),
@@ -59,10 +48,7 @@ fn staged_under(
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions {
-            execution: Submission::Replay,
-            limits: poot_graph_plan::CompileLimits::STANDARD,
-        },
+        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect("compile the packed graph")
 }
@@ -124,6 +110,18 @@ fn split_consts_and_slots(
                         packed_owners
                             .entry(parsed.linear_id().to_string())
                             .or_insert_with(|| Arc::clone(component.owner()));
+                    }
+                    // An expert stack: its experts are the store entries `{stack id}.{expert}`, which
+                    // `ConstWeights` views as one `ExpertStack`.
+                    Some(Value::PackedStack(component)) => {
+                        let parsed = PackedSourceName::parse(&name)
+                            .unwrap_or_else(|| panic!("{name}: not a packed carrier name"));
+                        let stack = component.stack();
+                        for expert in 0..stack.experts() {
+                            packed_owners
+                                .entry(format!("{}.{expert}", parsed.linear_id()))
+                                .or_insert_with(|| Arc::clone(stack.owner(expert)));
+                        }
                     }
                     Some(Value::Host(t)) => {
                         let bytes: Vec<u8> = t
@@ -201,6 +199,13 @@ fn formats() -> Vec<WeightFormat> {
             groups: GroupMap::Indexed { groups: nz(4) },
         },
     ]
+}
+
+/// The layouts of a routed expert table: [`formats`] and the codebook-scaled 4-bit block format.
+fn expert_formats() -> Vec<WeightFormat> {
+    let mut formats = formats();
+    formats.push(WeightFormat::Mxfp4);
+    formats
 }
 
 /// The decode column one step selects.
@@ -320,17 +325,16 @@ fn packed_decode_through_resident_serving_path_is_bit_exact() {
             seed as u64 + 11,
         ));
         let packed = packed_graph(owner.weight(), 1);
-        let program = staged(&packed.graph, target);
-        assert_claims_packed_contraction(program.stages().next().unwrap().2.graph());
         let weights = carriers(&packed.graph, &owner);
         let path = "step";
         let mut init_inputs = weights.clone();
         init_inputs.insert(packed.x, one_hot(1, |_| column(0)).into());
         init_inputs.insert(packed.pos.unwrap(), HostTensor::scalar(0.0).into());
         let (store, _) = split_consts_and_slots(&packed.graph, &init_inputs);
-        let exe = exec
-            .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
-            .unwrap();
+        let (bound, map) = ConstWeights::bind(&packed.graph, &store);
+        let program = staged(&bound, target);
+        assert_claims_packed_contraction(program.stages().next().unwrap().2.graph());
+        let exe = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
         let entry = exec.add_entry(exe, &program).unwrap();
         for step in 0..STEPS {
             let k = column(step);
@@ -399,14 +403,13 @@ fn packed_prefill_through_serving_paths_is_bit_exact() {
             seed as u64 + 29,
         ));
         let packed = packed_graph(owner.weight(), K);
-        let program = staged(&packed.graph, target);
-        assert_claims_packed_contraction(program.stages().next().unwrap().2.graph());
         let mut inputs = carriers(&packed.graph, &owner);
         inputs.insert(packed.x, one_hot(K, |r| r).into());
         let (store, slot_binds) = split_consts_and_slots(&packed.graph, &inputs);
-        let exe = exec
-            .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
-            .unwrap();
+        let (bound, map) = ConstWeights::bind(&packed.graph, &store);
+        let program = staged(&bound, target);
+        assert_claims_packed_contraction(program.stages().next().unwrap().2.graph());
+        let exe = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
         let entry = exec.add_entry(exe, &program).unwrap();
         let step_in = step_inputs(&slot_binds);
         let y = f32_bytes(
@@ -455,13 +458,235 @@ fn packed_prefill_through_serving_paths_is_bit_exact() {
 // longer a caller-supplied role to get wrong - W11a's invariant moved from a runtime refusal to a
 // structural one (verified by reading `Engine::weight_buffer`, `crates/poot-executor/src/engine.rs`).
 
-/// Card 642: the canonical packed MoE chain (`packed_indexed_linear` and
-/// `packed_grouped_linear`, every expert a `PackedDequant` planned as `Materialize`, the table the
-/// dense `IndexedMatMul`) compiles and runs through `run_resident`, row `m` reading expert `ids[m]`:
-/// with a one-hot row the output is exactly that expert's decoded column, bit-exact against the
-/// oracle decoder (zero sign canonicalized).
+const EXPERTS: usize = 3;
+const ROWS: usize = 5;
+/// Rows past `INDEXED_GEMV_MAX_ROWS` (32), so an indexed contraction of them runs the segmented Tiled schedule.
+const PREFILL_ROWS: usize = 70;
+const PREFILL_OUT: usize = 11;
+/// Row `m` routed to expert `(2m + 1) % EXPERTS`: every window of rows holds all the experts.
+fn interleaved(m: usize) -> usize {
+    (m * 2 + 1) % EXPERTS
+}
+
+/// Prefill routing in which a tile can skip an expert: the first half of every 64 rows takes only experts 2 and 0
+/// in an unsorted order (the segmented walk must step from expert 0 to expert 2, not to the next integer), the
+/// second half is [`interleaved`].
+fn gapped(m: usize) -> usize {
+    if m % 64 < 32 {
+        [2, 0, 2, 0, 0, 2, 2, 0][m % 8]
+    } else {
+        interleaved(m)
+    }
+}
+
+/// 17.0M outputs: past the 65,535 x 256 the packed Gemv body can address on wgpu.
+const GRID_LIMIT_ROWS: usize = 4096;
+const GRID_LIMIT_OUT: usize = 4160;
+
+/// The decode column row `m` selects of a `k`-wide table.
+fn column_of(m: usize, k: usize) -> usize {
+    (m * 67 + 5) % k
+}
+
+fn indexed_one_hot(rows: usize, k: usize) -> HostTensor {
+    let mut data = vec![0.0f32; rows * k];
+    for r in 0..rows {
+        data[r * k + column_of(r, k)] = 1.0;
+    }
+    HostTensor::f32(vec![rows, k], data)
+}
+
+/// Every row of `owner` decoded by the oracle, `[out, k]` flattened: decoded once per expert, so a table of
+/// millions of outputs is not re-decoded for each of the rows that read it.
+fn decoded_rows(owner: &PackedPayload) -> Vec<f32> {
+    let [out, k] = owner.weight().shape();
+    let mut decoded = vec![0.0f32; out * k];
+    for (o, row) in decoded.chunks_mut(k).enumerate() {
+        owner.decode_row(o, row).unwrap();
+    }
+    decoded
+}
+
+fn assert_indexed_row(what: &str, decoded: &[f32], k: usize, got: &[f32], column: usize) {
+    assert_eq!(got.len() * k, decoded.len(), "{what}");
+    for (o, value) in got.iter().enumerate() {
+        let want = decoded[o * k + column];
+        assert_eq!(
+            canonical(*value),
+            canonical(want),
+            "{what}: [{o}, k={column}] device {value} vs oracle {want}"
+        );
+    }
+}
+
+/// How the stacked table of an indexed packed launch binds (card 1067).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StackBuffers {
+    /// Every source is one buffer.
+    One,
+    /// The target's single-buffer limit holds two of the three experts of the largest source, so `legalize` splits
+    /// the table into the expert ranges 0..2 and 2..3, each its own buffer.
+    Split,
+}
+
+impl StackBuffers {
+    /// `g` as `legalize` leaves it for a device of `target` whose single-buffer limit is this layout's: the stacked
+    /// table split into the expert ranges the limit holds. The device keeps its real caps, so the result is
+    /// compiled and run for the real target; `g` itself is the unsplit graph.
+    fn graph(self, g: &Graph, target: Target, descriptor: poot_quant::PackedWeight) -> Graph {
+        match self {
+            Self::One => g.clone(),
+            Self::Split => {
+                let slab = descriptor
+                    .sources()
+                    .into_iter()
+                    .map(|role| descriptor.slab_bytes(role))
+                    .max()
+                    .expect("a packed weight has a source") as u64;
+                assert!(
+                    2 * slab < 4096,
+                    "a limit this small is used as is, not rounded"
+                );
+                let caps = poot_target::DeviceCaps {
+                    max_buffer_bytes: 2 * slab,
+                    ..target.caps
+                };
+                let split =
+                    poot_graph_plan::legalize(g, &caps, &poot_graph_plan::CompileLimits::STANDARD)
+                        .expect("the stacked table splits");
+                let carriers: Vec<usize> = split
+                    .consts
+                    .iter()
+                    .map(|&id| split.aval(id).shape[0])
+                    .collect();
+                assert_eq!(
+                    carriers,
+                    self.carrier_experts(descriptor.sources().len()),
+                    "the experts each stacked carrier holds after the split"
+                );
+                split
+            }
+        }
+    }
+
+    /// The leading extents of the compiled graph's stacked carriers: one buffer of every expert, or the 2 + 1
+    /// split with every source's piece 0 before its piece 1.
+    fn carrier_experts(self, sources: usize) -> Vec<usize> {
+        match self {
+            Self::One => vec![EXPERTS; sources],
+            Self::Split => [[2].repeat(sources), [1].repeat(sources)].concat(),
+        }
+    }
+}
+
+/// One `packed_indexed_linear` launch over `EXPERTS` stacked `[out, k]` experts of `format`, row `m` routed to
+/// the expert `expert_of(m)` routes it to with a one-hot activation: one `PackedContraction { rows: Indexed }`, each row
+/// bit-exact against the oracle decoder (zero sign canonicalized).
+fn run_indexed_case(
+    exec: &mut dyn Executor,
+    target: Target,
+    format: WeightFormat,
+    (rows, out, k): (usize, usize, usize),
+    expert_of: fn(usize) -> usize,
+    buffers: StackBuffers,
+) {
+    let owners: Vec<Arc<PackedPayload>> = (0..EXPERTS)
+        .map(|e| {
+            Arc::new(poot_test_util::packed::prescribed_scale_payload(
+                format,
+                [out, k],
+                e as u64 * 7 + 101,
+            ))
+        })
+        .collect();
+    let table = poot_graph_ir::ops::PackedExpertStack {
+        stack_id: "experts".to_string(),
+        descriptor: owners[0].weight(),
+        experts: EXPERTS,
+    };
+    let stack = Arc::new(PackedStack::try_new(owners.clone()).unwrap());
+    let what = format!("{format:?}");
+    let b = Builder::new();
+    let x = b.slot_named(Slot::Activation, "moe-x", TensorType::f32(vec![rows, k]));
+    let ids = b.slot_named(Slot::Activation, "moe-ids", TensorType::f32(vec![rows]));
+    let y = poot_graph_ir::ops::packed_indexed_linear(&b, x, ids, &table).unwrap();
+    let g = b.finish(y);
+    let mut inputs: HashMap<ValueId, Value> = HashMap::new();
+    for &id in &g.inputs {
+        let Some(name) = g.meta(id).name.as_deref().and_then(PackedSourceName::parse) else {
+            continue;
+        };
+        inputs.insert(
+            id,
+            PackedStackComponentRef::new(Arc::clone(&stack), name.role()).into(),
+        );
+    }
+    inputs.insert(x.id, indexed_one_hot(rows, k).into());
+    let selected: Vec<f32> = (0..rows).map(|m| expert_of(m) as f32).collect();
+    inputs.insert(ids.id, HostTensor::f32(vec![rows], selected).into());
+
+    let (store, slot_binds) = split_consts_and_slots(&g, &inputs);
+    let (bound, map) = ConstWeights::bind(&g, &store);
+    let bound = buffers.graph(&bound, target, table.descriptor);
+    let program = staged(&bound, target);
+    let compiled = program.stages().next().expect("single stage").2.graph();
+    let carriers: Vec<usize> = compiled
+        .consts
+        .iter()
+        .map(|&id| compiled.aval(id).shape[0])
+        .collect();
+    assert_eq!(
+        carriers,
+        buffers.carrier_experts(table.descriptor.sources().len()),
+        "{what}: the experts each stacked carrier holds"
+    );
+    if buffers == StackBuffers::One {
+        let [contraction] = compiled.eqns.as_slice() else {
+            panic!("{what}: one equation, got {:?}", compiled.eqns);
+        };
+        assert!(
+            matches!(
+                contraction.op,
+                poot_graph_ir::OpKind::PackedContraction {
+                    rows: poot_graph_ir::ContractionRows::Indexed { experts: EXPERTS },
+                    ..
+                }
+            ),
+            "{what}: {:?}",
+            contraction.op
+        );
+    }
+    let exe = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
+    let entry = exec.add_entry(exe, &program).unwrap();
+    let step_in = step_inputs(&slot_binds);
+    let got = f32_bytes(
+        &exec
+            .step(exe, entry, &step_in, &mut NoSync)
+            .unwrap_or_else(|error| panic!("{what}: {error}"))
+            .read()
+            .unwrap_or_else(|error| panic!("{what}: {error}")),
+    );
+    exec.remove_entry(exe, entry).unwrap();
+    exec.unload(exe).unwrap();
+    let decoded: Vec<Vec<f32>> = owners.iter().map(|owner| decoded_rows(owner)).collect();
+    for m in 0..rows {
+        assert_indexed_row(
+            &format!("{what} row {m} expert {}", expert_of(m)),
+            &decoded[expert_of(m)],
+            k,
+            &got[m * out..(m + 1) * out],
+            column_of(m, k),
+        );
+    }
+}
+
+/// SC-001 (wgpu): `packed_indexed_linear` over a stacked table of every format (Q4_K, Q8_0, AWQ, GPTQ
+/// act-order, MXFP4) compiles to one `PackedContraction { rows: Indexed }` and runs through the executor
+/// contract with one-hot rows bit-exact against the oracle decoder.
+/// Mutation: slab stride 0 in the planner's metadata (every row reads expert 0); the rows routed to
+/// experts 1 and 2 go red.
 #[test]
-fn canonical_packed_moe_chain_runs_bit_exact() {
+fn packed_indexed_contraction_runs_bit_exact() {
     let Some(device) =
         poot_test_util::device_skip::open_or_skip(DeviceBackend::Wgpu, WgpuDevice::new())
     else {
@@ -469,85 +694,117 @@ fn canonical_packed_moe_chain_runs_bit_exact() {
     };
     let target = device.target();
     let mut exec: Box<dyn Executor> = Box::new(poot_executor::Engine::new(device));
-    const EXPERTS: usize = 3;
-    const ROWS: usize = 5;
-    for format in formats() {
-        let owners: Vec<Arc<PackedPayload>> = (0..EXPERTS)
-            .map(|e| {
-                Arc::new(poot_test_util::packed::random_payload(
-                    format,
-                    [OUT, K],
-                    e as u64 * 7 + 101,
-                ))
-            })
-            .collect();
-        let rows: Vec<poot_graph_ir::ops::PackedLinearGraphRow> = (0..EXPERTS)
-            .map(|ordinal| poot_graph_ir::ops::PackedLinearGraphRow {
-                ordinal,
-                linear_id: format!("expert.{ordinal}"),
-                descriptor: owners[ordinal].weight(),
-            })
-            .collect();
-        let expert_of = |m: usize| (m * 2 + 1) % EXPERTS;
-        for grouped in [false, true] {
-            let what = format!("{format:?} grouped={grouped}");
-            let b = Builder::new();
-            let x = b.slot_named(Slot::Activation, "moe-x", TensorType::f32(vec![ROWS, K]));
-            let ids = b.slot_named(Slot::Activation, "moe-ids", TensorType::f32(vec![ROWS]));
-            let y = if grouped {
-                poot_graph_ir::ops::packed_grouped_linear(&b, x, ids, &rows)
-            } else {
-                poot_graph_ir::ops::packed_indexed_linear(&b, x, ids, &rows)
-            }
-            .unwrap();
-            let g = b.finish(y);
-            let mut inputs: HashMap<ValueId, Value> = HashMap::new();
-            for &id in &g.inputs {
-                let Some(name) = g.meta(id).name.as_deref().and_then(PackedSourceName::parse)
-                else {
-                    continue;
-                };
-                let expert: usize = name
-                    .linear_id()
-                    .strip_prefix("expert.")
-                    .unwrap()
-                    .parse()
-                    .unwrap();
-                inputs.insert(
-                    id,
-                    PackedComponentRef::new(Arc::clone(&owners[expert]), name.role()).into(),
-                );
-            }
-            inputs.insert(x.id, one_hot(ROWS, column).into());
-            let selected: Vec<f32> = (0..ROWS).map(|m| expert_of(m) as f32).collect();
-            inputs.insert(ids.id, HostTensor::f32(vec![ROWS], selected).into());
-
-            let program = staged(&g, target);
-            let (store, slot_binds) = split_consts_and_slots(&g, &inputs);
-            let exe = exec
-                .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
-                .unwrap();
-            let entry = exec.add_entry(exe, &program).unwrap();
-            let step_in = step_inputs(&slot_binds);
-            let out = f32_bytes(
-                &exec
-                    .step(exe, entry, &step_in, &mut NoSync)
-                    .unwrap_or_else(|error| panic!("{what}: {error}"))
-                    .read()
-                    .unwrap_or_else(|error| panic!("{what}: {error}")),
-            );
-            exec.remove_entry(exe, entry).unwrap();
-            exec.unload(exe).unwrap();
-            for m in 0..ROWS {
-                assert_decode_row(
-                    &format!("{what} row {m} expert {}", expert_of(m)),
-                    &owners[expert_of(m)],
-                    &out[m * OUT..(m + 1) * OUT],
-                    column(m),
-                );
-            }
-        }
+    for format in expert_formats() {
+        run_indexed_case(
+            &mut *exec,
+            target,
+            format,
+            (ROWS, OUT, K),
+            interleaved,
+            StackBuffers::One,
+        );
     }
+}
+
+/// Card 1067 (wgpu): a stacked table over the target's single-buffer limit runs split into expert ranges
+/// (0..2 and 2..3, each its own buffer per source) through the executor contract and is bit-exact against the
+/// oracle decoder on every format, with rows routed to every expert, the last one alone in its buffer. The buffer
+/// limit is set on the target's `DeviceCaps` (`StackBuffers::Split`), the one input of `legalize`'s split; the
+/// graph, weights and executor are those of the unsplit case.
+/// Mutation: in `legalize`'s `split_oversized_expert_stacks` shift the ids of the later pieces by one less
+/// than `range.start`; the row routed to expert 2 reads expert 1's slab of the piece and goes red.
+#[test]
+fn a_split_expert_stack_runs_bit_exact() {
+    let Some(device) =
+        poot_test_util::device_skip::open_or_skip(DeviceBackend::Wgpu, WgpuDevice::new())
+    else {
+        return;
+    };
+    let target = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(poot_executor::Engine::new(device));
+    for format in expert_formats() {
+        run_indexed_case(
+            &mut *exec,
+            target,
+            format,
+            (ROWS, 2, K),
+            interleaved,
+            StackBuffers::Split,
+        );
+    }
+}
+
+/// SC-002 (wgpu): a Q8_0 table with `out = 3, K = 32` is 102 bytes per expert, not a whole number of words,
+/// so the binder pads each expert to 104 bytes and the kernel strides by that: one-hot rows routed to
+/// experts 1 and 2 (whose slabs start at byte 104 and 208, not 102 and 204) are bit-exact. Mutation: drop the
+/// per-expert padding in `WeightBinder::read`; experts 1 and 2 read misaligned blocks and go red.
+#[test]
+fn an_unaligned_expert_slab_table_runs_bit_exact() {
+    let Some(device) =
+        poot_test_util::device_skip::open_or_skip(DeviceBackend::Wgpu, WgpuDevice::new())
+    else {
+        return;
+    };
+    let target = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(poot_executor::Engine::new(device));
+    run_indexed_case(
+        &mut *exec,
+        target,
+        WeightFormat::Q8_0,
+        (ROWS, 3, 32),
+        interleaved,
+        StackBuffers::One,
+    );
+}
+
+/// A prefill-sized routed table (wgpu): `PREFILL_ROWS` rows is past the decode row count, so the indexed packed
+/// contraction runs the segmented Tiled schedule (rows routed by `gapped`, so a tile holds several
+/// experts and may skip one) over every format, with `N = 11` leaving edge columns in the last column tile. One-hot rows bit-exact
+/// against the oracle decoder. Mutation: take the Tiled step's slab from the wrong segment (`weight.step(.., lo,
+/// ..)` in `indexed_tiled_body`); rows routed to an expert after a gap read another expert and go red.
+#[test]
+fn packed_indexed_prefill_runs_bit_exact() {
+    let Some(device) =
+        poot_test_util::device_skip::open_or_skip(DeviceBackend::Wgpu, WgpuDevice::new())
+    else {
+        return;
+    };
+    let target = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(poot_executor::Engine::new(device));
+    for format in expert_formats() {
+        run_indexed_case(
+            &mut *exec,
+            target,
+            format,
+            (PREFILL_ROWS, PREFILL_OUT, K),
+            gapped,
+            StackBuffers::One,
+        );
+    }
+}
+
+/// A routed prefill above the wgpu Gemv-body route's `DispatchGridLimit` (more than 65,535 x 256 outputs) (wgpu): `4096 x 4160` outputs of a Q8_0 table is 17.0M, past
+/// 65,535 x 256, which the Gemv-body route refused; the Tiled schedule plans it (folded onto `GroupY` where the
+/// device's X extent is smaller than the tile count) and every one of the 17M outputs is bit-exact against the
+/// oracle decoder. Mutation: read the tile index from `GroupX` alone in `indexed_tiled_body`; every tile past
+/// the first fold row is never computed and goes red.
+#[test]
+fn packed_indexed_prefill_above_the_gemv_grid_limit_runs_bit_exact() {
+    let Some(device) =
+        poot_test_util::device_skip::open_or_skip(DeviceBackend::Wgpu, WgpuDevice::new())
+    else {
+        return;
+    };
+    let target = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(poot_executor::Engine::new(device));
+    run_indexed_case(
+        &mut *exec,
+        target,
+        WeightFormat::Q8_0,
+        (GRID_LIMIT_ROWS, GRID_LIMIT_OUT, 64),
+        gapped,
+        StackBuffers::One,
+    );
 }
 
 /// Card 545a: a quantized token-embedding lookup (`packed_embedding`, claimed by
@@ -590,7 +847,12 @@ fn packed_embedding_row_gather_is_bit_exact() {
             )
             .unwrap();
             let g = b.finish(rows);
-            let program = staged(&g, target);
+            let mut inputs = carriers(&g, &owner);
+            let token_ids: Vec<f32> = ids.iter().map(|&id| id as f32).collect();
+            inputs.insert(token.id, HostTensor::f32(shape, token_ids).into());
+            let (store, slot_binds) = split_consts_and_slots(&g, &inputs);
+            let (bound, map) = ConstWeights::bind(&g, &store);
+            let program = staged(&bound, target);
             assert!(
                 program
                     .stages()
@@ -603,13 +865,7 @@ fn packed_embedding_row_gather_is_bit_exact() {
                     .any(|eqn| matches!(eqn.op, poot_graph_ir::OpKind::PackedRowGather { .. })),
                 "{what}: compile claims the embedding"
             );
-            let mut inputs = carriers(&g, &owner);
-            let token_ids: Vec<f32> = ids.iter().map(|&id| id as f32).collect();
-            inputs.insert(token.id, HostTensor::f32(shape, token_ids).into());
-            let (store, slot_binds) = split_consts_and_slots(&g, &inputs);
-            let exe = exec
-                .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
-                .unwrap();
+            let exe = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
             let entry = exec.add_entry(exe, &program).unwrap();
             let step_in = step_inputs(&slot_binds);
             let out = f32_bytes(
@@ -637,14 +893,12 @@ fn packed_embedding_row_gather_is_bit_exact() {
     }
 }
 
-/// Card 545a SC-004: a MoE expert stack traced DENSE - one `[E, K, out]`
-/// constant read by `IndexedMatMul`, the storage-agnostic form every MoE tracer emits - is bound to
-/// four Q6_K expert owners by `bind_packed_weights`, claimed and planned by `compile`, and run on
-/// wgpu; it matches the CPU oracle over the same traced graph with the decoded dense stack at tier 2.
-/// Each row reads a different expert, so an owner bound to the wrong expert changes that row.
-/// Mutation (recorded, never left in the tree): swapping two experts' owners (`linear_ids` order
-/// `[0, 2, 1, 3]`) in the `WeightFormats` placement turns this red: "row 0 (expert 1) col 0: device
-/// -24.379936 vs oracle 7.571762".
+/// Card 545a SC-004: a MoE expert stack traced DENSE - one `[E, out, K]` constant read through
+/// `Transpose([0, 2, 1])` by `IndexedMatMul`, the storage-agnostic form every MoE tracer emits - is bound to
+/// four Q6_K expert owners by `bind_packed_weights` (rewritten to one indexed packed contraction), planned by
+/// `compile`, and run on wgpu; it matches the CPU oracle over the same traced graph with the decoded dense
+/// stack at tier 2. Each row reads a different expert, so an owner bound to the wrong expert changes that
+/// row. Mutation: swap two experts' keys in the store (`experts.weight.1` and `.2`) turns this red.
 #[test]
 fn a_dense_traced_q6_k_expert_stack_binds_and_matches_the_oracle() {
     use poot_graph_plan::{PackedConst, PackedLayout, WeightFormats, bind_packed_weights};
@@ -672,8 +926,8 @@ fn a_dense_traced_q6_k_expert_stack_binds_and_matches_the_oracle() {
     let b = Builder::new();
     let x = b.slot_named(Slot::Activation, "moe-x", TensorType::f32(vec![ROWS, K]));
     let ids = b.slot_named(Slot::Activation, "moe-ids", TensorType::f32(vec![ROWS]));
-    let w = b.constant("experts.weight", TensorType::f32(vec![EXPERTS, K, OUT]));
-    let y = b.indexed_matmul(x, w, ids);
+    let w = b.constant("experts.weight", TensorType::f32(vec![EXPERTS, OUT, K]));
+    let y = b.indexed_matmul(x, b.transpose(w, vec![0, 2, 1]), ids);
     let traced = b.finish(y);
 
     let mut formats = WeightFormats::default();
@@ -681,15 +935,14 @@ fn a_dense_traced_q6_k_expert_stack_binds_and_matches_the_oracle() {
         .insert(
             "experts.weight".to_string(),
             PackedConst {
-                linear_ids: (0..EXPERTS).map(|e| format!("experts.{e}")).collect(),
+                linear_id: "experts.weight".to_string(),
                 weight: owners[0].weight(),
-                layout: PackedLayout::StackedColumns,
+                layout: PackedLayout::ExpertRows { experts: EXPERTS },
             },
         )
         .unwrap();
     let bound = bind_packed_weights(&traced, &formats).expect("bind the expert stack");
     let graph = &bound;
-    let program = staged(&bound, target);
 
     let activation = HostTensor::f32(
         vec![ROWS, K],
@@ -701,6 +954,7 @@ fn a_dense_traced_q6_k_expert_stack_binds_and_matches_the_oracle() {
         vec![ROWS],
         (0..ROWS).map(|m| expert_of(m) as f32).collect::<Vec<f32>>(),
     );
+    let stack = Arc::new(PackedStack::try_new(owners.clone()).unwrap());
     let mut inputs: HashMap<ValueId, Value> = HashMap::new();
     for &id in &graph.inputs {
         let meta = graph.meta(id);
@@ -714,24 +968,19 @@ fn a_dense_traced_q6_k_expert_stack_binds_and_matches_the_oracle() {
             Some(name) => {
                 let name = PackedSourceName::parse(name)
                     .unwrap_or_else(|| panic!("input v{id} {name:?} is not a packed carrier"));
-                let expert: usize = name
-                    .linear_id()
-                    .strip_prefix("experts.")
-                    .unwrap()
-                    .parse()
-                    .unwrap();
+                assert_eq!(name.linear_id(), "experts.weight");
                 inputs.insert(
                     id,
-                    PackedComponentRef::new(Arc::clone(&owners[expert]), name.role()).into(),
+                    PackedStackComponentRef::new(Arc::clone(&stack), name.role()).into(),
                 );
             }
             None => panic!("unnamed input v{id}"),
         }
     }
     let (store, slot_binds) = split_consts_and_slots(graph, &inputs);
-    let exe = exec
-        .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (named, map) = ConstWeights::bind(graph, &store);
+    let program = staged(&named, target);
+    let exe = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
     let entry = exec.add_entry(exe, &program).unwrap();
     let step_in = step_inputs(&slot_binds);
     let got = f32_bytes(
@@ -744,15 +993,12 @@ fn a_dense_traced_q6_k_expert_stack_binds_and_matches_the_oracle() {
     exec.remove_entry(exe, entry).unwrap();
     exec.unload(exe).unwrap();
 
-    // The oracle: the traced (dense) graph over the decoded stack `W[e, k, o] = decode(e)[o, k]`.
-    let mut stack = vec![0.0f32; EXPERTS * K * OUT];
-    let mut row = vec![0.0f32; K];
+    // The oracle: the traced (dense) graph over the decoded stack `W[e, o, k] = decode(e)[o, k]`.
+    let mut decoded = vec![0.0f32; EXPERTS * OUT * K];
     for (e, owner) in owners.iter().enumerate() {
         for o in 0..OUT {
-            owner.decode_row(o, &mut row).unwrap();
-            for (k, value) in row.iter().enumerate() {
-                stack[(e * K + k) * OUT + o] = *value;
-            }
+            let at = (e * OUT + o) * K;
+            owner.decode_row(o, &mut decoded[at..at + K]).unwrap();
         }
     }
     let mut dense: HashMap<ValueId, Value> = HashMap::new();
@@ -760,7 +1006,7 @@ fn a_dense_traced_q6_k_expert_stack_binds_and_matches_the_oracle() {
         let value = match traced.meta(id).name.as_deref() {
             Some("activation.moe-x") => activation.clone(),
             Some("activation.moe-ids") => selected.clone(),
-            Some("experts.weight") => HostTensor::f32(vec![EXPERTS, K, OUT], stack.clone()),
+            Some("experts.weight") => HostTensor::f32(vec![EXPERTS, OUT, K], decoded.clone()),
             other => panic!("unexpected traced input {other:?}"),
         };
         dense.insert(id, value.into());
@@ -782,6 +1028,88 @@ fn a_dense_traced_q6_k_expert_stack_binds_and_matches_the_oracle() {
             "row {m} (expert {}) col {o}: device {got} vs oracle {want}",
             expert_of(m)
         );
+    }
+}
+
+/// POOT-1060: the sharded-PLE lookup's table shape - a dense E4M3FN `[rows, width]` checkpoint const
+/// gathered by an exact I32 index and widened in one `DenseRowGather` - through the executor contract,
+/// bit-exact against `poot_quant::scalar::e4m3fn_to_f32`. The table holds all 256 codes (NaN
+/// included) and is read at its first and last row, a repeated row and an interior row, at widths 1, 3,
+/// 4, 6 and 8: a width that is not a multiple of four pads each row to a whole `u32` word
+/// (`words_per_row = ceil(width / 4)`), so a flat `element / 4` lane read goes red on the odd widths.
+/// Mutations (each red, then restored): pad rows to `width / 4` words in `lanes::row_padded_words`;
+/// flip the sign/exponent decode in `packed_e4m3_row_gather.rs`; read `index[s] + 1`.
+#[test]
+fn dense_e4m3_row_gather_is_bit_exact() {
+    let Some(device) =
+        poot_test_util::device_skip::open_or_skip(DeviceBackend::Wgpu, WgpuDevice::new())
+    else {
+        return;
+    };
+    let target = device.target();
+    let mut engine = poot_executor::Engine::new(device);
+    for width in [1usize, 3, 4, 6, 8] {
+        let rows = 256 / width + 3;
+        let table: Vec<u8> = (0..rows * width).map(|i| (i % 256) as u8).collect();
+        let ids: Vec<i32> = vec![rows as i32 - 1, 0, rows as i32 / 2, rows as i32 - 1, 1];
+        let b = Builder::new();
+        let table_value = b.constant(
+            "ple.table",
+            TensorType::new(vec![rows, width], DType::E4M3FN),
+        );
+        let idx = b.slot_named(
+            Slot::Activation,
+            "idx",
+            TensorType::new(vec![ids.len()], DType::I32),
+        );
+        let gathered = b.cast(b.gather(table_value, 0, idx), DType::F32);
+        let graph = b.finish(gathered);
+        let idx_key = graph.meta(idx.id).slot_key().unwrap().clone();
+
+        let store = {
+            let mut builder = WeightStore::builder();
+            let dense =
+                DenseWeight::try_new(DType::E4M3FN, vec![rows, width], Arc::from(table.clone()))
+                    .unwrap();
+            builder
+                .insert("ple.table", WeightEntry::Dense(dense))
+                .unwrap();
+            Arc::new(builder.build())
+        };
+        let mut weights = ConstWeights::new(&store);
+        let named = weights.graph(&graph);
+        let exe = engine
+            .load_weights(Arc::clone(&store), Arc::new(weights.map()))
+            .unwrap();
+        let entry = engine.add_entry(exe, &staged(&named, target)).unwrap();
+        let id_bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+        let shape = [ids.len()];
+        let mut inputs = StepInputs::new();
+        inputs.push(
+            idx_key,
+            &shape,
+            HostView::new(DType::I32, ids.len(), &id_bytes).unwrap(),
+        );
+        let bytes = engine
+            .step(exe, entry, &inputs, &mut NoSync)
+            .unwrap()
+            .read()
+            .unwrap();
+        let out = f32_bytes(&bytes);
+        assert_eq!(out.len(), ids.len() * width, "width {width}");
+        for (r, &id) in ids.iter().enumerate() {
+            for c in 0..width {
+                let byte = table[id as usize * width + c];
+                let want = poot_quant::scalar::e4m3fn_to_f32(byte);
+                let got = out[r * width + c];
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "width {width} row {r} (id {id}) col {c} byte {byte:#04x}: device {got} vs oracle {want}"
+                );
+            }
+        }
+        engine.unload(exe).unwrap();
     }
 }
 
@@ -823,13 +1151,11 @@ fn run_dense_activation(
     target: Target,
     graph: &Graph,
     inputs: &HashMap<ValueId, Value>,
-    guarded: bool,
 ) -> Vec<f32> {
-    let program = staged_under(graph, target, guarded);
     let (store, slot_binds) = split_consts_and_slots(graph, inputs);
-    let exe = exec
-        .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (bound, map) = ConstWeights::bind(graph, &store);
+    let program = staged(&bound, target);
+    let exe = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
     let entry = exec.add_entry(exe, &program).unwrap();
     let step_in = step_inputs(&slot_binds);
     let out = f32_bytes(
@@ -876,7 +1202,7 @@ fn packed_loaders_match_the_oracle_on_every_output_on_wgpu() {
                 x.id,
                 HostTensor::f32(vec![m, K], fill(7 + m as u64, m * K)).into(),
             );
-            let got = run_dense_activation(&mut *exec, target, &graph, &inputs, false);
+            let got = run_dense_activation(&mut *exec, target, &graph, &inputs);
             let oracle_inputs = inputs.clone();
             let want = poot_eval::eval(
                 &graph,
@@ -899,14 +1225,14 @@ fn packed_loaders_match_the_oracle_on_every_output_on_wgpu() {
 }
 
 /// SC-003, the head half: with an epilogue that cannot be contracted (`head + bias`, no multiply to fuse
-/// with the add), the fused packed Gemv and the standalone one produce bit-identical results, so the head
-/// sum is the same computation in both bodies. Every loader format, a generic and a cancelling bias, at
+/// with the add), the fused packed Gemv equals the standalone one's head plus the bias on the host, bit for
+/// bit, so the head sum is the same computation in both bodies. Every loader format, a generic and a cancelling bias, at
 /// tolerance 0.0. A format whose decode carries `BinaryOpNoContract` (Q4_K's min term) loses that
 /// protection if the no-contraction marker lands on a different op in the longer fused body, and its fused
 /// head then drifts by an ulp or two. Mutation: place the SPIR-V `NoContraction` decoration by instruction
 /// ordinal, as card 628 first did; the Q4_K row goes red on wgpu while the other formats stay green.
 #[test]
-fn a_packed_gemv_head_is_shared_with_the_unfused_program_on_wgpu() {
+fn a_packed_gemv_head_is_shared_with_the_standalone_gemv_on_wgpu() {
     use poot_executor_parity::weight_map::assert_close;
     use poot_graph_ir::op::{BinOp, ContractionHead};
     let Some(device) =
@@ -916,13 +1242,6 @@ fn a_packed_gemv_head_is_shared_with_the_unfused_program_on_wgpu() {
     };
     let target = device.target();
     let mut exec: Box<dyn Executor> = Box::new(poot_executor::Engine::new(device));
-    // The unfused program is compiled under the routed-expert hang guard, so it runs on an engine whose
-    // device reports the hang.
-    let mut hung: Box<dyn Executor> = Box::new(poot_executor::Engine::new(
-        poot_executor_parity::hung::WithRoutedHang(
-            WgpuDevice::new().expect("a second wgpu device"),
-        ),
-    ));
     for (seed, format) in loader_formats().into_iter().enumerate() {
         let owner = Arc::new(poot_test_util::packed::prescribed_scale_payload(
             format,
@@ -951,7 +1270,7 @@ fn a_packed_gemv_head_is_shared_with_the_unfused_program_on_wgpu() {
         let (head_graph, head_x, _) = build(false);
         let mut head_inputs = carriers(&head_graph, &owner);
         head_inputs.insert(head_x, activation.clone().into());
-        let head = run_dense_activation(&mut *exec, target, &head_graph, &head_inputs, false);
+        let head = run_dense_activation(&mut *exec, target, &head_graph, &head_inputs);
 
         let (graph, x, bias) = build(true);
         let bias = bias.unwrap();
@@ -979,32 +1298,35 @@ fn a_packed_gemv_head_is_shared_with_the_unfused_program_on_wgpu() {
         ] {
             let mut inputs = carriers(&graph, &owner);
             inputs.insert(x, activation.clone().into());
-            inputs.insert(bias, HostTensor::f32(vec![OUT], bias_values).into());
-            let fused = run_dense_activation(&mut *exec, target, &graph, &inputs, false);
-            let unfused = run_dense_activation(&mut *hung, target, &graph, &inputs, true);
+            inputs.insert(bias, HostTensor::f32(vec![OUT], bias_values.clone()).into());
+            let fused = run_dense_activation(&mut *exec, target, &graph, &inputs);
+            let want: Vec<f32> = head
+                .iter()
+                .zip(&bias_values)
+                .map(|(head, bias)| head + bias)
+                .collect();
             assert_close(
                 &fused,
-                &unfused,
+                &want,
                 0.0,
-                &format!("{what} {label}: fused vs unfused head"),
+                &format!("{what} {label}: fused head vs the standalone head plus the bias"),
             );
         }
     }
 }
 
 /// SC-003: a packed head with a pointwise epilogue. `tanh(head + bias) * 0.5 + residual` over the `m == 1` Gemv
-/// forms one `ContractionEpilogue { head: Packed }`, and the fused device program agrees with the unfused one
-/// (same Gemv schedule, the head summed on the device in both). The head itself is bit-identical in both (the
-/// `head_is_shared` row); the epilogue's `bias` add and `0.5` multiply may contract to an FMA in one body and
-/// not the other (`contraction/epilogue.rs` deliberately does not forbid it), so this comparison is 1e-5, and
-/// is sharpened by a cancellation fixture: `bias` is the negated device head, so every pre-activation is within a few ulps of zero
+/// forms one `ContractionEpilogue { head: Packed }`, and the fused device program agrees with the oracle (the
+/// head summed on the device). The head itself is the standalone Gemv's (the `head_is_shared` row); the
+/// epilogue's `bias` add and `0.5` multiply may contract to an FMA (`contraction/epilogue.rs` deliberately does
+/// not forbid it), so the comparison is the tier-2 tolerance, and is sharpened by a cancellation fixture: `bias` is the negated device head, so every pre-activation is within a few ulps of zero
 /// when the epilogue sees each column's completed sum, and the fused result is `residual` to a few ulps of the
 /// head. An epilogue applied to a lane's partial accumulator (before the LDS reduction) adds the bias once per
 /// lane and saturates the activation, moving the result by about half the lane count. Mutation: apply the
 /// epilogue to the per-lane partial before the LDS reduction in `gemv_body`; the cancellation row and the
-/// fused-versus-unfused row go red.
+/// oracle row go red.
 #[test]
-fn a_packed_gemv_epilogue_agrees_with_the_unfused_program_on_wgpu() {
+fn a_packed_gemv_epilogue_agrees_with_the_oracle_on_wgpu() {
     use poot_executor_parity::weight_map::assert_close;
     use poot_graph_ir::op::{BinOp, ContractionHead, UnOp};
     use poot_graph_ir::types::Scalar;
@@ -1015,13 +1337,6 @@ fn a_packed_gemv_epilogue_agrees_with_the_unfused_program_on_wgpu() {
     };
     let target = device.target();
     let mut exec: Box<dyn Executor> = Box::new(poot_executor::Engine::new(device));
-    // The unfused program is compiled under the routed-expert hang guard, so it runs on an engine whose
-    // device reports the hang.
-    let mut hung: Box<dyn Executor> = Box::new(poot_executor::Engine::new(
-        poot_executor_parity::hung::WithRoutedHang(
-            WgpuDevice::new().expect("a second wgpu device"),
-        ),
-    ));
     for (seed, format) in loader_formats().into_iter().enumerate() {
         let owner = Arc::new(poot_test_util::packed::prescribed_scale_payload(
             format,
@@ -1056,7 +1371,7 @@ fn a_packed_gemv_epilogue_agrees_with_the_unfused_program_on_wgpu() {
         let (head_graph, head_x, _) = build(false);
         let mut head_inputs = carriers(&head_graph, &owner);
         head_inputs.insert(head_x, activation.clone().into());
-        let head = run_dense_activation(&mut *exec, target, &head_graph, &head_inputs, false);
+        let head = run_dense_activation(&mut *exec, target, &head_graph, &head_inputs);
         let head_scale = head.iter().fold(0.0f32, |m, v| m.max(v.abs()));
 
         let (graph, x, leaves) = build(true);
@@ -1091,14 +1406,7 @@ fn a_packed_gemv_epilogue_agrees_with_the_unfused_program_on_wgpu() {
                 residual,
                 HostTensor::f32(vec![1, OUT], residual_values.clone()).into(),
             );
-            let fused = run_dense_activation(&mut *exec, target, &graph, &inputs, false);
-            let unfused = run_dense_activation(&mut *hung, target, &graph, &inputs, true);
-            assert_close(
-                &fused,
-                &unfused,
-                1e-5,
-                &format!("{what} {label}: fused vs unfused"),
-            );
+            let fused = run_dense_activation(&mut *exec, target, &graph, &inputs);
             let oracle = poot_eval::eval(
                 &graph,
                 &inputs,

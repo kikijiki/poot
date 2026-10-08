@@ -293,6 +293,7 @@ impl Context {
             tensor_core,
             known_miscompiles,
             compute_units,
+            memory_budget_bytes: None,
         };
 
         Ok(Context {

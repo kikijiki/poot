@@ -3,15 +3,18 @@
 //! `in_proj` splits into the output gate `z`, the conv input `xBC` and the timestep `dt`; a causal
 //! depthwise conv ([`super::conv`]) and SiLU run over `xBC` (the SSM input `x` and the grouped `B`
 //! and `C` together), `Delta = softplus(dt + dt_bias)`, and the SSD recurrence runs per head with
-//! the decay `A = -exp(A_log)` ([`ops::mamba2_ssd_prefill`], which takes a carried state and so
-//! continues the previous chunk exactly: one token is a decode step). The output is the gated
+//! the decay `A = -exp(A_log)` (the [`ScanFamily::Ssd`] scan, whose reference definition runs
+//! [`ops::mamba2_ssd_prefill`] per chunk, each continuing the previous chunk's state exactly: one token is a
+//! decode step). The output is the gated
 //! RMSNorm `rmsnorm(y * silu(z), scale)` and the output projection.
 //!
 //! The step carries two recurrent states per layer: the conv window and the SSM state `[rows,
 //! heads, state, head_dim]`. The `rows` sequences of a step fold into the head axis of the SSD
 //! op (heads of different rows share the weights but not the state).
 
-use poot_graph_ir::{BinOp, Builder, StateRole, TensorType, Traced, UnOp, ops};
+use poot_graph_ir::{
+    BinOp, Builder, ScanAttrs, ScanFamily, ScanResult, StateRole, TensorType, Traced, UnOp, ops,
+};
 use poot_quant::weights::{Mamba2Role, WeightId, WeightMap, WeightRole};
 
 use super::conv::{ConvParams, ConvWeights, causal_conv};
@@ -19,6 +22,11 @@ use super::linear::{Weight, WeightError, linear};
 use super::norm::{NormParams, norm};
 use super::standard::{ParamError, Step};
 use crate::model::ConfigReason;
+
+/// The chunk length of the SSD scan's reference decomposition (a power of two): a sequence of at most this
+/// many positions is one [`ops::mamba2_ssd_prefill`] call, a longer one is cut into chunks that each continue
+/// from the previous one's state. A device schedule is free to differ.
+const SSD_CHUNK: usize = 64;
 
 /// Checked Mamba2 parameters.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -193,25 +201,24 @@ pub fn mamba2(
         TensorType::f32(vec![rows, h, n, hd]),
         StateRole::Recurrent,
     );
-    let tril = {
-        let ramp = b.iota(t);
-        let ge = b.binary(
-            BinOp::Ge,
-            b.broadcast(b.reshape(ramp, vec![t, 1]), vec![t, t]),
-            b.broadcast(b.reshape(ramp, vec![1, t]), vec![t, t]),
-        );
-        b.broadcast(b.reshape(ge, vec![1, 1, t, t]), vec![1, rows * h, t, t])
-    };
-    let (y, state_out) = ops::mamba2_ssd_prefill(
-        b,
-        fold(x_heads),
-        fold(b_heads),
-        fold(c_heads),
-        fold(delta),
-        per_head(&w.a_log, true),
-        per_head(&w.d, false),
-        fold(state),
-        tril,
+    let ScanResult {
+        y,
+        s_out: state_out,
+        ..
+    } = b.scan(
+        ScanAttrs {
+            family: ScanFamily::Ssd,
+            chunk: SSD_CHUNK,
+        },
+        &[
+            fold(x_heads),
+            fold(b_heads),
+            fold(c_heads),
+            fold(delta),
+            per_head(&w.a_log, true),
+            per_head(&w.d, false),
+            fold(state),
+        ],
     );
     step.carry(state, b.reshape(state_out, vec![rows, h, n, hd]));
 

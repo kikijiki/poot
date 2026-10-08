@@ -2,8 +2,9 @@
 
 An OpenAI-compatible HTTP server.
 
-It serves embeddings and reranking for BERT-class encoders, with request parsing and bounds, metrics, LoRA
-administration and graceful shutdown. The completion endpoints validate and bound requests; see
+It loads any registered model as a `ModelHandle`, with request parsing and bounds, metrics and graceful
+shutdown, and serves completions and chat from one scheduling loop over the driver's `step`. Embeddings,
+rerank and LoRA administration return a typed `503` until they are restored; see
 [serving](../../website/docs/serve/index.md) for what each endpoint does.
 
 ## Quick start
@@ -16,10 +17,13 @@ cargo run -p poot-serve --release -- /path/to/model 127.0.0.1:8080
 
 - Positional: `[MODEL_DIR] [ADDR]`. `ADDR` defaults to `127.0.0.1:8080`. Without `MODEL_DIR` the model is
   `qwen2.5-0.5b` under the `POOT_MODELS_DIR` directory; with neither, startup fails naming the variable.
-- `--lora-adapter NAME=DIR` - repeatable; registers a PEFT adapter at startup
-- `--lora-pool-capacity N` - LoRA pool slots to provision for later hot-loads
+- `--backend wgpu|rocm|ptx|vulkan|auto` (default `auto`) - the device. `auto` opens PTX if a CUDA device opens,
+  else ROCm if an HSA GPU agent opens, else wgpu, once; a model the chosen backend refuses fails startup and no
+  other backend is tried.
 
-Any other `--` option fails startup with an `unknown option` error.
+Any other `--` option is refused at startup. `GET /health` is `503` (`starting`) until the engine plan is
+prepared and `200` (`serving`, with `backend`, `rows`, `max_seq`) after; `503` `draining` during shutdown and `503` `dead`
+(with `cause` and `reason`) once the engine thread has ended.
 
 ## Environment variables
 
@@ -47,8 +51,9 @@ Any other `--` option fails startup with an `unknown option` error.
 - `GET /metrics` - JSON metrics
 - `GET /metrics/prometheus` - Prometheus exposition format
 
-`src/batch/` holds the scheduling pieces: slot admission, KV-fit budgeting, recompute preemption, token commit and
-terminal delivery.
+`src/batch/` holds the scheduling loop (`engine.rs`), the per-step prefill budget, token commit and terminal
+delivery. A request's KV blocks are reserved when it opens, so nothing is preempted: a request that finds no
+room waits.
 
 ## Graceful shutdown
 
@@ -58,4 +63,4 @@ lets in-flight requests finish before exiting.
 ## Models
 
 Pass a `.gguf` file path or a safetensors directory. A BERT encoder or cross-encoder loads as such; anything
-else loads as a causal decoder `Runner`.
+else loads as a causal decoder through the driver.

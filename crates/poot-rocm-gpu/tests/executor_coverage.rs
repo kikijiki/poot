@@ -332,13 +332,13 @@ fn a_one_dispatch_grid_past_255_workgroups_matches_the_oracle_on_rocm() {
 /// zero-point source); the AWQ rows go red (the swapped component has the wrong length, so `add_entry`
 /// refuses it).
 #[test]
-fn packed_linears_and_the_canonical_expert_chain_match_the_oracle_on_rocm() {
+fn packed_linears_and_the_indexed_expert_contraction_match_the_oracle_on_rocm() {
     let Some((mut exec, target)) = rocm() else {
         return;
     };
     let fixtures = poot_executor_parity::packed::packed_linear_fixtures()
         .into_iter()
-        .chain(poot_executor_parity::packed::packed_chain_fixtures());
+        .chain(poot_executor_parity::packed::packed_expert_fixtures());
     for fixture in fixtures {
         let expected = oracle_for(&fixture.graph, &fixture.store)(&fixture.steps[0]);
         let largest = expected
@@ -444,7 +444,7 @@ fn chunked_gdn_prefill_matches_the_sequential_recurrence_on_rocm() {
 /// embedding), traced for one decode token, its weights bound by const name as stored (bf16 words
 /// for the projections), and one decode step per prompt token.
 fn qwen05b_fixture(checkpoint: &std::path::Path, prompt: &[u32]) -> Fixture {
-    use poot_executor_parity::dense::{const_named_store, plain, step};
+    use poot_executor_parity::dense::{const_named_weights, plain, step};
     use poot_executor_parity::weight_map::MappedModel;
     use poot_models::model::{LogitRows, Phase};
     use poot_models::registry::{RawConfig, Registry};
@@ -481,7 +481,7 @@ fn qwen05b_fixture(checkpoint: &std::path::Path, prompt: &[u32]) -> Fixture {
             .trace(Phase::Decode, step(1, 1, CAP, LogitRows::Last))
             .unwrap(),
     );
-    let store = const_named_store(&mapped, &graph);
+    let (store, _) = const_named_weights(&mapped, &graph);
 
     let slot = |wanted: poot_graph_ir::Slot| {
         graph
@@ -511,7 +511,6 @@ fn qwen05b_fixture(checkpoint: &std::path::Path, prompt: &[u32]) -> Fixture {
         graph,
         store,
         steps,
-        guarded: false,
     }
 }
 

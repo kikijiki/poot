@@ -31,7 +31,6 @@ fn matmul_fixture(name: &'static str, m: usize, k: usize, n: usize) -> Fixture {
         graph,
         store,
         steps,
-        guarded: false,
     }
 }
 
@@ -96,7 +95,6 @@ fn wmma_fixture(name: &'static str, s: usize) -> Fixture {
         graph,
         store,
         steps,
-        guarded: false,
     }
 }
 
@@ -178,7 +176,6 @@ fn wmma_batched_fixture(name: &'static str, operand: DType) -> Fixture {
         graph,
         store: store_from_tensors(vec![("w", tensor)]),
         steps,
-        guarded: false,
     }
 }
 
@@ -232,6 +229,5 @@ pub fn wide_grid_fixture() -> Fixture {
         graph,
         store: store_from_tensors(Vec::new()),
         steps,
-        guarded: false,
     }
 }

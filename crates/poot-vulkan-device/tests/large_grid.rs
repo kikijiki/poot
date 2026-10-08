@@ -65,10 +65,7 @@ fn flash_prefill_over_65535_workgroups_is_one_wide_dispatch_and_matches_the_orac
     let program = compile(
         &graph,
         &target,
-        &CompileOptions {
-            execution: Submission::Replay,
-            limits: CompileLimits::STANDARD,
-        },
+        &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
     )
     .expect("the flash prefill compiles for this device");
     let widest = program

@@ -4,6 +4,7 @@
 //! `load_weights`/`add_entry`/`step` (or `poot_executor_parity::run_once` for the one-shot graph),
 //! comparing against an independent CPU reference.
 
+use poot_test_util::const_weights::ConstWeights;
 use std::sync::Arc;
 
 use poot_executor::{Device, Engine, Executor, NoSync, StepInputs};
@@ -45,10 +46,7 @@ fn staged(g: &Graph<ValidationOutputs>, target: Target) -> StagedProgram<Validat
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions {
-            execution: Submission::Replay,
-            limits: poot_graph_plan::CompileLimits::STANDARD,
-        },
+        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
     )
     .unwrap()
 }
@@ -73,7 +71,15 @@ fn packed_linear_case(
     let y = packed_linear(&b, x, "layer", owner.weight(), None, None)
         .unwrap_or_else(|e| panic!("{format:?} K={k} N={n} M={m}: packed_linear: {e}"));
     let compiled = b.finish(y).with_validations(Vec::new());
-    let staged = staged(&compiled, target);
+    let store = {
+        let mut builder = WeightStore::builder();
+        builder
+            .insert("layer", WeightEntry::Packed(Arc::clone(&owner)))
+            .unwrap();
+        builder.build()
+    };
+    let (named, map) = ConstWeights::bind(&compiled, &store);
+    let staged = staged(&named, target);
     assert!(
         staged
             .stages()
@@ -85,16 +91,7 @@ fn packed_linear_case(
         "{format:?} K={k} N={n} M={m}: compile should claim the packed linear"
     );
 
-    let store = {
-        let mut builder = WeightStore::builder();
-        builder
-            .insert("layer", WeightEntry::Packed(Arc::clone(&owner)))
-            .unwrap();
-        builder.build()
-    };
-    let exe = engine
-        .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let exe = engine.load_weights(Arc::new(store), Arc::new(map)).unwrap();
     let entry = engine.add_entry(exe, &staged).unwrap();
 
     let x_id = compiled
@@ -206,8 +203,6 @@ fn wgpu_q6k_gemv_determinism_probe() {
     let y = packed_linear(&b, x, "layer", owner.weight(), None, None)
         .expect("Q6_K packed_linear at the GEMV shape");
     let compiled = b.finish(y).with_validations(Vec::new());
-    let staged = staged(&compiled, target);
-
     let store = {
         let mut builder = WeightStore::builder();
         builder
@@ -215,9 +210,10 @@ fn wgpu_q6k_gemv_determinism_probe() {
             .unwrap();
         builder.build()
     };
-    let exe = engine
-        .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (named, map) = ConstWeights::bind(&compiled, &store);
+    let staged = staged(&named, target);
+
+    let exe = engine.load_weights(Arc::new(store), Arc::new(map)).unwrap();
     let entry = engine.add_entry(exe, &staged).unwrap();
 
     let x_id = compiled

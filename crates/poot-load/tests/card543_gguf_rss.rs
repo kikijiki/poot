@@ -1,8 +1,8 @@
 //! Card 543 SC-001 (the GGUF loader RSS gate): reading a real Q4_K_M or Q8_0 GGUF through
 //! [`poot_load::gguf::read_gguf`] alone peaks at no more than 1.3x the file size in host RSS.
 //! `read_gguf` range-reads each tensor's own bytes into a [`poot_quant::weights::WeightStore`] with
-//! no widening (card 543); this proves that at the reader itself. The Runner-level row
-//! (`Runner::load_gguf`, packed storage end to end) is `poot-llm/tests/card545a_gguf_load_rss.rs`.
+//! no widening (card 543); this proves that at the reader itself. The driver-level row
+//! (the GGUF load, packed storage end to end) is `poot-llm/tests/card545a_gguf_load_rss.rs`.
 //!
 //! Mutation (recorded here, never left in the tree; `crates/poot-load/src/gguf.rs`, `read_gguf`):
 //! reading the whole file into a buffer kept alive for the whole scan, alongside every range-read
@@ -55,7 +55,7 @@ fn assert_read_gguf_peaks_under_1_3x_file_size(path: &std::path::Path) {
 }
 
 /// Runs `assert_read_gguf_peaks_under_1_3x_file_size` in a freshly spawned copy of this test binary
-/// (a clean RSS baseline), as `card540b_rss_gate.rs` does for the Runner-level M4 gate.
+/// (a clean RSS baseline), as `card540b_rss_gate.rs` does for the driver-level M4 gate.
 fn run_in_fresh_process(child_env: &str, test_name: &str, checkpoint: poot_test_util::Checkpoint) {
     let Some(path) = poot_test_util::model_path(checkpoint) else {
         return;

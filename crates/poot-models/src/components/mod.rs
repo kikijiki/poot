@@ -10,13 +10,16 @@ pub mod dims;
 pub mod dsa;
 pub mod embed;
 pub mod ffn;
+pub mod gdn;
 pub mod head;
-mod kv_pool;
+pub mod kda;
 pub mod linear;
 pub mod mamba2;
+pub mod mhc;
 pub mod mla;
 pub mod moe;
 pub mod norm;
+pub mod ple;
 pub mod rope;
 pub mod router;
 pub(crate) mod sparse_top_k;
@@ -24,5 +27,3 @@ pub mod standard;
 #[cfg(test)]
 pub(crate) mod testing;
 pub mod witness;
-
-pub use kv_pool::*;

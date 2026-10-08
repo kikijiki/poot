@@ -129,7 +129,6 @@ pub fn gdn_prefill_chunked_case() -> GdnChunkedCase {
             graph,
             store,
             steps,
-            guarded: false,
         },
         inputs: calls,
     }

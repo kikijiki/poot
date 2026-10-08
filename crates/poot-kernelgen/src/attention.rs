@@ -184,23 +184,23 @@ fn validate(spec: &AttentionSpec) -> Result<usize, KernelGenError> {
     Ok(lanes)
 }
 
-fn f32_array(len: usize) -> WorkgroupLocalDecl {
+pub(crate) fn f32_array(len: usize) -> WorkgroupLocalDecl {
     WorkgroupLocalDecl {
         elem_ty: Ty::F32,
         len: len as u32,
     }
 }
 
-fn f32c(value: f32) -> Operand {
+pub(crate) fn f32c(value: f32) -> Operand {
     Operand::Const(Constant::F32(value))
 }
 
-fn local_op(local: poot_kernel_ir::Local) -> Operand {
+pub(crate) fn local_op(local: poot_kernel_ir::Local) -> Operand {
     copy_local(local)
 }
 
 /// A usize `a op b` of two locals.
-fn ubin(
+pub(crate) fn ubin(
     c: &mut Cfg,
     op: BinOp,
     a: poot_kernel_ir::Local,
@@ -210,12 +210,17 @@ fn ubin(
 }
 
 /// A usize `a op n`.
-fn uc(c: &mut Cfg, op: BinOp, a: poot_kernel_ir::Local, n: usize) -> poot_kernel_ir::Local {
+pub(crate) fn uc(
+    c: &mut Cfg,
+    op: BinOp,
+    a: poot_kernel_ir::Local,
+    n: usize,
+) -> poot_kernel_ir::Local {
     c.bin(Ty::Usize, op, local_op(a), cu(n))
 }
 
 /// An f32 `a op b` of two locals.
-fn fbin(
+pub(crate) fn fbin(
     c: &mut Cfg,
     op: BinOp,
     a: poot_kernel_ir::Local,
@@ -228,22 +233,26 @@ fn exp(c: &mut Cfg, x: poot_kernel_ir::Local) -> poot_kernel_ir::Local {
     c.let_(Ty::F32, Rvalue::MathUnary(MathOp::Exp, local_op(x)))
 }
 
-fn lds_read(c: &mut Cfg, array: u8, idx: poot_kernel_ir::Local) -> poot_kernel_ir::Local {
+pub(crate) fn lds_read(
+    c: &mut Cfg,
+    array: u8,
+    idx: poot_kernel_ir::Local,
+) -> poot_kernel_ir::Local {
     c.emit(|e| e.read_lds(Ty::F32, array, local_op(idx)))
 }
 
-fn lds_write(c: &mut Cfg, array: u8, idx: poot_kernel_ir::Local, value: Operand) {
+pub(crate) fn lds_write(c: &mut Cfg, array: u8, idx: poot_kernel_ir::Local, value: Operand) {
     c.emit(|e| e.write_lds(array, local_op(idx), value));
 }
 
 /// `var <- var + 1`.
-fn bump(c: &mut Cfg, var: poot_kernel_ir::Local, by: usize) {
+pub(crate) fn bump(c: &mut Cfg, var: poot_kernel_ir::Local, by: usize) {
     let next = uc(c, BinOp::Add, var, by);
     c.assign(Place::local(var), Rvalue::Use(local_op(next)));
 }
 
 /// `while counter < end { body; counter += step }` over a fresh usize counter starting at `start`.
-fn count(
+pub(crate) fn count(
     c: &mut Cfg,
     start: Operand,
     end: usize,
@@ -254,7 +263,7 @@ fn count(
 }
 
 /// [`count`] with an end known only at run time.
-fn count_to(
+pub(crate) fn count_to(
     c: &mut Cfg,
     start: Operand,
     end: Operand,

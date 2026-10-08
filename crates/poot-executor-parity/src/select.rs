@@ -11,10 +11,11 @@ use poot_executor::Executor;
 use poot_graph_ir::op::FusedOp;
 use poot_graph_ir::{Builder, OpKind, Slot, TensorType, Traced, UnOp};
 use poot_graph_plan::{Submission, Target};
-use poot_quant::weights::WeightStore;
+use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::{DType, HostTensor};
 use poot_test_util::StepFixture;
 use poot_test_util::weight_map_oracle::oracle_for;
+use std::sync::Arc;
 
 use crate::Fixture;
 
@@ -117,7 +118,6 @@ fn slot_fixture(
         graph,
         store: WeightStore::builder().build(),
         steps,
-        guarded: false,
     }
 }
 
@@ -222,6 +222,193 @@ fn check_lowering(fixture: &Fixture, target: Target) -> Result<(), String> {
             fixture.name,
             (plain, fused)
         ))
+    }
+}
+
+/// The words of one two-byte float layout that a select must carry unchanged.
+struct HalfWords {
+    quiet_nan_payload: u16,
+    signaling_nan: u16,
+    negative_nan_payload: u16,
+    positive_infinity: u16,
+    negative_infinity: u16,
+    negative_zero: u16,
+    one: u16,
+    three: u16,
+    five: u16,
+    seven: u16,
+}
+
+impl HalfWords {
+    fn of(dtype: DType) -> Self {
+        match dtype {
+            DType::BF16 => Self {
+                quiet_nan_payload: 0x7FC1,
+                signaling_nan: 0x7F81,
+                negative_nan_payload: 0xFFC3,
+                positive_infinity: 0x7F80,
+                negative_infinity: 0xFF80,
+                negative_zero: 0x8000,
+                one: 0x3F80,
+                three: 0x4040,
+                five: 0x40A0,
+                seven: 0x40E0,
+            },
+            _ => Self {
+                quiet_nan_payload: 0x7E01,
+                signaling_nan: 0x7C01,
+                negative_nan_payload: 0xFE03,
+                positive_infinity: 0x7C00,
+                negative_infinity: 0xFC00,
+                negative_zero: 0x8000,
+                one: 0x3C00,
+                three: 0x4200,
+                five: 0x4500,
+                seven: 0x4700,
+            },
+        }
+    }
+
+    /// `(if_true, if_false, expected)` for [`CONDITION`], the same lane plan as the F32 table: every NaN,
+    /// infinity and `-0.0` appears once in a selected branch and once in an unselected one.
+    fn table(&self) -> ([u16; 8], [u16; 8], [u16; 8]) {
+        let if_true = [
+            self.quiet_nan_payload,
+            self.one,
+            self.positive_infinity,
+            self.negative_zero,
+            self.five,
+            self.negative_infinity,
+            self.signaling_nan,
+            self.negative_nan_payload,
+        ];
+        let if_false = [
+            self.three,
+            self.signaling_nan,
+            self.seven,
+            self.negative_nan_payload,
+            self.negative_zero,
+            self.quiet_nan_payload,
+            self.positive_infinity,
+            self.negative_infinity,
+        ];
+        let expected = [
+            self.quiet_nan_payload,
+            self.signaling_nan,
+            self.positive_infinity,
+            self.negative_zero,
+            self.negative_zero,
+            self.negative_infinity,
+            self.positive_infinity,
+            self.negative_nan_payload,
+        ];
+        (if_true, if_false, expected)
+    }
+}
+
+/// A BF16 and an F16 select over [`HalfWords`], each with its dtype's expected output words. The branches are
+/// constants (a slot has no two-byte lane to bind); the condition is a runtime slot, so the select stays on the
+/// device whatever the planner folds.
+fn two_byte_cases() -> Vec<(Fixture, Vec<u16>)> {
+    [DType::BF16, DType::F16]
+        .into_iter()
+        .map(|dtype| {
+            let (if_true, if_false, expected) = HalfWords::of(dtype).table();
+            let name = match dtype {
+                DType::BF16 => "select_bf16_poisoned",
+                _ => "select_f16_poisoned",
+            };
+            let n = CONDITION.len();
+            let b = Builder::new();
+            let cond = b.slot_named(Slot::Token, "cond", TensorType::new(vec![n], DType::I32));
+            let on = b.constant("if_true", TensorType::new(vec![n], dtype));
+            let off = b.constant("if_false", TensorType::new(vec![n], dtype));
+            let selected = b.select(cond, on, off);
+            let graph = b.finish(selected);
+            let bytes = |words: &[u16]| -> Arc<[u8]> {
+                words.iter().flat_map(|w| w.to_le_bytes()).collect()
+            };
+            let mut store = WeightStore::builder();
+            for (key, words) in [("if_true", if_true), ("if_false", if_false)] {
+                let dense = DenseWeight::try_new(dtype, vec![n], bytes(&words))
+                    .expect("a two-byte dense weight");
+                store
+                    .insert(key.to_owned(), WeightEntry::Dense(dense))
+                    .expect("a fresh key");
+            }
+            let key = graph
+                .meta(cond.id)
+                .slot_key()
+                .expect("a slot input has a key")
+                .clone();
+            let step = || {
+                vec![StepFixture {
+                    key: key.clone(),
+                    tensor: HostTensor::i32(vec![n], CONDITION.to_vec()),
+                }]
+            };
+            let fixture = Fixture {
+                name,
+                graph,
+                store: store.build(),
+                steps: vec![step(), step()],
+            };
+            (fixture, expected.to_vec())
+        })
+        .collect()
+}
+
+/// A BF16 and an F16 select on a device with a native two-byte lane: the oracle's and the device's output
+/// words equal the hand-written ones, bit for bit. A signaling NaN, NaN payloads, infinities and `-0.0` in
+/// the selected branch pass through (a trip through F32 would quiet the signaling NaN), and the same values
+/// in the unselected branch stay out.
+pub fn assert_two_byte_select_is_bitwise(exec: &mut dyn Executor, target: Target) {
+    let mut failures = Vec::new();
+    for (fixture, expected) in &two_byte_cases() {
+        let check = |who: &str, got: &HostTensor| match got.as_half() {
+            Some(words) if words == expected.as_slice() => None,
+            Some(words) => Some(format!(
+                "{}: {who} words {words:#06x?}, want {expected:#06x?}",
+                fixture.name
+            )),
+            None => Some(format!("{}: {who} is not a two-byte float", fixture.name)),
+        };
+        let oracle = oracle_for(&fixture.graph, &fixture.store)(&fixture.steps[0]);
+        failures.extend(check("oracle", &oracle));
+        match crate::run_outputs(exec, target, fixture) {
+            Ok(got) => failures.extend(check("device", &got[0])),
+            Err(error) => failures.push(format!("{}: device run: {error}", fixture.name)),
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A BF16 and an F16 select on a target with no native two-byte lane (SPIR-V) is refused at planning with
+/// the typed `DtypeLowering` on the `Select`, never lowered through a lane that would convert the words.
+pub fn assert_two_byte_select_is_refused(target: Target) {
+    use poot_graph_plan::{Capability, CompileError, PlanError};
+    for (fixture, _) in &two_byte_cases() {
+        let refused = poot_graph_plan::compile(
+            &fixture.graph,
+            &target,
+            &poot_graph_plan::CompileOptions::new(
+                Submission::Replay,
+                poot_graph_plan::CompileLimits::STANDARD,
+            ),
+        );
+        let Err(CompileError::Plan(error)) = refused else {
+            panic!("{}: the two-byte select must be refused", fixture.name);
+        };
+        let PlanError::Refused(refusal) = *error else {
+            panic!("{}: expected a typed refusal, got {error:?}", fixture.name);
+        };
+        assert_eq!(
+            refusal.missing,
+            Capability::DtypeLowering,
+            "{}",
+            fixture.name
+        );
+        assert!(matches!(refusal.op, OpKind::Select), "{}", fixture.name);
     }
 }
 

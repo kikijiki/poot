@@ -73,6 +73,19 @@ pub struct Dispatch<'a, D: Device + ?Sized> {
     pub work: u64,
 }
 
+/// What a device does with a weight's bytes when the engine uploads it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WeightUpload {
+    /// The engine reads the weight from the store, encodes it into the planned lane and writes it.
+    #[default]
+    Bytes,
+    /// The device only sizes the weight: the engine allocates its buffer from the shape (or the stored length
+    /// of a packed source) and never reads, encodes or writes the bytes. For a device that records
+    /// allocations to plan a footprint and executes nothing. The checks that need the bytes (a non-finite
+    /// packed-F16 element) are the executing upload's; the dtype and lane checks run in both modes.
+    SizeOnly,
+}
+
 /// One backend's mechanism below the executor contract (dexec 3.1). Every method is a scoped
 /// transaction's primitive; the engine (`crate::Engine`) owns the transaction itself: it calls
 /// [`Device::abort`] on any failure of `begin`/`dispatch`/`copy`/`finish`, exactly once, and never
@@ -88,10 +101,24 @@ pub trait Device {
 
     fn target(&self) -> Target;
 
+    /// What this device does with weight bytes. Every executing device takes them; only a recording-only
+    /// planning device sizes them.
+    fn weight_upload(&self) -> WeightUpload {
+        WeightUpload::Bytes
+    }
+
     /// Live/peak bytes and allocation count by role, read from this device's own runtime counters
     /// (Card 547a: `Engine::stats().memory` reads this, not an engine-side tally over its own
     /// bookkeeping, so cross-backend equality is not equal by construction).
     fn memory(&self) -> Vec<(BufferRole, MemoryCounterSnapshot)>;
+
+    /// Device memory this process could still allocate right now, in bytes, read from the runtime when
+    /// asked (not cached from open). `None` where the runtime cannot say or the query failed: a
+    /// consumer treats that as an unknown budget, never as unlimited. The default is `None`, so a
+    /// device that cannot observe its memory says so by not overriding it.
+    fn free_memory_bytes(&self) -> Option<u64> {
+        None
+    }
 
     /// A zero-filled buffer holding `elems` native elements of `storage`.
     fn allocate(

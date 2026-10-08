@@ -151,10 +151,19 @@ pub(super) fn plan(
             }
         }
         OpKind::Select => {
-            // The condition leaf is an I32 word; the branches are I32 (exact-I32 form) or F32 (float form).
+            // The condition leaf is an I32 word; the branches are I32 (exact-I32 form), F32 or a two-byte
+            // float (float form). A two-byte branch is moved as stored, so it needs a native two-byte lane:
+            // SPIR-V has none (its BF16 and F16 values are packed words), so it keeps the typed refusal.
             let branch = match odt {
                 DType::I32 => kg::LeafTy::I32,
                 DType::F32 => kg::LeafTy::F32,
+                DType::BF16 | DType::F16 if backend != Backend::SpirvVulkan => {
+                    if odt == DType::BF16 {
+                        kg::LeafTy::BF16
+                    } else {
+                        kg::LeafTy::F16
+                    }
+                }
                 _ => return Err(site.refuse(Capability::DtypeLowering)),
             };
             let kernel = kg::FusedKernel {
@@ -357,6 +366,7 @@ pub(super) fn plan(
         | moe_ops!()
         | matmul_ops!()
         | attention_ops!()
+        | scan_ops!()
         | cast_ops!()
         | movement_ops!()
         | sampling_ops!() => unreachable!("plan_eqn routes only elementwise ops here"),

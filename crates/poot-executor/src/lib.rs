@@ -12,16 +12,18 @@ mod device;
 mod engine;
 mod error;
 mod lanes;
+mod shared_kernels;
 mod timing;
 
 pub use device::{
     Arg, BufferRole, Device, DeviceTime, Dispatch, DispatchDeviceTime, MeasuredDeviceTime,
-    MemoryCounterSnapshot,
+    MemoryCounterSnapshot, WeightUpload,
 };
 pub use engine::Engine;
 pub use error::{BindError, DeviceError, ExecError, LoadError};
 use poot_tensor::HostTensor;
 pub use poot_tensor::HostView;
+pub use shared_kernels::{SharedKernels, SharedKernelsMismatch};
 pub use timing::{DetailedTiming, DrainPolicy, TimingOptions};
 
 #[cfg(test)]
@@ -31,18 +33,6 @@ use poot_graph_ir::SlotKey;
 use poot_graph_plan::{StagedProgram, SyncId, TargetSet};
 use poot_quant::weights::{WeightMap, WeightStore};
 use std::sync::Arc;
-
-/// How an executable's graph consts bind to its store.
-#[derive(Clone, Debug)]
-pub enum WeightSource {
-    /// A `Model` graph: each weight const is a [`poot_quant::weights::WeightId::const_name`] (or a
-    /// packed source name over one), bound through the map's view to byte runs of store entries.
-    /// A const the map does not name is unbound, even when a store key equals its name.
-    Map(Arc<WeightMap>),
-    /// Name equality: a const binds the store entry its name equals (a packed source name, the
-    /// entry at its linear id). Held for the Runner's graphs until Card 739 deletes it.
-    ConstNames,
-}
 
 /// One executable (weights plus entries) inside one executor. Not a heap address: engine-owned,
 /// behind a typed handle (spike-546 F1 - an object-safe `Executor` cannot hand out a generic
@@ -140,6 +130,13 @@ pub struct ExecutorStats {
     pub recordings: u64,
     pub replays: u64,
     pub memory: Vec<(BufferRole, MemoryCounterSnapshot)>,
+    /// Bytes read from the weight store and encoded for upload, summed over every weight upload. A
+    /// [`WeightUpload::SizeOnly`] device reads none.
+    pub weight_bytes_read: u64,
+    /// Kernels this engine took through the kernel cache (a disk load or a codegen run), once per distinct
+    /// kernel. An engine built over [`SharedKernels`] does not count a kernel another engine of that
+    /// table already resolved.
+    pub kernels_resolved: u64,
     /// Bounded typed timing (Card 552): exact cumulative step/host/device-sum counters per entry,
     /// plus whatever per-dispatch detail the engine's [`TimingOptions`] retained. Never an
     /// append-only history; see [`poot_profile::TimingSnapshot`].
@@ -149,6 +146,10 @@ pub struct ExecutorStats {
 /// The object-safe executor the driver holds as `Box<dyn Executor>`.
 pub trait Executor {
     fn target_set(&self) -> TargetSet;
+    /// Device memory this executor's device could still allocate right now ([`Device::free_memory_bytes`]),
+    /// read live; `None` where the runtime cannot say. Admission asks again at each decision instead of
+    /// trusting the figure the device reported when it opened.
+    fn free_memory_bytes(&self) -> Option<u64>;
     /// A new executable over `store`, its consts bound by `weights`. Records both and uploads
     /// nothing: a weight's device lane is a per-program planning decision, so upload happens at
     /// `add_entry`, through the engine's residency map keyed by (store generation, stored byte
@@ -157,11 +158,14 @@ pub trait Executor {
     fn load_weights(
         &mut self,
         store: Arc<WeightStore>,
-        weights: WeightSource,
+        weights: Arc<WeightMap>,
     ) -> Result<ExecutableId, ExecError>;
-    /// Binds `program`'s consts to the store through the executable's [`WeightSource`], uploads
-    /// each stored byte run once per planned storage and store generation, fills a hosted embed
-    /// gather from the step's tokens, allocates or shares state by (name, aval, storage),
+    /// Binds `program`'s consts to the store through the executable's weight map (each weight const
+    /// is a [`poot_quant::weights::WeightId::const_name`], or a packed source name over one, bound
+    /// through the map's view to byte runs of store entries; a const the map does not name is
+    /// unbound, even when a store key equals its name), uploads each stored byte run once per
+    /// planned storage and store generation, fills a hosted embed gather from the step's tokens,
+    /// allocates or shares state by (name, aval, storage),
     /// and loads every plan. The entry records on its first `step`.
     fn add_entry(
         &mut self,

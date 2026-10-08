@@ -1,0 +1,36 @@
+---
+id: recurrence-scan
+title: Recurrence Scan
+sidebar_position: 14
+---
+
+# Recurrence Scan
+
+Gated delta rule (GDN) layers (Qwen3-Next, Qwen3.8) and Mamba2 layers (Nemotron-H) replace attention with a
+recurrence over the sequence: each token updates a per-head state matrix, and the state is carried from one
+step to the next. Prefill traced as primitive equations is one unrolled chunk body per chunk, so the graph grows
+with the prompt length.
+
+## One equation, one packed result
+
+The tracer emits a single `Scan` equation, of the `DeltaRule` or the `Ssd` family. An equation has one result,
+so the scan's result is one packed tensor `[1, H, L + S, W]`: the first `L` rows are the sequence output `y`,
+the following `S` rows are the carried state `s_out`. A typed layout names the two row ranges, and the builder
+returns `y` and `s_out` as slices of that one result. The state is published by pairing `s_out` with its input
+state, like any other carried state.
+
+The scan is defined by its decomposition into primitives: the chunked delta-rule chain, or the Mamba2 SSD run
+chunk by chunk, each chunk continuing from the previous chunk's state. The CPU oracle evaluates exactly that,
+one chunk window at a time, so it has no sequence-length ceiling. A device kernel is compared with it within the
+reassociating tolerance, every element of the output and of the state.
+
+## The schedule
+
+The planner records a generated schedule: one streaming kernel with a workgroup per head and column block, each
+lane owning one state column in workgroup memory. The loop over the sequence is a runtime loop, so the kernel
+and the graph stay the same size at every prompt length. When a device reports a bound on the work of one
+dispatch, the sequence is split into launches that each stay within it, handing the state on through the result.
+A state column that does not fit the device's workgroup memory is refused at plan time.
+
+The kernel is the streaming recurrence, so its time grows linearly with the prompt length. A chunk-parallel
+matrix form of the same recurrence was built and measured on wgpu and ROCm; it was no faster, so it was not kept.

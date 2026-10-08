@@ -50,9 +50,25 @@ test: test-model-free
 
 # the model-free gate: dead-pub and unused-dependency checks, the inventory and lane self-tests, device-probe
 # self-test, then every model-free test and doctest
-test-model-free: dead-pub machete cargo-freshness test-model-free-inventory
+test-model-free: dead-pub machete cargo-freshness test-model-free-inventory test-lane-coverage test-bench-runner
     scripts/with-required-backend.sh --self-test
     scripts/test-model-free.sh run
+
+# The bench runner's host tests, which the model-free lane cannot carry (its dependency on poot-llm turns the rocm
+# feature on for every poot-llm build in the same invocation). Devices and checkpoints are hidden and required
+# here exactly as in that lane. The recursion that once forked the box out of memory is removed at its root (a
+# backtick in a double-quoted string of the script executed this recipe); the script's POOT_MODEL_FREE_ACTIVE
+# re-entry guard is defence in depth, not the fix.
+test-bench-runner:
+    scripts/test-model-free.sh run-isolated {{isolated_package}}
+
+# Fail when a test runs in no lane. A test is covered when it is model-free or real-dims (the model-free lane), a
+# checkpoint test (`just test-optional` and the checkpoint recipes, with a model), or matched by one of the
+# selections above; a device test or a test of a package outside the inventory that matches none is the gap this
+# gate exists to close (card 1058: 155 of 239 poot-gpu tests once ran nowhere).
+test-lane-coverage:
+    scripts/check-lane-coverage.py --self-test
+    scripts/check-lane-coverage.py '{{wgpu_selection}}' '{{vulkan_selection}}' '{{rocm_selection}}' '{{ptx_selection}}' '{{kernels_selection}}' 'package({{isolated_package}})'
 
 # The add-a-model standing test (ADR-0104 rule 3), host half: a family defined inside the test (a config type, a
 # checkpoint-name table, a tracer over `standard_stack` and `standard_layer`) registers through the public
@@ -86,16 +102,22 @@ test-model-free-inventory:
     scripts/test-model-free.sh self-test
 
 # Run this after adding, renaming or deleting a test; a new test in a `reviewed` package (see `gate_policy` in
-# scripts/test-model-free.sh) then needs its class chosen by hand: model-free, or checkpoint-device.
+# scripts/test-model-free.sh) then needs its class chosen by hand: model-free, checkpoint or device.
 
 # rewrite scripts/test-model-free-inventory.tsv from the test binaries
 test-model-free-inventory-regen:
     scripts/test-model-free.sh regen
 
-# rewrite crates/poot-graph-plan/tests/plan_summary/*.tsv (the plan-summary gate, card 599); a card that
+# rewrite crates/poot-models/tests/plan_summary/*.tsv (the plan-summary gate, card 599); a card that
 # changes plans on purpose runs this and lists every changed line in its landing note
 test-plan-summary-regen:
-    POOT_PLAN_SUMMARY_REGEN=1 cargo nextest run -p poot-graph-plan --test plan_summary spirv_vulkan_plan_summary amd_gcn_plan_summary nvptx_plan_summary
+    POOT_PLAN_SUMMARY_REGEN=1 cargo nextest run -p poot-models --test plan_summary spirv_vulkan_plan_summary amd_gcn_plan_summary nvptx_plan_summary
+
+# rewrite the generated region of website/docs/reference/feature-matrix.md from what `compile` says about every
+# registered family's fixture graphs and every weight format on each reference target. The matrix test fails
+# when the page differs from the generator, so a planner or registry change that moves a cell runs this.
+feature-matrix-regen:
+    POOT_FEATURE_MATRIX_REGEN=1 cargo nextest run -p poot-models --test feature_matrix the_page_is_what_the_generator_renders
 
 # tests that build real model dimensions, in the release profile (too slow for the debug default lane)
 test-real-dims:
@@ -110,6 +132,25 @@ test-optional:
     POOT_MODELS_DIR={{models_dir}} cargo nextest run --workspace --lib --bins --tests --no-fail-fast --success-output final
     cargo test --workspace --doc
 
+# Device-lane selection. Each lane's nextest filterset is defined once, here, and used twice: by the lane
+# recipe, and by `test-lane-coverage`, which fails when a device test (or any test of a package the
+# model-free lane excludes) matches none of them. Select a device crate by `package(...)`, never by listing its
+# test binaries: a binary added later is then selected without anyone remembering to list it. The kernels lane
+# runs its two packages whole, so it has no filter.
+# A `package(...)` selection also runs that package's model-free tests (poot-runtime, poot-rocm-runtime), which
+# `just test` runs too: the repeat is harmless and costs seconds.
+wgpu_selection := 'package(poot-runtime) | (binary_id(=poot-llm) & test(/^driver::device_tests::[a-z_0-9]+_wgpu$/)) | (binary_id(=poot-llm::add_a_model) & test(/_wgpu$/)) | (binary_id(=poot-llm::speculate) & test(/_wgpu$/)) | binary_id(=poot-executor) | binary_id(=poot-executor::cr30_lifecycle) | package(poot-gpu) | binary_id(=poot-serve::bounded_drain_production) | (binary_id(=poot-serve::served_loop) & test(/_wgpu$/)) | test(/^prefill_kv_shared_pool_matches_contiguous$/) | test(/^qwen2_decode_gpu_matches_cpu$/)'
+vulkan_selection := 'package(poot-vulkan-runtime) | package(poot-vulkan-device)'
+rocm_selection := 'package(poot-rocm-runtime) | (binary_id(=poot-llm) & test(/^driver::device_tests::[a-z_0-9]+_rocm$/)) | (binary_id(=poot-llm::add_a_model) & test(/_rocm$/)) | package(poot-rocm-gpu) | (binary_id(=poot-llm::speculate) & test(/_rocm$/)) | binary_id(=poot-llm::card234_rocm_batched_decode_plan_classify) | (binary_id(=poot-serve::served_loop) & test(/_rocm$/))'
+# `captured_executor_facade` spawns `cargo rustdoc` and a Cargo fixture, which a device pod does not carry; it is
+# model-free and `just test` runs it, so the PTX lane excludes that binary by id.
+ptx_selection := '(binary_id(=poot-llm) & test(/^driver::device_tests::[a-z_0-9]+_ptx$/)) | (binary_id(=poot-llm::add_a_model) & test(/_ptx$/)) | (binary_id(=poot-llm::speculate) & test(/_ptx$/)) | (package(poot-ptx-gpu) & not binary_id(=poot-ptx-gpu::captured_executor_facade)) | package(poot-ptx-runtime) | test(/^(wmma_tile_dispatches_and_matches_cpu_on_ptx|attention_leading_true_inf_mask_dispatches_and_matches_cpu_on_ptx|attention_fixture_bank_matches_cpu_on_ptx|attention_split_key_and_live_bound_match_cpu_on_ptx)$/)'
+kernels_selection := 'package(pootc) | package(poot-kernelgen)'
+
+# poot-bench-runner builds poot-llm with the rocm feature, which cannot unify into the model-free lane, so
+# its host tests run in `test-bench-runner`.
+isolated_package := 'poot-bench-runner'
+
 # Required small-device lanes. Each runs through scripts/with-required-backend.sh, which clears the legacy
 # global and every backend-specific requirement, sets only its own, and fails the lane before any test runs
 # when no device of that backend is visible. The nextest group serializes inside this invocation only.
@@ -119,12 +160,13 @@ test-optional:
 # case in scripts/required-device-cases/<lane>.txt ran and passed - a skip never counts as a pass.
 
 # wgpu lane: the migrated executor-contract, packed serving/launch-widening, I32, state/capture, failure and
-# cache-identity cases; wgpu device required, then the required-case gate
+# cache-identity cases, and every poot-gpu test (a test no lane selects goes red silently); wgpu device required,
+# then the required-case gate
 test-device-wgpu:
     scripts/check-required-cases.py --self-test
     scripts/with-required-backend.sh POOT_REQUIRE_WGPU \
-        {{nextest}} --profile device-wgpu -p poot-gpu -p poot-executor -p poot-llm -p poot-runtime \
-        -E '(binary_id(=poot-runtime) & test(/^context::init::launch_caps_device_receipt::/)) | (binary_id(=poot-llm) & test(/^driver::device_tests::[a-z_0-9]+_wgpu$/)) | (binary_id(=poot-llm::add_a_model) & test(/_wgpu$/)) | (binary_id(=poot-llm::speculate) & test(/_wgpu$/)) | binary_id(=poot-executor) | binary_id(=poot-executor::cr30_lifecycle) | binary_id(=poot-gpu::executor_contract) | binary_id(=poot-gpu::weight_map_binding) | binary_id(=poot-gpu::packed_serving) | binary_id(=poot-gpu::packed_launch_widening) | binary_id(=poot-gpu::buffer_plan) | (binary_id(=poot-gpu) & test(/^imported_kernel_tests::/)) | (binary_id(=poot-gpu) & test(/^parity_tests::(((f16_|bf16_)?checkpoint_orientation_projection|alibi_slopes_attention)_matches_the_oracle(_and_the_reference)?_on_wgpu|bf16_const_cast_is_bit_exact_on_wgpu|select_is_bitwise_on_wgpu|packed_linears_and_the_canonical_expert_chain_match_the_oracle_on_wgpu)$/)) | (binary_id(=poot-gpu::graph) & test(/^dense_gemv::/)) | (binary_id(=poot-gpu::graph) & test(/^epilogue::/)) | (binary_id(=poot-gpu::graph) & test(/^(gemm::(indexed_matmul|routed_gate_weighting)|moe::moe_sparse_decode_with_separated)/)) | (binary_id(=poot-gpu::graph) & test(/^gather_scatter::i32_slot_gather_variants_compiled_match_cpu_bit_exact$/)) | (binary_id(=poot-gpu::graph) & test(/^flash::decomposed_prefill_attention_over_65535_query_groups_matches_cpu$/)) | (binary_id(=poot-gpu::graph) & test(/^flash::(gemma2_softcap_decode|deepseek_v2_mla_split_key_decode)_gpu_matches_cpu$/)) | (binary_id(=poot-gpu::validation) & test(/^wgpu_live_attention_/)) | (binary_id(=poot-gpu::cross_backend) & (test(/^sample_token_gumbel/) | test(=unary_tanh_erf_cross_backend))) | (binary_id(=poot-gpu::stress) & test(/^sliding_window_mask_from_pos_gpu_matches_cpu$/)) | test(/^prefill_kv_shared_pool_matches_contiguous$/) | test(/^qwen2_decode_gpu_matches_cpu$/)'
+        {{nextest}} --profile device-wgpu -p poot-gpu -p poot-executor -p poot-llm -p poot-runtime -p poot-serve \
+        -E '{{wgpu_selection}}'
     scripts/check-required-cases.py wgpu
 
 # The poot-executor rows this lane requires (cr30_lifecycle, kernel identity) also run in `just test`;
@@ -135,7 +177,7 @@ test-device-wgpu:
 test-device-kernels:
     scripts/check-required-cases.py --self-test
     scripts/with-required-backend.sh POOT_REQUIRE_WGPU \
-        {{nextest}} --profile device-kernels -p pootc -p poot-kernelgen --test-threads=1
+        {{nextest}} --profile device-kernels -p pootc -p poot-kernelgen --test-threads=1 -E '{{kernels_selection}}'
     scripts/check-required-cases.py kernels
 
 # raw Vulkan lane: the poot-vulkan-runtime add dispatch and live caps receipt, and the poot-vulkan-device executor
@@ -145,16 +187,17 @@ test-device-vulkan:
     scripts/check-required-cases.py --self-test
     scripts/with-required-backend.sh POOT_REQUIRE_VULKAN env POOT_VULKAN_VALIDATION=1 \
         {{nextest}} --profile device-vulkan -p poot-vulkan-runtime -p poot-vulkan-device \
-        -E '(binary_id(=poot-vulkan-runtime) & test(/^context::init::launch_caps_device_receipt::/)) | binary_id(=poot-vulkan-runtime::run_add) | binary_id(=poot-vulkan-runtime::device_caps) | binary_id(=poot-vulkan-device::parity) | binary_id(=poot-vulkan-device::executor_contract) | binary_id(=poot-vulkan-device::generate) | binary_id(=poot-vulkan-device::large_grid) | binary_id(=poot-vulkan-device::coopmat)'
+        -E '{{vulkan_selection}}'
     scripts/check-required-cases.py vulkan
 
 # ROCm lane: the migrated executor-contract, packed-serving and parity suites (card 548; the old
-# resident probes went with resident.rs), ROCm device required, then the required-case gate
+# resident probes went with resident.rs) and every poot-rocm-gpu test (a test no lane selects goes red silently),
+# ROCm device required, then the required-case gate
 test-device-rocm:
     scripts/check-required-cases.py --self-test
     scripts/with-required-backend.sh POOT_REQUIRE_ROCM \
-        {{nextest}} --profile device-rocm -p poot-rocm-gpu -p poot-llm -p poot-rocm-runtime --features poot-llm/rocm \
-        -E '(binary_id(=poot-rocm-runtime) & test(/^context::caps_tests::a_live_agent_reports_the_workgroup_ceiling_the_caps_document$/)) | (binary_id(=poot-rocm-runtime) & test(=tests::dispatch_refuses_malformed_geometry_before_reserving_a_slot)) | (binary_id(=poot-llm) & test(/^driver::device_tests::[a-z_0-9]+_rocm$/)) | (binary_id(=poot-llm::add_a_model) & test(/_rocm$/)) | binary_id(=poot-rocm-gpu::attention) | binary_id(=poot-rocm-gpu::executor_contract) | binary_id(=poot-rocm-gpu::executor_coverage) | binary_id(=poot-rocm-gpu::packed_serving) | binary_id(=poot-rocm-gpu::parity) | binary_id(=poot-rocm-gpu::buffer_plan) | binary_id(=poot-rocm-gpu::weight_map_binding) | binary_id(=poot-rocm-gpu::cross_backend) | binary_id(=poot-rocm-gpu::indexed_matmul) | binary_id(=poot-rocm-gpu::routed_prefill_unguarded) | (binary_id(=poot-llm::speculate) & test(/_rocm$/))'
+        {{nextest}} --profile device-rocm -p poot-rocm-gpu -p poot-llm -p poot-rocm-runtime -p poot-serve --features poot-llm/rocm \
+        -E '{{rocm_selection}}'
     scripts/check-required-cases.py rocm
 
 # The poot-llm tests that exist only under `--features rocm`. Nothing else builds the feature,
@@ -203,10 +246,10 @@ test-rocm-feature:
 
 # PTX lane: PTX implements the shared executor contract (card 549), so this mirrors the ROCm lane's own
 # packed-serving theme (the whole packed_serving.rs binary: resident, capture/replay, prefill, the
-# canonical packed-MoE chain, and packed row-gather), the card's own SC-001/002/004/006/007/009/010/011
+# indexed packed expert contraction, and packed row-gather), the card's own SC-001/002/004/006/007/009/010/011
 # acceptance rows (sc_acceptance.rs), the target-neutral matrix-fragment op's real NVPTX dispatch
 # (card 530), and the rest of the migrated device suite SC-008 names: launch widening (the widened-vs-
-# narrow Materialize/row-gather regression guard), the cross-backend elementwise/reduce/matmul/gather
+# narrow indexed-contraction/row-gather regression guard), the cross-backend elementwise/reduce/matmul/gather
 # parity suite (including its I32 index case, `gather_axis0_ptx_matches_cpu`), the Mixtral batched
 # shared-pool decode/prefill receipt, the fused Gemma2 GeGLU receipt, the batched LoRA decode receipt,
 # and (card 675) the Gumbel-max sampler's no-contract SC-001 - the committed production asset dispatched
@@ -218,14 +261,8 @@ test-rocm-feature:
 test-device-ptx:
     scripts/check-required-cases.py --self-test
     scripts/with-required-backend.sh POOT_REQUIRE_PTX \
-        {{nextest}} --profile device-ptx -p poot-ptx-gpu -p poot-kernelgen -p poot-llm \
-        -E '(binary_id(=poot-llm) & test(/^driver::device_tests::[a-z_0-9]+_ptx$/)) | (binary_id(=poot-llm::add_a_model) & test(/_ptx$/)) | (binary_id(=poot-llm::speculate) & test(/_ptx$/)) | binary_id(=poot-ptx-gpu::packed_serving) | binary_id(=poot-ptx-gpu::sc_acceptance) | \
-            binary_id(=poot-ptx-gpu::packed_launch_widening) | binary_id(=poot-ptx-gpu::cross_backend) | binary_id(=poot-ptx-gpu::indexed_matmul) | \
-            binary_id(=poot-ptx-gpu::gemma2_geglu_ptx) | \
-            binary_id(=poot-ptx-gpu::batched_lora_ptx) | binary_id(=poot-ptx-gpu::buffer_plan) | binary_id(=poot-ptx-gpu::device_caps_planning) | \
-            binary_id(=poot-ptx-gpu::sample_gumbel_no_contract) | binary_id(=poot-ptx-gpu::parity) | \
-            binary_id(=poot-ptx-gpu::weight_map_binding) | binary_id(=poot-ptx-gpu::live_attention) | binary_id(=poot-ptx-gpu::routed_prefill_unguarded) | \
-            test(/^(wmma_tile_dispatches_and_matches_cpu_on_ptx|attention_leading_true_inf_mask_dispatches_and_matches_cpu_on_ptx|attention_fixture_bank_matches_cpu_on_ptx|attention_split_key_and_live_bound_match_cpu_on_ptx)$/)'
+        {{nextest}} --profile device-ptx -p poot-ptx-gpu -p poot-ptx-runtime -p poot-kernelgen -p poot-llm \
+        -E '{{ptx_selection}}'
     scripts/check-required-cases.py ptx
 
 # Alias for the default GPU backend.
@@ -238,7 +275,7 @@ bench:
 
 # ---- mutation sampling (card 538, R486-015) ----------------------------------
 
-# recurring cargo-mutants sample on the high-survival modules 486 found (matcher, planner, eval, runner);
+# recurring cargo-mutants sample on the high-survival modules 486 found (matcher, planner, eval, sampler);
 # reports survivors under a dated Backstage receipt, does not make them die, and exits nonzero on any
 # survivor or a failed baseline. `module` is one of the names in scripts/mutation-sample.sh, or `all`.
 # Expect tens of minutes per module (cargo-mutants rebuilds and re-tests the crate once per mutant); `all`
@@ -341,6 +378,16 @@ site-check: _site-deps
     (cd website && bun run build) || rc=1
     echo "-- stale names (identifiers, variables, crates, paths, recipes, flags the code no longer has) --"
     scripts/site-stale-names.sh || rc=1
+    echo "-- card numbers (the site never names an internal card or board id) --"
+    card_rc=0
+    git grep -nIiP '\b(cards? #?[0-9]{3,4}[a-d]?|POOT-[0-9]+|POOT-ADR-[0-9]+)\b' -- website/docs website/src || card_rc=$?
+    if [ "$card_rc" -eq 0 ]; then
+        echo "internal card numbers found (see above) - the site holds user-facing truth only"
+        rc=1
+    elif [ "$card_rc" -ne 1 ]; then
+        echo "card-number scan failed with status $card_rc"
+        rc=1
+    fi
     echo "-- ascii (no em-dashes / non-ascii) --"
     ascii_rc=0
     git grep -nIP '[^\x00-\x7F]' -- website ':!website/bun.lock' || ascii_rc=$?

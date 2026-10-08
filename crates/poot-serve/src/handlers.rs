@@ -1,4 +1,5 @@
-//! Endpoint handlers for the Runner-backed decoder/encoder paths: completions, chat, streaming, embeddings, rerank.
+//! Endpoint handlers of the decoder paths: completions, chat and streaming. Each validates the request,
+//! submits a job to the one serving loop over the driver and turns its events into the response.
 
 use std::io::Write;
 use std::net::TcpStream;
@@ -7,8 +8,8 @@ use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use poot_llm::encoder::{CrossEncoderRunner, EncoderPooling, EncoderRunner};
-use poot_llm::{GenerationControl, Runner};
+use poot_llm::GenerationControl;
+use poot_llm::driver::ModelHandle;
 
 use crate::api::{
     ChatChoice, ChatReq, ChatResp, ChatRespMsg, Choice, CompletionReq, CompletionResp,
@@ -16,8 +17,8 @@ use crate::api::{
     clamp_n, logprobs_json, parse_tool_calls, resolve_lora_adapter, sampler_of,
     suppress_stream_usage, tool_call_stream_deltas,
 };
-use crate::http::{error_body, respond, respond_error};
-use crate::lifecycle::{require_engine, submit};
+use crate::http::{error_body, respond_error};
+use crate::lifecycle::{peer_closed, require_engine, submit};
 use crate::metrics::{InFlight, Metrics};
 use crate::types::{GenerationError, Job};
 /// Count only response-side transport failures. Explicit `Failed`, `Done`, and receiver cancellation are
@@ -119,14 +120,14 @@ pub(crate) fn require_stream_done<T>(
 pub(crate) fn stream_completion(
     stream: &mut TcpStream,
     engine: Option<&Sender<Job>>,
-    runner: &Runner,
+    handle: &ModelHandle,
     metrics: &Metrics,
     req: &CompletionReq,
 ) -> Result<()> {
     let _inflight = InFlight::enter(metrics);
     // Validate before sending the 200 + SSE headers: a bad `guided_json`/`guided_regex` or failed encode
     // must be a 400, not a 200 followed by a broken stream.
-    let prompt_tokens = match runner.encode(&req.prompt) {
+    let prompt_tokens = match handle.text().encode(&req.prompt) {
         Ok(t) => t.len(),
         Err(e) => {
             return respond_error(stream, 400, format_args!("{e:#}"), "invalid_request_error");
@@ -134,7 +135,7 @@ pub(crate) fn stream_completion(
     };
     let sampler = match apply_guided(
         sampler_of(&req.sampling),
-        runner,
+        handle,
         &req.guided_choice,
         &req.guided_regex,
         &req.guided_grammar,
@@ -149,7 +150,7 @@ pub(crate) fn stream_completion(
         }
     };
     // Acquire the `lora_adapter` lease before committing to the stream; an unknown name is a 400.
-    let lora_adapter = match resolve_lora_adapter(runner, &req.lora_adapter) {
+    let lora_adapter = match resolve_lora_adapter(handle, &req.lora_adapter) {
         Ok(lease) => lease,
         Err(e) => {
             return respond_error(stream, 400, format_args!("{e:#}"), "invalid_request_error");
@@ -173,6 +174,8 @@ pub(crate) fn stream_completion(
     // Hold back any pending stop-sequence suffix so the stop marker never leaks; `buf.hit` records a match.
     let mut buf = StreamStops::new(stops.clone());
     let mut full_text = String::new();
+    // A second handle on the socket, for the hang-up probe: the token closure owns the writes.
+    let probe = stream.try_clone().ok();
     let res = submit(
         tx,
         &req.prompt,
@@ -181,6 +184,7 @@ pub(crate) fn stream_completion(
         stops,
         true,
         lora_adapter,
+        &|| probe.as_ref().is_some_and(peer_closed),
         |piece, info| {
             let emit = buf.push(piece);
             if emit.is_empty() {
@@ -232,7 +236,7 @@ pub(crate) fn stream_completion(
         "choices": [{ "index": 0, "text": "", "finish_reason": finish }],
     });
     write_sse_data(stream, &final_chunk)?;
-    let completion_tokens = runner.token_count(&full_text).unwrap_or(0);
+    let completion_tokens = handle.text().token_count(&full_text).unwrap_or(0);
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
     let ttft_ms = ttft.map(|d| d.as_secs_f64() * 1000.0).unwrap_or(total_ms);
     // Record TTFT only when a token streamed.
@@ -375,181 +379,21 @@ impl StreamStops {
     }
 }
 
-/// Encode one embedding vector per OpenAI `encoding_format`: a JSON number array (`"float"`, default) or
-/// a base64 string of little-endian f32 bytes (`"base64"`). openai-python requests base64 by default.
-pub(crate) fn embedding_value(emb: &[f32], base64_fmt: bool) -> serde_json::Value {
-    if base64_fmt {
-        use base64::Engine;
-        let mut bytes = Vec::with_capacity(emb.len() * 4);
-        for f in emb {
-            bytes.extend_from_slice(&f.to_le_bytes());
-        }
-        serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(&bytes))
-    } else {
-        serde_json::json!(emb)
-    }
-}
-
-/// Resolve the encoder `/v1/embeddings` pooling override (poot extension): "mean"/"cls" (case-insensitive
-/// for cls) pick that mode; any other value or absent falls back to the model's `1_Pooling` mode.
-pub(crate) fn encoder_pooling_override(
-    req: Option<&str>,
-    model_default: EncoderPooling,
-) -> EncoderPooling {
-    match req {
-        Some(s) if s.eq_ignore_ascii_case("cls") => EncoderPooling::Cls,
-        Some(s) if s.eq_ignore_ascii_case("mean") => EncoderPooling::Mean,
-        _ => model_default,
-    }
-}
-
-/// `/v1/embeddings` on a BERT-class encoder: L2-normalized sentence embeddings via `EncoderRunner::embed`,
-/// same request/response shape as `handle_embeddings`. Runs on the connection thread's CPU eval.
-pub(crate) fn handle_embeddings_encoder(
-    stream: &mut TcpStream,
-    enc: &EncoderRunner,
-    metrics: &Metrics,
-    body: &str,
-) -> Result<()> {
-    #[derive(serde::Deserialize)]
-    #[serde(untagged)]
-    enum EmbedInput {
-        One(String),
-        Many(Vec<String>),
-    }
-    #[derive(serde::Deserialize)]
-    struct EmbedReq {
-        input: EmbedInput,
-        /// poot extension: override the encoder pooling, "mean" or "cls". Defaults to the model's `1_Pooling` mode.
-        #[serde(default)]
-        pooling: Option<String>,
-        /// OpenAI `encoding_format`: "float" (default) or "base64" (openai-python's default).
-        #[serde(default)]
-        encoding_format: Option<String>,
-    }
-    let req: EmbedReq = match serde_json::from_str(body) {
-        Ok(r) => r,
-        Err(e) => {
-            return respond_error(stream, 400, e, "invalid_request_error");
-        }
-    };
-    // Per-request pooling override, else the model's configured mode.
-    let pooling = encoder_pooling_override(req.pooling.as_deref(), enc.pooling());
-    let base64_fmt = req.encoding_format.as_deref() == Some("base64");
-    let inputs = match req.input {
-        EmbedInput::One(s) => vec![s],
-        EmbedInput::Many(v) => v,
-    };
-    let mut data = Vec::with_capacity(inputs.len());
-    let mut total_tokens = 0usize;
-    for (i, text) in inputs.iter().enumerate() {
-        match enc.embed_with(text, pooling) {
-            Ok(emb) => {
-                total_tokens += enc.token_count(text).unwrap_or(0);
-                data.push(serde_json::json!({ "object": "embedding", "index": i, "embedding": embedding_value(&emb, base64_fmt) }));
-            }
-            Err(e) => {
-                return respond_error(stream, 400, format_args!("{e:#}"), "invalid_request_error");
-            }
-        }
-    }
-    let resp = serde_json::json!({
-        "object": "list",
-        "data": data,
-        "model": metrics.model,
-        "usage": { "prompt_tokens": total_tokens, "total_tokens": total_tokens },
-    })
-    .to_string();
-    respond(stream, 200, &resp)
-}
-
-/// `POST /v1/rerank` on a BERT-class encoder: order `documents` by cosine similarity to `query` via
-/// `EncoderRunner::rerank`. Same response shape as `handle_rerank`.
-pub(crate) fn handle_rerank_encoder(
-    stream: &mut TcpStream,
-    enc: &EncoderRunner,
-    body: &str,
-) -> Result<()> {
-    #[derive(serde::Deserialize)]
-    struct RerankReq {
-        query: String,
-        documents: Vec<String>,
-        #[serde(default)]
-        top_n: Option<usize>,
-    }
-    let req: RerankReq = match serde_json::from_str(body) {
-        Ok(r) => r,
-        Err(e) => {
-            return respond_error(stream, 400, e, "invalid_request_error");
-        }
-    };
-    let docs: Vec<&str> = req.documents.iter().map(String::as_str).collect();
-    let ranked = match enc.rerank(&req.query, &docs) {
-        Ok(r) => r,
-        Err(e) => {
-            return respond_error(stream, 400, format_args!("{e:#}"), "invalid_request_error");
-        }
-    };
-    let n = req.top_n.unwrap_or(ranked.len()).min(ranked.len());
-    let results: Vec<_> = ranked[..n]
-        .iter()
-        .map(|&(index, score)| serde_json::json!({ "index": index, "relevance_score": score }))
-        .collect();
-    let resp = serde_json::json!({ "results": results }).to_string();
-    respond(stream, 200, &resp)
-}
-
-/// `POST /v1/rerank` on a cross-encoder: score each `documents` entry against `query` jointly through
-/// `BertForSequenceClassification`. Same response shape as `handle_rerank`; `relevance_score` is the raw
-/// classifier logit (higher is more relevant, not bounded to [0, 1]).
-pub(crate) fn handle_rerank_cross(
-    stream: &mut TcpStream,
-    ce: &CrossEncoderRunner,
-    body: &str,
-) -> Result<()> {
-    #[derive(serde::Deserialize)]
-    struct RerankReq {
-        query: String,
-        documents: Vec<String>,
-        #[serde(default)]
-        top_n: Option<usize>,
-    }
-    let req: RerankReq = match serde_json::from_str(body) {
-        Ok(r) => r,
-        Err(e) => {
-            return respond_error(stream, 400, e, "invalid_request_error");
-        }
-    };
-    let docs: Vec<&str> = req.documents.iter().map(String::as_str).collect();
-    let ranked = match ce.rerank(&req.query, &docs) {
-        Ok(r) => r,
-        Err(e) => {
-            return respond_error(stream, 400, format_args!("{e:#}"), "invalid_request_error");
-        }
-    };
-    let n = req.top_n.unwrap_or(ranked.len()).min(ranked.len());
-    let results: Vec<_> = ranked[..n]
-        .iter()
-        .map(|&(index, score)| serde_json::json!({ "index": index, "relevance_score": score }))
-        .collect();
-    let resp = serde_json::json!({ "results": results }).to_string();
-    respond(stream, 200, &resp)
-}
-
 /// `/v1/completions` (non-streaming): greedy-continue `prompt`, return the text (OpenAI text_completion).
 pub(crate) fn handle_completion(
     engine: Option<&Sender<Job>>,
-    runner: &Runner,
+    handle: &ModelHandle,
     metrics: &Metrics,
     req: &CompletionReq,
+    client_gone: &dyn Fn() -> bool,
 ) -> Result<String> {
     let _inflight = InFlight::enter(metrics);
     let start = Instant::now();
-    let prompt_len = runner.encode(&req.prompt)?.len();
+    let prompt_len = handle.text().encode(&req.prompt)?.len();
     let stops = Stop::list(&req.stop);
     let n = clamp_n(req.n);
     // Acquire once, outside the `n`-choices loop; every choice shares the lease.
-    let lora_adapter = resolve_lora_adapter(runner, &req.lora_adapter).map_err(LoraAdapterError)?;
+    let lora_adapter = resolve_lora_adapter(handle, &req.lora_adapter).map_err(LoraAdapterError)?;
     // Bound `max_tokens` once, before any engine is asked to size an allocation from it.
     let max_new = req.effective_max_tokens();
     // `n` choices: one sequential submission each (so a request never exhausts the engine's slots), with
@@ -564,7 +408,7 @@ pub(crate) fn handle_completion(
         }
         sampler = apply_guided(
             sampler,
-            runner,
+            handle,
             &req.guided_choice,
             &req.guided_regex,
             &req.guided_grammar,
@@ -590,7 +434,8 @@ pub(crate) fn handle_completion(
             sampler,
             stops.clone(),
             false,
-            lora_adapter.clone(),
+            lora_adapter,
+            client_gone,
             |_, _| GenerationControl::Continue(()),
         ) {
             Ok(done) => done,
@@ -600,11 +445,13 @@ pub(crate) fn handle_completion(
             }
         };
         let generated = tokens.len() - prompt_len.min(tokens.len());
-        let mut text = runner.decode(&tokens[prompt_len.min(tokens.len())..])?;
+        let mut text = handle
+            .text()
+            .decode(&tokens[prompt_len.min(tokens.len())..])?;
         let trimmed = apply_stop(&mut text, &stops);
         // A stop sequence trims the returned text, so usage counts only what is returned.
         let completion_tokens = if trimmed {
-            runner.token_count(&text)?
+            handle.text().token_count(&text)?
         } else {
             generated
         };
@@ -617,7 +464,7 @@ pub(crate) fn handle_completion(
             finish_reason: if natural { "stop" } else { "length" }.into(),
             logprobs: req
                 .logprobs
-                .map(|_| logprobs_json(runner, &logprobs, completion_tokens)),
+                .map(|_| logprobs_json(handle, &logprobs, completion_tokens)),
         });
     }
     let resp = CompletionResp {
@@ -644,11 +491,11 @@ pub(crate) fn handle_completion(
 /// `chat_template` when it ships one, else the per-arch `ChatFormat`. Shared by the stream and non-stream
 /// paths. The prompt must come from the model's own template; wrong markup degrades output and the
 /// turn-end never matches.
-pub(crate) fn chat_prompt_and_stops(runner: &Runner, req: &ChatReq) -> (String, Vec<String>) {
+pub(crate) fn chat_prompt_and_stops(handle: &ModelHandle, req: &ChatReq) -> (String, Vec<String>) {
     // Pass the full message objects (role, content, tool_calls, tool_call_id, name) so multi-turn tool
     // conversations render through the template's tool-history branch.
     let msgs = serde_json::to_value(&req.messages).unwrap_or(serde_json::Value::Null);
-    let rendered = runner.render_chat_value(&msgs, req.tools.as_ref());
+    let rendered = handle.text().render_chat_value(&msgs, req.tools.as_ref());
     (rendered.prompt, rendered.stops)
 }
 
@@ -656,24 +503,25 @@ pub(crate) fn chat_prompt_and_stops(runner: &Runner, req: &ChatReq) -> (String, 
 /// at the turn end.
 pub(crate) fn handle_chat(
     engine: Option<&Sender<Job>>,
-    runner: &Runner,
+    handle: &ModelHandle,
     metrics: &Metrics,
     req: &ChatReq,
+    client_gone: &dyn Fn() -> bool,
 ) -> Result<String> {
     // A modality the loaded model has no front end for is refused before any generation work.
-    crate::api::reject_unsupported_modality(runner, req)?;
+    crate::api::reject_unsupported_modality(handle, req)?;
     let _inflight = InFlight::enter(metrics);
     let start = Instant::now();
-    let (prompt, turn_stops) = chat_prompt_and_stops(runner, req);
+    let (prompt, turn_stops) = chat_prompt_and_stops(handle, req);
 
-    let prompt_len = runner.encode(&prompt)?.len();
+    let prompt_len = handle.text().encode(&prompt)?.len();
     // Stop at the template's end marker(s) as well as user stop sequences.
     let mut stops = Stop::list(&req.stop);
     stops.extend(turn_stops.iter().cloned());
     let user_stops = Stop::list(&req.stop);
     let n = clamp_n(req.n);
     // Acquire once, outside the `n`-choices loop (as in `handle_completion`).
-    let lora_adapter = resolve_lora_adapter(runner, &req.lora_adapter).map_err(LoraAdapterError)?;
+    let lora_adapter = resolve_lora_adapter(handle, &req.lora_adapter).map_err(LoraAdapterError)?;
     // Bound `max_tokens` once (as in `handle_completion`).
     let max_new = req.effective_max_tokens();
     // `n` choices: one submission each (sequential), with a per-choice seed so sampled choices differ.
@@ -687,7 +535,7 @@ pub(crate) fn handle_chat(
         }
         sampler = apply_guided(
             sampler,
-            runner,
+            handle,
             &req.guided_choice,
             &req.guided_regex,
             &req.guided_grammar,
@@ -713,7 +561,8 @@ pub(crate) fn handle_chat(
             sampler,
             stops.clone(),
             false,
-            lora_adapter.clone(),
+            lora_adapter,
+            client_gone,
             |_, _| GenerationControl::Continue(()),
         ) {
             Ok(done) => done,
@@ -723,13 +572,15 @@ pub(crate) fn handle_chat(
             }
         };
         let generated = tokens.len() - prompt_len.min(tokens.len());
-        let mut content = runner.decode(&tokens[prompt_len.min(tokens.len())..])?;
+        let mut content = handle
+            .text()
+            .decode(&tokens[prompt_len.min(tokens.len())..])?;
         // The turn ends at the earliest template end marker; user stops truncate further.
         let turn_end = apply_stop(&mut content, &turn_stops);
         let user_stopped = apply_stop(&mut content, &user_stops);
         let content = content.trim_end().to_string();
         let completion_tokens = if turn_end || user_stopped {
-            runner.token_count(&content)?
+            handle.text().token_count(&content)?
         } else {
             generated
         };
@@ -773,7 +624,7 @@ pub(crate) fn handle_chat(
             finish_reason,
             logprobs: req
                 .logprobs
-                .then(|| logprobs_json(runner, &logprobs, completion_tokens)),
+                .then(|| logprobs_json(handle, &logprobs, completion_tokens)),
         });
     }
     let resp = ChatResp {
@@ -801,12 +652,12 @@ pub(crate) fn handle_chat(
 pub(crate) fn stream_chat(
     stream: &mut TcpStream,
     engine: Option<&Sender<Job>>,
-    runner: &Runner,
+    handle: &ModelHandle,
     metrics: &Metrics,
     req: &ChatReq,
 ) -> Result<()> {
     // Refuse an input the loaded model cannot take before the 200 headers.
-    if let Err(e) = crate::api::reject_unsupported_modality(runner, req) {
+    if let Err(e) = crate::api::reject_unsupported_modality(handle, req) {
         let (status, type_) = crate::api::classify_handler_error(&e);
         return respond_error(stream, status, format_args!("{e:#}"), type_);
     }
@@ -814,8 +665,8 @@ pub(crate) fn stream_chat(
     let model = &metrics.model;
     // Validate before sending the 200 + SSE headers (as in stream_completion). The guided constraint is
     // rebuilt per choice below; this call only rejects an invalid one before the 200.
-    let (prompt, turn_stops) = chat_prompt_and_stops(runner, req);
-    let prompt_tokens = match runner.encode(&prompt) {
+    let (prompt, turn_stops) = chat_prompt_and_stops(handle, req);
+    let prompt_tokens = match handle.text().encode(&prompt) {
         Ok(t) => t.len(),
         Err(e) => {
             return respond_error(stream, 400, format_args!("{e:#}"), "invalid_request_error");
@@ -823,7 +674,7 @@ pub(crate) fn stream_chat(
     };
     if let Err(e) = apply_guided(
         sampler_of(&req.sampling),
-        runner,
+        handle,
         &req.guided_choice,
         &req.guided_regex,
         &req.guided_grammar,
@@ -835,7 +686,7 @@ pub(crate) fn stream_chat(
         return respond_error(stream, 400, format_args!("{e:#}"), "invalid_request_error");
     }
     // Acquire before the streaming response so an unknown adapter is a 400.
-    let lora_adapter = match resolve_lora_adapter(runner, &req.lora_adapter) {
+    let lora_adapter = match resolve_lora_adapter(handle, &req.lora_adapter) {
         Ok(lease) => lease,
         Err(e) => {
             return respond_error(stream, 400, format_args!("{e:#}"), "invalid_request_error");
@@ -868,7 +719,7 @@ pub(crate) fn stream_chat(
                 sampler_of(&req.sampling).reseed(req.sampling.seed.wrapping_add(choice_idx as u64));
             apply_guided(
                 s,
-                runner,
+                handle,
                 &req.guided_choice,
                 &req.guided_regex,
                 &req.guided_grammar,
@@ -892,6 +743,7 @@ pub(crate) fn stream_chat(
         // `delta.tool_calls` chunk; otherwise the buffered text is flushed as one content delta.
         let mut buf = StreamStops::new(all_stops.clone());
         let mut full_content = String::new();
+        let probe = stream.try_clone().ok();
         let res = submit(
             tx,
             &prompt,
@@ -899,7 +751,8 @@ pub(crate) fn stream_chat(
             sampler,
             all_stops.clone(),
             true,
-            lora_adapter.clone(),
+            lora_adapter,
+            &|| probe.as_ref().is_some_and(peer_closed),
             |piece, info| {
                 let emit = buf.push(piece);
                 if tools_mode && write_tool_stream_heartbeat(stream).is_err() {
@@ -987,7 +840,10 @@ pub(crate) fn stream_chat(
             "choices": [{ "index": choice_idx, "delta": {}, "finish_reason": finish }],
         });
         write_sse_data(stream, &done)?;
-        total_completion += runner.token_count(full_content.trim_end()).unwrap_or(0);
+        total_completion += handle
+            .text()
+            .token_count(full_content.trim_end())
+            .unwrap_or(0);
     }
 
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;

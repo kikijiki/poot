@@ -9,6 +9,7 @@
 //! attention kernel with its softcap score transform. This is the GPU test that runs the softcap branch
 //! of that kernel at the real head width of 256.
 use poot_runtime_common::DeviceBackend;
+use poot_test_util::const_weights::ConstWeights;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -42,10 +43,7 @@ fn staged(g: &Graph, target: Target) -> StagedProgram<poot_graph_ir::ValidationO
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions {
-            execution: Submission::Replay,
-            limits: poot_graph_plan::CompileLimits::STANDARD,
-        },
+        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect("compile the gemma2 graph")
 }
@@ -242,7 +240,9 @@ fn gemma2_softcap_flash_prefill_gpu_matches_cpu() {
     // so the structural assertion below is checked on the actual artifact under test, not a stand-in for
     // it. `compile` runs strictly more than `optimize()` (legalize, dtype passes); this synthetic F32
     // graph needs none of that extra work, so the flash-fusion structure is unaffected.
-    let program = staged(&g, target);
+    let (store, slot_binds) = gpu_consts_and_slots(&g, n, &tokens);
+    let (bound, map) = ConstWeights::bind(&g, &store);
+    let program = staged(&bound, target);
     let stage = program.stages().next().expect("single stage").2;
     let opt = stage.graph();
     // Confirm the softcap fusion fires on this graph (as in the CPU-only test in poot-models).
@@ -296,10 +296,7 @@ fn gemma2_softcap_flash_prefill_gpu_matches_cpu() {
     // `compile` preserves `g`'s input/const identity, so binding against it stays valid. Card 546a's
     // contract zero-seeds a newly allocated state buffer on first use (`Engine`'s own state arena), the
     // same zero seed `GpuExecutor::run_prefill` used to upload by hand.
-    let (store, slot_binds) = gpu_consts_and_slots(&g, n, &tokens);
-    let exe = exec
-        .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let exe = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
     let entry = exec.add_entry(exe, &program).unwrap();
     let inputs = step_inputs(&slot_binds);
     let gpu_bytes = exec
@@ -432,10 +429,9 @@ fn run_decode_once(
     store: &Arc<WeightStore>,
     binds: &[SlotBind],
 ) -> Vec<f32> {
-    let program = staged(g, target);
-    let exe = exec
-        .load_weights(Arc::clone(store), poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (bound, map) = ConstWeights::bind(g, store);
+    let program = staged(&bound, target);
+    let exe = exec.load_weights(Arc::clone(store), Arc::new(map)).unwrap();
     let entry = exec.add_entry(exe, &program).unwrap();
     let inputs = step_inputs(binds);
     let bytes = exec

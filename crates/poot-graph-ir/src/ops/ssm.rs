@@ -1,40 +1,9 @@
 use super::*;
 
-/// Decode step of linear attention (card 038: Qwen3.5 / MiniMax-style recurrence). Instead of a
-/// growing KV cache + softmax, each head carries a fixed-size recurrent state matrix
-/// `S [1, Hq, D_k, D_v]` (the running sum of outer products), so decode is O(1) in sequence length:
-///
-/// ```text
-/// S_t = decay * S_{t-1} + k_t^T v_t        (outer product update, [D_k, D_v])
-/// o_t = q_t @ S_t                          ([1, D_k] @ [D_k, D_v] -> [1, D_v])
-/// ```
-///
-/// `q[1,Hq,1,D_k]`, `k`/`v[1,Hkv,1,D_k|D_v]` (GQA via `repeat_kv`), `s_in[1,Hq,D_k,D_v]`. Returns
-/// `(o[1,Hq,1,D_v], s_out[1,Hq,D_k,D_v])`; the caller wires `s_out` back as the carried state
-/// (`finish_with_state`), like the KV cache. `decay` is a scalar gate; per-head / data-dependent
-/// gating is [`linear_attention_decode_gated`]. Pure primitive composition, shared by
-/// tracer and eval.
-pub fn linear_attention_decode(
-    b: &Builder,
-    q: Traced,
-    k: Traced,
-    v: Traced,
-    n_rep: usize,
-    decay: f32,
-    s_in: Traced,
-) -> (Traced, Traced) {
-    let k = repeat_kv(b, k, n_rep); // [1,Hq,1,D_k]
-    let v = repeat_kv(b, v, n_rep); // [1,Hq,1,D_v]
-    let kt = b.transpose(k, vec![0, 1, 3, 2]); // [1,Hq,D_k,1]
-    let kv = b.matmul(kt, v); // outer product [1,Hq,D_k,D_v]
-    let s_decayed = b.binary_scalar(BinOp::Mul, s_in, Scalar::F32(decay));
-    let s_out = b.binary(BinOp::Add, s_decayed, kv); // S_t = decay*S + k^T v
-    let o = b.matmul(q, s_out); // q @ S_t -> [1,Hq,1,D_v]
-    (o, s_out)
-}
-
-/// Gated linear-attention decode (card 038): [`linear_attention_decode`] with a data-dependent
-/// per-key-channel decay instead of a scalar (the GLA / gated-delta-net form of hybrid models); the
+/// Gated linear-attention decode (card 038), the decode step of linear attention (Qwen3.5 /
+/// MiniMax-style recurrence): each head carries a fixed-size recurrent state matrix
+/// `S [1, Hq, D_k, D_v]` (the running sum of outer products), so decode is O(1) in sequence length, with
+/// a data-dependent per-key-channel decay (the GLA / gated-delta-net form of hybrid models); the
 /// caller computes the gate `g_t` from the token. `gate[1,Hq,D_k,1]` decays each row `a` of the state
 /// by `g_t[a]` (broadcast over `D_v`):
 ///
@@ -43,8 +12,9 @@ pub fn linear_attention_decode(
 /// o_t = q_t @ S_t
 /// ```
 ///
-/// Same shapes and return contract as [`linear_attention_decode`]; `decay: f32` becomes a `gate`
-/// tensor multiplied with broadcast. Pure primitive composition.
+/// `q[1,Hq,1,D_k]`, `k`/`v[1,Hkv,1,D_k|D_v]` (GQA via `repeat_kv`), `s_in[1,Hq,D_k,D_v]`. Returns
+/// `(o[1,Hq,1,D_v], s_out[1,Hq,D_k,D_v])`; the caller wires `s_out` back as the carried state
+/// (`finish_with_state`), like the KV cache. Pure primitive composition.
 pub fn linear_attention_decode_gated(
     b: &Builder,
     q: Traced,
@@ -169,6 +139,51 @@ pub fn mamba2_ssd_prefill(
     (y, h_out)
 }
 
+/// The packed definition of `OpKind::Scan` over [`ScanFamily::Ssd`](crate::ScanFamily): the sequence cut into
+/// chunks of `chunk` positions (the last one shorter when `L % chunk != 0`), each run through
+/// [`mamba2_ssd_prefill`] seeded with the previous chunk's final state, and the result
+/// `concat(y, h_out)` along the sequence axis, `[1, Hq, L + N, P]`. A sequence of at most one chunk is
+/// exactly `mamba2_ssd_prefill`; a longer one is the same recurrence with the O(L^2) mask bounded to
+/// `chunk^2`.
+#[allow(clippy::too_many_arguments)]
+pub fn scan_ssd_packed(
+    b: &Builder,
+    x: Traced,
+    b_in: Traced,
+    c_in: Traced,
+    delta: Traced,
+    a_param: Traced,
+    d_skip: Traced,
+    h_in: Traced,
+    chunk: usize,
+) -> Traced {
+    let shape = b.aval(x).shape;
+    let (hq, l) = (shape[1], shape[2]);
+    let mut state = h_in;
+    let mut ys = Vec::with_capacity(l.div_ceil(chunk));
+    for start in (0..l).step_by(chunk) {
+        let end = (start + chunk).min(l);
+        let len = end - start;
+        let part = |t: Traced| b.slice(t, 2, start, end);
+        let tril = b.broadcast(super::lower_triangle(b, len, 0.0), vec![1, hq, len, len]);
+        let (y, next) = mamba2_ssd_prefill(
+            b,
+            part(x),
+            part(b_in),
+            part(c_in),
+            part(delta),
+            a_param,
+            d_skip,
+            state,
+            tril,
+        );
+        ys.push(y);
+        state = next;
+    }
+    ys.push(state);
+    b.concat(2, &ys)
+}
+
 /// Decode step of a depthwise causal conv1d (card 038: the short conv before Mamba's SSM). Per
 /// channel, `out[c] = sum_k w[k][c] * window[k][c]`, where `window` is the last `K-1` inputs (the
 /// carried conv cache) plus the current token; the cache shifts in the new token each step. `x[B,1,C]`,
@@ -204,7 +219,7 @@ pub fn causal_conv1d_decode(
 ///
 /// `out[t,c] = sum_{j=0..K-1} w[j,c] * x[t-(K-1)+j,c]`, with `x[<0,c] = 0`, matching
 /// [`causal_conv1d_decode`] per position (`causal_conv1d_prefill_matches_decode`). No bias, no
-/// activation; the caller applies SiLU (e.g. `qwen3next_gdn_block`).
+/// activation; the caller applies SiLU (e.g. the Gated DeltaNet mixer).
 pub fn causal_conv1d_prefill(b: &Builder, x: Traced, w: Traced, k: usize) -> Traced {
     causal_conv1d_prefill_dilated(b, x, w, k, 1)
 }
@@ -282,45 +297,6 @@ fn conv_taps(b: &Builder, x_ext: Traced, w: Traced, l: usize, k: usize, dilation
         });
     }
     acc.expect("k >= 1")
-}
-
-/// Dilated decode-step counterpart of [`causal_conv1d_prefill_dilated`] (spec 282): one new token
-/// against a carried `[B, (K-1)*dilation, C]` conv cache. `out[c] = sum_{j=0..K-1} w[j,c] *
-/// window[j*dilation, c]` where `window = cache ++ x` is `(K-1)*dilation + 1` long, so the last tap
-/// lands on the current token. Returns `(out[B,1,C], new_cache[B,(K-1)*dilation,C])`; the cache drops
-/// its oldest entry each step.
-///
-/// Not shared with [`causal_conv1d_decode`]: that one computes the `dilation == 1` math via
-/// transpose-then-reduce on the hot Gated-DeltaNet decode path and is left as is.
-pub fn causal_conv1d_decode_dilated(
-    b: &Builder,
-    x: Traced,
-    w: Traced,
-    cache: Traced,
-    k: usize,
-    dilation: usize,
-) -> (Traced, Traced) {
-    assert!(dilation >= 1, "dilation must be >= 1");
-    let x_shape = b.aval(x).shape;
-    let batch = x_shape[0];
-    let c = *x_shape.last().expect("conv input is at least 1-D");
-    let state_len = (k - 1) * dilation;
-    let window = b.concat(1, &[cache, x]); // [B, (K-1)*dilation + 1, C]
-
-    let mut acc: Option<Traced> = None;
-    for j in 0..k {
-        let off = j * dilation;
-        let tap = b.slice(window, 1, off, off + 1); // [B, 1, C]
-        let wj = b.reshape(b.slice(w, 0, j, j + 1), vec![1, 1, c]); // [1, 1, C] = w[j, :]
-        let term = b.binary(BinOp::Mul, tap, wj);
-        acc = Some(match acc {
-            None => term,
-            Some(prev) => b.binary(BinOp::Add, prev, term),
-        });
-    }
-    let out = b.reshape(acc.expect("k >= 1"), vec![batch, 1, c]);
-    let new_cache = b.slice(window, 1, 1, state_len + 1); // drop the oldest
-    (out, new_cache)
 }
 
 /// Gated delta-net decode step (card 135c): the per-token recurrence of Qwen3-Next (qwen35moe) hybrid

@@ -169,7 +169,7 @@ pub(crate) fn plan_buffers<V: ValidationChannel>(
             continue;
         }
         let value_storage = storage.storage(eqn.out).buffer_storage();
-        let Some(value_elems) = value_storage.device_elems(g.aval(eqn.out).numel()) else {
+        let Some(value_elems) = value_storage.device_elems(&g.aval(eqn.out).shape) else {
             // E4M3/raw-byte lanes: `Engine::load_entry`'s own `allocate` refuses this value the same
             // way at load time (`LoadError::Unimplemented`), so leaving it unassigned here changes
             // nothing a caller could observe.

@@ -14,7 +14,7 @@ pub trait EvalObserver {
     ///
     /// `EvalBudget`/this hook are a materialization ceiling for the packed, cast and Spec-376 BF16
     /// arms (`walk.rs`'s `opts.charge` call sites: `PackedDequant`,
-    /// `PackedRowGather`, `Cast`'s `I32 -> F32` and BF16 widens, and the Spec-376 `Widen`/`Gather`/
+    /// `PackedRowGather`, an indexed `PackedContraction` (one `[out, K]` charge per expert decoded), `Cast`'s `I32 -> F32` and BF16 widens, and the Spec-376 `Widen`/`Gather`/
     /// `WeightMatMul` arms) - the paths where one equation can
     /// lazily materialize an allocation whose size depends on a checkpoint table far larger than the
     /// graph's own declared shapes would suggest. Every intermediate of a

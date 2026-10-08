@@ -1,6 +1,7 @@
 //! MoE equation planning: the indexed matmul (with its fused gate-weighting epilogue) and the ArgTopK rank
 //! inversion.
 
+use super::matmul::{FoldedTileGrid, folded_tile_grid};
 use super::*;
 use poot_target::{Backend, BufferStorage, DeviceCaps};
 
@@ -70,6 +71,7 @@ pub(super) fn plan(
         | elementwise_ops!()
         | matmul_ops!()
         | attention_ops!()
+        | scan_ops!()
         | cast_ops!()
         | movement_ops!()
         | sampling_ops!() => unreachable!("plan_eqn routes only MoE ops here"),
@@ -165,30 +167,8 @@ fn plan_indexed(
                 .div_ceil(ts)
                 .checked_mul(n.div_ceil(ts))
                 .ok_or_else(overflow)?;
-            let tiles = u32::try_from(tiles).map_err(|_| overflow())?;
-            let limit_x = caps.max_grid[0].max(1);
-            let (x_groups, y_groups) = if tiles <= limit_x {
-                (tiles, 1)
-            } else {
-                let y_groups = tiles.div_ceil(limit_x);
-                if y_groups > caps.max_grid[1] {
-                    return Err(site.refuse(Capability::DispatchGridLimit {
-                        threads: tiles as usize * ts * ts,
-                        workgroups_x: tiles as usize,
-                        workgroup_width: ts * ts,
-                        limit: limit_x as usize,
-                    }));
-                }
-                (limit_x, y_groups)
-            };
-            let threads_x = x_groups
-                .checked_mul((ts * ts) as u32)
-                .ok_or_else(overflow)?;
-            (
-                kg::Schedule::Tiled { tile },
-                [threads_x, y_groups, 1],
-                x_groups,
-            )
+            let FoldedTileGrid { x_groups, grid } = folded_tile_grid(site, tiles, ts, caps)?;
+            (kg::Schedule::Tiled { tile }, grid, x_groups)
         }
     };
     let meta = [k, n, experts, m]

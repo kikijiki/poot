@@ -1,4 +1,5 @@
 use super::*;
+use poot_graph_ir::ContractionRows;
 /// The `f32` unaries the pointwise-fusion phase admits into a region. [`kernel_mapping::map_fused_op`]
 /// (`poot-graph-plan`) must lower every one of these inside a fused region: legality here and the
 /// kernel table are one contract (card 536b, R481-007), checked by
@@ -720,16 +721,18 @@ pub fn fuse_contraction_epilogues<V: ValidationChannel>(
 /// The [`ContractionHead`] of `eqn` when it is a contraction an epilogue can follow: a `MatMul` whose operands
 /// and result share one float dtype (a mixed-dtype matmul is the tensor-core and decode-GEMV arms' contract), an
 /// `IndexedMatMul` of one float dtype (the routed expert matmul, whose gate weighting is the epilogue), a
-/// `DenseContraction`, or a plain (`blocks == 1`) `PackedContraction`.
+/// `DenseContraction`, or a plain (`Blocks(1)`) or indexed `PackedContraction`.
 fn epilogue_head<V: ValidationChannel>(g: &Graph<V>, eqn: &Eqn) -> Option<ContractionHead> {
     match &eqn.op {
         OpKind::DenseContraction { weight } => Some(ContractionHead::Dense { weight: *weight }),
+        // A plain (`Blocks(1)`) or indexed contraction: the packed Gemv carries an epilogue, the tiled one does not
+        // (`epilogue_head_lowers` decides per shape).
         OpKind::PackedContraction {
             descriptor,
-            blocks: 1,
+            rows: rows @ (ContractionRows::Blocks(1) | ContractionRows::Indexed { .. }),
         } => Some(ContractionHead::Packed {
             descriptor: *descriptor,
-            blocks: 1,
+            rows: *rows,
         }),
         OpKind::IndexedMatMul => {
             let [Operand::Value(x), Operand::Value(w), Operand::Value(_)] = eqn.inputs.as_slice()

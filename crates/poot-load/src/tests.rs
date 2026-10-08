@@ -5,58 +5,6 @@ use poot_quant::scalar::{e4m3fn_to_f32, e8m0_to_f32, f16_to_f32};
 use poot_quant::weights::{WeightEntry, WeightStore};
 use safetensors::{load_weight_store_bytes, pack_quantized_linears};
 
-fn cfg(model_type: &str, attention_bias: Option<bool>) -> Qwen2HfConfig {
-    Qwen2HfConfig {
-        model_type: model_type.to_string(),
-        vocab_size: 1,
-        hidden_size: 8,
-        intermediate_size: 8,
-        num_hidden_layers: 1,
-        num_attention_heads: 2,
-        num_key_value_heads: 1,
-        rms_norm_eps: 1e-6,
-        rope_theta: Some(1e4),
-        rope_parameters: None,
-        max_position_embeddings: 16,
-        tie_word_embeddings: false,
-        head_dim: None,
-        partial_rotary_factor: None,
-        original_max_position_embeddings: None,
-        attention_bias,
-        eos_token_id: Some(0),
-        bos_token_id: None,
-        rope_scaling: None,
-        query_pre_attn_scalar: None,
-        rope_local_base_freq: None,
-        sliding_window_pattern: None,
-        sliding_window: None,
-        use_sliding_window: None,
-        attn_logit_softcapping: None,
-        final_logit_softcapping: None,
-        num_local_experts: None,
-        num_experts_per_tok: None,
-        num_experts: None,
-        moe_intermediate_size: None,
-        norm_topk_prob: None,
-        decoder_sparse_step: None,
-        mlp_only_layers: None,
-        embedding_multiplier: None,
-        attention_multiplier: None,
-        residual_multiplier: None,
-        logits_scaling: None,
-        quantization_config: None,
-        swiglu_limit: None,
-        layer_types: None,
-        hc_mult: None,
-        hc_sinkhorn_iters: None,
-        hc_eps: None,
-        o_groups: None,
-        o_lora_rank: None,
-        compress_rope_theta: None,
-        compress_ratios: None,
-    }
-}
-
 /// Build a minimal safetensors byte blob covering the resident dtype branches: 8-byte LE header
 /// length, JSON header, then contiguous little-endian data.
 fn synthetic_safetensors() -> Vec<u8> {
@@ -192,8 +140,11 @@ fn load_and_load_bytes_agree_on_the_same_archive() {
     assert_eq!(dense_of(&from_file, "w_f16").bytes().len(), 2 * 2);
     assert_eq!(dense_of(&from_file, "w_e4m3").dtype(), DType::E4M3FN);
     assert_eq!(dense_of(&from_file, "w_e4m3").bytes().len(), 3);
-    // I64 index/position buffers are skipped by both entry points (never a weight).
-    assert!(!from_file.contains("position_ids") && !from_bytes.contains("position_ids"));
+    // I64 index tables land as ordinary dense entries through both entry points.
+    for store in [&from_file, &from_bytes] {
+        assert_eq!(dense_of(store, "position_ids").dtype(), DType::I64);
+        assert_eq!(dense_of(store, "position_ids").bytes().len(), 8);
+    }
     // I32 tensors land as ordinary dense entries.
     assert_eq!(dense_of(&from_file, "idx").dtype(), DType::I32);
     assert_eq!(
@@ -423,126 +374,6 @@ fn file_load_peak_rss_is_bounded() {
 }
 
 #[test]
-fn phi3_longrope_config_parses() {
-    // Phi-3/Phi-4 config shape: rope_scaling uses the LongRoPE schema (`type: "longrope"`
-    // with `long_factor`/`short_factor`, no `factor`) and the config carries
-    // `partial_rotary_factor`. Trimmed from phi-4-mini/config.json. phi3 keeps
-    // `original_max_position_embeddings` at the top level (llama3 nests it in rope_scaling);
-    // reading the wrong place gave 0, an infinite LongRoPE attention factor, and a poisoned
-    // forward.
-    let json = r#"{
-            "model_type": "phi3", "vocab_size": 200064, "hidden_size": 3072,
-            "intermediate_size": 8192, "num_hidden_layers": 32, "num_attention_heads": 24,
-            "num_key_value_heads": 8, "rms_norm_eps": 1e-5, "rope_theta": 10000.0,
-            "max_position_embeddings": 131072, "tie_word_embeddings": true,
-            "partial_rotary_factor": 0.75,
-            "original_max_position_embeddings": 4096,
-            "rope_scaling": {
-                "type": "longrope",
-                "long_factor": [1.0, 1.1, 1.2],
-                "short_factor": [1.0, 1.0, 1.0]
-            }
-        }"#;
-    let c: Qwen2HfConfig = serde_json::from_str(json).expect("phi3 config must parse");
-    // head_dim 3072/24 = 128; 0.75 * 128 = 96 (already even).
-    assert_eq!(c.head_dim(), 128);
-    assert_eq!(c.rotary_dim(), 96);
-    assert_eq!(c.original_max_position_embeddings, Some(4096)); // top-level, not in rope_scaling
-    let rs = c.rope_scaling.expect("rope_scaling present");
-    assert_eq!(rs.rope_type, "longrope"); // came in under the `type` alias
-    assert_eq!(rs.long_factor.unwrap().len(), 3);
-    // A non-phi arch with no partial_rotary_factor keeps full rotary.
-    assert_eq!(
-        cfg("qwen2", None).rotary_dim(),
-        cfg("qwen2", None).head_dim()
-    );
-}
-
-#[test]
-fn qkv_bias_per_arch_default() {
-    // qwen2 and Qwen-VL text towers: no field means biased; mistral/llama: no field means unbiased.
-    assert!(cfg("qwen2", None).qkv_bias());
-    assert!(cfg("qwen2_vl", None).qkv_bias());
-    assert!(cfg("qwen2_5_vl", None).qkv_bias());
-    assert!(!cfg("mistral", None).qkv_bias());
-    assert!(!cfg("llama", None).qkv_bias());
-    // An explicit value wins over the per-arch default.
-    assert!(!cfg("qwen2", Some(false)).qkv_bias());
-    assert!(cfg("llama", Some(true)).qkv_bias());
-}
-
-#[test]
-fn effective_sliding_window_honors_use_sliding_window_false() {
-    // Qwen/Qwen2.5-0.5B-Instruct config.json shape: sliding_window=32768,
-    // use_sliding_window=false, so the window is dormant.
-    let mut c = cfg("qwen2", None);
-    c.sliding_window = Some(32768);
-    c.use_sliding_window = Some(false);
-    assert_eq!(c.effective_sliding_window(), None);
-
-    // use_sliding_window=true (or omitted) passes the raw value through unchanged.
-    c.use_sliding_window = Some(true);
-    assert_eq!(c.effective_sliding_window(), Some(32768));
-    c.use_sliding_window = None;
-    assert_eq!(c.effective_sliding_window(), Some(32768));
-
-    // No sliding_window key at all -> None regardless of the flag (nothing to suppress).
-    c.sliding_window = None;
-    c.use_sliding_window = Some(false);
-    assert_eq!(c.effective_sliding_window(), None);
-
-    // Archs with no such flag (Mistral/Gemma, which never set use_sliding_window) pass
-    // sliding_window through.
-    let mistral = cfg("mistral", None);
-    let mut mistral_swa = mistral.clone();
-    mistral_swa.sliding_window = Some(4096);
-    assert_eq!(mistral_swa.effective_sliding_window(), Some(4096));
-}
-
-#[test]
-fn rope_theta_config_json_without_a_top_level_key_parses_via_default() {
-    // hf-tiny-v2/tiny-random-OlmoeForCausalLM shape: no top-level "rope_theta", only a nested
-    // "rope_parameters": {"rope_theta": ..., "rope_type": "default"}. rope_theta was once a
-    // required serde field, which made this config error on load.
-    let json = br#"{
-            "model_type": "olmoe",
-            "vocab_size": 8,
-            "hidden_size": 8,
-            "intermediate_size": 8,
-            "num_hidden_layers": 1,
-            "num_attention_heads": 2,
-            "num_key_value_heads": 2,
-            "rms_norm_eps": 1e-5,
-            "max_position_embeddings": 16,
-            "rope_parameters": {"rope_theta": 12345.0, "rope_type": "default"}
-        }"#;
-    let c: Qwen2HfConfig =
-        serde_json::from_slice(json).expect("parse config without flat rope_theta");
-    assert_eq!(c.rope_theta, None);
-    assert_eq!(c.rope_parameters.unwrap().rope_theta, Some(12345.0));
-}
-
-#[test]
-fn rms_norm_eps_config_json_without_the_key_parses_via_default() {
-    // allenai/OLMoE-1B-7B-0924-Instruct config.json (card 135d, spec 262): the top-level
-    // "rms_norm_eps" key is absent (OlmoE's tiny-random fixture sets it). It was once a
-    // required serde field, giving a "missing field `rms_norm_eps`" error on load.
-    let json = br#"{
-            "model_type": "olmoe",
-            "vocab_size": 8,
-            "hidden_size": 8,
-            "intermediate_size": 8,
-            "num_hidden_layers": 1,
-            "num_attention_heads": 2,
-            "num_key_value_heads": 2,
-            "max_position_embeddings": 16,
-            "rope_theta": 10000.0
-        }"#;
-    let c: Qwen2HfConfig = serde_json::from_slice(json).expect("parse config without rms_norm_eps");
-    assert_eq!(c.rms_norm_eps, 1e-5);
-}
-
-#[test]
 fn bf16_roundtrip() {
     // 1.0 in bf16 is 0x3F80; high 16 bits of f32 1.0 (0x3F800000).
     let raw = 0x3F80u16.to_le_bytes();
@@ -741,6 +572,125 @@ fn fp8_weight_without_a_recognized_scale_sibling_is_refused() {
                 })
             ),
         }
+    }
+}
+
+/// POOT-1059: the Qwen4Exp n-gram PLE table is stored as numbered E4M3 shards
+/// (`<table>.shard_N.weight`) under ONE `<table>.weight_scale`; they carry no per-shard scale, yet
+/// load as dense E4M3 entries (the model applies the shared scale) instead of tripping the
+/// fail-closed rule. Mutation: removing the `is_ple_table_shard` exemption turns this red with the
+/// shard named in the layout refusal.
+#[test]
+fn ple_table_shards_under_a_shared_scale_load_as_dense_e4m3() {
+    let fp8 = QuantScheme {
+        kind: QuantKind::Fp8,
+        group_size: 0,
+    };
+    let table = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding";
+    let shard = |n: u32| format!("{table}.shard_{n}.weight");
+    let store = store_of(vec![
+        (&shard(0), DType::E4M3FN, vec![2, 4], vec![0x38; 8]),
+        (&shard(1), DType::E4M3FN, vec![2, 4], vec![0x38; 8]),
+        (
+            &format!("{table}.weight_scale"),
+            DType::F32,
+            vec![],
+            1.0f32.to_le_bytes().to_vec(),
+        ),
+    ]);
+    let packed = pack_quantized_linears(&store, fp8)
+        .unwrap_or_else(|error| panic!("PLE shards refused: {error:?}"));
+    for n in [0, 1] {
+        assert!(matches!(
+            packed.get(&shard(n)),
+            Some(WeightEntry::Dense(dense)) if dense.dtype() == DType::E4M3FN
+        ));
+    }
+}
+
+/// POOT-1059: the exemption is exactly the named PLE shard shape. Each near miss stays refused
+/// naming its tensor: a shard with no shared table scale, an ordinary `*.shard_N.weight` that is not
+/// an `ngram_embedding` table, and a non-numeric ordinal. Mutation: widening the predicate (dropping the
+/// `ngram_embedding`, scale or digit check) turns the matching row red.
+#[test]
+fn e4m3_weights_that_are_not_ple_table_shards_stay_refused() {
+    let fp8 = QuantScheme {
+        kind: QuantKind::Fp8,
+        group_size: 0,
+    };
+    let scale = |table: &str| {
+        (
+            format!("{table}.weight_scale"),
+            DType::F32,
+            vec![],
+            1.0f32.to_le_bytes().to_vec(),
+        )
+    };
+    let weight = |name: &str| (name.to_string(), DType::E4M3FN, vec![2, 4], vec![0x38; 8]);
+    let cases = [
+        (
+            "no shared scale",
+            vec![weight("l.ple.ngram_embedding.shard_0.weight")],
+            "l.ple.ngram_embedding.shard_0.weight",
+        ),
+        (
+            "not an ngram_embedding table",
+            vec![weight("l.table.shard_0.weight"), scale("l.table")],
+            "l.table.shard_0.weight",
+        ),
+        (
+            "non-numeric ordinal",
+            vec![
+                weight("l.ngram_embedding.shard_x.weight"),
+                scale("l.ngram_embedding"),
+            ],
+            "l.ngram_embedding.shard_x.weight",
+        ),
+    ];
+    for (what, tensors, refused) in cases {
+        let store = store_of(
+            tensors
+                .iter()
+                .map(|(name, dtype, shape, bytes)| {
+                    (name.as_str(), *dtype, shape.clone(), bytes.clone())
+                })
+                .collect(),
+        );
+        match pack_quantized_linears(&store, fp8) {
+            Err(LoadError::QuantizedLinearLayout { tensor, .. }) => {
+                assert_eq!(tensor, refused, "{what}")
+            }
+            other => panic!("{what}: expected a typed layout refusal, got {other:?}"),
+        }
+    }
+}
+
+/// An HF `quant_method: "fp8"` block-scaled checkpoint (the `Qwen/Qwen3.8-27B-FP8` block) is the FP8
+/// scheme, and a block other than the 128x128 one `E4m3Block128` describes is refused by name. Mutation:
+/// drop the `"fp8"` arm of `QuantConfig::scheme`; the supported block is refused as an unknown
+/// `quant_method` and the row goes red.
+#[test]
+fn an_hf_block_fp8_quantization_config_is_the_fp8_scheme() {
+    let config = |block: serde_json::Value| {
+        serde_json::json!({
+            "quantization_config": {
+                "quant_method": "fp8",
+                "fmt": "e4m3",
+                "activation_scheme": "dynamic",
+                "weight_block_size": block,
+            }
+        })
+    };
+    let scheme = crate::config::quant_scheme(&config(serde_json::json!([128, 128])))
+        .unwrap()
+        .expect("a quantization_config names a scheme");
+    assert_eq!(scheme.kind, QuantKind::Fp8);
+    match crate::config::quant_scheme(&config(serde_json::json!([64, 64]))) {
+        Err(LoadError::SafeTensors(message)) => assert!(
+            message.contains("weight_block_size"),
+            "the refusal names the field: {message}"
+        ),
+        other => panic!("expected a typed refusal of a 64x64 block, got {other:?}"),
     }
 }
 

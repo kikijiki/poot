@@ -4,11 +4,31 @@ import math
 import re
 from typing import TypeGuard
 
+try:
+    from .performance_receipt import preparation_shape_errors, request_tpot_ms, request_window_errors
+except ImportError:  # direct `python harness/bench.py` execution
+    from performance_receipt import preparation_shape_errors, request_tpot_ms, request_window_errors
+
 CURVE_KIND = "decode-curve"
 
 # Frameworks whose runner is a binary built from this repository. Their result must say which build
 # produced it (`build_sha`) and on which backend, so a row is attributable to one binary and one backend.
 BUILD_IDENTITY_FRAMEWORKS = frozenset({"poot"})
+
+# What timing a framework's runner claims. A runner that CLAIMS the request window reports every request's raw
+# boundaries (tokens, first/last token, finish, steps) and its result is judged by `request_window_errors`,
+# the one derivation of TTFT, ITL, finish, E2E and TPOT for that capability. Every other runner reports
+# row-level timing only (ttft, e2e and per-token gaps): its rows carry `timing_claim: "row-level"`, compare on
+# the row-level identity subset, and TPOT is (e2e - ttft) / (osl - 1). One derivation per capability, never both.
+REQUEST_WINDOW = "request-window"
+ROW_LEVEL = "row-level"
+WINDOW_CLAIMING_FRAMEWORKS = frozenset({"poot"})
+
+
+def timing_claim(framework):
+    """The timing capability `framework`'s runner claims."""
+    return REQUEST_WINDOW if framework in WINDOW_CLAIMING_FRAMEWORKS else ROW_LEVEL
+
 
 _BUILD_SHA_PATTERN = re.compile(r"[0-9a-f]{40}(-dirty)?")
 
@@ -76,19 +96,58 @@ _SINGLE_FIELD_RULES = (
         for field in _NONNEGATIVE_NUMBER_FIELDS
     ),
 )
-_CURVE_ITERATION_RULES = (
-    (
-        "ttft_ms",
-        lambda value: _is_finite_number(value) and value >= 0,
-        "a finite nonnegative number",
-    ),
-    (
-        "e2e_ms",
-        lambda value: _is_finite_number(value) and value >= 0,
-        "a finite nonnegative number",
-    ),
+# A timed request, curve iteration or single run alike, carries its raw boundaries; the window itself is
+# judged by `request_window_errors`, the one definition of TTFT, ITL, finish and E2E.
+_REQUEST_FIELDS = (
+    "tokens",
+    "first_token_ms",
+    "last_token_ms",
+    "ttft_ms",
+    "itl_ms",
+    "finish_ms",
+    "e2e_ms",
+    "steps",
+)
+
+
+def _row_level_errors(iteration, osl, prefix):
+    """A row-level runner's iteration: ttft, e2e and the osl - 1 inter-token gaps."""
+    errors = _check_fields(iteration, _ROW_LEVEL_ITERATION_RULES, prefix)
+    ttft, e2e = iteration.get("ttft_ms"), iteration.get("e2e_ms")
+    if _is_finite_number(ttft) and _is_finite_number(e2e):
+        if e2e <= ttft:
+            errors.append(f"{prefix}e2e_ms must be greater than ttft_ms")
+        elif not _is_finite_positive_number(_row_level_tpot_ms(e2e, ttft, osl)):
+            errors.append(f"{prefix}derived TPOT must be a finite positive number")
+    itls = iteration.get("itl_ms")
+    if isinstance(itls, list):
+        if len(itls) != osl - 1:
+            errors.append(f"{prefix}itl_ms must contain {osl - 1} samples; got {len(itls)}")
+        for index, sample in enumerate(itls):
+            if not (_is_finite_number(sample) and sample >= 0):
+                errors.append(f"{prefix}itl_ms[{index}] must be a finite nonnegative number; got {sample!r}")
+    return errors
+
+
+def _row_level_tpot_ms(e2e, ttft, osl):
+    try:
+        return (e2e - ttft) / (osl - 1)
+    except (OverflowError, TypeError, ZeroDivisionError):
+        return None
+
+
+_ROW_LEVEL_ITERATION_RULES = (
+    ("ttft_ms", lambda value: _is_finite_number(value) and value >= 0, "a finite nonnegative number"),
+    ("e2e_ms", lambda value: _is_finite_number(value) and value >= 0, "a finite nonnegative number"),
     ("itl_ms", lambda value: isinstance(value, list), "an array"),
 )
+
+
+def _request_errors(request, requested_tokens, prefix):
+    missing = [f"missing required field {prefix}{field!r}" for field in _REQUEST_FIELDS if field not in request]
+    if missing:
+        return missing
+    return [f"{prefix}{error}" for error in request_window_errors(request, requested_tokens)]
 
 
 def runner_refusal(result, *, framework, backend=None):
@@ -133,6 +192,7 @@ def validate_runner_result(result, *, framework, precision, scenario, gen_tokens
 
     if framework in BUILD_IDENTITY_FRAMEWORKS:
         errors.extend(_build_identity_errors(result, backend))
+        errors.extend(preparation_shape_errors(result.get("preparation"), require_state=False))
 
     if "error" in result:
         errors.append(f"runner reported error: {result['error']!r}")
@@ -175,7 +235,7 @@ def validate_runner_result(result, *, framework, precision, scenario, gen_tokens
 
     curve = None
     if _is_curve(scenario):
-        curve_errors, curve = _validate_curve_result(result, scenario)
+        curve_errors, curve = _validate_curve_result(result, scenario, timing_claim(framework))
         errors.extend(curve_errors)
     else:
         errors.extend(_check_fields(result, _SINGLE_FIELD_RULES))
@@ -190,6 +250,8 @@ def validate_runner_result(result, *, framework, precision, scenario, gen_tokens
             and result["e2e_ms"] < result["ttft_ms"]
         ):
             errors.append("e2e_ms must be greater than or equal to ttft_ms")
+        if timing_claim(framework) == REQUEST_WINDOW:
+            errors.extend(_single_run_errors(result, gen_tokens))
 
     if errors:
         raise ResultValidationError(errors)
@@ -198,6 +260,21 @@ def validate_runner_result(result, *, framework, precision, scenario, gen_tokens
         prepared["curve"] = curve
         return prepared
     return result
+
+
+def _single_run_errors(result, gen_tokens):
+    runs = result.get("runs")
+    if not isinstance(runs, list) or not runs:
+        return [f"runs must be a non-empty array of the timed requests; got {runs!r}"]
+    errors = []
+    if result.get("iterations") != len(runs):
+        errors.append(f"iterations {result.get('iterations')!r} must equal the {len(runs)} timed runs")
+    for index, run in enumerate(runs):
+        if not isinstance(run, dict):
+            errors.append(f"runs[{index}] must be an object; got {type(run).__name__}")
+        else:
+            errors.extend(_request_errors(run, gen_tokens, f"runs[{index}]."))
+    return errors
 
 
 def _build_identity_errors(result, backend):
@@ -218,7 +295,7 @@ def _build_identity_errors(result, backend):
     return errors
 
 
-def _validate_curve_result(result, scenario):
+def _validate_curve_result(result, scenario, claim):
     errors = []
     requested_osl = scenario.get("osl", 128)
     requested_isls = list(scenario.get("isl", []))
@@ -250,9 +327,8 @@ def _validate_curve_result(result, scenario):
             f"requested {requested_isls!r}, reported {reported_isls!r}"
         )
 
-    itl_count = (
-        requested_osl - 1 if _is_int(requested_osl) and requested_osl > 1 else None
-    )
+    # An OSL of one or less is already an error above; its windows are not judged on top of it.
+    osl_valid = _is_int(requested_osl) and requested_osl > 1
     for point_index, point in enumerate(curve):
         prefix = f"curve[{point_index}]."
         if not isinstance(point, dict):
@@ -301,49 +377,25 @@ def _validate_curve_result(result, scenario):
                     f"got {type(iteration).__name__}"
                 )
                 continue
-            errors.extend(_check_fields(iteration, _CURVE_ITERATION_RULES, iter_prefix))
-            ttft = iteration.get("ttft_ms")
-            e2e = iteration.get("e2e_ms")
-            if _is_finite_number(ttft) and _is_finite_number(e2e):
-                if e2e <= ttft:
-                    errors.append(f"{iter_prefix}e2e_ms must be greater than ttft_ms")
-                elif not _is_finite_positive_number(
-                    _curve_tpot_ms(e2e, ttft, requested_osl)
-                ):
-                    errors.append(
-                        f"{iter_prefix}derived TPOT must be a finite positive number"
-                    )
-            itls = iteration.get("itl_ms")
-            if not isinstance(itls, list):
+            if not osl_valid:
                 continue
-            if itl_count is not None and len(itls) != itl_count:
-                errors.append(
-                    f"{iter_prefix}itl_ms must contain {itl_count} samples; "
-                    f"got {len(itls)}"
-                )
-            for sample_index, sample in enumerate(itls):
-                if not (_is_finite_number(sample) and sample >= 0):
-                    errors.append(
-                        f"{iter_prefix}itl_ms[{sample_index}] must be a finite "
-                        f"nonnegative number; got {sample!r}"
-                    )
+            if claim == REQUEST_WINDOW:
+                window = _request_errors(iteration, requested_osl, iter_prefix)
+                errors.extend(window)
+                if not window and not _is_finite_positive_number(request_tpot_ms(iteration)):
+                    errors.append(f"{iter_prefix}token-to-token TPOT must be a finite positive number")
+            else:
+                errors.extend(_row_level_errors(iteration, requested_osl, iter_prefix))
     if errors:
         return errors, None
 
-    aggregated = _aggregate_curve(curve, requested_osl)
+    aggregated = _aggregate_curve(curve, requested_osl, claim)
     errors.extend(_validate_curve_aggregates(aggregated))
     return errors, aggregated
 
 
 def _is_finite_positive_number(value):
     return _is_finite_number(value) and value > 0
-
-
-def _curve_tpot_ms(e2e, ttft, osl):
-    try:
-        return (e2e - ttft) / (osl - 1)
-    except (OverflowError, TypeError, ZeroDivisionError):
-        return None
 
 
 def _pct(values, percentile):
@@ -368,16 +420,16 @@ _CURVE_AGGREGATE_FIELDS = (
 )
 
 
-def _aggregate_curve(raw_curve, osl):
+def _aggregate_curve(raw_curve, osl, claim):
     points = []
     for point in raw_curve:
         iterations = point["iters"]
         ttfts = [iteration["ttft_ms"] for iteration in iterations]
         all_itls = [gap for iteration in iterations for gap in iteration["itl_ms"]]
-        tpots = [
-            _curve_tpot_ms(iteration["e2e_ms"], iteration["ttft_ms"], osl)
-            for iteration in iterations
-        ]
+        if claim == REQUEST_WINDOW:
+            tpots = [request_tpot_ms(iteration) for iteration in iterations]
+        else:
+            tpots = [_row_level_tpot_ms(i["e2e_ms"], i["ttft_ms"], osl) for i in iterations]
         tpot_percentiles = _pcts(tpots)
         tpot_median = tpot_percentiles["p50"]
         try:

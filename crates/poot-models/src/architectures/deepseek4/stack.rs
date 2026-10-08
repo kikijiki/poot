@@ -1,359 +1,180 @@
-#[cfg(test)]
-use super::*;
+//! DeepSeek-V4's layer and stack: the residual stream is `hc_mult` parallel streams per token, mixed
+//! around the attention block and the feed-forward block of every layer by manifold-constrained
+//! hyper-connections ([`crate::components::mhc`]), and collapsed to one stream before the closing
+//! norm. This is the family's own topology; everything a block computes is a component.
 
-/// Trace a single V4 DECODE step for a mixed per-layer `layer_types` schedule. `schedule` gives one
-/// [`V4LayerKind`] per layer (typically from [`parse_compress_ratios`]); each layer dispatches to the per-layer
-/// body its single-attention-type tracer uses ([`deepseek4_sliding_layer_decode`],
-/// [`deepseek4_hca_layer_decode`], [`deepseek4_csa_layer_decode`]), like
-/// `crate::nemotron_h::trace_nemotron_h_hybrid_stack_prefill`.
-///
-/// The local sliding-window K==V branch and `local_mask` are built once, since every V4 layer keeps the local
-/// branch. The rope tables (`"main"`/`rope_theta` for sliding layers, `"compress"`/`compress_rope_theta` for
-/// CSA/HCA) and each compression kind's window-position/causal-validity constants are built only if that kind
-/// appears in `schedule`. `cap` must be a multiple of `hca_compress_rate` when an HCA layer is present and of
-/// `csa_compress_rate` when a CSA layer is present.
-#[cfg(test)]
-pub(crate) fn trace_deepseek4_hybrid_stack_decode(
-    cfg: DeepseekV4Config,
-    cap: usize,
-    schedule: &[V4LayerKind],
-) -> Result<Graph<ValidationOutputs>, DeepseekV4MoeError> {
-    assert_eq!(
-        schedule.len(),
-        cfg.layers,
-        "trace_deepseek4_hybrid_stack_decode: schedule length must equal cfg.layers"
-    );
-    let has_sliding = schedule.contains(&V4LayerKind::Sliding);
-    let has_hca = schedule.contains(&V4LayerKind::Hca);
-    let has_csa = schedule.contains(&V4LayerKind::Csa);
-    if has_hca {
-        assert!(
-            cap.is_multiple_of(cfg.hca_compress_rate) && cfg.hca_compress_rate > 0,
-            "trace_deepseek4_hybrid_stack_decode: cap must be an exact multiple of hca_compress_rate \
-when the schedule includes an HCA layer"
-        );
-    }
-    if has_csa {
-        assert!(
-            cap.is_multiple_of(cfg.csa_compress_rate) && cfg.csa_compress_rate > 0,
-            "trace_deepseek4_hybrid_stack_decode: cap must be an exact multiple of csa_compress_rate \
-when the schedule includes a CSA layer"
-        );
-    }
+use poot_graph_ir::{Builder, Traced, ValidationId};
+use poot_quant::weights::{NormRole, WeightId, WeightMap, WeightRole};
 
-    let b = Builder::new();
-    let (h, hc, rd) = (cfg.hidden, cfg.hc_mult, cfg.qk_rope_head_dim);
+use super::config::{DeepseekV4Config, LayerKind};
+use super::csa::{self, IndexerWeights};
+use super::hca::{self, CompressorWeights, Owner, Pooling};
+use super::moe::RoutedWeights;
+use super::sliding::{self, Compressed, LocalWeights};
+use crate::components::linear::{Weight, WeightError};
+use crate::components::mhc::{MhcHeadWeights, MhcSite, MhcSiteWeights, mhc_post, widen};
+use crate::components::norm::{norm, norm_with};
+use crate::components::rope::rope_rows;
+use crate::components::standard::{StackWeights, Step};
+use crate::model::LogitRows;
 
-    // `[1]`, not a scalar: Card 372c's guard needs an axis to reduce, and Card 371's exact lane has no I32
-    // reshape.
-    let token = b.slot(Slot::Token, TensorType::new(vec![1], DType::I32));
-    let (plan, dims, tokens, mut moe) =
-        deepseek4_moe_preamble(&b, &cfg, schedule, token, V4MoePhase::Decode)?;
-    let pos_slot = b.slot(Slot::Pos, TensorType::scalar(DType::I32));
-    let _seq_len = b.slot(Slot::SeqLen, TensorType::scalar(DType::I32));
-    let mask = b.slot(Slot::Mask, TensorType::f32(vec![cap]));
-    let mask = b.reshape(mask, vec![1, 1, 1, cap]);
+/// The validation id of the token-id bound. The router witnesses of layer `l` are ids `3 * l` to
+/// `3 * l + 2` ([`crate::components::witness::WitnessKind::id`]); this one is the family's own, at the
+/// top of the range no layer count reaches.
+const TOKEN_INDEX_IN_RANGE: ValidationId = ValidationId(u32::MAX);
 
-    let iota_full = b.iota(cfg.max_pos);
-    let iota_cap = b.slice(iota_full, 0, 0, cap);
-    let pos_f = b.gather_scalar(iota_full, 0, pos_slot);
-    let local_mask = sliding_window_floor(&b, mask, pos_f, iota_cap, cfg.sliding_window, 1, cap);
-
-    let main_rope = has_sliding.then(|| {
-        (
-            b.constant(V4_ROPE_COS, TensorType::f32(vec![cfg.max_pos, rd / 2])),
-            b.constant(V4_ROPE_SIN, TensorType::f32(vec![cfg.max_pos, rd / 2])),
-        )
-    });
-    let compress_rope = (has_hca || has_csa).then(|| {
-        (
-            b.constant(
-                V4_COMPRESS_ROPE_COS,
-                TensorType::f32(vec![cfg.max_pos, rd / 2]),
-            ),
-            b.constant(
-                V4_COMPRESS_ROPE_SIN,
-                TensorType::f32(vec![cfg.max_pos, rd / 2]),
-            ),
-        )
-    });
-
-    let hca_info = has_hca.then(|| {
-        let cr = cfg.hca_compress_rate;
-        let n_windows = cap / cr;
-        let win_positions = b.slot_named(
-            Slot::Activation,
-            V4_HCA_WINDOW_POSITIONS,
-            TensorType::f32(vec![n_windows]),
-        );
-        let hca_mask = hca_decode_validity_mask(&b, pos_f, win_positions, cr);
-        let hca_mask = b.reshape(hca_mask, vec![1, 1, 1, n_windows]);
-        let combined_mask = b.concat(3, &[local_mask, hca_mask]);
-        (combined_mask, win_positions, n_windows)
-    });
-    let csa_info = has_csa.then(|| {
-        let cr = cfg.csa_compress_rate;
-        let n_windows = cap / cr;
-        let win_positions = b.slot_named(
-            Slot::Activation,
-            V4_CSA_WINDOW_POSITIONS,
-            TensorType::f32(vec![n_windows]),
-        );
-        let csa_causal_mask = hca_decode_validity_mask(&b, pos_f, win_positions, cr);
-        let csa_causal_mask = b.reshape(csa_causal_mask, vec![1, 1, 1, n_windows]);
-        (csa_causal_mask, win_positions, n_windows)
-    });
-
-    let embed = v4_source(&b, plan.top_dense(V4TopDense::Embedding)?);
-    let x0 = b.cast(b.gather(embed, 0, tokens), DType::F32);
-    let x0 = b.reshape(x0, vec![1, 1, 1, h]);
-    let mut x = b.broadcast(x0, vec![1, 1, hc, h]);
-
-    let mut state: Vec<(Traced, Traced)> = Vec::new();
-
-    for (li, kind) in schedule.iter().enumerate() {
-        let _layer_scope = b.layer_scope(li);
-        let (new_x, pairs) = match kind {
-            V4LayerKind::Sliding => {
-                let (cos, sin) = main_rope.expect("has_sliding implies main_rope is built");
-                deepseek4_sliding_layer_decode(
-                    &b,
-                    &cfg,
-                    li,
-                    x,
-                    cap,
-                    pos_slot,
-                    local_mask,
-                    cos,
-                    sin,
-                    &plan,
-                    dims,
-                    &mut moe.context(),
-                )?
-            }
-            V4LayerKind::Hca => {
-                let (cos, sin) = compress_rope.expect("has_hca implies compress_rope is built");
-                let (combined_mask, win_idx, n_windows) =
-                    hca_info.expect("has_hca implies hca_info is built");
-                deepseek4_hca_layer_decode(
-                    &b,
-                    &cfg,
-                    li,
-                    x,
-                    cap,
-                    pos_slot,
-                    cos,
-                    sin,
-                    combined_mask,
-                    win_idx,
-                    n_windows,
-                    &plan,
-                    dims,
-                    &mut moe.context(),
-                )?
-            }
-            V4LayerKind::Csa => {
-                let (cos, sin) = compress_rope.expect("has_csa implies compress_rope is built");
-                let (csa_causal_mask, win_idx, n_windows) =
-                    csa_info.expect("has_csa implies csa_info is built");
-                deepseek4_csa_layer_decode(
-                    &b,
-                    &cfg,
-                    li,
-                    x,
-                    cap,
-                    pos_slot,
-                    cos,
-                    sin,
-                    local_mask,
-                    csa_causal_mask,
-                    win_idx,
-                    n_windows,
-                    &plan,
-                    dims,
-                    &mut moe.context(),
-                )?
-            }
-        };
-        x = new_x;
-        state.extend(pairs);
-    }
-
-    let hh_fn = v4_mhc_projection(&b, plan.top_dense(V4TopDense::HcHeadProjection)?);
-    let hh_base = v4_source_f32(&b, plan.top_dense(V4TopDense::HcHeadBase)?);
-    let hh_scale = v4_source_f32(&b, plan.top_dense(V4TopDense::HcHeadScale)?);
-    let collapsed_final = hyper_head(
-        &b, x, hh_fn, hh_base, hh_scale, hc, h, 1, cfg.eps, cfg.hc_eps,
-    );
-
-    let norm = v4_source_f32(&b, plan.top_dense(V4TopDense::FinalNorm)?);
-    let xf = rmsnorm(&b, collapsed_final, norm, cfg.eps);
-    let logits = v4_source_linear(&b, xf, plan.top_dense(V4TopDense::Head)?);
-    moe.finish(b, logits, &state)
+/// One layer's weights.
+#[derive(Debug)]
+pub(super) struct Layer {
+    kind: LayerKind,
+    mhc_attn: MhcSiteWeights,
+    mhc_ffn: MhcSiteWeights,
+    attn_norm: Weight,
+    ffn_norm: Weight,
+    local: LocalWeights,
+    compressor: Option<CompressorWeights>,
+    indexer: Option<IndexerWeights>,
+    routed: RoutedWeights,
 }
 
-/// [`trace_deepseek4_hybrid_stack_decode`]'s PREFILL twin. The universal `[1,1,l,l]` windowed-causal `mask` is
-/// built internally, as are `hca.block_bias`/`csa.block_bias` (`[1,1,l,n_windows]`), only for kinds present in
-/// `schedule`. `seq_len` need not be a multiple of any active rate: the graph is padded internally (see
-/// [`deepseek4_prefill_pad_len`] for why that cannot change a real position's output).
-#[cfg(test)]
-pub(crate) fn trace_deepseek4_hybrid_stack_prefill(
-    cfg: DeepseekV4Config,
-    seq_len: usize,
-    schedule: &[V4LayerKind],
-) -> Result<Graph<ValidationOutputs>, DeepseekV4MoeError> {
-    assert_eq!(
-        schedule.len(),
-        cfg.layers,
-        "trace_deepseek4_hybrid_stack_prefill: schedule length must equal cfg.layers"
-    );
-    let has_sliding = schedule.contains(&V4LayerKind::Sliding);
-    let has_hca = schedule.contains(&V4LayerKind::Hca);
-    let has_csa = schedule.contains(&V4LayerKind::Csa);
-    // `Runner::generate`'s CPU re-prefill loop re-traces at the growing token count every step, so requiring
-    // `seq_len` to be a multiple of the active rates would panic after one step on the real schedule (CSA rate
-    // 4, HCA rate 128). Pad to the next valid length (see `deepseek4_prefill_pad_len`) and slice the final
-    // logits at the real last token.
-    let l = deepseek4_prefill_pad_len(seq_len, &cfg, has_hca, has_csa);
-
-    let b = Builder::new();
-    let (h, hc, rd) = (cfg.hidden, cfg.hc_mult, cfg.qk_rope_head_dim);
-
-    let tokens = b.slot(Slot::Token, TensorType::new(vec![l], DType::I32));
-    let (plan, dims, tokens, mut moe) =
-        deepseek4_moe_preamble(&b, &cfg, schedule, tokens, V4MoePhase::Prefill)?;
-    let mask = b.slot_named(Slot::Mask, "prefill", TensorType::f32(vec![1, 1, l, l]));
-
-    let main_rope = has_sliding.then(|| {
-        (
-            b.constant(V4_ROPE_COS, TensorType::f32(vec![cfg.max_pos, rd / 2])),
-            b.constant(V4_ROPE_SIN, TensorType::f32(vec![cfg.max_pos, rd / 2])),
-        )
-    });
-    let compress_rope = (has_hca || has_csa).then(|| {
-        (
-            b.constant(
-                V4_COMPRESS_ROPE_COS,
-                TensorType::f32(vec![cfg.max_pos, rd / 2]),
-            ),
-            b.constant(
-                V4_COMPRESS_ROPE_SIN,
-                TensorType::f32(vec![cfg.max_pos, rd / 2]),
-            ),
-        )
-    });
-
-    let hca_info = has_hca.then(|| {
-        let cr = cfg.hca_compress_rate;
-        let n_windows = l / cr;
-        let block_bias = b.slot_named(
-            Slot::Activation,
-            V4_HCA_BLOCK_BIAS,
-            TensorType::f32(vec![1, 1, l, n_windows]),
-        );
-        let win_idx = b.slot_named(
-            Slot::Activation,
-            V4_HCA_WINDOW_POSITIONS,
-            TensorType::f32(vec![n_windows]),
-        );
-        (block_bias, win_idx, n_windows)
-    });
-    let csa_info = has_csa.then(|| {
-        let cr = cfg.csa_compress_rate;
-        let n_windows = l / cr;
-        let block_bias = b.slot_named(
-            Slot::Activation,
-            V4_CSA_BLOCK_BIAS,
-            TensorType::f32(vec![1, 1, l, n_windows]),
-        );
-        let win_idx = b.slot_named(
-            Slot::Activation,
-            V4_CSA_WINDOW_POSITIONS,
-            TensorType::f32(vec![n_windows]),
-        );
-        (block_bias, win_idx, n_windows)
-    });
-
-    let embed = v4_source(&b, plan.top_dense(V4TopDense::Embedding)?);
-    let emb = b.cast(b.gather(embed, 0, tokens), DType::F32); // [L, hidden]
-    let x0 = b.reshape(emb, vec![1, l, 1, h]);
-    let mut x = b.broadcast(x0, vec![1, l, hc, h]);
-
-    for (li, kind) in schedule.iter().enumerate() {
-        let _layer_scope = b.layer_scope(li);
-        x = match kind {
-            V4LayerKind::Sliding => {
-                let (cos, sin) = main_rope.expect("has_sliding implies main_rope is built");
-                deepseek4_sliding_layer_prefill(
-                    &b,
-                    &cfg,
-                    li,
-                    x,
-                    l,
-                    mask,
-                    cos,
-                    sin,
-                    &plan,
-                    dims,
-                    &mut moe.context(),
-                )?
-            }
-            V4LayerKind::Hca => {
-                let (cos, sin) = compress_rope.expect("has_hca implies compress_rope is built");
-                let (block_bias, win_idx, n_windows) =
-                    hca_info.expect("has_hca implies hca_info is built");
-                let combined_mask = b.concat(3, &[mask, block_bias]);
-                deepseek4_hca_layer_prefill(
-                    &b,
-                    &cfg,
-                    li,
-                    x,
-                    l,
-                    cos,
-                    sin,
-                    combined_mask,
-                    win_idx,
-                    n_windows,
-                    &plan,
-                    dims,
-                    &mut moe.context(),
-                )?
-            }
-            V4LayerKind::Csa => {
-                let (cos, sin) = compress_rope.expect("has_csa implies compress_rope is built");
-                let (block_bias, win_idx, n_windows) =
-                    csa_info.expect("has_csa implies csa_info is built");
-                deepseek4_csa_layer_prefill(
-                    &b,
-                    &cfg,
-                    li,
-                    x,
-                    l,
-                    cos,
-                    sin,
-                    mask,
-                    block_bias,
-                    win_idx,
-                    n_windows,
-                    &plan,
-                    dims,
-                    &mut moe.context(),
-                )?
-            }
+impl Layer {
+    fn new(
+        map: &WeightMap,
+        layer: usize,
+        kind: LayerKind,
+        cfg: &DeepseekV4Config,
+    ) -> Result<Self, WeightError> {
+        let norm_weight = |role| {
+            Weight::new(
+                map,
+                WeightId::layer(layer, WeightRole::Norm(role)),
+                &[cfg.width],
+            )
         };
+        let compressor = match (kind, cfg.rate(kind)) {
+            (LayerKind::Sliding, _) | (_, None) => None,
+            (kind, Some(rate)) => Some(CompressorWeights::new(
+                map,
+                layer,
+                Owner::Layer,
+                cfg.width,
+                rate,
+                cfg.attn.head_dim,
+                match kind {
+                    LayerKind::Csa => Pooling::Overlapping,
+                    _ => Pooling::Disjoint,
+                },
+            )?),
+        };
+        Ok(Self {
+            kind,
+            mhc_attn: MhcSiteWeights::new(map, layer, MhcSite::Attn, cfg.width, &cfg.mhc)?,
+            mhc_ffn: MhcSiteWeights::new(map, layer, MhcSite::Ffn, cfg.width, &cfg.mhc)?,
+            attn_norm: norm_weight(NormRole::Attn)?,
+            ffn_norm: norm_weight(NormRole::Ffn)?,
+            local: LocalWeights::new(map, layer, cfg)?,
+            compressor,
+            indexer: (kind == LayerKind::Csa)
+                .then(|| IndexerWeights::new(map, layer, cfg))
+                .transpose()?,
+            routed: RoutedWeights::new(map, layer, cfg)?,
+        })
     }
 
-    let hh_fn = v4_mhc_projection(&b, plan.top_dense(V4TopDense::HcHeadProjection)?);
-    let hh_base = v4_source_f32(&b, plan.top_dense(V4TopDense::HcHeadBase)?);
-    let hh_scale = v4_source_f32(&b, plan.top_dense(V4TopDense::HcHeadScale)?);
-    let collapsed_final = hyper_head(
-        &b, x, hh_fn, hh_base, hh_scale, hc, h, l, cfg.eps, cfg.hc_eps,
-    );
+    /// The layer over the widened streams `x[rows, tokens, streams, width]`: attention, then the
+    /// routed feed-forward, each between a hyper-connection's collapse and its placement back.
+    fn trace(
+        &self,
+        b: &Builder,
+        step: &Step,
+        index: usize,
+        x: Traced,
+        tokens: Traced,
+        cfg: &DeepseekV4Config,
+    ) -> Traced {
+        let mix = self.mhc_attn.pre(b, x, &cfg.mhc);
+        let normed = norm(b, mix.collapsed, &self.attn_norm, cfg.norm);
+        let attended = self.attention(b, step, index, normed, cfg);
+        let x = mhc_post(b, mix.post, mix.comb, attended, x, &cfg.mhc);
 
-    let norm = v4_source_f32(&b, plan.top_dense(V4TopDense::FinalNorm)?);
-    let xf = rmsnorm(&b, collapsed_final, norm, cfg.eps);
-    // Real last token, not the padded one.
-    let last = b.slice(xf, 1, seq_len - 1, seq_len);
-    let logits = v4_source_linear(&b, last, plan.top_dense(V4TopDense::Head)?);
-    moe.finish(b, logits, &[])
+        let mix = self.mhc_ffn.pre(b, x, &cfg.mhc);
+        let normed = norm(b, mix.collapsed, &self.ffn_norm, cfg.norm);
+        let routed = self.routed.trace(b, step, index, normed, tokens, cfg);
+        mhc_post(b, mix.post, mix.comb, routed, x, &cfg.mhc)
+    }
+
+    /// The layer's attention block over the normalized input `normed`: `[rows, tokens, width]`.
+    fn attention(
+        &self,
+        b: &Builder,
+        step: &Step,
+        index: usize,
+        normed: Traced,
+        cfg: &DeepseekV4Config,
+    ) -> Traced {
+        let capacity = step.shape().capacity.get();
+        let rows = rope_rows(b, cfg.rope_of(self.kind), step.pos(), capacity);
+        let local = sliding::local(b, step, index, normed, &self.local, cfg, rows);
+        let compressed: Option<Compressed> = match (self.kind, &self.compressor, &self.indexer) {
+            (LayerKind::Hca, Some(compressor), _) => {
+                hca::compressed(b, step, index, normed, &local.write_at, compressor, cfg)
+            }
+            (LayerKind::Csa, Some(compressor), Some(indexer)) => {
+                csa::compressed(b, step, index, normed, &local, compressor, indexer, cfg)
+            }
+            _ => None,
+        };
+        sliding::attend(b, step, &local, compressed.as_ref(), &self.local, cfg)
+    }
+}
+
+/// Every weight of the tower: the embedding, the layers, the closing collapse, norm and head.
+#[derive(Debug)]
+pub(super) struct Tower {
+    stack: StackWeights,
+    collapse: MhcHeadWeights,
+    layers: Vec<Layer>,
+}
+
+impl Tower {
+    pub fn new(map: &WeightMap, cfg: &DeepseekV4Config) -> Result<Self, WeightError> {
+        Ok(Self {
+            stack: StackWeights::new(map, cfg.vocab, cfg.width)?,
+            collapse: MhcHeadWeights::new(map, cfg.width, &cfg.mhc)?,
+            layers: cfg
+                .kinds
+                .iter()
+                .enumerate()
+                .map(|(l, &kind)| Layer::new(map, l, kind, cfg))
+                .collect::<Result<_, _>>()?,
+        })
+    }
+
+    /// The step's logits: embed, widen, every layer inside its scope, collapse the streams, the
+    /// final norm and the head. Under [`LogitRows::Last`] only the last token's logits.
+    pub fn trace(&self, b: &Builder, step: &Step, cfg: &DeepseekV4Config) -> Traced {
+        // The token ids, bounded by the vocabulary once: the embedding and every hash table index
+        // read the bounded ids, and an id outside the vocabulary is the step's validation fault.
+        let tokens = b
+            .guard_index_bounds(step.tokens(), cfg.vocab)
+            .expect("a step's tokens are rank-two I32 and a vocabulary fits I32");
+        step.validate(
+            TOKEN_INDEX_IN_RANGE,
+            "deepseek4.token_index".to_string(),
+            tokens.witness,
+        );
+        let embedded = self.stack.embed.embed(b, tokens.guarded);
+        let mut x = widen(b, embedded, &cfg.mhc);
+        for (l, layer) in self.layers.iter().enumerate() {
+            let _scope = b.layer_scope(l);
+            x = layer.trace(b, step, l, x, tokens.guarded, cfg);
+        }
+        let tokens = step.shape().tokens.get();
+        if step.shape().logits == LogitRows::Last && tokens > 1 {
+            x = b.slice(x, 1, tokens - 1, tokens);
+        }
+        let collapsed = self.collapse.collapse(b, x, &cfg.mhc);
+        let normed = norm_with(b, collapsed, &self.stack.final_norm, cfg.norm);
+        self.stack.head.logits(b, normed)
+    }
 }

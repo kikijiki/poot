@@ -203,3 +203,84 @@ fn bf16_select_passes_half_width_bits_through() {
     assert_eq!(out.dtype(), DType::BF16);
     assert_eq!(out.as_half().unwrap(), [0x7FC1, 0x7FC2, 0x8000, 0xFFC3]);
 }
+
+/// The half-width bit patterns a select must carry unchanged: payload NaNs of both signs, a signaling NaN
+/// (low mantissa bit only), the infinities and `-0.0`, in the BF16 or the F16 layout.
+fn half_patterns(dtype: DType) -> [u16; 6] {
+    match dtype {
+        DType::BF16 => [0x7FC1, 0xFFC3, 0x7F81, 0x7F80, 0xFF80, 0x8000],
+        _ => [0x7E01, 0xFE03, 0x7C01, 0x7C00, 0xFC00, 0x8000],
+    }
+}
+
+fn half_tensor(dtype: DType, shape: Vec<usize>, words: Vec<u16>) -> HostTensor {
+    match dtype {
+        DType::BF16 => HostTensor::bf16(shape, words),
+        _ => HostTensor::f16(shape, words),
+    }
+}
+
+/// POOT-1041: `Select` over two-byte floats is the same bit-moving select as the F32 and I32 forms, for a
+/// branch that comes straight from an input AND for one that went through the movement ops that carry an
+/// owner-backed view (reshape, transpose) or a materialized copy (broadcast, slice, concat). The expectations
+/// are hand-written words: the signaling NaN keeps its payload (a trip through F32 would quiet it) and the
+/// unselected branch's NaN stays out. Mutation: read the movement operands through `get` instead of `stored`
+/// in `evaluate_dense`; the BF16 concat refuses mixed lanes.
+#[test]
+fn narrow_select_moves_exact_words_through_movement_ops() {
+    for dtype in [DType::BF16, DType::F16] {
+        let words = half_patterns(dtype);
+        let b = Builder::new();
+        let ty = |shape: &[usize], dtype| TensorType::new(shape.to_vec(), dtype);
+        let cond = b.constant("cond", ty(&[6], DType::I32));
+        let on = b.constant("if_true", ty(&[6], dtype));
+        let off = b.constant("if_false", ty(&[6], dtype));
+        // The true branch: the words reshaped to [2,3] and transposed twice (owner-backed views), then split
+        // along the last axis and re-joined.
+        let moved = b.transpose(
+            b.transpose(b.reshape(on, vec![2, 3]), vec![1, 0]),
+            vec![1, 0],
+        );
+        let joined = b.reshape(
+            b.concat(1, &[b.slice(moved, 1, 0, 1), b.slice(moved, 1, 1, 3)]),
+            vec![6],
+        );
+        // The false branch: a broadcast of the same words from a leading axis, reshaped back.
+        let widened = b.reshape(
+            b.broadcast(b.reshape(off, vec![1, 6]), vec![2, 6]),
+            vec![12],
+        );
+        let other = b.slice(widened, 0, 6, 12);
+        let out = b.select(cond, joined, other);
+        let g = b.finish(out);
+        let inputs = HashMap::from([
+            (
+                cond.id,
+                Value::from(HostTensor::i32(vec![6], vec![1, 0, 1, 0, 1, 0])),
+            ),
+            (
+                on.id,
+                Value::from(half_tensor(dtype, vec![6], words.to_vec())),
+            ),
+            (
+                off.id,
+                Value::from(half_tensor(
+                    dtype,
+                    vec![6],
+                    words.iter().rev().copied().collect(),
+                )),
+            ),
+        ]);
+        let out = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+            .unwrap()
+            .output
+            .into_host()
+            .unwrap();
+        assert_eq!(out.dtype(), dtype);
+        assert_eq!(
+            out.as_half().unwrap(),
+            [words[0], words[4], words[2], words[2], words[4], words[0]],
+            "{dtype:?}"
+        );
+    }
+}

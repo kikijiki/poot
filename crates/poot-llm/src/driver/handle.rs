@@ -13,6 +13,7 @@ use poot_models::model::{Model, ModelConfig};
 use poot_models::registry::{FamilyEntry, RawConfig, Registry};
 use poot_quant::weights::WeightStore;
 
+use crate::core::modality::Modality;
 use crate::driver::error::{DriverError, LoadError, Unsupported};
 use crate::text::tokenize::TextCodec;
 
@@ -185,7 +186,7 @@ impl ModelHandle {
                 .map_err(LoadError::from)?,
             None => store,
         };
-        Self::build(family, &raw, store, |config| {
+        Self::build(family, &raw, Arc::new(store), |config| {
             TextCodec::from_hf_dir(dir, constraint_eos(config), config.prompt_bos, config.chat)
                 .map_err(|e| LoadError::Text(Box::new(e)))
         })
@@ -204,7 +205,7 @@ impl ModelHandle {
         let family = resolve(&raw, registry)?;
         let file = File::open(path).map_err(io_error(path))?;
         let store = read_gguf(&index, &file, &IdentityNames).map_err(LoadError::from)?;
-        Self::build(family, &raw, store, |config| {
+        Self::build(family, &raw, Arc::new(store), |config| {
             TextCodec::from_gguf(&index, constraint_eos(config), config.chat)
                 .map_err(|e| LoadError::Text(Box::new(e)))
         })
@@ -220,6 +221,17 @@ impl ModelHandle {
         registry: &Registry,
         text: impl FnOnce(&ModelConfig) -> Result<TextCodec, LoadError>,
     ) -> Result<Self, DriverError> {
+        Self::build(resolve(raw, registry)?, raw, Arc::new(store), text)
+    }
+
+    /// Build the family `raw` names over a store the caller shares: one section of a multimodal
+    /// checkpoint, whose towers are each a family of their own over the same bytes.
+    pub(crate) fn from_shared(
+        raw: &RawConfig<'_>,
+        store: Arc<WeightStore>,
+        registry: &Registry,
+        text: impl FnOnce(&ModelConfig) -> Result<TextCodec, LoadError>,
+    ) -> Result<Self, DriverError> {
         Self::build(resolve(raw, registry)?, raw, store, text)
     }
 
@@ -227,20 +239,33 @@ impl ModelHandle {
     fn build(
         family: &FamilyEntry,
         raw: &RawConfig<'_>,
-        store: WeightStore,
+        store: Arc<WeightStore>,
         text: impl FnOnce(&ModelConfig) -> Result<TextCodec, LoadError>,
     ) -> Result<Self, DriverError> {
         let model = (family.build)(raw, &store).map_err(DriverError::Model)?;
+        let report = model.weights().report(&store);
+        tracing::info!(
+            family = %model.config().family,
+            loaded = report.loaded.len(),
+            known = report.known.len(),
+            unknown = report.unknown.len(),
+            "checkpoint tensors"
+        );
         let text = text(model.config())?;
-        Ok(Self {
-            model,
-            store: Arc::new(store),
-            text,
-        })
+        Ok(Self { model, store, text })
     }
 
     pub fn config(&self) -> &ModelConfig {
         self.model.config()
+    }
+
+    /// Whether this model has a front end for `modality`, that is, a way to turn that input into
+    /// embeddings. A handle is a text model: its only front end is the token embedding, so it takes
+    /// [`Modality::Text`] and nothing else. A multimodal checkpoint's front end is its own type
+    /// ([`crate::front_end::Idefics3`]) over the towers' handles. A caller decides on this answer,
+    /// never on the model family.
+    pub fn accepts_modality(&self, modality: Modality) -> bool {
+        modality == Modality::Text
     }
 
     pub fn text(&self) -> &TextCodec {

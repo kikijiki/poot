@@ -3,7 +3,7 @@
 //! Held for Card 566b (the VLM front end on the driver): `Qwen25VlApngFrameSource` is the only production
 //! `Qwen25VlDecodedFrameSource` implementation, so the raw-video preprocessing path needs it, and no
 //! production caller constructs it yet. Where rustc reports one as dead it carries
-//! `#[expect(dead_code, reason = "held for POOT-739 (formerly 566b)")]`.
+//! `#[expect(dead_code, reason = "held for POOT-650")]`.
 
 use std::io::Cursor;
 
@@ -34,10 +34,7 @@ pub(crate) struct Qwen25VlApng<'a> {
     pub(crate) frame_timestamps_seconds: Vec<f64>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "held for POOT-739 (formerly 566b)")
-)]
+#[cfg_attr(not(test), expect(dead_code, reason = "held for POOT-650"))]
 impl Qwen25VlApng<'_> {
     pub(crate) fn metadata(&self) -> Qwen25VlVideoMetadata<'_> {
         Qwen25VlVideoMetadata {
@@ -57,10 +54,7 @@ impl Qwen25VlApng<'_> {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "held for POOT-739 (formerly 566b)")
-)]
+#[cfg_attr(not(test), expect(dead_code, reason = "held for POOT-650"))]
 impl<'a> Qwen25VlApng<'a> {
     /// Probe and validate one complete APNG animation from borrowed in-memory bytes.
     pub(crate) fn from_bytes(bytes: &'a [u8]) -> Result<Self, Qwen25VlApngError> {

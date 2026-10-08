@@ -76,7 +76,7 @@ fn sixteen_replayed_steps_record_once() {
     let exe = engine
         .load_weights(
             Arc::new(fixture.store.clone()),
-            poot_executor::WeightSource::ConstNames,
+            poot_executor_parity::fixture_weights(&fixture),
         )
         .unwrap();
     let entry = engine
@@ -476,7 +476,7 @@ fn memory_counters_charge_the_roles_a_decode_entry_allocates_as_wgpu_does() {
         let exe = device
             .load_weights(
                 Arc::new(fixture.store.clone()),
-                poot_executor::WeightSource::ConstNames,
+                poot_executor_parity::fixture_weights(&fixture),
             )
             .unwrap();
         device

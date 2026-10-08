@@ -19,8 +19,9 @@ use poot_quant::format::{
 
 use super::decode_plan::Factors;
 use super::float_decode::emit_float_decode;
+use super::source::Source;
 use crate::KernelGenError;
-use crate::emit::{Emit, bin, copy, cu, emit_read_bits};
+use crate::emit::{Emit, bin, copy, cu};
 
 fn reject(format: WeightFormat, reason: &'static str) -> KernelGenError {
     KernelGenError::UnsupportedDescriptor { format, reason }
@@ -90,7 +91,7 @@ impl PlanarPlan {
     pub(crate) fn emit_factors(
         &self,
         e: &mut Emit,
-        src: &[Local],
+        src: &[Source],
         o: Local,
         k: Local,
         k_total: Local,
@@ -123,7 +124,7 @@ impl PlanarPlan {
     pub(crate) fn emit_value(
         &self,
         e: &mut Emit,
-        src: &[Local],
+        src: &[Source],
         o: Local,
         k: Local,
         k_total: Local,
@@ -192,7 +193,7 @@ impl PlanarPlan {
     fn emit_operand_bits(
         &self,
         e: &mut Emit,
-        src: &[Local],
+        src: &[Source],
         source_index: usize,
         operand: &PlanarOperand,
         o: Local,
@@ -252,7 +253,7 @@ impl PlanarPlan {
             cu(operand.bits as usize),
         );
         let bit = bin(e, Ty::Usize, BinOp::Add, copy(base_bit), copy(lane_bit));
-        emit_read_bits(e, src[source_index], bit, operand.bits)
+        src[source_index].read_bits(e, bit, operand.bits)
     }
 
     /// The static per-group K-value count (`GroupMap::Contiguous`'s size), when this format's
@@ -295,7 +296,7 @@ impl PlanarPlan {
     /// The quantization group of K index `k` (`poot_quant::decode::FormatDescriptor::group_of`,
     /// emitted): `k / group_size` for contiguous groups, `g_idx[k]` (the `GroupIndex` operand, one
     /// `i32` word per K index) for act-order groups.
-    fn emit_group_of(&self, e: &mut Emit, src: &[Local], k: Local) -> Local {
+    fn emit_group_of(&self, e: &mut Emit, src: &[Source], k: Local) -> Local {
         match self.group_size() {
             Some(size) => bin(e, Ty::Usize, BinOp::Div, copy(k), cu(size)),
             None => {
@@ -303,7 +304,7 @@ impl PlanarPlan {
                     .group_index
                     .expect("act-order GPTQ has a GroupIndex source");
                 let bit = bin(e, Ty::Usize, BinOp::Mul, copy(k), cu(32));
-                let bits = emit_read_bits(e, src[group_index], bit, 32);
+                let bits = src[group_index].read_bits(e, bit, 32);
                 // g_idx is stored as a signed i32, but every admitted value is a nonnegative,
                 // in-range group index: `poot_quant::PackedPayload::try_new`'s content validation
                 // (`FormatDescriptor::first_invalid_group_index`, card 542c) refuses a

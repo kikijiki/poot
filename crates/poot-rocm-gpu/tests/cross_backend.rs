@@ -19,6 +19,7 @@ use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_rocm_gpu::device::RocmDevice;
 use poot_tensor::DType;
 use poot_tensor::HostTensor;
+use poot_test_util::const_weights::ConstWeights;
 
 fn try_rocm() -> Option<(Target, Engine<RocmDevice>)> {
     let device = poot_test_util::device_skip::open_or_skip(DeviceBackend::Rocm, RocmDevice::new())?;
@@ -63,8 +64,9 @@ fn run_once_rocm(
         builder.insert(name, WeightEntry::Dense(dense)).unwrap();
     }
     let store = Arc::new(builder.build());
+    let mut weights = ConstWeights::new(&store);
     let staged = {
-        let g = g.clone().with_validations(Vec::new());
+        let g = weights.graph(g).with_validations(Vec::new());
         poot_graph_plan::compile_staged(
             &g,
             &poot_graph_plan::TargetSet::single(poot_graph_plan::DeviceId(0), target),
@@ -72,15 +74,15 @@ fn run_once_rocm(
                 experts: poot_graph_plan::ExpertPlacement::AllResident,
                 devices: poot_graph_plan::DevicePlacement::Single(poot_graph_plan::DeviceId(0)),
             },
-            &poot_graph_plan::CompileOptions {
-                execution: poot_graph_plan::Submission::Replay,
-                limits: poot_graph_plan::CompileLimits::STANDARD,
-            },
+            &poot_graph_plan::CompileOptions::new(
+                poot_graph_plan::Submission::Replay,
+                poot_graph_plan::CompileLimits::STANDARD,
+            ),
         )
         .expect("compile_staged")
     };
     let exe = engine
-        .load_weights(store, poot_executor::WeightSource::ConstNames)
+        .load_weights(Arc::clone(&store), Arc::new(weights.map()))
         .unwrap();
     let entry = engine.add_entry(exe, &staged).unwrap();
     let bytes = engine
@@ -701,6 +703,83 @@ fn gather_axis0_rocm_matches_cpu() {
     );
 }
 
+/// A `Gather` over an I32 const table whose words need all 32 bits ([`poot_test_util::i32_table_gather`])
+/// returns the table's words exactly on ROCm: the table is stored as raw I32, not as its F32 mirror.
+///
+/// Mutation: pin the Gather-over-I32-data component to the mirror lane (drop the `pinned` pass of
+/// `ExactI32StorageAnalysis::new`); the output is the table rounded through F32 and this row goes red.
+#[test]
+fn i32_table_gather_is_exact_beyond_f32_rocm() {
+    use poot_test_util::i32_table_gather as fixture;
+
+    let Some((target, mut rocm)) = try_rocm() else {
+        return;
+    };
+    let g = fixture::graph();
+    let mut builder = WeightStore::builder();
+    let words: Vec<u8> = fixture::table()
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    builder
+        .insert(
+            "table",
+            WeightEntry::Dense(
+                DenseWeight::try_new(DType::I32, vec![6, 4], Arc::from(words)).unwrap(),
+            ),
+        )
+        .unwrap();
+    let store = Arc::new(builder.build());
+    let mut weights = ConstWeights::new(&store);
+    let staged = {
+        let g = weights.graph(&g).with_validations(Vec::new());
+        poot_graph_plan::compile_staged(
+            &g,
+            &poot_graph_plan::TargetSet::single(poot_graph_plan::DeviceId(0), target),
+            &poot_graph_plan::Partition {
+                experts: poot_graph_plan::ExpertPlacement::AllResident,
+                devices: poot_graph_plan::DevicePlacement::Single(poot_graph_plan::DeviceId(0)),
+            },
+            &poot_graph_plan::CompileOptions::new(
+                poot_graph_plan::Submission::Replay,
+                poot_graph_plan::CompileLimits::STANDARD,
+            ),
+        )
+        .expect("compile_staged")
+    };
+    let exe = rocm
+        .load_weights(Arc::clone(&store), Arc::new(weights.map()))
+        .unwrap();
+    let entry = rocm.add_entry(exe, &staged).unwrap();
+    let tokens = fixture::tokens();
+    let token_bytes: Vec<u8> = tokens.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let key = g
+        .inputs
+        .iter()
+        .find_map(|&id| g.meta(id).slot_key().cloned())
+        .expect("the token slot");
+    let shape = [tokens.len()];
+    let mut slots = StepInputs::new();
+    slots.push(
+        key,
+        &shape,
+        poot_executor::HostView::new(DType::I32, tokens.len(), &token_bytes).unwrap(),
+    );
+    let bytes = rocm
+        .step(exe, entry, &slots, &mut NoSync)
+        .unwrap()
+        .read()
+        .unwrap();
+    rocm.unload(exe).unwrap();
+    let got: Vec<i32> = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| i32::from_le_bytes(*c))
+        .collect();
+    fixture::check("rocm", &got).unwrap();
+}
+
 #[test]
 fn matmul_bias_rocm_matches_cpu() {
     let (target, mut rocm) = match try_rocm() {
@@ -1092,8 +1171,9 @@ fn sample_token_greedy_rocm_matches_cpu() {
     let dense = DenseWeight::try_new(DType::F32, tensor.shape().to_vec(), bytes).unwrap();
     builder.insert(name, WeightEntry::Dense(dense)).unwrap();
     let store = Arc::new(builder.build());
+    let mut weights = ConstWeights::new(&store);
     let staged = {
-        let g = g.clone().with_validations(Vec::new());
+        let g = weights.graph(&g).with_validations(Vec::new());
         poot_graph_plan::compile_staged(
             &g,
             &poot_graph_plan::TargetSet::single(poot_graph_plan::DeviceId(0), target),
@@ -1101,15 +1181,15 @@ fn sample_token_greedy_rocm_matches_cpu() {
                 experts: poot_graph_plan::ExpertPlacement::AllResident,
                 devices: poot_graph_plan::DevicePlacement::Single(poot_graph_plan::DeviceId(0)),
             },
-            &poot_graph_plan::CompileOptions {
-                execution: poot_graph_plan::Submission::Replay,
-                limits: poot_graph_plan::CompileLimits::STANDARD,
-            },
+            &poot_graph_plan::CompileOptions::new(
+                poot_graph_plan::Submission::Replay,
+                poot_graph_plan::CompileLimits::STANDARD,
+            ),
         )
         .expect("compile_staged")
     };
     let exe = rocm
-        .load_weights(store, poot_executor::WeightSource::ConstNames)
+        .load_weights(Arc::clone(&store), Arc::new(weights.map()))
         .unwrap();
     let entry = rocm.add_entry(exe, &staged).unwrap();
     let bytes = rocm
@@ -1174,17 +1254,15 @@ fn random_uniform_rocm_matches_cpu() {
                 experts: poot_graph_plan::ExpertPlacement::AllResident,
                 devices: poot_graph_plan::DevicePlacement::Single(poot_graph_plan::DeviceId(0)),
             },
-            &poot_graph_plan::CompileOptions {
-                execution: poot_graph_plan::Submission::Replay,
-                limits: poot_graph_plan::CompileLimits::STANDARD,
-            },
+            &poot_graph_plan::CompileOptions::new(
+                poot_graph_plan::Submission::Replay,
+                poot_graph_plan::CompileLimits::STANDARD,
+            ),
         )
         .expect("compile_staged")
     };
     let store = Arc::new(WeightStore::builder().build());
-    let exe = rocm
-        .load_weights(store, poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let exe = rocm.load_weights(store, Arc::default()).unwrap();
     let entry = rocm.add_entry(exe, &staged).unwrap();
     let seed_bytes: Vec<u8> = seed_data.iter().flat_map(|v| v.to_le_bytes()).collect();
     let mut step_in = StepInputs::new();
@@ -1233,8 +1311,9 @@ fn run_gumbel_family_contract_rocm(
         builder.insert(name, WeightEntry::Dense(dense)).unwrap();
     }
     let store = Arc::new(builder.build());
+    let mut weights = ConstWeights::new(&store);
     let staged = {
-        let g = g.clone().with_validations(Vec::new());
+        let g = weights.graph(g).with_validations(Vec::new());
         poot_graph_plan::compile_staged(
             &g,
             &poot_graph_plan::TargetSet::single(poot_graph_plan::DeviceId(0), target),
@@ -1242,15 +1321,15 @@ fn run_gumbel_family_contract_rocm(
                 experts: poot_graph_plan::ExpertPlacement::AllResident,
                 devices: poot_graph_plan::DevicePlacement::Single(poot_graph_plan::DeviceId(0)),
             },
-            &poot_graph_plan::CompileOptions {
-                execution: poot_graph_plan::Submission::Replay,
-                limits: poot_graph_plan::CompileLimits::STANDARD,
-            },
+            &poot_graph_plan::CompileOptions::new(
+                poot_graph_plan::Submission::Replay,
+                poot_graph_plan::CompileLimits::STANDARD,
+            ),
         )
         .expect("compile_staged")
     };
     let exe = rocm
-        .load_weights(store, poot_executor::WeightSource::ConstNames)
+        .load_weights(Arc::clone(&store), Arc::new(weights.map()))
         .unwrap();
     let entry = rocm.add_entry(exe, &staged).unwrap();
     let mut step_in = StepInputs::new();
@@ -1614,19 +1693,17 @@ fn sample_token_gumbel_topp_only_excludes_untruncated_winner_rocm_matches_cpu() 
 // ---- contraction epilogue (SC-001, SC-006) ------------------------------------------------------------
 //
 // A bias, a pointwise activation and a residual add fuse into the contraction that feeds them, and the fused
-// device program equals the same graph compiled under the routed-expert hang guard (one kernel per equation, the
-// contraction on the schedule its fused plan picks) bit for bit. A narrow head (BF16, F16) rounds to its dtype in
-// registers before the epilogue reads it: the fused kernel keeps the narrow and widen the unfused program's store
-// and reload perform.
+// device program meets the CPU oracle of the unfused graph. A narrow head (BF16, F16) rounds to its dtype in
+// registers before the epilogue reads it: the fused kernel keeps the narrow and widen a separate store and reload
+// would perform.
 
-/// `g` run once on `engine` under the routed-expert hang guard when `guarded`; every input is a named const of its own dtype and the output is
-/// returned as the graph declares it.
+/// `g` run once on `engine`; every input is a named const of its own dtype and the output is returned as the
+/// graph declares it.
 fn run_under(
     engine: &mut Engine<RocmDevice>,
     target: Target,
     g: &Graph,
     inputs: &HashMap<ValueId, HostTensor>,
-    guarded: bool,
 ) -> HostTensor {
     let mut builder = WeightStore::builder();
     for (&id, tensor) in inputs {
@@ -1642,25 +1719,23 @@ fn run_under(
             .insert(meta.name.clone().unwrap(), WeightEntry::Dense(dense))
             .unwrap();
     }
+    let store = Arc::new(builder.build());
+    let mut weights = ConstWeights::new(&store);
+    let named = weights.graph(g);
     let exe = engine
-        .load_weights(
-            Arc::new(builder.build()),
-            poot_executor::WeightSource::ConstNames,
-        )
+        .load_weights(Arc::clone(&store), Arc::new(weights.map()))
         .unwrap();
-    let (gc, caps) = poot_test_util::graph_fixtures::pipeline_input(g, target.caps, guarded);
-    let target = Target { caps, ..target };
     let staged = poot_graph_plan::compile_staged(
-        &gc.with_validations(Vec::new()),
+        &named.with_validations(Vec::new()),
         &poot_graph_plan::TargetSet::single(poot_graph_plan::DeviceId(0), target),
         &poot_graph_plan::Partition {
             experts: poot_graph_plan::ExpertPlacement::AllResident,
             devices: poot_graph_plan::DevicePlacement::Single(poot_graph_plan::DeviceId(0)),
         },
-        &poot_graph_plan::CompileOptions {
-            execution: poot_graph_plan::Submission::Replay,
-            limits: poot_graph_plan::CompileLimits::STANDARD,
-        },
+        &poot_graph_plan::CompileOptions::new(
+            poot_graph_plan::Submission::Replay,
+            poot_graph_plan::CompileLimits::STANDARD,
+        ),
     )
     .expect("compile_staged");
     let entry = engine.add_entry(exe, &staged).unwrap();
@@ -1696,35 +1771,21 @@ fn run_under(
     }
 }
 
-/// The bits of `tensor` widened to f32 (exact for every dtype the rows use).
-fn widened_bits(tensor: &HostTensor) -> Vec<u32> {
-    tensor
-        .to_f32()
-        .expect("a float tensor")
-        .iter()
-        .map(|v| v.to_bits())
-        .collect()
-}
-
-/// The fused program holds exactly one `ContractionEpilogue` over `head`, and the unfused one none.
+/// The compiled program holds exactly one `ContractionEpilogue`, over `head`.
 fn assert_fuses_into_one_epilogue(
     g: &Graph,
     target: &Target,
     head: poot_graph_ir::op::ContractionHead,
 ) {
-    let compile = |guarded| {
-        let (g, caps) = poot_test_util::graph_fixtures::pipeline_input(g, target.caps, guarded);
-        poot_graph_plan::compile(
-            &g,
-            &Target { caps, ..*target },
-            &poot_graph_plan::CompileOptions {
-                execution: poot_graph_plan::Submission::Replay,
-                limits: poot_graph_plan::CompileLimits::STANDARD,
-            },
-        )
-        .expect("the graph compiles")
-    };
-    let fused = compile(false);
+    let fused = poot_graph_plan::compile(
+        g,
+        target,
+        &poot_graph_plan::CompileOptions::new(
+            poot_graph_plan::Submission::Replay,
+            poot_graph_plan::CompileLimits::STANDARD,
+        ),
+    )
+    .expect("the graph compiles");
     let heads: Vec<_> = fused
         .graph()
         .eqns
@@ -1740,32 +1801,17 @@ fn assert_fuses_into_one_epilogue(
         "one fused contraction: {:?}",
         fused.graph().eqns
     );
-    assert!(
-        compile(true)
-            .graph()
-            .eqns
-            .iter()
-            .all(|eqn| !matches!(eqn.op, poot_graph_ir::OpKind::ContractionEpilogue { .. })),
-        "the guard keeps one kernel per equation"
-    );
 }
 
-/// The fused and the unfused device results are bit-identical, and the fused one meets the oracle's tier-2
-/// tolerance (`label` names the row in a failure).
-fn assert_fused_equals_unfused(
+/// The fused device result meets the CPU oracle's tier-2 tolerance (`label` names the row in a failure).
+fn assert_fused_matches_oracle(
     engine: &mut Engine<RocmDevice>,
     target: Target,
     g: &Graph,
     inputs: &HashMap<ValueId, HostTensor>,
     label: &str,
 ) -> HostTensor {
-    let fused = run_under(engine, target, g, inputs, false);
-    let unfused = run_under(engine, target, g, inputs, true);
-    assert_eq!(
-        widened_bits(&fused),
-        widened_bits(&unfused),
-        "{label}: the fused device program must equal the unfused one bit for bit"
-    );
+    let fused = run_under(engine, target, g, inputs);
     let oracle_inputs: HashMap<ValueId, Value> = inputs
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
@@ -1804,11 +1850,11 @@ fn epilogue_chain(
 }
 
 /// SC-001 (ROCm, the decode Gemv): an F32 `[N, K]` projection at `M == 1` with a bias, an activation, a scale
-/// and a residual fuses into one `ContractionEpilogue { head: Dense }`; fused and unfused device results are
-/// bit-identical. Mutation: omit the bias or the residual leaf in `emit_epilogue` (`read_leaf` yields zero); the
+/// and a residual fuses into one `ContractionEpilogue { head: Dense }`; the device result meets the
+/// oracle. Mutation: omit the bias or the residual leaf in `emit_epilogue` (`read_leaf` yields zero); the
 /// nonzero inputs then differ and this row goes red.
 #[test]
-fn a_dense_gemv_epilogue_equals_the_unfused_program_on_rocm() {
+fn a_dense_gemv_epilogue_matches_the_oracle_on_rocm() {
     let Some((target, mut rocm)) = try_rocm() else {
         return;
     };
@@ -1832,7 +1878,7 @@ fn a_dense_gemv_epilogue_equals_the_unfused_program_on_rocm() {
         &target,
         poot_graph_ir::op::ContractionHead::Dense { weight: DType::F32 },
     );
-    assert_fused_equals_unfused(&mut rocm, target, &g, &inputs, "dense gemv epilogue");
+    assert_fused_matches_oracle(&mut rocm, target, &g, &inputs, "dense gemv epilogue");
 }
 
 /// Round an f32 to its BF16 bits, nearest even.
@@ -1843,10 +1889,10 @@ fn bf16_bits(x: f32) -> u16 {
 
 /// POOT-1032 (ROCm, the generated tiled GEMM): the dense head at `M > 1` over an F32 and a packed-BF16 `[N, K]`
 /// weight, with the same chain, fuses into one `ContractionEpilogue { head: Dense }` at a single partial row-tile
-/// (`M == 5`) and at many (`M == 160`); fused and unfused device results are bit-identical. Mutation: drop the
+/// (`M == 5`) and at many (`M == 160`); the device result meets the oracle. Mutation: drop the
 /// epilogue from the tiled store in `tiled_region`; the nonzero inputs then differ and this row goes red.
 #[test]
-fn a_dense_tiled_epilogue_equals_the_unfused_program_on_rocm() {
+fn a_dense_tiled_epilogue_matches_the_oracle_on_rocm() {
     let Some((target, mut rocm)) = try_rocm() else {
         return;
     };
@@ -1882,7 +1928,7 @@ fn a_dense_tiled_epilogue_equals_the_unfused_program_on_rocm() {
                     weight: weight_dtype,
                 },
             );
-            assert_fused_equals_unfused(
+            assert_fused_matches_oracle(
                 &mut rocm,
                 target,
                 &g,
@@ -1894,9 +1940,9 @@ fn a_dense_tiled_epilogue_equals_the_unfused_program_on_rocm() {
 }
 
 /// SC-001 (ROCm, the one-thread-per-output body): a batched F32 `MatMul` the planner lowers serially, with the
-/// same chain, fuses into `ContractionEpilogue { head: MatMul }` and equals the unfused program bit for bit.
+/// same chain, fuses into `ContractionEpilogue { head: MatMul }` and meets the oracle.
 #[test]
-fn a_serial_matmul_epilogue_equals_the_unfused_program_on_rocm() {
+fn a_serial_matmul_epilogue_matches_the_oracle_on_rocm() {
     let Some((target, mut rocm)) = try_rocm() else {
         return;
     };
@@ -1915,15 +1961,15 @@ fn a_serial_matmul_epilogue_equals_the_unfused_program_on_rocm() {
     ]);
     let g = b.finish(out);
     assert_fuses_into_one_epilogue(&g, &target, poot_graph_ir::op::ContractionHead::MatMul);
-    assert_fused_equals_unfused(&mut rocm, target, &g, &inputs, "serial matmul epilogue");
+    assert_fused_matches_oracle(&mut rocm, target, &g, &inputs, "serial matmul epilogue");
 }
 
 /// POOT-1036 (ROCm, the generated tiled GEMM over an f32 `[K, N]` weight): a plain `MatMul` head at `M > 1`
 /// with the same chain fuses into one `ContractionEpilogue { head: MatMul }` at a single partial row-tile
-/// (`M == 5`) and at many (`M == 160`); fused and unfused device results are bit-identical. Mutation: drop the
+/// (`M == 5`) and at many (`M == 160`); the device result meets the oracle. Mutation: drop the
 /// `Tileable` arm of `epilogue_head_lowers`; the head stays apart from its chain and this row goes red.
 #[test]
-fn a_tiled_matmul_epilogue_equals_the_unfused_program_on_rocm() {
+fn a_tiled_matmul_epilogue_matches_the_oracle_on_rocm() {
     let Some((target, mut rocm)) = try_rocm() else {
         return;
     };
@@ -1944,7 +1990,7 @@ fn a_tiled_matmul_epilogue_equals_the_unfused_program_on_rocm() {
         ]);
         let g = b.finish(out);
         assert_fuses_into_one_epilogue(&g, &target, poot_graph_ir::op::ContractionHead::MatMul);
-        assert_fused_equals_unfused(
+        assert_fused_matches_oracle(
             &mut rocm,
             target,
             &g,
@@ -1957,7 +2003,7 @@ fn a_tiled_matmul_epilogue_equals_the_unfused_program_on_rocm() {
 /// SC-006 (ROCm, BF16 and F16 heads): a narrow head rounds to its dtype before its residual reads it. `A = [1, 1]`
 /// against `B = [1, tie]^T`, `tie` half a unit in the last place of 1.0 (`2^-8` BF16, `2^-11` F16), accumulates
 /// to exactly halfway between 1.0 and its successor; round-to-nearest-even rounds the head to 1.0 and the residual
-/// `-1` leaves zero. The fused device program, the unfused one and the CPU decomposition agree and are zero.
+/// `-1` leaves zero. The fused device program and the CPU decomposition agree and are zero.
 ///
 /// Mutation: remove the head's narrow and widen from `emit_epilogue` (`round_through` returns its input
 /// unrounded); the fused kernel then reads the f32 accumulator, yields `tie`, and this row goes red.
@@ -1988,7 +2034,7 @@ fn a_narrow_head_rounds_before_its_residual_on_rocm() {
         ]);
         let g = b.finish(out);
         assert_fuses_into_one_epilogue(&g, &target, poot_graph_ir::op::ContractionHead::MatMul);
-        let got = assert_fused_equals_unfused(
+        let got = assert_fused_matches_oracle(
             &mut rocm,
             target,
             &g,
@@ -2028,6 +2074,6 @@ fn every_step_of_a_narrow_epilogue_rounds_through_its_dtype_on_rocm() {
     ]);
     let g = b.finish(out);
     assert_fuses_into_one_epilogue(&g, &target, poot_graph_ir::op::ContractionHead::MatMul);
-    let got = assert_fused_equals_unfused(&mut rocm, target, &g, &inputs, "bf16 multistage");
+    let got = assert_fused_matches_oracle(&mut rocm, target, &g, &inputs, "bf16 multistage");
     assert_eq!(got.to_f32().unwrap().as_ref(), [1.0]);
 }

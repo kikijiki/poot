@@ -85,7 +85,7 @@ fn run_case(x_shape: Vec<usize>, x_data: Vec<f32>, bytes: Vec<Vec<u8>>, scales: 
         .equation(
             OpKind::PackedContraction {
                 descriptor,
-                blocks: 1,
+                rows: poot_graph_ir::ContractionRows::Blocks(1),
             },
             operands,
         )

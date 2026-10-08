@@ -6,7 +6,7 @@
 //! not a hardcoded wall (deval A5).
 
 use poot_graph_ir::{Graph, OpKind, Operand, ValidationChannel, ValueId};
-use poot_quant::{PackedComponentRef, PackedPayload, SourceRole};
+use poot_quant::{PackedComponentRef, PackedPayload, PackedStack, SourceRole};
 
 use crate::value::PackedEvalError;
 use poot_tensor::{HostData, HostTensor};
@@ -223,4 +223,127 @@ pub(crate) fn evaluate_packed_row_gather(
     let mut shape = ids.shape().to_vec();
     shape.push(k);
     Ok(HostTensor::f32(shape, values))
+}
+
+/// Bind an indexed `PackedContraction`'s stacked carriers (operands `2..`) by role and return the one
+/// [`PackedStack`] every source resolves to. The stacked counterpart of [`packed_components`]: each
+/// carrier must be a [`Value::PackedStack`] of its role, of `descriptor` and `experts` experts, over one
+/// shared stack, and named after one stack id.
+pub(crate) fn packed_stack_components<'a, V: ValidationChannel>(
+    g: &Graph<V>,
+    eqn: &poot_graph_ir::Eqn,
+    env: &'a [Option<Value>],
+    descriptor: poot_quant::PackedWeight,
+    experts: usize,
+) -> Result<&'a std::sync::Arc<PackedStack>, EvalError> {
+    let roles = descriptor.sources();
+    let carriers = eqn.inputs.get(2..).unwrap_or_default();
+    if carriers.len() != roles.len() {
+        return Err(PackedEvalError::Binding { field: "operands" }.into());
+    }
+    let mut first: Option<&poot_quant::PackedStackComponentRef> = None;
+    let mut linear_id: Option<String> = None;
+    for (operand, role) in carriers.iter().zip(roles.iter().copied()) {
+        let Operand::Value(value_id) = operand else {
+            return Err(PackedEvalError::Binding { field: "operands" }.into());
+        };
+        if g.meta(*value_id).storage != poot_graph_ir::Storage::Const {
+            return Err(PackedEvalError::Binding {
+                field: "source.storage",
+            }
+            .into());
+        }
+        let Some(Value::PackedStack(component)) = env[*value_id].as_ref() else {
+            return Err(PackedEvalError::Binding {
+                field: "source.storage",
+            }
+            .into());
+        };
+        if component.role() != role {
+            return Err(PackedEvalError::Binding {
+                field: "source.role",
+            }
+            .into());
+        }
+        if component.weight() != descriptor {
+            return Err(PackedEvalError::Binding {
+                field: "descriptor",
+            }
+            .into());
+        }
+        if component.stack().experts() != experts {
+            return Err(PackedEvalError::Binding { field: "experts" }.into());
+        }
+        if first.is_some_and(|first| !first.same_owner(component)) {
+            return Err(PackedEvalError::OwnerIdentity.into());
+        }
+        first.get_or_insert(component);
+        let name = g
+            .meta(*value_id)
+            .name
+            .as_deref()
+            .and_then(crate::PackedSourceName::parse)
+            .filter(|name| name.role() == role)
+            .ok_or(PackedEvalError::Binding { field: "name" })?;
+        match &linear_id {
+            None => linear_id = Some(name.linear_id().to_string()),
+            Some(existing) if existing != name.linear_id() => {
+                return Err(PackedEvalError::Binding { field: "name" }.into());
+            }
+            _ => {}
+        }
+    }
+    first
+        .map(|component| component.stack())
+        .ok_or(PackedEvalError::Binding { field: "operands" }.into())
+}
+
+/// `out[m, n] = sum over k of x[m, k] * decode(expert ids[m], n, k)`: the indexed packed contraction, evaluated
+/// by decoding only the experts the ids select. Rows are grouped by expert; each distinct selected expert is
+/// decoded once (`charge` is called per decode, so the caller's budget and observer see exactly the experts
+/// read, never the whole table), and the unselected experts' bytes are never touched. Accumulation is the
+/// sequential `k` sum of the dense `IndexedMatMul` oracle over the same decoded weight, bit for bit.
+pub(crate) fn evaluate_packed_indexed(
+    x: &HostTensor,
+    ids: &HostTensor,
+    stack: &PackedStack,
+    out_shape: &[usize],
+    eqn: ValueId,
+    mut charge: impl FnMut() -> Result<(), EvalError>,
+) -> Result<HostTensor, EvalError> {
+    let [out, k] = stack.weight().shape();
+    let m = x.shape()[0];
+    let x_view = x.to_f32()?;
+    let selected: Vec<usize> = super::movement::index_values(ids)?
+        .into_iter()
+        .enumerate()
+        .map(|(position, value)| super::index_rule::index_at(value, position, stack.experts(), eqn))
+        .collect::<Result<_, _>>()?;
+    let mut by_expert: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
+    for (row, &expert) in selected.iter().enumerate() {
+        by_expert.entry(expert).or_default().push(row);
+    }
+    let mut data = vec![0.0f32; checked_packed_oracle_product(m, out, "rows_out")?];
+    let mut weight = vec![0.0f32; checked_packed_oracle_product(out, k, "logical_values")?];
+    for (expert, rows) in by_expert {
+        charge()?;
+        for (row, decoded) in weight.chunks_exact_mut(k).enumerate() {
+            stack.decode_row(expert, row, decoded).map_err(|error| {
+                EvalError::from(PackedEvalError::Decode {
+                    row,
+                    detail: error.to_string(),
+                })
+            })?;
+        }
+        for mm in rows {
+            for nn in 0..out {
+                let mut acc = 0.0f32;
+                for kk in 0..k {
+                    acc += x_view[mm * k + kk] * weight[nn * k + kk];
+                }
+                data[mm * out + nn] = acc;
+            }
+        }
+    }
+    Ok(HostTensor::f32(out_shape.to_vec(), data))
 }

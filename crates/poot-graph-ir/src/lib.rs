@@ -25,24 +25,30 @@ mod test_support;
 pub mod types;
 
 pub use builder::{
-    Builder, BuilderAppendAccounting, BuilderAppendPlan, LayerScope, PreparedBuilderAppend, Traced,
+    Builder, BuilderAppendAccounting, BuilderAppendPlan, LayerScope, PreparedBuilderAppend,
+    ScanResult, Traced,
 };
 pub use error::{
-    BuilderAppendError, BuilderCollection, BuilderValueNamespace, GraphValidationError, ShapeError,
+    BuilderAppendError, BuilderCollection, BuilderValueNamespace, GraphValidationError, ScanReason,
+    ShapeError,
 };
 pub use graph::{
-    ComputedConst, Eqn, ExecutionValidationFailure, Graph, LayerIndex, MAX_VALIDATION_PACKET_BYTES,
-    NoValidations, Operand, Slot, SlotKey, StatePair, StateRole, Storage, ValidationChannel,
-    ValidationId, ValidationOutput, ValidationOutputs, ValidationPacketEntry,
-    ValidationPacketError, ValidationPacketLayout, ValueId, ValueMeta,
+    ComputedConst, Eqn, ExecutionValidationFailure, Graph, LayerIndex, LayerRuns, LayerTagError,
+    MAX_VALIDATION_PACKET_BYTES, NoValidations, Operand, Slot, SlotKey, StatePair, StateRole,
+    Storage, ValidationChannel, ValidationId, ValidationOutput, ValidationOutputs,
+    ValidationPacketEntry, ValidationPacketError, ValidationPacketLayout, ValueId, ValueMeta,
 };
 pub use index_guard::{
     GuardedIndex, IndexBoundsGuard, IndexGuardError, IndexGuardRejection,
     recognize_index_bounds_guard,
 };
 pub use op::{
-    AttentionAttrs, BinOp, DENSE_CONTRACTION_WEIGHT_DTYPES, DENSE_ROW_GATHER_SOURCE_DTYPES,
-    KeyLayout, KvBound, MaskOperand, OpClass, OpKind, RedOp, UnOp,
+    AttentionAttrs, BinOp, ContractionRows, DENSE_CONTRACTION_WEIGHT_DTYPES,
+    DENSE_ROW_GATHER_SOURCE_DTYPES, KeyLayout, KvBound, MaskOperand, OpClass, OpKind, RedOp,
+    ScanAttrs, ScanFamily, ScanLayout, UnOp,
 };
-pub use packed_source::{PackedSourceName, packed_source_constants, packed_source_type};
+pub use packed_source::{
+    PackedSourceName, packed_source_constants, packed_source_type, packed_stack_source_constants,
+    packed_stack_source_type,
+};
 pub use types::{Scalar, TensorType};

@@ -247,34 +247,6 @@
 .catReduce   { background: color-mix(in srgb, #e67e22 15%, transparent);                  color: #935116; }
 .catCompute  { background: color-mix(in srgb, #27ae60 15%, transparent);                  color: #1a6e3c; }
 
-/* Backend comparison table */
-
-.backendTable {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 0.82rem;
-  margin: 1.5rem 0;
-}
-
-.backendTable th {
-  background: var(--ifm-color-emphasis-100);
-  padding: 0.5rem 0.9rem;
-  text-align: left;
-  font-weight: 600;
-  border-bottom: 2px solid var(--ifm-color-emphasis-200);
-}
-
-.backendTable td {
-  padding: 0.4rem 0.9rem;
-  border-bottom: 1px solid var(--ifm-color-emphasis-100);
-}
-
-.backendTable tr:last-child td {
-  border-bottom: none;
-}
-
-/* Status badges live in custom.css (.matrix-status). BackendTable uses .matrix-table. */
-
 /* Fusion before/after toggle */
 
 .fusionToggle {

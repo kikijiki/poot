@@ -29,15 +29,42 @@ let ff = ops::swiglu(b, gate, up);
 ```
 
 Each helper appends primitive eqns; none of them is an opcode. `Builder::finish(out)` (or
-`finish_with_state(out, &[(state_in, state_out)])`) closes the graph. Per-architecture
-tracers live in `poot-models`, for example `poot_models::qwen2::trace_decode_kv_masked(cfg,
-cap)` for a constant-shape masked decode step.
+`finish_with_state(out, &[(state_in, state_out)])`) closes the graph.
+
+## From a family to a step
+
+A model family lives in `poot-models` and implements the `Model` trait. Its `trace(phase, shape)` builds the
+graph of one step: a `StepShape` gives the rows, the new tokens per row, the cache capacity, the KV layout
+(contiguous or paged) and whether logits come back for the last token or every token. A dense decoder is a
+short call of the shared residual pair in `poot_models::components::standard`:
+
+```rust
+let step = Step::new(&b, shape);
+let logits = standard_stack(&b, &step, &stack, &params, layers, |b, l, x| {
+    standard_layer(
+        b, x, &layers[l].norms, &layer_params,
+        |b, h| attention(b, &step, l, h, &layers[l].attn, &attn_params),   // the mixer
+        |b, input| gated_ffn(b, input.block, &layers[l].ffn),              // the feed-forward
+    )
+});
+step.finish(b, logits)
+```
+
+`standard_stack` embeds the step's tokens, runs one `layer_scope` per layer and applies the final norm and the
+head. `standard_layer` is `x += mixer(norm(x)); x += ffn(norm(x))`. A mixture-of-experts family passes a routed
+feed-forward, a latent-attention or Mamba2 family passes another mixer, and the shared pieces (attention, norms,
+rotary embeddings, projections, routers) are reused rather than copied. The pieces are described on
+[Models, Registry and the Driver](./driver.mdx).
+
+Prefill and decode are one body. The step's token and position inputs are typed slots with absolute
+positions, so a prefill is a step that continues from a position, and a decode is the same graph with one
+new token.
 
 **Adding a model is writing a graph.** A family is a config type parsed from the checkpoint, a table
-mapping weight names to `(layer, role)`, and plain tracer functions over shared components. KV layout,
+mapping weight names to `(layer, role)`, a fixture, and a tracer over shared components. KV layout,
 batching, paging, weight format and device limits are not the tracer's business: they are binding
-choices, graph transforms or planner legalization. Today some of this still lives in per-variant
-tracer wrappers and in the runner.
+choices, graph transforms or planner legalization, and nothing in the driver, the planner or an executor
+changes when a family is added. The family is registered in the model registry, which is how the driver finds it.
 
 ## How the tracer records eqns
 
@@ -62,9 +89,8 @@ name with `Builder::constant`. The checkpoint loader binds device buffers to tho
 close. Const buffers never move.
 
 **Slots** (`Storage::Slot`). Per-step inputs such as the token id and position
-(`Slot::Token`, `Slot::Pos`; paged decode adds `Slot::SlotMap`). The dense families (qwen2 and its
-relatives, bloom, granite, mpt, smollm3, gemma2) build the attention mask in-graph from `Slot::Pos`
-instead of taking it as a slot; other families still take it as a `Slot::Mask` input. Each slot is
+(`Slot::Token`, `Slot::Pos`; paged decode adds `Slot::SlotMap`). The attention mask is built in-graph
+from `Slot::Pos`; no slot carries it. Each slot is
 bound to a stable device buffer that the host rewrites in place every step.
 
 **State** (`Storage::State`). The KV cache. Each `state_in` binder is paired with a
@@ -78,7 +104,7 @@ requires.
 
 A Qwen2.5-0.5B decode step (24 layers, 896 hidden dim, 14 Q heads, 2 KV heads) traces to
 a flat graph of primitive eqns, on the order of a thousand or more. Count it with
-`poot_graph_ir::analysis::dispatch_count` on `trace_decode_kv_masked(Qwen2Config::qwen2_0_5b(), cap)`.
+`poot_graph_ir::analysis::dispatch_count` on the traced decode graph.
 Every shape is known statically at trace time. The trace takes a few milliseconds and
 happens once at model load.
 
@@ -116,9 +142,9 @@ special FFN opcode exists.
 
 ## Checkpoint loading
 
-`poot-load` reads safetensors directories and GGUF files and binds tensors to the graph's named
-consts. Supported quantized formats bind packed constants. Dense projections decode them in the
-consuming contraction; packed MoE paths still materialize expert tables. Fused QKV tensors are split, and
+`poot-load` reads safetensors directories and GGUF files into a weight store, and the family's weight map
+binds tensors to the graph's named consts. Supported quantized formats bind packed constants. Dense projections decode them in the
+consuming contraction, and a packed expert stack is read by one indexed packed contraction. Fused QKV tensors are split, and
 transposed layouts corrected, at load time. Packed projections stay packed. Dense BF16/F16 tensors are
 loaded as stored BF16/F16 words; there is one loader and no widened f32 copy of any tensor. The bound
 graph reads a stored BF16/F16 norm scale, bias or embedding through an explicit cast to f32 (a gather
@@ -129,9 +155,10 @@ cannot read this way is a typed error at bind.
 
 MoE layers (`ops::moe`, `moe_sparse`, `moe_grouped`) compute router scores, select the
 top-k expert ids with `ArgTopK`, and contract each row against its own expert with
-`IndexedMatMul`. Dense expert tables are read in place. Packed expert weights use per-expert
-`PackedDequant` branches followed by movement/stacking and `IndexedMatMul`; the current execution
-path materializes that table; there is no direct packed indexed contraction.
+`IndexedMatMul`. Dense expert tables are read in place. A packed expert stack is rewritten when its
+weights are bound into one indexed packed contraction over the stored blocks, one buffer per source
+role with each expert padded to whole words; only the selected experts' blocks are decoded, and no
+expert table is materialized.
 
 Expert ids are runtime values, not slots. The graph structure (which ops run) is fixed;
 the ids are computed inside the graph each token.

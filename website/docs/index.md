@@ -14,8 +14,8 @@ inference with async capture/replay.
 
 - **[Develop](./develop/index.md)**: build the workspace, run models as a library, author `#[kernel]` functions,
   embed crates.
-- **[Serve](./serve/index.md)**: OpenAI-compatible HTTP server. It starts, bounds requests and serves encoder
-  embeddings and reranking; generation returns when the new scheduling loop lands.
+- **[Serve](./serve/index.md)**: OpenAI-compatible HTTP server. It starts, bounds requests and loads any
+  registered model; every route that runs it returns `503` until the new scheduling loop lands.
 - **[Architecture](./architecture/index.mdx)**: graph IR, fusion, backends, capture/replay, serving design.
 
 ## Develop

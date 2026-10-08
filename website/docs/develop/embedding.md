@@ -52,7 +52,7 @@ let handle = ModelHandle::load("/path/to/gptq-model".as_ref(), &registry, &LoadO
 
 A family the registry does not know is a typed refusal, `DriverError::Unsupported(Unsupported::Registry(..))`.
 The dense, mixture-of-experts (Qwen3-MoE, Granite MoE, Mixtral, OLMoE, gpt-oss), MLA (DeepSeek) and hybrid
-(Nemotron-H) families are registered. A registered family refuses to load on the Runner.
+(Nemotron-H) families are registered, as are the BERT encoders and the SmolVLM vision tower (below).
 `LoadOptions::integrity` names a manifest of file lengths and SHA-256 digests the load checks before it reads a tensor.
 
 Useful accessors after load: `handle.config()` (family, vocabulary, positions, end-of-sequence ids),
@@ -133,18 +133,25 @@ let text = handle.text().decode(&ids)?;
 
 ## Sentence embeddings and reranking
 
-Embeddings and reranking come from BERT-class models, through the encoder types:
+Embeddings and reranking come from BERT-class models, which run on the driver's `Encode` step on the device
+you open. `SentenceEncoder` and `CrossEncoder` load a checkpoint and a backend, tokenize, run the step and
+do the host side (pooling, normalization, ranking):
 
 ```rust
-use poot_llm::encoder::{CrossEncoderRunner, EncoderRunner};
+use std::path::Path;
+use poot_llm::driver::{BackendChoice, open_executor};
+use poot_llm::encoders::{CrossEncoder, SentenceEncoder};
 
-let enc = EncoderRunner::load("/path/to/all-minilm")?;
-let vec = enc.embed("a small domestic cat")?; // L2-normalized
+let mut enc = SentenceEncoder::load(Path::new("/path/to/all-minilm"), open_executor(BackendChoice::Auto)?)?;
+let vectors = enc.embed(&["a small domestic cat", "a young kitten"])?; // L2-normalized
 let ranked = enc.rerank("query", &["doc a", "doc b"])?;
 
-let ce = CrossEncoderRunner::load("/path/to/ms-marco-minilm")?;
+let mut ce = CrossEncoder::load(Path::new("/path/to/ms-marco-minilm"), open_executor(BackendChoice::Auto)?)?;
 let ranked = ce.rerank("query", &["doc a", "doc b"])?;
 ```
+
+A decoder's embedding pass is the same step: `Driver::encode` over token rows returns the final hidden state of
+every position, and the pooling is yours.
 
 ## What not to do in-process
 

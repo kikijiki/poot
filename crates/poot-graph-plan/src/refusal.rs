@@ -92,6 +92,9 @@ pub enum Capability {
     /// The attention kernel keeps one lane's running state (`dv` output channels and two scalars) in
     /// workgroup memory, and not even one lane's fits the device's `lds_bytes`.
     AttentionLds { dv: usize, lds_bytes: u32 },
+    /// The scan kernel keeps one state column (`rows` floats) per lane in workgroup memory, and not even one
+    /// lane's fits the device's `lds_bytes`.
+    ScanLds { rows: usize, lds_bytes: u32 },
     /// The selected generator's own precondition on its shape or count arguments rejected this
     /// equation (card 531b): the planner chose this lowering for the equation's dtypes and target, but
     /// forwarded it a static value the generator itself refuses to build a body for.
@@ -134,6 +137,9 @@ pub enum StorageGap {
     /// An F16 dense-contraction weight is stored packed two elements per `u32` word (Card 1007), so it must be a
     /// const no other equation reads and no output observes.
     F16PackedLanes,
+    /// An E4M3FN `DenseRowGather` table is stored packed four elements per `u32` word with padded rows
+    /// (POOT-1060), so it must be a const no other equation reads and no output observes.
+    E4m3PackedLanes,
     /// Exact I32 values compile, but production bind, replay and typed readback are not wired.
     ExactI32BindReplay,
 }
@@ -297,6 +303,11 @@ impl fmt::Display for Capability {
                 "the attention kernel needs {} bytes of workgroup memory for one lane at value dim {dv}, the device has {lds_bytes}",
                 4 * (dv + 2)
             ),
+            Capability::ScanLds { rows, lds_bytes } => write!(
+                f,
+                "the scan kernel needs {} bytes of workgroup memory for one state column of {rows} rows, the device has {lds_bytes}",
+                4 * rows
+            ),
             Capability::KernelGen(err) => write!(f, "kernel generator: {err}"),
             Capability::KernelResources(err) => write!(f, "kernel resources: {err}"),
             Capability::PackedLowering { format, op } => {
@@ -337,6 +348,10 @@ impl fmt::Display for StorageGap {
             StorageGap::F16PackedLanes => f.write_str(
                 "a packed-F16 dense-contraction weight must be a const read only by dense contractions, \
                  not a computed value, an output or a buffer another kernel reads natively",
+            ),
+            StorageGap::E4m3PackedLanes => f.write_str(
+                "a packed-E4M3 row-gather table must be a const read only by dense row gathers, \
+                 not a computed value, an output or a buffer another kernel reads as raw bytes",
             ),
             StorageGap::ExactI32BindReplay => {
                 f.write_str("production bind, replay and typed readback are not wired")

@@ -61,9 +61,15 @@ from the list. The lane runs the tests listed as `model-free` in `scripts/test-m
 the script generates from the test binaries: run `just test-model-free-inventory-regen` after adding, renaming, or
 deleting a test. In most packages a test's class is derived (`model-free`, or `real-dims` for a test whose name ends
 in `_real_dims`). In packages that mix host tests with device or checkpoint tests (`poot-llm`, `poot-load`,
-`poot-models`, `poot-serve`, `pootc`, `poot-kernelgen` and the runtime crates) you choose `model-free` or
-`checkpoint-device` for each new test by reading it. `scripts/test-model-free.sh self-test` (also
-`just test-model-free-inventory`) checks the checker and the lane against known-bad inventories.
+`poot-models`, `poot-serve`, `pootc`, `poot-kernelgen` and the runtime crates) you choose `model-free`,
+`checkpoint` (loads a model; `just test-optional` runs it) or `device` (dispatches on a device) for each new test
+by reading it. `scripts/test-model-free.sh self-test` (also `just test-model-free-inventory`) checks the checker
+and the lane against known-bad inventories.
+
+`just test-lane-coverage` (part of `just test`) fails when a test runs in no lane: a `device` test, or any test of a
+package the model-free lane excludes, must match one of the `test-device-*` selections in the `justfile`. Select a
+device crate by `package(...)` there, so a test added later is picked up, and list the new test in
+`scripts/required-device-cases/<lane>.txt`.
 
 To run the push gate (formatting, benchmark harness tests and the complete `just test-model-free` gate)
 before every `git push`, opt in with `just install-pre-push-hook`.

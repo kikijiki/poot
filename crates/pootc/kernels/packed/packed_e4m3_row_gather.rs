@@ -2,8 +2,8 @@
 //!
 //! One thread owns one output element `i`. The table arrives as packed `u32` lanes holding the checkpoint
 //! bytes verbatim: four little-endian E4M3FN elements per lane, laid out **per row** the way
-//! `poot_eval::fp8::PortableE4m3FnLayout` packs them and the way `poot_gpu`'s `BoundValueKind::E4m3Fn`
-//! upload writes them - `words_per_row = row_width.div_ceil(4)`, so element `c` of row `r` lives in lane
+//! `poot_eval::fp8::PortableE4m3FnLayout` packs them and the way the executor's
+//! `StorageLayout::E4m3Packed` upload (`poot_executor::lanes::row_padded_words`) writes them - `words_per_row = row_width.div_ceil(4)`, so element `c` of row `r` lives in lane
 //! `r * words_per_row + c / 4` at shift `(c % 4) * 8`. The per-row rounding is why the lane comes from
 //! `words_per_row` and not from a flat `element / 4`: a row whose width is not a multiple of four starts
 //! the next row in the *next* lane, not mid-lane. This is the only portable E4M3FN read on wgpu (the

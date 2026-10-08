@@ -13,7 +13,7 @@
 //! layer shared by every row and addressed through the step's slot maps ([`Step::paged`]),
 //! declared `Positional` on axis 0; the leading axis of a pool is the slot axis, not a row axis.
 
-use poot_graph_ir::{Builder, ComputedConst, StateRole, TensorType, Traced, ops};
+use poot_graph_ir::{BinOp, Builder, ComputedConst, StateRole, TensorType, Traced, ops};
 use poot_quant::weights::{AttnRole, WeightId, WeightMap, WeightRole};
 
 use super::linear::{Weight, WeightError, linear};
@@ -50,6 +50,7 @@ pub struct AttentionParams {
     sinks: bool,
     value_from_key: bool,
     value_norm: Option<NormParams>,
+    output_gate: bool,
 }
 
 impl AttentionParams {
@@ -114,6 +115,7 @@ impl AttentionParams {
             sinks: false,
             value_from_key: false,
             value_norm: None,
+            output_gate: false,
         })
     }
 
@@ -218,6 +220,23 @@ impl AttentionParams {
         }
     }
 
+    /// The query projection also emits a per-head output gate (Qwen3-Next): each head's `2 * head_dim`
+    /// rows are its query then its gate, and the attention output is multiplied by `sigmoid(gate)`
+    /// before the output projection. The Q projection (and its bias) is `2 * heads * head_dim` wide.
+    /// Needs separate projections.
+    pub fn with_output_gate(self) -> Result<Self, ParamError> {
+        if self.fused_qkv {
+            return Err(ParamError::new(
+                "attn_output_gate",
+                ConfigReason::Unsupported,
+            ));
+        }
+        Ok(Self {
+            output_gate: true,
+            ..self
+        })
+    }
+
     /// V is the raw K projection (before K's norm and RoPE) instead of its own projection, so the
     /// layer has no V weights (Gemma 4's global layers). Needs separate, unbiased projections.
     pub fn with_value_from_key(self) -> Result<Self, ParamError> {
@@ -309,6 +328,8 @@ impl AttentionWeights {
             Weight::new(map, WeightId::layer(layer, WeightRole::Attn(role)), shape)
         };
         let (q, kv) = (p.heads * p.head_dim, p.kv_heads * p.head_dim);
+        // With an output gate each head projects its query and its gate.
+        let q_rows = if p.output_gate { 2 * q } else { q };
         let qkv = if p.fused_qkv {
             QkvWeights::Fused {
                 qkv: w(AttnRole::Qkv, &[3 * q, width])?,
@@ -321,7 +342,7 @@ impl AttentionWeights {
         } else {
             let bias = if p.qkv_bias {
                 Some([
-                    w(AttnRole::QBias, &[q])?,
+                    w(AttnRole::QBias, &[q_rows])?,
                     w(AttnRole::KBias, &[kv])?,
                     w(AttnRole::VBias, &[kv])?,
                 ])
@@ -329,7 +350,7 @@ impl AttentionWeights {
                 None
             };
             QkvWeights::Separate(Box::new(SeparateQkv {
-                q: w(AttnRole::Q, &[q, width])?,
+                q: w(AttnRole::Q, &[q_rows, width])?,
                 k: w(AttnRole::K, &[kv, width])?,
                 v: if p.value_from_key {
                     None
@@ -504,6 +525,23 @@ pub fn attention(
     w: &AttentionWeights,
     p: &AttentionParams,
 ) -> Traced {
+    attention_selecting(b, step, layer, x, w, p, &|_, mask| mask)
+}
+
+/// Replaces the causal-over-cache mask `[rows, 1, tokens, capacity]` of an attention with the one a
+/// selector builds from it (a sparse selection narrows which cached positions a query reads).
+pub type MaskSelector<'a> = &'a dyn Fn(&Builder, Traced) -> Traced;
+
+/// [`attention`] under the mask `select` makes of the causal one.
+pub fn attention_selecting(
+    b: &Builder,
+    step: &Step,
+    layer: usize,
+    x: Traced,
+    w: &AttentionWeights,
+    p: &AttentionParams,
+    select: MaskSelector<'_>,
+) -> Traced {
     let shape = step.shape();
     let (rows, t, cap) = (shape.rows.get(), shape.tokens.get(), shape.capacity.get());
     let (hq, hkv, d) = (p.heads, p.kv_heads, p.head_dim);
@@ -531,6 +569,15 @@ pub fn attention(
             };
             (part(0), part(1), part(2))
         }
+    };
+    // Each head's rows are its query then its gate: `[rows, tokens, heads, 2 * head_dim]`.
+    let (q, gate) = if p.output_gate {
+        let pairs = b.reshape(q, vec![rows, t, hq, 2 * d]);
+        let part =
+            |from: usize| b.reshape(b.slice(pairs, 3, from, from + d), vec![rows, t, hq * d]);
+        (part(0), Some(part(d)))
+    } else {
+        (q, None)
     };
     let (q, k) = match (p.qk_norm, &w.qk_norm) {
         (Some(QkNorm::Projection(np)), Some([qw, kw])) => (norm(b, q, qw, np), norm(b, k, kw, np)),
@@ -564,6 +611,7 @@ pub fn attention(
     } else {
         ops::causal_mask_from_pos(b, step.pos(), cap, p.window)
     };
+    let mask = select(b, mask);
     let out = match &w.sinks {
         Some(sinks) => ops::attention_prefill_with_sink(
             b,
@@ -589,6 +637,10 @@ pub fn attention(
         ),
     };
     let out = b.reshape(b.transpose(out, vec![0, 2, 1, 3]), vec![rows, t, hq * d]);
+    let out = match gate {
+        Some(gate) => b.binary(BinOp::Mul, out, ops::sigmoid(b, gate)),
+        None => out,
+    };
     linear(b, out, &w.o, w.o_bias.as_ref())
 }
 
@@ -629,6 +681,8 @@ mod tests {
         scale: Option<f32>,
         positions: Positions,
         sinks: bool,
+        /// Each head's query rows are followed by its output gate (Qwen3-Next).
+        gate: bool,
     }
 
     const BASE: Opts = Opts {
@@ -638,6 +692,7 @@ mod tests {
         scale: None,
         positions: Positions::HalfSplit,
         sinks: false,
+        gate: false,
     };
 
     fn params(o: Opts) -> AttentionParams {
@@ -666,6 +721,9 @@ mod tests {
         }
         if o.sinks {
             p = p.with_sinks().unwrap();
+        }
+        if o.gate {
+            p = p.with_output_gate().unwrap();
         }
         p
     }
@@ -701,12 +759,13 @@ mod tests {
 
     fn fixture(o: Opts) -> Fx {
         let (q, kv) = (HEADS * HEAD_DIM, KV_HEADS * HEAD_DIM);
+        let q_rows = if o.gate { 2 * q } else { q };
         let mut fx = Fx::new(31);
-        fx.bf16(id(AttnRole::Q), &[q, WIDTH]);
+        fx.bf16(id(AttnRole::Q), &[q_rows, WIDTH]);
         fx.f32(id(AttnRole::K), &[kv, WIDTH]);
         fx.bf16(id(AttnRole::V), &[kv, WIDTH]);
         fx.f32(id(AttnRole::O), &[WIDTH, q]);
-        fx.f32(id(AttnRole::QBias), &[q]);
+        fx.f32(id(AttnRole::QBias), &[q_rows]);
         fx.bf16(id(AttnRole::KBias), &[kv]);
         fx.f32(id(AttnRole::VBias), &[kv]);
         if let Some(per_head) = o.qk_norm {
@@ -815,13 +874,25 @@ mod tests {
         let mut queries = Vec::new();
         for (i, &p) in pos.iter().enumerate() {
             let xi: Vec<f64> = x[i * WIDTH..][..WIDTH].iter().map(|&v| v.into()).collect();
-            let mut q = proj(
+            let q_rows = if o.gate { 2 * q_dim } else { q_dim };
+            let projected = proj(
                 &vals(AttnRole::Q),
                 &vals(AttnRole::QBias),
                 &xi,
-                q_dim,
+                q_rows,
                 WIDTH,
             );
+            // Each head's `2 * HEAD_DIM` rows are its query then its gate.
+            let (mut q, gate) = if o.gate {
+                let part = |from: usize| -> Vec<f64> {
+                    (0..HEADS)
+                        .flat_map(|h| projected[h * 2 * HEAD_DIM + from..][..HEAD_DIM].to_vec())
+                        .collect()
+                };
+                (part(0), part(HEAD_DIM))
+            } else {
+                (projected, Vec::new())
+            };
             let mut k = proj(
                 &vals(AttnRole::K),
                 &vals(AttnRole::KBias),
@@ -865,13 +936,13 @@ mod tests {
                 caches[0][at..at + HEAD_DIM].copy_from_slice(&k[h * HEAD_DIM..][..HEAD_DIM]);
                 caches[1][at..at + HEAD_DIM].copy_from_slice(&v[h * HEAD_DIM..][..HEAD_DIM]);
             }
-            queries.push(q);
+            queries.push((q, gate));
         }
         let scale = o.scale.map_or(1.0 / (HEAD_DIM as f64).sqrt(), f64::from);
         // ALiBi's published slopes for 4 heads: 2^(-8 (h + 1) / 4).
         let slope = |h: usize| 2f64.powf(-8.0 * (h + 1) as f64 / HEADS as f64);
         let mut out = Vec::new();
-        for (i, q) in queries.iter().enumerate() {
+        for (i, (q, gate)) in queries.iter().enumerate() {
             let mut attn = vec![0.0f64; q_dim];
             for h in 0..HEADS {
                 let g = h / (HEADS / KV_HEADS);
@@ -904,6 +975,11 @@ mod tests {
                     for c in 0..HEAD_DIM {
                         attn[h * HEAD_DIM + c] += e / sum * caches[1][(g * CAP + j) * HEAD_DIM + c];
                     }
+                }
+            }
+            if o.gate {
+                for (a, g) in attn.iter_mut().zip(gate) {
+                    *a /= 1.0 + (-g).exp();
                 }
             }
             out.extend(proj(&vals(AttnRole::O), &[], &attn, WIDTH, q_dim));
@@ -1016,6 +1092,64 @@ mod tests {
         assert_eq!(
             plain.with_sinks().unwrap().with_softcap(1.0),
             Err(ParamError::new("softcap", ConfigReason::Unsupported))
+        );
+    }
+
+    /// The output gate (Qwen3-Next): each head's `2 * head_dim` Q rows are its query then its gate,
+    /// the attention output is multiplied by `sigmoid(gate)` before the output projection, alone and
+    /// with per-head Q/K norm, and the gate rows matter (the Q weight is in the perturbation list;
+    /// a gate that ignored its rows would not change when only they change). Mutation: apply the
+    /// gate after the output projection, or read the gate from the query rows; red.
+    #[test]
+    fn the_output_gate_matches_the_reference() {
+        assert_matches_reference(Opts { gate: true, ..BASE });
+        assert_matches_reference(Opts {
+            gate: true,
+            qk_norm: Some(true),
+            ..BASE
+        });
+    }
+
+    /// The gate rows alone change the output: with the same query rows and different gate rows the
+    /// attention differs, and the gated attention differs from the ungated one.
+    #[test]
+    fn only_the_gate_rows_change_a_gated_attention() {
+        let cache_len = KV_HEADS * CAP * HEAD_DIM;
+        let state = [oracle::random(cache_len, 41), oracle::random(cache_len, 42)];
+        let x = oracle::random(3 * WIDTH, 43);
+        let pos = [2, 3, 4];
+        let gated = Opts { gate: true, ..BASE };
+        let fx = fixture(gated);
+        let base = run(&fx, gated, &x, &pos, &state).0;
+        // Replace the gate rows of every head, keeping its query rows.
+        let q_rows = 2 * HEADS * HEAD_DIM;
+        let mut values = fx.values(id(AttnRole::Q));
+        let fresh = oracle::random(q_rows * WIDTH, 77);
+        for head in 0..HEADS {
+            let from = (head * 2 * HEAD_DIM + HEAD_DIM) * WIDTH;
+            values[from..from + HEAD_DIM * WIDTH]
+                .copy_from_slice(&fresh[from..from + HEAD_DIM * WIDTH]);
+        }
+        let mut other = fx.clone();
+        other.set(id(AttnRole::Q), &[q_rows, WIDTH], values);
+        assert_ne!(run(&other, gated, &x, &pos, &state).0, base);
+        assert_ne!(run(&fixture(BASE), BASE, &x, &pos, &state).0, base);
+    }
+
+    /// A fused QKV projection has no per-head query/gate rows to split.
+    #[test]
+    fn an_output_gate_excludes_the_fused_projection() {
+        let rope = RopeParams::new(HEAD_DIM, THETA, &RopeFlavor::Plain).unwrap();
+        let fused = AttentionParams::new(HEADS, HEADS, HEAD_DIM, false, rope)
+            .unwrap()
+            .with_fused_qkv()
+            .unwrap();
+        assert_eq!(
+            fused.with_output_gate(),
+            Err(ParamError::new(
+                "attn_output_gate",
+                ConfigReason::Unsupported
+            ))
         );
     }
 

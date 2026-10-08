@@ -177,6 +177,27 @@ impl ExactValue {
         }
     }
 
+    /// This value as a [`HostTensor`] of its own dtype and bits (a BF16 value keeps its two-byte words,
+    /// unlike [`Self::materialize_dense`], which decodes to F32 for arithmetic). For a site that moves
+    /// elements without reading them as numbers. Never called for [`Self::I32`].
+    pub(crate) fn materialize_stored(&self) -> HostTensor {
+        let bf16_words = |view: &ExactBf16TensorView| {
+            let words: Vec<u16> = (0..view.numel()).map(|flat| view.word(flat)).collect();
+            HostTensor::bf16(view.shape().to_vec(), words)
+        };
+        match self {
+            Self::Dense(view) if view.dtype() == DType::BF16 => {
+                bf16_words(&ExactBf16TensorView::from_owner_view(view).expect(
+                    "DenseOwnerTensorView::new only ever pairs dtype BF16 with an owner of \
+                     ExactSourceKind::Bf16",
+                ))
+            }
+            Self::Dense(_) => self.materialize_dense(),
+            Self::Bf16(view) => bf16_words(view),
+            Self::I32(_) => unreachable!("materialize_stored is never called for ExactValue::I32"),
+        }
+    }
+
     pub(crate) fn reshape(&self, shape: Vec<usize>) -> Result<Self, EvalError> {
         match self {
             Self::Dense(view) => view.reshape(shape).map(Self::Dense).map_err(Into::into),

@@ -27,6 +27,11 @@ impl<'a> Emitter<'a> {
             Rvalue::Len(place) => self.emit_len(place.local, w),
             Rvalue::Cast { to, operand } => self.emit_cast(to, operand, w),
             Rvalue::Bitcast { to, operand } => self.emit_bitcast(to, operand, w),
+            Rvalue::Select {
+                condition,
+                if_true,
+                if_false,
+            } => self.emit_select(condition, if_true, if_false, w),
             Rvalue::Fp8Encode { format, operand } => {
                 self.emit_fp8_encode(*format, operand, dest_ty, w)
             }
@@ -500,6 +505,23 @@ impl<'a> Emitter<'a> {
         let t = self.fresh();
         let _ = writeln!(w, "  {t} = bitcast {from_llty} {v} to {to_llty}");
         Ok((t, to_llty))
+    }
+
+    /// `select i1 c, T a, T b`: LLVM moves the chosen operand's bits, so a NaN payload passes through at any
+    /// float width.
+    pub(super) fn emit_select(
+        &mut self,
+        condition: &Operand,
+        if_true: &Operand,
+        if_false: &Operand,
+        w: &mut String,
+    ) -> Result<(String, String), EmitError> {
+        let (c, _) = self.operand(condition, w)?;
+        let (a, llty) = self.operand(if_true, w)?;
+        let (b, _) = self.operand(if_false, w)?;
+        let t = self.fresh();
+        let _ = writeln!(w, "  {t} = select i1 {c}, {llty} {a}, {llty} {b}");
+        Ok((t, llty))
     }
 
     pub(super) fn emit_unary(

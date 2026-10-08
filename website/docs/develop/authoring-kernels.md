@@ -82,8 +82,8 @@ prefill) are imported-from-Rust kernels dispatched every step.
 Most of poot's kernels are never hand-authored: a fusion/lowering pass generates a `Body` for an
 equation shape at compile time (the elementwise, reduce, matmul and attention families kernelgen
 produces on the fly). Authoring a kernel in Rust and shipping it as a committed asset is for the kernels
-that family generation doesn't cover: the coalesced decode GEMVs over a `[K, N]` weight (f32 and BF16,
-with and without bias), the coarsened prefill GEMMs, the M > 1 BF16 contraction over a checkpoint-order
+that family generation doesn't cover: the coalesced decode GEMVs over an f32 `[K, N]` weight
+(with and without bias), the coarsened prefill GEMMs, the M > 1 BF16 contraction over a checkpoint-order
 weight and the flash-attention bodies, whose shape-generic form is simpler to hand-write than to
 synthesize per shape (the decode GEMV over a checkpoint-order `[N, K]` weight is generated), the
 on-device sampler bodies, the I8 KV-cache pack/unpack pair, the packed-row gathers, and a handful of

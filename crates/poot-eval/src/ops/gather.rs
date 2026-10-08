@@ -159,7 +159,7 @@ impl crate::Value {
                 )
             }
             crate::Value::Owner(value) => Err(value.unsupported("Gather")),
-            crate::Value::Packed(_) => {
+            crate::Value::Packed(_) | crate::Value::PackedStack(_) => {
                 Err(EvalError::Packed(crate::PackedEvalError::WrongConsumer {
                     operation: "Gather",
                 }))

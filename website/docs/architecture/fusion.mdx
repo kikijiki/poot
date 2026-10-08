@@ -38,7 +38,7 @@ registers or shared memory. `poot_graph_ir::analysis::dispatch_count` gives a gr
 crate's `assets/`). The plan carries the imported body and the executor dispatches its precompiled
 SPIR-V/PTX/AMDGPU artifact. Imported kernels cover the shapes the synthesizer does not:
 
-- Decode `MatMul` (M=1) and batched GEMV variants (`gemv_coalesced*.rs`)
+- Decode `MatMul` (M=1) over an f32 `[K, N]` weight, and its batched variant (`gemv_coalesced*.rs`)
 - Greedy argmax and the batched samplers (`argmax_batched.rs`, `sample_*_gumbel_argmax_batched.rs`)
 
 Data movement (`Gather`, `Scatter`, `Slice`, `Concat`, `Transpose`, `Broadcast`, `DynamicUpdateSlice`) is
@@ -67,9 +67,11 @@ flash attention rewrite replaces the whole chain, both matmuls included).
 
 **Pointwise chains.** `Binary` ops and the unaries `Neg`, `Exp`, `Log`, `Sqrt`, `Recip`, `Tanh`,
 and `Erf` (plus the I32 bit ops and `Select`, whose I32 condition is a region input) with compatible
-iteration spaces fuse into one synthesized elementwise kernel. A float `Select` is a bitwise select
-inside the kernel, so a NaN or Inf in the branch it does not pick never reaches the result; it joins
-pointwise regions, not row (reduction-rooted) ones, because a row kernel reads float lanes only. The
+iteration spaces fuse into one synthesized elementwise kernel. A float `Select` is a bit-moving select
+inside the kernel (a hardware select, never arithmetic), so a NaN or Inf in the branch it does not pick never reaches
+the result; it joins pointwise regions, not row (reduction-rooted) ones, because a row kernel reads float lanes only.
+Over BF16 or F16 branches the select moves the two-byte elements as stored, so it plans as its own kernel on ROCm
+and PTX; a SPIR-V target has no native two-byte lane and refuses it with a typed `DtypeLowering`. The
 activations are compositions over these, so SwiGLU and GeGLU fuse as plain `Exp`/`Div`/`Mul` chains, and a value read more than once (the activation's input)
 fuses as long as every read is inside the same region. `MatMul`, `Gather`, `Scatter`, `Concat`,
 `Reduce`, the movement ops (`Reshape`, `Slice`, `Broadcast`, `Transpose`), and the unary `Round`
@@ -119,7 +121,7 @@ request, imported from a shipped kernel, or needs no dispatch at all.
 | **Elementwise**       | `Fused` pointwise region                         | Synthesized: one thread per element                                                                                       |
 | **Reduction**         | `FusedRow` region                                | Synthesized: block reduce + epilogue in shared memory                                                                     |
 | **GEMV**              | `MatMul` with M=1 (decode)                       | Imported or `kernelgen::gemv_lds`: one workgroup per output row                                                           |
-| **Tiled GEMM**        | `MatMul` with f32 operands, M>1 and a 2-D weight | Synthesized by `kg::tiled_region`: 2-D tile with LDS staging (not under the routed-expert hang guard)                     |
+| **Tiled GEMM**        | `MatMul` with f32 operands, M>1 and a 2-D weight | Synthesized by `kg::tiled_region`: 2-D tile with LDS staging                                                                |
 | **Tensor-core GEMM**  | bf16 operands                                    | WMMA bodies on PTX and ROCm; not on wgpu                                                                                  |
 | **Attention**         | `Attention`                                      | Generated from `KernelRequest::Attention` (`AttentionSpec`): one workgroup per (batch row, Q head, query row), lanes striding the keys, softcap optional |
 | **Dequant GEMV/GEMM** | `PackedContraction`                              | Generated decode from the format descriptor, then contraction                                                             |
@@ -155,11 +157,9 @@ fusion boundaries. A narrow contraction result rounds before a following F32 epi
 that epilogue is fused. The numerical comparison class describes device scheduling; it does not
 prove a semantic graph rewrite legal.
 
-A target that records the routed-expert hang (`KnownMiscompiles::routed_expert_tiling_hang`, set for ROCm
-and PTX) compiles a graph with a routed-expert site without the attention, fusion and tiling group. A
-site is a router contraction over more than one row whose `ArgTopK` expert ids feed an indexed
-contraction, so a one-row decode keeps the group. The guard does not bypass packed recognition or
-legalization. Callers select typed options, not their own pass sequence.
+Every target runs every pass on every graph, a routed-expert prefill included: `compile` has no per-graph
+skip. Packed recognition and legalization run in the same fixed order. Callers select typed options, not
+their own pass sequence.
 
 Planner refusals are typed and name the equation and missing capability. The executor contract
 consumes the complete `Program`: `compile_staged` stages it for one device and `Executor::add_entry`
@@ -168,8 +168,7 @@ loads it, so no caller re-plans the graph.
 ## What fusion reports
 
 `poot_graph_ir::analysis::dispatch_count` and `poot_graph_ir::analysis::peak_transient_bytes` (peak live
-activation bytes) are computed from the graph. `poot-serve` runs no generation engine, so its generation counters stay at
-zero.
+activation bytes) are computed from the graph. `poot-serve` reports the driver's compile count and device bytes on `/metrics`.
 
 ## Implementation details
 

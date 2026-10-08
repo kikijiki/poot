@@ -340,20 +340,12 @@ pub fn gemv_grid(out_numel: usize, caps: &DeviceCaps) -> (usize, usize) {
 /// element-count-only (unlike the K-scaled `serial_dequant_work`), and the box's own wgpu/RADV device is
 /// measured at 220_000 (`DeviceCaps::wgpu_rdna3_igpu`), between the proven-safe 201088 and the
 /// proven-hanging 250880.
-///
-/// `weight_bf16` selects the packed-BF16-weight body variant (same coalesced shape; the weight is
-/// `&[u32]` lanes holding checkpoint BF16, widened in-register) under the eligibility rule
-/// [`crate::matmul_bf16_decode_gemv_eligible`] - dtype-driven planning, not a separate menu. The
-/// chunk arm is never taken with `weight_bf16` (eligibility excludes the over-trigger chunk shape on a
-/// device with a watchdog budget), so that path stays f32-only.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_gemv_plan(
     site: Site<'_>,
     backend: Backend,
     k: usize,
     n: usize,
     out_numel: usize,
-    weight_bf16: bool,
     caps: &DeviceCaps,
 ) -> Result<Planned, PlanError> {
     // One workgroup of GEMV_WIDTH lanes per output element on the same 2-D spill grid every
@@ -365,19 +357,6 @@ pub(crate) fn decode_gemv_plan(
     let grid = [(gx * GEMV_WIDTH) as u32, gy as u32, 1];
     // B=1 (`out_numel == n`) takes no metadata; a batched decode binds `dims = [B]`.
     let batch_meta = (out_numel != n).then(|| vec![(out_numel / n.max(1)) as u32]);
-    if weight_bf16 {
-        debug_assert!(
-            caps.watchdog_budget
-                .is_none_or(|w| out_numel <= w.decode_gemv_out_elems as usize),
-            "bf16 decode GEMV eligibility excludes the over-trigger chunk shape"
-        );
-        let kernel = if batch_meta.is_some() {
-            ImportedKernel::GemvBatchedCoalescedBf16
-        } else {
-            ImportedKernel::GemvCoalescedBf16
-        };
-        return Ok(Planned::imported(kernel, backend, batch_meta, grid));
-    }
     let over_trigger = caps
         .watchdog_budget
         .is_some_and(|w| out_numel > w.decode_gemv_out_elems as usize);

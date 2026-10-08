@@ -19,7 +19,7 @@ use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
 use crate::components::ffn::{GatedFfnWeights, gated_ffn};
 use crate::components::linear::WeightError;
 use crate::components::standard::{
-    BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
+    BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_embeddable_step,
     standard_layer, standard_stack,
 };
 use crate::model::{
@@ -164,9 +164,13 @@ impl Model for Qwen2 {
         shape: StepShape,
     ) -> Result<Graph<ValidationOutputs>, TraceError> {
         let p = &self.params;
-        check_step(FAMILY, phase, shape, p.max_positions)?;
+        check_embeddable_step(FAMILY, phase, shape, p.max_positions)?;
         let b = Builder::new();
-        let step = Step::new(&b, shape);
+        let step = match phase {
+            Phase::Prefill | Phase::Decode => Step::new(&b, shape),
+            Phase::PrefillEmbeds => Step::with_embeds(&b, shape, p.width),
+            Phase::Encode => Step::new(&b, shape).returning_hidden(),
+        };
         let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
             let layer = &self.layers[l];
             standard_layer(
@@ -222,6 +226,10 @@ mod tests {
 
     use super::*;
     use crate::components::standard::oracle::{self, run_step};
+    /// The first four dimensions of the mean over `PROMPT`'s positions of the `Encode` hidden state on
+    /// the fixture: the sentence vector before any normalization (tier 2).
+    const RECORDED_MEAN: [f32; 4] = [-0.6346052, 0.3129701, 0.27594122, -0.24472162];
+
     use crate::components::testing::{
         CAP, Recorded, assert_bf16_and_q8_0_trace_through_the_packed_transform,
         assert_chunked_prefill_equals_decode, assert_matches_recorded, build as build_ok, close,
@@ -297,6 +305,121 @@ mod tests {
     fn chunked_prefill_continuing_from_pos_equals_token_by_token_decode() {
         let fx = fixture();
         assert_chunked_prefill_equals_decode(&*model(&fx.raw(), &fx.store), &fx.store);
+    }
+
+    /// The prompt every encode and embeds test traces.
+    const PROMPT: [i32; 5] = [3, 17, 40, 8, 25];
+
+    fn zero_state(g: &Graph<ValidationOutputs>) -> Vec<Vec<f32>> {
+        g.state
+            .iter()
+            .map(|&(si, _)| vec![0.0; g.aval(si).numel()])
+            .collect()
+    }
+
+    /// One `PrefillEmbeds` step of `PROMPT` on the oracle: the logits at every position, with
+    /// `embeds` (`[tokens, width]`) over the positions `at` marks.
+    fn prefill_embeds(
+        model: &dyn Model,
+        store: &WeightStore,
+        tokens: &[i32],
+        embeds: &[f32],
+        at: &[i32],
+    ) -> Vec<f32> {
+        let shape = crate::components::testing::step_shape(tokens.len(), CAP, LogitRows::All);
+        let g = model.trace(Phase::PrefillEmbeds, shape).unwrap();
+        let state = zero_state(&g);
+        let state: Vec<&[f32]> = state.iter().map(Vec::as_slice).collect();
+        let pos: Vec<i32> = (0..tokens.len() as i32).collect();
+        oracle::eval_slots(
+            &g,
+            store,
+            model.weights(),
+            &[],
+            &[(Slot::Token, tokens), (Slot::Pos, &pos)],
+            (
+                &[("activation.embeds_at", at)],
+                &[("activation.embeds", embeds)],
+            ),
+            &state,
+        )
+        .0
+    }
+
+    /// SC-001 (model half): `PrefillEmbeds` scatters the caller's rows over the embedded tokens.
+    /// Rows equal to the table rows of the tokens they replace change nothing; a row that is another
+    /// token's embedding gives that token's logits; with nothing marked the rows are never read.
+    /// Mutation: ignore the mask (take the rows at every position); the unmarked case goes red.
+    #[test]
+    fn prefill_embeds_replaces_only_the_marked_positions() {
+        let fx = fixture();
+        let model = model(&fx.raw(), &fx.store);
+        let w = 64;
+        let table = values(fx.store.get("model.embed_tokens.weight").unwrap());
+        let row = |t: i32| &table[t as usize * w..(t as usize + 1) * w];
+        let (plain, _) = run_step(&*model, &fx.store, Phase::Prefill, CAP, &PROMPT, 0, &[]);
+
+        // Table rows over positions 1 and 3: the same logits as the tokens.
+        let mut embeds = vec![0.0; PROMPT.len() * w];
+        for i in [1, 3] {
+            embeds[i * w..(i + 1) * w].copy_from_slice(row(PROMPT[i]));
+        }
+        let at = [0, 1, 0, 1, 0];
+        close(
+            &prefill_embeds(&*model, &fx.store, &PROMPT, &embeds, &at),
+            &plain,
+        );
+
+        // Position 2 takes token 7's row: the logits of the prompt with token 7 there.
+        let mut embeds = vec![0.0; PROMPT.len() * w];
+        embeds[2 * w..3 * w].copy_from_slice(row(7));
+        let swapped = [3, 17, 7, 8, 25];
+        let (want, _) = run_step(&*model, &fx.store, Phase::Prefill, CAP, &swapped, 0, &[]);
+        let got = prefill_embeds(&*model, &fx.store, &PROMPT, &embeds, &[0, 0, 1, 0, 0]);
+        close(&got, &want);
+        assert_ne!(got, plain, "the replaced row did not reach the logits");
+
+        // Nothing marked: whatever the rows hold is never read.
+        let junk = vec![7.5; PROMPT.len() * w];
+        close(
+            &prefill_embeds(&*model, &fx.store, &PROMPT, &junk, &[0; 5]),
+            &plain,
+        );
+    }
+
+    /// SC-004: the `Encode` phase returns the head's input, the final-norm hidden state of every
+    /// position: its product with the head weight is the `Prefill` logits at every position (tier
+    /// 2), and mean pooling it on the host gives the recorded sentence vector. Mutation: take the
+    /// hidden state one layer early (skip the last layer); the head product no longer equals the
+    /// logits and this goes red.
+    #[test]
+    fn encode_returns_the_head_input_and_its_host_mean_is_the_sentence_vector() {
+        let fx = fixture();
+        let model = model(&fx.raw(), &fx.store);
+        let w = 64;
+        let (hidden, state) = run_step(&*model, &fx.store, Phase::Encode, CAP, &PROMPT, 0, &[]);
+        assert_eq!(hidden.len(), PROMPT.len() * w);
+        let _ = state;
+        let (logits, _) = run_step(&*model, &fx.store, Phase::Prefill, CAP, &PROMPT, 0, &[]);
+        let head: Vec<f64> = values(fx.store.get("lm_head.weight").unwrap())
+            .into_iter()
+            .map(f64::from)
+            .collect();
+        let hidden64: Vec<f64> = hidden.iter().map(|&v| f64::from(v)).collect();
+        let want = crate::architectures::bert::reference::dense(
+            &hidden64,
+            PROMPT.len(),
+            &head,
+            &vec![0.0; VOCAB],
+        );
+        oracle::assert_matches_f64(&logits, &want, 1e-4);
+
+        let mean: Vec<f32> = (0..w)
+            .map(|j| {
+                (0..PROMPT.len()).map(|i| hidden[i * w + j]).sum::<f32>() / PROMPT.len() as f32
+            })
+            .collect();
+        close(&mean[..4], &RECORDED_MEAN);
     }
 
     /// SC-004: BF16 and Q8_0 stores trace through the one body and the packed

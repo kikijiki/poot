@@ -251,7 +251,7 @@ fn render_jinja_core(
     // `.startswith`, ...) that minijinja lacks by default, so real GGUF/HF chat_templates fail to render
     // ("unknown method: map has no method named get") and callers silently drop to the ChatFormat fallback.
     // minijinja-contrib's pycompat implements those methods on maps/strings/lists; wiring it here covers every
-    // render_jinja_* caller (Runner's chat path and poot-serve's gemma4/qwen3next backends funnel through
+    // render_jinja_* caller (the text codec's chat path and poot-serve's backends funnel through
     // render_jinja_core).
     env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
     // Templates call raise_exception(...) on an invalid conversation; surface it as an error (which the caller
@@ -401,7 +401,7 @@ mod read_tokenizer_config_chat_tests {
     }
 
     /// `tokenizer_config.json` alone is not enough for current HF releases that ship their template as a standalone
-    /// `chat_template.jinja` file (e.g. `openai/gpt-oss-20b`). Without the fallback, `Runner::render_chat_value` would
+    /// `chat_template.jinja` file (e.g. `openai/gpt-oss-20b`). Without the fallback, `TextCodec::render_chat_value` would
     /// silently degrade to the hardcoded `ChatFormat` for any such model.
     #[test]
     fn falls_back_to_standalone_chat_template_jinja_file() {
@@ -492,7 +492,7 @@ mod jinja_chat_template {
 
     #[test]
     fn bad_template_errors_so_the_caller_can_fall_back() {
-        // An unsupported/broken template surfaces an error (Runner::render_chat turns it into a ChatFormat fallback) rather than panicking.
+        // An unsupported/broken template surfaces an error (`TextCodec::render_chat` turns it into a ChatFormat fallback) rather than panicking.
         assert!(render_jinja_chat("{% for x in %}", MSGS, None, None, None).is_err());
     }
 

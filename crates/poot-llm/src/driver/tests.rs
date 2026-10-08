@@ -14,18 +14,22 @@ use std::sync::{Arc, Mutex};
 
 use poot_executor::{
     BufferRole, Device, Dispatch, Engine, EntryId, ExecError, ExecutableId, Executor,
-    ExecutorStats, HostSync, StateScope, StepInputs, StepOutputs, WeightSource,
+    ExecutorStats, HostSync, StateScope, StepInputs, StepOutputs,
 };
-use poot_graph_ir::{BinOp, Builder, Graph, Slot, StateRole, TensorType, ValidationOutputs};
+use poot_graph_ir::{BinOp, Builder, Graph, StateRole, TensorType, ValidationOutputs};
 use poot_graph_plan::{CompileOptions, StagedProgram, Submission, Target, TargetSet};
 use poot_models::chat::ChatFormat;
+use poot_models::components::linear::{Weight, linear};
 use poot_models::components::standard::Step;
 use poot_models::model::{
     ConfigReason, FamilyKey, LogitRows, Model, ModelConfig, ModelError, ModelOutput, Phase,
     ShapeReason, StepShape, TraceError,
 };
 use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig, Registry};
-use poot_quant::weights::{WeightMap, WeightStore};
+use poot_quant::weights::{
+    AttnRole, DenseWeight, WeightEntry, WeightId, WeightKey, WeightMap, WeightRole, WeightStore,
+    WeightView,
+};
 use poot_target::{Backend, DeviceCaps, ElementKind};
 use poot_tensor::DType;
 use tokenizers::Tokenizer;
@@ -68,7 +72,7 @@ pub(super) enum Variant {
     Recurrent,
     /// A recurrent state whose row axis is axis 1 (`[4, rows]`): malformed.
     BadRowAxis,
-    /// A `Slot::LoraIdx` input added into the logits.
+    /// One `w.l0.attn.q` projection `[VOCAB, 4]` the LoRA pass can adapt, added into the logits.
     Lora,
 }
 
@@ -150,7 +154,7 @@ impl Model for Tiny {
         let out = n - first;
         let token = b.cast(b.slice(step.tokens(), 1, first, n), DType::F32);
         let pos = b.cast(b.slice(step.pos(), 1, first, n), DType::F32);
-        let mut seed = b.binary(BinOp::Add, token, pos);
+        let seed = b.binary(BinOp::Add, token, pos);
         match self.variant {
             Variant::Plain => {}
             Variant::Recurrent | Variant::BadRowAxis => {
@@ -172,12 +176,15 @@ impl Model for Tiny {
                 let folded = b.binary(BinOp::Add, state, spread);
                 step.carry(state, folded);
             }
-            Variant::Lora => {
-                let idx = b.slot(Slot::LoraIdx, TensorType::f32(vec![rows]));
-                seed = b.binary(BinOp::Add, seed, b.reshape(idx, vec![rows, 1]));
-            }
+            Variant::Lora => {}
         }
-        let logits = b.broadcast(b.reshape(seed, vec![rows, out, 1]), vec![rows, out, VOCAB]);
+        let mut logits = b.broadcast(b.reshape(seed, vec![rows, out, 1]), vec![rows, out, VOCAB]);
+        if self.variant == Variant::Lora {
+            let q = Weight::new(&self.weights, tiny_projection(), &[VOCAB, 4])
+                .expect("the lora variant's store holds its projection");
+            let inputs = b.broadcast(b.reshape(seed, vec![rows, out, 1]), vec![rows, out, 4]);
+            logits = b.binary(BinOp::Add, logits, linear(&b, inputs, &q, None));
+        }
         Ok(step.finish(b, logits))
     }
 }
@@ -186,7 +193,7 @@ impl Model for Tiny {
 /// "eos_token_id": [..]}`.
 fn build_tiny(
     raw: &RawConfig<'_>,
-    _store: &WeightStore,
+    store: &WeightStore,
     log: TraceLog,
 ) -> Result<Box<dyn Model>, ModelError> {
     let RawConfig::HfJson { config, .. } = raw else {
@@ -237,9 +244,42 @@ fn build_tiny(
             prefill_granule: granule,
             chat: ChatFormat::ChatML,
         },
-        weights: WeightMap::default(),
+        weights: tiny_weights(variant, store),
         log,
     }))
+}
+
+/// The one projection the lora variant carries.
+fn tiny_projection() -> WeightId {
+    WeightId::layer(0, WeightRole::Attn(AttnRole::Q))
+}
+
+/// The checkpoint of the fake family: empty, except the lora variant's `[VOCAB, 4]` projection.
+fn tiny_store(variant: Variant) -> WeightStore {
+    let mut builder = WeightStore::builder();
+    if variant == Variant::Lora {
+        let values: Vec<u8> = (0..VOCAB * 4)
+            .flat_map(|i| (((i * 7) % 11) as f32 / 11.0 - 0.4).to_le_bytes())
+            .collect();
+        builder
+            .insert(
+                "q",
+                WeightEntry::Dense(
+                    DenseWeight::try_new(DType::F32, vec![VOCAB, 4], Arc::from(values)).unwrap(),
+                ),
+            )
+            .unwrap();
+    }
+    builder.build()
+}
+
+fn tiny_weights(variant: Variant, store: &WeightStore) -> WeightMap {
+    let mut map = WeightMap::builder(store);
+    if variant == Variant::Lora {
+        map.map(tiny_projection(), WeightView::Stored(WeightKey::from("q")))
+            .unwrap();
+    }
+    map.build()
 }
 
 fn tiny_config(granule: usize, max_positions: usize, variant: Variant) -> serde_json::Value {
@@ -316,6 +356,8 @@ struct World {
     add_entry_calls: usize,
     /// Make `remove_entry` fail, for the unload-atomicity row.
     fail_remove: bool,
+    /// Make `unload` fail, for the unload-ordering row.
+    fail_unload: bool,
 }
 
 type Shared = Rc<RefCell<World>>;
@@ -512,11 +554,14 @@ impl Executor for Counting {
     fn target_set(&self) -> TargetSet {
         self.inner.target_set()
     }
+    fn free_memory_bytes(&self) -> Option<u64> {
+        self.inner.free_memory_bytes()
+    }
 
     fn load_weights(
         &mut self,
         store: Arc<WeightStore>,
-        weights: WeightSource,
+        weights: Arc<WeightMap>,
     ) -> Result<ExecutableId, ExecError> {
         self.inner.load_weights(store, weights)
     }
@@ -573,6 +618,12 @@ impl Executor for Counting {
     }
 
     fn unload(&mut self, exe: ExecutableId) -> Result<(), ExecError> {
+        if self.world.borrow().fail_unload {
+            return Err(ExecError::Device(Box::new(poot_executor::DeviceError {
+                backend: "fake",
+                source: Box::new(FakeError),
+            })));
+        }
         self.inner.unload(exe)
     }
 }
@@ -672,7 +723,9 @@ fn build_rig(options: RigOptions, script: Script) -> Result<Rig, DriverError> {
         generation: None,
     };
     let handle =
-        ModelHandle::from_checkpoint(&raw, WeightStore::default(), &registry, |_| Ok(tiny_text()))?;
+        ModelHandle::from_checkpoint(&raw, tiny_store(options.variant), &registry, |_| {
+            Ok(tiny_text())
+        })?;
     let world: Shared = Rc::new(RefCell::new(World {
         script,
         entries: Vec::new(),
@@ -684,6 +737,7 @@ fn build_rig(options: RigOptions, script: Script) -> Result<Rig, DriverError> {
         weight_allocations: 0,
         add_entry_calls: 0,
         fail_remove: false,
+        fail_unload: false,
     }));
     let device = FakeDevice {
         world: world.clone(),
@@ -694,15 +748,12 @@ fn build_rig(options: RigOptions, script: Script) -> Result<Rig, DriverError> {
         world: world.clone(),
         log,
     };
-    let compile = CompileOptions {
-        execution: Submission::Replay,
-        limits: poot_graph_plan::CompileLimits::STANDARD,
-    };
+    let compile = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
     let driver = Driver::new(
         Arc::new(handle),
         Box::new(executor),
         DriverOptions {
-            prefill: compile,
+            prefill: compile.clone(),
             decode: compile,
             capacity: nz(options.capacity),
             prefill_chunk: nz(options.chunk),

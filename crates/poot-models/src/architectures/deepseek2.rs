@@ -22,8 +22,6 @@ use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
 use poot_graph_ir::rope_table::RopeFlavor;
-#[cfg(test)]
-use poot_graph_ir::{BinOp, TensorType, Traced, ops::swiglu};
 use poot_graph_ir::{Builder, Graph, ValidationOutputs};
 use poot_quant::weights::{
     AttnRole, DsaRole, ExpertProj, FfnRole, MlaRole, NormRole, WeightMap, WeightRole, WeightStore,
@@ -806,6 +804,7 @@ fn moe_names(source: ConfigSource, routing: &Routing, shared: bool) -> MoeNames 
                 gate: ".mlp.shared_experts.gate_proj",
                 up: ".mlp.shared_experts.up_proj",
                 down: ".mlp.shared_experts.down_proj",
+                scalar_gate: None,
             }),
             experts: HF_EXPERTS,
         },
@@ -817,6 +816,7 @@ fn moe_names(source: ConfigSource, routing: &Routing, shared: bool) -> MoeNames 
                 gate: ".ffn_gate_shexp",
                 up: ".ffn_up_shexp",
                 down: ".ffn_down_shexp",
+                scalar_gate: None,
             }),
             experts: GGUF_EXPERTS,
         },
@@ -1120,225 +1120,6 @@ fn fixture() -> Fixture {
     Fixture::bf16(config, shapes)
 }
 
-// ---- test references ---------------------------------------------------------------------------
-// The interleaved RoPE, its YaRN tables written from HF's `_compute_yarn_parameters` and the dense
-// SwiGLU block that deepseek4's and qwen3.8's tests compare against (held for POOT-568 and 572).
-
-/// DeepSeek's interleaved-pair RoPE (module docs, item 6): each adjacent pair `(x[2i], x[2i+1])`
-/// rotates by its own angle, unlike [`poot_graph_ir::ops::rope`]'s half-split pairing
-/// (`x[i]` with `x[i+d/2]`).
-///
-/// ```text
-/// out[2i]   = x[2i]*cos[i] - x[2i+1]*sin[i]
-/// out[2i+1] = x[2i]*sin[i] + x[2i+1]*cos[i]
-/// ```
-///
-/// `x[.., D]` (`D` even); `cos`/`sin` are already position-selected, `[.., D/2]` (one angle per
-/// pair). Deinterleave by reshaping `D -> [D/2, 2]` and slicing index `0`/`1` (as
-/// `poot_models::gpt_oss::gptoss_ffn` does), rotate elementwise, then reshape each half to
-/// `[.., D/2, 1]` and `concat` on the new trailing axis to reinterleave (the row-major flatten of
-/// `[.., D/2, 2]` is the interleaved order).
-#[cfg(test)]
-pub(crate) fn rope_interleave_apply(b: &Builder, x: Traced, cos: Traced, sin: Traced) -> Traced {
-    let shape = b.aval(x).shape;
-    let d = *shape.last().expect("rope on a scalar");
-    let last = shape.len() - 1;
-    let half = d / 2;
-
-    let mut pair_shape = shape.clone();
-    pair_shape[last] = half;
-    pair_shape.push(2); // [.., D/2, 2]
-    let xp = b.reshape(x, pair_shape);
-
-    let mut half_shape = shape.clone();
-    half_shape[last] = half; // [.., D/2]
-    let x_even = b.reshape(b.slice(xp, last + 1, 0, 1), half_shape.clone()); // x[2i]
-    let x_odd = b.reshape(b.slice(xp, last + 1, 1, 2), half_shape.clone()); // x[2i+1]
-
-    let ec = b.binary(BinOp::Mul, x_even, cos);
-    let os = b.binary(BinOp::Mul, x_odd, sin);
-    let out_even = b.binary(BinOp::Sub, ec, os); // x[2i]*cos - x[2i+1]*sin
-
-    let es = b.binary(BinOp::Mul, x_even, sin);
-    let oc = b.binary(BinOp::Mul, x_odd, cos);
-    let out_odd = b.binary(BinOp::Add, es, oc); // x[2i]*sin + x[2i+1]*cos
-
-    let mut col_shape = half_shape;
-    col_shape.push(1); // [.., D/2, 1]
-    let oe = b.reshape(out_even, col_shape.clone());
-    let oo = b.reshape(out_odd, col_shape);
-    let cat = b.concat(last + 1, &[oe, oo]); // [.., D/2, 2] - row-major flatten IS interleaved order
-    b.reshape(cat, shape)
-}
-
-/// [`rope_interleave_apply`] for a full sequence `x[.., L, D]` at positions `0..L`; the interleaved
-/// analog of [`poot_graph_ir::ops::rope_prefill`].
-#[cfg(test)]
-pub(crate) fn rope_interleaved_prefill(
-    b: &Builder,
-    x: Traced,
-    cos_table: Traced,
-    sin_table: Traced,
-    seq_len: usize,
-) -> Traced {
-    let cos = b.slice(cos_table, 0, 0, seq_len); // [L, D/2]
-    let sin = b.slice(sin_table, 0, 0, seq_len);
-    rope_interleave_apply(b, x, cos, sin)
-}
-
-/// [`rope_interleave_apply`] for one decode step at a runtime `pos`; the interleaved analog of
-/// [`poot_graph_ir::ops::rope`].
-#[cfg(test)]
-pub(crate) fn rope_interleaved_decode(
-    b: &Builder,
-    x: Traced,
-    cos_table: Traced,
-    sin_table: Traced,
-    pos: Traced,
-) -> Traced {
-    let cos = b.gather_scalar(cos_table, 0, pos); // [D/2]
-    let sin = b.gather_scalar(sin_table, 0, pos);
-    rope_interleave_apply(b, x, cos, sin)
-}
-
-#[cfg(test)]
-/// YaRN RoPE-scaling parameters of the reference tables.
-///
-/// Two separate corrections from `modeling_deepseek_v2.py`:
-/// 1. **The RoPE table** (`DeepseekV2RotaryEmbedding`/`_compute_yarn_parameters`, see
-///    `poot_llm::gguf::yarn_inv_freq`): an NTK-by-parts ramp blending extrapolated (unscaled) and
-///    interpolated (divided by `factor`) per-frequency values, plus a constant `attention_factor`
-///    multiplier on the cos/sin table (`freqs_cis * self.attention_scaling`).
-/// 2. **The attention softmax scale** (`self.scaling = yarn_apply_mscale(config.rope_parameters,
-///    self.qk_head_dim ** (-0.5))`): a `mscale^2` correction from `mscale_all_dim` on top of
-///    `qk_head_dim^-0.5`, applied whenever `rope_scaling.type != "default"`
-///    (`yarn_get_mscale(factor, mscale_all_dim)`, squared); see `softmax_mscale_sq`.
-///
-/// These are different scalars. V2-Lite's `mscale == mscale_all_dim == 0.707` gives
-/// `attention_factor == 1.0` while `softmax_mscale_sq` is still ~1.59 (`get_mscale(40, 0.707)^2`).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct DeepseekV2Yarn {
-    /// context-extension factor (`rope_scaling.factor`).
-    pub factor: f32,
-    /// NTK-by-parts ramp low-end, extrapolation side (`rope_scaling.beta_fast`, HF default 32).
-    pub beta_fast: f32,
-    /// NTK-by-parts ramp high-end, interpolation side (`rope_scaling.beta_slow`, HF default 1).
-    pub beta_slow: f32,
-    /// the checkpoint's pretrained context length (`rope_scaling.original_max_position_embeddings`).
-    pub original_max_position_embeddings: usize,
-    /// the RoPE table's cos/sin magnitude multiplier, as resolved by the loader: an explicit
-    /// `rope_scaling.attention_factor` if present, else `get_mscale(factor, mscale) /
-    /// get_mscale(factor, mscale_all_dim)` when both `mscale` and `mscale_all_dim` are nonzero, else the
-    /// generic YaRN default `get_mscale(factor, 1.0)`.
-    pub attention_factor: f32,
-    /// the extra softmax-scale correction: `get_mscale(factor, mscale_all_dim)^2` when
-    /// `rope_scaling.mscale_all_dim` is nonzero, else `1.0`.
-    pub softmax_mscale_sq: f32,
-}
-
-#[cfg(test)]
-/// The dense per-layer MLP for layers `< first_k_dense_replace`: SwiGLU without bias
-/// (`DeepseekV2MLP`), `linear -> linear -> swiglu -> linear`.
-pub(crate) fn deepseek2_dense_ffn(
-    b: &Builder,
-    normed: Traced,
-    h: usize,
-    inter: usize,
-    li: usize,
-) -> Traced {
-    let p = |s: &str| format!("model.layers.{li}.{s}");
-    let wg = b.constant(&p("mlp.gate_proj.weight"), TensorType::f32(vec![h, inter]));
-    let wu = b.constant(&p("mlp.up_proj.weight"), TensorType::f32(vec![h, inter]));
-    let wd = b.constant(&p("mlp.down_proj.weight"), TensorType::f32(vec![inter, h]));
-    let g = poot_graph_ir::ops::linear(b, normed, wg, None);
-    let u = poot_graph_ir::ops::linear(b, normed, wu, None);
-    let act = swiglu(b, g, u);
-    poot_graph_ir::ops::linear(b, act, wd, None)
-}
-
-#[cfg(test)]
-/// Build the interleaved-pair RoPE table for DeepSeek's decoupled-rope slice: `cos`/`sin`
-/// `[max_pos, rope_dim/2]`, one angle per pair. Shared by this module's CPU-oracle test and (via
-/// `poot_llm::runner`) the safetensors loader, so the table math has one definition.
-///
-/// `yarn: None` builds the unscaled table. `yarn: Some(_)` applies the NTK-by-parts ramp and
-/// `attention_factor` scale of `poot_llm::gguf::yarn_inv_freq` (verified against an f64 reference by
-/// `yarn_matches_hf_reference_formula`), on an interleaved table (see [`DeepseekV2Yarn`]). The math is
-/// duplicated here because `poot-models` must not depend on `poot-llm`.
-pub(crate) fn deepseek2_rope_tables_interleaved(
-    max_pos: usize,
-    rope_dim: usize,
-    theta: f32,
-    yarn: Option<&DeepseekV2Yarn>,
-) -> (Vec<f32>, Vec<f32>) {
-    let half = rope_dim / 2;
-    let (inv_freq, attention_factor) = deepseek2_rope_inv_freq(rope_dim, theta, yarn);
-    let mut cos = vec![0.0f32; max_pos * half];
-    let mut sin = vec![0.0f32; max_pos * half];
-    for pos in 0..max_pos {
-        for i in 0..half {
-            let ang = pos as f32 * inv_freq[i];
-            let (s, c) = ang.sin_cos();
-            cos[pos * half + i] = c * attention_factor;
-            sin[pos * half + i] = s * attention_factor;
-        }
-    }
-    (cos, sin)
-}
-
-#[cfg(test)]
-/// The inv_freq/attention_factor computation shared by [`deepseek2_rope_tables_interleaved`]
-/// (interleaved-pair layout) and `crate::deepseek32`'s Lightning Indexer RoPE table (half-split layout,
-/// spec 277). Both use the same frequencies: in `deepseek-ai/DeepSeek-V3.2-Exp`'s `inference/model.py`,
-/// `Indexer.forward` receives the same `freqs_cis` as `MLA.forward` (`precompute_freqs_cis` runs once
-/// per model); only the pairing convention differs.
-pub(crate) fn deepseek2_rope_inv_freq(
-    rope_dim: usize,
-    theta: f32,
-    yarn: Option<&DeepseekV2Yarn>,
-) -> (Vec<f32>, f32) {
-    let half = rope_dim / 2;
-    match yarn {
-        None => (
-            (0..half)
-                .map(|i| 1.0 / theta.powf(2.0 * i as f32 / rope_dim as f32))
-                .collect(),
-            1.0,
-        ),
-        Some(y) => {
-            let d = rope_dim as f32;
-            let orig = y.original_max_position_embeddings.max(1) as f32;
-            let factor = y.factor.max(1e-6);
-            // find_correction_dim: frequency index where a wavelength makes `num_rotations` turns over
-            // the original context (as `poot_llm::gguf::yarn_inv_freq`).
-            let correction_dim = |num_rotations: f32| -> f32 {
-                (d * (orig / (num_rotations * 2.0 * std::f32::consts::PI)).ln())
-                    / (2.0 * theta.ln())
-            };
-            let low = correction_dim(y.beta_fast).floor().max(0.0);
-            let high = correction_dim(y.beta_slow)
-                .ceil()
-                .min(rope_dim as f32 - 1.0);
-            let (low, high) = if low == high {
-                (low, high + 0.001)
-            } else {
-                (low, high)
-            };
-            let inv_freq = (0..half)
-                .map(|j| {
-                    let pos_freq = theta.powf((2 * j) as f32 / d);
-                    let extrap = 1.0 / pos_freq;
-                    let interp = 1.0 / (factor * pos_freq);
-                    let ramp = ((j as f32 - low) / (high - low)).clamp(0.0, 1.0);
-                    let extrap_factor = 1.0 - ramp;
-                    interp * (1.0 - extrap_factor) + extrap * extrap_factor
-                })
-                .collect();
-            (inv_freq, y.attention_factor)
-        }
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod family_tests {
     //! The rows every DeepSeek MLA family owes, parameterized by its entry and fixture so
@@ -1415,7 +1196,35 @@ pub(crate) mod family_tests {
                 .iter()
                 .filter(|e| matches!(e.op, OpKind::PackedDequant { .. }))
                 .count();
-            assert_eq!(dequants, packed, "{label}: one decode per packed weight");
+            let indexed = bound
+                .eqns
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e.op,
+                        OpKind::PackedContraction {
+                            rows: poot_graph_ir::ContractionRows::Indexed { .. },
+                            ..
+                        }
+                    )
+                })
+                .count();
+            let stacks = model
+                .weights()
+                .iter()
+                .filter(|(_, _, h)| {
+                    matches!(h.format, HandleFormat::Packed(_)) && h.shape.len() == 3
+                })
+                .count();
+            assert_eq!(
+                dequants + stacks,
+                packed,
+                "{label}: one decode per packed weight"
+            );
+            assert_eq!(
+                indexed, stacks,
+                "{label}: one indexed contraction per packed stack"
+            );
             assert_eq!(packed > 0, label == "q8_0", "{label}: {packed} packed");
 
             let reference_store = decoded(&store);
@@ -1723,7 +1532,7 @@ pub(crate) mod family_tests {
     }
 
     /// Tier 3 on the oracle (ADR-0101): the fixture's 24 greedy tokens after the 7-token prompt equal
-    /// the literals recorded from the Runner's CPU `generate` at the base commit `64602bced`.
+    /// the literals recorded from the pre-driver engine's CPU generate at the base commit `64602bced`.
     pub(crate) fn assert_generates_the_recorded_tokens(
         entry: &FamilyEntry,
         fixture: &Fixture,
@@ -1909,7 +1718,7 @@ mod tests {
         assert_ne!(with_routing(plain, &scaled).unwrap(), plain);
     }
 
-    /// SC-001 (tier 3 on the oracle): the Runner's recorded tokens. Mutation: swap two experts'
+    /// SC-001 (tier 3 on the oracle): the pre-driver engine's recorded tokens. Mutation: swap two experts'
     /// ids in the router arm; the first tokens change.
     #[test]
     fn the_fixture_generates_the_tokens_the_runner_recorded() {

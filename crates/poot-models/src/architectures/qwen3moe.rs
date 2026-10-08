@@ -586,14 +586,27 @@ mod tests {
                 .iter()
                 .filter(|e| matches!(e.op, OpKind::PackedDequant { .. }))
                 .count();
-            // 4 attention projections per layer, a dense FFN's 3 on layer 0, and 3 projections of
-            // each of the 8 experts on layer 1.
-            let packed = if label == "q8_0" {
-                2 * 4 + 3 + 3 * 8
+            let indexed = bound
+                .eqns
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e.op,
+                        OpKind::PackedContraction {
+                            rows: poot_graph_ir::ContractionRows::Indexed { .. },
+                            ..
+                        }
+                    )
+                })
+                .count();
+            // 4 attention projections per layer and a dense FFN's 3 on layer 0 decode as projections;
+            // the 3 expert-projection stacks of layer 1 are one indexed contraction each.
+            let (packed, stacks) = if label == "q8_0" {
+                (2 * 4 + 3, 3)
             } else {
-                0
+                (0, 0)
             };
-            assert_eq!(dequants, packed, "{label}");
+            assert_eq!((dequants, indexed), (packed, stacks), "{label}");
 
             let reference_store = decoded(&store);
             let reference = model_of(&fx.config, &reference_store);
@@ -797,11 +810,17 @@ mod tests {
             Qwen3MoeParams::from_raw(&raw).unwrap().sparse,
             [false, true]
         );
-        let expert0 = WeightId::layer(1, WeightRole::Moe(MoeRole::Expert(ExpertProj::Gate, 0)));
+        let experts = WeightId::layer(1, WeightRole::Moe(MoeRole::Stack(ExpertProj::Gate)));
+        let handle = model.weights().handle(experts).unwrap();
         assert!(matches!(
-            model.weights().handle(expert0).unwrap().format,
+            handle.format,
             poot_quant::weights::HandleFormat::Packed(_)
         ));
+        assert_eq!(
+            handle.shape.len(),
+            3,
+            "the experts are one stack: {handle:?}"
+        );
         assert_eq!(model.config().eos, BTreeSet::from([47]));
         let reference = model_of(&fixture_config(), &reference_store);
         let prompt = [3, 17, 40, 8];

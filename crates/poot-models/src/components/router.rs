@@ -31,6 +31,11 @@ pub enum RouterKind {
     /// each selected expert taken from the UNBIASED sigmoid score (MiniMax-M2; the DeepSeek-V3
     /// router without its group limit). See [`SigmoidTopK`] for the options.
     SigmoidBiasedTopK(SigmoidTopK),
+    /// `sqrt(softplus(logits))` per expert (DeepSeek-V4), the `top_k` of that score plus the
+    /// selection bias, and the gate of each selected expert taken from the UNBIASED score divided
+    /// by the selected scores' sum. A layer with a hash router takes its experts from a table
+    /// instead and reads only this score function ([`scores`]).
+    SqrtSoftplusBiasedTopK,
 }
 
 /// The options of [`RouterKind::SigmoidBiasedTopK`]: MiniMax-M2's router is the default, with the
@@ -71,6 +76,17 @@ pub enum RouterBias {
     /// Added to the score for the selection only; the gate weights come from the unbiased scores
     /// (DeepSeek-V3's `e_score_correction_bias`, MiniMax-M2). For [`RouterKind::SigmoidBiasedTopK`].
     SelectionOnly,
+}
+
+impl RouterKind {
+    /// Whether the arm scores each expert on its own, selects on that score plus a bias and gates
+    /// on the unbiased score (the sigmoid and the sqrt-softplus arms).
+    const fn is_biased_top_k(self) -> bool {
+        matches!(
+            self,
+            Self::SigmoidBiasedTopK(_) | Self::SqrtSoftplusBiasedTopK
+        )
+    }
 }
 
 /// Group-limited selection (DeepSeek): the experts split into `groups` equal groups and only the
@@ -137,7 +153,7 @@ impl RouterParams {
     /// for the sigmoid arm: its gates are normalized, then scaled by the family's routed factor,
     /// and no family combines the two, so the order has no reference.
     pub fn with_expert_scale(self) -> Result<Self, ParamError> {
-        if matches!(self.kind, RouterKind::SigmoidBiasedTopK(_)) {
+        if self.kind.is_biased_top_k() {
             return Err(ParamError::new("expert_scale", ConfigReason::Unsupported));
         }
         Ok(Self {
@@ -151,6 +167,9 @@ impl RouterParams {
     /// than groups, fewer eligible experts than `top_k`, or (the sigmoid arm scores a group by its two
     /// best experts) a group of fewer than two experts.
     pub fn with_group_limit(self, groups: usize, keep: usize) -> Result<Self, ParamError> {
+        if self.kind == RouterKind::SqrtSoftplusBiasedTopK {
+            return Err(ParamError::new("n_group", ConfigReason::Unsupported));
+        }
         if groups == 0 {
             return Err(ParamError::new("n_group", ConfigReason::Zero));
         }
@@ -215,7 +234,10 @@ impl RouterParams {
             (
                 RouterKind::SoftmaxTopK { .. } | RouterKind::TopKSoftmax,
                 RouterBias::AddedToLogits
-            ) | (RouterKind::SigmoidBiasedTopK(_), RouterBias::SelectionOnly)
+            ) | (
+                RouterKind::SigmoidBiasedTopK(_) | RouterKind::SqrtSoftplusBiasedTopK,
+                RouterBias::SelectionOnly
+            )
         );
         if !defined {
             return Err(ParamError::new("router_bias", ConfigReason::Unsupported));
@@ -280,6 +302,13 @@ impl RouterWeights {
     }
 }
 
+impl RouterWeights {
+    /// The router projection `[experts, width]`.
+    pub fn weight(&self) -> &Weight {
+        &self.weight
+    }
+}
+
 /// What the router decided for `T` tokens: the selected experts of each token, best first, and the
 /// weight of each. Both `[T, top_k]` F32 (ids are exact small integers).
 #[derive(Clone, Copy, Debug)]
@@ -311,8 +340,8 @@ pub fn route(
 
     // The values the selection ranks, and the router's own decision of what a group scores.
     let selection = match p.kind {
-        RouterKind::SigmoidBiasedTopK(_) => {
-            let scores = ops::sigmoid(b, logits);
+        RouterKind::SigmoidBiasedTopK(_) | RouterKind::SqrtSoftplusBiasedTopK => {
+            let scores = scores(b, logits, p.kind);
             match (&w.bias, p.bias) {
                 (Some(bias), Some(RouterBias::SelectionOnly)) => {
                     let shape = b.aval(scores).shape;
@@ -344,8 +373,9 @@ pub fn route(
         }
         RouterKind::TopKSoftmax => softmax_top_k(b, logits, rank, p.top_k, true),
         RouterKind::SigmoidBiasedTopK(SigmoidTopK { renormalize }) => {
-            sigmoid_top_k(b, logits, rank, p.top_k, renormalize)
+            biased_top_k(b, logits, p.kind, rank, p.top_k, renormalize)
         }
+        RouterKind::SqrtSoftplusBiasedTopK => biased_top_k(b, logits, p.kind, rank, p.top_k, true),
     };
     witness::declare(
         step,
@@ -416,6 +446,9 @@ fn group_eligible(
         RouterKind::SoftmaxTopK { .. } | RouterKind::TopKSoftmax => {
             b.reduce(RedOp::Max, grouped, 2, false)
         }
+        RouterKind::SqrtSoftplusBiasedTopK => {
+            unreachable!("RouterParams::with_group_limit refuses the sqrt-softplus arm")
+        }
     }; // [T, groups]
     let rank = ops::stable_descending_rank(b, score);
     let keep = ops::top_k_keep_mask(b, rank, limit.keep); // [T, groups]
@@ -463,18 +496,32 @@ fn softmax_top_k(
     }
 }
 
-/// The unbiased sigmoid scores of `logits`, masked to the `top_k` experts of `rank` (which the
-/// selection bias chose) and, with `renormalize`, divided by their sum. The denominator is the
-/// selected sum either way: the `SelectedSumUsable` witness reads it.
-fn sigmoid_top_k(
+/// The score of every expert for a biased top-k router: the per-expert value the selection bias
+/// is added to and the gates are taken from. Not the logits themselves, and not defined for the
+/// softmax arms.
+pub fn scores(b: &Builder, logits: Traced, kind: RouterKind) -> Traced {
+    match kind {
+        RouterKind::SigmoidBiasedTopK(_) => ops::sigmoid(b, logits),
+        RouterKind::SqrtSoftplusBiasedTopK => b.unary(UnOp::Sqrt, ops::softplus(b, logits)),
+        RouterKind::SoftmaxTopK { .. } | RouterKind::TopKSoftmax => {
+            unreachable!("only a biased top-k router scores each expert on its own")
+        }
+    }
+}
+
+/// The unbiased scores of `logits`, masked to the `top_k` experts of `rank` (which the selection
+/// bias chose) and, with `renormalize`, divided by their sum. The denominator is the selected sum
+/// either way: the `SelectedSumUsable` witness reads it.
+fn biased_top_k(
     b: &Builder,
     logits: Traced,
+    kind: RouterKind,
     rank: Traced,
     top_k: usize,
     renormalize: bool,
 ) -> Gate {
     let last = b.aval(logits).shape.len() - 1;
-    let scores = ops::canonical_router_scores(b, ops::sigmoid(b, logits));
+    let scores = ops::canonical_router_scores(b, scores(b, logits, kind));
     let keep = ops::top_k_keep_mask(b, rank, top_k);
     let selected = b.binary(BinOp::Mul, scores, keep);
     let denominator = b.reduce(RedOp::Sum, selected, last, true);
@@ -539,7 +586,7 @@ mod tests {
         let p = RouterParams::new(EXPERTS, TOP_K, kind).unwrap();
         match (biased, kind) {
             (false, _) => p,
-            (true, RouterKind::SigmoidBiasedTopK(_)) => {
+            (true, RouterKind::SigmoidBiasedTopK(_) | RouterKind::SqrtSoftplusBiasedTopK) => {
                 p.with_bias(RouterBias::SelectionOnly).unwrap()
             }
             (true, _) => p.with_bias(RouterBias::AddedToLogits).unwrap(),
@@ -589,15 +636,19 @@ mod tests {
                     dot + bias.as_ref().map_or(0.0, |b| f64::from(b[e]))
                 })
                 .collect();
-            if let RouterKind::SigmoidBiasedTopK(_) = kind {
+            if let RouterKind::SigmoidBiasedTopK(_) | RouterKind::SqrtSoftplusBiasedTopK = kind {
                 // Independent of the graph: scores, then selection on score + bias, then the
                 // unbiased scores of the selection.
+                let score = |dot: f64| match kind {
+                    RouterKind::SqrtSoftplusBiasedTopK => (1.0 + dot.exp()).ln().sqrt(),
+                    _ => 1.0 / (1.0 + (-dot).exp()),
+                };
                 let plain: Vec<f64> = (0..EXPERTS)
                     .map(|e| {
                         let dot: f64 = (0..WIDTH)
                             .map(|j| f64::from(token[j]) * f64::from(w[e * WIDTH + j]))
                             .sum();
-                        1.0 / (1.0 + (-dot).exp())
+                        score(dot)
                     })
                     .collect();
                 let chosen_by: Vec<f64> = (0..EXPERTS)
@@ -670,15 +721,18 @@ mod tests {
         }
     }
 
-    const SIGMOID_ARMS: [RouterKind; 1] = [RouterKind::SigmoidBiasedTopK(SigmoidTopK::new())];
+    const SIGMOID_ARMS: [RouterKind; 2] = [
+        RouterKind::SigmoidBiasedTopK(SigmoidTopK::new()),
+        RouterKind::SqrtSoftplusBiasedTopK,
+    ];
 
-    /// SC-001 (sigmoid arm): with and without a selection bias, the experts and weights equal an
-    /// independent f64 reference, and the weights sum to one. A bias
-    /// that dominates the scores selects its experts, yet their weights stay the unbiased sigmoid
-    /// scores. Mutation: add the bias to the logits before the sigmoid (or weight by the biased
-    /// scores) and the f64 row goes red.
+    /// SC-001 (the biased arms: sigmoid, and DeepSeek-V4's `sqrt(softplus)`): with and without a
+    /// selection bias, the experts and weights equal an independent f64 reference, and the weights
+    /// sum to one. A bias that dominates the scores selects its experts, yet their weights stay the
+    /// unbiased scores. Mutation: add the bias to the logits before the score (or weight by the
+    /// biased scores) and the f64 row goes red.
     #[test]
-    fn the_sigmoid_arm_selects_with_the_bias_and_weights_without_it() {
+    fn the_biased_arms_select_with_the_bias_and_weights_without_it() {
         let x = oracle::random(T * WIDTH, 8);
         for biased in [false, true] {
             let fx = fixture(biased);
@@ -896,8 +950,8 @@ mod tests {
     }
 
     /// The sigmoid arm with a bias, a group limit and a scale equals the graph-level DeepSeek-V3
-    /// router the GLM-5.3 tests also compare against (`deepseek3_router_gate_and_ids`, written
-    /// separately from this module): the same experts, the same weights.
+    /// router (`deepseek3_router_gate_and_ids`, written separately from this module): the same
+    /// experts, the same weights.
     #[test]
     fn the_sigmoid_arm_equals_the_deepseek3_graph_reference() {
         let x = oracle::random(T * WIDTH, 31)
@@ -1172,5 +1226,25 @@ mod tests {
             sigmoid.with_expert_scale().unwrap_err(),
             ParamError::new("expert_scale", ConfigReason::Unsupported)
         );
+    }
+
+    /// The sqrt-softplus arm has no group limit and no per-expert scale: a request for either is a
+    /// typed refusal naming the field, and its bias is selection-only.
+    #[test]
+    fn the_sqrt_softplus_arm_refuses_options_it_does_not_define() {
+        let p = RouterParams::new(EXPERTS, TOP_K, RouterKind::SqrtSoftplusBiasedTopK).unwrap();
+        assert_eq!(
+            p.with_group_limit(2, 1),
+            Err(ParamError::new("n_group", ConfigReason::Unsupported))
+        );
+        assert_eq!(
+            p.with_expert_scale(),
+            Err(ParamError::new("expert_scale", ConfigReason::Unsupported))
+        );
+        assert_eq!(
+            p.with_bias(RouterBias::AddedToLogits),
+            Err(ParamError::new("router_bias", ConfigReason::Unsupported))
+        );
+        assert!(p.with_bias(RouterBias::SelectionOnly).is_ok());
     }
 }

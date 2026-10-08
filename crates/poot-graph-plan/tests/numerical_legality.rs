@@ -14,10 +14,8 @@ use poot_tensor::HostTensor;
 /// back, inlined at each call site below rather than kept behind a renamed `eval_all` shim - the
 /// deleted convenience's call shape (`env[value_id]` as `&Tensor`), rebuilt from
 /// `eval(..).environment` plus `Value::into_dense`.
-const OPTIONS: CompileOptions = CompileOptions {
-    execution: Submission::Replay,
-    limits: poot_graph_plan::CompileLimits::STANDARD,
-};
+const OPTIONS: CompileOptions =
+    CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
 
 fn target(backend: Backend) -> Target {
     Target {

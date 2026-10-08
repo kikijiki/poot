@@ -16,15 +16,45 @@ pub type ValueId = usize;
 /// A decoder-layer tag on an equation: the layer whose loop emitted it, as reported by
 /// [`crate::Builder::layer_scope`].
 ///
-/// Layer tags are the graph-side image of a layer-pipeline placement: `poot-llm`'s
-/// `exact_partition` records `after_layer` cuts between devices, and
-/// `poot-graph-plan`'s `split_stages_after_layers` maps those cuts onto this graph through the tag,
+/// Layer tags are the graph-side image of a layer-pipeline placement: a placement records
+/// `after_layer` cuts between devices, and the stage split maps those cuts onto this graph through
+/// the tag ([`Graph::layer_runs`] is the one query),
 /// so no caller has to infer a layer from a name. `None` means "emitted outside any layer scope" -
 /// the graph-wide preamble (slots, guards, masks), the head, or an equation a transform
 /// synthesized. The tag is data, not semantics: an evaluator or planner that does not split by
 /// layer ignores it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LayerIndex(pub usize);
+
+/// The equation range of every decoder layer of a graph, as [`Graph::layer_runs`] reads it from the
+/// [`LayerIndex`] tags.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayerRuns {
+    /// Number of layers: the tagged region holds layer ids `0..layers`. Zero for a graph with no
+    /// layer tags.
+    pub layers: usize,
+    /// One `[start, end)` equation range per layer, in layer order; `runs.len() == layers`.
+    pub runs: Vec<std::ops::Range<usize>>,
+}
+
+/// Why a graph's layer tags are not one run per layer in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum LayerTagError {
+    #[error(
+        "equation {equation} is untagged between the first and last layer-tagged equation; a \
+         layer-cut split will not guess which side it belongs to"
+    )]
+    Untagged { equation: usize },
+    #[error(
+        "equation {equation} is tagged layer {layer}, breaking the one-run-per-layer order the \
+         layer cuts map onto (expected layer {expected})"
+    )]
+    NonContiguous {
+        equation: usize,
+        layer: usize,
+        expected: usize,
+    },
+}
 
 /// Stable model-adapter key for one bounded validation witness.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -79,15 +109,15 @@ pub enum Operand {
     Lit(Scalar),
 }
 
-/// Runtime inputs. Most variants are graph-architecture.md PerTokenSlots: `Token`/`Pos`/`SeqLen` are scalars,
-/// and `Mask` is the additive attention mask over the fixed-capacity cache (G3d), host-filled per token.
+/// Runtime inputs. Most variants are graph-architecture.md PerTokenSlots: `Token` and `Pos` are scalars. The
+/// attention mask is not a slot: it is an in-graph computation over `Pos` and an iota.
 /// `Activation` is an explicitly named standalone boundary, not a model-engine slot.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Slot {
     Token,
     /// A caller-supplied dense activation for a standalone graph boundary. Unlike [`Slot::Token`], it is not a
     /// token id and has no model-engine binding convention. Declare it with [`crate::builder::Builder::slot_named`]
-    /// and bind it by value id or name through a caller-owned contract, such as the Runner-adjacent resident E4M3
+    /// and bind it by value id or name through a caller-owned contract, such as the driver-adjacent resident E4M3
     /// linear handoff.
     Activation,
     Pos,
@@ -96,23 +126,11 @@ pub enum Slot {
     /// the order temporal, height, width. One packed kind keeps a binder from updating only a subset of the axes;
     /// model tracers split it with Slice/Reshape before `rope_sectioned`. Per-prompt/per-step data, never a `Const`.
     MropePosition,
-    SeqLen,
-    /// Additive attention mask `[cap]`: 0 for valid key slots `t <= pos`, large-negative for `t > pos`. The
-    /// constant-shape masked decode (G3d) uses it instead of slicing `[0..=pos]`.
-    Mask,
     /// Paged-KV slot map `[cap]` (i32): logical key position `t` -> the flat physical slot in the block pool holding
     /// its K/V. The paged decode graph (spec 045) gathers the physical-order K/V cache by this to reconstruct
     /// logical order before masked attention; the physical write slot is derived in-graph as
     /// `gather_scalar(slot_map, pos)`. Per-step-varying, so a Slot.
     SlotMap,
-    /// Card 188: the GDN recurrent-state pool's row map `[batch]` (i32): row `r`'s target GDN pool slot this step
-    /// (the read/write-back index of the GDN pool's device mirror; see
-    /// `poot_models::qwen3next::qwen3next_gdn_decode_batched_pool`). A distinct variant from [`Slot::SlotMap`]:
-    /// reusing `Slot::SlotMap` at shape `[batch]` is safe for `poot-eval`'s per-id CPU binder but not for an engine
-    /// binder that resolves a whole `Slot` kind from one caller-supplied buffer (e.g. `poot-llm`'s
-    /// `bind_decode_batched`), which would stamp the same data onto both differently-shaped ids. A dedicated
-    /// variant lets a binder give this map its own bind path; `Slot` is matched exhaustively at every binder site.
-    GdnSlotMap,
     /// The current token's already-embedded input row `[hidden]`, host-computed per step (a single-row dequant, not
     /// a GPU gather). Lets a decode graph skip declaring the full `[vocab,hidden]` embedding table as a GPU-resident
     /// Const, needed when its dense-f32 size exceeds a backend's max single-buffer size (gemma4's `hidden=5376`
@@ -120,9 +138,8 @@ pub enum Slot {
     TokenEmbed,
     /// Spec 248 (epic 129 B8): a batched LoRA decode graph's per-row adapter selection `[batch]` (f32,
     /// `IndexedMatMul`'s idx convention, see its doc comment on why idx is always f32): row `m`'s value is the
-    /// `poot_load::lora::LoraAdapterPool` index (1-based; `LoraAdapterPool::NO_ADAPTER` = 0) whose stacked `A`/`B`
-    /// that row's `lora_linear_batched` call uses this step. A distinct variant from `Slot::SlotMap`/
-    /// `Slot::GdnSlotMap` for the reason given at `GdnSlotMap`: an engine binder resolves one whole `Slot` kind
+    /// adapter index (1-based; 0 is the no-adapter row) whose stacked `A`/`B` the LoRA compile pass applies to
+    /// that row this step. A distinct variant from `Slot::SlotMap`: an engine binder resolves one whole `Slot` kind
     /// from one buffer per bind call. Per-step-varying (requests and adapters change as the batch admits/evicts),
     /// so a `Slot` rebound every step, never a `Const` (const-cache staleness).
     LoraIdx,
@@ -133,7 +150,7 @@ pub enum Slot {
     /// `[P, ...]` pool weight instead of the full `[E, ...]` stack.
     ///
     /// Unlike every other `Slot` kind, one graph contains many of these (one per MoE layer, each with different
-    /// content in the same step). Slot binders resolve a whole kind from one buffer (see `GdnSlotMap`), which would
+    /// content in the same step). Slot binders resolve a whole kind from one buffer (a `Slot::SlotMap` at two shapes), which would
     /// stamp the same bytes onto every layer's table. So this kind must be declared through
     /// [`crate::builder::Builder::slot_named`], giving each occurrence a distinct [`ValueMeta::name`], and its
     /// binders must resolve per name (as `Const` does), never per kind. Per-step-varying (a refill moves experts
@@ -164,10 +181,7 @@ impl Slot {
             Slot::Activation => "activation",
             Slot::Pos => "pos",
             Slot::MropePosition => "mropeposition",
-            Slot::SeqLen => "seqlen",
-            Slot::Mask => "mask",
             Slot::SlotMap => "slotmap",
-            Slot::GdnSlotMap => "gdnslotmap",
             Slot::TokenEmbed => "tokenembed",
             Slot::LoraIdx => "loraidx",
             Slot::ExpertPoolMap => "expertpoolmap",
@@ -675,6 +689,50 @@ impl<V: ValidationChannel> Graph<V> {
     /// Validation declarations in declaration order; always empty for `Graph`.
     pub fn validation_outputs(&self) -> &[ValidationOutput] {
         self.validations.outputs()
+    }
+
+    /// The one tag query: where each decoder layer's equations sit. The tagged region (first to
+    /// last tagged equation) must hold no untagged equation and one run per layer id, `0, 0, .., 1,
+    /// 1, ..` in order; untagged equations before it (preamble) and after it (head) are expected and
+    /// belong to no run. A graph with no tags has zero layers.
+    pub fn layer_runs(&self) -> Result<LayerRuns, LayerTagError> {
+        let tags: Vec<Option<LayerIndex>> = self.eqns.iter().map(|eqn| eqn.layer).collect();
+        let (Some(first), Some(last)) = (
+            tags.iter().position(Option::is_some),
+            tags.iter().rposition(Option::is_some),
+        ) else {
+            return Ok(LayerRuns {
+                layers: 0,
+                runs: Vec::new(),
+            });
+        };
+        let mut runs: Vec<std::ops::Range<usize>> = Vec::new();
+        for (equation, tag) in tags.iter().enumerate().take(last + 1).skip(first) {
+            let Some(LayerIndex(layer)) = *tag else {
+                return Err(LayerTagError::Untagged { equation });
+            };
+            let current = runs.len().checked_sub(1);
+            if current == Some(layer) {
+                runs[layer].end = equation + 1;
+                continue;
+            }
+            let next = runs.len();
+            if layer != next {
+                return Err(LayerTagError::NonContiguous {
+                    equation,
+                    layer,
+                    expected: match current {
+                        Some(current) if layer < current => current,
+                        _ => next,
+                    },
+                });
+            }
+            runs.push(equation..equation + 1);
+        }
+        Ok(LayerRuns {
+            layers: runs.len(),
+            runs,
+        })
     }
 
     pub fn aval(&self, id: ValueId) -> &TensorType {

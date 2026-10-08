@@ -4,7 +4,7 @@
 //! the `model.layers.{l}` layout shares; a family adds its own rows beside them.
 
 use poot_quant::weights::{
-    AttnRole, ExpertProj, FfnRole, MoeRole, NormRole, WeightEntry, WeightId, WeightKey, WeightMap,
+    AttnRole, ExpertProj, FfnRole, MoeRole, NormRole, WeightId, WeightKey, WeightMap,
     WeightMapBuilder, WeightMapError, WeightRole, WeightStore, WeightView,
 };
 
@@ -475,12 +475,14 @@ pub(crate) struct MoeNames {
     pub experts: &'static [ExpertNames],
 }
 
-/// A shared expert's gate, up and down linear stems, relative to `prefix` and the layer index.
+/// A shared expert's gate, up and down linear stems, relative to `prefix` and the layer index, and
+/// the stem of its scalar gate (`[1, width]` or `[width]`) when the family gates it.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SharedNames {
     pub gate: &'static str,
     pub up: &'static str,
     pub down: &'static str,
+    pub scalar_gate: Option<&'static str>,
 }
 
 /// One expert projection's checkpoint names.
@@ -555,7 +557,7 @@ impl ExpertNames {
     }
 }
 
-fn map_moe_layer(
+pub(crate) fn map_moe_layer(
     map: &mut WeightMapBuilder<'_>,
     store: &WeightStore,
     names: &MoeNames,
@@ -601,6 +603,10 @@ fn map_moe_layer(
             let role = MoeRole::Shared(proj);
             map.map(id(role), required(role, linear(stem))?)?;
         }
+        if let Some(stem) = shared.scalar_gate {
+            let role = MoeRole::SharedGate;
+            map.map(id(role), required(role, linear(stem))?)?;
+        }
     }
     for expert in names.experts {
         let stack = id(MoeRole::Stack(expert.proj));
@@ -612,21 +618,8 @@ fn map_moe_layer(
                 map.map(stack, WeightView::Stored(key))?;
             }
             ExpertKeys::PerExpert(keys) => {
-                // Dense per-expert tensors stack into one `[experts, ..]` weight; packed ones
-                // are one `[out, K]` matrix each and stay one weight per expert.
-                let packed = store
-                    .get(keys[0].as_str())
-                    .is_some_and(|entry| matches!(entry, WeightEntry::Packed(_)));
-                if packed {
-                    for (e, key) in keys.into_iter().enumerate() {
-                        map.map(
-                            id(MoeRole::Expert(expert.proj, e as u32)),
-                            WeightView::Stored(key),
-                        )?;
-                    }
-                } else {
-                    map.map(stack, WeightView::ExpertStack(keys))?;
-                }
+                // Per-expert tensors, dense or packed, are one `[experts, ..]` stack weight.
+                map.map(stack, WeightView::ExpertStack(keys))?;
             }
         }
         if let Some(bias) = expert.bias {

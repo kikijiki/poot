@@ -92,15 +92,13 @@ fn write_deadline_bounds_normal_http_response_to_never_reading_client() {
 /// serializing the held tail), which is what made a start-to-exit budget fail on a loaded box.
 #[cfg(unix)]
 #[test]
-#[ignore = "constructs a Runner and no family loads on it (POOT-740); POOT-739 retypes serve onto ModelHandle and re-enables this row"]
 fn write_deadline_bounds_production_stream_finalization_after_held_tail_saturates() {
     // The deadline must stay long enough that "the attempt blocked" separates a real timeout from an
     // instant transport error, and short enough to keep one saturated attempt cheap in the suite.
     let write_timeout = Duration::from_millis(300);
     let completion_budget = Duration::from_secs(3);
-    let model_path = write_tiny_runner_gguf();
-    let runner =
-        Arc::new(Runner::load_gguf(&model_path).expect("load finalization fixture runner"));
+    let model_path = write_tiny_gguf();
+    let runner = load_handle(&model_path);
     let _ = std::fs::remove_file(&model_path);
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind finalization fixture");

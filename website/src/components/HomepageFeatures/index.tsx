@@ -71,7 +71,7 @@ const FeatureList: FeatureItem[] = [
     description: (
       <>
         Build the workspace, run graphs and kernels as a compute engine, or use
-        the LLM <code>Runner</code>{" "}
+        the LLM <code>Driver</code>{" "}
         API and embed crates in your own project.
       </>
     ),
@@ -83,8 +83,8 @@ const FeatureList: FeatureItem[] = [
     description: (
       <>
         Run <code>poot-serve</code> for an OpenAI-compatible HTTP API that
-        bounds requests and serves embeddings, reranking and LoRA
-        administration. Generation is not available yet (poot is being refactored; planned to return).
+        bounds requests. Generation, embeddings, reranking and LoRA
+        administration are not available yet (poot is being refactored; planned to return).
       </>
     ),
   },

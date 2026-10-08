@@ -76,6 +76,11 @@ pub enum StorageLayout {
     Bf16Packed,
     /// Two logical IEEE binary16 elements packed per element-kind word (Card 1007).
     F16Packed,
+    /// Four logical E4M3FN elements packed per element-kind word, each row of the last axis padded to a
+    /// whole word (POOT-1060): element `c` of a row lives in word `c / 4` at bit `(c % 4) * 8`, and row `r`
+    /// starts at word `r * ceil(width / 4)`. The checkpoint's own bytes, `poot_eval::fp8::PortableE4m3FnLayout`'s
+    /// device layout, so the generated row gather decodes each byte in-register.
+    E4m3Packed,
 }
 
 impl std::fmt::Display for StorageLayout {
@@ -84,6 +89,7 @@ impl std::fmt::Display for StorageLayout {
             StorageLayout::Dense => write!(f, "dense"),
             StorageLayout::Bf16Packed => write!(f, "bf16-packed"),
             StorageLayout::F16Packed => write!(f, "f16-packed"),
+            StorageLayout::E4m3Packed => write!(f, "e4m3-packed"),
         }
     }
 }
@@ -142,14 +148,24 @@ impl BufferStorage {
         )
     }
 
+    /// E4M3FN packed four elements per `u32` word with rows padded to a whole word (POOT-1060), the
+    /// sibling of [`Self::bf16_packed`] on the same word. A buffer of this storage holds a table whose last
+    /// axis is the row; its word count depends on that width, so [`Self::device_elems`] takes the shape.
+    pub const fn e4m3_packed() -> Self {
+        Self::new(
+            ElementKind::I32,
+            LogicalDType::E4M3FN,
+            StorageLayout::E4m3Packed,
+        )
+    }
+
     pub const fn f32() -> Self {
         Self::dense(ElementKind::F32, LogicalDType::F32)
     }
     pub const fn i32() -> Self {
         Self::dense(ElementKind::I32, LogicalDType::I32)
     }
-    /// A declared-I32 value bound as its F32 bit-pattern mirror (card 621): a `Slot::SlotMap`/
-    /// `Slot::GdnSlotMap` index (or any other I32-declared value) feeding a
+    /// A declared-I32 value bound as its F32 bit-pattern mirror (card 621): a `Slot::SlotMap` index (or any other I32-declared value) feeding a
     /// `ScatterUpdate`/`DynamicUpdateSlice` index operand, whose kernel body reads `Slice<f32>` and
     /// casts to i32 in-kernel (spec 045) on every backend, independent of device caps. The mirror image
     /// of [`Self::bf16_packed`]: there the physical element (I32) differs from the logical dtype
@@ -185,22 +201,29 @@ impl BufferStorage {
     pub const fn is_packed(&self) -> bool {
         matches!(
             self.layout,
-            StorageLayout::Bf16Packed | StorageLayout::F16Packed
+            StorageLayout::Bf16Packed | StorageLayout::F16Packed | StorageLayout::E4m3Packed
         )
     }
 
-    /// Native device elements a value of `numel` logical elements occupies in this storage (Card
-    /// 547b): `None` for a lane no executor device-encodes (E4M3FN/RawBytes/I8 - left to the host).
-    /// The one owner both `poot-graph-plan` (buffer-plan sizing) and `poot-executor` (bind-time
-    /// allocation and dispatch argument lengths) call, so the two can never drift against each
-    /// other - before this, each crate kept its own copy of the same formula.
-    pub const fn device_elems(&self, numel: usize) -> Option<usize> {
-        if self.is_packed() {
-            return Some(numel.div_ceil(2));
-        }
-        match self.dtype {
-            LogicalDType::E4M3FN | LogicalDType::RawBytes | LogicalDType::I8 => None,
-            _ => Some(numel),
+    /// Native device elements a value of `shape` occupies in this storage (Card 547b): `None` for a lane
+    /// no executor device-encodes (dense E4M3FN/RawBytes/I8 - left to the host). The one owner both
+    /// `poot-graph-plan` (buffer-plan sizing) and `poot-executor` (bind-time allocation and dispatch
+    /// argument lengths) call, so the two can never drift against each other - before this, each crate
+    /// kept its own copy of the same formula. Takes the shape, not an element count, because the packed
+    /// E4M3FN layout pads each row of the last axis to a whole word (POOT-1060); a 0-D value is one row
+    /// of width one.
+    pub fn device_elems(&self, shape: &[usize]) -> Option<usize> {
+        let numel: usize = shape.iter().product();
+        match self.layout {
+            StorageLayout::Bf16Packed | StorageLayout::F16Packed => Some(numel.div_ceil(2)),
+            StorageLayout::E4m3Packed => {
+                let width = shape.last().copied().unwrap_or(1);
+                Some(numel.checked_div(width).unwrap_or(0) * width.div_ceil(4))
+            }
+            StorageLayout::Dense => match self.dtype {
+                LogicalDType::E4M3FN | LogicalDType::RawBytes | LogicalDType::I8 => None,
+                _ => Some(numel),
+            },
         }
     }
 }
@@ -251,8 +274,34 @@ mod tests {
         assert_ne!(packed, BufferStorage::bf16_packed());
         assert_ne!(packed, BufferStorage::i32());
         assert_ne!(packed, BufferStorage::f16());
-        assert_eq!(packed.device_elems(7), Some(4));
-        assert_eq!(packed.device_elems(8), Some(4));
+        assert_eq!(packed.device_elems(&[7]), Some(4));
+        assert_eq!(packed.device_elems(&[2, 4]), Some(4));
+    }
+
+    /// POOT-1060: packed E4M3FN is its own record on the packed word, and its word count pads each row of
+    /// the last axis to a whole word: a width that is not a multiple of four starts the next row in the
+    /// next word. Dense E4M3FN still has no device encoding.
+    #[test]
+    fn e4m3_packed_pads_each_row_to_a_whole_word() {
+        let packed = BufferStorage::e4m3_packed();
+        assert_eq!(packed.element(), ElementKind::I32);
+        assert_eq!(packed.dtype(), LogicalDType::E4M3FN);
+        assert_eq!(packed.layout(), StorageLayout::E4m3Packed);
+        assert!(packed.is_packed());
+        assert_ne!(packed, BufferStorage::bf16_packed());
+        assert_ne!(packed, BufferStorage::i32());
+        assert_eq!(packed.device_elems(&[3, 8]), Some(6));
+        assert_eq!(packed.device_elems(&[3, 6]), Some(6));
+        assert_eq!(packed.device_elems(&[3, 5]), Some(6));
+        assert_eq!(packed.device_elems(&[3, 4]), Some(3));
+        assert_eq!(packed.device_elems(&[3, 1]), Some(3));
+        assert_eq!(packed.device_elems(&[2, 3, 6]), Some(12));
+        assert_eq!(packed.device_elems(&[]), Some(1));
+        assert_eq!(packed.device_elems(&[0, 6]), Some(0));
+        assert_eq!(
+            BufferStorage::dense(ElementKind::RawBytes, LogicalDType::E4M3FN).device_elems(&[4]),
+            None
+        );
     }
 
     /// Card 621: the I32-F32-mirror record shares its element kind with a plain dense F32 buffer (both

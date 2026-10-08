@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use poot_executor::{
     BufferRole, Device, Dispatch, Engine, EntryId, ExecError, ExecutableId, Executor,
-    ExecutorStats, HostSync, StateScope, StepInputs, StepOutputs, WeightSource,
+    ExecutorStats, HostSync, StateScope, StepInputs, StepOutputs,
 };
 use poot_graph_ir::op::SampleRule;
 use poot_graph_ir::{Slot, SlotKey, ValidationOutputs};
@@ -30,15 +30,17 @@ use poot_graph_plan::{
     CompileLimits, CompileOptions, StagedProgram, Submission, Target, TargetSet, WeightFormats,
     bind_packed_weights, compile,
 };
-use poot_llm::driver::error::{DriverError, InvalidOptions};
+use poot_llm::driver::error::{DriverError, InvalidOptions, Unsupported};
+use poot_llm::driver::step::PickPolicy;
 use poot_llm::driver::{
-    BackendChoice, DraftPolicy, Driver, DriverOptions, GenerateRequest, Head, Layout, LoadOptions,
-    ModelHandle, PreparedSetLimits, ServingShapes, Warm, open_executor, program_retention,
+    AdapterRef, Admission, BackendChoice, DraftPolicy, Driver, DriverOptions, GenerateRequest,
+    Head, Layout, LoadOptions, ModelHandle, PoolShape, PreparedSetLimits, Release, RowWork,
+    SeqRequest, ServingShapes, StepRow, Warm, open_executor, program_retention,
 };
 use poot_llm::{GenerationControl, Sampler};
 use poot_models::model::{KvLayout, LogitRows, Model, Phase, StepShape};
-use poot_models::registry::{Fixture, Registry, RegistryError};
-use poot_quant::weights::WeightStore;
+use poot_models::registry::{ConfigSource, Fixture, Registry, RegistryError};
+use poot_quant::weights::{WeightMap, WeightStore};
 use poot_runtime_common::DeviceBackend;
 use poot_target::{AmdArch, Backend, DeviceCaps};
 use poot_tensor::HostTensor;
@@ -258,10 +260,7 @@ fn the_fixture_family_registers_loads_and_compiles_for_every_reference_target() 
             },
         ),
     ];
-    let options = CompileOptions {
-        execution: Submission::Replay,
-        limits: CompileLimits::STANDARD,
-    };
+    let options = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
     let formats = WeightFormats::from_weight_map(model.weights());
     for (name, target) in &targets {
         for (phase, tokens) in [(Phase::Prefill, 4), (Phase::Decode, 1)] {
@@ -271,6 +270,49 @@ fn the_fixture_family_registers_loads_and_compiles_for_every_reference_target() 
                 .unwrap_or_else(|e| panic!("{phase:?} does not compile for {name}: {e}"));
         }
     }
+}
+
+/// An unregistered `model_type` is refused by the one `ModelHandle::load` entry point as
+/// `Unsupported::Registry(Unregistered { origin, key })` naming it, whether the checkpoint is a family
+/// this registry lacks (the fixture family against the built-ins alone: no production code treats it as
+/// known) or a name nobody registered. Mutation: add a `model_type` predicate in `ModelHandle::load`
+/// that accepts the fixture's name; the built-in-only load succeeds and the first assertion goes red.
+#[test]
+fn an_unregistered_model_type_is_refused_by_load_naming_origin_and_key() {
+    let fixture = family::fixture();
+    let dir = poot_test_util::unique_temp_path("unregistered_checkpoint");
+    write_checkpoint(&dir, &fixture);
+
+    let refused = |dir: &Path| match ModelHandle::load(
+        dir,
+        &Registry::builtin().unwrap(),
+        &LoadOptions::default(),
+    ) {
+        Err(DriverError::Unsupported(Unsupported::Registry(RegistryError::Unregistered {
+            origin,
+            key,
+        }))) => (origin, key),
+        Err(other) => panic!("expected Unregistered, got {other:?}"),
+        Ok(_) => panic!("an unregistered family loaded"),
+    };
+    assert_eq!(
+        refused(&dir),
+        (
+            ConfigSource::HfModelType,
+            "poot_fixture_neoxish".to_string()
+        )
+    );
+
+    let mut config = fixture.config.clone();
+    config["model_type"] = "nobody-registered-this".into();
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    assert_eq!(
+        refused(&dir),
+        (
+            ConfigSource::HfModelType,
+            "nobody-registered-this".to_string()
+        )
+    );
 }
 
 /// SC-001: 8 greedy tokens of the oracle equal the pinned list. The oracle is the family's own
@@ -425,10 +467,13 @@ impl Executor for Counting {
     fn target_set(&self) -> TargetSet {
         self.inner.target_set()
     }
+    fn free_memory_bytes(&self) -> Option<u64> {
+        self.inner.free_memory_bytes()
+    }
     fn load_weights(
         &mut self,
         store: Arc<WeightStore>,
-        weights: WeightSource,
+        weights: Arc<WeightMap>,
     ) -> Result<ExecutableId, ExecError> {
         self.loads.set(self.loads.get() + 1);
         self.inner.load_weights(store, weights)
@@ -464,12 +509,9 @@ impl Executor for Counting {
 }
 
 fn driver_options(chunk: usize, max_trace_tokens: usize) -> DriverOptions {
-    let compile = CompileOptions {
-        execution: Submission::Replay,
-        limits: CompileLimits::STANDARD,
-    };
+    let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
     DriverOptions {
-        prefill: compile,
+        prefill: compile.clone(),
         decode: compile,
         capacity: nz(CAPACITY),
         prefill_chunk: nz(chunk),
@@ -688,4 +730,285 @@ fn generate_equals_the_oracle_tokens_rocm() {
 #[test]
 fn generate_equals_the_oracle_tokens_ptx() {
     assert_generate_matches_the_oracle(BackendChoice::Ptx, DeviceBackend::Ptx);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Four rows, paged (POOT-579 SC-001): batching and paging are binding choices, so a family that was
+// written for one row serves four with no edit.
+// ---------------------------------------------------------------------------------------------
+
+/// Four distinct prompts of four tokens.
+const ROW_PROMPTS: [[u32; 4]; 4] = [
+    [3, 17, 8, 29],
+    [5, 21, 2, 13],
+    [40, 9, 31, 6],
+    [11, 25, 44, 7],
+];
+
+fn bits(values: &[f32]) -> Vec<u32> {
+    values.iter().map(|v| v.to_bits()).collect()
+}
+
+/// One paged step of the fixture on the oracle: row `r` feeds `feed[r]` at positions `start..` and owns
+/// pool slots `r * CAPACITY ..`, so no two rows share a slot. Returns the last token's logits of every row
+/// and the carried pool.
+fn oracle_paged_step(
+    model: &dyn Model,
+    store: &WeightStore,
+    phase: Phase,
+    feed: &[Vec<u32>],
+    start: usize,
+    state: &mut Vec<HostTensor>,
+) -> Vec<f32> {
+    let (rows, n) = (feed.len(), feed[0].len());
+    let pool = rows * CAPACITY;
+    let graph = model
+        .trace(
+            phase,
+            StepShape {
+                rows: nz(rows),
+                tokens: nz(n),
+                capacity: nz(CAPACITY),
+                kv: KvLayout::Paged {
+                    pool_slots: nz(pool),
+                },
+                logits: LogitRows::Last,
+            },
+        )
+        .unwrap();
+    if state.is_empty() {
+        *state = graph
+            .state
+            .iter()
+            .map(|&(input, _)| HostTensor::zeros(graph.aval(input).shape.clone()))
+            .collect();
+    }
+    let read: Vec<i32> = (0..rows)
+        .flat_map(|r| (0..CAPACITY).map(move |p| (r * CAPACITY + p) as i32))
+        .collect();
+    let mut write = vec![-1i32; pool];
+    for r in 0..rows {
+        for j in 0..n {
+            write[r * CAPACITY + start + j] = (r * n + j) as i32;
+        }
+    }
+    let slots = [
+        (
+            SlotKey::new(Slot::Token, None),
+            HostTensor::i32(
+                vec![rows, n],
+                feed.iter().flatten().map(|&t| t as i32).collect(),
+            ),
+        ),
+        (
+            SlotKey::new(Slot::Pos, None),
+            HostTensor::i32(
+                vec![rows, n],
+                (0..rows)
+                    .flat_map(|_| (start..start + n).map(|p| p as i32))
+                    .collect(),
+            ),
+        ),
+        (
+            SlotKey::new(Slot::SlotMap, Some("read")),
+            HostTensor::i32(vec![rows, CAPACITY], read),
+        ),
+        (
+            SlotKey::new(Slot::SlotMap, Some("write")),
+            HostTensor::i32(vec![pool], write),
+        ),
+    ];
+    let (logits, next) = eval_mapped(&graph, store, model.weights(), &slots, state);
+    *state = next;
+    logits.as_f32().expect("f32 logits").to_vec()
+}
+
+/// SC-001 (tier 1): the fixture family's four paged rows - a prefill of four tokens each, then one decode
+/// step - give, for every row, the bits of that prompt's single-row contiguous run on the oracle. The
+/// family traces a slot dimension and a paged pool it never declared: `standard_stack` reads both from the
+/// step shape. Mutation: give `standard_stack` a slot parameter only qwen2 passes; this file no longer
+/// compiles against it (the family's `standard_stack` call lacks the argument).
+#[test]
+fn four_paged_rows_equal_four_single_row_runs_on_the_oracle() {
+    let fixture = family::fixture();
+    let model = fixture_model(&fixture);
+    let feed: Vec<Vec<u32>> = ROW_PROMPTS.iter().map(|p| p.to_vec()).collect();
+    let mut pool = Vec::new();
+    let paged_prefill =
+        oracle_paged_step(&*model, &fixture.store, Phase::Prefill, &feed, 0, &mut pool);
+    let vocab = paged_prefill.len() / feed.len();
+    let next: Vec<Vec<u32>> = (0..feed.len())
+        .map(|r| vec![greedy(&paged_prefill[r * vocab..(r + 1) * vocab]).0])
+        .collect();
+    let paged_decode =
+        oracle_paged_step(&*model, &fixture.store, Phase::Decode, &next, 4, &mut pool);
+
+    for (r, prompt) in ROW_PROMPTS.iter().enumerate() {
+        let mut state = Vec::new();
+        let prefill = oracle_step(
+            &*model,
+            &fixture.store,
+            Phase::Prefill,
+            prompt,
+            0,
+            &mut state,
+        );
+        assert_eq!(
+            bits(&paged_prefill[r * vocab..(r + 1) * vocab]),
+            bits(&prefill),
+            "row {r}: the paged prefill differs from the single-row run"
+        );
+        let decode = oracle_step(
+            &*model,
+            &fixture.store,
+            Phase::Decode,
+            &next[r],
+            4,
+            &mut state,
+        );
+        assert_eq!(
+            bits(&paged_decode[r * vocab..(r + 1) * vocab]),
+            bits(&decode),
+            "row {r}: the paged decode differs from the single-row run"
+        );
+    }
+    // The rows are different prompts: one row's logits are not another's, so a row bound to the wrong
+    // pool slots would show.
+    assert_ne!(
+        bits(&paged_prefill[..vocab]),
+        bits(&paged_prefill[vocab..2 * vocab])
+    );
+}
+
+/// SC-001 (tier 3): four sequences decode paged through the driver, a step per round over the unfinished
+/// rows, and each produces the tokens of its own single-row `generate`. Mutation: bind KV as one row (every
+/// row reads row 0's block table); the other rows decode against row 0's K/V and the tokens differ.
+fn assert_four_paged_rows_equal_single_row_runs(choice: BackendChoice, backend: DeviceBackend) {
+    let Some(executor) = poot_test_util::device_skip::open_or_skip(backend, open_executor(choice))
+    else {
+        return;
+    };
+    let Some(reference) = poot_test_util::device_skip::open_or_skip(backend, open_executor(choice))
+    else {
+        return;
+    };
+    let fixture = family::fixture();
+    let dir = poot_test_util::unique_temp_path("neoxish_four_rows_checkpoint");
+    write_checkpoint(&dir, &fixture);
+    let handle = Arc::new(load(&dir));
+    let mut alone = Driver::new(Arc::clone(&handle), reference, driver_options(8, 64)).unwrap();
+    let mut batched = Driver::new(handle, executor, driver_options(8, 64)).unwrap();
+
+    let want: Vec<Vec<u32>> = ROW_PROMPTS
+        .iter()
+        .map(|prompt| {
+            alone
+                .generate(
+                    GenerateRequest {
+                        prompt: prompt.to_vec(),
+                        max_new: NEW_TOKENS,
+                        sampler: Sampler::greedy(),
+                        stops: Vec::new(),
+                        ignore_eos: true,
+                    },
+                    &mut |_: u32, _: &str| GenerationControl::Continue(()),
+                )
+                .unwrap()
+                .tokens
+        })
+        .collect();
+
+    batched
+        .prepare(&ServingShapes {
+            layout: Layout::Paged(PoolShape {
+                blocks: nz(8),
+                max_seqs: nz(4),
+            }),
+            rows: &[nz(4)],
+            heads: &[Head::GREEDY],
+            warm: Warm::Admitted,
+            windows: &[],
+            adapters: &[],
+        })
+        .unwrap();
+    struct Lane {
+        seq: poot_llm::driver::SeqId,
+        prefilled: usize,
+        out: Vec<u32>,
+        sampler: Sampler,
+    }
+    let mut lanes: Vec<Lane> = ROW_PROMPTS
+        .iter()
+        .map(|prompt| {
+            let admission = batched
+                .open(SeqRequest {
+                    prompt,
+                    max_new: NEW_TOKENS,
+                    adapter: AdapterRef::Base,
+                })
+                .unwrap();
+            let Admission::Opened { seq, reused } = admission else {
+                panic!("no room for a row: {admission:?}");
+            };
+            Lane {
+                seq,
+                prefilled: reused,
+                out: Vec::new(),
+                sampler: Sampler::greedy(),
+            }
+        })
+        .collect();
+    while lanes.iter().any(|lane| lane.out.len() < NEW_TOKENS) {
+        let results = {
+            let mut rows: Vec<StepRow<'_>> = lanes
+                .iter_mut()
+                .zip(ROW_PROMPTS.iter())
+                .filter(|(lane, _)| lane.out.len() < NEW_TOKENS)
+                .map(|(lane, prompt)| StepRow {
+                    seq: lane.seq,
+                    work: if lane.prefilled < prompt.len() {
+                        RowWork::Prefill { upto: prompt.len() }
+                    } else {
+                        RowWork::Decode {
+                            ahead: &[],
+                            pick: PickPolicy::Greedy,
+                        }
+                    },
+                    sampler: &mut lane.sampler,
+                })
+                .collect();
+            batched.step(&mut rows).unwrap()
+        };
+        for result in results {
+            let lane = lanes.iter_mut().find(|l| l.seq == result.seq).unwrap();
+            lane.prefilled += result.consumed;
+            let kept = result.tokens.len();
+            lane.out.extend(&result.tokens);
+            batched.commit(result.seq, kept, &mut lane.sampler).unwrap();
+        }
+    }
+    for (r, lane) in lanes.iter().enumerate() {
+        assert_eq!(
+            lane.out, want[r],
+            "row {r}: four paged rows vs its single-row run"
+        );
+    }
+    for lane in &lanes {
+        batched.release(lane.seq, Release::Finished).unwrap();
+    }
+}
+
+#[test]
+fn four_paged_rows_equal_single_row_runs_wgpu() {
+    assert_four_paged_rows_equal_single_row_runs(BackendChoice::Wgpu, DeviceBackend::Wgpu);
+}
+
+#[test]
+fn four_paged_rows_equal_single_row_runs_rocm() {
+    assert_four_paged_rows_equal_single_row_runs(BackendChoice::Rocm, DeviceBackend::Rocm);
+}
+
+#[test]
+fn four_paged_rows_equal_single_row_runs_ptx() {
+    assert_four_paged_rows_equal_single_row_runs(BackendChoice::Ptx, DeviceBackend::Ptx);
 }

@@ -40,7 +40,7 @@ const ENTRIES: Entry[] = [
   },
   {
     term: "Causal mask",
-    def: "An additive attention mask (shape [cap]) that is 0 for valid key positions t <= pos and a large negative value for later ones, added to the scores before softmax. It also hides KV cache positions not yet written, enabling a fixed-capacity KV allocation. For the dense families (qwen2 and its relatives, bloom, granite, mpt, smollm3, gemma2) it is a graph computation over Slot::Pos; other families still take it as a host-refilled Slot::Mask input.",
+    def: "An additive attention mask (shape [cap]) that is 0 for valid key positions t <= pos and a large negative value for later ones, added to the scores before softmax. It also hides KV cache positions not yet written, enabling a fixed-capacity KV allocation. It is a graph computation over Slot::Pos; no slot carries a mask.",
     see: "attention",
   },
   {
@@ -75,7 +75,7 @@ const ENTRIES: Entry[] = [
   },
   {
     term: "Packed dequantization",
-    def: "Decoding stored weights according to a PackedWeight descriptor from poot-quant. PackedDequant is the primitive; compiler-only PackedContraction and PackedRowGather decode values while consuming them. Current packed MoE paths still materialize expert tables before indexed matmul.",
+    def: "Decoding stored weights according to a PackedWeight descriptor from poot-quant. PackedDequant is the primitive; compiler-only PackedContraction and PackedRowGather decode values while consuming them. A packed MoE expert stack is read by one indexed packed contraction, so no expert table is materialized.",
     see: "graph-ir",
   },
   {
@@ -158,7 +158,7 @@ const ENTRIES: Entry[] = [
   },
   {
     term: "LoRA",
-    def: "Low-Rank Adaptation (Hu et al., 2021): fine-tune small rank adapters instead of full weights. poot-serve can register, hot-load and unload PEFT-format LoRA adapters; applying one to generation returns when the new scheduling loop lands.",
+    def: "Low-Rank Adaptation (Hu et al., 2021): fine-tune small rank adapters instead of full weights. The driver keeps adapter sets for library use; poot-serve has no adapter registration yet (its administration routes answer 503) and returns it when the new scheduling loop lands.",
     see: "serving-design",
   },
   {
@@ -218,7 +218,7 @@ const ENTRIES: Entry[] = [
   },
   {
     term: "Slot",
-    def: "A per-step graph input (Storage::Slot) such as Token, Pos, Mask, or SlotMap. Stored in a device buffer at a stable address. The captured graph references these addresses; per-token updates write the new value in place.",
+    def: "A per-step graph input (Storage::Slot) such as Token, Pos, or SlotMap. Stored in a device buffer at a stable address. The captured graph references these addresses; per-token updates write the new value in place.",
     see: "execution",
   },
   {
@@ -313,6 +313,36 @@ const ENTRIES: Entry[] = [
     term: "Workgroup",
     def: 'The unit of GPU parallelism in which threads share LDS and can synchronize with a barrier. Called a "thread block" in CUDA, "workgroup" in Vulkan/SPIR-V. poot kernels are written in terms of workgroups.',
     see: "kernel-import",
+  },
+  {
+    term: "Driver",
+    def: "The poot-llm token loop over the executor contract. It binds one ModelHandle to one executor, loads the weights once as one executable, adds one entry per (phase, step shape, sampling suffix) it needs, and runs open, step, commit and release. It knows no model family and no backend.",
+    see: "driver",
+  },
+  {
+    term: "Entry (executor)",
+    def: "One compiled specialization on an executable: a program for a (phase, step shape, sampling suffix) key. An entry records on its first step and replays afterwards. Token ids, positions and sampler parameters are bound inputs and never make a new entry.",
+    see: "driver",
+  },
+  {
+    term: "Model (trait)",
+    def: "What a model family implements: its ModelConfig, its WeightMap, and trace(phase, step shape), which builds the graph of one step. A shape or phase the family cannot trace is a typed TraceError.",
+    see: "driver",
+  },
+  {
+    term: "ModelHandle",
+    def: "A loaded checkpoint: the family's Model, its weight store and its text services (tokenizer, chat template). Loading resolves the family from the config before any weight is read.",
+    see: "driver",
+  },
+  {
+    term: "Registry",
+    def: "The set of model families a driver can load. Each FamilyEntry names the config keys that select the family (a Hugging Face model_type, a GGUF architecture), how to build it and its fixture. A key no family holds is a typed unsupported-model error.",
+    see: "driver",
+  },
+  {
+    term: "StepShape",
+    def: "The semantic shape of one traced step: rows, new tokens per row, cache capacity, KV layout (contiguous or paged) and whether logits return for the last token or all tokens.",
+    see: "driver",
   },
   {
     term: "XDNA2",

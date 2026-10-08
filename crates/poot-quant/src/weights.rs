@@ -30,13 +30,13 @@
 //! families. [`WeightId::const_name`] is the one graph const name of a mapped weight.
 
 use std::borrow::{Borrow, Cow};
-use std::collections::BTreeMap;
 use std::collections::btree_map;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{PackedPayload, StoredBytes};
+use crate::{PackedPayload, PackedStack, StoredBytes};
 
 /// The name a loader assigned one stored weight: the checkpoint tensor name for a dense entry, or
 /// the loader's linear id (built from that weight's several source tensors - `weight` and `scale`
@@ -400,8 +400,23 @@ pub enum WeightRole {
     Mla(MlaRole),
     /// A Mamba2 mixer's weights.
     Mamba2(Mamba2Role),
+    /// A Gated DeltaNet mixer's weights.
+    Gdn(GdnRole),
+    /// A Kimi Delta Attention (KDA) mixer's weights.
+    Kda(KdaRole),
     /// The DeepSeek sparse-attention lightning indexer's weights.
     Dsa(DsaRole),
+    /// The block indexer of Qwen Sparse Attention.
+    Qsa(QsaRole),
+    /// One Hyper-Connections gate around a block (Qwen4Exp's `*_hyper_connection` modules), and the
+    /// model-level mixer that collapses the streams before the head.
+    Hyper(HyperSite, HyperRole),
+    /// The per-layer-embedding (n-gram) block's weights.
+    Ple(PleRole),
+    /// DeepSeek-V4's manifold-constrained hyper-connection (mHC) mixing weights.
+    Mhc(MhcRole),
+    /// DeepSeek-V4's attention-window compressors (the layer's and its indexer's).
+    Compress(CompressRole),
     /// The bias of a model-level LayerNorm (the final norm's; a layer norm's bias is
     /// [`NormRole::AttnBias`] or [`NormRole::FfnBias`]).
     FinalNormBias,
@@ -410,6 +425,101 @@ pub enum WeightRole {
     EmbedNormBias,
     /// The scalar a layer multiplies its output by (Gemma 4's `layer_scalar`), `[1]`.
     LayerScale,
+    /// A learned absolute position table `[positions, width]` (BERT, a vision tower), and BERT's
+    /// token-type table `[types, width]`.
+    PosEmbed,
+    TypeEmbed,
+    /// BERT's `[CLS]` pooler projection `[width, width]` and its bias.
+    Pooler,
+    PoolerBias,
+    /// The bias of the output head (a classifier's), `[out]`.
+    HeadBias,
+    /// A vision tower's patch embedding, the stored convolution `[width, channels, patch, patch]`,
+    /// and its bias.
+    Patch,
+    PatchBias,
+    /// A modality connector's projection `[text_width, vision_width * scale^2]`.
+    Connector,
+    /// The stacked LoRA adapter tensors the compile-time LoRA pass reads beside the base weights.
+    Lora(LoraRole),
+}
+
+/// A projection a LoRA adapter can target: the four attention projections and the three gated-MLP ones.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LoraTarget {
+    AttnQ,
+    AttnK,
+    AttnV,
+    AttnO,
+    FfnGate,
+    FfnUp,
+    FfnDown,
+}
+
+impl LoraTarget {
+    /// Every targetable projection.
+    pub const ALL: [LoraTarget; 7] = [
+        LoraTarget::AttnQ,
+        LoraTarget::AttnK,
+        LoraTarget::AttnV,
+        LoraTarget::AttnO,
+        LoraTarget::FfnGate,
+        LoraTarget::FfnUp,
+        LoraTarget::FfnDown,
+    ];
+
+    /// The base weight role this projection is.
+    pub const fn weight_role(self) -> WeightRole {
+        match self {
+            LoraTarget::AttnQ => WeightRole::Attn(AttnRole::Q),
+            LoraTarget::AttnK => WeightRole::Attn(AttnRole::K),
+            LoraTarget::AttnV => WeightRole::Attn(AttnRole::V),
+            LoraTarget::AttnO => WeightRole::Attn(AttnRole::O),
+            LoraTarget::FfnGate => WeightRole::Ffn(FfnRole::Gate),
+            LoraTarget::FfnUp => WeightRole::Ffn(FfnRole::Up),
+            LoraTarget::FfnDown => WeightRole::Ffn(FfnRole::Down),
+        }
+    }
+
+    /// The projection `role` is, if it is one an adapter can target.
+    pub fn of(role: WeightRole) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|target| target.weight_role() == role)
+    }
+}
+
+/// Which stacked adapter tensor a [`WeightRole::Lora`] weight holds. `A` is `[adapters + 1, in, r]` and
+/// `B` is `[adapters + 1, r, out]` for the projection `target` of a layer, both in `x @ W` orientation
+/// and zero-padded to a common rank; row 0 of each is the no-adapter row. `Scale` is the model-level
+/// `[adapters + 1]` per-adapter `lora_alpha / r`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LoraRole {
+    A(LoraTarget),
+    B(LoraTarget),
+    Scale,
+}
+
+impl LoraRole {
+    const fn spelling(self) -> &'static str {
+        match self {
+            LoraRole::A(LoraTarget::AttnQ) => "lora.a.attn.q",
+            LoraRole::A(LoraTarget::AttnK) => "lora.a.attn.k",
+            LoraRole::A(LoraTarget::AttnV) => "lora.a.attn.v",
+            LoraRole::A(LoraTarget::AttnO) => "lora.a.attn.o",
+            LoraRole::A(LoraTarget::FfnGate) => "lora.a.ffn.gate",
+            LoraRole::A(LoraTarget::FfnUp) => "lora.a.ffn.up",
+            LoraRole::A(LoraTarget::FfnDown) => "lora.a.ffn.down",
+            LoraRole::B(LoraTarget::AttnQ) => "lora.b.attn.q",
+            LoraRole::B(LoraTarget::AttnK) => "lora.b.attn.k",
+            LoraRole::B(LoraTarget::AttnV) => "lora.b.attn.v",
+            LoraRole::B(LoraTarget::AttnO) => "lora.b.attn.o",
+            LoraRole::B(LoraTarget::FfnGate) => "lora.b.ffn.gate",
+            LoraRole::B(LoraTarget::FfnUp) => "lora.b.ffn.up",
+            LoraRole::B(LoraTarget::FfnDown) => "lora.b.ffn.down",
+            LoraRole::Scale => "lora.scale",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -432,6 +542,10 @@ pub enum AttnRole {
     QkvBias,
     /// The per-query-head attention sink logits (gpt-oss), `[heads]`.
     Sinks,
+    /// The first stage of a grouped low-rank output projection (DeepSeek-V4's `wo_a`): the stored
+    /// `[groups * rank, heads * head_dim / groups]` matrix, read as `groups` block-diagonal
+    /// projections. The second stage is [`AttnRole::O`].
+    OA,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -465,9 +579,10 @@ impl ExpertProj {
     }
 }
 
-/// The weights of a routed mixture-of-experts block. A dense checkpoint stores one projection of
-/// every expert as a stack ([`MoeRole::Stack`]); a packed one stores each expert's projection as
-/// its own packed weight ([`MoeRole::Expert`]), because a packed weight is one `[out, K]` matrix.
+/// The weights of a routed mixture-of-experts block. A checkpoint stores one projection of every expert
+/// as a stack ([`MoeRole::Stack`]), whether as one tensor or as per-expert tensors; per-expert packed
+/// weights (each one `[out, K]` matrix) are viewed as one stack ([`WeightView::ExpertStack`]) without
+/// being copied together.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MoeRole {
     /// The router projection, `[experts, width]`.
@@ -478,16 +593,19 @@ pub enum MoeRole {
     RouterScale,
     /// The scale on each expert's routing weight, `[experts]` (Gemma 4's `per_expert_scale`).
     ExpertScale,
-    /// One projection of every expert, dense: the stored stack `[experts, out, K]` /
-    /// `[experts, K, out]`, or per-expert tensors stacked into `[experts, out, K]`
+    /// One projection of every expert: the stored stack `[experts, out, K]` / `[experts, K, out]`, or
+    /// per-expert tensors, dense or packed, stacked into `[experts, out, K]`
     /// ([`WeightView::ExpertStack`]).
     Stack(ExpertProj),
-    /// One projection of one expert, packed: `[out, K]`.
-    Expert(ExpertProj, u32),
     /// The bias of every expert's projection, `[experts, out]`.
     StackBias(ExpertProj),
     /// One projection of the always-active shared expert, `[out, K]`.
     Shared(ExpertProj),
+    /// A hash router's token-to-experts table, `[vocab, top_k]` I32 (DeepSeek-V4's `tid2eid`).
+    HashTable,
+    /// The shared expert's scalar gate: one logit per token, `[1, width]` (or `[width]`), through a
+    /// sigmoid (Qwen3-Next).
+    SharedGate,
 }
 
 /// The weights of multi-head latent attention (DeepSeek). A plain query is [`AttnRole::Q`]; the
@@ -531,6 +649,66 @@ pub enum Mamba2Role {
     Out,
 }
 
+/// The weights of a Gated DeltaNet mixer layer (Qwen3-Next). The layer's pre-mixer norm is
+/// [`NormRole::Attn`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum GdnRole {
+    /// The mixed query, key and value projection `[2 * key_dim + value_dim, width]` and the output
+    /// gate `z` projection `[value_dim, width]`, each separate (a GGUF; Qwen3.5).
+    Qkv,
+    Z,
+    /// The per-value-head beta and decay (`alpha`) projections `[value_heads, width]`, separate.
+    Beta,
+    Alpha,
+    /// The fused projections of an HF `qwen3_next` checkpoint, whose rows group per key head:
+    /// `[key_heads * (2 * head_dim + 2 * value_heads / key_heads * head_dim), width]` for `q|k|v|z`
+    /// and `[2 * value_heads, width]` for `b|a`.
+    Qkvz,
+    Ba,
+    /// The bias added to `alpha` before its softplus, `[value_heads]`.
+    DtBias,
+    /// The depthwise conv kernel over the mixed channels, `[channels, 1, K]` (or `[channels, K]`).
+    Conv,
+    /// The per-head decay factor, `[value_heads]`: `A_log` (HF; the decay is `-exp(A_log)`) or the
+    /// decay itself, already negative (GGUF's `ssm_a`).
+    A,
+    /// The gated RMSNorm scale over each value head's `head_dim`, and the output projection.
+    GateNorm,
+    Out,
+}
+
+/// The weights of a Kimi Delta Attention mixer layer (GLM-5.3-Flash). The layer's pre-mixer norm is
+/// [`NormRole::Attn`]. `heads * head_dim` is the width of each of the query, key and value
+/// projections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum KdaRole {
+    /// The query, key and value projections `[heads * head_dim, width]`.
+    Q,
+    K,
+    V,
+    /// The depthwise conv kernels over the query, key and value channels, `[heads * head_dim, 1, K]`.
+    ConvQ,
+    ConvK,
+    ConvV,
+    /// The low-rank forget-gate projections: `FA` `[gate_rank, width]` and `FB`
+    /// `[heads * head_dim, gate_rank]`.
+    FA,
+    FB,
+    /// The per-head beta projection `[heads, width]`.
+    Beta,
+    /// The low-rank output-gate projections, shaped as `FA` and `FB`.
+    GA,
+    GB,
+    /// The per-head log decay rate `[heads]` and the bias added to the forget gate's argument,
+    /// `[heads * head_dim]`.
+    ALog,
+    DtBias,
+    /// The RMSNorm scale over each head's `head_dim`, and the output projection `[width, heads *
+    /// head_dim]`.
+    ONorm,
+    Out,
+}
+
 /// The lightning indexer of DeepSeek sparse attention.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DsaRole {
@@ -542,6 +720,94 @@ pub enum DsaRole {
     KNormBias,
     /// The per-head weights projection `[heads, width]`.
     Weights,
+}
+
+/// The block indexer of Qwen Sparse Attention: its query and key projections (read from one fused
+/// checkpoint tensor, `[(heads + 1) * dim, width]`, query rows first) and the scales of the two
+/// norms over each head's `dim`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum QsaRole {
+    /// The query projection `[heads * dim, width]`.
+    Q,
+    /// The shared key projection `[dim, width]`.
+    K,
+    QNorm,
+    KNorm,
+}
+
+/// Where a Hyper-Connections gate sits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum HyperSite {
+    /// Around a layer's mixer (attention or Gated DeltaNet).
+    Attn,
+    /// Around a layer's feed-forward.
+    Mlp,
+    /// The model-level mixer after the last layer (a model-level weight).
+    Final,
+}
+
+/// One Hyper-Connections gate's weights.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum HyperRole {
+    /// The grouped RMSNorm scale over the `streams * width` state, `[streams * width]`.
+    Norm,
+    /// The low-rank gate projections `[rank, streams * width]` and `[streams * width, rank]`.
+    MixDown,
+    MixUp,
+    /// The per-stream injection weights `[streams, streams * width]` (not on the final mixer).
+    Inject,
+}
+
+/// The weights of a per-layer-embedding block: the n-gram embedding table and the projections,
+/// norms and short conv that gate it into the stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PleRole {
+    /// The n-gram embedding table `[rows, head_dim]`.
+    Table,
+    /// One row-range shard of the table, `[shard_rows, head_dim]`, in logical row order: shard `i`
+    /// holds the rows after shards `0..i`. A table is stored as `Table` or as shards, never both.
+    TableShard(u32),
+    /// The scalar a sharded table's rows are multiplied by after the lookup, `[]`.
+    TableScale,
+    /// The key projection `[streams * width, embed_dim]` and value projection `[width, embed_dim]`.
+    Key,
+    Value,
+    /// The grouped norm scales over the key, the query (the stream) and the gated value.
+    KeyNorm,
+    QueryNorm,
+    ConvNorm,
+    /// The dilated depthwise conv kernel `[streams * width, 1, K]`.
+    Conv,
+}
+
+/// The weights of one mHC site. A layer has an `Attn` and an `Ffn` site and the model one `Head`
+/// collapse; each site is a projection `[mix, streams * width]`, a base `[mix]` and a scale.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MhcRole {
+    AttnFn,
+    AttnBase,
+    AttnScale,
+    FfnFn,
+    FfnBase,
+    FfnScale,
+    HeadFn,
+    HeadBase,
+    HeadScale,
+}
+
+/// The weights of an attention-window compressor: the key/value and gate projections of the layer's
+/// compressed branch, the learned position bias added to the gate, and the norm of the pooled
+/// entry. The `Indexer` rows are the same four for the lightning indexer's own compressor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CompressRole {
+    Kv,
+    Gate,
+    PositionBias,
+    Norm,
+    IndexerKv,
+    IndexerGate,
+    IndexerPositionBias,
+    IndexerNorm,
 }
 
 /// The per-layer norms around a block (the model-level output norm is [`WeightRole::FinalNorm`]).
@@ -593,12 +859,98 @@ impl WeightRole {
                 Mamba2Role::GateNorm => "mamba2.gate_norm",
                 Mamba2Role::Out => "mamba2.out",
             },
+            WeightRole::Gdn(role) => match role {
+                GdnRole::Qkv => "gdn.qkv",
+                GdnRole::Z => "gdn.z",
+                GdnRole::Beta => "gdn.beta",
+                GdnRole::Alpha => "gdn.alpha",
+                GdnRole::Qkvz => "gdn.qkvz",
+                GdnRole::Ba => "gdn.ba",
+                GdnRole::DtBias => "gdn.dt_bias",
+                GdnRole::Conv => "gdn.conv",
+                GdnRole::A => "gdn.a",
+                GdnRole::GateNorm => "gdn.gate_norm",
+                GdnRole::Out => "gdn.out",
+            },
+            WeightRole::Kda(role) => match role {
+                KdaRole::Q => "kda.q",
+                KdaRole::K => "kda.k",
+                KdaRole::V => "kda.v",
+                KdaRole::ConvQ => "kda.conv_q",
+                KdaRole::ConvK => "kda.conv_k",
+                KdaRole::ConvV => "kda.conv_v",
+                KdaRole::FA => "kda.f_a",
+                KdaRole::FB => "kda.f_b",
+                KdaRole::Beta => "kda.beta",
+                KdaRole::GA => "kda.g_a",
+                KdaRole::GB => "kda.g_b",
+                KdaRole::ALog => "kda.a_log",
+                KdaRole::DtBias => "kda.dt_bias",
+                KdaRole::ONorm => "kda.o_norm",
+                KdaRole::Out => "kda.out",
+            },
             WeightRole::Dsa(role) => match role {
                 DsaRole::Q => "dsa.q",
                 DsaRole::K => "dsa.k",
                 DsaRole::KNorm => "dsa.k_norm",
                 DsaRole::KNormBias => "dsa.k_norm_bias",
                 DsaRole::Weights => "dsa.weights",
+            },
+            WeightRole::Qsa(role) => match role {
+                QsaRole::Q => "qsa.q",
+                QsaRole::K => "qsa.k",
+                QsaRole::QNorm => "qsa.q_norm",
+                QsaRole::KNorm => "qsa.k_norm",
+            },
+            WeightRole::Hyper(site, role) => {
+                return Cow::Owned(format!(
+                    "hyper.{}.{}",
+                    match site {
+                        HyperSite::Attn => "attn",
+                        HyperSite::Mlp => "mlp",
+                        HyperSite::Final => "final",
+                    },
+                    match role {
+                        HyperRole::Norm => "norm",
+                        HyperRole::MixDown => "mix_down",
+                        HyperRole::MixUp => "mix_up",
+                        HyperRole::Inject => "inject",
+                    }
+                ));
+            }
+            WeightRole::Ple(role) => match role {
+                PleRole::Table => "ple.table",
+                PleRole::TableShard(shard) => {
+                    return Cow::Owned(format!("ple.table.shard_{shard}"));
+                }
+                PleRole::TableScale => "ple.table_scale",
+                PleRole::Key => "ple.key",
+                PleRole::Value => "ple.value",
+                PleRole::KeyNorm => "ple.key_norm",
+                PleRole::QueryNorm => "ple.query_norm",
+                PleRole::ConvNorm => "ple.conv_norm",
+                PleRole::Conv => "ple.conv",
+            },
+            WeightRole::Mhc(role) => match role {
+                MhcRole::AttnFn => "mhc.attn_fn",
+                MhcRole::AttnBase => "mhc.attn_base",
+                MhcRole::AttnScale => "mhc.attn_scale",
+                MhcRole::FfnFn => "mhc.ffn_fn",
+                MhcRole::FfnBase => "mhc.ffn_base",
+                MhcRole::FfnScale => "mhc.ffn_scale",
+                MhcRole::HeadFn => "mhc.head_fn",
+                MhcRole::HeadBase => "mhc.head_base",
+                MhcRole::HeadScale => "mhc.head_scale",
+            },
+            WeightRole::Compress(role) => match role {
+                CompressRole::Kv => "compress.kv",
+                CompressRole::Gate => "compress.gate",
+                CompressRole::PositionBias => "compress.position_bias",
+                CompressRole::Norm => "compress.norm",
+                CompressRole::IndexerKv => "compress.indexer_kv",
+                CompressRole::IndexerGate => "compress.indexer_gate",
+                CompressRole::IndexerPositionBias => "compress.indexer_position_bias",
+                CompressRole::IndexerNorm => "compress.indexer_norm",
             },
             WeightRole::Embed => "embed",
             WeightRole::Head => "head",
@@ -620,6 +972,7 @@ impl WeightRole {
                 AttnRole::Qkv => "attn.qkv",
                 AttnRole::QkvBias => "attn.qkv_bias",
                 AttnRole::Sinks => "attn.sinks",
+                AttnRole::OA => "attn.o_a",
             },
             WeightRole::Ffn(role) => match role {
                 FfnRole::Gate => "ffn.gate",
@@ -640,6 +993,15 @@ impl WeightRole {
                 NormRole::PostRouted => "norm.post_routed",
             },
             WeightRole::LayerScale => "layer_scale",
+            WeightRole::PosEmbed => "pos_embed",
+            WeightRole::TypeEmbed => "type_embed",
+            WeightRole::Pooler => "pooler",
+            WeightRole::PoolerBias => "pooler_bias",
+            WeightRole::HeadBias => "head_bias",
+            WeightRole::Patch => "patch",
+            WeightRole::PatchBias => "patch_bias",
+            WeightRole::Connector => "connector",
+            WeightRole::Lora(role) => role.spelling(),
         })
     }
 }
@@ -652,11 +1014,10 @@ impl MoeRole {
             MoeRole::RouterScale => Cow::Borrowed("moe.router_scale"),
             MoeRole::ExpertScale => Cow::Borrowed("moe.expert_scale"),
             MoeRole::Stack(proj) => Cow::Owned(format!("moe.stack.{}", proj.spelling())),
-            MoeRole::Expert(proj, index) => {
-                Cow::Owned(format!("moe.expert{index}.{}", proj.spelling()))
-            }
             MoeRole::StackBias(proj) => Cow::Owned(format!("moe.stack_bias.{}", proj.spelling())),
             MoeRole::Shared(proj) => Cow::Owned(format!("moe.shared.{}", proj.spelling())),
+            MoeRole::HashTable => Cow::Borrowed("moe.hash_table"),
+            MoeRole::SharedGate => Cow::Borrowed("moe.shared_gate"),
         }
     }
 }
@@ -705,15 +1066,33 @@ pub enum WeightView {
     /// Several entries stacked along the leading (row) axis, in order (split `gate`/`up`, expert
     /// stacks).
     RowStack(Vec<WeightKey>),
-    /// Dense entries of one dtype and shape stacked along a new leading axis, in order: the
-    /// `[experts, out, K]` stack of per-expert tensors. A packed weight is one `[out, K]` matrix and
-    /// is never stacked (each packed expert is its own weight).
+    /// Entries of one format and shape stacked along a new leading axis, in order: the
+    /// `[experts, out, K]` stack of per-expert tensors. Dense parts are copied into one dense entry
+    /// ([`WeightMap::materialize`]); packed parts stay their own payloads and are read together as a
+    /// [`PackedStack`] ([`WeightMap::materialize_stack`]), whose device table pads every expert's
+    /// source to word strides ([`crate::PackedWeight::slab_bytes`]).
     ExpertStack(Vec<WeightKey>),
     /// A leading-axis row range of one entry (a slice of a fused `qkv`).
     RowRange {
         key: WeightKey,
         rows: std::ops::Range<usize>,
     },
+    /// An integer index table stored as I64, read as I32 (DeepSeek-V4's `tid2eid`): every value is
+    /// range-checked when the map is built, so a table that does not fit I32 is refused before any
+    /// trace. The one view whose bytes are derived rather than cut from the store.
+    IndexNarrow(WeightKey),
+}
+
+impl WeightView {
+    /// The store keys this view reads.
+    fn keys(&self) -> &[WeightKey] {
+        match self {
+            Self::Stored(key) | Self::IndexNarrow(key) | Self::RowRange { key, .. } => {
+                std::slice::from_ref(key)
+            }
+            Self::RowStack(keys) | Self::ExpertStack(keys) => keys,
+        }
+    }
 }
 
 /// The stored format of a mapped weight (the driver path's only source of weight
@@ -777,14 +1156,33 @@ pub enum WeightMapError {
         id: WeightId,
         source: Box<crate::PackedWeightError>,
     },
-    /// A [`WeightView::ExpertStack`] over an entry that is not dense, or whose dtype or shape differs
-    /// from the first part's.
+    /// A [`WeightView::IndexNarrow`] over an entry that is not a dense I64 or I32 table.
+    NotAnIndexTable {
+        id: WeightId,
+        key: WeightKey,
+        found: Box<WeightHandle>,
+    },
+    /// A [`WeightView::IndexNarrow`] table holding a value outside I32: element `index` (row-major)
+    /// of `key` is `value`.
+    IndexOutOfRange {
+        id: WeightId,
+        key: WeightKey,
+        index: usize,
+        value: i64,
+    },
+    /// A [`WeightView::ExpertStack`] over an entry whose format (dense dtype or packed format) or
+    /// shape differs from the first part's.
     NotStackable {
         id: WeightId,
         key: WeightKey,
         first: Box<WeightHandle>,
         other: Box<WeightHandle>,
     },
+    /// [`WeightMap::materialize`] over a packed [`WeightView::ExpertStack`]: its experts are separate
+    /// payloads, read with [`WeightMap::materialize_stack`], never one entry.
+    PackedStackIsNotOneEntry { id: WeightId },
+    /// [`WeightMap::materialize_stack`] over a view that is not a packed expert stack.
+    NotAPackedStack { id: WeightId },
 }
 
 impl fmt::Display for WeightMapError {
@@ -812,6 +1210,19 @@ impl fmt::Display for WeightMapError {
                 "weight {id}: row-stack parts must share one format and row shape: {first:?} vs {other:?}"
             ),
             Self::Packed { id, source } => write!(f, "weight {id}: {source}"),
+            Self::NotAnIndexTable { id, key, found } => write!(
+                f,
+                "weight {id}: entry {key} is {found:?}, not an I64 or I32 index table"
+            ),
+            Self::IndexOutOfRange {
+                id,
+                key,
+                index,
+                value,
+            } => write!(
+                f,
+                "weight {id}: entry {key} element {index} is {value}, outside the I32 range"
+            ),
             Self::NotStackable {
                 id,
                 key,
@@ -821,6 +1232,13 @@ impl fmt::Display for WeightMapError {
                 f,
                 "weight {id}: entry {key} cannot join an expert stack of {first:?}: it is {other:?}"
             ),
+            Self::PackedStackIsNotOneEntry { id } => write!(
+                f,
+                "weight {id}: a packed expert stack is one payload per expert, not one entry (read it with materialize_stack)"
+            ),
+            Self::NotAPackedStack { id } => {
+                write!(f, "weight {id} is not a packed expert stack")
+            }
         }
     }
 }
@@ -840,6 +1258,20 @@ impl std::error::Error for WeightMapError {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WeightMap {
     entries: BTreeMap<WeightId, (WeightView, WeightHandle)>,
+    /// Stored tensors the family recognises and does not read.
+    known: BTreeSet<WeightKey>,
+}
+
+/// How a checkpoint's stored tensors stand against a model's [`WeightMap`]: every store key is read by
+/// the model, known to it and left unread, or not recognised at all.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LoadReport {
+    /// Keys some mapped weight reads.
+    pub loaded: BTreeSet<WeightKey>,
+    /// Keys the family claims without reading (a multi-token-prediction head it does not trace).
+    pub known: BTreeSet<WeightKey>,
+    /// Keys the family neither reads nor claims.
+    pub unknown: BTreeSet<WeightKey>,
 }
 
 impl WeightMap {
@@ -847,6 +1279,16 @@ impl WeightMap {
         WeightMapBuilder {
             store,
             map: WeightMap::default(),
+        }
+    }
+
+    /// A builder over `store` that starts from this map's weights, for a map that adds weights beside
+    /// them (an adapter generation's stacked LoRA tensors). `store` must hold every entry this map's
+    /// views read, as a store built with [`WeightStoreBuilder::extend_from`] over the original does.
+    pub fn extending<'s>(&self, store: &'s WeightStore) -> WeightMapBuilder<'s> {
+        WeightMapBuilder {
+            store,
+            map: self.clone(),
         }
     }
 
@@ -872,6 +1314,29 @@ impl WeightMap {
         self.entries.is_empty()
     }
 
+    /// Where every key of `store` stands: read by a mapped weight, claimed as known, or unknown.
+    /// A key a weight reads is loaded even if it is also claimed.
+    pub fn report(&self, store: &WeightStore) -> LoadReport {
+        let loaded: BTreeSet<WeightKey> = self
+            .entries
+            .values()
+            .flat_map(|(view, _)| view.keys().iter())
+            .cloned()
+            .collect();
+        let mut report = LoadReport::default();
+        for key in store.keys() {
+            let part = if loaded.contains(key) {
+                &mut report.loaded
+            } else if self.known.contains(key) {
+                &mut report.known
+            } else {
+                &mut report.unknown
+            };
+            part.insert(key.clone());
+        }
+        report
+    }
+
     /// `id`'s bytes as one store-shaped entry: the stored entry itself for
     /// [`WeightView::Stored`], or the stacked / sliced rows copied byte for byte (a packed block
     /// format's rows are whole runs of blocks, so no decode is involved). The result's handle is
@@ -886,6 +1351,30 @@ impl WeightMap {
             .get(&id)
             .ok_or(WeightMapError::Unmapped { id })?;
         materialize_view(id, view, store)
+    }
+
+    /// The experts of a packed [`WeightView::ExpertStack`] `id`, each its own payload, as one
+    /// [`PackedStack`]. Fails for any other view.
+    pub fn materialize_stack(
+        &self,
+        id: WeightId,
+        store: &WeightStore,
+    ) -> Result<PackedStack, WeightMapError> {
+        let (view, _) = self
+            .entries
+            .get(&id)
+            .ok_or(WeightMapError::Unmapped { id })?;
+        let WeightView::ExpertStack(parts) = view else {
+            return Err(WeightMapError::NotAPackedStack { id });
+        };
+        let owners = parts
+            .iter()
+            .map(|key| match stored(id, key, store)? {
+                WeightEntry::Packed(payload) => Ok(Arc::clone(payload)),
+                WeightEntry::Dense(_) => Err(WeightMapError::NotAPackedStack { id }),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        PackedStack::try_new(owners).map_err(packed_error(id))
     }
 }
 
@@ -906,6 +1395,13 @@ impl WeightMapBuilder<'_> {
         let handle = view_handle(id, &view, self.store)?;
         self.map.entries.insert(id, (view, handle));
         Ok(self)
+    }
+
+    /// Claim the stored tensor `key` as known: the family recognises it and reads no weight from
+    /// it, so [`WeightMap::report`] lists it as known, not unknown.
+    pub fn known(&mut self, key: WeightKey) -> &mut Self {
+        self.map.known.insert(key);
+        self
     }
 
     pub fn build(self) -> WeightMap {
@@ -1024,12 +1520,19 @@ fn view_handle(
                 }
             }
         }
+        WeightView::IndexNarrow(key) => {
+            let shape = narrowed_index_table(id, key, store)?.shape().to_vec();
+            Ok(WeightHandle {
+                format: HandleFormat::Dense(poot_tensor::DType::I32),
+                shape,
+            })
+        }
         WeightView::ExpertStack(parts) => {
             let first_key = parts.first().ok_or(WeightMapError::EmptyStack { id })?;
             let first = WeightHandle::of(stored(id, first_key, store)?);
             for key in parts {
                 let other = WeightHandle::of(stored(id, key, store)?);
-                if !matches!(other.format, HandleFormat::Dense(_)) || other != first {
+                if other != first {
                     return Err(WeightMapError::NotStackable {
                         id,
                         key: key.clone(),
@@ -1121,11 +1624,14 @@ fn materialize_view(
                 }
             }
         }
+        WeightView::IndexNarrow(key) => {
+            narrowed_index_table(id, key, store).map(WeightEntry::Dense)
+        }
         WeightView::ExpertStack(parts) => {
-            // The handle checks every part is dense, of one dtype and one shape.
+            // The handle checks every part is of one format and one shape.
             let handle = view_handle(id, view, store)?;
             let HandleFormat::Dense(dtype) = handle.format else {
-                unreachable!("an expert stack handle is dense: view_handle refuses packed parts");
+                return Err(WeightMapError::PackedStackIsNotOneEntry { id });
             };
             let mut bytes = Vec::new();
             for key in parts {
@@ -1139,6 +1645,52 @@ fn materialize_view(
                 bytes: StoredBytes::new(Arc::from(bytes)),
             }))
         }
+    }
+}
+
+/// `key`'s I64 (or already I32) index table as an I32 table: every value checked against the I32
+/// range, the first one outside it named by element index.
+fn narrowed_index_table(
+    id: WeightId,
+    key: &WeightKey,
+    store: &WeightStore,
+) -> Result<DenseWeight, WeightMapError> {
+    use poot_tensor::DType;
+    let entry = stored(id, key, store)?;
+    let WeightEntry::Dense(dense) = entry else {
+        return Err(not_an_index_table(id, key, entry));
+    };
+    let bytes = dense.bytes().as_slice();
+    let narrowed: Vec<u8> = match dense.dtype() {
+        DType::I32 => bytes.to_vec(),
+        DType::I64 => {
+            let mut out = Vec::with_capacity(bytes.len() / 2);
+            for (index, word) in bytes.as_chunks::<8>().0.iter().enumerate() {
+                let value = i64::from_le_bytes(*word);
+                let narrow = i32::try_from(value).map_err(|_| WeightMapError::IndexOutOfRange {
+                    id,
+                    key: key.clone(),
+                    index,
+                    value,
+                })?;
+                out.extend_from_slice(&narrow.to_le_bytes());
+            }
+            out
+        }
+        _ => return Err(not_an_index_table(id, key, entry)),
+    };
+    Ok(DenseWeight {
+        dtype: DType::I32,
+        shape: dense.shape().to_vec(),
+        bytes: StoredBytes::new(Arc::from(narrowed)),
+    })
+}
+
+fn not_an_index_table(id: WeightId, key: &WeightKey, entry: &WeightEntry) -> WeightMapError {
+    WeightMapError::NotAnIndexTable {
+        id,
+        key: key.clone(),
+        found: Box::new(WeightHandle::of(entry)),
     }
 }
 
@@ -1285,6 +1837,18 @@ mod tests {
     fn const_names_are_the_stable_per_role_spellings() {
         let cases = [
             (WeightId::model(WeightRole::Embed), "w.embed"),
+            (
+                WeightId::layer(2, WeightRole::Lora(LoraRole::A(LoraTarget::AttnQ))),
+                "w.l2.lora.a.attn.q",
+            ),
+            (
+                WeightId::layer(2, WeightRole::Lora(LoraRole::B(LoraTarget::FfnDown))),
+                "w.l2.lora.b.ffn.down",
+            ),
+            (
+                WeightId::model(WeightRole::Lora(LoraRole::Scale)),
+                "w.lora.scale",
+            ),
             (WeightId::model(WeightRole::Head), "w.head"),
             (WeightId::model(WeightRole::FinalNorm), "w.final_norm"),
             (
@@ -1349,8 +1913,8 @@ mod tests {
                 "w.l2.moe.stack.gate_up",
             ),
             (
-                WeightId::layer(2, WeightRole::Moe(MoeRole::Expert(ExpertProj::Down, 7))),
-                "w.l2.moe.expert7.down",
+                WeightId::layer(2, WeightRole::Moe(MoeRole::Stack(ExpertProj::Down))),
+                "w.l2.moe.stack.down",
             ),
             (
                 WeightId::layer(2, WeightRole::Moe(MoeRole::StackBias(ExpertProj::Up))),
@@ -1403,6 +1967,90 @@ mod tests {
             (
                 WeightId::layer(12, WeightRole::Ffn(FfnRole::Down)),
                 "w.l12.ffn.down",
+            ),
+            (
+                WeightId::layer(1, WeightRole::Attn(AttnRole::OA)),
+                "w.l1.attn.o_a",
+            ),
+            (
+                WeightId::layer(1, WeightRole::Moe(MoeRole::HashTable)),
+                "w.l1.moe.hash_table",
+            ),
+            (
+                WeightId::layer(2, WeightRole::Mhc(MhcRole::AttnFn)),
+                "w.l2.mhc.attn_fn",
+            ),
+            (
+                WeightId::layer(2, WeightRole::Mhc(MhcRole::AttnBase)),
+                "w.l2.mhc.attn_base",
+            ),
+            (
+                WeightId::layer(2, WeightRole::Mhc(MhcRole::AttnScale)),
+                "w.l2.mhc.attn_scale",
+            ),
+            (
+                WeightId::layer(2, WeightRole::Mhc(MhcRole::FfnFn)),
+                "w.l2.mhc.ffn_fn",
+            ),
+            (
+                WeightId::layer(2, WeightRole::Mhc(MhcRole::FfnBase)),
+                "w.l2.mhc.ffn_base",
+            ),
+            (
+                WeightId::layer(2, WeightRole::Mhc(MhcRole::FfnScale)),
+                "w.l2.mhc.ffn_scale",
+            ),
+            (
+                WeightId::model(WeightRole::Mhc(MhcRole::HeadFn)),
+                "w.mhc.head_fn",
+            ),
+            (
+                WeightId::model(WeightRole::Mhc(MhcRole::HeadBase)),
+                "w.mhc.head_base",
+            ),
+            (
+                WeightId::model(WeightRole::Mhc(MhcRole::HeadScale)),
+                "w.mhc.head_scale",
+            ),
+            (
+                WeightId::layer(3, WeightRole::Compress(CompressRole::Kv)),
+                "w.l3.compress.kv",
+            ),
+            (
+                WeightId::layer(3, WeightRole::Compress(CompressRole::Gate)),
+                "w.l3.compress.gate",
+            ),
+            (
+                WeightId::layer(3, WeightRole::Compress(CompressRole::PositionBias)),
+                "w.l3.compress.position_bias",
+            ),
+            (
+                WeightId::layer(3, WeightRole::Compress(CompressRole::Norm)),
+                "w.l3.compress.norm",
+            ),
+            (
+                WeightId::layer(3, WeightRole::Compress(CompressRole::IndexerKv)),
+                "w.l3.compress.indexer_kv",
+            ),
+            (
+                WeightId::layer(3, WeightRole::Compress(CompressRole::IndexerGate)),
+                "w.l3.compress.indexer_gate",
+            ),
+            (
+                WeightId::layer(3, WeightRole::Compress(CompressRole::IndexerPositionBias)),
+                "w.l3.compress.indexer_position_bias",
+            ),
+            (
+                WeightId::layer(3, WeightRole::Compress(CompressRole::IndexerNorm)),
+                "w.l3.compress.indexer_norm",
+            ),
+            (
+                WeightId::layer(1, WeightRole::Ple(PleRole::TableShard(7))),
+                "w.l1.ple.table.shard_7",
+            ),
+            (
+                WeightId::layer(1, WeightRole::Ple(PleRole::TableScale)),
+                "w.l1.ple.table_scale",
             ),
             (
                 WeightId::layer(4, WeightRole::Norm(NormRole::Attn)),
@@ -1654,6 +2302,216 @@ mod tests {
                 rows: 4..6,
                 available: 3
             })
+        );
+    }
+
+    /// An I64 table of `words` stored under `key`.
+    fn i64_table_store(key: &str, shape: Vec<usize>, words: &[i64]) -> WeightStore {
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut builder = WeightStore::builder();
+        builder
+            .insert(
+                key,
+                WeightEntry::Dense(DenseWeight::try_new(DType::I64, shape, bytes.into()).unwrap()),
+            )
+            .unwrap();
+        builder.build()
+    }
+
+    /// An I64 index table read through `IndexNarrow` is an I32 table of the same shape and values
+    /// (negatives and the I32 bounds included), and the handle says so.
+    #[test]
+    fn index_narrow_reads_an_i64_table_as_i32() {
+        let words = [0i64, 7, -3, i64::from(i32::MAX), i64::from(i32::MIN), 42];
+        let store = i64_table_store("t", vec![3, 2], &words);
+        let id = WeightId::layer(0, WeightRole::Moe(MoeRole::HashTable));
+        let mut builder = WeightMap::builder(&store);
+        builder
+            .map(id, WeightView::IndexNarrow(WeightKey::from("t")))
+            .unwrap();
+        let map = builder.build();
+        let handle = map.handle(id).unwrap();
+        assert_eq!(handle.format, HandleFormat::Dense(DType::I32));
+        assert_eq!(handle.shape, vec![3, 2]);
+        let WeightEntry::Dense(narrowed) = map.materialize(id, &store).unwrap() else {
+            panic!("a narrowed table is dense")
+        };
+        assert_eq!(
+            (narrowed.dtype(), narrowed.shape()),
+            (DType::I32, &[3, 2][..])
+        );
+        let got: Vec<i32> = narrowed
+            .bytes()
+            .as_slice()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| i32::from_le_bytes(*w))
+            .collect();
+        assert_eq!(got, words.map(|w| w as i32));
+    }
+
+    /// A word outside I32, above or below, is refused when the map is built, naming the table and
+    /// the element; so is a table that is not integer-valued. Mutation: narrow with `as i32`; the
+    /// out-of-range word wraps, `map` succeeds and the row goes red.
+    #[test]
+    fn index_narrow_refuses_a_word_outside_i32_at_build() {
+        let id = WeightId::layer(2, WeightRole::Moe(MoeRole::HashTable));
+        for (words, index, value) in [
+            (
+                [1i64, 2, i64::from(i32::MAX) + 1, 4],
+                2,
+                i64::from(i32::MAX) + 1,
+            ),
+            (
+                [i64::from(i32::MIN) - 1, 2, 3, 4],
+                0,
+                i64::from(i32::MIN) - 1,
+            ),
+        ] {
+            let store = i64_table_store("t", vec![2, 2], &words);
+            let error = WeightMap::builder(&store)
+                .map(id, WeightView::IndexNarrow(WeightKey::from("t")))
+                .map(|_| ())
+                .unwrap_err();
+            assert_eq!(
+                error,
+                WeightMapError::IndexOutOfRange {
+                    id,
+                    key: WeightKey::from("t"),
+                    index,
+                    value,
+                }
+            );
+        }
+        let mut builder = WeightStore::builder();
+        builder
+            .insert(
+                "f",
+                WeightEntry::Dense(DenseWeight::try_new(DType::F32, vec![2], bytes(8)).unwrap()),
+            )
+            .unwrap();
+        let store = builder.build();
+        let error = WeightMap::builder(&store)
+            .map(id, WeightView::IndexNarrow(WeightKey::from("f")))
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            matches!(error, WeightMapError::NotAnIndexTable { .. }),
+            "{error:?}"
+        );
+    }
+
+    fn block_entry(format: WeightFormat, shape: [usize; 2], _seed: u64) -> WeightEntry {
+        let weight = PackedWeight::try_new(format, shape).unwrap();
+        let block_bytes = weight.source_bytes(SourceRole::Blocks);
+        WeightEntry::Packed(Arc::new(
+            PackedPayload::try_new(weight, [(SourceRole::Blocks, bytes(block_bytes))]).unwrap(),
+        ))
+    }
+
+    /// The experts of a routed projection are packed `[out, K]` weights, each its own payload: the map views
+    /// them as one `[experts, out, K]` stack with the experts' packed format (the handle a tracer declares the
+    /// stack by), `materialize` refuses to make one entry of them, and `materialize_stack` returns the experts
+    /// as one `PackedStack` whose bytes are the stored ones, expert for expert.
+    #[test]
+    fn packed_experts_are_viewed_as_one_stack_that_stays_separate_payloads() {
+        let mut store = WeightStore::builder();
+        for e in 0..3 {
+            store
+                .insert(format!("e{e}"), block_entry(WeightFormat::Q8_0, [3, 32], e))
+                .unwrap();
+        }
+        let store = store.build();
+        let keys: Vec<WeightKey> = (0..3)
+            .map(|e| WeightKey::from(format!("e{e}").as_str()))
+            .collect();
+        let mut builder = WeightMap::builder(&store);
+        builder.map(Q, WeightView::ExpertStack(keys)).unwrap();
+        let map = builder.build();
+
+        let handle = map.handle(Q).unwrap();
+        assert_eq!(
+            handle.format,
+            HandleFormat::Packed(PackedWeight::try_new(WeightFormat::Q8_0, [3, 32]).unwrap())
+        );
+        assert_eq!(handle.shape, [3, 3, 32]);
+        assert_eq!(
+            map.materialize(Q, &store).unwrap_err(),
+            WeightMapError::PackedStackIsNotOneEntry { id: Q }
+        );
+        let stack = map.materialize_stack(Q, &store).unwrap();
+        assert_eq!(stack.experts(), 3);
+        for e in 0..3 {
+            let WeightEntry::Packed(stored) = store.get(&format!("e{e}")).unwrap() else {
+                unreachable!()
+            };
+            assert!(
+                Arc::ptr_eq(stack.owner(e), stored),
+                "expert {e} stays the stored payload, not a copy"
+            );
+        }
+    }
+
+    /// Parts of one stack must share a format and a shape: a different packed format, a different shape, a
+    /// dense part among packed ones, and an empty stack are each typed refusals at map time, and
+    /// `materialize_stack` refuses a view that is not a packed stack.
+    #[test]
+    fn a_packed_expert_stack_with_unlike_parts_is_a_typed_refusal() {
+        let mut store = WeightStore::builder();
+        store
+            .insert("q8", block_entry(WeightFormat::Q8_0, [3, 32], 1))
+            .unwrap();
+        store
+            .insert("q8b", block_entry(WeightFormat::Q8_0, [3, 32], 2))
+            .unwrap();
+        store
+            .insert("q4", block_entry(WeightFormat::Q4_0, [3, 32], 3))
+            .unwrap();
+        store
+            .insert("tall", block_entry(WeightFormat::Q8_0, [4, 32], 4))
+            .unwrap();
+        store
+            .insert(
+                "dense",
+                WeightEntry::Dense(
+                    DenseWeight::try_new(DType::F32, vec![3, 32], bytes(3 * 32 * 4)).unwrap(),
+                ),
+            )
+            .unwrap();
+        let store = store.build();
+        let stack = |parts: &[&str]| {
+            WeightView::ExpertStack(parts.iter().map(|p| WeightKey::from(*p)).collect())
+        };
+        for (label, parts) in [
+            ("format", &["q8", "q4"][..]),
+            ("shape", &["q8", "tall"][..]),
+            ("dense part", &["q8", "dense"][..]),
+            ("dense first", &["dense", "q8"][..]),
+        ] {
+            let error = WeightMap::builder(&store)
+                .map(Q, stack(parts))
+                .map(|_| ())
+                .unwrap_err();
+            assert!(
+                matches!(error, WeightMapError::NotStackable { id: Q, .. }),
+                "{label}: {error:?}"
+            );
+        }
+        assert_eq!(
+            WeightMap::builder(&store)
+                .map(Q, stack(&[]))
+                .map(|_| ())
+                .unwrap_err(),
+            WeightMapError::EmptyStack { id: Q }
+        );
+        let mut builder = WeightMap::builder(&store);
+        builder.map(Q, stack(&["q8", "q8b"])).unwrap();
+        builder.map(K, WeightView::Stored("q8".into())).unwrap();
+        let map = builder.build();
+        assert_eq!(
+            map.materialize_stack(K, &store).unwrap_err(),
+            WeightMapError::NotAPackedStack { id: K }
         );
     }
 }

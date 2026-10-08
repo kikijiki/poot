@@ -11,7 +11,6 @@ use poot_target::Backend;
 /// the format, so it cannot change whether a row admits a format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PackedKernelOpKind {
-    Materialize,
     RowGather,
     Contraction,
 }
@@ -19,7 +18,6 @@ pub enum PackedKernelOpKind {
 impl From<poot_kernelgen::PackedKernelOp> for PackedKernelOpKind {
     fn from(op: poot_kernelgen::PackedKernelOp) -> Self {
         match op {
-            poot_kernelgen::PackedKernelOp::Materialize => Self::Materialize,
             poot_kernelgen::PackedKernelOp::RowGather => Self::RowGather,
         }
     }
@@ -74,8 +72,7 @@ fn admits_planar(descriptor: &poot_quant::format::FormatDescriptor) -> bool {
 }
 
 /// `admits_blocks(d) || admits_planar(d)`: every descriptor `poot-kernelgen`'s two front ends cover
-/// (dquant.md D4, "two addressing front ends... come from `Storage`"). `Materialize` and
-/// `Contraction` admit both storages; `RowGather` stays block-only (`admits_blocks`) - its one
+/// (dquant.md D4, "two addressing front ends... come from `Storage`"). `Contraction` admits both storages; `RowGather` stays block-only (`admits_blocks`) - its one
 /// production consumer is GGUF token-embedding gather, and no planar format's row is gathered today
 /// (`poot_kernelgen::packed::row_gather`'s explicit refusal for `Storage::Planar`).
 fn admits_blocks_or_planar(descriptor: &poot_quant::format::FormatDescriptor) -> bool {
@@ -88,15 +85,12 @@ const EVERY_BACKEND: &[PackedLoweringBackend] = &[
     PackedLoweringBackend::Nvptx,
 ];
 
-/// The descriptor-driven packed kernel lowering table (card 542a covers `Materialize`, `RowGather`
-/// and `Contraction` for the block-32 formats on every backend; 542b widens block admission to every
-/// block-storage descriptor; 542c adds the planar-storage predicate for `Materialize`/`Contraction`).
+/// The descriptor-driven packed kernel lowering table (card 542a covers `RowGather` and `Contraction`
+/// for the block-32 formats on every backend; 542b widens block admission to every block-storage
+/// descriptor; 542c adds the planar-storage predicate for `Contraction`). There is no standalone
+/// dequantize row: no target materializes a packed weight (the escape gate refuses a `PackedDequant`
+/// no contraction or row gather claims).
 pub const PACKED_LOWERING: &[PackedLoweringRow] = &[
-    PackedLoweringRow {
-        op: PackedKernelOpKind::Materialize,
-        backends: EVERY_BACKEND,
-        admits: admits_blocks_or_planar,
-    },
     PackedLoweringRow {
         op: PackedKernelOpKind::RowGather,
         backends: EVERY_BACKEND,
@@ -130,7 +124,7 @@ pub fn admit_packed(
     Ok(format)
 }
 
-/// Select a generated packed kernel (a dequantize or a row gather) from `table`: `op`'s
+/// Select a generated packed kernel (a row gather) from `table`: `op`'s
 /// [`PackedKernelOpKind`] must have a row admitting `weight`'s descriptor on `backend` ([`admit_packed`]).
 pub fn select_packed_kernel(
     table: &[PackedLoweringRow],
@@ -166,11 +160,6 @@ mod packed_lowering_tests {
     #[test]
     fn a_table_without_the_gemv_row_refuses_by_name_not_a_panic() {
         let table = &[
-            PackedLoweringRow {
-                op: PackedKernelOpKind::Materialize,
-                backends: &[PackedLoweringBackend::SpirvVulkan],
-                admits: admits_blocks,
-            },
             PackedLoweringRow {
                 op: PackedKernelOpKind::RowGather,
                 backends: &[PackedLoweringBackend::SpirvVulkan],
@@ -208,16 +197,13 @@ mod packed_lowering_tests {
             Backend::AmdGcn(poot_target::AmdArch::gfx1151()),
         ] {
             assert_eq!(
-                select_packed_kernel(
+                admit_packed(
                     PACKED_LOWERING,
                     weight,
-                    PackedKernelOp::Materialize,
+                    PackedKernelOpKind::Contraction,
                     backend
                 ),
-                Ok(poot_kernelgen::PackedKernelSpec {
-                    format: WeightFormat::Q4_K,
-                    op: PackedKernelOp::Materialize,
-                }),
+                Ok(WeightFormat::Q4_K),
                 "{backend:?}: Q4_K (SubScale/SubMin) must now be admitted (card 542b)"
             );
         }
@@ -230,11 +216,6 @@ mod packed_lowering_tests {
     #[test]
     fn a_table_without_the_contraction_row_refuses_a_tiled_claim_by_name_not_a_panic() {
         let table = &[
-            PackedLoweringRow {
-                op: PackedKernelOpKind::Materialize,
-                backends: &[PackedLoweringBackend::SpirvVulkan],
-                admits: admits_blocks,
-            },
             PackedLoweringRow {
                 op: PackedKernelOpKind::RowGather,
                 backends: &[PackedLoweringBackend::SpirvVulkan],
@@ -259,8 +240,8 @@ mod packed_lowering_tests {
     }
 
     /// Card 542c: `admits_planar` widens the table to every planar-storage descriptor, so a GPTQ
-    /// format (three sources: `Codes`, `Zero`, `Scale`) is now admitted for `Materialize` and
-    /// `Contraction` on every backend - the planar counterpart of
+    /// format (three sources: `Codes`, `Zero`, `Scale`) is now admitted for `Contraction` on every
+    /// backend - the planar counterpart of
     /// `the_real_table_now_admits_a_kquant_format_on_every_backend`.
     #[test]
     fn the_real_table_now_admits_a_planar_format_on_every_backend() {
@@ -275,19 +256,6 @@ mod packed_lowering_tests {
             Backend::Nvptx,
             Backend::AmdGcn(poot_target::AmdArch::gfx1151()),
         ] {
-            assert_eq!(
-                select_packed_kernel(
-                    PACKED_LOWERING,
-                    weight,
-                    PackedKernelOp::Materialize,
-                    backend
-                ),
-                Ok(poot_kernelgen::PackedKernelSpec {
-                    format,
-                    op: PackedKernelOp::Materialize,
-                }),
-                "{backend:?}: GPTQ Materialize must be admitted (card 542c)"
-            );
             assert_eq!(
                 admit_packed(
                     PACKED_LOWERING,
@@ -328,7 +296,7 @@ mod packed_lowering_tests {
     /// loader-side half: `E4m3PerChannel` - never one of the four `PackedLinearFormat` cells card
     /// 542d deleted - loads with no panic). This is the planning-side half of the same story: the
     /// same unregistered-but-described format has a descriptor (so `admits_planar` would admit it
-    /// for `Materialize`/`Contraction`), but `RowGather` stays block-only, so it is refused here by
+    /// for `Contraction`), but `RowGather` stays block-only, so it is refused here by
     /// name, a typed `Refusal`, not a panic - the same shape as
     /// `the_real_table_does_not_admit_a_planar_format_for_row_gather` above, for a format that was
     /// never registered at all.
@@ -350,35 +318,27 @@ mod packed_lowering_tests {
                 op: PackedKernelOpKind::RowGather,
             })
         );
-        // The same format IS admitted for Materialize (ADR-0104: the loader never gated on
+        // The same format IS admitted for Contraction (ADR-0104: the loader never gated on
         // registration, and neither does planning admission - `admits_planar` is a storage-shape
         // predicate, not a format list).
         assert_eq!(
-            select_packed_kernel(
+            admit_packed(
                 PACKED_LOWERING,
                 weight,
-                PackedKernelOp::Materialize,
+                PackedKernelOpKind::Contraction,
                 Backend::SpirvVulkan
             ),
-            Ok(poot_kernelgen::PackedKernelSpec {
-                format,
-                op: PackedKernelOp::Materialize,
-            })
+            Ok(format)
         );
     }
 
     /// SC-003 (card 542c): a test-only table with the planar row removed yields a typed `Refusal`
     /// naming the equation, not a panic, as 542a's SC-006 and 542b's SC-003. Mutation: restore the
-    /// row (use `PACKED_LOWERING`, which does admit `Materialize` for planar storage); the refusal
+    /// row (use `PACKED_LOWERING`, which does admit `Contraction` for planar storage); the refusal
     /// row goes red (the call succeeds instead of refusing).
     #[test]
-    fn a_table_without_the_planar_row_refuses_a_planar_materialize_by_name_not_a_panic() {
+    fn a_table_without_the_planar_row_refuses_a_planar_contraction_by_name_not_a_panic() {
         let table = &[
-            PackedLoweringRow {
-                op: PackedKernelOpKind::Materialize,
-                backends: &[PackedLoweringBackend::SpirvVulkan],
-                admits: admits_blocks,
-            },
             PackedLoweringRow {
                 op: PackedKernelOpKind::RowGather,
                 backends: &[PackedLoweringBackend::SpirvVulkan],
@@ -395,30 +355,15 @@ mod packed_lowering_tests {
             group_size: std::num::NonZeroUsize::new(8).unwrap(),
         };
         let weight = PackedWeight::try_new(format, [8, 16]).unwrap();
+        let kind = PackedKernelOpKind::Contraction;
         assert_eq!(
-            select_packed_kernel(
-                table,
-                weight,
-                PackedKernelOp::Materialize,
-                Backend::SpirvVulkan
-            ),
-            Err(Capability::PackedLowering {
-                format,
-                op: PackedKernelOpKind::Materialize,
-            })
+            admit_packed(table, weight, kind, Backend::SpirvVulkan),
+            Err(Capability::PackedLowering { format, op: kind })
         );
         // Restoring the row (the real table) makes the same call succeed.
         assert_eq!(
-            select_packed_kernel(
-                PACKED_LOWERING,
-                weight,
-                PackedKernelOp::Materialize,
-                Backend::SpirvVulkan
-            ),
-            Ok(poot_kernelgen::PackedKernelSpec {
-                format,
-                op: PackedKernelOp::Materialize,
-            })
+            admit_packed(PACKED_LOWERING, weight, kind, Backend::SpirvVulkan),
+            Ok(format)
         );
     }
 }

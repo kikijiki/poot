@@ -279,11 +279,6 @@ pub struct KnownMiscompiles {
     /// RADV: the LDS-cooperative tiled GEMM produces wrong, non-deterministic output at or above this
     /// many workgroups in one dispatch (card 095). `None` on a device with no confirmed ceiling.
     pub tiled_gemm_max_workgroups: Option<u32>,
-    /// ROCm and PTX: a routed-expert prefill graph (a router contraction over more than one row whose
-    /// selected expert ids feed an indexed contraction) has hung under flash-attention synthesis,
-    /// fusion and the generated tiled GEMM (cards 186/192). `compile` leaves those out of a graph
-    /// with such a site when this is set. wgpu runs them. POOT-575 deletes this fact.
-    pub routed_expert_tiling_hang: bool,
 }
 
 /// A device-capability descriptor: measured once by the runtime, read by the planner and codegen for
@@ -320,6 +315,15 @@ pub struct DeviceCaps {
     /// where the backend exposes it; the planner's Gemv launch policy sizes its grid
     /// against it (at least two workgroups per compute unit).
     pub compute_units: u32,
+    /// The device memory a process may allocate, in bytes, as the runtime queried it when the device
+    /// opened (`VK_EXT_memory_budget`'s heap budget, the HSA pool size, CUDA's total). An observation
+    /// at open, not a reservation: it is the ceiling of a budget, and admission reads the live free memory
+    /// from the executor (`Executor::free_memory_bytes`) under it. `None` where the runtime has no
+    /// such query or it failed; a consumer treats that as an unknown budget, never as unlimited. What the
+    /// figure measures differs by runtime: wgpu reports `VK_EXT_memory_budget`'s heap budget (what the OS
+    /// lets this process use), ROCm the coarse pool's size and PTX the device's total memory. The last two
+    /// are capacities, not what is free: do not read them as available memory.
+    pub memory_budget_bytes: Option<u64>,
 }
 
 /// Card 258: output-element count (one `gemv_lds` workgroup per element) above which a wgpu decode-GEMV
@@ -388,9 +392,9 @@ impl DeviceCaps {
             tensor_core: TensorCoreSupport::Wmma16x16x16Rdna3,
             known_miscompiles: KnownMiscompiles {
                 tiled_gemm_max_workgroups: Some(1 << 15),
-                routed_expert_tiling_hang: false,
             },
             compute_units: STRIX_HALO_COMPUTE_UNITS,
+            memory_budget_bytes: None,
         }
     }
 
@@ -411,11 +415,9 @@ impl DeviceCaps {
             max_grid: [u32::MAX, u32::MAX, u32::MAX],
             watchdog_budget: None,
             tensor_core: TensorCoreSupport::None,
-            known_miscompiles: KnownMiscompiles {
-                routed_expert_tiling_hang: true,
-                ..KnownMiscompiles::default()
-            },
+            known_miscompiles: KnownMiscompiles::default(),
             compute_units: STRIX_HALO_COMPUTE_UNITS,
+            memory_budget_bytes: None,
         }
     }
 
@@ -435,11 +437,9 @@ impl DeviceCaps {
             max_grid: [u32::MAX, 65_535, 65_535],
             watchdog_budget: None,
             tensor_core: TensorCoreSupport::NvidiaWmma16x16x16Sm80,
-            known_miscompiles: KnownMiscompiles {
-                routed_expert_tiling_hang: true,
-                ..KnownMiscompiles::default()
-            },
+            known_miscompiles: KnownMiscompiles::default(),
             compute_units: SM80_A100_COMPUTE_UNITS,
+            memory_budget_bytes: None,
         }
     }
 }
@@ -520,25 +520,5 @@ mod tests {
         assert!(DeviceCaps::wgpu_rdna3_igpu().watchdog_budget.is_some());
         assert!(DeviceCaps::rocm_default().watchdog_budget.is_none());
         assert!(DeviceCaps::ptx_default().watchdog_budget.is_none());
-    }
-
-    /// The routed-expert hang is a ROCm and PTX fact; the wgpu preset runs the full pipeline.
-    #[test]
-    fn the_routed_expert_hang_is_set_for_rocm_and_ptx_only() {
-        assert!(
-            !DeviceCaps::wgpu_rdna3_igpu()
-                .known_miscompiles
-                .routed_expert_tiling_hang
-        );
-        assert!(
-            DeviceCaps::rocm_default()
-                .known_miscompiles
-                .routed_expert_tiling_hang
-        );
-        assert!(
-            DeviceCaps::ptx_default()
-                .known_miscompiles
-                .routed_expert_tiling_hang
-        );
     }
 }

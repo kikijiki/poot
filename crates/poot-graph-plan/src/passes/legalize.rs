@@ -4,7 +4,7 @@
 //! Loaders used to decide whether a graph's embedding table stayed on device from a hard-coded wgpu
 //! constant, applied on every backend before a device was even chosen (R488-007: the same decision
 //! broke ROCm, whose real buffer limit is nowhere near wgpu's). Tracers hand-rolled the same device
-//! math themselves (R474-003: `qwen2::Qwen2Config::host_embed`, `gemma4`'s unconditional host embed,
+//! math themselves (R474-003: the qwen2 tracer's host embed, `gemma4`'s unconditional host embed,
 //! `Qwen35BufferLimits`/`lm_head_chunks`). [`legalize`] is the one place that decision is made now,
 //! from the target's own measured [`DeviceCaps::max_buffer_bytes`] (card 522): tracers always emit the
 //! plain dense gather and the plain unsplit matmul, and this pass decides, per target, whether a
@@ -16,24 +16,32 @@
 //! binds a graph's inputs before executing it must bind against what `compile` actually produced
 //! (card 523a: a bare call outside `compile` is a second entry point).
 //!
-//! Two rewrites, tried in order, before anything still over the limit is refused:
+//! Three rewrites, tried in order, before anything still over the limit is refused:
 //! - [`host_oversized_token_gathers`]: an axis-0 `Gather` of an oversized constant by a `Slot::Token`
 //!   index (the tracers' embedding lookup) becomes a host-computed `Slot::TokenEmbed` row.
-//! - [`split_oversized_matmul_weights`]: an oversized 2D `MatMul` weight read through a transpose (Card
-//!   453 D1's lm_head precedent, generalized to any matmul) splits into row chunks that each fit, each chunk
-//!   matmul'd separately and joined by a `Concat` - restoring the "split" capability card 523a's first
-//!   landing dropped.
+//! - [`split_oversized_matmul_weights`]: an oversized 2D weight splits into row chunks that each fit, each chunk
+//!   computed separately and joined by a `Concat` (Card 453 D1's lm_head precedent, generalized to any matmul -
+//!   restoring the "split" capability card 523a's first landing dropped). The weight is read either as the
+//!   `[n, k]` operand of a `DenseContraction` (`compile` folds before legalizing, so this is the usual form;
+//!   each chunk is a `DenseContraction` over its stored rows) or through a `[1, 0]` transpose into a `MatMul`
+//!   (the form the fold declines; each chunk keeps its own transpose).
+//! - [`split_oversized_expert_stacks`]: an indexed packed contraction whose stacked expert table is over the single
+//!   buffer limit, or over what the kernels' 32-bit bit offsets address, splits into expert ranges that each fit
+//!   (see its doc for how the ranges recombine).
 
 use std::collections::{HashMap, HashSet};
 
 use poot_target::DeviceCaps;
 
-use poot_graph_ir::PackedSourceName;
+use poot_graph_ir::graph::LayerIndex;
 use poot_graph_ir::graph::{
     Eqn, Graph, Operand, Slot, Storage, ValidationChannel, ValueId, ValueMeta,
 };
 use poot_graph_ir::op::OpKind;
 use poot_graph_ir::types::TensorType;
+use poot_graph_ir::{BinOp, ContractionRows, PackedSourceName, Scalar};
+use poot_quant::PackedWeight;
+use poot_tensor::DType;
 
 use super::GraphBudget;
 use crate::{CompileLimits, ExpansionError};
@@ -71,7 +79,8 @@ pub enum LegalizeError {
 /// over the limit, becomes a host-computed `Slot::TokenEmbed` row block named after the constant it
 /// replaces - the binder reads that name to gather the row(s) host-side instead of uploading the whole
 /// table, `poot-llm`'s `gather_token_embed_rows`), then [`split_oversized_matmul_weights`] (an
-/// oversized 2D matmul weight read through a transpose splits into row chunks that each fit, joined by a `Concat`). Anything
+/// oversized 2D weight read by a `DenseContraction`, or through a transpose into a `MatMul`, splits into row
+/// chunks that each fit, joined by a `Concat`). Anything
 /// still over the limit after both rewrites is a typed refusal, before any device allocation (SC-002).
 pub fn legalize<V: ValidationChannel>(
     g: &Graph<V>,
@@ -81,6 +90,7 @@ pub fn legalize<V: ValidationChannel>(
     let limit = caps.max_buffer_bytes;
     let g = host_oversized_token_gathers(g, limit);
     let g = split_oversized_matmul_weights(&g, limit, GraphBudget::of(limits))?;
+    let g = split_oversized_expert_stacks(&g, limit, GraphBudget::of(limits))?;
     refuse_oversized_constants(&g, limit)?;
     Ok(g)
 }
@@ -103,10 +113,13 @@ fn operand_value(o: Operand) -> Option<ValueId> {
 /// value becomes a `Slot::TokenEmbed` input named after the constant (so a binder can still find the
 /// weight to gather host-side), the gather equation is dropped, and the constant (and the token slot,
 /// if nothing else reads it) drop out of the graph's input tables. Every other value keeps its
-/// [`ValueId`], so nothing downstream needs rewiring.
+/// [`ValueId`], so nothing downstream needs rewiring. A constant is hosted only when every reader of it
+/// is a hosted gather: a tied head (the same table also read by a `MatMul` over its transpose) keeps
+/// the constant, and the later stages split it or refuse it.
 fn host_oversized_token_gathers<V: ValidationChannel>(g: &Graph<V>, limit: u64) -> Graph<V> {
     let mut dropped_eqns = std::collections::HashSet::new();
     let mut hosted: Vec<(ValueId, ValueId, ValueId)> = Vec::new(); // (gather output, const, token index)
+    let mut candidates: Vec<(usize, ValueId, ValueId, ValueId)> = Vec::new(); // (eqn, out, const, index)
 
     for (i, eqn) in g.eqns.iter().enumerate() {
         let OpKind::Gather { axis } = eqn.op else {
@@ -129,8 +142,26 @@ fn host_oversized_token_gathers<V: ValidationChannel>(g: &Graph<V>, limit: u64) 
         if const_bytes(g, data_id) <= limit {
             continue;
         }
-        dropped_eqns.insert(i);
-        hosted.push((eqn.out, data_id, index_id));
+        candidates.push((i, eqn.out, data_id, index_id));
+    }
+
+    // The constant leaves the graph, so every reader of it must be a gather being hosted: a live
+    // `MatMul` over `Transpose(w)` (a tied head) would be left reading a value that no longer exists.
+    // Such a constant stays, and `split_oversized_matmul_weights` or `refuse_oversized_constants`
+    // answers for it.
+    let candidate_eqns: std::collections::HashSet<usize> =
+        candidates.iter().map(|&(i, ..)| i).collect();
+    let pinned: HashSet<ValueId> = g.pinned_values().collect();
+    for &(i, out, data_id, index_id) in &candidates {
+        let sole_readers = !pinned.contains(&data_id)
+            && g.eqns.iter().enumerate().all(|(j, e)| {
+                candidate_eqns.contains(&j)
+                    || !e.inputs.iter().any(|&o| operand_value(o) == Some(data_id))
+            });
+        if sole_readers {
+            dropped_eqns.insert(i);
+            hosted.push((out, data_id, index_id));
+        }
     }
 
     if hosted.is_empty() {
@@ -216,7 +247,11 @@ fn host_oversized_token_gathers<V: ValidationChannel>(g: &Graph<V>, limit: u64) 
 /// shrinks `eqns` (`dce`'s own doc: "the value table is preserved, dead entries are
 /// harmless"), so `g.consts` can still list an oversized constant nothing reads any more. Refusing on
 /// declaration alone would fail a graph a real device would never even see.
-fn refuse_oversized_constants<V: ValidationChannel>(
+///
+/// `legalize` calls this on its own output, and `compile` calls it again on the finished pipeline's
+/// graph: `revert_unplannable_rewrites` can undo a split the target cannot plan, so the graph the
+/// planner receives may hold a constant `legalize` had already brought under `limit`.
+pub(crate) fn refuse_oversized_constants<V: ValidationChannel>(
     g: &Graph<V>,
     limit: u64,
 ) -> Result<(), LegalizeError> {
@@ -252,6 +287,17 @@ fn live_value_ids<V: ValidationChannel>(g: &Graph<V>) -> HashSet<ValueId> {
     live
 }
 
+/// `limit` rounded down to a 4096-byte boundary (a driver that aligns `create_buffer` up to 4096 must not push the
+/// allocation over `limit`), except for limits below 4096 where no positive count can satisfy that alignment and
+/// the plain `limit` is used (tiny fixtures / typed test overrides).
+fn usable_bytes(limit: u64) -> u64 {
+    if limit >= 4096 {
+        (limit / 4096) * 4096
+    } else {
+        limit
+    }
+}
+
 /// Column ranges of a `[k, n]` weight, split so each chunk stays within `limit` bytes, or `None` when
 /// even one row (`k` elements) is already over the limit and no split can help. Every chunk holds
 /// `rows_per_chunk` rows of the `[n, k]` stored weight except a smaller final chunk.
@@ -267,11 +313,7 @@ fn row_chunks(k: usize, n: usize, elem_bytes: usize, limit: u64) -> Option<Vec<(
     if row_bytes > limit {
         return None; // no split helps: a single row already exceeds the target's real limit.
     }
-    let usable = if limit >= 4096 {
-        (limit / 4096) * 4096
-    } else {
-        limit
-    };
+    let usable = usable_bytes(limit);
     let rows_per_chunk = ((usable / row_bytes.max(1)) as usize).max(1);
     let mut ranges = Vec::new();
     let mut start = 0usize;
@@ -289,6 +331,18 @@ struct SplitCandidate {
     x: ValueId,
     weight: ValueId,
     ranges: Vec<(usize, usize)>,
+    /// Whether the weight is read as a [`OpKind::DenseContraction`] operand (stored `[n, k]`, no transpose)
+    /// rather than through a `[1, 0]` transpose into a `MatMul`.
+    read: WeightRead,
+}
+
+/// How a splittable equation reads its `[n, k]` stored weight.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WeightRead {
+    /// `MatMul(x, Transpose([1, 0], w))`.
+    Transposed,
+    /// `DenseContraction { weight: dtype }(x, w)`.
+    Dense,
 }
 
 /// Every `[1, 0]` `Transpose` of a 2D named [`Storage::Const`], keyed by the transpose's output value.
@@ -320,12 +374,18 @@ fn splittable_matmul<V: ValidationChannel>(
     transposed: &HashMap<ValueId, ValueId>,
     limit: u64,
 ) -> Option<SplitCandidate> {
-    if eqn.op != OpKind::MatMul || eqn.inputs.len() != 2 {
+    if eqn.inputs.len() != 2 {
         return None;
     }
     let x = operand_value(eqn.inputs[0])?;
     let read = operand_value(eqn.inputs[1])?;
-    let weight = *transposed.get(&read)?;
+    let (weight, how) = match eqn.op {
+        OpKind::MatMul => (*transposed.get(&read)?, WeightRead::Transposed),
+        OpKind::DenseContraction { .. } if g.meta(read).storage == Storage::Const => {
+            (read, WeightRead::Dense)
+        }
+        _ => return None,
+    };
     // Only a dense weight splits into row blocks: a packed source (named as one) has no byte rows a
     // binder cuts, and stays whole for `refuse_oversized_constants` to refuse by name.
     if g.meta(weight)
@@ -345,7 +405,12 @@ fn splittable_matmul<V: ValidationChannel>(
     if ranges.len() < 2 {
         return None;
     }
-    Some(SplitCandidate { x, weight, ranges })
+    Some(SplitCandidate {
+        x,
+        weight,
+        ranges,
+        read: how,
+    })
 }
 
 /// Split every oversized-weight `MatMul` [`splittable_matmul`] finds into row-chunk matmuls joined by a
@@ -371,6 +436,7 @@ fn split_oversized_matmul_weights<V: ValidationChannel>(
             x: x_id,
             weight: w_id,
             ranges,
+            read: how,
         }) = splittable_matmul(g, eqn, &transposed, limit)
         else {
             budget.push_eqn(STAGE, &mut eqns, eqn.clone())?;
@@ -402,25 +468,31 @@ fn split_oversized_matmul_weights<V: ValidationChannel>(
             )?;
             new_consts.push(chunk_w);
 
-            let read = budget.push_value(
-                STAGE,
-                &mut values,
-                ValueMeta::new(
-                    TensorType::new(vec![k, width], dtype),
-                    Storage::Device,
-                    None,
-                ),
-            )?;
-            budget.push_eqn(
-                STAGE,
-                &mut eqns,
-                Eqn {
-                    op: OpKind::Transpose { perm: vec![1, 0] },
-                    inputs: vec![Operand::Value(chunk_w)],
-                    out: read,
-                    layer: eqn.layer,
-                },
-            )?;
+            let chunk_read = match how {
+                WeightRead::Dense => chunk_w,
+                WeightRead::Transposed => {
+                    let read = budget.push_value(
+                        STAGE,
+                        &mut values,
+                        ValueMeta::new(
+                            TensorType::new(vec![k, width], dtype),
+                            Storage::Device,
+                            None,
+                        ),
+                    )?;
+                    budget.push_eqn(
+                        STAGE,
+                        &mut eqns,
+                        Eqn {
+                            op: OpKind::Transpose { perm: vec![1, 0] },
+                            inputs: vec![Operand::Value(chunk_w)],
+                            out: read,
+                            layer: eqn.layer,
+                        },
+                    )?;
+                    read
+                }
+            };
 
             let mut shape = prefix.clone();
             shape.push(width);
@@ -433,8 +505,8 @@ fn split_oversized_matmul_weights<V: ValidationChannel>(
                 STAGE,
                 &mut eqns,
                 Eqn {
-                    op: OpKind::MatMul,
-                    inputs: vec![Operand::Value(x_id), Operand::Value(read)],
+                    op: eqn.op.clone(),
+                    inputs: vec![Operand::Value(x_id), Operand::Value(chunk_read)],
                     out: chunk_out,
                     layer: eqn.layer,
                 },
@@ -487,6 +559,334 @@ fn split_oversized_matmul_weights<V: ValidationChannel>(
         inputs,
         consts,
         ..split
+    })
+}
+
+/// The expert ranges an indexed packed contraction of `experts` experts splits into so that each range's sources
+/// are single buffers within `limit` bytes, addressable by the kernels' 32-bit bit offsets
+/// ([`PackedWeight::max_stack_experts`]); `None` when the stack fits whole, or when one expert's slab alone is over
+/// the buffer limit (no split helps: `refuse_oversized_constants` names the carrier, and an expert past the address
+/// range is the planner's typed `DispatchSizeOverflow`).
+fn expert_ranges(
+    descriptor: PackedWeight,
+    experts: usize,
+    limit: u64,
+) -> Option<Vec<std::ops::Range<usize>>> {
+    let usable = usable_bytes(limit);
+    let mut per_chunk = descriptor.max_stack_experts();
+    for role in descriptor.sources() {
+        let slab = descriptor.slab_bytes(role) as u64;
+        if slab > limit {
+            return None;
+        }
+        per_chunk = per_chunk.min(((usable / slab.max(1)) as usize).max(1));
+    }
+    if per_chunk == 0 || per_chunk >= experts {
+        return None;
+    }
+    Some(
+        (0..experts)
+            .step_by(per_chunk)
+            .map(|first| first..(first + per_chunk).min(experts))
+            .collect(),
+    )
+}
+
+/// The id every piece of a split expert stack reads for a row no expert of the stack holds: past any expert count,
+/// so the row is invalid in each piece, and exact in `f32`.
+const UNHELD_ID: f32 = (1u32 << 30) as f32;
+
+/// An indexed packed contraction `legalize` can split: its activation, row ids and packed source carriers (named
+/// constants, one per role), and the expert ranges of the pieces.
+struct StackSplit {
+    descriptor: PackedWeight,
+    experts: usize,
+    x: ValueId,
+    ids: ValueId,
+    carriers: Vec<ValueId>,
+    ranges: Vec<std::ops::Range<usize>>,
+}
+
+/// The equations and values a rewrite appends, each reserved against the graph budget.
+struct Appender<'a> {
+    budget: GraphBudget,
+    values: &'a mut Vec<ValueMeta>,
+    eqns: &'a mut Vec<Eqn>,
+    layer: Option<LayerIndex>,
+}
+
+impl Appender<'_> {
+    /// Append one equation `op` over `inputs` writing a fresh device value of type `aval`.
+    fn push(
+        &mut self,
+        op: OpKind,
+        inputs: &[Operand],
+        aval: TensorType,
+    ) -> Result<ValueId, ExpansionError> {
+        let out = self.budget.push_value(
+            STAGE,
+            self.values,
+            ValueMeta::new(aval, Storage::Device, None),
+        )?;
+        self.push_to(op, inputs, out)?;
+        Ok(out)
+    }
+
+    /// Append one equation `op` over `inputs` writing the existing value `out`.
+    fn push_to(
+        &mut self,
+        op: OpKind,
+        inputs: &[Operand],
+        out: ValueId,
+    ) -> Result<(), ExpansionError> {
+        self.budget.push_eqn(
+            STAGE,
+            self.eqns,
+            Eqn {
+                op,
+                inputs: inputs.to_vec(),
+                out,
+                layer: self.layer,
+            },
+        )
+    }
+
+    /// `1.0` for the rows whose id lies in `range` and `0.0` for any other, a NaN id included: `Ge(id, from) -
+    /// Ge(id, to)` (a NaN compares false twice).
+    fn indicator(
+        &mut self,
+        ids: ValueId,
+        ids_aval: &TensorType,
+        range: std::ops::Range<usize>,
+    ) -> Result<ValueId, ExpansionError> {
+        let ge = |at: usize| [Operand::Value(ids), Operand::Lit(Scalar::F32(at as f32))];
+        let from = self.push(
+            OpKind::Binary(BinOp::Ge),
+            &ge(range.start),
+            ids_aval.clone(),
+        )?;
+        let to = self.push(OpKind::Binary(BinOp::Ge), &ge(range.end), ids_aval.clone())?;
+        self.push(
+            OpKind::Binary(BinOp::Sub),
+            &[Operand::Value(from), Operand::Value(to)],
+            ids_aval.clone(),
+        )
+    }
+}
+
+/// Split every indexed packed contraction whose stacked expert table does not fit one buffer
+/// ([`expert_ranges`]) into one contraction per expert range, summed at the original output id.
+///
+/// Piece `c` holds experts `lo..hi`: its carriers are the constants `{carrier}.chunkC` (the rows `lo..hi` of the
+/// stack's leading expert axis, which the executor binder places as that run of the parent's experts, like a dense
+/// weight's row chunk). Every piece computes every row, so a row the piece does not own is neutralized instead of
+/// selected away (a `Select` needs an I32 condition, and no F32 to I32 cast lowers): the piece reads the
+/// activation row times `owned` (`1.0` when `lo <= id < hi`, else `0.0`), which makes its output row exactly `0`
+/// for a finite activation row, and the id `(id - lo) * owned` shifted into the piece's table, or `0` for a row it
+/// does not own. A row whose id no expert of the stack holds (outside `0..E`, NaN) instead reads an id of
+/// `2^30` in every piece, so every piece outputs the NaN row of the unsplit contraction; a fractional id lies in
+/// its owner's range and stays fractional there. The sum of the pieces is then the owning piece's row plus zeros.
+/// The split costs one full contraction per piece, and a non-finite activation row turns into NaN rather than
+/// whatever the unsplit contraction makes of it.
+fn split_oversized_expert_stacks<V: ValidationChannel>(
+    g: &Graph<V>,
+    limit: u64,
+    budget: GraphBudget,
+) -> Result<Graph<V>, ExpansionError> {
+    let mut values = g.values.clone();
+    let mut new_consts = Vec::new();
+    let mut split_carriers = HashSet::new();
+    let mut eqns = Vec::with_capacity(g.eqns.len());
+
+    for eqn in &g.eqns {
+        let Some(StackSplit {
+            descriptor,
+            experts,
+            x,
+            ids,
+            carriers,
+            ranges,
+        }) = splittable_stack(g, eqn, limit)
+        else {
+            budget.push_eqn(STAGE, &mut eqns, eqn.clone())?;
+            continue;
+        };
+        split_carriers.extend(carriers.iter().copied());
+        let out_aval = values[eqn.out].aval.clone();
+        let x_aval = values[x].aval.clone();
+        let ids_aval = values[ids].aval.clone();
+        let column = TensorType::f32(vec![ids_aval.shape[0], 1]);
+        let mut emit = Appender {
+            budget,
+            values: &mut values,
+            eqns: &mut eqns,
+            layer: eqn.layer,
+        };
+
+        // `2^30` for a row no expert of the stack holds, else `-0.0`: added to every piece's id.
+        let held = emit.indicator(ids, &ids_aval, 0..experts)?;
+        let missing = emit.push(
+            OpKind::Binary(BinOp::Sub),
+            &[Operand::Value(held), Operand::Lit(Scalar::F32(1.0))],
+            ids_aval.clone(),
+        )?;
+        let unheld_id = emit.push(
+            OpKind::Binary(BinOp::Mul),
+            &[
+                Operand::Value(missing),
+                Operand::Lit(Scalar::F32(-UNHELD_ID)),
+            ],
+            ids_aval.clone(),
+        )?;
+
+        let mut sum: Option<ValueId> = None;
+        for (index, range) in ranges.iter().enumerate() {
+            let owned = emit.indicator(ids, &ids_aval, range.clone())?;
+            let local_ids = if range.start == 0 {
+                ids
+            } else {
+                emit.push(
+                    OpKind::Binary(BinOp::Sub),
+                    &[
+                        Operand::Value(ids),
+                        Operand::Lit(Scalar::F32(range.start as f32)),
+                    ],
+                    ids_aval.clone(),
+                )?
+            };
+            let owned_ids = emit.push(
+                OpKind::Binary(BinOp::Mul),
+                &[Operand::Value(local_ids), Operand::Value(owned)],
+                ids_aval.clone(),
+            )?;
+            let piece_ids = emit.push(
+                OpKind::Binary(BinOp::Add),
+                &[Operand::Value(owned_ids), Operand::Value(unheld_id)],
+                ids_aval.clone(),
+            )?;
+            let owned_column = emit.push(
+                OpKind::Reshape {
+                    shape: column.shape.clone(),
+                },
+                &[Operand::Value(owned)],
+                column.clone(),
+            )?;
+            let piece_x = emit.push(
+                OpKind::Binary(BinOp::Mul),
+                &[Operand::Value(x), Operand::Value(owned_column)],
+                x_aval.clone(),
+            )?;
+            let mut piece_inputs = vec![Operand::Value(piece_x), Operand::Value(piece_ids)];
+            for &carrier in &carriers {
+                let name = emit.values[carrier]
+                    .name
+                    .clone()
+                    .expect("legalize: a Storage::Const value always carries a checkpoint name");
+                let mut shape = emit.values[carrier].aval.shape.clone();
+                shape[0] = range.len();
+                let dtype = emit.values[carrier].aval.dtype;
+                let piece = emit.budget.push_value(
+                    STAGE,
+                    emit.values,
+                    ValueMeta::new(
+                        TensorType::new(shape, dtype),
+                        Storage::Const,
+                        Some(format!("{name}.chunk{index}")),
+                    ),
+                )?;
+                new_consts.push(piece);
+                piece_inputs.push(Operand::Value(piece));
+            }
+            let contraction = OpKind::PackedContraction {
+                descriptor,
+                rows: ContractionRows::Indexed {
+                    experts: range.len(),
+                },
+            };
+            let last = index + 1 == ranges.len();
+            let piece_out = emit.push(contraction, &piece_inputs, out_aval.clone())?;
+            sum = Some(match sum {
+                None => piece_out,
+                Some(sum) => {
+                    let add = [Operand::Value(sum), Operand::Value(piece_out)];
+                    if last {
+                        emit.push_to(OpKind::Binary(BinOp::Add), &add, eqn.out)?;
+                        eqn.out
+                    } else {
+                        emit.push(OpKind::Binary(BinOp::Add), &add, out_aval.clone())?
+                    }
+                }
+            });
+        }
+    }
+
+    if split_carriers.is_empty() {
+        return Ok(g.clone());
+    }
+    let split = super::dce(&Graph {
+        values,
+        eqns,
+        ..g.clone()
+    });
+    let live = live_value_ids(&split);
+    let drop_consts: HashSet<ValueId> = split_carriers
+        .into_iter()
+        .filter(|id| !live.contains(id))
+        .collect();
+    let inputs: Vec<ValueId> = g
+        .inputs
+        .iter()
+        .copied()
+        .filter(|id| !drop_consts.contains(id))
+        .chain(new_consts.iter().copied())
+        .collect();
+    let consts: Vec<ValueId> = g
+        .consts
+        .iter()
+        .copied()
+        .filter(|id| !drop_consts.contains(id))
+        .chain(new_consts)
+        .collect();
+    Ok(Graph {
+        inputs,
+        consts,
+        ..split
+    })
+}
+
+/// The split of `eqn` when it is an indexed packed contraction over named constant carriers and F32 ids whose
+/// stacked table [`expert_ranges`] splits.
+fn splittable_stack<V: ValidationChannel>(
+    g: &Graph<V>,
+    eqn: &Eqn,
+    limit: u64,
+) -> Option<StackSplit> {
+    let OpKind::PackedContraction {
+        descriptor,
+        rows: ContractionRows::Indexed { experts },
+    } = &eqn.op
+    else {
+        return None;
+    };
+    let ranges = expert_ranges(*descriptor, *experts, limit)?;
+    let operands: Vec<ValueId> = eqn
+        .inputs
+        .iter()
+        .map(|operand| operand_value(*operand))
+        .collect::<Option<_>>()?;
+    let (&x, &ids) = (operands.first()?, operands.get(1)?);
+    let carriers = operands[2..].to_vec();
+    (g.aval(ids).dtype == DType::F32
+        && carriers.iter().all(|&carrier| {
+            g.meta(carrier).storage == Storage::Const && g.meta(carrier).name.is_some()
+        }))
+    .then_some(StackSplit {
+        descriptor: *descriptor,
+        experts: *experts,
+        x,
+        ids,
+        carriers,
+        ranges,
     })
 }
 
@@ -548,6 +948,31 @@ mod tests {
         assert_eq!(meta.storage, Storage::Slot(Slot::TokenEmbed));
         assert_eq!(meta.name.as_deref(), Some("model.embed_tokens.weight"));
         assert_eq!(meta.aval.shape, vec![hidden_of(&g)]);
+    }
+
+    /// A tied head: the oversized embed table is also read by a `MatMul` over its transpose. Hosting the
+    /// gather would drop a constant the matmul still reads (`InvalidGraph(EquationOperandNotDefined)`
+    /// at compile); the rewrite must leave it, so legalize answers with the typed `OversizedConstant`.
+    #[test]
+    fn legalize_does_not_host_a_gather_whose_table_another_eqn_reads() {
+        let b = Builder::new();
+        let token = b.slot(Slot::Token, TensorType::scalar(DType::I32));
+        let embed = b.constant("tied.weight", TensorType::f32(vec![152_064, 3584]));
+        let row = b.gather_scalar(embed, 0, token);
+        let x = b.reshape(row, vec![1, 3584]);
+        let out = b.matmul(x, b.transpose(embed, vec![1, 0]));
+        let g = b.finish(out);
+
+        let err = legalize(
+            &g,
+            &caps_with_limit(2_147_483_647),
+            &CompileLimits::STANDARD,
+        )
+        .expect_err("the gather still reads the table, so it cannot be hosted away");
+        assert!(
+            matches!(err, LegalizeError::OversizedConstant { ref name, .. } if name == "tied.weight"),
+            "{err:?}"
+        );
     }
 
     fn hidden_of(g: &Graph) -> usize {
@@ -648,6 +1073,56 @@ mod tests {
                 const_bytes(&legalized, id) <= 2_147_483_647,
                 "every remaining constant, including each chunk, fits the limit"
             );
+        }
+    }
+
+    /// SC-002 (split, dense): an oversized `[N, K]` weight read by a `DenseContraction` (the fold has run, as in
+    /// `compile`) splits into row-chunk `DenseContraction`s over the stored rows - no transpose, no matmul -
+    /// joined by a `Concat` at the original output id. Mutation: drop the `DenseContraction` arm in
+    /// `splittable_matmul`; the weight stays whole and `legalize` refuses it (`OversizedConstant`).
+    #[test]
+    fn legalize_splits_an_oversized_dense_contraction_weight() {
+        let b = Builder::new();
+        let x = b.constant("x", TensorType::f32(vec![1, 4096]));
+        let w = b.constant(
+            "big.weight",
+            TensorType::new(vec![200_000, 4096], DType::BF16),
+        );
+        let out = b.matmul(x, b.transpose(w, vec![1, 0]));
+        let g = crate::fold_dense_contractions(&b.finish(out));
+        assert!(
+            g.eqns
+                .iter()
+                .any(|e| matches!(e.op, OpKind::DenseContraction { .. })),
+            "the fixture folds"
+        );
+
+        let limit = 1_000_000_000;
+        let legalized = legalize(&g, &caps_with_limit(limit), &CompileLimits::STANDARD)
+            .expect("an oversized dense weight always splits");
+        let chunks = legalized
+            .eqns
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.op,
+                    OpKind::DenseContraction {
+                        weight: DType::BF16
+                    }
+                )
+            })
+            .count();
+        assert_eq!(chunks, 2, "1.6 GB over a 1 GB limit needs 2 chunks");
+        assert!(
+            !legalized
+                .eqns
+                .iter()
+                .any(|e| matches!(e.op, OpKind::Transpose { .. } | OpKind::MatMul)),
+            "the chunks read the stored rows directly"
+        );
+        assert_eq!(legalized.output, g.output);
+        for &id in &legalized.consts {
+            assert!(const_bytes(&legalized, id) <= limit, "every chunk fits");
         }
     }
 

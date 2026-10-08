@@ -1,163 +1,375 @@
-//! DeepSeek-V4 CPU-oracle tracers (spec 281, arXiv 2606.19348). F32 only, no GPU path. See
-//! `specs/281-deepseek-v4-csa-hca-mhc/spec.md` for the derivation, citations, and scope.
+//! DeepSeek-V4 behind [`Model`] (arXiv 2606.19348): a decoder whose residual stream is `hc_mult`
+//! parallel streams per token, mixed around every block by manifold-constrained hyper-connections
+//! ([`crate::components::mhc`]), with three kinds of attention layer chosen by the checkpoint's
+//! `compress_ratios` schedule:
 //!
-//! # Coverage
+//! - **sliding**: the local window over a carried cache ([`sliding`]);
+//! - **HCA** (heavily compressed attention): the window plus every complete window of a
+//!   non-overlapping compression of the layer's keys ([`hca`]);
+//! - **CSA** (compressed sparse attention): the window plus the best `index_topk` entries of an
+//!   overlapping compression, selected per query token by a lightning indexer ([`csa`]).
 //!
-//! V4 has three per-layer attention types (`sliding_attention`, `compressed_sparse_attention` (CSA),
-//! `heavily_compressed_attention` (HCA)) and a widened `[.., hc_mult, hidden]` residual stream mixed by
-//! Manifold-Constrained Hyper-Connections (mHC) at every layer.
+//! The attention core is not MLA: a low-rank query, one key-value head read as both key and value,
+//! partial interleaved RoPE on the trailing `qk_rope_head_dim` dims of each head (undone on the
+//! output), per-head attention sinks and a grouped low-rank output projection. Every layer routes
+//! through a mixture of experts with the square-root-softplus score; the first `num_hash_layers`
+//! layers take their experts from a token-to-experts table ([`moe`]).
 //!
-//! - HCA: non-overlapping softmax-gated pooling plus dense (no top-k) attention over every causally valid
-//!   compressed entry, concatenated onto the local sliding-window K==V branch
-//!   (`trace_deepseek4_hca_decode`/`trace_deepseek4_hca_prefill`).
-//! - CSA: overlapping-window pooling (`csa_overlap_pool`: an entry pools window `w-1`'s "Ca" half plus
-//!   window `w`'s "Cb" half) and a Lightning Indexer (`csa_indexer_scores`/`csa_topk_mask`) that selects
-//!   the top-`k` entries each query attends to
-//!   (`trace_deepseek4_csa_decode`/`trace_deepseek4_csa_prefill`).
-//! - FP4/FP8, DSpark and YaRN are out of scope (see the spec).
-//!
-//! # The attention core is not MLA
-//!
-//! Checked against the `huggingface/transformers` `deepseek_v4` module: `DeepseekV4Attention` has no
-//! `kv_a_proj_with_mqa`/`kv_a_layernorm`/`kv_b_proj` latent compression. Instead it uses:
-//!
-//! - a low-rank query (`q_a_proj`, weighted RMSNorm, `q_b_proj`, then an unweighted per-head RMSNorm
-//!   ([`poot_graph_ir::ops::rmsnorm_no_weight`]) before RoPE);
-//! - a single shared KV head read as both K and V;
-//! - per-query-head learned attention sinks (same math as `crate::gpt_oss`, shared via
-//!   [`poot_graph_ir::ops::attention_masked_with_sink`]/[`poot_graph_ir::ops::attention_prefill_with_sink`]);
-//! - partial interleaved RoPE on the trailing `qk_rope_head_dim` slice of each head, with an inverse rotation
-//!   on the trailing slice of the attention output (undoing the rotation V picked up from sharing K's
-//!   tensor);
-//! - a grouped low-rank output projection (`o_groups` block-diagonal matmuls, then one linear).
-//!
-//! # mHC (Manifold-Constrained Hyper-Connections)
-//!
-//! The residual stream is `[1, S, hc_mult, hidden]` for the whole model. Each decoder layer has two
-//! `hyper_connection`/`hyper_connection_combine` pairs (attention site, MLP site), and one final
-//! `hyper_head` collapse precedes the closing RMSNorm. `comb` (the cross-stream residual mixer) is
-//! projected onto the doubly stochastic matrices by Sinkhorn-Knopp: one column-normalize, then
-//! `hc_sinkhorn_iters - 1` rounds of (row-normalize, column-normalize), matching the reference code. The
-//! column-normalize reduces the penultimate `hc` axis directly (see `sum_penultimate_keepdim`; card 523b:
-//! `compile` legalizes a non-last-axis reduce for every target).
-//!
-//! # Real config values (`deepseek-ai/DeepSeek-V4-Flash-0731/config.json`)
-//!
-//! `hidden_size: 4096`, `num_hidden_layers: 43`, `num_attention_heads: 64`, `head_dim: 512`,
-//! `qk_rope_head_dim: 64`, `q_lora_rank: 1024`, `o_groups: 8`, `o_lora_rank: 1024`, `sliding_window: 128`,
-//! `hc_mult: 4`, `hc_sinkhorn_iters: 20`, `hc_eps: 1e-6`, `rms_norm_eps: 1e-6`, `swiglu_limit: 10.0`. Test
-//! fixtures use tiny analogs of these dims.
-//!
-//! # Reused pieces
-//!
-//! - `crate::deepseek2::{rope_interleave_apply, rope_interleaved_decode, rope_interleaved_prefill,
-//!   deepseek2_rope_tables_interleaved}`: interleaved-pair partial RoPE, also used for the inverse rotation.
-//! - `poot_graph_ir::ops::{attention_masked_with_sink, attention_prefill_with_sink, sigmoid, softmax, rmsnorm,
-//!   rmsnorm_no_weight, linear, relu, repeat_kv}`.
-//! - `sliding_window_floor` for the decode-side sliding-window mask.
-//! - `crate::deepseek3::{pairwise_rank, keep_top_k_mask}` for the indexer's top-`k` selection.
-//!   `csa_topk_mask` has the same additive-mask recombination as `crate::deepseek32::dsa_combined_mask`, but
-//!   V4's indexer scorer applies two extra scale multiplies (see `csa_indexer_scores`).
-//! - `hca_window_rope`/`hca_decode_validity_mask` are shared by CSA. `softmax_gate_pool_core` is the
-//!   softmax-then-pool math shared by `hca_softmax_gate_pool` and `csa_overlap_pool`.
+//! One body traces every phase. The window caches and the raw histories the compressors pool carry
+//! the position axis like an attention cache, and the compressed entries are recomputed from them,
+//! so a prefill chunk continues from the positions already written and one token is a decode step.
+//! Every dimension, count and the schedule is the checkpoint's: a fine-tune with fewer layers or
+//! experts or other compression rates is the same family, and the checkpoint's packed experts and
+//! projections are read as stored.
 
-#[cfg(test)]
-use crate::deepseek2::{rope_interleave_apply, rope_interleaved_decode, rope_interleaved_prefill};
-#[cfg(test)]
+use poot_graph_ir::{Builder, Graph, ValidationOutputs};
+use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
 use poot_tensor::DType;
 
-#[cfg(test)]
-use crate::components::sparse_top_k::{keep_top_k_mask, pairwise_rank};
-
-/// Test helper (POOT-568 deletes it with the tracers that use it): add the sliding-window floor to a full-causal decode mask in-graph (card 151), so LOCAL layers window
-/// while GLOBAL layers keep the raw mask, with no second `Slot::Mask` (GPU-capture aliasing hazard) and no
-/// per-backend binder change. The window `w` is a compile-time constant: `floor[.,t] = -1e9 * max(0,
-/// (pos - w + 1) - t)` is large-negative where key slot `t <= pos - w` is too old. `pos_f` (f32 position(s)) is
-/// gathered from the in-graph `iota` at `Slot::Pos` (`iota[pos] == pos`, card 550a), avoiding an i32->f32 `Cast`, which
-/// mis-lowers to bf16 on wgpu. `iota_cap` is `[0,1,...,cap-1]`. Returns `mask_4d + floor`. `rows` is 1 for
-/// single-seq decode (scalar pos) or `batch` for batched shared-pool decode (`[batch]` pos). Same arithmetic as
-/// Gemma's decode per-layer window floor. Inert
-/// (all-zero floor) whenever `w >= cap`.
-#[cfg(test)]
-fn sliding_window_floor(
-    b: &Builder,
-    mask_4d: poot_graph_ir::Traced,
-    pos_f: poot_graph_ir::Traced,
-    iota_cap: poot_graph_ir::Traced,
-    window: usize,
-    rows: usize,
-    cap: usize,
-) -> poot_graph_ir::Traced {
-    use poot_graph_ir::{BinOp, Scalar};
-    let pos_f = b.reshape(pos_f, vec![rows, 1]);
-    let thresh = b.binary_scalar(BinOp::Sub, pos_f, Scalar::F32(window as f32 - 1.0));
-    let thresh = b.broadcast(thresh, vec![rows, cap]);
-    let iota_row = b.reshape(iota_cap, vec![1, cap]);
-    let iota_row = b.broadcast(iota_row, vec![rows, cap]);
-    let arg = b.binary(BinOp::Sub, thresh, iota_row); // (pos - w + 1) - t
-    let relu = b.binary_scalar(BinOp::Max, arg, Scalar::F32(0.0));
-    let floor = b.binary_scalar(BinOp::Mul, relu, Scalar::F32(-1e9));
-    let floor = b.reshape(floor, vec![rows, 1, 1, cap]);
-    b.binary(BinOp::Add, mask_4d, floor)
-}
-
-#[cfg(test)]
-use poot_graph_ir::ops::{
-    PackedLinearGraphRow, attention_masked_with_sink, attention_prefill_with_sink,
-    canonical_router_scores, packed_block_diagonal_linear, packed_grouped_linear,
-    packed_indexed_linear, packed_linear, relu, repeat_kv, rmsnorm, softplus,
-    stable_descending_rank,
+use crate::chat::ChatFormat;
+use crate::components::standard::{Step, check_step};
+use crate::model::{
+    FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, ShapeReason, StepShape,
+    TraceError,
 };
-
-#[cfg(test)]
-use poot_graph_ir::{
-    ExecutionValidationFailure, Graph, Slot, StateRole, TensorType, UnOp, ValidationId,
-    ValidationOutputs,
-};
-
-#[cfg(test)]
-use poot_graph_ir::ops::{linear, rmsnorm_no_weight, sigmoid, softmax};
-#[cfg(test)]
-use poot_graph_ir::{
-    BinOp, Builder, BuilderAppendError, GraphValidationError, IndexGuardError, RedOp, Scalar,
-    Traced,
-};
-#[cfg(test)]
-use sources::V4SourcePlanError;
-
-/// Owner of every V4 graph source name and its role.
-pub mod sources;
-
-#[cfg(test)]
-use sources::{
-    DeepseekV4SourcePlan, V4_COMPRESS_ROPE_COS, V4_COMPRESS_ROPE_SIN, V4_CSA_BLOCK_BIAS,
-    V4_CSA_WINDOW_POSITIONS, V4_HCA_BLOCK_BIAS, V4_HCA_WINDOW_POSITIONS, V4_ROPE_COS, V4_ROPE_SIN,
-    V4CompressorDense, V4DenseSourceSpec, V4ExpertProjection, V4IndexerDense, V4LayerDense,
-    V4PackedRole, V4TopDense,
-};
+use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
 
 mod config;
 mod csa;
 mod hca;
-mod mhc;
 mod moe;
+mod names;
 mod sliding;
 mod stack;
 
 #[cfg(test)]
-pub(crate) use config::*;
-#[cfg(test)]
-pub(crate) use csa::*;
-#[cfg(test)]
-pub(crate) use hca::*;
-#[cfg(test)]
-pub(crate) use mhc::*;
-#[cfg(test)]
-pub(crate) use moe::*;
-#[cfg(test)]
-pub(crate) use sliding::*;
-#[cfg(test)]
-pub(crate) use stack::*;
-
-#[cfg(test)]
 mod tests;
+
+pub use config::{DeepseekV4Config, LayerKind};
+
+pub const FAMILY: FamilyKey = FamilyKey::new("deepseek4");
+
+pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
+    family: FAMILY,
+    keys: &[(ConfigSource::HfModelType, "deepseek_v4")],
+    build,
+    fixture,
+    variants: &[("finetune", finetune_fixture)],
+};
+
+#[derive(Debug)]
+pub struct DeepseekV4 {
+    params: DeepseekV4Config,
+    weights: WeightMap,
+    tower: stack::Tower,
+    config: ModelConfig,
+}
+
+fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+    let p = DeepseekV4Config::from_raw(raw)?;
+    let weights = names::weights_of(&p, store)?;
+    let tower = stack::Tower::new(&weights, &p).map_err(|e| e.for_family(FAMILY))?;
+    let config = ModelConfig {
+        family: FAMILY,
+        vocab: p.vocab,
+        max_positions: p.max_positions,
+        eos: p.eos.clone(),
+        bos: p.bos,
+        prompt_bos: None,
+        output: ModelOutput::Logits { vocab: p.vocab },
+        prefill_granule: p.granule,
+        chat: ChatFormat::ChatML,
+    };
+    Ok(Box::new(DeepseekV4 {
+        params: p,
+        weights,
+        tower,
+        config,
+    }))
+}
+
+impl Model for DeepseekV4 {
+    fn config(&self) -> &ModelConfig {
+        &self.config
+    }
+
+    fn weights(&self) -> &WeightMap {
+        &self.weights
+    }
+
+    fn trace(
+        &self,
+        phase: Phase,
+        shape: StepShape,
+    ) -> Result<Graph<ValidationOutputs>, TraceError> {
+        let p = &self.params;
+        check_step(FAMILY, phase, shape, p.max_positions)?;
+        crate::components::moe::check_step(FAMILY, shape, &p.score_moe)?;
+        let granule = p.granule.get();
+        if phase == Phase::Prefill && !shape.tokens.get().is_multiple_of(granule) {
+            return Err(TraceError::ShapeUnsupported {
+                family: FAMILY,
+                shape,
+                reason: ShapeReason::Granule { granule },
+            });
+        }
+        let b = Builder::new();
+        let step = Step::new(&b, shape);
+        let logits = self.tower.trace(&b, &step, p);
+        Ok(step.finish(b, logits))
+    }
+}
+
+/// The fixture's config: four layers (sliding, CSA, HCA, CSA) with compression rates 2 and 4 (a
+/// prefill granule of 4), two hyper-connection streams, a hash-routed first layer and score-routed
+/// others over 8 experts of which 2 route, with every projection width a multiple of 32 (so a packed
+/// copy of its store is a valid checkpoint too).
+pub(crate) fn fixture_config() -> serde_json::Value {
+    serde_json::json!({
+        "model_type": "deepseek_v4",
+        "vocab_size": 48,
+        "hidden_size": 32,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 4,
+        "head_dim": 16,
+        "qk_rope_head_dim": 8,
+        "q_lora_rank": 16,
+        "o_groups": 2,
+        "o_lora_rank": 8,
+        "sliding_window": 3,
+        "hc_mult": 2,
+        "hc_sinkhorn_iters": 3,
+        "hc_eps": 1e-6,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 10000.0,
+        "compress_rope_theta": 20000.0,
+        "compress_rates": {"compressed_sparse_attention": 2, "heavily_compressed_attention": 4},
+        "compress_ratios": [0, 2, 4, 2],
+        "index_n_heads": 2,
+        "index_head_dim": 8,
+        "index_topk": 2,
+        "n_routed_experts": 8,
+        "num_experts_per_tok": 2,
+        "n_shared_experts": 1,
+        "num_hash_layers": 1,
+        "moe_intermediate_size": 32,
+        "routed_scaling_factor": 1.5,
+        "scoring_func": "sqrtsoftplus",
+        // Low enough that the fixture's activations reach the clamp, so the gate's one-sided clamp
+        // and the up projection's two-sided one are both live.
+        "swiglu_limit": 0.5,
+        "max_position_embeddings": 64,
+        "eos_token_id": 47,
+    })
+}
+
+fn fixture() -> Fixture {
+    fixture_of(fixture_config())
+}
+
+/// A fine-tune of the fixture's architecture with other counts than any release: three layers
+/// (CSA, sliding, HCA) at other compression rates, two hash-routed layers, six experts, fewer
+/// heads and a narrower window. It ships no manifest and is the same family.
+fn finetune_fixture() -> Fixture {
+    let mut config = fixture_config();
+    config["num_hidden_layers"] = serde_json::json!(3);
+    config["compress_rates"] = serde_json::json!({
+        "compressed_sparse_attention": 4,
+        "heavily_compressed_attention": 2,
+    });
+    config["compress_ratios"] = serde_json::json!([4, 0, 2, 0, 0]);
+    config["num_hash_layers"] = serde_json::json!(2);
+    config["n_routed_experts"] = serde_json::json!(6);
+    config["num_attention_heads"] = serde_json::json!(2);
+    config["sliding_window"] = serde_json::json!(2);
+    fixture_of(config)
+}
+
+/// Every tensor of a checkpoint of `config`'s dimensions: `(name, shape, how it is stored)`.
+pub(crate) fn tensors(config: &serde_json::Value) -> Vec<(String, Vec<usize>, Stored)> {
+    let n = |f: &str| config[f].as_u64().unwrap() as usize;
+    let (vocab, w, layers) = (n("vocab_size"), n("hidden_size"), n("num_hidden_layers"));
+    let (heads, d) = (n("num_attention_heads"), n("head_dim"));
+    let (ql, groups, ol) = (n("q_lora_rank"), n("o_groups"), n("o_lora_rank"));
+    let (hc, experts, inter) = (
+        n("hc_mult"),
+        n("n_routed_experts"),
+        n("moe_intermediate_size"),
+    );
+    let (k, hash) = (n("num_experts_per_tok"), n("num_hash_layers"));
+    let rate = |name: &str| {
+        config["compress_rates"][name].as_u64().map_or(
+            if name.starts_with("compressed") {
+                4
+            } else {
+                128
+            },
+            |r| r as usize,
+        )
+    };
+    let csa = rate("compressed_sparse_attention");
+    let mix = (2 + hc) * hc;
+    use Stored::{Bf16, F32, I64Table};
+    let mut shapes = vec![
+        ("embed.weight".to_string(), vec![vocab, w], Bf16),
+        ("norm.weight".to_string(), vec![w], Bf16),
+        ("head.weight".to_string(), vec![vocab, w], Bf16),
+        ("hc_head_fn".to_string(), vec![hc, hc * w], Bf16),
+        ("hc_head_base".to_string(), vec![hc], F32),
+        ("hc_head_scale".to_string(), vec![1], F32),
+    ];
+    for l in 0..layers {
+        let at = |s: &str| format!("layers.{l}.{s}");
+        let ratio = config["compress_ratios"][l].as_u64().unwrap() as usize;
+        shapes.extend([
+            (at("attn_norm.weight"), vec![w], Bf16),
+            (at("ffn_norm.weight"), vec![w], Bf16),
+            (at("attn.wq_a.weight"), vec![ql, w], Bf16),
+            (at("attn.q_norm.weight"), vec![ql], Bf16),
+            (at("attn.wq_b.weight"), vec![heads * d, ql], Bf16),
+            (at("attn.wkv.weight"), vec![d, w], Bf16),
+            (at("attn.kv_norm.weight"), vec![d], Bf16),
+            (at("attn.attn_sink"), vec![heads], Bf16),
+            (
+                at("attn.wo_a.weight"),
+                vec![groups * ol, heads * d / groups],
+                Bf16,
+            ),
+            (at("attn.wo_b.weight"), vec![w, groups * ol], Bf16),
+            (at("hc_attn_fn"), vec![mix, hc * w], Bf16),
+            (at("hc_attn_base"), vec![mix], F32),
+            (at("hc_attn_scale"), vec![3], F32),
+            (at("hc_ffn_fn"), vec![mix, hc * w], Bf16),
+            (at("hc_ffn_base"), vec![mix], F32),
+            (at("hc_ffn_scale"), vec![3], F32),
+            (at("ffn.gate.weight"), vec![experts, w], Bf16),
+            (at("ffn.shared_experts.w1.weight"), vec![inter, w], Bf16),
+            (at("ffn.shared_experts.w3.weight"), vec![inter, w], Bf16),
+            (at("ffn.shared_experts.w2.weight"), vec![w, inter], Bf16),
+        ]);
+        if l < hash {
+            shapes.push((at("ffn.gate.tid2eid"), vec![vocab, k], I64Table));
+        } else {
+            shapes.push((at("ffn.gate.bias"), vec![experts], F32));
+        }
+        for e in 0..experts {
+            shapes.extend([
+                (
+                    at(&format!("ffn.experts.{e}.w1.weight")),
+                    vec![inter, w],
+                    Bf16,
+                ),
+                (
+                    at(&format!("ffn.experts.{e}.w3.weight")),
+                    vec![inter, w],
+                    Bf16,
+                ),
+                (
+                    at(&format!("ffn.experts.{e}.w2.weight")),
+                    vec![w, inter],
+                    Bf16,
+                ),
+            ]);
+        }
+        if ratio != 0 {
+            let overlapping = ratio == csa;
+            let (r, raw) = (ratio, if overlapping { 2 * d } else { d });
+            shapes.extend([
+                (at("attn.compressor.wkv.weight"), vec![raw, w], Bf16),
+                (at("attn.compressor.wgate.weight"), vec![raw, w], Bf16),
+                (at("attn.compressor.ape"), vec![r, raw], Bf16),
+                (at("attn.compressor.norm.weight"), vec![d], Bf16),
+            ]);
+        }
+        if ratio == csa {
+            let (ih, id) = (n("index_n_heads"), n("index_head_dim"));
+            shapes.extend([
+                (at("attn.indexer.wq_b.weight"), vec![ih * id, ql], Bf16),
+                (at("attn.indexer.weights_proj.weight"), vec![ih, w], Bf16),
+                (
+                    at("attn.indexer.compressor.wkv.weight"),
+                    vec![2 * id, w],
+                    Bf16,
+                ),
+                (
+                    at("attn.indexer.compressor.wgate.weight"),
+                    vec![2 * id, w],
+                    Bf16,
+                ),
+                (at("attn.indexer.compressor.ape"), vec![csa, 2 * id], Bf16),
+                (at("attn.indexer.compressor.norm.weight"), vec![id], Bf16),
+            ]);
+        }
+    }
+    shapes
+}
+
+/// How a fixture tensor is stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Stored {
+    Bf16,
+    F32,
+    /// The hash router's `[vocab, top_k]` table of expert ids, stored as I64.
+    I64Table,
+}
+
+/// A deterministic checkpoint of `config`: norm scales near one, hyper-connection scales near one,
+/// every other weight small and centred, and a hash table whose row `t` names the experts `t,
+/// t + 1, ...` (mod the expert count), so neighbouring tokens route differently.
+fn fixture_of(config: serde_json::Value) -> Fixture {
+    let experts = config["n_routed_experts"].as_u64().unwrap() as usize;
+    let mut store = WeightStore::builder();
+    let mut seed = 0x9e37_79b9u32;
+    let mut uniform = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        (seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+    };
+    for (key, shape, stored) in tensors(&config) {
+        let n: usize = shape.iter().product();
+        let value = |u: f32| {
+            if key.contains("norm") || key.ends_with("_scale") {
+                1.0 + 0.2 * u
+            } else if key.ends_with("_base") || key.ends_with("gate.bias") {
+                0.2 * u
+            } else {
+                0.5 * u
+            }
+        };
+        let (dtype, bytes): (DType, Vec<u8>) = match stored {
+            Stored::Bf16 => (
+                DType::BF16,
+                (0..n)
+                    .flat_map(|_| ((value(uniform()).to_bits() >> 16) as u16).to_le_bytes())
+                    .collect(),
+            ),
+            Stored::F32 => (
+                DType::F32,
+                (0..n)
+                    .flat_map(|_| value(uniform()).to_le_bytes())
+                    .collect(),
+            ),
+            Stored::I64Table => {
+                let k = shape[1];
+                (
+                    DType::I64,
+                    (0..n)
+                        .map(|i| (((i / k) + (i % k)) % experts) as i64)
+                        .flat_map(i64::to_le_bytes)
+                        .collect(),
+                )
+            }
+        };
+        let dense = DenseWeight::try_new(dtype, shape, bytes.into())
+            .expect("fixture bytes match their shape");
+        store
+            .insert(key, WeightEntry::Dense(dense))
+            .expect("fixture keys are unique");
+    }
+    Fixture {
+        config,
+        generation: None,
+        store: store.build(),
+    }
+}

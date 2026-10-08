@@ -47,7 +47,6 @@ fn fixture(name: &'static str, tokens: usize, starts: &[usize]) -> Fixture {
         graph,
         store,
         steps,
-        guarded: false,
     }
 }
 

@@ -388,6 +388,15 @@ fn rewrite_rvalue(rv: &mut Rvalue, aliases: &HashMap<u32, Place>) {
             rewrite_operand(a, aliases);
             rewrite_operand(b, aliases);
         }
+        Rvalue::Select {
+            condition,
+            if_true,
+            if_false,
+        } => {
+            rewrite_operand(condition, aliases);
+            rewrite_operand(if_true, aliases);
+            rewrite_operand(if_false, aliases);
+        }
         Rvalue::Len(p) => rewrite_place(p, aliases),
         Rvalue::WorkgroupLocalRead { idx, .. } => rewrite_operand(idx, aliases),
         Rvalue::WorkgroupLocalAtomic { idx, value, .. } => {

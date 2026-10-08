@@ -22,6 +22,7 @@ use poot_graph_plan::{
     Submission, Target, TargetSet, compile_staged,
 };
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
+use poot_test_util::const_weights::ConstWeights;
 use poot_test_util::max_abs_error;
 
 fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -46,10 +47,7 @@ fn staged(g: &Graph, target: Target) -> StagedProgram<poot_graph_ir::ValidationO
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions {
-            execution: Submission::Replay,
-            limits: poot_graph_plan::CompileLimits::STANDARD,
-        },
+        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect("compile the graph")
 }
@@ -217,11 +215,10 @@ fn run_once_contract(
     g: &Graph,
     inputs: &HashMap<ValueId, HostTensor>,
 ) -> Vec<f32> {
-    let program = staged(g, target);
     let (store, slot_binds) = split_consts_and_slots_t(g, inputs);
-    let exe = exec
-        .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (bound, map) = ConstWeights::bind(g, &store);
+    let program = staged(&bound, target);
+    let exe = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
     let entry = exec.add_entry(exe, &program).unwrap();
     let step_in = step_inputs(&slot_binds);
     let bytes = exec
@@ -241,11 +238,10 @@ fn run_once_contract_v(
     g: &Graph,
     inputs: &HashMap<ValueId, Value>,
 ) -> Vec<f32> {
-    let program = staged(g, target);
     let (store, slot_binds) = split_consts_and_slots_v(g, inputs);
-    let exe = exec
-        .load_weights(Arc::new(store), poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let (bound, map) = ConstWeights::bind(g, &store);
+    let program = staged(&bound, target);
+    let exe = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
     let entry = exec.add_entry(exe, &program).unwrap();
     let step_in = step_inputs(&slot_binds);
     let bytes = exec

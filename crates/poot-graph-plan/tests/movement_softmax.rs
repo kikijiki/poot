@@ -412,10 +412,7 @@ fn compile_chooses_the_generated_tiled_gemm_for_m_over_one_only() {
     use poot_kernelgen::{ContractionSpec, KernelRequest};
     use poot_target::{AmdArch, Backend};
 
-    let options = CompileOptions {
-        execution: Submission::Replay,
-        limits: poot_graph_plan::CompileLimits::STANDARD,
-    };
+    let options = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
     let backend = Backend::AmdGcn(AmdArch::gfx1151());
     let target = Target {
         backend,

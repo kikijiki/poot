@@ -1,7 +1,7 @@
 //! The indexed contraction: `out[m, n] = sum over k of x[m, k] * W[ids[m], k, n]` over a stacked `[E, K, N]`
 //! weight, where output row `m` reads the expert slab `ids[m]` (the MoE expert matmul, and every per-row
 //! adapter). Row selection is a property of the contraction's index map, not of a loader: both schedules read
-//! the slab through [`emit_row_slab`], and the schedule only decides the loop order.
+//! the expert through [`emit_row_expert`], and the schedule only decides the loop order.
 //!
 //! - [`Schedule::Gemv`] (decode, few rows): the shared Gemv loop nest ([`gemv_body`]) with an indexed run
 //!   read. Flat output column `m * N + n` is the "weight row"; its run read takes the expert slab of row `m`
@@ -19,8 +19,8 @@
 //! schedule (R-632-4), and the slab it would have addressed is clamped in range so no read leaves the buffer.
 
 use poot_kernel_ir::{
-    BasicBlock, BinOp, BlockId, Body, Constant, IndexAxis, Local, MathOp, Operand, Place, Rvalue,
-    Statement, Terminator, Ty, WorkgroupLocalDecl,
+    BasicBlock, BinOp, BlockId, Body, Constant, IndexAxis, Local, LocalDecl, MathOp, Operand,
+    Place, Rvalue, Statement, Terminator, Ty, WorkgroupLocalDecl,
 };
 
 use poot_target::BufferStorage;
@@ -36,21 +36,23 @@ use crate::helpers::{
 
 /// The launch metadata words of an indexed contraction, in order: `K`, `N`, `E` (the expert count), `M`
 /// (the activation rows) and `x_groups` (the Tiled grid's X extent; the Gemv ignores it).
-const META_K: usize = 0;
-const META_N: usize = 1;
-const META_EXPERTS: usize = 2;
-const META_ROWS: usize = 3;
-const META_X_GROUPS: usize = 4;
+pub(crate) const META_K: usize = 0;
+pub(crate) const META_N: usize = 1;
+pub(crate) const META_EXPERTS: usize = 2;
+pub(crate) const META_ROWS: usize = 3;
+pub(crate) const META_X_GROUPS: usize = 4;
+/// The first word past the shared layout: a packed table's per-source slab strides start here.
+pub(crate) const META_PACKED_SLAB_WORDS: usize = 5;
 
 /// The IEEE-754 quiet NaN the fail-closed rows carry.
 const NAN_BITS: u32 = 0x7FC0_0000;
 
 /// The expert row `m`'s id names, checked.
-struct RowExpert {
+pub(crate) struct RowExpert {
     /// The expert, clamped into `0..E` so an invalid id never addresses outside the weight.
-    expert: Local,
+    pub(crate) expert: Local,
     /// Whether the id is an integer in `0..E`.
-    valid: Local,
+    pub(crate) valid: Local,
 }
 
 /// What row `m`'s expert id selects: the slab it reads, and whether it may.
@@ -64,7 +66,7 @@ struct RowSlab {
 /// `ids[row]` as an expert: valid when it is an integer in `0..experts` (ordered comparisons, so NaN fails each),
 /// with the expert taken from the id clamped after the cast, so whatever the cast of a non-finite or negative id
 /// yields, the expert stays inside the table.
-fn emit_row_expert(e: &mut Emit, ids: Local, row: Local, experts: Local) -> RowExpert {
+pub(crate) fn emit_row_expert(e: &mut Emit, ids: Local, row: Local, experts: Local) -> RowExpert {
     let id = e.let_(Ty::F32, Rvalue::Use(Operand::Copy(elem(ids, row))));
     let experts_f = e.let_(
         Ty::F32,
@@ -103,21 +105,27 @@ fn emit_row_expert(e: &mut Emit, ids: Local, row: Local, experts: Local) -> RowE
     RowExpert { expert, valid }
 }
 
-/// The one place a row's expert id is turned into a slab: [`emit_row_expert`] plus the slab base and the NaN
-/// poison of an invalid id.
-fn emit_row_slab(e: &mut Emit, ids: Local, row: Local, experts: Local, stride: Local) -> RowSlab {
-    let RowExpert { expert, valid } = emit_row_expert(e, ids, row, experts);
-    let base = bin(e, Ty::Usize, BinOp::Mul, copy(expert), copy(stride));
+/// `0.0` for a valid expert id and NaN otherwise: added to the first term of a row's sum so an invalid row's
+/// output is NaN (R-632-4), the one definition of the fail-closed row every indexed schedule shares.
+pub(crate) fn emit_poison(e: &mut Emit, valid: Local) -> Local {
     let clean = e.let_(Ty::U32, Rvalue::Use(c32(0)));
     let nan = e.let_(Ty::U32, Rvalue::Use(c32(NAN_BITS)));
     let bits = select_u32(e, valid, clean, nan);
-    let poison = e.let_(
+    e.let_(
         Ty::F32,
         Rvalue::Bitcast {
             to: Ty::F32,
             operand: copy(bits),
         },
-    );
+    )
+}
+
+/// The one place a row's expert id is turned into a slab: [`emit_row_expert`] plus the slab base and the NaN
+/// poison of an invalid id.
+fn emit_row_slab(e: &mut Emit, ids: Local, row: Local, experts: Local, stride: Local) -> RowSlab {
+    let RowExpert { expert, valid } = emit_row_expert(e, ids, row, experts);
+    let base = bin(e, Ty::Usize, BinOp::Mul, copy(expert), copy(stride));
+    let poison = emit_poison(e, valid);
     RowSlab { base, poison }
 }
 
@@ -302,7 +310,6 @@ fn indexed_tiled(
     lane: WeightLane,
     epilogue: Option<&Epilogue>,
 ) -> Result<Body, KernelGenError> {
-    let ts = tile.get() as usize;
     let leaf_count = epilogue.map_or(0, Epilogue::leaf_count);
     let lanes = match epilogue {
         Some(epilogue) => epilogue.lanes("indexed_contraction")?,
@@ -319,12 +326,105 @@ fn indexed_tiled(
     }
     params.push(ld(slice_dtype(Ty::U32, false), false));
     params.push(ld(slice_f32(true), true));
+    let leaves: Vec<Local> = (0..leaf_count).map(|j| local(4 + j as u32)).collect();
+    Ok(indexed_tiled_body(
+        IndexedTiledBody {
+            name,
+            tile,
+            params,
+            x: local(1),
+            ids: local(3),
+            metadata: local(4 + leaf_count as u32),
+            out: local(5 + leaf_count as u32),
+            epilogue: epilogue.map(|epilogue| GemvEpilogue {
+                epilogue,
+                leaves: &leaves,
+                lanes: &lanes,
+            }),
+        },
+        &DenseExperts {
+            layout,
+            lane,
+            weight: local(2),
+        },
+    ))
+}
+
+/// A stacked dense `[E, K, N]` weight (or `[E, N, K]`, [`WeightLayout`]) as the segmented Tiled body reads it.
+struct DenseExperts {
+    layout: WeightLayout,
+    lane: WeightLane,
+    weight: Local,
+}
+
+impl IndexedTiledWeight for DenseExperts {
+    /// The element offset of the expert's slab: `expert * K * N`.
+    fn step(&self, e: &mut Emit, expert: Local, (k, n): (Local, Local)) -> Vec<Local> {
+        let stride = bin(e, Ty::Usize, BinOp::Mul, copy(k), copy(n));
+        vec![bin(e, Ty::Usize, BinOp::Mul, copy(expert), copy(stride))]
+    }
+
+    fn load(
+        &self,
+        e: &mut Emit,
+        step: &[Local],
+        at: (Local, Local),
+        extents: (Local, Local),
+    ) -> Local {
+        let in_slab = emit_in_slab(e, self.layout, at, extents);
+        let at = bin(e, Ty::Usize, BinOp::Add, copy(step[0]), copy(in_slab));
+        self.lane.emit_elem(e, self.weight, at)
+    }
+}
+
+/// How the segmented Tiled body reads one expert's weight, the only part that differs between the dense stack
+/// and a packed one: everything else (the key walk, the staging, the dot, the poison and the epilogue) is
+/// [`indexed_tiled_body`].
+pub(crate) trait IndexedTiledWeight {
+    /// What the walk computes once per step for the step's `expert` (its slab offset in each buffer), given the
+    /// weight's `(K, N)`; handed back to every [`Self::load`] of the step.
+    fn step(&self, e: &mut Emit, expert: Local, extents: (Local, Local)) -> Vec<Local>;
+    /// Element `(k, n)` (`at`, both inside the weight) of the step's expert, for a weight of `extents` `(K, N)`.
+    fn load(
+        &self,
+        e: &mut Emit,
+        step: &[Local],
+        at: (Local, Local),
+        extents: (Local, Local),
+    ) -> Local;
+}
+
+/// What [`indexed_tiled_body`] needs besides the weight read: the body's parameters (`unit, x, .., metadata,
+/// out`, with the `ids` and any epilogue leaves among them) and where each of those sits.
+pub(crate) struct IndexedTiledBody<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) tile: TileSize,
+    pub(crate) params: Vec<LocalDecl>,
+    pub(crate) x: Local,
+    pub(crate) ids: Local,
+    pub(crate) metadata: Local,
+    pub(crate) out: Local,
+    pub(crate) epilogue: Option<GemvEpilogue<'a>>,
+}
+
+/// The segmented Tiled body, over whichever stacked weight `weight` reads (see [`indexed_tiled`]).
+pub(crate) fn indexed_tiled_body(
+    spec: IndexedTiledBody<'_>,
+    weight: &impl IndexedTiledWeight,
+) -> Body {
+    let IndexedTiledBody {
+        name,
+        tile,
+        params,
+        x,
+        ids,
+        metadata,
+        out,
+        epilogue,
+    } = spec;
+    let ts = tile.get() as usize;
     let n_inputs = (params.len() - 1) as u32;
     let mut al = Alloc::new(params);
-    let (x, w, ids) = (local(1), local(2), local(3));
-    let leaves: Vec<Local> = (0..leaf_count).map(|j| local(4 + j as u32)).collect();
-    let (metadata, out) = (local(4 + leaf_count as u32), local(5 + leaf_count as u32));
-
     let gx = al.add(Ty::Usize, false);
     let gy = al.add(Ty::Usize, false);
     let l = al.add(Ty::Usize, false);
@@ -416,8 +516,8 @@ fn indexed_tiled(
     let last_k = bin(&mut s, Ty::Usize, BinOp::Sub, copy(k), cu(1));
     let row_ok = bin(&mut s, Ty::Bool, BinOp::Lt, copy(row), copy(rows));
     let col_ok = bin(&mut s, Ty::Bool, BinOp::Lt, copy(col), copy(n));
-    let stride = bin(&mut s, Ty::Usize, BinOp::Mul, copy(k), copy(n));
-    let slab = emit_row_slab(&mut s, ids, row_c, experts, stride);
+    let RowExpert { valid, .. } = emit_row_expert(&mut s, ids, row_c, experts);
+    let poison = emit_poison(&mut s, valid);
     let key = emit_row_key(&mut s, ids, row, (rows, experts));
     let tr_ts = bin(&mut s, Ty::Usize, BinOp::Mul, copy(tr), cu(ts));
     let mut setup = s.take();
@@ -463,7 +563,7 @@ fn indexed_tiled(
 
     // Step setup: this step's expert slab (a real key, so in range) and a zeroed step accumulator.
     let mut s = Emit::new(&mut al);
-    let step_base = bin(&mut s, Ty::Usize, BinOp::Mul, copy(next), copy(stride));
+    let step = weight.step(&mut s, next, (k, n));
     let mut slab_stmts = s.take();
     slab_stmts.extend([
         Statement::Assign(
@@ -499,9 +599,7 @@ fn indexed_tiled(
     let a_keep = bin(&mut s, Ty::Bool, BinOp::BitAnd, copy(row_ok), copy(a_k_ok));
     let a_val = masked(&mut s, a_keep, a_raw);
     s.write_lds(0, copy(l), copy(a_val));
-    let b_in = emit_in_slab(&mut s, layout, (b_k_c, col_c), (k, n));
-    let b_at = bin(&mut s, Ty::Usize, BinOp::Add, copy(step_base), copy(b_in));
-    let b_raw = lane.emit_elem(&mut s, w, b_at);
+    let b_raw = weight.load(&mut s, &step, (b_k_c, col_c), (k, n));
     let b_keep = bin(&mut s, Ty::Bool, BinOp::BitAnd, copy(col_ok), copy(b_k_ok));
     let b_val = masked(&mut s, b_keep, b_raw);
     s.write_lds(1, copy(l), copy(b_val));
@@ -564,9 +662,13 @@ fn indexed_tiled(
     let mut s = Emit::new(&mut al);
     let out_row = bin(&mut s, Ty::Usize, BinOp::Mul, copy(row), copy(n));
     let out_at = bin(&mut s, Ty::Usize, BinOp::Add, copy(out_row), copy(col));
-    let total = bin(&mut s, Ty::F32, BinOp::Add, copy(acc), copy(slab.poison));
+    let total = bin(&mut s, Ty::F32, BinOp::Add, copy(acc), copy(poison));
     let value = match epilogue {
-        Some(epilogue) => emit_epilogue(&mut s, epilogue, out_at, &leaves, &lanes, total),
+        Some(GemvEpilogue {
+            epilogue,
+            leaves,
+            lanes,
+        }) => emit_epilogue(&mut s, epilogue, out_at, leaves, lanes, total),
         None => total,
     };
     s.assign(elem(out, out_at), Rvalue::Use(copy(value)));
@@ -607,5 +709,5 @@ fn indexed_tiled(
         len: len as u32,
     };
     body.workgroup_locals = vec![lds(ts * ts), lds(ts * ts)];
-    Ok(body)
+    body
 }

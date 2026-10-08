@@ -26,17 +26,18 @@ use poot_graph_plan::{
 };
 use poot_kernel_ir::Body;
 use poot_quant::SourceRole;
-use poot_quant::weights::{StoreGeneration, WeightStore};
+use poot_quant::weights::{StoreGeneration, WeightMap, WeightStore};
 use poot_target::{Backend, BufferStorage};
 use poot_tensor::DType;
 
 use crate::binder::{self, BoundSlot, EmbedRows, StoredAs, WeightBinder};
-use crate::device::{Arg, BufferRole, Device, DeviceTime, Dispatch};
+use crate::device::{Arg, BufferRole, Device, DeviceTime, Dispatch, WeightUpload};
 use crate::error::{BindError, DeviceError, ExecError, LoadError};
+use crate::shared_kernels::{SharedKernels, SharedKernelsMismatch};
 use crate::timing::TimingOptions;
 use crate::{
     EntryId, ExecutableId, Executor, ExecutorStats, HostSync, OutputSource, StateScope, StepInputs,
-    StepOutputs, WeightSource,
+    StepOutputs,
 };
 
 /// The engine's only device id: one engine drives one device (Card 581a's multi-stage composition
@@ -61,10 +62,17 @@ pub struct Engine<D: Device> {
     /// the first's kernel before ever reaching `kernel_cache`'s own content-keyed lookup below.
     kernel_index: HashMap<u64, usize>,
     kernel_cache: poot_codegen::KernelCache,
+    /// Artifacts shared with the other engines of one planning pass; `None` for an executing engine,
+    /// which keeps no artifact bytes beyond the kernel it loads.
+    shared_kernels: Option<SharedKernels>,
+    /// Kernels this engine resolved through `kernel_cache` ([`ExecutorStats::kernels_resolved`]).
+    kernels_resolved: u64,
     /// Every live weight upload, by what it uploads. Weak: an upload lives exactly as long as some
     /// executable (or a pending release of one) holds it, so a replaced adapter's weights are freed
     /// once nothing references them while a base shared with another executable stays.
     residency: HashMap<Residency, Weak<ResidentWeight<D>>>,
+    /// Bytes read from the weight store for uploads ([`ExecutorStats::weight_bytes_read`]).
+    weight_bytes_read: u64,
     device: D,
     /// Set once `Device::abort` itself fails: no further work can run on this device (core review
     /// CR30). Checked at the top of every `Executor` method that would touch the device.
@@ -273,13 +281,38 @@ impl<D: Device> Engine<D> {
             kernels: Vec::new(),
             kernel_index: HashMap::new(),
             kernel_cache: poot_codegen::KernelCache::open(codegen_target(backend)),
+            shared_kernels: None,
+            kernels_resolved: 0,
             residency: HashMap::new(),
+            weight_bytes_read: 0,
             device,
             poisoned: false,
             timing: snapshot,
             timing_options: timing,
             detail_sample_counter: 0,
         }
+    }
+
+    /// This engine resolves kernels through `kernels`, shared with the other engines built over it: a
+    /// kernel any of them already resolved is reused, not resolved again. For a planning pass, whose
+    /// candidates each own an engine over mostly the same kernels.
+    ///
+    /// # Errors
+    ///
+    /// [`SharedKernelsMismatch`] when `kernels` is bound to another backend than this device's.
+    pub fn with_shared_kernels(
+        mut self,
+        kernels: SharedKernels,
+    ) -> Result<Self, SharedKernelsMismatch> {
+        let engine = self.backend();
+        if kernels.backend() != engine {
+            return Err(SharedKernelsMismatch {
+                table: kernels.backend(),
+                engine,
+            });
+        }
+        self.shared_kernels = Some(kernels);
+        Ok(self)
     }
 
     pub fn device(&self) -> &D {
@@ -325,14 +358,30 @@ impl<D: Device> Engine<D> {
             return Ok(index);
         }
         let backend = self.backend();
-        let artifact = self
-            .kernel_cache
-            .load_or_compile(body, max_artifact_bytes)
-            .map_err(|source| LoadError::Codegen {
-                key: key.to_string(),
-                source,
-            })?;
-        let compiled = poot_codegen::kernel_handle(body, codegen_target(backend), artifact.bytes);
+        let cache = &self.kernel_cache;
+        let resolve = || {
+            cache
+                .load_or_compile(body, max_artifact_bytes)
+                .map(|artifact| artifact.bytes)
+        };
+        let codegen_error = |source| LoadError::Codegen {
+            key: key.to_string(),
+            source,
+        };
+        let bytes = match &self.shared_kernels {
+            Some(shared) => {
+                let (bytes, resolved) = shared
+                    .get_or_resolve(fingerprint, max_artifact_bytes, resolve)
+                    .map_err(codegen_error)?;
+                self.kernels_resolved += u64::from(resolved);
+                bytes.to_vec()
+            }
+            None => {
+                self.kernels_resolved += 1;
+                resolve().map_err(codegen_error)?
+            }
+        };
+        let compiled = poot_codegen::kernel_handle(body, codegen_target(backend), bytes);
         let kernel = self
             .device
             .load_kernel(key, compiled)
@@ -343,7 +392,7 @@ impl<D: Device> Engine<D> {
         Ok(index)
     }
 
-    /// `numel` is a logical tensor element count (never already device-encoded - see
+    /// `shape` is a logical tensor shape (never already device-encoded - see
     /// `allocate_arena_slot` for a caller that already has one). Returns `(buffer, bytes, elems)`:
     /// `elems` is this buffer's native device-element count (Card 547b) - the same quantity
     /// `Device::allocate` itself was called with, handed back so a caller that also needs to publish
@@ -353,10 +402,10 @@ impl<D: Device> Engine<D> {
         &mut self,
         role: BufferRole,
         storage: BufferStorage,
-        numel: usize,
+        shape: &[usize],
     ) -> Result<(D::Buffer, usize, usize), ExecError> {
         let elems = storage
-            .device_elems(numel)
+            .device_elems(shape)
             .ok_or(LoadError::Unimplemented("E4M3/raw-byte device lanes"))?;
         let buffer = self.allocate_arena_slot(role, storage, elems)?;
         Ok((buffer, elems * storage.element().byte_width(), elems))
@@ -406,7 +455,7 @@ impl<D: Device> Engine<D> {
         // function of its declared `TensorType` alone, so this formula must never be applied to one.
         let elems_of = |id: ValueId| -> Result<u32, ExecError> {
             let elems = storage_of(id)
-                .device_elems(g.aval(id).numel())
+                .device_elems(&g.aval(id).shape)
                 .ok_or(LoadError::Unimplemented("E4M3/raw-byte device lanes"))?;
             checked_u32(elems)
         };
@@ -429,8 +478,8 @@ impl<D: Device> Engine<D> {
         }
 
         macro_rules! push_local {
-            ($role:expr, $storage:expr, $numel:expr) => {{
-                let (buffer, _bytes, elems) = self.allocate($role, $storage, $numel)?;
+            ($role:expr, $storage:expr, $shape:expr) => {{
+                let (buffer, _bytes, elems) = self.allocate($role, $storage, $shape)?;
                 locals.push(buffer);
                 (Loc::Local(locals.len() - 1), checked_u32(elems)?)
             }};
@@ -481,7 +530,7 @@ impl<D: Device> Engine<D> {
                                 planned: storage,
                             }
                         })?;
-                    let (loc, elems) = push_local!(BufferRole::Input, storage, meta.aval.numel());
+                    let (loc, elems) = push_local!(BufferRole::Input, storage, &meta.aval.shape);
                     self.device
                         .write(resolve::<D>(loc, &locals, &arena, &[], &[]), &encoded)
                         .map_err(device_error(backend))?;
@@ -496,7 +545,7 @@ impl<D: Device> Engine<D> {
                         .loaded(exe)?
                         .binder
                         .embed_rows(id, name, &meta.aval, storage)?;
-                    let (loc, elems) = push_local!(BufferRole::Input, storage, meta.aval.numel());
+                    let (loc, elems) = push_local!(BufferRole::Input, storage, &meta.aval.shape);
                     let Loc::Local(buffer) = loc else {
                         unreachable!("push_local! always returns Loc::Local")
                     };
@@ -513,7 +562,7 @@ impl<D: Device> Engine<D> {
                         .slot_key()
                         .cloned()
                         .ok_or(LoadError::UnkeyedSlot { value: id })?;
-                    let (loc, elems) = push_local!(BufferRole::Input, storage, meta.aval.numel());
+                    let (loc, elems) = push_local!(BufferRole::Input, storage, &meta.aval.shape);
                     let Loc::Local(buffer) = loc else {
                         unreachable!("push_local! always returns Loc::Local")
                     };
@@ -626,7 +675,7 @@ impl<D: Device> Engine<D> {
             let (buf, _bytes, _elems) = self.allocate(
                 BufferRole::Output,
                 storage_of(g.output),
-                g.aval(g.output).numel(),
+                &g.aval(g.output).shape,
             )?;
             locals.push(buf);
             Some(Loc::Local(locals.len() - 1))
@@ -634,7 +683,7 @@ impl<D: Device> Engine<D> {
             None
         };
         let output_bytes = storage_of(g.output)
-            .device_elems(g.aval(g.output).numel())
+            .device_elems(&g.aval(g.output).shape)
             .ok_or(LoadError::Unimplemented("E4M3/raw-byte device lanes"))?
             * storage_of(g.output).element().byte_width();
         let output_host =
@@ -719,7 +768,7 @@ impl<D: Device> Engine<D> {
             }
             return Ok((index, existing.elems));
         }
-        let (buffer, bytes, elems) = self.allocate(BufferRole::State, storage, aval.numel())?;
+        let (buffer, bytes, elems) = self.allocate(BufferRole::State, storage, &aval.shape)?;
         let elems = checked_u32(elems)?;
         let state = &mut self.loaded(exe)?.state;
         state.push(StateBuffer {
@@ -731,6 +780,46 @@ impl<D: Device> Engine<D> {
             buffer,
         });
         Ok((state.len() - 1, elems))
+    }
+
+    /// The bytes of one weight upload as its planned lane holds them: read from the store and encoded.
+    fn encode_weight(
+        &mut self,
+        exe: ExecutableId,
+        bytes: &binder::ConstBytes,
+        name: &str,
+        aval: &TensorType,
+        storage: BufferStorage,
+    ) -> Result<Vec<u8>, ExecError> {
+        let stored = self.loaded(exe)?.binder.read(bytes);
+        self.weight_bytes_read += stored.len() as u64;
+        match bytes.stored {
+            StoredAs::PackedSource | StoredAs::PackedStackSource { .. } => {
+                Ok(poot_quant::packed_source_words(&stored)
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect())
+            }
+            StoredAs::Dense(dtype) => {
+                crate::lanes::encode_stored(dtype, &aval.shape, &stored, storage).map_err(|error| {
+                    match error {
+                        crate::lanes::EncodeError::NoEncoding => LoadError::WeightFormat {
+                            name: name.to_string(),
+                            stored: format!("{dtype:?}"),
+                            planned: storage,
+                        },
+                        crate::lanes::EncodeError::NonFiniteF16 { index, bits } => {
+                            LoadError::NonFiniteF16Weight {
+                                name: name.to_string(),
+                                index,
+                                bits,
+                            }
+                        }
+                    }
+                    .into()
+                })
+            }
+        }
     }
 
     /// The executable's resident buffer for const `name` (input `value`, declared `aval`) in
@@ -769,70 +858,69 @@ impl<D: Device> Engine<D> {
             loaded.weights.push(resident);
             return Ok((loaded.weights.len() - 1, elems));
         }
-        let stored = self.loaded(exe)?.binder.read(&bytes.spans);
-        let encoded = match bytes.stored {
-            // A generated kernel's packed-source argument always reads `u32` words (Card 642,
-            // dquant.md D9), regardless of this value's declared I8/RawBytes logical dtype:
-            // `poot_quant::packed_source_words` is the one definition every executor's packed-source
-            // const upload calls (card 546a review: no second copy of this byte layout).
-            StoredAs::PackedSource => poot_quant::packed_source_words(&stored)
-                .into_iter()
-                .flat_map(u32::to_le_bytes)
-                .collect(),
-            StoredAs::Dense(dtype) => {
-                // The plan never retypes a const, so any stored/declared difference is the tracer's and
-                // is refused.
-                if dtype != aval.dtype {
-                    return Err(LoadError::WeightDtype {
-                        name: name.to_string(),
-                        stored: dtype,
-                        declared: aval.dtype,
-                    }
-                    .into());
+        let packed = matches!(
+            bytes.stored,
+            StoredAs::PackedSource | StoredAs::PackedStackSource { .. }
+        );
+        if let StoredAs::Dense(dtype) = bytes.stored {
+            // The plan never retypes a const, so any stored/declared difference is the tracer's and
+            // is refused.
+            if dtype != aval.dtype {
+                return Err(LoadError::WeightDtype {
+                    name: name.to_string(),
+                    stored: dtype,
+                    declared: aval.dtype,
                 }
-                crate::lanes::encode_stored(dtype, &stored, storage).map_err(
-                    |error| match error {
-                        crate::lanes::EncodeError::NoEncoding => LoadError::WeightFormat {
-                            name: name.to_string(),
-                            stored: format!("{dtype:?}"),
-                            planned: storage,
-                        },
-                        crate::lanes::EncodeError::NonFiniteF16 { index, bits } => {
-                            LoadError::NonFiniteF16Weight {
-                                name: name.to_string(),
-                                index,
-                                bits,
-                            }
-                        }
-                    },
-                )?
+                .into());
             }
+            if crate::lanes::encoding_of(dtype, storage).is_none() {
+                return Err(LoadError::WeightFormat {
+                    name: name.to_string(),
+                    stored: format!("{dtype:?}"),
+                    planned: storage,
+                }
+                .into());
+            }
+        }
+        // A generated kernel's packed-source argument always reads `u32` words (Card 642, dquant.md D9),
+        // regardless of this value's declared I8/RawBytes logical dtype, padded by one zero word
+        // (`poot_quant::packed_source_words`, the one definition of this layout).
+        let packed_words = bytes.stored_len().div_ceil(4) + 1;
+        let upload = match self.device.weight_upload() {
+            WeightUpload::Bytes => Some(self.encode_weight(exe, &bytes, name, aval, storage)?),
+            WeightUpload::SizeOnly => None,
         };
         let backend = self.backend();
-        let (buffer, elems) = if bytes.stored == StoredAs::PackedSource {
+        let (buffer, elems) = if packed {
             // A packed source's device buffer is always `u32` words (Card 642), never this value's
             // declared I8/RawBytes logical storage (`BufferStorage::device_elems` explicitly
             // refuses that lane): bypass `self.allocate`'s value-lane gate exactly as `meta_buffer`
-            // does, sized and typed by `encoded`'s own words rather than `storage`/`aval.numel()`.
-            debug_assert_eq!(
-                encoded.len() % 4,
-                0,
-                "packed_source_words pads to whole u32 words"
-            );
-            let elems = encoded.len() / 4;
+            // does, sized and typed by the packed word count rather than `storage`/`aval.numel()`.
+            if let Some(encoded) = &upload
+                && encoded.len() != packed_words * 4
+            {
+                return Err(LoadError::WeightSizing {
+                    name: name.to_string(),
+                    sized_words: packed_words,
+                    encoded_words: encoded.len().div_ceil(4),
+                }
+                .into());
+            }
             let buffer = self
                 .device
-                .allocate(BufferRole::Weight, BufferStorage::i32(), elems.max(1))
+                .allocate(BufferRole::Weight, BufferStorage::i32(), packed_words)
                 .map_err(device_error(backend))?;
-            (buffer, checked_u32(elems)?)
+            (buffer, checked_u32(packed_words)?)
         } else {
             let (buffer, _bytes, elems) =
-                self.allocate(BufferRole::Weight, storage, aval.numel())?;
+                self.allocate(BufferRole::Weight, storage, &aval.shape)?;
             (buffer, checked_u32(elems)?)
         };
-        self.device
-            .write(&buffer, &encoded)
-            .map_err(device_error(backend))?;
+        if let Some(encoded) = upload {
+            self.device
+                .write(&buffer, &encoded)
+                .map_err(device_error(backend))?;
+        }
         let resident = Arc::new(ResidentWeight { buffer, elems });
         self.residency.insert(key, Arc::downgrade(&resident));
         let loaded = self.loaded(exe)?;
@@ -1300,10 +1388,14 @@ impl<D: Device> Executor for Engine<D> {
         TargetSet::single(DEVICE, self.device.target())
     }
 
+    fn free_memory_bytes(&self) -> Option<u64> {
+        self.device.free_memory_bytes()
+    }
+
     fn load_weights(
         &mut self,
         store: Arc<WeightStore>,
-        weights: WeightSource,
+        weights: Arc<WeightMap>,
     ) -> Result<ExecutableId, ExecError> {
         self.check_not_poisoned()?;
         self.executables.push(Some(Loaded {
@@ -1524,6 +1616,8 @@ impl<D: Device> Executor for Engine<D> {
             recordings,
             replays,
             memory: self.device.memory(),
+            weight_bytes_read: self.weight_bytes_read,
+            kernels_resolved: self.kernels_resolved,
             timing: self.timing.clone(),
         }
     }
@@ -1553,6 +1647,7 @@ impl<D: Device> Executor for Engine<D> {
 mod kernel_identity_tests {
     use super::*;
     use crate::device::DeviceTime;
+    use poot_codegen::ArtifactTooLarge;
 
     struct NoopDevice;
 
@@ -1695,6 +1790,70 @@ mod kernel_identity_tests {
             "the same body content must still hit the cache"
         );
     }
+
+    /// POOT-1068: a table bound to another backend than the engine's is refused, not shared.
+    /// Mutation: drop the backend comparison in `with_shared_kernels`; the engine accepts it and this row
+    /// goes red.
+    #[test]
+    fn a_shared_table_bound_to_another_backend_is_refused() {
+        let engine = Engine::new(NoopDevice);
+        let table = SharedKernels::new(Backend::Nvptx);
+        let Err(mismatch) = engine.with_shared_kernels(table) else {
+            panic!("a table for another backend must be refused");
+        };
+        assert_eq!(
+            mismatch,
+            SharedKernelsMismatch {
+                table: Backend::Nvptx,
+                engine: Backend::SpirvVulkan,
+            }
+        );
+    }
+
+    /// POOT-1068: the artifact limit holds on a hit of the shared table too: an artifact one engine
+    /// resolved under a generous limit is refused to an engine whose program allows less, exactly as a
+    /// kernel-cache hit would be. Mutation: skip the length check on a hit in `get_or_resolve`; the second
+    /// engine loads the oversize artifact and this row goes red.
+    #[test]
+    fn a_shared_hit_is_checked_against_the_callers_artifact_limit() {
+        let body = poot_test_util::kernel_fixtures::reduce_last(
+            "limit",
+            poot_kernel_ir::BinOp::Add,
+            4,
+            0.0,
+        );
+        let table = SharedKernels::new(Backend::SpirvVulkan);
+        let mut first = Engine::new(NoopDevice)
+            .with_shared_kernels(table.clone())
+            .unwrap();
+        first
+            .kernel(
+                "limit",
+                &body,
+                poot_graph_plan::CompileLimits::STANDARD.max_artifact_bytes,
+            )
+            .unwrap();
+        assert_eq!(first.kernels_resolved, 1);
+        let mut second = Engine::new(NoopDevice).with_shared_kernels(table).unwrap();
+        let tiny = NonZeroU64::new(1).unwrap();
+        let ExecError::Load(load) = second.kernel("limit", &body, tiny).unwrap_err() else {
+            panic!("expected a load error");
+        };
+        assert!(
+            matches!(
+                *load,
+                LoadError::Codegen {
+                    source: poot_codegen::CompileError::ArtifactTooLarge(ArtifactTooLarge {
+                        limit: 1,
+                        ..
+                    }),
+                    ..
+                }
+            ),
+            "{load:?}"
+        );
+        assert_eq!(second.kernels_resolved, 0, "the hit resolved nothing");
+    }
 }
 
 #[cfg(test)]
@@ -1808,13 +1967,19 @@ mod f16_packed_weight_upload_tests {
         CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, TargetSet,
         compile_staged,
     };
-    use poot_quant::weights::{DenseWeight, WeightEntry};
+    use poot_quant::weights::{
+        AttnRole, DenseWeight, FfnRole, WeightEntry, WeightId, WeightMap, WeightRole, WeightView,
+    };
+
+    const PROJECTION_INPUT: WeightId = WeightId::layer(0, WeightRole::Attn(AttnRole::Q));
+    const PROJECTION_WEIGHT: WeightId = WeightId::layer(0, WeightRole::Ffn(FfnRole::Gate));
 
     /// Records every allocation (role, storage, native elements) and every write, by buffer index.
     #[derive(Default)]
     struct UploadRecorder {
         allocations: Vec<(BufferRole, BufferStorage, usize)>,
         writes: Vec<(usize, Vec<u8>)>,
+        upload: WeightUpload,
     }
 
     impl Device for UploadRecorder {
@@ -1822,6 +1987,10 @@ mod f16_packed_weight_upload_tests {
         type Kernel = ();
         type Recording = ();
         type Error = std::convert::Infallible;
+
+        fn weight_upload(&self) -> WeightUpload {
+            self.upload
+        }
 
         fn target(&self) -> poot_graph_plan::Target {
             poot_graph_plan::Target {
@@ -1902,10 +2071,37 @@ mod f16_packed_weight_upload_tests {
         declared: DType,
     ) -> Result<EntryId, ExecError> {
         let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![4, K]));
-        let w = b.constant("w", TensorType::new(vec![N, K], declared));
+        let x = b.constant(&PROJECTION_INPUT.const_name(), TensorType::f32(vec![4, K]));
+        let w = b.constant(
+            &PROJECTION_WEIGHT.const_name(),
+            TensorType::new(vec![N, K], declared),
+        );
         let out = b.matmul(x, b.transpose(w, vec![1, 0]));
         let g = b.finish(out).with_validations(Vec::new());
+        let x_bytes: Vec<u8> = (0..4 * K).flat_map(|i| (i as f32).to_le_bytes()).collect();
+        let w_bytes: Vec<u8> = w_bits.iter().flat_map(|b| b.to_le_bytes()).collect();
+        let mut store = WeightStore::builder();
+        for (id, dtype, shape, bytes) in [
+            (PROJECTION_INPUT, DType::F32, vec![4, K], x_bytes),
+            (PROJECTION_WEIGHT, stored, vec![N, K], w_bytes),
+        ] {
+            store
+                .insert(
+                    id.const_name(),
+                    WeightEntry::Dense(
+                        DenseWeight::try_new(dtype, shape, Arc::from(bytes)).unwrap(),
+                    ),
+                )
+                .unwrap();
+        }
+        let store = Arc::new(store.build());
+        let mut weights = WeightMap::builder(&store);
+        for id in [PROJECTION_INPUT, PROJECTION_WEIGHT] {
+            weights
+                .map(id, WeightView::Stored(id.const_name().into()))
+                .unwrap();
+        }
+        let weights = weights.build();
         let program = compile_staged(
             &g,
             &TargetSet::single(DeviceId(0), engine.device().target()),
@@ -1913,29 +2109,10 @@ mod f16_packed_weight_upload_tests {
                 experts: ExpertPlacement::AllResident,
                 devices: DevicePlacement::Single(DeviceId(0)),
             },
-            &CompileOptions {
-                execution: Submission::Replay,
-                limits: poot_graph_plan::CompileLimits::STANDARD,
-            },
+            &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
         )
         .expect("the projection compiles");
-        let x_bytes: Vec<u8> = (0..4 * K).flat_map(|i| (i as f32).to_le_bytes()).collect();
-        let w_bytes: Vec<u8> = w_bits.iter().flat_map(|b| b.to_le_bytes()).collect();
-        let mut store = WeightStore::builder();
-        for (name, dtype, shape, bytes) in [
-            ("x", DType::F32, vec![4, K], x_bytes),
-            ("w", stored, vec![N, K], w_bytes),
-        ] {
-            store
-                .insert(
-                    name,
-                    WeightEntry::Dense(
-                        DenseWeight::try_new(dtype, shape, Arc::from(bytes)).unwrap(),
-                    ),
-                )
-                .unwrap();
-        }
-        let exe = engine.load_weights(Arc::new(store.build()), crate::WeightSource::ConstNames)?;
+        let exe = engine.load_weights(Arc::clone(&store), Arc::new(weights))?;
         engine.add_entry(exe, &program)
     }
 
@@ -2011,7 +2188,10 @@ mod f16_packed_weight_upload_tests {
         match add_projection(&mut engine, &bits) {
             Err(ExecError::Load(error)) => match *error {
                 LoadError::NonFiniteF16Weight { name, index, bits } => {
-                    assert_eq!((name.as_str(), index, bits), ("w", 5, 0xfc00));
+                    assert_eq!(
+                        (name.as_str(), index, bits),
+                        (PROJECTION_WEIGHT.const_name().as_str(), 5, 0xfc00)
+                    );
                 }
                 other => panic!("expected NonFiniteF16Weight, got {other}"),
             },
@@ -2037,7 +2217,11 @@ mod f16_packed_weight_upload_tests {
                     declared,
                 } => assert_eq!(
                     (name.as_str(), stored, declared),
-                    ("w", DType::F16, DType::F32)
+                    (
+                        PROJECTION_WEIGHT.const_name().as_str(),
+                        DType::F16,
+                        DType::F32
+                    )
                 ),
                 other => panic!("expected WeightDtype, got {other}"),
             },
@@ -2054,6 +2238,44 @@ mod f16_packed_weight_upload_tests {
                     && elems == N * K),
             "no f32 weight buffer was allocated for the refused weight"
         );
+    }
+
+    /// POOT-1066: a size-only (planning) device refuses a stored/declared dtype mismatch exactly as the
+    /// byte-taking one does, so a planning pass cannot admit a graph the real upload would refuse, and it
+    /// reads none of the store. A packed-F16 weight is sized to the words the byte-taking upload allocates.
+    ///
+    /// Mutation: skip the dtype check when the device only sizes; the refused weight loads and this row goes
+    /// red.
+    #[test]
+    fn a_size_only_device_refuses_a_dtype_mismatch_and_sizes_a_packed_weight_like_the_byte_taking_one()
+     {
+        let sized = || {
+            Engine::new(UploadRecorder {
+                upload: WeightUpload::SizeOnly,
+                ..UploadRecorder::default()
+            })
+        };
+        let mut engine = sized();
+        match add_projection_declared(&mut engine, &finite_bits(), DType::F16, DType::F32) {
+            Err(ExecError::Load(error)) => assert!(
+                matches!(*error, LoadError::WeightDtype { .. }),
+                "expected WeightDtype, got {error}"
+            ),
+            Err(other) => panic!("expected WeightDtype, got {other}"),
+            Ok(_) => panic!("a size-only upload admitted an F16-stored weight declared F32"),
+        }
+        assert_eq!(engine.stats().weight_bytes_read, 0);
+
+        let mut sized_engine = sized();
+        add_projection(&mut sized_engine, &finite_bits()).expect("the size-only entry loads");
+        let mut bytes_engine = Engine::new(UploadRecorder::default());
+        add_projection(&mut bytes_engine, &finite_bits()).expect("the entry loads");
+        assert_eq!(
+            sized_engine.device.allocations,
+            bytes_engine.device.allocations
+        );
+        assert_eq!(sized_engine.stats().weight_bytes_read, 0);
+        assert!(bytes_engine.stats().weight_bytes_read > 0);
     }
 
     /// Card 1011: the plan never retypes a BF16 const, so a BF16-stored weight declared F32 is a refusal like
@@ -2074,7 +2296,11 @@ mod f16_packed_weight_upload_tests {
                     declared,
                 } => assert_eq!(
                     (name.as_str(), stored, declared),
-                    ("w", DType::BF16, DType::F32)
+                    (
+                        PROJECTION_WEIGHT.const_name().as_str(),
+                        DType::BF16,
+                        DType::F32
+                    )
                 ),
                 other => panic!("expected WeightDtype, got {other}"),
             },
@@ -2094,7 +2320,7 @@ mod f16_packed_weight_upload_tests {
     }
 }
 
-/// Card 564: weight binding through the executable's `WeightSource` - the map's views to stored byte
+/// Card 564: weight binding through the executable's weight map - the map's views to stored byte
 /// runs, the typed unbound refusal, residency by what uploads, and the hosted embed fill - driven
 /// through the production `load_weights`/`add_entry`/`step` path on a recording device.
 #[cfg(test)]
@@ -2113,6 +2339,7 @@ mod weight_source_tests {
     };
     use poot_quant::{PackedPayload, SourceRole};
     use poot_runtime_common::MemoryCounters;
+    use poot_test_util::const_weights::ConstWeights;
     use std::ops::Range;
 
     /// Records every allocation (role, storage, native elements) and every write by buffer index,
@@ -2124,6 +2351,7 @@ mod weight_source_tests {
         writes: Vec<(usize, Vec<u8>)>,
         memory: MemoryCounters,
         cap: Option<u64>,
+        upload: WeightUpload,
     }
 
     impl Device for Recorder {
@@ -2131,6 +2359,10 @@ mod weight_source_tests {
         type Kernel = ();
         type Recording = ();
         type Error = std::convert::Infallible;
+
+        fn weight_upload(&self) -> WeightUpload {
+            self.upload
+        }
 
         fn target(&self) -> poot_graph_plan::Target {
             let mut caps = poot_target::DeviceCaps::wgpu_rdna3_igpu();
@@ -2240,10 +2472,7 @@ mod weight_source_tests {
                 experts: ExpertPlacement::AllResident,
                 devices: DevicePlacement::Single(DeviceId(0)),
             },
-            &CompileOptions {
-                execution: Submission::Replay,
-                limits: poot_graph_plan::CompileLimits::STANDARD,
-            },
+            &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
         )
         .expect("the fixture compiles")
     }
@@ -2275,6 +2504,53 @@ mod weight_source_tests {
             .collect()
     }
 
+    /// Load `g` over `weights` twice, once taking the bytes and once only sizing them, and require the
+    /// size-only engine to allocate exactly what the byte-taking one does while reading none of the store.
+    /// Mutation: have the engine read the store in `WeightUpload::SizeOnly`; the read counter goes red.
+    fn assert_size_only_matches_bytes(
+        weights: &Arc<WeightStore>,
+        mapped: &Arc<WeightMap>,
+        g: &Graph,
+    ) {
+        let load = |upload| {
+            let mut engine = Engine::new(Recorder {
+                upload,
+                ..Recorder::default()
+            });
+            let program = compile(&engine, g);
+            let exe = engine
+                .load_weights(Arc::clone(weights), Arc::clone(mapped))
+                .unwrap();
+            engine.add_entry(exe, &program).unwrap();
+            engine
+        };
+        let bytes = load(WeightUpload::Bytes);
+        let sized = load(WeightUpload::SizeOnly);
+        assert_eq!(
+            sized.device().allocations,
+            bytes.device().allocations,
+            "size-only allocates what the byte-taking upload allocates"
+        );
+        let held = |engine: &Engine<Recorder>| {
+            engine
+                .stats()
+                .memory
+                .iter()
+                .map(|(role, s)| (*role, s.live_bytes))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(held(&sized), held(&bytes));
+        assert!(
+            bytes.stats().weight_bytes_read > 0,
+            "the byte-taking upload reads the store"
+        );
+        assert_eq!(
+            sized.stats().weight_bytes_read,
+            0,
+            "size-only reads none of the store"
+        );
+    }
+
     fn unbound(result: Result<EntryId, ExecError>) -> (ValueId, String) {
         match result {
             Err(ExecError::Load(error)) => match *error {
@@ -2289,19 +2565,20 @@ mod weight_source_tests {
     /// SC-002: a graph const with no store entry and no step value is a typed refusal naming the
     /// value and the const, before any step runs.
     ///
-    /// Mutation: in `WeightBinder::entry`, answer a missing key with a zero-filled dense entry of
-    /// the declared shape; the entry loads and this row goes red.
+    /// Mutation: in `WeightBinder::locate`, answer a name no id spells with the first mapped id; the
+    /// entry loads and this row goes red.
     #[test]
     fn a_const_with_no_store_entry_and_no_step_value_is_unbound() {
         let mut engine = Engine::new(Recorder::default());
-        let (g, missing) = sum_of("a", "b");
+        let a = id(Q).const_name();
+        let (g, missing) = sum_of(&a, "b");
         let program = compile(&engine, &g);
-        let exe = engine
-            .load_weights(
-                store(vec![("a", f32_entry(vec![N, K], 1))]),
-                WeightSource::ConstNames,
-            )
-            .unwrap();
+        let weights = store(vec![(a.as_str(), f32_entry(vec![N, K], 1))]);
+        let mapped = map(
+            &weights,
+            vec![(id(Q), WeightView::Stored(a.as_str().into()))],
+        );
+        let exe = engine.load_weights(weights, mapped).unwrap();
         assert_eq!(
             unbound(engine.add_entry(exe, &program)),
             (missing, "b".to_string())
@@ -2309,10 +2586,11 @@ mod weight_source_tests {
     }
 
     /// SC-003: under `Map`, a const whose name equals a store key but which the map does not name is
-    /// `Unbound`; the same graph and store bind under `ConstNames`, so the store key is there.
+    /// `Unbound`; a map that does name it binds the same graph over the same store, so the store key
+    /// is there.
     ///
-    /// Mutation: in `WeightBinder::locate`'s `Rule::Map` arm, fall back to the name-equality lookup
-    /// when the map has no id for the name; the const binds and this row goes red.
+    /// Mutation: in `WeightBinder::locate`, fall back to a store lookup by the const's name when the
+    /// map has no id for it; the const binds and this row goes red.
     #[test]
     fn a_map_const_that_is_only_a_store_key_is_unbound() {
         let q = id(Q).const_name();
@@ -2328,20 +2606,24 @@ mod weight_source_tests {
 
         let mut engine = Engine::new(Recorder::default());
         let program = compile(&engine, &g);
-        let exe = engine
-            .load_weights(Arc::clone(&weights), WeightSource::Map(mapped))
-            .unwrap();
+        let exe = engine.load_weights(Arc::clone(&weights), mapped).unwrap();
         assert_eq!(
             unbound(engine.add_entry(exe, &program)),
             (embed, "w.embed".to_string())
         );
 
-        let names = engine
-            .load_weights(weights, WeightSource::ConstNames)
-            .unwrap();
+        let embed_id = WeightId::model(WeightRole::Embed);
+        let both = map(
+            &weights,
+            vec![
+                (id(Q), WeightView::Stored(q.as_str().into())),
+                (embed_id, WeightView::Stored("w.embed".into())),
+            ],
+        );
+        let named = engine.load_weights(weights, both).unwrap();
         engine
-            .add_entry(names, &program)
-            .expect("by name the store key binds");
+            .add_entry(named, &program)
+            .expect("once the map names it the store key binds");
     }
 
     /// SC-005 (S62-9 at the map level): one stored entry viewed by two ids (a head tied to the
@@ -2365,9 +2647,7 @@ mod weight_source_tests {
         );
         let mut engine = Engine::new(Recorder::default());
         let program = compile(&engine, &g);
-        let exe = engine
-            .load_weights(tied_store, WeightSource::Map(tied))
-            .unwrap();
+        let exe = engine.load_weights(tied_store, tied).unwrap();
         engine.add_entry(exe, &program).unwrap();
         assert_eq!(weight_allocations(&engine), 1, "a tied head uploads once");
 
@@ -2383,9 +2663,7 @@ mod weight_source_tests {
             ],
         );
         let mut engine = Engine::new(Recorder::default());
-        let exe = engine
-            .load_weights(untied_store, WeightSource::Map(untied))
-            .unwrap();
+        let exe = engine.load_weights(untied_store, untied).unwrap();
         engine.add_entry(exe, &program).unwrap();
         assert_eq!(weight_allocations(&engine), 2, "two entries upload twice");
     }
@@ -2449,7 +2727,7 @@ mod weight_source_tests {
         let mut engine = Engine::new(Recorder::default());
         let program = compile(&engine, &g);
         let exe = engine
-            .load_weights(weights, WeightSource::Map(mapped))
+            .load_weights(Arc::clone(&weights), Arc::clone(&mapped))
             .unwrap();
         engine.add_entry(exe, &program).unwrap();
         let writes = written(&engine);
@@ -2465,6 +2743,54 @@ mod weight_source_tests {
             );
         }
         assert_eq!(weight_allocations(&engine), 4);
+        assert_size_only_matches_bytes(&weights, &mapped, &g);
+    }
+
+    /// An I64 index table viewed by `IndexNarrow` uploads its words as I32, narrowed from the
+    /// stored I64 bytes (negative words included) and range-checked when the map was built.
+    ///
+    /// Mutation: in `WeightBinder::read`, copy a narrowed span's stored bytes unchanged; the upload
+    /// holds the eight-byte words, the declared I32 const is read at the wrong size and this row
+    /// goes red.
+    #[test]
+    fn an_i64_index_table_view_uploads_its_words_as_i32() {
+        let words = [3i64, -1, 7, i64::from(i32::MAX)];
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let weights = store(vec![(
+            "tid2eid",
+            WeightEntry::Dense(
+                DenseWeight::try_new(DType::I64, vec![2, 2], Arc::from(bytes)).unwrap(),
+            ),
+        )]);
+        let table = WeightId::layer(0, WeightRole::Moe(poot_quant::weights::MoeRole::HashTable));
+        let mapped = map(
+            &weights,
+            vec![(table, WeightView::IndexNarrow("tid2eid".into()))],
+        );
+        let b = Builder::new();
+        let tokens = b.slot(Slot::Token, TensorType::new(vec![1], DType::I32));
+        let rows = b.gather(
+            b.constant(&table.const_name(), TensorType::new(vec![2, 2], DType::I32)),
+            0,
+            tokens,
+        );
+        let out = b.cast(rows, DType::F32);
+        let g = b.finish(out);
+        let mut engine = Engine::new(Recorder::default());
+        let program = compile(&engine, &g);
+        let exe = engine
+            .load_weights(Arc::clone(&weights), Arc::clone(&mapped))
+            .unwrap();
+        engine.add_entry(exe, &program).unwrap();
+        let narrowed: Vec<u8> = words
+            .iter()
+            .flat_map(|&w| (w as i32).to_le_bytes())
+            .collect();
+        assert!(
+            written(&engine).iter().any(|bytes| *bytes == narrowed),
+            "no upload holds the table as its narrowed I32 words"
+        );
+        assert_size_only_matches_bytes(&weights, &mapped, &g);
     }
 
     /// The packed half of the row-view bytes: a fused Q8_0 `[3N, K]` payload viewed as Q/K/V by
@@ -2526,9 +2852,19 @@ mod weight_source_tests {
         let mut engine = Engine::new(Recorder::default());
         let program = compile(&engine, &g);
         let exe = engine
-            .load_weights(weights, WeightSource::Map(mapped))
+            .load_weights(Arc::clone(&weights), Arc::clone(&mapped))
             .unwrap();
         engine.add_entry(exe, &program).unwrap();
+        // Golden, recorded from the per-candidate full-load path at 79bbd35479: Q, K, V and the stacked gate
+        // are four Q8_0 sources of four 34-byte block rows, 136 bytes = 34 words + 1 pad word each.
+        let weight_elems: Vec<usize> = engine
+            .device()
+            .allocations
+            .iter()
+            .filter(|a| a.0 == BufferRole::Weight)
+            .map(|a| a.2)
+            .collect();
+        assert_eq!(weight_elems, [35, 35, 35, 35]);
         let writes = written(&engine);
         for (label, want) in [
             ("q", rows(0..N)),
@@ -2541,6 +2877,7 @@ mod weight_source_tests {
                 "{label}: no upload holds its stored block rows"
             );
         }
+        assert_size_only_matches_bytes(&weights, &mapped, &g);
     }
 
     /// An engine whose target's buffer cap is one byte below a `[rows, K]` F32 table, and an embed
@@ -2628,9 +2965,7 @@ mod weight_source_tests {
                 )],
             );
             let (mut engine, program) = hosted_embed(6, ids.len());
-            let exe = engine
-                .load_weights(weights, WeightSource::Map(mapped))
-                .unwrap();
+            let exe = engine.load_weights(weights, mapped).unwrap();
             let entry = engine.add_entry(exe, &program).unwrap();
             step_tokens(&mut engine, exe, entry, &ids);
             assert!(
@@ -2668,9 +3003,7 @@ mod weight_source_tests {
         let w = b.constant(&head.const_name(), TensorType::f32(vec![ROWS, K]));
         let out = b.matmul(x, b.transpose(w, vec![1, 0]));
         let program = compile(&engine, &b.finish(out));
-        let exe = engine
-            .load_weights(Arc::clone(&weights), WeightSource::Map(mapped))
-            .unwrap();
+        let exe = engine.load_weights(Arc::clone(&weights), mapped).unwrap();
         engine.add_entry(exe, &program).unwrap();
 
         let WeightEntry::Dense(parent) = weights.get("head").unwrap() else {
@@ -2731,9 +3064,14 @@ mod weight_source_tests {
     fn a_token_outside_the_embed_table_is_refused() {
         let weights = store(vec![("w.embed", f32_entry(vec![6, K], 1))]);
         let (mut engine, program) = hosted_embed(6, 2);
-        let exe = engine
-            .load_weights(weights, WeightSource::ConstNames)
-            .unwrap();
+        let embed = map(
+            &weights,
+            vec![(
+                WeightId::model(WeightRole::Embed),
+                WeightView::Stored("w.embed".into()),
+            )],
+        );
+        let exe = engine.load_weights(weights, embed).unwrap();
         let entry = engine.add_entry(exe, &program).unwrap();
         let bytes: Vec<u8> = [1i32, 6].iter().flat_map(|t| t.to_le_bytes()).collect();
         let mut inputs = StepInputs::new();
@@ -2878,10 +3216,7 @@ mod weight_source_tests {
                 experts: ExpertPlacement::AllResident,
                 devices: DevicePlacement::Single(DeviceId(0)),
             },
-            &CompileOptions {
-                execution: Submission::Replay,
-                limits: poot_graph_plan::CompileLimits::STANDARD,
-            },
+            &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
         )
         .expect("the fixture compiles")
     }
@@ -2922,10 +3257,11 @@ mod weight_source_tests {
         engine: &mut Engine<Resident>,
         store: Arc<WeightStore>,
     ) -> (ExecutableId, EntryId, EntryId) {
-        let lora = compile_resident(engine, &identity_of("lora"));
-        let base = compile_resident(engine, &identity_of("base"));
+        let mut names = ConstWeights::new(&store);
+        let lora = compile_resident(engine, &names.graph(&identity_of("lora")));
+        let base = compile_resident(engine, &names.graph(&identity_of("base")));
         let exe = engine
-            .load_weights(store, WeightSource::ConstNames)
+            .load_weights(Arc::clone(&store), Arc::new(names.map()))
             .unwrap();
         let lora = engine.add_entry(exe, &lora).unwrap();
         let base = engine.add_entry(exe, &base).unwrap();
@@ -3061,7 +3397,7 @@ mod weight_source_tests {
         let mut engine = Engine::new(Resident::default());
         let bind = |engine: &mut Engine<Resident>| {
             let exe = engine
-                .load_weights(Arc::clone(&weights), WeightSource::Map(Arc::clone(&mapped)))
+                .load_weights(Arc::clone(&weights), Arc::clone(&mapped))
                 .unwrap();
             let entries: Vec<EntryId> = [Q, KR]
                 .into_iter()

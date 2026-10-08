@@ -68,9 +68,8 @@ pub enum LoadError {
         program: Box<Target>,
         device: Box<Target>,
     },
-    /// A graph const its executable's `WeightSource` binds no weight to: under `Map`, a name that is
-    /// no mapped `WeightId::const_name` (even when a store key equals it); under `ConstNames`, a
-    /// name no store entry has.
+    /// A graph const its executable's weight map binds no weight to: a name that is no mapped
+    /// `WeightId::const_name` (even when a store key equals it).
     #[error("const v{value} ({name}) is bound to no weight")]
     Unbound { value: ValueId, name: String },
     #[error("const v{value} has no name to bind by")]
@@ -92,6 +91,17 @@ pub enum LoadError {
         name: String,
         index: usize,
         bits: u16,
+    },
+    /// POOT-1066: a packed weight's encoded upload is not the word count the planned sizing computed from its
+    /// stored length. The buffer was sized by one and would be written with the other, so the upload is
+    /// refused rather than overrun.
+    #[error(
+        "weight {name}: sized {sized_words} words from its stored length but encoded {encoded_words}"
+    )]
+    WeightSizing {
+        name: String,
+        sized_words: usize,
+        encoded_words: usize,
     },
     /// Card 1008: a tracer declares the dtype its loader stores; a stored and declared dtype that differ are
     /// refused at load, never converted on upload.

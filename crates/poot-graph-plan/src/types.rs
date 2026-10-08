@@ -32,17 +32,6 @@ pub enum PlanError {
     /// A programmer error, detected so storage is never selected from unrelated value IDs.
     #[error("exact-I32 analysis context mismatch: {0}")]
     AnalysisContextMismatch(String),
-    /// A Gather whose data and output disagree on exact I32 storage. One kernel cannot read f32-lane data
-    /// and write exact I32 words (or the reverse), so the planner rejects it.
-    #[error(
-        "Gather v{gather} data v{data} exact I32 storage is {data_exact}, but its output requires {output_exact}"
-    )]
-    ExactI32GatherStorage {
-        gather: ValueId,
-        data: ValueId,
-        data_exact: bool,
-        output_exact: bool,
-    },
     /// An I32 value whose planned readers disagree on its lane: one kernel reads it through `Slice<i32>`
     /// (exact words), another through `Slice<f32>` (the f32 mirror). One buffer holds one representation,
     /// so one of the two would read reinterpreted bits (spike-562 F-9). `value` is the buffer's root: a
@@ -215,8 +204,11 @@ pub enum StorageKind {
     /// F16 checkpoint bytes packed two elements per device `u32` word (Card 1007): a `DenseContraction`
     /// weight, which every backend's generated body decodes in-register. Always F16.
     F16Packed,
-    /// A declared-I32 value bound as its F32 bit-pattern mirror (card 621): a `Slot::SlotMap`/
-    /// `Slot::GdnSlotMap` index (or any other I32-declared value) feeding a
+    /// E4M3FN checkpoint bytes packed four elements per device `u32` word, each row of the last axis
+    /// padded to a whole word (POOT-1060): a `DenseRowGather` table, which every backend's imported
+    /// `PackedE4m3RowGather` body decodes in-register. Always E4M3FN.
+    E4m3Packed,
+    /// A declared-I32 value bound as its F32 bit-pattern mirror (card 621): a `Slot::SlotMap` index (or any other I32-declared value) feeding a
     /// `ScatterUpdate`/`DynamicUpdateSlice` index operand. Those imported/kernelgen bodies read that
     /// operand as `Slice<f32>` and cast to i32 in-kernel (spec 045) on every backend, so the device
     /// buffer's own words are F32 while the value's declared dtype stays I32 (see
@@ -255,6 +247,7 @@ impl ValueStorage {
             }
             StorageKind::Bf16Packed => poot_target::BufferStorage::bf16_packed(),
             StorageKind::F16Packed => poot_target::BufferStorage::f16_packed(),
+            StorageKind::E4m3Packed => poot_target::BufferStorage::e4m3_packed(),
             StorageKind::I32F32Mirror => poot_target::BufferStorage::i32_f32_mirror(),
         };
         Self { storage }
@@ -267,14 +260,14 @@ impl ValueStorage {
         self.storage
     }
 
-    /// The dtype a binder uploads: `Dense`'s own dtype, or the packed dtype (`BF16` or `F16`) for a
-    /// packed value (still checkpoint bytes, just packed two elements per device word).
+    /// The dtype a binder uploads: `Dense`'s own dtype, or the packed dtype (`BF16`, `F16` or `E4M3FN`) for a
+    /// packed value (still checkpoint bytes, just packed several elements per device word).
     pub fn dtype(&self) -> DType {
         logical_to_dtype(self.storage.dtype())
     }
 
     /// Card 621: whether this declared-I32 value's device buffer holds the F32 bit-pattern mirror of
-    /// each element rather than raw I32 bytes (a `Slot::SlotMap`/`Slot::GdnSlotMap` index feeding a
+    /// each element rather than raw I32 bytes (a `Slot::SlotMap` index feeding a
     /// `ScatterUpdate`/`DynamicUpdateSlice` index operand). A binder reads this to choose the upload
     /// lane instead of re-deriving it from `t.ints`/a local per-eqn walk (R469-004). `pub(crate)`/
     /// test-only: no production binder survives Card 546b's `GpuExecutor` deletion to call this; kept

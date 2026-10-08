@@ -1,8 +1,5 @@
 //! Graph-structure, execution-lane, and validation-packet admission checks.
 
-#[cfg(test)]
-use poot_target::Backend;
-
 use crate::*;
 
 /// One graph value copied into the canonical validation packet.
@@ -67,9 +64,9 @@ pub(crate) fn validate_graph_execution<V: ValidationChannel>(
 /// `run_resident_kv`, `run_resident_kv_argmax`, `run_resident_prefill` and the cached decode paths.
 ///
 /// It adds one rejection: a BF16-typed value. Card 380 gave BF16 a real wgpu representation (packed
-/// `u32` lanes holding the checkpoint bytes verbatim), but only on the typed value walk, which uploads
-/// it through `upload_typed_input` and checks every planned kernel against it with
-/// `validate_typed_plan_storage`. A tensor-bound executor has neither half of that contract: it uploads
+/// `u32` lanes holding the checkpoint bytes verbatim), but only through the executor contract, which binds
+/// each const in the storage the plan chose and checks it against the planned kernel's parameter. A
+/// tensor-bound executor has neither half of that contract: it uploads
 /// `numel` four-byte f32 words, so the card 380 contraction kernel would read an f32 buffer as packed
 /// BF16 lanes. That buffer is larger than the kernel expects, so its bounds guard passes and the answer
 /// is silently wrong rather than an out-of-bounds read.
@@ -84,18 +81,11 @@ pub(crate) fn validate_graph_execution<V: ValidationChannel>(
 /// Not part of [`validate_graph_execution`], which PTX and ROCm also call: PTX has actual two-byte BF16
 /// storage and ROCm has `ConstLayout::Bf16Wmma`, so both run real BF16 graphs and must not be gated by
 /// a wgpu limitation.
-/// Card 380 P1 + the decode bf16 GEMV lane: reject a BF16 value on the wgpu tensor-bound entry points
-/// unless every consumer reads it as packed u32 lanes the resident binder now stores that way.
-///
-/// Two narrow cases survive:
-/// - a decode-GEMV weight ([`bf16_const_feeds_decode_bf16_gemv`]): `bind_resident` uploads packed u32
-///   lanes and the planned `gemv*:bf16` body widens in-register;
-/// - nothing else on this lane. DenseContraction/DenseRowGather weights stay typed-walk only (the
-///   card 380 contract): the tensor lane does not plan those ops for a resident decode.
-///
-/// Every other BF16 value (a computed value, a const whose consumers are not both packed-lane) is
-/// rejected by name rather than uploaded as four-byte f32 words for a kernel that reads two-byte
-/// elements packed into u32 lanes.
+/// Card 380 P1: reject a BF16 value on the wgpu tensor-bound entry points. No consumer reads one there: the
+/// DenseContraction/DenseRowGather weights stay typed-walk only (the card 380 contract), the tensor lane does
+/// not plan those ops for a resident decode, and the BF16 `[K, N]` decode GEMV is retired. Every BF16 value is
+/// rejected by name rather than uploaded as four-byte f32 words for a kernel that reads two-byte elements
+/// packed into u32 lanes.
 ///
 /// `pub(crate)`/test-only: no production caller survives Card 546b's `GpuExecutor` deletion; kept for
 /// the packed-BF16 contract coverage in `tests.rs`.
@@ -104,11 +94,7 @@ pub(crate) fn validate_wgpu_tensor_execution<V: ValidationChannel>(
     g: &Graph<V>,
 ) -> Result<(), PlanError> {
     validate_graph_execution(g)?;
-    let caps = poot_target::DeviceCaps::wgpu_rdna3_igpu();
-    if let Some(value) = (0..g.values.len()).find(|&id| {
-        g.values[id].aval.dtype == DType::BF16
-            && !bf16_const_feeds_decode_bf16_gemv(g, id, Backend::SpirvVulkan, &caps)
-    }) {
+    if let Some(value) = (0..g.values.len()).find(|&id| g.values[id].aval.dtype == DType::BF16) {
         return Err(PlanError::UnrepresentableValue {
             value,
             dtype: DType::BF16,

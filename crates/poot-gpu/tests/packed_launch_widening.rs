@@ -5,7 +5,9 @@
 //! runtime's pipeline tier used to hit on that key alone, so after a small shape compiled the narrow
 //! module, a large shape dispatched it over a grid sized for 256 lanes: exactly a quarter of the
 //! output was written and the rest read back as zero. That was the "real-size Materialize garbage"
-//! the eager 1.5B Q4_K decode produced (8c36446de): its small K/V projections compiled first.
+//! the eager 1.5B Q4_K decode produced (8c36446de): its small K/V projections compiled first. The
+//! indexed packed contraction rides the same rows: its shapes ride in metadata, so one body must serve
+//! every table size.
 //!
 //! Each row runs the small shape, then the large one, in one executor, and compares every element of
 //! the large output with the oracle decoder. The order matters: the large shape alone was correct.
@@ -14,6 +16,7 @@
 //! alone (`executor/counters.rs`), or make `Context::cached_pipeline` hit on the key alone
 //! (`poot-runtime` `context/init.rs`).
 
+use poot_test_util::const_weights::ConstWeights;
 use std::sync::Arc;
 
 use poot_executor::{Device, Executor, HostView, NoSync, StepInputs};
@@ -40,10 +43,7 @@ fn staged(g: &Graph, target: Target) -> StagedProgram<poot_graph_ir::ValidationO
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions {
-            execution: Submission::Replay,
-            limits: poot_graph_plan::CompileLimits::STANDARD,
-        },
+        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect("compile the packed graph")
 }
@@ -67,8 +67,8 @@ fn mismatches(got: &[f32], want: &[f32]) -> Option<(usize, usize, f32, f32)> {
     bad.first().map(|&i| (bad.len(), i, got[i], want[i]))
 }
 
-/// The canonical packed MoE chain (`packed_indexed_linear`: every expert a `PackedDequant` that
-/// `compile` plans as a standalone `Materialize`) at `[out, k]` Q4_K experts, run through the
+/// The indexed packed contraction (`packed_indexed_linear`: one `PackedContraction` over a stacked table, no
+/// `Materialize`) at `[out, k]` Q4_K experts, run through the
 /// executor contract (`exec` is reused across calls so its kernel/pipeline cache persists exactly as
 /// `GpuExecutor`'s own `self.compiled` cache did); returns the output and the oracle's. Row `m` reads
 /// expert `m % 2` at column `(m * 37 + 11) % k` through a one-hot activation, so every output is one
@@ -85,45 +85,47 @@ fn run_moe(exec: &mut dyn Executor, target: Target, out: usize, k: usize) -> (Ve
             ))
         })
         .collect();
-    let rows: Vec<poot_graph_ir::ops::PackedLinearGraphRow> = (0..EXPERTS)
-        .map(|ordinal| poot_graph_ir::ops::PackedLinearGraphRow {
-            ordinal,
-            linear_id: format!("expert.{ordinal}"),
-            descriptor: owners[ordinal].weight(),
-        })
-        .collect();
+    let table = poot_graph_ir::ops::PackedExpertStack {
+        stack_id: "experts".to_string(),
+        descriptor: owners[0].weight(),
+        experts: EXPERTS,
+    };
     let column = |m: usize| (m * 37 + 11) % k;
     let b = Builder::new();
     let x = b.slot_named(Slot::Activation, "moe-x", TensorType::f32(vec![ROWS, k]));
     let ids = b.slot_named(Slot::Activation, "moe-ids", TensorType::f32(vec![ROWS]));
-    let y = poot_graph_ir::ops::packed_indexed_linear(&b, x, ids, &rows).unwrap();
+    let y = poot_graph_ir::ops::packed_indexed_linear(&b, x, ids, &table).unwrap();
     let g = b.finish(y);
-
-    let program = staged(&g, target);
-    let compiled_graph = program.stages().next().expect("single stage").2.graph();
-    assert!(
-        compiled_graph
-            .eqns
-            .iter()
-            .any(|eqn| matches!(eqn.op, poot_graph_ir::OpKind::PackedDequant { .. })),
-        "[{out}, {k}]: the canonical chain keeps its standalone Materialize"
-    );
 
     let mut store = WeightStore::builder();
     for (ordinal, owner) in owners.iter().enumerate() {
         store
             .insert(
-                format!("expert.{ordinal}"),
+                format!("experts.{ordinal}"),
                 WeightEntry::Packed(Arc::clone(owner)),
             )
             .unwrap();
     }
-    let exe = exec
-        .load_weights(
-            Arc::new(store.build()),
-            poot_executor::WeightSource::ConstNames,
-        )
-        .unwrap();
+    let store = store.build();
+    let (bound, map) = ConstWeights::bind(&g, &store);
+    let program = staged(&bound, target);
+    let compiled_graph = program.stages().next().expect("single stage").2.graph();
+    assert!(
+        matches!(
+            compiled_graph.eqns.as_slice(),
+            [poot_graph_ir::Eqn {
+                op: poot_graph_ir::OpKind::PackedContraction {
+                    rows: poot_graph_ir::ContractionRows::Indexed { .. },
+                    ..
+                },
+                ..
+            }]
+        ),
+        "[{out}, {k}]: one indexed packed contraction, got {:?}",
+        compiled_graph.eqns
+    );
+
+    let exe = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
     let entry = exec.add_entry(exe, &program).unwrap();
 
     let mut one_hot = vec![0.0f32; ROWS * k];
@@ -165,11 +167,10 @@ fn run_moe(exec: &mut dyn Executor, target: Target, out: usize, k: usize) -> (Ve
     (got, want)
 }
 
-/// SC-004 (Materialize): the canonical MoE chain at `[8, 256]` experts, then at `[2816, 1536]`
-/// (4.3M elements per Materialize, past the 64-lane grid cap, so the planner widens the body), is
-/// bit-exact at both sizes in one executor.
+/// SC-004 (indexed contraction): the stacked-expert contraction at `[8, 256]` experts, then at
+/// `[2816, 1536]` (a different Gemv launch over a larger table), is bit-exact at both sizes in one executor.
 #[test]
-fn a_widened_materialize_after_a_narrow_one_is_bit_exact() {
+fn a_wide_indexed_contraction_after_a_narrow_one_is_bit_exact() {
     let Some(device) =
         poot_test_util::device_skip::open_or_skip(DeviceBackend::Wgpu, WgpuDevice::new())
     else {
@@ -216,7 +217,16 @@ fn a_widened_row_gather_after_a_narrow_one_is_bit_exact() {
                 .unwrap();
         let g = b.finish(rows);
 
-        let program = staged(&g, target);
+        let mut store = WeightStore::builder();
+        store
+            .insert(
+                "model.embed_tokens",
+                WeightEntry::Packed(Arc::clone(&owner)),
+            )
+            .unwrap();
+        let store = store.build();
+        let (bound, map) = ConstWeights::bind(&g, &store);
+        let program = staged(&bound, target);
         let compiled_graph = program.stages().next().expect("single stage").2.graph();
         assert!(
             compiled_graph
@@ -226,19 +236,7 @@ fn a_widened_row_gather_after_a_narrow_one_is_bit_exact() {
             "{n} ids: compile claims the embedding"
         );
 
-        let mut store = WeightStore::builder();
-        store
-            .insert(
-                "model.embed_tokens",
-                WeightEntry::Packed(Arc::clone(&owner)),
-            )
-            .unwrap();
-        let exe = exec
-            .load_weights(
-                Arc::new(store.build()),
-                poot_executor::WeightSource::ConstNames,
-            )
-            .unwrap();
+        let exe = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
         let entry = exec.add_entry(exe, &program).unwrap();
 
         let ids: Vec<usize> = (0..n).map(|r| (r * 13 + 5) % VOCAB).collect();

@@ -13,17 +13,16 @@
 //! internally (the `executor_contract.rs` SC-015 precedent) - and, model-free and backend-neutral,
 //! in `poot_executor`'s own `tests/buffer_plan_arena.rs`.
 //!
-//! The fixture below is unfused (the routed-expert hang guard) so its five equations compile to five
-//! separate dispatches, in a known order, with a known buffer-plan lifetime for each:
+//! The fixture below compiles through the full pipeline to four dispatches (`fuse` folds `c + c` into the
+//! reduce that reads it), in a known order, with a known buffer-plan lifetime for each:
 //!
 //! ```text
 //! a, b: const [K]
 //! v1  = a + b                 // eqn 0: [K], born here
 //! s1  = reduce_sum(v1, axis0) // eqn 1: [1]; v1 last read here (dies)
 //! c:    const [1], negative
-//! v2  = c + c                 // eqn 2: [1]; v1's freed [K] slot is reused (SC-002's "short value")
-//! s2  = reduce_max(v2, axis0) // eqn 3: [1]
-//! out = s1 + s2                // eqn 4
+//! s2  = reduce_max(c + c)     // eqn 2: one FusedRow, [1]; v1's freed [K] slot is reused (SC-002's "short value")
+//! out = s1 + s2                // eqn 3
 //! ```
 //!
 //! `c` is negative and `s2` uses `Max` (not `Sum`, like `s1`) so that if this kernel class ever did
@@ -32,6 +31,7 @@
 //! zero is `Add`'s identity) - the sharpest oracle comparison this file's fixture can offer, even
 //! though today's kernels do not exercise that path.
 
+use poot_test_util::const_weights::ConstWeights;
 use std::sync::Arc;
 
 use poot_executor::{Arg, BufferRole, Device, Dispatch, Engine, Executor, NoSync, StepInputs};
@@ -70,9 +70,7 @@ fn fixture() -> (Graph, Vec<f32>, Vec<f32>, f32) {
     let v2 = builder.binary(poot_graph_ir::op::BinOp::Add, tc, tc);
     let s2 = builder.reduce(RedOp::Max, v2, 0, true);
     let out = builder.binary(poot_graph_ir::op::BinOp::Add, s1, s2);
-    // The routed-expert hang guard (compile's `staged` below) needs a routed-expert site in the graph.
-    let g = poot_test_util::graph_fixtures::with_routed_expert_site(builder.finish(out));
-    (g.with_validations(Vec::new()), a, b, c)
+    (builder.finish(out).with_validations(Vec::new()), a, b, c)
 }
 
 fn store(a: &[f32], b: &[f32], c: f32) -> Arc<WeightStore> {
@@ -102,23 +100,10 @@ fn bytemuck_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// `compile` under the routed-expert hang guard (`compile.rs`'s
-/// `compile_skips_fuse_only_for_a_routed_site_on_a_target_with_the_hang`): skip `fuse` (and the
-/// tiled-GEMM choice) so the fixture's five equations stay five separate dispatches, each with the exact
-/// lifetime the module doc names. The guard needs a routed-expert site in the graph (`fixture`) and a target
-/// with the hang ([`staged`]).
-const UNFUSED_REPLAY: CompileOptions = CompileOptions {
-    execution: Submission::Replay,
-    limits: poot_graph_plan::CompileLimits::STANDARD,
-};
+const REPLAY: CompileOptions =
+    CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
 
-/// Compiled under the routed-expert hang guard: the fixture's graph carries a routed-expert site and
-/// the target is given the hang.
 fn staged(g: &Graph, target: Target) -> StagedProgram<ValidationOutputs> {
-    let target = Target {
-        caps: poot_test_util::graph_fixtures::with_routed_expert_hang(target.caps),
-        ..target
-    };
     compile_staged(
         g,
         &TargetSet::single(DeviceId(0), target),
@@ -126,9 +111,9 @@ fn staged(g: &Graph, target: Target) -> StagedProgram<ValidationOutputs> {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &UNFUSED_REPLAY,
+        &REPLAY,
     )
-    .expect("the fixture compiles unfused")
+    .expect("the fixture compiles")
 }
 
 fn oracle(a: &[f32], b: &[f32], c: f32) -> f32 {
@@ -154,29 +139,27 @@ fn disjoint_lifetimes_reuse_one_slot_and_match_the_oracle() {
         eprintln!("skip: no wgpu adapter");
         return;
     };
-    // The unfused fixture is compiled under the routed-expert hang guard, so the device reports the hang.
-    let device = poot_executor_parity::hung::WithRoutedHang(device);
     let target = device.target();
     let (g, a, b, c) = fixture();
-    let program = poot_graph_plan::compile(&g, &target, &UNFUSED_REPLAY)
-        .expect("the fixture compiles for wgpu");
+    let weights = store(&a, &b, c);
+    let (named, map) = ConstWeights::bind(&g, &weights);
+    let program =
+        poot_graph_plan::compile(&named, &target, &REPLAY).expect("the fixture compiles for wgpu");
 
     // The naive "one buffer per locally-computed value" sum this card's arena coloring replaces:
-    // v1 [K], s1 [1], v2 [1], s2 [1], out [1] (4 bytes per f32 element). `out` always gets its own
-    // dedicated slot (an export, module doc), so the only reuse this fixture can show is v2 folding
+    // v1 [K], s1 [1], s2 [1], out [1] (4 bytes per f32 element). `out` always gets its own
+    // dedicated slot (an export, module doc), so the only reuse this fixture can show is s2 folding
     // into v1's freed [K] slot - one fewer element-sized slot than the naive count.
-    let naive_sum_bytes = (K + 1 + 1 + 1 + 1) * 4;
+    let naive_sum_bytes = (K + 1 + 1 + 1) * 4;
     let arena_bytes = program.buffer_plan().arena_bytes();
     assert!(
         arena_bytes < naive_sum_bytes,
-        "v1's freed [K] slot must be reused by v2 (arena_bytes={arena_bytes}, naive sum={naive_sum_bytes})"
+        "v1's freed [K] slot must be reused by s2 (arena_bytes={arena_bytes}, naive sum={naive_sum_bytes})"
     );
 
     let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
-    let exe = exec
-        .load_weights(store(&a, &b, c), poot_executor::WeightSource::ConstNames)
-        .unwrap();
-    let entry = exec.add_entry(exe, &staged(&g, target)).unwrap();
+    let exe = exec.load_weights(weights, Arc::new(map)).unwrap();
+    let entry = exec.add_entry(exe, &staged(&named, target)).unwrap();
     let mut out = exec
         .step(exe, entry, &StepInputs::new(), &mut NoSync)
         .unwrap();
@@ -185,8 +168,8 @@ fn disjoint_lifetimes_reuse_one_slot_and_match_the_oracle() {
     assert_close_rel(&got, &[oracle(&a, &b, c)], 1e-5);
 }
 
-/// SC-002 (wgpu, arena-reuse-is-transparent half): `s2`'s reduce still returns exactly `v2`'s one
-/// logical element, correct to the oracle, even though `v2` is read through an arena slot sized for
+/// SC-002 (wgpu, arena-reuse-is-transparent half): `s2`'s reduce still returns exactly one
+/// logical element, correct to the oracle, even though `s2` is written through an arena slot sized for
 /// `v1`'s earlier, larger [K] value - the reuse itself never corrupts a real dispatch.
 ///
 /// This is not the decoupled-length proof (that one is `poot_executor`'s own
@@ -206,15 +189,13 @@ fn a_short_value_reusing_a_larger_slot_publishes_its_own_length_not_the_slots() 
         eprintln!("skip: no wgpu adapter");
         return;
     };
-    // The unfused fixture is compiled under the routed-expert hang guard, so the device reports the hang.
-    let device = poot_executor_parity::hung::WithRoutedHang(device);
     let target = device.target();
     let (g, a, b, c) = fixture();
     let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
-    let exe = exec
-        .load_weights(store(&a, &b, c), poot_executor::WeightSource::ConstNames)
-        .unwrap();
-    let entry = exec.add_entry(exe, &staged(&g, target)).unwrap();
+    let weights = store(&a, &b, c);
+    let (named, map) = ConstWeights::bind(&g, &weights);
+    let exe = exec.load_weights(weights, Arc::new(map)).unwrap();
+    let entry = exec.add_entry(exe, &staged(&named, target)).unwrap();
     let mut out = exec
         .step(exe, entry, &StepInputs::new(), &mut NoSync)
         .unwrap();

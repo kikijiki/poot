@@ -29,7 +29,7 @@
   --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
 }
 
-/* Shared matrix status badges (BackendTable + feature-matrix markdown tables). */
+/* Shared matrix status badges (the feature-matrix markdown tables). */
 .matrix-status {
   display: inline-block;
   font-weight: 700;
@@ -79,42 +79,6 @@
 [data-theme='dark'] .matrix-status--na {
   color: #d1d5db;
   background: rgba(156, 163, 175, 0.2);
-}
-
-/* Capability / feature matrices: tighten layout; center short status columns. */
-.matrix-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 0.85rem;
-  margin: 1.25rem 0;
-}
-
-.matrix-table th {
-  background: var(--ifm-color-emphasis-100);
-  padding: 0.5rem 0.75rem;
-  text-align: left;
-  font-weight: 600;
-  border-bottom: 2px solid var(--ifm-color-emphasis-200);
-}
-
-.matrix-table td {
-  padding: 0.4rem 0.75rem;
-  border-bottom: 1px solid var(--ifm-color-emphasis-100);
-  vertical-align: middle;
-}
-
-.matrix-table tr:last-child td {
-  border-bottom: none;
-}
-
-.matrix-table td.matrix-cell-status {
-  text-align: center;
-  white-space: nowrap;
-}
-
-.matrix-table td.matrix-cell-notes {
-  font-size: 0.78rem;
-  color: var(--ifm-color-emphasis-600);
 }
 
 /* Feature-matrix page: style status badges inside ordinary markdown tables. */

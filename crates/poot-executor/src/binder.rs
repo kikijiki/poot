@@ -4,22 +4,24 @@
 //! planned device lane. A check here is the contract's only gate: a test may not forge the state it
 //! guards, so every row drives this function with inputs where the two sides differ.
 //!
-//! Weights bind here too (Card 564), by the executable's [`WeightSource`]: under
-//! [`WeightSource::Map`] a const's name is a [`WeightId::const_name`] (or a [`PackedSourceName`] over
+//! Weights bind here too (Card 564), through the executable's weight map: a const's name is a [`WeightId::const_name`] (or a [`PackedSourceName`] over
 //! one), the id's [`WeightView`] names byte runs of store entries, and those runs - never a const
 //! name - are the weight's residency identity, so two ids viewing one entry share one upload.
+//! A packed expert stack ([`WeightView::ExpertStack`] over packed entries) binds one const per source role:
+//! the experts' sources back to back, each padded to whole `u32` words ([`PackedWeight::slab_bytes`]) so a
+//! kernel finds expert `e` at word `e * slab_words`.
 //! A `<name>.chunkN` const (legalize's split of an oversized weight, [`Chunk`]) binds the rows of
 //! its parent weight `<name>` that the chunks before it leave off, as a row range of the parent's
-//! own spans: the parent is never read or uploaded whole.
-//! [`WeightSource::ConstNames`] is the name-equality rule held for POOT-739. A hosted embed gather
-//! ([`Slot::TokenEmbed`](poot_graph_ir::Slot::TokenEmbed)) reads its rows through the same
-//! resolution.
+//! own spans: the parent is never read or uploaded whole. A chunk of a packed expert stack's source (legalize's
+//! split of a stack over the buffer limit) is a run of whole experts, padded to the slab stride like the whole.
+//! A hosted embed gather ([`Slot::TokenEmbed`](poot_graph_ir::Slot::TokenEmbed)) reads its rows
+//! through the same resolution.
 
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use poot_graph_ir::{PackedSourceName, SlotKey, TensorType, ValueId};
+use poot_graph_ir::{PackedSourceName, SlotKey, TensorType, ValueId, packed_stack_source_type};
 use poot_quant::SourceRole;
 use poot_quant::weights::{
     HandleFormat, StoreGeneration, WeightEntry, WeightId, WeightKey, WeightMap, WeightStore,
@@ -28,7 +30,6 @@ use poot_quant::weights::{
 use poot_target::BufferStorage;
 use poot_tensor::{DType, HostView};
 
-use crate::WeightSource;
 use crate::error::{BindError, LoadError};
 
 /// One entry slot: the structured key a step input matches by, its declared type, and the device
@@ -93,6 +94,9 @@ pub(crate) struct StoredSpan {
     pub generation: StoreGeneration,
     pub role: Option<SourceRole>,
     pub bytes: Range<usize>,
+    /// The bytes are an I64 table read as I32 ([`WeightView::IndexNarrow`]): [`WeightBinder::read`]
+    /// narrows each word. The map range-checked the table against this very entry when it was built.
+    pub narrowed: bool,
 }
 
 /// How a weight const's stored bytes are encoded.
@@ -102,6 +106,9 @@ pub(crate) enum StoredAs {
     Dense(DType),
     /// One packed source's raw bytes, uploaded as `u32` words (Card 642).
     PackedSource,
+    /// One source role of an expert-stacked packed table: one span per expert, each padded with zeros to
+    /// `slab_bytes` (a whole number of words) before the upload, so the experts' slabs sit at fixed word strides.
+    PackedStackSource { slab_bytes: usize },
 }
 
 /// What one weight const reads: its spans back to back, and how they are stored.
@@ -109,6 +116,29 @@ pub(crate) enum StoredAs {
 pub(crate) struct ConstBytes {
     pub spans: Vec<StoredSpan>,
     pub stored: StoredAs,
+}
+
+impl ConstBytes {
+    /// The length of [`WeightBinder::read`]'s result, from the spans alone: a planning pass sizes an upload
+    /// without reading the store.
+    pub fn stored_len(&self) -> usize {
+        match self.stored {
+            // Every expert's run is padded to the slab stride.
+            StoredAs::PackedStackSource { slab_bytes } => self.spans.len() * slab_bytes,
+            StoredAs::Dense(_) | StoredAs::PackedSource => self
+                .spans
+                .iter()
+                .map(|span| {
+                    // A narrowed I64 table reads back as I32: half the bytes.
+                    if span.narrowed {
+                        span.bytes.len() / 2
+                    } else {
+                        span.bytes.len()
+                    }
+                })
+                .sum(),
+        }
+    }
 }
 
 /// Where a `<base>.chunkN` const sits in its parent weight `base`: the parent's leading-axis rows
@@ -173,6 +203,8 @@ pub(crate) fn chunks<'a>(
 enum Part {
     Whole(WeightKey),
     Rows(WeightKey, Range<usize>),
+    /// A whole I64 index table read as I32.
+    Narrowed(WeightKey),
 }
 
 /// A graph name resolved to the store: the parts its view reads, in order, the format and logical
@@ -182,6 +214,8 @@ struct Located {
     format: HandleFormat,
     shape: Vec<usize>,
     role: Option<SourceRole>,
+    /// The expert count when the view is an [`WeightView::ExpertStack`] (`parts` is one per expert).
+    experts: Option<usize>,
 }
 
 /// One logical row run of a hosted embed table: rows `rows` of store entry `key`.
@@ -208,31 +242,18 @@ impl EmbedRows {
     }
 }
 
-/// An executable's weights: its store and the rule its graph consts bind by.
+/// An executable's weights: its store and the map its graph consts bind through, each mapped weight
+/// under its [`WeightId::const_name`].
 pub(crate) struct WeightBinder {
     store: Arc<WeightStore>,
-    rule: Rule,
-}
-
-enum Rule {
-    /// Each mapped weight under its [`WeightId::const_name`].
-    Map {
-        map: Arc<WeightMap>,
-        ids: HashMap<String, WeightId>,
-    },
-    ConstNames,
+    map: Arc<WeightMap>,
+    ids: HashMap<String, WeightId>,
 }
 
 impl WeightBinder {
-    pub fn new(store: Arc<WeightStore>, source: WeightSource) -> Self {
-        let rule = match source {
-            WeightSource::Map(map) => {
-                let ids = map.iter().map(|(id, _, _)| (id.const_name(), id)).collect();
-                Rule::Map { map, ids }
-            }
-            WeightSource::ConstNames => Rule::ConstNames,
-        };
-        Self { store, rule }
+    pub fn new(store: Arc<WeightStore>, map: Arc<WeightMap>) -> Self {
+        let ids = map.iter().map(|(id, _, _)| (id.const_name(), id)).collect();
+        Self { store, map, ids }
     }
 
     fn entry(&self, value: ValueId, name: &str, key: &str) -> Result<&WeightEntry, LoadError> {
@@ -242,65 +263,43 @@ impl WeightBinder {
         })
     }
 
-    /// Resolve graph name `name` (of input `value`) to its view over the store. Under
-    /// [`Rule::Map`] only a mapped id binds: a name that is a store key but no const name of the map
-    /// is [`LoadError::Unbound`] (SC-003).
+    /// Resolve graph name `name` (of input `value`) to its view over the store. Only a mapped id
+    /// binds: a name that is a store key but no const name of the map is [`LoadError::Unbound`]
+    /// (SC-003).
     fn locate(&self, value: ValueId, name: &str) -> Result<Located, LoadError> {
         let unbound = || LoadError::Unbound {
             value,
             name: name.to_string(),
         };
-        match &self.rule {
-            Rule::Map { map, ids } => {
-                let (id, role) = match ids.get(name) {
-                    Some(&id) => (id, None),
-                    None => {
-                        let source = PackedSourceName::parse(name).ok_or_else(unbound)?;
-                        let id = *ids.get(source.linear_id()).ok_or_else(unbound)?;
-                        (id, Some(source.role()))
-                    }
-                };
-                let (Some(view), Some(handle)) = (map.view(id), map.handle(id)) else {
-                    return Err(unbound());
-                };
-                let parts = match view {
-                    WeightView::Stored(key) => vec![Part::Whole(key.clone())],
-                    WeightView::RowStack(keys) | WeightView::ExpertStack(keys) => {
-                        keys.iter().cloned().map(Part::Whole).collect()
-                    }
-                    WeightView::RowRange { key, rows } => {
-                        vec![Part::Rows(key.clone(), rows.clone())]
-                    }
-                };
-                Ok(Located {
-                    parts,
-                    format: handle.format,
-                    shape: handle.shape.clone(),
-                    role,
-                })
+        let (id, role) = match self.ids.get(name) {
+            Some(&id) => (id, None),
+            None => {
+                let source = PackedSourceName::parse(name).ok_or_else(unbound)?;
+                let id = *self.ids.get(source.linear_id()).ok_or_else(unbound)?;
+                (id, Some(source.role()))
             }
-            Rule::ConstNames => {
-                let (key, role) = match PackedSourceName::parse(name) {
-                    Some(source) => (source.linear_id().to_string(), Some(source.role())),
-                    None => (name.to_string(), None),
-                };
-                let (format, shape) = match self.entry(value, name, &key)? {
-                    WeightEntry::Dense(dense) => {
-                        (HandleFormat::Dense(dense.dtype()), dense.shape().to_vec())
-                    }
-                    WeightEntry::Packed(payload) => (
-                        HandleFormat::Packed(payload.weight()),
-                        payload.weight().shape().to_vec(),
-                    ),
-                };
-                Ok(Located {
-                    parts: vec![Part::Whole(WeightKey::from(key))],
-                    format,
-                    shape,
-                    role,
-                })
+        };
+        let (Some(view), Some(handle)) = (self.map.view(id), self.map.handle(id)) else {
+            return Err(unbound());
+        };
+        let parts = match view {
+            WeightView::Stored(key) => vec![Part::Whole(key.clone())],
+            WeightView::RowStack(keys) | WeightView::ExpertStack(keys) => {
+                keys.iter().cloned().map(Part::Whole).collect()
             }
-        }
+            WeightView::RowRange { key, rows } => {
+                vec![Part::Rows(key.clone(), rows.clone())]
+            }
+            WeightView::IndexNarrow(key) => vec![Part::Narrowed(key.clone())],
+        };
+        let experts = matches!(view, WeightView::ExpertStack(_)).then_some(parts.len());
+        Ok(Located {
+            parts,
+            format: handle.format,
+            shape: handle.shape.clone(),
+            role,
+            experts,
+        })
     }
 
     /// Resolve chunk const `name` (of input `value`, declared `aval`) to the rows `chunk.rows` of its
@@ -314,6 +313,28 @@ impl WeightBinder {
         chunk: &Chunk,
     ) -> Result<Located, LoadError> {
         let parent = self.locate(value, &chunk.base)?;
+        // A packed expert stack's source is `[experts, slab_bytes]`: its leading axis is the experts, one part
+        // each, so a chunk is a run of whole experts.
+        if let (HandleFormat::Packed(weight), Some(role), Some(experts)) =
+            (parent.format, parent.role, parent.experts)
+        {
+            let stack = packed_stack_source_type(weight, experts, role);
+            if chunk.rows.end > experts
+                || aval.shape.first() != Some(&chunk.rows.len())
+                || aval.shape[1..] != stack.shape[1..]
+            {
+                return Err(LoadError::WeightShape {
+                    name: name.to_string(),
+                    stored: stack.shape,
+                    declared: aval.shape.clone(),
+                });
+            }
+            return Ok(Located {
+                parts: parent.parts[chunk.rows.clone()].to_vec(),
+                experts: Some(chunk.rows.len()),
+                ..parent
+            });
+        }
         let HandleFormat::Dense(_) = parent.format else {
             return Err(LoadError::UnboundPackedRole {
                 value,
@@ -342,6 +363,8 @@ impl WeightBinder {
                     let total = self.entry(value, name, key.as_str())?.shape()[0];
                     (key, 0..total)
                 }
+                // A narrowed table is read whole: a chunk of it would split a derived buffer.
+                Part::Narrowed(_) => return Err(shape_error()),
             };
             let span = held..held + rows.len();
             held = span.end;
@@ -357,6 +380,7 @@ impl WeightBinder {
             format: parent.format,
             shape: aval.shape.clone(),
             role: None,
+            experts: None,
         })
     }
 
@@ -389,7 +413,22 @@ impl WeightBinder {
                 StoredAs::Dense(dtype)
             }
             (HandleFormat::Packed(weight), Some(role)) if weight.sources().contains(&role) => {
-                StoredAs::PackedSource
+                match located.experts {
+                    None => StoredAs::PackedSource,
+                    Some(experts) => {
+                        let expected = packed_stack_source_type(weight, experts, role);
+                        if *aval != expected {
+                            return Err(LoadError::WeightShape {
+                                name: name.to_string(),
+                                stored: expected.shape,
+                                declared: aval.shape.clone(),
+                            });
+                        }
+                        StoredAs::PackedStackSource {
+                            slab_bytes: weight.slab_bytes(role),
+                        }
+                    }
+                }
             }
             _ => return Err(wrong_role()),
         };
@@ -398,6 +437,8 @@ impl WeightBinder {
             .iter()
             .map(|part| self.span(value, name, part, located.role))
             .collect::<Result<Vec<_>, _>>()?;
+        // A stacked source's length was checked against its padded type above; each expert's own bytes were
+        // checked against the store entry by `span`.
         if stored == StoredAs::PackedSource {
             let len: usize = spans.iter().map(|span| span.bytes.len()).sum();
             if len != aval.numel() {
@@ -422,7 +463,7 @@ impl WeightBinder {
         role: Option<SourceRole>,
     ) -> Result<StoredSpan, LoadError> {
         let key = match part {
-            Part::Whole(key) | Part::Rows(key, _) => key,
+            Part::Whole(key) | Part::Rows(key, _) | Part::Narrowed(key) => key,
         };
         let (len, row_bytes) = match (self.entry(value, name, key.as_str())?, role) {
             (WeightEntry::Dense(dense), None) => {
@@ -444,7 +485,7 @@ impl WeightBinder {
             }
         };
         let bytes = match part {
-            Part::Whole(_) => 0..len,
+            Part::Whole(_) | Part::Narrowed(_) => 0..len,
             Part::Rows(_, rows) => {
                 let row_bytes =
                     row_bytes.ok_or(LoadError::Unimplemented("a row range of a planar source"))?;
@@ -470,19 +511,38 @@ impl WeightBinder {
             generation,
             role,
             bytes,
+            narrowed: matches!(part, Part::Narrowed(_)),
         })
     }
 
-    /// `spans`' stored bytes, back to back.
-    pub fn read(&self, spans: &[StoredSpan]) -> Vec<u8> {
+    /// `bytes`' stored runs, back to back; a stacked source's runs are each padded with zeros to the slab
+    /// stride, so expert `e` starts at byte `e * slab_bytes`.
+    pub fn read(&self, bytes: &ConstBytes) -> Vec<u8> {
+        let slab = match bytes.stored {
+            StoredAs::PackedStackSource { slab_bytes } => Some(slab_bytes),
+            StoredAs::Dense(_) | StoredAs::PackedSource => None,
+        };
+        let spans = &bytes.spans;
         let mut out = Vec::with_capacity(spans.iter().map(|span| span.bytes.len()).sum());
-        for span in spans {
+        for (index, span) in spans.iter().enumerate() {
             let stored = match (self.store.get(span.key.as_str()), span.role) {
                 (Some(WeightEntry::Dense(dense)), None) => dense.bytes().as_slice(),
                 (Some(WeightEntry::Packed(payload)), Some(role)) => payload.bytes(role),
                 _ => unreachable!("a span is built from the store it reads"),
             };
-            out.extend_from_slice(&stored[span.bytes.clone()]);
+            let stored = &stored[span.bytes.clone()];
+            if span.narrowed {
+                out.extend(stored.as_chunks::<8>().0.iter().flat_map(|word| {
+                    let value = i32::try_from(i64::from_le_bytes(*word))
+                        .expect("WeightMapBuilder::map range-checked this table against the store");
+                    value.to_le_bytes()
+                }));
+            } else {
+                out.extend_from_slice(stored);
+            }
+            if let Some(slab) = slab {
+                out.resize((index + 1) * slab, 0);
+            }
         }
         out
     }
@@ -511,7 +571,7 @@ impl WeightBinder {
         }
         let encodes = match located.format {
             HandleFormat::Dense(dtype) => {
-                aval.dtype == dtype && crate::lanes::encode_stored(dtype, &[], storage).is_ok()
+                aval.dtype == dtype && crate::lanes::encoding_of(dtype, storage).is_some()
             }
             HandleFormat::Packed(_) => {
                 aval.dtype == DType::F32
@@ -534,6 +594,8 @@ impl WeightBinder {
                     let rows = self.entry(value, name, key.as_str())?.shape()[0];
                     Ok(RowRun { key, rows: 0..rows })
                 }
+                // An index table is no embedding.
+                Part::Narrowed(_) => Err(shape_error()),
             })
             .collect::<Result<Vec<_>, LoadError>>()?;
         Ok(EmbedRows {
@@ -598,7 +660,9 @@ impl WeightBinder {
             }
         }
         let encoded = match rows.format {
-            HandleFormat::Dense(dtype) => crate::lanes::encode_stored(dtype, &dense, storage).ok(),
+            HandleFormat::Dense(dtype) => {
+                crate::lanes::encode_stored(dtype, &[rows.width], &dense, storage).ok()
+            }
             HandleFormat::Packed(_) => {
                 crate::lanes::encode_host(DType::F32, bytemuck::cast_slice(&decoded), storage)
             }
@@ -607,5 +671,155 @@ impl WeightBinder {
             name: rows.name.clone(),
             planned: storage,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use poot_quant::format::WeightFormat;
+    use poot_quant::weights::{
+        MoeRole, WeightEntry, WeightMap, WeightRole, WeightStore, WeightView,
+    };
+    use poot_quant::{PackedPayload, PackedWeight, SourceRole};
+
+    use super::*;
+
+    /// Three Q8_0 experts of `out = 3, K = 32`: 102 bytes each (3 rows of one 34-byte block), not a whole
+    /// number of `u32` words, viewed as the stack `id`.
+    fn q8_stack() -> (WeightBinder, WeightId, Vec<Arc<PackedPayload>>) {
+        let id = WeightId::layer(
+            0,
+            WeightRole::Moe(MoeRole::Stack(poot_quant::weights::ExpertProj::Gate)),
+        );
+        let experts: Vec<Arc<PackedPayload>> = (0..3)
+            .map(|e| {
+                Arc::new(poot_test_util::packed::random_payload(
+                    WeightFormat::Q8_0,
+                    [3, 32],
+                    17 + e,
+                ))
+            })
+            .collect();
+        let mut store = WeightStore::builder();
+        for (e, expert) in experts.iter().enumerate() {
+            store
+                .insert(format!("gate.{e}"), WeightEntry::Packed(Arc::clone(expert)))
+                .unwrap();
+        }
+        let store = Arc::new(store.build());
+        let mut map = WeightMap::builder(&store);
+        map.map(
+            id,
+            WeightView::ExpertStack(
+                (0..3)
+                    .map(|e| WeightKey::from(format!("gate.{e}").as_str()))
+                    .collect(),
+            ),
+        )
+        .unwrap();
+        let map = Arc::new(map.build());
+        (WeightBinder::new(store, map), id, experts)
+    }
+
+    /// SC-002: a per-expert Q8_0 table with `out = 3, K = 32` (102 bytes per expert, not word-aligned) binds as
+    /// one const per source role whose bytes are the experts back to back, each padded with zeros to the word
+    /// stride (104 bytes), so expert `e` starts at byte `104 * e`. The padded type is the graph's declared
+    /// carrier type; the declared per-expert type is refused by name. Mutation: drop the per-expert padding in
+    /// [`WeightBinder::read`]; the table is 306 bytes, expert 1 starts at byte 102 and every offset check goes
+    /// red.
+    #[test]
+    fn an_unaligned_expert_table_binds_one_const_with_word_padded_slabs() {
+        let (binder, id, experts) = q8_stack();
+        let weight = PackedWeight::try_new(WeightFormat::Q8_0, [3, 32]).unwrap();
+        let role = SourceRole::Blocks;
+        assert_eq!(weight.source_bytes(role), 102);
+        assert_eq!(weight.slab_bytes(role), 104);
+        let name = PackedSourceName::new(&id.const_name(), role);
+        let declared = packed_stack_source_type(weight, 3, role);
+        let bytes = binder
+            .const_bytes(0, name.as_str(), &declared, None)
+            .expect("the stacked source binds");
+        assert_eq!(
+            bytes.stored,
+            StoredAs::PackedStackSource { slab_bytes: 104 }
+        );
+        assert_eq!(
+            bytes.spans.len(),
+            3,
+            "one run per expert, one const per role"
+        );
+        let table = binder.read(&bytes);
+        assert_eq!(table.len(), 3 * 104);
+        assert_eq!(bytes.stored_len(), table.len());
+        for (e, expert) in experts.iter().enumerate() {
+            let slab = &table[e * 104..(e + 1) * 104];
+            assert_eq!(&slab[..102], expert.bytes(role), "expert {e}");
+            assert_eq!(&slab[102..], [0, 0], "expert {e}'s word padding");
+        }
+
+        let per_expert = poot_graph_ir::packed_source_type(weight, role);
+        assert!(matches!(
+            binder.const_bytes(0, name.as_str(), &per_expert, None),
+            Err(LoadError::WeightShape { .. })
+        ));
+    }
+
+    /// SC-004 (card 1067): a `{source}.chunkN` const of a packed expert stack (legalize's split of a table over the
+    /// buffer limit) binds the run of whole experts the chunks before it leave off, padded to the slab stride like
+    /// the whole table: chunk 0 of a 3-expert stack split 2 + 1 is experts 0 and 1, chunk 1 is expert 2 alone and
+    /// starts at byte 0 of its own buffer. A chunk whose declared height disagrees with the experts it is
+    /// placed over, or that runs past the stack, is refused by name.
+    /// Mutation: in `locate_chunk` start the run one expert early (`chunk.rows.start.saturating_sub(1)`). Red:
+    /// `assertion `left == right` failed: chunk 1  left: 208  right: 104` (the chunk holds two experts, not one).
+    #[test]
+    fn a_chunk_of_an_expert_stack_binds_its_run_of_experts() {
+        let (binder, id, experts) = q8_stack();
+        let weight = PackedWeight::try_new(WeightFormat::Q8_0, [3, 32]).unwrap();
+        let role = SourceRole::Blocks;
+        let parent = PackedSourceName::new(&id.const_name(), role).to_string();
+        let chunk_names = [format!("{parent}.chunk0"), format!("{parent}.chunk1")];
+        let shape_of = |experts: usize| packed_stack_source_type(weight, experts, role);
+        let declared = [shape_of(2), shape_of(1)];
+        let placed = chunks(
+            chunk_names
+                .iter()
+                .zip(&declared)
+                .enumerate()
+                .map(|(value, (name, aval))| (value, name.as_str(), aval.shape.as_slice())),
+        )
+        .unwrap();
+        for (index, (name, aval)) in chunk_names.iter().zip(&declared).enumerate() {
+            let bytes = binder
+                .const_bytes(index, name, aval, placed.get(&index))
+                .expect("the chunk binds");
+            assert_eq!(
+                bytes.stored,
+                StoredAs::PackedStackSource { slab_bytes: 104 }
+            );
+            let table = binder.read(&bytes);
+            let first = [0, 2][index];
+            assert_eq!(table.len(), aval.shape[0] * 104, "chunk {index}");
+            for (offset, expert) in experts[first..first + aval.shape[0]].iter().enumerate() {
+                let slab = &table[offset * 104..(offset + 1) * 104];
+                assert_eq!(
+                    &slab[..102],
+                    expert.bytes(role),
+                    "chunk {index}, expert {}",
+                    first + offset
+                );
+                assert_eq!(&slab[102..], [0, 0]);
+            }
+        }
+
+        // A chunk declared taller than the experts left past its start is refused, never clamped.
+        let tall = shape_of(2);
+        let past_the_end = Chunk {
+            base: parent.clone(),
+            rows: 2..4,
+        };
+        assert!(matches!(
+            binder.const_bytes(0, &chunk_names[1], &tall, Some(&past_the_end)),
+            Err(LoadError::WeightShape { .. })
+        ));
     }
 }

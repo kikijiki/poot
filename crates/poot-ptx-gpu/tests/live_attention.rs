@@ -1,114 +1,28 @@
 //! POOT-1040 on PTX: a guarded live-attention graph the matcher declines (no declared length witness, so the
 //! length is not bounded) stays generic primitives, key ends in exact I32 included, and a live PTX device runs it.
 
-use std::sync::Arc;
-
 use poot_eval::{EvalBudget, EvalOptions, eval};
-use poot_executor::{
-    Device, Engine, ExecError, Executor, HostView, NoSync, StepInputs, WeightSource,
-};
-use poot_graph_ir::{Slot, Storage, ValidationOutputs};
-use poot_graph_plan::{
-    CompileLimits, CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, KernelChoice,
-    Partition, Submission, Target, TargetSet, compile_staged,
-};
+use poot_executor::{Device, Engine, Executor};
+use poot_executor_parity::live_attention::{compile_live, live_step};
+use poot_graph_plan::{KernelChoice, Target};
 use poot_kernelgen::KernelRequest;
 use poot_ptx_gpu::PtxDevice;
-use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_runtime_common::DeviceBackend;
-use poot_tensor::DType;
 use poot_test_util::device_skip::open_or_skip;
-use poot_test_util::live_attention::{Inputs, LiveAttentionFixture, LiveAttentionGraph};
+use poot_test_util::live_attention::{LiveAttentionFixture, LiveAttentionGraph};
 
-/// The graph compiled for the executor contract, then one step of it through `exec`.
-fn live_step(
-    exec: &mut dyn Executor,
-    target: Target,
-    built: &LiveAttentionGraph,
-    inputs: &Inputs,
-) -> Result<(Vec<f32>, bool), ExecError> {
-    let graph: &poot_graph_ir::Graph<ValidationOutputs> = &built.graph;
-    let program = compile_staged(
-        graph,
-        &TargetSet::single(DeviceId(0), target),
-        &Partition {
-            experts: ExpertPlacement::AllResident,
-            devices: DevicePlacement::Single(DeviceId(0)),
-        },
-        &CompileOptions {
-            execution: Submission::Replay,
-            limits: CompileLimits::STANDARD,
-        },
-    )
-    .expect("the declined live attention compiles for PTX");
-    let planned_attention = program.stages().any(|(_, _, stage)| {
-        stage.planned().any(|(eqn, _)| {
-            matches!(
-                stage.kernel_choice(eqn),
-                KernelChoice::Generated(KernelRequest::Attention(_))
-            )
-        })
-    });
-    let mut store = WeightStore::builder();
-    let mut pos_bytes = Vec::new();
-    let mut pos_key = None;
-    for &id in &graph.inputs {
-        let meta = graph.meta(id);
-        match meta.storage {
-            Storage::Const => {
-                let tensor = &inputs.0[&id];
-                let dense = DenseWeight::try_new(
-                    DType::F32,
-                    tensor.shape().to_vec(),
-                    Arc::from(tensor.view().bytes()),
+/// Whether the plan `built` compiles to for `target` holds a generated attention kernel.
+fn plans_attention_kernel(built: &LiveAttentionGraph, target: Target) -> bool {
+    compile_live(&built.graph, target)
+        .stages()
+        .any(|(_, _, stage)| {
+            stage.planned().any(|(eqn, _)| {
+                matches!(
+                    stage.kernel_choice(eqn),
+                    KernelChoice::Generated(KernelRequest::Attention(_))
                 )
-                .unwrap();
-                store
-                    .insert(
-                        meta.name.clone().expect("a named const"),
-                        WeightEntry::Dense(dense),
-                    )
-                    .unwrap();
-            }
-            Storage::Slot(Slot::Pos) => {
-                pos_bytes = inputs.0[&id]
-                    .as_i32()
-                    .unwrap()
-                    .iter()
-                    .flat_map(|word| word.to_le_bytes())
-                    .collect();
-                pos_key = Some((meta.slot_key().unwrap().clone(), meta.aval.shape.clone()));
-            }
-            other => panic!("unexpected live-attention input storage {other:?}"),
-        }
-    }
-    let exe = exec
-        .load_weights(Arc::new(store.build()), WeightSource::ConstNames)
-        .unwrap();
-    let entry = exec.add_entry(exe, &program).unwrap();
-    let (key, shape) = pos_key.expect("the decode reads Slot::Pos");
-    let mut step_in = StepInputs::new();
-    step_in.push(
-        key,
-        &shape,
-        HostView::new(DType::I32, shape.iter().product(), &pos_bytes).unwrap(),
-    );
-    let result = exec
-        .step(exe, entry, &step_in, &mut NoSync)
-        .map(|mut output| {
-            output
-                .read()
-                .unwrap()
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|chunk| f32::from_le_bytes(*chunk))
-                .collect()
+            })
         })
-        .map(|out| (out, planned_attention));
-    exec.remove_entry(exe, entry).unwrap();
-    exec.unload(exe).unwrap();
-    result
 }
 
 /// With NaN in every key and value past the length, the output is finite and within the attention tier of the
@@ -130,12 +44,16 @@ fn a_declined_live_attention_graph_runs_as_primitives_on_ptx() {
         dv: 8,
         shared_dim: None,
         softcap: None,
+        dtype: poot_tensor::DType::F32,
     };
     let built = fixture.build(false);
     let inputs = fixture.inputs(&built, &[5], true);
-    let (got, planned_attention) = live_step(&mut *exec, target, &built, &inputs)
+    assert!(
+        !plans_attention_kernel(&built, target),
+        "the unproved graph stays generic"
+    );
+    let got = live_step(&mut *exec, target, &built, &inputs)
         .expect("a declined graph runs on the device");
-    assert!(!planned_attention, "the unproved graph stays generic");
     assert!(
         got.iter().all(|x| x.is_finite()),
         "poison reached the output: {got:?}"
@@ -159,6 +77,83 @@ fn a_declined_live_attention_graph_runs_as_primitives_on_ptx() {
                 (g - w).abs() <= 1e-3,
                 "vs the {label}: element {i}: device {g} vs oracle {w}"
             );
+        }
+    }
+}
+
+/// POOT-1041 on PTX: the guarded live composite over BF16 and F16 operands (dense and split key, batch rows
+/// with different lengths, NaN in every key and value past each length) runs as generic primitives at its own
+/// dtype, the two-byte `Select` guarding keys, values and scores. The output is finite and within the two-byte
+/// tier of the guarded graph's CPU evaluation and of the first-`len` keys' oracle. Mutation: emit the select
+/// as an unconditional `if_true` in `emit_select` (kernelgen `fused.rs`); the poisoned tail reaches the
+/// matmuls and the finiteness assertion fails.
+#[test]
+fn a_narrow_live_attention_graph_runs_on_ptx_and_never_reads_the_poisoned_tail() {
+    let Some(device) = open_or_skip(DeviceBackend::Ptx, PtxDevice::new()) else {
+        return;
+    };
+    let target = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    for (dtype, tier) in [
+        (poot_tensor::DType::BF16, 4e-3),
+        (poot_tensor::DType::F16, 1e-3),
+    ] {
+        for shared_dim in [None, Some(4)] {
+            let fixture = LiveAttentionFixture {
+                batch: 2,
+                hq: 4,
+                hkv: 2,
+                cap: 37,
+                dk: 12,
+                dv: 8,
+                shared_dim,
+                softcap: Some(30.0),
+                dtype,
+            };
+            let label = format!("{dtype:?} shared {shared_dim:?}");
+            let built = fixture.build(true);
+            let len = [5, 37];
+            let inputs = fixture.inputs(&built, &len, true);
+            assert!(
+                !plans_attention_kernel(&built, target),
+                "{label}: the F32 attention kernel must not claim a narrow chain"
+            );
+            let got = live_step(&mut *exec, target, &built, &inputs)
+                .unwrap_or_else(|e| panic!("{label}: a narrow live graph runs on PTX: {e:?}"));
+            assert!(
+                got.iter().all(|x| x.is_finite()),
+                "{label}: poison reached the output: {got:?}"
+            );
+            let cpu = eval(
+                &built.graph,
+                &inputs.values(),
+                EvalOptions::new(EvalBudget::UNBOUNDED),
+            )
+            .unwrap()
+            .output
+            .into_host()
+            .unwrap();
+            let want = fixture.oracle(&inputs, &built, &len);
+            for (reference_label, reference) in [
+                ("guarded graph", cpu.as_f32().unwrap()),
+                ("first keys", &want[..]),
+            ] {
+                let worst = got
+                    .iter()
+                    .zip(reference)
+                    .map(|(g, w)| {
+                        if (g - w).is_nan() {
+                            f32::INFINITY
+                        } else {
+                            (g - w).abs()
+                        }
+                    })
+                    .fold(0.0, f32::max);
+                assert!(
+                    worst <= tier,
+                    "{label}: vs the {reference_label}: worst difference {worst:.3e}"
+                );
+            }
         }
     }
 }

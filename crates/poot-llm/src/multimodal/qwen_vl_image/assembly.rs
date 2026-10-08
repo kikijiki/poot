@@ -2,12 +2,14 @@ use poot_models::mrope::{
     MropeGrid, MropePositionError, MropeProcessorFpsInput, MropeProcessorTimingError,
     MropeSampledFramesPerSecond, MropeSecondsPerGridStep, MropeTemporalPatchSize, MropeVisualKind,
 };
-use poot_tensor::{DType, HostTensor};
+use std::mem::MaybeUninit;
+use std::sync::Arc;
+
+use poot_tensor::{DType, HostData, HostTensor};
 
 use super::MAX_VIDEO_FRAMES;
 use super::config::Qwen25VlImageProcessorConfig;
 use super::preprocess::{Qwen25VlTemporalLayoutError, qwen25_vl_temporal_layout};
-use crate::checkpoint::gguf::permute::gather_from;
 use crate::multimodal::qwen_vl_mrope::Qwen25VlProcessorMedia;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -548,4 +550,71 @@ pub(super) fn assemble_qwen25_vl_videos(
         grids,
         sampled_frames_per_second: fps,
     })
+}
+
+/// One tensor of `shape` gathered from several same-dtype sources: element `d` is element
+/// `order[d].1` of source `order[d].0` (the parts concatenated, whatever their storage class).
+pub(crate) fn gather_from(
+    srcs: &[&HostTensor],
+    shape: Vec<usize>,
+    order: impl Iterator<Item = (usize, usize)>,
+) -> HostTensor {
+    let dtype = srcs[0].dtype();
+    assert!(
+        srcs.iter().all(|src| src.dtype() == dtype),
+        "gather: every source must share one dtype"
+    );
+    let count: usize = shape.iter().product();
+    let data = match srcs[0].data() {
+        HostData::F32(_) => {
+            HostData::F32(gather_arc(&slices(srcs, HostTensor::as_f32), count, order))
+        }
+        HostData::I32(_) => {
+            HostData::I32(gather_arc(&slices(srcs, HostTensor::as_i32), count, order))
+        }
+        HostData::Half(_) => {
+            HostData::Half(gather_arc(&slices(srcs, HostTensor::as_half), count, order))
+        }
+        HostData::Bytes(_) => {
+            // An element is `byte_size` consecutive bytes, so its byte order is the element
+            // order expanded: one generic loop covers every width (E4M3FN, I8, I64, ...).
+            let width = dtype.byte_size();
+            let byte_order =
+                order.flat_map(move |(s, k)| (0..width).map(move |b| (s, k * width + b)));
+            let bytes: Vec<&[u8]> = srcs.iter().map(|src| src.view().bytes()).collect();
+            HostData::Bytes(gather_arc(&bytes, count * width, byte_order))
+        }
+    };
+    HostTensor::new(dtype, shape, data)
+        .expect("a gather writes exactly the destination shape's elements in the source's class")
+}
+
+fn slices<'a, T>(
+    srcs: &[&'a HostTensor],
+    words: impl Fn(&'a HostTensor) -> Option<&'a [T]>,
+) -> Vec<&'a [T]> {
+    srcs.iter()
+        .map(|src| words(src).expect("one dtype means one storage class"))
+        .collect()
+}
+
+fn gather_arc<T: Copy>(
+    srcs: &[&[T]],
+    count: usize,
+    order: impl Iterator<Item = (usize, usize)>,
+) -> Arc<[T]> {
+    let mut out: Arc<[MaybeUninit<T>]> = Arc::new_uninit_slice(count);
+    let buf = Arc::get_mut(&mut out).expect("freshly allocated Arc has exactly one owner");
+    let mut written = 0;
+    for (slot, (s, k)) in buf.iter_mut().zip(order) {
+        slot.write(srcs[s][k]);
+        written += 1;
+    }
+    assert_eq!(
+        written, count,
+        "gather: `order` must yield every destination element"
+    );
+    // SAFETY: `buf` has `count` slots and the loop wrote `written == count` of them (the zip stops
+    // at the shorter side, and the assert rules out a short `order`), each exactly once.
+    unsafe { out.assume_init() }
 }

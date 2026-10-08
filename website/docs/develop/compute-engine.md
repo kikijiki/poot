@@ -113,16 +113,17 @@ The wgpu backend runs the same contract as PTX and ROCm: build a `WgpuDevice`, w
 ```rust
 use std::sync::Arc;
 
-use poot_executor::{Device, Engine, Executor, HostView, NoSync, StepInputs, WeightSource};
+use poot_executor::{Device, Engine, Executor, HostView, NoSync, StepInputs};
 use poot_gpu::device::WgpuDevice;
 use poot_graph_plan::{
     compile_staged, CompileLimits, CompileOptions, DeviceId, DevicePlacement, ExpertPlacement,
     Partition, Submission, TargetSet,
 };
-use poot_quant::weights::WeightStore;
+use poot_quant::weights::{WeightMap, WeightStore};
 
-// use Builder / ops::* to trace the graph, as above; `store` is a WeightStore
-// naming every Storage::Const the graph declares.
+// use Builder / ops::* to trace the graph, as above; each Storage::Const the graph declares is a
+// WeightId::const_name, `store` holds the stored tensors and `map` (a WeightMap built over it)
+// names the store entries each weight reads.
 
 let device = WgpuDevice::new()?; // Err if no Vulkan adapter
 let target = device.target();
@@ -142,9 +143,8 @@ let staged = compile_staged(
 )?;
 
 let mut exec = Engine::new(device);
-// One load, reused by every entry. This hand-traced graph names each const by its store key, so it
-// binds by name; a `Model`'s graph passes `WeightSource::Map(map)` with the model's weight map.
-let exe = exec.load_weights(Arc::new(store), WeightSource::ConstNames)?;
+// One load, reused by every entry. A `Model`'s graph passes its own weight map.
+let exe = exec.load_weights(Arc::new(store), Arc::new(map))?;
 let entry = exec.add_entry(exe, &staged)?; // binds consts, loads plans
 
 // Bind this step's slot inputs (consts come from the store through the weight source), then run:

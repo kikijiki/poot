@@ -799,16 +799,6 @@ impl MropePositionIds {
         packed
     }
 
-    pub fn packed_for_len(&self, expected: usize) -> Result<Vec<i32>, MropePositionError> {
-        if self.len() != expected {
-            return Err(MropePositionError::LengthMismatch {
-                expected,
-                actual: self.len(),
-            });
-        }
-        Ok(self.packed())
-    }
-
     pub fn position(&self, index: usize) -> Result<MropePosition, MropePositionError> {
         if index >= self.len() {
             return Err(MropePositionError::IndexOutOfBounds {
@@ -2907,13 +2897,6 @@ mod tests {
     #[test]
     fn mrope_binding_shape_and_index_validation_is_typed() {
         let ids = build_mrope_position_ids(&[MropeSegment::Text(2)], 1).unwrap();
-        assert_eq!(
-            ids.packed_for_len(3),
-            Err(MropePositionError::LengthMismatch {
-                expected: 3,
-                actual: 2,
-            })
-        );
         assert_eq!(
             ids.position(2),
             Err(MropePositionError::IndexOutOfBounds { index: 2, len: 2 })

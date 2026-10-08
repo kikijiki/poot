@@ -4,7 +4,7 @@ use poot_tensor::DType;
 use std::collections::{HashMap, HashSet};
 
 use poot_graph_ir::Storage;
-use poot_target::{Backend, DeviceCaps};
+use poot_target::Backend;
 
 use crate::dtype_widen::bf16_const_is_packed;
 use crate::*;
@@ -80,7 +80,25 @@ impl<'g, V: ValidationChannel> ExactI32StorageAnalysis<'g, V> {
     /// Analyze exact-I32 storage requirements for one immutable graph.
     pub fn new(graph: &'g Graph<V>) -> Self {
         let mut components = ValueComponents::new(graph.values.len());
+        let is_i32 = |id: ValueId| {
+            graph
+                .values
+                .get(id)
+                .is_some_and(|value| value.aval.dtype == DType::I32)
+        };
+        // A Gather over I32 data moves the data's words, and an I32 table is an authoritative integer
+        // source (a hash table of expert ids), so data and output are exact whatever else touches them.
+        let mut pinned = Vec::new();
         for eqn in &graph.eqns {
+            if let (OpKind::Gather { .. }, Some(Operand::Value(data))) =
+                (&eqn.op, eqn.inputs.first())
+                && is_i32(*data)
+                && is_i32(eqn.out)
+            {
+                components.union(eqn.out, *data);
+                pinned.push(eqn.out);
+                continue;
+            }
             if graph
                 .values
                 .get(eqn.out)
@@ -136,6 +154,11 @@ impl<'g, V: ValidationChannel> ExactI32StorageAnalysis<'g, V> {
                     observed[root] = true;
                 }
             }
+        }
+        for id in pinned {
+            let root = components.find(id);
+            has_binary[root] = true;
+            observed[root] = true;
         }
         for root in graph.liveness_roots() {
             if root < graph.values.len() {
@@ -205,26 +228,6 @@ impl<'g, V: ValidationChannel> ExactI32StorageAnalysis<'g, V> {
     }
 }
 
-/// Gather data and output share one kernel element type, so they must agree on exact I32 storage. With the
-/// component rule neither is exact for an isolated Gather, which keeps legacy plans unchanged.
-pub(crate) fn exact_i32_gather_data(
-    analysis: ExactI32Requirements<'_>,
-    eqn: &Eqn,
-    data: ValueId,
-) -> Result<bool, PlanError> {
-    let data_exact = analysis.required(data);
-    let output_exact = analysis.required(eqn.out);
-    if data_exact != output_exact {
-        return Err(PlanError::ExactI32GatherStorage {
-            gather: eqn.out,
-            data,
-            data_exact,
-            output_exact,
-        });
-    }
-    Ok(data_exact)
-}
-
 pub(crate) fn exact_i32_pointwise_observation(op: &OpKind) -> Option<bool> {
     match op {
         OpKind::Binary(
@@ -271,7 +274,7 @@ pub(crate) fn exact_i32_pointwise_observation(op: &OpKind) -> Option<bool> {
 
 /// Card 526: every value's physical storage (dtype and packing) for one graph on one backend,
 /// computed once for the whole graph. Folds in the packed-vs-native distinction of a BF16 const each
-/// binder used to re-derive separately with its own call to `bf16_const_feeds_decode_bf16_gemv`:
+/// binder used to re-derive separately:
 /// `poot-gpu`, `poot-rocm-gpu` and `poot-ptx-gpu`'s binders read the result instead.
 ///
 /// Call once per (graph, backend) after `compile`'s dtype passes have run; a const's storage dtype is its
@@ -280,13 +283,11 @@ pub(crate) fn exact_i32_pointwise_observation(op: &OpKind) -> Option<bool> {
 /// A value's declared dtype and storage `Const`/`Device`/`Slot`/`State` residency, both already on
 /// `poot_graph_ir::ValueMeta`, are not restated here.
 ///
-/// `caps` is the device's measured [`DeviceCaps`], exactly as [`plan_eqn_analyzed`] takes it (card 522): the I32-slot-vs-F32-mirror decision (card 621) is a real per-eqn planning question -
-/// whether a value's consuming kernel param is `Slice<i32>` - that only the planner can answer (a
-/// `Gather` index is `Slice<i32>` exactly when [`ExactI32StorageAnalysis`] proves the value's whole
-/// component is authoritative I32, `Slice<f32>` otherwise; card 545b: no const
-/// is `Slice<i32>` unconditionally any more - `MatMulDequant`, the only op that ever consumed one that
-/// way, is deleted). A caller with no measured device yet passes a documented fixture, as for
-/// [`plan_eqn_analyzed`].
+/// The I32-slot-vs-F32-mirror decision (card 621) is a real per-eqn planning question - whether a value's
+/// consuming kernel param is `Slice<i32>` - that only the planner can answer (a `Gather` index is
+/// `Slice<i32>` exactly when [`ExactI32StorageAnalysis`] proves the value's whole component is authoritative
+/// I32, `Slice<f32>` otherwise; card 545b: no const is `Slice<i32>` unconditionally any more -
+/// `MatMulDequant`, the only op that ever consumed one that way, is deleted). That is why this takes the plans.
 ///
 /// Every value's storage, read from one plan per equation (in `g.eqns` order; `None` for an equation that
 /// did not plan, which constrains no operand). A pure function of the graph and the plans:
@@ -304,15 +305,15 @@ pub(crate) fn exact_i32_pointwise_observation(op: &OpKind) -> Option<bool> {
 pub(crate) fn value_storage_of_plans<'p, V: ValidationChannel>(
     g: &Graph<V>,
     backend: Backend,
-    caps: &DeviceCaps,
     plans: impl Iterator<Item = Option<&'p Plan>>,
 ) -> Result<GraphStorage, PlanError> {
     let plans: Vec<Option<&Plan>> = plans.collect();
     let lanes = I32ReadLanes::of_plans(g, plans.iter().copied());
     lanes.check_agreement()?;
-    let weights = dense_contraction_weight_storages(g)?;
+    let mut weights = dense_contraction_weight_storages(g)?;
+    weights.extend(e4m3_row_gather_table_storages(g)?);
     let views = compute_views(g, backend);
-    let storage = storage_of_read_lanes(g, backend, &views, &lanes, &weights, caps);
+    let storage = storage_of_read_lanes(g, backend, &views, &lanes, &weights);
     check_bf16_const_reads(g, backend, &storage, &plans)?;
     Ok(storage)
 }
@@ -379,13 +380,12 @@ fn storage_of_read_lanes<V: ValidationChannel>(
     views: &HashMap<ValueId, Layout>,
     lanes: &I32ReadLanes,
     weights: &HashMap<ValueId, StorageKind>,
-    caps: &DeviceCaps,
 ) -> GraphStorage {
     let values = (0..g.values.len())
         .map(|id| {
             ValueStorage::new(match weights.get(&id) {
                 Some(&kind) => kind,
-                None => value_storage_kind(g, views, id, backend, lanes, caps),
+                None => value_storage_kind(g, views, id, backend, lanes),
             })
         })
         .collect();
@@ -442,6 +442,48 @@ fn dense_contraction_weight_storages<V: ValidationChannel>(
     Ok(weights)
 }
 
+/// Every E4M3FN table a `DenseRowGather` reads, with the packed lane that gather's body decodes
+/// ([`StorageKind::E4m3Packed`], POOT-1060). A buffer has one storage, so such a table must be a non-escaping
+/// const whose every reader is a `DenseRowGather` at its table operand: anything else is
+/// [`PlanError::UnrepresentableValue`] with [`StorageGap::E4m3PackedLanes`], naming the table. An E4M3FN value
+/// no row gather reads keeps its dense record, which no executor binds (the engine refuses it by name).
+fn e4m3_row_gather_table_storages<V: ValidationChannel>(
+    g: &Graph<V>,
+) -> Result<HashMap<ValueId, StorageKind>, PlanError> {
+    let gathers = |eqn: &Eqn| match (&eqn.op, eqn.inputs.first()) {
+        (
+            OpKind::DenseRowGather {
+                source: DType::E4M3FN,
+            },
+            Some(Operand::Value(table)),
+        ) => Some(*table),
+        _ => None,
+    };
+    let tables: HashSet<ValueId> = g.eqns.iter().filter_map(gathers).collect();
+    for &table in &tables {
+        let sole_reader = g.eqns.iter().all(|eqn| {
+            eqn.inputs.iter().enumerate().all(|(position, operand)| {
+                !matches!(operand, Operand::Value(read) if *read == table)
+                    || (position == 0 && gathers(eqn) == Some(table))
+            })
+        });
+        if g.meta(table).storage != Storage::Const
+            || g.liveness_roots().any(|root| root == table)
+            || !sole_reader
+        {
+            return Err(PlanError::UnrepresentableValue {
+                value: table,
+                dtype: DType::E4M3FN,
+                gap: StorageGap::E4m3PackedLanes,
+            });
+        }
+    }
+    Ok(tables
+        .into_iter()
+        .map(|table| (table, StorageKind::E4m3Packed))
+        .collect())
+}
+
 /// Card 621 (generalizing the pre-card-621 `i32_param_value_ids` duplicated in `poot-gpu`,
 /// `poot-rocm-gpu` and `poot-ptx-gpu`): which kernel param type each value is read through. `exact` holds
 /// the values some kernel consumes through a `Slice<i32>` param, i.e. that must be bound as exact i32 bytes
@@ -454,7 +496,7 @@ fn dense_contraction_weight_storages<V: ValidationChannel>(
 /// declared I32. Without the walk, an exact-I32 value reshaped into the f32-only DynamicUpdateSlice index
 /// has two values, each read on one lane, and the conflict hides.
 ///
-/// A value's consumer is well-defined (a `Slot::SlotMap`/`Slot::GdnSlotMap` feeds only its
+/// A value's consumer is well-defined (a `Slot::SlotMap` feeds only its
 /// `ScatterUpdate`/`DynamicUpdateSlice` as an f32 mirror; a `Gather` index or an I32->F32 `Cast` source
 /// is i32 only when [`ExactI32StorageAnalysis`] proves its whole component authoritative, e.g. a
 /// `Slot::Token` feeding embedding lookup alone never is - card 545b: a quant
@@ -552,7 +594,7 @@ fn slice_elem(ty: &poot_kernel_ir::Ty) -> Option<&poot_kernel_ir::Ty> {
 }
 
 /// [`fixture_value_storage`]'s per-value decision. A declared-I32 value no kernel reads through `Slice<i32>`
-/// ([`I32ReadLanes`]) is the F32-mirror lane (card 621: a `Slot::SlotMap`/`Slot::GdnSlotMap` index, an
+/// ([`I32ReadLanes`]) is the F32-mirror lane (card 621: a `Slot::SlotMap` index, an
 /// embedding-lookup `Slot::Token`, or any other I32 value whose planned consumers read `Slice<f32>`). Every other
 /// value that is not a BF16 const keeps its declared dtype, densely stored. A BF16 const is never widened
 /// (Card 1011): it is BF16 on every backend, and [`bf16_const_is_packed`] decides whether the buffer is
@@ -563,7 +605,6 @@ fn value_storage_kind<V: ValidationChannel>(
     id: ValueId,
     backend: Backend,
     lanes: &I32ReadLanes,
-    caps: &DeviceCaps,
 ) -> StorageKind {
     let declared = g.aval(id).dtype;
     if declared == DType::I32 {
@@ -576,7 +617,7 @@ fn value_storage_kind<V: ValidationChannel>(
     if g.meta(id).storage != Storage::Const || declared != DType::BF16 {
         return StorageKind::Dense(declared);
     }
-    if bf16_const_is_packed(g, views, id, backend, caps) {
+    if bf16_const_is_packed(g, views, id, backend) {
         StorageKind::Bf16Packed
     } else {
         StorageKind::Dense(DType::BF16)
@@ -598,6 +639,16 @@ mod value_storage_tests {
     /// takes pre-planned equations rather than planning them itself. This test-only wrapper restores
     /// the "plan everything, then derive storage" shape these fixtures want.
     fn fixture_value_storage(g: &Graph, backend: Backend, caps: &DeviceCaps) -> GraphStorage {
+        fixture_value_storage_result(g, backend, caps)
+            .expect("fixture graph has no I32 reader lane conflict")
+    }
+
+    /// [`fixture_value_storage`], keeping the refusal a graph with an unrepresentable value gets.
+    fn fixture_value_storage_result(
+        g: &Graph,
+        backend: Backend,
+        caps: &DeviceCaps,
+    ) -> Result<GraphStorage, crate::PlanError> {
         let exact_i32 = ExactI32StorageAnalysis::new(g);
         let plans: Vec<Option<Plan>> = g
             .eqns
@@ -614,8 +665,7 @@ mod value_storage_tests {
                 .ok()
             })
             .collect();
-        super::value_storage_of_plans(g, backend, caps, plans.iter().map(Option::as_ref))
-            .expect("fixture graph has no I32 reader lane conflict")
+        super::value_storage_of_plans(g, backend, plans.iter().map(Option::as_ref))
     }
 
     /// `a x w -> f32` over two consts of the given dtypes, `m x 32 x 32`; mirrors
@@ -673,7 +723,7 @@ mod value_storage_tests {
         for backend in backends {
             for (label, g) in &graphs {
                 let caps = poot_test_util::device_caps::default_caps_for(backend);
-                let prepared = prepare_target_graph(g, backend, &caps);
+                let prepared = prepare_target_graph(g, backend);
                 let storage = fixture_value_storage(&prepared, backend, &caps);
                 for id in (0..prepared.values.len())
                     .filter(|&id| prepared.meta(id).storage == Storage::Const)
@@ -708,7 +758,7 @@ mod value_storage_tests {
 
         // Card 545b: `MatMulDequant`'s packed-quant I32 const (the original raw-I32-lane producer here) is
         // deleted; the surviving I32-lane consumer this pure-planner test can use is a `Gather` index
-        // `ExactI32StorageAnalysis` proves authoritative (`storage_analysis.rs`, `exact_i32_gather_data`):
+        // `ExactI32StorageAnalysis` proves authoritative (`ExactI32StorageAnalysis::new`):
         // `Binary(GeU, idx_a, idx_b)`'s unsigned bit-pattern comparison has no legacy float
         // interpretation, so its whole component - `idx_a`, `idx_b` and the `GeU` output feeding
         // `Gather`'s index - is "required", unconditionally, unlike the isolated Token/SlotMap cases below.
@@ -826,10 +876,7 @@ mod value_storage_tests {
                 experts: ExpertPlacement::AllResident,
                 devices: DevicePlacement::Single(DeviceId(0)),
             },
-            &CompileOptions {
-                execution: Submission::Replay,
-                limits: crate::CompileLimits::STANDARD,
-            },
+            &CompileOptions::new(Submission::Replay, crate::CompileLimits::STANDARD),
         )
         .expect_err("a gather over a packed BF16 table has no lane to read");
         let crate::staged::StagedCompileError::Compile(crate::CompileError::Plan(plan)) = error
@@ -881,10 +928,7 @@ mod value_storage_tests {
                     experts: ExpertPlacement::AllResident,
                     devices: DevicePlacement::Single(DeviceId(0)),
                 },
-                &CompileOptions {
-                    execution: Submission::Replay,
-                    limits: crate::CompileLimits::STANDARD,
-                },
+                &CompileOptions::new(Submission::Replay, crate::CompileLimits::STANDARD),
             )
             .unwrap();
             let (_, _, program) = staged.stages().next().unwrap();
@@ -907,6 +951,78 @@ mod value_storage_tests {
                     poot_target::BufferStorage::bf16_packed(),
                     "{name}: a BF16 const read only by a packed reader on {backend:?}"
                 );
+            }
+        }
+    }
+
+    /// A `Qwen4Exp` PLE shard: an E4M3FN `[rows, width]` const gathered by an I32 index and widened,
+    /// which `fold_dense_bf16_row_gathers` makes one `DenseRowGather`.
+    fn e4m3_shard_graph(rows: usize, width: usize, second_reader: bool) -> (Graph, usize) {
+        use poot_graph_ir::{BinOp, RedOp, Slot};
+
+        let b = Builder::new();
+        let table = b.constant("shard", TensorType::new(vec![rows, width], DType::E4M3FN));
+        let token = b.slot(Slot::Token, TensorType::new(vec![3], DType::I32));
+        let gathered = b.cast(b.gather(table, 0, token), DType::F32);
+        let out = if second_reader {
+            // The table is also widened whole and summed: a reader that is not a row gather, so the
+            // table cannot be the packed lane.
+            let widened = b.cast(table, DType::F32);
+            let sum = |v| b.reduce(RedOp::Sum, b.reduce(RedOp::Sum, v, 1, false), 0, false);
+            b.binary(BinOp::Add, sum(gathered), sum(widened))
+        } else {
+            gathered
+        };
+        (crate::fold_dense_bf16_row_gathers(&b.finish(out)), table.id)
+    }
+
+    /// POOT-1060: an E4M3FN table only `DenseRowGather` reads is planned `e4m3_packed()` on every backend,
+    /// at `rows * ceil(width / 4)` words.
+    ///
+    /// Mutation: drop the `e4m3_row_gather_table_storages` extension in `value_storage_of_plans`; the table
+    /// plans as dense E4M3FN raw bytes on every backend and this row goes red.
+    #[test]
+    fn an_e4m3_table_read_only_by_row_gathers_plans_packed() {
+        let (g, table) = e4m3_shard_graph(9, 6, false);
+        for backend in [
+            Backend::SpirvVulkan,
+            Backend::Nvptx,
+            Backend::AmdGcn(AmdArch::gfx1151()),
+        ] {
+            let caps = poot_test_util::device_caps::default_caps_for(backend);
+            let storage = fixture_value_storage(&g, backend, &caps);
+            let planned = storage.storage(table).buffer_storage();
+            assert_eq!(
+                planned,
+                poot_target::BufferStorage::e4m3_packed(),
+                "{backend:?}"
+            );
+            assert_eq!(planned.device_elems(&[9, 6]), Some(18), "{backend:?}");
+        }
+    }
+
+    /// POOT-1060: a buffer has one storage, so an E4M3FN table a second, non-row-gather equation reads is a
+    /// typed refusal naming the table, not a packed buffer another kernel would read as raw bytes.
+    ///
+    /// Mutation: skip the `sole_reader` test in `e4m3_row_gather_table_storages`; the shared table plans
+    /// packed and this row goes red.
+    #[test]
+    fn an_e4m3_table_with_a_second_reader_is_a_typed_refusal() {
+        let (g, table) = e4m3_shard_graph(9, 6, true);
+        for backend in [
+            Backend::SpirvVulkan,
+            Backend::Nvptx,
+            Backend::AmdGcn(AmdArch::gfx1151()),
+        ] {
+            let caps = poot_test_util::device_caps::default_caps_for(backend);
+            match fixture_value_storage_result(&g, backend, &caps) {
+                Err(crate::PlanError::UnrepresentableValue {
+                    value,
+                    dtype: DType::E4M3FN,
+                    gap: crate::StorageGap::E4m3PackedLanes,
+                }) => assert_eq!(value, table, "{backend:?}"),
+                Err(other) => panic!("{backend:?}: expected the packed-E4M3 refusal, got {other}"),
+                Ok(_) => panic!("{backend:?}: a shared E4M3 table was planned"),
             }
         }
     }

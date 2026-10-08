@@ -69,39 +69,6 @@ pub fn attention_prefill_with_sink(
     b.matmul(p, v) // [1,Hq,L,D]
 }
 
-/// [`attention_prefill_with_sink`]'s single-query decode analog (`L=1`, `mask[1,1,1,cap]`).
-#[allow(clippy::too_many_arguments)]
-pub fn attention_masked_with_sink(
-    b: &Builder,
-    q: Traced,
-    k: Traced,
-    v: Traced,
-    n_rep: usize,
-    scale: f32,
-    mask: Traced,
-    sinks: Traced,
-    hq: usize,
-) -> Traced {
-    let k = repeat_kv(b, k, n_rep);
-    let v = repeat_kv(b, v, n_rep);
-    let kt = b.transpose(k, vec![0, 1, 3, 2]); // [1,Hq,D,cap]
-    let scores = b.matmul(q, kt); // [1,Hq,1,cap]
-    let scores = b.binary_scalar(BinOp::Mul, scores, Scalar::F32(scale));
-    let scores = b.binary(BinOp::Add, scores, mask);
-    let last = b.aval(scores).rank() - 1;
-    let m_scores = b.reduce(RedOp::Max, scores, last, true); // [1,Hq,1,1]
-    let sinks_b = b.reshape(sinks, vec![1, hq, 1, 1]); // L=1: no broadcast needed
-    let m = b.binary(BinOp::Max, m_scores, sinks_b);
-    let shifted = b.binary(BinOp::Sub, scores, m);
-    let e = b.unary(UnOp::Exp, shifted);
-    let denom_scores = b.reduce(RedOp::Sum, e, last, true);
-    let sink_shifted = b.binary(BinOp::Sub, sinks_b, m);
-    let e_sink = b.unary(UnOp::Exp, sink_shifted);
-    let denom = b.binary(BinOp::Add, denom_scores, e_sink);
-    let p = b.binary(BinOp::Div, e, denom);
-    b.matmul(p, v) // [1,Hq,1,D]
-}
-
 /// Decode attention (single query token), GQA, no mask (l=1 attends all cached keys). `q[1,Hq,1,D]`,
 /// `k`/`v[1,Hkv,S,D]`. Returns `[1,Hq,1,D]`.
 pub fn attention(b: &Builder, q: Traced, k: Traced, v: Traced, n_rep: usize, scale: f32) -> Traced {
@@ -265,7 +232,7 @@ pub(crate) fn attention_over_keys(
     attn_logit_softcap: Option<f32>,
     live_len: Option<Traced>,
 ) -> Traced {
-    let live = live_len.map(|len| LiveKeys::new(b, len, b.aval(v).shape[2]));
+    let live = live_len.map(|len| LiveKeys::new(b, len, b.aval(v).shape[2], b.aval(v).dtype));
     let guard_rows = |x: Traced| match &live {
         Some(live) => b.select(live.rows, x, live.zero_rows),
         None => x,
@@ -310,14 +277,14 @@ struct LiveKeys {
     rows: Traced,
     /// `[B,1,1,Lk]` I32: the same condition laid along the score row.
     columns: Traced,
-    /// `[1,1,Lk,1]` finite zeros, the fallback for an inactive K or V row.
+    /// `[1,1,Lk,1]` finite zeros in the operands' dtype, the fallback for an inactive K or V row.
     zero_rows: Traced,
-    /// `[1,1,1,Lk]` `-inf`, the fallback for an inactive score.
+    /// `[1,1,1,Lk]` `-inf` in the operands' dtype, the fallback for an inactive score.
     neg_inf_columns: Traced,
 }
 
 impl LiveKeys {
-    fn new(b: &Builder, len: Traced, lk: usize) -> Self {
+    fn new(b: &Builder, len: Traced, lk: usize, dtype: DType) -> Self {
         let batch = b.aval(len).shape[0];
         let len = b.reshape(len, vec![batch, 1, 1, 1]);
         // `j < len` is `len >= j + 1`; the key ends `1..=Lk` are built exactly in I32, with no float round trip.
@@ -326,6 +293,12 @@ impl LiveKeys {
         // scalar, and `-inf` is added to a zero rather than multiplied into a possible `0 * inf`.
         let zero = b.binary_scalar(BinOp::Mul, b.iota(lk), Scalar::F32(0.0));
         let neg_inf = b.binary_scalar(BinOp::Add, zero, Scalar::F32(f32::NEG_INFINITY));
+        // A select's branches share one dtype: zero and `-inf` are exact in every float dtype.
+        let (zero, neg_inf) = if dtype == DType::F32 {
+            (zero, neg_inf)
+        } else {
+            (b.cast(zero, dtype), b.cast(neg_inf, dtype))
+        };
         Self {
             rows: b.binary(BinOp::Ge, len, b.reshape(ends, vec![1, 1, lk, 1])),
             columns: b.binary(BinOp::Ge, len, b.reshape(ends, vec![1, 1, 1, lk])),

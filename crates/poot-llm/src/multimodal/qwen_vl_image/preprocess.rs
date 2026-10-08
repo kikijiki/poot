@@ -2,7 +2,7 @@
 //!
 //! Held for Card 566b (the VLM front end on the driver): the single-image entries below are the only
 //! producers of the public `Qwen25VlProcessedImage` and have no production caller yet, so rustc reports
-//! them dead where it reports them at all (`#[expect(dead_code, reason = "held for POOT-739 (formerly 566b)")]`). The
+//! them dead where it reports them at all (`#[expect(dead_code, reason = "held for POOT-650")]`). The
 //! default-config wrappers only this crate's tests call are `#[cfg(test)]`; `raw_request.rs` calls the
 //! live `*_with_config` batch and video entries.
 
@@ -282,10 +282,7 @@ pub(super) fn validate_decoded_dimensions(
 }
 
 /// Preprocess one decoded RGB8 image into the existing processor-media handoff contract.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "held for POOT-739 (formerly 566b)")
-)]
+#[cfg_attr(not(test), expect(dead_code, reason = "held for POOT-650"))]
 pub(crate) fn preprocess_qwen2_5_vl_image(
     image: &Qwen25VlDecodedImage,
 ) -> Result<Qwen25VlProcessedImage, Qwen25VlImagePreprocessError> {

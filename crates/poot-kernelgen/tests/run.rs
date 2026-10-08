@@ -1784,7 +1784,7 @@ fn matmul_epilogue_chain_matches_cpu() {
 
 #[test]
 fn epilogue_bodies_compile_to_valid_spirv_and_nvptx() {
-    use kg::{ContractionSpec, KernelRequest, MatmulShapes, Schedule, WeightLayout};
+    use kg::{ContractionSpec, KernelRequest, MatmulShapes, Schedule};
     use poot_target::DeviceCaps;
     let caps = DeviceCaps::wgpu_rdna3_igpu();
     let limits = kg::BodyLimits {
@@ -1839,7 +1839,6 @@ fn epilogue_bodies_compile_to_valid_spirv_and_nvptx() {
             "epilogue_dense_gemv_f16_weight",
             KernelRequest::Contraction(ContractionSpec::DenseGemv {
                 weight: BufferStorage::f16_packed(),
-                layout: WeightLayout::Nk,
                 schedule: Schedule::Gemv {
                     width: 16,
                     cols: 2,

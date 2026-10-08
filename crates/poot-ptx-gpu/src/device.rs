@@ -81,7 +81,7 @@ impl PtxDevice {
         }
     }
 
-    /// Diagnostic access to the underlying context (e.g. `profiler()`, `vram_used_bytes()`).
+    /// Diagnostic access to the underlying context (e.g. `profiler()`).
     pub fn context(&self) -> &PtxContext {
         &self.ctx
     }
@@ -102,6 +102,10 @@ impl Device for PtxDevice {
 
     fn memory(&self) -> Vec<(BufferRole, poot_executor::MemoryCounterSnapshot)> {
         self.ctx.memory()
+    }
+
+    fn free_memory_bytes(&self) -> Option<u64> {
+        self.ctx.vram_free_bytes()
     }
 
     fn allocate(

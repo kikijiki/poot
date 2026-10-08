@@ -69,8 +69,17 @@ order-dependent TTFT variance).
 
 - **TTFT** = request start to first generated token. The one-time prefill cost; grows with ISL.
 - **ITL_i** = gap between decode token i-1 and i. Reported as p50 / p90 / p99.
-- **TPOT** = (e2e - TTFT) / (OSL - 1) = mean decode ITL, prefill EXCLUDED. (MLPerf/Anyscale convention;
-  the `OSL-1` denominator is stated in output, not vLLM's historical `OSL`.)
+- **TPOT** = mean ITL = (last token - first token) / (OSL - 1), prefill EXCLUDED and post-token cleanup
+  EXCLUDED. (MLPerf/Anyscale convention; the `OSL-1` denominator is stated in output, not vLLM's historical
+  `OSL`.)
+- **Finish** = completion minus the last token's delivery: cleanup after the last token. It changes E2E and
+  never TPOT. **E2E** = TTFT + sum(ITL) + finish for every request, checked per request from the raw,
+  unrounded boundaries (rounding is for display only). Zero tokens: no TTFT or ITL, everything is finish. One
+  token: TTFT and finish, no ITL. A request that stops before the requested length is an early stop; it
+  cannot supply exact-work timing.
+- **Steps** = executor steps a request cost. Prefill yields token 1 and each decode step one more, so a
+  request that delivered N tokens cost at least N steps; fewer means a token was computed outside its
+  request (hidden in warmup) and the request is refused.
 - **Decode tokens/s (steady state)** = 1000 / median TPOT_ms, the headline decode number. Not
   `gen_tokens / e2e`, which folds the one-time prefill into the per-token rate.
 - Report percentiles (p50/p90/p99), not just means; windows are kept >1s (sub-second windows are
@@ -138,9 +147,9 @@ python3 harness/bench.py report harness/fixtures/run-a
 
 ### Compare two builds
 
-A speed change is only real if it clears the noise, so `compare` takes repeats, not single runs: at least 5
-run directories per side, each a full run of the same matrix, all of one binary per side. Run the matrix 5
-times per build with distinct run ids, then:
+A speed change is only real if it clears the noise, so `compare` takes repeats, not single runs: at least
+`min_trials` (manifest `[performance]`, 5) run directories per side, each a full run of the same matrix, all
+of one binary per side. Run the matrix 5 times per build with distinct run ids, then:
 
 ```bash
 for i in 1 2 3 4 5; do uv run bench run --framework poot --model qwen2.5-0.5b --run-id base-$i; done
@@ -148,10 +157,64 @@ for i in 1 2 3 4 5; do uv run bench run --framework poot --model qwen2.5-0.5b --
 python3 harness/bench.py compare --baseline results/base-{1..5} --candidate results/cand-{1..5}
 ```
 
-A cell is keyed by `(model, scenario, framework, backend, device)`. The band is the baseline median plus or
-minus its range; a candidate median more than one further range below it is a regression. The exit code is 1
-for a regression, a failed candidate cell or a non-finite sample, 2 when a cell has too few repeats, mixes
-binaries, or nothing could be compared, and 0 otherwise. Speed is recorded, never gated.
+A cell is keyed by `(model, scenario, framework, backend, device)`, and rows that state different workloads
+(precision, prompt length, output length) are `incomparable`. One comparator, `harness/performance_receipt.py`,
+judges every required pair of a cell: the smallest-context headline and, for a decode-curve cell, TPOT and
+TTFT at every context the baseline measured. The cell's verdict is the most serious pair, so a good headline
+never hides a slower long-context token, a context the candidate did not run (`not run`) or a failed repeat
+(`repeat failed`: a failed repeat is never dropped, however many others succeeded). Latency is worse when
+higher, throughput worse when lower.
+
+The uncertainty rule is bounded and declared in `manifest.toml` `[performance]`: the band is twice the larger
+observed range of the two sides; a candidate further outside it is a regression (or improvement); inside it
+the cell is within noise only if the band is narrower than the metric's `max_uncertainty` and cannot hide a
+loss of its `practical_threshold`. A band too wide, too few repeats, or an exhausted `max_trials` budget that
+never narrowed it is `unverified`, never success. The exit code is 1 for a regression, a failed or incomparable
+cell or a non-finite sample, 2 when any cell is unverified, not run, refused or has no baseline, and 0 only
+when every cell the baseline measured was compared without a regression: a partial comparison never passes.
+
+Which timing a runner claims is declared once, in `harness/result_contract.py` (`timing_claim`): poot claims
+`request-window` (every request reports its raw boundaries and steps, and TPOT is the mean inter-token gap); the
+candle, transformers, vllm and llamacpp runners report `row-level` timing only (ttft, e2e and per-token gaps;
+TPOT is `(e2e - ttft) / (osl - 1)`). Each stored row says which in `timing_claim`, and row-level rows compare on
+the row-level identity subset only.
+
+### Performance receipts and the bank
+
+`harness/performance_receipt.py` also validates a *receipt* (a record of one workload on one device with
+every repeat): identity and preparation. Two records are compared only if they state the same workload
+identity: checkpoint digest and token fixture, precision and layout, dimensions and lengths (prompt, live,
+max context, requested and actual output), sampler and template, cache state and prepared set, timing
+policy, and backend/device/driver. A field a record omits is a mismatch, never a wildcard. Profiled or
+otherwise perturbed time is a diagnostic and cannot supply any speed metric.
+
+Preparation is reported per layer (plan, entries, generated bodies, artifact builds and hits, runtime
+pipelines, recordings, graph instantiations), as the work preparing the declared set cost and the work
+repeating it added, under one of three labelled states: `cold-process-empty-artifacts`,
+`cold-process-populated-artifacts`, `reused-prepared-driver`. Repeating the declared set must add no work to
+any layer. A layer no producer counts is `null` (Unknown) and makes the receipt incomplete for it; the poot
+runner counts plan, entries and recordings and the artifact cache directory (`POOT_KERNEL_CACHE_DIR`), and
+reports the rest as Unknown. Pass `--prepared-state` to declare the state.
+
+`performance-bank/` is the checked-in small bank: `cases.json` defines each case (shape, storage, numerics,
+token fixture, cache condition, schedules) once, for the validator and for the backend runners
+(`examples/performance_bank.rs` in `poot-gpu`, `poot-rocm-gpu`, `poot-ptx-gpu`). `receipts.json` claims, per
+case and backend, a verified baseline receipt or the case as missing/refused with its reason; planned cases
+(packed decode, long recurrence, expert routing) stay explicit missing coverage until their producers land.
+
+```bash
+python3 harness/performance_bank.py                       # validate identities, claims and receipt files
+python3 harness/performance_bank.py --stamp               # restamp identities after an intended case edit
+flock /tmp/poot-gpu.lock python3 harness/performance_bank.py --record dense-decode-gemv wgpu \
+    --wrap "poot-cargo nix develop -c"                    # measure on this device, register the receipt
+```
+
+Receipts are hardware measurements under `performance-bank/receipts/<backend>/`, kept apart from the
+model-free fixtures in `harness/tests`. A receipt names the commit its binary was built from (the tree must be
+clean), the device and driver, the realized plan, the observed workload, and an independent f64 reference.
+`receipts/request-level/` holds the poot runner's own decode-curve lines from the three preparation states on one device (qwen2.5-0.5b, wgpu): measurements, not claims, so `receipts.json` does not list them.
+Hardware numbers are recorded with their noise: a baseline taken next to other GPU work shows it, and the
+uncertainty rule above then calls a later comparison unverified instead of passing it.
 
 ### Run it (needs a GPU + the runners built/installed)
 
@@ -263,8 +326,8 @@ once a clean baseline curve is committed, a poot-only re-run is a single ~30-40 
 ## Per-framework gotchas (full detail in each `runners/<fw>/NOTES.md`)
 
 - **poot** - built with `cargo build --release -p poot-bench-runner` (a root-workspace member; GPU kernels are
-  generated at runtime). One measure loop serves the `ptx`, `rocm` and `wgpu` backends (`--backend`); each
-  backend only names the `Runner` generation entry it uses. Decode-curve contexts are prefilled in one batched
+  generated at runtime). One measure loop serves the `ptx`, `rocm` and `wgpu` backends (`--backend`), all
+  over the driver. Decode-curve contexts are prefilled in one batched
   forward and decoded with EOS ignored for a fixed token count. The runner takes only measurement flags, and
   its one output line is the result: it has no probe or receipt modes. A refused model is reported as an
   `unsupported` result carrying the refusal text.

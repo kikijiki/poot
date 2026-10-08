@@ -5,8 +5,8 @@
 //! is the two KV caches, the conv window and the recurrent matrix.
 
 use poot_graph_ir::ops::{
-    attention_masked_softcap, causal_conv1d_decode, gated_delta_net_decode, linear, moe_grouped,
-    rmsnorm, rope, sigmoid, silu, softplus,
+    attention_masked_softcap, causal_conv1d_decode, causal_mask_from_pos, gated_delta_net_decode,
+    linear, moe_grouped, rmsnorm, rope, sigmoid, silu, softplus,
 };
 use poot_graph_ir::{BinOp, Builder, Slot, StateRole, TensorType, UnOp};
 use poot_tensor::{DType, HostTensor};
@@ -45,8 +45,7 @@ fn toy_fixture(name: &'static str, bias: bool) -> Fixture {
     let b = Builder::new();
     let token = b.slot(Slot::Token, TensorType::scalar(DType::I32));
     let pos = b.slot(Slot::Pos, TensorType::scalar(DType::I32));
-    let mask = b.slot(Slot::Mask, TensorType::f32(vec![CAP]));
-    let mask4 = b.reshape(mask, vec![1, 1, 1, CAP]);
+    let mask4 = causal_mask_from_pos(&b, b.reshape(pos, vec![1, 1]), CAP, None);
 
     let embed = b.constant("toy.embed", TensorType::f32(vec![VOCAB, H]));
     let mut x = b.reshape(b.gather_scalar(embed, 0, token), vec![1, 1, H]);
@@ -140,9 +139,6 @@ fn toy_fixture(name: &'static str, bias: bool) -> Fixture {
     let key = |id| graph.meta(id).slot_key().unwrap().clone();
     let steps = (0..CAP)
         .map(|step| {
-            let mask_row: Vec<f32> = (0..CAP)
-                .map(|t| if t <= step { 0.0 } else { -1.0e9 })
-                .collect();
             vec![
                 StepFixture {
                     key: key(token.id),
@@ -152,10 +148,6 @@ fn toy_fixture(name: &'static str, bias: bool) -> Fixture {
                     key: key(pos.id),
                     tensor: HostTensor::i32(vec![], vec![step as i32]),
                 },
-                StepFixture {
-                    key: key(mask.id),
-                    tensor: HostTensor::f32(vec![CAP], mask_row),
-                },
             ]
         })
         .collect();
@@ -164,7 +156,6 @@ fn toy_fixture(name: &'static str, bias: bool) -> Fixture {
         graph,
         store,
         steps,
-        guarded: false,
     }
 }
 

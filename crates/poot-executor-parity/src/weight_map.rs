@@ -1,12 +1,12 @@
 //! Card 564's device fixtures: qwen2's one body (Card 732) behind [`Model`], over BF16 or Q8_0
-//! fixture stores, bound through [`WeightSource::Map`]. A backend's tests run [`run_steps`] on their
+//! fixture stores, bound through the weight map. A backend's tests run [`run_steps`] on their
 //! own `Executor` and compare with the caller's oracle; nothing here depends on `poot-eval`.
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use poot_executor::{ExecError, Executor, NoSync, StepInputs, WeightSource};
+use poot_executor::{ExecError, Executor, NoSync, StepInputs};
 use poot_graph_ir::{Graph, Slot, SlotKey, ValidationOutputs};
 use poot_graph_plan::{
     CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram,
@@ -398,10 +398,7 @@ pub fn compile(g: &Graph<ValidationOutputs>, target: Target) -> StagedProgram<Va
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions {
-            execution: Submission::Replay,
-            limits: poot_graph_plan::CompileLimits::STANDARD,
-        },
+        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
     )
     .unwrap_or_else(|e| panic!("compile: {e}"))
 }
@@ -422,7 +419,7 @@ pub fn run_steps(
     steps: &[Step],
     prepare: &dyn Fn(Graph<ValidationOutputs>) -> Graph<ValidationOutputs>,
 ) -> Result<Vec<Vec<f32>>, ExecError> {
-    let exe = exec.load_weights(store, WeightSource::Map(Arc::clone(&map)))?;
+    let exe = exec.load_weights(store, Arc::clone(&map))?;
     let mut entries = HashMap::new();
     let mut logits = Vec::with_capacity(steps.len());
     for step in steps {
@@ -503,7 +500,7 @@ pub fn assert_close(got: &[f32], want: &[f32], tol: f32, label: &str) {
 /// class-to-tolerance table exists in the tree yet, so this stated bound is the row's own.
 pub const TIER2: f32 = 1e-3;
 
-/// SC-001: qwen2's one body over a `projections` store, bound through `WeightSource::Map`: a
+/// SC-001: qwen2's one body over a `projections` store, bound through the weight map: a
 /// prefill of three tokens and the decode after it each equal the oracle on the same graph, state
 /// carried. `bind` is the map the device binds through (the model's own; a mutation swaps views).
 pub fn check_matches_oracle(
@@ -702,7 +699,7 @@ pub fn check_split_head(exec: &mut dyn Executor, target: Target) {
 }
 
 /// POOT-651: a qwen2.5-0.5B-shaped BF16 checkpoint whose head is tied to the embedding (two layers; vocab,
-/// hidden, heads and intermediate width are the real ones) decodes through [`WeightSource::Map`]. Every step's
+/// hidden, heads and intermediate width are the real ones) decodes through the weight map. Every step's
 /// logits equal `oracle` within [`TIER2`], and the executable's `Weight` residency is exactly the stored tensors
 /// at two bytes per element: the tied head and the embedding share one packed BF16 buffer and no F32 copy of the
 /// head exists.
@@ -742,7 +739,7 @@ pub fn check_tied_head(exec: &mut dyn Executor, target: Target, oracle: &MappedO
 
     let g = trace(model.as_ref(), &map, Phase::Decode, 1, CAPACITY);
     let exe = exec
-        .load_weights(Arc::clone(&store), WeightSource::Map(Arc::clone(&map)))
+        .load_weights(Arc::clone(&store), Arc::clone(&map))
         .unwrap();
     let entry = exec.add_entry(exe, &compile(&g, target)).unwrap();
     let mut state: Vec<HostTensor> = g

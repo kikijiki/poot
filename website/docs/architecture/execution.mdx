@@ -24,16 +24,14 @@ a constant shape. poot uses **fixed-capacity KV with masking**:
 - K and V are `Storage::State` buffers preallocated to a capacity `cap` per layer.
 - Each step writes the new K/V at `pos` (`DynamicUpdateSlice`, or `ScatterUpdate` through a slot map
   for paged KV).
-- Attention always sweeps `[cap]`; a mask hides positions after `pos`. For the dense families (qwen2
-  and its relatives, bloom, granite, mpt, smollm3, gemma2) that mask is a graph computation over
-  `Slot::Pos` against an `Iota`; other families still carry it as a `Slot::Mask` input.
+- Attention always sweeps `[cap]`; a mask hides positions after `pos`. That mask is a graph
+  computation over `Slot::Pos` against an `Iota`; no slot carries it.
 
 Grids and buffer addresses stay constant, so one capture serves every position up to `cap`.
 
 ## Slot buffers
 
-Per-step inputs (`Slot::Token`, `Slot::Pos`, and `Slot::SlotMap` for paged KV, plus `Slot::Mask` on
-families that have not yet moved their mask in-graph) live in device buffers at stable addresses. The
+Per-step inputs (`Slot::Token`, `Slot::Pos`, and `Slot::SlotMap` for paged KV) live in device buffers at stable addresses. The
 recorded kernel arguments point at them, and the host rewrites their contents before each replay. The
 planner binds any scalar that depends on a slot to the slot buffer rather than baking it into the
 capture, which would replay a stale value.
@@ -55,19 +53,20 @@ per-backend `Device` trait implements an object-safe `Executor` (`target_set`, `
 `add_entry`, `step`, `reset_state`, `remove_entry`, `stats`, `unload`), so the driver above it never
 branches on a backend. `Submission::Replay` is the contract's only admitted mode; `Submission::Eager`
 is a typed refusal there. The three `Device` implementations are `poot-gpu`'s `WgpuDevice`,
-`poot-rocm-gpu`'s `RocmDevice` and `poot-ptx-gpu`'s `PtxDevice`. `load_weights` takes the weight store and a
-`WeightSource`: `Map` binds each weight a model's graph names through the model's weight map, by its typed role, and
-`ConstNames` binds a const to the store entry of the same name, the form the runner's own graphs still use.
+`poot-rocm-gpu`'s `RocmDevice` and `poot-ptx-gpu`'s `PtxDevice`. `load_weights` takes the weight store and a weight map, which binds each weight a graph names by its typed role; a const the map
+does not name is unbound, even when a store key spells its name.
 
-The `poot-llm` driver drives this contract on every backend: `Driver::new` loads a `ModelHandle`'s weights
-once (`WeightSource::Map`), and each step's entry comes from the family's `trace` for that step shape,
-compiled for the executor's target. Every causal family that generates is registered and runs on the driver.
-The vision-language caption path still runs on the Runner, whose `Runner::load_on` bakes its weights into the
-`WeightStore` that `Engine::load_weights` records and whose caption entry takes the returned
-`ExecutableId` together with `&mut dyn Executor`. Greedy and plain-temperature generation (including top-k/top-p/min-p)
+The `poot-llm` driver drives this contract on every backend ([Models, Registry and the
+Driver](./driver.mdx)): `Driver::new` loads a `ModelHandle`'s weights once, as one executable (through the
+model's weight map), and each step shape it needs is an entry added to that executable, from the family's
+`trace` for that shape, compiled for the executor's target. Entries are keyed by phase, step shape and sampling
+suffix, so a token, a position or a sampler parameter never makes a new one. Every causal family that generates is registered and runs on the driver, and
+so do the rest: `Driver::encode` runs an `Encode` step (a BERT encoder's embeddings and reranking, a decoder's
+hidden states, a vision tower's frames), and a prompt can supply embedding rows in place of some tokens'
+(`Driver::generate_with_embeds`), which is how the vision-language caption path scatters its image rows. Those
+rows and a frame's pixels are bound by value on every step, never baked into a program. Greedy and plain-temperature generation (including top-k/top-p/min-p)
 pick the next token on-device: a sampling step is appended to the decode graph itself, and the host
-reads back only the chosen token id and a non-finite flag, not the full logits. A request with a
-logit-bias/penalty, logprob recording, or a guided-decoding constraint still reads the full logits
+reads back only the chosen token id and a non-finite flag, not the full logits. A request with logit-bias/penalty, logprob recording, or a guided-decoding constraint still reads the full logits
 back and picks on the host, since those transforms are host-side. Batching pieces for serving (slot
 admission, KV-fit budgeting) exist as tested building blocks, but `poot-serve` runs no generation
 engine.
@@ -76,8 +75,7 @@ engine.
 
 `poot-eval` is the CPU reference: one evaluation walk, `poot_eval::eval(&graph, &inputs, EvalOptions)`,
 which returns an `Evaluation` (primary output, carried state, optional environment). The driver's
-oracle checks, the vision-language caption path's CPU runs and the encoder embeddings/reranking server paths call it;
-GPU generation never does.
+oracle checks and the device rows' CPU references call it; GPU generation never does.
 The verification contract has three tiers; these are requirements, not a claim that every current
 path has complete coverage:
 

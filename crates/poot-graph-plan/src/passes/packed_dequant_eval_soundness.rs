@@ -14,10 +14,13 @@ use poot_graph_ir::{
     Traced, packed_source_constants,
 };
 use poot_quant::format::{ScaleEncoding, Storage, WeightFormat};
-use poot_quant::{OperandRole, PackedComponentRef, PackedPayload, PackedWeight, SourceRole};
+use poot_quant::{
+    OperandRole, PackedComponentRef, PackedPayload, PackedStack, PackedStackComponentRef,
+    PackedWeight, SourceRole,
+};
 
 use poot_eval::{EvalBudget, EvalError, EvalOptions, PackedEvalError, Value, eval};
-use poot_tensor::HostTensor;
+use poot_tensor::{DType, HostTensor};
 
 /// Thread-local allocation byte counter (duplicated from `poot-eval/src/tests/allocation.rs`: an
 /// external integration test cannot reach that `pub(super)` helper, and `#[global_allocator]` can
@@ -426,21 +429,15 @@ fn packed_dequant_fused_and_unfused_compositions_match() -> Result<(), BuilderAp
     Ok(())
 }
 
-/// Mutant M8 (mutants-m4.md): `packed_grouped_linear`'s stable-sort comparators (`ge * -1 + 1` for
-/// "selector less" and "row less") were checked only structurally. Five rows routed to experts
-/// `[2, 0, 2, 1, 0]` (a tie in expert 0 and in expert 2, so both comparators decide) through three
-/// experts with distinct weights: the grouped graph and the indexed graph must both give, row by
-/// row, the row's own expert's `x @ W^T` computed from `PackedPayload::decode_row`.
-#[test]
-fn packed_grouped_linear_matches_the_per_row_expert_product() -> Result<(), BuilderAppendError> {
-    use poot_graph_ir::ops::{PackedLinearGraphRow, packed_grouped_linear, packed_indexed_linear};
-
+/// Three E4M3 experts with distinct weights, `[out, k] = [3, 5]`: the payloads the indexed rows below route
+/// through.
+fn indexed_experts(experts: u8) -> (PackedWeight, Vec<Arc<PackedPayload>>) {
     let format = WeightFormat::E4m3Block128 {
         scale: ScaleEncoding::E8m0,
     };
     let [out, k] = [3, 5];
     let descriptor = PackedWeight::try_new(format, [out, k]).unwrap();
-    let experts: Vec<Arc<PackedPayload>> = (0..3u8)
+    let payloads = (0..experts)
         .map(|expert| {
             let codes: Vec<u8> = (0..(out * k) as u8)
                 .map(|index| (index * 7 + expert * 3 + 1) % 0x70)
@@ -460,20 +457,73 @@ fn packed_grouped_linear_matches_the_per_row_expert_product() -> Result<(), Buil
             )
         })
         .collect();
-    let rows: Vec<PackedLinearGraphRow> = (0..experts.len())
-        .map(|ordinal| PackedLinearGraphRow {
-            ordinal,
-            linear_id: format!("moe.expert.{ordinal}"),
-            descriptor,
-        })
-        .collect();
+    (descriptor, payloads)
+}
+
+/// The indexed packed graph over `experts` (one `PackedStack` of them), bound for the CPU oracle: the graph, its
+/// inputs for activations `x_data` routed by `route`.
+fn indexed_graph(
+    descriptor: PackedWeight,
+    experts: &[Arc<PackedPayload>],
+    x_data: &[f32],
+    route: &[usize],
+) -> (Graph, HashMap<usize, Value>) {
+    use poot_graph_ir::ops::{PackedExpertStack, packed_indexed_linear};
+    let (m, k) = (route.len(), descriptor.shape()[1]);
+    let table = PackedExpertStack {
+        stack_id: "moe.experts".to_string(),
+        descriptor,
+        experts: experts.len(),
+    };
+    let b = Builder::new();
+    let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![m, k]));
+    let selector = b.slot_named(Slot::Activation, "selector", TensorType::f32(vec![m]));
+    let output = packed_indexed_linear(&b, x, selector, &table).unwrap();
+    let graph = b.finish(output);
+    let stack = Arc::new(PackedStack::try_new(experts.to_vec()).unwrap());
+    let mut inputs = HashMap::new();
+    inputs.insert(
+        x.id,
+        Value::Host(HostTensor::f32(vec![m, k], x_data.to_vec())),
+    );
+    inputs.insert(
+        selector.id,
+        Value::Host(HostTensor::f32(
+            vec![m],
+            route.iter().map(|&expert| expert as f32).collect(),
+        )),
+    );
+    for graph_input in &graph.inputs {
+        let Some(source) = graph
+            .meta(*graph_input)
+            .name
+            .as_deref()
+            .and_then(PackedSourceName::parse)
+        else {
+            continue;
+        };
+        inputs.insert(
+            *graph_input,
+            PackedStackComponentRef::new(Arc::clone(&stack), source.role()).into(),
+        );
+    }
+    (graph, inputs)
+}
+
+/// `packed_indexed_linear`'s claimed contraction against the per-row expert product computed from
+/// `PackedPayload::decode_row`: five rows routed to experts `[2, 0, 2, 1, 0]` (a tie in expert 0 and in
+/// expert 2) through three experts with distinct weights give, row by row, the row's own expert's `x @ W^T`.
+/// The accumulation is the dense `IndexedMatMul` oracle's sequential `k` sum over the same decoded weight, so
+/// the result is bit-identical to it (`to_bits`), not merely close.
+#[test]
+fn packed_indexed_linear_matches_the_per_row_expert_product() {
+    let (descriptor, experts) = indexed_experts(3);
+    let [out, k] = descriptor.shape();
     let route = [2usize, 0, 2, 1, 0];
     let m = route.len();
     let x_data: Vec<f32> = (0..m * k)
         .map(|index| (index as f32 - 11.0) / 7.0)
         .collect();
-
-    // Each expert's `[out, K]` weight, row by row through `PackedPayload::decode_row`.
     let weights: Vec<Vec<f32>> = experts
         .iter()
         .map(|expert| {
@@ -487,71 +537,124 @@ fn packed_grouped_linear_matches_the_per_row_expert_product() -> Result<(), Buil
     let mut expected = vec![0.0f32; m * out];
     for (row, &expert) in route.iter().enumerate() {
         for o in 0..out {
-            expected[row * out + o] = (0..k)
-                .map(|column| x_data[row * k + column] * weights[expert][o * k + column])
-                .sum();
+            let mut acc = 0.0f32;
+            for column in 0..k {
+                acc += x_data[row * k + column] * weights[expert][o * k + column];
+            }
+            expected[row * out + o] = acc;
         }
     }
+    let (graph, inputs) = indexed_graph(descriptor, &experts, &x_data, &route);
+    let Value::Host(got) = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        .map(|r| r.output)
+        .unwrap()
+    else {
+        panic!("dense result");
+    };
+    assert_eq!(got.shape(), vec![m, out]);
+    for (index, (&got, &want)) in got.as_f32().unwrap().iter().zip(&expected).enumerate() {
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "row {} output {}: {got} vs {want}",
+            index / out,
+            index % out
+        );
+    }
+}
 
-    type Build =
-        fn(&Builder, Traced, Traced, &[PackedLinearGraphRow]) -> Result<Traced, BuilderAppendError>;
-    let builders: [(&str, Build); 2] = [
-        ("packed_grouped_linear", packed_grouped_linear),
-        ("packed_indexed_linear", packed_indexed_linear),
-    ];
-    for (name, build) in builders {
-        let b = Builder::new();
-        let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![m, k]));
-        let selector = b.slot_named(Slot::Activation, "selector", TensorType::f32(vec![m]));
-        let output = build(&b, x, selector, &rows)?;
-        let graph = b.finish(output);
-        let mut inputs = HashMap::new();
-        inputs.insert(
-            x.id,
-            Value::Host(HostTensor::f32(vec![m, k], x_data.clone())),
-        );
-        inputs.insert(
-            selector.id,
-            Value::Host(HostTensor::f32(
-                vec![m],
-                route.iter().map(|&expert| expert as f32).collect(),
-            )),
-        );
-        for graph_input in &graph.inputs {
-            let Some(source) = graph
-                .meta(*graph_input)
-                .name
-                .as_deref()
-                .and_then(PackedSourceName::parse)
-            else {
-                continue;
-            };
-            let expert = rows
-                .iter()
-                .position(|row| row.linear_id == source.linear_id())
-                .expect("every packed source names one expert row");
-            inputs.insert(
-                *graph_input,
-                PackedComponentRef::new(Arc::clone(&experts[expert]), source.role()).into(),
-            );
-        }
-        let Value::Host(got) = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
-            .map(|r| r.output)
-            .unwrap()
-        else {
-            panic!("{name}: dense result");
-        };
-        assert_eq!(got.shape(), vec![m, out], "{name}");
-        for (index, (&got, &want)) in got.as_f32().unwrap().iter().zip(&expected).enumerate() {
-            assert!(
-                (got - want).abs() <= 1e-5 * want.abs().max(1.0),
-                "{name} row {} output {}: {got} vs {want}",
-                index / out,
-                index % out
-            );
+/// An observer counting the allocations an evaluation charges, by size.
+#[derive(Default)]
+struct Allocations(Vec<usize>);
+
+impl poot_eval::observer::EvalObserver for Allocations {
+    fn allocation(&mut self, _eqn: usize, _out: usize, _dtype: DType, bytes: usize) {
+        self.0.push(bytes);
+    }
+}
+
+/// SC-005 (ruling F545-11): the CPU oracle evaluates a claimed `PackedContraction { rows: Indexed }` by decoding
+/// only the experts the routing selects. Six experts, three rows routed to experts `[4, 1, 4]` (two distinct
+/// experts, `K = 2 < E = 6`): the output is bit-identical to a full per-expert decode (the dense
+/// `IndexedMatMul` over all six decoded experts), and the decode-block witness - one `[out, K]` allocation per
+/// expert actually decoded, charged through the observer - counts `K = 2`, not `E = 6`.
+/// Mutation: decode every stacked expert before applying the row selection; the output is unchanged but the
+/// witness count is 6 and this row goes red.
+#[test]
+fn the_indexed_oracle_decodes_only_the_selected_experts() {
+    let (descriptor, experts) = indexed_experts(6);
+    let [out, k] = descriptor.shape();
+    let route = [4usize, 1, 4];
+    let m = route.len();
+    let x_data: Vec<f32> = (0..m * k).map(|index| (index as f32 - 4.0) / 5.0).collect();
+    let (graph, inputs) = indexed_graph(descriptor, &experts, &x_data, &route);
+    let mut allocations = Allocations::default();
+    let evaluation = eval(
+        &graph,
+        &inputs,
+        EvalOptions::new(EvalBudget::UNBOUNDED).observer(&mut allocations),
+    )
+    .unwrap();
+    let Value::Host(got) = evaluation.output else {
+        panic!("dense result");
+    };
+
+    // The full materialization: every expert decoded into one `[E, K, out]` table, then the dense oracle.
+    let mut table = vec![0.0f32; experts.len() * k * out];
+    for (e, expert) in experts.iter().enumerate() {
+        let mut row = vec![0.0f32; k];
+        for o in 0..out {
+            expert.decode_row(o, &mut row).unwrap();
+            for (c, &value) in row.iter().enumerate() {
+                table[e * k * out + c * out + o] = value;
+            }
         }
     }
-    Ok(())
+    let b = Builder::new();
+    let x = b.constant("x", TensorType::f32(vec![m, k]));
+    let w = b.constant("w", TensorType::f32(vec![experts.len(), k, out]));
+    let ids = b.constant("ids", TensorType::f32(vec![m]));
+    let y = b.indexed_matmul(x, w, ids);
+    let dense = b.finish(y);
+    let dense_inputs: HashMap<usize, Value> = [
+        (x.id, HostTensor::f32(vec![m, k], x_data.clone())),
+        (w.id, HostTensor::f32(vec![experts.len(), k, out], table)),
+        (
+            ids.id,
+            HostTensor::f32(vec![m], route.iter().map(|&e| e as f32).collect()),
+        ),
+    ]
+    .into_iter()
+    .map(|(id, tensor)| (id, Value::Host(tensor)))
+    .collect();
+    let Value::Host(want) = eval(
+        &dense,
+        &dense_inputs,
+        EvalOptions::new(EvalBudget::UNBOUNDED),
+    )
+    .unwrap()
+    .output
+    else {
+        panic!("dense result");
+    };
+    let bits =
+        |t: &HostTensor| -> Vec<u32> { t.as_f32().unwrap().iter().map(|v| v.to_bits()).collect() };
+    assert_eq!(
+        bits(&got),
+        bits(&want),
+        "bit-identical to a full per-expert decode"
+    );
+
+    let expert_decodes = allocations
+        .0
+        .iter()
+        .filter(|&&bytes| bytes == out * k * 4)
+        .count();
+    assert_eq!(
+        expert_decodes, 2,
+        "one decode per selected expert (4 and 1), not per stacked expert (6): {:?}",
+        allocations.0
+    );
 }
 
 /// R467-009: the reversed `(W @ x^T)^T` spelling of `packed_linear`'s canonical `x @ W^T`, recognized as
@@ -620,7 +723,10 @@ fn transposed_packed_contraction_fused_and_unfused_compositions_match()
             matches!(
                 fused.eqns.as_slice(),
                 [poot_graph_ir::Eqn {
-                    op: OpKind::PackedContraction { blocks: 1, .. },
+                    op: OpKind::PackedContraction {
+                        rows: poot_graph_ir::ContractionRows::Blocks(1),
+                        ..
+                    },
                     ..
                 }]
             ),
@@ -709,7 +815,10 @@ fn blocked_packed_contraction_fused_and_unfused_compositions_match()
         assert!(matches!(
             fused.eqns.as_slice(),
             [poot_graph_ir::Eqn {
-                op: poot_graph_ir::OpKind::PackedContraction { blocks: 4, .. },
+                op: poot_graph_ir::OpKind::PackedContraction {
+                    rows: poot_graph_ir::ContractionRows::Blocks(4),
+                    ..
+                },
                 ..
             }]
         ));
@@ -787,7 +896,7 @@ fn packed_dequant_production_rejects_valid_preexisting_candidate() -> Result<(),
         [poot_graph_ir::Eqn {
             op: poot_graph_ir::OpKind::PackedContraction {
                 descriptor: actual,
-                blocks: 1
+                rows: poot_graph_ir::ContractionRows::Blocks(1)
             },
             ..
         }] if *actual == descriptor
@@ -855,7 +964,7 @@ fn contract_through_the_oracle(
     let output = plan.equation(
         OpKind::PackedContraction {
             descriptor: weight,
-            blocks: 1,
+            rows: poot_graph_ir::ContractionRows::Blocks(1),
         },
         operands,
     )?;

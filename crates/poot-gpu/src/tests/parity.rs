@@ -6,7 +6,6 @@ use crate::device::WgpuDevice;
 use poot_executor::Executor;
 use poot_executor::{Device, Engine};
 use poot_executor_parity::Fixture;
-use poot_executor_parity::hung::WithRoutedHang;
 use poot_tensor::HostTensor;
 use poot_test_util::weight_map_oracle::oracle_for;
 
@@ -14,29 +13,16 @@ fn target(device: &WgpuDevice) -> poot_graph_plan::Target {
     device.target()
 }
 
-/// Every fixture against its oracle, a plain one on an engine over the bare device and a guarded one
-/// (compiled under the routed-expert hang guard) on an engine over a device that reports the hang, so
-/// the guarded program loads. `before` runs on each fixture with the target it will be compiled for.
-/// `None` when no adapter opens.
+/// Every fixture against its oracle on an engine over the device. `before` runs on each fixture with the
+/// target it will be compiled for. `None` when no adapter opens.
 fn run_each(
     fixtures: &[Fixture],
     before: impl Fn(&Fixture, poot_graph_plan::Target),
 ) -> Option<()> {
-    let plain = WgpuDevice::new().ok()?;
-    let t = target(&plain);
-    let mut plain: Box<dyn Executor> = Box::new(Engine::new(plain));
-    let mut hung: Option<(Box<dyn Executor>, poot_graph_plan::Target)> = None;
+    let device = WgpuDevice::new().ok()?;
+    let t = target(&device);
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
     for fixture in fixtures {
-        let (exec, t) = if fixture.guarded {
-            let (exec, t) = hung.get_or_insert_with(|| {
-                let device = WithRoutedHang(WgpuDevice::new().expect("a second wgpu device"));
-                let t = device.target();
-                (Box::new(Engine::new(device)) as Box<dyn Executor>, t)
-            });
-            (exec, *t)
-        } else {
-            (&mut plain, t)
-        };
         before(fixture, t);
         let mut oracle = oracle_for(&fixture.graph, &fixture.store);
         poot_executor_parity::run_parity(exec.as_mut(), t, fixture, &mut oracle)
@@ -107,7 +93,7 @@ fn alibi_slopes_attention_matches_the_oracle_and_the_reference_on_wgpu() {
 }
 
 /// Card 1007 acceptance row 1: `matmul(x, transpose(w))` over an F16 `[N, K]` const, at `M = 1` (the decode GEMV),
-/// `4` and `33` (the tiled GEMM) and under the MoE hang guard (the serial kernel), compiled for wgpu: the program
+/// `4` and `33` (the tiled GEMM), compiled for wgpu: the program
 /// holds one `DenseContraction` and no `Transpose`, and every replayed step matches `eval(g)` of the traced graph
 /// within the parity tolerance (ADR-0101 tier 2). The weight lives on the device as packed binary16 words.
 /// Mutation: remove `DType::F16` from `DENSE_CONTRACTION_WEIGHT_DTYPES`; a `Transpose` is planned and this row goes
@@ -125,7 +111,7 @@ fn f16_checkpoint_orientation_projection_matches_the_oracle_on_wgpu() {
 }
 
 /// Card 1024: `matmul(x, transpose(w))` over a BF16 `[N, K]` const, at `M = 1` (the decode GEMV), `4` and `33`
-/// (the generated tiled GEMM) and under the MoE hang guard (the serial kernel), compiled for wgpu: the program
+/// (the generated tiled GEMM), compiled for wgpu: the program
 /// holds one `DenseContraction` and no `Transpose`, and every replayed step matches `eval(g)` of the traced graph
 /// within the parity tolerance (ADR-0101 tier 2). The weight lives on the device as packed bfloat16 words.
 /// Mutation: in `tiled_region`'s `WeightLayout::Nk` arm index the weight as `[K, N]`; the `M = 4` and `M = 33`
@@ -135,6 +121,25 @@ fn bf16_checkpoint_orientation_projection_matches_the_oracle_on_wgpu() {
     if run_each(
         &poot_executor_parity::checkpoint_projection_bf16_fixtures(),
         poot_executor_parity::assert_one_dense_contraction,
+    )
+    .is_none()
+    {
+        eprintln!("skip: no wgpu adapter");
+    }
+}
+
+/// POOT-1048: a grouped projection `matmul(x, transpose(reshape(w, [G, N, K]), [0, 2, 1]))` over a BF16 `[G * N, K]`
+/// const (DeepSeek V4's `wo_a`), at `M = 1`, `5` and `33` with three groups and at one group, compiled for wgpu: the
+/// program holds one `GroupedDenseContraction` and neither a `Transpose` nor a `Cast`, and every replayed step
+/// matches `eval(g)` of the traced graph within the parity tolerance (ADR-0101 tier 2). The weight lives on the
+/// device as packed bfloat16 words.
+/// Mutation: in `matmul_batched_impl` give the weight no per-group batch offset (zero its `b_beff`); the three-group
+/// rows go red.
+#[test]
+fn bf16_grouped_projection_matches_the_oracle_on_wgpu() {
+    if run_each(
+        &poot_executor_parity::grouped_projection_bf16_fixtures(),
+        poot_executor_parity::assert_one_grouped_dense_contraction,
     )
     .is_none()
     {
@@ -257,7 +262,7 @@ fn run_once_matches_a_hand_computed_elementwise_add() {
 /// poisoned branches and an I32 select over nonzero condition words each equal the hand-written select words
 /// and the oracle's, bit for bit: a NaN or an infinity in the unselected branch stays out, and a NaN payload,
 /// an infinity or `-0.0` in the selected one passes through.
-/// Mutation: emit the arithmetic form `if_false + cond * (if_true - if_false)` in `emit_bitwise_select`
+/// Mutation: emit the arithmetic form `if_false + cond * (if_true - if_false)` in `emit_select`
 /// (`poot-kernelgen`'s `fused.rs`), with a fresh `POOT_KERNEL_CACHE_DIR`; every row goes red.
 #[test]
 fn select_is_bitwise_on_wgpu() {
@@ -268,6 +273,19 @@ fn select_is_bitwise_on_wgpu() {
     let t = target(&device);
     let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
     poot_executor_parity::select::assert_select_is_bitwise(exec.as_mut(), t);
+}
+
+/// POOT-1041: a BF16 and an F16 `Select` are refused at planning for the wgpu device's target with the typed
+/// `DtypeLowering` on the select: SPIR-V has no native two-byte lane to move.
+/// Mutation: drop the SPIR-V exclusion from the two-byte arm of the `Select` planning
+/// (`planner/elementwise.rs`); the compile succeeds and this row goes red.
+#[test]
+fn two_byte_select_is_refused_on_wgpu() {
+    let Ok(device) = WgpuDevice::new() else {
+        eprintln!("skip: no wgpu adapter");
+        return;
+    };
+    poot_executor_parity::select::assert_two_byte_select_is_refused(target(&device));
 }
 
 /// Card 1011: a BF16 const cast to F32 is read from its packed `u32` lanes by the imported
@@ -300,7 +318,7 @@ fn bf16_const_cast_is_bit_exact_on_wgpu() {
 /// the oracle panics in `materialize_dense`.
 /// Mutation: drop the packed-components arm of `poot_test_util::weight_map_oracle::oracle_for`; every row goes red.
 #[test]
-fn packed_linears_and_the_canonical_expert_chain_match_the_oracle_on_wgpu() {
+fn packed_linears_and_the_indexed_expert_contraction_match_the_oracle_on_wgpu() {
     let Ok(device) = WgpuDevice::new() else {
         eprintln!("skip: no wgpu adapter");
         return;
@@ -309,7 +327,7 @@ fn packed_linears_and_the_canonical_expert_chain_match_the_oracle_on_wgpu() {
     let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
     let fixtures = poot_executor_parity::packed::packed_linear_fixtures()
         .into_iter()
-        .chain(poot_executor_parity::packed::packed_chain_fixtures());
+        .chain(poot_executor_parity::packed::packed_expert_fixtures());
     for fixture in fixtures {
         let mut oracle = oracle_for(&fixture.graph, &fixture.store);
         poot_executor_parity::run_parity(exec.as_mut(), t, &fixture, &mut oracle)

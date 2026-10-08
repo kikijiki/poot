@@ -1,14 +1,8 @@
-//! Typed host binding for Card 152's packed mRoPE position slot.
+//! The sectioned-RoPE position cursor of a Qwen-VL decode (held for POOT-650).
 
-use poot_tensor::DType;
-use std::collections::HashMap;
-
-use poot_eval::Value;
-use poot_graph_ir::{Graph, Slot, ValueId};
 use poot_models::mrope::{
     MAX_EXACT_MROPE_POSITION, MropePosition, MropePositionError, MropePositionIds,
 };
-use poot_tensor::HostTensor;
 
 /// Per-request sectioned-RoPE cursor for production decode scheduling.
 ///
@@ -17,15 +11,17 @@ use poot_tensor::HostTensor;
 /// the prompt it advances collapsed generated-text positions from
 /// [`MropePositionIds::next_text_position`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MropeDecodeState {
+#[cfg_attr(not(test), expect(dead_code, reason = "held for POOT-650"))]
+pub(crate) struct MropeDecodeState {
     positions: MropePositionIds,
     token_index: usize,
     current: MropePosition,
 }
 
+#[cfg_attr(not(test), expect(dead_code, reason = "held for POOT-650"))]
 impl MropeDecodeState {
     /// Construct a cursor at `token_index`, validating the request's encoded prompt length first.
-    pub fn new(
+    pub(crate) fn new(
         positions: MropePositionIds,
         expected_prompt_len: usize,
         token_index: usize,
@@ -44,21 +40,17 @@ impl MropeDecodeState {
         })
     }
 
-    pub const fn current(&self) -> MropePosition {
+    pub(crate) const fn current(&self) -> MropePosition {
         self.current
     }
 
-    pub const fn token_index(&self) -> usize {
+    pub(crate) const fn token_index(&self) -> usize {
         self.token_index
-    }
-
-    pub fn prompt_len(&self) -> usize {
-        self.positions.len()
     }
 
     /// Move to an explicit scheduler token index. Validation is atomic: overflow leaves the cursor
     /// unchanged.
-    pub fn seek(&mut self, token_index: usize) -> Result<(), MropePositionError> {
+    pub(crate) fn seek(&mut self, token_index: usize) -> Result<(), MropePositionError> {
         let current = position_for_token_index(&self.positions, token_index)?;
         self.token_index = token_index;
         self.current = current;
@@ -66,7 +58,7 @@ impl MropeDecodeState {
     }
 
     /// Advance exactly one consumed row token. A scheduler holds a row by not calling this method.
-    pub fn advance(&mut self) -> Result<(), MropePositionError> {
+    pub(crate) fn advance(&mut self) -> Result<(), MropePositionError> {
         let next = self
             .token_index
             .checked_add(1)
@@ -104,263 +96,10 @@ fn position_for_token_index(
     Ok(MropePosition::collapsed(position))
 }
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum MropeBindError {
-    #[error("mRoPE graph has no Slot::MropePosition input")]
-    MissingSlot,
-    #[error(
-        "mRoPE graph has {count} Slot::MropePosition inputs; exactly one packed slot is required"
-    )]
-    MultipleSlots { count: usize },
-    #[error("mRoPE {mode} slot has shape {actual:?}; expected {expected:?}")]
-    Shape {
-        mode: &'static str,
-        expected: Vec<usize>,
-        actual: Vec<usize>,
-    },
-    #[error("mRoPE slot has dtype {actual}; expected i32")]
-    WrongDType { actual: DType },
-    #[error(transparent)]
-    Position(#[from] MropePositionError),
-}
-
-/// Bind the one axis-major `[3,L]` mRoPE prefill slot into an input map.
-pub fn bind_mrope_prefill_positions(
-    graph: &Graph,
-    inputs: &mut HashMap<ValueId, Value>,
-    positions: &MropePositionIds,
-) -> Result<(), MropeBindError> {
-    let id = one_mrope_slot(graph)?;
-    let expected = vec![3, positions.len()];
-    let actual = graph.aval(id).shape.clone();
-    if actual != expected {
-        // Validate against the graph length, not the host object's own length, so callers receive the
-        // precise typed length mismatch promised by the host position contract.
-        if actual.len() == 2 && actual[0] == 3 {
-            positions.packed_for_len(actual[1])?;
-        }
-        return Err(MropeBindError::Shape {
-            mode: "prefill",
-            expected,
-            actual,
-        });
-    }
-    inputs.insert(id, HostTensor::i32(actual, positions.packed()).into());
-    Ok(())
-}
-
-/// Bind one temporal/height/width tuple per row into an axis-major `[3,B]` batched-decode slot.
-/// The complete slot contract is checked before `inputs` is mutated.
-#[cfg(test)]
-pub(crate) fn bind_mrope_batched_decode_positions(
-    graph: &Graph,
-    inputs: &mut HashMap<ValueId, Value>,
-    positions: &[MropePosition],
-) -> Result<(), MropeBindError> {
-    let id = one_mrope_slot(graph)?;
-    let expected = vec![3, positions.len()];
-    let actual = graph.aval(id).shape.clone();
-    if actual != expected {
-        return Err(MropeBindError::Shape {
-            mode: "batched decode",
-            expected,
-            actual,
-        });
-    }
-
-    let mut packed = Vec::with_capacity(positions.len() * 3);
-    packed.extend(positions.iter().map(|position| position.temporal));
-    packed.extend(positions.iter().map(|position| position.height));
-    packed.extend(positions.iter().map(|position| position.width));
-    inputs.insert(id, HostTensor::i32(actual, packed).into());
-    Ok(())
-}
-
-fn one_mrope_slot(graph: &Graph) -> Result<ValueId, MropeBindError> {
-    let ids: Vec<ValueId> = graph
-        .slots
-        .iter()
-        .filter_map(|&(id, slot)| (slot == Slot::MropePosition).then_some(id))
-        .collect();
-    match ids.as_slice() {
-        [] => Err(MropeBindError::MissingSlot),
-        [id] => {
-            let actual = graph.aval(*id).dtype;
-            if actual != DType::I32 {
-                return Err(MropeBindError::WrongDType { actual });
-            }
-            Ok(*id)
-        }
-        _ => Err(MropeBindError::MultipleSlots { count: ids.len() }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use poot_graph_ir::{Builder, TensorType};
     use poot_models::mrope::{MropeSegment, build_mrope_position_ids};
-    use poot_models::qwen2::{Qwen2Config, trace_decode_kv_masked_batched, trace_prefill_mrope};
-
-    fn tiny_cfg() -> Qwen2Config {
-        Qwen2Config {
-            vocab: 8,
-            hidden: 8,
-            inter: 16,
-            layers: 0,
-            n_heads: 1,
-            n_kv_heads: 1,
-            head_dim: 8,
-            rotary_dim: 8,
-            max_pos: 32,
-            qkv_bias: true,
-            qk_norm: false,
-            mrope_section: Some([1, 1, 2]),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn mrope_prefill_binder_uses_one_axis_major_i32_slot() {
-        let positions = build_mrope_position_ids(&[MropeSegment::Text(3)], 1).unwrap();
-        let graph = trace_prefill_mrope(tiny_cfg(), 3);
-        let mut inputs = HashMap::new();
-        bind_mrope_prefill_positions(&graph, &mut inputs, &positions).unwrap();
-
-        let slots: Vec<_> = graph
-            .slots
-            .iter()
-            .filter(|(_, slot)| *slot == Slot::MropePosition)
-            .collect();
-        assert_eq!(slots.len(), 1);
-        let tensor = &inputs[&slots[0].0];
-        assert_eq!(tensor.as_host().expect("dense weight").shape(), vec![3, 3]);
-        assert_eq!(
-            tensor.as_host().expect("dense weight").as_i32(),
-            Some(&[0, 1, 2, 0, 1, 2, 0, 1, 2][..])
-        );
-    }
-
-    #[test]
-    fn mrope_binder_rejects_length_shape_and_slot_contract_violations() {
-        let positions = build_mrope_position_ids(&[MropeSegment::Text(2)], 1).unwrap();
-        let graph = trace_prefill_mrope(tiny_cfg(), 3);
-        assert_eq!(
-            bind_mrope_prefill_positions(&graph, &mut HashMap::new(), &positions),
-            Err(MropeBindError::Position(
-                MropePositionError::LengthMismatch {
-                    expected: 3,
-                    actual: 2,
-                }
-            ))
-        );
-    }
-
-    #[test]
-    fn mrope_binders_reject_non_i32_slots_before_inserting_inputs() {
-        let positions = build_mrope_position_ids(&[MropeSegment::Text(2)], 1).unwrap();
-
-        let b = Builder::new();
-        let slot = b.slot(Slot::MropePosition, TensorType::f32(vec![3, 2]));
-        let prefill = b.finish(slot);
-        let mut prefill_inputs = HashMap::new();
-        assert_eq!(
-            bind_mrope_prefill_positions(&prefill, &mut prefill_inputs, &positions),
-            Err(MropeBindError::WrongDType { actual: DType::F32 })
-        );
-        assert!(prefill_inputs.is_empty());
-    }
-
-    #[test]
-    fn mrope_batched_decode_binder_packs_axis_major() {
-        let graph = trace_decode_kv_masked_batched(tiny_cfg(), 8, 2);
-        let positions = [
-            MropePosition {
-                temporal: 2,
-                height: 5,
-                width: 7,
-            },
-            MropePosition {
-                temporal: 3,
-                height: 4,
-                width: 6,
-            },
-        ];
-        let mut inputs = HashMap::new();
-        bind_mrope_batched_decode_positions(&graph, &mut inputs, &positions).unwrap();
-        let id = one_mrope_slot(&graph).unwrap();
-        assert_eq!(
-            inputs[&id].as_host().expect("dense weight").shape(),
-            vec![3, 2]
-        );
-        assert_eq!(
-            inputs[&id].as_host().expect("dense weight").as_i32(),
-            Some(&[2, 3, 5, 4, 7, 6][..])
-        );
-    }
-
-    #[test]
-    fn mrope_batched_decode_binder_rejects_atomically() {
-        let positions = [MropePosition::collapsed(1), MropePosition::collapsed(2)];
-        let sentinel = HashMap::from([(999usize, Value::from(HostTensor::scalar(42.0)))]);
-
-        let b = Builder::new();
-        let token = b.slot(Slot::Token, TensorType::scalar(DType::I32));
-        let graph = b.finish(token);
-        let mut inputs = sentinel.clone();
-        assert_eq!(
-            bind_mrope_batched_decode_positions(&graph, &mut inputs, &positions),
-            Err(MropeBindError::MissingSlot)
-        );
-        assert_eq!(inputs, sentinel);
-
-        let b = Builder::new();
-        let first = b.slot(Slot::MropePosition, TensorType::new(vec![3, 2], DType::I32));
-        let _second = b.slot(Slot::MropePosition, TensorType::new(vec![3, 2], DType::I32));
-        let graph = b.finish(first);
-        let mut inputs = sentinel.clone();
-        assert_eq!(
-            bind_mrope_batched_decode_positions(&graph, &mut inputs, &positions),
-            Err(MropeBindError::MultipleSlots { count: 2 })
-        );
-        assert_eq!(inputs, sentinel);
-
-        let b = Builder::new();
-        let slot = b.slot(Slot::MropePosition, TensorType::f32(vec![3, 2]));
-        let graph = b.finish(slot);
-        let mut inputs = sentinel.clone();
-        assert_eq!(
-            bind_mrope_batched_decode_positions(&graph, &mut inputs, &positions),
-            Err(MropeBindError::WrongDType { actual: DType::F32 })
-        );
-        assert_eq!(inputs, sentinel);
-
-        let b = Builder::new();
-        let slot = b.slot(Slot::MropePosition, TensorType::new(vec![2, 2], DType::I32));
-        let graph = b.finish(slot);
-        let mut inputs = sentinel.clone();
-        assert_eq!(
-            bind_mrope_batched_decode_positions(&graph, &mut inputs, &positions),
-            Err(MropeBindError::Shape {
-                mode: "batched decode",
-                expected: vec![3, 2],
-                actual: vec![2, 2],
-            })
-        );
-        assert_eq!(inputs, sentinel);
-
-        let graph = trace_decode_kv_masked_batched(tiny_cfg(), 8, 2);
-        let mut inputs = sentinel.clone();
-        assert_eq!(
-            bind_mrope_batched_decode_positions(&graph, &mut inputs, &positions[..1]),
-            Err(MropeBindError::Shape {
-                mode: "batched decode",
-                expected: vec![3, 1],
-                actual: vec![3, 2],
-            })
-        );
-        assert_eq!(inputs, sentinel);
-    }
 
     #[test]
     fn mrope_decode_state_seeks_prompt_and_advances_generated_text() {

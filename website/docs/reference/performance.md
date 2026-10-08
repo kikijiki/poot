@@ -112,7 +112,7 @@ completed both cells cleanly (25.8 and 24.0 tok/s). This is separate from the ra
 ## Notes and caveats
 
 - **The measured path used f32.** Current packed GGUF, GPTQ/AWQ and supported FP8 projections stay
-  packed at load time. Dense host mirrors and packed MoE materialization remain separate limitations;
+  packed at load time. Dense host mirrors remain a separate limitation;
   see [Using quantized checkpoints](../serve/quantized-checkpoints.md).
 - **vLLM** is flaky on the test pods: its engine core failed to initialize for Qwen2.5-0.5B but ran for
   Qwen3-0.6B. That is a setup/environment issue, not a model result; failed cells are recorded as errors
@@ -141,8 +141,8 @@ before delivering the first token includes submitting and completing pending upl
 cache build or request-state reset. That cost belongs to preparation, TTFT and E2E; it can
 increase TTFT and reduce the first gap without reducing E2E. Raw cold and repeated requests are
 retained separately. For zero tokens, first/last token
-times are absent and the whole request is finish; zero/one-token requests report zero TPOT and
-decode rate. These conventions do not revise the historical tables above.
+times are absent and the whole request is finish; zero/one-token requests have no token-to-token gap, so their TPOT and
+decode rate are undefined (null in the per-request record). These conventions do not revise the historical tables above.
 
 Unprofiled wgpu execution groups dispatches within each existing submission into one compute
 pass. Profiling preserves per-dispatch passes and adds measurement overhead; use unprofiled

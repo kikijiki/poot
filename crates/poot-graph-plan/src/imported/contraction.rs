@@ -1,7 +1,8 @@
-//! Matmul-family imported kernels (card 044): the coalesced decode GEMV (single and batched, f32 and
-//! BF16-weight), the thread-coarsened tiled GEMM (single and batched-weight), and card 380's dense BF16 contraction at M > 1 - authored in Rust
-//! (`pootc/kernels/contraction/*.rs`). Its M == 1 decode GEMV is kernelgen's dense Gemv (card 727). 560a
-//! retires this family into kernelgen's `ContractionSpec`.
+//! Matmul-family imported kernels (card 044): the coalesced decode GEMV (single and batched, f32 `[K, N]` weight)
+//! and the thread-coarsened tiled GEMM (single and batched-weight), authored in Rust
+//! (`pootc/kernels/contraction/*.rs`). The BF16-weight column-tile GEMVs are retired: a BF16 weight decodes
+//! through kernelgen's dense Gemv over `[N, K]` (card 727), and a `[K, N]` BF16 decode projection is refused.
+//! 560a retires this family into kernelgen's `ContractionSpec`.
 
 kernel_assets! {
     family = body_contraction;
@@ -17,20 +18,6 @@ kernel_assets! {
         name: "gemv_batched_coalesced",
         source: "gemv_batched_coalesced",
         entry: "__poot_kernel_gemv_batched_coalesced",
-        params: 4,
-        dest: GraphPlan,
-    },
-    GemvCoalescedBf16 {
-        name: "gemv_coalesced_bf16",
-        source: "gemv_coalesced_bf16",
-        entry: "__poot_kernel_gemv_coalesced_bf16",
-        params: 3,
-        dest: GraphPlan,
-    },
-    GemvBatchedCoalescedBf16 {
-        name: "gemv_batched_coalesced_bf16",
-        source: "gemv_batched_coalesced_bf16",
-        entry: "__poot_kernel_gemv_batched_coalesced_bf16",
         params: 4,
         dest: GraphPlan,
     },

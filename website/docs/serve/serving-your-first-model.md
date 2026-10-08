@@ -13,7 +13,7 @@ poot inside `nix develop`. See [Develop: Build and test](../develop/build-and-te
 poot is being refactored. This is not available yet and is planned to return.
 :::
 
-Today the server answers health, embeddings and reranking, and refuses a dense decoder (Qwen, Llama, ...) at startup; see [Embeddings and reranking](./embeddings-and-reranking.md). This walkthrough uses an embedding model for that reason.
+Today the server starts on any model the registry knows, answers health, metrics and model listing, and returns `503` on every route that runs the model; see [Embeddings and reranking](./embeddings-and-reranking.md). This walkthrough uses an embedding model because it is the quickest checkpoint to fetch.
 
 ## 1. Get a checkpoint
 
@@ -38,12 +38,12 @@ builds are 10-50x slower. The server has no `--backend` option; see [Picking a b
 
 ```bash
 curl http://localhost:8080/health
-# {"engine_loaded":false,"status":"ok"}
+# {"backend":"spirv-vulkan","engine_loaded":true,"max_seq":4096,"rows":4,"status":"serving"}
 
-curl http://localhost:8080/v1/embeddings \
+curl http://localhost:8080/v1/completions \
   -H 'Content-Type: application/json' \
-  -d '{"input": ["a cute kitten", "a fast car"]}'
-# {"object":"list","data":[{"object":"embedding","index":0,"embedding":[...]}, ...], ...}
+  -d '{"prompt": "The capital of France is", "max_tokens": 8}'
+# 200: {"id":"cmpl-poot","object":"text_completion","choices":[{"index":0,"text":" Paris. ..."}],...}
 ```
 
 `GET /v1/models` lists what is being served; `GET /metrics` and `GET /metrics/prometheus` report counters
@@ -51,12 +51,13 @@ curl http://localhost:8080/v1/embeddings \
 
 ## Which models load
 
-- A decoder of a family the driver loads (Qwen2/3, Llama, Mistral, Mixtral, Gemma, Granite, Granite MoE,
-  OLMo 2, OLMoE, Phi-3, SmolLM3, BLOOM, MPT, Qwen3-MoE, gpt-oss, Gemma 4, DeepSeek-V2/V3/V3.2, Nemotron-H) is
-  refused at startup: not available yet (poot is being refactored; planned to return).
-- A BERT-class encoder (all-MiniLM, E5, BGE, ...) serves `/v1/embeddings`.
-- A BERT-class cross-encoder (ms-marco-MiniLM, ...) serves `/v1/rerank`.
-- Qwen3-Next checkpoints and SmolVLM / idefics3 checkpoints are not available yet (poot is being refactored; planned to return).
+- Every family the registry knows loads as a `ModelHandle`: the decoders (Qwen2/3, Llama, Mistral, Mixtral,
+  Gemma, Granite, Granite MoE, OLMo 2, OLMoE, Phi-3, SmolLM3, BLOOM, MPT, Qwen3-MoE, gpt-oss, Gemma 4,
+  DeepSeek-V2/V3/V3.2, Nemotron-H, Qwen3-Next, Qwen3.8-Flash-Next), BERT-class encoders (all-MiniLM, E5, BGE) and cross-encoders (ms-marco-MiniLM).
+  A decoder serves generation from the scheduling loop; the embeddings, reranking and LoRA routes return `503`
+  until they are restored.
+- A checkpoint whose family the registry does not know, SmolVLM / idefics3 among them, is refused at
+  startup with the registry's error naming its `model_type`. SmolVLM runs through the library (`poot-caption`).
 
 ## Next steps
 

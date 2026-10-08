@@ -23,6 +23,7 @@ use poot_runtime_common::{BufferRole, DeviceBackend, MemoryCounterSnapshot};
 use poot_target::BufferStorage;
 use poot_tensor::DType;
 use poot_tensor::HostTensor;
+use poot_test_util::const_weights::ConstWeights;
 use poot_test_util::device_skip::open_or_skip;
 use poot_test_util::{assert_close_rel, max_abs_error};
 
@@ -105,10 +106,10 @@ fn decode_staged(
             experts: poot_graph_plan::ExpertPlacement::AllResident,
             devices: poot_graph_plan::DevicePlacement::Single(poot_graph_plan::DeviceId(0)),
         },
-        &poot_graph_plan::CompileOptions {
-            execution: poot_graph_plan::Submission::Replay,
-            limits: poot_graph_plan::CompileLimits::STANDARD,
-        },
+        &poot_graph_plan::CompileOptions::new(
+            poot_graph_plan::Submission::Replay,
+            poot_graph_plan::CompileLimits::STANDARD,
+        ),
     )
     .unwrap()
 }
@@ -125,15 +126,14 @@ fn decode_slot_inputs(g: &Graph, token: u32, pos: usize, _cap: usize) -> StepInp
         let key = meta.slot_key().unwrap().clone();
         let shape: &'static [usize] = Box::leak(meta.aval.shape.clone().into_boxed_slice());
         // Card 621/188 Inc 6c: a slot's bytes must respect its *declared* dtype, never a hardcoded
-        // f32 - an I32-declared index slot (Token/Pos/SeqLen on some archs) fed f32 bits reinterprets
+        // f32 - an I32-declared index slot (Token/Pos on some archs) fed f32 bits reinterprets
         // as a huge wrong index, corrupting a gather/KV-cache write (an out-of-bounds device access,
         // not a value mismatch; mirrors `poot_executor_parity::step_fixtures`'s own dtype switch).
         // Card 550: `Slot::Pos` is now `[1,1]`, not a bare scalar; the mask is a graph computation
-        // over `Slot::Pos` and `iota`, so the decode graph declares no `Slot::Mask`.
+        // over `Slot::Pos` and `iota`.
         let values: Vec<f64> = match slot {
             poot_graph_ir::Slot::Token => vec![token as f64],
             poot_graph_ir::Slot::Pos => vec![pos as f64],
-            poot_graph_ir::Slot::SeqLen => vec![(pos + 1) as f64],
             other => panic!("decode fixture has no {other:?} slot"),
         };
         let bytes: &'static [u8] = match meta.aval.dtype {
@@ -187,10 +187,14 @@ fn qwen2_decode_on_the_contract_matches_the_oracle_and_records_once() {
     let mut engine = Engine::new(device);
     let g = decode_graph();
     let store = store_for(&g);
+    let mut weights = ConstWeights::new(&store);
+    let named = weights.graph(&g);
     let exe = engine
-        .load_weights(store.clone(), poot_executor::WeightSource::ConstNames)
+        .load_weights(store.clone(), Arc::new(weights.map()))
         .unwrap();
-    let entry = engine.add_entry(exe, &decode_staged(&g, target)).unwrap();
+    let entry = engine
+        .add_entry(exe, &decode_staged(&named, target))
+        .unwrap();
 
     let mut state: HashMap<String, HostTensor> = HashMap::new();
     let mut device_tokens: Vec<u32> = Vec::with_capacity(CAP);
@@ -271,7 +275,6 @@ fn oracle_decode_step(
                 let values: Vec<f64> = match slot {
                     poot_graph_ir::Slot::Token => vec![token as f64],
                     poot_graph_ir::Slot::Pos => vec![pos as f64],
-                    poot_graph_ir::Slot::SeqLen => vec![(pos + 1) as f64],
                     other => panic!("no {other:?} slot"),
                 };
                 match meta.aval.dtype {
@@ -301,6 +304,32 @@ fn oracle_decode_step(
         .as_f32()
         .unwrap()
         .to_vec()
+}
+
+/// POOT-1065: the ROCm device reports the HSA pool's live availability, within the pool size it
+/// reported when it opened. Mutation: `free_memory_bytes` returns `None` and the first assertion goes
+/// red; returns `u64::MAX` and the ceiling assertion goes red.
+#[test]
+fn the_rocm_device_reports_live_free_memory_within_its_open_time_ceiling() {
+    let Some(device) = require_rocm() else {
+        return;
+    };
+    let ceiling = device
+        .target()
+        .caps
+        .memory_budget_bytes
+        .expect("the ROCm device queried its pool size at open");
+    let free = device
+        .free_memory_bytes()
+        .expect("the ROCm device reports live free memory");
+    assert!(
+        free > 0,
+        "a device with no free memory cannot run this test"
+    );
+    assert!(
+        free <= ceiling,
+        "free {free} is over the open-time ceiling {ceiling}"
+    );
 }
 
 /// SC-005: ROCm profiling of a fixture reports `Unknown` device time, never host wall. Mutation:
@@ -340,10 +369,15 @@ fn memory_counters_charge_the_roles_a_decode_entry_actually_allocates() {
     let mut engine = Engine::new(device);
     let g = decode_graph();
     let store = store_for(&g);
+    let mut weights = ConstWeights::new(&store);
+    let named = weights.graph(&g);
+    let source = Arc::new(weights.map());
     let exe = engine
-        .load_weights(Arc::clone(&store), poot_executor::WeightSource::ConstNames)
+        .load_weights(Arc::clone(&store), source.clone())
         .unwrap();
-    let _entry = engine.add_entry(exe, &decode_staged(&g, target)).unwrap();
+    let _entry = engine
+        .add_entry(exe, &decode_staged(&named, target))
+        .unwrap();
     let memory = engine.stats().memory;
     let rocm_weight: u64 = memory
         .iter()
@@ -370,11 +404,9 @@ fn memory_counters_charge_the_roles_a_decode_entry_actually_allocates() {
     };
     let wgpu_target = wgpu_device.target();
     let mut wgpu_engine = Engine::new(wgpu_device);
-    let wgpu_exe = wgpu_engine
-        .load_weights(store, poot_executor::WeightSource::ConstNames)
-        .unwrap();
+    let wgpu_exe = wgpu_engine.load_weights(store, source).unwrap();
     let _wgpu_entry = wgpu_engine
-        .add_entry(wgpu_exe, &decode_staged(&g, wgpu_target))
+        .add_entry(wgpu_exe, &decode_staged(&named, wgpu_target))
         .unwrap();
     let wgpu_memory = wgpu_engine.stats().memory;
     for role in [BufferRole::Weight, BufferRole::State] {
@@ -414,10 +446,14 @@ fn wait_timeout_is_typed_construction_state_not_an_env_read() {
         let mut engine = Engine::new(device);
         let g = decode_graph();
         let store = store_for(&g);
+        let mut weights = ConstWeights::new(&store);
+        let named = weights.graph(&g);
         let exe = engine
-            .load_weights(store, poot_executor::WeightSource::ConstNames)
+            .load_weights(store.clone(), Arc::new(weights.map()))
             .unwrap();
-        let entry = engine.add_entry(exe, &decode_staged(&g, target)).unwrap();
+        let entry = engine
+            .add_entry(exe, &decode_staged(&named, target))
+            .unwrap();
         let inputs = decode_slot_inputs(&g, 0, 0, CAP);
         Some(engine.step(exe, entry, &inputs, &mut NoSync).is_ok())
     })();
@@ -478,10 +514,14 @@ fn two_phase_state_commit_matches_the_oracle_after_four_steps_on_rocm() {
         )
         .unwrap();
     let store = Arc::new(builder.build());
+    let mut weights = ConstWeights::new(&store);
+    let named = weights.graph(&g);
     let exe = engine
-        .load_weights(store, poot_executor::WeightSource::ConstNames)
+        .load_weights(Arc::clone(&store), Arc::new(weights.map()))
         .unwrap();
-    let entry = engine.add_entry(exe, &decode_staged(&g, target)).unwrap();
+    let entry = engine
+        .add_entry(exe, &decode_staged(&named, target))
+        .unwrap();
 
     let mut oracle_a = vec![0.0f32; 4];
     let mut oracle_s = vec![0.0f32; 4];
@@ -714,10 +754,14 @@ fn an_ordinary_unload_with_completion_proven_releases_its_allocations() {
     let mut engine = Engine::new(device);
     let g = decode_graph();
     let store = store_for(&g);
+    let mut weights = ConstWeights::new(&store);
+    let named = weights.graph(&g);
     let exe = engine
-        .load_weights(store, poot_executor::WeightSource::ConstNames)
+        .load_weights(Arc::clone(&store), Arc::new(weights.map()))
         .unwrap();
-    let entry = engine.add_entry(exe, &decode_staged(&g, target)).unwrap();
+    let entry = engine
+        .add_entry(exe, &decode_staged(&named, target))
+        .unwrap();
     let inputs = decode_slot_inputs(&g, 0, 0, CAP);
     engine
         .step(exe, entry, &inputs, &mut NoSync)
@@ -803,10 +847,9 @@ fn i32_slot_gather_variants_compiled_match_cpu_oracle_on_rocm() {
                 .map_err(|e| format!("seed_{i}: {e:?}"))?;
         }
         let store = Arc::new(builder.build());
-        let exe = engine
-            .load_weights(store, poot_executor::WeightSource::ConstNames)
-            .map_err(|e| format!("load_weights: {e}"))?;
-
+        let mut weights = ConstWeights::new(&store);
+        let real_graph = weights.graph(&variant.graph);
+        let mut seed_graphs = Vec::new();
         for (i, &(si, _)) in variant.graph.state.iter().enumerate() {
             let meta = variant.graph.meta(si);
             let name = meta.name.as_deref().unwrap().to_string();
@@ -816,8 +859,15 @@ fn i32_slot_gather_variants_compiled_match_cpu_oracle_on_rocm() {
                 b.state_input(&name, TensorType::f32(shape.clone()), StateRole::Recurrent);
             let seed_const = b.constant(&format!("seed_{i}"), TensorType::f32(shape));
             let seed_g = b.finish_with_state(seed_const, &[(state_in, seed_const)]);
+            seed_graphs.push((name, weights.graph(&seed_g)));
+        }
+        let exe = engine
+            .load_weights(Arc::clone(&store), Arc::new(weights.map()))
+            .map_err(|e| format!("load_weights: {e}"))?;
+
+        for (name, seed_g) in &seed_graphs {
             let seed_entry = engine
-                .add_entry(exe, &decode_staged(&seed_g, target))
+                .add_entry(exe, &decode_staged(seed_g, target))
                 .map_err(|e| format!("seed {name}: add_entry: {e}"))?;
             engine
                 .step(exe, seed_entry, &StepInputs::new(), &mut NoSync)
@@ -867,7 +917,7 @@ fn i32_slot_gather_variants_compiled_match_cpu_oracle_on_rocm() {
         }
 
         let real_entry = engine
-            .add_entry(exe, &decode_staged(&variant.graph, target))
+            .add_entry(exe, &decode_staged(&real_graph, target))
             .map_err(|e| format!("add_entry: {e}"))?;
         let bytes = engine
             .step(exe, real_entry, &slot_inputs, &mut NoSync)
@@ -953,10 +1003,14 @@ fn sliding_window_mask_from_pos_rocm_matches_cpu() {
             .unwrap();
     }
     let store = Arc::new(builder.build());
+    let mut weights = ConstWeights::new(&store);
+    let named = weights.graph(&g);
     let exe = engine
-        .load_weights(store, poot_executor::WeightSource::ConstNames)
+        .load_weights(Arc::clone(&store), Arc::new(weights.map()))
         .unwrap();
-    let entry = engine.add_entry(exe, &decode_staged(&g, target)).unwrap();
+    let entry = engine
+        .add_entry(exe, &decode_staged(&named, target))
+        .unwrap();
 
     let pos_key = g.meta(posi).slot_key().unwrap().clone();
     let pos_shape = [1usize, l];

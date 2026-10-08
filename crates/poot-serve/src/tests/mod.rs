@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -6,16 +6,12 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
-use poot_llm::driver::block_table::{BLOCK_SIZE, PagedKvCache};
-use poot_llm::driver::prefix_cache::PrefixIdentity;
-use poot_llm::encoder::EncoderPooling;
-use poot_llm::{
-    GenerationControl, LoraAdapterLease, MropeDecodeState, MropePosition, MropePositionIds, Runner,
-    Sampler,
-};
+use anyhow::{Result, bail};
+use poot_llm::driver::{AdapterRef, LoadOptions, ModelHandle};
+use poot_llm::{GenerationControl, Sampler};
+use poot_models::registry::Registry;
 
-use crate::admin::{LoraAdminBackend, LoraAdminBackendResolver, LoraAdminPolicy};
+use crate::admin::LoraAdminPolicy;
 use crate::api::{
     ChatReq, CompletionReq, GuidedDecodeError, MAX_CHOICES, MAX_LOGPROBS, MAX_NEW_TOKENS_CAP,
     MAX_STOP_SEQUENCES, ResponseFormatConstraint, Stop, StreamOptions, UnsupportedCapabilityError,
@@ -23,28 +19,17 @@ use crate::api::{
     reject_unsupported_modality, resolve_forced_tools, response_format_constraint, sampler_of,
     suppress_stream_usage, tool_call_stream_deltas,
 };
-use crate::batch::commit::{
-    commit_token, record_non_mrope_prefix_cache_admission, release_slot_kv,
+use crate::batch::commit::{SlotFate, commit_tokens};
+use crate::batch::engine::{
+    EngineError, Exit, OpenRequest, Opening, Row, RowResult, ServeEngine, Work, run_engine,
+    run_engine_thread,
 };
-use crate::batch::kv_budget::{
-    KV_POOL_VRAM_MULTIPLIER, KV_POOL_VRAM_MULTIPLIER_INPLACE,
-    ROCM_SHARED_POOL_UNROLL_OVERHEAD_BYTES_PER_LAYER_PER_SLOT_TOKEN,
-    WGPU_SHARED_POOL_UNROLL_OVERHEAD_BYTES_PER_LAYER_PER_SLOT_TOKEN, fit_kv_to_budget,
-};
-use crate::batch::preempt::{
-    PreemptedSeq, admit_prefix_with_preemption, preempt_slot,
-    reserve_without_prefix_with_preemption, resume_preempted, select_preemption_victim,
-};
-use crate::batch::schedule::{
-    drain_ready_jobs, resume_into_free_slots, schedule_prefill_admissions,
-};
-use crate::batch::slot::{
-    Slot, admit_job_to_slot, advance_slot_position, build_mrope_rows, fail_active_slots,
-    reject_job, shutdown_batch_requests,
-};
+use crate::batch::schedule::schedule_prefill_admissions;
+use crate::batch::slot::{Slot, Waiting, reject_job};
+use crate::engine_plan::EngineHealth;
 use crate::handlers::{
-    StreamStops, account_generation_error, embedding_value, encoder_pooling_override, handle_chat,
-    sse_write_probe, stream_chat, stream_completion, stream_receipt,
+    StreamStops, account_generation_error, handle_chat, sse_write_probe, stream_chat,
+    stream_completion, stream_receipt,
 };
 use crate::http::{
     ConnGuard, MAX_BODY_BYTES, MAX_HEADER_BYTES, RateLimiter, RequestRead,
@@ -63,14 +48,18 @@ use crate::types::{
 
 mod admin;
 mod drain;
+pub(crate) mod encoder_routes;
+mod engine_loop;
 mod http_parse;
 mod no_engine;
 mod other;
-mod preemption;
+mod recording_engine;
 mod scheduling;
 mod streaming;
 mod terminal_done;
 mod write_deadline;
+
+use recording_engine::{Event, FakeSeq, JobSpec, RecordingEngine, Submitted, outcome, serve};
 
 /// The test double at the engine boundary: drains the job queue and runs each job through `generate`,
 /// streaming `Token` events when the job asked to stream and a terminal `Done`/`Failed`, with the same
@@ -138,7 +127,7 @@ where
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GenerationFailureAccountingCase {
     DeliveredDirect,
     DroppedDirect,
@@ -147,7 +136,6 @@ enum GenerationFailureAccountingCase {
     ActiveFailure,
     QueuedShutdown,
     ActiveShutdown,
-    PreemptedShutdown,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -187,7 +175,7 @@ fn terminal_token_info() -> PerTokenInfo {
 fn run_generation_stream_handler(
     endpoint: GenerationStreamEndpoint,
     terminal: GenerationStreamTerminal,
-    runner: Arc<Runner>,
+    runner: Arc<ModelHandle>,
 ) -> (String, Arc<Metrics>) {
     use std::net::Shutdown;
 
@@ -329,56 +317,6 @@ fn run_generation_stream_handler(
     (response, metrics)
 }
 
-fn distinct_mrope_layouts() -> (MropePositionIds, MropePositionIds) {
-    let collapsed =
-        poot_llm::build_mrope_position_ids(&[poot_llm::MropeSegment::Text(20)], 2).unwrap();
-    let sectioned = poot_llm::build_mrope_position_ids(
-        &[
-            poot_llm::MropeSegment::Text(1),
-            poot_llm::MropeSegment::Image(poot_llm::MropeGrid::new(1, 2, 36)),
-            poot_llm::MropeSegment::Text(1),
-        ],
-        2,
-    )
-    .unwrap();
-    assert_eq!(collapsed.len(), sectioned.len());
-    assert_ne!(
-        collapsed.position(2).unwrap(),
-        sectioned.position(2).unwrap()
-    );
-    (collapsed, sectioned)
-}
-
-// Recompute preemption (spec 237): `select_preemption_victim`, `preempt_slot`, `admit_prefix_with_preemption` and `resume_preempted` are host logic over `PagedKvCache` (no GPU types), so the bookkeeping is tested without a device.
-
-/// `n` distinct token ids starting at `base` (a copy of the `toks` helper in `poot_llm::driver::block_table`'s tests).
-fn preempt_toks(base: u32, n: usize) -> Vec<u32> {
-    (0..n as u32).map(|i| base + i).collect()
-}
-
-/// A `Slot` at `pos` with `generated` tokens produced: the two fields the preemption machinery reads. Other fields are placeholders.
-fn preempt_test_slot(tokens: Vec<u32>, pos: usize, generated: usize, max_new: usize) -> Slot {
-    let (reply, _rx) = mpsc::channel();
-    // `saturating_sub`: callers pass arbitrary short token vectors; only `pos`/`generated` matter.
-    let prompt_len = tokens.len().saturating_sub(generated);
-    Slot {
-        tokens,
-        prompt_len,
-        pos,
-        generated,
-        max_new,
-        sampler: Sampler::greedy(),
-        stop: vec![],
-        stream: false,
-        reply,
-        prefilled: true,
-        decode_start: None,
-        last_token: None,
-        lora_adapter: LoraAdapterLease::none(),
-        mrope: None,
-    }
-}
-
 // Helper: feed pieces through a StreamStops, returning the concatenated emitted text + whether a stop hit.
 fn run_stream_stops(stops: &[&str], pieces: &[&str]) -> (String, bool) {
     let mut buf = StreamStops::new(stops.iter().map(|s| s.to_string()).collect());
@@ -401,15 +339,26 @@ fn unique_fixture_suffix() -> String {
 mod tiny_gguf;
 
 /// A tiny all-F32 deepseek2-architecture GGUF (two layers, a 4-token vocabulary): a decoder the
-/// `Runner` still loads. A registered family is refused by `Runner::load_gguf`, so the serve tests
-/// use a family that has not moved onto the driver.
-pub(crate) fn write_tiny_runner_gguf() -> std::path::PathBuf {
+/// registry loads as a `ModelHandle`, the way the server loads one.
+pub(crate) fn write_tiny_gguf() -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!(
         "poot_serve_deepseek2_fixture_{}.gguf",
         unique_fixture_suffix()
     ));
     tiny_gguf::write_tiny_deepseek2_gguf(&path, 64);
     path
+}
+
+/// The model at `path` (an HF directory or a GGUF) through the family registry, as the server loads it.
+pub(crate) fn load_handle(path: &std::path::Path) -> Arc<ModelHandle> {
+    Arc::new(
+        ModelHandle::load(
+            path,
+            &Registry::builtin().expect("shipped families register disjoint keys"),
+            &LoadOptions::default(),
+        )
+        .expect("load the model"),
+    )
 }
 
 /// A minimal `Metrics` for the card 201 tests: only `model` varies; every counter/histogram starts at zero. Mirrors the inline construction in `prometheus_exposition_is_well_formed`.
@@ -422,7 +371,6 @@ pub(crate) fn test_metrics(model: &str) -> Metrics {
         requests_completed: AtomicU64::new(0),
         requests_cancelled: AtomicU64::new(0),
         requests_errored: AtomicU64::new(0),
-        requests_preempted: AtomicU64::new(0),
         inflight: AtomicU64::new(0),
         ttft: Histogram::new(),
         itl: Histogram::new(),
@@ -430,8 +378,7 @@ pub(crate) fn test_metrics(model: &str) -> Metrics {
         queue_wait: Histogram::new(),
         batch_size: AtomicU64::new(0),
         slot_capacity: 1,
-        on_gpu: false,
-        profile: false,
+        backend: "spirv-vulkan".to_string(),
         model: model.into(),
         sys: Mutex::new(sysinfo::System::new()),
         cache: CacheMetrics::default(),
@@ -462,100 +409,8 @@ impl AdminOperation {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct FakeLoraAdminSnapshot {
-    list_calls: usize,
-    load_paths: Vec<String>,
-    lookup_calls: usize,
-    unload_calls: usize,
-    adapters: Vec<String>,
-}
-
-struct FakeLoraAdmin {
-    state: Mutex<FakeLoraAdminSnapshot>,
-}
-
-impl FakeLoraAdmin {
-    fn with_base_adapter() -> Self {
-        Self {
-            state: Mutex::new(FakeLoraAdminSnapshot {
-                adapters: vec!["base".into()],
-                ..FakeLoraAdminSnapshot::default()
-            }),
-        }
-    }
-
-    fn snapshot(&self) -> FakeLoraAdminSnapshot {
-        self.state.lock().unwrap().clone()
-    }
-}
-
-impl LoraAdminBackend for FakeLoraAdmin {
-    fn list(&self) -> Vec<(String, usize, usize)> {
-        let mut state = self.state.lock().unwrap();
-        state.list_calls += 1;
-        state
-            .adapters
-            .iter()
-            .enumerate()
-            .map(|(index, name)| (name.clone(), index + 1, 0))
-            .collect()
-    }
-
-    fn hot_load_dir(&self, name: &str, path: &str) -> Result<usize> {
-        let mut state = self.state.lock().unwrap();
-        state.load_paths.push(path.into());
-        state.adapters.push(name.into());
-        Ok(state.adapters.len())
-    }
-
-    fn index_of(&self, name: &str) -> Option<usize> {
-        let mut state = self.state.lock().unwrap();
-        state.lookup_calls += 1;
-        state
-            .adapters
-            .iter()
-            .position(|candidate| candidate == name)
-            .map(|index| index + 1)
-    }
-
-    fn hot_unload(&self, name: &str) -> Result<usize> {
-        let mut state = self.state.lock().unwrap();
-        state.unload_calls += 1;
-        let index = state
-            .adapters
-            .iter()
-            .position(|candidate| candidate == name)
-            .context("fake adapter must exist before unload")?;
-        state.adapters.remove(index);
-        Ok(index + 1)
-    }
-}
-
-struct FakeLoraAdminResolver {
-    admin: FakeLoraAdmin,
-    resolve_calls: AtomicUsize,
-}
-
-impl FakeLoraAdminResolver {
-    fn with_base_adapter() -> Self {
-        Self {
-            admin: FakeLoraAdmin::with_base_adapter(),
-            resolve_calls: AtomicUsize::new(0),
-        }
-    }
-}
-
-impl LoraAdminBackendResolver for FakeLoraAdminResolver {
-    fn resolve_lora_admin_backend(&self) -> Option<&dyn LoraAdminBackend> {
-        self.resolve_calls.fetch_add(1, Ordering::SeqCst);
-        Some(&self.admin)
-    }
-}
-
-fn run_fake_lora_admin_socket(
+fn run_lora_admin_socket(
     policy: &LoraAdminPolicy,
-    resolver: &FakeLoraAdminResolver,
     method: &str,
     path: &str,
     authorization: &[&str],
@@ -584,7 +439,7 @@ fn run_fake_lora_admin_socket(
     client.flush().expect("flush admin request");
 
     assert!(
-        read_request_for_routing(&mut server, resolver, policy)
+        read_request_for_routing(&mut server, policy)
             .expect("stage and handle admin request")
             .is_none(),
         "an admin target must be consumed before ordinary routing"
@@ -599,15 +454,14 @@ fn run_fake_lora_admin_socket(
 }
 
 /// Send a complete protected request head with a nonzero declared body, but deliberately withhold every
-/// body byte. A denial can only arrive if production authorizes before body reading. The independent lazy
-/// resolver count proves it also authorizes before discriminating the production backend.
+/// body byte. A denial can only arrive if production authorizes before body reading.
 fn run_denied_lora_admin_head_without_body(
     policy: LoraAdminPolicy,
     method: &str,
     path: &str,
     authorization: &[&str],
     content_length: usize,
-) -> (String, Arc<FakeLoraAdminResolver>) {
+) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind head-first admin socket");
     let addr = listener.local_addr().expect("head-first socket address");
     let mut client = TcpStream::connect(addr).expect("connect head-first admin client");
@@ -619,11 +473,7 @@ fn run_denied_lora_admin_head_without_body(
         .set_read_timeout(Some(Duration::from_millis(500)))
         .expect("make an accidental body read fail promptly");
 
-    let resolver = Arc::new(FakeLoraAdminResolver::with_base_adapter());
-    let resolver_for_handler = Arc::clone(&resolver);
-    let handler = std::thread::spawn(move || {
-        read_request_for_routing(&mut server, resolver_for_handler.as_ref(), &policy)
-    });
+    let handler = std::thread::spawn(move || read_request_for_routing(&mut server, &policy));
 
     let authorization_headers = authorization
         .iter()
@@ -648,7 +498,7 @@ fn run_denied_lora_admin_head_without_body(
             .is_none(),
         "a denied admin request is fully handled"
     );
-    (response, resolver)
+    response
 }
 
 #[cfg(unix)]
@@ -738,7 +588,8 @@ fn run_write_deadline_stream_case(case: WriteDeadlineClientCase) {
                         Sampler::greedy(),
                         vec![],
                         true,
-                        LoraAdapterLease::none(),
+                        AdapterRef::Base,
+                        &|| false,
                         |piece, _| {
                             if write!(server, "data: {piece}\n\n")
                                 .and_then(|_| server.flush())

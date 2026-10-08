@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use poot_quant::format::{
-    FieldEncoding, FloatFormat, GroupMap, OperandRole, Storage, WeightFormat,
+    FieldEncoding, FloatFormat, GroupMap, OperandRole, ScaleEncoding, Storage, WeightFormat,
 };
 use poot_quant::{PackedPayload, PackedWeight, SourceRole};
 
@@ -32,7 +32,8 @@ fn sanitize_float(value: &mut [u8], float: FloatFormat) {
             }
         }
         FloatFormat::E8m0 => value[0] = value[0].min(0xfe),
-        FloatFormat::F32 | FloatFormat::E2m1 => {}
+        FloatFormat::F32 => value[3] &= !0x40,
+        FloatFormat::E2m1 => {}
     }
 }
 
@@ -95,22 +96,30 @@ pub fn random_payload(format: WeightFormat, shape: [usize; 2], seed: u64) -> Pac
 }
 
 /// [`random_payload`] for a contraction fixture that must be sensitive to its scales: an E4M3 payload keeps its
-/// random codes but gets prescribed nonzero BF16 scales cycling through 0.5, 1.0, 1.5 and 2.0, so every output
-/// depends on every scale (a random sanitized BF16 scale is usually near zero, which hides a wrong scale). Any
-/// other format is the plain random payload.
+/// random codes but gets prescribed nonzero scales (in the format's own BF16 or F32 encoding) cycling through
+/// 0.5, 1.0, 1.5 and 2.0, so every output depends on every scale (a random sanitized scale is usually near
+/// zero, which hides a wrong scale); a block payload with E8M0 scales (MXFP4) keeps its codes and gets scales
+/// cycling through 0.25 ..= 16 (a random E8M0 scale spans `2^-127 ..= 2^127`, so a one-hot row would read
+/// `0 * inf`; the cycle has seven values and a seed-dependent phase, so a misread block or expert is visible).
+/// Any other format is the plain random payload.
 pub fn prescribed_scale_payload(
     format: WeightFormat,
     shape: [usize; 2],
     seed: u64,
 ) -> PackedPayload {
     let base = random_payload(format, shape, seed);
-    if !matches!(
-        format,
-        WeightFormat::E4m3PerChannel { .. } | WeightFormat::E4m3Block128 { .. }
-    ) {
-        return base;
+    if has_e8m0_block_scale(format) {
+        // Seven scales (0.25 ..= 16) cycling with a stride that depends on the seed: two blocks four apart, or the
+        // same block of two experts, differ, so a scale read from the wrong block moves the decoded value.
+        return e8m0_scaled_payload(format, shape, seed, |block| {
+            0x7d + ((block * 3 + seed as usize) % 7) as u8
+        });
     }
-    const SCALES: [u16; 4] = [0x3f00, 0x3f80, 0x3fc0, 0x4000];
+    let (WeightFormat::E4m3PerChannel { scale } | WeightFormat::E4m3Block128 { scale }) = format
+    else {
+        return base;
+    };
+    const SCALES: [f32; 4] = [0.5, 1.0, 1.5, 2.0];
     let weight = base.weight();
     let sources: Vec<(SourceRole, Arc<[u8]>)> = weight
         .sources()
@@ -118,13 +127,59 @@ pub fn prescribed_scale_payload(
         .map(|role| {
             let mut bytes = base.bytes(role).to_vec();
             if role == SourceRole::Planar(OperandRole::Scale) {
-                for (index, scale) in bytes.chunks_mut(2).enumerate() {
-                    scale.copy_from_slice(&SCALES[index % SCALES.len()].to_le_bytes());
+                let width = match scale {
+                    ScaleEncoding::Bf16 => 2,
+                    ScaleEncoding::F32 => 4,
+                    ScaleEncoding::E8m0 => unreachable!("E4M3 scales are BF16 or F32"),
+                };
+                for (index, element) in bytes.chunks_mut(width).enumerate() {
+                    let bits = SCALES[index % SCALES.len()].to_bits();
+                    match scale {
+                        ScaleEncoding::Bf16 => {
+                            element.copy_from_slice(&((bits >> 16) as u16).to_le_bytes());
+                        }
+                        _ => element.copy_from_slice(&bits.to_le_bytes()),
+                    }
                 }
             }
             (role, Arc::from(bytes))
         })
         .collect();
     PackedPayload::try_new(weight, sources)
+        .unwrap_or_else(|error| panic!("{format:?} {shape:?}: {error:?}"))
+}
+
+fn has_e8m0_block_scale(format: WeightFormat) -> bool {
+    matches!(format.descriptor().storage, Storage::Blocks(layout)
+        if layout.field(OperandRole::Scale).is_some_and(|scale| scale.field.encoding == FieldEncoding::Float(FloatFormat::E8m0)))
+}
+
+/// [`random_payload`] of a block format with an E8M0 scale (MXFP4) whose block `b` carries the scale byte
+/// `scale(b)`: the way to put the extreme admitted exponents (`0x00` = `2^-127`, `0xfe` = `2^127`) into a
+/// payload. `0xff` (NaN) is not admitted by [`PackedPayload::try_new`], so it cannot be built here.
+pub fn e8m0_scaled_payload(
+    format: WeightFormat,
+    shape: [usize; 2],
+    seed: u64,
+    scale: impl Fn(usize) -> u8,
+) -> PackedPayload {
+    let base = random_payload(format, shape, seed);
+    let Storage::Blocks(layout) = format.descriptor().storage else {
+        panic!("{format:?}: not a block format");
+    };
+    let field = layout
+        .field(OperandRole::Scale)
+        .unwrap_or_else(|| panic!("{format:?}: no scale field"));
+    assert_eq!(
+        field.field.encoding,
+        FieldEncoding::Float(FloatFormat::E8m0),
+        "{format:?}"
+    );
+    let at = (field.field.pieces[0].layout.bit(0) / 8) as usize;
+    let mut bytes = base.bytes(SourceRole::Blocks).to_vec();
+    for (block, bytes) in bytes.chunks_mut(layout.bytes).enumerate() {
+        bytes[at] = scale(block);
+    }
+    PackedPayload::try_new(base.weight(), [(SourceRole::Blocks, Arc::from(bytes))])
         .unwrap_or_else(|error| panic!("{format:?} {shape:?}: {error:?}"))
 }

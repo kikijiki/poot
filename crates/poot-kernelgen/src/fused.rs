@@ -31,8 +31,8 @@ pub enum FusedScalarOp {
     /// Abramowitz-Stegun 7.1.26 polynomial (about 1.5e-7 max abs error).
     Erf,
     /// Pointwise select `(cond, if_true, if_false)`: the bit pattern of `if_true` where the I32 condition
-    /// word is nonzero, else of `if_false` ([`emit_bitwise_select`]). The condition is an I32 leaf; the
-    /// branches are F32 in a float region and I32 in an exact-I32 region.
+    /// word is nonzero, else of `if_false` ([`emit_select`]). The condition is an I32 leaf; the
+    /// branches are F32 or a two-byte float in a float region and I32 in an exact-I32 region.
     Select,
     /// Leading-zero count of an I32 word interpreted as u32. I32 fused regions only.
     Clz,
@@ -180,10 +180,9 @@ pub(crate) fn emit_scalar_op(
             let sign = em.sign(x);
             Rvalue::BinaryOp(BinOp::Mul, mag, sign)
         }
-        FusedScalarOp::Select => emit_bitwise_select(
+        FusedScalarOp::Select => emit_select(
             al,
             stmts,
-            Ty::F32,
             operands[0].clone(),
             operands[1].clone(),
             operands[2].clone(),
@@ -222,6 +221,10 @@ pub struct FusedStep {
 pub enum LeafTy {
     F32,
     I32,
+    /// A two-byte float leaf, read as stored. Only a `Select` step may read it (it moves the element, it
+    /// never computes on it), and a float region's output may be such a `Select`.
+    BF16,
+    F16,
 }
 
 impl LeafTy {
@@ -229,6 +232,8 @@ impl LeafTy {
         match self {
             Self::F32 => Ty::F32,
             Self::I32 => Ty::I32,
+            Self::BF16 => Ty::BF16,
+            Self::F16 => Ty::F16,
         }
     }
 }
@@ -301,7 +306,7 @@ impl FusedScalarOp {
             Self::Binary(_) => (1, 0),
             Self::Tanh => (11, 10),
             Self::Erf => (24, 23),
-            Self::Select => (11, 9),
+            Self::Select => (2, 1),
             Self::GeU | Self::RemU => (4, 3),
         };
         BodySize {
@@ -437,33 +442,79 @@ pub fn fused(
     fused_views(name, out_shape, leaf_shapes, &layouts, k, None)
 }
 
-/// The leaf types of a float region: an I32 leaf is read only as a `Select` condition.
-fn check_float_leaf_tys(generator: &'static str, k: &FusedKernel) -> Result<(), KernelGenError> {
-    // The index of the I32 leaf `input` names, if it names one.
-    let index_leaf = |input: &FusedInput| match input {
-        FusedInput::Leaf(leaf) if k.leaf_tys.get(*leaf) == Some(&LeafTy::I32) => Some(*leaf),
-        _ => None,
+/// The element types of a float region: each step's result type and the output's.
+struct FloatRegionTys {
+    steps: Vec<Ty>,
+    output: Ty,
+}
+
+/// Type a float region and refuse what no float body can state. An I32 leaf has no float meaning, so it is
+/// read only as a `Select` condition. A two-byte float leaf or step is moved, never computed on, so only a
+/// `Select`'s branches (and the region output) may be one; a `Select` over two-byte floats is itself that
+/// type, its two branches agree, and every other step computes in F32.
+fn check_float_region_tys(
+    generator: &'static str,
+    k: &FusedKernel,
+) -> Result<FloatRegionTys, KernelGenError> {
+    let leaf_ty = |leaf: usize| k.leaf_tys.get(leaf).copied().map(LeafTy::ty);
+    let mut steps: Vec<Ty> = Vec::with_capacity(k.steps.len());
+    let input_ty = |input: &FusedInput, steps: &[Ty]| match input {
+        FusedInput::Leaf(leaf) => leaf_ty(*leaf).unwrap_or(Ty::F32),
+        FusedInput::Step(step) => steps.get(*step).cloned().unwrap_or(Ty::F32),
+        FusedInput::Lit(_) | FusedInput::LitI32(_) | FusedInput::LeafLane { .. } => Ty::F32,
+    };
+    let consumer_error = |input: &FusedInput, ty: &Ty, consumer: String| match (input, ty) {
+        (FusedInput::Leaf(leaf), Ty::I32) => KernelGenError::IndexLeafOperand {
+            generator,
+            leaf: *leaf,
+            consumer,
+        },
+        _ => KernelGenError::NarrowOperand {
+            generator,
+            consumer,
+        },
     };
     for step in &k.steps {
+        let is_select = matches!(step.op, FusedScalarOp::Select);
         for (position, input) in step.inputs.iter().enumerate() {
-            let is_condition = matches!(step.op, FusedScalarOp::Select) && position == 0;
-            if let Some(leaf) = index_leaf(input).filter(|_| !is_condition) {
-                return Err(KernelGenError::IndexLeafOperand {
-                    generator,
-                    leaf,
-                    consumer: format!("{:?}", step.op),
-                });
+            let ty = input_ty(input, &steps);
+            let allowed = match ty {
+                Ty::I32 => is_select && position == 0,
+                Ty::BF16 | Ty::F16 => is_select && position != 0,
+                _ => true,
+            };
+            if !allowed {
+                return Err(consumer_error(input, &ty, format!("{:?}", step.op)));
             }
         }
+        let result = match step.op {
+            FusedScalarOp::Select => {
+                let branches = step.inputs.get(1..).unwrap_or_default();
+                let first = branches.first().map(|input| input_ty(input, &steps));
+                if branches
+                    .iter()
+                    .any(|input| Some(input_ty(input, &steps)) != first)
+                {
+                    return Err(KernelGenError::NarrowOperand {
+                        generator,
+                        consumer: "a Select whose branches differ in type".to_string(),
+                    });
+                }
+                first.unwrap_or(Ty::F32)
+            }
+            _ => Ty::F32,
+        };
+        steps.push(result);
     }
-    match index_leaf(&k.output) {
-        Some(leaf) => Err(KernelGenError::IndexLeafOperand {
-            generator,
-            leaf,
-            consumer: "the region output".to_string(),
-        }),
-        None => Ok(()),
+    let output = input_ty(&k.output, &steps);
+    if output == Ty::I32 {
+        return Err(consumer_error(
+            &k.output,
+            &output,
+            "the region output".to_string(),
+        ));
     }
+    Ok(FloatRegionTys { steps, output })
 }
 
 /// [`fused`] reading each leaf through its own physical [`Layout`]. Byte-identical to `fused` when every layout
@@ -494,7 +545,7 @@ pub fn fused_views(
             actual: leaf_layouts.len(),
         });
     }
-    check_float_leaf_tys("fused_views", k)?;
+    let region_tys = check_float_region_tys("fused_views", k)?;
     let r = out_shape.len();
     let out_strides = row_major_strides(out_shape);
     let n = k.n_leaves();
@@ -504,7 +555,7 @@ pub fn fused_views(
     for leaf in &k.leaf_tys {
         locals.push(ld(slice_dtype(leaf.ty(), false), false));
     }
-    locals.push(ld(slice_f32(true), true));
+    locals.push(ld(slice_dtype(region_tys.output.clone(), true), true));
     let mut al = Alloc::new(locals);
     let out_local = local((n + 1) as u32);
 
@@ -524,7 +575,11 @@ pub fn fused_views(
         .map(|leaf| al.add(leaf.ty(), false))
         .collect();
     // per-step result register.
-    let step_reg: Vec<Local> = (0..k.steps.len()).map(|_| al.add(Ty::F32, false)).collect();
+    let step_reg: Vec<Local> = region_tys
+        .steps
+        .iter()
+        .map(|ty| al.add(ty.clone(), false))
+        .collect();
     let cu = |x: usize| Operand::Const(Constant::Usize(x as u64));
 
     let mut body: Vec<Statement> = Vec::new();
@@ -1053,10 +1108,9 @@ fn emit_scalar_op_i32(
             emit_i32_shift(b, operands[0].clone(), operands[1].clone(), al, stmts)
         }
         FusedScalarOp::Binary(b) => Rvalue::BinaryOp(b, operands[0].clone(), operands[1].clone()),
-        FusedScalarOp::Select => emit_bitwise_select(
+        FusedScalarOp::Select => emit_select(
             al,
             stmts,
-            Ty::I32,
             operands[0].clone(),
             operands[1].clone(),
             operands[2].clone(),
@@ -1066,15 +1120,13 @@ fn emit_scalar_op_i32(
     stmts.push(Statement::Assign(Place::local(dst), rv));
 }
 
-/// The one kernel definition of `Select`: `(t & mask) | (f & !mask)` over the branches' I32 bit
-/// patterns, `mask` all ones where the condition word is nonzero. `branch` is the branches' type (`F32` or
-/// `I32`); a float branch is bitcast to its word and the result bitcast back, so no arithmetic ever touches
-/// a branch and a NaN, Inf or `-0.0` passes through (or stays out) bit for bit. Returns the rvalue that
-/// writes the result.
-fn emit_bitwise_select(
+/// The one kernel definition of `Select`: a hardware select of the branch whose condition word is nonzero, so
+/// the chosen branch's bits reach the result and the other is never read as a number. `branch` is the
+/// branches' type (`F32`, `I32`, `BF16` or `F16`): no arithmetic ever touches a branch and a NaN, Inf or
+/// `-0.0` passes through (or stays out) bit for bit at every width. Returns the rvalue that writes the result.
+fn emit_select(
     al: &mut Alloc,
     stmts: &mut Vec<Statement>,
-    branch: Ty,
     condition: Operand,
     if_true: Operand,
     if_false: Operand,
@@ -1084,43 +1136,10 @@ fn emit_bitwise_select(
         Ty::Bool,
         Rvalue::BinaryOp(BinOp::Ne, condition, Operand::Const(Constant::I32(0))),
     );
-    let one = em.typed(
-        Ty::I32,
-        Rvalue::Cast {
-            to: Ty::I32,
-            operand: selected,
-        },
-    );
-    let mask = em.typed(Ty::I32, Rvalue::UnaryOp(UnOp::Neg, one));
-    let not_mask = em.typed(Ty::I32, Rvalue::UnaryOp(UnOp::Not, mask.clone()));
-    let mut bits = |operand: Operand| {
-        if branch == Ty::I32 {
-            operand
-        } else {
-            em.typed(
-                Ty::I32,
-                Rvalue::Bitcast {
-                    to: Ty::I32,
-                    operand,
-                },
-            )
-        }
-    };
-    let (true_bits, false_bits) = (bits(if_true), bits(if_false));
-    let kept_true = em.typed(Ty::I32, Rvalue::BinaryOp(BinOp::BitAnd, true_bits, mask));
-    let kept_false = em.typed(
-        Ty::I32,
-        Rvalue::BinaryOp(BinOp::BitAnd, false_bits, not_mask),
-    );
-    let merged = Rvalue::BinaryOp(BinOp::BitOr, kept_true, kept_false);
-    if branch == Ty::I32 {
-        merged
-    } else {
-        let merged = em.typed(Ty::I32, merged);
-        Rvalue::Bitcast {
-            to: branch,
-            operand: merged,
-        }
+    Rvalue::Select {
+        condition: selected,
+        if_true,
+        if_false,
     }
 }
 

@@ -1,6 +1,6 @@
 //! The token embedding: rows of the `[vocab, width]` table gathered by token id.
 
-use poot_graph_ir::{Builder, Traced};
+use poot_graph_ir::{Builder, Slot, TensorType, Traced};
 use poot_quant::weights::{WeightId, WeightMap, WeightRole};
 use poot_tensor::DType;
 
@@ -31,6 +31,47 @@ impl Embedding {
         } else {
             b.cast(rows, DType::F32)
         }
+    }
+}
+
+/// The name of the `Slot::Activation` input holding a step's caller-computed embedding rows,
+/// `[rows, tokens, width]` F32.
+pub const EMBEDS_SLOT: &str = "embeds";
+/// The name of the `Slot::Activation` input marking where those rows apply, `[rows, tokens]` I32:
+/// nonzero where the row replaces the token's embedding.
+pub const EMBEDS_AT_SLOT: &str = "embeds_at";
+
+/// A step's `StepInput::TokensWithEmbeds` inputs: embedding rows the caller computed (a vision
+/// tower's output for a prompt's image placeholders) and the positions they replace.
+#[derive(Clone, Copy, Debug)]
+pub struct EmbedInputs {
+    rows: Traced,
+    at: Traced,
+}
+
+impl EmbedInputs {
+    /// Declare the two inputs for a `[rows, tokens]` step of embedding width `width`.
+    pub fn declare(b: &Builder, rows: usize, tokens: usize, width: usize) -> Self {
+        Self {
+            rows: b.slot_named(
+                Slot::Activation,
+                EMBEDS_SLOT,
+                TensorType::f32(vec![rows, tokens, width]),
+            ),
+            at: b.slot_named(
+                Slot::Activation,
+                EMBEDS_AT_SLOT,
+                TensorType::new(vec![rows, tokens], DType::I32),
+            ),
+        }
+    }
+
+    /// `x` (`[rows, tokens, width]`, F32) with the caller's rows where [`EMBEDS_AT_SLOT`] is set. A
+    /// select, so the unused rows of the input (zeros at the other positions) never reach the result.
+    pub fn scatter(&self, b: &Builder, x: Traced) -> Traced {
+        let shape = b.aval(x).shape;
+        let at = b.reshape(self.at, vec![shape[0], shape[1], 1]);
+        b.select(b.broadcast(at, shape), self.rows, x)
     }
 }
 

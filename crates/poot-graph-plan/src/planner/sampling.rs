@@ -61,6 +61,7 @@ pub(super) fn plan(
         | elementwise_ops!()
         | matmul_ops!()
         | attention_ops!()
+        | scan_ops!()
         | cast_ops!()
         | movement_ops!() => unreachable!("plan_eqn routes only sampling ops here"),
     };

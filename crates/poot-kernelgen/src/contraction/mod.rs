@@ -1,7 +1,7 @@
 //! The contraction lowering (Card 727): one loop structure ([`Schedule`]) per
 //! contraction shape, and one body per schedule that serves every operand load. A load supplies only the
-//! read of a run of weight values: the dense loader ([`DenseLoad`], an f32, f16-packed or bf16-packed
-//! weight) here, the descriptor-driven block decode in `crate::packed`. The planner picks the schedule and
+//! read of a run of weight values: the dense loader (an f32, f16-packed or bf16-packed
+//! `[N, K]` weight) here, the descriptor-driven block decode in `crate::packed`. The planner picks the schedule and
 //! its launch from shapes and the device ([`poot_target::DeviceCaps::compute_units`]); the generator only
 //! implements it.
 
@@ -10,12 +10,14 @@ mod epilogue;
 mod gemv;
 mod indexed;
 
-pub(crate) use dense::DenseLoad;
 pub(crate) use dense::dense_contraction;
 pub(crate) use epilogue::emit_epilogue;
 pub use epilogue::{Epilogue, EpilogueInput, EpilogueLeaf, EpilogueStep};
 pub(crate) use gemv::{GemvEpilogue, GemvLaunch, gemv_body};
-pub(crate) use indexed::indexed_contraction;
+pub(crate) use indexed::{
+    IndexedTiledBody, IndexedTiledWeight, META_EXPERTS, META_N, META_PACKED_SLAB_WORDS, RowExpert,
+    emit_poison, emit_row_expert, indexed_contraction, indexed_tiled_body,
+};
 
 use crate::KernelGenError;
 

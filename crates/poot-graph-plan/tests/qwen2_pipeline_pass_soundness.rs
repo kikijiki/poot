@@ -225,6 +225,7 @@ fn caps_hosting_only_the_tiny_embed() -> poot_target::DeviceCaps {
         tensor_core: poot_target::TensorCoreSupport::None,
         known_miscompiles: poot_target::KnownMiscompiles::default(),
         compute_units: poot_target::STRIX_HALO_COMPUTE_UNITS,
+        memory_budget_bytes: None,
         ..poot_target::DeviceCaps::rocm_default()
     }
 }

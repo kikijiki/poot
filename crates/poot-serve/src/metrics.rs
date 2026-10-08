@@ -89,6 +89,14 @@ pub(crate) struct CacheMetrics {
     pub(crate) prefix_hit_tokens: AtomicU64,
     /// cumulative prompt tokens looked up against the prefix cache - the hit-rate denominator.
     pub(crate) prefix_query_tokens: AtomicU64,
+    /// cumulative prompt tokens a released request registered in the prefix cache (whole blocks).
+    pub(crate) prefix_registered_tokens: AtomicU64,
+    /// releases that registered no prefix: a preempted or failed sequence, a recurrent-state model, or the
+    /// contiguous layout.
+    pub(crate) prefix_skipped_releases: AtomicU64,
+    /// programs the engine has compiled (the driver's own count): constant once the prepared set is warm, so
+    /// a request mix that changes batch composition must not move it.
+    pub(crate) engine_compiles: AtomicU64,
     /// model weight bytes resident in GPU memory (set once at engine start; the fixed VRAM cost).
     pub(crate) gpu_weight_bytes: AtomicU64,
     /// KV-pool bytes resident in GPU memory (set once at engine start; the shared paged pool's buffers).
@@ -98,24 +106,15 @@ pub(crate) struct CacheMetrics {
     pub(crate) decode_gpu_ns: AtomicU64,
     /// cumulative ns of the whole decode step (GPU call plus host slot bookkeeping/sampling): the denominator.
     pub(crate) decode_step_ns: AtomicU64,
-    /// device-wide VRAM in use (bytes), refreshed each decode step from the backend's runtime API: Vulkan
-    /// `VK_EXT_memory_budget` (`GpuExecutor::vram_used_bytes`) on wgpu, CUDA `cuMemGetInfo`
-    /// (`PtxContext::vram_used_bytes`, Card 549: moved here with the rest of the executor contract,
-    /// `PtxGraphExecutor`'s own copy deleted) on PTX, HSA `HSA_AMD_AGENT_INFO_MEMORY_AVAIL`
-    /// (`RocmContext::vram_used_bytes`, Card 548: moved here with the rest of the executor contract's
-    /// memory service, `RocmGraphExecutor`'s own copy deleted) on ROCm. Includes co-resident
-    /// processes. 0 until the first step or if the query is unavailable.
+    /// device bytes the engine holds (weights, KV pool and workspace, summed over the executor's buffer
+    /// roles), refreshed each step from the driver's live accounting. Engine-produced; it does not see
+    /// other processes on the device.
     pub(crate) gpu_vram_used_bytes: AtomicU64,
-    /// total device VRAM visible to this process (bytes): Vulkan `VK_EXT_memory_budget` `heap_budget`
-    /// (`GpuExecutor::vram_budget_bytes`) on wgpu, CUDA `cuMemGetInfo` total (`PtxContext::vram_budget_bytes`,
-    /// Card 549: moved here with the rest of the executor contract, `PtxGraphExecutor`'s own copy
-    /// deleted) on PTX, HSA `HSA_AMD_MEMORY_POOL_INFO_SIZE` (`RocmContext::vram_budget_bytes`, Card 548: moved
-    /// here with the rest of the executor contract's memory service, `RocmGraphExecutor`'s own copy
-    /// deleted) on ROCm. Refreshed per decode step; 0 if the query is unavailable.
+    /// the device memory the engine plan found available when it started (bytes); 0 if the budget is unknown.
     pub(crate) gpu_vram_total_bytes: AtomicU64,
     /// per-token GPU dispatch count of the optimized decode graph (set once at engine start): the graph eqn count
     /// after cse/flash/fuse, i.e. the kernel launches per token that capture/replay collapses to one host call.
-    /// A qwen2-style estimate (see `Runner::decode_graph_cost`).
+    /// A qwen2-style estimate (the driver's decode graph cost).
     pub(crate) decode_dispatch_count: AtomicU64,
     /// peak transient activation bytes of the optimized decode graph (set once at engine start), by a liveness
     /// sweep; the per-token working set apart from weights and KV.
@@ -154,15 +153,9 @@ pub(crate) struct Metrics {
     /// (`GenEvent::Done`). vLLM's `finish_reason in {stop, length}`.
     pub(crate) requests_completed: AtomicU64,
     /// requests evicted because the client disconnected before completion (reply channel closed mid-stream).
-    /// Unlike `requests_preempted`, a cancellation ends the request for good.
     pub(crate) requests_cancelled: AtomicU64,
     /// requests that ended in an engine/generation error (`GenEvent::Failed` or equivalent).
     pub(crate) requests_errored: AtomicU64,
-    /// cumulative preemption events (recompute mode): a running slot's KV blocks were freed and the request
-    /// requeued so another admission could use the pool space. Not terminal; the request resumes later, possibly
-    /// recomputing part of its generated span. One request can be preempted repeatedly, so this can exceed
-    /// `requests`. Mirrors vLLM's `num_preemptions_total`.
-    pub(crate) requests_preempted: AtomicU64,
     /// generation requests currently being processed (a gauge: +1 on entry, -1 on completion/error).
     pub(crate) inflight: AtomicU64,
     /// time-to-first-token distribution (streaming requests, where TTFT is observable).
@@ -176,10 +169,10 @@ pub(crate) struct Metrics {
     pub(crate) queue_wait: Histogram,
     /// the most recent batched-decode width (active slots) on the GPU path; 0 on the CPU fallback.
     pub(crate) batch_size: AtomicU64,
-    /// the batched-decode slot capacity (POOT_SLOTS on GPU, 1 on the sequential CPU fallback).
+    /// the decode rows the engine plan serves (`EnginePlan::rows`); 0 for a workload with no decode slots.
     pub(crate) slot_capacity: u64,
-    pub(crate) on_gpu: bool,
-    pub(crate) profile: bool,
+    /// the resolved backend the engine plan runs on (`EnginePlan::backend_label`).
+    pub(crate) backend: String,
     /// the served model's name (the model-dir basename), echoed in responses + `/v1/models`.
     pub(crate) model: String,
     /// persistent so CPU usage is a meaningful delta since the previous `/metrics` refresh.
@@ -223,7 +216,6 @@ impl Metrics {
     /// cancellation. `engine_loop` passes the delivery outcome read from the channel *before* it
     /// sends, so the count exists before the event can be observed; the batched paths pass the send
     /// result.
-    #[cfg(test)]
     pub(crate) fn record_terminal(&self, delivered: bool) {
         if delivered {
             self.requests_completed.fetch_add(1, Ordering::Relaxed);
@@ -235,7 +227,6 @@ impl Metrics {
     /// Terminal failure accounting: `requests_errored`, whether or not a receiver is left, published
     /// before the failure event exists - the rule [`crate::types::GenEvent::failed`] documents and
     /// every terminal failure routes through, so the increment lives in exactly one place.
-    #[cfg(test)]
     pub(crate) fn record_terminal_failure(&self) {
         self.requests_errored.fetch_add(1, Ordering::Relaxed);
     }
@@ -301,7 +292,6 @@ impl Metrics {
             "requests_completed": self.requests_completed.load(Ordering::Relaxed),
             "requests_cancelled": self.requests_cancelled.load(Ordering::Relaxed),
             "requests_errored": self.requests_errored.load(Ordering::Relaxed),
-            "requests_preempted": self.requests_preempted.load(Ordering::Relaxed),
             "inflight_requests": self.inflight.load(Ordering::Relaxed),
             "queue_depth": self.queue_depth(),
             "batch_size": self.batch_size.load(Ordering::Relaxed),
@@ -309,6 +299,9 @@ impl Metrics {
             "kv_cache_usage": round1(self.kv_cache_usage() * 100.0) / 100.0,
             "kv_cache_blocks_used": self.cache.kv_used_blocks.load(Ordering::Relaxed),
             "kv_cache_blocks_total": self.cache.kv_total_blocks.load(Ordering::Relaxed),
+            "engine_compiles": self.cache.engine_compiles.load(Ordering::Relaxed),
+            "prefix_registered_tokens": self.cache.prefix_registered_tokens.load(Ordering::Relaxed),
+            "prefix_skipped_releases": self.cache.prefix_skipped_releases.load(Ordering::Relaxed),
             "prefix_cache_hit_rate": round1(self.prefix_cache_hit_rate() * 100.0) / 100.0,
             "gpu_weight_bytes": self.cache.gpu_weight_bytes.load(Ordering::Relaxed),
             "gpu_kv_cache_bytes": self.cache.gpu_kv_bytes.load(Ordering::Relaxed),
@@ -329,8 +322,7 @@ impl Metrics {
             "request_e2e_ms": { "count": self.e2e.count(), "avg": round1(self.e2e.avg_ms()) },
             "queue_wait_ms": { "count": self.queue_wait.count(), "avg": round1(self.queue_wait.avg_ms()) },
             "model": &self.model,
-            "decode_path": if self.on_gpu { "gpu" } else { "cpu" },
-            "profiling": self.profile,
+            "backend": &self.backend,
             "cpu_percent": round1(sys.global_cpu_usage() as f64),
             "mem_used_mb": mb(sys.used_memory()),
             "mem_total_mb": mb(sys.total_memory()),
@@ -368,9 +360,6 @@ impl Metrics {
              # HELP poot_requests_errored_total Requests that ended in an engine/generation error.\n\
              # TYPE poot_requests_errored_total counter\n\
              poot_requests_errored_total {}\n\
-             # HELP poot_requests_preempted_total Preemption events (recompute mode): a running request's KV was freed and it was requeued, not terminated.\n\
-             # TYPE poot_requests_preempted_total counter\n\
-             poot_requests_preempted_total {}\n\
              # HELP poot_inflight_requests Generation requests currently being processed.\n\
              # TYPE poot_inflight_requests gauge\n\
              poot_inflight_requests {}\n\
@@ -383,9 +372,9 @@ impl Metrics {
              # HELP poot_slot_capacity Batched-decode slot capacity.\n\
              # TYPE poot_slot_capacity gauge\n\
              poot_slot_capacity {}\n\
-             # HELP poot_decode_path Decode backend in use (1 for the active path).\n\
-             # TYPE poot_decode_path gauge\n\
-             poot_decode_path{{path=\"{}\"}} 1\n\
+             # HELP poot_backend_info Backend the engine plan resolved to (1 for the active backend).\n\
+             # TYPE poot_backend_info gauge\n\
+             poot_backend_info{{backend=\"{}\"}} 1\n\
              # HELP poot_cpu_percent System CPU utilization since the last scrape.\n\
              # TYPE poot_cpu_percent gauge\n\
              poot_cpu_percent {}\n\
@@ -422,10 +411,10 @@ impl Metrics {
              # HELP poot_gpu_resident_bytes Resident GPU memory the engine tracks (weights + KV pool).\n\
              # TYPE poot_gpu_resident_bytes gauge\n\
              poot_gpu_resident_bytes {}\n\
-             # HELP poot_gpu_vram_used_bytes Device-wide VRAM in use (bytes), queried from the active backend's runtime GPU API (Vulkan VK_EXT_memory_budget on wgpu, CUDA cuMemGetInfo on PTX, HSA hsa_agent_get_info MEMORY_AVAIL on ROCm); engine-produced, no sysfs/CLI.\n\
+             # HELP poot_gpu_vram_used_bytes Device bytes the engine holds (weights, KV pool and workspace), summed over the executor's live buffer roles; engine-produced, it does not see other processes.\n\
              # TYPE poot_gpu_vram_used_bytes gauge\n\
              poot_gpu_vram_used_bytes {}\n\
-             # HELP poot_gpu_vram_total_bytes Total device VRAM visible to this process (bytes), from the active backend's runtime GPU API (Vulkan VK_EXT_memory_budget heap_budget on wgpu, CUDA cuMemGetInfo total on PTX, HSA memory-pool SIZE on ROCm); engine-produced, no sysfs/CLI.\n\
+             # HELP poot_gpu_vram_total_bytes Device memory the engine plan found available at start (bytes); 0 if the budget is unknown.\n\
              # TYPE poot_gpu_vram_total_bytes gauge\n\
              poot_gpu_vram_total_bytes {}\n\
              # HELP poot_gpu_active_ratio Engine-produced GPU-active fraction (GPU-step time / total decode-step wall time), 0..1.\n\
@@ -459,12 +448,11 @@ impl Metrics {
             self.requests_completed.load(Ordering::Relaxed),
             self.requests_cancelled.load(Ordering::Relaxed),
             self.requests_errored.load(Ordering::Relaxed),
-            self.requests_preempted.load(Ordering::Relaxed),
             self.inflight.load(Ordering::Relaxed),
             self.queue_depth(),
             self.batch_size.load(Ordering::Relaxed),
             self.slot_capacity,
-            if self.on_gpu { "gpu" } else { "cpu" },
+            self.backend,
             cpu,
             mb(sys.used_memory()),
             mb(sys.total_memory()),

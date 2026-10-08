@@ -1,5 +1,43 @@
 use crate::*;
 
+/// How long [`RocmContext::wait_completion_bounded`] polls a completion signal before it falls back to
+/// blocked waits. Covers a decode step's replay (~7ms for a 924-packet granite MoE step) and every
+/// small readback.
+const COMPLETION_SPIN_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The wait policy of [`RocmContext::wait_completion_bounded`], over the signal's two reads: polls
+/// `load` (a relaxed signal load) for `spin_window`, then repeats `blocked` (a bounded blocked wait that
+/// returns the signal value) until the signal is below 1 (`true`) or `timeout` elapses (`false`). The
+/// spin window is clamped by `timeout`, so a zero timeout never spins.
+/// A signal that drops inside the window never reaches `blocked`, which on this stack sleeps its whole
+/// hint even for a finished signal.
+pub(crate) fn await_below_one(
+    timeout: std::time::Duration,
+    spin_window: std::time::Duration,
+    mut load: impl FnMut() -> i64,
+    mut blocked: impl FnMut() -> i64,
+) -> bool {
+    let start = std::time::Instant::now();
+    let spin_window = spin_window.min(timeout);
+    while start.elapsed() < spin_window {
+        if load() < 1 {
+            // Pairs with the device's release store of the signal: what the packet or copy wrote is
+            // visible to the caller's reads.
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+            return true;
+        }
+        std::hint::spin_loop();
+    }
+    loop {
+        if blocked() < 1 {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+    }
+}
+
 /// Walk the HSACO ELF and return (name, file offset) for every `.kd` (kernel descriptor) symbol.
 /// Used by `load_hsaco` to patch `kernel_code_properties` bit 3 (ENABLE_SGPR_KERNARG_SEGMENT_PTR) of
 /// every kernel before the runtime copies the HSACO bytes.
@@ -446,6 +484,13 @@ impl RocmContext {
     /// A 1ms hint bounds the wake latency; the wall-clock loop below still enforces
     /// [`RocmContext::wait_timeout`] across attempts.
     ///
+    /// Because this stack's blocked wait costs the full hint even for a signal that has already
+    /// dropped (~1.05ms measured per 4-byte readback), the first [`COMPLETION_SPIN_WINDOW`] polls the
+    /// signal instead (the same busy-wait `synchronize` uses): a small DMA readback completes in
+    /// microseconds, and one blocked wait each made a granite-3.0-1b-a400m decode step (72
+    /// validation-lane reads) cost ~75ms of sleeping. A wait that outlasts the window falls back to
+    /// the blocked wait, so a long replay does not hold a core.
+    ///
     /// The signal is released only on proven completion: on success (signal value below 1) it is
     /// destroyed and `held` is handed back, so the caller may read and then drop it. On timeout the
     /// signal and `held` move to the context's leak list, because the packet or copy may still use
@@ -459,11 +504,13 @@ impl RocmContext {
         tag: &'static str,
         held: Held,
     ) -> Result<Held, RocmError> {
-        let timeout = self.wait_timeout.as_secs();
-        let start = std::time::Instant::now();
-        loop {
+        let completed = await_below_one(
+            self.wait_timeout,
+            COMPLETION_SPIN_WINDOW,
             // SAFETY: `completion` is a live signal this context created and has not destroyed.
-            let value = unsafe {
+            || unsafe { (self.hsa.funcs.hsa_signal_load_relaxed)(completion) },
+            // SAFETY: as above.
+            || unsafe {
                 (self.hsa.funcs.hsa_signal_wait_scacquire)(
                     completion,
                     bindings::HSA_SIGNAL_CONDITION_LT,
@@ -473,23 +520,24 @@ impl RocmContext {
                     1_000_000,
                     bindings::HSA_WAIT_STATE_BLOCKED,
                 )
-            };
-            if value < 1 {
-                // SAFETY: the packet or copy has completed, so nothing uses `completion` any more; it
-                // is destroyed once.
-                unsafe {
-                    let _ = (self.hsa.funcs.hsa_signal_destroy)(completion);
-                }
-                return Ok(held);
+            },
+        );
+        if completed {
+            // SAFETY: the packet or copy has completed, so nothing uses `completion` any more; it is
+            // destroyed once.
+            unsafe {
+                let _ = (self.hsa.funcs.hsa_signal_destroy)(completion);
             }
-            if start.elapsed().as_secs() >= timeout {
-                self.timeouts.abandon(Abandoned {
-                    signal: completion,
-                    held,
-                });
-                return Err(RocmError::QueueWaitTimeout(timeout, tag));
-            }
+            return Ok(held);
         }
+        self.timeouts.abandon(Abandoned {
+            signal: completion,
+            held,
+        });
+        Err(RocmError::QueueWaitTimeout(
+            self.wait_timeout.as_secs(),
+            tag,
+        ))
     }
 
     /// Dispatch a single kernel and wait on its completion signal. The kernarg buffer must already

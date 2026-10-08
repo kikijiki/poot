@@ -9,9 +9,9 @@ use std::sync::Arc;
 
 use poot_eval::{EvalBudget, EvalOptions, Value, eval, materialize_dense};
 use poot_graph_ir::{Graph, PackedSourceName, SlotKey, Storage, ValidationChannel};
-use poot_quant::PackedComponentRef;
-use poot_quant::weights::{WeightEntry, WeightId, WeightMap, WeightStore};
-use poot_tensor::HostTensor;
+use poot_quant::weights::{WeightEntry, WeightId, WeightMap, WeightStore, WeightView};
+use poot_quant::{PackedComponentRef, PackedPayload, PackedStack, PackedStackComponentRef};
+use poot_tensor::{DType, HostTensor};
 
 use crate::StepFixture;
 
@@ -28,6 +28,8 @@ pub fn eval_mapped<V: ValidationChannel>(
     let ids: HashMap<String, WeightId> =
         map.iter().map(|(id, _, _)| (id.const_name(), id)).collect();
     let materialize = |id: WeightId| map.materialize(id, store).unwrap();
+    // One stack per packed expert-stack id, shared by every source role that names it.
+    let mut stacks: HashMap<WeightId, Arc<PackedStack>> = HashMap::new();
     assert_eq!(state.len(), g.state.len(), "one value per state input");
     let mut inputs: HashMap<usize, Value> = HashMap::new();
     for (&(input, _), value) in g.state.iter().zip(state) {
@@ -52,16 +54,40 @@ pub fn eval_mapped<V: ValidationChannel>(
                     let WeightEntry::Dense(dense) = materialize(wid) else {
                         panic!("{name} is packed but the graph declares it dense")
                     };
-                    let mut one = WeightStore::builder();
-                    one.insert("w", WeightEntry::Dense(dense)).unwrap();
-                    Value::Host(materialize_dense(&one.build(), "w").unwrap())
+                    if dense.dtype() == DType::I32 {
+                        // An index table (a hash router's): its words as stored.
+                        let words = dense
+                            .bytes()
+                            .as_slice()
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|w| i32::from_le_bytes(*w))
+                            .collect();
+                        HostTensor::i32(dense.shape().to_vec(), words).into()
+                    } else {
+                        let mut one = WeightStore::builder();
+                        one.insert("w", WeightEntry::Dense(dense)).unwrap();
+                        Value::Host(materialize_dense(&one.build(), "w").unwrap())
+                    }
                 } else {
                     let source = PackedSourceName::parse(name)
                         .unwrap_or_else(|| panic!("the map names no const {name}"));
-                    let WeightEntry::Packed(payload) = materialize(ids[source.linear_id()]) else {
-                        panic!("{name} names a dense weight")
-                    };
-                    Value::Packed(PackedComponentRef::new(Arc::clone(&payload), source.role()))
+                    let wid = ids[source.linear_id()];
+                    if matches!(map.view(wid), Some(WeightView::ExpertStack(_))) {
+                        let stack = stacks.entry(wid).or_insert_with(|| {
+                            Arc::new(map.materialize_stack(wid, store).unwrap())
+                        });
+                        Value::PackedStack(PackedStackComponentRef::new(
+                            Arc::clone(stack),
+                            source.role(),
+                        ))
+                    } else {
+                        let WeightEntry::Packed(payload) = materialize(wid) else {
+                            panic!("{name} names a dense weight")
+                        };
+                        Value::Packed(PackedComponentRef::new(Arc::clone(&payload), source.role()))
+                    }
                 }
             }
             Storage::Device => unreachable!("a graph input is never a device intermediate"),
@@ -88,17 +114,29 @@ pub fn oracle_for<'a, V: ValidationChannel>(
     store: &'a WeightStore,
 ) -> impl FnMut(&[StepFixture]) -> HostTensor + 'a {
     let mut state: HashMap<String, HostTensor> = HashMap::new();
-    let packed: HashMap<usize, PackedComponentRef> = graph
+    let mut stacks: HashMap<String, Arc<PackedStack>> = HashMap::new();
+    let packed: HashMap<usize, Value> = graph
         .inputs
         .iter()
         .filter_map(|&id| {
             let source = PackedSourceName::parse(graph.meta(id).name.as_deref()?)?;
-            let WeightEntry::Packed(owner) = store.get(source.linear_id())? else {
-                return None;
-            };
+            if let Some(WeightEntry::Packed(owner)) = store.get(source.linear_id()) {
+                return Some((
+                    id,
+                    Value::Packed(PackedComponentRef::new(Arc::clone(owner), source.role())),
+                ));
+            }
+            // An expert stack: the store holds its experts as `{id}.0`, `{id}.1`, ..
+            let owners = expert_owners(store, source.linear_id())?;
+            let stack = stacks
+                .entry(source.linear_id().to_string())
+                .or_insert_with(|| Arc::new(PackedStack::try_new(owners).unwrap()));
             Some((
                 id,
-                PackedComponentRef::new(Arc::clone(owner), source.role()),
+                Value::PackedStack(PackedStackComponentRef::new(
+                    Arc::clone(stack),
+                    source.role(),
+                )),
             ))
         })
         .collect();
@@ -108,7 +146,7 @@ pub fn oracle_for<'a, V: ValidationChannel>(
             let meta = graph.meta(id);
             let value = match meta.storage {
                 Storage::Const => match packed.get(&id) {
-                    Some(component) => Value::Packed(component.clone()),
+                    Some(component) => component.clone(),
                     None => Value::from(
                         materialize_dense(store, meta.name.as_deref().unwrap()).unwrap(),
                     ),
@@ -138,4 +176,15 @@ pub fn oracle_for<'a, V: ValidationChannel>(
         }
         evaluation.output.into_host().expect("dense output")
     }
+}
+
+/// The packed experts a store holds for stack `stack_id`: the entries `{stack_id}.0`, `{stack_id}.1`, ..
+/// (the key spelling a GGUF load gives a rank-3 expert tensor), or `None` when it holds no `{stack_id}.0`.
+pub fn expert_owners(store: &WeightStore, stack_id: &str) -> Option<Vec<Arc<PackedPayload>>> {
+    let mut owners = Vec::new();
+    while let Some(WeightEntry::Packed(owner)) = store.get(&format!("{stack_id}.{}", owners.len()))
+    {
+        owners.push(Arc::clone(owner));
+    }
+    (!owners.is_empty()).then_some(owners)
 }

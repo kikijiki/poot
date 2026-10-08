@@ -10,10 +10,10 @@ use poot_models::model::{ModelError, Phase, StepShape, TraceError};
 use poot_models::registry::RegistryError;
 
 use crate::core::sampler::SamplerFault;
-use crate::driver::lora::{GenerationId, LoraError};
+use crate::driver::lora::{AdapterError, GenerationId, LoraError};
 use crate::driver::step::SeqId;
 use crate::driver::suffix::Head;
-use crate::error::RunnerError;
+use crate::error::TextError;
 
 /// Why the driver cannot serve something: the model, the registry or the planner has no way to.
 #[derive(Debug, thiserror::Error)]
@@ -43,6 +43,9 @@ pub enum Unsupported {
     /// The draft policy cannot be served on this model or with this draft.
     #[error(transparent)]
     Speculation(SpeculationRefusal),
+    /// The adapters do not stack against this model's weights.
+    #[error(transparent)]
+    Adapter(AdapterError),
 }
 
 /// Why a [`DraftPolicy`](crate::driver::DraftPolicy) is refused at `prepare`.
@@ -113,8 +116,11 @@ pub enum InvalidRequest {
     /// An explicit verify window is a greedy pick per position; a sampled window is a draft policy's.
     #[error("sequence {0:?} asks for a verify window with a sampler that is not greedy")]
     WindowNeedsGreedy(SeqId),
-    /// One step is one entry, compiled for one adapter-set generation.
-    #[error("one step cannot mix rows of different adapter generations")]
+    /// One step is one entry on one executable, and a generation's executable holds only the
+    /// sequences opened under it.
+    #[error(
+        "one step cannot mix rows of different adapter generations, or base rows with adapter rows"
+    )]
     MixedAdapters,
     #[error("commit of {kept} tokens exceeds the {produced} the last step produced")]
     CommitBeyondResult { kept: usize, produced: usize },
@@ -133,6 +139,57 @@ pub enum InvalidRequest {
     SlotsBusy,
     #[error(transparent)]
     Adapter(LoraError),
+    /// The embedding rows a prompt supplies do not fit it.
+    #[error(transparent)]
+    Embeds(EmbedsError),
+    /// An encode request the driver cannot batch into one step.
+    #[error(transparent)]
+    Encode(EncodeError),
+}
+
+/// Why a prompt's embedding rows are refused.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum EmbedsError {
+    /// `rows` holds `rows` values, not `positions * width`.
+    #[error("{positions} embedding rows of width {width} need {} values, got {rows}", positions * width)]
+    Length {
+        positions: usize,
+        width: usize,
+        rows: usize,
+    },
+    /// The positions must be strictly ascending and inside the prompt.
+    #[error("embedding position {position} is out of order or outside the {prompt}-token prompt")]
+    Position { position: usize, prompt: usize },
+    /// The rows are not as wide as the model's embedding.
+    #[error("embedding rows are {got} wide, the model's embedding is {want}")]
+    Width { got: usize, want: usize },
+    /// A prefix block cache keys on tokens alone: a paged sequence cannot take embedding rows that
+    /// change what the same tokens mean.
+    #[error("a paged driver cannot serve a prompt with embedding rows")]
+    Paged,
+}
+
+/// Why an encode request is refused.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum EncodeError {
+    #[error("an encode request needs at least one row")]
+    Empty,
+    /// One step has one kind of input: token rows or image frames.
+    #[error("an encode request cannot mix token rows and image frames")]
+    Mixed,
+    #[error("encode row {row} has no tokens")]
+    EmptyRow { row: usize },
+    /// The step's cache aliases an open sequence's.
+    #[error("encode shares the cache of an open sequence: release it first")]
+    SequenceOpen,
+    #[error("encode row {row}: {types} token types for {tokens} tokens")]
+    TokenTypes {
+        row: usize,
+        tokens: usize,
+        types: usize,
+    },
+    #[error("encode row {row}: a frame of {got} values, the step takes {want}")]
+    FrameLength { row: usize, got: usize, want: usize },
 }
 
 /// A [`DriverOptions`](crate::driver::DriverOptions) value the model cannot honor.
@@ -223,7 +280,7 @@ pub enum LoadError {
     Unpinned { file: String },
     /// The tokenizer or chat template could not be built from the checkpoint.
     #[error("tokenizer: {0}")]
-    Text(#[source] Box<RunnerError>),
+    Text(#[source] Box<TextError>),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -251,12 +308,18 @@ pub enum DriverError {
     Load(LoadError),
     /// The text codec could not decode the generated tokens.
     #[error("detokenization: {0}")]
-    Text(#[source] Box<RunnerError>),
+    Text(#[source] Box<TextError>),
 }
 
 impl From<Unsupported> for DriverError {
     fn from(error: Unsupported) -> Self {
         DriverError::Unsupported(error)
+    }
+}
+
+impl From<AdapterError> for DriverError {
+    fn from(error: AdapterError) -> Self {
+        DriverError::Unsupported(Unsupported::Adapter(error))
     }
 }
 

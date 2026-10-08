@@ -14,11 +14,15 @@ One place for `poot-serve` command-line options and environment variables. Gener
 | --------------- | ------- | ----- |
 | `MODEL` (positional) | developer-local `qwen2.5-0.5b` path | Safetensors directory or `.gguf` file. Always pass it. |
 | `ADDR` (positional) | `127.0.0.1:8080` | Bind address. |
-| `--lora-adapter NAME=DIR` | none | Repeatable. Registers a PEFT adapter at startup; refused for now (not available yet), see [LoRA adapters](./lora-adapters.md). |
-| `--lora-pool-capacity N` | no headroom | LoRA pool slots for later hot-loads; refused for now with the registration, see [LoRA adapters](./lora-adapters.md). |
+| `--backend` | `auto` | `wgpu`, `rocm`, `ptx`, `vulkan` or `auto`. `auto` opens PTX if a CUDA device opens, else ROCm if an HSA GPU agent opens, else wgpu, and never falls back after a refusal. See [Picking a backend](./choosing-a-backend.md). |
 
-Any other `--` option fails startup with an `unknown option` error. `--backend`, `--tensor-parallel` and
-`--profile` are not available yet.
+Any other `--` option is refused at startup.
+
+The listener opens once the model is prepared on the device, so a client gets connection refused while the server
+starts. `/health` is then `200` with `"status": "serving"` and the `backend`, `rows` and `max_seq` the engine plan
+settled on. `serving` means the device plan was admitted, not that generation is available: every inference route
+is still a typed `503`. A model whose entries are prepared on first use (embeddings, rerank) is refused at startup
+until its routes exist.
 
 Logging uses `RUST_LOG` (default `info`). `SIGINT`/`SIGTERM` stop accepting connections and drain in-flight requests.
 

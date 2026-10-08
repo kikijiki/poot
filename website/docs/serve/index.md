@@ -10,11 +10,7 @@ sidebar_position: 1
 checkpoints, first-time bring-up, and the features that are available. For embedding poot as a library,
 see [Develop](../develop/index.md).
 
-:::caution[Being restored]
-poot is being refactored. This is not available yet and is planned to return.
-:::
-
-Today the server starts, parses and bounds requests, and serves encoder embeddings and reranking. `/v1/completions` and `/v1/chat/completions` return `503`, and `/health` reports `"engine_loaded": false`. Continuous batching, speculative decoding, tensor parallelism, pooled MoE serving, vision-language serving, LoRA adapters and Qwen3-Next are not available yet.
+Today the server loads a registered model, fits it to the device and serves `/v1/completions` and `/v1/chat/completions` from one scheduling loop over the driver ([Continuous batching](./continuous-batching.md)). `/health` answers `200` `serving` once the engine thread is running, `503` while it starts, drains, or after it dies (`"status": "dead"` with the cause and reason). The embeddings and reranking routes and LoRA administration return `503` until they are restored. Speculative decoding, tensor parallelism, pooled MoE serving, vision-language serving, LoRA adapters and Qwen3-Next are not available yet.
 
 Design and paper provenance for continuous batching, speculative decoding, LoRA, quantization,
 and tensor parallelism live under [Serving design](../architecture/serving-design.mdx).

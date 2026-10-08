@@ -29,10 +29,11 @@ use poot_graph_plan::{
 };
 use poot_quant::PackedPayload;
 use poot_quant::format::{GroupMap, WeightFormat};
-use poot_quant::weights::{WeightEntry, WeightStore};
+use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_rocm_gpu::device::RocmDevice;
 use poot_runtime_common::DeviceBackend;
 use poot_tensor::DType;
+use poot_test_util::const_weights::ConstWeights;
 use poot_test_util::device_skip::open_or_skip;
 
 const K: usize = 256;
@@ -51,6 +52,13 @@ fn formats() -> Vec<WeightFormat> {
     ]
 }
 
+/// The layouts of a routed expert table: [`formats`] and the codebook-scaled 4-bit block format.
+fn expert_formats() -> Vec<WeightFormat> {
+    let mut formats = formats();
+    formats.push(WeightFormat::Mxfp4);
+    formats
+}
+
 /// The decode column one step selects.
 fn column(step: usize) -> usize {
     (step * 67 + 5) % K
@@ -65,19 +73,7 @@ fn staged(
     target: Target,
     graph: &Graph,
 ) -> poot_graph_plan::StagedProgram<poot_graph_ir::ValidationOutputs> {
-    staged_under(target, graph, false)
-}
-
-/// [`staged`], with `guarded` under the routed-expert hang guard: the unfused program, one kernel per
-/// equation (the graph carries a dead routed-expert site and the target has the hang).
-fn staged_under(
-    target: Target,
-    graph: &Graph,
-    guarded: bool,
-) -> poot_graph_plan::StagedProgram<poot_graph_ir::ValidationOutputs> {
-    let (graph, caps) = poot_test_util::graph_fixtures::pipeline_input(graph, target.caps, guarded);
-    let target = Target { caps, ..target };
-    let graph = graph.with_validations(Vec::new());
+    let graph = graph.clone().with_validations(Vec::new());
     compile_staged(
         &graph,
         &TargetSet::single(DeviceId(0), target),
@@ -85,10 +81,7 @@ fn staged_under(
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions {
-            execution: Submission::Replay,
-            limits: poot_graph_plan::CompileLimits::STANDARD,
-        },
+        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
     )
     .unwrap()
 }
@@ -111,12 +104,30 @@ fn store_for(graph: &Graph, owners: &HashMap<String, Arc<PackedPayload>>) -> Arc
         if !seen.insert(name.linear_id().to_string()) {
             continue;
         }
-        let owner = owners
-            .get(name.linear_id())
-            .unwrap_or_else(|| panic!("no payload registered for linear_id {}", name.linear_id()));
-        builder
-            .insert(name.linear_id(), WeightEntry::Packed(Arc::clone(owner)))
-            .unwrap();
+        if let Some(owner) = owners.get(name.linear_id()) {
+            builder
+                .insert(name.linear_id(), WeightEntry::Packed(Arc::clone(owner)))
+                .unwrap();
+            continue;
+        }
+        // An expert stack: its experts are the entries `{stack id}.{expert}`, which `ConstWeights` views as
+        // one `ExpertStack`.
+        let experts: Vec<_> = (0..)
+            .map_while(|expert| owners.get(&format!("{}.{expert}", name.linear_id())))
+            .collect();
+        assert!(
+            !experts.is_empty(),
+            "no payload registered for linear_id {}",
+            name.linear_id()
+        );
+        for (expert, owner) in experts.into_iter().enumerate() {
+            builder
+                .insert(
+                    format!("{}.{expert}", name.linear_id()),
+                    WeightEntry::Packed(Arc::clone(owner)),
+                )
+                .unwrap();
+        }
     }
     Arc::new(builder.build())
 }
@@ -220,10 +231,12 @@ fn packed_decode_through_the_contract_is_bit_exact() {
         let (graph, x_key, pos_key) = slot_decode_graph(owner.weight());
         let owners = HashMap::from([("layer".to_string(), Arc::clone(&owner))]);
         let store = store_for(&graph, &owners);
+        let mut weights = ConstWeights::new(&store);
+        let named = weights.graph(&graph);
         let exe = engine
-            .load_weights(store, poot_executor::WeightSource::ConstNames)
+            .load_weights(Arc::clone(&store), Arc::new(weights.map()))
             .unwrap();
-        let entry = engine.add_entry(exe, &staged(target, &graph)).unwrap();
+        let entry = engine.add_entry(exe, &staged(target, &named)).unwrap();
         for step in 0..STEPS {
             let k = column(step);
             let values = [
@@ -301,10 +314,12 @@ fn packed_e4m3_per_channel_decode_through_the_contract_is_bit_exact() {
     let (graph, x_key, pos_key) = slot_decode_graph(owner.weight());
     let owners = HashMap::from([("layer".to_string(), Arc::clone(&owner))]);
     let store = store_for(&graph, &owners);
+    let mut weights = ConstWeights::new(&store);
+    let named = weights.graph(&graph);
     let exe = engine
-        .load_weights(store, poot_executor::WeightSource::ConstNames)
+        .load_weights(Arc::clone(&store), Arc::new(weights.map()))
         .unwrap();
-    let entry = engine.add_entry(exe, &staged(target, &graph)).unwrap();
+    let entry = engine.add_entry(exe, &staged(target, &named)).unwrap();
     for step in 0..STEPS {
         let k = column(step);
         let values = [
@@ -367,10 +382,12 @@ fn packed_prefill_through_the_contract_is_bit_exact() {
 
         let owners = HashMap::from([("layer".to_string(), Arc::clone(&owner))]);
         let store = store_for(&graph, &owners);
+        let mut weights = ConstWeights::new(&store);
+        let named = weights.graph(&graph);
         let exe = engine
-            .load_weights(store, poot_executor::WeightSource::ConstNames)
+            .load_weights(Arc::clone(&store), Arc::new(weights.map()))
             .unwrap();
-        let entry = engine.add_entry(exe, &staged(target, &graph)).unwrap();
+        let entry = engine.add_entry(exe, &staged(target, &named)).unwrap();
         let values = [(x_key, vec![K, K], DType::F32, one_hot_bytes(K, K, |r| r))];
         let inputs = slot_inputs(&graph, &values);
         let y_bytes = engine
@@ -424,10 +441,12 @@ fn a_swapped_packed_role_is_refused_before_upload() {
     let swapped_owner = Arc::new(poot_test_util::packed::random_payload(format, [K, OUT], 3));
     let owners = HashMap::from([("layer".to_string(), swapped_owner)]);
     let store = store_for(&graph, &owners);
+    let mut weights = ConstWeights::new(&store);
+    let named = weights.graph(&graph);
     let exe = engine
-        .load_weights(store, poot_executor::WeightSource::ConstNames)
+        .load_weights(Arc::clone(&store), Arc::new(weights.map()))
         .unwrap();
-    let staged_program = staged(target, &graph);
+    let staged_program = staged(target, &named);
     let Err(error) = engine.add_entry(exe, &staged_program) else {
         panic!("a role/shape-swapped packed carrier must be refused, not silently bound");
     };
@@ -435,91 +454,337 @@ fn a_swapped_packed_role_is_refused_before_upload() {
     let _ = (x_key, pos_key);
 }
 
-/// Card 642: the canonical packed MoE chain (`packed_indexed_linear` and
-/// `packed_grouped_linear`, every expert a `PackedDequant` planned as `Materialize`, the table the
-/// dense `IndexedMatMul`) runs through the contract, row `m` reading expert `ids[m]`: with a one-hot
-/// row the output is exactly that expert's decoded column, bit-exact against the oracle decoder
-/// (zero sign canonicalized).
+const EXPERTS: usize = 3;
+const ROWS: usize = 5;
+/// Rows past `INDEXED_GEMV_MAX_ROWS` (32), so an indexed contraction of them runs the segmented Tiled schedule.
+const PREFILL_ROWS: usize = 70;
+const PREFILL_OUT: usize = 11;
+/// Row `m` routed to expert `(2m + 1) % EXPERTS`: every window of rows holds all the experts.
+fn interleaved(m: usize) -> usize {
+    (m * 2 + 1) % EXPERTS
+}
+
+/// Prefill routing in which a tile can skip an expert: the first half of every 64 rows takes only experts 2 and 0
+/// in an unsorted order (the segmented walk must step from expert 0 to expert 2, not to the next integer), the
+/// second half is [`interleaved`].
+fn gapped(m: usize) -> usize {
+    if m % 64 < 32 {
+        [2, 0, 2, 0, 0, 2, 2, 0][m % 8]
+    } else {
+        interleaved(m)
+    }
+}
+
+/// 17.0M outputs: past the 65,535 x 256 the packed Gemv body can address on wgpu.
+const GRID_LIMIT_ROWS: usize = 4096;
+const GRID_LIMIT_OUT: usize = 4160;
+
+/// The decode column row `m` selects of a `k`-wide table.
+fn column_of(m: usize, k: usize) -> usize {
+    (m * 67 + 5) % k
+}
+
+/// Every row of `owner` decoded by the oracle, `[out, k]` flattened: decoded once per expert, so a table of
+/// millions of outputs is not re-decoded for each of the rows that read it.
+fn decoded_rows(owner: &PackedPayload) -> Vec<f32> {
+    let [out, k] = owner.weight().shape();
+    let mut decoded = vec![0.0f32; out * k];
+    for (o, row) in decoded.chunks_mut(k).enumerate() {
+        owner.decode_row(o, row).unwrap();
+    }
+    decoded
+}
+
+fn assert_indexed_row(what: &str, decoded: &[f32], k: usize, got: &[f32], column: usize) {
+    assert_eq!(got.len() * k, decoded.len(), "{what}");
+    for (o, value) in got.iter().enumerate() {
+        let want = decoded[o * k + column];
+        assert_eq!(
+            canonical(*value),
+            canonical(want),
+            "{what}: [{o}, k={column}] device {value} vs oracle {want}"
+        );
+    }
+}
+
+/// How the stacked table of an indexed packed launch binds (card 1067).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StackBuffers {
+    /// Every source is one buffer.
+    One,
+    /// The target's single-buffer limit holds two of the three experts of the largest source, so `legalize` splits
+    /// the table into the expert ranges 0..2 and 2..3, each its own buffer.
+    Split,
+}
+
+impl StackBuffers {
+    /// `g` as `legalize` leaves it for a device of `target` whose single-buffer limit is this layout's: the stacked
+    /// table split into the expert ranges the limit holds. The device keeps its real caps, so the result is
+    /// compiled and run for the real target; `g` itself is the unsplit graph.
+    fn graph(self, g: &Graph, target: Target, descriptor: poot_quant::PackedWeight) -> Graph {
+        match self {
+            Self::One => g.clone(),
+            Self::Split => {
+                let slab = descriptor
+                    .sources()
+                    .into_iter()
+                    .map(|role| descriptor.slab_bytes(role))
+                    .max()
+                    .expect("a packed weight has a source") as u64;
+                assert!(
+                    2 * slab < 4096,
+                    "a limit this small is used as is, not rounded"
+                );
+                let caps = poot_target::DeviceCaps {
+                    max_buffer_bytes: 2 * slab,
+                    ..target.caps
+                };
+                let split =
+                    poot_graph_plan::legalize(g, &caps, &poot_graph_plan::CompileLimits::STANDARD)
+                        .expect("the stacked table splits");
+                let carriers: Vec<usize> = split
+                    .consts
+                    .iter()
+                    .map(|&id| split.aval(id).shape[0])
+                    .collect();
+                assert_eq!(
+                    carriers,
+                    self.carrier_experts(descriptor.sources().len()),
+                    "the experts each stacked carrier holds after the split"
+                );
+                split
+            }
+        }
+    }
+
+    /// The leading extents of the compiled graph's stacked carriers: one buffer of every expert, or the 2 + 1
+    /// split with every source's piece 0 before its piece 1.
+    fn carrier_experts(self, sources: usize) -> Vec<usize> {
+        match self {
+            Self::One => vec![EXPERTS; sources],
+            Self::Split => [[2].repeat(sources), [1].repeat(sources)].concat(),
+        }
+    }
+}
+
+/// One `packed_indexed_linear` launch over `EXPERTS` stacked `[out, k]` experts of `format`, row `m` routed to
+/// the expert `expert_of(m)` routes it to with a one-hot activation: one `PackedContraction { rows: Indexed }`, each row
+/// bit-exact against the oracle decoder (zero sign canonicalized).
+fn run_indexed_case(
+    engine: &mut Engine<RocmDevice>,
+    target: Target,
+    format: WeightFormat,
+    (rows, out, k): (usize, usize, usize),
+    expert_of: fn(usize) -> usize,
+    buffers: StackBuffers,
+) {
+    let owners_vec: Vec<Arc<PackedPayload>> = (0..EXPERTS)
+        .map(|e| {
+            Arc::new(poot_test_util::packed::prescribed_scale_payload(
+                format,
+                [out, k],
+                e as u64 * 7 + 101,
+            ))
+        })
+        .collect();
+    let table = poot_graph_ir::ops::PackedExpertStack {
+        stack_id: "experts".to_string(),
+        descriptor: owners_vec[0].weight(),
+        experts: EXPERTS,
+    };
+    let what = format!("{format:?}");
+    let b = Builder::new();
+    let x = b.slot_named(Slot::Activation, "moe-x", TensorType::f32(vec![rows, k]));
+    let ids = b.slot_named(Slot::Activation, "moe-ids", TensorType::f32(vec![rows]));
+    let y = poot_graph_ir::ops::packed_indexed_linear(&b, x, ids, &table).unwrap();
+    let graph = b.finish(y);
+    let x_key = graph.meta(x.id).slot_key().unwrap().clone();
+    let ids_key = graph.meta(ids.id).slot_key().unwrap().clone();
+
+    let owners: HashMap<String, Arc<PackedPayload>> = (0..EXPERTS)
+        .map(|e| (format!("experts.{e}"), Arc::clone(&owners_vec[e])))
+        .collect();
+    let store = store_for(&graph, &owners);
+    let mut weights = ConstWeights::new(&store);
+    let named = weights.graph(&graph);
+    let exe = engine
+        .load_weights(Arc::clone(&store), Arc::new(weights.map()))
+        .unwrap();
+    let named = buffers.graph(&named, target, table.descriptor);
+    let program = staged(target, &named);
+    let compiled = program.stages().next().expect("single stage").2.graph();
+    let carriers: Vec<usize> = compiled
+        .consts
+        .iter()
+        .map(|&id| compiled.aval(id).shape[0])
+        .collect();
+    assert_eq!(
+        carriers,
+        buffers.carrier_experts(table.descriptor.sources().len()),
+        "{what}: the experts each stacked carrier holds"
+    );
+    if buffers == StackBuffers::One {
+        assert!(
+            matches!(
+                compiled.eqns.as_slice(),
+                [poot_graph_ir::Eqn {
+                    op: poot_graph_ir::OpKind::PackedContraction {
+                        rows: poot_graph_ir::ContractionRows::Indexed { experts: EXPERTS },
+                        ..
+                    },
+                    ..
+                }]
+            ),
+            "{what}: {:?}",
+            compiled.eqns
+        );
+    }
+    let entry = engine.add_entry(exe, &program).unwrap();
+
+    let selected: Vec<f32> = (0..rows).map(|m| expert_of(m) as f32).collect();
+    let values = [
+        (
+            x_key,
+            vec![rows, k],
+            DType::F32,
+            one_hot_bytes(rows, k, |m| column_of(m, k)),
+        ),
+        (ids_key, vec![rows], DType::F32, f32_bytes(&selected)),
+    ];
+    let inputs = slot_inputs(&graph, &values);
+    let got = bytemuck_f32(
+        &engine
+            .step(exe, entry, &inputs, &mut NoSync)
+            .unwrap_or_else(|e| panic!("{what}: {e}"))
+            .read()
+            .unwrap(),
+    );
+    let decoded: Vec<Vec<f32>> = owners_vec.iter().map(|owner| decoded_rows(owner)).collect();
+    for m in 0..rows {
+        assert_indexed_row(
+            &format!("{what} row {m} expert {}", expert_of(m)),
+            &decoded[expert_of(m)],
+            k,
+            &got[m * out..(m + 1) * out],
+            column_of(m, k),
+        );
+    }
+    engine.unload(exe).unwrap();
+}
+
+/// SC-001 (ROCm): `packed_indexed_linear` over a stacked table of every format runs through the contract
+/// as one `PackedContraction { rows: Indexed }`, one-hot rows bit-exact against the oracle decoder.
+/// Mutation: slab stride 0 in the planner's metadata (every row reads expert 0); the rows routed to
+/// experts 1 and 2 go red.
 #[test]
-fn canonical_packed_moe_chain_runs_bit_exact() {
+fn packed_indexed_contraction_runs_bit_exact() {
     let Some(device) = open_or_skip(DeviceBackend::Rocm, RocmDevice::new()) else {
         return;
     };
     let target = device.target();
     let mut engine = Engine::new(device);
-    const EXPERTS: usize = 3;
-    const ROWS: usize = 5;
-    for format in formats() {
-        let owners_vec: Vec<Arc<PackedPayload>> = (0..EXPERTS)
-            .map(|e| {
-                Arc::new(poot_test_util::packed::random_payload(
-                    format,
-                    [OUT, K],
-                    e as u64 * 7 + 101,
-                ))
-            })
-            .collect();
-        let rows: Vec<poot_graph_ir::ops::PackedLinearGraphRow> = (0..EXPERTS)
-            .map(|ordinal| poot_graph_ir::ops::PackedLinearGraphRow {
-                ordinal,
-                linear_id: format!("expert.{ordinal}"),
-                descriptor: owners_vec[ordinal].weight(),
-            })
-            .collect();
-        let expert_of = |m: usize| (m * 2 + 1) % EXPERTS;
-        for grouped in [false, true] {
-            let what = format!("{format:?} grouped={grouped}");
-            let b = Builder::new();
-            let x = b.slot_named(Slot::Activation, "moe-x", TensorType::f32(vec![ROWS, K]));
-            let ids = b.slot_named(Slot::Activation, "moe-ids", TensorType::f32(vec![ROWS]));
-            let y = if grouped {
-                poot_graph_ir::ops::packed_grouped_linear(&b, x, ids, &rows)
-            } else {
-                poot_graph_ir::ops::packed_indexed_linear(&b, x, ids, &rows)
-            }
-            .unwrap();
-            let graph = b.finish(y);
-            let x_key = graph.meta(x.id).slot_key().unwrap().clone();
-            let ids_key = graph.meta(ids.id).slot_key().unwrap().clone();
-
-            let owners: HashMap<String, Arc<PackedPayload>> = (0..EXPERTS)
-                .map(|e| (format!("expert.{e}"), Arc::clone(&owners_vec[e])))
-                .collect();
-            let store = store_for(&graph, &owners);
-            let exe = engine
-                .load_weights(store, poot_executor::WeightSource::ConstNames)
-                .unwrap();
-            let entry = engine.add_entry(exe, &staged(target, &graph)).unwrap();
-
-            let selected: Vec<f32> = (0..ROWS).map(|m| expert_of(m) as f32).collect();
-            let values = [
-                (
-                    x_key,
-                    vec![ROWS, K],
-                    DType::F32,
-                    one_hot_bytes(ROWS, K, column),
-                ),
-                (ids_key, vec![ROWS], DType::F32, f32_bytes(&selected)),
-            ];
-            let inputs = slot_inputs(&graph, &values);
-            let out = bytemuck_f32(
-                &engine
-                    .step(exe, entry, &inputs, &mut NoSync)
-                    .unwrap_or_else(|e| panic!("{what}: {e}"))
-                    .read()
-                    .unwrap(),
-            );
-            for m in 0..ROWS {
-                assert_decode_row(
-                    &format!("{what} row {m} expert {}", expert_of(m)),
-                    &owners_vec[expert_of(m)],
-                    &out[m * OUT..(m + 1) * OUT],
-                    column(m),
-                );
-            }
-            engine.unload(exe).unwrap();
-        }
+    for format in expert_formats() {
+        run_indexed_case(
+            &mut engine,
+            target,
+            format,
+            (ROWS, OUT, K),
+            interleaved,
+            StackBuffers::One,
+        );
     }
+}
+
+/// Card 1067 (ROCm): a stacked table over the target's single-buffer limit runs split into expert ranges
+/// (0..2 and 2..3, each its own buffer per source) and is bit-exact against the oracle decoder on every format,
+/// with rows routed to every expert, the last one alone in its buffer. The reduced limit is `legalize`'s one input
+/// (`StackBuffers::Split`); the graph, weights and executor are those of the unsplit case.
+/// Mutation: in `legalize`'s `split_oversized_expert_stacks` shift the ids of the later pieces by one less
+/// than `range.start`; the row routed to expert 2 reads the wrong slab and goes red.
+#[test]
+fn a_split_expert_stack_runs_bit_exact() {
+    let Some(device) = open_or_skip(DeviceBackend::Rocm, RocmDevice::new()) else {
+        return;
+    };
+    let target = device.target();
+    let mut engine = Engine::new(device);
+    for format in expert_formats() {
+        run_indexed_case(
+            &mut engine,
+            target,
+            format,
+            (ROWS, 2, K),
+            interleaved,
+            StackBuffers::Split,
+        );
+    }
+}
+
+/// SC-002 (ROCm): a Q8_0 table with `out = 3, K = 32` is 102 bytes per expert, not a whole number of words,
+/// so the binder pads each expert to 104 bytes and the kernel strides by that; one-hot rows routed to
+/// experts 1 and 2 are bit-exact. Mutation: drop the per-expert padding in `WeightBinder::read`; experts 1 and
+/// 2 read misaligned blocks and go red.
+#[test]
+fn an_unaligned_expert_slab_table_runs_bit_exact() {
+    let Some(device) = open_or_skip(DeviceBackend::Rocm, RocmDevice::new()) else {
+        return;
+    };
+    let target = device.target();
+    let mut engine = Engine::new(device);
+    run_indexed_case(
+        &mut engine,
+        target,
+        WeightFormat::Q8_0,
+        (ROWS, 3, 32),
+        interleaved,
+        StackBuffers::One,
+    );
+}
+
+/// A prefill-sized routed table (ROCm): `PREFILL_ROWS` rows is past the decode row count, so the indexed packed
+/// contraction runs the segmented Tiled schedule (rows routed by `gapped`, so a tile holds several
+/// experts and may skip one) over every format, with `N = 11` leaving edge columns in the last column tile. One-hot rows bit-exact
+/// against the oracle decoder. Mutation: take the Tiled step's slab from the wrong segment (`weight.step(.., lo,
+/// ..)` in `indexed_tiled_body`); rows routed to an expert after a gap read another expert and go red.
+#[test]
+fn packed_indexed_prefill_runs_bit_exact() {
+    let Some(device) = open_or_skip(DeviceBackend::Rocm, RocmDevice::new()) else {
+        return;
+    };
+    let target = device.target();
+    let mut engine = Engine::new(device);
+    for format in expert_formats() {
+        run_indexed_case(
+            &mut engine,
+            target,
+            format,
+            (PREFILL_ROWS, PREFILL_OUT, K),
+            gapped,
+            StackBuffers::One,
+        );
+    }
+}
+
+/// A routed prefill above the wgpu grid limit (ROCm): `4096 x 4160` outputs of a Q8_0 table is 17.0M, past
+/// 65,535 x 256, which the Gemv-body route refused; the Tiled schedule plans it (folded onto `GroupY` where the
+/// device's X extent is smaller than the tile count) and every one of the 17M outputs is bit-exact against the
+/// oracle decoder. Mutation: read the tile index from `GroupX` alone in `indexed_tiled_body`; every tile past
+/// the first fold row is never computed and goes red.
+#[test]
+fn packed_indexed_prefill_above_the_gemv_grid_limit_runs_bit_exact() {
+    let Some(device) = open_or_skip(DeviceBackend::Rocm, RocmDevice::new()) else {
+        return;
+    };
+    let target = device.target();
+    let mut engine = Engine::new(device);
+    run_indexed_case(
+        &mut engine,
+        target,
+        WeightFormat::Q8_0,
+        (GRID_LIMIT_ROWS, GRID_LIMIT_OUT, 64),
+        gapped,
+        StackBuffers::One,
+    );
 }
 
 /// Card 545a: a quantized token-embedding lookup (`packed_embedding`, claimed as one
@@ -564,10 +829,12 @@ fn packed_embedding_row_gather_is_bit_exact() {
 
             let owners = HashMap::from([("model.embed_tokens".to_string(), Arc::clone(&owner))]);
             let store = store_for(&graph, &owners);
+            let mut weights = ConstWeights::new(&store);
+            let named = weights.graph(&graph);
             let exe = engine
-                .load_weights(store, poot_executor::WeightSource::ConstNames)
+                .load_weights(Arc::clone(&store), Arc::new(weights.map()))
                 .unwrap();
-            let entry = engine.add_entry(exe, &staged(target, &graph)).unwrap();
+            let entry = engine.add_entry(exe, &staged(target, &named)).unwrap();
             let token_ids: Vec<f32> = ids.iter().map(|&id| id as f32).collect();
             let values = [(token_key, shape.clone(), DType::F32, f32_bytes(&token_ids))];
             let inputs = slot_inputs(&graph, &values);
@@ -592,6 +859,86 @@ fn packed_embedding_row_gather_is_bit_exact() {
             }
             engine.unload(exe).unwrap();
         }
+    }
+}
+
+/// POOT-1060: the sharded-PLE lookup's table shape - a dense E4M3FN `[rows, width]` checkpoint const
+/// gathered by an exact I32 index and widened in one `DenseRowGather` - through the executor contract,
+/// bit-exact against `poot_quant::scalar::e4m3fn_to_f32`. The table holds all 256 codes (NaN
+/// included) and is read at its first and last row, a repeated row and an interior row, at widths 1, 3,
+/// 4, 6 and 8: a width that is not a multiple of four pads each row to a whole `u32` word
+/// (`words_per_row = ceil(width / 4)`), so a flat `element / 4` lane read goes red on the odd widths.
+/// Mutations (each red, then restored): pad rows to `width / 4` words in `lanes::row_padded_words`;
+/// flip the sign/exponent decode in `packed_e4m3_row_gather.rs`; read `index[s] + 1`.
+#[test]
+fn dense_e4m3_row_gather_is_bit_exact() {
+    let Some(device) = open_or_skip(DeviceBackend::Rocm, RocmDevice::new()) else {
+        return;
+    };
+    let target = device.target();
+    let mut engine = Engine::new(device);
+    for width in [1usize, 3, 4, 6, 8] {
+        let rows = 256 / width + 3;
+        let table: Vec<u8> = (0..rows * width).map(|i| (i % 256) as u8).collect();
+        let ids: Vec<i32> = vec![rows as i32 - 1, 0, rows as i32 / 2, rows as i32 - 1, 1];
+        let b = Builder::new();
+        let table_value = b.constant(
+            "ple.table",
+            TensorType::new(vec![rows, width], DType::E4M3FN),
+        );
+        let idx = b.slot_named(
+            Slot::Activation,
+            "idx",
+            TensorType::new(vec![ids.len()], DType::I32),
+        );
+        let gathered = b.cast(b.gather(table_value, 0, idx), DType::F32);
+        let graph = b.finish(gathered);
+        let idx_key = graph.meta(idx.id).slot_key().unwrap().clone();
+
+        let store = {
+            let mut builder = WeightStore::builder();
+            let dense =
+                DenseWeight::try_new(DType::E4M3FN, vec![rows, width], Arc::from(table.clone()))
+                    .unwrap();
+            builder
+                .insert("ple.table", WeightEntry::Dense(dense))
+                .unwrap();
+            Arc::new(builder.build())
+        };
+        let mut weights = ConstWeights::new(&store);
+        let named = weights.graph(&graph);
+        let exe = engine
+            .load_weights(Arc::clone(&store), Arc::new(weights.map()))
+            .unwrap();
+        let entry = engine.add_entry(exe, &staged(target, &named)).unwrap();
+        let id_bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+        let shape = [ids.len()];
+        let mut inputs = StepInputs::new();
+        inputs.push(
+            idx_key,
+            &shape,
+            poot_executor::HostView::new(DType::I32, ids.len(), &id_bytes).unwrap(),
+        );
+        let bytes = engine
+            .step(exe, entry, &inputs, &mut NoSync)
+            .unwrap()
+            .read()
+            .unwrap();
+        let out = bytemuck_f32(&bytes);
+        assert_eq!(out.len(), ids.len() * width, "width {width}");
+        for (r, &id) in ids.iter().enumerate() {
+            for c in 0..width {
+                let byte = table[id as usize * width + c];
+                let want = poot_quant::scalar::e4m3fn_to_f32(byte);
+                let got = out[r * width + c];
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "width {width} row {r} (id {id}) col {c} byte {byte:#04x}: device {got} vs oracle {want}"
+                );
+            }
+        }
+        engine.unload(exe).unwrap();
     }
 }
 
@@ -626,7 +973,7 @@ fn fill(seed: u64, count: usize) -> Vec<f32> {
         .collect()
 }
 
-/// `graph` stepped once on `engine` (under the routed-expert hang guard when `guarded`), the packed weight bound as `owner`, the activation slot
+/// `graph` stepped once on `engine`, the packed weight bound as `owner`, the activation slot
 /// `x_key` bound to `activation` (`[rows, K]`) and every named dense `[OUT]`-or-`[1, OUT]` const in `consts`
 /// bound by name; the output read back.
 #[allow(clippy::too_many_arguments)]
@@ -638,7 +985,6 @@ fn run_dense_activation(
     x_key: &SlotKey,
     activation: (&[usize], &[f32]),
     consts: &[(&str, &[usize], &[f32])],
-    guarded: bool,
 ) -> Vec<f32> {
     let mut builder = WeightStore::builder();
     let mut seen = std::collections::HashSet::new();
@@ -668,15 +1014,13 @@ fn run_dense_activation(
             .insert(name.to_string(), WeightEntry::Dense(dense))
             .unwrap();
     }
+    let store = Arc::new(builder.build());
+    let mut weights = ConstWeights::new(&store);
+    let named = weights.graph(graph);
     let exe = engine
-        .load_weights(
-            Arc::new(builder.build()),
-            poot_executor::WeightSource::ConstNames,
-        )
+        .load_weights(Arc::clone(&store), Arc::new(weights.map()))
         .unwrap();
-    let entry = engine
-        .add_entry(exe, &staged_under(target, graph, guarded))
-        .unwrap();
+    let entry = engine.add_entry(exe, &staged(target, &named)).unwrap();
     let activation_bytes = f32_bytes(activation.1);
     let values = [(
         x_key.clone(),
@@ -730,7 +1074,6 @@ fn packed_loaders_match_the_oracle_on_every_output_on_rocm() {
                 &x_key,
                 (&[m, K], &activation),
                 &[],
-                false,
             );
             let mut oracle_inputs: HashMap<poot_graph_ir::ValueId, poot_eval::Value> =
                 HashMap::new();
@@ -778,7 +1121,7 @@ fn packed_loaders_match_the_oracle_on_every_output_on_rocm() {
 /// head then drifts by an ulp or two. Mutation: place the SPIR-V `NoContraction` decoration by instruction
 /// ordinal, as card 628 first did; the Q4_K row goes red on wgpu while the other formats stay green.
 #[test]
-fn a_packed_gemv_head_is_shared_with_the_unfused_program_on_rocm() {
+fn a_packed_gemv_head_is_shared_with_the_standalone_gemv_on_rocm() {
     use poot_executor_parity::weight_map::assert_close;
     use poot_graph_ir::op::{BinOp, ContractionHead};
     let Some(device) = open_or_skip(DeviceBackend::Rocm, RocmDevice::new()) else {
@@ -820,7 +1163,6 @@ fn a_packed_gemv_head_is_shared_with_the_unfused_program_on_rocm() {
             &head_key,
             (&[1, K], &activation),
             &[],
-            false,
         );
 
         let (graph, x_key) = build(true);
@@ -846,43 +1188,43 @@ fn a_packed_gemv_head_is_shared_with_the_unfused_program_on_rocm() {
                 head.iter().map(|v| -v).collect::<Vec<f32>>(),
             ),
         ] {
-            let mut run = |guarded| {
-                run_dense_activation(
-                    &mut engine,
-                    target,
-                    &graph,
-                    &owner,
-                    &x_key,
-                    (&[1, K], &activation),
-                    &[("bias", &[OUT], &bias_values)],
-                    guarded,
-                )
-            };
-            let fused = run(false);
-            let unfused = run(true);
+            let fused = run_dense_activation(
+                &mut engine,
+                target,
+                &graph,
+                &owner,
+                &x_key,
+                (&[1, K], &activation),
+                &[("bias", &[OUT], &bias_values)],
+            );
+            let want: Vec<f32> = head
+                .iter()
+                .zip(&bias_values)
+                .map(|(head, bias)| head + bias)
+                .collect();
             assert_close(
                 &fused,
-                &unfused,
+                &want,
                 0.0,
-                &format!("{what} {label}: fused vs unfused head"),
+                &format!("{what} {label}: fused head vs the standalone head plus the bias"),
             );
         }
     }
 }
 
 /// SC-003: a packed head with a pointwise epilogue. `tanh(head + bias) * 0.5 + residual` over the `m == 1` Gemv
-/// forms one `ContractionEpilogue { head: Packed }`, and the fused device program agrees with the unfused one
-/// (same Gemv schedule, the head summed on the device in both). The head itself is bit-identical in both (the
-/// `head_is_shared` row); the epilogue's `bias` add and `0.5` multiply may contract to an FMA in one body and
-/// not the other (`contraction/epilogue.rs` deliberately does not forbid it), so this comparison is 1e-5, and
-/// is sharpened by a cancellation fixture: `bias` is the negated device head, so every pre-activation is within a few ulps of zero
+/// forms one `ContractionEpilogue { head: Packed }`, and the fused device program agrees with the chain over
+/// the standalone head (the head summed on the device). The head itself is the standalone Gemv's (the
+/// `head_is_shared` row); the epilogue's `bias` add and `0.5` multiply may contract to an FMA
+/// (`contraction/epilogue.rs` deliberately does not forbid it), so this comparison is 1e-5, and is sharpened by a
+/// cancellation fixture: `bias` is the negated device head, so every pre-activation is within a few ulps of zero
 /// when the epilogue sees each column's completed sum, and the fused result is `residual` to a few ulps of the
 /// head. An epilogue applied to a lane's partial accumulator (before the LDS reduction) adds the bias once per
 /// lane and saturates the activation, moving the result by about half the lane count. Mutation: apply the
 /// epilogue to the per-lane partial before the LDS reduction in `gemv_body`; the cancellation row and the
-/// fused-versus-unfused row go red.
+/// chain row go red.
 #[test]
-fn a_packed_gemv_epilogue_agrees_with_the_unfused_program_on_rocm() {
+fn a_packed_gemv_epilogue_agrees_with_the_standalone_head_chain_on_rocm() {
     use poot_executor_parity::weight_map::assert_close;
     use poot_graph_ir::op::{BinOp, ContractionHead, UnOp};
     use poot_graph_ir::types::Scalar;
@@ -932,7 +1274,6 @@ fn a_packed_gemv_epilogue_agrees_with_the_unfused_program_on_rocm() {
             &head_key,
             (&[1, K], &activation),
             &[],
-            false,
         );
         let head_scale = head.iter().fold(0.0f32, |m, v| m.max(v.abs()));
 
@@ -960,28 +1301,31 @@ fn a_packed_gemv_epilogue_agrees_with_the_unfused_program_on_rocm() {
                 head.iter().map(|v| -v).collect::<Vec<f32>>(),
             ),
         ] {
-            let run = |engine: &mut Engine<RocmDevice>, guarded| {
-                run_dense_activation(
-                    engine,
-                    target,
-                    &graph,
-                    &owner,
-                    &x_key,
-                    (&[1, K], &activation),
-                    &[
-                        ("bias", &[OUT], &bias_values),
-                        ("residual", &[1, OUT], &residual_values),
-                    ],
-                    guarded,
-                )
-            };
-            let fused = run(&mut engine, false);
-            let unfused = run(&mut engine, true);
+            let fused = run_dense_activation(
+                &mut engine,
+                target,
+                &graph,
+                &owner,
+                &x_key,
+                (&[1, K], &activation),
+                &[
+                    ("bias", &[OUT], &bias_values),
+                    ("residual", &[1, OUT], &residual_values),
+                ],
+            );
+            // The chain over the standalone head: the epilogue's `bias` add and `0.5` multiply may contract
+            // to an FMA (`contraction/epilogue.rs` deliberately does not forbid it), hence 1e-5.
+            let want: Vec<f32> = head
+                .iter()
+                .zip(&bias_values)
+                .zip(&residual_values)
+                .map(|((head, bias), residual)| (head + bias).tanh() * 0.5 + residual)
+                .collect();
             assert_close(
                 &fused,
-                &unfused,
+                &want,
                 1e-5,
-                &format!("{what} {label}: fused vs unfused"),
+                &format!("{what} {label}: fused vs the chain over the standalone head"),
             );
             if label == "cancelling bias" {
                 // With the head cancelled, the result is the residual to a few ulps of the head's size.

@@ -24,6 +24,7 @@ use poot_runtime_common::DeviceBackend;
 use poot_target::BufferStorage;
 use poot_tensor::DType;
 use poot_test_util::assert_close_rel;
+use poot_test_util::const_weights::ConstWeights;
 use poot_test_util::device_skip::open_or_skip;
 
 type Graph = poot_graph_ir::Graph<ValidationOutputs>;
@@ -48,9 +49,7 @@ fn fixture() -> (Graph, Vec<f32>, Vec<f32>, f32) {
     let v2 = builder.binary(poot_graph_ir::op::BinOp::Add, tc, tc);
     let s2 = builder.reduce(RedOp::Max, v2, 0, true);
     let out = builder.binary(poot_graph_ir::op::BinOp::Add, s1, s2);
-    // The routed-expert hang guard (compile's `staged` below) needs a routed-expert site in the graph.
-    let g = poot_test_util::graph_fixtures::with_routed_expert_site(builder.finish(out));
-    (g.with_validations(Vec::new()), a, b, c)
+    (builder.finish(out).with_validations(Vec::new()), a, b, c)
 }
 
 fn store(a: &[f32], b: &[f32], c: f32) -> Arc<WeightStore> {
@@ -80,18 +79,10 @@ fn bytemuck_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-const UNFUSED_REPLAY: CompileOptions = CompileOptions {
-    execution: Submission::Replay,
-    limits: poot_graph_plan::CompileLimits::STANDARD,
-};
+const REPLAY: CompileOptions =
+    CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
 
-/// Compiled under the routed-expert hang guard: the fixture's graph carries a routed-expert site and
-/// the target is given the hang.
 fn staged(g: &Graph, target: Target) -> StagedProgram<ValidationOutputs> {
-    let target = Target {
-        caps: poot_test_util::graph_fixtures::with_routed_expert_hang(target.caps),
-        ..target
-    };
     compile_staged(
         g,
         &TargetSet::single(DeviceId(0), target),
@@ -99,9 +90,9 @@ fn staged(g: &Graph, target: Target) -> StagedProgram<ValidationOutputs> {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &UNFUSED_REPLAY,
+        &REPLAY,
     )
-    .expect("the fixture compiles unfused")
+    .expect("the fixture compiles")
 }
 
 fn oracle(a: &[f32], b: &[f32], c: f32) -> f32 {
@@ -109,7 +100,7 @@ fn oracle(a: &[f32], b: &[f32], c: f32) -> f32 {
     s1 + (c + c)
 }
 
-/// SC-002 (PTX half): a short value (`v2`, [1]) reusing a larger freed arena slot ([K], `v1`'s)
+/// SC-002 (PTX half): a short value (`s2`, [1]) reusing a larger freed arena slot ([K], `v1`'s)
 /// still matches the CPU oracle through a real PTX dispatch.
 #[test]
 fn a_short_value_reusing_a_larger_slot_matches_the_oracle_on_ptx() {
@@ -119,10 +110,12 @@ fn a_short_value_reusing_a_larger_slot_matches_the_oracle_on_ptx() {
     let target = device.target();
     let (g, a, b, c) = fixture();
     let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
-    let exe = exec
-        .load_weights(store(&a, &b, c), poot_executor::WeightSource::ConstNames)
-        .unwrap();
-    let entry = exec.add_entry(exe, &staged(&g, target)).unwrap();
+    let store = store(&a, &b, c);
+    let mut weights = ConstWeights::new(&store);
+    let named = weights.graph(&g);
+    let map = Arc::new(weights.map());
+    let exe = exec.load_weights(store, map).unwrap();
+    let entry = exec.add_entry(exe, &staged(&named, target)).unwrap();
     let mut out = exec
         .step(exe, entry, &StepInputs::new(), &mut NoSync)
         .unwrap();
