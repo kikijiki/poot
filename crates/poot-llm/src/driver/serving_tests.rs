@@ -496,7 +496,7 @@ fn a_state_value_without_a_leading_row_axis_fails_prepare() {
         });
         let heads = [Head::GREEDY];
         rig.driver
-            .prepare(&shapes(pool(4, 1), &[nz(rows)], &heads, &[]))
+            .prepare(&shapes(pool(4, rows), &[nz(rows)], &heads, &[]))
             .map(|_| ())
     };
     for rows in [1, 2] {
@@ -612,6 +612,145 @@ fn release_skips_recurrent_state_and_registers_dense_prefixes() {
         finish_prompt(&mut hybrid, &prompt).0,
         0,
         "a recurrent family reuses nothing"
+    );
+}
+
+/// POOT-1074 SC-001: admitting a sequence into a recurrent model zeroes that sequence's state row,
+/// through `reset_state(Row(slot))`, and writes nothing else into the state. The fake's `toy.state` is
+/// `[1, 4]` f32 per slot: sixteen bytes at the slot's offset.
+/// Mutation: drop the reset in `Driver::open` (the `private || residency == Recurrent` branch); the
+/// admission writes no state and the row goes red.
+#[test]
+fn opening_a_recurrent_sequence_zeroes_its_state_row() {
+    let mut rig = paged_rig(RigOptions {
+        variant: Variant::Recurrent,
+        ..RigOptions::default()
+    });
+    rig.driver
+        .prepare(&shapes(pool(4, 1), &[nz(1)], &[Head::GREEDY], &[]))
+        .unwrap();
+    let before = rig.world.borrow().state_writes.len();
+    open_one(&mut rig, &[1], AdapterRef::Base);
+    let writes = rig.world.borrow().state_writes[before..].to_vec();
+    assert_eq!(writes, [(0, 16)]);
+}
+
+/// Every input the last step bound, read as the f32 mirror an index slot is stored as on the fake's
+/// target (an exact integer), rounded back to the integers the driver wrote.
+fn last_step_inputs(rig: &Rig) -> Vec<Vec<i32>> {
+    rig.world
+        .borrow()
+        .last
+        .inputs
+        .iter()
+        .map(|bytes| {
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|word| f32::from_le_bytes(*word) as i32)
+                .collect()
+        })
+        .collect()
+}
+
+/// POOT-1074 SC-002: a recurrent model serves several sequences in one step. A sequence keeps the pool
+/// row of its slot whichever step row it occupies: `state_read` names each row's slot and
+/// `state_write` the step row whose result each slot takes (-1: none, so a masked row writes nothing).
+/// Releasing a sequence and admitting another reuses its slot and zeroes exactly that row.
+/// Mutation: bind `state_read[i] = i` (the row index, not the sequence's slot); the swapped step reads
+/// slots `[0, 1]` instead of `[2, 0]`.
+#[test]
+fn recurrent_rows_address_their_slots_and_a_readmitted_slot_zeroes_only_its_row() {
+    let mut rig = paged_rig(RigOptions {
+        variant: Variant::Recurrent,
+        ..RigOptions::default()
+    });
+    let rows = [nz(1), nz(3)];
+    rig.driver
+        .prepare(&shapes(pool(8, 4), &rows, &[Head::GREEDY], &[]))
+        .unwrap();
+    let before = rig.world.borrow().state_writes.len();
+    let a = open_one(&mut rig, &[1], AdapterRef::Base);
+    let b = open_one(&mut rig, &[2], AdapterRef::Base);
+    let c = open_one(&mut rig, &[3], AdapterRef::Base);
+    // Row bytes: the fake's `toy.state` row is four f32.
+    let resets = rig.world.borrow().state_writes[before..].to_vec();
+    assert_eq!(
+        resets,
+        [(0, 16), (16, 16), (32, 16)],
+        "one row per admission"
+    );
+
+    // Rows in the order C, A: C is slot 2 and A slot 0, in step rows 0 and 1. The third row is masked.
+    step_rows(
+        &mut rig,
+        &mut [(c, PREFILL1, plain()), (a, PREFILL1, plain())],
+    )
+    .unwrap();
+    let inputs = last_step_inputs(&rig);
+    assert!(
+        inputs.contains(&vec![2, 0, 0]),
+        "state_read names slots [2, 0] and the masked row reads 0: {inputs:?}"
+    );
+    assert!(
+        inputs.contains(&vec![1, -1, 0, -1]),
+        "state_write: slot 0 takes row 1, slot 2 takes row 0, the rest keep: {inputs:?}"
+    );
+
+    // B's slot is freed and re-used: only row 1 is zeroed.
+    rig.driver.release(b, Release::Finished).unwrap();
+    let before = rig.world.borrow().state_writes.len();
+    open_one(&mut rig, &[4], AdapterRef::Base);
+    let resets = rig.world.borrow().state_writes[before..].to_vec();
+    assert_eq!(
+        resets,
+        [(16, 16)],
+        "the re-admitted sequence zeroes its own slot's row"
+    );
+}
+
+/// POOT-1074 SC-002: rows feeding different token counts cannot share a recurrent step (the shorter
+/// row's padding would fold into its state), so the driver runs one entry per feed width and returns
+/// the picks in row order. A dense model runs the same rows as one entry.
+/// Mutation: group by nothing (`same_width` always true); the recurrent model runs one entry and the
+/// row goes red.
+#[test]
+fn recurrent_rows_of_different_widths_run_as_one_entry_per_width() {
+    let step_count = |variant| {
+        let mut rig = paged_rig(RigOptions {
+            variant,
+            granule: 1,
+            chunk: 4,
+            ..RigOptions::default()
+        });
+        rig.driver
+            .prepare(&ServingShapes {
+                warm: Warm::Prompts(&[4]),
+                ..shapes(pool(8, 2), &[nz(1), nz(2)], &[Head::GREEDY], &[])
+            })
+            .unwrap();
+        let long = open_one(&mut rig, &[1, 2, 3, 4], AdapterRef::Base);
+        let short = open_one(&mut rig, &[4], AdapterRef::Base);
+        // `short` prefills its one token, then decodes beside `long`'s three-token piece.
+        step_rows(&mut rig, &mut [(short, PREFILL1, plain())]).unwrap();
+        let before = rig.world.borrow().steps.len();
+        let picked = step_rows(
+            &mut rig,
+            &mut [
+                (long, RowWork::Prefill { upto: 4 }, plain()),
+                (short, DECODE, plain()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(picked, [vec![1], vec![1]], "picks come back in row order");
+        rig.world.borrow().steps.len() - before
+    };
+    assert_eq!(step_count(Variant::Recurrent), 2, "one entry per width");
+    assert_eq!(
+        step_count(Variant::Plain),
+        1,
+        "a dense model pads to one entry"
     );
 }
 
@@ -836,10 +975,10 @@ fn a_window_narrower_than_two_is_a_typed_refusal() {
     assert!(rig.driver.caps().is_none());
 }
 
-/// A refused `prepare` leaves the driver as it was: a recurrent model asked for two sequences is
-/// refused, and `open` still reports nothing prepared instead of admitting up to `max_seqs`; a valid
-/// call afterwards succeeds. Mutation: publish the pool before the residency check; `open` is then
-/// accepted after the refusal.
+/// A refused `prepare` leaves the driver as it was: a recurrent model asked for a verify window is
+/// refused (a rejected draft has already advanced its state), and `open` still reports nothing prepared
+/// instead of admitting up to `max_seqs`; a valid call afterwards succeeds. Mutation: publish the pool
+/// before the residency check; `open` is then accepted after the refusal.
 #[test]
 fn a_refused_prepare_publishes_nothing() {
     let mut rig = paged_rig(RigOptions {
@@ -848,12 +987,15 @@ fn a_refused_prepare_publishes_nothing() {
     });
     let err = rig
         .driver
-        .prepare(&shapes(pool(4, 2), &[nz(1)], &[Head::GREEDY], &[]))
+        .prepare(&ServingShapes {
+            windows: &[nz(2)],
+            ..shapes(pool(4, 2), &[nz(1)], &[Head::GREEDY], &[])
+        })
         .unwrap_err();
     assert!(
         matches!(
             err,
-            DriverError::InvalidOptions(InvalidOptions::RecurrentServesOneSequence)
+            DriverError::InvalidOptions(InvalidOptions::RecurrentHasNoVerifyWindows)
         ),
         "{err:?}"
     );
@@ -873,8 +1015,9 @@ fn a_refused_prepare_publishes_nothing() {
         ),
         "{err:?}"
     );
+    // The refused call compiled its entries, and state avals pin the pool's size: the retry asks for it.
     rig.driver
-        .prepare(&shapes(pool(4, 1), &[nz(1)], &[Head::GREEDY], &[]))
+        .prepare(&shapes(pool(4, 2), &[nz(1)], &[Head::GREEDY], &[]))
         .unwrap();
     open_one(&mut rig, &[1], AdapterRef::Base);
 }
@@ -1129,4 +1272,217 @@ fn generate_is_the_serving_surface_driven_for_one_row() {
     assert_eq!(out.tokens, tokens);
     assert_eq!(shapes(&generated), shapes(&manual));
     assert_eq!(generated.driver.stats().steps, manual.driver.stats().steps);
+}
+
+/// POOT-1076: only the base weights have `PrefillEmbeds` entries, so a prompt with embedding rows
+/// under an adapter is refused at `open_with_embeds`, before it holds a slot or blocks. Mutation: drop
+/// the adapter check in `open_with_embeds`; the open succeeds and the row goes red.
+#[test]
+fn embedding_rows_under_an_adapter_are_refused_before_admission() {
+    let mut rig = lora_rig(RigOptions::default());
+    let g = rig
+        .driver
+        .capture_adapter_set(set(1), &adapters(1))
+        .unwrap();
+    rig.driver
+        .prepare(&shapes(pool(4, 2), &[nz(1)], &[Head::GREEDY], &[g]))
+        .unwrap();
+    let free = rig.driver.free_blocks();
+    let adapter = AdapterRef::Adapter {
+        generation: g,
+        index: lora_idx(1),
+    };
+    let embeds = crate::driver::PromptEmbeds::new(4, vec![1], vec![0.0; 4]).unwrap();
+    let refusal = rig
+        .driver
+        .open_with_embeds(
+            SeqRequest {
+                prompt: &[1, 2, 3],
+                max_new: 2,
+                adapter,
+            },
+            embeds,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            refusal,
+            DriverError::InvalidRequest(InvalidRequest::Embeds(
+                crate::driver::error::EmbedsError::Adapter
+            ))
+        ),
+        "{refusal:?}"
+    );
+    assert_eq!(rig.driver.free_blocks(), free, "the refusal held no blocks");
+}
+
+/// POOT-1076: a draft model prefills over the prompt's tokens and cannot take embedding rows, so its
+/// proposals for such a prompt would come from placeholders: `open_with_embeds` refuses it under a
+/// draft-model policy, before the sequence holds a slot or blocks; the same prompt opens as plain
+/// tokens. Mutation: drop the policy check in `open_with_embeds`; the open succeeds and the row goes red.
+#[test]
+fn embedding_rows_under_a_draft_model_are_refused_before_admission() {
+    let mut rig = paged_rig(RigOptions {
+        draft_model_k: Some(nz(2)),
+        ..RigOptions::default()
+    });
+    rig.driver
+        .prepare(&shapes(pool(4, 2), &[nz(1)], &[Head::GREEDY], &[]))
+        .unwrap();
+    let free = rig.driver.free_blocks();
+    let embeds = crate::driver::PromptEmbeds::new(4, vec![1], vec![0.0; 4]).unwrap();
+    let request = || SeqRequest {
+        prompt: &[1, 2, 3],
+        max_new: 2,
+        adapter: AdapterRef::Base,
+    };
+    let refusal = rig.driver.open_with_embeds(request(), embeds).unwrap_err();
+    assert!(
+        matches!(
+            refusal,
+            DriverError::InvalidRequest(InvalidRequest::Embeds(
+                crate::driver::error::EmbedsError::DraftModel
+            ))
+        ),
+        "{refusal:?}"
+    );
+    assert_eq!(rig.driver.free_blocks(), free, "the refusal held no blocks");
+    assert!(matches!(
+        rig.driver.open(request()).unwrap(),
+        Admission::Opened { .. }
+    ));
+}
+
+fn text_positions(tokens: usize) -> poot_models::mrope::MropePositionIds {
+    poot_models::mrope::build_mrope_position_ids(
+        &[poot_models::mrope::MropeSegment::Text(tokens)],
+        2,
+    )
+    .unwrap()
+}
+
+/// POOT-650: sectioned positions that do not cover the prompt are refused at `open_with_mrope`, before the
+/// sequence holds a slot or blocks (`MropeError::Length`). Mutation: drop the length check in
+/// `open_with_mrope`; the open reaches the next check and the row goes red.
+#[test]
+fn mrope_positions_that_do_not_cover_the_prompt_are_refused_before_admission() {
+    let mut rig = paged_rig(RigOptions::default());
+    rig.driver
+        .prepare(&shapes(pool(4, 2), &[nz(1)], &[Head::GREEDY], &[]))
+        .unwrap();
+    let free = rig.driver.free_blocks();
+    let embeds = crate::driver::PromptEmbeds::new(4, vec![1], vec![0.0; 4]).unwrap();
+    let refusal = rig
+        .driver
+        .open_with_mrope(
+            SeqRequest {
+                prompt: &[1, 2, 3],
+                max_new: 2,
+                adapter: AdapterRef::Base,
+            },
+            embeds,
+            text_positions(2),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            refusal,
+            DriverError::InvalidRequest(InvalidRequest::Mrope(
+                crate::driver::error::MropeError::Length {
+                    positions: 2,
+                    prompt: 3
+                }
+            ))
+        ),
+        "{refusal:?}"
+    );
+    assert_eq!(rig.driver.free_blocks(), free, "the refusal held no blocks");
+}
+
+/// POOT-650: positions for a model with no `Slot::MropePosition` are refused at `open_with_mrope`
+/// (`MropeError::NotSectioned`), before the sequence holds a slot or blocks; the same prompt then opens as
+/// plain tokens. Mutation: drop the sectioned-entry check in `open_embedded`; the open succeeds and the
+/// row goes red.
+#[test]
+fn mrope_positions_on_a_model_without_sectioned_rope_are_refused_before_admission() {
+    let mut rig = paged_rig(RigOptions::default());
+    rig.driver
+        .prepare(&shapes(pool(4, 2), &[nz(1)], &[Head::GREEDY], &[]))
+        .unwrap();
+    let free = rig.driver.free_blocks();
+    let embeds = crate::driver::PromptEmbeds::new(4, vec![1], vec![0.0; 4]).unwrap();
+    let request = || SeqRequest {
+        prompt: &[1, 2, 3],
+        max_new: 2,
+        adapter: AdapterRef::Base,
+    };
+    let refusal = rig
+        .driver
+        .open_with_mrope(request(), embeds, text_positions(3))
+        .unwrap_err();
+    assert!(
+        matches!(
+            refusal,
+            DriverError::InvalidRequest(InvalidRequest::Mrope(
+                crate::driver::error::MropeError::NotSectioned
+            ))
+        ),
+        "{refusal:?}"
+    );
+    assert_eq!(rig.driver.free_blocks(), free, "the refusal held no blocks");
+    assert!(matches!(
+        rig.driver.open(request()).unwrap(),
+        Admission::Opened { .. }
+    ));
+}
+
+fn encode_tokens(driver: &mut Driver) -> Result<crate::driver::Encoded, DriverError> {
+    let ids = [1u32, 2];
+    driver.encode(&crate::driver::EncodeRequest {
+        rows: &[crate::driver::EncodeRow::Tokens {
+            ids: &ids,
+            types: &[],
+        }],
+    })
+}
+
+/// POOT-1084 SC-001: a device error from one `Encode` step is that step's failure, not the driver's.
+/// The step's executable is reset (the graph's cache is scratch), the error is `EncodeStep` in class
+/// `Step`, and the next encode on the same driver runs. Mutation: return the raw `Device` error from
+/// `encode` (skip `recover_encode`): the class is `Fault` and the row goes red.
+#[test]
+fn a_device_error_in_one_encode_step_fails_that_step_and_the_driver_encodes_again() {
+    let mut rig = rig_default(picks_one());
+    encode_tokens(&mut rig.driver).expect("the first encode runs");
+
+    rig.world.borrow_mut().fail_synchronize = true;
+    let error = encode_tokens(&mut rig.driver).expect_err("the device fails the step");
+    assert!(matches!(error, DriverError::EncodeStep(_)), "{error:?}");
+    assert_eq!(error.class(), crate::driver::error::FailureClass::Step);
+
+    rig.world.borrow_mut().fail_synchronize = false;
+    encode_tokens(&mut rig.driver).expect("the executable was reset, so the next encode runs");
+}
+
+/// POOT-1084 SC-002: a device that cannot even abort the failed step is lost (the engine poisons), and
+/// that stays a `Fault`: the driver cannot prove its state intact. Mutation: classify every device
+/// error as `EncodeStep` (drop the reset in `recover_encode`): the poisoned device reads `Step`.
+#[test]
+fn a_device_lost_during_an_encode_step_stays_a_fault() {
+    let mut rig = rig_default(picks_one());
+    encode_tokens(&mut rig.driver).expect("the first encode runs");
+
+    {
+        let mut world = rig.world.borrow_mut();
+        world.fail_synchronize = true;
+        world.fail_abort = true;
+    }
+    for _ in 0..2 {
+        let error = encode_tokens(&mut rig.driver).expect_err("the device is lost");
+        assert!(
+            matches!(&error, DriverError::Device(ExecError::Poisoned)),
+            "the reset finds the poisoned device and the step reports that: {error:?}"
+        );
+        assert_eq!(error.class(), crate::driver::error::FailureClass::Fault);
+    }
 }

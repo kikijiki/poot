@@ -7,8 +7,10 @@ sidebar_position: 9
 # Continuous batching and concurrency
 
 `poot-serve` runs every generation request through one scheduling loop on its engine thread. The loop
-drives the driver's `step` on whichever backend the engine plan chose (`wgpu` or `rocm`) and for every
-family the driver serves; there is no second loop per backend.
+drives the driver's `step` on whichever backend the engine plan chose (`wgpu`, `rocm`, `ptx` or `vulkan`) and for
+every family the driver serves; there is no second loop per backend, and speculative decoding
+([Speculative decoding](./speculative-decoding.md)) is a draft policy of the driver, not a branch of
+the loop.
 
 Each iteration of the loop:
 
@@ -19,7 +21,7 @@ Each iteration of the loop:
    and nothing is preempted; a request that finds no room waits for a running one to finish);
 4. steps the rows that have work: decoding rows, and prefill rows within a per-step token budget so a
    burst of long prompts cannot stall the ones that are decoding;
-5. commits the tokens each row picked, keeping tokens only up to an end-of-sequence token, a stop
+5. commits the tokens each row picked (one, or a verified round's accepted drafts and one more), keeping tokens only up to an end-of-sequence token, a stop
    string, or `max_tokens`, and streams each kept token.
 
 Batch composition changes between steps (a request is admitted, another retires) without compiling

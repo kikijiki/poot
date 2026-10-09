@@ -7,8 +7,9 @@
 //! step: one body for every phase, and no zero pad after the first chunk. The kernel is stored as
 //! PyTorch stores a depthwise `nn.Conv1d`, `[C, 1, K]`, or as a GGUF stores it, `[C, K]`.
 
-use poot_graph_ir::{BinOp, Builder, StateRole, TensorType, Traced, ops};
+use poot_graph_ir::{BinOp, Builder, Traced, ops};
 use poot_quant::weights::{WeightId, WeightMap};
+use poot_tensor::DType;
 
 use super::linear::{Weight, WeightError};
 use super::standard::{ParamError, Step};
@@ -94,19 +95,15 @@ pub fn causal_conv(
     w: &ConvWeights,
     p: &ConvParams,
 ) -> Traced {
-    let rows = step.shape().rows.get();
-    let window = b.state_input(
-        state_name,
-        TensorType::f32(vec![rows, p.window(), p.channels]),
-        StateRole::Recurrent,
-    );
+    let window = step.recurrent_state(b, state_name, DType::F32, &[p.window(), p.channels]);
     // `[C, 1, K]` -> the op's `[K, C]` taps.
     let taps = b.transpose(
         b.reshape(w.kernel.declare_f32(b), vec![p.channels, p.kernel]),
         vec![1, 0],
     );
-    let (out, next) = ops::causal_conv1d_windowed(b, x, taps, window, p.kernel, p.dilation);
-    step.carry(window, next);
+    let (out, next) =
+        ops::causal_conv1d_windowed(b, x, taps, window.current(), p.kernel, p.dilation);
+    step.carry_recurrent(b, window, next);
     match &w.bias {
         Some(bias) => {
             let shape = b.aval(out).shape;
@@ -125,6 +122,7 @@ mod tests {
     use crate::components::standard::oracle::{self, Fx};
     use crate::components::testing::{CAP, step_shape};
     use crate::model::LogitRows;
+    use poot_graph_ir::TensorType;
 
     const C: usize = 3;
     const K: usize = 3;

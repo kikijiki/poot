@@ -68,6 +68,89 @@ impl<'a> Stops<'a> {
     }
 }
 
+/// The stop strings of one request, matched against the generated text as it grows, and the text held
+/// back until it can no longer be the start of one. Only text that cannot be part of a stop string is
+/// released, so a stop marker split across tokens never leaks to the client, and the text ends before
+/// the marker. What is kept is bounded by the longest stop string.
+#[derive(Debug)]
+pub struct StopScanner {
+    strings: Vec<String>,
+    /// Text seen but not yet released: a possible stop prefix, or what follows a hit stop.
+    pending: String,
+    hit: bool,
+}
+
+impl StopScanner {
+    pub fn new(strings: Vec<String>) -> Self {
+        Self {
+            strings: strings.into_iter().filter(|s| !s.is_empty()).collect(),
+            pending: String::new(),
+            hit: false,
+        }
+    }
+
+    /// Whether the request has any stop string to scan for.
+    pub fn active(&self) -> bool {
+        !self.strings.is_empty()
+    }
+
+    /// Whether a full stop string has been seen.
+    pub fn hit(&self) -> bool {
+        self.hit
+    }
+
+    /// Record `piece`, the text the latest token added; the text now safe to release. After a hit, no
+    /// text is ever released again.
+    pub fn push(&mut self, piece: &str) -> String {
+        if self.hit {
+            return String::new();
+        }
+        self.pending.push_str(piece);
+        if let Some(at) = self
+            .strings
+            .iter()
+            .filter_map(|s| self.pending.find(s.as_str()))
+            .min()
+        {
+            self.hit = true;
+            let released = self.pending[..at].to_string();
+            self.pending.clear();
+            return released;
+        }
+        let cut = self.pending.len() - self.held_suffix();
+        let released = self.pending[..cut].to_string();
+        self.pending.drain(..cut);
+        released
+    }
+
+    /// The text still held at the end of generation: no stop string completed on it.
+    pub fn finish(&mut self) -> String {
+        std::mem::take(&mut self.pending)
+    }
+
+    /// Bytes of the longest suffix of `pending` that is a strict prefix of some stop string, on a char
+    /// boundary.
+    fn held_suffix(&self) -> usize {
+        let longest = self.strings.iter().map(String::len).max().unwrap_or(0);
+        let len = self.pending.len();
+        for k in (1..=longest.min(len)).rev() {
+            let start = len - k;
+            if !self.pending.is_char_boundary(start) {
+                continue;
+            }
+            let suffix = &self.pending[start..];
+            if self
+                .strings
+                .iter()
+                .any(|s| s.len() > suffix.len() && s.starts_with(suffix))
+            {
+                return k;
+            }
+        }
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

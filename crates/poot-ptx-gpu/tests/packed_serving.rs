@@ -2,7 +2,7 @@
 //! the M4 pod: this box has no NVIDIA GPU).
 //!
 //! A `packed_linear` graph (compiled, so `compile` claims it as a `PackedContraction`, or as the packed head of a `ContractionEpilogue`) runs through
-//! the executor contract - a one-shot entry for `run_resident`/`run_prefill`-shaped cases, a
+//! the executor contract - a one-shot entry for the cases the deleted `run_resident`/`run_prefill` served, a
 //! [`common::DecodeEntry`] stepped per token for the capture/replay-shaped cases - with the weight
 //! bound as `Value::Packed` carriers - never a dense f32 copy.
 //!
@@ -302,7 +302,7 @@ fn packed_decode_through_capture_and_replay_is_bit_exact_on_ptx() {
     }
 }
 
-/// W9 prefill: an identity activation decodes the whole weight through `run_prefill`, bit-exact per
+/// W9 prefill: an identity activation decodes the whole weight through a prefill entry, bit-exact per
 /// element, output and carried state.
 #[test]
 fn packed_prefill_through_serving_path_is_bit_exact_on_ptx() {

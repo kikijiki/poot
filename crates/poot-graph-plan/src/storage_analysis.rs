@@ -50,7 +50,8 @@ impl ValueComponents {
 
 /// Reusable whole-graph representation selection for exact I32 components.
 ///
-/// Binary, Reshape, Transpose, Slice, Broadcast, and Concat connect I32 values in both directions. A
+/// Binary, Reshape, Transpose, Slice, Broadcast, and Concat connect I32 values in both directions, and so do a
+/// ScatterUpdate (its base, source and result) and a carried state edge (the state input and its next value). A
 /// Binary-containing component is exact when it reaches the graph/state output or contains GeU, whose unsigned
 /// bit-pattern meaning has no legacy float interpretation. Construction is linear in graph values, equations,
 /// and operands. Borrowing the graph prevents mutation, while every public analyzed query also checks graph
@@ -99,6 +100,19 @@ impl<'g, V: ValidationChannel> ExactI32StorageAnalysis<'g, V> {
                 pinned.push(eqn.out);
                 continue;
             }
+            // A ScatterUpdate over I32 rows moves the base's and the source's words, the same way a
+            // Gather does: base, source and result share one lane. Its `inv` operand is an index, a
+            // value of its own.
+            if matches!(eqn.op, OpKind::ScatterUpdate) && is_i32(eqn.out) {
+                for input in eqn.inputs.iter().take(2) {
+                    if let Operand::Value(input) = input
+                        && is_i32(*input)
+                    {
+                        components.union(eqn.out, *input);
+                    }
+                }
+                continue;
+            }
             if graph
                 .values
                 .get(eqn.out)
@@ -127,6 +141,14 @@ impl<'g, V: ValidationChannel> ExactI32StorageAnalysis<'g, V> {
                 {
                     components.union(eqn.out, *input);
                 }
+            }
+        }
+
+        // A carried state value is one buffer across steps: its input and its next value are read by
+        // later kernels on one lane, whichever equations produce and consume them.
+        for &(input, output) in &graph.state {
+            if is_i32(input) && is_i32(output) {
+                components.union(input, output);
             }
         }
 

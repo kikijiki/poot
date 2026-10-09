@@ -1,6 +1,6 @@
-//! Dependency-light loading of safetensors weights and an HF `config.json`. Floating-point tensors are
-//! decoded to f32 for the eager reference executor; host dequant remains the compatibility oracle. A
-//! decoded tensor is a `poot_tensor::HostTensor` of its own dtype.
+//! Dependency-light loading of safetensors and GGUF weights into a `WeightStore` (every tensor's bytes as
+//! stored, quantized tensors packed) and of an HF `config.json`. [`safetensors::decode_dense`] widens one dense
+//! entry to f32 for the CPU oracle.
 
 use std::borrow::Cow;
 use std::collections::HashMap;

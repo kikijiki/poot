@@ -83,10 +83,7 @@ use poot_gpu::device::WgpuDevice;
 
 let device = WgpuDevice::new()?;
 let target: Target = device.target(); // backend plus measured DeviceCaps
-let program = compile(&g, &target, &CompileOptions {
-    execution: Submission::Replay,
-    limits: CompileLimits::STANDARD,
-})?;
+let program = compile(&g, &target, &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD))?;
 ```
 
 `CompileLimits` bounds what one compile may construct: the value and equation counts of every graph a
@@ -136,10 +133,7 @@ let staged = compile_staged(
         experts: ExpertPlacement::AllResident,
         devices: DevicePlacement::Single(DeviceId(0)),
     },
-    &CompileOptions {
-        execution: Submission::Replay,
-        limits: CompileLimits::STANDARD,
-    },
+    &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
 )?;
 
 let mut exec = Engine::new(device);

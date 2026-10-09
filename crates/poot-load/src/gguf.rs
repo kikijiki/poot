@@ -622,7 +622,7 @@ mod tests {
     /// The same comparison was run once on 11520 real weights fetched by HTTP range request from
     /// `ggml-org/gpt-oss-20b-GGUF/gpt-oss-20b-MXFP4.gguf` (`blk.0.ffn_gate_exps.weight`, type 39):
     /// bit-identical, block exponents 120-122 (scales 2^-8..2^-6), values in +-0.125. The receipt
-    /// is in `docs/updates/`; it is not committed because that would mean checking in model weights.
+    /// is in the Backstage update notes; it is not committed because that would mean checking in model weights.
     #[test]
     fn mxfp4_dequant_agrees_with_the_ocp_spec_stated_independently() {
         /// The OCP MX v1.0 formulation from the spec, not ggml: magnitude table for codes 0..7,

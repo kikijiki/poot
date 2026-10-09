@@ -1,10 +1,4 @@
 //! Qwen2.5-VL image and video preprocessing.
-//!
-//! Held for Card 566b (the VLM front end on the driver): the single-image entries below are the only
-//! producers of the public `Qwen25VlProcessedImage` and have no production caller yet, so rustc reports
-//! them dead where it reports them at all (`#[expect(dead_code, reason = "held for POOT-650")]`). The
-//! default-config wrappers only this crate's tests call are `#[cfg(test)]`; `raw_request.rs` calls the
-//! live `*_with_config` batch and video entries.
 
 use std::io::Cursor;
 
@@ -16,7 +10,7 @@ use poot_models::mrope::{
 use poot_tensor::HostTensor;
 
 use super::apng::Qwen25VlDecodedFrameSource;
-use super::assembly::{Qwen25VlProcessedImage, Qwen25VlProcessedImages, Qwen25VlProcessedVideo};
+use super::assembly::{Qwen25VlProcessedImages, Qwen25VlProcessedVideo};
 use super::config::Qwen25VlImageProcessorConfig;
 use super::video_sampling::{
     Qwen25VlSampledVideo, Qwen25VlVideoMetadata, Qwen25VlVideoSamplingError,
@@ -281,34 +275,6 @@ pub(super) fn validate_decoded_dimensions(
     Ok(expected)
 }
 
-/// Preprocess one decoded RGB8 image into the existing processor-media handoff contract.
-#[cfg_attr(not(test), expect(dead_code, reason = "held for POOT-650"))]
-pub(crate) fn preprocess_qwen2_5_vl_image(
-    image: &Qwen25VlDecodedImage,
-) -> Result<Qwen25VlProcessedImage, Qwen25VlImagePreprocessError> {
-    preprocess_qwen2_5_vl_image_with_config(image, &Qwen25VlImageProcessorConfig::default())
-}
-
-/// Preprocess one decoded RGB8 image with a validated persisted processor configuration.
-pub(crate) fn preprocess_qwen2_5_vl_image_with_config(
-    image: &Qwen25VlDecodedImage,
-    config: &Qwen25VlImageProcessorConfig,
-) -> Result<Qwen25VlProcessedImage, Qwen25VlImagePreprocessError> {
-    let layout = image_layout(image, config)?;
-    let mut data = Vec::new();
-    data.try_reserve_exact(layout.elements).map_err(|_| {
-        Qwen25VlImagePreprocessError::Allocation {
-            stage: "image pixel values",
-        }
-    })?;
-    preprocess_image_into(image, &layout, config, &mut data);
-    debug_assert_eq!(data.len(), layout.elements);
-    Ok(Qwen25VlProcessedImage {
-        pixel_values: HostTensor::f32(vec![layout.rows, layout.feature_width], data),
-        grid: layout.grid,
-    })
-}
-
 /// Preprocess and concatenate a nonempty ordered image list with the released defaults.
 #[cfg(test)]
 pub(crate) fn preprocess_qwen2_5_vl_images(
@@ -561,7 +527,6 @@ pub(super) struct ImageLayout {
     pub(super) width: usize,
     pub(crate) rows: usize,
     pub(crate) feature_width: usize,
-    pub(crate) elements: usize,
     pub(crate) grid: MropeGrid,
 }
 
@@ -687,17 +652,15 @@ pub(super) fn image_layout(
         .ok_or(Qwen25VlImagePreprocessError::ArithmeticOverflow {
             stage: "flattened patch feature width",
         })?;
-    let elements = rows.checked_mul(feature_width).ok_or(
-        Qwen25VlImagePreprocessError::ArithmeticOverflow {
+    rows.checked_mul(feature_width)
+        .ok_or(Qwen25VlImagePreprocessError::ArithmeticOverflow {
             stage: "flattened patch elements",
-        },
-    )?;
+        })?;
     Ok(ImageLayout {
         height,
         width,
         rows,
         feature_width,
-        elements,
         grid: MropeGrid::new(1, grid_height, grid_width),
     })
 }

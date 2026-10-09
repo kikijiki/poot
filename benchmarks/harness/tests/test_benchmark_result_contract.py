@@ -124,6 +124,54 @@ class BenchmarkResultContractTests(unittest.TestCase):
                 self.assertEqual(refused["status"], "error")
                 self.assertIn(fragment, refused["reason"])
 
+    def test_device_time_is_typed_and_only_a_device_timing_runner_may_report_it(self):
+        measured = {"kind": "measured", "sum_of_dispatch_ms": 1.5, "device_span_ms": None}
+        for name, value in (("null", None), ("unknown", {"kind": "unknown"}), ("measured", measured)):
+            with self.subTest(accepted=name):
+                single, _ = self.run_payload(valid_single() | {"device_time": value})
+                self.assertEqual(single["status"], "ok", single.get("reason"))
+                self.assert_schema_valid(single)
+                payload = valid_curve()
+                payload["curve"][0]["device_time"] = value
+                curve, _ = self.run_payload(payload, scenario=self.curve_scenario)
+                self.assertEqual(curve["status"], "ok", curve.get("reason"))
+                self.assertEqual(curve["curve"][0]["device_time"], value)
+                self.assert_schema_valid(curve)
+        for name, value, fragment in (
+            ("measured with no measure", {"kind": "measured", "sum_of_dispatch_ms": None, "device_span_ms": None},
+             "neither measure"),
+            ("measured with no keys", {"kind": "measured"}, "neither measure"),
+            ("negative", {"kind": "measured", "sum_of_dispatch_ms": -1.0, "device_span_ms": 1.0}, "nonnegative"),
+            ("unknown with a number", {"kind": "unknown", "sum_of_dispatch_ms": 0.0}, "unknown carries"),
+            ("bad kind", {"kind": "zero"}, "kind must be"),
+            ("not an object", 0.0, "null or an object"),
+        ):
+            with self.subTest(refused=name):
+                single, _ = self.run_payload(valid_single() | {"device_time": value})
+                self.assertEqual(single["status"], "error")
+                self.assertIn(fragment, single["reason"])
+                payload = valid_curve()
+                payload["curve"][1]["device_time"] = value
+                curve, _ = self.run_payload(payload, scenario=self.curve_scenario)
+                self.assertEqual(curve["status"], "error")
+                self.assertIn(f"curve[1].device_time", curve["reason"])
+        # A runner with no device timestamps has no device time to report.
+        payload = row_level_single("vllm") | {"device_time": {"kind": "unknown"}}
+        refused, _ = self.run_payload(payload, framework="vllm")
+        self.assertEqual(refused["status"], "error")
+        self.assertIn("does not claim device timing", refused["reason"])
+
+    def test_the_schema_declares_the_device_time_shape(self):
+        row, _ = self.run_payload(valid_single() | {"device_time": {"kind": "unknown"}})
+        self.assert_schema_valid(row)
+        for bad in (
+            {"kind": "measured"},
+            {"kind": "zero"},
+            {"kind": "measured", "sum_of_dispatch_ms": -1.0, "device_span_ms": 1.0},
+        ):
+            with self.subTest(bad=bad):
+                self.assertNotEqual(schema_errors(row | {"device_time": bad}, self.schema), [])
+
     def test_a_row_level_curve_still_checks_its_own_gaps(self):
         payload = row_level_curve("vllm")
         payload["curve"][0]["iters"][0]["itl_ms"] = [2.0]

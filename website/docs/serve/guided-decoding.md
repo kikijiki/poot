@@ -6,11 +6,7 @@ sidebar_position: 6
 
 # Guided decoding
 
-:::caution[Being restored]
-poot is being refactored. This is not available yet and is planned to return.
-:::
-
-Today a valid guided request returns `503` naming the missing engine. The server still validates the constraint first: an invalid `guided_regex`, `guided_json`, `guided_choice`, `guided_grammar` or `response_format` is a `400` either way.
+The server validates the constraint before it asks the engine: an invalid `guided_regex`, `guided_json`, `guided_choice`, `guided_grammar` or `response_format` is a `400`. Every one of a request's `n` choices carries the constraint.
 
 The completion and chat endpoints can constrain the output so it is guaranteed well-formed. The
 engine compiles the constraint to a per-step token mask and the sampler only ever picks an allowed

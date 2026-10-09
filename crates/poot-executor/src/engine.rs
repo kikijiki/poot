@@ -20,9 +20,12 @@ use std::ops::Range;
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
-use poot_graph_ir::{Eqn, Slot, SlotKey, Storage, TensorType, ValidationOutputs, ValueId};
+use poot_graph_ir::{
+    BoundaryId, Eqn, Slot, SlotKey, StateRole, Storage, TensorType, ValidationOutputs, ValueId,
+};
 use poot_graph_plan::{
-    DeviceId, Plan, Program, StagedProgram, Submission, TargetSet, dispatch_work, value_ids,
+    DeviceId, Link, Plan, Program, StageId, StagedProgram, Submission, TargetSet, dispatch_work,
+    value_ids,
 };
 use poot_kernel_ir::Body;
 use poot_quant::SourceRole;
@@ -36,12 +39,12 @@ use crate::error::{BindError, DeviceError, ExecError, LoadError};
 use crate::shared_kernels::{SharedKernels, SharedKernelsMismatch};
 use crate::timing::TimingOptions;
 use crate::{
-    EntryId, ExecutableId, Executor, ExecutorStats, HostSync, OutputSource, StateScope, StepInputs,
-    StepOutputs,
+    EntryId, ExecutableId, Executor, ExecutorStats, HostSync, OutputSource, StageStats, StateScope,
+    StepInputs, StepOutputs,
 };
 
-/// The engine's only device id: one engine drives one device (Card 581a's multi-stage composition
-/// is out of this card's scope; `add_entry` refuses a `StagedProgram` naming more than one stage).
+/// The engine's only device id: one engine drives one device. `add_entry` refuses a stage placed on
+/// another ([`ExecError::Placement`]); the stages of one program all run on this device, in order.
 const DEVICE: DeviceId = DeviceId(0);
 
 pub struct Engine<D: Device> {
@@ -73,6 +76,8 @@ pub struct Engine<D: Device> {
     residency: HashMap<Residency, Weak<ResidentWeight<D>>>,
     /// Bytes read from the weight store for uploads ([`ExecutorStats::weight_bytes_read`]).
     weight_bytes_read: u64,
+    /// Bytes the host wrote to device buffers while binding steps ([`ExecutorStats::host_write_bytes`]).
+    host_write_bytes: u64,
     device: D,
     /// Set once `Device::abort` itself fails: no further work can run on this device (core review
     /// CR30). Checked at the top of every `Executor` method that would touch the device.
@@ -138,6 +143,9 @@ struct Loaded<D: Device> {
 struct StateBuffer<D: Device> {
     name: String,
     aval: TensorType,
+    /// The role the first graph to declare this state traced it with: whether the leading axis is
+    /// a row axis [`StateScope::Row`] addresses.
+    role: StateRole,
     storage: BufferStorage,
     bytes: usize,
     /// This state buffer's native device-element count (Card 547b): never arena-shared, so always
@@ -146,31 +154,67 @@ struct StateBuffer<D: Device> {
     buffer: D::Buffer,
 }
 
-struct Entry<D: Device> {
-    // Field order is drop order: the recording drops before the buffers it references.
-    recording: Option<D::Recording>,
-    recordings: u64,
-    replays: u64,
+/// An entry while its stages load: the buffers they share and what each has exported so far.
+struct EntryBuild<D: Device> {
     locals: Vec<D::Buffer>,
-    /// One buffer per [`poot_graph_plan::BufferPlan`] arena slot (Card 547b), allocated once up
-    /// front from `Program::buffer_plan` and index-aligned with [`Loc::Arena`].
     arena: Vec<D::Buffer>,
-    steps: Vec<LoadedStep>,
-    /// Explicit two-phase commit copies (src, dst), run after every step's dispatches.
-    commits: Vec<(Loc, Loc)>,
-    /// The primary output snapshot taken before `commits`, when `preserve_output` is set (the output
-    /// aliases a destination the commit copies overwrite).
-    preserve_output: Option<Loc>,
+    slots: Vec<BoundSlot>,
+    token_embeds: Vec<TokenEmbedSlot>,
+    /// Each exported boundary's location and element count, by the stage that produced it.
+    exported: HashMap<BoundaryId, (Loc, u32)>,
+    stages: Vec<StageRun<D>>,
+    validations: Vec<ValidationLoad>,
+    /// The latest loaded stage's output: read location, bytes and host form.
+    output: Option<OutputLoad>,
+}
+
+/// A stage's primary output as the host reads it.
+struct OutputLoad {
+    loc: Loc,
+    bytes: usize,
+    host: Option<(DType, Vec<usize>)>,
+}
+
+struct Entry<D: Device> {
+    // Field order is drop order: the recordings drop before the buffers they reference.
+    stages: Vec<StageRun<D>>,
+    /// Steps replayed (one per `step`, whatever the stage count).
+    replays: u64,
+    /// Buffers shared by every stage of the entry: a stage binds a boundary to the producing stage's
+    /// buffer by index, so no link copies. Index-aligned with [`Loc::Local`].
+    locals: Vec<D::Buffer>,
+    /// One buffer per [`poot_graph_plan::BufferPlan`] arena slot of each stage (Card 547b), allocated
+    /// once up front and index-aligned with [`Loc::Arena`] (a stage's slots follow the previous
+    /// stage's).
+    arena: Vec<D::Buffer>,
     slots: Vec<BoundSlot>,
     /// Hosted embed gathers (`legalize`'s `Slot::TokenEmbed`), filled each step from the step's
     /// `Slot::Token` input and the executable's embed rows, never supplied by the caller.
     token_embeds: Vec<TokenEmbedSlot>,
+    /// Where the final stage's primary output is read from: its pre-commit snapshot when the output
+    /// aliases a commit destination, else the output itself.
     output: Loc,
     output_bytes: usize,
     /// The primary output as a host tensor: its dtype lane (`None` when the planned lane is not a
     /// dense natural-width one, e.g. a packed or mirrored output) and declared shape.
     output_host: Option<(DType, Vec<usize>)>,
-    validation: ValidationLoad,
+    /// One per stage, checked after the step's single completion wait.
+    validations: Vec<ValidationLoad>,
+}
+
+/// One stage of an entry: its own recording over the entry's shared buffers.
+struct StageRun<D: Device> {
+    id: StageId,
+    recording: Option<D::Recording>,
+    recordings: u64,
+    replays: u64,
+    steps: Vec<LoadedStep>,
+    /// Explicit two-phase commit copies (src, dst), run after every step's dispatches.
+    commits: Vec<(Loc, Loc)>,
+    /// This stage's primary output and, when it aliases a destination the commit copies overwrite,
+    /// the snapshot taken before `commits`.
+    output: Loc,
+    preserve_output: Option<Loc>,
 }
 
 /// One hosted embed gather: where its rows come from, its planned lane, and its buffer (an index
@@ -241,6 +285,19 @@ fn codegen_target(backend: Backend) -> poot_codegen::Target {
     }
 }
 
+/// The one way a step puts host bytes on the device: every write of a step's bind goes through here,
+/// so [`ExecutorStats::host_write_bytes`] counts exactly what the device was handed.
+fn host_write<D: Device>(
+    device: &mut D,
+    counter: &mut u64,
+    dst: &D::Buffer,
+    bytes: &[u8],
+) -> Result<(), D::Error> {
+    device.write(dst, 0, bytes)?;
+    *counter += bytes.len() as u64;
+    Ok(())
+}
+
 fn resolve<'a, D: Device>(
     loc: Loc,
     locals: &'a [D::Buffer],
@@ -285,6 +342,7 @@ impl<D: Device> Engine<D> {
             kernels_resolved: 0,
             residency: HashMap::new(),
             weight_bytes_read: 0,
+            host_write_bytes: 0,
             device,
             poisoned: false,
             timing: snapshot,
@@ -430,11 +488,73 @@ impl<D: Device> Engine<D> {
             .map_err(device_error(backend))
     }
 
+    /// Loads every stage of `program` in order into one entry. A stage's boundary inputs bind the
+    /// buffers earlier stages exported, so the whole entry shares one `locals`/`arena` pair.
     fn load_entry(
         &mut self,
         exe: ExecutableId,
-        program: &Program<ValidationOutputs>,
+        program: &StagedProgram<ValidationOutputs>,
     ) -> Result<Entry<D>, ExecError> {
+        let mut build = EntryBuild {
+            locals: Vec::new(),
+            arena: Vec::new(),
+            slots: Vec::new(),
+            token_embeds: Vec::new(),
+            exported: HashMap::new(),
+            stages: Vec::new(),
+            validations: Vec::new(),
+            output: None,
+        };
+        for (id, _, stage) in program.stages() {
+            self.load_stage(exe, id, stage, program.links(), &mut build)?;
+        }
+        let EntryBuild {
+            locals,
+            arena,
+            slots,
+            token_embeds,
+            stages,
+            validations,
+            output,
+            ..
+        } = build;
+        let OutputLoad {
+            loc: output,
+            bytes: output_bytes,
+            host: output_host,
+        } = output.expect("a staged program has at least one stage");
+        Ok(Entry {
+            stages,
+            replays: 0,
+            locals,
+            arena,
+            slots,
+            token_embeds,
+            output,
+            output_bytes,
+            output_host,
+            validations,
+        })
+    }
+
+    fn load_stage(
+        &mut self,
+        exe: ExecutableId,
+        stage: StageId,
+        program: &Program<ValidationOutputs>,
+        links: &[Link],
+        build: &mut EntryBuild<D>,
+    ) -> Result<(), ExecError> {
+        let EntryBuild {
+            locals,
+            arena,
+            slots,
+            token_embeds,
+            exported,
+            stages,
+            validations,
+            output: entry_output,
+        } = &mut *build;
         let device_target = self.device.target();
         if *program.target() != device_target {
             return Err(LoadError::TargetMismatch {
@@ -460,14 +580,13 @@ impl<D: Device> Engine<D> {
             checked_u32(elems)
         };
         let mut values: Vec<Option<(Loc, u32)>> = vec![None; g.values.len()];
-        let mut locals: Vec<D::Buffer> = Vec::new();
-        let mut slots: Vec<BoundSlot> = Vec::new();
-        let mut token_embeds: Vec<TokenEmbedSlot> = Vec::new();
 
         // Card 547b: one buffer per arena slot, allocated once up front from the program's buffer
-        // plan (`Program::buffer_plan`) - never one buffer per computed value.
+        // plan (`Program::buffer_plan`) - never one buffer per computed value. This stage's slots
+        // follow the earlier stages' in the entry's shared arena.
         let buffer_plan = program.buffer_plan();
-        let mut arena: Vec<D::Buffer> = Vec::with_capacity(buffer_plan.slot_count());
+        let arena_base = arena.len();
+        arena.reserve(buffer_plan.slot_count());
         for (_, slot_storage, slot_elems) in buffer_plan.slots() {
             // Review F3: `slot_elems` is already the slot's native device-element count - never
             // route it through `Self::allocate`, which would apply `BufferStorage::device_elems` to
@@ -500,7 +619,11 @@ impl<D: Device> Engine<D> {
                         .name
                         .clone()
                         .ok_or(LoadError::UnnamedConst { value: id })?;
-                    let (idx, elems) = self.state_buffer(exe, name, meta.aval.clone(), storage)?;
+                    let role = g
+                        .state_role(id)
+                        .expect("a validated graph gives every state input a role");
+                    let (idx, elems) =
+                        self.state_buffer(exe, name, meta.aval.clone(), role, storage)?;
                     (Loc::State(idx), elems)
                 }
                 Storage::Const => {
@@ -532,7 +655,7 @@ impl<D: Device> Engine<D> {
                         })?;
                     let (loc, elems) = push_local!(BufferRole::Input, storage, &meta.aval.shape);
                     self.device
-                        .write(resolve::<D>(loc, &locals, &arena, &[], &[]), &encoded)
+                        .write(resolve::<D>(loc, locals, arena, &[], &[]), 0, &encoded)
                         .map_err(device_error(backend))?;
                     (loc, elems)
                 }
@@ -562,17 +685,34 @@ impl<D: Device> Engine<D> {
                         .slot_key()
                         .cloned()
                         .ok_or(LoadError::UnkeyedSlot { value: id })?;
-                    let (loc, elems) = push_local!(BufferRole::Input, storage, &meta.aval.shape);
-                    let Loc::Local(buffer) = loc else {
-                        unreachable!("push_local! always returns Loc::Local")
-                    };
-                    slots.push(BoundSlot {
-                        key,
-                        aval: meta.aval.clone(),
-                        storage,
-                        buffer,
-                    });
-                    (loc, elems)
+                    if let Some(link) = links
+                        .iter()
+                        .find(|link| link.to == stage && link.id.slot_key() == key)
+                    {
+                        // A boundary: the producing stage's buffer, bound with no copy.
+                        *exported
+                            .get(&link.id)
+                            .ok_or(LoadError::BoundaryUnresolved { id: link.id, stage })?
+                    } else if let Some(shared) = slots.iter().find(|slot| slot.key == key) {
+                        // The same slot declared by an earlier stage: one host-written buffer.
+                        if shared.aval != meta.aval || shared.storage != storage {
+                            return Err(LoadError::SlotConflict { key }.into());
+                        }
+                        (Loc::Local(shared.buffer), elems_of(id)?)
+                    } else {
+                        let (loc, elems) =
+                            push_local!(BufferRole::Input, storage, &meta.aval.shape);
+                        let Loc::Local(buffer) = loc else {
+                            unreachable!("push_local! always returns Loc::Local")
+                        };
+                        slots.push(BoundSlot {
+                            key,
+                            aval: meta.aval.clone(),
+                            storage,
+                            buffer,
+                        });
+                        (loc, elems)
+                    }
                 }
                 Storage::Device => {
                     return Err(LoadError::Unimplemented("a Device-storage graph input").into());
@@ -605,14 +745,19 @@ impl<D: Device> Engine<D> {
                 };
             let work = dispatch_work(g, eqn);
             match plan {
-                Plan::Alias(source) => values[eqn.out] = Some(operand(&values, *source)?),
-                Plan::View { src, .. } => values[eqn.out] = Some(operand(&values, *src)?),
+                Plan::Alias(source) => {
+                    values[eqn.out] = Some(operand(&values, *source)?);
+                }
+                Plan::View { src, .. } => {
+                    values[eqn.out] = Some(operand(&values, *src)?);
+                }
                 Plan::Dispatches(dispatches) => {
                     let output_loc = out_loc(
                         OutLocArgs {
                             out: eqn.out,
                             commit_plan,
                             buffer_plan,
+                            arena_base,
                         },
                         &values,
                     )?;
@@ -628,7 +773,7 @@ impl<D: Device> Engine<D> {
                         let kernel = self.kernel(key, body, max_artifact_bytes)?;
                         let mut inputs = operands_with_elems(&values, eqn)?;
                         if !launch.meta.is_empty() {
-                            let meta_loc = self.meta_buffer(&launch.meta, &mut locals)?;
+                            let meta_loc = self.meta_buffer(&launch.meta, locals)?;
                             inputs.push((meta_loc, launch.meta.len() as u32));
                         }
                         steps.push(LoadedStep {
@@ -668,6 +813,20 @@ impl<D: Device> Engine<D> {
             }
             commits.push((src, dst));
         }
+
+        // Exports: the buffer each boundary value lives in, handed to the stages that read it. The
+        // buffer plan gave every export root a slot of its own, so no later equation reuses it.
+        // `compile_staged` refuses a boundary that views carried state; the check here is the
+        // invariant for a program assembled some other way.
+        if let Some((id, state)) = program.export_aliasing_state() {
+            return Err(LoadError::BoundaryAliasesState { id, state }.into());
+        }
+        for export in &g.exports {
+            let placed =
+                values[export.value].ok_or(LoadError::ExportUnmaterialized { id: export.id })?;
+            exported.insert(export.id, placed);
+        }
+
         let output = values[g.output]
             .ok_or(LoadError::Unimplemented("unmaterialized output"))?
             .0;
@@ -698,25 +857,27 @@ impl<D: Device> Engine<D> {
             validation_sources.push((loc, source.lane_count));
         }
 
-        Ok(Entry {
+        stages.push(StageRun {
+            id: stage,
             recording: None,
             recordings: 0,
             replays: 0,
-            locals,
-            arena,
             steps,
             commits,
-            preserve_output,
-            slots,
-            token_embeds,
             output,
-            output_bytes,
-            output_host,
-            validation: ValidationLoad {
-                layout: validation_layout,
-                sources: validation_sources,
-            },
-        })
+            preserve_output,
+        });
+        validations.push(ValidationLoad {
+            layout: validation_layout,
+            sources: validation_sources,
+        });
+        // The last stage loaded is the final one: its output is the entry's.
+        *entry_output = Some(OutputLoad {
+            loc: preserve_output.unwrap_or(output),
+            bytes: output_bytes,
+            host: output_host,
+        });
+        Ok(())
     }
 
     fn meta_buffer(&mut self, meta: &[u32], locals: &mut Vec<D::Buffer>) -> Result<Loc, ExecError> {
@@ -734,7 +895,7 @@ impl<D: Device> Engine<D> {
             .allocate(BufferRole::Meta, storage, elems)
             .map_err(device_error(backend))?;
         self.device
-            .write(&buffer, bytemuck::cast_slice(meta))
+            .write(&buffer, 0, bytemuck::cast_slice(meta))
             .map_err(device_error(backend))?;
         locals.push(buffer);
         Ok(Loc::Local(locals.len() - 1))
@@ -749,6 +910,7 @@ impl<D: Device> Engine<D> {
         exe: ExecutableId,
         name: String,
         aval: TensorType,
+        role: StateRole,
         storage: BufferStorage,
     ) -> Result<(usize, u32), ExecError> {
         if let Some((index, existing)) = self
@@ -774,6 +936,7 @@ impl<D: Device> Engine<D> {
         state.push(StateBuffer {
             name,
             aval,
+            role,
             storage,
             bytes,
             elems,
@@ -918,7 +1081,7 @@ impl<D: Device> Engine<D> {
         };
         if let Some(encoded) = upload {
             self.device
-                .write(&buffer, &encoded)
+                .write(&buffer, 0, &encoded)
                 .map_err(device_error(backend))?;
         }
         let resident = Arc::new(ResidentWeight { buffer, elems });
@@ -941,6 +1104,7 @@ impl<D: Device> Engine<D> {
         let Self {
             executables,
             device,
+            host_write_bytes,
             ..
         } = self;
         let loaded = executables
@@ -1015,23 +1179,24 @@ impl<D: Device> Engine<D> {
             writes.push((embed.buffer, bytes));
         }
         for (buffer, bytes) in writes {
-            device
-                .write(&e.locals[buffer], &bytes)
+            host_write(device, host_write_bytes, &e.locals[buffer], &bytes)
                 .map_err(device_error(backend))?;
         }
         Ok(())
     }
 
-    /// Walk one entry into the device: every dispatch, then the state commit.
+    /// Walk one stage into the device: every dispatch, then the state commit.
     fn walk(
         device: &mut D,
         kernels: &[D::Kernel],
-        entry: &Entry<D>,
+        stage: &StageRun<D>,
+        buffers: (&[D::Buffer], &[D::Buffer]),
         weights: &[Arc<ResidentWeight<D>>],
         state: &[StateBuffer<D>],
     ) -> Result<(), D::Error> {
-        let at = |loc| resolve::<D>(loc, &entry.locals, &entry.arena, weights, state);
-        for step in &entry.steps {
+        let (locals, arena) = buffers;
+        let at = |loc| resolve::<D>(loc, locals, arena, weights, state);
+        for step in &stage.steps {
             let inputs: Vec<Arg<'_, D>> = step
                 .inputs
                 .iter()
@@ -1056,10 +1221,10 @@ impl<D: Device> Engine<D> {
         // The two-phase commit: the primary output is snapshotted now, after every
         // dispatch has computed its final value but before any commit copy overwrites the buffer it
         // aliases; the commits themselves run as a simultaneous assignment immediately after.
-        if let Some(preserve) = entry.preserve_output {
-            device.copy(at(entry.output), at(preserve))?;
+        if let Some(preserve) = stage.preserve_output {
+            device.copy(at(stage.output), at(preserve))?;
         }
-        for &(src, dst) in &entry.commits {
+        for &(src, dst) in &stage.commits {
             device.copy(at(src), at(dst))?;
         }
         Ok(())
@@ -1073,6 +1238,7 @@ impl<D: Device> Engine<D> {
         &mut self,
         exe: ExecutableId,
         entry_idx: usize,
+        stage_idx: usize,
         submission: Submission,
         walk_recording: bool,
     ) -> Result<Option<D::Recording>, ExecError> {
@@ -1105,14 +1271,13 @@ impl<D: Device> Engine<D> {
             state,
             ..
         } = loaded;
-        let e = match entries.get_mut(entry_idx).and_then(Option::as_mut) {
-            Some(e) => e,
-            None => {
-                self.abort_after_failure(exe, false);
-                return Err(LoadError::UnknownHandle.into());
-            }
+        let Some(e) = entries.get(entry_idx).and_then(Option::as_ref) else {
+            self.abort_after_failure(exe, false);
+            return Err(LoadError::UnknownHandle.into());
         };
-        if let Err(walk_err) = Self::walk(device, kernels, e, weights, state) {
+        let stage = &e.stages[stage_idx];
+        let buffers = (e.locals.as_slice(), e.arena.as_slice());
+        if let Err(walk_err) = Self::walk(device, kernels, stage, buffers, weights, state) {
             self.abort_after_failure(exe, walk_recording);
             return Err(error(walk_err));
         }
@@ -1137,6 +1302,116 @@ impl<D: Device> Engine<D> {
         }
     }
 
+    /// Record every stage of `entry` that is not recorded yet, then replay every stage in order.
+    /// Returns the entry's replay count.
+    ///
+    /// Recording is all-or-nothing: the stages record into a scratch list and are published
+    /// together, so a failure in any stage (after which `Device::abort` ran exactly once) leaves
+    /// the entry with no recording at all. Capture executes nothing, so a recording failure never
+    /// marks the executable dirty. A replay failure may have run earlier stages' commits and does.
+    fn enqueue(&mut self, exe: ExecutableId, entry: EntryId) -> Result<u64, ExecError> {
+        let backend = self.backend();
+        let error = device_error(backend);
+        let stage_count = {
+            let e = self.loaded_entry(exe, entry)?;
+            if e.stages.iter().any(|stage| stage.recording.is_some()) {
+                0
+            } else {
+                e.stages.len()
+            }
+        };
+        if stage_count > 0 {
+            let mut recorded = Vec::with_capacity(stage_count);
+            for stage_idx in 0..stage_count {
+                recorded.push(self.run_transaction(
+                    exe,
+                    entry.index(),
+                    stage_idx,
+                    Submission::Replay,
+                    false,
+                )?);
+            }
+            let loaded = self.loaded(exe)?;
+            let e = loaded
+                .entries
+                .get_mut(entry.index())
+                .and_then(Option::as_mut)
+                .ok_or(LoadError::UnknownHandle)?;
+            for (stage, recording) in e.stages.iter_mut().zip(recorded) {
+                stage.recording = recording;
+                stage.recordings += 1;
+            }
+        }
+        let replay_result = {
+            let Self {
+                executables,
+                device,
+                ..
+            } = self;
+            let loaded = executables
+                .get_mut(exe.index())
+                .and_then(Option::as_mut)
+                .ok_or(LoadError::UnknownHandle)?;
+            let e = loaded
+                .entries
+                .get(entry.index())
+                .and_then(Option::as_ref)
+                .ok_or(LoadError::UnknownHandle)?;
+            device.begin_step().and_then(|()| {
+                e.stages.iter().try_for_each(|stage| {
+                    device.replay(stage.recording.as_ref().expect("recorded above"))
+                })
+            })
+        };
+        if let Err(err) = replay_result {
+            self.abort_after_failure(exe, true);
+            return Err(error(err));
+        }
+        let loaded = self.loaded(exe)?;
+        let e = loaded
+            .entries
+            .get_mut(entry.index())
+            .and_then(Option::as_mut)
+            .ok_or(LoadError::UnknownHandle)?;
+        e.replays += 1;
+        for stage in &mut e.stages {
+            stage.replays += 1;
+        }
+        Ok(e.replays)
+    }
+
+    /// Wait once for everything the step enqueued, drain deferred releases, and check every stage's
+    /// validation packet before any output readback. Returns the host time spent waiting.
+    fn complete(
+        &mut self,
+        exe: ExecutableId,
+        entry: EntryId,
+    ) -> Result<std::time::Duration, ExecError> {
+        let backend = self.backend();
+        let error = device_error(backend);
+        let sync_t0 = Instant::now();
+        if let Err(err) = self.device.synchronize() {
+            // A kernel-assert fault surfaces here (Z10): not a device-level failure, so it does not
+            // poison the engine or mark the executable NeedsReset - the device itself is in a
+            // consistent, reusable state, the program result is simply faulted.
+            if let Some((kernel, code)) = self.device.classify_fault(&err) {
+                return Err(ExecError::Fault { kernel, code });
+            }
+            // CR30: a non-fault synchronize failure (e.g. a device timeout) can
+            // follow a replay that already wrote state, so it is classified the same way a replay
+            // failure is - poisoned if abort fails, and NeedsReset since rollback is not proven.
+            self.abort_after_failure(exe, true);
+            return Err(error(err));
+        }
+        let wait_dur = sync_t0.elapsed();
+        // CR30: this synchronize just proved every op this device had queued before it - including
+        // whatever `unload` deferred into `pending_release` - has completed. Safe to finally drop.
+        self.pending_release.clear();
+        self.residency.retain(|_, upload| upload.strong_count() > 0);
+        self.check_validation(exe, entry.index())?;
+        Ok(wait_dur)
+    }
+
     /// Check the entry's validation packet (ADR-0101 decision 2's validated session): a
     /// zero-lane packet reads zero bytes and always passes. Called after replay/eager execution and
     /// `synchronize`, strictly before any primary-output readback.
@@ -1156,24 +1431,24 @@ impl<D: Device> Engine<D> {
             .get(entry_idx)
             .and_then(Option::as_ref)
             .ok_or(LoadError::UnknownHandle)?;
-        if e.validation.layout.lane_count == 0 {
-            return Ok(());
+        for validation in &e.validations {
+            if validation.layout.lane_count == 0 {
+                continue;
+            }
+            let mut bytes = vec![0u8; validation.layout.lane_count * 4];
+            let mut offset = 0usize;
+            for &(loc, lane_count) in &validation.sources {
+                let buf = resolve::<D>(loc, &e.locals, &e.arena, &loaded.weights, &loaded.state);
+                let len = lane_count * 4;
+                device
+                    .read(buf, &mut bytes[offset..offset + len])
+                    .map_err(device_error(backend))?;
+                offset += len;
+            }
+            let bits: &[u32] = bytemuck::cast_slice(&bytes);
+            validation.layout.validate_f32_bits(bits)?;
         }
-        let mut bytes = vec![0u8; e.validation.layout.lane_count * 4];
-        let mut offset = 0usize;
-        for &(loc, lane_count) in &e.validation.sources {
-            let buf = resolve::<D>(loc, &e.locals, &e.arena, &loaded.weights, &loaded.state);
-            let len = lane_count * 4;
-            device
-                .read(buf, &mut bytes[offset..offset + len])
-                .map_err(device_error(backend))?;
-            offset += len;
-        }
-        let bits: &[u32] = bytemuck::cast_slice(&bytes);
-        e.validation
-            .layout
-            .validate_f32_bits(bits)
-            .map_err(ExecError::from)
+        Ok(())
     }
 
     /// Card 552: of every `TimingOptions::Detailed`'s `sample_every` steps, records 1
@@ -1251,8 +1526,9 @@ impl<D: Device> Engine<D> {
                     .get(entry.index())
                     .and_then(Option::as_ref)
                     .ok_or(LoadError::UnknownHandle)?;
-                e.steps
+                e.stages
                     .iter()
+                    .flat_map(|stage| &stage.steps)
                     .map(|s| (s.kind_name, s.label.clone()))
                     .collect()
             };
@@ -1292,6 +1568,8 @@ struct OutLocArgs<'a> {
     out: ValueId,
     commit_plan: &'a poot_graph_plan::StateCommitPlan,
     buffer_plan: &'a poot_graph_plan::BufferPlan,
+    /// Where this stage's arena slots start in the entry's shared arena.
+    arena_base: usize,
 }
 
 fn out_loc(args: OutLocArgs<'_>, values: &[Option<(Loc, u32)>]) -> Result<Loc, ExecError> {
@@ -1302,7 +1580,7 @@ fn out_loc(args: OutLocArgs<'_>, values: &[Option<(Loc, u32)>]) -> Result<Loc, E
         .buffer_plan
         .slot(args.out)
         .ok_or(LoadError::Unimplemented("E4M3/raw-byte device lanes"))?;
-    Ok(Loc::Arena(slot.index()))
+    Ok(Loc::Arena(args.arena_base + slot.index()))
 }
 
 impl<D: Device> Engine<D> {
@@ -1358,8 +1636,13 @@ impl<D: Device> OutputSource for Engine<D> {
         // When the output aliases a commit destination (`preserve_output`), the commit copy has
         // already overwritten it for the next step; the snapshot taken before that copy is the
         // real answer.
-        let loc = e.preserve_output.unwrap_or(e.output);
-        let buffer = resolve::<D>(loc, &e.locals, &e.arena, &loaded.weights, &loaded.state);
+        let buffer = resolve::<D>(
+            e.output,
+            &e.locals,
+            &e.arena,
+            &loaded.weights,
+            &loaded.state,
+        );
         device
             .read(buffer, &mut out[..e.output_bytes])
             .map_err(device_error(backend))
@@ -1414,21 +1697,23 @@ impl<D: Device> Executor for Engine<D> {
         program: &StagedProgram<ValidationOutputs>,
     ) -> Result<EntryId, ExecError> {
         self.check_not_poisoned()?;
-        let mut stages = program.stages();
-        let (Some((_, device, program)), None) = (stages.next(), stages.next()) else {
-            return Err(LoadError::NotSingleStage(program.stages().count()).into());
-        };
-        if device != DEVICE {
-            return Err(LoadError::Unimplemented("a stage on another device").into());
-        }
-        // The contract admits Submission::Replay only. Refused here,
-        // before load_entry's first allocation - Submission::Eager survives as an enum and on the
-        // pre-contract executors (the bench prefill arm, PTX/ROCm/VLM/speculative), never here.
-        if program.submission() != Submission::Replay {
-            return Err(LoadError::Unimplemented(
-                "Submission::Eager (the contract admits Submission::Replay only)",
-            )
-            .into());
+        for (stage, device, stage_program) in program.stages() {
+            if device != DEVICE {
+                return Err(ExecError::Placement {
+                    stage,
+                    program: device,
+                    engine: DEVICE,
+                });
+            }
+            // The contract admits Submission::Replay only. Refused here, before load_entry's first
+            // allocation - Submission::Eager survives as an enum and on the pre-contract executors
+            // (the bench prefill arm, PTX/ROCm/VLM/speculative), never here.
+            if stage_program.submission() != Submission::Replay {
+                return Err(LoadError::Unimplemented(
+                    "Submission::Eager (the contract admits Submission::Replay only)",
+                )
+                .into());
+            }
         }
         // CR30-lite: weight_buffer/state_buffer mutate the executable's resident
         // weight/state caches as load_entry walks the program, before the entry itself is ever
@@ -1465,8 +1750,8 @@ impl<D: Device> Executor for Engine<D> {
         // Card 552: the host-wall partition is always measured (never gated by `TimingOptions`,
         // since `Instant::now()` costs nothing a step doesn't already pay). `encode` covers
         // binding + record/replay (building and submitting the work); `wait` is the explicit
-        // blocking `synchronize()` below; `other` (never stored, only ever printed) is whatever
-        // this step's wall includes past those two - never a device-time subtraction.
+        // blocking `synchronize()`; `other` (never stored, only ever printed) is whatever this
+        // step's wall includes past those two - never a device-time subtraction.
         let step_t0 = Instant::now();
         self.check_not_poisoned()?;
         if self
@@ -1478,82 +1763,13 @@ impl<D: Device> Executor for Engine<D> {
         {
             return Err(ExecError::NeedsReset(exe));
         }
+        // The step is three private seams (core review CR30): bind the inputs, record-or-enqueue
+        // every stage in order, then complete once. The engine itself waits only in `complete`: the
+        // stages share one in-order queue, and every backend's `replay` only enqueues.
         self.bind(exe, entry, inputs)?;
-        let backend = self.backend();
-        let error = device_error(backend);
-        // The contract admits Submission::Replay only (add_entry already refused anything else):
-        // record once, then always replay.
-        let needs_recording = {
-            let loaded = self.loaded(exe)?;
-            let e = loaded
-                .entries
-                .get(entry.index())
-                .and_then(Option::as_ref)
-                .ok_or(LoadError::UnknownHandle)?;
-            e.recording.is_none()
-        };
-        if needs_recording {
-            let recording = self.run_transaction(exe, entry.index(), Submission::Replay, false)?;
-            let loaded = self.loaded(exe)?;
-            let e = loaded
-                .entries
-                .get_mut(entry.index())
-                .and_then(Option::as_mut)
-                .ok_or(LoadError::UnknownHandle)?;
-            e.recording = recording;
-            e.recordings += 1;
-        }
-        let replay_result = {
-            let Self {
-                executables,
-                device,
-                ..
-            } = self;
-            let loaded = executables
-                .get_mut(exe.index())
-                .and_then(Option::as_mut)
-                .ok_or(LoadError::UnknownHandle)?;
-            let e = loaded
-                .entries
-                .get(entry.index())
-                .and_then(Option::as_ref)
-                .ok_or(LoadError::UnknownHandle)?;
-            let recording = e.recording.as_ref().expect("recorded above");
-            device.replay(recording)
-        };
-        if let Err(err) = replay_result {
-            self.abort_after_failure(exe, true);
-            return Err(error(err));
-        }
-        let loaded = self.loaded(exe)?;
-        let e = loaded
-            .entries
-            .get_mut(entry.index())
-            .and_then(Option::as_mut)
-            .ok_or(LoadError::UnknownHandle)?;
-        e.replays += 1;
-        let replay_count = e.replays;
+        let replay_count = self.enqueue(exe, entry)?;
         let encode_dur = step_t0.elapsed();
-        let sync_t0 = Instant::now();
-        if let Err(err) = self.device.synchronize() {
-            // A kernel-assert fault surfaces here (Z10): not a device-level failure, so it does not
-            // poison the engine or mark the executable NeedsReset - the device itself is in a
-            // consistent, reusable state, the program result is simply faulted.
-            if let Some((kernel, code)) = self.device.classify_fault(&err) {
-                return Err(ExecError::Fault { kernel, code });
-            }
-            // CR30: a non-fault synchronize failure (e.g. a device timeout) can
-            // follow a replay that already wrote state, so it is classified the same way a replay
-            // failure is - poisoned if abort fails, and NeedsReset since rollback is not proven.
-            self.abort_after_failure(exe, true);
-            return Err(error(err));
-        }
-        let wait_dur = sync_t0.elapsed();
-        // CR30: this synchronize just proved every op this device had queued before it - including
-        // whatever `unload` deferred into `pending_release` - has completed. Safe to finally drop.
-        self.pending_release.clear();
-        self.residency.retain(|_, upload| upload.strong_count() > 0);
-        self.check_validation(exe, entry.index())?;
+        let wait_dur = self.complete(exe, entry)?;
         let time = self.device.device_time();
         let wall_dur = step_t0.elapsed();
         self.record_step_timing(
@@ -1570,7 +1786,6 @@ impl<D: Device> Executor for Engine<D> {
 
     fn reset_state(&mut self, exe: ExecutableId, scope: StateScope) -> Result<(), ExecError> {
         self.check_not_poisoned()?;
-        let StateScope::All = scope;
         let backend = self.backend();
         let Self {
             executables,
@@ -1581,12 +1796,43 @@ impl<D: Device> Executor for Engine<D> {
             .get_mut(exe.index())
             .and_then(Option::as_mut)
             .ok_or(LoadError::UnknownHandle)?;
-        for state in &loaded.state {
-            device
-                .write(&state.buffer, &vec![0u8; state.bytes])
-                .map_err(device_error(backend))?;
+        match scope {
+            StateScope::All => {
+                for state in &loaded.state {
+                    device
+                        .write(&state.buffer, 0, &vec![0u8; state.bytes])
+                        .map_err(device_error(backend))?;
+                }
+                loaded.needs_reset = false;
+            }
+            StateScope::Row(row) => {
+                // A paged KV pool is the one carried value without a row axis: no row of it is
+                // this sequence's.
+                let rowed =
+                    |state: &&StateBuffer<D>| state.role != StateRole::Positional { axis: 0 };
+                // Check every buffer before writing any: a refused reset leaves the state as it was.
+                let mut rows = Vec::new();
+                for state in loaded.state.iter().filter(rowed) {
+                    let leading = state.aval.shape.first().copied().unwrap_or(0);
+                    let bytes = state.bytes.checked_div(leading).unwrap_or(0);
+                    if row >= leading || bytes * leading != state.bytes {
+                        return Err(BindError::StateRow {
+                            name: state.name.clone(),
+                            row,
+                            rows: leading,
+                        }
+                        .into());
+                    }
+                    rows.push((&state.buffer, row * bytes, bytes));
+                }
+                for (buffer, offset, bytes) in rows {
+                    device
+                        .write(buffer, offset, &vec![0u8; bytes])
+                        .map_err(device_error(backend))?;
+                }
+                // The other rows may be mid-failure: only `All` clears `needs_reset`.
+            }
         }
-        loaded.needs_reset = false;
         Ok(())
     }
 
@@ -1604,10 +1850,24 @@ impl<D: Device> Executor for Engine<D> {
     fn stats(&self) -> ExecutorStats {
         let mut recordings = 0u64;
         let mut replays = 0u64;
-        for loaded in self.executables.iter().flatten() {
-            for entry in loaded.entries.iter().flatten() {
-                recordings += entry.recordings;
-                replays += entry.replays;
+        let mut stages = Vec::new();
+        for (exe, loaded) in self.executables.iter().enumerate() {
+            let Some(loaded) = loaded else { continue };
+            for (entry, loaded_entry) in loaded.entries.iter().enumerate() {
+                let Some(loaded_entry) = loaded_entry else {
+                    continue;
+                };
+                replays += loaded_entry.replays;
+                for stage in &loaded_entry.stages {
+                    recordings += stage.recordings;
+                    stages.push(StageStats {
+                        exe: ExecutableId::new(exe),
+                        entry: EntryId::new(entry),
+                        stage: stage.id,
+                        recordings: stage.recordings,
+                        replays: stage.replays,
+                    });
+                }
             }
         }
         // Card 547a: read the device's own runtime counters, not an engine-side tally over its own
@@ -1615,8 +1875,10 @@ impl<D: Device> Executor for Engine<D> {
         ExecutorStats {
             recordings,
             replays,
+            stages,
             memory: self.device.memory(),
             weight_bytes_read: self.weight_bytes_read,
+            host_write_bytes: self.host_write_bytes,
             kernels_resolved: self.kernels_resolved,
             timing: self.timing.clone(),
         }
@@ -1696,7 +1958,12 @@ mod kernel_identity_tests {
         fn replay(&mut self, _recording: &()) -> Result<(), std::convert::Infallible> {
             Ok(())
         }
-        fn write(&mut self, _dst: &(), _bytes: &[u8]) -> Result<(), std::convert::Infallible> {
+        fn write(
+            &mut self,
+            _dst: &(),
+            _offset: usize,
+            _bytes: &[u8],
+        ) -> Result<(), std::convert::Infallible> {
             Ok(())
         }
         fn read(&mut self, _src: &(), _out: &mut [u8]) -> Result<(), std::convert::Infallible> {
@@ -1913,7 +2180,12 @@ mod arena_slot_alloc_tests {
         fn replay(&mut self, _recording: &()) -> Result<(), std::convert::Infallible> {
             Ok(())
         }
-        fn write(&mut self, _dst: &(), _bytes: &[u8]) -> Result<(), std::convert::Infallible> {
+        fn write(
+            &mut self,
+            _dst: &(),
+            _offset: usize,
+            _bytes: &[u8],
+        ) -> Result<(), std::convert::Infallible> {
             Ok(())
         }
         fn read(&mut self, _src: &(), _out: &mut [u8]) -> Result<(), std::convert::Infallible> {
@@ -2032,7 +2304,12 @@ mod f16_packed_weight_upload_tests {
         fn replay(&mut self, _recording: &()) -> Result<(), std::convert::Infallible> {
             Ok(())
         }
-        fn write(&mut self, dst: &usize, bytes: &[u8]) -> Result<(), std::convert::Infallible> {
+        fn write(
+            &mut self,
+            dst: &usize,
+            _offset: usize,
+            bytes: &[u8],
+        ) -> Result<(), std::convert::Infallible> {
             self.writes.push((*dst, bytes.to_vec()));
             Ok(())
         }
@@ -2410,7 +2687,12 @@ mod weight_source_tests {
         fn replay(&mut self, _recording: &()) -> Result<(), std::convert::Infallible> {
             Ok(())
         }
-        fn write(&mut self, dst: &usize, bytes: &[u8]) -> Result<(), std::convert::Infallible> {
+        fn write(
+            &mut self,
+            dst: &usize,
+            _offset: usize,
+            bytes: &[u8],
+        ) -> Result<(), std::convert::Infallible> {
             self.writes.push((*dst, bytes.to_vec()));
             Ok(())
         }
@@ -3181,7 +3463,8 @@ mod weight_source_tests {
             }
             Ok(())
         }
-        fn write(&mut self, dst: &Held, bytes: &[u8]) -> Result<(), Fault> {
+        fn write(&mut self, dst: &Held, offset: usize, bytes: &[u8]) -> Result<(), Fault> {
+            assert_eq!(offset, 0, "this fake holds whole-buffer writes only");
             self.contents[dst.index] = bytes.to_vec();
             Ok(())
         }

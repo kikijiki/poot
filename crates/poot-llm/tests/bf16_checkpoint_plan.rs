@@ -133,7 +133,7 @@ fn describe(g: &Graph, index: usize) -> String {
 }
 
 #[test]
-fn card298_bf16_prefill_and_decode_graphs_plan_on_wgpu_and_rocm() {
+fn bf16_prefill_and_decode_graphs_plan_on_wgpu_and_rocm() {
     let (n, cap) = (32usize, 64usize);
     let olmo2 = olmo2_like(Family::Olmo2);
     let graphs = [

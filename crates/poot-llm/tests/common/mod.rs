@@ -1,7 +1,10 @@
 //! Shared CPU-eval helpers of the equivalence tests: one step of a traced family graph over the
 //! model's own weights, state carried by the caller.
 //! Each test binary uses a subset of these.
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "compiled once per test binary, each using a different subset"
+)]
 
 use poot_executor_parity::weight_map::MappedModel;
 use poot_graph_ir::{Graph, Slot, SlotKey, ValidationOutputs};

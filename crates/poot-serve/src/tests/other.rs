@@ -126,9 +126,7 @@ fn completions_effective_max_tokens_is_clamped() {
 #[test]
 fn completions_handlers_submit_bounded_max_new() {
     use crate::handlers::handle_completion;
-    let model_path = write_tiny_gguf();
-    let runner = load_handle(&model_path);
-    let _ = std::fs::remove_file(&model_path);
+    let runner = tiny_model();
     let cases = [
         (usize::MAX.to_string(), MAX_NEW_TOKENS_CAP),
         ("999999999999".to_string(), MAX_NEW_TOKENS_CAP),
@@ -139,7 +137,7 @@ fn completions_handlers_submit_bounded_max_new() {
             let body =
                 format!(r#"{{"prompt":"a","max_tokens":{max_tokens},"stream":{streaming}}}"#);
             let req: CompletionReq = serde_json::from_str(&body).unwrap();
-            let (tx, engine_rx) = mpsc::channel::<Job>();
+            let (served, engine_rx) = served_over(Arc::clone(&runner), 1);
             let metrics = test_metrics("completions-bound");
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -148,17 +146,26 @@ fn completions_handlers_submit_bounded_max_new() {
             let engine_job = std::thread::scope(|scope| {
                 let handler = scope.spawn(|| {
                     if streaming {
-                        stream_completion(&mut server, Some(&tx), &runner, &metrics, &req).map(drop)
+                        stream_completion(&mut server, &served, &metrics, &req).map(drop)
                     } else {
-                        handle_completion(Some(&tx), &runner, &metrics, &req, &|| false).map(drop)
+                        handle_completion(&served, &metrics, &req, &|| false).map(drop)
                     }
                 });
-                let job = engine_rx
+                let EngineMsg::Generate(job) = engine_rx
                     .recv_timeout(Duration::from_secs(5))
-                    .expect("job must reach the bare channel");
+                    .expect("job must reach the bare channel")
+                else {
+                    panic!("a completions request sends a generation job");
+                };
                 let max_new = job.max_new;
                 job.reply
-                    .send(GenEvent::Done(vec![1, 2, 3], vec![], true))
+                    .send(GenEvent::Done(Completion {
+                        prompt_tokens: 1,
+                        tokens: vec![1, 2, 3],
+                        text: "abc".into(),
+                        logprobs: vec![],
+                        finish: FinishReason::Eos,
+                    }))
                     .unwrap();
                 handler
                     .join()
@@ -359,13 +366,6 @@ fn guided_decode_error_classifies_400_other_errors_stay_500() {
     assert_eq!(ty, "server_error");
 }
 
-fn tiny_text_only_runner() -> Arc<ModelHandle> {
-    let model_path = write_tiny_gguf();
-    let handle = load_handle(&model_path);
-    let _ = std::fs::remove_file(&model_path);
-    handle
-}
-
 fn chat_req_with_part(part: &str) -> ChatReq {
     serde_json::from_str(&format!(
         r#"{{"messages":[{{"role":"user","content":[{{"type":"text","text":"describe"}},{part}]}}]}}"#
@@ -373,14 +373,14 @@ fn chat_req_with_part(part: &str) -> ChatReq {
     .expect("chat request with a content part parses")
 }
 
-/// Card 573: a request part whose modality the loaded model has no front end for is refused with a typed
-/// error naming the modality, before any job reaches the engine. Without the check the part is dropped and
-/// the model answers a different request than the one sent. The decision is the model's capability
-/// (`ModelHandle::accepts_modality`), so the same tiny text decoder refuses each of these.
+/// Card 573: a request part whose modality the driver has no input for is refused with a typed error
+/// naming the modality, before any job reaches the engine. Without the check the part is dropped and the
+/// model answers a different request than the one sent. The decision reads what the driver prepared
+/// (`DriverCaps::inputs`), so the same tokens-only caps refuse each of these.
 #[test]
-fn text_only_model_refuses_an_image_audio_video_or_unknown_part_with_a_typed_error() {
-    let runner = tiny_text_only_runner();
-    assert!(runner.accepts_modality(poot_llm::Modality::Text));
+fn a_driver_with_only_token_inputs_refuses_an_image_audio_video_or_unknown_part_with_a_typed_error()
+{
+    let runner = tiny_model();
     for (part, modality) in [
         (
             r#"{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}"#,
@@ -396,10 +396,10 @@ fn text_only_model_refuses_an_image_audio_video_or_unknown_part_with_a_typed_err
         let req = chat_req_with_part(part);
         let metrics = Arc::new(test_metrics("modality-refusal"));
         // No engine listens: a request that got past the refusal fails at the send instead of hanging.
-        let (job_tx, job_rx) = mpsc::channel::<Job>();
+        let (served, job_rx) = served_over(Arc::clone(&runner), 1);
         drop(job_rx);
-        let error = handle_chat(Some(&job_tx), &runner, &metrics, &req, &|| false)
-            .expect_err("a part the model cannot take must be refused, not ignored");
+        let error = handle_chat(&served, &metrics, &req, &|| false)
+            .expect_err("a part the driver cannot take must be refused, not ignored");
         let refusal = error
             .downcast_ref::<UnsupportedCapabilityError>()
             .unwrap_or_else(|| panic!("{modality}: expected the typed refusal, got {error:#}"));
@@ -417,19 +417,38 @@ fn text_only_model_refuses_an_image_audio_video_or_unknown_part_with_a_typed_err
 }
 
 #[test]
-fn text_only_model_still_takes_a_text_only_part_array() {
-    let runner = tiny_text_only_runner();
+fn a_text_only_part_array_is_accepted() {
     let req: ChatReq = serde_json::from_str(
         r#"{"messages":[{"role":"user","content":[{"type":"text","text":"describe"}]}]}"#,
     )
     .expect("text part array parses");
-    reject_unsupported_modality(&runner, &req).expect("text parts are accepted");
+    reject_unsupported_modality(false, &req).expect("text parts are accepted");
+}
+
+/// The image decision is whether the served checkpoint has an image front end: without one an image is
+/// the typed refusal naming that, and with one the image part is taken while audio, video and unknown
+/// parts are still refused. Never a dropped part.
+#[test]
+fn an_image_part_is_taken_only_by_a_model_with_an_image_front_end() {
+    let image = chat_req_with_part(
+        r#"{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}"#,
+    );
+    let refusal = reject_unsupported_modality(false, &image).expect_err("no image front end");
+    assert_eq!(
+        classify_handler_error(&refusal),
+        (400, "unsupported_capability")
+    );
+    assert!(refusal.to_string().contains("image front end"), "{refusal}");
+    reject_unsupported_modality(true, &image).expect("an image front end takes the image part");
+    let audio = chat_req_with_part(r#"{"type":"input_audio","input_audio":{"data":"AAAA"}}"#);
+    let refusal = reject_unsupported_modality(true, &audio).expect_err("no audio front end");
+    assert!(refusal.to_string().contains("audio"), "{refusal}");
 }
 
 /// The streaming route refuses before it sends the 200 headers.
 #[test]
 fn streaming_chat_refuses_an_unsupported_part_before_the_200_headers() {
-    let runner = tiny_text_only_runner();
+    let runner = tiny_model();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let mut client = TcpStream::connect(listener.local_addr().unwrap()).expect("connect");
     client
@@ -438,13 +457,13 @@ fn streaming_chat_refuses_an_unsupported_part_before_the_200_headers() {
     let (mut server, _) = listener.accept().expect("accept");
     let metrics = Arc::new(test_metrics("modality-refusal-stream"));
     // No engine listens: a request that got past the refusal fails at the send instead of hanging.
-    let (job_tx, job_rx) = mpsc::channel::<Job>();
+    let (served, job_rx) = served_over(runner, 1);
     drop(job_rx);
     let mut req = chat_req_with_part(
         r#"{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}"#,
     );
     req.stream = true;
-    stream_chat(&mut server, Some(&job_tx), &runner, &metrics, &req)
+    stream_chat(&mut server, &served, &metrics, &req)
         .expect("the refusal is a written error response, not a handler failure");
     drop(server);
     let mut response = String::new();

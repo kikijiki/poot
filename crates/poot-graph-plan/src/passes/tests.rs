@@ -1607,104 +1607,104 @@ fn adr0099_s2_stage_graphs_partition_every_equation_and_validate() {
         (vec![3usize, 6], 2usize, vec![vec![0], vec![1], vec![2]]),
     ] {
         let assignment =
-            StageAssignment::from_cuts(&cuts, graph.eqns.len()).expect("the cuts are legal");
+            crate::test_support::assignment_before(&graph, &cuts).expect("the cuts are legal");
         let split = split_stages(&graph, &assignment).expect("the graph splits");
         assert_eq!(split.stages.len(), cuts.len() + 1);
         assert_eq!(split.boundaries.len(), expected_boundaries);
 
-        // Every equation lands in exactly one stage, in order, and none is invented.
+        // Every equation lands in exactly one stage, in order, and none is invented. Stage graphs
+        // renumber their values, so the equations are compared by operation and layer, not by id.
+        let shape_of = |graph: &Graph| -> Vec<String> {
+            graph
+                .eqns
+                .iter()
+                .map(|eqn| format!("{:?}/{:?}", eqn.op, eqn.layer))
+                .collect()
+        };
         let mut seen = Vec::new();
         for stage in &split.stages {
-            seen.extend(stage.graph.eqns.iter().map(|eqn| eqn.out));
+            seen.extend(shape_of(&stage.graph));
         }
-        assert_eq!(
-            seen,
-            graph.eqns.iter().map(|eqn| eqn.out).collect::<Vec<_>>()
-        );
+        assert_eq!(seen, shape_of(&graph));
 
-        // Carried state stays whole: stage `s` owns exactly the pairs listed for it, and a pair the
-        // stage does not own never reaches its binding tables.
+        // Carried state stays whole: stage `s` owns exactly the pairs listed for it (by declared
+        // name), and a pair the stage does not own never reaches its binding tables.
+        let state_name = |graph: &Graph, id: ValueId| graph.meta(id).name.clone().unwrap();
         for (stage_index, stage) in split.stages.iter().enumerate() {
-            let owned: Vec<(usize, (ValueId, ValueId))> = graph
+            let owned: Vec<String> = stage
+                .graph
                 .state
                 .iter()
-                .enumerate()
-                .filter(|&(pair, _)| stage.graph.state.contains(&graph.state[pair]))
-                .map(|(pair, &entry)| (pair, entry))
+                .map(|&(state_input, _)| state_name(&stage.graph, state_input))
+                .collect();
+            let expected: Vec<String> = expected_pairs[stage_index]
+                .iter()
+                .map(|&pair| state_name(&graph, graph.state[pair].0))
                 .collect();
             assert_eq!(
-                owned,
-                expected_pairs[stage_index]
-                    .iter()
-                    .map(|&pair| (pair, graph.state[pair]))
-                    .collect::<Vec<_>>(),
+                owned, expected,
                 "stage {stage_index} owns its own carried state"
             );
-            let foreign: Vec<ValueId> = graph
-                .state
+            let bound_state: Vec<String> = stage
+                .graph
+                .inputs
                 .iter()
-                .flat_map(|&(state_input, _)| [state_input])
-                .filter(|value| stage.graph.inputs.contains(value))
-                .filter(|value| {
-                    !expected_pairs[stage_index]
-                        .iter()
-                        .any(|&p| graph.state[p].0 == *value)
-                })
+                .filter(|&&id| stage.graph.meta(id).storage == Storage::State)
+                .map(|&id| state_name(&stage.graph, id))
                 .collect();
-            assert!(
-                foreign.is_empty(),
-                "stage {stage_index} must not bind another stage's cache: {foreign:?}"
+            assert_eq!(
+                bound_state, expected,
+                "stage {stage_index} must not bind another stage's cache"
             );
         }
 
-        // Each crossing value is an equation result of its producer and an activation input of every
-        // consumer, explicitly listed in both places.
+        // Each crossing value is an equation result of its producer, an explicit export there, and a
+        // keyed activation input of every consumer.
         for boundary in &split.boundaries {
-            let producer = &split.stages[boundary.producing_stage];
+            let producer = &split.stages[boundary.producing_stage].graph;
+            let export = producer
+                .exports
+                .iter()
+                .find(|export| export.id == boundary.id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{:?} is an explicit export of stage {}",
+                        boundary.id, boundary.producing_stage
+                    )
+                });
             assert!(
-                producer.outputs.contains(&boundary.value),
-                "v{} is an explicit output of stage {}",
-                boundary.value,
-                boundary.producing_stage
+                producer.eqns.iter().any(|eqn| eqn.out == export.value),
+                "the producing stage still defines {:?}",
+                boundary.id
             );
-            assert!(
-                producer
-                    .graph
-                    .eqns
-                    .iter()
-                    .any(|eqn| eqn.out == boundary.value),
-                "the producing stage still defines v{}",
-                boundary.value
-            );
-            assert_eq!(
-                producer.graph.values[boundary.value].storage,
-                Storage::Device
-            );
+            assert_eq!(producer.values[export.value].storage, Storage::Device);
             for &consumer in &boundary.consuming_stages {
-                let stage = &split.stages[consumer];
-                assert!(
-                    stage.graph.inputs.contains(&boundary.value),
-                    "v{} is an explicit input of stage {consumer}",
-                    boundary.value
-                );
+                let stage = &split.stages[consumer].graph;
+                let input = stage
+                    .inputs
+                    .iter()
+                    .copied()
+                    .find(|&id| stage.meta(id).slot_key() == Some(&boundary.id.slot_key()))
+                    .unwrap_or_else(|| {
+                        panic!("{:?} is an explicit input of stage {consumer}", boundary.id)
+                    });
                 assert_eq!(
-                    stage.graph.values[boundary.value].storage,
+                    stage.values[input].storage,
                     Storage::Slot(poot_graph_ir::graph::Slot::Activation),
-                    "v{} is bound as an activation input of stage {consumer}",
-                    boundary.value
+                    "{:?} is bound as an activation input of stage {consumer}",
+                    boundary.id
                 );
                 assert!(
                     stage
-                        .graph
                         .slots
-                        .contains(&(boundary.value, poot_graph_ir::graph::Slot::Activation)),
-                    "v{} has a slot binding in stage {consumer}",
-                    boundary.value
+                        .contains(&(input, poot_graph_ir::graph::Slot::Activation)),
+                    "{:?} has a slot binding in stage {consumer}",
+                    boundary.id
                 );
                 assert!(
-                    !stage.graph.eqns.iter().any(|eqn| eqn.out == boundary.value),
-                    "stage {consumer} reads v{}, it does not redefine it",
-                    boundary.value
+                    !stage.eqns.iter().any(|eqn| eqn.out == input),
+                    "stage {consumer} reads {:?}, it does not redefine it",
+                    boundary.id
                 );
             }
         }
@@ -1732,7 +1732,8 @@ fn adr0099_s2_boundary_descriptors_carry_dtype_shape_and_byte_len() {
     let graph = b.finish(out);
     assert_eq!(graph.eqns.len(), 9);
 
-    let assignment = StageAssignment::from_cuts(&[4], graph.eqns.len()).expect("the cut is legal");
+    let assignment =
+        crate::test_support::assignment_before(&graph, &[4]).expect("the cut is legal");
     let split = split_stages(&graph, &assignment).expect("the graph splits");
 
     // Four values are produced in stage 0, but `dense` is read only there, so exactly three cross -
@@ -1749,7 +1750,7 @@ fn adr0099_s2_boundary_descriptors_carry_dtype_shape_and_byte_len() {
         .iter()
         .map(|boundary| {
             (
-                boundary.value,
+                boundary.id.0,
                 boundary.aval.dtype,
                 boundary.byte_len,
                 boundary.producing_stage,
@@ -1787,7 +1788,8 @@ fn adr0099_s2_state_pair_split_across_stages_is_rejected() {
     let k_out = b.binary(BinOp::Add, mid, mid);
     let graph = b.finish_with_state(k_out, &[(k_in, k_out)]);
 
-    let assignment = StageAssignment::from_cuts(&[1], graph.eqns.len()).expect("the cut is legal");
+    let assignment =
+        crate::test_support::assignment_before(&graph, &[1]).expect("the cut is legal");
     assert_eq!(
         split_stages(&graph, &assignment).expect_err("the pair spans both stages"),
         StageSplitError::StatePairSplit {
@@ -1798,6 +1800,20 @@ fn adr0099_s2_state_pair_split_across_stages_is_rejected() {
             second_stage: 1,
         }
     );
+}
+
+/// Four chained equations, for cut-position errors.
+fn four_eqn_graph() -> Graph {
+    let b = Builder::new();
+    let x = b.slot(
+        poot_graph_ir::graph::Slot::Activation,
+        TensorType::f32(vec![4]),
+    );
+    let mut hidden = x;
+    for _ in 0..4 {
+        hidden = b.binary(BinOp::Add, hidden, x);
+    }
+    b.finish(hidden)
 }
 
 #[test]
@@ -1833,7 +1849,8 @@ fn adr0099_s2_assignment_must_be_contiguous_and_cover_the_graph() {
         }
     );
     assert_eq!(
-        StageAssignment::from_cuts(&[0], 4).expect_err("a cut at 0 empties the first stage"),
+        crate::test_support::assignment_before(&four_eqn_graph(), &[0])
+            .expect_err("a cut at 0 empties the first stage"),
         StageSplitError::CutOutOfRange {
             index: 0,
             cut: 0,
@@ -1841,7 +1858,8 @@ fn adr0099_s2_assignment_must_be_contiguous_and_cover_the_graph() {
         }
     );
     assert_eq!(
-        StageAssignment::from_cuts(&[4], 4).expect_err("a cut at the end empties the last stage"),
+        crate::test_support::assignment_before(&four_eqn_graph(), &[4])
+            .expect_err("a cut at the end empties the last stage"),
         StageSplitError::CutOutOfRange {
             index: 0,
             cut: 4,
@@ -1849,7 +1867,8 @@ fn adr0099_s2_assignment_must_be_contiguous_and_cover_the_graph() {
         }
     );
     assert_eq!(
-        StageAssignment::from_cuts(&[2, 2], 4).expect_err("cuts must strictly increase"),
+        crate::test_support::assignment_before(&four_eqn_graph(), &[2, 2])
+            .expect_err("cuts must strictly increase"),
         StageSplitError::CutOutOfOrder {
             index: 1,
             cut: 2,
@@ -1881,7 +1900,7 @@ fn adr0099_s2_a_stage_that_hands_off_nothing_is_rejected() {
     let graph = b.finish(out);
 
     let assignment =
-        StageAssignment::from_cuts(&[1, 2], graph.eqns.len()).expect("the cuts are legal");
+        crate::test_support::assignment_before(&graph, &[1, 2]).expect("the cuts are legal");
     assert_eq!(
         split_stages(&graph, &assignment)
             .expect_err("stage 1 reads only its own results, so it never feeds stage 2"),
@@ -1902,7 +1921,7 @@ fn adr0099_s2_a_final_stage_that_never_sees_the_output_is_rejected() {
     let graph = b.finish(t0);
 
     let assignment =
-        StageAssignment::from_cuts(&[1, 2], graph.eqns.len()).expect("the cuts are legal");
+        crate::test_support::assignment_before(&graph, &[1, 2]).expect("the cuts are legal");
     assert_eq!(
         split_stages(&graph, &assignment)
             .expect_err("the output is defined in stage 0 and reaches no later stage"),
@@ -1936,24 +1955,67 @@ fn adr0099_s2_each_stage_keeps_only_the_witnesses_it_defines() {
     )
     .expect("the witness values are f32 tensors");
 
-    let assignment = StageAssignment::from_cuts(&[2], graph.eqns.len()).expect("the cut is legal");
+    let assignment =
+        crate::test_support::assignment_before(&graph, &[2]).expect("the cut is legal");
     let split = split_stages(&graph, &assignment).expect("the graph splits");
 
-    let declarations = |stage: usize| -> Vec<(poot_graph_ir::ValidationId, &str, ValueId)> {
-        split.stages[stage]
-            .graph
-            .validation_outputs()
+    // Stage graphs renumber their values, so a witness is identified by what computes it: the
+    // producing equation's op and what each operand is (an equation's op, or the binder's storage).
+    fn describe<V: poot_graph_ir::ValidationChannel>(graph: &Graph<V>, value: ValueId) -> String {
+        match graph.eqns.iter().find(|eqn| eqn.out == value) {
+            Some(eqn) => format!("{:?}", eqn.op),
+            None => format!("{:?}", graph.meta(value).storage),
+        }
+    }
+    fn computation<V: poot_graph_ir::ValidationChannel>(
+        graph: &Graph<V>,
+        value: ValueId,
+    ) -> (String, Vec<String>) {
+        let eqn = graph
+            .eqns
             .iter()
-            .map(|declaration| (declaration.id, declaration.name.as_str(), declaration.value))
-            .collect()
-    };
+            .find(|eqn| eqn.out == value)
+            .expect("a witness is an equation result");
+        let operands = eqn
+            .inputs
+            .iter()
+            .map(|operand| match operand {
+                poot_graph_ir::Operand::Value(v) => describe(graph, *v),
+                poot_graph_ir::Operand::Lit(scalar) => format!("{scalar:?}"),
+            })
+            .collect();
+        (format!("{:?}", eqn.op), operands)
+    }
+    let declarations =
+        |stage: usize| -> Vec<(poot_graph_ir::ValidationId, String, (String, Vec<String>))> {
+            let stage_graph = &split.stages[stage].graph;
+            stage_graph
+                .validation_outputs()
+                .iter()
+                .map(|declaration| {
+                    (
+                        declaration.id,
+                        declaration.name.clone(),
+                        computation(stage_graph, declaration.value),
+                    )
+                })
+                .collect()
+        };
     assert_eq!(
         declarations(0),
-        vec![(ValidationId(1), "stage0_witness", w0.id)]
+        vec![(
+            ValidationId(1),
+            "stage0_witness".to_owned(),
+            computation(&graph, w0.id)
+        )]
     );
     assert_eq!(
         declarations(1),
-        vec![(ValidationId(2), "stage1_witness", w1.id)]
+        vec![(
+            ValidationId(2),
+            "stage1_witness".to_owned(),
+            computation(&graph, w1.id)
+        )]
     );
 }
 
@@ -2015,7 +2077,8 @@ fn adr0099_s2_layer_scope_tags_equations_and_layer_cuts_split_between_layers() {
 
     // `after_layer = [0, 1]` is the cut list a three-device plan records; each cut lands on the
     // first equation of the next layer, so the preamble rides stage 0 and the head the last stage.
-    let split = split_stages_after_layers(&graph, &[0, 1]).expect("both cuts map onto a boundary");
+    let split = crate::test_support::split_after_layers(&graph, &[0, 1])
+        .expect("both cuts map onto a boundary");
     let per_stage: Vec<Vec<Option<usize>>> = split
         .stages
         .iter()
@@ -2040,7 +2103,7 @@ fn adr0099_s2_layer_scope_tags_equations_and_layer_cuts_split_between_layers() {
     );
 
     // A single cut after layer 0: stage 0 holds layer 0, stage 1 everything from layer 1 on.
-    let two = split_stages_after_layers(&graph, &[0]).expect("after_layer 0 maps");
+    let two = crate::test_support::split_after_layers(&graph, &[0]).expect("after_layer 0 maps");
     assert_eq!(two.stages.len(), 2);
     assert_eq!(
         layer_tags(&two.stages[0].graph),
@@ -2083,7 +2146,7 @@ fn adr0099_s2_layer_cut_errors_are_typed() {
     let holey = b.finish(in_layer_one);
     let _ = in_layer_zero;
     assert_eq!(
-        StageAssignment::from_layer_cuts(&holey, &[0]),
+        crate::test_support::assignment_after_layers(&holey, &[0]),
         Err(StageSplitError::LayerTags(LayerTagError::Untagged {
             equation: 1
         }))
@@ -2105,7 +2168,7 @@ fn adr0099_s2_layer_cut_errors_are_typed() {
     };
     let skipped = b.finish(skipped);
     assert_eq!(
-        StageAssignment::from_layer_cuts(&skipped, &[0]),
+        crate::test_support::assignment_after_layers(&skipped, &[0]),
         Err(StageSplitError::LayerTags(LayerTagError::NonContiguous {
             equation: 1,
             layer: 2,
@@ -2125,7 +2188,7 @@ fn adr0099_s2_layer_cut_errors_are_typed() {
     };
     let started_at_one = b.finish(started_at_one);
     assert_eq!(
-        StageAssignment::from_layer_cuts(&started_at_one, &[]),
+        crate::test_support::assignment_after_layers(&started_at_one, &[0]),
         Err(StageSplitError::LayerTags(LayerTagError::NonContiguous {
             equation: 0,
             layer: 1,
@@ -2136,9 +2199,9 @@ fn adr0099_s2_layer_cut_errors_are_typed() {
     // A cut past the last layer would produce an empty stage, and a cut on an untagged graph has
     // no layer to land on at all. (A cut at layer 1 of three is legal - it separates 1 from 2.)
     let tagged = layer_scoped_graph();
-    assert!(StageAssignment::from_layer_cuts(&tagged, &[1]).is_ok());
+    assert!(crate::test_support::assignment_after_layers(&tagged, &[1]).is_ok());
     assert_eq!(
-        StageAssignment::from_layer_cuts(&tagged, &[2]),
+        crate::test_support::assignment_after_layers(&tagged, &[2]),
         Err(StageSplitError::LayerCutOutOfRange { cut: 2, layers: 3 })
     );
     let b = Builder::new();
@@ -2149,17 +2212,17 @@ fn adr0099_s2_layer_cut_errors_are_typed() {
     let untagged_value = b.binary(BinOp::Add, x, x);
     let untagged = b.finish(untagged_value);
     assert_eq!(
-        StageAssignment::from_layer_cuts(&untagged, &[0]),
+        crate::test_support::assignment_after_layers(&untagged, &[0]),
         Err(StageSplitError::LayerCutOutOfRange { cut: 0, layers: 0 })
     );
 
-    // Cuts must also strictly increase, the same contract `from_cuts` enforces.
+    // Cuts must also strictly increase, the same contract an equation cut enforces.
     assert_eq!(
-        StageAssignment::from_layer_cuts(&tagged, &[0, 0]),
+        crate::test_support::assignment_after_layers(&tagged, &[0, 0]),
         Err(StageSplitError::CutOutOfOrder {
             index: 1,
-            cut: 0,
-            previous: 0,
+            cut: 5,
+            previous: 5,
         })
     );
 }
@@ -2198,7 +2261,7 @@ fn adr0099_s2_cse_and_dce_preserve_layer_tags() {
 
     // Preserved tags mean a layer cut still maps on the transformed graphs.
     for (label, transformed) in [("cse", &folded), ("dce", &trimmed)] {
-        let split = split_stages_after_layers(transformed, &[0, 1])
+        let split = crate::test_support::split_after_layers(transformed, &[0, 1])
             .unwrap_or_else(|error| panic!("{label} must keep the tags a cut maps onto: {error}"));
         assert_eq!(split.stages.len(), 3, "{label} keeps three layers");
         assert_eq!(

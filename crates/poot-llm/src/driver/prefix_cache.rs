@@ -61,6 +61,9 @@ pub enum PrefixSkip {
     NoBlockTable,
     /// A preempted sequence is recomputed; its blocks go back to the pool.
     Preempted,
+    /// The prompt carries embedding rows, so its K/V is not a function of its tokens, the only thing
+    /// the cache keys on.
+    PromptEmbeds,
 }
 
 /// Automatic prefix cache (card 046c): the KV blocks of a shared prompt prefix are reused across

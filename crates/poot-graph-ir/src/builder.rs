@@ -508,7 +508,7 @@ impl Builder {
     /// }
     /// ```
     ///
-    /// The tag is what `poot-graph-plan`'s `split_stages_after_layers` maps a placement's
+    /// The tag is what `poot-graph-plan`'s `StageAssignment::from_sites` maps a placement's
     /// `after_layer` cut onto. It covers equations only: constants, slots and state binders created
     /// inside the scope stay untagged, because a layer cut never falls between a binder and its
     /// readers.

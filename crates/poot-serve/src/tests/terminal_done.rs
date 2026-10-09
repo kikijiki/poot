@@ -34,7 +34,7 @@ fn the_loops_terminal_done_publishes_its_count_before_the_event_is_delivered() {
             let Submitted { replies, .. } = submitted;
             let replies = receiver_alive.then_some(replies);
             let (tx, rx) = mpsc::channel();
-            tx.send(job).unwrap();
+            tx.send(EngineMsg::Generate(Box::new(job))).unwrap();
             drop(tx);
             let metrics = test_metrics(&label);
             run_engine(&mut engine, &rx, &metrics);

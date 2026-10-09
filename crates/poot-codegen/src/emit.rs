@@ -1,5 +1,6 @@
 //! Body -> textual LLVM IR, for the SPIR-V (Vulkan resource shape) and NVPTX (raw-pointer shape)
-//! targets, plus AMDGPU and AIE core. One target-branched walk: the block/statement/operand/binop logic is
+//! targets, plus AMDGPU and AIE core (the `AieCore` branches are retained but inactive: nothing in the
+//! pipeline compiles for it, POOT-1093). One target-branched walk: the block/statement/operand/binop logic is
 //! shared; the leaves that differ (usize width, buffer access, thread-id intrinsics, the length source, the
 //! signature, the footer) branch on `Target`. Alloca-form + plain branches throughout (llc's mem2reg/SROA does
 //! SSA construction and phi insertion); only SPIR-V resource handles stay SSA-direct in the entry block,

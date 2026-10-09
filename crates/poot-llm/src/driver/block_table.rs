@@ -244,6 +244,22 @@ impl PagedKvCache {
         Ok(skip)
     }
 
+    /// Admit a sequence into slot `s` with fresh blocks only: no prefix lookup. For a prompt whose K/V
+    /// is not a function of its tokens alone (it carries embedding rows), which the token-keyed prefix
+    /// cache must neither serve nor learn. All-or-nothing, like [`Self::admit_prefix_for`]; release it
+    /// with [`Self::reset`], which registers nothing.
+    pub fn admit_unshared(
+        &mut self,
+        s: usize,
+        prompt_len: usize,
+        max_new: usize,
+    ) -> Result<(), PoolExhausted> {
+        let mut table = BlockTable::new();
+        table.extend(prompt_len + max_new, &mut self.pool)?;
+        self.tables[s] = table;
+        Ok(())
+    }
+
     /// Finish slot `s`: register its (now-filled) prompt prefix blocks for future reuse under the
     /// effective-weights `identity`, then free the slot's references (registered prefix blocks survive in
     /// the cache; the tail + generation blocks return to the pool). `prompt` is the slot's prompt tokens.

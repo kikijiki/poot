@@ -272,3 +272,25 @@ fn batched_multi_block_wmma_matmul_matches_the_oracle_on_ptx() {
     poot_executor_parity::run_parity(exec.as_mut(), t, &fixture, &mut oracle)
         .unwrap_or_else(|e| panic!("{e}"));
 }
+
+/// POOT-1074: a recurrent state pool addressed by slot (rows in any order, a masked row committing
+/// nothing) and `reset_state(Row(n))` zeroing exactly pool row `n`, on PTX; a row outside the pool is a
+/// typed `StateRow` refusal that zeroes nothing.
+/// The pool runs over F32 and over I32 (the PLE token history), and a `Positional` counter beside it must
+/// survive every `Row`; the I32 run puts values above 2^24 in the pool, so it also proves the pool stays on
+/// the exact lane. Mutations: write the row at offset 0 instead of `row * bytes` in `Engine::reset_state`
+/// (the rows after `Row(2)` continue from slot 2's old state); let `Row` zero every state (the counter
+/// resets); drop the fixture's own `b.scatter_update` for the I32 pool (`state_row.rs`; the pool never
+/// changes); pin the I32 values to the F32 mirror lane (`required` always false in
+/// `ExactI32StorageAnalysis::new`; `2^24 + 1` reads back as `2^24`). `Step::carry_recurrent`'s I32 path is
+/// guarded by `served_qwen4exp_*`, not by this row.
+#[test]
+fn state_pool_rows_reset_independently_on_ptx() {
+    let Some(device) = open_or_skip(DeviceBackend::Ptx, PtxDevice::new()) else {
+        return;
+    };
+    let t = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    poot_executor_parity::state_row::run_state_pool_row_reset(exec.as_mut(), t)
+        .unwrap_or_else(|e| panic!("{e}"));
+}

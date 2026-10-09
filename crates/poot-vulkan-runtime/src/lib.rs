@@ -129,6 +129,9 @@ pub struct Context {
     /// matrix (tensor-core) hardware from the `VK_KHR_cooperative_matrix` query: [`Context::device_caps`]
     /// returns this stored value, never re-queries the driver.
     device_caps: poot_target::DeviceCaps,
+    /// `VK_EXT_memory_budget` is enabled on the device: [`Context::free_memory_bytes`] can read the live
+    /// heap budget. Without it the runtime cannot say, and reports no budget.
+    memory_budget: bool,
     /// Pipeline/module cache keyed by the caller's kernel key (see the module doc), used by `Context::pipeline`.
     pipeline_cache: HashMap<String, Arc<Pipeline>>,
     /// Count of pipeline builds (cache misses) via `Context::pipeline`, like `poot-runtime`'s `pipeline_builds()`.

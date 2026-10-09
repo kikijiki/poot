@@ -1,33 +1,37 @@
 //! ADR-0099 S2: the backend-neutral stage split - one traced graph in, one graph per stage plus
 //! the values that cross between them.
 //!
-//! # Two ways to say where the cuts are
+//! # Where the cuts are
 //!
-//! [`StageAssignment`] (from [`StageAssignment::from_stage_per_equation`] or
-//! [`StageAssignment::from_cuts`]) is a stage index per traced equation, validated as
-//! **contiguous**: stage `s` owns one non-empty run of the equation list, the runs appear in order
-//! (`0, 0, .., 1, 1, .., 2, ..`), and every stage id is used.
+//! [`StageAssignment::from_sites`] is the one constructor. It takes [`CutSite`]s: a
+//! [`CutSite::AfterLayer`] is exactly what a layer-pipeline placement's `after_layer` boundaries
+//! record and maps through [`Graph::layer_runs`] onto the first equation tagged with the next layer;
+//! a [`CutSite::Before`] names the first equation of the next stage directly. The result is a stage
+//! index per traced equation, validated as **contiguous**: stage `s` owns one non-empty run of the
+//! equation list, the runs appear in order (`0, 0, .., 1, 1, .., 2, ..`), and every stage id is used.
 //!
-//! [`split_stages_after_layers`] is the placement-facing entry: it takes `after_layer` cut indices -
-//! exactly what a layer-pipeline placement's `after_layer` boundaries record - and
-//! maps each cut onto the first equation tagged with the next layer. The tags come from
-//! [`poot_graph_ir::Builder::layer_scope`], which tracers wrap around their layer loop, so the cut list
-//! needs no name inference and no per-family equation index. What a family supplies is the placement
-//! it already supplied; the tracer's own loop reports where its layers are.
-//!
-//! Layer tags are checked, not trusted: [`Graph::layer_runs`] refuses an untagged equation between the
-//! first and last tagged one and layer ids that are not one run per layer in order (both reach the
-//! caller as [`StageSplitError::LayerTags`]), and a cut with no layer after it is
+//! The layer tags come from [`poot_graph_ir::Builder::layer_scope`], which tracers wrap around their
+//! layer loop, so the cut list needs no name inference and no per-family equation index. Layer tags
+//! are checked, not trusted: [`Graph::layer_runs`] refuses an untagged equation between the first and
+//! last tagged one and layer ids that are not one run per layer in order (both reach the caller as
+//! [`StageSplitError::LayerTags`]), and a cut with no layer after it is
 //! [`StageSplitError::LayerCutOutOfRange`]. Untagged equations *outside* the layer region - the
 //! graph-wide preamble and the head - are expected and belong to the first and last stage.
 //!
 //! # What crosses
 //!
-//! A boundary value is an equation result read by an equation in a different stage. It becomes an
-//! explicit output of the producing stage ([`StageGraph::outputs`]) and an explicit input of every
-//! consuming stage, retagged as [`Slot::Activation`] there. Graph input binders (constants, slots,
-//! carried state) are **not** boundary values: each stage binds the ones it reads itself, which is
-//! how a replicated weight or a per-replay slot reaches a device without a transfer.
+//! A boundary value is an equation result read by an equation in a different stage. It is named by
+//! its [`BoundaryId`] (the value's id in the uncut graph), becomes an explicit export of the producing
+//! stage ([`Graph::exports`], a liveness root every pass keeps and remaps) and an explicit input of
+//! every consuming stage, a [`Slot::Activation`] keyed by [`BoundaryId::slot_key`] so it never collides
+//! with a stage's own activation input. Graph input binders (constants, slots, carried state) are
+//! **not** boundary values: each stage binds the ones it reads itself, which is how a replicated
+//! weight or a per-replay slot reaches a device without a transfer.
+//!
+//! Each stage graph owns a compact value table: only the values the stage binds, produces, reads,
+//! exports or carries, renumbered in the uncut graph's order. The total across stages is the uncut
+//! graph plus the explicit boundary copies, never stages times values. The [`BoundaryId`] and the
+//! slot key, not the value id, are the names that survive the renumbering.
 //!
 //! Carried state stays whole: a `(state_in, state_out)` pair whose equations span two stages is
 //! [`StageSplitError::StatePairSplit`]. Each stage's graph keeps only the pairs it owns, so a KV
@@ -51,31 +55,45 @@
 //! wrote or refuses with a typed error. It never guesses a cut, and no pass silently moves an
 //! equation across a layer.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 
 use poot_graph_ir::Operand;
 use poot_graph_ir::error::GraphValidationError;
 use poot_graph_ir::graph::ValueId;
 use poot_graph_ir::graph::{
-    Eqn, Graph, LayerIndex, LayerTagError, NoValidations, Slot, Storage, ValidationChannel,
+    BoundaryId, Eqn, Export, Graph, LayerTagError, NoValidations, Slot, ValidationChannel,
+    ValueMeta,
 };
 use poot_graph_ir::types::TensorType;
+
+/// Where one stage ends and the next begins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CutSite {
+    /// After layer `k`: the next stage starts at the first equation tagged with layer `k + 1`
+    /// (a layer-pipeline placement's `after_layer`).
+    AfterLayer(usize),
+    /// Before equation `e` of the traced list: equation `e` is the first of the next stage.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "held for POOT-746: pool segmentation cuts by equation"
+        )
+    )]
+    Before(usize),
+}
 
 /// A stage assignment over the traced equation list: one contiguous, non-empty run of equations per
 /// stage, runs in stage order.
 ///
-/// Build it with [`StageAssignment::from_stage_per_equation`] (one index per equation) or
-/// [`StageAssignment::from_cuts`] (the first equation of each stage after the first).
+/// Build it with [`StageAssignment::from_sites`] (the cuts) or
+/// [`StageAssignment::from_stage_per_equation`] (one index per equation).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StageAssignment {
     stage_of_eqn: Vec<usize>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "held for POOT-745 (formerly 581a)")
-)]
 impl StageAssignment {
     /// Assign each equation a stage index. Rejects a sequence that is not `0, 0, .., 1, 1, ..`: a
     /// stage must be one run, runs must be in order and adjacent, and the first equation must be in
@@ -87,12 +105,35 @@ impl StageAssignment {
         })
     }
 
-    /// Cut points in the traced equation order: `cuts[i]` is the first equation of stage `i + 1`, so
-    /// `eqn_count` equations become `cuts.len() + 1` stages. This is the form a layer-pipeline
-    /// placement (`after_layer` cuts) maps to once the tracer reports each layer's first equation.
-    pub(crate) fn from_cuts(cuts: &[usize], eqn_count: usize) -> Result<Self, StageSplitError> {
-        let mut previous = 0;
-        for (index, &cut) in cuts.iter().enumerate() {
+    /// Cut `g` at `sites`, in order: `sites.len() + 1` stages. Every site resolves to the first
+    /// equation of the stage it opens; those positions must lie strictly inside the equation list
+    /// and strictly increase, so no stage is empty.
+    pub(crate) fn from_sites<V: ValidationChannel>(
+        g: &Graph<V>,
+        sites: &[CutSite],
+    ) -> Result<Self, StageSplitError> {
+        let eqn_count = g.eqns.len();
+        let runs = if sites.iter().any(|s| matches!(s, CutSite::AfterLayer(_))) {
+            Some(g.layer_runs()?)
+        } else {
+            None
+        };
+        let mut cuts = Vec::with_capacity(sites.len());
+        for (index, site) in sites.iter().enumerate() {
+            let cut = match (*site, &runs) {
+                (CutSite::Before(equation), _) => equation,
+                (CutSite::AfterLayer(layer), Some(runs)) => {
+                    runs.runs.get(layer + 1).map(|run| run.start).ok_or(
+                        StageSplitError::LayerCutOutOfRange {
+                            cut: layer,
+                            layers: runs.layers,
+                        },
+                    )?
+                }
+                (CutSite::AfterLayer(_), None) => {
+                    unreachable!("layer runs are read for a layer cut")
+                }
+            };
             if cut == 0 || cut >= eqn_count {
                 return Err(StageSplitError::CutOutOfRange {
                     index,
@@ -100,48 +141,7 @@ impl StageAssignment {
                     eqn_count,
                 });
             }
-            if cut <= previous {
-                return Err(StageSplitError::CutOutOfOrder {
-                    index,
-                    cut,
-                    previous,
-                });
-            }
-            previous = cut;
-        }
-        let stage_of_eqn: Vec<usize> = (0..eqn_count)
-            .map(|equation| cuts.iter().filter(|&&cut| cut <= equation).count())
-            .collect();
-        Self::from_stage_per_equation(&stage_of_eqn)
-    }
-
-    /// Cut at a placement's layer boundaries: `after_layers` holds one `StageBoundary::after_layer`
-    /// per boundary, and each cut lands on the first equation tagged with the next layer.
-    ///
-    /// This is the entry a caller holding a placement plan uses:
-    ///
-    /// ```ignore
-    /// let assignment = StageAssignment::from_layer_cuts(&graph, &plan.after_layer_cuts())?;
-    /// ```
-    ///
-    /// Layer tags come from [`poot_graph_ir::Builder::layer_scope`]. Untagged equations *inside* the layer
-    /// region, layer ids that do not run `0, 0, .., 1, 1, ..`, and a cut with no layer after it are
-    /// typed errors; untagged equations before the first layer (preamble) and after the last
-    /// (head) are expected and stay with the first and last stage.
-    pub(crate) fn from_layer_cuts<V: ValidationChannel>(
-        g: &Graph<V>,
-        after_layers: &[usize],
-    ) -> Result<Self, StageSplitError> {
-        let layer_of_eqn: Vec<Option<LayerIndex>> = g.eqns.iter().map(|eqn| eqn.layer).collect();
-        let first_tagged = layer_of_eqn.iter().position(Option::is_some);
-        let layers = g.layer_runs()?.layers;
-
-        let mut previous_cut: Option<usize> = None;
-        for (index, &cut) in after_layers.iter().enumerate() {
-            if cut >= layers.saturating_sub(1) {
-                return Err(StageSplitError::LayerCutOutOfRange { cut, layers });
-            }
-            if let Some(previous) = previous_cut
+            if let Some(&previous) = cuts.last()
                 && cut <= previous
             {
                 return Err(StageSplitError::CutOutOfOrder {
@@ -150,36 +150,21 @@ impl StageAssignment {
                     previous,
                 });
             }
-            previous_cut = Some(cut);
+            cuts.push(cut);
         }
-
-        let last_stage = after_layers.len();
-        let stage_of_eqn: Vec<usize> = layer_of_eqn
-            .iter()
-            .enumerate()
-            .map(|(equation, layer)| match layer {
-                // Preamble before the first tagged layer starts stage 0; head after the last one
-                // lands in the final stage; a tagged equation sits after every cut below its layer.
-                None => {
-                    if first_tagged.is_some_and(|first| equation < first) {
-                        0
-                    } else {
-                        last_stage
-                    }
-                }
-                Some(layer) => after_layers.iter().filter(|&&cut| cut < layer.0).count(),
-            })
+        let stage_of_eqn: Vec<usize> = (0..eqn_count)
+            .map(|equation| cuts.iter().filter(|&&cut| cut <= equation).count())
             .collect();
         Self::from_stage_per_equation(&stage_of_eqn)
     }
 
     /// Number of equations this assignment covers.
-    pub(crate) fn equation_count(&self) -> usize {
+    fn equation_count(&self) -> usize {
         self.stage_of_eqn.len()
     }
 
     /// Number of stages: the highest assigned stage index plus one.
-    pub(crate) fn stage_count(&self) -> usize {
+    fn stage_count(&self) -> usize {
         self.stage_of_eqn
             .last()
             .map(|&stage| stage + 1)
@@ -188,13 +173,13 @@ impl StageAssignment {
 
     /// The stage that owns equation `equation`. Indexes the equation list, so it panics out of range
     /// the same way `graph.eqns[equation]` does.
-    pub(crate) fn stage_of(&self, equation: usize) -> usize {
+    fn stage_of(&self, equation: usize) -> usize {
         self.stage_of_eqn[equation]
     }
 
     /// One `[start, end)` equation range per stage, in stage order; together the ranges partition
     /// `0..len()`.
-    pub(crate) fn stage_ranges(&self) -> Vec<Range<usize>> {
+    fn stage_ranges(&self) -> Vec<Range<usize>> {
         let mut ranges = Vec::with_capacity(self.stage_count());
         let mut start = 0;
         for equation in 1..self.stage_of_eqn.len() {
@@ -243,8 +228,9 @@ fn validate_stage_sequence(stage_of_eqn: &[usize]) -> Result<(), StageSplitError
 /// One value that crosses a stage boundary, in the order the producing equations appear.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoundaryDescriptor {
-    /// The value's id in the split graph and in every stage that defines or reads it.
-    pub value: ValueId,
+    /// The boundary's name: the value's id in the uncut graph. It names the producer's
+    /// [`Graph::exports`] entry and the consumers' [`BoundaryId::slot_key`] input in every stage.
+    pub id: BoundaryId,
     /// The value's dtype and shape, cloned from the producing graph.
     pub aval: TensorType,
     /// `aval.numel() * aval.dtype.byte_size()`, checked - the transfer size of this value.
@@ -254,32 +240,15 @@ pub struct BoundaryDescriptor {
     pub consuming_stages: Vec<usize>,
 }
 
-/// One stage of a split: its graph, and the boundary values it produces as explicit outputs.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "held for POOT-745 (formerly 581a)")
-)]
+/// One stage of a split: its graph, which exports the boundary values it produces
+/// ([`Graph::exports`], in producing-equation order; each is an input of the stages in
+/// [`BoundaryDescriptor::consuming_stages`]).
 #[derive(Clone, Debug)]
 pub(crate) struct StageGraph<V: ValidationChannel = NoValidations> {
-    #[cfg_attr(
-        test,
-        expect(
-            dead_code,
-            reason = "held for POOT-745 (formerly 581a) (its staged compile reads it)"
-        )
-    )]
-    pub stage: usize,
     pub graph: Graph<V>,
-    /// The crossing values this stage defines, in producing-equation order. Each is an input of the
-    /// stages in [`BoundaryDescriptor::consuming_stages`].
-    pub outputs: Vec<ValueId>,
 }
 
 /// The result of [`split_stages`]: one graph per stage plus the values that cross between them.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "held for POOT-745 (formerly 581a)")
-)]
 #[derive(Clone, Debug)]
 pub(crate) struct StageSplit<V: ValidationChannel = NoValidations> {
     pub stages: Vec<StageGraph<V>>,
@@ -288,7 +257,7 @@ pub(crate) struct StageSplit<V: ValidationChannel = NoValidations> {
 
 /// Split a traced graph into one graph per stage, following `assignment`.
 ///
-/// Every equation lands in exactly one stage; each crossing value becomes an explicit output of its
+/// Every equation lands in exactly one stage; each crossing value becomes an explicit export of its
 /// producing stage and an explicit input of its consumers; carried state stays with one stage. Each
 /// returned stage graph passes [`Graph::validate`].
 pub(crate) fn split_stages<V: ValidationChannel>(
@@ -341,7 +310,7 @@ pub(crate) fn split_stages<V: ValidationChannel>(
         let aval = g.aval(eqn.out).clone();
         let byte_len = tensor_byte_len(&aval, eqn.out)?;
         boundaries.push(BoundaryDescriptor {
-            value: eqn.out,
+            id: BoundaryId(eqn.out),
             aval,
             byte_len,
             // A boundary value is by construction defined by an equation.
@@ -360,9 +329,9 @@ pub(crate) fn split_stages<V: ValidationChannel>(
     for (pair, &owner) in pair_stage.iter().enumerate() {
         stage_state_pairs[owner].push(pair);
     }
-    let mut stage_outputs = vec![Vec::new(); stage_count];
+    let mut stage_exports = vec![Vec::new(); stage_count];
     for boundary in &boundaries {
-        stage_outputs[boundary.producing_stage].push(boundary.value);
+        stage_exports[boundary.producing_stage].push(boundary.id.0);
     }
 
     let mut input_binder = vec![false; g.values.len()];
@@ -373,12 +342,13 @@ pub(crate) fn split_stages<V: ValidationChannel>(
     let mut stages = Vec::with_capacity(stage_count);
     for (stage, range) in ranges.iter().enumerate() {
         let final_stage = stage + 1 == stage_count;
+        let eqns = &g.eqns[range.clone()];
 
         // What this stage binds: the graph inputs its own equations read, the carried state it owns,
         // the values earlier stages hand it, and (on the final stage) the graph output when that is
         // itself a binder.
         let mut bound: BTreeSet<ValueId> = BTreeSet::new();
-        for eqn in &g.eqns[range.clone()] {
+        for eqn in eqns {
             for operand in &eqn.inputs {
                 if let Operand::Value(value) = operand
                     && input_binder[*value]
@@ -394,48 +364,10 @@ pub(crate) fn split_stages<V: ValidationChannel>(
                 bound.insert(state_output);
             }
         }
-        bound.extend(stage_boundary_inputs[stage].iter().copied());
         if final_stage && input_binder[g.output] {
             bound.insert(g.output);
         }
 
-        let mut inputs: Vec<ValueId> = g
-            .inputs
-            .iter()
-            .copied()
-            .filter(|value| bound.contains(value))
-            .collect();
-        inputs.extend(stage_boundary_inputs[stage].iter().copied());
-
-        // A boundary value is an equation result, never an input binder (validation rejects an
-        // equation that redefines one), so retagging it as this stage's activation input is safe.
-        let mut values = g.values.clone();
-        for &value in &stage_boundary_inputs[stage] {
-            values[value].storage = Storage::Slot(Slot::Activation);
-        }
-        let consts: Vec<ValueId> = g
-            .consts
-            .iter()
-            .copied()
-            .filter(|value| bound.contains(value))
-            .collect();
-        let mut slots: Vec<(ValueId, Slot)> = g
-            .slots
-            .iter()
-            .copied()
-            .filter(|(value, _)| bound.contains(value))
-            .collect();
-        slots.extend(
-            stage_boundary_inputs[stage]
-                .iter()
-                .map(|&value| (value, Slot::Activation)),
-        );
-
-        let eqns: Vec<Eqn> = g.eqns[range.clone()].to_vec();
-        let state: Vec<(ValueId, ValueId)> = stage_state_pairs[stage]
-            .iter()
-            .map(|&pair| g.state[pair])
-            .collect();
         let output = if final_stage {
             g.output
         } else {
@@ -446,6 +378,111 @@ pub(crate) fn split_stages<V: ValidationChannel>(
                 .ok_or(StageSplitError::StageWithoutExit { stage })?
         };
 
+        // Witnesses stay with the piece of graph that defines them.
+        let mut defined: BTreeSet<ValueId> = bound.clone();
+        defined.extend(stage_boundary_inputs[stage].iter().copied());
+        defined.extend(eqns.iter().map(|eqn| eqn.out));
+        if final_stage && !defined.contains(&g.output) {
+            return Err(StageSplitError::FinalStageMissingOutput {
+                stage,
+                output: g.output,
+            });
+        }
+        let witnesses: Vec<ValueId> = g
+            .validation_outputs()
+            .iter()
+            .map(|declaration| declaration.value)
+            .filter(|value| defined.contains(value))
+            .collect();
+
+        // The compact value table: exactly the values this stage touches, in the uncut graph's order.
+        let mut used: BTreeSet<ValueId> = defined;
+        for eqn in eqns {
+            used.extend(eqn.inputs.iter().filter_map(|operand| match operand {
+                Operand::Value(value) => Some(*value),
+                Operand::Lit(_) => None,
+            }));
+        }
+        for &pair in &stage_state_pairs[stage] {
+            used.insert(g.state[pair].1);
+        }
+        used.insert(output);
+        used.extend(witnesses.iter().copied());
+        let renumber: HashMap<ValueId, ValueId> = used
+            .iter()
+            .enumerate()
+            .map(|(new, &old)| (old, new))
+            .collect();
+        let new = |old: ValueId| renumber[&old];
+
+        // A boundary value is an equation result, never an input binder (validation rejects an
+        // equation that redefines one), so retagging it as this stage's keyed activation input is safe.
+        let values: Vec<ValueMeta> = used
+            .iter()
+            .map(|&old| {
+                if stage_boundary_inputs[stage].binary_search(&old).is_ok() {
+                    ValueMeta::boundary_input(g.aval(old).clone(), BoundaryId(old))
+                } else {
+                    g.values[old].clone()
+                }
+            })
+            .collect();
+        let mut inputs: Vec<ValueId> = g
+            .inputs
+            .iter()
+            .copied()
+            .filter(|value| bound.contains(value))
+            .map(new)
+            .collect();
+        inputs.extend(stage_boundary_inputs[stage].iter().copied().map(new));
+        let consts: Vec<ValueId> = g
+            .consts
+            .iter()
+            .copied()
+            .filter(|value| bound.contains(value))
+            .map(new)
+            .collect();
+        let mut slots: Vec<(ValueId, Slot)> = g
+            .slots
+            .iter()
+            .copied()
+            .filter(|(value, _)| bound.contains(value))
+            .map(|(value, slot)| (new(value), slot))
+            .collect();
+        slots.extend(
+            stage_boundary_inputs[stage]
+                .iter()
+                .map(|&value| (new(value), Slot::Activation)),
+        );
+        let eqns: Vec<Eqn> = eqns
+            .iter()
+            .map(|eqn| Eqn {
+                op: eqn.op.clone(),
+                inputs: eqn
+                    .inputs
+                    .iter()
+                    .map(|operand| match operand {
+                        Operand::Value(value) => Operand::Value(new(*value)),
+                        Operand::Lit(scalar) => Operand::Lit(*scalar),
+                    })
+                    .collect(),
+                out: new(eqn.out),
+                layer: eqn.layer,
+            })
+            .collect();
+        let state: Vec<(ValueId, ValueId)> = stage_state_pairs[stage]
+            .iter()
+            .map(|&pair| g.state[pair])
+            .collect();
+        let exports: Vec<Export> = stage_exports[stage]
+            .iter()
+            .map(|&value| Export {
+                id: BoundaryId(value),
+                value,
+            })
+            .collect();
+
+        // Roots and witnesses are still in the uncut graph's ids; one remap moves them all.
         let mut graph = Graph {
             values,
             inputs,
@@ -454,33 +491,19 @@ pub(crate) fn split_stages<V: ValidationChannel>(
             eqns,
             output,
             validations: g.validations.clone(),
-            state,
+            exports,
+            state: state
+                .into_iter()
+                .map(|(state_input, state_output)| (new(state_input), state_output))
+                .collect(),
         };
-
-        // Witnesses stay with the piece of graph that defines them.
-        let mut defined = vec![false; graph.values.len()];
-        for &value in &graph.inputs {
-            defined[value] = true;
-        }
-        for eqn in &graph.eqns {
-            defined[eqn.out] = true;
-        }
-        if final_stage && !defined[g.output] {
-            return Err(StageSplitError::FinalStageMissingOutput {
-                stage,
-                output: g.output,
-            });
-        }
-        graph.retain_validations(|declaration| defined[declaration.value]);
+        graph.retain_validations(|declaration| witnesses.contains(&declaration.value));
+        graph.remap_results(new);
         graph
             .validate()
             .map_err(|source| StageSplitError::InvalidStage { stage, source })?;
 
-        stages.push(StageGraph {
-            stage,
-            graph,
-            outputs: std::mem::take(&mut stage_outputs[stage]),
-        });
+        stages.push(StageGraph { graph });
     }
 
     Ok(StageSplit { stages, boundaries })
@@ -521,24 +544,6 @@ fn state_pair_stages<V: ValidationChannel>(
     Ok(owners)
 }
 
-/// Split a traced graph at a placement's layer boundaries.
-///
-/// `after_layers` is one `StageBoundary::after_layer` per boundary, in order: cut `k` separates the
-/// equations tagged with layer `k` from those tagged `k + 1`. The tags come from
-/// [`poot_graph_ir::Builder::layer_scope`], which the model tracers wrap around their layer loop, so this
-/// call carries no per-family equation index and infers nothing from names. Everything else - the
-/// stage graphs, the crossing set, the descriptors - is [`split_stages`].
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "held for POOT-745 (formerly 581a)")
-)]
-pub(crate) fn split_stages_after_layers<V: ValidationChannel>(
-    g: &Graph<V>,
-    after_layers: &[usize],
-) -> Result<StageSplit<V>, StageSplitError> {
-    split_stages(g, &StageAssignment::from_layer_cuts(g, after_layers)?)
-}
-
 fn tensor_byte_len(aval: &TensorType, value: ValueId) -> Result<usize, StageSplitError> {
     let numel = aval
         .shape
@@ -553,7 +558,7 @@ fn tensor_byte_len(aval: &TensorType, value: ValueId) -> Result<usize, StageSpli
 /// Typed failure of [`split_stages`]. Value ids and stage indices are kept as fields so a caller can
 /// classify a bad split without parsing diagnostics.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum StageSplitError {
+pub enum StageSplitError {
     #[error("input graph is invalid: {0}")]
     InvalidGraph(#[from] GraphValidationError),
     #[error("stage assignment covers {assigned} equations but the graph has {eqn_count}")]
@@ -619,101 +624,16 @@ pub(crate) enum StageSplitError {
 mod tests {
     //! POOT-578 SC-002: a real qwen2 decode step (carried KV state) cut after every layer `k`.
 
-    use std::collections::HashMap;
+    use poot_eval::{EvalBudget, EvalOptions, eval};
 
-    use super::*;
-    use crate::split_stages_after_layers;
-    use poot_eval::{EvalBudget, EvalOptions, Value, eval};
-    use poot_executor_parity::dense::{Dense, Family, plain, step};
-    use poot_models::model::{LogitRows, Phase};
-    use poot_tensor::HostTensor;
-
-    /// Deterministic pseudo-random fill in [-1, 1) (xorshift, no rng dependency).
-    fn fill(n: usize, seed: u64) -> Vec<f32> {
-        let mut s = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        (0..n)
-            .map(|_| {
-                s ^= s << 13;
-                s ^= s >> 7;
-                s ^= s << 17;
-                ((s >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
-            })
-            .collect()
-    }
-
-    const LAYERS: usize = 3;
-
-    /// The tiny qwen2 decode graph (GQA 4 over 2, three layers) over a six-position cache.
-    fn qwen2_decode() -> Graph {
-        let model = Dense::new(Family::Qwen2)
-            .vocab(32)
-            .dims(16, 32, LAYERS)
-            .heads(4, 2)
-            .head_dim(4)
-            .max_positions(32)
-            .f32_model();
-        plain(
-            model
-                .model
-                .trace(Phase::Decode, step(1, 1, 6, LogitRows::Last))
-                .expect("the qwen2 fixture traces a decode step"),
-        )
-    }
-
-    /// Every input binder of `g` bound: token 5 at position 3, name-seeded weights, and a nonzero
-    /// KV cache per state pair (a zero cache would let a lost state input cancel).
-    fn bind(g: &Graph) -> HashMap<ValueId, Value> {
-        let mut inputs = HashMap::new();
-        for &id in &g.inputs {
-            let meta = g.meta(id);
-            let shape = meta.aval.shape.clone();
-            let numel = shape.iter().product::<usize>().max(1);
-            let tensor = match meta.storage {
-                Storage::Slot(Slot::Token) => HostTensor::i32(shape, vec![5; numel]),
-                Storage::Slot(Slot::Pos) => HostTensor::i32(shape, vec![3; numel]),
-                Storage::Slot(other) => panic!("unexpected slot {other:?}"),
-                Storage::Const => {
-                    let name = meta.name.as_deref().expect("a constant is named");
-                    let seed = name.bytes().fold(1469598103934665603u64, |h, c| {
-                        (h ^ u64::from(c)).wrapping_mul(1099511628211)
-                    });
-                    let data = fill(numel, seed).iter().map(|v| v * 0.1).collect();
-                    HostTensor::f32(shape, data)
-                }
-                Storage::Computed(computed) => computed.tensor(),
-                Storage::State => continue,
-                Storage::Device => unreachable!("an input binder is never a device value"),
-            };
-            inputs.insert(id, Value::from(tensor));
-        }
-        for (pair, &(state_input, _)) in g.state.iter().enumerate() {
-            let shape = g.aval(state_input).shape.clone();
-            let numel = shape.iter().product::<usize>().max(1);
-            inputs.insert(
-                state_input,
-                Value::from(HostTensor::f32(shape, fill(numel, 7000 + pair as u64))),
-            );
-        }
-        inputs
-    }
-
-    fn bits(value: &Value) -> Vec<u32> {
-        value
-            .as_host()
-            .expect("a dense value")
-            .as_f32()
-            .expect("an f32 value")
-            .iter()
-            .map(|v| v.to_bits())
-            .collect()
-    }
+    use crate::test_support::{LAYERS, bind_decode, bits, qwen2_decode};
 
     /// Splitting after layer `k` and chaining the stages (each stage bound to the original inputs it
     /// reads plus the boundary values the earlier stages produced) reproduces every logit and every
     /// carried-state output of the whole graph bit for bit.
     #[test]
     fn qwen2_decode_split_after_every_layer_chains_to_the_whole_graph() {
-        let graph = qwen2_decode();
+        let graph = qwen2_decode(LAYERS);
         let runs = graph
             .layer_runs()
             .expect("the qwen2 tracer tags its layers");
@@ -724,7 +644,7 @@ mod tests {
             "qwen2's layers are identical, so each owns the same number of equations: {lengths:?}"
         );
 
-        let inputs = bind(&graph);
+        let inputs = bind_decode(&graph);
         let whole = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
             .expect("the whole graph evaluates");
         assert!(
@@ -739,62 +659,33 @@ mod tests {
         );
 
         for k in 0..LAYERS - 1 {
-            let split = split_stages_after_layers(&graph, &[k])
+            let split = crate::test_support::split_after_layers(&graph, &[k])
                 .unwrap_or_else(|error| panic!("cut after layer {k}: {error}"));
             assert_eq!(split.stages.len(), 2);
             assert!(!split.boundaries.is_empty(), "cut {k} crosses a value");
 
-            let mut bound = inputs.clone();
-            let mut logits = None;
-            let mut states: HashMap<(ValueId, ValueId), Value> = HashMap::new();
-            for (index, stage) in split.stages.iter().enumerate() {
-                let stage_inputs: HashMap<ValueId, Value> = stage
-                    .graph
-                    .inputs
-                    .iter()
-                    .map(|id| {
-                        let value = bound
-                            .get(id)
-                            .unwrap_or_else(|| panic!("cut {k} stage {index}: v{id} is unbound"));
-                        (*id, value.clone())
-                    })
-                    .collect();
-                let result = eval(
-                    &stage.graph,
-                    &stage_inputs,
-                    EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
-                )
-                .unwrap_or_else(|error| panic!("cut {k} stage {index} did not evaluate: {error}"));
-                let environment = result.environment.expect("the environment was kept");
-                for &value in &stage.outputs {
-                    bound.insert(
-                        value,
-                        environment[value]
-                            .clone()
-                            .unwrap_or_else(|| panic!("stage {index} lacks boundary v{value}")),
-                    );
-                }
-                for (&pair, value) in stage.graph.state.iter().zip(result.state) {
-                    states.insert(pair, value);
-                }
-                if index + 1 == split.stages.len() {
-                    logits = Some(result.output);
-                }
-            }
-
+            let chained = crate::test_support::chain(
+                &graph,
+                &split.stages.iter().map(|s| &s.graph).collect::<Vec<_>>(),
+                &inputs,
+            );
             assert_eq!(
-                bits(&logits.expect("the final stage ran")),
+                bits(&chained.output),
                 bits(&whole.output),
                 "cut {k}: the chained logits differ from the whole graph's"
             );
             assert_eq!(
-                states.len(),
+                chained.state.len(),
                 graph.state.len(),
                 "cut {k}: every pair is owned"
             );
-            for (pair, expected) in graph.state.iter().zip(&whole.state) {
+            for (pair, (got, expected)) in graph
+                .state
+                .iter()
+                .zip(chained.state.iter().zip(&whole.state))
+            {
                 assert_eq!(
-                    bits(&states[pair]),
+                    bits(got),
                     bits(expected),
                     "cut {k}: carried state v{} -> v{} differs",
                     pair.0,

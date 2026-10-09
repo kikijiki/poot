@@ -1,8 +1,7 @@
 //! Card 642: packed decode through the wgpu SERVING executor paths.
 //!
 //! A `packed_linear` graph (compiled, so `compile` claims it as one `PackedContraction`) runs through
-//! `run_resident_kv` (eager resident decode with carried state) and `run_prefill`/`run_resident_prefill`
-//! (zero-seeded prefill), with the weight bound as `Value::Packed` carriers - never a dense f32
+//! the executor contract (a decode entry with carried state and a zero-seeded prefill entry), with the weight bound as `Value::Packed` carriers - never a dense f32
 //! copy.
 //!
 //! The activation is one-hot, so every output is exactly one decoded weight value: `y[o] =
@@ -88,7 +87,7 @@ fn step_inputs(binds: &[SlotBind]) -> StepInputs<'_> {
 /// [`StepInputs`] row. `Value::Packed` carriers are deduplicated by linear id into one
 /// `WeightEntry::Packed` each; the contract binds one payload per linear id and reads each operand's
 /// role from the graph's own declared name (`Engine::weight_buffer`), never a per-value
-/// caller-supplied role the way `GpuExecutor::bind_resident` did. `Value::Host` tensors become a
+/// caller-supplied role the way the deleted `GpuExecutor::bind_resident` did. `Value::Host` tensors become a
 /// `WeightEntry::Dense`. `Storage::State`/`Storage::Computed` are left out for the contract to seed
 /// itself.
 fn split_consts_and_slots(
@@ -380,9 +379,9 @@ fn packed_decode_through_resident_serving_path_is_bit_exact() {
 /// W9 prefill: an identity activation decodes the whole weight through the contract's `add_entry`/
 /// `step`, bit-exact per element, output and carried state.
 ///
-/// Card 546b: the old test ran this twice, through `GpuExecutor::run_prefill` and
-/// through `run_resident_kv` with an explicit zero seed - two call-sites into the SAME
-/// `run_resident_kv_prepared` body (`run_prefill` was only ever a zero-seed convenience wrapper around
+/// Card 546b: the old test ran this twice, through the deleted `GpuExecutor::run_prefill` and
+/// through the deleted `run_resident_kv` with an explicit zero seed - two call-sites into the SAME
+/// deleted `run_resident_kv_prepared` body (the deleted `run_prefill` was only ever a zero-seed convenience wrapper around
 /// it), so the "two paths" never actually exercised independent code. The contract has exactly one
 /// path (state is zero-seeded automatically on first use, Card 546a); this runs it once per format and
 /// keeps the real cross-check this test always relied on - bit-exact agreement with the independent
@@ -448,7 +447,7 @@ fn packed_prefill_through_serving_paths_is_bit_exact() {
 }
 
 // `a_swapped_packed_role_is_refused_before_upload` deleted (Card 546b, W11a): it tested
-// `GpuExecutor::bind_resident`'s `check_packed_bindings` call, which refused a caller-supplied
+// the deleted `GpuExecutor::bind_resident`'s `check_packed_bindings` call, which refused a caller-supplied
 // `Value::Packed` whose OWN `role` field disagreed with the role the graph's name declared
 // for that `ValueId` - a per-value, caller-supplied role the old `HashMap<ValueId, Value>` bind API
 // could misuse by construction (this test did so by swapping which component value two neighboring

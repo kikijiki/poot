@@ -6,7 +6,8 @@
 //! the sampling suffix its request needs appended ([`suffix`]), compiles through
 //! `poot_graph_plan::compile_staged` for the executor's own target, and runs through the object-safe
 //! [`Executor`]. A request the suffix cannot express (a guided mask, a penalty or bias, logprobs)
-//! falls back to the one host sampling path ([`host_sample`]).
+//! falls back to the one host sampling path ([`host_sample`]). [`Driver::beam`] is beam search over
+//! the rows of a batched step, with its own contiguous entries ([`beam`]).
 //!
 //! # Prepared entries
 //!
@@ -29,6 +30,7 @@
 //! capacity, KV layout and logit rows; [`Head`] names the suffix. Adapter sets and paging arrive with
 //! Card 735 as further key fields.
 
+pub mod beam;
 pub mod block_table;
 pub mod capacity;
 mod caps;
@@ -39,8 +41,11 @@ pub mod error;
 pub mod handle;
 mod host_sample;
 pub mod lora;
+pub mod mrope;
+pub mod oneshot;
 pub mod open;
 pub mod prefix_cache;
+mod reorder;
 pub mod speculate;
 pub mod step;
 pub mod stops;
@@ -63,12 +68,17 @@ use poot_graph_plan::{
 };
 use poot_models::bert::{ATTENTION_MASK_SLOT, TOKEN_TYPE_SLOT};
 use poot_models::components::embed::{EMBEDS_AT_SLOT, EMBEDS_SLOT};
+use poot_models::components::standard::{STATE_READ_SLOT, STATE_WRITE_SLOT};
 use poot_models::idefics3::PIXELS_SLOT;
 use poot_models::model::{KvLayout, Phase, ShapeReason, StepShape, TraceError};
+use poot_models::mrope::MropePositionIds;
+use poot_models::qwen_vl_vision::{FRAME_SLOT, POS_H_SLOT, POS_W_SLOT, WINDOW_SLOT};
+use poot_profile::{Mark, Report, TimingSnapshot};
 use poot_tensor::HostTensor;
 
 use crate::GenerationControl;
 use crate::core::sampler::{Sampler, TokenLogprob};
+pub use beam::{Beam, BeamError, BeamRequest};
 pub use caps::{
     DriverCaps, HeadSet, InputSet, Layout, LoraCaps, PoolShape, ServingShapes, StateResidency,
 };
@@ -81,7 +91,8 @@ use error::{
 };
 pub use handle::{LoadOptions, ModelHandle};
 pub use lora::{AdapterRef, AdapterSet, AdapterSource, AdapterSpec, GenerationId, LoraIdx};
-pub use open::{BackendChoice, open_executor};
+pub use oneshot::{OneShotError, Sampling, TextRequest, generate_text};
+pub use open::{BackendChoice, open_executor, open_timed_executor};
 pub use prefix_cache::{PrefixOutcome, PrefixSkip};
 pub use speculate::{
     DraftPolicy, NotSpeculated, RowSpeculation, SpeculationCaps, SpeculationStats,
@@ -213,6 +224,32 @@ pub struct GenerateRequest {
     pub ignore_eos: bool,
 }
 
+impl GenerateRequest {
+    /// The `max_new` of a run over a `prompt_tokens`-token prompt in a window of `max_positions`
+    /// positions. `None` asks for the rest of the window, so the run ends at EOS, a stop string or the
+    /// window's end; an explicit count must fit it. A prompt that leaves no position for a generated
+    /// token, or a count that overruns the window, is [`InvalidRequest::Capacity`].
+    pub fn max_new_within(
+        prompt_tokens: usize,
+        max_positions: usize,
+        requested: Option<usize>,
+    ) -> Result<usize, InvalidRequest> {
+        if prompt_tokens == 0 {
+            return Err(InvalidRequest::EmptyPrompt);
+        }
+        let room = max_positions.saturating_sub(prompt_tokens);
+        match requested {
+            Some(max_new) if max_new <= room => Ok(max_new),
+            None if room > 0 => Ok(room),
+            _ => Err(InvalidRequest::Capacity {
+                prompt: prompt_tokens,
+                max_new: requested.unwrap_or(1),
+                max: max_positions,
+            }),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Generation {
     /// The generated tokens, not including the end-of-sequence token that ended the run.
@@ -220,6 +257,33 @@ pub struct Generation {
     pub finish: FinishReason,
     /// One record per token, when the request's sampler recorded logprobs.
     pub logprobs: Vec<TokenLogprob>,
+    /// What the executor measured for the prompt and for the tokens after the first; `Some` only on a
+    /// driver built [`Driver::with_phase_timing`], because taking it snapshots the executor's timing.
+    pub timing: Option<GenerationTiming>,
+}
+
+/// The work of one phase of a generation and the host wall time the executor measured for its steps
+/// (`poot_profile::HostTiming::wall` summed over them: the engine's own clock, which excludes sampling,
+/// detokenization and the sink).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PhaseTiming {
+    pub tokens: usize,
+    pub wall: std::time::Duration,
+}
+
+impl PhaseTiming {
+    /// Tokens per second of engine wall time; `None` when the executor measured no time.
+    pub fn tokens_per_second(&self) -> Option<f64> {
+        (!self.wall.is_zero()).then(|| self.tokens as f64 / self.wall.as_secs_f64())
+    }
+}
+
+/// The prefill and decode phases of one generation. Prefill ends with the step that yields the first
+/// token, so the first token belongs to prefill and decode counts the tokens that follow it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GenerationTiming {
+    pub prefill: PhaseTiming,
+    pub decode: PhaseTiming,
 }
 
 /// Receives each generated token with the text it adds. Any `FnMut(u32, &str) -> GenerationControl`
@@ -258,12 +322,14 @@ pub enum Warm<'a> {
     Prompts(&'a [usize]),
 }
 
-/// Whose program an entry is: the served model's, or the draft model's under a
-/// [`DraftPolicy::DraftModel`].
+/// Whose program an entry is: the served model's, the draft model's under a
+/// [`DraftPolicy::DraftModel`], or the served model's beam-search entries ([`beam`]): contiguous
+/// layout at the beam width's row count, which serving never selects and the caps never count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ModelRole {
     Target,
     Draft,
+    Beam,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -325,6 +391,8 @@ struct SlotSpec {
 enum SlotRole {
     Token,
     Pos,
+    /// `Slot::MropePosition`: the step's sectioned positions ([`StepData::mrope`]).
+    MropePosition,
     /// `Slot::SlotMap` `"read"`: each row's logical position to pool slot.
     MapRead,
     /// `Slot::SlotMap` `"write"`: pool slot to the flat token index writing it, or -1.
@@ -343,6 +411,18 @@ enum SlotRole {
     AttentionMask,
     /// `Slot::Activation` `"pixels"`: the frames of a vision tower's step.
     Pixels,
+    /// `Slot::Activation` `"state_read"`: the recurrent state pool row each step row continues.
+    StateRead,
+    /// `Slot::Activation` `"state_write"`: recurrent pool row to the step row whose result it takes, or -1.
+    StateWrite,
+    /// `Slot::Activation` `"pos_h"`, `"pos_w"`, `"window"` and `"frame"`: the grid facts of a
+    /// windowed vision tower's patches ([`PatchGeometry`](poot_models::qwen_vl_vision::PatchGeometry)).
+    PosH,
+    PosW,
+    Window,
+    Frame,
+    /// `Slot::Activation` `"beam_rows"`: the row each state row takes in a beam reorder.
+    BeamRows,
 }
 
 impl Prepared {
@@ -352,6 +432,10 @@ impl Prepared {
         let roles = [
             (token_slot(), SlotRole::Token),
             (pos_slot(), SlotRole::Pos),
+            (
+                SlotKey::new(Slot::MropePosition, None),
+                SlotRole::MropePosition,
+            ),
             (named(Slot::SlotMap, "read"), SlotRole::MapRead),
             (named(Slot::SlotMap, "write"), SlotRole::MapWrite),
             (SlotKey::new(Slot::LoraIdx, None), SlotRole::LoraIdx),
@@ -366,6 +450,13 @@ impl Prepared {
                 SlotRole::AttentionMask,
             ),
             (activation_slot(PIXELS_SLOT), SlotRole::Pixels),
+            (activation_slot(STATE_READ_SLOT), SlotRole::StateRead),
+            (activation_slot(STATE_WRITE_SLOT), SlotRole::StateWrite),
+            (activation_slot(POS_H_SLOT), SlotRole::PosH),
+            (activation_slot(POS_W_SLOT), SlotRole::PosW),
+            (activation_slot(WINDOW_SLOT), SlotRole::Window),
+            (activation_slot(FRAME_SLOT), SlotRole::Frame),
+            (reorder::beam_rows_slot(), SlotRole::BeamRows),
         ];
         let mut slots = Vec::new();
         for &(value, _) in &graph.slots {
@@ -407,6 +498,23 @@ struct StepData {
     token_type: Vec<i32>,
     attention_mask: Vec<i32>,
     pixels: Vec<f32>,
+    state_read: Vec<i32>,
+    state_write: Vec<i32>,
+    pos_h: Vec<i32>,
+    pos_w: Vec<i32>,
+    window: Vec<f32>,
+    frame: Vec<f32>,
+    beam_rows: Vec<i32>,
+    /// `Slot::MropePosition`, axis-major `[3, rows * tokens]`, when some row of the step carries
+    /// sectioned positions ([`mrope::MropePositions`]); `None` is every token at its text position
+    /// on all three axes, which is plain RoPE at that position.
+    mrope: Option<Vec<i32>>,
+}
+
+impl StepData {
+    fn mrope(&self) -> Vec<i32> {
+        self.mrope.clone().unwrap_or_else(|| self.pos.repeat(3))
+    }
 }
 
 pub struct Driver {
@@ -419,6 +527,8 @@ pub struct Driver {
     /// Which of the model's weights the checkpoint stores packed: put on every traced graph.
     formats: WeightFormats,
     entries: HashMap<EntryKey, Prepared>,
+    /// The row-gather entries beam search reorders its state with, by row count ([`beam`]).
+    reorders: HashMap<NonZeroUsize, Prepared>,
     /// The shared owners the prepared entries reference, by key.
     owners: HashMap<String, Owner>,
     /// The bytes held: every shared owner once, plus each entry's own.
@@ -430,12 +540,18 @@ pub struct Driver {
     /// The executable serving each captured adapter generation that has an entry: the base weights
     /// shared with the base executable, plus the generation's stacked adapter tensors.
     adapter_exes: HashMap<GenerationId, ExecutableId>,
+    /// The executable each `Encode` shape runs on: a decoder's encode graph carries a cache of its own
+    /// `[rows, positions]` extent, and state is keyed by (name, aval) inside an executable, so two encode
+    /// shapes cannot share one. The weights are the base weights, shared with the serving executable.
+    encode_exes: HashMap<(NonZeroUsize, NonZeroUsize), ExecutableId>,
     speculation: speculate::Speculation,
     /// The paged pool, the open sequences and the published caps; absent until `prepare`.
     serving: Option<step::Serving>,
     /// The one layout `prepare` has admitted, and the caps it published.
     layout: Option<Layout>,
     caps: Option<DriverCaps>,
+    /// Whether `generate` reports [`Generation::timing`] ([`Driver::with_phase_timing`]).
+    time_phases: bool,
 }
 
 fn token_slot() -> SlotKey {
@@ -495,17 +611,27 @@ impl Driver {
             chunks,
             formats,
             entries: HashMap::new(),
+            reorders: HashMap::new(),
             owners: HashMap::new(),
             retained_bytes: 0,
             stats: DriverStats::default(),
             residency: StateResidency::KvOnly,
             lora: lora::LoraRegistry::default(),
             adapter_exes: HashMap::new(),
+            encode_exes: HashMap::new(),
             speculation,
             serving: None,
             layout: None,
             caps: None,
+            time_phases: false,
         })
+    }
+
+    /// Have [`Driver::generate`] report [`Generation::timing`]. Off by default: it snapshots the
+    /// executor's timing at each phase boundary, which a server that never reads it should not pay for.
+    pub fn with_phase_timing(mut self) -> Self {
+        self.time_phases = true;
+        self
     }
 
     pub fn stats(&self) -> DriverStats {
@@ -519,7 +645,7 @@ impl Driver {
 
     /// Prepared entries held.
     pub fn prepared_entries(&self) -> usize {
-        self.entries.len()
+        self.entries.len() + self.reorders.len()
     }
 
     /// Bytes the prepared entries are charged.
@@ -542,9 +668,9 @@ impl Driver {
             return Ok(entry.clone());
         }
         let limits = self.options.prepared;
-        if self.entries.len() >= limits.max_entries.get() {
+        if self.prepared_entries() >= limits.max_entries.get() {
             return Err(PreparedSetRefusal::Entries {
-                held: self.entries.len(),
+                held: self.prepared_entries(),
                 limit: limits.max_entries.get(),
             }
             .into());
@@ -594,14 +720,35 @@ impl Driver {
                 role: SlotRole::LoraIdx,
             });
         }
-        let program = compile_staged(
-            &graph,
+        let program = self.compile(&graph, &compile)?;
+        let reservation = self.admit(&program)?;
+        let exe = match (key.adapters, key.phase) {
+            (Some(generation), _) => self.adapter_exe(generation)?,
+            (None, Phase::Encode) if key.role == ModelRole::Target => self.encode_exe(key.shape)?,
+            (None, _) => exe,
+        };
+        let entry = self.add_entry(exe, &program, reservation, slots, output)?;
+        if key.role != ModelRole::Draft && residency == StateResidency::Recurrent {
+            self.residency = StateResidency::Recurrent;
+        }
+        self.entries.insert(key, entry.clone());
+        Ok(entry)
+    }
+
+    /// Compile `graph` for the executor's target.
+    fn compile(
+        &self,
+        graph: &Graph<ValidationOutputs>,
+        options: &CompileOptions,
+    ) -> Result<StagedProgram<ValidationOutputs>, Unsupported> {
+        compile_staged(
+            graph,
             &TargetSet::single(DeviceId(0), self.target),
             &Partition {
                 experts: ExpertPlacement::AllResident,
                 devices: DevicePlacement::Single(DeviceId(0)),
             },
-            &compile,
+            options,
         )
         .map_err(|e| match e {
             StagedCompileError::Compile(poot_graph_plan::CompileError::Plan(plan)) => match *plan {
@@ -609,38 +756,50 @@ impl Driver {
                 other => Unsupported::Compile(StagedCompileError::Compile(other.into())),
             },
             other => Unsupported::Compile(other),
-        })?;
+        })
+    }
+
+    /// Count the compile of `program` and check what retaining it would hold against the limits.
+    /// Nothing is recorded until [`Self::add_entry`].
+    fn admit(
+        &mut self,
+        program: &StagedProgram<ValidationOutputs>,
+    ) -> Result<Reservation, DriverError> {
         self.stats.compiles += 1;
-        let reservation = self.reserve((self.options.charge)(&program));
+        let reservation = self.reserve((self.options.charge)(program));
         let would_retain = self.retained_bytes.saturating_add(reservation.charge);
-        if would_retain > limits.max_retained_bytes.get() {
+        let limit = self.options.prepared.max_retained_bytes.get();
+        if would_retain > limit {
             return Err(PreparedSetRefusal::Bytes {
                 charge: reservation.charge,
                 held: self.retained_bytes,
                 would_retain,
-                limit: limits.max_retained_bytes.get(),
+                limit,
             }
             .into());
         }
-        let exe = match key.adapters {
-            Some(generation) => self.adapter_exe(generation)?,
-            None => exe,
-        };
-        let id = self.executor.add_entry(exe, &program)?;
+        Ok(reservation)
+    }
+
+    /// Add `program` to `exe` as a new entry and record its reservation.
+    fn add_entry(
+        &mut self,
+        exe: ExecutableId,
+        program: &StagedProgram<ValidationOutputs>,
+        reservation: Reservation,
+        slots: Vec<SlotSpec>,
+        output: Vec<usize>,
+    ) -> Result<Prepared, DriverError> {
+        let id = self.executor.add_entry(exe, program)?;
         self.stats.entries_added += 1;
         self.hold(&reservation);
-        let entry = Prepared {
+        Ok(Prepared {
             id,
             exe,
             held: reservation.held,
             slots,
             output,
-        };
-        if key.role == ModelRole::Target && residency == StateResidency::Recurrent {
-            self.residency = StateResidency::Recurrent;
-        }
-        self.entries.insert(key, entry.clone());
-        Ok(entry)
+        })
     }
 
     /// What admitting `retention` would hold and add: every shared owner not yet held, once, plus the
@@ -698,24 +857,28 @@ impl Driver {
         self.retained_bytes = self.retained_bytes.saturating_sub(freed);
     }
 
-    /// Dserve.md every carried state value's leading axis is the row axis, so per-row
-    /// reset and row reorder address a row by its leading index. A paged KV pool is the one value
-    /// without a row axis: the `Positional` cache whose leading axis is the pool's slots. Returns the
-    /// graph's state residency, read from its state roles, never from a family.
+    /// Every carried state value's leading axis is a row axis, so per-row reset addresses a row by its
+    /// leading index: the step's rows for a private cache, one row per sequence for a paged layout's
+    /// recurrent pool (a step's rows reach it through the state index inputs). A paged KV pool is the
+    /// one value without a row axis: the `Positional` cache whose leading axis is the pool's slots.
+    /// Returns the graph's state residency, read from its state roles, never from a family.
     fn check_state_rows(
         handle: &ModelHandle,
         graph: &Graph<ValidationOutputs>,
         shape: StepShape,
     ) -> Result<StateResidency, Unsupported> {
-        let rows = shape.rows.get();
         let mut residency = StateResidency::KvOnly;
         for pair in graph.state_pairs() {
             let leading = graph.aval(pair.input).shape.first().copied().unwrap_or(0);
             let pool = matches!(
                 (shape.kv, pair.role),
-                (KvLayout::Paged { pool_slots }, StateRole::Positional { axis: 0 })
+                (KvLayout::Paged { pool_slots, .. }, StateRole::Positional { axis: 0 })
                     if pool_slots.get() == leading
             );
+            let rows = match (shape.kv, pair.role) {
+                (KvLayout::Paged { seqs, .. }, StateRole::Recurrent) => seqs.get(),
+                _ => shape.rows.get(),
+            };
             if leading != rows && !pool {
                 return Err(Unsupported::Trace(TraceError::ShapeUnsupported {
                     family: handle.config().family,
@@ -744,6 +907,7 @@ impl Driver {
                 let tensor = match spec.role {
                     SlotRole::Token => HostTensor::i32(shape, data.tokens.clone()),
                     SlotRole::Pos => HostTensor::i32(shape, data.pos.clone()),
+                    SlotRole::MropePosition => HostTensor::i32(shape, data.mrope()),
                     SlotRole::MapRead => HostTensor::i32(shape, data.read.clone()),
                     SlotRole::MapWrite => HostTensor::i32(shape, data.write.clone()),
                     SlotRole::LoraIdx => HostTensor::f32(shape, data.lora.clone()),
@@ -755,6 +919,13 @@ impl Driver {
                     SlotRole::TokenType => HostTensor::i32(shape, data.token_type.clone()),
                     SlotRole::AttentionMask => HostTensor::i32(shape, data.attention_mask.clone()),
                     SlotRole::Pixels => HostTensor::f32(shape, data.pixels.clone()),
+                    SlotRole::StateRead => HostTensor::i32(shape, data.state_read.clone()),
+                    SlotRole::StateWrite => HostTensor::i32(shape, data.state_write.clone()),
+                    SlotRole::PosH => HostTensor::i32(shape, data.pos_h.clone()),
+                    SlotRole::PosW => HostTensor::i32(shape, data.pos_w.clone()),
+                    SlotRole::Window => HostTensor::f32(shape, data.window.clone()),
+                    SlotRole::Frame => HostTensor::f32(shape, data.frame.clone()),
+                    SlotRole::BeamRows => HostTensor::i32(shape, data.beam_rows.clone()),
                 };
                 (&spec.key, tensor)
             })
@@ -767,6 +938,21 @@ impl Driver {
         Ok(self
             .executor
             .step(entry.exe, entry.id, &inputs, &mut NoSync)?)
+    }
+
+    /// The executable `Encode` steps of `shape` run on, loaded on first use over the base weights. A failed
+    /// load leaves nothing registered.
+    fn encode_exe(&mut self, shape: StepShape) -> Result<ExecutableId, DriverError> {
+        let extent = (shape.rows, shape.tokens);
+        if let Some(&exe) = self.encode_exes.get(&extent) {
+            return Ok(exe);
+        }
+        let weights = Arc::new(self.handle.model().weights().clone());
+        let exe = self
+            .executor
+            .load_weights(self.handle.shared_store().clone(), weights)?;
+        self.encode_exes.insert(extent, exe);
+        Ok(exe)
     }
 
     /// The executable serving `generation`, loaded on first use: the base store and map, extended with
@@ -789,7 +975,7 @@ impl Driver {
     /// The model and executable `role`'s entries run: the served model's, or the loaded draft's.
     fn scope(&self, role: ModelRole) -> Result<(Arc<ModelHandle>, ExecutableId), DriverError> {
         match role {
-            ModelRole::Target => Ok((Arc::clone(&self.handle), self.exe)),
+            ModelRole::Target | ModelRole::Beam => Ok((Arc::clone(&self.handle), self.exe)),
             ModelRole::Draft => self
                 .speculation
                 .draft
@@ -824,21 +1010,33 @@ impl Driver {
 
     /// [`Driver::generate`] for a prompt that supplies embedding rows in place of some tokens'
     /// embeddings (a multimodal prompt's image rows): its prefill steps bind them
-    /// (`StepInput::TokensWithEmbeds`), so nothing of them is compiled into a program. Contiguous
-    /// layout only ([`Driver::open_with_embeds`]).
+    /// (`StepInput::TokensWithEmbeds`), so nothing of them is compiled into a program
+    /// ([`Driver::open_with_embeds`] says what the paged layout does with them).
     pub fn generate_with_embeds(
         &mut self,
         request: GenerateRequest,
         embeds: PromptEmbeds,
         sink: &mut dyn TokenSink,
     ) -> Result<Generation, DriverError> {
-        self.generate_with(request, Some(embeds), sink)
+        self.generate_with(request, Some((embeds, None)), sink)
+    }
+
+    /// [`Driver::generate_with_embeds`] for a model that rotates at sectioned positions: `positions`
+    /// are the prompt's ([`Driver::open_with_mrope`]).
+    pub fn generate_with_mrope(
+        &mut self,
+        request: GenerateRequest,
+        embeds: PromptEmbeds,
+        positions: MropePositionIds,
+        sink: &mut dyn TokenSink,
+    ) -> Result<Generation, DriverError> {
+        self.generate_with(request, Some((embeds, Some(positions))), sink)
     }
 
     fn generate_with(
         &mut self,
         request: GenerateRequest,
-        embeds: Option<PromptEmbeds>,
+        embedded: Option<(PromptEmbeds, Option<MropePositionIds>)>,
         sink: &mut dyn TokenSink,
     ) -> Result<Generation, DriverError> {
         let GenerateRequest {
@@ -853,6 +1051,7 @@ impl Driver {
                 tokens: Vec::new(),
                 finish: FinishReason::MaxTokens,
                 logprobs: Vec::new(),
+                timing: None,
             });
         }
         if prompt.is_empty() {
@@ -885,10 +1084,14 @@ impl Driver {
             max_new,
             adapter: AdapterRef::Base,
         };
-        let admission = match embeds {
-            Some(embeds) => {
+        let admission = match embedded {
+            Some((embeds, None)) => {
                 self.prepare_embeds(&shapes)?;
                 self.open_with_embeds(request_seq, embeds)?
+            }
+            Some((embeds, Some(positions))) => {
+                self.prepare_embeds(&shapes)?;
+                self.open_with_mrope(request_seq, embeds, positions)?
             }
             None => self.open(request_seq)?,
         };
@@ -946,6 +1149,9 @@ impl Driver {
         let config = handle.config();
         let upto = prompt.len();
         let mut logprobs = Vec::new();
+        let started = self
+            .time_phases
+            .then(|| self.executor.stats().timing.mark());
         let mut pending = loop {
             let result = self.step_one(seq, RowWork::Prefill { upto }, sampler)?;
             logprobs.extend(result.logprobs);
@@ -963,6 +1169,9 @@ impl Driver {
         );
         let mut context = prompt;
         let gen_start = context.len();
+        let prefilled = self.time_phases.then(|| self.executor.stats().timing);
+        let decoding = prefilled.as_ref().map(TimingSnapshot::mark);
+        let mut decoded = 0;
         let finish = loop {
             // A step returns one token, or under a draft policy the accepted drafts and one more:
             // keep tokens until one ends the sequence, and commit what was kept.
@@ -1000,12 +1209,36 @@ impl Driver {
                 sampler,
             )?;
             logprobs.extend(result.logprobs);
+            decoded += result.tokens.len();
             pending = result.tokens;
+        };
+        let timing = match (&started, &prefilled, &decoding) {
+            (Some(started), Some(prefilled), Some(decoding)) => {
+                let finished = self.executor.stats().timing;
+                Some(GenerationTiming {
+                    prefill: PhaseTiming {
+                        tokens: gen_start,
+                        wall: window_wall(prefilled, started),
+                    },
+                    decode: PhaseTiming {
+                        tokens: decoded,
+                        wall: window_wall(&finished, decoding),
+                    },
+                })
+            }
+            _ => None,
         };
         Ok(Generation {
             tokens: context.split_off(gen_start),
             finish,
             logprobs,
+            timing,
         })
     }
+}
+
+/// The host wall time of every step `snapshot` recorded after `since`, on whichever entries ran.
+fn window_wall(snapshot: &TimingSnapshot, since: &Mark) -> std::time::Duration {
+    let entries = snapshot.entries_with_activity_since(since);
+    Report::window(snapshot, since, &entries).host.wall
 }

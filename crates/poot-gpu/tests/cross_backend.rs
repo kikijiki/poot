@@ -139,7 +139,7 @@ fn split_consts_and_slots(
     (builder.build(), slots)
 }
 
-/// The executor-contract replacement for `GpuExecutor::run`/`.run(&g, &inputs)`: a one-shot,
+/// The executor-contract replacement for the deleted `GpuExecutor::run`/`.run(&g, &inputs)`: a one-shot,
 /// stateless step through `Engine<WgpuDevice>::add_entry`/`step`, torn back down afterward - every
 /// test in this file drives exactly one graph once, so there is no entry worth keeping alive across
 /// calls.
@@ -1706,9 +1706,9 @@ fn single_element_cross_backend() {
 /// DIAGNOSTIC (card 255 item 6): a large `transpose` + `matmul` of a BLOOM-scale `lm_head` weight
 /// ([vocab=250880, hidden=1024]) alone, with no ALiBi mask or BLOOM architecture. `bloom_560m_gpu_reprefill_
 /// matches_cpu` hung on this shape (kernel log: `ring gfx_0.0.0 timeout`); if this reproduces it, the bug is
-/// in `GpuExecutor::run`'s per-op large-transpose dispatch, not ALiBi/BLOOM.
+/// in the per-op large-transpose dispatch (then in the deleted `GpuExecutor::run`), not ALiBi/BLOOM.
 #[test]
-#[ignore = "KNOWN FAILING (docs/updates/0615-alibi-real-gpu-parity-wgpu.md, card 258): DOES hang real GPU \
+#[ignore = "KNOWN FAILING (Backstage update 0615-alibi-real-gpu-parity-wgpu, card 258): DOES hang real GPU \
             hardware (auto-recovers via a ring reset, no reboot needed, but disruptive) - allocates a \
             ~1GB weight; run manually only, with --ignored, once you understand the expected outcome"]
 fn large_vocab_lm_head_transpose_matmul_does_not_hang() {
@@ -1748,8 +1748,8 @@ fn large_vocab_lm_head_transpose_matmul_does_not_hang() {
 /// The bare `transpose` alone (no matmul), same BLOOM-scale shape: separates a hang in the transpose's
 /// materialize-copy kernel from one that needs the following matmul.
 #[test]
-#[ignore = "diagnostic: allocates a ~1GB weight (safe - passes cleanly in ~3.7s, see docs/updates/0615-\
-            alibi-real-gpu-parity-wgpu.md); run manually with --ignored"]
+#[ignore = "diagnostic: allocates a ~1GB weight (safe - passes cleanly in ~3.7s, see the Backstage update\
+            0615-alibi-real-gpu-parity-wgpu); run manually with --ignored"]
 fn large_vocab_transpose_alone_does_not_hang() {
     let _g = gpu_lock();
     let Some((mut exec, target)) = try_gpu() else {
@@ -1777,8 +1777,8 @@ fn large_vocab_transpose_alone_does_not_hang() {
 /// The bare `matmul` alone at BLOOM lm_head scale, weight fed already in `[hidden, vocab]` layout (no
 /// transpose op).
 #[test]
-#[ignore = "diagnostic: allocates a ~1GB weight (safe - passes cleanly in ~0.6s, see docs/updates/0615-\
-            alibi-real-gpu-parity-wgpu.md); run manually with --ignored"]
+#[ignore = "diagnostic: allocates a ~1GB weight (safe - passes cleanly in ~0.6s, see the Backstage update\
+            0615-alibi-real-gpu-parity-wgpu); run manually with --ignored"]
 fn large_vocab_matmul_alone_does_not_hang() {
     let _g = gpu_lock();
     let Some((mut exec, target)) = try_gpu() else {
@@ -1810,8 +1810,8 @@ fn large_vocab_matmul_alone_does_not_hang() {
 /// trigger (MPT ties `lm_head` via `b.transpose(embed, vec![1, 0])` in `crates/poot-models/src/mpt.rs`)
 /// without loading the ~5.2GB checkpoint.
 #[test]
-#[ignore = "diagnostic: allocates a large weight (safe - passes cleanly in ~2s, see docs/updates/0615-\
-            alibi-real-gpu-parity-wgpu.md); run manually with --ignored"]
+#[ignore = "diagnostic: allocates a large weight (safe - passes cleanly in ~2s, see the Backstage update\
+            0615-alibi-real-gpu-parity-wgpu); run manually with --ignored"]
 fn mpt_scale_tied_lm_head_transpose_matmul_does_not_hang() {
     let _g = gpu_lock();
     let Some((mut exec, target)) = try_gpu() else {

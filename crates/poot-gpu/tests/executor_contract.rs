@@ -1217,13 +1217,13 @@ fn wgpu_device_classifies_a_kernel_assert_fault_from_synchronize() {
         .allocate(BufferRole::Input, BufferStorage::i32(), 4)
         .unwrap();
     device
-        .write(&idx, bytemuck::cast_slice(&[3i32, 0, 4, 1]))
+        .write(&idx, 0, bytemuck::cast_slice(&[3i32, 0, 4, 1]))
         .unwrap();
     let data = device
         .allocate(BufferRole::Input, BufferStorage::f32(), 4)
         .unwrap();
     device
-        .write(&data, bytemuck::cast_slice(&[10.0f32, 20.0, 30.0, 40.0]))
+        .write(&data, 0, bytemuck::cast_slice(&[10.0f32, 20.0, 30.0, 40.0]))
         .unwrap();
     let out_buf = device
         .allocate(BufferRole::Output, BufferStorage::f32(), 4)

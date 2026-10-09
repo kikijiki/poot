@@ -1,5 +1,5 @@
 //! poot fuses a model's materialized softmax attention into a single flash-attention op automatically, as a
-//! compiler pass over the primitive graph: `transform::flash_attention` pattern-matches the
+//! compiler pass over the primitive graph: `poot_graph_plan::flash_attention_capped` pattern-matches the
 //! `softmax(scale*QKt + mask) @ V` decomposition and rewrites it. This example traces a tiny decode step, runs
 //! the default optimization pipeline, and prints the dispatch-count and peak-activation-memory it saves (poot's
 //! own cost model, no GPU or vendor API).

@@ -30,7 +30,7 @@ impl Context {
         self.pending_faults.borrow_mut().push(PendingFault {
             label: label.to_string(),
             storage,
-            guard,
+            _guard: guard,
         });
     }
 
@@ -240,8 +240,8 @@ impl Context {
             groups,
             label: label.to_string(),
             error_storage,
-            length_buffer_guard,
-            error_storage_guard,
+            _length_buffer_guard: length_buffer_guard,
+            _error_storage_guard: error_storage_guard,
         })
     }
 
@@ -456,7 +456,7 @@ impl Context {
                     read,
                     base_index,
                     count: dispatch_count,
-                    guard: ts_guard.expect("query_set implies a Staging guard"),
+                    _guard: ts_guard.expect("query_set implies a Staging guard"),
                 });
         }
         Ok(())

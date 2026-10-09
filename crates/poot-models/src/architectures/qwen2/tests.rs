@@ -285,10 +285,10 @@ fn inputs_are_const_slot_or_state() {
 
 /// The flash gate for `family`'s prefill under `kv`: `optimize()` must fuse attention into
 /// `Attention` (one per layer) and leave no materialized `[1,Hq,L,L]` softmax(QK^T)
-/// score `MatMul` (card 183; that O(L^2) matrix blew past the wgpu grid cap at long context,
-/// docs/updates/0483). `L=2048` is far from every fixture dimension, avoiding a false positive
-/// where a per-row weight matmul or attention reshape collides with `L` on some axis. This is the
-/// graph-transform half; the callers must also run the pipeline rather than a `cse`-only path.
+/// score `MatMul` (card 183; that O(L^2) matrix blew past the wgpu grid cap at long context).
+/// `L=2048` is far from every fixture dimension, avoiding a false positive where a per-row weight matmul or
+/// attention reshape collides with `L` on some axis. This is the graph-transform half;
+/// the callers must also run the pipeline rather than a `cse`-only path.
 fn assert_flash_fused_prefill(family: &str, kv: KvLayout) {
     let n = 2048usize;
     let m = model(family, |c| c["max_position_embeddings"] = 4096.into());
@@ -402,6 +402,7 @@ fn optimize_fuses_flash_prefill_paged_no_materialized_scores() {
         "qwen2",
         KvLayout::Paged {
             pool_slots: NonZeroUsize::new(n + 8).unwrap(),
+            seqs: NonZeroUsize::MIN,
         },
     );
 }
@@ -427,4 +428,402 @@ fn olmo2_prefill_traces_with_state_pairs() {
 #[test]
 fn optimize_fuses_flash_prefill_olmo2_no_materialized_scores() {
     assert_flash_fused_prefill("olmo2", KvLayout::Contiguous);
+}
+
+// The Qwen2.5-VL text tower: qwen2 with sectioned RoPE over `Slot::MropePosition`.
+
+mod vl {
+    use poot_graph_ir::Slot;
+    use poot_quant::weights::WeightStore;
+
+    use super::super::model::{VL_ENTRY, VL_FAMILY};
+    use super::*;
+    use crate::components::standard::oracle;
+    use crate::components::testing::{CAP, close, step_shape};
+    use crate::model::{ConfigReason, ModelError};
+    use crate::registry::Fixture;
+
+    /// The text tower over its own fixture with `tweak` applied to the config. The tensors do not
+    /// depend on the fields these rows change, and the plain qwen2 fixture holds the same bytes.
+    fn build(
+        tweak: impl FnOnce(&mut serde_json::Value),
+    ) -> (Fixture, Result<Box<dyn Model>, ModelError>) {
+        let mut fixture = (VL_ENTRY.fixture)();
+        tweak(&mut fixture.config);
+        let built = (VL_ENTRY.build)(&fixture.raw(), &fixture.store);
+        (fixture, built)
+    }
+
+    fn vl_model() -> (Fixture, Box<dyn Model>) {
+        let (fixture, built) = build(|_| {});
+        (fixture, built.unwrap())
+    }
+
+    /// The error a config the tower refuses reports: its field and reason, for the VL family.
+    fn refusal(tweak: impl FnOnce(&mut serde_json::Value)) -> (&'static str, ConfigReason) {
+        match build(tweak).1 {
+            Err(ModelError::Config {
+                family,
+                field,
+                reason,
+            }) => {
+                assert_eq!(family, VL_FAMILY);
+                (field, reason)
+            }
+            Err(other) => panic!("expected a config error, got {other}"),
+            Ok(_) => panic!("the config was accepted"),
+        }
+    }
+
+    const SECTION: &str = "rope_scaling.mrope_section";
+
+    /// The released config shape builds: `rope_scaling` names `mrope` and its three section widths.
+    /// The same config under `rope_parameters` with `rope_type` builds the same tower.
+    #[test]
+    fn the_released_shape_builds_under_either_rope_block() {
+        let (fixture, model) = vl_model();
+        assert_eq!(model.config().family, VL_FAMILY);
+        let relocated = build(|c| {
+            let scaling = c["rope_scaling"].take();
+            c["rope_parameters"] = serde_json::json!({
+                "rope_type": "mrope",
+                "mrope_section": scaling["mrope_section"],
+            });
+        })
+        .1
+        .unwrap();
+        let tokens = [3, 17, 40, 8, 25];
+        let (a, _) = vl_step(
+            &*model,
+            &fixture.store,
+            Phase::Prefill,
+            &tokens,
+            0,
+            None,
+            &[],
+        );
+        let (b, _) = vl_step(
+            &*relocated,
+            &fixture.store,
+            Phase::Prefill,
+            &tokens,
+            0,
+            None,
+            &[],
+        );
+        close(&a, &b);
+    }
+
+    /// Only `qwen2_5_vl` builds: Qwen2-VL (a different position scheme) and plain qwen2 are refused
+    /// by the `model_type` field. Mutation: drop the model type check; this goes red with
+    /// "the config was accepted".
+    #[test]
+    fn another_model_type_is_refused() {
+        for kind in ["qwen2_vl", "qwen2"] {
+            assert_eq!(
+                refusal(|c| c["model_type"] = kind.into()),
+                ("model_type", ConfigReason::Unsupported),
+                "{kind}"
+            );
+        }
+    }
+
+    /// A checkpoint without QKV bias is not the Qwen2.5-VL convention. Mutation: drop the
+    /// `attention_bias` check.
+    #[test]
+    fn a_checkpoint_without_qkv_bias_is_refused() {
+        assert_eq!(
+            refusal(|c| c["attention_bias"] = false.into()),
+            ("attention_bias", ConfigReason::Unsupported)
+        );
+    }
+
+    /// An explicit `head_dim` other than `hidden_size / num_attention_heads` (64 / 4 = 16) is
+    /// refused. Mutation: drop the head width check.
+    #[test]
+    fn a_head_width_other_than_hidden_over_heads_is_refused() {
+        assert_eq!(
+            refusal(|c| c["head_dim"] = 32.into()),
+            (
+                "head_dim",
+                ConfigReason::Mismatch {
+                    expected: 16,
+                    found: 32
+                }
+            )
+        );
+    }
+
+    /// A partial rotary is refused: the sections cover the whole head. Mutation: drop the
+    /// `partial_rotary_factor` check.
+    #[test]
+    fn a_partial_rotary_is_refused() {
+        assert_eq!(
+            refusal(|c| c["partial_rotary_factor"] = 0.5.into()),
+            (
+                "partial_rotary_factor",
+                ConfigReason::Mismatch {
+                    expected: 16,
+                    found: 8
+                }
+            )
+        );
+    }
+
+    /// Section widths that do not cover the rotary pairs exactly are refused: too few (3 of 8
+    /// pairs) and too many (9 of 8). Mutation: drop the sum check in `RopeParams::sectioned`.
+    #[test]
+    fn section_widths_must_cover_the_rotary_pairs() {
+        for (widths, found) in [([1, 1, 1], 3), ([3, 3, 3], 9)] {
+            assert_eq!(
+                refusal(|c| c["rope_scaling"]["mrope_section"] = widths.into()),
+                (SECTION, ConfigReason::Mismatch { expected: 8, found }),
+                "{widths:?}"
+            );
+        }
+    }
+
+    /// A sum past `usize` is an overflow, not a wrapped (and so accepted) width. Mutation: add the
+    /// widths with a wrapping sum in `RopeParams::sectioned`.
+    #[test]
+    fn section_widths_that_overflow_are_refused() {
+        // 2^63 + 2^63 + 8 wraps to 8 as a u64: the exact pairs of the fixture.
+        let half = 1u64 << 63;
+        assert_eq!(
+            refusal(|c| c["rope_scaling"]["mrope_section"] = serde_json::json!([half, half, 8])),
+            (SECTION, ConfigReason::Overflow)
+        );
+    }
+
+    /// An odd rotary width is refused whatever the sections sum to: a head of 15 has 7 full pairs
+    /// and a trailing dim, and sections `[2, 2, 3]` would cover those 7 pairs. Mutation: drop the
+    /// even-width check in `RopeParams::new`.
+    #[test]
+    fn an_odd_rotary_width_is_refused() {
+        assert_eq!(
+            refusal(|c| {
+                c["hidden_size"] = 60.into();
+                c["rope_scaling"]["mrope_section"] = serde_json::json!([2, 2, 3]);
+            }),
+            ("rotary_dim", ConfigReason::NotDivisible { by: 2 })
+        );
+    }
+
+    /// Malformed section metadata is a typed error naming the key: absent, not a list, the wrong
+    /// length, or a width that is not an unsigned integer. Mutation: accept a two-width list
+    /// (pad it with a zero); the length row goes red.
+    #[test]
+    fn malformed_section_metadata_is_refused() {
+        let key = |c: &mut serde_json::Value, value: serde_json::Value| {
+            c["rope_scaling"]["mrope_section"] = value;
+        };
+        assert_eq!(
+            refusal(|c| {
+                c["rope_scaling"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("mrope_section");
+            }),
+            (SECTION, ConfigReason::Missing)
+        );
+        assert_eq!(
+            refusal(|c| key(c, "2,3,3".into())),
+            (SECTION, ConfigReason::WrongType)
+        );
+        assert_eq!(
+            refusal(|c| key(c, serde_json::json!([4, 4]))),
+            (SECTION, ConfigReason::Length { expected: 3 })
+        );
+        assert_eq!(
+            refusal(|c| key(c, serde_json::json!([2, -3, 3]))),
+            (SECTION, ConfigReason::WrongType)
+        );
+    }
+
+    /// One step of `phase` over `tokens` from `start`, logits at every token, with the sectioned
+    /// positions `mrope` (three axes of `tokens.len()` ids, `None` for the text positions on all
+    /// three) over `state` (zeros when empty). Returns the logits and the carried state.
+    fn vl_step(
+        model: &dyn Model,
+        store: &WeightStore,
+        phase: Phase,
+        tokens: &[i32],
+        start: i32,
+        mrope: Option<[&[i32]; 3]>,
+        state: &[Vec<f32>],
+    ) -> (Vec<f32>, Vec<Vec<f32>>) {
+        let pos: Vec<i32> = (start..).take(tokens.len()).collect();
+        vl_step_at(model, store, phase, tokens, &pos, mrope, state)
+    }
+
+    /// [`vl_step`] with the cache positions `pos` given outright.
+    fn vl_step_at(
+        model: &dyn Model,
+        store: &WeightStore,
+        phase: Phase,
+        tokens: &[i32],
+        pos: &[i32],
+        mrope: Option<[&[i32]; 3]>,
+        state: &[Vec<f32>],
+    ) -> (Vec<f32>, Vec<Vec<f32>>) {
+        let g = model
+            .trace(phase, step_shape(tokens.len(), CAP, LogitRows::All))
+            .unwrap();
+        let zeros = state
+            .is_empty()
+            .then(|| g.state.iter().map(|&(si, _)| vec![0.0; g.aval(si).numel()]));
+        let zeros: Vec<Vec<f32>> = zeros.into_iter().flatten().collect();
+        let state: Vec<&[f32]> = if state.is_empty() { &zeros } else { state }
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
+        let packed: Vec<i32> = match mrope {
+            Some(axes) => axes.concat(),
+            None => pos.repeat(3),
+        };
+        oracle::eval_slots(
+            &g,
+            store,
+            model.weights(),
+            &[],
+            &[
+                (Slot::Token, tokens),
+                (Slot::Pos, pos),
+                (Slot::MropePosition, &packed),
+            ],
+            (&[], &[]),
+            &state,
+        )
+    }
+
+    const PROMPT: [i32; 5] = [3, 17, 40, 8, 25];
+
+    /// A text-only prompt (every token at its text position on all three axes) is plain qwen2: the
+    /// prefill logits at every position and the decode step after it equal the plain model's over
+    /// the same weights. Mutation: take the sin table from the cos table in `apply_rope_sectioned`;
+    /// the equality goes red.
+    #[test]
+    fn text_positions_on_all_three_axes_are_the_plain_qwen2_model() {
+        let (fixture, vl) = vl_model();
+        let plain = fixture_model("qwen2");
+        let plain_store = (plain_entry().fixture)().store;
+        assert_eq!(
+            plain_store.iter().count(),
+            fixture.store.iter().count(),
+            "both fixtures hold the same tensors"
+        );
+        let (want, plain_state) =
+            oracle::run_step(&*plain, &plain_store, Phase::Prefill, CAP, &PROMPT, 0, &[]);
+        let (got, state) = vl_step(&*vl, &fixture.store, Phase::Prefill, &PROMPT, 0, None, &[]);
+        close(&got, &want);
+        let (want, _) = oracle::run_step(
+            &*plain,
+            &plain_store,
+            Phase::Decode,
+            CAP,
+            &[11],
+            PROMPT.len() as i32,
+            &plain_state,
+        );
+        let (got, _) = vl_step(
+            &*vl,
+            &fixture.store,
+            Phase::Decode,
+            &[11],
+            PROMPT.len() as i32,
+            None,
+            &state,
+        );
+        close(&got, &want);
+    }
+
+    fn plain_entry() -> crate::registry::FamilyEntry {
+        super::super::model::ENTRY
+    }
+
+    /// Each axis of `Slot::MropePosition` reaches the logits through its own section: moving only
+    /// the temporal, only the height or only the width ids of a prompt (unevenly) changes them, each
+    /// differently, moving all three equals plain qwen2 at those positions, and moving none does not
+    /// change them. Mutation: build the tower's `Step` without
+    /// `with_mrope`; the trace panics at the sectioned attention.
+    #[test]
+    fn each_axis_changes_the_logits_through_its_own_section() {
+        let (fixture, vl) = vl_model();
+        let text: Vec<i32> = (0..PROMPT.len() as i32).collect();
+        // Not a uniform shift: RoPE is relative, so moving every id alike changes no score.
+        let moved: Vec<i32> = vec![0, 2, 3, 5, 7];
+        let (text, moved) = (text.as_slice(), moved.as_slice());
+        let run = |axes: [&[i32]; 3]| {
+            vl_step(
+                &*vl,
+                &fixture.store,
+                Phase::Prefill,
+                &PROMPT,
+                0,
+                Some(axes),
+                &[],
+            )
+            .0
+        };
+        let base = run([text, text, text]);
+        let (plain, _) = vl_step(&*vl, &fixture.store, Phase::Prefill, &PROMPT, 0, None, &[]);
+        close(&base, &plain);
+        // Independent reference: with all three axes on the moved ids the cache sits at the moved
+        // positions too, and the tower is plain qwen2 at those positions (holes in the cache and all).
+        let plain = fixture_model("qwen2");
+        let plain_store = (plain_entry().fixture)().store;
+        let g = plain
+            .trace(
+                Phase::Prefill,
+                step_shape(PROMPT.len(), CAP, LogitRows::All),
+            )
+            .unwrap();
+        let zeros: Vec<Vec<f32>> = g
+            .state
+            .iter()
+            .map(|&(si, _)| vec![0.0; g.aval(si).numel()])
+            .collect();
+        let zeros: Vec<&[f32]> = zeros.iter().map(Vec::as_slice).collect();
+        let (want, _) = oracle::eval_slots(
+            &g,
+            &plain_store,
+            plain.weights(),
+            &[],
+            &[(Slot::Token, &PROMPT), (Slot::Pos, moved)],
+            (&[], &[]),
+            &zeros,
+        );
+        let (got, _) = vl_step_at(
+            &*vl,
+            &fixture.store,
+            Phase::Prefill,
+            &PROMPT,
+            moved,
+            Some([moved, moved, moved]),
+            &[],
+        );
+        close(&got, &want);
+        // Each single axis moves the logits, and no two axes move them alike: a section read from
+        // the wrong axis would repeat another axis's logits.
+        let singles: Vec<(&str, Vec<f32>)> = [
+            ("temporal", [moved, text, text]),
+            ("height", [text, moved, text]),
+            ("width", [text, text, moved]),
+        ]
+        .into_iter()
+        .map(|(axis, axes)| (axis, run(axes)))
+        .collect();
+        let differ = |a: &[f32], b: &[f32]| a.iter().zip(b).any(|(x, y)| (x - y).abs() > 1e-5);
+        for (axis, out) in &singles {
+            assert!(differ(out, &base), "the {axis} ids do not reach the logits");
+        }
+        for (i, (a, out_a)) in singles.iter().enumerate() {
+            for (b, out_b) in &singles[i + 1..] {
+                assert!(
+                    differ(out_a, out_b),
+                    "the {a} and {b} ids move the logits alike"
+                );
+            }
+        }
+    }
 }

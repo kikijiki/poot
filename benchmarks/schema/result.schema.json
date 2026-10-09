@@ -4,6 +4,29 @@
   "title": "poot benchmark result record",
   "description": "One record per (framework, model, precision, scenario) cell. The harness writes one JSON object per line into results.jsonl. Timing fields come from the runner; memory fields come from the harness external sampler; the env block is written once per run into env.json (not repeated per row). Which binary, on which backend and device, produced a row is on the row itself (build_sha, binary_sha256, backend, device).",
   "definitions": {
+    "deviceTime": {
+      "description": "The device's own time for a profiled window (poot --profile): null when not profiled, `unknown` when the device reports none (ROCm, an untimed device), else measured milliseconds with at least one measure present. Never a zero standing for unknown.",
+      "type": ["object", "null"],
+      "required": ["kind"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "type": "string", "enum": ["measured", "unknown"] },
+        "sum_of_dispatch_ms": { "type": ["number", "null"], "minimum": 0 },
+        "device_span_ms": { "type": ["number", "null"], "minimum": 0 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "enum": ["measured"] } }, "required": ["kind"] },
+          "then": {
+            "required": ["sum_of_dispatch_ms", "device_span_ms"],
+            "anyOf": [
+              { "properties": { "sum_of_dispatch_ms": { "type": "number" } } },
+              { "properties": { "device_span_ms": { "type": "number" } } }
+            ]
+          }
+        }
+      ]
+    },
     "nonnegativePercentiles": {
       "type": "object",
       "required": ["p50", "p90", "p99"],
@@ -118,10 +141,12 @@
           "ttft_ms": { "$ref": "#/definitions/nonnegativePercentiles", "description": "Prefill cost (start to first token), percentiles p50/p90/p99 over iters." },
           "tpot_ms": { "$ref": "#/definitions/positivePercentiles", "description": "Per-token decode cost = (e2e-ttft)/(osl-1), prefill EXCLUDED, percentiles p50/p90/p99." },
           "itl_ms": { "$ref": "#/definitions/nonnegativePercentiles", "description": "Inter-token latency, token-weighted percentiles p50/p90/p99 over all decode gaps." },
-          "decode_tok_s": { "type": "number", "exclusiveMinimum": 0, "description": "Steady-state decode throughput = 1000 / median tpot_ms (prefill excluded)." }
+          "decode_tok_s": { "type": "number", "exclusiveMinimum": 0, "description": "Steady-state decode throughput = 1000 / median tpot_ms (prefill excluded)." },
+          "device_time": { "$ref": "#/definitions/deviceTime" }
         }
       }
     },
+    "device_time": { "$ref": "#/definitions/deviceTime" },
     "timing_claim": {
       "type": "string",
       "enum": ["request-window", "row-level"],

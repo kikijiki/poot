@@ -339,8 +339,7 @@ pub struct DeviceCaps {
 /// the Strix Halo iGPU's display-watchdog TDR within ~1.5s, even though the wgpu executor polls after
 /// every submit (the pre-contract `GpuExecutor::run` did this; the executor contract's `WgpuDevice`
 /// does the same). The trigger is the total busy stretch across a rapid sequence of large dispatches,
-/// not one dispatch's duration. Splitting gives display work scheduling gaps (see
-/// `docs/tasks/done/258-decode-gemv-watchdog-chunking-gap.md` for the calibration table).
+/// not one dispatch's duration. Splitting gives display work scheduling gaps (card 258 holds the calibration table).
 ///
 /// `N` is the dominant hazard axis: BLOOM `N=250880` hangs; gpt-oss `N=201088` (tied, `K=32`) and
 /// SmolLM3 `N=128256` (tied, `K=2048`, higher `out_numel*K` than BLOOM's `2.57e8`) do not. So the trigger

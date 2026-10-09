@@ -321,7 +321,7 @@ def run_cell(model, scen, fw, fw_cfg, runners, models_dir, suite, interval_ms, o
     if not curve:
         timing_fields += [
             "prompt_tokens", "gen_tokens", "ttft_ms", "tpot_ms", "e2e_ms",
-            "decode_tok_s", "iterations", "ttft_ms_stdev", "decode_tok_s_stdev",
+            "decode_tok_s", "iterations", "ttft_ms_stdev", "decode_tok_s_stdev", "device_time",
         ]
     for k in timing_fields:
         if k in timing:

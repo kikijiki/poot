@@ -7,7 +7,6 @@
 //! plan and a fresh budget, and only then publishes [`EngineState::Serving`]. The gauges and `/health`
 //! read the plan; no handler asks a family or a backend.
 
-use std::collections::HashSet;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::{Arc, RwLock};
 
@@ -18,7 +17,7 @@ use poot_llm::driver::capacity::{
     Budget, CapacityRefusal, Fit, FitError, Observation, PlanError, PlanFailure, Planner,
     verify_prepared,
 };
-use poot_llm::driver::error::{DriverError, InvalidOptions, Unsupported};
+use poot_llm::driver::error::{DriverError, InvalidOptions, InvalidRequest, Unsupported};
 use poot_llm::driver::{
     BackendChoice, DraftPolicy, Driver, DriverCaps, DriverOptions, Head, Layout, ModelHandle,
     PoolShape, PreparedSetLimits, ServingShapes, Warm, program_retention,
@@ -44,19 +43,33 @@ const MAX_ENTRIES: usize = 64;
 const MAX_RETAINED_BYTES: u64 = 1 << 32;
 
 /// What the operator asked for. Absent fields take the defaults above.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct EngineArgs {
     pub(crate) backend: BackendChoice,
     pub(crate) rows: NonZeroUsize,
     pub(crate) max_seq: NonZeroUsize,
+    /// How decode rows propose tokens to verify; `Off` serves one token a step.
+    pub(crate) draft: DraftPolicy,
+    /// Prompts carry embedding rows (an image front end feeds the engine): the `PrefillEmbeds`
+    /// entries are planned and prepared beside the token ones.
+    pub(crate) embeds: bool,
 }
 
 impl EngineArgs {
-    pub(crate) fn new(backend: BackendChoice) -> Self {
+    pub(crate) fn new(backend: BackendChoice, draft: DraftPolicy) -> Self {
         Self {
             backend,
+            draft,
+            embeds: false,
             rows: NonZeroUsize::new(DEFAULT_ROWS).expect("nonzero"),
             max_seq: NonZeroUsize::new(DEFAULT_MAX_SEQ).expect("nonzero"),
+        }
+    }
+
+    pub(crate) fn with_embeds(self) -> Self {
+        Self {
+            embeds: true,
+            ..self
         }
     }
 }
@@ -116,8 +129,8 @@ pub(crate) struct EnginePlan {
     pub(crate) device: DeviceId,
     pub(crate) model: String,
     pub(crate) workload: Workload,
-    /// What `prepare` compiled; `None` for a workload that prepares on first use.
-    pub(crate) caps: Option<DriverCaps>,
+    /// What `prepare` compiled.
+    pub(crate) caps: DriverCaps,
     pub(crate) budget: BudgetReport,
 }
 
@@ -342,7 +355,11 @@ fn domain(rows: NonZeroUsize, max_seq: NonZeroUsize) -> Vec<Candidate> {
     }
 }
 
-fn driver_options(handle: &ModelHandle, max_seq: NonZeroUsize) -> DriverOptions {
+fn driver_options(
+    handle: &ModelHandle,
+    max_seq: NonZeroUsize,
+    draft: DraftPolicy,
+) -> DriverOptions {
     let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
     // The largest granule multiple within the chunk budget and the capacity, and never below one granule.
     let granule = handle.config().prefill_granule.get();
@@ -360,7 +377,7 @@ fn driver_options(handle: &ModelHandle, max_seq: NonZeroUsize) -> DriverOptions 
             max_retained_bytes: NonZeroU64::new(MAX_RETAINED_BYTES).expect("nonzero"),
         },
         charge: program_retention,
-        draft: DraftPolicy::Off,
+        draft,
     }
 }
 
@@ -433,7 +450,12 @@ impl EnginePlan {
             max_seq,
             &mut observe,
         )?;
-        let caps = driver.caps().cloned();
+        // `prepare` published them: a driver without caps is a bug in the preparation, reported as the
+        // driver's own typed refusal.
+        let caps = driver
+            .caps()
+            .cloned()
+            .ok_or_else(|| DriverError::from(InvalidRequest::NotPrepared))?;
         let observed = observe(&driver.observation());
         let workload = Workload::Generate {
             rows: candidate.rows,
@@ -480,38 +502,23 @@ fn fit_and_prepare(
     observe: &mut impl FnMut(&Observation) -> Budget,
 ) -> Result<Fitted, StartupError> {
     let planner = Planner::new(Arc::clone(handle), targets)?;
-    // A row count the model cannot serve (recurrent state serves one) is refused whatever the
-    // positions are: remember it instead of planning each of its candidates.
-    let mut refused_rows = HashSet::new();
     let mut planning_weight_bytes_read = 0u64;
     let mut planning_kernels_resolved = 0u64;
     let fit = poot_llm::driver::capacity::fit(
         &domain(args.rows, max_seq),
         |candidate| {
-            if refused_rows.contains(&candidate.rows) {
-                return Err(PlanFailure::Shape(PlanError::Driver(
-                    InvalidOptions::RecurrentServesOneSequence.into(),
-                )));
-            }
             let rows = [candidate.rows];
             planner
                 .plan(
-                    driver_options(handle, candidate.max_seq),
+                    driver_options(handle, candidate.max_seq, args.draft.clone()),
                     &shapes_of(candidate, &rows),
+                    args.embeds,
                 )
                 .inspect(|planned| {
                     planning_weight_bytes_read += planned.weight_bytes_read;
                     planning_kernels_resolved += planned.kernels_resolved;
                 })
-                .map_err(|error| match error {
-                    PlanError::Driver(DriverError::InvalidOptions(
-                        InvalidOptions::RecurrentServesOneSequence,
-                    )) => {
-                        refused_rows.insert(candidate.rows);
-                        PlanFailure::Shape(error)
-                    }
-                    other => PlanFailure::Fatal(other),
-                })
+                .map_err(PlanFailure::Fatal)
         },
         // One observation per admission, never the budget read once before the search.
         || observe(&Observation::of(&*executor)),
@@ -532,10 +539,13 @@ fn fit_and_prepare(
     let mut driver = Driver::new(
         Arc::clone(handle),
         executor,
-        driver_options(handle, chosen.max_seq),
+        driver_options(handle, chosen.max_seq, args.draft.clone()),
     )?;
     let rows = [chosen.rows];
     driver.prepare(&shapes_of(&chosen, &rows))?;
+    if args.embeds {
+        driver.prepare_embeds(&shapes_of(&chosen, &rows))?;
+    }
     verify_prepared(
         &footprint,
         device,

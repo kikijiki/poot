@@ -30,6 +30,8 @@ pub(crate) struct DeviceFeatures {
     /// `VK_EXT_subgroup_size_control` with `subgroupSizeControl` and `computeFullSubgroups`: a pipeline
     /// can require full subgroups of a chosen size.
     subgroup_size_control: bool,
+    /// `VK_EXT_memory_budget`: the driver reports each heap's OS-arbitrated budget and this process's usage.
+    memory_budget: bool,
 }
 
 impl DeviceFeatures {
@@ -48,6 +50,7 @@ impl DeviceFeatures {
         let has_coop = has(ash::khr::cooperative_matrix::NAME);
         let has_zero_init = has(ash::khr::zero_initialize_workgroup_memory::NAME);
         let has_size_control = has(ash::ext::subgroup_size_control::NAME);
+        let has_memory_budget = has(ash::ext::memory_budget::NAME);
         let mut v11 = vk::PhysicalDeviceVulkan11Features::default();
         let mut v12 = vk::PhysicalDeviceVulkan12Features::default();
         let mut coop = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
@@ -90,7 +93,13 @@ impl DeviceFeatures {
             subgroup_size_control: has_size_control
                 && on(size_control.subgroup_size_control)
                 && on(size_control.compute_full_subgroups),
+            memory_budget: has_memory_budget,
         }
+    }
+
+    /// Whether `VK_EXT_memory_budget` is enabled on the device, so the heap budget can be queried.
+    pub(crate) fn memory_budget(&self) -> bool {
+        self.memory_budget
     }
 
     /// Whether `VK_KHR_cooperative_matrix` is present, so its properties can be queried.
@@ -127,6 +136,9 @@ impl DeviceFeatures {
         }
         if self.subgroup_size_control {
             extension_names.push(ash::ext::subgroup_size_control::NAME.as_ptr());
+        }
+        if self.memory_budget {
+            extension_names.push(ash::ext::memory_budget::NAME.as_ptr());
         }
         let core = vk::PhysicalDeviceFeatures::default()
             .shader_float64(self.shader_float64)

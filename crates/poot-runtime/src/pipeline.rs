@@ -59,8 +59,7 @@ pub(crate) struct PendingFault {
     /// whose guard lives on the `CachedDispatch` itself for its whole lifetime) - charging it twice here
     /// would double-count the same physical allocation. Dropped together with `storage` when this
     /// `PendingFault` drops, inside `Context::stage_pending_faults`'s per-entry closure.
-    #[allow(dead_code, reason = "held only for its Drop side effect, Card 547a")]
-    pub(crate) guard: Option<std::sync::Arc<poot_runtime_common::AllocGuard>>,
+    pub(crate) _guard: Option<std::sync::Arc<poot_runtime_common::AllocGuard>>,
 }
 
 /// One [`Context::submit_encoded`] call's registered-but-not-yet-drained timestamp readback under
@@ -73,11 +72,7 @@ pub(crate) struct PendingDeviceTiming {
     /// The dispatch index (within the whole step's recording) of this chunk's first dispatch.
     pub(crate) base_index: usize,
     pub(crate) count: usize,
-    #[allow(
-        dead_code,
-        reason = "held only for its Drop side effect (releases the Staging charge)"
-    )]
-    pub(crate) guard: std::sync::Arc<poot_runtime_common::AllocGuard>,
+    pub(crate) _guard: std::sync::Arc<poot_runtime_common::AllocGuard>,
 }
 
 /// Running fold of every [`PendingDeviceTiming`] drained so far this step (review F3: a resource-
@@ -153,9 +148,7 @@ pub struct CachedDispatch {
     /// direct validation/timestamp-adjacent staging the one memory service must see). Held only for
     /// its `Drop`, which fires when this `CachedDispatch` (and the `bind_group` referencing the length
     /// buffer) drops.
-    #[allow(dead_code, reason = "held only for its Drop side effect, Card 547a")]
-    pub(crate) length_buffer_guard: std::sync::Arc<poot_runtime_common::AllocGuard>,
+    pub(crate) _length_buffer_guard: std::sync::Arc<poot_runtime_common::AllocGuard>,
     /// Same accounting for [`Self::error_storage`], when present.
-    #[allow(dead_code, reason = "held only for its Drop side effect, Card 547a")]
-    pub(crate) error_storage_guard: Option<std::sync::Arc<poot_runtime_common::AllocGuard>>,
+    pub(crate) _error_storage_guard: Option<std::sync::Arc<poot_runtime_common::AllocGuard>>,
 }

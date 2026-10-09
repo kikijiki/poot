@@ -528,13 +528,15 @@ impl Planner {
         })
     }
 
-    /// Prepare `shapes` under `options` on a [`PlanningDevice`] and return what that allocated. The
-    /// preparation is the production one; only the device is a recorder, so nothing is uploaded and
-    /// nothing is left behind when this returns.
+    /// Prepare `shapes` under `options` on a [`PlanningDevice`] and return what that allocated; with
+    /// `embeds`, the `PrefillEmbeds` entries ([`Driver::prepare_embeds`]) too. The preparation is the
+    /// production one; only the device is a recorder, so nothing is uploaded and nothing is left
+    /// behind when this returns.
     pub fn plan(
         &self,
         options: DriverOptions,
         shapes: &ServingShapes<'_>,
+        embeds: bool,
     ) -> Result<Planned, PlanError> {
         let counters = MemoryCounters::new();
         let records: Records = Arc::default();
@@ -549,6 +551,9 @@ impl Planner {
             options,
         )?;
         driver.prepare(shapes)?;
+        if embeds {
+            driver.prepare_embeds(shapes)?;
+        }
         let mut footprint = Footprint::new();
         for record in records.lock().expect("planning records").iter() {
             if record.live {
@@ -681,7 +686,12 @@ impl Device for PlanningDevice {
     }
 
     /// Loading an entry uploads constants; the planning device drops the bytes.
-    fn write(&mut self, _dst: &PlanningBuffer, _bytes: &[u8]) -> Result<(), PlanningOnly> {
+    fn write(
+        &mut self,
+        _dst: &PlanningBuffer,
+        _offset: usize,
+        _bytes: &[u8],
+    ) -> Result<(), PlanningOnly> {
         Ok(())
     }
 

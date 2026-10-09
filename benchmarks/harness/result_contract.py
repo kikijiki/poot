@@ -25,6 +25,11 @@ ROW_LEVEL = "row-level"
 WINDOW_CLAIMING_FRAMEWORKS = frozenset({"poot"})
 
 
+# Frameworks whose runner reports the device's own time for a profiled window (`device_time`). Every other
+# runner has no device timestamps to report, and a `device_time` from one is refused rather than believed.
+DEVICE_TIME_CLAIMING_FRAMEWORKS = frozenset({"poot"})
+
+
 def timing_claim(framework):
     """The timing capability `framework`'s runner claims."""
     return REQUEST_WINDOW if framework in WINDOW_CLAIMING_FRAMEWORKS else ROW_LEVEL
@@ -194,6 +199,8 @@ def validate_runner_result(result, *, framework, precision, scenario, gen_tokens
         errors.extend(_build_identity_errors(result, backend))
         errors.extend(preparation_shape_errors(result.get("preparation"), require_state=False))
 
+    errors.extend(_device_time_claim_errors(result, framework))
+
     if "error" in result:
         errors.append(f"runner reported error: {result['error']!r}")
     if "status" in result and result["status"] != "ok":
@@ -260,6 +267,54 @@ def validate_runner_result(result, *, framework, precision, scenario, gen_tokens
         prepared["curve"] = curve
         return prepared
     return result
+
+
+def _device_time_errors(value, prefix):
+    """`device_time` is `null` (not profiled), `{"kind": "unknown"}` (the device reports none) or
+    `{"kind": "measured", "sum_of_dispatch_ms", "device_span_ms"}` with at least one measure a finite
+    nonnegative number and the other a number or null. A measured time with neither measure is the
+    zero-for-unknown the type exists to prevent."""
+    if value is None:
+        return []
+    if not isinstance(value, dict):
+        return [f"{prefix}device_time must be null or an object; got {value!r}"]
+    kind = value.get("kind")
+    if kind == "unknown":
+        extra = sorted(set(value) - {"kind"})
+        return [f"{prefix}device_time unknown carries {extra!r}"] if extra else []
+    if kind != "measured":
+        return [f"{prefix}device_time kind must be 'measured' or 'unknown'; got {kind!r}"]
+    errors = []
+    measures = []
+    for field in ("sum_of_dispatch_ms", "device_span_ms"):
+        measure = value.get(field)
+        if measure is None:
+            continue
+        if _is_finite_number(measure) and measure >= 0:
+            measures.append(measure)
+        else:
+            errors.append(f"{prefix}device_time.{field} must be a finite nonnegative number or null; got {measure!r}")
+    if not errors and not measures:
+        errors.append(f"{prefix}device_time measured carries neither measure; report unknown instead")
+    return errors
+
+
+def _device_time_claim_errors(result, framework):
+    """Every `device_time` of `result` (the row's, and each raw curve point's) is well formed and comes from a
+    runner that claims device timing."""
+    carriers = [("", result)]
+    curve = result.get("curve")
+    if isinstance(curve, list):
+        carriers += [(f"curve[{i}].", p) for i, p in enumerate(curve) if isinstance(p, dict)]
+    errors = []
+    for prefix, carrier in carriers:
+        if "device_time" not in carrier:
+            continue
+        if framework not in DEVICE_TIME_CLAIMING_FRAMEWORKS:
+            errors.append(f"{prefix}device_time reported by {framework!r}, which does not claim device timing")
+        else:
+            errors.extend(_device_time_errors(carrier["device_time"], prefix))
+    return errors
 
 
 def _single_run_errors(result, gen_tokens):
@@ -436,8 +491,7 @@ def _aggregate_curve(raw_curve, osl, claim):
             throughput = 1000.0 / tpot_median
         except (OverflowError, TypeError, ZeroDivisionError):
             throughput = None
-        points.append(
-            {
+        entry = {
                 "isl": point["isl"],
                 "osl": osl,
                 "prompt_tokens": point["prompt_tokens"],
@@ -446,8 +500,10 @@ def _aggregate_curve(raw_curve, osl, claim):
                 "tpot_ms": tpot_percentiles,
                 "itl_ms": _pcts(all_itls),
                 "decode_tok_s": throughput,
-            }
-        )
+        }
+        if "device_time" in point:
+            entry["device_time"] = point["device_time"]
+        points.append(entry)
     points.sort(key=lambda point: point["isl"])
     return points
 

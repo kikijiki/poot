@@ -40,6 +40,12 @@ impl PromptEmbeds {
         &self.positions
     }
 
+    /// The rows of entries `entries` (indices into [`Self::positions`]), row-major.
+    #[cfg(test)]
+    pub(super) fn rows_for(&self, entries: std::ops::Range<usize>) -> Vec<f32> {
+        self.rows[entries.start * self.width..entries.end * self.width].to_vec()
+    }
+
     /// Check the rows against a prompt of `prompt` tokens: ascending and inside it.
     pub(super) fn check_prompt(&self, prompt: usize) -> Result<(), EmbedsError> {
         let mut previous = None;

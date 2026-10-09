@@ -503,13 +503,18 @@ impl PtxContext {
         Ok(Some(PtxSpan { start, stop }))
     }
 
-    /// The elapsed device time `span` bracketed (Card 552 SC-006). The caller must have synchronized
-    /// since [`PtxContext::launch_timed`] recorded `span`, or the events may not have completed yet.
-    pub fn span_elapsed(&self, span: &PtxSpan) -> Result<Duration, PtxError> {
+    /// The elapsed device time from the start of the first of `spans` to the end of the last (Card
+    /// 552 SC-006): the window one step's consecutive replays occupied on this context's stream, `None`
+    /// for no spans. The caller must have synchronized since [`PtxContext::launch_timed`] recorded
+    /// them, or the events may not have completed yet.
+    pub fn spans_elapsed(&self, spans: &[PtxSpan]) -> Result<Option<Duration>, PtxError> {
+        let (Some(first), Some(last)) = (spans.first(), spans.last()) else {
+            return Ok(None);
+        };
         // SAFETY: both events are live and were recorded on this context's stream; the caller is
         // responsible for having synchronized first (documented above).
-        let ms = unsafe { result::event::elapsed(span.start.event, span.stop.event) }?;
-        Ok(Duration::from_secs_f64(ms as f64 / 1000.0))
+        let ms = unsafe { result::event::elapsed(first.start.event, last.stop.event) }?;
+        Ok(Some(Duration::from_secs_f64(ms as f64 / 1000.0)))
     }
 
     /// Refuse `op` with [`PtxError::CaptureOpen`] while a capture is open on this context.
@@ -550,14 +555,19 @@ impl PtxContext {
         self.alloc_zeroed("alloc_storage", elems, storage, role)
     }
 
-    /// Overwrite the first `bytes.len()` bytes of `buf`, dtype-agnostic (Card 547a: mirrors
+    /// Overwrite `bytes.len()` bytes of `buf` from byte `offset`, dtype-agnostic (Card 547a: mirrors
     /// `poot_runtime::Context::write_bytes`). Enqueued on `self.stream` and synchronized, like
     /// [`Self::update_f32`].
-    pub fn write_bytes(&self, buf: &PtxBuffer, bytes: &[u8]) -> Result<(), PtxError> {
+    pub fn write_bytes(
+        &self,
+        buf: &PtxBuffer,
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), PtxError> {
         self.refuse_during_capture("write_bytes")?;
-        let _range = crate::buffer::checked_byte_range("write_bytes", buf, bytes.len())?;
-        let dst = buf.ptr();
-        // SAFETY: `_range` proved `bytes.len()` lies inside `buf`'s live allocation. The copy runs on
+        let range = crate::buffer::checked_byte_range("write_bytes", buf, offset, bytes.len())?;
+        let dst = buf.ptr() + range.byte_offset as sys::CUdeviceptr;
+        // SAFETY: `range` proved `offset..offset + bytes.len()` lies inside `buf`'s live allocation. The copy runs on
         // this context's stream; the driver stages pageable `bytes` before returning, and the stream
         // is synchronized below before `bytes` can be released. No capture is open (refused above).
         unsafe { result::memcpy_htod_async(dst, bytes, self.owner.stream) }?;
@@ -569,7 +579,7 @@ impl PtxContext {
     /// `poot_runtime::Context::read_bytes`). Syncs the stream first so pending writes have completed.
     pub fn read_bytes(&self, buf: &PtxBuffer, out: &mut [u8]) -> Result<(), PtxError> {
         self.refuse_during_capture("read_bytes")?;
-        let _range = crate::buffer::checked_byte_range("read_bytes", buf, out.len())?;
+        let _range = crate::buffer::checked_byte_range("read_bytes", buf, 0, out.len())?;
         self.synchronize()?;
         // SAFETY: `_range` proved `out.len()` lies inside `buf`'s live allocation, and the stream has
         // finished every write to it.

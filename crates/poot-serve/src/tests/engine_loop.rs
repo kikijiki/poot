@@ -8,6 +8,7 @@ use poot_llm::driver::{PrefixOutcome, Release};
 use super::*;
 use crate::engine_plan::{Death, EngineState};
 use crate::lifecycle::JobGuard;
+use crate::types::EncodeRow;
 
 /// SC-005 (R477-011): a non-streaming request whose client disconnects is cancelled and its slot released
 /// within one step. The request never ends on its own and streams nothing, so only the hang-up probe can
@@ -23,7 +24,7 @@ fn a_non_streaming_request_whose_client_hangs_up_is_released_within_one_step() {
     });
     engine.max_seq = usize::MAX / 2;
     let log = Arc::clone(&engine.log);
-    let (tx, rx) = mpsc::channel::<Job>();
+    let (tx, rx) = mpsc::channel::<EngineMsg>();
     let metrics = Arc::new(test_metrics("submit-cancel"));
     let health = EngineHealth::serving_for_test("fake", 1, 64);
     let thread = {
@@ -33,15 +34,12 @@ fn a_non_streaming_request_whose_client_hangs_up_is_released_within_one_step() {
     let started = Instant::now();
     let (result_tx, result_rx) = mpsc::channel();
     let submit_tx = tx.clone();
+    let submit_metrics = Arc::clone(&metrics);
     std::thread::spawn(move || {
         let outcome = submit(
             &submit_tx,
-            "ab",
-            1_000_000,
-            Sampler::greedy(),
-            vec![],
-            false,
-            AdapterRef::Base,
+            &submit_metrics,
+            generation_request("ab", 1_000_000, false),
             &|| started.elapsed() > Duration::from_millis(150),
             |_, _| GenerationControl::Continue(()),
         )
@@ -108,7 +106,7 @@ fn a_cancel_during_a_step_releases_after_that_step_commits_and_before_the_next()
             Ok(())
         });
     let (tx, rx) = mpsc::channel();
-    tx.send(job).unwrap();
+    tx.send(EngineMsg::Generate(Box::new(job))).unwrap();
     drop(tx);
     let metrics = test_metrics("cancel-order");
     assert_eq!(run_engine(&mut engine, &rx, &metrics), Exit::Shutdown);
@@ -156,7 +154,7 @@ fn two_requests_over_one_prompt(recurrent: bool) -> (RecordingEngine, Arc<Metric
     let tokens: Vec<Vec<u32>> = submitted
         .iter()
         .map(|request| match outcome(request).1 {
-            GenEvent::Done(tokens, ..) => tokens,
+            GenEvent::Done(completion) => completion.tokens,
             GenEvent::Failed(failure) => panic!("the request failed: {failure}"),
             GenEvent::Token(..) => unreachable!("outcome stops at the terminal"),
         })
@@ -241,7 +239,7 @@ pub(super) fn health_over_http(health: &EngineHealth) -> (String, serde_json::Va
     client
         .write_all(b"GET /health HTTP/1.1\r\n\r\n")
         .expect("write request");
-    let backend = Backend::Decoder(model);
+    let (served, _queue) = served_over(model, 1);
     let metrics = test_metrics("health");
     let limiter = RateLimiter {
         rpm: 0,
@@ -249,7 +247,7 @@ pub(super) fn health_over_http(health: &EngineHealth) -> (String, serde_json::Va
     };
     let policy = LoraAdminPolicy::from_configured_key(IpAddr::from([127, 0, 0, 1]), None)
         .expect("loopback policy");
-    handle(server, None, health, &backend, &metrics, &limiter, &policy).expect("handled");
+    handle(server, &served, health, &metrics, &limiter, &policy).expect("handled");
     let mut response = String::new();
     client.read_to_string(&mut response).expect("read response");
     let status = response.lines().next().unwrap_or_default().to_string();
@@ -282,7 +280,7 @@ fn a_panicking_step_makes_health_dead_with_the_reason_and_fails_the_request() {
         Ok(())
     });
     let health = EngineHealth::serving_for_test("fake", 1, 64);
-    let (tx, rx) = mpsc::channel::<Job>();
+    let (tx, rx) = mpsc::channel::<EngineMsg>();
     let metrics = Arc::new(test_metrics("panic"));
     let thread = {
         let (metrics, health) = (Arc::clone(&metrics), health.clone());
@@ -290,12 +288,8 @@ fn a_panicking_step_makes_health_dead_with_the_reason_and_fails_the_request() {
     };
     let error = submit(
         &tx,
-        "ab",
-        10,
-        Sampler::greedy(),
-        vec![],
-        false,
-        AdapterRef::Base,
+        &metrics,
+        generation_request("ab", 10, false),
         &|| false,
         |_, _| GenerationControl::Continue(()),
     )
@@ -333,12 +327,12 @@ fn a_faulting_step_fails_every_request_and_marks_the_engine_dead_with_the_fault(
         Ok(())
     });
     let health = EngineHealth::serving_for_test("fake", 1, 64);
-    let (tx, rx) = mpsc::channel::<Job>();
+    let (tx, rx) = mpsc::channel::<EngineMsg>();
     let metrics = Arc::new(test_metrics("fault"));
     let mut requests = Vec::new();
     for prompt in ["ab", "cd"] {
         let (job, submitted) = JobSpec::new(prompt, 10).build();
-        tx.send(job).unwrap();
+        tx.send(EngineMsg::Generate(Box::new(job))).unwrap();
         requests.push(submitted);
     }
     drop(tx);
@@ -367,7 +361,7 @@ fn a_faulting_step_fails_every_request_and_marks_the_engine_dead_with_the_fault(
 fn a_refused_step_fails_its_requests_and_the_engine_keeps_serving() {
     let mut engine = RecordingEngine::new(2).on_step(|step, _| {
         if step == 1 {
-            return Err(EngineError::Refused("no prepared entry for 2 rows".into()));
+            return Err(refused("no prepared entry for 2 rows"));
         }
         Ok(())
     });
@@ -377,7 +371,7 @@ fn a_refused_step_fails_its_requests_and_the_engine_keeps_serving() {
     let mut first_wave = Vec::new();
     for prompt in ["ab", "cd"] {
         let (job, submitted) = JobSpec::new(prompt, 2).build();
-        tx.send(job).unwrap();
+        tx.send(EngineMsg::Generate(Box::new(job))).unwrap();
         first_wave.push(submitted);
     }
     let metrics = test_metrics("refused");
@@ -386,7 +380,7 @@ fn a_refused_step_fails_its_requests_and_the_engine_keeps_serving() {
     let sender = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(80));
         let (job, submitted) = JobSpec::new("ef", 2).build();
-        tx2.send(job).unwrap();
+        tx2.send(EngineMsg::Generate(Box::new(job))).unwrap();
         submitted
     });
     drop(tx);
@@ -443,7 +437,7 @@ fn a_fault_commits_nothing_releases_nothing_and_leaves_the_poison_in_place() {
     let mut requests = Vec::new();
     for prompt in ["ab", "cd"] {
         let (job, submitted) = JobSpec::new(prompt, 10).build();
-        tx.send(job).unwrap();
+        tx.send(EngineMsg::Generate(Box::new(job))).unwrap();
         requests.push(submitted);
     }
     drop(tx);
@@ -488,8 +482,8 @@ fn a_step_whose_results_do_not_match_its_rows_is_a_fault_and_commits_nothing() {
         fn eos(&self) -> &std::collections::BTreeSet<u32> {
             self.0.eos()
         }
-        fn encode(&self, prompt: &str) -> anyhow::Result<Vec<u32>> {
-            self.0.encode(prompt)
+        fn decode(&self, tokens: &[u32]) -> anyhow::Result<String> {
+            self.0.decode(tokens)
         }
         fn piece(&self, tokens: &[u32], gen_start: usize) -> anyhow::Result<String> {
             self.0.piece(tokens, gen_start)
@@ -517,6 +511,15 @@ fn a_step_whose_results_do_not_match_its_rows_is_a_fault_and_commits_nothing() {
         fn release(&mut self, seq: FakeSeq, mode: Release) -> Result<PrefixOutcome, EngineError> {
             self.0.release(seq, mode)
         }
+        fn encode(&mut self, rows: &[EncodeRow]) -> Result<poot_llm::driver::Encoded, EngineError> {
+            self.0.encode(rows)
+        }
+        fn admin(
+            &mut self,
+            request: crate::types::AdminRequest,
+        ) -> Result<crate::types::AdminReply, crate::types::AdminError> {
+            self.0.admin(request)
+        }
         fn kv_blocks(&self) -> Option<(usize, usize)> {
             self.0.kv_blocks()
         }
@@ -530,7 +533,7 @@ fn a_step_whose_results_do_not_match_its_rows_is_a_fault_and_commits_nothing() {
     let mut engine = Mismatch(RecordingEngine::new(1));
     let (job, submitted) = JobSpec::new("ab", 3).build();
     let (tx, rx) = mpsc::channel();
-    tx.send(job).unwrap();
+    tx.send(EngineMsg::Generate(Box::new(job))).unwrap();
     drop(tx);
     let metrics = test_metrics("mismatch");
     let exit = run_engine(&mut engine, &rx, &metrics);
@@ -589,4 +592,65 @@ fn a_failed_release_tells_the_client_the_fault_before_the_loop_stops() {
         failure.to_string().contains("device lost in release"),
         "{failure}"
     );
+}
+
+/// POOT-1084: an `Encode` step whose device error left the engine intact (`FailureClass::Step`) fails that
+/// request alone. A generation queued before it and one queued after both complete, the encode's caller gets
+/// the typed failure in its class and `/health` stays `serving`. Mutation: treat every encode error as an
+/// engine fault (`Err(Fault)` for `Refused` in `Run::encode`): the later generation fails, the engine is
+/// `dead`, and the row goes red.
+#[test]
+fn an_encode_step_failing_with_the_engine_intact_fails_only_its_request() {
+    let engine = RecordingEngine::new(1);
+    let mut engine = engine;
+    engine.on_encode = Box::new(|_| {
+        Err(EngineError::Refused {
+            class: poot_llm::driver::error::FailureClass::Step,
+            reason: "encode step failed, executable reset".into(),
+        })
+    });
+    let health = EngineHealth::serving_for_test("fake", 1, 64);
+    let (tx, rx) = mpsc::channel::<EngineMsg>();
+    let metrics = Arc::new(test_metrics("encode-step"));
+    let (before, before_events) = JobSpec::new("ab", 2).build();
+    tx.send(EngineMsg::Generate(Box::new(before))).unwrap();
+    let (reply, encode_reply) = mpsc::channel();
+    tx.send(EngineMsg::Encode(crate::types::EncodeJob {
+        rows: vec![EncodeRow {
+            ids: vec![1, 2],
+            types: Vec::new(),
+        }],
+        reply,
+        cancel: Arc::default(),
+    }))
+    .unwrap();
+    let (after, after_events) = JobSpec::new("cd", 2).build();
+    tx.send(EngineMsg::Generate(Box::new(after))).unwrap();
+    drop(tx);
+    let engine = run_engine_thread(engine, rx, &metrics, &health);
+
+    let failure = encode_reply
+        .recv()
+        .expect("the encode caller is answered")
+        .expect_err("the encode step failed");
+    assert_eq!(
+        failure.class(),
+        poot_llm::driver::error::FailureClass::Step,
+        "{failure}"
+    );
+    for request in [&before_events, &after_events] {
+        assert!(
+            matches!(outcome(request).1, GenEvent::Done(..)),
+            "a generation beside the failed encode completes"
+        );
+    }
+    assert!(
+        matches!(health.state(), EngineState::Serving { .. }),
+        "{:?}",
+        health.state()
+    );
+    let (status, body) = health_over_http(&health);
+    assert!(status.contains("200"), "{status} {body}");
+    assert_eq!(body["status"], "serving", "{body}");
+    drop(engine);
 }

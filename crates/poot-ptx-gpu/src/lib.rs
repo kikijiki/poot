@@ -10,10 +10,7 @@
 pub mod device;
 pub mod multi_device;
 pub mod p2p;
-mod precompile;
 pub mod ring;
-
-pub use precompile::precompile_graph;
 
 use poot_graph_ir::{ExecutionValidationFailure, ValidationId, ValueId};
 pub use poot_ptx_runtime::{PtxBuffer, PtxContext};

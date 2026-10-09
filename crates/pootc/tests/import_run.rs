@@ -10,6 +10,7 @@
 //! `.clamp()` and `.max().min()` are equivalent here.
 #![allow(clippy::manual_clamp)]
 
+use poot_test_util::contained_child::ContainChild;
 use std::process::Command;
 
 use poot_kernel_ir::Body;
@@ -130,6 +131,7 @@ fn pootc_compile(kernel_file: &str, src_name: &str) -> (CompiledKernel, u32, boo
     let out_dir = std::env::temp_dir().join(format!("pootc-{src_name}"));
     std::fs::create_dir_all(&out_dir).unwrap();
     let status = Command::new(exe)
+        .contained()
         .args([
             "--edition",
             "2021",
@@ -165,6 +167,7 @@ fn pootc_compile_nvptx(kernel_file: &str, src_name: &str) -> (Body, String) {
     let out_dir = std::env::temp_dir().join(format!("pootc-nvptx-{src_name}"));
     std::fs::create_dir_all(&out_dir).unwrap();
     let status = Command::new(exe)
+        .contained()
         .args([
             "--edition",
             "2021",
@@ -252,6 +255,7 @@ fn regenerate_asset(entry: &poot_graph_plan::AssetEntry) -> String {
     let out_dir = std::env::temp_dir().join(format!("pootc-assetcheck-{}", entry.source));
     std::fs::create_dir_all(&out_dir).unwrap();
     let status = Command::new(exe)
+        .contained()
         .args(["--edition", "2021", "--crate-type", "lib"])
         .arg(&src_path)
         .arg("-o")
@@ -401,6 +405,7 @@ fn llc_spin_depth4_and_reproducer() {
     let log_path = out_dir.join("pootc.log");
     let log = std::fs::File::create(&log_path).expect("pootc log file");
     let mut child = std::process::Command::new(exe)
+        .contained()
         .args(["--edition", "2021", "--crate-type", "lib", kernel, "-o"])
         .arg(out_dir.join("llc_spin_depth4_and.out"))
         .arg("--extern")
@@ -678,6 +683,7 @@ fn assert_trap_traps_on_ptx() {
     let out_dir = std::env::temp_dir().join("pootc-assert-trap-ptx");
     std::fs::create_dir_all(&out_dir).unwrap();
     let status = Command::new(exe)
+        .contained()
         .args(["--edition", "2021", "--crate-type", "lib", kernel, "-o"])
         .arg(out_dir.join("assert_trap.out"))
         .arg("--extern")
@@ -770,6 +776,7 @@ fn add_kernel_imported_from_mir_emits_ptx() {
     let out_dir = std::env::temp_dir().join("pootc-add-ptx");
     std::fs::create_dir_all(&out_dir).unwrap();
     let status = Command::new(exe)
+        .contained()
         .args(["--edition", "2021", "--crate-type", "lib", kernel, "-o"])
         .arg(out_dir.join("add.out"))
         .arg("--extern")

@@ -1,23 +1,24 @@
-//! Classifies every eqn of the qwen2 family's batched shared-pool decode graph
-//! via `plan_eqn` on `Backend::Nvptx` at `n_slots = 2`: every eqn must plan (the planner has no host
-//! plan; an unplannable eqn is a typed refusal, Card 626). CPU-only, no GPU or checkpoint. The graph is what `runner.trace_batched_shared_pool_decode(cap, n_slots, pool_slots,
-//! false)` produces for a batched paged-KV decode entry (Card 549: staged through `compile_staged` and
-//! stepped on `Engine<PtxDevice>`).
+//! CPU-only pre-check (no GPU, no checkpoint): classify every eqn of the qwen2 family's batched paged
+//! decode graph via `plan_eqn` at `n_slots = 2`. Every eqn planning
+//! (the planner has no host plan: an unplannable eqn is a typed refusal, Card 626) is what makes the
+//! executor contract's capture-on-first-step default (Card 548: `Engine::step` records once, replays every step after) safe for this graph
+//! on ROCm.
 //!
-//! PTX twin of `card234_rocm_batched_decode_plan_classify.rs` (`Backend::AmdGcn`): checks the graph is
-//! plannable before using a rented GPU. It traces
-//! the qwen2 family's paged decode step directly (no real checkpoint needed)
-//! and applies the pre-`compile` pass chain locally (below), so the equations classified are the fused ones `compile` plans.
+//! Builds the graph with `Model::trace` of the qwen2 family (a paged decode step over a checkpoint of zeros) and applies the pre-`compile` pass chain locally, which classifies the fused equations
+//! `compile` plans.
+
+#![cfg(feature = "rocm")]
 
 use poot_executor_parity::dense::{Dense, Family, paged_step, plain};
-use poot_graph_plan::{Plan, widen_mismatched_matmul_dtypes};
+use poot_graph_plan::{Plan, prepare_target_graph};
 use poot_llm::driver::block_table::BLOCK_SIZE;
 use poot_models::model::{LogitRows, Phase};
+use poot_target::AmdArch;
 use poot_target::Backend;
 use poot_tensor::DType;
+use poot_test_util::graph_fixtures::plan_eqn;
 
 use poot_graph_plan::passes_without_target as optimize;
-use poot_test_util::graph_fixtures::plan_eqn;
 use std::collections::BTreeMap;
 
 /// qwen2.5-0.5b dims (a BF16 checkpoint of zeros: only the traced graph is read).
@@ -44,12 +45,10 @@ fn plan_tag(p: &Plan) -> &'static str {
 }
 
 #[test]
-fn card129a5_ptx_paged_engine_plan_classify_qwen2_n_slots_2() {
+fn rocm_batched_decode_plan_classify_qwen2_n_slots_2() {
     let n_slots = 2usize;
-    // cap/pool_slots mirror a representative paged pool size
-    // (`num_blocks = (n_slots*cap).div_ceil(BLOCK_SIZE); pool_slots = num_blocks*BLOCK_SIZE + 1`, the
-    // same shape `poot-llm/src/driver/block_table.rs::BLOCK_SIZE`-backed batched decode uses); exact values
-    // only change tensor sizes, not which ops plan.
+    // cap/pool_slots approximate `batch_engine_loop_rocm_runner`'s computation in
+    // `crates/poot-serve/src/batch.rs`; exact values change tensor sizes, not which ops plan.
     let cap = 32;
     let num_blocks = (n_slots * cap).div_ceil(BLOCK_SIZE);
     let pool_slots = num_blocks * BLOCK_SIZE + 1;
@@ -63,10 +62,10 @@ fn card129a5_ptx_paged_engine_plan_classify_qwen2_n_slots_2() {
             )
             .unwrap(),
     );
-    let backend = Backend::Nvptx;
+    let backend = Backend::AmdGcn(AmdArch::gfx1151());
     // The pre-`compile` passes, so the equations classified are the fused ones `compile` plans: the
-    // BF16 checkpoint's mixed-dtype matmuls are widened as `compile` widens them.
-    let g = widen_mismatched_matmul_dtypes(&optimize(&g), backend);
+    // BF16 checkpoint's dense contractions are folded and its mixed-dtype matmuls widened as `compile` does.
+    let g = prepare_target_graph(&optimize(&g), backend);
     let mut tally: BTreeMap<&'static str, usize> = BTreeMap::new();
     for eqn in &g.eqns {
         let plan = plan_eqn(
@@ -80,7 +79,7 @@ fn card129a5_ptx_paged_engine_plan_classify_qwen2_n_slots_2() {
     }
 
     eprintln!(
-        "card129a5_ptx_paged_engine_plan_classify: n_slots={n_slots} total_eqns={} tally={tally:?}",
+        "rocm_batched_decode_plan_classify: n_slots={n_slots} total_eqns={} tally={tally:?}",
         g.eqns.len()
     );
 }

@@ -24,7 +24,7 @@ poot-llm = { path = "/path/to/poot/crates/poot-llm" }
 # poot-llm = { path = "...", features = ["rocm"] }
 ```
 
-Build and run under `nix develop` so nightly Rust, `llc` (SPIR-V/NVPTX), and Vulkan match what the GPU
+Build and run your crate under `nix develop` so nightly Rust, `llc` (SPIR-V/NVPTX), and Vulkan match what the GPU
 crates expect. Release mode matters for real models:
 
 ```bash
@@ -61,24 +61,22 @@ Useful accessors after load: `handle.config()` (family, vocabulary, positions, e
 ## Generate
 
 A `Driver` runs one model on one device. Open the executor with `open_executor` (`Wgpu`, `Rocm` with the
-`rocm` feature, `Ptx`, or `Auto`: PTX if a CUDA device opens, else ROCm, else wgpu), then generate:
+`rocm` feature, `Ptx`, `Vulkan` for raw Vulkan, or `Auto`: PTX if a CUDA device opens, else ROCm, else
+wgpu; `Auto` never picks `Vulkan`), then generate:
 
 ```rust
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 use poot_graph_plan::{CompileLimits, CompileOptions, Submission};
 use poot_llm::driver::{
-    BackendChoice, Driver, DriverOptions, GenerateRequest, PreparedSetLimits, open_executor,
+    BackendChoice, DraftPolicy, Driver, DriverOptions, GenerateRequest, PreparedSetLimits, open_executor,
 };
 use poot_llm::{GenerationControl, Sampler};
 
 let handle = Arc::new(handle);
-let compile = CompileOptions {
-    execution: Submission::Replay,
-    limits: CompileLimits::STANDARD,
-};
+let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
 let options = DriverOptions {
-    prefill: compile,
+    prefill: compile.clone(),
     decode: compile,
     capacity: NonZeroUsize::new(512).unwrap(),      // KV positions: prompt plus new tokens
     prefill_chunk: NonZeroUsize::new(128).unwrap(), // new tokens per prefill step
@@ -88,6 +86,7 @@ let options = DriverOptions {
         max_retained_bytes: NonZeroU64::new(1 << 32).unwrap(),
     },
     charge: poot_llm::driver::program_retention,
+    draft: DraftPolicy::Off, // or PromptLookup / DraftModel: see Speculative decoding
 };
 let mut driver = Driver::new(Arc::clone(&handle), open_executor(BackendChoice::Auto)?, options)?;
 let generation = driver.generate(
@@ -156,7 +155,7 @@ every position, and the pooling is yours.
 ## What not to do in-process
 
 - Multi-tenant HTTP, embeddings/rerank endpoints, metrics: use
-  [Serving](../serve/index.md) (generation serving is not available yet (poot is being refactored; planned to return)).
+  [Serving](../serve/index.md).
 - Writing GPU kernels: [Authoring kernels](./authoring-kernels.md).
 - Backend tradeoffs and capability tables: [Picking a backend](../serve/choosing-a-backend.md) and the
   [feature matrix](../reference/feature-matrix.md).

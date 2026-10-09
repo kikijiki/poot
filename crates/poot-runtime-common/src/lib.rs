@@ -490,9 +490,8 @@ mod device_backend_tests {
         Some(message.expect("device backend panics carry a message"))
     }
 
-    /// A backend is required by its own variable and by nothing else: not another backend's variable and
-    /// not the retired all-backend `POOT_REQUIRE_GPU`. This is the isolation
-    /// `scripts/with-required-backend.sh` relies on.
+    /// A backend is required by its own variable and by nothing else, not another backend's variable. This
+    /// is the isolation `scripts/with-required-backend.sh` relies on.
     #[test]
     fn each_backend_is_required_by_its_own_variable_only() {
         let variables = [
@@ -507,10 +506,6 @@ mod device_backend_tests {
             assert!(
                 backend.required(|name| (name == own).then(|| "1".to_string())),
                 "{backend:?} with only {own}=1"
-            );
-            assert!(
-                !backend.required(|name| (name == "POOT_REQUIRE_GPU").then(|| "1".to_string())),
-                "{backend:?} must ignore the retired POOT_REQUIRE_GPU=1"
             );
             for other in variables.into_iter().filter(|other| *other != own) {
                 assert!(

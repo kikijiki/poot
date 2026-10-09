@@ -7,11 +7,17 @@
 //! position inputs, and the state pairs the layers' components carry (an attention cache). The
 //! step's inputs are typed by role: `Slot::Token` and `Slot::Pos`, both `[rows, tokens]` I32, the
 //! positions absolute, so prefill and decode are one body continuing from `Pos`.
+//!
+//! A recurrent component (a conv window, a GDN or SSM matrix) keeps one state row per sequence:
+//! [`Step::recurrent_state`] hands it the rows this step continues and [`Step::carry_recurrent`] writes
+//! them back. Under [`KvLayout::Paged`] the state is a pool of one row per sequence the pool serves,
+//! addressed through two `Slot::Activation` index inputs (`state_read`, `state_write`), so a sequence
+//! keeps its row whichever step row it occupies; under [`KvLayout::Contiguous`] the one row is the step's.
 
 use std::cell::RefCell;
 
 use poot_graph_ir::{
-    BinOp, Builder, Graph, Slot, TensorType, Traced, ValidationId, ValidationOutput,
+    BinOp, Builder, Graph, Slot, StateRole, TensorType, Traced, ValidationId, ValidationOutput,
     ValidationOutputs, ops,
 };
 use poot_quant::weights::{NormRole, WeightId, WeightMap, WeightRole};
@@ -25,6 +31,11 @@ use crate::model::{
     ConfigReason, FamilyKey, KvLayout, LogitRows, ModelError, Phase, ShapeReason, StepShape,
     TraceError,
 };
+
+/// `Slot::Activation` tag of a paged step's `[rows]` state read index.
+pub const STATE_READ_SLOT: &str = "state_read";
+/// `Slot::Activation` tag of a paged step's `[seqs]` state write map.
+pub const STATE_WRITE_SLOT: &str = "state_write";
 
 /// A component parameter that cannot configure it, naming the field (spec 999: parameters are
 /// validated once, at construction, so tracing with them does not panic).
@@ -57,9 +68,12 @@ pub struct Step {
     shape: StepShape,
     tokens: Traced,
     pos: Traced,
+    mrope: Option<Traced>,
     embeds: Option<EmbedInputs>,
     head: HeadKind,
     paged: Option<PagedMaps>,
+    /// The recurrent state pool's index inputs, declared by the first recurrent component.
+    state_rows: RefCell<Option<StateRows>>,
     state: RefCell<Vec<(Traced, Traced)>>,
     validations: RefCell<Vec<ValidationOutput>>,
 }
@@ -74,6 +88,30 @@ pub struct PagedMaps {
     pub write: Traced,
 }
 
+/// The two index inputs of a paged step's recurrent state pool, both `Slot::Activation` I32.
+#[derive(Clone, Copy, Debug)]
+struct StateRows {
+    /// `[rows]`: the pool row each step row continues. A masked row (beyond the live ones) reads row 0.
+    read: Traced,
+    /// `[seqs]`: pool row to the step row whose result it takes, or -1 to keep it. A masked row is
+    /// named by no entry, so its result is dropped.
+    write: Traced,
+}
+
+/// One recurrent state a component continues: the carried value and the rows this step reads.
+#[derive(Clone, Copy, Debug)]
+pub struct RecurrentState {
+    pool: Traced,
+    current: Traced,
+}
+
+impl RecurrentState {
+    /// The state the step's rows continue from, `[rows, ..row_shape]`.
+    pub fn current(&self) -> Traced {
+        self.current
+    }
+}
+
 impl Step {
     /// Declare the step's inputs on `b`: the token ids and their absolute positions, both
     /// `[rows, tokens]` I32, and under a paged layout the two slot maps.
@@ -81,7 +119,7 @@ impl Step {
         let ids = TensorType::new(vec![shape.rows.get(), shape.tokens.get()], DType::I32);
         let paged = match shape.kv {
             KvLayout::Contiguous => None,
-            KvLayout::Paged { pool_slots } => Some(PagedMaps {
+            KvLayout::Paged { pool_slots, .. } => Some(PagedMaps {
                 read: b.slot_named(
                     Slot::SlotMap,
                     "read",
@@ -98,9 +136,11 @@ impl Step {
             shape,
             tokens: b.slot(Slot::Token, ids.clone()),
             pos: b.slot(Slot::Pos, ids),
+            mrope: None,
             embeds: None,
             head: HeadKind::Logits,
             paged,
+            state_rows: RefCell::new(None),
             state: RefCell::new(Vec::new()),
             validations: RefCell::new(Vec::new()),
         }
@@ -118,6 +158,20 @@ impl Step {
             width,
         ));
         step
+    }
+
+    /// A step whose attention rotates by sectioned positions: `Slot::MropePosition`, `[3, rows * tokens]`
+    /// I32 (temporal, height, width, axis-major), declared after the token, position and embedding
+    /// inputs. `Slot::Pos` still carries the absolute positions the cache and the mask use.
+    pub fn with_mrope(mut self, b: &Builder) -> Self {
+        let n = self.shape.rows.get() * self.shape.tokens.get();
+        self.mrope = Some(b.slot(Slot::MropePosition, TensorType::new(vec![3, n], DType::I32)));
+        self
+    }
+
+    /// The sectioned positions of a [`Self::with_mrope`] step.
+    pub fn mrope(&self) -> Option<Traced> {
+        self.mrope
     }
 
     /// A step that returns the final hidden states instead of logits ([`HeadKind::Hidden`]).
@@ -157,6 +211,71 @@ impl Step {
     /// Carry `input`'s value to the next step as `output`.
     pub fn carry(&self, input: Traced, output: Traced) {
         self.state.borrow_mut().push((input, output));
+    }
+
+    /// The recurrent state `name`, one `row_shape` row of `dtype` per sequence, as this step's rows
+    /// continue it (`[rows, ..row_shape]`). The caller computes the next rows and hands them to
+    /// [`Self::carry_recurrent`]. Under a paged layout the carried value is the pool `[seqs, ..row_shape]`
+    /// and the rows are gathered from it by the `state_read` input.
+    pub fn recurrent_state(
+        &self,
+        b: &Builder,
+        name: &str,
+        dtype: DType,
+        row_shape: &[usize],
+    ) -> RecurrentState {
+        let rows = self.shape.rows.get();
+        let pooled = |leading: usize| {
+            let mut shape = vec![leading];
+            shape.extend_from_slice(row_shape);
+            b.state_input(name, TensorType::new(shape, dtype), StateRole::Recurrent)
+        };
+        match self.shape.kv {
+            KvLayout::Contiguous => {
+                let pool = pooled(rows);
+                RecurrentState {
+                    pool,
+                    current: pool,
+                }
+            }
+            KvLayout::Paged { seqs, .. } => {
+                let pool = pooled(seqs.get());
+                let current = b.gather(pool, 0, self.state_rows(b, seqs.get()).read);
+                RecurrentState { pool, current }
+            }
+        }
+    }
+
+    /// Carry `next` (`[rows, ..row_shape]`) as the new value of `state`'s rows. Under a paged layout
+    /// it is written into the pool rows `state_write` names and every other row passes through.
+    pub fn carry_recurrent(&self, b: &Builder, state: RecurrentState, next: Traced) {
+        let carried = match self.shape.kv {
+            KvLayout::Contiguous => next,
+            KvLayout::Paged { seqs, .. } => {
+                let rows = self.state_rows(b, seqs.get());
+                b.scatter_update(state.pool, next, rows.write)
+            }
+        };
+        self.carry(state.pool, carried);
+    }
+
+    /// The pool's index inputs, declared once per step.
+    fn state_rows(&self, b: &Builder, seqs: usize) -> StateRows {
+        *self
+            .state_rows
+            .borrow_mut()
+            .get_or_insert_with(|| StateRows {
+                read: b.slot_named(
+                    Slot::Activation,
+                    STATE_READ_SLOT,
+                    TensorType::new(vec![self.shape.rows.get()], DType::I32),
+                ),
+                write: b.slot_named(
+                    Slot::Activation,
+                    STATE_WRITE_SLOT,
+                    TensorType::new(vec![seqs], DType::I32),
+                ),
+            })
     }
 
     /// Declare `value`, a bounded F32 witness, as validation root `id` named `name`: the executor
@@ -1035,12 +1154,19 @@ pub(crate) mod oracle {
             .map(Vec::as_slice)
             .collect();
         let pos: Vec<i32> = (start..).take(tokens.len()).collect();
+        // A sectioned model rotates every token at its text position on all three axes, which is
+        // plain RoPE (what the driver binds for a prompt with no image).
+        let mrope = pos.repeat(3);
         eval(
             &g,
             store,
             model.weights(),
             &[],
-            &[(Slot::Token, tokens), (Slot::Pos, &pos)],
+            &[
+                (Slot::Token, tokens),
+                (Slot::Pos, &pos),
+                (Slot::MropePosition, &mrope),
+            ],
             &state,
         )
     }

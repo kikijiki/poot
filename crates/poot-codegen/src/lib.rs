@@ -3,6 +3,15 @@
 //! HSACO for AMDGPU/ROCm, or an AIE core object for AMD XDNA2. [`Target`] names all four paths; individual
 //! IR operations can have narrower target support.
 //!
+//! # `AieCore` is retained and inactive
+//!
+//! Supporting NPUs (Intel, AMD XDNA2) remains a poot objective (POOT-1093); the AIE core emitter, the
+//! `POOT_AIE_LLC` toolchain override and the golden tests are kept on purpose as research for it. Nothing
+//! in the pipeline calls the AIE path: the planner has no AIE target, no executor `Device` implements it,
+//! there are no driver rows or `--backend` for it, and no runtime `CompiledKernel` handle exists for it
+//! (`kernel_handle` refuses it). Reactivating it means adding those pieces on the single
+//! pipeline, not reviving the removed NPU runtime.
+//!
 //! The rustc-bearing MIR import (Stable MIR -> Body) is the separate `pootc` crate; this crate is the
 //! rustc-free emit + llc half, host-testable with hand-built fixtures.
 //!
@@ -43,7 +52,8 @@ pub enum Target {
     /// AIE core machine code for the AMD XDNA2 NPU, via Peano (`llc --march=aie2p`). One AIE core runs a
     /// scalar loop kernel (no SPMD thread-index, no workgroup barrier, no LDS); the IRON harness tiles the
     /// data and does host<->tile movement. The IR is plain scalar LLVM IR with flat `ptr` args (card 089 /
-    /// spec 057). The triple/datalayout come from Peano via `--march`, not the IR text.
+    /// spec 057). The triple/datalayout come from Peano via `--march`, not the IR text. Retained but inactive
+    /// (POOT-1093): nothing in the pipeline compiles for this target.
     AieCore,
     /// HSACO for an AMD GPU (e.g. the Radeon 8060S, gfx1151) via the ROCm-flavored clang.
     /// `llc -filetype=obj` produces a relocatable without the `PT_AMDGPU_HSA_LOAD_*` program headers the
@@ -211,7 +221,8 @@ pub enum CompileError {
 }
 
 /// Emit + `llc` a body to a target artifact written at `out`. Returns the emitted LLVM IR (for debugging
-/// and golden tests). The tools come from `POOT_LLC` (SPIR-V, PTX), `POOT_AIE_LLC` (AIE core), and
+/// and golden tests). The tools come from `POOT_LLC` (SPIR-V, PTX), `POOT_AIE_LLC` (AIE core; it only
+/// matters for the retained, inactive `AieCore` path, POOT-1093), and
 /// `POOT_AMD_CLANG` with `POOT_ROCM_DEVICE_LIBS` (AMDGCN, which has no fallback).
 pub fn compile(
     body: &poot_kernel_ir::Body,
@@ -225,7 +236,8 @@ pub fn compile(
 struct Toolchain {
     /// `$POOT_LLC` or `llc` on PATH: lowers SPIR-V and PTX.
     llc: String,
-    /// `$POOT_AIE_LLC` (Peano, a separate llc fork from the system LLVM), else `llc`.
+    /// `$POOT_AIE_LLC` (Peano, a separate llc fork from the system LLVM), else `llc`. Only the retained,
+    /// inactive `AieCore` path reads it (POOT-1093).
     aie_llc: String,
     /// `$POOT_AMD_CLANG`: the AMD-flavored clang that links the HSACO and adds the `PT_AMDGPU_HSA_LOAD_*` program
     /// headers the HSA loader needs. There is no fallback: a bare llc object is rejected at load with

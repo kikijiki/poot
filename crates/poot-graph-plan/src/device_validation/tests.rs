@@ -211,6 +211,7 @@ fn device_witness_rejects_a_narrow_intermediate() {
         ],
         output: 2,
         validations: NoValidations,
+        exports: Vec::new(),
         state: Vec::new(),
     };
     let mut walk = WitnessWalk::new(&graph);

@@ -6,13 +6,14 @@ sidebar_position: 12
 
 # NPU Offload
 
-:::note[Removed]
+:::note[Removed, still an objective]
 The NPU runtime and executor have been removed. No `--backend` or library execution path reaches a
-laptop NPU. Experimental `AieCore` codegen remains in `poot-codegen`, but has no runtime
-`CompiledKernel` handle or graph-planner target. It does not provide usable NPU support.
+laptop NPU today, but NPU support (Intel and AMD) remains a poot objective. The `AieCore` codegen in
+`poot-codegen` is retained on purpose and is inactive: nothing in the pipeline calls it, and it has no
+runtime `CompiledKernel` handle or graph-planner target. It does not provide usable NPU support.
 :::
 
 Before removal, poot had an experimental, opt-in NPU library path (not a serving option): Intel
 prefill through OpenVINO IR and Level Zero, and AMD XDNA2 prefill through a Peano/IRON-built xclbin
 dispatched over XRT. Those runtime paths are gone. Restoring NPU execution would require a typed
-compiler artifact and ABI as well as a device implementation; that work is not implemented today.
+compiler artifact and ABI as well as a device implementation; That work is not implemented today. It will re-enter on the single pipeline.

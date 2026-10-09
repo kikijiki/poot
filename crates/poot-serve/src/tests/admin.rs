@@ -1,4 +1,5 @@
 use super::*;
+use poot_llm::driver::error::FailureClass;
 
 #[test]
 fn prometheus_exposition_is_well_formed() {
@@ -43,21 +44,20 @@ fn prometheus_exposition_is_well_formed() {
             prefill_dispatch_count: AtomicU64::new(140),
             prefill_activation_peak_bytes: AtomicU64::new(65536),
         },
-        // spec 268 Phase D: 10 greedy drafts forwarded, 7 committed (accept prefix + bonus); 6 sampled
-        // drafts forwarded, 2 committed.
+        // 4 verified rounds proposed 10 drafts and kept 7; 3 rows decoded one token.
         speculative: SpeculativeMetrics {
-            forwarded_greedy: AtomicU64::new(10),
-            committed_greedy: AtomicU64::new(7),
-            forwarded_sampled: AtomicU64::new(6),
-            committed_sampled: AtomicU64::new(2),
+            rounds: AtomicU64::new(4),
+            proposed: AtomicU64::new(10),
+            accepted: AtomicU64::new(7),
+            skipped: AtomicU64::new(3),
         },
     };
-    m.record_request(40.0, 17, Some(8.0));
+    m.record_request(40.0, Some(8.0));
     let out = m.prometheus();
     assert!(out.contains("# TYPE poot_requests_total counter"));
     assert!(out.contains("poot_requests_total 5"));
     assert!(out.contains("poot_completion_tokens_total 42"));
-    assert!(out.contains("poot_prompt_tokens_total 34")); // 17 initial + 17 from record_request
+    assert!(out.contains("poot_prompt_tokens_total 17")); // the loop's prefill counter, not the request record
     // card 051: request-outcome counters (completed/cancelled/errored), each its own counter series.
     assert!(out.contains("# HELP poot_requests_completed_total"));
     assert!(out.contains("# TYPE poot_requests_completed_total counter"));
@@ -100,16 +100,17 @@ fn prometheus_exposition_is_well_formed() {
     // measurement - no vendor API, no sysfs - so the gauge name is identical on any backend.
     assert!(out.contains("# TYPE poot_gpu_active_ratio gauge"));
     assert!(out.contains("poot_gpu_active_ratio 0.8"));
-    // spec 268 Phase D: batched-engine speculative-decode forwarded/committed counters, one series per
-    // sampler mode (greedy vs sampled).
-    assert!(out.contains("# HELP poot_speculative_forwarded_tokens_total"));
-    assert!(out.contains("# TYPE poot_speculative_forwarded_tokens_total counter"));
-    assert!(out.contains("poot_speculative_forwarded_tokens_total{mode=\"greedy\"} 10"));
-    assert!(out.contains("poot_speculative_forwarded_tokens_total{mode=\"sampled\"} 6"));
-    assert!(out.contains("# HELP poot_speculative_committed_tokens_total"));
-    assert!(out.contains("# TYPE poot_speculative_committed_tokens_total counter"));
-    assert!(out.contains("poot_speculative_committed_tokens_total{mode=\"greedy\"} 7"));
-    assert!(out.contains("poot_speculative_committed_tokens_total{mode=\"sampled\"} 2"));
+    // The driver's draft-policy accounting, as reported per row.
+    for (name, value) in [
+        ("rounds", 4),
+        ("proposed_tokens", 10),
+        ("accepted_tokens", 7),
+        ("skipped_rows", 3),
+    ] {
+        assert!(out.contains(&format!("# HELP poot_speculative_{name}_total")));
+        assert!(out.contains(&format!("# TYPE poot_speculative_{name}_total counter")));
+        assert!(out.contains(&format!("poot_speculative_{name}_total {value}\n")));
+    }
 
     // queue_depth = inflight - batch_size (vLLM num_requests_waiting), saturating.
     m.inflight.store(5, Ordering::Relaxed);
@@ -156,11 +157,15 @@ fn generation_terminal_failure_accounting_boundary_is_exact_once() {
         match case {
             GenerationFailureAccountingCase::DeliveredDirect
             | GenerationFailureAccountingCase::DroppedDirect => {
-                let _ = job.reply.send(GenEvent::failed(&metrics, "direct failure"));
+                let _ = job.reply.send(GenEvent::failed(
+                    &metrics,
+                    FailureClass::Fault,
+                    "direct failure",
+                ));
             }
             GenerationFailureAccountingCase::DeliveredRejection
             | GenerationFailureAccountingCase::DroppedRejection => {
-                reject_job(job, &metrics, "rejected");
+                reject_job(job, &metrics, FailureClass::Fault, "rejected");
             }
             GenerationFailureAccountingCase::ActiveFailure
             | GenerationFailureAccountingCase::ActiveShutdown
@@ -169,9 +174,7 @@ fn generation_terminal_failure_accounting_boundary_is_exact_once() {
                 // open. QueuedShutdown: the engine faults on a first request while this one waits.
                 let mut engine = RecordingEngine::new(1).on_step(move |_, _| {
                     Err(match case {
-                        GenerationFailureAccountingCase::ActiveFailure => {
-                            EngineError::Refused("refused".into())
-                        }
+                        GenerationFailureAccountingCase::ActiveFailure => refused("refused"),
                         _ => EngineError::Fault("faulted".into()),
                     })
                 });
@@ -179,10 +182,10 @@ fn generation_terminal_failure_accounting_boundary_is_exact_once() {
                 let mut keep_receiver = None;
                 if case == GenerationFailureAccountingCase::QueuedShutdown {
                     let (first, first_submitted) = JobSpec::new("first", 1).build();
-                    tx.send(first).unwrap();
+                    tx.send(EngineMsg::Generate(Box::new(first))).unwrap();
                     keep_receiver = Some(first_submitted);
                 }
-                tx.send(job).unwrap();
+                tx.send(EngineMsg::Generate(Box::new(job))).unwrap();
                 drop(tx);
                 run_engine(&mut engine, &rx, &metrics);
                 drop(keep_receiver);
@@ -220,14 +223,14 @@ fn generation_terminal_failure_accounting_boundary_is_exact_once() {
     }
 }
 
-/// Card 326's loopback contract invokes the two real streaming handlers. The token `a` is deliberately
-/// held as a strict prefix of stop `ab`: failure and EOF must return before `StreamStops::finish`, while
-/// explicit `Done` must retain the established successful tail/finish/usage/`[DONE]` behavior.
+/// Card 326's loopback contract invokes the two real streaming handlers. A failure or an EOF after a
+/// streamed piece ends the stream with an error event and none of the success metadata (a finish
+/// reason, the usage receipt, `[DONE]`), while an explicit `Done` keeps the successful
+/// finish/usage/`[DONE]` behavior. The text the loop holds back for a stop string is the loop's: see
+/// the lifecycle rows.
 #[test]
 fn generation_terminal_real_handlers_stop_before_success_finalization() {
-    let model_path = write_tiny_gguf();
-    let runner = load_handle(&model_path);
-    let _ = std::fs::remove_file(&model_path);
+    let runner = tiny_model();
 
     for endpoint in [
         GenerationStreamEndpoint::Completion,
@@ -262,9 +265,16 @@ fn generation_terminal_real_handlers_stop_before_success_finalization() {
                 response.contains(&format!("\"code\":{expected_code}")),
                 "{endpoint:?} {terminal:?}: {response}"
             );
-            assert!(
-                !response.contains("\"content\":\"a\"") && !response.contains("\"text\":\"a\""),
-                "{endpoint:?} {terminal:?}: a held stop-prefix tail leaked: {response}"
+            let streamed_a =
+                response.contains("\"content\":\"a\"") || response.contains("\"text\":\"a\"");
+            assert_eq!(
+                streamed_a,
+                matches!(
+                    terminal,
+                    GenerationStreamTerminal::FailedAfterHeldToken
+                        | GenerationStreamTerminal::EofAfterHeldToken
+                ),
+                "{endpoint:?} {terminal:?}: the piece the engine sent is streamed, and only that one: {response}"
             );
             assert!(
                 !response.contains("\"finish_reason\":\""),
@@ -286,7 +296,7 @@ fn generation_terminal_real_handlers_stop_before_success_finalization() {
         );
         assert!(
             success.contains("\"content\":\"a\"") || success.contains("\"text\":\"a\""),
-            "{endpoint:?}: Done must flush the held tail: {success}"
+            "{endpoint:?}: the streamed piece reaches the client: {success}"
         );
         assert!(
             success.contains("\"finish_reason\":\"length\""),
@@ -409,7 +419,14 @@ fn record_terminal_delivered_is_completed_undelivered_is_cancelled() {
 fn record_terminal_from_dropped_receiver_send() {
     let (tx, rx) = mpsc::channel::<GenEvent>();
     drop(rx);
-    let send_ok = tx.send(GenEvent::Done(vec![1, 2, 3], vec![], true)).is_ok();
+    let completion = Completion {
+        prompt_tokens: 1,
+        tokens: vec![1, 2, 3],
+        text: "abc".into(),
+        logprobs: vec![],
+        finish: FinishReason::Eos,
+    };
+    let send_ok = tx.send(GenEvent::Done(completion)).is_ok();
     assert!(!send_ok);
 
     let m = test_metrics("test-model");
@@ -418,7 +435,7 @@ fn record_terminal_from_dropped_receiver_send() {
     assert_eq!(m.requests_cancelled.load(Ordering::Relaxed), 1);
 }
 
-/// Card 315's authorization matrix. It uses the real request parser, policy gate, admin router and response writer over loopback TCP, with a fake loader/pool behind the narrow production trait. Bypassing the guard makes denied Load/Unload rows mutate the snapshot and fail.
+/// Card 315's authorization matrix. It uses the real request parser, policy gate, admin router and response writer over loopback TCP, with the recording fake answering on the engine thread behind the production queue. Bypassing the guard makes a denied request reach the engine: the fake's log then holds an administration call no allowed row accounts for, and the row fails.
 #[test]
 fn lora_admin_trust_boundary_policy_precedes_every_route_operation() {
     use std::net::{IpAddr, Ipv4Addr};
@@ -427,6 +444,10 @@ fn lora_admin_trust_boundary_policy_precedes_every_route_operation() {
     const SENTINEL_PATH: &str = "/must-not-be-read/unauthorized-adapter";
     let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let non_loopback = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+    let metrics = Arc::new(test_metrics("card315-admin"));
+    let (served, engine) = serve_with_fake(RecordingEngine::new(1), tiny_model(), &metrics);
+    // Every request the policy lets through reaches the engine thread exactly once.
+    let mut reached_the_engine = 0usize;
 
     #[derive(Clone, Copy, Debug)]
     struct PolicyCase {
@@ -434,7 +455,8 @@ fn lora_admin_trust_boundary_policy_precedes_every_route_operation() {
         listener_ip: IpAddr,
         configured_key: Option<&'static str>,
         authorization: Option<&'static str>,
-        expected_status: u16,
+        /// The status of a denied request; an allowed one answers by its operation.
+        denied_status: u16,
         allowed: bool,
     }
 
@@ -444,7 +466,7 @@ fn lora_admin_trust_boundary_policy_precedes_every_route_operation() {
             listener_ip: loopback,
             configured_key: None,
             authorization: None,
-            expected_status: 503,
+            denied_status: 0,
             allowed: true,
         },
         PolicyCase {
@@ -452,7 +474,7 @@ fn lora_admin_trust_boundary_policy_precedes_every_route_operation() {
             listener_ip: non_loopback,
             configured_key: None,
             authorization: Some("Bearer ignored-while-disabled"),
-            expected_status: 403,
+            denied_status: 403,
             allowed: false,
         },
         PolicyCase {
@@ -460,7 +482,7 @@ fn lora_admin_trust_boundary_policy_precedes_every_route_operation() {
             listener_ip: loopback,
             configured_key: Some(ADMIN_KEY),
             authorization: Some("Bearer card315-admin-secret"),
-            expected_status: 503,
+            denied_status: 0,
             allowed: true,
         },
         PolicyCase {
@@ -468,7 +490,7 @@ fn lora_admin_trust_boundary_policy_precedes_every_route_operation() {
             listener_ip: non_loopback,
             configured_key: Some(ADMIN_KEY),
             authorization: Some("bearer card315-admin-secret"),
-            expected_status: 503,
+            denied_status: 0,
             allowed: true,
         },
     ];
@@ -480,6 +502,11 @@ fn lora_admin_trust_boundary_policy_precedes_every_route_operation() {
 
     for policy_case in policy_cases {
         for operation in operations {
+            let expected_status = if policy_case.allowed {
+                operation.allowed_status()
+            } else {
+                policy_case.denied_status
+            };
             let policy = LoraAdminPolicy::from_configured_key(
                 policy_case.listener_ip,
                 policy_case.configured_key,
@@ -487,9 +514,10 @@ fn lora_admin_trust_boundary_policy_precedes_every_route_operation() {
             .unwrap_or_else(|e| panic!("{}: policy: {e:#}", policy_case.name));
             let (method, path, body) = operation.request(SENTINEL_PATH);
             let authorization = policy_case.authorization.into_iter().collect::<Vec<_>>();
-            let response = run_lora_admin_socket(&policy, method, path, &authorization, &body);
+            let response =
+                run_lora_admin_socket(&policy, &served, method, path, &authorization, &body);
             assert!(
-                response.starts_with(&format!("HTTP/1.1 {} ", policy_case.expected_status)),
+                response.starts_with(&format!("HTTP/1.1 {expected_status} ")),
                 "{} {operation:?}: {response}",
                 policy_case.name
             );
@@ -499,10 +527,11 @@ fn lora_admin_trust_boundary_policy_precedes_every_route_operation() {
                 policy_case.name
             );
             if policy_case.allowed {
-                // An authorized request of a shape a route takes reaches the route, which has no
-                // engine yet: the typed 503 naming it.
+                // An authorized request of a shape a route takes reaches the engine thread, which
+                // answers it.
+                reached_the_engine += 1;
                 assert!(
-                    response.contains("/v1/lora_adapters is not served yet"),
+                    response.contains(operation.allowed_body_marker()),
                     "{} {operation:?}: {response}",
                     policy_case.name
                 );
@@ -529,7 +558,8 @@ fn lora_admin_trust_boundary_policy_precedes_every_route_operation() {
                 let policy =
                     LoraAdminPolicy::from_configured_key(listener_ip, Some(ADMIN_KEY)).unwrap();
                 let (method, path, body) = operation.request(SENTINEL_PATH);
-                let response = run_lora_admin_socket(&policy, method, path, authorization, &body);
+                let response =
+                    run_lora_admin_socket(&policy, &served, method, path, authorization, &body);
                 assert!(
                     response.starts_with("HTTP/1.1 401 Unauthorized"),
                     "{listener_ip} {credential_case} {operation:?}: {response}"
@@ -630,6 +660,7 @@ fn lora_admin_trust_boundary_policy_precedes_every_route_operation() {
         let policy = LoraAdminPolicy::from_configured_key(loopback, Some(ADMIN_KEY)).unwrap();
         let response = run_denied_lora_admin_head_without_body(
             policy,
+            Arc::clone(&served),
             case.method,
             case.path,
             case.authorization,
@@ -713,9 +744,20 @@ fn lora_admin_trust_boundary_policy_precedes_every_route_operation() {
     ];
     for case in syntax_cases {
         let policy = LoraAdminPolicy::from_configured_key(loopback, Some(case.configured)).unwrap();
-        let response =
-            run_lora_admin_socket(&policy, "GET", "/v1/lora_adapters", &[case.presented], "");
-        let expected_status = if case.allowed { 503 } else { 401 };
+        let response = run_lora_admin_socket(
+            &policy,
+            &served,
+            "GET",
+            "/v1/lora_adapters",
+            &[case.presented],
+            "",
+        );
+        let expected_status = if case.allowed {
+            reached_the_engine += 1;
+            200
+        } else {
+            401
+        };
         assert!(
             response.starts_with(&format!("HTTP/1.1 {expected_status} ")),
             "{}: {response}",
@@ -724,7 +766,7 @@ fn lora_admin_trust_boundary_policy_precedes_every_route_operation() {
     }
 
     let supported_shape_cases = [
-        ("exact list", "GET", "/v1/lora_adapters", 503),
+        ("exact list", "GET", "/v1/lora_adapters", 200),
         ("child wrong method", "GET", "/v1/lora_adapters/base", 404),
         ("trailing slash", "GET", "/v1/lora_adapters/", 404),
         ("query unsupported", "GET", "/v1/lora_adapters?x=1", 404),
@@ -732,13 +774,42 @@ fn lora_admin_trust_boundary_policy_precedes_every_route_operation() {
     ];
     for (name, method, path, expected_status) in supported_shape_cases {
         let policy = LoraAdminPolicy::from_configured_key(loopback, Some(ADMIN_KEY)).unwrap();
-        let response =
-            run_lora_admin_socket(&policy, method, path, &["Bearer card315-admin-secret"], "");
+        let response = run_lora_admin_socket(
+            &policy,
+            &served,
+            method,
+            path,
+            &["Bearer card315-admin-secret"],
+            "",
+        );
+        if expected_status == 200 {
+            reached_the_engine += 1;
+        }
         assert!(
             response.starts_with(&format!("HTTP/1.1 {expected_status} ")),
             "{name}: {response}"
         );
     }
+
+    // The engine saw exactly the requests the policy let through: a denied request, a malformed path
+    // and an unsupported method never reached it.
+    let engine = engine.finish(served);
+    let admin_calls = engine
+        .events()
+        .into_iter()
+        .filter(|event| matches!(event, Event::Admin(_)))
+        .count();
+    assert_eq!(
+        admin_calls, reached_the_engine,
+        "only authorized requests of a shape a route takes reach the engine"
+    );
+    let reached_with_sentinel = engine.events().iter().any(|event| {
+        matches!(event, Event::Admin(crate::types::AdminRequest::Load { path, .. }) if path == SENTINEL_PATH)
+    });
+    assert!(
+        reached_with_sentinel,
+        "an authorized load carries its path to the engine"
+    );
 }
 
 #[test]
@@ -783,10 +854,7 @@ fn lora_admin_trust_boundary_rejects_invalid_configured_credentials() {
 fn lora_admin_trust_boundary_keeps_ordinary_inference_usable() {
     use std::net::{IpAddr, Ipv4Addr};
 
-    let model_path = write_tiny_gguf();
-    let runner = load_handle(&model_path);
-    let _ = std::fs::remove_file(model_path);
-    let backend = Arc::new(Backend::Decoder(Arc::clone(&runner)));
+    let runner = tiny_model();
     let policies = [
         LoraAdminPolicy::from_configured_key(IpAddr::V4(Ipv4Addr::UNSPECIFIED), None)
             .expect("non-loopback disabled policy"),
@@ -805,21 +873,19 @@ fn lora_admin_trust_boundary_keeps_ordinary_inference_usable() {
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("bound inference response read");
         let (server, _) = listener.accept().expect("accept inference control client");
-        let (job_tx, job_rx) = mpsc::channel();
+        let (served, job_rx) = served_over(Arc::clone(&runner), 1);
         let metrics = Arc::new(test_metrics("card315-inference"));
         let limiter = Arc::new(RateLimiter {
             rpm: 0,
             windows: Mutex::new(HashMap::new()),
         });
-        let backend_for_handler = Arc::clone(&backend);
         let metrics_for_handler = Arc::clone(&metrics);
         let limiter_for_handler = Arc::clone(&limiter);
         let handler = std::thread::spawn(move || {
             handle(
                 server,
-                Some(&job_tx),
+                &served,
                 &EngineHealth::serving_for_test("spirv-vulkan", 4, 1024),
-                &backend_for_handler,
                 &metrics_for_handler,
                 &limiter_for_handler,
                 &policy,
@@ -835,11 +901,20 @@ fn lora_admin_trust_boundary_keeps_ordinary_inference_usable() {
         .expect("write inference request without admin credentials");
         client.flush().expect("flush inference request");
 
-        let job = job_rx
+        let EngineMsg::Generate(job) = job_rx
             .recv_timeout(Duration::from_secs(5))
-            .expect("ordinary inference must reach the engine");
+            .expect("ordinary inference must reach the engine")
+        else {
+            panic!("a completions request sends a generation job");
+        };
         job.reply
-            .send(GenEvent::Done(vec![1], vec![], true))
+            .send(GenEvent::Done(Completion {
+                prompt_tokens: 1,
+                tokens: vec![1],
+                text: "a".into(),
+                logprobs: vec![],
+                finish: FinishReason::Eos,
+            }))
             .expect("deliver inference completion");
         handler
             .join()

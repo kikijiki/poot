@@ -1,27 +1,55 @@
-//! Shared job, event, and backend types used across the server modules.
+//! Shared job, event, and engine-view types used across the server modules.
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
-use poot_llm::driver::{AdapterRef, ModelHandle};
-use poot_llm::{Sampler, TokenLogprob};
+use poot_llm::Sampler;
+use poot_llm::TokenLogprob;
+use poot_llm::driver::ModelHandle;
+use poot_llm::driver::error::FailureClass;
+use poot_llm::driver::{AdapterRef, DriverCaps, Encoded, PromptEmbeds};
+use poot_llm::encoders::Pooling;
 
-use crate::engine_plan::Workload;
 use crate::metrics::Metrics;
+use crate::vision::ImageClient;
 
 /// Global shutdown flag: set by the SIGINT/SIGTERM handler so the accept loop exits cleanly.
 pub(crate) static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+/// The prompt of a generation job, tokenized on the connection thread.
+#[derive(Clone)]
+pub(crate) enum PromptInput {
+    /// A text prompt as token ids.
+    Tokens(Vec<u32>),
+    /// A multimodal prompt: the token ids, and the embedding rows that stand in for the tokens at their
+    /// positions (an image's rows at its placeholders). The sequence is opened with the rows, and no
+    /// prefix is matched or registered for it.
+    Multimodal {
+        tokens: Vec<u32>,
+        embeds: PromptEmbeds,
+    },
+}
+
+impl PromptInput {
+    pub(crate) fn tokens(&self) -> &[u32] {
+        match self {
+            PromptInput::Tokens(tokens) | PromptInput::Multimodal { tokens, .. } => tokens,
+        }
+    }
+}
+
 /// A generation job submitted to the engine: the spec plus a reply channel the engine streams events back on.
 pub(crate) struct Job {
-    pub(crate) prompt: String,
+    pub(crate) prompt: PromptInput,
     pub(crate) max_new: usize,
     pub(crate) sampler: Sampler,
-    /// stop sequences: the batched engine halts a slot as soon as its generated text contains one.
+    /// stop sequences: the loop ends a request as soon as its generated text contains one, and the text
+    /// it returns stops before the match.
     pub(crate) stop: Vec<String>,
-    /// stream token pieces as generated (SSE) vs only the final token list.
+    /// stream token pieces as generated (SSE) vs only the final completion.
     pub(crate) stream: bool,
     pub(crate) reply: Sender<GenEvent>,
     /// Enqueue time, for the queue-wait histogram (`now - submitted` at admit).
@@ -33,6 +61,135 @@ pub(crate) struct Job {
     /// the client disconnected or the drain expired. The engine releases the request at its next step
     /// boundary, streaming or not.
     pub(crate) cancel: Arc<AtomicBool>,
+}
+
+/// One token row of an encode job: its ids and each id's segment (empty for all zero).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EncodeRow {
+    pub(crate) ids: Vec<u32>,
+    pub(crate) types: Vec<u32>,
+}
+
+/// An encode job: token rows run through one `Encode` step on the engine thread (embeddings, rerank).
+pub(crate) struct EncodeJob {
+    pub(crate) rows: Vec<EncodeRow>,
+    pub(crate) reply: Sender<EncodeReply>,
+    pub(crate) cancel: Arc<AtomicBool>,
+}
+
+/// What an encode job answers: the hidden states or scores, or the failure of the step.
+pub(crate) type EncodeReply = Result<Encoded, AccountedGenerationFailure>;
+
+/// The LoRA administration operations the engine thread carries out on the driver.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AdminRequest {
+    List,
+    Load { name: String, path: String },
+    Unload { name: String },
+}
+
+/// One loaded adapter as `GET /v1/lora_adapters` lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AdapterInfo {
+    pub(crate) name: String,
+    pub(crate) index: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AdminReply {
+    Adapters(Vec<AdapterInfo>),
+    Loaded(AdapterInfo),
+    Unloaded(AdapterInfo),
+}
+
+/// Why an administration operation did not happen. Nothing was applied in any variant.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum AdminError {
+    /// The driver or the request refused it: `class` decides the status.
+    #[error("{reason}")]
+    Refused { class: FailureClass, reason: String },
+    #[error("lora adapter {0:?} is not registered")]
+    NotFound(String),
+    /// The adapter is held by running requests.
+    #[error("{0}")]
+    Busy(String),
+    #[error("engine thread is gone")]
+    EngineUnavailable,
+}
+
+impl AdminError {
+    pub(crate) fn status(&self) -> u16 {
+        match self {
+            AdminError::Refused { class, .. } => class_status(*class),
+            AdminError::NotFound(_) => 404,
+            AdminError::Busy(_) => 409,
+            AdminError::EngineUnavailable => 503,
+        }
+    }
+}
+
+/// An administration job: the operation and where its outcome goes.
+pub(crate) struct AdminJob {
+    pub(crate) request: AdminRequest,
+    pub(crate) reply: Sender<Result<AdminReply, AdminError>>,
+}
+
+/// What a connection thread sends the engine thread. Every route that runs the model sends one of
+/// these: the driver is `&mut`, not `Sync`, so the engine thread is the only place it is used.
+pub(crate) enum EngineMsg {
+    Generate(Box<Job>),
+    Encode(EncodeJob),
+    Admin(AdminJob),
+}
+
+/// The HTTP status a failure class is answered with: a request the driver refuses is the client's (400),
+/// one this prepared engine cannot serve is the server's to refuse (503), a fault is a 500.
+pub(crate) fn class_status(class: FailureClass) -> u16 {
+    match class {
+        FailureClass::Request => 400,
+        FailureClass::Unsupported => 503,
+        FailureClass::Step | FailureClass::Fault => 500,
+    }
+}
+
+/// What the engine thread publishes for the connection threads to read: the caps the driver serves
+/// now (an adapter load or a first encode changes them) and the loaded adapters' names.
+#[derive(Clone, Debug)]
+pub(crate) struct EngineView(Arc<RwLock<ViewState>>);
+
+#[derive(Debug)]
+struct ViewState {
+    caps: DriverCaps,
+    adapters: BTreeMap<String, AdapterRef>,
+}
+
+impl EngineView {
+    pub(crate) fn new(caps: DriverCaps) -> Self {
+        Self(Arc::new(RwLock::new(ViewState {
+            caps,
+            adapters: BTreeMap::new(),
+        })))
+    }
+
+    pub(crate) fn caps(&self) -> DriverCaps {
+        self.0.read().expect("engine view lock").caps.clone()
+    }
+
+    /// The adapter `name` selects, if it is loaded.
+    pub(crate) fn adapter(&self, name: &str) -> Option<AdapterRef> {
+        self.0
+            .read()
+            .expect("engine view lock")
+            .adapters
+            .get(name)
+            .copied()
+    }
+
+    pub(crate) fn publish(&self, caps: DriverCaps, adapters: BTreeMap<String, AdapterRef>) {
+        let mut state = self.0.write().expect("engine view lock");
+        state.caps = caps;
+        state.adapters = adapters;
+    }
 }
 
 /// Engine-produced per-token data sent with each streamed token. Timing is measured inside the engine
@@ -49,26 +206,73 @@ pub(crate) struct PerTokenInfo {
     pub(crate) kv_used_ratio: f64,
 }
 
-/// What the engine sends back per job: token pieces (streaming), then a terminal `Done` (the full token
-/// sequence plus any recorded per-token logprobs) or `Failed`.
+/// Why a generation ended, as the API reports it: `Eos` and `Stop` are OpenAI `"stop"`, `Length`
+/// (`max_tokens`, or the positions the engine holds) is `"length"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FinishReason {
+    /// The model sampled one of its end-of-sequence tokens.
+    Eos,
+    /// A stop string appeared in the generated text.
+    Stop,
+    /// `max_new` tokens were generated, or the positions ran out.
+    Length,
+}
+
+impl FinishReason {
+    pub(crate) fn api_name(self) -> &'static str {
+        match self {
+            FinishReason::Eos | FinishReason::Stop => "stop",
+            FinishReason::Length => "length",
+        }
+    }
+}
+
+/// A finished generation: what the request produced and why it ended.
+#[derive(Debug)]
+pub(crate) struct Completion {
+    /// Tokens in the prompt, the shared prefix included.
+    pub(crate) prompt_tokens: usize,
+    /// The generated tokens, the one that completed a stop string among them and an end-of-sequence
+    /// token not.
+    pub(crate) tokens: Vec<u32>,
+    /// The generated text, cut before a stop string.
+    pub(crate) text: String,
+    /// One record per generated token when the request's sampler records logprobs.
+    pub(crate) logprobs: Vec<TokenLogprob>,
+    pub(crate) finish: FinishReason,
+}
+
+/// What a connection thread holds of the engine: the loaded model for the request-side text services
+/// (tokenization, token counts, chat rendering, guided constraints), the queue every route that runs the
+/// model sends through, and the view the engine thread publishes.
+pub(crate) struct Served {
+    pub(crate) model: Arc<ModelHandle>,
+    pub(crate) engine: Sender<EngineMsg>,
+    pub(crate) view: EngineView,
+    /// How a sentence vector is pooled from hidden states, as the checkpoint declares.
+    pub(crate) pooling: Pooling,
+    /// The image front end of a vision-language checkpoint; `None` serves text only.
+    pub(crate) images: Option<ImageClient>,
+}
+
+/// What the engine sends back per job: token pieces (streaming), then a terminal `Done` or `Failed`.
 pub(crate) enum GenEvent {
-    /// A generated token piece plus engine-produced per-token timing/state data.
+    /// A generated token piece plus engine-produced per-token timing/state data. A piece the stop
+    /// scanner holds back, or that completes a stop string, is not sent.
     Token(String, PerTokenInfo),
-    /// The full token sequence + per-token logprobs, and `natural_stop`: true if generation ended on EOS
-    /// or a stop sequence (OpenAI `"stop"`), false if it hit max_tokens / the KV cap (`"length"`).
-    /// EOS is not appended to the sequence, so handlers cannot infer this from the tokens.
-    Done(Vec<u32>, Vec<TokenLogprob>, bool),
+    Done(Completion),
     Failed(AccountedGenerationFailure),
 }
 
 impl GenEvent {
     /// The only production constructor of a failure event. Building the `AccountedGenerationFailure`
     /// records the producer-side terminal error first, even if the receiver is gone.
-    pub(crate) fn failed(metrics: &Metrics, message: impl Into<String>) -> Self {
-        metrics.record_terminal_failure();
-        GenEvent::Failed(AccountedGenerationFailure {
-            message: message.into(),
-        })
+    pub(crate) fn failed(
+        metrics: &Metrics,
+        class: FailureClass,
+        message: impl Into<String>,
+    ) -> Self {
+        GenEvent::Failed(AccountedGenerationFailure::new(metrics, class, message))
     }
 
     /// The `GenEvent`-typed wrapper over [`deliver_terminal`]: build the `Done`, publish its outcome
@@ -77,11 +281,9 @@ impl GenEvent {
     pub(crate) fn deliver_done(
         metrics: &Metrics,
         reply: &Sender<GenEvent>,
-        tokens: Vec<u32>,
-        logprobs: Vec<TokenLogprob>,
-        natural: bool,
+        completion: Completion,
     ) -> bool {
-        deliver_terminal(metrics, reply, GenEvent::Done(tokens, logprobs, natural))
+        deliver_terminal(metrics, reply, GenEvent::Done(completion))
     }
 }
 
@@ -91,7 +293,7 @@ impl GenEvent {
 /// -> `requests_cancelled`. Delivery is read from the channel first because the count has to exist
 /// before the event can be observed; the one outcome that read can miss - a receiver dropped between it
 /// and the send - cannot be retracted from a monotonic counter, so it stays a completion and is logged.
-/// Returns whether the event was delivered. Every terminal `Done` send in the server goes through this,
+/// Returns whether the event was delivered. Every terminal success send in the server goes through this,
 /// so the ordering and card 051's classification exist once instead of per call site.
 pub(crate) fn deliver_terminal<T>(metrics: &Metrics, reply: &Sender<T>, event: T) -> bool {
     let predicted = !reply.is_disconnected();
@@ -108,12 +310,27 @@ pub(crate) fn deliver_terminal<T>(metrics: &Metrics, reply: &Sender<T>, event: T
     delivered
 }
 
-/// A producer failure whose `requests_errored` increment already happened. The private field and sole
-/// constructor on [`GenEvent`] keep uncounted failures out; the distinct type stops the response side
-/// counting it again.
+/// A producer failure whose `requests_errored` increment already happened. The private fields and sole
+/// constructor keep uncounted failures out; the distinct type stops the response side counting it again.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct AccountedGenerationFailure {
+    class: FailureClass,
     message: String,
+}
+
+impl AccountedGenerationFailure {
+    /// Count the failure, then build it: the count exists before the failure can be observed.
+    pub(crate) fn new(metrics: &Metrics, class: FailureClass, message: impl Into<String>) -> Self {
+        metrics.record_terminal_failure();
+        Self {
+            class,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn class(&self) -> FailureClass {
+        self.class
+    }
 }
 
 impl std::fmt::Display for AccountedGenerationFailure {
@@ -122,18 +339,10 @@ impl std::fmt::Display for AccountedGenerationFailure {
     }
 }
 
-/// A generation submission's terminal outcome when it is not [`GenEvent::Done`]: no engine, transport
-/// loss, an engine-reported failure, or client cancellation.
+/// A generation submission's terminal outcome when it is not [`GenEvent::Done`]: transport loss, an
+/// engine-reported failure, or client cancellation.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum GenerationError {
-    /// No generation engine is loaded. The request was valid and is refused; nothing was queued.
-    #[error("no generation engine is loaded: this server was started without one")]
-    NoEngine,
-    /// A route the loaded model could serve, but whose driver path the server has not restored yet
-    /// (embeddings, rerank, LoRA administration; POOT-589). The request was valid and is refused;
-    /// nothing ran.
-    #[error("{route} is not served yet: it runs the model on the driver, and POOT-589 restores it")]
-    NotServed { route: &'static str },
     #[error("engine thread is gone")]
     EngineUnavailable,
     #[error("{0}")]
@@ -157,57 +366,35 @@ impl GenerationError {
     }
 
     /// The HTTP status of the failure: the response status when it is found before any header is
-    /// written, else the status carried in an SSE error event after the 200 headers are sent.
+    /// written, else the status carried in an SSE error event after the 200 headers are sent. An
+    /// engine failure is answered by its class: a refusal is the client's 400 or the server's 503, a
+    /// fault is a 500.
     pub(crate) fn stream_status(&self) -> u16 {
         match self {
-            GenerationError::NoEngine
-            | GenerationError::NotServed { .. }
-            | GenerationError::EngineUnavailable
-            | GenerationError::ReplyChannelClosed => 503,
-            GenerationError::EngineFailed(_) => 500,
+            GenerationError::EngineUnavailable
+            | GenerationError::ReplyChannelClosed
+            | GenerationError::ServerDrainExpired => 503,
+            GenerationError::EngineFailed(failure) => class_status(failure.class()),
             GenerationError::ClientCancelled => 499,
-            GenerationError::ServerDrainExpired => 503,
+        }
+    }
+
+    /// The OpenAI error `type` of [`Self::stream_status`].
+    pub(crate) fn error_type(&self) -> &'static str {
+        if self.stream_status() < 500 {
+            "invalid_request_error"
+        } else {
+            "server_error"
         }
     }
 
     pub(crate) fn kind(&self) -> &'static str {
         match self {
-            GenerationError::NoEngine => "no_engine",
-            GenerationError::NotServed { .. } => "not_served",
             GenerationError::EngineUnavailable => "engine_unavailable",
             GenerationError::EngineFailed(_) => "engine_failed",
             GenerationError::ReplyChannelClosed => "reply_channel_closed",
             GenerationError::ClientCancelled => "client_cancelled",
             GenerationError::ServerDrainExpired => "server_drain_expired",
-        }
-    }
-}
-
-/// The model being served, a loaded checkpoint told apart by what its family's step returns
-/// ([`poot_llm::driver::ModelHandle::config`]'s `output`): logits make a causal `Decoder`, hidden
-/// states a BERT-class `Encoder` (embeddings and bi-encoder rerank), classifier scores a
-/// `CrossEncoder` (cross-encoder rerank only). Exactly one is loaded. Endpoints a model cannot serve
-/// return 400; the routes the model could serve but this server has no driver path for yet (generation,
-/// embeddings, rerank, LoRA administration) return the typed 503.
-pub(crate) enum Backend {
-    Decoder(Arc<ModelHandle>),
-    #[expect(
-        dead_code,
-        reason = "held for POOT-589 (the encoder routes run it on the driver)"
-    )]
-    Encoder(Arc<ModelHandle>),
-    #[expect(
-        dead_code,
-        reason = "held for POOT-589 (the encoder routes run it on the driver)"
-    )]
-    CrossEncoder(Arc<ModelHandle>),
-}
-
-impl Backend {
-    /// The served model told apart by the engine plan's workload.
-    pub(crate) fn for_workload(model: Arc<ModelHandle>, workload: &Workload) -> Self {
-        match workload {
-            Workload::Generate { .. } => Backend::Decoder(model),
         }
     }
 }

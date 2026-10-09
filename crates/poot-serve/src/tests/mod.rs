@@ -7,15 +7,20 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
-use poot_llm::driver::{AdapterRef, LoadOptions, ModelHandle};
+use poot_llm::driver::{
+    AdapterRef, DriverCaps, HeadSet, InputSet, LoadOptions, ModelHandle, RowSpeculation,
+    StateResidency,
+};
+use poot_llm::encoders::Pooling;
 use poot_llm::{GenerationControl, Sampler};
+use poot_models::model::KvLayout;
 use poot_models::registry::Registry;
 
 use crate::admin::LoraAdminPolicy;
 use crate::api::{
     ChatReq, CompletionReq, GuidedDecodeError, MAX_CHOICES, MAX_LOGPROBS, MAX_NEW_TOKENS_CAP,
     MAX_STOP_SEQUENCES, ResponseFormatConstraint, Stop, StreamOptions, UnsupportedCapabilityError,
-    apply_stop, clamp_logprobs, clamp_n, classify_handler_error, default_max, parse_tool_calls,
+    clamp_logprobs, clamp_n, classify_handler_error, default_max, parse_tool_calls,
     reject_unsupported_modality, resolve_forced_tools, response_format_constraint, sampler_of,
     suppress_stream_usage, tool_call_stream_deltas,
 };
@@ -25,11 +30,11 @@ use crate::batch::engine::{
     run_engine_thread,
 };
 use crate::batch::schedule::schedule_prefill_admissions;
-use crate::batch::slot::{Slot, Waiting, reject_job};
+use crate::batch::slot::{Slot, reject_job};
 use crate::engine_plan::EngineHealth;
 use crate::handlers::{
-    StreamStops, account_generation_error, handle_chat, sse_write_probe, stream_chat,
-    stream_completion, stream_receipt,
+    account_generation_error, handle_chat, sse_write_probe, stream_chat, stream_completion,
+    stream_receipt,
 };
 use crate::http::{
     ConnGuard, MAX_BODY_BYTES, MAX_HEADER_BYTES, RateLimiter, RequestRead,
@@ -38,20 +43,23 @@ use crate::http::{
     request_read_timeout_from, respond, respond_error, respond_typed, response_write_timeout_from,
 };
 use crate::lifecycle::{
-    CANCELLATION_SETTLE_TIMEOUT, MAX_DRAIN_TIMEOUT_SECS, WorkerRegistry, deadline_after,
-    drain_cancellation_requested, reset_drain_cancellation, server_drain_timeout_from, submit,
+    CANCELLATION_SETTLE_TIMEOUT, GenerationRequest, MAX_DRAIN_TIMEOUT_SECS, WorkerRegistry,
+    deadline_after, drain_cancellation_requested, reset_drain_cancellation,
+    server_drain_timeout_from, submit,
 };
 use crate::metrics::{CacheMetrics, Histogram, Metrics, SpeculativeMetrics};
 use crate::types::{
-    Backend, GenEvent, GenerationError, Job, PerTokenInfo, SHUTDOWN, terminal_delivery_probe,
+    Completion, EngineMsg, EngineView, FinishReason, GenEvent, GenerationError, Job, PerTokenInfo,
+    PromptInput, SHUTDOWN, Served, terminal_delivery_probe,
 };
+use poot_llm::driver::stops::StopScanner;
 
 mod admin;
 mod drain;
 pub(crate) mod encoder_routes;
 mod engine_loop;
 mod http_parse;
-mod no_engine;
+mod lifecycle;
 mod other;
 mod recording_engine;
 mod scheduling;
@@ -59,24 +67,34 @@ mod streaming;
 mod terminal_done;
 mod write_deadline;
 
-use recording_engine::{Event, FakeSeq, JobSpec, RecordingEngine, Submitted, outcome, serve};
+use recording_engine::{
+    Event, FakeSeq, JobSpec, RecordingEngine, Submitted, outcome, refused, serve, tokens_of,
+};
 
-/// The test double at the engine boundary: drains the job queue and runs each job through `generate`,
-/// streaming `Token` events when the job asked to stream and a terminal `Done`/`Failed`, with the same
-/// outcome accounting the batched commit path has (a terminal `Done` through `GenEvent::deliver_done`, a
-/// piece that cannot be delivered is a cancellation). It stands in for the serving loop so the request
-/// side (`submit`, the handlers, write deadlines) is tested without a model or a device.
-fn test_engine_loop<F>(rx: Receiver<Job>, metrics: Arc<Metrics>, mut generate: F)
+/// What a scripted generation of the test double returns: the generated tokens and text, and why it
+/// ended.
+type Generated = (Vec<u32>, String, FinishReason);
+
+/// The test double at the engine boundary: drains the queue and runs each generation job through
+/// `generate`, streaming `Token` events when the job asked to stream and a terminal `Done`/`Failed`, with
+/// the same outcome accounting the batched commit path has (a terminal `Done` through
+/// `GenEvent::deliver_done`, a piece that cannot be delivered is a cancellation). It stands in for the
+/// serving loop so the request side (`submit`, the handlers, write deadlines) is tested without a model
+/// or a device.
+fn test_engine_loop<F>(rx: Receiver<EngineMsg>, metrics: Arc<Metrics>, mut generate: F)
 where
     F: FnMut(
-        &str,
+        &[u32],
         usize,
         &mut Sampler,
         &[String],
         &mut dyn FnMut(&str) -> GenerationControl,
-    ) -> Result<(Vec<u32>, bool)>,
+    ) -> Result<Generated>,
 {
-    for job in rx {
+    for msg in rx {
+        let EngineMsg::Generate(job) = msg else {
+            panic!("the double serves generation jobs only");
+        };
         let Job {
             prompt,
             max_new,
@@ -85,45 +103,146 @@ where
             stream,
             reply,
             ..
-        } = job;
+        } = *job;
         let decode_start = Instant::now();
         let mut last_token: Option<Instant> = None;
         let mut token_idx = 0usize;
         let mut cancelled = false;
-        let res = generate(&prompt, max_new, &mut sampler, &stop, &mut |piece: &str| {
-            let now = Instant::now();
-            let info = PerTokenInfo {
-                token_idx,
-                since_prev_ms: last_token
-                    .map(|t| (now - t).as_secs_f64() * 1000.0)
-                    .unwrap_or(0.0),
-                cumulative_ms: (now - decode_start).as_secs_f64() * 1000.0,
-                kv_used_ratio: 0.0,
-            };
-            last_token = Some(now);
-            token_idx += 1;
-            if stream
-                && reply
-                    .send(GenEvent::Token(piece.to_string(), info))
-                    .is_err()
-            {
-                cancelled = true;
-                return GenerationControl::Break(());
-            }
-            GenerationControl::Continue(())
-        });
+        let prompt_tokens = prompt.tokens().to_vec();
+        let res = generate(
+            &prompt_tokens,
+            max_new,
+            &mut sampler,
+            &stop,
+            &mut |piece: &str| {
+                let now = Instant::now();
+                let info = PerTokenInfo {
+                    token_idx,
+                    since_prev_ms: last_token
+                        .map(|t| (now - t).as_secs_f64() * 1000.0)
+                        .unwrap_or(0.0),
+                    cumulative_ms: (now - decode_start).as_secs_f64() * 1000.0,
+                    kv_used_ratio: 0.0,
+                };
+                last_token = Some(now);
+                token_idx += 1;
+                if stream
+                    && reply
+                        .send(GenEvent::Token(piece.to_string(), info))
+                        .is_err()
+                {
+                    cancelled = true;
+                    return GenerationControl::Break(());
+                }
+                GenerationControl::Continue(())
+            },
+        );
         if cancelled {
             metrics.requests_cancelled.fetch_add(1, Ordering::Relaxed);
             continue;
         }
         match res {
-            Ok((tokens, natural)) => {
-                GenEvent::deliver_done(&metrics, &reply, tokens, sampler.take_logprobs(), natural);
+            Ok((tokens, text, finish)) => {
+                let completion = Completion {
+                    prompt_tokens: prompt_tokens.len(),
+                    tokens,
+                    text,
+                    logprobs: sampler.take_logprobs(),
+                    finish,
+                };
+                GenEvent::deliver_done(&metrics, &reply, completion);
             }
             Err(e) => {
-                let _ = reply.send(GenEvent::failed(&metrics, format!("{e:#}")));
+                let class = poot_llm::driver::error::FailureClass::Fault;
+                let _ = reply.send(GenEvent::failed(&metrics, class, format!("{e:#}")));
             }
         }
+    }
+}
+
+/// A caps the fakes publish: `rows` rows of a contiguous-free pool, tokens-only inputs, no adapter.
+pub(crate) fn test_caps(rows: usize) -> DriverCaps {
+    let rows = std::num::NonZeroUsize::new(rows).expect("at least one row");
+    let width = std::num::NonZeroUsize::new(8).expect("nonzero");
+    DriverCaps {
+        rows,
+        row_counts: vec![rows],
+        widths: vec![width],
+        max_seq: std::num::NonZeroUsize::new(64).expect("nonzero"),
+        kv: KvLayout::Contiguous,
+        kv_blocks: 0,
+        state: StateResidency::KvOnly,
+        heads: HeadSet::default(),
+        lora: None,
+        windows: Vec::new(),
+        speculation: None,
+        inputs: InputSet {
+            tokens: true,
+            embeds: false,
+            encode: false,
+        },
+    }
+}
+
+/// What a connection thread holds, over `model` and a queue the test reads: the double's engine side.
+pub(crate) fn served_over(
+    model: Arc<ModelHandle>,
+    rows: usize,
+) -> (Arc<Served>, Receiver<EngineMsg>) {
+    let (engine, queue) = mpsc::channel();
+    let served = Served {
+        model,
+        engine,
+        view: EngineView::new(test_caps(rows)),
+        pooling: Pooling::Mean,
+        images: None,
+    };
+    (Arc::new(served), queue)
+}
+
+/// A recording fake running the production loop on its own thread, behind a [`Served`]: what a request
+/// over a socket reaches. The loop's counters and the handlers' are the same `metrics`.
+pub(crate) struct EngineThread {
+    join: std::thread::JoinHandle<RecordingEngine>,
+}
+
+impl EngineThread {
+    /// Close the queue (the caller's `served` is the last sender) and take the fake back.
+    pub(crate) fn finish(self, served: Arc<Served>) -> RecordingEngine {
+        drop(served);
+        self.join.join().expect("the engine thread ends cleanly")
+    }
+}
+
+pub(crate) fn serve_with_fake(
+    engine: RecordingEngine,
+    model: Arc<ModelHandle>,
+    metrics: &Arc<Metrics>,
+) -> (Arc<Served>, EngineThread) {
+    let (served, queue) = served_over(model, engine.rows);
+    let health = EngineHealth::serving_for_test("fake", engine.rows, engine.max_seq);
+    let metrics = Arc::clone(metrics);
+    let join = std::thread::spawn(move || run_engine_thread(engine, queue, &metrics, &health));
+    (served, EngineThread { join })
+}
+
+/// The model of the tiny GGUF fixture, loaded and its file removed.
+pub(crate) fn tiny_model() -> Arc<ModelHandle> {
+    let path = write_tiny_gguf();
+    let model = load_handle(&path);
+    let _ = std::fs::remove_file(&path);
+    model
+}
+
+/// A generation request over the tokens of `prompt` (one token per character).
+pub(crate) fn generation_request(prompt: &str, max_new: usize, stream: bool) -> GenerationRequest {
+    GenerationRequest {
+        prompt: PromptInput::Tokens(tokens_of(prompt)),
+        max_new,
+        sampler: Sampler::greedy(),
+        stop: Vec::new(),
+        stream,
+        lora_adapter: AdapterRef::Base,
     }
 }
 
@@ -196,8 +315,7 @@ fn run_generation_stream_handler(
         .expect("clone terminal handler write control");
     let metrics = Arc::new(test_metrics(endpoint.name()));
     let handler_metrics = Arc::clone(&metrics);
-    let handler_runner = Arc::clone(&runner);
-    let (job_tx, job_rx) = mpsc::channel::<Job>();
+    let (served, job_rx) = served_over(runner, 1);
 
     let handler = std::thread::spawn(move || {
         let mut server = server;
@@ -207,26 +325,14 @@ fn run_generation_stream_handler(
                     r#"{"prompt":"a","max_tokens":1,"stream":true,"stop":"ab"}"#,
                 )
                 .expect("completion terminal request");
-                stream_completion(
-                    &mut server,
-                    Some(&job_tx),
-                    &handler_runner,
-                    &handler_metrics,
-                    &req,
-                )
+                stream_completion(&mut server, &served, &handler_metrics, &req)
             }
             GenerationStreamEndpoint::Chat => {
                 let req: ChatReq = serde_json::from_str(
                     r#"{"messages":[{"role":"user","content":"a"}],"max_tokens":1,"stream":true,"stop":"ab"}"#,
                 )
                 .expect("chat terminal request");
-                stream_chat(
-                    &mut server,
-                    Some(&job_tx),
-                    &handler_runner,
-                    &handler_metrics,
-                    &req,
-                )
+                stream_chat(&mut server, &served, &handler_metrics, &req)
             }
         }
     });
@@ -257,7 +363,7 @@ fn run_generation_stream_handler(
                             }
                             GenerationStreamTerminal::DoneAfterHeldToken => {
                                 let _ = on_token("a");
-                                Ok((vec![0], false))
+                                Ok((vec![0], "a".to_string(), FinishReason::Length))
                             }
                             GenerationStreamTerminal::Cancelled => {
                                 let _ = on_token("c");
@@ -269,7 +375,7 @@ fn run_generation_stream_handler(
                                     );
                                     std::thread::yield_now();
                                 }
-                                Ok((vec![3], false))
+                                Ok((vec![3], "c".to_string(), FinishReason::Length))
                             }
                             GenerationStreamTerminal::EofBeforeToken
                             | GenerationStreamTerminal::EofAfterHeldToken => {
@@ -293,9 +399,12 @@ fn run_generation_stream_handler(
             engine.join().expect("terminal handler engine");
         }
         GenerationStreamTerminal::EofBeforeToken | GenerationStreamTerminal::EofAfterHeldToken => {
-            let job = job_rx
+            let EngineMsg::Generate(job) = job_rx
                 .recv_timeout(Duration::from_secs(5))
-                .expect("handler submitted its EOF fixture job");
+                .expect("handler submitted its EOF fixture job")
+            else {
+                panic!("a generation request sends a generation job");
+            };
             if matches!(terminal, GenerationStreamTerminal::EofAfterHeldToken) {
                 job.reply
                     .send(GenEvent::Token("a".into(), terminal_token_info()))
@@ -315,17 +424,6 @@ fn run_generation_stream_handler(
         .read_to_string(&mut response)
         .expect("read bounded terminal handler response");
     (response, metrics)
-}
-
-// Helper: feed pieces through a StreamStops, returning the concatenated emitted text + whether a stop hit.
-fn run_stream_stops(stops: &[&str], pieces: &[&str]) -> (String, bool) {
-    let mut buf = StreamStops::new(stops.iter().map(|s| s.to_string()).collect());
-    let mut out = String::new();
-    for p in pieces {
-        out.push_str(&buf.push(p));
-    }
-    out.push_str(&buf.finish());
-    (out, buf.hit)
 }
 
 fn unique_fixture_suffix() -> String {
@@ -396,6 +494,24 @@ enum AdminOperation {
 }
 
 impl AdminOperation {
+    /// The status the recording fake answers an authorized request with: nothing is loaded, so
+    /// removing an adapter is a 404.
+    fn allowed_status(self) -> u16 {
+        match self {
+            Self::List | Self::Load => 200,
+            Self::Unload => 404,
+        }
+    }
+
+    /// What its body holds.
+    fn allowed_body_marker(self) -> &'static str {
+        match self {
+            Self::List => "\"object\":\"list\"",
+            Self::Load => "\"name\":\"loaded\"",
+            Self::Unload => "is not registered",
+        }
+    }
+
     fn request(self, path_marker: &str) -> (&'static str, &'static str, String) {
         match self {
             Self::List => ("GET", "/v1/lora_adapters", String::new()),
@@ -411,6 +527,7 @@ impl AdminOperation {
 
 fn run_lora_admin_socket(
     policy: &LoraAdminPolicy,
+    served: &Served,
     method: &str,
     path: &str,
     authorization: &[&str],
@@ -439,7 +556,7 @@ fn run_lora_admin_socket(
     client.flush().expect("flush admin request");
 
     assert!(
-        read_request_for_routing(&mut server, policy)
+        read_request_for_routing(&mut server, served, policy)
             .expect("stage and handle admin request")
             .is_none(),
         "an admin target must be consumed before ordinary routing"
@@ -457,6 +574,7 @@ fn run_lora_admin_socket(
 /// body byte. A denial can only arrive if production authorizes before body reading.
 fn run_denied_lora_admin_head_without_body(
     policy: LoraAdminPolicy,
+    served: Arc<Served>,
     method: &str,
     path: &str,
     authorization: &[&str],
@@ -473,7 +591,8 @@ fn run_denied_lora_admin_head_without_body(
         .set_read_timeout(Some(Duration::from_millis(500)))
         .expect("make an accidental body read fail promptly");
 
-    let handler = std::thread::spawn(move || read_request_for_routing(&mut server, &policy));
+    let handler =
+        std::thread::spawn(move || read_request_for_routing(&mut server, &served, &policy));
 
     let authorization_headers = authorization
         .iter()
@@ -561,8 +680,9 @@ fn run_write_deadline_stream_case(case: WriteDeadlineClientCase) {
 
     let live_connections = Arc::new(AtomicUsize::new(1));
     let handler_connections = Arc::clone(&live_connections);
-    let (job_tx, job_rx) = mpsc::channel::<Job>();
+    let (job_tx, job_rx) = mpsc::channel::<EngineMsg>();
     let (headers_tx, headers_rx) = mpsc::channel();
+    let metrics = Arc::new(test_metrics("write-deadline"));
     let (proceed_tx, proceed_rx) = mpsc::channel();
     let (handler_done_tx, handler_done_rx) = mpsc::channel();
     let handler = std::thread::Builder::new()
@@ -583,12 +703,8 @@ fn run_write_deadline_stream_case(case: WriteDeadlineClientCase) {
                 header_result.map_err(|error| error.to_string()).and_then(|_| {
                     submit(
                         &job_tx,
-                        "write deadline",
-                        2,
-                        Sampler::greedy(),
-                        vec![],
-                        true,
-                        AdapterRef::Base,
+                        &metrics,
+                        generation_request("write deadline", 2, true),
                         &|| false,
                         |piece, _| {
                             if write!(server, "data: {piece}\n\n")
@@ -616,9 +732,12 @@ fn run_write_deadline_stream_case(case: WriteDeadlineClientCase) {
     let engine = std::thread::Builder::new()
         .name(format!("write-deadline-engine-{case:?}"))
         .spawn(move || {
-            let job = job_rx
+            let EngineMsg::Generate(job) = job_rx
                 .recv_timeout(completion_budget)
-                .expect("stream handler submits response subscription");
+                .expect("stream handler submits response subscription")
+            else {
+                panic!("a stream handler sends a generation job");
+            };
             proceed_rx
                 .recv_timeout(completion_budget)
                 .expect("release fixture engine");
@@ -629,8 +748,15 @@ fn run_write_deadline_stream_case(case: WriteDeadlineClientCase) {
                 job.reply
                     .send(GenEvent::Token("two".into(), terminal_token_info()))
                     .expect("send second healthy event");
+                let done = Completion {
+                    prompt_tokens: 1,
+                    tokens: vec![1, 2],
+                    text: "onetwo".into(),
+                    logprobs: vec![],
+                    finish: FinishReason::Eos,
+                };
                 job.reply
-                    .send(GenEvent::Done(vec![1, 2], vec![], true))
+                    .send(GenEvent::Done(done))
                     .expect("send healthy terminal event");
                 engine_done_tx
                     .send(WriteDeadlineEngineOutcome::Completed)

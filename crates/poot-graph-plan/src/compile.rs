@@ -28,7 +28,10 @@ use poot_graph_ir::analysis::{
     NumericalRewriteDecline, NumericsError, NumericsProperty, PASS_DECLARATIONS, PassDeclaration,
     implied_numerics, verify_pass_numerics,
 };
-use poot_graph_ir::{Eqn, Graph, NoValidations, OpKind, Operand, Slot, ValidationChannel, ValueId};
+use poot_graph_ir::{
+    BoundaryId, Eqn, Export, Graph, NoValidations, OpKind, Operand, Slot, ValidationChannel,
+    ValueId,
+};
 use poot_target::{Backend, DeviceCaps};
 
 use crate::passes::{self as transform, GraphBudget, LegalizeError, PackedDequantProductionError};
@@ -294,6 +297,41 @@ impl<V: ValidationChannel> Program<V> {
         &self.buffer_plan
     }
 
+    /// Where each exported boundary lives after optimization, CSE and renumbering: the compiled
+    /// graph's [`Graph::exports`]. Several boundaries may resolve to one value.
+    pub fn exports(&self) -> &[Export] {
+        &self.graph.exports
+    }
+
+    /// The first export that is, after planning, a view (alias, reshape, strided view) of a carried-state
+    /// input, with that input: a later stage reading it would see the value the stage's own commit
+    /// wrote, not the one the uncut graph reads. `None` when every export is a computed or bound value.
+    pub fn export_aliasing_state(&self) -> Option<(BoundaryId, ValueId)> {
+        let mut root: Vec<ValueId> = (0..self.graph.values.len()).collect();
+        for (eqn, plan) in self.planned() {
+            match plan {
+                Plan::Alias(src) | Plan::View { src, .. } => root[eqn.out] = root[*src],
+                Plan::Dispatches(_) | Plan::Collective { .. } => {}
+            }
+        }
+        self.graph.exports.iter().find_map(|export| {
+            let source = root[export.value];
+            (self.graph.meta(source).storage == poot_graph_ir::Storage::State)
+                .then_some((export.id, source))
+        })
+    }
+
+    /// The input binder of the compiled graph that consumes boundary `id` (the keyed slot
+    /// [`BoundaryId::slot_key`] names), if this program has one.
+    pub fn boundary_input(&self, id: BoundaryId) -> Option<ValueId> {
+        let key = id.slot_key();
+        self.graph
+            .inputs
+            .iter()
+            .copied()
+            .find(|&input| self.graph.meta(input).slot_key() == Some(&key))
+    }
+
     /// Each equation of [`Program::graph`] with its plan, in execution order.
     pub fn planned(&self) -> impl Iterator<Item = (&Eqn, &Plan)> {
         self.graph.eqns.iter().zip(&self.plans)
@@ -381,9 +419,7 @@ pub fn compile<V: ValidationChannel>(
     let adapted;
     let g = match &options.lora {
         Some(plan) => {
-            adapted = transform::apply_lora(g, plan, &budget)?;
-            adapted.validate().map_err(PlanError::from)?;
-            budget.admit("apply_lora", &adapted)?;
+            adapted = adapt(g, plan, &budget)?;
             &adapted
         }
         None => g,
@@ -489,6 +525,20 @@ pub fn compile<V: ValidationChannel>(
         buffer_plan,
         limits: options.limits,
     })
+}
+
+/// The LoRA mode transform over a whole graph, validated and within `budget`. [`compile`] applies it
+/// to the graph it is handed; [`crate::compile_staged`] applies it once to the uncut graph and
+/// compiles every stage without it.
+pub(crate) fn adapt<V: ValidationChannel>(
+    g: &Graph<V>,
+    plan: &LoraPlan,
+    budget: &GraphBudget,
+) -> Result<Graph<V>, CompileError> {
+    let adapted = transform::apply_lora(g, plan, budget)?;
+    adapted.validate().map_err(PlanError::from)?;
+    budget.admit("apply_lora", &adapted)?;
+    Ok(adapted)
 }
 
 /// The graph as it moves through the passes, with the record of the passes that changed it.
@@ -1055,6 +1105,63 @@ mod tests {
             let program = compile(&decode, target, &REPLAY).expect("decode compiles");
             for pass in PIPELINE_PASSES {
                 assert!(ran(&program, pass), "{label} decode skipped {pass}");
+            }
+        }
+    }
+
+    /// POOT-742 SC-003 (ruling XC2-05): every MoE family's prefill fixture, compiled through `compile_staged`
+    /// for the ROCm preset, runs the full pass list, and `routed_expert_sites` (which POOT-746's pool transform
+    /// reads in production) finds the family's routed experts: each family routes them through `components::moe`,
+    /// never a dense broadcast over all `E` experts. (`tile_matmuls` is gone: the planner makes that choice, so
+    /// the contraction and pointwise passes are `fuse_contraction_epilogues` and `fuse`. `flash_attention_capped`
+    /// is not asserted: deepseek4's compressed-sparse and gpt_oss's sink attention have no flash form.)
+    ///
+    /// Mutation (observed red, restored; see the card record): restore deepseek3's broadcast form (the routed
+    /// experts as a dense `MatMul` over all `E`); `routed_expert_sites` finds no site in `deepseek3` and this row
+    /// goes red naming that family.
+    #[test]
+    fn every_moe_family_prefill_has_routed_expert_sites_and_runs_every_pass_on_rocm() {
+        use poot_models::model::Phase;
+        use poot_target::{AmdArch, DeviceCaps};
+
+        // (registered family, fixture variant): every family whose FFN is routed experts.
+        const MOE_FAMILIES: [(&str, Option<&str>); 11] = [
+            ("llama", Some("mixtral")),
+            ("qwen3moe", None),
+            ("olmoe", None),
+            ("deepseek2", None),
+            ("deepseek3", None),
+            ("deepseek32", None),
+            ("deepseek4", None),
+            ("glm53_flash", None),
+            ("minimax_m2", None),
+            ("gpt_oss", None),
+            ("gemma4", Some("moe")),
+        ];
+        let rocm = Target {
+            backend: Backend::AmdGcn(AmdArch::gfx1151()),
+            caps: DeviceCaps::rocm_default(),
+        };
+        let targets = TargetSet::single(DeviceId(0), rocm);
+        let partition = Partition {
+            experts: ExpertPlacement::AllResident,
+            devices: DevicePlacement::Single(DeviceId(0)),
+        };
+        for (family, variant) in MOE_FAMILIES {
+            let prefill = registered_step_and_weights(family, variant, Phase::Prefill, 4).0;
+            assert!(
+                !crate::passes::routed_expert_sites(&prefill).is_empty(),
+                "{family}: the prefill finds no routed-expert site"
+            );
+            let staged = compile_staged(&prefill, &targets, &partition, &REPLAY)
+                .unwrap_or_else(|e| panic!("{family}: prefill compiles: {e:?}"));
+            let stages: Vec<_> = staged.stages().collect();
+            assert_eq!(stages.len(), 1, "{family}: one stage");
+            for pass in ["fuse_contraction_epilogues", "fuse"] {
+                assert!(
+                    ran(stages[0].2, pass),
+                    "{family}: ROCm prefill skipped {pass}"
+                );
             }
         }
     }
@@ -2118,6 +2225,105 @@ mod tests {
             .find(|&&(_, kind)| kind == Slot::Pos)
             .expect("the Pos slot survives compile");
         assert!(!program.storage().storage(slot).is_f32_mirror());
+    }
+
+    /// POOT-1074: an I32 state pool read by a `Gather` and written back by a `ScatterUpdate` (the paged PLE
+    /// token history) plans on every backend. The Gather reads the pool as exact i32 (an I32 table is an
+    /// authoritative integer source), so the ScatterUpdate that writes the carried value back reads and
+    /// writes the same lane: base, source, result and the next value of the state edge are one component.
+    ///
+    /// The pool is exact through the `Gather`'s pin alone; the two union rules are each pinned by their own
+    /// test below (`..._scatter_update_joins_...`, `..._carried_state_edge_...`).
+    ///
+    /// Mutation (never left in the tree): drop both the `ScatterUpdate` union and the state-edge union in
+    /// `ExactI32StorageAnalysis::new` -> `Plan(I32ReaderLaneConflict { value: 0, .. })`.
+    #[test]
+    fn compile_plans_an_i32_state_pool_gathered_and_scattered_on_one_lane() {
+        let b = Builder::new();
+        let pool = b.state_input(
+            "pool",
+            TensorType::new(vec![4, 3], DType::I32),
+            StateRole::Recurrent,
+        );
+        let read = b.slot(Slot::Pos, TensorType::new(vec![2], DType::I32));
+        let write = b.slot(Slot::SlotMap, TensorType::new(vec![4], DType::I32));
+        let x = b.slot(Slot::Activation, TensorType::new(vec![2, 3], DType::I32));
+        let next = b.binary(BinOp::Add, b.gather(pool, 0, read), x);
+        let updated = b.scatter_update(pool, next, write);
+        let g = b.finish_with_state(next, &[(pool, updated)]);
+        for backend in [
+            Backend::SpirvVulkan,
+            Backend::Nvptx,
+            Backend::AmdGcn(poot_target::AmdArch::gfx1151()),
+        ] {
+            compile(&g, &target_for(backend), &REPLAY)
+                .unwrap_or_else(|error| panic!("{backend:?}: {error:?}"));
+        }
+    }
+
+    /// POOT-1074, the ScatterUpdate rule: an I32 `ScatterUpdate` that is NOT a state edge moves its base's and
+    /// its source's words, so base, source and result are one lane. Here the result is gathered as a table
+    /// (an authoritative integer source: pinned exact) while the source is also cast to F32, a reader that
+    /// alone would leave it on the mirror lane. The scatter reads the source exact beside the cast.
+    ///
+    /// Mutation (never left in the tree): drop the `ScatterUpdate` union in `ExactI32StorageAnalysis::new`
+    /// -> `Plan(I32ReaderLaneConflict)` on the source.
+    #[test]
+    fn compile_joins_an_i32_scatter_update_source_to_its_gathered_result() {
+        let b = Builder::new();
+        let base = b.constant("base", TensorType::new(vec![4, 3], DType::I32));
+        let src = b.slot(Slot::Activation, TensorType::new(vec![2, 3], DType::I32));
+        let inv = b.slot(Slot::SlotMap, TensorType::new(vec![4], DType::I32));
+        let at = b.slot(Slot::Pos, TensorType::new(vec![2], DType::I32));
+        let updated = b.scatter_update(base, src, inv);
+        let rows = b.cast(b.gather(updated, 0, at), DType::F32);
+        let out = b.binary(BinOp::Add, rows, b.cast(src, DType::F32));
+        let g = b.finish(out);
+        for backend in [
+            Backend::SpirvVulkan,
+            Backend::Nvptx,
+            Backend::AmdGcn(poot_target::AmdArch::gfx1151()),
+        ] {
+            compile(&g, &target_for(backend), &REPLAY)
+                .unwrap_or_else(|error| panic!("{backend:?}: {error:?}"));
+        }
+    }
+
+    /// POOT-1074, the state-edge rule: an I32 carried value is one buffer across steps. The state `s` is read
+    /// only as a `Gather` index into an F32 table, which alone leaves it on the mirror lane; its next value is
+    /// `GeU(slot, 3)`, an exact-only comparison observed through the state output. The next step reads the
+    /// carried buffer, so `s` and its next value must be one lane: `required(s) == required(next)`, both
+    /// exact, and `compile` plans every backend.
+    ///
+    /// Mutation (never left in the tree): drop the state-edge union in `ExactI32StorageAnalysis::new` ->
+    /// `required(s)` is false while `required(next)` is true (`left: false, right: true`).
+    #[test]
+    fn compile_joins_a_carried_i32_state_to_its_next_value() {
+        let b = Builder::new();
+        let s = b.state_input(
+            "s",
+            TensorType::new(vec![4], DType::I32),
+            StateRole::Recurrent,
+        );
+        let table = b.constant("table", TensorType::f32(vec![16, 8]));
+        let gathered = b.gather(table, 0, s);
+        let pos = b.slot(Slot::Pos, TensorType::new(vec![4], DType::I32));
+        let next = b.binary_scalar(BinOp::GeU, pos, Scalar::I32(3));
+        let g = b.finish_with_state(gathered, &[(s, next)]);
+        let analysis = ExactI32StorageAnalysis::new(&g);
+        assert_eq!(analysis.required(s.id), analysis.required(next.id));
+        assert!(
+            analysis.required(next.id),
+            "the comparison pins the component exact"
+        );
+        for backend in [
+            Backend::SpirvVulkan,
+            Backend::Nvptx,
+            Backend::AmdGcn(poot_target::AmdArch::gfx1151()),
+        ] {
+            compile(&g, &target_for(backend), &REPLAY)
+                .unwrap_or_else(|error| panic!("{backend:?}: {error:?}"));
+        }
     }
 
     /// The same agreement reached through an alias: the exact-I32 `[4]` slot is the Gather's index, and its

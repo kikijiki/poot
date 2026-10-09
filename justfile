@@ -23,7 +23,7 @@ fmt:
 # lint the workspace; any warning fails (cargo arguments go before the `--`)
 [positional-arguments]
 clippy *args:
-    # `poot-llm/cli` builds the two binaries (`qwen2-generate`, `poot-caption`), which need it (anyhow)
+    # `poot-llm/cli` builds the binaries (`poot-generate`, `poot-caption`, `poot-embed`), which need it (anyhow, clap)
     cargo clippy --workspace --all-targets --features poot-llm/cli "$@" -- -D warnings
 
 # ---- tests ------------------------------------------------------------------
@@ -48,17 +48,16 @@ models_dir := env("POOT_MODELS_DIR", home_directory() / "models")
 # the one entry point for the whole gate: dead-pub and unused-dependency checks, every self-test, the model-free lane
 test: test-model-free
 
-# the model-free gate: dead-pub and unused-dependency checks, the inventory and lane self-tests, device-probe
+# the model-free gate: dead-pub and unused-dependency checks, docs-path references, the inventory and lane self-tests, device-probe
 # self-test, then every model-free test and doctest
-test-model-free: dead-pub machete cargo-freshness test-model-free-inventory test-lane-coverage test-bench-runner
+test-model-free: dead-pub machete docs-paths crates-stale-names cargo-freshness test-model-free-inventory test-lane-coverage test-bench-runner
     scripts/with-required-backend.sh --self-test
     scripts/test-model-free.sh run
 
 # The bench runner's host tests, which the model-free lane cannot carry (its dependency on poot-llm turns the rocm
 # feature on for every poot-llm build in the same invocation). Devices and checkpoints are hidden and required
-# here exactly as in that lane. The recursion that once forked the box out of memory is removed at its root (a
-# backtick in a double-quoted string of the script executed this recipe); the script's POOT_MODEL_FREE_ACTIVE
-# re-entry guard is defence in depth, not the fix.
+# here exactly as in that lane. The script's POOT_MODEL_FREE_ACTIVE re-entry guard stops a recipe that
+# re-enters itself.
 test-bench-runner:
     scripts/test-model-free.sh run-isolated {{isolated_package}}
 
@@ -80,6 +79,12 @@ test-lane-coverage:
 test-add-a-model:
     cargo nextest run --no-tests=fail --no-fail-fast -p poot-llm --test add_a_model -E 'not test(/_(wgpu|rocm|ptx)$/)'
 
+# fail on a `docs/<name>.md` reference in a tracked file whose target does not exist (project notes live in
+# Backstage, not in this repository's docs/)
+docs-paths:
+    scripts/check-docs-paths.py --self-test
+    scripts/check-docs-paths.py
+
 # worktrees share a slot target dir, so cargo must decide freshness by source content, not mtime (POOT-1037)
 cargo-freshness:
     scripts/check-cargo-freshness.sh
@@ -92,6 +97,12 @@ cargo-freshness:
 dead-pub:
     python3 scripts/dead-pub/dead_pub.py --self-test
     python3 scripts/dead-pub/dead_pub.py
+
+# fail when a crate source or manifest cites a deleted API (Runner, GpuExecutor, run_resident_kv, run_prefill, POOT_SPEC_*)
+# as if it still existed; a comment block that says the name is gone is history and passes
+crates-stale-names:
+    python3 scripts/crates-stale-names.py --self-test
+    python3 scripts/crates-stale-names.py
 
 # fail on a dependency a manifest declares and its crate never uses
 machete:
@@ -139,20 +150,20 @@ test-optional:
 # runs its two packages whole, so it has no filter.
 # A `package(...)` selection also runs that package's model-free tests (poot-runtime, poot-rocm-runtime), which
 # `just test` runs too: the repeat is harmless and costs seconds.
-wgpu_selection := 'package(poot-runtime) | (binary_id(=poot-llm) & test(/^driver::device_tests::[a-z_0-9]+_wgpu$/)) | (binary_id(=poot-llm::add_a_model) & test(/_wgpu$/)) | (binary_id(=poot-llm::speculate) & test(/_wgpu$/)) | binary_id(=poot-executor) | binary_id(=poot-executor::cr30_lifecycle) | package(poot-gpu) | binary_id(=poot-serve::bounded_drain_production) | (binary_id(=poot-serve::served_loop) & test(/_wgpu$/)) | test(/^prefill_kv_shared_pool_matches_contiguous$/) | test(/^qwen2_decode_gpu_matches_cpu$/)'
-vulkan_selection := 'package(poot-vulkan-runtime) | package(poot-vulkan-device)'
-rocm_selection := 'package(poot-rocm-runtime) | (binary_id(=poot-llm) & test(/^driver::device_tests::[a-z_0-9]+_rocm$/)) | (binary_id(=poot-llm::add_a_model) & test(/_rocm$/)) | package(poot-rocm-gpu) | (binary_id(=poot-llm::speculate) & test(/_rocm$/)) | binary_id(=poot-llm::card234_rocm_batched_decode_plan_classify) | (binary_id(=poot-serve::served_loop) & test(/_rocm$/))'
+wgpu_selection := 'package(poot-runtime) | (binary_id(=poot-llm) & test(/^driver::device_tests::[a-z_0-9]+_wgpu$/)) | (binary_id(=poot-llm::add_a_model) & test(/_wgpu$/)) | (binary_id(=poot-llm::beam) & test(/_wgpu$/)) | (binary_id(=poot-llm::timed_executor) & test(/_wgpu$/)) | (binary_id(=poot-llm::speculate) & test(/_wgpu$/)) | (binary_id(=poot-llm::staged_timing) & test(/_wgpu$/)) | binary_id(=poot-executor) | binary_id(=poot-executor::cr30_lifecycle) | binary_id(=poot-executor::staged_pipeline) | package(poot-gpu) | binary_id(=poot-serve::bounded_drain_production) | (binary_id(=poot-serve::served_loop) & test(/_wgpu$/)) | (binary_id(=poot-serve::bin/poot-serve) & test(/^tests::lifecycle::device::[a-z_0-9]+_wgpu$/)) | (binary_id(=poot-serve::served_groups) & test(/_wgpu$/)) | test(/^prefill_kv_shared_pool_matches_contiguous$/) | test(/^qwen2_decode_gpu_matches_cpu$/)'
+vulkan_selection := 'package(poot-vulkan-runtime) | package(poot-vulkan-device) | (binary_id(=poot-serve::served_groups) & test(/_vulkan$/))'
+rocm_selection := 'package(poot-rocm-runtime) | (binary_id(=poot-llm) & test(/^driver::device_tests::[a-z_0-9]+_rocm$/)) | (binary_id(=poot-llm::add_a_model) & test(/_rocm$/)) | package(poot-rocm-gpu) | (binary_id(=poot-llm::beam) & test(/_rocm$/)) | (binary_id(=poot-llm::timed_executor) & test(/_rocm$/)) | (binary_id(=poot-llm::speculate) & test(/_rocm$/)) | binary_id(=poot-llm::rocm_batched_decode_plan_classify) | (binary_id(=poot-serve::served_loop) & test(/_rocm$/)) | (binary_id(=poot-serve::bin/poot-serve) & test(/^tests::lifecycle::device::[a-z_0-9]+_rocm$/)) | (binary_id(=poot-serve::served_groups) & test(/_rocm$/))'
 # `captured_executor_facade` spawns `cargo rustdoc` and a Cargo fixture, which a device pod does not carry; it is
 # model-free and `just test` runs it, so the PTX lane excludes that binary by id.
-ptx_selection := '(binary_id(=poot-llm) & test(/^driver::device_tests::[a-z_0-9]+_ptx$/)) | (binary_id(=poot-llm::add_a_model) & test(/_ptx$/)) | (binary_id(=poot-llm::speculate) & test(/_ptx$/)) | (package(poot-ptx-gpu) & not binary_id(=poot-ptx-gpu::captured_executor_facade)) | package(poot-ptx-runtime) | test(/^(wmma_tile_dispatches_and_matches_cpu_on_ptx|attention_leading_true_inf_mask_dispatches_and_matches_cpu_on_ptx|attention_fixture_bank_matches_cpu_on_ptx|attention_split_key_and_live_bound_match_cpu_on_ptx)$/)'
+ptx_selection := '(binary_id(=poot-llm) & test(/^driver::device_tests::[a-z_0-9]+_ptx$/)) | (binary_id(=poot-llm::add_a_model) & test(/_ptx$/)) | (binary_id(=poot-llm::speculate) & test(/_ptx$/)) | (binary_id(=poot-llm::staged_timing) & test(/_ptx$/)) | (binary_id(=poot-llm::timed_executor) & test(/_ptx$/)) | (binary_id(=poot-serve::served_groups) & test(/_ptx$/)) | (package(poot-ptx-gpu) & not binary_id(=poot-ptx-gpu::captured_executor_facade)) | package(poot-ptx-runtime) | test(/^(wmma_tile_dispatches_and_matches_cpu_on_ptx|attention_leading_true_inf_mask_dispatches_and_matches_cpu_on_ptx|attention_fixture_bank_matches_cpu_on_ptx|attention_split_key_and_live_bound_match_cpu_on_ptx)$/)'
 kernels_selection := 'package(pootc) | package(poot-kernelgen)'
 
 # poot-bench-runner builds poot-llm with the rocm feature, which cannot unify into the model-free lane, so
 # its host tests run in `test-bench-runner`.
 isolated_package := 'poot-bench-runner'
 
-# Required small-device lanes. Each runs through scripts/with-required-backend.sh, which clears the legacy
-# global and every backend-specific requirement, sets only its own, and fails the lane before any test runs
+# Required small-device lanes. Each runs through scripts/with-required-backend.sh, which clears every
+# backend requirement, sets only its own, and fails the lane before any test runs
 # when no device of that backend is visible. The nextest group serializes inside this invocation only.
 # Every lane also runs the required-case gate (card 670): scripts/check-required-cases.py --self-test proves
 # the gate itself first, the lane runs under its own nextest profile so results land in
@@ -186,7 +197,7 @@ test-device-kernels:
 test-device-vulkan:
     scripts/check-required-cases.py --self-test
     scripts/with-required-backend.sh POOT_REQUIRE_VULKAN env POOT_VULKAN_VALIDATION=1 \
-        {{nextest}} --profile device-vulkan -p poot-vulkan-runtime -p poot-vulkan-device \
+        {{nextest}} --profile device-vulkan -p poot-vulkan-runtime -p poot-vulkan-device -p poot-serve \
         -E '{{vulkan_selection}}'
     scripts/check-required-cases.py vulkan
 
@@ -261,16 +272,16 @@ test-rocm-feature:
 test-device-ptx:
     scripts/check-required-cases.py --self-test
     scripts/with-required-backend.sh POOT_REQUIRE_PTX \
-        {{nextest}} --profile device-ptx -p poot-ptx-gpu -p poot-ptx-runtime -p poot-kernelgen -p poot-llm \
+        {{nextest}} --profile device-ptx -p poot-ptx-gpu -p poot-ptx-runtime -p poot-kernelgen -p poot-llm -p poot-serve \
         -E '{{ptx_selection}}'
     scripts/check-required-cases.py ptx
 
 # Alias for the default GPU backend.
 test-gpu: test-device-wgpu
 
-# run both criterion benches: CPU decode (poot-eval) and wgpu op dispatch (poot-gpu, wgpu device required)
+# run both criterion benches: CPU decode (poot-graph-plan) and wgpu op dispatch (poot-gpu, wgpu device required)
 bench:
-    cargo bench -p poot-eval --bench decode
+    cargo bench -p poot-graph-plan --bench decode
     scripts/with-required-backend.sh POOT_REQUIRE_WGPU cargo bench -p poot-gpu --bench op_dispatch
 
 # ---- mutation sampling (card 538, R486-015) ----------------------------------
@@ -325,6 +336,14 @@ docs-check:
     prettier --check $files || rc=1
     echo "-- links --"
     lychee --no-progress $files || rc=1
+    echo "-- retired names (the generate binary is poot-generate) --"
+    # The pattern is written with a bracket so this line does not match itself.
+    if git grep -nI 'qwen2-gener[a]te' -- . ; then
+        echo "the old generate binary name was renamed poot-generate: replace it where listed above"
+        rc=1
+    fi
+    echo "-- docs/ path references --"
+    just docs-paths || rc=1
     echo "-- ascii (no em-dashes / non-ascii) --"
     if grep -nP '[^\x00-\x7F]' $files; then
         echo "non-ASCII characters found (see above) - replace with ASCII equivalents"
@@ -341,7 +360,7 @@ docs-fix:
 
 # ---- website: the Docusaurus docs site in ./website -------------------------
 # Runs bun via the devshell. The site is the user-facing manual only (getting started, architecture,
-# usage, examples); internal project tracking lives in the repo's docs/.
+# usage, examples); internal project tracking lives in Backstage.
 
 # install the site's node dependencies (first run, or after package.json changes)
 site-install:
@@ -366,7 +385,7 @@ site-build: _site-deps
 site-serve: _site-deps
     cd website && bun run serve
 
-# the site's checks: TypeScript typecheck, a production build (broken links), names the code no longer has, and the ascii rule over
+# the site's checks: TypeScript typecheck, a production build (broken links), names the code no longer has, the develop/ Rust snippets, and the ascii rule over
 # tracked text sources. git grep ignores untracked build/vendor files; bun.lock is generated metadata.
 site-check: _site-deps
     #!/usr/bin/env bash
@@ -378,16 +397,10 @@ site-check: _site-deps
     (cd website && bun run build) || rc=1
     echo "-- stale names (identifiers, variables, crates, paths, recipes, flags the code no longer has) --"
     scripts/site-stale-names.sh || rc=1
+    echo "-- rust snippets (the develop/ pages' code compiles) --"
+    scripts/site-rust-snippets.sh || rc=1
     echo "-- card numbers (the site never names an internal card or board id) --"
-    card_rc=0
-    git grep -nIiP '\b(cards? #?[0-9]{3,4}[a-d]?|POOT-[0-9]+|POOT-ADR-[0-9]+)\b' -- website/docs website/src || card_rc=$?
-    if [ "$card_rc" -eq 0 ]; then
-        echo "internal card numbers found (see above) - the site holds user-facing truth only"
-        rc=1
-    elif [ "$card_rc" -ne 1 ]; then
-        echo "card-number scan failed with status $card_rc"
-        rc=1
-    fi
+    scripts/site-card-numbers.sh || rc=1
     echo "-- ascii (no em-dashes / non-ascii) --"
     ascii_rc=0
     git grep -nIP '[^\x00-\x7F]' -- website ':!website/bun.lock' || ascii_rc=$?

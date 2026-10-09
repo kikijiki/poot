@@ -26,10 +26,9 @@
 //! group per key head, `A_log` (the decay is `-exp(A_log)`) and value heads grouped by key head
 //! ([`GdnHeadOrder::Grouped`]). [`GdnParams`] names which, and the same graph follows.
 
-use poot_graph_ir::{
-    BinOp, Builder, ScanAttrs, ScanFamily, ScanResult, StateRole, TensorType, Traced, UnOp, ops,
-};
+use poot_graph_ir::{BinOp, Builder, ScanAttrs, ScanFamily, ScanResult, Traced, UnOp, ops};
 use poot_quant::weights::{GdnRole, WeightId, WeightMap, WeightRole};
+use poot_tensor::DType;
 
 use super::conv::{ConvParams, ConvWeights, causal_conv};
 use super::linear::{Weight, WeightError, linear};
@@ -497,7 +496,6 @@ pub fn gdn(
     w: &GdnWeights,
     p: &GdnParams,
 ) -> Traced {
-    let rows = step.shape().rows.get();
     let d = &p.dims;
     let projected = project(b, x, w, d);
     let decay = w.decay.declare_f32(b);
@@ -521,10 +519,11 @@ pub fn gdn(
         &w.conv,
         &p.conv,
     );
-    let state = b.state_input(
+    let state = step.recurrent_state(
+        b,
         &format!("gdn.l{layer}.ssm"),
-        TensorType::f32(vec![rows, d.value_heads, d.head_dim, d.head_dim]),
-        StateRole::Recurrent,
+        DType::F32,
+        &[d.value_heads, d.head_dim, d.head_dim],
     );
     let (mixed, next) = gdn_scan(
         b,
@@ -535,7 +534,7 @@ pub fn gdn(
             g,
             norm_scale: w.gate_norm.declare_f32(b),
         },
-        state,
+        state.current(),
         &Recurrence {
             dims: *d,
             order: p.order,
@@ -543,7 +542,7 @@ pub fn gdn(
             chunk: p.chunk,
         },
     );
-    step.carry(state, next);
+    step.carry_recurrent(b, state, next);
     linear(b, mixed, &w.out, None)
 }
 
@@ -555,6 +554,7 @@ mod tests {
     use crate::components::standard::oracle::{self, Fx};
     use crate::components::testing::{CAP, step_shape};
     use crate::model::LogitRows;
+    use poot_graph_ir::TensorType;
 
     const WIDTH: usize = 6;
     const KEY_HEADS: usize = 2;

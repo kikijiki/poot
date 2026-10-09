@@ -11,6 +11,7 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
+libc = "0.2"
 poot-codegen = { workspace = true, optional = true }
 poot-eval = { workspace = true, optional = true }
 poot-graph-ir.workspace = true

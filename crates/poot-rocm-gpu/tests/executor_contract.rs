@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
 use poot_executor::StepInputs;
-use poot_executor::{Arg, Device, DeviceTime, Dispatch, Engine, Executor, ExecutorStats, NoSync};
+use poot_executor::{Arg, Device, Dispatch, Engine, Executor, ExecutorStats, NoSync};
 use poot_executor_parity::dense::{Dense, Family, plain, step};
 use poot_graph_ir::{BinOp, Builder, Graph, StateRole, TensorType};
 use poot_graph_plan::{ImportedKernel, Submission};
@@ -332,26 +332,6 @@ fn the_rocm_device_reports_live_free_memory_within_its_open_time_ceiling() {
     );
 }
 
-/// SC-005: ROCm profiling of a fixture reports `Unknown` device time, never host wall. Mutation:
-/// have `RocmDevice::device_time` return `DeviceTime::Measured` with a wall-clock span (restoring
-/// the pre-contract behavior `record_dispatch(name, wall, Some(wall))` once reported); the fixture
-/// then reports a number and this row goes red.
-#[test]
-fn rocm_device_time_is_always_unknown() {
-    let Some(mut device) = require_rocm() else {
-        return;
-    };
-    device.begin(poot_graph_plan::Submission::Replay).unwrap();
-    let recording = device.finish().unwrap().expect("Replay always records");
-    device.replay(&recording).unwrap();
-    device.synchronize().unwrap();
-    assert_eq!(
-        device.device_time(),
-        DeviceTime::Unknown,
-        "ROCm has no HSA timestamp binding yet (Card 552's SC-001, moved here)"
-    );
-}
-
 /// SC-006: the same fixture reads equal bytes by role on the wgpu and ROCm runtime counters (moved
 /// from Card 547a, R-546-7). The row's actual claim is cross-backend agreement,
 /// not just "ROCm's own Weight/State roles are self-consistently nonzero" - this now opens a wgpu
@@ -599,10 +579,10 @@ fn copy_round_trips_every_narrow_element_width_with_no_sentinel_corruption() {
             .allocate(BufferRole::Activation, storage, elems)
             .unwrap_or_else(|e| panic!("{name}: allocate dst_sentinel: {e}"));
         device
-            .write(&src, &src_data)
+            .write(&src, 0, &src_data)
             .unwrap_or_else(|e| panic!("{name}: write src: {e}"));
         device
-            .write(&dst_sentinel, &sentinel_pattern)
+            .write(&dst_sentinel, 0, &sentinel_pattern)
             .unwrap_or_else(|e| panic!("{name}: write dst_sentinel: {e}"));
         device.begin(Submission::Replay).unwrap();
         device
@@ -637,7 +617,8 @@ fn copy_round_trips_every_narrow_element_width_with_no_sentinel_corruption() {
 /// (not released) with their role-counter bytes still charged, and its code object alive - exactly
 /// the Card 602 `TimeoutLeaks`/`DevicePoison` contract proven here through the new `Device` trait's
 /// own entry points (`begin`/`dispatch`/`finish`/`replay`/`synchronize`), not a raw
-/// `RocmContext`/`HsacoModule` call. Mutation: skip `self.timeouts.poison()` in
+/// `RocmContext`/`HsacoModule` call. The timeout surfaces at `synchronize`, the step's one host wait
+/// (`replay` only enqueues). Mutation: skip `self.timeouts.poison()` in
 /// `wait_completion_bounded`'s timeout branch (the mutation `poot-rocm-runtime`'s own
 /// `submissions_after_a_timed_out_completion_wait_are_refused` already proves red/green for); this
 /// row's own evidence is specific to driving that path through `RocmDevice::replay`/`synchronize`.
@@ -647,6 +628,7 @@ fn a_timed_out_dispatch_through_the_device_trait_retains_its_allocations_and_poi
         DeviceBackend::Rocm,
         poot_rocm_runtime::RocmContext::new_with_options(poot_rocm_runtime::RocmContextOptions {
             wait_timeout: Duration::from_secs(2),
+            ..Default::default()
         }),
     ) else {
         return;
@@ -678,7 +660,7 @@ fn a_timed_out_dispatch_through_the_device_trait_retains_its_allocations_and_poi
     // 4e9 dependent-chain iterations: far beyond the 2s bound on any GPU this box runs, while still
     // finite (the dispatch really does complete, eventually, if left alone).
     device
-        .write(&n_buf, &4_000_000_000u32.to_le_bytes())
+        .write(&n_buf, 0, &4_000_000_000u32.to_le_bytes())
         .unwrap();
     let out_buf: RocmBuffer = device
         .allocate(BufferRole::Activation, BufferStorage::f32(), 1)
@@ -709,9 +691,12 @@ fn a_timed_out_dispatch_through_the_device_trait_retains_its_allocations_and_poi
         })
         .unwrap();
     let recording = device.finish().unwrap().expect("Replay always records");
+    device
+        .replay(&recording)
+        .expect("replay only enqueues: the spin is still running when it returns");
     let t0 = std::time::Instant::now();
     let err = device
-        .replay(&recording)
+        .synchronize()
         .expect_err("the 4e9-iteration spin must outlast the 2s wait_timeout bound");
     eprintln!(
         "a_timed_out_dispatch_through_the_device_trait_retains_its_allocations_and_poisons: \
@@ -788,7 +773,7 @@ fn an_ordinary_unload_with_completion_proven_releases_its_allocations() {
 /// is both a `Gather` index and feeds another use) does exist on ROCm - `poot-graph-plan`'s planner
 /// has no backend-specific admission for it, and `poot_test_util::i32_slot_gather`'s shared harness
 /// is backend-generic (wgpu's own row, `poot-gpu/tests/graph/gather_scatter.rs`, drives the same
-/// three variants through `run_resident_kv`). The two state-carrying variants (v1/v2) need a
+/// three variants through the executor contract). The two state-carrying variants (v1/v2) need a
 /// non-zero initial cache; the executor contract has no explicit "seed state" entry point (state
 /// always starts zero-seeded within an executable), so this primes each one
 /// through a one-shot entry on the same executable that writes the exact seed bytes into that named

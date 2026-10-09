@@ -16,7 +16,12 @@ poot-models.workspace = true
 poot-executor.workspace = true
 poot-graph-plan.workspace = true
 poot-target.workspace = true
+# LoRA administration loads a PEFT adapter directory; the synthetic GGUF writer of the startup and
+# handler fixtures (`tests/support/tiny_gguf.rs`) uses it too.
+poot-load.workspace = true
 clap.workspace = true
+# `encoding_format: base64` embeddings.
+base64.workspace = true
 anyhow.workspace = true
 ring.workspace = true
 subtle.workspace = true
@@ -30,12 +35,14 @@ thiserror.workspace = true
 
 [dev-dependencies]
 poot-test-util = { path = "../poot-test-util" }
-# The synthetic GGUF writer of the startup and handler fixtures (`tests/support/tiny_gguf.rs`).
-poot-load.workspace = true
 # The fixture device of the engine-plan rows counts allocations the way a runtime does.
 poot-runtime-common.workspace = true
 poot-quant.workspace = true
+# The dtype of the synthetic LoRA adapter the device rows write.
+poot-tensor.workspace = true
 poot-graph-ir.workspace = true
+# The image the served VLM row sends is a PNG it encodes.
+image.workspace = true
 
 [lints]
 workspace = true

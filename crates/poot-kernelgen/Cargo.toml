@@ -1,6 +1,6 @@
 [package]
 name = "poot-kernelgen"
-description = "Generate shape-specialized poot-kernel-ir Bodies for primitive tensor ops (the un-fused GPU path)"
+description = "Generate shape-specialized poot-kernel-ir Bodies for primitive tensor ops"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

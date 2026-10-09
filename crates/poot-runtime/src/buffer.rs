@@ -197,8 +197,7 @@ pub struct DeviceBuffer {
     /// `Arc` so every clone aliases the same guard, exactly as every clone aliases the same
     /// `wgpu::Buffer`: the role's live bytes decrement once, when the last clone drops. Never read:
     /// its only purpose is the decrement its `Drop` runs.
-    #[allow(dead_code, reason = "held only for its Drop side effect, Card 547a")]
-    pub(crate) guard: Arc<poot_runtime_common::AllocGuard>,
+    pub(crate) _guard: Arc<poot_runtime_common::AllocGuard>,
 }
 
 impl DeviceBuffer {

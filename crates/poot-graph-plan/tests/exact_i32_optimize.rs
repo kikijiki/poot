@@ -48,7 +48,7 @@ fn i32_inputs(entries: &[(ValueId, Vec<usize>, Vec<i32>)]) -> HashMap<ValueId, V
 /// step to `FusedOp::Binary(BinOp::Le)`); the I32 fused arm refuses it with "unsupported" and this
 /// test goes red.
 #[test]
-fn card533_optimized_exact_i32_region_matches_the_unoptimized_graph() {
+fn optimized_exact_i32_region_matches_the_unoptimized_graph() {
     let b = Builder::new();
     let history = b.state_input(
         "history",
@@ -122,7 +122,7 @@ fn card533_optimized_exact_i32_region_matches_the_unoptimized_graph() {
 /// Mutation: drop the `PackLane` arm in `fused_operand_words`; the optimized graph fails with
 /// "exact-I32 fused operand storage" and this test goes red.
 #[test]
-fn card533_exact_i32_pack_region_replays_its_concat() {
+fn exact_i32_pack_region_replays_its_concat() {
     let b = Builder::new();
     let packed_source = b.constant("packed", TensorType::new(vec![2, 2], DType::I32));
     let lane0 = b.slice(packed_source, 1, 0, 1);
@@ -174,7 +174,7 @@ fn card533_exact_i32_pack_region_replays_its_concat() {
 /// Mutation: drop the `ValidationChannel` generic on one pass (for example make `optimize` take
 /// `&Graph`); this call stops compiling, which is the type-check row recorded in the card.
 #[test]
-fn card533_optimize_accepts_a_validation_bearing_stateful_graph_bit_for_bit() {
+fn optimize_accepts_a_validation_bearing_stateful_graph_bit_for_bit() {
     let b = Builder::new();
     let cache = b.state_input("cache", TensorType::f32([4]), StateRole::Recurrent);
     let update = b.constant("update", TensorType::f32([1]));
@@ -304,7 +304,7 @@ fn card533_optimize_accepts_a_validation_bearing_stateful_graph_bit_for_bit() {
 /// Mutation: drop validation roots from `fuse`'s pinned set; the witness producer is absorbed and
 /// the kept environment refuses with "UseBeforeDef" instead of comparing.
 #[test]
-fn card533_pipeline_witness_output_survives_every_pass() {
+fn pipeline_witness_output_survives_every_pass() {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32([4]));
     let y = b.constant("y", TensorType::f32([4]));

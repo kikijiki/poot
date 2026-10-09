@@ -92,9 +92,9 @@ contract. Current state:
 
 - Tracing, optimization, planning, kernel import and codegen, and capture/replay work on wgpu, ROCm
   and PTX. Generation runs through the `poot-llm` library driver, over any family the model registry holds.
-- `poot-serve` starts, bounds requests and loads any registered model; every route that runs it returns a
-  typed `503` until it serves through the driver. **It serves no generation:** `/v1/completions` and `/v1/chat/completions` return it too.
-  See [Serving design](./serving-design.mdx).
+- `poot-serve` starts, bounds requests, loads any registered model and serves it through the driver on one
+  engine thread: generation, embeddings, rerank and LoRA administration are messages on one queue. See
+  [Serving design](./serving-design.mdx).
 - `compile` owns the pass sequence and returns a `Program` with plans, storage, slots and numerics.
   Runtime `DeviceCaps` and typed planner refusals are implemented.
 - One executor contract serves every backend: `poot-executor`'s `Engine<D>` over a per-backend

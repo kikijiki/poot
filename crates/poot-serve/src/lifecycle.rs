@@ -10,10 +10,14 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use poot_llm::driver::AdapterRef;
-use poot_llm::{GenerationControl, Sampler, TokenLogprob};
+use poot_llm::driver::{AdapterRef, Encoded};
+use poot_llm::{GenerationControl, Sampler};
 
-use crate::types::{GenEvent, GenerationError, Job, PerTokenInfo, SHUTDOWN};
+use crate::metrics::Metrics;
+use crate::types::{
+    AdminError, AdminJob, AdminReply, AdminRequest, Completion, EncodeJob, EncodeReply, EncodeRow,
+    EngineMsg, GenEvent, GenerationError, Job, PerTokenInfo, PromptInput, SHUTDOWN,
+};
 
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 pub(crate) const CANCELLATION_SETTLE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -388,15 +392,6 @@ impl WorkerRegistry {
     }
 }
 
-/// The engine's job queue, or [`GenerationError::NoEngine`] when none is loaded. Handlers call it after
-/// request validation and before any response byte is written, so a valid request is refused with a
-/// status instead of a broken stream.
-pub(crate) fn require_engine(
-    engine: Option<&Sender<Job>>,
-) -> std::result::Result<&Sender<Job>, GenerationError> {
-    engine.ok_or(GenerationError::NoEngine)
-}
-
 /// Whether the peer of `stream` has closed its end: an end-of-file read that consumes nothing. The
 /// request has been read in full by now, so a readable socket with no byte is a client that hung up (or
 /// half-closed, which an HTTP client does not do while it waits for a response).
@@ -433,67 +428,142 @@ impl Drop for JobGuard {
     }
 }
 
-/// Submit a job and block until it finishes, returning the token sequence and any per-token logprobs.
-/// `on_token` receives each streamed piece with its [`PerTokenInfo`]; non-streaming callers return
+/// Whether the client that waits for a job has gone: polled while the job waits. `Sync`, because a request's
+/// `n` choices wait on their own threads and share it.
+pub(crate) type ClientGone<'a> = &'a (dyn Fn() -> bool + Sync);
+
+/// What one generation job asks of the engine: the request-to-job conversion every route shares.
+pub(crate) struct GenerationRequest {
+    pub(crate) prompt: PromptInput,
+    pub(crate) max_new: usize,
+    pub(crate) sampler: Sampler,
+    pub(crate) stop: Vec<String>,
+    /// Stream the pieces as they are generated (SSE) instead of only the final completion.
+    pub(crate) stream: bool,
+    /// The request-owned selection from `resolve_lora_adapter`.
+    pub(crate) lora_adapter: AdapterRef,
+}
+
+/// The next reply of a job, or why none will come: the drain expired, the client hung up (`client_gone`
+/// is polled while the job waits, so a client that hangs up on a request that streams nothing is
+/// noticed too), or the engine dropped the reply channel.
+fn next_reply<T>(
+    rx: &mpsc::Receiver<T>,
+    client_gone: ClientGone<'_>,
+) -> std::result::Result<T, GenerationError> {
+    loop {
+        if drain_cancellation_requested() {
+            return Err(GenerationError::ServerDrainExpired);
+        }
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(reply) => return Ok(reply),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if client_gone() {
+                    return Err(GenerationError::ClientCancelled);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(GenerationError::ReplyChannelClosed);
+            }
+        }
+    }
+}
+
+/// Submit a generation job and block until it finishes, returning its [`Completion`]. `on_token`
+/// receives each streamed piece with its [`PerTokenInfo`]; non-streaming callers return
 /// `GenerationControl::Continue(())`. `Break(())` (e.g. after a client socket write fails) makes `submit`
-/// return early. `client_gone` is polled while the job waits, so a client that hangs up on a request
-/// that streams nothing is noticed too. However `submit` returns, the job's [`JobGuard`] drops and the
-/// engine releases the request within one step.
+/// return early. However `submit` returns, the job's [`JobGuard`] drops and the engine releases the
+/// request within one step.
 ///
-/// `lora_adapter` is the request-owned selection from `resolve_lora_adapter`; moving it into `Job` keeps
-/// the adapter unload-blocked while queued.
-#[allow(clippy::too_many_arguments)]
+/// A finished request is recorded in the request metrics here, once, whatever route it came from.
 pub(crate) fn submit(
-    tx: &Sender<Job>,
-    prompt: &str,
-    max_new: usize,
-    sampler: Sampler,
-    stop: Vec<String>,
-    stream: bool,
-    lora_adapter: AdapterRef,
-    client_gone: &dyn Fn() -> bool,
+    tx: &Sender<EngineMsg>,
+    metrics: &Metrics,
+    request: GenerationRequest,
+    client_gone: ClientGone<'_>,
     mut on_token: impl FnMut(&str, PerTokenInfo) -> GenerationControl,
-) -> std::result::Result<(Vec<u32>, Vec<TokenLogprob>, bool), GenerationError> {
+) -> std::result::Result<Completion, GenerationError> {
+    let GenerationRequest {
+        prompt,
+        max_new,
+        sampler,
+        stop,
+        stream,
+        lora_adapter,
+    } = request;
     let (reply, rx) = mpsc::channel();
     let (_guard, cancel) = JobGuard::new();
-    tx.send(Job {
-        prompt: prompt.to_string(),
+    let start = Instant::now();
+    tx.send(EngineMsg::Generate(Box::new(Job {
+        prompt,
         max_new,
         sampler,
         stop,
         stream,
         reply,
-        submitted: Instant::now(),
+        submitted: start,
         lora_adapter,
         cancel,
-    })
+    })))
     .map_err(|_| GenerationError::EngineUnavailable)?;
+    let mut ttft_ms = None;
     loop {
-        if drain_cancellation_requested() {
-            return Err(GenerationError::ServerDrainExpired);
-        }
-        let ev = match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(event) => event,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if client_gone() {
-                    return Err(GenerationError::ClientCancelled);
-                }
-                continue;
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(GenerationError::ReplyChannelClosed);
-            }
-        };
-        match ev {
+        match next_reply(&rx, client_gone)? {
             GenEvent::Token(piece, info) => {
+                ttft_ms.get_or_insert_with(|| start.elapsed().as_secs_f64() * 1000.0);
                 if on_token(&piece, info).is_break() {
                     return Err(GenerationError::ClientCancelled);
                 }
             }
-            GenEvent::Done(t, lp, n) => {
-                return Ok((t, lp, n));
+            GenEvent::Done(completion) => {
+                metrics.record_request(start.elapsed().as_secs_f64() * 1000.0, ttft_ms);
+                return Ok(completion);
             }
-            GenEvent::Failed(e) => return Err(GenerationError::EngineFailed(e)),
+            GenEvent::Failed(failure) => return Err(GenerationError::EngineFailed(failure)),
         }
+    }
+}
+
+/// Submit an encode job over token `rows` and block until the engine thread answers. A finished
+/// request is recorded in the request metrics here, with the tokens it encoded.
+pub(crate) fn submit_encode(
+    tx: &Sender<EngineMsg>,
+    metrics: &Metrics,
+    rows: Vec<EncodeRow>,
+    client_gone: ClientGone<'_>,
+) -> std::result::Result<Encoded, GenerationError> {
+    let tokens: usize = rows.iter().map(|row| row.ids.len()).sum();
+    let (reply, rx) = mpsc::channel::<EncodeReply>();
+    let (_guard, cancel) = JobGuard::new();
+    let start = Instant::now();
+    tx.send(EngineMsg::Encode(EncodeJob {
+        rows,
+        reply,
+        cancel,
+    }))
+    .map_err(|_| GenerationError::EngineUnavailable)?;
+    match next_reply(&rx, client_gone)? {
+        Ok(encoded) => {
+            metrics
+                .prompt_tokens
+                .fetch_add(tokens as u64, Ordering::Relaxed);
+            metrics.record_request(start.elapsed().as_secs_f64() * 1000.0, None);
+            Ok(encoded)
+        }
+        Err(failure) => Err(GenerationError::EngineFailed(failure)),
+    }
+}
+
+/// Run an administration `request` on the engine thread and block until it answers.
+pub(crate) fn submit_admin(
+    tx: &Sender<EngineMsg>,
+    request: AdminRequest,
+) -> std::result::Result<AdminReply, AdminError> {
+    let (reply, rx) = mpsc::channel();
+    tx.send(EngineMsg::Admin(AdminJob { request, reply }))
+        .map_err(|_| AdminError::EngineUnavailable)?;
+    match next_reply(&rx, &|| false) {
+        Ok(outcome) => outcome,
+        Err(_) => Err(AdminError::EngineUnavailable),
     }
 }

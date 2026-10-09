@@ -76,7 +76,7 @@ fn f16_in_f32_out_matmul_graph(
 /// the executor contract on RADV. Multi-tile (32x16x32, 2x2 output tiles), the shape
 /// `coopmat_dispatch_probe.rs` already proves at kernel level, so a mismatch here points at plan/bind/exec wiring.
 #[test]
-fn coopmat_matmul_run_resident_matches_cpu_on_radv() {
+fn coopmat_matmul_resident_matches_cpu_on_radv() {
     let _gpu_guard = gpu_lock();
     let Some(device) =
         poot_test_util::device_skip::open_or_skip(DeviceBackend::Wgpu, WgpuDevice::new())
@@ -137,20 +137,18 @@ fn coopmat_matmul_run_resident_matches_cpu_on_radv() {
     }
     if let Some((i, j, want, gv)) = first_bad {
         panic!(
-            "run_resident coopmat matmul MISMATCH at [{i},{j}]: want {want:.4} got {gv:.4} \
+            "resident coopmat matmul MISMATCH at [{i},{j}]: want {want:.4} got {gv:.4} \
              (max_abs={max_abs:.3e}) - the real plan->bind->exec path disagrees with the \
              kernel-body-level probe in coopmat_dispatch_probe.rs"
         );
     }
-    eprintln!(
-        "coopmat run_resident [{m}x{k}]@[{k}x{n}] OK end to end on RADV (max_abs={max_abs:.3e})"
-    );
+    eprintln!("coopmat resident [{m}x{k}]@[{k}x{n}] OK end to end on RADV (max_abs={max_abs:.3e})");
 }
 
 /// Checks the graph reaches the coopmat plan arm rather than a fallback that gives the same numbers.
 /// Inspects the kernel choice directly; no GPU needed.
 #[test]
-fn coopmat_matmul_run_resident_graph_selects_coopmat_arm() {
+fn coopmat_matmul_resident_graph_selects_coopmat_arm() {
     use poot_graph_plan::cse;
     use poot_target::Backend;
 
@@ -180,7 +178,7 @@ fn coopmat_matmul_run_resident_graph_selects_coopmat_arm() {
                 poot_kernelgen::ContractionSpec::Coopmat { .. }
             ))
         ),
-        "expected run_resident's exec_resident to select the coopmat arm too (same plan_eqn call \
+        "expected the resident entry to select the coopmat arm too (same plan_eqn call \
          with the same backend/graph shape): got {choice:?}"
     );
 }

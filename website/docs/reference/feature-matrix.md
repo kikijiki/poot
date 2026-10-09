@@ -18,19 +18,15 @@ NPU offload was removed; it is not listed as a column here. See
 
 For lower-level kernel/dispatch capability (elementwise, GEMV, flash attention, capture/replay, ...), see
 the [Backends](../architecture/backends.mdx#capability-comparison) architecture page, this page is the
-serving-level view: what `poot-serve` and the `poot-llm` library provide, with generation serving marked
-as being restored.
+serving-level view: what `poot-serve` and the `poot-llm` library provide, with the cells that have
+no served test marked as such.
 
 Legend: colored badges use the same vocabulary on this page and on
 [Backends: capability comparison](../architecture/backends.mdx#capability-comparison).
 **Yes** = the indicated path has test coverage; footnotes distinguish format tests from model receipts. **Partial** = works, with scope limits noted.
 **No** = not implemented for that backend. **N/A** = the concept does not apply to that backend.
 
-:::caution[Being restored]
-poot is being refactored. This is not available yet and is planned to return.
-:::
-
-Today `poot-serve` serves generation (`/v1/completions`, `/v1/chat/completions`) from one scheduling loop over the driver on wgpu and ROCm; embeddings, reranking and LoRA administration answer a typed `503`. See [Serving](../serve/index.md).
+`poot-serve` serves generation (`/v1/completions`, `/v1/chat/completions`), embeddings, reranking and LoRA administration from one engine thread over the driver on wgpu and ROCm. PTX and raw Vulkan serve generation too. See [Serving](../serve/index.md).
 
 ## Models and weight formats
 
@@ -77,6 +73,8 @@ Every registered family's fixture graphs (decode and prefill for a decoder, one 
 | `olmoe` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
 | `phi3` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
 | `qwen2` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `qwen2_5_vl` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `qwen2_5_vl_vision` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
 | `qwen3` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
 | `qwen35` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
 | `qwen35/finetune` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
@@ -142,39 +140,39 @@ No stored benchmark row names a resolved family yet. A row appears here once a b
   with the first token's top-five log-probabilities equal to the CPU oracle's within 1e-3; it has not run on wgpu or
   ROCm. DeepSeek-V4, MiniMax-M2, GLM-5.3-Flash and Qwen3.8-Flash-Next have only synthetic fixtures that match an
   independent f64 reference; no real public checkpoint of them has run.
-- The `bert` family runs on the driver's `Encode` step (`poot_llm::encoders`). The `poot-serve` embeddings and reranking
-  routes return `503` until they are restored, whatever the backend.
+- The `bert` family runs on the driver's `Encode` step (`poot_llm::encoders`). `poot-serve` runs `Encode` steps for a
+  decoder's embeddings and reranking on wgpu and ROCm; it does not start on a BERT checkpoint yet.
 - Per-channel E4M3 `compressed-tensors` projections load packed and use the shared generated lowering. See
   [Using quantized checkpoints](../serve/quantized-checkpoints.md).
 
 ## Expert pooling
 
-Expert pooling (a fixed-capacity expert pool per MoE layer with a runtime residency manager) is not available yet (poot is being refactored; planned to return).
+Expert pooling (a fixed-capacity expert pool per MoE layer with a runtime residency manager) is not implemented.
 The mixture-of-experts models in the matrix run through their ordinary, unpooled decode paths, with every expert's
 weights resident.
 
-[^serve-removed]:
-    Not available yet on this backend or for this feature (poot is being refactored; planned to return). `/v1/completions` and `/v1/chat/completions`
-    are served on wgpu and ROCm. See [Serving](../serve/index.md).
+[^ptx-served]:
+    The scheduling loop and the driver are backend-neutral, but the served tests on PTX cover the dense fixture
+    (greedy and sampled) and the SmolVLM caption only. A cell marked "no served test" has not been run through the
+    server on PTX. See [Serving](../serve/index.md).
 
 ## Serving features
 
 |                                                                                                      | wgpu                                                                                     | ROCm                                                                                     | PTX                                                                                      |
 | ---------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
 | OpenAI-compatible HTTP server (`poot-serve`)                                                         | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                |
-| Continuous (in-flight) batching                                                                      | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] |
-| Paged KV cache                                                                                       | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] |
-| Prefix caching (reuse across requests)                                                               | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] |
-| Fast one-shot prefill for the batched path                                                           | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] |
+| Continuous (in-flight) batching                                                                      | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>[^ptx-served] |
+| Paged KV cache                                                                                       | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>[^ptx-served] |
+| Prefix caching (reuse across requests)                                                               | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--no">No</span> (no served test)[^ptx-served] |
 | KV preemption / swap on eviction                                                                     | Not needed: a request's blocks are reserved at open; a request that finds no room waits | Not needed: a request's blocks are reserved at open; a request that finds no room waits | Not needed: a request's blocks are reserved at open; a request that finds no room waits |
-| Speculative decoding, single-sequence (prompt-lookup + draft-model, greedy + sampled)                | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] |
-| Speculative decoding, inside continuous batching (prompt-lookup and draft-model, greedy and sampled) | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] |
+| Speculative decoding, single-sequence (prompt-lookup + draft-model, greedy + sampled)                | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--no">No</span> (no served test)[^ptx-served] |
+| Speculative decoding, inside continuous batching (prompt-lookup and draft-model, greedy and sampled) | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--no">No</span> (no served test)[^ptx-served] |
 | On-device sampling: greedy                                                                           | <span class="matrix-status matrix-status--yes">Yes</span>[^device-sample]                | <span class="matrix-status matrix-status--yes">Yes</span>[^device-sample]                | <span class="matrix-status matrix-status--yes">Yes</span>[^device-sample]                |
 | On-device sampling: temperature/top-k/top-p/min-p                                                    | <span class="matrix-status matrix-status--yes">Yes</span>[^device-sample]                | <span class="matrix-status matrix-status--yes">Yes</span>[^device-sample]                | <span class="matrix-status matrix-status--yes">Yes</span>[^device-sample]                |
-| LoRA adapter serving (hot-load, per-request selection)                                               | <span class="matrix-status matrix-status--no">No</span> (being restored)[^lora-scope]    | <span class="matrix-status matrix-status--no">No</span> (being restored)[^lora-scope]    | <span class="matrix-status matrix-status--no">No</span> (being restored)[^lora-scope]    |
-| Tensor parallelism (multi-GPU)                                                                       | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] |
-| Structured/guided decoding (regex, JSON schema, grammar, choice, forced tool calls)                  | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] |
-| Embeddings (`/v1/embeddings`) and reranking (`/v1/rerank`)                                           | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] | <span class="matrix-status matrix-status--no">No</span> (being restored)[^serve-removed] |
+| LoRA adapter serving (hot-load, per-request selection)                                               | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--no">No</span> (no served test)[^lora-scope]    |
+| Tensor parallelism (multi-GPU)                                                                       | <span class="matrix-status matrix-status--no">No</span> (not implemented) | <span class="matrix-status matrix-status--no">No</span> (not implemented) | <span class="matrix-status matrix-status--no">No</span> (not implemented) |
+| Structured/guided decoding (regex, JSON schema, grammar, choice, forced tool calls)                  | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--no">No</span> (no served test)[^ptx-served] |
+| Embeddings (`/v1/embeddings`) and reranking (`/v1/rerank`), decoder checkpoints                       | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--no">No</span> (no served test)[^ptx-served] |
 | Prometheus metrics (`/metrics/prometheus`)                                                           | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                |
 
 [^device-sample]:
@@ -183,10 +181,10 @@ weights resident.
     token id (and a non-finite flag), not the full logits, for greedy and plain-temperature (including
     top-k/top-p/min-p) requests. A request with a logit-bias/penalty, logprob recording, or a
     guided-decoding constraint still reads the full logits back and picks on the host, since those
-    transforms are host-side. `poot-serve` does not call this path today (see the caution above); the capability lives in the library.
+    transforms are host-side. The driver applies it to every row it steps, including the rows `poot-serve` schedules.
 
 [^lora-scope]:
-    LoRA adapter serving is not available yet (poot is being refactored; planned to return). Registration is refused. The adapter scope, when it returns, is
+    LoRA adapters hot-load, select and unload on wgpu and ROCm (a device row each); PTX has no verification yet. The adapter scope is
     dense qwen2/llama-shaped models and the seven attention and MLP projections (`q_proj`/`k_proj`/`v_proj`/`o_proj`/`gate_proj`/`up_proj`/`down_proj`). See
     [Using LoRA adapters](../serve/lora-adapters.md).
 
@@ -224,7 +222,7 @@ one device family.
 | Tensor-core matmul (cooperative matrix) | <span class="matrix-status matrix-status--yes">Yes</span> (needs `VK_KHR_cooperative_matrix` and subgroup-size control; verified RDNA3.5) |
 | Device-time profiling                   | <span class="matrix-status matrix-status--no">No</span> (no typed timing mode constructs a raw Vulkan device yet)                         |
 | Multi-GPU / collectives                 | <span class="matrix-status matrix-status--no">No</span>                                                                                   |
-| Serving                                 | <span class="matrix-status matrix-status--no">No</span> (being restored, see the caution above)                                           |
+| Serving                                 | <span class="matrix-status matrix-status--yes">Yes</span> (greedy dense decoder verified; a driver without `VK_EXT_memory_budget` is refused at startup) |
 | Hardware verified                       | AMD Strix Halo iGPU under RADV only. NVIDIA and Intel Vulkan drivers are untested.                                                        |
 
 The device reports its own limits (largest buffer, grid, workgroup memory, subgroup sizes and matrix hardware)
@@ -233,13 +231,12 @@ driver.
 
 ## How to read this if you are choosing hardware
 
-- **NVIDIA GPU:** PTX has the most mature single-GPU library path. Sampling picks on the host, same as
-  every other backend. Serving is being restored (see the caution above).
+- **NVIDIA GPU:** PTX has the most mature single-GPU library path. `poot-serve` serves the dense fixture on PTX; see the serving table above for what has a served test.
 - **AMD GPU:** ROCm is the primary backend on AMD hardware for single-sequence library decode. wgpu also
   runs on the same AMD GPU as a fully portable fallback.
 - **Anything else (Intel iGPU/dGPU, other Vulkan-capable hardware):** wgpu is the supported choice. Raw Vulkan
-  runs there in principle but is verified on AMD (RADV) only. Pick either through the `poot-llm` API;
-  the `poot-serve` backend option is being restored.
+  runs there in principle but is verified on AMD (RADV) only. Pick either through the `poot-llm` API
+  or the `poot-serve` `--backend` option.
 - **NPU:** removed. See
   [Architecture: NPU Offload](../architecture/npu.mdx).
 

@@ -41,8 +41,6 @@ const MAX_FRAMES: usize = 512;
 pub enum FrontEndError {
     #[error("decode image: {0}")]
     Image(#[from] image::ImageError),
-    #[error("decode image: {0}")]
-    DataUrl(#[from] base64::DecodeError),
     #[error("image {width}x{height} ({pixels} pixels) exceeds the {MAX_IMAGE_PIXELS}-pixel cap")]
     ImageTooLarge {
         width: u32,
@@ -107,15 +105,6 @@ pub fn decode_image(bytes: &[u8]) -> Result<DecodedImage, FrontEndError> {
         height,
         width,
     })
-}
-
-/// Decode an OpenAI `image_url` value: a `data:image/...;base64,<b64>` URL, or bare base64. A remote
-/// `http(s)` URL is the caller's concern: this crate has no network.
-pub fn decode_image_data_url(url: &str) -> Result<DecodedImage, FrontEndError> {
-    use base64::Engine;
-    let b64 = url.split_once(";base64,").map_or(url, |(_, data)| data);
-    let bytes = base64::engine::general_purpose::STANDARD.decode(b64.trim())?;
-    decode_image(&bytes)
 }
 
 /// A decoded image that owns its pixels.
@@ -350,27 +339,30 @@ pub struct CaptionRequest<'a> {
     pub max_new: usize,
 }
 
-/// A loaded SmolVLM: the vision tower and the text tower, each on its own driver.
-pub struct Idefics3 {
-    vision: Driver,
-    text: Driver,
-    text_handle: Arc<ModelHandle>,
+/// A SmolVLM checkpoint read from its directory: the two towers' handles over the one set of weights,
+/// and the facts of its image pipeline. Nothing is on a device yet; the image side
+/// ([`ImageFrontEnd`]) and the text side (a [`Driver`] over [`Idefics3Checkpoint::text`]) are opened from it.
+pub struct Idefics3Checkpoint {
+    vision: Arc<ModelHandle>,
+    text: Arc<ModelHandle>,
     preprocess: PreprocessConfig,
     image_token: u32,
     patches: usize,
     visual_tokens: usize,
 }
 
-impl Idefics3 {
-    /// Load the SmolVLM / idefics3 checkpoint directory `dir`: parse its two towers through
-    /// `registry` over its one set of weights and open a driver for each. `vision` and `text` are the
-    /// towers' driver options (the vision tower's capacity is its patch count).
-    pub fn load(
-        dir: &Path,
-        registry: &Registry,
-        vision: (Box<dyn poot_executor::Executor>, DriverOptions),
-        text: (Box<dyn poot_executor::Executor>, DriverOptions),
-    ) -> Result<Self, FrontEndError> {
+/// Whether `dir`'s `config.json` declares an idefics3 (SmolVLM) checkpoint. Any other directory, and
+/// a file, is not one; a config that cannot be read is the loader's error to report, not this question's.
+pub fn is_idefics3_dir(dir: &Path) -> bool {
+    read_json(&dir.join("config.json")).is_ok_and(|config| {
+        config.get("model_type").and_then(serde_json::Value::as_str) == Some("idefics3")
+    })
+}
+
+impl Idefics3Checkpoint {
+    /// Read the SmolVLM / idefics3 checkpoint directory `dir`: parse its two towers through `registry`
+    /// over its one set of weights.
+    pub fn read(dir: &Path, registry: &Registry) -> Result<Self, FrontEndError> {
         let config = CheckpointConfig::read(dir)?;
         let preprocess = read_preprocess(dir, config.image_size)?;
         let store =
@@ -388,8 +380,12 @@ impl Idefics3 {
             config: &config.vision,
             generation: None,
         };
-        let vision_handle =
-            ModelHandle::from_shared(&vision_raw, Arc::clone(&store), registry, codec)?;
+        let vision = Arc::new(ModelHandle::from_shared(
+            &vision_raw,
+            Arc::clone(&store),
+            registry,
+            codec,
+        )?);
         let text_store = Arc::new(section(
             &store,
             "model.text_model.",
@@ -400,13 +396,12 @@ impl Idefics3 {
             config: &config.text,
             generation: None,
         };
-        let text_handle = Arc::new(ModelHandle::from_shared(
+        let text = Arc::new(ModelHandle::from_shared(
             &text_raw, text_store, registry, codec,
         )?);
         Ok(Self {
-            vision: Driver::new(Arc::new(vision_handle), vision.0, vision.1)?,
-            text: Driver::new(Arc::clone(&text_handle), text.0, text.1)?,
-            text_handle,
+            vision,
+            text,
             preprocess,
             image_token: config.image_token,
             patches: config.patches,
@@ -414,14 +409,49 @@ impl Idefics3 {
         })
     }
 
+    /// The text tower: the model a server generates with, and the codec that tokenizes prompts.
+    pub fn text(&self) -> &Arc<ModelHandle> {
+        &self.text
+    }
+
+    /// The positions the vision tower's driver needs: the patches of one frame.
+    pub fn patches(&self) -> usize {
+        self.patches
+    }
+
+    /// Open the image side on `vision`'s executor: the vision tower's driver beside whatever drives
+    /// the text tower.
+    pub fn front_end(
+        &self,
+        vision: (Box<dyn poot_executor::Executor>, DriverOptions),
+    ) -> Result<ImageFrontEnd, FrontEndError> {
+        Ok(ImageFrontEnd {
+            vision: Driver::new(Arc::clone(&self.vision), vision.0, vision.1)?,
+            text: Arc::clone(&self.text),
+            preprocess: self.preprocess,
+            image_token: self.image_token,
+            patches: self.patches,
+            visual_tokens: self.visual_tokens,
+        })
+    }
+}
+
+/// The image side of a SmolVLM: preprocessing, the vision tower on its own driver, and the prompt
+/// whose `<image>` placeholders the tower's rows replace. It produces what any text driver takes
+/// (token ids and [`PromptEmbeds`]); it never generates.
+pub struct ImageFrontEnd {
+    vision: Driver,
+    text: Arc<ModelHandle>,
+    preprocess: PreprocessConfig,
+    image_token: u32,
+    patches: usize,
+    visual_tokens: usize,
+}
+
+impl ImageFrontEnd {
     /// The vision tower's driver, for its stats and caps.
     pub fn vision(&self) -> &Driver {
         &self.vision
-    }
-
-    /// The text tower's driver.
-    pub fn text(&self) -> &Driver {
-        &self.text
     }
 
     /// The embedding rows each image frame gives the prompt.
@@ -452,19 +482,15 @@ impl Idefics3 {
         Ok(rows)
     }
 
-    /// Caption `request.images` (greedy): preprocess each into idefics3 frames, encode the frames,
-    /// build the prompt and generate on the text driver with the frames' rows scattered over the
-    /// prompt's `<image>` placeholders.
-    pub fn caption(
+    /// The prompt tokens and embedding rows for `images` and `question`: preprocess each image into
+    /// idefics3 frames, encode the frames, and build the prompt whose `<image>` placeholders the
+    /// frames' rows replace. The text driver serves it alone ([`Idefics3::caption`]) or beside other
+    /// requests' prompts (`Driver::open_with_embeds` on a paged pool).
+    pub fn prepare(
         &mut self,
-        request: &CaptionRequest<'_>,
-        sink: &mut dyn TokenSink,
-    ) -> Result<Generation, FrontEndError> {
-        let CaptionRequest {
-            images,
-            question,
-            max_new,
-        } = *request;
+        images: &[Image<'_>],
+        question: &str,
+    ) -> Result<CaptionPrompt, FrontEndError> {
         if images.is_empty() {
             return Err(FrontEndError::NoImage);
         }
@@ -484,11 +510,10 @@ impl Idefics3 {
                 });
             }
         }
-        let prompt = self.text_handle.text().encode(&caption_prompt(
-            question,
-            &grids,
-            self.visual_tokens,
-        ))?;
+        let prompt =
+            self.text
+                .text()
+                .encode(&caption_prompt(question, &grids, self.visual_tokens))?;
         let positions: Vec<usize> = prompt
             .iter()
             .enumerate()
@@ -506,10 +531,46 @@ impl Idefics3 {
         let width = encoded[0].len() / self.visual_tokens;
         let embeds = PromptEmbeds::new(width, positions, encoded.concat())
             .map_err(|e| DriverError::from(crate::driver::error::InvalidRequest::Embeds(e)))?;
+        Ok(CaptionPrompt { prompt, embeds })
+    }
+}
+
+/// A loaded SmolVLM: the image side and the text tower, each on its own driver.
+pub struct Idefics3 {
+    pub images: ImageFrontEnd,
+    pub text: Driver,
+}
+
+impl Idefics3 {
+    /// Load the SmolVLM / idefics3 checkpoint directory `dir` and open a driver for each tower.
+    /// `vision` and `text` are the towers' executors and driver options (the vision tower's capacity
+    /// is its patch count).
+    pub fn load(
+        dir: &Path,
+        registry: &Registry,
+        vision: (Box<dyn poot_executor::Executor>, DriverOptions),
+        text: (Box<dyn poot_executor::Executor>, DriverOptions),
+    ) -> Result<Self, FrontEndError> {
+        let checkpoint = Idefics3Checkpoint::read(dir, registry)?;
+        Ok(Self {
+            images: checkpoint.front_end(vision)?,
+            text: Driver::new(Arc::clone(&checkpoint.text), text.0, text.1)?,
+        })
+    }
+
+    /// Caption `request.images` (greedy): [`ImageFrontEnd::prepare`], then generate on the text
+    /// driver with the frames' rows scattered over the prompt's `<image>` placeholders.
+    pub fn caption(
+        &mut self,
+        request: &CaptionRequest<'_>,
+        sink: &mut dyn TokenSink,
+    ) -> Result<Generation, FrontEndError> {
+        let CaptionPrompt { prompt, embeds } =
+            self.images.prepare(request.images, request.question)?;
         Ok(self.text.generate_with_embeds(
             GenerateRequest {
                 prompt,
-                max_new,
+                max_new: request.max_new,
                 sampler: Sampler::greedy(),
                 stops: Vec::new(),
                 ignore_eos: false,
@@ -520,10 +581,18 @@ impl Idefics3 {
     }
 }
 
+/// A caption request lowered to what the text driver takes: the prompt's token ids (placeholders
+/// included) and the embedding rows that replace the placeholders.
+#[derive(Clone, Debug)]
+pub struct CaptionPrompt {
+    pub prompt: Vec<u32>,
+    pub embeds: PromptEmbeds,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use poot_models::vision::idefics3_frame_geometry;
+    use poot_models::vision::idefics3_preprocess;
 
     /// The split-image prompt emits `(rows * cols + 1) * tokens` `<image>` placeholders (one per
     /// visual token across all frames and the global one) and one `<row_R_col_C>` marker per tile, in
@@ -573,7 +642,8 @@ mod tests {
             (1, 1),
             (3, 4000),
         ] {
-            let (rows, cols, frames) = idefics3_frame_geometry(h, w, &config);
+            let split = idefics3_preprocess(&vec![100.0; h * w * 3], h, w, &config);
+            let (rows, cols, frames) = (split.rows, split.cols, split.frames.len());
             assert!(rows <= 6 && cols <= 6, "{h}x{w} -> {rows}x{cols}");
             let prompt = caption_prompt("Describe.", &[(rows, cols)], tokens);
             assert_eq!(
@@ -631,10 +701,9 @@ mod tests {
         ));
     }
 
-    /// PNG bytes and the same bytes as a data URL decode to the same pixels.
+    /// PNG bytes decode to their pixels, alpha dropped.
     #[test]
-    fn a_png_round_trips_through_bytes_and_a_data_url() {
-        use base64::Engine;
+    fn a_png_decodes_to_its_pixels() {
         let (w, h) = (2u32, 3u32);
         let mut img = image::RgbImage::new(w, h);
         for y in 0..h {
@@ -649,15 +718,6 @@ mod tests {
         assert_eq!((decoded.height, decoded.width), (3, 2));
         assert_eq!(&decoded.rgb[..3], &[0.0, 0.0, 7.0]);
         assert_eq!(&decoded.rgb[3..6], &[100.0, 0.0, 7.0]);
-        let url = format!(
-            "data:image/png;base64,{}",
-            base64::engine::general_purpose::STANDARD.encode(&png)
-        );
-        assert_eq!(decode_image_data_url(&url).unwrap(), decoded);
-        assert_eq!(
-            decode_image_data_url(&base64::engine::general_purpose::STANDARD.encode(&png)).unwrap(),
-            decoded
-        );
     }
 
     /// A section re-keys the entries under its prefix and keeps the named ones: the text tower's
@@ -796,7 +856,7 @@ mod smolvlm {
         let Some(mut vlm) = load(choice) else {
             return;
         };
-        assert_eq!(vlm.visual_tokens(), 64);
+        assert_eq!(vlm.images.visual_tokens(), 64);
         let tokens = caption(
             &mut vlm,
             &pattern(96, 96),
@@ -936,6 +996,10 @@ mod smolvlm {
             matches!(error, FrontEndError::TooManyFrames { .. }),
             "{error}"
         );
-        assert_eq!(vlm.vision().stats().steps, 0, "no frame reached the tower");
+        assert_eq!(
+            vlm.images.vision().stats().steps,
+            0,
+            "no frame reached the tower"
+        );
     }
 }

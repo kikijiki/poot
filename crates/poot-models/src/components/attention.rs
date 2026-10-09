@@ -18,7 +18,7 @@ use poot_quant::weights::{AttnRole, WeightId, WeightMap, WeightRole};
 
 use super::linear::{Weight, WeightError, linear};
 use super::norm::{NormParams, norm};
-use super::rope::{RopeParams, apply_rope, rope_rows};
+use super::rope::{RopeParams, apply_rope, apply_rope_sectioned, rope_rows};
 use super::standard::{PagedMaps, ParamError, Step};
 use crate::model::{ConfigReason, KvLayout};
 
@@ -122,6 +122,27 @@ impl AttentionParams {
     /// Attend without rotary embedding (a NoPE layer).
     pub fn without_rope(self) -> Self {
         Self { rope: None, ..self }
+    }
+
+    /// Rotate by sectioned positions ([`RopeParams::sectioned`]): the step must carry
+    /// `Step::with_mrope`. A NoPE attention has no rotation to section.
+    pub fn with_sectioned_rope(self, sections: [usize; 3]) -> Result<Self, ParamError> {
+        let rope = self
+            .rope
+            .ok_or(ParamError::new(
+                "rope_scaling.mrope_section",
+                ConfigReason::Unsupported,
+            ))?
+            .sectioned(sections)?;
+        Ok(Self {
+            rope: Some(rope),
+            ..self
+        })
+    }
+
+    /// Whether the rotation is sectioned, so the step must carry `Step::with_mrope`.
+    pub fn is_sectioned(&self) -> bool {
+        self.rope.is_some_and(|rope| rope.sections().is_some())
     }
 
     /// Rotate adjacent even/odd dims instead of the two halves (a GGUF's permuted Q/K rows).
@@ -456,7 +477,7 @@ fn write_paged(
 ) -> CacheWrite {
     let shape = step.shape();
     let (rows, t, cap) = (shape.rows.get(), shape.tokens.get(), shape.capacity.get());
-    let KvLayout::Paged { pool_slots } = shape.kv else {
+    let KvLayout::Paged { pool_slots, .. } = shape.kv else {
         unreachable!("a step with slot maps is paged")
     };
     let input = b.state_input(
@@ -595,6 +616,15 @@ pub fn attention_selecting(
     };
 
     let (q, k) = match p.rope {
+        Some(rope) if rope.sections().is_some() => {
+            let mrope = step
+                .mrope()
+                .expect("a sectioned rope traces over Step::with_mrope");
+            (
+                apply_rope_sectioned(b, rope, q, mrope, cap),
+                apply_rope_sectioned(b, rope, k, mrope, cap),
+            )
+        }
         Some(rope) => {
             let rows = rope_rows(b, rope, step.pos(), cap);
             (apply_rope(b, q, &rows), apply_rope(b, k, &rows))
@@ -1407,6 +1437,7 @@ mod tests {
             None => KvLayout::Contiguous,
             Some((pool_slots, ..)) => KvLayout::Paged {
                 pool_slots: NonZeroUsize::new(pool_slots).unwrap(),
+                seqs: NonZeroUsize::new(rows).unwrap(),
             },
         };
         let step = Step::new(

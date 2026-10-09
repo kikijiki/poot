@@ -28,9 +28,7 @@
 //! row never reaches the result. A sharded table carries one scale the rows are multiplied by.
 
 use poot_graph_ir::ops::{self, sigmoid, silu, u64_mul_i32_const, u64_rem_u32, u64_xor};
-use poot_graph_ir::{
-    BinOp, Builder, RedOp, Scalar, StateRole, TensorType, Traced, UnOp, ValidationId,
-};
+use poot_graph_ir::{BinOp, Builder, RedOp, Scalar, Traced, UnOp, ValidationId};
 use poot_quant::weights::{PleRole, WeightId, WeightMap, WeightRole};
 use poot_tensor::DType;
 
@@ -527,21 +525,18 @@ fn ngram_ids(b: &Builder, step: &Step, layer: usize, p: &PleParams) -> Traced {
         format!("ple_tokens_in_vocab.l{layer}"),
         guard.witness,
     );
-    let history = b.state_input(
-        &format!("ple.l{layer}.history"),
-        TensorType::new(vec![rows, ctx], DType::I32),
-        StateRole::Recurrent,
-    );
+    let history = step.recurrent_state(b, &format!("ple.l{layer}.history"), DType::I32, &[ctx]);
+    let current = history.current();
     let mut ids = Vec::with_capacity(rows);
     let mut next = Vec::with_capacity(rows);
     for row in 0..rows {
         let tokens = b.reshape(b.slice(guard.guarded, 0, row, row + 1), vec![t]);
-        let before = b.reshape(b.slice(history, 0, row, row + 1), vec![ctx]);
+        let before = b.reshape(b.slice(current, 0, row, row + 1), vec![ctx]);
         let (row_ids, row_next) = row_ids(b, tokens, before, p);
         ids.push(b.reshape(row_ids, vec![1, t, heads]));
         next.push(b.reshape(row_next, vec![1, ctx]));
     }
-    step.carry(history, b.concat(0, &next));
+    step.carry_recurrent(b, history, b.concat(0, &next));
     b.concat(0, &ids)
 }
 
@@ -840,6 +835,8 @@ pub(crate) mod oracle {
 #[cfg(test)]
 mod tests {
     use poot_graph_ir::{Graph, NoValidations, Slot};
+
+    use poot_graph_ir::TensorType;
 
     use super::*;
     use crate::components::standard::oracle::{self as harness, Fx};
@@ -1192,6 +1189,7 @@ mod tests {
             eqns,
             output: output.unwrap_or(own),
             validations: NoValidations,
+            exports: Vec::new(),
             state,
         }
     }

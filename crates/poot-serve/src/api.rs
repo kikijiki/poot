@@ -1,11 +1,11 @@
 //! OpenAI-compatible API types (request/response structs, serde) and request-shaping helpers.
 
 use anyhow::{Context, Result, bail};
-use poot_llm::driver::{AdapterRef, ModelHandle};
+use poot_llm::driver::{AdapterRef, DriverCaps, ModelHandle};
 use poot_llm::{Modality, Sampler, TokenLogprob};
 use serde::{Deserialize, Serialize};
 
-use crate::types::GenerationError;
+use crate::types::{EngineView, GenerationError};
 
 /// Sampling knobs shared by `/v1/completions` and `/v1/chat/completions`, flattened into both
 /// request structs. All optional; defaults are greedy with no penalties.
@@ -59,19 +59,18 @@ pub(crate) fn sampler_of(p: &SamplingParams) -> Sampler {
 /// Resolve a request's `lora_adapter` extension field (see [`CompletionReq::lora_adapter`]/
 /// [`ChatReq::lora_adapter`]) at the HTTP layer, before the `Job` reaches the engine. `None` (absent or
 /// `null`) is [`AdapterRef::Base`], so such a request behaves the same whether or not adapters are
-/// loaded. A named adapter is a hard error while no adapter set is loaded: a typo must not silently serve
-/// the un-adapted model, and adapter sets load through the driver, which this server does not run yet.
-pub(crate) fn resolve_lora_adapter(
-    _handle: &ModelHandle,
-    name: &Option<String>,
-) -> Result<AdapterRef> {
-    match name.as_deref() {
-        None => Ok(AdapterRef::Base),
-        Some(name) => bail!(
-            "unknown lora_adapter {name:?}: no adapter is loaded (adapter sets load on the driver, \
-             which this server does not serve yet)"
-        ),
+/// loaded. A named adapter is a hard error unless the engine has loaded it: a typo must not silently
+/// serve the un-adapted model, and a driver with no adapter generation (`caps.lora` is `None`) has
+/// nothing to select from.
+pub(crate) fn resolve_lora_adapter(view: &EngineView, name: &Option<String>) -> Result<AdapterRef> {
+    let Some(name) = name.as_deref() else {
+        return Ok(AdapterRef::Base);
+    };
+    if view.caps().lora.is_none() {
+        bail!("unknown lora_adapter {name:?}: no adapter is loaded");
     }
+    view.adapter(name)
+        .with_context(|| format!("unknown lora_adapter {name:?}: no loaded adapter has that name"))
 }
 
 /// Build the OpenAI-style `logprobs` object from the per-token records, decoding each token id to
@@ -141,28 +140,36 @@ impl std::error::Error for LoraAdapterError {
     }
 }
 
-/// A content part the loaded model cannot take: a modality it has no front end for (see
-/// [`ModelHandle::accepts_modality`]) or a part type this server does not know. An explicit refusal, not a
-/// silent ignore: the part would otherwise be dropped and the model would answer a different request than
-/// the one sent.
+/// A content part the loaded model cannot take: a modality it has no front end for or a part type this
+/// server does not know. An explicit refusal, not a silent
+/// ignore: the part would otherwise be dropped and the model would answer a different request than the
+/// one sent.
 #[derive(Debug)]
 pub(crate) struct UnsupportedCapabilityError {
     /// The modality name (`image`, `video`, `audio`), or `content` for an unknown part type.
     pub(crate) modality: &'static str,
     pub(crate) part_type: String,
+    /// What is missing.
+    pub(crate) missing: &'static str,
 }
 
 impl std::fmt::Display for UnsupportedCapabilityError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "unsupported capability: {} input (content part {:?}) is not supported by the loaded model",
-            self.modality, self.part_type
+            "unsupported capability: {} input (content part {:?}) is not supported by the loaded model: {}",
+            self.modality, self.part_type, self.missing
         )
     }
 }
 
 impl std::error::Error for UnsupportedCapabilityError {}
+
+/// A request the engine refuses before it runs: valid JSON the server cannot serve as asked (more
+/// choices than the engine has rows). A typed 400, never a silently dropped field.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct RefusedRequest(pub(crate) String);
 
 /// The modality an OpenAI content-part `type` needs a front end for. `None` for a part type this server
 /// does not know.
@@ -175,22 +182,43 @@ fn part_modality(part_type: &str) -> Option<Modality> {
     }
 }
 
-/// Refuse a chat request that carries a content part the loaded model cannot take, before any generation
-/// work. The decision is the model's capability ([`ModelHandle::accepts_modality`]), never its family; a part
-/// type nothing can take is refused for every model.
+/// Whether a content-part `type` names an image.
+pub(crate) fn is_image_part(part_type: &str) -> bool {
+    part_modality(part_type) == Some(Modality::Image)
+}
+
+/// Refuse a chat request that carries a content part nothing here can take, before any generation work.
+/// An image needs the image front end of a vision-language checkpoint (`image_front_end`); the other
+/// modalities and an unknown part type are refused for every model.
 pub(crate) fn reject_unsupported_modality(
-    handle: &ModelHandle,
+    image_front_end: bool,
     req: &ChatReq,
 ) -> anyhow::Result<()> {
     for part_type in req.messages.iter().flat_map(|msg| &msg.non_text_parts) {
         let modality = part_modality(part_type);
-        if modality.is_some_and(|modality| handle.accepts_modality(modality)) {
-            continue;
-        }
+        let missing = match modality {
+            Some(Modality::Image) if image_front_end => continue,
+            Some(Modality::Image) => "the loaded model has no image front end",
+            Some(_) => "this server has no front end for it",
+            None => "the part type is not one this server knows",
+        };
         return Err(anyhow::Error::new(UnsupportedCapabilityError {
             modality: modality.map_or("content", Modality::name),
             part_type: part_type.clone(),
+            missing,
         }));
+    }
+    Ok(())
+}
+
+/// Refuse `n` choices the engine has no rows to run at once: each choice is one job, and a request is
+/// answered only when every choice is, so more choices than rows could never all be served together.
+pub(crate) fn check_choices(n: usize, caps: &DriverCaps) -> anyhow::Result<()> {
+    if n > caps.rows.get() {
+        return Err(anyhow::Error::new(RefusedRequest(format!(
+            "n = {n} choices exceed the engine's {} rows: each choice is one concurrent job",
+            caps.rows
+        ))));
     }
     Ok(())
 }
@@ -198,17 +226,18 @@ pub(crate) fn reject_unsupported_modality(
 /// Classify a `handle_completion`/`handle_chat` error into the HTTP status + OpenAI error `type`
 /// (card 224): a [`GuidedDecodeError`] or [`LoraAdapterError`] is bad client input (400
 /// `invalid_request_error`), as in the streaming routes; an [`UnsupportedCapabilityError`] is 400
-/// `unsupported_capability`; a valid request with no engine loaded is a 503 `server_error`; anything
-/// else (encode/decode/engine failures) is a server fault (500 `server_error`).
+/// `unsupported_capability`; a [`GenerationError`] is answered by its own status (an engine failure by
+/// its class, R484-007); anything else (encode/decode failures) is a server fault (500 `server_error`).
 pub(crate) fn classify_handler_error(e: &anyhow::Error) -> (u16, &'static str) {
     if e.downcast_ref::<GuidedDecodeError>().is_some()
         || e.downcast_ref::<LoraAdapterError>().is_some()
+        || e.downcast_ref::<RefusedRequest>().is_some()
     {
         (400, "invalid_request_error")
     } else if e.downcast_ref::<UnsupportedCapabilityError>().is_some() {
         (400, "unsupported_capability")
-    } else if let Some(refusal @ GenerationError::NoEngine) = e.downcast_ref::<GenerationError>() {
-        (refusal.stream_status(), "server_error")
+    } else if let Some(error) = e.downcast_ref::<GenerationError>() {
+        (error.stream_status(), error.error_type())
     } else {
         (500, "server_error")
     }
@@ -408,8 +437,7 @@ pub(crate) fn clamp_logprobs(k: usize) -> usize {
 }
 
 /// Upper bound on client-supplied `stop` sequences. Each generated token runs an `O(stops * text)`
-/// scan per active slot (batch loop `hit_stop`), and `StreamStops`/`apply_stop` iterate every stop per
-/// streamed piece, so an unbounded `stop` array is a per-token CPU DoS: a ~64MB body of short strings
+/// scan per active slot (the loop's `StopScanner`), so an unbounded `stop` array is a per-token CPU DoS: a ~64MB body of short strings
 /// pins a worker doing millions of `contains` per token for up to `MAX_NEW_TOKENS_CAP` tokens. OpenAI
 /// caps `stop` at 4; 16 leaves headroom. Truncated, not rejected, like `clamp_n`/`clamp_logprobs`.
 pub(crate) const MAX_STOP_SEQUENCES: usize = 16;
@@ -708,21 +736,6 @@ pub(crate) fn tool_call_stream_deltas(calls: &[ToolCallOut]) -> Vec<serde_json::
         .collect()
 }
 
-/// Truncate `text` at the earliest occurrence of any stop string; returns whether one matched.
-pub(crate) fn apply_stop(text: &mut String, stops: &[String]) -> bool {
-    let cut = stops
-        .iter()
-        .filter(|s| !s.is_empty())
-        .filter_map(|s| text.find(s.as_str()))
-        .min();
-    if let Some(i) = cut {
-        text.truncate(i);
-        true
-    } else {
-        false
-    }
-}
-
 /// OpenAI-shaped token accounting.
 #[derive(Serialize)]
 pub(crate) struct Usage {
@@ -756,6 +769,11 @@ pub(crate) struct ChatMsg {
     /// round-trips see the flattened text form only.
     #[serde(default, skip_serializing)]
     pub(crate) non_text_parts: Vec<String>,
+    /// The `url` of each image part that carries one (`image_url`, `input_image`), in order. Not
+    /// re-serialized: the chat template sees the flattened text, and an image reaches the model through
+    /// the image front end.
+    #[serde(default, skip_serializing)]
+    pub(crate) image_urls: Vec<String>,
     /// Assistant turn's prior tool calls (OpenAI history echo), passed to the template so it re-renders
     /// the `<tool_call>` markup for a multi-turn tool conversation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -784,11 +802,12 @@ struct ChatMsgRaw {
 
 impl From<ChatMsgRaw> for ChatMsg {
     fn from(raw: ChatMsgRaw) -> Self {
-        let (content, non_text_parts) = flatten_chat_content(&raw.content);
+        let (content, non_text_parts, image_urls) = flatten_chat_content(&raw.content);
         ChatMsg {
             role: raw.role,
             content,
             non_text_parts,
+            image_urls,
             tool_calls: raw.tool_calls,
             tool_call_id: raw.tool_call_id,
             name: raw.name,
@@ -796,14 +815,16 @@ impl From<ChatMsgRaw> for ChatMsg {
     }
 }
 
-/// Flatten one OpenAI `content` value to `(text, non_text_part_types)`. Text parts are concatenated; every
-/// non-`text` part's `type` string is recorded.
-fn flatten_chat_content(v: &serde_json::Value) -> (Option<String>, Vec<String>) {
+/// Flatten one OpenAI `content` value to `(text, non_text_part_types, image_urls)`. Text parts are
+/// concatenated; every non-`text` part's `type` string is recorded, and the `url` of each image part
+/// (`image_url` as a string or as `{url}`).
+fn flatten_chat_content(v: &serde_json::Value) -> (Option<String>, Vec<String>, Vec<String>) {
     match v {
-        serde_json::Value::String(s) => (Some(s.clone()), Vec::new()),
+        serde_json::Value::String(s) => (Some(s.clone()), Vec::new(), Vec::new()),
         serde_json::Value::Array(parts) => {
             let mut text = String::new();
             let mut non_text_parts = Vec::new();
+            let mut image_urls = Vec::new();
             for part in parts {
                 match part.get("type").and_then(|t| t.as_str()) {
                     Some("text") => {
@@ -811,13 +832,21 @@ fn flatten_chat_content(v: &serde_json::Value) -> (Option<String>, Vec<String>) 
                             text.push_str(t);
                         }
                     }
-                    Some(other) => non_text_parts.push(other.to_string()),
+                    Some(other) => {
+                        if is_image_part(other) {
+                            let url = part.get("image_url").and_then(|image| {
+                                image.as_str().or_else(|| image.get("url")?.as_str())
+                            });
+                            image_urls.extend(url.map(str::to_string));
+                        }
+                        non_text_parts.push(other.to_string());
+                    }
                     None => {}
                 }
             }
-            (Some(text), non_text_parts)
+            (Some(text), non_text_parts, image_urls)
         }
-        _ => (None, Vec::new()),
+        _ => (None, Vec::new(), Vec::new()),
     }
 }
 

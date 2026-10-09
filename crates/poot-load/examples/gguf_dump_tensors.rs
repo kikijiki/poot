@@ -1,7 +1,7 @@
 //! Local diagnostic: dump a GGUF's architecture metadata and every tensor name matching a filter,
 //! via `GgufIndex::open` (header only, so it works on a partial download such as the first
 //! 256MB fetched with an HTTP Range request). Written for the Mixtral-8x7B coherence work
-//! (docs/updates/, search "mixtral-8x7b"): some pre-2024 conversions use per-expert
+//! (the Backstage update notes on mixtral-8x7b): some pre-2024 conversions use per-expert
 //! `ffn_gate.{e}.weight` tensors that poot's loader does not recognize, while current llama.cpp
 //! conversions use merged 3D `ffn_gate_exps.weight`.
 //! Usage:

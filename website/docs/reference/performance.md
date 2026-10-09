@@ -129,7 +129,7 @@ completed both cells cleanly (25.8 and 24.0 tok/s). This is separate from the ra
 - **These numbers are from early builds.** poot's kernels and kernel selection are still being tuned (for example,
   a better kernel choice for the projection shapes lifted PTX decode in the decode-128 scenario from 45 to 57 tok/s on
   2026-07-03; the 2026-07-28 run measured 101 tok/s).
-- **Pooled MoE decode is not available yet (poot is being refactored; planned to return).** There are no pooled throughput numbers; the numbers above cover the dense and
+- **There is no pooled MoE decode** (no expert pooling), so there are no pooled throughput numbers; the numbers above cover the dense and
   standard-MoE decode path only. See the [feature matrix](./feature-matrix.md#expert-pooling). 
 
 ## Request timing in the current runner

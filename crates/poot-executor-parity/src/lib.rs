@@ -38,9 +38,11 @@ pub mod launch;
 pub mod live_attention;
 pub mod lora;
 pub mod packed;
+pub mod pipeline;
 pub mod routing;
 pub mod scan;
 pub mod select;
+pub mod state_row;
 pub mod weight_map;
 
 use std::collections::HashMap;
@@ -625,7 +627,7 @@ pub struct ConstFixture {
 ///
 /// ```ignore
 /// // before (GpuExecutor, deleted):
-/// let mut gpu = poot_gpu::GpuExecutor::new()?;
+/// let mut gpu = poot_gpu::GpuExecutor::new()?; // deleted
 /// let got = gpu.run(&g, &inputs)?; // inputs: HashMap<ValueId, poot_eval::Value>, Const rows and
 ///                                  // Slot rows mixed together by ValueId.
 ///

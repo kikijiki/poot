@@ -11,10 +11,6 @@
 //!
 //! Each row runs the small shape, then the large one, in one executor, and compares every element of
 //! the large output with the oracle decoder. The order matters: the large shape alone was correct.
-//!
-//! Mutations (card 656, each alone turns both rows red): make `GpuExecutor::compiled` hit on the key
-//! alone (`executor/counters.rs`), or make `Context::cached_pipeline` hit on the key alone
-//! (`poot-runtime` `context/init.rs`).
 
 use poot_test_util::const_weights::ConstWeights;
 use std::sync::Arc;
@@ -70,7 +66,7 @@ fn mismatches(got: &[f32], want: &[f32]) -> Option<(usize, usize, f32, f32)> {
 /// The indexed packed contraction (`packed_indexed_linear`: one `PackedContraction` over a stacked table, no
 /// `Materialize`) at `[out, k]` Q4_K experts, run through the
 /// executor contract (`exec` is reused across calls so its kernel/pipeline cache persists exactly as
-/// `GpuExecutor`'s own `self.compiled` cache did); returns the output and the oracle's. Row `m` reads
+/// the deleted `GpuExecutor`'s own `self.compiled` cache did); returns the output and the oracle's. Row `m` reads
 /// expert `m % 2` at column `(m * 37 + 11) % k` through a one-hot activation, so every output is one
 /// decoded weight value.
 fn run_moe(exec: &mut dyn Executor, target: Target, out: usize, k: usize) -> (Vec<f32>, Vec<f32>) {

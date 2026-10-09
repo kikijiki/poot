@@ -43,7 +43,7 @@ fn resident_load_of_a_real_bf16_checkpoint_peaks_under_one_point_five_x_file_siz
         let incremental_peak = peak_rss.saturating_sub(baseline_rss);
         let limit = (file_bytes * 3 / 2) + 16 * 1024 * 1024;
         println!(
-            "card540b rss: file_bytes={file_bytes} baseline_rss_bytes={baseline_rss} \
+            "bf16 load rss: file_bytes={file_bytes} baseline_rss_bytes={baseline_rss} \
              baseline_peak_bytes={baseline_peak} peak_rss_bytes={peak_rss} \
              incremental_peak_bytes={incremental_peak} limit_bytes={limit}"
         );

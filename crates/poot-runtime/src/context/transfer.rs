@@ -20,7 +20,7 @@ impl Context {
             elem_count: data.len() as u32,
             id: next_buffer_id(),
             storage: BufferStorage::f32(),
-            guard: self.tag_alloc(
+            _guard: self.tag_alloc(
                 poot_runtime_common::BufferRole::Weight,
                 std::mem::size_of_val(data),
             ),
@@ -44,7 +44,7 @@ impl Context {
             elem_count: data.len() as u32,
             id: next_buffer_id(),
             storage: BufferStorage::i32(),
-            guard: self.tag_alloc(
+            _guard: self.tag_alloc(
                 poot_runtime_common::BufferRole::Weight,
                 std::mem::size_of_val(data),
             ),
@@ -70,7 +70,7 @@ impl Context {
             elem_count: data.len() as u32,
             id: next_buffer_id(),
             storage: BufferStorage::f16(),
-            guard: self.tag_alloc(
+            _guard: self.tag_alloc(
                 poot_runtime_common::BufferRole::Weight,
                 std::mem::size_of_val(data),
             ),
@@ -95,7 +95,7 @@ impl Context {
             // No fixed tensor dtype: this generic word buffer serves dims metadata, seeds, scratch
             // and packed rows alike, each named by the caller, not this allocation (card 527).
             storage: BufferStorage::dense(ElementKind::I32, LogicalDType::RawBytes),
-            guard: self.tag_alloc(
+            _guard: self.tag_alloc(
                 poot_runtime_common::BufferRole::Meta,
                 std::mem::size_of_val(data),
             ),
@@ -126,7 +126,7 @@ impl Context {
             // Card 527: E4M3FN packed rows are this function's documented caller; other packed or
             // metadata payloads may reuse it too, so the logical dtype stays opaque here as well.
             storage: BufferStorage::dense(ElementKind::I32, LogicalDType::RawBytes),
-            guard: self.tag_alloc(
+            _guard: self.tag_alloc(
                 poot_runtime_common::BufferRole::Weight,
                 std::mem::size_of_val(data),
             ),
@@ -163,7 +163,7 @@ impl Context {
             elem_count: elems as u32,
             id: next_buffer_id(),
             storage: BufferStorage::f32(),
-            guard: self.tag_alloc(poot_runtime_common::BufferRole::Output, elems * 4),
+            _guard: self.tag_alloc(poot_runtime_common::BufferRole::Output, elems * 4),
         }
     }
 
@@ -187,7 +187,7 @@ impl Context {
             elem_count: data.len() as u32,
             id: next_buffer_id(),
             storage: BufferStorage::i32(),
-            guard: self.tag_alloc(
+            _guard: self.tag_alloc(
                 poot_runtime_common::BufferRole::Input,
                 std::mem::size_of_val(data),
             ),
@@ -292,17 +292,33 @@ impl Context {
             elem_count: elems.max(1) as u32,
             id: next_buffer_id(),
             storage,
-            guard: self.tag_alloc(role, bytes),
+            _guard: self.tag_alloc(role, bytes),
         }
     }
 
-    /// Overwrite the first `bytes.len()` bytes of `buf` (a whole number of its elements, padded to a
-    /// word; Card 546a).
-    pub fn write_bytes(&self, buf: &DeviceBuffer, bytes: &[u8]) -> Result<(), RuntimeError> {
-        checked_write_range("write_bytes", buf, 0, bytes.len(), 1)?;
+    /// Overwrite `bytes.len()` bytes of `buf` from byte `offset` (a whole number of its elements, padded
+    /// to a word; Card 546a). The device writes whole words: `offset` and `bytes.len()` must be
+    /// multiples of four, except that a write reaching the end of the buffer may end mid-word.
+    pub fn write_bytes(
+        &self,
+        buf: &DeviceBuffer,
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), RuntimeError> {
+        checked_write_range("write_bytes", buf, offset, bytes.len(), 1)?;
+        let capacity = buf.elem_count as usize * buf.storage().element().byte_width();
+        let reaches_end = offset + bytes.len() == capacity;
+        if !offset.is_multiple_of(4) || (!bytes.len().is_multiple_of(4) && !reaches_end) {
+            return Err(RuntimeError::Misaligned {
+                op: "write_bytes",
+                offset,
+                len: bytes.len(),
+            });
+        }
         let mut padded = bytes.to_vec();
         padded.resize(bytes.len().div_ceil(4) * 4, 0);
-        self.queue.write_buffer(&buf.buf, 0, &padded);
+        self.queue
+            .write_buffer(&buf.buf, offset as wgpu::BufferAddress, &padded);
         self.record_upload_transfer(bytes.len());
         Ok(())
     }

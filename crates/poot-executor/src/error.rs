@@ -3,8 +3,8 @@
 //! needs a full reset before its next step (`NeedsReset`), and a device that failed to clean up after
 //! an aborted transaction can never be reused (`Poisoned`).
 
-use poot_graph_ir::{SlotKey, ValidationPacketError, ValueId};
-use poot_graph_plan::{PlanKind, Target};
+use poot_graph_ir::{BoundaryId, SlotKey, ValidationPacketError, ValueId};
+use poot_graph_plan::{DeviceId, PlanKind, StageId, Target};
 use poot_target::BufferStorage;
 use poot_tensor::DType;
 
@@ -35,6 +35,13 @@ pub enum ExecError {
     /// can run on it, and resetting an executable cannot clear this (core review CR30).
     #[error("the device is poisoned and cannot accept further work")]
     Poisoned,
+    /// A stage of the program was compiled for a device this engine does not drive.
+    #[error("stage {stage:?} is placed on {program:?}; this engine drives {engine:?}")]
+    Placement {
+        stage: StageId,
+        program: DeviceId,
+        engine: DeviceId,
+    },
 }
 
 impl From<LoadError> for ExecError {
@@ -134,10 +141,20 @@ pub enum LoadError {
     Unimplemented(&'static str),
     #[error("unknown executable, entry, or stage handle")]
     UnknownHandle,
-    /// A `StagedProgram` names more than one stage, or a stage on a device this executor does not
-    /// drive. Card 581a's multi-stage composition is out of this card's scope.
-    #[error("staged program names {0} stages; this card's engine drives exactly one")]
-    NotSingleStage(usize),
+    /// Two stages declare the same slot key with a different aval or storage; they would share one
+    /// host-written buffer.
+    #[error("slot {key} is declared with different avals or storages by two stages")]
+    SlotConflict { key: SlotKey },
+    /// A link names a boundary its producing stage never exported.
+    #[error("boundary {id:?} is read by stage {stage:?} but exported by no earlier stage")]
+    BoundaryUnresolved { id: BoundaryId, stage: StageId },
+    /// An exported value is a view of carried state read before the stage's commit: a later stage
+    /// would see the committed value, not the one the uncut graph reads.
+    #[error("boundary {id:?} is a view of carried-state input v{state}, which the stage commits")]
+    BoundaryAliasesState { id: BoundaryId, state: ValueId },
+    /// An export names a value no equation of its stage produced.
+    #[error("boundary {id:?} names a value its stage never materializes")]
+    ExportUnmaterialized { id: BoundaryId },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -165,6 +182,14 @@ pub enum BindError {
         key: SlotKey,
         expected: DType,
         got: DType,
+    },
+    /// `reset_state(Row(row))` named a row outside the carried state's leading axis, or the state
+    /// is not a whole number of equal rows.
+    #[error("state {name}: cannot reset row {row} of its {rows} leading rows")]
+    StateRow {
+        name: String,
+        row: usize,
+        rows: usize,
     },
     /// A hosted embed gather's token id is not a row of its table.
     #[error("embed {name}: token {token} is not one of its {rows} rows")]

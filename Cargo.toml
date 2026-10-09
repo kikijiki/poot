@@ -43,7 +43,7 @@ members = [
 
 # Test executables dominate a target dir and ~72% of one is DWARF. `test` inherits `dev`, so this covers both:
 # backtraces keep file and line; variable inspection in gdb/rocgdb needs `CARGO_PROFILE_DEV_DEBUG=2` or a
-# `[profile.dev.package.<crate>] debug = 2` entry (docs/operating-notes.md).
+# `[profile.dev.package.<crate>] debug = 2` entry.
 [profile.dev]
 debug = "line-tables-only"
 

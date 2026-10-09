@@ -60,13 +60,18 @@ decode step once per token. There is no cuBLAS and no cuDNN: every kernel is gen
 ```
 nix develop        # pinned Rust nightly, LLVM 22, Vulkan stack
 just test          # model-free tests: no GPU, no checkpoint
-cargo run -p poot-llm --release --features cli --bin qwen2-generate -- /path/to/qwen2.5-0.5b "The capital of France is" 16
+cargo run -p poot-llm --release --features cli --bin poot-generate -- -m /path/to/qwen2.5-0.5b -p "The capital of France is" -n 16
 ```
 
-The model argument is a safetensors directory or a `.gguf` file. Without it the tool reads `qwen2.5-0.5b`
-under `POOT_MODELS_DIR`, and tests that load checkpoints read them from the same directory. `--backend
-wgpu|rocm|ptx|vulkan` picks the device (ROCm builds with `--features rocm`): wgpu and vulkan need a Vulkan
-device, ROCm an AMD GPU, PTX an NVIDIA GPU.
+`poot-generate` takes the flags of llama.cpp's `llama-cli` where poot has the capability: `-m` the model (a
+safetensors directory or a `.gguf` file; without it the tool reads `qwen2.5-0.5b` under `POOT_MODELS_DIR`, and
+tests that load checkpoints read them from the same directory), `-p` or `-f` the prompt, `--system-prompt` (no `-sys` short form, unlike llama-cli),
+`-n` (default -1: run to the model's end-of-sequence token, a `-r` string or the end of the context window `-c`),
+`--temp` (default 0, greedy), `--top-k`, `--top-p`, `--min-p`, `--repeat-penalty`, `-s`, `-r`, `--ignore-eos`,
+`--show-timings` (engine-measured prefill and decode tokens/s, on by default) and `-v`. A model that ships a chat
+template answers the prompt as a user turn of it; `--no-chat-template` (or a base model) continues the text as
+written. `--backend wgpu|rocm|ptx|vulkan` picks the device (default `auto`): wgpu and vulkan need a Vulkan
+device, PTX an NVIDIA GPU, and ROCm an AMD GPU and a build with `--features cli,rocm`.
 
 ## Repository layout
 

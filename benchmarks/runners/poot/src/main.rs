@@ -44,8 +44,8 @@ use poot_llm::driver::error::DriverError;
 #[cfg(test)]
 use poot_llm::driver::error::Unsupported;
 use poot_llm::driver::{
-    open_executor, BackendChoice, Driver, DriverOptions, DriverStats, GenerateRequest, Head,
-    Layout, ModelHandle, PreparedSetLimits, ServingShapes, Warm,
+    open_executor, open_timed_executor, BackendChoice, Driver, DriverOptions, DriverStats,
+    GenerateRequest, Head, Layout, ModelHandle, PreparedSetLimits, ServingShapes, Warm,
 };
 use poot_llm::{GenerationControl, Sampler};
 use poot_models::registry::Registry;
@@ -300,12 +300,6 @@ fn parse_args(args: &[String]) -> anyhow::Result<Invocation> {
     };
 
     anyhow::ensure!(config.iters > 0, "--iters must be positive");
-    anyhow::ensure!(
-        !(config.profile && config.backend == Backend::Rocm),
-        "--profile is not supported on --backend rocm: RocmDevice has no HSA timestamp binding \
-         yet (Card 548), so device_time() is always Unknown and there is nothing to \
-         report - this used to silently print no profile section instead of refusing"
-    );
     match config.mode {
         Mode::Single => anyhow::ensure!(config.gen_tokens > 0, "--gen-tokens must be positive"),
         Mode::DecodeCurve => {
@@ -317,6 +311,26 @@ fn parse_args(args: &[String]) -> anyhow::Result<Invocation> {
         }
     }
     Ok(Invocation::Run(config))
+}
+
+/// A profiled window: the rendered report and the engine-produced device time of the same window.
+struct Profile {
+    text: String,
+    /// `{"kind": "measured", ...}` or `{"kind": "unknown"}`: see [`device_time_receipt`].
+    device_time: Value,
+}
+
+/// The window's device time as the result line carries it: measured milliseconds from the engine's own
+/// device timestamps, or the typed `unknown` of a device that reports none (ROCm, an untimed device) -
+/// never a zero and never a host-observed substitute.
+fn device_time_receipt(window: &poot_profile::WindowReport) -> Value {
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    let sum = window.device.sum_of_dispatch_durations.map(ms);
+    let span = window.device.device_span.map(ms);
+    if sum.is_none() && span.is_none() {
+        return json!({ "kind": "unknown" });
+    }
+    json!({ "kind": "measured", "sum_of_dispatch_ms": sum, "device_span_ms": span })
 }
 
 /// A loaded model on one backend, as the measure loop drives it; the loop is written once against this
@@ -345,7 +359,7 @@ trait Generate {
     /// Drop what a profiled executor recorded so far (compiles and cache fills before the timed window).
     fn reset_profile(&mut self);
 
-    fn profile_report(&self, tokens: usize, wall: Duration) -> Option<String>;
+    fn profile_report(&self, tokens: usize, wall: Duration) -> Option<Profile>;
 
     /// What the engine itself counted, for the result line: the driver's prepared set, compile and
     /// retention counters. `None` for an engine with nothing of its own to report.
@@ -383,6 +397,8 @@ struct DriverCell {
     driver: Driver,
     /// The driver's counters before `Driver::prepare` ran.
     initial: PreparationCounters,
+    /// The executor's timing snapshot when `reset_profile` last ran: the start of the profiled window.
+    mark: Option<poot_profile::Mark>,
 }
 
 /// The preparation layers the driver and its executor count.
@@ -466,10 +482,19 @@ impl Generate for DriverCell {
         self.run(&tokens, max_new, false, on_token)
     }
 
-    fn reset_profile(&mut self) {}
+    fn reset_profile(&mut self) {
+        self.mark = Some(self.driver.executor_stats().timing.mark());
+    }
 
-    fn profile_report(&self, _tokens: usize, _wall: Duration) -> Option<String> {
-        None
+    fn profile_report(&self, tokens: usize, wall: Duration) -> Option<Profile> {
+        let mark = self.mark.as_ref()?;
+        let timing = self.driver.executor_stats().timing;
+        let entries = timing.entries_with_activity_since(mark);
+        let window = poot_profile::Report::window(&timing, mark, &entries);
+        Some(Profile {
+            text: window.render(tokens, wall),
+            device_time: device_time_receipt(&window),
+        })
     }
 
     fn engine(&self) -> Engine {
@@ -526,10 +551,6 @@ fn open_driver(
     config: &Config,
     handle: ModelHandle,
 ) -> anyhow::Result<(Box<dyn Generate>, String)> {
-    anyhow::ensure!(
-        !config.profile,
-        "--profile is not supported on the driver (a registered family): it opens counters-only executors"
-    );
     let handle = Arc::new(handle);
     let precision = match &config.weights {
         Weights::Safetensors(_) => config.precision.clone(),
@@ -555,7 +576,12 @@ fn open_driver(
         }
     };
     let capacity = NonZeroUsize::new(longest).context("the longest request is empty")?;
-    let executor = open_executor(backend).context("open the executor")?;
+    let executor = if config.profile {
+        open_timed_executor(backend)
+    } else {
+        open_executor(backend)
+    }
+    .context("open the executor")?;
     let mut driver = Driver::new(
         Arc::clone(&handle),
         executor,
@@ -579,6 +605,7 @@ fn open_driver(
             handle,
             driver,
             initial,
+            mark: None,
         }),
         precision,
     ))
@@ -1023,10 +1050,12 @@ fn measure_single(
     let timed_wall = timed_start.elapsed();
     probe.repeated(&*engine);
 
-    if config.profile {
+    let device_time = if config.profile {
         let tokens = runs.iter().map(|run| run.tokens).sum();
-        print_profile(engine.profile_report(tokens, timed_wall));
-    }
+        print_profile(engine.profile_report(tokens, timed_wall))
+    } else {
+        Value::Null
+    };
 
     // The summary medians are over the requests that define the metric; the result contract wants a number,
     // so a cell where none does (fewer than two tokens) summarizes as 0 while every request says null.
@@ -1040,6 +1069,7 @@ fn measure_single(
         "prompt_tokens": engine.encode(&prompt)?.len(),
         "gen_tokens": runs.last().map_or(0, |run| run.tokens),
         "iterations": config.iters,
+        "device_time": device_time,
         "ttft_ms": round3(median(&ttft)),
         "tpot_ms": round3(median(&column(Run::tpot_ms))),
         "e2e_ms": round3(median(&column(|run| Some(run.e2e_ms)))),
@@ -1087,15 +1117,23 @@ fn measure_isl(
         iters.push(run.receipt());
     }
     probe.repeated(&*engine);
-    if config.profile {
+    let device_time = if config.profile {
         let tokens: usize = iters
             .iter()
             .map(|iter| iter["itl_ms"].as_array().map_or(0, Vec::len))
             .sum();
         eprintln!("poot-bench: isl={isl} profile window:");
-        print_profile(engine.profile_report(tokens, timed_start.elapsed()));
-    }
-    Ok(json!({ "isl": isl, "prompt_tokens": isl, "warmup_runs": warmup_runs, "iters": iters }))
+        print_profile(engine.profile_report(tokens, timed_start.elapsed()))
+    } else {
+        Value::Null
+    };
+    Ok(json!({
+        "isl": isl,
+        "prompt_tokens": isl,
+        "warmup_runs": warmup_runs,
+        "iters": iters,
+        "device_time": device_time,
+    }))
 }
 
 /// decode-curve. A per-ISL failure after the first keeps the measured points and records a caveat: the
@@ -1172,11 +1210,14 @@ fn measure_curve(
     Ok(json!({ "osl": config.osl, "caveats": caveats, "curve": curve }))
 }
 
-fn print_profile(report: Option<String>) {
-    if let Some(report) = report {
-        eprintln!("=== PROFILE ===");
-        eprintln!("{report}");
-    }
+/// Print the window and return its device time for the result line (`null` when nothing was profiled).
+fn print_profile(profile: Option<Profile>) -> Value {
+    let Some(profile) = profile else {
+        return Value::Null;
+    };
+    eprintln!("=== PROFILE ===");
+    eprintln!("{}", profile.text);
+    profile.device_time
 }
 
 /// A request the runner itself does not serve (a precision it cannot load). Reported like any refusal.
@@ -1415,11 +1456,14 @@ mod tests {
             self.events.borrow_mut().push(Event::ResetProfile);
         }
 
-        fn profile_report(&self, tokens: usize, _wall: Duration) -> Option<String> {
+        fn profile_report(&self, tokens: usize, _wall: Duration) -> Option<Profile> {
             self.events
                 .borrow_mut()
                 .push(Event::ProfileReport { tokens });
-            None
+            Some(Profile {
+                text: "stub window".to_string(),
+                device_time: json!({ "kind": "unknown" }),
+            })
         }
 
         fn engine(&self) -> Engine {
@@ -1452,6 +1496,51 @@ mod tests {
         match parse_args(&args) {
             Ok(_) => panic!("{extra:?} parsed, expected an error"),
             Err(error) => format!("{error:#}"),
+        }
+    }
+
+    fn window(sum: Option<Duration>, span: Option<Duration>) -> poot_profile::WindowReport {
+        poot_profile::WindowReport {
+            entries: vec![0],
+            steps: 1,
+            host: poot_profile::HostTiming::default(),
+            device: poot_profile::DeviceWindow {
+                sum_of_dispatch_durations: sum,
+                device_span: span,
+            },
+            detail: poot_profile::Coverage::Unavailable,
+            buckets: Default::default(),
+            perturbed: false,
+        }
+    }
+
+    /// POOT-1072: a window the engine measured reports its milliseconds, and a window with no device time
+    /// (ROCm, an untimed device) reports the typed `unknown`, never a zero. Mutation: make
+    /// `device_time_receipt` answer `measured` with the (absent) sum read as zero; the unknown case goes red.
+    #[test]
+    fn a_window_reports_measured_milliseconds_or_the_typed_unknown() {
+        let measured = device_time_receipt(&window(
+            Some(Duration::from_micros(1500)),
+            Some(Duration::from_micros(2000)),
+        ));
+        assert_eq!(
+            measured,
+            json!({ "kind": "measured", "sum_of_dispatch_ms": 1.5, "device_span_ms": 2.0 })
+        );
+        assert_eq!(
+            device_time_receipt(&window(None, None)),
+            json!({ "kind": "unknown" })
+        );
+    }
+
+    /// POOT-1072: `--profile` parses on every backend, ROCm included: it no longer refuses a backend with no
+    /// device timestamps, it reports `unknown`. Mutation: restore the ROCm refusal in `parse_args`.
+    #[test]
+    fn profile_is_accepted_on_every_backend() {
+        for backend in Backend::ALL {
+            let config = config(&["--profile", "--backend", backend.label()]);
+            assert!(config.profile, "{}", backend.label());
+            assert_eq!(config.backend, backend);
         }
     }
 
@@ -1603,6 +1692,57 @@ mod tests {
             assert_eq!(line["build_sha"], BUILD_SHA);
             assert_eq!(line["family"], "stub_family");
             harness_accepts(&line, mode == Mode::DecodeCurve, 6, Backend::Rocm);
+        }
+    }
+
+    /// POOT-1072: a profiled run puts the window's device time in the result line (the row's for a single run,
+    /// each ISL point's for a curve), the line passes the harness's contract, and an unprofiled run carries
+    /// `null`. Mutation: drop `"device_time"` from the single run's `json!` (or the curve point's); the key is
+    /// missing and this row goes red.
+    #[test]
+    fn a_profiled_run_reports_its_device_time_in_a_line_the_harness_accepts() {
+        for mode in Mode::ALL {
+            for profile in [true, false] {
+                let mut args = vec![
+                    "--mode",
+                    mode.label(),
+                    "--isl-list",
+                    "8,16",
+                    "--osl",
+                    "5",
+                    "--warmup",
+                    "1",
+                    "--iters",
+                    "2",
+                    "--gen-tokens",
+                    "6",
+                ];
+                if profile {
+                    args.push("--profile");
+                }
+                let mut config = config(&args);
+                config.backend = Backend::Rocm;
+                let outcome = measure(&config, &mut Stub::new(), "bf16", "stub_family");
+                let line = result_line(&config, None, outcome).unwrap();
+                let expected = if profile {
+                    json!({ "kind": "unknown" })
+                } else {
+                    Value::Null
+                };
+                let carriers: Vec<&Value> = match mode {
+                    Mode::Single => vec![&line],
+                    Mode::DecodeCurve => line["curve"].as_array().unwrap().iter().collect(),
+                };
+                assert!(!carriers.is_empty());
+                for carrier in carriers {
+                    assert_eq!(
+                        carrier.get("device_time"),
+                        Some(&expected),
+                        "{mode:?} profile={profile}"
+                    );
+                }
+                harness_accepts(&line, mode == Mode::DecodeCurve, 6, Backend::Rocm);
+            }
         }
     }
 
@@ -1828,7 +1968,7 @@ mod tests {
                 unreachable!("decode-curve only")
             }
             fn reset_profile(&mut self) {}
-            fn profile_report(&self, _: usize, _: Duration) -> Option<String> {
+            fn profile_report(&self, _: usize, _: Duration) -> Option<Profile> {
                 None
             }
             fn engine(&self) -> Engine {
@@ -2112,7 +2252,7 @@ mod preparation_tests {
             Ok(())
         }
         fn reset_profile(&mut self) {}
-        fn profile_report(&self, _: usize, _: Duration) -> Option<String> {
+        fn profile_report(&self, _: usize, _: Duration) -> Option<Profile> {
             None
         }
         fn engine(&self) -> Engine {

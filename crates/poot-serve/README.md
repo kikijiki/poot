@@ -3,9 +3,10 @@
 An OpenAI-compatible HTTP server.
 
 It loads any registered model as a `ModelHandle`, with request parsing and bounds, metrics and graceful
-shutdown, and serves completions and chat from one scheduling loop over the driver's `step`. Embeddings,
-rerank and LoRA administration return a typed `503` until they are restored; see
-[serving](../../website/docs/serve/index.md) for what each endpoint does.
+shutdown, and serves completions, chat, embeddings, rerank and LoRA administration from one engine thread over
+the driver: generation is one scheduling loop over `step`, and the other routes are `Encode` steps and adapter
+operations the loop runs between requests. See [serving](../../website/docs/serve/index.md) for what each
+endpoint does.
 
 ## Quick start
 

@@ -69,6 +69,22 @@ impl TextCodec {
     }
 }
 
+impl TextCodec {
+    /// `prompt` as the one user turn of the model's own jinja `chat_template` (after `system`, when given),
+    /// ready for the assistant to answer, with the turn-end markers generation should stop at. `None` when
+    /// the model ships no template (a base model): its prompt is raw text, and the hardcoded
+    /// [`ChatFormat`] fallback of [`TextCodec::render_chat_value`] is not applied to it.
+    pub fn render_user_turn(&self, system: Option<&str>, prompt: &str) -> Option<RenderedChat> {
+        self.chat_template.template.as_ref()?;
+        let mut messages = Vec::new();
+        if let Some(system) = system {
+            messages.push(serde_json::json!({ "role": "system", "content": system }));
+        }
+        messages.push(serde_json::json!({ "role": "user", "content": prompt }));
+        Some(self.render_chat_value(&serde_json::Value::Array(messages), None))
+    }
+}
+
 /// The result of rendering a conversation for the chat endpoint: the model-ready prompt and the turn-end markers
 /// generation should stop/truncate at (the template's per-turn separator + eos string, or
 /// [`ChatFormat::turn_end`] on the fallback path).
@@ -369,8 +385,8 @@ pub(crate) fn parse_tokenizer_config_chat_bytes(
 /// fields use [`parse_tokenizer_config_chat_bytes`].
 ///
 /// Also falls back to a standalone sibling `chat_template.jinja` file when `tokenizer_config.json` carries no
-/// embedded `chat_template` field (found during gpt-oss-20b coherence verification, docs/updates/ "gptoss real
-/// checkpoint coherence"): current HF releases, including `openai/gpt-oss-20b`, moved the template out of
+/// embedded `chat_template` field (found during gpt-oss-20b coherence verification, the Backstage "gptoss real
+/// checkpoint coherence" update): current HF releases, including `openai/gpt-oss-20b`, moved the template out of
 /// `tokenizer_config.json` into its own `chat_template.jinja`. Without this any such arch would silently degrade
 /// to the `ChatFormat` fallback.
 pub(crate) fn read_tokenizer_config_chat(
@@ -745,5 +761,70 @@ mod jinja_chat_template {
             .expect("the real gemma4 chat_template must render (this is the reported bug)");
         eprintln!("gemma4 chat_template render:\n{out}");
         assert!(!out.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod user_turn_tests {
+    use poot_models::chat::ChatFormat;
+    use tokenizers::Tokenizer;
+    use tokenizers::models::wordlevel::WordLevel;
+
+    use crate::text::tokenize::{ChatTemplate, TextCodec};
+
+    fn codec(template: Option<&str>) -> TextCodec {
+        let model = WordLevel::builder()
+            .vocab([("<unk>".to_string(), 0u32)].into_iter().collect())
+            .unk_token("<unk>".to_string())
+            .build()
+            .expect("build wordlevel model");
+        TextCodec::new(
+            Tokenizer::new(model),
+            None,
+            None,
+            0,
+            ChatFormat::Phi3,
+            ChatTemplate {
+                template: template.map(str::to_string),
+                bos_token: None,
+                eos_token: None,
+            },
+        )
+    }
+
+    const CHATML: &str = "{% for m in messages %}{{ '<|im_start|>' + m['role'] + '\\n' + m['content'] + \
+        '<|im_end|>\\n' }}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}";
+
+    /// A model that ships a template gets the prompt as a user turn of THAT template (not the family's
+    /// hardcoded fallback, which is Phi3 here), with the template's turn end as a stop. Mutation: render
+    /// through `ChatFormat` instead of the jinja template, or return the prompt unrendered.
+    #[test]
+    fn a_model_with_a_template_renders_the_prompt_as_a_user_turn() {
+        let rendered = codec(Some(CHATML)).render_user_turn(None, "Hi").unwrap();
+        assert_eq!(
+            rendered.prompt,
+            "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+        );
+        assert!(rendered.stops.iter().any(|s| s == "<|im_end|>"));
+    }
+
+    /// A base model has no template, so it has no user turn: `None`, even though its family has a
+    /// hardcoded fallback format. Mutation: return `Some` of the fallback render.
+    #[test]
+    fn a_model_without_a_template_has_no_user_turn() {
+        assert_eq!(codec(None).render_user_turn(None, "Hi"), None);
+    }
+
+    /// A system prompt is a system turn ahead of the user turn, in the model's template. Mutation: drop
+    /// the system message.
+    #[test]
+    fn a_system_prompt_precedes_the_user_turn() {
+        let rendered = codec(Some(CHATML))
+            .render_user_turn(Some("Be terse."), "Hi")
+            .unwrap();
+        assert_eq!(
+            rendered.prompt,
+            "<|im_start|>system\nBe terse.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+        );
     }
 }

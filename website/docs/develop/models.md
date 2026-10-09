@@ -15,7 +15,7 @@ embedded config and tokenizer). Both work from the library (`poot-llm`). A dense
 `driver::ModelHandle` and generates through the driver, and so do the mixture-of-experts families Qwen3-MoE,
 Granite MoE, Mixtral, OLMoE, gpt-oss, MiniMax-M2 and Gemma 4, the MLA families (DeepSeek-V2/V3/V3.2) and the hybrids Nemotron-H, Qwen3-Next, Qwen3.8-Flash-Next and Qwen3.5 (the Qwen3.8-27B-FP8 text tower). The
 checkpoint's config decides which: the families that load through the driver are the ones the model registry knows.
-Generation serving in `poot-serve` is not available yet (poot is being refactored; planned to return).
+`poot-serve` serves the families the registry knows through the same driver.
 
 ## Dense decoders
 
@@ -30,7 +30,7 @@ the matrix for backend coverage. Gemma 2's sliding window covers the even layers
 
 Qwen3-MoE, Granite MoE, Mixtral, OLMoE, gpt-oss, MiniMax-M2.
 
-Router plus sparse expert MLPs, with every expert's weights resident (expert pooling is not available yet (poot is being refactored; planned to return)). These load with `ModelHandle::load` and generate with `Driver`, from safetensors and from GGUF. Mixtral is the Llama family with experts: a Mixtral GGUF names the `llama` architecture, and it carries experts when its metadata has `llama.expert_count`. Granite MoE is the Granite family with experts. Experts are read as the checkpoint stores them, per-expert tensors or a stored stack, dense or packed; nothing is fused at load. A NaN or infinite router logit stops the step with a validation error naming the layer. MiniMax-M2 routes with a sigmoid score and a correction bias that only decides which experts run, and it is an HF safetensors family. Its layer, expert and head counts come from the checkpoint's config, so a fine-tune with other counts loads the same way. Check the matrix for your architecture and backend.
+Router plus sparse expert MLPs, with every expert's weights resident (there is no expert pooling). These load with `ModelHandle::load` and generate with `Driver`, from safetensors and from GGUF. Mixtral is the Llama family with experts: a Mixtral GGUF names the `llama` architecture, and it carries experts when its metadata has `llama.expert_count`. Granite MoE is the Granite family with experts. Experts are read as the checkpoint stores them, per-expert tensors or a stored stack, dense or packed; nothing is fused at load. A NaN or infinite router logit stops the step with a validation error naming the layer. MiniMax-M2 routes with a sigmoid score and a correction bias that only decides which experts run, and it is an HF safetensors family. Its layer, expert and head counts come from the checkpoint's config, so a fine-tune with other counts loads the same way. Check the matrix for your architecture and backend.
 
 ## Gemma 4
 
@@ -122,16 +122,16 @@ BERT-class encoder models for sentence embeddings and cross-encoder reranking.
 
 Safetensors is the usual format for HF-style encoder checkpoints. The `bert` family (an embedding encoder, or
 with the classifier head a cross-encoder) loads with `ModelHandle::load` and runs on the driver's `Encode` step on
-wgpu, ROCm and PTX; `poot_llm::encoders` is the library path. `/v1/embeddings` and `/v1/rerank` on `poot-serve`
-return `503` until they are restored.
+wgpu, ROCm and PTX; `poot_llm::encoders` is the library path. `poot-serve` does not start on an encoder
+checkpoint yet; its `/v1/embeddings` and `/v1/rerank` serve a decoder's embedding pass.
 
 ## Vision-language
 
-SmolVLM, idefics3.
+SmolVLM, idefics3, and Qwen2.5-VL.
 
 Multimodal chat: the vision tower (an `Encode`-only model) and the text decoder (the `llama` family read from the
 checkpoint's `text_config`) are two registered families over one checkpoint, each on its own driver. The library
-path is `poot_llm::front_end::Idefics3` and the `poot-caption` binary. Vision-language serving is not available yet (poot is being refactored; planned to return). ROCm and
+path is `poot_llm::front_end::Idefics3` and the `poot-caption` binary. Qwen2.5-VL is the same shape (`qwen2_5_vl_vision` and the `qwen2_5_vl` text decoder with sectioned RoPE; `poot_llm::qwen_vl::Qwen25Vl`). Serving covers the idefics3 (SmolVLM) checkpoint only, through `poot_llm::front_end::{Idefics3Checkpoint, ImageFrontEnd}` (see [Multimodal](../serve/multimodal.md)); Qwen2.5-VL runs through its library path and `poot-caption`, not the server. ROCm and
 PTX GPU verification is thinner than wgpu for some modalities; see the matrix before relying on it.
 
 ## Adding a model

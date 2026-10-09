@@ -1,9 +1,7 @@
 //! APNG probe and selected-frame source for Qwen2.5-VL.
 //!
-//! Held for Card 566b (the VLM front end on the driver): `Qwen25VlApngFrameSource` is the only production
-//! `Qwen25VlDecodedFrameSource` implementation, so the raw-video preprocessing path needs it, and no
-//! production caller constructs it yet. Where rustc reports one as dead it carries
-//! `#[expect(dead_code, reason = "held for POOT-650")]`.
+//! `Qwen25VlApngFrameSource` is the one `Qwen25VlDecodedFrameSource` implementation: the raw-video
+//! preprocessing path takes its frames from it (`poot-caption` opens an animated PNG with it).
 
 use std::io::Cursor;
 
@@ -24,8 +22,8 @@ const MAX_APNG_DECODER_ALLOC_BYTES: u64 = 512 * 1024 * 1024;
 /// Metadata describes one animation cycle. Timestamps keep variable frame delays; the scalar source
 /// FPS is the average `frame_count / duration`.
 #[derive(Debug, PartialEq)]
-pub(crate) struct Qwen25VlApng<'a> {
-    pub(crate) bytes: &'a [u8],
+pub struct Qwen25VlApng<'a> {
+    bytes: &'a [u8],
     pub(crate) width: usize,
     pub(crate) height: usize,
     pub(crate) duration_seconds: f64,
@@ -34,9 +32,8 @@ pub(crate) struct Qwen25VlApng<'a> {
     pub(crate) frame_timestamps_seconds: Vec<f64>,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "held for POOT-650"))]
 impl Qwen25VlApng<'_> {
-    pub(crate) fn metadata(&self) -> Qwen25VlVideoMetadata<'_> {
+    pub fn metadata(&self) -> Qwen25VlVideoMetadata<'_> {
         Qwen25VlVideoMetadata {
             duration_seconds: self.duration_seconds,
             source_frames_per_second: self.source_frames_per_second,
@@ -45,19 +42,18 @@ impl Qwen25VlApng<'_> {
         }
     }
 
-    pub(crate) const fn width(&self) -> usize {
+    pub const fn width(&self) -> usize {
         self.width
     }
 
-    pub(crate) const fn height(&self) -> usize {
+    pub const fn height(&self) -> usize {
         self.height
     }
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "held for POOT-650"))]
 impl<'a> Qwen25VlApng<'a> {
     /// Probe and validate one complete APNG animation from borrowed in-memory bytes.
-    pub(crate) fn from_bytes(bytes: &'a [u8]) -> Result<Self, Qwen25VlApngError> {
+    pub fn from_bytes(bytes: &'a [u8]) -> Result<Self, Qwen25VlApngError> {
         validate_qwen25_vl_apng_encoded_len(bytes.len())?;
         let (width, height, frames) = qwen25_vl_apng_frames(bytes)?;
         let canvas_pixels = width
@@ -133,7 +129,7 @@ impl<'a> Qwen25VlApng<'a> {
     }
 
     /// Create a fresh one-pass source for strictly increasing selected frame indices.
-    pub(crate) fn frame_source(&self) -> Result<Qwen25VlApngFrameSource<'a>, Qwen25VlApngError> {
+    pub fn frame_source(&self) -> Result<Qwen25VlApngFrameSource<'a>, Qwen25VlApngError> {
         let (width, height, frames) = qwen25_vl_apng_frames(self.bytes)?;
         if (width, height) != (self.width, self.height) {
             return Err(Qwen25VlApngError::SourceDimensionMismatch {
@@ -231,7 +227,7 @@ pub enum Qwen25VlApngError {
 }
 
 /// A one-pass APNG implementation of the established selected-frame source contract.
-pub(crate) struct Qwen25VlApngFrameSource<'a> {
+pub struct Qwen25VlApngFrameSource<'a> {
     pub(crate) frames: Frames<'a>,
     pub(crate) width: usize,
     pub(crate) height: usize,

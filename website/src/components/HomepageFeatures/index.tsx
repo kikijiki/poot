@@ -83,8 +83,8 @@ const FeatureList: FeatureItem[] = [
     description: (
       <>
         Run <code>poot-serve</code> for an OpenAI-compatible HTTP API that
-        bounds requests. Generation, embeddings, reranking and LoRA
-        administration are not available yet (poot is being refactored; planned to return).
+        bounds requests. It serves generation, embeddings, reranking and
+        LoRA adapter administration.
       </>
     ),
   },

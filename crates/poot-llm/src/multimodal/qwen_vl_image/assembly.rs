@@ -12,12 +12,6 @@ use super::config::Qwen25VlImageProcessorConfig;
 use super::preprocess::{Qwen25VlTemporalLayoutError, qwen25_vl_temporal_layout};
 use crate::multimodal::qwen_vl_mrope::Qwen25VlProcessorMedia;
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct Qwen25VlProcessedImage {
-    pub pixel_values: HostTensor,
-    pub grid: MropeGrid,
-}
-
 /// Ordered Qwen2.5-VL image processor output, concatenated in processor item order.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Qwen25VlProcessedImages {

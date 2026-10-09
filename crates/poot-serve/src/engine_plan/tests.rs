@@ -16,7 +16,7 @@ use poot_executor::{
 };
 use poot_graph_ir::ValidationOutputs;
 use poot_graph_plan::{Capability, StagedProgram, Submission, Target, TargetSet};
-use poot_llm::driver::{BackendChoice, ModelHandle};
+use poot_llm::driver::{BackendChoice, DraftPolicy, ModelHandle};
 use poot_quant::weights::{WeightMap, WeightStore};
 use poot_runtime_common::{CompiledKernel, MemoryCounterSnapshot, MemoryCounters};
 use poot_target::{AmdArch, Backend, DeviceCaps, Queried};
@@ -25,7 +25,6 @@ use super::*;
 use crate::admin::LoraAdminPolicy;
 use crate::http::{RateLimiter, handle};
 use crate::tests::{load_handle, test_metrics, write_tiny_gguf};
-use crate::types::Backend as ServedBackend;
 use poot_llm::driver::capacity::{CapacityRefusal, FitError, Observation};
 
 #[derive(Debug, thiserror::Error)]
@@ -101,7 +100,7 @@ impl Device for FixtureDevice {
     fn replay(&mut self, _recording: &()) -> Result<(), FixtureError> {
         Ok(())
     }
-    fn write(&mut self, _dst: &(), _bytes: &[u8]) -> Result<(), FixtureError> {
+    fn write(&mut self, _dst: &(), _offset: usize, _bytes: &[u8]) -> Result<(), FixtureError> {
         Ok(())
     }
     fn read(&mut self, _src: &(), _out: &mut [u8]) -> Result<(), FixtureError> {
@@ -223,6 +222,8 @@ fn args(backend: BackendChoice) -> EngineArgs {
         backend,
         rows: NonZeroUsize::new(4).unwrap(),
         max_seq: NonZeroUsize::new(64).unwrap(),
+        draft: DraftPolicy::Off,
+        embeds: false,
     }
 }
 
@@ -244,7 +245,7 @@ fn live_total(handle: &Arc<ModelHandle>, candidate: &Candidate) -> u64 {
     let mut driver = Driver::new(
         Arc::clone(handle),
         Box::new(executor),
-        driver_options(handle, candidate.max_seq),
+        driver_options(handle, candidate.max_seq, DraftPolicy::Off),
     )
     .expect("driver");
     let rows = [candidate.rows];
@@ -304,7 +305,7 @@ fn get_health(
     client
         .write_all(b"GET /health HTTP/1.1\r\n\r\n")
         .expect("write request");
-    let backend = ServedBackend::Decoder(Arc::clone(handle_model));
+    let (served, _queue) = crate::tests::served_over(Arc::clone(handle_model), 1);
     let metrics = test_metrics("health");
     let limiter = RateLimiter {
         rpm: 0,
@@ -312,7 +313,7 @@ fn get_health(
     };
     let policy = LoraAdminPolicy::from_configured_key(IpAddr::from([127, 0, 0, 1]), None)
         .expect("loopback policy");
-    handle(server, None, health, &backend, &metrics, &limiter, &policy).expect("handled");
+    handle(server, &served, health, &metrics, &limiter, &policy).expect("handled");
     let mut response = String::new();
     client.read_to_string(&mut response).expect("read response");
     let status = response.lines().next().unwrap_or_default().to_string();
@@ -493,15 +494,16 @@ fn every_candidates_planned_bytes_equal_a_real_preparation_without_reading_weigh
         let rows = [candidate.rows];
         let planned = planner
             .plan(
-                driver_options(&handle, candidate.max_seq),
+                driver_options(&handle, candidate.max_seq, DraftPolicy::Off),
                 &shapes_of(&candidate, &rows),
+                false,
             )
             .expect("plans");
         let (executor, _) = probe(spirv_target(), 0);
         let mut driver = Driver::new(
             Arc::clone(&handle),
             Box::new(executor),
-            driver_options(&handle, candidate.max_seq),
+            driver_options(&handle, candidate.max_seq, DraftPolicy::Off),
         )
         .unwrap();
         driver.prepare(&shapes_of(&candidate, &rows)).unwrap();
@@ -566,8 +568,9 @@ fn the_planned_footprints_match_the_numbers_the_full_load_pass_produced() {
         let r = [candidate.rows];
         let planned = planner
             .plan(
-                driver_options(&handle, candidate.max_seq),
+                driver_options(&handle, candidate.max_seq, DraftPolicy::Off),
                 &shapes_of(candidate, &r),
+                false,
             )
             .unwrap();
         let mut roles: Vec<String> = planned
@@ -604,7 +607,7 @@ fn startup_reads_the_weights_once_however_many_candidates_it_plans() {
         let mut driver = Driver::new(
             Arc::clone(&handle),
             Box::new(executor),
-            driver_options(&handle, chosen.max_seq),
+            driver_options(&handle, chosen.max_seq, DraftPolicy::Off),
         )
         .expect("driver");
         let rows = [chosen.rows];
@@ -650,7 +653,7 @@ fn loaded_kernels(handle: &Arc<ModelHandle>, candidate: &Candidate) -> HashSet<u
     let mut driver = Driver::new(
         Arc::clone(handle),
         Box::new(executor),
-        driver_options(handle, candidate.max_seq),
+        driver_options(handle, candidate.max_seq, DraftPolicy::Off),
     )
     .expect("driver");
     let rows = [candidate.rows];
@@ -683,8 +686,9 @@ fn a_planner_resolves_each_distinct_kernel_once_across_candidates() {
         let rows = [candidate.rows];
         planner
             .plan(
-                driver_options(&handle, candidate.max_seq),
+                driver_options(&handle, candidate.max_seq, DraftPolicy::Off),
                 &shapes_of(candidate, &rows),
+                false,
             )
             .expect("plans")
     };
@@ -811,7 +815,7 @@ fn admission_uses_the_fresh_budget_and_publishes_only_the_chosen_candidate() {
         let mut driver = Driver::new(
             Arc::clone(&handle),
             Box::new(reference),
-            driver_options(&handle, domain[k].max_seq),
+            driver_options(&handle, domain[k].max_seq, DraftPolicy::Off),
         )
         .expect("driver");
         let rows = [domain[k].rows];
@@ -968,7 +972,7 @@ fn a_lower_live_budget_than_the_open_time_figure_refuses_the_plan() {
     let mut oracle = Driver::new(
         Arc::clone(&handle),
         Box::new(executor),
-        driver_options(&handle, first.max_seq),
+        driver_options(&handle, first.max_seq, DraftPolicy::Off),
     )
     .unwrap();
     oracle.prepare(&shapes_of(&first, &[first.rows])).unwrap();
@@ -1004,7 +1008,11 @@ fn a_lower_live_budget_than_the_open_time_figure_refuses_the_plan() {
             };
             Planner::new(Arc::clone(&handle), &targets)
                 .unwrap()
-                .plan(driver_options(&handle, c.max_seq), &shapes_of(&c, &rows))
+                .plan(
+                    driver_options(&handle, c.max_seq, DraftPolicy::Off),
+                    &shapes_of(&c, &rows),
+                    false,
+                )
                 .unwrap()
                 .footprint
                 .device_bytes(device)
@@ -1094,8 +1102,9 @@ fn planned_weight_bytes_equal_the_stored_tensor_bytes() {
     let rows = [candidate.rows];
     let planned = planner
         .plan(
-            driver_options(&handle, candidate.max_seq),
+            driver_options(&handle, candidate.max_seq, DraftPolicy::Off),
             &shapes_of(&candidate, &rows),
+            false,
         )
         .expect("plans");
     let weight = |roles: Vec<(BufferRole, u64)>| {
@@ -1108,7 +1117,7 @@ fn planned_weight_bytes_equal_the_stored_tensor_bytes() {
     let mut driver = Driver::new(
         Arc::clone(&handle),
         Box::new(executor),
-        driver_options(&handle, candidate.max_seq),
+        driver_options(&handle, candidate.max_seq, DraftPolicy::Off),
     )
     .unwrap();
     driver.prepare(&shapes_of(&candidate, &rows)).unwrap();
@@ -1120,4 +1129,107 @@ fn planned_weight_bytes_equal_the_stored_tensor_bytes() {
         "planned vs live"
     );
     assert_eq!(live, oracle, "live vs the stored tensor sizes");
+}
+
+/// A Qwen3-Next fixture (gated delta rule layers beside attention) as an HF checkpoint directory the
+/// serve crate loads like any other model: recurrent state, the family the engine plan once refused to
+/// plan beyond one row.
+fn recurrent_handle() -> Arc<ModelHandle> {
+    let registry = poot_models::registry::Registry::builtin().unwrap();
+    let entry = registry
+        .entries()
+        .iter()
+        .find(|entry| entry.family.as_str() == "qwen3next")
+        .expect("the builtin qwen3next family");
+    let fixture = (entry.fixture)();
+    let dir = poot_test_util::unique_temp_path("poot_serve_qwen3next_fixture");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut config = fixture.config.clone();
+    config["eos_token_id"] = serde_json::json!(0);
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    poot_test_util::safetensors::write(&dir.join("model.safetensors"), &fixture.store);
+    let words: serde_json::Map<String, serde_json::Value> = (0..48)
+        .map(|i| (format!("w{i}"), serde_json::json!(i)))
+        .collect();
+    let tokenizer = serde_json::json!({
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": [],
+        "normalizer": null,
+        "pre_tokenizer": { "type": "WhitespaceSplit" },
+        "post_processor": null,
+        "decoder": null,
+        "model": { "type": "WordLevel", "vocab": words, "unk_token": "w0" },
+    });
+    std::fs::write(dir.join("tokenizer.json"), tokenizer.to_string()).unwrap();
+    Arc::new(
+        ModelHandle::load(&dir, &registry, &poot_llm::driver::LoadOptions::default())
+            .expect("load the qwen3next fixture"),
+    )
+}
+
+/// POOT-1074: the engine plan fits a recurrent family at more than one row, and the planned `State` bytes
+/// are the engine's own pool allocation: they grow by one row's bytes per sequence the pool serves, and do
+/// not depend on the step's row count. Planning is the real planner over the counting device.
+///
+/// Mutation: trace the pool at `shape.rows` instead of `seqs` in `Step::recurrent_state`; the pool no longer
+/// matches the sequences the driver admits (`check_state_rows` refuses it) and the plan fails.
+#[test]
+fn a_recurrent_family_plans_many_rows_and_its_state_bytes_grow_with_the_sequences() {
+    let handle = recurrent_handle();
+    let planner = Planner::new(
+        Arc::clone(&handle),
+        &probe(spirv_target(), 0).0.target_set(),
+    )
+    .unwrap();
+    let max_seq = NonZeroUsize::new(64).unwrap();
+    let state_bytes = |seqs: usize, rows: usize| -> u64 {
+        let pool = PoolShape {
+            blocks: NonZeroUsize::new(8).unwrap(),
+            max_seqs: NonZeroUsize::new(seqs).unwrap(),
+        };
+        let rows = [NonZeroUsize::new(rows).unwrap()];
+        let planned = planner
+            .plan(
+                driver_options(&handle, max_seq, DraftPolicy::Off),
+                &ServingShapes {
+                    layout: Layout::Paged(pool),
+                    rows: &rows,
+                    heads: &[Head::GREEDY],
+                    warm: Warm::Admitted,
+                    windows: &[],
+                    adapters: &[],
+                },
+                false,
+            )
+            .unwrap_or_else(|error| panic!("seqs {seqs} rows {rows:?}: {error}"));
+        planned
+            .footprint
+            .role_bytes(DeviceId(0))
+            .unwrap()
+            .into_iter()
+            .find(|&(role, _)| role == BufferRole::State)
+            .map_or(0, |(_, bytes)| bytes)
+    };
+    let (one, two, four) = (state_bytes(1, 1), state_bytes(2, 2), state_bytes(4, 2));
+    assert!(two > one, "a second sequence adds a row: {one} -> {two}");
+    assert_eq!(
+        four - one,
+        3 * (two - one),
+        "state grows by one row's bytes per sequence: {one}, {two}, {four}"
+    );
+    assert_eq!(
+        state_bytes(4, 4),
+        four,
+        "the step's row count does not size the state"
+    );
+
+    let args = args(BackendChoice::Wgpu);
+    let (executor, _) = probe(spirv_target(), 0);
+    let health = EngineHealth::starting();
+    let (started, _) = build_with(&args, &handle, executor, roomy, &health);
+    let started = started.expect("the recurrent family starts");
+    let Workload::Generate { rows, .. } = started.plan.workload;
+    assert!(rows.get() > 1, "the fitted plan serves {rows} rows");
 }

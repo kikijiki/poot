@@ -149,10 +149,22 @@ pub trait Device {
     /// returns `Some` unconditionally: nothing has run on the device yet, regardless of
     /// `submission`.
     fn finish(&mut self) -> Result<Option<Self::Recording>, Self::Error>;
+    /// Start a step's replays: called once per step, before the first of its (one per stage)
+    /// [`Self::replay`] calls. A backend resets whatever it accumulates per step here (device-timing
+    /// records), so a step that failed before `device_time` drained them cannot leak into this one
+    /// and the replays of a multi-stage step accumulate instead of overwriting each other.
+    fn begin_step(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    /// Submit one recording. A step replays one recording per stage, in stage order, between one
+    /// [`Self::begin_step`] and one [`Self::synchronize`].
     fn replay(&mut self, recording: &Self::Recording) -> Result<(), Self::Error>;
 
-    /// Overwrite all of `dst` with `bytes`, ordered before the next submitted step.
-    fn write(&mut self, dst: &Self::Buffer, bytes: &[u8]) -> Result<(), Self::Error>;
+    /// Overwrite `bytes.len()` bytes of `dst` from byte `offset` with `bytes`, ordered before the next
+    /// submitted step. A range outside `dst` is a device error. A device that writes whole words
+    /// (wgpu) takes a non-zero `offset` and `bytes.len()` in multiples of four.
+    fn write(&mut self, dst: &Self::Buffer, offset: usize, bytes: &[u8])
+    -> Result<(), Self::Error>;
     /// Read all of `src` into `out` after every submitted step finishes.
     fn read(&mut self, src: &Self::Buffer, out: &mut [u8]) -> Result<(), Self::Error>;
     /// Wait for the submitted work and raise any staged kernel-assert fault (Card 531c).

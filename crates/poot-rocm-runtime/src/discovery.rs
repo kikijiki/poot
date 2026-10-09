@@ -435,3 +435,29 @@ pub(crate) fn cstr_to_string(buf: &[c_char]) -> String {
     let bytes: Vec<u8> = buf[..nul].iter().map(|&b| b as u8).collect();
     String::from_utf8_lossy(&bytes).into_owned()
 }
+
+/// Turn on `queue`'s dispatch profiler and read the system-timestamp frequency that converts its
+/// ticks, for a context built with [`RocmContextOptions::device_timing`].
+///
+/// # Safety
+///
+/// `queue` must be the live queue created from `funcs`' runtime, with no packet in flight.
+pub(crate) unsafe fn enable_device_timing(
+    funcs: &Funcs,
+    queue: *mut hsa_queue_t,
+) -> Result<DeviceTiming, RocmError> {
+    let mut ticks_per_second: u64 = 0;
+    // SAFETY: `HSA_SYSTEM_INFO_TIMESTAMP_FREQUENCY` writes one `uint64_t` into `ticks_per_second`; the
+    // queue is live (caller contract).
+    unsafe {
+        check((funcs.hsa_system_get_info)(
+            bindings::HSA_SYSTEM_INFO_TIMESTAMP_FREQUENCY,
+            &mut ticks_per_second as *mut u64 as *mut c_void,
+        ))?;
+        check((funcs.hsa_amd_profiling_set_profiler_enabled)(queue, 1))?;
+    }
+    Ok(DeviceTiming {
+        ticks_per_second,
+        spans: Mutex::default(),
+    })
+}

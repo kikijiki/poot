@@ -280,6 +280,22 @@ impl RocmContext {
             });
             return Err(error);
         }
+        let device_timing = if options.device_timing {
+            // SAFETY: `queue` is the queue just created and validated, with nothing enqueued.
+            match unsafe { enable_device_timing(&hsa.funcs, queue) } {
+                Ok(timing) => Some(timing),
+                Err(error) => {
+                    // SAFETY: the queue was just created and never used, so it is destroyed once with
+                    // no packet in flight.
+                    let _ = destroy_queue_reference(&mut queue, |acquired| unsafe {
+                        (hsa.funcs.hsa_queue_destroy)(acquired)
+                    });
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         if let Some(receipt) = device_ring_receipt.as_mut() {
             receipt.queue_type_returned = q_layout.r#type;
             receipt.queue_features = q_layout.features;
@@ -330,7 +346,10 @@ impl RocmContext {
             vram_total_bytes,
             compute_units,
             timeouts: TimeoutLeaks::default(),
+            pending: Mutex::default(),
+            batch_waits: Arc::default(),
             wait_timeout: options.wait_timeout,
+            device_timing,
         })
     }
 
@@ -423,6 +442,7 @@ impl RocmContext {
             "dma_copy",
             Held {
                 staging: Some(staging),
+                ..Held::default()
             },
         )?;
         Ok(held
@@ -849,17 +869,22 @@ impl RocmContext {
         )
     }
 
-    /// Overwrite the first `bytes.len()` bytes of `buf`, through whichever pool it was allocated from
+    /// Overwrite `bytes.len()` bytes of `buf` from byte `offset`, through whichever pool it was allocated from
     /// (Card 547a: the storage-typed, dtype-agnostic write the executor contract's memory service
     /// needs, instead of one allocator/writer per dtype; mirrors `poot_runtime::Context::write_bytes`).
-    pub fn write_bytes(&self, buf: &RocmBuffer, bytes: &[u8]) -> Result<(), RocmError> {
-        let range = checked_byte_range("write_bytes", buf, bytes.len())?;
-        // SAFETY: `range` proved `bytes.len()` lies inside `buf`'s live allocation.
+    pub fn write_bytes(
+        &self,
+        buf: &RocmBuffer,
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), RocmError> {
+        let range = checked_byte_range("write_bytes", buf, offset, bytes.len())?;
+        // SAFETY: `range` proved `offset..offset + bytes.len()` lies inside `buf`'s live allocation.
         unsafe {
             self.upload_bytes_role_aware(
                 buf.pool(),
                 bytes.as_ptr(),
-                buf.alloc.as_ptr(),
+                buf.alloc.as_ptr().byte_add(range.byte_offset),
                 range.byte_len,
             )
         }
@@ -868,7 +893,7 @@ impl RocmContext {
     /// Read the first `out.len()` bytes of `buf` into `out`, through whichever pool it was allocated
     /// from (Card 547a). Synchronizes first so any queued kernel that wrote the buffer has completed.
     pub fn read_bytes(&self, buf: &RocmBuffer, out: &mut [u8]) -> Result<(), RocmError> {
-        let range = checked_byte_range("read_bytes", buf, out.len())?;
+        let range = checked_byte_range("read_bytes", buf, 0, out.len())?;
         self.synchronize()?;
         // SAFETY: `range` proved `out.len()` lies inside `buf`'s live allocation, and the queue is
         // drained.
@@ -887,6 +912,8 @@ impl RocmContext {
     /// signal-based capture/replay sync (`HSA_WAIT_STATE_BLOCKED` + doorbell) is a superset.
     pub fn synchronize(&self) -> Result<(), RocmError> {
         self.ensure_not_poisoned("synchronize")?;
+        // The one host wait for everything enqueued since the last synchronize.
+        self.complete_pending("synchronize")?;
         // Typed construction-time bound (Card 548), matching `wait_completion_bounded`.
         let timeout = self.wait_timeout.as_secs();
         // SAFETY: `queue` is the context's live queue (a `RocmContext` invariant); the index calls only

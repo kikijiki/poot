@@ -6,13 +6,13 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use poot_graph_ir::{Graph, OpKind, Slot, Storage, ValidationChannel};
+use poot_graph_ir::{Graph, OpKind, ValidationChannel};
 use poot_graph_plan::{WeightFormats, bind_packed_weights};
 use poot_load::gguf::{GgufIndex, GgufValue, IdentityNames, read_gguf, write_gguf};
 use poot_quant::SourceRole;
 use poot_quant::format::WeightFormat;
 use poot_quant::weights::{
-    AttnRole, DenseWeight, FfnRole, HandleFormat, WeightEntry, WeightMap, WeightRole, WeightStore,
+    AttnRole, DenseWeight, FfnRole, HandleFormat, WeightEntry, WeightRole, WeightStore,
 };
 use poot_tensor::DType;
 
@@ -139,121 +139,6 @@ pub(crate) fn declared_dtype<V: ValidationChannel>(g: &Graph<V>, name: &str) -> 
         .iter()
         .find(|&&id| g.meta(id).name.as_deref() == Some(name))
         .map(|&id| g.aval(id).dtype)
-}
-
-/// What a legacy tracer's graph reads that the store does not hold under the same name: named
-/// host constants (its RoPE tables, its ALiBi slopes).
-pub(crate) type HostConsts<'a> = &'a [(&'a str, Vec<f32>)];
-
-/// Evaluate a legacy tracer's graph over a transposed copy of `store` (the const map
-/// is built here, in the test module). The legacy tracers read HF names, every 2-D weight but the
-/// ones in `untransposed` pre-transposed to `[in, out]`, and `host` constants by name.
-pub(crate) fn legacy_eval(
-    g: &Graph,
-    store: &WeightStore,
-    host: HostConsts<'_>,
-    untransposed: &[&str],
-    tokens: &[i32],
-    pos: &[i32],
-    state: &[Vec<f32>],
-) -> (Vec<f32>, Vec<Vec<f32>>) {
-    let mut consts: Vec<(String, Vec<f32>)> = Vec::new();
-    for &id in &g.inputs {
-        let meta = g.meta(id);
-        if meta.storage != Storage::Const {
-            continue;
-        }
-        let name = meta.name.clone().unwrap();
-        let v = match host.iter().find(|(n, _)| *n == name) {
-            Some((_, v)) => v.clone(),
-            None => {
-                let entry = store
-                    .get(&name)
-                    .unwrap_or_else(|| panic!("no fixture tensor {name}"));
-                let (shape, v) = (entry.shape(), values(entry));
-                if shape.len() == 2 && !untransposed.contains(&name.as_str()) {
-                    let (rows, cols) = (shape[0], shape[1]);
-                    (0..rows * cols)
-                        .map(|i| v[(i % rows) * cols + i / rows])
-                        .collect()
-                } else {
-                    v
-                }
-            }
-        };
-        consts.push((name, v));
-    }
-    let consts: Vec<(&str, &[f32])> = consts
-        .iter()
-        .map(|(n, v)| (n.as_str(), v.as_slice()))
-        .collect();
-    let zeros: Vec<Vec<f32>> = g
-        .state
-        .iter()
-        .map(|&(si, _)| vec![0.0; g.aval(si).numel()])
-        .collect();
-    let state: Vec<&[f32]> = if state.is_empty() { &zeros } else { state }
-        .iter()
-        .map(Vec::as_slice)
-        .collect();
-    oracle::eval(
-        g,
-        store,
-        &WeightMap::default(),
-        &consts,
-        &[(Slot::Token, tokens), (Slot::Pos, pos)],
-        &state,
-    )
-}
-
-/// A step's logits and its carried state, as f32.
-pub(crate) type StepOutput = (Vec<f32>, Vec<Vec<f32>>);
-
-/// Evaluate a legacy graph on `(tokens, positions, state)`.
-pub(crate) type LegacyEval<'a> = dyn Fn(&Graph, &[i32], &[i32], &[Vec<f32>]) -> StepOutput + 'a;
-
-/// A legacy tracer pair and how to evaluate it: the prefill graph of the first `n` tokens (from
-/// position 0), the one decode graph, and an evaluator over each.
-pub(crate) struct Legacy<'a> {
-    pub prefill: &'a dyn Fn(usize) -> Graph,
-    pub decode: &'a Graph,
-    pub eval: &'a LegacyEval<'a>,
-}
-
-/// SC-002 (ADR-0101 tiers 1 and 2, spec 999 SC-003): on `store`, the new body's prefill logits at
-/// every position and its carried KV equal the legacy prefill tracer (each prefix's last logits),
-/// and three decode steps equal the legacy decode tracer, logits and every KV element, each path
-/// carrying its own caches.
-pub(crate) fn assert_matches_legacy(model: &dyn Model, store: &WeightStore, legacy: &Legacy<'_>) {
-    let vocab = model.config().vocab;
-    let prompt = [3, 17, 40, 8, 25];
-    let (logits, mut state) = run_step(model, store, Phase::Prefill, CAP, &prompt, 0, &[]);
-    let mut legacy_state = Vec::new();
-    for n in 1..=prompt.len() {
-        let pos: Vec<i32> = (0..n as i32).collect();
-        let g = (legacy.prefill)(n);
-        let (old, old_state) = (legacy.eval)(&g, &prompt[..n], &pos, &[]);
-        close(&logits[(n - 1) * vocab..n * vocab], &old);
-        if !g.state.is_empty() {
-            legacy_state = old_state;
-        }
-    }
-    if legacy_state.is_empty() {
-        // The legacy prefill carries no KV: its caches are the legacy decode over the prompt.
-        for (i, &token) in prompt.iter().enumerate() {
-            legacy_state = (legacy.eval)(legacy.decode, &[token], &[i as i32], &legacy_state).1;
-        }
-    }
-    close_all(&state, &legacy_state);
-
-    for (i, token) in [11, 30, 2].into_iter().enumerate() {
-        let pos = (prompt.len() + i) as i32;
-        let (new, new_state) = run_step(model, store, Phase::Decode, CAP, &[token], pos, &state);
-        let (old, old_state) = (legacy.eval)(legacy.decode, &[token], &[pos], &legacy_state);
-        close(&new, &old);
-        close_all(&new_state, &old_state);
-        (state, legacy_state) = (new_state, old_state);
-    }
 }
 
 /// The five largest logits of one step as `(token id, logit)`, largest first.

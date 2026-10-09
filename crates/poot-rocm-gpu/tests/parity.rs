@@ -253,3 +253,25 @@ fn bf16_const_cast_is_bit_exact_on_rocm() {
         poot_executor_parity::bf16_cast::assert_bit_exact(fixture, &got[0], &oracle);
     }
 }
+
+/// POOT-1074: a recurrent state pool addressed by slot (rows in any order, a masked row committing
+/// nothing) and `reset_state(Row(n))` zeroing exactly pool row `n`, on ROCm; a row outside the pool is a
+/// typed `StateRow` refusal that zeroes nothing.
+/// The pool runs over F32 and over I32 (the PLE token history), and a `Positional` counter beside it must
+/// survive every `Row`; the I32 run puts values above 2^24 in the pool, so it also proves the pool stays on
+/// the exact lane. Mutations: write the row at offset 0 instead of `row * bytes` in `Engine::reset_state`
+/// (the rows after `Row(2)` continue from slot 2's old state); let `Row` zero every state (the counter
+/// resets); drop the fixture's own `b.scatter_update` for the I32 pool (`state_row.rs`; the pool never
+/// changes); pin the I32 values to the F32 mirror lane (`required` always false in
+/// `ExactI32StorageAnalysis::new`; `2^24 + 1` reads back as `2^24`). `Step::carry_recurrent`'s I32 path is
+/// guarded by `served_qwen4exp_*`, not by this row.
+#[test]
+fn state_pool_rows_reset_independently_on_rocm() {
+    let Some(device) = open_or_skip(DeviceBackend::Rocm, RocmDevice::new()) else {
+        return;
+    };
+    let t = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    poot_executor_parity::state_row::run_state_pool_row_reset(exec.as_mut(), t)
+        .unwrap_or_else(|e| panic!("{e}"));
+}

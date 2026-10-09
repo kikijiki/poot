@@ -24,7 +24,7 @@ use poot_models::registry::Registry;
 use serde_json::Value;
 
 /// The config keys that carry a family's decoder (or encoder) layer count.
-const LAYER_COUNT_KEYS: &[&str] = &["num_hidden_layers", "n_layer", "n_layers"];
+const LAYER_COUNT_KEYS: &[&str] = &["num_hidden_layers", "n_layer", "n_layers", "depth"];
 
 /// The layer count a fixture's config declares: its layer-count key at the top level, else inside the
 /// nested text or vision config.

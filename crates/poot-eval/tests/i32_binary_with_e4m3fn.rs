@@ -27,7 +27,7 @@ fn build_graph() -> (Graph, ValueId, ValueId) {
     g.values.push(ValueMeta::new(
         TensorType::new(vec![1], DType::E4M3FN),
         Storage::Const,
-        Some("card423_test.e4m3_dummy".to_string()),
+        Some("i32_binary_test.e4m3_dummy".to_string()),
     ));
     g.inputs.push(e4m3_id);
     g.consts.push(e4m3_id);

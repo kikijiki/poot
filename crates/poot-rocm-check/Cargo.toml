@@ -1,6 +1,6 @@
 [package]
 name = "poot-rocm-check"
-description = "Standalone ROCm/HSA execution check (card 106 M1, 106b): load poot-emitted HSACO via poot-rocm-runtime and verify against the CPU oracle"
+description = "Standalone ROCm/HSA execution check: load poot-emitted HSACO via poot-rocm-runtime and verify against the CPU oracle"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -15,6 +15,10 @@ poot-rocm-runtime.workspace = true
 poot-target.workspace = true
 poot-runtime-common.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# The probe binary runs as a contained child of its test (POOT-1085).
+poot-test-util.workspace = true
 
 [[bin]]
 name = "poot-rocm-check"

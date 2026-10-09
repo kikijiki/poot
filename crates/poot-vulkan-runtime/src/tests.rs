@@ -344,6 +344,7 @@ fn mock_context(fail_at: Option<FailPoint>) -> (Context, Arc<MockDispatch>) {
                 compute_units: poot_target::STRIX_HALO_COMPUTE_UNITS,
                 memory_budget_bytes: None,
             },
+            memory_budget: false,
             pipeline_cache: HashMap::new(),
             pipeline_builds: 0,
             graphs_recorded: AtomicUsize::new(0),
@@ -461,7 +462,7 @@ fn buffer_and_clone_outlive_context_and_readback_does_not_alias_writes() {
     let (context, mock) = mock_context(None);
     let buffer = mock_buffer(&context, 3 * size_of::<f32>()).expect("mock allocation");
     buffer
-        .write_bytes(&f32_bytes(&[1.0, 2.0, 3.0]))
+        .write_bytes(0, &f32_bytes(&[1.0, 2.0, 3.0]))
         .expect("write");
     let clone = buffer.clone();
     let snapshot: Vec<f32> = read_f32_bytes(&buffer).expect("read back");
@@ -470,7 +471,7 @@ fn buffer_and_clone_outlive_context_and_readback_does_not_alias_writes() {
     assert!(!mock.events().contains(&"destroy_device"));
 
     clone
-        .write_bytes(&f32_bytes(&[4.0, 5.0, 6.0]))
+        .write_bytes(0, &f32_bytes(&[4.0, 5.0, 6.0]))
         .expect("write");
     assert_eq!(snapshot, [1.0, 2.0, 3.0]);
     assert_eq!(read_f32_bytes(&buffer).expect("read back"), [4.0, 5.0, 6.0]);
@@ -716,7 +717,7 @@ fn failed_fence_wait_after_submit_poisons_and_leaks_everything() {
         Err(RuntimeError::Poisoned { op: "read_bytes" })
     ));
     assert!(matches!(
-        buffer.write_bytes(&[0u8; 4]),
+        buffer.write_bytes(0, &[0u8; 4]),
         Err(RuntimeError::Poisoned { op: "write_bytes" })
     ));
     assert!(matches!(
@@ -1022,10 +1023,6 @@ fn vulkan_context_open_is_required_by_its_own_variable_only() {
         .is_err()
     };
     assert!(fails_open(DeviceBackend::Vulkan.variable()));
-    assert!(
-        !fails_open("POOT_REQUIRE_GPU"),
-        "the retired all-backend switch must not require Vulkan"
-    );
     for other in DeviceBackend::ALL
         .into_iter()
         .filter(|other| *other != DeviceBackend::Vulkan)
@@ -1035,4 +1032,26 @@ fn vulkan_context_open_is_required_by_its_own_variable_only() {
             "{other:?} must not require Vulkan"
         );
     }
+}
+
+/// POOT-1074: a write at a non-zero byte offset lands there and leaves its neighbours intact; an offset
+/// outside the buffer and an overflowing one are typed refusals that write nothing.
+/// Mutation: write at offset 0 in `DeviceBuffer::write_bytes_at`; the neighbour check goes red.
+#[test]
+fn a_write_at_an_offset_leaves_its_neighbours_intact_and_bad_ranges_are_typed() {
+    let (context, _mock) = mock_context(None);
+    let buffer = mock_buffer(&context, 4 * size_of::<f32>()).expect("mock allocation");
+    buffer
+        .write_bytes(0, &f32_bytes(&[1.0, 2.0, 3.0, 4.0]))
+        .unwrap();
+    buffer.write_bytes(4, &f32_bytes(&[9.0, 9.0])).unwrap();
+    assert_eq!(read_f32_bytes(&buffer).unwrap(), [1.0, 9.0, 9.0, 4.0]);
+    for (offset, len) in [(16, 4), (12, 8), (usize::MAX, 4)] {
+        let error = buffer.write_bytes(offset, &vec![0u8; len]).unwrap_err();
+        assert!(
+            matches!(error, RuntimeError::WriteCapacity { .. }),
+            "offset {offset} len {len}: {error:?}"
+        );
+    }
+    assert_eq!(read_f32_bytes(&buffer).unwrap(), [1.0, 9.0, 9.0, 4.0]);
 }

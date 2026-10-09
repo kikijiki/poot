@@ -5,6 +5,7 @@ on:
     branches: [master]
     paths:
       - website/**
+      - scripts/site-*
       - .github/workflows/cd-docs.yml
   workflow_dispatch:
 
@@ -38,6 +39,12 @@ jobs:
         run: bun run typecheck
       - name: Build
         run: bun run build
+      - name: Stale names
+        working-directory: .
+        run: scripts/site-stale-names.sh
+      - name: Card numbers
+        working-directory: .
+        run: scripts/site-card-numbers.sh
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v4
         with:

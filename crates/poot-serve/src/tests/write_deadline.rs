@@ -84,22 +84,22 @@ fn write_deadline_bounds_normal_http_response_to_never_reading_client() {
     drop(client);
 }
 
-/// The claim is one write deadline, not a wall-clock budget: after the held-tail write saturates, the
-/// handler gives up on the FIRST timeout instead of retrying finalization frames, each of which would
-/// cost another `write_timeout`. So the assertion counts the frame writes `write_sse_data` recorded on
-/// the handler thread ([`sse_write_probe`]) and checks that the single attempt actually blocked on the
-/// deadline. Elapsed time from handler start also carries work the deadline does not govern (encoding,
-/// serializing the held tail), which is what made a start-to-exit budget fail on a loaded box.
+/// The claim is one write deadline, not a wall-clock budget: after a streamed piece's write saturates,
+/// the handler gives up on the FIRST timeout instead of retrying later frames (an error event, finish
+/// chunks, the receipt), each of which would cost another `write_timeout`. So the assertion counts the
+/// frame writes `write_sse_data` recorded on the handler thread ([`sse_write_probe`]) and checks that
+/// the single attempt actually blocked on the deadline. Elapsed time from handler start also carries
+/// work the deadline does not govern (encoding, serializing the piece), which is what made a
+/// start-to-exit budget fail on a loaded box. A client that cannot be written to is cancelled, which
+/// writes nothing more.
 #[cfg(unix)]
 #[test]
-fn write_deadline_bounds_production_stream_finalization_after_held_tail_saturates() {
+fn write_deadline_bounds_production_stream_after_a_piece_saturates() {
     // The deadline must stay long enough that "the attempt blocked" separates a real timeout from an
     // instant transport error, and short enough to keep one saturated attempt cheap in the suite.
     let write_timeout = Duration::from_millis(300);
     let completion_budget = Duration::from_secs(3);
-    let model_path = write_tiny_gguf();
-    let runner = load_handle(&model_path);
-    let _ = std::fs::remove_file(&model_path);
+    let runner = tiny_model();
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind finalization fixture");
     let addr = listener.local_addr().expect("finalization fixture address");
@@ -109,33 +109,24 @@ fn write_deadline_bounds_production_stream_finalization_after_held_tail_saturate
     set_write_deadline_socket_buffer(&server, libc::SO_SNDBUF);
     configure_response_writes(&server, write_timeout).expect("configure finalization timeout");
 
-    let held_tail = "x".repeat(8 * 1024 * 1024);
-    let stop = format!("{held_tail}y");
+    let piece = "x".repeat(8 * 1024 * 1024);
     let req: CompletionReq = serde_json::from_value(serde_json::json!({
         "prompt": "a",
         "max_tokens": 1,
         "stream": true,
-        "stop": stop,
     }))
     .expect("finalization request");
     let metrics = Arc::new(test_metrics("write-finalization"));
     let live_connections = Arc::new(AtomicUsize::new(1));
     let handler_connections = Arc::clone(&live_connections);
-    let handler_runner = Arc::clone(&runner);
     let handler_metrics = Arc::clone(&metrics);
-    let (job_tx, job_rx) = mpsc::channel::<Job>();
+    let (served, job_rx) = served_over(runner, 1);
     let (done_tx, done_rx) = mpsc::channel();
     let handler = std::thread::spawn(move || {
         let result = {
             let _guard = ConnGuard(handler_connections);
             let mut server = server;
-            stream_completion(
-                &mut server,
-                Some(&job_tx),
-                &handler_runner,
-                &handler_metrics,
-                &req,
-            )
+            stream_completion(&mut server, &served, &handler_metrics, &req)
         };
         // The probe is thread-local, so it is read here: this thread recorded the writes.
         let (attempts, blocked) = sse_write_probe::summary();
@@ -144,26 +135,31 @@ fn write_deadline_bounds_production_stream_finalization_after_held_tail_saturate
             .expect("report finalization result");
     });
 
-    let job = job_rx
+    let EngineMsg::Generate(job) = job_rx
         .recv_timeout(completion_budget)
-        .expect("production handler submits finalization job");
+        .expect("production handler submits finalization job")
+    else {
+        panic!("a stream handler sends a generation job");
+    };
     job.reply
-        .send(GenEvent::Token(held_tail, terminal_token_info()))
-        .expect("send held tail");
-    job.reply
-        .send(GenEvent::Done(vec![1], vec![], false))
-        .expect("send generation Done");
+        .send(GenEvent::Token(piece, terminal_token_info()))
+        .expect("send the piece");
+    // The handler gives up on the piece and drops its subscription: later sends may find no receiver.
+    let _ = job.reply.send(GenEvent::Done(Completion {
+        prompt_tokens: 1,
+        tokens: vec![1],
+        text: String::new(),
+        logprobs: vec![],
+        finish: FinishReason::Length,
+    }));
 
     let (result, attempts, blocked) = done_rx
         .recv_timeout(completion_budget)
-        .expect("production handler terminates after first finalization timeout");
-    assert!(
-        result.is_err(),
-        "the held-tail write must saturate and fail"
-    );
+        .expect("production handler terminates after the first write timeout");
+    result.expect("a client that cannot be written to is cancelled, which writes nothing more");
     assert_eq!(
         attempts, 1,
-        "finalization must attempt exactly one frame write after the held tail saturates \
+        "the handler must attempt exactly one frame write after the piece saturates \
          (attempts={attempts}, blocked={blocked:?}): every retry costs another {write_timeout:?} \
          write timeout"
     );

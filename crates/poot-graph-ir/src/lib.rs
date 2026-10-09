@@ -33,10 +33,11 @@ pub use error::{
     ShapeError,
 };
 pub use graph::{
-    ComputedConst, Eqn, ExecutionValidationFailure, Graph, LayerIndex, LayerRuns, LayerTagError,
-    MAX_VALIDATION_PACKET_BYTES, NoValidations, Operand, Slot, SlotKey, StatePair, StateRole,
-    Storage, ValidationChannel, ValidationId, ValidationOutput, ValidationOutputs,
-    ValidationPacketEntry, ValidationPacketError, ValidationPacketLayout, ValueId, ValueMeta,
+    BoundaryId, ComputedConst, Eqn, ExecutionValidationFailure, Export, Graph, LayerIndex,
+    LayerRuns, LayerTagError, MAX_VALIDATION_PACKET_BYTES, NoValidations, Operand, Slot, SlotKey,
+    StatePair, StateRole, Storage, ValidationChannel, ValidationId, ValidationOutput,
+    ValidationOutputs, ValidationPacketEntry, ValidationPacketError, ValidationPacketLayout,
+    ValueId, ValueMeta,
 };
 pub use index_guard::{
     GuardedIndex, IndexBoundsGuard, IndexGuardError, IndexGuardRejection,

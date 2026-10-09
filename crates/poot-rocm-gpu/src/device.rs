@@ -4,10 +4,11 @@
 //! A recording is a list of [`CapturedAql`] packets. `begin` opens it; `dispatch`/`copy` each build a
 //! kernarg buffer and append one packet, compiling the kernel on first use and never touching the
 //! device (no HSA dispatch, no wait); `finish` hands the list to the caller as a [`RocmRecording`].
-//! `replay` is the one method that actually touches hardware: it batches every packet into one
-//! [`poot_rocm_runtime::RocmContext::replay_graph_batched`] call, which rings the doorbell once per
-//! chunk and blocks on the last packet's completion signal, so by the time `replay` returns `Ok` the
-//! work is already done (`synchronize` is a defensive second wait, not the real one).
+//! `replay` is the one method that submits to hardware: it batches every packet into one
+//! [`poot_rocm_runtime::RocmContext::enqueue_graph_batched`] call, which rings the doorbell once per
+//! chunk and returns without waiting. A step's stages enqueue back to back (each batch orders after
+//! the last behind the AQL barrier), and `synchronize` is the one host wait, on the newest batch's
+//! completion signal.
 //!
 //! `Device::copy` has no native ROCm primitive to record into the same AQL stream (HSA's async-copy
 //! engine is a separate queue with its own signal, not an AQL packet this recording's BARRIER-ordered
@@ -21,10 +22,15 @@
 
 use std::sync::Arc;
 
-use poot_executor::{Arg, BufferRole, Device, DeviceTime, Dispatch, MemoryCounterSnapshot};
+use poot_executor::{
+    Arg, BufferRole, Device, DeviceTime, Dispatch, DispatchDeviceTime, MeasuredDeviceTime,
+    MemoryCounterSnapshot,
+};
 use poot_graph_plan::{ImportedKernel, Submission, Target};
 use poot_kernel_ir::Body;
-use poot_rocm_runtime::{HsacoModule, KernelHandle, RocmBuffer, RocmContext};
+use poot_rocm_runtime::{
+    DispatchSpan, HsacoModule, KernelHandle, RocmBuffer, RocmContext, RocmContextOptions,
+};
 use poot_runtime_common::CompiledKernel;
 use poot_target::{AmdArch, Backend, BufferStorage, ElementKind};
 
@@ -53,7 +59,7 @@ struct CapturedAql {
     block: (u32, u32, u32),
 }
 
-/// One flattened entry of [`poot_rocm_runtime::RocmContext::replay_graph_batched`]'s dispatch list.
+/// One flattened entry of [`poot_rocm_runtime::RocmContext::enqueue_graph_batched`]'s dispatch list.
 type BatchedDispatch = (KernelHandle, RocmBuffer, (u32, u32, u32), (u32, u32, u32));
 
 pub struct RocmRecording {
@@ -76,6 +82,17 @@ pub struct RocmDevice {
 impl RocmDevice {
     pub fn new() -> Result<Self, RocmGpuError> {
         Self::from_context(RocmContext::new()?)
+    }
+
+    /// Like [`Self::new`], but the queue's profiler is on and every replayed dispatch carries its own
+    /// completion signal, so [`Device::device_time`] is `Measured` from the dispatches' HSA
+    /// timestamps. The per-packet signals cost one create, read and destroy per dispatch, so a timed
+    /// device is diagnostic, not throughput evidence.
+    pub fn new_with_device_timing() -> Result<Self, RocmGpuError> {
+        Self::from_context(RocmContext::new_with_options(RocmContextOptions {
+            device_timing: true,
+            ..RocmContextOptions::default()
+        })?)
     }
 
     pub fn from_context(ctx: RocmContext) -> Result<Self, RocmGpuError> {
@@ -321,6 +338,11 @@ impl Device for RocmDevice {
         Ok(Some(RocmRecording { aqls }))
     }
 
+    fn begin_step(&mut self) -> Result<(), RocmGpuError> {
+        self.ctx.clear_dispatch_spans();
+        Ok(())
+    }
+
     fn replay(&mut self, recording: &RocmRecording) -> Result<(), RocmGpuError> {
         if recording.aqls.is_empty() {
             return Ok(());
@@ -332,12 +354,12 @@ impl Device for RocmDevice {
             .collect();
         let elements: Vec<&[ElementKind]> =
             recording.aqls.iter().map(|aql| &*aql.elements).collect();
-        self.ctx.replay_graph_batched(&dispatches, &elements)?;
+        self.ctx.enqueue_graph_batched(&dispatches, &elements)?;
         Ok(())
     }
 
-    fn write(&mut self, dst: &RocmBuffer, bytes: &[u8]) -> Result<(), RocmGpuError> {
-        Ok(self.ctx.write_bytes(dst, bytes)?)
+    fn write(&mut self, dst: &RocmBuffer, offset: usize, bytes: &[u8]) -> Result<(), RocmGpuError> {
+        Ok(self.ctx.write_bytes(dst, offset, bytes)?)
     }
 
     fn read(&mut self, src: &RocmBuffer, out: &mut [u8]) -> Result<(), RocmGpuError> {
@@ -345,27 +367,27 @@ impl Device for RocmDevice {
     }
 
     fn synchronize(&mut self) -> Result<(), RocmGpuError> {
-        // `replay_graph_batched` already blocked on the batch's completion signal (the module doc);
-        // this is a defensive second wait (the queue read-index spin), never the real one. Still the
-        // right place for a timeout to surface if it ever does: it classifies the same way a replay
-        // failure does (CR30: abort, mark NeedsReset).
+        // The step's one host wait (the module doc): it completes every batch `replay` enqueued, and
+        // a timeout surfaces here, classified the way a replay failure is (CR30: abort, mark
+        // NeedsReset).
         Ok(self.ctx.synchronize()?)
     }
 
+    /// The dispatches the step's `synchronize` completed, from the HSA profiler's start/end ticks
+    /// (POOT-1079). `Unknown` for a device not built with [`Self::new_with_device_timing`], or a step
+    /// that completed no dispatch - never host wall, never a fabricated zero (Card 552).
     fn device_time(&self) -> DeviceTime {
-        // Card 552's SC-001 (moved to Card 548): no HSA timestamp binding exists yet, so
-        // ROCm reports `Unknown` from day one - never host wall. A real-timestamp follow-up is
-        // recorded, not this card's scope.
-        DeviceTime::Unknown
+        measured(&self.ctx.dispatch_spans())
     }
 
     fn abort(&mut self) -> Result<(), RocmGpuError> {
-        // Recording never touches the device (see the module doc): an eager replay's already-
-        // submitted batch cannot be undone, but `replay` either fully completes (the batch blocks on
-        // the last packet's signal) or returns a typed error the engine already treats as a failed
-        // transaction - there is no partial, still-running state to clean up here. `begin` panics
-        // (not errors) on a double-open, so `self.open` is the only Rust-level state abort must clear.
+        // Recording never touches the device (see the module doc). Batches an earlier stage of the
+        // failed step enqueued are still in flight and read its buffers, so abort completes them
+        // before the engine releases anything. `begin` panics (not errors) on a double-open, so
+        // `self.open` is the only other Rust-level state abort must clear.
         self.open = None;
+        self.ctx.clear_dispatch_spans();
+        let drained = self.ctx.synchronize();
         // CR30: a failed replay/synchronize that timed out already poisoned the underlying
         // `RocmContext` (Card 602's `TimeoutLeaks`) - no later submission on it can ever run again.
         // Reporting that here, rather than returning `Ok` unconditionally, is what lets `Engine` set
@@ -374,8 +396,31 @@ impl Device for RocmDevice {
         if self.ctx.is_poisoned() {
             return Err(poot_rocm_runtime::RocmError::ContextPoisoned { op: "abort" }.into());
         }
-        Ok(())
+        Ok(drained?)
     }
+}
+
+/// A step's device time from its dispatches' spans: `Unknown` for none, else the sum of the
+/// durations, the first start to the last end, and each dispatch in submission order.
+fn measured(spans: &[DispatchSpan]) -> DeviceTime {
+    let (Some(start), Some(end)) = (
+        spans.iter().map(|span| span.start).min(),
+        spans.iter().map(|span| span.end).max(),
+    ) else {
+        return DeviceTime::Unknown;
+    };
+    DeviceTime::Measured(MeasuredDeviceTime {
+        sum_of_dispatch_durations: Some(spans.iter().map(DispatchSpan::duration).sum()),
+        device_span: Some(end.saturating_sub(start)),
+        dispatches: spans
+            .iter()
+            .enumerate()
+            .map(|(index, span)| DispatchDeviceTime {
+                index,
+                duration: span.duration(),
+            })
+            .collect(),
+    })
 }
 
 #[cfg(test)]

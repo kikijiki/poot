@@ -2,4 +2,5 @@
 
 pub mod idefics3;
 pub mod mrope;
+pub mod qwen_vl_vision;
 pub mod vision;

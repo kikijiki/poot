@@ -497,10 +497,6 @@ fn rocm_context_open_is_required_by_its_own_variable_only() {
         .is_err()
     };
     assert!(fails_open(DeviceBackend::Rocm.variable()));
-    assert!(
-        !fails_open("POOT_REQUIRE_GPU"),
-        "the retired all-backend switch must not require Rocm"
-    );
     for other in DeviceBackend::ALL
         .into_iter()
         .filter(|other| *other != DeviceBackend::Rocm)
@@ -789,7 +785,7 @@ fn kernel_symbol_matching_is_exact_except_for_amdhsa_descriptor_suffix() {
 
 // Card 125 (spec 120 FR-004/SC-004): `upload_strategy_for_pool` is a pure function of (location,
 // flags), so it is unit-checkable with no HSA context. The DMA transfer itself and the second-target
-// run are the hardware gate (docs/tasks/*/125-amd-discrete-upload-dma.md).
+// run are the hardware gate (card 125).
 
 #[test]
 fn upload_strategy_cpu_pool_is_host_write() {
@@ -945,6 +941,7 @@ fn open_context_or_skip(test: &str) -> Option<RocmContext> {
 fn open_context_with_one_second_wait_bound_or_skip(test: &str) -> Option<RocmContext> {
     match RocmContext::new_with_options(RocmContextOptions {
         wait_timeout: std::time::Duration::from_secs(1),
+        ..RocmContextOptions::default()
     }) {
         Ok(ctx) => Some(ctx),
         Err(RocmError::LibraryNotFound(msg)) => {
@@ -995,12 +992,12 @@ fn assert_submissions_refused_without_touching_the_queue(ctx: &RocmContext, time
         matches!(dispatch, Err(RocmError::ContextPoisoned { op: "dispatch" })),
         "dispatch after a {timed_out_path} timeout must return ContextPoisoned, got {dispatch:?}"
     );
-    let replay = ctx.replay_graph_batched(&[(kernel, kernarg, (1, 1, 1), (1, 1, 1))], &[&[]]);
+    let replay = ctx.enqueue_graph_batched(&[(kernel, kernarg, (1, 1, 1), (1, 1, 1))], &[&[]]);
     assert!(
         matches!(
             replay,
             Err(RocmError::ContextPoisoned {
-                op: "replay_graph_batched"
+                op: "enqueue_graph_batched"
             })
         ),
         "replay after a {timed_out_path} timeout must return ContextPoisoned, got {replay:?}"
@@ -1055,6 +1052,7 @@ fn wait_completion_bounded_times_out() {
         "test",
         Held {
             staging: Some(staging),
+            ..Held::default()
         },
     );
     let elapsed = start.elapsed();
@@ -1162,7 +1160,7 @@ fn submissions_after_a_timed_out_back_pressure_wait_are_refused() {
     claim_every_queue_slot(&ctx);
 
     let error = ctx
-        .replay_graph_batched(&[(kernel, kernarg.clone(), (1, 1, 1), (1, 1, 1))], &[&[]])
+        .enqueue_graph_batched(&[(kernel, kernarg.clone(), (1, 1, 1), (1, 1, 1))], &[&[]])
         .expect_err("the publisher's queue-space wait must time out");
 
     assert!(
@@ -1525,31 +1523,31 @@ fn completion_wait_policy_times_out_on_a_signal_that_never_drops() {
 }
 
 /// Card 252 round 8: logs this box's `HSA_AGENT_INFO_QUEUE_MAX_SIZE` and whether
-/// `replay_graph_batched`'s `chunk_size = queue_size/2` exceeds granitemoe-tiny's 209-AQL-per-step
+/// `enqueue_graph_batched`'s `chunk_size = queue_size/2` exceeds granitemoe-tiny's 209-AQL-per-step
 /// batched decode graph. If `queue_size/2 > 209`, a decode step never spans more than one chunk here
 /// (round 8 addendum).
 #[test]
-fn replay_graph_batched_chunk_size_vs_granitemoe_step_aql_count() {
+fn enqueue_graph_batched_chunk_size_vs_granitemoe_step_aql_count() {
     let ctx = match RocmContext::new() {
         Ok(ctx) => ctx,
         Err(RocmError::LibraryNotFound(msg)) => {
             tracing::info!(
-                "poot-rocm-runtime: SKIP replay_graph_batched_chunk_size_vs_granitemoe_step_aql_count (no HSA library): {msg}"
+                "poot-rocm-runtime: SKIP enqueue_graph_batched_chunk_size_vs_granitemoe_step_aql_count (no HSA library): {msg}"
             );
             return;
         }
         Err(RocmError::NoGpuAgent) => {
             tracing::info!(
-                "poot-rocm-runtime: SKIP replay_graph_batched_chunk_size_vs_granitemoe_step_aql_count (no GPU agent)"
+                "poot-rocm-runtime: SKIP enqueue_graph_batched_chunk_size_vs_granitemoe_step_aql_count (no GPU agent)"
             );
             return;
         }
         Err(e) => {
-            panic!("replay_graph_batched_chunk_size_vs_granitemoe_step_aql_count failed: {e}")
+            panic!("enqueue_graph_batched_chunk_size_vs_granitemoe_step_aql_count failed: {e}")
         }
     };
 
-    // SAFETY: same cast `replay_graph_batched` uses to read `q.size`, per the HSA spec v1.2 layout
+    // SAFETY: same cast `enqueue_graph_batched` uses to read `q.size`, per the HSA spec v1.2 layout
     // `QueueLayout` documents.
     let q = ctx.queue_layout();
     let queue_size = q.size as u64;
@@ -1565,7 +1563,7 @@ fn replay_graph_batched_chunk_size_vs_granitemoe_step_aql_count() {
         chunk_size,
         granitemoe_tiny_step_aql_count = GRANITEMOE_TINY_STEP_AQL_COUNT,
         spans_multiple_chunks,
-        "poot-rocm-runtime: replay_graph_batched_chunk_size_vs_granitemoe_step_aql_count"
+        "poot-rocm-runtime: enqueue_graph_batched_chunk_size_vs_granitemoe_step_aql_count"
     );
     // No fixed assertion: this is a fact-finding probe. Sanity-check the size is plausible (HSA
     // requires a power-of-two queue size > 0).
@@ -1588,7 +1586,7 @@ fn first_diff(a: &[u8], b: &[u8]) -> Option<usize> {
     a.iter().zip(b.iter()).position(|(x, y)| x != y)
 }
 
-// Structural guards. Two wiring facts still cannot be observed model-free: `submit_and_wait` builds
+// Structural guards. Two wiring facts still cannot be observed model-free: `enqueue` builds
 // its publisher directly from the live `RocmContext` (its HSA queue, doorbell and function table),
 // and queue creation records provenance only an HSA queue creation can prove. Each guard below reads
 // only the one production file that owns the fact, extracts one item body, and asserts the call that
@@ -1731,6 +1729,7 @@ fn ring_writer_write_body_uses_the_shared_body_writer() {
     let mut writer = AqlRingWriter {
         dispatches: &dispatches,
         completion: bindings::hsa_signal_t { handle: 7 },
+        dispatch_signals: &[],
         ring: ring.as_mut_ptr(),
         header: 0,
     };
@@ -1782,6 +1781,7 @@ fn ring_writer_completion_signal_rides_only_the_final_packet() {
     let mut writer = AqlRingWriter {
         dispatches: &dispatches,
         completion: bindings::hsa_signal_t { handle: 7 },
+        dispatch_signals: &[],
         ring: ring.as_mut_ptr(),
         header: 0,
     };
@@ -1818,6 +1818,7 @@ fn ring_writer_device_store_fence_issues_the_architecture_fence() {
     let mut writer = AqlRingWriter {
         dispatches: &dispatches,
         completion: bindings::hsa_signal_t { handle: 0 },
+        dispatch_signals: &[],
         ring: ring.as_mut_ptr(),
         header: 0,
     };
@@ -1832,15 +1833,15 @@ fn ring_writer_device_store_fence_issues_the_architecture_fence() {
     );
 }
 
-/// STRUCTURAL GUARD. `submit_and_wait` needs a live `RocmContext` (its HSA queue, doorbell and
+/// STRUCTURAL GUARD. `enqueue` needs a live `RocmContext` (its HSA queue, doorbell and
 /// function table) and every model-free input yields the same contract either way, so the wiring is
-/// read from source: the publisher behind `replay_graph_batched` publishes through the contract the
+/// read from source: the publisher behind `enqueue_graph_batched` publishes through the contract the
 /// context retained, never a hard-coded one. The fence half of this guard became the behavior test
 /// `ring_writer_device_store_fence_issues_the_architecture_fence` (card 617). Mutation observed red:
-/// `submit_and_wait` validates a fresh `QueuePublication` from hard-coded `QueueRingMemory` facts.
+/// `enqueue` validates a fresh `QueuePublication` from hard-coded `QueueRingMemory` facts.
 #[test]
 fn structural_replay_publishes_through_the_retained_contract() {
-    let replay = rust_item_body(include_str!("hsaco.rs"), "fn submit_and_wait(");
+    let replay = rust_item_body(include_str!("hsaco.rs"), "fn enqueue(");
     assert!(
         replay.contains(".queue_publication") && replay.contains("publish_chunks"),
         "replay must consume the retained context publication contract"
@@ -2022,7 +2023,7 @@ fn write_add_kernarg(
 /// real dispatch of the real `add` fixture through `RocmContext::dispatch` rejects a bound-buffer element
 /// list that does not meet the compiled kernel's schema, before any submission - a same-length but
 /// wrong-representation swap this check exists to catch. Mutation (recorded separately, not by this test):
-/// short-circuit `check_element_schema` in `RocmContext::dispatch`/`replay_graph_batched` to always `Ok`;
+/// short-circuit `check_element_schema` in `RocmContext::dispatch`/`enqueue_graph_batched` to always `Ok`;
 /// this row would then observe `Ok(())` from the bad-schema call instead of `Err(KernelArgs(..))`.
 #[test]
 fn dispatch_rejects_buffers_that_do_not_meet_the_compiled_schema() {
@@ -2452,7 +2453,7 @@ fn bf16_round_trips_through_the_storage_typed_primitives_with_exactly_elems_time
     let buf = ctx
         .allocate_zeroed("test", elems, BufferStorage::bf16(), BufferRole::Activation)
         .expect("bf16 allocation");
-    ctx.write_bytes(&buf, &bytes).expect("write_bytes");
+    ctx.write_bytes(&buf, 0, &bytes).expect("write_bytes");
 
     let mut got = vec![0u8; elems * 2];
     ctx.read_bytes(&buf, &mut got).expect("read_bytes");
@@ -2603,9 +2604,9 @@ fn dispatch_geometry_table_refuses_each_malformed_shape_with_its_own_violation()
     }
 }
 
-/// SC-001 (production entry, live device): `dispatch` and `replay_graph_batched` refuse a zero-sized
+/// SC-001 (production entry, live device): `dispatch` and `enqueue_graph_batched` refuse a zero-sized
 /// workgroup with `InvalidDispatchGeometry` naming the offending dispatch, and reserve no ring slot.
-/// Mutation observed red: remove the validation loop in `submit_and_wait`; the call then publishes the
+/// Mutation observed red: remove the validation loop in `enqueue`; the call then publishes the
 /// packet and this row sees a queue fault or `Ok` instead of `InvalidDispatchGeometry`.
 #[test]
 fn dispatch_refuses_malformed_geometry_before_reserving_a_slot() {
@@ -2637,12 +2638,12 @@ fn dispatch_refuses_malformed_geometry_before_reserving_a_slot() {
         (kernel.clone(), kernarg.clone(), (1, 1, 1), (1, 1, 1)),
         (kernel, kernarg, (1, 0, 1), (1, 1, 1)),
     ];
-    let replay = ctx.replay_graph_batched(&batch, &[&[], &[]]);
+    let replay = ctx.enqueue_graph_batched(&batch, &[&[], &[]]);
     assert!(
         matches!(
             replay,
             Err(RocmError::InvalidDispatchGeometry {
-                op: "replay_graph_batched",
+                op: "enqueue_graph_batched",
                 dispatch: 1,
                 violation: DispatchGeometryViolation::ZeroGrid {
                     axis: DispatchAxis::Y
@@ -2658,4 +2659,111 @@ fn dispatch_refuses_malformed_geometry_before_reserving_a_slot() {
         "a refused geometry must not reserve a queue slot"
     );
     assert!(!ctx.is_poisoned(), "a refused geometry must not poison");
+}
+
+/// POOT-1074: a write at a non-zero byte offset lands there and leaves its neighbours intact; an offset
+/// outside the buffer and an overflowing one are typed refusals that write nothing.
+/// Mutation: ignore `range.byte_offset` in `RocmContext::write_bytes`; the neighbour check goes red.
+#[test]
+fn a_write_at_an_offset_leaves_its_neighbours_intact_and_bad_ranges_are_typed() {
+    let Some(ctx) = open_context_or_skip(
+        "a_write_at_an_offset_leaves_its_neighbours_intact_and_bad_ranges_are_typed",
+    ) else {
+        return;
+    };
+    let words =
+        |values: &[f32]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let buf = ctx
+        .allocate_zeroed("test", 4, BufferStorage::f32(), BufferRole::State)
+        .expect("allocation");
+    ctx.write_bytes(&buf, 0, &words(&[1.0, 2.0, 3.0, 4.0]))
+        .unwrap();
+    ctx.write_bytes(&buf, 4, &words(&[9.0, 9.0])).unwrap();
+    let mut got = vec![0u8; 16];
+    ctx.read_bytes(&buf, &mut got).unwrap();
+    assert_eq!(got, words(&[1.0, 9.0, 9.0, 4.0]), "only bytes 4..12 change");
+    for (offset, len) in [(16, 4), (12, 8), (usize::MAX, 4)] {
+        let error = ctx.write_bytes(&buf, offset, &vec![0u8; len]).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                RocmError::RangeOutOfBounds { .. } | RocmError::RangeOverflow { .. }
+            ),
+            "offset {offset} len {len}: {error:?}"
+        );
+    }
+    ctx.read_bytes(&buf, &mut got).unwrap();
+    assert_eq!(
+        got,
+        words(&[1.0, 9.0, 9.0, 4.0]),
+        "refused writes change nothing"
+    );
+}
+
+/// POOT-1079: system-timestamp ticks convert with the reported frequency. Mutation: have
+/// `ticks_to_duration` ignore `ticks_per_second` (return `ticks` as nanoseconds); the 100 MHz row
+/// reads 250 ns instead of 2.5 us and goes red.
+#[test]
+fn profiling_ticks_convert_with_the_system_timestamp_frequency() {
+    use std::time::Duration;
+    assert_eq!(
+        ticks_to_duration(250, 100_000_000),
+        Duration::from_nanos(2_500)
+    );
+    assert_eq!(ticks_to_duration(1, 1_000_000_000), Duration::from_nanos(1));
+    // Ten days of 100 MHz ticks: the intermediate product exceeds `u64`.
+    let ten_days = 10 * 86_400 * 100_000_000u64;
+    assert_eq!(
+        ticks_to_duration(ten_days, 100_000_000),
+        Duration::from_secs(10 * 86_400)
+    );
+}
+
+/// POOT-1079: a timed batch's earlier packets carry their own completion signals and the final packet
+/// the batch's; an untimed batch leaves the earlier ones null. Mutation: have `write_body` always hand
+/// non-final packets the null signal; the timed rows go red.
+#[test]
+fn ring_writer_gives_each_timed_packet_its_own_completion_signal() {
+    let kernel = KernelHandle::for_test(0x1111_2222_3333_4444, 16, 32, 64, &[]);
+    let geometry = DispatchGeometry::new((8, 1, 1), (4, 1, 1)).unwrap();
+    let dispatches: Vec<_> = (0..3)
+        .map(|_| {
+            (
+                kernel.clone(),
+                SyntheticKernarg(0x55u8 as *mut c_void),
+                geometry,
+            )
+        })
+        .collect();
+    let signals = [
+        bindings::hsa_signal_t { handle: 11 },
+        bindings::hsa_signal_t { handle: 12 },
+    ];
+    let mut ring = synthetic_ring(3);
+    let mut timed = AqlRingWriter {
+        dispatches: &dispatches,
+        completion: bindings::hsa_signal_t { handle: 13 },
+        dispatch_signals: &signals,
+        ring: ring.as_mut_ptr(),
+        header: 0,
+    };
+    for packet in 0..3 {
+        timed.write_body(packet, packet as u64, packet == 2);
+    }
+    let handles: Vec<u64> = ring.iter().map(|p| p.completion_signal.handle).collect();
+    assert_eq!(handles, [11, 12, 13]);
+
+    let mut ring = synthetic_ring(3);
+    let mut untimed = AqlRingWriter {
+        dispatches: &dispatches,
+        completion: bindings::hsa_signal_t { handle: 13 },
+        dispatch_signals: &[],
+        ring: ring.as_mut_ptr(),
+        header: 0,
+    };
+    for packet in 0..3 {
+        untimed.write_body(packet, packet as u64, packet == 2);
+    }
+    let handles: Vec<u64> = ring.iter().map(|p| p.completion_signal.handle).collect();
+    assert_eq!(handles, [0, 0, 13]);
 }

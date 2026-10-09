@@ -238,6 +238,19 @@ fn prior_exact_i32_storage_query(graph: &Graph, id: ValueId) -> bool {
             }
         }
     }
+    // A carried I32 state value is one buffer: its input and its next value are adjacent.
+    for &(input, output) in &graph.state {
+        let is_i32 = |id: ValueId| {
+            graph
+                .values
+                .get(id)
+                .is_some_and(|value| value.aval.dtype == GDt::I32)
+        };
+        if is_i32(input) && is_i32(output) {
+            adjacency.entry(input).or_default().push(output);
+            adjacency.entry(output).or_default().push(input);
+        }
+    }
     let mut seen = std::collections::HashSet::new();
     let mut pending = std::collections::VecDeque::from([id]);
     while let Some(value) = pending.pop_front() {
@@ -6787,7 +6800,7 @@ fn dense_bf16_decode_gemv_selection_rows() {
 /// f32 words for a kernel that reads packed lanes.
 ///
 /// The device test `wgpu_resident_kv_rejects_a_bf16_contraction_weight` drives the same rejection through
-/// `run_resident_kv`; this one covers it without a device.
+/// the executor contract; this one covers it without a device.
 #[test]
 fn card380_wgpu_tensor_execution_rejects_every_bf16_value() {
     // The card 380 shape: the contraction weight survives preparation as BF16, safe only on the typed walk.

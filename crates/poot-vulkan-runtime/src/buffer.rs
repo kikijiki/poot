@@ -154,15 +154,15 @@ impl DeviceBuffer {
         self.read_bytes_at("read_bytes", 0, out)
     }
 
-    /// Overwrite the first `bytes.len()` bytes of this buffer in place through its persistent
+    /// Overwrite `bytes.len()` bytes from byte `offset` of this buffer in place through its persistent
     /// `HOST_COHERENT` mapping (spec 133 FR-009, P2 slice 2a; Card 547a: dtype-agnostic, mirrors
     /// `poot_runtime::Context::write_bytes`). A recorded graph's descriptor sets bake this buffer's
     /// `VkBuffer` handle, so replaying with new data means overwriting this buffer. Safe between
     /// replays, since [`VulkanGraph::replay`] fence-waits before returning. `bytes` longer than the
     /// buffer is refused ([`RuntimeError::WriteCapacity`]), and so is any write once the device is
-    /// poisoned.
-    pub fn write_bytes(&self, bytes: &[u8]) -> Result<(), RuntimeError> {
-        self.write_bytes_at("write_bytes", 0, bytes)
+    /// poisoned. A range past the end of the buffer is refused the same way.
+    pub fn write_bytes(&self, offset: usize, bytes: &[u8]) -> Result<(), RuntimeError> {
+        self.write_bytes_at("write_bytes", offset, bytes)
     }
 
     /// The byte range `[offset, offset + len)` of this buffer, or [`RuntimeError::WriteCapacity`] when

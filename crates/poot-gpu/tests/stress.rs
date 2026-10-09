@@ -207,7 +207,7 @@ fn split_consts_and_slots_v(
     (builder.build(), slots)
 }
 
-/// The executor-contract replacement for `GpuExecutor::run`/`run_resident_kv` on a stateless graph: a
+/// The executor-contract replacement for the deleted `GpuExecutor::run`/`run_resident_kv` on a stateless graph: a
 /// one-shot step through `Engine<WgpuDevice>::add_entry`/`step`, torn back down afterward.
 fn run_once_contract(
     exec: &mut dyn Executor,
@@ -826,7 +826,7 @@ fn deep_fused_chain_gpu_matches_cpu() {
 /// Card 159 Inc 3 synthetic repro: force `scatter_update`'s dispatch grid past wgpu's 65535-per-dim workgroup
 /// cap so the movement generator's 2-D grid fold (`MovementSpec::folded`) engages. At `WORKGROUP_SIZE=256` the fold only
 /// kicks in above `out_numel = 65535*256 = 16_776_960`, so `pool` is just over that with `d=1` (~64MB f32).
-/// Compares `run_resident_kv` (per-dispatch) bit-exact against a plain CPU `poot_eval::eval`, so a
+/// Compares the per-dispatch executor bit-exact against a plain CPU `poot_eval::eval`, so a
 /// wrong-but-self-consistent GPU result is caught as well as a hang.
 #[test]
 fn wgpu_scatter_update_grid_over_65535_workgroups() {

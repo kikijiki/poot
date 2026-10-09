@@ -2,7 +2,6 @@
 //! three-stage split. Sizes and ids are literals, so a descriptor that loses a value or a builder
 //! that sizes a row from the wrong quantity reddens here.
 
-use crate::{StageAssignment, split_stages};
 use poot_graph_ir::RedOp;
 use poot_graph_ir::Slot;
 use poot_graph_ir::builder::Builder;
@@ -27,8 +26,7 @@ fn two_stage_split() -> (Vec<crate::BoundaryDescriptor>, Vec<DeviceId>) {
     let t0 = b.binary(BinOp::Add, x, x);
     let out = b.binary(BinOp::Mul, t0, t0);
     let graph = b.finish(out);
-    let assignment = StageAssignment::from_cuts(&[1], graph.eqns.len()).expect("the cut is legal");
-    let split = split_stages(&graph, &assignment).expect("the graph splits");
+    let split = crate::test_support::split_before(&graph, &[1]).expect("the graph splits");
     assert_eq!(split.boundaries.len(), 1, "one value crosses this cut");
     (split.boundaries, vec![device(0), device(1)])
 }
@@ -43,9 +41,7 @@ fn three_stage_split() -> Vec<crate::BoundaryDescriptor> {
     let back = b.cast(t1, poot_tensor::DType::F32);
     let out = b.binary(BinOp::Add, back, t0);
     let graph = b.finish(out);
-    let assignment =
-        StageAssignment::from_cuts(&[1, 2], graph.eqns.len()).expect("the cuts are legal");
-    let split = split_stages(&graph, &assignment).expect("the graph splits");
+    let split = crate::test_support::split_before(&graph, &[1, 2]).expect("the graph splits");
     assert_eq!(
         split
             .boundaries

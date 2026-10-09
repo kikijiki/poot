@@ -12,10 +12,9 @@
 //! heads, state, head_dim]`. The `rows` sequences of a step fold into the head axis of the SSD
 //! op (heads of different rows share the weights but not the state).
 
-use poot_graph_ir::{
-    BinOp, Builder, ScanAttrs, ScanFamily, ScanResult, StateRole, TensorType, Traced, UnOp, ops,
-};
+use poot_graph_ir::{BinOp, Builder, ScanAttrs, ScanFamily, ScanResult, Traced, UnOp, ops};
 use poot_quant::weights::{Mamba2Role, WeightId, WeightMap, WeightRole};
+use poot_tensor::DType;
 
 use super::conv::{ConvParams, ConvWeights, causal_conv};
 use super::linear::{Weight, WeightError, linear};
@@ -196,11 +195,7 @@ pub fn mamba2(
         let tiled = b.broadcast(b.reshape(v, vec![1, h, 1, 1]), vec![rows, h, 1, 1]);
         b.reshape(tiled, vec![1, rows * h, 1, 1])
     };
-    let state = b.state_input(
-        &format!("mamba2.l{layer}.ssm"),
-        TensorType::f32(vec![rows, h, n, hd]),
-        StateRole::Recurrent,
-    );
+    let state = step.recurrent_state(b, &format!("mamba2.l{layer}.ssm"), DType::F32, &[h, n, hd]);
     let ScanResult {
         y,
         s_out: state_out,
@@ -217,10 +212,10 @@ pub fn mamba2(
             fold(delta),
             per_head(&w.a_log, true),
             per_head(&w.d, false),
-            fold(state),
+            fold(state.current()),
         ],
     );
-    step.carry(state, b.reshape(state_out, vec![rows, h, n, hd]));
+    step.carry_recurrent(b, state, b.reshape(state_out, vec![rows, h, n, hd]));
 
     let y = b.reshape(y, vec![rows, h, t, hd]);
     let y = b.reshape(b.transpose(y, vec![0, 2, 1, 3]), vec![rows, t, inner]);

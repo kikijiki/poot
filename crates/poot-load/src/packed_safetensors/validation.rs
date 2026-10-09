@@ -1074,27 +1074,31 @@ impl<'de> Deserialize<'de> for UniqueJson {
     }
 }
 
+/// `bytes` as a JSON value, refusing an object that repeats a key at any depth: `serde_json::Value`
+/// alone keeps the last of a repeated key, so a config's earlier setting would be dropped unseen.
+pub fn parse_json_unique_keys(bytes: &[u8]) -> Result<serde_json::Value, serde_json::Error> {
+    serde_json::from_slice::<UniqueJson>(bytes).map(|value| value.0)
+}
+
 pub(crate) fn parse_unique_json(
     bytes: &[u8],
     filename: &str,
 ) -> Result<serde_json::Value, PackedSafetensorsError> {
-    serde_json::from_slice::<UniqueJson>(bytes)
-        .map(|value| value.0)
-        .map_err(|error| {
-            let reason = error.to_string();
-            if let Some(rest) = reason.strip_prefix("duplicate JSON key \"") {
-                let key = rest.split('"').next().unwrap_or(rest).to_string();
-                PackedSafetensorsError::DuplicateJsonKey {
-                    file: filename.to_string(),
-                    key,
-                }
-            } else {
-                PackedSafetensorsError::Json {
-                    file: filename.to_string(),
-                    reason,
-                }
+    parse_json_unique_keys(bytes).map_err(|error| {
+        let reason = error.to_string();
+        if let Some(rest) = reason.strip_prefix("duplicate JSON key \"") {
+            let key = rest.split('"').next().unwrap_or(rest).to_string();
+            PackedSafetensorsError::DuplicateJsonKey {
+                file: filename.to_string(),
+                key,
             }
-        })
+        } else {
+            PackedSafetensorsError::Json {
+                file: filename.to_string(),
+                reason,
+            }
+        }
+    })
 }
 
 #[cfg(test)]

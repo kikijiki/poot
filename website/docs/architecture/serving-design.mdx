@@ -10,8 +10,8 @@ import ContinuousBatchingDiagram from "@site/src/components/architecture/Continu
 
 `poot-serve` is an OpenAI-compatible HTTP server. It parses and bounds requests, loads any registered
 model as a `ModelHandle`, and serves `/v1/completions` and `/v1/chat/completions` from one scheduling loop
-over the driver's `step`. `/v1/embeddings`, `/v1/rerank` and the LoRA administration routes return a typed
-`503` until they are restored. It registers no LoRA adapter. Operator guides live under
+over the driver's `step`. `/v1/embeddings`, `/v1/rerank` and the LoRA administration routes run on the same
+engine thread, as `Encode` steps and adapter operations between requests. Operator guides live under
 [Serving](../serve/index.md).
 
 ## API
@@ -20,11 +20,11 @@ over the driver's `step`. `/v1/embeddings`, `/v1/rerank` and the LoRA administra
 | --------------------------- | ------------------------------------------------- |
 | `POST /v1/chat/completions` | Chat completion, streaming (SSE) or buffered JSON |
 | `POST /v1/completions`      | Raw text completion                               |
-| `POST /v1/embeddings`       | Embedding vectors (BERT-class models; `503` today) |
-| `POST /v1/rerank`           | Reranking scores (BERT-class models; `503` today) |
+| `POST /v1/embeddings`       | Embedding vectors (a decoder's embedding pass)    |
+| `POST /v1/rerank`           | Reranking scores (a decoder's embedding pass)     |
 | `GET /v1/models`            | List the served model(s)                          |
 | `GET /v1/models/{id}`       | Describe one served model                         |
-| `/v1/lora_adapters`         | LoRA administration (`503`: registers nothing yet) |
+| `/v1/lora_adapters`         | LoRA administration: list, hot-load, unload       |
 | `GET /metrics`              | Server metrics as JSON                            |
 | `GET /metrics/prometheus`   | Server metrics in Prometheus exposition format    |
 | `GET /health`               | Liveness probe                                    |
@@ -56,7 +56,9 @@ recording, or a guided-decoding constraint still reads the full logits back and 
 and forced tool calls are parsed and validated. They constrain sampling with a CPU automaton that masks
 disallowed tokens, which requires the host-readback sampling path.
 
-**Speculative decoding** is not available yet (poot is being refactored; planned to return).
+**Speculative decoding** is a policy of the driver: a decode row proposes drafts (prompt lookup or a second model)
+and verifies them in one step, and the scheduling loop does not change. `poot-serve` takes the policy with
+`--draft-lookup` or `--draft-model`. See [Speculative decoding](../serve/speculative-decoding.md).
 
 ## Weights, adapters and multiple GPUs
 
@@ -72,12 +74,12 @@ consume the weight, and a packed MoE expert stack is read by one indexed packed 
 | FP8 (`compressed-tensors`)              | Packed E4M3 per-channel projections on the supported Qwen loader path |
 
 Mixed K-quant files such as `Q4_K_M` widen some layers, as the ggml quantizer writes them. KV-cache
-quantization is not available yet. Operator detail: [Using quantized checkpoints](../serve/quantized-checkpoints.md).
+quantization is not implemented. Operator detail: [Using quantized checkpoints](../serve/quantized-checkpoints.md).
 
-**LoRA adapters** [^lora] use the PEFT [^peft] layout. They are not available yet (poot is being refactored; planned to return). When they return, adapters apply to the seven attention
+**LoRA adapters** [^lora] use the PEFT [^peft] layout. `poot-serve` loads, selects and unloads them while it runs. Adapters apply to the seven attention
 and MLP projections of dense qwen2/llama-shaped models. See [Using LoRA adapters](../serve/lora-adapters.md).
 
-**Tensor parallelism** is not available yet (poot is being refactored; planned to return). A
+**Tensor parallelism** is not implemented in the server. A
 captured multi-device executor exists in `poot-ptx-gpu` as a building block. See
 [Tensor parallelism](../serve/tensor-parallelism.md).
 

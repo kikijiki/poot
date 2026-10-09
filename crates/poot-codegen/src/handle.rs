@@ -1,4 +1,4 @@
-//! The one place a [`poot_runtime_common::CompiledKernel`] is built (card 608, ADR-0102 amendment): every
+//! The one place a [`poot_runtime_common::CompiledKernel`] is built (ADR-0102 amendment): every
 //! runtime dispatch, launch, load and replay entry point takes a `&CompiledKernel` instead of raw kernel
 //! bytes, and this crate is the sole caller of its `unsafe` constructor. Callers pass the artifact bytes
 //! [`compile`] or a [`crate::KernelCache`] produced for the same `body`/`target` pair; [`kernel_handle`]
@@ -72,7 +72,7 @@ fn backend_of(target: Target) -> Backend {
         Target::AmdGcn(arch) => Backend::AmdGcn(arch),
         Target::AieCore => {
             panic!(
-                "no runtime CompiledKernel for AieCore: the NPU run_bytes path is out of card 608's scope"
+                "no runtime CompiledKernel for AieCore: AieCore is retained but inactive (POOT-1093)"
             )
         }
     }
@@ -104,7 +104,7 @@ fn kernel_code_of(target: Target, bytes: Vec<u8>) -> KernelCode {
         Target::AmdGcn(_) => KernelCode::Hsaco(bytes.into_boxed_slice()),
         Target::AieCore => {
             panic!(
-                "no runtime CompiledKernel for AieCore: the NPU run_bytes path is out of card 608's scope"
+                "no runtime CompiledKernel for AieCore: AieCore is retained but inactive (POOT-1093)"
             )
         }
     }
@@ -118,8 +118,8 @@ fn kernel_code_of(target: Target, bytes: Vec<u8>) -> KernelCode {
 ///
 /// # Panics
 ///
-/// Panics if `target` is [`Target::AieCore`] (out of scope: the NPU `run_bytes` path is deferred, decision
-/// D4) or if `body`'s parameters are not all buffer-slice references with a runtime-representable element
+/// Panics if `target` is [`Target::AieCore`] (retained but inactive until NPU support re-enters the pipeline,
+/// POOT-1093) or if `body`'s parameters are not all buffer-slice references with a runtime-representable element
 /// type - every body this crate's own emitter compiles for wgpu/Vulkan/ROCm/PTX dispatch has that shape,
 /// so a body that does not is a codegen bug, not a caller error.
 pub fn kernel_handle(body: &Body, target: Target, bytes: Vec<u8>) -> CompiledKernel {

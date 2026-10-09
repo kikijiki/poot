@@ -307,21 +307,29 @@ pub type hsa_executable_iterate_symbols_cb_t = Option<
 
 pub const HSA_SIGNAL_CONDITION_LT: u32 = 0;
 
+// hsa.h system info attribute ids (for hsa_system_get_info)
+
+/// The system timestamp's increase rate in Hz (`uint64_t`); the unit of
+/// [`hsa_amd_profiling_dispatch_time_t`] ticks.
+pub const HSA_SYSTEM_INFO_TIMESTAMP_FREQUENCY: u32 = 3;
+
+/// `hsa_amd_profiling_dispatch_time_t`: a dispatch's start and end, in system-timestamp ticks.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct hsa_amd_profiling_dispatch_time_t {
+    pub start: u64,
+    pub end: u64,
+}
+
 // hsa.h wait states (for hsa_signal_wait_scacquire's state_hint arg)
 
 pub const HSA_WAIT_STATE_BLOCKED: u32 = 1;
-
-// Re-export c_char / c_void so callers need no separate `use`.
-pub use std::ffi::{c_char as c_char_re, c_void as c_void_re};
-
-// Silence unused-import warnings for the re-exports.
-#[allow(dead_code)]
-const _: *const c_char = std::ptr::null();
 
 // C enum parameter types (each an `int`-sized enum in the headers)
 
 pub type hsa_agent_info_t = u32;
 pub type hsa_isa_info_t = u32;
+pub type hsa_system_info_t = u32;
 pub type hsa_signal_condition_t = u32;
 pub type hsa_wait_state_t = u32;
 pub type hsa_amd_memory_pool_info_t = u32;
@@ -348,6 +356,19 @@ unsafe extern "C" {
         isa: hsa_isa_t,
         attribute: hsa_isa_info_t,
         value: *mut c_void,
+    ) -> hsa_status_t;
+    pub(crate) fn hsa_system_get_info(
+        attribute: hsa_system_info_t,
+        value: *mut c_void,
+    ) -> hsa_status_t;
+    pub(crate) fn hsa_amd_profiling_set_profiler_enabled(
+        queue: *mut hsa_queue_t,
+        enable: std::ffi::c_int,
+    ) -> hsa_status_t;
+    pub(crate) fn hsa_amd_profiling_get_dispatch_time(
+        agent: hsa_agent_t,
+        signal: hsa_signal_t,
+        time: *mut hsa_amd_profiling_dispatch_time_t,
     ) -> hsa_status_t;
     pub(crate) fn hsa_signal_create(
         initial_value: hsa_signal_value_t,

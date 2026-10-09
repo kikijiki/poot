@@ -13,8 +13,9 @@
 //! `BufferStorage` is exactly the representation mismatch `poot_target::BufferStorage` exists to catch
 //! (R484-001/R471-009) - so the arena coloring below runs independently per storage class.
 //!
-//! A value the engine commits with a whole-buffer `Device::copy` or reads back with a whole-buffer
-//! `Device::read` (the primary output, a state-commit source, or a validation witness) needs its
+//! A value the engine commits with a whole-buffer `Device::copy`, reads back with a whole-buffer
+//! `Device::read`, or hands to a later stage (the primary output, a state-commit source, a validation
+//! witness or a stage export, whose consumers bind its buffer with no copy) needs its
 //! buffer's capacity to equal its own logical size exactly: those two primitives have no per-call
 //! length, unlike a kernel dispatch's [`crate::Plan`]-carried argument. Such a value always gets a
 //! freshly allocated, never-reused slot (see `is_export` below), so nothing it was never sized for can
@@ -204,6 +205,9 @@ pub(crate) fn plan_buffers<V: ValidationChannel>(
         }
     };
     export(g.output);
+    for exported in &g.exports {
+        export(exported.value);
+    }
     for copy in &state_commit.copies {
         export(copy.state_output);
     }

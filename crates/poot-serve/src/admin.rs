@@ -8,18 +8,20 @@
 //!
 //! The route family is `/v1/lora_adapters`, alongside the existing `/v1/models` naming (see
 //! `http.rs`'s `handle` dispatch for the other routes): `GET` lists, `POST {"name", "path"}` hot-loads
-//! and `DELETE /v1/lora_adapters/{name}` hot-unloads. Adapters load into the driver's adapter sets,
-//! which this server has no engine for yet, so an authorized request of a well-formed shape gets the
-//! typed 503 until POOT-589 restores them; a malformed path is 404 and a method no
-//! route takes is 405.
+//! and `DELETE /v1/lora_adapters/{name}` hot-unloads. The operations run on the engine thread, which
+//! owns the driver: this module is the channel client (`submit_admin`) and the response mapping. A
+//! malformed path is 404 and a method no route takes is 405.
 
 use std::net::{IpAddr, TcpStream};
 
 use anyhow::{Result, anyhow, bail};
 use ring::digest;
+use serde::Deserialize;
 use subtle::ConstantTimeEq;
 
-use crate::http::{AuthorizationHeader, respond_error, respond_no_driver_route};
+use crate::http::{AuthorizationHeader, respond, respond_error};
+use crate::lifecycle::submit_admin;
+use crate::types::{AdapterInfo, AdminError, AdminReply, AdminRequest, Served};
 
 const LORA_ADMIN_KEY_ENV: &str = "POOT_LORA_ADMIN_KEY";
 
@@ -175,10 +177,21 @@ pub(crate) fn respond_lora_admin_denial(
     }
 }
 
+#[derive(Deserialize)]
+struct LoraHotLoadReq {
+    name: String,
+    path: String,
+}
+
 /// Route one already-authorized `/v1/lora_adapters[/*]` request. Request-head authorization is owned
-/// by `http.rs`, so this function cannot move the guard below an adapter operation. A request of a
-/// shape a route takes is the typed 503 (see the module docs); any other is a 404 or a 405.
-pub(crate) fn handle_lora_admin(stream: &mut TcpStream, method: &str, path: &str) -> Result<()> {
+/// by `http.rs`, so this function cannot move the guard below an adapter operation.
+pub(crate) fn handle_lora_admin(
+    stream: &mut TcpStream,
+    served: &Served,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> Result<()> {
     let unknown_path = |stream: &mut TcpStream| {
         respond_error(
             stream,
@@ -193,12 +206,63 @@ pub(crate) fn handle_lora_admin(stream: &mut TcpStream, method: &str, path: &str
             _ => respond_error(stream, 405, "method not allowed", "invalid_request_error"),
         };
     }
-    match (method, path.strip_prefix("/v1/lora_adapters/")) {
-        ("GET" | "POST", None) => respond_no_driver_route(stream, "/v1/lora_adapters"),
-        ("DELETE", Some(name)) if !name.is_empty() => {
-            respond_no_driver_route(stream, "/v1/lora_adapters")
-        }
-        ("GET" | "POST" | "DELETE", _) => unknown_path(stream),
-        _ => respond_error(stream, 405, "method not allowed", "invalid_request_error"),
+    let request = match (method, path.strip_prefix("/v1/lora_adapters/")) {
+        ("GET", None) => AdminRequest::List,
+        ("POST", None) => match serde_json::from_str::<LoraHotLoadReq>(body) {
+            Ok(req) if !req.name.is_empty() && !req.path.is_empty() => AdminRequest::Load {
+                name: req.name,
+                path: req.path,
+            },
+            Ok(_) => {
+                return respond_error(
+                    stream,
+                    400,
+                    "both \"name\" and \"path\" must be non-empty",
+                    "invalid_request_error",
+                );
+            }
+            Err(e) => return respond_error(stream, 400, e, "invalid_request_error"),
+        },
+        ("DELETE", Some(name)) if !name.is_empty() => AdminRequest::Unload {
+            name: name.to_string(),
+        },
+        ("GET" | "POST" | "DELETE", _) => return unknown_path(stream),
+        _ => return respond_error(stream, 405, "method not allowed", "invalid_request_error"),
+    };
+    match submit_admin(&served.engine, request) {
+        Ok(reply) => respond(stream, 200, &reply_json(&reply)),
+        Err(error) => respond_admin_error(stream, &error),
     }
+}
+
+fn adapter_json(info: &AdapterInfo) -> serde_json::Value {
+    serde_json::json!({ "name": info.name, "index": info.index })
+}
+
+/// The 200 body of an administration reply.
+fn reply_json(reply: &AdminReply) -> String {
+    match reply {
+        AdminReply::Adapters(adapters) => {
+            let data: Vec<_> = adapters.iter().map(adapter_json).collect();
+            serde_json::json!({ "object": "list", "data": data })
+        }
+        AdminReply::Loaded(info) => adapter_json(info),
+        AdminReply::Unloaded(info) => {
+            serde_json::json!({ "name": info.name, "freed_index": info.index })
+        }
+    }
+    .to_string()
+}
+
+/// An administration failure as its status says: a refusal by its class, 404 for a name nothing holds,
+/// 409 for an adapter running requests hold (the request is well-formed but cannot be satisfied right
+/// now; retry later).
+fn respond_admin_error(stream: &mut TcpStream, error: &AdminError) -> Result<()> {
+    let status = error.status();
+    let type_ = match error {
+        AdminError::Busy(_) => "conflict_error",
+        _ if status < 500 => "invalid_request_error",
+        _ => "server_error",
+    };
+    respond_error(stream, status, error, type_)
 }

@@ -7,7 +7,7 @@
 //!   host-side bookkeeping over numbers the step already produces;
 //! - whether the concrete [`crate::Device`] was constructed to request per-dispatch device
 //!   timestamps at all (a backend-specific capability, decided when the `Device` is built, e.g.
-//!   `WgpuDevice::new_with_timing`), which `TimingOptions::Detailed` documents the intent for but
+//!   `WgpuDevice::new_with_device_timing`), which `TimingOptions::Detailed` documents the intent for but
 //!   does not itself switch on a running device.
 //!
 //! The default, [`TimingOptions::CountersOnly`], retains no per-dispatch detail and asks nothing
@@ -49,11 +49,7 @@ pub struct DetailedTiming {
 impl DetailedTiming {
     /// Every step, bounded to `max_retained_steps` records and `max_retained_dispatch_records`
     /// dispatch records, at most `max_in_flight_queries` query resources in flight at once.
-    ///
-    /// Test-only until a typed timing mode constructs it in production: the bench runner's
-    /// pre-driver engines were its one production caller.
-    #[cfg(test)]
-    pub(crate) fn every_step(
+    pub fn every_step(
         max_retained_steps: usize,
         max_retained_dispatch_records: usize,
         max_in_flight_queries: usize,
