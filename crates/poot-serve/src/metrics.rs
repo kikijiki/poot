@@ -4,6 +4,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use poot_llm::driver::RowSpeculation;
+
 /// Upper bucket bounds (`le`, ms) for the latency histograms; the implicit `+Inf` bucket catches the rest.
 pub(crate) const LATENCY_BUCKETS_MS: [f64; 11] = [
     5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0,
@@ -77,13 +79,13 @@ impl Histogram {
     }
 }
 
-/// Paged-KV, prefix-cache and GPU-memory gauges. The batched engine updates them as it admits and steps; the
-/// CPU path leaves them 0.
+/// Paged-KV, prefix-cache and GPU-memory gauges. The batched engine updates them as it admits and steps; they read 0
+/// before the engine has started.
 #[derive(Default)]
 pub(crate) struct CacheMetrics {
     /// physical KV blocks in use across all slots (stored each step).
     pub(crate) kv_used_blocks: AtomicU64,
-    /// total physical KV blocks in the shared pool (set once at engine start; 0 on the CPU path).
+    /// total physical KV blocks in the shared pool (set once at engine start; 0 before the engine starts).
     pub(crate) kv_total_blocks: AtomicU64,
     /// cumulative prompt tokens served from a cached prefix - the prefix-cache hit-rate numerator.
     pub(crate) prefix_hit_tokens: AtomicU64,
@@ -126,21 +128,37 @@ pub(crate) struct CacheMetrics {
     pub(crate) prefill_activation_peak_bytes: AtomicU64,
 }
 
-/// Batched-engine speculative-decode telemetry, with one counter pair per sampler mode: greedy rows
-/// (argmax prefix-compare) and sampled rows (`spec_sample_round`) have distinct acceptance dynamics. Counted at
-/// the per-row branch point in `speculative_verify_step`/`_ptx`/`_rocm`.
+/// Speculative-decoding telemetry: what the driver's draft policy reported for each decode row, counted
+/// as it reported it. A row that decoded one token for want of room, a proposal or a verifiable sampler
+/// is a skip, not a round.
 #[derive(Default)]
 pub(crate) struct SpeculativeMetrics {
-    /// draft tokens forwarded to the batched verify step (before accept/reject) for greedy rows.
-    pub(crate) forwarded_greedy: AtomicU64,
-    /// tokens committed to a slot via the greedy speculative path: accepted draft prefix plus bonus token, counted
-    /// by the actual push (a token discarded as EOS, or a round cut short by max_new/a stop sequence, is not
-    /// counted; see `speculative_verify_step`).
-    pub(crate) committed_greedy: AtomicU64,
-    /// as `forwarded_greedy`, for sampled rows.
-    pub(crate) forwarded_sampled: AtomicU64,
-    /// as `committed_greedy`, for sampled rows.
-    pub(crate) committed_sampled: AtomicU64,
+    /// Rows whose drafts were verified.
+    pub(crate) rounds: AtomicU64,
+    /// Drafts those rows proposed (before accept/reject).
+    pub(crate) proposed: AtomicU64,
+    /// Drafts those rows kept: the driver's accepted count, not the tokens the row returned (that is
+    /// one more).
+    pub(crate) accepted: AtomicU64,
+    /// Decode rows that decoded one token under a draft policy.
+    pub(crate) skipped: AtomicU64,
+}
+
+impl SpeculativeMetrics {
+    /// Count what the driver reported for one row.
+    pub(crate) fn record(&self, row: RowSpeculation) {
+        match row {
+            RowSpeculation::NotApplicable => {}
+            RowSpeculation::Verified { proposed, accepted } => {
+                self.rounds.fetch_add(1, Ordering::Relaxed);
+                self.proposed.fetch_add(proposed as u64, Ordering::Relaxed);
+                self.accepted.fetch_add(accepted as u64, Ordering::Relaxed);
+            }
+            RowSpeculation::NotSpeculated(_) => {
+                self.skipped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 pub(crate) struct Metrics {
@@ -177,10 +195,10 @@ pub(crate) struct Metrics {
     pub(crate) model: String,
     /// persistent so CPU usage is a meaningful delta since the previous `/metrics` refresh.
     pub(crate) sys: Mutex<sysinfo::System>,
-    /// paged-KV utilization + prefix-cache hit rate (GPU batched engine; 0 on the CPU path).
+    /// paged-KV utilization + prefix-cache hit rate (batched engine; 0 before it starts).
     pub(crate) cache: CacheMetrics,
-    /// batched-engine speculative-decode counters; 0 unless `POOT_SPEC_DRAFT_MODEL`/`POOT_SPEC_LOOKUP_NGRAM` is
-    /// configured and at least one row has drafted.
+    /// batched-engine speculative-decode counters; 0 unless `--draft-lookup` or `--draft-model` is
+    /// given and at least one row has drafted.
     pub(crate) speculative: SpeculativeMetrics,
 }
 
@@ -200,12 +218,11 @@ impl Drop for InFlight<'_> {
 }
 
 impl Metrics {
-    /// Record a finished generation request: end-to-end latency, prefill token count and (streaming only) TTFT.
-    /// The engine bumps the decode-token counter per token.
-    pub(crate) fn record_request(&self, e2e_ms: f64, prompt_tokens: usize, ttft_ms: Option<f64>) {
+    /// Record a finished request: end-to-end latency and (streaming only) TTFT. The prompt tokens it
+    /// prefilled are counted where they are processed: by the loop's steps for a generation, by the
+    /// encode path for an `Encode`; the decode-token counter is bumped per token by the engine.
+    pub(crate) fn record_request(&self, e2e_ms: f64, ttft_ms: Option<f64>) {
         self.e2e.observe(e2e_ms);
-        self.prompt_tokens
-            .fetch_add(prompt_tokens as u64, Ordering::Relaxed);
         if let Some(t) = ttft_ms {
             self.ttft.observe(t);
         }
@@ -231,7 +248,7 @@ impl Metrics {
         self.requests_errored.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// KV-cache block utilization in `[0, 1]` (used / total); 0 when no paged pool exists (CPU path).
+    /// KV-cache block utilization in `[0, 1]` (used / total); 0 when no paged pool exists.
     pub(crate) fn kv_cache_usage(&self) -> f64 {
         let total = self.cache.kv_total_blocks.load(Ordering::Relaxed);
         if total == 0 {
@@ -251,7 +268,7 @@ impl Metrics {
     }
 
     /// Resident GPU memory the engine tracks: model weights plus the KV pool. Excludes transient intermediates;
-    /// 0 on the CPU path.
+    /// 0 before the engine starts.
     pub(crate) fn gpu_resident_bytes(&self) -> u64 {
         self.cache.gpu_weight_bytes.load(Ordering::Relaxed)
             + self.cache.gpu_kv_bytes.load(Ordering::Relaxed)
@@ -266,8 +283,7 @@ impl Metrics {
     }
 
     /// GPU-active ratio (0..1): cumulative time inside the GPU decode step over cumulative whole-step wall time.
-    /// Low means host/launch-bound, high means GPU-bound. 0 before any step or on the CPU path. See
-    /// docs/launch-overhead.md.
+    /// Low means host/launch-bound, high means GPU-bound. 0 before any step.
     pub(crate) fn gpu_active_ratio(&self) -> f64 {
         let gpu = self.cache.decode_gpu_ns.load(Ordering::Relaxed);
         let total = self.cache.decode_step_ns.load(Ordering::Relaxed);
@@ -313,10 +329,10 @@ impl Metrics {
             "prefill_dispatch_count": self.cache.prefill_dispatch_count.load(Ordering::Relaxed),
             "prefill_activation_peak_bytes": self.cache.prefill_activation_peak_bytes.load(Ordering::Relaxed),
             "gpu_active_ratio": round1(self.gpu_active_ratio() * 100.0) / 100.0,
-            "speculative_forwarded_tokens_greedy": self.speculative.forwarded_greedy.load(Ordering::Relaxed),
-            "speculative_committed_tokens_greedy": self.speculative.committed_greedy.load(Ordering::Relaxed),
-            "speculative_forwarded_tokens_sampled": self.speculative.forwarded_sampled.load(Ordering::Relaxed),
-            "speculative_committed_tokens_sampled": self.speculative.committed_sampled.load(Ordering::Relaxed),
+            "speculative_rounds": self.speculative.rounds.load(Ordering::Relaxed),
+            "speculative_proposed_tokens": self.speculative.proposed.load(Ordering::Relaxed),
+            "speculative_accepted_tokens": self.speculative.accepted.load(Ordering::Relaxed),
+            "speculative_skipped_rows": self.speculative.skipped.load(Ordering::Relaxed),
             "ttft_ms": { "count": self.ttft.count(), "avg": round1(self.ttft.avg_ms()) },
             "itl_ms": { "count": self.itl.count(), "avg": round1(self.itl.avg_ms()) },
             "request_e2e_ms": { "count": self.e2e.count(), "avg": round1(self.e2e.avg_ms()) },
@@ -432,14 +448,18 @@ impl Metrics {
              # HELP poot_prefill_activation_peak_bytes Peak transient activation bytes of the optimized prefill graph (engine-produced; flash keeps attention O(L*head_dim)).\n\
              # TYPE poot_prefill_activation_peak_bytes gauge\n\
              poot_prefill_activation_peak_bytes {}\n\
-             # HELP poot_speculative_forwarded_tokens_total Draft tokens forwarded to the batched speculative-decode verify step (proposed, before accept/reject), by sampler mode (spec 268 Phase D).\n\
-             # TYPE poot_speculative_forwarded_tokens_total counter\n\
-             poot_speculative_forwarded_tokens_total{{mode=\"greedy\"}} {}\n\
-             poot_speculative_forwarded_tokens_total{{mode=\"sampled\"}} {}\n\
-             # HELP poot_speculative_committed_tokens_total Tokens committed to a slot via the batched speculative-decode path (accepted draft prefix + bonus token), by sampler mode (spec 268 Phase D).\n\
-             # TYPE poot_speculative_committed_tokens_total counter\n\
-             poot_speculative_committed_tokens_total{{mode=\"greedy\"}} {}\n\
-             poot_speculative_committed_tokens_total{{mode=\"sampled\"}} {}\n\
+             # HELP poot_speculative_rounds_total Decode rows whose drafts the driver verified.\n\
+             # TYPE poot_speculative_rounds_total counter\n\
+             poot_speculative_rounds_total {}\n\
+             # HELP poot_speculative_proposed_tokens_total Draft tokens the driver proposed to verify (before accept/reject).\n\
+             # TYPE poot_speculative_proposed_tokens_total counter\n\
+             poot_speculative_proposed_tokens_total {}\n\
+             # HELP poot_speculative_accepted_tokens_total Draft tokens the driver kept after verification.\n\
+             # TYPE poot_speculative_accepted_tokens_total counter\n\
+             poot_speculative_accepted_tokens_total {}\n\
+             # HELP poot_speculative_skipped_rows_total Decode rows that decoded one token under a draft policy (no room, no proposal, or a sampler the window cannot verify).\n\
+             # TYPE poot_speculative_skipped_rows_total counter\n\
+             poot_speculative_skipped_rows_total {}\n\
              {}{}{}{}",
             self.started.elapsed().as_secs(),
             self.requests.load(Ordering::Relaxed),
@@ -476,10 +496,10 @@ impl Metrics {
             self.cache
                 .prefill_activation_peak_bytes
                 .load(Ordering::Relaxed),
-            self.speculative.forwarded_greedy.load(Ordering::Relaxed),
-            self.speculative.forwarded_sampled.load(Ordering::Relaxed),
-            self.speculative.committed_greedy.load(Ordering::Relaxed),
-            self.speculative.committed_sampled.load(Ordering::Relaxed),
+            self.speculative.rounds.load(Ordering::Relaxed),
+            self.speculative.proposed.load(Ordering::Relaxed),
+            self.speculative.accepted.load(Ordering::Relaxed),
+            self.speculative.skipped.load(Ordering::Relaxed),
             self.ttft
                 .prometheus("poot_ttft_ms", "Time to first token (streaming requests)."),
             self.itl

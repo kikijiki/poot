@@ -38,7 +38,7 @@ fn model_handle_load_gguf_peaks_near_one_x_file_size() {
         // does not store: 96 MiB covers the 151k-token tokenizer with room to spare.
         let limit = file_bytes + file_bytes / 20 + 96 * 1024 * 1024;
         println!(
-            "card545a rss: file={} file_bytes={file_bytes} incremental_peak_bytes={incremental_peak} \
+            "gguf load rss: file={} file_bytes={file_bytes} incremental_peak_bytes={incremental_peak} \
              ratio={:.3} limit_bytes={limit}",
             std::path::Path::new(&path).display(),
             incremental_peak as f64 / file_bytes as f64

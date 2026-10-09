@@ -15,7 +15,7 @@ use poot_models::model::{KvLayout, LogitRows, Phase, StepShape};
 
 use super::block_table::BLOCK_SIZE;
 use super::chunks::Piece;
-use super::error::{DriverError, EmbedsError, InvalidOptions, InvalidRequest};
+use super::error::{DriverError, InvalidOptions, InvalidRequest};
 use poot_load::lora::LoraAdapter;
 
 use super::lora::{AdapterSet, AdapterStack, GenerationId};
@@ -38,6 +38,7 @@ impl PoolShape {
         KvLayout::Paged {
             pool_slots: NonZeroUsize::new(self.blocks.get() * BLOCK_SIZE)
                 .expect("a pool of at least one block"),
+            seqs: self.max_seqs,
         }
     }
 }
@@ -158,19 +159,9 @@ impl Driver {
             }
             _ => {}
         }
-        let serves_one = |residency: StateResidency| {
-            let seqs = match shapes.layout {
-                Layout::Contiguous => 1,
-                Layout::Paged(pool) => pool.max_seqs.get(),
-            };
-            residency == StateResidency::Recurrent
-                && (seqs > 1
-                    || shapes.rows.iter().any(|rows| rows.get() > 1)
-                    || !shapes.windows.is_empty())
+        let verifies_windows = |residency: StateResidency| {
+            residency == StateResidency::Recurrent && !shapes.windows.is_empty()
         };
-        if serves_one(self.residency) {
-            return Err(InvalidOptions::RecurrentServesOneSequence.into());
-        }
         self.check_draft()?;
         let kv = match shapes.layout {
             Layout::Contiguous => KvLayout::Contiguous,
@@ -193,16 +184,21 @@ impl Driver {
                         self.prepare_entry(target, kv, piece_key(piece), rows, head, adapters)?;
                     }
                 }
+            }
+        }
+        // The residency of this model is known once an entry compiled, before any window compiles.
+        self.check_speculation_state()?;
+        if verifies_windows(self.residency) {
+            return Err(InvalidOptions::RecurrentHasNoVerifyWindows.into());
+        }
+        let adapters = std::iter::once(None).chain(shapes.adapters.iter().copied().map(Some));
+        for adapters in adapters {
+            for &rows in shapes.rows {
                 for &width in shapes.windows {
                     let key = (width.get(), LogitRows::All);
                     self.prepare_entry(ModelRole::Target, kv, key, rows, Head::GREEDY, adapters)?;
                 }
             }
-        }
-        // The residency of this model is known once an entry compiled.
-        self.check_speculation_state()?;
-        if serves_one(self.residency) {
-            return Err(InvalidOptions::RecurrentServesOneSequence.into());
         }
         self.prepare_speculation(shapes, kv, &pieces)?;
         if self.serving.is_none() {
@@ -215,14 +211,7 @@ impl Driver {
     /// Capture an adapter set: the generation already holding it, or a new one with `adapters` stacked
     /// against the model's weights. Entries for it exist once a `prepare` names it. The serve
     /// lifecycle's LoRA admin route is the caller.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "held for POOT-589 (LoRA admin through the engine)"
-        )
-    )]
-    pub(crate) fn capture_adapter_set(
+    pub fn capture_adapter_set(
         &mut self,
         set: AdapterSet,
         adapters: &[LoraAdapter],
@@ -233,17 +222,7 @@ impl Driver {
 
     /// Unload `generation` and drop its prepared entries, returning their retained bytes. Refused
     /// while an open sequence holds it. The serve lifecycle's LoRA admin route is the caller.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "held for POOT-589 (LoRA admin through the engine)"
-        )
-    )]
-    pub(crate) fn unload_adapter_set(
-        &mut self,
-        generation: GenerationId,
-    ) -> Result<(), DriverError> {
+    pub fn unload_adapter_set(&mut self, generation: GenerationId) -> Result<(), DriverError> {
         self.lora.check_unloadable(generation)?;
         let dropped: Vec<EntryKey> = self
             .entries
@@ -371,18 +350,18 @@ impl Driver {
 
     /// Admit the `PrefillEmbeds` entries a prompt with embedding rows runs, beside the entries
     /// [`Driver::prepare`] admitted: one per prefill piece `shapes.warm` plans, per head and row
-    /// count. Only the contiguous layout takes embedding rows, so `shapes` must name it, and a
-    /// `prepare` of the same layout must already have published it.
+    /// count. `shapes` must name the layout a `prepare` already published.
     pub fn prepare_embeds(
         &mut self,
         shapes: &ServingShapes<'_>,
     ) -> Result<&DriverCaps, DriverError> {
-        if shapes.layout != Layout::Contiguous {
-            return Err(InvalidRequest::Embeds(EmbedsError::Paged).into());
-        }
         if self.layout != Some(shapes.layout) {
             return Err(InvalidRequest::NotPrepared.into());
         }
+        let kv = match shapes.layout {
+            Layout::Contiguous => KvLayout::Contiguous,
+            Layout::Paged(pool) => pool.kv(),
+        };
         let pieces: Vec<Piece> = match shapes.warm {
             Warm::Admitted => self.chunks.admitted_pieces(),
             Warm::Prompts(lens) => lens.iter().flat_map(|&len| self.chunks.plan(len)).collect(),
@@ -404,7 +383,7 @@ impl Driver {
                             rows,
                             tokens,
                             capacity: self.options.capacity,
-                            kv: KvLayout::Contiguous,
+                            kv,
                             logits: LogitRows::Last,
                         },
                         head,

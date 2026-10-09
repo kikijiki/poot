@@ -79,9 +79,9 @@ pub use packed_bind::{
 pub(crate) use routed_experts::routed_expert_sites;
 pub use stage_split::BoundaryDescriptor;
 #[cfg(test)]
-pub(crate) use stage_split::{
-    StageAssignment, StageSplitError, split_stages, split_stages_after_layers,
-};
+pub(crate) use stage_split::StageSplit;
+pub use stage_split::StageSplitError;
+pub(crate) use stage_split::{CutSite, StageAssignment, split_stages};
 pub use widen::fuse_widening_casts;
 
 #[cfg(test)]

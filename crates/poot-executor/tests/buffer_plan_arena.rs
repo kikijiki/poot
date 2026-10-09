@@ -174,7 +174,12 @@ impl Device for RecordingDevice {
         Ok(())
     }
 
-    fn write(&mut self, _dst: &(), _bytes: &[u8]) -> Result<(), std::convert::Infallible> {
+    fn write(
+        &mut self,
+        _dst: &(),
+        _offset: usize,
+        _bytes: &[u8],
+    ) -> Result<(), std::convert::Infallible> {
         Ok(())
     }
 

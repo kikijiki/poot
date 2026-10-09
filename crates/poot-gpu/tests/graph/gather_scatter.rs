@@ -961,8 +961,8 @@ fn i32_slot_gather_variants_compiled_match_cpu_bit_exact() {
         return;
     };
 
-    // Card 546b: the contract admits `Submission::Replay` only (`staged_replay`), never the deleted
-    // `GpuExecutor::run_resident_kv`'s `Submission::Eager` + raw `&[DeviceBuffer]` state. The bug this
+    // Card 546b: the contract admits `Submission::Replay` only (`staged_replay`), never the `Submission::Eager`
+    // of the deleted `GpuExecutor::run_resident_kv` + raw `&[DeviceBuffer]` state. The bug this
     // row guards (an I32 `Slot::Pos` read as both a `Gather` index and a `Cast`/`DynamicUpdateSlice`
     // source, `planner/cast.rs`'s mirror-lane `Plan::Alias`) is a `compile`-time lane decision, not an
     // execution-model one, so `Submission::Replay` exercises the identical planner path. The Dus/

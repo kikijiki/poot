@@ -82,7 +82,7 @@ pub fn encode_e4m3fn_tensor(shape: Vec<usize>, values: &[f32]) -> Result<HostTen
 
 /// Pack each final-axis row of an E4M3FN tensor independently into little-endian u32 lanes. Newly
 /// allocated words start at zero, so all missing lanes in a ragged row remain deterministic zero
-/// padding. Test-only (card 546b): the production packer was `GpuExecutor::bind_resident`'s E4M3
+/// padding. Test-only (card 546b): the production packer was the deleted `GpuExecutor::bind_resident`'s E4M3
 /// upload path, gone with the rest of the pre-contract executor.
 #[cfg(test)]
 pub(crate) fn pack_portable_words(tensor: &HostTensor) -> Vec<u32> {

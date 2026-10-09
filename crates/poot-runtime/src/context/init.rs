@@ -11,13 +11,7 @@ impl Context {
     /// collection is off entirely (the counters-only default: no query resources are ever created,
     /// and [`Context::drain_device_timing`] always reports nothing); any positive value turns
     /// collection on and bounds it.
-    ///
-    /// Test-only until a typed timing mode constructs it in production: the bench runner's
-    /// pre-driver engines were its one production caller.
-    #[cfg(test)]
-    pub(crate) fn new_with_device_timing(
-        max_in_flight_queries: usize,
-    ) -> Result<Self, RuntimeError> {
+    pub fn new_with_device_timing(max_in_flight_queries: usize) -> Result<Self, RuntimeError> {
         pollster::block_on(Self::new_async(
             max_in_flight_queries > 0,
             max_in_flight_queries,
@@ -43,10 +37,9 @@ impl Context {
         self.next_dispatch_index.set(0);
     }
 
-    /// Whether device-time recording is available (the adapter supports `TIMESTAMP_QUERY`). Test-only: its
-    /// one caller is `tests::profiled_dispatch_tests`.
-    #[cfg(test)]
-    pub(crate) fn timestamps_available(&self) -> bool {
+    /// Whether device-time recording is available (the adapter supports `TIMESTAMP_QUERY`); when it is
+    /// not, a timing-enabled context still reports no device time.
+    pub fn timestamps_available(&self) -> bool {
         self.timestamps
     }
 

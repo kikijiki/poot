@@ -2,7 +2,7 @@
 //! planner never derives one from a model, tensor, layer, or expert name or from a device's position.
 //!
 //! Both tests plan a real layered graph end to end: the tracer-side layer tags
-//! ([`poot_graph_ir::Builder::layer_scope`]) give the stage cuts, `split_stages_after_layers` turns
+//! ([`poot_graph_ir::Builder::layer_scope`]) give the stage cuts, `split_after_layers` turns
 //! them into boundary descriptors, and `plan_stage_communication` turns those and a caller-declared
 //! device placement into communication rows. The layer tags and the placement are the only inputs
 //! that may move the rows.
@@ -13,7 +13,8 @@
 //! - `multi_device_substrate_is_model_neutral`: a planner or split step that branches on a value
 //!   name, so two namings of the same graph plan differently.
 
-use crate::{BoundaryDescriptor, split_stages_after_layers};
+use crate::BoundaryDescriptor;
+use crate::test_support::split_after_layers;
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::op::BinOp;
 use poot_graph_ir::types::TensorType;
@@ -78,7 +79,7 @@ fn plan_rows(
     after_layers: &[usize],
     stage_devices: &[u32],
 ) -> (Vec<BoundaryDescriptor>, Vec<CommunicationRow>) {
-    let split = split_stages_after_layers(graph, after_layers).expect("the layer cuts are legal");
+    let split = split_after_layers(graph, after_layers).expect("the layer cuts are legal");
     let devices: Vec<DeviceId> = stage_devices.iter().copied().map(DeviceId).collect();
     let plan =
         plan_stage_communication(&split.boundaries, &devices).expect("every stage is placed");

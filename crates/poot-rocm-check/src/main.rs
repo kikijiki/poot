@@ -1,4 +1,4 @@
-//! ROCm/HSA execution check (card 106 M1, 106b): load poot-emitted HSACO via poot-rocm-runtime
+//! ROCm/HSA execution check: load poot-emitted HSACO via poot-rocm-runtime
 //! and verify against the CPU oracle. Analog of `poot-ptx-check` for the AMD path.
 //!
 //! The `--add` invocation:
@@ -17,7 +17,7 @@
 //!
 //! The `--pcie-publication-receipt` mode (Card 333) opens the device-ring receipt constructor, asserts a
 //! `PcieDeviceMemory` contract on a discrete PCIe GPU, and replays a multi-packet add graph with changing
-//! inputs via `replay_graph_batched`. ROCr reads `HSA_ALLOCATE_QUEUE_DEV_MEM=1` once, when the runtime
+//! inputs via `enqueue_graph_batched`. ROCr reads `HSA_ALLOCATE_QUEUE_DEV_MEM=1` once, when the runtime
 //! loads, and the receipt constructor refuses to run without it, so this binary sets it as the first
 //! statement of `main` in that mode, while the process is still single-threaded. On an APU host the
 //! mode prints a SKIP and exits 0 unless ROCm is required.
@@ -364,7 +364,7 @@ fn run_pcie_publication_receipt() -> Result<(), CheckError> {
         let elements = [ElementKind::F32, ElementKind::F32, ElementKind::F32];
         let elements_per_packet: Vec<&[ElementKind]> =
             std::iter::repeat_n(elements.as_slice(), dispatches.len()).collect();
-        ctx.replay_graph_batched(&dispatches, &elements_per_packet)?;
+        ctx.enqueue_graph_batched(&dispatches, &elements_per_packet)?;
 
         for (c_buf, want) in c_bufs.iter().zip(&wants) {
             let mut got = vec![0.0f32; n];
@@ -539,10 +539,6 @@ mod tests {
             &RocmError::ApuNotDiscrete,
             env(DeviceBackend::Rocm.variable())
         ));
-        assert!(
-            pcie_receipt_may_skip(&RocmError::ApuNotDiscrete, env("POOT_REQUIRE_GPU")),
-            "the retired all-backend switch must not require the ROCm receipt"
-        );
         for other in DeviceBackend::ALL
             .into_iter()
             .filter(|other| *other != DeviceBackend::Rocm)

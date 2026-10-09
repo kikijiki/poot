@@ -4,6 +4,7 @@
 //! discrete GPU the receipt runs. Removing the binary's own `set_var` fails every case with the
 //! provenance conflict.
 
+use poot_test_util::contained_child::ContainChild;
 use std::process::Command;
 
 #[test]
@@ -17,6 +18,7 @@ fn pcie_receipt_without_the_env_reaches_the_device_checks() {
         std::env::var("CARGO_BIN_EXE_poot-rocm-check")
             .expect("CARGO_BIN_EXE_poot-rocm-check must be set by cargo for test binaries"),
     )
+    .contained()
     .arg("--pcie-publication-receipt")
     .env_remove("HSA_ALLOCATE_QUEUE_DEV_MEM")
     // Required-backend switches turn the APU skip into a failure by design; this row checks the

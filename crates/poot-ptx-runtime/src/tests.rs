@@ -13,10 +13,6 @@ mod require_backend_tests {
             .is_err()
         };
         assert!(fails_open(DeviceBackend::Ptx.variable()));
-        assert!(
-            !fails_open("POOT_REQUIRE_GPU"),
-            "the retired all-backend switch must not require Ptx"
-        );
         for other in DeviceBackend::ALL
             .into_iter()
             .filter(|other| *other != DeviceBackend::Ptx)
@@ -883,7 +879,9 @@ fn every_non_dispatch_operation_refuses_while_a_capture_is_open() {
         }),
         ("upload_f16", |ctx, _| ctx.upload_f16(&[0, 0]).map(drop)),
         ("update_f32", |ctx, buf| ctx.update_f32(buf, &[1.0; 4])),
-        ("write_bytes", |ctx, buf| ctx.write_bytes(buf, &[0u8; 16])),
+        ("write_bytes", |ctx, buf| {
+            ctx.write_bytes(buf, 0, &[0u8; 16])
+        }),
         ("read_bytes", |ctx, buf| ctx.read_bytes(buf, &mut [0u8; 16])),
         ("download_f32", |ctx, buf| ctx.download_f32(buf).map(drop)),
         ("download_i32", |ctx, buf| ctx.download_i32(buf).map(drop)),
@@ -1420,5 +1418,46 @@ fn ptx_buffer_and_its_context_move_into_another_thread() {
     assert_eq!(
         handle.join().expect("worker thread panicked"),
         vec![1.0, 2.0, 3.0, 4.0]
+    );
+}
+
+/// POOT-1074: a write at a non-zero byte offset lands there and leaves its neighbours intact; an offset
+/// outside the buffer and an overflowing one are typed refusals that write nothing.
+/// Mutation: ignore `range.byte_offset` in `PtxContext::write_bytes`; the neighbour check goes red.
+#[test]
+fn a_write_at_an_offset_leaves_its_neighbours_intact_and_bad_ranges_are_typed() {
+    let ctx = match PtxContext::new() {
+        Ok(ctx) => ctx,
+        Err(error) => {
+            eprintln!("SKIP a_write_at_an_offset_leaves_its_neighbours_intact: {error}");
+            return;
+        }
+    };
+    let words =
+        |values: &[f32]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let buf = ctx
+        .alloc_storage(BufferRole::State, BufferStorage::f32(), 4)
+        .expect("allocation");
+    ctx.write_bytes(&buf, 0, &words(&[1.0, 2.0, 3.0, 4.0]))
+        .unwrap();
+    ctx.write_bytes(&buf, 4, &words(&[9.0, 9.0])).unwrap();
+    let mut got = vec![0u8; 16];
+    ctx.read_bytes(&buf, &mut got).unwrap();
+    assert_eq!(got, words(&[1.0, 9.0, 9.0, 4.0]), "only bytes 4..12 change");
+    for (offset, len) in [(16, 4), (12, 8), (usize::MAX, 4)] {
+        let error = ctx.write_bytes(&buf, offset, &vec![0u8; len]).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                PtxError::RangeOutOfBounds { .. } | PtxError::RangeOverflow { .. }
+            ),
+            "offset {offset} len {len}: {error:?}"
+        );
+    }
+    ctx.read_bytes(&buf, &mut got).unwrap();
+    assert_eq!(
+        got,
+        words(&[1.0, 9.0, 9.0, 4.0]),
+        "refused writes change nothing"
     );
 }

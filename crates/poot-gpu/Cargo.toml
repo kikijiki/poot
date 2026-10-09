@@ -1,6 +1,6 @@
 [package]
 name = "poot-gpu"
-description = "GPU graph executor: run a poot-graph-ir Graph by dispatching a generated kernel per op"
+description = "wgpu/Vulkan device backend: the poot-executor Device implementation that compiles kernel bodies for the SPIR-V target"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

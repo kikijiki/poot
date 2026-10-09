@@ -137,7 +137,7 @@ impl Device for FaultyDevice {
         Ok(())
     }
 
-    fn write(&mut self, _dst: &(), _bytes: &[u8]) -> Result<(), FaultyError> {
+    fn write(&mut self, _dst: &(), _offset: usize, _bytes: &[u8]) -> Result<(), FaultyError> {
         Ok(())
     }
 

@@ -136,6 +136,7 @@ pub fn apply_lora<V: ValidationChannel>(
         output,
         state,
         validations,
+        exports,
     } = g.clone();
     let plain = Graph {
         values,
@@ -145,6 +146,7 @@ pub fn apply_lora<V: ValidationChannel>(
         eqns,
         output,
         validations: poot_graph_ir::NoValidations,
+        exports,
         state,
     };
     let Resumed {
@@ -286,6 +288,7 @@ pub fn apply_lora<V: ValidationChannel>(
         slots,
         output,
         state,
+        exports,
         ..
     } = declared;
     Ok(Graph {
@@ -296,6 +299,7 @@ pub fn apply_lora<V: ValidationChannel>(
         eqns,
         output,
         validations,
+        exports,
         state,
     })
 }

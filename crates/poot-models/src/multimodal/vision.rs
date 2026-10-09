@@ -96,25 +96,6 @@ pub fn idefics3_split_geometry(h: usize, w: usize, tile: usize) -> (usize, usize
     }
 }
 
-/// The full idefics3 split geometry for a raw `h x w` image at config `cfg`: the tile `(rows, cols)` and the total
-/// `n_frames` (`rows*cols + 1`, or `1` when unsplit). Pure integer arithmetic; the source of truth for the
-/// connector's per-frame visual-token accounting.
-pub fn idefics3_frame_geometry(
-    h: usize,
-    w: usize,
-    cfg: &PreprocessConfig,
-) -> (usize, usize, usize) {
-    let (rh, rw) = idefics3_resize_longest(h, w, cfg.longest_edge);
-    let (eh, ew) = idefics3_resize_for_encoder(rh, rw, cfg.image_size);
-    let (rows, cols) = idefics3_split_geometry(eh, ew, cfg.image_size);
-    let n_frames = if rows == 0 && cols == 0 {
-        1
-    } else {
-        rows * cols + 1
-    };
-    (rows, cols, n_frames)
-}
-
 /// The result of the idefics3 splitting pipeline: the ordered channel-first frames (tiles row-major, then the
 /// global thumbnail last, matching the reference `replace_image_token` prompt order) plus the tile grid.
 pub struct Idefics3Frames {
@@ -232,8 +213,8 @@ fn normalize_frame(rgb: &[f32], tile: usize, cfg: &PreprocessConfig) -> Vec<f32>
 /// The full idefics3 splitting pipeline for a decoded `h x w` interleaved-RGB image (values `[0, 255]`): resize the
 /// longest edge to `cfg.longest_edge` (Lanczos), round each edge up to a multiple of `cfg.image_size`, crop the
 /// `rows x cols` tiles, append the global thumbnail (whole image resized to `image_size`), and rescale+normalize
-/// each. Returns the ordered [`Idefics3Frames`] (tiles row-major then global). Multi-frame replacement for
-/// [`preprocess_image`]'s single squished frame.
+/// each. Returns the ordered [`Idefics3Frames`] (tiles row-major then global); the frame count is `rows * cols + 1`,
+/// or `1` when the image is not split.
 pub fn idefics3_preprocess(
     rgb: &[f32],
     h: usize,
@@ -403,7 +384,7 @@ mod tests {
     }
 
     #[test]
-    fn idefics3_frame_geometry_matches_reference_formula() {
+    fn idefics3_preprocess_split_grid_matches_reference_formula() {
         // Faithful to image_processing_idefics3.py: longest edge -> 2048 (upscaling small images too), each
         // edge rounded UP to a multiple of 512, then ceil(h/512) x ceil(w/512) tiles + 1 global thumbnail.
         // Expected (rows, cols, n_frames) hand-computed from the source arithmetic (h, w in that order):
@@ -422,7 +403,8 @@ mod tests {
             ((300, 100), (4, 2, 9)),
         ];
         for ((h, w), want) in cases {
-            let got = idefics3_frame_geometry(h, w, &cfg);
+            let out = idefics3_preprocess(&vec![100.0; h * w * 3], h, w, &cfg);
+            let got = (out.rows, out.cols, out.frames.len());
             assert_eq!(got, want, "geometry for {h}x{w}");
         }
     }
@@ -432,12 +414,14 @@ mod tests {
         // A non-square image is not forced to a square tile grid: a landscape image yields cols > rows and a portrait
         // rows > cols.
         let cfg = smolvlm();
-        let (lr, lc, _) = idefics3_frame_geometry(512, 1536, &cfg); // wide landscape
+        let wide = idefics3_preprocess(&vec![100.0; 512 * 1536 * 3], 512, 1536, &cfg);
+        let (lr, lc) = (wide.rows, wide.cols);
         assert!(
             lc > lr,
             "landscape must have more columns than rows: {lr}x{lc}"
         );
-        let (pr, pc, _) = idefics3_frame_geometry(1536, 512, &cfg); // tall portrait
+        let tall = idefics3_preprocess(&vec![100.0; 1536 * 512 * 3], 1536, 512, &cfg);
+        let (pr, pc) = (tall.rows, tall.cols);
         assert!(
             pr > pc,
             "portrait must have more rows than columns: {pr}x{pc}"
@@ -473,9 +457,6 @@ mod tests {
             assert_eq!(f.len(), 3 * 8 * 8, "frame {i} is [3,8,8]");
             assert!(f.iter().all(|v| v.is_finite()), "frame {i} finite");
         }
-        // the geometry helper agrees with the produced frame count.
-        let (_, _, n) = idefics3_frame_geometry(h, w, &cfg);
-        assert_eq!(n, out.frames.len());
     }
 
     #[test]
@@ -520,11 +501,15 @@ mod tests {
         ] {
             let rgb: Vec<f32> = (0..h * w * 3).map(|i| (i % 256) as f32).collect();
             let out = idefics3_preprocess(&rgb, h, w, &cfg);
-            let (_, _, n_frames) = idefics3_frame_geometry(h, w, &cfg);
+            let n_frames = if out.rows == 0 && out.cols == 0 {
+                1
+            } else {
+                out.rows * out.cols + 1
+            };
             assert_eq!(
                 out.frames.len(),
                 n_frames,
-                "{h}x{w}: frame count vs geometry"
+                "{h}x{w}: frame count vs tile grid"
             );
             for (i, f) in out.frames.iter().enumerate() {
                 assert_eq!(f.len(), 3 * s * s, "{h}x{w} frame {i} shape");

@@ -117,7 +117,8 @@ pub fn pool(hidden: &[f32], width: usize, pooling: Pooling) -> Vec<f32> {
 /// A relevance ranking: `(index, score)` pairs, most relevant first.
 pub type Ranking = Vec<(usize, f32)>;
 
-fn rank(scores: impl IntoIterator<Item = f32>) -> Ranking {
+/// `scores` ordered most relevant first, each with its index in the input.
+pub fn rank(scores: impl IntoIterator<Item = f32>) -> Ranking {
     let mut ranked: Ranking = scores.into_iter().enumerate().collect();
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
     ranked

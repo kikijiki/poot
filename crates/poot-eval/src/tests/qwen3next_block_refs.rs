@@ -146,7 +146,7 @@ fn gated_delta_net_decode_matches_recurrence() {
 }
 
 /// Card 188 / SC-001: `gated_delta_net_decode` (ops.rs:666-697) reads every shape off its inputs and never hardcodes a
-/// leading batch dim (its `matmul` calls treat leading `[B,H,...]` dims as batch dims, `docs/graph-architecture.md` sec
+/// leading batch dim (its `matmul` calls treat leading `[B,H,...]` dims as batch dims, the graph architecture notes, sec
 /// 3.2). This CPU oracle proves it is batch-generic: pack `B` independent rows (distinct nonzero q/k/v/g/beta and distinct
 /// nonzero starting state per row) into one call and check every row's `(o, s_out)` is bit-identical to an independent
 /// B=1 call on that row (no cross-row leakage, no batch-order dependence). Swept at `B in {2,4,8}`.

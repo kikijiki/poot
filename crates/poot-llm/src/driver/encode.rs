@@ -2,7 +2,8 @@
 //! states (or scores) for the host to pool or rank (POOT-739, dmodel `Phase::Encode`).
 //!
 //! The rows are either token sequences (an embedding or reranking encoder, or a decoder's embedding
-//! pass) or image frames (a vision tower). A step runs on one entry of its shape, prepared on first
+//! pass), image frames (a vision tower of a fixed grid) or patch rows (a vision tower whose windows
+//! depend on the image's grid). A step runs on one entry of its shape, prepared on first
 //! use like `generate`'s and kept under the same limits; token rows right-pad to the next power of two
 //! so a finite set of entries serves every length, and a padded position is masked, never attended to.
 //! An encode step carries no cache any later step reads, so it refuses while a sequence is open (its
@@ -10,7 +11,9 @@
 
 use std::num::NonZeroUsize;
 
+use poot_executor::{ExecError, ExecutableId, StateScope};
 use poot_models::model::{KvLayout, LogitRows, Phase, StepShape};
+use poot_models::qwen_vl_vision::PatchGeometry;
 
 use super::error::{DriverError, EncodeError, InvalidRequest};
 use super::host_sample;
@@ -26,6 +29,12 @@ pub enum EncodeRow<'a> {
     /// One image frame of a vision tower: its normalized pixels, channel first, and the positions
     /// (patches) the tower traces per frame.
     Frame { pixels: &'a [f32], positions: usize },
+    /// One image or video of a windowed vision tower: its patches in the tower's window order
+    /// (`patch_dim` values each) and the grid facts the tower attends and rotates by.
+    Patches {
+        pixels: &'a [f32],
+        geometry: &'a PatchGeometry,
+    },
 }
 
 /// What one [`Driver::encode`] step runs: every row of one kind.
@@ -46,6 +55,23 @@ pub struct Encoded {
 }
 
 impl Driver {
+    /// Turn a failed encode step into the driver's answer. The step graph's cache is scratch no later
+    /// step reads, so a device failure that left the device usable (a fault, a failed transaction) is
+    /// proven recoverable by resetting the executable's state: that is [`DriverError::EncodeStep`].
+    /// A poisoned device, a failed reset or any other error is returned as it came.
+    fn recover_encode(&mut self, exe: ExecutableId, error: DriverError) -> DriverError {
+        let DriverError::Device(
+            step @ (ExecError::Device(_) | ExecError::Fault { .. } | ExecError::NeedsReset(_)),
+        ) = error
+        else {
+            return error;
+        };
+        match self.executor.reset_state(exe, StateScope::All) {
+            Ok(()) => DriverError::EncodeStep(step),
+            Err(reset) => DriverError::Device(reset),
+        }
+    }
+
     /// Run one encode step over `request`'s rows.
     pub fn encode(&mut self, request: &EncodeRequest<'_>) -> Result<Encoded, DriverError> {
         let EncodeRequest { rows } = *request;
@@ -86,6 +112,15 @@ impl Driver {
                     .next_power_of_two()
                     .min(self.handle.config().max_positions)
                     .max(longest)
+            }
+            EncodeRow::Patches { geometry, .. } => {
+                let positions = geometry.patches();
+                if rows.iter().any(
+                    |row| !matches!(row, EncodeRow::Patches { geometry, .. } if geometry.patches() == positions),
+                ) {
+                    return Err(InvalidRequest::Encode(EncodeError::Mixed).into());
+                }
+                positions
             }
             EncodeRow::Frame { positions, .. } => {
                 if rows.iter().any(
@@ -136,6 +171,25 @@ impl Driver {
                         }
                     }
                 }
+                EncodeRow::Patches { pixels, geometry } => {
+                    if !entry.slots.iter().any(|spec| spec.role == SlotRole::Window) {
+                        return Err(InvalidRequest::Encode(EncodeError::NoGeometry).into());
+                    }
+                    let want = frame.unwrap_or(0);
+                    if pixels.len() != want {
+                        return Err(InvalidRequest::Encode(EncodeError::FrameLength {
+                            row: i,
+                            got: pixels.len(),
+                            want,
+                        })
+                        .into());
+                    }
+                    data.pixels.extend_from_slice(pixels);
+                    data.pos_h.extend_from_slice(geometry.pos_h());
+                    data.pos_w.extend_from_slice(geometry.pos_w());
+                    data.window.extend_from_slice(geometry.window());
+                    data.frame.extend_from_slice(geometry.frame());
+                }
                 EncodeRow::Frame { pixels, .. } => {
                     let want = frame.unwrap_or(0);
                     if pixels.len() != want {
@@ -151,7 +205,10 @@ impl Driver {
             }
         }
 
-        let mut outputs = self.execute(&entry, &data)?;
+        let mut outputs = match self.execute(&entry, &data) {
+            Ok(outputs) => outputs,
+            Err(error) => return Err(self.recover_encode(entry.exe, error)),
+        };
         let out = host_sample::read_logits(&mut outputs)?;
         let [out_rows, positions, out_width] = entry.output[..] else {
             unreachable!("an encode program returns [rows, positions, width]");

@@ -1790,6 +1790,7 @@ dependencies = [
  "poot-graph-plan",
  "poot-llm",
  "poot-models",
+ "poot-profile",
  "poot-quant",
  "serde_json",
 ]
@@ -1847,11 +1848,15 @@ dependencies = [
 name = "poot-executor-parity"
 version = "0.0.0"
 dependencies = [
+ "bytemuck",
  "poot-executor",
  "poot-graph-ir",
  "poot-graph-plan",
  "poot-models",
+ "poot-profile",
  "poot-quant",
+ "poot-runtime-common",
+ "poot-target",
  "poot-tensor",
  "poot-test-util",
  "serde_json",
@@ -1960,6 +1965,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "bytemuck",
+ "clap",
  "image",
  "minijinja",
  "minijinja-contrib",
@@ -1971,6 +1977,7 @@ dependencies = [
  "poot-graph-ir",
  "poot-graph-plan",
  "poot-kernel-ir",
+ "poot-llm",
  "poot-load",
  "poot-models",
  "poot-profile",
@@ -1986,7 +1993,6 @@ dependencies = [
  "poot-test-util",
  "poot-vulkan-device",
  "regex-automata",
- "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2116,6 +2122,7 @@ dependencies = [
  "poot-rocm-runtime",
  "poot-runtime-common",
  "poot-target",
+ "poot-test-util",
  "thiserror 2.0.18",
 ]
 
@@ -2190,7 +2197,9 @@ name = "poot-serve"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "clap",
+ "image",
  "libc",
  "poot-executor",
  "poot-graph-ir",
@@ -2201,6 +2210,7 @@ dependencies = [
  "poot-quant",
  "poot-runtime-common",
  "poot-target",
+ "poot-tensor",
  "poot-test-util",
  "ring",
  "serde",
@@ -2232,6 +2242,7 @@ name = "poot-test-util"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "libc",
  "poot-codegen",
  "poot-eval",
  "poot-graph-ir",

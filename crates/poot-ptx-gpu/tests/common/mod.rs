@@ -5,9 +5,12 @@
 //! these fixtures have no driver to supply one.
 //!
 //! `tests/common/mod.rs` compiles once per test binary that declares `mod common;`; each binary uses a
-//! different subset (some only `run_resident`, some only `DecodeEntry`), so dead-code warnings here are
-//! expected and suppressed rather than meaningful per binary.
-#![allow(dead_code)]
+//! different subset (some only `run_resident`, some only `DecodeEntry`), so the blanket allow below is
+//! the only way to share them (a per-binary `dead_code` is never meaningful here).
+#![allow(
+    dead_code,
+    reason = "compiled once per test binary, each using a different subset"
+)]
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -162,7 +165,7 @@ fn slot_inputs<'a>(g: &Graph, inputs: &'a HashMap<ValueId, Value>) -> StepInputs
 
 /// Device-resident, stateless run of `g` on the executor contract: a fresh one-shot executable loaded
 /// from `inputs`'s own consts, stepped once, unloaded. `g` must declare no carried state. The PTX
-/// twin of `PtxGraphExecutor::run_resident`/`run_resident_kv` before Card 549 (state must already be
+/// twin of the deleted `PtxGraphExecutor::run_resident`/`run_resident_kv` before Card 549 (state must already be
 /// zero, since the contract always zero-seeds a freshly declared state buffer - every fixture below
 /// that carries state starts from zero, matching the old tests' own "zero seeded" setup).
 pub fn run_resident(
@@ -377,8 +380,13 @@ impl Device for PtxDeviceProxy<'_> {
     fn replay(&mut self, recording: &Self::Recording) -> Result<(), Self::Error> {
         self.0.replay(recording)
     }
-    fn write(&mut self, dst: &Self::Buffer, bytes: &[u8]) -> Result<(), Self::Error> {
-        self.0.write(dst, bytes)
+    fn write(
+        &mut self,
+        dst: &Self::Buffer,
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), Self::Error> {
+        self.0.write(dst, offset, bytes)
     }
     fn read(&mut self, src: &Self::Buffer, out: &mut [u8]) -> Result<(), Self::Error> {
         self.0.read(src, out)

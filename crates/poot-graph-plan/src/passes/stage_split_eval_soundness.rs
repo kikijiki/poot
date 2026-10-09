@@ -7,7 +7,6 @@
 
 use std::collections::HashMap;
 
-use super::stage_split::{StageAssignment, split_stages};
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
 use poot_graph_ir::Graph;
 use poot_graph_ir::ValueId;
@@ -96,9 +95,7 @@ fn adr0099_s2_split_then_chain_matches_the_unsplit_graph() {
         .expect("the unsplit graph's output is dense");
 
     for (cuts, expected_boundaries) in [(vec![3usize], 1usize), (vec![3usize, 6], 2usize)] {
-        let assignment =
-            StageAssignment::from_cuts(&cuts, graph.eqns.len()).expect("the cuts are legal");
-        let split = split_stages(&graph, &assignment).expect("the graph splits");
+        let split = crate::test_support::split_before(&graph, &cuts).expect("the graph splits");
         assert_eq!(split.stages.len(), cuts.len() + 1);
         assert_eq!(
             split.boundaries.len(),
@@ -106,43 +103,26 @@ fn adr0099_s2_split_then_chain_matches_the_unsplit_graph() {
             "the fixture must actually cross the cut, or this row proves nothing"
         );
 
-        let mut bound = inputs.clone();
-        let last = split.stages.len() - 1;
-        for (index, stage) in split.stages.iter().enumerate() {
-            let env = eval(
-                &stage.graph,
-                &bound,
-                EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
-            )
-            .unwrap_or_else(|error| panic!("stage {index} did not evaluate: {error}"))
-            .environment
-            .unwrap();
-            for &value in &stage.outputs {
-                let handed = env[value].as_ref().unwrap_or_else(|| {
-                    panic!("stage {index} did not compute the boundary value v{value}")
-                });
-                let expected = reference[value].as_ref().unwrap_or_else(|| {
-                    panic!("the unsplit graph did not compute the boundary value v{value}")
-                });
-                assert_eq!(
-                    bits(handed.as_host().expect("boundary value is dense")),
-                    bits(expected.as_host().expect("boundary value is dense")),
-                    "stage {index} handed on a different v{value}"
-                );
-                bound.insert(value, handed.clone());
-            }
-            if index == last {
-                let output = env[stage.graph.output]
-                    .as_ref()
-                    .expect("the final stage computes the graph output")
-                    .as_host()
-                    .expect("the graph output is dense");
-                assert_eq!(
-                    bits(output),
-                    bits(reference_output),
-                    "the chained stages disagree with the unsplit output"
-                );
-            }
+        let chained = crate::test_support::chain(
+            &graph,
+            &split.stages.iter().map(|s| &s.graph).collect::<Vec<_>>(),
+            &inputs,
+        );
+        assert_eq!(chained.boundaries.len(), expected_boundaries);
+        for (id, handed) in &chained.boundaries {
+            let expected = reference[id.0].as_ref().unwrap_or_else(|| {
+                panic!("the unsplit graph did not compute the boundary value {id:?}")
+            });
+            assert_eq!(
+                bits(handed.as_host().expect("boundary value is dense")),
+                bits(expected.as_host().expect("boundary value is dense")),
+                "a stage handed on a different {id:?}"
+            );
         }
+        assert_eq!(
+            bits(chained.output.as_host().expect("the graph output is dense")),
+            bits(reference_output),
+            "the chained stages disagree with the unsplit output"
+        );
     }
 }

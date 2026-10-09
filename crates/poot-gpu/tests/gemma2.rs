@@ -97,7 +97,7 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
 
 /// Bind every input deterministically (weights seeded by name so CPU and GPU binds agree bit-for-bit).
 /// `include_state`: the CPU path (`eval_with_state`) wants `Storage::State` as a zero-seeded input; the
-/// GPU path (`GpuExecutor::run_prefill`) zero-seeds state itself and expects `inputs` to hold the rest.
+/// executor contract zero-seeds state itself (the deleted `GpuExecutor::run_prefill` did too) and expects `inputs` to hold the rest.
 fn bind(
     g: &poot_graph_ir::Graph,
     n: usize,
@@ -139,7 +139,7 @@ fn bind(
 /// [`WeightStore`] entry (the identical seed-by-name data `bind` uploads for the CPU oracle, so the
 /// two paths agree bit for bit), every `Storage::Slot` input becomes a [`StepInputs`] row, and
 /// `Storage::State` is left out entirely - the contract zero-seeds a newly allocated state buffer on
-/// first use, the same zero seed `GpuExecutor::run_prefill` used to upload by hand.
+/// first use, the same zero seed the deleted `GpuExecutor::run_prefill` used to upload by hand.
 fn gpu_consts_and_slots(
     g: &poot_graph_ir::Graph,
     n: usize,
@@ -235,7 +235,7 @@ fn gemma2_softcap_flash_prefill_gpu_matches_cpu() {
             .unwrap(),
     );
 
-    // Card 535b: `compile` (not the raw `optimize()`), like `run_prefill_runs_a_flash_fused_compiled_graph_and_matches_cpu`
+    // Card 535b: `compile` (not the raw `optimize()`), like `prefill_runs_a_flash_fused_compiled_graph_and_matches_cpu`
     // (qwen2.rs) and `deepseek32_dsa_prefill_gpu_matches_cpu` - the same graph the contract steps below,
     // so the structural assertion below is checked on the actual artifact under test, not a stand-in for
     // it. `compile` runs strictly more than `optimize()` (legalize, dtype passes); this synthetic F32
@@ -295,7 +295,7 @@ fn gemma2_softcap_flash_prefill_gpu_matches_cpu() {
     // `program`), so the caller binds the consts/slots directly against the compiled `opt` graph;
     // `compile` preserves `g`'s input/const identity, so binding against it stays valid. Card 546a's
     // contract zero-seeds a newly allocated state buffer on first use (`Engine`'s own state arena), the
-    // same zero seed `GpuExecutor::run_prefill` used to upload by hand.
+    // same zero seed the deleted `GpuExecutor::run_prefill` used to upload by hand.
     let exe = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
     let entry = exec.add_entry(exe, &program).unwrap();
     let inputs = step_inputs(&slot_binds);

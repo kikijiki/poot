@@ -1,6 +1,7 @@
 //! Process configuration, model startup, listener orchestration, and graceful shutdown.
 
 use std::net::TcpListener;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -8,7 +9,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use poot_llm::driver::{BackendChoice, LoadOptions, ModelHandle, open_executor};
+use poot_llm::driver::{BackendChoice, DraftPolicy, LoadOptions, ModelHandle, open_executor};
+use poot_llm::encoders::Pooling;
+use poot_llm::front_end::{Idefics3Checkpoint, is_idefics3_dir};
 use poot_models::registry::Registry;
 
 use crate::admin::{LoraAdminPolicy, LoraAdminPolicyMode};
@@ -25,7 +28,8 @@ use crate::lifecycle::{
     reset_drain_cancellation, server_drain_timeout,
 };
 use crate::metrics::{CacheMetrics, Histogram, Metrics, SpeculativeMetrics};
-use crate::types::{Backend, Job, SHUTDOWN};
+use crate::types::{EngineMsg, EngineView, SHUTDOWN, Served};
+use crate::vision::spawn_image_front_end;
 
 /// No model path was given and `POOT_MODELS_DIR` is unset or empty.
 #[derive(Debug, thiserror::Error)]
@@ -55,6 +59,46 @@ struct Cli {
     /// backend is tried.
     #[arg(long, default_value = "auto", value_parser = parse_backend)]
     backend: BackendChoice,
+    /// Speculate by prompt lookup: propose the K tokens that followed the latest earlier occurrence of
+    /// the sequence's last NGRAM tokens, written `NGRAM:K` (split at the first colon). Exclusive with
+    /// `--draft-model`; `draft_policy` refuses both.
+    #[arg(long, value_name = "NGRAM:K")]
+    draft_lookup: Option<String>,
+    /// Speculate with a second model that proposes K tokens a round, written `PATH:K` (split at the last
+    /// colon, so the path may contain colons). Its vocabulary must agree with the served model's.
+    #[arg(long, value_name = "PATH:K")]
+    draft_model: Option<String>,
+}
+
+/// The draft policy the flags name: `Off` with neither flag. A `--draft-model` checkpoint is loaded
+/// here, so a path that does not load is a startup error before the listener binds.
+fn draft_policy(lookup: Option<&str>, model: Option<&str>) -> Result<DraftPolicy> {
+    fn count(text: &str, what: &str) -> Result<NonZeroUsize> {
+        text.parse::<NonZeroUsize>()
+            .with_context(|| format!("{what} {text:?} is not a positive integer"))
+    }
+    match (lookup, model) {
+        (None, None) => Ok(DraftPolicy::Off),
+        (Some(spec), None) => {
+            let (ngram, k) = spec
+                .split_once(':')
+                .with_context(|| format!("--draft-lookup {spec:?}: expected NGRAM:K"))?;
+            Ok(DraftPolicy::PromptLookup {
+                ngram: count(ngram, "the n-gram length")?,
+                k: count(k, "the draft length")?,
+            })
+        }
+        (None, Some(spec)) => {
+            let (path, k) = spec
+                .rsplit_once(':')
+                .with_context(|| format!("--draft-model {spec:?}: expected PATH:K"))?;
+            Ok(DraftPolicy::DraftModel {
+                k: count(k, "the draft length")?,
+                handle: load_model(path).context("load the draft model")?,
+            })
+        }
+        (Some(_), Some(_)) => anyhow::bail!("--draft-lookup and --draft-model are exclusive"),
+    }
 }
 
 fn parse_backend(name: &str) -> Result<BackendChoice, String> {
@@ -145,30 +189,41 @@ fn load_model(model_dir: &str) -> Result<Arc<ModelHandle>> {
     Ok(model)
 }
 
+/// Load the served model. A SmolVLM (idefics3) checkpoint is served by its text tower, with its image
+/// front end beside it; any other checkpoint is the model itself.
+fn load_served(model_dir: &str) -> Result<(Arc<ModelHandle>, Option<Arc<Idefics3Checkpoint>>)> {
+    let path = std::path::Path::new(model_dir);
+    if !is_idefics3_dir(path) {
+        return Ok((load_model(model_dir)?, None));
+    }
+    tracing::info!(model_dir, "loading vision-language model");
+    let checkpoint = Idefics3Checkpoint::read(
+        path,
+        &Registry::builtin().context("build the family registry")?,
+    )
+    .context("load vision-language model")?;
+    Ok((Arc::clone(checkpoint.text()), Some(Arc::new(checkpoint))))
+}
+
 /// Start the engine thread and wait for it to report its plan. The device is opened, the workload fitted
 /// and prepared, and the loop run on that one thread: an executor is not `Send`, so the driver cannot be
 /// built elsewhere and moved in. A startup failure comes back here as the error, before the listener
-/// binds; a started engine returns its plan and the metrics its loop updates.
+/// binds; a started engine returns the metrics its loop updates and the view of itself it publishes for the
+/// connection threads.
 fn spawn_engine(
     workers: &mut WorkerRegistry,
     model: Arc<ModelHandle>,
-    backend: BackendChoice,
+    args: EngineArgs,
     model_name: String,
     health: &EngineHealth,
-    jobs: mpsc::Receiver<Job>,
-) -> Result<(EnginePlan, Arc<Metrics>)> {
-    type Startup = Result<(EnginePlan, Arc<Metrics>), StartupError>;
+    jobs: mpsc::Receiver<EngineMsg>,
+) -> Result<(Arc<Metrics>, EngineView)> {
+    type Startup = Result<(Arc<Metrics>, EngineView), StartupError>;
     let (started_tx, started_rx) = mpsc::channel::<Startup>();
     let health = health.clone();
     workers
         .spawn("poot-engine", move || {
-            let started = EnginePlan::build(
-                &EngineArgs::new(backend),
-                &model,
-                open_executor,
-                device_budget,
-                &health,
-            );
+            let started = EnginePlan::build(&args, &model, open_executor, device_budget, &health);
             let Started { plan, driver } = match started {
                 Ok(started) => started,
                 Err(error) => {
@@ -188,11 +243,17 @@ fn spawn_engine(
                 "engine plan"
             );
             let metrics = Arc::new(new_metrics(model_name, &plan, &driver.live_role_bytes()));
-            if started_tx.send(Ok((plan, Arc::clone(&metrics)))).is_err() {
+            let view = EngineView::new(plan.caps.clone());
+            let started = (Arc::clone(&metrics), view.clone());
+            if started_tx.send(Ok(started)).is_err() {
                 return;
             }
-            let engine =
-                run_engine_thread(DriverEngine::new(driver, model), jobs, &metrics, &health);
+            let engine = run_engine_thread(
+                DriverEngine::new(driver, model, view),
+                jobs,
+                &metrics,
+                &health,
+            );
             retain_dead_engine(engine, &health);
         })
         .context("spawn the engine thread")?;
@@ -245,9 +306,7 @@ fn new_metrics(
         cache: CacheMetrics {
             gpu_weight_bytes: AtomicU64::new(live(poot_executor::BufferRole::Weight)),
             gpu_kv_bytes: AtomicU64::new(live(poot_executor::BufferRole::State)),
-            kv_total_blocks: AtomicU64::new(
-                plan.caps.as_ref().map_or(0, |caps| caps.kv_blocks as u64),
-            ),
+            kv_total_blocks: AtomicU64::new(plan.caps.kv_blocks as u64),
             gpu_vram_total_bytes: AtomicU64::new(plan.budget.available_bytes.unwrap_or(0)),
             ..CacheMetrics::default()
         },
@@ -271,21 +330,37 @@ pub(crate) fn run() -> Result<()> {
 
     // The engine plan decides the backend, fits the workload to the device and prepares it. A refused
     // model or an unopenable device is a typed startup error and the listener never binds. The prepared
-    // driver moves to the engine thread, which runs the one scheduling loop over it; the embeddings,
-    // rerank and LoRA routes refuse with a typed 503 until POOT-589.
+    // driver moves to the engine thread, which runs the one scheduling loop over it: generation,
+    // embeddings, rerank and LoRA administration are messages on its one queue.
     let health = EngineHealth::starting();
-    let model = load_model(&model_dir)?;
+    let (model, checkpoint) = load_served(&model_dir)?;
     let mut workers = WorkerRegistry::new();
-    let (job_tx, job_rx) = mpsc::channel::<Job>();
-    let (plan, metrics) = spawn_engine(
+    let (job_tx, job_rx) = mpsc::channel::<EngineMsg>();
+    let draft = draft_policy(cli.draft_lookup.as_deref(), cli.draft_model.as_deref())?;
+    // The vision tower opens first, so the engine fits its workload to the memory the tower left.
+    let images = checkpoint
+        .map(|checkpoint| spawn_image_front_end(&mut workers, checkpoint, cli.backend))
+        .transpose()?;
+    let args = EngineArgs::new(cli.backend, draft);
+    let (metrics, view) = spawn_engine(
         &mut workers,
         Arc::clone(&model),
-        cli.backend,
+        if images.is_some() {
+            args.with_embeds()
+        } else {
+            args
+        },
         model_name,
         &health,
         job_rx,
     )?;
-    let backend = Arc::new(Backend::for_workload(model, &plan.workload));
+    let served = Arc::new(Served {
+        pooling: Pooling::read(std::path::Path::new(&model_dir)),
+        model,
+        engine: job_tx,
+        view,
+        images,
+    });
 
     let limiter = Arc::new(RateLimiter::from_env());
     if limiter.rpm > 0 {
@@ -351,8 +426,7 @@ pub(crate) fn run() -> Result<()> {
                     tracing::error!(error = %e, "configure connection write timeout");
                     continue;
                 }
-                let backend = Arc::clone(&backend);
-                let job_tx = job_tx.clone();
+                let served = Arc::clone(&served);
                 let health = health.clone();
                 let metrics = Arc::clone(&metrics);
                 let limiter = Arc::clone(&limiter);
@@ -362,15 +436,9 @@ pub(crate) fn run() -> Result<()> {
                 // One thread per connection: parse and shape concurrently.
                 if let Err(e) = workers.spawn_connection("poot-conn", s, move |s| {
                     let _guard = ConnGuard(conn_counter);
-                    if let Err(e) = handle(
-                        s,
-                        Some(&job_tx),
-                        &health,
-                        &backend,
-                        &metrics,
-                        &limiter,
-                        &lora_admin_policy,
-                    ) {
+                    if let Err(e) =
+                        handle(s, &served, &health, &metrics, &limiter, &lora_admin_policy)
+                    {
                         tracing::error!(error = format!("{e:#}"), "request error");
                     }
                 }) {
@@ -400,10 +468,9 @@ pub(crate) fn run() -> Result<()> {
         );
     }
 
-    // Connection-owned Backend and job-queue clones are gone after graceful completion or cancellation;
-    // dropping main's owners closes the queue, and the engine thread ends once its work is done.
-    drop(backend);
-    drop(job_tx);
+    // Connection-owned clones of `served` are gone after graceful completion or cancellation; dropping
+    // main's owner closes the queue, and the engine thread ends once its work is done.
+    drop(served);
 
     if graceful {
         graceful = workers.wait_for_all_until(graceful_deadline);
@@ -448,5 +515,25 @@ mod tests {
         }
         assert!(parse_backend("cuda").is_err());
         assert!(parse_backend("Rocm").is_err());
+    }
+
+    /// The flags parse into the policy they name; a malformed or zero value is a startup error.
+    #[test]
+    fn draft_policy_parses_lookup_and_refuses_malformed_values() {
+        assert!(matches!(draft_policy(None, None), Ok(DraftPolicy::Off)));
+        match draft_policy(Some("3:4"), None).unwrap() {
+            DraftPolicy::PromptLookup { ngram, k } => {
+                assert_eq!((ngram.get(), k.get()), (3, 4));
+            }
+            other => panic!("expected prompt lookup, got {other:?}"),
+        }
+        for bad in ["3", "3:0", "0:4", "x:4", "3:"] {
+            assert!(
+                draft_policy(Some(bad), None).is_err(),
+                "{bad:?} must refuse"
+            );
+        }
+        assert!(draft_policy(Some("3:4"), Some("m:2")).is_err());
+        assert!(draft_policy(None, Some("no-colon")).is_err());
     }
 }

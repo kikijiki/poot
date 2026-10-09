@@ -139,8 +139,9 @@ fn qwen25_vl_processed_media_assembly_concatenates_videos_and_timing_in_order() 
     assert_eq!(actual.sampled_frames_per_second(), [2.0, 4.0]);
     assert_eq!(actual.processor_media().validate(), Ok(()));
 
-    let metadata = MropeConfigMetadata::from_hf_config_slice(
-        br#"{
+    let metadata = MropeConfigMetadata::try_from(
+        poot_load::qwen_vl::QwenVlHfMetadata::from_slice(
+            br#"{
             "model_type":"qwen2_5_vl","vocab_size":100,"hidden_size":8,
             "intermediate_size":16,"num_hidden_layers":1,"num_attention_heads":1,
             "num_key_value_heads":1,"rms_norm_eps":1e-6,"rope_theta":1000000.0,
@@ -148,6 +149,8 @@ fn qwen25_vl_processed_media_assembly_concatenates_videos_and_timing_in_order() 
             "video_token_id":12,"rope_scaling":{"mrope_section":[1,1,2]},
             "vision_config":{"tokens_per_second":4}
         }"#,
+        )
+        .unwrap(),
     )
     .unwrap();
     let timings = assemble_qwen2_5_vl_video_timings(

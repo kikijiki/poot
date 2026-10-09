@@ -1,6 +1,6 @@
 [package]
 name = "poot-load"
-description = "Safetensors + HF config loading for poot (bf16/f16 -> f32), dependency-light"
+description = "Safetensors and GGUF weight loading plus HF config parsing for poot, dependency-light"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

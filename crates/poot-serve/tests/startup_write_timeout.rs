@@ -12,10 +12,12 @@ fn poot_serve_bin() -> String {
 #[cfg(unix)]
 #[test]
 fn non_unicode_write_timeout_fails_before_model_loading() {
+    use poot_test_util::contained_child::ContainChild;
     use std::os::unix::ffi::OsStringExt;
     use std::process::Command;
 
     let output = Command::new(poot_serve_bin())
+        .contained()
         .arg("/card316/model-must-not-load.gguf")
         .env(
             "POOT_WRITE_TIMEOUT_SECS",
@@ -44,6 +46,7 @@ fn non_unicode_write_timeout_fails_before_model_loading() {
 /// Mutation observed red: the timeout is validated after the backend `match` instead of before it.
 #[test]
 fn invalid_write_timeout_fails_before_every_model_loader() {
+    use poot_test_util::contained_child::ContainChild;
     use std::process::Command;
 
     let root =
@@ -81,6 +84,7 @@ fn invalid_write_timeout_fails_before_every_model_loader() {
 
     for (arm, model) in cases {
         let output = Command::new(poot_serve_bin())
+            .contained()
             .arg(&model)
             .env("POOT_WRITE_TIMEOUT_SECS", "0")
             .output()

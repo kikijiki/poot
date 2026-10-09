@@ -422,6 +422,7 @@ pub fn plain(g: Graph<ValidationOutputs>) -> Graph {
         eqns,
         output,
         state,
+        exports,
         validations: _,
     } = g;
     Graph {
@@ -432,6 +433,7 @@ pub fn plain(g: Graph<ValidationOutputs>) -> Graph {
         eqns,
         output,
         validations: NoValidations,
+        exports,
         state,
     }
 }
@@ -458,6 +460,7 @@ pub fn paged_step(
     StepShape {
         kv: KvLayout::Paged {
             pool_slots: NonZeroUsize::new(pool_slots).unwrap(),
+            seqs: NonZeroUsize::new(rows).unwrap(),
         },
         ..step(rows, tokens, capacity, logits)
     }

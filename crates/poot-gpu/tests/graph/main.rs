@@ -12,6 +12,7 @@ mod misc;
 mod moe;
 mod norms_rope;
 mod packed_kv;
+mod pipeline;
 mod plan_selection;
 mod prefill_qwen3next;
 mod ssm_linear_attn;
@@ -46,8 +47,8 @@ fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
     GPU.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Card 546b: the executor-contract replacement for `open_or_skip(DeviceBackend::Wgpu,
-/// GpuExecutor::new())`. The device's `target()` must be read before it is moved into the `Engine`.
+/// Card 546b: the executor-contract replacement for the deleted `open_or_skip(DeviceBackend::Wgpu,
+/// GpuExecutor::new())` (deleted). The device's `target()` must be read before it is moved into the `Engine`.
 fn open_engine_or_skip() -> Option<(Engine<WgpuDevice>, Target)> {
     let device = poot_test_util::device_skip::open_or_skip(
         poot_runtime_common::DeviceBackend::Wgpu,
@@ -57,11 +58,11 @@ fn open_engine_or_skip() -> Option<(Engine<WgpuDevice>, Target)> {
     Some((Engine::new(device), target))
 }
 
-/// Card 546b: `GpuExecutor::run`'s executor-contract replacement for this crate's hand-built test
+/// Card 546b: the executor-contract replacement for the deleted `GpuExecutor::run`, for for this crate's hand-built test
 /// graphs. Every `inputs` row is either a `Storage::Const` (becomes a named `ConstFixture`, keyed by
 /// `meta.name`) or a `Storage::Slot` (becomes a keyed `StepFixture`); `poot_executor_parity::run_once`
 /// binds, compiles, steps and tears the entry back down in one call, the same one-shot shape
-/// `GpuExecutor::run` had. The returned bytes become a `HostTensor` in `g.output`'s own declared
+/// the deleted `GpuExecutor::run` had. The returned bytes become a `HostTensor` in `g.output`'s own declared
 /// shape/dtype, so every existing CPU-oracle comparison against `got.shape()`/`got.as_f32()` is unchanged.
 fn run_via_contract(
     exec: &mut dyn Executor,
@@ -139,7 +140,7 @@ fn staged_replay(
     .unwrap()
 }
 
-/// Card 546b: `GpuExecutor::run_resident`'s executor-contract replacement for a perf microbench that
+/// Card 546b: the executor-contract replacement for the deleted `GpuExecutor::run_resident`, for a perf microbench that
 /// needs its (const-only) inputs uploaded once and the compiled entry kept live across many timed
 /// `step` calls - what `run_resident`'s "far fewer host copies than `run`" bought on the old executor.
 /// Every row of `inputs` must be `Storage::Const` (these microbenches bind the same consts to every
@@ -375,7 +376,7 @@ fn check_gdn_prefill_chunked_gpu(
     }
 
     for (pick, label) in [(0u8, "o"), (1u8, "s_out")] {
-        // gdn_prefill_chunked returns two outputs but `GpuExecutor::run` returns only the graph's single `output`, so (as in
+        // gdn_prefill_chunked returns two outputs but a one-shot entry returns only the graph's single `output` (as the deleted `GpuExecutor::run` did), so (as in
         // `causal_conv1d_decode_gpu_matches_cpu`'s pick_state loop) build a fresh Builder per picked output rather than using
         // state_input/finish_with_state (CPU-only `eval_with_state`). `s_in` is bound as a plain constant.
         let b = Builder::new();

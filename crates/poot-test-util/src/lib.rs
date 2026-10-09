@@ -3,6 +3,7 @@
 
 pub mod checkpoints;
 pub mod const_weights;
+pub mod contained_child;
 pub mod device_caps;
 pub mod device_skip;
 #[cfg(feature = "graph-fixtures")]

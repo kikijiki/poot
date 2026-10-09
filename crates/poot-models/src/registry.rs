@@ -344,6 +344,8 @@ pub(crate) enum Family {
     Qwen35,
     Qwen4Exp,
     Glm53Flash,
+    Qwen25VlText,
+    Qwen25VlVision,
 }
 
 impl Family {
@@ -376,6 +378,8 @@ impl Family {
         Family::Qwen35,
         Family::Qwen4Exp,
         Family::Glm53Flash,
+        Family::Qwen25VlText,
+        Family::Qwen25VlVision,
     ];
 
     pub(crate) const fn entry(self) -> FamilyEntry {
@@ -407,6 +411,8 @@ impl Family {
             Family::Qwen35 => crate::qwen38_27b::ENTRY,
             Family::Qwen4Exp => crate::qwen38::ENTRY,
             Family::Glm53Flash => crate::glm53_flash::ENTRY,
+            Family::Qwen25VlText => crate::qwen2::model::VL_ENTRY,
+            Family::Qwen25VlVision => crate::qwen_vl_vision::ENTRY,
         }
     }
 
@@ -442,6 +448,8 @@ impl Family {
             Family::Qwen35 => 24,
             Family::Qwen4Exp => 25,
             Family::Glm53Flash => 26,
+            Family::Qwen25VlText => 27,
+            Family::Qwen25VlVision => 28,
         }
     }
 }

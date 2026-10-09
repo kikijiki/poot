@@ -6,10 +6,6 @@ sidebar_position: 3
 
 # Picking a backend
 
-:::caution[Being restored]
-poot is being refactored. This is not available yet and is planned to return.
-:::
-
 `poot-serve --backend wgpu|rocm|ptx|vulkan|auto` (default `auto`) picks the device. The choice is made once, at
 startup, before the server listens:
 
@@ -24,11 +20,13 @@ startup, before the server listens:
   candidate (weights once, every retained arena, state) and takes the largest candidate that fits, then checks
   what the device actually allocated before `/health` reports `serving`.
 
+`--backend vulkan` serves too: raw Vulkan reads the free device memory from `VK_EXT_memory_budget`, so the engine plan fits the workload to it like any other backend. A Vulkan driver without that extension reports no budget, and startup then stops with a typed capacity error (an unknown budget is never guessed).
+
 The backends are libraries. **wgpu** (Vulkan/SPIR-V, the default), **rocm** (AMD raw HSA, `--features rocm`)
 and **ptx** (NVIDIA CUDA) share the graph IR and model definitions, and so does **vulkan**: the same SPIR-V
 kernels as wgpu, dispatched through raw Vulkan (`ash`) with no wgpu, recorded once as native command buffers
-and replayed. Only codegen and dispatch differ. Pick one through the `poot-llm` API (`--backend
-wgpu|rocm|ptx|vulkan|auto`); `auto` never picks vulkan, since it runs on the same hardware as wgpu. Raw Vulkan
+and replayed. Only codegen and dispatch differ. Pick one in `poot-serve` with `--backend
+wgpu|rocm|ptx|vulkan|auto`, or in library code through the `poot-llm` API; `auto` never picks vulkan, since it runs on the same hardware as wgpu. Raw Vulkan
 is the lowest-priority backend: it is verified on AMD (RADV) only. See the
 [feature matrix](../reference/feature-matrix.md) for what each supports and
 [Architecture: Backends](../architecture/backends.mdx) for the design.

@@ -13,6 +13,7 @@ fn poot_serve_bin() -> String {
 /// server that wrongly started would bind and wait, so the process must exit by itself. Returns whether
 /// it succeeded and its combined output.
 fn start_on_config_only(label: &str, model_type: &str) -> (bool, String) {
+    use poot_test_util::contained_child::ContainChild;
     use std::process::Command;
 
     let dir =
@@ -25,6 +26,7 @@ fn start_on_config_only(label: &str, model_type: &str) -> (bool, String) {
     )
     .expect("write model fixture config");
     let output = Command::new(poot_serve_bin())
+        .contained()
         .arg(&dir)
         .arg("127.0.0.1:0")
         .output()

@@ -124,6 +124,10 @@ impl Device for VulkanDevice {
         self.ctx.memory()
     }
 
+    fn free_memory_bytes(&self) -> Option<u64> {
+        self.ctx.free_memory_bytes()
+    }
+
     fn allocate(
         &mut self,
         role: BufferRole,
@@ -221,8 +225,13 @@ impl Device for VulkanDevice {
         Ok(())
     }
 
-    fn write(&mut self, dst: &DeviceBuffer, bytes: &[u8]) -> Result<(), VulkanGpuError> {
-        Ok(dst.write_bytes(bytes)?)
+    fn write(
+        &mut self,
+        dst: &DeviceBuffer,
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), VulkanGpuError> {
+        Ok(dst.write_bytes(offset, bytes)?)
     }
 
     fn read(&mut self, src: &DeviceBuffer, out: &mut [u8]) -> Result<(), VulkanGpuError> {

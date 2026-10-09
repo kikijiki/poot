@@ -293,7 +293,10 @@ impl Context {
             tensor_core,
             known_miscompiles,
             compute_units,
-            memory_budget_bytes: None,
+            memory_budget_bytes: features.memory_budget().then(|| {
+                // SAFETY: `physical_device` is from this instance's own enumeration.
+                unsafe { device_local_heap_budget(&owner.instance, physical_device) }.budget
+            }),
         };
 
         Ok(Context {
@@ -307,6 +310,7 @@ impl Context {
             min_storage_offset_alignment: props.limits.min_storage_buffer_offset_alignment as usize,
             max_workgroup_count,
             device_caps,
+            memory_budget: features.memory_budget(),
             pipeline_cache: HashMap::new(),
             pipeline_builds: 0,
             graphs_recorded: AtomicUsize::new(0),
@@ -367,6 +371,58 @@ impl Context {
     pub fn device_caps(&self) -> poot_target::DeviceCaps {
         self.device_caps
     }
+
+    /// Device-local memory this process may still allocate (bytes): the OS-arbitrated heap budget less the
+    /// heap usage, from one `VK_EXT_memory_budget` read, so memory other processes took since the device
+    /// opened is already out of it. `None` where the device does not implement the extension: the runtime
+    /// cannot say, which a consumer treats as an unknown budget, never as unlimited.
+    pub fn free_memory_bytes(&self) -> Option<u64> {
+        self.memory_budget.then(|| {
+            // SAFETY: `physical_device` is from this instance's own enumeration, and `memory_budget` says the
+            // device implements `VK_EXT_memory_budget`.
+            let heaps = unsafe { device_local_heap_budget(&self.instance, self.physical_device) };
+            heaps.budget.saturating_sub(heaps.usage)
+        })
+    }
+}
+
+/// The summed `VK_EXT_memory_budget` figures of a device's device-local heaps.
+struct HeapBudget {
+    /// What the OS lets this process use.
+    budget: u64,
+    /// What this process already holds.
+    usage: u64,
+}
+
+/// The device-local heaps' budget and usage, in one `VK_EXT_memory_budget` read.
+///
+/// # Safety
+/// `physical_device` must come from `instance`'s own enumeration, and the device must implement
+/// `VK_EXT_memory_budget`.
+unsafe fn device_local_heap_budget(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> HeapBudget {
+    let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+    let mut props2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+    // SAFETY: the caller's contract; `props2` and its chain outlive the call.
+    unsafe { instance.get_physical_device_memory_properties2(physical_device, &mut props2) };
+    let mem = props2.memory_properties;
+    let device_local = (0..mem.memory_heap_count as usize).filter(|&i| {
+        mem.memory_heaps[i]
+            .flags
+            .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+    });
+    device_local.fold(
+        HeapBudget {
+            budget: 0,
+            usage: 0,
+        },
+        |sum, i| HeapBudget {
+            budget: sum.budget + budget.heap_budget[i],
+            usage: sum.usage + budget.heap_usage[i],
+        },
+    )
 }
 
 /// The largest single `vkAllocateMemory` this device allows (`VkPhysicalDeviceMaintenance3Properties`,

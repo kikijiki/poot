@@ -18,6 +18,31 @@ use crate::multimodal::qwen_vl_mrope::{
     assemble_qwen2_5_vl_mrope_model_input_from_processor_media,
 };
 
+/// One image through the batch preprocessing the request path runs, as the single image the
+/// preprocessing tests ask about.
+#[derive(Debug, PartialEq)]
+struct ProcessedImage {
+    pixel_values: HostTensor,
+    grid: MropeGrid,
+}
+
+fn preprocess_qwen2_5_vl_image_with_config(
+    image: &Qwen25VlDecodedImage,
+    config: &Qwen25VlImageProcessorConfig,
+) -> Result<ProcessedImage, Qwen25VlImagePreprocessError> {
+    let batch = preprocess_qwen2_5_vl_images_with_config(std::slice::from_ref(image), config)?;
+    Ok(ProcessedImage {
+        pixel_values: batch.pixel_values,
+        grid: batch.grids[0],
+    })
+}
+
+fn preprocess_qwen2_5_vl_image(
+    image: &Qwen25VlDecodedImage,
+) -> Result<ProcessedImage, Qwen25VlImagePreprocessError> {
+    preprocess_qwen2_5_vl_image_with_config(image, &Qwen25VlImageProcessorConfig::default())
+}
+
 mod apng_tests;
 mod assembly_tests;
 mod config_tests;

@@ -22,8 +22,8 @@ use crate::driver::error::{DriverError, InvalidRequest};
 use crate::driver::step::PickPolicy;
 use crate::driver::{
     AdapterRef, Admission, BackendChoice, Driver, DriverOptions, GenerateRequest, Head, Layout,
-    ModelHandle, PoolShape, PrefixOutcome, PreparedSetLimits, Release, RowWork, SeqId, SeqRequest,
-    ServingShapes, StepRow, Warm, open_executor,
+    ModelHandle, PoolShape, PrefixOutcome, PrefixSkip, PreparedSetLimits, Release, RowWork, SeqId,
+    SeqRequest, ServingShapes, StepRow, Warm, open_executor,
 };
 use crate::text::tokenize::{ChatTemplate, TextCodec};
 
@@ -40,11 +40,11 @@ pub(super) fn nz(n: usize) -> NonZeroUsize {
 /// The fixture's text services: 48 single-character words (`a`..`z`, `0`..`9`, then `p0`..`p11`), so
 /// a regex over letters masks exactly the tokens it names.
 pub(super) fn fixture_text() -> TextCodec {
-    text_of(VOCAB)
+    text_of(VOCAB, ChatTemplate::default())
 }
 
 /// [`fixture_text`] over `vocab` words.
-fn text_of(vocab: usize) -> TextCodec {
+fn text_of(vocab: usize, chat_template: ChatTemplate) -> TextCodec {
     let mut words: Vec<String> = ('a'..='z').map(String::from).collect();
     words.extend(('0'..='9').map(String::from));
     words.extend((0..vocab - words.len()).map(|i| format!("p{i}")));
@@ -67,7 +67,7 @@ fn text_of(vocab: usize) -> TextCodec {
         None,
         FIXTURE_EOS,
         poot_models::chat::ChatFormat::ChatML,
-        ChatTemplate::default(),
+        chat_template,
     )
 }
 
@@ -125,12 +125,17 @@ fn scaled(store: &WeightStore, factor: f32) -> WeightStore {
 }
 
 #[derive(Clone, Copy)]
-enum Weights {
+pub(super) enum Weights {
     Random,
     ZeroHead,
 }
 
-fn handle(weights: Weights, eos: u32) -> Arc<ModelHandle> {
+pub(super) fn handle(weights: Weights, eos: u32) -> Arc<ModelHandle> {
+    handle_with(weights, eos, ChatTemplate::default())
+}
+
+/// [`handle`] for a model that ships `chat_template`.
+fn handle_with(weights: Weights, eos: u32, chat_template: ChatTemplate) -> Arc<ModelHandle> {
     let registry = Registry::builtin().unwrap();
     let fixture = (registry.entries()[0].fixture)();
     let mut config = fixture.config.clone();
@@ -143,7 +148,12 @@ fn handle(weights: Weights, eos: u32) -> Arc<ModelHandle> {
         config: &config,
         generation: None,
     };
-    Arc::new(ModelHandle::from_checkpoint(&raw, store, &registry, |_| Ok(fixture_text())).unwrap())
+    Arc::new(
+        ModelHandle::from_checkpoint(&raw, store, &registry, |_| {
+            Ok(text_of(VOCAB, chat_template))
+        })
+        .unwrap(),
+    )
 }
 
 pub(super) fn options(chunk: usize, capacity: usize) -> DriverOptions {
@@ -324,8 +334,10 @@ fn gemma4_sampled_differs_from_greedy(choice: BackendChoice) {
         generation: None,
     };
     let handle = Arc::new(
-        ModelHandle::from_checkpoint(&raw, store.build(), &registry, |_| Ok(text_of(WIDE)))
-            .unwrap(),
+        ModelHandle::from_checkpoint(&raw, store.build(), &registry, |_| {
+            Ok(text_of(WIDE, ChatTemplate::default()))
+        })
+        .unwrap(),
     );
     let Some(mut driver) = driver(choice, &handle, 4, CAPACITY) else {
         return;
@@ -582,6 +594,58 @@ per_backend!(
     fixture_tokens_equal_the_recorded_literals_wgpu,
     fixture_tokens_equal_the_recorded_literals_rocm,
     fixture_tokens_equal_the_recorded_literals_ptx
+);
+
+/// The Qwen2.5-VL text tower over the qwen2 fixture's own tensors.
+fn vl_handle() -> Arc<ModelHandle> {
+    let registry = Registry::builtin().unwrap();
+    let entry = registry
+        .entries()
+        .iter()
+        .find(|entry| entry.family == poot_models::qwen2::model::VL_FAMILY)
+        .expect("the text tower is a shipped family");
+    let fixture = (entry.fixture)();
+    let mut config = fixture.config.clone();
+    config["eos_token_id"] = serde_json::json!(NO_EOS);
+    let raw = RawConfig::HfJson {
+        config: &config,
+        generation: None,
+    };
+    Arc::new(
+        ModelHandle::from_checkpoint(&raw, fixture.store, &registry, |_| Ok(fixture_text()))
+            .unwrap(),
+    )
+}
+
+/// A text-only Qwen2.5-VL prompt generates the plain qwen2 reference's tokens: the driver binds
+/// `Slot::MropePosition` with every token at its text position on the temporal, height and width
+/// axes, which is plain RoPE, so the tower over the same tensors runs the recorded literals of
+/// `fixture_tokens_equal_the_recorded_literals` (whole and chunked prefill, suffix and host path).
+/// Mutation: bind `Slot::MropePosition` as zeros (`StepData::text_mrope`); every position rotates
+/// as position 0 and the tokens diverge from the literal.
+fn qwen25_vl_text_only_tokens_equal_the_plain_reference(choice: BackendChoice) {
+    let handle = vl_handle();
+    let Some(mut whole) = driver(choice, &handle, 8, CAPACITY) else {
+        return;
+    };
+    let Some(mut chunked) = driver(choice, &handle, 5, CAPACITY) else {
+        return;
+    };
+    for (chunk, driver) in [(8, &mut whole), (5, &mut chunked)] {
+        let device = generate(driver, &PROMPT, 24, Sampler::greedy());
+        let host = generate(driver, &PROMPT, 24, Sampler::greedy().with_logprobs(0));
+        assert_eq!(device, FIXTURE_GREEDY, "chunk {chunk}");
+        assert_eq!(
+            host, device,
+            "chunk {chunk}: the host path agrees with the suffix"
+        );
+    }
+}
+per_backend!(
+    qwen25_vl_text_only_tokens_equal_the_plain_reference,
+    qwen25_vl_text_only_tokens_equal_the_plain_reference_wgpu,
+    qwen25_vl_text_only_tokens_equal_the_plain_reference_rocm,
+    qwen25_vl_text_only_tokens_equal_the_plain_reference_ptx
 );
 
 /// SC-005 (device side): the capacity only sizes buffers. A request at 8x the live length generates
@@ -908,7 +972,7 @@ const RECORDED: &[RecordedFamily] = &[
             28, 31, 1, 1, 1, 27, 2, 0, 36, 25, 22, 25, 28, 31, 1, 1, 1, 27, 32, 34, 31, 1, 25, 28,
         ],
     },
-    // deepseek4 (POOT-568) has no Runner recording: its tokens are the independent f64 reference's
+    // deepseek4 (POOT-568) has no recording from the deleted `Runner`: its tokens are the independent f64 reference's
     // greedy decode (`deepseek4::tests::the_driver_literals_are_the_references_greedy_decode`,
     // smallest top-two logit margin 1.5e-2). The 7-token prompt is not a multiple of the family's
     // prefill granule (4), so each run is a prefill of four tokens and three decode steps.
@@ -921,7 +985,7 @@ const RECORDED: &[RecordedFamily] = &[
             31, 7,
         ],
     },
-    // glm53_flash (POOT-569) has no Runner recording: its tokens are the independent f64 reference's
+    // glm53_flash (POOT-569) has no recording from the deleted `Runner`: its tokens are the independent f64 reference's
     // greedy decode (`glm53_flash::tests::the_driver_literals_are_the_references_greedy_decode`,
     // smallest top-two logit margin 5.7e-3). The family has no prefill granule, so the 7-token prompt
     // runs as prefill pieces (8 or 4 tokens per chunk) and decode steps for no remainder.
@@ -933,7 +997,7 @@ const RECORDED: &[RecordedFamily] = &[
             29, 46, 25, 32, 34, 21, 17, 7, 2, 31, 37, 12, 30, 0, 4, 8, 4, 24, 21, 43, 9, 31, 24, 21,
         ],
     },
-    // qwen3next (POOT-575) has no Runner recording: its tokens are the CPU oracle's greedy decode over the
+    // qwen3next (POOT-575) has no recording from the deleted `Runner`: its tokens are the CPU oracle's greedy decode over the
     // fixture (`qwen3next::tests::the_fixture_generates_the_recorded_tokens`; the GDN, gated attention and
     // gated shared expert are pinned against f64 references in their own modules, tier 3).
     RecordedFamily {
@@ -978,7 +1042,7 @@ const RECORDED: &[RecordedFamily] = &[
             28,
         ],
     },
-    // qwen35 (POOT-572) has no Runner recording: its tokens are the CPU oracle's greedy decode over the
+    // qwen35 (POOT-572) has no recording from the deleted `Runner`: its tokens are the CPU oracle's greedy decode over the
     // fixture (`qwen38_27b::tests::the_fixture_generates_the_recorded_tokens`; its logits and every
     // carried state element are pinned against the independent plain-loop reference in the same module,
     // tier 2).
@@ -1350,6 +1414,77 @@ fn an_unregistered_family_is_refused_before_any_tensor_is_read() {
     ) {
         Err(DriverError::Unsupported(Unsupported::Registry(_))) => {}
         other => panic!("expected the registry refusal before any tensor read, got {other:?}"),
+    }
+}
+
+/// A Qwen2.5-VL checkpoint whose `config.json` cannot be read or parsed is refused as a load error
+/// naming the file's path (the config is the first thing `load` reads, whatever the family).
+/// Mutation: report `generation_config.json` as the path in `read_json`'s parse error; the parse row
+/// goes red.
+#[test]
+fn an_unreadable_or_malformed_config_is_attributed_to_its_path() {
+    use crate::driver::error::LoadError;
+    let registry = Registry::builtin().unwrap();
+    let load = |dir: &std::path::Path| {
+        ModelHandle::load(dir, &registry, &crate::driver::LoadOptions::default())
+    };
+    let dir = poot_test_util::unique_temp_path("poot_card1077_config_path");
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("config.json");
+    match load(&dir) {
+        Err(DriverError::Load(LoadError::Io { path, .. })) => assert_eq!(path, config),
+        other => panic!("expected the missing config named by path, got {other:?}"),
+    }
+    std::fs::write(&config, r#"{"model_type": "qwen2_5_vl", "hidden_size": "#).unwrap();
+    match load(&dir) {
+        Err(DriverError::Load(LoadError::Json { path, .. })) => assert_eq!(path, config),
+        other => panic!("expected the malformed config named by path, got {other:?}"),
+    }
+}
+
+/// A `config.json` that repeats a key is refused on the real load path, naming the key and the file:
+/// `serde_json::Value` alone keeps the last of a repeated key, so a second `rope_scaling`,
+/// `rope_parameters` or `mrope_section` would silently replace the first. Mutation: parse the config
+/// with `serde_json::from_slice` in `read_json`; each case is then not refused as a duplicate and the
+/// row goes red.
+#[test]
+fn a_config_repeating_a_rope_key_is_refused_by_model_handle_load() {
+    use crate::driver::error::LoadError;
+    let registry = Registry::builtin().unwrap();
+    let dir = poot_test_util::unique_temp_path("poot_card1077_duplicate_key");
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("config.json");
+    for (key, text) in [
+        (
+            "rope_scaling",
+            r#"{"model_type": "qwen2_5_vl", "rope_scaling": {"type": "mrope", "mrope_section": [2, 3, 3]},
+                "rope_scaling": {"type": "mrope", "mrope_section": [1, 3, 4]}}"#,
+        ),
+        (
+            "rope_parameters",
+            r#"{"model_type": "qwen2_5_vl", "rope_parameters": {"rope_type": "mrope", "mrope_section": [2, 3, 3]},
+                "rope_parameters": {"rope_type": "mrope", "mrope_section": [1, 3, 4]}}"#,
+        ),
+        (
+            "mrope_section",
+            r#"{"model_type": "qwen2_5_vl",
+                "rope_scaling": {"type": "mrope", "mrope_section": [2, 3, 3], "mrope_section": [1, 3, 4]}}"#,
+        ),
+    ] {
+        std::fs::write(&config, text).unwrap();
+        let loaded = ModelHandle::load(&dir, &registry, &crate::driver::LoadOptions::default());
+        match loaded {
+            Err(DriverError::Load(LoadError::Json { path, source })) => {
+                assert_eq!(path, config);
+                assert!(
+                    source
+                        .to_string()
+                        .contains(&format!("duplicate JSON key \"{key}\"")),
+                    "{key}: {source}"
+                );
+            }
+            other => panic!("expected the repeated {key} refused as a JSON error, got {other:?}"),
+        }
     }
 }
 
@@ -2945,6 +3080,31 @@ fn family_handle(family: &str, eos: u32) -> Arc<ModelHandle> {
     )
 }
 
+/// [`family_handle`] with its weights scaled up, so a hybrid fixture's recurrent state decides its tokens
+/// (at the fixture's own scale the greedy picks do not depend on the state, and a wrong state row would
+/// pass).
+fn recurrent_family_handle(family: &str) -> Arc<ModelHandle> {
+    let registry = Registry::builtin().unwrap();
+    let entry = registry
+        .entries()
+        .iter()
+        .find(|entry| entry.family.as_str() == family)
+        .unwrap_or_else(|| panic!("no builtin family {family}"));
+    let fixture = (entry.fixture)();
+    let mut config = fixture.config.clone();
+    config["eos_token_id"] = serde_json::json!(NO_EOS);
+    let raw = RawConfig::HfJson {
+        config: &config,
+        generation: None,
+    };
+    Arc::new(
+        ModelHandle::from_checkpoint(&raw, scaled(&fixture.store, 4.0), &registry, |_| {
+            Ok(fixture_text())
+        })
+        .unwrap(),
+    )
+}
+
 fn serving_driver(choice: BackendChoice, handle: &Arc<ModelHandle>) -> Option<Driver> {
     let executor = open(choice)?;
     Some(
@@ -3003,13 +3163,36 @@ impl Lane {
         max_new: usize,
         sampler: Sampler,
     ) -> (Self, usize) {
-        let admission = driver
-            .open(SeqRequest {
-                prompt,
-                max_new,
-                adapter: AdapterRef::Base,
-            })
-            .unwrap();
+        Self::open_with(driver, prompt, max_new, sampler, None)
+    }
+
+    /// A lane whose prompt carries embedding rows in place of some tokens' embeddings.
+    fn open_embeds(
+        driver: &mut Driver,
+        prompt: &[u32],
+        embeds: PromptEmbeds,
+        max_new: usize,
+    ) -> (Self, usize) {
+        Self::open_with(driver, prompt, max_new, Sampler::greedy(), Some(embeds))
+    }
+
+    fn open_with(
+        driver: &mut Driver,
+        prompt: &[u32],
+        max_new: usize,
+        sampler: Sampler,
+        embeds: Option<PromptEmbeds>,
+    ) -> (Self, usize) {
+        let request = SeqRequest {
+            prompt,
+            max_new,
+            adapter: AdapterRef::Base,
+        };
+        let admission = match embeds {
+            Some(embeds) => driver.open_with_embeds(request, embeds),
+            None => driver.open(request),
+        }
+        .unwrap();
         let Admission::Opened { seq, reused } = admission else {
             panic!("no room: {admission:?}");
         };
@@ -3087,7 +3270,18 @@ const SERVING_MAX_NEW: usize = 12;
 /// while the two short sequences decode beside it, so at least one step mixes the three rows.
 /// Mutation: swap two rows' block tables (row `i` reads row `i + 1`'s table); the row goes red.
 fn mixed_step_matches_generate(choice: BackendChoice, family: &str) {
-    let handle = family_handle(family, NO_EOS);
+    mixed_step_matches_generate_of(choice, family, family_handle(family, NO_EOS), None);
+}
+
+/// [`mixed_step_matches_generate`] over `handle`. With `recorded`, the solo runs (the reference) must
+/// first equal the tokens recorded before the batching change, so a fault in the shared tracer, which
+/// the batched and the solo run would both inherit, still turns the row red.
+fn mixed_step_matches_generate_of(
+    choice: BackendChoice,
+    family: &str,
+    handle: Arc<ModelHandle>,
+    recorded: Option<&[Vec<u32>; 3]>,
+) {
     let Some(mut driver) = serving_driver(choice, &handle) else {
         return;
     };
@@ -3100,6 +3294,12 @@ fn mixed_step_matches_generate(choice: BackendChoice, family: &str) {
         .iter()
         .map(|p| generate(&mut reference, p, SERVING_MAX_NEW, Sampler::greedy()))
         .collect();
+    if let Some(recorded) = recorded {
+        assert_eq!(
+            &want, recorded,
+            "{family}: the solo runs equal the recorded tokens"
+        );
+    }
     prepare_serving(&mut driver, pool_shape(8, 4), &[3], &[Head::GREEDY], &[]);
     let mut lanes: Vec<Lane> = prompts
         .iter()
@@ -3143,6 +3343,152 @@ per_backend!(
 );
 fn mixed_step_bloom(choice: BackendChoice) {
     mixed_step_matches_generate(choice, "bloom");
+}
+
+/// POOT-1074 SC-001: the mixed step above on a hybrid or SSM family; `recorded` is what `Driver::generate`
+/// produced for the three prompts at the commit before batching existed (the solo runs on the contiguous
+/// layout, which batching leaves as it was). The three sequences share one
+/// recurrent state pool of three rows, a step's rows are the sequences in whatever order the lanes list
+/// them, the long prompt's four-token pieces run beside one-token decodes (so the driver runs one entry
+/// per width), and every row still produces what `Driver::generate` produces for that sequence alone.
+/// Mutation: bind `state_read[i] = i` instead of the sequence's slot in `Driver::run_plans`; the rows
+/// whose slot differs from their position continue another sequence's state and diverge.
+fn mixed_step_recurrent(choice: BackendChoice, family: &str, recorded: &[Vec<u32>; 3]) {
+    mixed_step_matches_generate_of(
+        choice,
+        family,
+        recurrent_family_handle(family),
+        Some(recorded),
+    );
+}
+per_backend!(
+    mixed_step_qwen3next,
+    mixed_step_qwen3next_wgpu,
+    mixed_step_qwen3next_rocm,
+    mixed_step_qwen3next_ptx
+);
+fn mixed_step_qwen3next(choice: BackendChoice) {
+    mixed_step_recurrent(
+        choice,
+        "qwen3next",
+        &[
+            vec![36, 37, 44, 37, 34, 11, 22, 14, 17, 21, 7, 25],
+            vec![20, 0, 17, 20, 0, 34, 2, 5, 3, 3, 2, 11],
+            vec![37, 14, 34, 17, 16, 29, 6, 3, 37, 22, 46, 15],
+        ],
+    );
+}
+per_backend!(
+    mixed_step_qwen35,
+    mixed_step_qwen35_wgpu,
+    mixed_step_qwen35_rocm,
+    mixed_step_qwen35_ptx
+);
+fn mixed_step_qwen35(choice: BackendChoice) {
+    mixed_step_recurrent(
+        choice,
+        "qwen35",
+        &[
+            vec![43, 10, 29, 45, 38, 18, 10, 11, 15, 34, 38, 38],
+            vec![38, 9, 20, 17, 25, 3, 20, 12, 38, 1, 45, 37],
+            vec![11, 21, 20, 21, 45, 37, 10, 34, 5, 40, 28, 3],
+        ],
+    );
+}
+per_backend!(
+    mixed_step_nemotron_h,
+    mixed_step_nemotron_h_wgpu,
+    mixed_step_nemotron_h_rocm,
+    mixed_step_nemotron_h_ptx
+);
+fn mixed_step_nemotron_h(choice: BackendChoice) {
+    mixed_step_recurrent(
+        choice,
+        "nemotron_h",
+        &[
+            vec![22, 27, 8, 38, 26, 41, 37, 26, 10, 33, 19, 22],
+            vec![10, 47, 8, 47, 8, 36, 45, 27, 33, 8, 33, 17],
+            vec![2, 29, 11, 20, 11, 38, 41, 20, 30, 27, 27, 36],
+        ],
+    );
+}
+
+/// POOT-1074 SC-002: release and re-admit on a hybrid or SSM family, three sequences through a pool of
+/// two rows. The long and the short sequence fill the pool; the short one ends and is released; the
+/// third is admitted into its slot (slot 1) while the long one is mid-decode. The third must start from
+/// zero state (it equals its solo run) and the long one must be untouched by the admission (it equals
+/// its solo run, state and KV pool included).
+/// Mutation: drop the reset in `Driver::open`; `third` continues `first`'s state and diverges. Mutation:
+/// reset `StateScope::All` there; `second`'s state is zeroed mid-sequence and it diverges.
+fn readmit_matches_generate(choice: BackendChoice, family: &str) {
+    let handle = recurrent_family_handle(family);
+    let Some(mut driver) = serving_driver(choice, &handle) else {
+        return;
+    };
+    let Some(mut reference) = serving_driver(choice, &handle) else {
+        return;
+    };
+    let (long_prompt, short_prompt, third_prompt): (&[u32], &[u32], &[u32]) =
+        (&LONG, &MEDIUM, &SHORT);
+    let short_new = 3;
+    let solo =
+        |driver: &mut Driver, prompt: &[u32], new| generate(driver, prompt, new, Sampler::greedy());
+    let want_long = solo(&mut reference, long_prompt, SERVING_MAX_NEW);
+    let want_short = solo(&mut reference, short_prompt, short_new);
+    let want_third = solo(&mut reference, third_prompt, SERVING_MAX_NEW);
+    prepare_serving(&mut driver, pool_shape(8, 2), &[2], &[Head::GREEDY], &[]);
+    // The long sequence takes slot 0 and the short one slot 1: the slot that is recycled is not the
+    // first, so the row a re-admission zeroes is not the row (or the KV pool position) 0.
+    let mut lanes = vec![
+        Lane::open(&mut driver, long_prompt, SERVING_MAX_NEW, Sampler::greedy()).0,
+        Lane::open(&mut driver, short_prompt, short_new, Sampler::greedy()).0,
+    ];
+    while !lanes[1].done() {
+        step_lanes(&mut driver, &mut lanes, &[0, 1]);
+    }
+    assert_eq!(lanes[1].out, want_short, "{family}: the short sequence");
+    driver.release(lanes[1].seq, Release::Finished).unwrap();
+    assert!(
+        !lanes[0].done() && lanes[0].prefilled > 0,
+        "the long sequence is mid-flight when the third is admitted"
+    );
+    lanes[1] = Lane::open(
+        &mut driver,
+        third_prompt,
+        SERVING_MAX_NEW,
+        Sampler::greedy(),
+    )
+    .0;
+    run_to_end(&mut driver, &mut lanes);
+    assert_eq!(
+        lanes[0].out, want_long,
+        "{family}: the sequence beside the admission"
+    );
+    assert_eq!(
+        lanes[1].out, want_third,
+        "{family}: the re-admitted sequence"
+    );
+    for lane in &lanes {
+        driver.release(lane.seq, Release::Finished).unwrap();
+    }
+}
+per_backend!(
+    readmit_qwen3next,
+    readmit_qwen3next_wgpu,
+    readmit_qwen3next_rocm,
+    readmit_qwen3next_ptx
+);
+fn readmit_qwen3next(choice: BackendChoice) {
+    readmit_matches_generate(choice, "qwen3next");
+}
+per_backend!(
+    readmit_nemotron_h,
+    readmit_nemotron_h_wgpu,
+    readmit_nemotron_h_rocm,
+    readmit_nemotron_h_ptx
+);
+fn readmit_nemotron_h(choice: BackendChoice) {
+    readmit_matches_generate(choice, "nemotron_h");
 }
 
 /// A prompt of two full blocks and a tail, and one that shares the first two blocks.
@@ -4506,6 +4852,60 @@ fn smolvlm_fixture_dir() -> (poot_test_util::UniqueTempPath, Fixture) {
     (dir, text)
 }
 
+/// The prompt a SmolVLM front end builds for a 16x16 `rgb` image (a 2x2 tile grid and a global
+/// frame, four visual tokens each) and the vision oracle's rows for its frames, by hand from token ids.
+fn smolvlm_request(
+    vision_handle: &Arc<ModelHandle>,
+    preprocess: &poot_models::vision::PreprocessConfig,
+    rgb: &[f32],
+) -> (Vec<u32>, PromptEmbeds) {
+    use poot_models::vision::idefics3_preprocess;
+    use smolvlm_ids as ids;
+
+    let split = idefics3_preprocess(rgb, 16, 16, preprocess);
+    assert_eq!(
+        (split.rows, split.cols),
+        (2, 2),
+        "the fixture image tiles 2x2"
+    );
+    assert_eq!(split.frames.len(), 5, "four tiles and the global frame");
+    let mut prompt = vec![ids::IM_START, ids::USER];
+    let mut positions = Vec::new();
+    let mut placeholders = |prompt: &mut Vec<u32>| {
+        for _ in 0..4 {
+            positions.push(prompt.len());
+            prompt.push(ids::IMAGE);
+        }
+    };
+    for row in 0..2 {
+        for col in 0..2 {
+            prompt.extend([ids::FAKE, ids::tile(row, col)]);
+            placeholders(&mut prompt);
+        }
+    }
+    prompt.extend([ids::FAKE, ids::GLOBAL]);
+    placeholders(&mut prompt);
+    prompt.push(ids::FAKE);
+    prompt.extend(ids::QUESTION);
+    prompt.extend([ids::END_OF_UTTERANCE, ids::ASSISTANT]);
+    let rows: Vec<f32> = split
+        .frames
+        .iter()
+        .flat_map(|frame| {
+            oracle(
+                vision_handle,
+                Phase::Encode,
+                encode_shape(1, 16),
+                &[(
+                    named("pixels"),
+                    HostTensor::f32(vec![1, 3, 8, 8], frame.clone()),
+                )],
+            )
+        })
+        .collect();
+    (prompt, PromptEmbeds::new(24, positions, rows).unwrap())
+}
+
 /// POOT-1046 (the SmolVLM front end on the required lanes): `Idefics3::caption` over a fixture
 /// checkpoint on disk equals the same text tower run on a prompt built by hand from token ids with the
 /// vision oracle's rows for the frames (tier 2): the front end's prompt, placeholder positions, per-frame
@@ -4514,8 +4914,7 @@ fn smolvlm_fixture_dir() -> (poot_test_util::UniqueTempPath, Fixture) {
 /// zero-row continuation and the row goes red.
 fn smolvlm_caption_matches_the_oracle_rows(choice: BackendChoice) {
     use crate::multimodal::front_end::{CaptionRequest, Idefics3, Image};
-    use poot_models::vision::{PreprocessConfig, idefics3_preprocess};
-    use smolvlm_ids as ids;
+    use poot_models::vision::PreprocessConfig;
 
     let (dir, text) = smolvlm_fixture_dir();
     let (Some(vision_executor), Some(text_executor)) = (open(choice), open(choice)) else {
@@ -4529,7 +4928,7 @@ fn smolvlm_caption_matches_the_oracle_rows(choice: BackendChoice) {
         (text_executor, options(64, 128)),
     )
     .expect("load the fixture SmolVLM");
-    assert_eq!(vlm.visual_tokens(), 4);
+    assert_eq!(vlm.images.visual_tokens(), 4);
 
     let (vision_handle, _) = encoder_family_handle("idefics3_vision", None);
     let text_handle = Arc::new(
@@ -4553,47 +4952,7 @@ fn smolvlm_caption_matches_the_oracle_rows(choice: BackendChoice) {
     // of the pixel range, so their rows differ as much as the fixture's weights let them.
     let rgb_of = |value: f32| -> Vec<f32> { vec![value; 16 * 16 * 3] };
     let expected = |driver: &mut Driver, rgb: &[f32]| -> Vec<u32> {
-        let split = idefics3_preprocess(rgb, 16, 16, &preprocess);
-        assert_eq!(
-            (split.rows, split.cols),
-            (2, 2),
-            "the fixture image tiles 2x2"
-        );
-        assert_eq!(split.frames.len(), 5, "four tiles and the global frame");
-        let mut prompt = vec![ids::IM_START, ids::USER];
-        let mut positions = Vec::new();
-        let mut placeholders = |prompt: &mut Vec<u32>| {
-            for _ in 0..4 {
-                positions.push(prompt.len());
-                prompt.push(ids::IMAGE);
-            }
-        };
-        for row in 0..2 {
-            for col in 0..2 {
-                prompt.extend([ids::FAKE, ids::tile(row, col)]);
-                placeholders(&mut prompt);
-            }
-        }
-        prompt.extend([ids::FAKE, ids::GLOBAL]);
-        placeholders(&mut prompt);
-        prompt.push(ids::FAKE);
-        prompt.extend(ids::QUESTION);
-        prompt.extend([ids::END_OF_UTTERANCE, ids::ASSISTANT]);
-        let rows: Vec<f32> = split
-            .frames
-            .iter()
-            .flat_map(|frame| {
-                oracle(
-                    &vision_handle,
-                    Phase::Encode,
-                    encode_shape(1, 16),
-                    &[(
-                        named("pixels"),
-                        HostTensor::f32(vec![1, 3, 8, 8], frame.clone()),
-                    )],
-                )
-            })
-            .collect();
+        let (prompt, embeds) = smolvlm_request(&vision_handle, &preprocess, rgb);
         driver
             .generate_with_embeds(
                 GenerateRequest {
@@ -4603,7 +4962,7 @@ fn smolvlm_caption_matches_the_oracle_rows(choice: BackendChoice) {
                     stops: Vec::new(),
                     ignore_eos: false,
                 },
-                PromptEmbeds::new(24, positions, rows).unwrap(),
+                embeds,
                 &mut |_: u32, _: &str| GenerationControl::Continue(()),
             )
             .unwrap()
@@ -4660,6 +5019,400 @@ per_backend!(
     smolvlm_caption_matches_the_oracle_rows_wgpu,
     smolvlm_caption_matches_the_oracle_rows_rocm,
     smolvlm_caption_matches_the_oracle_rows_ptx
+);
+
+/// POOT-1076: the SmolVLM text tower on the paged pool serves several prompts with embedding rows
+/// in one batched run, each token for token the single-row contiguous `generate_with_embeds`: three
+/// images' full prompts (equal length, different rows), a short prompt with its own rows at other
+/// positions, and a plain token prompt of another length, all stepped together so their prefill
+/// pieces share `PrefillEmbeds` steps. Mutation: bind row 0's embeds buffer for every row (in
+/// `run_plans`, scatter `embeds` of the first lane for all lanes); the other lanes read the wrong
+/// image's rows and the row goes red.
+fn smolvlm_batched_paged_embeds_match_single_row_runs(choice: BackendChoice) {
+    use poot_models::vision::PreprocessConfig;
+    use smolvlm_ids as ids;
+
+    let (_dir, text) = smolvlm_fixture_dir();
+    let registry = Registry::builtin().unwrap();
+    let (vision_handle, _) = encoder_family_handle("idefics3_vision", None);
+    let text_handle = Arc::new(
+        ModelHandle::from_checkpoint(&text.raw(), text.store.clone(), &registry, |_| {
+            Ok(fixture_text())
+        })
+        .unwrap(),
+    );
+    let (Some(mut reference), Some(mut driver)) = (
+        driver(choice, &text_handle, 16, 128),
+        driver(choice, &text_handle, 16, 128),
+    ) else {
+        return;
+    };
+    let preprocess = PreprocessConfig {
+        image_size: 8,
+        longest_edge: 16,
+        rescale_factor: 1.0 / 255.0,
+        mean: [0.5; 3],
+        std: [0.5; 3],
+    };
+    let max_new = 6;
+    let rgb_of = |value: f32| -> Vec<f32> { vec![value; 16 * 16 * 3] };
+    let quadrant: Vec<f32> = (0..16 * 16)
+        .flat_map(|p| {
+            let (y, x) = (p / 16, p % 16);
+            let v = if y < 8 && x < 8 { 0.0 } else { 255.0 };
+            [v, v, v]
+        })
+        .collect();
+    let images = [rgb_of(0.0), rgb_of(255.0), quadrant];
+    let mut requests: Vec<(Vec<u32>, Option<PromptEmbeds>)> = images
+        .iter()
+        .map(|rgb| {
+            let (prompt, embeds) = smolvlm_request(&vision_handle, &preprocess, rgb);
+            (prompt, Some(embeds))
+        })
+        .collect();
+    // A short prompt: four placeholders at positions 2..6 take the first image's first four rows.
+    let (_, first) = &requests[0];
+    let rows = first.as_ref().unwrap().rows_for(0..4);
+    requests.push((
+        vec![
+            ids::IM_START,
+            ids::USER,
+            ids::IMAGE,
+            ids::IMAGE,
+            ids::IMAGE,
+            ids::IMAGE,
+            ids::QUESTION[0],
+        ],
+        Some(PromptEmbeds::new(24, vec![2, 3, 4, 5], rows).unwrap()),
+    ));
+    // A plain token prompt of yet another length shares the batch.
+    requests.push((
+        (0..21).map(|i| (i * 5 + 1) % 36).collect::<Vec<u32>>(),
+        None,
+    ));
+
+    let want: Vec<Vec<u32>> = requests
+        .iter()
+        .map(|(prompt, embeds)| match embeds {
+            Some(embeds) => {
+                reference
+                    .generate_with_embeds(
+                        GenerateRequest {
+                            prompt: prompt.clone(),
+                            max_new,
+                            sampler: Sampler::greedy(),
+                            stops: Vec::new(),
+                            ignore_eos: false,
+                        },
+                        embeds.clone(),
+                        &mut |_: u32, _: &str| GenerationControl::Continue(()),
+                    )
+                    .unwrap()
+                    .tokens
+            }
+            None => generate(&mut reference, prompt, max_new, Sampler::greedy()),
+        })
+        .collect();
+    assert_ne!(want[0], want[1], "the image rows reach the logits");
+
+    let pool = pool_shape(20, 5);
+    prepare_serving(&mut driver, pool, &[5], &[Head::GREEDY], &[]);
+    driver
+        .prepare_embeds(&ServingShapes {
+            layout: Layout::Paged(pool),
+            rows: &[nz(5)],
+            heads: &[Head::GREEDY],
+            warm: Warm::Admitted,
+            windows: &[],
+            adapters: &[],
+        })
+        .unwrap();
+    let mut lanes: Vec<Lane> = requests
+        .iter()
+        .map(|(prompt, embeds)| match embeds {
+            Some(embeds) => Lane::open_embeds(&mut driver, prompt, embeds.clone(), max_new).0,
+            None => Lane::open(&mut driver, prompt, max_new, Sampler::greedy()).0,
+        })
+        .collect();
+    run_to_end(&mut driver, &mut lanes);
+    for (i, lane) in lanes.iter().enumerate() {
+        assert_eq!(lane.out, want[i], "request {i} batched equals its own run");
+    }
+    for lane in &lanes {
+        driver.release(lane.seq, Release::Finished).unwrap();
+    }
+}
+per_backend!(
+    smolvlm_batched_paged_embeds_match_single_row_runs,
+    smolvlm_batched_paged_embeds_match_single_row_runs_wgpu,
+    smolvlm_batched_paged_embeds_match_single_row_runs_rocm,
+    smolvlm_batched_paged_embeds_match_single_row_runs_ptx
+);
+
+/// POOT-1075: requests lowered by the SmolVLM front end (`ImageFrontEnd::prepare`: preprocess,
+/// per-frame vision encode, prompt, placeholder positions) and served together on a paged text
+/// driver equal each request's own `Idefics3::caption` token for token. The requests differ in image
+/// (solid black, solid white, one black quadrant, a single-frame 8x8 image) and in question length,
+/// so their prompts have four lengths and their rows differ. Mutation: in `ImageFrontEnd::encode_frames`
+/// return the first frame's rows for every frame (`encoded[0]` cloned per frame); every request
+/// carries the same rows, the images stop reaching the logits and the row goes red.
+fn smolvlm_front_end_requests_served_batched_equal_single_row_captions(choice: BackendChoice) {
+    use crate::multimodal::front_end::{CaptionPrompt, CaptionRequest, Idefics3, Image};
+
+    let (dir, text) = smolvlm_fixture_dir();
+    // Every executor opens before any runs (the ROCm runtime does not survive a second open after a drop).
+    let (
+        Some(vision_executor),
+        Some(text_executor),
+        Some(batched_executor),
+        Some(reference_executor),
+    ) = (open(choice), open(choice), open(choice), open(choice))
+    else {
+        return;
+    };
+    let registry = Registry::builtin().unwrap();
+    let mut vlm = Idefics3::load(
+        &dir,
+        &registry,
+        (vision_executor, options(16, 16)),
+        (text_executor, options(16, 128)),
+    )
+    .expect("load the fixture SmolVLM");
+    let text_handle = Arc::new(
+        ModelHandle::from_checkpoint(&text.raw(), text.store.clone(), &registry, |_| {
+            Ok(fixture_text())
+        })
+        .unwrap(),
+    );
+    let mut driver =
+        Driver::new(Arc::clone(&text_handle), batched_executor, options(16, 128)).unwrap();
+    let mut reference = Driver::new(text_handle, reference_executor, options(16, 128)).unwrap();
+    let (vision_handle, _) = encoder_family_handle("idefics3_vision", None);
+    let preprocess = poot_models::vision::PreprocessConfig {
+        image_size: 8,
+        longest_edge: 16,
+        rescale_factor: 1.0 / 255.0,
+        mean: [0.5; 3],
+        std: [0.5; 3],
+    };
+
+    let max_new = 6;
+    let solid = |value: f32, side: usize| -> Vec<f32> { vec![value; side * side * 3] };
+    let quadrant: Vec<f32> = (0..16 * 16)
+        .flat_map(|p| {
+            let (y, x) = (p / 16, p % 16);
+            let v = if y < 8 && x < 8 { 0.0 } else { 255.0 };
+            [v, v, v]
+        })
+        .collect();
+    let (black, white, small) = (solid(0.0, 16), solid(255.0, 16), solid(255.0, 8));
+    fn image(rgb: &[f32], side: usize) -> Image<'_> {
+        Image {
+            rgb,
+            height: side,
+            width: side,
+        }
+    }
+    let cases: [(Image<'_>, &str); 4] = [
+        (image(&black, 16), "b c d"),
+        (image(&white, 16), "b c d e f"),
+        (image(&quadrant, 16), "b"),
+        (image(&small, 8), "b c d e f g h"),
+    ];
+    let requests: Vec<CaptionRequest<'_>> = cases
+        .iter()
+        .map(|(image, question)| CaptionRequest {
+            images: std::slice::from_ref(image),
+            question,
+            max_new,
+        })
+        .collect();
+
+    let want: Vec<Vec<u32>> = requests
+        .iter()
+        .map(|request| {
+            vlm.caption(request, &mut |_: u32, _: &str| {
+                GenerationControl::Continue(())
+            })
+            .expect("caption")
+            .tokens
+        })
+        .collect();
+    assert_ne!(want[0], want[1], "the image rows reach the logits");
+    // The front end's lowering is also checked against the vision oracle's rows on a prompt built by
+    // hand (the 16x16 images; a shared path would otherwise be equal to itself on both sides).
+    for (i, (image, question)) in cases.iter().take(3).enumerate() {
+        let (mut prompt, embeds) = smolvlm_request(&vision_handle, &preprocess, image.rgb);
+        // The by-hand prompt ends `... question end_of_utterance assistant`; swap in this question.
+        let tail = prompt.len() - 2;
+        prompt.splice(
+            tail - smolvlm_ids::QUESTION.len()..tail,
+            question
+                .split(' ')
+                .map(|word| u32::from(word.as_bytes()[0] - b'a')),
+        );
+        assert_eq!(
+            reference
+                .generate_with_embeds(
+                    GenerateRequest {
+                        prompt,
+                        max_new,
+                        sampler: Sampler::greedy(),
+                        stops: Vec::new(),
+                        ignore_eos: false,
+                    },
+                    embeds,
+                    &mut |_: u32, _: &str| GenerationControl::Continue(()),
+                )
+                .unwrap()
+                .tokens,
+            want[i],
+            "request {i}: caption equals the oracle-row run"
+        );
+    }
+    let prompts: Vec<CaptionPrompt> = requests
+        .iter()
+        .map(|request| {
+            vlm.images
+                .prepare(request.images, request.question)
+                .expect("prepare")
+        })
+        .collect();
+    let lengths: std::collections::BTreeSet<usize> =
+        prompts.iter().map(|p| p.prompt.len()).collect();
+    assert_eq!(lengths.len(), 4, "four prompt lengths share the batch");
+
+    let pool = pool_shape(24, 4);
+    prepare_serving(&mut driver, pool, &[4], &[Head::GREEDY], &[]);
+    driver
+        .prepare_embeds(&ServingShapes {
+            layout: Layout::Paged(pool),
+            rows: &[nz(4)],
+            heads: &[Head::GREEDY],
+            warm: Warm::Admitted,
+            windows: &[],
+            adapters: &[],
+        })
+        .unwrap();
+    let mut lanes: Vec<Lane> = prompts
+        .iter()
+        .map(|p| Lane::open_embeds(&mut driver, &p.prompt, p.embeds.clone(), max_new).0)
+        .collect();
+    run_to_end(&mut driver, &mut lanes);
+    for (i, lane) in lanes.iter().enumerate() {
+        assert_eq!(lane.out, want[i], "request {i} batched equals its caption");
+    }
+    for lane in &lanes {
+        driver.release(lane.seq, Release::Finished).unwrap();
+    }
+}
+per_backend!(
+    smolvlm_front_end_requests_served_batched_equal_single_row_captions,
+    smolvlm_front_end_requests_served_batched_equal_single_row_captions_wgpu,
+    smolvlm_front_end_requests_served_batched_equal_single_row_captions_rocm,
+    smolvlm_front_end_requests_served_batched_equal_single_row_captions_ptx
+);
+
+/// POOT-1076: the paged prefix cache keys on tokens alone, so a prompt with embedding rows reuses no
+/// block and registers none. Two images give prompts of identical tokens and different rows: the
+/// second finds nothing to reuse and equals its own single-row run; the first's release reports
+/// `PromptEmbeds`; and a plain prompt of the same tokens afterwards reuses nothing either. Mutation:
+/// admit the embeds prompt through `admit_prefix_for` and register it on release; the second image
+/// reuses the first's two blocks (and its tokens), and the row goes red.
+fn paged_embeds_prompts_neither_reuse_nor_register_prefix_blocks(choice: BackendChoice) {
+    use poot_models::vision::PreprocessConfig;
+
+    let (_dir, text) = smolvlm_fixture_dir();
+    let registry = Registry::builtin().unwrap();
+    let (vision_handle, _) = encoder_family_handle("idefics3_vision", None);
+    let text_handle = Arc::new(
+        ModelHandle::from_checkpoint(&text.raw(), text.store.clone(), &registry, |_| {
+            Ok(fixture_text())
+        })
+        .unwrap(),
+    );
+    let (Some(mut reference), Some(mut driver)) = (
+        driver(choice, &text_handle, 16, 128),
+        driver(choice, &text_handle, 16, 128),
+    ) else {
+        return;
+    };
+    let preprocess = PreprocessConfig {
+        image_size: 8,
+        longest_edge: 16,
+        rescale_factor: 1.0 / 255.0,
+        mean: [0.5; 3],
+        std: [0.5; 3],
+    };
+    let max_new = 6;
+    let (prompt, first) = smolvlm_request(&vision_handle, &preprocess, &vec![0.0; 16 * 16 * 3]);
+    let (same_prompt, second) =
+        smolvlm_request(&vision_handle, &preprocess, &vec![255.0; 16 * 16 * 3]);
+    assert_eq!(prompt, same_prompt, "equal tokens, different rows");
+    let single = |driver: &mut Driver, embeds: &PromptEmbeds| {
+        driver
+            .generate_with_embeds(
+                GenerateRequest {
+                    prompt: prompt.clone(),
+                    max_new,
+                    sampler: Sampler::greedy(),
+                    stops: Vec::new(),
+                    ignore_eos: false,
+                },
+                embeds.clone(),
+                &mut |_: u32, _: &str| GenerationControl::Continue(()),
+            )
+            .unwrap()
+            .tokens
+    };
+    let (want_first, want_second) = (
+        single(&mut reference, &first),
+        single(&mut reference, &second),
+    );
+    assert_ne!(
+        want_first, want_second,
+        "the two images continue differently"
+    );
+    let want_plain = generate(&mut reference, &prompt, max_new, Sampler::greedy());
+
+    let pool = pool_shape(12, 2);
+    prepare_serving(&mut driver, pool, &[1], &[Head::GREEDY], &[]);
+    driver
+        .prepare_embeds(&ServingShapes {
+            layout: Layout::Paged(pool),
+            rows: &[nz(1)],
+            heads: &[Head::GREEDY],
+            warm: Warm::Admitted,
+            windows: &[],
+            adapters: &[],
+        })
+        .unwrap();
+    let run = |driver: &mut Driver, embeds: Option<&PromptEmbeds>| {
+        let (lane, reused) = match embeds {
+            Some(embeds) => Lane::open_embeds(driver, &prompt, embeds.clone(), max_new),
+            None => Lane::open(driver, &prompt, max_new, Sampler::greedy()),
+        };
+        let mut lanes = [lane];
+        run_to_end(driver, &mut lanes);
+        let outcome = driver.release(lanes[0].seq, Release::Finished).unwrap();
+        (lanes[0].out.clone(), reused, outcome)
+    };
+    let (tokens, reused, outcome) = run(&mut driver, Some(&first));
+    assert_eq!((tokens, reused), (want_first, 0));
+    assert_eq!(outcome, PrefixOutcome::Skipped(PrefixSkip::PromptEmbeds));
+    let (tokens, reused, _) = run(&mut driver, Some(&second));
+    assert_eq!(reused, 0, "another image's rows reuse no block");
+    assert_eq!(tokens, want_second);
+    let (tokens, reused, _) = run(&mut driver, None);
+    assert_eq!(reused, 0, "the embeds prompts registered nothing");
+    assert_eq!(tokens, want_plain);
+}
+per_backend!(
+    paged_embeds_prompts_neither_reuse_nor_register_prefix_blocks,
+    paged_embeds_prompts_neither_reuse_nor_register_prefix_blocks_wgpu,
+    paged_embeds_prompts_neither_reuse_nor_register_prefix_blocks_rocm,
+    paged_embeds_prompts_neither_reuse_nor_register_prefix_blocks_ptx
 );
 
 /// An encode request is refused while a sequence is open (its cache would alias the sequence's),
@@ -5553,3 +6306,316 @@ per_backend!(
     adapter_generation_replacement_is_isolated_and_freed_rocm,
     adapter_generation_replacement_is_isolated_and_freed_ptx
 );
+
+/// POOT-650 SC-001: a Qwen2.5-VL image-plus-prompt request generates through `Driver` with the front
+/// end producing the step inputs (the vision tower's rows through `Driver::encode`, the prompt's
+/// sectioned positions bound to `Slot::MropePosition`), and the log-probabilities of every vocabulary
+/// token at the first step, and at the two decode steps after it, match the CPU oracle's over the same
+/// inputs (tier 2: every element within `1e-4 * (1 + |want|)`), for two different images through one
+/// front end. The oracle's two images' distributions differ by far more than the tolerance, so a row
+/// that ignored the image could not pass; the decode steps run at the positions that continue after
+/// the image. Mutation: feed zeroed image embeddings (`Qwen25Vl::generate` scatters zero rows); the
+/// log-probabilities leave the oracle's.
+fn qwen25_vl_image_prompt_first_step_matches_the_cpu_oracle(choice: BackendChoice) {
+    use crate::multimodal::qwen_vl::{Qwen25Vl, Qwen25VlGenerate, fixture};
+
+    const NEW: usize = 3;
+    let dir = fixture::checkpoint("sc001", 2.0);
+    let (first, second) = (fixture::image(12, 8, 1), fixture::image(12, 8, 2));
+    let inputs = [&first, &second].map(|image| {
+        let input = fixture::assemble(&dir, &fixture::messages(image));
+        let rows = fixture::oracle_rows(&dir, &input);
+        (input, rows)
+    });
+    let first_step = |n: usize| {
+        let (input, rows) = &inputs[n];
+        fixture::oracle_logprobs(&dir, input, rows, &[])
+    };
+    let apart = first_step(0)
+        .iter()
+        .zip(first_step(1))
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f32::max);
+    assert!(
+        apart > 1e-2,
+        "the two images' oracle distributions differ by {apart}"
+    );
+
+    let (Some(vision), Some(text)) = (open(choice), open(choice)) else {
+        return;
+    };
+    let mut vlm = Qwen25Vl::load(
+        &dir,
+        &Registry::builtin().unwrap(),
+        (vision, options(64, 64)),
+        (text, options(16, 32)),
+    )
+    .unwrap();
+    for (n, (input, rows)) in inputs.iter().enumerate() {
+        let generation = vlm
+            .generate(
+                input,
+                Qwen25VlGenerate {
+                    max_new: NEW,
+                    sampler: Sampler::greedy().with_logprobs(fixture::VOCAB),
+                },
+                &mut |_: u32, _: &str| GenerationControl::Continue(()),
+            )
+            .unwrap();
+        assert_eq!(generation.tokens.len(), NEW, "image {n}");
+        for step in 0..NEW {
+            // Step `k` is the distribution after the prompt and the `k` tokens generated before it.
+            let want = fixture::oracle_logprobs(&dir, input, rows, &generation.tokens[..step]);
+            let record = &generation.logprobs[step];
+            assert_eq!(record.top.len(), fixture::VOCAB, "image {n} step {step}");
+            let worst = record
+                .top
+                .iter()
+                .map(|&(token, got)| {
+                    let want = want[token as usize];
+                    ((got - want).abs() / (1.0 + want.abs()), token, got, want)
+                })
+                .fold((0.0f32, 0, 0.0, 0.0), |a, b| if b.0 > a.0 { b } else { a });
+            assert!(
+                worst.0 <= 1e-4,
+                "image {n} step {step}, token {}: device log-probability {}, oracle {}",
+                worst.1,
+                worst.2,
+                worst.3
+            );
+        }
+    }
+}
+per_backend!(
+    qwen25_vl_image_prompt_first_step_matches_the_cpu_oracle,
+    qwen25_vl_image_prompt_first_step_matches_the_cpu_oracle_wgpu,
+    qwen25_vl_image_prompt_first_step_matches_the_cpu_oracle_rocm,
+    qwen25_vl_image_prompt_first_step_matches_the_cpu_oracle_ptx
+);
+
+/// POOT-650: an image of more patches than the vision tower takes in one step (4100 against 4096) is a
+/// typed `CapacityAboveMax` refusal through `Qwen25Vl::generate`, from the vision driver's first
+/// prepare: no encode step and no generation step runs and nothing panics. Mutation: raise
+/// `MAX_PATCHES` in the tower to 8192; the image encodes and generates and the row goes red.
+fn qwen25_vl_an_image_past_the_patch_cap_is_a_typed_refusal(choice: BackendChoice) {
+    use crate::driver::error::Unsupported;
+    use crate::multimodal::qwen_vl::{Qwen25Vl, Qwen25VlError, Qwen25VlGenerate, fixture};
+    use poot_models::model::{ShapeReason, TraceError};
+
+    let dir = fixture::checkpoint("patch_cap", 2.0);
+    std::fs::write(
+        dir.join("preprocessor_config.json"),
+        r#"{"do_resize":false,"min_pixels":1,"max_pixels":1048576,"patch_size":2,
+           "temporal_patch_size":2,"merge_size":2}"#,
+    )
+    .unwrap();
+    // 164 x 100 pixels of 2-pixel patches: an 82 x 50 grid, 4100 patches.
+    let image = fixture::image(164, 100, 1);
+    let input = fixture::assemble(&dir, &fixture::messages(&image));
+    assert_eq!(
+        input.media.image_grids[0].height * input.media.image_grids[0].width,
+        4100
+    );
+    let (Some(vision), Some(text)) = (open(choice), open(choice)) else {
+        return;
+    };
+    let mut vlm = Qwen25Vl::load(
+        &dir,
+        &Registry::builtin().unwrap(),
+        (
+            vision,
+            // The driver's own trace bound is out of the way: the refusal is the tower's.
+            DriverOptions {
+                max_trace_tokens: nz(8192),
+                ..options(4096, 4096)
+            },
+        ),
+        (text, options(16, 32)),
+    )
+    .unwrap();
+    let error = vlm
+        .generate(
+            &input,
+            Qwen25VlGenerate {
+                max_new: 1,
+                sampler: Sampler::greedy(),
+            },
+            &mut |_: u32, _: &str| GenerationControl::Continue(()),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            Qwen25VlError::Driver(DriverError::Unsupported(Unsupported::Trace(
+                TraceError::ShapeUnsupported {
+                    reason: ShapeReason::CapacityAboveMax { max: 4096 },
+                    ..
+                }
+            )))
+        ),
+        "{error:?}"
+    );
+    assert_eq!(vlm.vision().stats().steps, 0, "no encode step ran");
+    assert_eq!(vlm.text().stats().steps, 0, "no generation step ran");
+}
+per_backend!(
+    qwen25_vl_an_image_past_the_patch_cap_is_a_typed_refusal,
+    qwen25_vl_an_image_past_the_patch_cap_is_a_typed_refusal_wgpu,
+    qwen25_vl_an_image_past_the_patch_cap_is_a_typed_refusal_rocm,
+    qwen25_vl_an_image_past_the_patch_cap_is_a_typed_refusal_ptx
+);
+
+/// `generate_text` on a fresh `choice` executor: the generation and every piece the sink saw, joined.
+fn text_run(
+    handle: &Arc<ModelHandle>,
+    choice: BackendChoice,
+    request: &crate::driver::TextRequest,
+) -> Option<(crate::driver::Generation, String)> {
+    let executor = open(choice)?;
+    let mut text = String::new();
+    let generation =
+        crate::driver::generate_text(handle, executor, request, &mut |piece| text.push_str(piece))
+            .unwrap();
+    Some((generation, text))
+}
+
+fn text_request(ctx: Option<usize>) -> crate::driver::TextRequest {
+    crate::driver::TextRequest {
+        // Seven one-character words of the fixture's vocabulary.
+        prompt: "b c d e f g h".into(),
+        system: None,
+        raw: false,
+        stops: Vec::new(),
+        max_new: None,
+        ctx,
+        sampling: crate::driver::Sampling::GREEDY,
+        ignore_eos: false,
+    }
+}
+
+/// A command-line run with no `-n` ends at the window: a 7-token prompt in a 16-position window
+/// generates 9 tokens and stops on the length, the text begins with the prompt it continues, and the
+/// engine's own timing covers the 7 prompt tokens and the 8 tokens after the first (the first comes out
+/// of the prefill step). Mutation: count the first token as a decode token (decode reads 9).
+#[test]
+fn a_text_run_ends_at_the_window_and_reports_engine_timing_wgpu() {
+    let handle = handle(Weights::ZeroHead, NO_EOS);
+    let Some((generation, text)) = text_run(&handle, BackendChoice::Wgpu, &text_request(Some(16)))
+    else {
+        return;
+    };
+    assert_eq!(generation.tokens.len(), 9);
+    assert_eq!(generation.finish, crate::driver::FinishReason::MaxTokens);
+    assert!(text.starts_with("b c d e f g h"), "{text}");
+    let timing = generation
+        .timing
+        .expect("generate_text measures its phases");
+    assert_eq!(timing.prefill.tokens, 7);
+    assert_eq!(timing.decode.tokens, 8);
+    assert!(!timing.prefill.wall.is_zero() && !timing.decode.wall.is_zero());
+    assert!(timing.prefill.tokens_per_second().is_some());
+    assert!(timing.decode.tokens_per_second().is_some());
+}
+
+/// `--ignore-eos` and `-r`: with every logit zero the greedy token is id 0, which this model declares
+/// its EOS. A run ends on it at once; with `ignore_eos` it runs to the window; and a stop string ends a
+/// run that has no EOS after the token that completes it. Mutations: pass `ignore_eos: false` always;
+/// drop the framed stops from the generate request.
+#[test]
+fn ignore_eos_and_reverse_prompts_decide_where_a_text_run_ends_wgpu() {
+    let ends_at_zero = handle(Weights::ZeroHead, 0);
+    let Some((ended, _)) = text_run(&ends_at_zero, BackendChoice::Wgpu, &text_request(Some(16)))
+    else {
+        return;
+    };
+    assert_eq!(ended.finish, crate::driver::FinishReason::Eos);
+    assert!(ended.tokens.is_empty());
+
+    let ignoring = crate::driver::TextRequest {
+        ignore_eos: true,
+        ..text_request(Some(16))
+    };
+    let (through, _) = text_run(&ends_at_zero, BackendChoice::Wgpu, &ignoring).unwrap();
+    assert_eq!(through.finish, crate::driver::FinishReason::MaxTokens);
+    assert_eq!(through.tokens.len(), 9);
+
+    let never_ends = handle(Weights::ZeroHead, NO_EOS);
+    let stopping = crate::driver::TextRequest {
+        stops: vec!["a".into()],
+        ..text_request(Some(16))
+    };
+    let (stopped, _) = text_run(&never_ends, BackendChoice::Wgpu, &stopping).unwrap();
+    assert_eq!(stopped.finish, crate::driver::FinishReason::Stop);
+    assert_eq!(stopped.tokens.len(), 1);
+}
+
+/// The two phases of a generation partition the engine's wall time: the prefill wall plus the decode
+/// wall is, to the nanosecond, the wall of every step the executor recorded during the run. A phase
+/// that reads another phase's window, or a window that drops steps, breaks the sum. Mutation: take the
+/// prefill wall from the decode window (the sum becomes twice the decode wall).
+#[test]
+fn a_generations_phase_timings_partition_the_engine_wall_wgpu() {
+    let handle = handle(Weights::ZeroHead, NO_EOS);
+    let Some(driver) = driver(BackendChoice::Wgpu, &handle, 4, CAPACITY) else {
+        return;
+    };
+    let mut driver = driver.with_phase_timing();
+    let mark = driver.executor_stats().timing.mark();
+    let generation = driver
+        .generate(
+            GenerateRequest {
+                prompt: PROMPT.to_vec(),
+                max_new: 9,
+                sampler: Sampler::greedy(),
+                stops: Vec::new(),
+                ignore_eos: false,
+            },
+            &mut |_: u32, _: &str| GenerationControl::Continue(()),
+        )
+        .unwrap();
+    let timing = driver.executor_stats().timing;
+    let entries = timing.entries_with_activity_since(&mark);
+    let engine_wall = poot_profile::Report::window(&timing, &mark, &entries)
+        .host
+        .wall;
+    assert!(!engine_wall.is_zero());
+    let timing = generation.timing.expect("the driver measures its phases");
+    assert_eq!(timing.prefill.wall + timing.decode.wall, engine_wall);
+}
+
+/// A chat reply stops at the template's turn end and the marker is not in the text: the template
+/// ends its turn with the token string `a`, which this zero-head model generates forever, so the run
+/// generates the marker, finishes on the stop, and the sink sees none of it. A `-r` string of the
+/// caller's own, by contrast, stays in the text. Mutation: forward the piece that completes the stop to
+/// the sink (the reply ends with `a`).
+#[test]
+fn a_chat_turn_end_is_cut_from_the_text_and_a_reverse_prompt_is_kept_wgpu() {
+    let template = ChatTemplate {
+        template: Some(
+            "{% for m in messages %}{{ m['content'] }}{% endfor %}{% if add_generation_prompt %}{{ ' b' }}{% endif %}"
+                .into(),
+        ),
+        bos_token: None,
+        eos_token: Some("a".into()),
+    };
+    let handle = handle_with(Weights::ZeroHead, NO_EOS, template);
+    let Some((chat, text)) = text_run(&handle, BackendChoice::Wgpu, &text_request(Some(16))) else {
+        return;
+    };
+    assert_eq!(chat.finish, crate::driver::FinishReason::Stop);
+    assert_eq!(chat.tokens.len(), 1, "the turn end is the first token");
+    assert!(
+        !text.contains('a'),
+        "the turn end reached the sink: {text:?}"
+    );
+
+    // The same model asked for the raw text: the caller's `a` stop is in the output.
+    let raw = crate::driver::TextRequest {
+        raw: true,
+        stops: vec!["a".into()],
+        ..text_request(Some(16))
+    };
+    let (kept, text) = text_run(&handle, BackendChoice::Wgpu, &raw).unwrap();
+    assert_eq!(kept.finish, crate::driver::FinishReason::Stop);
+    assert!(text.ends_with('a'), "{text}");
+}

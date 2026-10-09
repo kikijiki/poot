@@ -125,7 +125,7 @@ impl Device for FakeDevice {
         Ok(())
     }
 
-    fn write(&mut self, _dst: &(), _bytes: &[u8]) -> Result<(), FakeError> {
+    fn write(&mut self, _dst: &(), _offset: usize, _bytes: &[u8]) -> Result<(), FakeError> {
         Ok(())
     }
 

@@ -61,7 +61,7 @@ pub(crate) fn validate_graph_execution<V: ValidationChannel>(
 
 /// Card 380: sibling to [`validate_graph_execution`] for the wgpu entry points that bind every value as a
 /// plain `Arc<[f32]>` executor tensor: the (deleted) `GpuExecutor::run`/`bind_resident`, and so
-/// `run_resident_kv`, `run_resident_kv_argmax`, `run_resident_prefill` and the cached decode paths.
+/// the deleted `run_resident_kv`, `run_resident_kv_argmax`, `run_resident_prefill` and the cached decode paths.
 ///
 /// It adds one rejection: a BF16-typed value. Card 380 gave BF16 a real wgpu representation (packed
 /// `u32` lanes holding the checkpoint bytes verbatim), but only through the executor contract, which binds

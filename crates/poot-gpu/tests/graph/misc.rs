@@ -6,7 +6,7 @@ use poot_test_util::device_skip::open_or_skip;
 // NPU) probe measured previously at the same small shape.
 //
 // Shapes: small M=32, K=256, N=128 (the NPU's 17.8 GFLOPS reference); prefill M=128, K=896, N=896 (Qwen2.5-0.5B linear
-// at L=128). Protocol: 5 warmup dispatches (inputs resident), then 100 timed dispatches via `run_resident`. Reports
+// at L=128). Protocol: 5 warmup dispatches (inputs resident), then 100 timed dispatches via a resident entry. Reports
 // min/median/p95/max us and GFLOPS = 2*M*K*N / median_us / 1e3.
 //
 // Run: cargo test -p poot-gpu igpu_matmul_latency_vs_npu -- --ignored --nocapture --test-threads=1
@@ -61,7 +61,7 @@ fn igpu_matmul_latency_vs_npu() {
     };
 
     // Measure one shape: warmup_n warmups, then n_iters timed runs. A resident entry (consts uploaded
-    // once via `add_resident_entry`) replaces `GpuExecutor::run_resident`.
+    // once via `add_resident_entry`) replaces the deleted `GpuExecutor::run_resident`.
     let measure = |exec: &mut dyn Executor,
                    g: &poot_graph_ir::Graph,
                    inp: &HashMap<poot_graph_ir::ValueId, HostTensor>,

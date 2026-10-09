@@ -60,6 +60,28 @@ pub enum LayerTagError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ValidationId(pub u32);
 
+/// Names one value a graph hands to something outside it (a later stage of a split program). The
+/// name is stable across every pass that renumbers or merges values; the value it resolves to is
+/// [`Graph::exports`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BoundaryId(pub ValueId);
+
+impl BoundaryId {
+    /// The [`SlotKey`] a consuming stage binds this boundary under: [`Slot::Activation`] tagged with
+    /// the boundary, so it never collides with the stage's own activation input.
+    pub fn slot_key(self) -> SlotKey {
+        SlotKey::new(Slot::Activation, Some(&format!("boundary.{}", self.0)))
+    }
+}
+
+/// One exported value: a liveness root the passes keep alive and remap, beside the primary output.
+/// Several exports may resolve to one value (CSE merges them); each keeps its own id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Export {
+    pub id: BoundaryId,
+    pub value: ValueId,
+}
+
 /// One named validation root. The value remains an ordinary F32 graph value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidationOutput {
@@ -122,8 +144,8 @@ pub enum Slot {
     Activation,
     Pos,
     /// Card 152 / spec 267: one atomically-bound temporal/height/width position tuple for sectioned multimodal RoPE.
-    /// Shape `[3,L]` for prefill, `[3]` for scalar decode, or `[3,B]` for statically batched decode, axis-major in
-    /// the order temporal, height, width. One packed kind keeps a binder from updating only a subset of the axes;
+    /// Shape `[3,N]` for the `N = rows * tokens` positions of a step (`[3,L]` for prefill, `[3,B]` for statically
+    /// batched decode), axis-major in the order temporal, height, width. One packed kind keeps a binder from updating only a subset of the axes;
     /// model tracers split it with Slice/Reshape before `rope_sectioned`. Per-prompt/per-step data, never a `Const`.
     MropePosition,
     /// Paged-KV slot map `[cap]` (i32): logical key position `t` -> the flat physical slot in the block pool holding
@@ -377,6 +399,20 @@ impl ValueMeta {
             storage,
             name,
             key: None,
+            state_role: None,
+        }
+    }
+
+    /// The input binder a consuming stage declares for the exported value `id`: a keyed
+    /// [`Slot::Activation`] ([`BoundaryId::slot_key`]), named by that key's wire spelling like every
+    /// other keyed slot.
+    pub fn boundary_input(aval: TensorType, id: BoundaryId) -> Self {
+        let key = id.slot_key();
+        ValueMeta {
+            aval,
+            storage: Storage::Slot(Slot::Activation),
+            name: Some(key.to_string()),
+            key: Some(key),
             state_role: None,
         }
     }
@@ -637,6 +673,9 @@ pub struct Graph<V: ValidationChannel = NoValidations> {
     /// The validation channel: none for `Graph`, ordered bounded F32 witnesses for
     /// `Graph<ValidationOutputs>`.
     pub validations: V,
+    /// Values handed to other stages, each a liveness root that [`Graph::remap_results`] rewrites.
+    /// Empty for a graph that is not one stage of a split program.
+    pub exports: Vec<Export>,
     /// Input-output alias pairs `(state_in, state_out)` carried across decode steps: `state_in` is a
     /// `Storage::State` input binder and `state_out` a produced (or pass-through) value of identical type. The
     /// executor feeds each cache buffer in as `state_in` and overwrites it with `state_out` (the jax
@@ -654,6 +693,7 @@ impl Default for Graph {
             eqns: Vec::new(),
             output: 0,
             validations: NoValidations,
+            exports: Vec::new(),
             state: Vec::new(),
         }
     }
@@ -670,6 +710,7 @@ impl Graph {
             eqns,
             output,
             validations: NoValidations,
+            exports,
             state,
         } = self;
         Graph {
@@ -680,6 +721,7 @@ impl Graph {
             eqns,
             output,
             validations: ValidationOutputs(validations),
+            exports,
             state,
         }
     }
@@ -780,6 +822,7 @@ impl<V: ValidationChannel> Graph<V> {
     pub fn observable_values(&self) -> impl Iterator<Item = ValueId> + '_ {
         std::iter::once(self.output)
             .chain(self.validation_outputs().iter().map(|output| output.value))
+            .chain(self.exports.iter().map(|export| export.value))
     }
 
     pub fn liveness_roots(&self) -> impl Iterator<Item = ValueId> + '_ {
@@ -796,6 +839,9 @@ impl<V: ValidationChannel> Graph<V> {
         self.output = remap(self.output);
         for validation in sealed::Sealed::outputs_mut(&mut self.validations, sealed::Internal) {
             validation.value = remap(validation.value);
+        }
+        for export in &mut self.exports {
+            export.value = remap(export.value);
         }
         for (_, output) in &mut self.state {
             *output = remap(*output);
@@ -850,6 +896,19 @@ impl<V: ValidationChannel> Graph<V> {
                     state_output,
                     value_count: n,
                 });
+            }
+        }
+        let mut export_ids = HashSet::with_capacity(self.exports.len());
+        for export in &self.exports {
+            if export.value >= n {
+                return Err(GraphValidationError::ExportValueOutOfRange {
+                    id: export.id,
+                    value: export.value,
+                    value_count: n,
+                });
+            }
+            if !export_ids.insert(export.id) {
+                return Err(GraphValidationError::DuplicateExportId { id: export.id });
             }
         }
         // Input binders are defined up front. Binding tables are an executor-facing contract, so validate them before
@@ -1019,6 +1078,14 @@ impl<V: ValidationChannel> Graph<V> {
                 return Err(GraphValidationError::ValidationOutputNotDefined {
                     id: validation.id,
                     value: validation.value,
+                });
+            }
+        }
+        for export in &self.exports {
+            if !bound_or_produced[export.value] {
+                return Err(GraphValidationError::ExportNotDefined {
+                    id: export.id,
+                    value: export.value,
                 });
             }
         }

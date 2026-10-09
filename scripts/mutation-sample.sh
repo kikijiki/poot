@@ -20,10 +20,8 @@
 # match anything. This looks like a cargo-mutants matching quirk on that mutant genre, not a mis-seeded
 # regex (`--exclude-re` does not remove them either); the matcher receipt may carry these two extra rows.
 #
-# The oracle corners (`eval`) row seeds the live successors of 486's clusters: the half-width narrowing
-# (`narrow_f32`, `store_as`; the deleted `tensor.rs` `round_bf16`/`round_f16`) and, since Card 556
-# deleted the flash hand loops with `flash_mask_strides`, `evaluate_composite`, the one place a
-# composite's decomposition is bound, charged and evaluated.
+# The oracle corners (`eval`) row seeds the half-width narrowing (`narrow_f32`, `store_as`) and
+# `evaluate_composite`, the one place a composite's decomposition is bound, charged and evaluated.
 set -euo pipefail
 
 # name | package | space-separated file globs | -F regex seeding the sample to 486's clusters (a

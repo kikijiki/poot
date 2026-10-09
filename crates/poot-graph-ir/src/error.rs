@@ -227,6 +227,19 @@ pub enum GraphValidationError {
         id: crate::graph::ValidationId,
         value: ValueId,
     },
+    #[error("export {id:?} value v{value} out of range for {value_count} values")]
+    ExportValueOutOfRange {
+        id: crate::graph::BoundaryId,
+        value: ValueId,
+        value_count: usize,
+    },
+    #[error("export id {id:?} declared twice")]
+    DuplicateExportId { id: crate::graph::BoundaryId },
+    #[error("export {id:?} value v{value} not defined")]
+    ExportNotDefined {
+        id: crate::graph::BoundaryId,
+        value: ValueId,
+    },
     #[error("state pair (v{state_input}, v{state_output}) out of range for {value_count} values")]
     StatePairOutOfRange {
         state_input: ValueId,

@@ -30,7 +30,7 @@ pub use timing::{DetailedTiming, DrainPolicy, TimingOptions};
 mod tests;
 
 use poot_graph_ir::SlotKey;
-use poot_graph_plan::{StagedProgram, SyncId, TargetSet};
+use poot_graph_plan::{StageId, StagedProgram, SyncId, TargetSet};
 use poot_quant::weights::{WeightMap, WeightStore};
 use std::sync::Arc;
 
@@ -69,11 +69,16 @@ impl EntryId {
     }
 }
 
-/// Which carried state [`Executor::reset_state`] zeroes (rows are the leading row axis,
-/// a future card's `Rows` variant).
+/// Which carried state [`Executor::reset_state`] zeroes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StateScope {
+    /// Every carried value of the executable; the only scope that clears a failed step's
+    /// [`ExecError::NeedsReset`].
     All,
+    /// Row `n` of the leading axis of every carried value that has a row axis: a recurrent state
+    /// pool's sequence slot, a private KV cache's row. A paged KV pool has none and is left alone.
+    /// A row beyond a value's leading axis is a [`BindError::StateRow`] and nothing is zeroed.
+    Row(usize),
 }
 
 /// The host side of a step's sync points. A single-stage program (this card's only
@@ -129,6 +134,12 @@ impl<'a> StepInputs<'a> {
 pub struct ExecutorStats {
     pub recordings: u64,
     pub replays: u64,
+    /// Recordings and replays of each stage of each entry (a stage records once and replays every
+    /// step).
+    pub stages: Vec<StageStats>,
+    /// Bytes the host wrote to device buffers while binding steps: the caller's inputs and hosted
+    /// embeds. A link between stages is a shared device buffer, never a host write.
+    pub host_write_bytes: u64,
     pub memory: Vec<(BufferRole, MemoryCounterSnapshot)>,
     /// Bytes read from the weight store and encoded for upload, summed over every weight upload. A
     /// [`WeightUpload::SizeOnly`] device reads none.
@@ -141,6 +152,16 @@ pub struct ExecutorStats {
     /// plus whatever per-dispatch detail the engine's [`TimingOptions`] retained. Never an
     /// append-only history; see [`poot_profile::TimingSnapshot`].
     pub timing: poot_profile::TimingSnapshot,
+}
+
+/// One stage's recording and replay counts (see [`ExecutorStats::stages`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StageStats {
+    pub exe: ExecutableId,
+    pub entry: EntryId,
+    pub stage: StageId,
+    pub recordings: u64,
+    pub replays: u64,
 }
 
 /// The object-safe executor the driver holds as `Box<dyn Executor>`.

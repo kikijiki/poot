@@ -105,7 +105,7 @@ impl Model for Tiny {
         let pos = b.cast(b.slice(step.pos(), 1, first, n), DType::F32);
         let seed = b.binary(BinOp::Add, token, pos);
         let (dims, role) = match (self.variant, shape.kv) {
-            (Variant::Dense, KvLayout::Paged { pool_slots }) => {
+            (Variant::Dense, KvLayout::Paged { pool_slots, .. }) => {
                 (vec![pool_slots.get(), 4], StateRole::Positional { axis: 0 })
             }
             (Variant::Dense, _) => (
@@ -278,7 +278,7 @@ impl Device for CountingDevice {
     fn replay(&mut self, _recording: &()) -> Result<(), FakeError> {
         Ok(())
     }
-    fn write(&mut self, _dst: &(), _bytes: &[u8]) -> Result<(), FakeError> {
+    fn write(&mut self, _dst: &(), _offset: usize, _bytes: &[u8]) -> Result<(), FakeError> {
         Ok(())
     }
     fn read(&mut self, _src: &(), _out: &mut [u8]) -> Result<(), FakeError> {
@@ -344,7 +344,9 @@ fn planned_and_live(
         use poot_executor::Executor;
         Planner::new(Arc::clone(handle), &executor.target_set()).unwrap()
     };
-    let planned = planner.plan(options(capacity), &shapes(layout)).unwrap();
+    let planned = planner
+        .plan(options(capacity), &shapes(layout), false)
+        .unwrap();
     assert!(
         planned.residue.is_empty(),
         "a planning device releases everything it recorded"

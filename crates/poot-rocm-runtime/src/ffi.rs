@@ -85,6 +85,20 @@ fnptr!(
     *mut c_void
 );
 
+fnptr!(HsaSystemGetInfo, bindings::hsa_status_t, u32, *mut c_void);
+fnptr!(
+    HsaAmdProfilingSetProfilerEnabled,
+    bindings::hsa_status_t,
+    *mut bindings::hsa_queue_t,
+    std::ffi::c_int
+);
+fnptr!(
+    HsaAmdProfilingGetDispatchTime,
+    bindings::hsa_status_t,
+    bindings::hsa_agent_t,
+    bindings::hsa_signal_t,
+    *mut bindings::hsa_amd_profiling_dispatch_time_t
+);
 fnptr!(
     HsaSignalCreate,
     bindings::hsa_status_t,
@@ -312,6 +326,9 @@ declared_as! {
     HsaIterateAgents = hsa_iterate_agents;
     HsaAgentGetInfo = hsa_agent_get_info;
     HsaIsaGetInfoAlt = hsa_isa_get_info_alt;
+    HsaSystemGetInfo = hsa_system_get_info;
+    HsaAmdProfilingSetProfilerEnabled = hsa_amd_profiling_set_profiler_enabled;
+    HsaAmdProfilingGetDispatchTime = hsa_amd_profiling_get_dispatch_time;
     HsaSignalCreate = hsa_signal_create;
     HsaSignalDestroy = hsa_signal_destroy;
     HsaSignalStoreRelease = hsa_signal_store_release;
@@ -368,6 +385,9 @@ pub struct Funcs {
     pub hsa_iterate_agents: HsaIterateAgents,
     pub hsa_agent_get_info: HsaAgentGetInfo,
     pub hsa_isa_get_info_alt: HsaIsaGetInfoAlt,
+    pub hsa_system_get_info: HsaSystemGetInfo,
+    pub hsa_amd_profiling_set_profiler_enabled: HsaAmdProfilingSetProfilerEnabled,
+    pub hsa_amd_profiling_get_dispatch_time: HsaAmdProfilingGetDispatchTime,
     pub hsa_signal_create: HsaSignalCreate,
     pub hsa_signal_destroy: HsaSignalDestroy,
     pub hsa_signal_store_release: HsaSignalStoreRelease,
@@ -423,6 +443,9 @@ impl Funcs {
             hsa_iterate_agents: sym!(hsa_iterate_agents),
             hsa_agent_get_info: sym!(hsa_agent_get_info),
             hsa_isa_get_info_alt: sym!(hsa_isa_get_info_alt),
+            hsa_system_get_info: sym!(hsa_system_get_info),
+            hsa_amd_profiling_set_profiler_enabled: sym!(hsa_amd_profiling_set_profiler_enabled),
+            hsa_amd_profiling_get_dispatch_time: sym!(hsa_amd_profiling_get_dispatch_time),
             hsa_signal_create: sym!(hsa_signal_create),
             hsa_signal_destroy: sym!(hsa_signal_destroy),
             hsa_signal_store_release: sym!(hsa_signal_store_release),

@@ -331,7 +331,7 @@ pub fn gemv_grid(out_numel: usize, caps: &DeviceCaps) -> (usize, usize) {
 ///
 /// A single dispatch at BLOOM's scale (`N=250880, K=1024`) completes in ~0.6s alone, but the same dispatch
 /// right after another large one (a materializing `transpose` of the same weight, ~3.7s) trips the Strix
-/// Halo iGPU's display-watchdog TDR within ~1.5s, even though `GpuExecutor::run` polls after every submit.
+/// Halo iGPU's display-watchdog TDR within ~1.5s, even though the deleted `GpuExecutor::run` polled after every submit.
 /// The trigger is the total busy stretch across a rapid sequence of large dispatches, not one dispatch's
 /// duration. Splitting gives display work scheduling gaps.
 ///

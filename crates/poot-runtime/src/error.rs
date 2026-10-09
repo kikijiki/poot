@@ -57,6 +57,14 @@ pub enum RuntimeError {
         byte_end: usize,
         byte_capacity: usize,
     },
+    /// A write the device cannot take: it moves whole 32-bit words, so `offset` and `len` must be
+    /// multiples of four, except that a write reaching the end of the buffer may end mid-word.
+    #[error("{op} at byte offset {offset} of {len} bytes is not word aligned")]
+    Misaligned {
+        op: &'static str,
+        offset: usize,
+        len: usize,
+    },
     /// Offset or length arithmetic overflowed before the write (card 527 review G2).
     #[error("{op} byte range overflow at element offset {element_offset} with {elements} elements")]
     RangeOverflow {

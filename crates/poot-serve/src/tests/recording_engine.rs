@@ -4,9 +4,10 @@
 
 use std::collections::BTreeSet;
 
-use poot_llm::driver::{PrefixOutcome, PrefixSkip, Release};
+use poot_llm::driver::{Encoded, PrefixOutcome, PrefixSkip, PromptEmbeds, Release, RowSpeculation};
 
 use super::*;
+use crate::types::{AdapterInfo, AdminError, AdminReply, AdminRequest, EncodeRow};
 
 /// The block the fake's prefix cache registers and reuses in: whole multiples of it.
 const BLOCK: usize = 4;
@@ -21,6 +22,8 @@ pub(crate) enum Event {
         prompt_len: usize,
         max_new: usize,
         reused: usize,
+        /// The sequence opened with embedding rows.
+        embeds: bool,
     },
     Step(Vec<(u64, Work)>),
     Commit {
@@ -31,6 +34,11 @@ pub(crate) enum Event {
         seq: u64,
         mode: Release,
     },
+    /// One `Encode` step over this many rows.
+    Encode {
+        rows: usize,
+    },
+    Admin(AdminRequest),
 }
 
 pub(crate) type Log = Arc<Mutex<Vec<Event>>>;
@@ -43,6 +51,34 @@ struct Open {
     done: usize,
     committed: usize,
     pending: usize,
+    /// Opened with embedding rows: no prefix is matched and none registered.
+    embeds: bool,
+}
+
+/// What a test scripts into an `Encode` step: the rows it gets and the answer.
+type EncodeHook = Box<dyn FnMut(&[EncodeRow]) -> Result<Encoded, EngineError> + Send>;
+
+/// The fake's default `Encode` answer: a two-value hidden state per token, `[id, 1]`, so the pooled
+/// vectors of different texts differ.
+fn default_encoded(rows: &[EncodeRow]) -> Encoded {
+    Encoded {
+        width: 2,
+        rows: rows
+            .iter()
+            .map(|row| row.ids.iter().flat_map(|&id| [id as f32, 1.0]).collect())
+            .collect(),
+    }
+}
+
+/// What a test does with each row's sampler inside a step: the fake's stand-in for the driver's pick.
+type SamplerProbe = Box<dyn FnMut(u64, &mut Sampler) + Send>;
+
+/// A refusal of the request itself, as the fake's hooks return it.
+pub(crate) fn refused(reason: &str) -> EngineError {
+    EngineError::Refused {
+        class: poot_llm::driver::error::FailureClass::Request,
+        reason: reason.to_string(),
+    }
 }
 
 /// A scripted engine. `picks` gives the tokens a row picks given how many tokens it has committed;
@@ -61,8 +97,18 @@ pub(crate) struct RecordingEngine {
     pub(crate) on_step: StepHook,
     /// Set by a faulting step; a real driver's `release` frees the sequence's state and so would hide it.
     pub(crate) poisoned: bool,
+    /// What every decode row reports of the draft policy.
+    pub(crate) speculation: Option<RowSpeculation>,
     /// Every `release` fails with this.
     pub(crate) release_error: Option<String>,
+    /// Answers each `Encode` step.
+    pub(crate) on_encode: EncodeHook,
+    /// Sees each row's sampler once per step, as the driver's pick would.
+    pub(crate) probe: SamplerProbe,
+    /// The adapters `Admin` has loaded, in index order.
+    pub(crate) adapters: Vec<String>,
+    /// Every `Admin` call fails with this.
+    pub(crate) admin_error: Option<AdminError>,
     open: HashMap<u64, Open>,
     registered: Vec<Vec<u32>>,
     next: u64,
@@ -82,7 +128,12 @@ impl RecordingEngine {
             picks: Box::new(|_, _| vec![7]),
             on_step: Box::new(|_, _| Ok(())),
             poisoned: false,
+            speculation: None,
             release_error: None,
+            on_encode: Box::new(|rows| Ok(default_encoded(rows))),
+            probe: Box::new(|_, _| {}),
+            adapters: Vec::new(),
+            admin_error: None,
             open: HashMap::new(),
             registered: Vec::new(),
             next: 0,
@@ -99,6 +150,11 @@ impl RecordingEngine {
         picks: impl FnMut(u64, usize) -> Vec<u32> + Send + 'static,
     ) -> Self {
         self.picks = Box::new(picks);
+        self
+    }
+
+    pub(crate) fn probing(mut self, probe: impl FnMut(u64, &mut Sampler) + Send + 'static) -> Self {
+        self.probe = Box::new(probe);
         self
     }
 
@@ -148,9 +204,9 @@ impl ServeEngine for RecordingEngine {
         &self.eos
     }
 
-    /// One token per character, its code point.
-    fn encode(&self, prompt: &str) -> anyhow::Result<Vec<u32>> {
-        Ok(prompt.chars().map(u32::from).collect())
+    /// One `<id>` per token.
+    fn decode(&self, tokens: &[u32]) -> anyhow::Result<String> {
+        Ok(tokens.iter().map(|token| format!("<{token}>")).collect())
     }
 
     /// `<id>` for the newest token, so a stop string names tokens.
@@ -163,6 +219,7 @@ impl ServeEngine for RecordingEngine {
             return Ok(Opening::NoRoom { needed_blocks: 0 });
         }
         let prompt = request.prompt.to_vec();
+        let embeds = request.embeds.is_some();
         let common = self
             .registered
             .iter()
@@ -175,12 +232,18 @@ impl ServeEngine for RecordingEngine {
             })
             .max()
             .unwrap_or(0);
-        let reused = common.min(prompt.len() - 1) / BLOCK * BLOCK;
+        // A prompt with embedding rows has no tokens-only identity to match a cached prefix on.
+        let reused = if embeds {
+            0
+        } else {
+            common.min(prompt.len() - 1) / BLOCK * BLOCK
+        };
         self.next += 1;
         self.record(Event::Open {
             prompt_len: prompt.len(),
             max_new: request.max_new,
             reused,
+            embeds,
         });
         self.open.insert(
             self.next,
@@ -189,6 +252,7 @@ impl ServeEngine for RecordingEngine {
                 done: reused,
                 committed: 0,
                 pending: 0,
+                embeds,
             },
         );
         Ok(Opening::Opened {
@@ -211,7 +275,8 @@ impl ServeEngine for RecordingEngine {
             return Err(error);
         }
         let mut results = Vec::new();
-        for row in rows.iter() {
+        for row in rows.iter_mut() {
+            (self.probe)(row.seq.0, row.sampler);
             let state = self.open.get_mut(&row.seq.0).expect("an open sequence");
             let (consumed, picks) = match row.work {
                 Work::Prefill { upto } => {
@@ -232,6 +297,10 @@ impl ServeEngine for RecordingEngine {
                 consumed,
                 tokens,
                 logprobs: Vec::new(),
+                speculation: match (row.work, self.speculation) {
+                    (Work::Decode, Some(speculation)) => speculation,
+                    _ => RowSpeculation::NotApplicable,
+                },
             });
         }
         Ok(results)
@@ -259,7 +328,9 @@ impl ServeEngine for RecordingEngine {
         // A release frees the sequence's state, which clears a poisoned device in this fake.
         self.poisoned = false;
         let state = self.open.remove(&seq.0).expect("an open sequence");
-        Ok(if self.recurrent {
+        Ok(if state.embeds {
+            PrefixOutcome::Skipped(PrefixSkip::NoBlockTable)
+        } else if self.recurrent {
             PrefixOutcome::Skipped(PrefixSkip::RecurrentState)
         } else if mode == Release::Preempted {
             PrefixOutcome::Skipped(PrefixSkip::Preempted)
@@ -270,6 +341,52 @@ impl ServeEngine for RecordingEngine {
                 tokens: filled / BLOCK * BLOCK,
             }
         })
+    }
+
+    fn encode(&mut self, rows: &[EncodeRow]) -> Result<Encoded, EngineError> {
+        assert!(
+            self.open.is_empty(),
+            "the loop runs an encode step with no sequence open"
+        );
+        self.record(Event::Encode { rows: rows.len() });
+        (self.on_encode)(rows)
+    }
+
+    fn admin(&mut self, request: AdminRequest) -> Result<AdminReply, AdminError> {
+        assert!(
+            self.open.is_empty(),
+            "the loop runs an administration job with no sequence open"
+        );
+        self.record(Event::Admin(request.clone()));
+        if let Some(error) = &self.admin_error {
+            return Err(error.clone());
+        }
+        let info = |position: usize, name: &String| AdapterInfo {
+            name: name.clone(),
+            index: position as u32 + 1,
+        };
+        match request {
+            AdminRequest::List => Ok(AdminReply::Adapters(
+                self.adapters
+                    .iter()
+                    .enumerate()
+                    .map(|(position, name)| info(position, name))
+                    .collect(),
+            )),
+            AdminRequest::Load { name, .. } => {
+                self.adapters.push(name.clone());
+                Ok(AdminReply::Loaded(info(self.adapters.len() - 1, &name)))
+            }
+            AdminRequest::Unload { name } => {
+                let position = self
+                    .adapters
+                    .iter()
+                    .position(|loaded| *loaded == name)
+                    .ok_or_else(|| AdminError::NotFound(name.clone()))?;
+                self.adapters.remove(position);
+                Ok(AdminReply::Unloaded(info(position, &name)))
+            }
+        }
     }
 
     fn kv_blocks(&self) -> Option<(usize, usize)> {
@@ -296,6 +413,13 @@ pub(crate) struct JobSpec {
     pub(crate) max_new: usize,
     pub(crate) stop: Vec<String>,
     pub(crate) stream: bool,
+    /// Embedding rows standing in for the first prompt token: a multimodal prompt.
+    pub(crate) embeds: bool,
+}
+
+/// One token per character, its code point: the prompts the tests write as strings.
+pub(crate) fn tokens_of(prompt: &str) -> Vec<u32> {
+    prompt.chars().map(u32::from).collect()
 }
 
 impl JobSpec {
@@ -305,7 +429,14 @@ impl JobSpec {
             max_new,
             stop: Vec::new(),
             stream: false,
+            embeds: false,
         }
+    }
+
+    /// A multimodal prompt: one embedding row stands in for the first token.
+    pub(crate) fn with_embeds(mut self) -> Self {
+        self.embeds = true;
+        self
     }
 
     pub(crate) fn stop(mut self, stop: &str) -> Self {
@@ -321,8 +452,17 @@ impl JobSpec {
     pub(crate) fn build(self) -> (Job, Submitted) {
         let (reply, replies) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
+        let tokens = tokens_of(&self.prompt);
+        let prompt = if self.embeds {
+            PromptInput::Multimodal {
+                tokens,
+                embeds: PromptEmbeds::new(1, vec![0], vec![1.0]).expect("one row of one value"),
+            }
+        } else {
+            PromptInput::Tokens(tokens)
+        };
         let job = Job {
-            prompt: self.prompt,
+            prompt,
             max_new: self.max_new,
             sampler: Sampler::greedy(),
             stop: self.stop,
@@ -346,7 +486,8 @@ pub(crate) fn serve(
         .into_iter()
         .map(|spec| {
             let (job, submitted) = spec.build();
-            tx.send(job).expect("queue the job");
+            tx.send(EngineMsg::Generate(Box::new(job)))
+                .expect("queue the job");
             submitted
         })
         .collect();

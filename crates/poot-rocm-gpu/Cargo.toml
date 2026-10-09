@@ -1,6 +1,6 @@
 [package]
 name = "poot-rocm-gpu"
-description = "poot ROCm/HSA graph executor: the AMD/HSA twin of poot-ptx-gpu. Runs a poot-graph-ir Graph device-resident on the Strix Halo iGPU (Radeon 8060S, gfx1151) via raw HSA."
+description = "ROCm/HSA device backend: the poot-executor Device implementation for the AMD Strix Halo iGPU (Radeon 8060S, gfx1151) via raw HSA"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

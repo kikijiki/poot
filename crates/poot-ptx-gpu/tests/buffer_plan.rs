@@ -160,7 +160,7 @@ fn len_probe_reads_the_operand_own_length_never_a_larger_slots_capacity_on_ptx()
         .allocate(BufferRole::Input, BufferStorage::f32(), SLOT_CAPACITY)
         .unwrap();
     device
-        .write(&len_src, &bytemuck_bytes(&vec![0.0f32; SLOT_CAPACITY]))
+        .write(&len_src, 0, &bytemuck_bytes(&vec![0.0f32; SLOT_CAPACITY]))
         .unwrap();
     let out_buf = device
         .allocate(BufferRole::Output, BufferStorage::f32(), 1)

@@ -1,4 +1,4 @@
-//! poot LLM runner: load a checkpoint and generate on the wgpu, ROCm and PTX device executors.
+//! poot LLM driver: load a checkpoint and generate on the wgpu, ROCm and PTX device executors.
 //!
 //! A checkpoint loads as a [`driver::ModelHandle`] (its family from the registry, its weights as
 //! stored, its text services) and generates through [`driver::Driver`], which also runs `Encode`
@@ -26,7 +26,7 @@
 //! registered `Model` on the driver.
 //!
 //! ```compile_fail,E0432
-//! use poot_llm::Runner;
+//! use poot_llm::Runner; // deleted
 //! ```
 
 /// `TextError::Msg(format!(...))`. Same argument shape as `anyhow::anyhow!(...)`. Defined at the
@@ -55,21 +55,20 @@ pub mod driver;
 mod multimodal;
 mod text;
 
-pub use multimodal::{encoders, front_end};
+pub use multimodal::{encoders, front_end, qwen_vl};
 pub use text::grammar;
 
 pub use core::modality::Modality;
 pub use core::sampler::{Sampler, SamplerFault, TokenLogprob};
 pub use multimodal::qwen_vl_chat::{
-    QWEN2_5_VL_MAX_REMOTE_IMAGE_BYTES, Qwen25VlChatContent, Qwen25VlChatFileUrlError,
-    Qwen25VlChatImageDataUrlError, Qwen25VlChatImageFileError, Qwen25VlChatMessage,
-    Qwen25VlChatMessageContent, Qwen25VlChatRemoteImageError, Qwen25VlChatRequestError,
+    Qwen25VlChatContent, Qwen25VlChatImageFileError, Qwen25VlChatMessage,
+    Qwen25VlChatMessageContent, Qwen25VlChatRequestError,
 };
 pub use multimodal::qwen_vl_image::{
-    QWEN2_5_VL_MAX_RAW_MEDIA_ITEMS, Qwen25VlApngError, Qwen25VlDecodedFrameSource,
-    Qwen25VlDecodedImage, Qwen25VlImageDecodeError, Qwen25VlImagePreprocessError,
-    Qwen25VlImageProcessorConfig, Qwen25VlImageProcessorConfigError,
-    Qwen25VlImageProcessorConfigValidationError, Qwen25VlPadExpansionError, Qwen25VlProcessedImage,
+    QWEN2_5_VL_MAX_RAW_MEDIA_ITEMS, Qwen25VlApng, Qwen25VlApngError, Qwen25VlApngFrameSource,
+    Qwen25VlDecodedFrameSource, Qwen25VlDecodedImage, Qwen25VlImageDecodeError,
+    Qwen25VlImagePreprocessError, Qwen25VlImageProcessorConfig, Qwen25VlImageProcessorConfigError,
+    Qwen25VlImageProcessorConfigValidationError, Qwen25VlPadExpansionError,
     Qwen25VlProcessedImages, Qwen25VlProcessedMedia, Qwen25VlProcessedMediaAssemblyError,
     Qwen25VlProcessedVideo, Qwen25VlRawMediaInput, Qwen25VlRawRequestAssemblyError,
     Qwen25VlRawRequestMropeModelInput, Qwen25VlRawRequestMropeModelInputRequest,
@@ -86,22 +85,21 @@ pub use multimodal::qwen_vl_mrope::{
     Qwen25VlProcessorMediaMropeModelInput, Qwen25VlProcessorMediaMropeModelInputError,
     Qwen25VlProcessorMediaMropeModelInputRequest, Qwen25VlRenderedPromptMropeModelInput,
     Qwen25VlRenderedPromptMropeModelInputError, Qwen25VlRenderedPromptMropeModelInputRequest,
-    Qwen25VlVisualSpliceMapError, QwenVlMropeMetadata, QwenVlMropeMetadataLoadError,
-    QwenVlMropeSourceMetadata, load_qwen_vl_mrope_source_metadata,
+    QwenVlMropeMetadata, QwenVlMropeMetadataLoadError, QwenVlMropeSourceMetadata,
+    load_qwen_vl_mrope_source_metadata,
 };
 pub use poot_load::qwen_vl::QwenVlModelType;
 pub use poot_models::mrope::{
     MropeConfigMetadata, MropeConfigMetadataError, MropeGrid, MropePosition,
-    MropePositionAssemblyError, MropePositionError, MropePositionIds,
-    MropePositionSourceAssemblyError, MropeProcessorFpsInput, MropeProcessorSpecialToken,
-    MropeProcessorTimingError, MropeSampledFramesPerSecond, MropeSecondsPerGridStep, MropeSegment,
-    MropeSpanError, MropeSpecialTokenIds, MropeSpecialTokenKind, MropeSpecialTokenReconcileError,
-    MropeTemporalPatchSize, MropeTemporalTokensPerSecond, MropeTimingUnit,
-    MropeTokenizerSpecialToken, MropeVideoTiming, QWEN2_5_VL_PROCESSOR_DEFAULT_FPS,
-    Qwen25VlMropePositionInput, Qwen25VlMropePositionSourceInput,
-    assemble_qwen2_5_vl_mrope_positions, assemble_qwen2_5_vl_mrope_positions_from_sources,
-    assemble_qwen2_5_vl_video_timings, assemble_qwen2_5_vl_video_timings_with_default,
-    build_mrope_position_ids, discover_mrope_segments, reconcile_mrope_special_token_ids,
+    MropePositionAssemblyError, MropePositionError, MropePositionIds, MropeProcessorFpsInput,
+    MropeProcessorSpecialToken, MropeProcessorTimingError, MropeSampledFramesPerSecond,
+    MropeSecondsPerGridStep, MropeSegment, MropeSpanError, MropeSpecialTokenIds,
+    MropeSpecialTokenKind, MropeSpecialTokenReconcileError, MropeTemporalPatchSize,
+    MropeTemporalTokensPerSecond, MropeTimingUnit, MropeTokenizerSpecialToken, MropeVideoTiming,
+    QWEN2_5_VL_PROCESSOR_DEFAULT_FPS, Qwen25VlMropePositionInput,
+    assemble_qwen2_5_vl_mrope_positions, assemble_qwen2_5_vl_video_timings,
+    assemble_qwen2_5_vl_video_timings_with_default, build_mrope_position_ids,
+    discover_mrope_segments, reconcile_mrope_special_token_ids,
 };
 pub use text::chat::{RenderedChat, derive_jinja_stops, render_jinja_value};
 pub use text::guided::{Constraint, JsonAcceptor, json_schema_to_regex, tool_call_regex};

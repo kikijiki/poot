@@ -9,7 +9,7 @@ sidebar_position: 4
 The library loads supported GGUF and safetensors weights in their packed format. Generated kernels
 decode dense projections and embedding rows as they consume them. Loading a format does not imply
 that every model architecture or execution path supports it; see the [feature matrix](../reference/feature-matrix.md).
-Generation serving is not available yet (poot is being refactored; planned to return) and returns `503`.
+`poot-serve` serves the checkpoints its engine plan prepares; a refusal names the equation and the missing capability.
 
 ## GGUF
 

@@ -199,8 +199,8 @@ impl Drop for PtxEvent {
 
 /// A device-timed span around one [`PtxGraphExec`] launch (Card 552 SC-006), returned by
 /// [`crate::PtxContext::launch_timed`]: two owned CUDA events, read by
-/// [`crate::PtxContext::span_elapsed`]. Opaque to callers outside this crate; it exists only to be
-/// handed back to `span_elapsed`.
+/// [`crate::PtxContext::spans_elapsed`]. Opaque to callers outside this crate; it exists only to be
+/// handed back to `spans_elapsed`.
 pub struct PtxSpan {
     pub(crate) start: PtxEvent,
     pub(crate) stop: PtxEvent,

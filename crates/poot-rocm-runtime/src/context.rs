@@ -135,10 +135,18 @@ pub struct RocmContext {
     pub(crate) compute_units: Option<u32>,
     /// Work a timed-out wait left in flight, and the poison flag that follows it.
     pub(crate) timeouts: TimeoutLeaks,
+    /// Replays enqueued and not yet completed, oldest first ([`RocmContext::enqueue_graph_batched`]);
+    /// [`RocmContext::synchronize`] completes them.
+    pub(crate) pending: Mutex<Vec<PendingSubmission>>,
+    /// How many times the host waited on an enqueued batch's completion signal
+    /// ([`RocmContext::batch_waits`]).
+    pub(crate) batch_waits: Arc<std::sync::atomic::AtomicU64>,
     /// The bounded-wait ceiling every `wait_completion_bounded`/`synchronize`/queue-space wait reads
     /// (Card 548): typed construction-time configuration, never an environment read in
     /// library code (`poot/AGENTS.md`). Set once, from [`RocmContextOptions`], at construction.
     pub(crate) wait_timeout: std::time::Duration,
+    /// `Some` when constructed with [`RocmContextOptions::device_timing`].
+    pub(crate) device_timing: Option<DeviceTiming>,
 }
 
 /// Construction-time options for [`RocmContext::new_with_options`] (Card 548): the
@@ -150,14 +158,51 @@ pub struct RocmContextOptions {
     /// read-index spin, the publisher's queue-space wait): a hang detector, not a latency bound (see
     /// the former `GPU_WAIT_TIMEOUT_SECS` doc). [`Self::default`] is 600s, the prior constant default.
     pub wait_timeout: std::time::Duration,
+    /// Whether the queue's profiler is enabled and every replayed packet carries its own completion
+    /// signal, so [`RocmContext::dispatch_spans`] reports each dispatch's device start and end
+    /// (POOT-1079). Off by default: a profiled replay creates, waits on and reads one signal per
+    /// packet instead of one per batch, so it is diagnostic, never throughput evidence.
+    pub device_timing: bool,
 }
 
 impl Default for RocmContextOptions {
     fn default() -> Self {
         Self {
             wait_timeout: std::time::Duration::from_secs(600),
+            device_timing: false,
         }
     }
+}
+
+/// One dispatch's device execution window, in the system-timestamp clock domain
+/// (`hsa_amd_profiling_dispatch_time_t` ticks converted with `HSA_SYSTEM_INFO_TIMESTAMP_FREQUENCY`).
+/// Only the difference between two instants of this clock means anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DispatchSpan {
+    pub start: std::time::Duration,
+    pub end: std::time::Duration,
+}
+
+impl DispatchSpan {
+    /// The dispatch's device duration (`end - start`, zero if the clock reported them reversed).
+    pub fn duration(&self) -> std::time::Duration {
+        self.end.saturating_sub(self.start)
+    }
+}
+
+/// A system-timestamp tick count as a [`Duration`](std::time::Duration) at `ticks_per_second`.
+pub(crate) fn ticks_to_duration(ticks: u64, ticks_per_second: u64) -> std::time::Duration {
+    let nanos = u128::from(ticks) * 1_000_000_000 / u128::from(ticks_per_second.max(1));
+    std::time::Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+}
+
+/// Device-timing state of a context built with [`RocmContextOptions::device_timing`].
+pub(crate) struct DeviceTiming {
+    /// `HSA_SYSTEM_INFO_TIMESTAMP_FREQUENCY`, read once at construction.
+    pub(crate) ticks_per_second: u64,
+    /// Spans of the dispatches completed since the last [`RocmContext::clear_dispatch_spans`], in
+    /// submission order.
+    pub(crate) spans: Mutex<Vec<DispatchSpan>>,
 }
 
 /// `POOT_REQUIRE_ROCM=1` turns the "no ROCm device -> tests skip cleanly" convention into a loud
@@ -317,6 +362,20 @@ impl DevicePoison {
 )]
 pub(crate) struct Held {
     pub(crate) staging: Option<StagingBuffer>,
+    /// The kernarg buffers of an enqueued batch: its packets read them until the batch completes.
+    pub(crate) kernargs: Vec<RocmBuffer>,
+    /// The completion signals of an enqueued batch's non-final packets, present only on a context
+    /// built with [`RocmContextOptions::device_timing`]; the batch's own signal belongs to its final
+    /// packet. Handles, not owners: destroyed only after proven completion, leaked with the rest of an
+    /// abandoned submission.
+    pub(crate) dispatch_signals: Vec<bindings::hsa_signal_t>,
+}
+
+/// One enqueued batch: the completion signal of its last packet (created at 1, dropped to 0 by the
+/// packet) and what its packets still read.
+pub(crate) struct PendingSubmission {
+    pub(crate) signal: bindings::hsa_signal_t,
+    pub(crate) held: Held,
 }
 
 impl std::fmt::Debug for Held {
@@ -326,6 +385,8 @@ impl std::fmt::Debug for Held {
                 "staging_bytes",
                 &self.staging.as_ref().map(StagingBuffer::len),
             )
+            .field("kernargs", &self.kernargs.len())
+            .field("dispatch_signals", &self.dispatch_signals.len())
             .finish()
     }
 }
@@ -532,6 +593,9 @@ pub(crate) fn caps_from_agent(probe: &AgentProbe<'_>) -> poot_target::DeviceCaps
 
 impl Drop for RocmContext {
     fn drop(&mut self) {
+        // Enqueued work still reads the context's buffers: complete it before the queue goes. A
+        // failure poisons the context, which keeps the queue below.
+        let _ = self.complete_pending("drop");
         // Queue use is confined to the context. A poisoned queue may still run a packet, so it moves to
         // the leak list instead of being destroyed.
         let destroy = self.hsa.funcs.hsa_queue_destroy;

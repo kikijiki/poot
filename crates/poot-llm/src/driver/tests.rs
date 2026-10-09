@@ -68,7 +68,7 @@ const TINY: FamilyKey = FamilyKey::new("tiny");
 pub(super) enum Variant {
     /// Positions and tokens only: nothing carried.
     Plain,
-    /// One `StateRole::Recurrent` conv-like state, `[rows, 4]`, folded with every token.
+    /// One `StateRole::Recurrent` conv-like state, a `[4]` row per sequence, folded with every token.
     Recurrent,
     /// A recurrent state whose row axis is axis 1 (`[4, rows]`): malformed.
     BadRowAxis,
@@ -157,22 +157,21 @@ impl Model for Tiny {
         let seed = b.binary(BinOp::Add, token, pos);
         match self.variant {
             Variant::Plain => {}
-            Variant::Recurrent | Variant::BadRowAxis => {
-                let dims = if self.variant == Variant::Recurrent {
-                    vec![rows, 4]
-                } else {
-                    vec![4, rows]
-                };
+            Variant::Recurrent => {
+                let state = step.recurrent_state(&b, "toy.state", DType::F32, &[4]);
+                // The last position's seed, whatever width the step has.
+                let spread = b.broadcast(b.slice(seed, 1, out - 1, out), vec![rows, 4]);
+                let folded = b.binary(BinOp::Add, state.current(), spread);
+                step.carry_recurrent(&b, state, folded);
+            }
+            Variant::BadRowAxis => {
+                let dims = vec![4, rows];
                 let state = b.state_input(
                     "toy.state",
                     TensorType::f32(dims.clone()),
                     StateRole::Recurrent,
                 );
-                let spread = if self.variant == Variant::Recurrent {
-                    b.broadcast(seed, dims)
-                } else {
-                    b.broadcast(b.reshape(seed, vec![1, rows]), dims)
-                };
+                let spread = b.broadcast(b.reshape(seed, vec![1, rows]), dims);
                 let folded = b.binary(BinOp::Add, state, spread);
                 step.carry(state, folded);
             }
@@ -350,6 +349,8 @@ struct World {
     entry_inputs: Vec<Vec<usize>>,
     allocated: Vec<(BufferRole, usize, ElementKind)>,
     writes: HashMap<usize, Vec<u8>>,
+    /// Every write into a state buffer, in order: `(byte offset, byte length)`. A row reset is one.
+    state_writes: Vec<(usize, usize)>,
     last: StepRecord,
     steps: Vec<StepRecord>,
     weight_allocations: usize,
@@ -358,6 +359,10 @@ struct World {
     fail_remove: bool,
     /// Make `unload` fail, for the unload-ordering row.
     fail_unload: bool,
+    /// Make the device's `synchronize` fail, for the encode-step recovery rows.
+    fail_synchronize: bool,
+    /// Make the device's `abort` fail: the engine poisons, as a lost device does.
+    fail_abort: bool,
 }
 
 type Shared = Rc<RefCell<World>>;
@@ -505,12 +510,14 @@ impl Device for FakeDevice {
         Ok(())
     }
 
-    fn write(&mut self, dst: &FakeBuffer, bytes: &[u8]) -> Result<(), FakeError> {
-        if dst.role == BufferRole::Input {
-            self.world
-                .borrow_mut()
-                .writes
-                .insert(dst.id, bytes.to_vec());
+    fn write(&mut self, dst: &FakeBuffer, offset: usize, bytes: &[u8]) -> Result<(), FakeError> {
+        let mut world = self.world.borrow_mut();
+        match dst.role {
+            BufferRole::Input => {
+                world.writes.insert(dst.id, bytes.to_vec());
+            }
+            BufferRole::State => world.state_writes.push((offset, bytes.len())),
+            _ => {}
         }
         Ok(())
     }
@@ -531,6 +538,9 @@ impl Device for FakeDevice {
     }
 
     fn synchronize(&mut self) -> Result<(), FakeError> {
+        if self.world.borrow().fail_synchronize {
+            return Err(FakeError);
+        }
         Ok(())
     }
 
@@ -539,6 +549,9 @@ impl Device for FakeDevice {
     }
 
     fn abort(&mut self) -> Result<(), FakeError> {
+        if self.world.borrow().fail_abort {
+            return Err(FakeError);
+        }
         Ok(())
     }
 }
@@ -677,6 +690,8 @@ pub(super) struct RigOptions {
     max_retained_bytes: u64,
     charge: crate::driver::RetentionCharge,
     max_positions: usize,
+    /// Speculate with the rig's own model as the draft, `k` tokens a round.
+    draft_model_k: Option<NonZeroUsize>,
 }
 
 impl Default for RigOptions {
@@ -690,6 +705,7 @@ impl Default for RigOptions {
             max_retained_bytes: 1 << 40,
             charge: crate::driver::program_retention,
             max_positions: 256,
+            draft_model_k: None,
         }
     }
 }
@@ -732,12 +748,15 @@ fn build_rig(options: RigOptions, script: Script) -> Result<Rig, DriverError> {
         entry_inputs: Vec::new(),
         allocated: Vec::new(),
         writes: HashMap::new(),
+        state_writes: Vec::new(),
         last: StepRecord::default(),
         steps: Vec::new(),
         weight_allocations: 0,
         add_entry_calls: 0,
         fail_remove: false,
         fail_unload: false,
+        fail_synchronize: false,
+        fail_abort: false,
     }));
     let device = FakeDevice {
         world: world.clone(),
@@ -749,8 +768,16 @@ fn build_rig(options: RigOptions, script: Script) -> Result<Rig, DriverError> {
         log,
     };
     let compile = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
+    let handle = Arc::new(handle);
+    let draft = match options.draft_model_k {
+        Some(k) => crate::driver::DraftPolicy::DraftModel {
+            handle: Arc::clone(&handle),
+            k,
+        },
+        None => crate::driver::DraftPolicy::Off,
+    };
     let driver = Driver::new(
-        Arc::new(handle),
+        handle,
         Box::new(executor),
         DriverOptions {
             prefill: compile.clone(),
@@ -763,7 +790,7 @@ fn build_rig(options: RigOptions, script: Script) -> Result<Rig, DriverError> {
                 max_retained_bytes: NonZeroU64::new(options.max_retained_bytes).unwrap(),
             },
             charge: options.charge,
-            draft: crate::driver::DraftPolicy::Off,
+            draft,
         },
     )?;
     Ok(Rig { driver, world })
@@ -1602,3 +1629,46 @@ fn a_gguf_file_loads_through_the_registry() {
 
 #[path = "serving_tests.rs"]
 mod serving_tests;
+
+/// The generation budget of a window: the whole rest of it by default, an explicit count only when it
+/// fits, and a prompt that leaves no position is refused rather than run for zero tokens. Mutation: the
+/// default drops the prompt from the subtraction, or the explicit bound is `<` instead of `<=`.
+#[test]
+fn max_new_within_defaults_to_the_rest_of_the_window_and_refuses_an_overrun() {
+    let within = GenerateRequest::max_new_within;
+    assert_eq!(within(10, 64, None), Ok(54));
+    assert_eq!(within(10, 64, Some(54)), Ok(54));
+    assert_eq!(within(10, 64, Some(0)), Ok(0));
+    assert_eq!(
+        within(10, 64, Some(55)),
+        Err(InvalidRequest::Capacity {
+            prompt: 10,
+            max_new: 55,
+            max: 64
+        })
+    );
+    assert_eq!(
+        within(64, 64, None),
+        Err(InvalidRequest::Capacity {
+            prompt: 64,
+            max_new: 1,
+            max: 64
+        })
+    );
+    assert_eq!(within(0, 64, None), Err(InvalidRequest::EmptyPrompt));
+}
+
+/// Phase timing is opt-in: a driver that is not built `with_phase_timing` never snapshots the
+/// executor's timing (the serving path pays nothing) and reports none, and one that is reports the
+/// phases. Mutation: build every driver with phase timing on (the plain driver reports a timing).
+#[test]
+fn phase_timing_is_reported_only_when_asked_for() {
+    let mut plain = rig_default(logits_script(vec![favoring(1)]));
+    let generation = run(&mut plain, request(&[1, 2, 3], 2, Sampler::greedy())).unwrap();
+    assert_eq!(generation.timing, None);
+    let mut timed = rig_default(logits_script(vec![favoring(1)]));
+    timed.driver = timed.driver.with_phase_timing();
+    let generation = run(&mut timed, request(&[1, 2, 3], 2, Sampler::greedy())).unwrap();
+    let timing = generation.timing.expect("a timed driver reports phases");
+    assert_eq!(timing.prefill.tokens, 3);
+}

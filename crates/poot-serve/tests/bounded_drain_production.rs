@@ -2,6 +2,7 @@
 //! input; the accepted-request barrier is a deliberately incomplete HTTP head handled by the production
 //! parser. Nothing of the accept loop, deadline, or cancellation path is reimplemented here.
 
+use poot_test_util::contained_child::ContainChild;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -141,6 +142,7 @@ impl ProductionServer {
         // The server opens a device before it listens (the engine plan prepares the model on it), so the
         // production binary runs on the wgpu device lane, named explicitly.
         command
+            .contained()
             .arg(model.path())
             .arg(addr.to_string())
             .args(["--backend", "wgpu"])

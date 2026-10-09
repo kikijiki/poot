@@ -559,8 +559,13 @@ impl Device for FaultyOnceDevice {
     fn replay(&mut self, recording: &Self::Recording) -> Result<(), Self::Error> {
         self.inner.replay(recording)
     }
-    fn write(&mut self, dst: &Self::Buffer, bytes: &[u8]) -> Result<(), Self::Error> {
-        self.inner.write(dst, bytes)
+    fn write(
+        &mut self,
+        dst: &Self::Buffer,
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), Self::Error> {
+        self.inner.write(dst, offset, bytes)
     }
     fn read(&mut self, src: &Self::Buffer, out: &mut [u8]) -> Result<(), Self::Error> {
         self.inner.read(src, out)
@@ -584,7 +589,7 @@ impl Device for FaultyOnceDevice {
 /// `FaultyOnceDevice` is the fault injection; the assertions below exercise the real `abort()` path.
 ///
 /// MUTATION (recorded here, never left in the tree): in `poot-ptx-gpu/src/device.rs`'s
-/// `PtxDevice::abort`, delete the `self.ctx.abort_capture();` call (keep `self.pending_span = None;
+/// `PtxDevice::abort`, delete the `self.ctx.abort_capture();` call (keep `self.pending_spans.clear();
 /// Ok(())`). Result: RED - the real CUDA stream stays stuck in capture mode, so the retry step below
 /// fails with `CaptureOpen` instead of succeeding. Reverted: GREEN.
 #[test]
@@ -709,8 +714,13 @@ impl Device for FaultyOnceSyncDevice {
     fn replay(&mut self, recording: &Self::Recording) -> Result<(), Self::Error> {
         self.inner.replay(recording)
     }
-    fn write(&mut self, dst: &Self::Buffer, bytes: &[u8]) -> Result<(), Self::Error> {
-        self.inner.write(dst, bytes)
+    fn write(
+        &mut self,
+        dst: &Self::Buffer,
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), Self::Error> {
+        self.inner.write(dst, offset, bytes)
     }
     fn read(&mut self, src: &Self::Buffer, out: &mut [u8]) -> Result<(), Self::Error> {
         self.inner.read(src, out)

@@ -222,10 +222,18 @@ pub(crate) fn checked_copy<T>(
 pub(crate) fn checked_byte_range(
     op: &'static str,
     buf: &RocmBuffer,
+    offset: usize,
     len: usize,
 ) -> Result<CopyRange, RocmError> {
-    poot_runtime_common::checked_copy_range(0, len, 1, false, buf.elem_count(), buf.byte_capacity())
-        .map_err(|error| map_copy_range_error(op, 0, len, error))
+    poot_runtime_common::checked_copy_range(
+        offset,
+        len,
+        1,
+        false,
+        buf.elem_count(),
+        buf.byte_capacity(),
+    )
+    .map_err(|error| map_copy_range_error(op, offset, len, error))
 }
 
 impl Drop for RocmAlloc {

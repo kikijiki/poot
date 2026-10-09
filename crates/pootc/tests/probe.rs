@@ -1,5 +1,6 @@
 //! Process-level contract tests for the `pootc` rustc driver.
 
+use poot_test_util::contained_child::ContainChild;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -160,6 +161,7 @@ fn pootc_command(
     environment: &[(&str, &str)],
 ) -> Command {
     let mut command = Command::new(pootc_exe());
+    command.contained();
     command
         // 2021 (uniform paths): kernel sources `use poot_kernel_intrinsics::...;` without a leading
         // `extern crate` (card 531c); the pre-2018 default edition rejects that as an unresolved import.

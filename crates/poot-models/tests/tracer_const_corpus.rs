@@ -70,6 +70,7 @@ fn registered_trace(family: &str, phase: Phase, shape: poot_models::model::StepS
         eqns,
         output,
         state,
+        exports: _,
         validations: _,
     } = model.trace(phase, shape).expect("the fixture traces");
     Graph {
@@ -80,6 +81,7 @@ fn registered_trace(family: &str, phase: Phase, shape: poot_models::model::StepS
         eqns,
         output,
         validations: poot_graph_ir::NoValidations,
+        exports: Vec::new(),
         state,
     }
 }

@@ -393,7 +393,7 @@ fn state_probe_graph(name: &str, aval: TensorType) -> Graph<ValidationOutputs> {
 
 /// The same prefill entry, with a canonical witness: a poisoned step fails exactly as the CPU oracle does.
 /// Zero-seeded state is now the contract's own job (automatic on first use, Card 546b), not an explicit
-/// `run_resident_kv` seed upload; two independent executables give the "seeded" and "poisoned" steps
+/// seed upload as the deleted `run_resident_kv` needed; two independent executables give the "seeded" and "poisoned" steps
 /// each a fresh zero state, since a second `add_entry` on the SAME executable would bind the identical
 /// "accumulator" state by name and inherit the first step's already-advanced value instead.
 #[test]

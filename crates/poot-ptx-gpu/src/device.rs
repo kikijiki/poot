@@ -62,10 +62,10 @@ pub struct PtxDevice {
     /// from `Engine`'s plan-sourced one (`Engine::kernel`): `copy` is engine-internal state-commit
     /// logic `Engine::walk` calls directly, never through `Device::load_kernel`/`dispatch`.
     copy_kernel_cache: poot_codegen::KernelCache,
-    /// The open step's device-timed span (Card 552 SC-006), set by [`Self::replay`] and read by
-    /// [`Self::device_time`]; `None` when this device was not built with
+    /// The open step's device-timed spans (Card 552 SC-006), one per [`Self::replay`] since
+    /// [`Self::begin_step`], read by [`Self::device_time`]; empty when this device was not built with
     /// [`PtxContext::new_with_device_timing`], or no step has replayed yet.
-    pending_span: Option<PtxSpan>,
+    pending_spans: Vec<PtxSpan>,
 }
 
 impl PtxDevice {
@@ -73,11 +73,18 @@ impl PtxDevice {
         Ok(Self::with_context(PtxContext::new()?))
     }
 
+    /// Like [`Self::new`], but every graph replay is bracketed by a CUDA event pair, so
+    /// [`Device::device_time`] is `Measured` (the device span; PTX has no per-dispatch timing inside a
+    /// captured graph).
+    pub fn new_with_device_timing() -> Result<Self, PtxGpuError> {
+        Ok(Self::with_context(PtxContext::new_with_device_timing()?))
+    }
+
     fn with_context(ctx: PtxContext) -> Self {
         Self {
             ctx,
             copy_kernel_cache: poot_codegen::KernelCache::open(poot_codegen::Target::Nvptx),
-            pending_span: None,
+            pending_spans: Vec::new(),
         }
     }
 
@@ -193,13 +200,19 @@ impl Device for PtxDevice {
         Ok(Some(PtxRecording { exec }))
     }
 
-    fn replay(&mut self, recording: &PtxRecording) -> Result<(), PtxGpuError> {
-        self.pending_span = self.ctx.launch_timed(&recording.exec)?;
+    fn begin_step(&mut self) -> Result<(), PtxGpuError> {
+        self.pending_spans.clear();
         Ok(())
     }
 
-    fn write(&mut self, dst: &PtxBuffer, bytes: &[u8]) -> Result<(), PtxGpuError> {
-        Ok(self.ctx.write_bytes(dst, bytes)?)
+    fn replay(&mut self, recording: &PtxRecording) -> Result<(), PtxGpuError> {
+        self.pending_spans
+            .extend(self.ctx.launch_timed(&recording.exec)?);
+        Ok(())
+    }
+
+    fn write(&mut self, dst: &PtxBuffer, offset: usize, bytes: &[u8]) -> Result<(), PtxGpuError> {
+        Ok(self.ctx.write_bytes(dst, offset, bytes)?)
     }
 
     fn read(&mut self, src: &PtxBuffer, out: &mut [u8]) -> Result<(), PtxGpuError> {
@@ -210,21 +223,19 @@ impl Device for PtxDevice {
         Ok(self.ctx.synchronize()?)
     }
 
-    /// Card 552: the span [`Self::replay`] bracketed around the last `cuGraphLaunch`, read once the
-    /// caller has synchronized (`Engine::step` always does, strictly before calling this). `Unknown`
-    /// when this device was not built with [`PtxContext::new_with_device_timing`] (SC-006: never a
-    /// fabricated host-wall measurement), or if reading the event pair fails.
+    /// Card 552: the window [`Self::replay`] bracketed around the step's `cuGraphLaunch`es (first
+    /// stage's start to last stage's end), read once the caller has synchronized (`Engine::step`
+    /// always does, strictly before calling this). `Unknown` when this device was not built with
+    /// [`PtxContext::new_with_device_timing`] (SC-006: never a fabricated host-wall measurement), or
+    /// if reading the event pair fails.
     fn device_time(&self) -> DeviceTime {
-        match &self.pending_span {
-            None => DeviceTime::Unknown,
-            Some(span) => match self.ctx.span_elapsed(span) {
-                Ok(duration) => DeviceTime::Measured(MeasuredDeviceTime {
-                    sum_of_dispatch_durations: None,
-                    device_span: Some(duration),
-                    dispatches: Vec::new(),
-                }),
-                Err(_) => DeviceTime::Unknown,
-            },
+        match self.ctx.spans_elapsed(&self.pending_spans) {
+            Ok(Some(duration)) => DeviceTime::Measured(MeasuredDeviceTime {
+                sum_of_dispatch_durations: None,
+                device_span: Some(duration),
+                dispatches: Vec::new(),
+            }),
+            Ok(None) | Err(_) => DeviceTime::Unknown,
         }
     }
 
@@ -233,7 +244,7 @@ impl Device for PtxDevice {
         // Defense in depth, as `WgpuDevice::abort`'s identical comment explains: a failed replay
         // (e.g. a mid-launch error) reaches here too, and this guarantees no pending span survives
         // into whatever runs next.
-        self.pending_span = None;
+        self.pending_spans.clear();
         Ok(())
     }
 }

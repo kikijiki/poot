@@ -67,9 +67,8 @@ hidden states, a vision tower's frames), and a prompt can supply embedding rows 
 rows and a frame's pixels are bound by value on every step, never baked into a program. Greedy and plain-temperature generation (including top-k/top-p/min-p)
 pick the next token on-device: a sampling step is appended to the decode graph itself, and the host
 reads back only the chosen token id and a non-finite flag, not the full logits. A request with logit-bias/penalty, logprob recording, or a guided-decoding constraint still reads the full logits
-back and picks on the host, since those transforms are host-side. Batching pieces for serving (slot
-admission, KV-fit budgeting) exist as tested building blocks, but `poot-serve` runs no generation
-engine.
+back and picks on the host, since those transforms are host-side. `poot-serve` runs the driver in one scheduling loop that admits requests into
+slots and fits the KV cache to the device ([Continuous batching](../serve/continuous-batching.md)).
 
 ## Verification
 

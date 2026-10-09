@@ -1,6 +1,6 @@
 [package]
 name = "poot-llm"
-description = "poot LLM runner: load real weights + tokenizer and generate on the eager executor (host coherence path)"
+description = "poot LLM driver: load a checkpoint and generate on the wgpu, ROCm and PTX device executors"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -27,13 +27,10 @@ minijinja-contrib.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 image.workspace = true
-base64.workspace = true
-# Blocking HTTP(S) image loading for the Qwen2.5-VL chat constructor. Rustls avoids a platform TLS
-# dependency; response bytes are bounded before decode.
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 # Binaries only: the `cli` feature turns it on and the three bins that use it require that feature.
 # The library's own API is `thiserror` types throughout (`TextError`, `driver::error::DriverError`).
 anyhow = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, optional = true }
@@ -47,13 +44,17 @@ poot-executor.workspace = true
 # The planning device (`driver::capacity`) implements `Device` over the runtime memory counters.
 poot-runtime-common.workspace = true
 bytemuck.workspace = true
-# bin/ptx-graph-check's --precompile mode (card 549): compiles graphs through the shared
-# poot_graph_plan::compile plus one poot_codegen::KernelCache, with no CUDA context.
-poot-codegen.workspace = true
 # The driver measures the retained size of each planned kernel body (`program_retention`).
 poot-kernel-ir.workspace = true
+# `Generation::timing` windows the executor's typed step timing (`poot_profile::Report::window`).
+poot-profile.workspace = true
 
 [dev-dependencies]
+# The `cli` feature for this package's own tests: it builds the `poot-generate` binary, which the
+# `tests/poot_generate_cli.rs` rows spawn (`CARGO_BIN_EXE_poot-generate`), in every lane that builds the tests.
+poot-llm = { workspace = true, features = ["cli"] }
+# The APNG fixtures of the Qwen2.5-VL video tests are stored base64-encoded.
+base64.workspace = true
 # The examples (`examples/`) are binaries and use it directly.
 anyhow.workspace = true
 poot-test-util = { workspace = true, features = ["graph-fixtures"] }
@@ -68,14 +69,11 @@ poot-codegen.workspace = true
 poot-runtime.workspace = true
 poot-ptx-runtime.workspace = true
 poot-rocm-runtime.workspace = true
-# Card 546b: the olmo2 decode-GEMV device-time bound reads Card 552's typed per-entry window
-# (`poot_profile::Report::window`) instead of the deleted `GpuExecutor` label profiler.
-poot-profile.workspace = true
 
 [features]
-# `anyhow` and `tracing-subscriber` for the `qwen2-generate`, `poot-caption` and `poot-embed` binaries (a bin cannot carry its
-# own dependency).
-cli = ["dep:anyhow", "dep:tracing-subscriber"]
+# `anyhow`, `clap` and `tracing-subscriber` for the `poot-generate`, `poot-caption` and `poot-embed` binaries (a bin
+# cannot carry its own dependency).
+cli = ["dep:anyhow", "dep:clap", "dep:tracing-subscriber"]
 # ROCm/HSA GPU path.
 rocm = ["dep:poot-rocm-gpu"]
 
@@ -84,7 +82,7 @@ name = "poot_llm"
 path = "src/lib.rs"
 
 [[bin]]
-name = "qwen2-generate"
+name = "poot-generate"
 path = "src/main.rs"
 required-features = ["cli"]
 
@@ -97,10 +95,6 @@ required-features = ["cli"]
 name = "poot-embed"
 path = "src/bin/embed.rs"
 required-features = ["cli"]
-
-[[bin]]
-name = "ptx-graph-check"
-path = "src/bin/ptx-graph-check/main.rs"
 
 [lints]
 workspace = true

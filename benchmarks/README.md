@@ -299,8 +299,8 @@ env vars, and run `uv run bench run ...`.
   The harness passes `--gguf <model_dir>` and expects exactly one `.gguf` there.
 - **poot needs `warmup >= 2`.** With `warmup 1`, one-time CUDA module-load / PTX JIT leaks into the timed
   runs and reads a fraction of the true tok/s. On a pod the runner runs its `ptx` backend (NVIDIA
-  capture/replay) and needs libcuda (the pod driver) at runtime; the backend is `POOT_BENCH_BACKEND`, not
-  `POOT_TARGET`. Per-call CUDA-graph capture lands in TTFT, not in decode tok/s.
+  capture/replay) and needs libcuda (the pod driver) at runtime; the backend is
+  `POOT_BENCH_BACKEND`. Per-call CUDA-graph capture lands in TTFT, not in decode tok/s.
 - **poot prefill is naive and serial; cap the ISL if the top point is impractical.** TTFT is super-linear in
   context (qwen3-0.6b: 4 s / 20 s / 133 s at isl 128 / 512 / 2048), so isl=8192 can be a multi-hour cell.
   Raise `POOT_BENCH_CELL_TIMEOUT_S`, or cap poot at a lower ISL (edit the scenario `isl` list) and run

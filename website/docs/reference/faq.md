@@ -22,8 +22,8 @@ activations, KV capacity, staging and temporary tensors; a packed checkpoint's s
 - Packed MoE experts are read by an indexed packed contraction; no expert table is materialized.
 - Dense BF16/F16 weights are kept as stored words after loading; there is no host f32 copy. The CPU
   reference reads them through explicit casts in the graph on each step.
-- The serving settings that tuned the wgpu batch (`POOT_SLOTS` / `POOT_CAP`) are not available yet (poot is being refactored; planned to return). Library callers
-  set the batch shape directly.
+- The server does not read batch settings: the engine plan fits the row count and positions to the device.
+  Library callers set the batch shape directly in `DriverOptions`.
 
 FP8 projection storage and model support are separate questions. See
 [Using quantized checkpoints](../serve/quantized-checkpoints.md) for the supported layouts and current
@@ -42,14 +42,14 @@ artifact limit does not bound the external compiler's own memory or time.
 
 ## Can I use continuous batching and tensor parallelism together?
 
-Neither is available yet (poot is being refactored; planned to return). See [Serving](../serve/index.md).
+Not today. Continuous batching is served ([Continuous batching](../serve/continuous-batching.md)); tensor
+parallelism is not implemented in the server.
 
-## Where are prefix caching and fast batched prefill available?
+## Where is prefix caching available?
 
-They are library-level features, not served yet (being restored). wgpu has the broadest library coverage. PTX and
-ROCm generic decoders both reuse completed prompt prefixes. The pre-driver one-shot ROCm prefill path
-(fresh, f32-KV Qwen2-family requests, with or without one LoRA adapter) went with the old engine; ROCm and PTX
-prompts use the driver's prefill paths.
+Prefix caching is served on wgpu and ROCm: the loop registers a finished prompt's full blocks and a later
+request reuses them. The driver's chunked prefill is the only prefill path, on every backend. PTX serving is
+verified for the dense fixture only.
 
 ## Why is sampled decoding slower on ROCm?
 

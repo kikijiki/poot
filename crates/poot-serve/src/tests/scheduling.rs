@@ -52,15 +52,16 @@ fn the_loop_opens_no_more_sequences_than_rows_and_serves_the_whole_queue() {
     assert_eq!(peak_open(&engine.events()), 2);
     for request in &submitted {
         let (_, terminal) = outcome(request);
-        let GenEvent::Done(tokens, _, natural) = terminal else {
+        let GenEvent::Done(completion) = terminal else {
             panic!("every queued job is served");
         };
+        assert_eq!(completion.prompt_tokens, 2, "the prompt");
+        assert_eq!(completion.tokens.len(), 3, "three generated tokens");
         assert_eq!(
-            tokens.len(),
-            2 + 3,
-            "the prompt, then three generated tokens"
+            completion.finish,
+            FinishReason::Length,
+            "max_new ends the request: finish_reason length"
         );
-        assert!(!natural, "max_new ends the request: finish_reason length");
     }
     assert_eq!(metrics.requests_completed.load(Ordering::Relaxed), 5);
 }
@@ -120,22 +121,23 @@ fn max_new_is_cut_to_the_positions_the_window_leaves() {
     let mut engine = RecordingEngine::new(1);
     engine.max_seq = 10;
     let (_exit, _metrics, submitted) = serve(&mut engine, vec![JobSpec::new("abcdef", 100)]);
-    let GenEvent::Done(tokens, _, natural) = outcome(&submitted[0]).1 else {
+    let GenEvent::Done(completion) = outcome(&submitted[0]).1 else {
         panic!("served");
     };
+    assert_eq!(completion.prompt_tokens, 6);
     assert_eq!(
-        tokens.len(),
-        10,
-        "six prompt tokens and the four the window leaves"
+        completion.tokens.len(),
+        4,
+        "the four positions the window leaves after six prompt tokens"
     );
-    assert!(!natural);
+    assert_eq!(completion.finish, FinishReason::Length);
     assert!(matches!(engine.events()[0], Event::Open { max_new: 4, .. }));
 }
 
 /// An idle loop with a live queue stays open for a late job, and ends once the queue closes.
 #[test]
 fn an_idle_loop_serves_a_late_job_and_ends_when_the_queue_closes() {
-    let (tx, rx) = mpsc::channel::<Job>();
+    let (tx, rx) = mpsc::channel::<EngineMsg>();
     let metrics = Arc::new(test_metrics("idle"));
     let loop_metrics = Arc::clone(&metrics);
     let thread = std::thread::spawn(move || {
@@ -148,7 +150,7 @@ fn an_idle_loop_serves_a_late_job_and_ends_when_the_queue_closes() {
         "a live empty queue keeps the loop open"
     );
     let (job, submitted) = JobSpec::new("late", 1).build();
-    tx.send(job).unwrap();
+    tx.send(EngineMsg::Generate(Box::new(job))).unwrap();
     let terminal = submitted
         .replies
         .recv_timeout(Duration::from_secs(5))
@@ -211,4 +213,43 @@ fn schedule_prefill_admissions_empty_pending_is_a_no_op() {
         schedule_prefill_admissions(&[], 0, 100),
         Vec::<usize>::new()
     );
+}
+
+/// SC-003 (loop half): the loop counts the draft policy's report for each row as the driver gave it. A
+/// verified round that returned three tokens (two accepted drafts and one more) counts two accepted, not
+/// three, and a row that decoded without speculating counts as a skip. Mutation: record the row's token
+/// count where its accepted count belongs; the accepted counter reads 6 for 4 and the row goes red.
+#[test]
+fn the_loop_counts_the_drivers_accepted_drafts_not_the_tokens_a_round_returned() {
+    use poot_llm::driver::{NotSpeculated, RowSpeculation};
+
+    let mut engine = RecordingEngine::new(1).picking(|_, committed| {
+        if committed == 0 {
+            vec![1]
+        } else {
+            vec![5, 6, 7]
+        }
+    });
+    engine.speculation = Some(RowSpeculation::Verified {
+        proposed: 4,
+        accepted: 2,
+    });
+    let (exit, metrics, submitted) = serve(&mut engine, vec![JobSpec::new("ab", 7)]);
+    assert_eq!(exit, Exit::Shutdown);
+    let GenEvent::Done(completion) = outcome(&submitted[0]).1 else {
+        panic!("the request completes");
+    };
+    assert_eq!(completion.tokens.len(), 7, "seven generated tokens");
+    let speculative = &metrics.speculative;
+    let count = |counter: &std::sync::atomic::AtomicU64| counter.load(Ordering::Relaxed);
+    assert_eq!(count(&speculative.rounds), 2);
+    assert_eq!(count(&speculative.proposed), 8);
+    assert_eq!(count(&speculative.accepted), 4);
+    assert_eq!(count(&speculative.skipped), 0);
+
+    let mut engine = RecordingEngine::new(1);
+    engine.speculation = Some(RowSpeculation::NotSpeculated(NotSpeculated::NoProposal));
+    let (_, metrics, _) = serve(&mut engine, vec![JobSpec::new("ab", 3)]);
+    assert_eq!(count(&metrics.speculative.skipped), 2);
+    assert_eq!(count(&metrics.speculative.rounds), 0);
 }

@@ -473,7 +473,7 @@ impl RocmContext {
         })
     }
 
-    /// Shared bounded completion wait for `dispatch`, `replay_graph_batched` and `dma_copy`. Polls
+    /// Shared bounded completion wait for `dispatch`, `enqueue_graph_batched` and `dma_copy`. Polls
     /// `hsa_signal_wait_scacquire` in short chunks (not one `timeout_hint = u64::MAX` wait) so a lost
     /// completion signal surfaces as `QueueWaitTimeout` instead of an infinite host spin.
     ///
@@ -504,6 +504,24 @@ impl RocmContext {
         tag: &'static str,
         held: Held,
     ) -> Result<Held, RocmError> {
+        let held = self.wait_completion_unreleased(completion, tag, held)?;
+        // SAFETY: the packet or copy has completed, so nothing uses `completion` any more; it is
+        // destroyed once.
+        unsafe {
+            let _ = (self.hsa.funcs.hsa_signal_destroy)(completion);
+        }
+        Ok(held)
+    }
+
+    /// [`Self::wait_completion_bounded`] without releasing the signal on success, for a caller that
+    /// still reads it (a timed batch's final packet) and then destroys it. The timeout path is
+    /// identical: the signal and `held` are leaked and the context poisoned.
+    fn wait_completion_unreleased(
+        &self,
+        completion: bindings::hsa_signal_t,
+        tag: &'static str,
+        held: Held,
+    ) -> Result<Held, RocmError> {
         let completed = await_below_one(
             self.wait_timeout,
             COMPLETION_SPIN_WINDOW,
@@ -523,11 +541,6 @@ impl RocmContext {
             },
         );
         if completed {
-            // SAFETY: the packet or copy has completed, so nothing uses `completion` any more; it is
-            // destroyed once.
-            unsafe {
-                let _ = (self.hsa.funcs.hsa_signal_destroy)(completion);
-            }
             return Ok(held);
         }
         self.timeouts.abandon(Abandoned {
@@ -565,16 +578,21 @@ impl RocmContext {
     ) -> Result<(), RocmError> {
         validate_kernarg_buffer("dispatch", kernel, kernarg)?;
         poot_runtime_common::check_element_schema(kernel.args(), elements)?;
-        self.submit_and_wait(
+        self.enqueue(
             &[(kernel.clone(), kernarg.clone(), grid, block)],
             "dispatch",
         )?;
-        Ok(())
+        self.complete_pending("dispatch")
     }
 
-    /// Dispatch a batch of kernels with a single doorbell ring per chunk. All AQL packets are written to
-    /// the ring, then the doorbell rung once; the CP processes them in order (BARRIER bit set). Only the
-    /// last packet has a completion signal; earlier ones use `HSA_SIGNAL_INVALID`.
+    /// Enqueue a batch of kernels with a single doorbell ring per chunk, without waiting for it. All AQL
+    /// packets are written to the ring, then the doorbell rung once; the CP processes them in order
+    /// (BARRIER bit set). Only the last packet has a completion signal (on a context built with
+    /// [`RocmContextOptions::device_timing`] every packet has its own); otherwise earlier ones use
+    /// `HSA_SIGNAL_INVALID`. The batch is complete only after [`Self::synchronize`] (or any call that
+    /// synchronizes first, like [`Self::read_bytes`]) returns: until then the caller keeps every
+    /// buffer the packets bind alive (the kernarg buffers are held here), and enqueues of later
+    /// batches order after this one behind the barrier.
     ///
     /// Each entry is `(kernel, kernarg, grid, block)`. Every owned kernarg buffer must already hold the
     /// kernel's args and have the exact kernel-declared byte capacity. `elements[i]` is `dispatches[i]`'s
@@ -585,7 +603,7 @@ impl RocmContext {
     /// until each fits. Returns the number of physical AQL batch submissions (doorbell rings), which
     /// exceeds one when `dispatches` does not fit in a single chunk.
     #[allow(clippy::type_complexity)]
-    pub fn replay_graph_batched(
+    pub fn enqueue_graph_batched(
         &self,
         dispatches: &[(KernelHandle, RocmBuffer, (u32, u32, u32), (u32, u32, u32))],
         elements: &[&[poot_target::ElementKind]],
@@ -597,19 +615,20 @@ impl RocmContext {
         assert_eq!(
             elements.len(),
             n,
-            "replay_graph_batched: dispatches and elements must be reported pairwise (caller bug)"
+            "enqueue_graph_batched: dispatches and elements must be reported pairwise (caller bug)"
         );
         for ((kernel, kernarg, _, _), &elems) in dispatches.iter().zip(elements) {
-            validate_kernarg_buffer("replay_graph_batched", kernel, kernarg)?;
+            validate_kernarg_buffer("enqueue_graph_batched", kernel, kernarg)?;
             poot_runtime_common::check_element_schema(kernel.args(), elems)?;
         }
-        self.submit_and_wait(dispatches, "replay_graph_batched")
+        self.enqueue(dispatches, "enqueue_graph_batched")
     }
 
-    /// Publish `dispatches` through the queue's publication contract and wait on the last packet's
-    /// completion signal via `wait_completion_bounded`, so a lost signal surfaces as
-    /// `QueueWaitTimeout` instead of an infinite host spin (the card-188 batched-serve hang, likely the
-    /// card-186 gemma4-MoE hang). Returns the number of physical submissions.
+    /// Publish `dispatches` through the queue's publication contract and record the last packet's
+    /// completion signal as pending; [`Self::complete_pending`] waits on it through
+    /// `wait_completion_bounded`, so a lost signal surfaces as `QueueWaitTimeout` instead of an
+    /// infinite host spin (the card-188 batched-serve hang, likely the card-186 gemma4-MoE hang).
+    /// Returns the number of physical submissions.
     ///
     /// A poisoned context is refused before the queue is touched, and every dispatch's geometry is
     /// validated before any slot is reserved ([`DispatchGeometry::new`]). Once the publisher has
@@ -617,7 +636,7 @@ impl RocmContext {
     /// reserved but never published, so it leaks the completion signal like a timed-out completion
     /// wait and poisons the context.
     #[allow(clippy::type_complexity)]
-    fn submit_and_wait(
+    fn enqueue(
         &self,
         dispatches: &[(KernelHandle, RocmBuffer, (u32, u32, u32), (u32, u32, u32))],
         tag: &'static str,
@@ -640,16 +659,30 @@ impl RocmContext {
             .collect::<Result<Vec<_>, _>>()?;
 
         // Create a completion signal for the last packet, initialised to 1; the packet decrements it.
-        let mut completion: bindings::hsa_signal_t = bindings::hsa_signal_t { handle: 0 };
-        // SAFETY: zero consumers with a null list is allowed; `completion` is a valid out-pointer.
-        unsafe {
-            check((self.hsa.funcs.hsa_signal_create)(
-                1,
-                0,
-                std::ptr::null(),
-                &mut completion,
-            ))?;
+        // A timed context also gives every earlier packet its own, so the profiler can report each
+        // dispatch's start and end.
+        let timed_packets = if self.device_timing.is_some() {
+            validated.len() - 1
+        } else {
+            0
+        };
+        let mut dispatch_signals = Vec::with_capacity(timed_packets);
+        for _ in 0..timed_packets {
+            match self.create_signal() {
+                Ok(signal) => dispatch_signals.push(signal),
+                Err(error) => {
+                    self.destroy_unpublished(&dispatch_signals);
+                    return Err(error);
+                }
+            }
         }
+        let completion = match self.create_signal() {
+            Ok(signal) => signal,
+            Err(error) => {
+                self.destroy_unpublished(&dispatch_signals);
+                return Err(error);
+            }
+        };
 
         let q = self.queue_layout();
         let queue_size = q.size as u64;
@@ -665,6 +698,7 @@ impl RocmContext {
             writer: AqlRingWriter {
                 dispatches: &validated,
                 completion,
+                dispatch_signals: &dispatch_signals,
                 ring,
                 header,
             },
@@ -678,14 +712,183 @@ impl RocmContext {
             Err(error) => {
                 self.timeouts.abandon(Abandoned {
                     signal: completion,
-                    held: Held::default(),
+                    held: Held {
+                        dispatch_signals,
+                        ..Held::default()
+                    },
                 });
                 return Err(error);
             }
         };
 
-        self.wait_completion_bounded(completion, tag, Held::default())?;
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(PendingSubmission {
+                signal: completion,
+                held: Held {
+                    staging: None,
+                    kernargs: dispatches
+                        .iter()
+                        .map(|(_, kernarg, _, _)| kernarg.clone())
+                        .collect(),
+                    dispatch_signals,
+                },
+            });
         Ok(physical_submissions)
+    }
+
+    /// Wait for every enqueued batch (the replays since the last completion) with one bounded wait
+    /// on the newest batch's completion signal, then release them all. Every packet carries the
+    /// BARRIER bit, so the newest batch's last packet completing proves every earlier packet did,
+    /// and the earlier batches' signals need no wait of their own. `tag` names the caller in a
+    /// timeout.
+    ///
+    /// On a timeout every pending batch moves to the leak list with the poison, like a lone timed-out
+    /// batch ([`Self::wait_completion_bounded`]).
+    pub(crate) fn complete_pending(&self, tag: &'static str) -> Result<(), RocmError> {
+        let mut batches = std::mem::take(
+            &mut *self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let Some(newest) = batches.pop() else {
+            return Ok(());
+        };
+        self.batch_waits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let newest_signal = newest.signal;
+        match self.wait_completion_unreleased(newest_signal, tag, newest.held) {
+            Ok(newest_held) => {
+                // The newest batch completed behind a barrier, so every earlier packet completed and
+                // nothing uses any of these signals once their times are read.
+                let mut result = Ok(());
+                for (signal, held) in batches
+                    .into_iter()
+                    .map(|batch| (batch.signal, batch.held))
+                    .chain([(newest_signal, newest_held)])
+                {
+                    let released = self.release_completed_batch(signal, &held);
+                    result = result.and(released);
+                }
+                result
+            }
+            Err(error) => {
+                for earlier in batches {
+                    self.timeouts.abandon(Abandoned {
+                        signal: earlier.signal,
+                        held: earlier.held,
+                    });
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn create_signal(&self) -> Result<bindings::hsa_signal_t, RocmError> {
+        let mut signal = bindings::hsa_signal_t { handle: 0 };
+        // SAFETY: zero consumers with a null list is allowed; `signal` is a valid out-pointer.
+        unsafe {
+            check((self.hsa.funcs.hsa_signal_create)(
+                1,
+                0,
+                std::ptr::null(),
+                &mut signal,
+            ))?;
+        }
+        Ok(signal)
+    }
+
+    /// Destroy signals no packet was ever published with.
+    fn destroy_unpublished(&self, signals: &[bindings::hsa_signal_t]) {
+        for &signal in signals {
+            // SAFETY: no published packet references `signal`; destroyed once.
+            unsafe {
+                let _ = (self.hsa.funcs.hsa_signal_destroy)(signal);
+            }
+        }
+    }
+
+    /// Release a completed batch's signals: on a timed context first record each packet's device span
+    /// (in packet order), then destroy every signal even if a read failed, returning the first failure.
+    fn release_completed_batch(
+        &self,
+        final_signal: bindings::hsa_signal_t,
+        held: &Held,
+    ) -> Result<(), RocmError> {
+        let mut result = Ok(());
+        for &signal in held.dispatch_signals.iter().chain([&final_signal]) {
+            if let Some(timing) = &self.device_timing {
+                match self.read_dispatch_span(timing, signal) {
+                    Ok(span) => timing
+                        .spans
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(span),
+                    Err(error) => result = result.and(Err(error)),
+                }
+            }
+            // SAFETY: the packet carrying `signal` has completed, so nothing uses it; destroyed once.
+            unsafe {
+                let _ = (self.hsa.funcs.hsa_signal_destroy)(signal);
+            }
+        }
+        result
+    }
+
+    fn read_dispatch_span(
+        &self,
+        timing: &DeviceTiming,
+        signal: bindings::hsa_signal_t,
+    ) -> Result<DispatchSpan, RocmError> {
+        let mut time = bindings::hsa_amd_profiling_dispatch_time_t::default();
+        // SAFETY: `signal` completed a packet dispatched on the profiled queue and is still live;
+        // `time` is a valid out-pointer.
+        unsafe {
+            check((self.hsa.funcs.hsa_amd_profiling_get_dispatch_time)(
+                self.gpu_agent,
+                signal,
+                &mut time,
+            ))?;
+        }
+        Ok(DispatchSpan {
+            start: ticks_to_duration(time.start, timing.ticks_per_second),
+            end: ticks_to_duration(time.end, timing.ticks_per_second),
+        })
+    }
+
+    /// The device spans of every dispatch completed since the last [`Self::clear_dispatch_spans`], in
+    /// submission order. Empty on an untimed context. A batch's spans are recorded when
+    /// [`Self::synchronize`] completes it, so read them after that.
+    pub fn dispatch_spans(&self) -> Vec<DispatchSpan> {
+        self.device_timing.as_ref().map_or_else(Vec::new, |timing| {
+            timing
+                .spans
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        })
+    }
+
+    /// Forget the recorded dispatch spans (a new step starts).
+    pub fn clear_dispatch_spans(&self) {
+        if let Some(timing) = &self.device_timing {
+            timing
+                .spans
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
+    }
+
+    /// The count of times the host has waited on the completion signal of enqueued kernel batches:
+    /// one per [`Self::synchronize`] (or [`Self::dispatch`]) that had work to complete. Counted at
+    /// the signal wait, so an enqueue that blocked on its own batch would show here whatever the
+    /// caller does. The handle outlives the context's owner, so a test can read it while an engine
+    /// owns the device. DMA transfers' own waits are not batches and are not counted.
+    pub fn batch_waits(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.batch_waits)
     }
 
     pub fn queue_role(&self) -> QueueRole {
@@ -713,7 +916,7 @@ impl RocmContext {
 /// them from a genuinely loaded [`HsacoModule`], so safe code cannot forge a `kernel_object` that points
 /// an AQL packet at an arbitrary address. It also carries the argument schema `load_hsaco` copied from the
 /// `CompiledKernel` it loaded (card 608), so `RocmContext::dispatch`/
-/// `replay_graph_batched` can check a dispatch's bound buffers before submission even though a ROCm
+/// `enqueue_graph_batched` can check a dispatch's bound buffers before submission even though a ROCm
 /// kernarg is one opaque byte blob by then.
 ///
 /// ```compile_fail,E0451

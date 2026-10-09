@@ -761,10 +761,6 @@ mod require_backend_tests {
             .is_err()
         };
         assert!(fails_open(DeviceBackend::Wgpu.variable()));
-        assert!(
-            !fails_open("POOT_REQUIRE_GPU"),
-            "the retired all-backend switch must not require Wgpu"
-        );
         for other in DeviceBackend::ALL
             .into_iter()
             .filter(|other| *other != DeviceBackend::Wgpu)
@@ -935,7 +931,7 @@ fn bf16_round_trips_through_the_storage_typed_primitives_with_exactly_elems_time
     assert_eq!(bytes.len(), elems * 2, "fixture bytes must be elems * 2");
 
     let buf = ctx.alloc_storage(BufferRole::Activation, BufferStorage::bf16(), elems);
-    ctx.write_bytes(&buf, &bytes).expect("write_bytes");
+    ctx.write_bytes(&buf, 0, &bytes).expect("write_bytes");
 
     let mut got = vec![0u8; elems * 2];
     ctx.read_bytes(&buf, &mut got).expect("read_bytes");
@@ -1326,4 +1322,51 @@ mod device_timing_tests {
             "the early-drained first dispatch and the final-drained second must both be present"
         );
     }
+}
+
+/// POOT-1074: a write at a non-zero byte offset lands there and leaves its neighbours intact; an offset
+/// outside the buffer, an overflowing one and a misaligned one are typed refusals that write nothing.
+/// Mutation: ignore `offset` in `Context::write_bytes` (pass 0 to `queue.write_buffer`); the neighbour
+/// check goes red.
+#[test]
+fn a_write_at_an_offset_leaves_its_neighbours_intact_and_bad_ranges_are_typed() {
+    use crate::{BufferStorage, Context, RuntimeError};
+    use poot_runtime_common::{BufferRole, DeviceBackend};
+    use poot_test_util::device_skip::open_or_skip;
+
+    let Some(ctx) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+        return;
+    };
+    let words =
+        |values: &[f32]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let buf = ctx.alloc_storage(BufferRole::State, BufferStorage::f32(), 4);
+    ctx.write_bytes(&buf, 0, &words(&[1.0, 2.0, 3.0, 4.0]))
+        .unwrap();
+    ctx.write_bytes(&buf, 4, &words(&[9.0, 9.0])).unwrap();
+    let mut got = vec![0u8; 16];
+    ctx.read_bytes(&buf, &mut got).unwrap();
+    assert_eq!(got, words(&[1.0, 9.0, 9.0, 4.0]), "only bytes 4..12 change");
+    for (offset, len) in [(16, 4), (12, 8), (usize::MAX, 4)] {
+        let error = ctx.write_bytes(&buf, offset, &vec![0u8; len]).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                RuntimeError::RangeOutOfBounds { .. } | RuntimeError::RangeOverflow { .. }
+            ),
+            "offset {offset} len {len}: {error:?}"
+        );
+    }
+    for (offset, len) in [(2, 4), (4, 2)] {
+        let error = ctx.write_bytes(&buf, offset, &vec![0u8; len]).unwrap_err();
+        assert!(
+            matches!(error, RuntimeError::Misaligned { .. }),
+            "offset {offset} len {len}: {error:?}"
+        );
+    }
+    ctx.read_bytes(&buf, &mut got).unwrap();
+    assert_eq!(
+        got,
+        words(&[1.0, 9.0, 9.0, 4.0]),
+        "refused writes change nothing"
+    );
 }

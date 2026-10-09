@@ -843,9 +843,8 @@ fn synthesized_production_kernels_random_shapes_match_cpu() {
 fn flash_decode_batched_gpu_matches_cpu() {
     // Batched flash decode (q [B,Hq,1,D], k/v [B,Hkv,cap,D], mask [B,1,1,cap]; the planner's region decode, one
     // workgroup per (batch,head)) on the wgpu executor == CPU eval (== attention_masked per batch row). Random
-    // shapes, compiled from the traced decomposition. NVPTX parity was ptx-graph-check
-    // --decode-batched-flash-check, retired with the rest of that CLI's device modes (card 549) - no numeric
-    // NVPTX flash receipt replaces it.
+    // shapes, compiled from the traced decomposition. No numeric NVPTX flash receipt exists
+    // (the old `--decode-batched-flash-check` CLI mode was retired with the rest of that CLI, card 549).
     use poot_graph_ir::builder::Builder;
     let _gpu_guard = gpu_lock();
     let Some((mut gpu, target)) = open_engine_or_skip() else {

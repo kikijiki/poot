@@ -142,7 +142,7 @@ pub use graph_validation::*;
 pub(crate) use kernel_mapping::*;
 pub use passes::{
     BoundaryDescriptor, ExpertStackRefusal, PackedBindError, PackedConst, PackedLayout,
-    WeightFormats, WeightFormatsError, bind_packed_weights,
+    StageSplitError, WeightFormats, WeightFormatsError, bind_packed_weights,
 };
 // `poot-llm`'s CPU oracle (`core/cpu_oracle.rs`) claims a traced graph's packed contractions/row
 // gathers the same way `compile` does, so its eval matches what the device plans - a real production
@@ -156,6 +156,7 @@ pub use passes::{recognize_packed_contractions, recognize_packed_row_gathers};
 // drive an individual pass directly - this crate's own `tests/*.rs` and every crate that already
 // enables `poot-test-util/graph-fixtures` (which carries `poot-graph-plan/test-support` back here) see
 // these; a default build does not.
+pub(crate) use passes::{CutSite, StageAssignment, split_stages};
 #[cfg(any(test, feature = "test-support"))]
 pub use passes::{
     FUSABLE_FLOAT_UNARY_OPS, LegalizeError, PackedDequantErrorContext,
@@ -165,8 +166,6 @@ pub use passes::{
     fuse_widening_casts, legalize, passes_without_target, reject_packed_dequant_escapes,
     rope_fusion,
 };
-#[cfg(test)]
-pub(crate) use passes::{StageAssignment, split_stages, split_stages_after_layers};
 pub use planner::*;
 pub use refusal::*;
 pub use storage_analysis::*;

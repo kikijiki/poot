@@ -132,7 +132,7 @@ fn split_consts_and_slots_v(
     (builder.build(), slots)
 }
 
-/// The executor-contract replacement for `GpuExecutor::run`/`run_resident`/`run_resident_kv` on a
+/// The executor-contract replacement for the deleted `GpuExecutor::run`/`run_resident`/`run_resident_kv` on a
 /// one-shot graph (`Value`-typed bind): `add_entry`/`step` through `Engine<WgpuDevice>`, torn back
 /// down afterward. A graph with state zero-seeds it automatically on first use (Card 546a).
 fn run_once_contract_v(
@@ -412,7 +412,7 @@ fn flash_attention_pass_prefill_gpu_matches_cpu() {
 }
 
 #[test]
-fn run_prefill_runs_a_flash_fused_compiled_graph_and_matches_cpu() {
+fn prefill_runs_a_flash_fused_compiled_graph_and_matches_cpu() {
     // card 183/535b: the caller `compile`s the graph with full fusion (flash-attention included) before
     // running it. Uses a 64-token prefill (large enough that N^2 attention is not degenerate) and
     // checks GPU logits against a zero-seeded-state CPU reference on the unoptimized graph.
@@ -435,7 +435,7 @@ fn run_prefill_runs_a_flash_fused_compiled_graph_and_matches_cpu() {
     assert_eq!(got.len(), cpu.as_f32().unwrap().len());
     assert_close_rel(&got, cpu.as_f32().unwrap(), 5e-3);
     eprintln!(
-        "run_prefill flash-fused GPU vs CPU: max abs diff = {:.2e}",
+        "prefill flash-fused GPU vs CPU: max abs diff = {:.2e}",
         max_abs_error(&got, cpu.as_f32().unwrap())
     );
 }
@@ -671,13 +671,13 @@ fn fused_decode_matches_unfused_on_gpu() {
 // `ExecutorStats`. This is the "decode-cache warmth" case the contract excludes.
 
 // `kernel_disk_cache_persists_across_executors` deleted (Card 546b): it tested
-// `GpuExecutor::kernel_compiles()`, a counter with no equivalent on the `Executor` trait or
+// the deleted `GpuExecutor::kernel_compiles()`, a counter with no equivalent on the `Executor` trait or
 // `ExecutorStats` (verified: `poot-executor`'s `kernel_cache` field is private, with no compile-count
 // accessor). The underlying on-disk `poot_codegen::KernelCache` sharing this test exercised is the
 // SAME cache `Engine` uses (`Engine::with_timing`'s `kernel_cache: poot_codegen::KernelCache::open(..)`)
 // and is independently tested at the `poot_codegen::cache` level (persistence-across-instances,
-// epoch invalidation), so the underlying claim is not left untested - only the GpuExecutor-specific
-// observability is gone.
+// epoch invalidation), so the underlying claim is not left untested - only the observability of the deleted
+// `GpuExecutor` is gone.
 
 /// Paged decode graph (spec 045) runs on the wgpu executor and matches the CPU reference with a non-identity
 /// (reverse) slot map. The K/V gather is composed from on-device primitives (transpose + axis-0 gather +

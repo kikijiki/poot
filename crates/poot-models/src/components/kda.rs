@@ -24,8 +24,9 @@
 //! component. The decay differs per key channel, so the closed-form chunked solution of
 //! [`super::gdn`] does not apply as it stands.
 
-use poot_graph_ir::{BinOp, Builder, RedOp, Scalar, StateRole, TensorType, Traced, UnOp, ops};
+use poot_graph_ir::{BinOp, Builder, RedOp, Scalar, Traced, UnOp, ops};
 use poot_quant::weights::{KdaRole, WeightId, WeightMap, WeightRole};
+use poot_tensor::DType;
 
 use super::conv::{ConvParams, ConvWeights, causal_conv};
 use super::linear::{Weight, WeightError, linear};
@@ -198,12 +199,8 @@ pub fn kda(
     ); // [rows, heads, tokens, d]
     let beta = heads_first(b, ops::sigmoid(b, linear(b, x, &w.beta, None)), h, 1);
 
-    let state = b.state_input(
-        &format!("kda.l{layer}.state"),
-        TensorType::f32(vec![rows, h, d, d]),
-        StateRole::Recurrent,
-    );
-    let (mut s, mut outs) = (state, Vec::with_capacity(tokens));
+    let state = step.recurrent_state(b, &format!("kda.l{layer}.state"), DType::F32, &[h, d, d]);
+    let (mut s, mut outs) = (state.current(), Vec::with_capacity(tokens));
     for t in 0..tokens {
         let at = |y: Traced| b.slice(y, 2, t, t + 1); // [rows, heads, 1, ..]
         let (q, k, v) = (at(q), at(k), at(v));
@@ -219,7 +216,7 @@ pub fn kda(
         );
         outs.push(b.matmul(q, s));
     }
-    step.carry(state, s);
+    step.carry_recurrent(b, state, s);
     let o = if tokens == 1 {
         outs[0]
     } else {
@@ -241,6 +238,7 @@ mod tests {
     use crate::components::standard::oracle::{self, Fx};
     use crate::components::testing::{CAP, step_shape};
     use crate::model::LogitRows;
+    use poot_graph_ir::TensorType;
 
     const WIDTH: usize = 6;
     const HEADS: usize = 2;

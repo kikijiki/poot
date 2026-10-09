@@ -130,7 +130,9 @@ what the driver may retain.
   is that surface driven for one row with a sink for the tokens, and holds no feed, pick or layout logic of
   its own. `encode` runs an `Encode` step, and `generate_with_embeds` scatters caller-computed rows into a
   prompt (the vision-language path). Rows, frames and embeddings are bound by value every step, never baked
-  into a program.
+  into a program. Prompts with embedding rows (`open_with_embeds`) batch and page like any other sequence, but
+  they bypass the prefix cache, which keys on tokens alone: they reuse no cached block and register none. They
+  are refused under an adapter or a draft-model speculation policy.
 
 The CPU oracle is a test-side reference: tests evaluate a model's traced graph with `poot-eval` directly. It
 is not an executor the driver can choose.

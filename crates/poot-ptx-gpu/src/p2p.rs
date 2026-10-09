@@ -129,15 +129,6 @@ enum CapturablePeerAccess {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PeerInitializationOperation {
-    QueryCapability,
-    /// Deliberately unused by correct initialization; retained so the forbidden constructor mutation is
-    /// executable and observable in the host seam.
-    #[allow(dead_code)]
-    EnablePeerAccess,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CapturedDtoDCopy {
     current_context: sys::CUcontext,
     stream: sys::CUstream,
@@ -556,24 +547,12 @@ impl PtxP2PTransport {
 
         // The eager table is only a hardware fact. Capture-only peer mappings remain unavailable until
         // the executor supplies its already-admitted directed routes.
-        let peerable =
-            discover_peer_capabilities_with(world_size, |operation, i, j| match operation {
-                PeerInitializationOperation::QueryCapability => {
-                    let mut can: i32 = 0;
-                    unsafe {
-                        sys::cuDeviceCanAccessPeer(&mut can, ranks[i].device, ranks[j].device)
-                    }
-                    .result()?;
-                    Ok(can != 0)
-                }
-                PeerInitializationOperation::EnablePeerAccess => {
-                    let _guard = CurrentRankContext::activate(ranks[i].ctx)?;
-                    enable_peer_access_with(true, i, j, || unsafe {
-                        sys::cuCtxEnablePeerAccess(ranks[j].ctx, 0)
-                    })?;
-                    Ok(true)
-                }
-            })?;
+        let peerable = discover_peer_capabilities_with(world_size, |i, j| {
+            let mut can: i32 = 0;
+            unsafe { sys::cuDeviceCanAccessPeer(&mut can, ranks[i].device, ranks[j].device) }
+                .result()?;
+            Ok(can != 0)
+        })?;
         let capturable_peer_access =
             vec![vec![CapturablePeerAccess::Unavailable; world_size]; world_size];
 
@@ -1689,22 +1668,20 @@ fn require_capturable_peer(
     Ok(())
 }
 
-fn discover_peer_capabilities_with<Operation>(
+/// The eager peer table is a hardware fact: `can_access(src, dst)` is a capability query only, so the
+/// seam cannot enable peer access during discovery.
+fn discover_peer_capabilities_with<CanAccess>(
     world_size: usize,
-    mut operation: Operation,
+    mut can_access: CanAccess,
 ) -> Result<Vec<Vec<bool>>, P2pError>
 where
-    Operation: FnMut(PeerInitializationOperation, usize, usize) -> Result<bool, P2pError>,
+    CanAccess: FnMut(usize, usize) -> Result<bool, P2pError>,
 {
     let mut peerable = vec![vec![false; world_size]; world_size];
     for (src_rank, row) in peerable.iter_mut().enumerate() {
         for (dst_rank, cell) in row.iter_mut().enumerate() {
             if src_rank != dst_rank {
-                *cell = operation(
-                    PeerInitializationOperation::QueryCapability,
-                    src_rank,
-                    dst_rank,
-                )?;
+                *cell = can_access(src_rank, dst_rank)?;
             }
         }
     }
@@ -2332,10 +2309,8 @@ mod tests {
     #[test]
     fn eager_constructor_discovery_queries_capabilities_without_peer_enablement() {
         let operations = RefCell::new(Vec::new());
-        let peerable = discover_peer_capabilities_with(3, |operation, src_rank, dst_rank| {
-            operations
-                .borrow_mut()
-                .push((operation, src_rank, dst_rank));
+        let peerable = discover_peer_capabilities_with(3, |src_rank, dst_rank| {
+            operations.borrow_mut().push((src_rank, dst_rank));
             Ok(src_rank < dst_rank)
         })
         .unwrap();
@@ -2350,14 +2325,7 @@ mod tests {
         );
         assert_eq!(
             operations.into_inner(),
-            vec![
-                (PeerInitializationOperation::QueryCapability, 0, 1),
-                (PeerInitializationOperation::QueryCapability, 0, 2),
-                (PeerInitializationOperation::QueryCapability, 1, 0),
-                (PeerInitializationOperation::QueryCapability, 1, 2),
-                (PeerInitializationOperation::QueryCapability, 2, 0),
-                (PeerInitializationOperation::QueryCapability, 2, 1),
-            ]
+            vec![(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1),]
         );
     }
 

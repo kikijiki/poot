@@ -89,6 +89,7 @@ pub(crate) fn append_head(
         eqns: g.eqns,
         output: g.output,
         validations: NoValidations,
+        exports: g.exports,
         state: g.state,
     };
     let appended = with_head(plain, head);

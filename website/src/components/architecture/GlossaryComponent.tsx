@@ -55,7 +55,7 @@ const ENTRIES: Entry[] = [
   },
   {
     term: "Continuous batching",
-    def: "A serving strategy where in-flight requests are combined into one batch per token rather than at request boundaries. When a request finishes, its batch slot is freed immediately. New requests claim free slots. Not served: not available yet (poot is being refactored; planned to return).",
+    def: "A serving strategy where in-flight requests are combined into one batch per token rather than at request boundaries. When a request finishes, its batch slot is freed immediately. New requests claim free slots. `poot-serve --draft-lookup NGRAM:K` and `--draft-model PATH:K` serve it through the one scheduling loop.",
     see: "serving-design",
   },
   {
@@ -105,7 +105,7 @@ const ENTRIES: Entry[] = [
   },
   {
     term: "GBNF",
-    def: "GGML/llama.cpp Backus-Naur Form: a grammar syntax used to constrain model output. The HTTP schema retains guided_grammar, but generation serving is not available yet (poot is being refactored; planned to return).",
+    def: "GGML/llama.cpp Backus-Naur Form: a grammar syntax used to constrain model output. poot-serve accepts a grammar in the guided_grammar request field and masks disallowed tokens with it.",
     see: "serving-design",
   },
   {
@@ -158,7 +158,7 @@ const ENTRIES: Entry[] = [
   },
   {
     term: "LoRA",
-    def: "Low-Rank Adaptation (Hu et al., 2021): fine-tune small rank adapters instead of full weights. The driver keeps adapter sets for library use; poot-serve has no adapter registration yet (its administration routes answer 503) and returns it when the new scheduling loop lands.",
+    def: "Low-Rank Adaptation (Hu et al., 2021): fine-tune small rank adapters instead of full weights. The driver keeps adapter sets; poot-serve loads, selects and unloads them through its LoRA administration routes.",
     see: "serving-design",
   },
   {
@@ -168,7 +168,7 @@ const ENTRIES: Entry[] = [
   },
   {
     term: "Megatron",
-    def: "Megatron-LM style tensor parallelism: shard attention/MLP weights across GPUs with collectives. Tensor parallelism is not available yet (poot is being refactored; planned to return).",
+    def: "Megatron-LM style tensor parallelism: shard attention/MLP weights across GPUs with collectives. poot-serve does not implement tensor parallelism.",
     see: "backends",
   },
   {
@@ -233,7 +233,7 @@ const ENTRIES: Entry[] = [
   },
   {
     term: "Prefix cache",
-    def: "A serving optimization where KV blocks from a previous request are reused for a new request that starts with the same prefix tokens. Reduces prefill cost for common system prompts. Not served: not available yet (poot is being refactored; planned to return).",
+    def: "A serving optimization where KV blocks from a previous request are reused for a new request that starts with the same prefix tokens. Reduces prefill cost for common system prompts. `poot-serve --draft-lookup NGRAM:K` and `--draft-model PATH:K` serve it through the one scheduling loop.",
     see: "attention",
   },
   {
@@ -262,7 +262,7 @@ const ENTRIES: Entry[] = [
   },
   {
     term: "Speculative decoding",
-    def: "A latency optimization where a cheap draft model generates N token proposals, and the full target model verifies all N in one forward pass. Accepted tokens advance the sequence by up to N+1 positions. Not served: not available yet (poot is being refactored; planned to return).",
+    def: "A latency optimization where a cheap draft model generates N token proposals, and the full target model verifies all N in one forward pass. Accepted tokens advance the sequence by up to N+1 positions. `poot-serve --draft-lookup NGRAM:K` and `--draft-model PATH:K` serve it through the one scheduling loop.",
     see: "serving-design",
   },
   {

@@ -6,9 +6,14 @@ sidebar_position: 10
 
 # Speculative decoding
 
-:::caution[Not served yet]
-The library supports speculative decoding. `poot-serve` does not use it yet: `/v1/completions` and `/v1/chat/completions` return `503` naming the missing engine, and the `POOT_SPEC_*` settings are not read.
-:::
+## Serving it
+
+`poot-serve` takes the policy on the command line and hands it to the driver; the one scheduling loop does not change.
+
+- `--draft-lookup NGRAM:K` serves prompt lookup: the last `NGRAM` tokens of a sequence are matched against its earlier text and up to `K` following tokens are proposed.
+- `--draft-model PATH:K` serves a draft model loaded from `PATH`, `K` tokens a round. A path that does not load, or a draft the driver refuses (see below), fails startup before the listener binds.
+
+The two flags exclude each other. Without either, a decode row is one token. A request's tokens are those it would have without the policy; the policy changes only how many steps they take. `/metrics` reports what the driver counted for every decode row, as the driver reported it: `speculative_rounds`, `speculative_proposed_tokens`, `speculative_accepted_tokens` (drafts kept, not tokens returned: a round returns its accepted drafts and one more) and `speculative_skipped_rows`, also exported as `poot_speculative_*_total` counters.
 
 Speculative decoding is a policy of the `poot-llm` driver, not a decoding loop of its own and not a list of models. A driver is built with a `DraftPolicy` in `DriverOptions::draft`, and a decode row of `Driver::step` then returns one to `k + 1` tokens instead of one.
 
@@ -47,5 +52,7 @@ The `speculation_bench` example of `poot-llm` runs one policy on one checkpoint 
 
 - `RecurrentState`: the model carries recurrent state (Qwen3-Next, Nemotron-H, Mamba2). A rejected draft token has already been folded into that state and `commit` cannot undo it, so these models do not speculate. The check reads the state roles of the compiled program, never a model name.
 - `DraftMismatch`: the draft model's vocabulary is larger than the target's, its tokenizer gives a token another id, or it holds fewer positions than the driver's capacity.
+
+`poot-serve` reports the same refusals at startup, before the listener binds: a `--draft-model` that does not load or does not fit, or a draft flag on a model with recurrent state, stops the server with the driver's typed error. A request whose sampler the verify window cannot check (a penalty, `logit_bias`, logprobs or a constraint) decodes one token a step and is counted in `speculative_skipped_rows`.
 
 Design notes on the method live under [Architecture: Serving design](../architecture/serving-design.mdx).

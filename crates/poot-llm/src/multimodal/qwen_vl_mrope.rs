@@ -1,12 +1,10 @@
-//! Filesystem metadata adapter for Qwen-VL mRoPE model-input assembly.
+//! Filesystem metadata and tokenizer adapter for Qwen-VL mRoPE model-input assembly.
 //!
-//! Reads on-disk metadata and feeds it to the pure mRoPE source boundaries. It does not tokenize raw
-//! text, render chat templates, construct grids, or run vision.
+//! Reads on-disk metadata, tokenizes the rendered prompt and feeds both to the pure mRoPE source
+//! boundaries. It does not render chat templates, construct grids, or run vision.
 //!
-//! Held for POOT-650 (Qwen2.5-VL on the driver): the `pub(crate)` entry points below assemble the
-//! mRoPE positions and the visual-embedding placement that card feeds to the driver's steps, and none has
-//! a production caller yet. Where rustc reports one as dead it carries
-//! `#[expect(dead_code, reason = "held for POOT-650")]`.
+//! [`Qwen25Vl`](super::qwen_vl::Qwen25Vl) feeds the positions and the visual placeholders this assembles to the
+//! driver's steps.
 
 use poot_tensor::DType;
 use std::path::{Path, PathBuf};
@@ -17,12 +15,10 @@ use poot_load::qwen_vl::{
 };
 use poot_models::mrope::{
     MropeConfigMetadata, MropeConfigMetadataError, MropeGrid, MropePositionAssemblyError,
-    MropePositionIds, MropePositionSourceAssemblyError, MropeProcessorFpsInput,
-    MropeProcessorSpecialToken, MropeSpanError, MropeSpecialTokenIds, MropeSpecialTokenKind,
-    MropeSpecialTokenReconcileError, MropeTemporalPatchSize, MropeTokenizerSpecialToken,
-    Qwen25VlMropePositionInput, Qwen25VlMropePositionSourceInput,
-    assemble_qwen2_5_vl_mrope_positions, assemble_qwen2_5_vl_mrope_positions_from_sources,
-    discover_mrope_segments, reconcile_mrope_special_token_ids,
+    MropePositionIds, MropeProcessorFpsInput, MropeProcessorSpecialToken, MropeSpecialTokenIds,
+    MropeSpecialTokenKind, MropeSpecialTokenReconcileError, MropeTemporalPatchSize,
+    MropeTokenizerSpecialToken, Qwen25VlMropePositionInput, assemble_qwen2_5_vl_mrope_positions,
+    reconcile_mrope_special_token_ids,
 };
 use poot_tensor::HostTensor;
 use tokenizers::Tokenizer;
@@ -115,36 +111,6 @@ pub enum QwenVlMropeMetadataLoadError {
     Tokenizer { path: PathBuf, message: String },
     #[error(transparent)]
     SpecialTokens(#[from] MropeSpecialTokenReconcileError),
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Qwen25VlMropeFilesystemPositionInput<'a> {
-    pub model_dir: &'a Path,
-    pub tokens: &'a [u32],
-    pub image_grids: &'a [MropeGrid],
-    pub video_grids: &'a [MropeGrid],
-    pub spatial_merge_size: usize,
-    pub temporal_patch_size: MropeTemporalPatchSize,
-    pub fps: Option<MropeProcessorFpsInput<'a>>,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum Qwen25VlMropeFilesystemPositionError {
-    #[error(transparent)]
-    Metadata(#[from] QwenVlMropeMetadataLoadError),
-    #[error(transparent)]
-    Assembly(#[from] MropePositionSourceAssemblyError),
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Qwen25VlMropeModelInputRequest<'dir, 'data> {
-    pub model_dir: &'dir Path,
-    pub prompt_token_ids: &'data [u32],
-    pub image_grids: &'data [MropeGrid],
-    pub video_grids: &'data [MropeGrid],
-    pub spatial_merge_size: usize,
-    pub temporal_patch_size: MropeTemporalPatchSize,
-    pub fps: Option<MropeProcessorFpsInput<'data>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -356,25 +322,6 @@ pub enum Qwen25VlProcessorMediaMropeModelInputError {
     Media(#[from] Qwen25VlProcessorMediaError),
 }
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum Qwen25VlVisualSpliceMapError {
-    #[error("Qwen2.5-VL visual splice map does not support model type {model_type:?}")]
-    UnsupportedModelType { model_type: QwenVlModelType },
-    #[error(
-        "Qwen2.5-VL model-input positions have length {positions_len}, prompt has {prompt_len}"
-    )]
-    PositionLengthMismatch {
-        prompt_len: usize,
-        positions_len: usize,
-    },
-    #[error(transparent)]
-    Span(#[from] MropeSpanError),
-    #[error(
-        "Qwen2.5-VL visual splice map expected {expected} visual embedding rows from placeholders, got {actual}"
-    )]
-    VisualRowCountMismatch { expected: usize, actual: usize },
-}
-
 pub fn load_qwen_vl_mrope_source_metadata(
     dir: impl AsRef<Path>,
 ) -> Result<QwenVlMropeSourceMetadata, QwenVlMropeMetadataLoadError> {
@@ -431,13 +378,6 @@ fn load_qwen_vl_mrope_source_metadata_and_tokenizer(
     ))
 }
 
-pub(crate) fn load_qwen_vl_mrope_metadata(
-    dir: impl AsRef<Path>,
-) -> Result<QwenVlMropeMetadata, QwenVlMropeMetadataLoadError> {
-    let sources = load_qwen_vl_mrope_source_metadata(dir)?;
-    reconcile_qwen_vl_mrope_source_metadata(sources)
-}
-
 fn reconcile_qwen_vl_mrope_source_metadata(
     sources: QwenVlMropeSourceMetadata,
 ) -> Result<QwenVlMropeMetadata, QwenVlMropeMetadataLoadError> {
@@ -480,52 +420,6 @@ pub(crate) fn load_qwen_vl_mrope_metadata_snapshot(
     })
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "held for POOT-650"))]
-pub(crate) fn assemble_qwen2_5_vl_mrope_positions_from_files(
-    input: Qwen25VlMropeFilesystemPositionInput<'_>,
-) -> Result<MropePositionIds, Qwen25VlMropeFilesystemPositionError> {
-    let sources = load_qwen_vl_mrope_source_metadata(input.model_dir)?;
-    let processor_tokens = sources.processor_special_tokens();
-    let tokenizer_tokens = sources.tokenizer_special_tokens();
-    Ok(assemble_qwen2_5_vl_mrope_positions_from_sources(
-        Qwen25VlMropePositionSourceInput {
-            tokens: input.tokens,
-            processor_special_tokens: &processor_tokens,
-            tokenizer_special_tokens: &tokenizer_tokens,
-            image_grids: input.image_grids,
-            video_grids: input.video_grids,
-            spatial_merge_size: input.spatial_merge_size,
-            temporal_patch_size: input.temporal_patch_size,
-            fps: input.fps,
-            config: &sources.config,
-        },
-    )?)
-}
-
-#[cfg_attr(not(test), expect(dead_code, reason = "held for POOT-650"))]
-pub(crate) fn assemble_qwen2_5_vl_mrope_model_input_from_files<'data>(
-    input: Qwen25VlMropeModelInputRequest<'_, 'data>,
-) -> Result<Qwen25VlMropeModelInput<'data>, Qwen25VlMropeModelInputError> {
-    let metadata = load_qwen_vl_mrope_metadata(input.model_dir)?;
-    let (metadata, mrope_positions) = assemble_qwen2_5_vl_mrope_model_input_parts(
-        metadata,
-        input.prompt_token_ids,
-        input.image_grids,
-        input.video_grids,
-        input.spatial_merge_size,
-        input.temporal_patch_size,
-        input.fps,
-    )?;
-    Ok(Qwen25VlMropeModelInput {
-        prompt_token_ids: input.prompt_token_ids,
-        image_grids: input.image_grids,
-        video_grids: input.video_grids,
-        spatial_merge_size: input.spatial_merge_size,
-        metadata,
-        mrope_positions,
-    })
-}
-
 fn assemble_qwen2_5_vl_mrope_model_input_parts(
     metadata: QwenVlMropeMetadata,
     prompt_token_ids: &[u32],
@@ -551,58 +445,6 @@ fn assemble_qwen2_5_vl_mrope_model_input_parts(
         config: &metadata.config,
     })?;
     Ok((metadata, mrope_positions))
-}
-
-pub(crate) fn assemble_qwen2_5_vl_mrope_model_input_from_rendered_prompt<'data>(
-    input: Qwen25VlRenderedPromptMropeModelInputRequest<'_, '_, 'data>,
-) -> Result<Qwen25VlRenderedPromptMropeModelInput<'data>, Qwen25VlRenderedPromptMropeModelInputError>
-{
-    let (hf_config, config) = load_qwen_vl_hf_and_config_metadata(input.model_dir)?;
-    let model_type = hf_config.model_type();
-    if model_type != QwenVlModelType::Qwen25Vl {
-        return Err(Qwen25VlRenderedPromptMropeModelInputError::ModelInput(
-            Qwen25VlMropeModelInputError::UnsupportedModelType { model_type },
-        ));
-    }
-    let processor_tokens =
-        QwenVlProcessorSpecialTokenStrings::load_from_dir(input.model_dir, &hf_config)
-            .map_err(QwenVlMropeMetadataLoadError::from)?;
-    let tokenizer_path = input.model_dir.join("tokenizer.json");
-    let tokenizer = load_qwen_vl_tokenizer(&tokenizer_path)?;
-    let tokenizer_ids = qwen_vl_tokenizer_ids(&tokenizer, &processor_tokens);
-    let encoded = tokenizer
-        .encode(input.rendered_prompt, false)
-        .map_err(
-            |source| Qwen25VlRenderedPromptMropeModelInputError::Tokenize {
-                path: tokenizer_path,
-                message: source.to_string(),
-            },
-        )?;
-    let prompt_token_ids = encoded.get_ids().to_vec();
-    let sources = QwenVlMropeSourceMetadata {
-        model_type,
-        config,
-        processor_tokens,
-        tokenizer_ids,
-    };
-    let metadata = reconcile_qwen_vl_mrope_source_metadata(sources)?;
-    let (metadata, mrope_positions) = assemble_qwen2_5_vl_mrope_model_input_parts(
-        metadata,
-        &prompt_token_ids,
-        input.image_grids,
-        input.video_grids,
-        input.spatial_merge_size,
-        input.temporal_patch_size,
-        input.fps,
-    )?;
-    Ok(Qwen25VlRenderedPromptMropeModelInput {
-        prompt_token_ids,
-        image_grids: input.image_grids,
-        video_grids: input.video_grids,
-        spatial_merge_size: input.spatial_merge_size,
-        metadata,
-        mrope_positions,
-    })
 }
 
 pub(crate) fn assemble_qwen2_5_vl_mrope_model_input_from_rendered_prompt_with_metadata_snapshot<
@@ -674,35 +516,6 @@ impl Qwen25VlProcessorMedia<'_> {
     }
 }
 
-/// Assemble the existing rendered-prompt mRoPE model input and retain validated processor media beside it.
-///
-/// Host handoff only: pixel columns stay opaque and no vision graph runs.
-#[cfg_attr(not(test), expect(dead_code, reason = "held for POOT-650"))]
-pub(crate) fn assemble_qwen2_5_vl_mrope_model_input_from_processor_media<'data>(
-    input: Qwen25VlProcessorMediaMropeModelInputRequest<'_, '_, 'data>,
-) -> Result<Qwen25VlProcessorMediaMropeModelInput<'data>, Qwen25VlProcessorMediaMropeModelInputError>
-{
-    let rendered = assemble_qwen2_5_vl_mrope_model_input_from_rendered_prompt(
-        Qwen25VlRenderedPromptMropeModelInputRequest {
-            model_dir: input.model_dir,
-            rendered_prompt: input.rendered_prompt,
-            image_grids: input.media.image_grids,
-            video_grids: input.media.video_grids,
-            spatial_merge_size: input.spatial_merge_size,
-            temporal_patch_size: input.temporal_patch_size,
-            fps: input.fps,
-        },
-    )?;
-    input.media.validate()?;
-    Ok(Qwen25VlProcessorMediaMropeModelInput {
-        prompt_token_ids: rendered.prompt_token_ids,
-        media: input.media,
-        spatial_merge_size: rendered.spatial_merge_size,
-        metadata: rendered.metadata,
-        mrope_positions: rendered.mrope_positions,
-    })
-}
-
 pub(crate) fn assemble_qwen2_5_vl_mrope_model_input_from_processor_media_with_metadata_snapshot<
     'data,
 >(
@@ -731,6 +544,33 @@ pub(crate) fn assemble_qwen2_5_vl_mrope_model_input_from_processor_media_with_me
         metadata: rendered.metadata,
         mrope_positions: rendered.mrope_positions,
     })
+}
+
+/// The rendered-prompt model input of `input` over a snapshot of its model directory loaded here:
+/// what a request does in two steps (the raw-request assembler holds the snapshot across media
+/// processing), as one call for tests.
+#[cfg(test)]
+pub(crate) fn assemble_qwen2_5_vl_mrope_model_input_from_rendered_prompt<'data>(
+    input: Qwen25VlRenderedPromptMropeModelInputRequest<'_, '_, 'data>,
+) -> Result<Qwen25VlRenderedPromptMropeModelInput<'data>, Qwen25VlRenderedPromptMropeModelInputError>
+{
+    let snapshot = load_qwen_vl_mrope_metadata_snapshot(input.model_dir)?;
+    assemble_qwen2_5_vl_mrope_model_input_from_rendered_prompt_with_metadata_snapshot(
+        input, snapshot,
+    )
+}
+
+/// [`assemble_qwen2_5_vl_mrope_model_input_from_rendered_prompt`] for processor media.
+#[cfg(test)]
+pub(crate) fn assemble_qwen2_5_vl_mrope_model_input_from_processor_media<'data>(
+    input: Qwen25VlProcessorMediaMropeModelInputRequest<'_, '_, 'data>,
+) -> Result<Qwen25VlProcessorMediaMropeModelInput<'data>, Qwen25VlProcessorMediaMropeModelInputError>
+{
+    let snapshot = load_qwen_vl_mrope_metadata_snapshot(input.model_dir)
+        .map_err(Qwen25VlRenderedPromptMropeModelInputError::from)?;
+    assemble_qwen2_5_vl_mrope_model_input_from_processor_media_with_metadata_snapshot(
+        input, snapshot,
+    )
 }
 
 fn validate_qwen25_processor_pixels(
@@ -780,53 +620,6 @@ fn validate_qwen25_processor_pixels(
         });
     }
     Ok(())
-}
-
-/// Build the placement map of the visual rows for an already-validated Qwen2.5-VL model input: for each
-/// prompt position, the index of the visual row that replaces its token's embedding, or `-1`.
-///
-/// Re-runs the marker-span validator, then assigns visual rows only to image/video placeholder
-/// tokens. The vision-start delimiter and ordinary text keep `-1`.
-#[cfg_attr(not(test), expect(dead_code, reason = "held for POOT-650"))]
-pub(crate) fn qwen2_5_vl_visual_splice_inverse_map(
-    input: &impl Qwen25VlMropeModelInputView,
-    visual_embedding_rows: usize,
-) -> Result<Vec<f32>, Qwen25VlVisualSpliceMapError> {
-    if input.metadata().model_type != QwenVlModelType::Qwen25Vl {
-        return Err(Qwen25VlVisualSpliceMapError::UnsupportedModelType {
-            model_type: input.metadata().model_type,
-        });
-    }
-    if input.mrope_positions().len() != input.prompt_token_ids().len() {
-        return Err(Qwen25VlVisualSpliceMapError::PositionLengthMismatch {
-            prompt_len: input.prompt_token_ids().len(),
-            positions_len: input.mrope_positions().len(),
-        });
-    }
-    discover_mrope_segments(
-        input.prompt_token_ids(),
-        input.metadata().special_tokens,
-        input.image_grids(),
-        input.video_grids(),
-        input.spatial_merge_size(),
-    )?;
-
-    let ids = input.metadata().special_tokens;
-    let mut inv = vec![-1.0f32; input.prompt_token_ids().len()];
-    let mut next_visual = 0usize;
-    for (index, &token) in input.prompt_token_ids().iter().enumerate() {
-        if token == ids.image || token == ids.video {
-            inv[index] = next_visual as f32;
-            next_visual += 1;
-        }
-    }
-    if next_visual != visual_embedding_rows {
-        return Err(Qwen25VlVisualSpliceMapError::VisualRowCountMismatch {
-            expected: next_visual,
-            actual: visual_embedding_rows,
-        });
-    }
-    Ok(inv)
 }
 
 #[cfg(test)]
@@ -1010,187 +803,48 @@ mod tests {
             .replace(",\n            \"tokens_per_second\": 4", "")
     }
 
-    #[test]
-    fn qwen_vl_filesystem_adapter_delegates_to_existing_source_assembly() {
-        let dir = write_fixture("success", IMAGE_ID, true);
-        let tokens = [
-            0,
-            VISION_START_ID,
-            IMAGE_ID,
-            1,
-            VISION_START_ID,
-            VIDEO_ID,
-            VIDEO_ID,
-            2,
-        ];
-        let image_grids = [MropeGrid::new(1, 2, 2)];
-        let video_grids = [MropeGrid::new(2, 2, 2)];
-        let temporal_patch_size = MropeTemporalPatchSize::new(2).unwrap();
-
-        let sources = load_qwen_vl_mrope_source_metadata(&dir).unwrap();
-        let processor_tokens = sources.processor_special_tokens();
-        let tokenizer_tokens = sources.tokenizer_special_tokens();
-        let pure =
-            assemble_qwen2_5_vl_mrope_positions_from_sources(Qwen25VlMropePositionSourceInput {
-                tokens: &tokens,
-                processor_special_tokens: &processor_tokens,
-                tokenizer_special_tokens: &tokenizer_tokens,
-                image_grids: &image_grids,
-                video_grids: &video_grids,
-                spatial_merge_size: 2,
-                temporal_patch_size,
-                fps: None,
-                config: &sources.config,
-            })
-            .unwrap();
-        let from_files =
-            assemble_qwen2_5_vl_mrope_positions_from_files(Qwen25VlMropeFilesystemPositionInput {
-                model_dir: &dir,
-                tokens: &tokens,
-                image_grids: &image_grids,
-                video_grids: &video_grids,
-                spatial_merge_size: 2,
-                temporal_patch_size,
-                fps: None,
-            })
-            .unwrap();
-        assert_eq!(from_files, pure);
-
-        let metadata = load_qwen_vl_mrope_metadata(&dir).unwrap();
-        assert_eq!(metadata.model_type, QwenVlModelType::Qwen25Vl);
-        assert_eq!(
-            metadata.special_tokens,
-            MropeSpecialTokenIds::new(VISION_START_ID, IMAGE_ID, VIDEO_ID)
-        );
+    /// What a prompt of `tokens` makes of the model directory's metadata and the grids: the pure
+    /// position assembly over the snapshot a request would hold.
+    struct ExpectedModelInput {
+        metadata: QwenVlMropeMetadata,
+        mrope_positions: MropePositionIds,
     }
 
-    #[test]
-    fn qwen_vl_production_model_input_borrows_inputs_and_matches_pure_positions() {
-        let dir = write_fixture("model_input_success", IMAGE_ID, true);
-        let tokens = [
-            0,
-            VISION_START_ID,
-            IMAGE_ID,
-            1,
-            VISION_START_ID,
-            VIDEO_ID,
-            VIDEO_ID,
+    fn expected_model_input(
+        dir: &Path,
+        tokens: &[u32],
+        image_grids: &[MropeGrid],
+        video_grids: &[MropeGrid],
+        temporal_patch_size: MropeTemporalPatchSize,
+    ) -> ExpectedModelInput {
+        let snapshot = load_qwen_vl_mrope_metadata_snapshot(dir).unwrap();
+        let (metadata, mrope_positions) = assemble_qwen2_5_vl_mrope_model_input_parts(
+            snapshot.metadata,
+            tokens,
+            image_grids,
+            video_grids,
             2,
-        ];
-        let image_grids = [MropeGrid::new(1, 2, 2)];
-        let video_grids = [MropeGrid::new(2, 2, 2)];
-        let temporal_patch_size = MropeTemporalPatchSize::new(2).unwrap();
-        let fps = [4.0];
-        let metadata = load_qwen_vl_mrope_metadata(&dir).unwrap();
-        let expected = assemble_qwen2_5_vl_mrope_positions(Qwen25VlMropePositionInput {
-            tokens: &tokens,
-            special_tokens: metadata.special_tokens,
-            image_grids: &image_grids,
-            video_grids: &video_grids,
-            spatial_merge_size: 2,
             temporal_patch_size,
-            fps: Some(MropeProcessorFpsInput::PerVideo(&fps)),
-            config: &metadata.config,
-        })
+            None,
+        )
         .unwrap();
-
-        let actual =
-            assemble_qwen2_5_vl_mrope_model_input_from_files(Qwen25VlMropeModelInputRequest {
-                model_dir: &dir,
-                prompt_token_ids: &tokens,
-                image_grids: &image_grids,
-                video_grids: &video_grids,
-                spatial_merge_size: 2,
-                temporal_patch_size,
-                fps: Some(MropeProcessorFpsInput::PerVideo(&fps)),
-            })
-            .unwrap();
-
-        assert!(std::ptr::eq(actual.prompt_token_ids, tokens.as_slice()));
-        assert!(std::ptr::eq(actual.image_grids, image_grids.as_slice()));
-        assert!(std::ptr::eq(actual.video_grids, video_grids.as_slice()));
-        assert_eq!(actual.metadata, metadata);
-        assert_eq!(actual.mrope_positions, expected);
-    }
-
-    #[test]
-    fn qwen_vl_production_model_input_rejects_qwen2_vl_before_prompt_errors() {
-        let config = qwen2_vl_config_json();
-        let dir = write_fixture_with_config("model_input_qwen2_vl", &config, IMAGE_ID, true);
-        let metadata = load_qwen_vl_mrope_metadata(&dir).unwrap();
-        assert_eq!(metadata.model_type, QwenVlModelType::Qwen2Vl);
-        assert_eq!(metadata.config.temporal_tokens_per_second(), None);
-
-        let err =
-            assemble_qwen2_5_vl_mrope_model_input_from_files(Qwen25VlMropeModelInputRequest {
-                model_dir: &dir,
-                prompt_token_ids: &[VISION_START_ID],
-                image_grids: &[MropeGrid::new(0, 1, 1)],
-                video_grids: &[],
-                spatial_merge_size: 0,
-                temporal_patch_size: MropeTemporalPatchSize::new(2).unwrap(),
-                fps: Some(MropeProcessorFpsInput::Scalar(f64::NAN)),
-            })
-            .unwrap_err();
-
-        assert!(matches!(
-            err,
-            Qwen25VlMropeModelInputError::UnsupportedModelType {
-                model_type: QwenVlModelType::Qwen2Vl
-            }
-        ));
-    }
-
-    #[test]
-    fn qwen_vl_production_model_input_outlives_model_dir_borrow() {
-        fn assemble_with_ephemeral_dir<'data>(
-            tokens: &'data [u32],
-            image_grids: &'data [MropeGrid],
-            video_grids: &'data [MropeGrid],
-        ) -> Qwen25VlMropeModelInput<'data> {
-            let dir = write_fixture("model_input_short_dir_lifetime", IMAGE_ID, true);
-            assemble_qwen2_5_vl_mrope_model_input_from_files(Qwen25VlMropeModelInputRequest {
-                model_dir: &dir,
-                prompt_token_ids: tokens,
-                image_grids,
-                video_grids,
-                spatial_merge_size: 2,
-                temporal_patch_size: MropeTemporalPatchSize::new(2).unwrap(),
-                fps: None,
-            })
-            .unwrap()
+        ExpectedModelInput {
+            metadata,
+            mrope_positions,
         }
-
-        let tokens = [0, VISION_START_ID, IMAGE_ID, 1];
-        let image_grids = [MropeGrid::new(1, 2, 2)];
-        let video_grids = [];
-        let actual = assemble_with_ephemeral_dir(&tokens, &image_grids, &video_grids);
-
-        assert!(std::ptr::eq(actual.prompt_token_ids, tokens.as_slice()));
-        assert!(std::ptr::eq(actual.image_grids, image_grids.as_slice()));
-        assert_eq!(actual.video_grids, &[]);
-        assert_eq!(
-            actual.metadata.special_tokens,
-            MropeSpecialTokenIds::new(VISION_START_ID, IMAGE_ID, VIDEO_ID)
-        );
-        assert_eq!(actual.mrope_positions.len(), tokens.len());
     }
 
     #[test]
     fn qwen_vl_rendered_prompt_model_input_tokenizes_plain_text_and_owns_ids() {
         let dir = write_fixture("rendered_prompt_plain_text", IMAGE_ID, true);
         let expected_tokens = [0, 1, 2];
-        let expected =
-            assemble_qwen2_5_vl_mrope_model_input_from_files(Qwen25VlMropeModelInputRequest {
-                model_dir: &dir,
-                prompt_token_ids: &expected_tokens,
-                image_grids: &[],
-                video_grids: &[],
-                spatial_merge_size: 2,
-                temporal_patch_size: MropeTemporalPatchSize::new(2).unwrap(),
-                fps: None,
-            })
-            .unwrap();
+        let expected = expected_model_input(
+            &dir,
+            &expected_tokens,
+            &[],
+            &[],
+            MropeTemporalPatchSize::new(2).unwrap(),
+        );
 
         let actual = assemble_qwen2_5_vl_mrope_model_input_from_rendered_prompt(
             Qwen25VlRenderedPromptMropeModelInputRequest {
@@ -1234,17 +888,7 @@ mod tests {
         assert!(empty.mrope_positions.is_empty());
 
         let expected_tokens = [0, 1];
-        let expected =
-            assemble_qwen2_5_vl_mrope_model_input_from_files(Qwen25VlMropeModelInputRequest {
-                model_dir: &dir,
-                prompt_token_ids: &expected_tokens,
-                image_grids: &[],
-                video_grids: &[],
-                spatial_merge_size: 2,
-                temporal_patch_size,
-                fps: None,
-            })
-            .unwrap();
+        let expected = expected_model_input(&dir, &expected_tokens, &[], &[], temporal_patch_size);
         let unknown = assemble_qwen2_5_vl_mrope_model_input_from_rendered_prompt(
             Qwen25VlRenderedPromptMropeModelInputRequest {
                 model_dir: &dir,
@@ -1279,17 +923,13 @@ mod tests {
             VIDEO_ID,
             0,
         ];
-        let expected =
-            assemble_qwen2_5_vl_mrope_model_input_from_files(Qwen25VlMropeModelInputRequest {
-                model_dir: &dir,
-                prompt_token_ids: &expected_tokens,
-                image_grids: &image_grids,
-                video_grids: &video_grids,
-                spatial_merge_size: 2,
-                temporal_patch_size: MropeTemporalPatchSize::new(2).unwrap(),
-                fps: None,
-            })
-            .unwrap();
+        let expected = expected_model_input(
+            &dir,
+            &expected_tokens,
+            &image_grids,
+            &video_grids,
+            MropeTemporalPatchSize::new(2).unwrap(),
+        );
         let rendered = format!(
             "t0 {VISION_START} {VIDEO_PAD} t1 {VISION_START} {IMAGE_PAD} t2 \
              {VISION_START} {VIDEO_PAD} {VIDEO_PAD} t0"
@@ -1410,115 +1050,6 @@ mod tests {
             err,
             Qwen25VlRenderedPromptMropeModelInputError::Tokenize { ref path, .. }
                 if path == &encode_error.join("tokenizer.json")
-        ));
-
-        let qwen2_config = qwen2_vl_config_json();
-        let qwen2_dir =
-            write_fixture_with_config("rendered_prompt_qwen2_vl", &qwen2_config, IMAGE_ID, true);
-        let err = assemble_qwen2_5_vl_mrope_model_input_from_rendered_prompt(
-            Qwen25VlRenderedPromptMropeModelInputRequest {
-                model_dir: &qwen2_dir,
-                rendered_prompt: "not_vocab",
-                image_grids: &[MropeGrid::new(0, 1, 1)],
-                video_grids: &[],
-                spatial_merge_size: 0,
-                temporal_patch_size: MropeTemporalPatchSize::new(2).unwrap(),
-                fps: Some(MropeProcessorFpsInput::Scalar(f64::NAN)),
-            },
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            Qwen25VlRenderedPromptMropeModelInputError::ModelInput(
-                Qwen25VlMropeModelInputError::UnsupportedModelType {
-                    model_type: QwenVlModelType::Qwen2Vl
-                }
-            )
-        ));
-
-        let qwen2_missing_tokenizer = write_fixture_with_config(
-            "rendered_prompt_qwen2_vl_missing_tokenizer",
-            &qwen2_config,
-            IMAGE_ID,
-            true,
-        );
-        std::fs::remove_file(qwen2_missing_tokenizer.join("tokenizer.json")).unwrap();
-        let err = assemble_qwen2_5_vl_mrope_model_input_from_rendered_prompt(
-            Qwen25VlRenderedPromptMropeModelInputRequest {
-                model_dir: &qwen2_missing_tokenizer,
-                rendered_prompt: "not_vocab",
-                image_grids: &[MropeGrid::new(0, 1, 1)],
-                video_grids: &[],
-                spatial_merge_size: 0,
-                temporal_patch_size: MropeTemporalPatchSize::new(2).unwrap(),
-                fps: Some(MropeProcessorFpsInput::Scalar(f64::NAN)),
-            },
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            Qwen25VlRenderedPromptMropeModelInputError::ModelInput(
-                Qwen25VlMropeModelInputError::UnsupportedModelType {
-                    model_type: QwenVlModelType::Qwen2Vl
-                }
-            )
-        ));
-
-        let qwen2_malformed_tokenizer = write_fixture_with_config(
-            "rendered_prompt_qwen2_vl_malformed_tokenizer",
-            &qwen2_config,
-            IMAGE_ID,
-            true,
-        );
-        std::fs::write(qwen2_malformed_tokenizer.join("tokenizer.json"), "{").unwrap();
-        let err = assemble_qwen2_5_vl_mrope_model_input_from_rendered_prompt(
-            Qwen25VlRenderedPromptMropeModelInputRequest {
-                model_dir: &qwen2_malformed_tokenizer,
-                rendered_prompt: "not_vocab",
-                image_grids: &[MropeGrid::new(0, 1, 1)],
-                video_grids: &[],
-                spatial_merge_size: 0,
-                temporal_patch_size: MropeTemporalPatchSize::new(2).unwrap(),
-                fps: Some(MropeProcessorFpsInput::Scalar(f64::NAN)),
-            },
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            Qwen25VlRenderedPromptMropeModelInputError::ModelInput(
-                Qwen25VlMropeModelInputError::UnsupportedModelType {
-                    model_type: QwenVlModelType::Qwen2Vl
-                }
-            )
-        ));
-
-        let span_mismatch = write_fixture("rendered_prompt_span_mismatch", IMAGE_ID, true);
-        let image_grids = [MropeGrid::new(1, 2, 4)];
-        let rendered = format!("t0 {VISION_START} {IMAGE_PAD} t1");
-        let err = assemble_qwen2_5_vl_mrope_model_input_from_rendered_prompt(
-            Qwen25VlRenderedPromptMropeModelInputRequest {
-                model_dir: &span_mismatch,
-                rendered_prompt: &rendered,
-                image_grids: &image_grids,
-                video_grids: &[],
-                spatial_merge_size: 2,
-                temporal_patch_size: MropeTemporalPatchSize::new(2).unwrap(),
-                fps: Some(MropeProcessorFpsInput::Scalar(f64::NAN)),
-            },
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            Qwen25VlRenderedPromptMropeModelInputError::ModelInput(
-                Qwen25VlMropeModelInputError::PositionAssembly(MropePositionAssemblyError::Span(
-                    MropeSpanError::PlaceholderCountMismatch {
-                        start_index: 1,
-                        expected: 2,
-                        actual: 1,
-                        ..
-                    }
-                ))
-            )
         ));
     }
 
@@ -1919,216 +1450,6 @@ mod tests {
                 ((s >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
             })
             .collect()
-    }
-
-    fn model_input_for_tokens<'data>(
-        dir: &Path,
-        tokens: &'data [u32],
-        image_grids: &'data [MropeGrid],
-        video_grids: &'data [MropeGrid],
-    ) -> Qwen25VlMropeModelInput<'data> {
-        assemble_qwen2_5_vl_mrope_model_input_from_files(Qwen25VlMropeModelInputRequest {
-            model_dir: dir,
-            prompt_token_ids: tokens,
-            image_grids,
-            video_grids,
-            spatial_merge_size: 2,
-            temporal_patch_size: MropeTemporalPatchSize::new(2).unwrap(),
-            fps: None,
-        })
-        .unwrap()
-    }
-
-    #[test]
-    fn qwen25_vl_visual_splice_map_replaces_only_validated_placeholders() {
-        let dir = write_fixture("visual_splice_map", IMAGE_ID, true);
-        let tokens = [
-            0,
-            VISION_START_ID,
-            VIDEO_ID,
-            1,
-            VISION_START_ID,
-            IMAGE_ID,
-            2,
-            VISION_START_ID,
-            VIDEO_ID,
-            VIDEO_ID,
-            0,
-        ];
-        let image_grids = [MropeGrid::new(1, 2, 2)];
-        let video_grids = [MropeGrid::new(1, 2, 2), MropeGrid::new(2, 2, 2)];
-        let input = model_input_for_tokens(&dir, &tokens, &image_grids, &video_grids);
-
-        let inv = qwen2_5_vl_visual_splice_inverse_map(&input, 4).unwrap();
-        assert_eq!(
-            inv,
-            vec![-1.0, -1.0, 0.0, -1.0, -1.0, 1.0, -1.0, -1.0, 2.0, 3.0, -1.0]
-        );
-    }
-
-    #[test]
-    fn qwen25_vl_visual_splice_map_validates_rows_and_model_input() {
-        let dir = write_fixture("visual_splice_map_errors", IMAGE_ID, true);
-        let tokens = [0, VISION_START_ID, IMAGE_ID, 1];
-        let image_grids = [MropeGrid::new(1, 2, 2)];
-        let input = model_input_for_tokens(&dir, &tokens, &image_grids, &[]);
-
-        assert_eq!(
-            qwen2_5_vl_visual_splice_inverse_map(&input, 2),
-            Err(Qwen25VlVisualSpliceMapError::VisualRowCountMismatch {
-                expected: 1,
-                actual: 2,
-            })
-        );
-
-        let qwen2_config = qwen2_vl_config_json();
-        let qwen2_dir = write_fixture_with_config(
-            "visual_splice_map_wrong_kind",
-            &qwen2_config,
-            IMAGE_ID,
-            true,
-        );
-        let qwen2_metadata = load_qwen_vl_mrope_metadata(&qwen2_dir).unwrap();
-        let wrong_kind = Qwen25VlMropeModelInput {
-            prompt_token_ids: &tokens,
-            image_grids: &image_grids,
-            video_grids: &[],
-            spatial_merge_size: 2,
-            metadata: qwen2_metadata,
-            mrope_positions: input.mrope_positions.clone(),
-        };
-        assert!(matches!(
-            qwen2_5_vl_visual_splice_inverse_map(&wrong_kind, 1),
-            Err(Qwen25VlVisualSpliceMapError::UnsupportedModelType {
-                model_type: QwenVlModelType::Qwen2Vl
-            })
-        ));
-
-        let malformed = Qwen25VlMropeModelInput {
-            prompt_token_ids: &[VISION_START_ID],
-            image_grids: &[],
-            video_grids: &[],
-            spatial_merge_size: 2,
-            metadata: input.metadata.clone(),
-            mrope_positions: input.mrope_positions.clone(),
-        };
-        assert!(matches!(
-            qwen2_5_vl_visual_splice_inverse_map(&malformed, 0),
-            Err(Qwen25VlVisualSpliceMapError::PositionLengthMismatch {
-                prompt_len: 1,
-                positions_len: 4,
-            })
-        ));
-
-        let invalid_tokens = [VISION_START_ID, 0, 1, 2];
-        let invalid_positions = poot_models::mrope::build_mrope_position_ids(
-            &[poot_models::mrope::MropeSegment::Text(4)],
-            1,
-        )
-        .unwrap();
-        let invalid_span = Qwen25VlMropeModelInput {
-            prompt_token_ids: &invalid_tokens,
-            image_grids: &[],
-            video_grids: &[],
-            spatial_merge_size: 2,
-            metadata: input.metadata.clone(),
-            mrope_positions: invalid_positions,
-        };
-        assert!(matches!(
-            qwen2_5_vl_visual_splice_inverse_map(&invalid_span, 0),
-            Err(Qwen25VlVisualSpliceMapError::Span(
-                MropeSpanError::MissingVisualMarker {
-                    start_index: 0,
-                    index: 1,
-                }
-            ))
-        ));
-    }
-
-    #[test]
-    fn qwen_vl_production_model_input_reports_metadata_path_before_prompt_errors() {
-        let dir = write_fixture("model_input_metadata_first", IMAGE_ID, true);
-        std::fs::write(dir.join("config.json"), "{").unwrap();
-        let temporal_patch_size = MropeTemporalPatchSize::new(2).unwrap();
-        let err =
-            assemble_qwen2_5_vl_mrope_model_input_from_files(Qwen25VlMropeModelInputRequest {
-                model_dir: &dir,
-                prompt_token_ids: &[VISION_START_ID],
-                image_grids: &[MropeGrid::new(0, 1, 1)],
-                video_grids: &[],
-                spatial_merge_size: 0,
-                temporal_patch_size,
-                fps: Some(MropeProcessorFpsInput::Scalar(f64::NAN)),
-            })
-            .unwrap_err();
-
-        assert!(matches!(
-            err,
-            Qwen25VlMropeModelInputError::Metadata(QwenVlMropeMetadataLoadError::Config(
-                MropeConfigMetadataError::Load(
-                    poot_load::qwen_vl::QwenVlHfMetadataError::ParseConfig { ref path, .. }
-                )
-            )) if path == &dir.join("config.json")
-        ));
-    }
-
-    #[test]
-    fn qwen_vl_production_model_input_preserves_pure_span_before_fps_ordering() {
-        let dir = write_fixture("model_input_span_first", IMAGE_ID, true);
-        let temporal_patch_size = MropeTemporalPatchSize::new(2).unwrap();
-        let err =
-            assemble_qwen2_5_vl_mrope_model_input_from_files(Qwen25VlMropeModelInputRequest {
-                model_dir: &dir,
-                prompt_token_ids: &[VISION_START_ID],
-                image_grids: &[],
-                video_grids: &[],
-                spatial_merge_size: 2,
-                temporal_patch_size,
-                fps: Some(MropeProcessorFpsInput::Scalar(f64::NAN)),
-            })
-            .unwrap_err();
-
-        assert!(matches!(
-            err,
-            Qwen25VlMropeModelInputError::PositionAssembly(MropePositionAssemblyError::Span(
-                MropeSpanError::MissingVisualMarker {
-                    start_index: 0,
-                    index: 1
-                }
-            ))
-        ));
-    }
-
-    #[test]
-    fn qwen_vl_filesystem_adapter_returns_existing_unknown_tokenizer_error() {
-        let dir = write_fixture("unknown_tokenizer_marker", IMAGE_ID, false);
-        let err = load_qwen_vl_mrope_metadata(&dir).unwrap_err();
-        assert!(matches!(
-            err,
-            QwenVlMropeMetadataLoadError::SpecialTokens(
-                MropeSpecialTokenReconcileError::UnknownTokenizerSpecialToken {
-                    role: MropeSpecialTokenKind::Image,
-                    ..
-                }
-            )
-        ));
-    }
-
-    #[test]
-    fn qwen_vl_filesystem_adapter_returns_existing_config_mismatch_error() {
-        let dir = write_fixture("config_mismatch", 7, true);
-        let err = load_qwen_vl_mrope_metadata(&dir).unwrap_err();
-        assert!(matches!(
-            err,
-            QwenVlMropeMetadataLoadError::SpecialTokens(
-                MropeSpecialTokenReconcileError::ConfigSpecialTokenMismatch {
-                    role: MropeSpecialTokenKind::Image,
-                    tokenizer_id: 7,
-                    config_id: IMAGE_ID,
-                    ..
-                }
-            )
-        ));
     }
 
     #[test]

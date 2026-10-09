@@ -312,10 +312,6 @@ pub struct MropeConfigMetadata {
 }
 
 impl MropeConfigMetadata {
-    pub fn from_hf_config_slice(json: &[u8]) -> Result<Self, MropeConfigMetadataError> {
-        poot_load::qwen_vl::QwenVlHfMetadata::from_slice(json)?.try_into()
-    }
-
     pub const fn mrope_section(&self) -> [usize; 3] {
         self.mrope_section
     }
@@ -634,24 +630,6 @@ pub struct Qwen25VlMropePositionInput<'a> {
     pub config: &'a MropeConfigMetadata,
 }
 
-/// Inputs for the pure Qwen2.5-VL position assembly boundary before special-token ID reconciliation.
-///
-/// The processor/template records provide semantic marker strings. The tokenizer records map those strings to
-/// IDs. Reconciliation produces the existing `MropeSpecialTokenIds`, then delegates to
-/// [`assemble_qwen2_5_vl_mrope_positions`].
-#[derive(Clone, Copy, Debug)]
-pub struct Qwen25VlMropePositionSourceInput<'a> {
-    pub tokens: &'a [u32],
-    pub processor_special_tokens: &'a [MropeProcessorSpecialToken<'a>],
-    pub tokenizer_special_tokens: &'a [MropeTokenizerSpecialToken<'a>],
-    pub image_grids: &'a [MropeGrid],
-    pub video_grids: &'a [MropeGrid],
-    pub spatial_merge_size: usize,
-    pub temporal_patch_size: MropeTemporalPatchSize,
-    pub fps: Option<MropeProcessorFpsInput<'a>>,
-    pub config: &'a MropeConfigMetadata,
-}
-
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum MropePositionAssemblyError {
     #[error(transparent)]
@@ -660,14 +638,6 @@ pub enum MropePositionAssemblyError {
     ProcessorTiming(#[from] MropeProcessorTimingError),
     #[error(transparent)]
     Position(#[from] MropePositionError),
-}
-
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum MropePositionSourceAssemblyError {
-    #[error(transparent)]
-    SpecialTokens(#[from] MropeSpecialTokenReconcileError),
-    #[error(transparent)]
-    Assembly(#[from] MropePositionAssemblyError),
 }
 
 /// Assemble Qwen2.5-VL mRoPE positions from an already-tokenized prompt. Span discovery runs before timing
@@ -708,29 +678,6 @@ pub fn assemble_qwen2_5_vl_mrope_positions(
     Ok(build_mrope_position_ids(
         &timestamped_segments,
         input.spatial_merge_size,
-    )?)
-}
-
-/// Reconcile Qwen-VL special-token source metadata, then run the existing Qwen2.5-VL position assembly.
-pub fn assemble_qwen2_5_vl_mrope_positions_from_sources(
-    input: Qwen25VlMropePositionSourceInput<'_>,
-) -> Result<MropePositionIds, MropePositionSourceAssemblyError> {
-    let special_tokens = reconcile_mrope_special_token_ids(
-        input.processor_special_tokens,
-        input.tokenizer_special_tokens,
-        input.config,
-    )?;
-    Ok(assemble_qwen2_5_vl_mrope_positions(
-        Qwen25VlMropePositionInput {
-            tokens: input.tokens,
-            special_tokens,
-            image_grids: input.image_grids,
-            video_grids: input.video_grids,
-            spatial_merge_size: input.spatial_merge_size,
-            temporal_patch_size: input.temporal_patch_size,
-            fps: input.fps,
-            config: input.config,
-        },
     )?)
 }
 
@@ -1318,6 +1265,11 @@ mod tests {
     const IMAGE_PAD_TOKEN: &str = "<|image_pad|>";
     const VIDEO_PAD_TOKEN: &str = "<|video_pad|>";
 
+    /// Parse an HF `config.json` the way the loader does: the raw reader, then the validating `TryFrom`.
+    fn config_metadata(json: &[u8]) -> Result<MropeConfigMetadata, MropeConfigMetadataError> {
+        poot_load::qwen_vl::QwenVlHfMetadata::from_slice(json)?.try_into()
+    }
+
     fn special_tokens() -> MropeSpecialTokenIds {
         MropeSpecialTokenIds::new(VISION_START, IMAGE, VIDEO)
     }
@@ -1380,7 +1332,7 @@ mod tests {
     #[test]
     fn mrope_config_metadata_constructs_existing_domain_types_exactly() {
         let qwen2 = qwen_vl_config_json("qwen2_vl", [151652, 151655, 151656], None);
-        let metadata = MropeConfigMetadata::from_hf_config_slice(qwen2.as_bytes()).unwrap();
+        let metadata = config_metadata(qwen2.as_bytes()).unwrap();
         assert_eq!(metadata.mrope_section(), [16, 24, 24]);
         assert_eq!(
             metadata.special_token_ids(),
@@ -1389,7 +1341,7 @@ mod tests {
         assert_eq!(metadata.temporal_tokens_per_second(), None);
 
         let qwen25 = qwen_vl_config_json("qwen2_5_vl", [151652, 151655, 151656], Some("4"));
-        let metadata = MropeConfigMetadata::from_hf_config_slice(qwen25.as_bytes()).unwrap();
+        let metadata = config_metadata(qwen25.as_bytes()).unwrap();
         assert_eq!(
             metadata.temporal_tokens_per_second().map(|rate| rate.get()),
             Some(4.0)
@@ -1405,7 +1357,7 @@ mod tests {
         ] {
             let json = qwen_vl_config_json("qwen2_5_vl", token_ids, Some("4"));
             assert!(matches!(
-                MropeConfigMetadata::from_hf_config_slice(json.as_bytes()),
+                config_metadata(json.as_bytes()),
                 Err(MropeConfigMetadataError::SpecialTokenIds(
                     MropeSpanError::DuplicateSpecialTokenId { .. }
                 ))
@@ -1418,7 +1370,7 @@ mod tests {
         for value in ["0", "-0.0", "-1", "-1e-400"] {
             let json = qwen_vl_config_json("qwen2_5_vl", [151652, 151655, 151656], Some(value));
             assert!(matches!(
-                MropeConfigMetadata::from_hf_config_slice(json.as_bytes()),
+                config_metadata(json.as_bytes()),
                 Err(MropeConfigMetadataError::Timing(
                     MropePositionError::NonPositiveTiming {
                         unit: MropeTimingUnit::TemporalTokensPerSecond
@@ -1430,7 +1382,7 @@ mod tests {
         for value in ["NaN", "Infinity", "-Infinity", "1e400"] {
             let json = qwen_vl_config_json("qwen2_5_vl", [151652, 151655, 151656], Some(value));
             assert!(matches!(
-                MropeConfigMetadata::from_hf_config_slice(json.as_bytes()),
+                config_metadata(json.as_bytes()),
                 Err(MropeConfigMetadataError::Load(
                     poot_load::qwen_vl::QwenVlHfMetadataError::Json(_)
                 ))
@@ -1441,7 +1393,7 @@ mod tests {
     #[test]
     fn mrope_qwen25_processor_timing_matches_upstream_formula_and_timestamp_path() {
         let config_json = qwen_vl_config_json("qwen2_5_vl", [151652, 151655, 151656], Some("4"));
-        let metadata = MropeConfigMetadata::from_hf_config_slice(config_json.as_bytes()).unwrap();
+        let metadata = config_metadata(config_json.as_bytes()).unwrap();
         let patch_size = MropeTemporalPatchSize::new(2).unwrap();
         let sampled_fps = MropeSampledFramesPerSecond::new(3.0).unwrap();
         let timing =
@@ -1475,7 +1427,7 @@ mod tests {
     #[test]
     fn mrope_qwen25_processor_timing_resolves_multiple_videos_per_video() {
         let config_json = qwen_vl_config_json("qwen2_5_vl", [151652, 151655, 151656], Some("4"));
-        let metadata = MropeConfigMetadata::from_hf_config_slice(config_json.as_bytes()).unwrap();
+        let metadata = config_metadata(config_json.as_bytes()).unwrap();
         let patch_size = MropeTemporalPatchSize::new(2).unwrap();
         let sampled_fps = [4.0, 1.6];
         let timings: Vec<_> = sampled_fps
@@ -1525,7 +1477,7 @@ mod tests {
     #[test]
     fn mrope_qwen25_processor_input_broadcasts_scalar_and_preserves_list_order() {
         let config_json = qwen_vl_config_json("qwen2_5_vl", [151652, 151655, 151656], Some("4"));
-        let metadata = MropeConfigMetadata::from_hf_config_slice(config_json.as_bytes()).unwrap();
+        let metadata = config_metadata(config_json.as_bytes()).unwrap();
         let patch_size = MropeTemporalPatchSize::new(2).unwrap();
 
         let scalar = assemble_qwen2_5_vl_video_timings(
@@ -1565,7 +1517,7 @@ mod tests {
     #[test]
     fn mrope_qwen25_processor_input_checks_list_length_before_values_or_config() {
         let config_json = qwen_vl_config_json("qwen2_5_vl", [151652, 151655, 151656], None);
-        let metadata = MropeConfigMetadata::from_hf_config_slice(config_json.as_bytes()).unwrap();
+        let metadata = config_metadata(config_json.as_bytes()).unwrap();
         let patch_size = MropeTemporalPatchSize::new(2).unwrap();
 
         for (fps, expected, actual) in [(&[f64::NAN][..], 2, 1), (&[f64::NAN, 0.0, -1.0][..], 2, 3)]
@@ -1590,7 +1542,7 @@ mod tests {
     #[test]
     fn mrope_qwen25_processor_input_rejects_invalid_rates_in_input_order() {
         let config_json = qwen_vl_config_json("qwen2_5_vl", [151652, 151655, 151656], Some("4"));
-        let metadata = MropeConfigMetadata::from_hf_config_slice(config_json.as_bytes()).unwrap();
+        let metadata = config_metadata(config_json.as_bytes()).unwrap();
         let patch_size = MropeTemporalPatchSize::new(2).unwrap();
 
         for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
@@ -1627,8 +1579,7 @@ mod tests {
         );
 
         let missing_rate = qwen_vl_config_json("qwen2_5_vl", [151652, 151655, 151656], None);
-        let missing_rate =
-            MropeConfigMetadata::from_hf_config_slice(missing_rate.as_bytes()).unwrap();
+        let missing_rate = config_metadata(missing_rate.as_bytes()).unwrap();
         assert_eq!(
             assemble_qwen2_5_vl_video_timings(
                 2,
@@ -1643,7 +1594,7 @@ mod tests {
     #[test]
     fn mrope_qwen25_processor_input_zero_videos_matches_upstream_count_behavior() {
         let config_json = qwen_vl_config_json("qwen2_5_vl", [151652, 151655, 151656], None);
-        let metadata = MropeConfigMetadata::from_hf_config_slice(config_json.as_bytes()).unwrap();
+        let metadata = config_metadata(config_json.as_bytes()).unwrap();
         let patch_size = MropeTemporalPatchSize::new(2).unwrap();
 
         assert_eq!(
@@ -1692,7 +1643,7 @@ mod tests {
     #[test]
     fn mrope_qwen25_processor_default_fps_matches_explicit_scalar() {
         let config_json = qwen_vl_config_json("qwen2_5_vl", [151652, 151655, 151656], Some("4"));
-        let metadata = MropeConfigMetadata::from_hf_config_slice(config_json.as_bytes()).unwrap();
+        let metadata = config_metadata(config_json.as_bytes()).unwrap();
         let patch_size = MropeTemporalPatchSize::new(2).unwrap();
 
         assert_eq!(QWEN2_5_VL_PROCESSOR_DEFAULT_FPS.to_bits(), 2.0f64.to_bits());
@@ -1751,7 +1702,7 @@ mod tests {
     #[test]
     fn mrope_qwen25_processor_default_boundary_preserves_explicit_errors_atomically() {
         let config_json = qwen_vl_config_json("qwen2_5_vl", [151652, 151655, 151656], None);
-        let metadata = MropeConfigMetadata::from_hf_config_slice(config_json.as_bytes()).unwrap();
+        let metadata = config_metadata(config_json.as_bytes()).unwrap();
         let patch_size = MropeTemporalPatchSize::new(2).unwrap();
 
         assert_eq!(
@@ -1791,7 +1742,7 @@ mod tests {
     #[test]
     fn mrope_qwen25_processor_input_requires_config_rate_only_for_output_videos() {
         let config_json = qwen_vl_config_json("qwen2_5_vl", [151652, 151655, 151656], None);
-        let metadata = MropeConfigMetadata::from_hf_config_slice(config_json.as_bytes()).unwrap();
+        let metadata = config_metadata(config_json.as_bytes()).unwrap();
 
         assert_eq!(
             assemble_qwen2_5_vl_video_timings(
@@ -1824,7 +1775,7 @@ mod tests {
         }
 
         let config_json = qwen_vl_config_json("qwen2_5_vl", [151652, 151655, 151656], Some("4"));
-        let metadata = MropeConfigMetadata::from_hf_config_slice(config_json.as_bytes()).unwrap();
+        let metadata = config_metadata(config_json.as_bytes()).unwrap();
         assert_eq!(
             MropeVideoTiming::from_qwen2_5_vl_processor(
                 MropeTemporalPatchSize::new(usize::MAX).unwrap(),
@@ -1840,8 +1791,7 @@ mod tests {
 
         for model_type in ["qwen2_vl", "qwen2_5_vl"] {
             let config_json = qwen_vl_config_json(model_type, [151652, 151655, 151656], None);
-            let metadata =
-                MropeConfigMetadata::from_hf_config_slice(config_json.as_bytes()).unwrap();
+            let metadata = config_metadata(config_json.as_bytes()).unwrap();
             assert_eq!(
                 MropeVideoTiming::from_qwen2_5_vl_processor(
                     MropeTemporalPatchSize::new(2).unwrap(),
@@ -2294,7 +2244,7 @@ mod tests {
             [VISION_START as u64, IMAGE as u64, VIDEO as u64],
             Some("4"),
         );
-        let metadata = MropeConfigMetadata::from_hf_config_slice(config_json.as_bytes()).unwrap();
+        let metadata = config_metadata(config_json.as_bytes()).unwrap();
         let image_grids = [MropeGrid::new(1, 2, 2)];
         let video_grids = [MropeGrid::new(2, 2, 2), MropeGrid::new(1, 1, 1)];
         let tokens = [
@@ -2376,13 +2326,13 @@ mod tests {
     }
 
     #[test]
-    fn mrope_special_token_reconciliation_matches_records_and_feeds_position_assembly() {
+    fn mrope_special_token_reconciliation_matches_records() {
         let config_json = qwen_vl_config_json(
             "qwen2_5_vl",
             [VISION_START as u64, IMAGE as u64, VIDEO as u64],
             Some("4"),
         );
-        let metadata = MropeConfigMetadata::from_hf_config_slice(config_json.as_bytes()).unwrap();
+        let metadata = config_metadata(config_json.as_bytes()).unwrap();
         let processor_tokens = processor_special_tokens();
         let tokenizer_tokens = tokenizer_special_tokens();
 
@@ -2390,35 +2340,6 @@ mod tests {
             reconcile_mrope_special_token_ids(&processor_tokens, &tokenizer_tokens, &metadata)
                 .unwrap();
         assert_eq!(reconciled, special_tokens());
-
-        let video_grids = [MropeGrid::new(2, 1, 1)];
-        let tokens = [VISION_START, VIDEO, VIDEO, 42];
-        let patch_size = MropeTemporalPatchSize::new(2).unwrap();
-        let from_sources =
-            assemble_qwen2_5_vl_mrope_positions_from_sources(Qwen25VlMropePositionSourceInput {
-                tokens: &tokens,
-                processor_special_tokens: &processor_tokens,
-                tokenizer_special_tokens: &tokenizer_tokens,
-                image_grids: &[],
-                video_grids: &video_grids,
-                spatial_merge_size: 1,
-                temporal_patch_size: patch_size,
-                fps: Some(MropeProcessorFpsInput::Scalar(4.0)),
-                config: &metadata,
-            })
-            .unwrap();
-        let direct = assemble_qwen2_5_vl_mrope_positions(Qwen25VlMropePositionInput {
-            tokens: &tokens,
-            special_tokens: special_tokens(),
-            image_grids: &[],
-            video_grids: &video_grids,
-            spatial_merge_size: 1,
-            temporal_patch_size: patch_size,
-            fps: Some(MropeProcessorFpsInput::Scalar(4.0)),
-            config: &metadata,
-        })
-        .unwrap();
-        assert_eq!(from_sources, direct);
     }
 
     #[test]
@@ -2428,7 +2349,7 @@ mod tests {
             [VISION_START as u64, IMAGE as u64, VIDEO as u64],
             Some("4"),
         );
-        let metadata = MropeConfigMetadata::from_hf_config_slice(config_json.as_bytes()).unwrap();
+        let metadata = config_metadata(config_json.as_bytes()).unwrap();
         let tokenizer_tokens = tokenizer_special_tokens();
 
         assert_eq!(
@@ -2555,7 +2476,7 @@ mod tests {
             [VISION_START as u64, 99, VIDEO as u64],
             Some("4"),
         );
-        let metadata = MropeConfigMetadata::from_hf_config_slice(config_json.as_bytes()).unwrap();
+        let metadata = config_metadata(config_json.as_bytes()).unwrap();
 
         assert_eq!(
             reconcile_mrope_special_token_ids(
@@ -2577,7 +2498,7 @@ mod tests {
     #[test]
     fn mrope_special_token_reconciliation_has_deterministic_error_ordering() {
         let config_json = qwen_vl_config_json("qwen2_5_vl", [100, 101, 102], None);
-        let metadata = MropeConfigMetadata::from_hf_config_slice(config_json.as_bytes()).unwrap();
+        let metadata = config_metadata(config_json.as_bytes()).unwrap();
 
         assert_eq!(
             reconcile_mrope_special_token_ids(
@@ -2632,50 +2553,13 @@ mod tests {
     }
 
     #[test]
-    fn mrope_position_source_assembly_reconciles_before_later_errors() {
-        let config_json = qwen_vl_config_json(
-            "qwen2_5_vl",
-            [VISION_START as u64, IMAGE as u64, VIDEO as u64],
-            None,
-        );
-        let metadata = MropeConfigMetadata::from_hf_config_slice(config_json.as_bytes()).unwrap();
-        let processor_tokens = processor_special_tokens();
-        let patch_size = MropeTemporalPatchSize::new(2).unwrap();
-
-        let err =
-            assemble_qwen2_5_vl_mrope_positions_from_sources(Qwen25VlMropePositionSourceInput {
-                tokens: &[VISION_START, 99],
-                processor_special_tokens: &processor_tokens,
-                tokenizer_special_tokens: &[
-                    MropeTokenizerSpecialToken::new(VISION_START_TOKEN, VISION_START),
-                    MropeTokenizerSpecialToken::new(IMAGE_PAD_TOKEN, IMAGE),
-                ],
-                image_grids: &[],
-                video_grids: &[MropeGrid::new(1, 1, 1)],
-                spatial_merge_size: 1,
-                temporal_patch_size: patch_size,
-                fps: Some(MropeProcessorFpsInput::Scalar(f64::NAN)),
-                config: &metadata,
-            });
-        assert_eq!(
-            err,
-            Err(MropePositionSourceAssemblyError::SpecialTokens(
-                MropeSpecialTokenReconcileError::UnknownTokenizerSpecialToken {
-                    role: MropeSpecialTokenKind::Video,
-                    token: VIDEO_PAD_TOKEN.to_string(),
-                },
-            ))
-        );
-    }
-
-    #[test]
     fn mrope_qwen25_position_assembly_uses_default_and_preserves_zero_video_behavior() {
         let config_json = qwen_vl_config_json(
             "qwen2_5_vl",
             [VISION_START as u64, IMAGE as u64, VIDEO as u64],
             Some("4"),
         );
-        let metadata = MropeConfigMetadata::from_hf_config_slice(config_json.as_bytes()).unwrap();
+        let metadata = config_metadata(config_json.as_bytes()).unwrap();
         let video_grids = [MropeGrid::new(2, 1, 1)];
         let tokens = [VISION_START, VIDEO, VIDEO];
         let patch_size = MropeTemporalPatchSize::new(2).unwrap();
@@ -2709,8 +2593,7 @@ mod tests {
             [VISION_START as u64, IMAGE as u64, VIDEO as u64],
             None,
         );
-        let missing_rate =
-            MropeConfigMetadata::from_hf_config_slice(missing_rate.as_bytes()).unwrap();
+        let missing_rate = config_metadata(missing_rate.as_bytes()).unwrap();
         let zero_video = assemble_qwen2_5_vl_mrope_positions(Qwen25VlMropePositionInput {
             tokens: &[42],
             special_tokens: special_tokens(),
@@ -2732,7 +2615,7 @@ mod tests {
             [VISION_START as u64, IMAGE as u64, VIDEO as u64],
             None,
         );
-        let metadata = MropeConfigMetadata::from_hf_config_slice(config_json.as_bytes()).unwrap();
+        let metadata = config_metadata(config_json.as_bytes()).unwrap();
         let patch_size = MropeTemporalPatchSize::new(2).unwrap();
 
         let malformed = assemble_qwen2_5_vl_mrope_positions(Qwen25VlMropePositionInput {

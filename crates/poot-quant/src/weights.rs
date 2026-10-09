@@ -440,6 +440,11 @@ pub enum WeightRole {
     PatchBias,
     /// A modality connector's projection `[text_width, vision_width * scale^2]`.
     Connector,
+    /// A two-layer connector's first projection's bias, and its second projection and bias (a
+    /// Qwen2.5-VL patch merger's `mlp.0` bias, `mlp.2` and its bias).
+    ConnectorBias,
+    ConnectorOut,
+    ConnectorOutBias,
     /// The stacked LoRA adapter tensors the compile-time LoRA pass reads beside the base weights.
     Lora(LoraRole),
 }
@@ -535,9 +540,9 @@ pub enum AttnRole {
     KNorm,
     /// The output projection's bias.
     OBias,
-    /// A fused `[(heads + 2 * kv_heads) * head_dim, width]` QKV projection whose rows interleave
-    /// per head (`q_h, k_h, v_h` for each head; BLOOM), and its bias. A family that has one reads
-    /// it instead of `Q`/`K`/`V`.
+    /// A fused `[(heads + 2 * kv_heads) * head_dim, width]` QKV projection, and its bias. The row
+    /// order is the family's: BLOOM interleaves per head (`q_h, k_h, v_h` for each head), a Qwen2.5-VL
+    /// vision block stacks `q | k | v`. A family that has one reads it instead of `Q`/`K`/`V`.
     Qkv,
     QkvBias,
     /// The per-query-head attention sink logits (gpt-oss), `[heads]`.
@@ -553,9 +558,11 @@ pub enum FfnRole {
     Gate,
     Up,
     Down,
-    /// The biases of a plain MLP's two projections.
+    /// The biases of a plain MLP's two projections, and of a gated MLP's gate (a Qwen2.5-VL vision
+    /// block's three).
     UpBias,
     DownBias,
+    GateBias,
 }
 
 /// The projection of a routed expert a weight holds. `GateUp` is the one fused gate and up projection
@@ -980,6 +987,7 @@ impl WeightRole {
                 FfnRole::Down => "ffn.down",
                 FfnRole::UpBias => "ffn.up_bias",
                 FfnRole::DownBias => "ffn.down_bias",
+                FfnRole::GateBias => "ffn.gate_bias",
             },
             WeightRole::Norm(role) => match role {
                 NormRole::Attn => "norm.attn",
@@ -1001,6 +1009,9 @@ impl WeightRole {
             WeightRole::Patch => "patch",
             WeightRole::PatchBias => "patch_bias",
             WeightRole::Connector => "connector",
+            WeightRole::ConnectorBias => "connector_bias",
+            WeightRole::ConnectorOut => "connector_out",
+            WeightRole::ConnectorOutBias => "connector_out_bias",
             WeightRole::Lora(role) => role.spelling(),
         })
     }

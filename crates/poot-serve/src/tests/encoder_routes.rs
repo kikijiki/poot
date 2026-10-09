@@ -1,8 +1,10 @@
-//! The encoder backends over the production `http::handle` (POOT-739): a BERT embedder or
-//! cross-encoder is loaded as a `ModelHandle`, and the routes that would run it on the driver return
-//! the typed 503 until the serving loop restores them (POOT-589).
+//! The encoder models over the production `http::handle` (POOT-589): a BERT embedder or cross-encoder is
+//! loaded as a `ModelHandle`, and `/v1/embeddings` and `/v1/rerank` run it as `Encode` jobs on the
+//! engine thread, scored by what the model's output is (hidden states pooled on the host, or a
+//! classifier's score per pair). The engine is the recording fake, so these rows read the rows the
+//! handlers send it and the answers they build from what it returns.
 
-use super::no_engine::{json_body, roundtrip, status_line};
+use super::lifecycle::{json_body, status_line};
 use super::*;
 
 /// A BERT-class checkpoint directory: `family`'s registered fixture (or its named variant) written
@@ -45,49 +47,102 @@ pub(crate) fn encoder_handle(variant: Option<&str>) -> Arc<ModelHandle> {
     handle
 }
 
-/// A route the driver has no serving path for answers the typed `NotServed` refusal: a 503 whose
-/// body is that variant's message for that route, never a 200.
-fn assert_not_served(response: &str, route: &'static str, label: &str) {
-    assert_eq!(
-        status_line(response),
-        "HTTP/1.1 503 Service Unavailable",
-        "{label}: {response}"
-    );
-    let error = &json_body(response)["error"];
-    let refusal = GenerationError::NotServed { route };
-    assert_eq!(error["code"], refusal.stream_status(), "{label}");
-    assert_eq!(error["type"], "server_error", "{label}");
-    assert_eq!(error["message"], refusal.to_string(), "{label}: {error}");
+/// The request `body` to `path` through the production `handle`, with `fake` on the engine thread behind
+/// it: the response and the `Encode` rows the fake was asked to run.
+fn serve_encode(
+    model: Arc<ModelHandle>,
+    path: &str,
+    body: &str,
+    answer: impl FnMut(&[crate::types::EncodeRow]) -> poot_llm::driver::Encoded + Send + 'static,
+) -> (String, Vec<Vec<crate::types::EncodeRow>>) {
+    let asked: Arc<Mutex<Vec<Vec<crate::types::EncodeRow>>>> = Arc::default();
+    let hook_asked = Arc::clone(&asked);
+    let mut answer = answer;
+    let mut fake = RecordingEngine::new(1);
+    fake.on_encode = Box::new(move |rows| {
+        hook_asked.lock().unwrap().push(rows.to_vec());
+        Ok(answer(rows))
+    });
+    let metrics = Arc::new(test_metrics("encoder-routes"));
+    let (served, engine) = serve_with_fake(fake, model, &metrics);
+    let response = super::lifecycle::roundtrip(&served, &metrics, "POST", path, body);
+    engine.finish(served);
+    let asked = asked.lock().unwrap().clone();
+    (response, asked)
 }
 
-/// SC-006 (the serve row): an embedder answers both of its routes with the typed 503, and a
-/// cross-encoder answers rerank with it, while the route it has no output for stays a 400.
+/// A cross-encoder scores each `(query, document)` pair jointly in one `Encode` step: the rows are
+/// the pairs, their second sentence carries segment id 1, and `relevance_score` is the raw logit the
+/// model returned for the pair, ordered descending. The fake's score for a pair is its token count, so
+/// the longer pair ranks first and the order cannot come from the input order.
 #[test]
-fn encoder_backends_answer_the_routes_they_cannot_run_yet_with_the_typed_503() {
-    let embedder = Backend::Encoder(encoder_handle(None));
-    let body = r#"{"input":"w1 w2"}"#;
-    let rerank = r#"{"query":"w1","documents":["w2","w3"]}"#;
-    assert_not_served(
-        &roundtrip(&embedder, None, "POST", "/v1/embeddings", body, || {}),
-        "/v1/embeddings",
-        "encoder embeddings",
-    );
-    assert_not_served(
-        &roundtrip(&embedder, None, "POST", "/v1/rerank", rerank, || {}),
+fn a_cross_encoder_scores_each_pair_jointly_and_ranks_by_the_raw_logit() {
+    let model = encoder_handle(Some("cross_encoder"));
+    let (response, asked) = serve_encode(
+        model,
         "/v1/rerank",
-        "encoder rerank",
+        r#"{"query":"w1","documents":["w2","w3 w4 w5","w6 w7"]}"#,
+        |rows| poot_llm::driver::Encoded {
+            width: 1,
+            rows: rows.iter().map(|row| vec![row.ids.len() as f32]).collect(),
+        },
     );
+    assert_eq!(status_line(&response), "HTTP/1.1 200 OK", "{response}");
+    assert_eq!(asked.len(), 1, "one Encode step for all the pairs");
+    let rows = &asked[0];
+    assert_eq!(rows.len(), 3, "one row per pair");
+    for row in rows {
+        assert!(
+            row.types.contains(&1) && row.types.contains(&0),
+            "a pair row carries both segments: {row:?}"
+        );
+    }
+    let results = json_body(&response)["results"].as_array().unwrap().clone();
+    let order: Vec<u64> = results
+        .iter()
+        .map(|r| r["index"].as_u64().unwrap())
+        .collect();
+    assert_eq!(order, vec![1, 2, 0], "the longest pair first: {results:?}");
+    for (result, index) in results.iter().zip(&order) {
+        let score = rows[*index as usize].ids.len() as f64;
+        assert_eq!(
+            result["relevance_score"].as_f64().unwrap(),
+            score,
+            "{result}"
+        );
+    }
+}
 
-    let cross = Backend::CrossEncoder(encoder_handle(Some("cross_encoder")));
-    assert_not_served(
-        &roundtrip(&cross, None, "POST", "/v1/rerank", rerank, || {}),
-        "/v1/rerank",
-        "cross-encoder rerank",
+/// A BERT embedder answers embeddings through the engine: the hidden states it returns, mean-pooled and
+/// unit length, one vector per input.
+#[test]
+fn an_encoder_embedder_answers_embeddings_through_the_engine() {
+    let model = encoder_handle(None);
+    let (response, asked) = serve_encode(
+        model,
+        "/v1/embeddings",
+        r#"{"input":["w1 w2","w3"]}"#,
+        |rows| poot_llm::driver::Encoded {
+            width: 2,
+            rows: rows
+                .iter()
+                .map(|row| row.ids.iter().flat_map(|_| [3.0, 4.0]).collect())
+                .collect(),
+        },
     );
-    let response = roundtrip(&cross, None, "POST", "/v1/embeddings", body, || {});
-    assert_eq!(
-        status_line(&response),
-        "HTTP/1.1 400 Bad Request",
-        "a cross-encoder has no embedding output: {response}"
-    );
+    assert_eq!(status_line(&response), "HTTP/1.1 200 OK", "{response}");
+    assert_eq!(asked[0].len(), 2, "both inputs in one step");
+    let json = json_body(&response);
+    for entry in json["data"].as_array().unwrap() {
+        let vector: Vec<f64> = entry["embedding"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap())
+            .collect();
+        assert!(
+            (vector[0] - 0.6).abs() < 1e-6 && (vector[1] - 0.8).abs() < 1e-6,
+            "{vector:?}"
+        );
+    }
 }

@@ -247,7 +247,7 @@ impl Device for FakeDevice {
     fn replay(&mut self, _recording: &()) -> Result<(), FakeError> {
         Ok(())
     }
-    fn write(&mut self, _dst: &(), _bytes: &[u8]) -> Result<(), FakeError> {
+    fn write(&mut self, _dst: &(), _offset: usize, _bytes: &[u8]) -> Result<(), FakeError> {
         Ok(())
     }
     /// Every row picks token 1: the sampling suffix answers `[token, non_finite_index]`, the logits head

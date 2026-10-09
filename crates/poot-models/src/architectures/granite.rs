@@ -432,367 +432,24 @@ fn moe_fixture() -> Fixture {
     Fixture::bf16(config, shapes)
 }
 
-// ---- Legacy tracers (the tests' independent reference) ----
-
-#[cfg(test)]
-mod legacy {
-    use poot_graph_ir::ops::{
-        attention_masked, attention_prefill, causal_mask_from_pos, linear, rmsnorm, rope,
-        rope_prefill, swiglu,
-    };
-    use poot_graph_ir::{BinOp, Builder, Graph, Slot, StateRole, TensorType};
-    use poot_tensor::DType;
-
-    /// The dense decoder dimensions the legacy tracers read.
-    #[derive(Clone, Copy, Debug, Default)]
-    pub struct LegacyConfig {
-        pub vocab: usize,
-        pub hidden: usize,
-        pub inter: usize,
-        pub layers: usize,
-        pub n_heads: usize,
-        pub n_kv_heads: usize,
-        pub head_dim: usize,
-        pub rotary_dim: usize,
-        pub eps: f32,
-        pub max_pos: usize,
-        pub sliding_window: Option<usize>,
-    }
-
-    /// Granite parameters alongside a [`LegacyConfig`]: the four scalar multipliers plus the MLP kind.
-    #[derive(Clone, Copy, Debug)]
-    pub struct GraniteParams {
-        /// Token embeddings are multiplied by this (`embedding_multiplier`) in-graph: the embed table is tied to the
-        /// output projection, so a load-time scale would also scale the logits.
-        pub embed_mult: f32,
-        /// Attention softmax scale (`attention_multiplier`), replacing `1/sqrt(head_dim)`.
-        pub attn_mult: f32,
-        /// Each sublayer output is multiplied by this (`residual_multiplier`) before the residual add.
-        pub residual_mult: f32,
-        /// Final logits are divided by this (`logits_scaling`).
-        pub logits_scale: f32,
-    }
-
-    /// Granite batched prefill with KV-cache writes: [`trace_granite_prefill`] on the cache-writing skeleton of
-    /// [`crate::qwen2::trace_prefill_kv`]. One Q=N forward fills each layer's `[1,Hkv,cap,D]` K/V cache for
-    /// positions [0,N) (a `dynamic_update_slice` of the `[1,Hkv,N,D]` block at slot 0, axis 2), with the state
-    /// names/order of [`trace_granite_decode_kv_masked`] so the caches feed the decode loop from pos=N.
-    pub fn trace_granite_prefill_kv(
-        cfg: LegacyConfig,
-        gp: GraniteParams,
-        n: usize,
-        cap: usize,
-    ) -> Graph {
-        assert!(
-            cap >= n,
-            "cache capacity {cap} must be at least the prompt length {n}"
-        );
-        let b = Builder::new();
-        let (h, d, hq, hkv) = (cfg.hidden, cfg.head_dim, cfg.n_heads, cfg.n_kv_heads);
-        let n_rep = hq / hkv;
-        let q_dim = hq * d;
-        let kv_dim = hkv * d;
-        let l = n;
-
-        let tokens = b.slot(Slot::Token, TensorType::new(vec![l], DType::I32));
-        let cos = b.constant(
-            "rope.cos",
-            TensorType::f32(vec![cfg.max_pos, cfg.rotary_dim]),
-        );
-        let sin = b.constant(
-            "rope.sin",
-            TensorType::f32(vec![cfg.max_pos, cfg.rotary_dim]),
-        );
-        // this one-shot prefill always starts at position 0 (card 550).
-        let pos = b.slot(Slot::Pos, TensorType::new(vec![1, l], DType::I32));
-        let mask = causal_mask_from_pos(&b, pos, l, cfg.sliding_window);
-
-        let embed = b.constant(
-            "model.embed_tokens.weight",
-            TensorType::f32(vec![cfg.vocab, h]),
-        );
-        let emb = b.gather(embed, 0, tokens);
-        let x0 = b.reshape(emb, vec![1, l, h]);
-        let mut x = b.binary_scalar(BinOp::Mul, x0, Builder::f32(gp.embed_mult));
-
-        let mut state: Vec<(poot_graph_ir::Traced, poot_graph_ir::Traced)> =
-            Vec::with_capacity(2 * cfg.layers);
-
-        for li in 0..cfg.layers {
-            let p = |s: &str| format!("model.layers.{li}.{s}");
-
-            let ln1 = b.constant(&p("input_layernorm.weight"), TensorType::f32(vec![h]));
-            let normed = rmsnorm(&b, x, ln1, cfg.eps);
-
-            let wq = b.constant(
-                &p("self_attn.q_proj.weight"),
-                TensorType::f32(vec![h, q_dim]),
-            );
-            let wk = b.constant(
-                &p("self_attn.k_proj.weight"),
-                TensorType::f32(vec![h, kv_dim]),
-            );
-            let wv = b.constant(
-                &p("self_attn.v_proj.weight"),
-                TensorType::f32(vec![h, kv_dim]),
-            );
-            let wo = b.constant(
-                &p("self_attn.o_proj.weight"),
-                TensorType::f32(vec![q_dim, h]),
-            );
-
-            let q = linear(&b, normed, wq, None);
-            let k = linear(&b, normed, wk, None);
-            let v = linear(&b, normed, wv, None);
-
-            let q = b.reshape(q, vec![1, l, hq, d]);
-            let k = b.reshape(k, vec![1, l, hkv, d]);
-            let v = b.reshape(v, vec![1, l, hkv, d]);
-            let q = b.transpose(q, vec![0, 2, 1, 3]);
-            let k = b.transpose(k, vec![0, 2, 1, 3]);
-            let v = b.transpose(v, vec![0, 2, 1, 3]);
-
-            let q = rope_prefill(&b, q, cos, sin, l);
-            let k = rope_prefill(&b, k, cos, sin, l);
-
-            let kcache = b.state_input(
-                &p("kv.k_cache"),
-                TensorType::f32(vec![1, hkv, cap, d]),
-                StateRole::Recurrent,
-            );
-            let vcache = b.state_input(
-                &p("kv.v_cache"),
-                TensorType::f32(vec![1, hkv, cap, d]),
-                StateRole::Recurrent,
-            );
-            let kcache_out = b.dynamic_update_slice(kcache, k, 0, 2);
-            let vcache_out = b.dynamic_update_slice(vcache, v, 0, 2);
-            state.push((kcache, kcache_out));
-            state.push((vcache, vcache_out));
-
-            let attn = attention_prefill(&b, q, k, v, n_rep, gp.attn_mult, mask);
-            let attn = b.transpose(attn, vec![0, 2, 1, 3]);
-            let attn = b.reshape(attn, vec![1, l, q_dim]);
-            let attn = linear(&b, attn, wo, None);
-            let attn = b.binary_scalar(BinOp::Mul, attn, Builder::f32(gp.residual_mult));
-            x = b.binary(BinOp::Add, x, attn);
-
-            let ln2 = b.constant(
-                &p("post_attention_layernorm.weight"),
-                TensorType::f32(vec![h]),
-            );
-            let normed = rmsnorm(&b, x, ln2, cfg.eps);
-            let wg = b.constant(
-                &p("mlp.gate_proj.weight"),
-                TensorType::f32(vec![h, cfg.inter]),
-            );
-            let wu = b.constant(
-                &p("mlp.up_proj.weight"),
-                TensorType::f32(vec![h, cfg.inter]),
-            );
-            let wd = b.constant(
-                &p("mlp.down_proj.weight"),
-                TensorType::f32(vec![cfg.inter, h]),
-            );
-            let gate = linear(&b, normed, wg, None);
-            let up = linear(&b, normed, wu, None);
-            let act = swiglu(&b, gate, up);
-            let m = linear(&b, act, wd, None);
-            let m = b.binary_scalar(BinOp::Mul, m, Builder::f32(gp.residual_mult));
-            x = b.binary(BinOp::Add, x, m);
-        }
-
-        let norm = b.constant("model.norm.weight", TensorType::f32(vec![h]));
-        let x = rmsnorm(&b, x, norm, cfg.eps);
-        let last = b.slice(x, 1, l - 1, l);
-        let lm_head = b.constant("lm_head.weight", TensorType::f32(vec![h, cfg.vocab]));
-        let logits = linear(&b, last, lm_head, None);
-        let scaled = b.binary_scalar(BinOp::Mul, logits, Builder::f32(1.0 / gp.logits_scale));
-        b.finish_with_state(scaled, &state)
-    }
-
-    /// Granite single-token fixed-KV masked decode, the decode analog of [`trace_granite_prefill`] on the
-    /// [`crate::qwen2::trace_decode_kv_masked`] skeleton: embedding multiplier, `attn_mult` as attention scale,
-    /// `residual_mult` on each sublayer output, dense-swiglu MLP, final logits / `logits_scale`.
-    /// No qk-norm, no qkv bias, two norms (input + post_attention), single rope base.
-    pub fn trace_granite_decode_kv_masked(
-        cfg: LegacyConfig,
-        gp: GraniteParams,
-        cap: usize,
-    ) -> Graph {
-        let b = Builder::new();
-        let (h, d, hq, hkv) = (cfg.hidden, cfg.head_dim, cfg.n_heads, cfg.n_kv_heads);
-        let n_rep = hq / hkv;
-        let q_dim = hq * d;
-        let kv_dim = hkv * d;
-
-        let token = b.slot(Slot::Token, TensorType::scalar(DType::I32));
-        let pos = b.slot(Slot::Pos, TensorType::new(vec![1, 1], DType::I32));
-        let pos_slot = b.reshape(pos, vec![]);
-        let mask = causal_mask_from_pos(&b, pos, cap, cfg.sliding_window); // [1,1,1,cap]
-
-        let cos = b.constant(
-            "rope.cos",
-            TensorType::f32(vec![cfg.max_pos, cfg.rotary_dim]),
-        );
-        let sin = b.constant(
-            "rope.sin",
-            TensorType::f32(vec![cfg.max_pos, cfg.rotary_dim]),
-        );
-
-        let embed = b.constant(
-            "model.embed_tokens.weight",
-            TensorType::f32(vec![cfg.vocab, h]),
-        );
-        let x0 = b.gather_scalar(embed, 0, token);
-        let x0 = b.reshape(x0, vec![1, 1, h]);
-        let mut x = b.binary_scalar(BinOp::Mul, x0, Builder::f32(gp.embed_mult));
-
-        let mut state: Vec<(poot_graph_ir::Traced, poot_graph_ir::Traced)> =
-            Vec::with_capacity(2 * cfg.layers);
-
-        for li in 0..cfg.layers {
-            let p = |s: &str| format!("model.layers.{li}.{s}");
-
-            let ln1 = b.constant(&p("input_layernorm.weight"), TensorType::f32(vec![h]));
-            let normed = rmsnorm(&b, x, ln1, cfg.eps);
-
-            let wq = b.constant(
-                &p("self_attn.q_proj.weight"),
-                TensorType::f32(vec![h, q_dim]),
-            );
-            let wk = b.constant(
-                &p("self_attn.k_proj.weight"),
-                TensorType::f32(vec![h, kv_dim]),
-            );
-            let wv = b.constant(
-                &p("self_attn.v_proj.weight"),
-                TensorType::f32(vec![h, kv_dim]),
-            );
-            let wo = b.constant(
-                &p("self_attn.o_proj.weight"),
-                TensorType::f32(vec![q_dim, h]),
-            );
-
-            let q = linear(&b, normed, wq, None);
-            let k = linear(&b, normed, wk, None);
-            let v = linear(&b, normed, wv, None);
-
-            let q = b.reshape(q, vec![1, 1, hq, d]);
-            let k = b.reshape(k, vec![1, 1, hkv, d]);
-            let v = b.reshape(v, vec![1, 1, hkv, d]);
-            let q = b.transpose(q, vec![0, 2, 1, 3]);
-            let k = b.transpose(k, vec![0, 2, 1, 3]);
-            let v = b.transpose(v, vec![0, 2, 1, 3]);
-
-            let q = rope(&b, q, cos, sin, pos_slot);
-            let k = rope(&b, k, cos, sin, pos_slot);
-
-            let kcache = b.state_input(
-                &p("kv.k_cache"),
-                TensorType::f32(vec![1, hkv, cap, d]),
-                StateRole::Recurrent,
-            );
-            let vcache = b.state_input(
-                &p("kv.v_cache"),
-                TensorType::f32(vec![1, hkv, cap, d]),
-                StateRole::Recurrent,
-            );
-            let kcache_out = b.dynamic_update_slice_dyn(kcache, k, pos_slot, 2);
-            let vcache_out = b.dynamic_update_slice_dyn(vcache, v, pos_slot, 2);
-            state.push((kcache, kcache_out));
-            state.push((vcache, vcache_out));
-
-            let attn = attention_masked(&b, q, kcache_out, vcache_out, n_rep, gp.attn_mult, mask);
-            let attn = b.transpose(attn, vec![0, 2, 1, 3]);
-            let attn = b.reshape(attn, vec![1, 1, q_dim]);
-            let attn = linear(&b, attn, wo, None);
-            let attn = b.binary_scalar(BinOp::Mul, attn, Builder::f32(gp.residual_mult));
-            x = b.binary(BinOp::Add, x, attn);
-
-            let ln2 = b.constant(
-                &p("post_attention_layernorm.weight"),
-                TensorType::f32(vec![h]),
-            );
-            let normed = rmsnorm(&b, x, ln2, cfg.eps);
-            let wg = b.constant(
-                &p("mlp.gate_proj.weight"),
-                TensorType::f32(vec![h, cfg.inter]),
-            );
-            let wu = b.constant(
-                &p("mlp.up_proj.weight"),
-                TensorType::f32(vec![h, cfg.inter]),
-            );
-            let wd = b.constant(
-                &p("mlp.down_proj.weight"),
-                TensorType::f32(vec![cfg.inter, h]),
-            );
-            let gate = linear(&b, normed, wg, None);
-            let up = linear(&b, normed, wu, None);
-            let act = swiglu(&b, gate, up);
-            let m = linear(&b, act, wd, None);
-            let m = b.binary_scalar(BinOp::Mul, m, Builder::f32(gp.residual_mult));
-            x = b.binary(BinOp::Add, x, m);
-        }
-
-        let norm = b.constant("model.norm.weight", TensorType::f32(vec![h]));
-        let x = rmsnorm(&b, x, norm, cfg.eps);
-        let lm_head = b.constant("lm_head.weight", TensorType::f32(vec![h, cfg.vocab]));
-        let logits = linear(&b, x, lm_head, None);
-        let scaled = b.binary_scalar(BinOp::Mul, logits, Builder::f32(1.0 / gp.logits_scale));
-        b.finish_with_state(scaled, &state)
-    }
-}
-
 #[cfg(test)]
 mod family_tests {
-    use poot_graph_ir::rope_table::{RopeFlavor, rope_tables};
     use poot_load::gguf::GgufValue;
     use serde_json::json;
 
-    use super::legacy::{
-        GraniteParams, LegacyConfig, trace_granite_decode_kv_masked, trace_granite_prefill_kv,
-    };
     use super::*;
     use crate::components::standard::oracle::run_step;
     use crate::components::testing::{
-        CAP, Legacy, assert_bf16_and_q8_0_trace_through_the_packed_transform,
+        CAP, Recorded, assert_bf16_and_q8_0_trace_through_the_packed_transform,
         assert_chunked_prefill_equals_decode, assert_gguf_resolves_and_traces_packed,
-        assert_matches_legacy, assert_missing_weight_is_named, build as built, close, close_all,
-        f32_entry, gguf_dense_kvs, gguf_name_with_head, gguf_tensor, legacy_eval, q8_0_store,
-        read_back_owned, values,
+        assert_matches_recorded, assert_missing_weight_is_named, build as built, close, close_all,
+        f32_entry, gguf_dense_kvs, gguf_name_with_head, gguf_tensor, q8_0_store, read_back_owned,
+        values,
     };
     use crate::registry::Registry;
 
-    const VOCAB: usize = 48;
-
     fn is_projection(key: &str) -> bool {
         key.ends_with("_proj.weight")
-    }
-
-    fn legacy_cfg() -> LegacyConfig {
-        LegacyConfig {
-            vocab: VOCAB,
-            hidden: 64,
-            inter: 96,
-            layers: 2,
-            n_heads: 4,
-            n_kv_heads: 2,
-            head_dim: 16,
-            rotary_dim: 16,
-            eps: 1e-6,
-            max_pos: 64,
-            ..Default::default()
-        }
-    }
-
-    fn legacy_params() -> GraniteParams {
-        GraniteParams {
-            embed_mult: 2.0,
-            attn_mult: 0.2,
-            residual_mult: 0.5,
-            logits_scale: 2.0,
-        }
     }
 
     fn model_of(config: &serde_json::Value, store: &WeightStore) -> Box<dyn Model> {
@@ -803,34 +460,48 @@ mod family_tests {
         built(&ENTRY, &raw, store)
     }
 
-    /// SC-002 (ADR-0101 tiers 1 and 2): the standard-stack body equals the legacy granite prefill
-    /// and decode tracers on the fixture. Mutation: change the residual multiplier the family
-    /// passes (`with_residual_scale`); red.
+    /// SC-002 (ADR-0101 tiers 2 and 3): the standard-stack body gives the top-five logits recorded
+    /// from the per-mode granite tracers it replaced, over the fixture (token ids exact, logits
+    /// tier 2). Mutation: change the residual multiplier the family passes
+    /// (`with_residual_scale`); red.
     #[test]
-    fn granite_matches_the_legacy_tracers() {
+    fn granite_matches_the_recorded_legacy_logits() {
         let fx = fixture();
         let model = model_of(&fx.config, &fx.store);
-        let (cfg, gp) = (legacy_cfg(), legacy_params());
-        let tables = rope_tables(16, 64, 10_000.0, &RopeFlavor::Plain, None);
-        let host = [("rope.cos", tables.cos), ("rope.sin", tables.sin)];
-        let eval = |g: &Graph, tokens: &[i32], pos: &[i32], state: &[Vec<f32>]| {
-            legacy_eval(
-                g,
-                &fx.store,
-                &host,
-                &["model.embed_tokens.weight"],
-                tokens,
-                pos,
-                state,
-            )
-        };
-        assert_matches_legacy(
+        assert_matches_recorded(
             &*model,
             &fx.store,
-            &Legacy {
-                prefill: &|n| trace_granite_prefill_kv(cfg, gp, n, CAP),
-                decode: &trace_granite_decode_kv_masked(cfg, gp, CAP),
-                eval: &eval,
+            &Recorded {
+                prefill: [
+                    (13, 0.88173276),
+                    (46, 0.8056431),
+                    (26, 0.6313378),
+                    (37, 0.5623233),
+                    (33, 0.4459815),
+                ],
+                decode: [
+                    [
+                        (47, 1.1704509),
+                        (38, 1.0387655),
+                        (45, 0.81752884),
+                        (29, 0.6982854),
+                        (46, 0.67362595),
+                    ],
+                    [
+                        (24, 1.3668864),
+                        (46, 0.88934255),
+                        (0, 0.8467298),
+                        (47, 0.7711986),
+                        (1, 0.63357425),
+                    ],
+                    [
+                        (5, 1.0899231),
+                        (24, 1.0546522),
+                        (12, 0.83868855),
+                        (20, 0.83128154),
+                        (25, 0.7864492),
+                    ],
+                ],
             },
         );
     }

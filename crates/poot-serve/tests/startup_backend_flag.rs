@@ -2,6 +2,7 @@
 //! backend the build or the host cannot satisfy is refused at the process boundary, before the listener
 //! binds. A parse that dropped the flag and resolved `Auto` would name another device in the error.
 
+use poot_test_util::contained_child::ContainChild;
 use std::process::Command;
 
 #[path = "support/tiny_gguf.rs"]
@@ -24,6 +25,7 @@ fn run_with(args: &[&str]) -> (Option<i32>, String) {
     ));
     tiny_gguf::write_tiny_deepseek2_gguf(&path, 64);
     let mut child = Command::new(poot_serve_bin())
+        .contained()
         .arg(&path)
         .arg("127.0.0.1:0")
         .args(args)

@@ -37,8 +37,11 @@ pub enum Unsupported {
     /// A slot the traced program declares has no binding in the driver (no role names it).
     #[error("the program declares slot {key}, which the driver has no binding for")]
     UnboundSlot { key: String },
-    /// This build has no executor for the requested backend.
-    #[error("backend {backend:?} is not built into this binary")]
+    /// This build has no executor for the requested backend; the backend's cargo feature of the same
+    /// name (`--features {backend}`) builds it in.
+    #[error(
+        "backend {backend} is not built into this binary: rebuild with `--features {backend}` to enable it"
+    )]
     Backend { backend: &'static str },
     /// The draft policy cannot be served on this model or with this draft.
     #[error(transparent)]
@@ -142,9 +145,23 @@ pub enum InvalidRequest {
     /// The embedding rows a prompt supplies do not fit it.
     #[error(transparent)]
     Embeds(EmbedsError),
+    /// The sectioned positions a prompt supplies do not fit it or its model.
+    #[error(transparent)]
+    Mrope(MropeError),
     /// An encode request the driver cannot batch into one step.
     #[error(transparent)]
     Encode(EncodeError),
+}
+
+/// Why a prompt's sectioned (mRoPE) positions are refused.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum MropeError {
+    /// The positions cover `positions` tokens, the prompt has `prompt`.
+    #[error("sectioned positions cover {positions} tokens, the prompt has {prompt}")]
+    Length { positions: usize, prompt: usize },
+    /// The served model rotates at plain positions: it has no `Slot::MropePosition` to bind them to.
+    #[error("the model has no sectioned rotary positions: a prompt cannot supply them")]
+    NotSectioned,
 }
 
 /// Why a prompt's embedding rows are refused.
@@ -163,10 +180,14 @@ pub enum EmbedsError {
     /// The rows are not as wide as the model's embedding.
     #[error("embedding rows are {got} wide, the model's embedding is {want}")]
     Width { got: usize, want: usize },
-    /// A prefix block cache keys on tokens alone: a paged sequence cannot take embedding rows that
-    /// change what the same tokens mean.
-    #[error("a paged driver cannot serve a prompt with embedding rows")]
-    Paged,
+    /// Only the base weights have `PrefillEmbeds` entries: an adapter sequence cannot take embedding
+    /// rows.
+    #[error("a prompt with embedding rows cannot run under an adapter")]
+    Adapter,
+    /// A draft model prefills over the prompt's tokens and has no way to take the rows, so its
+    /// proposals for such a prompt would come from placeholder tokens.
+    #[error("a prompt with embedding rows cannot run under a draft-model speculation policy")]
+    DraftModel,
 }
 
 /// Why an encode request is refused.
@@ -190,6 +211,9 @@ pub enum EncodeError {
     },
     #[error("encode row {row}: a frame of {got} values, the step takes {want}")]
     FrameLength { row: usize, got: usize, want: usize },
+    /// The tower does not declare the grid inputs of a patch row (it is not a windowed vision tower).
+    #[error("the model takes no patch rows with a grid geometry")]
+    NoGeometry,
 }
 
 /// A [`DriverOptions`](crate::driver::DriverOptions) value the model cannot honor.
@@ -219,10 +243,10 @@ pub enum InvalidOptions {
     /// The contiguous layout is one private cache: one row.
     #[error("the contiguous layout serves one row")]
     ContiguousServesOneRow,
-    /// A model with recurrent state has no per-row state reset yet, so it serves one sequence at a
-    /// time in one row, without verify windows.
-    #[error("a model with recurrent state serves one sequence in one row, without verify windows")]
-    RecurrentServesOneSequence,
+    /// A verify window runs drafts the sequence may reject, and recurrent state has no rollback: the
+    /// rejected drafts would already have advanced it.
+    #[error("a model with recurrent state cannot verify a window of drafts")]
+    RecurrentHasNoVerifyWindows,
 }
 
 /// A new prepared entry the retention budget refuses. The entries already prepared stay usable and
@@ -301,6 +325,10 @@ pub enum DriverError {
     /// The device or the executor contract failed: one variant for every backend.
     #[error(transparent)]
     Device(ExecError),
+    /// An `Encode` step failed on the device and its executable was reset: the graph carries no state
+    /// a later step reads, so the failure cost only that step's request.
+    #[error("encode step failed, executable reset: {0}")]
+    EncodeStep(ExecError),
     /// Non-finite or unpickable logits reached the sampler (Card 601).
     #[error(transparent)]
     Sampler(SamplerFault),
@@ -309,6 +337,46 @@ pub enum DriverError {
     /// The text codec could not decode the generated tokens.
     #[error("detokenization: {0}")]
     Text(#[source] Box<TextError>),
+}
+
+/// How a [`DriverError`] relates to the request that met it and to the driver's state, which is what
+/// a server needs to answer with the right status and to know whether it may keep serving.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureClass {
+    /// The request itself cannot run (an empty or oversized prompt, an unknown adapter, rows that do not
+    /// fit). Nothing was applied: the driver is as it was.
+    Request,
+    /// A step failed on the device, but the driver proved its state intact (a stateless step's
+    /// executable was reset): that step's request is lost and the driver serves on.
+    Step,
+    /// The driver, as prepared, cannot serve this: a capability, a shape or a retention limit it does not
+    /// have. Nothing was applied: the driver is as it was.
+    Unsupported,
+    /// The device, the checkpoint or a half-applied call: the driver's state cannot be trusted.
+    Fault,
+}
+
+impl DriverError {
+    /// The class of this failure.
+    ///
+    /// An adapter that does not stack against the model is the request's: the one it named does not
+    /// fit. A sampler fault (no finite logit among a row's logits) is a request failure: the driver advances
+    /// its sequences only after every row picked, so the step left no trace.
+    pub fn class(&self) -> FailureClass {
+        match self {
+            DriverError::InvalidRequest(_)
+            | DriverError::Sampler(_)
+            | DriverError::Unsupported(Unsupported::Adapter(_)) => FailureClass::Request,
+            DriverError::EncodeStep(_) => FailureClass::Step,
+            DriverError::Unsupported(_)
+            | DriverError::InvalidOptions(_)
+            | DriverError::PreparedSet(_) => FailureClass::Unsupported,
+            DriverError::Model(_)
+            | DriverError::Device(_)
+            | DriverError::Load(_)
+            | DriverError::Text(_) => FailureClass::Fault,
+        }
+    }
 }
 
 impl From<Unsupported> for DriverError {

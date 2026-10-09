@@ -19,6 +19,7 @@ use poot_runtime::{
     BufferStorage, CachedDispatch, CompiledKernel, Context, DeviceBuffer, RuntimeError,
 };
 use poot_target::Backend;
+use std::num::NonZeroUsize;
 
 /// One loaded kernel: its compiled code and the plan key the pipeline cache and labels use.
 pub struct WgpuKernel {
@@ -29,7 +30,7 @@ pub struct WgpuKernel {
 enum Recorded {
     /// Each dispatch with its planner-owned watchdog work weight: `submit` splits a
     /// long run into several `submit_cached` calls once either bound is hit, the same constants
-    /// `GpuExecutor::flush_bounds` used.
+    /// the deleted `GpuExecutor::flush_bounds` used.
     Dispatches(Vec<(CachedDispatch, u64)>),
     Copy {
         src: DeviceBuffer,
@@ -62,6 +63,24 @@ impl WgpuDevice {
         })
     }
 
+    /// Like [`Self::new`], but every replay requests per-dispatch timestamps (Card 552), so
+    /// [`Device::device_time`] is `Measured` on an adapter with `TIMESTAMP_QUERY` (see
+    /// [`Self::has_device_timestamps`]). `max_in_flight_queries` bounds the un-drained readback resources.
+    pub fn new_with_device_timing(
+        max_in_flight_queries: NonZeroUsize,
+    ) -> Result<Self, RuntimeError> {
+        Ok(Self {
+            ctx: Context::new_with_device_timing(max_in_flight_queries.get())?,
+            open: None,
+        })
+    }
+
+    /// Whether the adapter can timestamp dispatches. A device built by [`Self::new_with_device_timing`]
+    /// on an adapter that cannot reports `DeviceTime::Unknown`.
+    pub fn has_device_timestamps(&self) -> bool {
+        self.ctx.timestamps_available()
+    }
+
     /// Diagnostic counters of the underlying context (bind groups, pipelines, submits).
     pub fn context(&self) -> &Context {
         &self.ctx
@@ -82,7 +101,7 @@ impl WgpuDevice {
     /// Card 552: always the one `submit_cached` method - whether it requests per-dispatch
     /// timestamps is `Context::device_timing`'s own decision, and the dispatch-index each chunk's
     /// records start at is `Context`'s own running counter (reset once per step by
-    /// `Context::discard_device_timing`, called from `Self::replay` below), not a parameter this
+    /// `Context::discard_device_timing`, called from `Self::begin_step` below), not a parameter this
     /// loop threads through.
     fn submit_chunked(&self, dispatches: &[(CachedDispatch, u64)]) -> Result<(), RuntimeError> {
         let mut start = 0;
@@ -202,19 +221,27 @@ impl Device for WgpuDevice {
 
     /// Card 552: discards any leftover pending/accumulated device timing from a previous
     /// step - one that failed after registering some but before `device_time()` ever drained it -
-    /// before this step's own replay registers anything new. `replay` is the one `Device` method
-    /// `Engine::step` calls unconditionally on every step (recording happens at most once per
-    /// entry; replay happens every time), so this is "the start of every step" in practice.
-    fn replay(&mut self, recording: &WgpuRecording) -> Result<(), RuntimeError> {
+    /// before this step's replays register anything new. `Engine::step` calls this once per step,
+    /// ahead of the first of its per-stage replays, which then accumulate into one step's timing.
+    fn begin_step(&mut self) -> Result<(), RuntimeError> {
         self.ctx.discard_device_timing();
+        Ok(())
+    }
+
+    fn replay(&mut self, recording: &WgpuRecording) -> Result<(), RuntimeError> {
         recording
             .items
             .iter()
             .try_for_each(|item| self.submit(item))
     }
 
-    fn write(&mut self, dst: &DeviceBuffer, bytes: &[u8]) -> Result<(), RuntimeError> {
-        self.ctx.write_bytes(dst, bytes)
+    fn write(
+        &mut self,
+        dst: &DeviceBuffer,
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), RuntimeError> {
+        self.ctx.write_bytes(dst, offset, bytes)
     }
 
     fn read(&mut self, src: &DeviceBuffer, out: &mut [u8]) -> Result<(), RuntimeError> {
@@ -251,7 +278,7 @@ impl Device for WgpuDevice {
         // reusable state. `begin` panics (not errors) on a double-open, so `self.open` is the only
         // state abort must clear.
         self.open = None;
-        // Card 552: defense in depth alongside `replay`'s own discard - a failed replay
+        // Card 552: defense in depth alongside `begin_step`'s own discard - a failed replay
         // (e.g. a mid-chunk submit error) reaches here too, and this guarantees no pending timing
         // survives into whatever runs next even if a future caller ever drives `replay` without
         // going through `Engine::step`.

@@ -43,6 +43,19 @@ pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     variants: &[],
 };
 
+/// The Qwen2.5-VL text tower: the qwen2 body with sectioned RoPE over `Slot::MropePosition`.
+pub const VL_FAMILY: FamilyKey = FamilyKey::new("qwen2_5_vl");
+
+/// The text tower's entry: registered beside the vision tower that feeds it
+/// ([`qwen_vl_vision`](crate::qwen_vl_vision)).
+pub(crate) const VL_ENTRY: FamilyEntry = FamilyEntry {
+    family: VL_FAMILY,
+    keys: &[(ConfigSource::HfModelType, "qwen2_5_vl")],
+    build: build_vl,
+    fixture: vl_fixture,
+    variants: &[],
+};
+
 /// qwen2's config facts: HF's `Qwen2Config` defaults, and llama.cpp's GGUF defaults (a `1e6` base
 /// when the GGUF omits it). The class declares no `eos_token_id`: a checkpoint names it.
 const SPEC: DenseSpec = DenseSpec {
@@ -72,14 +85,20 @@ pub struct Qwen2Params {
 
 impl Qwen2Params {
     pub fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
-        let fields = Fields::new(raw, FAMILY);
-        let dims = DenseDims::read(&fields, &SPEC)?;
+        Self::read(raw, FAMILY).map(|(params, _)| params)
+    }
+
+    /// The dimensions every qwen2-shaped config carries, errors reported for `family`.
+    fn read(raw: &RawConfig<'_>, family: FamilyKey) -> Result<(Self, DenseDims), ModelError> {
+        let spec = DenseSpec { family, ..SPEC };
+        let fields = Fields::new(raw, family);
+        let dims = DenseDims::read(&fields, &spec)?;
         if fields.flag(Field::hf("use_sliding_window"), false)? {
             return Err(fields.error("use_sliding_window", ConfigReason::Unsupported));
         }
-        let norm = dims.norm(&fields, &SPEC)?;
-        Ok(Self {
-            attention: dims.attention(&fields, &SPEC, true)?,
+        let norm = dims.norm(&fields, &spec)?;
+        let params = Self {
+            attention: dims.attention(&fields, &spec, true)?,
             layer: LayerParams::new(norm),
             stack: StackParams::new(norm),
             vocab: dims.vocab,
@@ -88,10 +107,110 @@ impl Qwen2Params {
             layers: dims.layers,
             max_positions: dims.max_positions,
             head_required: dims.head_required,
-            eos: dims.eos,
+            eos: dims.eos.clone(),
             bos: dims.bos,
-        })
+        };
+        Ok((params, dims))
     }
+
+    /// The Qwen2.5-VL text tower's config: the qwen2 dimensions of the checkpoint's top level, under
+    /// the conventions the sectioned body is written for. Anything else is refused, naming the
+    /// field: another model type (Qwen2-VL included), a checkpoint without QKV bias, a head width
+    /// other than `hidden_size / num_attention_heads`, a partial rotary, and a `mrope_section` that
+    /// is not three widths covering the rotary pairs exactly. The tower is HF-only (a GGUF config is
+    /// refused at `model_type`), and the old convention's `qk_norm=false` half has no analogue to
+    /// check: the qwen2 body holds no q/k norm tensors.
+    pub fn from_vl_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
+        let fields = Fields::new(raw, VL_FAMILY);
+        let RawConfig::HfJson { config, generation } = raw else {
+            return Err(fields.error("model_type", ConfigReason::Unsupported));
+        };
+        if config.get("model_type").and_then(|v| v.as_str()) != Some("qwen2_5_vl") {
+            return Err(fields.error("model_type", ConfigReason::Unsupported));
+        }
+        // The released config names its RoPE `mrope`: plain frequencies, whose sections are read below.
+        let plain = plain_rope_type(config);
+        let raw = &RawConfig::HfJson {
+            config: &plain,
+            generation: *generation,
+        };
+        if !fields.flag(Field::hf("attention_bias"), true)? {
+            return Err(fields.error("attention_bias", ConfigReason::Unsupported));
+        }
+        let (mut params, dims) = Self::read(raw, VL_FAMILY)?;
+        let natural = dims.width / dims.heads;
+        if !dims.width.is_multiple_of(dims.heads) || dims.head_dim != natural {
+            return Err(fields.error(
+                "head_dim",
+                ConfigReason::Mismatch {
+                    expected: natural,
+                    found: dims.head_dim,
+                },
+            ));
+        }
+        if let Some(factor) = fields.opt_f32(Field::hf("partial_rotary_factor"))?
+            && factor != 1.0
+        {
+            return Err(fields.error(
+                "partial_rotary_factor",
+                ConfigReason::Mismatch {
+                    expected: dims.head_dim,
+                    found: (dims.head_dim as f32 * factor) as usize,
+                },
+            ));
+        }
+        let sections = mrope_section(&fields, raw)?;
+        params.attention = params
+            .attention
+            .with_sectioned_rope(sections)
+            .map_err(|e| e.for_family(VL_FAMILY))?;
+        Ok(params)
+    }
+}
+
+/// `config` with the RoPE type `mrope` of its `rope_scaling` or `rope_parameters` block spelled
+/// `default`: the rotation's frequencies are plain, only the positions are sectioned.
+fn plain_rope_type(config: &serde_json::Value) -> serde_json::Value {
+    let mut config = config.clone();
+    for block in ["rope_scaling", "rope_parameters"] {
+        let Some(block) = config.get_mut(block).and_then(|b| b.as_object_mut()) else {
+            continue;
+        };
+        for key in ["type", "rope_type"] {
+            if block.get(key).and_then(|v| v.as_str()) == Some("mrope") {
+                block.insert(key.to_string(), "default".into());
+            }
+        }
+    }
+    config
+}
+
+/// The three section widths of `rope_scaling.mrope_section` (or `rope_parameters.mrope_section`):
+/// temporal, height and width, in rotary pairs.
+fn mrope_section(fields: &Fields<'_>, raw: &RawConfig<'_>) -> Result<[usize; 3], ModelError> {
+    const KEY: &str = "rope_scaling.mrope_section";
+    let RawConfig::HfJson { config, .. } = raw else {
+        return Err(fields.error(KEY, ConfigReason::Missing));
+    };
+    let section = ["rope_scaling", "rope_parameters"]
+        .iter()
+        .filter_map(|block| config.get(block)?.get("mrope_section"))
+        .find(|v| !v.is_null())
+        .ok_or(fields.error(KEY, ConfigReason::Missing))?;
+    let widths = section
+        .as_array()
+        .ok_or(fields.error(KEY, ConfigReason::WrongType))?;
+    if widths.len() != 3 {
+        return Err(fields.error(KEY, ConfigReason::Length { expected: 3 }));
+    }
+    let mut sections = [0usize; 3];
+    for (slot, width) in sections.iter_mut().zip(widths) {
+        *slot = width
+            .as_u64()
+            .and_then(|w| usize::try_from(w).ok())
+            .ok_or(fields.error(KEY, ConfigReason::WrongType))?;
+    }
+    Ok(sections)
 }
 
 #[derive(Debug)]
@@ -103,6 +222,7 @@ struct Layer {
 
 #[derive(Debug)]
 pub struct Qwen2 {
+    family: FamilyKey,
     params: Qwen2Params,
     weights: WeightMap,
     stack: StackWeights,
@@ -111,13 +231,25 @@ pub struct Qwen2 {
 }
 
 fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
-    let p = Qwen2Params::from_raw(raw)?;
+    build_from(FAMILY, Qwen2Params::from_raw(raw)?, raw, store)
+}
+
+fn build_vl(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+    build_from(VL_FAMILY, Qwen2Params::from_vl_raw(raw)?, raw, store)
+}
+
+fn build_from(
+    family: FamilyKey,
+    p: Qwen2Params,
+    raw: &RawConfig<'_>,
+    store: &WeightStore,
+) -> Result<Box<dyn Model>, ModelError> {
     let rows = match raw.source() {
         ConfigSource::HfModelType => HF_BASE,
         ConfigSource::GgufArchitecture => GGUF_BASE,
     };
-    let weights = family_weights(FAMILY, store, &[rows], p.layers, p.head_required)?;
-    let weight_error = |e: WeightError| e.for_family(FAMILY);
+    let weights = family_weights(family, store, &[rows], p.layers, p.head_required)?;
+    let weight_error = |e: WeightError| e.for_family(family);
     let stack = StackWeights::new(&weights, p.vocab, p.width).map_err(weight_error)?;
     let layers = (0..p.layers)
         .map(|l| {
@@ -130,7 +262,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         .collect::<Result<Vec<_>, WeightError>>()
         .map_err(weight_error)?;
     let config = ModelConfig {
-        family: FAMILY,
+        family,
         vocab: p.vocab,
         max_positions: p.max_positions,
         eos: p.eos.clone(),
@@ -141,6 +273,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         chat: ChatFormat::ChatML,
     };
     Ok(Box::new(Qwen2 {
+        family,
         params: p,
         weights,
         stack,
@@ -164,12 +297,17 @@ impl Model for Qwen2 {
         shape: StepShape,
     ) -> Result<Graph<ValidationOutputs>, TraceError> {
         let p = &self.params;
-        check_embeddable_step(FAMILY, phase, shape, p.max_positions)?;
+        check_embeddable_step(self.family, phase, shape, p.max_positions)?;
         let b = Builder::new();
         let step = match phase {
             Phase::Prefill | Phase::Decode => Step::new(&b, shape),
             Phase::PrefillEmbeds => Step::with_embeds(&b, shape, p.width),
             Phase::Encode => Step::new(&b, shape).returning_hidden(),
+        };
+        let step = if p.attention.is_sectioned() {
+            step.with_mrope(&b)
+        } else {
+            step
         };
         let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
             let layer = &self.layers[l];
@@ -204,6 +342,21 @@ pub(crate) fn fixture_config() -> serde_json::Value {
         "eos_token_id": 47,
         "bos_token_id": 1,
     })
+}
+
+/// The Qwen2.5-VL text tower's fixture config: the qwen2 fixture with the released config's keys
+/// (`model_type`, `rope_scaling` naming `mrope` and its sections over the 8 rotary pairs).
+fn vl_fixture_config() -> serde_json::Value {
+    let mut config = fixture_config();
+    config["model_type"] = "qwen2_5_vl".into();
+    config["rope_scaling"] = serde_json::json!({"type": "mrope", "mrope_section": [2, 3, 3]});
+    config
+}
+
+fn vl_fixture() -> Fixture {
+    let config = vl_fixture_config();
+    let shapes = hf_base_shapes(&config, true);
+    Fixture::bf16(config, shapes)
 }
 
 /// A tiny deterministic BF16 qwen2 checkpoint (`FamilyEntry::fixture`).

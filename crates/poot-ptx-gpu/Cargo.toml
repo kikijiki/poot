@@ -1,6 +1,6 @@
 [package]
 name = "poot-ptx-gpu"
-description = "PTX graph executor: run a poot-graph-ir Graph device-resident on NVIDIA (the PTX twin of poot-gpu's run_resident_kv)"
+description = "PTX device backend: the poot-executor Device implementation for NVIDIA, device-resident"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

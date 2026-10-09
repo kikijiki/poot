@@ -7,6 +7,8 @@
 //! - [`streamed_in_pieces`]: a long scan stepped in short pieces through the entry's committed state, assembled into
 //!   the one packed result a single launch over the whole sequence must equal.
 //! - [`measure`]: median step time of a scan, for timing receipts.
+//! - [`device_time_of_step`], [`timed_step`]: the [`DeviceTime`] a device reports for one scan step
+//!   (POOT-1072), and that step's packed result.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -175,6 +177,42 @@ fn step_once(
         step_inputs.push(key, bound[&id].shape(), bound[&id].view());
     }
     exec.step(exe, entry, &step_inputs, &mut NoSync)?.to_host()
+}
+
+/// The [`DeviceTime`] `exec` reports for one step of the scan `fixture` on `target`: the entry is
+/// loaded, stepped once, and unloaded. The device's own answer, so a backend built without device
+/// timing returns `Unknown` and one built with it returns `Measured`.
+pub fn device_time_of_step(
+    exec: &mut dyn Executor,
+    target: Target,
+    fixture: &ScanFixture,
+) -> DeviceTime {
+    timed_step(exec, target, fixture).0
+}
+
+/// One scan step's [`DeviceTime`] and its packed result, so a caller can compare a timed device's
+/// result with an untimed one's (timing must not change results).
+pub fn timed_step(
+    exec: &mut dyn Executor,
+    target: Target,
+    fixture: &ScanFixture,
+) -> (DeviceTime, Vec<f32>) {
+    let scan = fixture.packed_slot_graph();
+    let (exe, entry) = load_entry(exec, target, &scan, "device time");
+    let bound = fixture.bind(&scan, &fixture.inputs(7));
+    let mut step_inputs = StepInputs::new();
+    for &id in &scan.operands[..scan.operands.len() - 1] {
+        let key = scan.graph.meta(id).slot_key().unwrap().clone();
+        step_inputs.push(key, bound[&id].shape(), bound[&id].view());
+    }
+    let mut out = exec
+        .step(exe, entry, &step_inputs, &mut NoSync)
+        .expect("the scan steps");
+    let time = out.device_time();
+    let packed = out.to_host().expect("the packed result reads back");
+    drop(out);
+    exec.unload(exe).unwrap();
+    (time, packed.as_f32().unwrap().to_vec())
 }
 
 /// One scan's step time: the host wall time of a step (inputs staged, output read back) and, where the

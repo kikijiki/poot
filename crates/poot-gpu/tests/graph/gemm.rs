@@ -1249,7 +1249,7 @@ fn chunked_large_tiled_gemm_gpu_matches_cpu() {
         );
     }
     let max_abs = max_abs_error(got.as_f32().unwrap(), cpu.as_f32().unwrap());
-    // Card 546b: the old host-roundtrip `run()` and device-resident `run_resident_kv` were two
+    // Card 546b: the deleted host-roundtrip `run()` and device-resident `run_resident_kv` were two
     // separate executor code paths, so a >= 2^15-tile chunked GEMM needed checking on both. The
     // contract has one execution path (`add_entry`/`step`, via `run_via_contract` above), already
     // GPU-resident across replays, so there is no second path left to separately re-check here.

@@ -99,9 +99,9 @@ fn f16_matmul_compiles_valid_spirv_and_matches_cpu_on_radv() {
     let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.1 - 0.3).collect();
     let b_data: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.05 + 0.2).collect();
     let a_buf = ctx.alloc_storage(BufferRole::Input, BufferStorage::f16(), m * k);
-    ctx.write_bytes(&a_buf, &f16_encode(&a_data)).unwrap();
+    ctx.write_bytes(&a_buf, 0, &f16_encode(&a_data)).unwrap();
     let b_buf = ctx.alloc_storage(BufferRole::Input, BufferStorage::f16(), k * n);
-    ctx.write_bytes(&b_buf, &f16_encode(&b_data)).unwrap();
+    ctx.write_bytes(&b_buf, 0, &f16_encode(&b_data)).unwrap();
     let out_buf = ctx.alloc_storage(BufferRole::Output, BufferStorage::f16(), m * n);
     ctx.dispatch_dev(
         "f16mm",

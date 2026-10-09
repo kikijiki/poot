@@ -123,7 +123,7 @@ fn a_vulkan_buffer_moves_into_another_thread() {
         .allocate(BufferRole::Input, BufferStorage::f32(), 4)
         .unwrap();
     device
-        .write(&buffer, &f32_bytes(&[1.0, 2.0, 3.0, 4.0]))
+        .write(&buffer, 0, &f32_bytes(&[1.0, 2.0, 3.0, 4.0]))
         .unwrap();
     let clone = buffer.clone();
     let reader = std::thread::spawn(move || {
@@ -152,7 +152,7 @@ fn f32_buffer(
     let buffer = device
         .allocate(role, BufferStorage::f32(), values.len())
         .unwrap();
-    device.write(&buffer, &f32_bytes(values)).unwrap();
+    device.write(&buffer, 0, &f32_bytes(values)).unwrap();
     buffer
 }
 
@@ -278,8 +278,8 @@ fn copy_round_trips_every_element_width_with_no_sentinel_left() {
         let src = device.allocate(BufferRole::Input, storage, elems).unwrap();
         let dst = device.allocate(BufferRole::Output, storage, elems).unwrap();
         let payload: Vec<u8> = (0..elems * width).map(|i| i as u8 + 1).collect();
-        device.write(&src, &payload).unwrap();
-        device.write(&dst, &vec![0xAA; dst.byte_len()]).unwrap();
+        device.write(&src, 0, &payload).unwrap();
+        device.write(&dst, 0, &vec![0xAA; dst.byte_len()]).unwrap();
         device.begin(Submission::Replay).unwrap();
         device.copy(&src, &dst).unwrap();
         let recording = device.finish().unwrap().expect("a recording");
@@ -317,7 +317,7 @@ fn a_long_recording_is_cut_into_several_submissions_and_replays_exactly() {
     let ping = f32_buffer(&mut device, BufferRole::Activation, &[0.0; 4]);
     let pong = f32_buffer(&mut device, BufferRole::Activation, &[0.0; 4]);
     let chain = |device: &mut VulkanDevice, dispatches: usize, work: u64| {
-        device.write(&ping, &f32_bytes(&[0.0; 4])).unwrap();
+        device.write(&ping, 0, &f32_bytes(&[0.0; 4])).unwrap();
         device.begin(Submission::Replay).unwrap();
         for i in 0..dispatches {
             let (src, dst) = if i % 2 == 0 {
@@ -396,6 +396,7 @@ fn a_kernel_assert_is_a_fault_raised_at_synchronize() {
     device
         .write(
             &idx,
+            0,
             &[3i32, 0, 4, 1]
                 .iter()
                 .flat_map(|v| v.to_le_bytes())
@@ -447,6 +448,7 @@ fn a_kernel_assert_is_a_fault_raised_at_synchronize() {
     device
         .write(
             &idx,
+            0,
             &[3i32, 0, 2, 1]
                 .iter()
                 .flat_map(|v| v.to_le_bytes())
@@ -508,4 +510,45 @@ fn memory_counters_charge_the_roles_a_decode_entry_allocates_as_wgpu_does() {
             "{role:?} live bytes: vulkan {on_vulkan:?} wgpu {on_wgpu:?}"
         );
     }
+}
+
+/// POOT-1081: the raw Vulkan device reports what it could still allocate right now, read from
+/// `VK_EXT_memory_budget` at the call, not the open-time ceiling repeated: it sits within the ceiling the
+/// device reported at open, and it falls by about what a held allocation takes.
+///
+/// Mutation: `free_memory_bytes` returns `None` and the first assertion goes red; it returns the open-time
+/// ceiling (cached, not read live) and the drop assertion goes red; it returns `u64::MAX` and the ceiling
+/// assertion goes red.
+#[test]
+fn the_vulkan_device_reports_live_free_memory_within_its_open_time_ceiling() {
+    const HELD_ELEMS: usize = 64 << 20; // 256 MiB of f32
+    let Some(mut device) = vulkan() else {
+        return;
+    };
+    let ceiling = device
+        .target()
+        .caps
+        .memory_budget_bytes
+        .expect("the vulkan device queried its heap budget at open");
+    let free = device
+        .free_memory_bytes()
+        .expect("the vulkan device reports live free memory");
+    assert!(
+        free > 0,
+        "a device with no free memory cannot run this test"
+    );
+    assert!(
+        free <= ceiling,
+        "free {free} is over the open-time ceiling {ceiling}"
+    );
+    let held = device
+        .allocate(BufferRole::Activation, BufferStorage::f32(), HELD_ELEMS)
+        .unwrap();
+    let after = device.free_memory_bytes().unwrap();
+    let taken = (HELD_ELEMS * 4) as u64;
+    assert!(
+        free.saturating_sub(after) >= taken / 2,
+        "holding {taken} bytes moved free memory from {free} to {after}"
+    );
+    drop(held);
 }

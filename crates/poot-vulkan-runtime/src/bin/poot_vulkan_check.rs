@@ -21,7 +21,7 @@ fn upload_f32(ctx: &Context, role: BufferRole, data: &[f32]) -> DeviceBuffer {
         .alloc_storage(role, BufferStorage::f32(), data.len())
         .expect("alloc_storage");
     let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-    buf.write_bytes(&bytes).expect("write_bytes");
+    buf.write_bytes(0, &bytes).expect("write_bytes");
     buf
 }
 

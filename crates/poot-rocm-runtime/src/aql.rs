@@ -103,14 +103,18 @@ impl KernargAddress for RocmBuffer {
 pub(crate) struct AqlRingWriter<'a, K: KernargAddress> {
     pub(crate) dispatches: &'a [(KernelHandle, K, DispatchGeometry)],
     pub(crate) completion: bindings::hsa_signal_t,
+    /// The completion signals of every packet before the final one, in packet order, when the
+    /// dispatches are individually timed; empty otherwise, and those packets carry the null signal.
+    pub(crate) dispatch_signals: &'a [bindings::hsa_signal_t],
     pub(crate) ring: *mut bindings::hsa_kernel_dispatch_packet_t,
     pub(crate) header: u16,
 }
 
 impl<K: KernargAddress> AqlRingWriter<'_, K> {
     /// Write `dispatches[packet_index]`'s packet body into `ring[slot_index]` through the shared
-    /// [`write_kernel_dispatch_packet_body`], leaving the header `INVALID`. Only the final packet
-    /// carries the completion signal; earlier ones get the null signal.
+    /// [`write_kernel_dispatch_packet_body`], leaving the header `INVALID`. The final packet
+    /// carries the completion signal; an earlier one carries its `dispatch_signals` entry when the
+    /// dispatches are timed, else the null signal.
     pub(crate) fn write_body(
         &mut self,
         packet_index: usize,
@@ -130,7 +134,10 @@ impl<K: KernargAddress> AqlRingWriter<'_, K> {
                 if is_final_packet {
                     self.completion
                 } else {
-                    bindings::hsa_signal_t { handle: 0 }
+                    self.dispatch_signals
+                        .get(packet_index)
+                        .copied()
+                        .unwrap_or(bindings::hsa_signal_t { handle: 0 })
                 },
             );
         }

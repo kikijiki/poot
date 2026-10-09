@@ -3,6 +3,7 @@
 //! by that suffix. Nothing of the loop is reimplemented here; the tests read what the server answers and
 //! what its `/metrics` reports.
 
+use poot_test_util::contained_child::ContainChild;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -51,6 +52,7 @@ impl Server {
             .local_addr()
             .unwrap();
         let child = Command::new(poot_serve_bin())
+            .contained()
             .arg(&model)
             .arg(addr.to_string())
             .args(["--backend", backend])

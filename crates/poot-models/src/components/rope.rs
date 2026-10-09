@@ -7,7 +7,7 @@
 //! positions.
 
 use poot_graph_ir::rope_table::{RopeFlavor, RopeSpec, RopeSpecError, RopeTable, rope_tables};
-use poot_graph_ir::{BinOp, Builder, Traced, UnOp};
+use poot_graph_ir::{BinOp, Builder, Traced, UnOp, ops};
 
 use poot_quant::weights::WeightEntry;
 use poot_tensor::DType;
@@ -29,6 +29,7 @@ enum RopePairing {
 pub struct RopeParams {
     spec: RopeSpec,
     pairing: RopePairing,
+    sections: Option<[usize; 3]>,
 }
 
 fn positive(field: &'static str, value: f32) -> Result<f32, ParamError> {
@@ -97,7 +98,41 @@ impl RopeParams {
         Ok(Self {
             spec,
             pairing: RopePairing::HalfSplit,
+            sections: None,
         })
+    }
+
+    /// Sectioned ("mRoPE") rotation: the rotary pairs split into temporal, height and width groups
+    /// of `sections` pairs each, every group rotating at its own axis of `Slot::MropePosition`
+    /// ([`rope_sectioned_rows`]). The widths sum to half the rotary width; an interleaved pairing has
+    /// no sectioned form.
+    pub fn sectioned(self, sections: [usize; 3]) -> Result<Self, ParamError> {
+        const FIELD: &str = "rope_scaling.mrope_section";
+        if self.pairing != RopePairing::HalfSplit {
+            return Err(ParamError::new(FIELD, ConfigReason::Unsupported));
+        }
+        let pairs = sections
+            .iter()
+            .try_fold(0usize, |sum, &width| sum.checked_add(width))
+            .ok_or(ParamError::new(FIELD, ConfigReason::Overflow))?;
+        if pairs != self.rotary() / 2 {
+            return Err(ParamError::new(
+                FIELD,
+                ConfigReason::Mismatch {
+                    expected: self.rotary() / 2,
+                    found: pairs,
+                },
+            ));
+        }
+        Ok(Self {
+            sections: Some(sections),
+            ..self
+        })
+    }
+
+    /// The section widths of a sectioned rotation, in rotary pairs.
+    pub fn sections(self) -> Option<[usize; 3]> {
+        self.sections
     }
 
     /// The same rotation over adjacent even/odd dim pairs ([`RopePairing::Interleaved`]).
@@ -121,6 +156,7 @@ impl RopeParams {
             .map_err(|reason| ParamError::new(field, reason))?;
         Ok(Self {
             pairing: self.pairing,
+            sections: self.sections,
             ..Self::new(self.rotary(), self.spec.theta(), &flavor)?
         })
     }
@@ -372,6 +408,42 @@ pub fn rope_rows(b: &Builder, p: RopeParams, pos: Traced, capacity: usize) -> Ro
     }
 }
 
+/// Rotate `x` (`[rows, heads, tokens, head_dim]`) by `p`'s sectioned rotation at the three axes of
+/// `mrope` (`[3, rows * tokens]` I32, axis-major temporal, height, width): `ops::rope_sectioned`
+/// over the tables of `p`, each section's pairs taking their cos/sin from their own axis. Equal
+/// axes give the plain rotation at that position. `p` must be [`RopeParams::sectioned`].
+pub fn apply_rope_sectioned(
+    b: &Builder,
+    p: RopeParams,
+    x: Traced,
+    mrope: Traced,
+    capacity: usize,
+) -> Traced {
+    let sections = p
+        .sections
+        .expect("apply_rope_sectioned needs a sectioned RopeParams");
+    let shape = b.aval(x).shape;
+    let (rows, tokens) = (shape[0], shape[2]);
+    let table = |table| {
+        let computed = p
+            .spec
+            .computed(table, capacity)
+            .expect("a step's capacity fits a u32: StepShape capacities are checked by the model");
+        b.computed(computed)
+    };
+    let axes: Vec<Traced> = (0..3)
+        .map(|axis| b.reshape(b.slice(mrope, 0, axis, axis + 1), vec![rows, 1, tokens]))
+        .collect();
+    ops::rope_sectioned(
+        b,
+        x,
+        table(RopeTable::Cos),
+        table(RopeTable::Sin),
+        &axes,
+        &sections,
+    )
+}
+
 /// The rows of `p`'s tables at positions `0, stride, 2 * stride, ..`, `count` of them, for `rows`
 /// sequences: `[rows, 1, count, rotary]`, rows of compressed windows that start at every `stride`th
 /// position (known at trace time, so a view of the table and no gather). `count * stride` must not
@@ -511,6 +583,85 @@ mod tests {
             }
             oracle::assert_matches_f64(&got, &want, 1e-5);
         }
+    }
+
+    /// Sectioned RoPE rotates each rotary pair at its own axis: pairs `0..1` by the temporal id, `1..3`
+    /// by the height id and `3..4` by the width id (sections `[1, 2, 1]` over 4 pairs), against an
+    /// f64 reference whose axes differ at every token. Mutation: swap the first two section widths
+    /// in `apply_rope_sectioned`; the pairs change axis and this goes red.
+    #[test]
+    fn sectioned_rope_rotates_each_pair_at_its_sections_axis() {
+        let (heads, t, d, cap) = (2, 3, 8, 16);
+        let theta = 10_000.0f32;
+        let sections = [1usize, 2, 1];
+        let axes: [[i32; 3]; 3] = [[5, 6, 11], [2, 3, 3], [7, 9, 4]];
+        let packed: Vec<i32> = axes.iter().flatten().copied().collect();
+        let x = oracle::random(heads * t * d, 23);
+        let p = RopeParams::new(d, theta, &RopeFlavor::Plain)
+            .unwrap()
+            .sectioned(sections)
+            .unwrap();
+        let b = Builder::new();
+        let ms = b.slot(Slot::MropePosition, TensorType::new(vec![3, t], DType::I32));
+        let xs = b.constant("x", TensorType::f32(vec![1, heads, t, d]));
+        let y = apply_rope_sectioned(&b, p, xs, ms, cap);
+        let got = Fx::new(0)
+            .eval(
+                &b.finish(y),
+                &[("x", &x)],
+                &[(Slot::MropePosition, &packed)],
+                &[],
+            )
+            .0;
+        let axis_of_pair = |j: usize| match j {
+            0 => 0,
+            1..3 => 1,
+            _ => 2,
+        };
+        let position_of = |pair: usize, token: usize| axes[axis_of_pair(pair)][token];
+        let half = d / 2;
+        let mut want: Vec<f64> = x.iter().map(|&v| f64::from(v)).collect();
+        for h in 0..heads {
+            for i in 0..t {
+                let base = (h * t + i) * d;
+                for j in 0..half {
+                    let position = position_of(j, i);
+                    let inv = f64::from(theta).powf(-((2 * j) as f64) / d as f64);
+                    let (s, c) = (f64::from(position) * inv).sin_cos();
+                    let (a, bb) = (f64::from(x[base + j]), f64::from(x[base + half + j]));
+                    want[base + j] = a * c - bb * s;
+                    want[base + half + j] = bb * c + a * s;
+                }
+            }
+        }
+        oracle::assert_matches_f64(&got, &want, 1e-5);
+    }
+
+    /// A sectioned rotation is refused unless its widths cover the rotary pairs exactly, fit
+    /// `usize`, and the pairing is half-split.
+    #[test]
+    fn sectioned_rope_widths_are_checked_against_the_rotary_pairs() {
+        let plain = RopeParams::new(8, 10_000.0, &RopeFlavor::Plain).unwrap();
+        let field = "rope_scaling.mrope_section";
+        assert!(plain.sectioned([1, 2, 1]).is_ok());
+        assert_eq!(
+            plain.sectioned([1, 1, 1]),
+            Err(ParamError::new(
+                field,
+                ConfigReason::Mismatch {
+                    expected: 4,
+                    found: 3
+                }
+            ))
+        );
+        assert_eq!(
+            plain.sectioned([usize::MAX, 1, 1]),
+            Err(ParamError::new(field, ConfigReason::Overflow))
+        );
+        assert_eq!(
+            plain.interleaved().sectioned([1, 2, 1]),
+            Err(ParamError::new(field, ConfigReason::Unsupported))
+        );
     }
 
     /// SC-001: interleaved RoPE rotates each adjacent (2j, 2j + 1) pair by `theta^(-2j/rotary)`

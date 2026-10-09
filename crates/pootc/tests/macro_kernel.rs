@@ -2,6 +2,7 @@
 //! by the macro into `__poot_kernel_add`, which `pootc` discovers, imports, and compiles to a dispatchable
 //! SPIR-V module that runs on the GPU. The proc-macro artifact is wired in via `--extern`.
 
+use poot_test_util::contained_child::ContainChild;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeSet, HashMap};
 use std::env::consts::DLL_EXTENSION;
@@ -171,6 +172,7 @@ fn kernel_attribute_is_discovered_by_pootc() {
     let out_dir = std::env::temp_dir().join("pootc-macro-add");
     std::fs::create_dir_all(&out_dir).unwrap();
     let output = Command::new(&exe)
+        .contained()
         .args(["--edition", "2021", "--crate-type", "lib", kernel, "-o"])
         .arg(out_dir.join("add.out"))
         .arg("--extern")
@@ -327,6 +329,7 @@ fn host_pass_wrapper_dispatches_using_the_bodys_real_trap_and_schema() {
     // does.
     let intrinsics = build_kernel_intrinsics_rmeta();
     let device_pass = Command::new(&exe)
+        .contained()
         .args(["--edition", "2021", "--crate-type", "lib", kernel_src, "-o"])
         .arg(out_dir.join("add.out"))
         .arg("--extern")
@@ -412,6 +415,7 @@ fn main() {
         .collect();
     let bin_out = out_dir.join(format!("add_host{}", std::env::consts::EXE_SUFFIX));
     let mut host_pass = Command::new(&exe);
+    host_pass.contained();
     host_pass
         .args(["--edition", "2021", "--crate-type", "bin", "-o"])
         .arg(&bin_out)
@@ -447,6 +451,7 @@ fn main() {
 
     let _gpu = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let run = Command::new(&bin_out)
+        .contained()
         .output()
         .expect("run the compiled host-pass probe binary");
     let stdout = String::from_utf8_lossy(&run.stdout);

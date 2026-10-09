@@ -13,7 +13,6 @@ use poot_models::model::{Model, ModelConfig};
 use poot_models::registry::{FamilyEntry, RawConfig, Registry};
 use poot_quant::weights::WeightStore;
 
-use crate::core::modality::Modality;
 use crate::driver::error::{DriverError, LoadError, Unsupported};
 use crate::text::tokenize::TextCodec;
 
@@ -127,9 +126,11 @@ fn io_error(path: &Path) -> impl FnOnce(std::io::Error) -> LoadError + '_ {
 
 fn read_json(path: &Path) -> Result<serde_json::Value, LoadError> {
     let bytes = std::fs::read(path).map_err(io_error(path))?;
-    serde_json::from_slice(&bytes).map_err(|source| LoadError::Json {
-        path: path.to_path_buf(),
-        source,
+    poot_load::packed_safetensors::parse_json_unique_keys(&bytes).map_err(|source| {
+        LoadError::Json {
+            path: path.to_path_buf(),
+            source,
+        }
     })
 }
 
@@ -257,15 +258,6 @@ impl ModelHandle {
 
     pub fn config(&self) -> &ModelConfig {
         self.model.config()
-    }
-
-    /// Whether this model has a front end for `modality`, that is, a way to turn that input into
-    /// embeddings. A handle is a text model: its only front end is the token embedding, so it takes
-    /// [`Modality::Text`] and nothing else. A multimodal checkpoint's front end is its own type
-    /// ([`crate::front_end::Idefics3`]) over the towers' handles. A caller decides on this answer,
-    /// never on the model family.
-    pub fn accepts_modality(&self, modality: Modality) -> bool {
-        modality == Modality::Text
     }
 
     pub fn text(&self) -> &TextCodec {

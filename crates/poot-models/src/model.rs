@@ -97,8 +97,13 @@ pub enum KvLayout {
     /// writes through per-step slot maps bound as `Slot::SlotMap` (`"read"`: logical position to pool
     /// slot, `[rows, capacity]`; `"write"`: pool slot to the step's flat token index or -1,
     /// `[pool_slots]`), so a row's blocks may sit anywhere in the pool and a token whose write map
-    /// entry is -1 (a padding token) leaves the pool untouched.
-    Paged { pool_slots: NonZeroUsize },
+    /// entry is -1 (a padding token) leaves the pool untouched. Recurrent state is pooled the same way:
+    /// one row per sequence the pool serves (`seqs`), which a step's rows address through the
+    /// `state_read` and `state_write` index inputs (`Step::recurrent`).
+    Paged {
+        pool_slots: NonZeroUsize,
+        seqs: NonZeroUsize,
+    },
 }
 
 /// Which positions of a step produce logits.
@@ -151,6 +156,13 @@ pub enum ConfigReason {
     Length {
         expected: usize,
     },
+    /// A value that must equal a width the rest of the config fixes (a head width, a rotary width).
+    Mismatch {
+        expected: usize,
+        found: usize,
+    },
+    /// A sum or product that does not fit `usize`.
+    Overflow,
 }
 
 /// Why a family refuses a step shape.
@@ -165,9 +177,10 @@ pub enum ShapeReason {
     Granule {
         granule: usize,
     },
-    /// A carried state value whose leading axis is not the row axis: its
-    /// leading axis has `leading` entries where the step has `rows` rows. A paged KV pool is the one
-    /// exception, and only as the pooled `Positional` cache on axis 0.
+    /// A carried state value whose leading axis is not its row axis: its leading axis has `leading`
+    /// entries where it should have `rows` (the step's rows, or under a paged layout a recurrent
+    /// state's one row per sequence the pool serves). A paged KV pool is the one exception, and only as
+    /// the pooled `Positional` cache on axis 0.
     StateRowAxis {
         leading: usize,
         rows: usize,

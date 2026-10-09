@@ -25,15 +25,17 @@ use std::num::NonZeroU64;
 
 use poot_graph_ir::op::SampleRule;
 use poot_models::model::{KvLayout, LogitRows, Phase, StepShape};
+use poot_models::mrope::MropePositionIds;
 
 use super::block_table::{BLOCK_SIZE, PagedKvCache, PoolExhausted};
 use super::caps::{Layout, PoolShape, StateResidency};
 use super::chunks::Piece;
 use super::embeds::PromptEmbeds;
-use super::error::{DriverError, EmbedsError, InvalidRequest, PreparedSetRefusal};
-use super::lora::AdapterRef;
+use super::error::{DriverError, EmbedsError, InvalidRequest, MropeError, PreparedSetRefusal};
+use super::lora::{AdapterRef, GenerationId};
+use super::mrope::rotary_position;
 use super::prefix_cache::{PrefixIdentity, PrefixOutcome, PrefixSkip};
-use super::speculate::{self, NotSpeculated, Proposal, RowSpeculation, SpecRow};
+use super::speculate::{self, DraftPolicy, NotSpeculated, Proposal, RowSpeculation, SpecRow};
 use super::suffix::{self, Head, SuffixRows};
 use super::{Driver, EntryKey, ModelRole, SlotRole, StepData, host_sample};
 use crate::core::sampler::{Sampler, TokenLogprob};
@@ -119,6 +121,7 @@ pub struct RowResult {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Release {
     Finished,
+    /// The sequence will be recomputed. One opened with `open_with_embeds` must be reopened with it.
     Preempted,
 }
 
@@ -142,6 +145,9 @@ pub(super) struct Seq {
     /// Rows the prompt supplies in place of its tokens' embeddings, bound on every prefill step
     /// that covers one.
     embeds: Option<PromptEmbeds>,
+    /// The sectioned rotary positions of the prompt, bound on every step; absent, every token
+    /// rotates at its text position.
+    mrope: Option<MropePositionIds>,
 }
 
 /// Where the open sequences keep their K/V.
@@ -280,6 +286,64 @@ pub(super) enum Readback {
     },
 }
 
+impl Readback {
+    /// One readback in row order from the readbacks of `groups` of rows (`groups[g]` lists the rows
+    /// readback `g` covers, in the order it holds them).
+    fn merge(readbacks: Vec<Readback>, groups: &[Vec<usize>]) -> Readback {
+        let mut readbacks = readbacks;
+        if readbacks.len() == 1 {
+            return readbacks.remove(0);
+        }
+        let rows = groups.iter().map(Vec::len).sum::<usize>();
+        match readbacks.first() {
+            Some(Readback::Tokens(_)) => {
+                let mut tokens = vec![Vec::new(); rows];
+                for (readback, group) in readbacks.into_iter().zip(groups) {
+                    let Readback::Tokens(group_tokens) = readback else {
+                        unreachable!("every group of a step runs the same head")
+                    };
+                    for (&row, picked) in group.iter().zip(group_tokens) {
+                        tokens[row] = picked;
+                    }
+                }
+                Readback::Tokens(tokens)
+            }
+            Some(Readback::Logits {
+                vocab, positions, ..
+            }) => {
+                let (vocab, positions) = (*vocab, *positions);
+                let stride = positions * vocab;
+                let mut merged = vec![0.0; rows * stride];
+                for (readback, group) in readbacks.into_iter().zip(groups) {
+                    let Readback::Logits {
+                        rows: group_rows,
+                        vocab: group_vocab,
+                        positions: group_positions,
+                    } = readback
+                    else {
+                        unreachable!("every group of a step runs the same head")
+                    };
+                    assert_eq!(
+                        (group_vocab, group_positions),
+                        (vocab, positions),
+                        "the groups of a step read the same logits"
+                    );
+                    for (k, &row) in group.iter().enumerate() {
+                        merged[row * stride..(row + 1) * stride]
+                            .copy_from_slice(&group_rows[k * stride..(k + 1) * stride]);
+                    }
+                }
+                Readback::Logits {
+                    rows: merged,
+                    vocab,
+                    positions,
+                }
+            }
+            None => unreachable!("a step runs at least one group"),
+        }
+    }
+}
+
 /// The phase a serving entry traces: a single-token step is the decode step whether its rows decode or
 /// prefill their last prompt token (the graphs are the same), so a deployment that serves one-token
 /// steps prepares one entry per row count, not two.
@@ -296,6 +360,15 @@ impl Driver {
     /// rest of the prompt and `max_new` tokens. A pool that cannot hold it, after dropping cached
     /// prefixes nothing references, is [`Admission::NoRoom`].
     pub fn open(&mut self, request: SeqRequest<'_>) -> Result<Admission, DriverError> {
+        self.open_seq(request, None, None)
+    }
+
+    fn open_seq(
+        &mut self,
+        request: SeqRequest<'_>,
+        embeds: Option<PromptEmbeds>,
+        mrope: Option<MropePositionIds>,
+    ) -> Result<Admission, DriverError> {
         let capacity = self.options.capacity.get();
         let SeqRequest {
             prompt,
@@ -322,10 +395,20 @@ impl Driver {
         let reused = match &mut serving.kv {
             KvStore::Contiguous => 0,
             KvStore::Paged { cache, .. } => {
-                let mut admitted = cache.admit_prefix_for(slot, prompt, max_new, identity);
+                // Embedding rows change what the same tokens mean: such a prompt reuses no cached prefix.
+                let admit = |cache: &mut PagedKvCache| {
+                    if embeds.is_some() {
+                        cache
+                            .admit_unshared(slot, prompt.len(), max_new)
+                            .map(|()| 0)
+                    } else {
+                        cache.admit_prefix_for(slot, prompt, max_new, identity)
+                    }
+                };
+                let mut admitted = admit(cache);
                 if admitted.is_err() {
                     cache.evict_prefix();
-                    admitted = cache.admit_prefix_for(slot, prompt, max_new, identity);
+                    admitted = admit(cache);
                 }
                 match admitted {
                     Ok(reused) => reused,
@@ -355,21 +438,21 @@ impl Driver {
                 identity,
                 seeded: false,
                 pending: Vec::new(),
-                embeds: None,
+                embeds,
+                mrope,
             },
         );
         if private || residency == StateResidency::Recurrent {
-            // The private cache holds one sequence and recurrent state is one value (prepare enforces
-            // a single sequence): a new sequence starts from zero state.
-            self.executor
-                .reset_state(self.exe, poot_executor::StateScope::All)?;
+            // The private cache holds one sequence's row and a recurrent state pool one row per
+            // slot: a new sequence starts from zero in its own slot's row and leaves every other
+            // sequence's state alone.
+            let scope = poot_executor::StateScope::Row(slot);
+            self.executor.reset_state(self.exe, scope.clone())?;
             if let Some(draft) = &self.speculation.draft {
-                self.executor
-                    .reset_state(draft.exe, poot_executor::StateScope::All)?;
+                self.executor.reset_state(draft.exe, scope.clone())?;
             }
             for &exe in self.adapter_exes.values() {
-                self.executor
-                    .reset_state(exe, poot_executor::StateScope::All)?;
+                self.executor.reset_state(exe, scope.clone())?;
             }
         }
         self.speculation.open(seq, reused);
@@ -378,26 +461,74 @@ impl Driver {
 
     /// [`Driver::open`] for a prompt that supplies embedding rows in place of some tokens'
     /// embeddings (`embeds`). Its prefill steps run the `PrefillEmbeds` entries
-    /// ([`Driver::prepare_embeds`]); decode steps are ordinary. Only the contiguous layout takes them:
-    /// the paged prefix cache keys on tokens alone, which these rows change the meaning of.
+    /// ([`Driver::prepare_embeds`]); decode steps are ordinary. Under the paged layout the prompt
+    /// reuses no cached prefix and registers none: the prefix cache keys on tokens alone, which these
+    /// rows change the meaning of. An adapter sequence is refused (only the base weights have
+    /// `PrefillEmbeds` entries), and so is any sequence under a draft-model policy (the draft prefills
+    /// over placeholder tokens); prompt lookup speculates on the tokens and is fine. A preempted
+    /// embeds sequence is recomputed: reopen it with this method, not [`Driver::open`], or its
+    /// prefill would run over the placeholders.
     pub fn open_with_embeds(
         &mut self,
         request: SeqRequest<'_>,
         embeds: PromptEmbeds,
     ) -> Result<Admission, DriverError> {
-        let serving = self.serving.as_ref().ok_or(InvalidRequest::NotPrepared)?;
-        if !matches!(serving.kv, KvStore::Contiguous) {
-            return Err(InvalidRequest::Embeds(EmbedsError::Paged).into());
+        self.open_embedded(request, embeds, None)
+    }
+
+    /// [`Driver::open_with_embeds`] for a model that rotates at sectioned positions
+    /// (`Slot::MropePosition`, Qwen2.5-VL's text tower): the prompt's image tokens do not sit at their
+    /// index, so `positions` (the processor's, one entry per prompt token) says where every token of
+    /// the prompt rotates, and generated tokens continue from where it ends. A preempted sequence is
+    /// reopened with the same positions. A model without sectioned positions refuses the sequence here.
+    pub fn open_with_mrope(
+        &mut self,
+        request: SeqRequest<'_>,
+        embeds: PromptEmbeds,
+        positions: MropePositionIds,
+    ) -> Result<Admission, DriverError> {
+        if positions.len() != request.prompt.len() {
+            return Err(InvalidRequest::Mrope(MropeError::Length {
+                positions: positions.len(),
+                prompt: request.prompt.len(),
+            })
+            .into());
+        }
+        self.open_embedded(request, embeds, Some(positions))
+    }
+
+    fn open_embedded(
+        &mut self,
+        request: SeqRequest<'_>,
+        embeds: PromptEmbeds,
+        mrope: Option<MropePositionIds>,
+    ) -> Result<Admission, DriverError> {
+        if self.serving.is_none() {
+            return Err(InvalidRequest::NotPrepared.into());
+        }
+        if request.adapter != AdapterRef::Base {
+            return Err(InvalidRequest::Embeds(EmbedsError::Adapter).into());
+        }
+        if matches!(self.speculation.policy, DraftPolicy::DraftModel { .. }) {
+            return Err(InvalidRequest::Embeds(EmbedsError::DraftModel).into());
         }
         embeds
             .check_prompt(request.prompt.len())
             .map_err(InvalidRequest::Embeds)?;
-        let admission = self.open(request)?;
-        if let Admission::Opened { seq, .. } = admission {
-            let serving = self.serving.as_mut().expect("open succeeded");
-            serving.seqs.get_mut(&seq).expect("just opened").embeds = Some(embeds);
+        // The prepared entries say whether the model takes sectioned positions: refuse before the
+        // sequence holds a slot or blocks.
+        if mrope.is_some()
+            && !self.entries.iter().any(|(key, entry)| {
+                key.role == ModelRole::Target
+                    && entry
+                        .slots
+                        .iter()
+                        .any(|spec| spec.role == SlotRole::MropePosition)
+            })
+        {
+            return Err(InvalidRequest::Mrope(MropeError::NotSectioned).into());
         }
-        Ok(admission)
+        self.open_seq(request, Some(embeds), mrope)
     }
 
     /// Run one step over `rows`. Each row's sampler picks its token: the suffix entry when every
@@ -437,26 +568,15 @@ impl Driver {
             return Err(InvalidRequest::MixedAdapters.into());
         }
         let window = plans.iter().any(|plan| plan.picks > 1);
-        let tokens = plans.iter().map(|plan| plan.feed.len()).max().unwrap_or(1);
         let head = self.step_head(rows, &plans, window)?;
-        let embeds = plans.iter().any(|plan| plan.embeds);
-        let key = self.step_entry(
-            ModelRole::Target,
-            rows.len(),
-            tokens,
-            (window, embeds),
-            head,
-            adapter,
-        )?;
-        let mut lanes: Vec<Lane<'_>> = rows
+        let lanes: Vec<Lane<'_>> = rows
             .iter_mut()
             .map(|row| Lane {
                 seq: row.seq,
                 sampler: &mut *row.sampler,
             })
             .collect();
-        let readback = self.run_plans(&mut lanes, &plans, key)?;
-        drop(lanes);
+        let readback = self.run_rows(lanes, &mut plans, (window, head, adapter))?;
 
         let mut picked: Vec<Vec<u32>> = Vec::with_capacity(rows.len());
         let mut host_picks = false;
@@ -529,6 +649,75 @@ impl Driver {
         Ok(results)
     }
 
+    /// Run `lanes` once per feed width and merge what the runs return into one readback in lane order.
+    /// A row feeding fewer tokens than the step's widest is left-padded, which is harmless to attention
+    /// (the padding is masked) and fatal to recurrent state (the padding would fold into it): a
+    /// recurrent model's rows are grouped by the tokens they feed and each group runs its own entry.
+    /// Every other model runs all its rows as one.
+    fn run_rows(
+        &mut self,
+        lanes: Vec<Lane<'_>>,
+        plans: &mut Vec<RowPlan>,
+        (window, head, adapter): (bool, Option<Head>, Option<GenerationId>),
+    ) -> Result<Readback, DriverError> {
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for (i, plan) in plans.iter().enumerate() {
+            let same_width = |group: &Vec<usize>| {
+                self.residency != StateResidency::Recurrent
+                    || plans[group[0]].feed.len() == plan.feed.len()
+            };
+            match groups.iter_mut().find(|group| same_width(group)) {
+                Some(group) => group.push(i),
+                None => groups.push(vec![i]),
+            }
+        }
+        let mut parts: Vec<Option<(Lane<'_>, RowPlan)>> =
+            lanes.into_iter().zip(plans.drain(..)).map(Some).collect();
+        let mut readbacks = Vec::with_capacity(groups.len());
+        let mut failure = None;
+        for group in &groups {
+            let (mut group_lanes, group_plans): (Vec<_>, Vec<_>) = group
+                .iter()
+                .map(|&i| parts[i].take().expect("each row is in one group"))
+                .unzip();
+            let tokens = group_plans
+                .iter()
+                .map(|plan| plan.feed.len())
+                .max()
+                .unwrap_or(1);
+            let embeds = group_plans.iter().any(|plan| plan.embeds);
+            let ran = self
+                .step_entry(
+                    ModelRole::Target,
+                    group.len(),
+                    tokens,
+                    (window, embeds),
+                    head,
+                    adapter,
+                )
+                .and_then(|key| self.run_plans(&mut group_lanes, &group_plans, key));
+            for (&i, part) in group.iter().zip(group_lanes.into_iter().zip(group_plans)) {
+                parts[i] = Some(part);
+            }
+            match ran {
+                Ok(readback) => readbacks.push(readback),
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            }
+        }
+        plans.extend(
+            parts
+                .into_iter()
+                .map(|part| part.expect("restored above").1),
+        );
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        Ok(Readback::merge(readbacks, &groups))
+    }
+
     /// Run one prepared entry over `plans`: bind each live row's feed, positions and cache mapping,
     /// execute, and read back what the rows pick. `lanes` are the live rows in plan order; rows beyond
     /// them are masked. The caller owns the sequences' bookkeeping.
@@ -553,9 +742,18 @@ impl Driver {
             lora: vec![0.0; entry_rows],
             ..StepData::default()
         };
-        if let KvLayout::Paged { pool_slots } = kv {
+        if let KvLayout::Paged { pool_slots, .. } = kv {
             data.read = vec![0; entry_rows * capacity];
             data.write = vec![-1; pool_slots.get()];
+        }
+        // A recurrent state pool: masked rows read pool row 0 and write nothing.
+        if let Some(spec) = entry
+            .slots
+            .iter()
+            .find(|spec| spec.role == SlotRole::StateWrite)
+        {
+            data.state_read = vec![0; entry_rows];
+            data.state_write = vec![-1; spec.shape[0]];
         }
         let hidden = if key.phase == Phase::PrefillEmbeds {
             let spec = entry
@@ -570,6 +768,12 @@ impl Driver {
             0
         };
         let serving = self.serving.as_ref().expect("a step is served");
+        let supplies = lanes
+            .iter()
+            .any(|lane| serving.seqs[&lane.seq].mrope.is_some());
+        // Axis-major `[3, entry_rows * width]`; a row without positions of its own, and the padding,
+        // rotate at their text positions like `Slot::Pos`.
+        let mut mrope = supplies.then(|| vec![0; 3 * entry_rows * width]);
         for (i, (lane, plan)) in lanes.iter().zip(plans).enumerate() {
             let seq = &serving.seqs[&lane.seq];
             let n = plan.feed.len();
@@ -601,6 +805,10 @@ impl Driver {
                 }
                 KvStore::Contiguous => None,
             };
+            if !data.state_write.is_empty() {
+                data.state_read[i] = seq.slot as i32;
+                data.state_write[seq.slot] = i as i32;
+            }
             data.lora[i] = seq.adapter.row_value();
             for k in 0..width {
                 // Left padding: the row's real tokens are the last `n` of the step's width.
@@ -611,16 +819,36 @@ impl Driver {
                         let position = plan.start + j;
                         data.tokens[at] = plan.feed[j] as i32;
                         data.pos[at] = position as i32;
+                        if let Some(mrope) = &mut mrope {
+                            let axes = seq
+                                .mrope
+                                .as_ref()
+                                .map_or([position as i32; 3], |ids| rotary_position(ids, position));
+                            for (axis, value) in axes.into_iter().enumerate() {
+                                mrope[axis * entry_rows * width + at] = value;
+                            }
+                        }
                         if let Some(map) = &map
                             && position < seq.reserved
                         {
                             data.write[map[position] as usize] = at as i32;
                         }
                     }
-                    None => data.pos[at] = plan.start as i32,
+                    None => {
+                        data.pos[at] = plan.start as i32;
+                        if let Some(mrope) = &mut mrope {
+                            let axes = seq.mrope.as_ref().map_or([plan.start as i32; 3], |ids| {
+                                rotary_position(ids, plan.start)
+                            });
+                            for (axis, value) in axes.into_iter().enumerate() {
+                                mrope[axis * entry_rows * width + at] = value;
+                            }
+                        }
+                    }
                 }
             }
         }
+        data.mrope = mrope;
         // Sampler inputs of a non-greedy suffix: one row each, placeholders for rows that do not pick
         // and for the masked rows.
         if let Head::Sample(rule) = key.head
@@ -738,6 +966,9 @@ impl Driver {
                 if residency == StateResidency::Recurrent {
                     cache.reset(state.slot);
                     PrefixOutcome::Skipped(PrefixSkip::RecurrentState)
+                } else if state.embeds.is_some() {
+                    cache.reset(state.slot);
+                    PrefixOutcome::Skipped(PrefixSkip::PromptEmbeds)
                 } else if mode == Release::Preempted {
                     cache.reset(state.slot);
                     PrefixOutcome::Skipped(PrefixSkip::Preempted)
