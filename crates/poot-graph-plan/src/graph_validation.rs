@@ -47,8 +47,9 @@ pub(crate) fn validate_graph_execution<V: ValidationChannel>(
     validate_graph_structure(g)?;
     if let Some(value) = g
         .values
-        .iter()
-        .position(|value| value.aval.dtype == DType::E4M3FN)
+        .iter_enumerated()
+        .find(|(_, value)| value.aval.dtype == DType::E4M3FN)
+        .map(|(id, _)| id)
     {
         return Err(PlanError::UnrepresentableValue {
             value,
@@ -94,7 +95,11 @@ pub(crate) fn validate_wgpu_tensor_execution<V: ValidationChannel>(
     g: &Graph<V>,
 ) -> Result<(), PlanError> {
     validate_graph_execution(g)?;
-    if let Some(value) = (0..g.values.len()).find(|&id| g.values[id].aval.dtype == DType::BF16) {
+    if let Some(value) = g
+        .values
+        .ids()
+        .find(|&id| g.values[id].aval.dtype == DType::BF16)
+    {
         return Err(PlanError::UnrepresentableValue {
             value,
             dtype: DType::BF16,
@@ -116,7 +121,7 @@ pub(crate) fn validate_graph_exact_i32<V: ValidationChannel>(
     g: &Graph<V>,
 ) -> Result<(), PlanError> {
     let exact_i32 = ExactI32StorageAnalysis::new(g);
-    if let Some(value) = (0..g.values.len()).find(|&id| exact_i32.required(id)) {
+    if let Some(value) = g.values.ids().find(|&id| exact_i32.required(id)) {
         return Err(PlanError::UnrepresentableValue {
             value,
             dtype: DType::I32,

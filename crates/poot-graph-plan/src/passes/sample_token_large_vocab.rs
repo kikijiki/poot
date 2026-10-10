@@ -46,6 +46,7 @@ use poot_tensor::DType;
 
 use super::GraphBudget;
 use crate::{CompileLimits, ExpansionError};
+use poot_graph_ir::ValueTable;
 
 /// The stage name an expansion refusal reports.
 const STAGE: &str = "decompose_large_vocab_greedy";
@@ -71,7 +72,7 @@ const DECOMPOSE_THRESHOLD: usize = 2048;
 /// output type is computed by [`OpKind::infer`] itself, never hand-written, so a shape mistake here
 /// fails loudly at rewrite time instead of silently miscompiling.
 struct RawEmitter<'a> {
-    values: &'a mut Vec<ValueMeta>,
+    values: &'a mut ValueTable<ValueMeta>,
     eqns: &'a mut Vec<Eqn>,
     /// Every `Storage::Computed` value this emitter created (`iota_const`), for the caller to also
     /// register in `Graph::inputs`/`Graph::consts` (`fold_iota`'s own rewrite does the same for the
@@ -215,12 +216,12 @@ pub fn decompose_large_vocab_greedy<V: ValidationChannel>(
             "decompose_one's last eqn must produce its own returned id"
         );
         last.out = *out;
+        let popped = e.values.pop_last().map(|(id, _)| id);
         assert_eq!(
-            e.values.len() - 1,
-            final_id,
+            popped,
+            Some(final_id),
             "final_id must be the last value decompose_one pushed"
         );
-        e.values.pop();
     }
 
     if !any {

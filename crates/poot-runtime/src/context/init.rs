@@ -526,7 +526,7 @@ mod card537_wgpu_debug_tests {
         };
         // A 4-byte buffer with a 16-byte write is out of range: wgpu validates `write_buffer`'s size
         // against the destination buffer and routes the violation through `on_uncaptured_error`, not a
-        // `Result` (unlike this crate's own `write_f32`/`write_bytes`, which range-check first).
+        // `Result` (unlike this crate's own `write_f32`/`write_with`, which range-check first).
         let buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("card537-sc003-undersized"),
             size: 4,

@@ -79,8 +79,13 @@ quantization is not implemented. Operator detail: [Using quantized checkpoints](
 **LoRA adapters** [^lora] use the PEFT [^peft] layout. `poot-serve` loads, selects and unloads them while it runs. Adapters apply to the seven attention
 and MLP projections of dense qwen2/llama-shaped models. See [Using LoRA adapters](../serve/lora-adapters.md).
 
-**Tensor parallelism** is not implemented in the server. A
-captured multi-device executor exists in `poot-ptx-gpu` as a building block. See
+**Tensor parallelism** divides the weights by role and the paged KV pool by KV heads over the ranks
+of a group. A multi-device coordinator in `poot-executor` runs pipeline and tensor-parallel programs
+over PTX peer-to-peer copies, and the server plans and fits each rank against its own GPU. A tensor group
+and a layer pipeline have served requests on a two-GPU NVLink A100 PTX pair (greedy and sampled requests match
+single-GPU, with per-rank admission), and world-4 tensor-parallel decode matched the single-device oracle on a
+four-GPU A100 pod. Not covered: serving a group of four through the server, a real checkpoint, and GPUs reachable
+only across CPU sockets. Backends other than PTX are not supported. See
 [Tensor parallelism](../serve/tensor-parallelism.md).
 
 ## Metrics

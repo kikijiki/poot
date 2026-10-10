@@ -44,6 +44,5 @@ request, releases nothing, and the engine is dead: `GET /health` answers `503` w
 the cause (`panicked` or `fault`) and the reason. During shutdown `/health` answers `503` with
 `"status": "draining"` while in-flight requests finish.
 
-The `POOT_SLOTS`, `POOT_CAP` and `POOT_MAX_BATCHED_TOKENS` settings are not read: the engine plan fits
-the row count and positions to the device. A command-line option the server does not know fails
-startup.
+There is no row-count or position option: the engine plan fits both to the device, and no environment
+variable changes them. A command-line option the server does not know fails startup.

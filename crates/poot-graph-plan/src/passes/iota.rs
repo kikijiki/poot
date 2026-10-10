@@ -8,7 +8,7 @@
 //!
 //! Value-preserving: every consumer of the folded value reads the same elements it read before.
 
-use poot_graph_ir::graph::{ComputedConst, Graph, Storage, ValidationChannel};
+use poot_graph_ir::graph::{ComputedConst, Graph, Storage, ValidationChannel, ValueId};
 use poot_graph_ir::op::OpKind;
 
 /// Rewrite every `OpKind::Iota { len, dtype }` into a [`Storage::Computed`] graph constant and drop its
@@ -18,7 +18,7 @@ use poot_graph_ir::op::OpKind;
 /// written for the pipeline's simple `Graph -> Graph` shape).
 pub fn fold_iota<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
     let mut g = g.clone();
-    let mut folded: Vec<(usize, ComputedConst)> = Vec::new();
+    let mut folded: Vec<(ValueId, ComputedConst)> = Vec::new();
     for eqn in &g.eqns {
         if let OpKind::Iota { len, dtype } = &eqn.op {
             folded.push((

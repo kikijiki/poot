@@ -41,7 +41,7 @@ macro_rules! bail {
 }
 
 mod error;
-pub use error::{OptionExt, Result, TextError};
+pub use error::{ChatTemplateError, OptionExt, Result, TextError};
 
 /// Shared control result for every single-sequence text-piece callback.
 ///
@@ -55,7 +55,10 @@ pub mod driver;
 mod multimodal;
 mod text;
 
-pub use multimodal::{encoders, front_end, qwen_vl};
+pub use multimodal::{
+    ChatTurn, ImageCheckpoint, ImageCheckpointError, ImageFrontEnd, ImageRequestError,
+    MultimodalPrompt, encoders, front_end, qwen_vl, read_image_checkpoint,
+};
 pub use text::grammar;
 
 pub use core::modality::Modality;
@@ -101,6 +104,9 @@ pub use poot_models::mrope::{
     assemble_qwen2_5_vl_video_timings_with_default, build_mrope_position_ids,
     discover_mrope_segments, reconcile_mrope_special_token_ids,
 };
-pub use text::chat::{RenderedChat, derive_jinja_stops, render_jinja_value};
+pub use text::chat::{
+    ChatTemplateOverride, CheckedChatTemplate, RenderedChat, Speaker, derive_jinja_stops,
+    render_jinja_value,
+};
 pub use text::guided::{Constraint, JsonAcceptor, json_schema_to_regex, tool_call_regex};
 pub use text::tokenize::{ChatTemplate, TextCodec};

@@ -23,6 +23,12 @@ pub(crate) struct HsaRuntimeOwner {
     /// Live/peak bytes and allocation count by role (Card 547a): the one memory service's view of
     /// every allocation this runtime has made.
     pub(crate) memory: poot_runtime_common::MemoryCounters,
+    /// The completion signals of the upload copies in flight ([`crate::upload`]). An allocation's
+    /// `free_memory` must see every copy complete before it releases memory, and an allocation holds this
+    /// owner, not the context (or its ring, whose pinned buffers hold this owner: keeping the ring here would
+    /// be a reference cycle). The ring registers a signal when it submits a copy and removes it, under this
+    /// lock, as it proves the copy complete and destroys the signal.
+    pub(crate) uploads_in_flight: std::sync::Mutex<Vec<bindings::hsa_signal_t>>,
 }
 
 impl std::ops::Deref for HsaRuntimeOwner {
@@ -35,6 +41,11 @@ impl std::ops::Deref for HsaRuntimeOwner {
 
 impl ResourceOwner for HsaRuntimeOwner {
     fn free_memory(&self, ptr: *mut c_void) {
+        // A copy still in flight into this allocation would land in freed (or reallocated) memory: wait for
+        // it. One that cannot be proven complete leaves the allocation leaked, as a timed-out dispatch does.
+        if !self.await_uploads() {
+            return;
+        }
         // SAFETY: `ptr` is a live pool allocation of this runtime, freed once (trait contract).
         unsafe {
             let _ = (self.hsa.funcs.hsa_amd_memory_pool_free)(ptr);

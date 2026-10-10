@@ -3,23 +3,52 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{BuilderAppendError, BuilderCollection, BuilderValueNamespace};
 use crate::graph::{
     ComputedConst, Eqn, Graph, LayerIndex, Operand, Slot, SlotKey, StateRole, Storage, ValueId,
-    ValueMeta,
+    ValueMeta, ValueTable,
 };
 use crate::op::{OpKind, SampleRule};
 use crate::types::{DType, Scalar, TensorType};
 use poot_quant::PackedWeight;
 
-/// A type-only tensor handle: a `ValueId` with no data. There is no `Deref`/`as_slice`/`to_scalar`, so a host
-/// read of a traced tensor cannot be written (graph-architecture.md Q1). Static shape is available via
-/// [`Builder::aval`] for host-side static decisions (`n_rep`, the rope half-split, etc.).
-#[derive(Clone, Copy, Debug)]
+/// The identity of one [`Builder`] (or [`BuilderAppendPlan`] staged against it): a process-unique
+/// token every handle it mints carries, so a handle used with another builder is recognized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BuilderBrand(NonZeroU64);
+
+impl BuilderBrand {
+    fn mint() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let raw = NEXT.fetch_add(1, Ordering::Relaxed);
+        BuilderBrand(NonZeroU64::new(raw).expect("the brand counter starts at 1 and never wraps"))
+    }
+}
+
+/// A type-only tensor handle: a `ValueId` with no data, branded by the builder that minted it. There is no
+/// `Deref`/`as_slice`/`to_scalar`, so a host read of a traced tensor cannot be written
+/// (graph-architecture.md Q1). Static shape is available via [`Builder::aval`] for host-side static
+/// decisions (`n_rep`, the rope half-split, etc.).
+///
+/// A handle is only meaningful to its own builder: every [`Builder`] method that takes one panics when
+/// it comes from another builder (a tracer bug, not a recoverable condition). The transactional append
+/// path ([`BuilderAppendPlan`]) names values by [`ValueId`] and reports a foreign plan as
+/// [`BuilderAppendError::ForeignBuilder`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Traced {
-    pub id: ValueId,
+    id: ValueId,
+    brand: BuilderBrand,
+}
+
+impl Traced {
+    /// The value this handle names in its builder's graph.
+    pub fn id(self) -> ValueId {
+        self.id
+    }
 }
 
 /// Checked accounting for a prepared transactional append.
@@ -38,10 +67,10 @@ pub struct BuilderAppendAccounting {
 /// [`BuilderAppendPlan::equation`], and [`BuilderAppendPlan::declare_result`].
 #[derive(Debug)]
 pub struct BuilderAppendPlan {
-    builder_identity: Rc<()>,
+    brand: BuilderBrand,
     generation: u64,
     base_value_count: usize,
-    base_types: Vec<TensorType>,
+    base_types: ValueTable<TensorType>,
     values: Vec<ValueMeta>,
     equations: Vec<Eqn>,
     result: Option<DeclaredAppendResult>,
@@ -68,13 +97,27 @@ impl DeclaredAppendResult {
 
 impl BuilderAppendPlan {
     fn next_value_id(&self) -> Result<ValueId, BuilderAppendError> {
-        self.base_value_count.checked_add(self.values.len()).ok_or(
-            BuilderAppendError::SizeOverflow {
+        self.staged_id(self.values.len())
+    }
+
+    /// The id the staged value at `offset` takes when this plan commits.
+    fn staged_id(&self, offset: usize) -> Result<ValueId, BuilderAppendError> {
+        self.base_value_count
+            .checked_add(offset)
+            .and_then(ValueId::from_index)
+            .ok_or(BuilderAppendError::SizeOverflow {
                 collection: BuilderCollection::Values,
                 current: self.base_value_count,
-                additional: self.values.len(),
-            },
-        )
+                additional: offset,
+            })
+    }
+
+    /// The handle of a value this plan staged.
+    fn handle(&self, id: ValueId) -> Traced {
+        Traced {
+            id,
+            brand: self.brand,
+        }
     }
 
     fn add_name_bytes(&mut self, name: &str) -> Result<(), BuilderAppendError> {
@@ -118,7 +161,7 @@ impl BuilderAppendPlan {
             key: None,
             state_role: None,
         });
-        Ok(Traced { id })
+        Ok(self.handle(id))
     }
 
     /// Atomically stage a named non-Device input binder and declare that plan-owned input as the result.
@@ -214,12 +257,18 @@ impl BuilderAppendPlan {
             out: id,
             layer: self.layer,
         });
-        Ok(Traced { id })
+        Ok(self.handle(id))
     }
 
     /// Declare a staged equation output as the result. Input results must be staged and declared together with
-    /// [`Self::input_result`]; preflight enforces this because `Traced` carries only a public numeric id.
+    /// [`Self::input_result`]; preflight enforces this because a handle names a value, not how it was staged.
+    ///
+    /// A handle another builder minted is [`BuilderAppendError::ForeignBuilder`]: this is the transactional
+    /// path, where the typed error replaces the tracer's panic.
     pub fn declare_result(&mut self, result: Traced) -> Result<(), BuilderAppendError> {
+        if result.brand != self.brand {
+            return Err(BuilderAppendError::ForeignBuilder);
+        }
         if let Some(value) = self.result {
             return Err(BuilderAppendError::ResultAlreadyDeclared {
                 value: value.value(),
@@ -230,12 +279,9 @@ impl BuilderAppendPlan {
     }
 
     pub fn type_of(&self, value: ValueId) -> Option<&TensorType> {
-        if value < self.base_value_count {
-            self.base_types.get(value)
-        } else {
-            self.values
-                .get(value.checked_sub(self.base_value_count)?)
-                .map(|meta| &meta.aval)
+        match value.index().checked_sub(self.base_value_count) {
+            None => self.base_types.get(value),
+            Some(offset) => self.values.get(offset).map(|meta| &meta.aval),
         }
     }
 }
@@ -243,7 +289,7 @@ impl BuilderAppendPlan {
 /// A fully checked append. Neither `Clone` nor reusable.
 #[derive(Debug)]
 pub struct PreparedBuilderAppend {
-    builder_identity: Rc<()>,
+    brand: BuilderBrand,
     generation: u64,
     base_value_count: usize,
     accounting: BuilderAppendAccounting,
@@ -345,7 +391,7 @@ impl PreparedAppendResult {
 /// let _ = b.flash_attention_prefill_softcap(q, k, v, mask, 1, 0.5, Some(50.0));
 /// ```
 pub struct Builder {
-    identity: Rc<()>,
+    brand: BuilderBrand,
     g: RefCell<Graph>,
     generation: Cell<u64>,
     /// The layer tag every equation emitted right now carries. Shared with the [`LayerScope`]s this
@@ -396,17 +442,15 @@ fn checked_growth(
         })
 }
 
-fn reserve<T>(
-    values: &mut Vec<T>,
+fn reserve(
     additional: usize,
     collection: BuilderCollection,
+    try_reserve: impl FnOnce(usize) -> Result<(), std::collections::TryReserveError>,
 ) -> Result<(), BuilderAppendError> {
-    values
-        .try_reserve(additional)
-        .map_err(|_| BuilderAppendError::Reserve {
-            collection,
-            additional,
-        })
+    try_reserve(additional).map_err(|_| BuilderAppendError::Reserve {
+        collection,
+        additional,
+    })
 }
 
 fn checked_op_sizes(op: &OpKind, inputs: &[TensorType]) -> Result<(), BuilderAppendError> {
@@ -440,10 +484,10 @@ fn staged_namespace(
 }
 
 fn live_name_namespace(g: &Graph, name: &str) -> Option<BuilderValueNamespace> {
-    let value = g
+    let (value, _) = g
         .values
-        .iter()
-        .position(|meta| meta.name.as_deref() == Some(name))?;
+        .iter_enumerated()
+        .find(|(_, meta)| meta.name.as_deref() == Some(name))?;
     if g.consts.contains(&value) {
         Some(BuilderValueNamespace::Constant)
     } else if g.slots.iter().any(|&(id, _)| id == value) {
@@ -464,7 +508,7 @@ fn validate_append_result(
 ) -> Result<PreparedAppendResult, BuilderAppendError> {
     let declared = plan.result.ok_or(BuilderAppendError::MissingResult)?;
     let value = declared.value();
-    let Some(offset) = value.checked_sub(live_value_count) else {
+    let Some(offset) = value.index().checked_sub(live_value_count) else {
         return Err(BuilderAppendError::InvalidResult { value });
     };
     let Some(meta) = plan.values.get(offset) else {
@@ -488,7 +532,7 @@ fn validate_append_result(
 impl Builder {
     pub fn new() -> Self {
         Builder {
-            identity: Rc::new(()),
+            brand: BuilderBrand::mint(),
             g: RefCell::new(Graph::default()),
             generation: Cell::new(0),
             layer: Rc::new(Cell::new(None)),
@@ -527,18 +571,30 @@ impl Builder {
     }
 
     /// Finalize: set the primary output and return the graph.
+    ///
+    /// # Panics
+    /// When `out` was minted by another builder.
     pub fn finish(self, out: Traced) -> Graph {
+        let output = self.id(out);
         let mut g = self.g.into_inner();
-        g.output = out.id;
+        g.output = output;
         g
     }
 
     /// Finalize with carried state: set the primary output and the `(state_in, state_out)` alias pairs
     /// (the KV cache). `state` is `(the State input binder, the updated value)` per cache buffer.
+    ///
+    /// # Panics
+    /// When `out` or a state handle was minted by another builder.
     pub fn finish_with_state(self, out: Traced, state: &[(Traced, Traced)]) -> Graph {
+        let output = self.id(out);
+        let pairs = state
+            .iter()
+            .map(|&(si, so)| (self.id(si), self.id(so)))
+            .collect();
         let mut g = self.g.into_inner();
-        g.output = out.id;
-        g.state = state.iter().map(|(si, so)| (si.id, so.id)).collect();
+        g.output = output;
+        g.state = pairs;
         g
     }
 
@@ -554,28 +610,54 @@ impl Builder {
     /// has no implicit conversion down to it (see [`Graph`]'s own doc), so it cannot be passed to
     /// `resume` at all - a caller holding one must consume its validations first.
     pub fn resume(g: Graph) -> Resumed {
-        let out = Traced { id: g.output };
-        let state = g
-            .state
-            .iter()
-            .map(|&(si, so)| (Traced { id: si }, Traced { id: so }))
-            .collect();
+        let builder = Builder {
+            brand: BuilderBrand::mint(),
+            g: RefCell::new(g),
+            generation: Cell::new(0),
+            layer: Rc::new(Cell::new(None)),
+            #[cfg(test)]
+            reservation_failure: Cell::new(None),
+        };
+        let (out, state) = {
+            let g = builder.g.borrow();
+            (
+                builder.handle(g.output),
+                g.state
+                    .iter()
+                    .map(|&(si, so)| (builder.handle(si), builder.handle(so)))
+                    .collect(),
+            )
+        };
         Resumed {
-            builder: Builder {
-                identity: Rc::new(()),
-                g: RefCell::new(g),
-                generation: Cell::new(0),
-                layer: Rc::new(Cell::new(None)),
-                #[cfg(test)]
-                reservation_failure: Cell::new(None),
-            },
+            builder,
             out,
             state,
         }
     }
 
+    /// The handle for `id`, a value this builder just minted.
+    fn handle(&self, id: ValueId) -> Traced {
+        Traced {
+            id,
+            brand: self.brand,
+        }
+    }
+
+    /// The value `t` names. A handle from another builder is a tracer bug, not a recoverable
+    /// condition, so it panics here at first use.
+    #[track_caller]
+    fn id(&self, t: Traced) -> ValueId {
+        assert!(
+            t.brand == self.brand,
+            "Traced handle {} was minted by another Builder and cannot be used with this one",
+            t.id
+        );
+        t.id
+    }
+
     pub fn aval(&self, t: Traced) -> TensorType {
-        self.g.borrow().values[t.id].aval.clone()
+        let id = self.id(t);
+        self.g.borrow().values[id].aval.clone()
     }
 
     /// The mutation generation used to invalidate prepared transactional appends.
@@ -587,7 +669,7 @@ impl Builder {
     pub fn append_plan(&self, packed_rows: usize) -> BuilderAppendPlan {
         let g = self.g.borrow();
         BuilderAppendPlan {
-            builder_identity: Rc::clone(&self.identity),
+            brand: self.brand,
             generation: self.generation.get(),
             base_value_count: g.values.len(),
             base_types: g.values.iter().map(|meta| meta.aval.clone()).collect(),
@@ -605,7 +687,7 @@ impl Builder {
         &self,
         plan: BuilderAppendPlan,
     ) -> Result<PreparedBuilderAppend, BuilderAppendError> {
-        if !Rc::ptr_eq(&plan.builder_identity, &self.identity) {
+        if plan.brand != self.brand {
             return Err(BuilderAppendError::ForeignBuilder);
         }
         let g = self.g.borrow();
@@ -629,7 +711,7 @@ impl Builder {
         let mut staged_slots = 0usize;
         let mut staged_names: HashMap<&str, BuilderValueNamespace> = HashMap::new();
         for (offset, meta) in plan.values.iter().enumerate() {
-            let value = plan.base_value_count + offset;
+            let value = plan.staged_id(offset)?;
             let namespace = staged_namespace(&plan, value, meta);
             if meta.storage != Storage::Device {
                 staged_inputs =
@@ -680,6 +762,7 @@ impl Builder {
         checked_growth(BuilderCollection::Slots, g.slots.len(), staged_slots)?;
 
         let total_values = g.values.len() + plan.values.len();
+        let live_values = g.values.len();
         let mut defined = vec![false; plan.values.len()];
         for (offset, meta) in plan.values.iter().enumerate() {
             if meta.storage != Storage::Device {
@@ -692,10 +775,10 @@ impl Builder {
             for operand in &eqn.inputs {
                 match operand {
                     Operand::Lit(value) => in_types.push(value.ty()),
-                    Operand::Value(value) if *value < g.values.len() => {
+                    Operand::Value(value) if g.values.contains(*value) => {
                         in_types.push(g.values[*value].aval.clone());
                     }
-                    Operand::Value(value) if *value >= total_values => {
+                    Operand::Value(value) if value.index() >= total_values => {
                         return Err(BuilderAppendError::InvalidOperand {
                             equation,
                             operation,
@@ -703,7 +786,7 @@ impl Builder {
                         });
                     }
                     Operand::Value(value) => {
-                        let offset = *value - g.values.len();
+                        let offset = value.index() - live_values;
                         if !defined[offset] {
                             return Err(BuilderAppendError::OperandNotDefined {
                                 equation,
@@ -715,14 +798,14 @@ impl Builder {
                     }
                 }
             }
-            if eqn.out < g.values.len() || eqn.out >= total_values {
+            if eqn.out.index() < live_values || eqn.out.index() >= total_values {
                 return Err(BuilderAppendError::InvalidOperand {
                     equation,
                     operation,
                     value: eqn.out,
                 });
             }
-            let output_offset = eqn.out - g.values.len();
+            let output_offset = eqn.out.index() - live_values;
             if defined[output_offset] {
                 return Err(BuilderAppendError::ValueRedefined {
                     equation,
@@ -770,7 +853,7 @@ impl Builder {
         for (offset, meta) in plan.values.iter().enumerate() {
             if meta.storage == Storage::Device && !defined[offset] {
                 return Err(BuilderAppendError::MissingDefinition {
-                    value: g.values.len() + offset,
+                    value: plan.staged_id(offset)?,
                 });
             }
         }
@@ -783,7 +866,7 @@ impl Builder {
             checked_name_bytes: plan.checked_name_bytes,
         };
         Ok(PreparedBuilderAppend {
-            builder_identity: Rc::clone(&plan.builder_identity),
+            brand: plan.brand,
             generation: actual_generation,
             base_value_count: g.values.len(),
             accounting,
@@ -795,12 +878,13 @@ impl Builder {
         })
     }
 
-    /// Reserve all live collections and publish a preflighted fragment as one generation.
+    /// Reserve all live collections and publish a preflighted fragment as one generation. The result is
+    /// the handle of the value the plan declared as its result.
     pub fn commit_append(
         &self,
         prepared: &mut PreparedBuilderAppend,
-    ) -> Result<ValueId, BuilderAppendError> {
-        if !Rc::ptr_eq(&prepared.builder_identity, &self.identity) {
+    ) -> Result<Traced, BuilderAppendError> {
+        if prepared.brand != self.brand {
             return Err(BuilderAppendError::ForeignBuilder);
         }
         if prepared.plan.is_none() {
@@ -824,29 +908,25 @@ impl Builder {
             });
         }
         self.reserve_append_collection(
-            &mut g.values,
             prepared.accounting.staged_values,
             BuilderCollection::Values,
+            |n| g.values.try_reserve(n),
         )?;
+        self.reserve_append_collection(prepared.staged_inputs, BuilderCollection::Inputs, |n| {
+            g.inputs.try_reserve(n)
+        })?;
         self.reserve_append_collection(
-            &mut g.inputs,
-            prepared.staged_inputs,
-            BuilderCollection::Inputs,
-        )?;
-        self.reserve_append_collection(
-            &mut g.consts,
             prepared.staged_constants,
             BuilderCollection::Constants,
+            |n| g.consts.try_reserve(n),
         )?;
+        self.reserve_append_collection(prepared.staged_slots, BuilderCollection::Slots, |n| {
+            g.slots.try_reserve(n)
+        })?;
         self.reserve_append_collection(
-            &mut g.slots,
-            prepared.staged_slots,
-            BuilderCollection::Slots,
-        )?;
-        self.reserve_append_collection(
-            &mut g.eqns,
             prepared.accounting.staged_equations,
             BuilderCollection::Equations,
+            |n| g.eqns.try_reserve(n),
         )?;
 
         // Presence was checked before reservation; keep the invariant typed if this code is rearranged, and leave the
@@ -856,9 +936,10 @@ impl Builder {
             .take()
             .ok_or(BuilderAppendError::ConsumedPlan)?;
         let result = prepared.result.value();
-        for (offset, meta) in plan.values.into_iter().enumerate() {
-            let id = prepared.base_value_count + offset;
-            match meta.storage {
+        for meta in plan.values {
+            let storage = meta.storage;
+            let id = g.values.push(meta);
+            match storage {
                 Storage::Const | Storage::Computed(_) | Storage::State => {
                     g.inputs.push(id);
                     g.consts.push(id);
@@ -869,18 +950,17 @@ impl Builder {
                 }
                 Storage::Device => {}
             }
-            g.values.push(meta);
         }
         g.eqns.extend(plan.equations);
         self.generation.set(next_generation);
-        Ok(result)
+        Ok(self.handle(result))
     }
 
-    fn reserve_append_collection<T>(
+    fn reserve_append_collection(
         &self,
-        values: &mut Vec<T>,
         additional: usize,
         collection: BuilderCollection,
+        try_reserve: impl FnOnce(usize) -> Result<(), std::collections::TryReserveError>,
     ) -> Result<(), BuilderAppendError> {
         #[cfg(test)]
         if self.reservation_failure.get() == Some(collection) {
@@ -890,7 +970,7 @@ impl Builder {
                 additional,
             });
         }
-        reserve(values, additional, collection)
+        reserve(additional, collection, try_reserve)
     }
 
     fn push_value(
@@ -902,8 +982,7 @@ impl Builder {
         state_role: Option<StateRole>,
     ) -> ValueId {
         let mut g = self.g.borrow_mut();
-        let id = g.values.len();
-        g.values.push(ValueMeta {
+        let id = g.values.push(ValueMeta {
             aval,
             storage,
             name,
@@ -929,7 +1008,7 @@ impl Builder {
             g.consts.push(id);
             g.inputs.push(id);
         }
-        Traced { id }
+        self.handle(id)
     }
 
     /// A constant the binder materializes from its own payload (a derived table such as RoPE's):
@@ -942,7 +1021,7 @@ impl Builder {
             g.consts.push(id);
             g.inputs.push(id);
         }
-        Traced { id }
+        self.handle(id)
     }
 
     /// A per-token-varying input (token / pos / seq_len), routed through a stable device buffer.
@@ -955,7 +1034,7 @@ impl Builder {
             g.slots.push((id, slot));
             g.inputs.push(id);
         }
-        Traced { id }
+        self.handle(id)
     }
 
     /// A runtime input whose name carries a caller-supplied disambiguator, so one graph can hold several inputs of
@@ -994,7 +1073,7 @@ impl Builder {
             g.slots.push((id, slot));
             g.inputs.push(id);
         }
-        Traced { id }
+        self.handle(id)
     }
 
     /// A persistent state input (a KV-cache buffer), carried across decode steps. A stable input binder like a
@@ -1024,7 +1103,7 @@ impl Builder {
             g.consts.push(id);
             g.inputs.push(id);
         }
-        Traced { id }
+        self.handle(id)
     }
 
     // primitive emitters
@@ -1044,12 +1123,12 @@ impl Builder {
             out,
             layer: self.current_layer(),
         });
-        Traced { id: out }
+        self.handle(out)
     }
 
     pub fn unary(&self, op: crate::op::UnOp, x: Traced) -> Traced {
         let t = self.aval(x);
-        self.emit(OpKind::Unary(op), vec![Operand::Value(x.id)], &[t])
+        self.emit(OpKind::Unary(op), vec![Operand::Value(self.id(x))], &[t])
     }
 
     pub fn binary(&self, op: crate::op::BinOp, a: Traced, b: Traced) -> Traced {
@@ -1064,7 +1143,7 @@ impl Builder {
         }
         self.emit(
             OpKind::Binary(op),
-            vec![Operand::Value(a.id), Operand::Value(b.id)],
+            vec![Operand::Value(self.id(a)), Operand::Value(self.id(b))],
             &[ta, tb],
         )
     }
@@ -1073,7 +1152,7 @@ impl Builder {
     /// `ceil(L/4)`.
     pub fn pack_i8(&self, x: Traced) -> Traced {
         let tx = self.aval(x);
-        self.emit(OpKind::PackI8, vec![Operand::Value(x.id)], &[tx])
+        self.emit(OpKind::PackI8, vec![Operand::Value(self.id(x))], &[tx])
     }
 
     /// Unpack `len` int8 codes from i32 words (inverse of [`Builder::pack_i8`]). Output is `F32` with last dim `len`.
@@ -1081,7 +1160,7 @@ impl Builder {
         let tc = self.aval(codes);
         self.emit(
             OpKind::UnpackI8 { len },
-            vec![Operand::Value(codes.id)],
+            vec![Operand::Value(self.id(codes))],
             &[tc],
         )
     }
@@ -1092,7 +1171,7 @@ impl Builder {
         let ts = s.ty();
         self.emit(
             OpKind::Binary(op),
-            vec![Operand::Value(a.id), Operand::Lit(s)],
+            vec![Operand::Value(self.id(a)), Operand::Lit(s)],
             &[ta, ts],
         )
     }
@@ -1110,9 +1189,9 @@ impl Builder {
         self.emit(
             OpKind::Select,
             vec![
-                Operand::Value(cond.id),
-                Operand::Value(if_true.id),
-                Operand::Value(if_false.id),
+                Operand::Value(self.id(cond)),
+                Operand::Value(self.id(if_true)),
+                Operand::Value(self.id(if_false)),
             ],
             &[tc, tt, tf],
         )
@@ -1122,7 +1201,7 @@ impl Builder {
         let t = self.aval(x);
         self.emit(
             OpKind::Reduce { op, axis, keepdim },
-            vec![Operand::Value(x.id)],
+            vec![Operand::Value(self.id(x))],
             &[t],
         )
     }
@@ -1131,7 +1210,7 @@ impl Builder {
         let t = self.aval(x);
         self.emit(
             OpKind::Broadcast { shape },
-            vec![Operand::Value(x.id)],
+            vec![Operand::Value(self.id(x))],
             &[t],
         )
     }
@@ -1172,7 +1251,10 @@ impl Builder {
             .unwrap_or_else(|e| panic!("trace-time shape error in scan: {e}"));
         let packed = self.emit(
             OpKind::Scan(attrs),
-            operands.iter().map(|t| Operand::Value(t.id)).collect(),
+            operands
+                .iter()
+                .map(|&t| Operand::Value(self.id(t)))
+                .collect(),
             &in_types,
         );
         let (y, s_out) = project_scan(self, packed, &layout);
@@ -1181,33 +1263,41 @@ impl Builder {
 
     pub fn reshape(&self, x: Traced, shape: Vec<usize>) -> Traced {
         let t = self.aval(x);
-        self.emit(OpKind::Reshape { shape }, vec![Operand::Value(x.id)], &[t])
+        self.emit(
+            OpKind::Reshape { shape },
+            vec![Operand::Value(self.id(x))],
+            &[t],
+        )
     }
 
     /// Cast `x` to storage dtype `to` (same shape). f32 -> bf16 rounds to bf16 precision; a widening or same-dtype
     /// cast is the identity. Feeds bf16 operands into the tensor-core matmul (card 045).
     pub fn cast(&self, x: Traced, to: crate::types::DType) -> Traced {
         let t = self.aval(x);
-        self.emit(OpKind::Cast { to }, vec![Operand::Value(x.id)], &[t])
+        self.emit(OpKind::Cast { to }, vec![Operand::Value(self.id(x))], &[t])
     }
 
     pub fn transpose(&self, x: Traced, perm: Vec<usize>) -> Traced {
         let t = self.aval(x);
-        self.emit(OpKind::Transpose { perm }, vec![Operand::Value(x.id)], &[t])
+        self.emit(
+            OpKind::Transpose { perm },
+            vec![Operand::Value(self.id(x))],
+            &[t],
+        )
     }
 
     pub fn slice(&self, x: Traced, axis: usize, start: usize, end: usize) -> Traced {
         let t = self.aval(x);
         self.emit(
             OpKind::Slice { axis, start, end },
-            vec![Operand::Value(x.id)],
+            vec![Operand::Value(self.id(x))],
             &[t],
         )
     }
 
     pub fn concat(&self, axis: usize, parts: &[Traced]) -> Traced {
         let in_types: Vec<TensorType> = parts.iter().map(|p| self.aval(*p)).collect();
-        let operands: Vec<Operand> = parts.iter().map(|p| Operand::Value(p.id)).collect();
+        let operands: Vec<Operand> = parts.iter().map(|&p| Operand::Value(self.id(p))).collect();
         self.emit(OpKind::Concat { axis }, operands, &in_types)
     }
 
@@ -1217,7 +1307,10 @@ impl Builder {
         let (td, ti) = (self.aval(data), self.aval(index));
         self.emit(
             OpKind::Gather { axis },
-            vec![Operand::Value(data.id), Operand::Value(index.id)],
+            vec![
+                Operand::Value(self.id(data)),
+                Operand::Value(self.id(index)),
+            ],
             &[td, ti],
         )
     }
@@ -1228,7 +1321,11 @@ impl Builder {
     /// permutation. See [`OpKind::ArgTopK`].
     pub fn arg_top_k(&self, rank: Traced, k: usize) -> Traced {
         let tr = self.aval(rank);
-        self.emit(OpKind::ArgTopK { k }, vec![Operand::Value(rank.id)], &[tr])
+        self.emit(
+            OpKind::ArgTopK { k },
+            vec![Operand::Value(self.id(rank))],
+            &[tr],
+        )
     }
 
     /// Exact uniform noise from an integer seed (card 551a, R472-007): `seed` is any-shape I32; output
@@ -1238,7 +1335,7 @@ impl Builder {
         let ts = self.aval(seed);
         self.emit(
             OpKind::RandomUniform { cols },
-            vec![Operand::Value(seed.id)],
+            vec![Operand::Value(self.id(seed))],
             &[ts],
         )
     }
@@ -1256,10 +1353,10 @@ impl Builder {
         params: Option<Traced>,
         top_k: Option<Traced>,
     ) -> Traced {
-        let mut operands = vec![Operand::Value(logits.id)];
+        let mut operands = vec![Operand::Value(self.id(logits))];
         let mut types = vec![self.aval(logits)];
         for t in [noise, params, top_k].into_iter().flatten() {
-            operands.push(Operand::Value(t.id));
+            operands.push(Operand::Value(self.id(t)));
             types.push(self.aval(t));
         }
         self.emit(OpKind::SampleToken { rule }, operands, &types)
@@ -1271,7 +1368,7 @@ impl Builder {
         let (ts, ti) = (self.aval(src), self.aval(index));
         self.emit(
             OpKind::Scatter { axis: 0 },
-            vec![Operand::Value(src.id), Operand::Value(index.id)],
+            vec![Operand::Value(self.id(src)), Operand::Value(self.id(index))],
             &[ts, ti],
         )
     }
@@ -1285,9 +1382,9 @@ impl Builder {
         self.emit(
             OpKind::ScatterUpdate,
             vec![
-                Operand::Value(base.id),
-                Operand::Value(src.id),
-                Operand::Value(inv.id),
+                Operand::Value(self.id(base)),
+                Operand::Value(self.id(src)),
+                Operand::Value(self.id(inv)),
             ],
             &[tb, ts, ti],
         )
@@ -1312,8 +1409,8 @@ impl Builder {
         self.emit(
             OpKind::DynamicUpdateSlice { axis },
             vec![
-                Operand::Value(operand.id),
-                Operand::Value(update.id),
+                Operand::Value(self.id(operand)),
+                Operand::Value(self.id(update)),
                 Operand::Lit(idx),
             ],
             &[to, tu, idx.ty()],
@@ -1335,9 +1432,9 @@ impl Builder {
         self.emit(
             OpKind::DynamicUpdateSlice { axis },
             vec![
-                Operand::Value(operand.id),
-                Operand::Value(update.id),
-                Operand::Value(index.id),
+                Operand::Value(self.id(operand)),
+                Operand::Value(self.id(update)),
+                Operand::Value(self.id(index)),
             ],
             &[to, tu, ti],
         )
@@ -1347,7 +1444,7 @@ impl Builder {
         let (ta, tb) = (self.aval(a), self.aval(b));
         self.emit(
             OpKind::MatMul,
-            vec![Operand::Value(a.id), Operand::Value(b.id)],
+            vec![Operand::Value(self.id(a)), Operand::Value(self.id(b))],
             &[ta, tb],
         )
     }
@@ -1364,7 +1461,7 @@ impl Builder {
             OpKind::PackedDequant { descriptor },
             sources
                 .iter()
-                .map(|source| Operand::Value(source.id))
+                .map(|&source| Operand::Value(self.id(source)))
                 .collect(),
             &types,
         )
@@ -1378,38 +1475,39 @@ impl Builder {
         self.emit(
             OpKind::IndexedMatMul,
             vec![
-                Operand::Value(x.id),
-                Operand::Value(w.id),
-                Operand::Value(idx.id),
+                Operand::Value(self.id(x)),
+                Operand::Value(self.id(w)),
+                Operand::Value(self.id(idx)),
             ],
             &[tx, tw, tidx],
         )
     }
 
-    /// AllReduce collective (card 049a, tensor-parallel): `op`-reduces a same-shaped partial tensor across all ranks
-    /// and returns the full result in the same shape. `axis` is the shard axis (metadata for the multi-device
-    /// ring-allreduce lowering, card 049b).
+    /// AllReduce collective (tensor-parallel): `op`-reduces a same-shaped partial tensor across all ranks and
+    /// returns the full result in the same shape. `axis` is the shard axis.
     ///
-    /// In a single-rank (world_size=1) graph the node evaluates as the identity. The multi-rank test harness sums
-    /// per-rank evals outside the graph to simulate the collective.
+    /// A collective is a cut point between stage programs: `compile` refuses one inside a stage graph.
     pub fn all_reduce(&self, x: Traced, op: crate::op::RedOp, axis: usize) -> Traced {
         let t = self.aval(x);
         self.emit(
             OpKind::AllReduce { op, axis },
-            vec![Operand::Value(x.id)],
+            vec![Operand::Value(self.id(x))],
             &[t],
         )
     }
 
-    /// AllGather collective (card 049a, column-parallel matmul): each rank holds a slice of the output along `axis`;
-    /// the collective concatenates slices across ranks, growing `axis` by world_size.
+    /// AllGather collective (column-parallel matmul): each of `world` ranks holds a slice of the output along
+    /// `axis`; the collective concatenates the slices, so the result's `axis` is `world` times `x`'s.
     ///
-    /// `axis` is the gather axis (the output N/feature axis in column-parallel matmul). In a single-rank
-    /// (world_size=1) graph the node evaluates as the identity. The multi-rank lowering (card 049b) concatenates
-    /// per-rank output slices; the test harness simulates this by concatenating per-rank evals outside the graph.
-    pub fn all_gather(&self, x: Traced, axis: usize) -> Traced {
+    /// `axis` is the gather axis (the output N/feature axis in column-parallel matmul). A collective is a cut
+    /// point between stage programs: `compile` refuses one inside a stage graph.
+    pub fn all_gather(&self, x: Traced, axis: usize, world: NonZeroU32) -> Traced {
         let t = self.aval(x);
-        self.emit(OpKind::AllGather { axis }, vec![Operand::Value(x.id)], &[t])
+        self.emit(
+            OpKind::AllGather { axis, world },
+            vec![Operand::Value(self.id(x))],
+            &[t],
+        )
     }
 
     // convenience scalar makers (kept here so models do not import types directly).
@@ -1487,6 +1585,44 @@ mod tests {
         }
     }
 
+    /// A builder with one `[2]` F32 constant, `name`d; its value id is 0 in every builder, so a handle
+    /// from one is a valid-looking id in another.
+    fn builder_with_constant(name: &str) -> (Builder, Traced) {
+        let b = Builder::new();
+        let x = b.constant(name, TensorType::f32(vec![2]));
+        (b, x)
+    }
+
+    /// SC-001: a handle used with the builder that did not mint it panics at first use. Both handles
+    /// are value 0, so without the brand check the foreign one is silently read as the local value.
+    #[test]
+    #[should_panic(expected = "minted by another Builder")]
+    fn a_foreign_handle_in_an_emitter_panics() {
+        let (a, foreign) = builder_with_constant("a");
+        let (b, local) = builder_with_constant("b");
+        assert_eq!(foreign.id(), local.id());
+        drop(a);
+        b.binary(crate::op::BinOp::Add, local, foreign);
+    }
+
+    #[test]
+    #[should_panic(expected = "minted by another Builder")]
+    fn a_foreign_handle_cannot_finish_a_graph() {
+        let (a, foreign) = builder_with_constant("a");
+        let (b, _local) = builder_with_constant("b");
+        drop(a);
+        b.finish(foreign);
+    }
+
+    #[test]
+    #[should_panic(expected = "minted by another Builder")]
+    fn a_foreign_handle_has_no_aval() {
+        let (a, foreign) = builder_with_constant("a");
+        let (b, _local) = builder_with_constant("b");
+        drop(a);
+        b.aval(foreign);
+    }
+
     fn valid_plan(
         builder: &Builder,
         input: Traced,
@@ -1520,17 +1656,17 @@ mod tests {
                 checked_name_bytes: 12,
             }
         );
-        assert_eq!(builder.commit_append(&mut prepared)?, 0);
+        assert_eq!(builder.commit_append(&mut prepared)?.id(), ValueId::new(0));
 
         let graph = builder.finish(result);
-        assert_eq!(graph.output, 0);
-        assert_eq!(graph.inputs, vec![0]);
-        assert_eq!(graph.consts, vec![0]);
+        assert_eq!(graph.output, ValueId::new(0));
+        assert_eq!(graph.inputs, vec![ValueId::new(0)]);
+        assert_eq!(graph.consts, vec![ValueId::new(0)]);
         assert!(graph.slots.is_empty());
         assert!(graph.eqns.is_empty());
-        assert_eq!(graph.values[0].storage, Storage::Const);
+        assert_eq!(graph.values[ValueId::new(0)].storage, Storage::Const);
         assert_eq!(
-            graph.values[0].aval,
+            graph.values[ValueId::new(0)].aval,
             TensorType::new(vec![2, 3], DType::BF16)
         );
         assert!(graph.validate().is_ok());
@@ -1548,16 +1684,22 @@ mod tests {
         )?;
 
         let mut prepared = builder.preflight_append(plan)?;
-        assert_eq!(builder.commit_append(&mut prepared)?, 0);
+        assert_eq!(builder.commit_append(&mut prepared)?.id(), ValueId::new(0));
 
         let graph = builder.finish(result);
-        assert_eq!(graph.output, 0);
-        assert_eq!(graph.inputs, vec![0]);
+        assert_eq!(graph.output, ValueId::new(0));
+        assert_eq!(graph.inputs, vec![ValueId::new(0)]);
         assert!(graph.consts.is_empty());
-        assert_eq!(graph.slots, vec![(0, Slot::SlotMap)]);
+        assert_eq!(graph.slots, vec![(ValueId::new(0), Slot::SlotMap)]);
         assert!(graph.eqns.is_empty());
-        assert_eq!(graph.values[0].storage, Storage::Slot(Slot::SlotMap));
-        assert_eq!(graph.values[0].aval, TensorType::new(vec![4], DType::I8));
+        assert_eq!(
+            graph.values[ValueId::new(0)].storage,
+            Storage::Slot(Slot::SlotMap)
+        );
+        assert_eq!(
+            graph.values[ValueId::new(0)].aval,
+            TensorType::new(vec![4], DType::I8)
+        );
         assert!(graph.validate().is_ok());
         Ok(())
     }
@@ -1581,11 +1723,11 @@ mod tests {
             let builder = Builder::new();
             let mut plan = builder.append_plan(0);
             plan.input("staged", TensorType::f32(vec![1]), Storage::Const)?;
-            plan.declare_result(Traced { id: usize::MAX })?;
+            plan.declare_result(plan.handle(ValueId::new(u32::MAX)))?;
             let before = state(&builder);
             assert!(matches!(
                 builder.preflight_append(plan),
-                Err(BuilderAppendError::InvalidResult { value }) if value == usize::MAX
+                Err(BuilderAppendError::InvalidResult { value }) if value == ValueId::new(u32::MAX)
             ));
             assert_eq!(state(&builder), before);
         }
@@ -1622,12 +1764,17 @@ mod tests {
             let builder = Builder::new();
             let mut plan = builder.append_plan(0);
             let local_input = plan.input("local", TensorType::f32(vec![1]), Storage::Const)?;
-            assert_eq!(foreign_input.id, local_input.id);
-            plan.declare_result(foreign_input)?;
+            // Same numeric id, different builder: the brand, not the number, tells them apart.
+            assert_eq!(foreign_input.id(), local_input.id());
+            assert_eq!(
+                plan.declare_result(foreign_input),
+                Err(BuilderAppendError::ForeignBuilder)
+            );
+            assert!(plan.result.is_none());
             let before = state(&builder);
             assert!(matches!(
                 builder.preflight_append(plan),
-                Err(BuilderAppendError::InvalidResult { value }) if value == local_input.id
+                Err(BuilderAppendError::MissingResult)
             ));
             assert_eq!(state(&builder), before);
         }
@@ -1636,7 +1783,7 @@ mod tests {
             let builder = Builder::new();
             let mut plan = builder.append_plan(0);
             let local_input = plan.input("local", TensorType::f32(vec![1]), Storage::Const)?;
-            plan.declare_result(Traced { id: local_input.id })?;
+            plan.declare_result(local_input)?;
             let before = state(&builder);
             assert!(matches!(
                 builder.preflight_append(plan),
@@ -1656,7 +1803,7 @@ mod tests {
                 key: None,
                 state_role: None,
             });
-            plan.declare_result(Traced { id: value })?;
+            plan.declare_result(plan.handle(value))?;
             let before = state(&builder);
             assert!(matches!(
                 builder.preflight_append(plan),
@@ -1696,7 +1843,7 @@ mod tests {
             let mut plan = builder.append_plan(0);
             let stale_result =
                 plan.input_result("stale", TensorType::f32(vec![1]), Storage::Const)?;
-            assert_eq!(stale_result.id, 0);
+            assert_eq!(stale_result.id(), ValueId::new(0));
             builder.constant("intervening", TensorType::f32(vec![1]));
             let before = state(&builder);
             assert!(matches!(
@@ -1708,9 +1855,9 @@ mod tests {
             let mut next = builder.append_plan(0);
             let next_result =
                 next.input_result("next", TensorType::f32(vec![1]), Storage::Const)?;
-            assert_eq!(next_result.id, 1);
+            assert_eq!(next_result.id(), ValueId::new(1));
             let mut prepared = builder.preflight_append(next)?;
-            assert_eq!(builder.commit_append(&mut prepared)?, 1);
+            assert_eq!(builder.commit_append(&mut prepared)?.id(), ValueId::new(1));
         }
 
         {
@@ -1739,9 +1886,9 @@ mod tests {
                 TensorType::f32(vec![1]),
                 Storage::Slot(Slot::Activation),
             )?;
-            assert_eq!(next_result.id, 1);
+            assert_eq!(next_result.id(), ValueId::new(1));
             let mut prepared = builder.preflight_append(next)?;
-            assert_eq!(builder.commit_append(&mut prepared)?, 1);
+            assert_eq!(builder.commit_append(&mut prepared)?.id(), ValueId::new(1));
         }
 
         Ok(())
@@ -1786,8 +1933,8 @@ mod tests {
                 assert_eq!(state(&builder), before);
                 assert!(prepared.plan.is_some());
                 assert_eq!(prepared.result.value(), result.id);
-                assert_eq!(builder.commit_append(&mut prepared)?, result.id);
-                assert_eq!(result.id, 0);
+                assert_eq!(builder.commit_append(&mut prepared)?, result);
+                assert_eq!(result.id(), ValueId::new(0));
             }
         }
         Ok(())
@@ -1795,7 +1942,6 @@ mod tests {
 
     fn inject_name(builder: &Builder, namespace: BuilderValueNamespace, name: &str) {
         let mut graph = builder.g.borrow_mut();
-        let id = graph.values.len();
         let storage = match namespace {
             BuilderValueNamespace::Slot => Storage::Slot(Slot::Activation),
             BuilderValueNamespace::EquationResult | BuilderValueNamespace::NamedValue => {
@@ -1803,7 +1949,7 @@ mod tests {
             }
             BuilderValueNamespace::Input | BuilderValueNamespace::Constant => Storage::State,
         };
-        graph.values.push(ValueMeta {
+        let id = graph.values.push(ValueMeta {
             aval: TensorType::f32(vec![1]),
             storage,
             name: Some(name.to_string()),
@@ -1821,7 +1967,7 @@ mod tests {
                 graph.slots.push((id, Slot::Activation));
             }
             BuilderValueNamespace::EquationResult => {
-                let source = 0;
+                let source = ValueId::new(0);
                 graph.eqns.push(Eqn {
                     op: OpKind::Cast { to: DType::F32 },
                     inputs: vec![Operand::Value(source)],
@@ -1935,15 +2081,15 @@ mod tests {
         let builder = Builder::new();
         let input = builder.constant("input", TensorType::f32(vec![2, 3]));
         let mut plan = valid_plan(&builder, input)?;
-        plan.equations[0].inputs[0] = Operand::Value(usize::MAX);
+        plan.equations[0].inputs[0] = Operand::Value(ValueId::new(u32::MAX));
         let before = state(&builder);
         assert!(matches!(
             builder.preflight_append(plan),
             Err(BuilderAppendError::InvalidOperand {
                 equation: 0,
-                value: usize::MAX,
+                value,
                 ..
-            })
+            }) if value == ValueId::new(u32::MAX)
         ));
         assert_eq!(state(&builder), before);
         Ok(())
@@ -1967,7 +2113,7 @@ mod tests {
         let mut prepared = builder.preflight_append(plan)?;
         let output = builder.commit_append(&mut prepared)?;
         let after_success = state(&builder);
-        assert!(output < after_success.values);
+        assert!(output.id().index() < after_success.values);
         assert_eq!(
             builder.commit_append(&mut prepared),
             Err(BuilderAppendError::ConsumedPlan)
@@ -2012,7 +2158,7 @@ mod tests {
             ));
             assert_eq!(state(&builder), before, "{collection:?} reserved too late");
             assert!(prepared.plan.is_some(), "{collection:?} consumed the plan");
-            assert_eq!(builder.commit_append(&mut prepared)?, output.id);
+            assert_eq!(builder.commit_append(&mut prepared)?, output);
         }
         Ok(())
     }
@@ -2039,7 +2185,7 @@ mod tests {
             }
         );
         let generation = builder.generation();
-        assert_eq!(builder.commit_append(&mut prepared)?, output.id);
+        assert_eq!(builder.commit_append(&mut prepared)?, output);
         assert_eq!(builder.generation(), generation + 1);
         let graph = builder.finish(output);
         assert_eq!(graph.values.len(), 3);

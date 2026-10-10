@@ -235,13 +235,14 @@ impl Device for WgpuDevice {
             .try_for_each(|item| self.submit(item))
     }
 
-    fn write(
+    fn write_with(
         &mut self,
         dst: &DeviceBuffer,
         offset: usize,
-        bytes: &[u8],
+        len: usize,
+        fill: &mut dyn FnMut(std::ops::Range<usize>, &mut [u8]),
     ) -> Result<(), RuntimeError> {
-        self.ctx.write_bytes(dst, offset, bytes)
+        self.ctx.write_with(dst, offset, len, fill)
     }
 
     fn read(&mut self, src: &DeviceBuffer, out: &mut [u8]) -> Result<(), RuntimeError> {

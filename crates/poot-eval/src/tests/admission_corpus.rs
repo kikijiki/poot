@@ -28,9 +28,10 @@
 
 use poot_tensor::DType;
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 
 use poot_graph_ir::op::{ContractionHead, FusedOp, FusedOperand, FusedRegion, FusedStep};
-use poot_graph_ir::{BinOp, Builder, OpKind, Operand, RedOp, StateRole, TensorType, Traced, UnOp};
+use poot_graph_ir::{BinOp, Builder, OpKind, Operand, RedOp, StateRole, TensorType, UnOp};
 
 use super::helpers;
 use crate::cast_authority::CastAuthority;
@@ -252,7 +253,7 @@ fn unary_admits_f32_and_i32_word_forms() {
     let x = b.constant("x", TensorType::f32(vec![3]));
     let y = b.unary(UnOp::Neg, x);
     let g = b.finish(y);
-    let inputs = dense_inputs([(x.id, HostTensor::f32(vec![3], vec![1.0, -2.0, 0.0]))]);
+    let inputs = dense_inputs([(x.id(), HostTensor::f32(vec![3], vec![1.0, -2.0, 0.0]))]);
     let out = eval_every_combination("unary f32 neg", &g, &inputs).unwrap();
     let Value::Host(t) = out else {
         panic!("expected dense")
@@ -265,7 +266,7 @@ fn unary_admits_f32_and_i32_word_forms() {
     let x = helpers::i32_constant(&b, "x", vec![2]).unwrap();
     let y = b.unary(UnOp::Not, x);
     let g = b.finish(y);
-    let inputs = dense_inputs([(x.id, HostTensor::i32(vec![2], vec![0, -1]))]);
+    let inputs = dense_inputs([(x.id(), HostTensor::i32(vec![2], vec![0, -1]))]);
     let out = eval_every_combination("unary i32 not", &g, &inputs).unwrap();
     let Value::Host(t) = out else {
         panic!("expected dense")
@@ -282,8 +283,8 @@ fn binary_admits_f32_arithmetic_and_i32_word_forms() {
     let z = b.binary(BinOp::Add, x, y);
     let g = b.finish(z);
     let inputs = dense_inputs([
-        (x.id, HostTensor::f32(vec![2], vec![1.0, 2.0])),
-        (y.id, HostTensor::f32(vec![2], vec![3.0, 4.0])),
+        (x.id(), HostTensor::f32(vec![2], vec![1.0, 2.0])),
+        (y.id(), HostTensor::f32(vec![2], vec![3.0, 4.0])),
     ]);
     let out = eval_every_combination("binary f32 add", &g, &inputs).unwrap();
     let Value::Host(t) = out else {
@@ -303,8 +304,8 @@ fn binary_admits_f32_arithmetic_and_i32_word_forms() {
         let z = b.binary(op, x, y);
         let g = b.finish(z);
         let inputs = dense_inputs([
-            (x.id, HostTensor::i32(vec![2], a.to_vec())),
-            (y.id, HostTensor::i32(vec![2], bb.to_vec())),
+            (x.id(), HostTensor::i32(vec![2], a.to_vec())),
+            (y.id(), HostTensor::i32(vec![2], bb.to_vec())),
         ]);
         let out = eval_every_combination(&format!("binary i32 {op:?}"), &g, &inputs).unwrap();
         let Value::Host(t) = out else {
@@ -323,9 +324,9 @@ fn select_evaluates_i32_branches_through_every_binding() {
     let out = b.select(cond, t, f);
     let g = b.finish(out);
     let inputs = dense_inputs([
-        (cond.id, HostTensor::i32(vec![2], vec![1, 0])),
-        (t.id, HostTensor::i32(vec![2], vec![10, 10])),
-        (f.id, HostTensor::i32(vec![2], vec![20, 20])),
+        (cond.id(), HostTensor::i32(vec![2], vec![1, 0])),
+        (t.id(), HostTensor::i32(vec![2], vec![10, 10])),
+        (f.id(), HostTensor::i32(vec![2], vec![20, 20])),
     ]);
     let out = eval_every_combination("select i32", &g, &inputs).unwrap();
     let Value::Host(tensor) = out else {
@@ -345,7 +346,7 @@ fn reduce_broadcast_reshape_transpose_slice_concat_iota_evaluate() {
     let out = b.reduce(RedOp::Sum, x, 1, false);
     let g = b.finish(out);
     let inputs = dense_inputs([(
-        x.id,
+        x.id(),
         HostTensor::f32(vec![2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
     )]);
     let out = eval_every_combination("reduce sum", &g, &inputs).unwrap();
@@ -355,7 +356,7 @@ fn reduce_broadcast_reshape_transpose_slice_concat_iota_evaluate() {
     let x = b.constant("x", TensorType::f32(vec![1]));
     let out = b.broadcast(x, vec![3]);
     let g = b.finish(out);
-    let inputs = dense_inputs([(x.id, HostTensor::f32(vec![1], vec![7.0]))]);
+    let inputs = dense_inputs([(x.id(), HostTensor::f32(vec![1], vec![7.0]))]);
     let out = eval_every_combination("broadcast", &g, &inputs).unwrap();
     assert_eq!(out.as_host().unwrap().as_f32().unwrap(), &[7.0, 7.0, 7.0]);
 
@@ -364,7 +365,7 @@ fn reduce_broadcast_reshape_transpose_slice_concat_iota_evaluate() {
     let out = b.reshape(x, vec![3, 2]);
     let g = b.finish(out);
     let inputs = dense_inputs([(
-        x.id,
+        x.id(),
         HostTensor::f32(vec![2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
     )]);
     let out = eval_every_combination("reshape", &g, &inputs).unwrap();
@@ -375,7 +376,7 @@ fn reduce_broadcast_reshape_transpose_slice_concat_iota_evaluate() {
     let out = b.transpose(x, vec![1, 0]);
     let g = b.finish(out);
     let inputs = dense_inputs([(
-        x.id,
+        x.id(),
         HostTensor::f32(vec![2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
     )]);
     let out = eval_every_combination("transpose", &g, &inputs).unwrap();
@@ -385,7 +386,7 @@ fn reduce_broadcast_reshape_transpose_slice_concat_iota_evaluate() {
     let x = b.constant("x", TensorType::f32(vec![4]));
     let out = b.slice(x, 0, 1, 3);
     let g = b.finish(out);
-    let inputs = dense_inputs([(x.id, HostTensor::f32(vec![4], vec![1.0, 2.0, 3.0, 4.0]))]);
+    let inputs = dense_inputs([(x.id(), HostTensor::f32(vec![4], vec![1.0, 2.0, 3.0, 4.0]))]);
     let out = eval_every_combination("slice", &g, &inputs).unwrap();
     assert_eq!(out.as_host().unwrap().as_f32().unwrap(), &[2.0, 3.0]);
 
@@ -395,8 +396,8 @@ fn reduce_broadcast_reshape_transpose_slice_concat_iota_evaluate() {
     let out = b.concat(0, &[x, y]);
     let g = b.finish(out);
     let inputs = dense_inputs([
-        (x.id, HostTensor::f32(vec![2], vec![1.0, 2.0])),
-        (y.id, HostTensor::f32(vec![2], vec![3.0, 4.0])),
+        (x.id(), HostTensor::f32(vec![2], vec![1.0, 2.0])),
+        (y.id(), HostTensor::f32(vec![2], vec![3.0, 4.0])),
     ]);
     let out = eval_every_combination("concat", &g, &inputs).unwrap();
     assert_eq!(
@@ -428,10 +429,10 @@ fn gather_scatter_scatter_update_evaluate() {
     let g = b.finish(out);
     let inputs = dense_inputs([
         (
-            table.id,
+            table.id(),
             HostTensor::f32(vec![3, 2], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
         ),
-        (index.id, HostTensor::i32(vec![2], vec![2, 0])),
+        (index.id(), HostTensor::i32(vec![2], vec![2, 0])),
     ]);
     let out = eval_every_combination("gather", &g, &inputs).unwrap();
     assert_eq!(
@@ -446,10 +447,10 @@ fn gather_scatter_scatter_update_evaluate() {
     let g = b.finish(out);
     let inputs = dense_inputs([
         (
-            src.id,
+            src.id(),
             HostTensor::f32(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]),
         ),
-        (index.id, HostTensor::i32(vec![2], vec![1, 0])),
+        (index.id(), HostTensor::i32(vec![2], vec![1, 0])),
     ]);
     let out = eval_every_combination("scatter", &g, &inputs).unwrap();
     assert_eq!(
@@ -464,9 +465,9 @@ fn gather_scatter_scatter_update_evaluate() {
     let out = b.scatter_update(base, src, inv);
     let g = b.finish(out);
     let inputs = dense_inputs([
-        (base.id, HostTensor::f32(vec![3, 1], vec![0.0, 0.0, 0.0])),
-        (src.id, HostTensor::f32(vec![2, 1], vec![9.0, 8.0])),
-        (inv.id, HostTensor::f32(vec![3], vec![-1.0, 1.0, 0.0])),
+        (base.id(), HostTensor::f32(vec![3, 1], vec![0.0, 0.0, 0.0])),
+        (src.id(), HostTensor::f32(vec![2, 1], vec![9.0, 8.0])),
+        (inv.id(), HostTensor::f32(vec![3], vec![-1.0, 1.0, 0.0])),
     ]);
     let out = eval_every_combination("scatter_update", &g, &inputs).unwrap();
     assert_eq!(out.as_host().unwrap().as_f32().unwrap(), &[0.0, 8.0, 9.0]);
@@ -480,8 +481,11 @@ fn matmul_contraction_epilogue_indexed_matmul_evaluate() {
     let out = b.matmul(a, w);
     let g = b.finish(out);
     let inputs = dense_inputs([
-        (a.id, HostTensor::f32(vec![1, 2], vec![1.0, 2.0])),
-        (w.id, HostTensor::f32(vec![2, 2], vec![1.0, 0.0, 0.0, 1.0])),
+        (a.id(), HostTensor::f32(vec![1, 2], vec![1.0, 2.0])),
+        (
+            w.id(),
+            HostTensor::f32(vec![2, 2], vec![1.0, 0.0, 0.0, 1.0]),
+        ),
     ]);
     let out = eval_every_combination("matmul", &g, &inputs).unwrap();
     assert_eq!(out.as_host().unwrap().as_f32().unwrap(), &[1.0, 2.0]);
@@ -508,22 +512,23 @@ fn matmul_contraction_epilogue_indexed_matmul_evaluate() {
                 },
             },
             vec![
-                Operand::Value(a.id),
-                Operand::Value(w.id),
-                Operand::Value(bias.id),
+                Operand::Value(a.id()),
+                Operand::Value(w.id()),
+                Operand::Value(bias.id()),
             ],
         )
         .expect("stage ContractionEpilogue");
     plan.declare_result(staged).expect("declare result");
     let mut prepared = b.preflight_append(plan).expect("preflight append");
-    let out = Traced {
-        id: b.commit_append(&mut prepared).expect("commit append"),
-    };
+    let out = b.commit_append(&mut prepared).expect("commit append");
     let g = b.finish(out);
     let inputs = dense_inputs([
-        (a.id, HostTensor::f32(vec![1, 2], vec![1.0, 2.0])),
-        (w.id, HostTensor::f32(vec![2, 2], vec![1.0, 0.0, 0.0, 1.0])),
-        (bias.id, HostTensor::f32(vec![2], vec![10.0, 20.0])),
+        (a.id(), HostTensor::f32(vec![1, 2], vec![1.0, 2.0])),
+        (
+            w.id(),
+            HostTensor::f32(vec![2, 2], vec![1.0, 0.0, 0.0, 1.0]),
+        ),
+        (bias.id(), HostTensor::f32(vec![2], vec![10.0, 20.0])),
     ]);
     let out = eval_every_combination("contraction_epilogue", &g, &inputs).unwrap();
     assert_eq!(out.as_host().unwrap().as_f32().unwrap(), &[11.0, 22.0]);
@@ -535,12 +540,12 @@ fn matmul_contraction_epilogue_indexed_matmul_evaluate() {
     let out = b.indexed_matmul(x, w, idx);
     let g = b.finish(out);
     let inputs = dense_inputs([
-        (x.id, HostTensor::f32(vec![1, 2], vec![1.0, 2.0])),
+        (x.id(), HostTensor::f32(vec![1, 2], vec![1.0, 2.0])),
         (
-            w.id,
+            w.id(),
             HostTensor::f32(vec![2, 2, 2], vec![1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0]),
         ),
-        (idx.id, HostTensor::i32(vec![1], vec![1])),
+        (idx.id(), HostTensor::i32(vec![1], vec![1])),
     ]);
     let out = eval_every_combination("indexed_matmul", &g, &inputs).unwrap();
     assert_eq!(out.as_host().unwrap().as_f32().unwrap(), &[2.0, 1.0]);
@@ -554,8 +559,11 @@ fn dynamic_update_slice_pack_unpack_i8_arg_top_k_evaluate() {
     let out = b.dynamic_update_slice(base, update, 1, 0);
     let g = b.finish(out);
     let inputs = dense_inputs([
-        (base.id, HostTensor::f32(vec![4], vec![0.0, 0.0, 0.0, 0.0])),
-        (update.id, HostTensor::f32(vec![2], vec![9.0, 8.0])),
+        (
+            base.id(),
+            HostTensor::f32(vec![4], vec![0.0, 0.0, 0.0, 0.0]),
+        ),
+        (update.id(), HostTensor::f32(vec![2], vec![9.0, 8.0])),
     ]);
     let out = eval_every_combination("dynamic_update_slice", &g, &inputs).unwrap();
     assert_eq!(
@@ -567,7 +575,7 @@ fn dynamic_update_slice_pack_unpack_i8_arg_top_k_evaluate() {
     let x = helpers::i32_constant(&b, "x", vec![4]).unwrap();
     let packed = b.pack_i8(x);
     let g = b.finish(packed);
-    let inputs = dense_inputs([(x.id, HostTensor::i32(vec![4], vec![1, 2, 3, 4]))]);
+    let inputs = dense_inputs([(x.id(), HostTensor::i32(vec![4], vec![1, 2, 3, 4]))]);
     let out = eval_every_combination("pack_i8", &g, &inputs).unwrap();
     assert!(out.as_host().unwrap().as_i32().is_some());
 
@@ -576,7 +584,7 @@ fn dynamic_update_slice_pack_unpack_i8_arg_top_k_evaluate() {
     let packed = b.pack_i8(x);
     let out = b.unpack_i8(packed, 4);
     let g = b.finish(out);
-    let inputs = dense_inputs([(x.id, HostTensor::i32(vec![4], vec![1, 2, 3, 4]))]);
+    let inputs = dense_inputs([(x.id(), HostTensor::i32(vec![4], vec![1, 2, 3, 4]))]);
     let out = eval_every_combination("unpack_i8", &g, &inputs).unwrap();
     assert_eq!(
         out.as_host().unwrap().as_f32().unwrap(),
@@ -590,7 +598,7 @@ fn dynamic_update_slice_pack_unpack_i8_arg_top_k_evaluate() {
     let x = b.constant("x", TensorType::f32(vec![4]));
     let out = b.arg_top_k(x, 2);
     let g = b.finish(out);
-    let inputs = dense_inputs([(x.id, HostTensor::f32(vec![4], vec![2.0, 0.0, 3.0, 1.0]))]);
+    let inputs = dense_inputs([(x.id(), HostTensor::f32(vec![4], vec![2.0, 0.0, 3.0, 1.0]))]);
     let out = eval_every_combination("arg_top_k", &g, &inputs).unwrap();
     assert_eq!(out.as_host().unwrap().as_f32().unwrap(), &[1.0, 3.0]);
 }
@@ -601,17 +609,37 @@ fn all_reduce_all_gather_are_the_single_rank_identity() {
     let x = b.constant("x", TensorType::f32(vec![3]));
     let out = b.all_reduce(x, RedOp::Sum, 0);
     let g = b.finish(out);
-    let inputs = dense_inputs([(x.id, HostTensor::f32(vec![3], vec![1.0, 2.0, 3.0]))]);
+    let inputs = dense_inputs([(x.id(), HostTensor::f32(vec![3], vec![1.0, 2.0, 3.0]))]);
     let out = eval_every_combination("all_reduce", &g, &inputs).unwrap();
     assert_eq!(out.as_host().unwrap().as_f32().unwrap(), &[1.0, 2.0, 3.0]);
 
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![3]));
-    let out = b.all_gather(x, 0);
+    let out = b.all_gather(x, 0, NonZeroU32::MIN);
     let g = b.finish(out);
-    let inputs = dense_inputs([(x.id, HostTensor::f32(vec![3], vec![1.0, 2.0, 3.0]))]);
+    let inputs = dense_inputs([(x.id(), HostTensor::f32(vec![3], vec![1.0, 2.0, 3.0]))]);
     let out = eval_every_combination("all_gather", &g, &inputs).unwrap();
     assert_eq!(out.as_host().unwrap().as_f32().unwrap(), &[1.0, 2.0, 3.0]);
+}
+
+/// POOT-747: the oracle holds one rank, so an `AllGather` over more than one rank is a typed
+/// refusal on every option combination, never the input returned as if it were the gathered tensor.
+#[test]
+fn all_gather_over_more_than_one_rank_is_refused() {
+    let b = Builder::new();
+    let x = b.constant("x", TensorType::f32(vec![3]));
+    let out = b.all_gather(x, 0, NonZeroU32::new(2).unwrap());
+    let eqn = out.id();
+    let g = b.finish(out);
+    let inputs = dense_inputs([(x.id(), HostTensor::f32(vec![3], vec![1.0, 2.0, 3.0]))]);
+    match eval_every_combination("all_gather_world_2", &g, &inputs) {
+        Err(EvalError::Unsupported {
+            eqn: refused,
+            op: "all_gather",
+            ..
+        }) => assert_eq!(refused, eqn),
+        other => panic!("expected the all_gather refusal, got {other:?}"),
+    }
 }
 
 /// Card 551a: `RandomUniform` and every `SampleToken` rule evaluate without panicking,
@@ -625,7 +653,7 @@ fn random_uniform_and_sample_token_evaluate() {
     let seed = helpers::i32_constant(&b, "seed", vec![2]).unwrap();
     let out = b.random_uniform(seed, 3);
     let g = b.finish(out);
-    let inputs = dense_inputs([(seed.id, HostTensor::i32(vec![2], vec![1, 2]))]);
+    let inputs = dense_inputs([(seed.id(), HostTensor::i32(vec![2], vec![1, 2]))]);
     let out = eval_every_combination("random_uniform", &g, &inputs).unwrap();
     let data = out.as_host().unwrap();
     assert_eq!(data.shape(), vec![2, 3]);
@@ -644,7 +672,7 @@ fn random_uniform_and_sample_token_evaluate() {
     );
     let g = b.finish(out);
     let inputs = dense_inputs([(
-        logits.id,
+        logits.id(),
         HostTensor::f32(
             vec![2, 5],
             vec![1.0, 2.0, 3.0, 0.0, -1.0, 5.0, 4.0, 3.0, 2.0, 1.0],
@@ -681,19 +709,19 @@ fn random_uniform_and_sample_token_evaluate() {
         }
         let mut inputs: HashMap<poot_graph_ir::ValueId, Value> = HashMap::new();
         inputs.insert(
-            logits.id,
+            logits.id(),
             Value::from(HostTensor::f32(vec![1, 4], vec![1.0, 2.0, 3.0, 0.5])),
         );
         inputs.insert(
-            noise.id,
+            noise.id(),
             Value::from(HostTensor::f32(vec![1, 4], vec![0.0, 0.0, 0.0, 0.0])),
         );
         inputs.insert(
-            params.id,
+            params.id(),
             Value::from(HostTensor::f32(vec![1, cols], params_data)),
         );
         if let Some(top_k) = top_k {
-            inputs.insert(top_k.id, Value::from(HostTensor::i32(vec![1], vec![0])));
+            inputs.insert(top_k.id(), Value::from(HostTensor::i32(vec![1], vec![0])));
         }
         let out = eval_every_combination(&format!("sample_token_{rule:?}"), &g, &inputs).unwrap();
         let data = out.as_host().unwrap();
@@ -728,17 +756,17 @@ fn resume_appends_a_greedy_sample_head_and_keeps_state_unchanged() {
     let g2 = resumed.builder.finish_with_state(head.out, &resumed.state);
     assert_eq!(
         g2.state,
-        vec![(cache_in.id, cache_in.id)],
+        vec![(cache_in.id(), cache_in.id())],
         "resume must carry the state pair through unchanged into the re-finished graph"
     );
 
     let cache_data = vec![9.0f32, 8.0, 7.0, 6.0];
     let inputs = dense_inputs([
         (
-            logits.id,
+            logits.id(),
             HostTensor::f32(vec![4], vec![1.0, 5.0, 3.0, 2.0]),
         ),
-        (cache_in.id, HostTensor::f32(vec![4], cache_data.clone())),
+        (cache_in.id(), HostTensor::f32(vec![4], cache_data.clone())),
     ]);
     let result = eval(&g2, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap();
     let token_out = result.output.as_host().unwrap();
@@ -870,7 +898,7 @@ fn cast_sweeps_every_admitted_dtype_pair() {
             let x = b.constant("x", TensorType::new(vec![1], from));
             let y = b.cast(x, to);
             let g = b.finish(y);
-            let inputs: HashMap<_, Value> = HashMap::from([(x.id, literal_input(from))]);
+            let inputs: HashMap<_, Value> = HashMap::from([(x.id(), literal_input(from))]);
             let label = format!("cast {from:?} -> {to:?}");
             eval_every_combination(&label, &g, &inputs)
                 .unwrap_or_else(|error| panic!("{label}: expected success, got {error}"));
@@ -901,7 +929,7 @@ fn cast_i8_source_chain_rows_evaluate() {
         let i8 = b.cast(x, DType::I8);
         let y = b.cast(i8, to);
         let g = b.finish(y);
-        let inputs = dense_inputs([(x.id, HostTensor::i32(vec![2], vec![127, -3]))]);
+        let inputs = dense_inputs([(x.id(), HostTensor::i32(vec![2], vec![127, -3]))]);
         let label = format!("I32 -> I8 -> {to:?}");
         let out = eval_every_combination(&label, &g, &inputs).unwrap();
         let bits = value_bits(&out);
@@ -930,7 +958,7 @@ fn cast_bf16_to_e4m3fn_evaluates_a_walk_published_bf16() {
     let bf16 = b.cast(x, DType::BF16);
     let y = b.cast(bf16, DType::E4M3FN);
     let g = b.finish(y);
-    let inputs = dense_inputs([(x.id, HostTensor::f32(vec![2], vec![1.0, 2.0]))]);
+    let inputs = dense_inputs([(x.id(), HostTensor::f32(vec![2], vec![1.0, 2.0]))]);
     let Value::Host(got) = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
         .unwrap()
         .output
@@ -967,10 +995,10 @@ fn every_infer_admitted_pair_evaluates() {
     let g = b.finish(out);
     let inputs = dense_inputs([
         (
-            table.id,
+            table.id(),
             bf16_host(vec![3, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
         ),
-        (index.id, HostTensor::i32(vec![2], vec![2, 0])),
+        (index.id(), HostTensor::i32(vec![2], vec![2, 0])),
     ]);
     let out =
         eval_every_combination("gather bf16 table, i32 index (spec-376)", &g, &inputs).unwrap();
@@ -998,10 +1026,10 @@ fn every_infer_admitted_pair_evaluates() {
     let g = b.finish(out);
     let inputs = dense_inputs([
         (
-            table.id,
+            table.id(),
             bf16_host(vec![3, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
         ),
-        (index.id, HostTensor::f32(vec![2], vec![2.0, 0.0])),
+        (index.id(), HostTensor::f32(vec![2], vec![2.0, 0.0])),
     ]);
     let out = eval_every_combination("gather bf16 table, f32 index", &g, &inputs).unwrap();
     let Value::Host(t) = &out else {
@@ -1020,10 +1048,10 @@ fn every_infer_admitted_pair_evaluates() {
     let g = b.finish(out);
     let inputs = dense_inputs([
         (
-            table.id,
+            table.id(),
             f16_host(vec![3, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
         ),
-        (index.id, HostTensor::i32(vec![2], vec![2, 0])),
+        (index.id(), HostTensor::i32(vec![2], vec![2, 0])),
     ]);
     let out = eval_every_combination("gather f16 table, i32 index", &g, &inputs).unwrap();
     let Value::Host(t) = &out else {
@@ -1040,8 +1068,8 @@ fn every_infer_admitted_pair_evaluates() {
     let out = b.scatter(src, index);
     let g = b.finish(out);
     let inputs = dense_inputs([
-        (src.id, bf16_host(vec![2, 2], &[1.0, 2.0, 3.0, 4.0])),
-        (index.id, HostTensor::i32(vec![2], vec![1, 0])),
+        (src.id(), bf16_host(vec![2, 2], &[1.0, 2.0, 3.0, 4.0])),
+        (index.id(), HostTensor::i32(vec![2], vec![1, 0])),
     ]);
     let out = eval_every_combination("scatter bf16 src", &g, &inputs).unwrap();
     let Value::Host(t) = &out else {
@@ -1059,12 +1087,12 @@ fn every_infer_admitted_pair_evaluates() {
     let out = b.indexed_matmul(x, w, idx);
     let g = b.finish(out);
     let inputs = dense_inputs([
-        (x.id, HostTensor::f32(vec![1, 2], vec![1.0, 2.0])),
+        (x.id(), HostTensor::f32(vec![1, 2], vec![1.0, 2.0])),
         (
-            w.id,
+            w.id(),
             bf16_host(vec![2, 2, 2], &[1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0]),
         ),
-        (idx.id, HostTensor::i32(vec![1], vec![1])),
+        (idx.id(), HostTensor::i32(vec![1], vec![1])),
     ]);
     let out = eval_every_combination("indexed_matmul f32 x bf16 w", &g, &inputs).unwrap();
     assert_eq!(out.as_host().unwrap().as_f32().unwrap(), &[2.0, 1.0]);
@@ -1075,7 +1103,7 @@ fn every_infer_admitted_pair_evaluates() {
     let x = helpers::i32_constant(&b, "x", vec![4]).unwrap();
     let packed = b.pack_i8(x);
     let g = b.finish(packed);
-    let inputs = dense_inputs([(x.id, HostTensor::i32(vec![4], vec![1, 2, 3, 4]))]);
+    let inputs = dense_inputs([(x.id(), HostTensor::i32(vec![4], vec![1, 2, 3, 4]))]);
     let out = eval_every_combination("pack_i8 exact i32 (words only)", &g, &inputs).unwrap();
     let t = out.as_host().unwrap();
     assert_eq!(
@@ -1092,7 +1120,7 @@ fn every_infer_admitted_pair_evaluates() {
     let out = b.reshape(x, vec![4]);
     let g = b.finish(out);
     let wrong_dtype = HostTensor::f32(vec![4], vec![1.0, 2.0, 3.0, 4.0]);
-    let inputs = dense_inputs([(x.id, wrong_dtype)]);
+    let inputs = dense_inputs([(x.id(), wrong_dtype)]);
     let error = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap_err();
     assert!(
         matches!(error, EvalError::Input { .. }),
@@ -1105,7 +1133,7 @@ fn every_infer_admitted_pair_evaluates() {
     let x = b.constant("x", TensorType::new(vec![4], DType::F16));
     let out = b.reshape(x, vec![2, 2]);
     let g = b.finish(out);
-    let inputs = dense_inputs([(x.id, f16_host(vec![4], &[1.0, 2.0, 3.0, 4.0]))]);
+    let inputs = dense_inputs([(x.id(), f16_host(vec![4], &[1.0, 2.0, 3.0, 4.0]))]);
     let out = eval_every_combination("reshape f16 (legitimately narrowed)", &g, &inputs).unwrap();
     let Value::Host(t) = &out else {
         panic!("expected dense, got {out:?}")
@@ -1128,7 +1156,7 @@ fn f32_declared_input_bound_as_a_bf16_tensor_is_refused_at_bind_time() {
     let x = b.constant("x", TensorType::f32(vec![4]));
     let out = b.reshape(x, vec![4]);
     let g = b.finish(out);
-    let inputs = dense_inputs([(x.id, HostTensor::bf16(vec![4], vec![0u16; 4]))]);
+    let inputs = dense_inputs([(x.id(), HostTensor::bf16(vec![4], vec![0u16; 4]))]);
     let error = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap_err();
     assert!(
         matches!(error, EvalError::Input { .. }),
@@ -1198,7 +1226,7 @@ fn gather_index_faults_cover_every_data_dtype() {
         } else {
             Value::from(HostTensor::f32(vec![], vec![bad]))
         };
-        let inputs = HashMap::from([(table.id, table_value), (index.id, index_value)]);
+        let inputs = HashMap::from([(table.id(), table_value), (index.id(), index_value)]);
         eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).map(|r| r.output)
     }
 
@@ -1519,9 +1547,9 @@ fn scatter_update_dynamic_update_slice_indexed_matmul_arg_top_k_route_through_in
         let src_value = HostTensor::f32(vec![2, 1], vec![1.0, 2.0]);
 
         let inputs = dense_inputs([
-            (base.id, base_value.clone()),
-            (src.id, src_value.clone()),
-            (inv.id, HostTensor::f32(vec![3], vec![-1.0, 0.0, 1.0])),
+            (base.id(), base_value.clone()),
+            (src.id(), src_value.clone()),
+            (inv.id(), HostTensor::f32(vec![3], vec![-1.0, 0.0, 1.0])),
         ]);
         let out = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
             .unwrap()
@@ -1539,9 +1567,9 @@ fn scatter_update_dynamic_update_slice_indexed_matmul_arg_top_k_route_through_in
             (2.0, IndexFaultKind::OutOfRange),
         ] {
             let inputs = dense_inputs([
-                (base.id, base_value.clone()),
-                (src.id, src_value.clone()),
-                (inv.id, HostTensor::f32(vec![3], vec![-1.0, bad, 1.0])),
+                (base.id(), base_value.clone()),
+                (src.id(), src_value.clone()),
+                (inv.id(), HostTensor::f32(vec![3], vec![-1.0, bad, 1.0])),
             ]);
             let err = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap_err();
             let EvalError::Index(fault) = &err else {
@@ -1564,9 +1592,9 @@ fn scatter_update_dynamic_update_slice_indexed_matmul_arg_top_k_route_through_in
         let update_value = HostTensor::f32(vec![2], vec![9.0, 8.0]);
 
         let inputs = dense_inputs([
-            (operand.id, operand_value.clone()),
-            (update.id, update_value.clone()),
-            (index.id, HostTensor::f32(vec![], vec![1.0])),
+            (operand.id(), operand_value.clone()),
+            (update.id(), update_value.clone()),
+            (index.id(), HostTensor::f32(vec![], vec![1.0])),
         ]);
         let out = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
             .unwrap()
@@ -1580,9 +1608,9 @@ fn scatter_update_dynamic_update_slice_indexed_matmul_arg_top_k_route_through_in
             (2.5, IndexFaultKind::NotIntegral),
         ] {
             let inputs = dense_inputs([
-                (operand.id, operand_value.clone()),
-                (update.id, update_value.clone()),
-                (index.id, HostTensor::f32(vec![], vec![bad])),
+                (operand.id(), operand_value.clone()),
+                (update.id(), update_value.clone()),
+                (index.id(), HostTensor::f32(vec![], vec![bad])),
             ]);
             let err = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap_err();
             let EvalError::Index(fault) = &err else {
@@ -1601,12 +1629,12 @@ fn scatter_update_dynamic_update_slice_indexed_matmul_arg_top_k_route_through_in
         let out = b.indexed_matmul(x, w, idx);
         let g = b.finish(out);
         let inputs = dense_inputs([
-            (x.id, HostTensor::f32(vec![1, 2], vec![1.0, 2.0])),
+            (x.id(), HostTensor::f32(vec![1, 2], vec![1.0, 2.0])),
             (
-                w.id,
+                w.id(),
                 HostTensor::f32(vec![2, 2, 2], vec![1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0]),
             ),
-            (idx.id, HostTensor::i32(vec![1], vec![2])),
+            (idx.id(), HostTensor::i32(vec![1], vec![2])),
         ]);
         let err = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap_err();
         let EvalError::Index(fault) = &err else {
@@ -1622,7 +1650,7 @@ fn scatter_update_dynamic_update_slice_indexed_matmul_arg_top_k_route_through_in
         let x = b.constant("x", TensorType::f32(vec![4]));
         let out = b.arg_top_k(x, 2);
         let g = b.finish(out);
-        let inputs = dense_inputs([(x.id, HostTensor::f32(vec![4], vec![2.0, 0.5, 3.0, 1.0]))]);
+        let inputs = dense_inputs([(x.id(), HostTensor::f32(vec![4], vec![2.0, 0.5, 3.0, 1.0]))]);
         let err = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap_err();
         let EvalError::Index(fault) = &err else {
             panic!("ArgTopK rank 0.5: expected EvalError::Index, got {err:?}")

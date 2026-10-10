@@ -435,6 +435,7 @@ unsafe extern "C" {
         dep_signals: *const hsa_signal_t,
         completion_signal: hsa_signal_t,
     ) -> hsa_status_t;
+    pub(crate) fn hsa_amd_memory_fill(ptr: *mut c_void, value: u32, count: usize) -> hsa_status_t;
     pub(crate) fn hsa_amd_memory_lock(
         host_ptr: *mut c_void,
         size: usize,

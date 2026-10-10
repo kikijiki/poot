@@ -8,18 +8,19 @@ use poot_target::Backend;
 
 use crate::dtype_widen::bf16_const_is_packed;
 use crate::*;
+use poot_graph_ir::ValueTable;
 
 #[derive(Debug)]
 pub(crate) struct ValueComponents {
-    pub(crate) parent: Vec<ValueId>,
-    pub(crate) rank: Vec<u8>,
+    pub(crate) parent: ValueTable<ValueId>,
+    pub(crate) rank: ValueTable<u8>,
 }
 
 impl ValueComponents {
-    pub(crate) fn new(values: usize) -> Self {
+    pub(crate) fn new<T>(values: &ValueTable<T>) -> Self {
         Self {
-            parent: (0..values).collect(),
-            rank: vec![0; values],
+            parent: values.ids().collect(),
+            rank: ValueTable::filled(values.len(), 0),
         }
     }
 
@@ -63,13 +64,13 @@ impl ValueComponents {
 #[derive(Debug)]
 pub struct ExactI32StorageAnalysis<'g, V: ValidationChannel = NoValidations> {
     pub(crate) graph: &'g Graph<V>,
-    pub(crate) required: Vec<bool>,
+    pub(crate) required: ValueTable<bool>,
 }
 
 /// The requirement table of one [`ExactI32StorageAnalysis`], without its graph type. The per-equation planner
 /// body reads only this table, so it is compiled once for every validation channel.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ExactI32Requirements<'a>(&'a [bool]);
+pub(crate) struct ExactI32Requirements<'a>(&'a ValueTable<bool>);
 
 impl ExactI32Requirements<'_> {
     pub(crate) fn required(self, id: ValueId) -> bool {
@@ -80,7 +81,7 @@ impl ExactI32Requirements<'_> {
 impl<'g, V: ValidationChannel> ExactI32StorageAnalysis<'g, V> {
     /// Analyze exact-I32 storage requirements for one immutable graph.
     pub fn new(graph: &'g Graph<V>) -> Self {
-        let mut components = ValueComponents::new(graph.values.len());
+        let mut components = ValueComponents::new(&graph.values);
         let is_i32 = |id: ValueId| {
             graph
                 .values
@@ -152,8 +153,8 @@ impl<'g, V: ValidationChannel> ExactI32StorageAnalysis<'g, V> {
             }
         }
 
-        let mut has_binary = vec![false; graph.values.len()];
-        let mut observed = vec![false; graph.values.len()];
+        let mut has_binary = ValueTable::filled(graph.values.len(), false);
+        let mut observed = ValueTable::filled(graph.values.len(), false);
         for eqn in &graph.eqns {
             let Some(op_observed) = exact_i32_pointwise_observation(&eqn.op) else {
                 continue;
@@ -183,14 +184,14 @@ impl<'g, V: ValidationChannel> ExactI32StorageAnalysis<'g, V> {
             observed[root] = true;
         }
         for root in graph.liveness_roots() {
-            if root < graph.values.len() {
+            if graph.values.contains(root) {
                 let root = components.find(root);
                 observed[root] = true;
             }
         }
 
-        let mut required = vec![false; graph.values.len()];
-        for (id, value) in graph.values.iter().enumerate() {
+        let mut required = ValueTable::filled(graph.values.len(), false);
+        for (id, value) in graph.values.iter_enumerated() {
             let root = components.find(id);
             required[id] = value.aval.dtype == DType::I32 && has_binary[root] && observed[root];
         }
@@ -370,7 +371,7 @@ fn check_bf16_const_reads<V: ValidationChannel>(
         let params: Vec<_> = body.params().collect();
         for (i, &vid) in value_ids(eqn).iter().enumerate() {
             let root = roots.get(&vid).copied().unwrap_or(vid);
-            if g.meta(root).storage != Storage::Const || g.aval(root).dtype != DType::BF16 {
+            if !g.meta(root).storage.holds_weight_bytes() || g.aval(root).dtype != DType::BF16 {
                 continue;
             }
             let Some(&param) = params.get(i) else {
@@ -403,7 +404,9 @@ fn storage_of_read_lanes<V: ValidationChannel>(
     lanes: &I32ReadLanes,
     weights: &HashMap<ValueId, StorageKind>,
 ) -> GraphStorage {
-    let values = (0..g.values.len())
+    let values = g
+        .values
+        .ids()
         .map(|id| {
             ValueStorage::new(match weights.get(&id) {
                 Some(&kind) => kind,
@@ -636,7 +639,7 @@ fn value_storage_kind<V: ValidationChannel>(
             StorageKind::I32F32Mirror
         };
     }
-    if g.meta(id).storage != Storage::Const || declared != DType::BF16 {
+    if !g.meta(id).storage.holds_weight_bytes() || declared != DType::BF16 {
         return StorageKind::Dense(declared);
     }
     if bf16_const_is_packed(g, views, id, backend) {
@@ -747,14 +750,16 @@ mod value_storage_tests {
                 let caps = poot_test_util::device_caps::default_caps_for(backend);
                 let prepared = prepare_target_graph(g, backend);
                 let storage = fixture_value_storage(&prepared, backend, &caps);
-                for id in (0..prepared.values.len())
+                for id in prepared
+                    .values
+                    .ids()
                     .filter(|&id| prepared.meta(id).storage == Storage::Const)
                 {
                     let want = g.aval(id).dtype;
                     let got = storage.storage(id).dtype();
                     assert_eq!(
                         got, want,
-                        "{label} on {backend:?} v{id}: fixture_value_storage says {got:?}, the const is declared {want:?}"
+                        "{label} on {backend:?} {id}: fixture_value_storage says {got:?}, the const is declared {want:?}"
                     );
                 }
             }
@@ -808,9 +813,9 @@ mod value_storage_tests {
         let token = b.slot(Slot::Token, TensorType::new(vec![1], DType::I32));
         let out = b.gather_scalar(embed, 0, token);
 
-        let gather_index_id = idx.id;
-        let slot_id = slot_map.id;
-        let token_id = token.id;
+        let gather_index_id = idx.id();
+        let slot_id = slot_map.id();
+        let token_id = token.id();
         (b.finish(out), gather_index_id, slot_id, token_id)
     }
 
@@ -839,19 +844,19 @@ mod value_storage_tests {
             assert_eq!(gather_index_storage.dtype(), DType::I32);
             assert!(
                 !gather_index_storage.is_f32_mirror(),
-                "{backend:?}: authoritative Gather index v{gather_index_id} must stay on the raw I32 lane, not the F32 mirror"
+                "{backend:?}: authoritative Gather index {gather_index_id} must stay on the raw I32 lane, not the F32 mirror"
             );
             let slot_storage = storage.storage(slot_id);
             assert_eq!(slot_storage.dtype(), DType::I32);
             assert!(
                 slot_storage.is_f32_mirror(),
-                "{backend:?}: SlotMap v{slot_id} feeding ScatterUpdate's inv operand must be the F32 mirror, not raw I32"
+                "{backend:?}: SlotMap {slot_id} feeding ScatterUpdate's inv operand must be the F32 mirror, not raw I32"
             );
             let token_storage = storage.storage(token_id);
             assert_eq!(token_storage.dtype(), DType::I32);
             assert!(
                 token_storage.is_f32_mirror(),
-                "{backend:?}: Token v{token_id} feeding a plain embedding Gather must be the F32 mirror, not raw I32"
+                "{backend:?}: Token {token_id} feeding a plain embedding Gather must be the F32 mirror, not raw I32"
             );
         }
     }
@@ -979,7 +984,11 @@ mod value_storage_tests {
 
     /// A `Qwen4Exp` PLE shard: an E4M3FN `[rows, width]` const gathered by an I32 index and widened,
     /// which `fold_dense_bf16_row_gathers` makes one `DenseRowGather`.
-    fn e4m3_shard_graph(rows: usize, width: usize, second_reader: bool) -> (Graph, usize) {
+    fn e4m3_shard_graph(
+        rows: usize,
+        width: usize,
+        second_reader: bool,
+    ) -> (Graph, poot_graph_ir::ValueId) {
         use poot_graph_ir::{BinOp, RedOp, Slot};
 
         let b = Builder::new();
@@ -995,7 +1004,10 @@ mod value_storage_tests {
         } else {
             gathered
         };
-        (crate::fold_dense_bf16_row_gathers(&b.finish(out)), table.id)
+        (
+            crate::fold_dense_bf16_row_gathers(&b.finish(out)),
+            table.id(),
+        )
     }
 
     /// POOT-1060: an E4M3FN table only `DenseRowGather` reads is planned `e4m3_packed()` on every backend,

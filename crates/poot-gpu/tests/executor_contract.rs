@@ -27,6 +27,7 @@ use poot_graph_plan::{
 };
 use poot_models::model::{LogitRows, Phase};
 use poot_quant::PackedComponentRef;
+use poot_quant::StoredBytes;
 use poot_quant::format::{GroupMap, WeightFormat};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
 use poot_tensor::HostTensor;
@@ -110,7 +111,7 @@ fn store_for(graphs: &[&Graph]) -> WeightStore {
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect();
-        let dense = DenseWeight::try_new(DType::F32, shape, Arc::from(bytes)).unwrap();
+        let dense = DenseWeight::try_new(DType::F32, shape, StoredBytes::from(bytes)).unwrap();
         builder.insert(name, WeightEntry::Dense(dense)).unwrap();
     }
     builder.build()
@@ -281,6 +282,24 @@ fn state_probe_graph(name: &str, aval: TensorType) -> Graph {
 
 fn require_wgpu() -> Option<WgpuDevice> {
     WgpuDevice::new().ok()
+}
+
+/// POOT-1100 LP-3 (wgpu): `Device::write_with` puts every byte at its address across staging chunks. A
+/// buffer of two `WRITE_CHUNK_BYTES` and an odd tail is written whole and again from an unaligned offset,
+/// then read back.
+/// Mutation: in `Context::write_with` queue chunk `k` at `offset + done - 4` (one word early); the
+/// read-back differs and this row goes red.
+#[test]
+fn lp3_wgpu_write_with_is_exact_across_staging_chunks() {
+    let Some(mut device) = require_wgpu() else {
+        eprintln!("skip: no wgpu adapter");
+        return;
+    };
+    poot_executor_parity::write_probe::chunked_write_is_exact(
+        &mut device,
+        poot_runtime::WRITE_CHUNK_BYTES,
+        3,
+    );
 }
 
 /// POOT-1065: the wgpu device reports what it could still allocate right now, read from
@@ -894,7 +913,7 @@ fn two_phase_state_commit_matches_the_oracle_after_four_steps() {
                 DenseWeight::try_new(
                     DType::F32,
                     vec![4],
-                    Arc::from(
+                    StoredBytes::from(
                         bias_value
                             .iter()
                             .flat_map(|v| v.to_le_bytes())
@@ -1216,15 +1235,18 @@ fn wgpu_device_classifies_a_kernel_assert_fault_from_synchronize() {
     let idx = device
         .allocate(BufferRole::Input, BufferStorage::i32(), 4)
         .unwrap();
-    device
-        .write(&idx, 0, bytemuck::cast_slice(&[3i32, 0, 4, 1]))
+    poot_executor::write_slice(&mut device, &idx, 0, bytemuck::cast_slice(&[3i32, 0, 4, 1]))
         .unwrap();
     let data = device
         .allocate(BufferRole::Input, BufferStorage::f32(), 4)
         .unwrap();
-    device
-        .write(&data, 0, bytemuck::cast_slice(&[10.0f32, 20.0, 30.0, 40.0]))
-        .unwrap();
+    poot_executor::write_slice(
+        &mut device,
+        &data,
+        0,
+        bytemuck::cast_slice(&[10.0f32, 20.0, 30.0, 40.0]),
+    )
+    .unwrap();
     let out_buf = device
         .allocate(BufferRole::Output, BufferStorage::f32(), 4)
         .unwrap();
@@ -1305,13 +1327,17 @@ fn planted_bad_validation_packet_fails_before_any_output_readback() {
         .with_validations(vec![poot_graph_ir::ValidationOutput {
             id: poot_graph_ir::ValidationId(1),
             name: "planted".into(),
-            value: witness.id,
+            value: witness.id(),
         }]);
 
     let store = {
         let mut builder = WeightStore::builder();
-        let dense =
-            DenseWeight::try_new(DType::F32, vec![1], Arc::from([0u8, 0, 0x80, 0x3f])).unwrap(); // 1.0f32 little-endian: nonzero, must fail the planted packet.
+        let dense = DenseWeight::try_new(
+            DType::F32,
+            vec![1],
+            StoredBytes::from(vec![0u8, 0, 0x80, 0x3f]),
+        )
+        .unwrap(); // 1.0f32 little-endian: nonzero, must fail the planted packet.
         builder
             .insert("bad_witness", WeightEntry::Dense(dense))
             .unwrap();
@@ -1390,8 +1416,12 @@ fn bf16_embed_weight_feeds_gather_and_decode_gemv_with_no_host_f32_copy() {
         .collect();
     let store = {
         let mut builder = WeightStore::builder();
-        let dense = DenseWeight::try_new(DType::BF16, vec![rows, cols], Arc::from(w_bytes.clone()))
-            .unwrap();
+        let dense = DenseWeight::try_new(
+            DType::BF16,
+            vec![rows, cols],
+            StoredBytes::from(w_bytes.clone()),
+        )
+        .unwrap();
         builder.insert("embed", WeightEntry::Dense(dense)).unwrap();
         builder.build()
     };

@@ -18,7 +18,7 @@ use poot_executor::{Device, Executor, HostView, NoSync, StepInputs};
 use poot_executor_parity::dense::{Dense, Family, plain, step};
 use poot_gpu::device::WgpuDevice;
 use poot_graph_ir::op::{FusedOp, FusedOperand, OpKind, UnOp};
-use poot_graph_ir::{Graph, Slot, SlotKey, Storage};
+use poot_graph_ir::{Graph, Slot, SlotKey, Storage, ValueId};
 use poot_graph_plan::{
     CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, KernelChoice, Partition,
     StagedProgram, Submission, Target, TargetSet, compile_staged,
@@ -26,6 +26,7 @@ use poot_graph_plan::{
 use poot_graph_plan::{cse, fuse};
 use poot_kernelgen::{KernelRequest, ScoreTransform};
 use poot_models::model::{LogitRows, Phase};
+use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::DType;
 use poot_tensor::HostTensor;
@@ -103,8 +104,8 @@ fn bind(
     n: usize,
     tokens: &[u32],
     include_state: bool,
-) -> HashMap<usize, Value> {
-    let mut inputs: HashMap<usize, Value> = HashMap::new();
+) -> HashMap<ValueId, Value> {
+    let mut inputs: HashMap<ValueId, Value> = HashMap::new();
     for &id in &g.inputs {
         let m = &g.values[id];
         let t = match m.storage {
@@ -180,9 +181,12 @@ fn gpu_consts_and_slots(
                 });
                 let data = fill(m.aval.numel(), seed);
                 let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-                let dense =
-                    DenseWeight::try_new(DType::F32, m.aval.shape.clone(), Arc::from(bytes))
-                        .unwrap();
+                let dense = DenseWeight::try_new(
+                    DType::F32,
+                    m.aval.shape.clone(),
+                    StoredBytes::from(bytes),
+                )
+                .unwrap();
                 builder.insert(name, WeightEntry::Dense(dense)).unwrap();
             }
             // The RoPE tables are computed constants the executor materializes itself.
@@ -341,8 +345,8 @@ fn gemma2_softcap_flash_prefill_gpu_matches_cpu() {
 /// parameter, not the host `inputs` map (same convention as `poot-gpu/tests/qwen2.rs`'s
 /// `qwen2_decode_kv_gpu_resident_matches_cpu`); the CPU oracle side inserts it separately as plain
 /// tensors for `eval_with_state`.
-fn bind_decode(g: &poot_graph_ir::Graph, pos: usize, token: u32) -> HashMap<usize, Value> {
-    let mut inputs: HashMap<usize, Value> = HashMap::new();
+fn bind_decode(g: &poot_graph_ir::Graph, pos: usize, token: u32) -> HashMap<ValueId, Value> {
+    let mut inputs: HashMap<ValueId, Value> = HashMap::new();
     for (i, &id) in g.inputs.iter().enumerate() {
         let m = g.meta(id);
         match m.storage {
@@ -405,9 +409,12 @@ fn gpu_consts_and_slots_decode(
                 let name = m.name.clone().unwrap();
                 let data = fill(m.aval.numel(), 100 + i as u64);
                 let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-                let dense =
-                    DenseWeight::try_new(DType::F32, m.aval.shape.clone(), Arc::from(bytes))
-                        .unwrap();
+                let dense = DenseWeight::try_new(
+                    DType::F32,
+                    m.aval.shape.clone(),
+                    StoredBytes::from(bytes),
+                )
+                .unwrap();
                 builder.insert(name, WeightEntry::Dense(dense)).unwrap();
             }
             Storage::Computed(_) => {}

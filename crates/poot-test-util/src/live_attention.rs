@@ -115,7 +115,7 @@ impl LiveAttentionFixture {
             vec![ValidationOutput {
                 id: ValidationId(1),
                 name: "attention.len".to_owned(),
-                value: live.witness.id,
+                value: live.witness.id(),
             }]
         } else {
             Vec::new()
@@ -127,11 +127,11 @@ impl LiveAttentionFixture {
             .expect("the live composite is a valid graph");
         LiveAttentionGraph {
             graph,
-            q: q.id,
-            k: k.id,
-            k_shared: shared.map(|shared| shared.id),
-            v: v.id,
-            pos: pos.id,
+            q: q.id(),
+            k: k.id(),
+            k_shared: shared.map(|shared| shared.id()),
+            v: v.id(),
+            pos: pos.id(),
         }
     }
 
@@ -242,22 +242,22 @@ impl LiveAttentionFixture {
             let graph = g.finish(attended);
             let bound = HashMap::from([
                 (
-                    qi.id,
+                    qi.id(),
                     Value::from(HostTensor::f32(
                         vec![1, hq, 1, dk],
                         q[b * hq * dk..(b + 1) * hq * dk].to_vec(),
                     )),
                 ),
                 (
-                    ki.id,
+                    ki.id(),
                     Value::from(HostTensor::f32(vec![1, hkv, n, dk], keys)),
                 ),
                 (
-                    vi.id,
+                    vi.id(),
                     Value::from(HostTensor::f32(vec![1, hkv, n, dv], values)),
                 ),
                 (
-                    mi.id,
+                    mi.id(),
                     Value::from(HostTensor::f32(vec![1, 1, 1, n], vec![0.0; n])),
                 ),
             ]);

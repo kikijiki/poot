@@ -20,6 +20,7 @@ use poot_graph_plan::{
     CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram,
     Submission, Target, TargetSet, compile_staged,
 };
+use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::DType;
 use poot_tensor::HostTensor;
@@ -113,7 +114,8 @@ fn split_consts_and_slots(
                     .flat_map(|v| v.to_le_bytes())
                     .collect();
                 let dense =
-                    DenseWeight::try_new(DType::F32, t.shape().to_vec(), Arc::from(bytes)).unwrap();
+                    DenseWeight::try_new(DType::F32, t.shape().to_vec(), StoredBytes::from(bytes))
+                        .unwrap();
                 builder.insert(name, WeightEntry::Dense(dense)).unwrap();
             }
             Storage::Slot(_) => {
@@ -227,7 +229,7 @@ fn elementwise_add_sub_mul_div_cross_backend() {
     let sub = b.binary(BinOp::Sub, add, c);
     let mul = b.binary(BinOp::Mul, sub, a);
     let out = b.binary(BinOp::Div, mul, c);
-    let (ai, ci) = (a.id, c.id);
+    let (ai, ci) = (a.id(), c.id());
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();
@@ -302,7 +304,7 @@ fn unary_tanh_erf_cross_backend() {
         let b = Builder::new();
         let x = b.constant("x", TensorType::f32(vec![n]));
         let out = b.unary(op, x);
-        let xi = x.id;
+        let xi = x.id();
         let g = b.finish(out);
         let mut inputs = HashMap::new();
         inputs.insert(xi, HostTensor::f32(vec![n], TRANSCENDENTAL_TABLE.to_vec()));
@@ -333,7 +335,7 @@ fn unary_neg_exp_log_sqrt_cross_backend() {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![n]));
     let neg = b.unary(UnOp::Neg, x);
-    let xi = x.id;
+    let xi = x.id();
     let g = b.finish(neg);
 
     let xd: Vec<f32> = (1..=n).map(|i| i as f32 * 0.1).collect();
@@ -361,7 +363,7 @@ fn unary_neg_exp_log_sqrt_cross_backend() {
     let e = b2.unary(UnOp::Exp, x2);
     let g2 = b2.finish(e);
     let mut in2 = HashMap::new();
-    in2.insert(x2.id, HostTensor::f32(vec![n], fill(7, n)));
+    in2.insert(x2.id(), HostTensor::f32(vec![n], fill(7, n)));
     let cpu2 = eval(
         &g2,
         &in2.iter()
@@ -383,7 +385,7 @@ fn unary_neg_exp_log_sqrt_cross_backend() {
     let g3 = b3.finish(s);
     let xd3: Vec<f32> = (1..=n).map(|i| i as f32 * 0.5 + 0.1).collect();
     let mut in3 = HashMap::new();
-    in3.insert(x3.id, HostTensor::f32(vec![n], xd3));
+    in3.insert(x3.id(), HostTensor::f32(vec![n], xd3));
     let cpu3 = eval(
         &g3,
         &in3.iter()
@@ -412,7 +414,7 @@ fn matmul_cross_backend() {
     let a = b.constant("a", TensorType::f32(vec![m, k]));
     let w = b.constant("w", TensorType::f32(vec![k, n]));
     let out = b.matmul(a, w);
-    let (ai, wi) = (a.id, w.id);
+    let (ai, wi) = (a.id(), w.id());
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();
@@ -451,7 +453,7 @@ fn matmul_bias_cross_backend() {
     let bias = b.constant("bias", TensorType::f32(vec![n]));
     let mm = b.matmul(a, w);
     let out = b.binary(BinOp::Add, mm, bias);
-    let (ai, wi, bi) = (a.id, w.id, bias.id);
+    let (ai, wi, bi) = (a.id(), w.id(), bias.id());
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();
@@ -487,7 +489,7 @@ fn reduce_sum_last_axis_cross_backend() {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![rows, cols]));
     let out = b.reduce(RedOp::Sum, x, 1, false);
-    let xi = x.id;
+    let xi = x.id();
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();
@@ -524,7 +526,7 @@ fn reduce_max_last_axis_cross_backend() {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![rows, cols]));
     let out = b.reduce(RedOp::Max, x, 1, false);
-    let xi = x.id;
+    let xi = x.id();
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();
@@ -563,7 +565,7 @@ fn rmsnorm_cross_backend() {
     let x = b.constant("x", TensorType::f32(vec![1, 1, n]));
     let w = b.constant("w", TensorType::f32(vec![n]));
     let out = rmsnorm(&b, x, w, 1e-6);
-    let (xi, wi) = (x.id, w.id);
+    let (xi, wi) = (x.id(), w.id());
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();
@@ -609,7 +611,7 @@ fn masked_attention_cross_backend() {
     let v = b.constant("v", TensorType::f32(vec![1, hkv, cap, d]));
     let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
     let out = attention_masked(&b, q, k, v, n_rep, scale, mask);
-    let (qi, ki, vi, mi) = (q.id, k.id, v.id, mask.id);
+    let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();
@@ -660,7 +662,7 @@ fn ffn_block_cross_backend() {
     let h = b.matmul(x, w1);
     let act = silu(&b, h);
     let out = b.matmul(act, w2);
-    let (xi, w1i, w2i) = (x.id, w1.id, w2.id);
+    let (xi, w1i, w2i) = (x.id(), w1.id(), w2.id());
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();
@@ -697,7 +699,7 @@ fn broadcast_binary_cross_backend() {
     let a = b.constant("a", TensorType::f32(vec![batch, rows, cols]));
     let bias = b.constant("bias", TensorType::f32(vec![cols]));
     let out = b.binary(BinOp::Add, a, bias);
-    let (ai, bi) = (a.id, bias.id);
+    let (ai, bi) = (a.id(), bias.id());
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();
@@ -736,7 +738,7 @@ fn transpose_slice_cross_backend() {
     let x = b.constant("x", TensorType::f32(vec![r, c]));
     let t = b.transpose(x, vec![1, 0]);
     let s = b.slice(t, 1, 2, 6);
-    let xi = x.id;
+    let xi = x.id();
     let g = b.finish(s);
 
     let mut inputs = HashMap::new();
@@ -774,7 +776,7 @@ fn gather_axis0_cross_backend() {
     let data = b.constant("data", TensorType::f32(vec![n, d]));
     let idx = b.constant("idx", TensorType::f32(vec![idx_count]));
     let out = b.gather(data, 0, idx);
-    let (di, ii) = (data.id, idx.id);
+    let (di, ii) = (data.id(), idx.id());
     let g = b.finish(out);
 
     let dd: Vec<f32> = fill(901, n * d);
@@ -825,7 +827,7 @@ fn i32_table_gather_is_exact_beyond_f32_cross_backend() {
         .insert(
             "table",
             WeightEntry::Dense(
-                DenseWeight::try_new(DType::I32, vec![6, 4], Arc::from(words)).unwrap(),
+                DenseWeight::try_new(DType::I32, vec![6, 4], StoredBytes::from(words)).unwrap(),
             ),
         )
         .unwrap();
@@ -884,7 +886,7 @@ fn sample_token_greedy_cross_backend() {
         None,
         None,
     );
-    let li = logits.id;
+    let li = logits.id();
     let g = b.finish(out);
 
     let mut data = vec![0f32; rows * vocab];
@@ -953,7 +955,7 @@ fn random_uniform_cross_backend() {
 
     let seed_data: Vec<i32> = vec![0, 1, 0xDEADBEEFu32 as i32];
     let inputs: HashMap<ValueId, HostTensor> =
-        HashMap::from([(seed.id, HostTensor::i32(vec![rows], seed_data.clone()))]);
+        HashMap::from([(seed.id(), HostTensor::i32(vec![rows], seed_data.clone()))]);
     let cpu = eval(
         &g,
         &inputs
@@ -1012,7 +1014,8 @@ fn run_gumbel_family_contract(
     for (id, shape, data) in [&logits, &noise, &params] {
         let name = g.meta(*id).name.clone().unwrap();
         let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let dense = DenseWeight::try_new(DType::F32, shape.clone(), Arc::from(bytes)).unwrap();
+        let dense =
+            DenseWeight::try_new(DType::F32, shape.clone(), StoredBytes::from(bytes)).unwrap();
         builder.insert(name, WeightEntry::Dense(dense)).unwrap();
     }
     let store = builder.build();
@@ -1067,7 +1070,7 @@ fn sample_token_gumbel_cross_backend() {
         Some(params),
         None,
     );
-    let (li, ni, pi) = (logits.id, noise.id, params.id);
+    let (li, ni, pi) = (logits.id(), noise.id(), params.id());
     let g = b.finish(out);
 
     let mut logits_data = vec![-5.0f32; rows * vocab];
@@ -1154,7 +1157,7 @@ fn sample_token_gumbel_topk_cross_backend() {
         Some(params),
         Some(top_k),
     );
-    let (li, ni, pi) = (logits.id, noise.id, params.id);
+    let (li, ni, pi) = (logits.id(), noise.id(), params.id());
     let g = b.finish(out);
 
     let mut logits_data = vec![0.0f32; rows * vocab];
@@ -1177,7 +1180,7 @@ fn sample_token_gumbel_topk_cross_backend() {
             HostTensor::f32(vec![rows, 3], params_data.clone()).into(),
         ),
         (
-            top_k.id,
+            top_k.id(),
             HostTensor::i32(vec![rows], top_k_data.clone()).into(),
         ),
     ]);
@@ -1194,7 +1197,7 @@ fn sample_token_gumbel_topk_cross_backend() {
         (li, vec![rows, vocab], logits_data),
         (ni, vec![rows, vocab], noise_data),
         (pi, vec![rows, 3], params_data),
-        Some((top_k.id, vec![rows], top_k_data)),
+        Some((top_k.id(), vec![rows], top_k_data)),
     );
     assert_eq!(
         got,
@@ -1241,7 +1244,7 @@ fn sample_token_gumbel_topk_topp_cross_backend() {
         Some(params),
         Some(top_k),
     );
-    let (li, ni, pi) = (logits.id, noise.id, params.id);
+    let (li, ni, pi) = (logits.id(), noise.id(), params.id());
     let g = b.finish(out);
 
     let mut logits_data = vec![-100.0f32; rows * vocab];
@@ -1267,7 +1270,7 @@ fn sample_token_gumbel_topk_topp_cross_backend() {
             HostTensor::f32(vec![rows, 4], params_data.clone()).into(),
         ),
         (
-            top_k.id,
+            top_k.id(),
             HostTensor::i32(vec![rows], top_k_data.clone()).into(),
         ),
     ]);
@@ -1284,7 +1287,7 @@ fn sample_token_gumbel_topk_topp_cross_backend() {
         (li, vec![rows, vocab], logits_data),
         (ni, vec![rows, vocab], noise_data),
         (pi, vec![rows, 4], params_data),
-        Some((top_k.id, vec![rows], top_k_data)),
+        Some((top_k.id(), vec![rows], top_k_data)),
     );
     assert_eq!(
         got,
@@ -1338,7 +1341,7 @@ fn sample_token_gumbel_topp_only_excludes_untruncated_winner_cross_backend() {
         Some(params),
         Some(top_k),
     );
-    let (li, ni, pi) = (logits.id, noise.id, params.id);
+    let (li, ni, pi) = (logits.id(), noise.id(), params.id());
     let g = b.finish(out);
 
     let mut logits_data = vec![-100.0f32; rows * vocab];
@@ -1364,7 +1367,7 @@ fn sample_token_gumbel_topp_only_excludes_untruncated_winner_cross_backend() {
             HostTensor::f32(vec![rows, 4], params_data.clone()).into(),
         ),
         (
-            top_k.id,
+            top_k.id(),
             HostTensor::i32(vec![rows], top_k_data.clone()).into(),
         ),
     ]);
@@ -1381,7 +1384,7 @@ fn sample_token_gumbel_topp_only_excludes_untruncated_winner_cross_backend() {
         (li, vec![rows, vocab], logits_data),
         (ni, vec![rows, vocab], noise_data),
         (pi, vec![rows, 4], params_data),
-        Some((top_k.id, vec![rows], top_k_data)),
+        Some((top_k.id(), vec![rows], top_k_data)),
     );
     assert_eq!(
         got,
@@ -1466,7 +1469,7 @@ fn layernorm_cross_backend() {
     let w = b.constant("w", TensorType::f32(vec![n]));
     let bias = b.constant("bias", TensorType::f32(vec![n]));
     let out = poot_graph_ir::ops::layernorm(&b, x, w, bias, 1e-6);
-    let (xi, wi, bi) = (x.id, w.id, bias.id);
+    let (xi, wi, bi) = (x.id(), w.id(), bias.id());
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();
@@ -1515,7 +1518,7 @@ fn reduce_sum_nonpow2_wide_real_magnitude_cross_backend() {
         let b = Builder::new();
         let x = b.constant("x", TensorType::f32(vec![rows, cols]));
         let out = b.reduce(RedOp::Sum, x, 1, false);
-        let xi = x.id;
+        let xi = x.id();
         let g = b.finish(out);
 
         let data = fill_real_magnitude(820 + i as u64, rows * cols);
@@ -1565,7 +1568,7 @@ fn reduce_max_nonpow2_wide_real_magnitude_cross_backend() {
         let b = Builder::new();
         let x = b.constant("x", TensorType::f32(vec![rows, cols]));
         let out = b.reduce(RedOp::Max, x, 1, false);
-        let xi = x.id;
+        let xi = x.id();
         let g = b.finish(out);
 
         let data = fill_real_magnitude(660 + i as u64, rows * cols);
@@ -1607,7 +1610,7 @@ fn dynamic_update_slice_cross_backend() {
     let operand = b.constant("operand", TensorType::f32(vec![rows, cols]));
     let update = b.constant("update", TensorType::f32(vec![1, cols]));
     let out = b.dynamic_update_slice(operand, update, index, 0);
-    let (oi, ui) = (operand.id, update.id);
+    let (oi, ui) = (operand.id(), update.id());
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();
@@ -1646,7 +1649,7 @@ fn non_power_of_2_cross_backend() {
     let a = b.constant("a", TensorType::f32(vec![n]));
     let c = b.constant("c", TensorType::f32(vec![n]));
     let out = b.binary(BinOp::Add, a, c);
-    let (ai, ci) = (a.id, c.id);
+    let (ai, ci) = (a.id(), c.id());
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();
@@ -1680,7 +1683,7 @@ fn single_element_cross_backend() {
     let a = b.constant("a", TensorType::f32(vec![1]));
     let c = b.constant("c", TensorType::f32(vec![1]));
     let out = b.binary(BinOp::Add, a, c);
-    let (ai, ci) = (a.id, c.id);
+    let (ai, ci) = (a.id(), c.id());
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();
@@ -1727,7 +1730,7 @@ fn large_vocab_lm_head_transpose_matmul_does_not_hang() {
     let w = b.constant("lm_head.weight", TensorType::f32(vec![vocab, hidden]));
     let wt = b.transpose(w, vec![1, 0]); // [hidden, vocab]
     let out = b.matmul(hstate, wt); // [1,1,vocab]
-    let (hi, wi) = (hstate.id, w.id);
+    let (hi, wi) = (hstate.id(), w.id());
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();
@@ -1759,7 +1762,7 @@ fn large_vocab_transpose_alone_does_not_hang() {
     let b = Builder::new();
     let w = b.constant("lm_head.weight", TensorType::f32(vec![vocab, hidden]));
     let wt = b.transpose(w, vec![1, 0]); // [hidden, vocab]
-    let wi = w.id;
+    let wi = w.id();
     let g = b.finish(wt);
 
     let mut inputs = HashMap::new();
@@ -1789,7 +1792,7 @@ fn large_vocab_matmul_alone_does_not_hang() {
     let hstate = b.constant("hidden", TensorType::f32(vec![1, 1, hidden]));
     let w = b.constant("lm_head.weight.t", TensorType::f32(vec![hidden, vocab]));
     let out = b.matmul(hstate, w); // [1,1,vocab]
-    let (hi, wi) = (hstate.id, w.id);
+    let (hi, wi) = (hstate.id(), w.id());
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();
@@ -1823,7 +1826,7 @@ fn mpt_scale_tied_lm_head_transpose_matmul_does_not_hang() {
     let w = b.constant("wte.weight", TensorType::f32(vec![vocab, hidden]));
     let wt = b.transpose(w, vec![1, 0]); // [hidden, vocab] - the tied-lm_head pattern
     let out = b.matmul(hstate, wt); // [1,1,vocab]
-    let (hi, wi) = (hstate.id, w.id);
+    let (hi, wi) = (hstate.id(), w.id());
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();

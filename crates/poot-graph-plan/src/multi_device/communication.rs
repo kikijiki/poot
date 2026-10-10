@@ -5,8 +5,6 @@
 //! Every row's participants, byte accounting, and dependency edges are exactly what the caller declared.
 //! Card 360 never infers a route count, a producer, or a consumer from model-specific structure (FR-004).
 
-use std::collections::HashSet;
-
 use poot_graph_ir::RedOp;
 
 use crate::CollectiveKind;
@@ -24,7 +22,7 @@ pub struct PlanNodeId(pub u32);
 pub struct CommunicationRow {
     pub id: PlanNodeId,
     pub kind: CollectiveKind,
-    /// Meaningful for `AllReduce` only, mirroring `Plan::Collective`'s own field.
+    /// Meaningful for `AllReduce` only: the reduction the row combines with.
     pub op: RedOp,
     /// Ordered device group. For `PointToPoint` this is exactly `[from, to]`; for `AllGather`/
     /// `AllReduce`/`AllToAll` it is every participating device.
@@ -157,35 +155,46 @@ pub fn admit_communication_capability(
     topology: &Topology,
     rows: &[CommunicationRow],
 ) -> Result<(), CapabilityError> {
-    let accepted: HashSet<(DeviceId, DeviceId, CollectiveKind)> = topology
-        .links
-        .iter()
-        .map(|link| (link.from, link.to, link.kind))
-        .collect();
     for row in rows {
         if row.kind == CollectiveKind::PointToPoint && row.participants.len() == 2 {
-            let from = row.participants[0];
-            let to = row.participants[1];
-            if !accepted.contains(&(from, to, row.kind)) {
-                return Err(CapabilityError {
-                    from,
-                    to,
-                    kind: row.kind,
-                });
-            }
+            admit_directed(topology, row.participants[0], row.participants[1], row.kind)?;
             continue;
         }
-        for &from in &row.participants {
-            for &to in &row.participants {
-                if from != to && !accepted.contains(&(from, to, row.kind)) {
-                    return Err(CapabilityError {
-                        from,
-                        to,
-                        kind: row.kind,
-                    });
-                }
+        admit_group_capability(topology, row.kind, &row.participants)?;
+    }
+    Ok(())
+}
+
+/// The capability of `topology` to perform the group operation `kind` among `participants`: a link row
+/// of that kind for every ordered pair of distinct participants.
+pub fn admit_group_capability(
+    topology: &Topology,
+    kind: CollectiveKind,
+    participants: &[DeviceId],
+) -> Result<(), CapabilityError> {
+    for &from in participants {
+        for &to in participants {
+            if from != to {
+                admit_directed(topology, from, to, kind)?;
             }
         }
     }
     Ok(())
+}
+
+fn admit_directed(
+    topology: &Topology,
+    from: DeviceId,
+    to: DeviceId,
+    kind: CollectiveKind,
+) -> Result<(), CapabilityError> {
+    let accepted = topology
+        .links
+        .iter()
+        .any(|link| link.from == from && link.to == to && link.kind == kind);
+    if accepted {
+        Ok(())
+    } else {
+        Err(CapabilityError { from, to, kind })
+    }
 }

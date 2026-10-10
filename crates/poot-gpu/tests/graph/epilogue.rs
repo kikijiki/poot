@@ -10,6 +10,7 @@ use poot_graph_ir::analysis::dispatch_count;
 use poot_graph_ir::op::{BinOp, ContractionHead, UnOp};
 use poot_graph_ir::types::Scalar;
 use poot_graph_plan::{CompileOptions, Submission, compile};
+use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 
 /// `tanh(head + bias) * 0.5 + residual`: a bias, a representative pointwise activation, a literal scale and a
@@ -59,7 +60,7 @@ fn run_under(
         let dense = DenseWeight::try_new(
             tensor.dtype(),
             tensor.shape().to_vec(),
-            Arc::from(tensor.view().bytes()),
+            StoredBytes::from(tensor.view().bytes().to_vec()),
         )
         .unwrap();
         builder
@@ -174,10 +175,10 @@ fn a_dense_gemv_epilogue_matches_the_oracle_on_wgpu() {
     let head = b.matmul(x, b.transpose(w, vec![1, 0]));
     let out = epilogue_chain(&b, head, bias, residual);
     let inputs = HashMap::from([
-        (x.id, HostTensor::f32(vec![1, 1, k], fill(1, k))),
-        (w.id, HostTensor::f32(vec![n, k], fill(2, n * k))),
-        (bias.id, HostTensor::f32(vec![n], fill(3, n))),
-        (residual.id, HostTensor::f32(vec![1, 1, n], fill(4, n))),
+        (x.id(), HostTensor::f32(vec![1, 1, k], fill(1, k))),
+        (w.id(), HostTensor::f32(vec![n, k], fill(2, n * k))),
+        (bias.id(), HostTensor::f32(vec![n], fill(3, n))),
+        (residual.id(), HostTensor::f32(vec![1, 1, n], fill(4, n))),
     ]);
     let g = b.finish(out);
     let head = epilogue_head(&g, &target);
@@ -206,10 +207,13 @@ fn a_serial_matmul_epilogue_matches_the_oracle_on_wgpu() {
     let head = b.matmul(a, w);
     let out = epilogue_chain(&b, head, bias, residual);
     let inputs = HashMap::from([
-        (a.id, HostTensor::f32(vec![1, 2, 3, 4], fill(11, 24))),
-        (w.id, HostTensor::f32(vec![1, 1, 4, 5], fill(12, 20))),
-        (bias.id, HostTensor::f32(vec![5], fill(13, 5))),
-        (residual.id, HostTensor::f32(vec![1, 2, 3, 5], fill(14, 30))),
+        (a.id(), HostTensor::f32(vec![1, 2, 3, 4], fill(11, 24))),
+        (w.id(), HostTensor::f32(vec![1, 1, 4, 5], fill(12, 20))),
+        (bias.id(), HostTensor::f32(vec![5], fill(13, 5))),
+        (
+            residual.id(),
+            HostTensor::f32(vec![1, 2, 3, 5], fill(14, 30)),
+        ),
     ]);
     let g = b.finish(out);
     let head = epilogue_head(&g, &spirv_fixture_target());
@@ -239,10 +243,10 @@ fn a_tiled_matmul_epilogue_matches_the_oracle_on_wgpu() {
         let head = b.matmul(x, w);
         let out = epilogue_chain(&b, head, bias, residual);
         let inputs = HashMap::from([
-            (x.id, HostTensor::f32(vec![m, k], fill(1, m * k))),
-            (w.id, HostTensor::f32(vec![k, n], fill(2, k * n))),
-            (bias.id, HostTensor::f32(vec![n], fill(3, n))),
-            (residual.id, HostTensor::f32(vec![m, n], fill(4, m * n))),
+            (x.id(), HostTensor::f32(vec![m, k], fill(1, m * k))),
+            (w.id(), HostTensor::f32(vec![k, n], fill(2, k * n))),
+            (bias.id(), HostTensor::f32(vec![n], fill(3, n))),
+            (residual.id(), HostTensor::f32(vec![m, n], fill(4, m * n))),
         ]);
         let g = b.finish(out);
         let head = epilogue_head(&g, &target);
@@ -278,10 +282,10 @@ fn a_dense_bf16_weight_epilogue_matches_the_oracle_on_wgpu() {
     let out = epilogue_chain(&b, head, bias, residual);
     let weight: Vec<u16> = fill(22, n * k).into_iter().map(bf16_bits).collect();
     let inputs = HashMap::from([
-        (x.id, HostTensor::f32(vec![m, k], fill(21, m * k))),
-        (w.id, HostTensor::bf16(vec![n, k], weight)),
-        (bias.id, HostTensor::f32(vec![n], fill(23, n))),
-        (residual.id, HostTensor::f32(vec![m, n], fill(24, m * n))),
+        (x.id(), HostTensor::f32(vec![m, k], fill(21, m * k))),
+        (w.id(), HostTensor::bf16(vec![n, k], weight)),
+        (bias.id(), HostTensor::f32(vec![n], fill(23, n))),
+        (residual.id(), HostTensor::f32(vec![m, n], fill(24, m * n))),
     ]);
     let g = b.finish(out);
     let head = epilogue_head(&g, &target);
@@ -323,10 +327,10 @@ fn a_dense_tiled_epilogue_matches_the_oracle_on_wgpu() {
                 _ => HostTensor::f32(vec![n, k], weight_values),
             };
             let inputs = HashMap::from([
-                (x.id, HostTensor::f32(vec![m, k], fill(1, m * k))),
-                (w.id, weight),
-                (bias.id, HostTensor::f32(vec![n], fill(3, n))),
-                (residual.id, HostTensor::f32(vec![m, n], fill(4, m * n))),
+                (x.id(), HostTensor::f32(vec![m, k], fill(1, m * k))),
+                (w.id(), weight),
+                (bias.id(), HostTensor::f32(vec![n], fill(3, n))),
+                (residual.id(), HostTensor::f32(vec![m, n], fill(4, m * n))),
             ]);
             let g = b.finish(out);
             let head = epilogue_head(&g, &target);

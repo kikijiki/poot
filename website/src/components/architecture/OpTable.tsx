@@ -212,7 +212,8 @@ const OPS: Op[] = [
     category: "compute",
     inputs: "x: [...]",
     outputShape: "same shape",
-    notes: "Tensor-parallel collectives; identity at world size 1",
+    notes:
+      "Tensor-parallel collectives. AllGather takes the number of ranks and multiplies the gather axis by it. A collective is a cut between stages: compiling one inside a stage graph is refused, and the reference evaluator refuses an AllGather over more than one rank",
   },
 ];
 

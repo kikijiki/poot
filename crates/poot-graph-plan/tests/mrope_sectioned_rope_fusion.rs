@@ -46,7 +46,14 @@ fn rope_fusion_matches_and_is_result_preserving_on_sectioned_rope() {
     let pos_h = b.constant("pos_h", TensorType::scalar(DType::I32));
     let pos_w = b.constant("pos_w", TensorType::scalar(DType::I32));
     let out = rope_sectioned(&b, x, cos, sin, &[pos_t, pos_h, pos_w], &sections);
-    let (xi, ci, si, pti, phi, pwi) = (x.id, cos.id, sin.id, pos_t.id, pos_h.id, pos_w.id);
+    let (xi, ci, si, pti, phi, pwi) = (
+        x.id(),
+        cos.id(),
+        sin.id(),
+        pos_t.id(),
+        pos_h.id(),
+        pos_w.id(),
+    );
     let g = b.finish(out);
     let g2 = rope_fusion(&cse(&g));
     let has_rope_op = g2

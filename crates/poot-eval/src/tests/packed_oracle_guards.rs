@@ -9,6 +9,7 @@ use poot_quant::format::{ScaleEncoding, WeightFormat};
 use poot_quant::{OperandRole, PackedComponentRef, PackedPayload, PackedWeight, SourceRole};
 
 use crate::{EvalError, PackedEvalError, Value};
+use poot_graph_ir::{ValueId, ValueTable};
 
 fn scale_elements(descriptor: PackedWeight) -> usize {
     let bytes_per_element = descriptor
@@ -77,7 +78,7 @@ fn payload(format: WeightFormat, shape: [usize; 2]) -> Arc<PackedPayload> {
     )
 }
 
-fn primitive_graph(owner: &Arc<PackedPayload>) -> (poot_graph_ir::Graph, usize, usize) {
+fn primitive_graph(owner: &Arc<PackedPayload>) -> (poot_graph_ir::Graph, ValueId, ValueId) {
     let descriptor = owner.weight();
     let b = Builder::new();
     let [(weight_name, weight_type), (scale_name, scale_type)] = <[(PackedSourceName, TensorType);
@@ -88,7 +89,7 @@ fn primitive_graph(owner: &Arc<PackedPayload>) -> (poot_graph_ir::Graph, usize, 
     let weight = b.constant(weight_name.as_str(), weight_type);
     let scale = b.constant(scale_name.as_str(), scale_type);
     let output = b.packed_dequant(&[weight, scale], descriptor);
-    (b.finish(output), weight.id, scale.id)
+    (b.finish(output), weight.id(), scale.id())
 }
 
 /// `packed_components` binds each graph operand to `descriptor.sources()[i]`'s own role (the
@@ -117,7 +118,7 @@ fn packed_dequant_binding_rejects_a_swapped_role() {
     // (`Codes` and `Scale` have different source shapes), so this calls `packed_components` directly -
     // the seam this mutation targets - rather than going through the outer gate a same-shape role swap
     // would slip past.
-    let mut env: Vec<Option<Value>> = vec![None; graph.values.len()];
+    let mut env: ValueTable<Option<Value>> = ValueTable::filled(graph.values.len(), None);
     env[weight_id] = Some(Value::Packed(PackedComponentRef::new(
         Arc::clone(&owner),
         SourceRole::Planar(OperandRole::Scale),

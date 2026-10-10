@@ -55,8 +55,8 @@ let out = ops::rmsnorm(&b, x, w, 1e-6);
 let g = b.finish(out);
 
 let mut inputs = HashMap::new();
-inputs.insert(x.id, Value::from(HostTensor::f32(vec![1, 1, n], vec![1.0; n])));
-inputs.insert(w.id, Value::from(HostTensor::f32(vec![n], vec![1.0; n])));
+inputs.insert(x.id(), Value::from(HostTensor::f32(vec![1, 1, n], vec![1.0; n])));
+inputs.insert(w.id(), Value::from(HostTensor::f32(vec![n], vec![1.0; n])));
 let y = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))?;
 ```
 

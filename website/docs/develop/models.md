@@ -30,7 +30,7 @@ the matrix for backend coverage. Gemma 2's sliding window covers the even layers
 
 Qwen3-MoE, Granite MoE, Mixtral, OLMoE, gpt-oss, MiniMax-M2.
 
-Router plus sparse expert MLPs, with every expert's weights resident (there is no expert pooling). These load with `ModelHandle::load` and generate with `Driver`, from safetensors and from GGUF. Mixtral is the Llama family with experts: a Mixtral GGUF names the `llama` architecture, and it carries experts when its metadata has `llama.expert_count`. Granite MoE is the Granite family with experts. Experts are read as the checkpoint stores them, per-expert tensors or a stored stack, dense or packed; nothing is fused at load. A NaN or infinite router logit stops the step with a validation error naming the layer. MiniMax-M2 routes with a sigmoid score and a correction bias that only decides which experts run, and it is an HF safetensors family. Its layer, expert and head counts come from the checkpoint's config, so a fine-tune with other counts loads the same way. Check the matrix for your architecture and backend.
+Router plus sparse expert MLPs, with every expert's weights resident unless expert pooling is asked for (`Driver::with_expert_pool`, `--expert-pool` on the server). These load with `ModelHandle::load` and generate with `Driver`, from safetensors and from GGUF. Mixtral is the Llama family with experts: a Mixtral GGUF names the `llama` architecture, and it carries experts when its metadata has `llama.expert_count`. Granite MoE is the Granite family with experts. Experts are read as the checkpoint stores them, per-expert tensors or a stored stack, dense or packed; nothing is fused at load. A NaN or infinite router logit stops the step with a validation error naming the layer. MiniMax-M2 routes with a sigmoid score and a correction bias that only decides which experts run, and it is an HF safetensors family. Its layer, expert and head counts come from the checkpoint's config, so a fine-tune with other counts loads the same way. Check the matrix for your architecture and backend.
 
 ## Gemma 4
 
@@ -131,7 +131,7 @@ SmolVLM, idefics3, and Qwen2.5-VL.
 
 Multimodal chat: the vision tower (an `Encode`-only model) and the text decoder (the `llama` family read from the
 checkpoint's `text_config`) are two registered families over one checkpoint, each on its own driver. The library
-path is `poot_llm::front_end::Idefics3` and the `poot-caption` binary. Qwen2.5-VL is the same shape (`qwen2_5_vl_vision` and the `qwen2_5_vl` text decoder with sectioned RoPE; `poot_llm::qwen_vl::Qwen25Vl`). Serving covers the idefics3 (SmolVLM) checkpoint only, through `poot_llm::front_end::{Idefics3Checkpoint, ImageFrontEnd}` (see [Multimodal](../serve/multimodal.md)); Qwen2.5-VL runs through its library path and `poot-caption`, not the server. ROCm and
+path is `poot_llm::front_end::Idefics3` and the `poot-caption` binary. Qwen2.5-VL is the same shape (`qwen2_5_vl_vision` and the `qwen2_5_vl` text decoder with sectioned RoPE; `poot_llm::qwen_vl::Qwen25Vl`). Serving covers both families: `poot_llm::read_image_checkpoint` finds the vision-language checkpoint in a model directory and returns an `ImageCheckpoint`, which opens an `ImageFrontEnd` that turns a conversation and its images into the prompt's tokens, embedding rows and, for Qwen2.5-VL, its sectioned positions (see [Multimodal](../serve/multimodal.md)). ROCm and
 PTX GPU verification is thinner than wgpu for some modalities; see the matrix before relying on it.
 
 ## Adding a model

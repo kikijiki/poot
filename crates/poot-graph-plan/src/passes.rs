@@ -36,8 +36,10 @@ mod legalize;
 mod lora;
 mod packed;
 mod packed_bind;
+mod pool;
 mod routed_experts;
 mod sample_token_large_vocab;
+mod sharding;
 mod stage_split;
 mod widen;
 
@@ -75,8 +77,12 @@ pub use packed_bind::{
     ExpertStackRefusal, PackedBindError, PackedConst, PackedLayout, WeightFormats,
     WeightFormatsError, bind_packed_weights,
 };
+pub(crate) use pool::pool_experts;
+pub use pool::{PoolError, PoolSite, PoolSpec, PooledWeight, routed_step_demand};
 #[cfg(test)]
 pub(crate) use routed_experts::routed_expert_sites;
+pub(crate) use sharding::expand_ranks;
+pub use sharding::{ShardError, ShardRule, ShardedGraph, shard};
 pub use stage_split::BoundaryDescriptor;
 #[cfg(test)]
 pub(crate) use stage_split::StageSplit;

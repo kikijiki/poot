@@ -67,12 +67,12 @@ fn gated_delta_net_decode_matches_recurrence() {
         let btt: Vec<f32> = (0..h).map(|hh| betav[hh * l + t]).collect();
 
         let mut inp = HashMap::new();
-        inp.insert(q_in.id, HostTensor::f32(vec![1, h, 1, d], qt));
-        inp.insert(k_in.id, HostTensor::f32(vec![1, h, 1, d], kt));
-        inp.insert(v_in.id, HostTensor::f32(vec![1, h, 1, d], vt));
-        inp.insert(g_in.id, HostTensor::f32(vec![1, h, 1, 1], gt));
-        inp.insert(bt_in.id, HostTensor::f32(vec![1, h, 1, 1], btt));
-        inp.insert(s_in.id, state.clone());
+        inp.insert(q_in.id(), HostTensor::f32(vec![1, h, 1, d], qt));
+        inp.insert(k_in.id(), HostTensor::f32(vec![1, h, 1, d], kt));
+        inp.insert(v_in.id(), HostTensor::f32(vec![1, h, 1, d], vt));
+        inp.insert(g_in.id(), HostTensor::f32(vec![1, h, 1, 1], gt));
+        inp.insert(bt_in.id(), HostTensor::f32(vec![1, h, 1, 1], btt));
+        inp.insert(s_in.id(), state.clone());
 
         let (ot, new_states) = (|| -> Result<(HostTensor, Vec<HostTensor>), EvalError> {
             let values: HashMap<ValueId, Value> = inp
@@ -196,12 +196,12 @@ fn gated_delta_net_decode_batch_generalizes_from_batch1() {
                 let g_graph = b.finish_with_state(o, &[(s0, s_out)]);
 
                 let mut inp = HashMap::new();
-                inp.insert(q_in.id, HostTensor::f32(vec![1, h, 1, d], q.clone()));
-                inp.insert(k_in.id, HostTensor::f32(vec![1, h, 1, d], k.clone()));
-                inp.insert(v_in.id, HostTensor::f32(vec![1, h, 1, d], v.clone()));
-                inp.insert(g_in.id, HostTensor::f32(vec![1, h, 1, 1], g.clone()));
-                inp.insert(bt_in.id, HostTensor::f32(vec![1, h, 1, 1], beta.clone()));
-                inp.insert(s0.id, HostTensor::f32(vec![1, h, d, d], s_in.clone()));
+                inp.insert(q_in.id(), HostTensor::f32(vec![1, h, 1, d], q.clone()));
+                inp.insert(k_in.id(), HostTensor::f32(vec![1, h, 1, d], k.clone()));
+                inp.insert(v_in.id(), HostTensor::f32(vec![1, h, 1, d], v.clone()));
+                inp.insert(g_in.id(), HostTensor::f32(vec![1, h, 1, 1], g.clone()));
+                inp.insert(bt_in.id(), HostTensor::f32(vec![1, h, 1, 1], beta.clone()));
+                inp.insert(s0.id(), HostTensor::f32(vec![1, h, d, d], s_in.clone()));
                 let (o_t, new_states) = (|| -> Result<(HostTensor, Vec<HostTensor>), EvalError> {
                     let values: HashMap<ValueId, Value> = inp
                         .iter()
@@ -251,27 +251,27 @@ fn gated_delta_net_decode_batch_generalizes_from_batch1() {
         };
         let mut inp = HashMap::new();
         inp.insert(
-            q_in.id,
+            q_in.id(),
             HostTensor::f32(vec![b_batch, h, 1, d], flat(|r| &r.0)),
         );
         inp.insert(
-            k_in.id,
+            k_in.id(),
             HostTensor::f32(vec![b_batch, h, 1, d], flat(|r| &r.1)),
         );
         inp.insert(
-            v_in.id,
+            v_in.id(),
             HostTensor::f32(vec![b_batch, h, 1, d], flat(|r| &r.2)),
         );
         inp.insert(
-            g_in.id,
+            g_in.id(),
             HostTensor::f32(vec![b_batch, h, 1, 1], flat(|r| &r.3)),
         );
         inp.insert(
-            bt_in.id,
+            bt_in.id(),
             HostTensor::f32(vec![b_batch, h, 1, 1], flat(|r| &r.4)),
         );
         inp.insert(
-            s0.id,
+            s0.id(),
             HostTensor::f32(vec![b_batch, h, d, d], flat(|r| &r.5)),
         );
         let (o_t, new_states) = (|| -> Result<(HostTensor, Vec<HostTensor>), EvalError> {

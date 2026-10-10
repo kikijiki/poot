@@ -93,16 +93,16 @@ fn program(ids: &[f32], gate: Option<Vec<f32>>) -> Program {
     let w = b.constant("w", TensorType::f32(vec![EXPERTS, K, N]));
     let idx = b.constant("idx", TensorType::f32(vec![m]));
     let mut inputs = HashMap::new();
-    inputs.insert(x.id, HostTensor::f32(vec![m, K], int_fill(1, m * K)));
+    inputs.insert(x.id(), HostTensor::f32(vec![m, K], int_fill(1, m * K)));
     inputs.insert(
-        w.id,
+        w.id(),
         HostTensor::f32(vec![EXPERTS, K, N], int_fill(2, EXPERTS * K * N)),
     );
-    inputs.insert(idx.id, HostTensor::f32(vec![m], ids.to_vec()));
+    inputs.insert(idx.id(), HostTensor::f32(vec![m], ids.to_vec()));
     let mut out = b.indexed_matmul(x, w, idx);
     if let Some(gate) = gate {
         let gate_t = b.constant("gate", TensorType::f32(vec![m]));
-        inputs.insert(gate_t.id, HostTensor::f32(vec![m], gate));
+        inputs.insert(gate_t.id(), HostTensor::f32(vec![m], gate));
         let column = b.reshape(gate_t, vec![m, 1]);
         out = b.binary(BinOp::Mul, out, column);
     }
@@ -131,19 +131,19 @@ fn checkpoint_program_gated(ids: &[f32], gate: Option<Vec<f32>>) -> Program {
     let w = b.constant("w", TensorType::f32(vec![CHECKPOINT_EXPERTS, N, K]));
     let idx = b.constant("idx", TensorType::f32(vec![m]));
     let mut inputs = HashMap::new();
-    inputs.insert(x.id, HostTensor::f32(vec![m, K], int_fill(1, m * K)));
+    inputs.insert(x.id(), HostTensor::f32(vec![m, K], int_fill(1, m * K)));
     inputs.insert(
-        w.id,
+        w.id(),
         HostTensor::f32(
             vec![CHECKPOINT_EXPERTS, N, K],
             int_fill(2, CHECKPOINT_EXPERTS * N * K),
         ),
     );
-    inputs.insert(idx.id, HostTensor::f32(vec![m], ids.to_vec()));
+    inputs.insert(idx.id(), HostTensor::f32(vec![m], ids.to_vec()));
     let mut out = b.indexed_matmul(x, b.transpose(w, vec![0, 2, 1]), idx);
     if let Some(gate) = gate {
         let gate_t = b.constant("gate", TensorType::f32(vec![m]));
-        inputs.insert(gate_t.id, HostTensor::f32(vec![m], gate));
+        inputs.insert(gate_t.id(), HostTensor::f32(vec![m], gate));
         out = b.binary(BinOp::Mul, out, b.reshape(gate_t, vec![m, 1]));
     }
     Program {
@@ -363,8 +363,8 @@ fn bf16_program(ids: &[f32], checkpoint_order: bool, gate: Option<Vec<f32>>) -> 
     let x = b.constant("x", TensorType::f32(vec![m, K]));
     let idx = b.constant("idx", TensorType::f32(vec![m]));
     let mut inputs = HashMap::new();
-    inputs.insert(x.id, HostTensor::f32(vec![m, K], int_fill(1, m * K)));
-    inputs.insert(idx.id, HostTensor::f32(vec![m], ids.to_vec()));
+    inputs.insert(x.id(), HostTensor::f32(vec![m, K], int_fill(1, m * K)));
+    inputs.insert(idx.id(), HostTensor::f32(vec![m], ids.to_vec()));
     let stored = if checkpoint_order {
         vec![experts, N, K]
     } else {
@@ -375,7 +375,7 @@ fn bf16_program(ids: &[f32], checkpoint_order: bool, gate: Option<Vec<f32>>) -> 
         TensorType::new(stored.clone(), poot_tensor::DType::BF16),
     );
     inputs.insert(
-        w.id,
+        w.id(),
         HostTensor::bf16(stored.clone(), words(int_fill(2, experts * K * N))),
     );
     let weight = if checkpoint_order {
@@ -386,7 +386,7 @@ fn bf16_program(ids: &[f32], checkpoint_order: bool, gate: Option<Vec<f32>>) -> 
     let mut out = b.indexed_matmul(x, weight, idx);
     if let Some(gate) = gate {
         let gate_t = b.constant("gate", TensorType::f32(vec![m]));
-        inputs.insert(gate_t.id, HostTensor::f32(vec![m], gate));
+        inputs.insert(gate_t.id(), HostTensor::f32(vec![m], gate));
         out = b.binary(BinOp::Mul, out, b.reshape(gate_t, vec![m, 1]));
     }
     Program {

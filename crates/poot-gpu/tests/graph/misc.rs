@@ -54,7 +54,7 @@ fn igpu_matmul_latency_vs_npu() {
             let sz: usize = meta.aval.shape.iter().product();
             inp.insert(
                 id,
-                HostTensor::f32(meta.aval.shape.clone(), fill(sz, id as u64)),
+                HostTensor::f32(meta.aval.shape.clone(), fill(sz, id.index() as u64)),
             );
         }
         (g, inp)
@@ -188,7 +188,7 @@ fn masked_attention_gpu_matches_cpu() {
     let v = b.constant("v", TensorType::f32(vec![1, hkv, cap, d]));
     let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
     let out = attention_masked(&b, q, k, v, n_rep, scale, mask);
-    let (qi, ki, vi, mi) = (q.id, k.id, v.id, mask.id);
+    let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
     let g = b.finish(out);
 
     let fill =
@@ -242,7 +242,7 @@ fn swiglu_gpu_matches_cpu() {
     let gate = b.constant("gate", TensorType::f32(vec![1, 1, n]));
     let up = b.constant("up", TensorType::f32(vec![1, 1, n]));
     let out = poot_graph_ir::ops::swiglu(&b, gate, up);
-    let (gi, ui) = (gate.id, up.id);
+    let (gi, ui) = (gate.id(), up.id());
     let g = b.finish(out);
 
     let gd: Vec<f32> = (0..n).map(|i| (i as f32) * 0.3 - 1.5).collect();
@@ -362,12 +362,12 @@ fn fused_gpu_matches_cpu_over_random_graphs() {
         let mut inputs = HashMap::new();
         for (i, t) in full.iter().enumerate() {
             inputs.insert(
-                t.id,
+                t.id(),
                 HostTensor::f32(shape.clone(), fill(seed * 7 + i as u64 + 1, numel)),
             );
         }
         inputs.insert(
-            bcast.id,
+            bcast.id(),
             HostTensor::f32(bshape.clone(), fill(seed * 7 + 101, bnumel)),
         );
         let fg = fuse(&cse(&g));
@@ -457,7 +457,7 @@ fn movement_gpu_matches_cpu_over_random_graphs() {
             }
             let t = b.constant(&format!("x{k}"), TensorType::f32(shape.clone()));
             inputs.insert(
-                t.id,
+                t.id(),
                 HostTensor::f32(shape.clone(), fill(seed * 7 + k as u64, numel(&shape))),
             );
             pool.push((t, shape));

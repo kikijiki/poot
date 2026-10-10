@@ -29,15 +29,15 @@ pub use builder::{
     ScanResult, Traced,
 };
 pub use error::{
-    BuilderAppendError, BuilderCollection, BuilderValueNamespace, GraphValidationError, ScanReason,
-    ShapeError,
+    BuilderAppendError, BuilderCollection, BuilderValueNamespace, FusedOperandReason,
+    GraphValidationError, ScanReason, ShapeError,
 };
 pub use graph::{
     BoundaryId, ComputedConst, Eqn, ExecutionValidationFailure, Export, Graph, LayerIndex,
     LayerRuns, LayerTagError, MAX_VALIDATION_PACKET_BYTES, NoValidations, Operand, Slot, SlotKey,
     StatePair, StateRole, Storage, ValidationChannel, ValidationId, ValidationOutput,
     ValidationOutputs, ValidationPacketEntry, ValidationPacketError, ValidationPacketLayout,
-    ValueId, ValueMeta,
+    ValueId, ValueMeta, ValueTable,
 };
 pub use index_guard::{
     GuardedIndex, IndexBoundsGuard, IndexGuardError, IndexGuardRejection,

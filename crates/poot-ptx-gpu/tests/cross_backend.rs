@@ -128,7 +128,7 @@ fn elementwise_add_ptx_matches_cpu() {
     let a = b.constant("a", TensorType::f32(vec![n]));
     let c = b.constant("c", TensorType::f32(vec![n]));
     let out = b.binary(BinOp::Add, a, c);
-    let (ai, ci) = (a.id, c.id);
+    let (ai, ci) = (a.id(), c.id());
     let g = b.finish(out);
 
     let inputs = make_inputs(&[(ai, vec![n], fill(42, n)), (ci, vec![n], fill(99, n))]);
@@ -158,7 +158,7 @@ fn elementwise_mul_ptx_matches_cpu() {
     let a = b.constant("a", TensorType::f32(vec![n]));
     let c = b.constant("c", TensorType::f32(vec![n]));
     let out = b.binary(BinOp::Mul, a, c);
-    let (ai, ci) = (a.id, c.id);
+    let (ai, ci) = (a.id(), c.id());
     let g = b.finish(out);
 
     let inputs = make_inputs(&[(ai, vec![n], fill(201, n)), (ci, vec![n], fill(202, n))]);
@@ -187,7 +187,7 @@ fn elementwise_neg_ptx_matches_cpu() {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![n]));
     let out = b.unary(UnOp::Neg, x);
-    let xi = x.id;
+    let xi = x.id();
     let g = b.finish(out);
 
     let inputs = make_inputs(&[(xi, vec![n], fill(301, n))]);
@@ -219,7 +219,7 @@ fn matmul_ptx_matches_cpu() {
     let a = b.constant("a", TensorType::f32(vec![m, k]));
     let w = b.constant("w", TensorType::f32(vec![k, n]));
     let out = b.matmul(a, w);
-    let (ai, wi) = (a.id, w.id);
+    let (ai, wi) = (a.id(), w.id());
     let g = b.finish(out);
 
     let inputs = make_inputs(&[
@@ -253,7 +253,7 @@ fn reduce_sum_ptx_matches_cpu() {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![rows, cols]));
     let out = b.reduce(RedOp::Sum, x, 1, false);
-    let xi = x.id;
+    let xi = x.id();
     let g = b.finish(out);
 
     let inputs = make_inputs(&[(xi, vec![rows, cols], fill(501, rows * cols))]);
@@ -283,7 +283,7 @@ fn reduce_max_last_axis_ptx_matches_cpu() {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![rows, cols]));
     let out = b.reduce(RedOp::Max, x, 1, false);
-    let xi = x.id;
+    let xi = x.id();
     let g = b.finish(out);
 
     let inputs = make_inputs(&[(xi, vec![rows, cols], fill(511, rows * cols))]);
@@ -320,7 +320,7 @@ fn reduce_sum_nonpow2_wide_real_magnitude_ptx_matches_cpu() {
         let b = Builder::new();
         let x = b.constant("x", TensorType::f32(vec![rows, cols]));
         let out = b.reduce(RedOp::Sum, x, 1, false);
-        let xi = x.id;
+        let xi = x.id();
         let g = b.finish(out);
 
         let data = fill_real_magnitude(820 + i as u64, rows * cols);
@@ -371,7 +371,7 @@ fn reduce_max_nonpow2_wide_real_magnitude_ptx_matches_cpu() {
         let b = Builder::new();
         let x = b.constant("x", TensorType::f32(vec![rows, cols]));
         let out = b.reduce(RedOp::Max, x, 1, false);
-        let xi = x.id;
+        let xi = x.id();
         let g = b.finish(out);
 
         let data = fill_real_magnitude(920 + i as u64, rows * cols);
@@ -422,7 +422,7 @@ fn rmsnorm_ptx_matches_cpu() {
     let x = b.constant("x", TensorType::f32(vec![1, 1, n]));
     let w = b.constant("w", TensorType::f32(vec![n]));
     let out = poot_graph_ir::ops::rmsnorm(&b, x, w, 1e-6);
-    let (xi, wi) = (x.id, w.id);
+    let (xi, wi) = (x.id(), w.id());
     let g = b.finish(out);
 
     let xd = fill_real_magnitude(931, n);
@@ -456,7 +456,7 @@ fn layernorm_ptx_matches_cpu() {
     let w = b.constant("w", TensorType::f32(vec![n]));
     let bias = b.constant("bias", TensorType::f32(vec![n]));
     let out = poot_graph_ir::ops::layernorm(&b, x, w, bias, 1e-6);
-    let (xi, wi, bi) = (x.id, w.id, bias.id);
+    let (xi, wi, bi) = (x.id(), w.id(), bias.id());
     let g = b.finish(out);
 
     let xd = fill_real_magnitude(941, n);
@@ -495,7 +495,7 @@ fn non_power_of_2_ptx_matches_cpu() {
     let a = b.constant("a", TensorType::f32(vec![n]));
     let c = b.constant("c", TensorType::f32(vec![n]));
     let out = b.binary(BinOp::Add, a, c);
-    let (ai, ci) = (a.id, c.id);
+    let (ai, ci) = (a.id(), c.id());
     let g = b.finish(out);
 
     let inputs = make_inputs(&[(ai, vec![n], fill(601, n)), (ci, vec![n], fill(602, n))]);
@@ -526,7 +526,7 @@ fn single_element_ptx_matches_cpu() {
     let a = b.constant("a", TensorType::f32(vec![1]));
     let c = b.constant("c", TensorType::f32(vec![1]));
     let out = b.binary(BinOp::Add, a, c);
-    let (ai, ci) = (a.id, c.id);
+    let (ai, ci) = (a.id(), c.id());
     let g = b.finish(out);
 
     let inputs = make_inputs(&[(ai, vec![1], vec![3.5]), (ci, vec![1], vec![2.5])]);
@@ -558,7 +558,7 @@ fn large_elementwise_ptx_matches_cpu() {
     let a = b.constant("a", TensorType::f32(vec![n]));
     let c = b.constant("c", TensorType::f32(vec![n]));
     let out = b.binary(BinOp::Mul, a, c);
-    let (ai, ci) = (a.id, c.id);
+    let (ai, ci) = (a.id(), c.id());
     let g = b.finish(out);
 
     let inputs = make_inputs(&[(ai, vec![n], fill(701, n)), (ci, vec![n], fill(702, n))]);
@@ -592,7 +592,7 @@ fn gather_axis0_ptx_matches_cpu() {
     let data = b.constant("data", TensorType::f32(vec![n, d]));
     let idx = b.constant("idx", TensorType::f32(vec![idx_count]));
     let out = b.gather(data, 0, idx);
-    let (di, ii) = (data.id, idx.id);
+    let (di, ii) = (data.id(), idx.id());
     let g = b.finish(out);
     let inputs = make_inputs(&[
         (di, vec![n, d], fill(901, n * d)),
@@ -626,7 +626,7 @@ fn matmul_bias_ptx_matches_cpu() {
     let bias = b.constant("bias", TensorType::f32(vec![n]));
     let mm = b.matmul(a, w);
     let out = b.binary(BinOp::Add, mm, bias);
-    let (ai, wi, bi) = (a.id, w.id, bias.id);
+    let (ai, wi, bi) = (a.id(), w.id(), bias.id());
     let g = b.finish(out);
     let inputs = make_inputs(&[
         (ai, vec![m, k], fill(401, m * k)),
@@ -658,7 +658,7 @@ fn broadcast_binary_ptx_matches_cpu() {
     let a = b.constant("a", TensorType::f32(vec![batch, rows, cols]));
     let bias = b.constant("bias", TensorType::f32(vec![cols]));
     let out = b.binary(BinOp::Add, a, bias);
-    let (ai, bi) = (a.id, bias.id);
+    let (ai, bi) = (a.id(), bias.id());
     let g = b.finish(out);
     let inputs = make_inputs(&[
         (ai, vec![batch, rows, cols], fill(601, batch * rows * cols)),
@@ -689,7 +689,7 @@ fn transpose_slice_ptx_matches_cpu() {
     let x = b.constant("x", TensorType::f32(vec![r, c]));
     let t = b.transpose(x, vec![1, 0]);
     let s = b.slice(t, 1, 2, 6);
-    let xi = x.id;
+    let xi = x.id();
     let g = b.finish(s);
     let inputs = make_inputs(&[(xi, vec![r, c], fill(701, r * c))]);
     let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -719,7 +719,7 @@ fn elementwise_sub_div_ptx_matches_cpu() {
     let c = b.constant("c", TensorType::f32(vec![n]));
     let sub = b.binary(BinOp::Sub, a, c);
     let out = b.binary(BinOp::Div, sub, c);
-    let (ai, ci) = (a.id, c.id);
+    let (ai, ci) = (a.id(), c.id());
     let g = b.finish(out);
     let mut cd = fill(802, n);
     for v in cd.iter_mut() {
@@ -749,7 +749,7 @@ fn unary_ptx_case(op: UnOp, xd: Vec<f32>, label: &str) {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![n]));
     let out = b.unary(op, x);
-    let xi = x.id;
+    let xi = x.id();
     let g = b.finish(out);
     let inputs = make_inputs(&[(xi, vec![n], xd)]);
     let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -817,7 +817,7 @@ fn unary_transcendental_ptx(op: UnOp, label: &str) {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![n]));
     let out = b.unary(op, x);
-    let xi = x.id;
+    let xi = x.id();
     let g = b.finish(out);
     let inputs = make_inputs(&[(xi, vec![n], TRANSCENDENTAL_TABLE.to_vec())]);
     let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -863,7 +863,7 @@ fn masked_attention_ptx_matches_cpu() {
     let v = b.constant("v", TensorType::f32(vec![1, hkv, cap, d]));
     let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
     let out = attention_masked(&b, q, k, v, n_rep, scale, mask);
-    let (qi, ki, vi, mi) = (q.id, k.id, v.id, mask.id);
+    let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
     let g = b.finish(out);
     let inputs = make_inputs(&[
         (qi, vec![1, hq, 1, d], fill(501, hq * d)),
@@ -900,7 +900,7 @@ fn decomposed_prefill_attention_over_65535_query_groups_ptx_matches_cpu() {
     let v = b.constant("v", TensorType::f32(vec![1, hq, l, d]));
     let mask = b.constant("mask", TensorType::f32(vec![1, 1, l, l]));
     let out = attention_prefill(&b, q, k, v, 1, 0.3, mask);
-    let (qi, ki, vi, mi) = (q.id, k.id, v.id, mask.id);
+    let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
     let g = b.finish(out);
     let causal: Vec<f32> = (0..l * l)
         .map(|i| if i % l <= i / l { 0.0 } else { -1.0e9 })
@@ -947,7 +947,7 @@ fn large_vocab_lm_head_transpose_matmul_does_not_hang_ptx() {
     let w = b.constant("lm_head.weight", TensorType::f32(vec![vocab, hidden]));
     let wt = b.transpose(w, vec![1, 0]); // [hidden, vocab]
     let out = b.matmul(hstate, wt); // [1,1,vocab]
-    let (hi, wi) = (hstate.id, w.id);
+    let (hi, wi) = (hstate.id(), w.id());
     let g = b.finish(out);
 
     let inputs = make_inputs(&[
@@ -988,7 +988,7 @@ fn sample_token_greedy_ptx_matches_cpu() {
         None,
         None,
     );
-    let li = logits.id;
+    let li = logits.id();
     let g = b.finish(out);
 
     let mut data = vec![0f32; rows * vocab];
@@ -1045,7 +1045,7 @@ fn random_uniform_ptx_matches_cpu() {
 
     let seed_data: Vec<i32> = vec![0, 1, 0xDEADBEEFu32 as i32];
     let inputs: HashMap<ValueId, Value> =
-        HashMap::from([(seed.id, HostTensor::i32(vec![rows], seed_data).into())]);
+        HashMap::from([(seed.id(), HostTensor::i32(vec![rows], seed_data).into())]);
     let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
         .unwrap()
         .output
@@ -1096,7 +1096,7 @@ fn sample_token_gumbel_topp_only_excludes_untruncated_winner_ptx_matches_cpu() {
         Some(params),
         Some(top_k),
     );
-    let (li, ni, pi) = (logits.id, noise.id, params.id);
+    let (li, ni, pi) = (logits.id(), noise.id(), params.id());
     let g = b.finish(out);
 
     let mut logits_data = vec![-100.0f32; rows * vocab];
@@ -1112,7 +1112,7 @@ fn sample_token_gumbel_topp_only_excludes_untruncated_winner_ptx_matches_cpu() {
         (li, HostTensor::f32(vec![rows, vocab], logits_data).into()),
         (ni, HostTensor::f32(vec![rows, vocab], noise_data).into()),
         (pi, HostTensor::f32(vec![rows, 4], params_data).into()),
-        (top_k.id, HostTensor::i32(vec![rows], top_k_data).into()),
+        (top_k.id(), HostTensor::i32(vec![rows], top_k_data).into()),
     ]);
     let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
         .unwrap()
@@ -1197,11 +1197,11 @@ fn a_dense_tiled_epilogue_matches_the_oracle_on_ptx() {
                 _ => HostTensor::f32(vec![n, k], weight_values),
             };
             let inputs: HashMap<ValueId, Value> = HashMap::from([
-                (x.id, HostTensor::f32(vec![m, k], fill(1, m * k)).into()),
-                (w.id, weight.into()),
-                (bias.id, HostTensor::f32(vec![n], fill(3, n)).into()),
+                (x.id(), HostTensor::f32(vec![m, k], fill(1, m * k)).into()),
+                (w.id(), weight.into()),
+                (bias.id(), HostTensor::f32(vec![n], fill(3, n)).into()),
                 (
-                    residual.id,
+                    residual.id(),
                     HostTensor::f32(vec![m, n], fill(4, m * n)).into(),
                 ),
             ]);
@@ -1269,11 +1269,11 @@ fn a_tiled_matmul_epilogue_matches_the_oracle_on_ptx() {
         let head = b.matmul(x, w);
         let out = b.binary(BinOp::Add, b.binary(BinOp::Add, head, bias), residual);
         let inputs: HashMap<ValueId, Value> = HashMap::from([
-            (x.id, HostTensor::f32(vec![m, k], fill(1, m * k)).into()),
-            (w.id, HostTensor::f32(vec![k, n], fill(2, k * n)).into()),
-            (bias.id, HostTensor::f32(vec![n], fill(3, n)).into()),
+            (x.id(), HostTensor::f32(vec![m, k], fill(1, m * k)).into()),
+            (w.id(), HostTensor::f32(vec![k, n], fill(2, k * n)).into()),
+            (bias.id(), HostTensor::f32(vec![n], fill(3, n)).into()),
             (
-                residual.id,
+                residual.id(),
                 HostTensor::f32(vec![m, n], fill(4, m * n)).into(),
             ),
         ]);

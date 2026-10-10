@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use poot_graph_ir::{
     BinOp, Builder, ExecutionValidationFailure, Graph, GraphValidationError, Scalar, StateRole,
-    TensorType, ValidationId, ValidationOutput, ValidationOutputs,
+    TensorType, ValidationId, ValidationOutput, ValidationOutputs, ValueId,
 };
 
 use super::helpers;
@@ -18,9 +18,9 @@ use crate::walk::publication_probe;
 use crate::{EvalBudget, EvalError, EvalOptions, ExactI32TensorView, Value, eval};
 use poot_tensor::HostTensor;
 
-type ValueFixture = fn(f32) -> (Graph<ValidationOutputs>, HashMap<usize, Value>);
+type ValueFixture = fn(f32) -> (Graph<ValidationOutputs>, HashMap<ValueId, Value>);
 
-fn stateless_fixture(value: f32) -> (Graph<ValidationOutputs>, HashMap<usize, Value>) {
+fn stateless_fixture(value: f32) -> (Graph<ValidationOutputs>, HashMap<ValueId, Value>) {
     let b = Builder::new();
     let primary = b.constant("primary", TensorType::f32([1]));
     let witness = b.constant("witness", TensorType::f32([2]));
@@ -31,14 +31,14 @@ fn stateless_fixture(value: f32) -> (Graph<ValidationOutputs>, HashMap<usize, Va
     )
     .unwrap();
     let inputs = HashMap::from([
-        (primary.id, dense_value(vec![42.0])),
-        (witness.id, dense_value(vec![0.0, value])),
+        (primary.id(), dense_value(vec![42.0])),
+        (witness.id(), dense_value(vec![0.0, value])),
     ]);
     (graph, inputs)
 }
 
 /// A dense graph with one computed primary output and one computed state update.
-fn stateful_fixture(value: f32) -> (Graph<ValidationOutputs>, HashMap<usize, Value>) {
+fn stateful_fixture(value: f32) -> (Graph<ValidationOutputs>, HashMap<ValueId, Value>) {
     let b = Builder::new();
     let state = b.state_input("state", TensorType::f32([2]), StateRole::Recurrent);
     let x = b.constant("x", TensorType::f32([2]));
@@ -53,16 +53,16 @@ fn stateful_fixture(value: f32) -> (Graph<ValidationOutputs>, HashMap<usize, Val
     )
     .unwrap();
     let inputs = HashMap::from([
-        (state.id, dense_value(vec![11.0, 13.0])),
-        (x.id, dense_value(vec![2.0, 3.0])),
-        (witness.id, dense_value(vec![0.0, value])),
+        (state.id(), dense_value(vec![11.0, 13.0])),
+        (x.id(), dense_value(vec![2.0, 3.0])),
+        (witness.id(), dense_value(vec![0.0, value])),
     ]);
     (graph, inputs)
 }
 
 /// A graph that touches E4M3FN: the one walk dispatches its equations through the storage-aware path
 /// instead of the plain dense one.
-fn storage_aware_fixture(value: f32) -> (Graph<ValidationOutputs>, HashMap<usize, Value>) {
+fn storage_aware_fixture(value: f32) -> (Graph<ValidationOutputs>, HashMap<ValueId, Value>) {
     let b = Builder::new();
     let raw = b.constant("raw", TensorType::new([2], DType::E4M3FN));
     let witness = b.constant("witness", TensorType::f32([2]));
@@ -70,14 +70,16 @@ fn storage_aware_fixture(value: f32) -> (Graph<ValidationOutputs>, HashMap<usize
         helpers::finish_with_validations(b, raw, &[(ValidationId(17), "synthetic-check", witness)])
             .unwrap();
     let inputs = HashMap::from([
-        (raw.id, e4m3_value()),
-        (witness.id, dense_value(vec![0.0, value])),
+        (raw.id(), e4m3_value()),
+        (witness.id(), dense_value(vec![0.0, value])),
     ]);
     (graph, inputs)
 }
 
 /// Storage-aware (E4M3FN) and stateful: the state update is an ordinary dense equation.
-fn storage_aware_stateful_fixture(value: f32) -> (Graph<ValidationOutputs>, HashMap<usize, Value>) {
+fn storage_aware_stateful_fixture(
+    value: f32,
+) -> (Graph<ValidationOutputs>, HashMap<ValueId, Value>) {
     let b = Builder::new();
     let raw = b.constant("raw", TensorType::new([2], DType::E4M3FN));
     let state = b.state_input("state", TensorType::f32([2]), StateRole::Recurrent);
@@ -91,16 +93,16 @@ fn storage_aware_stateful_fixture(value: f32) -> (Graph<ValidationOutputs>, Hash
     )
     .unwrap();
     let inputs = HashMap::from([
-        (raw.id, e4m3_value()),
-        (state.id, dense_value(vec![11.0, 13.0])),
-        (witness.id, dense_value(vec![0.0, value])),
+        (raw.id(), e4m3_value()),
+        (state.id(), dense_value(vec![11.0, 13.0])),
+        (witness.id(), dense_value(vec![0.0, value])),
     ]);
     (graph, inputs)
 }
 
 /// An exact-I32 graph with carried state (card 371's carrier). The counter's update is an exact I32
 /// equation, so the walk keeps the exact carrier through to publication.
-fn exact_i32_stateful_fixture(value: f32) -> (Graph<ValidationOutputs>, HashMap<usize, Value>) {
+fn exact_i32_stateful_fixture(value: f32) -> (Graph<ValidationOutputs>, HashMap<ValueId, Value>) {
     let b = Builder::new();
     let counter = b.state_input(
         "counter",
@@ -120,14 +122,14 @@ fn exact_i32_stateful_fixture(value: f32) -> (Graph<ValidationOutputs>, HashMap<
     .unwrap();
     let inputs = HashMap::from([
         (
-            counter.id,
+            counter.id(),
             Value::from(
                 ExactI32TensorView::try_from_words(vec![2], std::sync::Arc::from(vec![5, 7]))
                     .unwrap(),
             ),
         ),
-        (x.id, dense_value(vec![2.0, 3.0])),
-        (witness.id, dense_value(vec![0.0, value])),
+        (x.id(), dense_value(vec![2.0, 3.0])),
+        (witness.id(), dense_value(vec![0.0, value])),
     ]);
     (graph, inputs)
 }
@@ -220,7 +222,7 @@ fn oversized_packet_is_rejected_before_evaluation() {
     let graph = b.finish(primary).with_validations(vec![ValidationOutput {
         id: ValidationId(17),
         name: "oversized".into(),
-        value: witness.id,
+        value: witness.id(),
     }]);
     // No input is bound: evaluating the equation would report `MissingInput` instead.
     let inputs = HashMap::new();
@@ -250,15 +252,15 @@ fn oversized_packet_is_rejected_before_evaluation() {
 
 #[test]
 fn empty_validation_graph_is_compatible() {
-    fn build() -> (Graph<ValidationOutputs>, Graph, HashMap<usize, Value>) {
+    fn build() -> (Graph<ValidationOutputs>, Graph, HashMap<ValueId, Value>) {
         let b = Builder::new();
         let state = b.state_input("state", TensorType::f32([1]), StateRole::Recurrent);
         let x = b.constant("x", TensorType::f32([1]));
         let primary = b.binary(BinOp::Mul, x, state);
         let next = b.binary(BinOp::Add, x, state);
         let inputs = HashMap::from([
-            (state.id, dense_value(vec![3.0])),
-            (x.id, dense_value(vec![5.0])),
+            (state.id(), dense_value(vec![3.0])),
+            (x.id(), dense_value(vec![5.0])),
         ]);
         let plain = b.finish_with_state(primary, &[(state, next)]);
         (plain.clone().with_validations(Vec::new()), plain, inputs)

@@ -70,9 +70,9 @@ fn coopmat_tile_dispatches_and_matches_cpu_on_radv() {
     let a_data: Vec<f32> = (0..256).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
     let b_data: Vec<f32> = (0..256).map(|i| ((i % 11) as f32 - 5.0) * 0.05).collect();
     let a_buf = ctx.alloc_storage(BufferRole::Input, BufferStorage::f16(), 256);
-    ctx.write_bytes(&a_buf, 0, &f16_encode(&a_data)).unwrap();
+    write_host_bytes(&ctx, &a_buf, 0, &f16_encode(&a_data)).unwrap();
     let b_buf = ctx.alloc_storage(BufferRole::Input, BufferStorage::f16(), 256);
-    ctx.write_bytes(&b_buf, 0, &f16_encode(&b_data)).unwrap();
+    write_host_bytes(&ctx, &b_buf, 0, &f16_encode(&b_data)).unwrap();
     let out_buf = ctx.alloc_storage(BufferRole::Output, BufferStorage::f32(), 256);
     ctx.dispatch_dev(
         "k",
@@ -169,9 +169,9 @@ fn coopmat_multi_tile_matmul_dispatches_and_matches_cpu_on_radv() {
     let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32 - 8.0) * 0.04).collect();
     let b_data: Vec<f32> = (0..k * n).map(|i| ((i % 19) as f32 - 9.0) * 0.04).collect();
     let a_buf = ctx.alloc_storage(BufferRole::Input, BufferStorage::f16(), m * k);
-    ctx.write_bytes(&a_buf, 0, &f16_encode(&a_data)).unwrap();
+    write_host_bytes(&ctx, &a_buf, 0, &f16_encode(&a_data)).unwrap();
     let b_buf = ctx.alloc_storage(BufferRole::Input, BufferStorage::f16(), k * n);
-    ctx.write_bytes(&b_buf, 0, &f16_encode(&b_data)).unwrap();
+    write_host_bytes(&ctx, &b_buf, 0, &f16_encode(&b_data)).unwrap();
     let out_buf = ctx.alloc_storage(BufferRole::Output, BufferStorage::f32(), m * n);
     let tiles_m = m / 16;
     let tiles_n = n / 16;
@@ -224,4 +224,17 @@ fn coopmat_multi_tile_matmul_dispatches_and_matches_cpu_on_radv() {
     eprintln!(
         "coopmat multi-tile matmul [{m}x{k}]@[{k}x{n}] ({num_tiles} tiles) OK on RADV cooperative matrix (max_abs={max_abs:.3e})"
     );
+}
+
+/// Write `bytes` at `offset` of `buf` through the context's one write primitive, `write_with` (a test helper:
+/// the contexts have no slice-taking write of their own).
+fn write_host_bytes(
+    ctx: &poot_runtime::Context,
+    buf: &poot_runtime::DeviceBuffer,
+    offset: usize,
+    bytes: &[u8],
+) -> Result<(), poot_runtime::RuntimeError> {
+    ctx.write_with(buf, offset, bytes.len(), &mut |range, out| {
+        out.copy_from_slice(&bytes[range.start - offset..range.end - offset]);
+    })
 }

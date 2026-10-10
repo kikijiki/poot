@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use poot_graph_ir::{Builder, OpKind, Operand, Slot, TensorType, Traced, packed_source_constants};
+use poot_graph_ir::{Builder, OpKind, Operand, Slot, TensorType, packed_source_constants};
 use poot_quant::format::{ScaleEncoding, WeightFormat};
 use poot_quant::{OperandRole, PackedComponentRef, PackedPayload, PackedWeight, SourceRole};
 
@@ -71,15 +71,15 @@ fn run_case(x_shape: Vec<usize>, x_data: Vec<f32>, bytes: Vec<Vec<u8>>, scales: 
     let b = Builder::new();
     let x = b.slot_named(Slot::Activation, "x", TensorType::f32(x_shape.clone()));
     let mut plan = b.append_plan(0);
-    let mut operands = vec![Operand::Value(x.id)];
+    let mut operands = vec![Operand::Value(x.id())];
     let mut source_ids = Vec::new();
     for (name, ty) in packed_source_constants("layer", descriptor) {
         let role = name.role();
         let input = plan
             .input(name, ty, poot_graph_ir::Storage::Const)
             .expect("stage packed source");
-        source_ids.push((input.id, role));
-        operands.push(Operand::Value(input.id));
+        source_ids.push((input.id(), role));
+        operands.push(Operand::Value(input.id()));
     }
     let output = plan
         .equation(
@@ -92,12 +92,12 @@ fn run_case(x_shape: Vec<usize>, x_data: Vec<f32>, bytes: Vec<Vec<u8>>, scales: 
         .expect("emit PackedContraction");
     plan.declare_result(output).expect("declare result");
     let mut prepared = b.preflight_append(plan).expect("preflight append");
-    let id = b.commit_append(&mut prepared).expect("commit append");
-    let graph = b.finish(Traced { id });
+    let out = b.commit_append(&mut prepared).expect("commit append");
+    let graph = b.finish(out);
 
     let expected = dense_oracle(&x_data, k, &bytes, &scales);
 
-    let mut inputs = HashMap::from([(x.id, Value::Host(HostTensor::f32(x_shape, x_data)))]);
+    let mut inputs = HashMap::from([(x.id(), Value::Host(HostTensor::f32(x_shape, x_data)))]);
     for (source_id, role) in &source_ids {
         inputs.insert(
             *source_id,

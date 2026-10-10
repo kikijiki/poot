@@ -34,15 +34,15 @@ fn dump_eqns() {
                     let sh = g.aval(*v).shape.clone();
                     let st = g.meta(*v).storage;
                     match producer.get(v) {
-                        Some((pi, pn)) => format!("v{v}(eqn{pi}:{pn},{sh:?})"),
-                        None => format!("v{v}({st:?},{sh:?})"),
+                        Some((pi, pn)) => format!("{v}(eqn{pi}:{pn},{sh:?})"),
+                        None => format!("{v}({st:?},{sh:?})"),
                     }
                 }
                 Operand::Lit(s) => format!("lit{s:?}"),
             })
             .collect();
         eprintln!(
-            "eqn {i:>3} {} out=v{} {:?} <- [{}]",
+            "eqn {i:>3} {} out={} {:?} <- [{}]",
             e.op.name(),
             e.out,
             g.aval(e.out).shape,

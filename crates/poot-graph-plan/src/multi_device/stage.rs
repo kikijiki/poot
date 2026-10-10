@@ -11,26 +11,34 @@
 //! and placement always produce the same ids (what a replay contract's cache identity needs):
 //! stage `s` is [`PlanNodeId`]`(`s`)`, and row `j` is [`PlanNodeId`]`(`stage count + j`)`.
 
-use crate::passes::BoundaryDescriptor;
-use poot_graph_ir::RedOp;
+use poot_graph_ir::{BoundaryId, RedOp};
 
 use super::communication::{CommunicationPlan, CommunicationRow, PlanNodeId};
 use super::topology::DeviceId;
 use crate::CollectiveKind;
+use crate::passes::BoundaryDescriptor;
 
-/// The plan shape of one stage split: an opaque compute node per stage, in stage order, plus the
-/// boundary transfer rows.
+/// The plan shape of one stage split: an opaque compute node per stage, in stage order, the boundary
+/// transfer rows, and which boundary hop each transfer row carries.
 ///
-/// Each stage node is the id Card 408's executor records the stage's compute segment against; the
-/// rows order the transfers between those nodes.
-///
-/// No caller outside this crate's own tests today: held for POOT-747 (formerly 584a), which names
-/// `plan_stage_communication` below as the function `compile` calls to produce a multi-device
-/// `Program`.
+/// Each stage node is the id the stage's compute is ordered by; the rows order the transfers between
+/// those nodes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StagePlan {
     pub stage_nodes: Vec<PlanNodeId>,
     pub communication: CommunicationPlan,
+    /// One entry per transfer row, in row order: the boundary value the row carries and the stage pair
+    /// it joins.
+    pub transfers: Vec<StageTransfer>,
+}
+
+/// One boundary hop that crosses devices and the [`PlanNodeId`] of the row that carries it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StageTransfer {
+    pub boundary: BoundaryId,
+    pub producing_stage: usize,
+    pub consuming_stage: usize,
+    pub row: PlanNodeId,
 }
 
 /// Typed failure of `plan_stage_communication`.
@@ -50,10 +58,6 @@ pub enum StagePlanError {
 /// consuming stage as its `consumers` entry. A linear pipeline split gives one consumer per boundary
 /// value, so it gives one row per boundary value; a value read by two later stages builds one row
 /// per hop, because a `PointToPoint` row has exactly `[from, to]` participants.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "held for POOT-747 (formerly 584a)")
-)]
 pub(crate) fn plan_stage_communication(
     boundaries: &[BoundaryDescriptor],
     stage_devices: &[DeviceId],
@@ -64,6 +68,7 @@ pub(crate) fn plan_stage_communication(
     }
 
     let mut rows = Vec::new();
+    let mut transfers = Vec::new();
     for boundary in boundaries {
         let from = device_of(stage_devices, boundary.producing_stage)?;
         for &consumer in &boundary.consuming_stages {
@@ -71,8 +76,9 @@ pub(crate) fn plan_stage_communication(
             if from == to {
                 continue;
             }
+            let row = plan_node_id(stage_devices.len() + rows.len())?;
             rows.push(CommunicationRow {
-                id: plan_node_id(stage_devices.len() + rows.len())?,
+                id: row,
                 kind: CollectiveKind::PointToPoint,
                 op: RedOp::Sum,
                 participants: vec![from, to],
@@ -82,12 +88,19 @@ pub(crate) fn plan_stage_communication(
                 consumers: vec![stage_nodes[consumer]],
                 route_counts: Vec::new(),
             });
+            transfers.push(StageTransfer {
+                boundary: boundary.id,
+                producing_stage: boundary.producing_stage,
+                consuming_stage: consumer,
+                row,
+            });
         }
     }
 
     Ok(StagePlan {
         stage_nodes,
         communication: CommunicationPlan { rows },
+        transfers,
     })
 }
 

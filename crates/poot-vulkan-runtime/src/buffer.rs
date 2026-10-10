@@ -50,7 +50,7 @@ pub(crate) struct DeviceBufferInner {
 // `vkUnmapMemory`/`vkFreeMemory` from any thread given external synchronization, which sole ownership at
 // drop provides). Every other field is `Send`.
 unsafe impl Send for DeviceBufferInner {}
-// SAFETY: a shared reference reaches `ptr` only through `read_bytes_at`/`write_bytes_at`, which hold
+// SAFETY: a shared reference reaches `ptr` only through `read_bytes_at`/`write_with_at`, which hold
 // `host_access` for the whole copy, so no two host copies overlap. The native handles are never mutated
 // after construction. A host copy racing a GPU access of the same bytes is excluded by the owner's
 // contract: every submission is fence-waited before the call that issued it returns (see
@@ -118,8 +118,8 @@ impl DeviceBuffer {
     /// Validate a copy against this buffer's full storage contract (card 527, R484-001/R471-009): a
     /// release check on element kind, logical dtype and layout together, not element kind alone (which
     /// a packed or widened value can share with a buffer of a different logical meaning; see
-    /// [`poot_target::BufferStorage`]). Card 547a: `read_bytes`/`write_bytes` (this crate's
-    /// storage-typed primitives, like `poot_runtime::Context::read_bytes`/`write_bytes`) are
+    /// [`poot_target::BufferStorage`]). Card 547a: `read_bytes`/`write_with` (this crate's
+    /// storage-typed primitives, like `poot_runtime::Context::read_bytes`/`write_with`) are
     /// deliberately dtype-agnostic and do not call this; it stays as this crate's own test evidence
     /// that the full storage contract (not element kind alone) is what a real binder must check.
     #[cfg(test)]
@@ -154,15 +154,19 @@ impl DeviceBuffer {
         self.read_bytes_at("read_bytes", 0, out)
     }
 
-    /// Overwrite `bytes.len()` bytes from byte `offset` of this buffer in place through its persistent
-    /// `HOST_COHERENT` mapping (spec 133 FR-009, P2 slice 2a; Card 547a: dtype-agnostic, mirrors
-    /// `poot_runtime::Context::write_bytes`). A recorded graph's descriptor sets bake this buffer's
-    /// `VkBuffer` handle, so replaying with new data means overwriting this buffer. Safe between
-    /// replays, since [`VulkanGraph::replay`] fence-waits before returning. `bytes` longer than the
-    /// buffer is refused ([`RuntimeError::WriteCapacity`]), and so is any write once the device is
-    /// poisoned. A range past the end of the buffer is refused the same way.
-    pub fn write_bytes(&self, offset: usize, bytes: &[u8]) -> Result<(), RuntimeError> {
-        self.write_bytes_at("write_bytes", offset, bytes)
+    /// Overwrite `len` bytes from byte `offset` of this buffer in place through its persistent `HOST_COHERENT`
+    /// mapping (spec 133 FR-009; Card 547a: dtype-agnostic). A recorded graph's descriptor sets bake this
+    /// buffer's `VkBuffer` handle, so replaying with new data means overwriting this buffer; safe between
+    /// replays, since [`VulkanGraph::replay`] fence-waits before returning. `fill(range, out)` writes the whole
+    /// range straight into the mapping (no staging; see [`Self::write_with_at`]). A range past the end of the
+    /// buffer, or any write once the device is poisoned, is refused.
+    pub fn write_with(
+        &self,
+        offset: usize,
+        len: usize,
+        fill: &mut dyn FnMut(std::ops::Range<usize>, &mut [u8]),
+    ) -> Result<(), RuntimeError> {
+        self.write_with_at("write_with", offset, len, fill)
     }
 
     /// The byte range `[offset, offset + len)` of this buffer, or [`RuntimeError::WriteCapacity`] when
@@ -201,29 +205,31 @@ impl DeviceBuffer {
         Ok(())
     }
 
-    /// Overwrite `bytes.len()` bytes starting at byte `offset` (see [`Self::write_bytes`]).
-    pub(crate) fn write_bytes_at(
+    /// Overwrite `len` bytes starting at byte `offset` in place, `fill` writing them straight into the
+    /// buffer's mapping: `fill(range, out)` is called once with the whole destination range, `out` being
+    /// the mapped bytes. There is no staging: the buffer is host memory the GPU reads.
+    pub(crate) fn write_with_at(
         &self,
         op: &'static str,
         offset: usize,
-        bytes: &[u8],
+        len: usize,
+        fill: &mut dyn FnMut(std::ops::Range<usize>, &mut [u8]),
     ) -> Result<(), RuntimeError> {
         self.inner.owner.check_live(op)?;
-        self.checked_range(offset, bytes.len())?;
+        self.checked_range(offset, len)?;
         let _host = self
             .inner
             .host_access
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         // SAFETY: `self.inner.ptr` is mapped HOST_COHERENT for `self.inner.byte_len` bytes for this
-        // buffer's whole lifetime (see `Context::alloc_storage`); `offset + bytes.len() <= byte_len` was
-        // just checked; `bytes` is a disjoint host slice (a byte copy has no alignment need). No GPU
-        // submission can still be reading/writing this buffer's memory: every submission fence-waits
-        // before returning (`DeviceOwner::submit_and_wait`), and one whose wait failed poisoned the
-        // device, which `check_live` refused above. No host copy overlaps this one: `_host` is held.
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.inner.ptr.add(offset), bytes.len())
-        };
+        // buffer's whole lifetime (see `Context::alloc_storage`); `offset + len <= byte_len` was just
+        // checked. No GPU submission can still be reading/writing this buffer's memory: every submission
+        // fence-waits before returning (`DeviceOwner::submit_and_wait`), and one whose wait failed
+        // poisoned the device, which `check_live` refused above. No other host access overlaps this one:
+        // `_host` is held, so this is the only reference to the range while `fill` runs.
+        let out = unsafe { std::slice::from_raw_parts_mut(self.inner.ptr.add(offset), len) };
+        fill(offset..offset + len, out);
         Ok(())
     }
 
@@ -235,7 +241,7 @@ impl DeviceBuffer {
             .host_access
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        // SAFETY: `ptr` is mapped for `byte_len` bytes (see `write_bytes_at`); no GPU access is pending
+        // SAFETY: `ptr` is mapped for `byte_len` bytes (see `write_with_at`); no GPU access is pending
         // for a buffer this call is given before its first submission or between fence-waited ones.
         unsafe { std::ptr::write_bytes(self.inner.ptr, 0, self.inner.byte_len) };
         Ok(())

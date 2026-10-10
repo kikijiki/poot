@@ -330,7 +330,7 @@ fn a_packed_f16_weight_with_a_native_reader_is_a_typed_refusal() {
         .find(|eqn| matches!(eqn.op, OpKind::MatMul))
         .expect("the traced graph multiplies");
     matmul.op = OpKind::DenseContraction { weight: DType::F16 };
-    matmul.inputs[1] = Operand::Value(w.id);
+    matmul.inputs[1] = Operand::Value(w.id());
     let options = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
     for backend in backends() {
         match compile(&g, &target(backend), &options) {
@@ -339,7 +339,7 @@ fn a_packed_f16_weight_with_a_native_reader_is_a_typed_refusal() {
                     value,
                     dtype: DType::F16,
                     gap: StorageGap::F16PackedLanes,
-                } => assert_eq!(value, w.id, "{backend:?}"),
+                } => assert_eq!(value, w.id(), "{backend:?}"),
                 other => panic!("{backend:?}: expected the packed-F16 refusal, got {other}"),
             },
             Err(other) => panic!("{backend:?}: expected the packed-F16 refusal, got {other}"),

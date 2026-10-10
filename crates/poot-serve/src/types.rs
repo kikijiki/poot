@@ -6,6 +6,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+use poot_llm::MropePositionIds;
 use poot_llm::Sampler;
 use poot_llm::TokenLogprob;
 use poot_llm::driver::ModelHandle;
@@ -27,10 +28,16 @@ pub(crate) enum PromptInput {
     /// A multimodal prompt: the token ids, and the embedding rows that stand in for the tokens at their
     /// positions (an image's rows at its placeholders). The sequence is opened with the rows, and no
     /// prefix is matched or registered for it.
-    Multimodal {
-        tokens: Vec<u32>,
-        embeds: PromptEmbeds,
-    },
+    Multimodal { tokens: Vec<u32>, rows: PromptRows },
+}
+
+/// What a multimodal prompt supplies besides its tokens.
+#[derive(Clone)]
+pub(crate) struct PromptRows {
+    pub(crate) embeds: PromptEmbeds,
+    /// Where each prompt token rotates, for a model with sectioned positions (Qwen2.5-VL): the
+    /// sequence is opened with them and its generated tokens continue from where they end.
+    pub(crate) mrope: Option<MropePositionIds>,
 }
 
 impl PromptInput {

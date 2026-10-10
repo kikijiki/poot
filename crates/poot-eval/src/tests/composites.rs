@@ -68,7 +68,7 @@ fn graph_over(
     let bound = traced
         .iter()
         .zip(inputs)
-        .map(|(traced, tensor)| (traced.id, Value::from(tensor.clone())))
+        .map(|(traced, tensor)| (traced.id(), Value::from(tensor.clone())))
         .collect();
     (b.finish(out), bound)
 }
@@ -78,13 +78,11 @@ fn graph_over(
 fn one_equation(op: OpKind, inputs: &[HostTensor]) -> (Graph, HashMap<ValueId, Value>) {
     graph_over(inputs, |b, traced| {
         let mut plan = b.append_plan(0);
-        let operands = traced.iter().map(|t| Operand::Value(t.id)).collect();
+        let operands = traced.iter().map(|t| Operand::Value(t.id())).collect();
         let out = plan.equation(op, operands).expect("the composite types");
         plan.declare_result(out).expect("declare the result");
         let mut prepared = b.preflight_append(plan).expect("preflight the append");
-        Traced {
-            id: b.commit_append(&mut prepared).expect("commit the append"),
-        }
+        b.commit_append(&mut prepared).expect("commit the append")
     })
 }
 
@@ -519,7 +517,8 @@ fn an_error_inside_a_decomposition_names_the_composite_equation() {
     let graph = one_equation(OpKind::Fused(region), &inputs);
     let composite = graph.0.eqns[0].out;
     assert_ne!(
-        composite, 0,
+        composite,
+        ValueId::new(0),
         "the composite's id must differ from the inner placeholder's"
     );
     match evaluate(&graph, EvalBudget::UNBOUNDED) {

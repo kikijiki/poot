@@ -11,8 +11,9 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use poot_executor::{
-    BufferRole, Device, DeviceTime, Dispatch, Engine, EntryId, ExecError, ExecutableId, Executor,
-    ExecutorStats, HostSync, StateScope, StepInputs, StepOutputs,
+    BufferRole, Collectives, Coordinator, Device, DeviceTime, Dispatch, Engine, EntryId, ExecError,
+    ExecutableId, Executor, ExecutorStats, HostSync, NativeCounters, StateScope, StepInputs,
+    StepOutputs, SupportBound,
 };
 use poot_graph_ir::ValidationOutputs;
 use poot_graph_plan::{Capability, StagedProgram, Submission, Target, TargetSet};
@@ -25,7 +26,177 @@ use super::*;
 use crate::admin::LoraAdminPolicy;
 use crate::http::{RateLimiter, handle};
 use crate::tests::{load_handle, test_metrics, write_tiny_gguf};
-use poot_llm::driver::capacity::{CapacityRefusal, FitError, Observation};
+use poot_llm::driver::capacity::{CapacityRefusal, FitError, Observation, Rejection};
+
+/// The production budget reader (`device_budget`) over a group whose devices hold exactly
+/// `capacity[rank]` bytes: the synthetic per-device budget of the admission rows below.
+fn build_group_with_capacity(
+    args: &EngineArgs,
+    handle: &Arc<ModelHandle>,
+    loaded: &Arc<Mutex<HashSet<u64>>>,
+    inflate: [u64; 2],
+    capacity: [u64; 2],
+    health: &EngineHealth,
+) -> Result<Started, StartupError> {
+    build_group(
+        args,
+        handle,
+        group_of(loaded, inflate, capacity.map(Some)),
+        device_budget,
+        health,
+    )
+}
+
+/// The two placements the admission rows run, each with the checkpoint it can divide and the bytes its
+/// smallest candidate needs on each rank, from the planner on its own.
+fn placed_cases() -> Vec<(&'static str, EngineArgs, Arc<ModelHandle>, [u64; 2])> {
+    let pipeline_handle = fixture_model();
+    let pipeline_args = group_args(pipeline_over_two());
+    let pipeline_needs = smallest_candidate_bytes(
+        &pipeline_handle,
+        &pipeline_args,
+        Placement::Pipeline {
+            after_layers: vec![0],
+        },
+    );
+    let tensor_handle = dense_model();
+    let tensor_args = group_args(tensor_over_two());
+    let tensor_needs = smallest_candidate_bytes(
+        &tensor_handle,
+        &tensor_args,
+        Placement::Tensor {
+            rule: ShardRule::Megatron,
+        },
+    );
+    vec![
+        ("pipeline", pipeline_args, pipeline_handle, pipeline_needs),
+        ("tensor", tensor_args, tensor_handle, tensor_needs),
+    ]
+}
+
+/// A group whose devices hold exactly the smallest candidate's bytes (and the production reserve) is
+/// admitted, per placement, through the production budget reader: the smallest candidate is chosen after
+/// every larger one is refused, each rank's published plan equals its own planned bytes, and the live
+/// counters after prepare sit at the plan on each rank.
+///
+/// Mutation: read every device's budget as the sum of the devices' free memory (`device_budget`), or
+/// observe only the first device (`fit_and_prepare`'s `Observation::of`): the exact figures no longer
+/// hold per rank, the group is refused or the fit chooses a larger candidate, and this row goes red.
+#[test]
+fn an_exact_per_device_capacity_admits_each_placement_at_its_smallest_candidate() {
+    for (label, args, handle, needs) in placed_cases() {
+        let domain = candidates(&handle, &args);
+        let smallest = *domain.last().expect("a domain");
+        assert!(
+            needs.iter().all(|&bytes| bytes > 0),
+            "{label}: each rank owns bytes: {needs:?}"
+        );
+        let health = EngineHealth::starting();
+        let loaded = Arc::new(Mutex::new(HashSet::new()));
+        let capacity = needs.map(|bytes| bytes + SUPPORT_RESERVE_BYTES);
+        let started = build_group_with_capacity(&args, &handle, &loaded, [0, 0], capacity, &health)
+            .unwrap_or_else(|error| panic!("{label}: the exact capacity is refused: {error}"));
+        let Workload::Generate { rows, max_seq } = started.plan.workload;
+        assert_eq!(
+            (rows, max_seq),
+            (smallest.rows, smallest.max_seq),
+            "{label}: every larger candidate was refused and the smallest fits"
+        );
+        for (index, device) in started.plan.budget.devices.iter().enumerate() {
+            assert_eq!(device.planned_bytes, needs[index], "{label}: {device:?}");
+            assert_eq!(
+                device.available_bytes,
+                Some(needs[index]),
+                "{label}: the budget after prepare is the exact capacity less the reserve"
+            );
+        }
+        assert!(matches!(health.state(), EngineState::Serving { .. }));
+        // The prepared counters sit at the plan on each rank: nothing was allocated beyond it.
+        let live = started.driver.live_device_bytes();
+        for (index, (device, roles)) in live.iter().enumerate() {
+            let held: u64 = roles.iter().map(|&(_, bytes)| bytes).sum();
+            assert!(
+                held <= needs[index],
+                "{label}: {device:?} holds {held} live bytes over its plan {}",
+                needs[index]
+            );
+        }
+    }
+}
+
+/// A group whose rank is one byte short of its own bytes is refused before `Serving`, per placement and
+/// whichever rank it is, with the refusal naming that rank: the other rank has room for the whole
+/// workload, so the summed capacities would admit it. Nothing is prepared on the devices.
+///
+/// Mutation: as above; the summed budget admits the plan and the row goes red.
+#[test]
+fn a_rank_one_byte_short_of_its_own_bytes_is_refused_before_serving_naming_it() {
+    for (label, args, handle, needs) in placed_cases() {
+        for short in [0usize, 1] {
+            let health = EngineHealth::starting();
+            let loaded = Arc::new(Mutex::new(HashSet::new()));
+            let mut capacity = [u64::MAX / 4; 2];
+            capacity[short] = needs[short] + SUPPORT_RESERVE_BYTES - 1;
+            let result =
+                build_group_with_capacity(&args, &handle, &loaded, [0, 0], capacity, &health);
+            let Err(StartupError::Capacity(FitError::NoCandidateFits { rejected })) = result else {
+                panic!(
+                    "{label} rank {short}: expected every candidate refused, got {:?}",
+                    result.err()
+                );
+            };
+            assert_eq!(rejected.len(), candidates(&handle, &args).len());
+            for rejection in &rejected {
+                match &rejection.why {
+                    Rejection::Capacity(CapacityRefusal::OverBudget {
+                        device, available, ..
+                    }) => {
+                        assert_eq!(*device, DeviceId(short as u32), "{label}: {rejection:?}");
+                        assert_eq!(*available, needs[short] - 1, "{label}: {rejection:?}");
+                    }
+                    other => panic!("{label}: expected an over-budget refusal, got {other:?}"),
+                }
+            }
+            assert!(matches!(health.state(), EngineState::Starting));
+            assert!(
+                loaded.lock().unwrap().is_empty(),
+                "{label} rank {short}: nothing was prepared on the devices"
+            );
+        }
+    }
+}
+
+/// A tensor rank whose live state is over its own plan is refused before `Serving` and named, whichever
+/// rank it is: the other rank sitting at its plan does not hide it.
+///
+/// Mutation: drop the `verify_prepared` call after prepare (`fit_and_prepare`): the group starts over a
+/// rank holding more than it planned and this row goes red.
+#[test]
+fn a_tensor_rank_whose_live_state_exceeds_its_plan_is_refused_and_named() {
+    let handle = dense_model();
+    for (inflate, rank) in [([1 << 20, 0], DeviceId(0)), ([0, 1 << 20], DeviceId(1))] {
+        let health = EngineHealth::starting();
+        let loaded = Arc::new(Mutex::new(HashSet::new()));
+        let result = build_group(
+            &group_args(tensor_over_two()),
+            &handle,
+            group_inflating(&loaded, inflate),
+            |_| known_pair(u64::MAX / 2, u64::MAX / 2),
+            &health,
+        );
+        let Err(StartupError::Admission(CapacityRefusal::Underestimated { device, role, .. })) =
+            result
+        else {
+            panic!("expected the underestimate refusal, got {:?}", result.err());
+        };
+        assert_eq!(
+            (device, role),
+            (rank, BufferRole::State),
+            "inflate {inflate:?}"
+        );
+        assert!(matches!(health.state(), EngineState::Starting));
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("fixture device error")]
@@ -44,6 +215,9 @@ struct FixtureDevice {
     loaded_kernels: Option<Arc<Mutex<HashSet<u64>>>>,
     /// What the runtime reports as free now, independent of the target's open-time figure.
     free_bytes: Option<u64>,
+    /// When set, the device holds this many bytes in all and reports the rest as free, so its free
+    /// figure falls as the engine allocates, as a real runtime's does.
+    capacity_bytes: Option<u64>,
 }
 
 impl Device for FixtureDevice {
@@ -59,7 +233,10 @@ impl Device for FixtureDevice {
         self.memory.snapshot_all()
     }
     fn free_memory_bytes(&self) -> Option<u64> {
-        self.free_bytes
+        match self.capacity_bytes {
+            Some(capacity) => Some(capacity.saturating_sub(self.memory.total_live_bytes())),
+            None => self.free_bytes,
+        }
     }
     fn allocate(
         &mut self,
@@ -100,7 +277,13 @@ impl Device for FixtureDevice {
     fn replay(&mut self, _recording: &()) -> Result<(), FixtureError> {
         Ok(())
     }
-    fn write(&mut self, _dst: &(), _offset: usize, _bytes: &[u8]) -> Result<(), FixtureError> {
+    fn write_with(
+        &mut self,
+        _dst: &(),
+        _offset: usize,
+        _len: usize,
+        _fill: &mut dyn FnMut(std::ops::Range<usize>, &mut [u8]),
+    ) -> Result<(), FixtureError> {
         Ok(())
     }
     fn read(&mut self, _src: &(), _out: &mut [u8]) -> Result<(), FixtureError> {
@@ -202,6 +385,7 @@ fn probe_reporting(
             inflate_state,
             loaded_kernels: None,
             free_bytes,
+            capacity_bytes: None,
         }),
         add_entries: Arc::clone(&add_entries),
         gate: None,
@@ -220,10 +404,12 @@ fn fixture_model() -> Arc<ModelHandle> {
 fn args(backend: BackendChoice) -> EngineArgs {
     EngineArgs {
         backend,
+        placement: PlacementSpec::Single,
         rows: NonZeroUsize::new(4).unwrap(),
         max_seq: NonZeroUsize::new(64).unwrap(),
         draft: DraftPolicy::Off,
         embeds: false,
+        expert_pool: None,
     }
 }
 
@@ -277,9 +463,9 @@ fn build_with(
     let started = EnginePlan::build(
         args,
         handle,
-        |choice| {
-            opened.push(choice);
-            Ok(Box::new(executor.take().expect("opened once")) as Box<dyn Executor>)
+        |args| {
+            opened.push(args.backend);
+            Ok(Opened::One(Box::new(executor.take().expect("opened once"))))
         },
         observe,
         health,
@@ -482,6 +668,7 @@ fn every_candidates_planned_bytes_equal_a_real_preparation_without_reading_weigh
     let planner = Planner::new(
         Arc::clone(&handle),
         &probe(spirv_target(), 0).0.target_set(),
+        Placement::Single,
     )
     .unwrap();
     let non_staging = |roles: Vec<(BufferRole, u64)>| -> Vec<(BufferRole, u64)> {
@@ -539,6 +726,7 @@ fn the_planned_footprints_match_the_numbers_the_full_load_pass_produced() {
     let planner = Planner::new(
         Arc::clone(&handle),
         &probe(spirv_target(), 0).0.target_set(),
+        Placement::Single,
     )
     .unwrap();
     let golden = [
@@ -648,6 +836,7 @@ fn loaded_kernels(handle: &Arc<ModelHandle>, candidate: &Candidate) -> HashSet<u
         memory: MemoryCounters::new(),
         inflate_state: 0,
         free_bytes: None,
+        capacity_bytes: None,
         loaded_kernels: Some(Arc::clone(&loaded)),
     });
     let mut driver = Driver::new(
@@ -681,7 +870,7 @@ fn a_planner_resolves_each_distinct_kernel_once_across_candidates() {
     let handle = fixture_model();
     let args = args(BackendChoice::Wgpu);
     let targets = probe(spirv_target(), 0).0.target_set();
-    let new_planner = || Planner::new(Arc::clone(&handle), &targets).unwrap();
+    let new_planner = || Planner::new(Arc::clone(&handle), &targets, Placement::Single).unwrap();
     let plan = |planner: &Planner, candidate: &Candidate| {
         let rows = [candidate.rows];
         planner
@@ -1006,7 +1195,7 @@ fn a_lower_live_budget_than_the_open_time_figure_refuses_the_plan() {
             let &[(device, _)] = targets.devices() else {
                 panic!("one device");
             };
-            Planner::new(Arc::clone(&handle), &targets)
+            Planner::new(Arc::clone(&handle), &targets, Placement::Single)
                 .unwrap()
                 .plan(
                     driver_options(&handle, c.max_seq, DraftPolicy::Off),
@@ -1084,7 +1273,10 @@ fn planned_weight_bytes_equal_the_stored_tensor_bytes() {
     let path = write_tiny_gguf();
     let handle = load_handle(&path);
     // The oracle reads the file's own tensor directory, not poot's store: every tensor is F32.
-    let index = poot_load::gguf::GgufIndex::open(&path).expect("tensor directory");
+    let index = poot_load::gguf::GgufIndex::parse(
+        &poot_quant::StoredBytes::map(std::fs::File::open(&path).unwrap()).unwrap(),
+    )
+    .expect("tensor directory");
     let _ = std::fs::remove_file(&path);
     let oracle: u64 = index
         .tensors
@@ -1097,6 +1289,7 @@ fn planned_weight_bytes_equal_the_stored_tensor_bytes() {
     let planner = Planner::new(
         Arc::clone(&handle),
         &probe(spirv_target(), 0).0.target_set(),
+        Placement::Single,
     )
     .unwrap();
     let rows = [candidate.rows];
@@ -1181,6 +1374,7 @@ fn a_recurrent_family_plans_many_rows_and_its_state_bytes_grow_with_the_sequence
     let planner = Planner::new(
         Arc::clone(&handle),
         &probe(spirv_target(), 0).0.target_set(),
+        Placement::Single,
     )
     .unwrap();
     let max_seq = NonZeroUsize::new(64).unwrap();
@@ -1232,4 +1426,509 @@ fn a_recurrent_family_plans_many_rows_and_its_state_bytes_grow_with_the_sequence
     let started = started.expect("the recurrent family starts");
     let Workload::Generate { rows, .. } = started.plan.workload;
     assert!(rows.get() > 1, "the fitted plan serves {rows} rows");
+}
+
+// ---------------------------------------------------------------------------------------------
+// A group of devices (POOT-1103).
+// ---------------------------------------------------------------------------------------------
+
+/// The fixture device takes part in a group: nothing it exchanges is real, but the coordinator admits its
+/// routes, events and copies as it would a runtime's.
+impl Collectives for FixtureDevice {
+    type Event = ();
+
+    fn native_counters(&self) -> NativeCounters {
+        NativeCounters::default()
+    }
+
+    fn support_bound(&self) -> SupportBound {
+        SupportBound::default()
+    }
+
+    fn open_route(&mut self, _peer: &Self) -> Result<(), FixtureError> {
+        Ok(())
+    }
+
+    fn create_event(&mut self) -> Result<(), FixtureError> {
+        Ok(())
+    }
+
+    fn record_event(&mut self, _event: &()) -> Result<(), FixtureError> {
+        Ok(())
+    }
+
+    fn wait_event(&mut self, _event: &()) -> Result<(), FixtureError> {
+        Ok(())
+    }
+
+    fn peer_copy(&mut self, _src: &(), _dst: &(), _bytes: usize) -> Result<(), FixtureError> {
+        Ok(())
+    }
+}
+
+fn ptx_target() -> Target {
+    Target {
+        backend: Backend::Nvptx,
+        caps: DeviceCaps {
+            memory_budget_bytes: Some(1 << 40),
+            ..DeviceCaps::ptx_default()
+        },
+    }
+}
+
+/// Two fixture devices under one coordinator, each reporting `loaded` kernels it is handed.
+fn group(loaded: &Arc<Mutex<HashSet<u64>>>) -> Coordinator<FixtureDevice> {
+    group_inflating(loaded, [0, 0])
+}
+
+/// [`group`] whose devices charge `inflate[rank]` extra `State` bytes per allocation, as a runtime that
+/// holds more on that rank than the plan counted.
+fn group_inflating(
+    loaded: &Arc<Mutex<HashSet<u64>>>,
+    inflate: [u64; 2],
+) -> Coordinator<FixtureDevice> {
+    group_of(loaded, inflate, [None, None])
+}
+
+/// [`group`] whose device `rank` holds `capacity[rank]` bytes in all and reports the rest as free, with
+/// `inflate[rank]` extra `State` bytes per allocation.
+fn group_of(
+    loaded: &Arc<Mutex<HashSet<u64>>>,
+    inflate: [u64; 2],
+    capacity: [Option<u64>; 2],
+) -> Coordinator<FixtureDevice> {
+    Coordinator::new(
+        (0..2)
+            .map(|index| {
+                (
+                    DeviceId(index),
+                    FixtureDevice {
+                        target: ptx_target(),
+                        memory: MemoryCounters::new(),
+                        inflate_state: inflate[index as usize],
+                        loaded_kernels: Some(Arc::clone(loaded)),
+                        free_bytes: Some(u64::MAX / 2),
+                        capacity_bytes: capacity[index as usize],
+                    },
+                )
+            })
+            .collect(),
+    )
+    .expect("two distinct devices")
+}
+
+fn group_args(placement: PlacementSpec) -> EngineArgs {
+    EngineArgs {
+        placement,
+        ..args(BackendChoice::Ptx)
+    }
+}
+
+fn pipeline_over_two() -> PlacementSpec {
+    PlacementSpec::Pipeline {
+        ordinals: vec![0, 1],
+    }
+}
+
+/// The two devices' budgets, each with the production reserve.
+fn known_pair(first: u64, second: u64) -> Budget {
+    let device = |bytes| poot_llm::driver::capacity::DeviceBudget::Known {
+        bytes,
+        reserve: SUPPORT_RESERVE_BYTES,
+    };
+    Budget::new()
+        .with(DeviceId(0), device(first))
+        .with(DeviceId(1), device(second))
+}
+
+fn build_group(
+    args: &EngineArgs,
+    handle: &Arc<ModelHandle>,
+    group: Coordinator<FixtureDevice>,
+    observe: impl FnMut(&Observation) -> Budget,
+    health: &EngineHealth,
+) -> Result<Started, StartupError> {
+    let mut group = Some(group);
+    EnginePlan::build(
+        args,
+        handle,
+        |args| {
+            let group = Box::new(Coordinated(group.take().expect("opened once")));
+            Ok(match args.placement {
+                PlacementSpec::Tensor { .. } => Opened::Tensor(group),
+                PlacementSpec::Pipeline { .. } | PlacementSpec::Single => Opened::Pipeline(group),
+            })
+        },
+        observe,
+        health,
+    )
+}
+
+/// The bytes the smallest candidate of the domain needs on each device of a two-stage pipeline, by the
+/// planner on its own: the figure a budget row sets its limit from.
+fn smallest_candidate_bytes(
+    handle: &Arc<ModelHandle>,
+    args: &EngineArgs,
+    placement: Placement,
+) -> [u64; 2] {
+    let candidate = *candidates(handle, args).last().expect("a domain");
+    let targets = TargetSet::new(vec![
+        (DeviceId(0), ptx_target()),
+        (DeviceId(1), ptx_target()),
+    ])
+    .unwrap();
+    let rows = [candidate.rows];
+    let planned = Planner::new(Arc::clone(handle), &targets, placement)
+        .expect("a planner")
+        .plan(
+            driver_options(handle, candidate.max_seq, DraftPolicy::Off),
+            &shapes_of(&candidate, &rows),
+            false,
+        )
+        .expect("the candidate plans");
+    [DeviceId(0), DeviceId(1)].map(|device| planned.footprint.device_bytes(device).unwrap())
+}
+
+/// A two-stage pipeline over two devices opens as one executor, is balanced and fitted per device, and
+/// publishes `Serving`: the plan names both devices, the placement it ran and each device's own bytes.
+///
+/// Mutation: report only the first device in the plan (`devices` from the first target): the row goes
+/// red on the device list and the per-device figures.
+#[test]
+fn a_two_device_pipeline_is_fitted_per_device_and_published() {
+    let handle = fixture_model();
+    let health = EngineHealth::starting();
+    let loaded = Arc::new(Mutex::new(HashSet::new()));
+    let started = build_group(
+        &group_args(pipeline_over_two()),
+        &handle,
+        group(&loaded),
+        |_| known_pair(u64::MAX / 2, u64::MAX / 2),
+        &health,
+    )
+    .unwrap_or_else(|error| panic!("the pipeline starts: {error}"));
+    let plan = &started.plan;
+    assert_eq!(plan.devices, [DeviceId(0), DeviceId(1)]);
+    assert_eq!(
+        plan.placement,
+        Placement::Pipeline {
+            after_layers: vec![0]
+        },
+        "a two-layer model over two devices cuts after its first layer"
+    );
+    assert_eq!(plan.budget.devices.len(), 2);
+    assert!(
+        plan.budget.devices.iter().all(|d| d.planned_bytes > 0),
+        "each device owns planned bytes: {:?}",
+        plan.budget.devices
+    );
+    assert!(matches!(health.state(), EngineState::Serving { .. }));
+    assert!(
+        !loaded.lock().unwrap().is_empty(),
+        "the prepared entries loaded kernels on the group"
+    );
+}
+
+/// An under-budget device is refused before `Serving`, with the typed refusal naming that device: the
+/// other device has room for the whole workload, so the devices' summed budgets would admit it.
+///
+/// Mutation: admit a footprint against the sum of the budgets (`Budget::admit` over the totals): the
+/// plan starts over a device that cannot hold its stage and this row goes red.
+#[test]
+fn an_under_budget_device_is_refused_before_serving_naming_that_device() {
+    let handle = fixture_model();
+    let args = group_args(pipeline_over_two());
+    let needs = smallest_candidate_bytes(
+        &handle,
+        &args,
+        Placement::Pipeline {
+            after_layers: vec![0],
+        },
+    );
+    assert!(needs[1] > 1, "the second stage owns bytes: {needs:?}");
+    let health = EngineHealth::starting();
+    let loaded = Arc::new(Mutex::new(HashSet::new()));
+    // The second device is a byte short of the smallest candidate's own bytes; the first has room for
+    // everything, so the sum of the two figures is far above what the whole plan needs.
+    let short = known_pair(u64::MAX / 2, SUPPORT_RESERVE_BYTES + needs[1] - 1);
+    let result = build_group(&args, &handle, group(&loaded), |_| short.clone(), &health);
+    let Err(StartupError::Capacity(FitError::NoCandidateFits { rejected })) = result else {
+        panic!("expected every candidate refused, got {:?}", result.err());
+    };
+    assert_eq!(rejected.len(), candidates(&handle, &args).len());
+    for rejection in &rejected {
+        match &rejection.why {
+            Rejection::Capacity(CapacityRefusal::OverBudget { device, .. }) => {
+                assert_eq!(*device, DeviceId(1), "{rejection:?}");
+            }
+            other => panic!("expected an over-budget refusal, got {other:?}"),
+        }
+    }
+    assert!(matches!(health.state(), EngineState::Starting));
+    assert!(
+        loaded.lock().unwrap().is_empty(),
+        "nothing was prepared on the real devices"
+    );
+}
+
+/// A device that cannot hold the weights of its own stage refuses the pipeline's balance, before any
+/// candidate is planned.
+#[test]
+fn a_stage_that_cannot_hold_its_layers_is_refused_by_the_balance() {
+    let handle = fixture_model();
+    let health = EngineHealth::starting();
+    let loaded = Arc::new(Mutex::new(HashSet::new()));
+    let tiny = known_pair(u64::MAX / 2, SUPPORT_RESERVE_BYTES + 1);
+    let result = build_group(
+        &group_args(pipeline_over_two()),
+        &handle,
+        group(&loaded),
+        |_| tiny.clone(),
+        &health,
+    );
+    let Err(StartupError::Pipeline(BalanceError::DeviceTooSmall { device, .. })) = result else {
+        panic!("expected the balance refusal, got {:?}", result.err());
+    };
+    assert_eq!(device, DeviceId(1));
+    assert!(matches!(health.state(), EngineState::Starting));
+}
+
+/// An unknown budget on one device of a pipeline is a typed refusal, never room.
+#[test]
+fn a_group_whose_budget_is_unknown_is_refused_not_assumed_unlimited() {
+    let handle = fixture_model();
+    let health = EngineHealth::starting();
+    let loaded = Arc::new(Mutex::new(HashSet::new()));
+    let unknown = Budget::new()
+        .with(
+            DeviceId(0),
+            poot_llm::driver::capacity::DeviceBudget::Known {
+                bytes: u64::MAX / 2,
+                reserve: SUPPORT_RESERVE_BYTES,
+            },
+        )
+        .with(
+            DeviceId(1),
+            poot_llm::driver::capacity::DeviceBudget::Unknown,
+        );
+    let result = build_group(
+        &group_args(pipeline_over_two()),
+        &handle,
+        group(&loaded),
+        |_| unknown.clone(),
+        &health,
+    );
+    assert!(
+        matches!(
+            result,
+            Err(StartupError::Admission(CapacityRefusal::UnknownBudget {
+                device: DeviceId(1)
+            }))
+        ),
+        "{:?}",
+        result.err()
+    );
+}
+
+/// A tensor placement of a model the rule has no split for (this fixture's latent attention) is the
+/// shard pass's typed refusal, surfaced as the startup error before anything is prepared.
+#[test]
+fn a_tensor_placement_of_an_unsplittable_model_is_a_typed_refusal() {
+    let handle = fixture_model();
+    let health = EngineHealth::starting();
+    let loaded = Arc::new(Mutex::new(HashSet::new()));
+    let result = build_group(
+        &group_args(PlacementSpec::Tensor {
+            ordinals: vec![0, 1],
+        }),
+        &handle,
+        group(&loaded),
+        |_| known_pair(u64::MAX / 2, u64::MAX / 2),
+        &health,
+    );
+    assert!(
+        matches!(
+            result,
+            Err(StartupError::Driver(DriverError::Unsupported(
+                Unsupported::Compile(poot_graph_plan::StagedCompileError::Shard(_))
+            )))
+        ),
+        "{:?}",
+        result.err()
+    );
+    assert!(matches!(health.state(), EngineState::Starting));
+}
+
+/// A dense two-head qwen2 checkpoint the Megatron rule can divide over two ranks.
+fn dense_model() -> Arc<ModelHandle> {
+    use poot_load::gguf::{GgufValue, write_gguf};
+    let (h, inter, vocab) = (8usize, 16usize, 8usize);
+    let mut tensors = Vec::new();
+    for (name, shape) in [
+        ("token_embd.weight", vec![h, vocab]),
+        ("output.weight", vec![h, vocab]),
+        ("output_norm.weight", vec![h]),
+        ("blk.0.attn_q.weight", vec![h, h]),
+        ("blk.0.attn_k.weight", vec![h, h]),
+        ("blk.0.attn_v.weight", vec![h, h]),
+        ("blk.0.attn_output.weight", vec![h, h]),
+        ("blk.0.attn_q.bias", vec![h]),
+        ("blk.0.attn_k.bias", vec![h]),
+        ("blk.0.attn_v.bias", vec![h]),
+        ("blk.0.attn_norm.weight", vec![h]),
+        ("blk.0.ffn_norm.weight", vec![h]),
+        ("blk.0.ffn_gate.weight", vec![h, inter]),
+        ("blk.0.ffn_up.weight", vec![h, inter]),
+        ("blk.0.ffn_down.weight", vec![inter, h]),
+    ] {
+        let n: usize = shape.iter().product();
+        let bytes: Vec<u8> = (0..n)
+            .flat_map(|i| (((i % 7) as f32) * 0.1 - 0.3).to_le_bytes())
+            .collect();
+        tensors.push((
+            name,
+            shape.into_iter().map(|d| d as u64).collect::<Vec<u64>>(),
+            0u32,
+            bytes,
+        ));
+    }
+    let kvs = vec![
+        ("general.architecture", GgufValue::Str("qwen2".into())),
+        ("qwen2.embedding_length", GgufValue::U32(h as u32)),
+        ("qwen2.block_count", GgufValue::U32(1)),
+        ("qwen2.attention.head_count", GgufValue::U32(2)),
+        ("qwen2.attention.head_count_kv", GgufValue::U32(2)),
+        ("qwen2.feed_forward_length", GgufValue::U32(inter as u32)),
+        ("qwen2.context_length", GgufValue::U32(64)),
+        ("tokenizer.ggml.eos_token_id", GgufValue::U32(7)),
+        (
+            "tokenizer.ggml.tokens",
+            GgufValue::Array(
+                ["a", "b", "c", "d", "e", "f", "g", "ab"]
+                    .into_iter()
+                    .map(|s| GgufValue::Str(s.into()))
+                    .collect(),
+            ),
+        ),
+        (
+            "tokenizer.ggml.merges",
+            GgufValue::Array(vec![GgufValue::Str("a b".into())]),
+        ),
+    ];
+    let path = std::env::temp_dir().join(format!(
+        "poot_serve_qwen2_fixture_{}.gguf",
+        crate::tests::unique_fixture_suffix()
+    ));
+    std::fs::write(&path, write_gguf(&kvs, &tensors)).expect("write the dense GGUF");
+    let handle = load_handle(&path);
+    let _ = std::fs::remove_file(&path);
+    handle
+}
+
+fn tensor_over_two() -> PlacementSpec {
+    PlacementSpec::Tensor {
+        ordinals: vec![0, 1],
+    }
+}
+
+/// The server's paged workload divides over tensor ranks (POOT-1104): the shard pass cuts the scatter
+/// into the shared KV pool and the read back by KV heads, so a tensor group over the paged pool opens as
+/// one executor, is fitted per rank and publishes `Serving`.
+///
+/// Mutation: remove the `ScatterUpdate` rule of the shard pass (`Sharder::rewrite`): the pass refuses
+/// the paged write by name (`Unpropagatable`) before anything is prepared and this row goes red.
+#[test]
+fn a_tensor_group_over_the_paged_pool_is_fitted_per_rank_and_published() {
+    let handle = dense_model();
+    let health = EngineHealth::starting();
+    let loaded = Arc::new(Mutex::new(HashSet::new()));
+    let started = build_group(
+        &group_args(tensor_over_two()),
+        &handle,
+        group(&loaded),
+        |_| known_pair(u64::MAX / 2, u64::MAX / 2),
+        &health,
+    )
+    .unwrap_or_else(|error| panic!("the tensor group starts over the paged pool: {error}"));
+    let plan = &started.plan;
+    assert_eq!(plan.devices, [DeviceId(0), DeviceId(1)]);
+    assert!(
+        plan.budget.devices.iter().all(|d| d.planned_bytes > 0),
+        "each rank owns planned bytes: {:?}",
+        plan.budget.devices
+    );
+    assert!(matches!(health.state(), EngineState::Serving { .. }));
+    assert!(
+        !loaded.lock().unwrap().is_empty(),
+        "the prepared entries loaded kernels on the group"
+    );
+}
+
+/// A rank whose live state is over its own plan is refused before `Serving` and named, whichever rank it
+/// is: the other rank sitting at its plan does not hide it, and the totals over both ranks are not the
+/// check.
+///
+/// Mutation: compare roles summed over the ranks with the plan's summed roles (the old group check):
+/// a rank that overran by less than the plan's slack elsewhere is admitted, and the named rank is lost.
+#[test]
+fn a_rank_whose_live_state_exceeds_its_own_plan_is_refused_and_named() {
+    let handle = fixture_model();
+    for (inflate, rank) in [([1 << 20, 0], DeviceId(0)), ([0, 1 << 20], DeviceId(1))] {
+        let health = EngineHealth::starting();
+        let loaded = Arc::new(Mutex::new(HashSet::new()));
+        let result = build_group(
+            &group_args(pipeline_over_two()),
+            &handle,
+            group_inflating(&loaded, inflate),
+            |_| known_pair(u64::MAX / 2, u64::MAX / 2),
+            &health,
+        );
+        let Err(StartupError::Admission(CapacityRefusal::Underestimated { device, role, .. })) =
+            result
+        else {
+            panic!("expected the underestimate refusal, got {:?}", result.err());
+        };
+        assert_eq!(
+            (device, role),
+            (rank, BufferRole::State),
+            "inflate {inflate:?}"
+        );
+        assert!(matches!(health.state(), EngineState::Starting));
+    }
+}
+
+/// A rank whose free memory fell after the fit is refused before `Serving` against its own fresh budget,
+/// even though the other rank has room for everything.
+///
+/// Mutation: skip the fresh admission for a group (verify roles only): the group starts and this row
+/// goes red.
+#[test]
+fn a_rank_whose_budget_dropped_after_the_fit_is_refused_before_serving() {
+    let handle = fixture_model();
+    let health = EngineHealth::starting();
+    let loaded = Arc::new(Mutex::new(HashSet::new()));
+    let result = build_group(
+        &group_args(pipeline_over_two()),
+        &handle,
+        group(&loaded),
+        |observation| {
+            // Nothing is held until the engine prepares: the fit sees room, the check after it sees
+            // rank 1 down to its reserve.
+            if observation
+                .devices
+                .iter()
+                .all(|device| device.held_bytes == 0)
+            {
+                known_pair(u64::MAX / 2, u64::MAX / 2)
+            } else {
+                known_pair(u64::MAX / 2, SUPPORT_RESERVE_BYTES + 1)
+            }
+        },
+        &health,
+    );
+    let Err(StartupError::Admission(CapacityRefusal::OverBudget { device, .. })) = result else {
+        panic!("expected the fresh-budget refusal, got {:?}", result.err());
+    };
+    assert_eq!(device, DeviceId(1));
+    assert!(matches!(health.state(), EngineState::Starting));
 }

@@ -1,19 +1,17 @@
 //! Packed-linear payloads decode through the one scalar decoder.
 
-use std::sync::Arc;
-
 use super::*;
 use crate::format::ScaleEncoding;
 
-fn owner(bytes: &[u8]) -> Arc<[u8]> {
-    Arc::from(bytes)
+fn owner(bytes: &[u8]) -> StoredBytes {
+    StoredBytes::from(bytes.to_vec())
 }
 
 fn payload(
     format: WeightFormat,
     shape: [usize; 2],
-    weight_bytes: Arc<[u8]>,
-    scale_bytes: Arc<[u8]>,
+    weight_bytes: StoredBytes,
+    scale_bytes: StoredBytes,
 ) -> PackedPayload {
     let weight = PackedWeight::try_new(format, shape).unwrap();
     PackedPayload::try_new(
@@ -60,7 +58,12 @@ fn block_fp8_payload(format: WeightFormat, scales: &[u8]) -> PackedPayload {
     ] {
         weights[coordinate[0] * 130 + coordinate[1]] = byte;
     }
-    payload(format, [129, 130], Arc::from(weights), owner(scales))
+    payload(
+        format,
+        [129, 130],
+        StoredBytes::from(weights),
+        owner(scales),
+    )
 }
 
 #[test]
@@ -138,7 +141,7 @@ fn adjacent_e2m1_payload_decodes_nibble_order_and_ragged_blocks() {
     let payload = payload(
         WeightFormat::E2m1Row32,
         [2, 35],
-        Arc::from(weights),
+        StoredBytes::from(weights),
         owner(&[0x7f, 0x80, 0x81, 0x7e]),
     );
     assert_decodes(
@@ -221,8 +224,11 @@ fn block32_formats_refuse_non_finite_fields_and_accept_everything_else() {
         };
         let weight = PackedWeight::try_new(format, [1, layout.values]).unwrap();
         let zero_block = vec![0u8; layout.bytes];
-        PackedPayload::try_new(weight, [(SourceRole::Blocks, Arc::from(zero_block))])
-            .unwrap_or_else(|error| panic!("{format:?}: an all-zero block must be valid: {error}"));
+        PackedPayload::try_new(
+            weight,
+            [(SourceRole::Blocks, StoredBytes::from(zero_block))],
+        )
+        .unwrap_or_else(|error| panic!("{format:?}: an all-zero block must be valid: {error}"));
     }
 
     // MXFP4: `e` = 0xff (E8M0 NaN).
@@ -230,7 +236,11 @@ fn block32_formats_refuse_non_finite_fields_and_accept_everything_else() {
     let mut mxfp4_block = vec![0u8; mxfp4.source_bytes(SourceRole::Blocks)];
     mxfp4_block[scale_byte_offset(WeightFormat::Mxfp4)] = 0xff;
     assert_eq!(
-        PackedPayload::try_new(mxfp4, [(SourceRole::Blocks, Arc::from(mxfp4_block))]).unwrap_err(),
+        PackedPayload::try_new(
+            mxfp4,
+            [(SourceRole::Blocks, StoredBytes::from(mxfp4_block))]
+        )
+        .unwrap_err(),
         PackedWeightError::NonFiniteField {
             format: WeightFormat::Mxfp4,
             role: SourceRole::Blocks,
@@ -246,7 +256,8 @@ fn block32_formats_refuse_non_finite_fields_and_accept_everything_else() {
     q8_0_block[d] = 0x00;
     q8_0_block[d + 1] = 0x7c;
     assert_eq!(
-        PackedPayload::try_new(q8_0, [(SourceRole::Blocks, Arc::from(q8_0_block))]).unwrap_err(),
+        PackedPayload::try_new(q8_0, [(SourceRole::Blocks, StoredBytes::from(q8_0_block))])
+            .unwrap_err(),
         PackedWeightError::NonFiniteField {
             format: WeightFormat::Q8_0,
             role: SourceRole::Blocks,
@@ -286,19 +297,19 @@ fn gptq_act_order_refuses_negative_and_out_of_range_group_index() {
             [
                 (
                     SourceRole::Planar(OperandRole::Codes),
-                    Arc::from(codes.clone()),
+                    StoredBytes::from(codes.clone()),
                 ),
                 (
                     SourceRole::Planar(OperandRole::Zero),
-                    Arc::from(zero.clone()),
+                    StoredBytes::from(zero.clone()),
                 ),
                 (
                     SourceRole::Planar(OperandRole::Scale),
-                    Arc::from(scale.clone()),
+                    StoredBytes::from(scale.clone()),
                 ),
                 (
                     SourceRole::Planar(OperandRole::GroupIndex),
-                    Arc::from(g_idx),
+                    StoredBytes::from(g_idx),
                 ),
             ],
         )
@@ -333,90 +344,6 @@ fn gptq_act_order_refuses_negative_and_out_of_range_group_index() {
             groups,
         }
     );
-}
-
-/// SC-002 (card 540a): [`StoredBytes`] is the one byte-ownership and content-identity type both a
-/// dense tensor and a packed source build on. Equality is bytes only; the fingerprint memo is
-/// observability, not identity.
-#[test]
-fn stored_bytes_owns_its_buffer_with_a_stable_content_based_fingerprint() {
-    let a = StoredBytes::new(owner(&[1, 2, 3, 4]));
-    let b = StoredBytes::new(owner(&[1, 2, 3, 4]));
-    assert_eq!(a.as_slice(), &[1, 2, 3, 4]);
-    assert_eq!(a.len(), 4);
-    assert!(!a.is_empty());
-    assert_eq!(
-        a, b,
-        "equal content is equal regardless of fingerprint state"
-    );
-
-    let first = a.fingerprint();
-    let second = a.fingerprint();
-    assert_eq!(first, second, "fingerprint is stable across calls");
-    assert_eq!(first, b.fingerprint(), "equal bytes fingerprint equal");
-}
-
-/// The source fingerprint is the FNV-1a 64 over each role's source bytes, independently per role, and
-/// survives a clone (the memo is observability, not identity: [`PackedPayload`]'s `PartialEq` is
-/// weight + bytes only).
-#[test]
-fn source_fingerprint_is_fnv1a_over_each_payload_source() {
-    const CODES: SourceRole = SourceRole::Planar(OperandRole::Codes);
-    const SCALE: SourceRole = SourceRole::Planar(OperandRole::Scale);
-
-    let weight = PackedWeight::try_new(
-        WeightFormat::E4m3Block128 {
-            scale: ScaleEncoding::F32,
-        },
-        [129, 130],
-    )
-    .unwrap();
-    let mut weight_source = vec![0; 16_770];
-    weight_source[0] = 0x38;
-    weight_source[16_769] = 0xb8;
-    let scale_source = [
-        0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x80, 0x40, 0x00, 0x00, 0x00,
-        0x41,
-    ];
-    let payload = PackedPayload::try_new(
-        weight,
-        [
-            (CODES, Arc::from(weight_source)),
-            (SCALE, owner(&scale_source)),
-        ],
-    )
-    .unwrap();
-
-    // The specification fold, written out here rather than called, so this row checks the value
-    // against the algorithm instead of against the function under test.
-    fn fold(bytes: &[u8]) -> u64 {
-        let mut hash = 0xcbf29ce484222325u64;
-        for byte in bytes {
-            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
-        }
-        hash
-    }
-
-    let weight_fingerprint = payload.source_fingerprint(CODES);
-    assert_eq!(weight_fingerprint.byte_len, 16_770);
-    assert_eq!(
-        weight_fingerprint.fnv1a64,
-        fold(payload.bytes(CODES)),
-        "weight fingerprint must be FNV-1a 64 over the weight bytes"
-    );
-
-    // A second request returns the same value.
-    assert_eq!(payload.source_fingerprint(CODES), weight_fingerprint);
-
-    let scale_fingerprint = payload.source_fingerprint(SCALE);
-    assert_eq!(scale_fingerprint.byte_len, 16);
-    assert_eq!(scale_fingerprint.fnv1a64, fold(payload.bytes(SCALE)));
-
-    // A clone shares the bytes, so it fingerprints the same.
-    let cloned = payload.clone();
-    assert_eq!(cloned.source_fingerprint(CODES), weight_fingerprint);
-    // Identity stays weight + bytes: the memo is observability, not identity.
-    assert_eq!(cloned, payload);
 }
 
 /// Deterministic bytes for `rows` rows of whole `format` blocks, `row_values` values each, with a
@@ -464,9 +391,11 @@ fn block_payload_decode_reads_the_addressed_row() {
         let weight = PackedWeight::try_new(format, shape).unwrap();
         let bytes = distinct_block_rows(format, shape[0], shape[1]);
         let row_bytes = bytes.len() / shape[0];
-        let payload =
-            PackedPayload::try_new(weight, [(SourceRole::Blocks, Arc::from(bytes.clone()))])
-                .unwrap();
+        let payload = PackedPayload::try_new(
+            weight,
+            [(SourceRole::Blocks, StoredBytes::from(bytes.clone()))],
+        )
+        .unwrap();
         let mut rows = Vec::new();
         for (row, row_source) in bytes.chunks_exact(row_bytes).enumerate() {
             let mut want = vec![0.0f32; shape[1]];
@@ -502,7 +431,7 @@ fn decode_row_refuses_a_row_or_output_outside_the_shape() {
         PackedWeight::try_new(q8_0, [3, 64]).unwrap(),
         [(
             SourceRole::Blocks,
-            Arc::from(distinct_block_rows(q8_0, 3, 64)),
+            StoredBytes::from(distinct_block_rows(q8_0, 3, 64)),
         )],
     )
     .unwrap();

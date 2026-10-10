@@ -18,19 +18,25 @@ use poot_graph_plan::{CompileLimits, CompileOptions, Submission};
 use poot_llm::driver::{
     BackendChoice, DraftPolicy, DriverOptions, PreparedSetLimits, open_executor, program_retention,
 };
-use poot_llm::front_end::{
-    CaptionPrompt, DecodedImage, FrontEndError, Idefics3Checkpoint, ImageFrontEnd, decode_image,
-};
+use poot_llm::{ChatTurn, ImageCheckpoint, ImageFrontEnd, ImageRequestError, MultimodalPrompt};
 
 use crate::api::RefusedRequest;
 use crate::lifecycle::WorkerRegistry;
 
-/// What the engine's driver is asked to take of a request's images: they are decoded already, and the
-/// question is the text of the one user message that carries them.
+/// One message of a request that holds images: its role, how many of the request's images it carries
+/// and its text.
+pub(crate) struct ImageTurn {
+    pub(crate) role: String,
+    pub(crate) images: usize,
+    pub(crate) text: String,
+}
+
+/// What the vision thread is asked to take of a request: its images, as encoded bytes in the order of
+/// the turns, and the conversation's turns that carry them.
 struct VisionJob {
-    images: Vec<DecodedImage>,
-    question: String,
-    reply: Sender<Result<CaptionPrompt, FrontEndError>>,
+    images: Vec<Vec<u8>>,
+    turns: Vec<ImageTurn>,
+    reply: Sender<Result<MultimodalPrompt, ImageRequestError>>,
 }
 
 /// What a connection thread holds of the image front end: the queue to the vision thread.
@@ -73,7 +79,7 @@ fn vision_options(patches: usize) -> DriverOptions {
 /// that refuses the tower is a startup error before the listener binds.
 pub(crate) fn spawn_image_front_end(
     workers: &mut WorkerRegistry,
-    checkpoint: std::sync::Arc<Idefics3Checkpoint>,
+    checkpoint: std::sync::Arc<dyn ImageCheckpoint>,
     backend: BackendChoice,
 ) -> Result<ImageClient> {
     let (jobs_tx, jobs_rx) = mpsc::channel::<VisionJob>();
@@ -97,7 +103,7 @@ pub(crate) fn spawn_image_front_end(
             if started_tx.send(Ok(())).is_err() {
                 return;
             }
-            run_vision_thread(&mut front_end, &jobs_rx);
+            run_vision_thread(front_end.as_mut(), &jobs_rx);
         })
         .context("spawn the vision thread")?;
     started_rx
@@ -108,10 +114,19 @@ pub(crate) fn spawn_image_front_end(
 }
 
 /// Lower jobs until every sender is gone.
-fn run_vision_thread(front_end: &mut ImageFrontEnd, jobs: &mpsc::Receiver<VisionJob>) {
+fn run_vision_thread(front_end: &mut dyn ImageFrontEnd, jobs: &mpsc::Receiver<VisionJob>) {
     while let Ok(job) = jobs.recv() {
-        let images: Vec<_> = job.images.iter().map(DecodedImage::as_image).collect();
-        let prepared = front_end.prepare(&images, &job.question);
+        let images: Vec<&[u8]> = job.images.iter().map(Vec::as_slice).collect();
+        let turns: Vec<_> = job
+            .turns
+            .iter()
+            .map(|turn| ChatTurn {
+                role: &turn.role,
+                images: turn.images,
+                text: &turn.text,
+            })
+            .collect();
+        let prepared = front_end.prepare(&images, &turns);
         let _ = job.reply.send(prepared);
     }
 }
@@ -137,24 +152,22 @@ fn image_bytes(url: &str) -> Result<Vec<u8>, RefusedRequest> {
 }
 
 impl ImageClient {
-    /// Decode `urls` and have the vision thread lower them with `question` to a prompt and its rows.
+    /// Read the bytes of `urls` (in the order of the turns) and have the vision thread lower the conversation
+    /// `turns` and its images to a prompt and its rows.
     pub(crate) fn prepare(
         &self,
         urls: &[String],
-        question: &str,
-    ) -> Result<CaptionPrompt, ImageError> {
+        turns: Vec<ImageTurn>,
+    ) -> Result<MultimodalPrompt, ImageError> {
         let images = urls
             .iter()
-            .map(|url| {
-                let bytes = image_bytes(url)?;
-                decode_image(&bytes).map_err(|e| ImageError::Refused(RefusedRequest(e.to_string())))
-            })
-            .collect::<Result<Vec<_>, ImageError>>()?;
+            .map(|url| image_bytes(url))
+            .collect::<Result<Vec<_>, _>>()?;
         let (reply, answer) = mpsc::channel();
         self.jobs
             .send(VisionJob {
                 images,
-                question: question.to_string(),
+                turns,
                 reply,
             })
             .map_err(|_| ImageError::Failed("the vision thread is gone".into()))?;
@@ -162,12 +175,8 @@ impl ImageClient {
             .recv()
             .map_err(|_| ImageError::Failed("the vision thread ended mid-request".into()))?;
         prepared.map_err(|error| match error {
-            FrontEndError::Image(_)
-            | FrontEndError::ImageTooLarge { .. }
-            | FrontEndError::NoImage
-            | FrontEndError::TooManyFrames { .. }
-            | FrontEndError::Placeholders { .. } => RefusedRequest(error.to_string()).into(),
-            other => ImageError::Failed(other.to_string()),
+            ImageRequestError::Refused(reason) => RefusedRequest(reason).into(),
+            failed @ ImageRequestError::Failed(_) => ImageError::Failed(failed.to_string()),
         })
     }
 }

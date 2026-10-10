@@ -262,5 +262,6 @@ pub unsafe fn amd_vulkan_compute_units(
 mod tests;
 
 pub use context::counters::{RuntimeCounterSnapshot, RuntimeCounters};
+pub use context::transfer::WRITE_CHUNK_BYTES;
 
 use context::counters::Counter;

@@ -34,11 +34,11 @@ fn select_f32_bits(shape: &[usize], cond: &[i32], if_true: &[u32], if_false: &[u
     };
     let inputs = HashMap::from([
         (
-            c.id,
+            c.id(),
             Value::from(HostTensor::i32(shape.to_vec(), cond.to_vec())),
         ),
-        (t.id, Value::from(floats(if_true))),
-        (f.id, Value::from(floats(if_false))),
+        (t.id(), Value::from(floats(if_true))),
+        (f.id(), Value::from(floats(if_false))),
     ]);
     let out = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
         .unwrap()
@@ -128,16 +128,16 @@ fn float_select_broadcasts_the_condition() {
     let out = b.select(c, t, f);
     let g = b.finish(out);
     let inputs = HashMap::from([
-        (c.id, Value::from(HostTensor::i32(vec![2, 1], vec![1, 0]))),
+        (c.id(), Value::from(HostTensor::i32(vec![2, 1], vec![1, 0]))),
         (
-            t.id,
+            t.id(),
             Value::from(HostTensor::f32(
                 vec![2, 3],
                 vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
             )),
         ),
         (
-            f.id,
+            f.id(),
             Value::from(HostTensor::f32(
                 vec![3],
                 vec![f32::NAN, f32::INFINITY, -0.0],
@@ -177,18 +177,18 @@ fn bf16_select_passes_half_width_bits_through() {
     let g = b.finish(out);
     let inputs = HashMap::from([
         (
-            c.id,
+            c.id(),
             Value::from(HostTensor::i32(vec![4], vec![1, 0, 1, 0])),
         ),
         (
-            t.id,
+            t.id(),
             Value::from(HostTensor::bf16(
                 vec![4],
                 vec![0x7FC1, 0x3F80, 0x8000, 0x7F80],
             )),
         ),
         (
-            f.id,
+            f.id(),
             Value::from(HostTensor::bf16(
                 vec![4],
                 vec![0x4000, 0x7FC2, 0x7F80, 0xFFC3],
@@ -255,15 +255,15 @@ fn narrow_select_moves_exact_words_through_movement_ops() {
         let g = b.finish(out);
         let inputs = HashMap::from([
             (
-                cond.id,
+                cond.id(),
                 Value::from(HostTensor::i32(vec![6], vec![1, 0, 1, 0, 1, 0])),
             ),
             (
-                on.id,
+                on.id(),
                 Value::from(half_tensor(dtype, vec![6], words.to_vec())),
             ),
             (
-                off.id,
+                off.id(),
                 Value::from(half_tensor(
                     dtype,
                     vec![6],

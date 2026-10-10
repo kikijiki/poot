@@ -1320,8 +1320,11 @@ fn mixed_snapshot_final_verification_is_atomic() {
     assert_eq!(packed_cache.len(), packed_len);
     assert_eq!(exact_cache.len(), exact_len);
 
+    // Restoring the byte does not restore the mapped file's identity, so only a fresh
+    // authentication of the repaired shard loads, and it reuses every cached owner.
     write_at(&fixture.root.path.join(SHARD_A), offset, 0x11);
-    let warm = authenticated
+    let warm = fixture
+        .authenticate()
         .load_mixed(&mut packed_cache, &mut exact_cache, |inventory| {
             decisions(inventory, TensorDisposition::Deferred)
         })

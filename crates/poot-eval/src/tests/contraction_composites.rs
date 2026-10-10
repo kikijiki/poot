@@ -12,11 +12,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use poot_graph_ir::{
-    Builder, Graph, OpKind, Operand, Slot, Storage, TensorType, Traced, ValueId,
-    packed_source_constants,
+    Builder, Graph, OpKind, Operand, Slot, Storage, TensorType, ValueId, packed_source_constants,
 };
 use poot_quant::format::{GroupMap, ScaleEncoding, WeightFormat};
-use poot_quant::{OperandRole, PackedComponentRef, PackedPayload, PackedWeight, SourceRole};
+use poot_quant::{
+    OperandRole, PackedComponentRef, PackedPayload, PackedWeight, SourceRole, StoredBytes,
+};
 use poot_tensor::{DType, HostTensor};
 
 use crate::{EvalBudget, EvalError, EvalOptions, Value, eval};
@@ -410,18 +411,18 @@ fn packed_contraction(
         TensorType::f32(activation.shape().to_vec()),
     );
     let mut plan = b.append_plan(0);
-    let mut operands = vec![Operand::Value(x.id)];
-    let mut inputs = HashMap::from([(x.id, Value::Host(activation))]);
+    let mut operands = vec![Operand::Value(x.id())];
+    let mut inputs = HashMap::from([(x.id(), Value::Host(activation))]);
     for (name, ty) in packed_source_constants("layer", descriptor) {
         let role = name.role();
         let input = plan
             .input(name, ty, Storage::Const)
             .expect("stage a packed carrier");
         inputs.insert(
-            input.id,
+            input.id(),
             Value::Packed(PackedComponentRef::new(Arc::clone(owner), role)),
         );
-        operands.push(Operand::Value(input.id));
+        operands.push(Operand::Value(input.id()));
     }
     let output = plan
         .equation(
@@ -434,8 +435,8 @@ fn packed_contraction(
         .expect("emit PackedContraction");
     plan.declare_result(output).expect("declare the result");
     let mut prepared = b.preflight_append(plan).expect("preflight the append");
-    let id = b.commit_append(&mut prepared).expect("commit the append");
-    (b.finish(Traced { id }), inputs)
+    let out = b.commit_append(&mut prepared).expect("commit the append");
+    (b.finish(out), inputs)
 }
 
 fn payload_of(case: &Case) -> Arc<PackedPayload> {
@@ -446,7 +447,7 @@ fn payload_of(case: &Case) -> Arc<PackedPayload> {
             descriptor,
             case.sources
                 .iter()
-                .map(|(role, bytes)| (*role, Arc::<[u8]>::from(bytes.as_slice()))),
+                .map(|(role, bytes)| (*role, StoredBytes::from(bytes.to_vec()))),
         )
         .unwrap_or_else(|error| panic!("{}: {error}", case.label)),
     )
@@ -557,17 +558,17 @@ fn dense_contraction(weight: HostTensor) -> (Graph, HashMap<ValueId, Value>) {
             OpKind::DenseContraction {
                 weight: weight.dtype(),
             },
-            vec![Operand::Value(x.id), Operand::Value(w.id)],
+            vec![Operand::Value(x.id()), Operand::Value(w.id())],
         )
         .expect("emit DenseContraction");
     plan.declare_result(output).expect("declare the result");
     let mut prepared = b.preflight_append(plan).expect("preflight the append");
-    let id = b.commit_append(&mut prepared).expect("commit the append");
+    let out = b.commit_append(&mut prepared).expect("commit the append");
     let inputs = HashMap::from([
-        (x.id, Value::Host(activation(&[2, 4]))),
-        (w.id, Value::Host(weight)),
+        (x.id(), Value::Host(activation(&[2, 4]))),
+        (w.id(), Value::Host(weight)),
     ]);
-    (b.finish(Traced { id }), inputs)
+    (b.finish(out), inputs)
 }
 
 fn dense_row_gather(table: HostTensor, ids: Vec<i32>) -> (Graph, HashMap<ValueId, Value>) {
@@ -587,17 +588,20 @@ fn dense_row_gather(table: HostTensor, ids: Vec<i32>) -> (Graph, HashMap<ValueId
             OpKind::DenseRowGather {
                 source: table.dtype(),
             },
-            vec![Operand::Value(t.id), Operand::Value(index.id)],
+            vec![Operand::Value(t.id()), Operand::Value(index.id())],
         )
         .expect("emit DenseRowGather");
     plan.declare_result(output).expect("declare the result");
     let mut prepared = b.preflight_append(plan).expect("preflight the append");
-    let id = b.commit_append(&mut prepared).expect("commit the append");
+    let out = b.commit_append(&mut prepared).expect("commit the append");
     let inputs = HashMap::from([
-        (t.id, Value::Host(table)),
-        (index.id, Value::Host(HostTensor::i32(vec![ids.len()], ids))),
+        (t.id(), Value::Host(table)),
+        (
+            index.id(),
+            Value::Host(HostTensor::i32(vec![ids.len()], ids)),
+        ),
     ]);
-    (b.finish(Traced { id }), inputs)
+    (b.finish(out), inputs)
 }
 
 /// Every fixture of SC-001 as `(label, graph, inputs)`.
@@ -958,17 +962,17 @@ fn a_grouped_dense_contraction_equals_each_groups_own_block_product() {
                 weight: DType::BF16,
                 groups,
             },
-            vec![Operand::Value(xs.id), Operand::Value(w.id)],
+            vec![Operand::Value(xs.id()), Operand::Value(w.id())],
         )
         .expect("emit GroupedDenseContraction");
     plan.declare_result(output).expect("declare the result");
     let mut prepared = b.preflight_append(plan).expect("preflight the append");
-    let id = b.commit_append(&mut prepared).expect("commit the append");
-    let graph = b.finish(Traced { id });
+    let out = b.commit_append(&mut prepared).expect("commit the append");
+    let graph = b.finish(out);
     let inputs = HashMap::from([
-        (xs.id, Value::Host(x.clone())),
+        (xs.id(), Value::Host(x.clone())),
         (
-            w.id,
+            w.id(),
             Value::Host(HostTensor::bf16(vec![groups * n, k], bf16_words(&weight))),
         ),
     ]);

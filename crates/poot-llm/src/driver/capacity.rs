@@ -27,14 +27,16 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use poot_executor::{
-    BufferRole, Device, DeviceTime, Dispatch, Engine, Executor, MemoryCounterSnapshot,
-    SharedKernels, SharedKernelsMismatch, WeightUpload,
+    BufferRole, Collectives, Coordinator, Device, DeviceTime, Dispatch, Engine, ExecError,
+    Executor, MemoryCounterSnapshot, NativeCounters, SharedKernels, SharedKernelsMismatch,
+    SupportBound, WeightUpload,
 };
 use poot_graph_plan::{DeviceId, Submission, Target, TargetSet};
 use poot_runtime_common::{AllocGuard, CompiledKernel, MemoryCounters};
 use poot_target::BufferStorage;
 
-use super::error::{DriverError, InvalidOptions};
+use super::error::DriverError;
+use super::placement::{Placed, Placement};
 use super::{Driver, DriverOptions, ModelHandle, ServingShapes};
 
 /// One owner of device bytes: an allocation with an identity. Two records naming the same `(device, id)`
@@ -150,28 +152,60 @@ pub enum DeviceBudget {
     Known { bytes: u64, reserve: u64 },
 }
 
-/// What an executor reports about its device memory at one moment, read when asked: the input of every
+/// What an executor reports about each device's memory at one moment, read when asked: the input of every
 /// admission decision. The caps' memory figure is the runtime's query at open and can be stale; `free_bytes`
 /// is the runtime's answer now.
 #[derive(Clone, Debug)]
 pub struct Observation {
-    pub targets: TargetSet,
-    /// [`poot_executor::Executor::free_memory_bytes`]: what the device could still allocate, or `None`
-    /// where the runtime cannot say.
+    pub devices: Vec<DeviceObservation>,
+}
+
+/// One device's memory as its runtime reports it now.
+#[derive(Clone, Debug)]
+pub struct DeviceObservation {
+    pub device: DeviceId,
+    pub target: Target,
+    /// [`poot_executor::DeviceMemory::free_bytes`]: what the device could still allocate, or `None` where
+    /// its runtime cannot say.
     pub free_bytes: Option<u64>,
-    /// Bytes this process's own executor already holds on the device, which `free_bytes` no longer
+    /// Bytes this process's own executor already holds on this device, which `free_bytes` no longer
     /// includes. Zero before anything is prepared.
     pub held_bytes: u64,
 }
 
 impl Observation {
-    /// Observe `executor` before it holds anything.
+    /// Observe `executor`'s devices, each with its own free memory and the bytes it holds.
     pub fn of(executor: &dyn Executor) -> Self {
-        Self {
-            targets: executor.target_set(),
-            free_bytes: executor.free_memory_bytes(),
-            held_bytes: 0,
-        }
+        let targets = executor.target_set();
+        let devices = executor
+            .device_memory()
+            .into_iter()
+            .map(|memory| DeviceObservation {
+                device: memory.device,
+                target: targets
+                    .devices()
+                    .iter()
+                    .find(|&&(id, _)| id == memory.device)
+                    .map(|&(_, target)| target)
+                    .expect("an executor reports the memory of its own devices"),
+                free_bytes: memory.free_bytes,
+                held_bytes: memory.live.iter().fold(0u64, |sum, (_, snapshot)| {
+                    sum.saturating_add(snapshot.live_bytes)
+                }),
+            })
+            .collect();
+        Self { devices }
+    }
+
+    /// The targets of the observed devices.
+    pub fn targets(&self) -> TargetSet {
+        TargetSet::new(
+            self.devices
+                .iter()
+                .map(|device| (device.device, device.target))
+                .collect(),
+        )
+        .expect("the devices of an executor are distinct")
     }
 }
 
@@ -252,10 +286,11 @@ impl Budget {
     /// admission refuses; the open-time ceiling is never promoted to a budget.
     pub fn observed(observation: &Observation, reserve: u64) -> Self {
         let mut budget = Self::new();
-        for (device, target) in observation.targets.devices() {
-            let live = observation
+        for observed in &observation.devices {
+            let (device, target) = (&observed.device, &observed.target);
+            let live = observed
                 .free_bytes
-                .map(|free| free.saturating_add(observation.held_bytes));
+                .map(|free| free.saturating_add(observed.held_bytes));
             let device_budget = match (live, target.caps.memory_budget_bytes) {
                 (None, _) => DeviceBudget::Unknown,
                 (Some(live), Some(ceiling)) => DeviceBudget::Known {
@@ -420,57 +455,89 @@ where
     Err(FitError::NoCandidateFits { rejected })
 }
 
-/// Check a prepared driver's live role bytes against its plan and a fresh budget, before it serves.
+/// Each device's live bytes by role, as its own runtime counters report them.
+pub type LiveBytes = Vec<(DeviceId, Vec<(BufferRole, u64)>)>;
+
+/// Check a prepared driver's live role bytes against its plan and a fresh budget, before it serves, one
+/// device at a time.
 ///
-/// A role may not hold more than it planned (a plan that under-counted admitted nothing), except
-/// [`BufferRole::Staging`], which runtimes allocate privately and the reserve bounds. The live bytes, not
-/// the plan, are then admitted against the budget: the plan chose the candidate, the counters prove it.
+/// On each device a role may not hold more live bytes than that device planned for it (a plan that
+/// under-counted admitted nothing), except [`BufferRole::Staging`], which runtimes allocate privately and
+/// the reserve bounds; the refusal names that device. The device's live bytes, not its plan, are then
+/// admitted against its own budget: the plan chose the candidate, the counters prove it.
 pub fn verify_prepared(
     planned: &Footprint,
-    device: DeviceId,
-    live: &[(BufferRole, u64)],
+    live: &LiveBytes,
     budget: &Budget,
     ledger: &Ledger,
 ) -> Result<(), CapacityRefusal> {
-    let planned_roles = planned.role_bytes(device)?;
     let mut actual = Footprint::new();
-    for &(role, bytes) in live {
-        if role != BufferRole::Staging {
-            let planned_bytes = planned_roles
-                .iter()
-                .find(|(planned_role, _)| *planned_role == role)
-                .map_or(0, |&(_, bytes)| bytes);
-            if bytes > planned_bytes {
-                return Err(CapacityRefusal::Underestimated {
-                    device,
-                    role,
-                    planned: planned_bytes,
-                    actual: bytes,
-                });
+    for (device, roles) in live {
+        let device = *device;
+        let planned_roles = planned.role_bytes(device)?;
+        for &(role, bytes) in roles {
+            if role != BufferRole::Staging {
+                let planned_bytes = planned_roles
+                    .iter()
+                    .find(|(planned_role, _)| *planned_role == role)
+                    .map_or(0, |&(_, bytes)| bytes);
+                if bytes > planned_bytes {
+                    return Err(CapacityRefusal::Underestimated {
+                        device,
+                        role,
+                        planned: planned_bytes,
+                        actual: bytes,
+                    });
+                }
             }
+            actual.insert(AllocationOwner {
+                id: format!("live {role:?}"),
+                device,
+                role,
+                bytes,
+            })?;
         }
-        actual.insert(AllocationOwner {
-            id: format!("live {role:?}"),
-            device,
-            role,
-            bytes,
-        })?;
     }
     budget.admit(&actual, ledger)
 }
 
 impl Driver {
-    /// The live bytes per role the executor's own runtime counters report, for the roles that have
-    /// allocated.
-    pub fn live_role_bytes(&self) -> Vec<(BufferRole, u64)> {
+    /// How this driver's model is placed over its executor's devices.
+    pub fn placement(&self) -> &Placement {
+        self.placed.placement()
+    }
+
+    /// The live bytes per role of each device, from the executor's per-device counters, for the roles
+    /// that have allocated.
+    pub fn live_device_bytes(&self) -> LiveBytes {
         self.executor
-            .stats()
-            .memory
+            .device_memory()
             .into_iter()
-            .map(|(role, snapshot): (BufferRole, MemoryCounterSnapshot)| {
-                (role, snapshot.live_bytes)
+            .map(|memory| {
+                let roles = memory
+                    .live
+                    .into_iter()
+                    .map(|(role, snapshot): (BufferRole, MemoryCounterSnapshot)| {
+                        (role, snapshot.live_bytes)
+                    })
+                    .collect();
+                (memory.device, roles)
             })
             .collect()
+    }
+
+    /// The live bytes per role the executor's runtime counters report, summed over its devices.
+    pub fn live_role_bytes(&self) -> Vec<(BufferRole, u64)> {
+        let mut total: Vec<(BufferRole, u64)> = Vec::new();
+        for (_, roles) in self.live_device_bytes() {
+            for (role, bytes) in roles {
+                match total.iter_mut().find(|(seen, _)| *seen == role) {
+                    Some((_, sum)) => *sum = sum.saturating_add(bytes),
+                    None => total.push((role, bytes)),
+                }
+            }
+        }
+        total
     }
 
     /// The targets the executor drives, as it reports them now.
@@ -478,15 +545,10 @@ impl Driver {
         self.executor.target_set()
     }
 
-    /// The device memory as the executor reports it now, with the bytes this driver already holds.
+    /// Each device's memory as the executor reports it now, with the bytes this driver already holds
+    /// on it.
     pub fn observation(&self) -> Observation {
-        Observation {
-            held_bytes: self
-                .live_role_bytes()
-                .iter()
-                .fold(0u64, |sum, &(_, bytes)| sum.saturating_add(bytes)),
-            ..Observation::of(&*self.executor)
-        }
+        Observation::of(&*self.executor)
     }
 }
 
@@ -502,35 +564,47 @@ pub enum PlanError {
     SharedKernels(#[from] SharedKernelsMismatch),
 }
 
-/// Plans candidate footprints for one model on one target without touching a device.
+/// Plans candidate footprints for one model on its target devices without touching one.
 pub struct Planner {
     handle: Arc<ModelHandle>,
-    device: DeviceId,
-    target: Target,
-    /// Shared by every candidate this planner plans, so codegen runs once per distinct kernel.
+    placed: Placed,
+    /// Shared by every candidate this planner plans on one device, so codegen runs once per distinct
+    /// kernel. A coordinator builds its engines itself, so a placed plan resolves its own kernels.
     kernels: SharedKernels,
+    /// Pool rows per routed selection when the planned drivers page their experts.
+    pool: Option<std::num::NonZeroUsize>,
 }
 
 impl Planner {
-    /// A planner for the single device of `targets`.
-    pub fn new(handle: Arc<ModelHandle>, targets: &TargetSet) -> Result<Self, DriverError> {
-        let &[(device, target)] = targets.devices() else {
-            return Err(InvalidOptions::Devices {
-                devices: targets.devices().len(),
-            }
-            .into());
-        };
+    /// A planner for `placement` over the devices of `targets`: the footprint it returns names the bytes
+    /// each device owns, so each device's budget is checked on its own.
+    pub fn new(
+        handle: Arc<ModelHandle>,
+        targets: &TargetSet,
+        placement: Placement,
+    ) -> Result<Self, DriverError> {
+        let placed = Placed::resolve(targets.clone(), placement)?;
+        let backend = targets.devices()[0].1.backend;
         Ok(Self {
             handle,
-            device,
-            target,
-            kernels: SharedKernels::new(target.backend),
+            placed,
+            kernels: SharedKernels::new(backend),
+            pool: None,
         })
     }
 
-    /// Prepare `shapes` under `options` on a [`PlanningDevice`] and return what that allocated; with
+    /// Plan candidates whose routed experts are paged through `slots_per_layer` pool rows per selection
+    /// ([`Driver::with_expert_pool`]): the pool rows, the maps and the entries' arenas are what the
+    /// production preparation allocates, so the footprint carries them. The refills write through the
+    /// device's own staging, which the budget's runtime reserve covers.
+    pub fn with_expert_pool(mut self, slots_per_layer: std::num::NonZeroUsize) -> Self {
+        self.pool = Some(slots_per_layer);
+        self
+    }
+
+    /// Prepare `shapes` under `options` on [`PlanningDevice`]s and return what that allocated; with
     /// `embeds`, the `PrefillEmbeds` entries ([`Driver::prepare_embeds`]) too. The preparation is the
-    /// production one; only the device is a recorder, so nothing is uploaded and nothing is left
+    /// production one; only the devices are recorders, so nothing is uploaded and nothing is left
     /// behind when this returns.
     pub fn plan(
         &self,
@@ -538,18 +612,55 @@ impl Planner {
         shapes: &ServingShapes<'_>,
         embeds: bool,
     ) -> Result<Planned, PlanError> {
-        let counters = MemoryCounters::new();
         let records: Records = Arc::default();
-        let device = PlanningDevice {
-            target: self.target,
-            counters: counters.clone(),
-            records: Arc::clone(&records),
+        let counters: Vec<(DeviceId, MemoryCounters)> = self
+            .placed
+            .targets()
+            .devices()
+            .iter()
+            .map(|&(id, _)| (id, MemoryCounters::new()))
+            .collect();
+        let mut devices = self
+            .placed
+            .targets()
+            .devices()
+            .iter()
+            .zip(&counters)
+            .map(|(&(id, target), (_, counters))| {
+                (
+                    id,
+                    PlanningDevice {
+                        id,
+                        target,
+                        counters: counters.clone(),
+                        records: Arc::clone(&records),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut driver = match self.placed.placement() {
+            Placement::Single => {
+                let (_, device) = devices.remove(0);
+                Driver::new(
+                    Arc::clone(&self.handle),
+                    Box::new(Engine::new(device).with_shared_kernels(self.kernels.clone())?),
+                    options,
+                )?
+            }
+            placement => {
+                let coordinator = Coordinator::new(devices)
+                    .map_err(|e| DriverError::Device(ExecError::from(e)))?;
+                Driver::placed(
+                    Arc::clone(&self.handle),
+                    coordinator,
+                    options,
+                    placement.clone(),
+                )?
+            }
         };
-        let mut driver = Driver::new(
-            Arc::clone(&self.handle),
-            Box::new(Engine::new(device).with_shared_kernels(self.kernels.clone())?),
-            options,
-        )?;
+        if let Some(slots) = self.pool {
+            driver = driver.with_expert_pool(slots)?;
+        }
         driver.prepare(shapes)?;
         if embeds {
             driver.prepare_embeds(shapes)?;
@@ -559,7 +670,7 @@ impl Planner {
             if record.live {
                 footprint.insert(AllocationOwner {
                     id: record.id.clone(),
-                    device: self.device,
+                    device: record.device,
                     role: record.role,
                     bytes: record.bytes,
                 })?;
@@ -567,16 +678,16 @@ impl Planner {
         }
         let stats = driver.executor_stats();
         drop(driver);
-        let held = counters.total_live_bytes();
+        let residue = counters
+            .iter()
+            .map(|(device, counters)| (*device, counters.total_live_bytes()))
+            .filter(|&(_, held)| held != 0)
+            .collect();
         Ok(Planned {
             weight_bytes_read: stats.weight_bytes_read,
             kernels_resolved: stats.kernels_resolved,
             footprint,
-            residue: if held == 0 {
-                BTreeMap::new()
-            } else {
-                BTreeMap::from([(self.device, held)])
-            },
+            residue,
         })
     }
 }
@@ -584,6 +695,7 @@ impl Planner {
 #[derive(Debug)]
 struct Record {
     id: String,
+    device: DeviceId,
     role: BufferRole,
     bytes: u64,
     live: bool,
@@ -594,6 +706,7 @@ type Records = Arc<Mutex<Vec<Record>>>;
 /// A [`Device`] that records every allocation the engine asks for and executes nothing. Its target is
 /// the real device's, so the planner and codegen decide exactly what they decide there.
 struct PlanningDevice {
+    id: DeviceId,
     target: Target,
     counters: MemoryCounters,
     records: Records,
@@ -638,6 +751,12 @@ impl Device for PlanningDevice {
         self.counters.snapshot_all()
     }
 
+    /// A planning device owns no memory to bound: the footprint it records is what admission checks
+    /// against the real devices' budgets, so a coordinator over planning devices is never short of room.
+    fn free_memory_bytes(&self) -> Option<u64> {
+        Some(u64::MAX)
+    }
+
     fn allocate(
         &mut self,
         role: BufferRole,
@@ -650,6 +769,7 @@ impl Device for PlanningDevice {
         let index = records.len();
         records.push(Record {
             id: format!("{role:?}#{index}"),
+            device: self.id,
             role,
             bytes,
             live: true,
@@ -686,11 +806,12 @@ impl Device for PlanningDevice {
     }
 
     /// Loading an entry uploads constants; the planning device drops the bytes.
-    fn write(
+    fn write_with(
         &mut self,
         _dst: &PlanningBuffer,
         _offset: usize,
-        _bytes: &[u8],
+        _len: usize,
+        _fill: &mut dyn FnMut(std::ops::Range<usize>, &mut [u8]),
     ) -> Result<(), PlanningOnly> {
         Ok(())
     }
@@ -708,6 +829,45 @@ impl Device for PlanningDevice {
     }
 
     fn abort(&mut self) -> Result<(), PlanningOnly> {
+        Ok(())
+    }
+}
+
+/// A planning device exchanges nothing: a coordinator over planning devices admits routes, events and
+/// copies so the preparation it plans is the production one, and records the staging they would own.
+impl Collectives for PlanningDevice {
+    type Event = ();
+
+    fn native_counters(&self) -> NativeCounters {
+        NativeCounters::default()
+    }
+
+    fn support_bound(&self) -> SupportBound {
+        SupportBound::default()
+    }
+
+    fn open_route(&mut self, _peer: &Self) -> Result<(), PlanningOnly> {
+        Ok(())
+    }
+
+    fn create_event(&mut self) -> Result<(), PlanningOnly> {
+        Ok(())
+    }
+
+    fn record_event(&mut self, _event: &()) -> Result<(), PlanningOnly> {
+        Ok(())
+    }
+
+    fn wait_event(&mut self, _event: &()) -> Result<(), PlanningOnly> {
+        Ok(())
+    }
+
+    fn peer_copy(
+        &mut self,
+        _src: &PlanningBuffer,
+        _dst: &PlanningBuffer,
+        _bytes: usize,
+    ) -> Result<(), PlanningOnly> {
         Ok(())
     }
 }
@@ -1057,9 +1217,12 @@ mod tests {
             target.caps.memory_budget_bytes = ceiling;
             Budget::observed(
                 &Observation {
-                    targets: TargetSet::single(D0, target),
-                    free_bytes: free,
-                    held_bytes: held,
+                    devices: vec![DeviceObservation {
+                        device: D0,
+                        target,
+                        free_bytes: free,
+                        held_bytes: held,
+                    }],
                 },
                 10,
             )
@@ -1069,6 +1232,58 @@ mod tests {
         assert_eq!(observe(Some(400), Some(300), 200).available(D0), Some(390));
         assert_eq!(observe(None, Some(300), 0).available(D0), Some(290));
         assert_eq!(observe(Some(1000), None, 200).available(D0), None);
+    }
+
+    fn on(device: DeviceId, roles: &[(BufferRole, u64)]) -> LiveBytes {
+        vec![(device, roles.to_vec())]
+    }
+
+    /// Each device is verified against its own plan and budget, and a refusal names the device that
+    /// overran: device 0 over its plan while device 1 is under is device 0's refusal, and a device whose
+    /// budget fell short is its own. Mutation: sum the roles over devices before comparing (the first
+    /// refusal then names no overrun, the second row admits).
+    #[test]
+    fn verify_prepared_checks_each_device_against_its_own_plan_and_budget() {
+        let mut planned = Footprint::new();
+        planned
+            .insert(owner("kv0", D0, BufferRole::State, 100))
+            .unwrap();
+        planned
+            .insert(owner("kv1", D1, BufferRole::State, 100))
+            .unwrap();
+        let roomy = Budget::new().with(D0, known(1000)).with(D1, known(1000));
+        let ledger = Ledger::default();
+        let live = |first: u64, second: u64| {
+            vec![
+                (D0, vec![(BufferRole::State, first)]),
+                (D1, vec![(BufferRole::State, second)]),
+            ]
+        };
+        assert_eq!(
+            verify_prepared(&planned, &live(100, 100), &roomy, &ledger),
+            Ok(())
+        );
+        // Device 0 overran by 20 while device 1 sits 20 under: the sum equals the plan.
+        assert_eq!(
+            verify_prepared(&planned, &live(120, 80), &roomy, &ledger),
+            Err(CapacityRefusal::Underestimated {
+                device: D0,
+                role: BufferRole::State,
+                planned: 100,
+                actual: 120,
+            })
+        );
+        // Device 1's budget fell below what it holds; device 0 has room for both.
+        let fell = Budget::new().with(D0, known(1000)).with(D1, known(90));
+        assert_eq!(
+            verify_prepared(&planned, &live(100, 100), &fell, &ledger),
+            Err(CapacityRefusal::OverBudget {
+                device: D1,
+                required: 100,
+                charged: 0,
+                available: 90,
+            })
+        );
     }
 
     /// SC-005: live bytes over a role's plan are refused (the plan under-counted), and live bytes are
@@ -1082,11 +1297,21 @@ mod tests {
         let roomy = Budget::new().with(D0, known(1000));
         let ledger = Ledger::default();
         assert_eq!(
-            verify_prepared(&planned, D0, &[(BufferRole::State, 100)], &roomy, &ledger),
+            verify_prepared(
+                &planned,
+                &on(D0, &[(BufferRole::State, 100)]),
+                &roomy,
+                &ledger
+            ),
             Ok(())
         );
         assert_eq!(
-            verify_prepared(&planned, D0, &[(BufferRole::State, 101)], &roomy, &ledger),
+            verify_prepared(
+                &planned,
+                &on(D0, &[(BufferRole::State, 101)]),
+                &roomy,
+                &ledger
+            ),
             Err(CapacityRefusal::Underestimated {
                 device: D0,
                 role: BufferRole::State,
@@ -1098,8 +1323,7 @@ mod tests {
         assert_eq!(
             verify_prepared(
                 &planned,
-                D0,
-                &[(BufferRole::State, 100), (BufferRole::Staging, 50)],
+                &on(D0, &[(BufferRole::State, 100), (BufferRole::Staging, 50)]),
                 &roomy,
                 &ledger
             ),
@@ -1109,8 +1333,7 @@ mod tests {
         assert_eq!(
             verify_prepared(
                 &planned,
-                D0,
-                &[(BufferRole::State, 100), (BufferRole::Staging, 50)],
+                &on(D0, &[(BufferRole::State, 100), (BufferRole::Staging, 50)]),
                 &tight,
                 &ledger
             ),
@@ -1120,6 +1343,138 @@ mod tests {
                 charged: 0,
                 available: 120,
             })
+        );
+    }
+
+    /// POOT-746 SC-008: the footprint of a pooled plan is exact. Against the unpooled plan of the same
+    /// shapes it saves `(E - P) * row bytes` of every stacked expert table and pays `4 * E` for each
+    /// selection's map, computed here from the checkpoint's own tables; the plan's role bytes equal the
+    /// live counters of the same preparation; and a budget of exactly the footprint admits it while one
+    /// byte less refuses it before anything executes.
+    ///
+    /// Mutations: allocate a `[1]` map in `Engine::pool_map` (the saving moves by `4 * (E - 1)` per
+    /// selection); in `Engine::pool_table` skip the identity lookup so a second entry allocates the pool
+    /// again (the plan counts it twice). Each goes red here.
+    #[test]
+    fn a_pooled_plan_has_exact_pool_bytes_and_matches_the_prepared_counters() {
+        use crate::driver::device_tests::{mixtral_handle, options};
+        use crate::driver::{Head, Layout, ServingShapes, Warm};
+        use poot_quant::weights::{HandleFormat, MoeRole, WeightRole};
+        use std::collections::BTreeSet;
+        use std::num::NonZeroUsize;
+
+        const POOL: usize = 3;
+        let handle = mixtral_handle();
+        let target = Target {
+            backend: poot_target::Backend::SpirvVulkan,
+            caps: poot_target::DeviceCaps::wgpu_rdna3_igpu(),
+        };
+        let targets = TargetSet::single(D0, target);
+        let rows = [NonZeroUsize::MIN];
+        // Two heads are two entries over the same pooled tables.
+        let heads = [Head::GREEDY, Head::Logits];
+        let shapes = ServingShapes {
+            layout: Layout::Contiguous,
+            rows: &rows,
+            heads: &heads,
+            warm: Warm::Prompts(&[2]),
+            windows: &[],
+            adapters: &[],
+        };
+        let plan = |pool: Option<usize>| {
+            let mut planner =
+                Planner::new(Arc::clone(&handle), &targets, Placement::Single).unwrap();
+            if let Some(slots) = pool {
+                planner = planner.with_expert_pool(NonZeroUsize::new(slots).unwrap());
+            }
+            planner.plan(options(8, 32), &shapes, false).unwrap()
+        };
+        let weight_bytes = |planned: &Planned| {
+            planned
+                .footprint
+                .role_bytes(D0)
+                .unwrap()
+                .into_iter()
+                .find(|(role, _)| *role == BufferRole::Weight)
+                .map_or(0, |(_, bytes)| bytes)
+        };
+        let resident = plan(None);
+        let pooled = plan(Some(POOL));
+
+        // The checkpoint's own stacked expert tables.
+        let (mut per_expert, mut experts, mut selections) = (0u64, 0usize, BTreeSet::new());
+        for (id, _, table) in handle.model().weights().iter() {
+            if let WeightRole::Moe(MoeRole::Stack(_)) = id.role {
+                assert!(matches!(
+                    table.format,
+                    HandleFormat::Dense(poot_tensor::DType::BF16)
+                ));
+                experts = table.shape[0];
+                per_expert += (table.shape.iter().product::<usize>() / experts * 2) as u64;
+                selections.insert(id.layer);
+            }
+        }
+        let saving =
+            (experts - POOL) as u64 * per_expert - selections.len() as u64 * experts as u64 * 4;
+        assert_eq!(
+            weight_bytes(&resident) - weight_bytes(&pooled),
+            saving,
+            "pool rows and maps against the whole tables"
+        );
+
+        // The same preparation on a counting device leaves the planned bytes.
+        let counters = MemoryCounters::new();
+        let device = PlanningDevice {
+            id: D0,
+            target,
+            counters,
+            records: Records::default(),
+        };
+        let mut driver = Driver::new(
+            Arc::clone(&handle),
+            Box::new(Engine::new(device)),
+            options(8, 32),
+        )
+        .unwrap()
+        .with_expert_pool(NonZeroUsize::new(POOL).unwrap())
+        .unwrap();
+        driver.prepare(&shapes).unwrap();
+        assert!(driver.prepared_entries() >= 2, "two entries share the pool");
+        let mut live: Vec<_> = driver
+            .live_role_bytes()
+            .into_iter()
+            .filter(|&(role, _)| role != BufferRole::Staging)
+            .collect();
+        let mut planned = pooled.footprint.role_bytes(D0).unwrap();
+        live.sort_by_key(|&(role, _)| format!("{role:?}"));
+        planned.sort_by_key(|&(role, _)| format!("{role:?}"));
+        assert_eq!(planned, live, "planned role bytes vs the prepared counters");
+
+        // An exact budget admits it, one byte less refuses it, and the whole-table plan does not fit.
+        let need = pooled.footprint.device_bytes(D0).unwrap();
+        let ledger = Ledger::default();
+        assert_eq!(
+            Budget::new()
+                .with(D0, known(need))
+                .admit(&pooled.footprint, &ledger),
+            Ok(())
+        );
+        assert_eq!(
+            Budget::new()
+                .with(D0, known(need - 1))
+                .admit(&pooled.footprint, &ledger),
+            Err(CapacityRefusal::OverBudget {
+                device: D0,
+                required: need,
+                charged: 0,
+                available: need - 1,
+            })
+        );
+        assert!(
+            Budget::new()
+                .with(D0, known(need))
+                .admit(&resident.footprint, &ledger)
+                .is_err()
         );
     }
 }

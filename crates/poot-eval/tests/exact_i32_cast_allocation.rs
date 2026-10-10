@@ -141,16 +141,16 @@ fn selected_cast_allocates_only_its_published_result() {
         .collect();
     let inputs = HashMap::from([
         (
-            table.id,
+            table.id(),
             Value::from(ExactI32TensorView::try_from_words(vec![SELECTED], table_words).unwrap()),
         ),
         (
-            index.id,
+            index.id(),
             Value::from(ExactI32TensorView::try_from_words(vec![SELECTED], index_words).unwrap()),
         ),
     ]);
     let mut authority = |value: poot_graph_ir::ValueId| {
-        (value == cast.id).then_some(ExactI32CastRole::HostCheckedSelector(ExactI32CastBounds {
+        (value == cast.id()).then_some(ExactI32CastRole::HostCheckedSelector(ExactI32CastBounds {
             selected_element_ceiling: SELECTED,
             expert_count: 3,
         }))

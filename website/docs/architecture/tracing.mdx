@@ -15,7 +15,9 @@ computation, JIT-compilation, or another transformation.
 ## The Builder and Traced handles
 
 `poot_graph_ir::Builder` records equations. A `Traced` value is a type-only handle: a
-`ValueId` plus a host-computed `TensorType`, with no data. Model code creates inputs with
+`ValueId` plus a brand identifying the builder that minted it, with no data; its host-computed
+`TensorType` is read through `Builder::aval`. Using a handle with a different builder panics (a
+tracer bug, not a recoverable condition). Model code creates inputs with
 `Builder::constant` (weights and tables), `Builder::slot` / `slot_named` (per-step inputs),
 and `Builder::state_input` (the KV cache), then calls the composite helpers in
 `poot_graph_ir::ops`:

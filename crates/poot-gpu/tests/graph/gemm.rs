@@ -67,8 +67,8 @@ fn tiled_gemm_large_n_under_tile_threshold_matches_cpu() {
             .collect()
     };
     let mut inp = HashMap::new();
-    inp.insert(a.id, HostTensor::f32(vec![m, k], r(1, m * k)));
-    inp.insert(wt.id, HostTensor::f32(vec![k, n], r(7, k * n)));
+    inp.insert(a.id(), HostTensor::f32(vec![m, k], r(1, m * k)));
+    inp.insert(wt.id(), HostTensor::f32(vec![k, n], r(7, k * n)));
     let eval_inp: HashMap<_, Value> = inp
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
@@ -139,8 +139,8 @@ fn tiled_gemm_tile_count_threshold_gated_and_correct() {
             m.div_ceil(16) * n.div_ceil(8)
         );
         let mut inp = HashMap::new();
-        inp.insert(a.id, HostTensor::f32(vec![m, k], r(1, m * k)));
-        inp.insert(wt.id, HostTensor::f32(vec![k, n], r(7, k * n)));
+        inp.insert(a.id(), HostTensor::f32(vec![m, k], r(1, m * k)));
+        inp.insert(wt.id(), HostTensor::f32(vec![k, n], r(7, k * n)));
         let eval_inp: HashMap<_, Value> = inp
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
@@ -184,7 +184,7 @@ fn large_elementwise_readback_matches_cpu() {
     let g = b.finish(y);
     let xd: Vec<f32> = (0..n).map(|i| ((i % 1000) as f32) * 0.001).collect();
     let mut inp = HashMap::new();
-    inp.insert(x.id, HostTensor::f32(vec![n], xd.clone()));
+    inp.insert(x.id(), HostTensor::f32(vec![n], xd.clone()));
     let eval_inp: HashMap<_, Value> = inp
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
@@ -237,8 +237,8 @@ fn lm_head_gemv_2d_grid_matches_cpu() {
             .collect()
     };
     let mut inp = HashMap::new();
-    inp.insert(a.id, HostTensor::f32(vec![1, k], r(1, k)));
-    inp.insert(wt.id, HostTensor::f32(vec![k, n], r(7, k * n)));
+    inp.insert(a.id(), HostTensor::f32(vec![1, k], r(1, k)));
+    inp.insert(wt.id(), HostTensor::f32(vec![k, n], r(7, k * n)));
     let eval_inp: HashMap<_, Value> = inp
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
@@ -310,8 +310,8 @@ fn decode_gemv_chunked_at_bloom_lm_head_n_matches_cpu() {
             .collect()
     };
     let mut inp = HashMap::new();
-    inp.insert(a.id, HostTensor::f32(vec![1, k], r(1, k)));
-    inp.insert(wt.id, HostTensor::f32(vec![k, n], r(7, k * n)));
+    inp.insert(a.id(), HostTensor::f32(vec![1, k], r(1, k)));
+    inp.insert(wt.id(), HostTensor::f32(vec![k, n], r(7, k * n)));
     let eval_inp: HashMap<_, Value> = inp
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
@@ -342,7 +342,7 @@ fn concat_n_gpu_matches_cpu() {
     let p1 = b.constant("p1", TensorType::f32(vec![2, 1, 3]));
     let p2 = b.constant("p2", TensorType::f32(vec![2, 3, 3]));
     let out = b.concat(1, &[p0, p1, p2]);
-    let (i0, i1, i2) = (p0.id, p1.id, p2.id);
+    let (i0, i1, i2) = (p0.id(), p1.id(), p2.id());
     let g = b.finish(out);
     let eqn = g
         .eqns
@@ -405,7 +405,7 @@ fn concat_n_rank4_axis2_gpu_matches_cpu() {
         .map(|k| b.constant(&format!("p{k}"), TensorType::f32(vec![1, 4, 32, 8])))
         .collect();
     let out = b.concat(2, &ps);
-    let ids: Vec<_> = ps.iter().map(|p| p.id).collect();
+    let ids: Vec<_> = ps.iter().map(|p| p.id()).collect();
     let g = b.finish(out);
     let eqn = g
         .eqns
@@ -545,13 +545,16 @@ fn indexed_program(case: &IndexedCase, gate: Option<Vec<f32>>) -> IndexedProgram
     let w = b.constant("w", TensorType::f32(vec![e, k, n]));
     let idx = b.constant("idx", TensorType::f32(vec![m]));
     let mut inputs = HashMap::new();
-    inputs.insert(x.id, HostTensor::f32(vec![m, k], int_fill(1, m * k)));
-    inputs.insert(w.id, HostTensor::f32(vec![e, k, n], int_fill(2, e * k * n)));
-    inputs.insert(idx.id, HostTensor::f32(vec![m], ids.clone()));
+    inputs.insert(x.id(), HostTensor::f32(vec![m, k], int_fill(1, m * k)));
+    inputs.insert(
+        w.id(),
+        HostTensor::f32(vec![e, k, n], int_fill(2, e * k * n)),
+    );
+    inputs.insert(idx.id(), HostTensor::f32(vec![m], ids.clone()));
     let mut out = b.indexed_matmul(x, w, idx);
     if let Some(gate) = gate {
         let gate_t = b.constant("gate", TensorType::f32(vec![m]));
-        inputs.insert(gate_t.id, HostTensor::f32(vec![m], gate));
+        inputs.insert(gate_t.id(), HostTensor::f32(vec![m], gate));
         let column = b.reshape(gate_t, vec![m, 1]);
         out = b.binary(poot_graph_ir::op::BinOp::Mul, out, column);
     }
@@ -649,9 +652,12 @@ fn indexed_matmul_checkpoint_order_experts_match_the_oracle_bit_for_bit() {
         let w = b.constant("w", TensorType::f32(vec![e, n, k]));
         let idx = b.constant("idx", TensorType::f32(vec![m]));
         let mut inputs = HashMap::new();
-        inputs.insert(x.id, HostTensor::f32(vec![m, k], int_fill(1, m * k)));
-        inputs.insert(w.id, HostTensor::f32(vec![e, n, k], int_fill(2, e * n * k)));
-        inputs.insert(idx.id, HostTensor::f32(vec![m], ids));
+        inputs.insert(x.id(), HostTensor::f32(vec![m, k], int_fill(1, m * k)));
+        inputs.insert(
+            w.id(),
+            HostTensor::f32(vec![e, n, k], int_fill(2, e * n * k)),
+        );
+        inputs.insert(idx.id(), HostTensor::f32(vec![m], ids));
         let out = b.indexed_matmul(x, b.transpose(w, vec![0, 2, 1]), idx);
         let program = IndexedProgram {
             graph: b.finish(out),
@@ -818,14 +824,17 @@ fn routed_gate_weighting_checkpoint_order_equals_the_oracle_bit_for_bit() {
         let idx = b.constant("idx", TensorType::f32(vec![m]));
         let gate_t = b.constant("gate", TensorType::f32(vec![m]));
         let mut inputs = HashMap::new();
-        inputs.insert(x.id, HostTensor::f32(vec![m, k], int_fill(1, m * k)));
-        inputs.insert(w.id, HostTensor::f32(vec![e, n, k], int_fill(2, e * n * k)));
-        inputs.insert(idx.id, HostTensor::f32(vec![m], ids));
+        inputs.insert(x.id(), HostTensor::f32(vec![m, k], int_fill(1, m * k)));
+        inputs.insert(
+            w.id(),
+            HostTensor::f32(vec![e, n, k], int_fill(2, e * n * k)),
+        );
+        inputs.insert(idx.id(), HostTensor::f32(vec![m], ids));
         // Dyadic gates, so the product with an exact integer sum is exact.
         let gate: Vec<f32> = (0..m)
             .map(|r| [0.5, -2.0, 1.25, 3.0, -0.75][r % 5])
             .collect();
-        inputs.insert(gate_t.id, HostTensor::f32(vec![m], gate));
+        inputs.insert(gate_t.id(), HostTensor::f32(vec![m], gate));
         let product = b.indexed_matmul(x, b.transpose(w, vec![0, 2, 1]), idx);
         let out = b.binary(
             poot_graph_ir::op::BinOp::Mul,
@@ -880,13 +889,13 @@ fn indexed_matmul_bf16_experts_match_the_oracle_bit_for_bit() {
                     TensorType::new(stored.clone(), poot_tensor::DType::BF16),
                 );
                 let mut inputs = HashMap::new();
-                inputs.insert(x.id, HostTensor::f32(vec![m, k], int_fill(1, m * k)));
-                inputs.insert(idx.id, HostTensor::f32(vec![m], ids.clone()));
+                inputs.insert(x.id(), HostTensor::f32(vec![m, k], int_fill(1, m * k)));
+                inputs.insert(idx.id(), HostTensor::f32(vec![m], ids.clone()));
                 let words = int_fill(2, e * k * n)
                     .iter()
                     .map(|v| (v.to_bits() >> 16) as u16)
                     .collect();
-                inputs.insert(w.id, HostTensor::bf16(stored, words));
+                inputs.insert(w.id(), HostTensor::bf16(stored, words));
                 let weight = if checkpoint_order {
                     b.transpose(w, vec![0, 2, 1])
                 } else {
@@ -899,7 +908,7 @@ fn indexed_matmul_bf16_experts_match_the_oracle_bit_for_bit() {
                     let gate: Vec<f32> = (0..m)
                         .map(|r| [0.5, -2.0, 1.25, 3.0, -0.75][r % 5])
                         .collect();
-                    inputs.insert(gate_t.id, HostTensor::f32(vec![m], gate));
+                    inputs.insert(gate_t.id(), HostTensor::f32(vec![m], gate));
                     out = b.binary(
                         poot_graph_ir::op::BinOp::Mul,
                         out,
@@ -942,7 +951,7 @@ fn tiled_gemm_gpu_matches_cpu() {
     let x = b.constant("x", TensorType::f32(vec![m, k]));
     let w = b.constant("w", TensorType::f32(vec![k, n]));
     let out = b.matmul(x, w);
-    let (xi, wi) = (x.id, w.id);
+    let (xi, wi) = (x.id(), w.id());
     let g = b.finish(out);
 
     // small, well-conditioned values so the f32 dot is near-exact.
@@ -1026,11 +1035,17 @@ fn tiled_gemm_random_shapes_gpu_matches_cpu() {
         let x = b.constant("x", TensorType::f32(vec![m, k]));
         let w = b.constant("w", TensorType::f32(vec![k, n]));
         let mut inputs = HashMap::new();
-        inputs.insert(x.id, HostTensor::f32(vec![m, k], fill(seed * 7 + 1, m * k)));
-        inputs.insert(w.id, HostTensor::f32(vec![k, n], fill(seed * 7 + 2, k * n)));
+        inputs.insert(
+            x.id(),
+            HostTensor::f32(vec![m, k], fill(seed * 7 + 1, m * k)),
+        );
+        inputs.insert(
+            w.id(),
+            HostTensor::f32(vec![k, n], fill(seed * 7 + 2, k * n)),
+        );
         let out = if with_bias {
             let bias = b.constant("bias", TensorType::f32(vec![n]));
-            inputs.insert(bias.id, HostTensor::f32(vec![n], fill(seed * 7 + 3, n)));
+            inputs.insert(bias.id(), HostTensor::f32(vec![n], fill(seed * 7 + 3, n)));
             poot_graph_ir::ops::linear(&b, x, w, Some(bias))
         } else {
             b.matmul(x, w)
@@ -1141,8 +1156,14 @@ fn synthesized_tiled_gemm_choice_matches_cpu() {
         let x = b.constant("x", TensorType::f32(vec![m, k]));
         let w = b.constant("w", TensorType::f32(vec![k, n]));
         let mut inputs = HashMap::new();
-        inputs.insert(x.id, HostTensor::f32(vec![m, k], fill(seed * 7 + 1, m * k)));
-        inputs.insert(w.id, HostTensor::f32(vec![k, n], fill(seed * 7 + 2, k * n)));
+        inputs.insert(
+            x.id(),
+            HostTensor::f32(vec![m, k], fill(seed * 7 + 1, m * k)),
+        );
+        inputs.insert(
+            w.id(),
+            HostTensor::f32(vec![k, n], fill(seed * 7 + 2, k * n)),
+        );
         let out = b.matmul(x, w);
         let g = b.finish(out);
 
@@ -1221,8 +1242,8 @@ fn chunked_large_tiled_gemm_gpu_matches_cpu() {
     let xd: Vec<f32> = (0..m * k).map(|i| ((i % 7) as f32) * 0.1 - 0.3).collect();
     let wd: Vec<f32> = (0..k * n).map(|i| ((i % 5) as f32) * 0.08 - 0.16).collect();
     let mut inputs = HashMap::new();
-    inputs.insert(x.id, HostTensor::f32(vec![m, k], xd));
-    inputs.insert(w.id, HostTensor::f32(vec![k, n], wd));
+    inputs.insert(x.id(), HostTensor::f32(vec![m, k], xd));
+    inputs.insert(w.id(), HostTensor::f32(vec![k, n], wd));
     let eval_inputs: HashMap<_, Value> = inputs
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
@@ -1313,11 +1334,11 @@ fn batched_tiled_gemm_random_shapes_gpu_matches_cpu() {
         let out = b.matmul(x, w);
         let mut inputs = HashMap::new();
         inputs.insert(
-            x.id,
+            x.id(),
             HostTensor::f32(xshape.clone(), fill(seed * 7 + 1, xshape.iter().product())),
         );
         inputs.insert(
-            w.id,
+            w.id(),
             HostTensor::f32(wshape.clone(), fill(seed * 7 + 2, wshape.iter().product())),
         );
         let g = b.finish(out);
@@ -1400,7 +1421,7 @@ fn tiled_gemm_then_bias_add_gpu_matches_cpu() {
     let w = b.constant("w", TensorType::f32(vec![k, n]));
     let bias = b.constant("bias", TensorType::f32(vec![n]));
     let out = poot_graph_ir::ops::linear(&b, x, w, Some(bias));
-    let (xi, wi, bi) = (x.id, w.id, bias.id);
+    let (xi, wi, bi) = (x.id(), w.id(), bias.id());
     let g = b.finish(out);
     let choice = compiled_choice(&g, &spirv_fixture_target(), |op| {
         matches!(
@@ -1466,7 +1487,7 @@ fn batched_tiled_gemm_gpu_matches_cpu() {
     let x = b.constant("x", TensorType::f32(vec![e, m, k]));
     let w = b.constant("w", TensorType::f32(vec![e, k, n]));
     let out = b.matmul(x, w);
-    let (xi, wi) = (x.id, w.id);
+    let (xi, wi) = (x.id(), w.id());
     let g = b.finish(out);
 
     let xd: Vec<f32> = (0..e * m * k)
@@ -1522,7 +1543,7 @@ fn rank4_batched_tiled_gemm_gpu_matches_cpu() {
     let x = b.constant("x", TensorType::f32(vec![bb, h, m, k]));
     let w = b.constant("w", TensorType::f32(vec![bb, h, k, n]));
     let out = b.matmul(x, w);
-    let (xi, wi) = (x.id, w.id);
+    let (xi, wi) = (x.id(), w.id());
     let g = b.finish(out);
 
     let xd: Vec<f32> = (0..bb * h * m * k)

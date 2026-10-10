@@ -4,25 +4,33 @@
 //! scalar decoder ([`decode`]) that interprets it; [`format`] holds the design. Packed-weight
 //! payloads preserve checkpoint-order source bytes. The crate does not parse checkpoints, define
 //! graph values or derive backend transport layouts; it decodes values only when a caller asks.
+//!
+//! `unsafe` is denied crate-wide except in `stored/mapping.rs`, the one file mapping behind
+//! [`StoredBytes`] (ADR-0103 amendment of 2026-10-09).
+
+#![deny(unsafe_code)]
 
 mod blocks;
+mod content;
 pub mod decode;
 pub mod format;
 pub mod plan;
 mod planar;
 pub mod scalar;
+mod stored;
 #[cfg(test)]
 mod tests;
 pub mod weights;
 
 use std::fmt;
 use std::sync::Arc;
-use std::sync::OnceLock;
 
+use content::ContentCheck;
 use decode::DecodeError;
 use format::{Axis, GroupMap, Storage, WeightFormat};
 
 pub use format::OperandRole;
+pub use stored::{Access, FileIdentity, MapError, SliceError, SourceChanged, StoredBytes};
 
 /// A logical shape axis rejected by descriptor construction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -400,103 +408,7 @@ impl PackedWeight {
     }
 }
 
-/// Content fingerprint of one packed source buffer: its byte length plus a 64-bit FNV-1a of every
-/// byte. It is a pure function of the bytes, and packed payload bytes are immutable, so a payload
-/// computes it once and hands the same value out forever after.
-///
-/// The fold has a serial dependency chain (one xor + one multiply per byte, never vectorizable),
-/// which costs roughly a billion bytes per second - at a 27 GB checkpoint that is tens of seconds.
-/// [`PackedPayload::source_fingerprint`] is therefore the only supported way to obtain one: a
-/// caller that re-folds payload bytes per graph step pays that price every step.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct PackedSourceFingerprint {
-    pub byte_len: usize,
-    pub fnv1a64: u64,
-}
-
-/// The workspace's one FNV-1a 64 ([`poot_runtime_common::fnv1a_bytes`]) over `bytes`. Private on
-/// purpose: [`PackedPayload::source_fingerprint`] is the only supported way to obtain one, so no
-/// caller can re-fold payload bytes per graph step.
-fn fingerprint_source(bytes: &[u8]) -> PackedSourceFingerprint {
-    PackedSourceFingerprint {
-        byte_len: bytes.len(),
-        fnv1a64: poot_runtime_common::fnv1a_bytes(bytes),
-    }
-}
-
-/// One immutable buffer this crate owns: a dense tensor's whole stored bytes
-/// ([`weights::DenseWeight`]), or one [`SourceRole`]'s bytes inside a [`PackedPayload`]. Owns the
-/// bytes (today an `Arc<[u8]>`; a later mmap region changes this one type, not its callers) and
-/// memoizes the content fingerprint ([`Self::fingerprint`]), so the byte-ownership policy and the
-/// content identity for "bytes read off a checkpoint" live in one place (card 540a).
-#[derive(Debug)]
-pub struct StoredBytes {
-    bytes: Arc<[u8]>,
-    fingerprint: OnceLock<PackedSourceFingerprint>,
-}
-
-impl StoredBytes {
-    pub fn new(bytes: Arc<[u8]>) -> Self {
-        Self {
-            bytes,
-            fingerprint: OnceLock::new(),
-        }
-    }
-
-    pub fn as_slice(&self) -> &[u8] {
-        &self.bytes
-    }
-
-    /// A cheap `Arc` clone (a refcount bump, not a byte copy) of the owned buffer: for a caller that
-    /// wants to hand these exact bytes to another `Arc`-backed owner (e.g. `poot_eval::Tensor`'s
-    /// native bf16/f16 `Payload`) without decoding through an intermediate `Vec<u8>` copy.
-    pub fn as_arc(&self) -> Arc<[u8]> {
-        Arc::clone(&self.bytes)
-    }
-
-    pub fn len(&self) -> usize {
-        self.bytes.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
-    }
-
-    /// This buffer's content fingerprint, folded at most once and memoized from then on (see
-    /// [`PackedSourceFingerprint`]'s docs for the cost this amortizes).
-    pub fn fingerprint(&self) -> PackedSourceFingerprint {
-        *self
-            .fingerprint
-            .get_or_init(|| fingerprint_source(&self.bytes))
-    }
-}
-
-impl Clone for StoredBytes {
-    fn clone(&self) -> Self {
-        Self {
-            bytes: Arc::clone(&self.bytes),
-            fingerprint: self.fingerprint.clone(),
-        }
-    }
-}
-
-impl PartialEq for StoredBytes {
-    fn eq(&self, other: &Self) -> bool {
-        self.bytes == other.bytes
-    }
-}
-
-impl Eq for StoredBytes {}
-
-impl From<Arc<[u8]>> for StoredBytes {
-    fn from(bytes: Arc<[u8]>) -> Self {
-        Self::new(bytes)
-    }
-}
-
-/// One payload source: its role and its bytes. Identity is role + bytes only ([`StoredBytes`]
-/// excludes the fingerprint memo from equality): the memo is observability of when the bytes were
-/// folded, not part of what two sources are.
+/// One payload source: its role and its bytes. Identity is role + bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PayloadSource {
     role: SourceRole,
@@ -536,14 +448,6 @@ impl PackedComponentRef {
 
     pub fn same_owner(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.owner, &other.owner)
-    }
-
-    /// The content fingerprint of this component's source bytes, folded at most once per payload
-    /// ([`PackedPayload::source_fingerprint`]): the identity a device const cache keys a resident
-    /// packed source on (card 642), so a step that re-binds the same weight costs a lookup, never a
-    /// re-fold of the bytes.
-    pub fn fingerprint(&self) -> PackedSourceFingerprint {
-        self.owner.source_fingerprint(self.role)
     }
 }
 
@@ -698,10 +602,6 @@ impl PartialEq for PackedComponentRef {
 impl Eq for PackedComponentRef {}
 
 /// Authoritative, immutable source storage for one packed weight.
-///
-/// The source fingerprints are memoized here (see [`Self::source_fingerprint`]): the bytes never
-/// change, so folding them again on every graph step would be pure waste - at Card 453's 27 GB
-/// checkpoint a per-step fold measured 21 s of a 33 s decode step.
 #[derive(Debug, Clone)]
 pub struct PackedPayload {
     weight: PackedWeight,
@@ -722,9 +622,9 @@ impl PackedPayload {
     /// exactly those roles, each of the byte length [`PackedWeight::source_bytes`] states).
     pub fn try_new(
         weight: PackedWeight,
-        sources: impl IntoIterator<Item = (SourceRole, Arc<[u8]>)>,
+        sources: impl IntoIterator<Item = (SourceRole, StoredBytes)>,
     ) -> Result<Self, PackedWeightError> {
-        let mut provided: Vec<(SourceRole, Arc<[u8]>)> = sources.into_iter().collect();
+        let mut provided: Vec<(SourceRole, StoredBytes)> = sources.into_iter().collect();
         let mut ordered = Vec::with_capacity(provided.len());
         for role in weight.sources() {
             let position = provided
@@ -744,10 +644,7 @@ impl PackedPayload {
                     actual: bytes.len(),
                 });
             }
-            ordered.push(PayloadSource {
-                role,
-                bytes: StoredBytes::new(bytes),
-            });
+            ordered.push(PayloadSource { role, bytes });
         }
         if let Some((role, _)) = provided.into_iter().next() {
             return Err(PackedWeightError::UnexpectedSource {
@@ -774,18 +671,16 @@ impl PackedPayload {
         self.source(role).bytes.as_slice()
     }
 
+    /// Every source's owner, in [`PackedWeight::sources`] order.
+    pub(crate) fn stored(&self) -> impl Iterator<Item = &StoredBytes> {
+        self.sources.iter().map(|source| &source.bytes)
+    }
+
     fn source(&self, role: SourceRole) -> &PayloadSource {
         self.sources
             .iter()
             .find(|source| source.role == role)
             .unwrap_or_else(|| panic!("{role:?} is not a source of {:?}", self.weight.format()))
-    }
-
-    /// The content fingerprint of `role`'s source bytes, folded at most once per payload and
-    /// memoized from then on (card 453's checkpoint fold cost). Reached through
-    /// [`PackedComponentRef::fingerprint`], the device const caches' identity for a packed source.
-    pub(crate) fn source_fingerprint(&self, role: SourceRole) -> PackedSourceFingerprint {
-        self.source(role).bytes.fingerprint()
     }
 
     /// A new block-format payload whose logical rows are `rows` of `parts` stacked in order (row
@@ -814,10 +709,9 @@ impl PackedPayload {
         let weight = PackedWeight::try_new(format, [rows.len(), first.shape()[1]])?;
         let [_, row_bytes] = first.source_shape(SourceRole::Blocks);
         let stacked: usize = parts.iter().map(|part| part.weight.shape()[0]).sum();
-        let mut bytes = Vec::with_capacity(rows.len() * row_bytes);
-        for &row in rows {
+        let locate = |row: usize| {
             let mut local = row;
-            let part = parts
+            parts
                 .iter()
                 .find(|part| {
                     let held = part.weight.shape()[0];
@@ -827,11 +721,30 @@ impl PackedPayload {
                     local -= held;
                     false
                 })
-                .ok_or(PackedWeightError::RowOutOfRange { row, rows: stacked })?;
+                .map(|part| (*part, local))
+                .ok_or(PackedWeightError::RowOutOfRange { row, rows: stacked })
+        };
+        // One part and an ascending contiguous run of rows is one contiguous byte run of the
+        // part's source: a view of it, not a copy.
+        let contiguous = rows.windows(2).all(|pair| pair[1] == pair[0] + 1);
+        if let ([only], true, Some(&first_row)) = (parts, contiguous, rows.first())
+            && first_row + rows.len() <= only.weight.shape()[0]
+        {
+            let start = first_row * row_bytes;
+            let view = only
+                .source(SourceRole::Blocks)
+                .bytes
+                .slice(start..start + rows.len() * row_bytes)
+                .expect("the run lies within the part's rows");
+            return Self::try_new(weight, [(SourceRole::Blocks, view)]);
+        }
+        let mut bytes = Vec::with_capacity(rows.len() * row_bytes);
+        for &row in rows {
+            let (part, local) = locate(row)?;
             let start = local * row_bytes;
             bytes.extend_from_slice(&part.bytes(SourceRole::Blocks)[start..start + row_bytes]);
         }
-        Self::try_new(weight, [(SourceRole::Blocks, Arc::from(bytes))])
+        Self::try_new(weight, [(SourceRole::Blocks, StoredBytes::from(bytes))])
     }
 
     /// Decode logical row `row` (all `K` values) into `out` through the one scalar decoder,
@@ -902,10 +815,11 @@ fn validate_content(
             .bytes
             .as_slice()
     };
-    match descriptor.storage {
-        Storage::Blocks(_) => {
+    let check = ContentCheck::of(format)?;
+    match (&*check, descriptor.storage) {
+        (ContentCheck::Blocks(check), _) => {
             let bytes = source_bytes(SourceRole::Blocks);
-            if let Some((operand, element)) = descriptor.first_non_finite_block_field(bytes) {
+            if let Some((operand, element)) = check.first_non_finite(bytes, &mut ()) {
                 return Err(PackedWeightError::NonFiniteField {
                     format,
                     role: SourceRole::Blocks,
@@ -914,12 +828,12 @@ fn validate_content(
                 });
             }
         }
-        Storage::Planar(layout) => {
-            for operand in layout.operands {
+        (ContentCheck::Planar(checks), Storage::Planar(layout)) => {
+            for (operand, check) in layout.operands.iter().zip(checks) {
                 let role = SourceRole::Planar(operand.role);
                 let bytes = source_bytes(role);
                 if let Some(element) =
-                    descriptor.first_non_finite_planar_operand(operand, weight.shape(), bytes)?
+                    check.and_then(|check| check.first_non_finite(bytes, &mut ()))
                 {
                     return Err(PackedWeightError::NonFiniteField {
                         format,
@@ -948,6 +862,7 @@ fn validate_content(
                 }
             }
         }
+        _ => unreachable!("a format's compiled content check follows its storage"),
     }
     validate_adjacent_k_padding(weight, sources)
 }

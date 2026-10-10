@@ -29,6 +29,7 @@ use poot_graph_plan::{
     CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram,
     Submission, Target, TargetSet, compile_staged,
 };
+use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::DType;
@@ -58,7 +59,7 @@ fn fixture() -> (Graph, Arc<WeightStore>, Arc<poot_quant::weights::WeightMap>) {
         wb.insert(
             name,
             WeightEntry::Dense(
-                DenseWeight::try_new(DType::F32, vec![n], Arc::from(bytes)).unwrap(),
+                DenseWeight::try_new(DType::F32, vec![n], StoredBytes::from(bytes)).unwrap(),
             ),
         )
         .unwrap();
@@ -174,11 +175,12 @@ impl Device for RecordingDevice {
         Ok(())
     }
 
-    fn write(
+    fn write_with(
         &mut self,
         _dst: &(),
         _offset: usize,
-        _bytes: &[u8],
+        _len: usize,
+        _fill: &mut dyn FnMut(std::ops::Range<usize>, &mut [u8]),
     ) -> Result<(), std::convert::Infallible> {
         Ok(())
     }
@@ -388,7 +390,7 @@ fn state_commit_export_keeps_its_own_slot_through_the_epilogue() {
     wb.insert(
         "bias",
         WeightEntry::Dense(
-            DenseWeight::try_new(DType::F32, vec![K], Arc::from(bias_bytes)).unwrap(),
+            DenseWeight::try_new(DType::F32, vec![K], StoredBytes::from(bias_bytes)).unwrap(),
         ),
     )
     .unwrap();

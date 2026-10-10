@@ -1,6 +1,5 @@
-//! Card 545a: `driver::ModelHandle::load` reads a GGUF once. The header comes from the
-//! bounded `GgufIndex` read, every tensor is range-read into the `WeightStore` exactly once, and a
-//! quantized tensor stays packed (never widened), so loading the real Qwen2.5-0.5B Q8_0 and Q4_K_M
+//! Card 545a: `driver::ModelHandle::load` maps a GGUF once. The header and every tensor are views of
+//! that one mapping, and a quantized tensor stays packed (never widened), so loading the real Qwen2.5-0.5B Q8_0 and Q4_K_M
 //! files peaks near 1x the file size in host RSS; the excess over the file is the tokenizer.
 
 fn proc_status_kib(field: &str) -> u64 {

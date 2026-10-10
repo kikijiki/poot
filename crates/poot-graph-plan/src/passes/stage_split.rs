@@ -59,6 +59,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 
 use poot_graph_ir::Operand;
+use poot_graph_ir::ValueTable;
 use poot_graph_ir::error::GraphValidationError;
 use poot_graph_ir::graph::ValueId;
 use poot_graph_ir::graph::{
@@ -74,13 +75,6 @@ pub(crate) enum CutSite {
     /// (a layer-pipeline placement's `after_layer`).
     AfterLayer(usize),
     /// Before equation `e` of the traced list: equation `e` is the first of the next stage.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "held for POOT-746: pool segmentation cuts by equation"
-        )
-    )]
     Before(usize),
 }
 
@@ -276,8 +270,9 @@ pub(crate) fn split_stages<V: ValidationChannel>(
 
     // Which stage defines each value, and which stages read it. A value with no defining equation is
     // a graph input binder: every stage that reads it binds it itself, so it never crosses.
-    let mut producer: Vec<Option<usize>> = vec![None; g.values.len()];
-    let mut readers: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); g.values.len()];
+    let mut producer: ValueTable<Option<usize>> = ValueTable::filled(g.values.len(), None);
+    let mut readers: ValueTable<BTreeSet<usize>> =
+        ValueTable::filled(g.values.len(), BTreeSet::new());
     for (equation, eqn) in g.eqns.iter().enumerate() {
         let stage = assignment.stage_of(equation);
         producer[eqn.out] = Some(stage);
@@ -289,7 +284,7 @@ pub(crate) fn split_stages<V: ValidationChannel>(
     }
 
     let mut consuming_stages: BTreeMap<ValueId, BTreeSet<usize>> = BTreeMap::new();
-    for (value, stages) in readers.iter().enumerate() {
+    for (value, stages) in readers.iter_enumerated() {
         let Some(producing) = producer[value] else {
             continue;
         };
@@ -334,7 +329,7 @@ pub(crate) fn split_stages<V: ValidationChannel>(
         stage_exports[boundary.producing_stage].push(boundary.id.0);
     }
 
-    let mut input_binder = vec![false; g.values.len()];
+    let mut input_binder = ValueTable::filled(g.values.len(), false);
     for &value in &g.inputs {
         input_binder[value] = true;
     }
@@ -408,25 +403,19 @@ pub(crate) fn split_stages<V: ValidationChannel>(
         }
         used.insert(output);
         used.extend(witnesses.iter().copied());
-        let renumber: HashMap<ValueId, ValueId> = used
-            .iter()
-            .enumerate()
-            .map(|(new, &old)| (old, new))
-            .collect();
-        let new = |old: ValueId| renumber[&old];
-
         // A boundary value is an equation result, never an input binder (validation rejects an
         // equation that redefines one), so retagging it as this stage's keyed activation input is safe.
-        let values: Vec<ValueMeta> = used
-            .iter()
-            .map(|&old| {
-                if stage_boundary_inputs[stage].binary_search(&old).is_ok() {
-                    ValueMeta::boundary_input(g.aval(old).clone(), BoundaryId(old))
-                } else {
-                    g.values[old].clone()
-                }
-            })
-            .collect();
+        let mut values = ValueTable::with_capacity(used.len());
+        let mut renumber: HashMap<ValueId, ValueId> = HashMap::with_capacity(used.len());
+        for &old in &used {
+            let meta = if stage_boundary_inputs[stage].binary_search(&old).is_ok() {
+                ValueMeta::boundary_input(g.aval(old).clone(), BoundaryId(old))
+            } else {
+                g.values[old].clone()
+            };
+            renumber.insert(old, values.push(meta));
+        }
+        let new = |old: ValueId| renumber[&old];
         let mut inputs: Vec<ValueId> = g
             .inputs
             .iter()
@@ -515,8 +504,8 @@ pub(crate) fn split_stages<V: ValidationChannel>(
 /// `state_in`/`state_out` must agree. A pair no equation touches is inert and stays with stage 0.
 fn state_pair_stages<V: ValidationChannel>(
     g: &Graph<V>,
-    producer: &[Option<usize>],
-    readers: &[BTreeSet<usize>],
+    producer: &ValueTable<Option<usize>>,
+    readers: &ValueTable<BTreeSet<usize>>,
 ) -> Result<Vec<usize>, StageSplitError> {
     let mut owners = Vec::with_capacity(g.state.len());
     for (pair, &(state_input, state_output)) in g.state.iter().enumerate() {
@@ -593,10 +582,10 @@ pub enum StageSplitError {
          past the last layer would produce an empty stage"
     )]
     LayerCutOutOfRange { cut: usize, layers: usize },
-    #[error("byte length of v{value} overflows usize")]
+    #[error("byte length of {value} overflows usize")]
     ByteLenOverflow { value: ValueId },
     #[error(
-        "state pair {pair} (v{state_input} -> v{state_output}) spans stages {first_stage} and \
+        "state pair {pair} ({state_input} -> {state_output}) spans stages {first_stage} and \
          {second_stage}; carried state must stay with one stage"
     )]
     StatePairSplit {
@@ -609,7 +598,7 @@ pub enum StageSplitError {
     #[error("stage {stage} produces no boundary value, so it cannot feed a later stage")]
     StageWithoutExit { stage: usize },
     #[error(
-        "stage {stage} is the final stage but neither defines nor binds the graph output v{output}"
+        "stage {stage} is the final stage but neither defines nor binds the graph output {output}"
     )]
     FinalStageMissingOutput { stage: usize, output: ValueId },
     #[error("stage {stage} graph is invalid: {source}")]
@@ -687,7 +676,7 @@ mod tests {
                 assert_eq!(
                     bits(got),
                     bits(expected),
-                    "cut {k}: carried state v{} -> v{} differs",
+                    "cut {k}: carried state {} -> {} differs",
                     pair.0,
                     pair.1
                 );

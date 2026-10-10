@@ -16,24 +16,31 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use poot_executor::Executor;
-use poot_models::qwen_vl_vision::{GridError, Qwen25VlVisionParams};
+use poot_models::qwen_vl_vision::{GridError, MAX_PATCHES, Qwen25VlVisionParams};
 use poot_models::registry::{RawConfig, Registry};
 use poot_tensor::HostTensor;
 
 use super::qwen_vl_chat::{
-    Qwen25VlChatMessage, Qwen25VlChatRequestError, Qwen25VlChatRequestMropeModelInputRequest,
-    assemble_qwen2_5_vl_chat_request_mrope_model_input,
+    Qwen25VlChatContent, Qwen25VlChatMessage, Qwen25VlChatMessageContent, Qwen25VlChatRequestError,
+    Qwen25VlChatRequestMropeModelInputRequest, assemble_qwen2_5_vl_chat_request_mrope_model_input,
 };
-use super::qwen_vl_image::{Qwen25VlDecodedFrameSource, Qwen25VlRawRequestMropeModelInput};
+use super::qwen_vl_image::{
+    Qwen25VlApngFrameSource, Qwen25VlDecodedFrameSource, Qwen25VlRawRequestAssemblyError,
+    Qwen25VlRawRequestMropeModelInput, decode_qwen2_5_vl_image,
+};
 use super::qwen_vl_mrope::Qwen25VlMropeModelInputView;
+use super::{
+    ChatTurn, ImageCheckpoint, ImageCheckpointError, ImageFrontEnd, ImageRequestError,
+    MultimodalPrompt,
+};
 use crate::core::sampler::Sampler;
-use crate::driver::error::{DriverError, InvalidRequest, LoadError};
+use crate::driver::error::{DriverError, InvalidRequest, LoadError, PreparedSetRefusal};
 use crate::driver::{
     Driver, DriverOptions, EncodeRequest, EncodeRow, GenerateRequest, Generation, LoadOptions,
     ModelHandle, PromptEmbeds, TokenSink,
 };
 use crate::text::tokenize::TextCodec;
-use poot_models::mrope::{MropeProcessorFpsInput, MropeVisualKind};
+use poot_models::mrope::{MropePositionIds, MropeProcessorFpsInput, MropeVisualKind};
 
 /// Why a Qwen2.5-VL checkpoint cannot load or a request cannot run.
 #[derive(Debug, thiserror::Error)]
@@ -91,12 +98,59 @@ pub struct Qwen25VlGenerate {
     pub sampler: Sampler,
 }
 
-/// A loaded Qwen2.5-VL: the vision tower and the text tower, each on its own driver.
-pub struct Qwen25Vl {
+/// A Qwen2.5-VL checkpoint read from its directory: the two towers' handles over the one set of
+/// weights. Nothing is on a device yet; the image side ([`Qwen25VlFrontEnd`]) and the text side (a
+/// [`Driver`] over [`Qwen25VlCheckpoint::text`]) are opened from it.
+pub struct Qwen25VlCheckpoint {
+    dir: PathBuf,
+    vision: Arc<ModelHandle>,
+    text: Arc<ModelHandle>,
+    params: Qwen25VlVisionParams,
+}
+
+/// Whether `dir`'s `config.json` declares a Qwen2.5-VL checkpoint with a vision tower (a
+/// `vision_config`). Any other directory, a file, and a text-only `qwen2_5_vl` config are not one; a
+/// config that cannot be read is the loader's error to report, not this question's.
+pub fn is_qwen2_5_vl_dir(dir: &Path) -> bool {
+    read_config(&dir.join("config.json")).is_ok_and(|config| {
+        config.get("model_type").and_then(serde_json::Value::as_str) == Some("qwen2_5_vl")
+            && config.get("vision_config").is_some_and(|v| v.is_object())
+    })
+}
+
+/// The image side of a Qwen2.5-VL: the vision tower on its own driver, and the request assembly
+/// (chat template, processor patches and grids, sectioned positions) whose placeholders the tower's
+/// rows replace. It produces what the text driver takes ([`MultimodalPrompt`]); it never generates.
+pub struct Qwen25VlFrontEnd {
     dir: PathBuf,
     vision: Driver,
-    text: Driver,
     params: Qwen25VlVisionParams,
+}
+
+/// A Qwen2.5-VL request lowered to what the text driver takes: unlike [`MultimodalPrompt`], the
+/// sectioned positions are not optional.
+#[derive(Clone, Debug)]
+pub struct Qwen25VlPrompt {
+    pub prompt: Vec<u32>,
+    pub embeds: PromptEmbeds,
+    /// Where every prompt token rotates (`Slot::MropePosition`).
+    pub mrope: MropePositionIds,
+}
+
+impl From<Qwen25VlPrompt> for MultimodalPrompt {
+    fn from(prompt: Qwen25VlPrompt) -> Self {
+        Self {
+            prompt: prompt.prompt,
+            embeds: prompt.embeds,
+            mrope: Some(prompt.mrope),
+        }
+    }
+}
+
+/// A loaded Qwen2.5-VL: the image side and the text tower, each on its own driver.
+pub struct Qwen25Vl {
+    images: Qwen25VlFrontEnd,
+    text: Driver,
 }
 
 fn read_config(path: &Path) -> Result<serde_json::Value, Qwen25VlError> {
@@ -128,18 +182,11 @@ fn patch_values(
         .ok_or(Qwen25VlError::Patches { kind, patch_dim })
 }
 
-impl Qwen25Vl {
-    /// Load the Qwen2.5-VL checkpoint directory `dir`: the text tower from its top-level config and
+impl Qwen25VlCheckpoint {
+    /// Read the Qwen2.5-VL checkpoint directory `dir`: the text tower from its top-level config and
     /// the vision tower from its `vision_config`, both through `registry` over the one set of
-    /// weights, each on a driver of its own. `vision` and `text` are the towers' executors and driver
-    /// options (the vision tower's capacity bounds the patches of one image; the text tower's, the
-    /// prompt and the generation).
-    pub fn load(
-        dir: &Path,
-        registry: &Registry,
-        vision: (Box<dyn Executor>, DriverOptions),
-        text: (Box<dyn Executor>, DriverOptions),
-    ) -> Result<Self, Qwen25VlError> {
+    /// weights.
+    pub fn read(dir: &Path, registry: &Registry) -> Result<Self, Qwen25VlError> {
         let config_path = dir.join("config.json");
         let config = read_config(&config_path)?;
         let mut vision_config = config
@@ -150,16 +197,16 @@ impl Qwen25Vl {
             })?
             .clone();
         vision_config["model_type"] = serde_json::json!("qwen2_5_vl_vision");
-        let text_handle = Arc::new(ModelHandle::load(dir, registry, &LoadOptions::default())?);
+        let text = Arc::new(ModelHandle::load(dir, registry, &LoadOptions::default())?);
         let vision_raw = RawConfig::HfJson {
             config: &vision_config,
             generation: None,
         };
         let params = Qwen25VlVisionParams::from_raw(&vision_raw)
             .map_err(|e| Qwen25VlError::Driver(DriverError::Model(e)))?;
-        let vision_handle = Arc::new(ModelHandle::from_shared(
+        let vision = Arc::new(ModelHandle::from_shared(
             &vision_raw,
-            Arc::clone(text_handle.shared_store()),
+            Arc::clone(text.shared_store()),
             registry,
             |config| {
                 TextCodec::from_hf_dir(
@@ -173,33 +220,41 @@ impl Qwen25Vl {
         )?);
         Ok(Self {
             dir: dir.to_path_buf(),
-            vision: Driver::new(vision_handle, vision.0, vision.1)?,
-            text: Driver::new(text_handle, text.0, text.1)?,
+            vision,
+            text,
             params,
         })
     }
 
+    /// Open the image side on `vision`'s executor and driver options (the capacity bounds the
+    /// patches of one image). Inherent, not only the trait's, because [`Qwen25Vl`] holds the concrete type.
+    pub fn front_end(
+        &self,
+        vision: (Box<dyn Executor>, DriverOptions),
+    ) -> Result<Qwen25VlFrontEnd, Qwen25VlError> {
+        Ok(Qwen25VlFrontEnd {
+            dir: self.dir.clone(),
+            vision: Driver::new(Arc::clone(&self.vision), vision.0, vision.1)?,
+            params: self.params.clone(),
+        })
+    }
+}
+
+impl Qwen25VlFrontEnd {
     /// The vision tower's driver, for its stats and caps.
     pub fn vision(&self) -> &Driver {
         &self.vision
     }
 
-    /// The text tower's driver.
-    pub fn text(&self) -> &Driver {
-        &self.text
-    }
-
     /// Assemble the chat `messages` (the checkpoint's chat template, the media decoded and
-    /// processed) and generate from them.
-    pub fn generate_chat<S: Qwen25VlDecodedFrameSource>(
-        &mut self,
+    /// processed) into a request.
+    pub fn assemble_chat<S: Qwen25VlDecodedFrameSource>(
+        &self,
         messages: &[Qwen25VlChatMessage<'_>],
         fps: Option<MropeProcessorFpsInput<'_>>,
         video_sources: &mut [S],
-        generate: Qwen25VlGenerate,
-        sink: &mut dyn TokenSink,
-    ) -> Result<Generation, Qwen25VlChatError<S::Error>> {
-        let input = assemble_qwen2_5_vl_chat_request_mrope_model_input(
+    ) -> Result<Qwen25VlRawRequestMropeModelInput, Qwen25VlChatRequestError<S::Error>> {
+        assemble_qwen2_5_vl_chat_request_mrope_model_input(
             Qwen25VlChatRequestMropeModelInputRequest {
                 model_dir: &self.dir,
                 messages,
@@ -207,8 +262,6 @@ impl Qwen25Vl {
                 video_sources,
             },
         )
-        .map_err(Qwen25VlChatError::Assemble)?;
-        Ok(self.generate(&input, generate, sink)?)
     }
 
     /// Encode every image and video of `input` into the rows its placeholders stand for, in prompt
@@ -262,14 +315,12 @@ impl Qwen25Vl {
         Ok(rows)
     }
 
-    /// Generate from an assembled request: encode its media, scatter the rows over the prompt's image
-    /// and video placeholders and generate on the text driver at the prompt's sectioned positions.
-    pub fn generate(
+    /// The prompt tokens, embedding rows and sectioned positions of an assembled request: encode its
+    /// media and check that the rows cover the prompt's image and video placeholders.
+    pub fn prepare_input(
         &mut self,
         input: &Qwen25VlRawRequestMropeModelInput,
-        generate: Qwen25VlGenerate,
-        sink: &mut dyn TokenSink,
-    ) -> Result<Generation, Qwen25VlError> {
+    ) -> Result<Qwen25VlPrompt, Qwen25VlError> {
         let rows = self.encode_media(input)?;
         let ids = input.metadata().special_tokens;
         let prompt = input.prompt_token_ids().to_vec();
@@ -288,6 +339,181 @@ impl Qwen25Vl {
         }
         let embeds = PromptEmbeds::new(width, positions, rows)
             .map_err(|e| DriverError::from(InvalidRequest::Embeds(e)))?;
+        Ok(Qwen25VlPrompt {
+            prompt,
+            embeds,
+            mrope: input.mrope_positions().clone(),
+        })
+    }
+}
+
+impl ImageFrontEnd for Qwen25VlFrontEnd {
+    /// The conversation `turns` rendered through the checkpoint's chat template, each turn's images
+    /// first in its content.
+    fn prepare(
+        &mut self,
+        images: &[&[u8]],
+        turns: &[ChatTurn<'_>],
+    ) -> Result<MultimodalPrompt, ImageRequestError> {
+        if images.is_empty() {
+            return Err(ImageRequestError::Refused(
+                "a request needs at least one image".into(),
+            ));
+        }
+        let in_turns: usize = turns.iter().map(|turn| turn.images).sum();
+        if in_turns != images.len() {
+            return Err(ImageRequestError::Refused(format!(
+                "the turns hold {in_turns} images but the request has {}",
+                images.len()
+            )));
+        }
+        let decoded = images
+            .iter()
+            .map(|bytes| decode_qwen2_5_vl_image(bytes))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ImageRequestError::Refused(e.to_string()))?;
+        let mut next = decoded.iter();
+        let messages: Vec<_> = turns
+            .iter()
+            .map(|turn| {
+                let mut parts: Vec<_> = next
+                    .by_ref()
+                    .take(turn.images)
+                    .map(Qwen25VlChatContent::Image)
+                    .collect();
+                parts.push(Qwen25VlChatContent::Text(turn.text));
+                Qwen25VlChatMessage {
+                    role: turn.role,
+                    content: Qwen25VlChatMessageContent::Parts(parts),
+                }
+            })
+            .collect();
+        let mut no_videos: [Qwen25VlApngFrameSource<'_>; 0] = [];
+        let input = self
+            .assemble_chat(&messages, None, &mut no_videos)
+            .map_err(|error| {
+                if request_shaped(&error) {
+                    ImageRequestError::Refused(error.to_string())
+                } else {
+                    ImageRequestError::Failed(Box::new(error))
+                }
+            })?;
+        let prompt = self.prepare_input(&input).map_err(|error| match error {
+            // An image of more patches than the tower takes is refused by the tower's own bound or by the
+            // driver's trace limit set to it.
+            Qwen25VlError::Grid { .. }
+            | Qwen25VlError::Driver(
+                DriverError::Unsupported(_)
+                | DriverError::PreparedSet(PreparedSetRefusal::TraceTokens { .. }),
+            ) => ImageRequestError::Refused(error.to_string()),
+            other => ImageRequestError::Failed(Box::new(other)),
+        })?;
+        Ok(prompt.into())
+    }
+}
+
+/// Whether a chat assembly failed on the request (its messages or its images) and not on the checkpoint
+/// (its metadata, processor config or chat template).
+fn request_shaped<E: std::error::Error + 'static>(error: &Qwen25VlChatRequestError<E>) -> bool {
+    use Qwen25VlChatRequestError as Chat;
+    use Qwen25VlRawRequestAssemblyError as Raw;
+    match error {
+        Chat::EmptyMessages
+        | Chat::MissingRole { .. }
+        | Chat::EmptyRole { .. }
+        | Chat::EmptyImagePath { .. }
+        | Chat::ImageFile { .. }
+        | Chat::TooManyMediaItems { .. } => true,
+        Chat::RawRequest(raw) => matches!(
+            raw,
+            Raw::TooManyMediaItems { .. }
+                | Raw::ImagePreprocess { .. }
+                | Raw::ImageBatchPreprocess(_)
+                | Raw::MediaOrderMismatch { .. }
+                | Raw::MediaCountMismatch { .. }
+                | Raw::PadExpansion(_)
+        ),
+        Chat::Metadata(_)
+        | Chat::UnsupportedModelType { .. }
+        | Chat::MissingChatTemplate
+        | Chat::ChatTemplate(_) => false,
+    }
+}
+
+impl ImageCheckpoint for Qwen25VlCheckpoint {
+    fn text(&self) -> &Arc<ModelHandle> {
+        &self.text
+    }
+
+    /// The tower's own bound: an image of more patches is refused when it is traced.
+    fn patches(&self) -> usize {
+        MAX_PATCHES
+    }
+
+    fn front_end(
+        &self,
+        vision: (Box<dyn Executor>, DriverOptions),
+    ) -> Result<Box<dyn ImageFrontEnd>, ImageCheckpointError> {
+        Ok(Box::new(Qwen25VlCheckpoint::front_end(self, vision)?))
+    }
+}
+
+impl Qwen25Vl {
+    /// Load the Qwen2.5-VL checkpoint directory `dir` and open a driver for each tower. `vision` and
+    /// `text` are the towers' executors and driver options (the vision tower's capacity bounds the
+    /// patches of one image; the text tower's, the prompt and the generation).
+    pub fn load(
+        dir: &Path,
+        registry: &Registry,
+        vision: (Box<dyn Executor>, DriverOptions),
+        text: (Box<dyn Executor>, DriverOptions),
+    ) -> Result<Self, Qwen25VlError> {
+        let checkpoint = Qwen25VlCheckpoint::read(dir, registry)?;
+        Ok(Self {
+            images: checkpoint.front_end(vision)?,
+            text: Driver::new(Arc::clone(&checkpoint.text), text.0, text.1)?,
+        })
+    }
+
+    /// The vision tower's driver, for its stats and caps.
+    pub fn vision(&self) -> &Driver {
+        self.images.vision()
+    }
+
+    /// The text tower's driver.
+    pub fn text(&self) -> &Driver {
+        &self.text
+    }
+
+    /// Assemble the chat `messages` and generate from them.
+    pub fn generate_chat<S: Qwen25VlDecodedFrameSource>(
+        &mut self,
+        messages: &[Qwen25VlChatMessage<'_>],
+        fps: Option<MropeProcessorFpsInput<'_>>,
+        video_sources: &mut [S],
+        generate: Qwen25VlGenerate,
+        sink: &mut dyn TokenSink,
+    ) -> Result<Generation, Qwen25VlChatError<S::Error>> {
+        let input = self
+            .images
+            .assemble_chat(messages, fps, video_sources)
+            .map_err(Qwen25VlChatError::Assemble)?;
+        Ok(self.generate(&input, generate, sink)?)
+    }
+
+    /// Generate from an assembled request: prepare its prompt (the media encoded and scattered over
+    /// the placeholders) and generate on the text driver at the prompt's sectioned positions.
+    pub fn generate(
+        &mut self,
+        input: &Qwen25VlRawRequestMropeModelInput,
+        generate: Qwen25VlGenerate,
+        sink: &mut dyn TokenSink,
+    ) -> Result<Generation, Qwen25VlError> {
+        let Qwen25VlPrompt {
+            prompt,
+            embeds,
+            mrope,
+        } = self.images.prepare_input(input)?;
         Ok(self.text.generate_with_mrope(
             GenerateRequest {
                 prompt,
@@ -297,7 +523,7 @@ impl Qwen25Vl {
                 ignore_eos: false,
             },
             embeds,
-            input.mrope_positions().clone(),
+            mrope,
             sink,
         )?)
     }
@@ -698,6 +924,11 @@ mod tests {
     use poot_models::mrope::MropeGrid;
 
     use super::fixture::*;
+    use super::{
+        Qwen25VlApngFrameSource, Qwen25VlChatMessage, Qwen25VlChatRequestError,
+        Qwen25VlChatRequestMropeModelInputRequest,
+        assemble_qwen2_5_vl_chat_request_mrope_model_input, request_shaped,
+    };
 
     /// SC-002: the sectioned positions the front end produces for `hello <image> t1` equal the
     /// reference's, written out by hand from its rule: text sits at its index on all three axes; an
@@ -725,5 +956,62 @@ mod tests {
 
     fn user_id() -> u32 {
         2
+    }
+
+    /// A chat assembly fails as the client's only when the request is at fault: no messages is the
+    /// request's, a checkpoint without a chat template is the checkpoint's. Mutation: make
+    /// `request_shaped` return true for `MissingChatTemplate`; the second assertion goes red.
+    #[test]
+    fn only_request_faults_of_a_chat_assembly_are_the_clients() {
+        let dir = checkpoint("shaped", 1.0);
+        let assemble = |messages: &[Qwen25VlChatMessage<'_>]| {
+            let mut no_videos: [Qwen25VlApngFrameSource<'_>; 0] = [];
+            assemble_qwen2_5_vl_chat_request_mrope_model_input(
+                Qwen25VlChatRequestMropeModelInputRequest {
+                    model_dir: &dir,
+                    messages,
+                    fps: None,
+                    video_sources: &mut no_videos,
+                },
+            )
+            .unwrap_err()
+        };
+        assert!(request_shaped(&assemble(&[])));
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("tokenizer_config.json")).unwrap())
+                .unwrap();
+        config.as_object_mut().unwrap().remove("chat_template");
+        std::fs::write(dir.join("tokenizer_config.json"), config.to_string()).unwrap();
+        let image = image(12, 8, 1);
+        let error = assemble(&messages(&image));
+        assert!(
+            matches!(error, Qwen25VlChatRequestError::MissingChatTemplate),
+            "{error:?}"
+        );
+        assert!(!request_shaped(&error));
+    }
+
+    /// A serving front end exists for a checkpoint with a vision tower and for no other: a text-only
+    /// `qwen2_5_vl` config (no `vision_config`) is served as the text model it is. Mutation: drop the
+    /// `vision_config` clause of `is_qwen2_5_vl_dir`; the text-only directory is claimed and the row goes
+    /// red.
+    #[test]
+    fn only_a_checkpoint_with_a_vision_tower_has_an_image_front_end() {
+        let dir = checkpoint("detect", 1.0);
+        let registry = poot_models::registry::Registry::builtin().unwrap();
+        assert!(
+            crate::read_image_checkpoint(&dir, &registry)
+                .unwrap()
+                .is_some()
+        );
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+        config.as_object_mut().unwrap().remove("vision_config");
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        assert!(
+            crate::read_image_checkpoint(&dir, &registry)
+                .unwrap()
+                .is_none()
+        );
     }
 }

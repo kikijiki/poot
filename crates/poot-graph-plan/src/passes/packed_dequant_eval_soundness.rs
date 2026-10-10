@@ -11,8 +11,9 @@ use super::{
 use poot_graph_ir::ops::{packed_block_diagonal_linear, packed_linear};
 use poot_graph_ir::{
     Builder, BuilderAppendError, Graph, OpKind, Operand, PackedSourceName, Slot, TensorType,
-    Traced, packed_source_constants,
+    ValueId, packed_source_constants,
 };
+use poot_quant::StoredBytes;
 use poot_quant::format::{ScaleEncoding, Storage, WeightFormat};
 use poot_quant::{
     OperandRole, PackedComponentRef, PackedPayload, PackedStack, PackedStackComponentRef,
@@ -172,7 +173,7 @@ fn payload(format: WeightFormat, shape: [usize; 2]) -> Arc<PackedPayload> {
     )
 }
 
-fn primitive_graph(owner: &Arc<PackedPayload>) -> (poot_graph_ir::Graph, usize, usize) {
+fn primitive_graph(owner: &Arc<PackedPayload>) -> (poot_graph_ir::Graph, ValueId, ValueId) {
     let descriptor = owner.weight();
     let b = Builder::new();
     let [(weight_name, weight_type), (scale_name, scale_type)] = <[(PackedSourceName, TensorType);
@@ -183,7 +184,7 @@ fn primitive_graph(owner: &Arc<PackedPayload>) -> (poot_graph_ir::Graph, usize, 
     let weight = b.constant(weight_name.as_str(), weight_type);
     let scale = b.constant(scale_name.as_str(), scale_type);
     let output = b.packed_dequant(&[weight, scale], descriptor);
-    (b.finish(output), weight.id, scale.id)
+    (b.finish(output), weight.id(), scale.id())
 }
 
 fn independent_fp4(owner: &PackedPayload, coordinate: [usize; 2]) -> f32 {
@@ -377,7 +378,7 @@ fn packed_dequant_fused_and_unfused_compositions_match() -> Result<(), BuilderAp
         let fused = prepare_packed_dequant_production(&graph).unwrap();
         let mut inputs = HashMap::new();
         inputs.insert(
-            activation.id,
+            activation.id(),
             Value::Host(HostTensor::f32(
                 activation_shape.clone(),
                 (0..activation_shape.iter().product())
@@ -446,10 +447,13 @@ fn indexed_experts(experts: u8) -> (PackedWeight, Vec<Arc<PackedPayload>>) {
                 PackedPayload::try_new(
                     descriptor,
                     [
-                        (SourceRole::Planar(OperandRole::Codes), Arc::from(codes)),
+                        (
+                            SourceRole::Planar(OperandRole::Codes),
+                            StoredBytes::from(codes),
+                        ),
                         (
                             SourceRole::Planar(OperandRole::Scale),
-                            Arc::from([0x7f + expert].as_slice()),
+                            StoredBytes::from(vec![0x7f + expert]),
                         ),
                     ],
                 )
@@ -467,7 +471,7 @@ fn indexed_graph(
     experts: &[Arc<PackedPayload>],
     x_data: &[f32],
     route: &[usize],
-) -> (Graph, HashMap<usize, Value>) {
+) -> (Graph, HashMap<ValueId, Value>) {
     use poot_graph_ir::ops::{PackedExpertStack, packed_indexed_linear};
     let (m, k) = (route.len(), descriptor.shape()[1]);
     let table = PackedExpertStack {
@@ -483,11 +487,11 @@ fn indexed_graph(
     let stack = Arc::new(PackedStack::try_new(experts.to_vec()).unwrap());
     let mut inputs = HashMap::new();
     inputs.insert(
-        x.id,
+        x.id(),
         Value::Host(HostTensor::f32(vec![m, k], x_data.to_vec())),
     );
     inputs.insert(
-        selector.id,
+        selector.id(),
         Value::Host(HostTensor::f32(
             vec![m],
             route.iter().map(|&expert| expert as f32).collect(),
@@ -568,7 +572,7 @@ fn packed_indexed_linear_matches_the_per_row_expert_product() {
 struct Allocations(Vec<usize>);
 
 impl poot_eval::observer::EvalObserver for Allocations {
-    fn allocation(&mut self, _eqn: usize, _out: usize, _dtype: DType, bytes: usize) {
+    fn allocation(&mut self, _eqn: usize, _out: ValueId, _dtype: DType, bytes: usize) {
         self.0.push(bytes);
     }
 }
@@ -616,11 +620,11 @@ fn the_indexed_oracle_decodes_only_the_selected_experts() {
     let ids = b.constant("ids", TensorType::f32(vec![m]));
     let y = b.indexed_matmul(x, w, ids);
     let dense = b.finish(y);
-    let dense_inputs: HashMap<usize, Value> = [
-        (x.id, HostTensor::f32(vec![m, k], x_data.clone())),
-        (w.id, HostTensor::f32(vec![experts.len(), k, out], table)),
+    let dense_inputs: HashMap<ValueId, Value> = [
+        (x.id(), HostTensor::f32(vec![m, k], x_data.clone())),
+        (w.id(), HostTensor::f32(vec![experts.len(), k, out], table)),
         (
-            ids.id,
+            ids.id(),
             HostTensor::f32(vec![m], route.iter().map(|&e| e as f32).collect()),
         ),
     ]
@@ -697,26 +701,29 @@ fn transposed_packed_contraction_fused_and_unfused_compositions_match()
         let weight = plan.equation(
             OpKind::PackedDequant { descriptor },
             vec![
-                Operand::Value(weight_source.id),
-                Operand::Value(scale_source.id),
+                Operand::Value(weight_source.id()),
+                Operand::Value(scale_source.id()),
             ],
         )?;
         let activation_t = plan.equation(
             OpKind::Transpose { perm: vec![1, 0] },
-            vec![Operand::Value(activation.id)],
+            vec![Operand::Value(activation.id())],
         )?;
         let product = plan.equation(
             OpKind::MatMul,
-            vec![Operand::Value(weight.id), Operand::Value(activation_t.id)],
+            vec![
+                Operand::Value(weight.id()),
+                Operand::Value(activation_t.id()),
+            ],
         )?;
         let y = plan.equation(
             OpKind::Transpose { perm: vec![1, 0] },
-            vec![Operand::Value(product.id)],
+            vec![Operand::Value(product.id())],
         )?;
         plan.declare_result(y)?;
         let mut prepared = b.preflight_append(plan)?;
-        let id = b.commit_append(&mut prepared)?;
-        let graph = b.finish(Traced { id });
+        let committed = b.commit_append(&mut prepared)?;
+        let graph = b.finish(committed);
 
         let fused = prepare_packed_dequant_production(&graph).unwrap();
         assert!(
@@ -735,7 +742,7 @@ fn transposed_packed_contraction_fused_and_unfused_compositions_match()
 
         let mut inputs = HashMap::new();
         inputs.insert(
-            activation.id,
+            activation.id(),
             Value::Host(HostTensor::f32(
                 activation_shape.clone(),
                 (0..activation_shape.iter().product())
@@ -824,7 +831,7 @@ fn blocked_packed_contraction_fused_and_unfused_compositions_match()
         ));
         let mut inputs = HashMap::new();
         inputs.insert(
-            activation.id,
+            activation.id(),
             Value::Host(HostTensor::f32(
                 activation_shape.clone(),
                 (0..activation_shape.iter().product())
@@ -917,7 +924,7 @@ fn packed_dequant_production_rejects_valid_preexisting_candidate() -> Result<(),
     assert!(weight.same_owner(&scale));
     let inputs = HashMap::from([
         (
-            activation.id,
+            activation.id(),
             Value::Host(HostTensor::f32(
                 vec![2, 35],
                 (0..70).map(|index| index as f32 / 17.0).collect(),
@@ -953,13 +960,13 @@ fn contract_through_the_oracle(
         TensorType::f32(activation.shape().to_vec()),
     );
     let mut plan = b.append_plan(0);
-    let mut operands = vec![Operand::Value(activation_value.id)];
+    let mut operands = vec![Operand::Value(activation_value.id())];
     let mut source_ids = Vec::new();
     for (name, ty) in packed_source_constants(label, weight) {
         let role = name.role();
         let input = plan.input(name, ty, poot_graph_ir::Storage::Const)?;
-        source_ids.push((input.id, role));
-        operands.push(Operand::Value(input.id));
+        source_ids.push((input.id(), role));
+        operands.push(Operand::Value(input.id()));
     }
     let output = plan.equation(
         OpKind::PackedContraction {
@@ -970,11 +977,11 @@ fn contract_through_the_oracle(
     )?;
     plan.declare_result(output)?;
     let mut prepared = b.preflight_append(plan)?;
-    let id = b.commit_append(&mut prepared)?;
-    let graph = b.finish(Traced { id });
+    let committed = b.commit_append(&mut prepared)?;
+    let graph = b.finish(committed);
 
     let mut inputs = HashMap::new();
-    inputs.insert(activation_value.id, Value::Host(activation));
+    inputs.insert(activation_value.id(), Value::Host(activation));
     for (source_id, role) in &source_ids {
         inputs.insert(
             *source_id,
@@ -1029,8 +1036,11 @@ fn packed_dequant_oracle_matches_decode_blocks_per_row() -> Result<(), BuilderAp
         }
         let weight = PackedWeight::try_new(format, [out, k]).unwrap();
         let owner = Arc::new(
-            PackedPayload::try_new(weight, [(SourceRole::Blocks, Arc::from(bytes.as_slice()))])
-                .unwrap(),
+            PackedPayload::try_new(
+                weight,
+                [(SourceRole::Blocks, StoredBytes::from(bytes.to_vec()))],
+            )
+            .unwrap(),
         );
 
         let mut identity = vec![0.0f32; k * k];
@@ -1850,7 +1860,7 @@ fn packed_dequant_oracle_matches_the_539a_literal_reference_for_every_scheme()
                 weight,
                 case.sources
                     .iter()
-                    .map(|(role, bytes)| (*role, Arc::<[u8]>::from(bytes.as_slice()))),
+                    .map(|(role, bytes)| (*role, StoredBytes::from(bytes.to_vec()))),
             )
             .unwrap_or_else(|error| {
                 panic!("{}: PackedPayload::try_new failed: {error}", case.label)
@@ -1917,7 +1927,10 @@ fn gguf_payload(format: WeightFormat, shape: [usize; 2]) -> Arc<PackedPayload> {
             }
         }
     }
-    Arc::new(PackedPayload::try_new(descriptor, [(SourceRole::Blocks, Arc::from(bytes))]).unwrap())
+    Arc::new(
+        PackedPayload::try_new(descriptor, [(SourceRole::Blocks, StoredBytes::from(bytes))])
+            .unwrap(),
+    )
 }
 
 /// SC-003 (dquant.md R5): the CPU oracle decodes each weight row once, so its decode work is
@@ -1981,7 +1994,7 @@ fn packed_oracle_decode_work_is_linear_in_k() -> Result<(), BuilderAppendError> 
             let graph = prepare_packed_dequant_production(&b.finish(output)).unwrap();
             let mut inputs = packed_inputs(&graph, &owner);
             inputs.insert(
-                activation.id,
+                activation.id(),
                 Value::Host(HostTensor::f32(vec![2, k], vec![0.5; 2 * k])),
             );
             let (result, contraction_bytes) = allocated_bytes(|| {
@@ -2056,7 +2069,7 @@ fn packed_contraction_oracle_decodes_gguf_rows_bit_exactly() -> Result<(), Build
             .collect();
         let mut inputs = HashMap::new();
         inputs.insert(
-            activation.id,
+            activation.id(),
             Value::Host(HostTensor::f32(activation_shape.clone(), x.clone())),
         );
         for graph_input in &graph.inputs {
@@ -2133,7 +2146,8 @@ fn packed_row_gather_oracle_decodes_only_the_gathered_rows() {
         }
     }
     let owner = Arc::new(
-        PackedPayload::try_new(descriptor, [(SourceRole::Blocks, Arc::from(bytes))]).unwrap(),
+        PackedPayload::try_new(descriptor, [(SourceRole::Blocks, StoredBytes::from(bytes))])
+            .unwrap(),
     );
     let b = Builder::new();
     let ids = b.slot(Slot::Token, TensorType::f32(vec![3]));
@@ -2146,7 +2160,7 @@ fn packed_row_gather_oracle_decodes_only_the_gathered_rows() {
             ..
         }]
     ));
-    let mut inputs: HashMap<usize, Value> = HashMap::new();
+    let mut inputs: HashMap<ValueId, Value> = HashMap::new();
     for &id in &graph.inputs {
         if let Some(source) = graph
             .meta(id)
@@ -2162,7 +2176,7 @@ fn packed_row_gather_oracle_decodes_only_the_gathered_rows() {
     }
     let wanted = [32_999usize, 0, 250];
     inputs.insert(
-        ids.id,
+        ids.id(),
         HostTensor::f32(vec![3], wanted.iter().map(|&r| r as f32).collect()).into(),
     );
     let Value::Host(got) = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -2184,7 +2198,7 @@ fn packed_row_gather_oracle_decodes_only_the_gathered_rows() {
         }
     }
     inputs.insert(
-        ids.id,
+        ids.id(),
         HostTensor::f32(vec![3], vec![0.0, rows as f32, 1.0]).into(),
     );
     assert!(matches!(
@@ -2194,7 +2208,10 @@ fn packed_row_gather_oracle_decodes_only_the_gathered_rows() {
         }))
     )); // Review minor 12: a NaN or fractional id names no row and is refused, never rounded.
     for bad in [f32::NAN, 1.5] {
-        inputs.insert(ids.id, HostTensor::f32(vec![3], vec![0.0, bad, 1.0]).into());
+        inputs.insert(
+            ids.id(),
+            HostTensor::f32(vec![3], vec![0.0, bad, 1.0]).into(),
+        );
         assert!(
             matches!(
                 eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).map(|r| r.output),
@@ -2223,10 +2240,13 @@ fn distinct_row_q8_0(rows: usize, k: usize) -> Arc<PackedPayload> {
             bytes.extend_from_slice(&block);
         }
     }
-    Arc::new(PackedPayload::try_new(descriptor, [(SourceRole::Blocks, Arc::from(bytes))]).unwrap())
+    Arc::new(
+        PackedPayload::try_new(descriptor, [(SourceRole::Blocks, StoredBytes::from(bytes))])
+            .unwrap(),
+    )
 }
 
-fn bind_carriers(graph: &Graph, owner: &Arc<PackedPayload>) -> HashMap<usize, Value> {
+fn bind_carriers(graph: &Graph, owner: &Arc<PackedPayload>) -> HashMap<ValueId, Value> {
     graph
         .inputs
         .iter()
@@ -2267,7 +2287,10 @@ fn a_packed_projection_past_the_oracle_cap_evaluates() {
     );
     let activation: Vec<f32> = (0..k).map(|i| ((i % 17) as f32 - 8.0) * 0.125).collect();
     let mut inputs = bind_carriers(&graph, &owner);
-    inputs.insert(x.id, HostTensor::f32(vec![1, k], activation.clone()).into());
+    inputs.insert(
+        x.id(),
+        HostTensor::f32(vec![1, k], activation.clone()).into(),
+    );
     let Value::Host(got) = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
         .map(|r| r.output)
         .expect("the projection is uncapped")
@@ -2337,7 +2360,7 @@ fn packed_contraction_above_budget_is_refused_unbounded_evaluates() -> Result<()
     let scale = PackedComponentRef::new(Arc::clone(&owner), SourceRole::Planar(OperandRole::Scale));
     let inputs = HashMap::from([
         (
-            activation.id,
+            activation.id(),
             Value::Host(HostTensor::f32(
                 vec![2, 35],
                 (0..70).map(|index| index as f32 / 17.0).collect(),

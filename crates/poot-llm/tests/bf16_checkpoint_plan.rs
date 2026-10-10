@@ -88,10 +88,10 @@ fn bf16_matmul(g: &Graph, eqn: &Eqn) -> bool {
 
 /// The BF16 consts of `g`.
 fn bf16_consts(g: &Graph) -> BTreeSet<ValueId> {
-    (0..g.values.len())
-        .filter(|&id| {
-            g.values[id].storage == Storage::Const && g.values[id].aval.dtype == DType::BF16
-        })
+    g.values
+        .iter_enumerated()
+        .filter(|(_, meta)| meta.storage == Storage::Const && meta.aval.dtype == DType::BF16)
+        .map(|(id, _)| id)
         .collect()
 }
 

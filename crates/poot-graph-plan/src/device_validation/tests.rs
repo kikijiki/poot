@@ -74,7 +74,7 @@ fn device_witness_admits_spec_recipes() {
             .iter()
             .map(|source| source.value)
             .collect::<Vec<_>>(),
-        vec![nonfinite.id, nonpositive.id, bounds.id]
+        vec![nonfinite.id(), nonpositive.id(), bounds.id()]
     );
 }
 
@@ -151,13 +151,13 @@ fn device_witness_rejects_noncanonical_heads() {
         )
         .unwrap();
         let (id, value, reason) = rejection(admit_device_witnesses(&graph));
-        assert_eq!((id, value), (ValidationId(9), witness.id), "{name}");
+        assert_eq!((id, value), (ValidationId(9), witness.id()), "{name}");
         let blame = if name == "graph input" {
-            input.id
+            input.id()
         } else {
-            h.id
+            h.id()
         };
-        assert!(expect(&reason, witness.id, blame), "{name}: {reason:?}");
+        assert!(expect(&reason, witness.id(), blame), "{name}: {reason:?}");
     }
 }
 
@@ -182,8 +182,9 @@ fn device_witness_rejects_a_narrow_intermediate() {
     let narrow = |shape: Vec<usize>| {
         ValueMeta::new(TensorType::new(shape, DType::BF16), Storage::Device, None)
     };
+    let (x, mid, out) = (ValueId::new(0), ValueId::new(1), ValueId::new(2));
     let graph: Graph<NoValidations> = Graph {
-        values: vec![
+        values: [
             ValueMeta::new(
                 TensorType::new(vec![4], DType::BF16),
                 Storage::Const,
@@ -191,34 +192,36 @@ fn device_witness_rejects_a_narrow_intermediate() {
             ),
             narrow(vec![4]),
             narrow(vec![4]),
-        ],
-        inputs: vec![0],
-        consts: vec![0],
+        ]
+        .into_iter()
+        .collect(),
+        inputs: vec![x],
+        consts: vec![x],
         slots: Vec::new(),
         eqns: vec![
             Eqn {
                 op: OpKind::Binary(BinOp::Ge),
-                inputs: vec![Operand::Value(0), Operand::Lit(Scalar::F32(0.0))],
-                out: 1,
+                inputs: vec![Operand::Value(x), Operand::Lit(Scalar::F32(0.0))],
+                out: mid,
                 layer: None,
             },
             Eqn {
                 op: OpKind::Binary(BinOp::Mul),
-                inputs: vec![Operand::Value(1), Operand::Value(1)],
-                out: 2,
+                inputs: vec![Operand::Value(mid), Operand::Value(mid)],
+                out,
                 layer: None,
             },
         ],
-        output: 2,
+        output: out,
         validations: NoValidations,
         exports: Vec::new(),
         state: Vec::new(),
     };
     let mut walk = WitnessWalk::new(&graph);
     assert_eq!(
-        walk.bound(2),
+        walk.bound(out),
         Err(DeviceWitnessRejection::Dtype {
-            value: 2,
+            value: out,
             dtype: DType::BF16
         })
     );
@@ -239,7 +242,7 @@ fn device_witness_reports_the_first_declaration() {
     )
     .unwrap();
     let (id, value, _) = rejection(admit_device_witnesses(&graph));
-    assert_eq!((id, value), (ValidationId(5), second.id));
+    assert_eq!((id, value), (ValidationId(5), second.id()));
 }
 
 #[test]
@@ -263,7 +266,7 @@ fn device_witness_admits_the_selector_bounds_chain() {
     // The walk stops at the unsigned comparison, so the Gather that would produce the raw ids in a real
     // router is never classified. Bound: one flag per lane summed over 4 lanes.
     let mut walk = WitnessWalk::new(&graph);
-    assert_eq!(walk.bound(guard.witness.id).unwrap(), 4);
+    assert_eq!(walk.bound(guard.witness.id()).unwrap(), 4);
 }
 
 #[test]
@@ -283,11 +286,11 @@ fn device_witness_rejects_the_chain_above_the_exact_bound() {
 
     let (id, value, reason) = rejection(admit_device_witnesses(&graph));
     assert_eq!(id, ValidationId(0));
-    assert_eq!(value, guard.witness.id);
+    assert_eq!(value, guard.witness.id());
     assert_eq!(
         reason,
         DeviceWitnessRejection::Bound {
-            value: guard.witness.id,
+            value: guard.witness.id(),
             bound: lanes as u64,
         }
     );

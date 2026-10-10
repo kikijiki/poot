@@ -43,7 +43,7 @@
 //! owns, so a graph of thousands of dispatches costs a handful of allocations. The graph retains every
 //! buffer it binds and every pipeline it references (a freed buffer a captured dispatch references would
 //! be a use-after-free, card 126). Descriptor sets are baked at record time and never updated afterward;
-//! per-replay input data overwrites the same bound buffers in place via [`DeviceBuffer::write_bytes`]
+//! per-replay input data overwrites the same bound buffers in place via [`DeviceBuffer::write_with`]
 //! (FR-009's persistently-mapped host-visible slot buffers). A dispatch is told each buffer's own element
 //! count ([`Binding::elems`]), never the allocation's capacity.
 //!

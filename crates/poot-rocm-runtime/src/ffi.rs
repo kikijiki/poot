@@ -233,6 +233,15 @@ fnptr!(
     *const bindings::hsa_signal_t,
     bindings::hsa_signal_t
 );
+// Zero-fill of a fresh allocation on the device: `hsa_amd_memory_fill(ptr, value, count)` writes `count`
+// 32-bit words of `value`, so a new buffer is zeroed without a host buffer and a DMA.
+fnptr!(
+    HsaAmdMemoryFill,
+    bindings::hsa_status_t,
+    *mut c_void,
+    u32,
+    usize
+);
 fnptr!(
     HsaAmdMemoryLock,
     bindings::hsa_status_t,
@@ -347,6 +356,7 @@ declared_as! {
     HsaAmdMemoryPoolAllocate = hsa_amd_memory_pool_allocate;
     HsaAmdMemoryPoolFree = hsa_amd_memory_pool_free;
     HsaAmdMemoryAsyncCopy = hsa_amd_memory_async_copy;
+    HsaAmdMemoryFill = hsa_amd_memory_fill;
     HsaAmdMemoryLock = hsa_amd_memory_lock;
     HsaAmdMemoryUnlock = hsa_amd_memory_unlock;
     HsaCodeObjectReaderCreateFromMemory = hsa_code_object_reader_create_from_memory;
@@ -406,6 +416,7 @@ pub struct Funcs {
     pub hsa_amd_memory_pool_allocate: HsaAmdMemoryPoolAllocate,
     pub hsa_amd_memory_pool_free: HsaAmdMemoryPoolFree,
     pub hsa_amd_memory_async_copy: HsaAmdMemoryAsyncCopy,
+    pub hsa_amd_memory_fill: HsaAmdMemoryFill,
     pub hsa_amd_memory_lock: HsaAmdMemoryLock,
     pub hsa_amd_memory_unlock: HsaAmdMemoryUnlock,
     // code-object + executable + symbols + signals
@@ -464,6 +475,7 @@ impl Funcs {
             hsa_amd_memory_pool_allocate: sym!(hsa_amd_memory_pool_allocate),
             hsa_amd_memory_pool_free: sym!(hsa_amd_memory_pool_free),
             hsa_amd_memory_async_copy: sym!(hsa_amd_memory_async_copy),
+            hsa_amd_memory_fill: sym!(hsa_amd_memory_fill),
             hsa_amd_memory_lock: sym!(hsa_amd_memory_lock),
             hsa_amd_memory_unlock: sym!(hsa_amd_memory_unlock),
             hsa_code_object_reader_create_from_memory: sym!(

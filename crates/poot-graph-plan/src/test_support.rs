@@ -34,7 +34,7 @@ pub(crate) fn finish_with_state_and_validations(
             .map(|&(id, name, value)| ValidationOutput {
                 id,
                 name: name.to_owned(),
-                value: value.id,
+                value: value.id(),
             })
             .collect(),
     );

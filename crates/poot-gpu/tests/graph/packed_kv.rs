@@ -114,11 +114,17 @@ fn decode_gemv_random_shapes_gpu_matches_cpu() {
         let x = b.constant("x", TensorType::f32(vec![1, 1, k]));
         let w = b.constant("w", TensorType::f32(vec![k, n]));
         let mut inputs = HashMap::new();
-        inputs.insert(x.id, HostTensor::f32(vec![1, 1, k], fill(seed * 7 + 1, k)));
-        inputs.insert(w.id, HostTensor::f32(vec![k, n], fill(seed * 7 + 2, k * n)));
+        inputs.insert(
+            x.id(),
+            HostTensor::f32(vec![1, 1, k], fill(seed * 7 + 1, k)),
+        );
+        inputs.insert(
+            w.id(),
+            HostTensor::f32(vec![k, n], fill(seed * 7 + 2, k * n)),
+        );
         let out = if with_bias {
             let bias = b.constant("bias", TensorType::f32(vec![n]));
-            inputs.insert(bias.id, HostTensor::f32(vec![n], fill(seed * 7 + 3, n)));
+            inputs.insert(bias.id(), HostTensor::f32(vec![n], fill(seed * 7 + 3, n)));
             poot_graph_ir::ops::linear(&b, x, w, Some(bias))
         } else {
             b.matmul(x, w)
@@ -233,13 +239,16 @@ fn batched_decode_gemv_gpu_matches_cpu() {
         let w = b.constant("w", TensorType::f32(vec![k, n]));
         let mut inputs = HashMap::new();
         inputs.insert(
-            x.id,
+            x.id(),
             HostTensor::f32(vec![bsz, 1, k], fill(seed * 7 + 1, bsz * k)),
         );
-        inputs.insert(w.id, HostTensor::f32(vec![k, n], fill(seed * 7 + 2, k * n)));
+        inputs.insert(
+            w.id(),
+            HostTensor::f32(vec![k, n], fill(seed * 7 + 2, k * n)),
+        );
         let out = if with_bias {
             let bias = b.constant("bias", TensorType::f32(vec![n]));
-            inputs.insert(bias.id, HostTensor::f32(vec![n], fill(seed * 7 + 3, n)));
+            inputs.insert(bias.id(), HostTensor::f32(vec![n], fill(seed * 7 + 3, n)));
             poot_graph_ir::ops::linear(&b, x, w, Some(bias))
         } else {
             b.matmul(x, w)

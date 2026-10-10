@@ -1335,7 +1335,7 @@ fn timed_out_dma_download_leaves_the_caller_buffer_to_the_host() {
 }
 
 /// Card 602: the staged DMA path round-trips every byte. On this APU production uses host writes, so
-/// this is the only device run of `dma_upload`/`dma_download`; the upload is also checked through the
+/// this is the only device run of the upload ring's `ring_copy` and of `dma_download`; the upload is also checked through the
 /// host-visible allocation, independently of the download.
 #[test]
 fn staged_dma_transfers_round_trip_every_byte() {
@@ -1346,8 +1346,9 @@ fn staged_dma_transfers_round_trip_every_byte() {
     let buffer = ctx.allocate_kernarg(bytes.len()).expect("allocate");
 
     // SAFETY: `buffer` is a live allocation of `bytes.len()` bytes.
-    unsafe { ctx.dma_upload(bytes.as_ptr(), buffer.alloc.as_ptr(), bytes.len()) }
-        .expect("dma_upload");
+    unsafe { ctx.ring_copy(bytes.as_ptr(), buffer.alloc.as_ptr(), bytes.len()) }
+        .expect("ring_copy");
+    ctx.drain_uploads("test").expect("drain");
     if ctx.upload_strategy == UploadStrategy::HostWrite {
         // SAFETY: under `HostWrite` the allocation is host-visible, `bytes.len()` bytes long, and fully
         // written by the completed upload.
@@ -1361,6 +1362,105 @@ fn staged_dma_transfers_round_trip_every_byte() {
         .expect("dma_download");
     assert_eq!(first_diff(&back, &bytes), None, "downloaded bytes differ");
     assert!(!ctx.is_poisoned());
+}
+
+/// POOT-1100: `allocate` hands back zeroed memory without a host buffer of zeros: the device fills it
+/// (`hsa_amd_memory_fill`) and the tail of fewer than four bytes goes through the ring. Each round writes a
+/// non-zero pattern over a whole device-pool buffer and frees it, so the next allocation of the same size
+/// can land on the dirtied memory; every allocation, of an odd byte length too (three bytes of tail), must
+/// read back all zero.
+/// Mutation: make `zero_fill` return before the `hsa_amd_memory_fill` call; whether this goes red depends on
+/// the pool handing back dirtied memory (recorded in the POOT-1100 report).
+#[test]
+fn allocate_returns_zeroed_device_memory_after_dirty_reuse() {
+    let Some(ctx) = open_context_or_skip("allocate_returns_zeroed_device_memory_after_dirty_reuse")
+    else {
+        return;
+    };
+    for (storage, elems) in [
+        (BufferStorage::i32(), 1 << 20),
+        (BufferStorage::f16(), 1_000_003),
+        (BufferStorage::i32(), 1),
+    ] {
+        for round in 0..6 {
+            let buffer = ctx
+                .allocate(BufferRole::Weight, storage, elems)
+                .expect("allocate");
+            let mut bytes = vec![0xFFu8; buffer.byte_capacity()];
+            ctx.read_bytes(&buffer, &mut bytes).expect("read");
+            assert_eq!(
+                first_diff(&bytes, &vec![0u8; bytes.len()]),
+                None,
+                "{storage:?} x {elems}, round {round}: a fresh allocation is zero"
+            );
+            write_host_bytes(&ctx, &buffer, 0, &vec![0xA5u8; bytes.len()])
+                .expect("dirty the buffer");
+            ctx.synchronize().expect("synchronize");
+        }
+    }
+}
+
+/// POOT-1100 review: a coarse write returns with its copies still in flight, so freeing the buffer and
+/// allocating again at once must not let a stale copy overwrite the new allocation's zeros. Each round writes a
+/// buffer of four ring chunks (so copies are queued behind one another), drops it with NO synchronize, allocates
+/// the same size straight away and reads it back: all zero. `RocmAlloc` frees only after the ring's copies are
+/// proven complete, and `zero_fill` drains the ring ranges it fills.
+/// Mutation: make `HsaRuntimeOwner::await_uploads` return `true` without waiting and drop the drain in
+/// `zero_fill`; a stale copy lands after the fill and a round reads back the pattern (recorded in the report).
+#[test]
+fn a_freed_buffer_with_copies_in_flight_does_not_dirty_the_next_allocation() {
+    let Some(ctx) = open_context_or_skip(
+        "a_freed_buffer_with_copies_in_flight_does_not_dirty_the_next_allocation",
+    ) else {
+        return;
+    };
+    let elems = 4 * UPLOAD_CHUNK_BYTES / 4;
+    for round in 0..8 {
+        let buffer = ctx
+            .allocate(BufferRole::Weight, BufferStorage::i32(), elems)
+            .expect("allocate");
+        ctx.write_with(&buffer, 0, buffer.byte_capacity(), &mut |_, out| {
+            out.fill(0xA5)
+        })
+        .expect("write");
+        drop(buffer);
+        let fresh = ctx
+            .allocate(BufferRole::Weight, BufferStorage::i32(), elems)
+            .expect("allocate again");
+        let mut bytes = vec![0xFFu8; fresh.byte_capacity()];
+        ctx.read_bytes(&fresh, &mut bytes).expect("read");
+        assert_eq!(
+            bytes.iter().position(|&b| b != 0),
+            None,
+            "round {round}: the reallocated buffer holds a stale copy"
+        );
+    }
+}
+
+/// POOT-1100 review: a ring slot is pinned at the size its first chunk asks for, not 64 MiB: a 100-byte write
+/// pins 64 KiB, and a 1 MiB write grows the slot to 1 MiB, never to a whole chunk.
+/// Mutation: make `slot_bytes` return `UPLOAD_CHUNK_BYTES`; the first assertion goes red.
+#[test]
+fn a_small_write_pins_a_small_ring_slot() {
+    let Some(ctx) = open_context_or_skip("a_small_write_pins_a_small_ring_slot") else {
+        return;
+    };
+    let buffer = ctx
+        .allocate(BufferRole::Weight, BufferStorage::i32(), 1 << 20)
+        .expect("allocate");
+    write_host_bytes(&ctx, &buffer, 0, &[7u8; 100]).expect("write");
+    ctx.drain_uploads("test").expect("drain");
+    assert_eq!(ctx.lock_ring().pinned_bytes(), 64 << 10);
+    write_host_bytes(&ctx, &buffer, 0, &vec![9u8; 1 << 20]).expect("write");
+    ctx.drain_uploads("test").expect("drain");
+    let pinned = ctx.lock_ring().pinned_bytes();
+    assert!(
+        (1 << 20..UPLOAD_CHUNK_BYTES).contains(&pinned),
+        "pinned {pinned}"
+    );
+    let mut back = vec![0u8; 1 << 20];
+    ctx.read_bytes(&buffer, &mut back).expect("read");
+    assert!(back.iter().all(|&b| b == 9));
 }
 
 /// A completion signal that drops while the host is waiting must wake the wait promptly. On gfx1151
@@ -2453,7 +2553,7 @@ fn bf16_round_trips_through_the_storage_typed_primitives_with_exactly_elems_time
     let buf = ctx
         .allocate_zeroed("test", elems, BufferStorage::bf16(), BufferRole::Activation)
         .expect("bf16 allocation");
-    ctx.write_bytes(&buf, 0, &bytes).expect("write_bytes");
+    write_host_bytes(&ctx, &buf, 0, &bytes).expect("write_with");
 
     let mut got = vec![0u8; elems * 2];
     ctx.read_bytes(&buf, &mut got).expect("read_bytes");
@@ -2663,7 +2763,7 @@ fn dispatch_refuses_malformed_geometry_before_reserving_a_slot() {
 
 /// POOT-1074: a write at a non-zero byte offset lands there and leaves its neighbours intact; an offset
 /// outside the buffer and an overflowing one are typed refusals that write nothing.
-/// Mutation: ignore `range.byte_offset` in `RocmContext::write_bytes`; the neighbour check goes red.
+/// Mutation: ignore `range.byte_offset` in `RocmContext::write_with`; the neighbour check goes red.
 #[test]
 fn a_write_at_an_offset_leaves_its_neighbours_intact_and_bad_ranges_are_typed() {
     let Some(ctx) = open_context_or_skip(
@@ -2676,14 +2776,13 @@ fn a_write_at_an_offset_leaves_its_neighbours_intact_and_bad_ranges_are_typed() 
     let buf = ctx
         .allocate_zeroed("test", 4, BufferStorage::f32(), BufferRole::State)
         .expect("allocation");
-    ctx.write_bytes(&buf, 0, &words(&[1.0, 2.0, 3.0, 4.0]))
-        .unwrap();
-    ctx.write_bytes(&buf, 4, &words(&[9.0, 9.0])).unwrap();
+    write_host_bytes(&ctx, &buf, 0, &words(&[1.0, 2.0, 3.0, 4.0])).unwrap();
+    write_host_bytes(&ctx, &buf, 4, &words(&[9.0, 9.0])).unwrap();
     let mut got = vec![0u8; 16];
     ctx.read_bytes(&buf, &mut got).unwrap();
     assert_eq!(got, words(&[1.0, 9.0, 9.0, 4.0]), "only bytes 4..12 change");
     for (offset, len) in [(16, 4), (12, 8), (usize::MAX, 4)] {
-        let error = ctx.write_bytes(&buf, offset, &vec![0u8; len]).unwrap_err();
+        let error = write_host_bytes(&ctx, &buf, offset, &vec![0u8; len]).unwrap_err();
         assert!(
             matches!(
                 error,
@@ -2766,4 +2865,17 @@ fn ring_writer_gives_each_timed_packet_its_own_completion_signal() {
     }
     let handles: Vec<u64> = ring.iter().map(|p| p.completion_signal.handle).collect();
     assert_eq!(handles, [0, 0, 13]);
+}
+
+/// Write `bytes` at `offset` of `buf` through the context's one write primitive, `write_with` (a test helper:
+/// the contexts have no slice-taking write of their own).
+fn write_host_bytes(
+    ctx: &RocmContext,
+    buf: &RocmBuffer,
+    offset: usize,
+    bytes: &[u8],
+) -> Result<(), RocmError> {
+    ctx.write_with(buf, offset, bytes.len(), &mut |range, out| {
+        out.copy_from_slice(&bytes[range.start - offset..range.end - offset]);
+    })
 }

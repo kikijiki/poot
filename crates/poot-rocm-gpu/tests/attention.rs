@@ -69,7 +69,7 @@ fn case(
         ("v", vec![batch, hkv, lk, d], fill(3, batch * hkv * lk * d)),
         ("m", vec![batch, 1, lq, lk], mask),
     ];
-    let ids = [q.id, k.id, v.id, m.id];
+    let ids = [q.id(), k.id(), v.id(), m.id()];
     Case {
         graph: b.finish(out),
         ids,
@@ -233,7 +233,7 @@ fn gemma2_softcap_decode_matches_the_oracle_on_rocm() {
         ("v", vec![1, hkv, lk, d], fill(3, hkv * lk * d)),
         ("m", vec![1, 1, 1, lk], mask),
     ];
-    let ids = [q.id, k.id, v.id, m.id];
+    let ids = [q.id(), k.id(), v.id(), m.id()];
     check(
         "gemma2 softcap decode",
         &Case {
@@ -276,7 +276,7 @@ fn deepseek_v2_mla_split_key_decode_matches_the_oracle_on_rocm() {
         ("v", vec![1, hq, lk, dv], fill(4, hq * lk * dv)),
         ("m", vec![1, 1, 1, lk], mask),
     ];
-    let ids = [q.id, k_nope.id, k_pe.id, v.id, m.id];
+    let ids = [q.id(), k_nope.id(), k_pe.id(), v.id(), m.id()];
     let graph = b.finish(out);
     let Some(device) = open_or_skip(DeviceBackend::Rocm, RocmDevice::new()) else {
         return;

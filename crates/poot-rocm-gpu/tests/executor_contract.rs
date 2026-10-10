@@ -16,6 +16,7 @@ use poot_graph_ir::{BinOp, Builder, Graph, StateRole, TensorType};
 use poot_graph_plan::{ImportedKernel, Submission};
 use poot_kernel_ir::Body;
 use poot_models::model::{LogitRows, Phase};
+use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_rocm_gpu::RocmBuffer;
 use poot_rocm_gpu::device::RocmDevice;
@@ -31,6 +32,23 @@ const CAP: usize = 8;
 
 fn require_rocm() -> Option<RocmDevice> {
     open_or_skip(DeviceBackend::Rocm, RocmDevice::new())
+}
+
+/// POOT-1100 LP-3 (rocm): `Device::write_with` puts every byte at its address across upload-ring chunks. A
+/// device buffer of two `UPLOAD_CHUNK_BYTES` and an odd tail is written whole and again from an
+/// unaligned offset, then read back.
+/// Mutation: in `RocmContext::ring_write` copy chunk `k` to `dst + done - 1`; the read-back differs and this
+/// row goes red.
+#[test]
+fn lp3_rocm_write_with_is_exact_across_ring_chunks() {
+    let Some(mut device) = require_rocm() else {
+        return;
+    };
+    poot_executor_parity::write_probe::chunked_write_is_exact(
+        &mut device,
+        poot_rocm_runtime::UPLOAD_CHUNK_BYTES,
+        3,
+    );
 }
 
 const VOCAB: usize = 32;
@@ -79,7 +97,7 @@ fn store_for(g: &Graph) -> Arc<WeightStore> {
             (h ^ c as u64).wrapping_mul(1099511628211)
         });
         let bytes: Vec<u8> = fill(n, seed).iter().flat_map(|v| v.to_le_bytes()).collect();
-        let dense = DenseWeight::try_new(DType::F32, shape, Arc::from(bytes)).unwrap();
+        let dense = DenseWeight::try_new(DType::F32, shape, StoredBytes::from(bytes)).unwrap();
         builder.insert(name, WeightEntry::Dense(dense)).unwrap();
     }
     Arc::new(builder.build())
@@ -482,7 +500,7 @@ fn two_phase_state_commit_matches_the_oracle_after_four_steps_on_rocm() {
                 DenseWeight::try_new(
                     DType::F32,
                     vec![4],
-                    Arc::from(
+                    StoredBytes::from(
                         bias_value
                             .iter()
                             .flat_map(|v| v.to_le_bytes())
@@ -578,11 +596,9 @@ fn copy_round_trips_every_narrow_element_width_with_no_sentinel_corruption() {
         let dst_sentinel = device
             .allocate(BufferRole::Activation, storage, elems)
             .unwrap_or_else(|e| panic!("{name}: allocate dst_sentinel: {e}"));
-        device
-            .write(&src, 0, &src_data)
+        poot_executor::write_slice(&mut device, &src, 0, &src_data)
             .unwrap_or_else(|e| panic!("{name}: write src: {e}"));
-        device
-            .write(&dst_sentinel, 0, &sentinel_pattern)
+        poot_executor::write_slice(&mut device, &dst_sentinel, 0, &sentinel_pattern)
             .unwrap_or_else(|e| panic!("{name}: write dst_sentinel: {e}"));
         device.begin(Submission::Replay).unwrap();
         device
@@ -659,9 +675,7 @@ fn a_timed_out_dispatch_through_the_device_trait_retains_its_allocations_and_poi
         .unwrap();
     // 4e9 dependent-chain iterations: far beyond the 2s bound on any GPU this box runs, while still
     // finite (the dispatch really does complete, eventually, if left alone).
-    device
-        .write(&n_buf, 0, &4_000_000_000u32.to_le_bytes())
-        .unwrap();
+    poot_executor::write_slice(&mut device, &n_buf, 0, &4_000_000_000u32.to_le_bytes()).unwrap();
     let out_buf: RocmBuffer = device
         .allocate(BufferRole::Activation, BufferStorage::f32(), 1)
         .unwrap();
@@ -810,8 +824,12 @@ fn i32_slot_gather_variants_compiled_match_cpu_oracle_on_rocm() {
                 .insert(
                     name.as_str(),
                     WeightEntry::Dense(
-                        DenseWeight::try_new(DType::F32, tensor.shape().to_vec(), Arc::from(bytes))
-                            .map_err(|e| format!("{name}: {e:?}"))?,
+                        DenseWeight::try_new(
+                            DType::F32,
+                            tensor.shape().to_vec(),
+                            StoredBytes::from(bytes),
+                        )
+                        .map_err(|e| format!("{name}: {e:?}"))?,
                     ),
                 )
                 .map_err(|e| format!("{name}: {e:?}"))?;
@@ -825,7 +843,7 @@ fn i32_slot_gather_variants_compiled_match_cpu_oracle_on_rocm() {
                 .insert(
                     format!("seed_{i}").as_str(),
                     WeightEntry::Dense(
-                        DenseWeight::try_new(DType::F32, shape, Arc::from(bytes))
+                        DenseWeight::try_new(DType::F32, shape, StoredBytes::from(bytes))
                             .map_err(|e| format!("seed_{i}: {e:?}"))?,
                     ),
                 )
@@ -941,7 +959,7 @@ fn sliding_window_mask_from_pos_rocm_matches_cpu() {
     );
     let mask = poot_graph_ir::ops::causal_mask_from_pos(&b, pos, l, Some(window));
     let out = poot_graph_ir::ops::attention_prefill(&b, q, k, v, n_rep, scale, mask);
-    let (qi, ki, vi, posi) = (q.id, k.id, v.id, pos.id);
+    let (qi, ki, vi, posi) = (q.id(), k.id(), v.id(), pos.id());
     let g = b.finish(out);
 
     let fill = |seed: u64, count: usize| -> Vec<f32> {
@@ -960,7 +978,7 @@ fn sliding_window_mask_from_pos_rocm_matches_cpu() {
     let vd = fill(20003, hkv * l * d);
     let posd: Vec<i32> = (0..l as i32).collect();
 
-    let mut const_inputs: HashMap<usize, Value> = HashMap::new();
+    let mut const_inputs: HashMap<poot_graph_ir::ValueId, Value> = HashMap::new();
     const_inputs.insert(qi, HostTensor::f32(vec![1, hq, l, d], qd.clone()).into());
     const_inputs.insert(ki, HostTensor::f32(vec![1, hkv, l, d], kd.clone()).into());
     const_inputs.insert(vi, HostTensor::f32(vec![1, hkv, l, d], vd.clone()).into());
@@ -982,7 +1000,7 @@ fn sliding_window_mask_from_pos_rocm_matches_cpu() {
             .insert(
                 name,
                 WeightEntry::Dense(
-                    DenseWeight::try_new(DType::F32, shape, Arc::from(bytes)).unwrap(),
+                    DenseWeight::try_new(DType::F32, shape, StoredBytes::from(bytes)).unwrap(),
                 ),
             )
             .unwrap();

@@ -375,29 +375,29 @@ pub enum ExactDenseError {
     },
     #[error("exact dense binding graph is invalid: {0}")]
     InvalidGraph(#[from] GraphValidationError),
-    #[error("exact dense binding id v{value_id} is outside graph value count {value_count}")]
+    #[error("exact dense binding id {value_id} is outside graph value count {value_count}")]
     ValueIdOutOfRange {
         value_id: ValueId,
         value_count: usize,
     },
-    #[error("exact dense binding v{value_id} has no graph name")]
+    #[error("exact dense binding {value_id} has no graph name")]
     MissingGraphName { value_id: ValueId },
     #[error(
-        "exact dense binding v{value_id} graph name {graph_name} does not match owner name {owner_name}"
+        "exact dense binding {value_id} graph name {graph_name} does not match owner name {owner_name}"
     )]
     NameMismatch {
         value_id: ValueId,
         graph_name: String,
         owner_name: String,
     },
-    #[error("exact dense binding v{value_id} ({name}) requires Const storage, got {actual:?}")]
+    #[error("exact dense binding {value_id} ({name}) requires Const storage, got {actual:?}")]
     StorageMismatch {
         value_id: ValueId,
         name: String,
         actual: Storage,
     },
     #[error(
-        "exact dense binding v{value_id} ({name}) graph dtype {graph_dtype} does not match owner dtype {owner_dtype}"
+        "exact dense binding {value_id} ({name}) graph dtype {graph_dtype} does not match owner dtype {owner_dtype}"
     )]
     DtypeMismatch {
         value_id: ValueId,
@@ -406,7 +406,7 @@ pub enum ExactDenseError {
         owner_dtype: DType,
     },
     #[error(
-        "exact dense binding v{value_id} ({name}) graph shape {graph_shape:?} does not match owner shape {owner_shape:?}"
+        "exact dense binding {value_id} ({name}) graph shape {graph_shape:?} does not match owner shape {owner_shape:?}"
     )]
     ShapeMismatch {
         value_id: ValueId,
@@ -415,7 +415,7 @@ pub enum ExactDenseError {
         owner_shape: Vec<usize>,
     },
     #[error(
-        "exact dense binding v{value_id} owner shape {owner_shape:?} and view shape {view_shape:?} have different element counts"
+        "exact dense binding {value_id} owner shape {owner_shape:?} and view shape {view_shape:?} have different element counts"
     )]
     OwnerElementCountMismatch {
         value_id: ValueId,
@@ -425,7 +425,7 @@ pub enum ExactDenseError {
     #[error("exact dense value cannot be consumed directly by {consumer}")]
     ClosedSurface { consumer: &'static str },
     #[error(
-        "exact dense graph value v{value_id} dtype {dtype} shape {shape:?} storage {storage:?} cannot be consumed by {consumer}"
+        "exact dense graph value {value_id} dtype {dtype} shape {shape:?} storage {storage:?} cannot be consumed by {consumer}"
     )]
     GraphConsumer {
         value_id: ValueId,

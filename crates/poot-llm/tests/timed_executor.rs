@@ -11,6 +11,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::sync::Arc;
 
+use poot_executor::DetailedTiming;
 use poot_graph_plan::{CompileLimits, CompileOptions, Submission};
 use poot_llm::driver::{
     BackendChoice, DraftPolicy, Driver, DriverOptions, GenerateRequest, Head, Layout, LoadOptions,
@@ -27,6 +28,11 @@ use tokenizers::pre_tokenizers::whitespace::WhitespaceSplit;
 
 const CAPACITY: usize = 64;
 const NEW_TOKENS: usize = 16;
+
+/// The bounded detail every timed row retains: every step, within finite record and query bounds.
+fn detail() -> DetailedTiming {
+    DetailedTiming::default_diagnostic()
+}
 
 fn nz(n: usize) -> NonZeroUsize {
     NonZeroUsize::new(n).unwrap()
@@ -125,7 +131,7 @@ fn profiled_window(executor: Box<dyn poot_executor::Executor>) -> WindowReport {
 fn profiled_executor_reports_a_nonzero_device_time_wgpu() {
     let Some(executor) = poot_test_util::device_skip::open_or_skip(
         DeviceBackend::Wgpu,
-        open_timed_executor(BackendChoice::Wgpu),
+        open_timed_executor(BackendChoice::Wgpu, detail()),
     ) else {
         return;
     };
@@ -144,7 +150,7 @@ fn profiled_executor_reports_a_nonzero_device_time_wgpu() {
 fn profiled_executor_reports_a_nonzero_device_time_rocm() {
     let Some(executor) = poot_test_util::device_skip::open_or_skip(
         DeviceBackend::Rocm,
-        open_timed_executor(BackendChoice::Rocm),
+        open_timed_executor(BackendChoice::Rocm, detail()),
     ) else {
         return;
     };
@@ -178,7 +184,7 @@ fn unprofiled_executor_reports_unknown_device_time_wgpu() {
 fn a_profiled_generation_equals_the_unprofiled_one_wgpu() {
     let Some(timed) = poot_test_util::device_skip::open_or_skip(
         DeviceBackend::Wgpu,
-        open_timed_executor(BackendChoice::Wgpu),
+        open_timed_executor(BackendChoice::Wgpu, detail()),
     ) else {
         return;
     };
@@ -201,7 +207,7 @@ fn a_profiled_generation_equals_the_unprofiled_one_wgpu() {
 fn a_profiled_generation_equals_the_unprofiled_one_rocm() {
     let Some(timed) = poot_test_util::device_skip::open_or_skip(
         DeviceBackend::Rocm,
-        open_timed_executor(BackendChoice::Rocm),
+        open_timed_executor(BackendChoice::Rocm, detail()),
     ) else {
         return;
     };
@@ -224,7 +230,7 @@ fn a_profiled_generation_equals_the_unprofiled_one_rocm() {
 fn profiled_executor_reports_a_nonzero_device_span_ptx() {
     let Some(executor) = poot_test_util::device_skip::open_or_skip(
         DeviceBackend::Ptx,
-        open_timed_executor(BackendChoice::Ptx),
+        open_timed_executor(BackendChoice::Ptx, detail()),
     ) else {
         return;
     };

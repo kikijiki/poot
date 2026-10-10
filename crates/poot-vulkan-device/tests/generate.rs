@@ -6,7 +6,7 @@
 //! before either runs. A row skips when its device does not open (`POOT_REQUIRE_VULKAN=1` /
 //! `POOT_REQUIRE_WGPU=1` turn that into a failure). Device rows run serially under `/tmp/poot-gpu.lock`.
 //!
-//! Mutation (SC-002): make `VulkanDevice::write` a no-op after the first step (the `Device::write` arm
+//! Mutation (SC-002): make `VulkanDevice::write_with` a no-op after the first step (the `Device::write_with` arm
 //! in `poot-vulkan-device/src/device.rs`); the second token is computed from a stale input and the
 //! tiny-fixture row goes red.
 

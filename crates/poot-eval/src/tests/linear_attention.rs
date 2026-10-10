@@ -26,7 +26,7 @@ fn attention_matches_direct() {
     let k = b.constant("k", TensorType::f32(vec![1, hkv, s, d]));
     let v = b.constant("v", TensorType::f32(vec![1, hkv, s, d]));
     let out = attention(&b, q, k, v, n_rep, scale);
-    let (qi, ki, vi) = (q.id, k.id, v.id);
+    let (qi, ki, vi) = (q.id(), k.id(), v.id());
     let g = b.finish(out);
 
     let qd = fill(hq * d, 8);
@@ -118,7 +118,7 @@ fn linear_attention_decode_gated_matches_direct() {
         let gate = b.constant("g", TensorType::f32(vec![1, hq, dk, 1]));
         let s = b.constant("s", TensorType::f32(vec![1, hq, dk, dv]));
         let (o, s_out) = linear_attention_decode_gated(&b, q, k, v, n_rep, gate, s);
-        let (qi, ki, vi, gi, si) = (q.id, k.id, v.id, gate.id, s.id);
+        let (qi, ki, vi, gi, si) = (q.id(), k.id(), v.id(), gate.id(), s.id());
         let g = b.finish(if pick_state { s_out } else { o });
         let mut inputs = HashMap::new();
         inputs.insert(
@@ -180,7 +180,7 @@ fn linear_attention_prefill_matches_recurrence() {
     let v = b.constant("v", TensorType::f32(vec![1, hkv, l, dv]));
     let mask = b.constant("m", TensorType::f32(vec![1, 1, l, l]));
     let o = linear_attention_prefill(&b, q, k, v, n_rep, mask);
-    let (qi, ki, vi, mi) = (q.id, k.id, v.id, mask.id);
+    let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
     let g = b.finish(o);
     let mut inputs = HashMap::new();
     inputs.insert(
@@ -256,7 +256,7 @@ fn ut_transform_inverse_reconstructs_identity() {
     let g = b.finish(t);
     let mut inputs = HashMap::new();
     inputs.insert(
-        attn_t.id,
+        attn_t.id(),
         Value::from(HostTensor::f32(vec![c, c], attn.clone())),
     );
     let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -326,7 +326,7 @@ fn ut_transform_inverse_reconstructs_identity_c64() {
     let g = b.finish(t);
     let mut inputs = HashMap::new();
     inputs.insert(
-        attn_t.id,
+        attn_t.id(),
         Value::from(HostTensor::f32(vec![c, c], attn.clone())),
     );
     let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -393,7 +393,7 @@ fn ut_transform_inverse_matches_forward_substitution_under_adversarial_input() {
     let g = b.finish(t);
     let mut inputs = HashMap::new();
     inputs.insert(
-        attn_t.id,
+        attn_t.id(),
         Value::from(HostTensor::f32(vec![c, c], attn.clone())),
     );
     let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -448,7 +448,7 @@ fn ut_transform_inverse_reconstructs_identity_batched() {
     let g = b.finish(t);
     let mut inputs = HashMap::new();
     inputs.insert(
-        attn_t.id,
+        attn_t.id(),
         Value::from(HostTensor::f32(vec![h, c, c], attn.clone())),
     );
     let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -575,26 +575,26 @@ fn check_gdn_prefill_chunked_matches_decode_ex(
 
         let mut inp = HashMap::new();
         inp.insert(
-            q_in.id,
+            q_in.id(),
             Value::from(HostTensor::f32(vec![1, h_v, 1, d], qt)),
         );
         inp.insert(
-            k_in.id,
+            k_in.id(),
             Value::from(HostTensor::f32(vec![1, h_v, 1, d], kt)),
         );
         inp.insert(
-            v_in.id,
+            v_in.id(),
             Value::from(HostTensor::f32(vec![1, h_v, 1, d], vt)),
         );
         inp.insert(
-            g_in.id,
+            g_in.id(),
             Value::from(HostTensor::f32(vec![1, h_v, 1, 1], gt)),
         );
         inp.insert(
-            bt_in.id,
+            bt_in.id(),
             Value::from(HostTensor::f32(vec![1, h_v, 1, 1], btt)),
         );
-        inp.insert(ds_in.id, Value::from(state.clone()));
+        inp.insert(ds_in.id(), Value::from(state.clone()));
 
         let (ot, new_states) = eval(&dg, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
             .map(|r| {
@@ -674,24 +674,36 @@ fn check_gdn_prefill_chunked_matches_decode_ex(
     let cgraph = cb.finish_with_state(co, &[(cs_in, cs_out)]);
 
     let mut cinp = HashMap::new();
-    cinp.insert(cq.id, Value::from(HostTensor::f32(vec![1, h_k, l, d], qd)));
-    cinp.insert(ck.id, Value::from(HostTensor::f32(vec![1, h_k, l, d], kd)));
-    cinp.insert(cv.id, Value::from(HostTensor::f32(vec![1, h_v, l, d], vd)));
-    cinp.insert(cg.id, Value::from(HostTensor::f32(vec![1, h_v, l, 1], gd)));
     cinp.insert(
-        cbeta.id,
+        cq.id(),
+        Value::from(HostTensor::f32(vec![1, h_k, l, d], qd)),
+    );
+    cinp.insert(
+        ck.id(),
+        Value::from(HostTensor::f32(vec![1, h_k, l, d], kd)),
+    );
+    cinp.insert(
+        cv.id(),
+        Value::from(HostTensor::f32(vec![1, h_v, l, d], vd)),
+    );
+    cinp.insert(
+        cg.id(),
+        Value::from(HostTensor::f32(vec![1, h_v, l, 1], gd)),
+    );
+    cinp.insert(
+        cbeta.id(),
         Value::from(HostTensor::f32(vec![1, h_v, l, 1], betad)),
     );
     cinp.insert(
-        cs_in.id,
+        cs_in.id(),
         Value::from(HostTensor::f32(vec![1, h_v, d, d], s0)),
     );
     cinp.insert(
-        ctril_incl.id,
+        ctril_incl.id(),
         Value::from(HostTensor::f32(vec![1, 1, c, c], tril_incl)),
     );
     cinp.insert(
-        ctril_strict.id,
+        ctril_strict.id(),
         Value::from(HostTensor::f32(vec![1, 1, c, c], tril_strict)),
     );
 
@@ -874,35 +886,35 @@ fn gdn_prefill_chunked_decay_magnitude_sweep_real_dims() {
         // chunked prefill.
         let mut cinp = HashMap::new();
         cinp.insert(
-            cq.id,
+            cq.id(),
             Value::from(HostTensor::f32(vec![1, h_k, l, d], qd.clone())),
         );
         cinp.insert(
-            ck.id,
+            ck.id(),
             Value::from(HostTensor::f32(vec![1, h_k, l, d], kd.clone())),
         );
         cinp.insert(
-            cv.id,
+            cv.id(),
             Value::from(HostTensor::f32(vec![1, h_v, l, d], vd.clone())),
         );
         cinp.insert(
-            cg.id,
+            cg.id(),
             Value::from(HostTensor::f32(vec![1, h_v, l, 1], gd.clone())),
         );
         cinp.insert(
-            cbeta.id,
+            cbeta.id(),
             Value::from(HostTensor::f32(vec![1, h_v, l, 1], betad.clone())),
         );
         cinp.insert(
-            cs_in.id,
+            cs_in.id(),
             Value::from(HostTensor::f32(vec![1, h_v, d, d], s0.clone())),
         );
         cinp.insert(
-            cti.id,
+            cti.id(),
             Value::from(HostTensor::f32(vec![1, 1, c, c], tril_incl.clone())),
         );
         cinp.insert(
-            cts.id,
+            cts.id(),
             Value::from(HostTensor::f32(vec![1, 1, c, c], tril_strict.clone())),
         );
         let (got_o, _) = eval(&cgraph, &cinp, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -938,26 +950,26 @@ fn gdn_prefill_chunked_decay_magnitude_sweep_real_dims() {
             let btt: Vec<f32> = (0..h_v).map(|hh| betad[hh * l + t]).collect();
             let mut inp = HashMap::new();
             inp.insert(
-                q_in.id,
+                q_in.id(),
                 Value::from(HostTensor::f32(vec![1, h_v, 1, d], qt)),
             );
             inp.insert(
-                k_in.id,
+                k_in.id(),
                 Value::from(HostTensor::f32(vec![1, h_v, 1, d], kt)),
             );
             inp.insert(
-                v_in.id,
+                v_in.id(),
                 Value::from(HostTensor::f32(vec![1, h_v, 1, d], vt)),
             );
             inp.insert(
-                g_in.id,
+                g_in.id(),
                 Value::from(HostTensor::f32(vec![1, h_v, 1, 1], gt)),
             );
             inp.insert(
-                bt_in.id,
+                bt_in.id(),
                 Value::from(HostTensor::f32(vec![1, h_v, 1, 1], btt)),
             );
-            inp.insert(ds_in.id, Value::from(state.clone()));
+            inp.insert(ds_in.id(), Value::from(state.clone()));
             let (ot, ns) = eval(&dg, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
                 .map(|r| {
                     let state = r
@@ -1080,35 +1092,35 @@ fn gdn_decode_continuation_one_level(
     let cgraph = cb.finish_with_state(_co, &[(cs_in, cs_out)]);
     let mut cinp = HashMap::new();
     cinp.insert(
-        cq.id,
+        cq.id(),
         Value::from(HostTensor::f32(vec![1, h_v, l, d], qd.clone())),
     );
     cinp.insert(
-        ck.id,
+        ck.id(),
         Value::from(HostTensor::f32(vec![1, h_v, l, d], kd.clone())),
     );
     cinp.insert(
-        cv.id,
+        cv.id(),
         Value::from(HostTensor::f32(vec![1, h_v, l, d], vd.clone())),
     );
     cinp.insert(
-        cg.id,
+        cg.id(),
         Value::from(HostTensor::f32(vec![1, h_v, l, 1], gd.clone())),
     );
     cinp.insert(
-        cbeta.id,
+        cbeta.id(),
         Value::from(HostTensor::f32(vec![1, h_v, l, 1], betad.clone())),
     );
     cinp.insert(
-        cs_in.id,
+        cs_in.id(),
         Value::from(HostTensor::f32(vec![1, h_v, d, d], s0.clone())),
     );
     cinp.insert(
-        cti.id,
+        cti.id(),
         Value::from(HostTensor::f32(vec![1, 1, c, c], tril_incl)),
     );
     cinp.insert(
-        cts.id,
+        cts.id(),
         Value::from(HostTensor::f32(vec![1, 1, c, c], tril_strict)),
     );
     let (_, chunked_states) = eval(&cgraph, &cinp, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -1152,26 +1164,26 @@ fn gdn_decode_continuation_one_level(
                 btt: Vec<f32>| {
         let mut inp = HashMap::new();
         inp.insert(
-            q_in.id,
+            q_in.id(),
             Value::from(HostTensor::f32(vec![1, h_v, 1, d], qt)),
         );
         inp.insert(
-            k_in.id,
+            k_in.id(),
             Value::from(HostTensor::f32(vec![1, h_v, 1, d], kt)),
         );
         inp.insert(
-            v_in.id,
+            v_in.id(),
             Value::from(HostTensor::f32(vec![1, h_v, 1, d], vt)),
         );
         inp.insert(
-            g_in.id,
+            g_in.id(),
             Value::from(HostTensor::f32(vec![1, h_v, 1, 1], gt)),
         );
         inp.insert(
-            bt_in.id,
+            bt_in.id(),
             Value::from(HostTensor::f32(vec![1, h_v, 1, 1], btt)),
         );
-        inp.insert(ds_in.id, Value::from(state.clone()));
+        inp.insert(ds_in.id(), Value::from(state.clone()));
         let (ot, ns) = eval(&dg, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
             .map(|r| {
                 let state = r
@@ -1300,10 +1312,10 @@ fn cumulative_log_decay_scan_at_least_as_precise_as_matmul_cumsum() {
     let mgraph = mb.finish(mcum);
     let mut minp = HashMap::new();
     minp.insert(
-        mg.id,
+        mg.id(),
         Value::from(HostTensor::f32(vec![1, hv, c, 1], gd.clone())),
     );
-    minp.insert(mt.id, Value::from(HostTensor::f32(vec![1, 1, c, c], ti)));
+    minp.insert(mt.id(), Value::from(HostTensor::f32(vec![1, 1, c, c], ti)));
     let matmul_cum = eval(&mgraph, &minp, EvalOptions::new(EvalBudget::UNBOUNDED))
         .unwrap()
         .output
@@ -1317,7 +1329,7 @@ fn cumulative_log_decay_scan_at_least_as_precise_as_matmul_cumsum() {
     let sgraph = sb.finish(scum);
     let mut sinp = HashMap::new();
     sinp.insert(
-        sg.id,
+        sg.id(),
         Value::from(HostTensor::f32(vec![1, hv, c, 1], gd.clone())),
     );
     let scan_cum = eval(&sgraph, &sinp, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -1417,31 +1429,31 @@ fn gdn_prefill_chunked_matches_decode_at_extreme_within_chunk_decay_step() {
     let cgraph = cb.finish_with_state(co, &[(cs, cso)]);
     let mut cin = HashMap::new();
     cin.insert(
-        cq.id,
+        cq.id(),
         Value::from(HostTensor::f32(vec![1, h_k, l, d], qd.clone())),
     );
     cin.insert(
-        ck.id,
+        ck.id(),
         Value::from(HostTensor::f32(vec![1, h_k, l, d], kd.clone())),
     );
     cin.insert(
-        cv.id,
+        cv.id(),
         Value::from(HostTensor::f32(vec![1, h_v, l, d], vd.clone())),
     );
     cin.insert(
-        cg.id,
+        cg.id(),
         Value::from(HostTensor::f32(vec![1, h_v, l, 1], gd.clone())),
     );
     cin.insert(
-        cbeta.id,
+        cbeta.id(),
         Value::from(HostTensor::f32(vec![1, h_v, l, 1], betad.clone())),
     );
     cin.insert(
-        cs.id,
+        cs.id(),
         Value::from(HostTensor::f32(vec![1, h_v, d, d], s0.clone())),
     );
-    cin.insert(cti.id, Value::from(HostTensor::f32(vec![1, 1, c, c], ti)));
-    cin.insert(cts.id, Value::from(HostTensor::f32(vec![1, 1, c, c], ts)));
+    cin.insert(cti.id(), Value::from(HostTensor::f32(vec![1, 1, c, c], ti)));
+    cin.insert(cts.id(), Value::from(HostTensor::f32(vec![1, 1, c, c], ts)));
     let (got_o, got_s) = eval(&cgraph, &cin, EvalOptions::new(EvalBudget::UNBOUNDED))
         .map(|r| {
             let state = r
@@ -1477,35 +1489,35 @@ fn gdn_prefill_chunked_matches_decode_at_extreme_within_chunk_decay_step() {
     for t in 0..l {
         let mut inp = HashMap::new();
         inp.insert(
-            q_in.id,
+            q_in.id(),
             Value::from(HostTensor::f32(
                 vec![1, h_v, 1, d],
                 qd[t * d..(t + 1) * d].to_vec(),
             )),
         );
         inp.insert(
-            k_in.id,
+            k_in.id(),
             Value::from(HostTensor::f32(
                 vec![1, h_v, 1, d],
                 kd[t * d..(t + 1) * d].to_vec(),
             )),
         );
         inp.insert(
-            v_in.id,
+            v_in.id(),
             Value::from(HostTensor::f32(
                 vec![1, h_v, 1, d],
                 vd[t * d..(t + 1) * d].to_vec(),
             )),
         );
         inp.insert(
-            g_in.id,
+            g_in.id(),
             Value::from(HostTensor::f32(vec![1, h_v, 1, 1], vec![gd[t]])),
         );
         inp.insert(
-            bt_in.id,
+            bt_in.id(),
             Value::from(HostTensor::f32(vec![1, h_v, 1, 1], vec![betad[t]])),
         );
-        inp.insert(ds_in.id, Value::from(state.clone()));
+        inp.insert(ds_in.id(), Value::from(state.clone()));
         let (ot, ns) = eval(&dg, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
             .map(|r| {
                 let state = r
@@ -1559,11 +1571,11 @@ fn causal_conv1d_prefill_vs_decode_real_dims() {
     let pg = pb.finish(po);
     let mut pin = HashMap::new();
     pin.insert(
-        px.id,
+        px.id(),
         Value::from(HostTensor::f32(vec![1, l, conv_dim], xd.clone())),
     );
     pin.insert(
-        pw.id,
+        pw.id(),
         Value::from(HostTensor::f32(vec![k, conv_dim], wd.clone())),
     );
     let got = eval(&pg, &pin, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -1590,14 +1602,14 @@ fn causal_conv1d_prefill_vs_decode_real_dims() {
         let xt = xd[t * conv_dim..(t + 1) * conv_dim].to_vec();
         let mut inp = HashMap::new();
         inp.insert(
-            dx.id,
+            dx.id(),
             Value::from(HostTensor::f32(vec![1, 1, conv_dim], xt)),
         );
         inp.insert(
-            dw.id,
+            dw.id(),
             Value::from(HostTensor::f32(vec![k, conv_dim], wd.clone())),
         );
-        inp.insert(dc.id, Value::from(cache.clone()));
+        inp.insert(dc.id(), Value::from(cache.clone()));
         let (ot, ns) = eval(&dgg, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
             .map(|r| {
                 let state = r
@@ -1654,7 +1666,7 @@ fn linear_attention_prefill_per_head_gate_matches_recurrence() {
     let v = b.constant("v", TensorType::f32(vec![1, hkv, l, dv]));
     let mask = b.constant("m", TensorType::f32(vec![1, hq, l, l])); // PER-HEAD mask (not broadcast)
     let o = linear_attention_prefill(&b, q, k, v, n_rep, mask);
-    let (qi, ki, vi, mi) = (q.id, k.id, v.id, mask.id);
+    let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
     let g = b.finish(o);
     let mut inputs = HashMap::new();
     inputs.insert(
@@ -1715,7 +1727,7 @@ fn reduce_over_non_last_axis_keepdim_is_correct() {
     let g = bld.finish(r);
     let mut inp = HashMap::new();
     inp.insert(
-        x.id,
+        x.id(),
         Value::from(HostTensor::f32(vec![a, b_, c], xd.clone())),
     );
     let got = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -1763,14 +1775,14 @@ fn causal_conv1d_decode_loop_matches_reference() {
     for t in 0..l {
         let mut inp = HashMap::new();
         inp.insert(
-            x.id,
+            x.id(),
             Value::from(HostTensor::f32(
                 vec![1, 1, c],
                 xd[t * c..t * c + c].to_vec(),
             )),
         );
-        inp.insert(w.id, Value::from(HostTensor::f32(vec![k, c], wd.clone())));
-        inp.insert(cache.id, Value::from(caches[0].clone()));
+        inp.insert(w.id(), Value::from(HostTensor::f32(vec![k, c], wd.clone())));
+        inp.insert(cache.id(), Value::from(caches[0].clone()));
         let (o_t, new) = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
             .map(|r| {
                 let state = r
@@ -1832,14 +1844,17 @@ fn causal_conv1d_prefill_matches_decode() {
     for t in 0..l {
         let mut inp = HashMap::new();
         inp.insert(
-            dx.id,
+            dx.id(),
             Value::from(HostTensor::f32(
                 vec![1, 1, c],
                 xd[t * c..t * c + c].to_vec(),
             )),
         );
-        inp.insert(dw.id, Value::from(HostTensor::f32(vec![k, c], wd.clone())));
-        inp.insert(dcache.id, Value::from(cache.clone()));
+        inp.insert(
+            dw.id(),
+            Value::from(HostTensor::f32(vec![k, c], wd.clone())),
+        );
+        inp.insert(dcache.id(), Value::from(cache.clone()));
         let (o_t, new_states) = eval(&dg, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
             .map(|r| {
                 let state = r
@@ -1872,8 +1887,8 @@ fn causal_conv1d_prefill_matches_decode() {
     let pg = pb.finish(pout);
 
     let mut pinp = HashMap::new();
-    pinp.insert(px.id, Value::from(HostTensor::f32(vec![1, l, c], xd)));
-    pinp.insert(pw.id, Value::from(HostTensor::f32(vec![k, c], wd)));
+    pinp.insert(px.id(), Value::from(HostTensor::f32(vec![1, l, c], xd)));
+    pinp.insert(pw.id(), Value::from(HostTensor::f32(vec![k, c], wd)));
     let got = eval(&pg, &pinp, EvalOptions::new(EvalBudget::UNBOUNDED))
         .unwrap()
         .output

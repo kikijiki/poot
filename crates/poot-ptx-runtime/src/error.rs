@@ -60,6 +60,19 @@ pub enum PtxError {
     /// Only kernel dispatches may run while a stream capture is open; see `PtxContext::begin_capture`.
     #[error("{op} refused: a stream capture is open on this context")]
     CaptureOpen { op: &'static str },
+    /// A cross-device operation that only makes sense inside a stream capture was issued with none open.
+    #[error("{op} refused: no stream capture is open on this context")]
+    CaptureClosed { op: &'static str },
+    /// An event, buffer or context of another owner was passed where this context's own is required.
+    #[error("{op} refused: the handle belongs to another context")]
+    ForeignHandle { op: &'static str },
+    /// Direct access between two devices is not available: a copy between them would have to stage
+    /// through the host, which a capture cannot hold.
+    #[error("device {from} cannot access device {to}'s memory directly")]
+    PeerUnavailable { from: i32, to: i32 },
+    /// The destination's device was never enabled with `PtxContext::enable_peer_access`.
+    #[error("copy_to_peer refused: direct access to the destination's device was not enabled")]
+    PeerNotEnabled,
 }
 
 /// Native element representation retained by a PTX allocation (card 527: moved to `poot-target`, the

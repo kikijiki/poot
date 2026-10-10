@@ -446,17 +446,89 @@ impl Driver {
             // The private cache holds one sequence's row and a recurrent state pool one row per
             // slot: a new sequence starts from zero in its own slot's row and leaves every other
             // sequence's state alone.
-            let scope = poot_executor::StateScope::Row(slot);
-            self.executor.reset_state(self.exe, scope.clone())?;
-            if let Some(draft) = &self.speculation.draft {
-                self.executor.reset_state(draft.exe, scope.clone())?;
-            }
-            for &exe in self.adapter_exes.values() {
-                self.executor.reset_state(exe, scope.clone())?;
-            }
+            self.reset_row_state(slot)?;
         }
         self.speculation.open(seq, reused);
         Ok(Admission::Opened { seq, reused })
+    }
+
+    /// Zero slot `slot`'s row of every executable's state.
+    fn reset_row_state(&mut self, slot: usize) -> Result<(), DriverError> {
+        let scope = poot_executor::StateScope::Row(slot);
+        self.executor.reset_state(self.exe, scope.clone())?;
+        if let Some(draft) = &self.speculation.draft {
+            self.executor.reset_state(draft.exe, scope.clone())?;
+        }
+        for &exe in self.adapter_exes.values() {
+            self.executor.reset_state(exe, scope.clone())?;
+        }
+        Ok(())
+    }
+
+    /// Continue the open, fully committed `seq` with `prompt`, the whole next context: the tokens it
+    /// already holds, then the new ones. The longest leading run of `prompt` that the sequence's K/V
+    /// already covers is kept and the rest is prefilled, so a conversation's next turn pays for its
+    /// new tokens only. Returns the positions kept, which leave at least the prompt's last token to
+    /// prefill (its pick is the turn's first token). Room for `max_new` more tokens is reserved.
+    ///
+    /// A recurrent state cannot be rewound to a shorter context: unless it all lies inside `prompt`
+    /// the row restarts from zero and the whole prompt is prefilled. Only the contiguous layout is
+    /// resumed in place; a paged pool shares turns through its prefix cache ([`Driver::open`]).
+    pub fn resume(
+        &mut self,
+        seq: SeqId,
+        prompt: &[u32],
+        max_new: usize,
+    ) -> Result<usize, DriverError> {
+        let capacity = self.options.capacity.get();
+        if prompt.is_empty() {
+            return Err(InvalidRequest::EmptyPrompt.into());
+        }
+        if prompt.len() + max_new > capacity {
+            return Err(InvalidRequest::Capacity {
+                prompt: prompt.len(),
+                max_new,
+                max: capacity,
+            }
+            .into());
+        }
+        let residency = self.residency;
+        let serving = self.serving.as_mut().ok_or(InvalidRequest::NotPrepared)?;
+        if !matches!(serving.kv, KvStore::Contiguous) {
+            return Err(InvalidRequest::ResumePaged.into());
+        }
+        let state = serving
+            .seqs
+            .get_mut(&seq)
+            .ok_or(InvalidRequest::UnknownSeq(seq))?;
+        if !state.pending.is_empty() {
+            return Err(InvalidRequest::UncommittedResult(seq).into());
+        }
+        if state.embeds.is_some() || state.mrope.is_some() {
+            return Err(InvalidRequest::ResumeEmbedded(seq).into());
+        }
+        // A decode step writes the K/V of the token it feeds, so the last committed token has none.
+        let resident = state.done.max(state.tokens.len() - 1);
+        let shared = state.tokens[..resident]
+            .iter()
+            .zip(prompt)
+            .take_while(|(held, new)| held == new)
+            .count();
+        let mut reused = shared.min(prompt.len() - 1);
+        if residency == StateResidency::Recurrent && reused != resident {
+            reused = 0;
+        }
+        state.tokens = prompt.to_vec();
+        state.prompt_len = prompt.len();
+        state.done = reused;
+        state.reserved = prompt.len() + max_new;
+        state.seeded = false;
+        let slot = state.slot;
+        if reused == 0 {
+            self.reset_row_state(slot)?;
+        }
+        self.speculation.rewind(seq, reused);
+        Ok(reused)
     }
 
     /// [`Driver::open`] for a prompt that supplies embedding rows in place of some tokens'

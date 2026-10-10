@@ -2,9 +2,13 @@ use poot_tensor::DType;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore, WeightStoreBuilder};
+use std::num::NonZeroUsize;
+
+use poot_quant::StoredBytes;
+use poot_quant::weights::{DenseWeight, WeightEntry, WeightKey, WeightStore};
 
 use super::*;
+use crate::plan::{Container, JobKind, LoadPlan, TensorJob, build_store, default_workers};
 
 struct UniqueSafetensorsHeader(serde_json::Map<String, serde_json::Value>);
 
@@ -155,18 +159,18 @@ fn parse_tensor_header_entry(
     })
 }
 
-/// Every non-metadata header entry's stored bytes, inserted as a [`WeightEntry::Dense`] keyed by
-/// its checkpoint tensor name; `read_range` supplies the raw bytes exactly as the checkpoint
-/// stored them (ADR-0103 decision 1: no widening, no decode). Every dtype is kept, `I64` index
-/// tables included (DeepSeek-V4's `tid2eid` is one, read through `WeightView::IndexNarrow`); a
-/// tensor no family claims is just an unused entry.
-/// `insert_header_entries`'s cross-call duplicate-name tracking: every non-metadata header key seen
-/// so far, the same real-world duplicate-tensor bug the store-keyed check below also catches.
-fn insert_header_entries<'a>(
+/// Plan every non-metadata header entry of `files[file]` as a dense job keyed by its checkpoint tensor
+/// name: the entry's stored bytes exactly as the checkpoint stored them (ADR-0103 decision 1: no
+/// widening, no decode, no copy). Every dtype is kept, `I64` index tables included (DeepSeek-V4's
+/// `tid2eid` is one, read through `WeightView::IndexNarrow`); a tensor no family claims is just an
+/// unused entry. `seen_names` is the cross-file duplicate-name tracking: every non-metadata header key
+/// seen so far, the same real-world duplicate-tensor bug the store-keyed check also catches.
+fn plan_header_entries(
+    plan: &mut LoadPlan,
+    file: usize,
     header_bytes: &[u8],
+    data_start: usize,
     data_len: usize,
-    mut read_range: impl FnMut(usize, usize) -> Result<Cow<'a, [u8]>, LoadError>,
-    builder: &mut WeightStoreBuilder,
     seen_names: &mut HashSet<String>,
 ) -> Result<(), LoadError> {
     let obj = parse_safetensors_header(header_bytes)?;
@@ -186,58 +190,24 @@ fn insert_header_entries<'a>(
             start,
             end,
         } = parse_tensor_header_entry(name, meta, data_len)?;
-        let raw = read_range(start, end)?;
-        let bytes: Arc<[u8]> = Arc::from(raw.into_owned());
-        let dense = DenseWeight::try_new(dtype, shape, bytes)
-            .map_err(|error| LoadError::SafeTensors(format!("{name}: {error}")))?;
-        // `seen_names` above already proves this name is unique across every call into this
-        // builder (within a header, `UniqueSafetensorsHeader` also rejects a repeat), so this
-        // insert cannot collide.
-        builder
-            .insert(name.clone(), WeightEntry::Dense(dense))
-            .expect("seen_names already proved this key unique");
+        plan.push(TensorJob {
+            key: WeightKey::from(name.as_str()),
+            file,
+            range: data_start + start..data_start + end,
+            kind: JobKind::Dense { dtype, shape },
+        });
     }
     Ok(())
 }
 
-fn insert_file(
-    path: &Path,
-    builder: &mut WeightStoreBuilder,
+/// Plan one safetensors file: the header is parsed from the mapping and every tensor is a range of it.
+fn plan_file(
+    plan: &mut LoadPlan,
+    file: usize,
+    stored: &StoredBytes,
     seen_names: &mut HashSet<String>,
 ) -> Result<(), LoadError> {
-    let mut file = File::open(path)?;
-    let file_len = usize::try_from(file.metadata()?.len())
-        .map_err(|_| LoadError::SafeTensors("file length does not fit usize".into()))?;
-    if file_len < 8 {
-        return Err(LoadError::SafeTensors("file too small".into()));
-    }
-    let mut len_bytes = [0u8; 8];
-    file.read_exact(&mut len_bytes)?;
-    let header_end = checked_header_end(u64::from_le_bytes(len_bytes), file_len)?;
-    let mut header_bytes = vec![0u8; header_end - 8];
-    file.read_exact(&mut header_bytes)?;
-    let data_len = file_len - header_end;
-    insert_header_entries(
-        &header_bytes,
-        data_len,
-        |start, end| {
-            let absolute = header_end.checked_add(start).ok_or_else(|| {
-                LoadError::SafeTensors("tensor file offset overflows usize".into())
-            })?;
-            file.seek(SeekFrom::Start(u64::try_from(absolute).map_err(|_| {
-                LoadError::SafeTensors("tensor file offset does not fit u64".into())
-            })?))?;
-            let mut raw = vec![0u8; end - start];
-            file.read_exact(&mut raw)?;
-            Ok(Cow::Owned(raw))
-        },
-        builder,
-        seen_names,
-    )
-}
-
-#[cfg(test)]
-fn insert_bytes(bytes: &[u8], builder: &mut WeightStoreBuilder) -> Result<(), LoadError> {
+    let bytes = stored.as_slice();
     if bytes.len() < 8 {
         return Err(LoadError::SafeTensors("file too small".into()));
     }
@@ -245,15 +215,36 @@ fn insert_bytes(bytes: &[u8], builder: &mut WeightStoreBuilder) -> Result<(), Lo
         u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
         bytes.len(),
     )?;
-    let data = &bytes[header_end..];
-    let mut seen_names = HashSet::new();
-    insert_header_entries(
+    plan_header_entries(
+        plan,
+        file,
         &bytes[8..header_end],
-        data.len(),
-        |start, end| Ok(Cow::Borrowed(&data[start..end])),
-        builder,
-        &mut seen_names,
+        header_end,
+        bytes.len() - header_end,
+        seen_names,
     )
+}
+
+/// The plan for `files` (mapped safetensors files, [`map_weight_files`]) in the order given.
+fn safetensors_plan(files: &[(String, StoredBytes)]) -> Result<LoadPlan, LoadError> {
+    let mut plan = LoadPlan::new(
+        Container::Safetensors,
+        files.iter().map(|(_, file)| file.clone()).collect(),
+    );
+    let mut seen_names = HashSet::new();
+    for (index, (_, file)) in files.iter().enumerate() {
+        plan_file(&mut plan, index, file, &mut seen_names)?;
+    }
+    Ok(plan)
+}
+
+/// Map one safetensors file for [`load_mapped_weight_store`].
+fn map_file(path: &Path) -> Result<(String, StoredBytes), LoadError> {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    Ok((name, StoredBytes::map(File::open(path)?)?))
 }
 
 /// Unique shard file names a `model.safetensors.index.json`'s `weight_map` names, sorted so shards
@@ -276,20 +267,16 @@ fn shard_files(index: &serde_json::Value) -> Result<Vec<String>, LoadError> {
     Ok(shards)
 }
 
-/// Load a model's weights from a directory (single `model.safetensors` or the sharded
-/// `model.safetensors.index.json` layout) into a [`WeightStore`]: every tensor's bytes exactly as
-/// the checkpoint stored them, keyed by its checkpoint name (ADR-0103 decisions 1 and 3, card
-/// 540b). No f32 widening happens here; a consumer that needs f32 (the CPU oracle, or a GPU
-/// backend with no native upload lane for the stored dtype) decodes on demand from the returned
-/// entries.
-pub fn load_weight_store(dir: impl AsRef<Path>) -> Result<WeightStore, LoadError> {
+/// Map the weight files of a model directory (single `model.safetensors` or the sharded
+/// `model.safetensors.index.json` layout), each exactly once, as `(file name, mapping)` in load order.
+/// A caller that pins the files checks the pins over these mappings and then builds the store from the
+/// same mappings ([`load_mapped_weight_store`]), so digest, header and tensors come from one inode
+/// (ADR-0103 amendment). Nothing is read from a mapping here.
+pub fn map_weight_files(dir: impl AsRef<Path>) -> Result<Vec<(String, StoredBytes)>, LoadError> {
     let dir = dir.as_ref();
-    let mut builder = WeightStore::builder();
-    let mut seen_names = HashSet::new();
     let single = dir.join("model.safetensors");
     if single.exists() {
-        insert_file(&single, &mut builder, &mut seen_names)?;
-        return Ok(builder.build());
+        return Ok(vec![map_file(&single)?]);
     }
     let index_path = dir.join("model.safetensors.index.json");
     if !index_path.exists() {
@@ -298,10 +285,30 @@ pub fn load_weight_store(dir: impl AsRef<Path>) -> Result<WeightStore, LoadError
         ));
     }
     let index: serde_json::Value = serde_json::from_slice(&std::fs::read(&index_path)?)?;
-    for shard in shard_files(&index)? {
-        insert_file(&dir.join(shard), &mut builder, &mut seen_names)?;
-    }
-    Ok(builder.build())
+    shard_files(&index)?
+        .into_iter()
+        .map(|shard| map_file(&dir.join(shard)))
+        .collect()
+}
+
+/// Build a [`WeightStore`] from mapped safetensors files ([`map_weight_files`]): every tensor's bytes a
+/// view of its file exactly as the checkpoint stored them, keyed by its checkpoint name (ADR-0103
+/// decisions 1 and 3, card 540b). No f32 widening happens here; a consumer that needs f32 (the CPU
+/// oracle, or a GPU backend with no native upload lane for the stored dtype) decodes on demand from the
+/// returned entries. Once the last file is read, every file must still be the one that was mapped
+/// (ADR-0103 amendment, boundary 1) or the load is [`LoadError::SourceChanged`]. The tensors are
+/// validated on `workers` threads ([`build_store`]).
+pub fn load_mapped_weight_store(
+    files: &[(String, StoredBytes)],
+    workers: NonZeroUsize,
+) -> Result<WeightStore, LoadError> {
+    build_store(safetensors_plan(files)?, workers)
+}
+
+/// [`map_weight_files`] then [`load_mapped_weight_store`] on [`default_workers`], for a caller with no
+/// files to pin.
+pub fn load_weight_store(dir: impl AsRef<Path>) -> Result<WeightStore, LoadError> {
+    load_mapped_weight_store(&map_weight_files(dir)?, default_workers())
 }
 
 /// Whether `prefix` (a `.weight` tensor's name without that suffix) names one numbered shard of a
@@ -425,7 +432,7 @@ pub fn pack_quantized_linears(
         type Linear = (
             WeightFormat,
             [usize; 2],
-            Vec<(SourceRole, Arc<[u8]>)>,
+            Vec<(SourceRole, StoredBytes)>,
             Vec<&'static str>,
         );
         let (format, shape, sources, parts): Linear = match validated_scheme {
@@ -466,15 +473,15 @@ pub fn pack_quantized_linears(
                 let mut sources = vec![
                     (
                         SourceRole::Planar(OperandRole::Codes),
-                        qweight.bytes().as_arc(),
+                        qweight.bytes().clone(),
                     ),
                     (
                         SourceRole::Planar(OperandRole::Zero),
-                        qzeros.bytes().as_arc(),
+                        qzeros.bytes().clone(),
                     ),
                     (
                         SourceRole::Planar(OperandRole::Scale),
-                        scales.bytes().as_arc(),
+                        scales.bytes().clone(),
                     ),
                 ];
                 let groups = if contiguous {
@@ -482,7 +489,7 @@ pub fn pack_quantized_linears(
                 } else {
                     sources.push((
                         SourceRole::Planar(OperandRole::GroupIndex),
-                        g_idx.bytes().as_arc(),
+                        g_idx.bytes().clone(),
                     ));
                     GroupMap::Indexed {
                         groups: nonzero(format!("{prefix}.scales"), groups, "the group count")?,
@@ -511,15 +518,15 @@ pub fn pack_quantized_linears(
                     vec![
                         (
                             SourceRole::Planar(OperandRole::Codes),
-                            qweight.bytes().as_arc(),
+                            qweight.bytes().clone(),
                         ),
                         (
                             SourceRole::Planar(OperandRole::Zero),
-                            qzeros.bytes().as_arc(),
+                            qzeros.bytes().clone(),
                         ),
                         (
                             SourceRole::Planar(OperandRole::Scale),
-                            scales.bytes().as_arc(),
+                            scales.bytes().clone(),
                         ),
                     ],
                     vec![".qweight", ".qzeros", ".scales"],
@@ -588,11 +595,11 @@ pub fn pack_quantized_linears(
                     vec![
                         (
                             SourceRole::Planar(OperandRole::Codes),
-                            weight.bytes().as_arc(),
+                            weight.bytes().clone(),
                         ),
                         (
                             SourceRole::Planar(OperandRole::Scale),
-                            scale.bytes().as_arc(),
+                            scale.bytes().clone(),
                         ),
                     ],
                     vec![".weight", suffix],
@@ -624,19 +631,15 @@ pub fn pack_quantized_linears(
 /// [`load_weight_store`]. Only this crate's tests build an archive in memory.
 #[cfg(test)]
 pub(crate) fn load_weight_store_bytes(bytes: &[u8]) -> Result<WeightStore, LoadError> {
-    let mut builder = WeightStore::builder();
-    insert_bytes(bytes, &mut builder)?;
-    Ok(builder.build())
+    let files = [(String::new(), StoredBytes::from(bytes.to_vec()))];
+    build_store(safetensors_plan(&files)?, default_workers())
 }
 
 /// Load one safetensors file (not a model directory: no sharding, no fixed `model.safetensors`
 /// name) into a [`WeightStore`]. Used by loaders whose single archive has its own name (the LoRA
 /// adapter loader's `adapter_model.safetensors`, e.g.). See [`load_weight_store`].
 pub fn load_weight_store_file(path: impl AsRef<Path>) -> Result<WeightStore, LoadError> {
-    let mut builder = WeightStore::builder();
-    let mut seen_names = HashSet::new();
-    insert_file(path.as_ref(), &mut builder, &mut seen_names)?;
-    Ok(builder.build())
+    load_mapped_weight_store(&[map_file(path.as_ref())?], default_workers())
 }
 
 /// The dense entry named `name`, or a typed error for a missing/packed entry. Exposed beyond this

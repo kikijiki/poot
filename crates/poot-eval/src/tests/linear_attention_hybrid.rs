@@ -1,7 +1,6 @@
 //! Linear-attention fuzz, hybrid model loops, decay masks, mamba2 block, layer-level decode-vs-prefill.
 
 use crate::{EvalBudget, EvalOptions, Value, eval};
-use poot_graph_ir::AttentionAttrs;
 use poot_graph_ir::builder::{Builder, Traced};
 use poot_graph_ir::graph::{Operand, StateRole};
 use poot_graph_ir::op::{BinOp, OpKind};
@@ -10,6 +9,7 @@ use poot_graph_ir::ops::{
     repeat_kv, rmsnorm,
 };
 use poot_graph_ir::types::TensorType;
+use poot_graph_ir::{AttentionAttrs, ValueId};
 use poot_tensor::HostTensor;
 use std::collections::HashMap;
 
@@ -55,15 +55,13 @@ fn stage_flash_prefill(
             OpKind::Attention(AttentionAttrs::new(n_rep, scale, None)),
             [q, k, v, mask]
                 .iter()
-                .map(|t| Operand::Value(t.id))
+                .map(|t| Operand::Value(t.id()))
                 .collect(),
         )
         .expect("stage Attention");
     plan.declare_result(out).expect("declare result");
     let mut prepared = b.preflight_append(plan).expect("preflight append");
-    Traced {
-        id: b.commit_append(&mut prepared).expect("commit append"),
-    }
+    b.commit_append(&mut prepared).expect("commit append")
 }
 
 #[test]
@@ -127,21 +125,24 @@ fn linear_attention_decode_gated_fuzz_matches_recurrence() {
         for t in 0..l {
             let mut inp = HashMap::new();
             inp.insert(
-                qc.id,
+                qc.id(),
                 Value::from(HostTensor::f32(vec![1, hq, 1, dk], q[t].clone())),
             );
             inp.insert(
-                kc.id,
+                kc.id(),
                 Value::from(HostTensor::f32(vec![1, hkv, 1, dk], k[t].clone())),
             );
             inp.insert(
-                vc.id,
+                vc.id(),
                 Value::from(HostTensor::f32(vec![1, hkv, 1, dv], v[t].clone())),
             );
             // gate broadcasts over D_v: shape [1,Hq,D_k,1].
             let gv: Vec<f32> = (0..hq * dk).map(|i| gate[t][i]).collect();
-            inp.insert(gc.id, Value::from(HostTensor::f32(vec![1, hq, dk, 1], gv)));
-            inp.insert(s_in.id, Value::from(state.clone()));
+            inp.insert(
+                gc.id(),
+                Value::from(HostTensor::f32(vec![1, hq, dk, 1], gv)),
+            );
+            inp.insert(s_in.id(), Value::from(state.clone()));
             let (ot, new) = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
                 .map(|r| {
                     let state = r
@@ -252,30 +253,30 @@ fn mamba2_ssd_decode_fuzz_matches_recurrence() {
         for t in 0..l {
             let mut inp = HashMap::new();
             inp.insert(
-                x.id,
+                x.id(),
                 Value::from(HostTensor::f32(vec![1, hq, 1, p], xs[t].clone())),
             );
             inp.insert(
-                bin.id,
+                bin.id(),
                 Value::from(HostTensor::f32(vec![1, hq, 1, n], bs[t].clone())),
             );
             inp.insert(
-                cin.id,
+                cin.id(),
                 Value::from(HostTensor::f32(vec![1, hq, 1, n], cs[t].clone())),
             );
             inp.insert(
-                delta.id,
+                delta.id(),
                 Value::from(HostTensor::f32(vec![1, hq, 1, 1], dts[t].clone())),
             );
             inp.insert(
-                a.id,
+                a.id(),
                 Value::from(HostTensor::f32(vec![1, hq, 1, 1], a_par.clone())),
             );
             inp.insert(
-                dsk.id,
+                dsk.id(),
                 Value::from(HostTensor::f32(vec![1, hq, 1, 1], d_par.clone())),
             );
-            inp.insert(h_in.id, Value::from(hstate.clone()));
+            inp.insert(h_in.id(), Value::from(hstate.clone()));
             let (yt, new) = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
                 .map(|r| {
                     let state = r
@@ -387,30 +388,30 @@ fn mamba2_ssd_prefill_matches_decode_loop() {
         for t in 0..l {
             let mut inp = HashMap::new();
             inp.insert(
-                xd.id,
+                xd.id(),
                 Value::from(HostTensor::f32(vec![1, hq, 1, p], xs[t].clone())),
             );
             inp.insert(
-                bind.id,
+                bind.id(),
                 Value::from(HostTensor::f32(vec![1, hq, 1, n], bs[t].clone())),
             );
             inp.insert(
-                cind.id,
+                cind.id(),
                 Value::from(HostTensor::f32(vec![1, hq, 1, n], cs[t].clone())),
             );
             inp.insert(
-                deltad.id,
+                deltad.id(),
                 Value::from(HostTensor::f32(vec![1, hq, 1, 1], dts[t].clone())),
             );
             inp.insert(
-                ad.id,
+                ad.id(),
                 Value::from(HostTensor::f32(vec![1, hq, 1, 1], a_par.clone())),
             );
             inp.insert(
-                dskd.id,
+                dskd.id(),
                 Value::from(HostTensor::f32(vec![1, hq, 1, 1], d_par.clone())),
             );
-            inp.insert(h_ind.id, Value::from(hstate.clone()));
+            inp.insert(h_ind.id(), Value::from(hstate.clone()));
             let (yt, new) = eval(&gd, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
                 .map(|r| {
                     let state = r
@@ -447,7 +448,7 @@ fn mamba2_ssd_prefill_matches_decode_loop() {
         let (yp, h_outp) = mamba2_ssd_prefill(&bp, xp, binp, cinp, deltap, ap, dskp, h0p, trilp);
         let gy = bp.finish(yp);
         let mut gh = gy.clone();
-        gh.output = h_outp.id;
+        gh.output = h_outp.id();
 
         // Reindex the step-major generated data into head-major [Hq,L,*] for the prefill inputs.
         let mut x_hm = vec![0.0f32; hq * l * p];
@@ -475,33 +476,36 @@ fn mamba2_ssd_prefill_matches_decode_loop() {
         }
 
         let mut inp = HashMap::new();
-        inp.insert(xp.id, Value::from(HostTensor::f32(vec![1, hq, l, p], x_hm)));
         inp.insert(
-            binp.id,
+            xp.id(),
+            Value::from(HostTensor::f32(vec![1, hq, l, p], x_hm)),
+        );
+        inp.insert(
+            binp.id(),
             Value::from(HostTensor::f32(vec![1, hq, l, n], b_hm)),
         );
         inp.insert(
-            cinp.id,
+            cinp.id(),
             Value::from(HostTensor::f32(vec![1, hq, l, n], c_hm)),
         );
         inp.insert(
-            deltap.id,
+            deltap.id(),
             Value::from(HostTensor::f32(vec![1, hq, l, 1], d_hm)),
         );
         inp.insert(
-            ap.id,
+            ap.id(),
             Value::from(HostTensor::f32(vec![1, hq, 1, 1], a_par.clone())),
         );
         inp.insert(
-            dskp.id,
+            dskp.id(),
             Value::from(HostTensor::f32(vec![1, hq, 1, 1], d_par.clone())),
         );
         inp.insert(
-            trilp.id,
+            trilp.id(),
             Value::from(HostTensor::f32(vec![1, hq, l, l], tril)),
         );
         inp.insert(
-            h0p.id,
+            h0p.id(),
             Value::from(HostTensor::f32(vec![1, hq, n, p], vec![0.0; hq * n * p])),
         );
 
@@ -573,11 +577,14 @@ fn causal_conv1d_decode_fuzz_matches_reference() {
         for t in 0..l {
             let mut inp = HashMap::new();
             inp.insert(
-                x.id,
+                x.id(),
                 Value::from(HostTensor::f32(vec![1, 1, c], xs[t].clone())),
             );
-            inp.insert(w.id, Value::from(HostTensor::f32(vec![kk, c], wv.clone())));
-            inp.insert(cache.id, Value::from(cv.clone()));
+            inp.insert(
+                w.id(),
+                Value::from(HostTensor::f32(vec![kk, c], wv.clone())),
+            );
+            inp.insert(cache.id(), Value::from(cv.clone()));
             let (ot, new) = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
                 .map(|r| {
                     let state = r
@@ -681,11 +688,11 @@ fn causal_conv1d_decode_batch_generalizes_from_batch1() {
             for (t, out_row) in got.iter_mut().enumerate() {
                 let mut inp = HashMap::new();
                 inp.insert(
-                    x.id,
+                    x.id(),
                     Value::from(HostTensor::f32(vec![1, 1, c], xs[row][t].clone())),
                 );
-                inp.insert(w.id, Value::from(HostTensor::f32(vec![k, c], wd.clone())));
-                inp.insert(cache.id, Value::from(cv.clone()));
+                inp.insert(w.id(), Value::from(HostTensor::f32(vec![k, c], wd.clone())));
+                inp.insert(cache.id(), Value::from(cv.clone()));
                 let (o_t, new) = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
                     .map(|r| {
                         let state = r
@@ -746,12 +753,12 @@ fn causal_conv1d_decode_batch_generalizes_from_batch1() {
         let mut inp = HashMap::new();
         let x_flat: Vec<f32> = (0..b_batch).flat_map(|row| xs[row][t].clone()).collect();
         inp.insert(
-            x.id,
+            x.id(),
             Value::from(HostTensor::f32(vec![b_batch, 1, c], x_flat)),
         );
-        inp.insert(w.id, Value::from(HostTensor::f32(vec![k, c], wd.clone())));
+        inp.insert(w.id(), Value::from(HostTensor::f32(vec![k, c], wd.clone())));
         inp.insert(
-            cache.id,
+            cache.id(),
             Value::from(HostTensor::f32(vec![b_batch, k - 1, c], cv_flat.clone())),
         );
         let (o_t, new) = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -830,10 +837,13 @@ fn decay_mask_from_gates_fuzz_matches_cumprod() {
         let g = b.finish(m);
         let mut inp = HashMap::new();
         inp.insert(
-            gates.id,
+            gates.id(),
             Value::from(HostTensor::f32(vec![1, hh, 1, l], gd.clone())),
         );
-        inp.insert(tr.id, Value::from(HostTensor::f32(vec![1, hh, l, l], tril)));
+        inp.insert(
+            tr.id(),
+            Value::from(HostTensor::f32(vec![1, hh, l, l], tril)),
+        );
         let got = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
             .unwrap()
             .output
@@ -899,19 +909,19 @@ fn flash_prefill_matches_materialized_attention_prefill() {
             let g = b.finish(o);
             let mut inp = HashMap::new();
             inp.insert(
-                q.id,
+                q.id(),
                 Value::from(HostTensor::f32(vec![1, hq, l, d], qd.clone())),
             );
             inp.insert(
-                k.id,
+                k.id(),
                 Value::from(HostTensor::f32(vec![1, hkv, l, d], kd.clone())),
             );
             inp.insert(
-                v.id,
+                v.id(),
                 Value::from(HostTensor::f32(vec![1, hkv, l, d], vd.clone())),
             );
             inp.insert(
-                m.id,
+                m.id(),
                 Value::from(HostTensor::f32(vec![1, 1, l, l], mask.clone())),
             );
             eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -976,19 +986,19 @@ fn flash_attention_matches_f64_reference_at_real_head_dim_and_sink_outlier() {
         let g = b.finish(o);
         let mut inp = HashMap::new();
         inp.insert(
-            q.id,
+            q.id(),
             Value::from(HostTensor::f32(vec![1, hq, l, d], qd.clone())),
         );
         inp.insert(
-            k.id,
+            k.id(),
             Value::from(HostTensor::f32(vec![1, hkv, l, d], kd.clone())),
         );
         inp.insert(
-            v.id,
+            v.id(),
             Value::from(HostTensor::f32(vec![1, hkv, l, d], vd.clone())),
         );
         inp.insert(
-            m.id,
+            m.id(),
             Value::from(HostTensor::f32(vec![1, 1, l, l], mask.clone())),
         );
         eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -1083,25 +1093,25 @@ fn hybrid_model_decode_loop_matches_prefill() {
         ]
     };
     type LayerW = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
-    let bind_w = |inp: &mut HashMap<usize, Value>, ids: &[Traced; 5], wts: &LayerW| {
+    let bind_w = |inp: &mut HashMap<ValueId, Value>, ids: &[Traced; 5], wts: &LayerW| {
         inp.insert(
-            ids[0].id,
+            ids[0].id(),
             Value::from(HostTensor::f32(vec![h], wts.0.clone())),
         );
         inp.insert(
-            ids[1].id,
+            ids[1].id(),
             Value::from(HostTensor::f32(vec![h, qdim], wts.1.clone())),
         );
         inp.insert(
-            ids[2].id,
+            ids[2].id(),
             Value::from(HostTensor::f32(vec![h, kvd], wts.2.clone())),
         );
         inp.insert(
-            ids[3].id,
+            ids[3].id(),
             Value::from(HostTensor::f32(vec![h, kvd], wts.3.clone())),
         );
         inp.insert(
-            ids[4].id,
+            ids[4].id(),
             Value::from(HostTensor::f32(vec![qdim, h], wts.4.clone())),
         );
     };
@@ -1149,13 +1159,13 @@ fn hybrid_model_decode_loop_matches_prefill() {
     let gp = bp.finish(x2);
     let mut pin = HashMap::new();
     pin.insert(
-        xp.id,
+        xp.id(),
         Value::from(HostTensor::f32(vec![1, l, h], xd.clone())),
     );
     bind_w(&mut pin, &w0, &l0);
     bind_w(&mut pin, &w1, &l1);
-    pin.insert(cmd.id, Value::from(HostTensor::f32(vec![1, 1, l, l], dm)));
-    pin.insert(cmc.id, Value::from(HostTensor::f32(vec![1, 1, l, l], cm)));
+    pin.insert(cmd.id(), Value::from(HostTensor::f32(vec![1, 1, l, l], dm)));
+    pin.insert(cmc.id(), Value::from(HostTensor::f32(vec![1, 1, l, l], cm)));
     let want = eval(&gp, &pin, EvalOptions::new(EvalBudget::UNBOUNDED))
         .unwrap()
         .output
@@ -1217,7 +1227,7 @@ fn hybrid_model_decode_loop_matches_prefill() {
 
         let mut inp = HashMap::new();
         inp.insert(
-            xt.id,
+            xt.id(),
             Value::from(HostTensor::f32(
                 vec![1, 1, h],
                 xd[pos * h..pos * h + h].to_vec(),
@@ -1225,9 +1235,9 @@ fn hybrid_model_decode_loop_matches_prefill() {
         );
         bind_w(&mut inp, &w0d, &l0);
         bind_w(&mut inp, &w1d, &l1);
-        inp.insert(s_in.id, Value::from(s_mat.clone()));
-        inp.insert(kc_in.id, Value::from(kc.clone()));
-        inp.insert(vc_in.id, Value::from(vc.clone()));
+        inp.insert(s_in.id(), Value::from(s_mat.clone()));
+        inp.insert(kc_in.id(), Value::from(kc.clone()));
+        inp.insert(vc_in.id(), Value::from(vc.clone()));
         let (o_t, new) = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
             .map(|r| {
                 let state = r
@@ -1279,11 +1289,11 @@ fn decay_mask_from_gates_matches_reference() {
         let g = b.finish(m);
         let mut inp = HashMap::new();
         inp.insert(
-            gates.id,
+            gates.id(),
             Value::from(HostTensor::f32(vec![1, hh, 1, l], gv.to_vec())),
         );
         inp.insert(
-            tr.id,
+            tr.id(),
             Value::from(HostTensor::f32(vec![1, hh, l, l], tril.clone())),
         );
         eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -1357,22 +1367,25 @@ fn gated_linear_attention_prefill_with_in_graph_mask_matches_reference() {
     let g = b.finish(o);
     let mut inp = HashMap::new();
     inp.insert(
-        q.id,
+        q.id(),
         Value::from(HostTensor::f32(vec![1, hq, l, d], qd.clone())),
     );
     inp.insert(
-        k.id,
+        k.id(),
         Value::from(HostTensor::f32(vec![1, hkv, l, d], kd.clone())),
     );
     inp.insert(
-        v.id,
+        v.id(),
         Value::from(HostTensor::f32(vec![1, hkv, l, d], vd.clone())),
     );
     inp.insert(
-        gates.id,
+        gates.id(),
         Value::from(HostTensor::f32(vec![1, hq, 1, l], gd.clone())),
     );
-    inp.insert(tr.id, Value::from(HostTensor::f32(vec![1, hq, l, l], tril)));
+    inp.insert(
+        tr.id(),
+        Value::from(HostTensor::f32(vec![1, hq, l, l], tril)),
+    );
     let got = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
         .unwrap()
         .output
@@ -1470,45 +1483,45 @@ fn mamba2_block_decode_loop_matches_reference() {
     let result = b.binary(BinOp::Add, x, out);
     let g = b.finish_with_state(result, &[(conv_cache, conv_cache_out), (h_in, h_out)]);
 
-    let bind_w = |inp: &mut HashMap<usize, Value>| {
+    let bind_w = |inp: &mut HashMap<ValueId, Value>| {
         inp.insert(
-            cz.id,
+            cz.id(),
             Value::from(HostTensor::f32(vec![hh, ch], w_z.clone())),
         );
         inp.insert(
-            cxc.id,
+            cxc.id(),
             Value::from(HostTensor::f32(vec![hh, ch], w_xc.clone())),
         );
         inp.insert(
-            cb.id,
+            cb.id(),
             Value::from(HostTensor::f32(vec![hh, hq * n], w_b.clone())),
         );
         inp.insert(
-            cc.id,
+            cc.id(),
             Value::from(HostTensor::f32(vec![hh, hq * n], w_c.clone())),
         );
         inp.insert(
-            cdt.id,
+            cdt.id(),
             Value::from(HostTensor::f32(vec![hh, hq], w_dt.clone())),
         );
         inp.insert(
-            cdtb.id,
+            cdtb.id(),
             Value::from(HostTensor::f32(vec![hq], dt_bias.clone())),
         );
         inp.insert(
-            cwconv.id,
+            cwconv.id(),
             Value::from(HostTensor::f32(vec![kk, ch], w_conv.clone())),
         );
         inp.insert(
-            ca.id,
+            ca.id(),
             Value::from(HostTensor::f32(vec![1, hq, 1, 1], a_par.clone())),
         );
         inp.insert(
-            cd.id,
+            cd.id(),
             Value::from(HostTensor::f32(vec![1, hq, 1, 1], d_par.clone())),
         );
         inp.insert(
-            cwout.id,
+            cwout.id(),
             Value::from(HostTensor::f32(vec![ch, hh], w_out.clone())),
         );
     };
@@ -1519,15 +1532,15 @@ fn mamba2_block_decode_loop_matches_reference() {
     for t in 0..l {
         let mut inp = HashMap::new();
         inp.insert(
-            x.id,
+            x.id(),
             Value::from(HostTensor::f32(
                 vec![1, 1, hh],
                 xd[t * hh..t * hh + hh].to_vec(),
             )),
         );
         bind_w(&mut inp);
-        inp.insert(conv_cache.id, Value::from(cv_cache.clone()));
-        inp.insert(h_in.id, Value::from(h_state.clone()));
+        inp.insert(conv_cache.id(), Value::from(cv_cache.clone()));
+        inp.insert(h_in.id(), Value::from(h_state.clone()));
         let (yt, new) = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
             .map(|r| {
                 let state = r
@@ -1663,7 +1676,7 @@ fn linear_attention_layer_decode_loop_matches_prefill() {
     let attn = linear(&bp, from_heads(&bp, o, l), cwo, None);
     let xout_p = bp.binary(BinOp::Add, xp, attn);
     let gp = bp.finish(xout_p);
-    let bindw = |inp: &mut HashMap<usize, Value>, ids: [usize; 5]| {
+    let bindw = |inp: &mut HashMap<ValueId, Value>, ids: [ValueId; 5]| {
         inp.insert(ids[0], Value::from(HostTensor::f32(vec![h], wn.clone())));
         inp.insert(
             ids[1],
@@ -1684,11 +1697,14 @@ fn linear_attention_layer_decode_loop_matches_prefill() {
     };
     let mut pin = HashMap::new();
     pin.insert(
-        xp.id,
+        xp.id(),
         Value::from(HostTensor::f32(vec![1, l, h], xd.clone())),
     );
-    bindw(&mut pin, [cwn.id, cwq.id, cwk.id, cwv.id, cwo.id]);
-    pin.insert(cmask.id, Value::from(HostTensor::f32(vec![1, 1, l, l], md)));
+    bindw(&mut pin, [cwn.id(), cwq.id(), cwk.id(), cwv.id(), cwo.id()]);
+    pin.insert(
+        cmask.id(),
+        Value::from(HostTensor::f32(vec![1, 1, l, l], md)),
+    );
     let want = eval(&gp, &pin, EvalOptions::new(EvalBudget::UNBOUNDED))
         .unwrap()
         .output
@@ -1722,13 +1738,13 @@ fn linear_attention_layer_decode_loop_matches_prefill() {
     for t in 0..l {
         let mut inp = HashMap::new();
         inp.insert(
-            xt.id,
+            xt.id(),
             Value::from(HostTensor::f32(
                 vec![1, 1, h],
                 xd[t * h..t * h + h].to_vec(),
             )),
         );
-        bindw(&mut inp, [dwn.id, dwq.id, dwk.id, dwv.id, dwo.id]);
+        bindw(&mut inp, [dwn.id(), dwq.id(), dwk.id(), dwv.id(), dwo.id()]);
         for (ci, &(s, _)) in gd.state.iter().enumerate() {
             inp.insert(s, Value::from(caches[ci].clone()));
         }
@@ -1779,7 +1795,7 @@ fn linear_attention_decode_loop_matches_prefill() {
         StateRole::Recurrent,
     );
     let (o, s_out) = scalar_decay_decode(&b, q, k, v, n_rep, decay, s_in);
-    let (qi, ki, vi) = (q.id, k.id, v.id);
+    let (qi, ki, vi) = (q.id(), k.id(), v.id());
     let gd = b.finish_with_state(o, &[(s_in, s_out)]);
 
     // run the decode loop, carrying S; collect outputs into the prefill's [Hq, L, D_v] layout.
@@ -1844,7 +1860,7 @@ fn linear_attention_decode_loop_matches_prefill() {
     let pv = bp.constant("v", TensorType::f32(vec![1, hkv, l, dv]));
     let pm = bp.constant("m", TensorType::f32(vec![1, 1, l, l]));
     let po = linear_attention_prefill(&bp, pq, pk, pv, n_rep, pm);
-    let (pqi, pki, pvi, pmi) = (pq.id, pk.id, pv.id, pm.id);
+    let (pqi, pki, pvi, pmi) = (pq.id(), pk.id(), pv.id(), pm.id());
     let gp = bp.finish(po);
     let mut pin = HashMap::new();
     pin.insert(pqi, Value::from(HostTensor::f32(vec![1, hq, l, dk], qd)));
@@ -1894,20 +1910,20 @@ fn mamba2_ssd_prefill_stays_finite_when_delta_a_underflows_the_gate() {
     let (y, h_out) = mamba2_ssd_prefill(&b, xs, bs, cs, dl, ap, dk, h, tr);
     let gy = b.finish(y);
     let mut gh = gy.clone();
-    gh.output = h_out.id;
+    gh.output = h_out.id();
 
     let mut inp = HashMap::new();
     let mut put = |id, shape: Vec<usize>, data: Vec<f32>| {
         inp.insert(id, Value::from(HostTensor::f32(shape, data)));
     };
-    put(xs.id, vec![1, hq, l, p], x.clone());
-    put(bs.id, vec![1, hq, l, n], b_in.clone());
-    put(cs.id, vec![1, hq, l, n], c_in.clone());
-    put(dl.id, vec![1, hq, l, 1], vec![delta; l]);
-    put(ap.id, vec![1, hq, 1, 1], vec![a]);
-    put(dk.id, vec![1, hq, 1, 1], vec![d_skip]);
-    put(tr.id, vec![1, hq, l, l], tril);
-    put(h.id, vec![1, hq, n, p], h0);
+    put(xs.id(), vec![1, hq, l, p], x.clone());
+    put(bs.id(), vec![1, hq, l, n], b_in.clone());
+    put(cs.id(), vec![1, hq, l, n], c_in.clone());
+    put(dl.id(), vec![1, hq, l, 1], vec![delta; l]);
+    put(ap.id(), vec![1, hq, 1, 1], vec![a]);
+    put(dk.id(), vec![1, hq, 1, 1], vec![d_skip]);
+    put(tr.id(), vec![1, hq, l, l], tril);
+    put(h.id(), vec![1, hq, n, p], h0);
     let run = |g: &poot_graph_ir::Graph| {
         eval(g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
             .unwrap()

@@ -38,7 +38,7 @@ fn masked_attention_equals_sliced() {
         let v = b.constant("v", TensorType::f32(vec![1, hkv, cap, d]));
         let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
         let out = attention_masked(&b, q, k, v, n_rep, scale, mask);
-        let (qi, ki, vi, mi) = (q.id, k.id, v.id, mask.id);
+        let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
         let g = b.finish(out);
         let mut inputs = HashMap::new();
         inputs.insert(qi, HostTensor::f32(vec![1, hq, 1, d], qd.clone()));
@@ -67,7 +67,7 @@ fn masked_attention_equals_sliced() {
         let kvalid = b.slice(k, 2, 0, pos + 1);
         let vvalid = b.slice(v, 2, 0, pos + 1);
         let out = attention(&b, q, kvalid, vvalid, n_rep, scale);
-        let (qi, ki, vi) = (q.id, k.id, v.id);
+        let (qi, ki, vi) = (q.id(), k.id(), v.id());
         let g = b.finish(out);
         let mut inputs = HashMap::new();
         inputs.insert(qi, HostTensor::f32(vec![1, hq, 1, d], qd.clone()));
@@ -101,7 +101,7 @@ fn softcap_evaluates_to_c_tanh_and_approaches_identity() {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![n]));
     let y = softcap(&b, x, c);
-    let xi = x.id;
+    let xi = x.id();
     let g = b.finish(y);
     let mut inputs = HashMap::new();
     inputs.insert(xi, HostTensor::f32(vec![n], xd.clone()));
@@ -128,7 +128,7 @@ fn softcap_evaluates_to_c_tanh_and_approaches_identity() {
     let b2 = Builder::new();
     let x2 = b2.constant("x", TensorType::f32(vec![n]));
     let y2 = softcap(&b2, x2, big);
-    let xi2 = x2.id;
+    let xi2 = x2.id();
     let g2 = b2.finish(y2);
     let mut in2 = HashMap::new();
     in2.insert(xi2, HostTensor::f32(vec![n], modest.clone()));
@@ -165,7 +165,7 @@ fn attention_softcap_matches_reference_and_differs_from_uncapped() {
         let k = b.constant("k", TensorType::f32(vec![1, hkv, s, d]));
         let v = b.constant("v", TensorType::f32(vec![1, hkv, s, d]));
         let out = attention_softcap(&b, q, k, v, n_rep, scale, softcap_c);
-        let (qi, ki, vi) = (q.id, k.id, v.id);
+        let (qi, ki, vi) = (q.id(), k.id(), v.id());
         let g = b.finish(out);
         let mut inputs = HashMap::new();
         inputs.insert(qi, HostTensor::f32(vec![1, hq, 1, d], qd.clone()));
@@ -227,7 +227,7 @@ fn matmul_matches_naive() {
     let a = b.constant("a", TensorType::f32(vec![1, 1, 3]));
     let w = b.constant("w", TensorType::f32(vec![3, 2]));
     let out = b.matmul(a, w);
-    let (ai, wi) = (a.id, w.id);
+    let (ai, wi) = (a.id(), w.id());
     let g = b.finish(out);
 
     let ad = vec![1.0, 2.0, 3.0];
@@ -419,12 +419,12 @@ fn dynamic_update_slice_writes_one_slot() {
     g.validate().expect("valid");
 
     let mut inputs: HashMap<ValueId, HostTensor> = HashMap::new();
-    inputs.insert(cache.id, HostTensor::zeros(vec![2, 4, 3]));
+    inputs.insert(cache.id(), HostTensor::zeros(vec![2, 4, 3]));
     inputs.insert(
-        upd.id,
+        upd.id(),
         HostTensor::f32(vec![2, 1, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
     );
-    inputs.insert(logits.id, HostTensor::zeros(vec![1, 1, 4]));
+    inputs.insert(logits.id(), HostTensor::zeros(vec![1, 1, 4]));
 
     let (_out, states) = {
         let values: HashMap<ValueId, Value> = inputs

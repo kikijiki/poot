@@ -12,7 +12,7 @@ use std::sync::Arc;
 use poot_graph_ir::decompose::{Decomposition, decompose};
 use poot_graph_ir::{
     ComputedConst, Eqn, Graph, OpClass, OpKind, Operand as IrOperand, ScanAttrs, TensorType,
-    ValidationChannel, ValueId,
+    ValidationChannel, ValueId, ValueTable,
 };
 
 use crate::cast_authority::{CastAuthority, ExactI32CastRole, validate_cast_source};
@@ -143,7 +143,7 @@ pub struct Evaluation {
     /// State outputs in [`Graph::state`] order.
     pub state: Vec<Value>,
     /// The full per-value environment, present only when [`EvalOptions::keep_environment`] was set.
-    pub environment: Option<Vec<Option<Value>>>,
+    pub environment: Option<ValueTable<Option<Value>>>,
 }
 
 /// Evaluate `g`. `inputs` must bind every graph input (consts and slots; a computed constant, such as
@@ -165,7 +165,7 @@ pub fn eval<V: ValidationChannel>(
     g.validate()?;
     preflight_bindings(g, inputs)?;
 
-    let mut env: Vec<Option<Value>> = vec![None; g.values.len()];
+    let mut env: ValueTable<Option<Value>> = ValueTable::filled(g.values.len(), None);
     bind_inputs(g, inputs, &mut env)?;
 
     let producers = producers(g);
@@ -214,8 +214,8 @@ pub fn eval<V: ValidationChannel>(
 }
 
 /// The index of the equation that produces each value, if any.
-fn producers<V: ValidationChannel>(g: &Graph<V>) -> Vec<Option<usize>> {
-    let mut producers: Vec<Option<usize>> = vec![None; g.values.len()];
+fn producers<V: ValidationChannel>(g: &Graph<V>) -> ValueTable<Option<usize>> {
+    let mut producers: ValueTable<Option<usize>> = ValueTable::filled(g.values.len(), None);
     for (index, eqn) in g.eqns.iter().enumerate() {
         producers[eqn.out] = Some(index);
     }
@@ -224,7 +224,7 @@ fn producers<V: ValidationChannel>(g: &Graph<V>) -> Vec<Option<usize>> {
 
 /// Copy one value out of the completed environment for publication: the one place every output and
 /// state value leaves the walk, always after [`validate_environment`] has gated it.
-fn publish_value(env: &[Option<Value>], value: ValueId) -> Result<Value, EvalError> {
+fn publish_value(env: &ValueTable<Option<Value>>, value: ValueId) -> Result<Value, EvalError> {
     #[cfg(test)]
     publication_probe::record();
     env.get(value)
@@ -237,7 +237,7 @@ fn publish_value(env: &[Option<Value>], value: ValueId) -> Result<Value, EvalErr
 /// dense F32 tensor of its declared shape; an empty validation set is a no-op.
 fn validate_environment<V: ValidationChannel>(
     g: &Graph<V>,
-    env: &[Option<Value>],
+    env: &ValueTable<Option<Value>>,
 ) -> Result<(), EvalError> {
     let validations = g.validation_outputs();
     if validations.is_empty() {
@@ -331,7 +331,7 @@ fn check_published<V: ValidationChannel>(
     };
     debug_assert!(
         shape_ok && class_ok,
-        "eqn v{} ({}) published {:?} for declared {expected}",
+        "eqn {} ({}) published {:?} for declared {expected}",
         eqn.out,
         resolve::op_label(&eqn.op),
         value.shape()
@@ -406,7 +406,7 @@ fn preflight_bindings<V: ValidationChannel>(
 fn bind_inputs<V: ValidationChannel>(
     g: &Graph<V>,
     inputs: &HashMap<ValueId, Value>,
-    env: &mut [Option<Value>],
+    env: &mut ValueTable<Option<Value>>,
 ) -> Result<(), EvalError> {
     for &id in &g.inputs {
         if let poot_graph_ir::Storage::Computed(computed) = g.meta(id).storage {
@@ -433,8 +433,8 @@ fn touches_e4m3<V: ValidationChannel>(g: &Graph<V>, eqn: &Eqn) -> bool {
 fn evaluate_equation<V: ValidationChannel>(
     g: &Graph<V>,
     eqn: &Eqn,
-    env: &[Option<Value>],
-    producers: &[Option<usize>],
+    env: &ValueTable<Option<Value>>,
+    producers: &ValueTable<Option<usize>>,
     idx: usize,
     opts: &mut EvalOptions<'_>,
     decompositions: &mut Decompositions,
@@ -538,7 +538,7 @@ impl Decompositions {
 fn evaluate_composite<V: ValidationChannel>(
     g: &Graph<V>,
     eqn: &Eqn,
-    env: &[Option<Value>],
+    env: &ValueTable<Option<Value>>,
     idx: usize,
     opts: &mut EvalOptions<'_>,
     decompositions: &mut Decompositions,
@@ -602,7 +602,7 @@ fn run_decomposition(
     decompositions: &mut Decompositions,
 ) -> Result<Value, EvalError> {
     let inner = &decomposition.graph;
-    let mut inner_env: Vec<Option<Value>> = vec![None; inner.values.len()];
+    let mut inner_env: ValueTable<Option<Value>> = ValueTable::filled(inner.values.len(), None);
     for (&placeholder, value) in decomposition.operands.iter().zip(bound) {
         inner_env[placeholder] = Some(value);
     }
@@ -746,8 +746,8 @@ fn evaluate_cast<V: ValidationChannel>(
     g: &Graph<V>,
     eqn: &Eqn,
     to: DType,
-    env: &[Option<Value>],
-    producers: &[Option<usize>],
+    env: &ValueTable<Option<Value>>,
+    producers: &ValueTable<Option<usize>>,
     idx: usize,
     opts: &mut EvalOptions<'_>,
 ) -> Result<Value, EvalError> {
@@ -979,7 +979,7 @@ fn evaluate_gather<V: ValidationChannel>(
     g: &Graph<V>,
     eqn: &Eqn,
     axis: usize,
-    env: &[Option<Value>],
+    env: &ValueTable<Option<Value>>,
     idx: usize,
     opts: &mut EvalOptions<'_>,
 ) -> Result<Value, EvalError> {
@@ -1073,7 +1073,7 @@ fn evaluate_bf16<V: ValidationChannel>(
     g: &Graph<V>,
     eqn: &Eqn,
     equation: Bf16Equation<'_>,
-    env: &[Option<Value>],
+    env: &ValueTable<Option<Value>>,
     idx: usize,
     opts: &mut EvalOptions<'_>,
 ) -> Result<Value, EvalError> {
@@ -1157,7 +1157,7 @@ fn evaluate_bf16<V: ValidationChannel>(
 fn evaluate_e4m3<V: ValidationChannel>(
     g: &Graph<V>,
     eqn: &Eqn,
-    env: &[Option<Value>],
+    env: &ValueTable<Option<Value>>,
 ) -> Result<Value, EvalError> {
     match &eqn.op {
         OpKind::Reshape { shape } => {
@@ -1260,7 +1260,7 @@ fn evaluate_e4m3<V: ValidationChannel>(
 
 /// A `HostTensor` over any I32-bearing operand: a host tensor as-is, or a zero-copy alias of an
 /// exact-I32 view's word `Arc` (a huge checkpoint-derived table costs one `Arc` clone, not a copy).
-fn i32_tensor(id: ValueId, env: &[Option<Value>]) -> Result<HostTensor, EvalError> {
+fn i32_tensor(id: ValueId, env: &ValueTable<Option<Value>>) -> Result<HostTensor, EvalError> {
     match env_value(env, id)? {
         Value::Host(tensor) => Ok(tensor.clone()),
         Value::Owner(ExactValue::I32(view)) => Ok(HostTensor::i32_arc(
@@ -1278,7 +1278,7 @@ fn i32_tensor(id: ValueId, env: &[Option<Value>]) -> Result<HostTensor, EvalErro
 fn evaluate_dense<V: ValidationChannel>(
     g: &Graph<V>,
     eqn: &Eqn,
-    env: &[Option<Value>],
+    env: &ValueTable<Option<Value>>,
     idx: usize,
     opts: &mut EvalOptions<'_>,
 ) -> Result<Value, EvalError> {
@@ -1462,8 +1462,9 @@ fn evaluate_dense<V: ValidationChannel>(
             let index = ops::index_rule::index_at(index_value, 0, starts, eqn.out)?;
             ops::movement::dynamic_update_slice(&operand, &update, index, *axis)?
         }
-        OpKind::AllReduce { .. } | OpKind::AllGather { .. } => {
-            ops::collective::single_rank_identity(get(&eqn.inputs[0])?)
+        OpKind::AllReduce { .. } => ops::collective::single_rank_identity(get(&eqn.inputs[0])?),
+        OpKind::AllGather { world, .. } => {
+            ops::collective::all_gather(get(&eqn.inputs[0])?, *world, eqn.out)?
         }
         OpKind::RandomUniform { cols } => {
             let seed = get(&eqn.inputs[0])?;
@@ -1533,7 +1534,7 @@ fn evaluate_dense<V: ValidationChannel>(
 /// weight, a small table) bound as an owner view instead of eagerly loaded.
 fn dense_tensor_or_materialize(
     id: ValueId,
-    env: &[Option<Value>],
+    env: &ValueTable<Option<Value>>,
 ) -> Result<HostTensor, EvalError> {
     match env_value(env, id)? {
         Value::Host(tensor) => Ok(tensor.clone()),
@@ -1552,7 +1553,7 @@ fn dense_tensor_or_materialize(
 /// materializes as BF16 words.
 fn stored_tensor_or_materialize(
     id: ValueId,
-    env: &[Option<Value>],
+    env: &ValueTable<Option<Value>>,
 ) -> Result<HostTensor, EvalError> {
     match env_value(env, id)? {
         Value::Owner(exact @ (ExactValue::Dense(_) | ExactValue::Bf16(_))) => {

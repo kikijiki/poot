@@ -52,9 +52,6 @@ pub use packed::{PackedKernelOp, PackedKernelSpec};
 // Generators still called by name outside `generate`, each for a recorded reason (card 636 census, at
 // dispatch the planner calls none of them):
 //
-// - PTX collective and segment kernels (`poot-ptx-gpu` `p2p.rs`, `multi_device/segment.rs`): `binary`. They
-//   build a body for a peer-to-peer add outside any graph equation, so there is no request to plan; Card
-//   748's rewrite owns them.
 // - `poot-codegen`'s cache key fixture (`unary`) and its emitter, probe and parity tests; `pootc`'s import
 //   equivalence tests; `poot-test-util`'s `kernel-fixtures`; `poot-gpu`, `poot-rocm-gpu` and `poot-graph-ir`
 //   tests; this crate's own `tests/`: they build one generator's body directly to compile, run or compare

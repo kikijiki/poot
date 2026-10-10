@@ -250,6 +250,41 @@ impl FloatFormat {
             Self::E2m1 => 4,
         }
     }
+
+    /// The stored patterns that decode to NaN or an infinity, or `None` when every pattern is
+    /// finite (E2M1). The one statement of which stored floats are finite: the content check
+    /// ([`crate::content`]) is compiled from it, the scalar decoder ([`crate::scalar::float_to_f32`])
+    /// is tested equal to it for every pattern, and the device decode (`poot-kernelgen`'s
+    /// `float_decode`, which implements only the admitted domain) is tested equal to the scalar
+    /// decoder on exactly the patterns it leaves finite.
+    pub const fn non_finite(self) -> Option<NonFinite> {
+        let (mask, pattern) = match self {
+            // Exponent all ones: infinities and NaNs.
+            Self::F32 => (0x7f80_0000, 0x7f80_0000),
+            Self::F16 => (0x7c00, 0x7c00),
+            Self::Bf16 => (0x7f80, 0x7f80),
+            // No infinities; the all-ones magnitude is NaN in either sign.
+            Self::E4m3Fn => (0x7f, 0x7f),
+            // The all-ones byte is NaN.
+            Self::E8m0 => (0xff, 0xff),
+            Self::E2m1 => return None,
+        };
+        Some(NonFinite { mask, pattern })
+    }
+}
+
+/// The stored patterns of a [`FloatFormat`] that are NaN or infinite: `bits & mask == pattern`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NonFinite {
+    pub mask: u32,
+    pub pattern: u32,
+}
+
+impl NonFinite {
+    /// Whether `bits` is one of the non-finite patterns.
+    pub const fn matches(self, bits: u32) -> bool {
+        bits & self.mask == self.pattern
+    }
 }
 
 /// How a field's raw bits become a number.

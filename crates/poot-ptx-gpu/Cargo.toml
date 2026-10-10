@@ -18,9 +18,6 @@ poot-kernelgen.workspace = true
 poot-codegen.workspace = true
 poot-ptx-runtime.workspace = true
 poot-runtime-common.workspace = true
-# Raw CUDA driver P2P surface (cuMemcpyPeerAsync, peer access, cross-device events). Dynamically loaded,
-# so this compiles with no CUDA toolkit or GPU present.
-cudarc.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

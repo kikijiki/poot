@@ -920,11 +920,45 @@ fn served_unspeculated_rows_decode_as_off_rocm() {
 // A vision-language checkpoint: a served image request returns the driver's caption.
 // ---------------------------------------------------------------------------------------------
 
+/// `store` with every bf16 weight whose name `keep` does not select multiplied by `factor`.
+fn scaled_except(
+    store: &poot_quant::weights::WeightStore,
+    factor: f32,
+    keep: impl Fn(&str) -> bool,
+) -> poot_quant::weights::WeightStore {
+    use poot_quant::weights::{DenseWeight, WeightStore};
+    let mut out = WeightStore::builder();
+    for (key, entry) in store.iter() {
+        let WeightEntry::Dense(dense) = entry else {
+            panic!("the fixture is dense")
+        };
+        let bytes: Vec<u8> = if keep(key.as_str()) {
+            dense.bytes().as_slice().to_vec()
+        } else {
+            dense
+                .bytes()
+                .as_slice()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .flat_map(|&pair| {
+                    let value = f32::from_bits(u32::from(u16::from_le_bytes(pair)) << 16);
+                    (((value * factor).to_bits() >> 16) as u16).to_le_bytes()
+                })
+                .collect()
+        };
+        let dense =
+            DenseWeight::try_new(dense.dtype(), dense.shape().to_vec(), bytes.into()).unwrap();
+        out.insert(key.clone(), WeightEntry::Dense(dense)).unwrap();
+    }
+    out.build()
+}
+
 /// The SmolVLM fixture: ids of the tokenizer's words, then the idefics3 markers the front end's prompt
 /// names, then a filler up to the vocabulary. `b c d` is the question.
 mod smolvlm {
     use poot_models::registry::{Fixture, Registry};
-    use poot_quant::weights::{DenseWeight, WeightEntry, WeightKey, WeightStore};
+    use poot_quant::weights::{WeightKey, WeightStore};
 
     pub(super) const IMAGE: u32 = 42;
     pub(super) const VOCAB: usize = 48;
@@ -984,31 +1018,7 @@ mod smolvlm {
     /// `store` with every non-norm bf16 weight multiplied by `factor`: the fixture's small weights would
     /// otherwise leave the image rows too faint to reach the greedy token.
     fn scaled(store: &WeightStore, factor: f32) -> WeightStore {
-        let mut out = WeightStore::builder();
-        for (key, entry) in store.iter() {
-            let WeightEntry::Dense(dense) = entry else {
-                panic!("the fixture is dense")
-            };
-            let bytes: Vec<u8> = if key.as_str().contains("norm") {
-                dense.bytes().as_slice().to_vec()
-            } else {
-                dense
-                    .bytes()
-                    .as_slice()
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .flat_map(|&pair| {
-                        let value = f32::from_bits(u32::from(u16::from_le_bytes(pair)) << 16);
-                        (((value * factor).to_bits() >> 16) as u16).to_le_bytes()
-                    })
-                    .collect()
-            };
-            let dense =
-                DenseWeight::try_new(dense.dtype(), dense.shape().to_vec(), bytes.into()).unwrap();
-            out.insert(key.clone(), WeightEntry::Dense(dense)).unwrap();
-        }
-        out.build()
+        super::scaled_except(store, factor, |name| name.contains("norm"))
     }
 
     /// The registry's `idefics3_vision` weights (8-pixel frames, 16 patches, 4 visual tokens of the
@@ -1082,6 +1092,12 @@ mod smolvlm {
         std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
         std::fs::write(dir.join("tokenizer.json"), tokenizer_json().to_string()).unwrap();
         std::fs::write(
+            dir.join("tokenizer_config.json"),
+            serde_json::json!({ "chat_template": poot_test_util::smolvlm::CHAT_TEMPLATE })
+                .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
             dir.join("preprocessor_config.json"),
             serde_json::json!({
                 "size": { "longest_edge": 16 },
@@ -1108,20 +1124,26 @@ fn png_of(fill: impl Fn(u32, u32) -> u8) -> Vec<u8> {
     png
 }
 
-fn chat_with_image(png: &[u8]) -> serde_json::Value {
+/// An OpenAI `image_url` part holding `png` as a data URI.
+fn image_part(png: &[u8]) -> serde_json::Value {
     use base64::Engine as _;
     let url = format!(
         "data:image/png;base64,{}",
         base64::engine::general_purpose::STANDARD.encode(png)
     );
-    serde_json::json!({
-        "messages": [{ "role": "user", "content": [
-            { "type": "text", "text": "b c d" },
-            { "type": "image_url", "image_url": { "url": url } },
-        ]}],
-        "max_tokens": 8,
-        "temperature": 0.0,
-    })
+    serde_json::json!({ "type": "image_url", "image_url": { "url": url } })
+}
+
+/// A chat request over `messages`, greedy.
+fn chat_of(messages: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "messages": messages, "max_tokens": 8, "temperature": 0.0 })
+}
+
+fn chat_with_image(png: &[u8]) -> serde_json::Value {
+    chat_of(serde_json::json!([{ "role": "user", "content": [
+        { "type": "text", "text": "b c d" },
+        image_part(png),
+    ]}]))
 }
 
 impl Server {
@@ -1141,7 +1163,11 @@ impl Server {
 /// 400, not a dropped image. Mutation: zero the rows in `vision::ImageClient::prepare`; the served
 /// caption is the zero-row continuation, equal for both images, and the row goes red.
 fn served_smolvlm_caption(choice: BackendChoice, backend: DeviceBackend, flag: &str) {
-    use poot_llm::front_end::{CaptionRequest, Idefics3, Idefics3Checkpoint, decode_image};
+    use poot_llm::ChatTurn;
+    use poot_llm::ImageCheckpoint as _;
+    use poot_llm::front_end::{
+        CaptionRequest, DecodedImage, Idefics3, Idefics3Checkpoint, decode_image,
+    };
 
     let dir = smolvlm::write_checkpoint(NO_EOS);
     let black = png_of(|_, _| 0);
@@ -1169,27 +1195,51 @@ fn served_smolvlm_caption(choice: BackendChoice, backend: DeviceBackend, flag: &
         (text, options(CAPACITY * 2)),
     )
     .expect("load the fixture SmolVLM in this process");
+    // The driver's caption of a conversation: the reference the served one must equal.
+    let mut caption = |pngs: &[&Vec<u8>], turns: &[ChatTurn<'_>]| -> String {
+        let decoded: Vec<_> = pngs
+            .iter()
+            .map(|png| decode_image(png).expect("decode the fixture image"))
+            .collect();
+        let images: Vec<_> = decoded.iter().map(DecodedImage::as_image).collect();
+        let generation = vlm
+            .caption(
+                &CaptionRequest {
+                    images: &images,
+                    turns,
+                    max_new: 8,
+                },
+                &mut |_: u32, _: &str| GenerationControl::Continue(()),
+            )
+            .expect("caption");
+        checkpoint
+            .text()
+            .text()
+            .decode(&generation.tokens)
+            .expect("decode the caption")
+    };
     let expected: Vec<String> = [&black, &white, &quadrant]
         .into_iter()
-        .map(|png| {
-            let decoded = decode_image(png).expect("decode the fixture image");
-            let generation = vlm
-                .caption(
-                    &CaptionRequest {
-                        images: &[decoded.as_image()],
-                        question: "b c d",
-                        max_new: 8,
-                    },
-                    &mut |_: u32, _: &str| GenerationControl::Continue(()),
-                )
-                .expect("caption");
-            checkpoint
-                .text()
-                .text()
-                .decode(&generation.tokens)
-                .expect("decode the caption")
-        })
+        .map(|png| caption(&[png], &[ChatTurn::user(1, "b c d")]))
         .collect();
+    // A conversation: a system prompt, an image question, the assistant's answer, a second image.
+    let conversation = [
+        ChatTurn {
+            role: "system",
+            images: 0,
+            text: "b",
+        },
+        ChatTurn::user(1, "b c d"),
+        ChatTurn {
+            role: "assistant",
+            images: 0,
+            text: "e f",
+        },
+        ChatTurn::user(1, "c d"),
+    ];
+    let expected_conversation = caption(&[&black, &white], &conversation);
+    let expected_last_turn_alone = caption(&[&white], &[ChatTurn::user(1, "c d")]);
+    drop(caption);
     drop(vlm);
     assert_ne!(
         expected[0], expected[1],
@@ -1198,6 +1248,10 @@ fn served_smolvlm_caption(choice: BackendChoice, backend: DeviceBackend, flag: &
     assert_ne!(
         expected[1], expected[2],
         "the tile order is part of the caption"
+    );
+    assert_ne!(
+        expected_conversation, expected_last_turn_alone,
+        "the earlier turns must reach the logits, or the multi-turn row proves nothing"
     );
 
     let server = Server::spawn(&dir, flag, &[]);
@@ -1223,12 +1277,42 @@ fn served_smolvlm_caption(choice: BackendChoice, backend: DeviceBackend, flag: &
     let mut garbage = chat_with_image(&black);
     garbage["messages"][0]["content"][1]["image_url"]["url"] = "data:image/png;base64,AAAA".into();
     refused(&garbage, "decode image");
-    let mut conversation = chat_with_image(&black);
-    conversation["messages"]
+    // A text that spells the image mark would take another image's rows, so it is refused.
+    let mut spelled = chat_with_image(&black);
+    spelled["messages"][0]["content"][0]["text"] = "b <image> c".into();
+    refused(&spelled, "<image> marks");
+    // A tool result has no place in the image chat template.
+    let mut tool_result = chat_with_image(&black);
+    tool_result["messages"]
         .as_array_mut()
         .unwrap()
-        .insert(0, serde_json::json!({ "role": "system", "content": "b" }));
-    refused(&conversation, "one user message");
+        .push(serde_json::json!({ "role": "tool", "content": "b", "tool_call_id": "t" }));
+    refused(&tool_result, "tool");
+
+    // A conversation with images in two turns, a system prompt and an assistant answer is rendered
+    // through the model's chat template: it equals the driver's caption of the same turns. Mutation:
+    // keep only the last message in `handlers::image_prompt`; the earlier turns and the first image
+    // are dropped, the served caption becomes the last turn alone, and the row goes red.
+    let served_conversation = chat_of(serde_json::json!([
+        { "role": "system", "content": "b" },
+        { "role": "user", "content": [
+            { "type": "text", "text": "b c d" },
+            image_part(&black),
+        ]},
+        { "role": "assistant", "content": "e f" },
+        { "role": "user", "content": [
+            { "type": "text", "text": "c d" },
+            image_part(&white),
+        ]},
+    ]));
+    let (status, served) = server.chat(&served_conversation);
+    assert_eq!(status, 200, "{served}");
+    assert_eq!(
+        served["choices"][0]["message"]["content"].as_str().unwrap(),
+        expected_conversation.trim_end(),
+        "{flag}: the served conversation differs from Idefics3::caption's"
+    );
+
     // Tools would be dropped by the image prompt, so they are refused rather than ignored. Mutation:
     // delete the tools check in `handlers::image_prompt`; the request is served and the row goes red.
     let mut tools = chat_with_image(&black);
@@ -1250,4 +1334,309 @@ fn served_smolvlm_caption_rocm() {
 #[test]
 fn served_smolvlm_caption_ptx() {
     served_smolvlm_caption(BackendChoice::Ptx, DeviceBackend::Ptx, "ptx");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Qwen2.5-VL: the second image front end, with the prompt's sectioned positions.
+// ---------------------------------------------------------------------------------------------
+
+/// The Qwen2.5-VL fixture: the registry's text and vision towers over one set of weights, a 48-word
+/// tokenizer with the vision markers, a one-line chat template and a processor of 2-pixel patches that
+/// merge 2 x 2.
+mod qwen_vl {
+    use std::collections::HashMap;
+
+    use poot_models::registry::Registry;
+    use poot_quant::weights::WeightStore;
+
+    pub(super) const VOCAB: usize = 48;
+    const VISION_START: (&str, u32) = ("<|vision_start|>", 40);
+    const IMAGE_PAD: (&str, u32) = ("<|image_pad|>", 41);
+    const VIDEO_PAD: (&str, u32) = ("<|video_pad|>", 42);
+    const VISION_END: (&str, u32) = ("<|vision_end|>", 43);
+    const IM_END: (&str, u32) = ("<|im_end|>", 47);
+    const CHAT_TEMPLATE: &str =
+        "{% for message in messages %}{{ message.role }} {{ message.content }}\n{% endfor %}";
+
+    /// A word-level tokenizer: word `t<i>` is token `i` but for `user`, `hello` and the markers.
+    fn tokenizer_json() -> serde_json::Value {
+        let mut vocab: HashMap<String, u32> =
+            (0..VOCAB as u32).map(|id| (format!("t{id}"), id)).collect();
+        let markers = [VISION_START, IMAGE_PAD, VIDEO_PAD, VISION_END, IM_END];
+        for (word, id) in [("user", 2), ("hello", 4)].into_iter().chain(markers) {
+            vocab.retain(|_, v| *v != id);
+            vocab.insert(word.to_string(), id);
+        }
+        let added: Vec<serde_json::Value> = markers
+            .iter()
+            .map(|&(word, id)| {
+                serde_json::json!({
+                    "id": id, "content": word, "single_word": false, "lstrip": false,
+                    "rstrip": false, "normalized": false, "special": true
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": added,
+            "normalizer": null,
+            "pre_tokenizer": { "type": "WhitespaceSplit" },
+            "post_processor": null,
+            "decoder": null,
+            "model": { "type": "WordLevel", "vocab": vocab, "unk_token": "t0" }
+        })
+    }
+
+    fn fixture_of(registry: &Registry, family: &str) -> poot_models::registry::Fixture {
+        let entry = registry
+            .entries()
+            .iter()
+            .find(|entry| entry.family.as_str() == family)
+            .unwrap_or_else(|| panic!("{family} is a shipped family"));
+        (entry.fixture)()
+    }
+
+    /// Both towers' fixtures (the weights multiplied by `factor`, norm scales and the merger's `ln_q`
+    /// kept) as one checkpoint directory: `config.json` with the text tower on top and `vision_config`
+    /// nested.
+    pub(super) fn write_checkpoint(factor: f32, no_eos: u32) -> poot_test_util::UniqueTempPath {
+        let registry = Registry::builtin().unwrap();
+        let text = fixture_of(&registry, "qwen2_5_vl");
+        let vision = fixture_of(&registry, "qwen2_5_vl_vision");
+        let dir = poot_test_util::unique_temp_path("served_qwen_vl_checkpoint");
+        std::fs::create_dir_all(&dir).unwrap();
+        let keep = |name: &str| name.contains("norm") || name.contains("ln_q");
+        let mut store = WeightStore::builder();
+        for (key, entry) in super::scaled_except(&text.store, factor, keep)
+            .iter()
+            .chain(super::scaled_except(&vision.store, factor, keep).iter())
+        {
+            store.insert(key.clone(), entry.clone()).unwrap();
+        }
+        poot_test_util::safetensors::write(&dir.join("model.safetensors"), &store.build());
+        let mut config = text.config.clone();
+        let mut vision_config = vision.config.clone();
+        vision_config.as_object_mut().unwrap().remove("model_type");
+        vision_config["tokens_per_second"] = 2.into();
+        config["vision_config"] = vision_config;
+        config["vision_start_token_id"] = VISION_START.1.into();
+        config["image_token_id"] = IMAGE_PAD.1.into();
+        config["video_token_id"] = VIDEO_PAD.1.into();
+        config["eos_token_id"] = no_eos.into();
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        std::fs::write(
+            dir.join("preprocessor_config.json"),
+            r#"{"do_resize":false,"min_pixels":1,"max_pixels":4096,"patch_size":2,
+               "temporal_patch_size":2,"merge_size":2}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            serde_json::json!({
+                "vision_start_token": VISION_START.0,
+                "image_token": IMAGE_PAD.0,
+                "video_token": VIDEO_PAD.0,
+                "chat_template": CHAT_TEMPLATE,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("tokenizer.json"), tokenizer_json().to_string()).unwrap();
+        dir
+    }
+}
+
+/// A 12-row, 8-column PNG (a 6 x 4 patch grid of 2-pixel patches, 6 merged tokens): `fill` gives each
+/// pixel's grey.
+fn small_png_of(fill: impl Fn(u32, u32) -> u8) -> Vec<u8> {
+    let image = image::RgbImage::from_fn(8, 12, |x, y| image::Rgb([fill(x, y); 3]));
+    let mut png = Vec::new();
+    image
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    png
+}
+
+/// A served image request on a Qwen2.5-VL checkpoint returns the generation `Qwen25Vl::generate_chat`
+/// gives the same image and question in this process: the vision tower's rows and the prompt's sectioned
+/// positions (`Slot::MropePosition`, the image's tokens off their index) reach the engine's paged text
+/// driver, which equals the single-request contiguous reference. Different images generate differently
+/// (the rows reach the logits). A request the front end cannot lower is a typed 400. Mutation: replace the
+/// positions with zeros where `DriverEngine::open` hands them to `open_with_mrope`; the served generation
+/// leaves the reference's and the row goes red.
+fn served_qwen_vl_caption(choice: BackendChoice, backend: DeviceBackend, flag: &str) {
+    use poot_llm::ImageCheckpoint as _;
+    use poot_llm::qwen_vl::{Qwen25Vl, Qwen25VlCheckpoint, Qwen25VlGenerate};
+    use poot_llm::{
+        Qwen25VlApngFrameSource, Qwen25VlChatContent, Qwen25VlChatMessage,
+        Qwen25VlChatMessageContent, decode_qwen2_5_vl_image,
+    };
+
+    const QUESTION: &str = "hello";
+    let dir = qwen_vl::write_checkpoint(2.0, NO_EOS);
+    let pngs = [
+        small_png_of(|_, _| 0),
+        small_png_of(|_, _| 255),
+        small_png_of(|x, y| if x < 4 && y < 6 { 0 } else { 255 }),
+    ];
+    let registry = Registry::builtin().unwrap();
+    let checkpoint =
+        Qwen25VlCheckpoint::read(&dir, &registry).expect("read the fixture Qwen2.5-VL");
+    let options = |chunk: usize, capacity: usize| {
+        let mut options = driver_options();
+        options.capacity = nz(capacity);
+        options.prefill_chunk = nz(chunk);
+        options.max_trace_tokens = nz(capacity);
+        options
+    };
+    let (Some(vision), Some(text)) = (
+        poot_test_util::device_skip::open_or_skip(backend, open_executor(choice)),
+        poot_test_util::device_skip::open_or_skip(backend, open_executor(choice)),
+    ) else {
+        return;
+    };
+    let mut vlm = Qwen25Vl::load(
+        &dir,
+        &registry,
+        (vision, options(64, 64)),
+        (text, options(32, 32)),
+    )
+    .expect("load the fixture Qwen2.5-VL in this process");
+    let expected: Vec<String> = pngs
+        .iter()
+        .map(|png| {
+            let image = decode_qwen2_5_vl_image(png).expect("decode the fixture image");
+            let messages = [Qwen25VlChatMessage {
+                role: "user",
+                content: Qwen25VlChatMessageContent::Parts(vec![
+                    Qwen25VlChatContent::Image(&image),
+                    Qwen25VlChatContent::Text(QUESTION),
+                ]),
+            }];
+            let mut no_videos: [Qwen25VlApngFrameSource<'_>; 0] = [];
+            let generation = vlm
+                .generate_chat(
+                    &messages,
+                    None,
+                    &mut no_videos,
+                    Qwen25VlGenerate {
+                        max_new: 8,
+                        sampler: Sampler::greedy(),
+                    },
+                    &mut |_: u32, _: &str| GenerationControl::Continue(()),
+                )
+                .expect("generate");
+            checkpoint
+                .text()
+                .text()
+                .decode(&generation.tokens)
+                .expect("decode the generation")
+        })
+        .collect();
+    drop(vlm);
+    assert_ne!(
+        expected[0], expected[1],
+        "the image rows must reach the logits, or the row proves nothing"
+    );
+    assert_ne!(
+        expected[1], expected[2],
+        "the patch order is part of the generation"
+    );
+
+    let server = Server::spawn(&dir, flag, &[]);
+    let chat = |png: &[u8]| {
+        let mut body = chat_with_image(png);
+        body["messages"][0]["content"][0]["text"] = QUESTION.into();
+        body
+    };
+    for (png, want) in pngs.iter().zip(&expected) {
+        let (status, served) = server.chat(&chat(png));
+        assert_eq!(status, 200, "{served}");
+        assert_eq!(
+            served["choices"][0]["message"]["content"].as_str().unwrap(),
+            want.trim_end(),
+            "{flag}: the served generation differs from Qwen25Vl::generate_chat's"
+        );
+    }
+
+    // An image request the front end cannot lower is the client's.
+    let refused = |body: &serde_json::Value, needle: &str| {
+        let (status, error) = server.chat(body);
+        assert_eq!(status, 400, "{error}");
+        assert!(error.to_string().contains(needle), "{error}");
+    };
+    let mut remote = chat(&pngs[0]);
+    remote["messages"][0]["content"][1]["image_url"]["url"] = "https://example.com/a.png".into();
+    refused(&remote, "data: URIs");
+    let mut garbage = chat(&pngs[0]);
+    garbage["messages"][0]["content"][1]["image_url"]["url"] = "data:image/png;base64,AAAA".into();
+    refused(&garbage, "image");
+}
+
+#[test]
+fn served_qwen_vl_caption_wgpu() {
+    served_qwen_vl_caption(BackendChoice::Wgpu, DeviceBackend::Wgpu, "wgpu");
+}
+
+#[test]
+fn served_qwen_vl_caption_rocm() {
+    served_qwen_vl_caption(BackendChoice::Rocm, DeviceBackend::Rocm, "rocm");
+}
+
+/// A Qwen2.5-VL checkpoint refuses what it cannot take, as the client's error: an image of more patches
+/// than the vision tower takes in one step (4100 against 4096) is a 400 from the tower's own bound, not a
+/// dropped image or a server fault; and the same checkpoint without a `vision_config` serves as the text
+/// model it is, whose image part is the typed `unsupported_capability` refusal. Mutation: stop mapping the
+/// driver's trace-limit refusal to `Refused` in `Qwen25VlFrontEnd::prepare`; the oversize image is a 500 and
+/// the row goes red.
+fn served_qwen_vl_refusals(choice: BackendChoice, backend: DeviceBackend, flag: &str) {
+    // The refusals are the server's, not the device's: skip when the backend is absent.
+    if poot_test_util::device_skip::open_or_skip(backend, open_executor(choice)).is_none() {
+        return;
+    }
+    let dir = qwen_vl::write_checkpoint(2.0, NO_EOS);
+    std::fs::write(
+        dir.join("preprocessor_config.json"),
+        r#"{"do_resize":false,"min_pixels":1,"max_pixels":1048576,"patch_size":2,
+           "temporal_patch_size":2,"merge_size":2}"#,
+    )
+    .unwrap();
+    // 164 rows by 100 columns of 2-pixel patches: an 82 x 50 grid, 4100 patches.
+    let oversize = {
+        let image = image::RgbImage::from_fn(100, 164, |x, y| image::Rgb([(x + y) as u8; 3]));
+        let mut png = Vec::new();
+        image
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        png
+    };
+    {
+        let server = Server::spawn(&dir, flag, &[]);
+        let (status, error) = server.chat(&chat_with_image(&oversize));
+        assert_eq!(status, 400, "{error}");
+        assert!(error.to_string().contains("4096"), "{error}");
+    }
+
+    let config_path = dir.join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config.as_object_mut().unwrap().remove("vision_config");
+    std::fs::write(&config_path, config.to_string()).unwrap();
+    let server = Server::spawn(&dir, flag, &[]);
+    let (status, error) = server.chat(&chat_with_image(&small_png_of(|_, _| 0)));
+    assert_eq!(status, 400, "{error}");
+    assert!(error.to_string().contains("no image front end"), "{error}");
+    assert_eq!(error["error"]["type"], "unsupported_capability", "{error}");
+}
+
+#[test]
+fn served_qwen_vl_refusals_wgpu() {
+    served_qwen_vl_refusals(BackendChoice::Wgpu, DeviceBackend::Wgpu, "wgpu");
+}
+
+#[test]
+fn served_qwen_vl_refusals_rocm() {
+    served_qwen_vl_refusals(BackendChoice::Rocm, DeviceBackend::Rocm, "rocm");
 }

@@ -28,18 +28,18 @@ pub fn packed_linear(
     let weight = stage_packed_dequant(&mut plan, linear_id, descriptor)?;
     let weight = plan.equation(
         crate::op::OpKind::Transpose { perm: vec![1, 0] },
-        vec![Operand::Value(weight.id)],
+        vec![Operand::Value(weight.id())],
     )?;
     let weight = match alias_weight_shape {
         Some(shape) => plan.equation(
             crate::op::OpKind::Reshape { shape },
-            vec![Operand::Value(weight.id)],
+            vec![Operand::Value(weight.id())],
         )?,
         None => weight,
     };
     let output = plan.equation(
         crate::op::OpKind::MatMul,
-        vec![Operand::Value(x.id), Operand::Value(weight.id)],
+        vec![Operand::Value(x.id()), Operand::Value(weight.id())],
     )?;
     let output = match bias {
         Some(bias) => plan_binary(&mut plan, BinOp::Add, output, bias)?,
@@ -65,7 +65,7 @@ pub fn packed_embedding(
     let table = stage_packed_dequant(&mut plan, linear_id, descriptor)?;
     let rows = plan.equation(
         crate::op::OpKind::Gather { axis: 0 },
-        vec![Operand::Value(table.id), Operand::Value(ids.id)],
+        vec![Operand::Value(table.id()), Operand::Value(ids.id())],
     )?;
     finish_packed_plan(b, plan, rows)
 }
@@ -103,17 +103,17 @@ pub fn packed_block_diagonal_linear(
         crate::op::OpKind::Reshape {
             shape: vec![blocks, block_out, k],
         },
-        vec![Operand::Value(weight.id)],
+        vec![Operand::Value(weight.id())],
     )?;
     let weight = plan.equation(
         crate::op::OpKind::Transpose {
             perm: vec![0, 2, 1],
         },
-        vec![Operand::Value(weight.id)],
+        vec![Operand::Value(weight.id())],
     )?;
     let output = plan.equation(
         crate::op::OpKind::MatMul,
-        vec![Operand::Value(x.id), Operand::Value(weight.id)],
+        vec![Operand::Value(x.id()), Operand::Value(weight.id())],
     )?;
     let output = match bias {
         Some(bias) => plan_binary(&mut plan, BinOp::Add, output, bias)?,
@@ -148,29 +148,29 @@ pub fn packed_indexed_linear(
     let mut plan = b.append_plan(0);
     let [_, k] = table.descriptor.shape();
     let x_type = plan
-        .type_of(x.id)
+        .type_of(x.id())
         .cloned()
         .ok_or(BuilderAppendError::InvalidOperand {
             equation: 0,
             operation: "packed_indexed_linear".to_string(),
-            value: x.id,
+            value: x.id(),
         })?;
     if x_type.dtype != DType::F32 || x_type.shape.len() != 2 || x_type.shape[1] != k {
         return Err(BuilderAppendError::OperandType {
-            value: x.id,
+            value: x.id(),
             expected: TensorType::f32(vec![x_type.shape.first().copied().unwrap_or(0), k]),
             actual: x_type,
         });
     }
     require_operand_type(&plan, selector, TensorType::f32(vec![x_type.shape[0]]))?;
-    let mut operands = vec![Operand::Value(x.id), Operand::Value(selector.id)];
+    let mut operands = vec![Operand::Value(x.id()), Operand::Value(selector.id())];
     for (name, tensor_type) in crate::packed_source::packed_stack_source_constants(
         &table.stack_id,
         table.descriptor,
         table.experts,
     ) {
         let carrier = plan.input(name, tensor_type, Storage::Const)?;
-        operands.push(Operand::Value(carrier.id));
+        operands.push(Operand::Value(carrier.id()));
     }
     let output = plan.equation(
         crate::op::OpKind::PackedContraction {
@@ -191,8 +191,7 @@ pub(crate) fn finish_packed_plan(
 ) -> Result<Traced, BuilderAppendError> {
     plan.declare_result(output)?;
     let mut prepared = b.preflight_append(plan)?;
-    let id = b.commit_append(&mut prepared)?;
-    Ok(Traced { id })
+    b.commit_append(&mut prepared)
 }
 
 /// Stage every source constant of one packed weight and emit its `PackedDequant` over them, in
@@ -206,7 +205,7 @@ pub(crate) fn stage_packed_dequant(
     let mut sources = Vec::new();
     for (name, tensor_type) in packed_source_constants(linear_id, descriptor) {
         let source = plan.input(name, tensor_type, Storage::Const)?;
-        sources.push(Operand::Value(source.id));
+        sources.push(Operand::Value(source.id()));
     }
     plan.equation(crate::op::OpKind::PackedDequant { descriptor }, sources)
 }
@@ -217,16 +216,16 @@ pub(crate) fn require_operand_type(
     expected: TensorType,
 ) -> Result<(), BuilderAppendError> {
     let actual = plan
-        .type_of(value.id)
+        .type_of(value.id())
         .cloned()
         .ok_or(BuilderAppendError::InvalidOperand {
             equation: 0,
             operation: "packed_linear operand".to_string(),
-            value: value.id,
+            value: value.id(),
         })?;
     if actual != expected {
         return Err(BuilderAppendError::OperandType {
-            value: value.id,
+            value: value.id(),
             expected,
             actual,
         });
@@ -242,6 +241,6 @@ pub(crate) fn plan_binary(
 ) -> Result<Traced, BuilderAppendError> {
     plan.equation(
         crate::op::OpKind::Binary(op),
-        vec![Operand::Value(left.id), Operand::Value(right.id)],
+        vec![Operand::Value(left.id()), Operand::Value(right.id())],
     )
 }

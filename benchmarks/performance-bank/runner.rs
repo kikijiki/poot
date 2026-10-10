@@ -20,6 +20,7 @@ use poot_graph_plan::{
     Submission, Target, TargetSet, compile_staged,
 };
 use poot_load::packed_safetensors::sha256_digest;
+use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::HostTensor;
 use poot_test_util::const_weights::ConstWeights;
@@ -298,7 +299,7 @@ where
         let dense = DenseWeight::try_new(
             tensor.dtype(),
             tensor.shape().to_vec(),
-            Arc::from(tensor.view().bytes()),
+            StoredBytes::from(tensor.view().bytes().to_vec()),
         )
         .map_err(|e| format!("const {name}: {e}"))?;
         builder

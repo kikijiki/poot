@@ -77,9 +77,9 @@ fn optimized_exact_i32_region_matches_the_unoptimized_graph() {
         let result_a = eval(
             &graph,
             &i32_inputs(&[
-                (history.id, vec![4], graph_state.clone()),
-                (zero.id, vec![4], vec![0; 4]),
-                (ones.id, vec![4], vec![1; 4]),
+                (history.id(), vec![4], graph_state.clone()),
+                (zero.id(), vec![4], vec![0; 4]),
+                (ones.id(), vec![4], vec![1; 4]),
             ]),
             EvalOptions::new(EvalBudget::UNBOUNDED),
         )
@@ -87,9 +87,9 @@ fn optimized_exact_i32_region_matches_the_unoptimized_graph() {
         let result_b = eval(
             &optimized,
             &i32_inputs(&[
-                (history.id, vec![4], optimized_state.clone()),
-                (zero.id, vec![4], vec![0; 4]),
-                (ones.id, vec![4], vec![1; 4]),
+                (history.id(), vec![4], optimized_state.clone()),
+                (zero.id(), vec![4], vec![0; 4]),
+                (ones.id(), vec![4], vec![1; 4]),
             ]),
             EvalOptions::new(EvalBudget::UNBOUNDED),
         )
@@ -144,7 +144,7 @@ fn exact_i32_pack_region_replays_its_concat() {
     );
 
     let dense_inputs: HashMap<ValueId, Value> = HashMap::from([(
-        packed_source.id,
+        packed_source.id(),
         HostTensor::i32(vec![2, 2], vec![1, 2, 3, 4]).into(),
     )]);
     let dense = eval(
@@ -158,7 +158,7 @@ fn exact_i32_pack_region_replays_its_concat() {
     .unwrap();
     let after = eval(
         &optimized,
-        &i32_inputs(&[(packed_source.id, vec![2, 2], vec![1, 2, 3, 4])]),
+        &i32_inputs(&[(packed_source.id(), vec![2, 2], vec![1, 2, 3, 4])]),
         EvalOptions::new(EvalBudget::UNBOUNDED),
     )
     .unwrap()
@@ -203,9 +203,9 @@ fn optimize_accepts_a_validation_bearing_stateful_graph_bit_for_bit() {
         let update_value = [2.0, -0.5, 3.0][step];
         let inputs = |state: &[f32]| -> HashMap<ValueId, Value> {
             HashMap::from([
-                (cache.id, HostTensor::f32(vec![4], state.to_vec()).into()),
+                (cache.id(), HostTensor::f32(vec![4], state.to_vec()).into()),
                 (
-                    update.id,
+                    update.id(),
                     HostTensor::f32(vec![1], vec![update_value]).into(),
                 ),
             ])
@@ -271,14 +271,14 @@ fn optimize_accepts_a_validation_bearing_stateful_graph_bit_for_bit() {
             "step {step}: primary output differs in the full environment"
         );
         assert_eq!(
-            env_a[witness.id]
+            env_a[witness.id()]
                 .as_ref()
                 .unwrap()
                 .as_host()
                 .unwrap()
                 .as_f32()
                 .unwrap(),
-            env_b[witness.id]
+            env_b[witness.id()]
                 .as_ref()
                 .unwrap()
                 .as_host()
@@ -326,11 +326,11 @@ fn pipeline_witness_output_survives_every_pass() {
 
     let inputs: HashMap<ValueId, Value> = HashMap::from([
         (
-            x.id,
+            x.id(),
             HostTensor::f32(vec![4], vec![1.0, -2.0, 3.0, 0.5]).into(),
         ),
         (
-            y.id,
+            y.id(),
             HostTensor::f32(vec![4], vec![0.5, 4.0, -1.0, 2.0]).into(),
         ),
     ]);
@@ -351,14 +351,14 @@ fn pipeline_witness_output_survives_every_pass() {
     .environment
     .unwrap();
     assert_eq!(
-        before[witness.id]
+        before[witness.id()]
             .as_ref()
             .unwrap()
             .as_host()
             .unwrap()
             .as_f32()
             .unwrap(),
-        after[witness.id]
+        after[witness.id()]
             .as_ref()
             .unwrap()
             .as_host()

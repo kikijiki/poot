@@ -94,8 +94,8 @@ fn operand_value(eqn: &poot_graph_ir::Eqn, position: usize) -> Option<ValueId> {
 fn value_named<V: poot_graph_ir::ValidationChannel>(graph: &Graph<V>, name: &str) -> ValueId {
     graph
         .values
-        .iter()
-        .position(|value| value.name.as_deref() == Some(name))
+        .iter_enumerated()
+        .find_map(|(id, value)| (value.name.as_deref() == Some(name)).then_some(id))
         .unwrap_or_else(|| panic!("the graph declares {name}"))
 }
 

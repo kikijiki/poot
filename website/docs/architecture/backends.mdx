@@ -56,9 +56,12 @@ The decode dispatch sequence is captured once into a CUDA graph and replayed per
 `cuGraphLaunch`; kernel arguments point at stable slot buffers the host rewrites in place (see
 [Execution](./execution)). Tensor-core GEMMs use `llvm.nvvm.mma.*`.
 
-PTX also has a lower-level captured multi-device executor: a captured graph per device,
-point-to-point and all-to-all transfers, replay without reallocation. It is not used for model
-partitioning or serving.
+PTX can also drive several GPUs from one executor: a layer pipeline across devices, where each
+stage is captured into its own CUDA graph on its own device and the activations that cross a stage
+boundary are copied peer to peer, with replay creating nothing new. Only point-to-point pipeline
+transfers are supported; reductions and gathers are refused as unsupported. The coordinator lives in
+`poot-executor`, over the peer-copy and event operations `PtxDevice` provides. It is not used for
+serving.
 
 Verified on NVIDIA L40S through rented pods.
 

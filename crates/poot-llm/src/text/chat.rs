@@ -1,17 +1,17 @@
 //! Chat templating: the hardcoded ChatFormat fallback families and jinja chat_template rendering.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use poot_models::chat::ChatFormat;
 
-use crate::error::Result;
+use crate::error::{ChatTemplateError, Result, TextError};
 use crate::text::tokenize::TextCodec;
 
 impl TextCodec {
-    /// The chat-prompt template family for this model (from its family): the fallback used when the model
-    /// ships no jinja `chat_template`. Prefer [`TextCodec::render_chat_value`], which uses the model's own
-    /// template when available.
+    /// The chat-prompt template family for this model (from its family): the fallback used when there is
+    /// no jinja chat template. Prefer [`TextCodec::render_chat_value`], which uses the chat template
+    /// (the checkpoint's, or the override given at load) when there is one.
     pub fn chat_format(&self) -> ChatFormat {
         self.chat_format
     }
@@ -19,12 +19,14 @@ impl TextCodec {
     /// Render `messages`, a raw OpenAI `messages` array (full objects), so multi-turn tool conversations
     /// render: an assistant turn's `tool_calls` and `role: "tool"` result messages reach the template's
     /// tool-history branch. Falls back to [`ChatFormat`] over each message's `role`/`content` (tool fields
-    /// dropped) when there is no jinja template or it fails to render.
+    /// dropped) when there is no jinja template or the checkpoint's own fails to render. A template given
+    /// at load in place of the checkpoint's own never falls back: failing to render is
+    /// [`ChatTemplateError::Render`].
     pub fn render_chat_value(
         &self,
         messages: &serde_json::Value,
         tools: Option<&serde_json::Value>,
-    ) -> RenderedChat {
+    ) -> Result<RenderedChat> {
         let chat = &self.chat_template;
         if let Some(tmpl) = &chat.template {
             match render_jinja_value(
@@ -40,7 +42,10 @@ impl TextCodec {
                         chat.bos_token.as_deref(),
                         chat.eos_token.as_deref(),
                     );
-                    return RenderedChat { prompt, stops };
+                    return Ok(RenderedChat { prompt, stops });
+                }
+                Err(e) if self.chat_template_overridden => {
+                    return Err(ChatTemplateError::Render(e.to_string()).into());
                 }
                 Err(e) => {
                     tracing::warn!("chat_template render failed ({e}); falling back to ChatFormat");
@@ -62,26 +67,142 @@ impl TextCodec {
             })
             .unwrap_or_default();
         let fmt = self.chat_format;
-        RenderedChat {
+        Ok(RenderedChat {
             prompt: fmt.render(&pairs),
             stops: vec![fmt.turn_end().to_string()],
+        })
+    }
+}
+
+/// A chat template the caller supplies in place of the checkpoint's own. The bos and eos strings it
+/// references stay the checkpoint's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChatTemplateOverride {
+    /// The template text. A value with no jinja syntax names a built-in template, which poot lacks.
+    Jinja(String),
+    /// A file holding the template text.
+    File(PathBuf),
+}
+
+/// A chat template text that has been read and compiles: what [`TextCodec::with_chat_template`] takes.
+#[derive(Debug)]
+pub struct CheckedChatTemplate(String);
+
+impl ChatTemplateOverride {
+    /// The override the `--chat-template` (jinja text) and `--chat-template-file` flags name: `None` with
+    /// neither. The command lines keep the two exclusive; with both, the text wins.
+    pub fn from_flags(text: Option<String>, file: Option<PathBuf>) -> Option<Self> {
+        match (text, file) {
+            (Some(text), _) => Some(Self::Jinja(text)),
+            (None, Some(path)) => Some(Self::File(path)),
+            (None, None) => None,
         }
+    }
+
+    /// The template text, read and checked to compile.
+    pub fn check(&self) -> std::result::Result<CheckedChatTemplate, ChatTemplateError> {
+        let template = match self {
+            Self::Jinja(text) if !["{{", "{%", "{#"].iter().any(|open| text.contains(open)) => {
+                return Err(ChatTemplateError::UnknownBuiltin { name: text.clone() });
+            }
+            Self::Jinja(text) => text.clone(),
+            Self::File(path) => {
+                std::fs::read_to_string(path).map_err(|source| ChatTemplateError::Unreadable {
+                    path: path.clone(),
+                    source,
+                })?
+            }
+        };
+        check_compiles(&template).map_err(|e| ChatTemplateError::Invalid(e.to_string()))?;
+        Ok(CheckedChatTemplate(template))
     }
 }
 
 impl TextCodec {
-    /// `prompt` as the one user turn of the model's own jinja `chat_template` (after `system`, when given),
-    /// ready for the assistant to answer, with the turn-end markers generation should stop at. `None` when
-    /// the model ships no template (a base model): its prompt is raw text, and the hardcoded
-    /// [`ChatFormat`] fallback of [`TextCodec::render_chat_value`] is not applied to it.
-    pub fn render_user_turn(&self, system: Option<&str>, prompt: &str) -> Option<RenderedChat> {
-        self.chat_template.template.as_ref()?;
-        let mut messages = Vec::new();
-        if let Some(system) = system {
-            messages.push(serde_json::json!({ "role": "system", "content": system }));
+    /// This codec rendering every chat through `template` instead of the checkpoint's own, so a base
+    /// model with no template answers turns too.
+    pub fn with_chat_template(mut self, template: CheckedChatTemplate) -> Self {
+        self.chat_template.template = Some(template.0);
+        self.chat_template_overridden = true;
+        self
+    }
+}
+
+impl TextCodec {
+    /// `messages` rendered through the jinja `chat_template`, ready for the assistant to
+    /// answer. Unlike [`TextCodec::render_chat_value`] there is no fallback: a model with no template
+    /// or a template that fails to render is an error, for callers whose messages carry content parts
+    /// (images) that a flat fallback format would drop.
+    pub fn render_template_chat(&self, messages: &serde_json::Value) -> Result<String> {
+        let chat = &self.chat_template;
+        let template = chat
+            .template
+            .as_ref()
+            .ok_or_else(|| TextError::Msg("the model ships no chat template".into()))?;
+        render_jinja_value(
+            template,
+            messages,
+            chat.bos_token.as_deref(),
+            chat.eos_token.as_deref(),
+            None,
+        )
+    }
+
+    /// `prompt` as the one user turn of the jinja chat template (the checkpoint's, or the override given at
+    /// load; after `system`, when given), ready for the assistant to answer, with the turn-end markers
+    /// generation should stop at. `None` when there is no template (a base model): its prompt is raw text,
+    /// and the hardcoded [`ChatFormat`] fallback of [`TextCodec::render_chat_value`] is not applied to it.
+    pub fn render_user_turn(
+        &self,
+        system: Option<&str>,
+        prompt: &str,
+    ) -> Result<Option<RenderedChat>> {
+        self.render_turns(system, &[(Speaker::User, prompt)])
+    }
+
+    /// Whether there is a chat template, the checkpoint's or the override given at load: a base model with
+    /// neither answers no turns.
+    pub fn has_chat_template(&self) -> bool {
+        self.chat_template.template.is_some()
+    }
+
+    /// `turns`, in order, through the jinja chat template (the checkpoint's, or the override given at load;
+    /// after `system`, when given), ready for the assistant to answer next. `None` when there is no
+    /// template.
+    pub fn render_turns(
+        &self,
+        system: Option<&str>,
+        turns: &[(Speaker, &str)],
+    ) -> Result<Option<RenderedChat>> {
+        if self.chat_template.template.is_none() {
+            return Ok(None);
         }
-        messages.push(serde_json::json!({ "role": "user", "content": prompt }));
-        Some(self.render_chat_value(&serde_json::Value::Array(messages), None))
+        let messages = system
+            .map(|system| serde_json::json!({ "role": "system", "content": system }))
+            .into_iter()
+            .chain(turns.iter().map(|(speaker, content)| {
+                serde_json::json!({ "role": speaker.role(), "content": content })
+            }))
+            .collect();
+        self.render_chat_value(&serde_json::Value::Array(messages), None)
+            .map(Some)
+    }
+}
+
+/// Who said a turn of a conversation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Speaker {
+    User,
+    Assistant,
+}
+
+impl Speaker {
+    /// The `role` the chat template reads.
+    fn role(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+        }
     }
 }
 
@@ -251,17 +372,9 @@ fn format_strftime(fmt: &str, secs: i64) -> String {
     out
 }
 
-/// Shared jinja render: build the environment, bind `messages` (already a jinja value), `tools`,
-/// `add_generation_prompt`, and the bos/eos tokens, and render.
-fn render_jinja_core(
-    template: &str,
-    messages_val: minijinja::value::Value,
-    bos_token: Option<&str>,
-    eos_token: Option<&str>,
-    add_generation_prompt: bool,
-    tools: Option<&serde_json::Value>,
-) -> Result<String> {
-    use minijinja::{Environment, context, value::Value};
+/// The jinja environment every chat template compiles and renders in.
+fn chat_environment<'source>() -> minijinja::Environment<'source> {
+    use minijinja::{Environment, value::Value};
     let mut env = Environment::new();
     // HF chat templates are Python-Jinja: they call Python dict/str/list methods (`.get`, `.items`, `.strip`,
     // `.startswith`, ...) that minijinja lacks by default, so real GGUF/HF chat_templates fail to render
@@ -291,6 +404,26 @@ fn render_jinja_core(
             .unwrap_or(0);
         format_strftime(&fmt, secs)
     });
+    env
+}
+
+/// Whether `template` compiles in the chat environment, without rendering it.
+fn check_compiles(template: &str) -> std::result::Result<(), minijinja::Error> {
+    chat_environment().add_template("chat", template)
+}
+
+/// Shared jinja render: build the environment, bind `messages` (already a jinja value), `tools`,
+/// `add_generation_prompt`, and the bos/eos tokens, and render.
+fn render_jinja_core(
+    template: &str,
+    messages_val: minijinja::value::Value,
+    bos_token: Option<&str>,
+    eos_token: Option<&str>,
+    add_generation_prompt: bool,
+    tools: Option<&serde_json::Value>,
+) -> Result<String> {
+    use minijinja::{context, value::Value};
+    let mut env = chat_environment();
     env.add_template("chat", template)
         .map_err(|e| err!("compile chat_template: {e}"))?;
     let tmpl = env.get_template("chat").expect("just added");
@@ -738,7 +871,7 @@ mod jinja_chat_template {
     fn real_gemma4_chat_template_renders_via_jinja_not_the_chatformat_fallback() {
         // The production repro: serving gemma4 logged `gemma4 chat_template render failed (...
         // unknown method: map has no method named get ...); falling back to ChatFormat`. This reads the real GGUF's
-        // `tokenizer.chat_template` (header-only via GgufIndex::open, no tensor data) and renders a 2-message
+        // `tokenizer.chat_template` (header-only via GgufIndex::parse over a mapping, no tensor data) and renders a 2-message
         // conversation through it, asserting it succeeds and uses role-specific gemma markup (proving the real
         // template rendered, not a fallback). Skipped when the model is absent from POOT_MODELS_DIR.
         let Some(path) = poot_test_util::model_path(poot_test_util::checkpoint!(
@@ -747,7 +880,10 @@ mod jinja_chat_template {
             return;
         };
         assert!(path.is_file(), "not a file: {}", path.display());
-        let g = poot_load::gguf::GgufIndex::open(path).expect("load gemma4 gguf header/metadata");
+        let g = poot_load::gguf::GgufIndex::parse(
+            &poot_quant::StoredBytes::map(std::fs::File::open(path).unwrap()).unwrap(),
+        )
+        .expect("load gemma4 gguf header/metadata");
         let tmpl = g
             .get("tokenizer.chat_template")
             .and_then(|v| v.as_str())
@@ -800,7 +936,10 @@ mod user_turn_tests {
     /// through `ChatFormat` instead of the jinja template, or return the prompt unrendered.
     #[test]
     fn a_model_with_a_template_renders_the_prompt_as_a_user_turn() {
-        let rendered = codec(Some(CHATML)).render_user_turn(None, "Hi").unwrap();
+        let rendered = codec(Some(CHATML))
+            .render_user_turn(None, "Hi")
+            .unwrap()
+            .unwrap();
         assert_eq!(
             rendered.prompt,
             "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
@@ -812,7 +951,7 @@ mod user_turn_tests {
     /// hardcoded fallback format. Mutation: return `Some` of the fallback render.
     #[test]
     fn a_model_without_a_template_has_no_user_turn() {
-        assert_eq!(codec(None).render_user_turn(None, "Hi"), None);
+        assert_eq!(codec(None).render_user_turn(None, "Hi").unwrap(), None);
     }
 
     /// A system prompt is a system turn ahead of the user turn, in the model's template. Mutation: drop
@@ -821,6 +960,7 @@ mod user_turn_tests {
     fn a_system_prompt_precedes_the_user_turn() {
         let rendered = codec(Some(CHATML))
             .render_user_turn(Some("Be terse."), "Hi")
+            .unwrap()
             .unwrap();
         assert_eq!(
             rendered.prompt,

@@ -22,7 +22,7 @@ fn scatter_axis0_inverts_a_permutation() {
     let src = b.constant("src", TensorType::f32(vec![3, 2]));
     let idx = b.constant("idx", TensorType::f32(vec![3]));
     let s = b.scatter(src, idx);
-    let (si, ii) = (src.id, idx.id);
+    let (si, ii) = (src.id(), idx.id());
     let g = b.finish(s);
 
     let mut inputs = HashMap::new();
@@ -56,7 +56,7 @@ fn scatter_axis0_inverts_a_permutation() {
     let src2 = b2.constant("s", TensorType::f32(vec![4]));
     let idx2 = b2.constant("i", TensorType::f32(vec![4]));
     let sc = b2.scatter(src2, idx2);
-    let (s2, i2) = (src2.id, idx2.id);
+    let (s2, i2) = (src2.id(), idx2.id());
     let g2 = b2.finish(sc);
     let mut in2 = HashMap::new();
     in2.insert(
@@ -91,7 +91,7 @@ fn scatter_refuses_an_index_outside_the_rows() {
         let src = b.constant("src", TensorType::f32(vec![3, 2]));
         let idx = b.constant("idx", TensorType::f32(vec![3]));
         let scattered = b.scatter(src, idx);
-        let (si, ii) = (src.id, idx.id);
+        let (si, ii) = (src.id(), idx.id());
         let g = b.finish(scattered);
         let mut inputs = HashMap::new();
         inputs.insert(si, Value::from(HostTensor::f32(vec![3, 2], vec![0.0; 6])));
@@ -138,7 +138,7 @@ fn arg_top_k_matches_per_row_scatter_iota_rank_slice() {
     let gt = br.binary_scalar(BinOp::Mul, ge, poot_graph_ir::types::Scalar::F32(-1.0));
     let gt = br.binary_scalar(BinOp::Add, gt, poot_graph_ir::types::Scalar::F32(1.0));
     let rank = br.reduce(RedOp::Sum, gt, 2, false); // [L, E]
-    let lgi = lg.id;
+    let lgi = lg.id();
     let gr = br.finish(rank);
     let mut rank_inputs = HashMap::new();
     rank_inputs.insert(lgi, Value::from(HostTensor::f32(vec![l, e], logits)));
@@ -163,7 +163,7 @@ fn arg_top_k_matches_per_row_scatter_iota_rank_slice() {
         DType::F32,
         "ArgTopK ids are F32 (fork c)"
     );
-    let rki = rk.id;
+    let rki = rk.id();
     let ga = ba.finish(out);
     assert!(
         matches!(ga.eqns.last().unwrap().op, OpKind::ArgTopK { k: kk } if kk == k),
@@ -186,7 +186,7 @@ fn arg_top_k_matches_per_row_scatter_iota_rank_slice() {
             rank_t.as_f32().unwrap()[row * e..(row + 1) * e].to_vec(),
         );
         let iota_row = HostTensor::f32(vec![e], (0..e).map(|j| j as f32).collect());
-        let inverted = scatter_axis0(&iota_row, &rank_row, 0).unwrap();
+        let inverted = scatter_axis0(&iota_row, &rank_row, ValueId::new(0)).unwrap();
         let expected = &inverted.as_f32().unwrap()[0..k];
         let actual = &got.as_f32().unwrap()[row * k..(row + 1) * k];
         assert_eq!(
@@ -224,7 +224,7 @@ fn ge_indicator_with_broadcast() {
     let x = b.constant("x", TensorType::f32(vec![2, 3]));
     let y = b.constant("y", TensorType::f32(vec![3]));
     let g = b.binary(BinOp::Ge, x, y);
-    let (xi, yi) = (x.id, y.id);
+    let (xi, yi) = (x.id(), y.id());
     let g = b.finish(g);
 
     let mut inputs = HashMap::new();
@@ -254,7 +254,7 @@ fn top_k_gate_selects_topk_and_normalizes() {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![2, 4]));
     let g = top_k_gate(&b, x, 2);
-    let xi = x.id;
+    let xi = x.id();
     let g = b.finish(g);
 
     let xd = vec![1.0, 3.0, 2.0, 0.0, 5.0, 5.0, 1.0, 4.0];
@@ -283,7 +283,7 @@ fn top_k_gate_composition_matches_sort_reference() {
     let (rows, e, k) = (6usize, 8usize, 3usize);
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![rows, e]));
-    let xi = x.id;
+    let xi = x.id();
     let gate = top_k_gate(&b, x, k);
     let g = b.finish(gate);
 
@@ -327,7 +327,7 @@ fn moe_matches_reference() {
     let w_in = b.constant("w_in", TensorType::f32(vec![e, h, 2 * i]));
     let w_out = b.constant("w_out", TensorType::f32(vec![e, i, h]));
     let out = moe_dense(&b, x, router, w_in, w_out, e, k, i);
-    let (xi, ri, wii, woi) = (x.id, router.id, w_in.id, w_out.id);
+    let (xi, ri, wii, woi) = (x.id(), router.id(), w_in.id(), w_out.id());
     let g = b.finish(out);
 
     let xd = fill(l * h, 1);
@@ -822,7 +822,7 @@ fn deterministic_moe_routes_match_stable_sort_table() {
         let logits = b.constant("scores", TensorType::f32(vec![1, 5]));
         let (_, ids, weights) = poot_graph_ir::ops::moe_grouped_prep(&b, xm, logits, 5, case.k);
         let route = b.concat(0, &[ids, weights]);
-        let (xm_id, logits_id) = (xm.id, logits.id);
+        let (xm_id, logits_id) = (xm.id(), logits.id());
         let graph = b.finish(route);
         let inputs: HashMap<_, _> = graph
             .inputs

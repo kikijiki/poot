@@ -4,7 +4,6 @@
 
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 
 use poot_graph_ir::{Builder, Graph, TensorType, ValidationOutputs};
 use poot_models::chat::ChatFormat;
@@ -105,7 +104,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
 
 fn fixture() -> Fixture {
     let (vocab, width) = (3, 2);
-    let bytes: Arc<[u8]> = vec![0u8; vocab * width * 4].into();
+    let bytes = poot_quant::StoredBytes::from(vec![0u8; vocab * width * 4]);
     let mut store = WeightStore::builder();
     store
         .insert(

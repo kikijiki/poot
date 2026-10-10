@@ -222,8 +222,8 @@ fn packed_linear_error_preserves_graph() {
     assert_eq!(inference_builder.generation(), before);
     let graph = inference_builder.finish(wrong_x);
     assert_eq!(graph.values.len(), 1);
-    assert_eq!(graph.inputs, vec![wrong_x.id]);
-    assert_eq!(graph.consts, vec![wrong_x.id]);
+    assert_eq!(graph.inputs, vec![wrong_x.id()]);
+    assert_eq!(graph.consts, vec![wrong_x.id()]);
     assert!(graph.slots.is_empty());
     assert!(graph.eqns.is_empty());
 }
@@ -340,7 +340,7 @@ fn packed_indexed_linear_is_one_claimed_contraction_over_stacked_carriers()
         );
         assert_eq!(
             [operand_value(eqn, 0), operand_value(eqn, 1)],
-            [x.id, selector.id]
+            [x.id(), selector.id()]
         );
         for (position, role) in descriptor.sources().into_iter().enumerate() {
             let carrier = operand_value(eqn, 2 + position);
@@ -427,7 +427,7 @@ fn packed_indexed_linear_refuses_a_bad_table_or_operand_without_mutation() {
         let b = Builder::new();
         let x = b.constant("x", x_type.clone());
         let selector = b.constant("selector", selector_type.clone());
-        let wrong = if *x_is_wrong { x.id } else { selector.id };
+        let wrong = if *x_is_wrong { x.id() } else { selector.id() };
         match packed_indexed_linear(&b, x, selector, &table) {
             Err(BuilderAppendError::OperandType { value, .. }) if value == wrong => {}
             other => panic!("{label}: expected OperandType on {wrong}, got {other:?}"),

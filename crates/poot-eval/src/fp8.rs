@@ -367,7 +367,7 @@ mod tests {
         let graph = builder.finish(reshaped);
         let bytes = vec![0x00, 0x80, 0x01, 0x7e, 0x7f, 0xff, 0x38, 0xb8, 0x55, 0xd5];
         let inputs = HashMap::from([(
-            x.id,
+            x.id(),
             crate::Value::Host(e4m3fn_tensor(vec![2, 5], bytes.clone()).unwrap()),
         )]);
         let got = crate::eval(
@@ -401,7 +401,7 @@ mod tests {
             0.3,
         ];
         let inputs = HashMap::from([(
-            x.id,
+            x.id(),
             crate::Value::Host(poot_tensor::HostTensor::f32(vec![2, 5], values.clone())),
         )]);
         let got = crate::eval(
@@ -431,7 +431,7 @@ mod tests {
         let bytes = vec![0x00, 0x80, 0x01, 0x7e, 0x7f, 0xff, 0x38, 0xb8, 0x55, 0xd5];
         let raw = e4m3fn_tensor(vec![2, 5], bytes.clone()).unwrap();
         let raw_bytes = raw.view().bytes().as_ptr();
-        let inputs = HashMap::from([(x.id, crate::Value::Host(raw))]);
+        let inputs = HashMap::from([(x.id(), crate::Value::Host(raw))]);
 
         let got = crate::eval(
             &graph,
@@ -463,7 +463,7 @@ mod tests {
         let bytes = vec![0x00, 0x80, 0x01, 0x7e, 0x7f, 0xff, 0x38, 0xb8, 0x55, 0xd5];
         let raw = e4m3fn_tensor(vec![2, 5], bytes.clone()).unwrap();
         let raw_bytes = raw.view().bytes().as_ptr();
-        let inputs = HashMap::from([(x.id, crate::Value::Host(raw))]);
+        let inputs = HashMap::from([(x.id(), crate::Value::Host(raw))]);
 
         let got = crate::eval(
             &graph,
@@ -496,7 +496,7 @@ mod tests {
         let bytes = vec![0x7f, 0xff, 1, 2, 3, 4, 5, 6, 7, 8];
         let input = e4m3fn_tensor(vec![2, 5], bytes.clone()).unwrap();
         let input_ptr = input.view().bytes().as_ptr();
-        let inputs = HashMap::from([(state.id, crate::Value::Host(input))]);
+        let inputs = HashMap::from([(state.id(), crate::Value::Host(input))]);
 
         let result = crate::eval(
             &graph,
@@ -540,13 +540,13 @@ mod tests {
         let mut carried = crate::Value::Host(initial);
         for (position, raw_update) in updates {
             let inputs = HashMap::from([
-                (state.id, carried),
+                (state.id(), carried),
                 (
-                    update.id,
+                    update.id(),
                     crate::Value::Host(e4m3fn_tensor(vec![2, 2], raw_update).unwrap()),
                 ),
                 (
-                    index.id,
+                    index.id(),
                     crate::Value::Host(poot_tensor::HostTensor::scalar(position)),
                 ),
             ]);
@@ -595,11 +595,11 @@ mod tests {
         let malformed = builder.finish_with_state(state, &[(state, dense)]);
         let inputs = HashMap::from([
             (
-                state.id,
+                state.id(),
                 crate::Value::Host(e4m3fn_tensor(vec![2, 5], vec![0; 10]).unwrap()),
             ),
             (
-                dense.id,
+                dense.id(),
                 crate::Value::Host(poot_tensor::HostTensor::f32(vec![2, 5], vec![0.0; 10])),
             ),
         ]);
@@ -615,7 +615,7 @@ mod tests {
                     state_output,
                     ..
                 }
-            )) if state_input == state.id && state_output == dense.id
+            )) if state_input == state.id() && state_output == dense.id()
         ));
 
         let builder = Builder::new();
@@ -626,7 +626,7 @@ mod tests {
         );
         let graph = builder.finish_with_state(state, &[(state, state)]);
         let wrong = HashMap::from([(
-            state.id,
+            state.id(),
             crate::Value::Host(poot_tensor::HostTensor::f32(vec![2, 5], vec![0.0; 10])),
         )]);
         // Card 554d: `walk::preflight_bindings` catches this the same way for any input (not a
@@ -654,10 +654,10 @@ mod tests {
         let replacement =
             builder.constant("replacement", TensorType::new(vec![2, 5], DType::E4M3FN));
         let mut graph = builder.finish_with_state(replacement, &[(state, replacement)]);
-        graph.inputs.retain(|&id| id != state.id);
+        graph.inputs.retain(|&id| id != state.id());
 
         let inputs = HashMap::from([(
-            replacement.id,
+            replacement.id(),
             crate::Value::Host(e4m3fn_tensor(vec![2, 5], vec![0x7f; 10]).unwrap()),
         )]);
         assert!(matches!(
@@ -668,7 +668,7 @@ mod tests {
             ),
             Err(crate::EvalError::InvalidGraph(
                 GraphValidationError::ConstNotInput { value }
-            )) if value == state.id
+            )) if value == state.id()
         ));
     }
 
@@ -680,7 +680,7 @@ mod tests {
         let graph = builder.finish(y);
         let bytes = vec![0x00, 0x80, 0x01, 0x7e, 0x7f, 0xff, 0x38, 0xb8, 0x55, 0xd5];
         let input = e4m3fn_tensor(vec![2, 5], bytes).unwrap();
-        let inputs = HashMap::from([(x.id, crate::Value::Host(input))]);
+        let inputs = HashMap::from([(x.id(), crate::Value::Host(input))]);
 
         let got = crate::eval(
             &graph,
@@ -707,7 +707,7 @@ mod tests {
         let graph = builder.finish(y);
         let bytes = vec![0x00, 0x80, 0x01, 0x7e, 0x7f, 0xff, 0x38, 0xb8, 0x55, 0xd5];
         let input = e4m3fn_tensor(vec![2, 5], bytes).unwrap();
-        let inputs = HashMap::from([(x.id, crate::Value::Host(input))]);
+        let inputs = HashMap::from([(x.id(), crate::Value::Host(input))]);
 
         let got = crate::eval(
             &graph,
@@ -732,11 +732,11 @@ mod tests {
         let graph = builder.finish(output);
         let inputs = HashMap::from([
             (
-                a.id,
+                a.id(),
                 crate::Value::Host(e4m3fn_tensor(vec![2, 3], vec![0x7f, 1, 2, 3, 4, 5]).unwrap()),
             ),
             (
-                b.id,
+                b.id(),
                 crate::Value::Host(e4m3fn_tensor(vec![2, 2], vec![0xff, 6, 7, 8]).unwrap()),
             ),
         ]);
@@ -765,9 +765,9 @@ mod tests {
         ];
         let input = e4m3fn_tensor(vec![3, 5], bytes).unwrap();
         let inputs = HashMap::from([
-            (x.id, crate::Value::Host(input)),
+            (x.id(), crate::Value::Host(input)),
             (
-                index.id,
+                index.id(),
                 crate::Value::Host(poot_tensor::HostTensor::f32(vec![], vec![1.0])),
             ),
         ]);
@@ -840,17 +840,17 @@ mod tests {
             let update_bytes = vec![0xff, 0x7f, 0x55, 0xaa];
             let mut inputs = HashMap::from([
                 (
-                    operand.id,
+                    operand.id(),
                     crate::Value::Host(e4m3fn_tensor(vec![2, 5], operand_bytes.clone()).unwrap()),
                 ),
                 (
-                    update.id,
+                    update.id(),
                     crate::Value::Host(e4m3fn_tensor(vec![2, 2], update_bytes.clone()).unwrap()),
                 ),
             ]);
             if let Some(index) = index {
                 inputs.insert(
-                    index.id,
+                    index.id(),
                     crate::Value::Host(poot_tensor::HostTensor::f32(vec![], vec![position as f32])),
                 );
             }
@@ -894,15 +894,15 @@ mod tests {
         let graph = builder.finish(output);
         let inputs = HashMap::from([
             (
-                operand.id,
+                operand.id(),
                 crate::Value::Host(e4m3fn_tensor(vec![2, 5], vec![0; 10]).unwrap()),
             ),
             (
-                update.id,
+                update.id(),
                 crate::Value::Host(e4m3fn_tensor(vec![2, 2], vec![1; 4]).unwrap()),
             ),
             (
-                index.id,
+                index.id(),
                 crate::Value::Host(poot_tensor::HostTensor::i32(vec![], vec![1])),
             ),
         ]);
@@ -925,15 +925,15 @@ mod tests {
         let graph = builder.finish(output);
         let inputs = HashMap::from([
             (
-                base.id,
+                base.id(),
                 crate::Value::Host(e4m3fn_tensor(vec![2, 5], vec![0; 10]).unwrap()),
             ),
             (
-                src.id,
+                src.id(),
                 crate::Value::Host(e4m3fn_tensor(vec![1, 5], vec![1; 5]).unwrap()),
             ),
             (
-                inverse.id,
+                inverse.id(),
                 crate::Value::Host(poot_tensor::HostTensor::i32(vec![2], vec![0, -1])),
             ),
         ]);
@@ -956,7 +956,7 @@ mod tests {
         let y = builder.broadcast(x, vec![2, 3]);
         let graph = builder.finish(y);
         let input = e4m3fn_tensor(vec![1, 3], vec![0x7f, 0xff, 0x01]).unwrap();
-        let inputs = HashMap::from([(x.id, crate::Value::Host(input))]);
+        let inputs = HashMap::from([(x.id(), crate::Value::Host(input))]);
 
         let got = crate::eval(
             &graph,
@@ -988,10 +988,10 @@ mod tests {
         let src_value =
             e4m3fn_tensor(vec![2, 5], vec![0xff, 21, 22, 23, 24, 0x7f, 31, 32, 33, 34]).unwrap();
         let inputs = HashMap::from([
-            (base.id, crate::Value::Host(base_value)),
-            (src.id, crate::Value::Host(src_value)),
+            (base.id(), crate::Value::Host(base_value)),
+            (src.id(), crate::Value::Host(src_value)),
             (
-                inverse.id,
+                inverse.id(),
                 crate::Value::Host(poot_tensor::HostTensor::f32(vec![3], vec![1.0, -1.0, 0.0])),
             ),
         ]);

@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use poot_graph_ir::ops::{PackedExpertStack, packed_indexed_linear};
 use poot_graph_ir::{Builder, Slot, TensorType, ops};
+use poot_quant::StoredBytes;
 use poot_quant::format::{
     FieldEncoding, FloatFormat, GroupMap, OperandRole, Storage as FormatStorage, WeightFormat,
 };
@@ -128,7 +129,7 @@ fn real_magnitude_payload(scheme: &Scheme, seed: u64) -> Arc<PackedPayload> {
     let format = (scheme.format)();
     let weight = PackedWeight::try_new(format, [OUT, K]).unwrap();
     let descriptor = format.descriptor();
-    let sources: Vec<(SourceRole, Arc<[u8]>)> = weight
+    let sources: Vec<(SourceRole, StoredBytes)> = weight
         .sources()
         .into_iter()
         .enumerate()
@@ -171,7 +172,7 @@ fn real_magnitude_payload(scheme: &Scheme, seed: u64) -> Arc<PackedPayload> {
                 }
                 (storage, role) => unreachable!("{storage:?} has no {role:?} source"),
             }
-            (role, Arc::from(bytes))
+            (role, StoredBytes::from(bytes))
         })
         .collect();
     let payload = PackedPayload::try_new(weight, sources).unwrap();
@@ -224,7 +225,7 @@ pub fn packed_linear_fixtures() -> Vec<Fixture> {
             let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![m, K]));
             let y = ops::packed_linear(&b, x, "layer", payload.weight(), None, None).unwrap();
             let graph = b.finish(y);
-            let key = graph.meta(x.id).slot_key().unwrap().clone();
+            let key = graph.meta(x.id()).slot_key().unwrap().clone();
             let steps = (0..2)
                 .map(|step| {
                     vec![StepFixture {
@@ -269,8 +270,8 @@ pub fn packed_expert_fixtures() -> Vec<Fixture> {
         let y = packed_indexed_linear(&b, x, ids, &table).unwrap();
         let graph = b.finish(y);
         let (kx, ki) = (
-            graph.meta(x.id).slot_key().unwrap().clone(),
-            graph.meta(ids.id).slot_key().unwrap().clone(),
+            graph.meta(x.id()).slot_key().unwrap().clone(),
+            graph.meta(ids.id()).slot_key().unwrap().clone(),
         );
         let steps = (0..2usize)
             .map(|step| {

@@ -41,6 +41,14 @@ pub struct RefusalDtypes {
 /// [`Refusal`] says for which equation and target.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Capability {
+    /// The equation is a cross-device collective (`AllReduce`, `AllGather`). A collective is a cut point
+    /// between stage programs: `compile_staged` places the transfer between them, so no stage program
+    /// holds one.
+    CollectiveInStage,
+    /// The target set lacks the cross-device operation a stage cut needs: the refused equation produces a
+    /// value that crosses devices, and no link row admits `kind` between its producer's and consumer's
+    /// devices. Raised before any stage compile or device call.
+    Collective(CollectiveKind),
     /// The op lowers through imported-kernel production planning (the packed-block-float and production
     /// plan routes), never the generic per-equation planner.
     ImportedKernelPlanning,
@@ -229,7 +237,7 @@ impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "v{} = {} ({}) is refused on {:?}: {}",
+            "{} = {} ({}) is refused on {:?}: {}",
             self.eqn,
             self.op.name(),
             self.dtypes,
@@ -244,6 +252,13 @@ impl std::error::Error for Refusal {}
 impl fmt::Display for Capability {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Capability::CollectiveInStage => f.write_str(
+                "a collective is a cut between stage programs, never an equation inside one",
+            ),
+            Capability::Collective(kind) => write!(
+                f,
+                "the target set has no link that performs {kind:?} between the devices this value crosses"
+            ),
             Capability::ImportedKernelPlanning => f.write_str(
                 "the op lowers through imported-kernel production planning, not the generic planner",
             ),
@@ -281,10 +296,10 @@ impl fmt::Display for Capability {
                 shape,
                 expected,
             } => {
-                write!(f, "v{value} has shape {shape:?}, the lowering needs {expected:?}")
+                write!(f, "{value} has shape {shape:?}, the lowering needs {expected:?}")
             }
             Capability::OperandLayout { value } => {
-                write!(f, "v{value} is a strided view the lowering cannot read")
+                write!(f, "{value} is a strided view the lowering cannot read")
             }
             Capability::LiteralFirstOperand => {
                 f.write_str("a literal first operand is outside the planner's operand grammar")

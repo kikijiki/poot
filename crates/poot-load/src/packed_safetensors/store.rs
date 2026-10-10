@@ -49,7 +49,7 @@ fn dense_entry(owner: &Arc<ExactSourceOwner>) -> Result<WeightEntry, MixedWeight
     let dense = DenseWeight::try_new(
         dtype,
         owner.descriptor().shape().to_vec(),
-        Arc::clone(&owner.bytes),
+        owner.bytes.clone(),
     )
     .map_err(|error| MixedWeightStoreError::Dense {
         name: name.to_string(),
@@ -122,7 +122,7 @@ pub(crate) fn build_mixed_store(
 #[cfg(test)]
 mod tests {
     use poot_quant::format::WeightFormat;
-    use poot_quant::{PackedPayload, PackedWeight, SourceRole};
+    use poot_quant::{PackedPayload, PackedWeight, SourceRole, StoredBytes};
 
     use super::*;
     use crate::packed_safetensors::{
@@ -167,13 +167,12 @@ mod tests {
             artifact: artifact(),
             descriptor: descriptor.clone(),
             kind,
-            bytes: Arc::from(bytes),
+            bytes: StoredBytes::from(bytes),
         });
         StagedExactRow {
             row: ValidatedExactSelection {
                 descriptor,
                 kind,
-                data_start: 0,
                 key: ExactSourceCacheKey {
                     artifact: artifact(),
                     descriptor: owner.descriptor.clone(),
@@ -201,10 +200,7 @@ mod tests {
             weight_shape: weight.shape(),
             scale_shape: [0, 0],
         };
-        let row = ValidatedSelection {
-            selection,
-            data_start: 0,
-        };
+        let row = ValidatedSelection { selection };
         let key = row.cache_key(artifact_digest());
         StagedRow {
             row,
@@ -279,7 +275,10 @@ mod tests {
         let owner = Arc::new(
             PackedPayload::try_new(
                 weight,
-                [(SourceRole::Blocks, Arc::from(vec![0u8; block_bytes]))],
+                [(
+                    SourceRole::Blocks,
+                    StoredBytes::from(vec![0u8; block_bytes]),
+                )],
             )
             .unwrap(),
         );
@@ -326,7 +325,10 @@ mod tests {
         let owner = Arc::new(
             PackedPayload::try_new(
                 weight,
-                [(SourceRole::Blocks, Arc::from(vec![0u8; block_bytes]))],
+                [(
+                    SourceRole::Blocks,
+                    StoredBytes::from(vec![0u8; block_bytes]),
+                )],
             )
             .unwrap(),
         );

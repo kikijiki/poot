@@ -46,15 +46,13 @@ pub fn i32_constant(
             shape: shape.clone(),
         })?;
     let mut plan = b.append_plan(0);
-    let value = plan.input_result(
+    plan.input_result(
         name.to_string(),
         TensorType::new(shape, DType::I32),
         Storage::Const,
     )?;
     let mut prepared = b.preflight_append(plan)?;
-    let id = b.commit_append(&mut prepared)?;
-    debug_assert_eq!(id, value.id);
-    Ok(value)
+    b.commit_append(&mut prepared)
 }
 
 /// Finalize with one validation output, no carried state. Reimplements `poot-graph-ir`'s deleted
@@ -82,7 +80,7 @@ pub fn finish_with_state_and_validations(
             .map(|&(id, name, value)| ValidationOutput {
                 id,
                 name: name.to_owned(),
-                value: value.id,
+                value: value.id(),
             })
             .collect(),
     );

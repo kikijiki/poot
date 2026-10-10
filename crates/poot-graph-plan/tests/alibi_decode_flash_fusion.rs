@@ -14,10 +14,10 @@ use poot_graph_ir::{Graph, Slot, Storage, ValidationOutputs};
 use poot_graph_plan::{cse, dce, flash_attention_capped};
 use poot_models::model::{LogitRows, Phase};
 use poot_models::registry::Registry;
+use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::{DType, HostTensor};
 use std::collections::HashMap;
-use std::sync::Arc;
 
 /// Heads and layers of the MPT registry fixture (ALiBi, no RoPE, no GQA).
 const HEADS: usize = 4;
@@ -77,7 +77,8 @@ fn mpt_graph(phase: Phase, tokens: usize, cap: usize) -> Graph<ValidationOutputs
             .unwrap()
             .into_owned();
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let dense = DenseWeight::try_new(DType::F32, stored.shape(), Arc::from(bytes)).unwrap();
+        let dense =
+            DenseWeight::try_new(DType::F32, stored.shape(), StoredBytes::from(bytes)).unwrap();
         f32_store
             .insert(key.clone(), WeightEntry::Dense(dense))
             .unwrap();

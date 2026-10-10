@@ -16,6 +16,9 @@ startup, before the server listens:
   capability for), stops startup with the refusal. `poot-serve` never tries another backend after a refusal:
   a model that does not run on the device you chose is an error you can read, not a silent move to different
   hardware.
+- `--placement pipeline:ORD,ORD,...` (or `tensor:...`) runs one model over several GPUs, and only the **ptx**
+  backend can: the other backends cannot copy between their devices, so a group on them is refused at startup.
+  `--device-timing` is refused over a group.
 - Before it serves, the server fits the workload to the device memory: it computes the exact footprint of each
   candidate (weights once, every retained arena, state) and takes the largest candidate that fits, then checks
   what the device actually allocated before `/health` reports `serving`.

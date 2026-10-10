@@ -931,7 +931,7 @@ fn bf16_round_trips_through_the_storage_typed_primitives_with_exactly_elems_time
     assert_eq!(bytes.len(), elems * 2, "fixture bytes must be elems * 2");
 
     let buf = ctx.alloc_storage(BufferRole::Activation, BufferStorage::bf16(), elems);
-    ctx.write_bytes(&buf, 0, &bytes).expect("write_bytes");
+    write_host_bytes(&ctx, &buf, 0, &bytes).expect("write_with");
 
     let mut got = vec![0u8; elems * 2];
     ctx.read_bytes(&buf, &mut got).expect("read_bytes");
@@ -954,7 +954,7 @@ fn bf16_round_trips_through_the_storage_typed_primitives_with_exactly_elems_time
 }
 
 /// Card 547a: `read_bytes` with an `out` longer than the source buffer's byte capacity must
-/// return the typed [`RuntimeError::RangeOutOfBounds`] (mirroring [`Context::write_bytes`]'s own
+/// return the typed [`RuntimeError::RangeOutOfBounds`] (mirroring [`Context::write_with`]'s own
 /// `checked_write_range` check), never panic inside wgpu's own validation layer. A BF16 buffer (odd
 /// element count, so its allocated capacity is itself padded to a 4-byte multiple below the
 /// requested-but-refused size) is the same shape an earlier bug had: `out.len()` not a multiple of
@@ -1326,7 +1326,7 @@ mod device_timing_tests {
 
 /// POOT-1074: a write at a non-zero byte offset lands there and leaves its neighbours intact; an offset
 /// outside the buffer, an overflowing one and a misaligned one are typed refusals that write nothing.
-/// Mutation: ignore `offset` in `Context::write_bytes` (pass 0 to `queue.write_buffer`); the neighbour
+/// Mutation: ignore `offset` in `Context::write_with` (pass 0 to `queue.write_buffer`); the neighbour
 /// check goes red.
 #[test]
 fn a_write_at_an_offset_leaves_its_neighbours_intact_and_bad_ranges_are_typed() {
@@ -1340,14 +1340,13 @@ fn a_write_at_an_offset_leaves_its_neighbours_intact_and_bad_ranges_are_typed() 
     let words =
         |values: &[f32]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
     let buf = ctx.alloc_storage(BufferRole::State, BufferStorage::f32(), 4);
-    ctx.write_bytes(&buf, 0, &words(&[1.0, 2.0, 3.0, 4.0]))
-        .unwrap();
-    ctx.write_bytes(&buf, 4, &words(&[9.0, 9.0])).unwrap();
+    write_host_bytes(&ctx, &buf, 0, &words(&[1.0, 2.0, 3.0, 4.0])).unwrap();
+    write_host_bytes(&ctx, &buf, 4, &words(&[9.0, 9.0])).unwrap();
     let mut got = vec![0u8; 16];
     ctx.read_bytes(&buf, &mut got).unwrap();
     assert_eq!(got, words(&[1.0, 9.0, 9.0, 4.0]), "only bytes 4..12 change");
     for (offset, len) in [(16, 4), (12, 8), (usize::MAX, 4)] {
-        let error = ctx.write_bytes(&buf, offset, &vec![0u8; len]).unwrap_err();
+        let error = write_host_bytes(&ctx, &buf, offset, &vec![0u8; len]).unwrap_err();
         assert!(
             matches!(
                 error,
@@ -1357,7 +1356,7 @@ fn a_write_at_an_offset_leaves_its_neighbours_intact_and_bad_ranges_are_typed() 
         );
     }
     for (offset, len) in [(2, 4), (4, 2)] {
-        let error = ctx.write_bytes(&buf, offset, &vec![0u8; len]).unwrap_err();
+        let error = write_host_bytes(&ctx, &buf, offset, &vec![0u8; len]).unwrap_err();
         assert!(
             matches!(error, RuntimeError::Misaligned { .. }),
             "offset {offset} len {len}: {error:?}"
@@ -1369,4 +1368,17 @@ fn a_write_at_an_offset_leaves_its_neighbours_intact_and_bad_ranges_are_typed() 
         words(&[1.0, 9.0, 9.0, 4.0]),
         "refused writes change nothing"
     );
+}
+
+/// Write `bytes` at `offset` of `buf` through the context's one write primitive, `write_with` (a test helper:
+/// the contexts have no slice-taking write of their own).
+fn write_host_bytes(
+    ctx: &crate::Context,
+    buf: &crate::DeviceBuffer,
+    offset: usize,
+    bytes: &[u8],
+) -> Result<(), crate::RuntimeError> {
+    ctx.write_with(buf, offset, bytes.len(), &mut |range, out| {
+        out.copy_from_slice(&bytes[range.start - offset..range.end - offset]);
+    })
 }

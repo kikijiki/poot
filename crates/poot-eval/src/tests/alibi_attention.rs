@@ -18,11 +18,11 @@ use poot_graph_ir::types::TensorType;
 use poot_graph_ir::{ComputedConst, Operand, Storage};
 use poot_models::model::{LogitRows, Model, Phase};
 use poot_models::registry::Registry;
+use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::DType;
 use poot_tensor::HostTensor;
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use super::helpers::*;
 use super::qwen2_pipeline::{eval_step, trace_step};
@@ -39,15 +39,13 @@ fn stage_flash(b: &Builder, op: OpKind, [q, k, v, mask]: [Traced; 4]) -> Traced 
             op,
             [q, k, v, mask]
                 .iter()
-                .map(|t| Operand::Value(t.id))
+                .map(|t| Operand::Value(t.id()))
                 .collect(),
         )
         .expect("stage the flash op");
     plan.declare_result(out).expect("declare result");
     let mut prepared = b.preflight_append(plan).expect("preflight append");
-    Traced {
-        id: b.commit_append(&mut prepared).expect("commit append"),
-    }
+    b.commit_append(&mut prepared).expect("commit append")
 }
 
 fn decode(n_rep: usize, scale: f32) -> OpKind {
@@ -142,7 +140,7 @@ fn attention_masked_with_alibi_bias_matches_hand_rolled_reference() {
     let v = b.constant("v", TensorType::f32(vec![1, hkv, cap, d]));
     let mask = b.constant("mask", TensorType::f32(vec![1, hq, 1, cap]));
     let out = attention_masked(&b, q, k, v, n_rep, scale, mask);
-    let (qi, ki, vi, mi) = (q.id, k.id, v.id, mask.id);
+    let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();
@@ -243,7 +241,7 @@ fn bloom_f32_model() -> Box<dyn Model> {
             .map(|v| v * 0.1)
             .collect();
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let dense = DenseWeight::try_new(DType::F32, shape, Arc::from(bytes)).unwrap();
+        let dense = DenseWeight::try_new(DType::F32, shape, StoredBytes::from(bytes)).unwrap();
         store
             .insert(key.clone(), WeightEntry::Dense(dense))
             .unwrap();
@@ -345,7 +343,7 @@ fn flash_decode_per_head_alibi_mask_matches_reference_and_decomposition() {
         let v = b.constant("v", TensorType::f32(vec![1, hkv, cap, d]));
         let mask = b.constant("mask", TensorType::f32(mask_shape.clone()));
         let out = stage_flash(&b, decode(n_rep, scale), [q, k, v, mask]);
-        let (qi, ki, vi, mi) = (q.id, k.id, v.id, mask.id);
+        let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
         let g = b.finish(out);
         let mut inputs = HashMap::new();
         inputs.insert(
@@ -384,7 +382,7 @@ fn flash_decode_per_head_alibi_mask_matches_reference_and_decomposition() {
     let v = b.constant("v", TensorType::f32(vec![1, hkv, cap, d]));
     let mask = b.constant("mask", TensorType::f32(vec![1, hq, 1, cap]));
     let out = attention_masked(&b, q, k, v, n_rep, scale, mask);
-    let (qi, ki, vi, mi) = (q.id, k.id, v.id, mask.id);
+    let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
     let g = b.finish(out);
     let mut inputs = HashMap::new();
     inputs.insert(
@@ -459,7 +457,7 @@ fn flash_decode_broadcast_mask_unchanged_batched() {
     let v = b.constant("v", TensorType::f32(vec![bsz, hkv, cap, d]));
     let mask = b.constant("mask", TensorType::f32(vec![bsz, 1, 1, cap]));
     let out = stage_flash(&b, decode(n_rep, scale), [q, k, v, mask]);
-    let (qi, ki, vi, mi) = (q.id, k.id, v.id, mask.id);
+    let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
     let g = b.finish(out);
     let mut inputs = HashMap::new();
     inputs.insert(
@@ -530,7 +528,7 @@ fn flash_prefill_per_head_alibi_mask_matches_reference() {
         let v = b.constant("v", TensorType::f32(vec![1, hkv, l, d]));
         let mask = b.constant("mask", TensorType::f32(mask_shape.clone()));
         let out = stage_flash(&b, prefill(n_rep, scale), [q, k, v, mask]);
-        let (qi, ki, vi, mi) = (q.id, k.id, v.id, mask.id);
+        let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
         let g = b.finish(out);
         let mut inputs = HashMap::new();
         inputs.insert(
@@ -589,7 +587,7 @@ fn flash_prefill_broadcast_mask_unchanged() {
     let v = b.constant("v", TensorType::f32(vec![1, hkv, l, d]));
     let mask = b.constant("mask", TensorType::f32(vec![1, 1, l, l]));
     let out = stage_flash(&b, prefill(n_rep, scale), [q, k, v, mask]);
-    let (qi, ki, vi, mi) = (q.id, k.id, v.id, mask.id);
+    let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
     let g = b.finish(out);
     let mut inputs = HashMap::new();
     inputs.insert(
@@ -633,7 +631,7 @@ fn flash_decode_rejects_bad_mask_head_axis() {
     let v = b.constant("v", TensorType::f32(vec![1, hkv, cap, d]));
     let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
     let out = stage_flash(&b, decode(hq / hkv, 1.0), [q, k, v, mask]);
-    let (qi, ki, vi, mi) = (q.id, k.id, v.id, mask.id);
+    let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
     let mut g = b.finish(out);
     g.values[mi].aval.shape = vec![1, 2, 1, cap]; // 2 is neither 1 nor Hq=4
     let mut inputs = HashMap::new();

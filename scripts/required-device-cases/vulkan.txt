@@ -14,6 +14,7 @@
 # (poot-serve served_groups: startup admits raw Vulkan on its VK_EXT_memory_budget figure). The Qwen2.5-0.5B
 # row is #[ignore]d (it loads a checkpoint: run by exact name).
 poot-serve::served_groups	served_qwen2_vulkan
+poot-serve::served_loop	served_device_timing_flag_reports_unknown_device_time_on_raw_vulkan_vulkan
 poot-vulkan-device::coopmat	coopmat_matmul_plans_the_coopmat_arm_and_matches_the_cpu_product_on_vulkan
 poot-vulkan-device::executor_contract	a_copy_is_ordered_between_the_dispatches_around_it
 poot-vulkan-device::executor_contract	a_kernel_assert_is_a_fault_raised_at_synchronize
@@ -21,6 +22,7 @@ poot-vulkan-device::executor_contract	a_long_recording_is_cut_into_several_submi
 poot-vulkan-device::executor_contract	a_vulkan_buffer_moves_into_another_thread
 poot-vulkan-device::executor_contract	copy_round_trips_every_element_width_with_no_sentinel_left
 poot-vulkan-device::executor_contract	dispatch_reads_the_argument_element_count_not_the_buffer_capacity
+poot-vulkan-device::executor_contract	lp3_vulkan_write_with_is_exact_into_the_mapping
 poot-vulkan-device::executor_contract	memory_counters_charge_the_roles_a_decode_entry_allocates_as_wgpu_does
 poot-vulkan-device::executor_contract	sixteen_replayed_steps_record_once
 poot-vulkan-device::executor_contract	the_vulkan_device_reports_live_free_memory_within_its_open_time_ceiling

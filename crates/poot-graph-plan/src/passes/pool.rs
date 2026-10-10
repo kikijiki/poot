@@ -1,0 +1,464 @@
+//! The expert-pool transform (POOT-746): a routed MoE layer whose expert tables hold `E` experts is
+//! rewritten to read `P < E` resident rows, with the router's global expert ids translated to pool
+//! rows by an in-graph `Gather` through a host-written map.
+//!
+//! One [`PoolSite`] is one selection of expert ids and the tables its indexed contractions read (the
+//! up and down projections of one layer share a site). For each site the pass
+//!
+//! - declares the site's [`Slot::ExpertPoolMap`] `[E]` (the pool row holding global expert `e`, or `-1`),
+//! - inserts `Gather(map, ids)` just before the first contraction that reads the ids and points every
+//!   contraction of the site at the translated ids,
+//! - rebinds each table const (a dense `[E, ..]` stack, or each source role of a packed stack) as a
+//!   resident [`Slot::ExpertPool`] `[P, ..]` of the same name, and a packed contraction's `Indexed`
+//!   expert count becomes `P`.
+//!
+//! The translating `Gather` is where the program is cut: everything before it computes the ids, the
+//! host sync reads them and makes those experts resident, and the rest of the layer reads the pool
+//! (`staged::pool` owns the cut and the sync point). The tables stay in the stored lane: a refill
+//! writes one expert's bytes as stored, never a re-encode (ADR-0103).
+//!
+//! A selection that cannot be served is a typed [`PoolError`]: a site's step demand above the pool
+//! ([`PoolError::CapacityBelowStepDemand`]), a pool that is not smaller than the experts
+//! ([`PoolError::CapacityNotBelowExperts`]), or a table the pass cannot page.
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+use poot_graph_ir::error::GraphValidationError;
+use poot_graph_ir::graph::{BoundaryId, Eqn, Graph, Operand, Slot, SlotKey, Storage, ValueId};
+use poot_graph_ir::graph::{ValidationChannel, ValueMeta};
+use poot_graph_ir::op::{ContractionRows, OpKind};
+use poot_graph_ir::types::TensorType;
+
+use super::GraphBudget;
+use super::routed_experts::routed_expert_sites;
+use crate::ExpansionError;
+
+const STAGE: &str = "pool_experts";
+
+/// One pooled table: the const it replaces (its name is how the weight map finds the stored experts), the
+/// resident slot that stands in for it, and that slot's type, `[P, ..]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PooledWeight {
+    pub name: String,
+    pub slot: SlotKey,
+    pub pool: TensorType,
+}
+
+/// One routed selection and the tables it indexes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PoolSite {
+    /// The decoder layer the site's contractions were traced in, when the tracer tagged one.
+    pub layer: Option<usize>,
+    /// Experts in each table, `E`.
+    pub experts: usize,
+    /// Pool rows, `P`.
+    pub slots: usize,
+    /// The router's expert ids (F32, one per routed row): the value the host reads at the sync.
+    pub ids: BoundaryId,
+    /// The `[E]` map slot: pool row of each global expert, `-1` when not resident.
+    pub map: SlotKey,
+    /// The tables, in the order the site's contractions read them.
+    pub weights: Vec<PooledWeight>,
+}
+
+/// What the pool pass did to a graph: its sites in cut order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PoolSpec {
+    pub sites: Vec<PoolSite>,
+}
+
+/// A graph with its expert tables pooled, and where each site cuts it.
+pub(crate) struct Pooled<V: ValidationChannel> {
+    pub graph: Graph<V>,
+    pub spec: PoolSpec,
+    /// `cuts[i]` is the equation of the translating `Gather` of `spec.sites[i]`: the first equation
+    /// of the stage that follows the site's sync.
+    pub cuts: Vec<usize>,
+}
+
+/// Why a graph could not be pooled.
+#[derive(Debug, thiserror::Error)]
+pub enum PoolError {
+    /// One step can route more rows to distinct experts than the pool holds rows: the demand is the
+    /// site's id count, `rows * tokens * k`.
+    #[error(
+        "the routed selection of layer {layer:?} can need {demand} experts in one step, over the pool's {slots} rows"
+    )]
+    CapacityBelowStepDemand {
+        layer: Option<usize>,
+        demand: usize,
+        slots: usize,
+    },
+    /// A pool as large as the expert table pages nothing: serve the table resident.
+    #[error("a pool of {slots} rows is not smaller than the {experts} experts it would page")]
+    CapacityNotBelowExperts { slots: usize, experts: usize },
+    /// The graph has no routed selection, so there is nothing to page.
+    #[error("the graph has no routed expert selection to pool")]
+    NoRoutedExperts,
+    /// An indexed contraction's table is not a named const reached by leading-axis-preserving views.
+    #[error(
+        "equation {eqn}: the expert table behind {value} is not a named const the pool can page"
+    )]
+    TableNotPageable { eqn: usize, value: ValueId },
+    /// A table is read by something other than its site's contractions, so shrinking it would change
+    /// that reader.
+    #[error("expert table {name} is also read outside its routed contractions")]
+    TableReadOutsideSite { name: String },
+    /// One table is indexed by two different selections.
+    #[error("expert table {name} is indexed by more than one routed selection")]
+    TableSharedAcrossSites { name: String },
+    /// The tables of one selection do not agree on how many experts they hold.
+    #[error("the tables of one routed selection hold {first} and {second} experts")]
+    ExpertCountMismatch { first: usize, second: usize },
+    #[error(transparent)]
+    Expansion(Box<ExpansionError>),
+    #[error(transparent)]
+    InvalidGraph(#[from] GraphValidationError),
+}
+
+impl From<ExpansionError> for PoolError {
+    fn from(error: ExpansionError) -> Self {
+        Self::Expansion(Box::new(error))
+    }
+}
+
+/// One selection found in the unpooled graph.
+struct Found {
+    ids: ValueId,
+    /// The most experts one step can select: the router's rows (every row of every token) times the
+    /// `k` each row picks.
+    demand: usize,
+    /// The contractions reading `ids`, in equation order.
+    eqns: Vec<usize>,
+    tables: Vec<Table>,
+    experts: usize,
+    /// The view equations (transposes) between each table const and its contraction.
+    views: Vec<usize>,
+}
+
+struct Table {
+    value: ValueId,
+    name: String,
+}
+
+/// The most experts one step of `g` can select at any one routed selection (`rows * tokens * k`), `0`
+/// when `g` has none. A driver divides its pool by this per-token demand to bound a step's tokens.
+pub fn routed_step_demand<V: ValidationChannel>(g: &Graph<V>) -> Result<usize, PoolError> {
+    Ok(find(g)?.iter().map(|site| site.demand).max().unwrap_or(0))
+}
+
+/// Pool every routed selection of `g` to `slots` rows.
+pub(crate) fn pool_experts<V: ValidationChannel>(
+    g: &Graph<V>,
+    slots: usize,
+    budget: &GraphBudget,
+) -> Result<Pooled<V>, PoolError> {
+    let mut found = find(g)?;
+    if found.is_empty() {
+        return Err(PoolError::NoRoutedExperts);
+    }
+    for site in &found {
+        if slots >= site.experts {
+            return Err(PoolError::CapacityNotBelowExperts {
+                slots,
+                experts: site.experts,
+            });
+        }
+        if site.demand > slots {
+            return Err(PoolError::CapacityBelowStepDemand {
+                layer: g.eqns[site.eqns[0]].layer.map(|layer| layer.0),
+                demand: site.demand,
+                slots,
+            });
+        }
+    }
+    found.sort_by_key(|site| site.eqns[0]);
+    budget.reserve(STAGE, g, found.len(), found.len())?;
+
+    let mut pooled = g.clone();
+    let mut sites = Vec::with_capacity(found.len());
+    // `(original equation the gather goes before, the gather)`, in ascending position.
+    let mut gathers: Vec<(usize, Eqn)> = Vec::with_capacity(found.len());
+    for (ordinal, site) in found.iter().enumerate() {
+        let first = site.eqns[0];
+        let layer = g.eqns[first].layer;
+        let tag = format!("site.{ordinal}");
+        let map = pooled.declare_slot(
+            Slot::ExpertPoolMap,
+            &tag,
+            TensorType::f32(vec![site.experts]),
+        );
+        let ids_aval = g.aval(site.ids).clone();
+        let translated = pooled
+            .values
+            .push(ValueMeta::new(ids_aval, Storage::Device, None));
+        gathers.push((
+            first,
+            Eqn {
+                op: OpKind::Gather { axis: 0 },
+                inputs: vec![Operand::Value(map), Operand::Value(site.ids)],
+                out: translated,
+                layer,
+            },
+        ));
+        for &e in &site.eqns {
+            let eqn = &mut pooled.eqns[e];
+            let position = match eqn.op {
+                OpKind::IndexedMatMul => 2,
+                OpKind::PackedContraction {
+                    descriptor,
+                    rows: ContractionRows::Indexed { .. },
+                } => {
+                    eqn.op = OpKind::PackedContraction {
+                        descriptor,
+                        rows: ContractionRows::Indexed { experts: slots },
+                    };
+                    1
+                }
+                _ => unreachable!("find only collects indexed contractions"),
+            };
+            eqn.inputs[position] = Operand::Value(translated);
+        }
+        let mut weights = Vec::with_capacity(site.tables.len());
+        for table in &site.tables {
+            let slot = pooled.rebind_const_as_pool(table.value, slots);
+            weights.push(PooledWeight {
+                name: table.name.clone(),
+                slot,
+                pool: pooled.aval(table.value).clone(),
+            });
+        }
+        sites.push(PoolSite {
+            layer: layer.map(|layer| layer.0),
+            experts: site.experts,
+            slots,
+            ids: BoundaryId(site.ids),
+            map: SlotKey::new(Slot::ExpertPoolMap, Some(&tag)),
+            weights,
+        });
+    }
+
+    // The views between a table and its contraction now carry `P` rows: re-infer them in order.
+    let views: HashSet<usize> = found.iter().flat_map(|site| site.views.clone()).collect();
+    for index in 0..pooled.eqns.len() {
+        if !views.contains(&index) {
+            continue;
+        }
+        let eqn = &pooled.eqns[index];
+        let inputs: Vec<TensorType> = eqn
+            .inputs
+            .iter()
+            .filter_map(|operand| match operand {
+                Operand::Value(value) => Some(pooled.values[*value].aval.clone()),
+                Operand::Lit(_) => None,
+            })
+            .collect();
+        let aval = eqn
+            .op
+            .infer(&inputs)
+            .unwrap_or_else(|error| panic!("pool_experts: view of a pooled table: {error}"));
+        let out = eqn.out;
+        pooled.values[out].aval = aval;
+    }
+
+    // Rebuild the equation list: each site's gather opens the stage after its sync, so the views
+    // between its tables and its contractions move to just after the gather (they read the pool,
+    // which is only resident from the sync on). Cuts are the gathers' positions in the new list.
+    let original = std::mem::take(&mut pooled.eqns);
+    let moved: HashSet<usize> = found.iter().flat_map(|site| site.views.clone()).collect();
+    let mut opens: HashMap<usize, usize> = HashMap::new();
+    for (ordinal, site) in found.iter().enumerate() {
+        opens.insert(site.eqns[0], ordinal);
+    }
+    let mut gathers: Vec<Option<Eqn>> = gathers.into_iter().map(|(_, g)| Some(g)).collect();
+    let mut cuts = Vec::with_capacity(found.len());
+    let mut eqns = Vec::with_capacity(original.len() + found.len());
+    for (index, eqn) in original.iter().enumerate() {
+        if let Some(&ordinal) = opens.get(&index) {
+            cuts.push(eqns.len());
+            eqns.push(gathers[ordinal].take().expect("one gather per site"));
+            eqns.extend(found[ordinal].views.iter().map(|&v| original[v].clone()));
+        }
+        if !moved.contains(&index) {
+            eqns.push(eqn.clone());
+        }
+    }
+    pooled.eqns = eqns;
+
+    pooled.validate()?;
+    Ok(Pooled {
+        graph: pooled,
+        spec: PoolSpec { sites },
+        cuts,
+    })
+}
+
+/// Every routed selection of `g` whose contractions read pageable tables.
+fn find<V: ValidationChannel>(g: &Graph<V>) -> Result<Vec<Found>, PoolError> {
+    let producer: HashMap<ValueId, usize> =
+        g.eqns.iter().enumerate().map(|(i, e)| (e.out, i)).collect();
+    let mut readers: HashMap<ValueId, Vec<usize>> = HashMap::new();
+    for (i, eqn) in g.eqns.iter().enumerate() {
+        for operand in &eqn.inputs {
+            if let Operand::Value(value) = operand {
+                readers.entry(*value).or_default().push(i);
+            }
+        }
+    }
+
+    // Sites grouped by the index value the contractions read: one selection, however many
+    // projections consume it.
+    let mut by_ids: BTreeMap<ValueId, (usize, Vec<usize>)> = BTreeMap::new();
+    for site in routed_expert_sites(g) {
+        // Every router row selects `k` experts: that is one step's demand on the pool.
+        let OpKind::ArgTopK { k } = g.eqns[site.select].op else {
+            unreachable!("a routed site's selection is an ArgTopK")
+        };
+        let router_shape = &g.aval(g.eqns[site.router].out).shape;
+        let routed_rows: usize = router_shape[..router_shape.len() - 1].iter().product();
+        let demand = routed_rows * k;
+        for &e in &site.experts {
+            let eqn = &g.eqns[e];
+            let position = match eqn.op {
+                OpKind::IndexedMatMul => 2,
+                _ => 1,
+            };
+            let Some(Operand::Value(ids)) = eqn.inputs.get(position) else {
+                continue;
+            };
+            let (_, eqns) = by_ids.entry(*ids).or_insert_with(|| (demand, Vec::new()));
+            if !eqns.contains(&e) {
+                eqns.push(e);
+            }
+        }
+    }
+
+    let mut owner: HashMap<ValueId, ValueId> = HashMap::new();
+    let mut found = Vec::new();
+    for (ids, (demand, mut eqns)) in by_ids {
+        eqns.sort_unstable();
+        let mut tables: Vec<Table> = Vec::new();
+        let mut views: Vec<usize> = Vec::new();
+        let mut experts: Option<usize> = None;
+        let allowed_start = eqns.clone();
+        for &e in &eqns {
+            let eqn = &g.eqns[e];
+            let operands: Vec<ValueId> = match eqn.op {
+                OpKind::IndexedMatMul => vec![operand(eqn, 1)],
+                _ => eqn
+                    .inputs
+                    .iter()
+                    .skip(2)
+                    .filter_map(|operand| match operand {
+                        Operand::Value(value) => Some(*value),
+                        Operand::Lit(_) => None,
+                    })
+                    .collect(),
+            };
+            for start in operands {
+                let (table, chain) = walk_to_const(g, &producer, e, start)?;
+                let count = g.aval(table).shape[0];
+                match experts {
+                    None => experts = Some(count),
+                    Some(first) if first != count => {
+                        return Err(PoolError::ExpertCountMismatch {
+                            first,
+                            second: count,
+                        });
+                    }
+                    Some(_) => {}
+                }
+                let name = g
+                    .meta(table)
+                    .name
+                    .clone()
+                    .expect("walk_to_const returns a named const");
+                // Every reader of the const and of each view must be this site's own chain.
+                let mut allowed: HashSet<usize> = allowed_start.iter().copied().collect();
+                allowed.extend(chain.iter().copied());
+                let values = std::iter::once(table).chain(chain.iter().map(|&i| g.eqns[i].out));
+                for value in values {
+                    let readers = readers.get(&value).map(Vec::as_slice).unwrap_or(&[]);
+                    if readers.iter().any(|r| !allowed.contains(r))
+                        || g.liveness_roots().any(|root| root == value)
+                    {
+                        return Err(PoolError::TableReadOutsideSite { name });
+                    }
+                }
+                if let Some(&other) = owner.get(&table)
+                    && other != ids
+                {
+                    return Err(PoolError::TableSharedAcrossSites { name });
+                }
+                owner.insert(table, ids);
+                if !tables.iter().any(|t| t.value == table) {
+                    tables.push(Table { value: table, name });
+                }
+                views.extend(chain);
+            }
+        }
+        views.sort_unstable();
+        views.dedup();
+        found.push(Found {
+            ids,
+            demand,
+            eqns,
+            tables,
+            experts: experts.expect("a site has a contraction with a table"),
+            views,
+        });
+    }
+    Ok(found)
+}
+
+fn operand(eqn: &Eqn, position: usize) -> ValueId {
+    match eqn.inputs[position] {
+        Operand::Value(value) => value,
+        Operand::Lit(_) => unreachable!("an indexed contraction's table is a value"),
+    }
+}
+
+/// Follow `start` back through transposes that keep the leading axis to a named const, returning
+/// the const and the view equations crossed (nearest the contraction first).
+fn walk_to_const<V: ValidationChannel>(
+    g: &Graph<V>,
+    producer: &HashMap<ValueId, usize>,
+    contraction: usize,
+    start: ValueId,
+) -> Result<(ValueId, Vec<usize>), PoolError> {
+    let mut value = start;
+    let mut chain = Vec::new();
+    loop {
+        match producer.get(&value) {
+            None => {
+                let meta = g.meta(value);
+                return if meta.storage == Storage::Const
+                    && meta.name.is_some()
+                    && !g.aval(value).shape.is_empty()
+                {
+                    Ok((value, chain))
+                } else {
+                    Err(PoolError::TableNotPageable {
+                        eqn: contraction,
+                        value: start,
+                    })
+                };
+            }
+            Some(&i) => {
+                let eqn = &g.eqns[i];
+                match &eqn.op {
+                    OpKind::Transpose { perm } if perm.first() == Some(&0) => {
+                        chain.push(i);
+                        value = operand(eqn, 0);
+                    }
+                    _ => {
+                        return Err(PoolError::TableNotPageable {
+                            eqn: contraction,
+                            value: start,
+                        });
+                    }
+                }
+            }
+        }
+    }
+}

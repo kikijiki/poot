@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use poot_graph_plan::LoraPlan;
 use poot_load::lora::{LoraAdapter, LoraWeight};
+use poot_quant::StoredBytes;
 use poot_quant::weights::{
     DenseWeight, DenseWeightError, DuplicateWeightKey, LoraRole, LoraTarget, WeightEntry, WeightId,
     WeightKey, WeightMap, WeightMapError, WeightRole, WeightStore, WeightView,
@@ -317,7 +318,7 @@ fn parse_module(module: &str) -> Option<(usize, LoraTarget)> {
 
 fn dense(shape: Vec<usize>, values: &[f32]) -> Result<WeightEntry, DenseWeightError> {
     let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-    DenseWeight::try_new(DType::F32, shape, Arc::from(bytes)).map(WeightEntry::Dense)
+    DenseWeight::try_new(DType::F32, shape, StoredBytes::from(bytes)).map(WeightEntry::Dense)
 }
 
 /// The adapters of one generation stacked as the LoRA pass reads them: per adapted projection of every

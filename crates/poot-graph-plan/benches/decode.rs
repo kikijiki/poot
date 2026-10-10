@@ -17,7 +17,7 @@ use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use poot_eval::{EvalBudget, EvalOptions, Value};
 use poot_executor_parity::dense::{Dense, Family, plain, step};
 use poot_executor_parity::weight_map::MappedModel;
-use poot_graph_ir::{Graph, Slot, Storage};
+use poot_graph_ir::{Graph, Slot, Storage, ValueId};
 use poot_models::model::{LogitRows, Phase};
 use poot_tensor::HostTensor;
 
@@ -65,8 +65,8 @@ fn weight(name: &str, shape: &[usize]) -> HostTensor {
 /// Bind a step graph for timing: token ids `i % 17` and positions `0..tokens` (any in-vocab ids and
 /// in-range positions work), every `Const` filled by [`weight`], caches seeded to zeros. The step has no
 /// other slots.
-fn bind(g: &Graph) -> HashMap<usize, Value> {
-    let mut inputs: HashMap<usize, Value> = HashMap::new();
+fn bind(g: &Graph) -> HashMap<ValueId, Value> {
+    let mut inputs: HashMap<ValueId, Value> = HashMap::new();
     for &id in &g.inputs {
         let m = g.meta(id);
         let numel = m.aval.shape.iter().product::<usize>().max(1);

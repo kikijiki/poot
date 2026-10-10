@@ -7,8 +7,8 @@ use std::num::NonZeroUsize;
 
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
 use poot_graph_ir::{
-    BinOp, Builder, Graph, Scalar, Slot, StateRole, TensorType, UnOp, ValidationChannel,
-    ValidationId, ValidationOutputs, ValueId,
+    BinOp, Builder, Graph, Scalar, Slot, SlotKey, StateRole, Storage, TensorType, UnOp,
+    ValidationChannel, ValidationId, ValidationOutputs, ValueId,
 };
 use poot_quant::weights::LoraTarget;
 use poot_target::Backend;
@@ -104,7 +104,7 @@ fn a_qwen2_pipeline_cut_after_layers_zero_and_one_equals_the_uncut_oracle() {
         assert_eq!(
             bits(got),
             bits(expected),
-            "carried state v{} -> v{} differs",
+            "carried state {} -> {} differs",
             pair.0,
             pair.1
         );
@@ -227,13 +227,7 @@ fn exports_survive_cse_dce_and_renumbering_and_every_consumer_sees_its_value() {
         .iter()
         .zip(chained.state.iter().zip(&whole.state))
     {
-        assert_eq!(
-            bits(got),
-            bits(expected),
-            "state v{} -> v{}",
-            pair.0,
-            pair.1
-        );
+        assert_eq!(bits(got), bits(expected), "state {} -> {}", pair.0, pair.1);
     }
     let environment = whole.environment.as_ref().unwrap();
     let declared = &graph.validation_outputs()[0];
@@ -505,14 +499,14 @@ fn unsupported_partitions_are_typed_refusals() {
             after_layers: vec![0],
             devices: vec![DeviceId(0), DeviceId(1)],
         })),
-        StagedCompileError::Unsupported(Unsupported::MultiDevice)
+        StagedCompileError::UnknownDevice(DeviceId(1))
     ));
     assert!(matches!(
         refused(Partition {
-            experts: ExpertPlacement::Pooled,
+            experts: ExpertPlacement::Pooled { slots_per_layer: 2 },
             devices: DevicePlacement::Single(DeviceId(0)),
         }),
-        StagedCompileError::Unsupported(Unsupported::ExpertPool)
+        StagedCompileError::Pool(PoolError::NoRoutedExperts)
     ));
     assert!(matches!(
         refused(partition(DevicePlacement::Single(DeviceId(5)))),
@@ -570,6 +564,274 @@ fn a_boundary_that_views_carried_state_is_refused_at_compile() {
         }
         other => panic!(
             "expected a BoundaryAliasesState refusal, got {:?}",
+            other.map(|_| ())
+        ),
+    }
+}
+
+// ---- POOT-746: the expert pool ---------------------------------------------------------------
+
+const EXPERTS: usize = 8;
+const TOP_K: usize = 2;
+const HIDDEN: usize = 4;
+const INTER: usize = 3;
+
+/// `layers` routed MoE blocks over `tokens` tokens: each layer's up projection is held in the
+/// checkpoint's `[E, N, K]` orientation and read through the transpose tracers spell, its down
+/// projection as the logical `[E, K, N]` stack.
+fn moe_model(tokens: usize, layers: usize) -> Graph {
+    let b = Builder::new();
+    let mut x = b.slot(Slot::Activation, TensorType::f32(vec![1, tokens, HIDDEN]));
+    for layer in 0..layers {
+        let _scope = b.layer_scope(layer);
+        let router = b.constant(
+            &format!("w.l{layer}.router"),
+            TensorType::f32(vec![HIDDEN, EXPERTS]),
+        );
+        let stored_in = b.constant(
+            &format!("w.l{layer}.moe.in"),
+            TensorType::f32(vec![EXPERTS, 2 * INTER, HIDDEN]),
+        );
+        let w_in = b.transpose(stored_in, vec![0, 2, 1]);
+        let w_out = b.constant(
+            &format!("w.l{layer}.moe.out"),
+            TensorType::f32(vec![EXPERTS, INTER, HIDDEN]),
+        );
+        let y = poot_graph_ir::ops::moe(&b, x, router, w_in, w_out, EXPERTS, TOP_K, INTER);
+        x = b.binary(BinOp::Add, x, y);
+    }
+    b.finish(x)
+}
+
+fn pooled_partition(slots_per_layer: usize) -> Partition {
+    Partition {
+        experts: ExpertPlacement::Pooled { slots_per_layer },
+        devices: DevicePlacement::Single(DeviceId(0)),
+    }
+}
+
+fn compile_pooled(
+    g: &Graph,
+    slots_per_layer: usize,
+) -> Result<StagedProgram<poot_graph_ir::NoValidations>, StagedCompileError> {
+    compile_staged(
+        g,
+        &TargetSet::single(DeviceId(0), target()),
+        &pooled_partition(slots_per_layer),
+        &options(),
+    )
+}
+
+/// A host that makes exactly the experts a step selected resident, one row each in ascending expert
+/// order, and rewrites each pooled table and map: the contract of a sync point with none of the LRU
+/// (the production manager's, and its tests, live with the driver).
+struct PoolHost<'g> {
+    /// The unpooled graph's inputs by const name: the full `[E, ..]` tables.
+    tables: HashMap<String, (Vec<usize>, Vec<f32>)>,
+    graph: &'g Graph,
+    /// Experts made resident per sync, for the rows that need to see eviction.
+    resident: Vec<Vec<usize>>,
+}
+
+impl PoolHost<'_> {
+    fn sync(&mut self, point: &SyncPoint, ids: &[f32]) -> HashMap<SlotKey, Value> {
+        let mut needed: Vec<usize> = ids.iter().map(|&id| id as usize).collect();
+        needed.sort_unstable();
+        needed.dedup();
+        assert!(needed.len() <= point.site.slots);
+        self.resident.push(needed.clone());
+        let mut map = vec![-1.0f32; point.site.experts];
+        for (row, &expert) in needed.iter().enumerate() {
+            map[expert] = row as f32;
+        }
+        let mut writes = HashMap::new();
+        writes.insert(
+            point.site.map.clone(),
+            Value::from(HostTensor::f32(vec![point.site.experts], map)),
+        );
+        for weight in &point.site.weights {
+            let (shape, data) = &self.tables[&weight.name];
+            assert_eq!(shape[0], point.site.experts);
+            let per_expert = data.len() / shape[0];
+            let mut pool = vec![0.0f32; weight.pool.numel()];
+            for (row, &expert) in needed.iter().enumerate() {
+                pool[row * per_expert..(row + 1) * per_expert]
+                    .copy_from_slice(&data[expert * per_expert..(expert + 1) * per_expert]);
+            }
+            writes.insert(
+                weight.slot.clone(),
+                Value::from(HostTensor::f32(weight.pool.shape.clone(), pool)),
+            );
+        }
+        let _ = self.graph;
+        writes
+    }
+}
+
+/// Evaluate a pooled program stage by stage on the oracle: each stage binds the unpooled graph's
+/// inputs by name, the boundaries earlier stages exported, and whatever the sync before it wrote.
+fn eval_pooled(
+    program: &StagedProgram<poot_graph_ir::NoValidations>,
+    graph: &Graph,
+    inputs: &HashMap<ValueId, Value>,
+) -> (Value, Vec<Vec<usize>>) {
+    let mut by_name: HashMap<String, Value> = HashMap::new();
+    let mut tables = HashMap::new();
+    let mut activations: HashMap<SlotKey, Value> = HashMap::new();
+    for &id in &graph.inputs {
+        let meta = graph.meta(id);
+        let value = inputs[&id].clone();
+        match meta.storage {
+            Storage::Const => {
+                let host = value
+                    .as_host()
+                    .expect("dense")
+                    .as_f32()
+                    .expect("f32")
+                    .to_vec();
+                tables.insert(
+                    meta.name.clone().expect("named"),
+                    (meta.aval.shape.clone(), host),
+                );
+                by_name.insert(meta.name.clone().expect("named"), value);
+            }
+            Storage::Slot(_) => {
+                activations.insert(meta.slot_key().cloned().expect("keyed"), value);
+            }
+            _ => {}
+        }
+    }
+    let mut host = PoolHost {
+        tables,
+        graph,
+        resident: Vec::new(),
+    };
+    let mut resident_slots: HashMap<SlotKey, Value> = HashMap::new();
+    let mut boundaries: HashMap<SlotKey, Value> = HashMap::new();
+    let mut output = None;
+    for (index, (stage, _, program_stage)) in program.stages().enumerate() {
+        let g = program_stage.graph();
+        let stage_inputs: HashMap<ValueId, Value> = g
+            .inputs
+            .iter()
+            .map(|&id| {
+                let meta = g.meta(id);
+                let value = match meta.storage {
+                    Storage::Computed(payload) => Value::from(payload.tensor()),
+                    Storage::Const => by_name[meta.name.as_deref().expect("named")].clone(),
+                    Storage::Slot(Slot::ExpertPool | Slot::ExpertPoolMap) => {
+                        resident_slots[meta.slot_key().expect("keyed")].clone()
+                    }
+                    Storage::Slot(_) => {
+                        let key = meta.slot_key().expect("keyed");
+                        boundaries
+                            .get(key)
+                            .or_else(|| activations.get(key))
+                            .unwrap_or_else(|| panic!("stage {stage:?}: {key:?} is unbound"))
+                            .clone()
+                    }
+                    other => panic!("unexpected input storage {other:?}"),
+                };
+                (id, value)
+            })
+            .collect();
+        let result = eval(
+            g,
+            &stage_inputs,
+            EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
+        )
+        .unwrap_or_else(|error| panic!("stage {index} did not evaluate: {error}"));
+        let environment = result.environment.expect("the environment was kept");
+        for export in &g.exports {
+            boundaries.insert(
+                export.id.slot_key(),
+                environment[export.value].clone().expect("exported"),
+            );
+        }
+        for point in program.sync_points().iter().filter(|p| p.after == stage) {
+            let &[read] = point.reads.as_slice() else {
+                panic!("a routed sync reads the ids")
+            };
+            let ids = boundaries[&read.slot_key()]
+                .as_host()
+                .expect("dense")
+                .as_f32()
+                .expect("f32")
+                .to_vec();
+            resident_slots.extend(host.sync(point, &ids));
+        }
+        output = Some(result.output);
+    }
+    (output.expect("a stage ran"), host.resident)
+}
+
+/// SC-001 (oracle half): the pooled program's cut graphs, with a host that makes the selected experts
+/// resident at each sync, equal the unpooled graph bit for bit, at decode (one token) and at a
+/// prefill whose demand fills the pool. Eviction happens: across the layers' syncs different experts
+/// are resident in the same `P = 4 < E = 8` rows.
+///
+/// Mutation (observed red): in `pool_experts`, point the contractions at the untranslated ids instead
+/// of the gather's output; the pooled tables are indexed by global ids and the output differs.
+#[test]
+fn a_pooled_moe_program_equals_the_unpooled_oracle_bit_for_bit() {
+    for tokens in [1, 2] {
+        let graph = moe_model(tokens, 3);
+        let inputs = bind_decode(&graph);
+        let whole = uncut(&graph, &inputs);
+        let program = compile_pooled(&graph, 4).expect("the pool fits the step's demand");
+        assert_eq!(program.stages().count(), 4, "one cut per routed layer");
+        assert_eq!(program.sync_points().len(), 3);
+        for (layer, point) in program.sync_points().iter().enumerate() {
+            assert_eq!(point.after, StageId(layer as u32));
+            assert_eq!(point.site.layer, Some(layer));
+            assert_eq!((point.site.experts, point.site.slots), (EXPERTS, 4));
+            assert_eq!(point.site.weights.len(), 2, "the up and the down table");
+            assert_eq!(point.reads, vec![point.site.ids]);
+            for weight in &point.site.weights {
+                assert_eq!(weight.pool.shape[0], 4);
+            }
+        }
+        let (pooled, resident) = eval_pooled(&program, &graph, &inputs);
+        assert_eq!(
+            bits(&pooled),
+            bits(&whole.output),
+            "tokens={tokens}: pooled output differs from the unpooled graph"
+        );
+        assert!(
+            resident.iter().any(|experts| experts.len() > 1),
+            "the host paged real selections"
+        );
+    }
+}
+
+/// SC-003 (compile half): a step whose selection can need more experts than the pool holds, and a pool
+/// that is not smaller than the experts, are the two typed refusals from `compile_staged`.
+///
+/// Mutation (observed red): compute the demand from the last axis of the ids only (without the rows
+/// of the step); the three-token prefill's six ids pass as a demand of two and the first assertion
+/// goes red.
+#[test]
+fn a_pool_below_the_step_demand_or_not_below_the_experts_is_a_typed_refusal() {
+    let prefill = moe_model(3, 1);
+    match compile_pooled(&prefill, 4) {
+        Err(StagedCompileError::Pool(PoolError::CapacityBelowStepDemand {
+            layer: Some(0),
+            demand: 6,
+            slots: 4,
+        })) => {}
+        other => panic!(
+            "expected CapacityBelowStepDemand, got {:?}",
+            other.map(|_| ())
+        ),
+    }
+    let decode = moe_model(1, 1);
+    match compile_pooled(&decode, EXPERTS) {
+        Err(StagedCompileError::Pool(PoolError::CapacityNotBelowExperts {
+            slots: 8,
+            experts: 8,
+        })) => {}
+        other => panic!(
+            "expected CapacityNotBelowExperts, got {:?}",
             other.map(|_| ())
         ),
     }

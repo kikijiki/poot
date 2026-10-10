@@ -1,5 +1,6 @@
 use super::*;
 use poot_graph_ir::ContractionRows;
+use poot_graph_ir::ValueTable;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PackedDequantErrorContext {
     pub value: ValueId,
@@ -21,7 +22,7 @@ impl std::fmt::Display for PackedDequantErrorContext {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "v{} {:?} {:?}",
+            "{} {:?} {:?}",
             self.value, self.format, self.logical_shape
         )
     }
@@ -34,7 +35,7 @@ pub enum PackedDequantProductionError {
     #[error("packed contraction {context} was present before Card 355 recognition")]
     PreexistingContraction { context: PackedDequantErrorContext },
     #[error(
-        "packed dequant {context} carrier v{carrier} uses {storage:?} storage; Const is required"
+        "packed dequant {context} carrier {carrier} uses {storage:?} storage; Const is required"
     )]
     CarrierStorage {
         context: PackedDequantErrorContext,
@@ -42,7 +43,7 @@ pub enum PackedDequantProductionError {
         storage: Storage,
     },
     #[error(
-        "packed dequant {context} {roles:?} carrier v{carrier} has invalid identity {name:?}: two distinct source roles resolved to the same graph value"
+        "packed dequant {context} {roles:?} carrier {carrier} has invalid identity {name:?}: two distinct source roles resolved to the same graph value"
     )]
     CarrierIdentity {
         context: PackedDequantErrorContext,
@@ -50,14 +51,14 @@ pub enum PackedDequantProductionError {
         roles: (poot_quant::SourceRole, poot_quant::SourceRole),
         name: Option<String>,
     },
-    #[error("packed dequant {context} carrier v{carrier} escapes through {destination}")]
+    #[error("packed dequant {context} carrier {carrier} escapes through {destination}")]
     CarrierEscape {
         context: PackedDequantErrorContext,
         carrier: ValueId,
         destination: &'static str,
     },
     #[error(
-        "packed dequant {context} carrier v{carrier} has {consumers} equation consumers; only its claimed candidate is allowed"
+        "packed dequant {context} carrier {carrier} has {consumers} equation consumers; only its claimed candidate is allowed"
     )]
     CarrierConsumerCount {
         context: PackedDequantErrorContext,
@@ -75,7 +76,7 @@ pub enum PackedDequantProductionError {
     #[error("packed dequant {context} has an internal value that escapes as carried-state output")]
     StateOutput { context: PackedDequantErrorContext },
     #[error(
-        "packed dequant {context} internal v{internal} has {consumers} equation consumers; exactly one is required"
+        "packed dequant {context} internal {internal} has {consumers} equation consumers; exactly one is required"
     )]
     ConsumerCount {
         context: PackedDequantErrorContext,
@@ -96,8 +97,8 @@ pub enum PackedDequantProductionError {
     Unmatched { context: PackedDequantErrorContext },
 }
 
-pub(super) fn packed_consumer_map<V: ValidationChannel>(g: &Graph<V>) -> Vec<Vec<usize>> {
-    let mut consumers = vec![Vec::new(); g.values.len()];
+pub(super) fn packed_consumer_map<V: ValidationChannel>(g: &Graph<V>) -> ValueTable<Vec<usize>> {
+    let mut consumers = ValueTable::filled(g.values.len(), Vec::new());
     for (equation, eqn) in g.eqns.iter().enumerate() {
         for operand in &eqn.inputs {
             if let Operand::Value(value) = operand {
@@ -151,7 +152,7 @@ fn validate_packed_carriers<V: ValidationChannel>(
     equation: usize,
     descriptor: poot_quant::PackedWeight,
     carrier_inputs: &[Operand],
-    consumers: &[Vec<usize>],
+    consumers: &ValueTable<Vec<usize>>,
 ) -> Result<Vec<ValueId>, PackedDequantProductionError> {
     let context = PackedDequantErrorContext::new(g.eqns[equation].out, descriptor);
     let roles = descriptor.sources();
@@ -239,7 +240,7 @@ struct PackedContractionCandidate {
 fn recognize_canonical_packed_chain<V: ValidationChannel>(
     g: &Graph<V>,
     producer: &HashMap<ValueId, usize>,
-    consumers: &[Vec<usize>],
+    consumers: &ValueTable<Vec<usize>>,
     mut weight: ValueId,
 ) -> Option<PackedContractionCandidate> {
     let mut member_indices = Vec::new();
@@ -293,7 +294,7 @@ fn recognize_canonical_packed_chain<V: ValidationChannel>(
 fn recognize_blocked_packed_chain<V: ValidationChannel>(
     g: &Graph<V>,
     producer: &HashMap<ValueId, usize>,
-    consumers: &[Vec<usize>],
+    consumers: &ValueTable<Vec<usize>>,
     weight: ValueId,
 ) -> Option<PackedContractionCandidate> {
     let &transpose_index = producer.get(&weight)?;
@@ -348,7 +349,7 @@ fn recognize_blocked_packed_chain<V: ValidationChannel>(
 fn recognize_transposed_canonical_packed_chain<V: ValidationChannel>(
     g: &Graph<V>,
     producer: &HashMap<ValueId, usize>,
-    consumers: &[Vec<usize>],
+    consumers: &ValueTable<Vec<usize>>,
     mut weight: ValueId,
     activation_t: ValueId,
 ) -> Option<(PackedContractionCandidate, ValueId)> {
@@ -754,14 +755,12 @@ mod tests {
         let dequant_shape = canonical.values[dequant].aval.shape.clone();
 
         let mut g = canonical.clone();
-        let xt = g.values.len();
-        g.values.push(ValueMeta::new(
+        let xt = g.values.push(ValueMeta::new(
             TensorType::f32(vec![activation_shape[1], activation_shape[0]]),
             Storage::Device,
             None,
         ));
-        let wx = g.values.len();
-        g.values.push(ValueMeta::new(
+        let wx = g.values.push(ValueMeta::new(
             TensorType::f32(vec![dequant_shape[0], activation_shape[0]]),
             Storage::Device,
             None,
@@ -873,7 +872,7 @@ mod tests {
             g.values.iter().any(|value| value.name.is_some()),
             "fixture has no named value, so clearing names would prove nothing"
         );
-        for value in &mut g.values {
+        for value in g.values.iter_mut() {
             value.name = None;
         }
         let recognized = prepare_packed_dequant_production(&g).unwrap();
@@ -928,25 +927,28 @@ mod tests {
         let weight = plan
             .equation(
                 OpKind::PackedDequant { descriptor },
-                vec![Operand::Value(blocks.id)],
+                vec![Operand::Value(blocks.id())],
             )
             .unwrap();
         let weight_t = plan
             .equation(
                 OpKind::Transpose { perm: vec![1, 0] },
-                vec![Operand::Value(weight.id)],
+                vec![Operand::Value(weight.id())],
             )
             .unwrap();
         let output = plan
             .equation(
                 OpKind::MatMul,
-                vec![Operand::Value(activation.id), Operand::Value(weight_t.id)],
+                vec![
+                    Operand::Value(activation.id()),
+                    Operand::Value(weight_t.id()),
+                ],
             )
             .unwrap();
         plan.declare_result(output).unwrap();
         let mut prepared = b.preflight_append(plan).unwrap();
-        let id = b.commit_append(&mut prepared).unwrap();
-        let g = b.finish(poot_graph_ir::Traced { id });
+        let committed = b.commit_append(&mut prepared).unwrap();
+        let g = b.finish(committed);
 
         let recognized = prepare_packed_dequant_production(&g).unwrap();
         assert_eq!(

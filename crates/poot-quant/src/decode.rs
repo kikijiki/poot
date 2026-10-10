@@ -6,8 +6,8 @@
 use std::fmt;
 
 use crate::format::{
-    Axis, BlockLayout, Extent, Field, FieldEncoding, FormatDescriptor, GroupMap, Major, MinSign,
-    OperandRole, PlanarLayout, PlanarOperand, Storage, ValueMap, WeightFormat,
+    Axis, Extent, FieldEncoding, FormatDescriptor, GroupMap, Major, MinSign, OperandRole,
+    PlanarLayout, PlanarOperand, Storage, ValueMap, WeightFormat,
 };
 use crate::scalar::float_to_f32;
 
@@ -66,6 +66,11 @@ pub enum DecodeError {
     },
     /// Deriving a planar operand's extent overflowed `usize`.
     Overflow { format: WeightFormat },
+    /// A `Float` field whose stored bits the content check cannot locate as whole bytes.
+    UnsupportedFloatField {
+        format: WeightFormat,
+        role: OperandRole,
+    },
     /// A stored operand is NaN (E8M0 `0xff`, E4M3FN `0x7f`, a NaN float).
     NotANumber {
         format: WeightFormat,
@@ -136,6 +141,10 @@ impl fmt::Display for DecodeError {
             Self::NotANumber { format, role } => {
                 write!(f, "{format:?} stores a NaN {role:?} operand")
             }
+            Self::UnsupportedFloatField { format, role } => write!(
+                f,
+                "{format:?} {role:?} is a float the content check cannot locate as whole bytes"
+            ),
         }
     }
 }
@@ -252,32 +261,7 @@ fn read_bits(bytes: &[u8], bit: usize, width: u32) -> u32 {
     ((window >> (bit % 8)) & ((1u64 << width) - 1)) as u32
 }
 
-/// A block field's raw bits for element `index`: its pieces concatenated low bits first.
-fn read_field(field: &Field, block: &[u8], index: u32) -> Raw {
-    let mut bits = 0u32;
-    let mut width = 0;
-    for piece in field.pieces {
-        let value = read_bits(block, piece.layout.bit(index) as usize, piece.width);
-        bits |= value << width;
-        width += piece.width;
-    }
-    Raw {
-        bits,
-        width,
-        encoding: field.encoding,
-    }
-}
-
 impl FormatDescriptor {
-    fn blocks(&self) -> Result<BlockLayout, DecodeError> {
-        match self.storage {
-            Storage::Blocks(layout) => Ok(layout),
-            Storage::Planar(_) => Err(DecodeError::WrongStorage {
-                format: self.format,
-            }),
-        }
-    }
-
     fn planar(&self) -> Result<PlanarLayout, DecodeError> {
         match self.storage {
             Storage::Planar(layout) => Ok(layout),
@@ -285,71 +269,6 @@ impl FormatDescriptor {
                 format: self.format,
             }),
         }
-    }
-
-    /// The first `Float`-encoded block field whose value at some element does not decode finite (its
-    /// role and the flat K index of the failing element), or `None` if every one does. `bytes` is a
-    /// run of whole blocks (a row or a whole tensor); content validation does not care which row an
-    /// element is in, only whether some stored value is non-finite.
-    ///
-    /// Walks every element of every `Float`-encoded field directly (not through the compiled
-    /// [`crate::plan::ConstPlan`], which only groups the *scale* factors): a codes field encoded as
-    /// `Float` (MXFP4's E2M1) varies every element, so it cannot be checked once per block.
-    pub(crate) fn first_non_finite_block_field(
-        &self,
-        bytes: &[u8],
-    ) -> Option<(OperandRole, usize)> {
-        let layout = self.blocks().ok()?;
-        for (block_index, block) in bytes.chunks_exact(layout.bytes).enumerate() {
-            for field in layout.fields {
-                let FieldEncoding::Float(_) = field.field.encoding else {
-                    continue;
-                };
-                for i in 0..layout.values {
-                    if read_field(&field.field, block, i as u32)
-                        .number()
-                        .is_finite()
-                    {
-                        continue;
-                    }
-                    return Some((field.role, block_index * layout.values + i));
-                }
-            }
-        }
-        None
-    }
-
-    /// The first stored element of a `Float`-encoded planar operand that does not decode finite (its
-    /// flat index in the operand's own stored grid, lane-major), or `None` if the operand is not
-    /// `Float`-encoded or every stored value decodes finite. Walks the operand's own stored elements
-    /// once each (never a logical `[out, K]` coordinate, which a `Group`/`Whole` extent or packing can
-    /// map many-to-one onto the same stored bits).
-    pub(crate) fn first_non_finite_planar_operand(
-        &self,
-        operand: &PlanarOperand,
-        shape: [usize; 2],
-        bytes: &[u8],
-    ) -> Result<Option<usize>, DecodeError> {
-        let FieldEncoding::Float(float) = operand.encoding else {
-            return Ok(None);
-        };
-        let [rows, columns] = self.stored_shape(operand, shape)?;
-        let lanes = operand.packing.map_or(1, |packing| packing.values_per_word);
-        let element_bits = operand.element_bytes() * 8;
-        for row in 0..rows {
-            for column in 0..columns {
-                let base_bit = (row * columns + column) * element_bits;
-                for lane in 0..lanes {
-                    let bit = base_bit + lane * operand.bits as usize;
-                    let value = float_to_f32(float, read_bits(bytes, bit, operand.bits));
-                    if value.is_finite() {
-                        continue;
-                    }
-                    return Ok(Some((row * columns + column) * lanes + lane));
-                }
-            }
-        }
-        Ok(None)
     }
 
     /// The first stored `GroupIndex` value (GPTQ act-order `g_idx`) that names no group - negative,
@@ -649,8 +568,34 @@ const fn axis_index(axis: Axis) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::{BlockLayout, Field};
+
+    /// A block field's raw bits for element `index`: its pieces concatenated low bits first.
+    fn read_field(field: &Field, block: &[u8], index: u32) -> Raw {
+        let mut bits = 0u32;
+        let mut width = 0;
+        for piece in field.pieces {
+            let value = read_bits(block, piece.layout.bit(index) as usize, piece.width);
+            bits |= value << width;
+            width += piece.width;
+        }
+        Raw {
+            bits,
+            width,
+            encoding: field.encoding,
+        }
+    }
 
     impl FormatDescriptor {
+        fn blocks(&self) -> Result<BlockLayout, DecodeError> {
+            match self.storage {
+                Storage::Blocks(layout) => Ok(layout),
+                Storage::Planar(_) => Err(DecodeError::WrongStorage {
+                    format: self.format,
+                }),
+            }
+        }
+
         /// Decode element `index` of one block: the reference interpreter the compiled
         /// [plan](crate::plan) is tested against.
         pub(crate) fn decode_block_value(

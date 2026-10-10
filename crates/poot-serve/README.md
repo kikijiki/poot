@@ -22,21 +22,27 @@ cargo run -p poot-serve --release -- /path/to/model 127.0.0.1:8080
   else ROCm if an HSA GPU agent opens, else wgpu, once; a model the chosen backend refuses fails startup and no
   other backend is tried.
 
-Any other `--` option is refused at startup. `GET /health` is `503` (`starting`) until the engine plan is
-prepared and `200` (`serving`, with `backend`, `rows`, `max_seq`) after; `503` `draining` during shutdown and `503` `dead`
-(with `cause` and `reason`) once the engine thread has ended.
+- `--rate-limit-rpm N` - per-client requests-per-minute limit (default 0 = unlimited)
+- `--max-connections N` - connection-handler thread cap (default 4096, 0 = unlimited)
+- `--read-timeout-secs N` - idle read timeout for the request head and body (default 30, 0 disables)
+- `--write-timeout-secs N` - positive whole-second idle timeout for HTTP and SSE response writes (default 30)
+- `--drain-timeout-secs N` - graceful shutdown drain timeout before cancellation (default 30, 1 to 86400)
+- `--lora-admin-key-file FILE` - file holding the bearer token for `/v1/lora_adapters`
+- `--draft-lookup NGRAM:K`, `--draft-model PATH:K` - speculative decoding
+- `--chat-template JINJA`, `--chat-template-file FILE` - chat template override
+- `--device-timing` and `--timing-max-steps`, `--timing-max-dispatch-records`,
+  `--timing-max-in-flight-queries`, `--timing-sample-every` - bounded device timing (off by default)
 
-## Environment variables
+Every flag is parsed strictly: a value that does not parse, a zero where zero is meaningless, or a value past
+its bound stops startup; nothing falls back to a default. Any other `--` option is refused at startup.
+`GET /health` is `503` (`starting`) until the engine plan is prepared and `200` (`serving`, with `backend`,
+`rows`, `max_seq`) after; `503` `draining` during shutdown and `503` `dead` (with `cause` and `reason`) once the
+engine thread has ended.
 
-- `POOT_RATE_LIMIT_RPM` - per-key requests-per-minute limit (default 0 = unlimited)
-- `POOT_MAX_CONNECTIONS` - connection-handler thread cap (default 4096, 0 = unlimited)
-- `POOT_READ_TIMEOUT_SECS` - idle read timeout for the request head and body (default 30, 0 disables)
-- `POOT_WRITE_TIMEOUT_SECS` - positive whole-second idle timeout for HTTP and SSE response writes (default
-  30 when unset; zero, negative, malformed, or overflowing values fail before model loading)
-- `POOT_DRAIN_TIMEOUT_SECS` - positive graceful shutdown drain timeout before cancellation (default 30,
-  maximum 86400)
-- `POOT_LORA_ADMIN_KEY` - bearer token for `/v1/lora_adapters`
-- `POOT_MODELS_DIR` - directory that holds the models, used when no `MODEL_DIR` is given
+## Environment
+
+- `POOT_MODELS_DIR` - directory that holds the models, used when no `MODEL_DIR` is given. It locates a
+  path and selects no mode.
 - `RUST_LOG` - log verbosity (default `info`)
 
 ## Endpoints

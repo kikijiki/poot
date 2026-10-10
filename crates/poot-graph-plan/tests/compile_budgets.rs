@@ -209,7 +209,7 @@ fn the_dtype_widening_is_sized_before_it_runs() {
     let w = b.constant("w", TensorType::f32(vec![5, 4]));
     let out = b.matmul(x, w);
     let mut g = b.finish(out);
-    g.values[w.id].aval.dtype = poot_tensor::DType::BF16;
+    g.values[w.id()].aval.dtype = poot_tensor::DType::BF16;
     assert_eq!(g.eqns.len(), 1);
 
     let refusal = expansion(
@@ -292,7 +292,6 @@ fn a_real_fused_region_is_refused_before_it_is_generated_under_small_body_limits
             graph,
             eqn,
             target.backend,
-            1,
             &HashMap::new(),
             &target.caps,
             limits,

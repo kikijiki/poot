@@ -239,7 +239,7 @@ fn run_once_matches_a_hand_computed_elementwise_add() {
     let out = b.binary(BinOp::Add, w, x);
     let g = b.finish(out);
     let slot_key = g
-        .meta(x.id)
+        .meta(x.id())
         .slot_key()
         .expect("declared slot carries a SlotKey")
         .clone();

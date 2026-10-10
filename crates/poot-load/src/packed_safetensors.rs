@@ -21,7 +21,10 @@ use std::path::{Component, Path};
 use std::sync::Arc;
 
 use poot_quant::format::WeightFormat;
-use poot_quant::{OperandRole, PackedPayload, PackedWeight, PackedWeightError, SourceRole};
+use poot_quant::{
+    MapError, OperandRole, PackedPayload, PackedWeight, PackedWeightError, SliceError, SourceRole,
+    StoredBytes,
+};
 
 use ring::digest::{Context, SHA256};
 
@@ -63,7 +66,6 @@ mod tests {
     struct CountingReader {
         bytes: Cursor<Vec<u8>>,
         read_count: ReadCount,
-        fail_at: Option<Rc<Cell<Option<u64>>>>,
     }
 
     impl CountingReader {
@@ -71,33 +73,12 @@ mod tests {
             Self {
                 bytes: Cursor::new(bytes),
                 read_count,
-                fail_at: None,
-            }
-        }
-
-        fn with_failure_switch(
-            bytes: Vec<u8>,
-            read_count: ReadCount,
-            fail_at: Rc<Cell<Option<u64>>>,
-        ) -> Self {
-            Self {
-                bytes: Cursor::new(bytes),
-                read_count,
-                fail_at: Some(fail_at),
             }
         }
     }
 
     impl Read for CountingReader {
         fn read(&mut self, buffer: &mut [u8]) -> Result<usize, std::io::Error> {
-            if self
-                .fail_at
-                .as_ref()
-                .and_then(|fail_at| fail_at.get())
-                .is_some_and(|fail_at| self.bytes.position() >= fail_at)
-            {
-                return Err(std::io::Error::other("injected retained-reader failure"));
-            }
             let read = self.bytes.read(buffer)?;
             self.read_count.0.set(self.read_count.get() + read);
             Ok(read)
@@ -127,7 +108,6 @@ mod tests {
     struct FixtureReads {
         config: ReadCount,
         index: ReadCount,
-        shard: ReadCount,
     }
 
     impl CountingFixture {
@@ -181,15 +161,10 @@ mod tests {
             let reads = FixtureReads {
                 config: ReadCount::default(),
                 index: ReadCount::default(),
-                shard: ReadCount::default(),
             };
             let opened_shards = BTreeMap::from([(
                 SHARD.to_string(),
-                (
-                    Some(shard_manifest),
-                    Box::new(CountingReader::new(self.shard.clone(), reads.shard.clone()))
-                        as RetainedHandle,
-                ),
+                (Some(shard_manifest), StoredBytes::from(self.shard.clone())),
             )]);
             let result = AuthenticatedSafetensorsHandleSet::authenticate_retained(
                 manifest,
@@ -205,10 +180,9 @@ mod tests {
         }
     }
 
-    fn assert_reads(reads: &FixtureReads, config: usize, index: usize, shard: usize) {
+    fn assert_reads(reads: &FixtureReads, config: usize, index: usize) {
         assert_eq!(reads.config.get(), config, "config bytes read");
         assert_eq!(reads.index.get(), index, "index bytes read");
-        assert_eq!(reads.shard.get(), shard, "shard bytes read");
     }
 
     #[test]
@@ -218,15 +192,8 @@ mod tests {
         let authenticated = authenticated.expect("fixture authenticates");
 
         assert_eq!(authenticated.config_bytes(), fixture.config);
-        let header_length = u64::from_le_bytes(fixture.shard[..8].try_into().unwrap()) as usize;
-        // Card 544: authentication no longer hashes the shard's full content up front (that pass
-        // moves to `verify_before_publication`, once); only the header prefix is read here.
-        assert_reads(
-            &reads,
-            fixture.config.len(),
-            fixture.index.len(),
-            8 + header_length,
-        );
+        // The shard is a mapping, not a reader: only the small files are read, once each.
+        assert_reads(&reads, fixture.config.len(), fixture.index.len());
     }
 
     #[test]
@@ -237,7 +204,6 @@ mod tests {
         let config_owner = config.as_ptr();
         let config_reads = ReadCount::default();
         let index_reads = ReadCount::default();
-        let shard_reads = ReadCount::default();
         let authenticated = AuthenticatedSafetensorsHandleSet::authenticate_retained_config_bytes(
             ArtifactLabel {
                 repository: fixture.manifest.repository.clone(),
@@ -258,10 +224,7 @@ mod tests {
                 SHARD.to_string(),
                 (
                     Some(shard_manifest),
-                    Box::new(CountingReader::new(
-                        fixture.shard.clone(),
-                        shard_reads.clone(),
-                    )) as RetainedHandle,
+                    StoredBytes::from(fixture.shard.clone()),
                 ),
             )]),
         )
@@ -270,10 +233,6 @@ mod tests {
         assert_eq!(authenticated.config_bytes().as_ptr(), config_owner);
         assert_eq!(config_reads.get(), 0, "config handle must not be reread");
         assert_eq!(index_reads.get(), fixture.index.len());
-        let header_length = u64::from_le_bytes(fixture.shard[..8].try_into().unwrap()) as usize;
-        // Card 544: only the header prefix is read at authentication time now; the shard's
-        // full content streams once, later, at `verify_before_publication`.
-        assert_eq!(shard_reads.get(), 8 + header_length);
     }
 
     #[test]
@@ -331,36 +290,29 @@ mod tests {
             "mutation preserves length and the shard's declared shape"
         );
 
-        let opened_shards = BTreeMap::from([(
-            SHARD.to_string(),
-            (
-                None,
-                Box::new(CountingReader::new(tampered_shard, ReadCount::default()))
-                    as RetainedHandle,
-            ),
-        )]);
-        let mut authenticated =
-            AuthenticatedSafetensorsHandleSet::authenticate_retained_config_bytes(
-                ArtifactLabel {
-                    repository: fixture.manifest.repository.clone(),
-                    revision: fixture.manifest.revision.clone(),
-                },
-                None,
-                fixture.limits,
-                Box::new(CountingReader::new(
-                    fixture.config.clone(),
-                    ReadCount::default(),
-                )),
+        let opened_shards =
+            BTreeMap::from([(SHARD.to_string(), (None, StoredBytes::from(tampered_shard)))]);
+        let authenticated = AuthenticatedSafetensorsHandleSet::authenticate_retained_config_bytes(
+            ArtifactLabel {
+                repository: fixture.manifest.repository.clone(),
+                revision: fixture.manifest.revision.clone(),
+            },
+            None,
+            fixture.limits,
+            Box::new(CountingReader::new(
                 fixture.config.clone(),
-                Box::new(CountingReader::new(
-                    fixture.index.clone(),
-                    ReadCount::default(),
-                )),
-                opened_shards,
-            )
-            .expect("a tampered shard with no manifest pin loads by capability alone");
+                ReadCount::default(),
+            )),
+            fixture.config.clone(),
+            Box::new(CountingReader::new(
+                fixture.index.clone(),
+                ReadCount::default(),
+            )),
+            opened_shards,
+        )
+        .expect("a tampered shard with no manifest pin loads by capability alone");
         authenticated
-            .verify_before_publication(&BTreeMap::new())
+            .verify_before_publication()
             .expect("publication admits the same capability-only shard, not just authentication");
     }
 
@@ -382,70 +334,54 @@ mod tests {
 
         let opened_shards = BTreeMap::from([(
             SHARD.to_string(),
-            (
-                Some(shard_manifest),
-                Box::new(CountingReader::new(tampered_shard, ReadCount::default()))
-                    as RetainedHandle,
-            ),
+            (Some(shard_manifest), StoredBytes::from(tampered_shard)),
         )]);
-        let mut authenticated =
-            AuthenticatedSafetensorsHandleSet::authenticate_retained_config_bytes(
-                ArtifactLabel {
-                    repository: fixture.manifest.repository.clone(),
-                    revision: fixture.manifest.revision.clone(),
-                },
-                Some(fixture.manifest.clone()),
-                fixture.limits,
-                Box::new(CountingReader::new(
-                    fixture.config.clone(),
-                    ReadCount::default(),
-                )),
+        let authenticated = AuthenticatedSafetensorsHandleSet::authenticate_retained_config_bytes(
+            ArtifactLabel {
+                repository: fixture.manifest.repository.clone(),
+                revision: fixture.manifest.revision.clone(),
+            },
+            Some(fixture.manifest.clone()),
+            fixture.limits,
+            Box::new(CountingReader::new(
                 fixture.config.clone(),
-                Box::new(CountingReader::new(
-                    fixture.index.clone(),
-                    ReadCount::default(),
-                )),
-                opened_shards,
-            )
-            .expect("the header is untouched, so structural authentication still succeeds");
+                ReadCount::default(),
+            )),
+            fixture.config.clone(),
+            Box::new(CountingReader::new(
+                fixture.index.clone(),
+                ReadCount::default(),
+            )),
+            opened_shards,
+        )
+        .expect("the header is untouched, so structural authentication still succeeds");
         let error = authenticated
-            .verify_before_publication(&BTreeMap::new())
+            .verify_before_publication()
             .expect_err("a pinned digest that no longer matches the shard must refuse the load");
         assert!(
-            matches!(error, PackedSafetensorsError::ArtifactChanged { .. }),
+            matches!(error, PackedSafetensorsError::DigestMismatch { .. }),
             "{error:?}"
         );
     }
 
-    /// Card 544 SC-002: a shard streams its full content at most once across a whole load - the
-    /// baseline hashed every shard twice (R475-014), once during authentication and again before
-    /// publication.
+    /// Card 544 SC-002 (ADR-0103 amendment): a shard is hashed at most once across a whole load,
+    /// over its mapping, and only when the manifest pins it. Authentication hashes none of the
+    /// body (only the small files); publication hashes a pinned shard exactly once and an unpinned
+    /// one never. The old streamed-read count (header prefix plus one pass) is retired with the
+    /// reader: the mapping has no read calls to count.
     ///
-    /// Mutation: reintroduce the old authentication-time full-shard `hash_file` call ahead of
-    /// publication; the second assertion's byte count doubles (header probe plus two full
-    /// passes instead of one) and goes red.
+    /// Mutation: hash the pinned shard twice in `verify_before_publication`; the first assertion's
+    /// byte count doubles and goes red.
     #[test]
-    fn card544_sc002_shard_body_streams_at_most_once_across_authenticate_and_publish() {
+    fn card544_sc002_publication_hashes_a_pinned_shard_once_and_an_unpinned_one_never() {
         let fixture = CountingFixture::new();
-        let shard_manifest = fixture.manifest.shards[0].clone();
-        let shard_reads = ReadCount::default();
-        let opened_shards = BTreeMap::from([(
-            SHARD.to_string(),
-            (
-                Some(shard_manifest),
-                Box::new(CountingReader::new(
-                    fixture.shard.clone(),
-                    shard_reads.clone(),
-                )) as RetainedHandle,
-            ),
-        )]);
-        let mut authenticated =
+        let authenticate = |manifest: Option<PackedArtifactManifest>| {
             AuthenticatedSafetensorsHandleSet::authenticate_retained_config_bytes(
                 ArtifactLabel {
                     repository: fixture.manifest.repository.clone(),
                     revision: fixture.manifest.revision.clone(),
                 },
-                Some(fixture.manifest.clone()),
+                manifest.clone(),
                 fixture.limits,
                 Box::new(CountingReader::new(
                     fixture.config.clone(),
@@ -456,39 +392,74 @@ mod tests {
                     fixture.index.clone(),
                     ReadCount::default(),
                 )),
-                opened_shards,
+                BTreeMap::from([(
+                    SHARD.to_string(),
+                    (
+                        manifest.map(|manifest| manifest.shards[0].clone()),
+                        StoredBytes::from(fixture.shard.clone()),
+                    ),
+                )]),
             )
-            .expect("fixture authenticates");
+            .expect("fixture authenticates")
+        };
 
-        let header_length = u64::from_le_bytes(fixture.shard[..8].try_into().unwrap()) as usize;
         assert_eq!(
-            shard_reads.get(),
-            8 + header_length,
-            "authentication reads only the header prefix, not the shard's data section"
+            authenticate(Some(fixture.manifest.clone()))
+                .verify_before_publication()
+                .expect("the unmutated shard matches its pin"),
+            fixture.shard.len(),
+            "a pinned shard is hashed once, over its whole mapping"
         );
-
-        authenticated
-            .verify_before_publication(&BTreeMap::new())
-            .expect("the unmutated shard matches its pin");
         assert_eq!(
-            shard_reads.get(),
-            8 + header_length + fixture.shard.len(),
-            "publication streams the shard's full content exactly once more, not the whole file twice"
+            authenticate(None)
+                .verify_before_publication()
+                .expect("an unpinned shard is admitted by capability"),
+            0,
+            "an unpinned shard is not hashed at all"
         );
     }
 
-    #[derive(Clone, Copy)]
-    enum SecondPairFailure {
-        Read,
-        Build,
+    /// A scratch directory holding real shard files, removed on drop. Fixtures map their shards
+    /// through the production open path ([`map_shard`]), so a test can change the file under the
+    /// mapping exactly as an outside writer would.
+    struct TempRoot(std::path::PathBuf);
+
+    impl TempRoot {
+        fn new(label: &str) -> Self {
+            static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+            let serial = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
+            let root =
+                std::env::temp_dir().join(format!("poot-{label}-{}-{serial}", std::process::id()));
+            std::fs::create_dir(&root).unwrap();
+            Self(root)
+        }
+
+        fn write(&self, name: &str, bytes: &[u8]) {
+            std::fs::write(self.0.join(name), bytes).unwrap();
+        }
+
+        /// Truncate `name` to zero length through a second handle. The mapping already open over
+        /// it must not be read after this: its pages are gone.
+        fn truncate(&self, name: &str) {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(self.0.join(name))
+                .unwrap()
+                .set_len(0)
+                .unwrap();
+        }
     }
 
-    fn rollback_fixture(
-        failure: SecondPairFailure,
-    ) -> (
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn rollback_fixture() -> (
         AuthenticatedSafetensorsHandleSet,
         Vec<PackedSelectionRow>,
-        Rc<Cell<Option<u64>>>,
+        TempRoot,
     ) {
         let config = br#"{}"#;
         let index = format!(
@@ -502,10 +473,7 @@ mod tests {
             "second.scale": {"dtype": "F32", "shape": [1, 1], "data_offsets": [6, 10]},
         }))
         .expect("synthetic header serializes");
-        let second_weight = match failure {
-            SecondPairFailure::Read => 0x02,
-            SecondPairFailure::Build => 0x7f,
-        };
+        let second_weight = 0x7f;
         let data = [
             0x01,
             0x00,
@@ -522,7 +490,6 @@ mod tests {
         shard.extend_from_slice(&(header.len() as u64).to_le_bytes());
         shard.extend_from_slice(&header);
         shard.extend_from_slice(&data);
-        let data_start = 8 + header.len();
         let shard_manifest = PackedShardManifest {
             filename: SHARD.to_string(),
             file_length: shard.len(),
@@ -530,6 +497,8 @@ mod tests {
             header_length: header.len(),
             header_sha256: sha256_digest(&header),
         };
+        let root = TempRoot::new("rollback");
+        root.write(SHARD, &shard);
         let manifest = PackedArtifactManifest {
             repository: "local/rollback".to_string(),
             revision: "rollback-revision".to_string(),
@@ -547,16 +516,11 @@ mod tests {
             selected_source_bytes: 10,
             packed_source_bytes: 10,
         };
-        let fail_at = Rc::new(Cell::new(None));
         let opened_shards = BTreeMap::from([(
             SHARD.to_string(),
             (
                 Some(shard_manifest),
-                Box::new(CountingReader::with_failure_switch(
-                    shard,
-                    ReadCount::default(),
-                    Rc::clone(&fail_at),
-                )) as RetainedHandle,
+                map_shard(&root.0, SHARD).expect("the fixture shard maps"),
             ),
         )]);
         let authenticated = AuthenticatedSafetensorsHandleSet::authenticate_retained(
@@ -602,42 +566,30 @@ mod tests {
                 scale_shape: [1, 1],
             },
         ];
-        if matches!(failure, SecondPairFailure::Read) {
-            fail_at.set(Some((data_start + 5) as u64));
-        }
-        (authenticated, selections, fail_at)
+        (authenticated, selections, root)
     }
 
+    /// The second pair's payload fails its content check after the first pair is staged: the first
+    /// staged owner is dropped and nothing is published. The mid-read I/O failure variant of this
+    /// test is retired with the copy path: a mapped source has no read to fail.
     #[test]
     fn second_pair_failure_drops_actual_first_staged_owner() {
-        for failure in [SecondPairFailure::Read, SecondPairFailure::Build] {
-            let (mut authenticated, selections, _fail_at) = rollback_fixture(failure);
-            let mut cache = PackedOwnerCache::new();
-            let mut staged_owners = Vec::new();
-            let result =
-                authenticated.load_with_staging_observer(&selections, &mut cache, |owner| {
-                    staged_owners.push(Arc::downgrade(owner))
-                });
-            match failure {
-                SecondPairFailure::Read => assert!(matches!(
-                    result,
-                    Err(PackedSafetensorsError::SelectedRead {
-                        completed_payloads: 1,
-                        ..
-                    })
-                )),
-                SecondPairFailure::Build => assert!(matches!(
-                    result,
-                    Err(PackedSafetensorsError::PayloadBuild {
-                        completed_payloads: 1,
-                        ..
-                    })
-                )),
-            }
-            assert!(cache.is_empty());
-            assert_eq!(staged_owners.len(), 1);
-            assert!(staged_owners[0].upgrade().is_none());
-        }
+        let (mut authenticated, selections, _root) = rollback_fixture();
+        let mut cache = PackedOwnerCache::new();
+        let mut staged_owners = Vec::new();
+        let result = authenticated.load_with_staging_observer(&selections, &mut cache, |owner| {
+            staged_owners.push(Arc::downgrade(owner))
+        });
+        assert!(matches!(
+            result,
+            Err(PackedSafetensorsError::PayloadBuild {
+                completed_payloads: 1,
+                ..
+            })
+        ));
+        assert!(cache.is_empty());
+        assert_eq!(staged_owners.len(), 1);
+        assert!(staged_owners[0].upgrade().is_none());
     }
 
     fn exact_source_key_fixture() -> ExactSourceCacheKey {
@@ -739,9 +691,12 @@ mod tests {
         }
     }
 
+    /// A mixed load whose shard is truncated after every owner is staged is refused at the
+    /// publication gate as `ArtifactChanged`, publishes nothing, drops every staged owner, and the
+    /// process survives (no staged page is read after the truncation).
     #[test]
     fn mixed_snapshot_publication_is_atomic() {
-        let (mut authenticated, _selections, _fail_at) = rollback_fixture(SecondPairFailure::Read);
+        let (mut authenticated, _selections, root) = rollback_fixture();
         let mut packed_cache = PackedOwnerCache::new();
         let mut exact_cache = ExactSourceOwnerCache::new();
         let mut packed_owners = Vec::new();
@@ -752,64 +707,48 @@ mod tests {
             |inventory| Ok::<_, ()>(rollback_mixed_decisions(inventory)),
             |owner| match owner {
                 StagedOwnerRef::Packed(owner) => packed_owners.push(Arc::downgrade(owner)),
-                StagedOwnerRef::Exact { owner, .. } => exact_owners.push(Arc::downgrade(owner)),
+                StagedOwnerRef::Exact { owner } => {
+                    exact_owners.push(Arc::downgrade(owner));
+                    root.truncate(SHARD);
+                }
             },
         );
         assert!(matches!(
             result,
             Err(MixedLoadError::Assembly(
-                PackedSafetensorsError::ExactSourceRead {
-                    completed_owners: 0,
-                    ..
-                }
+                PackedSafetensorsError::ArtifactChanged { .. }
             ))
         ));
         assert!(packed_cache.is_empty());
         assert!(exact_cache.is_empty());
         assert_eq!(packed_owners.len(), 1);
         assert!(packed_owners[0].upgrade().is_none());
-        assert!(exact_owners.is_empty());
+        assert_eq!(exact_owners.len(), 1);
+        assert!(exact_owners[0].upgrade().is_none());
     }
 
+    /// An exact-source owner is a view of the shard's one mapping, not a copy of it. Replaces the
+    /// retired read-allocation handoff test (`Arc<[u8]>` pointer and strong-count identity of a
+    /// zero-filled read buffer), whose buffer no longer exists.
     #[test]
-    fn exact_source_read_allocation_is_owner_allocation() {
-        let (mut authenticated, _selections, _fail_at) = rollback_fixture(SecondPairFailure::Build);
+    fn exact_source_owner_is_a_view_of_the_shard_mapping() {
+        let (mut authenticated, _selections, _root) = rollback_fixture();
         let mut packed_cache = PackedOwnerCache::new();
         let mut exact_cache = ExactSourceOwnerCache::new();
-        let mut handoffs = Vec::new();
         let result = authenticated
             .load_mixed_with_staging_observer(
                 &mut packed_cache,
                 &mut exact_cache,
                 |inventory| Ok::<_, ()>(rollback_mixed_decisions(inventory)),
-                |owner| {
-                    if let StagedOwnerRef::Exact {
-                        read_allocation,
-                        owner,
-                    } = owner
-                    {
-                        assert!(std::ptr::eq(read_allocation, Arc::as_ptr(&owner.bytes)));
-                        handoffs.push((read_allocation, Arc::downgrade(&owner.bytes)));
-                    }
-                },
+                |_| {},
             )
             .unwrap();
 
-        assert_eq!(handoffs.len(), 1);
-        let (read_allocation, owner_bytes) = &handoffs[0];
-        let owner_bytes = owner_bytes.upgrade().unwrap();
-        assert!(std::ptr::eq(*read_allocation, Arc::as_ptr(&owner_bytes)));
         assert_eq!(result.exact_metadata.len(), 1);
         let published = result.exact_metadata.values().next().unwrap();
-        assert!(Arc::ptr_eq(&owner_bytes, &published.owner.bytes));
-        // Three live `Arc<[u8]>` handles on this allocation: `published.owner.bytes` itself, the
-        // `WeightStore`'s own `WeightEntry::Dense` (`Arc::clone`-d from that same owner while
-        // `result.store` was built - card 540a: the store is `MixedLoadResult`'s
-        // returned field, not a view built and dropped before the caller sees it), and this test's
-        // own `owner_bytes` handle.
-        assert_eq!(Arc::strong_count(&owner_bytes), 3);
-        drop(owner_bytes);
-        assert_eq!(Arc::strong_count(&published.owner.bytes), 2);
+        let shard = &authenticated.shards[SHARD];
+        assert!(published.owner.bytes.same_region(&shard.bytes));
+        assert_eq!(published.owner.bytes(), &[0x7f]);
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -832,8 +771,7 @@ mod tests {
             PreProbeFailure::DuplicateSelectedName,
             PreProbeFailure::DuplicateEmptySpan,
         ] {
-            let (mut authenticated, _selections, _fail_at) =
-                rollback_fixture(SecondPairFailure::Build);
+            let (mut authenticated, _selections, _root) = rollback_fixture();
             match failure {
                 PreProbeFailure::DuplicateSelectedName => {
                     authenticated.inventory[3].name = authenticated.inventory[1].name.clone();
@@ -846,7 +784,7 @@ mod tests {
                 }
                 _ => {}
             }
-            let (foreign, _selections, _fail_at) = rollback_fixture(SecondPairFailure::Build);
+            let (foreign, _selections, _root) = rollback_fixture();
             let foreign_key = foreign.inventory().rows().next().unwrap().key();
             let mut packed_cache = PackedOwnerCache::new();
             let mut exact_cache = ExactSourceOwnerCache::new();
@@ -1050,7 +988,7 @@ mod tests {
                 ..
             })
         ));
-        assert_reads(&reads, 0, 0, 0);
+        assert_reads(&reads, 0, 0);
 
         let mut limits = fixture.limits;
         limits.index_bytes -= 1;
@@ -1062,7 +1000,7 @@ mod tests {
                 ..
             })
         ));
-        assert_reads(&reads, fixture.config.len(), 0, 0);
+        assert_reads(&reads, fixture.config.len(), 0);
 
         let mut manifest = fixture.manifest.clone();
         manifest.shards[0].file_length += 1;
@@ -1071,7 +1009,7 @@ mod tests {
             result,
             Err(PackedSafetensorsError::FileLengthMismatch { .. })
         ));
-        assert_reads(&reads, fixture.config.len(), fixture.index.len(), 0);
+        assert_reads(&reads, fixture.config.len(), fixture.index.len());
 
         let mut limits = fixture.limits;
         limits.header_bytes_per_shard -= 1;
@@ -1083,7 +1021,7 @@ mod tests {
                 ..
             })
         ));
-        assert_reads(&reads, fixture.config.len(), fixture.index.len(), 8);
+        assert_reads(&reads, fixture.config.len(), fixture.index.len());
 
         let mut manifest = fixture.manifest.clone();
         manifest.shards.push(manifest.shards[0].clone());
@@ -1095,62 +1033,22 @@ mod tests {
                 ..
             })
         ));
-        assert_reads(&reads, 0, 0, 0);
+        assert_reads(&reads, 0, 0);
     }
 
-    /// A shard whose bytes a test can change between the loader's span read and its final
-    /// verification pass, served at most `SHORT_READ` bytes per `read`, so that pass sees every
-    /// range check in a later read than the first.
-    struct ShortReads {
-        bytes: Rc<std::cell::RefCell<Vec<u8>>>,
-        position: u64,
-    }
-
-    const SHORT_READ: usize = 7;
-
-    impl Read for ShortReads {
-        fn read(&mut self, buffer: &mut [u8]) -> Result<usize, std::io::Error> {
-            let bytes = self.bytes.borrow();
-            let start = (self.position as usize).min(bytes.len());
-            let read = buffer.len().min(SHORT_READ).min(bytes.len() - start);
-            buffer[..read].copy_from_slice(&bytes[start..start + read]);
-            self.position += read as u64;
-            Ok(read)
-        }
-    }
-
-    impl Seek for ShortReads {
-        fn seek(&mut self, position: SeekFrom) -> Result<u64, std::io::Error> {
-            let length = self.bytes.borrow().len() as i64;
-            let target = match position {
-                SeekFrom::Start(offset) => offset as i64,
-                SeekFrom::End(delta) => length + delta,
-                SeekFrom::Current(delta) => self.position as i64 + delta,
-            };
-            self.position = u64::try_from(target)
-                .map_err(|_| std::io::Error::other("seek before the start"))?;
-            Ok(self.position)
-        }
-    }
-
-    impl RetainedReader for ShortReads {
-        fn file_length(&self) -> Result<u64, std::io::Error> {
-            Ok(self.bytes.borrow().len() as u64)
-        }
-    }
-
-    /// Mutant H4 (mutants-m4.md): `verify_file` compares each staged range with the buffer at
-    /// `overlap_start - total`. Made `+ total`, it is right only in the first read (`total == 0`),
-    /// and every fixture's range fell inside the first `HASH_BUFFER_BYTES` read. Here the shard
-    /// has no pin (so only the range check can see a change) and is served 7 bytes per read. A
-    /// weight byte changed after the loader read it must refuse the load, and the untouched shard
-    /// must load.
+    /// A shard truncated in place between the loader's span views and its publication gate is
+    /// refused as `ArtifactChanged`, with no pin, and the process survives. Re-expresses the retired
+    /// second-stream `RangeCheck` mismatch test (mutant H4: a range compared at the wrong buffer
+    /// offset): a second streamed read of the same pages proves nothing, so the contract now rests
+    /// on the mapping's file identity, checked once at publication. The untouched shard must load.
+    ///
+    /// Mutation: drop the `check_unchanged` call in `verify_before_publication`; the truncated
+    /// shard is published and the refusal below goes red.
     #[test]
-    fn range_check_in_a_later_read_detects_a_changed_byte() {
+    fn a_shard_truncated_before_publication_is_refused_as_artifact_changed() {
         let config = br#"{}"#.to_vec();
         let index = format!(r#"{{"weight_map":{{"w":"{SHARD}","s":"{SHARD}"}}}}"#).into_bytes();
         let header = br#"{"w":{"dtype":"F8_E4M3","shape":[2,5],"data_offsets":[0,10]},"s":{"dtype":"F32","shape":[1,1],"data_offsets":[10,14]}}"#;
-        let data_start = 8 + header.len();
         let mut shard = Vec::new();
         shard.extend_from_slice(&(header.len() as u64).to_le_bytes());
         shard.extend_from_slice(header);
@@ -1184,7 +1082,7 @@ mod tests {
             weight_shape: [2, 5],
             scale_shape: [1, 1],
         };
-        let authenticate = |bytes: &Rc<std::cell::RefCell<Vec<u8>>>| {
+        let authenticate = |root: &TempRoot| {
             AuthenticatedSafetensorsHandleSet::authenticate_retained_config_bytes(
                 ArtifactLabel {
                     repository: "local/short-reads".to_string(),
@@ -1197,19 +1095,14 @@ mod tests {
                 Box::new(CountingReader::new(index.clone(), ReadCount::default())),
                 BTreeMap::from([(
                     SHARD.to_string(),
-                    (
-                        None,
-                        Box::new(ShortReads {
-                            bytes: Rc::clone(bytes),
-                            position: 0,
-                        }) as RetainedHandle,
-                    ),
+                    (None, map_shard(&root.0, SHARD).expect("the shard maps")),
                 )]),
             )
             .expect("the unpinned shard authenticates")
         };
 
-        let untouched = Rc::new(std::cell::RefCell::new(shard.clone()));
+        let untouched = TempRoot::new("untouched-shard");
+        untouched.write(SHARD, &shard);
         let loaded = authenticate(&untouched)
             .load(
                 std::slice::from_ref(&selection),
@@ -1218,13 +1111,14 @@ mod tests {
             .expect("the untouched shard loads");
         assert_eq!(loaded.rows.len(), 1);
 
-        let changed = Rc::new(std::cell::RefCell::new(shard));
+        let changed = TempRoot::new("truncated-shard");
+        changed.write(SHARD, &shard);
         let mut cache = PackedOwnerCache::new();
         let error = authenticate(&changed)
             .load_with_staging_observer(std::slice::from_ref(&selection), &mut cache, |_| {
-                changed.borrow_mut()[data_start + 3] ^= 0x01;
+                changed.truncate(SHARD);
             })
-            .expect_err("a weight byte changed after its read must refuse the load");
+            .expect_err("a shard truncated after its spans were viewed must refuse the load");
         assert!(
             matches!(error, PackedSafetensorsError::ArtifactChanged { .. }),
             "{error:?}"

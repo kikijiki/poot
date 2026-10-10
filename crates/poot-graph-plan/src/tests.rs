@@ -109,12 +109,12 @@ fn validation_packet_plan_matches_layout() {
         plan.sources,
         [
             ValidationPacketSource {
-                value: first.id,
+                value: first.id(),
                 first_lane: 0,
                 lane_count: 2,
             },
             ValidationPacketSource {
-                value: second.id,
+                value: second.id(),
                 first_lane: 2,
                 lane_count: 3,
             },
@@ -321,17 +321,22 @@ fn assert_analysis_matches_prior(graph: &Graph, label: &str) {
         std::ptr::eq(analysis.graph(), graph),
         "{label}: analysis must borrow the supplied graph"
     );
-    for id in (0..=graph.values.len()).chain([usize::MAX]) {
+    let ids = graph
+        .values
+        .ids()
+        .chain(graph.values.next_id())
+        .chain([ValueId::new(u32::MAX)]);
+    for id in ids {
         let analyzed = analysis.required(id);
         assert_eq!(
             analyzed,
             prior_exact_i32_storage_query(graph, id),
-            "{label}: v{id}"
+            "{label}: {id}"
         );
-        if id >= graph.values.len() {
+        if !graph.values.contains(id) {
             assert!(
                 !value_requires_exact_i32_storage(graph, id),
-                "{label}: v{id}"
+                "{label}: {id}"
             );
         }
     }
@@ -387,7 +392,7 @@ fn reusable_exact_i32_analysis_matches_the_prior_component_query() {
 
     let fixtures = [graph, output_graph, state_graph];
     for (fixture_index, fixture) in fixtures.into_iter().enumerate() {
-        for bad in [fixture.values.len(), usize::MAX] {
+        for bad in [fixture.values.next_id().unwrap(), ValueId::new(u32::MAX)] {
             let mut malformed = fixture.clone();
             malformed.output = bad;
             assert_analysis_matches_prior(
@@ -426,7 +431,7 @@ fn reusable_exact_i32_analysis_matches_the_prior_component_query() {
             }
         }
 
-        for value in 0..fixture.values.len() {
+        for value in fixture.values.ids() {
             let mut malformed = fixture.clone();
             malformed.values[value].aval.dtype = if malformed.values[value].aval.dtype == GDt::I32 {
                 GDt::F32
@@ -435,7 +440,7 @@ fn reusable_exact_i32_analysis_matches_the_prior_component_query() {
             };
             assert_analysis_matches_prior(
                 &malformed,
-                &format!("fixture {fixture_index} malformed dtype v{value}"),
+                &format!("fixture {fixture_index} malformed dtype {value}"),
             );
         }
     }
@@ -543,7 +548,6 @@ fn fresh_and_reused_storage_analysis_plan_identically() {
                     &graph,
                     eqn,
                     Backend::SpirvVulkan,
-                    1,
                     &views,
                     &default_caps_for(Backend::SpirvVulkan),
                     &poot_test_util::graph_fixtures::roomy_body_limits()
@@ -556,7 +560,6 @@ fn fresh_and_reused_storage_analysis_plan_identically() {
                     &graph,
                     eqn,
                     Backend::SpirvVulkan,
-                    1,
                     &views,
                     &default_caps_for(Backend::SpirvVulkan),
                     &poot_test_util::graph_fixtures::roomy_body_limits()
@@ -589,7 +592,6 @@ fn planned_with_choice_caps(
         g,
         eqn,
         backend,
-        1,
         &HashMap::new(),
         caps,
         &poot_test_util::graph_fixtures::roomy_body_limits(),
@@ -1227,10 +1229,10 @@ fn a_gather_over_i32_data_shares_its_component_with_the_arithmetic_over_its_rows
     let output = b.binary(GBinOp::Add, gathered, addend);
     let g = b.finish(output);
     let analysis = ExactI32StorageAnalysis::new(&g);
-    assert!(analysis.required(gathered.id));
-    assert!(analysis.required(table.id));
-    assert!(analysis.required(addend.id));
-    assert!(!analysis.required(index.id));
+    assert!(analysis.required(gathered.id()));
+    assert!(analysis.required(table.id()));
+    assert!(analysis.required(addend.id()));
+    assert!(!analysis.required(index.id()));
 }
 
 #[test]
@@ -1296,7 +1298,7 @@ fn exact_i32_runtime_is_gated_without_blocking_bounded_index_graphs() {
                 value,
                 dtype: GDt::I32,
                 gap: StorageGap::ExactI32BindReplay,
-            } if value == x.id
+            } if value == x.id()
         ),
         "{error:?}"
     );
@@ -1309,7 +1311,7 @@ fn exact_i32_runtime_is_gated_without_blocking_bounded_index_graphs() {
     let legacy_graph = b.finish(gathered);
     validate_graph_execution(&legacy_graph)
         .expect("bounded I32 arithmetic used only as an index retains legacy execution");
-    assert!(!value_requires_exact_i32_storage(&legacy_graph, pos.id));
+    assert!(!value_requires_exact_i32_storage(&legacy_graph, pos.id()));
 }
 
 #[test]
@@ -1322,8 +1324,8 @@ fn exact_i32_runtime_gate_precedes_binder_payload_choice() {
         poot_tensor::HostTensor::i32(vec![1], vec![7]),
         poot_tensor::HostTensor::f32(vec![1], vec![7.0]),
     ] {
-        let inputs = std::collections::HashMap::from([(x.id, tensor)]);
-        assert!(inputs.contains_key(&x.id));
+        let inputs = std::collections::HashMap::from([(x.id(), tensor)]);
+        assert!(inputs.contains_key(&x.id()));
         let error = validate_graph_execution(&g).unwrap_err();
         assert!(
             matches!(
@@ -1344,16 +1346,16 @@ fn planner_structural_boundary_rejects_invalid_binding_table_first() {
     let x = b.constant("x", TensorType::new(vec![1], GDt::I32));
     let output = b.binary_scalar(GBinOp::Add, x, Scalar::I32(1));
     let mut graph = b.finish(output);
-    graph.consts.push(usize::MAX);
+    graph.consts.push(ValueId::new(u32::MAX));
 
     assert!(matches!(
         validate_graph_execution(&graph),
         Err(PlanError::InvalidGraph(
             poot_graph_ir::GraphValidationError::ConstOutOfRange {
-                value: usize::MAX,
+                value,
                 value_count,
             }
-        )) if value_count == graph.values.len()
+        )) if value == ValueId::new(u32::MAX) && value_count == graph.values.len()
     ));
 }
 
@@ -1363,9 +1365,12 @@ fn exact_i32_runtime_inspection_is_total_for_a_malformed_graph() {
     let x = b.constant("x", TensorType::new(vec![1], GDt::I32));
     let output = b.binary_scalar(GBinOp::Add, x, Scalar::I32(1));
     let mut g = b.finish(output);
-    g.eqns[0].inputs[0] = Operand::Value(g.values.len());
+    g.eqns[0].inputs[0] = Operand::Value(g.values.next_id().unwrap());
 
-    assert!(!value_requires_exact_i32_storage(&g, g.values.len()));
+    assert!(!value_requires_exact_i32_storage(
+        &g,
+        g.values.next_id().unwrap()
+    ));
     assert!(matches!(
         validate_graph_execution(&g),
         Err(PlanError::InvalidGraph(
@@ -1373,7 +1378,7 @@ fn exact_i32_runtime_inspection_is_total_for_a_malformed_graph() {
                 equation: 0,
                 value,
             }
-        )) if value == g.values.len()
+        )) if Some(value) == g.values.next_id()
     ));
 }
 
@@ -1383,7 +1388,7 @@ fn exact_i32_planner_rejects_static_numel_overflow() {
     let x = b.constant("x", TensorType::new(vec![1], GDt::I32));
     let output = b.binary_scalar(GBinOp::Add, x, Scalar::I32(1));
     let mut g = b.finish(output);
-    g.values[output.id].aval.shape = vec![usize::MAX, 2];
+    g.values[output.id()].aval.shape = vec![usize::MAX, 2];
     // card 525: plan_eqn now derives out_shape/out_numel from this same mutated aval itself (it can no
     // longer be told a different shape than the graph's own), so the overflow it must survive without
     // panicking is now computed inside plan_eqn, not passed in by the caller.
@@ -1927,7 +1932,7 @@ fn e4m3fn_dynamic_update_slice_rejects_zero_invalid_window_and_index_storage() {
     assert_eq!(
         refusal.missing,
         Capability::OperandShape {
-            value: operand.id,
+            value: operand.id(),
             shape: vec![2, 5],
             expected: vec![2, 6],
         }
@@ -2127,7 +2132,7 @@ fn e4m3fn_concat_preserves_n_input_contract_and_aliases_only_one_input_on_wgpu()
        Backend::SpirvVulkan,
        &default_caps_for(Backend::SpirvVulkan),
     &poot_test_util::graph_fixtures::roomy_body_limits()).unwrap(),
-           Plan::Alias(id) if id == only.id
+           Plan::Alias(id) if id == only.id()
        ));
 }
 
@@ -2243,7 +2248,7 @@ fn e4m3fn_broadcast_materializes_expansions_and_aliases_only_identity_on_wgpu() 
        Backend::SpirvVulkan,
        &default_caps_for(Backend::SpirvVulkan),
     &poot_test_util::graph_fixtures::roomy_body_limits()).unwrap(),
-           Plan::Alias(id) if id == input.id
+           Plan::Alias(id) if id == input.id()
        ));
 }
 
@@ -2559,7 +2564,7 @@ fn e4m3fn_same_dtype_cast_is_an_alias_only_on_spirv_wgpu_value_path() {
        Backend::SpirvVulkan,
        &default_caps_for(Backend::SpirvVulkan),
     &poot_test_util::graph_fixtures::roomy_body_limits()).unwrap(),
-           Plan::Alias(id) if id == x.id
+           Plan::Alias(id) if id == x.id()
        ));
     assert!(matches!(
            plan_eqn_analyzed(
@@ -2569,7 +2574,7 @@ fn e4m3fn_same_dtype_cast_is_an_alias_only_on_spirv_wgpu_value_path() {
        Backend::Nvptx,
        &default_caps_for(Backend::Nvptx),
     &poot_test_util::graph_fixtures::roomy_body_limits()).unwrap(),
-           Plan::Alias(id) if id == x.id
+           Plan::Alias(id) if id == x.id()
        ));
     let backend = Backend::AmdGcn(AmdArch::gfx1151());
     let refusal = refusal_of(
@@ -2648,7 +2653,7 @@ fn e4m3fn_transpose_materializes_nonidentity_and_aliases_only_identity_on_wgpu()
        Backend::SpirvVulkan,
        &default_caps_for(Backend::SpirvVulkan),
     &poot_test_util::graph_fixtures::roomy_body_limits()).unwrap(),
-           Plan::Alias(id) if id == x.id
+           Plan::Alias(id) if id == x.id()
        ));
 
     let builder = Builder::new();
@@ -2756,7 +2761,7 @@ fn e4m3fn_slice_materializes_proper_ranges_and_aliases_only_full_range_on_wgpu()
        Backend::SpirvVulkan,
        &default_caps_for(Backend::SpirvVulkan),
     &poot_test_util::graph_fixtures::roomy_body_limits()).unwrap(),
-           Plan::Alias(id) if id == x.id
+           Plan::Alias(id) if id == x.id()
        ));
 
     let builder = Builder::new();
@@ -2947,10 +2952,10 @@ fn e4m3fn_zero_eqn_identity_graph_is_rejected_before_executor_binding() {
             matches!(
                 err,
                 PlanError::UnrepresentableValue {
-                    value: 0,
+                    value,
                     dtype: GDt::E4M3FN,
                     gap: StorageGap::E4m3RawBytes,
-                }
+                } if value == graph.output
             ),
             "{err:?}"
         );
@@ -3686,7 +3691,7 @@ fn a_refusal_names_the_equation_op_dtypes_target_and_missing_capability_on_every
         assert_eq!(
             refusal,
             Refusal {
-                eqn: c.id,
+                eqn: c.id(),
                 op: OpKind::Cast { to: GDt::F16 },
                 dtypes: RefusalDtypes {
                     operands: vec![GDt::BF16],
@@ -3920,7 +3925,6 @@ fn only_an_f32_m_gt_1_matmul_takes_the_tiled_gemm() {
             &g,
             eqn,
             backend,
-            1,
             &HashMap::new(),
             &default_caps_for(backend),
             &poot_test_util::graph_fixtures::roomy_body_limits(),
@@ -3952,7 +3956,6 @@ fn f16_matmul_never_reaches_tiled_region() {
         &g,
         eqn,
         Backend::SpirvVulkan,
-        1,
         &HashMap::new(),
         &default_caps_for(Backend::SpirvVulkan),
         &poot_test_util::graph_fixtures::roomy_body_limits(),
@@ -4305,125 +4308,48 @@ fn a_large_tiled_matmul_keeps_its_tile_workgroup_on_amdgcn() {
     }
 }
 
-// --- Plan::Collective marker for the collective graph ops ---
+// --- a collective is a cut between stages, never an equation a stage program plans ---
 
-/// Build a matmul graph ending in `AllReduce(Sum)` over the last axis and return that eqn's plan at the
-/// given `world_size`.
-fn all_reduce_plan(world_size: usize) -> Plan {
-    let bld = Builder::new();
-    let x = bld.constant("x", TensorType::f32(vec![2, 8])); // [M, K]
-    let w = bld.constant("w", TensorType::f32(vec![8, 4])); // [K, N]
-    let y = bld.all_reduce(bld.matmul(x, w), RedOp::Sum, 1);
-    let g = bld.finish(y);
-    let eqn = g
-        .eqns
-        .iter()
-        .find(|e| matches!(e.op, OpKind::AllReduce { .. }))
-        .expect("the graph ends in an AllReduce eqn");
-    plan_eqn_views_analyzed(
-        &ExactI32StorageAnalysis::new(&g),
-        &g,
-        eqn,
-        Backend::Nvptx,
-        world_size,
-        &HashMap::new(),
-        &default_caps_for(Backend::Nvptx),
-        &poot_test_util::graph_fixtures::roomy_body_limits(),
-    )
-    .unwrap()
-}
-
-/// Build a matmul graph ending in `AllGather` over the last axis and return that eqn's plan at `world_size`.
-fn all_gather_plan(world_size: usize) -> Plan {
-    let bld = Builder::new();
-    let x = bld.constant("x", TensorType::f32(vec![2, 8])); // [M, K]
-    let w = bld.constant("w", TensorType::f32(vec![8, 4])); // [K, N]
-    let y = bld.all_gather(bld.matmul(x, w), 1);
-    let g = bld.finish(y);
-    let eqn = g
-        .eqns
-        .iter()
-        .find(|e| matches!(e.op, OpKind::AllGather { .. }))
-        .expect("the graph ends in an AllGather eqn");
-    plan_eqn_views_analyzed(
-        &ExactI32StorageAnalysis::new(&g),
-        &g,
-        eqn,
-        Backend::Nvptx,
-        world_size,
-        &HashMap::new(),
-        &default_caps_for(Backend::Nvptx),
-        &poot_test_util::graph_fixtures::roomy_body_limits(),
-    )
-    .unwrap()
-}
-
-/// At world_size=1 the collectives are the identity: they lower to `Plan::Alias` (FR-007), as the plain
-/// `plan_eqn` entry point does (the single-GPU path).
+/// POOT-747 SC-005: a collective built into one stage graph (uncut) is refused by `compile` on every
+/// backend. The baseline lowered it to `Plan::Alias` and `compile` returned `Ok`, silently dropping the
+/// cross-device exchange the node stands for.
 #[test]
-fn collective_world_size_1_lowers_to_alias() {
-    assert!(
-        matches!(all_reduce_plan(1), Plan::Alias(_)),
-        "ws=1 AllReduce must stay Plan::Alias (identity)"
-    );
-    assert!(
-        matches!(all_gather_plan(1), Plan::Alias(_)),
-        "ws=1 AllGather must stay Plan::Alias (identity)"
-    );
-    // the default entry point (plan_eqn) is ws=1, so it must agree with plan_eqn_ws(.., 1).
-    let bld = Builder::new();
-    let x = bld.constant("x", TensorType::f32(vec![2, 8]));
-    let w = bld.constant("w", TensorType::f32(vec![8, 4]));
-    let y = bld.all_reduce(bld.matmul(x, w), RedOp::Sum, 1);
-    let g = bld.finish(y);
-    let eqn = g
-        .eqns
-        .iter()
-        .find(|e| matches!(e.op, OpKind::AllReduce { .. }))
-        .unwrap();
-    assert!(
-        matches!(
-            plan_eqn_analyzed(
-                &ExactI32StorageAnalysis::new(&g),
-                &g,
-                eqn,
-                Backend::Nvptx,
-                &default_caps_for(Backend::Nvptx),
-                &poot_test_util::graph_fixtures::roomy_body_limits()
-            )
-            .unwrap(),
-            Plan::Alias(_)
-        ),
-        "plan_eqn (the ws=1 wrapper) must lower the collective to Plan::Alias"
-    );
-}
-
-/// At world_size=2 the collectives lower to `Plan::Collective`: AllReduce carries `{AllReduce, Sum, axis}`,
-/// AllGather carries `{AllGather, .., axis}`.
-#[test]
-fn collective_world_size_2_lowers_to_collective_marker() {
-    // The AllReduce(Sum) is over the last axis of the [M, N] output (axis 1).
-    match all_reduce_plan(2) {
-        Plan::Collective { kind, op, axis } => {
-            assert_eq!(kind, CollectiveKind::AllReduce);
-            assert_eq!(op, RedOp::Sum, "row-parallel AllReduce combines with Sum");
-            assert_eq!(
-                axis, 1,
-                "AllReduce axis is the [M,N] output's last (N) axis"
-            );
+fn a_collective_inside_a_stage_graph_is_refused_by_compile() {
+    let world = std::num::NonZeroU32::new(2).unwrap();
+    type Collective<'a> = &'a dyn Fn(&Builder, poot_graph_ir::Traced) -> poot_graph_ir::Traced;
+    let all_reduce = |bld: &Builder, y| bld.all_reduce(y, RedOp::Sum, 1);
+    let all_gather = |bld: &Builder, y| bld.all_gather(y, 1, world);
+    let cases: [(&str, Collective); 2] = [("all_reduce", &all_reduce), ("all_gather", &all_gather)];
+    for backend in [Backend::Nvptx, Backend::SpirvVulkan] {
+        for (name, collective) in cases {
+            let bld = Builder::new();
+            let x = bld.constant("x", TensorType::f32(vec![2, 8]));
+            let w = bld.constant("w", TensorType::f32(vec![8, 4]));
+            let y = collective(&bld, bld.matmul(x, w));
+            let reduced = y.id();
+            let g = bld.finish(y);
+            let target = Target {
+                backend,
+                caps: default_caps_for(backend),
+            };
+            let options = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+            match compile(&g, &target, &options) {
+                Err(CompileError::Plan(error)) => match *error {
+                    PlanError::Refused(refusal) => {
+                        assert_eq!(
+                            refusal.missing,
+                            Capability::CollectiveInStage,
+                            "{backend:?} {name}"
+                        );
+                        assert_eq!(refusal.eqn, reduced, "{backend:?} {name}");
+                        assert_eq!(refusal.target, backend);
+                    }
+                    other => panic!("{backend:?} {name}: expected a typed refusal, got {other:?}"),
+                },
+                Ok(_) => panic!("{backend:?} {name}: compile accepted a collective in a stage"),
+                Err(other) => panic!("{backend:?} {name}: expected a refusal, got {other:?}"),
+            }
         }
-        _ => panic!("ws=2 AllReduce must be Plan::Collective, got a different plan"),
-    }
-    // The AllGather concatenates along the output N axis = the last axis.
-    match all_gather_plan(2) {
-        Plan::Collective { kind, axis, .. } => {
-            assert_eq!(kind, CollectiveKind::AllGather);
-            assert_eq!(
-                axis, 1,
-                "AllGather axis is the [M,N] output's last (N) axis"
-            );
-        }
-        _ => panic!("ws=2 AllGather must be Plan::Collective, got a different plan"),
     }
 }
 
@@ -4441,7 +4367,7 @@ fn view_test_graph(
     let t = movement(&bld, a);
     let y = bld.binary(GBinOp::Add, t, t);
     let g = bld.finish(y);
-    let t_id = t.id;
+    let t_id = t.id();
     let move_eqn = g
         .eqns
         .iter()
@@ -4488,7 +4414,6 @@ fn transpose_into_binary_add_lowers_to_view_zero_dispatch() {
         &g,
         eqn,
         Backend::SpirvVulkan,
-        1,
         &views,
         &default_caps_for(Backend::SpirvVulkan),
         &poot_test_util::graph_fixtures::roomy_body_limits(),
@@ -4525,7 +4450,7 @@ fn transpose_into_matmul_keeps_the_materialize_copy() {
     let w = bld.constant("w", TensorType::f32(vec![4, 5]));
     let mm = bld.matmul(t, w); // [3,5]
     let g = bld.finish(mm);
-    let t_id = t.id;
+    let t_id = t.id();
 
     let views = compute_views(&g, Backend::SpirvVulkan);
     assert!(
@@ -4538,7 +4463,6 @@ fn transpose_into_matmul_keeps_the_materialize_copy() {
         &g,
         move_eqn,
         Backend::SpirvVulkan,
-        1,
         &views,
         &default_caps_for(Backend::SpirvVulkan),
         &poot_test_util::graph_fixtures::roomy_body_limits(),
@@ -4569,12 +4493,12 @@ fn view_cache_key_never_collides_with_a_plain_buffer_of_the_same_shape() {
 
     let views = compute_views(&g, Backend::SpirvVulkan);
     assert!(
-        views.contains_key(&t.id),
+        views.contains_key(&t.id()),
         "t's only consumer (y_view's Binary) is strided-capable"
     );
 
-    let eqn_view = g.eqns.iter().find(|e| e.out == y_view.id).unwrap();
-    let eqn_plain = g.eqns.iter().find(|e| e.out == y_plain.id).unwrap();
+    let eqn_view = g.eqns.iter().find(|e| e.out == y_view.id()).unwrap();
+    let eqn_plain = g.eqns.iter().find(|e| e.out == y_plain.id()).unwrap();
     let Dispatch {
         key: key_view,
         body: body_view,
@@ -4585,7 +4509,6 @@ fn view_cache_key_never_collides_with_a_plain_buffer_of_the_same_shape() {
             &g,
             eqn_view,
             Backend::SpirvVulkan,
-            1,
             &views,
             &default_caps_for(Backend::SpirvVulkan),
             &poot_test_util::graph_fixtures::roomy_body_limits(),
@@ -4602,7 +4525,6 @@ fn view_cache_key_never_collides_with_a_plain_buffer_of_the_same_shape() {
             &g,
             eqn_plain,
             Backend::SpirvVulkan,
-            1,
             &views,
             &default_caps_for(Backend::SpirvVulkan),
             &poot_test_util::graph_fixtures::roomy_body_limits(),
@@ -4883,7 +4805,6 @@ fn planned_graph_summary(g: &Graph, backend: Backend) -> Vec<String> {
             g,
             eqn,
             backend,
-            1,
             &views,
             &default_caps_for(backend),
             &poot_test_util::graph_fixtures::roomy_body_limits(),
@@ -5154,7 +5075,7 @@ fn transpose_then_slice_into_binary_add_composes_both_into_views() {
     let s = bld.slice(t, 1, 1, 3); // axis 1 (len 3) [1,3) -> [4,2,2]
     let y = bld.binary(GBinOp::Add, s, s);
     let g = bld.finish(y);
-    let (t_id, s_id) = (t.id, s.id);
+    let (t_id, s_id) = (t.id(), s.id());
 
     let views = compute_views(&g, Backend::SpirvVulkan);
     assert!(
@@ -5266,7 +5187,7 @@ fn view_chain_matches_oracle_fuzz() {
                     shape = new_shape;
                 }
             }
-            link_ids.push(cur.id);
+            link_ids.push(cur.id());
         }
         let y = bld.binary(GBinOp::Add, cur, cur);
         let g = bld.finish(y);
@@ -5281,7 +5202,7 @@ fn view_chain_matches_oracle_fuzz() {
             );
         }
 
-        let a_shape = g.aval(a.id).shape.clone();
+        let a_shape = g.aval(a.id()).shape.clone();
         let a_numel = numel(&a_shape);
         let a_data: Vec<f32> = (0..a_numel).map(|i| i as f32 + 0.5).collect();
         let mut oracle = poot_tensor::HostTensor::f32(a_shape, a_data.clone());
@@ -5650,14 +5571,14 @@ impl AttentionFixture {
                     self.softcap,
                 )),
                 [q, k, v, mask]
-                    .map(|operand| Operand::Value(operand.id))
+                    .map(|operand| Operand::Value(operand.id()))
                     .to_vec(),
             )
             .unwrap_or_else(|e| panic!("{}: stage the attention: {e:?}", self.name));
         plan.declare_result(out).expect("declare the result");
         let mut prepared = bld.preflight_append(plan).expect("preflight");
-        let id = bld.commit_append(&mut prepared).expect("commit");
-        bld.finish(poot_graph_ir::Traced { id })
+        let committed = bld.commit_append(&mut prepared).expect("commit");
+        bld.finish(committed)
     }
 }
 
@@ -5932,7 +5853,7 @@ fn arg_top_k_plan_rejects_0d_rank_operand_as_typed_error_not_panic() {
     let rank = bld.constant("rank", TensorType::f32(vec![4, 8]));
     let idx = bld.arg_top_k(rank, 2);
     let mut g = bld.finish(idx);
-    g.values[rank.id].aval = TensorType::f32(vec![]); // corrupt the declared shape to 0-D
+    g.values[rank.id()].aval = TensorType::f32(vec![]); // corrupt the declared shape to 0-D
     let eqn = g
         .eqns
         .iter()
@@ -5958,7 +5879,7 @@ fn pack_i8_plan_rejects_0d_input_as_typed_error_not_panic() {
     let codes = bld.constant("codes", TensorType::f32(vec![4, 8]));
     let packed = bld.pack_i8(codes);
     let mut g = bld.finish(packed);
-    g.values[codes.id].aval = TensorType::f32(vec![]); // corrupt the declared shape to 0-D
+    g.values[codes.id()].aval = TensorType::f32(vec![]); // corrupt the declared shape to 0-D
     let eqn = g
         .eqns
         .iter()
@@ -5997,7 +5918,7 @@ fn is_elementwise_2d_folds_binary_and_unary_for_a_non_f32_dtype() {
     let binary_eqn = Eqn {
         op: OpKind::Binary(GBinOp::Add),
         inputs: vec![],
-        out: x.id,
+        out: x.id(),
         layer: None,
     };
     assert!(
@@ -6014,7 +5935,7 @@ fn is_elementwise_2d_folds_binary_and_unary_for_a_non_f32_dtype() {
     let unary_eqn = Eqn {
         op: OpKind::Unary(GUnOp::Exp),
         inputs: vec![],
-        out: x.id,
+        out: x.id(),
         layer: None,
     };
     assert!(
@@ -6043,7 +5964,7 @@ fn is_elementwise_2d_folds_binary_and_unary_for_a_non_f32_dtype() {
     let scatter_eqn = Eqn {
         op: OpKind::ScatterUpdate,
         inputs: vec![],
-        out: x.id,
+        out: x.id(),
         layer: None,
     };
     assert!(
@@ -6067,7 +5988,8 @@ fn is_elementwise_2d_folds_binary_and_unary_for_a_non_f32_dtype() {
 
 /// Find the named const's value id in `g`.
 fn const_id(g: &Graph, name: &str) -> ValueId {
-    (0..g.values.len())
+    g.values
+        .ids()
         .find(|&id| g.meta(id).name.as_deref() == Some(name))
         .unwrap_or_else(|| panic!("const {name} not found"))
 }
@@ -6344,8 +6266,7 @@ fn card380_bf16_const_stays_narrow_only_for_a_contraction_weight() {
     // A widening `Cast` is a packed reader (Card 1011); a second consumer that is not one disqualifies the
     // const: that consumer would read f32 lanes.
     let mut shared = folded.clone();
-    let widened = shared.values.len();
-    shared.values.push(poot_graph_ir::graph::ValueMeta::new(
+    let widened = shared.values.push(poot_graph_ir::graph::ValueMeta::new(
         TensorType::new(vec![16, 32], GDt::F32),
         Storage::Device,
         None,
@@ -6361,8 +6282,7 @@ fn card380_bf16_const_stays_narrow_only_for_a_contraction_weight() {
         &Default::default(),
         weight
     ));
-    let negated = shared.values.len();
-    shared.values.push(poot_graph_ir::graph::ValueMeta::new(
+    let negated = shared.values.push(poot_graph_ir::graph::ValueMeta::new(
         TensorType::new(vec![16, 32], GDt::BF16),
         Storage::Device,
         None,
@@ -6382,8 +6302,7 @@ fn card380_bf16_const_stays_narrow_only_for_a_contraction_weight() {
     // Only the weight operand is admitted. A const read as a contraction's activation is an f32 operand of
     // that kernel, so keeping it narrow would feed two-byte words to an `&[f32]` param.
     let mut as_activation = folded.clone();
-    let out = as_activation.values.len();
-    as_activation
+    let out = as_activation
         .values
         .push(poot_graph_ir::graph::ValueMeta::new(
             TensorType::new(vec![32, 16], GDt::F32),
@@ -6408,8 +6327,7 @@ fn card380_bf16_const_stays_narrow_only_for_a_contraction_weight() {
     // A const nothing reads is not eligible: the binder would upload two-byte words no kernel can
     // interpret.
     let mut orphaned = folded.clone();
-    let orphan = orphaned.values.len();
-    orphaned.values.push(poot_graph_ir::graph::ValueMeta::new(
+    let orphan = orphaned.values.push(poot_graph_ir::graph::ValueMeta::new(
         TensorType::new(vec![4, 4], GDt::BF16),
         Storage::Const,
         Some("orphan".into()),
@@ -6568,8 +6486,7 @@ fn card381_bf16_const_stays_narrow_for_a_row_gather_table() {
     assert_eq!(prepared.aval(id).dtype, GDt::BF16);
     // Only the table operand is admitted for this operation.
     let mut as_index = folded.clone();
-    let out = as_index.values.len();
-    as_index.values.push(poot_graph_ir::graph::ValueMeta::new(
+    let out = as_index.values.push(poot_graph_ir::graph::ValueMeta::new(
         TensorType::f32(vec![8, 4]),
         Storage::Device,
         None,

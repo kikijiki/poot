@@ -6,10 +6,12 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use poot_graph_ir::{Graph, OpKind, ValidationChannel};
+use poot_graph_ir::{Graph, OpKind, ValidationChannel, ValueId};
 use poot_graph_plan::{WeightFormats, bind_packed_weights};
 use poot_load::gguf::{GgufIndex, GgufValue, IdentityNames, read_gguf, write_gguf};
+use poot_load::plan::default_workers;
 use poot_quant::SourceRole;
+use poot_quant::StoredBytes;
 use poot_quant::format::WeightFormat;
 use poot_quant::weights::{
     AttnRole, DenseWeight, FfnRole, HandleFormat, WeightEntry, WeightRole, WeightStore,
@@ -336,8 +338,9 @@ pub(crate) fn read_back(
     tensors: &[(&str, Vec<u64>, u32, Vec<u8>)],
 ) -> (GgufIndex, WeightStore) {
     let bytes = write_gguf(kvs, tensors);
-    let index = GgufIndex::from_bytes(&bytes).unwrap();
-    let store = read_gguf(&index, bytes.as_slice(), &IdentityNames).unwrap();
+    let file = StoredBytes::from(bytes);
+    let index = GgufIndex::parse(&file).unwrap();
+    let store = read_gguf(&index, &file, &IdentityNames, default_workers()).unwrap();
     (index, store)
 }
 
@@ -525,7 +528,7 @@ pub(crate) fn assert_same_graph<V: ValidationChannel, W: ValidationChannel>(
         assert_eq!(format!("{x:?}"), format!("{y:?}"), "equation {i}");
         assert_eq!(a.meta(x.out).name, b.meta(y.out).name, "equation {i} name");
     }
-    let named = |g: &dyn Fn(usize) -> Option<String>, ids: &[usize]| -> Vec<Option<String>> {
+    let named = |g: &dyn Fn(ValueId) -> Option<String>, ids: &[ValueId]| -> Vec<Option<String>> {
         ids.iter().map(|&id| g(id)).collect()
     };
     assert_eq!(

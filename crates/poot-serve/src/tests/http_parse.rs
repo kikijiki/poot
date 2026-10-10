@@ -495,27 +495,6 @@ fn read_request_from_rejects_oversized_cumulative_headers() {
     );
 }
 
-/// The read timeout is 30s by default and disable-able via `POOT_READ_TIMEOUT_SECS=0` (env-gated so the
-/// bound is auditable). Value parsing only - the socket wiring is exercised by the live server.
-#[test]
-fn request_read_timeout_default_and_disable() {
-    // Default when unset: a positive timeout. (Cannot mutate process env safely in parallel tests, so
-    // just assert the default branch via the same parse the fn uses.)
-    assert_eq!(
-        request_read_timeout_from(None),
-        Some(Duration::from_secs(30))
-    );
-    assert_eq!(request_read_timeout_from(Some("0")), None);
-    assert_eq!(
-        request_read_timeout_from(Some("5")),
-        Some(Duration::from_secs(5))
-    );
-    assert_eq!(
-        request_read_timeout_from(Some("garbage")),
-        Some(Duration::from_secs(30))
-    );
-}
-
 #[test]
 fn reason_phrase_covers_the_status_codes_this_server_emits() {
     for (status, want) in [

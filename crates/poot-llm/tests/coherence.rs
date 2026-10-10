@@ -150,7 +150,7 @@ fn cross_encoder_reranks() {
 /// `dict`/`str` methods), the class `render_jinja_core`'s `pycompat` + `strftime_now` wiring exists
 /// for.
 ///
-/// Uses `GgufIndex::open` (reads at most the first 256 MB), not the checkpoint's 12.1 GB. Run it
+/// Uses `GgufIndex::parse` over a mapping (only the header pages are touched), not the checkpoint's 12.1 GB. Run it
 /// before renting anything.
 #[test]
 #[ignore = "reads the GGUF HEADER ONLY of a real ggml-org/gpt-oss-20b-GGUF MXFP4 file (no tensor data, no \
@@ -162,7 +162,10 @@ fn gptoss_20b_gguf_harmony_chat_template_renders() {
     )) else {
         return;
     };
-    let g = poot_load::gguf::GgufIndex::open(&gguf_path).expect("read gpt-oss-20b gguf header");
+    let g = poot_load::gguf::GgufIndex::parse(
+        &poot_quant::StoredBytes::map(std::fs::File::open(&gguf_path).unwrap()).unwrap(),
+    )
+    .expect("read gpt-oss-20b gguf header");
     assert_eq!(
         g.architecture(),
         Some("gpt-oss"),

@@ -692,7 +692,7 @@ mod tests {
             &builder, x, "layer", descriptor, blocks, None,
         )
         .unwrap();
-        let out_id = out_value.id;
+        let out_id = out_value.id();
         let graph = builder.finish(out_value);
         let target = Target {
             backend: Backend::SpirvVulkan,

@@ -296,30 +296,78 @@ impl Context {
         }
     }
 
-    /// Overwrite `bytes.len()` bytes of `buf` from byte `offset` (a whole number of its elements, padded
-    /// to a word; Card 546a). The device writes whole words: `offset` and `bytes.len()` must be
-    /// multiples of four, except that a write reaching the end of the buffer may end mid-word.
-    pub fn write_bytes(
+    /// Overwrite `len` bytes of `buf` from byte `offset` (a whole number of its elements, padded to a
+    /// word; Card 546a), in chunks of at most [`WRITE_CHUNK_BYTES`], each one wgpu staging allocation:
+    /// `fill(range, out)` gets consecutive destination ranges covering `offset..offset + len`, at most
+    /// 1 MiB at a time, so no host copy of the whole exists. The device writes whole words: `offset` and
+    /// `len` must be multiples of four, except that a write reaching the end of the buffer may end
+    /// mid-word (its last word is zero-padded). After [`PENDING_STAGING_BYTES`] of staging a write submits
+    /// an empty command buffer, which starts the queued transfers and lets wgpu release their staging, so
+    /// a large upload holds a bounded amount of it. Asynchronous: ordered before the next submitted work
+    /// by the queue.
+    pub fn write_with(
         &self,
         buf: &DeviceBuffer,
         offset: usize,
-        bytes: &[u8],
+        len: usize,
+        fill: &mut dyn FnMut(std::ops::Range<usize>, &mut [u8]),
     ) -> Result<(), RuntimeError> {
-        checked_write_range("write_bytes", buf, offset, bytes.len(), 1)?;
+        checked_write_range("write_with", buf, offset, len, 1)?;
         let capacity = buf.elem_count as usize * buf.storage().element().byte_width();
-        let reaches_end = offset + bytes.len() == capacity;
-        if !offset.is_multiple_of(4) || (!bytes.len().is_multiple_of(4) && !reaches_end) {
+        let reaches_end = offset + len == capacity;
+        if !offset.is_multiple_of(4) || (!len.is_multiple_of(4) && !reaches_end) {
             return Err(RuntimeError::Misaligned {
-                op: "write_bytes",
+                op: "write_with",
                 offset,
-                len: bytes.len(),
+                len,
             });
         }
-        let mut padded = bytes.to_vec();
-        padded.resize(bytes.len().div_ceil(4) * 4, 0);
-        self.queue
-            .write_buffer(&buf.buf, offset as wgpu::BufferAddress, &padded);
-        self.record_upload_transfer(bytes.len());
+        let mut scratch = vec![0u8; SCRATCH_BYTES.min(len)];
+        let mut pending = 0;
+        let mut done = 0;
+        while done < len {
+            let chunk = WRITE_CHUNK_BYTES.min(len - done);
+            let padded = chunk.div_ceil(4) * 4;
+            let size = wgpu::BufferSize::new(padded as u64).expect("a chunk is non-empty");
+            let mut view = self
+                .queue
+                .write_buffer_with(&buf.buf, (offset + done) as wgpu::BufferAddress, size)
+                .ok_or(RuntimeError::Misaligned {
+                    op: "write_with",
+                    offset: offset + done,
+                    len: padded,
+                })?;
+            // wgpu's staging view is write-only (it may be write-combined memory): the caller's encoder
+            // fills a cache-sized scratch, and each scratch run is copied into the view.
+            let mut at = 0;
+            while at < chunk {
+                let run = SCRATCH_BYTES.min(chunk - at);
+                let run_range = offset + done + at..offset + done + at + run;
+                fill(run_range, &mut scratch[..run]);
+                view.slice(at..at + run).copy_from_slice(&scratch[..run]);
+                at += run;
+            }
+            view.slice(chunk..padded).fill(0);
+            drop(view);
+            done += chunk;
+            pending += padded;
+            if pending >= PENDING_STAGING_BYTES && done < len {
+                // Not a compute submission: it carries no work, so no submit counter moves.
+                self.queue.submit([]);
+                pending = 0;
+            }
+        }
+        self.record_upload_transfer(len);
         Ok(())
     }
 }
+
+/// The largest range one [`Context::write_with`] chunk covers: one staging allocation.
+pub const WRITE_CHUNK_BYTES: usize = 64 << 20;
+
+/// The bytes the caller's `fill` is handed at a time: a scratch that stays in cache between the encoder's
+/// writes and the copy into wgpu's write-only staging view.
+const SCRATCH_BYTES: usize = 1 << 20;
+
+/// Staging a [`Context::write_with`] may queue before it submits to release it.
+const PENDING_STAGING_BYTES: usize = 256 << 20;

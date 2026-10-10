@@ -5,14 +5,14 @@ use poot_quant::weights::WeightStore;
 use super::{
     Arc, BTreeMap, BTreeSet, File, FilePin, Hash, HashMap, HashSet, Hasher, MixedAccountingTable,
     MixedByteQuantity, MixedReportInputs, MixedWeightStoreError, OperandRole, PackedDecisionPair,
-    PackedPayload, PackedWeight, PackedWeightDecision, PackedWeightError, Path, RangeCheck, Read,
-    SHA256, Seek, SourceRole, StagedExactRow, StagedMixedSelection, StagedOwnerRef, StagedRow,
-    ValidatedExactSelection, ValidatedMixedSelection, ValidatedSelection, WeightFormat, admit_file,
-    admit_shard, artifact_cache_identity, build_mixed_report, category_for_disposition,
-    checked_add, commit_mixed_publication, commit_packed_publication, disposition_selects_source,
-    enforce_limit, exact_kind_for_disposition, file_length, fmt, open_regular,
-    parse_header_entries, parse_unique_json, parse_weight_map, prepare_mixed_publication,
-    prepare_packed_publication, read_exact_file, read_header, read_header_length, read_source_arc,
+    PackedPayload, PackedWeight, PackedWeightDecision, PackedWeightError, Path, Read, SHA256, Seek,
+    SliceError, SourceRole, StagedExactRow, StagedMixedSelection, StagedOwnerRef, StagedRow,
+    StoredBytes, ValidatedExactSelection, ValidatedMixedSelection, ValidatedSelection,
+    WeightFormat, admit_file, admit_shard, artifact_cache_identity, build_mixed_report,
+    category_for_disposition, checked_add, commit_mixed_publication, commit_packed_publication,
+    disposition_selects_source, enforce_limit, exact_kind_for_disposition, file_length, fmt,
+    map_shard, open_regular, parse_header_entries, parse_unique_json, parse_weight_map,
+    prepare_mixed_publication, prepare_packed_publication, read_exact_file, read_header_length,
     report_selected_accounting, shape_2, validate_index_header_bijection,
     validate_manifest_and_limits, validate_relative_path, validate_selection_row,
     validate_shard_overlaps,
@@ -42,7 +42,8 @@ impl RetainedReader for File {
 
 pub(crate) type RetainedHandle = Box<dyn RetainedReader>;
 
-pub(crate) type OpenedShards = BTreeMap<String, (Option<PackedShardManifest>, RetainedHandle)>;
+/// Each shard is mapped once, at open; everything that follows is a view of that mapping.
+pub(crate) type OpenedShards = BTreeMap<String, (Option<PackedShardManifest>, StoredBytes)>;
 
 /// Opaque ownership of the one bounded `config.json` snapshot used for dispatch and authentication.
 ///
@@ -471,7 +472,7 @@ pub struct ExactSourceOwner {
     pub(crate) artifact: AuthenticatedArtifactIdentity,
     pub(crate) descriptor: AuthenticatedTensorDescriptor,
     pub(crate) kind: ExactSourceKind,
-    pub(crate) bytes: Arc<[u8]>,
+    pub(crate) bytes: StoredBytes,
 }
 
 impl ExactSourceOwner {
@@ -488,7 +489,7 @@ impl ExactSourceOwner {
     }
 
     pub fn bytes(&self) -> &[u8] {
-        &self.bytes
+        self.bytes.as_slice()
     }
 }
 
@@ -663,15 +664,11 @@ pub enum PackedSafetensorsError {
     },
     #[error("checked arithmetic overflow while deriving {field}")]
     ArithmeticOverflow { field: &'static str },
-    #[error(
-        "selection {linear_id:?} {buffer:?} read failed after {completed_payloads} payloads: {error}"
-    )]
-    SelectedRead {
-        linear_id: String,
-        buffer: PackedBufferKind,
-        completed_payloads: usize,
+    #[error("{shard}: a selected source lies outside the mapped shard: {error}")]
+    SourceOutsideShard {
+        shard: String,
         #[source]
-        error: std::io::Error,
+        error: SliceError,
     },
     #[error(
         "selection {linear_id:?} payload construction failed after {completed_payloads} payloads: {error}"
@@ -713,13 +710,6 @@ pub enum PackedSafetensorsError {
         linear_id: String,
         #[source]
         error: PackedWeightError,
-    },
-    #[error("exact source {tensor:?} read failed after {completed_owners} owners: {error}")]
-    ExactSourceRead {
-        tensor: String,
-        completed_owners: usize,
-        #[source]
-        error: std::io::Error,
     },
     #[error("could not reserve {additional} entries in the {cache:?} owner cache")]
     CacheReservation {
@@ -1000,7 +990,8 @@ pub(crate) struct TensorEntry {
 
 pub(crate) struct ShardState {
     pub(crate) manifest: Option<PackedShardManifest>,
-    pub(crate) file: RetainedHandle,
+    /// The whole shard, mapped once; every selected source is a slice of it.
+    pub(crate) bytes: StoredBytes,
     pub(crate) data_start: usize,
 }
 
@@ -1036,8 +1027,8 @@ fn open_index_and_shards(
 
     let mut opened_shards = BTreeMap::new();
     for (filename, shard_manifest) in shard_manifests {
-        let file = open_regular(root, &filename)?;
-        opened_shards.insert(filename, (Some(shard_manifest), file));
+        let bytes = map_shard(root, &filename)?;
+        opened_shards.insert(filename, (Some(shard_manifest), bytes));
     }
     Ok((index_file, opened_shards))
 }
@@ -1245,8 +1236,8 @@ impl AuthenticatedSafetensorsHandleSet {
         let initial_artifact_hash_bytes =
             checked_add(config_length, index_length, "initial_artifact_hash_bytes")?;
 
-        for (filename, (shard_manifest, mut file)) in opened_shards {
-            let actual_length = file_length(file.as_ref(), &filename)?;
+        for (filename, (shard_manifest, shard_bytes)) in opened_shards {
+            let actual_length = shard_bytes.len();
             if let Some(shard_manifest) = &shard_manifest
                 && actual_length != shard_manifest.file_length
             {
@@ -1257,7 +1248,7 @@ impl AuthenticatedSafetensorsHandleSet {
                 });
             }
             let (header_length, data_start) =
-                read_header_length(file.as_mut(), &filename, actual_length)?;
+                read_header_length(shard_bytes.as_slice(), &filename)?;
             if let Some(shard_manifest) = &shard_manifest
                 && header_length != shard_manifest.header_length
             {
@@ -1272,9 +1263,9 @@ impl AuthenticatedSafetensorsHandleSet {
                 limits.header_bytes_per_shard,
                 header_length,
             )?;
-            let header_bytes = read_header(file.as_mut(), &filename, header_length)?;
+            let header_bytes = &shard_bytes.as_slice()[8..data_start];
             if let Some(shard_manifest) = &shard_manifest
-                && sha256_digest(&header_bytes) != shard_manifest.header_sha256
+                && sha256_digest(header_bytes) != shard_manifest.header_sha256
             {
                 return Err(PackedSafetensorsError::HeaderDigestMismatch { file: filename });
             }
@@ -1283,7 +1274,7 @@ impl AuthenticatedSafetensorsHandleSet {
                     field: "shard data length",
                 },
             )?;
-            let header_json = parse_unique_json(&header_bytes, &filename)?;
+            let header_json = parse_unique_json(header_bytes, &filename)?;
             let header_tensor_count = header_json
                 .as_object()
                 .ok_or_else(|| PackedSafetensorsError::Json {
@@ -1321,13 +1312,13 @@ impl AuthenticatedSafetensorsHandleSet {
                     .map(|shard_manifest| shard_manifest.file_sha256)
                     .unwrap_or(NO_PIN_DIGEST),
                 header_length,
-                header_sha256: sha256_digest(&header_bytes),
+                header_sha256: sha256_digest(header_bytes),
             });
             shards.insert(
                 filename,
                 ShardState {
                     manifest: shard_manifest,
-                    file,
+                    bytes: shard_bytes,
                     data_start,
                 },
             );
@@ -1497,7 +1488,7 @@ impl AuthenticatedSafetensorsHandleSet {
             packed_cache,
             exact_cache,
         )?;
-        let final_hash_io_bytes = self.verify_before_publication(&prepared.checks)?;
+        let final_hash_io_bytes = self.verify_before_publication()?;
         Ok(commit_mixed_publication(
             prepared,
             final_hash_io_bytes,
@@ -1536,7 +1527,7 @@ impl AuthenticatedSafetensorsHandleSet {
             &mut observe_cold_owner,
         )?;
         let prepared = prepare_packed_publication(staged, report, cache)?;
-        let final_verification_bytes = self.verify_before_publication(&prepared.checks)?;
+        let final_verification_bytes = self.verify_before_publication()?;
         Ok(commit_packed_publication(
             prepared,
             final_verification_bytes,
@@ -1574,34 +1565,14 @@ impl AuthenticatedSafetensorsHandleSet {
             }
             observe_owner_construction(OwnerCacheKind::Packed);
 
-            let shard = self.shards.get_mut(&row.selection.shard).ok_or_else(|| {
+            let shard = self.shards.get(&row.selection.shard).ok_or_else(|| {
                 PackedSafetensorsError::MissingSelectionTensor {
                     linear_id: row.selection.linear_id.clone(),
                     tensor: row.selection.weight_name.clone(),
                 }
             })?;
-            let weight = read_source_arc(
-                shard.file.as_mut(),
-                shard.data_start,
-                row.selection.weight_span,
-            )
-            .map_err(|error| PackedSafetensorsError::SelectedRead {
-                linear_id: row.selection.linear_id.clone(),
-                buffer: PackedBufferKind::Weight,
-                completed_payloads,
-                error,
-            })?;
-            let scale = read_source_arc(
-                shard.file.as_mut(),
-                shard.data_start,
-                row.selection.scale_span,
-            )
-            .map_err(|error| PackedSafetensorsError::SelectedRead {
-                linear_id: row.selection.linear_id.clone(),
-                buffer: PackedBufferKind::Scale,
-                completed_payloads,
-                error,
-            })?;
+            let weight = shard_source(shard, &row.selection.shard, row.selection.weight_span)?;
+            let scale = shard_source(shard, &row.selection.shard, row.selection.scale_span)?;
             let payload = PackedPayload::try_new(
                 row.selection.descriptor,
                 [
@@ -1756,15 +1727,9 @@ impl AuthenticatedSafetensorsHandleSet {
                         category,
                         source_bytes,
                     )?;
-                    let data_start = self
-                        .shards
-                        .get(&descriptor.shard)
-                        .expect("authenticated inventory names an open shard")
-                        .data_start;
                     exact.push(ValidatedExactSelection {
                         descriptor: descriptor.clone(),
                         kind,
-                        data_start,
                         key: ExactSourceCacheKey {
                             artifact: self.artifact_identity.clone(),
                             descriptor: descriptor.clone(),
@@ -1864,29 +1829,16 @@ impl AuthenticatedSafetensorsHandleSet {
             observe_owner_construction(OwnerCacheKind::ExactSource);
             let shard = self
                 .shards
-                .get_mut(&row.descriptor.shard)
+                .get(&row.descriptor.shard)
                 .expect("authenticated exact source names an open shard");
-            let bytes = read_source_arc(shard.file.as_mut(), row.data_start, row.descriptor.span)
-                .map_err(|error| PackedSafetensorsError::ExactSourceRead {
-                tensor: row.descriptor.name.clone(),
-                completed_owners,
-                error,
-            })?;
-            #[cfg(test)]
-            let read_allocation = Arc::as_ptr(&bytes);
+            let bytes = shard_source(shard, &row.descriptor.shard, row.descriptor.span)?;
             let owner = Arc::new(ExactSourceOwner {
                 artifact: self.artifact_identity.clone(),
                 descriptor: row.descriptor.clone(),
                 kind: row.kind,
                 bytes,
             });
-            let staged_owner = StagedOwnerRef::Exact {
-                #[cfg(test)]
-                read_allocation,
-                owner: &owner,
-            };
-            #[cfg(test)]
-            debug_assert!(staged_owner.preserves_read_allocation());
+            let staged_owner = StagedOwnerRef::Exact { owner: &owner };
             let _ = staged_owner.strong_count();
             observe_cold_owner(staged_owner);
             completed_owners = checked_add(completed_owners, 1, "completed exact-source owners")?;
@@ -1984,47 +1936,67 @@ impl AuthenticatedSafetensorsHandleSet {
                 self.limits.packed_source_bytes,
                 packed_source_bytes,
             )?;
-            let data_start = self
-                .shards
-                .get(&selection.shard)
-                .ok_or_else(|| PackedSafetensorsError::SelectionMismatch {
+            if !self.shards.contains_key(&selection.shard) {
+                return Err(PackedSafetensorsError::SelectionMismatch {
                     linear_id: selection.linear_id.clone(),
                     field: PackedSelectionField::Shard,
                     expected: selection.shard.clone(),
                     actual: "<missing authenticated shard>".to_string(),
-                })?
-                .data_start;
+                });
+            }
             out.push(ValidatedSelection {
                 selection: selection.clone(),
-                data_start,
             });
         }
         Ok(out)
     }
 
-    /// The one remaining full-content pass over each shard (card 544): config and index were
-    /// already admitted once, fully, in [`Self::authenticate_retained_config_bytes`] and never
-    /// reread from disk, so re-verifying them here would be the exact second hash R475-014 named.
-    /// A shard streams here at most once - hashed against its pin when the manifest names one,
-    /// and always cross-checked against `checks` (the weight/scale spans this shard staged
-    /// between authentication and now), so a race is still caught even with no pin.
-    pub(crate) fn verify_before_publication(
-        &mut self,
-        checks: &BTreeMap<String, Vec<RangeCheck>>,
-    ) -> Result<usize, PackedSafetensorsError> {
-        let mut verified = 0usize;
-        for (filename, shard) in &mut self.shards {
-            let shard_checks = checks.get(filename).map(Vec::as_slice).unwrap_or(&[]);
+    /// The publication gate for every shard (card 544, ADR-0103 amendment): a mapped shard's file
+    /// identity must still be the one recorded when it was mapped, so a shard modified or truncated
+    /// between selection and publication is refused as `ArtifactChanged` rather than published as
+    /// views of changed pages; then, when the manifest pins the shard, its length and digest are
+    /// compared once over the mapping. Config and index were admitted once, fully, in
+    /// [`Self::authenticate_retained_config_bytes`] and are never re-read. Returns the bytes hashed.
+    pub(crate) fn verify_before_publication(&self) -> Result<usize, PackedSafetensorsError> {
+        let mut hashed = 0usize;
+        for (filename, shard) in &self.shards {
+            shard
+                .bytes
+                .check_unchanged()
+                .map_err(|_| PackedSafetensorsError::ArtifactChanged {
+                    file: filename.clone(),
+                })?;
             let pin = shard.manifest.as_ref().map(|manifest| FilePin {
                 length: manifest.file_length,
                 sha256: manifest.file_sha256,
             });
-            verified = checked_add(
-                verified,
-                admit_shard(shard.file.as_mut(), filename, pin, shard_checks)?,
-                "final_verification_bytes",
-            )?;
+            let shard_hashed = admit_shard(&shard.bytes, filename, pin)?;
+            if shard_hashed != 0 {
+                shard.bytes.check_unchanged().map_err(|_| {
+                    PackedSafetensorsError::ArtifactChanged {
+                        file: filename.clone(),
+                    }
+                })?;
+            }
+            hashed = checked_add(hashed, shard_hashed, "final_verification_bytes")?;
         }
-        Ok(verified)
+        Ok(hashed)
     }
+}
+
+/// A selected source: a view of `span` of the shard's data region, never a copy.
+fn shard_source(
+    shard: &ShardState,
+    filename: &str,
+    span: SourceSpan,
+) -> Result<StoredBytes, PackedSafetensorsError> {
+    let start = checked_add(shard.data_start, span.start, "selected source start")?;
+    let end = checked_add(shard.data_start, span.end, "selected source end")?;
+    shard
+        .bytes
+        .slice(start..end)
+        .map_err(|error| PackedSafetensorsError::SourceOutsideShard {
+            shard: filename.to_string(),
+            error,
+        })
 }

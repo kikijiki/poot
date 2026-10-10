@@ -60,7 +60,9 @@ Useful accessors after load: `handle.config()` (family, vocabulary, positions, e
 
 ## Generate
 
-A `Driver` runs one model on one device. Open the executor with `open_executor` (`Wgpu`, `Rocm` with the
+`Driver::new` runs one model on one device; `Driver::placed` runs it over a `Coordinator` of several (the
+`ptx` backend's `open_group`) as a layer pipeline or a tensor-parallel group, each device fitted against its own
+memory by `capacity::Planner::new(handle, targets, placement)`. Open the executor with `open_executor` (`Wgpu`, `Rocm` with the
 `rocm` feature, `Ptx`, `Vulkan` for raw Vulkan, or `Auto`: PTX if a CUDA device opens, else ROCm, else
 wgpu; `Auto` never picks `Vulkan`), then generate:
 

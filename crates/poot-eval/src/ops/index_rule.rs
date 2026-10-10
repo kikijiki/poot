@@ -45,7 +45,7 @@ pub enum IndexFaultKind {
 /// `0..len` (deval 4). The oracle's one index-validity refusal; every index-consuming op raises this
 /// instead of restating its own rounding or bounds check.
 #[derive(Clone, Copy, Debug, PartialEq, thiserror::Error)]
-#[error("index v{eqn} position {position} value {value} is not a valid row of 0..{len} ({kind:?})")]
+#[error("index {eqn} position {position} value {value} is not a valid row of 0..{len} ({kind:?})")]
 pub struct IndexFault {
     pub eqn: ValueId,
     pub position: usize,

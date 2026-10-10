@@ -18,6 +18,7 @@ use poot_graph_plan::{
     CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram,
     Submission, Target, TargetSet, compile_staged,
 };
+use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_rocm_gpu::device::RocmDevice;
 use poot_runtime_common::DeviceBackend;
@@ -58,7 +59,7 @@ fn store(a: &[f32], b: &[f32], c: f32) -> Arc<WeightStore> {
         let dense = DenseWeight::try_new(
             DType::F32,
             vec![bytes.len()],
-            Arc::from(bytemuck_bytes(&bytes)),
+            StoredBytes::from(bytemuck_bytes(&bytes)),
         )
         .unwrap();
         wb.insert(name, WeightEntry::Dense(dense)).unwrap();
@@ -167,9 +168,13 @@ fn len_probe_reads_the_operand_own_length_never_a_larger_slots_capacity_on_rocm(
     let len_src = device
         .allocate(BufferRole::Input, BufferStorage::f32(), SLOT_CAPACITY)
         .unwrap();
-    device
-        .write(&len_src, 0, &bytemuck_bytes(&vec![0.0f32; SLOT_CAPACITY]))
-        .unwrap();
+    poot_executor::write_slice(
+        &mut device,
+        &len_src,
+        0,
+        &bytemuck_bytes(&vec![0.0f32; SLOT_CAPACITY]),
+    )
+    .unwrap();
     let out_buf = device
         .allocate(BufferRole::Output, BufferStorage::f32(), 1)
         .unwrap();

@@ -370,7 +370,7 @@ fn mock_buffer(context: &Context, byte_len: usize) -> Result<DeviceBuffer, Runti
     mock_buffer_with_storage(context, byte_len, BufferStorage::f32())
 }
 
-/// `data` as little-endian bytes, for [`DeviceBuffer::write_bytes`] (Card 547a: the storage-typed
+/// `data` as little-endian bytes, for [`DeviceBuffer::write_with`] (Card 547a: the storage-typed
 /// primitive replacing the deleted per-dtype `write_f32`).
 fn f32_bytes(data: &[f32]) -> Vec<u8> {
     data.iter().flat_map(|v| v.to_le_bytes()).collect()
@@ -411,7 +411,7 @@ fn mock_buffer_with_storage(
 /// alone) tells them apart. `poot-vulkan-runtime` has no `*-gpu` binder crate yet (raw Vulkan's
 /// executor is a later card, D4), so this calls `check_storage` directly on a real allocation.
 ///
-/// Card 547a: `check_storage` is `#[cfg(test)]` (Card 547a: `read_bytes`/`write_bytes`, this
+/// Card 547a: `check_storage` is `#[cfg(test)]` (Card 547a: `read_bytes`/`write_with`, this
 /// crate's own storage-typed primitives, are deliberately dtype-agnostic and never call it), so this is
 /// evidence that the full storage contract check itself is correct, not evidence that a release bind
 /// path enforces it - there is no such path on this backend yet. Wire `check_storage` into a real
@@ -461,18 +461,14 @@ fn dense_f32_buffer_rejects_a_bf16_bind() {
 fn buffer_and_clone_outlive_context_and_readback_does_not_alias_writes() {
     let (context, mock) = mock_context(None);
     let buffer = mock_buffer(&context, 3 * size_of::<f32>()).expect("mock allocation");
-    buffer
-        .write_bytes(0, &f32_bytes(&[1.0, 2.0, 3.0]))
-        .expect("write");
+    write_host_bytes(&buffer, 0, &f32_bytes(&[1.0, 2.0, 3.0])).expect("write");
     let clone = buffer.clone();
     let snapshot: Vec<f32> = read_f32_bytes(&buffer).expect("read back");
 
     drop(context);
     assert!(!mock.events().contains(&"destroy_device"));
 
-    clone
-        .write_bytes(0, &f32_bytes(&[4.0, 5.0, 6.0]))
-        .expect("write");
+    write_host_bytes(&clone, 0, &f32_bytes(&[4.0, 5.0, 6.0])).expect("write");
     assert_eq!(snapshot, [1.0, 2.0, 3.0]);
     assert_eq!(read_f32_bytes(&buffer).expect("read back"), [4.0, 5.0, 6.0]);
 
@@ -717,8 +713,8 @@ fn failed_fence_wait_after_submit_poisons_and_leaks_everything() {
         Err(RuntimeError::Poisoned { op: "read_bytes" })
     ));
     assert!(matches!(
-        buffer.write_bytes(0, &[0u8; 4]),
-        Err(RuntimeError::Poisoned { op: "write_bytes" })
+        write_host_bytes(&buffer, 0, &[0u8; 4]),
+        Err(RuntimeError::Poisoned { op: "write_with" })
     ));
     assert!(matches!(
         context.begin_graph(GraphTiming::Off),
@@ -1036,22 +1032,31 @@ fn vulkan_context_open_is_required_by_its_own_variable_only() {
 
 /// POOT-1074: a write at a non-zero byte offset lands there and leaves its neighbours intact; an offset
 /// outside the buffer and an overflowing one are typed refusals that write nothing.
-/// Mutation: write at offset 0 in `DeviceBuffer::write_bytes_at`; the neighbour check goes red.
+/// Mutation: write at offset 0 in `DeviceBuffer::write_with_at`; the neighbour check goes red.
 #[test]
 fn a_write_at_an_offset_leaves_its_neighbours_intact_and_bad_ranges_are_typed() {
     let (context, _mock) = mock_context(None);
     let buffer = mock_buffer(&context, 4 * size_of::<f32>()).expect("mock allocation");
-    buffer
-        .write_bytes(0, &f32_bytes(&[1.0, 2.0, 3.0, 4.0]))
-        .unwrap();
-    buffer.write_bytes(4, &f32_bytes(&[9.0, 9.0])).unwrap();
+    write_host_bytes(&buffer, 0, &f32_bytes(&[1.0, 2.0, 3.0, 4.0])).unwrap();
+    write_host_bytes(&buffer, 4, &f32_bytes(&[9.0, 9.0])).unwrap();
     assert_eq!(read_f32_bytes(&buffer).unwrap(), [1.0, 9.0, 9.0, 4.0]);
     for (offset, len) in [(16, 4), (12, 8), (usize::MAX, 4)] {
-        let error = buffer.write_bytes(offset, &vec![0u8; len]).unwrap_err();
+        let error = write_host_bytes(&buffer, offset, &vec![0u8; len]).unwrap_err();
         assert!(
             matches!(error, RuntimeError::WriteCapacity { .. }),
             "offset {offset} len {len}: {error:?}"
         );
     }
     assert_eq!(read_f32_bytes(&buffer).unwrap(), [1.0, 9.0, 9.0, 4.0]);
+}
+
+/// Write `bytes` at `offset` of `buffer` through `DeviceBuffer::write_with` (a test helper).
+fn write_host_bytes(
+    buffer: &DeviceBuffer,
+    offset: usize,
+    bytes: &[u8],
+) -> Result<(), RuntimeError> {
+    buffer.write_with(offset, bytes.len(), &mut |range, out| {
+        out.copy_from_slice(&bytes[range.start - offset..range.end - offset]);
+    })
 }

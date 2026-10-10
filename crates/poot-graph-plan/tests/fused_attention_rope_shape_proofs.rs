@@ -23,7 +23,7 @@ fn inputs(g: &Graph) -> HashMap<ValueId, Value> {
         .iter()
         .map(|&id| {
             let shape = g.aval(id).shape.clone();
-            let mut s = (id as u64 + 7).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut s = (id.index() as u64 + 7).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
             let data = (0..shape.iter().product::<usize>())
                 .map(|_| {
                     s ^= s << 13;

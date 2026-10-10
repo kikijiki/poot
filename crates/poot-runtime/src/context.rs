@@ -2,4 +2,4 @@ pub(crate) mod counters;
 mod dispatch;
 mod init;
 mod readback;
-mod transfer;
+pub(crate) mod transfer;

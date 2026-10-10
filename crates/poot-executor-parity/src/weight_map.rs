@@ -15,6 +15,7 @@ use poot_graph_plan::{
 use poot_models::model::{KvLayout, LogitRows, Model, Phase, StepShape};
 use poot_models::registry::{RawConfig, Registry};
 use poot_quant::PackedPayload;
+use poot_quant::StoredBytes;
 use poot_quant::format::WeightFormat;
 use poot_quant::weights::{
     AttnRole, DenseWeight, FfnRole, WeightEntry, WeightKey, WeightMap, WeightRole, WeightStore,
@@ -81,7 +82,7 @@ fn dense(dtype: DType, shape: Vec<usize>, values: &[f32]) -> WeightEntry {
             .collect(),
         other => panic!("fixture weights are F32 or BF16, not {other:?}"),
     };
-    WeightEntry::Dense(DenseWeight::try_new(dtype, shape, Arc::from(bytes)).unwrap())
+    WeightEntry::Dense(DenseWeight::try_new(dtype, shape, StoredBytes::from(bytes)).unwrap())
 }
 
 /// A qwen2 checkpoint of `dims` in HF names: norms near 1, everything else small and centred, the
@@ -184,7 +185,9 @@ fn rows_of(entry: &WeightEntry, rows: std::ops::Range<usize>) -> WeightEntry {
             let mut shape = d.shape().to_vec();
             shape[0] = rows.len();
             let bytes = &d.bytes().as_slice()[rows.start * row_bytes..rows.end * row_bytes];
-            WeightEntry::Dense(DenseWeight::try_new(d.dtype(), shape, Arc::from(bytes)).unwrap())
+            WeightEntry::Dense(
+                DenseWeight::try_new(d.dtype(), shape, StoredBytes::from(bytes.to_vec())).unwrap(),
+            )
         }
         WeightEntry::Packed(p) => {
             let rows: Vec<usize> = rows.collect();
@@ -208,7 +211,7 @@ fn stacked(parts: &[&WeightEntry]) -> WeightEntry {
                 bytes.extend_from_slice(d.bytes().as_slice());
             }
             WeightEntry::Dense(
-                DenseWeight::try_new(first.dtype(), shape, Arc::from(bytes)).unwrap(),
+                DenseWeight::try_new(first.dtype(), shape, StoredBytes::from(bytes)).unwrap(),
             )
         }
         WeightEntry::Packed(_) => {

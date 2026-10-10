@@ -1,7 +1,5 @@
 //! Bounded ownership for server-created threads and accepted response sockets.
 
-#[cfg(debug_assertions)]
-use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
@@ -16,109 +14,40 @@ use poot_llm::{GenerationControl, Sampler};
 use crate::metrics::Metrics;
 use crate::types::{
     AdminError, AdminJob, AdminReply, AdminRequest, Completion, EncodeJob, EncodeReply, EncodeRow,
-    EngineMsg, GenEvent, GenerationError, Job, PerTokenInfo, PromptInput, SHUTDOWN,
+    EngineMsg, GenEvent, GenerationError, Job, PerTokenInfo, PromptInput,
 };
 
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 pub(crate) const CANCELLATION_SETTLE_TIMEOUT: Duration = Duration::from_secs(1);
-const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 30;
 pub(crate) const MAX_DRAIN_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 
 static DRAIN_CANCELLATION: AtomicBool = AtomicBool::new(false);
-
-/// Debug-build-only rendezvous for card 327's subprocess test. The control socket lets the test pause an
-/// accepted connection just before the post-accept shutdown check. Inert unless the test env var is set.
-pub(crate) struct Card327AcceptBarrier {
-    #[cfg(debug_assertions)]
-    control: Option<TcpStream>,
-}
-
-impl Card327AcceptBarrier {
-    pub(crate) fn from_env() -> std::io::Result<Self> {
-        #[cfg(debug_assertions)]
-        {
-            let Some(addr) = std::env::var_os("POOT_CARD327_TEST_ACCEPT_BARRIER_ADDR") else {
-                return Ok(Self { control: None });
-            };
-            let addr = addr.into_string().map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "POOT_CARD327_TEST_ACCEPT_BARRIER_ADDR must be valid Unicode",
-                )
-            })?;
-            let addr = addr.parse().map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "POOT_CARD327_TEST_ACCEPT_BARRIER_ADDR must be a socket address",
-                )
-            })?;
-            let control = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
-            control.set_read_timeout(Some(Duration::from_secs(5)))?;
-            control.set_nonblocking(true)?;
-            Ok(Self {
-                control: Some(control),
-            })
-        }
-
-        #[cfg(not(debug_assertions))]
-        Ok(Self {})
-    }
-
-    /// Consume an armed byte after `accept` succeeds, acknowledge, and wait for release.
-    pub(crate) fn after_accept(&mut self) -> std::io::Result<()> {
-        #[cfg(debug_assertions)]
-        if let Some(control) = &mut self.control {
-            let mut command = [0u8; 1];
-            match control.read(&mut command) {
-                Ok(1) if command[0] == b'A' => {
-                    control.set_nonblocking(false)?;
-                    control.write_all(b"B")?;
-                    loop {
-                        match control.read_exact(&mut command) {
-                            Ok(()) if command[0] == b'R' => break,
-                            Ok(()) => {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    "unexpected Card 327 accept-barrier release",
-                                ));
-                            }
-                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                            Err(error) => return Err(error),
-                        }
-                    }
-                    // The release byte follows SIGINT/SIGTERM; wait for the signal handler to set SHUTDOWN.
-                    let shutdown_deadline = deadline_after(Instant::now(), Duration::from_secs(5));
-                    while !SHUTDOWN.load(Ordering::SeqCst) {
-                        if Instant::now() >= shutdown_deadline {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::TimedOut,
-                                "Card 327 accept barrier did not observe shutdown",
-                            ));
-                        }
-                        thread::yield_now();
-                    }
-                    control.set_nonblocking(true)?;
-                }
-                Ok(1) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "unexpected Card 327 accept-barrier command",
-                    ));
-                }
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(())
-    }
-}
 
 /// A positive graceful-drain duration capped at one day, so an `Instant` deadline is never built from an unchecked value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ServerDrainTimeout(Duration);
 
+/// A `--drain-timeout-secs` value outside the accepted range.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum DrainTimeoutError {
+    #[error("must be greater than zero, got 0")]
+    Zero,
+    #[error("must be at most {MAX_DRAIN_TIMEOUT_SECS} seconds (one day), got {seconds}")]
+    TooLong { seconds: u64 },
+}
+
 impl ServerDrainTimeout {
+    /// The drain duration of `seconds`, which must be positive and at most one day.
+    pub(crate) fn from_secs(seconds: u64) -> Result<Self, DrainTimeoutError> {
+        match seconds {
+            0 => Err(DrainTimeoutError::Zero),
+            seconds if seconds > MAX_DRAIN_TIMEOUT_SECS => {
+                Err(DrainTimeoutError::TooLong { seconds })
+            }
+            seconds => Ok(Self(Duration::from_secs(seconds))),
+        }
+    }
+
     pub(crate) fn duration(self) -> Duration {
         self.0
     }
@@ -131,21 +60,6 @@ impl ServerDrainTimeout {
 /// Return a deadline without panicking; an unrepresentable deadline expires immediately.
 pub(crate) fn deadline_after(start: Instant, duration: Duration) -> Instant {
     start.checked_add(duration).unwrap_or(start)
-}
-
-/// Graceful-drain duration from `POOT_DRAIN_TIMEOUT_SECS`. Missing, zero, and invalid values use the
-/// default; values above one day clamp to the maximum.
-pub(crate) fn server_drain_timeout() -> ServerDrainTimeout {
-    server_drain_timeout_from(std::env::var("POOT_DRAIN_TIMEOUT_SECS").ok().as_deref())
-}
-
-pub(crate) fn server_drain_timeout_from(raw: Option<&str>) -> ServerDrainTimeout {
-    let seconds = raw
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|seconds| *seconds > 0)
-        .unwrap_or(DEFAULT_DRAIN_TIMEOUT_SECS)
-        .min(MAX_DRAIN_TIMEOUT_SECS);
-    ServerDrainTimeout(Duration::from_secs(seconds))
 }
 
 pub(crate) fn reset_drain_cancellation() {

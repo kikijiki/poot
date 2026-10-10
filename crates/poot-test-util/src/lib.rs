@@ -20,6 +20,7 @@ pub mod live_attention;
 pub mod packed;
 pub mod safetensors;
 pub mod scan;
+pub mod smolvlm;
 #[cfg(feature = "graph-fixtures")]
 pub mod weight_map_oracle;
 

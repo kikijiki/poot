@@ -1,5 +1,7 @@
 //! Typed errors for the graph IR.
 
+use std::num::NonZeroU32;
+
 use crate::graph::{Slot, Storage, ValueId};
 use crate::types::{DType, TensorType};
 use poot_quant::SourceRole;
@@ -40,21 +42,21 @@ pub enum BuilderAppendError {
     },
     #[error("staged input {name:?} has Device storage")]
     DeviceInput { name: String },
-    #[error("staged equation result v{value} has non-Device storage {storage:?}")]
+    #[error("staged equation result {value} has non-Device storage {storage:?}")]
     EquationResultStorage { value: ValueId, storage: Storage },
-    #[error("staged equation {equation} ({operation}) references invalid operand v{value}")]
+    #[error("staged equation {equation} ({operation}) references invalid operand {value}")]
     InvalidOperand {
         equation: usize,
         operation: String,
         value: ValueId,
     },
-    #[error("staged equation {equation} ({operation}) uses v{value} before its definition")]
+    #[error("staged equation {equation} ({operation}) uses {value} before its definition")]
     OperandNotDefined {
         equation: usize,
         operation: String,
         value: ValueId,
     },
-    #[error("staged equation {equation} ({operation}) redefines v{value}")]
+    #[error("staged equation {equation} ({operation}) redefines {value}")]
     ValueRedefined {
         equation: usize,
         operation: String,
@@ -74,13 +76,13 @@ pub enum BuilderAppendError {
         stored: TensorType,
         inferred: TensorType,
     },
-    #[error("staged Device value v{value} has no equation definition")]
+    #[error("staged Device value {value} has no equation definition")]
     MissingDefinition { value: ValueId },
-    #[error("append result v{value} is not one produced staged value")]
+    #[error("append result {value} is not one produced staged value")]
     InvalidResult { value: ValueId },
     #[error("append plan does not declare a result")]
     MissingResult,
-    #[error("append plan already declares result v{value}")]
+    #[error("append plan already declares result {value}")]
     ResultAlreadyDeclared { value: ValueId },
     #[error("checked {collection:?} growth overflow: current={current}, additional={additional}")]
     SizeOverflow {
@@ -107,7 +109,7 @@ pub enum BuilderAppendError {
     EmptyPackedLinearId { index: usize },
     #[error("packed block-diagonal out={out} is not divisible by blocks={blocks}")]
     PackedBlockDiagonalBlocks { out: usize, blocks: usize },
-    #[error("operand v{value} has type {actual}, expected {expected}")]
+    #[error("operand {value} has type {actual}, expected {expected}")]
     OperandType {
         value: ValueId,
         expected: TensorType,
@@ -121,7 +123,7 @@ pub enum BuilderAppendError {
 /// Equation errors also retain the operation name and inference source needed to locate the failure.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum GraphValidationError {
-    #[error("validation output v{value} out of range for {value_count} values")]
+    #[error("validation output {value} out of range for {value_count} values")]
     ValidationValueOutOfRange { value: ValueId, value_count: usize },
     #[error("duplicate validation id {id:?}")]
     DuplicateValidationId { id: crate::graph::ValidationId },
@@ -129,18 +131,18 @@ pub enum GraphValidationError {
     EmptyValidationName { id: crate::graph::ValidationId },
     #[error("duplicate validation name {name:?}")]
     DuplicateValidationName { name: String },
-    #[error("validation {id:?} value v{value} has dtype {actual}; expected f32")]
+    #[error("validation {id:?} value {value} has dtype {actual}; expected f32")]
     ValidationDtype {
         id: crate::graph::ValidationId,
         value: ValueId,
         actual: DType,
     },
-    #[error("validation {id:?} value v{value} has zero lanes")]
+    #[error("validation {id:?} value {value} has zero lanes")]
     EmptyValidationValue {
         id: crate::graph::ValidationId,
         value: ValueId,
     },
-    #[error("validation {id:?} value v{value} shape {shape:?} overflows usize")]
+    #[error("validation {id:?} value {value} shape {shape:?} overflows usize")]
     ValidationShapeOverflow {
         id: crate::graph::ValidationId,
         value: ValueId,
@@ -152,37 +154,37 @@ pub enum GraphValidationError {
     ValidationPacketByteOverflow,
     #[error("validation packet is {byte_len} bytes; maximum is {max_bytes}")]
     ValidationPacketTooLarge { byte_len: usize, max_bytes: usize },
-    #[error("input v{value} out of range for {value_count} values")]
+    #[error("input {value} out of range for {value_count} values")]
     InputOutOfRange { value: ValueId, value_count: usize },
-    #[error("duplicate input binder v{value}")]
+    #[error("duplicate input binder {value}")]
     DuplicateInput { value: ValueId },
-    #[error("input binder v{value} has Device storage")]
+    #[error("input binder {value} has Device storage")]
     DeviceInput { value: ValueId },
-    #[error("const table v{value} out of range for {value_count} values")]
+    #[error("const table {value} out of range for {value_count} values")]
     ConstOutOfRange { value: ValueId, value_count: usize },
-    #[error("duplicate const table entry v{value}")]
+    #[error("duplicate const table entry {value}")]
     DuplicateConst { value: ValueId },
-    #[error("const table v{value} is not an input binder")]
+    #[error("const table {value} is not an input binder")]
     ConstNotInput { value: ValueId },
-    #[error("const table v{value} has {storage:?} storage; expected Const or State")]
+    #[error("const table {value} has {storage:?} storage; expected Const or State")]
     ConstStorageMismatch { value: ValueId, storage: Storage },
-    #[error("slot table v{value} out of range for {value_count} values")]
+    #[error("slot table {value} out of range for {value_count} values")]
     SlotOutOfRange { value: ValueId, value_count: usize },
-    #[error("duplicate slot table entry v{value}")]
+    #[error("duplicate slot table entry {value}")]
     DuplicateSlot { value: ValueId },
-    #[error("slot table v{value} is not an input binder")]
+    #[error("slot table {value} is not an input binder")]
     SlotNotInput { value: ValueId },
-    #[error("slot table v{value} kind {table_slot:?} does not match storage {storage:?}")]
+    #[error("slot table {value} kind {table_slot:?} does not match storage {storage:?}")]
     SlotStorageMismatch {
         value: ValueId,
         table_slot: Slot,
         storage: Storage,
     },
-    #[error("input binder v{value} with {storage:?} storage is missing from const table")]
+    #[error("input binder {value} with {storage:?} storage is missing from const table")]
     MissingConstBinding { value: ValueId, storage: Storage },
-    #[error("input binder v{value} with {slot:?} slot storage is missing from slot table")]
+    #[error("input binder {value} with {slot:?} slot storage is missing from slot table")]
     MissingSlotBinding { value: ValueId, slot: Slot },
-    #[error("eqn {equation}: operand v{value} used before def")]
+    #[error("eqn {equation}: operand {value} used before def")]
     EquationOperandNotDefined { equation: usize, value: ValueId },
     #[error(
         "eqn {equation} ({operation}): two value operands have different dtypes ({left} vs {right})"
@@ -193,14 +195,14 @@ pub enum GraphValidationError {
         left: DType,
         right: DType,
     },
-    #[error("eqn {equation} ({operation}): output v{value} out of range for {value_count} values")]
+    #[error("eqn {equation} ({operation}): output {value} out of range for {value_count} values")]
     EquationOutputOutOfRange {
         equation: usize,
         operation: String,
         value: ValueId,
         value_count: usize,
     },
-    #[error("eqn {equation} ({operation}): output v{value} redefines an existing SSA value")]
+    #[error("eqn {equation} ({operation}): output {value} redefines an existing SSA value")]
     EquationOutputRedefined {
         equation: usize,
         operation: String,
@@ -220,14 +222,14 @@ pub enum GraphValidationError {
         stored: TensorType,
         inferred: TensorType,
     },
-    #[error("output v{value} not defined")]
+    #[error("output {value} not defined")]
     OutputNotDefined { value: ValueId },
-    #[error("validation {id:?} output v{value} not defined")]
+    #[error("validation {id:?} output {value} not defined")]
     ValidationOutputNotDefined {
         id: crate::graph::ValidationId,
         value: ValueId,
     },
-    #[error("export {id:?} value v{value} out of range for {value_count} values")]
+    #[error("export {id:?} value {value} out of range for {value_count} values")]
     ExportValueOutOfRange {
         id: crate::graph::BoundaryId,
         value: ValueId,
@@ -235,27 +237,27 @@ pub enum GraphValidationError {
     },
     #[error("export id {id:?} declared twice")]
     DuplicateExportId { id: crate::graph::BoundaryId },
-    #[error("export {id:?} value v{value} not defined")]
+    #[error("export {id:?} value {value} not defined")]
     ExportNotDefined {
         id: crate::graph::BoundaryId,
         value: ValueId,
     },
-    #[error("state pair (v{state_input}, v{state_output}) out of range for {value_count} values")]
+    #[error("state pair ({state_input}, {state_output}) out of range for {value_count} values")]
     StatePairOutOfRange {
         state_input: ValueId,
         state_output: ValueId,
         value_count: usize,
     },
-    #[error("duplicate state destination v{value}")]
+    #[error("duplicate state destination {value}")]
     DuplicateStateDestination { value: ValueId },
-    #[error("state_in v{value} has {storage:?} storage; expected State")]
+    #[error("state_in {value} has {storage:?} storage; expected State")]
     StateInputStorageMismatch { value: ValueId, storage: Storage },
-    #[error("state_in v{value} is not an input binder")]
+    #[error("state_in {value} is not an input binder")]
     StateInputNotInput { value: ValueId },
-    #[error("state_out v{value} not defined")]
+    #[error("state_out {value} not defined")]
     StateOutputNotDefined { value: ValueId },
     #[error(
-        "state pair (v{state_input}, v{state_output}) type mismatch: {input_type} vs {output_type}"
+        "state pair ({state_input}, {state_output}) type mismatch: {input_type} vs {output_type}"
     )]
     StateTypeMismatch {
         state_input: ValueId,
@@ -263,12 +265,12 @@ pub enum GraphValidationError {
         input_type: TensorType,
         output_type: TensorType,
     },
-    #[error("state input v{value} has no StateRole")]
+    #[error("state input {value} has no StateRole")]
     MissingStateRole { value: ValueId },
-    #[error("v{value} has a StateRole but {storage:?} storage; expected State")]
+    #[error("{value} has a StateRole but {storage:?} storage; expected State")]
     UnexpectedStateRole { value: ValueId, storage: Storage },
     #[error(
-        "state input v{value} declares Positional axis {axis} out of range for rank-{rank} value"
+        "state input {value} declares Positional axis {axis} out of range for rank-{rank} value"
     )]
     StateRoleAxis {
         value: ValueId,
@@ -301,6 +303,13 @@ pub enum ShapeError {
     #[error("axis {axis} out of range for rank-{rank} tensor")]
     Axis { axis: usize, rank: usize },
 
+    #[error("all_gather of {world} ranks overflows axis {axis} of length {len}")]
+    AllGatherOverflow {
+        axis: usize,
+        len: usize,
+        world: NonZeroU32,
+    },
+
     #[error("transpose perm {perm:?} does not match rank {rank}")]
     Perm { perm: Vec<usize>, rank: usize },
 
@@ -320,9 +329,6 @@ pub enum ShapeError {
     #[error("matmul contracting dim mismatch: {a:?} x {b:?}")]
     MatMulContract { a: Vec<usize>, b: Vec<usize> },
 
-    #[error("gather expects a scalar index, got shape {0:?}")]
-    GatherIndex(Vec<usize>),
-
     #[error(
         "dynamic_update_slice: update {update:?} does not fit operand {operand:?} on axis {axis}"
     )]
@@ -334,6 +340,54 @@ pub enum ShapeError {
 
     #[error("op expected {expected} inputs, got {got}")]
     Arity { expected: usize, got: usize },
+
+    /// An operand has fewer axes than the op reads: it has a last axis (or a leading one) to take and
+    /// none exists.
+    #[error("{op} operand {operand} has rank {actual}; it needs rank >= {min}")]
+    RankTooLow {
+        op: &'static str,
+        operand: &'static str,
+        min: usize,
+        actual: usize,
+    },
+
+    /// An operand's rank must be exactly `expected`, or equal another operand's.
+    #[error("{op} operand {operand} has rank {actual}; expected rank {expected}")]
+    OperandRank {
+        op: &'static str,
+        operand: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+
+    /// One operand's extent on `dim` does not agree with the extent the op's other operands fix.
+    #[error("{op} operand {operand} has extent {actual} on dim {dim}; expected {expected}")]
+    OperandDim {
+        op: &'static str,
+        operand: &'static str,
+        dim: usize,
+        expected: usize,
+        actual: usize,
+    },
+
+    /// A fused region's operand names something the region does not define.
+    #[error("fused region operand: {0}")]
+    FusedOperand(FusedOperandReason),
+
+    /// A fused region's `pack` list is not a set of unit-last-axis locals of one type.
+    #[error("fused region pack member local {local} has type {actual}; expected {expected}")]
+    FusedPack {
+        local: usize,
+        expected: Box<TensorType>,
+        actual: Box<TensorType>,
+    },
+
+    /// A contraction epilogue's region result is not the head's shape (the epilogue never reshapes).
+    #[error("contraction epilogue region result {region:?} is not the head result {head:?}")]
+    EpilogueShape {
+        head: Vec<usize>,
+        region: Vec<usize>,
+    },
 
     #[error("dtype mismatch: {a:?} vs {b:?}")]
     Dtype { a: TensorType, b: TensorType },
@@ -491,6 +545,23 @@ pub enum ShapeError {
         expected: Vec<usize>,
         actual: Vec<usize>,
     },
+}
+
+/// Why a fused region's operand or output reference is invalid ([`ShapeError::FusedOperand`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum FusedOperandReason {
+    #[error("local {local} is not defined here (only locals 0..{defined} exist)")]
+    LocalNotDefined { local: usize, defined: usize },
+    #[error("pack lane reads external input {input} of a region with {inputs} inputs")]
+    PackLaneInput { input: usize, inputs: usize },
+    #[error("pack lane {lane} is outside the last axis (width {width}) of external input {input}")]
+    PackLaneWidth {
+        input: usize,
+        lane: usize,
+        width: usize,
+    },
+    #[error("a row region has no pack-lane operand")]
+    PackLaneInRowRegion,
 }
 
 /// Why operands are not a scan of their family ([`ShapeError::Scan`]).

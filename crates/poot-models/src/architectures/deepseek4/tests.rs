@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use poot_graph_ir::Slot;
 use poot_graph_plan::{CompileLimits, CompileOptions, Submission, Target, compile};
+use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_target::{AmdArch, Backend, DeviceCaps};
 use poot_tensor::DType;
@@ -785,8 +786,11 @@ fn a_bf16_checkpoint_keeps_the_grouped_o_projection_bf16_resident() {
                 .unwrap_or_else(|e| panic!("{phase:?} on {backend:?}: {e}"));
             let g = program.graph();
             for name in &consts {
-                let id = (0..g.values.len())
-                    .find(|&id| g.values[id].name.as_deref() == Some(name))
+                let id = g
+                    .values
+                    .iter_enumerated()
+                    .find(|(_, meta)| meta.name.as_deref() == Some(name))
+                    .map(|(id, _)| id)
                     .unwrap_or_else(|| panic!("{phase:?} on {backend:?}: no const {name}"));
                 assert_eq!(
                     program.storage().storage(id).dtype(),
@@ -918,7 +922,7 @@ fn zero_checkpoint(config: serde_json::Value) -> Fixture {
                 let source = |role| {
                     (
                         role,
-                        Arc::<[u8]>::from(vec![0u8; weight.source_bytes(role)]),
+                        StoredBytes::from(vec![0u8; weight.source_bytes(role)]),
                     )
                 };
                 let codes = poot_quant::SourceRole::Planar(poot_quant::OperandRole::Codes);

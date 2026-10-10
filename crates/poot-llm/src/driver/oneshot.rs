@@ -14,13 +14,14 @@ use crate::core::sampler::Sampler;
 use crate::driver::error::{DriverError, InvalidRequest};
 use crate::driver::stops::StopScanner;
 use crate::driver::{
-    DraftPolicy, Driver, DriverOptions, GenerateRequest, Generation, ModelHandle,
+    Conversation, DraftPolicy, Driver, DriverOptions, GenerateRequest, Generation, ModelHandle,
     PreparedSetLimits, program_retention,
 };
 use crate::error::TextError;
+use crate::text::chat::Speaker;
 use crate::text::tokenize::TextCodec;
 
-/// Tokens per prefill step, rounded up to the model's prefill granule.
+/// Tokens per prefill step at most, a multiple of the model's prefill granule ([`driver_options`]).
 const PREFILL_CHUNK: usize = 128;
 
 /// How the next token is chosen: the sampling flags of a command line.
@@ -78,10 +79,19 @@ pub struct TextRequest {
 pub enum OneShotError {
     #[error("encoding the prompt: {0}")]
     Encode(#[source] TextError),
+    /// The chat template given in place of the model's own failed to render the conversation.
+    #[error("rendering the chat: {0}")]
+    Render(#[source] TextError),
     #[error(
         "a system prompt needs the model's chat template, and this prompt is used as written (the model ships no template, or the template was switched off)"
     )]
     SystemWithoutTemplate,
+    #[error(
+        "a conversation needs the model's chat template, and this model ships none (a base model)"
+    )]
+    ConversationWithoutTemplate,
+    #[error("a context of {asked} positions is not within the model's {max}")]
+    Window { asked: usize, max: usize },
     #[error(transparent)]
     Driver(DriverError),
 }
@@ -118,6 +128,7 @@ fn frame(text: &TextCodec, request: &TextRequest) -> Result<Framed, OneShotError
         None
     } else {
         text.render_user_turn(request.system.as_deref(), &request.prompt)
+            .map_err(OneShotError::Render)?
     };
     match (chat, &request.system) {
         (Some(rendered), _) => Ok(Framed {
@@ -173,9 +184,11 @@ fn plan(handle: &ModelHandle, request: &TextRequest) -> Result<Plan, OneShotErro
     })
 }
 
-fn options(capacity: NonZeroUsize, granule: NonZeroUsize) -> DriverOptions {
-    let chunk = NonZeroUsize::new(PREFILL_CHUNK.div_ceil(granule.get()) * granule.get())
-        .expect("a granule multiple is nonzero");
+fn driver_options(capacity: NonZeroUsize, granule: NonZeroUsize) -> DriverOptions {
+    // A step cannot carry more tokens than the driver has positions, and a conversation prepares every
+    // admitted piece, the full chunk included: a window under the chunk shrinks it.
+    let chunk = PREFILL_CHUNK.min(capacity.get()) / granule * granule.get();
+    let chunk = NonZeroUsize::new(chunk).unwrap_or(granule);
     let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
     DriverOptions {
         prefill: compile.clone(),
@@ -211,7 +224,7 @@ pub fn generate_text(
     let mut driver = Driver::new(
         Arc::clone(handle),
         executor,
-        options(capacity, handle.config().prefill_granule),
+        driver_options(capacity, handle.config().prefill_granule),
     )?
     .with_phase_timing();
     if framed.continued {
@@ -235,6 +248,138 @@ pub fn generate_text(
     )?;
     sink(&turn_ends.finish());
     Ok(generation)
+}
+
+/// What a conversation keeps the same across its turns.
+#[derive(Clone, Debug)]
+pub struct ChatOptions {
+    /// A system turn ahead of the conversation.
+    pub system: Option<String>,
+    /// Stop strings beyond the chat template's own turn end.
+    pub stops: Vec<String>,
+    /// At most this many new tokens per reply; `None` runs to EOS, a stop string or the end of the window.
+    pub max_new: Option<usize>,
+    /// The window, in positions, that the whole conversation must fit, and the capacity the driver is
+    /// sized to; `None` is the model's `max_positions`.
+    pub ctx: Option<usize>,
+    /// The seed of turn `n` is `sampling.seed + n`: a seeded conversation repeats, and no two turns
+    /// draw the same stream.
+    pub sampling: Sampling,
+    /// Keep going through the model's end-of-sequence token.
+    pub ignore_eos: bool,
+}
+
+/// A multi-turn conversation on one driver sequence. Each turn renders the whole conversation through
+/// the model's chat template, so the context is what a single run of the concatenated rendered prompt
+/// would read, and the sequence keeps the K/V of the leading run of it that did not change
+/// ([`Driver::resume`]): a turn prefills its new tokens, not the history again.
+pub struct ChatSession {
+    handle: Arc<ModelHandle>,
+    driver: Driver,
+    conversation: Conversation,
+    options: ChatOptions,
+    window: usize,
+    /// The finished turns, alternating user and assistant.
+    turns: Vec<(Speaker, String)>,
+}
+
+impl ChatSession {
+    /// A conversation with `handle` on `executor`. A model that ships no chat template (a base model)
+    /// cannot hold one, and a window above the model's own is refused, before any device work.
+    pub fn new(
+        handle: &Arc<ModelHandle>,
+        executor: Box<dyn Executor>,
+        options: ChatOptions,
+    ) -> Result<Self, OneShotError> {
+        if !handle.text().has_chat_template() {
+            return Err(OneShotError::ConversationWithoutTemplate);
+        }
+        let max = handle.config().max_positions;
+        let window = options.ctx.unwrap_or(max);
+        let capacity = NonZeroUsize::new(window)
+            .filter(|_| window <= max)
+            .ok_or(OneShotError::Window { asked: window, max })?;
+        let driver = Driver::new(
+            Arc::clone(handle),
+            executor,
+            driver_options(capacity, handle.config().prefill_granule),
+        )?
+        .with_phase_timing();
+        Ok(Self {
+            handle: Arc::clone(handle),
+            driver,
+            conversation: Conversation::default(),
+            options,
+            window,
+            turns: Vec::new(),
+        })
+    }
+
+    /// `user` as the next user turn, answered by the model with each piece of the reply passed to `sink`
+    /// as it is decoded. The template's turn end is markup and never reaches the sink; a caller's own
+    /// stop string stays in the reply. A conversation that no longer fits the window is
+    /// [`InvalidRequest::Capacity`], refused before the executor does any work, and the turn is not kept.
+    pub fn say(
+        &mut self,
+        user: &str,
+        sink: &mut dyn FnMut(&str),
+    ) -> Result<Generation, OneShotError> {
+        let text = self.handle.text();
+        let mut turns: Vec<(Speaker, &str)> = self
+            .turns
+            .iter()
+            .map(|(speaker, content)| (*speaker, content.as_str()))
+            .collect();
+        turns.push((Speaker::User, user));
+        let rendered = text
+            .render_turns(self.options.system.as_deref(), &turns)
+            .map_err(OneShotError::Render)?
+            .ok_or(OneShotError::ConversationWithoutTemplate)?;
+        let prompt = text
+            .encode(&rendered.prompt)
+            .map_err(OneShotError::Encode)?;
+        let max_new =
+            GenerateRequest::max_new_within(prompt.len(), self.window, self.options.max_new)?;
+        let sampling = Sampling {
+            seed: self
+                .options
+                .sampling
+                .seed
+                .wrapping_add(self.turns.len() as u64 / 2),
+            ..self.options.sampling
+        };
+        let mut turn_ends = StopScanner::new(rendered.stops.clone());
+        let mut reply = String::new();
+        let generation = self.driver.generate_turn(
+            &mut self.conversation,
+            GenerateRequest {
+                prompt,
+                max_new,
+                sampler: sampling.sampler(),
+                stops: [rendered.stops, self.options.stops.clone()].concat(),
+                ignore_eos: self.options.ignore_eos,
+            },
+            &mut |_: u32, piece: &str| {
+                let piece = turn_ends.push(piece);
+                reply.push_str(&piece);
+                sink(&piece);
+                GenerationControl::Continue(())
+            },
+        )?;
+        let tail = turn_ends.finish();
+        reply.push_str(&tail);
+        sink(&tail);
+        self.turns.push((Speaker::User, user.to_string()));
+        self.turns.push((Speaker::Assistant, reply));
+        Ok(generation)
+    }
+
+    /// End the conversation and free its sequence.
+    pub fn finish(mut self) -> Result<(), OneShotError> {
+        self.driver
+            .end_conversation(std::mem::take(&mut self.conversation))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

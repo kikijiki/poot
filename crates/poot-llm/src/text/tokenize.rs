@@ -48,6 +48,9 @@ pub struct TextCodec {
     pub(crate) eos: u32,
     pub(crate) chat_format: ChatFormat,
     pub(crate) chat_template: ChatTemplate,
+    /// Whether `chat_template` was given at load in place of the checkpoint's own: a template the caller
+    /// asked for does not fall back to `chat_format` when it fails to render.
+    pub(crate) chat_template_overridden: bool,
     /// Per-token UTF-8 bytes (token id -> decoded bytes), built once on first use: it depends only on
     /// the static tokenizer (~50ms for a 150k vocab).
     pub(crate) guided_byte_table: OnceLock<Arc<Vec<Vec<u8>>>>,
@@ -73,6 +76,7 @@ impl TextCodec {
             eos,
             chat_format,
             chat_template,
+            chat_template_overridden: false,
             guided_byte_table: OnceLock::new(),
             guided_dfa_cache: Mutex::new(HashMap::new()),
         }
@@ -927,7 +931,8 @@ mod stream_piece_tests {
             ),
         ];
         let bytes = write_gguf(&kvs, &[]);
-        let index = GgufIndex::from_bytes(&bytes).expect("parse the byte-level fixture");
+        let index = GgufIndex::parse(&poot_quant::StoredBytes::from(bytes))
+            .expect("parse the byte-level fixture");
         TextCodec::from_gguf(&index, u32::MAX, ChatFormat::ChatML)
             .expect("build the byte-level fixture's codec")
     }
@@ -1153,10 +1158,12 @@ mod double_bos_tests {
     #[test]
     fn render_chat_then_encode_has_exactly_one_leading_bos() {
         let runner = bos_template_codec();
-        let rendered = runner.render_chat_value(
-            &serde_json::json!([{"role": "user", "content": "hi"}]),
-            None,
-        );
+        let rendered = runner
+            .render_chat_value(
+                &serde_json::json!([{"role": "user", "content": "hi"}]),
+                None,
+            )
+            .unwrap();
         assert!(
             rendered.prompt.trim_start().starts_with("BOS"),
             "template must have rendered the bos_token literal first: {:?}",
@@ -1216,7 +1223,10 @@ mod phi3_gguf_inspect_legacy {
         )) else {
             return;
         };
-        let g = GgufIndex::open(&path).expect("load phi3 gguf");
+        let g = GgufIndex::parse(
+            &poot_quant::StoredBytes::map(std::fs::File::open(&path).unwrap()).unwrap(),
+        )
+        .expect("load phi3 gguf");
         let tok = gguf_tokenizer(&g).expect("build phi3 gguf tokenizer");
         for marker in ["<|user|>", "<|assistant|>", "<|end|>", "<|system|>"] {
             let ids = tok
@@ -1257,7 +1267,10 @@ mod phi3_gguf_inspect_legacy {
         )) else {
             return;
         };
-        let g = GgufIndex::open(&path).expect("load phi3 gguf");
+        let g = GgufIndex::parse(
+            &poot_quant::StoredBytes::map(std::fs::File::open(&path).unwrap()).unwrap(),
+        )
+        .expect("load phi3 gguf");
         eprintln!("arch = {:?}", g.architecture());
         let mut keys: Vec<&String> = g
             .metadata
@@ -1336,7 +1349,10 @@ mod gemma_tokenizer {
         else {
             return;
         };
-        let g = GgufIndex::open(gguf).unwrap();
+        let g = GgufIndex::parse(
+            &poot_quant::StoredBytes::map(std::fs::File::open(gguf).unwrap()).unwrap(),
+        )
+        .unwrap();
         let ours = gguf_tokenizer(&g).expect("build gguf spm-bpe tokenizer");
         let hf = Tokenizer::from_file(tjson).expect("load tokenizer.json");
         // Validated: whole-word text (space-separated, no attached punctuation) tokenizes bit-exactly vs HF
@@ -1442,7 +1458,10 @@ mod llama3_golden_tests {
         )) else {
             return;
         };
-        let g = GgufIndex::open(&path).expect("open the Qwen2.5 GGUF");
+        let g = GgufIndex::parse(
+            &poot_quant::StoredBytes::map(std::fs::File::open(&path).unwrap()).unwrap(),
+        )
+        .expect("open the Qwen2.5 GGUF");
         assert_eq!(
             BpePre::from_gguf(&g),
             BpePre::Qwen2,
@@ -1465,7 +1484,10 @@ mod llama3_golden_tests {
         )) else {
             return;
         };
-        let g = GgufIndex::open(&path).expect("open the Llama-3.2-1B GGUF");
+        let g = GgufIndex::parse(
+            &poot_quant::StoredBytes::map(std::fs::File::open(&path).unwrap()).unwrap(),
+        )
+        .expect("open the Llama-3.2-1B GGUF");
         assert_eq!(
             BpePre::from_gguf(&g),
             BpePre::Llama3,
@@ -1516,7 +1538,8 @@ mod gguf_special_policy_tests {
             ("tokenizer.ggml.eos_token_id", GgufValue::U32(EOS)),
         ];
         kvs.extend(flags.iter().map(|&(k, v)| (k, GgufValue::Bool(v))));
-        let index = GgufIndex::from_bytes(&write_gguf(&kvs, &[])).expect("parse the BPE fixture");
+        let index = GgufIndex::parse(&poot_quant::StoredBytes::from(write_gguf(&kvs, &[])))
+            .expect("parse the BPE fixture");
         TextCodec::from_gguf(&index, EOS, ChatFormat::ChatML).expect("build the BPE codec")
     }
 
@@ -1543,7 +1566,8 @@ mod gguf_special_policy_tests {
             ("tokenizer.ggml.eos_token_id", GgufValue::U32(2)),
         ];
         kvs.extend(flags.iter().map(|&(k, v)| (k, GgufValue::Bool(v))));
-        let index = GgufIndex::from_bytes(&write_gguf(&kvs, &[])).expect("parse the SPM fixture");
+        let index = GgufIndex::parse(&poot_quant::StoredBytes::from(write_gguf(&kvs, &[])))
+            .expect("parse the SPM fixture");
         TextCodec::from_gguf(&index, 2, ChatFormat::ChatML).expect("build the SPM codec")
     }
 

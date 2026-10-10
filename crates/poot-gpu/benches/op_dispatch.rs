@@ -24,6 +24,7 @@ use poot_graph_plan::{
     CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, Submission, TargetSet,
     compile_staged,
 };
+use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::DType;
 
@@ -52,7 +53,8 @@ fn setup(
     let mut builder = WeightStore::builder();
     for (name, shape, values) in consts {
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let dense = DenseWeight::try_new(DType::F32, shape.clone(), Arc::from(bytes)).ok()?;
+        let dense =
+            DenseWeight::try_new(DType::F32, shape.clone(), StoredBytes::from(bytes)).ok()?;
         builder.insert(*name, WeightEntry::Dense(dense)).ok()?;
     }
     let store = builder.build();

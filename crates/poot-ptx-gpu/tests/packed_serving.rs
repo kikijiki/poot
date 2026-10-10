@@ -33,6 +33,7 @@ use poot_graph_ir::{
 };
 use poot_graph_plan::{CompileOptions, Submission, Target, compile};
 use poot_ptx_gpu::PtxDevice;
+use poot_quant::StoredBytes;
 use poot_quant::format::{GroupMap, WeightFormat};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_quant::{PackedComponentRef, PackedPayload};
@@ -165,7 +166,11 @@ fn slot_decode_graph(descriptor: poot_quant::PackedWeight) -> (Graph, ValueId, V
         StateRole::Recurrent,
     );
     let cache_out = b.dynamic_update_slice_dyn(cache, y, pos, 0);
-    (b.finish_with_state(y, &[(cache, cache_out)]), x.id, pos.id)
+    (
+        b.finish_with_state(y, &[(cache, cache_out)]),
+        x.id(),
+        pos.id(),
+    )
 }
 
 /// The model decode contract `capture_decode` binds (Token, Pos slots): the token selects a
@@ -328,7 +333,7 @@ fn packed_prefill_through_serving_path_is_bit_exact_on_ptx() {
         let graph = b.finish_with_state(y, &[(cache, cache_out)]);
         compiled(&ptx, &graph);
         let mut inputs = carriers(&graph, &owner);
-        inputs.insert(x.id, one_hot(K, |r| r).into());
+        inputs.insert(x.id(), one_hot(K, |r| r).into());
         let path = "prefill entry";
         // A one-shot entry (the contract's twin of the pre-549 `run_prefill`): state starts zero
         // (Z5), the one step both computes `y` and commits its whole-cache write, then a probe entry
@@ -521,9 +526,9 @@ fn run_indexed_case(
             poot_quant::PackedStackComponentRef::new(Arc::clone(&stack), name.role()).into(),
         );
     }
-    inputs.insert(x.id, indexed_one_hot(rows, k).into());
+    inputs.insert(x.id(), indexed_one_hot(rows, k).into());
     let selected: Vec<f32> = (0..rows).map(|m| expert_of(m) as f32).collect();
-    inputs.insert(ids.id, HostTensor::f32(vec![rows], selected).into());
+    inputs.insert(ids.id(), HostTensor::f32(vec![rows], selected).into());
     let target = poot_executor::Device::target(&*ptx);
     let got = common::run_resident_prepared(ptx, &graph, &inputs, |named| {
         buffers.graph(named, target, table.descriptor)
@@ -584,7 +589,7 @@ fn a_split_expert_stack_runs_bit_exact_on_ptx() {
 
 /// SC-002 (PTX): a Q8_0 table with `out = 3, K = 32` is 102 bytes per expert, not a whole number of words,
 /// so the binder pads each expert to 104 bytes and the kernel strides by that; one-hot rows routed to
-/// experts 1 and 2 are bit-exact. Mutation: drop the per-expert padding in `WeightBinder::read`; experts 1 and
+/// experts 1 and 2 are bit-exact. Mutation: drop the per-expert padding in `WeightWriter::read_stream`; experts 1 and
 /// 2 read misaligned blocks and go red.
 #[test]
 fn an_unaligned_expert_slab_table_runs_bit_exact_on_ptx() {
@@ -685,7 +690,7 @@ fn packed_embedding_row_gather_is_bit_exact_on_ptx() {
             );
             let mut inputs = carriers(&graph, &owner);
             let token_ids: Vec<f32> = ids.iter().map(|&id| id as f32).collect();
-            inputs.insert(token.id, HostTensor::f32(shape, token_ids).into());
+            inputs.insert(token.id(), HostTensor::f32(shape, token_ids).into());
             let out = common::run_resident(&mut ptx, &graph, &inputs);
             assert_eq!(out.as_f32().unwrap().len(), ids.len() * K, "{what}");
             let mut expected = vec![0.0f32; K];
@@ -737,13 +742,16 @@ fn dense_e4m3_row_gather_is_bit_exact_on_ptx() {
         );
         let gathered = b.cast(b.gather(table_value, 0, idx), DType::F32);
         let graph = b.finish(gathered);
-        let idx_key = graph.meta(idx.id).slot_key().unwrap().clone();
+        let idx_key = graph.meta(idx.id()).slot_key().unwrap().clone();
 
         let store = {
             let mut builder = WeightStore::builder();
-            let dense =
-                DenseWeight::try_new(DType::E4M3FN, vec![rows, width], Arc::from(table.clone()))
-                    .unwrap();
+            let dense = DenseWeight::try_new(
+                DType::E4M3FN,
+                vec![rows, width],
+                StoredBytes::from(table.clone()),
+            )
+            .unwrap();
             builder
                 .insert("ple.table", WeightEntry::Dense(dense))
                 .unwrap();
@@ -859,7 +867,7 @@ fn packed_loaders_match_the_oracle_on_every_output_on_ptx() {
             let graph = b.finish(y);
             let mut inputs = carriers(&graph, &owner);
             inputs.insert(
-                x.id,
+                x.id(),
                 HostTensor::f32(vec![m, K], fill(7 + m as u64, m * K)).into(),
             );
             let got = common::run_resident(&mut ptx, &graph, &inputs);
@@ -906,11 +914,11 @@ fn a_packed_gemv_head_is_shared_with_the_standalone_gemv_on_ptx() {
                 poot_graph_ir::ops::packed_linear(&b, x, "layer", owner.weight(), None, None)
                     .unwrap();
             if !with_bias {
-                return (b.finish(head), x.id, None);
+                return (b.finish(head), x.id(), None);
             }
             let bias = b.constant("bias", TensorType::f32(vec![OUT]));
             let out = b.binary(BinOp::Add, head, bias);
-            (b.finish(out), x.id, Some(bias.id))
+            (b.finish(out), x.id(), Some(bias.id()))
         };
 
         let (head_graph, head_x, _) = build(false);
@@ -996,7 +1004,7 @@ fn a_packed_gemv_epilogue_agrees_with_the_oracle_on_ptx() {
                 poot_graph_ir::ops::packed_linear(&b, x, "layer", owner.weight(), None, None)
                     .unwrap();
             if !with_chain {
-                return (b.finish(head), x.id, None);
+                return (b.finish(head), x.id(), None);
             }
             let bias = b.constant("bias", TensorType::f32(vec![OUT]));
             let residual = b.constant("residual", TensorType::f32(vec![1, OUT]));
@@ -1004,7 +1012,7 @@ fn a_packed_gemv_epilogue_agrees_with_the_oracle_on_ptx() {
             let activated = b.unary(UnOp::Tanh, biased);
             let scaled = b.binary_scalar(BinOp::Mul, activated, Scalar::F32(0.5));
             let out = b.binary(BinOp::Add, scaled, residual);
-            (b.finish(out), x.id, Some((bias.id, residual.id)))
+            (b.finish(out), x.id(), Some((bias.id(), residual.id())))
         };
 
         // The device head alone, to cancel against.

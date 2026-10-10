@@ -223,7 +223,7 @@ const ENTRIES: Entry[] = [
   },
   {
     term: "Plan",
-    def: "The per-eqn output of planning (poot-graph-plan plan_eqn_analyzed): a compute body (optionally with a metadata buffer), chunked compute, a buffer alias or strided view, or a collective. The executor maps the Plans of a graph to a sequence of device dispatches.",
+    def: "The per-eqn output of planning (poot-graph-plan plan_eqn_analyzed): a compute body (optionally with a metadata buffer), chunked compute, a buffer alias or strided view. The executor maps the Plans of a graph to a sequence of device dispatches.",
     see: "fusion",
   },
   {

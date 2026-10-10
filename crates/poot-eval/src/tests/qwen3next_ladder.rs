@@ -33,7 +33,7 @@ fn card158_arg_top_k_ties_stay_in_range() {
         let gt = br.binary_scalar(BinOp::Mul, ge, poot_graph_ir::types::Scalar::F32(-1.0));
         let gt = br.binary_scalar(BinOp::Add, gt, poot_graph_ir::types::Scalar::F32(1.0));
         let rank = br.reduce(RedOp::Sum, gt, 2, false);
-        let lgi = lg.id;
+        let lgi = lg.id();
         let g = br.finish(rank);
         let mut inp = HashMap::new();
         inp.insert(
@@ -83,7 +83,7 @@ fn card158_arg_top_k_ties_stay_in_range() {
         let ba = Builder::new();
         let rk = ba.constant("rank", TensorType::f32(vec![1, e]));
         let out = ba.arg_top_k(rk, k);
-        let rki = rk.id;
+        let rki = rk.id();
         let g = ba.finish(out);
         let mut inp = HashMap::new();
         inp.insert(

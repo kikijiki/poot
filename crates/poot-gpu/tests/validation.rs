@@ -19,6 +19,7 @@ use poot_graph_plan::{
     ExpertPlacement, Partition, PlanError, StagedCompileError, StagedProgram, Submission, Target,
     TargetSet, compile_staged,
 };
+use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::DType;
 use poot_tensor::HostTensor;
@@ -101,7 +102,8 @@ fn split_consts_and_slots(
                     .flat_map(|v| v.to_le_bytes())
                     .collect();
                 let dense =
-                    DenseWeight::try_new(DType::F32, t.shape().to_vec(), Arc::from(bytes)).unwrap();
+                    DenseWeight::try_new(DType::F32, t.shape().to_vec(), StoredBytes::from(bytes))
+                        .unwrap();
                 builder.insert(name, WeightEntry::Dense(dense)).unwrap();
             }
             poot_graph_ir::Storage::Slot(_) => {
@@ -219,7 +221,7 @@ fn wgpu_validation_ge_ieee_edges_match_cpu() {
     )
     .unwrap();
     let inputs: HashMap<ValueId, Value> =
-        HashMap::from([(x.id, HostTensor::f32(vec![8], edges.clone()).into())]);
+        HashMap::from([(x.id(), HostTensor::f32(vec![8], edges.clone()).into())]);
     let expected = poot_eval::eval(&passing, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
         .unwrap()
         .output
@@ -261,7 +263,7 @@ fn wgpu_validation_ge_ieee_edges_match_cpu() {
     )
     .unwrap();
     let inputs: HashMap<ValueId, Value> =
-        HashMap::from([(x.id, HostTensor::f32(vec![8], edges).into())]);
+        HashMap::from([(x.id(), HostTensor::f32(vec![8], edges).into())]);
     let (store, slot_binds) = split_consts_and_slots(&failing, &inputs);
     let (bound, map) = ConstWeights::bind(&failing, &store);
     let program = staged(&bound, target);
@@ -299,7 +301,7 @@ fn wgpu_validation_view_source_is_materialized() {
     let mut data = vec![1.0; 8];
     data[1] = f32::MAX;
     let inputs: HashMap<ValueId, Value> =
-        HashMap::from([(x.id, HostTensor::f32(vec![2, 4], data).into())]);
+        HashMap::from([(x.id(), HostTensor::f32(vec![2, 4], data).into())]);
     let expected = cpu_failure(&graph, &inputs);
     assert_eq!(expected.lane, 2, "flags[0][1] is transposed[1][0]");
     let (store, slot_binds) = split_consts_and_slots(&graph, &inputs);
@@ -361,12 +363,15 @@ fn wgpu_validation_prefill_refuses_noncanonical_witness_at_compile_staged() {
             PlanError::ValidationWitnessNotCanonical { id, value, reason } => {
                 assert_eq!(*id, ValidationId(27), "the refusal names the declaration");
                 assert_eq!(
-                    *value, noncanonical.id,
+                    *value,
+                    noncanonical.id(),
                     "the refusal names the witness value"
                 );
                 assert_eq!(
                     reason,
-                    &DeviceWitnessRejection::GraphInput { value: state_in.id },
+                    &DeviceWitnessRejection::GraphInput {
+                        value: state_in.id()
+                    },
                     "the refusal names why v{value} is not a canonical device witness"
                 );
             }
@@ -427,7 +432,7 @@ fn wgpu_validation_prefill_rejects_a_failing_witness() {
     // Executable 1: seeded from zero, finite input, must publish and must let the state probe read
     // back the advanced state.
     let step: HashMap<ValueId, Value> = HashMap::from([(
-        x.id,
+        x.id(),
         HostTensor::f32(vec![4], vec![1.0, 2.0, 3.0, 4.0]).into(),
     )]);
     let (store, slot_binds) = split_consts_and_slots(&graph, &step);
@@ -462,7 +467,7 @@ fn wgpu_validation_prefill_rejects_a_failing_witness() {
 
     // Executable 2: a fresh zero state, poisoned input, must fail exactly as the CPU oracle does.
     let poisoned: HashMap<ValueId, Value> = HashMap::from([(
-        x.id,
+        x.id(),
         HostTensor::f32(vec![4], vec![0.0, 0.0, f32::NAN, 0.0]).into(),
     )]);
     let (store, slot_binds) = split_consts_and_slots(&graph, &poisoned);
@@ -473,7 +478,7 @@ fn wgpu_validation_prefill_rejects_a_failing_witness() {
     let result = exec.step(exe2, entry2, &step_in, &mut NoSync);
     let failure = contract_failure(result);
     let mut cpu_inputs = poisoned.clone();
-    cpu_inputs.insert(state_in.id, HostTensor::f32(vec![4], vec![0.0; 4]).into());
+    cpu_inputs.insert(state_in.id(), HostTensor::f32(vec![4], vec![0.0; 4]).into());
     assert_eq!(failure, cpu_failure(&graph, &cpu_inputs));
     exec.remove_entry(exe2, entry2).unwrap();
     exec.unload(exe2).unwrap();
@@ -496,7 +501,7 @@ fn wgpu_validation_plan_uses_prepared_graph_ids() {
     // A structurally identical witness: CSE remaps it onto the primary flags, so its original producer
     // equations do not exist in the graph the executor runs.
     let witness = nonfinite_flags(&b, y);
-    assert_ne!(primary.id, witness.id);
+    assert_ne!(primary.id(), witness.id());
     let graph = poot_test_util::graph_fixtures::finish_with_validations(
         b,
         primary,
@@ -506,7 +511,7 @@ fn wgpu_validation_plan_uses_prepared_graph_ids() {
     let mut data = finite_input();
     data[4] = f32::NAN;
     let inputs: HashMap<ValueId, Value> =
-        HashMap::from([(x.id, HostTensor::f32(vec![8], data).into())]);
+        HashMap::from([(x.id(), HostTensor::f32(vec![8], data).into())]);
     let (store, slot_binds) = split_consts_and_slots(&graph, &inputs);
     let (bound, map) = ConstWeights::bind(&graph, &store);
     let program = staged(&bound, target);

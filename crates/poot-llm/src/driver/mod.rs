@@ -38,12 +38,14 @@ pub(crate) mod chunks;
 pub mod embeds;
 pub mod encode;
 pub mod error;
+pub mod expert_residency;
 pub mod handle;
 mod host_sample;
 pub mod lora;
 pub mod mrope;
 pub mod oneshot;
 pub mod open;
+pub mod placement;
 pub mod prefix_cache;
 mod reorder;
 pub mod speculate;
@@ -54,17 +56,22 @@ pub(crate) mod suffix;
 #[cfg(test)]
 mod device_tests;
 #[cfg(test)]
+mod placed_tests;
+#[cfg(test)]
 mod tests;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
-use poot_executor::{EntryId, ExecutableId, Executor, NoSync, StepInputs};
+use poot_executor::{
+    Collectives, Coordinator, Device, EntryId, ExecError, ExecutableId, Executor, HostSync, NoSync,
+    StepInputs,
+};
 use poot_graph_ir::{Graph, Slot, SlotKey, StateRole, ValidationOutputs};
 use poot_graph_plan::{
-    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedCompileError,
-    StagedProgram, Target, TargetSet, WeightFormats, bind_packed_weights, compile_staged,
+    CompileOptions, ExpertPlacement, ShardRule, StagedCompileError, StagedProgram, TensorParallel,
+    WeightFormats, bind_packed_weights, compile_staged, shard,
 };
 use poot_models::bert::{ATTENTION_MASK_SLOT, TOKEN_TYPE_SLOT};
 use poot_models::components::embed::{EMBEDS_AT_SLOT, EMBEDS_SLOT};
@@ -74,6 +81,7 @@ use poot_models::model::{KvLayout, Phase, ShapeReason, StepShape, TraceError};
 use poot_models::mrope::MropePositionIds;
 use poot_models::qwen_vl_vision::{FRAME_SLOT, POS_H_SLOT, POS_W_SLOT, WINDOW_SLOT};
 use poot_profile::{Mark, Report, TimingSnapshot};
+use poot_quant::weights::WeightMap;
 use poot_tensor::HostTensor;
 
 use crate::GenerationControl;
@@ -89,10 +97,12 @@ use error::{
     DriverError, InvalidOptions, InvalidRequest, PreparedSetRefusal, SpeculationRefusal,
     Unsupported,
 };
+pub use expert_residency::{ExpertResidency, ResidencyCounters};
 pub use handle::{LoadOptions, ModelHandle};
 pub use lora::{AdapterRef, AdapterSet, AdapterSource, AdapterSpec, GenerationId, LoraIdx};
-pub use oneshot::{OneShotError, Sampling, TextRequest, generate_text};
-pub use open::{BackendChoice, open_executor, open_timed_executor};
+pub use oneshot::{ChatOptions, ChatSession, OneShotError, Sampling, TextRequest, generate_text};
+pub use open::{BackendChoice, open_executor, open_group, open_timed_executor};
+use placement::{Placed, Placement};
 pub use prefix_cache::{PrefixOutcome, PrefixSkip};
 pub use speculate::{
     DraftPolicy, NotSpeculated, RowSpeculation, SpeculationCaps, SpeculationStats,
@@ -171,9 +181,7 @@ pub fn program_retention(program: &StagedProgram<ValidationOutputs>) -> Retentio
                         own(&dispatch.key, &dispatch.body, &mut retention);
                     }
                 }
-                poot_graph_plan::Plan::Alias(_)
-                | poot_graph_plan::Plan::View { .. }
-                | poot_graph_plan::Plan::Collective { .. } => {}
+                poot_graph_plan::Plan::Alias(_) | poot_graph_plan::Plan::View { .. } => {}
             }
         }
     }
@@ -222,6 +230,13 @@ pub struct GenerateRequest {
     /// Keep generating through the model's end-of-sequence token (it is then an ordinary token of the
     /// output): for fixed-length measurements. A request that ends on EOS leaves this off.
     pub ignore_eos: bool,
+}
+
+/// The sequence that carries a conversation between its turns ([`Driver::generate_turn`]): none until
+/// the first turn opens it.
+#[derive(Debug, Default)]
+pub struct Conversation {
+    seq: Option<SeqId>,
 }
 
 impl GenerateRequest {
@@ -310,6 +325,8 @@ pub struct DriverStats {
     pub host_picks: u64,
     /// What the draft policy did across the rows stepped.
     pub speculation: SpeculationStats,
+    /// What the expert residency managers did, summed over the executables (zero without a pool).
+    pub residency: ResidencyCounters,
 }
 
 /// Which entries [`Driver::prepare`] warms.
@@ -521,7 +538,10 @@ pub struct Driver {
     handle: Arc<ModelHandle>,
     executor: Box<dyn Executor>,
     exe: ExecutableId,
-    target: Target,
+    /// Where the model runs: the executor's devices and how the placement uses them.
+    placed: Placed,
+    /// The served model's weights, which a tensor placement divides by role.
+    weights: Arc<WeightMap>,
     options: DriverOptions,
     chunks: ChunkPolicy,
     /// Which of the model's weights the checkpoint stores packed: put on every traced graph.
@@ -552,6 +572,15 @@ pub struct Driver {
     caps: Option<DriverCaps>,
     /// Whether `generate` reports [`Generation::timing`] ([`Driver::with_phase_timing`]).
     time_phases: bool,
+    /// The expert pool, when routed experts are paged ([`Driver::with_expert_pool`]).
+    pool: Option<ExpertPool>,
+}
+
+/// Paged routed experts: the pool's rows per selection and one residency manager per executable (each
+/// executable has resident buffers of its own, so each has its own assignments).
+struct ExpertPool {
+    slots: NonZeroUsize,
+    managers: HashMap<ExecutableId, ExpertResidency>,
 }
 
 fn token_slot() -> SlotKey {
@@ -571,21 +600,75 @@ fn activation_slot(tag: &str) -> SlotKey {
 }
 
 impl Driver {
-    /// A driver over `executor`: one executable holding the model's weights, shared by every entry.
-    /// Nothing uploads until an entry is added.
+    /// A driver over `executor`'s one device: one executable holding the model's weights, shared by
+    /// every entry. Nothing uploads until an entry is added. An executor over several devices is
+    /// [`Driver::placed`]'s.
     pub fn new(
         handle: Arc<ModelHandle>,
         mut executor: Box<dyn Executor>,
         options: DriverOptions,
     ) -> Result<Self, DriverError> {
-        let targets = executor.target_set();
-        let devices = targets.devices();
-        let &[(_, target)] = devices else {
-            return Err(InvalidOptions::Devices {
-                devices: devices.len(),
+        let placed = Placed::resolve(executor.target_set(), Placement::Single)?;
+        let chunks = Self::check_options(&handle, &options)?;
+        let weights = Arc::new(handle.model().weights().clone());
+        let exe = executor.load_weights(handle.shared_store().clone(), Arc::clone(&weights))?;
+        Ok(Self::assemble(
+            handle, executor, exe, options, chunks, placed, weights,
+        ))
+    }
+
+    /// A driver over a multi-device `coordinator`, with the model placed as `placement` says: a pipeline
+    /// loads the whole weight map on every device and each stage binds what it reads; a tensor
+    /// placement loads each rank's own share of every weight the rule divides
+    /// ([`Coordinator::load_tensor_weights`]). Either way the executable is loaded once, and nothing
+    /// uploads until an entry is added.
+    ///
+    /// The coordinator is taken by value and concrete because a tensor placement loads through it
+    /// before it becomes the driver's `dyn Executor`.
+    pub fn placed<D: Device + Collectives + 'static>(
+        handle: Arc<ModelHandle>,
+        mut coordinator: Coordinator<D>,
+        options: DriverOptions,
+        placement: Placement,
+    ) -> Result<Self, DriverError> {
+        let placed = Placed::resolve(coordinator.target_set(), placement)?;
+        if !matches!(placed.placement(), Placement::Single)
+            && matches!(options.draft, DraftPolicy::DraftModel { .. })
+        {
+            return Err(Unsupported::Placement {
+                placement: placed.name(),
+                what: "a draft model, whose layers are not the target's",
             }
             .into());
+        }
+        let chunks = Self::check_options(&handle, &options)?;
+        let weights = Arc::new(handle.model().weights().clone());
+        let store = handle.shared_store().clone();
+        let exe = match placed.placement() {
+            Placement::Tensor { rule } => {
+                let tensor = Self::tensor_shares(&handle, &options, &placed, &weights, *rule)?;
+                coordinator.load_tensor_weights(store, Arc::clone(&weights), &tensor)?
+            }
+            Placement::Single | Placement::Pipeline { .. } => {
+                coordinator.load_weights(store, Arc::clone(&weights))?
+            }
         };
+        Ok(Self::assemble(
+            handle,
+            Box::new(coordinator),
+            exe,
+            options,
+            chunks,
+            placed,
+            weights,
+        ))
+    }
+
+    /// The options a driver can honor, as the chunk policy they make.
+    fn check_options(
+        handle: &ModelHandle,
+        options: &DriverOptions,
+    ) -> Result<ChunkPolicy, DriverError> {
         if options.capacity.get() > handle.config().max_positions {
             return Err(InvalidOptions::CapacityAboveMax {
                 capacity: options.capacity.get(),
@@ -593,20 +676,67 @@ impl Driver {
             }
             .into());
         }
-        let chunks = ChunkPolicy::new(
+        Ok(ChunkPolicy::new(
             options.prefill_chunk,
             handle.config().prefill_granule,
             options.max_trace_tokens,
-        )?;
+        )?)
+    }
+
+    /// Which weights each rank of a tensor placement reads cut, and on which axis: the shards the rule
+    /// makes of one decode step's graph, which names every weight of the model. A program compiled
+    /// later that cut a weight differently would bind the wrong shape, which the executor refuses when
+    /// the entry is added.
+    fn tensor_shares(
+        handle: &ModelHandle,
+        options: &DriverOptions,
+        placed: &Placed,
+        weights: &WeightMap,
+        rule: ShardRule,
+    ) -> Result<TensorParallel, DriverError> {
+        let devices = placed.devices();
+        let world = u32::try_from(devices.len())
+            .ok()
+            .and_then(std::num::NonZeroU32::new)
+            .ok_or(InvalidOptions::TensorWithoutDevices)?;
+        let shape = StepShape {
+            rows: NonZeroUsize::MIN,
+            tokens: NonZeroUsize::MIN,
+            capacity: options.capacity,
+            kv: KvLayout::Contiguous,
+            logits: poot_models::model::LogitRows::Last,
+        };
+        let graph = handle
+            .model()
+            .trace(Phase::Decode, shape)
+            .map_err(Unsupported::Trace)?;
+        let formats = WeightFormats::from_weight_map(weights);
+        let graph = bind_packed_weights(&graph, &formats).map_err(Unsupported::PackedBind)?;
+        let sharded = shard(&graph, weights, rule, world)
+            .map_err(|e| Unsupported::Compile(StagedCompileError::Shard(e)))?;
+        Ok(TensorParallel {
+            devices,
+            shares: sharded.weights,
+        })
+    }
+
+    fn assemble(
+        handle: Arc<ModelHandle>,
+        executor: Box<dyn Executor>,
+        exe: ExecutableId,
+        options: DriverOptions,
+        chunks: ChunkPolicy,
+        placed: Placed,
+        weights: Arc<WeightMap>,
+    ) -> Self {
         let formats = WeightFormats::from_weight_map(handle.model().weights());
-        let weights = Arc::new(handle.model().weights().clone());
-        let exe = executor.load_weights(handle.shared_store().clone(), weights)?;
         let speculation = speculate::Speculation::new(options.draft.clone());
-        Ok(Self {
+        Self {
             handle,
             executor,
             exe,
-            target,
+            placed,
+            weights,
             options,
             chunks,
             formats,
@@ -624,7 +754,125 @@ impl Driver {
             layout: None,
             caps: None,
             time_phases: false,
-        })
+            pool: None,
+        }
+    }
+
+    /// Page every routed expert table through a pool of `slots_per_layer` rows per selection
+    /// (ADR-0072): the experts a step selects are made resident at a sync point before they are read,
+    /// least recently used rows making room. Call it before the first step. The prefill chunk shrinks
+    /// to what the pool serves (`tokens * k <= slots_per_layer`, granule-aligned), so a longer prompt
+    /// runs as more chunks; a pool that cannot serve one granule, a pool not smaller than the experts
+    /// and a model with no routed experts are refused.
+    pub fn with_expert_pool(mut self, slots_per_layer: NonZeroUsize) -> Result<Self, DriverError> {
+        let shape = StepShape {
+            rows: NonZeroUsize::MIN,
+            tokens: NonZeroUsize::MIN,
+            capacity: self.options.capacity,
+            kv: KvLayout::Contiguous,
+            logits: poot_models::model::LogitRows::Last,
+        };
+        let graph = self
+            .handle
+            .model()
+            .trace(Phase::Decode, shape)
+            .map_err(Unsupported::Trace)?;
+        let graph = bind_packed_weights(&graph, &self.formats).map_err(Unsupported::PackedBind)?;
+        let per_token = poot_graph_plan::routed_step_demand(&graph)
+            .map_err(|e| Unsupported::Compile(e.into()))?;
+        if per_token == 0 {
+            return Err(InvalidOptions::PoolWithoutRoutedExperts.into());
+        }
+        let granule = self.handle.config().prefill_granule.get();
+        let fits = slots_per_layer.get() / per_token / granule * granule;
+        let chunk = NonZeroUsize::new(fits.min(self.options.prefill_chunk.get())).ok_or(
+            InvalidOptions::PoolBelowGranule {
+                slots: slots_per_layer.get(),
+                per_token,
+                granule,
+            },
+        )?;
+        self.options.prefill_chunk = chunk;
+        self.chunks = ChunkPolicy::new(
+            chunk,
+            self.handle.config().prefill_granule,
+            self.options.max_trace_tokens,
+        )?;
+        self.pool = Some(ExpertPool {
+            slots: slots_per_layer,
+            managers: HashMap::new(),
+        });
+        Ok(self)
+    }
+
+    /// What the expert residency managers have done, summed over the executables: all zero without a
+    /// pool.
+    fn residency_counters(&self) -> ResidencyCounters {
+        let mut total = ResidencyCounters::default();
+        for manager in self.pool.iter().flat_map(|pool| pool.managers.values()) {
+            let c = manager.counters();
+            total.syncs += c.syncs;
+            total.id_reads += c.id_reads;
+            total.refills += c.refills;
+            total.evictions += c.evictions;
+            total.refill_bytes += c.refill_bytes;
+        }
+        total
+    }
+
+    /// Reset every executable's carried state and, with it, every residency manager: the recovery
+    /// after a failed step left an executable needing a reset. A manager that outlived the device's
+    /// cleared pool rows would trust rows that are gone, so the two are cleared in one call.
+    pub fn reset_executables(&mut self) -> Result<(), DriverError> {
+        let mut exes = vec![self.exe];
+        exes.extend(self.speculation.draft.iter().map(|draft| draft.exe));
+        exes.extend(self.adapter_exes.values().copied());
+        exes.extend(self.encode_exes.values().copied());
+        for exe in exes {
+            self.reset_exe(exe)?;
+        }
+        Ok(())
+    }
+
+    /// The answer to a failed run of the one-row surface: `error` itself, after the executables were
+    /// reset when it left one needing it (a device failure, a fault, a refused host sync or an
+    /// executable already refusing steps) and nothing else depends on their state. Open sequences
+    /// would lose their cache to a reset, and a paged layout's registered prefixes would point at
+    /// zeroed blocks, so only a driver with no open sequence on the contiguous layout recovers;
+    /// anything else is returned as it came and its caller owns the recovery.
+    fn recover_after(&mut self, error: DriverError) -> DriverError {
+        let needs_reset = matches!(
+            error,
+            DriverError::Device(
+                ExecError::Device(_)
+                    | ExecError::Fault { .. }
+                    | ExecError::NeedsReset(_)
+                    | ExecError::Host(_)
+            )
+        );
+        let alone = self.serving.as_ref().is_none_or(|s| s.seqs.is_empty())
+            && matches!(self.layout, None | Some(Layout::Contiguous));
+        if !(needs_reset && alone) {
+            return error;
+        }
+        match self.reset_executables() {
+            Ok(()) => error,
+            Err(reset) => reset,
+        }
+    }
+
+    /// `reset_state(All)` on `exe` and a reset of its residency manager, together.
+    fn reset_exe(&mut self, exe: ExecutableId) -> Result<(), DriverError> {
+        self.executor
+            .reset_state(exe, poot_executor::StateScope::All)?;
+        if let Some(manager) = self
+            .pool
+            .as_mut()
+            .and_then(|pool| pool.managers.get_mut(&exe))
+        {
+            manager.reset();
+        }
+        Ok(())
     }
 
     /// Have [`Driver::generate`] report [`Generation::timing`]. Off by default: it snapshots the
@@ -635,7 +883,10 @@ impl Driver {
     }
 
     pub fn stats(&self) -> DriverStats {
-        self.stats
+        DriverStats {
+            residency: self.residency_counters(),
+            ..self.stats
+        }
     }
 
     /// The executor's own counters: recordings, replays and live memory by role.
@@ -741,13 +992,24 @@ impl Driver {
         graph: &Graph<ValidationOutputs>,
         options: &CompileOptions,
     ) -> Result<StagedProgram<ValidationOutputs>, Unsupported> {
+        // The pool pages the graphs that have routed experts; a dense draft model's or an encode graph's
+        // stays resident, decided here from the graph rather than by catching the pool's refusal.
+        let experts = match &self.pool {
+            Some(pool)
+                if poot_graph_plan::routed_step_demand(graph)
+                    .map_err(|e| Unsupported::Compile(e.into()))?
+                    > 0 =>
+            {
+                ExpertPlacement::Pooled {
+                    slots_per_layer: pool.slots.get(),
+                }
+            }
+            _ => ExpertPlacement::AllResident,
+        };
         compile_staged(
             graph,
-            &TargetSet::single(DeviceId(0), self.target),
-            &Partition {
-                experts: ExpertPlacement::AllResident,
-                devices: DevicePlacement::Single(DeviceId(0)),
-            },
+            self.placed.targets(),
+            &self.placed.partition(experts, &self.weights),
             options,
         )
         .map_err(|e| match e {
@@ -935,9 +1197,26 @@ impl Driver {
             inputs.push((*key).clone(), tensor.shape(), tensor.view());
         }
         self.stats.steps += 1;
-        Ok(self
-            .executor
-            .step(entry.exe, entry.id, &inputs, &mut NoSync)?)
+        let mut none = NoSync;
+        let host: &mut dyn HostSync = match &mut self.pool {
+            Some(pool) => pool.managers.entry(entry.exe).or_default(),
+            None => &mut none,
+        };
+        // A failed step may have left rows half refilled; the manager forgets what it assigned so the
+        // next step refills (the executable's own reset clears the device side).
+        match self.executor.step(entry.exe, entry.id, &inputs, host) {
+            Ok(outputs) => Ok(outputs),
+            Err(error) => {
+                if let Some(manager) = self
+                    .pool
+                    .as_mut()
+                    .and_then(|pool| pool.managers.get_mut(&entry.exe))
+                {
+                    manager.reset();
+                }
+                Err(error.into())
+            }
+        }
     }
 
     /// The executable `Encode` steps of `shape` run on, loaded on first use over the base weights. A failed
@@ -946,6 +1225,13 @@ impl Driver {
         let extent = (shape.rows, shape.tokens);
         if let Some(&exe) = self.encode_exes.get(&extent) {
             return Ok(exe);
+        }
+        if self.placed.is_tensor() {
+            return Err(Unsupported::Placement {
+                placement: self.placed.name(),
+                what: "an encode step beside the served executable",
+            }
+            .into());
         }
         let weights = Arc::new(self.handle.model().weights().clone());
         let exe = self
@@ -960,6 +1246,13 @@ impl Driver {
     fn adapter_exe(&mut self, generation: GenerationId) -> Result<ExecutableId, DriverError> {
         if let Some(&exe) = self.adapter_exes.get(&generation) {
             return Ok(exe);
+        }
+        if self.placed.is_tensor() {
+            return Err(Unsupported::Placement {
+                placement: self.placed.name(),
+                what: "an adapter generation's executable",
+            }
+            .into());
         }
         let stack = self
             .lora
@@ -1031,6 +1324,75 @@ impl Driver {
         sink: &mut dyn TokenSink,
     ) -> Result<Generation, DriverError> {
         self.generate_with(request, Some((embeds, Some(positions))), sink)
+    }
+
+    /// Generate the next turn of `conversation`: `request.prompt` is the whole context so far (every
+    /// earlier turn, then the new one). The first turn opens the conversation's sequence; each later
+    /// turn [`Driver::resume`]s it, so the K/V of the leading run of context that has not changed stays
+    /// resident and only the rest is prefilled. The sequence stays open for the next turn until
+    /// [`Driver::end_conversation`] or an error, which closes it.
+    ///
+    /// Turns can be any length, so the prepared set is the admitted one ([`Warm::Admitted`]), not the
+    /// pieces one prompt plans to.
+    pub fn generate_turn(
+        &mut self,
+        conversation: &mut Conversation,
+        request: GenerateRequest,
+        sink: &mut dyn TokenSink,
+    ) -> Result<Generation, DriverError> {
+        let head = match suffix::rule_of(&request.sampler) {
+            Some(rule) => Head::Sample(rule),
+            None => Head::Logits,
+        };
+        let shapes = ServingShapes {
+            layout: self.layout.unwrap_or(Layout::Contiguous),
+            rows: &[NonZeroUsize::MIN],
+            heads: &[head],
+            warm: Warm::Admitted,
+            windows: &[],
+            adapters: &[],
+        };
+        self.prepare(&shapes)?;
+        let seq = match conversation.seq {
+            Some(seq) => {
+                self.resume(seq, &request.prompt, request.max_new)?;
+                seq
+            }
+            None => {
+                let opened = self.open(SeqRequest {
+                    prompt: &request.prompt,
+                    max_new: request.max_new,
+                    adapter: AdapterRef::Base,
+                })?;
+                match opened {
+                    Admission::Opened { seq, .. } => seq,
+                    Admission::NoRoom { needed_blocks: 0 } => {
+                        return Err(InvalidRequest::SlotsBusy.into());
+                    }
+                    Admission::NoRoom { needed_blocks } => {
+                        return Err(InvalidRequest::NoRoom { needed_blocks }.into());
+                    }
+                }
+            }
+        };
+        conversation.seq = Some(seq);
+        let generation = self.decode_sequence(seq, request, sink);
+        match generation {
+            Err(error) => {
+                conversation.seq = None;
+                let _ = self.release(seq, Release::Preempted);
+                Err(self.recover_after(error))
+            }
+            ok => ok,
+        }
+    }
+
+    /// Close the sequence `conversation` holds, if it has one.
+    pub fn end_conversation(&mut self, conversation: Conversation) -> Result<(), DriverError> {
+        if let Some(seq) = conversation.seq {
+            self.release(seq, Release::Finished)?;
+        }
+        Ok(())
     }
 
     fn generate_with(
@@ -1113,7 +1475,7 @@ impl Driver {
                 // The run's own error is the one worth reporting; a sequence that never ran to its
                 // end registers no prefix.
                 let _ = self.release(seq, Release::Preempted);
-                Err(error)
+                Err(self.recover_after(error))
             }
         }
     }
@@ -1148,6 +1510,7 @@ impl Driver {
         let handle = Arc::clone(&self.handle);
         let config = handle.config();
         let upto = prompt.len();
+        let mut prefilled_tokens = 0;
         let mut logprobs = Vec::new();
         let started = self
             .time_phases
@@ -1155,6 +1518,7 @@ impl Driver {
         let mut pending = loop {
             let result = self.step_one(seq, RowWork::Prefill { upto }, sampler)?;
             logprobs.extend(result.logprobs);
+            prefilled_tokens += result.consumed;
             if !result.tokens.is_empty() {
                 break result.tokens;
             }
@@ -1217,7 +1581,7 @@ impl Driver {
                 let finished = self.executor.stats().timing;
                 Some(GenerationTiming {
                     prefill: PhaseTiming {
-                        tokens: gen_start,
+                        tokens: prefilled_tokens,
                         wall: window_wall(prefilled, started),
                     },
                     decode: PhaseTiming {

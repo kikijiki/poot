@@ -10,7 +10,9 @@ use poot_tensor::DType;
 use std::collections::HashMap;
 
 use poot_graph_ir::op::{ContractionHead, OpKind, UnOp as GUnOp};
-use poot_graph_ir::{Eqn, Graph, Operand, TensorType, ValidationChannel, ValueId, ValueMeta};
+use poot_graph_ir::{
+    Eqn, Graph, Operand, TensorType, ValidationChannel, ValueId, ValueMeta, ValueTable,
+};
 use poot_kernelgen as kg;
 use poot_target::{Backend, DeviceCaps, TensorCoreSupport};
 
@@ -56,7 +58,7 @@ pub fn numel(shape: &[usize]) -> usize {
 /// analysis.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GraphTables<'g> {
-    pub(crate) values: &'g [ValueMeta],
+    pub(crate) values: &'g ValueTable<ValueMeta>,
     pub(crate) eqns: &'g [Eqn],
 }
 

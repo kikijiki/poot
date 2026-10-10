@@ -51,6 +51,7 @@ fn prometheus_exposition_is_well_formed() {
             accepted: AtomicU64::new(7),
             skipped: AtomicU64::new(3),
         },
+        timing: TimingMetrics::new(TelemetryConfig::CountersOnly),
     };
     m.record_request(40.0, Some(8.0));
     let out = m.prometheus();
@@ -835,7 +836,7 @@ fn lora_admin_trust_boundary_rejects_invalid_configured_credentials() {
                 });
         let message = error.to_string();
         assert_eq!(
-            message, "POOT_LORA_ADMIN_KEY must be one non-empty RFC 6750 b64token",
+            message, "the LoRA admin key must be one non-empty RFC 6750 b64token",
             "startup diagnostics must be generic rather than echoing invalid credential contents"
         );
     }

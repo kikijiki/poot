@@ -5,10 +5,10 @@ use poot_executor_parity::{Fixture, run_outputs};
 use poot_graph_ir::{Builder, OpKind, Slot, TensorType};
 use poot_graph_plan::{CompileLimits, CompileOptions, KernelChoice, Submission, Target, compile};
 use poot_kernelgen::{ContractionSpec, KernelRequest, Schedule};
+use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::{DType, HostTensor};
 use poot_test_util::StepFixture;
-use std::sync::Arc;
 
 use super::{gpu_lock, open_engine_or_skip};
 
@@ -71,10 +71,10 @@ fn gemv_case(dtype: DType, k: usize, n: usize) -> GemvCase {
     let w = b.constant("w", TensorType::new(vec![n, k], dtype));
     let out = b.matmul(x, b.transpose(w, vec![1, 0]));
     let graph = b.finish(out);
-    let key = graph.meta(x.id).slot_key().unwrap().clone();
+    let key = graph.meta(x.id()).slot_key().unwrap().clone();
     let (bytes, held) = weight(dtype, n * k, (k * 131 + n) as u64);
     let mut builder = WeightStore::builder();
-    let dense = DenseWeight::try_new(dtype, vec![n, k], Arc::from(bytes)).unwrap();
+    let dense = DenseWeight::try_new(dtype, vec![n, k], StoredBytes::from(bytes)).unwrap();
     builder
         .insert("w".to_string(), WeightEntry::Dense(dense))
         .unwrap();
@@ -191,10 +191,11 @@ fn attention_gemv_case(hq: usize, cap: usize, d: usize) -> (Fixture, Vec<f32>, V
     let v = b.constant("v", TensorType::f32(vec![1, hq, cap, d]));
     let out = b.matmul(scores, v);
     let graph = b.finish(out);
-    let key = graph.meta(scores.id).slot_key().unwrap().clone();
+    let key = graph.meta(scores.id()).slot_key().unwrap().clone();
     let (bytes, values) = weight(DType::F32, hq * cap * d, 0x5C0);
     let mut builder = WeightStore::builder();
-    let dense = DenseWeight::try_new(DType::F32, vec![1, hq, cap, d], Arc::from(bytes)).unwrap();
+    let dense =
+        DenseWeight::try_new(DType::F32, vec![1, hq, cap, d], StoredBytes::from(bytes)).unwrap();
     builder
         .insert("v".to_string(), WeightEntry::Dense(dense))
         .unwrap();

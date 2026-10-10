@@ -38,6 +38,11 @@ impl Drop for Server {
 
 impl Server {
     fn spawn(backend: &str) -> Self {
+        Self::spawn_with(backend, &[])
+    }
+
+    /// As [`Self::spawn`], with `flags` after `--backend`.
+    fn spawn_with(backend: &str, flags: &[&str]) -> Self {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -56,6 +61,7 @@ impl Server {
             .arg(&model)
             .arg(addr.to_string())
             .args(["--backend", backend])
+            .args(flags)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -246,6 +252,101 @@ fn a_dense_prefix_is_registered_on_release_and_reused(backend: &str) {
         metrics["prefix_cache_hit_rate"].as_f64().unwrap() > 0.0,
         "the second request found its prefix resident: {metrics}"
     );
+}
+
+/// `/metrics` `device_timing` once the engine has published it: polled, because the loop publishes its
+/// timing summary after the steps that produced it, at the latest when it goes idle.
+fn device_timing_after(server: &Server, steps: u64) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let timing = server.metrics()["device_timing"].clone();
+        if timing["steps"].as_u64().unwrap_or(0) >= steps {
+            return timing;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the engine never published {steps} steps: {timing}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The server's default timing is counters only: the step count is exact, and the device time is
+/// unknown (`null`), not zero, because no device timestamp was requested. Mutation: open the executor
+/// timed when no flag is given; `mode` reads `detailed`, the device time is a number, and the row goes red.
+fn default_serving_reports_counters_and_unknown_device_time(backend: &str) {
+    let server = Server::spawn(backend);
+    server.complete(&greedy("a", 4));
+    let timing = device_timing_after(&server, 1);
+    assert_eq!(timing["mode"], "counters_only", "{timing}");
+    assert!(timing["device_time_ms"].is_null(), "{timing}");
+    assert_eq!(timing["detail_coverage"]["kind"], "unavailable", "{timing}");
+    assert_eq!(timing["perturbed"], false, "{timing}");
+}
+
+/// `--device-timing` is the one way to get device time: the executor opens with timestamps and bounded
+/// detail, the served steps carry a measured device time, and the export says the run is perturbed and how
+/// complete the retained detail is. A bound of 2 retained steps is exceeded by the run, so coverage is
+/// `truncated`, never `complete`. Mutation: ignore `--device-timing` when opening the executor; the device
+/// time stays `null` and the row goes red.
+fn device_timing_flag_measures_device_time_within_its_bounds(backend: &str) {
+    let server = Server::spawn_with(
+        backend,
+        &[
+            "--device-timing",
+            "--timing-max-steps",
+            "2",
+            "--timing-max-dispatch-records",
+            "64",
+        ],
+    );
+    server.complete(&greedy("a", 8));
+    let timing = device_timing_after(&server, 4);
+    assert_eq!(timing["mode"], "detailed", "{timing}");
+    let device_ms = timing["device_time_ms"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("no device time measured: {timing}"));
+    assert!(device_ms > 0.0, "{timing}");
+    assert_eq!(timing["perturbed"], true, "{timing}");
+    assert_eq!(timing["detail_coverage"]["kind"], "truncated", "{timing}");
+    assert!(
+        timing["detail_coverage"]["retained"].as_u64().unwrap() <= 2,
+        "retained detail exceeded its bound: {timing}"
+    );
+}
+
+/// Raw Vulkan has no device timestamps: `--device-timing` still serves, the mode says `detailed`, the step
+/// count is exact, and the device time is unknown (`null`) with detail that is not `complete`, never a
+/// fabricated figure. Mutation: report a zero device time for an untimed backend; `device_time_ms` becomes
+/// a number and the row goes red.
+#[test]
+fn served_device_timing_flag_reports_unknown_device_time_on_raw_vulkan_vulkan() {
+    let server = Server::spawn_with("vulkan", &["--device-timing"]);
+    server.complete(&greedy("a", 8));
+    let timing = device_timing_after(&server, 4);
+    assert_eq!(timing["mode"], "detailed", "{timing}");
+    assert!(timing["device_time_ms"].is_null(), "{timing}");
+    assert_ne!(timing["detail_coverage"]["kind"], "complete", "{timing}");
+}
+
+#[test]
+fn served_default_serving_reports_counters_and_unknown_device_time_wgpu() {
+    default_serving_reports_counters_and_unknown_device_time("wgpu");
+}
+
+#[test]
+fn served_default_serving_reports_counters_and_unknown_device_time_rocm() {
+    default_serving_reports_counters_and_unknown_device_time("rocm");
+}
+
+#[test]
+fn served_device_timing_flag_measures_device_time_within_its_bounds_wgpu() {
+    device_timing_flag_measures_device_time_within_its_bounds("wgpu");
+}
+
+#[test]
+fn served_device_timing_flag_measures_device_time_within_its_bounds_rocm() {
+    device_timing_flag_measures_device_time_within_its_bounds("rocm");
 }
 
 #[test]

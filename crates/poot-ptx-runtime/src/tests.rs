@@ -1,4 +1,5 @@
 use super::*;
+use crate::upload::UploadRing;
 
 mod require_backend_tests {
     use super::require_gpu_check_with;
@@ -31,7 +32,7 @@ use std::sync::Mutex;
 /// A test double for [`CudaDriver`] (R471-010): `Mutex`-backed, not `Cell`/`RefCell`-backed, so it is
 /// `Send + Sync` like every real implementor must be now that `Arc<dyn CudaDriver>` replaces `Rc`.
 #[derive(Default)]
-struct MockCleanup {
+pub(crate) struct MockCleanup {
     events: Mutex<Vec<String>>,
     current: Mutex<Option<usize>>,
     fail_next_set: Mutex<bool>,
@@ -176,7 +177,7 @@ fn injected_error() -> PtxError {
     PtxError::BadKernel("injected lifecycle failure".to_string())
 }
 
-fn mock_owner(mock: &Arc<MockCleanup>) -> Arc<PtxOwner> {
+pub(crate) fn mock_owner(mock: &Arc<MockCleanup>) -> Arc<PtxOwner> {
     let driver: Arc<dyn CudaDriver> = mock.clone();
     Arc::new(PtxOwner {
         driver,
@@ -185,6 +186,7 @@ fn mock_owner(mock: &Arc<MockCleanup>) -> Arc<PtxOwner> {
         stream: fake_stream(13),
         modules: Mutex::new(Vec::new()),
         memory: poot_runtime_common::MemoryCounters::new(),
+        counters: Default::default(),
     })
 }
 
@@ -497,12 +499,15 @@ fn final_owner_restore_failure_suppresses_primary_release() {
 #[test]
 fn surviving_graph_scopes_launch_and_sync_after_context_switch_or_clear() {
     let mock = Arc::new(MockCleanup::default());
+    let owner = mock_owner(&mock);
     let context = PtxContext {
-        owner: mock_owner(&mock),
+        upload: RefCell::new(UploadRing::new(Arc::clone(&owner))),
+        owner,
         funcs: RefCell::new(HashMap::new()),
         capture: CaptureRetention::default(),
         device_caps: poot_target::DeviceCaps::ptx_default(),
         device_timing: false,
+        peers: RefCell::new(Vec::new()),
     };
     let graph = instantiate_graph(
         Arc::clone(&context.owner),
@@ -696,11 +701,13 @@ fn children_delay_context_cleanup_and_preserve_dependency_order() {
     let owner = mock_owner(&mock);
     ModuleConstruction::new(fake_module(17), Arc::clone(&owner)).finish();
     let context = PtxContext {
+        upload: RefCell::new(UploadRing::new(Arc::clone(&owner))),
         owner,
         funcs: RefCell::new(HashMap::new()),
         capture: CaptureRetention::default(),
         device_caps: poot_target::DeviceCaps::ptx_default(),
         device_timing: false,
+        peers: RefCell::new(Vec::new()),
     };
     let buffer = allocate_owned(
         Arc::clone(&context.owner),
@@ -760,12 +767,15 @@ fn children_delay_context_cleanup_and_preserve_dependency_order() {
 }
 
 fn mock_context(mock: &Arc<MockCleanup>) -> PtxContext {
+    let owner = mock_owner(mock);
     PtxContext {
-        owner: mock_owner(mock),
+        upload: RefCell::new(UploadRing::new(Arc::clone(&owner))),
+        owner,
         funcs: RefCell::new(HashMap::new()),
         capture: CaptureRetention::default(),
         device_caps: poot_target::DeviceCaps::ptx_default(),
         device_timing: false,
+        peers: RefCell::new(Vec::new()),
     }
 }
 
@@ -869,7 +879,7 @@ fn captured_graph_owns_dispatched_buffers_until_it_drops() {
 #[test]
 fn every_non_dispatch_operation_refuses_while_a_capture_is_open() {
     type Operation = fn(&PtxContext, &PtxBuffer) -> Result<(), PtxError>;
-    let operations: [(&str, Operation); 12] = [
+    let operations: [(&str, Operation); 14] = [
         ("synchronize", |ctx, _| ctx.synchronize()),
         ("upload_f32", |ctx, _| ctx.upload_f32(&[1.0]).map(drop)),
         ("upload_i32", |ctx, _| ctx.upload_i32(&[1]).map(drop)),
@@ -879,13 +889,17 @@ fn every_non_dispatch_operation_refuses_while_a_capture_is_open() {
         }),
         ("upload_f16", |ctx, _| ctx.upload_f16(&[0, 0]).map(drop)),
         ("update_f32", |ctx, buf| ctx.update_f32(buf, &[1.0; 4])),
-        ("write_bytes", |ctx, buf| {
-            ctx.write_bytes(buf, 0, &[0u8; 16])
+        ("write_with", |ctx, buf| {
+            ctx.write_with(buf, 0, 16, &mut |_, out| out.fill(0))
         }),
         ("read_bytes", |ctx, buf| ctx.read_bytes(buf, &mut [0u8; 16])),
         ("download_f32", |ctx, buf| ctx.download_f32(buf).map(drop)),
         ("download_i32", |ctx, buf| ctx.download_i32(buf).map(drop)),
         ("begin_capture", |ctx, _| ctx.begin_capture()),
+        ("create_sync_event", |ctx, _| {
+            ctx.create_sync_event().map(drop)
+        }),
+        ("enable_peer_access", |ctx, _| ctx.enable_peer_access(ctx)),
     ];
     let mock = Arc::new(MockCleanup::default());
     let context = mock_context(&mock);
@@ -902,6 +916,127 @@ fn every_non_dispatch_operation_refuses_while_a_capture_is_open() {
         "a refused operation must not reach the driver"
     );
     assert!(context.capture.is_open());
+}
+
+/// A mock owner on another device and context than [`mock_owner`]'s, sharing its recording driver.
+fn mock_owner_on(mock: &Arc<MockCleanup>, device: sys::CUdevice, context: usize) -> Arc<PtxOwner> {
+    let driver: Arc<dyn CudaDriver> = mock.clone();
+    Arc::new(PtxOwner {
+        driver,
+        device,
+        ctx: fake_context(context),
+        stream: fake_stream(context + 2),
+        modules: Mutex::new(Vec::new()),
+        memory: poot_runtime_common::MemoryCounters::new(),
+        counters: Default::default(),
+    })
+}
+
+fn owned_buffer(owner: &Arc<PtxOwner>, ptr: sys::CUdeviceptr) -> PtxBuffer {
+    allocate_owned(
+        Arc::clone(owner),
+        "test_alloc",
+        4,
+        BufferStorage::f32(),
+        BufferRole::Activation,
+        |_| Ok(ptr),
+        |_, _| Ok(()),
+    )
+    .expect("mock allocation")
+}
+
+fn sync_event(owner: &Arc<PtxOwner>, handle: usize) -> PtxSyncEvent {
+    PtxSyncEvent {
+        event: Arc::new(crate::graph::PtxEvent::new(
+            fake_event(handle),
+            Arc::clone(owner),
+        )),
+    }
+}
+
+/// The context's counters report each native object the sequence created and each launch, from the
+/// driver-facing seams (an instantiated graph, a launch, an event), never an engine-side tally.
+/// Mutation: skip the bump in `instantiate_graph`; the instantiation count reads 0.
+#[test]
+fn native_counters_count_instantiations_launches_and_events() {
+    let mock = Arc::new(MockCleanup::default());
+    let context = mock_context(&mock);
+    let _event = sync_event(&context.owner, 41);
+    context.capture.begin();
+    let graph = instantiate_graph(
+        Arc::clone(&context.owner),
+        fake_graph(23),
+        context.capture.finish(),
+        |exec| {
+            *exec = fake_graph_exec(29);
+            Ok(())
+        },
+    )
+    .expect("mock graph");
+    graph.launch().expect("launch");
+    graph.launch().expect("launch");
+    assert_eq!(
+        context.native_counters(),
+        NativeCounters {
+            graph_instantiations: 1,
+            graph_launches: 2,
+            events: 1,
+            ..NativeCounters::default()
+        }
+    );
+}
+
+/// Event ordering is a stream operation and never a captured node, a record names only its own
+/// context's event, and a peer copy only exists inside a capture on a context the destination's device
+/// was enabled for; each refusal precedes any driver call. Mutation: drop the owner check in
+/// `record_sync_event`; the foreign event is recorded through this context's stream and the row fails.
+#[test]
+fn cross_device_operations_refuse_in_a_capture_outside_one_and_on_foreign_handles() {
+    let mock = Arc::new(MockCleanup::default());
+    let context = mock_context(&mock);
+    let peer = mock_owner_on(&mock, 8, 21);
+    let own_event = sync_event(&context.owner, 41);
+    let foreign_event = sync_event(&peer, 42);
+    let own_buffer = owned_buffer(&context.owner, 101);
+    let peer_buffer = owned_buffer(&peer, 201);
+
+    assert!(matches!(
+        context.record_sync_event(&foreign_event),
+        Err(PtxError::ForeignHandle {
+            op: "record_sync_event"
+        })
+    ));
+    assert!(matches!(
+        context.copy_to_peer(&own_buffer, &peer_buffer, 16),
+        Err(PtxError::CaptureClosed { op: "copy_to_peer" })
+    ));
+
+    context.capture.begin();
+    for refused in [
+        context.record_sync_event(&own_event),
+        context.wait_sync_event(&foreign_event),
+    ] {
+        assert!(
+            matches!(refused, Err(PtxError::CaptureOpen { .. })),
+            "{refused:?}"
+        );
+    }
+    assert!(matches!(
+        context.copy_to_peer(&peer_buffer, &own_buffer, 16),
+        Err(PtxError::ForeignHandle { op: "copy_to_peer" })
+    ));
+    assert!(
+        matches!(
+            context.copy_to_peer(&own_buffer, &peer_buffer, 16),
+            Err(PtxError::PeerNotEnabled)
+        ),
+        "a destination on a device that was never enabled is refused before the driver"
+    );
+    assert!(matches!(
+        context.copy_to_peer(&own_buffer, &own_buffer, 1 << 20),
+        Err(PtxError::RangeOutOfBounds { .. })
+    ));
+    assert!(mock.snapshot().is_empty());
 }
 
 fn test_buffer(elements: usize, storage: BufferStorage) -> PtxBuffer {
@@ -1423,7 +1558,7 @@ fn ptx_buffer_and_its_context_move_into_another_thread() {
 
 /// POOT-1074: a write at a non-zero byte offset lands there and leaves its neighbours intact; an offset
 /// outside the buffer and an overflowing one are typed refusals that write nothing.
-/// Mutation: ignore `range.byte_offset` in `PtxContext::write_bytes`; the neighbour check goes red.
+/// Mutation: ignore `range.byte_offset` in `PtxContext::write_with`; the neighbour check goes red.
 #[test]
 fn a_write_at_an_offset_leaves_its_neighbours_intact_and_bad_ranges_are_typed() {
     let ctx = match PtxContext::new() {
@@ -1438,14 +1573,13 @@ fn a_write_at_an_offset_leaves_its_neighbours_intact_and_bad_ranges_are_typed() 
     let buf = ctx
         .alloc_storage(BufferRole::State, BufferStorage::f32(), 4)
         .expect("allocation");
-    ctx.write_bytes(&buf, 0, &words(&[1.0, 2.0, 3.0, 4.0]))
-        .unwrap();
-    ctx.write_bytes(&buf, 4, &words(&[9.0, 9.0])).unwrap();
+    write_host_bytes(&ctx, &buf, 0, &words(&[1.0, 2.0, 3.0, 4.0])).unwrap();
+    write_host_bytes(&ctx, &buf, 4, &words(&[9.0, 9.0])).unwrap();
     let mut got = vec![0u8; 16];
     ctx.read_bytes(&buf, &mut got).unwrap();
     assert_eq!(got, words(&[1.0, 9.0, 9.0, 4.0]), "only bytes 4..12 change");
     for (offset, len) in [(16, 4), (12, 8), (usize::MAX, 4)] {
-        let error = ctx.write_bytes(&buf, offset, &vec![0u8; len]).unwrap_err();
+        let error = write_host_bytes(&ctx, &buf, offset, &vec![0u8; len]).unwrap_err();
         assert!(
             matches!(
                 error,
@@ -1460,4 +1594,17 @@ fn a_write_at_an_offset_leaves_its_neighbours_intact_and_bad_ranges_are_typed() 
         words(&[1.0, 9.0, 9.0, 4.0]),
         "refused writes change nothing"
     );
+}
+
+/// Write `bytes` at `offset` of `buf` through the context's one write primitive, `write_with` (a test helper:
+/// the contexts have no slice-taking write of their own).
+fn write_host_bytes(
+    ctx: &PtxContext,
+    buf: &PtxBuffer,
+    offset: usize,
+    bytes: &[u8],
+) -> Result<(), PtxError> {
+    ctx.write_with(buf, offset, bytes.len(), &mut |range, out| {
+        out.copy_from_slice(&bytes[range.start - offset..range.end - offset]);
+    })
 }

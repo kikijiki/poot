@@ -1,0 +1,28 @@
+# Required cases for `just test-device-ptx-2gpu` (POOT-748), one per line:
+# binary_id<TAB>test_name, the identity the lane's JUnit report carries as classname and name.
+# Hand-maintained: never generated from the lane's selection. The gate
+# (scripts/check-required-cases.py ptx-2gpu) fails the lane unless every case here ran and passed -
+# a skip is never a pass. Sorted in canonical (LC_ALL=C) order.
+#
+# The captured coordinator across two NVIDIA GPUs: MiniMax-M2, qwen2 and GLM-5.3 fixtures as a
+# two-device pipeline against single-device decode (SC-001..SC-003), one recording session per device
+# over sixteen steps (SC-004), rank 0 -> rank 1 -> rank 0 over many generations (SC-005) and a capture
+# failure on the later rank (SC-006), and the peer-copy-plus-event primitive under every transfer.
+# POOT-749: tensor-parallel decode of qwen2, Llama and Qwen3 against single-device decode (SC-003) and
+# the weight shares read once over sixteen steps (SC-004).
+# POOT-750: the production server over both placements against the driver's tokens (SC-001), a sampled
+# tensor-parallel request (SC-002, R477-006).
+poot-ptx-gpu::multi_device_pipeline	a_capture_failure_on_the_later_rank_aborts_cleanly_and_the_retry_runs_on_ptx
+poot-ptx-gpu::multi_device_pipeline	a_peer_copy_in_a_graph_delivers_its_bytes_and_an_event_orders_the_peer_on_ptx
+poot-ptx-gpu::multi_device_pipeline	glm_5_3_fixture_two_device_pipeline_matches_single_device_decode
+poot-ptx-gpu::multi_device_pipeline	minimax_m2_fixture_two_device_pipeline_matches_single_device_decode
+poot-ptx-gpu::multi_device_pipeline	qwen2_two_stage_split_matches_single_device_decode
+poot-ptx-gpu::multi_device_pipeline	rank_zero_to_rank_one_to_rank_zero_never_consumes_a_prior_generation_on_ptx
+poot-ptx-gpu::multi_device_pipeline	sixteen_unchanged_steps_are_one_recording_session_per_device_on_ptx
+poot-ptx-gpu::tensor_parallel	llama_tensor_parallel_decode_matches_single_device_on_ptx
+poot-ptx-gpu::tensor_parallel	qwen2_tensor_parallel_decode_matches_single_device_on_ptx
+poot-ptx-gpu::tensor_parallel	qwen3_tensor_parallel_decode_matches_single_device_on_ptx
+poot-ptx-gpu::tensor_parallel	sixteen_tensor_parallel_steps_upload_the_weight_shares_once_on_ptx
+poot-serve::served_multi_device	a_sampled_tensor_parallel_request_returns_the_samplers_tokens_ptx
+poot-serve::served_multi_device	a_served_tensor_parallel_request_matches_the_drivers_tokens_ptx
+poot-serve::served_multi_device	a_served_two_device_pipeline_request_matches_the_drivers_tokens_ptx

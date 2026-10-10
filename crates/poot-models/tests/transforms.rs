@@ -8,7 +8,7 @@ use poot_eval::{EvalBudget, EvalError, EvalOptions, Value, eval};
 use poot_executor_parity::dense::{Dense, Family, plain, step};
 use poot_graph_ir::{
     BinOp, Eqn, ExecutionValidationFailure, Graph, MAX_VALIDATION_PACKET_BYTES, OpKind, Operand,
-    Storage, ValidationId, ValidationOutput, ValidationOutputs, ValueId, ValueMeta,
+    Storage, ValidationId, ValidationOutput, ValidationOutputs, ValueId, ValueMeta, ValueTable,
 };
 use poot_graph_plan::{collapse_reshape_chains, cse, dce, elide_noop_transposes, fuse};
 use poot_models::model::{LogitRows, Phase};
@@ -98,8 +98,7 @@ fn qwen2_value_preserving_transforms_keep_validation_bits() {
         "four witnesses of {lanes} lanes must fit the packet"
     );
     let mut append = |op: BinOp, left: ValueId, right: ValueId| -> ValueId {
-        let out = traced.values.len();
-        traced.values.push(ValueMeta::new(
+        let out = traced.values.push(ValueMeta::new(
             traced.aval(h).clone(),
             Storage::Device,
             None,
@@ -150,7 +149,7 @@ fn qwen2_value_preserving_transforms_keep_validation_bits() {
                     vec![0i32; graph.aval(value).numel()]
                 } else {
                     (0..graph.aval(value).numel())
-                        .map(|lane| ((value.wrapping_mul(17) + lane * 13) % 11) as i32 - 5)
+                        .map(|lane| ((value.index().wrapping_mul(17) + lane * 13) % 11) as i32 - 5)
                         .collect()
                 };
                 HostTensor::i32(shape, ints)
@@ -160,7 +159,8 @@ fn qwen2_value_preserving_transforms_keep_validation_bits() {
                 } else {
                     (0..graph.aval(value).numel())
                         .map(|lane| {
-                            let centered = ((value.wrapping_mul(17) + lane * 13) % 11) as f32 - 5.0;
+                            let centered =
+                                ((value.index().wrapping_mul(17) + lane * 13) % 11) as f32 - 5.0;
                             centered * 0.01
                         })
                         .collect()
@@ -183,7 +183,7 @@ fn qwen2_value_preserving_transforms_keep_validation_bits() {
             EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
         )
         .expect("validation-bearing graph evaluates");
-        let environment: Vec<Option<HostTensor>> = result
+        let environment: ValueTable<Option<HostTensor>> = result
             .environment
             .expect("keep_environment was set")
             .into_iter()

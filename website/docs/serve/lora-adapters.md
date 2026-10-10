@@ -12,11 +12,11 @@ request that names no adapter runs the base model unchanged.
 
 ## Administration routes
 
-| Request | Effect |
-| ------- | ------ |
-| `GET /v1/lora_adapters` | Lists the loaded adapters: `{"object": "list", "data": [{"name", "index"}]}`. |
+| Request                                          | Effect                                                                                                        |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------- |
+| `GET /v1/lora_adapters`                          | Lists the loaded adapters: `{"object": "list", "data": [{"name", "index"}]}`.                                 |
 | `POST /v1/lora_adapters` with `{"name", "path"}` | Loads the PEFT adapter directory at `path` (`adapter_config.json` and `adapter_model.safetensors`) as `name`. |
-| `DELETE /v1/lora_adapters/{name}` | Unloads `name`. |
+| `DELETE /v1/lora_adapters/{name}`                | Unloads `name`.                                                                                               |
 
 The operations run on the engine thread, which runs them with no request in flight. A load captures every loaded
 adapter plus the new one as a new generation and prepares its entries for the shapes the server prepared; the
@@ -27,8 +27,9 @@ cannot be unloaded because running requests hold it (retry later); `503` when th
 take the new generation.
 
 The routes keep their trust policy: on a loopback listener they are open to local processes, on a non-loopback
-listener they are disabled unless `POOT_LORA_ADMIN_KEY` is set, and then every request under `/v1/lora_adapters`
-needs that bearer token. Inference stays unauthenticated.
+listener they are disabled unless `--lora-admin-key-file` names a file holding a bearer token, and then every
+request under `/v1/lora_adapters` needs that token, on a loopback listener too. The key is read from the file once
+at startup, so it never appears in the process arguments. Inference stays unauthenticated.
 
 ## Selecting an adapter
 

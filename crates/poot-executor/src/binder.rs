@@ -31,6 +31,7 @@ use poot_target::BufferStorage;
 use poot_tensor::{DType, HostView};
 
 use crate::error::{BindError, LoadError};
+use crate::lanes::{EncodeError, Encoding, first_non_finite_f16};
 
 /// One entry slot: the structured key a step input matches by, its declared type, and the device
 /// lane the planner chose for it.
@@ -94,7 +95,7 @@ pub(crate) struct StoredSpan {
     pub generation: StoreGeneration,
     pub role: Option<SourceRole>,
     pub bytes: Range<usize>,
-    /// The bytes are an I64 table read as I32 ([`WeightView::IndexNarrow`]): [`WeightBinder::read`]
+    /// The bytes are an I64 table read as I32 ([`WeightView::IndexNarrow`]): [`WeightWriter`]
     /// narrows each word. The map range-checked the table against this very entry when it was built.
     pub narrowed: bool,
 }
@@ -119,8 +120,8 @@ pub(crate) struct ConstBytes {
 }
 
 impl ConstBytes {
-    /// The length of [`WeightBinder::read`]'s result, from the spans alone: a planning pass sizes an upload
-    /// without reading the store.
+    /// The length of the stored stream (a [`WeightWriter`]'s source), from the spans alone: a planning pass
+    /// sizes an upload without reading the store.
     pub fn stored_len(&self) -> usize {
         match self.stored {
             // Every expert's run is padded to the slab stride.
@@ -137,6 +138,118 @@ impl ConstBytes {
                     }
                 })
                 .sum(),
+        }
+    }
+}
+
+/// The stored bytes `span` names, as the store holds them (an I64 table is still I64 here).
+fn stored_bytes<'s>(store: &'s WeightStore, span: &StoredSpan) -> &'s [u8] {
+    let stored = match (store.get(span.key.as_str()), span.role) {
+        (Some(WeightEntry::Dense(dense)), None) => dense.bytes().as_slice(),
+        (Some(WeightEntry::Packed(payload)), Some(role)) => payload.bytes(role),
+        _ => unreachable!("a span is built from the store it reads"),
+    };
+    &stored[span.bytes.clone()]
+}
+
+impl StoredSpan {
+    /// The bytes this span contributes to the stored stream: a narrowed I64 table is half as long.
+    fn data_len(&self) -> usize {
+        if self.narrowed {
+            self.bytes.len() / 2
+        } else {
+            self.bytes.len()
+        }
+    }
+}
+
+/// One weight const on its way to the device: its spans, back to back (a stacked source's runs each
+/// followed by zeros to the slab stride, so expert `e` starts at byte `e * slab_bytes`), landed in the planned
+/// lane by [`lanes::encode_range`](crate::lanes::encode_range). It reads the store's views straight into
+/// the buffers a [`Device::write_with`](crate::Device::write_with) hands out: no intermediate copy of the
+/// weight is built (dmap.md section 6.1).
+pub(crate) struct WeightWriter {
+    /// The store the spans read, shared with the binder: the writer borrows nothing, so the engine builds it
+    /// once per weight and keeps it across the device allocation.
+    store: Arc<WeightStore>,
+    spans: Vec<StoredSpan>,
+    /// Each span's first byte in the stored stream.
+    starts: Vec<usize>,
+    encoding: Encoding,
+    shape: Vec<usize>,
+    /// The stored stream's length without a stack's last slab padding.
+    data_len: usize,
+}
+
+impl WeightWriter {
+    /// The bytes the device is handed (the encoded length; what the lane holds past it is its zeros).
+    pub fn len(&self) -> usize {
+        crate::lanes::encoded_len(self.encoding, &self.shape, self.data_len)
+    }
+
+    /// A packed-F16 weight holding an infinity or NaN is refused before any byte is written: the
+    /// generated bodies decode the packed binary16 lane over its finite domain only (Card 1007).
+    pub fn check_encodable(&self) -> Result<(), EncodeError> {
+        if self.encoding != Encoding::PackedWordsFiniteF16 {
+            return Ok(());
+        }
+        let mut base = 0;
+        for span in &self.spans {
+            if let Some((index, bits)) = first_non_finite_f16(stored_bytes(&self.store, span)) {
+                return Err(EncodeError::NonFiniteF16 {
+                    index: base + index,
+                    bits,
+                });
+            }
+            base += span.bytes.len() / 2;
+        }
+        Ok(())
+    }
+
+    /// Encoded bytes `range` into `out` (`out.len() == range.len()`): any sub-range, since every encoding
+    /// is element- or row-local. Writes every byte of `out`.
+    pub fn fill(&self, range: Range<usize>, out: &mut [u8]) {
+        crate::lanes::encode_range(
+            self.encoding,
+            &self.shape,
+            self.data_len,
+            range,
+            &mut |stored, into| self.read_stream(stored, into),
+            out,
+        );
+    }
+
+    /// Stored-stream bytes `range` into `out`; a slab gap is zeros.
+    fn read_stream(&self, range: Range<usize>, out: &mut [u8]) {
+        out.fill(0);
+        let first = self
+            .starts
+            .partition_point(|&start| start <= range.start)
+            .saturating_sub(1);
+        for (span, &start) in self.spans.iter().zip(&self.starts).skip(first) {
+            if start >= range.end {
+                break;
+            }
+            let end = start + span.data_len();
+            let (lo, hi) = (range.start.max(start), range.end.min(end));
+            if lo >= hi {
+                continue;
+            }
+            let into = &mut out[lo - range.start..hi - range.start];
+            let stored = stored_bytes(&self.store, span);
+            if span.narrowed {
+                // Output word `w` of the I32 stream is stored word `w` of the I64 table.
+                for (offset, byte) in (lo - start..hi - start).zip(into.iter_mut()) {
+                    let (word, lane) = (offset / 4, offset % 4);
+                    let wide =
+                        i64::from_le_bytes(stored[word * 8..word * 8 + 8].try_into().unwrap());
+                    let value = i32::try_from(wide)
+                        .expect("WeightMapBuilder::map range-checked this table against the store");
+                    *byte = value.to_le_bytes()[lane];
+                }
+            } else {
+                into.copy_from_slice(&stored[lo - start..hi - start]);
+            }
         }
     }
 }
@@ -205,6 +318,8 @@ enum Part {
     Rows(WeightKey, Range<usize>),
     /// A whole I64 index table read as I32.
     Narrowed(WeightKey),
+    /// The range `cols` of axis `axis` (at least 1) of an entry: one byte run per outer index.
+    Columns(WeightKey, usize, Range<usize>),
 }
 
 /// A graph name resolved to the store: the parts its view reads, in order, the format and logical
@@ -256,6 +371,12 @@ impl WeightBinder {
         Self { store, map, ids }
     }
 
+    /// The store's mapped checkpoint files are still the files that were loaded (one `fstat` per
+    /// file): the boundary before a bind batch reads the store's views.
+    pub fn check_sources(&self) -> Result<(), LoadError> {
+        Ok(self.store.check_sources()?)
+    }
+
     fn entry(&self, value: ValueId, name: &str, key: &str) -> Result<&WeightEntry, LoadError> {
         self.store.get(key).ok_or_else(|| LoadError::Unbound {
             value,
@@ -291,6 +412,9 @@ impl WeightBinder {
                 vec![Part::Rows(key.clone(), rows.clone())]
             }
             WeightView::IndexNarrow(key) => vec![Part::Narrowed(key.clone())],
+            WeightView::BlockColumns { key, axis, cols } => {
+                vec![Part::Columns(key.clone(), *axis, cols.clone())]
+            }
         };
         let experts = matches!(view, WeightView::ExpertStack(_)).then_some(parts.len());
         Ok(Located {
@@ -365,6 +489,8 @@ impl WeightBinder {
                 }
                 // A narrowed table is read whole: a chunk of it would split a derived buffer.
                 Part::Narrowed(_) => return Err(shape_error()),
+                // A column cut is a strided set of runs, not a row range.
+                Part::Columns(..) => return Err(shape_error()),
             };
             let span = held..held + rows.len();
             held = span.end;
@@ -435,8 +561,9 @@ impl WeightBinder {
         let spans = located
             .parts
             .iter()
-            .map(|part| self.span(value, name, part, located.role))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|part| self.spans(value, name, part, located.role))
+            .collect::<Result<Vec<_>, _>>()?
+            .concat();
         // A stacked source's length was checked against its padded type above; each expert's own bytes were
         // checked against the store entry by `span`.
         if stored == StoredAs::PackedSource {
@@ -452,20 +579,25 @@ impl WeightBinder {
         Ok(ConstBytes { spans, stored })
     }
 
-    /// `part`'s byte run in its entry (in source `role` of a packed one). A row run is whole stored
+    /// `part`'s byte runs in its entry (in source `role` of a packed one). A row run is whole stored
     /// rows: a dense row's elements, or a block format's run of `K / block_values` blocks (a planar
-    /// source has no byte rows, and a map refuses a row range of one).
-    fn span(
+    /// source has no byte rows, and a map refuses a row range of one). A column range is one run per
+    /// outer index: a dense entry's elements, or a block format's blocks of each row.
+    fn spans(
         &self,
         value: ValueId,
         name: &str,
         part: &Part,
         role: Option<SourceRole>,
-    ) -> Result<StoredSpan, LoadError> {
+    ) -> Result<Vec<StoredSpan>, LoadError> {
         let key = match part {
-            Part::Whole(key) | Part::Rows(key, _) | Part::Narrowed(key) => key,
+            Part::Whole(key)
+            | Part::Rows(key, _)
+            | Part::Narrowed(key)
+            | Part::Columns(key, ..) => key,
         };
-        let (len, row_bytes) = match (self.entry(value, name, key.as_str())?, role) {
+        let entry = self.entry(value, name, key.as_str())?;
+        let (len, row_bytes) = match (entry, role) {
             (WeightEntry::Dense(dense), None) => {
                 let len = dense.bytes().len();
                 (len, dense.shape().first().map(|&rows| len / rows.max(1)))
@@ -484,21 +616,51 @@ impl WeightBinder {
                 });
             }
         };
-        let bytes = match part {
-            Part::Whole(_) | Part::Narrowed(_) => 0..len,
+        let runs: Vec<Range<usize>> = match part {
+            Part::Whole(_) | Part::Narrowed(_) => std::iter::once(0..len).collect(),
             Part::Rows(_, rows) => {
                 let row_bytes =
                     row_bytes.ok_or(LoadError::Unimplemented("a row range of a planar source"))?;
-                rows.start * row_bytes..rows.end * row_bytes
+                std::iter::once(rows.start * row_bytes..rows.end * row_bytes).collect()
             }
+            Part::Columns(_, axis, cols) => match (entry, role) {
+                (WeightEntry::Dense(dense), None) => {
+                    let shape = dense.shape();
+                    let numel: usize = shape.iter().product::<usize>().max(1);
+                    let unit = len / numel;
+                    let outer: usize = shape[..*axis].iter().product();
+                    let extent = shape[*axis];
+                    let inner: usize = shape[*axis + 1..].iter().product::<usize>() * unit;
+                    (0..outer)
+                        .map(|o| {
+                            let row = o * extent;
+                            (row + cols.start) * inner..(row + cols.end) * inner
+                        })
+                        .collect()
+                }
+                (WeightEntry::Packed(payload), Some(SourceRole::Blocks)) => {
+                    let weight = payload.weight();
+                    let poot_quant::format::Storage::Blocks(layout) =
+                        weight.format().descriptor().storage
+                    else {
+                        return Err(LoadError::Unimplemented(
+                            "a column range of a planar source",
+                        ));
+                    };
+                    let row_bytes = row_bytes.expect("a blocks source has byte rows");
+                    let first = cols.start / layout.values * layout.bytes;
+                    let last = cols.end / layout.values * layout.bytes;
+                    (0..weight.shape()[0])
+                        .map(|row| row * row_bytes + first..row * row_bytes + last)
+                        .collect()
+                }
+                _ => {
+                    return Err(LoadError::Unimplemented(
+                        "a column range of a planar source",
+                    ));
+                }
+            },
         };
-        if bytes.end > len {
-            return Err(LoadError::WeightShape {
-                name: name.to_string(),
-                stored: vec![len],
-                declared: vec![bytes.end],
-            });
-        }
         let generation = self
             .store
             .generation(key.as_str())
@@ -506,45 +668,64 @@ impl WeightBinder {
                 value,
                 name: name.to_string(),
             })?;
-        Ok(StoredSpan {
-            key: key.clone(),
-            generation,
-            role,
-            bytes,
-            narrowed: matches!(part, Part::Narrowed(_)),
-        })
+        runs.into_iter()
+            .map(|bytes| {
+                if bytes.end > len {
+                    return Err(LoadError::WeightShape {
+                        name: name.to_string(),
+                        stored: vec![len],
+                        declared: vec![bytes.end],
+                    });
+                }
+                Ok(StoredSpan {
+                    key: key.clone(),
+                    generation,
+                    role,
+                    bytes,
+                    narrowed: matches!(part, Part::Narrowed(_)),
+                })
+            })
+            .collect()
     }
 
-    /// `bytes`' stored runs, back to back; a stacked source's runs are each padded with zeros to the slab
-    /// stride, so expert `e` starts at byte `e * slab_bytes`.
-    pub fn read(&self, bytes: &ConstBytes) -> Vec<u8> {
-        let slab = match bytes.stored {
-            StoredAs::PackedStackSource { slab_bytes } => Some(slab_bytes),
-            StoredAs::Dense(_) | StoredAs::PackedSource => None,
+    /// The writer that lands `bytes` (a const of logical `shape`, planned in `storage`) in its device
+    /// lane, a byte range at a time. A dense const with no encoding into `storage` is
+    /// [`EncodeError::NoEncoding`].
+    pub fn writer(
+        &self,
+        bytes: &ConstBytes,
+        shape: &[usize],
+        storage: BufferStorage,
+    ) -> Result<WeightWriter, EncodeError> {
+        let encoding = match bytes.stored {
+            StoredAs::Dense(dtype) => {
+                crate::lanes::encoding_of(dtype, storage).ok_or(EncodeError::NoEncoding)?
+            }
+            // A packed source is its stored bytes as little-endian `u32` words (dquant.md D9).
+            StoredAs::PackedSource | StoredAs::PackedStackSource { .. } => Encoding::PackedWords,
         };
-        let spans = &bytes.spans;
-        let mut out = Vec::with_capacity(spans.iter().map(|span| span.bytes.len()).sum());
-        for (index, span) in spans.iter().enumerate() {
-            let stored = match (self.store.get(span.key.as_str()), span.role) {
-                (Some(WeightEntry::Dense(dense)), None) => dense.bytes().as_slice(),
-                (Some(WeightEntry::Packed(payload)), Some(role)) => payload.bytes(role),
-                _ => unreachable!("a span is built from the store it reads"),
+        let mut starts = Vec::with_capacity(bytes.spans.len());
+        let mut next = 0;
+        for span in &bytes.spans {
+            starts.push(next);
+            next += match bytes.stored {
+                StoredAs::PackedStackSource { slab_bytes } => slab_bytes,
+                _ => span.data_len(),
             };
-            let stored = &stored[span.bytes.clone()];
-            if span.narrowed {
-                out.extend(stored.as_chunks::<8>().0.iter().flat_map(|word| {
-                    let value = i32::try_from(i64::from_le_bytes(*word))
-                        .expect("WeightMapBuilder::map range-checked this table against the store");
-                    value.to_le_bytes()
-                }));
-            } else {
-                out.extend_from_slice(stored);
-            }
-            if let Some(slab) = slab {
-                out.resize((index + 1) * slab, 0);
-            }
         }
-        out
+        // A stack's last slab is padded to the stride: that padding is the allocation's zeros, not data.
+        let data_len = bytes
+            .spans
+            .last()
+            .map_or(0, |last| starts[starts.len() - 1] + last.data_len());
+        Ok(WeightWriter {
+            store: Arc::clone(&self.store),
+            spans: bytes.spans.clone(),
+            starts,
+            encoding,
+            shape: shape.to_vec(),
+            data_len,
+        })
     }
 
     /// Where the hosted embed gather named `name` (the `Slot::TokenEmbed` input `value`, declared
@@ -594,8 +775,8 @@ impl WeightBinder {
                     let rows = self.entry(value, name, key.as_str())?.shape()[0];
                     Ok(RowRun { key, rows: 0..rows })
                 }
-                // An index table is no embedding.
-                Part::Narrowed(_) => Err(shape_error()),
+                // An index table is no embedding, and a column cut is no row run.
+                Part::Narrowed(_) | Part::Columns(..) => Err(shape_error()),
             })
             .collect::<Result<Vec<_>, LoadError>>()?;
         Ok(EmbedRows {
@@ -684,6 +865,17 @@ mod tests {
 
     use super::*;
 
+    /// The stored stream of a packed const: its spans back to back, a stack's runs padded to the slab stride
+    /// (what [`WeightWriter`] reads, whole).
+    fn stored_stream(binder: &WeightBinder, bytes: &ConstBytes) -> Vec<u8> {
+        let writer = binder
+            .writer(bytes, &[], BufferStorage::i32())
+            .expect("a packed source has an encoding");
+        let mut out = vec![0u8; bytes.stored_len()];
+        writer.read_stream(0..out.len(), &mut out);
+        out
+    }
+
     /// Three Q8_0 experts of `out = 3, K = 32`: 102 bytes each (3 rows of one 34-byte block), not a whole
     /// number of `u32` words, viewed as the stack `id`.
     fn q8_stack() -> (WeightBinder, WeightId, Vec<Arc<PackedPayload>>) {
@@ -725,7 +917,7 @@ mod tests {
     /// one const per source role whose bytes are the experts back to back, each padded with zeros to the word
     /// stride (104 bytes), so expert `e` starts at byte `104 * e`. The padded type is the graph's declared
     /// carrier type; the declared per-expert type is refused by name. Mutation: drop the per-expert padding in
-    /// [`WeightBinder::read`]; the table is 306 bytes, expert 1 starts at byte 102 and every offset check goes
+    /// [`WeightWriter::read_stream`]; the table is 306 bytes, expert 1 starts at byte 102 and every offset check goes
     /// red.
     #[test]
     fn an_unaligned_expert_table_binds_one_const_with_word_padded_slabs() {
@@ -737,7 +929,7 @@ mod tests {
         let name = PackedSourceName::new(&id.const_name(), role);
         let declared = packed_stack_source_type(weight, 3, role);
         let bytes = binder
-            .const_bytes(0, name.as_str(), &declared, None)
+            .const_bytes(ValueId::new(0), name.as_str(), &declared, None)
             .expect("the stacked source binds");
         assert_eq!(
             bytes.stored,
@@ -748,7 +940,7 @@ mod tests {
             3,
             "one run per expert, one const per role"
         );
-        let table = binder.read(&bytes);
+        let table = stored_stream(&binder, &bytes);
         assert_eq!(table.len(), 3 * 104);
         assert_eq!(bytes.stored_len(), table.len());
         for (e, expert) in experts.iter().enumerate() {
@@ -759,9 +951,104 @@ mod tests {
 
         let per_expert = poot_graph_ir::packed_source_type(weight, role);
         assert!(matches!(
-            binder.const_bytes(0, name.as_str(), &per_expert, None),
+            binder.const_bytes(ValueId::new(0), name.as_str(), &per_expert, None),
             Err(LoadError::WeightShape { .. })
         ));
+    }
+
+    /// POOT-1100 LP-4: a stack's writer fills any chunking of its range with the transport layout of
+    /// `packed_source_words` over the slab-padded stream: each expert at its `slab_bytes` stride, the word
+    /// padding between slabs zero, however the destination range is cut. Every chunk is handed pre-filled with
+    /// garbage, so a gap the writer leaves unwritten shows.
+    /// Mutation: drop the `out.fill(0)` that opens `WeightWriter::read_stream`; the gaps keep the garbage and
+    /// this row goes red.
+    #[test]
+    fn a_stack_writer_fills_any_chunking_with_zero_gaps() {
+        let (binder, id, experts) = q8_stack();
+        let weight = PackedWeight::try_new(WeightFormat::Q8_0, [3, 32]).unwrap();
+        let role = SourceRole::Blocks;
+        let name = PackedSourceName::new(&id.const_name(), role);
+        let declared = packed_stack_source_type(weight, 3, role);
+        let bytes = binder
+            .const_bytes(ValueId::new(0), name.as_str(), &declared, None)
+            .expect("the stacked source binds");
+        let writer = binder
+            .writer(&bytes, &[], BufferStorage::i32())
+            .expect("a packed source has an encoding");
+        let transport: Vec<u8> = poot_quant::packed_source_words(&stored_stream(&binder, &bytes))
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let len = writer.len();
+        assert!(len <= transport.len());
+        assert!(
+            transport[len..].iter().all(|&b| b == 0),
+            "what the writer leaves out is the allocation's zeros"
+        );
+        for chunk in [1usize, 3, 7, 104, 1000] {
+            let mut out = vec![0xAAu8; len];
+            let mut at = 0;
+            while at < len {
+                let n = chunk.min(len - at);
+                writer.fill(at..at + n, &mut out[at..at + n]);
+                at += n;
+            }
+            assert_eq!(out, transport[..len], "chunks of {chunk}");
+        }
+        for (e, expert) in experts.iter().enumerate() {
+            let mut slab = vec![0xAAu8; 104];
+            writer.fill(e * 104..(e + 1) * 104, &mut slab);
+            assert_eq!(&slab[..102], expert.bytes(role), "expert {e}");
+            assert_eq!(&slab[102..], [0, 0], "expert {e}'s word padding");
+        }
+    }
+
+    /// POOT-1100: an I64 table read through `IndexNarrow` is written as the I32 table it narrows to, in any
+    /// chunking, including a chunk that starts in the middle of a word (negatives and the I32 bounds included).
+    /// Mutation: write the low byte of every narrowed word at lane 0 regardless of `offset % 4` (drop the `lane`
+    /// index in `read_stream`); every chunking that cuts a word goes red.
+    #[test]
+    fn a_narrowed_index_table_is_written_as_i32_in_any_chunking() {
+        let words = [0i64, 7, -3, i64::from(i32::MAX), i64::from(i32::MIN), 42];
+        let raw: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut store = WeightStore::builder();
+        store
+            .insert(
+                "t",
+                WeightEntry::Dense(
+                    poot_quant::weights::DenseWeight::try_new(DType::I64, vec![3, 2], raw.into())
+                        .unwrap(),
+                ),
+            )
+            .unwrap();
+        let store = Arc::new(store.build());
+        let id = WeightId::layer(0, WeightRole::Moe(MoeRole::HashTable));
+        let mut map = WeightMap::builder(&store);
+        map.map(id, WeightView::IndexNarrow(WeightKey::from("t")))
+            .unwrap();
+        let binder = WeightBinder::new(Arc::clone(&store), Arc::new(map.build()));
+        let declared = TensorType::new(vec![3, 2], DType::I32);
+        let bytes = binder
+            .const_bytes(ValueId::new(0), &id.const_name(), &declared, None)
+            .expect("the narrowed table binds");
+        let writer = binder
+            .writer(&bytes, &[3, 2], BufferStorage::i32())
+            .expect("an I32 table lands verbatim");
+        let expected: Vec<u8> = words
+            .iter()
+            .flat_map(|&w| (w as i32).to_le_bytes())
+            .collect();
+        assert_eq!(writer.len(), expected.len());
+        for chunk in [1usize, 3, 4, 5, 24] {
+            let mut out = vec![0xAAu8; expected.len()];
+            let mut at = 0;
+            while at < out.len() {
+                let n = chunk.min(out.len() - at);
+                writer.fill(at..at + n, &mut out[at..at + n]);
+                at += n;
+            }
+            assert_eq!(out, expected, "chunks of {chunk}");
+        }
     }
 
     /// SC-004 (card 1067): a `{source}.chunkN` const of a packed expert stack (legalize's split of a table over the
@@ -780,15 +1067,18 @@ mod tests {
         let chunk_names = [format!("{parent}.chunk0"), format!("{parent}.chunk1")];
         let shape_of = |experts: usize| packed_stack_source_type(weight, experts, role);
         let declared = [shape_of(2), shape_of(1)];
-        let placed = chunks(
-            chunk_names
-                .iter()
-                .zip(&declared)
-                .enumerate()
-                .map(|(value, (name, aval))| (value, name.as_str(), aval.shape.as_slice())),
-        )
+        let placed = chunks(chunk_names.iter().zip(&declared).enumerate().map(
+            |(value, (name, aval))| {
+                (
+                    ValueId::new(value as u32),
+                    name.as_str(),
+                    aval.shape.as_slice(),
+                )
+            },
+        ))
         .unwrap();
         for (index, (name, aval)) in chunk_names.iter().zip(&declared).enumerate() {
+            let index = ValueId::new(index as u32);
             let bytes = binder
                 .const_bytes(index, name, aval, placed.get(&index))
                 .expect("the chunk binds");
@@ -796,8 +1086,8 @@ mod tests {
                 bytes.stored,
                 StoredAs::PackedStackSource { slab_bytes: 104 }
             );
-            let table = binder.read(&bytes);
-            let first = [0, 2][index];
+            let table = stored_stream(&binder, &bytes);
+            let first = [0, 2][index.index()];
             assert_eq!(table.len(), aval.shape[0] * 104, "chunk {index}");
             for (offset, expert) in experts[first..first + aval.shape[0]].iter().enumerate() {
                 let slab = &table[offset * 104..(offset + 1) * 104];
@@ -818,7 +1108,7 @@ mod tests {
             rows: 2..4,
         };
         assert!(matches!(
-            binder.const_bytes(0, &chunk_names[1], &tall, Some(&past_the_end)),
+            binder.const_bytes(ValueId::new(0), &chunk_names[1], &tall, Some(&past_the_end)),
             Err(LoadError::WeightShape { .. })
         ));
     }

@@ -80,6 +80,12 @@ impl PtxDevice {
         Ok(Self::with_context(PtxContext::new_with_device_timing()?))
     }
 
+    /// A device on GPU `ordinal`: one of the devices a [`poot_executor::Coordinator`] drives. Several
+    /// may live on one host thread.
+    pub fn open(ordinal: usize) -> Result<Self, PtxGpuError> {
+        Ok(Self::with_context(PtxContext::open(ordinal)?))
+    }
+
     fn with_context(ctx: PtxContext) -> Self {
         Self {
             ctx,
@@ -211,8 +217,14 @@ impl Device for PtxDevice {
         Ok(())
     }
 
-    fn write(&mut self, dst: &PtxBuffer, offset: usize, bytes: &[u8]) -> Result<(), PtxGpuError> {
-        Ok(self.ctx.write_bytes(dst, offset, bytes)?)
+    fn write_with(
+        &mut self,
+        dst: &PtxBuffer,
+        offset: usize,
+        len: usize,
+        fill: &mut dyn FnMut(std::ops::Range<usize>, &mut [u8]),
+    ) -> Result<(), PtxGpuError> {
+        Ok(self.ctx.write_with(dst, offset, len, fill)?)
     }
 
     fn read(&mut self, src: &PtxBuffer, out: &mut [u8]) -> Result<(), PtxGpuError> {

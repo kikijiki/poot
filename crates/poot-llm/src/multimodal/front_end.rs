@@ -25,6 +25,11 @@ use crate::driver::{
 use crate::error::TextError;
 use crate::text::tokenize::TextCodec;
 
+use super::{
+    ChatTurn, ImageCheckpoint, ImageCheckpointError, ImageFrontEnd, ImageRequestError,
+    MultimodalPrompt,
+};
+
 /// Upper bound on a decoded image's pixel count, guarding against a decompression bomb (a tiny file
 /// that decodes to huge dimensions, blowing up the `w*h*3` RGB buffer and its f32 expansion). About 32
 /// megapixels is far above any real SmolVLM input. The `image` crate's default limits are not honored
@@ -49,6 +54,12 @@ pub enum FrontEndError {
     },
     #[error("a caption needs at least one image")]
     NoImage,
+    #[error("the turns carry {turns} images but {images} were given")]
+    TurnImages { turns: usize, images: usize },
+    #[error(
+        "the rendered conversation holds {marks} <image> marks for {images} images: a turn's text must not spell <image>"
+    )]
+    ImageMarks { marks: usize, images: usize },
     #[error(
         "too many image frames ({frames}+); at most {MAX_FRAMES} (idefics3 tiles each image into 17 to 34 frames)"
     )]
@@ -172,14 +183,50 @@ fn image_block(rows: usize, cols: usize, tokens: usize) -> String {
     block
 }
 
-/// The chat turn of one or more images and a question: each image's block, in order, before the
-/// question. `grids` is one `(rows, cols)` tile grid per image.
-fn caption_prompt(question: &str, grids: &[(usize, usize)], tokens: usize) -> String {
-    let blocks: String = grids
-        .iter()
-        .map(|&(rows, cols)| image_block(rows, cols, tokens))
-        .collect();
-    format!("<|im_start|>User:{blocks}{question}<end_of_utterance>\nAssistant:")
+/// What the chat template renders for one image part, and the token the checkpoint registers for it.
+/// Each occurrence in the rendered conversation is replaced by that image's block.
+const IMAGE_MARK: &str = "<image>";
+
+/// The turn as an idefics3 chat-template message: content parts, images first.
+fn turn_message(turn: &ChatTurn<'_>) -> serde_json::Value {
+    let mut content = vec![serde_json::json!({ "type": "image" }); turn.images];
+    content.push(serde_json::json!({ "type": "text", "text": turn.text }));
+    serde_json::json!({ "role": turn.role, "content": content })
+}
+
+/// The conversation as the checkpoint's own chat template renders it, ready for the assistant to
+/// answer, with one `<image>` per image part. A model with no template cannot place an image in a
+/// turn, so there is no fallback format.
+fn render_conversation(text: &TextCodec, turns: &[ChatTurn<'_>]) -> Result<String, FrontEndError> {
+    let messages: Vec<_> = turns.iter().map(turn_message).collect();
+    Ok(text.render_template_chat(&serde_json::Value::Array(messages))?)
+}
+
+/// Replace the `k`-th `<image>` of `rendered` with the `k`-th image's block. `grids` is one
+/// `(rows, cols)` tile grid per image. The rendered conversation must hold exactly one `<image>` per
+/// image: a turn's text that spells `<image>` would otherwise take another image's rows.
+fn expand_images(
+    rendered: &str,
+    grids: &[(usize, usize)],
+    tokens: usize,
+) -> Result<String, FrontEndError> {
+    let marks = rendered.matches(IMAGE_MARK).count();
+    if marks != grids.len() {
+        return Err(FrontEndError::ImageMarks {
+            marks,
+            images: grids.len(),
+        });
+    }
+    let mut prompt = String::with_capacity(rendered.len());
+    let mut rest = rendered;
+    for &(rows, cols) in grids {
+        let (before, after) = rest.split_once(IMAGE_MARK).expect("the marks were counted");
+        prompt.push_str(before);
+        prompt.push_str(&image_block(rows, cols, tokens));
+        rest = after;
+    }
+    prompt.push_str(rest);
+    Ok(prompt)
 }
 
 /// What the front end reads of a checkpoint's `config.json`.
@@ -331,17 +378,17 @@ fn section(store: &WeightStore, prefix: &str, to: &str, keep: &[&str]) -> Weight
     out.build()
 }
 
-/// One image to caption alongside the question that asks about it.
+/// The images of a conversation to caption, and the turns that carry them.
 #[derive(Clone, Copy, Debug)]
 pub struct CaptionRequest<'a> {
     pub images: &'a [Image<'a>],
-    pub question: &'a str,
+    pub turns: &'a [ChatTurn<'a>],
     pub max_new: usize,
 }
 
 /// A SmolVLM checkpoint read from its directory: the two towers' handles over the one set of weights,
 /// and the facts of its image pipeline. Nothing is on a device yet; the image side
-/// ([`ImageFrontEnd`]) and the text side (a [`Driver`] over [`Idefics3Checkpoint::text`]) are opened from it.
+/// ([`Idefics3FrontEnd`]) and the text side (a [`Driver`] over [`Idefics3Checkpoint::text`]) are opened from it.
 pub struct Idefics3Checkpoint {
     vision: Arc<ModelHandle>,
     text: Arc<ModelHandle>,
@@ -409,23 +456,13 @@ impl Idefics3Checkpoint {
         })
     }
 
-    /// The text tower: the model a server generates with, and the codec that tokenizes prompts.
-    pub fn text(&self) -> &Arc<ModelHandle> {
-        &self.text
-    }
-
-    /// The positions the vision tower's driver needs: the patches of one frame.
-    pub fn patches(&self) -> usize {
-        self.patches
-    }
-
     /// Open the image side on `vision`'s executor: the vision tower's driver beside whatever drives
-    /// the text tower.
+    /// the text tower. Inherent, not only the trait's, because [`Idefics3`] holds the concrete type.
     pub fn front_end(
         &self,
         vision: (Box<dyn poot_executor::Executor>, DriverOptions),
-    ) -> Result<ImageFrontEnd, FrontEndError> {
-        Ok(ImageFrontEnd {
+    ) -> Result<Idefics3FrontEnd, FrontEndError> {
+        Ok(Idefics3FrontEnd {
             vision: Driver::new(Arc::clone(&self.vision), vision.0, vision.1)?,
             text: Arc::clone(&self.text),
             preprocess: self.preprocess,
@@ -439,7 +476,7 @@ impl Idefics3Checkpoint {
 /// The image side of a SmolVLM: preprocessing, the vision tower on its own driver, and the prompt
 /// whose `<image>` placeholders the tower's rows replace. It produces what any text driver takes
 /// (token ids and [`PromptEmbeds`]); it never generates.
-pub struct ImageFrontEnd {
+pub struct Idefics3FrontEnd {
     vision: Driver,
     text: Arc<ModelHandle>,
     preprocess: PreprocessConfig,
@@ -448,7 +485,7 @@ pub struct ImageFrontEnd {
     visual_tokens: usize,
 }
 
-impl ImageFrontEnd {
+impl Idefics3FrontEnd {
     /// The vision tower's driver, for its stats and caps.
     pub fn vision(&self) -> &Driver {
         &self.vision
@@ -482,17 +519,25 @@ impl ImageFrontEnd {
         Ok(rows)
     }
 
-    /// The prompt tokens and embedding rows for `images` and `question`: preprocess each image into
-    /// idefics3 frames, encode the frames, and build the prompt whose `<image>` placeholders the
-    /// frames' rows replace. The text driver serves it alone ([`Idefics3::caption`]) or beside other
+    /// The prompt tokens and embedding rows for the conversation `turns` and its `images` (in the order
+    /// of the turns): render the turns through the checkpoint's chat template, preprocess each image
+    /// into idefics3 frames, encode the frames, and expand each image's mark into the block whose
+    /// `<image>` placeholders the frames' rows replace. The text driver serves it alone ([`Idefics3::caption`]) or beside other
     /// requests' prompts (`Driver::open_with_embeds` on a paged pool).
-    pub fn prepare(
+    pub fn prepare_decoded(
         &mut self,
         images: &[Image<'_>],
-        question: &str,
-    ) -> Result<CaptionPrompt, FrontEndError> {
+        turns: &[ChatTurn<'_>],
+    ) -> Result<MultimodalPrompt, FrontEndError> {
         if images.is_empty() {
             return Err(FrontEndError::NoImage);
+        }
+        let in_turns: usize = turns.iter().map(|turn| turn.images).sum();
+        if in_turns != images.len() {
+            return Err(FrontEndError::TurnImages {
+                turns: in_turns,
+                images: images.len(),
+            });
         }
         // Every image splits into its own frames (aspect-preserving tiles and a global thumbnail);
         // the prompt has one block per image, so its `<image>` count is the frames times the
@@ -510,10 +555,11 @@ impl ImageFrontEnd {
                 });
             }
         }
+        let rendered = render_conversation(self.text.text(), turns)?;
         let prompt =
             self.text
                 .text()
-                .encode(&caption_prompt(question, &grids, self.visual_tokens))?;
+                .encode(&expand_images(&rendered, &grids, self.visual_tokens)?)?;
         let positions: Vec<usize> = prompt
             .iter()
             .enumerate()
@@ -531,13 +577,17 @@ impl ImageFrontEnd {
         let width = encoded[0].len() / self.visual_tokens;
         let embeds = PromptEmbeds::new(width, positions, encoded.concat())
             .map_err(|e| DriverError::from(crate::driver::error::InvalidRequest::Embeds(e)))?;
-        Ok(CaptionPrompt { prompt, embeds })
+        Ok(MultimodalPrompt {
+            prompt,
+            embeds,
+            mrope: None,
+        })
     }
 }
 
 /// A loaded SmolVLM: the image side and the text tower, each on its own driver.
 pub struct Idefics3 {
-    pub images: ImageFrontEnd,
+    pub images: Idefics3FrontEnd,
     pub text: Driver,
 }
 
@@ -558,15 +608,15 @@ impl Idefics3 {
         })
     }
 
-    /// Caption `request.images` (greedy): [`ImageFrontEnd::prepare`], then generate on the text
+    /// Caption `request.images` (greedy): [`Idefics3FrontEnd::prepare_decoded`], then generate on the text
     /// driver with the frames' rows scattered over the prompt's `<image>` placeholders.
     pub fn caption(
         &mut self,
         request: &CaptionRequest<'_>,
         sink: &mut dyn TokenSink,
     ) -> Result<Generation, FrontEndError> {
-        let CaptionPrompt { prompt, embeds } =
-            self.images.prepare(request.images, request.question)?;
+        let MultimodalPrompt { prompt, embeds, .. } =
+            self.images.prepare_decoded(request.images, request.turns)?;
         Ok(self.text.generate_with_embeds(
             GenerateRequest {
                 prompt,
@@ -581,18 +631,92 @@ impl Idefics3 {
     }
 }
 
-/// A caption request lowered to what the text driver takes: the prompt's token ids (placeholders
-/// included) and the embedding rows that replace the placeholders.
-#[derive(Clone, Debug)]
-pub struct CaptionPrompt {
-    pub prompt: Vec<u32>,
-    pub embeds: PromptEmbeds,
+impl ImageFrontEnd for Idefics3FrontEnd {
+    fn prepare(
+        &mut self,
+        images: &[&[u8]],
+        turns: &[ChatTurn<'_>],
+    ) -> Result<MultimodalPrompt, ImageRequestError> {
+        let decoded = images
+            .iter()
+            .map(|bytes| decode_image(bytes))
+            .collect::<Result<Vec<_>, _>>()?;
+        let images: Vec<_> = decoded.iter().map(DecodedImage::as_image).collect();
+        Ok(self.prepare_decoded(&images, turns)?)
+    }
+}
+
+impl ImageCheckpoint for Idefics3Checkpoint {
+    fn text(&self) -> &Arc<ModelHandle> {
+        &self.text
+    }
+
+    /// The positions the vision tower's driver needs: the patches of one frame.
+    fn patches(&self) -> usize {
+        self.patches
+    }
+
+    fn front_end(
+        &self,
+        vision: (Box<dyn poot_executor::Executor>, DriverOptions),
+    ) -> Result<Box<dyn ImageFrontEnd>, ImageCheckpointError> {
+        Ok(Box::new(Idefics3Checkpoint::front_end(self, vision)?))
+    }
+}
+
+impl From<FrontEndError> for ImageRequestError {
+    /// The image, its size and its frame count are the client's; the rest is the front end's.
+    fn from(error: FrontEndError) -> Self {
+        match error {
+            FrontEndError::Image(_)
+            | FrontEndError::ImageTooLarge { .. }
+            | FrontEndError::NoImage
+            | FrontEndError::TurnImages { .. }
+            | FrontEndError::ImageMarks { .. }
+            | FrontEndError::TooManyFrames { .. }
+            | FrontEndError::Placeholders { .. } => ImageRequestError::Refused(error.to_string()),
+            other => ImageRequestError::Failed(Box::new(other)),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use poot_models::vision::idefics3_preprocess;
+
+    /// One user turn of `grids.len()` images and a question, as the SmolVLM template renders it,
+    /// with every image expanded to its block.
+    fn caption_prompt(question: &str, grids: &[(usize, usize)], tokens: usize) -> String {
+        let rendered = format!(
+            "<|im_start|>User:{}{question}<end_of_utterance>\nAssistant:",
+            IMAGE_MARK.repeat(grids.len())
+        );
+        expand_images(&rendered, grids, tokens).expect("one mark per image")
+    }
+
+    /// A conversation expands each image in its own turn: the `k`-th mark takes the `k`-th image's
+    /// block, and the text between them is untouched. A turn's text that spells `<image>` makes the
+    /// marks disagree with the images and is refused.
+    #[test]
+    fn each_image_takes_the_block_of_its_own_turn() {
+        let rendered = "<|im_start|>User:<image>a<end_of_utterance>\nAssistant: b<end_of_utterance>\nUser:<image>c<end_of_utterance>\nAssistant:";
+        let prompt = expand_images(rendered, &[(0, 0), (1, 2)], 3).unwrap();
+        assert_eq!(
+            prompt,
+            format!(
+                "<|im_start|>User:{}a<end_of_utterance>\nAssistant: b<end_of_utterance>\nUser:{}c<end_of_utterance>\nAssistant:",
+                image_block(0, 0, 3),
+                image_block(1, 2, 3)
+            )
+        );
+        for grids in [&[(0, 0)][..], &[(0, 0), (0, 0), (0, 0)][..]] {
+            assert!(matches!(
+                expand_images(rendered, grids, 3),
+                Err(FrontEndError::ImageMarks { marks: 2, .. })
+            ));
+        }
+    }
 
     /// The split-image prompt emits `(rows * cols + 1) * tokens` `<image>` placeholders (one per
     /// visual token across all frames and the global one) and one `<row_R_col_C>` marker per tile, in
@@ -832,7 +956,7 @@ mod smolvlm {
         vlm.caption(
             &CaptionRequest {
                 images: &[image],
-                question,
+                turns: &[ChatTurn::user(1, question)],
                 max_new,
             },
             &mut |_: u32, _: &str| GenerationControl::Continue(()),
@@ -955,7 +1079,7 @@ mod smolvlm {
             .caption(
                 &CaptionRequest {
                     images: &images,
-                    question: "Describe both images.",
+                    turns: &[ChatTurn::user(2, "Describe both images.")],
                     max_new: 16,
                 },
                 &mut |_: u32, _: &str| GenerationControl::Continue(()),
@@ -986,7 +1110,7 @@ mod smolvlm {
             .caption(
                 &CaptionRequest {
                     images: &images,
-                    question: "describe",
+                    turns: &[ChatTurn::user(40, "describe")],
                     max_new: 8,
                 },
                 &mut |_: u32, _: &str| GenerationControl::Continue(()),

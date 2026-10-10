@@ -3,13 +3,12 @@
 use poot_quant::format::{FieldEncoding, FloatFormat, PlanarOperand};
 
 use super::{
-    Arc, ArtifactIdentityFields, BTreeMap, Component, Context, Deserialize, Deserializer, File,
-    HASH_BUFFER_BYTES, INDEX_FILE, MapAccess, OperandRole, PackedArtifactManifest,
-    PackedBufferKind, PackedLimitKind, PackedLoadReport, PackedSafetensorsError,
-    PackedSafetensorsLimits, PackedSelectionField, PackedSelectionRow, PackedWeight, Path,
-    RangeCheck, RangeCheckOwner, RetainedHandle, RetainedReader, SHA256, SeekFrom, SeqAccess,
-    Sha256Digest, SourceRole, SourceSpan, StagedRow, TensorEntry, ValidatedSelection, Visitor, de,
-    fmt, sha256_digest,
+    ArtifactIdentityFields, BTreeMap, Component, Context, Deserialize, Deserializer, File,
+    HASH_BUFFER_BYTES, INDEX_FILE, MapAccess, MapError, OperandRole, PackedArtifactManifest,
+    PackedLimitKind, PackedLoadReport, PackedSafetensorsError, PackedSafetensorsLimits,
+    PackedSelectionField, PackedSelectionRow, PackedWeight, Path, RetainedHandle, RetainedReader,
+    SHA256, SeekFrom, SeqAccess, Sha256Digest, SourceRole, SourceSpan, StoredBytes, TensorEntry,
+    ValidatedSelection, Visitor, de, fmt, sha256_digest,
 };
 
 pub(crate) fn validate_manifest_and_limits(
@@ -104,6 +103,26 @@ pub(crate) fn open_regular(
     Ok(Box::new(file))
 }
 
+/// Maps one shard read-only, once: the single view every selected source of that shard slices.
+pub(crate) fn map_shard(
+    root: &Path,
+    relative: &str,
+) -> Result<StoredBytes, PackedSafetensorsError> {
+    let file = File::open(root.join(relative)).map_err(|error| PackedSafetensorsError::Io {
+        file: relative.to_string(),
+        error,
+    })?;
+    StoredBytes::map(file).map_err(|error| match error {
+        MapError::Io(error) => PackedSafetensorsError::Io {
+            file: relative.to_string(),
+            error,
+        },
+        MapError::NotRegularFile { .. } => PackedSafetensorsError::NotRegularFile {
+            file: relative.to_string(),
+        },
+    })
+}
+
 pub(crate) fn file_length(
     file: &dyn RetainedReader,
     name: &str,
@@ -143,36 +162,25 @@ pub(crate) fn read_exact_file(
         })
 }
 
+/// The header length and data start of a mapped shard, read off its first eight bytes.
 pub(crate) fn read_header_length(
-    file: &mut dyn RetainedReader,
+    shard: &[u8],
     name: &str,
-    file_length: usize,
 ) -> Result<(usize, usize), PackedSafetensorsError> {
-    if file_length < 8 {
+    let Some(prefix) = shard.first_chunk::<8>() else {
         return Err(PackedSafetensorsError::InvalidTensorMetadata {
             file: name.to_string(),
             tensor: "<header>".to_string(),
             reason: "file is shorter than the eight-byte header prefix".to_string(),
         });
-    }
-    file.seek(SeekFrom::Start(0))
-        .map_err(|error| PackedSafetensorsError::Io {
-            file: name.to_string(),
-            error,
-        })?;
-    let mut bytes = [0u8; 8];
-    file.read_exact(&mut bytes)
-        .map_err(|error| PackedSafetensorsError::Io {
-            file: name.to_string(),
-            error,
-        })?;
-    let header_u64 = u64::from_le_bytes(bytes);
-    let header_length =
-        usize::try_from(header_u64).map_err(|_| PackedSafetensorsError::ArithmeticOverflow {
+    };
+    let header_length = usize::try_from(u64::from_le_bytes(*prefix)).map_err(|_| {
+        PackedSafetensorsError::ArithmeticOverflow {
             field: "header length conversion",
-        })?;
+        }
+    })?;
     let data_start = checked_add(8, header_length, "header end")?;
-    if data_start > file_length {
+    if data_start > shard.len() {
         return Err(PackedSafetensorsError::InvalidTensorMetadata {
             file: name.to_string(),
             tensor: "<header>".to_string(),
@@ -180,20 +188,6 @@ pub(crate) fn read_header_length(
         });
     }
     Ok((header_length, data_start))
-}
-
-pub(crate) fn read_header(
-    file: &mut dyn RetainedReader,
-    name: &str,
-    header_length: usize,
-) -> Result<Vec<u8>, PackedSafetensorsError> {
-    let mut bytes = vec![0u8; header_length];
-    file.read_exact(&mut bytes)
-        .map_err(|error| PackedSafetensorsError::Io {
-            file: name.to_string(),
-            error,
-        })?;
-    Ok(bytes)
 }
 
 pub(crate) fn parse_weight_map(
@@ -594,26 +588,6 @@ pub(crate) fn expected_scale_dtype(descriptor: PackedWeight) -> &'static str {
     operand_stored_dtype(planar_operand(descriptor, OperandRole::Scale))
 }
 
-pub(crate) fn read_source_arc(
-    file: &mut dyn RetainedReader,
-    data_start: usize,
-    span: SourceSpan,
-) -> Result<Arc<[u8]>, std::io::Error> {
-    let length = span
-        .end
-        .checked_sub(span.start)
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid span"))?;
-    let absolute = data_start
-        .checked_add(span.start)
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "offset overflow"))?;
-    let absolute = u64::try_from(absolute)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "offset overflow"))?;
-    let mut owner: Arc<[u8]> = Arc::from(vec![0u8; length]);
-    file.seek(SeekFrom::Start(absolute))?;
-    file.read_exact(Arc::get_mut(&mut owner).expect("new source owner is unique"))?;
-    Ok(owner)
-}
-
 pub(crate) fn report_selected_accounting(
     report: &mut PackedLoadReport,
     selections: &[ValidatedSelection],
@@ -685,46 +659,6 @@ fn packed_source_padding_bits(descriptor: PackedWeight) -> Result<usize, PackedS
         .ok_or(PackedSafetensorsError::ArithmeticOverflow {
             field: "source padding bits",
         })
-}
-
-pub(crate) fn build_range_checks(
-    staged: &[StagedRow],
-) -> Result<BTreeMap<String, Vec<RangeCheck>>, PackedSafetensorsError> {
-    let mut checks: BTreeMap<String, Vec<RangeCheck>> = BTreeMap::new();
-    for row in staged.iter().filter(|row| row.cold) {
-        checks
-            .entry(row.row.selection.shard.clone())
-            .or_default()
-            .push(RangeCheck {
-                start: checked_add(
-                    row.row.data_start,
-                    row.row.selection.weight_span.start,
-                    "weight verification start",
-                )?,
-                owner: RangeCheckOwner::Packed {
-                    owner: Arc::clone(&row.owner),
-                    buffer: PackedBufferKind::Weight,
-                },
-            });
-        checks
-            .entry(row.row.selection.shard.clone())
-            .or_default()
-            .push(RangeCheck {
-                start: checked_add(
-                    row.row.data_start,
-                    row.row.selection.scale_span.start,
-                    "scale verification start",
-                )?,
-                owner: RangeCheckOwner::Packed {
-                    owner: Arc::clone(&row.owner),
-                    buffer: PackedBufferKind::Scale,
-                },
-            });
-    }
-    for shard_checks in checks.values_mut() {
-        shard_checks.sort_unstable_by_key(|check| check.start);
-    }
-    Ok(checks)
 }
 
 /// One resident file's optional integrity pin (card 544, ADR-0103 decision 4): the exact length
@@ -827,111 +761,20 @@ pub(crate) fn admit_file(
     Ok(bytes)
 }
 
-/// The streaming counterpart of [`admit_file`] for a file too large to materialize whole (a
-/// shard). With no pin and nothing to cross-check, admission costs one length probe and no body
-/// I/O at all: the caller's later bounded range reads of the exact weight/scale spans it selects
-/// are what admits the shard's content, by capability. Otherwise the file streams exactly once -
-/// hashed against its pin when one is given, and always cross-checked against `checks` (the
-/// previously-read weight/scale spans this shard staged, so a race between selection and
-/// publication is still caught even when no pin was ever supplied) - so one shard is hashed at
-/// most once per call, never twice (R475-014's baseline hashed every shard twice).
+/// The shard counterpart of [`admit_file`], over a shard already mapped once. A pin, when given, is
+/// compared by [`check_pin`] against the mapping itself (length, then digest), so one shard is hashed
+/// at most once per load and never re-read; with no pin nothing is hashed and the shard is admitted
+/// by capability, by the structural checks that parsed its header. Returns the bytes hashed.
 pub(crate) fn admit_shard(
-    file: &mut dyn RetainedReader,
+    shard: &StoredBytes,
     name: &str,
     pin: Option<FilePin>,
-    checks: &[RangeCheck],
 ) -> Result<usize, PackedSafetensorsError> {
-    if pin.is_none() && checks.is_empty() {
-        return file_length(file, name);
-    }
-    let expected_length = match pin {
-        Some(pin) => pin.length,
-        None => file_length(file, name)?,
+    let Some(pin) = pin else {
+        return Ok(0);
     };
-    verify_file(
-        file,
-        name,
-        expected_length,
-        pin.map(|pin| pin.sha256),
-        checks,
-    )
-}
-
-pub(crate) fn verify_file(
-    file: &mut dyn RetainedReader,
-    name: &str,
-    expected_length: usize,
-    expected_digest: Option<Sha256Digest>,
-    checks: &[RangeCheck],
-) -> Result<usize, PackedSafetensorsError> {
-    if file_length(file, name)? != expected_length {
-        return Err(PackedSafetensorsError::ArtifactChanged {
-            file: name.to_string(),
-        });
-    }
-    file.seek(SeekFrom::Start(0))
-        .map_err(|error| PackedSafetensorsError::Io {
-            file: name.to_string(),
-            error,
-        })?;
-    let mut context = Context::new(&SHA256);
-    let mut buffer = [0u8; HASH_BUFFER_BYTES];
-    let mut total = 0usize;
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| PackedSafetensorsError::Io {
-                file: name.to_string(),
-                error,
-            })?;
-        if read == 0 {
-            break;
-        }
-        let chunk_end =
-            total
-                .checked_add(read)
-                .ok_or(PackedSafetensorsError::ArithmeticOverflow {
-                    field: "streamed file bytes",
-                })?;
-        for check in checks {
-            let check_bytes = check.bytes();
-            let check_end = check.start.checked_add(check_bytes.len()).ok_or(
-                PackedSafetensorsError::ArithmeticOverflow {
-                    field: "verification range end",
-                },
-            )?;
-            let overlap_start = total.max(check.start);
-            let overlap_end = chunk_end.min(check_end);
-            if overlap_start < overlap_end {
-                let actual = &buffer[overlap_start - total..overlap_end - total];
-                let expected = &check_bytes[overlap_start - check.start..overlap_end - check.start];
-                if actual != expected {
-                    return Err(PackedSafetensorsError::ArtifactChanged {
-                        file: name.to_string(),
-                    });
-                }
-            }
-        }
-        context.update(&buffer[..read]);
-        total = chunk_end;
-    }
-    if total != expected_length || file_length(file, name)? != expected_length {
-        return Err(PackedSafetensorsError::ArtifactChanged {
-            file: name.to_string(),
-        });
-    }
-    if let Some(expected_digest) = expected_digest {
-        let actual_digest = Sha256Digest::from(
-            <[u8; 32]>::try_from(context.finish().as_ref())
-                .expect("SHA-256 output is exactly 32 bytes"),
-        );
-        if actual_digest != expected_digest {
-            return Err(PackedSafetensorsError::ArtifactChanged {
-                file: name.to_string(),
-            });
-        }
-    }
-    Ok(total)
+    check_pin(shard.as_slice(), Some(pin), name)?;
+    Ok(shard.len())
 }
 
 /// The cache identity is content-derived, not pin-derived (card 544): `identity` carries the

@@ -21,6 +21,7 @@ use poot_graph_plan::{
     CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram,
     Submission, Target, TargetSet, compile_staged,
 };
+use poot_quant::StoredBytes;
 use poot_quant::weights::WeightStore;
 use poot_target::{Backend, DeviceCaps};
 
@@ -125,7 +126,13 @@ impl Device for FakeDevice {
         Ok(())
     }
 
-    fn write(&mut self, _dst: &(), _offset: usize, _bytes: &[u8]) -> Result<(), FakeError> {
+    fn write_with(
+        &mut self,
+        _dst: &(),
+        _offset: usize,
+        _len: usize,
+        _fill: &mut dyn FnMut(std::ops::Range<usize>, &mut [u8]),
+    ) -> Result<(), FakeError> {
         Ok(())
     }
 
@@ -181,7 +188,7 @@ fn fixture() -> (
                 DenseWeight::try_new(
                     DType::F32,
                     vec![2],
-                    Arc::from([0u8, 0, 0x80, 0x3f, 0, 0, 0, 0x40]), // [1.0, 2.0]
+                    StoredBytes::from(vec![0u8, 0, 0x80, 0x3f, 0, 0, 0, 0x40]), // [1.0, 2.0]
                 )
                 .unwrap(),
             ),
@@ -271,7 +278,7 @@ fn fixture_shared_kind_different_keys() -> (
                 DenseWeight::try_new(
                     DType::F32,
                     vec![2],
-                    Arc::from([0u8, 0, 0x80, 0x3f, 0, 0, 0, 0x40]), // [1.0, 2.0]
+                    StoredBytes::from(vec![0u8, 0, 0x80, 0x3f, 0, 0, 0, 0x40]), // [1.0, 2.0]
                 )
                 .unwrap(),
             ),
@@ -284,7 +291,7 @@ fn fixture_shared_kind_different_keys() -> (
                 DenseWeight::try_new(
                     DType::F32,
                     vec![3],
-                    Arc::from([
+                    StoredBytes::from(vec![
                         0u8, 0, 0x80, 0x3f, // 1.0
                         0, 0, 0, 0x40, // 2.0
                         0, 0, 0x40, 0x40, // 3.0

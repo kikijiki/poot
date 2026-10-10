@@ -12,7 +12,7 @@
 
 use poot_graph_ir::op::{BinOp, OpKind, RedOp};
 use poot_graph_ir::{
-    Eqn, Graph, Operand, Scalar, ValidationChannel, ValidationPacketLayout, ValueId,
+    Eqn, Graph, Operand, Scalar, ValidationChannel, ValidationPacketLayout, ValueId, ValueTable,
 };
 use poot_kernel_ir::{Body, WmmaShape};
 use poot_kernelgen::{BodyUse, FragmentUse, KernelRequirements, UnmeasurableLds};
@@ -27,25 +27,25 @@ pub const DEVICE_WITNESS_MAGNITUDE_BOUND: u64 = 1 << 24;
 /// Why a validation value is not a canonical device witness.
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum DeviceWitnessRejection {
-    #[error("v{value} is a graph input, not a device computation")]
+    #[error("{value} is a graph input, not a device computation")]
     GraphInput { value: ValueId },
-    #[error("v{value} has dtype {dtype}, which cannot hold an exact count")]
+    #[error("{value} has dtype {dtype}, which cannot hold an exact count")]
     Dtype { value: ValueId, dtype: DType },
-    #[error("v{value} is produced by {op}, which has no exact witness-head role")]
+    #[error("{value} is produced by {op}, which has no exact witness-head role")]
     UnsupportedOp { value: ValueId, op: String },
-    #[error("v{value} casts {from} to {to}; only F32 and I32 counts are exact")]
+    #[error("{value} casts {from} to {to}; only F32 and I32 counts are exact")]
     CastDtype {
         value: ValueId,
         from: DType,
         to: DType,
     },
-    #[error("v{value} uses literal {literal:?}, which is not an integer of magnitude at most 2^24")]
+    #[error("{value} uses literal {literal:?}, which is not an integer of magnitude at most 2^24")]
     Literal { value: ValueId, literal: Scalar },
-    #[error("v{value} can reach magnitude {bound}, above the exact bound 2^24")]
+    #[error("{value} can reach magnitude {bound}, above the exact bound 2^24")]
     Bound { value: ValueId, bound: u64 },
-    #[error("the magnitude bound of v{value} overflowed u64")]
+    #[error("the magnitude bound of {value} overflowed u64")]
     BoundOverflow { value: ValueId },
-    #[error("v{value} reduces axis {axis}, which its operand does not have")]
+    #[error("{value} reduces axis {axis}, which its operand does not have")]
     ReduceAxis { value: ValueId, axis: usize },
 }
 
@@ -161,20 +161,20 @@ fn witness_op(op: &OpKind) -> WitnessOp {
 
 struct WitnessWalk<'g, V: ValidationChannel> {
     graph: &'g Graph<V>,
-    producers: Vec<Option<&'g Eqn>>,
-    bounds: Vec<Option<u64>>,
+    producers: ValueTable<Option<&'g Eqn>>,
+    bounds: ValueTable<Option<u64>>,
 }
 
 impl<'g, V: ValidationChannel> WitnessWalk<'g, V> {
     fn new(graph: &'g Graph<V>) -> Self {
-        let mut producers = vec![None; graph.values.len()];
+        let mut producers = ValueTable::filled(graph.values.len(), None);
         for eqn in &graph.eqns {
             producers[eqn.out] = Some(eqn);
         }
         Self {
             graph,
             producers,
-            bounds: vec![None; graph.values.len()],
+            bounds: ValueTable::filled(graph.values.len(), None),
         }
     }
 

@@ -1,4 +1,5 @@
 use super::*;
+use poot_graph_ir::ValueTable;
 use poot_graph_ir::{
     AttentionAttrs, ComputedConst, KeyLayout, KvBound, recognize_index_bounds_guard,
 };
@@ -85,8 +86,8 @@ pub(super) fn producer_map<V: ValidationChannel>(g: &Graph<V>) -> HashMap<ValueI
 }
 
 /// The equation indices that consume each value.
-fn consumer_map<V: ValidationChannel>(g: &Graph<V>) -> Vec<Vec<usize>> {
-    let mut consumers = vec![Vec::new(); g.values.len()];
+fn consumer_map<V: ValidationChannel>(g: &Graph<V>) -> ValueTable<Vec<usize>> {
+    let mut consumers = ValueTable::filled(g.values.len(), Vec::new());
     for (index, eqn) in g.eqns.iter().enumerate() {
         for operand in &eqn.inputs {
             if let Operand::Value(value) = operand {

@@ -9,6 +9,8 @@ fn poot_serve_bin() -> String {
         .expect("CARGO_BIN_EXE_poot-serve must be set by cargo for test binaries")
 }
 
+/// A non-UTF-8 flag value is a startup error before any model loads. The value cannot be a `String`, so
+/// the parser refuses it as invalid UTF-8.
 #[cfg(unix)]
 #[test]
 fn non_unicode_write_timeout_fails_before_model_loading() {
@@ -19,17 +21,15 @@ fn non_unicode_write_timeout_fails_before_model_loading() {
     let output = Command::new(poot_serve_bin())
         .contained()
         .arg("/card316/model-must-not-load.gguf")
-        .env(
-            "POOT_WRITE_TIMEOUT_SECS",
-            std::ffi::OsString::from_vec(vec![0xff]),
-        )
+        .arg("--write-timeout-secs")
+        .arg(std::ffi::OsString::from_vec(vec![0xff]))
         .output()
         .expect("run poot-serve with non-Unicode timeout configuration");
 
     assert!(!output.status.success(), "invalid startup must fail");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("POOT_WRITE_TIMEOUT_SECS must be valid Unicode"),
+        stderr.contains("invalid UTF-8"),
         "typed configuration error missing from stderr: {stderr}"
     );
     let process_output = format!("{}{}", String::from_utf8_lossy(&output.stdout), stderr);
@@ -43,7 +43,7 @@ fn non_unicode_write_timeout_fails_before_model_loading() {
 /// model path selects. One model path per loader arm of startup (cross-encoder, encoder, decoder
 /// directory, GGUF file), each holding nothing a loader could load: with the timeout invalid the
 /// process must fail on the timeout, and none of the loaders' progress lines or errors may appear.
-/// Mutation observed red: the timeout is validated after the backend `match` instead of before it.
+/// The flag is parsed with every other before the model path is touched.
 #[test]
 fn invalid_write_timeout_fails_before_every_model_loader() {
     use poot_test_util::contained_child::ContainChild;
@@ -86,7 +86,7 @@ fn invalid_write_timeout_fails_before_every_model_loader() {
         let output = Command::new(poot_serve_bin())
             .contained()
             .arg(&model)
-            .env("POOT_WRITE_TIMEOUT_SECS", "0")
+            .args(["--write-timeout-secs", "0"])
             .output()
             .expect("run poot-serve with a zero write timeout");
         let process_output = format!(
@@ -96,7 +96,8 @@ fn invalid_write_timeout_fails_before_every_model_loader() {
         );
         assert!(!output.status.success(), "{arm}: invalid startup must fail");
         assert!(
-            process_output.contains("POOT_WRITE_TIMEOUT_SECS must be greater than zero"),
+            process_output.contains("--write-timeout-secs")
+                && process_output.contains("must be greater than zero"),
             "{arm}: the typed timeout error is missing: {process_output}"
         );
         for loader_trace in [

@@ -38,7 +38,7 @@
 //! after the fact: a guard whose witness observes some other value is not this shape.
 
 use crate::builder::{Builder, Traced};
-use crate::graph::{Graph, Operand, ValidationChannel, ValueId};
+use crate::graph::{Graph, Operand, ValidationChannel, ValueId, ValueTable};
 use crate::op::{BinOp, OpKind, RedOp};
 use crate::types::{DType, Scalar};
 
@@ -64,25 +64,25 @@ pub struct IndexBoundsGuard {
 /// Why a pair of values is not a canonical index-bounds guard and its witness.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum IndexGuardRejection {
-    #[error("guarded value v{guarded} is not produced by a Select")]
+    #[error("guarded value {guarded} is not produced by a Select")]
     GuardedNotSelect { guarded: ValueId },
-    #[error("guard v{guarded} has a literal operand; every Select operand must be a value")]
+    #[error("guard {guarded} has a literal operand; every Select operand must be a value")]
     GuardedLiteralOperand { guarded: ValueId },
-    #[error("guard condition v{invalid} is not an unsigned upper-bound comparison")]
+    #[error("guard condition {invalid} is not an unsigned upper-bound comparison")]
     ConditionNotUnsignedBound { invalid: ValueId },
-    #[error("guard condition v{invalid} does not compare v{expected}")]
+    #[error("guard condition {invalid} does not compare {expected}")]
     ConditionComparesAnotherValue {
         invalid: ValueId,
         expected: ValueId,
         actual: ValueId,
     },
-    #[error("guard condition v{invalid} does not bound by an I32 literal")]
+    #[error("guard condition {invalid} does not bound by an I32 literal")]
     BoundNotI32Literal { invalid: ValueId },
-    #[error("guard fallback v{zero} is not Sub(v{expected}, v{expected})")]
+    #[error("guard fallback {zero} is not Sub({expected}, {expected})")]
     FallbackNotZeroOfSource { zero: ValueId, expected: ValueId },
-    #[error("witness v{witness} is not a keepdim last-axis Sum of a Cast to F32")]
+    #[error("witness {witness} is not a keepdim last-axis Sum of a Cast to F32")]
     WitnessNotSumOfCast { witness: ValueId },
-    #[error("witness v{witness} observes v{observed}, not the guard condition v{invalid}")]
+    #[error("witness {witness} observes {observed}, not the guard condition {invalid}")]
     WitnessObservesAnotherValue {
         witness: ValueId,
         observed: ValueId,
@@ -93,9 +93,9 @@ pub enum IndexGuardRejection {
 /// Why a guard cannot be emitted for the requested selector and bound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum IndexGuardError {
-    #[error("selector v{raw} has dtype {dtype}; an index-bounds guard needs I32")]
+    #[error("selector {raw} has dtype {dtype}; an index-bounds guard needs I32")]
     RawNotI32 { raw: ValueId, dtype: DType },
-    #[error("selector v{raw} is rank 0; an index-bounds guard needs an axis to reduce")]
+    #[error("selector {raw} is rank 0; an index-bounds guard needs an axis to reduce")]
     RawNotRanked { raw: ValueId },
     #[error("bound {upper_exclusive} does not fit in i32")]
     BoundNotRepresentable { upper_exclusive: usize },
@@ -122,12 +122,12 @@ impl Builder {
         let aval = self.aval(raw);
         if aval.dtype != DType::I32 {
             return Err(IndexGuardError::RawNotI32 {
-                raw: raw.id,
+                raw: raw.id(),
                 dtype: aval.dtype,
             });
         }
         let Some(axis) = aval.shape.len().checked_sub(1) else {
-            return Err(IndexGuardError::RawNotRanked { raw: raw.id });
+            return Err(IndexGuardError::RawNotRanked { raw: raw.id() });
         };
         let bound = i32::try_from(upper_exclusive)
             .map_err(|_| IndexGuardError::BoundNotRepresentable { upper_exclusive })?;
@@ -227,7 +227,7 @@ pub fn recognize_index_bounds_guard<V: ValidationChannel>(
 
 /// The value a canonical witness reduces: a keepdim `Sum` over the last axis of its operand.
 fn witness_source<V: ValidationChannel>(
-    producers: &[Option<usize>],
+    producers: &ValueTable<Option<usize>>,
     graph: &Graph<V>,
     witness: ValueId,
 ) -> Result<ValueId, IndexGuardRejection> {
@@ -252,8 +252,8 @@ fn witness_source<V: ValidationChannel>(
     Ok(*source)
 }
 
-fn producer_table<V: ValidationChannel>(graph: &Graph<V>) -> Vec<Option<usize>> {
-    let mut producers = vec![None; graph.values.len()];
+fn producer_table<V: ValidationChannel>(graph: &Graph<V>) -> ValueTable<Option<usize>> {
+    let mut producers = ValueTable::filled(graph.values.len(), None);
     for (index, eqn) in graph.eqns.iter().enumerate() {
         producers[eqn.out] = Some(index);
     }
@@ -261,7 +261,7 @@ fn producer_table<V: ValidationChannel>(graph: &Graph<V>) -> Vec<Option<usize>> 
 }
 
 fn producer<'g, V: ValidationChannel>(
-    producers: &[Option<usize>],
+    producers: &ValueTable<Option<usize>>,
     graph: &'g Graph<V>,
     value: ValueId,
 ) -> Option<&'g crate::graph::Eqn> {

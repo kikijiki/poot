@@ -20,7 +20,7 @@ fn pack_unpack_i8_gpu_matches_cpu() {
     let x = b.constant("x", TensorType::f32(vec![rows, cols]));
     let packed = b.pack_i8(x);
     let out = b.unpack_i8(packed, cols);
-    let xi = x.id;
+    let xi = x.id();
     let g = b.finish(out);
 
     // span past +-127 so the clamp is exercised; mix signs.

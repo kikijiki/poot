@@ -6,9 +6,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use poot_load::packed_safetensors::{
-    AuthenticatedSafetensorsHandleSet, PackedArtifactManifest, PackedBufferKind, PackedLimitKind,
-    PackedOwnerCache, PackedSafetensorsError, PackedSafetensorsLimits, PackedSelectionField,
-    PackedSelectionRow, PackedShardManifest, Sha256Digest, SourceSpan, sha256_digest,
+    AuthenticatedSafetensorsHandleSet, PackedArtifactManifest, PackedLimitKind, PackedOwnerCache,
+    PackedSafetensorsError, PackedSafetensorsLimits, PackedSelectionField, PackedSelectionRow,
+    PackedShardManifest, Sha256Digest, SourceSpan, sha256_digest,
 };
 use poot_quant::format::{ScaleEncoding, WeightFormat};
 use poot_quant::{OperandRole, PackedWeight, PackedWeightError, SourceRole};
@@ -961,41 +961,55 @@ fn between_phase_mutation_rejects_before_publication() {
     ));
     assert!(cache.is_empty());
 
+    // Restoring the byte does not restore the mapped file's identity: a changed shard is refused
+    // for the life of the handle set, and only a fresh authentication loads it.
     write_at(&path, offset, 0x01);
-    let loaded = authenticated.load(&fixture.selections, &mut cache).unwrap();
+    assert!(matches!(
+        authenticated.load(&fixture.selections, &mut cache),
+        Err(PackedSafetensorsError::ArtifactChanged { .. })
+    ));
+    assert!(cache.is_empty());
+    let loaded = fixture
+        .authenticate()
+        .load(&fixture.selections, &mut cache)
+        .unwrap();
     assert_eq!(loaded.rows.len(), 2);
 }
 
+/// A shard truncated under a held handle set is refused at publication as `ArtifactChanged`, and the
+/// process survives. The load is warm (every owner cached), so no page of the truncated file is
+/// read after the change: the identity check runs before anything touches the mapping.
 #[test]
-fn second_pair_read_or_build_failure_publishes_nothing() {
-    let read_failure = Fixture::new();
-    let mut authenticated = read_failure.authenticate();
+fn truncated_shard_is_refused_at_publication_and_the_process_survives() {
+    let fixture = Fixture::new();
+    let mut authenticated = fixture.authenticate();
     let mut cache = PackedOwnerCache::new();
-    let original_shard = fs::read(read_failure.root.path.join(SHARD_B)).unwrap();
-    let second_weight_end =
-        read_failure.data_starts[SHARD_B] + read_failure.selections[1].weight_span.end - 1;
-    OpenOptions::new()
-        .write(true)
-        .open(read_failure.root.path.join(SHARD_B))
-        .unwrap()
-        .set_len(second_weight_end as u64)
-        .unwrap();
-    assert!(matches!(
-        authenticated.load(&read_failure.selections, &mut cache),
-        Err(PackedSafetensorsError::SelectedRead {
-            buffer: PackedBufferKind::Weight,
-            completed_payloads: 1,
-            ..
-        })
-    ));
-    assert!(cache.is_empty());
-    fs::write(read_failure.root.path.join(SHARD_B), original_shard).unwrap();
-    let retry = authenticated
-        .load(&read_failure.selections, &mut cache)
-        .unwrap();
-    assert_eq!(retry.report.payload_builds, 2);
+    authenticated.load(&fixture.selections, &mut cache).unwrap();
     assert_eq!(cache.len(), 2);
 
+    OpenOptions::new()
+        .write(true)
+        .open(fixture.root.path.join(SHARD_B))
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    assert!(matches!(
+        authenticated.load(&fixture.selections, &mut cache),
+        Err(PackedSafetensorsError::ArtifactChanged { file }) if file == SHARD_B
+    ));
+    assert_eq!(
+        cache.len(),
+        2,
+        "a refused publication leaves the cache as it was"
+    );
+}
+
+/// The second pair's payload fails its content check after the first pair is staged: nothing is
+/// published and a fresh authentication of the repaired file loads both. The truncated-file
+/// variant of this test (a selected span read failing mid-load) is retired with the copy path;
+/// the truncation contract is `truncated_shard_is_refused_at_publication_and_the_process_survives`.
+#[test]
+fn second_pair_build_failure_publishes_nothing() {
     let build_failure = Fixture::new();
     let mut authenticated = build_failure.authenticate();
     let mut cache = PackedOwnerCache::new();
@@ -1012,7 +1026,8 @@ fn second_pair_read_or_build_failure_publishes_nothing() {
     ));
     assert!(cache.is_empty());
     write_at(&build_failure.root.path.join(SHARD_B), tail, 0x04);
-    let retry = authenticated
+    let retry = build_failure
+        .authenticate()
         .load(&build_failure.selections, &mut cache)
         .unwrap();
     assert_eq!(retry.report.payload_builds, 2);

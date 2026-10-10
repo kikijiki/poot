@@ -6,13 +6,13 @@ use poot_executor_parity::{Fixture, run_outputs};
 use poot_graph_ir::{Builder, OpKind, Slot, TensorType};
 use poot_graph_plan::{CompileLimits, CompileOptions, KernelChoice, Submission, Target, compile};
 use poot_kernelgen::{ContractionSpec, KernelRequest, Schedule};
+use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_rocm_gpu::device::RocmDevice;
 use poot_runtime_common::DeviceBackend;
 use poot_tensor::{DType, HostTensor};
 use poot_test_util::StepFixture;
 use poot_test_util::device_skip::open_or_skip;
-use std::sync::Arc;
 
 /// A seeded xorshift stream.
 fn stream(seed: u64) -> impl FnMut() -> u64 {
@@ -73,10 +73,10 @@ fn gemv_case(dtype: DType, k: usize, n: usize) -> GemvCase {
     let w = b.constant("w", TensorType::new(vec![n, k], dtype));
     let out = b.matmul(x, b.transpose(w, vec![1, 0]));
     let graph = b.finish(out);
-    let key = graph.meta(x.id).slot_key().unwrap().clone();
+    let key = graph.meta(x.id()).slot_key().unwrap().clone();
     let (bytes, held) = weight(dtype, n * k, (k * 131 + n) as u64);
     let mut builder = WeightStore::builder();
-    let dense = DenseWeight::try_new(dtype, vec![n, k], Arc::from(bytes)).unwrap();
+    let dense = DenseWeight::try_new(dtype, vec![n, k], StoredBytes::from(bytes)).unwrap();
     builder
         .insert("w".to_string(), WeightEntry::Dense(dense))
         .unwrap();

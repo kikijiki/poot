@@ -4,8 +4,9 @@
 //! [`crate::ops`]). Each variant carries its by-value params (the jaxpr eqn `params`); tensor operands are passed
 //! separately to `infer`.
 
-use crate::error::ScanReason;
-use crate::error::ShapeError;
+use std::num::NonZeroU32;
+
+use crate::error::{FusedOperandReason, ScanReason, ShapeError};
 use crate::types::{DType, DTypeClass, DTypeClassExt, Scalar, TensorType, broadcast_shapes};
 pub use poot_quant::format::{ScaleEncoding, WeightFormat};
 pub use poot_quant::{OperandRole, PackedWeight, SourceRole};
@@ -206,6 +207,7 @@ impl FusedRegion {
 
     /// The output type, threading the input types through the steps. `ins` are the `n_inputs` external input
     /// types, in order. Mirrors how the un-fused chain would infer.
+    #[deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
     pub fn infer(&self, ins: &[TensorType]) -> Result<TensorType, ShapeError> {
         if ins.len() != self.n_inputs {
             return Err(ShapeError::Arity {
@@ -218,54 +220,81 @@ impl FusedRegion {
             let mut in_tys = Vec::with_capacity(step.inputs.len());
             for o in &step.inputs {
                 in_tys.push(match o {
-                    FusedOperand::Local(id) => locals[*id].clone(),
+                    FusedOperand::Local(id) => local_ty(&locals, *id)?.clone(),
                     FusedOperand::Lit(s) => s.ty(),
-                    FusedOperand::PackLane { input, lane } => pack_lane_ty(&ins[*input], *lane)?,
+                    FusedOperand::PackLane { input, lane } => {
+                        let source = ins.get(*input).ok_or(ShapeError::FusedOperand(
+                            FusedOperandReason::PackLaneInput {
+                                input: *input,
+                                inputs: ins.len(),
+                            },
+                        ))?;
+                        pack_lane_ty(source, *input, *lane)?
+                    }
                 });
             }
             let ty = step.op.kind().infer(&in_tys)?;
             locals.push(ty);
         }
-        if self.pack.is_empty() {
-            return Ok(locals[self.output].clone());
-        }
-        let first = locals[self.pack[0]].clone();
-        if first.shape.last() != Some(&1) {
-            return Err(ShapeError::Concat {
-                dim: first.rank().saturating_sub(1),
-                a: first.shape.last().copied().unwrap_or(0),
-                b: 1,
+        let Some(&first_local) = self.pack.first() else {
+            return Ok(local_ty(&locals, self.output)?.clone());
+        };
+        let first = local_ty(&locals, first_local)?;
+        let Some((&1, leading)) = first.shape.split_last() else {
+            let mut unit = first.shape.clone();
+            match unit.last_mut() {
+                Some(last) => *last = 1,
+                None => unit.push(1),
+            }
+            return Err(ShapeError::FusedPack {
+                local: first_local,
+                expected: Box::new(TensorType::new(unit, first.dtype)),
+                actual: Box::new(first.clone()),
             });
-        }
+        };
         for &id in &self.pack {
-            if locals[id].dtype != first.dtype || locals[id].shape != first.shape {
-                return Err(ShapeError::Concat {
-                    dim: first.rank().saturating_sub(1),
-                    a: locals[id].numel(),
-                    b: first.numel(),
+            let member = local_ty(&locals, id)?;
+            if member != first {
+                return Err(ShapeError::FusedPack {
+                    local: id,
+                    expected: Box::new(first.clone()),
+                    actual: Box::new(member.clone()),
                 });
             }
         }
-        let mut shape = first.shape;
-        let last = shape.len() - 1;
-        shape[last] = self.pack.len();
+        let mut shape = leading.to_vec();
+        shape.push(self.pack.len());
         Ok(TensorType::new(shape, first.dtype))
     }
 }
 
-fn pack_lane_ty(input: &TensorType, lane: usize) -> Result<TensorType, ShapeError> {
-    let last = input.rank().saturating_sub(1);
-    let width = input.shape.last().copied().unwrap_or(0);
-    if input.shape.is_empty() || width <= lane {
-        return Err(ShapeError::Concat {
-            dim: last,
-            a: width,
-            b: lane + 1,
-        });
+/// The type of fused-region local `id`, or the typed fault for a local the region does not define.
+fn local_ty(locals: &[TensorType], id: usize) -> Result<&TensorType, ShapeError> {
+    locals.get(id).ok_or(ShapeError::FusedOperand(
+        FusedOperandReason::LocalNotDefined {
+            local: id,
+            defined: locals.len(),
+        },
+    ))
+}
+
+/// The type a [`FusedOperand::PackLane`] of external input `input` (type `source`) reads: the source with
+/// its last axis reduced to the one lane.
+fn pack_lane_ty(source: &TensorType, input: usize, lane: usize) -> Result<TensorType, ShapeError> {
+    let mut shape = source.shape.clone();
+    match shape.last_mut() {
+        Some(width) if lane < *width => *width = 1,
+        other => {
+            return Err(ShapeError::FusedOperand(
+                FusedOperandReason::PackLaneWidth {
+                    input,
+                    lane,
+                    width: other.map_or(0, |width| *width),
+                },
+            ));
+        }
     }
-    let mut shape = input.shape.clone();
-    shape[last] = 1;
-    Ok(TensorType::new(shape, input.dtype))
+    Ok(TensorType::new(shape, source.dtype))
 }
 
 /// One step of a row-wise fused region ([`RowRegion`]): a pointwise op (a Map over the row, or a Scalar
@@ -307,6 +336,7 @@ impl RowRegion {
     }
 
     /// The output type, threading input types through the steps (the un-fused chain's inference).
+    #[deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
     pub fn infer(&self, ins: &[TensorType]) -> Result<TensorType, ShapeError> {
         if ins.len() != self.n_inputs {
             return Err(ShapeError::Arity {
@@ -316,17 +346,20 @@ impl RowRegion {
         }
         let mut locals: Vec<TensorType> = ins.to_vec();
         let ty_of = |o: &FusedOperand, locals: &[TensorType]| match o {
-            FusedOperand::Local(id) => locals[*id].clone(),
-            FusedOperand::Lit(s) => s.ty(),
-            FusedOperand::PackLane { .. } => {
-                panic!("PackLane cannot appear in an f32 FusedRow region")
-            }
+            FusedOperand::Local(id) => local_ty(locals, *id).cloned(),
+            FusedOperand::Lit(s) => Ok(s.ty()),
+            FusedOperand::PackLane { .. } => Err(ShapeError::FusedOperand(
+                FusedOperandReason::PackLaneInRowRegion,
+            )),
         };
         for step in &self.steps {
             let ty = match step {
                 RowStep::Pointwise { op, inputs } => {
-                    let in_tys: Vec<TensorType> =
-                        inputs.iter().map(|o| ty_of(o, &locals)).collect();
+                    let in_tys = inputs.iter().map(|o| ty_of(o, &locals)).collect::<Result<
+                        Vec<TensorType>,
+                        ShapeError,
+                    >>(
+                    )?;
                     op.kind().infer(&in_tys)?
                 }
                 RowStep::Reduce { op, input } => OpKind::Reduce {
@@ -334,11 +367,11 @@ impl RowRegion {
                     axis: self.axis,
                     keepdim: true,
                 }
-                .infer(&[ty_of(input, &locals)])?,
+                .infer(&[ty_of(input, &locals)?])?,
             };
             locals.push(ty);
         }
-        Ok(locals[self.output].clone())
+        Ok(local_ty(&locals, self.output)?.clone())
     }
 }
 
@@ -777,28 +810,27 @@ pub enum OpKind {
     /// sharding). It is metadata for the multi-device lowering (ring-allreduce, card 049b) and shard-shape checking;
     /// it does not index an axis that gets reduced here.
     ///
-    /// Single-rank (world_size=1) eval: the identity (AllReduce(x) with R=1 replicas gives x). The test harness that
-    /// simulates multi-rank sums the per-rank partial results outside the graph, so the node's within-graph eval
-    /// stays identity.
+    /// The oracle evaluates one rank: the identity (`AllReduce(x)` over one replica is `x`). A collective is a cut
+    /// point between stage programs, never an equation a stage program plans (`compile` refuses it).
     AllReduce {
         op: RedOp,
         /// The shard (contraction) axis this collective collapses across replicas. Metadata only for this slice; the
         /// ring-allreduce lowering (card 049b) uses it for buffer sizing.
         axis: usize,
     },
-    /// Cross-replica all-gather (card 049a, column-parallel matmul). Each rank holds a slice of the output tensor
-    /// along `axis`; the collective concatenates the slices across ranks, growing `axis` by world_size.
+    /// Cross-replica all-gather (column-parallel matmul). Each rank holds a slice of the output tensor along
+    /// `axis`; the collective concatenates the slices of `world` ranks, so the output's `axis` dimension is
+    /// `world` times the input's.
     ///
-    /// The output type is shape-preserving in the single-rank (world_size=1) graph (the slice is the full tensor). In
-    /// a multi-rank lowering (card 049b) the output's `axis` dimension grows by world_size. The node marks where the
-    /// gather goes so the multi-rank lowering can find it.
-    ///
-    /// Single-rank eval: the identity. The test harness simulates multi-rank by concatenating per-rank evals outside
-    /// the graph, so the in-graph eval stays identity.
+    /// A collective is a cut point between stage programs, never an equation a stage program plans: `compile`
+    /// refuses one inside a stage graph, and the oracle refuses `world > 1` (there is no identity to fall
+    /// back on once the axis has grown).
     AllGather {
-        /// The output axis along which ranks are concatenated. In column-parallel matmul this is the last axis (the
-        /// N / output-feature axis); metadata for card 049b.
+        /// The output axis along which ranks are concatenated. In column-parallel matmul this is the last axis
+        /// (the N / output-feature axis).
         axis: usize,
+        /// The number of ranks whose slices are concatenated. `1` is the identity.
+        world: NonZeroU32,
     },
     /// Exact uniform noise from an integer seed (card 551a, R472-007): one integer hash plus a
     /// power-of-two multiply, bit-exact on every backend (tier 1, ADR-0101). Input `seed [..]` I32 (u32
@@ -1033,7 +1065,10 @@ impl OpKind {
                 op.hash(h);
                 axis.hash(h);
             }
-            OpKind::AllGather { axis } => axis.hash(h),
+            OpKind::AllGather { axis, world } => {
+                axis.hash(h);
+                world.hash(h);
+            }
             OpKind::RandomUniform { cols } => cols.hash(h),
             OpKind::SampleToken { rule } => rule.hash(h),
         }
@@ -1041,6 +1076,7 @@ impl OpKind {
 
     /// Infer the output type from the operand types. Pure, host-only, no data. The single source of
     /// truth for every eqn's result shape/dtype.
+    #[deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
     pub fn infer(&self, ins: &[TensorType]) -> Result<TensorType, ShapeError> {
         match self {
             OpKind::Unary(op) => {
@@ -1293,13 +1329,13 @@ impl OpKind {
                 let mut total = 0;
                 for t in ins {
                     // Every operand must share ins[0]'s rank: otherwise the zip dim-check below ignores the extra dims of a
-                    // longer operand, and `t.shape[*axis]` panics when a shorter operand has rank <= axis. Report the rank
-                    // mismatch (a/b carry the ranks).
+                    // longer operand, and `t.shape[*axis]` panics when a shorter operand has rank <= axis.
                     if t.rank() != rank {
-                        return Err(ShapeError::Concat {
-                            dim: *axis,
-                            a: t.rank(),
-                            b: rank,
+                        return Err(ShapeError::OperandRank {
+                            op: "Concat",
+                            operand: "input",
+                            expected: rank,
+                            actual: t.rank(),
                         });
                     }
                     for (d, (&a, &b)) in t.shape.iter().zip(shape.iter()).enumerate() {
@@ -1352,43 +1388,28 @@ impl OpKind {
                 // rank [..,E] -> [..,k]: same leading dims, last axis replaced by k. Output dtype is always F32 (the idx
                 // convention IndexedMatMul reads via its f32 lane).
                 arity(ins, 1)?;
-                if ins[0].rank() == 0 {
-                    return Err(ShapeError::Arity {
-                        expected: 1,
-                        got: 0,
+                let mut shape = ins[0].shape.clone();
+                let extent = last_axis_mut(&mut shape, "ArgTopK", "input")?;
+                if *k > *extent {
+                    return Err(ShapeError::TopK {
+                        k: *k,
+                        extent: *extent,
                     });
                 }
-                let mut shape = ins[0].shape.clone();
-                let extent = *shape.last().unwrap();
-                if *k > extent {
-                    return Err(ShapeError::TopK { k: *k, extent });
-                }
-                *shape.last_mut().unwrap() = *k;
+                *extent = *k;
                 Ok(TensorType::new(shape, DType::F32))
             }
             OpKind::PackI8 => {
                 arity(ins, 1)?;
-                if ins[0].rank() == 0 {
-                    return Err(ShapeError::Arity {
-                        expected: 1,
-                        got: 0,
-                    });
-                }
                 let mut shape = ins[0].shape.clone();
-                let last = shape.last_mut().unwrap();
+                let last = last_axis_mut(&mut shape, "PackI8", "input")?;
                 *last = last.div_ceil(4);
                 Ok(TensorType::new(shape, DType::I32))
             }
             OpKind::UnpackI8 { len } => {
                 arity(ins, 1)?;
-                if ins[0].rank() == 0 {
-                    return Err(ShapeError::Arity {
-                        expected: 1,
-                        got: 0,
-                    });
-                }
                 let mut shape = ins[0].shape.clone();
-                *shape.last_mut().unwrap() = *len;
+                *last_axis_mut(&mut shape, "UnpackI8", "codes")? = *len;
                 Ok(TensorType::new(shape, DType::F32))
             }
             OpKind::ScatterUpdate => {
@@ -1397,22 +1418,50 @@ impl OpKind {
                 arity(ins, 3)?;
                 let (base, src, inv) = (&ins[0], &ins[1], &ins[2]);
                 check_index_dtype("ScatterUpdate", inv.dtype)?;
-                if base.rank() < 1 || src.rank() != base.rank() || inv.rank() != 1 {
-                    return Err(ShapeError::MatMulRank {
-                        a: base.shape.clone(),
-                        b: src.shape.clone(),
+                let Some((&pool, rest)) = base.shape.split_first() else {
+                    return Err(ShapeError::RankTooLow {
+                        op: "ScatterUpdate",
+                        operand: "base",
+                        min: 1,
+                        actual: 0,
+                    });
+                };
+                if src.rank() != base.rank() {
+                    return Err(ShapeError::OperandRank {
+                        op: "ScatterUpdate",
+                        operand: "src",
+                        expected: base.rank(),
+                        actual: src.rank(),
                     });
                 }
-                if base.shape[1..] != src.shape[1..] {
-                    return Err(ShapeError::MatMulContract {
-                        a: base.shape.clone(),
-                        b: src.shape.clone(),
+                let &[inv_len] = inv.shape.as_slice() else {
+                    return Err(ShapeError::OperandRank {
+                        op: "ScatterUpdate",
+                        operand: "inv",
+                        expected: 1,
+                        actual: inv.rank(),
                     });
+                };
+                for (dim, (&expected, &actual)) in
+                    rest.iter().zip(src.shape.iter().skip(1)).enumerate()
+                {
+                    if expected != actual {
+                        return Err(ShapeError::OperandDim {
+                            op: "ScatterUpdate",
+                            operand: "src",
+                            dim: dim + 1,
+                            expected,
+                            actual,
+                        });
+                    }
                 }
-                if inv.shape[0] != base.shape[0] {
-                    return Err(ShapeError::Broadcast {
-                        a: base.shape.clone(),
-                        b: inv.shape.clone(),
+                if inv_len != pool {
+                    return Err(ShapeError::OperandDim {
+                        op: "ScatterUpdate",
+                        operand: "inv",
+                        dim: 0,
+                        expected: pool,
+                        actual: inv_len,
                     });
                 }
                 Ok(base.clone())
@@ -1512,15 +1561,16 @@ impl OpKind {
                         }
                         let block_out = out / blocks;
                         if blocks == 1 {
-                            if activation.rank() < 2 || activation.shape.last().copied() != Some(k)
-                            {
-                                return Err(ShapeError::PackedContractionActivation {
-                                    expected_k: k,
-                                    actual: activation.clone(),
-                                });
-                            }
                             let mut shape = activation.shape.clone();
-                            *shape.last_mut().expect("rank checked") = out;
+                            match shape.last_mut() {
+                                Some(last) if activation.rank() >= 2 && *last == k => *last = out,
+                                _ => {
+                                    return Err(ShapeError::PackedContractionActivation {
+                                        expected_k: k,
+                                        actual: activation.clone(),
+                                    });
+                                }
+                            }
                             Ok(TensorType::f32(shape))
                         } else {
                             let shape = activation.shape.as_slice();
@@ -1536,17 +1586,36 @@ impl OpKind {
                     ContractionRows::Indexed { .. } => {
                         let ids = &ins[1];
                         check_index_dtype("PackedContraction", ids.dtype)?;
-                        if activation.rank() != 2
-                            || activation.shape[1] != k
-                            || ids.rank() != 1
-                            || ids.shape[0] != activation.shape[0]
-                        {
+                        let &[rows, activation_k] = activation.shape.as_slice() else {
+                            return Err(ShapeError::PackedContractionActivation {
+                                expected_k: k,
+                                actual: activation.clone(),
+                            });
+                        };
+                        if activation_k != k {
                             return Err(ShapeError::PackedContractionActivation {
                                 expected_k: k,
                                 actual: activation.clone(),
                             });
                         }
-                        Ok(TensorType::f32(vec![activation.shape[0], out]))
+                        let &[ids_len] = ids.shape.as_slice() else {
+                            return Err(ShapeError::OperandRank {
+                                op: "PackedContraction",
+                                operand: "ids",
+                                expected: 1,
+                                actual: ids.rank(),
+                            });
+                        };
+                        if ids_len != rows {
+                            return Err(ShapeError::OperandDim {
+                                op: "PackedContraction",
+                                operand: "ids",
+                                dim: 0,
+                                expected: rows,
+                                actual: ids_len,
+                            });
+                        }
+                        Ok(TensorType::f32(vec![rows, out]))
                     }
                 }
             }
@@ -1559,9 +1628,9 @@ impl OpKind {
                 .infer(&ins[..roles])?;
                 let ids = &ins[roles];
                 if !matches!(ids.dtype, DType::F32 | DType::I32) {
-                    return Err(ShapeError::PackedContractionDtype {
-                        operand: "row ids",
-                        actual: ids.dtype,
+                    return Err(ShapeError::DtypeOp {
+                        op: "PackedRowGather",
+                        dtype: ids.dtype,
                     });
                 }
                 let mut shape = ids.shape.clone();
@@ -1593,15 +1662,21 @@ impl OpKind {
                         actual: source.clone(),
                     });
                 }
-                let k = source.shape[1];
-                if activation.rank() < 2 || activation.shape.last().copied() != Some(k) {
-                    return Err(ShapeError::DenseContractionActivation {
-                        expected_k: k,
-                        actual: activation.clone(),
+                let &[n, k] = source.shape.as_slice() else {
+                    return Err(ShapeError::DenseContractionWeightRank {
+                        actual: source.clone(),
                     });
-                }
+                };
                 let mut shape = activation.shape.clone();
-                *shape.last_mut().expect("rank checked") = source.shape[0];
+                match shape.last_mut() {
+                    Some(last) if activation.rank() >= 2 && *last == k => *last = n,
+                    _ => {
+                        return Err(ShapeError::DenseContractionActivation {
+                            expected_k: k,
+                            actual: activation.clone(),
+                        });
+                    }
+                }
                 Ok(TensorType::f32(shape))
             }
             OpKind::GroupedDenseContraction { weight, groups } => {
@@ -1694,9 +1769,9 @@ impl OpKind {
                 region_ins.extend_from_slice(&ins[head_operands..]);
                 let out = region.infer(&region_ins)?;
                 if out.shape != head_ty.shape {
-                    return Err(ShapeError::Broadcast {
-                        a: head_ty.shape,
-                        b: out.shape,
+                    return Err(ShapeError::EpilogueShape {
+                        head: head_ty.shape,
+                        region: out.shape,
                     });
                 }
                 Ok(out)
@@ -1706,26 +1781,40 @@ impl OpKind {
                 arity(ins, 3)?;
                 let (x, w, idx) = (&ins[0], &ins[1], &ins[2]);
                 check_index_dtype("IndexedMatMul", idx.dtype)?;
-                if x.rank() != 2 || w.rank() != 3 || idx.rank() != 1 {
-                    return Err(ShapeError::MatMulRank {
-                        a: x.shape.clone(),
-                        b: w.shape.clone(),
+                let rank_error = |operand, expected, actual| ShapeError::OperandRank {
+                    op: "IndexedMatMul",
+                    operand,
+                    expected,
+                    actual,
+                };
+                let &[m, k] = x.shape.as_slice() else {
+                    return Err(rank_error("x", 2, x.rank()));
+                };
+                let &[_, w_k, n] = w.shape.as_slice() else {
+                    return Err(rank_error("w", 3, w.rank()));
+                };
+                let &[idx_len] = idx.shape.as_slice() else {
+                    return Err(rank_error("idx", 1, idx.rank()));
+                };
+                if w_k != k {
+                    return Err(ShapeError::OperandDim {
+                        op: "IndexedMatMul",
+                        operand: "w",
+                        dim: 1,
+                        expected: k,
+                        actual: w_k,
                     });
                 }
-                let (m, k) = (x.shape[0], x.shape[1]);
-                if w.shape[1] != k {
-                    return Err(ShapeError::MatMulContract {
-                        a: x.shape.clone(),
-                        b: w.shape.clone(),
+                if idx_len != m {
+                    return Err(ShapeError::OperandDim {
+                        op: "IndexedMatMul",
+                        operand: "idx",
+                        dim: 0,
+                        expected: m,
+                        actual: idx_len,
                     });
                 }
-                if idx.shape[0] != m {
-                    return Err(ShapeError::Broadcast {
-                        a: x.shape.clone(),
-                        b: idx.shape.clone(),
-                    });
-                }
-                Ok(TensorType::new(vec![m, w.shape[2]], x.dtype))
+                Ok(TensorType::new(vec![m, n], x.dtype))
             }
             OpKind::DynamicUpdateSlice { axis } => {
                 arity(ins, 3)?;
@@ -1733,24 +1822,37 @@ impl OpKind {
                 check_index_dtype("DynamicUpdateSlice", index.dtype)?;
                 check_axis(*axis, operand.rank())?;
                 if update.rank() != operand.rank() {
-                    return Err(ShapeError::UpdateSlice {
-                        operand: operand.shape.clone(),
-                        update: update.shape.clone(),
-                        axis: *axis,
+                    return Err(ShapeError::OperandRank {
+                        op: "DynamicUpdateSlice",
+                        operand: "update",
+                        expected: operand.rank(),
+                        actual: update.rank(),
+                    });
+                }
+                if !index.shape.is_empty() {
+                    return Err(ShapeError::OperandRank {
+                        op: "DynamicUpdateSlice",
+                        operand: "index",
+                        expected: 0,
+                        actual: index.rank(),
                     });
                 }
                 // every non-axis dim must match; the axis extent must fit (bound checked against the
                 // index at eval time, where the concrete index is known).
-                for (d, (&o, &u)) in operand.shape.iter().zip(&update.shape).enumerate() {
-                    if d != *axis && o != u {
-                        return Err(ShapeError::UpdateSlice {
-                            operand: operand.shape.clone(),
-                            update: update.shape.clone(),
-                            axis: *axis,
+                for (dim, (&expected, &actual)) in
+                    operand.shape.iter().zip(&update.shape).enumerate()
+                {
+                    if dim != *axis && expected != actual {
+                        return Err(ShapeError::OperandDim {
+                            op: "DynamicUpdateSlice",
+                            operand: "update",
+                            dim,
+                            expected,
+                            actual,
                         });
                     }
                 }
-                if update.shape[*axis] > operand.shape[*axis] || !index.shape.is_empty() {
+                if update.shape.get(*axis) > operand.shape.get(*axis) {
                     return Err(ShapeError::UpdateSlice {
                         operand: operand.shape.clone(),
                         update: update.shape.clone(),
@@ -1770,12 +1872,9 @@ impl OpKind {
                 arity(ins, 1)?;
                 Ok(ins[0].clone())
             }
-            OpKind::AllGather { .. } => {
-                // Shape-preserving in the single-rank graph: the shard is the full tensor. A multi-rank lowering (card 049b)
-                // would grow the axis dim by world_size; that lowering is deferred. The in-graph aval stays identity so the
-                // rest of the graph sees the full output shape in simulation.
+            OpKind::AllGather { axis, world } => {
                 arity(ins, 1)?;
-                Ok(ins[0].clone())
+                infer_all_gather(&ins[0], *axis, *world)
             }
             OpKind::RandomUniform { cols } => {
                 arity(ins, 1)?;
@@ -1819,7 +1918,7 @@ impl OpKind {
     /// | `PackedRowGather` | the packed gather claim; the oracle defines it directly and decodes only the rows it gathers |
     /// | `ArgTopK` | inverts a rank permutation without the `[.., E]` scatter a decomposition would need |
     /// | `PackI8`, `UnpackI8` | bit packing of KV codes; no arithmetic decomposition |
-    /// | `AllReduce`, `AllGather` | cross-rank collectives; the identity at world size 1 |
+    /// | `AllReduce`, `AllGather` | cross-rank collectives; `AllReduce` keeps the shape, `AllGather` multiplies `axis` by `world` |
     /// | `IndexedMatMul` | the row-indexed MoE contraction; revisited when contraction lowering lands (Card 727) |
     /// | `RandomUniform`, `SampleToken` | the sampling primitives (Card 719): counter-based noise and the token rule |
     ///
@@ -2002,7 +2101,7 @@ impl OpKind {
             OpKind::AllReduce { op, axis } => {
                 format!("all_reduce.{} ax={axis}", format!("{op:?}").to_lowercase())
             }
-            OpKind::AllGather { axis } => format!("all_gather ax={axis}"),
+            OpKind::AllGather { axis, world } => format!("all_gather ax={axis} world={world}"),
             OpKind::RandomUniform { cols } => format!("random_uniform cols={cols}"),
             OpKind::SampleToken { rule } => format!("sample_token rule={rule:?}").to_lowercase(),
         }
@@ -2292,6 +2391,26 @@ impl ScanLayout {
     }
 }
 
+/// `AllGather`: the output is the input with `axis` multiplied by `world`; the dtype is unchanged.
+fn infer_all_gather(
+    input: &TensorType,
+    axis: usize,
+    world: NonZeroU32,
+) -> Result<TensorType, ShapeError> {
+    let mut shape = input.shape.clone();
+    let rank = shape.len();
+    let len = shape.get_mut(axis).ok_or(ShapeError::Axis { axis, rank })?;
+    let gathered = len
+        .checked_mul(world.get() as usize)
+        .ok_or(ShapeError::AllGatherOverflow {
+            axis,
+            len: *len,
+            world,
+        })?;
+    *len = gathered;
+    Ok(TensorType::new(shape, input.dtype))
+}
+
 /// The typing rule of `Scan`: the packed result of the layout the operands imply.
 fn infer_scan(ins: &[TensorType], attrs: &ScanAttrs) -> Result<TensorType, ShapeError> {
     Ok(TensorType::new(
@@ -2330,7 +2449,15 @@ fn infer_rope(ins: &[TensorType], rot: usize) -> Result<TensorType, ShapeError> 
         });
     }
     let mut rotated = x.shape.clone();
-    *rotated.last_mut().expect("rot <= D implies rank >= 1") = rot;
+    match rotated.last_mut() {
+        Some(last) => *last = rot,
+        None => {
+            return Err(ShapeError::RopeWidth {
+                rot,
+                x: x.shape.clone(),
+            });
+        }
+    }
     for (operand, t) in [("cos", &ins[1]), ("sin", &ins[2])] {
         if broadcast_shapes(&rotated, &t.shape).as_ref() != Some(&rotated) {
             return Err(ShapeError::RopeTable {
@@ -2366,13 +2493,14 @@ fn infer_sample_token(ins: &[TensorType], rule: SampleRule) -> Result<TensorType
             actual: logits.dtype,
         });
     }
-    if logits.rank() == 0 {
-        return Err(ShapeError::Arity {
-            expected: 1,
-            got: 0,
+    let Some((_, leading)) = logits.shape.split_last() else {
+        return Err(ShapeError::RankTooLow {
+            op: "SampleToken",
+            operand: "logits",
+            min: 1,
+            actual: 0,
         });
-    }
-    let leading = &logits.shape[..logits.rank() - 1];
+    };
     if !matches!(rule, SampleRule::Greedy) {
         let noise = &ins[1];
         if noise.dtype != DType::F32 {
@@ -2467,6 +2595,20 @@ fn arity(ins: &[TensorType], expected: usize) -> Result<(), ShapeError> {
     Ok(())
 }
 
+/// The last-axis extent of `shape`, or [`ShapeError::RankTooLow`] for a scalar.
+fn last_axis_mut<'a>(
+    shape: &'a mut [usize],
+    op: &'static str,
+    operand: &'static str,
+) -> Result<&'a mut usize, ShapeError> {
+    shape.last_mut().ok_or(ShapeError::RankTooLow {
+        op,
+        operand,
+        min: 1,
+        actual: 0,
+    })
+}
+
 fn check_axis(axis: usize, rank: usize) -> Result<(), ShapeError> {
     if axis >= rank {
         return Err(ShapeError::Axis { axis, rank });
@@ -2483,6 +2625,34 @@ mod tests {
 
     fn f(shape: &[usize]) -> TensorType {
         TensorType::f32(shape.to_vec())
+    }
+
+    /// POOT-747 SC-002 (R466-015): `AllGather` over `world` ranks multiplies the gather axis by `world`.
+    /// The baseline returned the input type for every `world`.
+    #[test]
+    fn all_gather_grows_the_gather_axis_by_world() {
+        let world = |n| NonZeroU32::new(n).unwrap();
+        let gather = |axis, n| OpKind::AllGather {
+            axis,
+            world: world(n),
+        };
+        assert_eq!(gather(1, 2).infer(&[f(&[3, 5])]), Ok(f(&[3, 10])));
+        assert_eq!(gather(0, 4).infer(&[f(&[3, 5])]), Ok(f(&[12, 5])));
+        assert_eq!(gather(1, 1).infer(&[f(&[3, 5])]), Ok(f(&[3, 5])));
+        assert_eq!(
+            gather(2, 2).infer(&[f(&[3, 5])]),
+            Err(ShapeError::Axis { axis: 2, rank: 2 })
+        );
+        assert_eq!(
+            gather(0, 2).infer(&[f(&[usize::MAX, 1])]),
+            Err(ShapeError::AllGatherOverflow {
+                axis: 0,
+                len: usize::MAX,
+                world: world(2)
+            })
+        );
+        // The world is part of the op's identity: two worlds never share a hash or a label.
+        assert_ne!(gather(1, 2).name(), gather(1, 4).name());
     }
 
     /// Card 552 (R-552-2): `kind_name` ignores parameters (two `Reduce`s with different axes share
@@ -3127,10 +3297,16 @@ mod tests {
                 "{label}"
             );
         }
-        assert!(matches!(
+        assert_eq!(
             operation.infer(&[x.clone(), TensorType::f32(vec![4]), stacked.clone()]),
-            Err(ShapeError::PackedContractionActivation { expected_k: 32, .. })
-        ));
+            Err(ShapeError::OperandDim {
+                op: "PackedContraction",
+                operand: "ids",
+                dim: 0,
+                expected: 5,
+                actual: 4,
+            })
+        );
         assert_eq!(
             OpKind::PackedContraction {
                 descriptor,
@@ -3534,10 +3710,30 @@ mod tests {
         // A later operand with rank <= axis would panic on `t.shape[axis]`; infer must return a ShapeError instead.
         // axis=2 is valid for the rank-3 first operand but out of range for the rank-2 second.
         let e = OpKind::Concat { axis: 2 }.infer(&[f(&[1, 2, 3]), f(&[1, 2])]);
-        assert!(matches!(e, Err(ShapeError::Concat { .. })), "got {e:?}");
+        assert!(
+            matches!(
+                e,
+                Err(ShapeError::OperandRank {
+                    expected: 3,
+                    actual: 2,
+                    ..
+                })
+            ),
+            "got {e:?}"
+        );
         // A rank mismatch that does not put axis out of range must also be rejected.
         let e2 = OpKind::Concat { axis: 0 }.infer(&[f(&[2, 3]), f(&[2, 3, 4])]);
-        assert!(matches!(e2, Err(ShapeError::Concat { .. })), "got {e2:?}");
+        assert!(
+            matches!(
+                e2,
+                Err(ShapeError::OperandRank {
+                    expected: 2,
+                    actual: 3,
+                    ..
+                })
+            ),
+            "got {e2:?}"
+        );
     }
 
     #[test]
@@ -3596,7 +3792,307 @@ mod tests {
                 TensorType::scalar(DType::I32),
             ])
             .unwrap_err();
-        assert!(matches!(e, ShapeError::UpdateSlice { .. }));
+        assert!(matches!(e, ShapeError::OperandDim { dim: 0, .. }));
+    }
+
+    fn i32_ty(shape: &[usize]) -> TensorType {
+        TensorType::new(shape.to_vec(), DType::I32)
+    }
+
+    /// `n_inputs` external inputs, one step `op(operands)`, the step result as output.
+    fn one_step_fused(n_inputs: usize, op: FusedOp, operands: Vec<FusedOperand>) -> FusedRegion {
+        FusedRegion {
+            n_inputs,
+            steps: vec![FusedStep {
+                op,
+                inputs: operands,
+            }],
+            output: n_inputs,
+            pack: Vec::new(),
+        }
+    }
+
+    /// SC-002 (R466-025): a `PackLane` operand in a row region is a typed error. The baseline panicked
+    /// (`panic!("PackLane cannot appear in an f32 FusedRow region")`), which a malformed region from a
+    /// buggy pass reached through `infer`.
+    #[test]
+    fn row_region_pack_lane_is_a_typed_error_not_a_panic() {
+        let region = RowRegion {
+            n_inputs: 1,
+            axis: 1,
+            steps: vec![RowStep::Pointwise {
+                op: FusedOp::Unary(UnOp::Neg),
+                inputs: vec![FusedOperand::PackLane { input: 0, lane: 0 }],
+            }],
+            output: 1,
+        };
+        assert_eq!(
+            region.infer(&[i32_ty(&[2, 4])]),
+            Err(ShapeError::FusedOperand(
+                FusedOperandReason::PackLaneInRowRegion
+            ))
+        );
+        let reduce = RowRegion {
+            n_inputs: 1,
+            axis: 1,
+            steps: vec![RowStep::Reduce {
+                op: RedOp::Sum,
+                input: FusedOperand::PackLane { input: 0, lane: 0 },
+            }],
+            output: 1,
+        };
+        assert_eq!(
+            reduce.infer(&[i32_ty(&[2, 4])]),
+            Err(ShapeError::FusedOperand(
+                FusedOperandReason::PackLaneInRowRegion
+            ))
+        );
+    }
+
+    /// SC-003 (R466-024): each shape-failure class returns its own `ShapeError` variant, asserted
+    /// exactly. The rows are the classes the baseline folded into `Arity`, `Concat`, `MatMulRank`,
+    /// `MatMulContract`, `Broadcast`, `UpdateSlice` and `PackedContractionActivation`.
+    #[test]
+    fn each_shape_failure_class_has_its_own_variant() {
+        let scalar = TensorType::scalar(DType::F32);
+        let i32_scalar = TensorType::scalar(DType::I32);
+        let local_neg = |local| {
+            OpKind::Fused(one_step_fused(
+                1,
+                FusedOp::Unary(UnOp::Neg),
+                vec![FusedOperand::Local(local)],
+            ))
+        };
+        let pack_neg = |input, lane| {
+            OpKind::Fused(one_step_fused(
+                1,
+                FusedOp::Unary(UnOp::Neg),
+                vec![FusedOperand::PackLane { input, lane }],
+            ))
+        };
+        let pack_of = |locals: Vec<usize>| {
+            OpKind::Fused(FusedRegion {
+                n_inputs: 2,
+                steps: Vec::new(),
+                output: 0,
+                pack: locals,
+            })
+        };
+        let rank_too_low = |op, operand| ShapeError::RankTooLow {
+            op,
+            operand,
+            min: 1,
+            actual: 0,
+        };
+        let operand_rank = |op, operand, expected, actual| ShapeError::OperandRank {
+            op,
+            operand,
+            expected,
+            actual,
+        };
+        let operand_dim = |op, operand, dim, expected, actual| ShapeError::OperandDim {
+            op,
+            operand,
+            dim,
+            expected,
+            actual,
+        };
+        let epilogue = OpKind::ContractionEpilogue {
+            head: ContractionHead::MatMul,
+            region: one_step_fused(
+                2,
+                FusedOp::Binary(BinOp::Add),
+                vec![FusedOperand::Local(0), FusedOperand::Local(1)],
+            ),
+        };
+        let cases: Vec<(&str, OpKind, Vec<TensorType>, ShapeError)> = vec![
+            (
+                "arg_top_k of a scalar",
+                OpKind::ArgTopK { k: 1 },
+                vec![scalar.clone()],
+                rank_too_low("ArgTopK", "input"),
+            ),
+            (
+                "pack_i8 of a scalar",
+                OpKind::PackI8,
+                vec![scalar.clone()],
+                rank_too_low("PackI8", "input"),
+            ),
+            (
+                "unpack_i8 of a scalar",
+                OpKind::UnpackI8 { len: 4 },
+                vec![i32_scalar.clone()],
+                rank_too_low("UnpackI8", "codes"),
+            ),
+            (
+                "scatter_update of a scalar base",
+                OpKind::ScatterUpdate,
+                vec![scalar.clone(), f(&[1]), i32_ty(&[1])],
+                rank_too_low("ScatterUpdate", "base"),
+            ),
+            (
+                "sample_token of scalar logits",
+                OpKind::SampleToken {
+                    rule: SampleRule::Greedy,
+                },
+                vec![scalar.clone()],
+                rank_too_low("SampleToken", "logits"),
+            ),
+            (
+                "scatter_update src rank",
+                OpKind::ScatterUpdate,
+                vec![f(&[4, 2]), f(&[4]), i32_ty(&[4])],
+                operand_rank("ScatterUpdate", "src", 2, 1),
+            ),
+            (
+                "scatter_update inv rank",
+                OpKind::ScatterUpdate,
+                vec![f(&[4, 2]), f(&[3, 2]), i32_ty(&[4, 1])],
+                operand_rank("ScatterUpdate", "inv", 1, 2),
+            ),
+            (
+                "concat operand rank",
+                OpKind::Concat { axis: 0 },
+                vec![f(&[2, 3]), f(&[2, 3, 4])],
+                operand_rank("Concat", "input", 2, 3),
+            ),
+            (
+                "indexed_matmul x rank",
+                OpKind::IndexedMatMul,
+                vec![f(&[2, 3, 4]), f(&[5, 4, 6]), i32_ty(&[2])],
+                operand_rank("IndexedMatMul", "x", 2, 3),
+            ),
+            (
+                "indexed_matmul w rank",
+                OpKind::IndexedMatMul,
+                vec![f(&[2, 4]), f(&[4, 6]), i32_ty(&[2])],
+                operand_rank("IndexedMatMul", "w", 3, 2),
+            ),
+            (
+                "indexed_matmul idx rank",
+                OpKind::IndexedMatMul,
+                vec![f(&[2, 4]), f(&[5, 4, 6]), i32_ty(&[2, 1])],
+                operand_rank("IndexedMatMul", "idx", 1, 2),
+            ),
+            (
+                "dynamic_update_slice update rank",
+                OpKind::DynamicUpdateSlice { axis: 0 },
+                vec![f(&[2, 4]), f(&[1]), i32_scalar.clone()],
+                operand_rank("DynamicUpdateSlice", "update", 2, 1),
+            ),
+            (
+                "dynamic_update_slice index rank",
+                OpKind::DynamicUpdateSlice { axis: 0 },
+                vec![f(&[2, 4]), f(&[1, 4]), i32_ty(&[1])],
+                operand_rank("DynamicUpdateSlice", "index", 0, 1),
+            ),
+            (
+                "scatter_update src trailing dim",
+                OpKind::ScatterUpdate,
+                vec![f(&[4, 2]), f(&[3, 5]), i32_ty(&[4])],
+                operand_dim("ScatterUpdate", "src", 1, 2, 5),
+            ),
+            (
+                "scatter_update inv extent",
+                OpKind::ScatterUpdate,
+                vec![f(&[4, 2]), f(&[3, 2]), i32_ty(&[3])],
+                operand_dim("ScatterUpdate", "inv", 0, 4, 3),
+            ),
+            (
+                "indexed_matmul contraction extent",
+                OpKind::IndexedMatMul,
+                vec![f(&[2, 4]), f(&[5, 3, 6]), i32_ty(&[2])],
+                operand_dim("IndexedMatMul", "w", 1, 4, 3),
+            ),
+            (
+                "indexed_matmul idx extent",
+                OpKind::IndexedMatMul,
+                vec![f(&[2, 4]), f(&[5, 4, 6]), i32_ty(&[3])],
+                operand_dim("IndexedMatMul", "idx", 0, 2, 3),
+            ),
+            (
+                "dynamic_update_slice non-axis extent",
+                OpKind::DynamicUpdateSlice { axis: 1 },
+                vec![f(&[2, 16, 4]), f(&[3, 1, 4]), i32_scalar.clone()],
+                operand_dim("DynamicUpdateSlice", "update", 0, 2, 3),
+            ),
+            (
+                "dynamic_update_slice axis extent",
+                OpKind::DynamicUpdateSlice { axis: 1 },
+                vec![f(&[2, 16, 4]), f(&[2, 17, 4]), i32_scalar.clone()],
+                ShapeError::UpdateSlice {
+                    operand: vec![2, 16, 4],
+                    update: vec![2, 17, 4],
+                    axis: 1,
+                },
+            ),
+            (
+                "concat non-axis extent",
+                OpKind::Concat { axis: 0 },
+                vec![f(&[2, 3]), f(&[2, 4])],
+                ShapeError::Concat { dim: 1, a: 4, b: 3 },
+            ),
+            (
+                "fused local not defined",
+                local_neg(5),
+                vec![f(&[2])],
+                ShapeError::FusedOperand(FusedOperandReason::LocalNotDefined {
+                    local: 5,
+                    defined: 1,
+                }),
+            ),
+            (
+                "fused pack lane input",
+                pack_neg(3, 0),
+                vec![i32_ty(&[2, 4])],
+                ShapeError::FusedOperand(FusedOperandReason::PackLaneInput {
+                    input: 3,
+                    inputs: 1,
+                }),
+            ),
+            (
+                "fused pack lane width",
+                pack_neg(0, 4),
+                vec![i32_ty(&[2, 4])],
+                ShapeError::FusedOperand(FusedOperandReason::PackLaneWidth {
+                    input: 0,
+                    lane: 4,
+                    width: 4,
+                }),
+            ),
+            (
+                "fused pack member without a unit last axis",
+                pack_of(vec![0]),
+                vec![f(&[2, 3]), f(&[2, 3])],
+                ShapeError::FusedPack {
+                    local: 0,
+                    expected: Box::new(f(&[2, 1])),
+                    actual: Box::new(f(&[2, 3])),
+                },
+            ),
+            (
+                "fused pack members of different types",
+                pack_of(vec![0, 1]),
+                vec![f(&[2, 1]), f(&[3, 1])],
+                ShapeError::FusedPack {
+                    local: 1,
+                    expected: Box::new(f(&[2, 1])),
+                    actual: Box::new(f(&[3, 1])),
+                },
+            ),
+            (
+                "contraction epilogue region result shape",
+                epilogue,
+                vec![f(&[2, 3]), f(&[3, 4]), f(&[5, 2, 4])],
+                ShapeError::EpilogueShape {
+                    head: vec![2, 4],
+                    region: vec![5, 2, 4],
+                },
+            ),
+        ];
+        for (class, op, ins, expected) in cases {
+            assert_eq!(op.infer(&ins), Err(expected), "{class}");
+        }
     }
 
     fn params_hash(op: &OpKind) -> u64 {

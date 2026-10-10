@@ -37,11 +37,11 @@ fn fuse_preserves_the_exact_i32_bit_select_and_clz_chain() {
 
     let inputs = HashMap::from([
         (
-            x.id,
+            x.id(),
             Value::from(HostTensor::i32(vec![4], vec![0, -1, i32::MIN, 1])),
         ),
         (
-            y.id,
+            y.id(),
             Value::from(HostTensor::i32(vec![4], vec![7, 0, 1, 33])),
         ),
     ]);

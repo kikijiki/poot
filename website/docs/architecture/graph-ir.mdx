@@ -57,9 +57,9 @@ struct ValueMeta {
 }
 ```
 
-`ValueId` is a dense integer. Each computed value is defined by one `Eqn`; graph inputs are binders.
-There are no separate def-use chains; a use is an index into `values`, and an equation result
-is defined by the unique `Eqn` whose `out` is that index. This makes all transforms (fusion, substitution, dead-code elimination) straightforward.
+`ValueId` is a `u32` newtype that indexes a `ValueTable`; a bare `usize` is rejected by the compiler. Each computed value is defined by one `Eqn`; graph inputs are binders.
+There are no separate def-use chains; a use is a `ValueId` into `values`, and an equation result
+is defined by the unique `Eqn` whose `out` is that id. This makes all transforms (fusion, substitution, dead-code elimination) straightforward.
 
 ## Storage classes
 

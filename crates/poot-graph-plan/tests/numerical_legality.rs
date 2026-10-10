@@ -4,7 +4,9 @@ use poot_tensor::DType;
 use std::collections::HashMap;
 
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
-use poot_graph_ir::{BinOp, Builder, Graph, OpKind, Scalar, StateRole, TensorType, UnOp};
+use poot_graph_ir::{
+    BinOp, Builder, Graph, OpKind, Scalar, StateRole, TensorType, UnOp, ValueId, ValueTable,
+};
 use poot_graph_plan::canonicalize;
 use poot_graph_plan::{CompileOptions, Submission, Target, compile};
 use poot_target::{Backend, DeviceCaps};
@@ -30,12 +32,12 @@ fn target(backend: Backend) -> Target {
 
 /// Compare every word of every published result, including both carried-state buffers. A NaN is
 /// never accepted as numerical parity. Non-finite input semantics have separate classification tests.
-fn assert_observables(graph: &Graph, transformed: &Graph, inputs: &HashMap<usize, HostTensor>) {
-    let values: HashMap<usize, Value> = inputs
+fn assert_observables(graph: &Graph, transformed: &Graph, inputs: &HashMap<ValueId, HostTensor>) {
+    let values: HashMap<ValueId, Value> = inputs
         .iter()
         .map(|(&k, v)| (k, Value::from(v.clone())))
         .collect();
-    let before: Vec<Option<HostTensor>> = eval(
+    let before: ValueTable<Option<HostTensor>> = eval(
         graph,
         &values,
         EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
@@ -46,7 +48,7 @@ fn assert_observables(graph: &Graph, transformed: &Graph, inputs: &HashMap<usize
     .into_iter()
     .map(|v| v.map(|v| v.into_host().unwrap()))
     .collect();
-    let after: Vec<Option<HostTensor>> = eval(
+    let after: ValueTable<Option<HostTensor>> = eval(
         transformed,
         &values,
         EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
@@ -99,7 +101,7 @@ fn with_states(b: Builder, output: poot_graph_ir::Traced) -> Graph {
     b.finish_with_state(output, &[(first, next_first), (second, next_second)])
 }
 
-fn bind_states(graph: &Graph, inputs: &mut HashMap<usize, HostTensor>) {
+fn bind_states(graph: &Graph, inputs: &mut HashMap<ValueId, HostTensor>) {
     for (index, pair) in graph.state_pairs().enumerate() {
         let shape = graph.aval(pair.input).shape.clone();
         let count = shape.iter().product();
@@ -120,16 +122,16 @@ fn finite_scaled_contraction_survives_compile() {
     let output = b.matmul(scaled, w);
     let graph = with_states(b, output);
     let mut inputs = HashMap::from([
-        (x.id, HostTensor::f32(vec![1, 1], vec![1.0e30])),
-        (w.id, HostTensor::f32(vec![1, 1], vec![1.0e30])),
+        (x.id(), HostTensor::f32(vec![1, 1], vec![1.0e30])),
+        (w.id(), HostTensor::f32(vec![1, 1], vec![1.0e30])),
     ]);
     bind_states(&graph, &mut inputs);
     let program = compile(&graph, &target(Backend::SpirvVulkan), &OPTIONS).unwrap();
-    let values: HashMap<usize, Value> = inputs
+    let values: HashMap<ValueId, Value> = inputs
         .iter()
         .map(|(&k, v)| (k, Value::from(v.clone())))
         .collect();
-    let original: Vec<Option<HostTensor>> = eval(
+    let original: ValueTable<Option<HostTensor>> = eval(
         &graph,
         &values,
         EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
@@ -140,7 +142,7 @@ fn finite_scaled_contraction_survives_compile() {
     .into_iter()
     .map(|v| v.map(|v| v.into_host().unwrap()))
     .collect();
-    let compiled: Vec<Option<HostTensor>> = eval(
+    let compiled: ValueTable<Option<HostTensor>> = eval(
         program.graph(),
         &values,
         EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
@@ -204,9 +206,9 @@ fn scalar_contraction_corner_corpus_is_bitwise() {
             };
             let graph = with_states(b, result);
             let mut inputs = HashMap::from([
-                (x.id, HostTensor::f32(vec![2, 2], x_data.repeat(2))),
+                (x.id(), HostTensor::f32(vec![2, 2], x_data.repeat(2))),
                 (
-                    w.id,
+                    w.id(),
                     HostTensor::f32(vec![2, 2], vec![w_data[0], w_data[0], w_data[1], w_data[1]]),
                 ),
             ]);
@@ -228,15 +230,15 @@ fn reciprocal_rounding_is_not_division() {
     let output = b.binary(BinOp::Mul, a, reciprocal);
     let graph = with_states(b, output);
     let mut inputs = HashMap::from([
-        (a.id, HostTensor::f32(vec![4], vec![3.0, -3.0, 0.0, -0.0])),
-        (d.id, HostTensor::f32(vec![4], vec![7.0, 7.0, -3.0, -3.0])),
+        (a.id(), HostTensor::f32(vec![4], vec![3.0, -3.0, 0.0, -0.0])),
+        (d.id(), HostTensor::f32(vec![4], vec![7.0, 7.0, -3.0, -3.0])),
     ]);
     bind_states(&graph, &mut inputs);
-    let values: HashMap<usize, Value> = inputs
+    let values: HashMap<ValueId, Value> = inputs
         .iter()
         .map(|(&k, v)| (k, Value::from(v.clone())))
         .collect();
-    let before: Vec<Option<HostTensor>> = eval(
+    let before: ValueTable<Option<HostTensor>> = eval(
         &graph,
         &values,
         EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
@@ -248,7 +250,7 @@ fn reciprocal_rounding_is_not_division() {
     .map(|v| v.map(|v| v.into_host().unwrap()))
     .collect();
     assert_ne!(
-        before[output.id].as_ref().unwrap().as_f32().unwrap()[0].to_bits(),
+        before[output.id()].as_ref().unwrap().as_f32().unwrap()[0].to_bits(),
         (3.0f32 / 7.0).to_bits(),
         "the pinned reciprocal counterexample must distinguish division"
     );
@@ -278,14 +280,14 @@ fn narrow_contraction_rounds_before_fused_epilogue() {
         let graph = with_states(b, output);
         let mut inputs = HashMap::from([
             (
-                x.id,
+                x.id(),
                 HostTensor::f32(vec![2, 2], vec![1.0, 1.0, -1.0, -1.0]),
             ),
             (
-                w.id,
+                w.id(),
                 HostTensor::f32(vec![2, 2], vec![1.0, 2.0, half_ulp, half_ulp * 2.0]),
             ),
-            (bias.id, HostTensor::f32(vec![2], vec![-1.0, -2.0])),
+            (bias.id(), HostTensor::f32(vec![2], vec![-1.0, -2.0])),
         ]);
         bind_states(&graph, &mut inputs);
         let program = compile(&graph, &target(Backend::Nvptx), &OPTIONS).unwrap();
@@ -297,11 +299,11 @@ fn narrow_contraction_rounds_before_fused_epilogue() {
                 .any(|eqn| matches!(eqn.op, OpKind::Fused(_))),
             "the real compiler must select the F32 epilogue region"
         );
-        let values: HashMap<usize, Value> = inputs
+        let values: HashMap<ValueId, Value> = inputs
             .iter()
             .map(|(&k, v)| (k, Value::from(v.clone())))
             .collect();
-        let compiled: Vec<Option<HostTensor>> = eval(
+        let compiled: ValueTable<Option<HostTensor>> = eval(
             program.graph(),
             &values,
             EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
@@ -349,19 +351,19 @@ fn explicit_narrow_casts_remain_between_contraction_and_epilogue() {
         let output = b.binary_scalar(BinOp::Mul, sum, Scalar::F32(1.0));
         let graph = with_states(b, output);
         let mut inputs = HashMap::from([
-            (x.id, HostTensor::f32(vec![1, 2], vec![1.0, 1.0])),
+            (x.id(), HostTensor::f32(vec![1, 2], vec![1.0, 1.0])),
             (
-                w.id,
+                w.id(),
                 HostTensor::f32(vec![2, 2], vec![1.0, 1.0, half_ulp, half_ulp * 3.0]),
             ),
         ]);
         bind_states(&graph, &mut inputs);
         let program = compile(&graph, &target(Backend::Nvptx), &OPTIONS).unwrap();
-        let values: HashMap<usize, Value> = inputs
+        let values: HashMap<ValueId, Value> = inputs
             .iter()
             .map(|(&k, v)| (k, Value::from(v.clone())))
             .collect();
-        let result: Vec<Option<HostTensor>> = eval(
+        let result: ValueTable<Option<HostTensor>> = eval(
             program.graph(),
             &values,
             EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
@@ -395,15 +397,18 @@ fn nonfinite_inputs_keep_ieee_classification() {
     let program = compile(&graph, &target(Backend::SpirvVulkan), &OPTIONS).unwrap();
     for data in [vec![f32::INFINITY, 1.0], vec![f32::NAN, 1.0]] {
         let inputs = HashMap::from([
-            (x.id, HostTensor::f32(vec![1, 2], data.clone())),
-            (w.id, HostTensor::f32(vec![2, 2], vec![1.0, 0.0, 1.0, 1.0])),
+            (x.id(), HostTensor::f32(vec![1, 2], data.clone())),
+            (
+                w.id(),
+                HostTensor::f32(vec![2, 2], vec![1.0, 0.0, 1.0, 1.0]),
+            ),
         ]);
-        let values: HashMap<usize, Value> = inputs
+        let values: HashMap<ValueId, Value> = inputs
             .iter()
             .map(|(&k, v)| (k, Value::from(v.clone())))
             .collect();
         for candidate in [&graph, &canonicalize(&graph), program.graph()] {
-            let env: Vec<Option<HostTensor>> = eval(
+            let env: ValueTable<Option<HostTensor>> = eval(
                 candidate,
                 &values,
                 EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
@@ -472,7 +477,7 @@ fn legal_attention_regions_keep_selection_and_prescaled_query() {
         let graph = with_states(b, output);
         let mut inputs = HashMap::from([
             (
-                q.id,
+                q.id(),
                 HostTensor::f32(
                     vec![1, 2, 1, 4],
                     if prescale {
@@ -483,7 +488,7 @@ fn legal_attention_regions_keep_selection_and_prescaled_query() {
                 ),
             ),
             (
-                k.id,
+                k.id(),
                 HostTensor::f32(
                     vec![1, 2, 3, 4],
                     (0..24)
@@ -498,14 +503,14 @@ fn legal_attention_regions_keep_selection_and_prescaled_query() {
                 ),
             ),
             (
-                v.id,
+                v.id(),
                 HostTensor::f32(
                     vec![1, 2, 3, 4],
                     (0..24).map(|i| (i as f32 - 12.0) * 0.2).collect(),
                 ),
             ),
             (
-                mask.id,
+                mask.id(),
                 HostTensor::f32(vec![1, 1, 1, 3], vec![0.0, -0.125, 0.25]),
             ),
         ]);
@@ -524,7 +529,7 @@ fn legal_attention_regions_keep_selection_and_prescaled_query() {
         );
         if prescale {
             assert!(
-                matches!(flash[0].inputs[0], Operand::Value(id) if id == query.id),
+                matches!(flash[0].inputs[0], Operand::Value(id) if id == query.id()),
                 "the fused kernel must consume the already-scaled query"
             );
             assert!(matches!(&flash[0].op, OpKind::Attention(attrs) if attrs.scale == 1.0));
@@ -563,27 +568,27 @@ fn softcap_requires_the_exact_reciprocal_literal() {
     let original = with_states(b, out);
     let mut inputs = HashMap::from([
         (
-            q.id,
+            q.id(),
             HostTensor::f32(
                 vec![1, 2, 3, 4],
                 (0..24).map(|i| (i as f32 * 0.31).sin()).collect(),
             ),
         ),
         (
-            k.id,
+            k.id(),
             HostTensor::f32(
                 vec![1, 2, 3, 4],
                 (0..24).map(|i| (i as f32 * 0.71).cos()).collect(),
             ),
         ),
         (
-            v.id,
+            v.id(),
             HostTensor::f32(
                 vec![1, 2, 3, 4],
                 (0..24).map(|i| i as f32 * 0.13 - 1.0).collect(),
             ),
         ),
-        (mask.id, HostTensor::f32(vec![1, 1, 3, 3], vec![0.0; 9])),
+        (mask.id(), HostTensor::f32(vec![1, 1, 3, 3], vec![0.0; 9])),
     ]);
     bind_states(&original, &mut inputs);
     for exact in [true, false] {
@@ -640,16 +645,16 @@ fn underflow_before_contraction(scale_rhs: bool) {
         (vec![1e-30, 0.0, 1e-30, 0.0], vec![1e30; 4])
     };
     let mut inputs = HashMap::from([
-        (x.id, HostTensor::f32(vec![2, 2], x_data)),
-        (w.id, HostTensor::f32(vec![2, 2], w_data)),
+        (x.id(), HostTensor::f32(vec![2, 2], x_data)),
+        (w.id(), HostTensor::f32(vec![2, 2], w_data)),
     ]);
     bind_states(&graph, &mut inputs);
     let program = compile(&graph, &target(Backend::SpirvVulkan), &OPTIONS).unwrap();
-    let values: HashMap<usize, Value> = inputs
+    let values: HashMap<ValueId, Value> = inputs
         .iter()
         .map(|(&k, v)| (k, Value::from(v.clone())))
         .collect();
-    let before: Vec<Option<HostTensor>> = eval(
+    let before: ValueTable<Option<HostTensor>> = eval(
         &graph,
         &values,
         EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
@@ -660,7 +665,7 @@ fn underflow_before_contraction(scale_rhs: bool) {
     .into_iter()
     .map(|v| v.map(|v| v.into_host().unwrap()))
     .collect();
-    let after: Vec<Option<HostTensor>> = eval(
+    let after: ValueTable<Option<HostTensor>> = eval(
         program.graph(),
         &values,
         EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
@@ -706,11 +711,11 @@ fn reciprocal_identity_reports_no_numerical_decline() {
     let graph = with_states(b, output);
     let mut inputs = HashMap::from([
         (
-            denominator.id,
+            denominator.id(),
             HostTensor::f32(vec![2, 2], vec![2.0, 4.0, 8.0, 16.0]),
         ),
         (
-            weight.id,
+            weight.id(),
             HostTensor::f32(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]),
         ),
     ]);

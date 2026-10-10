@@ -52,7 +52,7 @@ fn fused_equals_unfused_elementwise_chain_all_fusable() {
         // Two leaf constants. Binary steps use x1 as the "other" arg so each acc is consumed once.
         let x0 = b.constant("x0", TensorType::f32(shape.clone()));
         let x1 = b.constant("x1", TensorType::f32(shape.clone()));
-        let leaf_ids = [x0.id, x1.id];
+        let leaf_ids = [x0.id(), x1.id()];
         // Build a deep single-use chain: every intermediate consumed exactly once.
         let depth = 3 + (rng() % 6) as usize; // 3..8
         let mut acc = x0;
@@ -193,15 +193,15 @@ fn fused_equals_unfused_matmul_epilogue() {
         let numel_b = m * n;
         let mut inputs = HashMap::new();
         inputs.insert(
-            a.id,
+            a.id(),
             Value::from(HostTensor::f32(vec![m, k], fill(numel_a, seed * 5 + 1))),
         );
         inputs.insert(
-            w.id,
+            w.id(),
             Value::from(HostTensor::f32(vec![k, n], fill(numel_w, seed * 5 + 2))),
         );
         inputs.insert(
-            bias.id,
+            bias.id(),
             Value::from(HostTensor::f32(
                 out_shape.clone(),
                 fill(numel_b, seed * 5 + 3),

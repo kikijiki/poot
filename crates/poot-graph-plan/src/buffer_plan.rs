@@ -24,7 +24,7 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use poot_graph_ir::{Graph, ValidationChannel, ValueId};
+use poot_graph_ir::{Graph, ValidationChannel, ValueId, ValueTable};
 use poot_target::BufferStorage;
 
 use crate::{GraphStorage, Plan, StateCommitPlan, ValidationPacketPlan, value_ids};
@@ -131,8 +131,8 @@ impl SlotInfo {
 /// result); `state_commit` and `validation` are the program's already-derived plans, read only to find
 /// the values this program's epilogue exports by a whole-buffer `copy`/`read` (see the module doc).
 ///
-/// A value's lifetime spans the equation index that materializes it (`Plan::Dispatches`/
-/// `Collective`; `Alias`/`View` never materialize - a read of them extends their
+/// A value's lifetime spans the equation index that materializes it (`Plan::Dispatches`;
+/// `Alias`/`View` never materialize - a read of them extends their
 /// root's lifetime instead, the same alias resolution [`crate::state_commit::state_commit_from_plans`]
 /// already runs) to the last equation that reads it, inclusive: an equation that both reads a value
 /// last and produces a new one is one dispatch with distinct input/output buffers, so the two are
@@ -145,7 +145,7 @@ pub(crate) fn plan_buffers<V: ValidationChannel>(
     validation: &ValidationPacketPlan,
 ) -> BufferPlan {
     let n = g.eqns.len();
-    let mut roots: Vec<ValueId> = (0..g.values.len()).collect();
+    let mut roots: ValueTable<ValueId> = g.values.ids().collect();
     let mut birth: HashMap<ValueId, usize> = HashMap::new();
     let mut death: HashMap<ValueId, usize> = HashMap::new();
     let mut elems: HashMap<ValueId, usize> = HashMap::new();

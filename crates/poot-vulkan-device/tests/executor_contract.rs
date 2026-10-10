@@ -25,6 +25,20 @@ fn vulkan() -> Option<VulkanDevice> {
     open_or_skip(DeviceBackend::Vulkan, VulkanDevice::new())
 }
 
+/// POOT-1100 LP-3 (vulkan): `Device::write_with` writes straight into the buffer's host-visible mapping,
+/// whole and from an unaligned offset, with no staging; the read-back holds exactly the bytes written. The
+/// probe's "chunk" is 1 MiB: this backend has none (one `fill` call), and the probe only needs a buffer
+/// of a few MiB.
+/// Mutation: in `DeviceBuffer::write_with_at` write at `offset - 1`; the offset write lands a byte early
+/// and this row goes red.
+#[test]
+fn lp3_vulkan_write_with_is_exact_into_the_mapping() {
+    let Some(mut device) = vulkan() else {
+        return;
+    };
+    poot_executor_parity::write_probe::chunked_write_is_exact(&mut device, 1 << 20, 1);
+}
+
 fn step_inputs(step: &[StepFixture]) -> StepInputs<'_> {
     let mut inputs = StepInputs::new();
     for value in step {
@@ -122,9 +136,7 @@ fn a_vulkan_buffer_moves_into_another_thread() {
     let buffer = device
         .allocate(BufferRole::Input, BufferStorage::f32(), 4)
         .unwrap();
-    device
-        .write(&buffer, 0, &f32_bytes(&[1.0, 2.0, 3.0, 4.0]))
-        .unwrap();
+    poot_executor::write_slice(&mut device, &buffer, 0, &f32_bytes(&[1.0, 2.0, 3.0, 4.0])).unwrap();
     let clone = buffer.clone();
     let reader = std::thread::spawn(move || {
         let mut out = [0u8; 16];
@@ -152,7 +164,7 @@ fn f32_buffer(
     let buffer = device
         .allocate(role, BufferStorage::f32(), values.len())
         .unwrap();
-    device.write(&buffer, 0, &f32_bytes(values)).unwrap();
+    poot_executor::write_slice(device, &buffer, 0, &f32_bytes(values)).unwrap();
     buffer
 }
 
@@ -278,8 +290,8 @@ fn copy_round_trips_every_element_width_with_no_sentinel_left() {
         let src = device.allocate(BufferRole::Input, storage, elems).unwrap();
         let dst = device.allocate(BufferRole::Output, storage, elems).unwrap();
         let payload: Vec<u8> = (0..elems * width).map(|i| i as u8 + 1).collect();
-        device.write(&src, 0, &payload).unwrap();
-        device.write(&dst, 0, &vec![0xAA; dst.byte_len()]).unwrap();
+        poot_executor::write_slice(&mut device, &src, 0, &payload).unwrap();
+        poot_executor::write_slice(&mut device, &dst, 0, &vec![0xAA; dst.byte_len()]).unwrap();
         device.begin(Submission::Replay).unwrap();
         device.copy(&src, &dst).unwrap();
         let recording = device.finish().unwrap().expect("a recording");
@@ -317,7 +329,7 @@ fn a_long_recording_is_cut_into_several_submissions_and_replays_exactly() {
     let ping = f32_buffer(&mut device, BufferRole::Activation, &[0.0; 4]);
     let pong = f32_buffer(&mut device, BufferRole::Activation, &[0.0; 4]);
     let chain = |device: &mut VulkanDevice, dispatches: usize, work: u64| {
-        device.write(&ping, 0, &f32_bytes(&[0.0; 4])).unwrap();
+        poot_executor::write_slice(device, &ping, 0, &f32_bytes(&[0.0; 4])).unwrap();
         device.begin(Submission::Replay).unwrap();
         for i in 0..dispatches {
             let (src, dst) = if i % 2 == 0 {
@@ -393,16 +405,16 @@ fn a_kernel_assert_is_a_fault_raised_at_synchronize() {
     let idx = device
         .allocate(BufferRole::Input, BufferStorage::i32(), 4)
         .unwrap();
-    device
-        .write(
-            &idx,
-            0,
-            &[3i32, 0, 4, 1]
-                .iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect::<Vec<u8>>(),
-        )
-        .unwrap();
+    poot_executor::write_slice(
+        &mut device,
+        &idx,
+        0,
+        &[3i32, 0, 4, 1]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    )
+    .unwrap();
     let data = f32_buffer(&mut device, BufferRole::Input, &[10.0, 20.0, 30.0, 40.0]);
     let out = f32_buffer(&mut device, BufferRole::Output, &[0.0; 4]);
     device.begin(Submission::Replay).unwrap();
@@ -445,16 +457,16 @@ fn a_kernel_assert_is_a_fault_raised_at_synchronize() {
     );
 
     // The error word is cleared for the next replay: the same recording over in-range indices is clean.
-    device
-        .write(
-            &idx,
-            0,
-            &[3i32, 0, 2, 1]
-                .iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect::<Vec<u8>>(),
-        )
-        .unwrap();
+    poot_executor::write_slice(
+        &mut device,
+        &idx,
+        0,
+        &[3i32, 0, 2, 1]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    )
+    .unwrap();
     device.replay(&recording).unwrap();
     device.synchronize().expect("no fault on in-range indices");
     assert_eq!(read_f32(&mut device, &out), [40.0, 10.0, 30.0, 20.0]);

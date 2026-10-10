@@ -22,7 +22,7 @@ use std::sync::Arc;
 use poot_graph_ir::{Builder, Graph, ValidationOutputs};
 use poot_quant::format::{OperandRole, ScaleEncoding, WeightFormat};
 use poot_quant::weights::{WeightEntry, WeightMap, WeightStore};
-use poot_quant::{PackedPayload, PackedWeight, SourceRole};
+use poot_quant::{PackedPayload, PackedWeight, SourceRole, StoredBytes};
 
 use crate::chat::ChatFormat;
 use crate::components::linear::WeightError;
@@ -399,7 +399,7 @@ fn e4m3_payload(shape: [usize; 2], seed: u64) -> PackedPayload {
     };
     let weight = PackedWeight::try_new(format, shape).expect("a block-scaled E4M3 weight");
     let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
-    let sources: Vec<(SourceRole, Arc<[u8]>)> = weight
+    let sources: Vec<(SourceRole, StoredBytes)> = weight
         .sources()
         .into_iter()
         .map(|role| {
@@ -418,7 +418,7 @@ fn e4m3_payload(shape: [usize; 2], seed: u64) -> PackedPayload {
                     })
                     .collect(),
             };
-            (role, Arc::from(bytes))
+            (role, StoredBytes::from(bytes))
         })
         .collect();
     PackedPayload::try_new(weight, sources).expect("finite codes and scales are admitted")

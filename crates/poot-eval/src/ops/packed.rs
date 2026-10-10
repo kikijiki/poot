@@ -5,7 +5,7 @@
 //! charges every packed output against the caller's `EvalBudget` instead, so the limit is an option,
 //! not a hardcoded wall (deval A5).
 
-use poot_graph_ir::{Graph, OpKind, Operand, ValidationChannel, ValueId};
+use poot_graph_ir::{Graph, OpKind, Operand, ValidationChannel, ValueId, ValueTable};
 use poot_quant::{PackedComponentRef, PackedPayload, PackedStack, SourceRole};
 
 use crate::value::PackedEvalError;
@@ -32,7 +32,7 @@ pub(crate) fn checked_packed_oracle_product(
 pub(crate) fn packed_components<'a, V: ValidationChannel>(
     g: &Graph<V>,
     eqn: &poot_graph_ir::Eqn,
-    env: &'a [Option<Value>],
+    env: &'a ValueTable<Option<Value>>,
     descriptor: poot_quant::PackedWeight,
 ) -> Result<&'a std::sync::Arc<PackedPayload>, EvalError> {
     let owner = bind_packed_carriers(g, eqn, descriptor, |value_id| {
@@ -162,7 +162,7 @@ fn decode_packed_row(owner: &PackedPayload, row: usize, out: &mut [f32]) -> Resu
 /// The row ids operand of a `PackedRowGather` (its last input), dense F32 or I32.
 pub(crate) fn packed_row_ids<'a>(
     eqn: &poot_graph_ir::Eqn,
-    env: &'a [Option<Value>],
+    env: &'a ValueTable<Option<Value>>,
 ) -> Result<&'a HostTensor, EvalError> {
     let Some(Operand::Value(ids)) = eqn.inputs.last() else {
         return Err(PackedEvalError::Binding { field: "operands" }.into());
@@ -232,7 +232,7 @@ pub(crate) fn evaluate_packed_row_gather(
 pub(crate) fn packed_stack_components<'a, V: ValidationChannel>(
     g: &Graph<V>,
     eqn: &poot_graph_ir::Eqn,
-    env: &'a [Option<Value>],
+    env: &'a ValueTable<Option<Value>>,
     descriptor: poot_quant::PackedWeight,
     experts: usize,
 ) -> Result<&'a std::sync::Arc<PackedStack>, EvalError> {
