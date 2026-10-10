@@ -65,7 +65,7 @@ fn a_norm_scale_cast_folds_into_the_row_region_and_evaluates_identically() {
     let x = b.constant("x", TensorType::f32(vec![1, 1, n]));
     let w = b.constant("w", TensorType::new(vec![n], DType::BF16));
     let out = rmsnorm(&b, x, b.cast(w, DType::F32), 1e-6);
-    let (xi, wi) = (x.id, w.id);
+    let (xi, wi) = (x.id(), w.id());
     let g = b.finish(out);
 
     let og = optimize(&g);
@@ -117,12 +117,13 @@ fn a_bias_cast_folds_into_the_contraction_epilogue_and_evaluates_identically() {
     let y = b.matmul(x, w);
     let bias = b.broadcast(b.cast(bias, DType::F32), vec![1, 1, n]);
     let out = b.binary(BinOp::Add, y, bias);
-    let (xi, wi) = (x.id, w.id);
+    let (xi, wi) = (x.id(), w.id());
     let g = b.finish(out);
     let bias_const = g
         .values
-        .iter()
-        .position(|v| v.name.as_deref() == Some("bias"))
+        .iter_enumerated()
+        .find(|(_, v)| v.name.as_deref() == Some("bias"))
+        .map(|(id, _)| id)
         .expect("the bias const");
 
     let og = optimize(&g);

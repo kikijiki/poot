@@ -331,6 +331,7 @@ impl RocmContext {
             hsa: Arc::new(HsaRuntimeOwner {
                 hsa,
                 memory: poot_runtime_common::MemoryCounters::new(),
+                uploads_in_flight: Mutex::default(),
             }),
             gpu_agent,
             isa_name: isa,
@@ -347,6 +348,7 @@ impl RocmContext {
             compute_units,
             timeouts: TimeoutLeaks::default(),
             pending: Mutex::default(),
+            upload_ring: Mutex::default(),
             batch_waits: Arc::default(),
             wait_timeout: options.wait_timeout,
             device_timing,
@@ -398,6 +400,40 @@ impl RocmContext {
         staging: StagingBuffer,
         after: &[bindings::hsa_signal_t],
     ) -> Result<StagingBuffer, RocmError> {
+        // Every upload copy lands before another transfer starts: one may be the source of this one.
+        self.drain_uploads("dma_copy")?;
+        // SAFETY: the function contract is `dma_copy_begin`'s.
+        let completion = unsafe { self.dma_copy_begin(dst, src, size, after) }?;
+        let held = self.wait_completion_bounded(
+            completion,
+            "dma_copy",
+            Held {
+                staging: Some(staging),
+                ..Held::default()
+            },
+        )?;
+        Ok(held
+            .staging
+            .expect("a completed wait hands back the staging buffer it was given"))
+    }
+
+    /// Submit one `hsa_amd_memory_async_copy` and return its completion signal (created at 1, dropped to 0 by
+    /// the copy) without waiting: the caller proves completion with
+    /// [`Self::wait_completion_bounded`] and owns the signal until then. The copy starts once every signal in
+    /// `after` is below 1.
+    ///
+    /// # Safety
+    ///
+    /// Both ranges must be valid for `size` bytes, one pinned (agent-accessible) runtime-owned staging memory
+    /// and the other a live pool allocation of this runtime, and both must stay alive and unmoved until the
+    /// returned signal is proven complete.
+    pub(crate) unsafe fn dma_copy_begin(
+        &self,
+        dst: *mut c_void,
+        src: *const c_void,
+        size: usize,
+        after: &[bindings::hsa_signal_t],
+    ) -> Result<bindings::hsa_signal_t, RocmError> {
         self.ensure_not_poisoned("dma_copy")?;
         let mut completion = bindings::hsa_signal_t { handle: 0 };
         // SAFETY: zero consumers with a null list is allowed; `completion` is a valid out-pointer.
@@ -410,10 +446,8 @@ impl RocmContext {
             ))?;
         }
         let after_count = u32::try_from(after.len()).expect("DMA dependency count fits in u32");
-        // SAFETY: both ranges are valid for `size` bytes (function contract) and stay alive until the
-        // copy is proven complete: the staging buffer moves into the wait below, which leaks it on
-        // timeout, and a timeout poisons the runtime so no pool allocation is freed. `after` holds
-        // `after_count` live signals and outlives the call.
+        // SAFETY: both ranges are valid for `size` bytes and stay alive until the copy is proven complete
+        // (function contract); `after` holds `after_count` live signals and outlives the call.
         let status = unsafe {
             (self.hsa.funcs.hsa_amd_memory_async_copy)(
                 dst,
@@ -437,43 +471,7 @@ impl RocmContext {
             }
             return Err(RocmError::Driver(HsaStatus { code: status }));
         }
-        let held = self.wait_completion_bounded(
-            completion,
-            "dma_copy",
-            Held {
-                staging: Some(staging),
-                ..Held::default()
-            },
-        )?;
-        Ok(held
-            .staging
-            .expect("a completed wait hands back the staging buffer it was given"))
-    }
-
-    /// Card 602: DMA `size` host bytes at `src` into device pointer `dst` through a runtime-owned
-    /// staging buffer. The host copies `src` into staging before the copy is submitted, so a timeout
-    /// leaves no device reference to the caller's memory.
-    ///
-    /// # Safety
-    /// `dst` must point to a live allocation of at least `size` bytes; `src` must be valid to read for
-    /// `size` bytes.
-    pub(crate) unsafe fn dma_upload(
-        &self,
-        src: *const u8,
-        dst: *mut c_void,
-        size: usize,
-    ) -> Result<(), RocmError> {
-        let mut staging = self.dma_staging(size)?;
-        // SAFETY: `src` is readable for `size` bytes (function contract) and `staging` holds `size`
-        // freshly allocated bytes, so the ranges do not overlap.
-        unsafe {
-            std::ptr::copy_nonoverlapping(src, staging.host_mut_ptr(), size);
-        }
-        let staged = staging.agent_ptr();
-        // SAFETY: `staged` is `staging`'s agent address and `dst` a live allocation of `size` bytes
-        // (function contract).
-        unsafe { self.dma_copy(dst, staged, size, staging, &[]) }?;
-        Ok(())
+        Ok(completion)
     }
 
     /// Card 602: DMA `size` device bytes at `src` into host pointer `dst` through a runtime-owned
@@ -505,9 +503,32 @@ impl RocmContext {
         Ok(())
     }
 
+    /// Write `size` host bytes at `src` to device pointer `dst` through the upload ring: the staged DMA
+    /// every coarse write takes. Returns with the last copy in flight (module `upload`).
+    ///
+    /// # Safety
+    /// `dst` must point to a live allocation of at least `size` bytes that outlives the next
+    /// [`Self::drain_uploads`]; `src` must be valid to read for `size` bytes.
+    pub(crate) unsafe fn ring_copy(
+        &self,
+        src: *const u8,
+        dst: *mut c_void,
+        size: usize,
+    ) -> Result<(), RocmError> {
+        if size == 0 {
+            return Ok(());
+        }
+        // SAFETY: `src` is readable for `size` bytes (function contract), so every chunk range is.
+        unsafe {
+            self.ring_write(dst, size, &mut |range, out| {
+                std::ptr::copy_nonoverlapping(src.add(range.start), out.as_mut_ptr(), range.len());
+            })
+        }
+    }
+
     /// Card 125 (FR-004/SC-004): write `size` bytes from host pointer `src` to device pointer `dst`,
     /// branching on [`Self::upload_strategy`]: `ptr::copy_nonoverlapping` when `fine_pool` is
-    /// host-visible (`HostWrite`, APU/HMM), or a staged DMA ([`Self::dma_upload`]) when it is not
+    /// host-visible (`HostWrite`, APU/HMM), or a staged DMA ([`Self::ring_copy`]) when it is not
     /// (`Dma`, discrete VRAM).
     ///
     /// # Safety
@@ -534,8 +555,9 @@ impl RocmContext {
                 }
                 Ok(())
             }
-            // SAFETY: the function contract is `dma_upload`'s.
-            UploadStrategy::Dma => unsafe { self.dma_upload(src, dst, size) },
+            // SAFETY: `dst` is a live allocation of `size` bytes and `src` readable for `size` bytes (function
+            // contract); the destination stays alive until the next drain (the contract of the whole write path).
+            UploadStrategy::Dma => unsafe { self.ring_copy(src, dst, size) },
         }
     }
 
@@ -569,7 +591,7 @@ impl RocmContext {
     }
 
     /// Card 547a: [`Self::upload_bytes_into`] for a fine-pool buffer, or an unconditional staged DMA
-    /// ([`Self::dma_upload`]) for a coarse-pool one - the coarse-grained pool is never assumed
+    /// ([`Self::ring_copy`]) for a coarse-pool one - the coarse-grained pool is never assumed
     /// host-mappable (the gfx1151 risk the card names), so a coarse write always bridges through a
     /// pinned host staging buffer and a device-to-device copy, regardless of `self.upload_strategy`
     /// (which describes `fine_pool` only).
@@ -587,8 +609,8 @@ impl RocmContext {
         match pool {
             // SAFETY: the function contract matches `upload_bytes_into`'s.
             Pool::Fine => unsafe { self.upload_bytes_into(src, dst, size) },
-            // SAFETY: the function contract matches `dma_upload`'s.
-            Pool::Coarse => unsafe { self.dma_upload(src, dst, size) },
+            // SAFETY: as in `upload_bytes_into`'s `Dma` arm.
+            Pool::Coarse => unsafe { self.ring_copy(src, dst, size) },
         }
     }
 
@@ -634,16 +656,10 @@ impl RocmContext {
         role: BufferRole,
     ) -> Result<RocmBuffer, RocmError> {
         let buf = self.allocate_uninit(op, elems, storage, role)?;
-        let zeros = vec![0u8; buf.byte_capacity()];
-        // SAFETY: `buf` is a fresh allocation of exactly `byte_capacity()` bytes, and `zeros` holds
-        // that many readable bytes.
+        // SAFETY: `buf` is a fresh allocation of exactly `byte_capacity()` bytes, 4-byte aligned (a pool
+        // allocation).
         unsafe {
-            self.upload_bytes_role_aware(
-                buf.pool(),
-                zeros.as_ptr(),
-                buf.alloc.as_ptr(),
-                buf.byte_capacity(),
-            )?;
+            self.zero_fill(buf.pool(), buf.alloc.as_ptr(), buf.byte_capacity())?;
         }
         Ok(buf)
     }
@@ -666,7 +682,7 @@ impl RocmContext {
     /// Allocate a zeroed buffer of `elems` f32, charged to `role` (Card 547a review F1/F4: the caller
     /// states the role; this no longer hardcodes `Activation`). `Pool::for_role(role)` decides which
     /// native pool backs it: `Weight`/`Activation`/`State` resolve to the coarse-grained device pool,
-    /// so a later write bridges through a staged DMA ([`Self::dma_upload`]); `Input`/`Output`/`Meta`/
+    /// so a later write bridges through a staged DMA ([`Self::ring_copy`]); `Input`/`Output`/`Meta`/
     /// `Staging` resolve to the fine-grained system pool, so a later write on Strix Halo (APU, HMM) is
     /// a plain host `ptr::copy_nonoverlapping`. Callers on the hot per-token path (`poot-rocm-gpu`'s
     /// per-step Token/Pos/Mask/SlotMap/TokenEmbed slots) must pass `BufferRole::Input` to
@@ -760,7 +776,7 @@ impl RocmContext {
     /// (Card 547a: pool-aware, `buf.pool()`). On Strix Halo (HMM/SVM) a fine-pool buffer (`Input`/
     /// `Output`/`Meta`/`Staging`, Card 547a review F1/F4) gets the same host `ptr::copy_nonoverlapping`
     /// as before; a coarse-pool buffer (`Weight`/`Activation`/`State`) always bridges through a pinned
-    /// host staging copy ([`Self::dma_upload`]). `poot-rocm-gpu`'s `decode_step` refreshes the Token,
+    /// host staging copy ([`Self::ring_copy`]). `poot-rocm-gpu`'s `decode_step` refreshes the Token,
     /// Pos, and Mask slot buffers between steps without re-allocating through this; those slots are
     /// allocated with `BufferRole::Input`, so this is the unchanged plain host write on the hot
     /// per-token path - a caller that allocates a per-step slot under `Activation` instead pays a
@@ -869,24 +885,41 @@ impl RocmContext {
         )
     }
 
-    /// Overwrite `bytes.len()` bytes of `buf` from byte `offset`, through whichever pool it was allocated from
+    /// Overwrite `len` bytes of `buf` from byte `offset`, through whichever pool it was allocated from
     /// (Card 547a: the storage-typed, dtype-agnostic write the executor contract's memory service
-    /// needs, instead of one allocator/writer per dtype; mirrors `poot_runtime::Context::write_bytes`).
-    pub fn write_bytes(
+    /// needs, instead of one allocator/writer per dtype). `fill(range, out)` gets consecutive destination
+    /// ranges covering `offset..offset + len` and writes every byte of `out`: the buffer's own memory
+    /// for a host-visible pool, a pinned slot of the upload ring (`UPLOAD_CHUNK_BYTES` at most, DMA'd
+    /// asynchronously while the next is filled) for the device pool. The last copies may still be in
+    /// flight on return: they complete before the next submission, synchronize or other DMA, and `buf`
+    /// must stay alive until then.
+    pub fn write_with(
         &self,
         buf: &RocmBuffer,
         offset: usize,
-        bytes: &[u8],
+        len: usize,
+        fill: &mut dyn FnMut(std::ops::Range<usize>, &mut [u8]),
     ) -> Result<(), RocmError> {
-        let range = checked_byte_range("write_bytes", buf, offset, bytes.len())?;
-        // SAFETY: `range` proved `offset..offset + bytes.len()` lies inside `buf`'s live allocation.
-        unsafe {
-            self.upload_bytes_role_aware(
-                buf.pool(),
-                bytes.as_ptr(),
-                buf.alloc.as_ptr().byte_add(range.byte_offset),
-                range.byte_len,
-            )
+        let range = checked_byte_range("write_with", buf, offset, len)?;
+        if len == 0 {
+            return Ok(());
+        }
+        // SAFETY: `range` proved `offset..offset + len` lies inside `buf`'s live allocation.
+        let dst = unsafe { buf.alloc.as_ptr().byte_add(range.byte_offset) };
+        match (buf.pool(), self.upload_strategy) {
+            (Pool::Fine, UploadStrategy::HostWrite) => {
+                // SAFETY: `HostWrite` means the fine pool is host-visible, so `dst` is a host address for
+                // `len` bytes of the live allocation; nothing else references it while `fill` runs.
+                let out = unsafe { std::slice::from_raw_parts_mut(dst.cast::<u8>(), len) };
+                fill(offset..offset + len, out);
+                Ok(())
+            }
+            // SAFETY: `dst` is a live allocation of `len` bytes, kept alive by `buf` (function contract).
+            _ => unsafe {
+                self.ring_write(dst, len, &mut |chunk, out| {
+                    fill(offset + chunk.start..offset + chunk.end, out);
+                })
+            },
         }
     }
 
@@ -912,6 +945,8 @@ impl RocmContext {
     /// signal-based capture/replay sync (`HSA_WAIT_STATE_BLOCKED` + doorbell) is a superset.
     pub fn synchronize(&self) -> Result<(), RocmError> {
         self.ensure_not_poisoned("synchronize")?;
+        // Upload copies in flight land first: the step that follows reads what they wrote.
+        self.drain_uploads("synchronize")?;
         // The one host wait for everything enqueued since the last synchronize.
         self.complete_pending("synchronize")?;
         // Typed construction-time bound (Card 548), matching `wait_completion_bounded`.

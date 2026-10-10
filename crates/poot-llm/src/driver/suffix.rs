@@ -65,9 +65,9 @@ pub(crate) fn with_head(g: Graph, head: Head) -> Appended {
             let graph = resumed.builder.finish_with_state(sh.out, &resumed.state);
             Appended {
                 graph,
-                seed: sh.seed.map(|t| t.id),
-                params: sh.params.map(|t| t.id),
-                top_k: sh.top_k.map(|t| t.id),
+                seed: sh.seed.map(|t| t.id()),
+                params: sh.params.map(|t| t.id()),
+                top_k: sh.top_k.map(|t| t.id()),
             }
         }
     }
@@ -260,25 +260,25 @@ pub(crate) fn eval_sample_token(
 
     let mut inputs: HashMap<ValueId, Value> = HashMap::new();
     inputs.insert(
-        logits_in.id,
+        logits_in.id(),
         HostTensor::f32(vec![vocab], logits.to_vec()).into(),
     );
     if let Some(seed_id) = head.seed {
         inputs.insert(
-            seed_id.id,
+            seed_id.id(),
             HostTensor::i32(vec![], vec![seed as i32]).into(),
         );
     }
     if let Some(params_id) = head.params {
         let params = row_params(rule, temperature, min_p, top_p);
         inputs.insert(
-            params_id.id,
+            params_id.id(),
             HostTensor::f32(vec![params.len()], params).into(),
         );
     }
     if let Some(top_k_id) = head.top_k {
         inputs.insert(
-            top_k_id.id,
+            top_k_id.id(),
             HostTensor::i32(vec![], vec![top_k as i32]).into(),
         );
     }

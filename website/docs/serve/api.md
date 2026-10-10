@@ -31,21 +31,21 @@ curl -i http://localhost:8080/v1/completions \
 
 ## Endpoints
 
-| Endpoint | Notes |
-| -------- | ----- |
-| `POST /v1/completions` | Parsed, bounded and run by the scheduling loop. Fields: `prompt`, `max_tokens`, `stream`, `stop`, `n`, `logprobs`, sampling, guided fields, `lora_adapter`. |
-| `POST /v1/chat/completions` | Parsed, bounded and run by the scheduling loop. Fields: `messages`, `max_tokens` or `max_completion_tokens`, `logprobs`/`top_logprobs`, `tools`/`tool_choice`, `response_format`, plus the completions fields. |
-| `POST /v1/embeddings`, `POST /v1/rerank` | Run as `Encode` steps on the engine thread; hidden states are pooled on the host. See [Embeddings and reranking](./embeddings-and-reranking.md). |
-| `GET /v1/models`, `GET /v1/models/{id}` | One served model; an unknown id is 404. |
-| `GET`/`POST`/`DELETE /v1/lora_adapters` | List, hot-load and unload adapters on the engine thread, under the trust policy in [LoRA adapters](./lora-adapters.md). |
-| `GET /health`, `GET /metrics`, `GET /metrics/prometheus` | Liveness and metrics. |
+| Endpoint                                                 | Notes                                                                                                                                                                                                          |
+| -------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /v1/completions`                                   | Parsed, bounded and run by the scheduling loop. Fields: `prompt`, `max_tokens`, `stream`, `stop`, `n`, `logprobs`, sampling, guided fields, `lora_adapter`.                                                    |
+| `POST /v1/chat/completions`                              | Parsed, bounded and run by the scheduling loop. Fields: `messages`, `max_tokens` or `max_completion_tokens`, `logprobs`/`top_logprobs`, `tools`/`tool_choice`, `response_format`, plus the completions fields. |
+| `POST /v1/embeddings`, `POST /v1/rerank`                 | Run as `Encode` steps on the engine thread; hidden states are pooled on the host. See [Embeddings and reranking](./embeddings-and-reranking.md).                                                               |
+| `GET /v1/models`, `GET /v1/models/{id}`                  | One served model; an unknown id is 404.                                                                                                                                                                        |
+| `GET`/`POST`/`DELETE /v1/lora_adapters`                  | List, hot-load and unload adapters on the engine thread, under the trust policy in [LoRA adapters](./lora-adapters.md).                                                                                        |
+| `GET /health`, `GET /metrics`, `GET /metrics/prometheus` | Liveness and metrics.                                                                                                                                                                                          |
 
 A request that is invalid on its face is a `400` before the engine is asked: malformed JSON, a `max_tokens` that is not an integer, an unknown `lora_adapter`,
 an invalid guided-decoding constraint, image input the served model cannot take, `n` above the engine's rows (each choice is one concurrent job), or `logprobs` on a
 stream (a stream has nowhere to put them). `max_tokens` above the cap
 (32768) is clamped, not refused, and `n`, `logprobs` and `stop` are clamped the same way. Errors are
 OpenAI-shaped: `{"error": {"message", "type", "code"}}`. Over-limit requests get `429` with
-`Retry-After` when `POOT_RATE_LIMIT_RPM` is set.
+`Retry-After` when `--rate-limit-rpm` is set.
 
 An error the engine reports is answered by its class: a request the engine refuses (an empty or too long
 prompt, an adapter it does not have) is a `400`, a request this prepared engine cannot serve (a shape or
@@ -57,7 +57,7 @@ receipt or `[DONE]`.
 
 The model can be a safetensors directory or a single **GGUF** file. A causal decoder (Qwen2/3, Llama, Mistral,
 Mixtral, Gemma, Granite, Granite MoE, OLMo 2, OLMoE, Phi-3, SmolLM3, BLOOM, MPT, Qwen3-MoE, gpt-oss, Gemma 4,
-DeepSeek-V2/V3/V3.2, Nemotron-H, Qwen3-Next, Qwen3.8-Flash-Next) is served if compiling its graph for the chosen backend succeeds; a refusal names the equation and the missing capability. A BERT encoder or cross-encoder is refused at startup, because an encoder prepares its entries on first use and its memory cannot be planned; a decoder answers embeddings and rerank through its embedding pass. A SmolVLM (idefics3) checkpoint also takes images; see [Multimodal](./multimodal.md). See the [feature matrix](../reference/feature-matrix.md) for what the
+DeepSeek-V2/V3/V3.2, Nemotron-H, Qwen3-Next, Qwen3.8-Flash-Next) is served if compiling its graph for the chosen backend succeeds; a refusal names the equation and the missing capability. A BERT encoder or cross-encoder is refused at startup, because an encoder prepares its entries on first use and its memory cannot be planned; a decoder answers embeddings and rerank through its embedding pass. A SmolVLM (idefics3) or Qwen2.5-VL checkpoint also takes images; see [Multimodal](./multimodal.md). See the [feature matrix](../reference/feature-matrix.md) for what the
 libraries support.
 
 Related: [Configuration reference](./configuration.md), [LoRA adapters](./lora-adapters.md),

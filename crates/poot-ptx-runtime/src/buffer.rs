@@ -224,8 +224,8 @@ pub(crate) fn checked_copy<T>(
 }
 
 /// Validate a byte range against `buf`'s capacity alone, with no storage/dtype check (Card 547a: the
-/// storage-typed primitive's own range check, deliberately dtype-agnostic - [`PtxContext::write_bytes`]/
-/// [`PtxContext::read_bytes`] serve any role's buffer, mirroring `poot_runtime::Context::write_bytes`'s
+/// storage-typed primitive's own range check, deliberately dtype-agnostic - [`PtxContext::write_with`]/
+/// [`PtxContext::read_bytes`] serve any role's buffer, mirroring `poot_runtime::Context::write_with`'s
 /// lack of a storage check).
 pub(crate) fn checked_byte_range(
     op: &'static str,

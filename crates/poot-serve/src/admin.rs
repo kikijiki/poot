@@ -1,8 +1,8 @@
 //! The LoRA administration surface (spec 248, epic 129 B8) and its trust boundary.
 //!
 //! Card 315 defines the trust boundary. A loopback listener without an admin key uses a local-process
-//! trust model. A non-loopback listener without a key disables every admin route. Setting
-//! `POOT_LORA_ADMIN_KEY` on either listener class requires the exact bearer credential. Only admin
+//! trust model. A non-loopback listener without a key disables every admin route. Naming a key file
+//! with `--lora-admin-key-file` on either listener class requires the exact bearer credential. Only admin
 //! routes are gated; inference stays unauthenticated. After bounded request-head parsing,
 //! authorization runs before body handling, route-shape handling or JSON parsing.
 //!
@@ -13,8 +13,9 @@
 //! malformed path is 404 and a method no route takes is 405.
 
 use std::net::{IpAddr, TcpStream};
+use std::path::Path;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, bail};
 use ring::digest;
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
@@ -23,7 +24,44 @@ use crate::http::{AuthorizationHeader, respond, respond_error};
 use crate::lifecycle::submit_admin;
 use crate::types::{AdapterInfo, AdminError, AdminReply, AdminRequest, Served};
 
-const LORA_ADMIN_KEY_ENV: &str = "POOT_LORA_ADMIN_KEY";
+/// A bearer key read from the file `--lora-admin-key-file` names. The key never appears in `argv`
+/// (where `ps` shows it), and the type has no `Display` and a redacted `Debug`, so logging cannot
+/// format it.
+#[derive(Clone)]
+pub(crate) struct AdminKey(String);
+
+impl std::fmt::Debug for AdminKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AdminKey(..)")
+    }
+}
+
+impl AdminKey {
+    /// Read and validate the key in `path`: one RFC 6750 `b64token`, with the trailing line break an
+    /// editor or `echo` leaves. An unreadable file, an empty file and a key with any other whitespace
+    /// are each an error.
+    pub(crate) fn from_file(path: &str) -> std::result::Result<Self, String> {
+        let raw = std::fs::read_to_string(Path::new(path))
+            .map_err(|error| format!("cannot read the key file {path:?}: {error}"))?;
+        let key = raw.trim_end_matches(['\n', '\r']);
+        check_key(key).map_err(|error| format!("{path:?}: {error}"))?;
+        Ok(Self(key.to_string()))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+const KEY_SHAPE: &str = "the LoRA admin key must be one non-empty RFC 6750 b64token";
+
+fn check_key(key: &str) -> std::result::Result<(), &'static str> {
+    if is_b64token(key) {
+        Ok(())
+    } else {
+        Err(KEY_SHAPE)
+    }
+}
 
 /// Deployment policy for the LoRA administration routes. The credential-bearing variant has no
 /// `Debug` or `Display` implementation, so structured logging cannot format its secret.
@@ -54,15 +92,15 @@ pub(crate) enum LoraAdminDenial {
 
 impl LoraAdminPolicy {
     /// Build the policy from the address the listener bound and an optional configured key.
-    /// `configured_key` is injected for deterministic tests; production passes the environment value.
+    /// `configured_key` is the key `--lora-admin-key-file` named, when given.
     pub(crate) fn from_configured_key(
         listener_ip: IpAddr,
         configured_key: Option<&str>,
     ) -> Result<Self> {
         let access = match configured_key {
             Some(key) => {
-                if !is_b64token(key) {
-                    bail!("{LORA_ADMIN_KEY_ENV} must be one non-empty RFC 6750 b64token");
+                if let Err(error) = check_key(key) {
+                    bail!("{error}");
                 }
                 LoraAdminAccess::Bearer(AdminCredential(credential_digest(key.as_bytes())))
             }
@@ -70,17 +108,6 @@ impl LoraAdminPolicy {
             None => LoraAdminAccess::Disabled,
         };
         Ok(Self { access })
-    }
-
-    pub(crate) fn from_env(listener_ip: IpAddr) -> Result<Self> {
-        let configured = std::env::var_os(LORA_ADMIN_KEY_ENV)
-            .map(|value| {
-                value.into_string().map_err(|_| {
-                    anyhow!("{LORA_ADMIN_KEY_ENV} must contain valid UTF-8 bearer-token bytes")
-                })
-            })
-            .transpose()?;
-        Self::from_configured_key(listener_ip, configured.as_deref())
     }
 
     pub(crate) fn mode(&self) -> LoraAdminPolicyMode {

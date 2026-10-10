@@ -68,7 +68,14 @@ fn mrope_matches_direct_reference_with_distinct_section_positions() {
     let pos_h = b.constant("pos_h", TensorType::scalar(DType::I32));
     let pos_w = b.constant("pos_w", TensorType::scalar(DType::I32));
     let out = rope_sectioned(&b, x, cos, sin, &[pos_t, pos_h, pos_w], &sections);
-    let (xi, ci, si, pti, phi, pwi) = (x.id, cos.id, sin.id, pos_t.id, pos_h.id, pos_w.id);
+    let (xi, ci, si, pti, phi, pwi) = (
+        x.id(),
+        cos.id(),
+        sin.id(),
+        pos_t.id(),
+        pos_h.id(),
+        pos_w.id(),
+    );
     let g = b.finish(out);
 
     let xd = fill(d, 201);
@@ -115,7 +122,14 @@ fn mrope_batched_matches_independent_per_row_reference() {
     let pos_h = b.constant("pos_h", TensorType::new(vec![batch], DType::I32));
     let pos_w = b.constant("pos_w", TensorType::new(vec![batch], DType::I32));
     let out = rope_sectioned_batched(&b, x, cos, sin, &[pos_t, pos_h, pos_w], &sections, batch);
-    let (xi, ci, si, pti, phi, pwi) = (x.id, cos.id, sin.id, pos_t.id, pos_h.id, pos_w.id);
+    let (xi, ci, si, pti, phi, pwi) = (
+        x.id(),
+        cos.id(),
+        sin.id(),
+        pos_t.id(),
+        pos_h.id(),
+        pos_w.id(),
+    );
     let g = b.finish(out);
     g.validate()
         .expect("batched sectioned RoPE graph validates");
@@ -199,7 +213,7 @@ fn mrope_matches_rope_bit_exact_when_section_positions_equal_decode() {
         let p1 = b.constant("p1", TensorType::scalar(DType::I32));
         let p2 = b.constant("p2", TensorType::scalar(DType::I32));
         let out = rope_sectioned(&b, x, cos, sin, &[p0, p1, p2], &sections);
-        let (xi, ci, si, p0i, p1i, p2i) = (x.id, cos.id, sin.id, p0.id, p1.id, p2.id);
+        let (xi, ci, si, p0i, p1i, p2i) = (x.id(), cos.id(), sin.id(), p0.id(), p1.id(), p2.id());
         let g = b.finish(out);
         let mut inputs = HashMap::new();
         inputs.insert(
@@ -231,7 +245,7 @@ fn mrope_matches_rope_bit_exact_when_section_positions_equal_decode() {
         let sin = b.constant("sin", TensorType::f32(vec![max_pos, d]));
         let pos = b.constant("pos", TensorType::scalar(DType::I32));
         let out = rope(&b, x, cos, sin, pos);
-        let (xi, ci, si, pi) = (x.id, cos.id, sin.id, pos.id);
+        let (xi, ci, si, pi) = (x.id(), cos.id(), sin.id(), pos.id());
         let g = b.finish(out);
         let mut inputs = HashMap::new();
         inputs.insert(
@@ -295,7 +309,7 @@ fn mrope_matches_rope_prefill_bit_exact_when_section_positions_equal_whole_seque
         let p1 = b.constant("p1", TensorType::new(vec![l], DType::I32));
         let p2 = b.constant("p2", TensorType::new(vec![l], DType::I32));
         let out = rope_sectioned(&b, x, cos, sin, &[p0, p1, p2], &sections);
-        let (xi, ci, si, p0i, p1i, p2i) = (x.id, cos.id, sin.id, p0.id, p1.id, p2.id);
+        let (xi, ci, si, p0i, p1i, p2i) = (x.id(), cos.id(), sin.id(), p0.id(), p1.id(), p2.id());
         let g = b.finish(out);
         let mut inputs = HashMap::new();
         inputs.insert(
@@ -326,7 +340,7 @@ fn mrope_matches_rope_prefill_bit_exact_when_section_positions_equal_whole_seque
         let cos = b.constant("cos", TensorType::f32(vec![max_pos, d]));
         let sin = b.constant("sin", TensorType::f32(vec![max_pos, d]));
         let out = rope_prefill(&b, x, cos, sin, l);
-        let (xi, ci, si) = (x.id, cos.id, sin.id);
+        let (xi, ci, si) = (x.id(), cos.id(), sin.id());
         let g = b.finish(out);
         let mut inputs = HashMap::new();
         inputs.insert(
@@ -381,7 +395,7 @@ fn mrope_partial_rotary_passes_through_untouched_dims() {
     let pos_t = b.constant("pos_t", TensorType::scalar(DType::I32));
     let pos_h = b.constant("pos_h", TensorType::scalar(DType::I32));
     let out = rope_sectioned(&b, x, cos, sin, &[pos_t, pos_h], &sections);
-    let (xi, ci, si, pti, phi) = (x.id, cos.id, sin.id, pos_t.id, pos_h.id);
+    let (xi, ci, si, pti, phi) = (x.id(), cos.id(), sin.id(), pos_t.id(), pos_h.id());
     let g = b.finish(out);
 
     let xd = fill(d, 501);
@@ -437,7 +451,14 @@ fn mrope_zero_width_section_traces_and_is_inert() {
     let pos_h = b.constant("pos_h", TensorType::scalar(DType::I32));
     let pos_w = b.constant("pos_w", TensorType::scalar(DType::I32));
     let out = rope_sectioned(&b, x, cos, sin, &[pos_t, pos_h, pos_w], &sections);
-    let (xi, ci, si, pti, phi, pwi) = (x.id, cos.id, sin.id, pos_t.id, pos_h.id, pos_w.id);
+    let (xi, ci, si, pti, phi, pwi) = (
+        x.id(),
+        cos.id(),
+        sin.id(),
+        pos_t.id(),
+        pos_h.id(),
+        pos_w.id(),
+    );
     let g = b.finish(out);
 
     let xd = fill(d, 601);

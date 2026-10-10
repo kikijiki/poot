@@ -1,5 +1,6 @@
 use super::*;
 use poot_tensor::DType;
+use std::io::Read;
 
 use poot_quant::scalar::{e4m3fn_to_f32, e8m0_to_f32, f16_to_f32};
 use poot_quant::weights::{WeightEntry, WeightStore};

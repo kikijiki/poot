@@ -1,29 +1,40 @@
 //! The typed engine plan, computed once at startup (POOT-587, target L12).
 //!
 //! [`EnginePlan::build`] is the one place the server decides what it will run: it opens the executor the
-//! operator's [`BackendChoice`] names (once; a model the resolved backend refuses fails startup, and
-//! nothing retries another backend), fits the workload to the device's memory by exact planned footprints
-//! ([`poot_llm::driver::capacity`]), prepares the fitted shapes, checks the live allocations against the
-//! plan and a fresh budget, and only then publishes [`EngineState::Serving`]. The gauges and `/health`
-//! read the plan; no handler asks a family or a backend.
+//! operator's [`BackendChoice`] and [`PlacementSpec`] name (once; a model the resolved backend refuses
+//! fails startup, and nothing retries another backend), places the model over its devices, fits the
+//! workload to each device's memory by exact planned footprints ([`poot_llm::driver::capacity`]),
+//! prepares the fitted shapes, checks the live allocations against the plan and a fresh budget, and only
+//! then publishes [`EngineState::Serving`]. The gauges and `/health` read the plan; no handler asks a
+//! family or a backend.
+//!
+//! One device or several is the same pipeline: the placement only changes how the executor is opened,
+//! which [`Placement`] the driver is built with, and over how many devices the footprints are kept.
 
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::{Arc, RwLock};
 
-use poot_executor::{Executor, SharedKernelsMismatch};
-use poot_graph_plan::{CompileLimits, CompileOptions, DeviceId, Refusal, Submission, TargetSet};
+use poot_executor::{Collectives, Coordinator, Device, Executor, SharedKernelsMismatch};
+use poot_graph_plan::multi_device::DeviceSpec;
+use poot_graph_plan::{
+    CompileLimits, CompileOptions, DeviceId, DevicePlacement, Refusal, ShardRule, Submission,
+    TargetSet,
+};
 use poot_llm::driver::block_table::BLOCK_SIZE;
 use poot_llm::driver::capacity::{
     Budget, CapacityRefusal, Fit, FitError, Observation, PlanError, PlanFailure, Planner,
     verify_prepared,
 };
-use poot_llm::driver::error::{DriverError, InvalidOptions, InvalidRequest, Unsupported};
+use poot_llm::driver::error::{DriverError, InvalidRequest, Unsupported};
+use poot_llm::driver::placement::{BalanceError, LayerBytes, Placement, balance_layers};
 use poot_llm::driver::{
     BackendChoice, DraftPolicy, Driver, DriverCaps, DriverOptions, Head, Layout, ModelHandle,
     PoolShape, PreparedSetLimits, ServingShapes, Warm, program_retention,
 };
 use poot_models::model::ModelOutput;
 use poot_target::Backend as TargetBackend;
+
+use crate::config::PlacementSpec;
 
 /// Bytes kept back on every device for allocations the planner cannot see: recordings, staging and
 /// driver state a runtime makes on its own. A bound, not a measurement; the live counters are checked
@@ -46,6 +57,8 @@ const MAX_RETAINED_BYTES: u64 = 1 << 32;
 #[derive(Clone, Debug)]
 pub(crate) struct EngineArgs {
     pub(crate) backend: BackendChoice,
+    /// Which devices run the model, and how.
+    pub(crate) placement: PlacementSpec,
     pub(crate) rows: NonZeroUsize,
     pub(crate) max_seq: NonZeroUsize,
     /// How decode rows propose tokens to verify; `Off` serves one token a step.
@@ -53,17 +66,32 @@ pub(crate) struct EngineArgs {
     /// Prompts carry embedding rows (an image front end feeds the engine): the `PrefillEmbeds`
     /// entries are planned and prepared beside the token ones.
     pub(crate) embeds: bool,
+    /// Pool rows per routed selection when experts are paged ([`Driver::with_expert_pool`]).
+    pub(crate) expert_pool: Option<NonZeroUsize>,
 }
 
 impl EngineArgs {
     pub(crate) fn new(backend: BackendChoice, draft: DraftPolicy) -> Self {
         Self {
             backend,
+            placement: PlacementSpec::Single,
             draft,
             embeds: false,
+            expert_pool: None,
             rows: NonZeroUsize::new(DEFAULT_ROWS).expect("nonzero"),
             max_seq: NonZeroUsize::new(DEFAULT_MAX_SEQ).expect("nonzero"),
         }
+    }
+
+    pub(crate) fn with_expert_pool(self, expert_pool: Option<NonZeroUsize>) -> Self {
+        Self {
+            expert_pool,
+            ..self
+        }
+    }
+
+    pub(crate) fn with_placement(self, placement: PlacementSpec) -> Self {
+        Self { placement, ..self }
     }
 
     pub(crate) fn with_embeds(self) -> Self {
@@ -105,28 +133,49 @@ impl Workload {
     }
 }
 
-/// What the memory fit settled on, in bytes.
+/// What the memory fit settled on for one device, in bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct BudgetReport {
+pub(crate) struct DeviceBytes {
+    pub(crate) device: DeviceId,
     /// Bytes the fitted plan allocates on the device.
     pub(crate) planned_bytes: u64,
+    /// The device budget (less the reserve) the runtime reported when the device opened.
+    pub(crate) discovered_bytes: Option<u64>,
+    /// The same budget observed after prepare.
+    pub(crate) available_bytes: Option<u64>,
+}
+
+/// What the memory fit settled on, in bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BudgetReport {
+    /// Each device's own figures, in rank order: a budget is per device.
+    pub(crate) devices: Vec<DeviceBytes>,
     /// Bytes of the weight store every planned candidate read together: zero, because planning sizes
     /// weights and the one real read is the prepared driver's own (POOT-1066).
     pub(crate) planning_weight_bytes_read: u64,
     /// Kernels the planned candidates took through the kernel cache together: each distinct kernel once,
     /// however many candidates use it (POOT-1068).
     pub(crate) planning_kernels_resolved: u64,
-    /// The device budget (less the reserve) the runtime reported when the device opened.
-    pub(crate) discovered_bytes: Option<u64>,
-    /// The same budget observed after prepare, which the live allocations were admitted against.
-    pub(crate) available_bytes: Option<u64>,
+}
+
+impl BudgetReport {
+    /// The budget the devices have together once prepared: the sum of what each reports.
+    pub(crate) fn available_bytes(&self) -> Option<u64> {
+        self.devices
+            .iter()
+            .map(|device| device.available_bytes)
+            .try_fold(0u64, |total, bytes| Some(total.saturating_add(bytes?)))
+    }
 }
 
 /// The plan the server runs: computed once, read by the gauges and `/health`.
 #[derive(Debug)]
 pub(crate) struct EnginePlan {
     pub(crate) backend: TargetBackend,
-    pub(crate) device: DeviceId,
+    /// The devices the model runs on, in rank order.
+    pub(crate) devices: Vec<DeviceId>,
+    /// How the model is placed over them.
+    pub(crate) placement: Placement,
     pub(crate) model: String,
     pub(crate) workload: Workload,
     /// What `prepare` compiled.
@@ -280,6 +329,9 @@ pub(crate) enum StartupError {
     /// The prepared engine holds more than its plan, or more than the budget observed now.
     #[error("the prepared engine is not admitted: {0}")]
     Admission(#[source] CapacityRefusal),
+    /// No layer pipeline over the devices holds the model's weights.
+    #[error("the model has no balanced pipeline over the devices: {0}")]
+    Pipeline(#[source] BalanceError),
     /// The model's workload prepares its entries on first use, so its allocations cannot be accounted
     /// before `Serving`. Refused rather than served unaccounted.
     #[error(
@@ -402,18 +454,129 @@ pub(crate) struct Started {
     pub(crate) driver: Driver,
 }
 
+/// What an open produced. The variant is the placement the engine runs: a group is opened as the
+/// pipeline or the tensor group it was asked to be, and the driver is built from the variant, so an
+/// executor and a placement that disagree cannot be written down.
+pub(crate) enum Opened {
+    /// One device behind a boxed executor.
+    One(Box<dyn Executor>),
+    /// Several devices under one coordinator, run as a layer pipeline.
+    Pipeline(Box<dyn Group>),
+    /// Several devices under one coordinator, run as a tensor-parallel group.
+    Tensor(Box<dyn Group>),
+}
+
+/// A coordinator the driver takes concretely, because a tensor placement loads its weights through the
+/// coordinator before it becomes the driver's `dyn Executor`.
+pub(crate) trait Group {
+    fn executor(&self) -> &dyn Executor;
+
+    fn driver(
+        self: Box<Self>,
+        handle: Arc<ModelHandle>,
+        options: DriverOptions,
+        placement: Placement,
+    ) -> Result<Driver, DriverError>;
+}
+
+/// A coordinator over devices of one kind.
+pub(crate) struct Coordinated<D: Device + Collectives + 'static>(pub(crate) Coordinator<D>);
+
+impl<D: Device + Collectives + 'static> Group for Coordinated<D> {
+    fn executor(&self) -> &dyn Executor {
+        &self.0
+    }
+
+    fn driver(
+        self: Box<Self>,
+        handle: Arc<ModelHandle>,
+        options: DriverOptions,
+        placement: Placement,
+    ) -> Result<Driver, DriverError> {
+        Driver::placed(handle, self.0, options, placement)
+    }
+}
+
+/// An opened executor with the placement it runs, resolved: the one thing the driver is built from.
+enum Launch {
+    One(Box<dyn Executor>),
+    Group(Box<dyn Group>),
+}
+
+impl Launch {
+    fn executor(&self) -> &dyn Executor {
+        match self {
+            Launch::One(executor) => &**executor,
+            Launch::Group(group) => group.executor(),
+        }
+    }
+
+    fn driver(
+        self,
+        handle: Arc<ModelHandle>,
+        options: DriverOptions,
+        placement: Placement,
+    ) -> Result<Driver, DriverError> {
+        match self {
+            Launch::One(executor) => Driver::new(handle, executor, options),
+            Launch::Group(group) => group.driver(handle, options, placement),
+        }
+    }
+}
+
+/// The placement `opened` runs and the launch that builds its driver; a pipeline's cut is balanced over
+/// the devices' budgets.
+fn place(
+    opened: Opened,
+    handle: &ModelHandle,
+    discovered: &Budget,
+) -> Result<(Placement, Launch), StartupError> {
+    match opened {
+        Opened::One(executor) => Ok((Placement::Single, Launch::One(executor))),
+        Opened::Tensor(group) => Ok((
+            Placement::Tensor {
+                rule: ShardRule::Megatron,
+            },
+            Launch::Group(group),
+        )),
+        Opened::Pipeline(group) => {
+            let targets = group.executor().target_set();
+            let mut specs = Vec::with_capacity(targets.devices().len());
+            for &(id, target) in targets.devices() {
+                let usable_bytes = discovered.available(id).ok_or(StartupError::Admission(
+                    CapacityRefusal::UnknownBudget { device: id },
+                ))?;
+                specs.push(DeviceSpec {
+                    id,
+                    backend: target.backend,
+                    usable_bytes,
+                });
+            }
+            let bytes = LayerBytes::of(handle);
+            match balance_layers(&bytes, &specs).map_err(StartupError::Pipeline)? {
+                DevicePlacement::Pipeline { after_layers, .. } => {
+                    Ok((Placement::Pipeline { after_layers }, Launch::Group(group)))
+                }
+                DevicePlacement::Single(_) | DevicePlacement::Tensor { .. } => {
+                    unreachable!("a balance is a pipeline")
+                }
+            }
+        }
+    }
+}
+
 impl EnginePlan {
-    /// Open the executor `args.backend` names, fit and prepare the workload, and publish `Serving`.
+    /// Open the executor `args` name, place and fit the workload, prepare it, and publish `Serving`.
     ///
     /// `open` is called exactly once: the backend the operator named, or the one `Auto` resolves to in
-    /// [`poot_llm::driver::open_executor`]. A refusal on that backend is the startup error; no other
-    /// backend is tried. `observe` reads the device budget from the targets at each admission and again
-    /// after prepare; [`device_budget`] reads the memory the targets report. `health` stays `Starting`
-    /// until the prepared engine has been checked.
+    /// [`poot_llm::driver::open_executor`], over the devices `args.placement` names. A refusal on that
+    /// backend is the startup error; no other backend is tried. `observe` reads the device budgets from
+    /// the targets at each admission and again after prepare; [`device_budget`] reads the memory the
+    /// targets report. `health` stays `Starting` until the prepared engine has been checked.
     pub(crate) fn build(
         args: &EngineArgs,
         handle: &Arc<ModelHandle>,
-        open: impl FnOnce(BackendChoice) -> Result<Box<dyn Executor>, DriverError>,
+        open: impl FnOnce(&EngineArgs) -> Result<Opened, DriverError>,
         mut observe: impl FnMut(&Observation) -> Budget,
         health: &EngineHealth,
     ) -> Result<Started, StartupError> {
@@ -422,31 +585,30 @@ impl EnginePlan {
             .expect("a model has positions");
         // Refused before any device opens: an unaccounted workload never touches the device.
         Workload::of(config.output, args.rows, max_seq)?;
-        let executor = open(args.backend).map_err(|source| StartupError::Device {
+        let opened = open(args).map_err(|source| StartupError::Device {
             choice: args.backend,
             source,
         })?;
-        let targets = executor.target_set();
-        let &[(device, target)] = targets.devices() else {
-            return Err(DriverError::from(InvalidOptions::Devices {
-                devices: targets.devices().len(),
-            })
-            .into());
-        };
-        let discovered = observe(&Observation::of(&*executor));
-        let discovered_bytes = discovered.available(device);
+        let discovered = observe(&Observation::of(match &opened {
+            Opened::One(executor) => &**executor,
+            Opened::Pipeline(group) | Opened::Tensor(group) => group.executor(),
+        }));
+        let (placement, launch) = place(opened, handle, &discovered)?;
+        let targets = launch.executor().target_set();
+        let devices: Vec<DeviceId> = targets.devices().iter().map(|&(id, _)| id).collect();
+        let backend = targets.devices()[0].1.backend;
         let Fitted {
             candidate,
             driver,
-            planned_bytes,
+            planned,
             planning_weight_bytes_read,
             planning_kernels_resolved,
         } = fit_and_prepare(
             args,
             handle,
-            executor,
+            launch,
             &targets,
-            device,
+            &placement,
             max_seq,
             &mut observe,
         )?;
@@ -462,15 +624,22 @@ impl EnginePlan {
             max_seq: candidate.max_seq,
         };
         let budget = BudgetReport {
-            planned_bytes,
+            devices: planned
+                .into_iter()
+                .map(|(device, planned_bytes)| DeviceBytes {
+                    device,
+                    planned_bytes,
+                    discovered_bytes: discovered.available(device),
+                    available_bytes: observed.available(device),
+                })
+                .collect(),
             planning_weight_bytes_read,
             planning_kernels_resolved,
-            discovered_bytes,
-            available_bytes: observed.available(device),
         };
         let plan = EnginePlan {
-            backend: target.backend,
-            device,
+            backend,
+            devices,
+            placement,
             model: config.family.to_string(),
             workload,
             caps,
@@ -485,23 +654,27 @@ impl EnginePlan {
 struct Fitted {
     candidate: Candidate,
     driver: Driver,
-    planned_bytes: u64,
+    /// The bytes the chosen plan allocates on each device, in rank order.
+    planned: Vec<(DeviceId, u64)>,
     planning_weight_bytes_read: u64,
     planning_kernels_resolved: u64,
 }
 
-/// Fit the generation workload to the device, then prepare the chosen shapes on the real executor and
+/// Fit the generation workload to the devices, then prepare the chosen shapes on the real executor and
 /// check what it allocated.
 fn fit_and_prepare(
     args: &EngineArgs,
     handle: &Arc<ModelHandle>,
-    executor: Box<dyn Executor>,
+    launch: Launch,
     targets: &TargetSet,
-    device: DeviceId,
+    placement: &Placement,
     max_seq: NonZeroUsize,
     observe: &mut impl FnMut(&Observation) -> Budget,
 ) -> Result<Fitted, StartupError> {
-    let planner = Planner::new(Arc::clone(handle), targets)?;
+    let mut planner = Planner::new(Arc::clone(handle), targets, placement.clone())?;
+    if let Some(slots) = args.expert_pool {
+        planner = planner.with_expert_pool(slots);
+    }
     let mut planning_weight_bytes_read = 0u64;
     let mut planning_kernels_resolved = 0u64;
     let fit = poot_llm::driver::capacity::fit(
@@ -521,7 +694,7 @@ fn fit_and_prepare(
                 .map_err(PlanFailure::Fatal)
         },
         // One observation per admission, never the budget read once before the search.
-        || observe(&Observation::of(&*executor)),
+        || observe(&Observation::of(launch.executor())),
     )
     .map_err(|error| match error {
         FitError::Plan(error) => error.into(),
@@ -533,14 +706,24 @@ fn fit_and_prepare(
         ledger,
         ..
     } = fit;
-    let planned_bytes = footprint
-        .device_bytes(device)
-        .map_err(|error| StartupError::Admission(error.into()))?;
-    let mut driver = Driver::new(
+    let devices: Vec<DeviceId> = targets.devices().iter().map(|&(id, _)| id).collect();
+    let planned = devices
+        .iter()
+        .map(|&device| {
+            footprint
+                .device_bytes(device)
+                .map(|bytes| (device, bytes))
+                .map_err(|error| StartupError::Admission(error.into()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut driver = launch.driver(
         Arc::clone(handle),
-        executor,
         driver_options(handle, chosen.max_seq, args.draft.clone()),
+        placement.clone(),
     )?;
+    if let Some(slots) = args.expert_pool {
+        driver = driver.with_expert_pool(slots)?;
+    }
     let rows = [chosen.rows];
     driver.prepare(&shapes_of(&chosen, &rows))?;
     if args.embeds {
@@ -548,8 +731,7 @@ fn fit_and_prepare(
     }
     verify_prepared(
         &footprint,
-        device,
-        &driver.live_role_bytes(),
+        &driver.live_device_bytes(),
         &observe(&driver.observation()),
         &ledger,
     )
@@ -557,7 +739,7 @@ fn fit_and_prepare(
     Ok(Fitted {
         candidate: chosen,
         driver,
-        planned_bytes,
+        planned,
         planning_weight_bytes_read,
         planning_kernels_resolved,
     })

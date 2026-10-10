@@ -42,8 +42,11 @@ artifact limit does not bound the external compiler's own memory or time.
 
 ## Can I use continuous batching and tensor parallelism together?
 
-Not today. Continuous batching is served ([Continuous batching](../serve/continuous-batching.md)); tensor
-parallelism is not implemented in the server.
+Yes, on the `ptx` backend. Continuous batching is served ([Continuous batching](../serve/continuous-batching.md)),
+and a tensor group divides the paged KV pool by KV heads. A tensor group served requests on a two-GPU NVLink A100
+pair, greedy and sampled matching single-GPU, with each rank admitting against its own pool. A four-GPU group
+decoded a tiny model to the single-GPU logits. Serving a group of four through the server, a real checkpoint, and GPUs
+that reach each other only across CPU sockets are not covered. Other backends do not support it.
 
 ## Where is prefix caching available?
 

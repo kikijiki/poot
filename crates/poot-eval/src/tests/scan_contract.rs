@@ -140,7 +140,7 @@ fn the_delta_rule_scan_is_bitwise_the_pre_card_chain() {
         seq("beta", 1),
     );
     let s = b.state_input("s", TensorType::f32(vec![1, 2, 4, 4]), StateRole::Recurrent);
-    let ids = [q.id, k.id, v.id, g.id, beta.id, s.id];
+    let ids = [q.id(), k.id(), v.id(), g.id(), beta.id(), s.id()];
     // The tables the component used to build and pass in.
     let (o, s_chain) = gdn_prefill_chunked(
         &b,
@@ -210,7 +210,7 @@ fn the_ssd_scan_matches_the_decode_loop_and_the_seeded_prefill() {
         let (py, ph) = mamba2_ssd_prefill(
             &b, traced[0], traced[1], traced[2], traced[3], traced[4], traced[5], h, tril,
         );
-        let ids: Vec<_> = traced.iter().map(|t| t.id).chain([h.id]).collect();
+        let ids: Vec<_> = traced.iter().map(|t| t.id()).chain([h.id()]).collect();
         let prefill = b.finish_with_state(py, &[(h, ph)]);
         let values: HashMap<_, _> = ids
             .iter()
@@ -263,7 +263,7 @@ fn the_ssd_scan_matches_the_decode_loop_and_the_seeded_prefill() {
             StateRole::Recurrent,
         );
         let (dy, dh_out) = mamba2_ssd_decode(&d, dt[0], dt[1], dt[2], dt[3], dt[4], dt[5], dh);
-        let ids: Vec<_> = dt.iter().map(|t| t.id).chain([dh.id]).collect();
+        let ids: Vec<_> = dt.iter().map(|t| t.id()).chain([dh.id()]).collect();
         let decode = d.finish_with_state(dy, &[(dh, dh_out)]);
         let mut state = inputs.operands[6].clone();
         let mut loop_y = vec![0.0f32; 2 * len * 3];

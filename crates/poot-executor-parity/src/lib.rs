@@ -44,6 +44,7 @@ pub mod scan;
 pub mod select;
 pub mod state_row;
 pub mod weight_map;
+pub mod write_probe;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -56,6 +57,7 @@ use poot_graph_plan::{
     Submission, Target, TargetSet, compile_staged,
 };
 use poot_models::model::{LogitRows, Phase};
+use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::{DType, HostTensor};
 use poot_test_util::StepFixture;
@@ -114,7 +116,7 @@ fn store_with(g: &Graph, adjust: impl Fn(&str, &mut [f32])) -> WeightStore {
         let mut data = const_data(&name, &shape);
         adjust(&name, &mut data);
         let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let dense = DenseWeight::try_new(DType::F32, shape, Arc::from(bytes)).unwrap();
+        let dense = DenseWeight::try_new(DType::F32, shape, StoredBytes::from(bytes)).unwrap();
         builder.insert(name, WeightEntry::Dense(dense)).unwrap();
     }
     builder.build()
@@ -309,7 +311,7 @@ fn checkpoint_projection_fixture(
     let w = b.constant("w", TensorType::new(vec![n, k], weight));
     let out = b.matmul(x, b.transpose(w, vec![1, 0]));
     let graph = b.finish(out);
-    let key = graph.meta(x.id).slot_key().unwrap().clone();
+    let key = graph.meta(x.id()).slot_key().unwrap().clone();
     let steps = (0..2u64)
         .map(|step| {
             vec![StepFixture {
@@ -356,7 +358,7 @@ fn narrow_weight_store(name: &str, shape: Vec<usize>, dtype: DType) -> WeightSto
         })
         .collect();
     let mut builder = WeightStore::builder();
-    let dense = DenseWeight::try_new(dtype, shape, Arc::from(bytes)).unwrap();
+    let dense = DenseWeight::try_new(dtype, shape, StoredBytes::from(bytes)).unwrap();
     builder
         .insert(name.to_string(), WeightEntry::Dense(dense))
         .unwrap();
@@ -427,7 +429,7 @@ fn grouped_projection_fixture(
     let blocks = b.reshape(w, vec![groups, n, k]);
     let out = b.matmul(x, b.transpose(blocks, vec![0, 2, 1]));
     let graph = b.finish(out);
-    let key = graph.meta(x.id).slot_key().unwrap().clone();
+    let key = graph.meta(x.id()).slot_key().unwrap().clone();
     let steps = (0..2u64)
         .map(|step| {
             vec![StepFixture {
@@ -519,7 +521,7 @@ fn store_from_tensors(entries: Vec<(&str, HostTensor)>) -> WeightStore {
         let dense = DenseWeight::try_new(
             tensor.dtype(),
             tensor.shape().to_vec(),
-            Arc::from(tensor.view().bytes()),
+            StoredBytes::from(tensor.view().bytes().to_vec()),
         )
         .unwrap();
         builder
@@ -659,7 +661,7 @@ pub fn run_once(
         let dense = DenseWeight::try_new(
             c.tensor.dtype(),
             c.tensor.shape().to_vec(),
-            Arc::from(c.tensor.view().bytes()),
+            StoredBytes::from(c.tensor.view().bytes().to_vec()),
         )
         .map_err(|e| format!("run_once: const `{}`: {e}", c.name))?;
         builder

@@ -11,17 +11,18 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use poot_llm::driver::error::{DriverError, FailureClass};
 use poot_llm::driver::step::PickPolicy;
 use poot_llm::driver::{
     AdapterRef, AdapterSet, AdapterSource, AdapterSpec, Admission, Driver, EncodeRequest, Encoded,
-    GenerationId, Head, Layout, LoraIdx, ModelHandle, PoolShape, PrefixOutcome, PromptEmbeds,
-    Release, RowSpeculation, RowWork, SeqId, SeqRequest, ServingShapes, StepRow, Warm,
+    GenerationId, Head, Layout, LoraIdx, ModelHandle, PoolShape, PrefixOutcome, Release,
+    RowSpeculation, RowWork, SeqId, SeqRequest, ServingShapes, StepRow, Warm,
 };
 use poot_llm::{Sampler, TokenLogprob};
 use poot_load::lora::LoraAdapter;
+use poot_profile::TimingSnapshot;
 
 use crate::batch::commit::{
     SlotFate, commit_tokens, record_prefix_admission, record_prefix_outcome,
@@ -33,11 +34,13 @@ use crate::metrics::Metrics;
 use crate::types::{
     AccountedGenerationFailure, AdapterInfo, AdminError, AdminJob, AdminReply, AdminRequest,
     Completion, EncodeJob, EncodeReply, EncodeRow, EngineMsg, EngineView, FinishReason, GenEvent,
-    Job, PromptInput, deliver_terminal,
+    Job, PromptInput, PromptRows, deliver_terminal,
 };
 
 /// How long an idle loop waits for a job before it looks again.
 const IDLE_POLL: Duration = Duration::from_millis(10);
+/// The most often the executor's timing summary is published while the loop is stepping.
+const TIMING_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Why an engine call failed, as the loop must treat it.
 #[derive(Debug, PartialEq, Eq)]
@@ -107,9 +110,9 @@ pub(crate) struct OpenRequest<'a> {
     /// The most tokens that will be committed after the prompt: their KV blocks are reserved at open.
     pub(crate) max_new: usize,
     pub(crate) adapter: AdapterRef,
-    /// Embedding rows that stand in for the prompt tokens at their positions: the sequence matches and
-    /// registers no prefix.
-    pub(crate) embeds: Option<&'a PromptEmbeds>,
+    /// Embedding rows that stand in for the prompt tokens at their positions, and the sectioned
+    /// positions of a model that rotates at them: the sequence matches and registers no prefix.
+    pub(crate) rows: Option<&'a PromptRows>,
 }
 
 /// The driver's serving surface as the loop uses it, plus the text services a request needs.
@@ -152,6 +155,10 @@ pub(crate) trait ServeEngine {
     fn resident_bytes(&self) -> u64;
     /// Programs compiled so far: constant across steps once the prepared set is warm.
     fn compiles(&self) -> u64;
+    /// The executor's timing snapshot, for an engine that runs on an executor. `None` publishes nothing.
+    fn timing(&self) -> Option<TimingSnapshot> {
+        None
+    }
 
     /// Used over total blocks of the KV pool, 0 without one.
     fn kv_used_ratio(&self) -> f64 {
@@ -363,15 +370,24 @@ impl ServeEngine for DriverEngine {
             prompt,
             max_new,
             adapter,
-            embeds,
+            rows,
         } = request;
         let seq = SeqRequest {
             prompt,
             max_new,
             adapter,
         };
-        let admission = match embeds {
-            Some(embeds) => self.driver.open_with_embeds(seq, embeds.clone())?,
+        let admission = match rows {
+            Some(PromptRows {
+                embeds,
+                mrope: Some(positions),
+            }) => self
+                .driver
+                .open_with_mrope(seq, embeds.clone(), positions.clone())?,
+            Some(PromptRows {
+                embeds,
+                mrope: None,
+            }) => self.driver.open_with_embeds(seq, embeds.clone())?,
             None => self.driver.open(seq)?,
         };
         Ok(match admission {
@@ -498,6 +514,10 @@ impl ServeEngine for DriverEngine {
     fn compiles(&self) -> u64 {
         self.driver.stats().compiles
     }
+
+    fn timing(&self) -> Option<TimingSnapshot> {
+        Some(self.driver.executor_stats().timing)
+    }
 }
 
 /// Why [`run_engine`] returned.
@@ -520,6 +540,10 @@ struct Scheduler<'a, E: ServeEngine> {
     encodes: VecDeque<EncodeJob>,
     admins: VecDeque<AdminJob>,
     closed: bool,
+    /// Steps ran since the executor's timing was last published.
+    timing_dirty: bool,
+    /// When the executor's timing was last published.
+    timing_published: Option<Instant>,
 }
 
 /// Serve `rx` over `engine` until every sender is gone and the work is done, or the engine faults.
@@ -537,6 +561,8 @@ pub(crate) fn run_engine<E: ServeEngine>(
         encodes: VecDeque::new(),
         admins: VecDeque::new(),
         closed: false,
+        timing_dirty: false,
+        timing_published: None,
     };
     match scheduler.run() {
         Ok(()) => Exit::Shutdown,
@@ -562,6 +588,8 @@ impl<E: ServeEngine> Scheduler<'_, E> {
                 self.admit()?;
             }
             if self.slots.is_empty() {
+                // Idle: whatever the last steps measured is published before the loop blocks.
+                self.publish_timing(true);
                 continue;
             }
             self.step()?;
@@ -721,9 +749,9 @@ impl<E: ServeEngine> Scheduler<'_, E> {
                 prompt: front.prompt.tokens(),
                 max_new,
                 adapter: front.lora_adapter,
-                embeds: match &front.prompt {
+                rows: match &front.prompt {
                     PromptInput::Tokens(_) => None,
-                    PromptInput::Multimodal { embeds, .. } => Some(embeds),
+                    PromptInput::Multimodal { rows, .. } => Some(rows),
                 },
             };
             match self.engine.open(request) {
@@ -910,7 +938,7 @@ impl<E: ServeEngine> Scheduler<'_, E> {
             .map_err(|error| format!("release: {error:?}"))
     }
 
-    fn refresh_gauges(&self) {
+    fn refresh_gauges(&mut self) {
         let cache = &self.metrics.cache;
         if let Some((free, total)) = self.engine.kv_blocks() {
             cache
@@ -926,6 +954,28 @@ impl<E: ServeEngine> Scheduler<'_, E> {
         self.metrics
             .batch_size
             .store(self.slots.len() as u64, Ordering::Relaxed);
+        self.timing_dirty = true;
+        self.publish_timing(false);
+    }
+
+    /// Publish the executor's timing summary when steps ran since the last publish: at most once per
+    /// [`TIMING_PUBLISH_INTERVAL`] while stepping, and always (`force`) once the loop goes idle. The
+    /// summary is fixed-size, so a metrics reader that never comes retains nothing.
+    fn publish_timing(&mut self, force: bool) {
+        if !self.timing_dirty {
+            return;
+        }
+        let due = self
+            .timing_published
+            .is_none_or(|at| at.elapsed() >= TIMING_PUBLISH_INTERVAL);
+        if !(force || due) {
+            return;
+        }
+        if let Some(snapshot) = self.engine.timing() {
+            self.metrics.timing.publish(&snapshot);
+        }
+        self.timing_dirty = false;
+        self.timing_published = Some(Instant::now());
     }
 
     /// The engine faulted: every request fails with the reason and nothing is released, because the

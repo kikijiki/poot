@@ -1,20 +1,18 @@
 //! Validation staging, atomic publication, and mixed-source byte accounting.
 
 use super::{
-    Arc, AuthenticatedArtifactIdentity, AuthenticatedTensorDescriptor, BTreeMap,
-    ClassifiedInventoryRow, ExactSourceBuildCounts, ExactSourceCacheKey, ExactSourceKind,
-    ExactSourceOwner, ExactSourceOwnerCache, HASH_BUFFER_BYTES, LoadedPackedLinear,
-    MixedCategoryBytes, MixedLoadReport, MixedLoadResult, MixedSourceCategory, OperandRole,
-    OwnerCacheKind, PackedBufferKind, PackedLoadReport, PackedLoadResult, PackedOwnerCache,
-    PackedOwnerCacheKey, PackedPayload, PackedSafetensorsError, PackedSelectionField,
-    PackedSelectionRow, Sha256Digest, SourceRole, TensorDisposition, WeightFormat,
-    build_mixed_store, build_range_checks, checked_add,
+    Arc, AuthenticatedArtifactIdentity, AuthenticatedTensorDescriptor, ClassifiedInventoryRow,
+    ExactSourceBuildCounts, ExactSourceCacheKey, ExactSourceKind, ExactSourceOwner,
+    ExactSourceOwnerCache, HASH_BUFFER_BYTES, LoadedPackedLinear, MixedCategoryBytes,
+    MixedLoadReport, MixedLoadResult, MixedSourceCategory, OwnerCacheKind, PackedLoadReport,
+    PackedLoadResult, PackedOwnerCache, PackedOwnerCacheKey, PackedPayload, PackedSafetensorsError,
+    PackedSelectionField, PackedSelectionRow, Sha256Digest, TensorDisposition, WeightFormat,
+    build_mixed_store, checked_add,
 };
 
 #[derive(Clone)]
 pub(crate) struct ValidatedSelection {
     pub(crate) selection: PackedSelectionRow,
-    pub(crate) data_start: usize,
 }
 
 impl ValidatedSelection {
@@ -44,7 +42,6 @@ pub(crate) struct StagedRow {
 
 pub(crate) struct PreparedPackedPublication {
     pub(crate) staged: Vec<StagedRow>,
-    pub(crate) checks: BTreeMap<String, Vec<RangeCheck>>,
     pub(crate) result: PackedLoadResult,
 }
 
@@ -64,7 +61,6 @@ pub(crate) struct PackedDecisionPair {
 pub(crate) struct ValidatedExactSelection {
     pub(crate) descriptor: AuthenticatedTensorDescriptor,
     pub(crate) kind: ExactSourceKind,
-    pub(crate) data_start: usize,
     pub(crate) key: ExactSourceCacheKey,
 }
 
@@ -90,11 +86,7 @@ pub(crate) struct StagedMixedSelection {
 
 pub(crate) enum StagedOwnerRef<'a> {
     Packed(&'a Arc<PackedPayload>),
-    Exact {
-        #[cfg(test)]
-        read_allocation: *const [u8],
-        owner: &'a Arc<ExactSourceOwner>,
-    },
+    Exact { owner: &'a Arc<ExactSourceOwner> },
 }
 
 impl StagedOwnerRef<'_> {
@@ -102,17 +94,6 @@ impl StagedOwnerRef<'_> {
         match self {
             Self::Packed(owner) => Arc::strong_count(owner),
             Self::Exact { owner, .. } => Arc::strong_count(owner),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn preserves_read_allocation(&self) -> bool {
-        match self {
-            Self::Packed(_) => true,
-            Self::Exact {
-                read_allocation,
-                owner,
-            } => std::ptr::eq(*read_allocation, Arc::as_ptr(&owner.bytes)),
         }
     }
 }
@@ -223,7 +204,6 @@ impl MixedAccountingTable {
 
 pub(crate) struct PreparedMixedPublication {
     pub(crate) staged: StagedMixedSelection,
-    pub(crate) checks: BTreeMap<String, Vec<RangeCheck>>,
     pub(crate) result: MixedLoadResult,
 }
 
@@ -243,7 +223,6 @@ pub(crate) fn prepare_packed_publication(
     report: PackedLoadReport,
     cache: &mut PackedOwnerCache,
 ) -> Result<PreparedPackedPublication, PackedSafetensorsError> {
-    let checks = build_range_checks(&staged)?;
     let cold_count = staged.iter().filter(|row| row.cold).count();
     cache
         .owners
@@ -267,7 +246,6 @@ pub(crate) fn prepare_packed_publication(
         .collect();
     Ok(PreparedPackedPublication {
         staged,
-        checks,
         result: PackedLoadResult { rows, report },
     })
 }
@@ -296,7 +274,6 @@ pub(crate) fn prepare_mixed_publication(
     packed_cache: &mut PackedOwnerCache,
     exact_cache: &mut ExactSourceOwnerCache,
 ) -> Result<PreparedMixedPublication, PackedSafetensorsError> {
-    let checks = build_mixed_range_checks(&staged.packed, &staged.exact)?;
     let cold_packed = staged.packed.iter().filter(|row| row.cold).count();
     let cold_exact = staged.exact.iter().filter(|row| row.cold).count();
     packed_cache.owners.try_reserve(cold_packed).map_err(|_| {
@@ -322,11 +299,7 @@ pub(crate) fn prepare_mixed_publication(
         report: staged.report,
     };
     result.report.stored_bytes = result.store.total_stored_bytes();
-    Ok(PreparedMixedPublication {
-        staged,
-        checks,
-        result,
-    })
+    Ok(PreparedMixedPublication { staged, result })
 }
 
 pub(crate) fn commit_mixed_publication(
@@ -486,30 +459,6 @@ pub(crate) fn mixed_metadata_bytes(
     )
 }
 
-pub(crate) fn build_mixed_range_checks(
-    packed: &[StagedRow],
-    exact: &[StagedExactRow],
-) -> Result<BTreeMap<String, Vec<RangeCheck>>, PackedSafetensorsError> {
-    let mut checks = build_range_checks(packed)?;
-    for row in exact.iter().filter(|row| row.cold) {
-        checks
-            .entry(row.row.descriptor.shard.clone())
-            .or_default()
-            .push(RangeCheck {
-                start: checked_add(
-                    row.row.data_start,
-                    row.row.descriptor.span.start,
-                    "exact-source verification start",
-                )?,
-                owner: RangeCheckOwner::Exact(Arc::clone(&row.owner)),
-            });
-    }
-    for shard_checks in checks.values_mut() {
-        shard_checks.sort_unstable_by_key(|check| check.start);
-    }
-    Ok(checks)
-}
-
 pub(crate) fn category_for_disposition(disposition: &TensorDisposition) -> MixedSourceCategory {
     match disposition {
         TensorDisposition::PackedWeight { .. } | TensorDisposition::PackedScale { .. } => {
@@ -604,33 +553,4 @@ pub(crate) fn shape_2(
             expected: "rank-two physical shape".to_string(),
             actual: format!("{:?}", descriptor.shape),
         })
-}
-
-pub(crate) struct RangeCheck {
-    pub(crate) start: usize,
-    pub(crate) owner: RangeCheckOwner,
-}
-
-pub(crate) enum RangeCheckOwner {
-    Packed {
-        owner: Arc<PackedPayload>,
-        buffer: PackedBufferKind,
-    },
-    Exact(Arc<ExactSourceOwner>),
-}
-
-impl RangeCheck {
-    pub(crate) fn bytes(&self) -> &[u8] {
-        match &self.owner {
-            RangeCheckOwner::Packed {
-                owner,
-                buffer: PackedBufferKind::Weight,
-            } => owner.bytes(SourceRole::Planar(OperandRole::Codes)),
-            RangeCheckOwner::Packed {
-                owner,
-                buffer: PackedBufferKind::Scale,
-            } => owner.bytes(SourceRole::Planar(OperandRole::Scale)),
-            RangeCheckOwner::Exact(owner) => owner.bytes(),
-        }
-    }
 }

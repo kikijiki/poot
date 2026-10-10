@@ -141,7 +141,11 @@ fn plan_indexed(
     // The BF16 stack is read as packed lanes, which only a const upload (or a view of one, read in place) has.
     let weight = match g.aval(ids[1]).dtype {
         DType::F32 => BufferStorage::f32(),
-        DType::BF16 if g.values[view_source(g, views, ids[1])].storage == Storage::Const => {
+        DType::BF16
+            if g.values[view_source(g, views, ids[1])]
+                .storage
+                .holds_weight_bytes() =>
+        {
             BufferStorage::bf16_packed()
         }
         _ => return Err(site.refuse(Capability::DtypeLowering)),

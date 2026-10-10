@@ -166,7 +166,7 @@ fn dyn_update_slice_dynamic_gpu_matches_static() {
     let update = b.constant("update", TensorType::f32(vec![rows, 1, cols]));
     let index = b.constant("index", TensorType::scalar(poot_tensor::DType::F32));
     let out = b.dynamic_update_slice_dyn(operand, update, index, 1);
-    let (oi, ui, ii) = (operand.id, update.id, index.id);
+    let (oi, ui, ii) = (operand.id(), update.id(), index.id());
     let g = b.finish(out);
     let mut inputs = HashMap::new();
     inputs.insert(
@@ -192,7 +192,7 @@ fn dyn_update_slice_dynamic_gpu_matches_static() {
     let so = bs.constant("operand", TensorType::f32(vec![rows, cap, cols]));
     let su = bs.constant("update", TensorType::f32(vec![rows, 1, cols]));
     let sout = bs.dynamic_update_slice(so, su, idx, 1);
-    let (soi, sui) = (so.id, su.id);
+    let (soi, sui) = (so.id(), su.id());
     let gs = bs.finish(sout);
     let mut sinputs = HashMap::new();
     sinputs.insert(

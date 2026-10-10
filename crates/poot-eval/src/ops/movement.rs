@@ -428,7 +428,7 @@ pub(crate) fn dynamic_update_slice(
 /// `test-support`.
 #[cfg(any(test, feature = "test-support"))]
 pub fn apply_movement(op: &OpKind, ins: &[HostTensor]) -> Result<HostTensor, EvalError> {
-    const NO_EQN: ValueId = 0;
+    const NO_EQN: ValueId = ValueId::new(0);
     match op {
         OpKind::Reshape { shape } => reshape(&ins[0], shape),
         OpKind::Transpose { perm } => transpose(&ins[0], perm),

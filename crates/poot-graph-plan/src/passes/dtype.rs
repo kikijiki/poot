@@ -1,4 +1,5 @@
 use super::*;
+use poot_graph_ir::ValueTable;
 
 /// A `Transpose` is a pure data no-op (the row-major flat buffer is unchanged) iff its non-unit input dims
 /// keep their relative order under the permutation - only size-1 axes are shuffled. Then `transpose(perm)`
@@ -29,7 +30,7 @@ pub(crate) fn transpose_is_noop(in_shape: &[usize], perm: &[usize]) -> bool {
 /// is a reshape, in every layer. Reshapes are free buffer aliases, so this removes no dispatches; it
 /// cuts node count, and so the per-token host capture/plan work, on the launch-bound decode path.
 pub fn collapse_reshape_chains<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
-    let mut producer: Vec<Option<usize>> = vec![None; g.values.len()];
+    let mut producer: ValueTable<Option<usize>> = ValueTable::filled(g.values.len(), None);
     for (i, e) in g.eqns.iter().enumerate() {
         producer[e.out] = Some(i);
     }

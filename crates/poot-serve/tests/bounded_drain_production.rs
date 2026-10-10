@@ -1,6 +1,8 @@
-//! Card 327 shutdown coverage through the production `poot-serve` binary. The tiny GGUF is the model
-//! input; the accepted-request barrier is a deliberately incomplete HTTP head handled by the production
-//! parser. Nothing of the accept loop, deadline, or cancellation path is reimplemented here.
+//! Shutdown coverage through the production `poot-serve` binary, on every build. The tiny GGUF is the
+//! model input; the accepted-request barrier is a deliberately incomplete HTTP head handled by the
+//! production parser, held open through the real listener. Nothing of the accept loop, deadline, or
+//! cancellation path is reimplemented here, and the server has no test hook: the drain bound is observed
+//! from outside, over its sockets.
 
 use poot_test_util::contained_child::ContainChild;
 use std::io::{Read, Write};
@@ -112,7 +114,6 @@ fn spawn_reader<R: Read + Send + 'static>(
 struct ProductionServer {
     child: Child,
     addr: SocketAddr,
-    accept_barrier: Option<TcpStream>,
     log: Arc<Mutex<Vec<u8>>>,
     readers: Vec<JoinHandle<()>>,
     _model: TinyModel,
@@ -120,24 +121,17 @@ struct ProductionServer {
 
 impl ProductionServer {
     fn spawn(drain_secs: u64) -> Self {
-        Self::spawn_inner(drain_secs, false)
+        Self::spawn_inner(drain_secs, None)
     }
 
-    #[cfg(debug_assertions)]
-    fn spawn_with_accept_barrier(drain_secs: u64) -> Self {
-        Self::spawn_inner(drain_secs, true)
+    /// As [`Self::spawn`], with the removed `POOT_CARD327_TEST_ACCEPT_BARRIER_ADDR` pointing at `hook`.
+    fn spawn_with_removed_hook(drain_secs: u64, hook: SocketAddr) -> Self {
+        Self::spawn_inner(drain_secs, Some(hook))
     }
 
-    fn spawn_inner(drain_secs: u64, with_accept_barrier: bool) -> Self {
+    fn spawn_inner(drain_secs: u64, removed_hook: Option<SocketAddr>) -> Self {
         let model = TinyModel::create();
         let addr = unused_loopback_addr();
-        let accept_barrier_listener = with_accept_barrier.then(|| {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind Card 327 accept barrier");
-            listener
-                .set_nonblocking(true)
-                .expect("make Card 327 accept barrier nonblocking");
-            listener
-        });
         let mut command = Command::new(poot_serve_bin());
         // The server opens a device before it listens (the engine plan prepares the model on it), so the
         // production binary runs on the wgpu device lane, named explicitly.
@@ -146,14 +140,11 @@ impl ProductionServer {
             .arg(model.path())
             .arg(addr.to_string())
             .args(["--backend", "wgpu"])
-            .env("POOT_DRAIN_TIMEOUT_SECS", drain_secs.to_string())
-            .env("POOT_READ_TIMEOUT_SECS", "30")
-            .env("POOT_WRITE_TIMEOUT_SECS", "30");
-        if let Some(listener) = &accept_barrier_listener {
-            command.env(
-                "POOT_CARD327_TEST_ACCEPT_BARRIER_ADDR",
-                listener.local_addr().unwrap().to_string(),
-            );
+            .args(["--drain-timeout-secs", &drain_secs.to_string()])
+            .args(["--read-timeout-secs", "30"])
+            .args(["--write-timeout-secs", "30"]);
+        if let Some(hook) = removed_hook {
+            command.env("POOT_CARD327_TEST_ACCEPT_BARRIER_ADDR", hook.to_string());
         }
         let mut child = command
             .env("RUST_LOG", "info")
@@ -166,38 +157,9 @@ impl ProductionServer {
             spawn_reader(child.stdout.take().unwrap(), Arc::clone(&log)),
             spawn_reader(child.stderr.take().unwrap(), Arc::clone(&log)),
         ];
-        let accept_barrier = accept_barrier_listener.map(|listener| {
-            let accept_deadline = Instant::now().checked_add(STARTUP_TIMEOUT).unwrap();
-            let stream = loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        if let Some(status) = child.try_wait().unwrap() {
-                            panic!(
-                                "production server exited before accept-barrier setup: {status}"
-                            );
-                        }
-                        assert!(
-                            Instant::now() < accept_deadline,
-                            "production server did not connect its Card 327 accept barrier"
-                        );
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(error) => panic!("accept Card 327 control connection: {error}"),
-                }
-            };
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream
-                .set_write_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream
-        });
         let mut server = Self {
             child,
             addr,
-            accept_barrier,
             log,
             readers,
             _model: model,
@@ -256,32 +218,6 @@ impl ProductionServer {
     fn signal(&self, signal: libc::c_int) {
         let result = unsafe { libc::kill(self.child.id() as libc::pid_t, signal) };
         assert_eq!(result, 0, "signal production server");
-    }
-
-    fn arm_accept_barrier(&mut self) {
-        self.accept_barrier
-            .as_mut()
-            .expect("Card 327 accept barrier enabled")
-            .write_all(b"A")
-            .unwrap();
-    }
-
-    fn wait_for_guarded_accept(&mut self) {
-        let mut marker = [0u8; 1];
-        self.accept_barrier
-            .as_mut()
-            .expect("Card 327 accept barrier enabled")
-            .read_exact(&mut marker)
-            .unwrap();
-        assert_eq!(marker, [b'B']);
-    }
-
-    fn release_guarded_accept(&mut self) {
-        self.accept_barrier
-            .as_mut()
-            .expect("Card 327 accept barrier enabled")
-            .write_all(b"R")
-            .unwrap();
     }
 
     fn assert_alive(&mut self) {
@@ -357,33 +293,23 @@ fn accepted_request_barrier(server: &ProductionServer) -> TcpStream {
     barrier
 }
 
-#[cfg(debug_assertions)]
+/// A signal closes admission and lets an accepted request finish: the incomplete head is completed after
+/// SIGINT and gets its response, then the process exits cleanly inside the drain bound. The old
+/// accept-barrier environment variable is set to a listener that expects no connection: it has no effect
+/// on any build, so the server never connects to it. Mutation: restore the `debug_assertions`-gated read
+/// in `lifecycle.rs`; on a debug build the server connects to the listener and this row goes red.
 #[test]
 fn bounded_drain_production_completes_accepted_barrier_before_exit() {
-    let mut server = ProductionServer::spawn_with_accept_barrier(3);
+    let removed_hook = TcpListener::bind("127.0.0.1:0").expect("bind the removed-hook listener");
+    removed_hook
+        .set_nonblocking(true)
+        .expect("make the removed-hook listener nonblocking");
+    let mut server =
+        ProductionServer::spawn_with_removed_hook(3, removed_hook.local_addr().unwrap());
     let mut barrier = accepted_request_barrier(&server);
-    server.arm_accept_barrier();
-    let mut rejected =
-        TcpStream::connect(server.addr).expect("connect guarded post-signal request");
-    rejected
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-    rejected
-        .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .unwrap();
-    server.wait_for_guarded_accept();
     server.signal(libc::SIGINT);
-    server.release_guarded_accept();
     server.wait_log("shutting down (signal received", Duration::from_secs(2));
     server.assert_alive();
-    let mut rejected_response = String::new();
-    if let Err(error) = rejected.read_to_string(&mut rejected_response) {
-        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
-    }
-    assert!(
-        rejected_response.is_empty(),
-        "post-signal accepted socket reached a handler: {rejected_response:?}"
-    );
 
     barrier.write_all(b"\r\n").unwrap();
     let mut response = String::new();
@@ -396,6 +322,11 @@ fn bounded_drain_production_completes_accepted_barrier_before_exit() {
     );
     server.wait_success(PROCESS_EXIT_TIMEOUT);
     assert!(server.log_text().contains("server stopped"));
+    match removed_hook.accept() {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+        Ok((_, peer)) => panic!("the server connected to the removed test hook from {peer}"),
+        Err(error) => panic!("removed-hook listener failed: {error}"),
+    }
 }
 
 #[test]

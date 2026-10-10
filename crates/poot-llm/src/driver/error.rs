@@ -13,7 +13,7 @@ use crate::core::sampler::SamplerFault;
 use crate::driver::lora::{AdapterError, GenerationId, LoraError};
 use crate::driver::step::SeqId;
 use crate::driver::suffix::Head;
-use crate::error::TextError;
+use crate::error::{ChatTemplateError, TextError};
 
 /// Why the driver cannot serve something: the model, the registry or the planner has no way to.
 #[derive(Debug, thiserror::Error)]
@@ -43,12 +43,27 @@ pub enum Unsupported {
         "backend {backend} is not built into this binary: rebuild with `--features {backend}` to enable it"
     )]
     Backend { backend: &'static str },
+    /// The backend's devices cannot exchange values with one another, so no multi-device placement
+    /// runs on it.
+    #[error(
+        "backend {backend} has no peer copies between its devices: a multi-device placement needs ptx"
+    )]
+    MultiDevice { backend: &'static str },
     /// The draft policy cannot be served on this model or with this draft.
     #[error(transparent)]
     Speculation(SpeculationRefusal),
     /// The adapters do not stack against this model's weights.
     #[error(transparent)]
     Adapter(AdapterError),
+    /// The placement has no form of something the driver was asked for: a tensor-parallel driver loads
+    /// one executable whose weights are cut per rank, so a second executable over whole weights is
+    /// refused rather than served over weights the program does not bind; a draft model's layers are
+    /// not the target's, so the target's pipeline cut names nothing in them.
+    #[error("a {placement} placement has no form of {what}")]
+    Placement {
+        placement: &'static str,
+        what: &'static str,
+    },
 }
 
 /// Why a [`DraftPolicy`](crate::driver::DraftPolicy) is refused at `prepare`.
@@ -140,6 +155,15 @@ pub enum InvalidRequest {
     /// slot of the paged pool. No block count would help.
     #[error("every sequence slot is taken: release a sequence first")]
     SlotsBusy,
+    /// A paged pool shares earlier turns through its prefix cache (`open` finds them); only the contiguous
+    /// layout's one private cache is resumed in place.
+    #[error(
+        "a paged sequence cannot be resumed: open the next turn and the prefix cache reuses it"
+    )]
+    ResumePaged,
+    /// The sequence's prompt supplied embedding rows or sectioned positions that a new prompt does not.
+    #[error("sequence {0:?} was opened with prompt embeddings or positions and cannot be resumed")]
+    ResumeEmbedded(SeqId),
     #[error(transparent)]
     Adapter(LoraError),
     /// The embedding rows a prompt supplies do not fit it.
@@ -231,9 +255,18 @@ pub enum InvalidOptions {
     /// A step may not carry more new tokens than the trace limit admits.
     #[error("prefill_chunk {chunk} exceeds the trace limit of {max_tokens} tokens per step")]
     ChunkAboveTraceLimit { chunk: usize, max_tokens: usize },
-    /// The executor must drive exactly one device (the M3 contract).
-    #[error("the executor names {devices} devices; the driver drives exactly one")]
+    /// A single placement runs on exactly one device.
+    #[error("a single placement runs on one device; the executor names {devices}")]
     Devices { devices: usize },
+    /// A pipeline needs a device for each of its stages, and at least two of them.
+    #[error(
+        "a pipeline cut into {stages} stages cannot run over {devices} devices (at least two, one per stage)"
+    )]
+    PipelineStages { stages: usize, devices: usize },
+    /// A tensor placement divides the weights over the executor's devices: there is nothing to divide
+    /// over zero.
+    #[error("a tensor placement needs at least one device")]
+    TensorWithoutDevices,
     /// A driver admits one KV layout, and one pool size: state avals pin one cache per driver.
     #[error("the driver already admitted a different KV layout or pool size")]
     LayoutChanged,
@@ -243,10 +276,25 @@ pub enum InvalidOptions {
     /// The contiguous layout is one private cache: one row.
     #[error("the contiguous layout serves one row")]
     ContiguousServesOneRow,
+    /// A pooled driver needs a routed model: the graph has no expert selection to page.
+    #[error("the model has no routed experts to pool")]
+    PoolWithoutRoutedExperts,
+    /// One step of the smallest chunk selects more experts than the pool has rows.
+    #[error(
+        "a pool of {slots} rows cannot serve one granule of {granule} tokens at {per_token} experts per token"
+    )]
+    PoolBelowGranule {
+        slots: usize,
+        per_token: usize,
+        granule: usize,
+    },
     /// A verify window runs drafts the sequence may reject, and recurrent state has no rollback: the
     /// rejected drafts would already have advanced it.
     #[error("a model with recurrent state cannot verify a window of drafts")]
     RecurrentHasNoVerifyWindows,
+    /// A timing bound of zero would disable what it bounds: a detailed run needs every bound positive.
+    #[error("the timing bound `{bound}` must be positive, got 0")]
+    TimingBoundZero { bound: &'static str },
 }
 
 /// A new prepared entry the retention budget refuses. The entries already prepared stay usable and
@@ -305,6 +353,9 @@ pub enum LoadError {
     /// The tokenizer or chat template could not be built from the checkpoint.
     #[error("tokenizer: {0}")]
     Text(#[source] Box<TextError>),
+    /// The chat template given in place of the checkpoint's own is refused.
+    #[error(transparent)]
+    ChatTemplate(#[from] ChatTemplateError),
 }
 
 #[derive(Debug, thiserror::Error)]

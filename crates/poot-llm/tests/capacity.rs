@@ -13,6 +13,7 @@ use poot_executor::{BufferRole, Device, Dispatch, Engine};
 use poot_graph_ir::{BinOp, Builder, Graph, StateRole, TensorType, ValidationOutputs};
 use poot_graph_plan::{CompileLimits, CompileOptions, DeviceId, Submission, Target};
 use poot_llm::driver::capacity::Planner;
+use poot_llm::driver::placement::Placement;
 use poot_llm::driver::{
     Driver, DriverOptions, Head, Layout, ModelHandle, PoolShape, PreparedSetLimits, ServingShapes,
     Warm,
@@ -278,7 +279,13 @@ impl Device for CountingDevice {
     fn replay(&mut self, _recording: &()) -> Result<(), FakeError> {
         Ok(())
     }
-    fn write(&mut self, _dst: &(), _offset: usize, _bytes: &[u8]) -> Result<(), FakeError> {
+    fn write_with(
+        &mut self,
+        _dst: &(),
+        _offset: usize,
+        _len: usize,
+        _fill: &mut dyn FnMut(std::ops::Range<usize>, &mut [u8]),
+    ) -> Result<(), FakeError> {
         Ok(())
     }
     fn read(&mut self, _src: &(), _out: &mut [u8]) -> Result<(), FakeError> {
@@ -342,7 +349,12 @@ fn planned_and_live(
     let executor = Engine::new(device);
     let planner = {
         use poot_executor::Executor;
-        Planner::new(Arc::clone(handle), &executor.target_set()).unwrap()
+        Planner::new(
+            Arc::clone(handle),
+            &executor.target_set(),
+            Placement::Single,
+        )
+        .unwrap()
     };
     let planned = planner
         .plan(options(capacity), &shapes(layout), false)

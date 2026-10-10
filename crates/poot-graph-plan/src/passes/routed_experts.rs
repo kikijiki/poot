@@ -2,27 +2,28 @@
 //! flash-attention synthesis, fusion and the generated tiled GEMM (POOT-1038 measured it completing on both
 //! with every pass on, so no compile reads a site to skip one).
 //!
-//! A site is a router-logits contraction over more than one row whose `ArgTopK` expert ids feed an
-//! indexed contraction. The shape is what decides, not the family: a one-row decode has no site, a
-//! `ArgTopK` that feeds nothing indexed (a sampler's top-k) has none, and every routed family has one
-//! at prefill, however it spells its router.
+//! A site is a router-logits contraction whose `ArgTopK` expert ids feed indexed contractions. The
+//! shape is what decides, not the family: an `ArgTopK` that feeds nothing indexed (a sampler's top-k)
+//! has no site, and every routed family has one at prefill and at decode, however it spells its router.
 //!
-//! The walk is held for POOT-746's pool transform, its production caller.
+//! The walk's production caller is the expert-pool transform (`pool`), which pages the tables the
+//! site's indexed contractions read.
 
 use std::collections::HashMap;
 
 use poot_graph_ir::graph::{Graph, Operand, ValidationChannel, ValueId};
-use poot_graph_ir::op::OpKind;
+use poot_graph_ir::op::{ContractionRows, OpKind};
 
 /// One routed-expert site, as equation indices into the graph's `eqns`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RoutedExpertSite {
-    /// The router-logits contraction (`MatMul`) over more than one row.
+    /// The router-logits contraction (`MatMul`).
     pub router: usize,
     /// The `ArgTopK` selecting each row's experts from the router's scores.
     pub select: usize,
-    /// The indexed contraction whose per-row expert index the selection feeds.
-    pub experts: usize,
+    /// Every indexed contraction whose per-row expert index the selection feeds, in equation order:
+    /// the up and down projections of a layer share one selection.
+    pub experts: Vec<usize>,
 }
 
 fn value_inputs(inputs: &[Operand]) -> impl Iterator<Item = ValueId> + '_ {
@@ -33,7 +34,6 @@ fn value_inputs(inputs: &[Operand]) -> impl Iterator<Item = ValueId> + '_ {
 }
 
 /// Every routed-expert site of `g`.
-#[cfg_attr(not(test), expect(dead_code, reason = "held for POOT-746"))]
 pub(crate) fn routed_expert_sites<V: ValidationChannel>(g: &Graph<V>) -> Vec<RoutedExpertSite> {
     let producer: HashMap<ValueId, usize> = g
         .eqns
@@ -56,9 +56,10 @@ pub(crate) fn routed_expert_sites<V: ValidationChannel>(g: &Graph<V>) -> Vec<Rou
         let Some(router) = upstream_router(g, &producer, select) else {
             continue;
         };
-        let Some(experts) = downstream_indexed(g, &consumers, select) else {
+        let experts = downstream_indexed(g, &consumers, select);
+        if experts.is_empty() {
             continue;
-        };
+        }
         sites.push(RoutedExpertSite {
             router,
             select,
@@ -68,8 +69,8 @@ pub(crate) fn routed_expert_sites<V: ValidationChannel>(g: &Graph<V>) -> Vec<Rou
     sites
 }
 
-/// The nearest `MatMul` over more than one row feeding equation `start`: the walk stops at the first
-/// contraction on every path, so it never reaches an earlier layer's.
+/// The nearest `MatMul` feeding equation `start`: the walk stops at the first contraction on every
+/// path, so it never reaches an earlier layer's.
 fn upstream_router<V: ValidationChannel>(
     g: &Graph<V>,
     producer: &HashMap<ValueId, usize>,
@@ -83,41 +84,54 @@ fn upstream_router<V: ValidationChannel>(
         }
         let eqn = &g.eqns[i];
         if i != start && matches!(eqn.op, OpKind::MatMul) {
-            let shape = &g.aval(eqn.out).shape;
-            let rows: usize = shape[..shape.len().saturating_sub(1)].iter().product();
-            if rows > 1 {
-                return Some(i);
-            }
-            continue;
+            return Some(i);
         }
         stack.extend(value_inputs(&eqn.inputs).filter_map(|v| producer.get(&v).copied()));
     }
     None
 }
 
-/// The first `IndexedMatMul` whose per-row expert index (its third operand) is reached from the
-/// output of equation `start`.
+/// The operand position of an indexed contraction's per-row expert index, `None` for any other op.
+fn expert_index_position(op: &OpKind) -> Option<usize> {
+    match op {
+        OpKind::IndexedMatMul => Some(2),
+        OpKind::PackedContraction {
+            rows: ContractionRows::Indexed { .. },
+            ..
+        } => Some(1),
+        _ => None,
+    }
+}
+
+/// Every indexed contraction whose per-row expert index is reached from the output of equation
+/// `start`, in equation order. The walk does not continue through a contraction: its result is an
+/// activation, never an index, so a later layer's selection is not this one's.
 fn downstream_indexed<V: ValidationChannel>(
     g: &Graph<V>,
     consumers: &HashMap<ValueId, Vec<usize>>,
     start: usize,
-) -> Option<usize> {
+) -> Vec<usize> {
     let mut seen = vec![false; g.eqns.len()];
+    let mut found = Vec::new();
     let mut stack = vec![g.eqns[start].out];
     while let Some(value) = stack.pop() {
         for &i in consumers.get(&value).into_iter().flatten() {
             let eqn = &g.eqns[i];
-            if matches!(eqn.op, OpKind::IndexedMatMul)
-                && matches!(eqn.inputs.get(2), Some(Operand::Value(idx)) if *idx == value)
-            {
-                return Some(i);
+            if let Some(position) = expert_index_position(&eqn.op) {
+                if matches!(eqn.inputs.get(position), Some(Operand::Value(idx)) if *idx == value)
+                    && !found.contains(&i)
+                {
+                    found.push(i);
+                }
+                continue;
             }
             if !std::mem::replace(&mut seen[i], true) {
                 stack.push(eqn.out);
             }
         }
     }
-    None
+    found.sort_unstable();
+    found
 }
 
 #[cfg(test)]
@@ -150,16 +164,16 @@ mod tests {
         routed_expert_sites(g).len()
     }
 
-    /// A router over several rows whose selection feeds an indexed contraction is a site; the same
-    /// router over one row (a decode), a selection nothing indexed reads (a sampler's top-k), and an
-    /// `ArgTopK` with no router contraction behind it are not.
+    /// A router whose selection feeds an indexed contraction is a site, at prefill and at decode; a
+    /// selection nothing indexed reads (a sampler's top-k) and an `ArgTopK` with no router contraction
+    /// behind it are not.
     ///
-    /// Mutation (observed red): match every `ArgTopK` in `routed_expert_sites`; the one-row, the
-    /// unconsumed and the router-less rows each report a site.
+    /// Mutation (observed red): match every `ArgTopK` in `routed_expert_sites`; the unconsumed and the
+    /// router-less rows each report a site.
     #[test]
     fn a_site_is_a_multi_row_router_whose_selection_feeds_an_indexed_contraction() {
         assert_eq!(sites(&routed(4, true)), 1, "a prefill router");
-        assert_eq!(sites(&routed(1, true)), 0, "a one-row router is a decode");
+        assert_eq!(sites(&routed(1, true)), 1, "a one-row router is a decode");
         assert_eq!(
             sites(&routed(4, false)),
             0,
@@ -180,11 +194,12 @@ mod tests {
     #[test]
     fn a_site_names_its_three_equations() {
         let g = routed(4, true);
-        let [site] = routed_expert_sites(&g)[..] else {
+        let [ref site] = routed_expert_sites(&g)[..] else {
             panic!("one site");
         };
         assert!(matches!(g.eqns[site.router].op, OpKind::MatMul));
         assert!(matches!(g.eqns[site.select].op, OpKind::ArgTopK { .. }));
-        assert!(matches!(g.eqns[site.experts].op, OpKind::IndexedMatMul));
+        assert_eq!(site.experts.len(), 1);
+        assert!(matches!(g.eqns[site.experts[0]].op, OpKind::IndexedMatMul));
     }
 }

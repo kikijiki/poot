@@ -27,7 +27,7 @@
 use poot_graph_ir::graph::{Storage, ValueMeta};
 use poot_graph_ir::op::{ContractionHead, OpKind};
 use poot_graph_ir::types::TensorType;
-use poot_graph_ir::{Eqn, Graph, Operand, ValidationChannel, ValueId};
+use poot_graph_ir::{Eqn, Graph, Operand, ValidationChannel, ValueId, ValueTable};
 use poot_target::{Backend, TensorCoreSupport};
 use poot_tensor::DType;
 
@@ -269,8 +269,8 @@ pub fn prepare_target_graph<V: ValidationChannel>(g: &Graph<V>, backend: Backend
 /// produces it. Local to the two folds below (their own copy of `poot-graph-ir`'s private
 /// `packed_consumer_map`/`value_input`/`is_graph_escape`, kept small rather than widening
 /// `poot-graph-ir`'s public surface for two callers - Card 534a).
-fn packed_consumer_map<V: ValidationChannel>(g: &Graph<V>) -> Vec<Vec<usize>> {
-    let mut consumers = vec![Vec::new(); g.values.len()];
+fn packed_consumer_map<V: ValidationChannel>(g: &Graph<V>) -> ValueTable<Vec<usize>> {
+    let mut consumers = ValueTable::filled(g.values.len(), Vec::new());
     for (equation, eqn) in g.eqns.iter().enumerate() {
         for operand in &eqn.inputs {
             if let Operand::Value(value) = operand {
@@ -574,8 +574,8 @@ pub(crate) fn fold_dense_bf16_row_gathers<V: ValidationChannel>(g: &Graph<V>) ->
                 agreed = false;
                 break;
             }
-            let value = out.values.len();
-            out.values
+            let value = out
+                .values
                 .push(ValueMeta::new(current_type, Storage::Device, None));
             rebuilt.push(Eqn {
                 op: current_op,
@@ -695,8 +695,8 @@ pub(crate) fn lower_nonlast_reduces<V: ValidationChannel>(g: &Graph<V>) -> Graph
         // Nothing is committed until every check passes: the fresh intermediates are appended to
         // a scratch prefix and dropped again on any disagreement.
         let committed_before = out.values.len();
-        let transposed_id = out.values.len();
-        out.values
+        let transposed_id = out
+            .values
             .push(ValueMeta::new(transposed_aval, Storage::Device, None));
 
         let mut rebuilt = Vec::with_capacity(3);
@@ -723,8 +723,8 @@ pub(crate) fn lower_nonlast_reduces<V: ValidationChannel>(g: &Graph<V>) -> Graph
             true
         } else if reduced_aval.numel() == out_aval.numel() {
             // keepdim=true: the size-1 axis sits where the reduced axis was, not at the end.
-            let reduced_id = out.values.len();
-            out.values
+            let reduced_id = out
+                .values
                 .push(ValueMeta::new(reduced_aval, Storage::Device, None));
             rebuilt.push(Eqn {
                 op: OpKind::Reduce {
@@ -828,8 +828,7 @@ pub fn widen_mismatched_matmul_dtypes<V: ValidationChannel>(
             return false;
         }
         let aval = TensorType::new(out.aval(table_id).shape.clone(), odt);
-        let nv = out.values.len();
-        out.values.push(ValueMeta::new(aval, Storage::Device, None));
+        let nv = out.values.push(ValueMeta::new(aval, Storage::Device, None));
         out.eqns.push(Eqn {
             op: OpKind::Cast { to: odt },
             inputs: vec![Operand::Value(table_id)],
@@ -898,8 +897,7 @@ pub fn widen_mismatched_matmul_dtypes<V: ValidationChannel>(
                 return id;
             }
             let aval = TensorType::new(out.aval(id).shape.clone(), dt);
-            let nv = out.values.len();
-            out.values.push(ValueMeta::new(aval, Storage::Device, None));
+            let nv = out.values.push(ValueMeta::new(aval, Storage::Device, None));
             out.eqns.push(Eqn {
                 op: OpKind::Cast { to: dt },
                 inputs: vec![Operand::Value(id)],
@@ -987,11 +985,15 @@ mod tests {
         for backend in backends {
             for (label, g) in &graphs {
                 let prepared = prepare_target_graph(g, backend);
-                for id in (0..g.values.len()).filter(|&id| g.meta(id).storage == Storage::Const) {
+                for id in g
+                    .values
+                    .ids()
+                    .filter(|&id| g.meta(id).storage == Storage::Const)
+                {
                     assert_eq!(
                         prepared.aval(id).dtype,
                         g.aval(id).dtype,
-                        "{label} on {backend:?}: const v{id} was retyped"
+                        "{label} on {backend:?}: const {id} was retyped"
                     );
                 }
             }
@@ -1019,7 +1021,7 @@ mod tensor_core_weight_tests {
         let g = b.finish(out);
 
         let widened = widen_mismatched_matmul_dtypes(&g, Backend::Nvptx);
-        assert_eq!(widened.aval(weight.id).dtype, DType::BF16);
+        assert_eq!(widened.aval(weight.id()).dtype, DType::BF16);
         assert!(
             !widened
                 .eqns
@@ -1036,7 +1038,6 @@ mod tensor_core_weight_tests {
             &widened,
             eqn,
             Backend::Nvptx,
-            1,
             &std::collections::HashMap::new(),
             &poot_test_util::device_caps::default_caps_for(Backend::Nvptx),
             &poot_test_util::graph_fixtures::roomy_body_limits(),
@@ -1115,12 +1116,12 @@ mod prepare_target_graph_tests {
 
         for backend in [Backend::SpirvVulkan, Backend::Nvptx] {
             let prepared = prepare_target_graph(&g, backend);
-            assert_eq!(prepared.aval(weight.id).dtype, DType::BF16, "{backend:?}");
+            assert_eq!(prepared.aval(weight.id()).dtype, DType::BF16, "{backend:?}");
             assert!(
                 prepared.eqns.iter().any(|eqn| matches!(
                     eqn.op,
                     OpKind::Cast { to: DType::F32 }
-                ) && matches!(eqn.inputs.as_slice(), [poot_graph_ir::Operand::Value(v)] if *v == weight.id)),
+                ) && matches!(eqn.inputs.as_slice(), [poot_graph_ir::Operand::Value(v)] if *v == weight.id())),
                 "{backend:?}: the weight reaches the matmul through an explicit Cast"
             );
         }
@@ -1150,8 +1151,9 @@ mod fold_dense_bf16_tests {
 
     fn const_id(g: &Graph, name: &str) -> ValueId {
         g.values
-            .iter()
-            .position(|value| value.name.as_deref() == Some(name))
+            .iter_enumerated()
+            .find(|(_, value)| value.name.as_deref() == Some(name))
+            .map(|(id, _)| id)
             .expect("named constant")
     }
 
@@ -1404,8 +1406,7 @@ mod fold_dense_bf16_tests {
             .find(|eqn| matches!(eqn.op, OpKind::Transpose { .. }))
             .expect("the traced graph transposes")
             .out;
-        let widened = graph.values.len();
-        graph.values.push(ValueMeta::new(
+        let widened = graph.values.push(ValueMeta::new(
             TensorType::f32(vec![5, 7]),
             Storage::Device,
             None,
@@ -1562,8 +1563,7 @@ mod fold_dense_bf16_tests {
     fn fold_declines_a_gather_with_a_second_consumer() {
         let mut graph = embedding_shaped_graph(DType::BF16);
         let rows = graph.eqns[eqn_index(&graph, |eqn| matches!(eqn.op, OpKind::Gather { .. }))].out;
-        let second = graph.values.len();
-        graph.values.push(ValueMeta::new(
+        let second = graph.values.push(ValueMeta::new(
             TensorType::f32(vec![3, 5]),
             Storage::Device,
             None,
@@ -1780,7 +1780,7 @@ mod lower_nonlast_reduces_tests {
             let graph = b.finish(consumed);
 
             for original in [bare, graph] {
-                let bound = inputs(x.id);
+                let bound = inputs(x.id());
                 let base = poot_eval::eval(
                     &original,
                     &bound,
@@ -1910,7 +1910,7 @@ mod tied_head_tests {
             let g = program.graph();
             let head_elems = VOCAB * HIDDEN;
             assert!(
-                g.values.iter().enumerate().all(|(id, meta)| {
+                g.values.iter_enumerated().all(|(id, meta)| {
                     meta.storage != Storage::Const
                         || g.aval(id).dtype != DType::F32
                         || numel(&g.aval(id).shape) < head_elems

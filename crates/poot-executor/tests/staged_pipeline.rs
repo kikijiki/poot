@@ -26,6 +26,7 @@ use poot_graph_plan::{
     CompileLimits, CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Link, Partition,
     StageId, StagedParts, StagedProgram, Submission, Target, TargetSet, compile_staged,
 };
+use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::{DType, HostView};
@@ -187,11 +188,14 @@ impl Device for FakeDevice {
         Ok(())
     }
 
-    fn write(&mut self, _dst: &(), _offset: usize, bytes: &[u8]) -> Result<(), Injected> {
-        self.control
-            .log
-            .borrow_mut()
-            .push(Event::Write(bytes.len()));
+    fn write_with(
+        &mut self,
+        _dst: &(),
+        _offset: usize,
+        len: usize,
+        _fill: &mut dyn FnMut(std::ops::Range<usize>, &mut [u8]),
+    ) -> Result<(), Injected> {
+        self.control.log.borrow_mut().push(Event::Write(len));
         Ok(())
     }
 
@@ -277,7 +281,7 @@ fn layered() -> (
         .insert(
             "w",
             WeightEntry::Dense(
-                DenseWeight::try_new(DType::F32, vec![4], Arc::from(bytes)).unwrap(),
+                DenseWeight::try_new(DType::F32, vec![4], StoredBytes::from(bytes)).unwrap(),
             ),
         )
         .unwrap();
@@ -677,7 +681,11 @@ fn load_refusal(
 #[test]
 fn a_link_read_before_its_producer_exported_is_unresolved() {
     let (g, store, map) = layered();
-    let StagedParts { stages, links } = pipeline(&g).into_parts();
+    let StagedParts {
+        stages,
+        links,
+        sync_points,
+    } = pipeline(&g).into_parts();
     let last = stages.len() as u32 - 1;
     let flip = |stage: StageId| StageId(last - stage.0);
     let stages = stages
@@ -693,7 +701,15 @@ fn a_link_read_before_its_producer_exported_is_unresolved() {
             ..link
         })
         .collect();
-    let error = load_refusal(StagedParts { stages, links }, store, map);
+    let error = load_refusal(
+        StagedParts {
+            stages,
+            links,
+            sync_points,
+        },
+        store,
+        map,
+    );
     assert!(
         matches!(
             error,
@@ -752,8 +768,8 @@ fn an_export_viewing_carried_state_is_refused_at_load() {
         .finish_with_state(out, &[(k_in, k_out)])
         .with_validations(Vec::new());
     graph.exports.push(Export {
-        id: BoundaryId(view.id),
-        value: view.id,
+        id: BoundaryId(view.id()),
+        value: view.id(),
     });
     let options = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
     let program = poot_graph_plan::compile(&graph, &target(), &options).unwrap();
@@ -761,6 +777,7 @@ fn an_export_viewing_carried_state_is_refused_at_load() {
         StagedParts {
             stages: vec![(StageId(0), DeviceId(0), program)],
             links: Vec::new(),
+            sync_points: Vec::new(),
         },
         store,
         map,

@@ -48,7 +48,7 @@ fn flash_prefill_over_65535_workgroups_is_one_wide_dispatch_and_matches_the_orac
     let k = b.constant("k", TensorType::f32(vec![1, hq, l, d]));
     let v = b.constant("v", TensorType::f32(vec![1, hq, l, d]));
     let mask = b.constant("m", TensorType::f32(vec![1, 1, l, l]));
-    let ids = [q.id, k.id, v.id, mask.id];
+    let ids = [q.id(), k.id(), v.id(), mask.id()];
     let mut plan = b.append_plan(0);
     let o = plan
         .equation(
@@ -58,8 +58,8 @@ fn flash_prefill_over_65535_workgroups_is_one_wide_dispatch_and_matches_the_orac
         .expect("stage the flash prefill");
     plan.declare_result(o).expect("declare the result");
     let mut prepared = b.preflight_append(plan).expect("preflight");
-    let id = b.commit_append(&mut prepared).expect("commit");
-    let graph = b.finish(poot_graph_ir::Traced { id });
+    let out = b.commit_append(&mut prepared).expect("commit");
+    let graph = b.finish(out);
 
     // The planner trusts the device's x grid: one dispatch of more than 65535 workgroups.
     let program = compile(

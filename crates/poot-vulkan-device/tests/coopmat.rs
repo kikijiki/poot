@@ -77,7 +77,6 @@ fn coopmat_matmul_plans_the_coopmat_arm_and_matches_the_cpu_product_on_vulkan() 
         &graph,
         eqn,
         Backend::SpirvVulkan,
-        1,
         &std::collections::HashMap::new(),
         &target.caps,
         &poot_test_util::graph_fixtures::roomy_body_limits(),

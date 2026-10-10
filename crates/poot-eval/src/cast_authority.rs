@@ -5,7 +5,7 @@
 //! F32)` equation: what role is this selector, so the walk can check the right shape of bound.
 
 use poot_graph_ir::index_guard::recognize_index_bounds_guard;
-use poot_graph_ir::{Graph, OpKind, ValidationChannel, ValueId};
+use poot_graph_ir::{Graph, OpKind, ValidationChannel, ValueId, ValueTable};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExactI32CastBounds {
@@ -60,21 +60,21 @@ impl<F: FnMut(ValueId) -> Option<ExactI32CastRole>> CastAuthority for F {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CastAuthorityError {
-    #[error("Cast v{cast} has no exact I32 authorization")]
+    #[error("Cast {cast} has no exact I32 authorization")]
     MissingCastAuthorization { cast: ValueId },
-    #[error("Cast v{cast} input v{input} is not a Gather result")]
+    #[error("Cast {cast} input {input} is not a Gather result")]
     CastSourceNotGather { cast: ValueId, input: ValueId },
-    #[error("Cast v{cast} input v{input} is not a canonical index-bounds guard over a Gather")]
+    #[error("Cast {cast} input {input} is not a canonical index-bounds guard over a Gather")]
     CastSourceNotGuardedGather { cast: ValueId, input: ValueId },
-    #[error("Cast v{cast} input v{input} is not an ordered comparison")]
+    #[error("Cast {cast} input {input} is not an ordered comparison")]
     CastSourceNotObservation { cast: ValueId, input: ValueId },
-    #[error("Cast v{cast} selected {actual} elements, ceiling {limit}")]
+    #[error("Cast {cast} selected {actual} elements, ceiling {limit}")]
     SelectedElementLimit {
         cast: ValueId,
         actual: usize,
         limit: usize,
     },
-    #[error("Cast v{cast} word {index} expert {value} outside [0,{experts})")]
+    #[error("Cast {cast} word {index} expert {value} outside [0,{experts})")]
     ExpertIdRange {
         cast: ValueId,
         index: usize,
@@ -92,7 +92,7 @@ pub enum CastAuthorityError {
 /// (`poot_graph_plan`'s `GuardBoundMismatch`).
 pub(crate) fn validate_cast_source<V: ValidationChannel>(
     graph: &Graph<V>,
-    producers: &[Option<usize>],
+    producers: &ValueTable<Option<usize>>,
     cast: ValueId,
     source: ValueId,
     role: ExactI32CastRole,

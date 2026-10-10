@@ -23,8 +23,7 @@ use poot_tensor::HostTensor;
 fn build_graph() -> (Graph, ValueId, ValueId) {
     let mut g = Graph::default();
 
-    let e4m3_id = g.values.len();
-    g.values.push(ValueMeta::new(
+    let e4m3_id = g.values.push(ValueMeta::new(
         TensorType::new(vec![1], DType::E4M3FN),
         Storage::Const,
         Some("i32_binary_test.e4m3_dummy".to_string()),
@@ -32,8 +31,7 @@ fn build_graph() -> (Graph, ValueId, ValueId) {
     g.inputs.push(e4m3_id);
     g.consts.push(e4m3_id);
 
-    let id_val = g.values.len();
-    g.values.push(ValueMeta::new(
+    let id_val = g.values.push(ValueMeta::new(
         TensorType::scalar(DType::I32),
         Storage::Slot(Slot::Token),
         None,
@@ -41,8 +39,7 @@ fn build_graph() -> (Graph, ValueId, ValueId) {
     g.inputs.push(id_val);
     g.slots.push((id_val, Slot::Token));
 
-    let local_row = g.values.len();
-    g.values.push(ValueMeta::new(
+    let local_row = g.values.push(ValueMeta::new(
         TensorType::scalar(DType::I32),
         Storage::Device,
         None,
@@ -54,8 +51,7 @@ fn build_graph() -> (Graph, ValueId, ValueId) {
         layer: None,
     });
 
-    let squared = g.values.len();
-    g.values.push(ValueMeta::new(
+    let squared = g.values.push(ValueMeta::new(
         TensorType::scalar(DType::I32),
         Storage::Device,
         None,

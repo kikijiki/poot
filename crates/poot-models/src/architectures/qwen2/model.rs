@@ -371,7 +371,9 @@ mod tests {
     use poot_graph_ir::{OpKind, Slot};
     use poot_graph_plan::{WeightFormats, bind_packed_weights};
     use poot_load::gguf::{GgufIndex, GgufValue, IdentityNames, read_gguf, write_gguf};
+    use poot_load::plan::default_workers;
     use poot_quant::SourceRole;
+    use poot_quant::StoredBytes;
     use poot_quant::format::WeightFormat;
     use poot_quant::weights::{WeightEntry, WeightId, WeightRole};
     use serde_json::json;
@@ -836,8 +838,9 @@ mod tests {
     #[test]
     fn a_q8_0_gguf_resolves_by_architecture_and_builds_packed_projections() {
         let (bytes, reference_store) = gguf_fixture(false);
-        let index = GgufIndex::from_bytes(&bytes).unwrap();
-        let store = read_gguf(&index, bytes.as_slice(), &IdentityNames).unwrap();
+        let file = StoredBytes::from(bytes);
+        let index = GgufIndex::parse(&file).unwrap();
+        let store = read_gguf(&index, &file, &IdentityNames, default_workers()).unwrap();
         let raw = RawConfig::Gguf(&index);
         let registry = Registry::builtin().unwrap();
         assert_eq!(registry.resolve(&raw).unwrap().family, FAMILY);
@@ -910,8 +913,9 @@ mod tests {
         use poot_graph_plan::{recognize_packed_contractions, recognize_packed_row_gathers};
 
         let (bytes, reference_store) = gguf_fixture(true);
-        let index = GgufIndex::from_bytes(&bytes).unwrap();
-        let store = read_gguf(&index, bytes.as_slice(), &IdentityNames).unwrap();
+        let file = StoredBytes::from(bytes);
+        let index = GgufIndex::parse(&file).unwrap();
+        let store = read_gguf(&index, &file, &IdentityNames, default_workers()).unwrap();
         let model = model(&RawConfig::Gguf(&index), &store);
         assert_tied(&*model);
         let embed = model
@@ -978,7 +982,7 @@ mod tests {
 
     #[test]
     fn a_malformed_gguf_config_is_a_typed_error_naming_its_key() {
-        let index = GgufIndex::from_bytes(&write_gguf(
+        let index = GgufIndex::parse(&StoredBytes::from(write_gguf(
             &[
                 ("general.architecture", GgufValue::Str("qwen2".into())),
                 ("qwen2.embedding_length", GgufValue::U32(64)),
@@ -992,7 +996,7 @@ mod tests {
                 ),
             ],
             &[],
-        ))
+        )))
         .unwrap();
         let err = Qwen2Params::from_raw(&RawConfig::Gguf(&index)).unwrap_err();
         assert!(

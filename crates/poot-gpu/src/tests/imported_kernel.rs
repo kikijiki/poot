@@ -54,7 +54,7 @@ fn rowsum_for_asset_matches_cpu_on_wgpu() {
     let x_buf = device
         .allocate(BufferRole::Input, BufferStorage::f32(), x.len())
         .unwrap();
-    device.write(&x_buf, 0, bytemuck::cast_slice(&x)).unwrap();
+    poot_executor::write_slice(&mut device, &x_buf, 0, bytemuck::cast_slice(&x)).unwrap();
     let out_buf = device
         .allocate(BufferRole::Output, BufferStorage::f32(), rows)
         .unwrap();
@@ -126,11 +126,11 @@ fn rmsnorm_dyn_asset_matches_cpu_on_wgpu() {
     let x_buf = device
         .allocate(BufferRole::Input, BufferStorage::f32(), x.len())
         .unwrap();
-    device.write(&x_buf, 0, bytemuck::cast_slice(&x)).unwrap();
+    poot_executor::write_slice(&mut device, &x_buf, 0, bytemuck::cast_slice(&x)).unwrap();
     let w_buf = device
         .allocate(BufferRole::Input, BufferStorage::f32(), w.len())
         .unwrap();
-    device.write(&w_buf, 0, bytemuck::cast_slice(&w)).unwrap();
+    poot_executor::write_slice(&mut device, &w_buf, 0, bytemuck::cast_slice(&w)).unwrap();
     let dims = [d as u32];
     let dims_storage = BufferStorage::dense(
         poot_target::ElementKind::I32,
@@ -139,9 +139,7 @@ fn rmsnorm_dyn_asset_matches_cpu_on_wgpu() {
     let dims_buf = device
         .allocate(BufferRole::Meta, dims_storage, dims.len())
         .unwrap();
-    device
-        .write(&dims_buf, 0, bytemuck::cast_slice(&dims))
-        .unwrap();
+    poot_executor::write_slice(&mut device, &dims_buf, 0, bytemuck::cast_slice(&dims)).unwrap();
     let out_buf = device
         .allocate(BufferRole::Output, BufferStorage::f32(), rows * d)
         .unwrap();

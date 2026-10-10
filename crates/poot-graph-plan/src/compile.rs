@@ -30,7 +30,7 @@ use poot_graph_ir::analysis::{
 };
 use poot_graph_ir::{
     BoundaryId, Eqn, Export, Graph, NoValidations, OpKind, Operand, Slot, ValidationChannel,
-    ValueId,
+    ValueId, ValueTable,
 };
 use poot_target::{Backend, DeviceCaps};
 
@@ -307,11 +307,11 @@ impl<V: ValidationChannel> Program<V> {
     /// input, with that input: a later stage reading it would see the value the stage's own commit
     /// wrote, not the one the uncut graph reads. `None` when every export is a computed or bound value.
     pub fn export_aliasing_state(&self) -> Option<(BoundaryId, ValueId)> {
-        let mut root: Vec<ValueId> = (0..self.graph.values.len()).collect();
+        let mut root: ValueTable<ValueId> = self.graph.values.ids().collect();
         for (eqn, plan) in self.planned() {
             match plan {
                 Plan::Alias(src) | Plan::View { src, .. } => root[eqn.out] = root[*src],
-                Plan::Dispatches(_) | Plan::Collective { .. } => {}
+                Plan::Dispatches(_) => {}
             }
         }
         self.graph.exports.iter().find_map(|export| {
@@ -1053,7 +1053,7 @@ mod tests {
     ///
     /// Mutation (observed red, restored; see the card record): skip the three passes in `compile` whenever
     /// `routed_expert_sites(g)` is non-empty; the prefill program loses them on every preset and this row goes
-    /// red, while the decode step (a one-row router, no site) keeps them.
+    /// red, as would the decode step's, which is a site too.
     #[test]
     fn routed_expert_prefill_runs_the_full_pipeline_on_every_preset() {
         use poot_models::model::Phase;
@@ -1083,8 +1083,8 @@ mod tests {
             "prefill has a site"
         );
         assert!(
-            crate::passes::routed_expert_sites(&decode).is_empty(),
-            "a one-row router has no site"
+            !crate::passes::routed_expert_sites(&decode).is_empty(),
+            "a decode step's router is a site as well: the pool pages it"
         );
 
         let prompt = [3, 17, 40, 8];
@@ -1332,7 +1332,7 @@ mod tests {
         let mut narrow = wgpu();
         narrow.caps.max_grid = [2, 65_535, 65_535];
         let refusal = refusal(compile(&g, &narrow, &REPLAY), "a two-workgroup x-grid");
-        assert_eq!(refusal.eqn, out.id);
+        assert_eq!(refusal.eqn, out.id());
         assert_eq!(refusal.target, Backend::SpirvVulkan);
         let Capability::DispatchGridLimit {
             workgroups_x,
@@ -1411,7 +1411,7 @@ mod tests {
                 compile(&g, &target_for(backend), &REPLAY),
                 &format!("{backend:?} non-axis-0 scatter"),
             );
-            assert_eq!(refusal.eqn, out.id);
+            assert_eq!(refusal.eqn, out.id());
             assert_eq!(refusal.target, backend);
             assert_eq!(refusal.missing, Capability::ScatterNonZeroAxis { axis: 1 });
         }
@@ -1432,7 +1432,7 @@ mod tests {
             compile(&b.finish(out), &wgpu(), &REPLAY),
             "E4M3FN ScatterUpdate over an f32 source",
         );
-        assert_eq!(refusal.eqn, out.id);
+        assert_eq!(refusal.eqn, out.id());
         assert_eq!(refusal.missing, Capability::DtypeLowering);
     }
 
@@ -1552,7 +1552,7 @@ mod tests {
         let g = b.finish(gate);
 
         let inputs = HashMap::from([(
-            logits.id,
+            logits.id(),
             poot_eval::Value::from(poot_tensor::HostTensor::f32(
                 vec![4, 2],
                 vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
@@ -2311,9 +2311,9 @@ mod tests {
         let next = b.binary_scalar(BinOp::GeU, pos, Scalar::I32(3));
         let g = b.finish_with_state(gathered, &[(s, next)]);
         let analysis = ExactI32StorageAnalysis::new(&g);
-        assert_eq!(analysis.required(s.id), analysis.required(next.id));
+        assert_eq!(analysis.required(s.id()), analysis.required(next.id()));
         assert!(
-            analysis.required(next.id),
+            analysis.required(next.id()),
             "the comparison pins the component exact"
         );
         for backend in [
@@ -2467,7 +2467,7 @@ mod tests {
         let graph = crate::test_support::finish_with_validations(b, out, &validations).unwrap();
         let members = members
             .into_iter()
-            .map(|(name, member)| (name, member.id))
+            .map(|(name, member)| (name, member.id()))
             .collect();
         (graph, members)
     }
@@ -2801,12 +2801,12 @@ mod tests {
             .map(|pair| (pair.input, pair.role))
             .collect();
         assert_eq!(
-            roles[&kv_cache.id],
+            roles[&kv_cache.id()],
             StateRole::Positional { axis: 2 },
             "the KV-cache pair's traced role must survive compile"
         );
         assert_eq!(
-            roles[&gdn_state.id],
+            roles[&gdn_state.id()],
             StateRole::Recurrent,
             "the recurrent pair's traced role must survive compile"
         );
@@ -3120,8 +3120,8 @@ mod tests {
             let y = poot_graph_ir::ops::packed_indexed_linear(&b, x, ids, &table).unwrap();
             Self {
                 graph: b.finish(y),
-                x: x.id,
-                ids: ids.id,
+                x: x.id(),
+                ids: ids.id(),
                 descriptor,
                 owners: (0..SPLIT_EXPERTS)
                     .map(|e| {

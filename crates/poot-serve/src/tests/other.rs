@@ -207,6 +207,7 @@ fn cache_metric_ratios_handle_the_empty_case() {
         sys: Mutex::new(sysinfo::System::new()),
         cache: CacheMetrics::default(),
         speculative: SpeculativeMetrics::default(),
+        timing: TimingMetrics::new(TelemetryConfig::CountersOnly),
     };
     assert_eq!(m.kv_cache_usage(), 0.0);
     assert_eq!(m.prefix_cache_hit_rate(), 0.0);
@@ -297,17 +298,8 @@ fn body_len_ok_boundaries() {
 }
 
 #[test]
-fn max_connections_default_and_disable() {
-    // card 058 follow-on: unlike the rate limiter, this defaults ON (4096), a resource-safety floor.
-    assert_eq!(max_connections_from(None), 4096);
-    assert_eq!(max_connections_from(Some("0")), 0); // 0 = explicit opt-out (unlimited)
-    assert_eq!(max_connections_from(Some("10")), 10);
-    assert_eq!(max_connections_from(Some("garbage")), 4096);
-}
-
-#[test]
 fn conn_guard_decrements_on_drop_including_a_panicking_thread() {
-    // Regression shape: the live-connection counter must come back down even if the connection-handler thread panics mid-`handle`: ConnGuard's decrement lives in Drop, so unwinding runs it. A counter that only goes up would eventually wedge POOT_MAX_CONNECTIONS shut with zero connections live.
+    // Regression shape: the live-connection counter must come back down even if the connection-handler thread panics mid-`handle`: ConnGuard's decrement lives in Drop, so unwinding runs it. A counter that only goes up would eventually wedge the `--max-connections` cap shut with zero connections live.
     let counter = Arc::new(AtomicUsize::new(1));
     {
         let _guard = ConnGuard(Arc::clone(&counter));

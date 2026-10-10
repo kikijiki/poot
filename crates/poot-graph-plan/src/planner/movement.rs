@@ -1,6 +1,6 @@
 //! Data-movement equation planning: gather/scatter/slice/concat/transpose/broadcast/reshape and dynamic
-//! KV-cache updates, all through the one generated movement kernel (`poot_kernelgen::MovementSpec`), and
-//! the tensor-parallel collectives (AllReduce/AllGather).
+//! KV-cache updates, all through the one generated movement kernel (`poot_kernelgen::MovementSpec`). The
+//! tensor-parallel collectives (AllReduce/AllGather) are refused: a collective is a cut between stages.
 //!
 //! A movement names its storage, not its dtype: 32-bit values (and 16-bit natively stored ones) move
 //! element by element, an E4M3FN payload moves as packed byte lanes with its rows padded to a word. The
@@ -26,7 +26,7 @@ fn index_ty(exact_i32: bool) -> Ty {
     if exact_i32 { Ty::I32 } else { Ty::F32 }
 }
 
-/// Plan one data-movement equation (including the e4m3fn packed forms and the collectives).
+/// Plan one data-movement equation (including the e4m3fn packed forms) and refuse the collectives.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn plan(
     analysis: ExactI32Requirements<'_>,
@@ -37,7 +37,6 @@ pub(super) fn plan(
     backend: Backend,
     views: &HashMap<ValueId, Layout>,
     odt: DType,
-    world_size: usize,
     caps: &DeviceCaps,
     limits: BodyLimits,
 ) -> Result<Planned, PlanError> {
@@ -85,32 +84,11 @@ pub(super) fn plan(
             }
         }
         OpKind::Reshape { .. } => Planned::alias(ids[0]),
-        // card 049a (tensor-parallel). At world_size=1 both collectives are the identity: with one
-        // replica AllReduce(x)=x and AllGather(x)=x (the shard is the full tensor), and the op is
-        // shape-preserving in the single-rank graph, so the output aliases the input buffer, like
-        // Reshape. This makes a sharded TP graph GPU-executable at ws=1 (FR-007).
-        //
-        // At world_size>1 the collective lowers to `Plan::Collective`, a marker the multi-rank executor
-        // consumes: AllReduce runs poot's own ring reduce-scatter + all-gather over real cross-device
-        // buffers (combine per `op` along the shard `axis`), AllGather runs the ring all-gather (concat
-        // along `axis`). Cross-device comms do not belong in this pure device-local planner (`plan_eqn`
-        // cannot know peer buffers), so it only tags which collective goes here; the single-device
-        // executors reject `Plan::Collective` (they plan at ws=1 and never see it) rather than run a
-        // wrong local kernel.
-        OpKind::AllReduce { op, axis } => {
-            if world_size <= 1 {
-                Planned::alias(ids[0])
-            } else {
-                Planned::collective(CollectiveKind::AllReduce, *op, *axis)
-            }
-        }
-        OpKind::AllGather { axis } => {
-            if world_size <= 1 {
-                Planned::alias(ids[0])
-            } else {
-                // `op` is unused for AllGather (it concatenates, no reduction); carry Sum as a filler.
-                Planned::collective(CollectiveKind::AllGather, RedOp::Sum, *axis)
-            }
+        // A collective is a cut point between stage programs (`compile_staged` places the transfer between
+        // them), never an equation inside one: no stage program holds it, so planning it is a refusal, not
+        // an identity that would silently drop the cross-device exchange.
+        OpKind::AllReduce { .. } | OpKind::AllGather { .. } => {
+            return Err(site.refuse(Capability::CollectiveInStage));
         }
         OpKind::Gather { axis } => {
             let data = shape(ids[0]);

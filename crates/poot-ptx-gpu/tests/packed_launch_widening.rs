@@ -129,9 +129,9 @@ fn run_moe(gpu: &mut PtxDevice, out: usize, k: usize) -> (Vec<f32>, Vec<f32>) {
     for m in 0..ROWS {
         one_hot[m * k + column(m)] = 1.0;
     }
-    inputs.insert(x.id, HostTensor::f32(vec![ROWS, k], one_hot).into());
+    inputs.insert(x.id(), HostTensor::f32(vec![ROWS, k], one_hot).into());
     let selected: Vec<f32> = (0..ROWS).map(|m| (m % EXPERTS) as f32).collect();
-    inputs.insert(ids.id, HostTensor::f32(vec![ROWS], selected).into());
+    inputs.insert(ids.id(), HostTensor::f32(vec![ROWS], selected).into());
     let got = common::run_resident(gpu, &graph, &inputs)
         .as_f32()
         .unwrap()
@@ -202,7 +202,7 @@ fn a_widened_row_gather_after_a_narrow_one_is_bit_exact() {
         let mut inputs = carriers(&graph, |_| Arc::clone(&owner));
         let ids: Vec<usize> = (0..n).map(|r| (r * 13 + 5) % VOCAB).collect();
         inputs.insert(
-            token.id,
+            token.id(),
             HostTensor::f32(vec![n], ids.iter().map(|&id| id as f32).collect()).into(),
         );
         let got = common::run_resident(&mut gpu, &graph, &inputs)

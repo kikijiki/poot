@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use super::packed::packed_consumer_map;
 use super::*;
 use poot_graph_ir::ContractionRows;
+use poot_graph_ir::ValueTable;
 use poot_graph_ir::packed_source::{
     PackedSourceName, packed_source_type, packed_stack_source_constants,
 };
@@ -243,12 +244,11 @@ pub fn bind_packed_weights<V: ValidationChannel>(
             for (carrier_name, carrier_type) in
                 packed_stack_source_constants(&packed.linear_id, packed.weight, experts)
             {
-                out.values.push(ValueMeta::new(
+                let carrier = out.values.push(ValueMeta::new(
                     carrier_type,
                     Storage::Const,
                     Some(carrier_name.into()),
                 ));
-                let carrier = out.values.len() - 1;
                 out.inputs.push(carrier);
                 out.consts.push(carrier);
                 inputs.push(Operand::Value(carrier));
@@ -272,12 +272,11 @@ pub fn bind_packed_weights<V: ValidationChannel>(
         }
         let mut carriers = Vec::new();
         for role in packed.weight.sources() {
-            out.values.push(ValueMeta::new(
+            let carrier = out.values.push(ValueMeta::new(
                 packed_source_type(packed.weight, role),
                 Storage::Const,
                 Some(PackedSourceName::new(&packed.linear_id, role).into()),
             ));
-            let carrier = out.values.len() - 1;
             out.inputs.push(carrier);
             out.consts.push(carrier);
             carriers.push(Operand::Value(carrier));
@@ -286,14 +285,11 @@ pub fn bind_packed_weights<V: ValidationChannel>(
         // itself.
         let dequant_out = match packed.layout {
             PackedLayout::Rows => id,
-            PackedLayout::Columns => {
-                out.values.push(ValueMeta::new(
-                    TensorType::f32(vec![rows, k]),
-                    Storage::Device,
-                    None,
-                ));
-                out.values.len() - 1
-            }
+            PackedLayout::Columns => out.values.push(ValueMeta::new(
+                TensorType::f32(vec![rows, k]),
+                Storage::Device,
+                None,
+            )),
             PackedLayout::ExpertRows { .. } => unreachable!("expert stacks continue above"),
         };
         decode.push(Eqn {
@@ -343,7 +339,7 @@ pub fn bind_packed_weights<V: ValidationChannel>(
 fn expert_stack_use<V: ValidationChannel>(
     g: &Graph<V>,
     stack: ValueId,
-    consumers: &[Vec<usize>],
+    consumers: &ValueTable<Vec<usize>>,
 ) -> Result<(usize, usize), ExpertStackRefusal> {
     let escapes = |value: ValueId| {
         g.liveness_roots().any(|root| root == value)

@@ -8,6 +8,7 @@
 //! reads carried state through a production step output, never a `read_state` escape hatch.
 
 mod binder;
+mod coordinator;
 mod device;
 mod engine;
 mod error;
@@ -15,9 +16,14 @@ mod lanes;
 mod shared_kernels;
 mod timing;
 
+pub use coordinator::{
+    Coordinator, CoordinatorCounters, CoordinatorError, DeviceCounters, DeviceSupport,
+    ScheduleError, SupportActual, SupportPlan,
+};
 pub use device::{
-    Arg, BufferRole, Device, DeviceTime, Dispatch, DispatchDeviceTime, MeasuredDeviceTime,
-    MemoryCounterSnapshot, WeightUpload,
+    Arg, BufferRole, Collectives, Device, DeviceTime, Dispatch, DispatchDeviceTime,
+    MeasuredDeviceTime, MemoryCounterSnapshot, NativeCounters, SupportBound, WeightUpload,
+    write_slice,
 };
 pub use engine::Engine;
 pub use error::{BindError, DeviceError, ExecError, LoadError};
@@ -29,8 +35,8 @@ pub use timing::{DetailedTiming, DrainPolicy, TimingOptions};
 #[cfg(test)]
 mod tests;
 
-use poot_graph_ir::SlotKey;
-use poot_graph_plan::{StageId, StagedProgram, SyncId, TargetSet};
+use poot_graph_ir::{BoundaryId, SlotKey};
+use poot_graph_plan::{DeviceId, StageId, StagedProgram, SyncPoint, TargetSet};
 use poot_quant::weights::{WeightMap, WeightStore};
 use std::sync::Arc;
 
@@ -81,18 +87,95 @@ pub enum StateScope {
     Row(usize),
 }
 
-/// The host side of a step's sync points. A single-stage program (this card's only
-/// shape) has none.
-pub trait HostSync {
-    fn sync(&mut self, point: SyncId) -> Result<(), ExecError>;
+/// The canonical identity of one pooled site (POOT-746): which stored bytes its tables page, in
+/// which planned lanes and at how many rows. Entry-local site numbering never reaches a host: two
+/// entries of one executable that page the same tables (a prefill and a decode, a chunk) report equal
+/// identities, two tables of one layer report different ones, and a same-named weight of another store
+/// generation never compares equal. A host keys its per-site state by this and nothing else.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SiteIdentity(Vec<TableIdentity>);
+
+/// One pooled table's identity inside a [`SiteIdentity`]: the stored byte runs it reads, each named by
+/// the generation of the store payload that holds it, and its planned lane and pool height.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct TableIdentity {
+    pub(crate) runs: Vec<(
+        poot_quant::weights::StoreGeneration,
+        Option<poot_quant::SourceRole>,
+        std::ops::Range<usize>,
+    )>,
+    pub(crate) storage: poot_target::BufferStorage,
+    pub(crate) pool_rows: usize,
 }
 
-/// The host sync of a single-stage program: it is never called.
+impl SiteIdentity {
+    pub(crate) fn new(tables: Vec<TableIdentity>) -> Self {
+        Self(tables)
+    }
+}
+
+/// What the host reads at a sync point: the boundary values the point names (F32, as the stage that
+/// exported them left them) and the site's canonical identity and per-row costs.
+#[derive(Clone, Debug)]
+pub struct SyncReads {
+    site: SiteIdentity,
+    row_bytes: Vec<usize>,
+    values: Vec<(BoundaryId, Vec<f32>)>,
+}
+
+impl SyncReads {
+    /// The pooled site this sync serves, canonical across entries.
+    pub fn site(&self) -> &SiteIdentity {
+        &self.site
+    }
+
+    /// Device bytes one pool row of each table holds, in [`SyncPoint::site`] table order: what a
+    /// refill of one expert writes.
+    pub fn row_bytes(&self) -> &[usize] {
+        &self.row_bytes
+    }
+
+    /// The values `id` named, as the point's stage left them.
+    pub fn values(&self, id: BoundaryId) -> Option<&[f32]> {
+        self.values
+            .iter()
+            .find(|(read, _)| *read == id)
+            .map(|(_, values)| values.as_slice())
+    }
+}
+
+/// Make experts `experts` resident in rows `first_row..` of table `table` (an index into the sync
+/// point's [`SyncPoint::site`] weights): the executor writes each expert's stored bytes into its row
+/// in the table's planned lane, never a re-encode.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RowFill {
+    pub table: usize,
+    pub first_row: usize,
+    pub experts: Vec<usize>,
+}
+
+/// What the host wants written before the next stage runs. The executor validates every range before
+/// it writes any byte, then writes the rows and then the map.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SyncWrites {
+    pub rows: Vec<RowFill>,
+    /// The site's whole `[E]` map: the pool row of each global expert, `-1` when absent.
+    pub map: Option<Vec<f32>>,
+}
+
+/// The host side of a step's sync points (the expert-residency manager is the one implementation):
+/// called once per point, after the stage before it completed, with the values the point reads. Its
+/// writes land before the next stage is replayed.
+pub trait HostSync {
+    fn sync(&mut self, point: &SyncPoint, reads: &SyncReads) -> Result<SyncWrites, ExecError>;
+}
+
+/// The host sync of a program with no sync points: a program that reaches one is refused.
 pub struct NoSync;
 
 impl HostSync for NoSync {
-    fn sync(&mut self, point: SyncId) -> Result<(), ExecError> {
-        unreachable!("single-stage program reached sync point {point:?}")
+    fn sync(&mut self, point: &SyncPoint, _reads: &SyncReads) -> Result<SyncWrites, ExecError> {
+        Err(ExecError::NoHostSync { point: point.id })
     }
 }
 
@@ -144,6 +227,15 @@ pub struct ExecutorStats {
     /// Bytes read from the weight store and encoded for upload, summed over every weight upload. A
     /// [`WeightUpload::SizeOnly`] device reads none.
     pub weight_bytes_read: u64,
+    /// Host syncs run: one per sync point of each pooled step. The engine's own count, the source of
+    /// truth for what a pooled step moved (an all-hit step adds to `syncs` and `sync_read_bytes` and
+    /// nothing to `pool_rows_written` or `pool_refill_bytes`); a host's counters only cross-check it.
+    pub syncs: u64,
+    /// Bytes read back for those syncs (the ids a host decides residency from).
+    pub sync_read_bytes: u64,
+    /// Pool rows refilled and the stored bytes they wrote, summed over every sync.
+    pub pool_rows_written: u64,
+    pub pool_refill_bytes: u64,
     /// Kernels this engine took through the kernel cache (a disk load or a codegen run), once per distinct
     /// kernel. An engine built over [`SharedKernels`] does not count a kernel another engine of that
     /// table already resolved.
@@ -164,9 +256,35 @@ pub struct StageStats {
     pub replays: u64,
 }
 
+/// What one device of an executor holds and could still allocate, read now. Admission checks each device
+/// against its own plan and budget, so a total over devices is never a substitute.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceMemory {
+    pub device: DeviceId,
+    /// What the device's runtime could still allocate ([`Device::free_memory_bytes`]); `None` where it
+    /// cannot say.
+    pub free_bytes: Option<u64>,
+    /// The device's own live bytes by role, for the roles that have allocated.
+    pub live: Vec<(BufferRole, MemoryCounterSnapshot)>,
+}
+
 /// The object-safe executor the driver holds as `Box<dyn Executor>`.
 pub trait Executor {
     fn target_set(&self) -> TargetSet;
+    /// Each device's own free memory and live bytes by role, in rank order. The default is the one
+    /// device of a single-device executor, from [`Executor::free_memory_bytes`] and its counters; an
+    /// executor over several devices reports each of them.
+    fn device_memory(&self) -> Vec<DeviceMemory> {
+        let targets = self.target_set();
+        let &[(device, _)] = targets.devices() else {
+            unreachable!("an executor over several devices reports each device's memory itself")
+        };
+        vec![DeviceMemory {
+            device,
+            free_bytes: self.free_memory_bytes(),
+            live: self.stats().memory,
+        }]
+    }
     /// Device memory this executor's device could still allocate right now ([`Device::free_memory_bytes`]),
     /// read live; `None` where the runtime cannot say. Admission asks again at each decision instead of
     /// trusting the figure the device reported when it opened.

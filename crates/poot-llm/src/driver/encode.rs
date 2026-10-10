@@ -11,7 +11,7 @@
 
 use std::num::NonZeroUsize;
 
-use poot_executor::{ExecError, ExecutableId, StateScope};
+use poot_executor::{ExecError, ExecutableId};
 use poot_models::model::{KvLayout, LogitRows, Phase, StepShape};
 use poot_models::qwen_vl_vision::PatchGeometry;
 
@@ -66,9 +66,9 @@ impl Driver {
         else {
             return error;
         };
-        match self.executor.reset_state(exe, StateScope::All) {
+        match self.reset_exe(exe) {
             Ok(()) => DriverError::EncodeStep(step),
-            Err(reset) => DriverError::Device(reset),
+            Err(reset) => reset,
         }
     }
 

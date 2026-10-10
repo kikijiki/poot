@@ -11,7 +11,7 @@ fn rmsnorm_gpu_matches_cpu() {
     let x = b.constant("x", TensorType::f32(vec![1, 1, n]));
     let w = b.constant("w", TensorType::f32(vec![n]));
     let out = rmsnorm(&b, x, w, 1e-6);
-    let (xi, wi) = (x.id, w.id);
+    let (xi, wi) = (x.id(), w.id());
     let g = b.finish(out);
 
     let xd: Vec<f32> = (0..n).map(|i| (i as f32) * 0.1 - 0.7).collect();
@@ -117,7 +117,7 @@ fn ge_comparison_gpu_matches_cpu() {
     let a = b.constant("a", TensorType::f32(vec![1, 1, n]));
     let bb = b.constant("b", TensorType::f32(vec![1, 1, n]));
     let ge = b.binary(BinOp::Ge, a, bb);
-    let (ai, bi) = (a.id, bb.id);
+    let (ai, bi) = (a.id(), bb.id());
     let g = b.finish(ge);
 
     let mut inputs = HashMap::new();
@@ -156,7 +156,7 @@ fn ge_comparison_gpu_matches_cpu() {
     let b2b = b2.constant("b", TensorType::f32(vec![1, 1, n]));
     let c2 = b2.constant("c", TensorType::f32(vec![1, 1, n]));
     let masked = b2.binary(BinOp::Mul, b2.binary(BinOp::Ge, a2, b2b), c2);
-    let (a2i, b2i, c2i) = (a2.id, b2b.id, c2.id);
+    let (a2i, b2i, c2i) = (a2.id(), b2b.id(), c2.id());
     let g2 = fuse(&cse(&b2.finish(masked)));
 
     let mut in2 = HashMap::new();
@@ -203,7 +203,7 @@ fn layernorm_gpu_matches_cpu() {
     let w = b.constant("w", TensorType::f32(vec![n]));
     let bias = b.constant("b", TensorType::f32(vec![n]));
     let out = layernorm(&b, x, w, bias, 1e-6);
-    let (xi, wi, bi) = (x.id, w.id, bias.id);
+    let (xi, wi, bi) = (x.id(), w.id(), bias.id());
     let g = b.finish(out);
 
     let xd: Vec<f32> = (0..3 * n)
@@ -267,7 +267,7 @@ fn round_and_quantize_composition_gpu_matches_cpu() {
     let neg_lo = b.unary(UnOp::Neg, lo);
     let m = b.binary_scalar(BinOp::Max, neg_lo, Scalar::F32(-127.0));
     let codes = b.unary(UnOp::Neg, m);
-    let xi = x.id;
+    let xi = x.id();
     let g = b.finish(codes);
 
     let xd: Vec<f32> = (0..rows * cols)
@@ -318,7 +318,7 @@ fn gelu_erf_gpu_matches_true_erf_cpu() {
     let n = 64usize;
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![n]));
-    let xi = x.id;
+    let xi = x.id();
     let y = gelu_erf(&b, x);
     let g = b.finish(y);
     // a spread spanning the interesting range (both signs, near zero, out to +-6).
@@ -353,7 +353,7 @@ fn gelu_erf_gpu_matches_true_erf_cpu() {
     let gt = {
         let bb = Builder::new();
         let xx = bb.constant("x", TensorType::f32(vec![n]));
-        let id = xx.id;
+        let id = xx.id();
         let yy = gelu(&bb, xx);
         let gg = bb.finish(yy);
         let mut ii = HashMap::new();
@@ -373,7 +373,7 @@ fn gelu_erf_gpu_matches_true_erf_cpu() {
     for (xv, want) in [(1.0f32, 0.8413447), (-1.0, -0.15865526), (2.0, 1.9544997)] {
         let bb = Builder::new();
         let xx = bb.constant("x", TensorType::f32(vec![1]));
-        let id = xx.id;
+        let id = xx.id();
         let yy = gelu_erf(&bb, xx);
         let gg = bb.finish(yy);
         let mut ii = HashMap::new();
@@ -406,7 +406,7 @@ fn log_and_softplus_gpu_matches_cpu() {
     let sp = softplus(&b, xp);
     let lg = b.unary(UnOp::Log, pp);
     let out = b.binary(poot_graph_ir::op::BinOp::Add, sp, lg); // one graph exercising both
-    let (xi, pi) = (xp.id, pp.id);
+    let (xi, pi) = (xp.id(), pp.id());
     let g = b.finish(out);
     let mut inputs = HashMap::new();
     inputs.insert(xi, HostTensor::f32(vec![16], xd.clone()));

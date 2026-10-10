@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 poot-llm = { workspace = true, features = ["rocm"] }
+poot-executor.workspace = true
 poot-graph-plan.workspace = true
 poot-models.workspace = true
 poot-profile.workspace = true

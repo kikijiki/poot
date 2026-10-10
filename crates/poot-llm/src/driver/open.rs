@@ -4,11 +4,13 @@
 
 use std::num::NonZeroUsize;
 
-use poot_executor::{DetailedTiming, DeviceError, Engine, ExecError, Executor, TimingOptions};
+use poot_executor::{
+    Coordinator, DetailedTiming, DeviceError, Engine, ExecError, Executor, TimingOptions,
+};
+use poot_graph_plan::DeviceId;
+use poot_ptx_gpu::device::PtxDevice;
 
-use crate::driver::error::DriverError;
-#[cfg(not(feature = "rocm"))]
-use crate::driver::error::Unsupported;
+use crate::driver::error::{DriverError, InvalidOptions, Unsupported};
 
 /// Which device executes the model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -37,40 +39,63 @@ fn open_failed(
     })))
 }
 
-/// Whether the executor asks its device for device-side timestamps.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// How the executor is built: counters only, or with device timestamps and the bounded detail
+/// [`DetailedTiming`] names.
+#[derive(Clone, Copy)]
 enum Timing {
     /// Counters only: no device timestamps requested, no per-dispatch detail retained.
     Counters,
     /// Device timing on a backend that can produce it (wgpu timestamp queries, PTX CUDA events, ROCm
     /// HSA dispatch timestamps); a backend that cannot (Vulkan) opens as `Counters` and reports
     /// `DeviceTime::Unknown`.
-    Device,
+    Detailed(DetailedTiming),
 }
 
-/// Bounds of the detail a profiled engine retains and of the timestamp queries a wgpu device keeps in flight.
-const PROFILE_STEPS: usize = 4096;
-const PROFILE_DISPATCH_RECORDS: usize = 1 << 16;
-const PROFILE_QUERIES: NonZeroUsize = NonZeroUsize::new(64).unwrap();
+impl Timing {
+    /// The in-flight timestamp-query bound a wgpu device is built with. [`open_timed_executor`] has
+    /// refused a zero bound before any device opens, so a detailed run always has a positive one.
+    fn queries(self) -> NonZeroUsize {
+        match self {
+            Timing::Counters => NonZeroUsize::MIN,
+            Timing::Detailed(detail) => NonZeroUsize::new(detail.max_in_flight_queries)
+                .expect("a detailed timing's bounds were validated when it was opened"),
+        }
+    }
+}
+
+/// Refuse a detailed timing whose bound is zero: it would disable what it bounds, and an invalid limit is
+/// an error, never repaired.
+fn check_bounds(detail: &DetailedTiming) -> Result<(), DriverError> {
+    let bounds = [
+        ("sample_every", detail.sample_every as usize),
+        ("max_retained_steps", detail.max_retained_steps),
+        (
+            "max_retained_dispatch_records",
+            detail.max_retained_dispatch_records,
+        ),
+        ("max_in_flight_queries", detail.max_in_flight_queries),
+    ];
+    match bounds.into_iter().find(|&(_, value)| value == 0) {
+        Some((bound, _)) => Err(InvalidOptions::TimingBoundZero { bound }.into()),
+        None => Ok(()),
+    }
+}
 
 fn engine<D: poot_executor::Device + 'static>(device: D, timing: Timing) -> Box<dyn Executor> {
     match timing {
         Timing::Counters => Box::new(Engine::new(device)),
-        Timing::Device => Box::new(Engine::with_timing(
-            device,
-            TimingOptions::Detailed(DetailedTiming::every_step(
-                PROFILE_STEPS,
-                PROFILE_DISPATCH_RECORDS,
-                PROFILE_QUERIES.get(),
-            )),
-        )),
+        Timing::Detailed(detail) => {
+            Box::new(Engine::with_timing(device, TimingOptions::Detailed(detail)))
+        }
     }
 }
 
 fn wgpu(timing: Timing) -> Result<Box<dyn Executor>, DriverError> {
     let device = match timing {
         Timing::Counters => poot_gpu::device::WgpuDevice::new(),
-        Timing::Device => poot_gpu::device::WgpuDevice::new_with_device_timing(PROFILE_QUERIES),
+        Timing::Detailed(_) => {
+            poot_gpu::device::WgpuDevice::new_with_device_timing(timing.queries())
+        }
     }
     .map_err(|e| open_failed("wgpu", e))?;
     Ok(engine(device, timing))
@@ -79,7 +104,7 @@ fn wgpu(timing: Timing) -> Result<Box<dyn Executor>, DriverError> {
 fn ptx(timing: Timing) -> Result<Box<dyn Executor>, DriverError> {
     let device = match timing {
         Timing::Counters => poot_ptx_gpu::device::PtxDevice::new(),
-        Timing::Device => poot_ptx_gpu::device::PtxDevice::new_with_device_timing(),
+        Timing::Detailed(_) => poot_ptx_gpu::device::PtxDevice::new_with_device_timing(),
     }
     .map_err(|e| open_failed("ptx", e))?;
     Ok(engine(device, timing))
@@ -94,7 +119,7 @@ fn vulkan() -> Result<Box<dyn Executor>, DriverError> {
 fn rocm(timing: Timing) -> Result<Box<dyn Executor>, DriverError> {
     let device = match timing {
         Timing::Counters => poot_rocm_gpu::device::RocmDevice::new(),
-        Timing::Device => poot_rocm_gpu::device::RocmDevice::new_with_device_timing(),
+        Timing::Detailed(_) => poot_rocm_gpu::device::RocmDevice::new_with_device_timing(),
     }
     .map_err(|e| open_failed("rocm", e))?;
     Ok(engine(device, timing))
@@ -117,16 +142,86 @@ fn open(choice: BackendChoice, timing: Timing) -> Result<Box<dyn Executor>, Driv
     }
 }
 
+/// Open the executor `choice` names with cumulative counters only: no device timestamps and no
+/// per-dispatch detail retained.
 pub fn open_executor(choice: BackendChoice) -> Result<Box<dyn Executor>, DriverError> {
     open(choice, Timing::Counters)
 }
 
-/// [`open_executor`] for a profiled run: the device requests timestamps where it can (wgpu, PTX, ROCm), and
-/// the engine retains per-dispatch detail. Timing perturbs submission grouping, so a profiled run is
-/// diagnostic, never throughput evidence. A backend with no device timing (Vulkan) opens as
-/// [`open_executor`] does and its steps report `DeviceTime::Unknown`.
-pub fn open_timed_executor(choice: BackendChoice) -> Result<Box<dyn Executor>, DriverError> {
-    open(choice, Timing::Device)
+/// [`open_executor`] with device timing: the device requests timestamps where it can (wgpu, PTX, ROCm)
+/// and the engine retains per-dispatch detail inside `detail`'s bounds. Timing perturbs submission
+/// grouping, so a timed run is diagnostic, never throughput evidence. A zero bound in `detail` is refused
+/// with [`InvalidOptions::TimingBoundZero`] before any device opens. A backend with no device timing
+/// (Vulkan) opens as [`open_executor`] does and its steps report `DeviceTime::Unknown`.
+pub fn open_timed_executor(
+    choice: BackendChoice,
+    detail: DetailedTiming,
+) -> Result<Box<dyn Executor>, DriverError> {
+    check_bounds(&detail)?;
+    open(choice, Timing::Detailed(detail))
+}
+
+/// Open GPU `ordinals[i]` as rank `i` of one coordinator (`DeviceId(i)`), for a multi-device
+/// [`Placement`](crate::driver::Placement). Only a backend whose devices copy to one another can: today
+/// that is PTX, which `Auto` resolves to here without trying another, since a group is never split
+/// across backends. A GPU that fails to open is the error; nothing is opened on a backend that cannot
+/// group.
+pub fn open_group(
+    choice: BackendChoice,
+    ordinals: &[usize],
+) -> Result<Coordinator<PtxDevice>, DriverError> {
+    match choice {
+        BackendChoice::Ptx | BackendChoice::Auto => {}
+        BackendChoice::Wgpu => return Err(Unsupported::MultiDevice { backend: "wgpu" }.into()),
+        BackendChoice::Rocm => return Err(Unsupported::MultiDevice { backend: "rocm" }.into()),
+        BackendChoice::Vulkan => {
+            return Err(Unsupported::MultiDevice { backend: "vulkan" }.into());
+        }
+    }
+    let mut devices = Vec::with_capacity(ordinals.len());
+    for (rank, &ordinal) in ordinals.iter().enumerate() {
+        let device = PtxDevice::open(ordinal).map_err(|e| open_failed("ptx", e))?;
+        devices.push((DeviceId(rank as u32), device));
+    }
+    Coordinator::new(devices).map_err(|e| DriverError::Device(ExecError::from(e)))
+}
+
+#[cfg(test)]
+mod bound_tests {
+    use super::*;
+
+    /// A zero timing bound is refused with its name, before a device opens, and is not repaired to one.
+    /// Mutation: clamp the bound (`.max(1)`) instead of refusing; the row stops being an error and goes red.
+    #[test]
+    fn a_zero_timing_bound_is_refused_by_name() {
+        for (bound, detail) in [
+            ("max_in_flight_queries", DetailedTiming::every_step(8, 8, 0)),
+            ("max_retained_steps", DetailedTiming::every_step(0, 8, 8)),
+            (
+                "max_retained_dispatch_records",
+                DetailedTiming::every_step(8, 0, 8),
+            ),
+            (
+                "sample_every",
+                DetailedTiming {
+                    sample_every: 0,
+                    ..DetailedTiming::every_step(8, 8, 8)
+                },
+            ),
+        ] {
+            let Err(refused) = open_timed_executor(BackendChoice::Wgpu, detail) else {
+                panic!("a zero {bound} opened an executor");
+            };
+            assert!(
+                matches!(
+                    refused,
+                    DriverError::InvalidOptions(InvalidOptions::TimingBoundZero { bound: named })
+                        if named == bound
+                ),
+                "{bound}: got {refused}"
+            );
+        }
+    }
 }
 
 #[cfg(all(test, not(feature = "rocm")))]

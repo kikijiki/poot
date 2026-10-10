@@ -20,6 +20,7 @@ use poot_graph_plan::{
     CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram,
     Submission, Target, TargetSet, compile_staged,
 };
+use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::DType;
@@ -137,7 +138,13 @@ impl Device for FaultyDevice {
         Ok(())
     }
 
-    fn write(&mut self, _dst: &(), _offset: usize, _bytes: &[u8]) -> Result<(), FaultyError> {
+    fn write_with(
+        &mut self,
+        _dst: &(),
+        _offset: usize,
+        _len: usize,
+        _fill: &mut dyn FnMut(std::ops::Range<usize>, &mut [u8]),
+    ) -> Result<(), FaultyError> {
         Ok(())
     }
 
@@ -199,7 +206,7 @@ fn fixture() -> (
                 DenseWeight::try_new(
                     DType::F32,
                     vec![2],
-                    Arc::from([0u8, 0, 0x80, 0x3f, 0, 0, 0, 0x40]), // [1.0, 2.0]
+                    StoredBytes::from(vec![0u8, 0, 0x80, 0x3f, 0, 0, 0, 0x40]), // [1.0, 2.0]
                 )
                 .unwrap(),
             ),

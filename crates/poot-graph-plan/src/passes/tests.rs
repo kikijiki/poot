@@ -38,9 +38,8 @@ fn packed_graph_with_extra_consumer() -> Result<Graph, poot_graph_ir::BuilderApp
     let mut graph = packed_graph()?;
     let dequant = graph.eqns[0].out;
     let first_output = graph.output;
-    let transpose2 = graph.values.len();
     let transpose_meta = graph.values[graph.eqns[1].out].clone();
-    graph.values.push(transpose_meta);
+    let transpose2 = graph.values.push(transpose_meta);
     graph.eqns.push(Eqn {
         op: OpKind::Transpose { perm: vec![1, 0] },
         inputs: vec![Operand::Value(dequant)],
@@ -51,16 +50,14 @@ fn packed_graph_with_extra_consumer() -> Result<Graph, poot_graph_ir::BuilderApp
         Operand::Value(value) => value,
         Operand::Lit(_) => unreachable!(),
     };
-    let second_output = graph.values.len();
-    graph.values.push(graph.values[first_output].clone());
+    let second_output = graph.values.push(graph.values[first_output].clone());
     graph.eqns.push(Eqn {
         op: OpKind::MatMul,
         inputs: vec![Operand::Value(activation), Operand::Value(transpose2)],
         out: second_output,
         layer: None,
     });
-    let combined = graph.values.len();
-    graph.values.push(graph.values[first_output].clone());
+    let combined = graph.values.push(graph.values[first_output].clone());
     graph.eqns.push(Eqn {
         op: OpKind::Binary(BinOp::Add),
         inputs: vec![Operand::Value(first_output), Operand::Value(second_output)],
@@ -78,8 +75,7 @@ fn packed_graph_with_extra_carrier_consumer() -> Result<Graph, poot_graph_ir::Bu
         Operand::Lit(_) => unreachable!(),
     };
     let original_output = graph.output;
-    let cast = graph.values.len();
-    graph.values.push(poot_graph_ir::ValueMeta::new(
+    let cast = graph.values.push(poot_graph_ir::ValueMeta::new(
         TensorType::f32(vec![3, 18]),
         Storage::Device,
         None,
@@ -90,8 +86,7 @@ fn packed_graph_with_extra_carrier_consumer() -> Result<Graph, poot_graph_ir::Bu
         out: cast,
         layer: None,
     });
-    let reduced = graph.values.len();
-    graph.values.push(poot_graph_ir::ValueMeta::new(
+    let reduced = graph.values.push(poot_graph_ir::ValueMeta::new(
         TensorType::f32(vec![3]),
         Storage::Device,
         None,
@@ -106,8 +101,7 @@ fn packed_graph_with_extra_carrier_consumer() -> Result<Graph, poot_graph_ir::Bu
         out: reduced,
         layer: None,
     });
-    let broadcast = graph.values.len();
-    graph.values.push(poot_graph_ir::ValueMeta::new(
+    let broadcast = graph.values.push(poot_graph_ir::ValueMeta::new(
         TensorType::f32(vec![2, 3]),
         Storage::Device,
         None,
@@ -118,8 +112,7 @@ fn packed_graph_with_extra_carrier_consumer() -> Result<Graph, poot_graph_ir::Bu
         out: broadcast,
         layer: None,
     });
-    let combined = graph.values.len();
-    graph.values.push(poot_graph_ir::ValueMeta::new(
+    let combined = graph.values.push(poot_graph_ir::ValueMeta::new(
         TensorType::f32(vec![2, 3]),
         Storage::Device,
         None,
@@ -238,16 +231,14 @@ fn packed_block_diagonal_graph_with_extra_consumer()
     let dequant = graph.eqns[0].out;
     let first_output = graph.output;
 
-    let reshape2 = graph.values.len();
-    graph.values.push(graph.values[graph.eqns[1].out].clone());
+    let reshape2 = graph.values.push(graph.values[graph.eqns[1].out].clone());
     graph.eqns.push(Eqn {
         op: graph.eqns[1].op.clone(),
         inputs: vec![Operand::Value(dequant)],
         out: reshape2,
         layer: None,
     });
-    let transpose2 = graph.values.len();
-    graph.values.push(graph.values[graph.eqns[2].out].clone());
+    let transpose2 = graph.values.push(graph.values[graph.eqns[2].out].clone());
     graph.eqns.push(Eqn {
         op: graph.eqns[2].op.clone(),
         inputs: vec![Operand::Value(reshape2)],
@@ -258,16 +249,14 @@ fn packed_block_diagonal_graph_with_extra_consumer()
         Operand::Value(value) => value,
         Operand::Lit(_) => unreachable!(),
     };
-    let second_output = graph.values.len();
-    graph.values.push(graph.values[first_output].clone());
+    let second_output = graph.values.push(graph.values[first_output].clone());
     graph.eqns.push(Eqn {
         op: OpKind::MatMul,
         inputs: vec![Operand::Value(activation), Operand::Value(transpose2)],
         out: second_output,
         layer: None,
     });
-    let combined = graph.values.len();
-    graph.values.push(graph.values[first_output].clone());
+    let combined = graph.values.push(graph.values[first_output].clone());
     graph.eqns.push(Eqn {
         op: OpKind::Binary(BinOp::Add),
         inputs: vec![Operand::Value(first_output), Operand::Value(second_output)],
@@ -406,8 +395,7 @@ fn production_rejects_packed_dequant_escape_table() -> Result<(), poot_graph_ir:
 
     for (label, state_out) in [("dequant state", dequant), ("transpose state", transpose)] {
         let mut graph = base.clone();
-        let state_in = graph.values.len();
-        graph.values.push(poot_graph_ir::ValueMeta::new_state(
+        let state_in = graph.values.push(poot_graph_ir::ValueMeta::new_state(
             graph.aval(state_out).clone(),
             Some(format!("{label}.state")),
             poot_graph_ir::StateRole::Recurrent,
@@ -421,14 +409,12 @@ fn production_rejects_packed_dequant_escape_table() -> Result<(), poot_graph_ir:
     }
 
     let mut candidate_state = base.clone();
-    let state_in = candidate_state.values.len();
-    candidate_state
-        .values
-        .push(poot_graph_ir::ValueMeta::new_state(
-            candidate_state.aval(candidate_state.output).clone(),
-            Some("candidate.state".into()),
-            poot_graph_ir::StateRole::Recurrent,
-        ));
+    let state_meta = poot_graph_ir::ValueMeta::new_state(
+        candidate_state.aval(candidate_state.output).clone(),
+        Some("candidate.state".into()),
+        poot_graph_ir::StateRole::Recurrent,
+    );
+    let state_in = candidate_state.values.push(state_meta);
     candidate_state.inputs.push(state_in);
     candidate_state.consts.push(state_in);
     candidate_state
@@ -459,8 +445,7 @@ fn production_rejects_packed_dequant_escape_table() -> Result<(), poot_graph_ir:
     unmatched.eqns.remove(1);
     let matmul = unmatched.eqns.remove(1);
     unmatched.output = dequant;
-    let output = unmatched.values.len();
-    unmatched.values.push(unmatched.values[dequant].clone());
+    let output = unmatched.values.push(unmatched.values[dequant].clone());
     unmatched.eqns.push(Eqn {
         op: OpKind::Reshape { shape: vec![3, 35] },
         inputs: vec![Operand::Value(dequant)],
@@ -591,7 +576,7 @@ fn flash_graph(decode: bool) -> (Graph, [ValueId; 3]) {
         "the matcher forms the flash op: {:?}",
         flash.op
     );
-    (g, [k.id, v.id, mask.id])
+    (g, [k.id(), v.id(), mask.id()])
 }
 
 /// R467-001: `Graph::validate` rejects a fused flash op whose K/V or mask the op would index past, from
@@ -1094,9 +1079,9 @@ fn fuse_i32_pack_concat_keeps_a_pinned_unpack_slice() {
     let fg = fuse(&g);
     fg.validate()
         .expect("pinned unpack slice must remain a produced graph output");
-    assert_eq!(fg.output, left.id);
+    assert_eq!(fg.output, left.id());
     assert!(
-        fg.eqns.iter().any(|eqn| eqn.out == left.id),
+        fg.eqns.iter().any(|eqn| eqn.out == left.id()),
         "pinned unit last-axis slice must not be absorbed"
     );
 }
@@ -1267,7 +1252,7 @@ fn collapse_reshape_chains_merges_a_chain() {
     assert_eq!(c.eqns.len(), 1, "the reshape chain collapses to one");
     assert!(matches!(c.eqns[0].op, OpKind::Reshape { .. }));
     assert!(
-        matches!(c.eqns[0].inputs[0], Operand::Value(v) if v == x.id),
+        matches!(c.eqns[0].inputs[0], Operand::Value(v) if v == x.id()),
         "reads the source"
     );
     assert_eq!(c.aval(c.output).shape, vec![4, 6], "final shape preserved");
@@ -1287,7 +1272,7 @@ fn collapse_keeps_a_still_used_intermediate() {
     let c = collapse_reshape_chains(&g);
     c.validate().expect("collapsed graph valid");
     assert!(
-        c.eqns.iter().any(|e| e.out == r1.id),
+        c.eqns.iter().any(|e| e.out == r1.id()),
         "the multi-use intermediate reshape is retained"
     );
 }
@@ -1514,7 +1499,7 @@ fn dce_keeps_validation_only_producer() {
 
     let transformed = dce(&graph);
     transformed.validate().unwrap();
-    assert!(transformed.eqns.iter().any(|eqn| eqn.out == witness.id));
+    assert!(transformed.eqns.iter().any(|eqn| eqn.out == witness.id()));
 }
 
 #[test]
@@ -1536,7 +1521,7 @@ fn fusion_pins_validation_packet_values() {
     let transformed = fuse(&graph);
     transformed.validate().unwrap();
     assert!(
-        transformed.eqns.iter().any(|eqn| eqn.out == witness.id),
+        transformed.eqns.iter().any(|eqn| eqn.out == witness.id()),
         "the validation root must not be absorbed into its consumer"
     );
 }
@@ -1564,7 +1549,7 @@ fn movement_cleanup_preserves_validation_only_root() {
         transformed
             .eqns
             .iter()
-            .any(|eqn| eqn.out == witness.id && matches!(eqn.op, OpKind::Reshape { .. })),
+            .any(|eqn| eqn.out == witness.id() && matches!(eqn.op, OpKind::Reshape { .. })),
         "the validation-only movement value must stay independently materialized"
     );
 }
@@ -1761,9 +1746,9 @@ fn adr0099_s2_boundary_descriptors_carry_dtype_shape_and_byte_len() {
     assert_eq!(
         carried,
         vec![
-            (bf16.id, DType::BF16, 24, 0, vec![1]),
-            (i32.id, DType::I32, 48, 0, vec![1]),
-            (i8.id, DType::I8, 12, 0, vec![1]),
+            (bf16.id(), DType::BF16, 24, 0, vec![1]),
+            (i32.id(), DType::I32, 48, 0, vec![1]),
+            (i8.id(), DType::I8, 12, 0, vec![1]),
         ]
     );
     assert!(
@@ -1794,8 +1779,8 @@ fn adr0099_s2_state_pair_split_across_stages_is_rejected() {
         split_stages(&graph, &assignment).expect_err("the pair spans both stages"),
         StageSplitError::StatePairSplit {
             pair: 0,
-            state_input: k_in.id,
-            state_output: k_out.id,
+            state_input: k_in.id(),
+            state_output: k_out.id(),
             first_stage: 0,
             second_stage: 1,
         }
@@ -1927,7 +1912,7 @@ fn adr0099_s2_a_final_stage_that_never_sees_the_output_is_rejected() {
             .expect_err("the output is defined in stage 0 and reaches no later stage"),
         StageSplitError::FinalStageMissingOutput {
             stage: 2,
-            output: t0.id,
+            output: t0.id(),
         }
     );
 }
@@ -2006,7 +1991,7 @@ fn adr0099_s2_each_stage_keeps_only_the_witnesses_it_defines() {
         vec![(
             ValidationId(1),
             "stage0_witness".to_owned(),
-            computation(&graph, w0.id)
+            computation(&graph, w0.id())
         )]
     );
     assert_eq!(
@@ -2014,7 +1999,7 @@ fn adr0099_s2_each_stage_keeps_only_the_witnesses_it_defines() {
         vec![(
             ValidationId(2),
             "stage1_witness".to_owned(),
-            computation(&graph, w1.id)
+            computation(&graph, w1.id())
         )]
     );
 }
@@ -2241,7 +2226,7 @@ fn adr0099_s2_cse_and_dce_preserve_layer_tags() {
     for eqn in &folded.eqns {
         assert_eq!(
             eqn.layer, original[&eqn.out],
-            "cse changed the layer tag of v{}",
+            "cse changed the layer tag of {}",
             eqn.out
         );
     }
@@ -2254,7 +2239,7 @@ fn adr0099_s2_cse_and_dce_preserve_layer_tags() {
     for eqn in &trimmed.eqns {
         assert_eq!(
             eqn.layer, original[&eqn.out],
-            "dce changed the layer tag of v{}",
+            "dce changed the layer tag of {}",
             eqn.out
         );
     }
@@ -2577,8 +2562,7 @@ fn card536a_rope_near_misses_decline_with_a_reason() {
 
     // The two slices do not split the same tensor: cut the keep slice from a different tensor.
     let mut wrong_source = hand_rope(vec![1, 4, 3, 8], vec![1, 1, 3, 8], false);
-    let other = wrong_source.values.len();
-    wrong_source
+    let other = wrong_source
         .values
         .push(poot_graph_ir::graph::ValueMeta::new(
             TensorType::f32(vec![1, 4, 3, 8]),
@@ -2721,8 +2705,8 @@ fn a_split_key_with_a_narrower_value_matches_as_a_split_attention() {
     let graph = b.finish(out);
     let matched = match_attention(&graph, &producer_map(&graph), output_eqn(&graph))
         .unwrap_or_else(|decline| panic!("the MLA chain must match, declined {decline:?}"));
-    assert_eq!(matched.k, k_nope.id);
-    assert_eq!(matched.k_shared, Some(k_pe.id));
+    assert_eq!(matched.k, k_nope.id());
+    assert_eq!(matched.k_shared, Some(k_pe.id()));
     assert_eq!(matched.key, KeyLayout::Split { shared_dim: rope });
     assert_eq!(matched.len, None);
     let OpKind::Attention(attrs) = matched.op() else {
@@ -2764,7 +2748,7 @@ fn live_attention_graph(
         vec![poot_graph_ir::ValidationOutput {
             id: poot_graph_ir::ValidationId(1),
             name: "attention.len".to_owned(),
-            value: live.witness.id,
+            value: live.witness.id(),
         }]
     } else {
         Vec::new()
@@ -2858,7 +2842,7 @@ fn live_near_misses_decline_with_a_reason() {
 
     // One key off: the key positions start at 2 instead of 1.
     let mut off_by_one = live_attention_graph(false, true);
-    let iotas: Vec<usize> = off_by_one
+    let iotas: Vec<ValueId> = off_by_one
         .eqns
         .iter()
         .filter(|eqn| {
@@ -2898,16 +2882,14 @@ fn live_near_misses_decline_with_a_reason() {
             matches!(eqn.op, OpKind::Binary(B::Ge)) && other_len.aval(eqn.out).shape == [2, 1, 6, 1]
         })
         .expect("the key-row condition");
-    let other = other_len.values.len();
-    other_len.values.push(poot_graph_ir::graph::ValueMeta::new(
+    let other = other_len.values.push(poot_graph_ir::graph::ValueMeta::new(
         TensorType::new(vec![2], poot_tensor::DType::I32),
         Storage::Const,
         Some("other_len".into()),
     ));
     other_len.consts.push(other);
     other_len.inputs.push(other);
-    let view = other_len.values.len();
-    other_len.values.push(poot_graph_ir::graph::ValueMeta::new(
+    let view = other_len.values.push(poot_graph_ir::graph::ValueMeta::new(
         TensorType::new(vec![2, 1, 1, 1], poot_tensor::DType::I32),
         Storage::Device,
         None,
@@ -2974,14 +2956,14 @@ fn canonicalize_preserves_unproved_spellings_and_removes_identity() {
         assert!(matches!(root.op, OpKind::MatMul));
         assert_eq!(root.out, graph.output);
         if scale == 1.0 {
-            assert!(matches!(root.inputs[0], Operand::Value(id) if id == x.id));
+            assert!(matches!(root.inputs[0], Operand::Value(id) if id == x.id()));
             assert!(declines.is_empty());
         } else {
             assert_eq!(format!("{:?}", canonical.eqns), format!("{:?}", graph.eqns));
             assert_eq!(
                 declines,
                 vec![NumericalRewriteDecline {
-                    value: output.id,
+                    value: output.id(),
                     reason: NumericalRewriteReason::ScalarAcrossContraction,
                 }]
             );
@@ -3002,7 +2984,7 @@ fn canonicalize_preserves_unproved_spellings_and_removes_identity() {
     assert_eq!(
         declines,
         vec![NumericalRewriteDecline {
-            value: mul.id,
+            value: mul.id(),
             reason: NumericalRewriteReason::ReciprocalRounding,
         }]
     );
@@ -3084,7 +3066,7 @@ fn a_traced_bias_linear_is_primitive_and_fuses_into_one_contraction_epilogue() {
         matches!(
             epilogues[0].inputs.as_slice(),
             [Operand::Value(a), Operand::Value(b), Operand::Value(c)]
-                if [*a, *b, *c] == [x.id, w.id, bias.id]
+                if [*a, *b, *c] == [x.id(), w.id(), bias.id()]
         ),
         "ContractionEpilogue reads (activation, weight, bias): {:?}",
         epilogues[0].inputs
@@ -3103,9 +3085,9 @@ fn a_traced_bias_linear_is_primitive_and_fuses_into_one_contraction_epilogue() {
         (0..len).map(|i| ((i as f32 + seed) * 0.37).sin()).collect()
     };
     let inputs: HashMap<ValueId, Value> = [
-        (x.id, HostTensor::f32(vec![m, k], data(m * k, 1.0))),
-        (w.id, HostTensor::f32(vec![k, n], data(k * n, 2.0))),
-        (bias.id, HostTensor::f32(vec![n], data(n, 3.0))),
+        (x.id(), HostTensor::f32(vec![m, k], data(m * k, 1.0))),
+        (w.id(), HostTensor::f32(vec![k, n], data(k * n, 2.0))),
+        (bias.id(), HostTensor::f32(vec![n], data(n, 3.0))),
     ]
     .into_iter()
     .map(|(id, tensor)| (id, Value::from(tensor)))
@@ -3150,7 +3132,7 @@ fn eval_bits(g: &Graph) -> Vec<u32> {
             let shape = g.aval(id).shape.clone();
             let numel: usize = shape.iter().product();
             let data = (0..numel)
-                .map(|i| ((i as f32 + id as f32) * 0.37).sin())
+                .map(|i| ((i as f32 + id.index() as f32) * 0.37).sin())
                 .collect();
             (id, Value::from(HostTensor::f32(shape, data)))
         })
@@ -3258,7 +3240,7 @@ fn a_single_use_bias_broadcast_folds_into_the_epilogue_leaf() {
         matches!(
             epilogues[0].inputs.as_slice(),
             [Operand::Value(a), Operand::Value(bw), Operand::Value(leaf)]
-                if [*a, *bw, *leaf] == [x.id, w.id, bias.id]
+                if [*a, *bw, *leaf] == [x.id(), w.id(), bias.id()]
         ),
         "the leaf is the [N] bias: {:?}",
         epilogues[0].inputs

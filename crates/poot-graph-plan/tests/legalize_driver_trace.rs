@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
 use poot_eval::{EvalBudget, EvalOptions, Value, eval, materialize_dense};
-use poot_graph_ir::{Slot, SlotKey, Storage};
+use poot_graph_ir::{Slot, SlotKey, Storage, ValueId};
 use poot_graph_plan::{
     CompileError, CompileLimits, CompileOptions, LegalizeError, Submission, Target, compile,
 };
@@ -145,7 +145,7 @@ fn driver_compile_splits_transposed_weights_under_a_small_buffer_limit() {
 
     // per split weight: (chunks bound so far, rows bound so far)
     let mut next: HashMap<String, (usize, usize)> = HashMap::new();
-    let mut inputs: HashMap<usize, Value> = HashMap::new();
+    let mut inputs: HashMap<ValueId, Value> = HashMap::new();
     for &(si, _) in &g.state {
         inputs.insert(si, Value::from(HostTensor::zeros(g.aval(si).shape.clone())));
     }

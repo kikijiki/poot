@@ -15,12 +15,10 @@ use crate::*;
 /// An equation that plans no kernel launch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoDispatch {
-    /// The output aliases an input buffer (reshape, an identity cast, a collective at world size 1).
+    /// The output aliases an input buffer (reshape, an identity cast).
     Alias,
     /// The output is a strided view of an input buffer.
     View,
-    /// A cross-rank collective the multi-rank executor runs.
-    Collective,
 }
 
 /// The kernel the planner chose for one equation.
@@ -279,10 +277,6 @@ impl Planned {
         )
     }
 
-    pub(crate) fn collective(kind: CollectiveKind, op: RedOp, axis: usize) -> Self {
-        Self::no_dispatch(Plan::Collective { kind, op, axis }, NoDispatch::Collective)
-    }
-
     fn no_dispatch(plan: Plan, kind: NoDispatch) -> Self {
         Self {
             plan,
@@ -406,14 +400,14 @@ mod tests {
             .equation(
                 OpKind::Attention(AttentionAttrs::new(1, 0.5, None)),
                 [q, k, v, mask]
-                    .map(|operand| poot_graph_ir::Operand::Value(operand.id))
+                    .map(|operand| poot_graph_ir::Operand::Value(operand.id()))
                     .to_vec(),
             )
             .expect("stage the flash decode");
         plan.declare_result(out).expect("declare the result");
         let mut prepared = b.preflight_append(plan).expect("preflight");
-        let id = b.commit_append(&mut prepared).expect("commit");
-        b.finish(poot_graph_ir::Traced { id })
+        let committed = b.commit_append(&mut prepared).expect("commit");
+        b.finish(committed)
     }
 
     /// Card 636 SC-004: a request the device cannot hold is a typed refusal out of `compile`, not a panic.

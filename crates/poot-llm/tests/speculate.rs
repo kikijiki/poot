@@ -323,7 +323,13 @@ impl Device for FakeDevice {
     fn replay(&mut self, _recording: &()) -> Result<(), FakeError> {
         Ok(())
     }
-    fn write(&mut self, _dst: &(), _offset: usize, _bytes: &[u8]) -> Result<(), FakeError> {
+    fn write_with(
+        &mut self,
+        _dst: &(),
+        _offset: usize,
+        _len: usize,
+        _fill: &mut dyn FnMut(std::ops::Range<usize>, &mut [u8]),
+    ) -> Result<(), FakeError> {
         Ok(())
     }
     fn read(&mut self, _src: &(), out: &mut [u8]) -> Result<(), FakeError> {

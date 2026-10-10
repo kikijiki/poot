@@ -2,6 +2,13 @@
 pub enum LoadError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// A checkpoint file could not be mapped (not a regular file, or the mapping failed).
+    #[error("map: {0}")]
+    Map(#[from] poot_quant::MapError),
+    /// A mapped checkpoint file was modified in place, or replaced under the descriptor, while it was
+    /// being loaded (ADR-0103 amendment): the validated bytes are no longer the file's bytes.
+    #[error("{0}")]
+    SourceChanged(#[from] poot_quant::SourceChanged),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
     #[error("safetensors: {0}")]
@@ -37,6 +44,14 @@ pub enum LoadError {
     /// A GGUF tensor's bytes end before its declared shape does.
     #[error("gguf tensor data truncated: {need} bytes needed, {have} present")]
     GgufTensorTruncated { need: usize, have: usize },
+    /// A planned job's byte range lies outside its checkpoint file (a plan bug: each reader checks its ranges
+    /// against the container before planning, so this is the pipeline's own guard).
+    #[error("tensor {tensor:?}: bytes {need} needed, file holds {have}")]
+    TensorOutsideFile {
+        tensor: String,
+        need: usize,
+        have: usize,
+    },
     #[error("gguf packed weight: {0}")]
     GgufPackedWeight(#[from] poot_quant::PackedWeightError),
     #[error("gguf dense weight: {0}")]

@@ -128,6 +128,8 @@ fn scaled(store: &WeightStore, factor: f32) -> WeightStore {
 pub(super) enum Weights {
     Random,
     ZeroHead,
+    /// Random weights scaled so a greedy continuation depends on its prompt (see [`scaled`]).
+    Scaled,
 }
 
 pub(super) fn handle(weights: Weights, eos: u32) -> Arc<ModelHandle> {
@@ -143,6 +145,7 @@ fn handle_with(weights: Weights, eos: u32, chat_template: ChatTemplate) -> Arc<M
     let store = match weights {
         Weights::Random => fixture.store.clone(),
         Weights::ZeroHead => zero_head(&fixture.store),
+        Weights::Scaled => scaled(&fixture.store, 4.0),
     };
     let raw = RawConfig::HfJson {
         config: &config,
@@ -1205,6 +1208,116 @@ recorded_family_rows! {
     "qwen35/fp8" => recorded_qwen35_fp8_tokens_wgpu, recorded_qwen35_fp8_tokens_rocm, recorded_qwen35_fp8_tokens_ptx;
     "glm53_flash" => recorded_glm53_flash_tokens_wgpu, recorded_glm53_flash_tokens_rocm, recorded_glm53_flash_tokens_ptx;
 }
+
+// ---------------------------------------------------------------------------------------------
+// POOT-746: routed experts paged through a pool smaller than the table.
+// ---------------------------------------------------------------------------------------------
+
+/// The Mixtral fixture has four experts and routes two per token: a pool of three rows is smaller than the
+/// table and serves one token per step.
+const MIXTRAL_POOL_ROWS: usize = 3;
+
+/// The Mixtral fixture's handle, for the capacity rows.
+pub(super) fn mixtral_handle() -> Arc<ModelHandle> {
+    recorded_family_handle(mixtral_recorded())
+}
+
+fn mixtral_recorded() -> &'static RecordedFamily {
+    RECORDED
+        .iter()
+        .find(|recorded| recorded.family == "llama/mixtral")
+        .expect("recorded Mixtral literals")
+}
+
+/// SC-002: Mixtral decodes its recorded 24 tokens with `P = 3 < E = 4`, evicting (evictions above zero),
+/// every stage of every entry recording once and replaying every step. Mutation: in `ExpertResidency`,
+/// skip the refill of a miss (answer no rows); the pool serves another expert's bytes and the tokens
+/// diverge. Mutation: in the engine's step, replay the next stage before applying the sync writes; the
+/// stage reads the previous step's rows and the tokens diverge.
+fn pooled_mixtral_decodes_the_recorded_tokens_with_evictions(choice: BackendChoice) {
+    let recorded = mixtral_recorded();
+    let handle = recorded_family_handle(recorded);
+    let Some(executor) = open(choice) else {
+        return;
+    };
+    let mut driver = Driver::new(handle, executor, options(8, CAPACITY))
+        .unwrap()
+        .with_expert_pool(nz(MIXTRAL_POOL_ROWS))
+        .unwrap();
+    let got = generate(&mut driver, recorded.prompt, 24, Sampler::greedy());
+    assert_eq!(got, recorded.tokens, "pooled Mixtral on {choice:?}");
+    let counters = driver.stats().residency;
+    eprintln!("residency counters: {counters:?}");
+    assert!(
+        counters.refills > 0 && counters.evictions > 0,
+        "{counters:?}"
+    );
+    let stats = driver.executor_stats();
+    assert!(stats.syncs > 0 && stats.sync_read_bytes > 0, "{stats:?}");
+    assert!(
+        stats.stages.iter().all(|stage| stage.recordings == 1),
+        "every stage records once: {:?}",
+        stats.stages
+    );
+}
+per_backend!(
+    pooled_mixtral_decodes_the_recorded_tokens_with_evictions,
+    pooled_mixtral_decodes_the_recorded_tokens_with_evictions_wgpu,
+    pooled_mixtral_decodes_the_recorded_tokens_with_evictions_rocm,
+    pooled_mixtral_decodes_the_recorded_tokens_with_evictions_ptx
+);
+
+/// SC-003 and SC-005 (driver half): a 20-token prompt runs as one-token chunks through the pool, and
+/// prompts of different lengths interleaved through the same pooled sites, with a complete reset between,
+/// each equal the unpooled driver's tokens on the same weights. The reset clears the manager with the
+/// device pool: its counters read zero and the next run still matches. Mutation: in
+/// `Driver::reset_exe` reset the executable but keep the manager; the run after the reset trusts rows the
+/// device no longer holds and the tokens diverge.
+fn pooled_mixtral_interleaves_chunks_prompts_and_resets(choice: BackendChoice) {
+    let recorded = mixtral_recorded();
+    let handle = recorded_family_handle(recorded);
+    // Both executors open before either driver runs (the ROCm runtime does not reopen one).
+    let Some(plain_executor) = open(choice) else {
+        return;
+    };
+    let Some(pooled_executor) = open(choice) else {
+        return;
+    };
+    let mut plain = Driver::new(Arc::clone(&handle), plain_executor, options(8, CAPACITY)).unwrap();
+    let mut pooled = Driver::new(handle, pooled_executor, options(8, CAPACITY))
+        .unwrap()
+        .with_expert_pool(nz(MIXTRAL_POOL_ROWS))
+        .unwrap();
+    let long: Vec<u32> = (0..20).map(|i| PROMPT[i % PROMPT.len()]).collect();
+    let short: Vec<u32> = PROMPT.to_vec();
+    let round = |label: &str, prompt: &[u32], pooled: &mut Driver, plain: &mut Driver| {
+        let want = generate(plain, prompt, 6, Sampler::greedy());
+        let got = generate(pooled, prompt, 6, Sampler::greedy());
+        assert_eq!(got, want, "{label} on {choice:?}");
+    };
+    round("long prompt", &long, &mut pooled, &mut plain);
+    round("short prompt", &short, &mut pooled, &mut plain);
+    round("long prompt again", &long, &mut pooled, &mut plain);
+    pooled.reset_executables().unwrap();
+    assert_eq!(
+        pooled.stats().residency,
+        crate::driver::ResidencyCounters::default(),
+        "the reset cleared the manager's counters with the device pool"
+    );
+    round(
+        "short prompt after a reset",
+        &short,
+        &mut pooled,
+        &mut plain,
+    );
+    assert!(pooled.stats().residency.refills > 0);
+}
+per_backend!(
+    pooled_mixtral_interleaves_chunks_prompts_and_resets,
+    pooled_mixtral_interleaves_chunks_prompts_and_resets_wgpu,
+    pooled_mixtral_interleaves_chunks_prompts_and_resets_rocm,
+    pooled_mixtral_interleaves_chunks_prompts_and_resets_ptx
+);
 
 // ---------------------------------------------------------------------------------------------
 // POOT-737 SC-002 and SC-004: a step shape a dense family's trace refuses is a typed refusal before
@@ -4839,6 +4952,11 @@ fn smolvlm_fixture_dir() -> (poot_test_util::UniqueTempPath, Fixture) {
         .save(dir.join("tokenizer.json"), false)
         .unwrap();
     std::fs::write(
+        dir.join("tokenizer_config.json"),
+        serde_json::json!({ "chat_template": poot_test_util::smolvlm::CHAT_TEMPLATE }).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
         dir.join("preprocessor_config.json"),
         serde_json::json!({
             "size": { "longest_edge": 16 },
@@ -4913,6 +5031,7 @@ fn smolvlm_request(
 /// logits). Mutation: scatter zeroed embeddings in `driver/step.rs`; both captions collapse to the
 /// zero-row continuation and the row goes red.
 fn smolvlm_caption_matches_the_oracle_rows(choice: BackendChoice) {
+    use crate::multimodal::ChatTurn;
     use crate::multimodal::front_end::{CaptionRequest, Idefics3, Image};
     use poot_models::vision::PreprocessConfig;
 
@@ -4976,7 +5095,7 @@ fn smolvlm_caption_matches_the_oracle_rows(choice: BackendChoice) {
                     height: 16,
                     width: 16,
                 }],
-                question: "b c d",
+                turns: &[ChatTurn::user(1, "b c d")],
                 max_new,
             },
             &mut |_: u32, _: &str| GenerationControl::Continue(()),
@@ -5150,15 +5269,16 @@ per_backend!(
     smolvlm_batched_paged_embeds_match_single_row_runs_ptx
 );
 
-/// POOT-1075: requests lowered by the SmolVLM front end (`ImageFrontEnd::prepare`: preprocess,
+/// POOT-1075: requests lowered by the SmolVLM front end (`Idefics3FrontEnd::prepare`: preprocess,
 /// per-frame vision encode, prompt, placeholder positions) and served together on a paged text
 /// driver equal each request's own `Idefics3::caption` token for token. The requests differ in image
 /// (solid black, solid white, one black quadrant, a single-frame 8x8 image) and in question length,
-/// so their prompts have four lengths and their rows differ. Mutation: in `ImageFrontEnd::encode_frames`
+/// so their prompts have four lengths and their rows differ. Mutation: in `Idefics3FrontEnd::encode_frames`
 /// return the first frame's rows for every frame (`encoded[0]` cloned per frame); every request
 /// carries the same rows, the images stop reaching the logits and the row goes red.
 fn smolvlm_front_end_requests_served_batched_equal_single_row_captions(choice: BackendChoice) {
-    use crate::multimodal::front_end::{CaptionPrompt, CaptionRequest, Idefics3, Image};
+    use crate::multimodal::ChatTurn;
+    use crate::multimodal::front_end::{CaptionRequest, Idefics3, Image};
 
     let (dir, text) = smolvlm_fixture_dir();
     // Every executor opens before any runs (the ROCm runtime does not survive a second open after a drop).
@@ -5220,11 +5340,16 @@ fn smolvlm_front_end_requests_served_batched_equal_single_row_captions(choice: B
         (image(&quadrant, 16), "b"),
         (image(&small, 8), "b c d e f g h"),
     ];
+    let turns: Vec<[ChatTurn<'_>; 1]> = cases
+        .iter()
+        .map(|(_, question)| [ChatTurn::user(1, question)])
+        .collect();
     let requests: Vec<CaptionRequest<'_>> = cases
         .iter()
-        .map(|(image, question)| CaptionRequest {
+        .zip(&turns)
+        .map(|((image, _), turns)| CaptionRequest {
             images: std::slice::from_ref(image),
-            question,
+            turns,
             max_new,
         })
         .collect();
@@ -5271,11 +5396,11 @@ fn smolvlm_front_end_requests_served_batched_equal_single_row_captions(choice: B
             "request {i}: caption equals the oracle-row run"
         );
     }
-    let prompts: Vec<CaptionPrompt> = requests
+    let prompts: Vec<crate::multimodal::MultimodalPrompt> = requests
         .iter()
         .map(|request| {
             vlm.images
-                .prepare(request.images, request.question)
+                .prepare_decoded(request.images, request.turns)
                 .expect("prepare")
         })
         .collect();
@@ -6618,4 +6743,132 @@ fn a_chat_turn_end_is_cut_from_the_text_and_a_reverse_prompt_is_kept_wgpu() {
     let (kept, text) = text_run(&handle, BackendChoice::Wgpu, &raw).unwrap();
     assert_eq!(kept.finish, crate::driver::FinishReason::Stop);
     assert!(text.ends_with('a'), "{text}");
+}
+
+/// A chat template over the fixture's vocabulary whose roles are single letters (`u`, `a`) and whose
+/// generation prompt is the assistant's own role marker, so a conversation's earlier turns render to the
+/// exact tokens the sequence already holds.
+const ROLE_TEMPLATE: &str = "{% for m in messages %}{{ m['role'][0] }} {{ m['content'] }} {% endfor %}{% if add_generation_prompt %}a {% endif %}";
+
+/// The same without role markers: the generation prompt `a` of a finished turn is not in the rendered
+/// history, so a later turn shares only the run before it with the sequence.
+const BARE_TEMPLATE: &str = "{% for m in messages %}{{ m['content'] }} {% endfor %}{% if add_generation_prompt %}a {% endif %}";
+
+fn chat_handle(template: &str) -> Arc<ModelHandle> {
+    handle_with(
+        Weights::Scaled,
+        NO_EOS,
+        ChatTemplate {
+            template: Some(template.into()),
+            bos_token: None,
+            eos_token: None,
+        },
+    )
+}
+
+fn chat_options() -> crate::driver::ChatOptions {
+    crate::driver::ChatOptions {
+        system: None,
+        stops: Vec::new(),
+        max_new: Some(5),
+        ctx: None,
+        sampling: crate::driver::Sampling::GREEDY,
+        ignore_eos: false,
+    }
+}
+
+/// What a two-turn conversation and a single run of its concatenated rendered prompt say.
+struct TwoTurns {
+    /// The second reply's generation and the engine-measured tokens its prefill fed.
+    second: crate::driver::Generation,
+    /// The one-shot run over `[user, reply, user]` rendered as the template renders them.
+    reference: crate::driver::Generation,
+    /// Tokens of the second turn's context.
+    context: usize,
+    /// Tokens of the first turn's context and reply.
+    held: usize,
+}
+
+fn two_turns(template: &str, choice: BackendChoice) -> Option<TwoTurns> {
+    use crate::Speaker;
+    let handle = chat_handle(template);
+    let mut session =
+        crate::driver::ChatSession::new(&handle, open(choice)?, chat_options()).unwrap();
+    let mut first_reply = String::new();
+    let first = session
+        .say("b c d", &mut |piece| first_reply.push_str(piece))
+        .unwrap();
+    let mut second_reply = String::new();
+    let second = session
+        .say("e f g", &mut |piece| second_reply.push_str(piece))
+        .unwrap();
+    session.finish().unwrap();
+
+    let text = handle.text();
+    let first_context = text
+        .render_turns(None, &[(Speaker::User, "b c d")])
+        .unwrap()
+        .unwrap()
+        .prompt;
+    let rendered = text
+        .render_turns(
+            None,
+            &[
+                (Speaker::User, "b c d"),
+                (Speaker::Assistant, &first_reply),
+                (Speaker::User, "e f g"),
+            ],
+        )
+        .unwrap()
+        .unwrap()
+        .prompt;
+    let reference = crate::driver::TextRequest {
+        prompt: rendered.clone(),
+        system: None,
+        raw: true,
+        stops: Vec::new(),
+        max_new: Some(5),
+        ctx: None,
+        sampling: crate::driver::Sampling::GREEDY,
+        ignore_eos: false,
+    };
+    let (reference, _) = text_run(&handle, choice, &reference)?;
+    assert_eq!(first.tokens.len(), 5);
+    assert_eq!(second.tokens.len(), 5);
+    Some(TwoTurns {
+        second,
+        reference,
+        context: text.encode(&rendered).unwrap().len(),
+        held: text.encode(&first_context).unwrap().len() + first.tokens.len(),
+    })
+}
+
+/// POOT-1094 SC-001: the second reply of a two-turn conversation equals one run of the concatenated
+/// rendered prompt, and the second turn prefills only what the sequence did not hold: the context less the
+/// positions of the first turn that have K/V (all but the last token it generated). Mutations: reset the
+/// sequence between turns (`Driver::resume` keeps nothing; the prefill count is the whole context);
+/// forget the earlier turns (`ChatSession::say` renders only the new user turn; the reply is another).
+#[test]
+fn a_second_turn_equals_one_run_of_the_concatenated_prompt_and_prefills_only_the_new_tokens_wgpu() {
+    let Some(run) = two_turns(ROLE_TEMPLATE, BackendChoice::Wgpu) else {
+        return;
+    };
+    assert_eq!(run.second.tokens, run.reference.tokens);
+    let timing = run.second.timing.expect("a session measures its phases");
+    assert_eq!(timing.prefill.tokens, run.context - (run.held - 1));
+}
+
+/// POOT-1094 SC-002: when the template does not render the history back to the tokens the sequence
+/// holds, the turn keeps the run they share and prefills from the first difference, and the reply is still
+/// the single run's. Mutation: keep the whole resident run without comparing it to the context
+/// (`shared = resident`); the K/V past the difference is another conversation's and the reply changes.
+#[test]
+fn a_second_turn_over_a_rewritten_history_still_equals_one_run_wgpu() {
+    let Some(run) = two_turns(BARE_TEMPLATE, BackendChoice::Wgpu) else {
+        return;
+    };
+    assert_eq!(run.second.tokens, run.reference.tokens);
+    // The first context is `b c d a`; the second renders `b c d <reply> e f g a`: three tokens are shared.
+    let timing = run.second.timing.expect("a session measures its phases");
+    assert_eq!(timing.prefill.tokens, run.context - 3);
 }

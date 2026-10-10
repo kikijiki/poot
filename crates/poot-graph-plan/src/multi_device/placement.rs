@@ -61,33 +61,6 @@ pub enum PlacementRow {
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PlacementError {
-    #[error("owner {owner:?} has zero total bytes")]
-    EmptyOwner { owner: OwnerId },
-    #[error("owner {owner:?} replicated placement has no residents")]
-    NoResidents { owner: OwnerId },
-    #[error("owner {owner:?} has an empty range [{start}, {end})")]
-    EmptyRange {
-        owner: OwnerId,
-        start: usize,
-        end: usize,
-    },
-    #[error("owner {owner:?} range [{start}, {end}) exceeds its logical extent {total_bytes}")]
-    RangeOutOfBounds {
-        owner: OwnerId,
-        start: usize,
-        end: usize,
-        total_bytes: usize,
-    },
-    #[error("owner {owner:?} ranges [{a_start}, {a_end}) and [{b_start}, {b_end}) overlap")]
-    RangeOverlap {
-        owner: OwnerId,
-        a_start: usize,
-        a_end: usize,
-        b_start: usize,
-        b_end: usize,
-    },
-    #[error("owner {owner:?} coverage has a gap starting at byte {byte}")]
-    CoverageGap { owner: OwnerId, byte: usize },
     #[error(
         "owner {owner:?} range [{start}, {end}) does not align to its {unit}-byte encoding unit"
     )]
@@ -103,101 +76,21 @@ pub enum PlacementError {
     MissingOwner { owner: OwnerId },
     #[error("placement row {index} names owner {owner:?}, which is not in the expected set")]
     UnexpectedOwner { owner: OwnerId, index: usize },
-}
-
-/// Validate exact disjoint coverage and encoding-unit alignment for one placement row (FR-003).
-///
-/// For [`PlacementRow::Partitioned`], ranges are sorted by start before adjacency is checked. Comparing
-/// adjacent pairs in caller-supplied order would miss an overlap between two ranges that are not
-/// adjacent in input order at three or more partitions (N=2 cannot exercise this; see the acceptance
-/// table's "Partitioned (general)" row).
-pub fn validate_placement(row: &PlacementRow) -> Result<(), PlacementError> {
-    match row {
-        PlacementRow::Replicated { owner, residents } => {
-            if owner.total_bytes == 0 {
-                return Err(PlacementError::EmptyOwner { owner: owner.owner });
-            }
-            if residents.is_empty() {
-                return Err(PlacementError::NoResidents { owner: owner.owner });
-            }
-            Ok(())
-        }
-        PlacementRow::Partitioned { owner, ranges } => {
-            if owner.total_bytes == 0 {
-                return Err(PlacementError::EmptyOwner { owner: owner.owner });
-            }
-            let unit = owner.encoding_unit_bytes.max(1);
-            for &(_, range) in ranges {
-                if range.is_empty() {
-                    return Err(PlacementError::EmptyRange {
-                        owner: owner.owner,
-                        start: range.start,
-                        end: range.end,
-                    });
-                }
-                if range.end > owner.total_bytes {
-                    return Err(PlacementError::RangeOutOfBounds {
-                        owner: owner.owner,
-                        start: range.start,
-                        end: range.end,
-                        total_bytes: owner.total_bytes,
-                    });
-                }
-                let end_aligned = range.end == owner.total_bytes || range.end % unit == 0;
-                if range.start % unit != 0 || !end_aligned {
-                    return Err(PlacementError::IllegalEncodingSplit {
-                        owner: owner.owner,
-                        start: range.start,
-                        end: range.end,
-                        unit,
-                    });
-                }
-            }
-            // Sort by start, not the caller's declaration order, so an overlap between ranges that are
-            // non-adjacent in input order is still caught by an adjacent-pair scan.
-            let mut sorted: Vec<ByteRange> = ranges.iter().map(|&(_, range)| range).collect();
-            sorted.sort_by_key(|range| range.start);
-            let mut cursor = 0usize;
-            for range in &sorted {
-                if range.start < cursor {
-                    let overlapping = sorted
-                        .iter()
-                        .find(|other| other.start < range.start && other.end > range.start)
-                        .copied()
-                        .unwrap_or(ByteRange {
-                            start: 0,
-                            end: cursor,
-                        });
-                    return Err(PlacementError::RangeOverlap {
-                        owner: owner.owner,
-                        a_start: overlapping.start,
-                        a_end: overlapping.end,
-                        b_start: range.start,
-                        b_end: range.end,
-                    });
-                }
-                if range.start > cursor {
-                    return Err(PlacementError::CoverageGap {
-                        owner: owner.owner,
-                        byte: cursor,
-                    });
-                }
-                cursor = cursor.max(range.end);
-            }
-            if cursor < owner.total_bytes {
-                return Err(PlacementError::CoverageGap {
-                    owner: owner.owner,
-                    byte: cursor,
-                });
-            }
-            Ok(())
-        }
-    }
+    /// The placement puts bytes of `owner` on `device`, which hosts none of the stages that read it. The
+    /// first reading stage is `stage`.
+    #[error(
+        "owner {owner:?} is placed on device {device:?}, which runs none of its stages (first reader: stage {stage})"
+    )]
+    OffStage {
+        owner: OwnerId,
+        device: DeviceId,
+        stage: usize,
+    },
 }
 
 /// Placement rows in which every expected owner appears in exactly one row and no row names an
 /// owner outside the expected set. This is the set-level property only; row-level validity
-/// (empty owners, coverage gaps, encoding alignment) remains [`validate_placement`]'s job.
+/// (encoding alignment of a split) is the sharding pass's job.
 /// Constructed solely by [`validate_placement_set`], so an owner set that is duplicated, missing
 /// or unexpected cannot be represented once validated.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -232,8 +125,6 @@ fn row_owner(row: &PlacementRow) -> OwnerId {
 /// is redundant, not an error. Report order is unexpected (lowest row index), then duplicate
 /// (first duplicated owner in row order), then missing (first gap in `expected` order).
 ///
-/// Row-level validity is still checked separately by [`validate_placement`]; this function does
-/// not subsume it.
 pub fn validate_placement_set(
     rows: &[PlacementRow],
     expected: &[OwnerId],
@@ -273,6 +164,38 @@ pub fn validate_placement_set(
     Ok(PlacementSet {
         rows: rows.to_vec(),
     })
+}
+
+/// [`validate_placement_set`], then the stage rule: every device an owner's placement reaches runs a
+/// stage that reads that owner.
+///
+/// `readers[owner]` is the `(stage, device)` of every stage that reads `owner`; an owner no stage reads
+/// has no entry, so any device it is placed on is off stage.
+pub fn validate_stage_placement(
+    rows: &[PlacementRow],
+    expected: &[OwnerId],
+    readers: &HashMap<OwnerId, Vec<(usize, DeviceId)>>,
+) -> Result<PlacementSet, PlacementError> {
+    let set = validate_placement_set(rows, expected)?;
+    for row in set.rows() {
+        let owner = row_owner(row);
+        let stages = readers.get(&owner).map(Vec::as_slice).unwrap_or_default();
+        let mut devices: Vec<DeviceId> = placement_device_bytes(row).into_keys().collect();
+        devices.sort();
+        for device in devices {
+            if !stages
+                .iter()
+                .any(|&(_, stage_device)| stage_device == device)
+            {
+                return Err(PlacementError::OffStage {
+                    owner,
+                    device,
+                    stage: stages.first().map_or(0, |&(stage, _)| stage),
+                });
+            }
+        }
+    }
+    Ok(set)
 }
 
 /// Per-device byte contribution of one placement row (FR-002/FR-007): the only place device accounting

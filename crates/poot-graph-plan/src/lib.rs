@@ -56,8 +56,8 @@ pub mod dtype_widen;
 
 /// Card 360: packed multi-device topology and communication planner (planner half only - see
 /// `specs/360-packed-multi-device-topology-capture/spec.md`). Model-neutral device topology, placement,
-/// communication, accounting, and replay-contract identity, proved against a model-free virtual topology
-/// and a fake runtime. Card 408 owns the device-resident captured executor.
+/// communication and accounting, proved against a model-free virtual topology. The captured coordinator in
+/// `poot-executor` runs the rows `compile_staged` plans from it.
 pub mod multi_device;
 
 /// Pure Card 356 contracts for table-driven block-float planning. Kernel import, graph recognition, and
@@ -141,8 +141,9 @@ pub use compile::*;
 pub use graph_validation::*;
 pub(crate) use kernel_mapping::*;
 pub use passes::{
-    BoundaryDescriptor, ExpertStackRefusal, PackedBindError, PackedConst, PackedLayout,
-    StageSplitError, WeightFormats, WeightFormatsError, bind_packed_weights,
+    BoundaryDescriptor, ExpertStackRefusal, PackedBindError, PackedConst, PackedLayout, PoolError,
+    PoolSite, PoolSpec, PooledWeight, ShardError, ShardRule, ShardedGraph, StageSplitError,
+    WeightFormats, WeightFormatsError, bind_packed_weights, routed_step_demand, shard,
 };
 // `poot-llm`'s CPU oracle (`core/cpu_oracle.rs`) claims a traced graph's packed contractions/row
 // gathers the same way `compile` does, so its eval matches what the device plans - a real production

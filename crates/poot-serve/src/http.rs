@@ -22,7 +22,7 @@ use crate::types::Served;
 /// Per-key request-rate limiter (card 058). Fixed 60-second window per key: the first request starts the
 /// window, later ones increment until `rpm` is reached, then the window rejects until it rolls over.
 /// Model endpoints (`/v1/completions`, `/v1/chat/completions`, `/v1/embeddings`, `/v1/rerank`) are limited;
-/// `/health` and `/metrics` are not. `rpm = 0` (`POOT_RATE_LIMIT_RPM` unset or 0, the default) disables it.
+/// `/health` and `/metrics` are not. `rpm = 0` (`--rate-limit-rpm` unset or 0, the default) disables it.
 ///
 /// The key is the client's peer IP, not the `Authorization` value. Inference has no auth layer (only LoRA
 /// administration reads that header), so keying on it would let a client reset its budget by varying the
@@ -37,11 +37,8 @@ pub(crate) struct RateLimiter {
 const STALE_WINDOW_AGE: Duration = Duration::from_secs(300);
 
 impl RateLimiter {
-    pub(crate) fn from_env() -> Self {
-        let rpm = std::env::var("POOT_RATE_LIMIT_RPM")
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0);
+    /// A limiter of `rpm` requests per minute per client; `0` disables it.
+    pub(crate) fn new(rpm: usize) -> Self {
         Self {
             rpm,
             windows: Mutex::new(HashMap::new()),
@@ -75,18 +72,6 @@ impl RateLimiter {
     }
 }
 
-/// Max simultaneous connection-handler threads. The accept loop spawns one OS thread per connection, so
-/// many idle connections could exhaust thread/memory limits before the rate limiter or size caps run.
-/// `POOT_MAX_CONNECTIONS=0` means unlimited; unset defaults to 4096.
-pub(crate) fn max_connections() -> usize {
-    max_connections_from(std::env::var("POOT_MAX_CONNECTIONS").ok().as_deref())
-}
-
-/// Pure core of [`max_connections`]. An unparseable value falls back to 4096; `0` disables the cap.
-pub(crate) fn max_connections_from(raw: Option<&str>) -> usize {
-    raw.and_then(|s| s.trim().parse().ok()).unwrap_or(4096)
-}
-
 /// RAII decrement for the live-connection counter. Uses `Drop` so the count still falls if `handle`
 /// panics; otherwise the cap would eventually wedge shut.
 pub(crate) struct ConnGuard(pub(crate) Arc<AtomicUsize>);
@@ -108,74 +93,6 @@ pub(crate) const MAX_HEADER_BYTES: usize = 64 * 1024;
 /// True when the declared `Content-Length` fits within [`MAX_BODY_BYTES`].
 pub(crate) fn body_len_ok(content_length: usize) -> bool {
     content_length <= MAX_BODY_BYTES
-}
-
-/// Idle read timeout for the request head and body (slowloris bound); a stalled client would otherwise
-/// pin a `poot-conn` thread forever. It never cuts an active generation, since streaming responses are
-/// writes. `POOT_READ_TIMEOUT_SECS=0` disables it; default 30s.
-pub(crate) fn request_read_timeout() -> Option<Duration> {
-    request_read_timeout_from(std::env::var("POOT_READ_TIMEOUT_SECS").ok().as_deref())
-}
-
-/// Pure core of [`request_read_timeout`]. An unparseable value falls back to 30s; `0` disables it.
-pub(crate) fn request_read_timeout_from(raw: Option<&str>) -> Option<Duration> {
-    let secs = raw.and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(30);
-    (secs > 0).then(|| Duration::from_secs(secs))
-}
-
-/// A rejected explicit `POOT_WRITE_TIMEOUT_SECS` value. Variants are distinct so malformed
-/// configuration is never silently replaced by the default.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub(crate) enum ResponseWriteTimeoutError {
-    #[error("POOT_WRITE_TIMEOUT_SECS must be valid Unicode, got {value:?}")]
-    NotUnicode { value: std::ffi::OsString },
-    #[error("POOT_WRITE_TIMEOUT_SECS must be greater than zero, got 0")]
-    Zero,
-    #[error("POOT_WRITE_TIMEOUT_SECS must be a positive whole number of seconds, got {value:?}")]
-    Negative { value: String },
-    #[error("POOT_WRITE_TIMEOUT_SECS must be a positive whole number of seconds, got {value:?}")]
-    Malformed { value: String },
-    #[error("POOT_WRITE_TIMEOUT_SECS is too large to represent as seconds, got {value:?}")]
-    Overflow { value: String },
-}
-
-/// Idle write timeout for every response write, so one blocked socket write cannot hold a handler
-/// indefinitely. Missing selects 30 seconds; an explicit value must be a positive `u64`.
-pub(crate) fn response_write_timeout() -> std::result::Result<Duration, ResponseWriteTimeoutError> {
-    match std::env::var("POOT_WRITE_TIMEOUT_SECS") {
-        Ok(raw) => response_write_timeout_from(Some(&raw)),
-        Err(std::env::VarError::NotPresent) => response_write_timeout_from(None),
-        Err(std::env::VarError::NotUnicode(value)) => {
-            Err(ResponseWriteTimeoutError::NotUnicode { value })
-        }
-    }
-}
-
-/// Pure core of [`response_write_timeout`].
-pub(crate) fn response_write_timeout_from(
-    raw: Option<&str>,
-) -> std::result::Result<Duration, ResponseWriteTimeoutError> {
-    let Some(raw) = raw else {
-        return Ok(Duration::from_secs(30));
-    };
-    let value = raw.trim();
-    if value.starts_with('-') {
-        return Err(ResponseWriteTimeoutError::Negative {
-            value: raw.to_string(),
-        });
-    }
-    let secs = value.parse::<u64>().map_err(|error| match error.kind() {
-        std::num::IntErrorKind::PosOverflow => ResponseWriteTimeoutError::Overflow {
-            value: raw.to_string(),
-        },
-        _ => ResponseWriteTimeoutError::Malformed {
-            value: raw.to_string(),
-        },
-    })?;
-    if secs == 0 {
-        return Err(ResponseWriteTimeoutError::Zero);
-    }
-    Ok(Duration::from_secs(secs))
 }
 
 /// Configure the accepted socket before a handler owns it. Callers must close the socket if this fails,

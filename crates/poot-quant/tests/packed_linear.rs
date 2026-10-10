@@ -1,12 +1,13 @@
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 
 use poot_quant::decode::DecodeError;
 use poot_quant::format::{GroupMap, OperandRole, ScaleEncoding, Storage, WeightFormat};
-use poot_quant::{LogicalAxis, PackedPayload, PackedWeight, PackedWeightError, SourceRole};
+use poot_quant::{
+    LogicalAxis, PackedPayload, PackedWeight, PackedWeightError, SourceRole, StoredBytes,
+};
 
-fn owner(bytes: &[u8]) -> Arc<[u8]> {
-    Arc::from(bytes)
+fn owner(bytes: &[u8]) -> StoredBytes {
+    StoredBytes::from(bytes.to_vec())
 }
 
 /// Logical value `[row, column]` of `payload`, read through [`PackedPayload::decode_row`].
@@ -279,7 +280,7 @@ fn packed_payload_try_new_rejects_a_missing_or_unexpected_source() {
     let scale_bytes = owner(&[0x00, 0x00, 0x80, 0x3f]);
 
     assert_eq!(
-        PackedPayload::try_new(weight, [(CODES, Arc::clone(&weight_bytes))]).unwrap_err(),
+        PackedPayload::try_new(weight, [(CODES, weight_bytes.clone())]).unwrap_err(),
         PackedWeightError::MissingSource {
             format: weight.format(),
             role: SCALE,
@@ -289,9 +290,9 @@ fn packed_payload_try_new_rejects_a_missing_or_unexpected_source() {
         PackedPayload::try_new(
             weight,
             [
-                (CODES, Arc::clone(&weight_bytes)),
-                (SCALE, Arc::clone(&scale_bytes)),
-                (SourceRole::Blocks, Arc::clone(&weight_bytes)),
+                (CODES, weight_bytes.clone()),
+                (SCALE, scale_bytes.clone()),
+                (SourceRole::Blocks, weight_bytes.clone()),
             ],
         )
         .unwrap_err(),
@@ -315,11 +316,8 @@ fn packed_payload_try_new_rejects_wrong_length_or_invalid_content() {
     let valid_f32_scale = owner(&[0x00, 0x00, 0x80, 0x3f]);
 
     assert_eq!(
-        PackedPayload::try_new(
-            one,
-            [(CODES, owner(&[])), (SCALE, Arc::clone(&valid_f32_scale))]
-        )
-        .unwrap_err(),
+        PackedPayload::try_new(one, [(CODES, owner(&[])), (SCALE, valid_f32_scale.clone())])
+            .unwrap_err(),
         PackedWeightError::SourceLengthMismatch {
             format: one.format(),
             role: CODES,
@@ -331,7 +329,7 @@ fn packed_payload_try_new_rejects_wrong_length_or_invalid_content() {
         PackedPayload::try_new(
             one,
             [
-                (CODES, Arc::clone(&valid_weight)),
+                (CODES, valid_weight.clone()),
                 (SCALE, owner(&[0x00, 0x00, 0x80])),
             ],
         )
@@ -357,7 +355,7 @@ fn packed_payload_try_new_rejects_wrong_length_or_invalid_content() {
                 two_weights,
                 [
                     (CODES, owner(&[0x38, nan_byte])),
-                    (SCALE, Arc::clone(&valid_f32_scale)),
+                    (SCALE, valid_f32_scale.clone()),
                 ],
             )
             .unwrap_err(),
@@ -379,17 +377,14 @@ fn packed_payload_try_new_rejects_wrong_length_or_invalid_content() {
     .unwrap();
     PackedPayload::try_new(
         bf16,
-        [
-            (CODES, Arc::clone(&valid_weight)),
-            (SCALE, owner(&[0x80, 0x3f])),
-        ],
+        [(CODES, valid_weight.clone()), (SCALE, owner(&[0x80, 0x3f]))],
     )
     .unwrap();
     // Zero and negative are legitimate scales (finiteness only, not positivity).
     for valid in [[0x00, 0x00], [0x80, 0xbf]] {
         PackedPayload::try_new(
             bf16,
-            [(CODES, Arc::clone(&valid_weight)), (SCALE, owner(&valid))],
+            [(CODES, valid_weight.clone()), (SCALE, owner(&valid))],
         )
         .unwrap();
     }
@@ -397,7 +392,7 @@ fn packed_payload_try_new_rejects_wrong_length_or_invalid_content() {
         assert_eq!(
             PackedPayload::try_new(
                 bf16,
-                [(CODES, Arc::clone(&valid_weight)), (SCALE, owner(&invalid))],
+                [(CODES, valid_weight.clone()), (SCALE, owner(&invalid))],
             )
             .unwrap_err(),
             PackedWeightError::NonFiniteField {
@@ -442,7 +437,7 @@ fn packed_payload_try_new_rejects_wrong_length_or_invalid_content() {
         PackedPayload::try_new(
             adjacent,
             [
-                (CODES, Arc::from(nonzero_padding)),
+                (CODES, StoredBytes::from(nonzero_padding)),
                 (SCALE, owner(&[0, 0, 0, 0])),
             ],
         )
@@ -496,22 +491,17 @@ fn e4m3_f32_payload_is_authoritative_shared_and_source_ordered() {
     weight_source[130] = 0x42;
     weight_source[16_640] = 0x01;
     weight_source[16_769] = 0xb8;
-    let weight_owner: Arc<[u8]> = Arc::from(weight_source);
+    let weight_owner: StoredBytes = StoredBytes::from(weight_source);
     let scale_owner = owner(&[
         0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x80, 0x40, 0x00, 0x00, 0x00,
         0x41,
     ]);
-    let weight_pointer = weight_owner.as_ptr();
-    let scale_pointer = scale_owner.as_ptr();
-    let weight_weak = Arc::downgrade(&weight_owner);
-    let scale_weak = Arc::downgrade(&scale_owner);
+    let weight_pointer = weight_owner.as_slice().as_ptr();
+    let scale_pointer = scale_owner.as_slice().as_ptr();
 
     let payload = PackedPayload::try_new(
         weight,
-        [
-            (CODES, Arc::clone(&weight_owner)),
-            (SCALE, Arc::clone(&scale_owner)),
-        ],
+        [(CODES, weight_owner.clone()), (SCALE, scale_owner.clone())],
     )
     .unwrap();
     assert_eq!(payload.weight(), weight);
@@ -535,16 +525,12 @@ fn e4m3_f32_payload_is_authoritative_shared_and_source_ordered() {
     assert_eq!(cloned, payload);
     assert_eq!(cloned.bytes(CODES).as_ptr(), weight_pointer);
     assert_eq!(cloned.bytes(SCALE).as_ptr(), scale_pointer);
+    // The payload keeps the bytes alive on its own: dropping the caller's owners changes nothing.
     drop(weight_owner);
     drop(scale_owner);
-    assert!(weight_weak.upgrade().is_some());
-    assert!(scale_weak.upgrade().is_some());
     drop(payload);
-    assert!(weight_weak.upgrade().is_some());
-    assert!(scale_weak.upgrade().is_some());
-    drop(cloned);
-    assert!(weight_weak.upgrade().is_none());
-    assert!(scale_weak.upgrade().is_none());
+    assert_eq!(cloned.bytes(CODES).as_ptr(), weight_pointer);
+    assert_eq!(cloned.bytes(CODES)[16_769], 0xb8);
 }
 
 #[test]
@@ -567,7 +553,7 @@ fn coordinate_mapping_uses_handwritten_row_and_scale_sentinels() {
     let payload = PackedPayload::try_new(
         weight,
         [
-            (CODES, Arc::from(weight_source)),
+            (CODES, StoredBytes::from(weight_source)),
             (
                 SCALE,
                 owner(&[
@@ -615,7 +601,7 @@ fn adjacent_e2m1_ragged_padding_and_nibble_mapping_are_exact() {
     let payload = PackedPayload::try_new(
         weight,
         [
-            (CODES, Arc::from(accepted_weight_source.clone())),
+            (CODES, StoredBytes::from(accepted_weight_source.clone())),
             (SCALE, owner(&scale_source)),
         ],
     )
@@ -647,7 +633,7 @@ fn adjacent_e2m1_ragged_padding_and_nibble_mapping_are_exact() {
         PackedPayload::try_new(
             weight,
             [
-                (CODES, Arc::from(rejected_weight_source.clone())),
+                (CODES, StoredBytes::from(rejected_weight_source.clone())),
                 (SCALE, owner(&scale_source)),
             ],
         )
@@ -662,7 +648,7 @@ fn adjacent_e2m1_ragged_padding_and_nibble_mapping_are_exact() {
     PackedPayload::try_new(
         weight,
         [
-            (CODES, Arc::from(rejected_weight_source.clone())),
+            (CODES, StoredBytes::from(rejected_weight_source.clone())),
             (SCALE, owner(&scale_source)),
         ],
     )
@@ -673,7 +659,7 @@ fn adjacent_e2m1_ragged_padding_and_nibble_mapping_are_exact() {
         PackedPayload::try_new(
             weight,
             [
-                (CODES, Arc::from(rejected_weight_source)),
+                (CODES, StoredBytes::from(rejected_weight_source)),
                 (SCALE, owner(&scale_source)),
             ],
         )

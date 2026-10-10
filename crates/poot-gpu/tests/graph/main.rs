@@ -18,6 +18,7 @@ mod prefill_qwen3next;
 mod ssm_linear_attn;
 mod tiled_dequant;
 
+use poot_quant::StoredBytes;
 use poot_tensor::DType;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -170,7 +171,7 @@ fn add_resident_entry(
         let dense = poot_quant::weights::DenseWeight::try_new(
             DType::F32,
             t.shape().to_vec(),
-            Arc::from(bytes),
+            StoredBytes::from(bytes),
         )
         .unwrap();
         builder
@@ -246,7 +247,7 @@ fn build_rope_decomposition(
     } else {
         rotated
     };
-    let (xi, ci, si) = (x.id, cos.id, sin.id);
+    let (xi, ci, si) = (x.id(), cos.id(), sin.id());
     (b.finish(out), xi, ci, si)
 }
 
@@ -388,7 +389,16 @@ fn check_gdn_prefill_chunked_gpu(
         let s_in = b.constant("s_in", TensorType::f32(vec![1, h_v, d, d]));
         let ti = b.constant("tril_incl", TensorType::f32(vec![1, 1, c, c]));
         let ts = b.constant("tril_strict", TensorType::f32(vec![1, 1, c, c]));
-        let ids = [q.id, k.id, v.id, gate.id, beta.id, s_in.id, ti.id, ts.id];
+        let ids = [
+            q.id(),
+            k.id(),
+            v.id(),
+            gate.id(),
+            beta.id(),
+            s_in.id(),
+            ti.id(),
+            ts.id(),
+        ];
         let (o, s_out) = gdn_prefill_chunked(&b, q, k, v, gate, beta, s_in, ti, ts, c);
         let graph = b.finish(if pick == 0 { o } else { s_out });
 
@@ -491,7 +501,6 @@ fn plan_eqn_with_choice(
         g,
         eqn,
         backend,
-        1,
         &std::collections::HashMap::new(),
         caps,
         &poot_test_util::graph_fixtures::roomy_body_limits(),

@@ -460,6 +460,7 @@ mod tests {
     use crate::chat::ChatFormat;
     use crate::model::{ModelConfig, ModelOutput, Phase, StepShape, TraceError};
     use poot_graph_ir::{Graph, ValidationOutputs};
+    use poot_quant::StoredBytes;
     use poot_quant::weights::WeightMap;
     use std::num::NonZeroUsize;
 
@@ -630,14 +631,15 @@ mod tests {
             1,
             "a refused entry leaves no trace"
         );
-        let gguf = poot_load::gguf::GgufIndex::from_bytes(&poot_load::gguf::write_gguf(
-            &[(
-                "general.architecture",
-                poot_load::gguf::GgufValue::Str("beta".into()),
-            )],
-            &[],
-        ))
-        .unwrap();
+        let gguf =
+            poot_load::gguf::GgufIndex::parse(&StoredBytes::from(poot_load::gguf::write_gguf(
+                &[(
+                    "general.architecture",
+                    poot_load::gguf::GgufValue::Str("beta".into()),
+                )],
+                &[],
+            )))
+            .unwrap();
         assert!(matches!(
             registry.resolve(&RawConfig::Gguf(&gguf)),
             Err(RegistryError::Unregistered { .. })
@@ -723,13 +725,13 @@ mod tests {
     #[test]
     fn gguf_eos_is_the_tokenizer_eos_id() {
         use poot_load::gguf::{GgufValue, write_gguf};
-        let gguf = GgufIndex::from_bytes(&write_gguf(
+        let gguf = GgufIndex::parse(&StoredBytes::from(write_gguf(
             &[
                 ("general.architecture", GgufValue::Str("qwen2".into())),
                 ("tokenizer.ggml.eos_token_id", GgufValue::U32(151645)),
             ],
             &[],
-        ))
+        )))
         .unwrap();
         let raw = RawConfig::Gguf(&gguf);
         assert_eq!(raw.family_key(), Ok("qwen2"));

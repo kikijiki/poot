@@ -62,7 +62,7 @@ fn fused_pointwise_chain_is_bit_identical_to_unfused() {
     let t2 = b.unary(UnOp::Exp, t1);
     let t3 = b.binary(BinOp::Mul, t2, c);
     let out = b.binary(BinOp::Add, t3, a);
-    let (ai, bi, ci) = (a.id, bb.id, c.id);
+    let (ai, bi, ci) = (a.id(), bb.id(), c.id());
     let g = b.finish(out);
 
     let fg = fuse(&g);
@@ -107,7 +107,7 @@ fn fused_equals_unfused_over_random_pointwise_graphs() {
         let inputs_t: Vec<_> = (0..3)
             .map(|i| b.constant(&format!("x{i}"), TensorType::f32(shape.clone())))
             .collect();
-        let leaf_ids: Vec<ValueId> = inputs_t.iter().map(|t| t.id).collect();
+        let leaf_ids: Vec<ValueId> = inputs_t.iter().map(|t| t.id()).collect();
         // `acc` is the running output (a deep dependent chain, so fusable); `pool` holds reused
         // intermediates (shared subexpressions, multi-use).
         let mut pool = inputs_t.clone();
@@ -260,7 +260,7 @@ fn fused_equals_unfused_over_random_reduction_graphs() {
         let mut inputs = HashMap::new();
         for (i, t) in full.iter().enumerate() {
             inputs.insert(
-                t.id,
+                t.id(),
                 Value::from(HostTensor::f32(
                     shape.clone(),
                     fill(numel, seed * 13 + i as u64 + 1),
@@ -268,7 +268,7 @@ fn fused_equals_unfused_over_random_reduction_graphs() {
             );
         }
         inputs.insert(
-            bcast.id,
+            bcast.id(),
             Value::from(HostTensor::f32(
                 bshape.clone(),
                 fill(bnumel, seed * 13 + 101),
@@ -321,7 +321,7 @@ fn rope_graph_and_inputs(d: usize, rot: usize) -> (poot_graph_ir::Graph, HashMap
     let sin = b.constant("sin", TensorType::f32(vec![max_pos, rot]));
     let pos = b.slot(Slot::Pos, TensorType::scalar(DType::I32));
     let out = rope(&b, x, cos, sin, pos);
-    let (xi, ci, si, pi) = (x.id, cos.id, sin.id, pos.id);
+    let (xi, ci, si, pi) = (x.id(), cos.id(), sin.id(), pos.id());
     let g = b.finish(out);
     let mut inputs = HashMap::new();
     inputs.insert(

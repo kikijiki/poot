@@ -52,3 +52,11 @@ store-success-output = true
 [profile.device-ptx.junit]
 path = "results.xml"
 store-success-output = true
+
+[profile.device-ptx-2gpu.junit]
+path = "results.xml"
+store-success-output = true
+
+[profile.device-ptx-4gpu.junit]
+path = "results.xml"
+store-success-output = true

@@ -4,7 +4,7 @@
 //! an aborted transaction can never be reused (`Poisoned`).
 
 use poot_graph_ir::{BoundaryId, SlotKey, ValidationPacketError, ValueId};
-use poot_graph_plan::{DeviceId, PlanKind, StageId, Target};
+use poot_graph_plan::{DeviceId, StageId, SyncId, Target};
 use poot_target::BufferStorage;
 use poot_tensor::DType;
 
@@ -35,6 +35,16 @@ pub enum ExecError {
     /// can run on it, and resetting an executable cannot clear this (core review CR30).
     #[error("the device is poisoned and cannot accept further work")]
     Poisoned,
+    /// The host that served a sync point refused it (an expert id outside the table, a pool too
+    /// small for the step). The step did not complete: the executable needs a reset.
+    #[error("host sync refused: {0}")]
+    Host(Box<dyn std::error::Error + Send + Sync>),
+    /// A step reached a sync point and the host handed in [`crate::NoSync`].
+    #[error("sync point {point:?} needs a host: the step was run with NoSync")]
+    NoHostSync { point: poot_graph_plan::SyncId },
+    /// A coordinator refused a multi-device program or device before any device work.
+    #[error(transparent)]
+    Coordinator(Box<crate::CoordinatorError>),
     /// A stage of the program was compiled for a device this engine does not drive.
     #[error("stage {stage:?} is placed on {program:?}; this engine drives {engine:?}")]
     Placement {
@@ -70,6 +80,10 @@ impl From<DeviceError> for ExecError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
+    /// A checkpoint file mapped under the executable's weight store changed after it was loaded
+    /// (ADR-0103 amendment: the identity check at each bind batch). Nothing was uploaded from it.
+    #[error(transparent)]
+    SourceChanged(#[from] poot_quant::SourceChanged),
     #[error("program was compiled for {program:?}, the device is {device:?}")]
     TargetMismatch {
         program: Box<Target>,
@@ -77,11 +91,11 @@ pub enum LoadError {
     },
     /// A graph const its executable's weight map binds no weight to: a name that is no mapped
     /// `WeightId::const_name` (even when a store key equals it).
-    #[error("const v{value} ({name}) is bound to no weight")]
+    #[error("const {value} ({name}) is bound to no weight")]
     Unbound { value: ValueId, name: String },
-    #[error("const v{value} has no name to bind by")]
+    #[error("const {value} has no name to bind by")]
     UnnamedConst { value: ValueId },
-    #[error("slot v{value} has no structured slot key")]
+    #[error("slot {value} has no structured slot key")]
     UnkeyedSlot { value: ValueId },
     #[error("weight {name}: stored {stored} cannot load as planned {planned}")]
     WeightFormat {
@@ -99,17 +113,6 @@ pub enum LoadError {
         index: usize,
         bits: u16,
     },
-    /// POOT-1066: a packed weight's encoded upload is not the word count the planned sizing computed from its
-    /// stored length. The buffer was sized by one and would be written with the other, so the upload is
-    /// refused rather than overrun.
-    #[error(
-        "weight {name}: sized {sized_words} words from its stored length but encoded {encoded_words}"
-    )]
-    WeightSizing {
-        name: String,
-        sized_words: usize,
-        encoded_words: usize,
-    },
     /// Card 1008: a tracer declares the dtype its loader stores; a stored and declared dtype that differ are
     /// refused at load, never converted on upload.
     #[error("weight {name}: stored as {stored} but the graph declares {declared}")]
@@ -126,10 +129,11 @@ pub enum LoadError {
     },
     /// Card 546a's contract binds a packed store entry by (store key, `SourceRole`); naming for an
     /// arbitrary role mapping is Card 642's. A packed entry with no such binding yet is refused by name.
-    #[error("const v{value} ({name}): packed weight has no bound role")]
+    #[error("const {value} ({name}): packed weight has no bound role")]
     UnboundPackedRole { value: ValueId, name: String },
-    #[error("eqn {eqn} planned as {kind:?}, which no device loads")]
-    UnloadablePlan { eqn: usize, kind: PlanKind },
+    /// A tensor-parallel rank's share of a weight could not be cut from the executable's map.
+    #[error("rank weights: {0}")]
+    RankWeights(#[from] poot_quant::weights::WeightMapError),
     #[error("kernel {key}: {source}")]
     Codegen {
         key: String,
@@ -150,11 +154,26 @@ pub enum LoadError {
     BoundaryUnresolved { id: BoundaryId, stage: StageId },
     /// An exported value is a view of carried state read before the stage's commit: a later stage
     /// would see the committed value, not the one the uncut graph reads.
-    #[error("boundary {id:?} is a view of carried-state input v{state}, which the stage commits")]
+    #[error("boundary {id:?} is a view of carried-state input {state}, which the stage commits")]
     BoundaryAliasesState { id: BoundaryId, state: ValueId },
     /// An export names a value no equation of its stage produced.
     #[error("boundary {id:?} names a value its stage never materializes")]
     ExportUnmaterialized { id: BoundaryId },
+    /// A pooled slot or map no sync point of the program declares, or one no stage reads: the
+    /// engine could not say which stored table it pages or in which lane.
+    #[error("pool slot {key} is declared by no sync point of the program, or read by no stage")]
+    PoolUndeclared { key: SlotKey },
+    /// A sync point reads a value the engine cannot hand a host as F32.
+    #[error("sync point {point:?} reads boundary {id:?}, which is not a plain F32 value")]
+    SyncReadLane { point: SyncId, id: BoundaryId },
+    /// A pooled table whose experts do not fall on whole device words of its lane cannot be refilled
+    /// one row at a time.
+    #[error("pooled table {name}: {experts} experts do not fill whole device words of {planned:?}")]
+    PoolRowAlignment {
+        name: String,
+        experts: usize,
+        planned: BufferStorage,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -209,6 +228,28 @@ pub enum BindError {
     TokenEmbedEncode {
         name: String,
         planned: poot_target::BufferStorage,
+    },
+    /// A sync wrote pool rows outside the table's pool (`first_row + len > pool_rows`).
+    #[error("pooled table {table}: rows {first_row}..{end} are outside its {pool_rows} pool rows")]
+    RowRange {
+        table: String,
+        first_row: usize,
+        end: usize,
+        pool_rows: usize,
+    },
+    /// A sync named an expert the table does not hold, or a table the site does not have.
+    #[error("pooled table {table}: expert {expert} is not one of its {experts}")]
+    ExpertRange {
+        table: String,
+        expert: usize,
+        experts: usize,
+    },
+    /// A sync's map is not `[E]`.
+    #[error("pool map {key}: {got} entries for {experts} experts")]
+    MapLength {
+        key: SlotKey,
+        got: usize,
+        experts: usize,
     },
     #[error("state {name}: existing {expected:?}, entry declares {got:?}")]
     StateSchema {

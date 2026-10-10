@@ -12,10 +12,11 @@ use super::buffer::{PtxBuffer, allocate_owned, checked_copy};
 use super::driver::{CudaDriver, DriverCleanup};
 use super::error::{BufferStorage, PtxError};
 use super::graph::{
-    CaptureRetention, ModuleConstruction, PtxGraphExec, PtxSpan, create_event_pair,
-    instantiate_graph,
+    CaptureRetention, ModuleConstruction, PtxEvent, PtxGraphExec, PtxSpan, PtxSyncEvent,
+    create_event_pair, instantiate_graph,
 };
-use super::owner::{PtxOwner, construct_owner};
+use super::owner::{NativeCounters, OwnerCounters, PtxOwner, construct_owner};
+use super::upload::UploadRing;
 
 /// A CUDA context + stream, reusable across dispatches. Caches loaded modules/functions by kernel text.
 pub struct PtxContext {
@@ -32,6 +33,11 @@ pub struct PtxContext {
     /// with one CUDA event pair instead of skipping timing (a plain [`PtxGraphExec::launch`] with no
     /// event overhead).
     pub(crate) device_timing: bool,
+    /// The pinned staging ring device writes go through ([`PtxContext::write_with`]).
+    pub(crate) upload: RefCell<UploadRing>,
+    /// The contexts this one has enabled direct peer access to ([`PtxContext::enable_peer_access`]): a
+    /// captured copy reaches only these, never one that lazily negotiates access mid-capture.
+    pub(crate) peers: RefCell<Vec<sys::CUcontext>>,
 }
 
 // SAFETY: `owner` is already `Send + Sync` (see its doc). `funcs` caches `CUfunction` handles -
@@ -133,15 +139,31 @@ fn caps_from_attributes(total_memory: u64, attrs: &CudaAttributes) -> poot_targe
 impl PtxContext {
     /// Initialise CUDA, retain device 0's primary context, set it current, create a non-blocking stream.
     pub fn new() -> Result<Self, PtxError> {
-        Self::build_ordinal(0).map_err(require_gpu_check)
+        Self::open(0)
     }
 
     /// Like [`PtxContext::new`], but [`PtxContext::launch_timed`] brackets every graph replay with one
     /// CUDA event pair (Card 552 SC-006): the executor contract's device-span timing.
     pub fn new_with_device_timing() -> Result<Self, PtxError> {
-        let mut ctx = Self::build_ordinal(0).map_err(require_gpu_check)?;
+        let mut ctx = Self::open(0)?;
         ctx.device_timing = true;
         Ok(ctx)
+    }
+
+    /// A context on GPU `ordinal`. Several contexts, on several devices, may live on one host thread: each
+    /// call into a context makes its own primary context current first, so none relies on the
+    /// constructing thread's current-context state.
+    pub fn open(ordinal: usize) -> Result<Self, PtxError> {
+        Self::build_ordinal(ordinal).map_err(require_gpu_check)
+    }
+
+    /// Make this context's primary context current on the calling thread. Every driver-touching method
+    /// starts here, so a thread that drives several contexts never issues a call into the wrong one.
+    fn bind(&self) -> Result<(), PtxError> {
+        // SAFETY: `owner.ctx` is the primary context this context retained; it stays alive while `owner`
+        // does.
+        unsafe { result::ctx::set_current(self.owner.ctx) }?;
+        Ok(())
     }
 
     fn build_ordinal(ordinal: usize) -> Result<Self, PtxError> {
@@ -174,11 +196,13 @@ impl PtxContext {
         // returns this stored `Copy` instead of re-querying the driver.
         let device_caps = measure_device_caps(device)?;
         Ok(PtxContext {
+            upload: RefCell::new(UploadRing::new(Arc::clone(&owner))),
             owner,
             funcs: RefCell::new(HashMap::new()),
             capture: CaptureRetention::default(),
             device_caps,
             device_timing: false,
+            peers: RefCell::new(Vec::new()),
         })
     }
 
@@ -206,6 +230,7 @@ impl PtxContext {
     /// reading a result).
     pub fn synchronize(&self) -> Result<(), PtxError> {
         self.refuse_during_capture("synchronize")?;
+        self.bind()?;
         // SAFETY: `owner.stream` is this context's live stream, destroyed only when `owner` drops.
         unsafe { result::stream::synchronize(self.owner.stream) }?;
         Ok(())
@@ -308,6 +333,7 @@ impl PtxContext {
         storage: BufferStorage,
         role: BufferRole,
     ) -> Result<PtxBuffer, PtxError> {
+        self.bind()?;
         allocate_owned(
             Arc::clone(&self.owner),
             op,
@@ -338,6 +364,7 @@ impl PtxContext {
         storage: BufferStorage,
         role: BufferRole,
     ) -> Result<PtxBuffer, PtxError> {
+        self.bind()?;
         allocate_owned(
             Arc::clone(&self.owner),
             op,
@@ -356,6 +383,7 @@ impl PtxContext {
 
     /// (free, total) device memory in bytes (`cuMemGetInfo`), used to receipt the bf16 VRAM win (spec 024).
     pub fn mem_info(&self) -> Result<(usize, usize), PtxError> {
+        self.bind()?;
         Ok(result::mem_get_info()?)
     }
 
@@ -406,6 +434,7 @@ impl PtxContext {
         data: &[T],
         whole: bool,
     ) -> Result<(), PtxError> {
+        self.bind()?;
         checked_copy(buf, op, storage, elem_offset, data.len(), whole, |range| {
             assert_eq!(
                 std::mem::size_of_val(data),
@@ -454,6 +483,7 @@ impl PtxContext {
     /// illegal during capture, and a recorded host copy would read caller memory at every replay. See G3c.
     pub fn begin_capture(&self) -> Result<(), PtxError> {
         self.refuse_during_capture("begin_capture")?;
+        self.bind()?;
         // SAFETY: `stream` is this context's live stream (owned by `owner`), and thread-local mode confines the
         // capture to this thread.
         unsafe {
@@ -470,6 +500,7 @@ impl PtxContext {
     /// buffers the capture dispatched. On an instantiate failure the recorded `graph` (a bare driver handle not
     /// yet wrapped in [`PtxGraphExec`]'s `Drop`) is destroyed before returning the error, or it would leak.
     pub fn end_capture(&self) -> Result<PtxGraphExec, PtxError> {
+        self.bind()?;
         let captured = self.capture.finish();
         // SAFETY: `stream` is this context's live stream; ending a capture takes no host memory.
         let graph = unsafe { result::stream::end_capture(self.owner.stream) }?;
@@ -487,6 +518,7 @@ impl PtxContext {
     /// measurement). Does not sync; the caller reads [`PtxContext::span_elapsed`] only after its own
     /// sync has proven the replay complete.
     pub fn launch_timed(&self, exec: &PtxGraphExec) -> Result<Option<PtxSpan>, PtxError> {
+        self.bind()?;
         if !self.device_timing {
             exec.launch()?;
             return Ok(None);
@@ -511,6 +543,7 @@ impl PtxContext {
         let (Some(first), Some(last)) = (spans.first(), spans.last()) else {
             return Ok(None);
         };
+        self.bind()?;
         // SAFETY: both events are live and were recorded on this context's stream; the caller is
         // responsible for having synchronized first (documented above).
         let ms = unsafe { result::event::elapsed(first.start.event, last.stop.event) }?;
@@ -542,6 +575,152 @@ impl PtxContext {
         drop(captured);
     }
 
+    /// The native resources this context has created and the graph launches it has issued so far. A warm
+    /// replay changes none of the creation counts.
+    pub fn native_counters(&self) -> NativeCounters {
+        self.owner.counters.snapshot()
+    }
+
+    /// Whether this context drives the same physical GPU as `other`.
+    fn same_device(&self, other: &PtxContext) -> bool {
+        self.owner.device == other.owner.device
+    }
+
+    /// Enable direct access from this context to `peer`'s device memory, so a copy recorded in a capture
+    /// ([`PtxContext::copy_to_peer`]) can write it. Done outside any capture: a context that has to
+    /// negotiate access lazily mid-capture is a transfer the capture cannot hold. Two contexts on one
+    /// physical GPU need no negotiation. A pair the hardware cannot connect is a typed refusal here, never
+    /// a host-staged copy.
+    pub fn enable_peer_access(&self, peer: &PtxContext) -> Result<(), PtxError> {
+        self.refuse_during_capture("enable_peer_access")?;
+        self.bind()?;
+        if !self.same_device(peer) {
+            let mut can = 0i32;
+            // SAFETY: both devices are live device handles this crate's contexts retained.
+            unsafe { sys::cuDeviceCanAccessPeer(&mut can, self.owner.device, peer.owner.device) }
+                .result()?;
+            if can == 0 {
+                return Err(PtxError::PeerUnavailable {
+                    from: self.owner.device,
+                    to: peer.owner.device,
+                });
+            }
+            // SAFETY: this context is current (bound above) and `peer.owner.ctx` is a live primary
+            // context of another device.
+            let status = unsafe { sys::cuCtxEnablePeerAccess(peer.owner.ctx, 0) };
+            match status {
+                sys::CUresult::CUDA_SUCCESS
+                | sys::CUresult::CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED => {}
+                error => return Err(PtxError::Driver(cudarc::driver::DriverError(error))),
+            }
+        }
+        let mut peers = self.peers.borrow_mut();
+        if !peers.contains(&peer.owner.ctx) {
+            peers.push(peer.owner.ctx);
+        }
+        Ok(())
+    }
+
+    /// A new cross-device ordering event, owned by this context. Created outside any capture.
+    pub fn create_sync_event(&self) -> Result<PtxSyncEvent, PtxError> {
+        self.refuse_during_capture("create_sync_event")?;
+        self.bind()?;
+        let event = result::event::create(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING)?;
+        Ok(PtxSyncEvent {
+            event: Arc::new(PtxEvent::new(event, Arc::clone(&self.owner))),
+        })
+    }
+
+    /// Refuse `op` with [`PtxError::CaptureClosed`] unless a capture is open on this context.
+    fn require_capture(&self, op: &'static str) -> Result<(), PtxError> {
+        if self.capture.is_open() {
+            Ok(())
+        } else {
+            Err(PtxError::CaptureClosed { op })
+        }
+    }
+
+    /// Record `event` on this context's stream now: it completes when every launch the stream has been
+    /// handed before this call has, so a graph launched just before it is what the event publishes. The
+    /// record is enqueued at this host call, and a later [`PtxContext::wait_sync_event`] on any context
+    /// waits for exactly it. `event` must be this context's own; not recordable during a capture.
+    pub fn record_sync_event(&self, event: &PtxSyncEvent) -> Result<(), PtxError> {
+        self.refuse_during_capture("record_sync_event")?;
+        if !Arc::ptr_eq(&event.event.owner, &self.owner) {
+            return Err(PtxError::ForeignHandle {
+                op: "record_sync_event",
+            });
+        }
+        self.bind()?;
+        // SAFETY: `event` is a live event of this context and `stream` its live stream; no capture is
+        // open, so the record is an ordinary stream operation.
+        unsafe { result::event::record(event.event.event, self.owner.stream) }?;
+        Ok(())
+    }
+
+    /// Make this context's stream wait, from this host call on, for the latest record of `event` that
+    /// was enqueued before it: work launched after the call does not start until that record
+    /// completes. The event may belong to another context. Not enqueueable during a capture.
+    pub fn wait_sync_event(&self, event: &PtxSyncEvent) -> Result<(), PtxError> {
+        self.refuse_during_capture("wait_sync_event")?;
+        self.bind()?;
+        // SAFETY: `event` is a live event (the caller's handle outlives this call) and `stream` this
+        // context's live stream; no capture is open.
+        unsafe {
+            result::stream::wait_event(
+                self.owner.stream,
+                event.event.event,
+                sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
+            )
+        }?;
+        Ok(())
+    }
+
+    /// Record a copy of the first `bytes` bytes of `src` (a buffer of this context) into `dst` (a buffer of
+    /// a peer this context enabled with [`PtxContext::enable_peer_access`]) in the open capture, ordered
+    /// after everything captured before it. The graph keeps both buffers alive.
+    pub fn copy_to_peer(
+        &self,
+        src: &PtxBuffer,
+        dst: &PtxBuffer,
+        bytes: usize,
+    ) -> Result<(), PtxError> {
+        self.require_capture("copy_to_peer")?;
+        let owned = src
+            .alloc
+            .owner
+            .as_ref()
+            .is_some_and(|owner| Arc::ptr_eq(owner, &self.owner));
+        if !owned {
+            return Err(PtxError::ForeignHandle { op: "copy_to_peer" });
+        }
+        let reachable = dst.alloc.owner.as_ref().is_some_and(|owner| {
+            owner.device == self.owner.device || self.peers.borrow().contains(&owner.ctx)
+        });
+        if !reachable {
+            return Err(PtxError::PeerNotEnabled);
+        }
+        for buffer in [src, dst] {
+            if bytes > buffer.byte_capacity() {
+                return Err(PtxError::RangeOutOfBounds {
+                    op: "copy_to_peer",
+                    byte_offset: 0,
+                    byte_end: bytes,
+                    byte_capacity: buffer.byte_capacity(),
+                });
+            }
+        }
+        self.bind()?;
+        // SAFETY: both ranges were checked against their live allocations, the copy is enqueued on this
+        // context's live stream (current, bound above) in capture mode, and direct access to the
+        // destination's device was enabled before the capture.
+        unsafe { result::memcpy_dtod_async(dst.ptr(), src.ptr(), bytes, self.owner.stream) }?;
+        self.capture.retain(src);
+        self.capture.retain(dst);
+        OwnerCounters::bump(&self.owner.counters.peer_copies);
+        Ok(())
+    }
+
     /// A zero-filled device buffer holding `elems` native elements of `storage`, charged to `role`
     /// (Card 547a: the storage-typed, role-typed allocation the executor contract's memory service
     /// needs, instead of one allocator per dtype; mirrors `poot_runtime::Context::alloc_storage`).
@@ -555,24 +734,34 @@ impl PtxContext {
         self.alloc_zeroed("alloc_storage", elems, storage, role)
     }
 
-    /// Overwrite `bytes.len()` bytes of `buf` from byte `offset`, dtype-agnostic (Card 547a: mirrors
-    /// `poot_runtime::Context::write_bytes`). Enqueued on `self.stream` and synchronized, like
-    /// [`Self::update_f32`].
-    pub fn write_bytes(
+    /// Overwrite `len` bytes of `buf` from byte `offset`, dtype-agnostic (Card 547a: mirrors
+    /// `poot_runtime::Context::write_with`). `fill(range, out)` gets consecutive destination ranges
+    /// covering `offset..offset + len` (at most [`crate::UPLOAD_CHUNK_BYTES`] each) and writes every byte of `out`,
+    /// a pinned slot of the upload ring that is copied to the device asynchronously on this context's
+    /// stream while the next is filled. The copies may still be running on return: the stream orders every
+    /// later launch and readback after them. Freeing `buf` with copies still queued is sound only because
+    /// the buffer's free is `cuMemFree` (synchronous: it waits for the device work using the memory), never
+    /// an asynchronous free; a change to `cuMemFreeAsync` must drain the ring first.
+    pub fn write_with(
         &self,
         buf: &PtxBuffer,
         offset: usize,
-        bytes: &[u8],
+        len: usize,
+        fill: &mut dyn FnMut(std::ops::Range<usize>, &mut [u8]),
     ) -> Result<(), PtxError> {
-        self.refuse_during_capture("write_bytes")?;
-        let range = crate::buffer::checked_byte_range("write_bytes", buf, offset, bytes.len())?;
+        self.refuse_during_capture("write_with")?;
+        self.bind()?;
+        let range = crate::buffer::checked_byte_range("write_with", buf, offset, len)?;
         let dst = buf.ptr() + range.byte_offset as sys::CUdeviceptr;
-        // SAFETY: `range` proved `offset..offset + bytes.len()` lies inside `buf`'s live allocation. The copy runs on
-        // this context's stream; the driver stages pageable `bytes` before returning, and the stream
-        // is synchronized below before `bytes` can be released. No capture is open (refused above).
-        unsafe { result::memcpy_htod_async(dst, bytes, self.owner.stream) }?;
-        self.synchronize()?;
-        Ok(())
+        // SAFETY: `range` proved `offset..offset + len` lies inside `buf`'s live allocation and `stream`
+        // is this context's live stream. No capture is open (refused above).
+        unsafe {
+            self.upload
+                .borrow_mut()
+                .write(dst, len, self.owner.stream, &mut |chunk, out| {
+                    fill(offset + chunk.start..offset + chunk.end, out);
+                })
+        }
     }
 
     /// Read the first `out.len()` bytes of `buf`, dtype-agnostic (Card 547a: mirrors
@@ -627,6 +816,7 @@ impl PtxContext {
         out: &PtxBuffer,
         out_len: u32,
     ) -> Result<(), PtxError> {
+        self.bind()?;
         check_ptx_args(kernel, ins, out)?;
         debug_assert_eq!(
             ins.len(),

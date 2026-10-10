@@ -9,8 +9,11 @@
 //! check (`multi_device_placement_set_rejects_a_missing_owner` must go red). Each row is a single
 //! defect so an unexpected-owner pass cannot mask a duplicate (or vice versa).
 
+use std::collections::HashMap;
+
 use crate::multi_device::placement::{
-    HostOwner, OwnerId, PlacementError, PlacementRow, validate_placement_set,
+    ByteRange, HostOwner, OwnerId, PlacementError, PlacementRow, validate_placement_set,
+    validate_stage_placement,
 };
 use crate::multi_device::topology::DeviceId;
 
@@ -154,5 +157,107 @@ fn multi_device_placement_set_empty_rows_match_empty_expectations() {
     assert_eq!(
         validate_placement_set(&[], &EXPECTED),
         Err(PlacementError::MissingOwner { owner: OwnerId(1) })
+    );
+}
+
+/// POOT-747 F-14: a placement that reaches a device none of the owner's stages runs on is
+/// `OffStage`, for a replicated resident and for a partitioned range alike; a placement on the stage's
+/// own device, or on any of several reading stages' devices, is accepted. Missing and duplicate owners
+/// still come from the set check. `OffStage` and `MissingOwner` are invariant checks of the weight
+/// derivation `compile_staged` runs (it has no independent placement source), so this row drives
+/// `validate_stage_placement` directly; `DuplicateOwner` and capacity are the `compile_staged` rows.
+///
+/// Mutation: delete the device loop in `validate_stage_placement`; both off-stage rows go red.
+#[test]
+fn multi_device_stage_placement_rejects_an_owner_placed_off_its_stage() {
+    let readers: HashMap<OwnerId, Vec<(usize, DeviceId)>> = HashMap::from([
+        (OwnerId(1), vec![(0, DeviceId(0))]),
+        (OwnerId(2), vec![(1, DeviceId(1)), (2, DeviceId(2))]),
+        (OwnerId(3), vec![(2, DeviceId(2))]),
+    ]);
+    let on_stage = vec![
+        replicated(OwnerId(1)),
+        PlacementRow::Replicated {
+            owner: HostOwner {
+                owner: OwnerId(2),
+                total_bytes: 4096,
+                encoding_unit_bytes: 1,
+            },
+            residents: vec![DeviceId(1), DeviceId(2)],
+        },
+        PlacementRow::Partitioned {
+            owner: HostOwner {
+                owner: OwnerId(3),
+                total_bytes: 4096,
+                encoding_unit_bytes: 1,
+            },
+            ranges: vec![(
+                DeviceId(2),
+                ByteRange {
+                    start: 0,
+                    end: 4096,
+                },
+            )],
+        },
+    ];
+    validate_stage_placement(&on_stage, &EXPECTED, &readers).expect("every owner is on its stage");
+
+    // Owner 1 is read by stage 0 on device 0 and replicated onto device 1: off stage.
+    let mut replicated_off = on_stage.clone();
+    replicated_off[0] = PlacementRow::Replicated {
+        owner: HostOwner {
+            owner: OwnerId(1),
+            total_bytes: 4096,
+            encoding_unit_bytes: 1,
+        },
+        residents: vec![DeviceId(0), DeviceId(1)],
+    };
+    assert_eq!(
+        validate_stage_placement(&replicated_off, &EXPECTED, &readers),
+        Err(PlacementError::OffStage {
+            owner: OwnerId(1),
+            device: DeviceId(1),
+            stage: 0,
+        })
+    );
+
+    // Owner 3 is read by stage 2 on device 2; half of it is sent to device 0.
+    let mut ranged_off = on_stage.clone();
+    ranged_off[2] = PlacementRow::Partitioned {
+        owner: HostOwner {
+            owner: OwnerId(3),
+            total_bytes: 4096,
+            encoding_unit_bytes: 1,
+        },
+        ranges: vec![
+            (
+                DeviceId(0),
+                ByteRange {
+                    start: 0,
+                    end: 2048,
+                },
+            ),
+            (
+                DeviceId(2),
+                ByteRange {
+                    start: 2048,
+                    end: 4096,
+                },
+            ),
+        ],
+    };
+    assert_eq!(
+        validate_stage_placement(&ranged_off, &EXPECTED, &readers),
+        Err(PlacementError::OffStage {
+            owner: OwnerId(3),
+            device: DeviceId(0),
+            stage: 2,
+        })
+    );
+
+    // The set checks still run first.
+    assert_eq!(
+        validate_stage_placement(&on_stage[..2], &EXPECTED, &readers),
+        Err(PlacementError::MissingOwner { owner: OwnerId(3) })
     );
 }

@@ -42,6 +42,14 @@ cargo run -p poot-llm --release --features cli --bin poot-generate -- -m /path/t
   `--system-prompt` a system turn (no `-sys` short form, unlike llama-cli).
 - A model that ships a chat template answers the prompt as a user turn of it and prints the reply; `--no-chat-template`,
   or a base model with no template, continues the text as written.
+- `--chat-template JINJA` renders through that jinja template instead of the model's own, and `--chat-template-file FILE`
+  reads it from a file; a base model then answers turns too. Unlike llama-cli there are no built-in template names: a
+  value with no jinja syntax (`chatml`), an unreadable file or a template that does not compile is refused before the
+  checkpoint is read, and a template that fails to render a conversation is an error, never a fallback to another format.
+  Neither flag combines with `--no-chat-template`, and the two do not combine with each other.
+- `--conversation` reads one user turn per line of stdin (`-p`/`-f` is the first turn, answered before stdin is read) and
+  keeps the conversation's K/V between turns, so a turn prefills only its new tokens; `--single-turn` ends after one reply.
+  It needs a model with a chat template (no `-cnv`/`-st` short forms, unlike llama-cli).
 - `-n` is the number of new tokens; the default, -1, runs to the end-of-sequence token, a `-r` string or the end of the
   context window. `-c` sets the window (default: the model's own). A prompt plus `-n` that does not fit the window is refused.
 - `--temp` defaults to 0, greedy, poot's exact-token convention (`llama-cli` samples at 0.80). `--top-k`, `--top-p`,

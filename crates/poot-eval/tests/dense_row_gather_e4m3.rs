@@ -48,8 +48,7 @@ fn build_graph(
     let mut g = Graph::default();
 
     let table_shape = vec![rows, row_width];
-    let table_id = g.values.len();
-    g.values.push(ValueMeta::new(
+    let table_id = g.values.push(ValueMeta::new(
         TensorType::new(table_shape.clone(), DType::E4M3FN),
         Storage::Const,
         Some("table".to_string()),
@@ -58,8 +57,7 @@ fn build_graph(
     g.consts.push(table_id);
 
     let index_shape = vec![index_len];
-    let index_id = g.values.len();
-    g.values.push(ValueMeta::new(
+    let index_id = g.values.push(ValueMeta::new(
         TensorType::new(index_shape.clone(), DType::I32),
         Storage::Slot(Slot::Token),
         None,
@@ -76,8 +74,8 @@ fn build_graph(
             TensorType::new(index_shape, DType::I32),
         ])
         .expect("E4M3FN is an admitted DenseRowGather source (Card 405); operands are well-formed");
-    let gather_id = g.values.len();
-    g.values
+    let gather_id = g
+        .values
         .push(ValueMeta::new(gather_type.clone(), Storage::Device, None));
     g.eqns.push(Eqn {
         op: gather_op,
@@ -93,8 +91,8 @@ fn build_graph(
             let mul_type = mul_op
                 .infer(&[gather_type, Scalar::F32(scale).ty()])
                 .expect("F32 gather output times an F32 scalar literal broadcasts");
-            let mul_id = g.values.len();
-            g.values
+            let mul_id = g
+                .values
                 .push(ValueMeta::new(mul_type, Storage::Device, None));
             g.eqns.push(Eqn {
                 op: mul_op,

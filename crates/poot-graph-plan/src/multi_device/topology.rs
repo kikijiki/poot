@@ -1,8 +1,8 @@
 //! Device topology: stable identities, usable bytes, backend, and link capability rows.
 //!
 //! The caller supplies every device and link explicitly (FR-001, FR-004); nothing is inferred from a
-//! topology shape. `Topology::devices` order is part of the cache-key identity (FR-010, see
-//! `crate::multi_device::cache_key`): the same device set in a different order is a different plan.
+//! topology shape. `Topology::devices` order is meaningful (FR-010): the same device set in a different
+//! order is a different plan.
 
 use crate::CollectiveKind;
 use poot_target::Backend;
@@ -64,4 +64,23 @@ pub fn validate_topology(topology: &Topology) -> Result<(), TopologyError> {
         }
     }
     Ok(())
+}
+
+/// The cross-device operations `backend`'s runtime performs between two of its own devices. A link row
+/// between two devices exists only for a kind both devices' backends implement.
+///
+/// NVIDIA's runtime has the peer-to-peer transport (point-to-point copies and the ring collectives built
+/// on it). The wgpu, ROCm and Vulkan runtimes have no cross-device transport, so a stage cut between two
+/// of their devices has nothing to carry its boundary. The match is exhaustive: a new backend states its
+/// answer here.
+pub(crate) fn backend_link_kinds(backend: Backend) -> &'static [CollectiveKind] {
+    match backend {
+        Backend::Nvptx => &[
+            CollectiveKind::PointToPoint,
+            CollectiveKind::AllReduce,
+            CollectiveKind::AllGather,
+            CollectiveKind::AllToAll,
+        ],
+        Backend::SpirvVulkan | Backend::AmdGcn(_) => &[],
+    }
 }

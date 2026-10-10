@@ -358,8 +358,14 @@ impl Device for RocmDevice {
         Ok(())
     }
 
-    fn write(&mut self, dst: &RocmBuffer, offset: usize, bytes: &[u8]) -> Result<(), RocmGpuError> {
-        Ok(self.ctx.write_bytes(dst, offset, bytes)?)
+    fn write_with(
+        &mut self,
+        dst: &RocmBuffer,
+        offset: usize,
+        len: usize,
+        fill: &mut dyn FnMut(std::ops::Range<usize>, &mut [u8]),
+    ) -> Result<(), RocmGpuError> {
+        Ok(self.ctx.write_with(dst, offset, len, fill)?)
     }
 
     fn read(&mut self, src: &RocmBuffer, out: &mut [u8]) -> Result<(), RocmGpuError> {

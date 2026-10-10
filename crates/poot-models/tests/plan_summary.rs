@@ -118,7 +118,7 @@ fn attention_detail(eqn: &Eqn, choice: &KernelChoice, dispatch: &Dispatch) -> St
     };
     let bound = match (spec.bound, eqn.inputs.last()) {
         (poot_kernelgen::KeyBound::Static, _) => "capacity".to_string(),
-        (poot_kernelgen::KeyBound::Live, Some(Operand::Value(len))) => format!("live(v{len})"),
+        (poot_kernelgen::KeyBound::Live, Some(Operand::Value(len))) => format!("live({len})"),
         (poot_kernelgen::KeyBound::Live, _) => {
             unreachable!("a live bound reads its length operand")
         }
@@ -174,7 +174,7 @@ fn describe_plan(eqn: &Eqn, plan: &Plan, choice: &KernelChoice) -> PlanCells {
                 ),
             },
         },
-        Plan::Alias(src) => PlanCells::no_launch("alias", choice, format!("src=v{src}")),
+        Plan::Alias(src) => PlanCells::no_launch("alias", choice, format!("src={src}")),
         Plan::View {
             src,
             strides,
@@ -182,11 +182,8 @@ fn describe_plan(eqn: &Eqn, plan: &Plan, choice: &KernelChoice) -> PlanCells {
         } => PlanCells::no_launch(
             "view",
             choice,
-            format!("src=v{src} strides={strides:?} offset={offset}"),
+            format!("src={src} strides={strides:?} offset={offset}"),
         ),
-        Plan::Collective { kind, op, axis } => {
-            PlanCells::no_launch("collective", choice, format!("{kind:?} {op:?} axis={axis}"))
-        }
     }
 }
 
@@ -435,12 +432,10 @@ fn nvptx_plan_summary_matches_the_checked_in_file() {
 
 /// The plan kinds `poot_executor::Engine::load` accepts: every kind a single-device `compile` may emit.
 /// An exhaustive match (no wildcard), so a new `Plan` variant must be classified here before this
-/// file compiles; `Collective` is the multi-rank kind a single-device executor refuses with
-/// `LoadError::UnloadablePlan`.
+/// file compiles.
 fn is_loadable(plan: &Plan) -> bool {
     match plan {
         Plan::Dispatches(_) | Plan::Alias(_) | Plan::View { .. } => true,
-        Plan::Collective { .. } => false,
     }
 }
 

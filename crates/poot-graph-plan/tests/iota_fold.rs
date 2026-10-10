@@ -88,7 +88,7 @@ fn iota_matches_the_bound_range_oracle_and_folds_to_the_same_values() {
     assert_eq!(
         materialized.as_f32().unwrap(),
         expected.as_f32().unwrap(),
-        "the folded computed constant must materialize the same [0..6) range (v{folded_value})"
+        "the folded computed constant must materialize the same [0..6) range ({folded_value})"
     );
 }
 

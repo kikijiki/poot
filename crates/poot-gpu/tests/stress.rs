@@ -21,6 +21,7 @@ use poot_graph_plan::{
     CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram,
     Submission, Target, TargetSet, compile_staged,
 };
+use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_test_util::const_weights::ConstWeights;
 use poot_test_util::max_abs_error;
@@ -113,7 +114,8 @@ fn split_consts_and_slots_t(
                         .collect()
                 };
                 let dense =
-                    DenseWeight::try_new(dtype, t.shape().to_vec(), Arc::from(bytes)).unwrap();
+                    DenseWeight::try_new(dtype, t.shape().to_vec(), StoredBytes::from(bytes))
+                        .unwrap();
                 builder.insert(name, WeightEntry::Dense(dense)).unwrap();
             }
             Storage::Slot(_) => {
@@ -171,7 +173,8 @@ fn split_consts_and_slots_v(
                         .collect()
                 };
                 let dense =
-                    DenseWeight::try_new(dtype, t.shape().to_vec(), Arc::from(bytes)).unwrap();
+                    DenseWeight::try_new(dtype, t.shape().to_vec(), StoredBytes::from(bytes))
+                        .unwrap();
                 builder.insert(name, WeightEntry::Dense(dense)).unwrap();
             }
             Storage::Slot(_) => {
@@ -290,7 +293,7 @@ fn elementwise_large_256_gpu_matches_cpu() {
     let a = b.constant("a", TensorType::f32(vec![n]));
     let c = b.constant("c", TensorType::f32(vec![n]));
     let out = b.binary(BinOp::Add, a, c);
-    let (ai, ci) = (a.id, c.id);
+    let (ai, ci) = (a.id(), c.id());
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();
@@ -324,7 +327,7 @@ fn elementwise_large_1024_gpu_matches_cpu() {
     let a = b.constant("a", TensorType::f32(vec![n]));
     let c = b.constant("c", TensorType::f32(vec![n]));
     let out = b.binary(BinOp::Mul, a, c);
-    let (ai, ci) = (a.id, c.id);
+    let (ai, ci) = (a.id(), c.id());
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();
@@ -361,7 +364,7 @@ fn non_power_of_2_elementwise_gpu_matches_cpu() {
         let a = b.constant("a", TensorType::f32(vec![n]));
         let c = b.constant("c", TensorType::f32(vec![n]));
         let out = b.binary(BinOp::Add, a, c);
-        let (ai, ci) = (a.id, c.id);
+        let (ai, ci) = (a.id(), c.id());
         let g = b.finish(out);
 
         let mut inputs = HashMap::new();
@@ -395,7 +398,7 @@ fn non_power_of_2_reduce_gpu_matches_cpu() {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![rows, cols]));
     let out = b.reduce(RedOp::Sum, x, 1, false);
-    let xi = x.id;
+    let xi = x.id();
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();
@@ -431,7 +434,7 @@ fn non_power_of_2_matmul_gpu_matches_cpu() {
     let a = b.constant("a", TensorType::f32(vec![m, k]));
     let w = b.constant("w", TensorType::f32(vec![k, n]));
     let out = b.matmul(a, w);
-    let (ai, wi) = (a.id, w.id);
+    let (ai, wi) = (a.id(), w.id());
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();
@@ -466,7 +469,7 @@ fn single_element_add_gpu_matches_cpu() {
     let a = b.constant("a", TensorType::f32(vec![1]));
     let c = b.constant("c", TensorType::f32(vec![1]));
     let out = b.binary(BinOp::Add, a, c);
-    let (ai, ci) = (a.id, c.id);
+    let (ai, ci) = (a.id(), c.id());
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();
@@ -500,7 +503,7 @@ fn single_element_matmul_gpu_matches_cpu() {
     let a = b.constant("a", TensorType::f32(vec![1, 1]));
     let w = b.constant("w", TensorType::f32(vec![1, 1]));
     let out = b.matmul(a, w);
-    let (ai, wi) = (a.id, w.id);
+    let (ai, wi) = (a.id(), w.id());
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();
@@ -532,7 +535,7 @@ fn single_element_reduce_gpu_matches_cpu() {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![1, 1]));
     let out = b.reduce(RedOp::Sum, x, 1, false);
-    let xi = x.id;
+    let xi = x.id();
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();
@@ -568,7 +571,7 @@ fn large_matmul_gpu_matches_cpu() {
     let a = b.constant("a", TensorType::f32(vec![m, k]));
     let w = b.constant("w", TensorType::f32(vec![k, n]));
     let out = b.matmul(a, w);
-    let (ai, wi) = (a.id, w.id);
+    let (ai, wi) = (a.id(), w.id());
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();
@@ -601,7 +604,7 @@ fn large_reduce_wide_gpu_matches_cpu() {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![rows, cols]));
     let out = b.reduce(RedOp::Sum, x, 1, false);
-    let xi = x.id;
+    let xi = x.id();
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();
@@ -642,7 +645,7 @@ fn row_vector_matmul_gpu_matches_cpu() {
     let a = b.constant("a", TensorType::f32(vec![1, k]));
     let w = b.constant("w", TensorType::f32(vec![k, n]));
     let out = b.matmul(a, w);
-    let (ai, wi) = (a.id, w.id);
+    let (ai, wi) = (a.id(), w.id());
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();
@@ -677,7 +680,7 @@ fn column_vector_matmul_gpu_matches_cpu() {
     let a = b.constant("a", TensorType::f32(vec![m, k]));
     let w = b.constant("w", TensorType::f32(vec![k, 1]));
     let out = b.matmul(a, w);
-    let (ai, wi) = (a.id, w.id);
+    let (ai, wi) = (a.id(), w.id());
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();
@@ -715,7 +718,7 @@ fn high_dimensional_broadcast_gpu_matches_cpu() {
     let a = b.constant("a", TensorType::f32(shape.clone()));
     let bias = b.constant("bias", TensorType::f32(vec![5]));
     let out = b.binary(BinOp::Add, a, bias);
-    let (ai, bi) = (a.id, bias.id);
+    let (ai, bi) = (a.id(), bias.id());
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();
@@ -750,7 +753,7 @@ fn rmsnorm_non_power_of_2_gpu_matches_cpu() {
     let x = b.constant("x", TensorType::f32(vec![1, n]));
     let w = b.constant("w", TensorType::f32(vec![n]));
     let out = rmsnorm(&b, x, w, 1e-6);
-    let (xi, wi) = (x.id, w.id);
+    let (xi, wi) = (x.id(), w.id());
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();
@@ -798,7 +801,7 @@ fn deep_fused_chain_gpu_matches_cpu() {
     let x = b.unary(UnOp::Neg, x);
     let x = b.binary(BinOp::Add, x, c);
     let x = b.binary(BinOp::Mul, x, x);
-    let (ai, ci) = (a.id, c.id);
+    let (ai, ci) = (a.id(), c.id());
     let g = fuse(&cse(&b.finish(x)));
 
     let mut inputs = HashMap::new();
@@ -863,11 +866,17 @@ fn wgpu_scatter_update_grid_over_65535_workgroups() {
 
     let mut inputs: HashMap<ValueId, Value> = HashMap::new();
     inputs.insert(
-        base.id,
+        base.id(),
         HostTensor::f32(vec![pool, d], base_data.clone()).into(),
     );
-    inputs.insert(src.id, HostTensor::f32(vec![n, d], src_data.clone()).into());
-    inputs.insert(inv.id, HostTensor::f32(vec![pool], inv_data.clone()).into());
+    inputs.insert(
+        src.id(),
+        HostTensor::f32(vec![n, d], src_data.clone()).into(),
+    );
+    inputs.insert(
+        inv.id(),
+        HostTensor::f32(vec![pool], inv_data.clone()).into(),
+    );
 
     // CPU oracle first (independent of any GPU dispatch-grid math).
     let cpu_out = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -931,9 +940,9 @@ fn wgpu_dyn_update_slice_grid_over_65535_workgroups() {
     let update_data = fill(4, d);
 
     let mut inputs: HashMap<ValueId, Value> = HashMap::new();
-    inputs.insert(cache.id, HostTensor::f32(vec![cap, d], cache_data).into());
-    inputs.insert(update.id, HostTensor::f32(vec![1, d], update_data).into());
-    inputs.insert(idx_val.id, HostTensor::scalar(pos as f32).into());
+    inputs.insert(cache.id(), HostTensor::f32(vec![cap, d], cache_data).into());
+    inputs.insert(update.id(), HostTensor::f32(vec![1, d], update_data).into());
+    inputs.insert(idx_val.id(), HostTensor::scalar(pos as f32).into());
 
     let cpu_out = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
         .expect("cpu eval dyn_update_slice")
@@ -1019,14 +1028,14 @@ fn wgpu_scatter_shared_pool_chained_dus_grid_over_65535_workgroups() {
 
     let mut inputs: HashMap<ValueId, Value> = HashMap::new();
     inputs.insert(
-        pool0.id,
+        pool0.id(),
         HostTensor::f32(vec![pool_slots, hkv, d], pool_data).into(),
     );
     inputs.insert(
-        update.id,
+        update.id(),
         HostTensor::f32(vec![batch, hkv, 1, d], update_data).into(),
     );
-    inputs.insert(phys.id, HostTensor::i32(vec![batch], phys_data).into());
+    inputs.insert(phys.id(), HostTensor::i32(vec![batch], phys_data).into());
 
     let cpu_out = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
         .expect("cpu eval chained scatter_shared_pool")
@@ -1093,8 +1102,11 @@ fn wgpu_binary_broadcast_grid_over_65535_workgroups() {
     let mask_data = fill(4, cap);
 
     let mut inputs = HashMap::new();
-    inputs.insert(scores.id, HostTensor::f32(vec![1, hq, 1, cap], scores_data));
-    inputs.insert(mask.id, HostTensor::f32(vec![1, 1, 1, cap], mask_data));
+    inputs.insert(
+        scores.id(),
+        HostTensor::f32(vec![1, hq, 1, cap], scores_data),
+    );
+    inputs.insert(mask.id(), HostTensor::f32(vec![1, 1, 1, cap], mask_data));
 
     // CPU oracle first (independent of any GPU dispatch-grid math).
     let cpu_out = eval(
@@ -1175,8 +1187,8 @@ fn wgpu_transpose_grid_over_65535_workgroups_feeding_matmul() {
     let q_data = fill(6, hq * d);
 
     let mut inputs = HashMap::new();
-    inputs.insert(k.id, HostTensor::f32(vec![1, hq, cap, d], k_data));
-    inputs.insert(q.id, HostTensor::f32(vec![1, hq, 1, d], q_data));
+    inputs.insert(k.id(), HostTensor::f32(vec![1, hq, cap, d], k_data));
+    inputs.insert(q.id(), HostTensor::f32(vec![1, hq, 1, d], q_data));
 
     // CPU oracle first (independent of any GPU dispatch-grid math).
     let cpu_out = eval(
@@ -1255,8 +1267,8 @@ fn wgpu_concat2_grid_over_65535_workgroups() {
     let row1_data = fill(8, row_numel);
 
     let mut inputs = HashMap::new();
-    inputs.insert(row0.id, HostTensor::f32(vec![1, hkv, cap, d], row0_data));
-    inputs.insert(row1.id, HostTensor::f32(vec![1, hkv, cap, d], row1_data));
+    inputs.insert(row0.id(), HostTensor::f32(vec![1, hkv, cap, d], row0_data));
+    inputs.insert(row1.id(), HostTensor::f32(vec![1, hkv, cap, d], row1_data));
 
     // CPU oracle first (independent of any GPU dispatch-grid math).
     let cpu_out = eval(
@@ -1327,7 +1339,7 @@ fn wgpu_cast_grid_over_65535_workgroups_every_element() {
     // Exact for every lane at or below 2^24 (card 372c); n == 2^24 covers lanes 0..=n-1.
     let src_data: Vec<i32> = (0..n as i32).collect();
     let mut inputs = HashMap::new();
-    inputs.insert(src.id, HostTensor::i32(vec![n], src_data.clone()));
+    inputs.insert(src.id(), HostTensor::i32(vec![n], src_data.clone()));
 
     let cpu = eval(
         &g,
@@ -1389,8 +1401,11 @@ fn wgpu_gather_grid_over_65535_workgroups_every_element() {
     let table_data = fill(11, rest);
     let index_data = vec![0f32; rows]; // every row reads table row 0
     let mut inputs = HashMap::new();
-    inputs.insert(table.id, HostTensor::f32(vec![1, rest], table_data.clone()));
-    inputs.insert(index.id, HostTensor::f32(vec![rows], index_data));
+    inputs.insert(
+        table.id(),
+        HostTensor::f32(vec![1, rest], table_data.clone()),
+    );
+    inputs.insert(index.id(), HostTensor::f32(vec![rows], index_data));
 
     let cpu = eval(
         &g,
@@ -1452,7 +1467,7 @@ fn sliding_window_mask_from_pos_gpu_matches_cpu() {
     );
     let mask = poot_graph_ir::ops::causal_mask_from_pos(&b, pos, l, Some(window));
     let out = poot_graph_ir::ops::attention_prefill(&b, q, k, v, n_rep, scale, mask);
-    let (qi, ki, vi, posi) = (q.id, k.id, v.id, pos.id);
+    let (qi, ki, vi, posi) = (q.id(), k.id(), v.id(), pos.id());
     let g = b.finish(out);
 
     let mut inputs: HashMap<ValueId, Value> = HashMap::new();

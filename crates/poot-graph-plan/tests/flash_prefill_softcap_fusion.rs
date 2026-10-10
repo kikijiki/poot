@@ -71,19 +71,19 @@ fn flash_prefill_softcap_matches_attention_prefill_softcap_and_f64_reference() {
             let g = b.finish(o);
             let mut inp = HashMap::new();
             inp.insert(
-                q.id,
+                q.id(),
                 Value::from(HostTensor::f32(vec![1, hq, l, d], qd.clone())),
             );
             inp.insert(
-                k.id,
+                k.id(),
                 Value::from(HostTensor::f32(vec![1, hkv, l, d], kd.clone())),
             );
             inp.insert(
-                v.id,
+                v.id(),
                 Value::from(HostTensor::f32(vec![1, hkv, l, d], vd.clone())),
             );
             inp.insert(
-                m.id,
+                m.id(),
                 Value::from(HostTensor::f32(vec![1, 1, l, l], mask.clone())),
             );
             (g, inp)

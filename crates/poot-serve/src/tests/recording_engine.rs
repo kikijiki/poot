@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use poot_llm::driver::{Encoded, PrefixOutcome, PrefixSkip, PromptEmbeds, Release, RowSpeculation};
 
 use super::*;
-use crate::types::{AdapterInfo, AdminError, AdminReply, AdminRequest, EncodeRow};
+use crate::types::{AdapterInfo, AdminError, AdminReply, AdminRequest, EncodeRow, PromptRows};
 
 /// The block the fake's prefix cache registers and reuses in: whole multiples of it.
 const BLOCK: usize = 4;
@@ -109,6 +109,8 @@ pub(crate) struct RecordingEngine {
     pub(crate) adapters: Vec<String>,
     /// Every `Admin` call fails with this.
     pub(crate) admin_error: Option<AdminError>,
+    /// The executor timing the engine reports; `None` is an engine with no executor.
+    pub(crate) timing: Option<poot_profile::TimingSnapshot>,
     open: HashMap<u64, Open>,
     registered: Vec<Vec<u32>>,
     next: u64,
@@ -134,6 +136,7 @@ impl RecordingEngine {
             probe: Box::new(|_, _| {}),
             adapters: Vec::new(),
             admin_error: None,
+            timing: None,
             open: HashMap::new(),
             registered: Vec::new(),
             next: 0,
@@ -219,7 +222,7 @@ impl ServeEngine for RecordingEngine {
             return Ok(Opening::NoRoom { needed_blocks: 0 });
         }
         let prompt = request.prompt.to_vec();
-        let embeds = request.embeds.is_some();
+        let embeds = request.rows.is_some();
         let common = self
             .registered
             .iter()
@@ -400,6 +403,10 @@ impl ServeEngine for RecordingEngine {
     fn compiles(&self) -> u64 {
         0
     }
+
+    fn timing(&self) -> Option<poot_profile::TimingSnapshot> {
+        self.timing.clone()
+    }
 }
 
 /// A job for `prompt`, and what the test keeps of it: the reply receiver and the cancel flag.
@@ -456,7 +463,10 @@ impl JobSpec {
         let prompt = if self.embeds {
             PromptInput::Multimodal {
                 tokens,
-                embeds: PromptEmbeds::new(1, vec![0], vec![1.0]).expect("one row of one value"),
+                rows: PromptRows {
+                    embeds: PromptEmbeds::new(1, vec![0], vec![1.0]).expect("one row of one value"),
+                    mrope: None,
+                },
             }
         } else {
             PromptInput::Tokens(tokens)

@@ -6,21 +6,26 @@ sidebar_position: 8
 
 # Multimodal
 
-`poot-serve` serves a SmolVLM (idefics3) checkpoint: `/v1/chat/completions` takes `image_url` content parts and
-answers with the caption the text decoder generates from the image. Other checkpoints, and other vision-language
-families, are not served yet.
+`poot-serve` serves a SmolVLM (idefics3) or a Qwen2.5-VL checkpoint: `/v1/chat/completions` takes `image_url`
+content parts and answers with the text the decoder generates from the image. Other vision-language families are
+not served yet.
 
 The server loads the checkpoint as two registered families over one set of weights. The text decoder runs on the
 engine's driver as for any model, with its embedding-row entries prepared. The vision tower runs on its own driver
 and thread, opened before the engine so the engine fits its workload to the memory the tower left. A request's
-images are decoded, split into frames and encoded there, off the engine thread, and the prompt's `<image>`
-placeholders then take the frames' rows. The sequence opens with those rows; no prefix is matched or registered
-for it.
+images are decoded and encoded there, off the engine thread (SmolVLM splits them into frames first), and the
+prompt's image placeholders then take the tower's rows. The sequence opens with those rows; no prefix is matched
+or registered for it. For Qwen2.5-VL the request also carries the prompt's rotary position table: the image's
+tokens sit at their own temporal, height and width positions, and the sequence opens with that table and continues
+from where it ends.
 
-A request with images is limited to one `user` message, whose text is the question and whose `image_url` parts
-are `data:` URIs with base64 PNG or JPEG content. The server fetches no URLs, so a URL, an image that does not
-decode, a message list with more than one message, `tools` or `tool_choice` (the image prompt is not rendered through the chat template), or too many frames is a `400`. `stop`, `response_format` and the guided fields apply as usual. A checkpoint without an image
-front end refuses an image part with a `400` `unsupported_capability` error, and so does a video or audio part
+A request with images can hold a whole conversation: system, user and assistant messages in any order, with
+`image_url` parts in any message other than a tool message. The conversation is rendered through the checkpoint's
+own chat template, with each image where its message carries it (a message's images come before its text), and each
+image's placeholders then take its frames' rows. The `image_url` parts are `data:` URIs with base64 PNG or JPEG
+content. The server fetches no URLs, so a URL, an image that does not decode, a message text that spells
+`<image>`, `tools`, `tool_choice`, a tool call or a tool message (the image chat template has no tool branch), too many frames (SmolVLM), or an image over the tower's patch limit (Qwen2.5-VL) is a `400`. `stop`, `response_format` and the guided fields apply as usual. A checkpoint without an
+image front end refuses an image part with a `400` `unsupported_capability` error, and so does a video or audio part
 on any checkpoint, instead of dropping the part.
 
 The `poot-caption` binary of `poot-llm` captions an image from the command line and does not use the

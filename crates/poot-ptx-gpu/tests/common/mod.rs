@@ -23,6 +23,7 @@ use poot_graph_plan::{
     Submission, Target, TargetSet, compile_staged,
 };
 use poot_ptx_gpu::PtxDevice;
+use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::HostTensor;
 use poot_test_util::const_weights::ConstWeights;
@@ -65,18 +66,24 @@ fn const_store(g: &Graph, inputs: &HashMap<ValueId, Value>) -> WeightStore {
             .unwrap_or_else(|| panic!("no value bound for const {name}"));
         match value {
             Value::Host(dense) => {
-                let (dtype, bytes): (_, Arc<[u8]>) = match dense.dtype() {
+                let (dtype, bytes): (_, StoredBytes) = match dense.dtype() {
                     poot_tensor::DType::F32 => (
                         poot_tensor::DType::F32,
-                        Arc::from(bytemuck::cast_slice::<f32, u8>(dense.as_f32().unwrap())),
+                        StoredBytes::from(
+                            bytemuck::cast_slice::<f32, u8>(dense.as_f32().unwrap()).to_vec(),
+                        ),
                     ),
                     poot_tensor::DType::BF16 => (
                         poot_tensor::DType::BF16,
-                        Arc::from(bytemuck::cast_slice::<u16, u8>(dense.as_half().unwrap())),
+                        StoredBytes::from(
+                            bytemuck::cast_slice::<u16, u8>(dense.as_half().unwrap()).to_vec(),
+                        ),
                     ),
                     poot_tensor::DType::I32 => (
                         poot_tensor::DType::I32,
-                        Arc::from(bytemuck::cast_slice::<i32, u8>(dense.as_i32().unwrap())),
+                        StoredBytes::from(
+                            bytemuck::cast_slice::<i32, u8>(dense.as_i32().unwrap()).to_vec(),
+                        ),
                     ),
                     other => panic!(
                         "{name}: dense const dtype {other:?} is not supported by this test helper"
@@ -380,13 +387,14 @@ impl Device for PtxDeviceProxy<'_> {
     fn replay(&mut self, recording: &Self::Recording) -> Result<(), Self::Error> {
         self.0.replay(recording)
     }
-    fn write(
+    fn write_with(
         &mut self,
         dst: &Self::Buffer,
         offset: usize,
-        bytes: &[u8],
+        len: usize,
+        fill: &mut dyn FnMut(std::ops::Range<usize>, &mut [u8]),
     ) -> Result<(), Self::Error> {
-        self.0.write(dst, offset, bytes)
+        self.0.write_with(dst, offset, len, fill)
     }
     fn read(&mut self, src: &Self::Buffer, out: &mut [u8]) -> Result<(), Self::Error> {
         self.0.read(src, out)

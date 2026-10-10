@@ -754,6 +754,7 @@ const VARIANT_FINETUNE: FixtureVariant = ("finetune", finetune_fixture);
 
 #[cfg(test)]
 mod tests {
+    use poot_quant::StoredBytes;
     use poot_quant::weights::HandleFormat;
     use serde_json::json;
 
@@ -1558,10 +1559,10 @@ mod tests {
     #[test]
     fn a_gguf_config_is_refused_typed() {
         use poot_load::gguf::{GgufIndex, GgufValue, write_gguf};
-        let index = GgufIndex::from_bytes(&write_gguf(
+        let index = GgufIndex::parse(&StoredBytes::from(write_gguf(
             &[("general.architecture", GgufValue::Str("qwen35".into()))],
             &[],
-        ))
+        )))
         .unwrap();
         let err = Qwen35Params::from_raw(&RawConfig::Gguf(&index)).unwrap_err();
         assert!(

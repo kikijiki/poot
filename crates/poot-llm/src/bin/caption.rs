@@ -13,6 +13,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use poot_graph_plan::{CompileLimits, CompileOptions, Submission};
+use poot_llm::ChatTurn;
 use poot_llm::GenerationControl;
 use poot_llm::driver::{
     BackendChoice, DraftPolicy, DriverOptions, PreparedSetLimits, open_executor, program_retention,
@@ -177,7 +178,7 @@ fn main() -> Result<()> {
         .caption(
             &CaptionRequest {
                 images: &[image.as_image()],
-                question,
+                turns: &[ChatTurn::user(1, question)],
                 max_new: 64,
             },
             &mut |_: u32, piece: &str| {

@@ -144,9 +144,15 @@ impl Context {
         let mut lengths: Vec<u8> = args.iter().flat_map(|a| a.elems.to_le_bytes()).collect();
         lengths.extend_from_slice(&crate::x_extent(groups, wg).to_le_bytes());
         let lengths_block = graph.core.reserve_meta(self, lengths.len())?;
-        lengths_block
-            .chunk
-            .write_bytes_at("record_dispatch", lengths_block.offset, &lengths)?;
+        let offset = lengths_block.offset;
+        lengths_block.chunk.write_with_at(
+            "record_dispatch",
+            offset,
+            lengths.len(),
+            &mut |range, out| {
+                out.copy_from_slice(&lengths[range.start - offset..range.end - offset])
+            },
+        )?;
         let trap_block = if pipeline.shape.has_trap {
             let block = graph.core.reserve_meta(self, 4)?;
             Some(block)

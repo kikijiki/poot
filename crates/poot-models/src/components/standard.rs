@@ -284,7 +284,7 @@ impl Step {
         self.validations.borrow_mut().push(ValidationOutput {
             id,
             name,
-            value: value.id,
+            value: value.id(),
         });
     }
 
@@ -681,7 +681,7 @@ pub(crate) mod oracle {
     use std::sync::Arc;
 
     use poot_eval::{EvalBudget, EvalOptions, Value};
-    use poot_graph_ir::{Graph, PackedSourceName, Slot, Storage, ValidationChannel};
+    use poot_graph_ir::{Graph, PackedSourceName, Slot, Storage, ValidationChannel, ValueId};
     use poot_quant::weights::{
         DenseWeight, WeightEntry, WeightId, WeightKey, WeightMap, WeightStore, WeightView,
     };
@@ -988,7 +988,7 @@ pub(crate) mod oracle {
         assert_eq!(state.len(), g.state.len(), "one value per state input");
         // One stack per packed expert-stack id, shared by every source role that names it.
         let mut stacks: HashMap<WeightId, Arc<PackedStack>> = HashMap::new();
-        let mut inputs: HashMap<usize, Value> = HashMap::new();
+        let mut inputs: HashMap<ValueId, Value> = HashMap::new();
         // The harness carries every state as f32; an integer state (a token history) is exact
         // below 2^24 and is bound at its own dtype.
         for (i, &(si, _)) in g.state.iter().enumerate() {

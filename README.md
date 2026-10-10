@@ -70,7 +70,10 @@ tests that load checkpoints read them from the same directory), `-p` or `-f` the
 `--temp` (default 0, greedy), `--top-k`, `--top-p`, `--min-p`, `--repeat-penalty`, `-s`, `-r`, `--ignore-eos`,
 `--show-timings` (engine-measured prefill and decode tokens/s, on by default) and `-v`. A model that ships a chat
 template answers the prompt as a user turn of it; `--no-chat-template` (or a base model) continues the text as
-written. `--backend wgpu|rocm|ptx|vulkan` picks the device (default `auto`): wgpu and vulkan need a Vulkan
+written. `--chat-template JINJA` or `--chat-template-file FILE` renders through that jinja template instead of the
+model's own (a base model then answers turns too); a bare built-in template name such as `chatml` is refused, and
+neither flag combines with `--no-chat-template`. `--conversation` reads one user turn per line of stdin and keeps the conversation's K/V between turns
+(`-p`/`-f` is the first turn; `--single-turn` ends after one; no `-cnv`/`-st` short forms). `--backend wgpu|rocm|ptx|vulkan` picks the device (default `auto`): wgpu and vulkan need a Vulkan
 device, PTX an NVIDIA GPU, and ROCm an AMD GPU and a build with `--features cli,rocm`.
 
 ## Repository layout

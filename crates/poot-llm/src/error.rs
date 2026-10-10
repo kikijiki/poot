@@ -11,11 +11,39 @@ pub enum TextError {
     /// A guided-decoding schema or a chat-template value did not parse as JSON.
     #[error("{0}")]
     Json(#[from] serde_json::Error),
+    /// A chat template given in place of the checkpoint's own is unusable.
+    #[error(transparent)]
+    ChatTemplate(#[from] ChatTemplateError),
     /// A tokenizer, template or constraint the services refuse, with the reason: a validation
     /// failure, or an external error that is not a `std::error::Error` (`tokenizers`,
     /// `regex-automata`) formatted through [`err!`].
     #[error("{0}")]
     Msg(String),
+}
+
+/// Why a chat template the caller supplied in place of the checkpoint's own is refused.
+#[derive(Debug, thiserror::Error)]
+pub enum ChatTemplateError {
+    /// The value is not jinja (it has no `{{`, `{%` or `{#`), so it names a built-in template; poot has
+    /// none, only templates given as text or as a file.
+    #[error(
+        "`{name}` is not a jinja template, and poot has no built-in chat templates by name: pass the template text, or a template file"
+    )]
+    UnknownBuiltin { name: String },
+    /// The template file could not be read.
+    #[error("chat template file {path}: {source}")]
+    Unreadable {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// The template does not compile.
+    #[error("the chat template does not compile: {0}")]
+    Invalid(String),
+    /// The template compiled but failed to render a conversation (`raise_exception`, an undefined
+    /// access). An override never falls back to the family's hardcoded format.
+    #[error("the chat template failed to render the conversation: {0}")]
+    Render(String),
 }
 
 /// Same `.context()` on an `Option` as anyhow's, turning `None` into a [`TextError::Msg`].

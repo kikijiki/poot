@@ -1,7 +1,7 @@
 //! Descriptors of the planar (safetensors) quantized formats: one source tensor per operand role,
 //! and the row concatenation those source tensors admit ([`PackedPayload::concat_rows`]).
 
-use std::sync::Arc;
+use crate::StoredBytes;
 
 use crate::format::{
     Axis, Extent, FieldEncoding, FloatFormat, FormatDescriptor, GroupMap, LaneOrder, Major,
@@ -71,13 +71,13 @@ impl PackedPayload {
             }
         }
         let weight = PackedWeight::try_new(format, [rows, first.shape()[1]])?;
-        let sources: Vec<(SourceRole, Arc<[u8]>)> = layout
+        let sources: Vec<(SourceRole, StoredBytes)> = layout
             .operands
             .iter()
             .map(|operand| {
                 let role = SourceRole::Planar(operand.role);
                 let bytes: Vec<&[u8]> = parts.iter().map(|part| part.bytes(role)).collect();
-                (role, Arc::from(bytes.concat()))
+                (role, StoredBytes::from(bytes.concat()))
             })
             .collect();
         Self::try_new(weight, sources)
@@ -692,8 +692,14 @@ mod tests {
         PackedPayload::try_new(
             weight,
             [
-                (SourceRole::Planar(OperandRole::Codes), Arc::from(codes)),
-                (SourceRole::Planar(OperandRole::Scale), Arc::from(scales)),
+                (
+                    SourceRole::Planar(OperandRole::Codes),
+                    StoredBytes::from(codes),
+                ),
+                (
+                    SourceRole::Planar(OperandRole::Scale),
+                    StoredBytes::from(scales),
+                ),
             ],
         )
         .unwrap()
@@ -762,7 +768,7 @@ mod tests {
             PackedWeight::try_new(format, [8, 16]).unwrap(),
             gptq_sources(None)
                 .into_iter()
-                .map(|(role, bytes)| (SourceRole::Planar(role), Arc::from(bytes))),
+                .map(|(role, bytes)| (SourceRole::Planar(role), StoredBytes::from(bytes))),
         )
         .unwrap();
         assert_eq!(

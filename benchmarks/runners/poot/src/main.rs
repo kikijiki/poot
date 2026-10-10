@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use serde_json::{json, Value};
 
+use poot_executor::DetailedTiming;
 use poot_graph_plan::{CompileOptions, Submission};
 use poot_llm::driver::error::DriverError;
 #[cfg(test)]
@@ -577,7 +578,7 @@ fn open_driver(
     };
     let capacity = NonZeroUsize::new(longest).context("the longest request is empty")?;
     let executor = if config.profile {
-        open_timed_executor(backend)
+        open_timed_executor(backend, DetailedTiming::default_diagnostic())
     } else {
         open_executor(backend)
     }

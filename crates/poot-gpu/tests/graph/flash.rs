@@ -58,7 +58,7 @@ fn flash_decode_gpu_matches_cpu() {
     let v = b.constant("v", TensorType::f32(vec![1, hkv, cap, d]));
     let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
     let y = attention_masked(&b, q, k, v, n_rep, scale, mask);
-    let (qi, ki, vi, mi) = (q.id, k.id, v.id, mask.id);
+    let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
     let g = b.finish(y);
     let choice = compiled_choice(&g, &target, |op| matches!(op, OpKind::Attention(_)));
     assert!(is_attention_decode(&choice), "{choice:?}");
@@ -116,7 +116,7 @@ fn attention_decode_matches_cpu() {
         let v = b.constant("v", TensorType::f32(vec![1, hkv, cap, d]));
         let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
         let y = attention_masked(&b, q, k, v, n_rep, scale, mask);
-        let (qi, ki, vi, mi) = (q.id, k.id, v.id, mask.id);
+        let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
         let g = b.finish(y);
 
         let choice = compiled_choice(&g, &spirv_fixture_target(), |op| {
@@ -217,7 +217,7 @@ fn attention_over_many_key_tiles_matches_cpu() {
         let k = b.constant("k", TensorType::f32(vec![batch, hkv, lk, d]));
         let v = b.constant("v", TensorType::f32(vec![batch, hkv, lk, d]));
         let mask = b.constant("mask", TensorType::f32(vec![batch, 1, lq, lk]));
-        let ids = [q.id, k.id, v.id, mask.id];
+        let ids = [q.id(), k.id(), v.id(), mask.id()];
         let y = attention_masked(&b, q, k, v, n_rep, scale, mask);
         let g = b.finish(y);
         let choice = compiled_choice(&g, &spirv_fixture_target(), |op| {
@@ -301,7 +301,7 @@ fn attention_prefill_into_a_cache_matches_cpu() {
     let k = b.constant("k", TensorType::f32(vec![1, hkv, lk, d]));
     let v = b.constant("v", TensorType::f32(vec![1, hkv, lk, d]));
     let mask = b.constant("m", TensorType::f32(vec![1, 1, lq, lk]));
-    let ids = [q.id, k.id, v.id, mask.id];
+    let ids = [q.id(), k.id(), v.id(), mask.id()];
     let y = attention_prefill(&b, q, k, v, hq / hkv, 0.25, mask);
     let g = b.finish(y);
     let choice = compiled_choice(&g, &spirv_fixture_target(), |op| {
@@ -391,7 +391,7 @@ fn attention_batched_decode_matches_cpu() {
         let k = b.constant("k", TensorType::f32(vec![bsz, hkv, cap, d]));
         let v = b.constant("v", TensorType::f32(vec![bsz, hkv, cap, d]));
         let mask = b.constant("m", TensorType::f32(vec![bsz, 1, 1, cap]));
-        let ids = [q.id, k.id, v.id, mask.id];
+        let ids = [q.id(), k.id(), v.id(), mask.id()];
         let y = attention_masked(&b, q, k, v, n_rep, scale, mask);
         let g = b.finish(y);
 
@@ -477,7 +477,7 @@ fn attention_prefill_matches_cpu() {
         let k = b.constant("k", TensorType::f32(vec![1, hkv, l, d]));
         let v = b.constant("v", TensorType::f32(vec![1, hkv, l, d]));
         let mask = b.constant("m", TensorType::f32(vec![1, 1, l, l]));
-        let (qi, ki, vi, mi) = (q.id, k.id, v.id, mask.id);
+        let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
         let o = attention_prefill(&b, q, k, v, n_rep, scale, mask);
         let g = b.finish(o);
 
@@ -561,7 +561,7 @@ fn attention_prefill_d512_matches_cpu() {
     let k = b.constant("k", TensorType::f32(vec![1, hkv, l, d]));
     let v = b.constant("v", TensorType::f32(vec![1, hkv, l, d]));
     let mask = b.constant("m", TensorType::f32(vec![1, 1, l, l]));
-    let (qi, ki, vi, mi) = (q.id, k.id, v.id, mask.id);
+    let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
     let o = attention_prefill(&b, q, k, v, n_rep, scale, mask);
     let g = b.finish(o);
 
@@ -683,8 +683,14 @@ fn synthesized_production_kernels_random_shapes_match_cpu() {
             "seed {seed}: an M>1 matmul should choose the tiled GEMM, got {choice:?}"
         );
         let mut inputs = HashMap::new();
-        inputs.insert(x.id, HostTensor::f32(vec![m, k], fill(seed * 7 + 1, m * k)));
-        inputs.insert(w.id, HostTensor::f32(vec![k, n], fill(seed * 7 + 2, k * n)));
+        inputs.insert(
+            x.id(),
+            HostTensor::f32(vec![m, k], fill(seed * 7 + 1, m * k)),
+        );
+        inputs.insert(
+            w.id(),
+            HostTensor::f32(vec![k, n], fill(seed * 7 + 2, k * n)),
+        );
         let eval_inputs: HashMap<_, Value> = inputs
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
@@ -727,7 +733,7 @@ fn synthesized_production_kernels_random_shapes_match_cpu() {
             let k = b.constant("k", TensorType::f32(vec![1, hkv, l, d]));
             let v = b.constant("v", TensorType::f32(vec![1, hkv, l, d]));
             let mask = b.constant("m", TensorType::f32(vec![1, 1, l, l]));
-            let (qi, ki, vi, mi) = (q.id, k.id, v.id, mask.id);
+            let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
             let o = attention_prefill(&b, q, k, v, n_rep, scale, mask);
             let g = b.finish(o);
             let choice = compiled_choice(&g, &spirv_fixture_target(), |op| {
@@ -781,7 +787,7 @@ fn synthesized_production_kernels_random_shapes_match_cpu() {
             let k = b.constant("k", TensorType::f32(vec![1, hkv, cap, d]));
             let v = b.constant("v", TensorType::f32(vec![1, hkv, cap, d]));
             let mask = b.constant("m", TensorType::f32(vec![1, 1, 1, cap]));
-            let (qi, ki, vi, mi) = (q.id, k.id, v.id, mask.id);
+            let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
             let o = attention_masked(&b, q, k, v, n_rep, scale, mask);
             let g = b.finish(o);
             let choice = compiled_choice(&g, &spirv_fixture_target(), |op| {
@@ -884,7 +890,7 @@ fn flash_decode_batched_gpu_matches_cpu() {
         let k = b.constant("k", TensorType::f32(vec![bsz, hkv, cap, d]));
         let v = b.constant("v", TensorType::f32(vec![bsz, hkv, cap, d]));
         let mask = b.constant("m", TensorType::f32(vec![bsz, 1, 1, cap]));
-        let ids = [q.id, k.id, v.id, mask.id];
+        let ids = [q.id(), k.id(), v.id(), mask.id()];
         let y = attention_masked(&b, q, k, v, n_rep, scale, mask);
         let g = b.finish(y);
         let md: Vec<f32> = (0..bsz * cap)
@@ -1046,7 +1052,7 @@ fn flash_decode_gpu_matches_cpu_over_random_shapes() {
         let v = b.constant("v", TensorType::f32(vec![1, hkv, cap, d]));
         let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
         let y = attention_masked(&b, q, k, v, n_rep, scale, mask);
-        let (qi, ki, vi, mi) = (q.id, k.id, v.id, mask.id);
+        let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
         let g = b.finish(y);
 
         // mask: position 0 always kept; each other position randomly masked (additive -1e9).
@@ -1128,7 +1134,7 @@ fn flash_prefill_gpu_2d_grid_over_65535_workgroups() {
     let k = b.constant("k", TensorType::f32(vec![1, hkv, l, d]));
     let v = b.constant("v", TensorType::f32(vec![1, hkv, l, d]));
     let mask = b.constant("m", TensorType::f32(vec![1, 1, l, l]));
-    let ids = [q.id, k.id, v.id, mask.id];
+    let ids = [q.id(), k.id(), v.id(), mask.id()];
     let mut plan = b.append_plan(0);
     let o = plan
         .equation(
@@ -1138,8 +1144,8 @@ fn flash_prefill_gpu_2d_grid_over_65535_workgroups() {
         .expect("stage the flash prefill");
     plan.declare_result(o).expect("declare the result");
     let mut prepared = b.preflight_append(plan).expect("preflight");
-    let id = b.commit_append(&mut prepared).expect("commit");
-    let g = b.finish(poot_graph_ir::Traced { id });
+    let out = b.commit_append(&mut prepared).expect("commit");
+    let g = b.finish(out);
     assert!(
         is_attention_prefill(&compiled_choice(&g, &target, |op| {
             matches!(op, OpKind::Attention(_))
@@ -1209,7 +1215,7 @@ fn decomposed_prefill_attention_over_65535_query_groups_matches_cpu() {
     let k = b.constant("k", TensorType::f32(vec![1, hq, l, d]));
     let v = b.constant("v", TensorType::f32(vec![1, hq, l, d]));
     let mask = b.constant("m", TensorType::f32(vec![1, 1, l, l]));
-    let ids = [q.id, k.id, v.id, mask.id];
+    let ids = [q.id(), k.id(), v.id(), mask.id()];
     let o = attention_prefill(&b, q, k, v, 1, 0.3, mask);
     let g = b.finish(o);
     assert!(
@@ -1299,7 +1305,7 @@ fn flash_prefill_gpu_matches_cpu_over_random_shapes() {
         let k = b.constant("k", TensorType::f32(vec![1, hkv, l, d]));
         let v = b.constant("v", TensorType::f32(vec![1, hkv, l, d]));
         let mask = b.constant("m", TensorType::f32(vec![1, 1, l, l]));
-        let ids = [q.id, k.id, v.id, mask.id];
+        let ids = [q.id(), k.id(), v.id(), mask.id()];
         let softcap = (!seed.is_multiple_of(2)).then_some(30.0f32);
         let o = attention_prefill_softcap(&b, q, k, v, n_rep, scale, mask, softcap);
         let g = b.finish(o);
@@ -1399,8 +1405,14 @@ fn synthesized_tiled_region_element_by_element_matches_cpu() {
         let x = b.constant("x", TensorType::f32(vec![m, k]));
         let w = b.constant("w", TensorType::f32(vec![k, n]));
         let mut inputs = HashMap::new();
-        inputs.insert(x.id, HostTensor::f32(vec![m, k], fill(seed * 7 + 1, m * k)));
-        inputs.insert(w.id, HostTensor::f32(vec![k, n], fill(seed * 7 + 2, k * n)));
+        inputs.insert(
+            x.id(),
+            HostTensor::f32(vec![m, k], fill(seed * 7 + 1, m * k)),
+        );
+        inputs.insert(
+            w.id(),
+            HostTensor::f32(vec![k, n], fill(seed * 7 + 2, k * n)),
+        );
         let out = b.matmul(x, w);
         let g = b.finish(out);
 
@@ -1478,8 +1490,8 @@ fn synthesized_tiled_region_chunked_large_matches_cpu() {
     let xd: Vec<f32> = (0..m * k).map(|i| ((i % 7) as f32) * 0.1 - 0.3).collect();
     let wd: Vec<f32> = (0..k * n).map(|i| ((i % 5) as f32) * 0.08 - 0.16).collect();
     let mut inputs = HashMap::new();
-    inputs.insert(x.id, HostTensor::f32(vec![m, k], xd));
-    inputs.insert(w.id, HostTensor::f32(vec![k, n], wd));
+    inputs.insert(x.id(), HostTensor::f32(vec![m, k], xd));
+    inputs.insert(w.id(), HostTensor::f32(vec![k, n], wd));
     let eval_inputs: HashMap<_, Value> = inputs
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
@@ -1635,7 +1647,7 @@ fn flash_per_head_alibi_mask_gpu_matches_cpu() {
         let v = b.constant("v", TensorType::f32(vec![1, hkv, cap, d]));
         let mask = b.constant("mask", TensorType::f32(vec![1, hq, 1, cap]));
         let y = attention_masked(&b, q, k, v, n_rep, scale, mask);
-        let (qi, ki, vi, mi) = (q.id, k.id, v.id, mask.id);
+        let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
         let g = b.finish(y);
         let md = decode_mask(cap, pos);
         let mut inputs = HashMap::new();
@@ -1660,7 +1672,7 @@ fn flash_per_head_alibi_mask_gpu_matches_cpu() {
         let bv = bb.constant("v", TensorType::f32(vec![1, hkv, cap, d]));
         let bmask = bb.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
         let by = attention_masked(&bb, bq, bk, bv, n_rep, scale, bmask);
-        let (bqi, bki, bvi, bmi) = (bq.id, bk.id, bv.id, bmask.id);
+        let (bqi, bki, bvi, bmi) = (bq.id(), bk.id(), bv.id(), bmask.id());
         let gb = bb.finish(by);
         let mut bcast_inputs = HashMap::new();
         bcast_inputs.insert(bqi, HostTensor::f32(vec![1, hq, 1, d], fill(1, hq * d)));
@@ -1704,7 +1716,7 @@ fn flash_per_head_alibi_mask_gpu_matches_cpu() {
         let v = b.constant("v", TensorType::f32(vec![1, hkv, l, d]));
         let mask = b.constant("m", TensorType::f32(vec![1, hq, l, l]));
         let y = attention_prefill_softcap(&b, q, k, v, n_rep, scale, mask, softcap);
-        let (qi, ki, vi, mi) = (q.id, k.id, v.id, mask.id);
+        let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
         let g = b.finish(y);
         let md = prefill_mask(l);
         let mut inputs = HashMap::new();
@@ -1728,7 +1740,7 @@ fn flash_per_head_alibi_mask_gpu_matches_cpu() {
         let bv = bb.constant("v", TensorType::f32(vec![1, hkv, l, d]));
         let bmask = bb.constant("m", TensorType::f32(vec![1, 1, l, l]));
         let by = attention_prefill_softcap(&bb, bq, bk, bv, n_rep, scale, bmask, softcap);
-        let (bqi, bki, bvi, bmi) = (bq.id, bk.id, bv.id, bmask.id);
+        let (bqi, bki, bvi, bmi) = (bq.id(), bk.id(), bv.id(), bmask.id());
         let gb = bb.finish(by);
         let mut bcast_inputs = HashMap::new();
         bcast_inputs.insert(bqi, HostTensor::f32(vec![1, hq, l, d], fill(4, hq * l * d)));
@@ -1815,7 +1827,7 @@ fn gemma2_softcap_decode_gpu_matches_cpu() {
     // Scale 4.0 pushes the raw scores far past the cap of 3.0.
     let y =
         poot_graph_ir::ops::attention_masked_softcap(&b, q, k, v, hq / hkv, 4.0, mask, Some(3.0));
-    let (qi, ki, vi, mi) = (q.id, k.id, v.id, mask.id);
+    let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
     let g = b.finish(y);
     let choice = compiled_choice(&g, &target, |op| matches!(op, OpKind::Attention(_)));
     assert!(
@@ -1861,7 +1873,7 @@ fn deepseek_v2_mla_split_key_decode_gpu_matches_cpu() {
     let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
     let key = b.concat(3, &[k_nope, poot_graph_ir::ops::repeat_kv(&b, k_pe, hq)]);
     let y = poot_graph_ir::ops::attention_masked(&b, q, key, v, 1, 0.07, mask);
-    let ids = (q.id, k_nope.id, k_pe.id, v.id, mask.id);
+    let ids = (q.id(), k_nope.id(), k_pe.id(), v.id(), mask.id());
     let g = b.finish(y);
     let choice = compiled_choice(&g, &target, |op| matches!(op, OpKind::Attention(_)));
     let spec = generated_attention(&choice).expect("the MLA chain is the generated attention");

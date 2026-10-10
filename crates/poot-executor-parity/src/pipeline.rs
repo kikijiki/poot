@@ -29,6 +29,7 @@ use poot_graph_plan::{
     StagedProgram, Submission, Target, TargetSet, compile_staged,
 };
 use poot_models::model::{LogitRows, Phase};
+use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
 use poot_runtime_common::CompiledKernel;
 use poot_target::BufferStorage;
@@ -85,7 +86,7 @@ fn store_for(g: &Graph) -> WeightStore {
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect();
-        let dense = DenseWeight::try_new(DType::F32, shape, Arc::from(bytes)).unwrap();
+        let dense = DenseWeight::try_new(DType::F32, shape, StoredBytes::from(bytes)).unwrap();
         builder.insert(name, WeightEntry::Dense(dense)).unwrap();
     }
     builder.build()
@@ -462,7 +463,7 @@ fn export_fixture() -> (Graph<ValidationOutputs>, Graph) {
         .with_validations(vec![poot_graph_ir::ValidationOutput {
             id: ValidationId(1),
             name: "d_not_positive".to_owned(),
-            value: witness.id,
+            value: witness.id(),
         }]);
     validated.validate().expect("the export fixture validates");
     (validated, graph)
@@ -569,13 +570,14 @@ impl<D: Device> Device for Counting<D> {
     fn replay(&mut self, recording: &Self::Recording) -> Result<(), Self::Error> {
         self.inner.replay(recording)
     }
-    fn write(
+    fn write_with(
         &mut self,
         dst: &Self::Buffer,
         offset: usize,
-        bytes: &[u8],
+        len: usize,
+        fill: &mut dyn FnMut(std::ops::Range<usize>, &mut [u8]),
     ) -> Result<(), Self::Error> {
-        self.inner.write(dst, offset, bytes)
+        self.inner.write_with(dst, offset, len, fill)
     }
     fn read(&mut self, src: &Self::Buffer, out: &mut [u8]) -> Result<(), Self::Error> {
         self.inner.read(src, out)

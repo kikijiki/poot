@@ -121,10 +121,13 @@ fn exact_i32_binary_uses_authoritative_words_with_scalar_and_broadcast_forms() {
     let g = b.finish(out);
     let mut inputs = HashMap::new();
     inputs.insert(
-        x.id,
+        x.id(),
         Value::from(i32_tensor(vec![2, 1], &[16_777_217, i32::MAX])),
     );
-    inputs.insert(y.id, Value::from(i32_tensor(vec![1, 3], &[0, 1, i32::MIN])));
+    inputs.insert(
+        y.id(),
+        Value::from(i32_tensor(vec![1, 3], &[0, 1, i32::MIN])),
+    );
     let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
         .unwrap()
         .output
@@ -143,7 +146,7 @@ fn exact_i32_binary_uses_authoritative_words_with_scalar_and_broadcast_forms() {
 
     // 2^24+1 is not an f32: the bound input keeps its exact word and the computed output is an
     // I32 tensor with no f32 payload, so the exact result cannot have gone through an f32 rounding.
-    let Value::Host(x_tensor) = &inputs[&x.id] else {
+    let Value::Host(x_tensor) = &inputs[&x.id()] else {
         panic!("expected a host I32 carrier for x")
     };
     assert_eq!(x_tensor.as_i32().unwrap()[0], 16_777_217);
@@ -162,10 +165,10 @@ fn signed_and_unsigned_i32_comparisons_diverge_at_the_sign_bit() {
     let g = b.finish(unsigned);
     let mut inputs = HashMap::new();
     inputs.insert(
-        x.id,
+        x.id(),
         Value::from(i32_tensor(vec![4], &[0, 1, i32::MAX, i32::MIN])),
     );
-    inputs.insert(zero.id, Value::from(i32_tensor(vec![4], &[0; 4])));
+    inputs.insert(zero.id(), Value::from(i32_tensor(vec![4], &[0; 4])));
     let env = eval(
         &g,
         &inputs,
@@ -175,15 +178,20 @@ fn signed_and_unsigned_i32_comparisons_diverge_at_the_sign_bit() {
     .environment
     .unwrap();
     assert_eq!(
-        env[max.id].as_ref().unwrap().as_host().unwrap().as_i32(),
+        env[max.id()].as_ref().unwrap().as_host().unwrap().as_i32(),
         Some(&[0, 1, i32::MAX, 0][..])
     );
     assert_eq!(
-        env[signed.id].as_ref().unwrap().as_host().unwrap().as_i32(),
+        env[signed.id()]
+            .as_ref()
+            .unwrap()
+            .as_host()
+            .unwrap()
+            .as_i32(),
         Some(&[1, 1, 1, 0][..])
     );
     assert_eq!(
-        env[unsigned.id]
+        env[unsigned.id()]
             .as_ref()
             .unwrap()
             .as_host()
@@ -215,8 +223,8 @@ fn unsigned_remainder_matches_u32_modulus_literals_above_the_sign_bit() {
     let out = b.binary(BinOp::RemU, x, m);
     let g = b.finish(out);
     let mut inputs = HashMap::new();
-    inputs.insert(x.id, Value::from(i32_tensor(vec![5], &dividends)));
-    inputs.insert(m.id, Value::from(i32_tensor(vec![5], &divisors)));
+    inputs.insert(x.id(), Value::from(i32_tensor(vec![5], &dividends)));
+    inputs.insert(m.id(), Value::from(i32_tensor(vec![5], &divisors)));
     let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
         .unwrap()
         .output
@@ -245,8 +253,8 @@ fn unsigned_remainder_matches_u32_modulus_literals_above_the_sign_bit() {
     let err = eval(
         &g0,
         &HashMap::from([
-            (x0.id, Value::from(i32_tensor(vec![1], &[1]))),
-            (m0.id, Value::from(i32_tensor(vec![1], &[0]))),
+            (x0.id(), Value::from(i32_tensor(vec![1], &[1]))),
+            (m0.id(), Value::from(i32_tensor(vec![1], &[0]))),
         ]),
         EvalOptions::new(EvalBudget::UNBOUNDED),
     )
@@ -266,7 +274,7 @@ fn i32_broadcast_preserves_words_and_bounded_index_inputs_remain_compatible() {
     let g = b.finish(out);
     let mut inputs = HashMap::new();
     inputs.insert(
-        words.id,
+        words.id(),
         Value::from(i32_tensor(vec![2, 1], &[16_777_217, i32::MIN])),
     );
     assert_eq!(
@@ -301,13 +309,13 @@ fn i32_broadcast_preserves_words_and_bounded_index_inputs_remain_compatible() {
     let g = b.finish(row);
     let mut inputs = HashMap::new();
     inputs.insert(
-        table.id,
+        table.id(),
         Value::from(HostTensor::f32(
             vec![3, 2],
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
         )),
     );
-    inputs.insert(index.id, Value::from(HostTensor::i32(vec![], vec![2])));
+    inputs.insert(index.id(), Value::from(HostTensor::i32(vec![], vec![2])));
     assert_eq!(
         eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
             .unwrap()
@@ -328,7 +336,7 @@ fn i32_words_are_exact_and_a_non_i32_bind_is_refused() {
     let g = b.finish(out);
     // 2^24 + 1 is not an f32: the sum is exact only because the words are never widened.
     let mut inputs = HashMap::from([(
-        x.id,
+        x.id(),
         Value::from(HostTensor::i32(vec![1], vec![16_777_217])),
     )]);
     assert_eq!(
@@ -343,7 +351,7 @@ fn i32_words_are_exact_and_a_non_i32_bind_is_refused() {
 
     // An F32 tensor is not an I32 input: there is no implicit conversion at bind.
     inputs.insert(
-        x.id,
+        x.id(),
         Value::from(HostTensor::f32(vec![1], vec![16_777_216.0])),
     );
     let error = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -364,10 +372,10 @@ fn exact_concat_combines_two_authoritative_i32_parts() {
     let g = b.finish(out);
     let inputs = HashMap::from([
         (
-            exact.id,
+            exact.id(),
             Value::from(HostTensor::i32(vec![1], vec![i32::MIN])),
         ),
-        (legacy.id, Value::from(HostTensor::i32(vec![1], vec![7]))),
+        (legacy.id(), Value::from(HostTensor::i32(vec![1], vec![7]))),
     ]);
     let env = eval(
         &g,
@@ -378,11 +386,16 @@ fn exact_concat_combines_two_authoritative_i32_parts() {
     .environment
     .unwrap();
     assert_eq!(
-        env[joined.id].as_ref().unwrap().as_host().unwrap().as_i32(),
+        env[joined.id()]
+            .as_ref()
+            .unwrap()
+            .as_host()
+            .unwrap()
+            .as_i32(),
         Some(&[i32::MIN, 7][..])
     );
     assert_eq!(
-        env[out.id].as_ref().unwrap().as_host().unwrap().as_i32(),
+        env[out.id()].as_ref().unwrap().as_host().unwrap().as_i32(),
         Some(&[i32::MIN, 7][..])
     );
 }
@@ -397,7 +410,7 @@ fn exact_i32_scalar_empty_overflow_and_error_precedence_are_total() {
         eval(
             &scalar_graph,
             &HashMap::from([(
-                scalar.id,
+                scalar.id(),
                 Value::from(HostTensor::i32(vec![], vec![i32::MAX]))
             )]),
             EvalOptions::new(EvalBudget::UNBOUNDED),
@@ -418,7 +431,7 @@ fn exact_i32_scalar_empty_overflow_and_error_precedence_are_total() {
     empty_graph.eqns[0].op = poot_graph_ir::OpKind::Binary(BinOp::Div);
     let error = eval(
         &empty_graph,
-        &HashMap::from([(empty.id, Value::from(empty_words))]),
+        &HashMap::from([(empty.id(), Value::from(empty_words))]),
         EvalOptions::new(EvalBudget::UNBOUNDED),
     )
     .unwrap_err()
@@ -459,10 +472,10 @@ fn exact_i32_bit_select_and_clz_match_wrapping_word_semantics() {
     let g = b.finish(selected);
     let mut inputs = HashMap::new();
     inputs.insert(
-        x.id,
+        x.id(),
         Value::from(i32_tensor(vec![4], &[0, -1, i32::MIN, 1])),
     );
-    inputs.insert(y.id, Value::from(i32_tensor(vec![4], &[7, 0, 1, 33])));
+    inputs.insert(y.id(), Value::from(i32_tensor(vec![4], &[7, 0, 1, 33])));
     let env = eval(
         &g,
         &inputs,
@@ -480,17 +493,20 @@ fn exact_i32_bit_select_and_clz_match_wrapping_word_semantics() {
             .as_i32()
             .map(<[i32]>::to_vec)
     };
-    assert_eq!(dense_ints(and.id), Some(vec![0, 0, 0, 1]));
-    assert_eq!(dense_ints(or.id), Some(vec![7, -1, i32::MIN | 1, 33]));
-    assert_eq!(dense_ints(xor.id), Some(vec![7, -1, i32::MIN ^ 1, 32]));
-    assert_eq!(dense_ints(shl.id), Some(vec![0, -2, 0, 2]));
+    assert_eq!(dense_ints(and.id()), Some(vec![0, 0, 0, 1]));
+    assert_eq!(dense_ints(or.id()), Some(vec![7, -1, i32::MIN | 1, 33]));
+    assert_eq!(dense_ints(xor.id()), Some(vec![7, -1, i32::MIN ^ 1, 32]));
+    assert_eq!(dense_ints(shl.id()), Some(vec![0, -2, 0, 2]));
     assert_eq!(
-        dense_ints(shr.id),
+        dense_ints(shr.id()),
         Some(vec![0, -1, ((i32::MIN as u32) >> 1) as i32, 0])
     );
-    assert_eq!(dense_ints(not.id), Some(vec![-1, 0, i32::MAX, -2]));
-    assert_eq!(dense_ints(clz.id), Some(vec![32, 0, 0, 31]));
-    assert_eq!(dense_ints(selected.id), Some(vec![7, -1, i32::MIN ^ 1, 33]));
+    assert_eq!(dense_ints(not.id()), Some(vec![-1, 0, i32::MAX, -2]));
+    assert_eq!(dense_ints(clz.id()), Some(vec![32, 0, 0, 31]));
+    assert_eq!(
+        dense_ints(selected.id()),
+        Some(vec![7, -1, i32::MIN ^ 1, 33])
+    );
 }
 
 #[test]
@@ -501,7 +517,7 @@ fn clz_of_zero_and_sign_bit_are_defined() {
     let g = b.finish(out);
     let got = eval(
         &g,
-        &HashMap::from([(x.id, Value::from(i32_tensor(vec![2], &[0, i32::MIN])))]),
+        &HashMap::from([(x.id(), Value::from(i32_tensor(vec![2], &[0, i32::MIN])))]),
         EvalOptions::new(EvalBudget::UNBOUNDED),
     )
     .unwrap()
@@ -522,9 +538,9 @@ fn select_takes_if_true_for_any_nonzero_condition_word() {
     let got = eval(
         &g,
         &HashMap::from([
-            (cond.id, Value::from(i32_tensor(vec![2], &[2, -1]))),
-            (if_true.id, Value::from(i32_tensor(vec![2], &[10, 10]))),
-            (if_false.id, Value::from(i32_tensor(vec![2], &[3, 3]))),
+            (cond.id(), Value::from(i32_tensor(vec![2], &[2, -1]))),
+            (if_true.id(), Value::from(i32_tensor(vec![2], &[10, 10]))),
+            (if_false.id(), Value::from(i32_tensor(vec![2], &[3, 3]))),
         ]),
         EvalOptions::new(EvalBudget::UNBOUNDED),
     )
@@ -624,8 +640,8 @@ fn exact_i32_gather_reads_an_owner_backed_bf16_data_source() {
     let result = eval(
         &graph,
         &HashMap::from([
-            (table.id, Value::Owner(ExactValue::Dense(view))),
-            (index.id, exact_view(vec![2], [3, 1])),
+            (table.id(), Value::Owner(ExactValue::Dense(view))),
+            (index.id(), exact_view(vec![2], [3, 1])),
         ]),
         EvalOptions::new(EvalBudget::UNBOUNDED),
     )
@@ -658,8 +674,8 @@ fn exact_i32_gather_reads_an_owner_backed_f32_data_source() {
     let result = eval(
         &graph,
         &HashMap::from([
-            (table.id, Value::Owner(ExactValue::Dense(view))),
-            (index.id, exact_view(vec![2], [2, 0])),
+            (table.id(), Value::Owner(ExactValue::Dense(view))),
+            (index.id(), exact_view(vec![2], [2, 0])),
         ]),
         EvalOptions::new(EvalBudget::UNBOUNDED),
     )
@@ -687,8 +703,8 @@ fn exact_i32_gather_still_checks_bounds_on_an_owner_backed_data_source() {
     let result = eval(
         &graph,
         &HashMap::from([
-            (table.id, Value::Owner(ExactValue::Dense(view))),
-            (index.id, exact_view(vec![1], [5])),
+            (table.id(), Value::Owner(ExactValue::Dense(view))),
+            (index.id(), exact_view(vec![1], [5])),
         ]),
         EvalOptions::new(EvalBudget::UNBOUNDED),
     );
@@ -725,15 +741,15 @@ fn exact_i32_gather_owner_backed_path_agrees_with_the_plain_dense_path() {
         .reshape(vec![2, 3])
         .unwrap();
     let owner_inputs = HashMap::from([
-        (table.id, Value::Owner(ExactValue::Dense(view))),
-        (index.id, exact_view(vec![2], [2, 0])),
+        (table.id(), Value::Owner(ExactValue::Dense(view))),
+        (index.id(), exact_view(vec![2], [2, 0])),
     ]);
     let dense_inputs = HashMap::from([
         (
-            table.id,
+            table.id(),
             Value::Host(crate::ops::cast::narrow_f32(vec![2, 3], &values, DType::BF16).unwrap()),
         ),
-        (index.id, exact_view(vec![2], [2, 0])),
+        (index.id(), exact_view(vec![2], [2, 0])),
     ]);
 
     let owner_result = eval(
@@ -787,8 +803,8 @@ fn exact_i32_gather_does_not_materialize_the_whole_owner_backed_source() {
     let (builder, table, index, output) = gather_graph(ROWS, DType::BF16, 2);
     let graph = builder.finish(output);
     let inputs = HashMap::from([
-        (table.id, Value::Owner(ExactValue::Dense(view))),
-        (index.id, exact_view(vec![2], [3, ROWS as i32 - 1])),
+        (table.id(), Value::Owner(ExactValue::Dense(view))),
+        (index.id(), exact_view(vec![2], [3, ROWS as i32 - 1])),
     ]);
 
     let (result, bytes) = allocated_bytes(|| {
@@ -837,7 +853,7 @@ fn owner_backed_bf16_constant_consumed_by_a_plain_binary_is_refused() {
     let view = owner_backed_bf16_dense("norm", &[3.0, -1.0]);
     let error = eval(
         &graph,
-        &HashMap::from([(table.id, Value::Owner(ExactValue::Dense(view)))]),
+        &HashMap::from([(table.id(), Value::Owner(ExactValue::Dense(view)))]),
         EvalOptions::new(EvalBudget::UNBOUNDED),
     )
     .unwrap_err();
@@ -847,7 +863,7 @@ fn owner_backed_bf16_constant_consumed_by_a_plain_binary_is_refused() {
     else {
         panic!("expected a refused GraphConsumer, got {error:?}")
     };
-    assert_eq!(*value_id, table.id);
+    assert_eq!(*value_id, table.id());
     assert_eq!(consumer, "add");
 }
 
@@ -864,8 +880,8 @@ fn exact_i32_compare_sub_select_are_wordwise() {
     let output = builder.select(difference, signed, unsigned);
     let graph = builder.finish(output);
     let inputs = HashMap::from([
-        (left.id, exact_view(vec![2], [i32::MIN, i32::MAX])),
-        (right.id, exact_view(vec![2], [0, -1])),
+        (left.id(), exact_view(vec![2], [i32::MIN, i32::MAX])),
+        (right.id(), exact_view(vec![2], [0, -1])),
     ]);
     let result = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
         .unwrap()
@@ -889,8 +905,8 @@ fn exact_i32_compare_sub_select_are_wordwise() {
     let result = eval(
         &graph,
         &HashMap::from([
-            (left.id, exact_view(vec![1], [7])),
-            (right.id, exact_view(vec![1], [7])),
+            (left.id(), exact_view(vec![1], [7])),
+            (right.id(), exact_view(vec![1], [7])),
         ]),
         EvalOptions::new(EvalBudget::UNBOUNDED),
     )
@@ -915,8 +931,8 @@ fn exact_i32_gather_preserves_large_words() {
     let result = eval(
         &graph,
         &HashMap::from([
-            (table.id, table_value.clone()),
-            (index.id, exact_view(vec![2], [0, 2])),
+            (table.id(), table_value.clone()),
+            (index.id(), exact_view(vec![2], [0, 2])),
         ]),
         EvalOptions::new(EvalBudget::UNBOUNDED),
     )
@@ -939,8 +955,8 @@ fn exact_i32_gather_preserves_large_words() {
         let outcome = eval(
             &graph,
             &HashMap::from([
-                (table.id, table_value.clone()),
-                (index.id, exact_view(vec![2], [1, bad])),
+                (table.id(), table_value.clone()),
+                (index.id(), exact_view(vec![2], [1, bad])),
             ]),
             EvalOptions::new(EvalBudget::UNBOUNDED),
         );
@@ -976,11 +992,11 @@ fn selected_cast_checks_before_allocation() {
     let cast = builder.cast(selected, DType::F32);
     let graph = builder.finish(cast);
     let valid_inputs = HashMap::from([
-        (table.id, exact_view(vec![3], [0, 1, 2])),
-        (index.id, exact_view(vec![2], [0, 2])),
+        (table.id(), exact_view(vec![3], [0, 1, 2])),
+        (index.id(), exact_view(vec![2], [0, 2])),
     ]);
     let mut ceiling_role = |value: poot_graph_ir::ValueId| {
-        (value == cast.id).then_some(ExactI32CastRole::HostCheckedSelector(ExactI32CastBounds {
+        (value == cast.id()).then_some(ExactI32CastRole::HostCheckedSelector(ExactI32CastBounds {
             selected_element_ceiling: 1,
             expert_count: 3,
         }))
@@ -997,7 +1013,7 @@ fn selected_cast_checks_before_allocation() {
     ));
 
     let mut range_role = |value: poot_graph_ir::ValueId| {
-        (value == cast.id).then_some(ExactI32CastRole::HostCheckedSelector(ExactI32CastBounds {
+        (value == cast.id()).then_some(ExactI32CastRole::HostCheckedSelector(ExactI32CastBounds {
             selected_element_ceiling: 2,
             expert_count: 3,
         }))
@@ -1005,8 +1021,8 @@ fn selected_cast_checks_before_allocation() {
     let error = eval(
         &graph,
         &HashMap::from([
-            (table.id, exact_view(vec![3], [0, 16_777_217, 2])),
-            (index.id, exact_view(vec![2], [0, 1])),
+            (table.id(), exact_view(vec![3], [0, 16_777_217, 2])),
+            (index.id(), exact_view(vec![2], [0, 1])),
         ]),
         EvalOptions::new(EvalBudget::UNBOUNDED).cast_authority(&mut range_role),
     )
@@ -1019,7 +1035,7 @@ fn selected_cast_checks_before_allocation() {
     ));
 
     let mut expert_role = |value: poot_graph_ir::ValueId| {
-        (value == cast.id).then_some(ExactI32CastRole::HostCheckedSelector(ExactI32CastBounds {
+        (value == cast.id()).then_some(ExactI32CastRole::HostCheckedSelector(ExactI32CastBounds {
             selected_element_ceiling: 2,
             expert_count: 2,
         }))
@@ -1037,7 +1053,7 @@ fn selected_cast_checks_before_allocation() {
     ));
 
     let mut accept_role = |value: poot_graph_ir::ValueId| {
-        (value == cast.id).then_some(ExactI32CastRole::HostCheckedSelector(ExactI32CastBounds {
+        (value == cast.id()).then_some(ExactI32CastRole::HostCheckedSelector(ExactI32CastBounds {
             selected_element_ceiling: 2,
             expert_count: 3,
         }))
@@ -1065,16 +1081,16 @@ fn exact_i32_errors_preserve_typed_sources() {
     let builder = Builder::new();
     let value = helpers::i32_constant(&builder, "value", vec![1]).unwrap();
     let mut graph = builder.finish(value);
-    graph.output = usize::MAX;
+    graph.output = poot_graph_ir::ValueId::new(u32::MAX);
     assert!(matches!(
         eval(
             &graph,
-            &HashMap::from([(value.id, exact_view(vec![1], [1]))]),
+            &HashMap::from([(value.id(), exact_view(vec![1], [1]))]),
             EvalOptions::new(EvalBudget::UNBOUNDED),
         ),
         Err(EvalError::InvalidGraph(
-            poot_graph_ir::GraphValidationError::OutputNotDefined { value: usize::MAX }
-        ))
+            poot_graph_ir::GraphValidationError::OutputNotDefined { value }
+        )) if value == poot_graph_ir::ValueId::new(u32::MAX)
     ));
 }
 
@@ -1129,15 +1145,15 @@ fn exact_i32_cast_authority_set_but_silent_is_missing_authorization() {
     let outcome = eval(
         &cast_graph,
         &HashMap::from([
-            (table.id, exact_view(vec![1], [0])),
-            (index.id, exact_view(vec![1], [0])),
+            (table.id(), exact_view(vec![1], [0])),
+            (index.id(), exact_view(vec![1], [0])),
         ]),
         EvalOptions::new(EvalBudget::UNBOUNDED).cast_authority(&mut silent_authority),
     );
     assert!(matches!(
         outcome,
         Err(EvalError::CastAuthority(ref boxed))
-            if matches!(**boxed, CastAuthorityError::MissingCastAuthorization { cast: missing } if missing == cast.id)
+            if matches!(**boxed, CastAuthorityError::MissingCastAuthorization { cast: missing } if missing == cast.id())
     ));
 }
 
@@ -1157,7 +1173,7 @@ fn i32_boundary_test_is_scalar_bounded() {
 
     let run = |words: [i32; 2], experts: usize| {
         let mut role = |value: poot_graph_ir::ValueId| {
-            (value == cast.id).then_some(ExactI32CastRole::HostCheckedSelector(
+            (value == cast.id()).then_some(ExactI32CastRole::HostCheckedSelector(
                 ExactI32CastBounds {
                     selected_element_ceiling: 2,
                     expert_count: experts,
@@ -1167,8 +1183,8 @@ fn i32_boundary_test_is_scalar_bounded() {
         eval(
             &graph,
             &HashMap::from([
-                (table.id, exact_view(vec![2], words)),
-                (index.id, indices.clone()),
+                (table.id(), exact_view(vec![2], words)),
+                (index.id(), indices.clone()),
             ]),
             EvalOptions::new(EvalBudget::UNBOUNDED).cast_authority(&mut role),
         )
@@ -1235,7 +1251,7 @@ fn exact_i32_rejection_table_covers_cast_source() {
     let cast = builder.cast(difference, DType::F32);
     let graph = builder.finish(cast);
     let mut role = |value: poot_graph_ir::ValueId| {
-        (value == cast.id).then_some(ExactI32CastRole::HostCheckedSelector(ExactI32CastBounds {
+        (value == cast.id()).then_some(ExactI32CastRole::HostCheckedSelector(ExactI32CastBounds {
             selected_element_ceiling: 2,
             expert_count: 3,
         }))
@@ -1243,8 +1259,8 @@ fn exact_i32_rejection_table_covers_cast_source() {
     let error = eval(
         &graph,
         &HashMap::from([
-            (left.id, exact_view(vec![2], [2, 1])),
-            (right.id, exact_view(vec![2], [1, 1])),
+            (left.id(), exact_view(vec![2], [2, 1])),
+            (right.id(), exact_view(vec![2], [1, 1])),
         ]),
         EvalOptions::new(EvalBudget::UNBOUNDED).cast_authority(&mut role),
     )
@@ -1259,8 +1275,8 @@ fn exact_i32_rejection_table_covers_cast_source() {
     assert_eq!(
         *error,
         CastAuthorityError::CastSourceNotGather {
-            cast: cast.id,
-            input: difference.id,
+            cast: cast.id(),
+            input: difference.id(),
         }
     );
     covered.insert(ExactI32RejectionRow::Gather);
@@ -1306,7 +1322,7 @@ fn guarded_selector_graph(
         &[(ValidationId(3), "route.bounds", guard.witness)],
     )
     .unwrap();
-    (graph, table.id, indices.id, selected.id)
+    (graph, table.id(), indices.id(), selected.id())
 }
 
 /// The authorization a guarded chain needs: the selector Cast is guarded, the flag Cast is a witness.
@@ -1374,7 +1390,13 @@ fn guarded_non_gather_graph() -> (
         &[(ValidationId(3), "route.bounds", guard.witness)],
     )
     .unwrap();
-    (graph, left.id, right.id, selected.id, guard.guarded.id)
+    (
+        graph,
+        left.id(),
+        right.id(),
+        selected.id(),
+        guard.guarded.id(),
+    )
 }
 
 #[test]
@@ -1509,10 +1531,10 @@ fn unauthorized_cast_graph() -> (
     let cast = builder.cast(difference, DType::F32);
     let graph = builder.finish(cast);
     let inputs = HashMap::from([
-        (left.id, exact_view(vec![2], [2, 1])),
-        (right.id, exact_view(vec![2], [1, 1])),
+        (left.id(), exact_view(vec![2], [2, 1])),
+        (right.id(), exact_view(vec![2], [1, 1])),
     ]);
-    (graph, inputs, cast.id, difference.id)
+    (graph, inputs, cast.id(), difference.id())
 }
 
 #[test]
@@ -1604,7 +1626,12 @@ fn address_chain_graph(
     let address = builder.binary(BinOp::Add, row_base, slot_iota);
     let flat = builder.reshape(address, vec![rows * slots]);
     let gathered = builder.gather(table, 0, flat);
-    (builder.finish(gathered), row_ids.id, slot_iota.id, table.id)
+    (
+        builder.finish(gathered),
+        row_ids.id(),
+        slot_iota.id(),
+        table.id(),
+    )
 }
 
 #[test]
@@ -1776,11 +1803,11 @@ fn computed_gather_addresses_are_bounds_checked() {
     let bind = |ids: [i32; 2]| {
         HashMap::from([
             (
-                scores.id,
+                scores.id(),
                 Value::Host(HostTensor::f32(vec![6], vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0])),
             ),
-            (row_ids.id, exact_view(vec![2], [0, 1])),
-            (expert_ids.id, exact_view(vec![2], ids)),
+            (row_ids.id(), exact_view(vec![2], [0, 1])),
+            (expert_ids.id(), exact_view(vec![2], ids)),
         ])
     };
 
@@ -1837,13 +1864,13 @@ fn state_carrying_graph() -> (
 fn state_carrying_bindings(
     cache: poot_graph_ir::Traced,
     counter: poot_graph_ir::Traced,
-) -> HashMap<usize, crate::Value> {
+) -> HashMap<poot_graph_ir::ValueId, crate::Value> {
     HashMap::from([
         (
-            cache.id,
+            cache.id(),
             crate::Value::Host(HostTensor::f32(vec![2], vec![3.0, -1.0])),
         ),
-        (counter.id, exact_view(vec![2], [5, 7])),
+        (counter.id(), exact_view(vec![2], [5, 7])),
     ])
 }
 
@@ -1912,11 +1939,11 @@ fn exact_i32_with_state_requires_the_dense_carrier() {
     // The dense carrier now round-trips: an identity I32 state pair published on `Value::Host`.
     let dense_inputs = HashMap::from([
         (
-            counter.id,
+            counter.id(),
             Value::Host(HostTensor::i32(vec![2], vec![5, 7])),
         ),
         (
-            cache.id,
+            cache.id(),
             Value::Host(HostTensor::f32(vec![2], vec![1.0, 2.0])),
         ),
     ]);
@@ -1934,9 +1961,9 @@ fn exact_i32_with_state_requires_the_dense_carrier() {
 
     // The exact carrier is now the one `check_state_storage` refuses for I32 state.
     let exact_inputs = HashMap::from([
-        (counter.id, exact_view(vec![2], [5, 7])),
+        (counter.id(), exact_view(vec![2], [5, 7])),
         (
-            cache.id,
+            cache.id(),
             Value::Host(HostTensor::f32(vec![2], vec![1.0, 2.0])),
         ),
     ]);
@@ -1953,7 +1980,7 @@ fn exact_i32_with_state_requires_the_dense_carrier() {
                 value,
                 got: "Value::Owner(ExactValue::I32)",
                 ..
-            } if *value == counter.id
+            } if *value == counter.id()
         ),
         "{error:?}"
     );
@@ -1987,8 +2014,8 @@ fn exact_i32_with_state_publishes_shared_allocations() {
     let cache_in = HostTensor::f32(vec![2], vec![3.0, -1.0]);
     let counter_in = HostTensor::i32(vec![2], vec![5, 7]);
     let inputs = HashMap::from([
-        (cache.id, Value::Host(cache_in.clone())),
-        (counter.id, Value::Host(counter_in.clone())),
+        (cache.id(), Value::Host(cache_in.clone())),
+        (counter.id(), Value::Host(counter_in.clone())),
     ]);
     let state = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
         .unwrap()
@@ -2039,12 +2066,12 @@ fn exact_i32_dynamic_update_slice_writes_at_the_exact_position() {
     // disturbing the previous row.
     for (step, row) in [(0usize, [9.0, -9.0]), (1, [4.0, -4.0])] {
         let inputs = HashMap::from([
-            (cache.id, carried.clone()),
+            (cache.id(), carried.clone()),
             (
-                update.id,
+                update.id(),
                 Value::Host(HostTensor::f32(vec![1, 2], row.to_vec())),
             ),
-            (position.id, exact_view(vec![], [step as i32 + 1])),
+            (position.id(), exact_view(vec![], [step as i32 + 1])),
         ]);
         let state = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
             .unwrap()
@@ -2088,12 +2115,12 @@ fn exact_i32_dynamic_update_slice_rejects_an_out_of_range_position() {
         (-1, IndexFaultKind::Negative),
     ] {
         let inputs = HashMap::from([
-            (cache.id, carried.clone()),
+            (cache.id(), carried.clone()),
             (
-                update.id,
+                update.id(),
                 Value::Host(HostTensor::f32(vec![1, 2], vec![1.0, -1.0])),
             ),
-            (position.id, exact_view(vec![], [bad_position])),
+            (position.id(), exact_view(vec![], [bad_position])),
         ]);
         let err = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
             .expect_err("an out-of-range position must fail closed");
@@ -2130,8 +2157,8 @@ fn eval_i32_requires_an_i32_tensor() {
     let g = b.finish(out);
     let f32_only = HostTensor::f32(vec![2], vec![1.0, 2.0]);
     let inputs = HashMap::from([
-        (x.id, Value::Host(f32_only)),
-        (y.id, Value::Host(HostTensor::i32(vec![2], vec![1, 2]))),
+        (x.id(), Value::Host(f32_only)),
+        (y.id(), Value::Host(HostTensor::i32(vec![2], vec![1, 2]))),
     ]);
     let err = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
         .expect_err("an I32 input that is not an I32 tensor must fail closed");

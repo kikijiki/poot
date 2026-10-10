@@ -10,6 +10,7 @@ use poot_graph_plan::{
     CompileLimits, CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition,
     StagedProgram, Submission, Target, TargetSet, compile_staged,
 };
+use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::DType;
 use poot_test_util::const_weights::ConstWeights;
@@ -54,7 +55,7 @@ pub fn live_step(
                 let dense = DenseWeight::try_new(
                     DType::F32,
                     tensor.shape().to_vec(),
-                    Arc::from(tensor.view().bytes()),
+                    StoredBytes::from(tensor.view().bytes().to_vec()),
                 )
                 .unwrap();
                 store

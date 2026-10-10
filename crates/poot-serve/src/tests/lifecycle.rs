@@ -11,7 +11,7 @@ use poot_llm::driver::error::FailureClass;
 
 use super::*;
 use crate::batch::engine::Exit;
-use crate::types::{AdminRequest, EncodeRow};
+use crate::types::{AdminRequest, EncodeRow, PromptRows};
 
 /// A request through the production `handle` and the full response text.
 pub(super) fn roundtrip(
@@ -470,7 +470,7 @@ fn every_generation_route_appears_in_the_request_metrics() {
     let completion_prompt = model.text().encode("a").unwrap().len();
     let chat_prompt = {
         let msgs = serde_json::json!([{"role": "user", "content": "a"}]);
-        let rendered = model.text().render_chat_value(&msgs, None);
+        let rendered = model.text().render_chat_value(&msgs, None).unwrap();
         model.text().encode(&rendered.prompt).unwrap().len()
     };
     for (case, path, body) in [
@@ -536,7 +536,10 @@ fn a_multimodal_job_appears_in_the_request_metrics() {
     let mut request = generation_request("ab", 2, false);
     request.prompt = PromptInput::Multimodal {
         tokens: tokens_of("ab"),
-        embeds: poot_llm::driver::PromptEmbeds::new(1, vec![0], vec![1.0]).unwrap(),
+        rows: PromptRows {
+            embeds: poot_llm::driver::PromptEmbeds::new(1, vec![0], vec![1.0]).unwrap(),
+            mrope: None,
+        },
     };
     let completion = submit(&served.engine, &metrics, request, &|| false, |_, _| {
         GenerationControl::Continue(())
@@ -898,7 +901,7 @@ fn every_restored_route_answers_on_the_fixture() {
     let (served, engine) = serve_with_fake(counting_engine(1), Arc::clone(&model), &metrics);
     let rendered_tokens = |content: &str| {
         let msgs = serde_json::json!([{"role": "user", "content": content}]);
-        let rendered = model.text().render_chat_value(&msgs, None);
+        let rendered = model.text().render_chat_value(&msgs, None).unwrap();
         model.text().encode(&rendered.prompt).unwrap().len()
     };
     for (route, method, path, body) in [
@@ -1417,7 +1420,9 @@ mod device {
 
     use super::*;
     use crate::batch::engine::{DriverEngine, run_engine_thread};
-    use crate::engine_plan::{EngineArgs, EnginePlan, Started, StartupError, device_budget};
+    use crate::engine_plan::{
+        EngineArgs, EnginePlan, Opened, Started, StartupError, device_budget,
+    };
     use crate::lifecycle::{submit_admin, submit_encode};
     use crate::types::{AdapterInfo, AdminError, AdminReply};
 
@@ -1629,7 +1634,10 @@ mod device {
         let mut request = greedy_request(Vec::new(), AdapterRef::Base);
         request.prompt = PromptInput::Multimodal {
             tokens: placeholders.clone(),
-            embeds,
+            rows: PromptRows {
+                embeds,
+                mrope: None,
+            },
         };
         request.stream = true;
         let completion = submit(tx, &metrics, request, &|| false, |piece, _| {
@@ -1712,7 +1720,7 @@ mod device {
                 let started = EnginePlan::build(
                     &EngineArgs::new(choice, DraftPolicy::Off),
                     &handle,
-                    |_| Ok(executor.take().expect("opened once")),
+                    |_| Ok(Opened::One(executor.take().expect("opened once"))),
                     device_budget,
                     &health,
                 );
@@ -1872,7 +1880,7 @@ mod device {
                 let started = EnginePlan::build(
                     &EngineArgs::new(choice, DraftPolicy::Off),
                     &handle,
-                    |_| Ok(executor.take().expect("opened once")),
+                    |_| Ok(Opened::One(executor.take().expect("opened once"))),
                     device_budget,
                     &health,
                 );

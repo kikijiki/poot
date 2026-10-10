@@ -2,12 +2,10 @@
 //! factor is finite, so `PackedPayload::try_new`'s content check admits the fixture, and every other
 //! bit pattern of every field is exercised.
 
-use std::sync::Arc;
-
 use poot_quant::format::{
     FieldEncoding, FloatFormat, GroupMap, OperandRole, ScaleEncoding, Storage, WeightFormat,
 };
-use poot_quant::{PackedPayload, PackedWeight, SourceRole};
+use poot_quant::{PackedPayload, PackedWeight, SourceRole, StoredBytes};
 
 /// xorshift64 bytes: deterministic, every bit pattern of every field.
 pub fn random_bytes(len: usize, seed: u64) -> Vec<u8> {
@@ -43,7 +41,7 @@ pub fn random_payload(format: WeightFormat, shape: [usize; 2], seed: u64) -> Pac
     let weight = PackedWeight::try_new(format, shape)
         .unwrap_or_else(|error| panic!("{format:?} {shape:?}: {error:?}"));
     let descriptor = format.descriptor();
-    let sources: Vec<(SourceRole, Arc<[u8]>)> = weight
+    let sources: Vec<(SourceRole, StoredBytes)> = weight
         .sources()
         .into_iter()
         .enumerate()
@@ -88,7 +86,7 @@ pub fn random_payload(format: WeightFormat, shape: [usize; 2], seed: u64) -> Pac
                 }
                 (storage, role) => unreachable!("{storage:?} has no {role:?} source"),
             };
-            (role, Arc::from(bytes))
+            (role, StoredBytes::from(bytes))
         })
         .collect();
     PackedPayload::try_new(weight, sources)
@@ -121,7 +119,7 @@ pub fn prescribed_scale_payload(
     };
     const SCALES: [f32; 4] = [0.5, 1.0, 1.5, 2.0];
     let weight = base.weight();
-    let sources: Vec<(SourceRole, Arc<[u8]>)> = weight
+    let sources: Vec<(SourceRole, StoredBytes)> = weight
         .sources()
         .into_iter()
         .map(|role| {
@@ -142,7 +140,7 @@ pub fn prescribed_scale_payload(
                     }
                 }
             }
-            (role, Arc::from(bytes))
+            (role, StoredBytes::from(bytes))
         })
         .collect();
     PackedPayload::try_new(weight, sources)
@@ -180,6 +178,9 @@ pub fn e8m0_scaled_payload(
     for (block, bytes) in bytes.chunks_mut(layout.bytes).enumerate() {
         bytes[at] = scale(block);
     }
-    PackedPayload::try_new(base.weight(), [(SourceRole::Blocks, Arc::from(bytes))])
-        .unwrap_or_else(|error| panic!("{format:?} {shape:?}: {error:?}"))
+    PackedPayload::try_new(
+        base.weight(),
+        [(SourceRole::Blocks, StoredBytes::from(bytes))],
+    )
+    .unwrap_or_else(|error| panic!("{format:?} {shape:?}: {error:?}"))
 }

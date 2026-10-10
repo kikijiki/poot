@@ -12,7 +12,7 @@ use poot_eval::{EvalBudget, EvalOptions, Value, eval};
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::ops::{geglu, gelu, gelu_erf, sigmoid, silu, softcap, softplus, swiglu};
 use poot_graph_ir::types::TensorType;
-use poot_graph_ir::{Graph, Traced};
+use poot_graph_ir::{Graph, Traced, ValueId};
 use poot_graph_plan::passes_without_target as optimize;
 use poot_tensor::HostTensor;
 
@@ -97,8 +97,8 @@ const MLP_GELU_ERF: [u32; 32] = [
     0xc09ea9c1, 0xc09db0a8, 0xc0925b0a, 0xc0781b7f, 0xc035b2f2, 0xbfbe1812, 0x3e0dc87e, 0x3ffb69db,
 ];
 
-fn eval_bits(g: &Graph, inputs: HashMap<usize, HostTensor>) -> Vec<u32> {
-    let inputs: HashMap<usize, Value> = inputs
+fn eval_bits(g: &Graph, inputs: HashMap<ValueId, HostTensor>) -> Vec<u32> {
+    let inputs: HashMap<ValueId, Value> = inputs
         .into_iter()
         .map(|(k, v)| (k, Value::from(v)))
         .collect();
@@ -119,14 +119,14 @@ fn run_table(f: impl Fn(&Builder, Traced) -> Traced) -> (Vec<u32>, Vec<u32>) {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![TABLE.len()]));
     let y = f(&b, x);
-    let xi = x.id;
+    let xi = x.id();
     let g = b.finish(y);
     let input = || HashMap::from([(xi, HostTensor::f32(vec![TABLE.len()], TABLE.to_vec()))]);
     (eval_bits(&g, input()), eval_bits(&optimize(&g), input()))
 }
 
 /// The MLP fixture inputs: a gate sweeping `[-5, 5)` and an oscillating up projection.
-fn mlp_inputs(gate: usize, up: usize) -> HashMap<usize, HostTensor> {
+fn mlp_inputs(gate: ValueId, up: ValueId) -> HashMap<ValueId, HostTensor> {
     let n = 32usize;
     let gd: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.37 - 5.0) * 0.9).collect();
     let ud: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.21).sin() * 1.5).collect();
@@ -143,7 +143,7 @@ fn run_mlp(act: fn(&Builder, Traced) -> Traced) -> (Vec<u32>, Vec<u32>) {
     let gate = b.constant("gate", TensorType::f32(vec![1, 1, 32]));
     let up = b.constant("up", TensorType::f32(vec![1, 1, 32]));
     let out = b.binary(poot_graph_ir::BinOp::Mul, act(&b, gate), up);
-    let (gi, ui) = (gate.id, up.id);
+    let (gi, ui) = (gate.id(), up.id());
     let g = b.finish(out);
     (
         eval_bits(&g, mlp_inputs(gi, ui)),
@@ -265,7 +265,7 @@ fn glu_wrappers_equal_activation_times_up() {
         let b = Builder::new();
         let gate = b.constant("gate", TensorType::f32(vec![1, 1, 32]));
         let up = b.constant("up", TensorType::f32(vec![1, 1, 32]));
-        let (gi, ui) = (gate.id, up.id);
+        let (gi, ui) = (gate.id(), up.id());
         let out = glu(&b, gate, up);
         let g = b.finish(out);
         let want = run_mlp(act).0;

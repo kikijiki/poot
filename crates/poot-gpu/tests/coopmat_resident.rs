@@ -55,7 +55,7 @@ fn f16_in_f32_out_matmul_graph(
     let a = bld.constant("a", TensorType::new(vec![1, m, k], DType::F16));
     let w = bld.constant("w", TensorType::new(vec![k, n], DType::F16));
     let mm = bld.matmul(a, w);
-    let (ai, wi) = (a.id, w.id);
+    let (ai, wi) = (a.id(), w.id());
     let mut g = bld.finish(mm);
     let out = g
         .eqns
@@ -197,7 +197,6 @@ fn plan_eqn_with_choice(
         g,
         eqn,
         backend,
-        1,
         &std::collections::HashMap::new(),
         caps,
         &poot_test_util::graph_fixtures::roomy_body_limits(),

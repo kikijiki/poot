@@ -47,11 +47,11 @@ fn reshape_collapse_is_value_identical() {
     let inputs = {
         let mut m = HashMap::new();
         m.insert(
-            x.id,
+            x.id(),
             Value::from(HostTensor::f32(vec![2, 3, 4], fill(24, 1))),
         );
         m.insert(
-            y.id,
+            y.id(),
             Value::from(HostTensor::f32(vec![1, 1, 24], fill(24, 2))),
         );
         m
@@ -158,7 +158,7 @@ fn fused_equals_unfused_over_random_movement_graphs() {
             let shape = rand_shape(&mut rng);
             let t = b.constant(&format!("x{k}"), TensorType::f32(shape.clone()));
             inputs.insert(
-                t.id,
+                t.id(),
                 Value::from(HostTensor::f32(
                     shape.clone(),
                     fill(numel(&shape), seed * 7 + k as u64),
@@ -289,14 +289,14 @@ fn fused_multi_axis_broadcast_leaf_matches_unfused() {
 
         let mut inputs = HashMap::new();
         inputs.insert(
-            leaf.id,
+            leaf.id(),
             Value::from(HostTensor::f32(
                 vec![1, n, 1],
                 fill(n, m as u64 * 97 + k as u64),
             )),
         );
         inputs.insert(
-            other.id,
+            other.id(),
             Value::from(HostTensor::f32(
                 vec![m, n, k],
                 fill(m * n * k, m as u64 * 13 + n as u64 * 7 + k as u64),
@@ -362,8 +362,8 @@ fn fused_pointwise_over_empty_tensor_edges() {
         let g = b.finish(reshaped);
 
         let mut inputs = HashMap::new();
-        inputs.insert(x.id, Value::from(HostTensor::f32(shape.clone(), vec![])));
-        inputs.insert(y.id, Value::from(HostTensor::f32(shape.clone(), vec![])));
+        inputs.insert(x.id(), Value::from(HostTensor::f32(shape.clone(), vec![])));
+        inputs.insert(y.id(), Value::from(HostTensor::f32(shape.clone(), vec![])));
 
         let unfused = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
             .unwrap_or_else(|e| {

@@ -14,8 +14,8 @@ pub fn peak_transient_bytes(g: &Graph) -> usize {
     let n = g.eqns.len();
     // birth + last-use index per value. Only eqn-produced values are transient; the rest stay at the
     // never-born sentinel and contribute nothing.
-    let mut born = vec![false; g.values.len()];
-    let mut last_use = vec![0usize; g.values.len()];
+    let mut born = ValueTable::filled(g.values.len(), false);
+    let mut last_use = ValueTable::filled(g.values.len(), 0usize);
     for (i, e) in g.eqns.iter().enumerate() {
         born[e.out] = true;
         last_use[e.out] = i; // dies at birth if never used
@@ -30,7 +30,7 @@ pub fn peak_transient_bytes(g: &Graph) -> usize {
         }
     }
     // graph output + state writes are live to the end (never freed within the sweep).
-    let mut lives_to_end = vec![false; g.values.len()];
+    let mut lives_to_end = ValueTable::filled(g.values.len(), false);
     if born[g.output] {
         lives_to_end[g.output] = true;
     }
@@ -41,7 +41,7 @@ pub fn peak_transient_bytes(g: &Graph) -> usize {
     }
     // deaths[i] = transient values whose last use is eqn i (and that do not live to the end).
     let mut deaths: Vec<Vec<ValueId>> = vec![Vec::new(); n.max(1)];
-    for v in 0..g.values.len() {
+    for v in g.values.ids() {
         if born[v] && !lives_to_end[v] {
             deaths[last_use[v]].push(v);
         }

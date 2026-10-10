@@ -1,11 +1,11 @@
 //! The chunked gated delta-net core against the sequential one on realistic inputs, and the Mamba2 core paths.
 
 use crate::{EvalBudget, EvalError, EvalOptions, Value};
-use poot_graph_ir::ValueId;
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::graph::StateRole;
 use poot_graph_ir::ops::{gated_delta_net_decode, gdn_prefill_chunked, mamba2_ssd_decode};
 use poot_graph_ir::types::TensorType;
+use poot_graph_ir::{ValueId, ValueTable};
 use poot_tensor::HostTensor;
 use std::collections::HashMap;
 
@@ -74,19 +74,19 @@ fn gdn_core_on_realistic_frontend_inputs_per_head_real_dims() {
         // Multiple outputs via eval_all and reading ids.
         let fg = fb.finish(q); // primary irrelevant; use eval_all to read every tap.
         let mut fin = HashMap::new();
-        fin.insert(x.id, HostTensor::f32(vec![1, l, h], fill(l * h, 111)));
+        fin.insert(x.id(), HostTensor::f32(vec![1, l, h], fill(l * h, 111)));
         fin.insert(
-            w_qkv.id,
+            w_qkv.id(),
             HostTensor::f32(vec![h, conv_dim], fill(h * conv_dim, 112)),
         );
         fin.insert(
-            w_conv.id,
+            w_conv.id(),
             HostTensor::f32(vec![ck, conv_dim], fill(ck * conv_dim, 114)),
         );
-        fin.insert(w_beta.id, HostTensor::f32(vec![h, hv], fill(h * hv, 115)));
+        fin.insert(w_beta.id(), HostTensor::f32(vec![h, hv], fill(h * hv, 115)));
         // dt_scale scales w_alpha to raise/lower the softplus argument (dt magnitude).
         fin.insert(
-            w_alpha.id,
+            w_alpha.id(),
             HostTensor::f32(
                 vec![h, hv],
                 fill(h * hv, 116)
@@ -95,9 +95,9 @@ fn gdn_core_on_realistic_frontend_inputs_per_head_real_dims() {
                     .collect(),
             ),
         );
-        fin.insert(dt_bias.id, HostTensor::f32(vec![hv], fill(hv, 117)));
-        fin.insert(ssm_a.id, HostTensor::f32(vec![hv], ssm_a_d.clone()));
-        let env = (|| -> Result<Vec<Option<HostTensor>>, EvalError> {
+        fin.insert(dt_bias.id(), HostTensor::f32(vec![hv], fill(hv, 117)));
+        fin.insert(ssm_a.id(), HostTensor::f32(vec![hv], ssm_a_d.clone()));
+        let env = (|| -> Result<ValueTable<Option<HostTensor>>, EvalError> {
             let values: HashMap<ValueId, Value> = fin
                 .iter()
                 .map(|(&id, tensor)| (id, Value::from(tensor.clone())))
@@ -115,7 +115,7 @@ fn gdn_core_on_realistic_frontend_inputs_per_head_real_dims() {
                 .collect()
         })()
         .unwrap();
-        let read = |t: poot_graph_ir::Traced| env[t.id].clone().unwrap();
+        let read = |t: poot_graph_ir::Traced| env[t.id()].clone().unwrap();
         let (qd, kd, vd, gd, betad) = (
             read(q).as_f32().unwrap().to_vec(),
             read(k).as_f32().unwrap().to_vec(),
@@ -168,12 +168,12 @@ fn gdn_core_on_realistic_frontend_inputs_per_head_real_dims() {
             let gt: Vec<f32> = (0..hv).map(|hh| gd[hh * l + t]).collect();
             let btt: Vec<f32> = (0..hv).map(|hh| betad[hh * l + t]).collect();
             let mut inp = HashMap::new();
-            inp.insert(q_in.id, HostTensor::f32(vec![1, hv, 1, d], qt));
-            inp.insert(k_in.id, HostTensor::f32(vec![1, hv, 1, d], kt));
-            inp.insert(v_in.id, HostTensor::f32(vec![1, hv, 1, d], vt));
-            inp.insert(g_in.id, HostTensor::f32(vec![1, hv, 1, 1], gt));
-            inp.insert(bt_in.id, HostTensor::f32(vec![1, hv, 1, 1], btt));
-            inp.insert(ds_in.id, state.clone());
+            inp.insert(q_in.id(), HostTensor::f32(vec![1, hv, 1, d], qt));
+            inp.insert(k_in.id(), HostTensor::f32(vec![1, hv, 1, d], kt));
+            inp.insert(v_in.id(), HostTensor::f32(vec![1, hv, 1, d], vt));
+            inp.insert(g_in.id(), HostTensor::f32(vec![1, hv, 1, 1], gt));
+            inp.insert(bt_in.id(), HostTensor::f32(vec![1, hv, 1, 1], btt));
+            inp.insert(ds_in.id(), state.clone());
             state = (|| -> Result<(HostTensor, Vec<HostTensor>), EvalError> {
                 let values: HashMap<ValueId, Value> = inp
                     .iter()
@@ -229,17 +229,20 @@ fn gdn_core_on_realistic_frontend_inputs_per_head_real_dims() {
             let (co, cso) = gdn_prefill_chunked(&cb, cq, ckk, cv, cg, cbeta, cs, cti, cts, c);
             let cgraph = cb.finish_with_state(co, &[(cs, cso)]);
             let mut cin = HashMap::new();
-            cin.insert(cq.id, HostTensor::f32(vec![1, hk, l, d], qd.clone()));
-            cin.insert(ckk.id, HostTensor::f32(vec![1, hk, l, d], kd.clone()));
-            cin.insert(cv.id, HostTensor::f32(vec![1, hv, l, d], vd.clone()));
-            cin.insert(cg.id, HostTensor::f32(vec![1, hv, l, 1], gd.clone()));
-            cin.insert(cbeta.id, HostTensor::f32(vec![1, hv, l, 1], betad.clone()));
+            cin.insert(cq.id(), HostTensor::f32(vec![1, hk, l, d], qd.clone()));
+            cin.insert(ckk.id(), HostTensor::f32(vec![1, hk, l, d], kd.clone()));
+            cin.insert(cv.id(), HostTensor::f32(vec![1, hv, l, d], vd.clone()));
+            cin.insert(cg.id(), HostTensor::f32(vec![1, hv, l, 1], gd.clone()));
             cin.insert(
-                cs.id,
+                cbeta.id(),
+                HostTensor::f32(vec![1, hv, l, 1], betad.clone()),
+            );
+            cin.insert(
+                cs.id(),
                 HostTensor::f32(vec![1, hv, d, d], vec![0.0; hv * d * d]),
             );
-            cin.insert(cti.id, HostTensor::f32(vec![1, 1, c, c], ti));
-            cin.insert(cts.id, HostTensor::f32(vec![1, 1, c, c], ts));
+            cin.insert(cti.id(), HostTensor::f32(vec![1, 1, c, c], ti));
+            cin.insert(cts.id(), HostTensor::f32(vec![1, 1, c, c], ts));
             let (_go, gss) = (|| -> Result<(HostTensor, Vec<HostTensor>), EvalError> {
                 let values: HashMap<ValueId, Value> = cin
                     .iter()
@@ -324,20 +327,20 @@ fn mamba_core_path_decode_loop_matches_reference() {
     let (y, h_out) = mamba2_ssd_decode(&b, xheads, bb, cc, delta, ap, dsk, h_in);
     let g = b.finish_with_state(y, &[(conv_cache, conv_cache_out), (h_in, h_out)]);
 
-    let bind_scalars = |inp: &mut HashMap<usize, HostTensor>| {
+    let bind_scalars = |inp: &mut HashMap<ValueId, HostTensor>| {
         inp.insert(
-            wc.id,
+            wc.id(),
             HostTensor::f32(
                 vec![kk, ch],
                 (0..kk * ch).map(|i| wcv(i / ch, i % ch)).collect(),
             ),
         );
         inp.insert(
-            ap.id,
+            ap.id(),
             HostTensor::f32(vec![1, hq, 1, 1], (0..hq).map(av).collect()),
         );
         inp.insert(
-            dsk.id,
+            dsk.id(),
             HostTensor::f32(vec![1, hq, 1, 1], (0..hq).map(dv).collect()),
         );
     };
@@ -348,30 +351,30 @@ fn mamba_core_path_decode_loop_matches_reference() {
     for t in 0..l {
         let mut inp = HashMap::new();
         inp.insert(
-            xc.id,
+            xc.id(),
             HostTensor::f32(vec![1, 1, ch], (0..ch).map(|c| xcv(t, c)).collect()),
         );
         inp.insert(
-            bb.id,
+            bb.id(),
             HostTensor::f32(
                 vec![1, hq, 1, n],
                 (0..hq * n).map(|i| bv(t, i / n, i % n)).collect(),
             ),
         );
         inp.insert(
-            cc.id,
+            cc.id(),
             HostTensor::f32(
                 vec![1, hq, 1, n],
                 (0..hq * n).map(|i| cvv(t, i / n, i % n)).collect(),
             ),
         );
         inp.insert(
-            dt.id,
+            dt.id(),
             HostTensor::f32(vec![1, hq, 1, 1], (0..hq).map(|h| dtv(t, h)).collect()),
         );
         bind_scalars(&mut inp);
-        inp.insert(conv_cache.id, cv_cache.clone());
-        inp.insert(h_in.id, h_state.clone());
+        inp.insert(conv_cache.id(), cv_cache.clone());
+        inp.insert(h_in.id(), h_state.clone());
         let (yt, new) = (|| -> Result<(HostTensor, Vec<HostTensor>), EvalError> {
             let values: HashMap<ValueId, Value> = inp
                 .iter()
@@ -479,13 +482,13 @@ fn mamba2_ssd_decode_matches_recurrence() {
             .collect();
         let dlt_t: Vec<f32> = (0..hq).map(|h| dlt(h, t)).collect();
         let mut inp = HashMap::new();
-        inp.insert(x.id, HostTensor::f32(vec![1, hq, 1, p], xt));
-        inp.insert(bin.id, HostTensor::f32(vec![1, hq, 1, n], bt));
-        inp.insert(cin.id, HostTensor::f32(vec![1, hq, 1, n], ct));
-        inp.insert(delta.id, HostTensor::f32(vec![1, hq, 1, 1], dlt_t));
-        inp.insert(a_param.id, HostTensor::f32(vec![1, hq, 1, 1], ad.clone()));
-        inp.insert(d_skip.id, HostTensor::f32(vec![1, hq, 1, 1], dd.clone()));
-        inp.insert(h_in.id, caches[0].clone());
+        inp.insert(x.id(), HostTensor::f32(vec![1, hq, 1, p], xt));
+        inp.insert(bin.id(), HostTensor::f32(vec![1, hq, 1, n], bt));
+        inp.insert(cin.id(), HostTensor::f32(vec![1, hq, 1, n], ct));
+        inp.insert(delta.id(), HostTensor::f32(vec![1, hq, 1, 1], dlt_t));
+        inp.insert(a_param.id(), HostTensor::f32(vec![1, hq, 1, 1], ad.clone()));
+        inp.insert(d_skip.id(), HostTensor::f32(vec![1, hq, 1, 1], dd.clone()));
+        inp.insert(h_in.id(), caches[0].clone());
         let (yt, new) = (|| -> Result<(HostTensor, Vec<HostTensor>), EvalError> {
             let values: HashMap<ValueId, Value> = inp
                 .iter()

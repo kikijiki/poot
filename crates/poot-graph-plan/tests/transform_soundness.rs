@@ -27,12 +27,14 @@ use std::collections::HashMap;
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
 use poot_graph_ir::analysis::dispatch_count;
 use poot_graph_ir::ops::{attention_masked, attention_masked_softcap};
-use poot_graph_ir::{BinOp, Builder, Graph, OpKind, Operand, RedOp, Scalar, TensorType, UnOp};
+use poot_graph_ir::{
+    BinOp, Builder, Graph, OpKind, Operand, RedOp, Scalar, TensorType, UnOp, ValueId,
+};
 use poot_graph_plan::passes_without_target as optimize;
 use poot_tensor::HostTensor;
 
 /// Bind every graph input to a deterministic tensor of its declared shape.
-fn bind_inputs(g: &Graph) -> HashMap<usize, HostTensor> {
+fn bind_inputs(g: &Graph) -> HashMap<ValueId, HostTensor> {
     g.inputs
         .iter()
         .map(|&id| {
@@ -47,7 +49,7 @@ fn bind_inputs(g: &Graph) -> HashMap<usize, HostTensor> {
 }
 
 fn eval_graph(g: &Graph) -> HostTensor {
-    let inputs: HashMap<usize, Value> = bind_inputs(g)
+    let inputs: HashMap<ValueId, Value> = bind_inputs(g)
         .into_iter()
         .map(|(k, v)| (k, Value::from(v)))
         .collect();
@@ -273,7 +275,7 @@ fn card536a_attention_near_misses_decline_with_a_reason() {
     // Axis 0 is the batch dim and is always 1 in these fixtures, so forcing the reduce there with
     // `keepdim: true` leaves the shape unchanged - the declared aval is still correct, it just needs
     // recomputing from each reduce's own input (not left at its pre-mutation value).
-    let reduce_input_avals: Vec<(usize, TensorType)> = wrong_axis
+    let reduce_input_avals: Vec<(ValueId, TensorType)> = wrong_axis
         .eqns
         .iter()
         .filter_map(|eqn| match (&eqn.op, eqn.inputs.first()) {
@@ -447,21 +449,21 @@ fn flash_decode_batched_matches_attention_masked() {
             } else {
                 materialized
             };
-            let mut inp: HashMap<usize, Value> = HashMap::new();
+            let mut inp: HashMap<ValueId, Value> = HashMap::new();
             inp.insert(
-                q.id,
+                q.id(),
                 Value::from(HostTensor::f32(vec![bsz, hq, 1, d], qd.clone())),
             );
             inp.insert(
-                k.id,
+                k.id(),
                 Value::from(HostTensor::f32(vec![bsz, hkv, cap, d], kd.clone())),
             );
             inp.insert(
-                v.id,
+                v.id(),
                 Value::from(HostTensor::f32(vec![bsz, hkv, cap, d], vd.clone())),
             );
             inp.insert(
-                mask.id,
+                mask.id(),
                 Value::from(HostTensor::f32(vec![bsz, 1, 1, cap], md.clone())),
             );
             eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))

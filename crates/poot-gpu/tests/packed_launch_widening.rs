@@ -133,12 +133,12 @@ fn run_moe(exec: &mut dyn Executor, target: Target, out: usize, k: usize) -> (Ve
     let ids_shape = [ROWS];
     let mut inputs = StepInputs::new();
     inputs.push(
-        g.meta(x.id).slot_key().unwrap().clone(),
+        g.meta(x.id()).slot_key().unwrap().clone(),
         &x_shape,
         HostView::new(DType::F32, ROWS * k, bytemuck::cast_slice(&one_hot)).unwrap(),
     );
     inputs.push(
-        g.meta(ids.id).slot_key().unwrap().clone(),
+        g.meta(ids.id()).slot_key().unwrap().clone(),
         &ids_shape,
         HostView::new(DType::F32, ROWS, bytemuck::cast_slice(&selected)).unwrap(),
     );
@@ -240,7 +240,7 @@ fn a_widened_row_gather_after_a_narrow_one_is_bit_exact() {
         let token_shape = [n];
         let mut inputs = StepInputs::new();
         inputs.push(
-            g.meta(token.id).slot_key().unwrap().clone(),
+            g.meta(token.id()).slot_key().unwrap().clone(),
             &token_shape,
             HostView::new(DType::F32, n, bytemuck::cast_slice(&id_values)).unwrap(),
         );

@@ -1,7 +1,6 @@
 //! Process configuration, model startup, listener orchestration, and graceful shutdown.
 
 use std::net::TcpListener;
-use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -9,25 +8,27 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use poot_llm::driver::{BackendChoice, DraftPolicy, LoadOptions, ModelHandle, open_executor};
+use poot_llm::driver::error::DriverError;
+use poot_llm::driver::{
+    DraftPolicy, LoadOptions, ModelHandle, open_executor, open_group, open_timed_executor,
+};
 use poot_llm::encoders::Pooling;
-use poot_llm::front_end::{Idefics3Checkpoint, is_idefics3_dir};
+use poot_llm::{ImageCheckpoint, read_image_checkpoint};
 use poot_models::registry::Registry;
 
-use crate::admin::{LoraAdminPolicy, LoraAdminPolicyMode};
+use crate::admin::LoraAdminPolicyMode;
 use crate::batch::engine::{DriverEngine, run_engine_thread};
+use crate::config::{PlacementSpec, ServeConfig, TelemetryConfig};
 use crate::engine_plan::{
-    EngineArgs, EngineHealth, EnginePlan, EngineState, Started, StartupError, device_budget,
+    Coordinated, EngineArgs, EngineHealth, EnginePlan, EngineState, Opened, Started, StartupError,
+    device_budget,
 };
-use crate::http::{
-    ConnGuard, RateLimiter, configure_response_writes, handle, max_connections,
-    request_read_timeout, response_write_timeout,
-};
+use crate::http::{ConnGuard, RateLimiter, configure_response_writes, handle};
 use crate::lifecycle::{
-    CANCELLATION_SETTLE_TIMEOUT, Card327AcceptBarrier, WorkerRegistry, deadline_after,
-    reset_drain_cancellation, server_drain_timeout,
+    CANCELLATION_SETTLE_TIMEOUT, ServerDrainTimeout, WorkerRegistry, deadline_after,
+    reset_drain_cancellation,
 };
-use crate::metrics::{CacheMetrics, Histogram, Metrics, SpeculativeMetrics};
+use crate::metrics::{CacheMetrics, Histogram, Metrics, SpeculativeMetrics, TimingMetrics};
 use crate::types::{EngineMsg, EngineView, SHUTDOWN, Served};
 use crate::vision::spawn_image_front_end;
 
@@ -41,76 +42,56 @@ pub(crate) struct ModelDirUnset;
 /// The model directory under `POOT_MODELS_DIR` used when no path is given.
 const DEFAULT_MODEL: &str = "qwen2.5-0.5b";
 
-/// The command line. The LoRA flags of the earlier serve modes stay refused (clap rejects an unknown
-/// option) until the typed serve configuration (POOT-590) replaces this parser.
-#[derive(Debug, Parser)]
-#[command(
-    name = "poot-serve",
-    about = "An OpenAI-compatible server over the poot driver"
-)]
-struct Cli {
-    /// Model directory or GGUF file; default: `qwen2.5-0.5b` under `POOT_MODELS_DIR`.
-    model: Option<String>,
-    /// Listen address.
-    #[arg(default_value = "127.0.0.1:8080")]
-    addr: String,
-    /// The device backend: wgpu, rocm, ptx, vulkan, or auto (PTX if a CUDA device opens, else ROCm if an
-    /// HSA GPU agent opens, else wgpu). A model the chosen backend refuses fails startup; no other
-    /// backend is tried.
-    #[arg(long, default_value = "auto", value_parser = parse_backend)]
-    backend: BackendChoice,
-    /// Speculate by prompt lookup: propose the K tokens that followed the latest earlier occurrence of
-    /// the sequence's last NGRAM tokens, written `NGRAM:K` (split at the first colon). Exclusive with
-    /// `--draft-model`; `draft_policy` refuses both.
-    #[arg(long, value_name = "NGRAM:K")]
-    draft_lookup: Option<String>,
-    /// Speculate with a second model that proposes K tokens a round, written `PATH:K` (split at the last
-    /// colon, so the path may contain colons). Its vocabulary must agree with the served model's.
-    #[arg(long, value_name = "PATH:K")]
-    draft_model: Option<String>,
+/// The values the accept loop and the drain run on, built once from the configuration: the rate limiter,
+/// the connection cap, the read and write bounds and the drain bound.
+pub(crate) struct Transport {
+    pub(crate) limiter: Arc<RateLimiter>,
+    pub(crate) max_connections: usize,
+    pub(crate) read_timeout: Option<Duration>,
+    pub(crate) write_timeout: Duration,
+    pub(crate) drain_timeout: ServerDrainTimeout,
+}
+
+impl Transport {
+    pub(crate) fn of(config: &ServeConfig) -> Self {
+        Self {
+            limiter: Arc::new(RateLimiter::new(config.rate_limit_rpm)),
+            max_connections: config.max_connections,
+            read_timeout: config.read_timeout_secs.0,
+            write_timeout: config.write_timeout_secs,
+            drain_timeout: config.drain_timeout_secs,
+        }
+    }
+}
+
+/// What the operator asked of the engine plan: the backend, the placement, the draft policy and the
+/// expert pool. A device group records no device timing, so asking for both is refused here, before
+/// anything loads.
+pub(crate) fn engine_args(config: &ServeConfig, draft: DraftPolicy) -> Result<EngineArgs> {
+    anyhow::ensure!(
+        config.placement == PlacementSpec::Single || !config.device_timing,
+        "--device-timing is not recorded over a device group: use it with --placement single"
+    );
+    Ok(EngineArgs::new(config.backend, draft)
+        .with_placement(config.placement.clone())
+        .with_expert_pool(config.expert_pool))
 }
 
 /// The draft policy the flags name: `Off` with neither flag. A `--draft-model` checkpoint is loaded
 /// here, so a path that does not load is a startup error before the listener binds.
-fn draft_policy(lookup: Option<&str>, model: Option<&str>) -> Result<DraftPolicy> {
-    fn count(text: &str, what: &str) -> Result<NonZeroUsize> {
-        text.parse::<NonZeroUsize>()
-            .with_context(|| format!("{what} {text:?} is not a positive integer"))
-    }
-    match (lookup, model) {
+pub(crate) fn draft_policy(config: &ServeConfig) -> Result<DraftPolicy> {
+    match (&config.draft_lookup, &config.draft_model) {
         (None, None) => Ok(DraftPolicy::Off),
-        (Some(spec), None) => {
-            let (ngram, k) = spec
-                .split_once(':')
-                .with_context(|| format!("--draft-lookup {spec:?}: expected NGRAM:K"))?;
-            Ok(DraftPolicy::PromptLookup {
-                ngram: count(ngram, "the n-gram length")?,
-                k: count(k, "the draft length")?,
-            })
-        }
-        (None, Some(spec)) => {
-            let (path, k) = spec
-                .rsplit_once(':')
-                .with_context(|| format!("--draft-model {spec:?}: expected PATH:K"))?;
-            Ok(DraftPolicy::DraftModel {
-                k: count(k, "the draft length")?,
-                handle: load_model(path).context("load the draft model")?,
-            })
-        }
+        (Some(lookup), None) => Ok(DraftPolicy::PromptLookup {
+            ngram: lookup.ngram,
+            k: lookup.k,
+        }),
+        (None, Some(draft)) => Ok(DraftPolicy::DraftModel {
+            k: draft.k,
+            handle: load_model(&draft.path, &LoadOptions::default())
+                .context("load the draft model")?,
+        }),
         (Some(_), Some(_)) => anyhow::bail!("--draft-lookup and --draft-model are exclusive"),
-    }
-}
-
-fn parse_backend(name: &str) -> Result<BackendChoice, String> {
-    match name {
-        "wgpu" => Ok(BackendChoice::Wgpu),
-        "rocm" => Ok(BackendChoice::Rocm),
-        "ptx" => Ok(BackendChoice::Ptx),
-        "vulkan" => Ok(BackendChoice::Vulkan),
-        "auto" => Ok(BackendChoice::Auto),
-        other => Err(format!(
-            "unknown backend {other:?}: expected wgpu, rocm, ptx, vulkan or auto"
-        )),
     }
 }
 
@@ -169,13 +150,13 @@ fn install_signal_handlers() {
 }
 
 /// Load the checkpoint. Every failure is a startup error, and `run` has not bound the listener yet.
-fn load_model(model_dir: &str) -> Result<Arc<ModelHandle>> {
+fn load_model(model_dir: &str, options: &LoadOptions) -> Result<Arc<ModelHandle>> {
     tracing::info!(model_dir, "loading model");
     let model = Arc::new(
         ModelHandle::load(
             std::path::Path::new(model_dir),
             &Registry::builtin().context("build the family registry")?,
-            &LoadOptions::default(),
+            options,
         )
         .context("load model")?,
     );
@@ -189,20 +170,27 @@ fn load_model(model_dir: &str) -> Result<Arc<ModelHandle>> {
     Ok(model)
 }
 
-/// Load the served model. A SmolVLM (idefics3) checkpoint is served by its text tower, with its image
-/// front end beside it; any other checkpoint is the model itself.
-fn load_served(model_dir: &str) -> Result<(Arc<ModelHandle>, Option<Arc<Idefics3Checkpoint>>)> {
+/// The served model, and the image front end of a vision-language checkpoint.
+type LoadedModel = (Arc<ModelHandle>, Option<Arc<dyn ImageCheckpoint>>);
+
+/// Load the served model. A vision-language checkpoint (SmolVLM, Qwen2.5-VL) is served by its text tower,
+/// with its image front end beside it; any other checkpoint is the model itself.
+fn load_served(model_dir: &str, options: &LoadOptions) -> Result<LoadedModel> {
     let path = std::path::Path::new(model_dir);
-    if !is_idefics3_dir(path) {
-        return Ok((load_model(model_dir)?, None));
+    let registry = Registry::builtin().context("build the family registry")?;
+    let checkpoint =
+        read_image_checkpoint(path, &registry).context("load vision-language model")?;
+    match checkpoint {
+        Some(checkpoint) => {
+            anyhow::ensure!(
+                options.chat_template.is_none(),
+                "--chat-template is not supported for a vision-language checkpoint: its image chats render through the checkpoint's own template"
+            );
+            tracing::info!(model_dir, "loaded vision-language model");
+            Ok((Arc::clone(checkpoint.text()), Some(checkpoint)))
+        }
+        None => Ok((load_model(model_dir, options)?, None)),
     }
-    tracing::info!(model_dir, "loading vision-language model");
-    let checkpoint = Idefics3Checkpoint::read(
-        path,
-        &Registry::builtin().context("build the family registry")?,
-    )
-    .context("load vision-language model")?;
-    Ok((Arc::clone(checkpoint.text()), Some(Arc::new(checkpoint))))
 }
 
 /// Start the engine thread and wait for it to report its plan. The device is opened, the workload fitted
@@ -214,6 +202,7 @@ fn spawn_engine(
     workers: &mut WorkerRegistry,
     model: Arc<ModelHandle>,
     args: EngineArgs,
+    telemetry: TelemetryConfig,
     model_name: String,
     health: &EngineHealth,
     jobs: mpsc::Receiver<EngineMsg>,
@@ -223,7 +212,26 @@ fn spawn_engine(
     let health = health.clone();
     workers
         .spawn("poot-engine", move || {
-            let started = EnginePlan::build(&args, &model, open_executor, device_budget, &health);
+            let open = |args: &EngineArgs| -> Result<Opened, DriverError> {
+                match &args.placement {
+                    PlacementSpec::Single => {
+                        let executor = match telemetry {
+                            TelemetryConfig::CountersOnly => open_executor(args.backend),
+                            TelemetryConfig::Detailed(detail) => {
+                                open_timed_executor(args.backend, detail)
+                            }
+                        }?;
+                        Ok(Opened::One(executor))
+                    }
+                    PlacementSpec::Pipeline { ordinals } => Ok(Opened::Pipeline(Box::new(
+                        Coordinated(open_group(args.backend, ordinals)?),
+                    ))),
+                    PlacementSpec::Tensor { ordinals } => Ok(Opened::Tensor(Box::new(
+                        Coordinated(open_group(args.backend, ordinals)?),
+                    ))),
+                }
+            };
+            let started = EnginePlan::build(&args, &model, open, device_budget, &health);
             let Started { plan, driver } = match started {
                 Ok(started) => started,
                 Err(error) => {
@@ -233,16 +241,20 @@ fn spawn_engine(
             };
             tracing::info!(
                 backend = plan.backend_label(),
-                device = ?plan.device,
+                devices = ?plan.devices,
+                placement = ?plan.placement,
                 model = plan.model,
                 rows = plan.rows(),
                 workload = ?plan.workload,
-                planned_bytes = ?plan.budget.planned_bytes,
-                discovered_bytes = ?plan.budget.discovered_bytes,
-                available_bytes = ?plan.budget.available_bytes,
+                budget = ?plan.budget.devices,
                 "engine plan"
             );
-            let metrics = Arc::new(new_metrics(model_name, &plan, &driver.live_role_bytes()));
+            let metrics = Arc::new(new_metrics(
+                model_name,
+                &plan,
+                &driver.live_role_bytes(),
+                telemetry,
+            ));
             let view = EngineView::new(plan.caps.clone());
             let started = (Arc::clone(&metrics), view.clone());
             if started_tx.send(Ok(started)).is_err() {
@@ -278,6 +290,7 @@ fn new_metrics(
     model_name: String,
     plan: &EnginePlan,
     driver_bytes: &[(poot_executor::BufferRole, u64)],
+    telemetry: TelemetryConfig,
 ) -> Metrics {
     let live = |role| {
         driver_bytes
@@ -307,10 +320,11 @@ fn new_metrics(
             gpu_weight_bytes: AtomicU64::new(live(poot_executor::BufferRole::Weight)),
             gpu_kv_bytes: AtomicU64::new(live(poot_executor::BufferRole::State)),
             kv_total_blocks: AtomicU64::new(plan.caps.kv_blocks as u64),
-            gpu_vram_total_bytes: AtomicU64::new(plan.budget.available_bytes.unwrap_or(0)),
+            gpu_vram_total_bytes: AtomicU64::new(plan.budget.available_bytes().unwrap_or(0)),
             ..CacheMetrics::default()
         },
         speculative: SpeculativeMetrics::default(),
+        timing: TimingMetrics::new(telemetry),
     }
 }
 
@@ -318,14 +332,13 @@ pub(crate) fn run() -> Result<()> {
     reset_drain_cancellation();
     SHUTDOWN.store(false, Ordering::SeqCst);
     init_logging();
-
-    // Validate transport config before model detection or any loader call, so a bad value fails fast.
-    let write_timeout = response_write_timeout()?;
     install_signal_handlers();
 
-    let cli = Cli::parse();
-    let model_dir = model_dir_or_env(cli.model.as_ref())?;
-    let addr = cli.addr;
+    // Every setting parses before the model is detected or any loader runs, so a bad value fails fast.
+    let config = ServeConfig::parse();
+    let model_dir = model_dir_or_env(config.model.as_ref())?;
+    let load_options = config.load_options();
+    let telemetry = config.telemetry();
     let model_name = served_model_name(&model_dir);
 
     // The engine plan decides the backend, fits the workload to the device and prepares it. A refused
@@ -333,15 +346,15 @@ pub(crate) fn run() -> Result<()> {
     // driver moves to the engine thread, which runs the one scheduling loop over it: generation,
     // embeddings, rerank and LoRA administration are messages on its one queue.
     let health = EngineHealth::starting();
-    let (model, checkpoint) = load_served(&model_dir)?;
+    let (model, checkpoint) = load_served(&model_dir, &load_options)?;
     let mut workers = WorkerRegistry::new();
     let (job_tx, job_rx) = mpsc::channel::<EngineMsg>();
-    let draft = draft_policy(cli.draft_lookup.as_deref(), cli.draft_model.as_deref())?;
+    let draft = draft_policy(&config)?;
     // The vision tower opens first, so the engine fits its workload to the memory the tower left.
     let images = checkpoint
-        .map(|checkpoint| spawn_image_front_end(&mut workers, checkpoint, cli.backend))
+        .map(|checkpoint| spawn_image_front_end(&mut workers, checkpoint, config.backend))
         .transpose()?;
-    let args = EngineArgs::new(cli.backend, draft);
+    let args = engine_args(&config, draft)?;
     let (metrics, view) = spawn_engine(
         &mut workers,
         Arc::clone(&model),
@@ -350,6 +363,7 @@ pub(crate) fn run() -> Result<()> {
         } else {
             args
         },
+        telemetry,
         model_name,
         &health,
         job_rx,
@@ -362,16 +376,23 @@ pub(crate) fn run() -> Result<()> {
         images,
     });
 
-    let limiter = Arc::new(RateLimiter::from_env());
+    let Transport {
+        limiter,
+        max_connections: max_conns,
+        read_timeout,
+        write_timeout,
+        drain_timeout,
+    } = Transport::of(&config);
     if limiter.rpm > 0 {
         tracing::info!(
             rpm = limiter.rpm,
-            "per-key rate limit active (POOT_RATE_LIMIT_RPM)"
+            "per-key rate limit active (--rate-limit-rpm)"
         );
     }
 
-    let listener = TcpListener::bind(&addr).with_context(|| format!("bind {addr}"))?;
-    let lora_admin_policy = Arc::new(LoraAdminPolicy::from_env(listener.local_addr()?.ip())?);
+    let addr = &config.addr;
+    let listener = TcpListener::bind(addr).with_context(|| format!("bind {addr}"))?;
+    let lora_admin_policy = Arc::new(config.lora_admin_policy(listener.local_addr()?.ip())?);
     match lora_admin_policy.mode() {
         LoraAdminPolicyMode::LocalOnly => {
             tracing::info!("LoRA administration enabled under the loopback-only local trust policy")
@@ -385,10 +406,6 @@ pub(crate) fn run() -> Result<()> {
     }
     // Non-blocking accept so the shutdown flag is checked between connections.
     listener.set_nonblocking(true)?;
-    let mut card327_accept_barrier = Card327AcceptBarrier::from_env()?;
-    let read_timeout = request_read_timeout();
-    let drain_timeout = server_drain_timeout();
-    let max_conns = max_connections();
     let live_conns = Arc::new(AtomicUsize::new(0));
     tracing::info!(%addr, max_connections = max_conns, write_timeout_secs = write_timeout.as_secs(), drain_timeout_secs = drain_timeout.duration().as_secs(), "poot-serve listening (POST /v1/completions, /v1/chat/completions; GET /health, /metrics, /metrics/prometheus)");
 
@@ -401,7 +418,6 @@ pub(crate) fn run() -> Result<()> {
         }
         match listener.accept() {
             Ok((s, _)) => {
-                card327_accept_barrier.after_accept()?;
                 // A signal may land after the top-of-loop check while a queued socket makes `accept` succeed; the signal is
                 // the admission boundary, so close that socket rather than start one more request.
                 if SHUTDOWN.load(Ordering::SeqCst) {
@@ -495,45 +511,4 @@ pub(crate) fn run() -> Result<()> {
     }
     tracing::info!(graceful, "server stopped");
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Every backend name the flag documents parses to its choice, and nothing else does.
-    #[test]
-    fn parse_backend_accepts_each_documented_name_and_rejects_others() {
-        for (name, choice) in [
-            ("wgpu", BackendChoice::Wgpu),
-            ("rocm", BackendChoice::Rocm),
-            ("ptx", BackendChoice::Ptx),
-            ("vulkan", BackendChoice::Vulkan),
-            ("auto", BackendChoice::Auto),
-        ] {
-            assert_eq!(parse_backend(name), Ok(choice));
-        }
-        assert!(parse_backend("cuda").is_err());
-        assert!(parse_backend("Rocm").is_err());
-    }
-
-    /// The flags parse into the policy they name; a malformed or zero value is a startup error.
-    #[test]
-    fn draft_policy_parses_lookup_and_refuses_malformed_values() {
-        assert!(matches!(draft_policy(None, None), Ok(DraftPolicy::Off)));
-        match draft_policy(Some("3:4"), None).unwrap() {
-            DraftPolicy::PromptLookup { ngram, k } => {
-                assert_eq!((ngram.get(), k.get()), (3, 4));
-            }
-            other => panic!("expected prompt lookup, got {other:?}"),
-        }
-        for bad in ["3", "3:0", "0:4", "x:4", "3:"] {
-            assert!(
-                draft_policy(Some(bad), None).is_err(),
-                "{bad:?} must refuse"
-            );
-        }
-        assert!(draft_policy(Some("3:4"), Some("m:2")).is_err());
-        assert!(draft_policy(None, Some("no-colon")).is_err());
-    }
 }

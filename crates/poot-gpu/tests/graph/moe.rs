@@ -179,7 +179,7 @@ fn moe_sparse_gpu_matches_dense() {
     data.insert("router".into(), fill(h * e, 2));
     data.insert("w_in".into(), fill(e * h * 2 * i, 3));
     data.insert("w_out".into(), fill(e * i * h, 4));
-    let bind = |g: &poot_graph_ir::Graph| -> HashMap<usize, HostTensor> {
+    let bind = |g: &poot_graph_ir::Graph| -> HashMap<poot_graph_ir::ValueId, HostTensor> {
         let mut inputs = HashMap::new();
         for &id in &g.inputs {
             let meta = g.meta(id);
@@ -337,7 +337,7 @@ fn moe_grouped_gpu_matches_cpu() {
     data.insert("router".into(), fill(h * e, 2));
     data.insert("w_in".into(), fill(e * h * 2 * i, 3));
     data.insert("w_out".into(), fill(e * i * h, 4));
-    let bind = |g: &poot_graph_ir::Graph| -> HashMap<usize, HostTensor> {
+    let bind = |g: &poot_graph_ir::Graph| -> HashMap<poot_graph_ir::ValueId, HostTensor> {
         let mut inputs = HashMap::new();
         for &id in &g.inputs {
             let meta = g.meta(id);

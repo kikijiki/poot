@@ -1,5 +1,6 @@
 use super::*;
 use poot_graph_ir::ContractionRows;
+use poot_graph_ir::ValueTable;
 /// The `f32` unaries the pointwise-fusion phase admits into a region. [`kernel_mapping::map_fused_op`]
 /// (`poot-graph-plan`) must lower every one of these inside a fused region: legality here and the
 /// kernel table are one contract (card 536b, R481-007), checked by
@@ -111,7 +112,7 @@ fn row_fits(shape: &[usize], l: &[usize], n: usize) -> bool {
 fn region_layout<V: ValidationChannel>(
     g: &Graph<V>,
     members: &[usize],
-    producer: &[Option<usize>],
+    producer: &ValueTable<Option<usize>>,
 ) -> (usize, Vec<ValueId>, HashMap<ValueId, usize>) {
     let member_set: HashSet<usize> = members.iter().copied().collect();
     let consumed_internally = |out: ValueId| -> bool {
@@ -157,7 +158,7 @@ fn to_region_operand(o: &Operand, local_of: &HashMap<ValueId, usize>) -> FusedOp
 
 fn i32_unit_last_slice<V: ValidationChannel>(
     g: &Graph<V>,
-    producer: &[Option<usize>],
+    producer: &ValueTable<Option<usize>>,
     value: ValueId,
 ) -> Option<(usize, ValueId, usize)> {
     let eqn_idx = producer[value]?;
@@ -187,8 +188,8 @@ fn i32_unit_last_slice<V: ValidationChannel>(
 fn i32_region_leaves<V: ValidationChannel>(
     g: &Graph<V>,
     members: &[usize],
-    producer: &[Option<usize>],
-    consumers: &[Vec<usize>],
+    producer: &ValueTable<Option<usize>>,
+    consumers: &ValueTable<Vec<usize>>,
     pinned: &HashSet<ValueId>,
 ) -> (Vec<ValueId>, HashMap<ValueId, FusedOperand>, Vec<usize>) {
     let member_set: HashSet<usize> = members.iter().copied().collect();
@@ -275,8 +276,8 @@ pub fn fuse<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
     let n_vals = g.values.len();
     let n_eqns = g.eqns.len();
 
-    let mut producer: Vec<Option<usize>> = vec![None; n_vals];
-    let mut uses: Vec<usize> = vec![0; n_vals];
+    let mut producer: ValueTable<Option<usize>> = ValueTable::filled(n_vals, None);
+    let mut uses: ValueTable<usize> = ValueTable::filled(n_vals, 0);
     for (e, eqn) in g.eqns.iter().enumerate() {
         producer[eqn.out] = Some(e);
         for o in &eqn.inputs {
@@ -450,7 +451,7 @@ pub fn fuse<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
     // A producer read more than once fuses too when every read is by a member of one region (a diamond:
     // the activation compositions read their input twice, `x / (1 + exp(-x))`). Its value then never
     // escapes the region, so legality is the single-use rule's: no outside reader, no pinned value.
-    let mut readers: Vec<Vec<usize>> = vec![Vec::new(); n_vals];
+    let mut readers: ValueTable<Vec<usize>> = ValueTable::filled(n_vals, Vec::new());
     for (e, eqn) in g.eqns.iter().enumerate() {
         for o in &eqn.inputs {
             if let Operand::Value(v) = o {
@@ -563,9 +564,9 @@ pub fn fuse_contraction_epilogues<V: ValidationChannel>(
     g: &Graph<V>,
     head_lowers: impl Fn(&Graph<V>, &Eqn) -> bool,
 ) -> Graph<V> {
-    let mut producer: Vec<Option<usize>> = vec![None; g.values.len()];
-    let mut uses: Vec<usize> = vec![0; g.values.len()];
-    let mut consumer: Vec<Option<usize>> = vec![None; g.values.len()];
+    let mut producer: ValueTable<Option<usize>> = ValueTable::filled(g.values.len(), None);
+    let mut uses: ValueTable<usize> = ValueTable::filled(g.values.len(), 0);
+    let mut consumer: ValueTable<Option<usize>> = ValueTable::filled(g.values.len(), None);
     for (e, eqn) in g.eqns.iter().enumerate() {
         producer[eqn.out] = Some(e);
         for operand in &eqn.inputs {
@@ -776,13 +777,13 @@ fn is_float(dtype: DType) -> bool {
 
 fn fuse_i32_pack_concat<V: ValidationChannel>(
     g: &Graph<V>,
-    producer: &[Option<usize>],
+    producer: &ValueTable<Option<usize>>,
     pinned: &HashSet<ValueId>,
     fused_at: &mut HashMap<usize, Eqn>,
     absorbed: &mut HashSet<usize>,
 ) {
     let n_eqns = g.eqns.len();
-    let mut consumers: Vec<Vec<usize>> = vec![Vec::new(); g.values.len()];
+    let mut consumers: ValueTable<Vec<usize>> = ValueTable::filled(g.values.len(), Vec::new());
     for (index, eqn) in g.eqns.iter().enumerate() {
         for input in &eqn.inputs {
             if let Operand::Value(value) = input {
@@ -942,13 +943,13 @@ fn fuse_i32_pack_concat<V: ValidationChannel>(
 
 fn fuse_closed_i32_pointwise<V: ValidationChannel>(
     g: &Graph<V>,
-    producer: &[Option<usize>],
+    producer: &ValueTable<Option<usize>>,
     pinned: &HashSet<ValueId>,
     fused_at: &mut HashMap<usize, Eqn>,
     absorbed: &mut HashSet<usize>,
 ) {
     let n_eqns = g.eqns.len();
-    let mut consumers: Vec<Vec<usize>> = vec![Vec::new(); g.values.len()];
+    let mut consumers: ValueTable<Vec<usize>> = ValueTable::filled(g.values.len(), Vec::new());
     for (index, eqn) in g.eqns.iter().enumerate() {
         for input in &eqn.inputs {
             if let Operand::Value(value) = input {

@@ -9,7 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-poot-runtime-common.workspace = true
+memmap2.workspace = true
 poot-tensor.workspace = true
 
 [dev-dependencies]

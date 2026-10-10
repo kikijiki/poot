@@ -225,13 +225,14 @@ impl Device for VulkanDevice {
         Ok(())
     }
 
-    fn write(
+    fn write_with(
         &mut self,
         dst: &DeviceBuffer,
         offset: usize,
-        bytes: &[u8],
+        len: usize,
+        fill: &mut dyn FnMut(std::ops::Range<usize>, &mut [u8]),
     ) -> Result<(), VulkanGpuError> {
-        Ok(dst.write_bytes(offset, bytes)?)
+        Ok(dst.write_with(offset, len, fill)?)
     }
 
     fn read(&mut self, src: &DeviceBuffer, out: &mut [u8]) -> Result<(), VulkanGpuError> {

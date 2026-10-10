@@ -147,9 +147,14 @@ No stored benchmark row names a resolved family yet. A row appears here once a b
 
 ## Expert pooling
 
-Expert pooling (a fixed-capacity expert pool per MoE layer with a runtime residency manager) is not implemented.
-The mixture-of-experts models in the matrix run through their ordinary, unpooled decode paths, with every expert's
-weights resident.
+Expert pooling keeps a fixed number of resident expert rows per MoE layer and makes the experts a step selects
+resident before they are read, least recently used rows making room. It is a serving option (`--expert-pool ROWS`,
+see [Configuration](../serve/configuration.md)) for a model with routed experts whose stacked tables the planner can
+page, with the pool smaller than the expert count and at least the experts one token selects. A prefill longer than
+the pool serves is split into smaller chunks by the driver; a decode step whose rows times experts per token exceed
+the pool is refused at prepare with a typed capacity error, never split. Without the option every expert's weights
+are resident. Pooled decode is verified token for token against the resident run on Mixtral's fixture on wgpu and
+ROCm; the PTX run is pending, and the matrix cells above describe the resident paths.
 
 [^ptx-served]:
     The scheduling loop and the driver are backend-neutral, but the served tests on PTX cover the dense fixture
@@ -170,7 +175,7 @@ weights resident.
 | On-device sampling: greedy                                                                           | <span class="matrix-status matrix-status--yes">Yes</span>[^device-sample]                | <span class="matrix-status matrix-status--yes">Yes</span>[^device-sample]                | <span class="matrix-status matrix-status--yes">Yes</span>[^device-sample]                |
 | On-device sampling: temperature/top-k/top-p/min-p                                                    | <span class="matrix-status matrix-status--yes">Yes</span>[^device-sample]                | <span class="matrix-status matrix-status--yes">Yes</span>[^device-sample]                | <span class="matrix-status matrix-status--yes">Yes</span>[^device-sample]                |
 | LoRA adapter serving (hot-load, per-request selection)                                               | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--no">No</span> (no served test)[^lora-scope]    |
-| Tensor parallelism (multi-GPU)                                                                       | <span class="matrix-status matrix-status--no">No</span> (not implemented) | <span class="matrix-status matrix-status--no">No</span> (not implemented) | <span class="matrix-status matrix-status--no">No</span> (not implemented) |
+| Tensor parallelism (multi-GPU)                                                                       | <span class="matrix-status matrix-status--no">No</span> (not supported) | <span class="matrix-status matrix-status--no">No</span> (not supported) | <span class="matrix-status matrix-status--yes">Yes</span> (served on a two-GPU NVLink pair; four-GPU decode only) |
 | Structured/guided decoding (regex, JSON schema, grammar, choice, forced tool calls)                  | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--no">No</span> (no served test)[^ptx-served] |
 | Embeddings (`/v1/embeddings`) and reranking (`/v1/rerank`), decoder checkpoints                       | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--no">No</span> (no served test)[^ptx-served] |
 | Prometheus metrics (`/metrics/prometheus`)                                                           | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                |

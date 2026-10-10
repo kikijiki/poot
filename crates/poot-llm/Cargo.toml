@@ -57,7 +57,7 @@ poot-llm = { workspace = true, features = ["cli"] }
 base64.workspace = true
 # The examples (`examples/`) are binaries and use it directly.
 anyhow.workspace = true
-poot-test-util = { workspace = true, features = ["graph-fixtures"] }
+poot-test-util = { workspace = true, features = ["graph-fixtures", "kernel-fixtures"] }
 # The dense family fixtures (`poot_executor_parity::dense`): the graphs the plan and equivalence tests trace.
 poot-executor-parity.workspace = true
 # `AmdArch` (poot-codegen) for a CPU-only `#[cfg(feature = "rocm")]` test that classifies prefill-graph

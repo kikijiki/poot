@@ -1,6 +1,7 @@
 use poot_graph_ir::graph::ComputedConst;
 
 use super::*;
+use poot_graph_ir::ValueTable;
 
 /// Common-subexpression elimination: collapse structurally identical eqns (same op + same operands)
 /// to a single value, rewiring later uses. Pure and order-preserving. On a transformer trace this
@@ -14,9 +15,9 @@ use super::*;
 /// The rest of the value table is preserved (dead entries are harmless); the eqn list shrinks and the
 /// output is remapped to its canonical value.
 pub fn cse<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
-    let mut remap: HashMap<usize, usize> = HashMap::new(); // old value id -> canonical id
-    let mut computed: HashMap<ComputedConst, usize> = HashMap::new();
-    for (id, value) in g.values.iter().enumerate() {
+    let mut remap: HashMap<ValueId, ValueId> = HashMap::new(); // old value id -> canonical id
+    let mut computed: HashMap<ComputedConst, ValueId> = HashMap::new();
+    for (id, value) in g.values.iter_enumerated() {
         if let Storage::Computed(payload) = value.storage {
             let canon = *computed.entry(payload).or_insert(id);
             if canon != id {
@@ -24,10 +25,10 @@ pub fn cse<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
             }
         }
     }
-    let mut seen: HashMap<String, usize> = HashMap::new(); // eqn key -> canonical out id
+    let mut seen: HashMap<String, ValueId> = HashMap::new(); // eqn key -> canonical out id
     let mut eqns: Vec<Eqn> = Vec::with_capacity(g.eqns.len());
 
-    let resolve = |o: &Operand, remap: &HashMap<usize, usize>| -> Operand {
+    let resolve = |o: &Operand, remap: &HashMap<ValueId, ValueId>| -> Operand {
         match o {
             Operand::Value(v) => Operand::Value(remap.get(v).copied().unwrap_or(*v)),
             Operand::Lit(s) => Operand::Lit(*s),
@@ -51,7 +52,7 @@ pub fn cse<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
         }
     }
 
-    let canon = |v: usize| remap.get(&v).copied().unwrap_or(v);
+    let canon = |v: ValueId| remap.get(&v).copied().unwrap_or(v);
     let mut out = Graph { eqns, ..g.clone() };
     out.inputs.retain(|id| !remap.contains_key(id));
     out.consts.retain(|id| !remap.contains_key(id));
@@ -70,7 +71,7 @@ pub fn dce<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
 /// Extra roots are a transform hint only. They do not change [`Graph::output`] or carried-state
 /// semantics and must be re-proved by the caller after this pass.
 pub fn dce_with_roots<V: ValidationChannel>(g: &Graph<V>, extra_roots: &[ValueId]) -> Graph<V> {
-    let mut live = vec![false; g.values.len()];
+    let mut live = ValueTable::filled(g.values.len(), false);
     for root in g.liveness_roots() {
         live[root] = true;
     }

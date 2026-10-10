@@ -30,7 +30,7 @@ impl std::fmt::Display for CastOperand {
 /// `Cast` admits the pair (`infer` never refuses one), but the value at `index` cannot round-trip:
 /// X3's I32<->F32 exact-integer range, F32->I32 non-finite/fractional, or I32->I8 out of range.
 #[derive(Clone, Copy, Debug, PartialEq, thiserror::Error)]
-#[error("cast v{eqn} ({from} -> {to}) word {index} value {value} does not round-trip")]
+#[error("cast {eqn} ({from} -> {to}) word {index} value {value} does not round-trip")]
 pub struct CastFault {
     pub eqn: ValueId,
     pub from: DType,
@@ -46,9 +46,9 @@ pub enum EvalError {
     InvalidGraph(#[from] GraphValidationError),
     #[error(transparent)]
     Validation(#[from] ExecutionValidationFailure),
-    #[error("validation output v{value} is not a complete dense f32 tensor")]
+    #[error("validation output {value} is not a complete dense f32 tensor")]
     ValidationValueNotHost { value: ValueId },
-    #[error("validation output v{value} has shape {actual:?}; expected {expected:?}")]
+    #[error("validation output {value} has shape {actual:?}; expected {expected:?}")]
     ValidationShape {
         value: ValueId,
         expected: Vec<usize>,
@@ -56,9 +56,9 @@ pub enum EvalError {
     },
     #[error("validation packet has {actual} lanes; the graph layout requires {expected}")]
     ValidationPacketLength { expected: usize, actual: usize },
-    #[error("no value bound for input v{0}")]
+    #[error("no value bound for input {0}")]
     MissingInput(ValueId),
-    #[error("operand v{0} used before it was computed")]
+    #[error("operand {0} used before it was computed")]
     UseBeforeDef(ValueId),
     #[error(transparent)]
     Packed(#[from] PackedEvalError),
@@ -89,7 +89,7 @@ pub enum EvalError {
     /// evaluator does not), or a deeper op-internal refusal with no total definition for its operands
     /// (`detail` then names the specific gap; `eqn` is `0` when no equation id is in scope at that
     /// depth).
-    #[error("eqn v{eqn} ({op}): {detail}")]
+    #[error("eqn {eqn} ({op}): {detail}")]
     Unsupported {
         eqn: ValueId,
         op: &'static str,
@@ -98,7 +98,7 @@ pub enum EvalError {
     /// A bind-time fail-closed check: the bound carrier does not match what `expected` requires
     /// (an I32 input without authoritative words, an E4M3FN input bound as dense, an owner view
     /// consumed by a non-admitted equation, ...).
-    #[error("input v{value} expected {expected}, got {got}")]
+    #[error("input {value} expected {expected}, got {got}")]
     Input {
         value: ValueId,
         expected: TensorType,
@@ -107,7 +107,7 @@ pub enum EvalError {
     #[error(transparent)]
     Cast(Box<CastFault>),
     /// A `PackedContraction`/packed table read, or a materialization, exceeded `EvalOptions`'s budget.
-    #[error("eqn v{eqn} needs {needed} {resource}, budget allows {limit}")]
+    #[error("eqn {eqn} needs {needed} {resource}, budget allows {limit}")]
     Budget {
         eqn: ValueId,
         resource: &'static str,
@@ -125,7 +125,7 @@ impl EvalError {
     /// built directly).
     pub(crate) fn unsupported(op: &'static str, detail: impl Into<String>) -> Self {
         EvalError::Unsupported {
-            eqn: 0,
+            eqn: ValueId::new(0),
             op,
             detail: detail.into(),
         }

@@ -322,6 +322,7 @@ fn fixture() -> Fixture {
 #[cfg(test)]
 mod tests {
     use poot_load::gguf::{GgufIndex, GgufValue, write_gguf};
+    use poot_quant::StoredBytes;
     use serde_json::json;
 
     use super::*;
@@ -701,7 +702,7 @@ mod tests {
 
     #[test]
     fn a_malformed_gguf_config_is_a_typed_error_naming_its_key() {
-        let index = GgufIndex::from_bytes(&write_gguf(
+        let index = GgufIndex::parse(&StoredBytes::from(write_gguf(
             &[
                 ("general.architecture", GgufValue::Str("gemma3".into())),
                 ("gemma3.embedding_length", GgufValue::U32(64)),
@@ -715,7 +716,7 @@ mod tests {
                 ),
             ],
             &[],
-        ))
+        )))
         .unwrap();
         let err = Gemma3Params::from_raw(&RawConfig::Gguf(&index)).unwrap_err();
         assert!(

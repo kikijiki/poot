@@ -15,7 +15,6 @@ use poot_target::{Backend, DeviceCaps};
 
 use crate::dtype_widen::bf16_const_is_packed;
 use crate::*;
-use poot_graph_ir::Storage;
 
 /// Ops over a packed weight, planned by the descriptor-driven lowering table (`planner::packed_dequant`),
 /// never through the per-family `plan_eqn` bodies.
@@ -270,10 +269,8 @@ pub(crate) fn per_eqn_plans_inside_compile() -> u64 {
 /// support) reads it, never a `Backend`-keyed default. A caller with no measured device yet (a test, the
 /// plan-summary corpus) passes a documented fixture.
 ///
-/// This is the single-device entry point: it plans at `world_size = 1`, so the tensor-parallel
-/// collectives (`AllReduce`/`AllGather`) lower to [`Plan::Alias`] (identity). The multi-rank executor
-/// (card 049a) calls [`plan_eqn_views_analyzed`] with the real world size, where the collectives lower to
-/// [`Plan::Collective`].
+/// A collective (`AllReduce`/`AllGather`) is refused with [`Capability::CollectiveInStage`]: it is a cut
+/// between stage programs, never an equation one plans.
 pub fn plan_eqn_analyzed<V: ValidationChannel>(
     analysis: &ExactI32StorageAnalysis<'_, V>,
     g: &Graph<V>,
@@ -282,7 +279,7 @@ pub fn plan_eqn_analyzed<V: ValidationChannel>(
     caps: &DeviceCaps,
     limits: &BodyLimits,
 ) -> Result<Plan, PlanError> {
-    plan_eqn_views_analyzed(analysis, g, eqn, backend, 1, &HashMap::new(), caps, limits)
+    plan_eqn_views_analyzed(analysis, g, eqn, backend, &HashMap::new(), caps, limits)
 }
 
 /// spec 024: map an output storage dtype to the kernel element `Ty`. bf16/f16 bridge to their own
@@ -333,14 +330,12 @@ pub(crate) fn movement_ty(d: DType, exact_i32: bool) -> Ty {
 }
 
 /// [`plan_eqn_analyzed`] with caller-owned whole-graph representation analysis, generalized to a strided
-/// -views map (spec 132 phase 1, `compute_views`) and a multi-GPU `world_size` (card 049a). A `views`
+/// -views map (spec 132 phase 1, `compute_views`). A `views`
 /// entry for a Transpose/Slice/Broadcast output routes that eqn to [`Plan::View`] (no dispatch) instead
 /// of a materialize copy; a `views` entry for a Binary/Fused/FusedRow operand routes that leaf's
 /// kernelgen read through the operand's [`Layout`] instead of assuming a plain row-major buffer. An
-/// empty map is a no-op: every arm falls through to the all-copy lowering. At `world_size == 1` with an
-/// empty map this is byte-identical to [`plan_eqn_analyzed`] (the collectives are the identity
-/// [`Plan::Alias`], FR-007); at `world_size > 1` the collective eqns lower to [`Plan::Collective`] for
-/// the multi-rank executor. Reads every device rule
+/// empty map is a no-op: every arm falls through to the all-copy lowering, byte-identical to
+/// [`plan_eqn_analyzed`]. Reads every device rule
 /// (display-watchdog chunk budgets, the RADV tiled-GEMM ceiling) from the caller's `caps`, never a
 /// `Backend`-keyed default (card 522: Card 532's `compile` entry point threads a real
 /// per-device `DeviceCaps` to every call site; until a caller has one, it passes a documented fixture,
@@ -352,12 +347,11 @@ pub fn plan_eqn_views_analyzed<V: ValidationChannel>(
     g: &Graph<V>,
     eqn: &Eqn,
     backend: Backend,
-    world_size: usize,
     views: &HashMap<ValueId, Layout>,
     caps: &DeviceCaps,
     limits: &BodyLimits,
 ) -> Result<Plan, PlanError> {
-    plan_eqn_choice_analyzed(analysis, g, eqn, backend, world_size, views, caps, limits)
+    plan_eqn_choice_analyzed(analysis, g, eqn, backend, views, caps, limits)
         .map(|planned| planned.plan)
 }
 
@@ -369,12 +363,11 @@ pub fn plan_eqn_choice_analyzed<V: ValidationChannel>(
     g: &Graph<V>,
     eqn: &Eqn,
     backend: Backend,
-    world_size: usize,
     views: &HashMap<ValueId, Layout>,
     caps: &DeviceCaps,
     limits: &BodyLimits,
 ) -> Result<Planned, PlanError> {
-    plan_eqn_policy(analysis, g, eqn, backend, world_size, views, caps, limits)
+    plan_eqn_policy(analysis, g, eqn, backend, views, caps, limits)
 }
 
 /// The single-device per-equation plan [`crate::compile`] makes, in [`plan_graph`] and in its rewrite
@@ -392,7 +385,6 @@ pub(crate) fn plan_eqn_compiled<V: ValidationChannel>(
         g,
         eqn,
         target.backend,
-        1,
         views,
         &target.caps,
         limits,
@@ -414,7 +406,6 @@ fn plan_eqn_policy<V: ValidationChannel>(
     g: &Graph<V>,
     eqn: &Eqn,
     backend: Backend,
-    world_size: usize,
     views: &HashMap<ValueId, Layout>,
     caps: &DeviceCaps,
     limits: &BodyLimits,
@@ -433,7 +424,7 @@ fn plan_eqn_policy<V: ValidationChannel>(
                 matches!(
                     operand,
                     Operand::Value(src)
-                        if g.meta(*src).storage == Storage::Const
+                        if g.meta(*src).storage.holds_weight_bytes()
                             && g.aval(*src).dtype == DType::BF16
                             && bf16_const_is_packed(g, views, *src, backend)
                 )
@@ -449,7 +440,6 @@ fn plan_eqn_policy<V: ValidationChannel>(
         &out_shape,
         out_numel,
         backend,
-        world_size,
         views,
         caps,
         &packed_operands,
@@ -482,7 +472,6 @@ pub(crate) fn plan_eqn_views_impl(
     out_shape: &[usize],
     out_numel: usize,
     backend: Backend,
-    world_size: usize,
     views: &HashMap<ValueId, Layout>,
     caps: &DeviceCaps,
     packed_operands: &[bool],
@@ -715,7 +704,7 @@ pub(crate) fn plan_eqn_views_impl(
             packed_operands.first().copied().unwrap_or(false),
         )?,
         movement_ops!() => movement::plan(
-            analysis, g, eqn, out_shape, out_numel, backend, views, odt, world_size, caps, limits,
+            analysis, g, eqn, out_shape, out_numel, backend, views, odt, caps, limits,
         )?,
         sampling_ops!() => sampling::plan(g, eqn, out_shape, out_numel, backend, odt, caps)?,
         imported_ops!() => {

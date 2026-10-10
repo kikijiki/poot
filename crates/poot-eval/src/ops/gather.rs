@@ -149,7 +149,7 @@ impl crate::Value {
     /// path (an id above 2^24 is never rounded through f32, card 363's E4M3 PLE n-gram ids), F32
     /// values through the f32 fault kinds.
     pub fn gather(&self, axis: usize, index: &HostTensor) -> Result<Self, EvalError> {
-        const NO_EQN: ValueId = 0;
+        const NO_EQN: ValueId = ValueId::new(0);
         match self {
             crate::Value::Host(table) => {
                 let (index_len, index_at_pos) = index_reader(index)?;

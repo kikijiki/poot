@@ -19,6 +19,7 @@ use poot_graph_plan::{
     Submission, Target, TargetSet, compile_staged,
 };
 use poot_ptx_gpu::device::PtxDevice;
+use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_runtime_common::DeviceBackend;
 use poot_target::BufferStorage;
@@ -33,6 +34,23 @@ const K: usize = 64;
 
 fn require_ptx() -> Option<PtxDevice> {
     open_or_skip(DeviceBackend::Ptx, PtxDevice::new())
+}
+
+/// POOT-1100 LP-3 (ptx): `Device::write_with` puts every byte at its address across upload-ring chunks. A
+/// device buffer of two `UPLOAD_CHUNK_BYTES` and an odd tail is written whole and again from an
+/// unaligned offset, then read back.
+/// Mutation: in `UploadRing::write` copy chunk `k` to `dst + done - 1`; the read-back differs and this
+/// row goes red.
+#[test]
+fn lp3_ptx_write_with_is_exact_across_ring_chunks() {
+    let Some(mut device) = require_ptx() else {
+        return;
+    };
+    poot_executor_parity::write_probe::chunked_write_is_exact(
+        &mut device,
+        poot_ptx_runtime::UPLOAD_CHUNK_BYTES,
+        3,
+    );
 }
 
 fn fixture() -> (Graph, Vec<f32>, Vec<f32>, f32) {
@@ -58,7 +76,7 @@ fn store(a: &[f32], b: &[f32], c: f32) -> Arc<WeightStore> {
         let dense = DenseWeight::try_new(
             DType::F32,
             vec![bytes.len()],
-            Arc::from(bytemuck_bytes(&bytes)),
+            StoredBytes::from(bytemuck_bytes(&bytes)),
         )
         .unwrap();
         wb.insert(name, WeightEntry::Dense(dense)).unwrap();
@@ -159,9 +177,13 @@ fn len_probe_reads_the_operand_own_length_never_a_larger_slots_capacity_on_ptx()
     let len_src = device
         .allocate(BufferRole::Input, BufferStorage::f32(), SLOT_CAPACITY)
         .unwrap();
-    device
-        .write(&len_src, 0, &bytemuck_bytes(&vec![0.0f32; SLOT_CAPACITY]))
-        .unwrap();
+    poot_executor::write_slice(
+        &mut device,
+        &len_src,
+        0,
+        &bytemuck_bytes(&vec![0.0f32; SLOT_CAPACITY]),
+    )
+    .unwrap();
     let out_buf = device
         .allocate(BufferRole::Output, BufferStorage::f32(), 1)
         .unwrap();

@@ -45,6 +45,7 @@ use poot_tensor::DType;
 
 use super::GraphBudget;
 use crate::{CompileLimits, ExpansionError};
+use poot_graph_ir::ValueTable;
 
 /// The stage name an expansion refusal reports.
 const STAGE: &str = "legalize";
@@ -610,7 +611,7 @@ struct StackSplit {
 /// The equations and values a rewrite appends, each reserved against the graph budget.
 struct Appender<'a> {
     budget: GraphBudget,
-    values: &'a mut Vec<ValueMeta>,
+    values: &'a mut ValueTable<ValueMeta>,
     eqns: &'a mut Vec<Eqn>,
     layer: Option<LayerIndex>,
 }
@@ -1289,8 +1290,7 @@ mod tests {
 
         // A dead oversized const: declared in `values`/`inputs`/`consts`, referenced by no eqn, no
         // output, no state - exactly what `dce` leaves behind (it never touches these tables).
-        let dead = g.values.len();
-        g.values.push(ValueMeta::new(
+        let dead = g.values.push(ValueMeta::new(
             TensorType::f32(vec![4096, 200_000]), // ~3.05 GB, unreachable
             Storage::Const,
             Some("dead.weight".to_string()),

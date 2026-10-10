@@ -209,7 +209,7 @@ fn bf16_cast_decodes_owner_words_bit_exactly() {
 
     let output = eval(
         &graph,
-        &HashMap::from([(source.id, Value::from(view))]),
+        &HashMap::from([(source.id(), Value::from(view))]),
         EvalOptions::new(EvalBudget::UNBOUNDED),
     )
     .map(|r| r.output);
@@ -234,8 +234,8 @@ fn bf16_gather_reads_the_selected_rows() {
     let graph = builder.finish(widened);
     let inputs = |ids: Vec<i32>| {
         HashMap::from([
-            (source.id, Value::from(table(&[4, 2]))),
-            (token.id, Value::Host(HostTensor::i32(vec![3], ids))),
+            (source.id(), Value::from(table(&[4, 2]))),
+            (token.id(), Value::Host(HostTensor::i32(vec![3], ids))),
         ])
     };
 
@@ -289,8 +289,11 @@ fn bf16_gather_reads_the_selected_rows() {
     let output = eval(
         &graph,
         &HashMap::from([
-            (source.id, Value::from(table(&[2, 3]))),
-            (token.id, Value::Host(HostTensor::i32(vec![2], vec![2, 0]))),
+            (source.id(), Value::from(table(&[2, 3]))),
+            (
+                token.id(),
+                Value::Host(HostTensor::i32(vec![2], vec![2, 0])),
+            ),
         ]),
         EvalOptions::new(EvalBudget::UNBOUNDED),
     )
@@ -314,9 +317,9 @@ fn bf16_weight_matmul_decodes_the_weight_and_keeps_f32_precision() {
     let output = eval(
         &graph,
         &HashMap::from([
-            (weight.id, Value::from(table(&[2, 3]))),
+            (weight.id(), Value::from(table(&[2, 3]))),
             (
-                x.id,
+                x.id(),
                 Value::Host(HostTensor::f32(vec![1, 3], activation.clone())),
             ),
         ]),
@@ -332,8 +335,8 @@ fn bf16_weight_matmul_decodes_the_weight_and_keeps_f32_precision() {
     // A host BF16 weight of the same words gives the same bits as the owner-backed weight.
     let words = WORDS[..6].iter().map(|&(word, _)| word).collect();
     let dense: HashMap<_, Value> = HashMap::from([
-        (weight.id, HostTensor::bf16(vec![2, 3], words).into()),
-        (x.id, HostTensor::f32(vec![1, 3], activation).into()),
+        (weight.id(), HostTensor::bf16(vec![2, 3], words).into()),
+        (x.id(), HostTensor::f32(vec![1, 3], activation).into()),
     ]);
     let dense = eval(&graph, &dense, EvalOptions::new(EvalBudget::UNBOUNDED))
         .unwrap()
@@ -353,7 +356,7 @@ fn dense_contraction_matches_the_mixed_matmul_definition() {
     let x = builder.slot(Slot::Activation, TensorType::f32(vec![1, 3]));
     let transposed = builder.transpose(weight, vec![1, 0]);
     let logits = builder.matmul(x, transposed);
-    let graph = as_dense_contraction(builder.finish(logits), x.id, weight.id);
+    let graph = as_dense_contraction(builder.finish(logits), x.id(), weight.id());
 
     assert!(
         graph.eqns.iter().any(|eqn| eqn.op
@@ -375,9 +378,9 @@ fn dense_contraction_matches_the_mixed_matmul_definition() {
     let output = eval(
         &graph,
         &HashMap::from([
-            (weight.id, Value::from(table(&[2, 3]))),
+            (weight.id(), Value::from(table(&[2, 3]))),
             (
-                x.id,
+                x.id(),
                 Value::Host(HostTensor::f32(vec![1, 3], activation.clone())),
             ),
         ]),
@@ -410,7 +413,7 @@ fn dense_row_gather_matches_gather_then_widen() {
     let token = builder.slot(Slot::Token, TensorType::new([3], DType::I32));
     let rows = builder.gather(source, 0, token);
     let widened = builder.cast(rows, DType::F32);
-    let graph = as_dense_row_gather(builder.finish(widened), source.id, token.id);
+    let graph = as_dense_row_gather(builder.finish(widened), source.id(), token.id());
 
     assert!(
         graph.eqns.iter().any(|eqn| eqn.op
@@ -429,8 +432,8 @@ fn dense_row_gather_matches_gather_then_widen() {
 
     let inputs = |ids: Vec<i32>| {
         HashMap::from([
-            (source.id, Value::from(table(&[4, 2]))),
-            (token.id, Value::Host(HostTensor::i32(vec![3], ids))),
+            (source.id(), Value::from(table(&[4, 2]))),
+            (token.id(), Value::Host(HostTensor::i32(vec![3], ids))),
         ])
     };
     let output = eval(
@@ -486,8 +489,7 @@ fn dense_row_gather_matches_gather_then_widen() {
     // Hand-rewrite to the post-fold shape for a `Reshape` link (Card 381 FR-004): the row gather
     // writes the ungathered `[3, 2]` F32 rows at a fresh id, and the same reshape, rebuilt over F32,
     // reads it and writes `widened.id`.
-    let gathered_f32 = graph.values.len();
-    graph.values.push(poot_graph_ir::graph::ValueMeta::new(
+    let gathered_f32 = graph.values.push(poot_graph_ir::graph::ValueMeta::new(
         TensorType::f32(vec![3, 2]),
         poot_graph_ir::graph::Storage::Device,
         None,
@@ -498,8 +500,8 @@ fn dense_row_gather_matches_gather_then_widen() {
                 source: DType::BF16,
             },
             inputs: vec![
-                poot_graph_ir::Operand::Value(source.id),
-                poot_graph_ir::Operand::Value(token.id),
+                poot_graph_ir::Operand::Value(source.id()),
+                poot_graph_ir::Operand::Value(token.id()),
             ],
             out: gathered_f32,
             layer: None,
@@ -509,16 +511,16 @@ fn dense_row_gather_matches_gather_then_widen() {
                 shape: vec![1, 3, 2],
             },
             inputs: vec![poot_graph_ir::Operand::Value(gathered_f32)],
-            out: widened.id,
+            out: widened.id(),
             layer: None,
         },
     ];
     let output = eval(
         &graph,
         &HashMap::from([
-            (source.id, Value::from(table(&[4, 2]))),
+            (source.id(), Value::from(table(&[4, 2]))),
             (
-                token.id,
+                token.id(),
                 Value::Host(HostTensor::i32(vec![3], vec![2, 0, 3])),
             ),
         ]),
@@ -542,7 +544,7 @@ fn bf16_reshape_aliases_contiguous_views_only() {
     let view = table(&[2, 3]);
     let output = eval(
         &graph,
-        &HashMap::from([(source.id, Value::from(view))]),
+        &HashMap::from([(source.id(), Value::from(view))]),
         EvalOptions::new(EvalBudget::UNBOUNDED),
     )
     .map(|r| r.output);
@@ -565,7 +567,7 @@ fn bf16_reshape_aliases_contiguous_views_only() {
     let graph = builder.finish(reshaped);
     let output = eval(
         &graph,
-        &HashMap::from([(source.id, Value::from(table(&[2, 3])))]),
+        &HashMap::from([(source.id(), Value::from(table(&[2, 3])))]),
         EvalOptions::new(EvalBudget::UNBOUNDED),
     )
     .map(|r| r.output);
@@ -638,9 +640,9 @@ fn f32_owner_view_is_rejected_as_a_matmul_activation_before_execution() {
     let output = eval(
         &graph,
         &HashMap::from([
-            (other.id, view("other")),
-            (activation.id, view("activation")),
-            (weight.id, view("table")),
+            (other.id(), view("other")),
+            (activation.id(), view("activation")),
+            (weight.id(), view("table")),
         ]),
         EvalOptions::new(EvalBudget::UNBOUNDED),
     )
@@ -649,7 +651,7 @@ fn f32_owner_view_is_rejected_as_a_matmul_activation_before_execution() {
         matches!(
             output,
             Err(EvalError::ExactDense(ExactDenseError::GraphConsumer { value_id, .. }))
-                if value_id == activation.id
+                if value_id == activation.id()
         ),
         "{output:?}"
     );
@@ -674,7 +676,7 @@ fn bf16_widening_cast_above_budget_is_refused() {
     let source = builder.constant("table", TensorType::new([2, 3], DType::BF16));
     let widened = builder.cast(source, DType::F32);
     let graph = builder.finish(widened);
-    let inputs = HashMap::from([(source.id, Value::from(table(&[2, 3])))]);
+    let inputs = HashMap::from([(source.id(), Value::from(table(&[2, 3])))]);
 
     // 6 elements decode to 24 F32 bytes; a 20-byte ceiling must refuse before any byte is written.
     let bounded = eval(
@@ -755,7 +757,7 @@ fn an_unrelated_e4m3fn_branch_does_not_change_an_otherwise_ordinary_mixed_dtype_
     let b = Builder::new();
     let (bf16_table, idx, cond, zero, one, sum) = chain(&b);
     let graph_a = b.finish(sum);
-    let inputs_a = common_inputs(bf16_table.id, idx.id, cond.id, zero.id, one.id);
+    let inputs_a = common_inputs(bf16_table.id(), idx.id(), cond.id(), zero.id(), one.id());
     let out_a = eval(&graph_a, &inputs_a, EvalOptions::new(EvalBudget::UNBOUNDED))
         .expect("the chain alone must evaluate")
         .output;
@@ -770,9 +772,9 @@ fn an_unrelated_e4m3fn_branch_does_not_change_an_otherwise_ordinary_mixed_dtype_
     let e4m3_out = b.cast(e4m3_mid, DType::F32);
     let output_b = b.binary(poot_graph_ir::BinOp::Add, sum, e4m3_out);
     let graph_b = b.finish(output_b);
-    let mut inputs_b = common_inputs(bf16_table.id, idx.id, cond.id, zero.id, one.id);
+    let mut inputs_b = common_inputs(bf16_table.id(), idx.id(), cond.id(), zero.id(), one.id());
     inputs_b.insert(
-        e4m3_in.id,
+        e4m3_in.id(),
         Value::Host(HostTensor::f32(vec![2], vec![0.0, 0.0])),
     );
     let out_b = eval(&graph_b, &inputs_b, EvalOptions::new(EvalBudget::UNBOUNDED))

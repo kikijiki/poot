@@ -281,6 +281,7 @@ fn streaming_rejects_bad_guided_with_400_before_headers() {
         sys: Mutex::new(sysinfo::System::new()),
         cache: CacheMetrics::default(),
         speculative: SpeculativeMetrics::default(),
+        timing: TimingMetrics::new(TelemetryConfig::CountersOnly),
     };
     let (served, _rx) = served_over(Arc::clone(&runner), 1); // never used: validation fails before submit
 

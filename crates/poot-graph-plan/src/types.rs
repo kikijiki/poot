@@ -2,7 +2,7 @@
 //! moved to `poot-target` (card 522 review): callers import it from there directly.
 //! Re-exported at the crate root.
 
-use poot_graph_ir::{GraphValidationError, RedOp, ValidationId, ValueId};
+use poot_graph_ir::{GraphValidationError, ValidationId, ValueId, ValueTable};
 use poot_tensor::DType;
 
 use crate::{DeviceWitnessRejection, Refusal, StorageGap};
@@ -18,7 +18,7 @@ pub enum PlanError {
     Refused(Box<Refusal>),
     /// The graph holds a value whose storage a tensor-bound executor entry point cannot represent. The
     /// check is graph-wide and runs before any equation is planned, so it names a value, not an equation.
-    #[error("v{value} ({dtype}) cannot bind to this executor entry point: {gap}")]
+    #[error("{value} ({dtype}) cannot bind to this executor entry point: {gap}")]
     UnrepresentableValue {
         value: ValueId,
         dtype: DType,
@@ -38,7 +38,7 @@ pub enum PlanError {
     /// read through a `Plan::Alias`/`Plan::View` chain counts as a read of it. Readers are named by their
     /// output.
     #[error(
-        "I32 v{value} is read as exact i32 by the equation defining v{i32_reader} but as the f32 mirror by v{f32_reader}"
+        "I32 {value} is read as exact i32 by the equation defining {i32_reader} but as the f32 mirror by {f32_reader}"
     )]
     I32ReaderLaneConflict {
         value: ValueId,
@@ -46,7 +46,7 @@ pub enum PlanError {
         f32_reader: ValueId,
     },
     /// A device executor admits only witness heads whose computation is exact on the device.
-    #[error("validation {id:?} v{value} is not a canonical device witness: {reason}")]
+    #[error("validation {id:?} {value} is not a canonical device witness: {reason}")]
     ValidationWitnessNotCanonical {
         id: ValidationId,
         value: ValueId,
@@ -57,16 +57,14 @@ pub enum PlanError {
     /// `DynamicUpdateSlice` provides that; `op` names the producing equation that does not. There is no
     /// whole-buffer snapshot fallback.
     #[error(
-        "state v{state_input} is donated by {op}, whose overwrite region a native transaction cannot statically recover for rollback"
+        "state {state_input} is donated by {op}, whose overwrite region a native transaction cannot statically recover for rollback"
     )]
     UnrecoverableDonation { state_input: ValueId, op: String },
 }
 
-/// Which cross-rank collective a [`Plan::Collective`] lowers. The first two variants mirror the graph
-/// nodes `OpKind::AllReduce{op,axis}` / `OpKind::AllGather{axis}`.
-///
-/// `PointToPoint` and `AllToAll` are planned by the `multi_device` module (backend-neutral communication
-/// rows over a caller-declared device topology, no device dispatch); device-resident dispatch is card 408.
+/// Which cross-device operation a communication row carries (`multi_device`). A collective is a cut
+/// point between stage programs, never an equation a stage program plans. The first two variants mirror
+/// the graph nodes `OpKind::AllReduce{op,axis}` / `OpKind::AllGather{axis,world}`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum CollectiveKind {
     /// `AllReduce{op}`: combine every rank's buffer with `op`; each rank ends with the full result in the same shape.
@@ -126,16 +124,6 @@ pub enum Plan {
         strides: Vec<usize>,
         offset: usize,
     },
-    /// A cross-rank collective run by the multi-rank executor (see
-    /// `specs/049-tensor-parallel/multi-gpu-execution.md`). Emitted only at `world_size > 1`; at
-    /// `world_size == 1` both collectives lower to [`Plan::Alias`] (byte-identical to the single-rank path,
-    /// FR-007). Single-device executors return a "needs the multi-rank executor" error. `op` is meaningful
-    /// for `AllReduce` only; `axis` is the shard/concat axis from the graph node.
-    Collective {
-        kind: CollectiveKind,
-        op: RedOp,
-        axis: usize,
-    },
 }
 
 /// Which [`Plan`] variant an equation planned as, without its payload. Executors name it when a walk
@@ -145,7 +133,6 @@ pub enum PlanKind {
     Dispatches,
     Alias,
     View,
-    Collective,
 }
 
 impl Plan {
@@ -185,7 +172,6 @@ impl Plan {
             Plan::Dispatches(_) => PlanKind::Dispatches,
             Plan::Alias(_) => PlanKind::Alias,
             Plan::View { .. } => PlanKind::View,
-            Plan::Collective { .. } => PlanKind::Collective,
         }
     }
 }
@@ -353,11 +339,11 @@ fn logical_to_dtype(logical: poot_target::LogicalDType) -> DType {
 /// dtype/layout predicates (R469-004).
 #[derive(Debug)]
 pub struct GraphStorage {
-    values: Vec<ValueStorage>,
+    values: ValueTable<ValueStorage>,
 }
 
 impl GraphStorage {
-    pub(crate) fn new(values: Vec<ValueStorage>) -> Self {
+    pub(crate) fn new(values: ValueTable<ValueStorage>) -> Self {
         Self { values }
     }
 

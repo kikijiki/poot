@@ -3,6 +3,7 @@
 //! donated state updates in place on every backend, decided by the engine from the state-commit plan,
 //! never asked of the device.
 
+use std::ops::Range;
 use std::time::Duration;
 
 use poot_graph_plan::{Submission, Target};
@@ -160,11 +161,27 @@ pub trait Device {
     /// [`Self::begin_step`] and one [`Self::synchronize`].
     fn replay(&mut self, recording: &Self::Recording) -> Result<(), Self::Error>;
 
-    /// Overwrite `bytes.len()` bytes of `dst` from byte `offset` with `bytes`, ordered before the next
-    /// submitted step. A range outside `dst` is a device error. A device that writes whole words
-    /// (wgpu) takes a non-zero `offset` and `bytes.len()` in multiples of four.
-    fn write(&mut self, dst: &Self::Buffer, offset: usize, bytes: &[u8])
-    -> Result<(), Self::Error>;
+    /// Overwrite `len` bytes of `dst` from byte `offset`, ordered before the next submitted step. A
+    /// range outside `dst` is a device error. The device hands out host memory it can transfer from:
+    /// `fill(range, out)` is called with consecutive, non-overlapping destination ranges covering
+    /// `offset..offset + len` in ascending order, with `out.len() == range.len()`, and must write
+    /// every byte of `out`. The device bounds its staging memory: it may wait for an earlier chunk's
+    /// transfer before the next call, and `fill` has returned for a range before that range's
+    /// transfer starts. A device that writes whole words (wgpu) takes a non-zero `offset` in multiples
+    /// of four and zero-pads a trailing partial word.
+    ///
+    /// This is the one way bytes reach a buffer. A caller that holds its bytes already uses [`write_slice`],
+    /// the one named helper over this method (a free function, not a second trait method: no device
+    /// implements it), which passes a `fill` that copies them. A weight's encoder instead writes each chunk
+    /// straight into the device's staging, so no host copy of the weight exists beyond the staging itself
+    /// (dmap.md section 6).
+    fn write_with(
+        &mut self,
+        dst: &Self::Buffer,
+        offset: usize,
+        len: usize,
+        fill: &mut dyn FnMut(Range<usize>, &mut [u8]),
+    ) -> Result<(), Self::Error>;
     /// Read all of `src` into `out` after every submitted step finishes.
     fn read(&mut self, src: &Self::Buffer, out: &mut [u8]) -> Result<(), Self::Error>;
     /// Wait for the submitted work and raise any staged kernel-assert fault (Card 531c).
@@ -185,4 +202,88 @@ pub trait Device {
     fn classify_fault(&self, _error: &Self::Error) -> Option<(String, u32)> {
         None
     }
+}
+
+/// Write host `bytes` that are already in hand to `dst` from byte `offset`: [`Device::write_with`] with a
+/// `fill` that copies them. A slot, a state reset, a computed constant and a test fixture have their bytes
+/// before the device asks for them; a weight's encoder writes into the device's staging directly instead.
+pub fn write_slice<D: Device>(
+    device: &mut D,
+    dst: &D::Buffer,
+    offset: usize,
+    bytes: &[u8],
+) -> Result<(), D::Error> {
+    device.write_with(dst, offset, bytes.len(), &mut |range, out| {
+        out.copy_from_slice(&bytes[range.start - offset..range.end - offset]);
+    })
+}
+
+/// The native objects a device created and the replays it issued: what a warm replay must leave
+/// unchanged. Counted by the device's runtime, never by the engine over its own bookkeeping.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NativeCounters {
+    /// Replayable native graphs instantiated from a recording.
+    pub graph_instantiations: u64,
+    /// Native graph launches.
+    pub graph_launches: u64,
+    /// Cross-device ordering events created.
+    pub events: u64,
+    /// Kernel modules loaded.
+    pub modules: u64,
+    /// Peer copies recorded.
+    pub peer_copies: u64,
+}
+
+/// A conservative byte bound for each native object a recording session creates beyond the buffers the
+/// engine allocates. A driver does not report the size of a graph or an event, so the device states the
+/// bound its admission may rely on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SupportBound {
+    /// One replayable native graph.
+    pub graph_bytes: u64,
+    /// One cross-device ordering event.
+    pub event_bytes: u64,
+}
+
+/// What a device adds to take part in a multi-device program: peer copies recorded into the same
+/// recording as its dispatches, and ordering events between devices. Only a backend that can do both
+/// implements it; a coordinator over a device without it does not compile.
+///
+/// There is one recording model: a stage is one `begin`, its dispatches, any peer copy of its exported
+/// values, and one `finish`; its recording is replayed with [`Device::replay`] like any other. Ordering
+/// between devices is by event, at replay: the coordinator records a stage's event on its device right
+/// after replaying the stage, and makes the consumer's device wait for it right before replaying the
+/// consumer, so every wait names the record the host enqueued for the same step.
+pub trait Collectives: Device {
+    /// A cross-device ordering point: recorded by the device that created it, waited for by another.
+    type Event: 'static;
+
+    fn native_counters(&self) -> NativeCounters;
+
+    fn support_bound(&self) -> SupportBound;
+
+    /// Admit the directed route from this device to `peer`, outside any recording. A route that would
+    /// need a host-staged copy is an error: a recording cannot hold it, and no fallback exists.
+    fn open_route(&mut self, peer: &Self) -> Result<(), Self::Error>;
+
+    /// A new event owned by this device. Outside any recording.
+    fn create_event(&mut self) -> Result<Self::Event, Self::Error>;
+
+    /// Record `event` now, outside any recording: it completes when everything this device has been
+    /// handed so far (the recording just replayed) has.
+    fn record_event(&mut self, event: &Self::Event) -> Result<(), Self::Error>;
+
+    /// Make this device wait, from this call on, for the record of `event` the host enqueued before
+    /// it: the next replay does not start until that record completes. Outside any recording.
+    fn wait_event(&mut self, event: &Self::Event) -> Result<(), Self::Error>;
+
+    /// Copy the first `bytes` bytes of `src` (this device's) into `dst` (a peer's, on a route
+    /// [`Self::open_route`] admitted), recorded into the open recording after everything it holds so
+    /// far.
+    fn peer_copy(
+        &mut self,
+        src: &Self::Buffer,
+        dst: &Self::Buffer,
+        bytes: usize,
+    ) -> Result<(), Self::Error>;
 }

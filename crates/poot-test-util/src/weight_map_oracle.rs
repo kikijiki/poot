@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use poot_eval::{EvalBudget, EvalOptions, Value, eval, materialize_dense};
-use poot_graph_ir::{Graph, PackedSourceName, SlotKey, Storage, ValidationChannel};
+use poot_graph_ir::{Graph, PackedSourceName, SlotKey, Storage, ValidationChannel, ValueId};
 use poot_quant::weights::{WeightEntry, WeightId, WeightMap, WeightStore, WeightView};
 use poot_quant::{PackedComponentRef, PackedPayload, PackedStack, PackedStackComponentRef};
 use poot_tensor::{DType, HostTensor};
@@ -31,7 +31,7 @@ pub fn eval_mapped<V: ValidationChannel>(
     // One stack per packed expert-stack id, shared by every source role that names it.
     let mut stacks: HashMap<WeightId, Arc<PackedStack>> = HashMap::new();
     assert_eq!(state.len(), g.state.len(), "one value per state input");
-    let mut inputs: HashMap<usize, Value> = HashMap::new();
+    let mut inputs: HashMap<ValueId, Value> = HashMap::new();
     for (&(input, _), value) in g.state.iter().zip(state) {
         inputs.insert(input, value.clone().into());
     }
@@ -115,7 +115,7 @@ pub fn oracle_for<'a, V: ValidationChannel>(
 ) -> impl FnMut(&[StepFixture]) -> HostTensor + 'a {
     let mut state: HashMap<String, HostTensor> = HashMap::new();
     let mut stacks: HashMap<String, Arc<PackedStack>> = HashMap::new();
-    let packed: HashMap<usize, Value> = graph
+    let packed: HashMap<ValueId, Value> = graph
         .inputs
         .iter()
         .filter_map(|&id| {
@@ -141,7 +141,7 @@ pub fn oracle_for<'a, V: ValidationChannel>(
         })
         .collect();
     move |step: &[StepFixture]| {
-        let mut inputs: HashMap<usize, Value> = HashMap::new();
+        let mut inputs: HashMap<ValueId, Value> = HashMap::new();
         for &id in &graph.inputs {
             let meta = graph.meta(id);
             let value = match meta.storage {

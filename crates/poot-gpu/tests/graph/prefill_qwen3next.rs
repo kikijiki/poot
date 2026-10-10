@@ -16,7 +16,7 @@ fn gpu_ut_transform_matches_cpu_c64() {
     let b = Builder::new();
     let attn_t = b.constant("attn", TensorType::f32(vec![c, c]));
     let t = unit_lower_triangular_inverse(&b, attn_t);
-    let ai = attn_t.id;
+    let ai = attn_t.id();
     let g = b.finish(t);
     let mut inputs = HashMap::new();
     inputs.insert(ai, HostTensor::f32(vec![c, c], attn));
@@ -73,7 +73,7 @@ fn gpu_attention_prefill_matches_cpu_l64() {
     let v = b.constant("v", TensorType::f32(vec![1, hkv, l, d]));
     let mask = b.constant("mask", TensorType::f32(vec![1, 1, l, l]));
     let out = attention_prefill(&b, q, k, v, n_rep, scale, mask);
-    let (qi, ki, vi, mi) = (q.id, k.id, v.id, mask.id);
+    let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();
@@ -145,7 +145,7 @@ fn gpu_attention_prefill_matches_cpu_past_matmul_grid_cap() {
     let v = b.constant("v", TensorType::f32(vec![1, hkv, l, d]));
     let mask = b.constant("mask", TensorType::f32(vec![1, 1, l, l]));
     let out = attention_prefill(&b, q, k, v, n_rep, scale, mask);
-    let (qi, ki, vi, mi) = (q.id, k.id, v.id, mask.id);
+    let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();
@@ -245,7 +245,7 @@ fn gpu_attention_prefill_matches_cpu_real_d() {
     let v = b.constant("v", TensorType::f32(vec![1, hkv, l, d]));
     let mask = b.constant("mask", TensorType::f32(vec![1, 1, l, l]));
     let out = attention_prefill(&b, q, k, v, n_rep, scale, mask);
-    let (qi, ki, vi, mi) = (q.id, k.id, v.id, mask.id);
+    let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();

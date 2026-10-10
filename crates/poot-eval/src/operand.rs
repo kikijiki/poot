@@ -8,7 +8,7 @@ use poot_tensor::DType;
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use poot_graph_ir::{Eqn, Operand as IrOperand, Scalar, ValueId};
+use poot_graph_ir::{Eqn, Operand as IrOperand, Scalar, ValueId, ValueTable};
 
 use crate::exact_bf16::ExactBf16TensorView;
 use crate::exact_value::ExactValue;
@@ -16,7 +16,7 @@ use crate::{EvalError, Value};
 use poot_tensor::{HostData, HostTensor};
 
 /// The bound value of environment slot `id`, or [`EvalError::UseBeforeDef`].
-pub(crate) fn env_value(env: &[Option<Value>], id: ValueId) -> Result<&Value, EvalError> {
+pub(crate) fn env_value(env: &ValueTable<Option<Value>>, id: ValueId) -> Result<&Value, EvalError> {
     env.get(id)
         .and_then(Option::as_ref)
         .ok_or(EvalError::UseBeforeDef(id))
@@ -41,7 +41,7 @@ fn operand_value(eqn: &Eqn, position: usize) -> Result<ValueId, EvalError> {
 pub(crate) fn host_tensor<'a>(
     eqn: &Eqn,
     position: usize,
-    env: &'a [Option<Value>],
+    env: &'a ValueTable<Option<Value>>,
 ) -> Result<&'a HostTensor, EvalError> {
     let id = operand_value(eqn, position)?;
     match env_value(env, id)? {
@@ -59,7 +59,7 @@ pub(crate) fn host_tensor<'a>(
 pub(crate) fn i32_words<'a>(
     eqn: &Eqn,
     position: usize,
-    env: &'a [Option<Value>],
+    env: &'a ValueTable<Option<Value>>,
 ) -> Result<(Cow<'a, [i32]>, Vec<usize>), EvalError> {
     match eqn.inputs.get(position) {
         Some(IrOperand::Lit(Scalar::I32(value))) => Ok((Cow::Owned(vec![*value]), Vec::new())),
@@ -74,7 +74,7 @@ pub(crate) fn i32_words<'a>(
 
 pub(crate) fn value_i32_words(
     id: ValueId,
-    env: &[Option<Value>],
+    env: &ValueTable<Option<Value>>,
 ) -> Result<(Cow<'_, [i32]>, Vec<usize>), EvalError> {
     match env_value(env, id)? {
         Value::Owner(ExactValue::I32(view)) => {
@@ -113,7 +113,7 @@ pub(crate) fn host_i32_words(
 pub(crate) fn bf16_view(
     eqn: &Eqn,
     position: usize,
-    env: &[Option<Value>],
+    env: &ValueTable<Option<Value>>,
 ) -> Result<ExactBf16TensorView, EvalError> {
     let id = operand_value(eqn, position)?;
     match env_value(env, id)? {
@@ -140,7 +140,7 @@ pub(crate) fn bf16_view(
 pub(crate) fn e4m3_tensor<'a>(
     eqn: &Eqn,
     position: usize,
-    env: &'a [Option<Value>],
+    env: &'a ValueTable<Option<Value>>,
 ) -> Result<&'a HostTensor, EvalError> {
     let id = operand_value(eqn, position)?;
     match env_value(env, id)? {
@@ -158,7 +158,7 @@ pub(crate) fn e4m3_tensor<'a>(
 pub(crate) fn value_operand<'a>(
     eqn: &Eqn,
     position: usize,
-    env: &'a [Option<Value>],
+    env: &'a ValueTable<Option<Value>>,
 ) -> Result<&'a Value, EvalError> {
     env_value(env, operand_value(eqn, position)?)
 }

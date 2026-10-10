@@ -28,6 +28,7 @@ use poot_graph_plan::{
     TargetSet, compile_staged,
 };
 use poot_quant::PackedPayload;
+use poot_quant::StoredBytes;
 use poot_quant::format::{GroupMap, WeightFormat};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_rocm_gpu::device::RocmDevice;
@@ -207,8 +208,8 @@ fn slot_decode_graph(descriptor: poot_quant::PackedWeight) -> (Graph, SlotKey, S
     );
     let cache_out = b.dynamic_update_slice_dyn(cache, y, pos, 0);
     let g = b.finish_with_state(y, &[(cache, cache_out)]);
-    let xk = g.meta(x.id).slot_key().unwrap().clone();
-    let pk = g.meta(pos.id).slot_key().unwrap().clone();
+    let xk = g.meta(x.id()).slot_key().unwrap().clone();
+    let pk = g.meta(pos.id()).slot_key().unwrap().clone();
     (g, xk, pk)
 }
 
@@ -378,7 +379,7 @@ fn packed_prefill_through_the_contract_is_bit_exact() {
         );
         let cache_out = b.dynamic_update_slice(cache, y, 0, 0);
         let graph = b.finish_with_state(y, &[(cache, cache_out)]);
-        let x_key = graph.meta(x.id).slot_key().unwrap().clone();
+        let x_key = graph.meta(x.id()).slot_key().unwrap().clone();
 
         let owners = HashMap::from([("layer".to_string(), Arc::clone(&owner))]);
         let store = store_for(&graph, &owners);
@@ -598,8 +599,8 @@ fn run_indexed_case(
     let ids = b.slot_named(Slot::Activation, "moe-ids", TensorType::f32(vec![rows]));
     let y = poot_graph_ir::ops::packed_indexed_linear(&b, x, ids, &table).unwrap();
     let graph = b.finish(y);
-    let x_key = graph.meta(x.id).slot_key().unwrap().clone();
-    let ids_key = graph.meta(ids.id).slot_key().unwrap().clone();
+    let x_key = graph.meta(x.id()).slot_key().unwrap().clone();
+    let ids_key = graph.meta(ids.id()).slot_key().unwrap().clone();
 
     let owners: HashMap<String, Arc<PackedPayload>> = (0..EXPERTS)
         .map(|e| (format!("experts.{e}"), Arc::clone(&owners_vec[e])))
@@ -722,7 +723,7 @@ fn a_split_expert_stack_runs_bit_exact() {
 
 /// SC-002 (ROCm): a Q8_0 table with `out = 3, K = 32` is 102 bytes per expert, not a whole number of words,
 /// so the binder pads each expert to 104 bytes and the kernel strides by that; one-hot rows routed to
-/// experts 1 and 2 are bit-exact. Mutation: drop the per-expert padding in `WeightBinder::read`; experts 1 and
+/// experts 1 and 2 are bit-exact. Mutation: drop the per-expert padding in `WeightWriter::read_stream`; experts 1 and
 /// 2 read misaligned blocks and go red.
 #[test]
 fn an_unaligned_expert_slab_table_runs_bit_exact() {
@@ -825,7 +826,7 @@ fn packed_embedding_row_gather_is_bit_exact() {
             )
             .unwrap();
             let graph = b.finish(rows);
-            let token_key = graph.meta(token.id).slot_key().unwrap().clone();
+            let token_key = graph.meta(token.id()).slot_key().unwrap().clone();
 
             let owners = HashMap::from([("model.embed_tokens".to_string(), Arc::clone(&owner))]);
             let store = store_for(&graph, &owners);
@@ -893,13 +894,16 @@ fn dense_e4m3_row_gather_is_bit_exact() {
         );
         let gathered = b.cast(b.gather(table_value, 0, idx), DType::F32);
         let graph = b.finish(gathered);
-        let idx_key = graph.meta(idx.id).slot_key().unwrap().clone();
+        let idx_key = graph.meta(idx.id()).slot_key().unwrap().clone();
 
         let store = {
             let mut builder = WeightStore::builder();
-            let dense =
-                DenseWeight::try_new(DType::E4M3FN, vec![rows, width], Arc::from(table.clone()))
-                    .unwrap();
+            let dense = DenseWeight::try_new(
+                DType::E4M3FN,
+                vec![rows, width],
+                StoredBytes::from(table.clone()),
+            )
+            .unwrap();
             builder
                 .insert("ple.table", WeightEntry::Dense(dense))
                 .unwrap();
@@ -1007,7 +1011,7 @@ fn run_dense_activation(
         let dense = poot_quant::weights::DenseWeight::try_new(
             DType::F32,
             shape.to_vec(),
-            Arc::from(f32_bytes(values)),
+            StoredBytes::from(f32_bytes(values)),
         )
         .unwrap();
         builder
@@ -1064,7 +1068,7 @@ fn packed_loaders_match_the_oracle_on_every_output_on_rocm() {
             let y = poot_graph_ir::ops::packed_linear(&b, x, "layer", owner.weight(), None, None)
                 .unwrap();
             let graph = b.finish(y);
-            let x_key = graph.meta(x.id).slot_key().unwrap().clone();
+            let x_key = graph.meta(x.id()).slot_key().unwrap().clone();
             let activation = fill(7 + m as u64, m * K);
             let got = run_dense_activation(
                 &mut engine,
@@ -1091,7 +1095,7 @@ fn packed_loaders_match_the_oracle_on_every_output_on_rocm() {
                 }
             }
             oracle_inputs.insert(
-                x.id,
+                x.id(),
                 poot_tensor::HostTensor::f32(vec![m, K], activation).into(),
             );
             let want = poot_eval::eval(
@@ -1150,7 +1154,7 @@ fn a_packed_gemv_head_is_shared_with_the_standalone_gemv_on_rocm() {
                 head
             };
             let g = b.finish(out);
-            let key = g.meta(x.id).slot_key().unwrap().clone();
+            let key = g.meta(x.id()).slot_key().unwrap().clone();
             (g, key)
         };
 
@@ -1250,8 +1254,8 @@ fn a_packed_gemv_epilogue_agrees_with_the_standalone_head_chain_on_rocm() {
                     .unwrap();
             if !with_chain {
                 let g = b.finish(head);
-                let key = g.meta(x.id).slot_key().unwrap().clone();
-                return (g, x.id, key);
+                let key = g.meta(x.id()).slot_key().unwrap().clone();
+                return (g, x.id(), key);
             }
             let bias = b.constant("bias", TensorType::f32(vec![OUT]));
             let residual = b.constant("residual", TensorType::f32(vec![1, OUT]));
@@ -1260,8 +1264,8 @@ fn a_packed_gemv_epilogue_agrees_with_the_standalone_head_chain_on_rocm() {
             let scaled = b.binary_scalar(BinOp::Mul, activated, Scalar::F32(0.5));
             let out = b.binary(BinOp::Add, scaled, residual);
             let g = b.finish(out);
-            let key = g.meta(x.id).slot_key().unwrap().clone();
-            (g, x.id, key)
+            let key = g.meta(x.id()).slot_key().unwrap().clone();
+            (g, x.id(), key)
         };
 
         // The device head alone, to cancel against.

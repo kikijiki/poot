@@ -2,9 +2,12 @@
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use poot_llm::driver::RowSpeculation;
+use poot_profile::{Coverage, HostTiming, Mark, Report, TimingSnapshot};
+
+use crate::config::TelemetryConfig;
 
 /// Upper bucket bounds (`le`, ms) for the latency histograms; the implicit `+Inf` bucket catches the rest.
 pub(crate) const LATENCY_BUCKETS_MS: [f64; 11] = [
@@ -161,6 +164,151 @@ impl SpeculativeMetrics {
     }
 }
 
+/// What the engine's executor timing says over every step it has run: exact cumulative counts, the
+/// device time when a device measured it, and how complete the retained detail is. A figure the device
+/// did not measure is `None`, never zero.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TimingExport {
+    /// Steps the executor ran, across every entry. Exact regardless of detail retention.
+    pub(crate) steps: u64,
+    /// The engine's own host wall of those steps, partitioned into encode, wait and the remainder.
+    pub(crate) host: HostTiming,
+    /// Sum of the measured per-dispatch device durations. `None`: no step was measured (counters only,
+    /// or a backend that reports no device time), which is not zero seconds.
+    pub(crate) device_sum: Option<Duration>,
+    /// Whether the retained per-dispatch detail is everything the step count says it should be:
+    /// complete, sampled by policy, truncated by a bound, or unavailable.
+    pub(crate) detail: Coverage,
+    /// Collecting the detail changed submission grouping, so the device figures are diagnostic and not
+    /// unprofiled throughput evidence.
+    pub(crate) perturbed: bool,
+}
+
+impl TimingExport {
+    /// The export of a run that has stepped nothing.
+    const EMPTY: Self = Self {
+        steps: 0,
+        host: HostTiming {
+            encode: Duration::ZERO,
+            wait: Duration::ZERO,
+            wall: Duration::ZERO,
+        },
+        device_sum: None,
+        detail: Coverage::Unavailable,
+        perturbed: false,
+    };
+
+    /// Summarize `snapshot` from its first step: the window over every entry that ever stepped.
+    pub(crate) fn of(snapshot: &TimingSnapshot) -> Self {
+        let start = Mark::default();
+        let entries = snapshot.entries_with_activity_since(&start);
+        let window = Report::window(snapshot, &start, &entries);
+        Self {
+            steps: window.steps,
+            host: window.host,
+            device_sum: window.device.sum_of_dispatch_durations,
+            detail: window.detail,
+            perturbed: window.perturbed,
+        }
+    }
+}
+
+/// The engine's published timing and the mode it was asked to run in.
+pub(crate) struct TimingMetrics {
+    telemetry: TelemetryConfig,
+    published: Mutex<TimingExport>,
+}
+
+impl TimingMetrics {
+    pub(crate) fn new(telemetry: TelemetryConfig) -> Self {
+        Self {
+            telemetry,
+            published: Mutex::new(TimingExport::EMPTY),
+        }
+    }
+
+    /// Replace the published figures with `snapshot`'s. The engine thread is the only writer, and the
+    /// export is a fixed-size summary, so a reader that never comes retains nothing.
+    pub(crate) fn publish(&self, snapshot: &TimingSnapshot) {
+        let export = TimingExport::of(snapshot);
+        *self.published.lock().unwrap() = export;
+    }
+
+    pub(crate) fn export(&self) -> TimingExport {
+        self.published.lock().unwrap().clone()
+    }
+
+    fn mode(&self) -> &'static str {
+        match self.telemetry {
+            TelemetryConfig::CountersOnly => "counters_only",
+            TelemetryConfig::Detailed(_) => "detailed",
+        }
+    }
+
+    fn json(&self) -> serde_json::Value {
+        let export = self.export();
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        let coverage = match export.detail {
+            Coverage::Complete => serde_json::json!({ "kind": "complete" }),
+            Coverage::Unsampled { sampled, total } => {
+                serde_json::json!({ "kind": "sampled", "sampled": sampled, "total": total })
+            }
+            Coverage::Truncated { retained, dropped } => {
+                serde_json::json!({ "kind": "truncated", "retained": retained, "dropped": dropped })
+            }
+            Coverage::Unavailable => serde_json::json!({ "kind": "unavailable" }),
+        };
+        serde_json::json!({
+            "mode": self.mode(),
+            "steps": export.steps,
+            "host_wall_ms": ms(export.host.wall),
+            "host_encode_ms": ms(export.host.encode),
+            "host_wait_ms": ms(export.host.wait),
+            // `null` is Unknown: no device measured these steps. It is not zero milliseconds.
+            "device_time_ms": export.device_sum.map(ms),
+            "detail_coverage": coverage,
+            "perturbed": export.perturbed,
+        })
+    }
+
+    fn prometheus(&self) -> String {
+        let export = self.export();
+        let coverage = match export.detail {
+            Coverage::Complete => "complete",
+            Coverage::Unsampled { .. } => "sampled",
+            Coverage::Truncated { .. } => "truncated",
+            Coverage::Unavailable => "unavailable",
+        };
+        let mut text = format!(
+            "# HELP poot_executor_steps_total Executor steps run (exact; independent of detail retention).\n\
+             # TYPE poot_executor_steps_total counter\n\
+             poot_executor_steps_total {}\n\
+             # HELP poot_executor_host_wall_seconds_total Host wall of those steps, as the engine's own clock measured it.\n\
+             # TYPE poot_executor_host_wall_seconds_total counter\n\
+             poot_executor_host_wall_seconds_total {}\n\
+             # HELP poot_timing_info Timing mode and how complete the retained per-dispatch detail is.\n\
+             # TYPE poot_timing_info gauge\n\
+             poot_timing_info{{mode=\"{}\",detail_coverage=\"{}\",perturbed=\"{}\"}} 1\n",
+            export.steps,
+            export.host.wall.as_secs_f64(),
+            self.mode(),
+            coverage,
+            export.perturbed,
+        );
+        // The device time is exported only when a device measured it: an absent series is Unknown, a
+        // `0` would claim a measurement.
+        if let Some(device) = export.device_sum {
+            text.push_str(&format!(
+                "# HELP poot_executor_device_seconds_total Sum of measured per-dispatch device durations.\n\
+                 # TYPE poot_executor_device_seconds_total counter\n\
+                 poot_executor_device_seconds_total {}\n",
+                device.as_secs_f64()
+            ));
+        }
+        text
+    }
+}
+
 pub(crate) struct Metrics {
     pub(crate) started: Instant,
     pub(crate) requests: AtomicU64,
@@ -200,6 +348,9 @@ pub(crate) struct Metrics {
     /// batched-engine speculative-decode counters; 0 unless `--draft-lookup` or `--draft-model` is
     /// given and at least one row has drafted.
     pub(crate) speculative: SpeculativeMetrics,
+    /// the executor's device timing as the engine last published it; counters only unless the server was
+    /// started with `--device-timing`.
+    pub(crate) timing: TimingMetrics,
 }
 
 /// RAII guard for the in-flight gauge: increments on construction, decrements on drop, so early returns and
@@ -333,6 +484,7 @@ impl Metrics {
             "speculative_proposed_tokens": self.speculative.proposed.load(Ordering::Relaxed),
             "speculative_accepted_tokens": self.speculative.accepted.load(Ordering::Relaxed),
             "speculative_skipped_rows": self.speculative.skipped.load(Ordering::Relaxed),
+            "device_timing": self.timing.json(),
             "ttft_ms": { "count": self.ttft.count(), "avg": round1(self.ttft.avg_ms()) },
             "itl_ms": { "count": self.itl.count(), "avg": round1(self.itl.avg_ms()) },
             "request_e2e_ms": { "count": self.e2e.count(), "avg": round1(self.e2e.avg_ms()) },
@@ -354,7 +506,7 @@ impl Metrics {
         sys.refresh_cpu_usage();
         let mb = |bytes: u64| bytes / (1024 * 1024);
         let cpu = ((sys.global_cpu_usage() as f64) * 10.0).round() / 10.0;
-        format!(
+        let mut text = format!(
             "# HELP poot_uptime_seconds Server uptime.\n\
              # TYPE poot_uptime_seconds gauge\n\
              poot_uptime_seconds {}\n\
@@ -512,6 +664,8 @@ impl Metrics {
                 "poot_queue_wait_ms",
                 "Time a request waited enqueued before a decode slot freed (GPU batched path)."
             ),
-        )
+        );
+        text.push_str(&self.timing.prometheus());
+        text
     }
 }

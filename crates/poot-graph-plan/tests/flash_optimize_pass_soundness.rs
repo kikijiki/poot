@@ -10,7 +10,7 @@
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
 use poot_executor_parity::dense::{Dense, Family, plain, step};
 use poot_executor_parity::weight_map::MappedModel;
-use poot_graph_ir::{Graph, OpKind, Slot, Storage};
+use poot_graph_ir::{Graph, OpKind, Slot, Storage, ValueId};
 use poot_models::model::{LogitRows, Phase};
 use poot_tensor::{DType, HostTensor};
 use std::collections::HashMap as Map;
@@ -99,8 +99,8 @@ fn bind(
     tokens: &[i32],
     start: i32,
     state: &dyn Fn(usize, &[usize]) -> HostTensor,
-) -> Map<usize, Value> {
-    let mut inputs: Map<usize, Value> = Map::new();
+) -> Map<ValueId, Value> {
+    let mut inputs: Map<ValueId, Value> = Map::new();
     for &id in &g.inputs {
         let m = &g.values[id];
         let shape = m.aval.shape.clone();
@@ -137,7 +137,7 @@ fn zeros(_: usize, shape: &[usize]) -> HostTensor {
 }
 
 /// `g` evaluated: the output and every carried state, dense.
-fn run(g: &Graph, inputs: &Map<usize, Value>) -> (HostTensor, Vec<HostTensor>) {
+fn run(g: &Graph, inputs: &Map<ValueId, Value>) -> (HostTensor, Vec<HostTensor>) {
     let r = eval(g, inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).expect("the graph evaluates");
     let state = r
         .state

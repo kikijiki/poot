@@ -10,6 +10,7 @@
 use poot_graph_ir::graph::{Eqn, Graph, ValidationChannel, ValueId, ValueMeta};
 
 use crate::{CompileLimits, ExpansionError, GraphResource};
+use poot_graph_ir::ValueTable;
 
 /// The value and equation caps of one compile, as the passes spend them.
 #[derive(Clone, Copy, Debug)]
@@ -94,11 +95,10 @@ impl GraphBudget {
     pub(crate) fn push_value(
         &self,
         stage: &'static str,
-        values: &mut Vec<ValueMeta>,
+        values: &mut ValueTable<ValueMeta>,
         meta: ValueMeta,
     ) -> Result<ValueId, ExpansionError> {
         self.check(stage, GraphResource::Values, values.len(), 1)?;
-        values.push(meta);
-        Ok(values.len() - 1)
+        Ok(values.push(meta))
     }
 }

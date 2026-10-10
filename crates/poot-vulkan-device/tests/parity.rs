@@ -513,12 +513,12 @@ fn chunked_gdn_prefill_matches_the_sequential_recurrence_on_vulkan() {
                 HostTensor::f32(vec![1, H_V, 1, last], values)
             };
             let bound = HashMap::from([
-                (q.id, Value::from(heads(qd, H_K, D))),
-                (k.id, Value::from(heads(kd, H_K, D))),
-                (v.id, Value::from(heads(vd, H_V, D))),
-                (g.id, Value::from(heads(gd, H_V, 1))),
-                (beta.id, Value::from(heads(bd, H_V, 1))),
-                (state.id, Value::from(carried.clone())),
+                (q.id(), Value::from(heads(qd, H_K, D))),
+                (k.id(), Value::from(heads(kd, H_K, D))),
+                (v.id(), Value::from(heads(vd, H_V, D))),
+                (g.id(), Value::from(heads(gd, H_V, 1))),
+                (beta.id(), Value::from(heads(bd, H_V, 1))),
+                (state.id(), Value::from(carried.clone())),
             ]);
             let step = eval(&graph, &bound, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap();
             carried = step.state.into_iter().next().unwrap().into_host().unwrap();

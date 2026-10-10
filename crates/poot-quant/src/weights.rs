@@ -16,12 +16,12 @@
 //!   scale?) stays with its consumer; the store only proves the bytes are the right length.
 //! - [`WeightEntry::Packed`]: an [`Arc<PackedPayload>`] (Card 627), the mixed loader's
 //!   authoritative source bytes for one packed weight (one [`StoredBytes`] per
-//!   [`PackedWeight::sources`] role, built by range reads with streamed upload), named by its
+//!   [`PackedWeight::sources`] role, a view of the checkpoint's file mapping), named by its
 //!   [`format::WeightFormat`] quantization scheme.
 //!
-//! [`StoredBytes`] is the one byte-ownership and content-identity type both entries build on: a
-//! dense tensor's whole buffer, or one packed source's buffer, own their bytes and memoize their
-//! fingerprint the same way.
+//! [`StoredBytes`] is the one byte-ownership type both entries build on: a dense tensor's whole
+//! buffer, or one packed source's buffer, is a view of a file mapping (or an owned region for bytes a
+//! loader derives or a fixture builds), checked for in-place change with [`WeightStore::check_sources`].
 //!
 //! Beside the store sits the [`WeightMap`] (Card 562a): a model's table from a typed
 //! [`WeightId`] (`(layer, role)`) to a [`WeightView`] over store entries and the [`WeightHandle`] a
@@ -36,7 +36,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{PackedPayload, PackedStack, StoredBytes};
+use crate::{PackedPayload, PackedStack, PackedWeight, SourceChanged, SourceRole, StoredBytes};
 
 /// The name a loader assigned one stored weight: the checkpoint tensor name for a dense entry, or
 /// the loader's linear id (built from that weight's several source tensors - `weight` and `scale`
@@ -168,7 +168,7 @@ impl DenseWeight {
     pub fn try_new(
         dtype: poot_tensor::DType,
         shape: Vec<usize>,
-        bytes: Arc<[u8]>,
+        bytes: StoredBytes,
     ) -> Result<Self, DenseWeightError> {
         let element_bytes = dtype.byte_size();
         let overflow = || DenseWeightError::ShapeOverflow {
@@ -192,7 +192,7 @@ impl DenseWeight {
         Ok(Self {
             dtype,
             shape,
-            bytes: StoredBytes::new(bytes),
+            bytes,
         })
     }
 
@@ -361,6 +361,28 @@ impl WeightStore {
 
     pub fn iter(&self) -> impl Iterator<Item = (&WeightKey, &WeightEntry)> {
         self.entries.iter().map(|(key, owned)| (key, &owned.entry))
+    }
+
+    /// [`StoredBytes::check_unchanged`] once per distinct region of the store's bytes (one `fstat` per
+    /// mapped checkpoint file, never per tensor): `Ok` when no file mapped under this store changed
+    /// since it was mapped. A loader runs it before publishing the store and an executor before a bind
+    /// batch (ADR-0103 amendment: the identity check at its named boundaries).
+    pub fn check_sources(&self) -> Result<(), SourceChanged> {
+        let mut checked: Vec<&StoredBytes> = Vec::new();
+        for owned in self.entries.values() {
+            let views: Vec<&StoredBytes> = match &owned.entry {
+                WeightEntry::Dense(dense) => vec![dense.bytes()],
+                WeightEntry::Packed(payload) => payload.stored().collect(),
+            };
+            for view in views {
+                // Owned regions never change; only a mapped region is checked, once per file.
+                if view.is_mapped() && !checked.iter().any(|seen| seen.same_region(view)) {
+                    view.check_unchanged()?;
+                    checked.push(view);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Removes and returns one entry, releasing the store's own copy of its bytes once the caller
@@ -1088,19 +1110,29 @@ pub enum WeightView {
         key: WeightKey,
         rows: std::ops::Range<usize>,
     },
-    /// An integer index table stored as I64, read as I32 (DeepSeek-V4's `tid2eid`): every value is
+    /// An index table stored as I64, read as I32 (DeepSeek-V4's `tid2eid`): every value is
     /// range-checked when the map is built, so a table that does not fit I32 is refused before any
     /// trace. The one view whose bytes are derived rather than cut from the store.
     IndexNarrow(WeightKey),
+    /// A range `cols` of axis `axis` (at least 1) of one entry: the share a tensor-parallel rank holds of a
+    /// row-parallel weight (the input columns of a checkpoint `[out, K]` matrix) or of a stacked adapter
+    /// factor. A packed `[out, K]` payload is cut on whole encoding blocks of its `K` axis only: a range
+    /// off a block boundary, or of a planar format, is refused when the view is built.
+    BlockColumns {
+        key: WeightKey,
+        axis: usize,
+        cols: std::ops::Range<usize>,
+    },
 }
 
 impl WeightView {
     /// The store keys this view reads.
     fn keys(&self) -> &[WeightKey] {
         match self {
-            Self::Stored(key) | Self::IndexNarrow(key) | Self::RowRange { key, .. } => {
-                std::slice::from_ref(key)
-            }
+            Self::Stored(key)
+            | Self::IndexNarrow(key)
+            | Self::RowRange { key, .. }
+            | Self::BlockColumns { key, .. } => std::slice::from_ref(key),
             Self::RowStack(keys) | Self::ExpertStack(keys) => keys,
         }
     }
@@ -1194,6 +1226,42 @@ pub enum WeightMapError {
     PackedStackIsNotOneEntry { id: WeightId },
     /// [`WeightMap::materialize_stack`] over a view that is not a packed expert stack.
     NotAPackedStack { id: WeightId },
+    /// A [`WeightView::BlockColumns`] over axis 0 (that is [`WeightView::RowRange`]) or past the entry's
+    /// rank.
+    ColumnAxis {
+        id: WeightId,
+        key: WeightKey,
+        axis: usize,
+        rank: usize,
+    },
+    /// A [`WeightView::BlockColumns`] range that is empty or reaches past its axis.
+    ColumnRangeOutOfBounds {
+        id: WeightId,
+        axis: usize,
+        cols: std::ops::Range<usize>,
+        available: usize,
+    },
+    /// A column range of a packed weight that does not start and end on whole encoding blocks of
+    /// `block_values` values, so a block would be cut in two.
+    ColumnsOffBlock {
+        id: WeightId,
+        key: WeightKey,
+        cols: std::ops::Range<usize>,
+        block_values: usize,
+    },
+    /// A column range of a packed weight whose format is not stored as one run of blocks per row (a
+    /// planar format), or of a packed axis other than its `K`.
+    ColumnsOfPlanar { id: WeightId, key: WeightKey },
+    /// [`WeightMap::rank_view`] over an axis whose extent `world` does not divide.
+    ShareNotDivisible {
+        id: WeightId,
+        axis: usize,
+        extent: usize,
+        world: u32,
+    },
+    /// [`WeightMap::rank_view`] over a weight whose view cannot be cut further on `axis`: a stack, an
+    /// index table, or a range already cut on another axis.
+    ShareOfView { id: WeightId, axis: usize },
 }
 
 impl fmt::Display for WeightMapError {
@@ -1250,6 +1318,50 @@ impl fmt::Display for WeightMapError {
             Self::NotAPackedStack { id } => {
                 write!(f, "weight {id} is not a packed expert stack")
             }
+            Self::ColumnAxis {
+                id,
+                key,
+                axis,
+                rank,
+            } => write!(
+                f,
+                "weight {id}: entry {key} of rank {rank} has no column axis {axis} (axis 0 is the rows)"
+            ),
+            Self::ColumnRangeOutOfBounds {
+                id,
+                axis,
+                cols,
+                available,
+            } => write!(
+                f,
+                "weight {id}: range {cols:?} is not a non-empty range of axis {axis}'s {available} values"
+            ),
+            Self::ColumnsOffBlock {
+                id,
+                key,
+                cols,
+                block_values,
+            } => write!(
+                f,
+                "weight {id}: columns {cols:?} of packed entry {key} are not whole {block_values}-value blocks"
+            ),
+            Self::ColumnsOfPlanar { id, key } => write!(
+                f,
+                "weight {id}: packed entry {key} is not stored as one run of blocks per row, so its columns cannot be cut"
+            ),
+            Self::ShareNotDivisible {
+                id,
+                axis,
+                extent,
+                world,
+            } => write!(
+                f,
+                "weight {id}: axis {axis} of extent {extent} does not divide over {world} ranks"
+            ),
+            Self::ShareOfView { id, axis } => write!(
+                f,
+                "weight {id}: its view cannot be cut to a rank's share of axis {axis}"
+            ),
         }
     }
 }
@@ -1387,6 +1499,76 @@ impl WeightMap {
             .collect::<Result<Vec<_>, _>>()?;
         PackedStack::try_new(owners).map_err(packed_error(id))
     }
+
+    /// This map as rank `rank` of `world` tensor-parallel ranks reads it: each weight of `splits`, named
+    /// with the axis of its mapped logical shape that is divided, is cut to the rank's equal share of that
+    /// axis; every other weight is read whole. Axis 0 is a [`WeightView::RowRange`], any other axis a
+    /// [`WeightView::BlockColumns`], so no byte is copied until a binder reads the view.
+    ///
+    /// Every cut is checked against `store` like a family's own view: an extent `world` does not divide,
+    /// a packed share off a block boundary, and a view that cannot be cut further are typed errors.
+    pub fn rank_view(
+        &self,
+        store: &WeightStore,
+        rank: usize,
+        world: std::num::NonZeroU32,
+        splits: &[(WeightId, usize)],
+    ) -> Result<WeightMap, WeightMapError> {
+        let mut view = self.clone();
+        for &(id, axis) in splits {
+            let (current, handle) = self
+                .entries
+                .get(&id)
+                .ok_or(WeightMapError::Unmapped { id })?;
+            let extent = *handle
+                .shape
+                .get(axis)
+                .ok_or(WeightMapError::ShareOfView { id, axis })?;
+            let world_n = world.get() as usize;
+            if !extent.is_multiple_of(world_n) {
+                return Err(WeightMapError::ShareNotDivisible {
+                    id,
+                    axis,
+                    extent,
+                    world: world.get(),
+                });
+            }
+            let share = extent / world_n;
+            let range = rank * share..(rank + 1) * share;
+            let refused = || WeightMapError::ShareOfView { id, axis };
+            let cut = match (current, axis) {
+                (WeightView::Stored(key), 0) => WeightView::RowRange {
+                    key: key.clone(),
+                    rows: range,
+                },
+                (WeightView::Stored(key), _) => WeightView::BlockColumns {
+                    key: key.clone(),
+                    axis,
+                    cols: range,
+                },
+                (WeightView::RowRange { key, rows }, 0) => WeightView::RowRange {
+                    key: key.clone(),
+                    rows: rows.start + range.start..rows.start + range.end,
+                },
+                (
+                    WeightView::BlockColumns {
+                        key,
+                        axis: cut_axis,
+                        cols,
+                    },
+                    _,
+                ) if *cut_axis == axis => WeightView::BlockColumns {
+                    key: key.clone(),
+                    axis,
+                    cols: cols.start + range.start..cols.start + range.end,
+                },
+                _ => return Err(refused()),
+            };
+            let handle = view_handle(id, &cut, store)?;
+            view.entries.insert(id, (cut, handle));
+        }
+        Ok(view)
+    }
 }
 
 /// Builds a [`WeightMap`] against one store, checking each view as it is added.
@@ -1461,6 +1643,78 @@ fn check_row_range(
     Ok(())
 }
 
+/// What a checked [`WeightView::BlockColumns`] cuts: `outer` runs of `extent` values on its axis, each
+/// value `inner` elements wide, `extent_product` elements in all; for a packed entry also the encoding
+/// block it must fall on.
+struct ColumnCut {
+    outer: usize,
+    extent: usize,
+    inner: usize,
+    extent_product: usize,
+    block_values: Option<usize>,
+    block_bytes: Option<usize>,
+}
+
+/// Check that `cols` is a non-empty range of axis `axis` (at least 1) of `entry`, and, for a packed
+/// entry, that it is the `K` axis cut on whole blocks of a block format.
+fn column_cut(
+    id: WeightId,
+    key: &WeightKey,
+    entry: &WeightEntry,
+    axis: usize,
+    cols: &std::ops::Range<usize>,
+) -> Result<ColumnCut, WeightMapError> {
+    let shape = entry.shape();
+    if axis == 0 || axis >= shape.len() {
+        return Err(WeightMapError::ColumnAxis {
+            id,
+            key: key.clone(),
+            axis,
+            rank: shape.len(),
+        });
+    }
+    let extent = shape[axis];
+    if cols.is_empty() || cols.end > extent {
+        return Err(WeightMapError::ColumnRangeOutOfBounds {
+            id,
+            axis,
+            cols: cols.clone(),
+            available: extent,
+        });
+    }
+    let (mut block_values, mut block_bytes) = (None, None);
+    if let WeightEntry::Packed(payload) = entry {
+        let planar = || WeightMapError::ColumnsOfPlanar {
+            id,
+            key: key.clone(),
+        };
+        let crate::format::Storage::Blocks(layout) = payload.weight().format().descriptor().storage
+        else {
+            return Err(planar());
+        };
+        if axis != 1 {
+            return Err(planar());
+        }
+        if !cols.start.is_multiple_of(layout.values) || !cols.end.is_multiple_of(layout.values) {
+            return Err(WeightMapError::ColumnsOffBlock {
+                id,
+                key: key.clone(),
+                cols: cols.clone(),
+                block_values: layout.values,
+            });
+        }
+        (block_values, block_bytes) = (Some(layout.values), Some(layout.bytes));
+    }
+    Ok(ColumnCut {
+        outer: shape[..axis].iter().product(),
+        extent,
+        inner: shape[axis + 1..].iter().product(),
+        extent_product: shape.iter().product::<usize>().max(1),
+        block_values,
+        block_bytes,
+    })
+}
+
 fn packed_error(id: WeightId) -> impl FnOnce(crate::PackedWeightError) -> WeightMapError {
     move |source| WeightMapError::Packed {
         id,
@@ -1531,6 +1785,30 @@ fn view_handle(
                 }
             }
         }
+        WeightView::BlockColumns { key, axis, cols } => {
+            let entry = stored(id, key, store)?;
+            column_cut(id, key, entry, *axis, cols)?;
+            match entry {
+                WeightEntry::Dense(dense) => {
+                    let mut shape = dense.shape().to_vec();
+                    shape[*axis] = cols.len();
+                    Ok(WeightHandle {
+                        format: HandleFormat::Dense(dense.dtype()),
+                        shape,
+                    })
+                }
+                WeightEntry::Packed(payload) => {
+                    let weight = payload.weight();
+                    let shape = [weight.shape()[0], cols.len()];
+                    PackedWeight::try_new(weight.format(), shape)
+                        .map(|weight| WeightHandle {
+                            format: HandleFormat::Packed(weight),
+                            shape: shape.to_vec(),
+                        })
+                        .map_err(packed_error(id))
+                }
+            }
+        }
         WeightView::IndexNarrow(key) => {
             let shape = narrowed_index_table(id, key, store)?.shape().to_vec();
             Ok(WeightHandle {
@@ -1573,13 +1851,16 @@ fn materialize_view(
             entry @ WeightEntry::Dense(dense) => {
                 check_row_range(id, key, entry, rows)?;
                 let row_bytes = dense.bytes().len() / dense.shape()[0];
-                let bytes = &dense.bytes().as_slice()[rows.start * row_bytes..rows.end * row_bytes];
+                let bytes = dense
+                    .bytes()
+                    .slice(rows.start * row_bytes..rows.end * row_bytes)
+                    .expect("check_row_range keeps the rows inside the entry");
                 let mut shape = dense.shape().to_vec();
                 shape[0] = rows.len();
                 Ok(WeightEntry::Dense(DenseWeight {
                     dtype: dense.dtype(),
                     shape,
-                    bytes: StoredBytes::new(Arc::from(bytes)),
+                    bytes,
                 }))
             }
             entry @ WeightEntry::Packed(payload) => {
@@ -1618,7 +1899,7 @@ fn materialize_view(
                     Ok(WeightEntry::Dense(DenseWeight {
                         dtype: first.dtype(),
                         shape,
-                        bytes: StoredBytes::new(Arc::from(bytes)),
+                        bytes: StoredBytes::from(bytes),
                     }))
                 }
                 Some(WeightEntry::Packed(_)) => {
@@ -1631,6 +1912,56 @@ fn materialize_view(
                         .collect::<Result<Vec<_>, _>>()?;
                     PackedPayload::concat_rows(&payloads)
                         .map(|stacked| WeightEntry::Packed(Arc::new(stacked)))
+                        .map_err(packed_error(id))
+                }
+            }
+        }
+        WeightView::BlockColumns { key, axis, cols } => {
+            let entry = stored(id, key, store)?;
+            let cut = column_cut(id, key, entry, *axis, cols)?;
+            match entry {
+                WeightEntry::Dense(dense) => {
+                    let source = dense.bytes().as_slice();
+                    let unit = source.len() / cut.extent_product;
+                    let inner = cut.inner * unit;
+                    let mut bytes = Vec::with_capacity(cut.outer * cols.len() * inner);
+                    for outer in 0..cut.outer {
+                        let row = outer * cut.extent;
+                        bytes.extend_from_slice(
+                            &source[(row + cols.start) * inner..(row + cols.end) * inner],
+                        );
+                    }
+                    let mut shape = dense.shape().to_vec();
+                    shape[*axis] = cols.len();
+                    Ok(WeightEntry::Dense(DenseWeight {
+                        dtype: dense.dtype(),
+                        shape,
+                        bytes: StoredBytes::from(bytes),
+                    }))
+                }
+                WeightEntry::Packed(payload) => {
+                    let weight = payload.weight();
+                    let [rows, _] = weight.shape();
+                    let layout = cut
+                        .block_values
+                        .zip(cut.block_bytes)
+                        .expect("a packed column cut names its block layout");
+                    let [_, row_bytes] = weight.source_shape(SourceRole::Blocks);
+                    let (first, last) = (
+                        cols.start / layout.0 * layout.1,
+                        cols.end / layout.0 * layout.1,
+                    );
+                    let source = payload.bytes(SourceRole::Blocks);
+                    let mut bytes = Vec::with_capacity(rows * (last - first));
+                    for row in 0..rows {
+                        bytes.extend_from_slice(
+                            &source[row * row_bytes + first..row * row_bytes + last],
+                        );
+                    }
+                    let sliced = PackedWeight::try_new(weight.format(), [rows, cols.len()])
+                        .map_err(packed_error(id))?;
+                    PackedPayload::try_new(sliced, [(SourceRole::Blocks, StoredBytes::from(bytes))])
+                        .map(|sliced| WeightEntry::Packed(Arc::new(sliced)))
                         .map_err(packed_error(id))
                 }
             }
@@ -1653,7 +1984,7 @@ fn materialize_view(
             Ok(WeightEntry::Dense(DenseWeight {
                 dtype,
                 shape: handle.shape,
-                bytes: StoredBytes::new(Arc::from(bytes)),
+                bytes: StoredBytes::from(bytes),
             }))
         }
     }
@@ -1693,7 +2024,7 @@ fn narrowed_index_table(
     Ok(DenseWeight {
         dtype: DType::I32,
         shape: dense.shape().to_vec(),
-        bytes: StoredBytes::new(Arc::from(narrowed)),
+        bytes: StoredBytes::from(narrowed),
     })
 }
 
@@ -1720,7 +2051,7 @@ mod tests {
     use crate::{PackedWeight, SourceRole};
     use poot_tensor::DType;
 
-    fn bytes(n: usize) -> Arc<[u8]> {
+    fn bytes(n: usize) -> StoredBytes {
         vec![0u8; n].into()
     }
 
@@ -2523,6 +2854,206 @@ mod tests {
         assert_eq!(
             map.materialize_stack(K, &store).unwrap_err(),
             WeightMapError::NotAPackedStack { id: K }
+        );
+    }
+
+    /// `rows` rows of two Q4_0 blocks each (K = 64), every block's quants distinct, so a column cut
+    /// that takes the wrong block, or any block of the wrong row, changes the bytes.
+    fn q4_wide(rows: usize) -> WeightEntry {
+        let weight = PackedWeight::try_new(WeightFormat::Q4_0, [rows, 64]).unwrap();
+        let bytes: Vec<u8> = (0..rows * 2)
+            .flat_map(|block| {
+                let mut bytes = vec![0x00, 0x3c];
+                bytes.extend(std::iter::repeat_n(0x10 + block as u8, 16));
+                bytes
+            })
+            .collect();
+        WeightEntry::Packed(Arc::new(
+            PackedPayload::try_new(weight, [(SourceRole::Blocks, bytes.into())]).unwrap(),
+        ))
+    }
+
+    fn column_store() -> WeightStore {
+        let mut b = WeightStore::builder();
+        b.insert("dense", ramp(3, 4, 0)).unwrap();
+        b.insert("packed", q4_wide(3)).unwrap();
+        b.insert("stack", ramp(6, 2, 40)).unwrap();
+        b.build()
+    }
+
+    /// A dense column range keeps each row's own columns, in row order.
+    #[test]
+    fn dense_column_views_cut_every_row_at_the_same_columns() {
+        let store = column_store();
+        let mut b = WeightMap::builder(&store);
+        b.map(
+            Q,
+            WeightView::BlockColumns {
+                key: "dense".into(),
+                axis: 1,
+                cols: 1..3,
+            },
+        )
+        .unwrap();
+        let map = b.build();
+        assert_eq!(map.handle(Q).unwrap().shape, vec![3, 2]);
+        let cut = map.materialize(Q, &store).unwrap();
+        assert_eq!(WeightHandle::of(&cut), *map.handle(Q).unwrap());
+        let whole = entry_bytes(store.get("dense").unwrap());
+        let want: Vec<u8> = (0..3)
+            .flat_map(|row| whole[(row * 4 + 1) * 4..(row * 4 + 3) * 4].to_vec())
+            .collect();
+        assert_eq!(entry_bytes(&cut), want);
+    }
+
+    /// A packed column range is whole blocks of every row, never a decode.
+    #[test]
+    fn packed_column_views_cut_whole_blocks_of_every_row() {
+        let store = column_store();
+        let mut b = WeightMap::builder(&store);
+        b.map(
+            Q,
+            WeightView::BlockColumns {
+                key: "packed".into(),
+                axis: 1,
+                cols: 32..64,
+            },
+        )
+        .unwrap();
+        let map = b.build();
+        assert_eq!(
+            map.handle(Q).unwrap().format,
+            HandleFormat::Packed(PackedWeight::try_new(WeightFormat::Q4_0, [3, 32]).unwrap())
+        );
+        let cut = map.materialize(Q, &store).unwrap();
+        assert_eq!(WeightHandle::of(&cut), *map.handle(Q).unwrap());
+        let whole = entry_bytes(store.get("packed").unwrap());
+        // 18-byte blocks, two per row: the second block of each of three rows.
+        let want: Vec<u8> = (0..3)
+            .flat_map(|row| whole[(row * 2 + 1) * 18..(row * 2 + 2) * 18].to_vec())
+            .collect();
+        assert_eq!(entry_bytes(&cut), want);
+    }
+
+    /// A packed range off a block boundary is refused when the view is built, and so are the axes a
+    /// column range cannot be.
+    #[test]
+    fn column_views_refuse_a_cut_block_and_the_wrong_axis() {
+        let store = column_store();
+        let view = |key: &str, axis, cols| WeightView::BlockColumns {
+            key: key.into(),
+            axis,
+            cols,
+        };
+        let err = |view| {
+            WeightMap::builder(&store)
+                .map(Q, view)
+                .map(|_| ())
+                .unwrap_err()
+        };
+        assert_eq!(
+            err(view("packed", 1, 16..48)),
+            WeightMapError::ColumnsOffBlock {
+                id: Q,
+                key: "packed".into(),
+                cols: 16..48,
+                block_values: 32
+            }
+        );
+        assert_eq!(
+            err(view("dense", 0, 0..1)),
+            WeightMapError::ColumnAxis {
+                id: Q,
+                key: "dense".into(),
+                axis: 0,
+                rank: 2
+            }
+        );
+        assert!(matches!(
+            err(view("dense", 1, 2..5)),
+            WeightMapError::ColumnRangeOutOfBounds { available: 4, .. }
+        ));
+        assert!(matches!(
+            err(view("packed", 0, 0..1)),
+            WeightMapError::ColumnAxis { .. }
+        ));
+    }
+
+    /// A rank's view of a map: axis 0 is the rank's rows, another axis its columns, composed with a view
+    /// that is already a row range; a share the world does not divide is refused by name.
+    #[test]
+    fn rank_views_give_each_rank_its_equal_share_of_the_named_axis() {
+        let store = column_store();
+        let mut b = WeightMap::builder(&store);
+        b.map(Q, WeightView::Stored("dense".into())).unwrap();
+        b.map(K, WeightView::Stored("packed".into())).unwrap();
+        b.map(
+            GATE_UP,
+            WeightView::RowRange {
+                key: "stack".into(),
+                rows: 2..6,
+            },
+        )
+        .unwrap();
+        let map = b.build();
+        let world = std::num::NonZeroU32::new(2).unwrap();
+        let splits = [(Q, 1), (K, 1), (GATE_UP, 0)];
+        let whole = |key: &str| entry_bytes(store.get(key).unwrap());
+        for rank in 0..2 {
+            let view = map.rank_view(&store, rank, world, &splits).unwrap();
+            assert_eq!(
+                view.view(Q),
+                Some(&WeightView::BlockColumns {
+                    key: "dense".into(),
+                    axis: 1,
+                    cols: rank * 2..rank * 2 + 2
+                })
+            );
+            assert_eq!(view.handle(Q).unwrap().shape, vec![3, 2]);
+            let dense = entry_bytes(&view.materialize(Q, &store).unwrap());
+            let want: Vec<u8> = (0..3)
+                .flat_map(|row| {
+                    let start = (row * 4 + rank * 2) * 4;
+                    whole("dense")[start..start + 8].to_vec()
+                })
+                .collect();
+            assert_eq!(dense, want, "rank {rank}'s dense columns");
+            let packed = entry_bytes(&view.materialize(K, &store).unwrap());
+            let want: Vec<u8> = (0..3)
+                .flat_map(|row| whole("packed")[(row * 2 + rank) * 18..][..18].to_vec())
+                .collect();
+            assert_eq!(packed, want, "rank {rank}'s packed blocks");
+            assert_eq!(
+                view.view(GATE_UP),
+                Some(&WeightView::RowRange {
+                    key: "stack".into(),
+                    rows: 2 + rank * 2..4 + rank * 2
+                })
+            );
+        }
+        let three = std::num::NonZeroU32::new(3).unwrap();
+        assert_eq!(
+            map.rank_view(&store, 0, three, &[(Q, 1)]).unwrap_err(),
+            WeightMapError::ShareNotDivisible {
+                id: Q,
+                axis: 1,
+                extent: 4,
+                world: 3
+            }
+        );
+        // Three ranks of a 64-value row would cut a 32-value block in two.
+        assert!(matches!(
+            map.rank_view(&store, 0, std::num::NonZeroU32::new(4).unwrap(), &[(K, 1)])
+                .unwrap_err(),
+            WeightMapError::ColumnsOffBlock { .. }
+        ));
+        assert_eq!(
+            map.rank_view(&store, 0, world, &[(GATE_UP, 1)])
+                .unwrap_err(),
+            WeightMapError::ShareOfView {
+                id: GATE_UP,
+                axis: 1
+            }
         );
     }
 }

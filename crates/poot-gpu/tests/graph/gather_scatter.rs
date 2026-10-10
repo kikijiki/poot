@@ -1,6 +1,7 @@
 use super::*;
 use poot_graph_plan::KernelChoice;
 use poot_kernelgen::{KernelRequest, MovementOp, MovementSpec};
+use poot_quant::StoredBytes;
 
 /// The generated movement a choice names, and whether its plan is one dispatch with no metadata buffer.
 fn movement_of(plan: &poot_graph_plan::Plan, choice: &KernelChoice) -> MovementSpec {
@@ -27,7 +28,7 @@ fn scatter_axis0_gpu_matches_cpu() {
     let src = b.constant("src", TensorType::f32(vec![n, rest]));
     let idx = b.constant("idx", TensorType::f32(vec![n]));
     let out = b.scatter(src, idx);
-    let (si, ii) = (src.id, idx.id);
+    let (si, ii) = (src.id(), idx.id());
     let g = b.finish(out);
 
     let srcd: Vec<f32> = (0..n * rest).map(|i| i as f32 + 1.0).collect();
@@ -82,7 +83,7 @@ fn arg_top_k_gpu_matches_cpu() {
     let b = Builder::new();
     let rank = b.constant("rank", TensorType::f32(vec![l, e]));
     let out = b.arg_top_k(rank, k);
-    let ri = rank.id;
+    let ri = rank.id();
     let g = b.finish(out);
 
     // rank[row,i] = (i*7 + row*3) % e: a permutation of 0..e per row (gcd(7,e)=1 for e=16), with a
@@ -146,7 +147,7 @@ fn gather_nonaxis0_gpu_matches_cpu() {
         let data = b.constant("data", TensorType::f32(vec![3, 4, 5]));
         let idx = b.constant("idx", TensorType::f32(vec![2]));
         let out = b.gather(data, 1, idx);
-        let (di, ii) = (data.id, idx.id);
+        let (di, ii) = (data.id(), idx.id());
         let g = b.finish(out);
         let eqn = g
             .eqns
@@ -208,7 +209,7 @@ fn gather_nonaxis0_gpu_matches_cpu() {
         let data = b.constant("data", TensorType::f32(vec![3, 4, 5]));
         let idx = b.constant("idx", TensorType::f32(vec![]));
         let out = b.gather(data, 2, idx);
-        let (di, ii) = (data.id, idx.id);
+        let (di, ii) = (data.id(), idx.id());
         let g = b.finish(out);
         let eqn = g
             .eqns
@@ -361,7 +362,7 @@ fn gather_nonaxis0_gpu_matches_cpu_over_random_shapes() {
         let data = b.constant("data", TensorType::f32(dims.clone()));
         let idx = b.constant("idx", TensorType::f32(vec![idx_size]));
         let out = b.gather(data, axis, idx);
-        let (di, ii) = (data.id, idx.id);
+        let (di, ii) = (data.id(), idx.id());
         let g = b.finish(out);
         let mut inputs = HashMap::new();
         inputs.insert(di, HostTensor::f32(dims.clone(), datad));
@@ -402,7 +403,7 @@ fn scatter_update_gpu_matches_cpu() {
     let src = b.constant("src", TensorType::f32(vec![n, rest]));
     let inv = b.constant("inv", TensorType::f32(vec![pool]));
     let out = b.scatter_update(base, src, inv);
-    let (bi, si, ii) = (base.id, src.id, inv.id);
+    let (bi, si, ii) = (base.id(), src.id(), inv.id());
     let g = b.finish(out);
 
     let based: Vec<f32> = (0..pool * rest).map(|i| 100.0 + i as f32).collect();
@@ -708,17 +709,20 @@ fn gather_composition_gpu_matches_cpu_over_random_graphs() {
         let mut inputs = HashMap::new();
         let table = b.constant("table", TensorType::f32(vec![v, d]));
         inputs.insert(
-            table.id,
+            table.id(),
             HostTensor::f32(vec![v, d], fill(seed * 7 + 1, v * d)),
         );
         let bcast = b.constant("bcast", TensorType::f32(vec![1, d])); // row-broadcast leaf
-        inputs.insert(bcast.id, HostTensor::f32(vec![1, d], fill(seed * 7 + 2, d)));
+        inputs.insert(
+            bcast.id(),
+            HostTensor::f32(vec![1, d], fill(seed * 7 + 2, d)),
+        );
 
         // the initial embedding-style gather: idx [k0] of valid rows into the [v, d] table.
         let k0 = 2 + (rng() % 4) as usize;
         let i0: Vec<f32> = (0..k0).map(|_| (rng() as usize % v) as f32).collect();
         let idx0 = b.constant("idx0", TensorType::f32(vec![k0]));
-        inputs.insert(idx0.id, HostTensor::f32(vec![k0], i0));
+        inputs.insert(idx0.id(), HostTensor::f32(vec![k0], i0));
         let mut acc = b.gather(table, 0, idx0); // [k0, d]
         let mut rows = k0;
 
@@ -753,7 +757,7 @@ fn gather_composition_gpu_matches_cpu_over_random_graphs() {
                     let kn = 2 + (rng() % 4) as usize;
                     let iv: Vec<f32> = (0..kn).map(|_| (rng() as usize % rows) as f32).collect();
                     let idxn = b.constant(&format!("idx{gctr}"), TensorType::f32(vec![kn]));
-                    inputs.insert(idxn.id, HostTensor::f32(vec![kn], iv));
+                    inputs.insert(idxn.id(), HostTensor::f32(vec![kn], iv));
                     gctr += 1;
                     acc = b.gather(acc, 0, idxn);
                     rows = kn;
@@ -852,11 +856,14 @@ fn scatter_composition_gpu_matches_cpu_over_random_graphs() {
         let mut inputs = HashMap::new();
         let mut acc = b.constant("x", TensorType::f32(vec![nn, d]));
         inputs.insert(
-            acc.id,
+            acc.id(),
             HostTensor::f32(vec![nn, d], fill(seed * 7 + 1, nn * d)),
         );
         let bcast = b.constant("bcast", TensorType::f32(vec![1, d]));
-        inputs.insert(bcast.id, HostTensor::f32(vec![1, d], fill(seed * 7 + 2, d)));
+        inputs.insert(
+            bcast.id(),
+            HostTensor::f32(vec![1, d], fill(seed * 7 + 2, d)),
+        );
 
         let mut gctr = 0usize;
         let mut did_scatter = false;
@@ -888,7 +895,7 @@ fn scatter_composition_gpu_matches_cpu_over_random_graphs() {
                         perm.swap(i, (rng() as usize) % (i + 1));
                     }
                     let idx = b.constant(&format!("idx{gctr}"), TensorType::f32(vec![nn]));
-                    inputs.insert(idx.id, HostTensor::f32(vec![nn], perm));
+                    inputs.insert(idx.id(), HostTensor::f32(vec![nn], perm));
                     gctr += 1;
                     acc = b.scatter(acc, idx);
                     did_scatter = true;
@@ -1002,9 +1009,12 @@ fn i32_slot_gather_variants_compiled_match_cpu_bit_exact() {
                         .iter()
                         .flat_map(|v| v.to_le_bytes())
                         .collect();
-                    let dense =
-                        DenseWeight::try_new(DType::F32, t.shape().to_vec(), Arc::from(bytes))
-                            .map_err(|e| e.to_string())?;
+                    let dense = DenseWeight::try_new(
+                        DType::F32,
+                        t.shape().to_vec(),
+                        StoredBytes::from(bytes),
+                    )
+                    .map_err(|e| e.to_string())?;
                     store
                         .insert(name, WeightEntry::Dense(dense))
                         .map_err(|e| e.to_string())?;
@@ -1034,9 +1044,12 @@ fn i32_slot_gather_variants_compiled_match_cpu_bit_exact() {
                         .iter()
                         .flat_map(|v| v.to_le_bytes())
                         .collect();
-                    let dense =
-                        DenseWeight::try_new(DType::F32, t.shape().to_vec(), Arc::from(seed_bytes))
-                            .map_err(|e| e.to_string())?;
+                    let dense = DenseWeight::try_new(
+                        DType::F32,
+                        t.shape().to_vec(),
+                        StoredBytes::from(seed_bytes),
+                    )
+                    .map_err(|e| e.to_string())?;
                     store
                         .insert(format!("{name}.seed"), WeightEntry::Dense(dense))
                         .map_err(|e| e.to_string())?;

@@ -15,6 +15,7 @@ use poot_graph_plan::{
     CompileLimits, CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, LoraPlan, Partition,
     Submission, Target, TargetSet, compile_staged,
 };
+use poot_quant::StoredBytes;
 use poot_quant::weights::{
     AttnRole, DenseWeight, LoraRole, LoraTarget, WeightEntry, WeightId, WeightKey, WeightMap,
     WeightRole, WeightStore, WeightView,
@@ -55,7 +56,7 @@ fn projections() -> [(LoraTarget, usize, usize); 7] {
 
 fn dense(shape: Vec<usize>, values: &[f32]) -> WeightEntry {
     let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-    WeightEntry::Dense(DenseWeight::try_new(DType::F32, shape, Arc::from(bytes)).unwrap())
+    WeightEntry::Dense(DenseWeight::try_new(DType::F32, shape, StoredBytes::from(bytes)).unwrap())
 }
 
 /// Every row of `tokens` tokens per row against the adapter it names, on `exec`: panics with the

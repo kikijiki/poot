@@ -11,11 +11,11 @@ use poot_executor::Executor;
 use poot_graph_ir::op::FusedOp;
 use poot_graph_ir::{Builder, OpKind, Slot, TensorType, Traced, UnOp};
 use poot_graph_plan::{Submission, Target};
+use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::{DType, HostTensor};
 use poot_test_util::StepFixture;
 use poot_test_util::weight_map_oracle::oracle_for;
-use std::sync::Arc;
 
 use crate::Fixture;
 
@@ -104,7 +104,7 @@ fn slot_fixture(
             .zip(&inputs)
             .map(|(slot, tensor)| StepFixture {
                 key: graph
-                    .meta(slot.id)
+                    .meta(slot.id())
                     .slot_key()
                     .expect("a slot input has a key")
                     .clone(),
@@ -325,8 +325,12 @@ fn two_byte_cases() -> Vec<(Fixture, Vec<u16>)> {
             let off = b.constant("if_false", TensorType::new(vec![n], dtype));
             let selected = b.select(cond, on, off);
             let graph = b.finish(selected);
-            let bytes = |words: &[u16]| -> Arc<[u8]> {
-                words.iter().flat_map(|w| w.to_le_bytes()).collect()
+            let bytes = |words: &[u16]| -> StoredBytes {
+                words
+                    .iter()
+                    .flat_map(|w| w.to_le_bytes())
+                    .collect::<Vec<u8>>()
+                    .into()
             };
             let mut store = WeightStore::builder();
             for (key, words) in [("if_true", if_true), ("if_false", if_false)] {
@@ -337,7 +341,7 @@ fn two_byte_cases() -> Vec<(Fixture, Vec<u16>)> {
                     .expect("a fresh key");
             }
             let key = graph
-                .meta(cond.id)
+                .meta(cond.id())
                 .slot_key()
                 .expect("a slot input has a key")
                 .clone();

@@ -44,11 +44,11 @@ fn layered_graph(layers: usize) -> (Graph, HashMap<ValueId, Value>) {
 
     let mut inputs = HashMap::new();
     inputs.insert(
-        x.id,
+        x.id(),
         Value::from(HostTensor::f32(vec![4], vec![1.5, -0.25, 3.0, 0.75])),
     );
     inputs.insert(
-        w.id,
+        w.id(),
         Value::from(HostTensor::f32(vec![4], vec![0.5, 2.0, -1.25, 1.0])),
     );
     for (layer, &(state_input, _)) in graph.state.iter().enumerate() {

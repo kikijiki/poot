@@ -12,7 +12,7 @@ use poot_runtime_common::{BufferRole, CompiledKernel};
 use poot_test_util::kernel_fixtures::square_kernel;
 use poot_vulkan_runtime::{BufferStorage, Context, DeviceBuffer};
 
-/// Upload `data` as f32 through the storage-typed [`Context::alloc_storage`]/[`DeviceBuffer::write_bytes`]
+/// Upload `data` as f32 through the storage-typed [`Context::alloc_storage`]/[`DeviceBuffer::write_with`]
 /// primitives (Card 547a: this crate has no `upload_f32`/`alloc_f32`/`read_f32` family, since it has no
 /// consumer outside its own tests).
 fn upload_f32(ctx: &Context, role: BufferRole, data: &[f32]) -> DeviceBuffer {
@@ -20,7 +20,8 @@ fn upload_f32(ctx: &Context, role: BufferRole, data: &[f32]) -> DeviceBuffer {
         .alloc_storage(role, BufferStorage::f32(), data.len())
         .expect("alloc_storage");
     let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-    buf.write_bytes(0, &bytes).expect("write_bytes");
+    buf.write_with(0, bytes.len(), &mut |_, out| out.copy_from_slice(&bytes))
+        .expect("write_with");
     buf
 }
 

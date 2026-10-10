@@ -1,6 +1,7 @@
 use poot_graph_ir::op::{FusedOp, FusedOperand, FusedStep};
 
 use super::*;
+use poot_graph_ir::ValueTable;
 
 /// Fold the widening `Cast` of a narrow weight into the fused region that reads it.
 ///
@@ -17,8 +18,8 @@ use super::*;
 /// every reader is a packed reader ([`crate::bf16_const_feeds_only_packed_readers`]). Pointwise
 /// [`OpKind::Fused`] regions are left as they are: their kernels read every leaf as f32.
 pub fn fuse_widening_casts<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
-    let mut producer: Vec<Option<usize>> = vec![None; g.values.len()];
-    let mut uses: Vec<usize> = vec![0; g.values.len()];
+    let mut producer: ValueTable<Option<usize>> = ValueTable::filled(g.values.len(), None);
+    let mut uses: ValueTable<usize> = ValueTable::filled(g.values.len(), 0);
     for (e, eqn) in g.eqns.iter().enumerate() {
         producer[eqn.out] = Some(e);
         for operand in &eqn.inputs {

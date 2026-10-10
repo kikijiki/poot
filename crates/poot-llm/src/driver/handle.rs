@@ -9,11 +9,14 @@ use std::sync::Arc;
 
 use poot_load::gguf::{GgufIndex, IdentityNames, read_gguf};
 use poot_load::packed_safetensors::{FilePin, Sha256Digest, check_pin_reader};
+use poot_load::plan::default_workers;
 use poot_models::model::{Model, ModelConfig};
 use poot_models::registry::{FamilyEntry, RawConfig, Registry};
+use poot_quant::StoredBytes;
 use poot_quant::weights::WeightStore;
 
 use crate::driver::error::{DriverError, LoadError, Unsupported};
+use crate::text::chat::{ChatTemplateOverride, CheckedChatTemplate};
 use crate::text::tokenize::TextCodec;
 
 /// How [`ModelHandle::load`] treats the checkpoint's files.
@@ -25,6 +28,9 @@ pub struct LoadOptions {
     /// file the load will parse (the GGUF itself, each `*.safetensors` shard of an HF directory)
     /// must be listed: an unlisted one is refused. `None` checks nothing.
     pub integrity: Option<PathBuf>,
+    /// A chat template to render with in place of the checkpoint's own (or in place of none, for a base
+    /// model). `None` keeps the checkpoint's.
+    pub chat_template: Option<ChatTemplateOverride>,
 }
 
 #[derive(serde::Deserialize)]
@@ -53,12 +59,22 @@ fn digest_from_hex<'de, D: serde::Deserializer<'de>>(d: D) -> Result<[u8; 32], D
     Ok(out)
 }
 
-/// Check the checkpoint's files against `options.integrity`, each streamed through the hash once,
-/// before any tensor is read. The weight files the load will parse must all be pinned: a GGUF's own
+/// Check the checkpoint's files against `options.integrity`, each hashed once, before any tensor is
+/// read. The weight files the load will parse must all be pinned: a GGUF's own
 /// file name (`only`), or for an HF directory every `*.safetensors` shard in it. An unpinned weight
 /// file is [`LoadError::Unpinned`], never admitted unchecked. Files that are not tensors (config,
 /// tokenizer, the shard index) need no pin, but an HF manifest entry for one is still checked.
-fn check_integrity(options: &LoadOptions, dir: &Path, only: Option<&str>) -> Result<(), LoadError> {
+///
+/// `mapped` holds the weight files the load will read, already mapped: a pin on one of them is checked
+/// against that mapping, so the digest, the header and the tensors all come from one inode (ADR-0103
+/// amendment). Only a pinned file that is no weight file of the load (config, tokenizer, the shard index,
+/// a shard the index does not name) is streamed from its path.
+pub(super) fn check_integrity(
+    options: &LoadOptions,
+    dir: &Path,
+    only: Option<&str>,
+    mapped: &[(String, StoredBytes)],
+) -> Result<(), LoadError> {
     let Some(manifest_path) = &options.integrity else {
         return Ok(());
     };
@@ -89,16 +105,21 @@ fn check_integrity(options: &LoadOptions, dir: &Path, only: Option<&str>) -> Res
         return Err(LoadError::Unpinned { file: file.clone() });
     }
     for (name, pin) in &manifest.files {
-        if only.is_some_and(|only| only != name) {
-            continue;
-        }
-        let path = dir.join(name);
-        let file = File::open(&path).map_err(io_error(&path))?;
         let pin = FilePin {
             length: pin.length,
             sha256: Sha256Digest::new(pin.sha256),
         };
-        check_pin_reader(file, pin, name)?;
+        if only.is_some_and(|only| only != name) {
+            continue;
+        }
+        match mapped.iter().find(|(file, _)| file == name) {
+            Some((_, bytes)) => check_pin_reader(bytes.as_slice(), pin, name)?,
+            None => {
+                let path = dir.join(name);
+                let file = File::open(&path).map_err(io_error(&path))?;
+                check_pin_reader(file, pin, name)?;
+            }
+        }
     }
     Ok(())
 }
@@ -154,10 +175,17 @@ impl ModelHandle {
         registry: &Registry,
         options: &LoadOptions,
     ) -> Result<Self, DriverError> {
+        // The override is checked before any checkpoint file is read: a template poot refuses costs no load.
+        let template = options
+            .chat_template
+            .as_ref()
+            .map(ChatTemplateOverride::check)
+            .transpose()
+            .map_err(LoadError::from)?;
         if path.is_dir() {
-            Self::load_hf(path, registry, options)
+            Self::load_hf(path, registry, options, template)
         } else {
-            Self::load_gguf(path, registry, options)
+            Self::load_gguf(path, registry, options, template)
         }
     }
 
@@ -165,6 +193,7 @@ impl ModelHandle {
         dir: &Path,
         registry: &Registry,
         options: &LoadOptions,
+        template: Option<CheckedChatTemplate>,
     ) -> Result<Self, DriverError> {
         let config = read_json(&dir.join("config.json"))?;
         let generation_path = dir.join("generation_config.json");
@@ -177,19 +206,26 @@ impl ModelHandle {
             generation: generation.as_ref(),
         };
         let family = resolve(&raw, registry)?;
-        check_integrity(options, dir, None)?;
+        let files = poot_load::safetensors::map_weight_files(dir).map_err(LoadError::from)?;
+        check_integrity(options, dir, None, &files)?;
         // A GPTQ, AWQ or FP8 checkpoint's quantized linears are packed straight from their stored
         // bytes, never decoded: the family maps the packed entries like any other weight.
         let scheme = poot_load::config::quant_scheme(&config).map_err(LoadError::from)?;
-        let store = poot_load::safetensors::load_weight_store(dir).map_err(LoadError::from)?;
+        let store = poot_load::safetensors::load_mapped_weight_store(&files, default_workers())
+            .map_err(LoadError::from)?;
         let store = match scheme {
             Some(scheme) => poot_load::safetensors::pack_quantized_linears(&store, scheme)
                 .map_err(LoadError::from)?,
             None => store,
         };
         Self::build(family, &raw, Arc::new(store), |config| {
-            TextCodec::from_hf_dir(dir, constraint_eos(config), config.prompt_bos, config.chat)
-                .map_err(|e| LoadError::Text(Box::new(e)))
+            let text =
+                TextCodec::from_hf_dir(dir, constraint_eos(config), config.prompt_bos, config.chat)
+                    .map_err(|e| LoadError::Text(Box::new(e)))?;
+            Ok(match template {
+                Some(template) => text.with_chat_template(template),
+                None => text,
+            })
         })
     }
 
@@ -197,18 +233,32 @@ impl ModelHandle {
         path: &Path,
         registry: &Registry,
         options: &LoadOptions,
+        template: Option<CheckedChatTemplate>,
     ) -> Result<Self, DriverError> {
+        let file = File::open(path).map_err(io_error(path))?;
+        let file = StoredBytes::map(file)
+            .map_err(poot_load::LoadError::from)
+            .map_err(LoadError::from)?;
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            check_integrity(options, path.parent().unwrap_or(Path::new("")), Some(name))?;
+            check_integrity(
+                options,
+                path.parent().unwrap_or(Path::new("")),
+                Some(name),
+                &[(name.to_string(), file.clone())],
+            )?;
         }
-        let index = GgufIndex::open(path).map_err(LoadError::from)?;
+        let index = GgufIndex::parse(&file).map_err(LoadError::from)?;
         let raw = RawConfig::Gguf(&index);
         let family = resolve(&raw, registry)?;
-        let file = File::open(path).map_err(io_error(path))?;
-        let store = read_gguf(&index, &file, &IdentityNames).map_err(LoadError::from)?;
+        let store =
+            read_gguf(&index, &file, &IdentityNames, default_workers()).map_err(LoadError::from)?;
         Self::build(family, &raw, Arc::new(store), |config| {
-            TextCodec::from_gguf(&index, constraint_eos(config), config.chat)
-                .map_err(|e| LoadError::Text(Box::new(e)))
+            let text = TextCodec::from_gguf(&index, constraint_eos(config), config.chat)
+                .map_err(|e| LoadError::Text(Box::new(e)))?;
+            Ok(match template {
+                Some(template) => text.with_chat_template(template),
+                None => text,
+            })
         })
     }
 

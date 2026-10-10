@@ -17,12 +17,13 @@ use poot_executor::{Device, Executor, HostView, NoSync, StepInputs};
 use poot_executor_parity::dense::{Dense, Family, paged_step, plain, step};
 use poot_gpu::device::WgpuDevice;
 use poot_graph_ir::Slot;
-use poot_graph_ir::{Graph, SlotKey, Storage};
+use poot_graph_ir::{Graph, SlotKey, Storage, ValueId, ValueTable};
 use poot_graph_plan::{
     CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram,
     Submission, Target, TargetSet, compile_staged,
 };
 use poot_models::model::{LogitRows, Phase, StepShape};
+use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::DType;
 use poot_tensor::HostTensor;
@@ -89,12 +90,12 @@ fn tensor_bytes(dtype: DType, t: &HostTensor) -> Vec<u8> {
     }
 }
 
-/// Split a `HashMap<usize, Value>` bind into the contract's two bind mechanisms (`Storage::Const` ->
+/// Split a `HashMap<ValueId, Value>` bind into the contract's two bind mechanisms (`Storage::Const` ->
 /// a named [`WeightStore`] entry, `Storage::Slot` -> a [`StepInputs`] row); `Storage::State`/
 /// `Storage::Computed` are left for the contract to seed itself.
 fn split_consts_and_slots_v(
     g: &Graph,
-    inputs: &HashMap<usize, Value>,
+    inputs: &HashMap<ValueId, Value>,
 ) -> (WeightStore, Vec<SlotBind>) {
     let mut builder = WeightStore::builder();
     let mut slots = Vec::new();
@@ -110,7 +111,8 @@ fn split_consts_and_slots_v(
                     .unwrap_or_else(|| panic!("missing const input {id:?}"));
                 let bytes = tensor_bytes(dtype, t);
                 let dense =
-                    DenseWeight::try_new(dtype, t.shape().to_vec(), Arc::from(bytes)).unwrap();
+                    DenseWeight::try_new(dtype, t.shape().to_vec(), StoredBytes::from(bytes))
+                        .unwrap();
                 builder.insert(name, WeightEntry::Dense(dense)).unwrap();
             }
             Storage::Slot(_) => {
@@ -139,7 +141,7 @@ fn run_once_contract_v(
     exec: &mut dyn Executor,
     target: Target,
     g: &Graph,
-    inputs: &HashMap<usize, Value>,
+    inputs: &HashMap<ValueId, Value>,
 ) -> Vec<f32> {
     let (store, slot_binds) = split_consts_and_slots_v(g, inputs);
     let (bound, map) = ConstWeights::bind(g, &store);
@@ -254,7 +256,7 @@ impl Feed {
 /// Binds every input of `g`: slots from `feed`, consts by name, computed constants as they are, and
 /// the carried state zero-filled when `seed_state` (the CPU oracle needs it; the contract seeds its
 /// own).
-fn bind(g: &Graph, feed: &Feed, seed_state: bool) -> HashMap<usize, Value> {
+fn bind(g: &Graph, feed: &Feed, seed_state: bool) -> HashMap<ValueId, Value> {
     let mut m = HashMap::new();
     for &id in &g.inputs {
         let meta = g.meta(id);
@@ -286,7 +288,7 @@ fn bind(g: &Graph, feed: &Feed, seed_state: bool) -> HashMap<usize, Value> {
 /// `state` (empty on the first step: zeros).
 fn cpu_step(
     g: &Graph,
-    inputs: &HashMap<usize, Value>,
+    inputs: &HashMap<ValueId, Value>,
     state: &[HostTensor],
 ) -> (HostTensor, Vec<HostTensor>) {
     let mut cpu_inputs = inputs.clone();
@@ -468,7 +470,7 @@ fn assert_paged_prefill_matches_contiguous(slot_map: &[usize], cap: usize, pool:
     let feed_c = Feed::new(tokens.clone(), pos.clone());
     let feed_p = Feed::new(tokens, pos).paged(read, write);
 
-    let env = |g: &Graph, feed: &Feed| -> Vec<Option<HostTensor>> {
+    let env = |g: &Graph, feed: &Feed| -> ValueTable<Option<HostTensor>> {
         eval(
             g,
             &bind(g, feed, true),
@@ -1056,9 +1058,12 @@ fn chunked_prefill_at_nonzero_start_matches_stepped_decode_gpu() {
                 }
                 let data = weight(&name, &meta.aval.shape);
                 let bytes = tensor_bytes(DType::F32, &data);
-                let dense =
-                    DenseWeight::try_new(DType::F32, meta.aval.shape.clone(), Arc::from(bytes))
-                        .unwrap();
+                let dense = DenseWeight::try_new(
+                    DType::F32,
+                    meta.aval.shape.clone(),
+                    StoredBytes::from(bytes),
+                )
+                .unwrap();
                 builder.insert(name, WeightEntry::Dense(dense)).unwrap();
             }
         }

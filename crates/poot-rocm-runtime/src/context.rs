@@ -138,6 +138,10 @@ pub struct RocmContext {
     /// Replays enqueued and not yet completed, oldest first ([`RocmContext::enqueue_graph_batched`]);
     /// [`RocmContext::synchronize`] completes them.
     pub(crate) pending: Mutex<Vec<PendingSubmission>>,
+    /// The pinned staging ring coarse-pool writes go through ([`RocmContext::ring_write`]); drained ahead
+    /// of any submission, synchronize and DMA. Its copies' signals are also listed in the runtime owner,
+    /// which is what a free waits on.
+    pub(crate) upload_ring: Mutex<crate::upload::UploadRing>,
     /// How many times the host waited on an enqueued batch's completion signal
     /// ([`RocmContext::batch_waits`]).
     pub(crate) batch_waits: Arc<std::sync::atomic::AtomicU64>,
@@ -296,8 +300,8 @@ impl StagingBuffer {
         self.bytes.as_ptr()
     }
 
-    pub(crate) fn host_mut_ptr(&mut self) -> *mut u8 {
-        self.bytes.as_mut_ptr()
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.bytes
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -596,6 +600,11 @@ impl Drop for RocmContext {
         // Enqueued work still reads the context's buffers: complete it before the queue goes. A
         // failure poisons the context, which keeps the queue below.
         let _ = self.complete_pending("drop");
+        // Upload copies in flight read pinned staging memory the ring owns: prove them complete, or leak
+        // that memory with the context (a copy that cannot be proven complete may still be reading it).
+        if self.drain_uploads("drop").is_err() {
+            self.lock_ring().forget_in_flight();
+        }
         // Queue use is confined to the context. A poisoned queue may still run a packet, so it moves to
         // the leak list instead of being destroyed.
         let destroy = self.hsa.funcs.hsa_queue_destroy;

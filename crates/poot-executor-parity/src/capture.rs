@@ -141,11 +141,11 @@ fn toy_fixture(name: &'static str, bias: bool) -> Fixture {
         .map(|step| {
             vec![
                 StepFixture {
-                    key: key(token.id),
+                    key: key(token.id()),
                     tensor: HostTensor::i32(vec![], vec![(step % VOCAB) as i32]),
                 },
                 StepFixture {
-                    key: key(pos.id),
+                    key: key(pos.id()),
                     tensor: HostTensor::i32(vec![], vec![step as i32]),
                 },
             ]

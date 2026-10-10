@@ -31,23 +31,22 @@ use crate::batch::engine::{
 };
 use crate::batch::schedule::schedule_prefill_admissions;
 use crate::batch::slot::{Slot, reject_job};
+use crate::config::TelemetryConfig;
 use crate::engine_plan::EngineHealth;
 use crate::handlers::{
     account_generation_error, handle_chat, sse_write_probe, stream_chat, stream_completion,
     stream_receipt,
 };
 use crate::http::{
-    ConnGuard, MAX_BODY_BYTES, MAX_HEADER_BYTES, RateLimiter, RequestRead,
-    ResponseWriteTimeoutError, body_len_ok, configure_response_writes, error_body, handle,
-    max_connections_from, model_object, read_request, read_request_for_routing, read_request_from,
-    request_read_timeout_from, respond, respond_error, respond_typed, response_write_timeout_from,
+    ConnGuard, MAX_BODY_BYTES, MAX_HEADER_BYTES, RateLimiter, RequestRead, body_len_ok,
+    configure_response_writes, error_body, handle, model_object, read_request,
+    read_request_for_routing, read_request_from, respond, respond_error, respond_typed,
 };
 use crate::lifecycle::{
-    CANCELLATION_SETTLE_TIMEOUT, GenerationRequest, MAX_DRAIN_TIMEOUT_SECS, WorkerRegistry,
-    deadline_after, drain_cancellation_requested, reset_drain_cancellation,
-    server_drain_timeout_from, submit,
+    CANCELLATION_SETTLE_TIMEOUT, GenerationRequest, WorkerRegistry, deadline_after,
+    drain_cancellation_requested, reset_drain_cancellation, submit,
 };
-use crate::metrics::{CacheMetrics, Histogram, Metrics, SpeculativeMetrics};
+use crate::metrics::{CacheMetrics, Histogram, Metrics, SpeculativeMetrics, TimingMetrics};
 use crate::types::{
     Completion, EngineMsg, EngineView, FinishReason, GenEvent, GenerationError, Job, PerTokenInfo,
     PromptInput, SHUTDOWN, Served, terminal_delivery_probe,
@@ -55,6 +54,7 @@ use crate::types::{
 use poot_llm::driver::stops::StopScanner;
 
 mod admin;
+mod config;
 mod drain;
 pub(crate) mod encoder_routes;
 mod engine_loop;
@@ -64,6 +64,7 @@ mod other;
 mod recording_engine;
 mod scheduling;
 mod streaming;
+mod telemetry;
 mod terminal_done;
 mod write_deadline;
 
@@ -426,7 +427,7 @@ fn run_generation_stream_handler(
     (response, metrics)
 }
 
-fn unique_fixture_suffix() -> String {
+pub(crate) fn unique_fixture_suffix() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -481,6 +482,7 @@ pub(crate) fn test_metrics(model: &str) -> Metrics {
         sys: Mutex::new(sysinfo::System::new()),
         cache: CacheMetrics::default(),
         speculative: SpeculativeMetrics::default(),
+        timing: TimingMetrics::new(TelemetryConfig::CountersOnly),
     }
 }
 

@@ -31,10 +31,10 @@ fn main() {
     let wv = vec![1.0f32; n];
     let mut inputs = HashMap::new();
     inputs.insert(
-        x.id,
+        x.id(),
         Value::from(HostTensor::f32(vec![1, 1, n], xv.clone())),
     );
-    inputs.insert(w.id, Value::from(HostTensor::f32(vec![n], wv)));
+    inputs.insert(w.id(), Value::from(HostTensor::f32(vec![n], wv)));
     let y = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
         .expect("eval")
         .output

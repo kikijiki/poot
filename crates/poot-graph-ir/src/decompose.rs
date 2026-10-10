@@ -196,7 +196,7 @@ pub fn decompose(op: &OpKind, operands: &[TensorType]) -> Option<Decomposition> 
         return None;
     }
     Some(Decomposition {
-        operands: inputs.iter().map(|input| input.id).collect(),
+        operands: inputs.iter().map(|input| input.id()).collect(),
         graph: b.finish(result),
     })
 }
@@ -236,11 +236,11 @@ fn region_operand(
             let Some(value) = locals.get(*local) else {
                 return Ok(None);
             };
-            Operand::Value(value.id)
+            Operand::Value(value.id())
         }
         FusedOperand::Lit(scalar) => Operand::Lit(*scalar),
         FusedOperand::PackLane { input, lane } => {
-            let Some(packed) = locals.get(*input).map(|value| value.id) else {
+            let Some(packed) = locals.get(*input).map(|value| value.id()) else {
                 return Ok(None);
             };
             let Some(ty) = plan.type_of(packed) else {
@@ -254,7 +254,7 @@ fn region_operand(
                 start: *lane,
                 end: lane + 1,
             };
-            Operand::Value(plan.equation(slice, vec![Operand::Value(packed)])?.id)
+            Operand::Value(plan.equation(slice, vec![Operand::Value(packed)])?.id())
         }
     }))
 }
@@ -275,14 +275,12 @@ fn commit_region(
         return Ok(None);
     };
     // A region whose output is one of its inputs has no equation to commit.
-    if inputs.iter().any(|input| input.id == result.id) {
+    if inputs.iter().any(|input| input.id() == result.id()) {
         return Ok(Some(result));
     }
     plan.declare_result(result)?;
     let mut prepared = b.preflight_append(plan)?;
-    Ok(Some(Traced {
-        id: b.commit_append(&mut prepared)?,
-    }))
+    Ok(Some(b.commit_append(&mut prepared)?))
 }
 
 /// A pointwise region's steps as equations over `locals`, then its output local or its last-axis `pack`.
@@ -309,10 +307,10 @@ fn stage_region(
         let Some(part) = locals.get(*local) else {
             return Ok(None);
         };
-        parts.push(Operand::Value(part.id));
+        parts.push(Operand::Value(part.id()));
     }
     let Some(axis) = plan
-        .type_of(locals[region.pack[0]].id)
+        .type_of(locals[region.pack[0]].id())
         .and_then(|ty| ty.rank().checked_sub(1))
     else {
         return Ok(None);
@@ -342,7 +340,7 @@ fn contraction_epilogue(
     let mut plan = b.append_plan(0);
     let operands = head_operands
         .iter()
-        .map(|operand| Operand::Value(operand.id))
+        .map(|operand| Operand::Value(operand.id()))
         .collect();
     let mut locals = vec![plan.equation(head.op(), operands)?];
     locals.extend_from_slice(extras);
@@ -351,9 +349,7 @@ fn contraction_epilogue(
     };
     plan.declare_result(result)?;
     let mut prepared = b.preflight_append(plan)?;
-    Ok(Some(Traced {
-        id: b.commit_append(&mut prepared)?,
-    }))
+    Ok(Some(b.commit_append(&mut prepared)?))
 }
 
 /// A row region's steps as equations: pointwise steps in place, each reduction a keepdim `Reduce` over
@@ -730,7 +726,13 @@ mod tests {
                 },
                 vec![f32(&[2])],
             ),
-            (OpKind::AllGather { axis: 0 }, vec![f32(&[2])]),
+            (
+                OpKind::AllGather {
+                    axis: 0,
+                    world: std::num::NonZeroU32::MIN,
+                },
+                vec![f32(&[2])],
+            ),
             (OpKind::RandomUniform { cols: 4 }, vec![typed(&[2], i32)]),
             (
                 OpKind::SampleToken {

@@ -26,6 +26,7 @@ use poot_models::model::{
     ShapeReason, StepShape, TraceError,
 };
 use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig, Registry};
+use poot_quant::StoredBytes;
 use poot_quant::weights::{
     AttnRole, DenseWeight, WeightEntry, WeightId, WeightKey, WeightMap, WeightRole, WeightStore,
     WeightView,
@@ -44,6 +45,8 @@ use crate::driver::{
     Driver, DriverOptions, FinishReason, GenerateRequest, Generation, Head, Layout, LoadOptions,
     ModelHandle, PreparedSetLimits, Retention, ServingShapes, Warm,
 };
+use crate::error::ChatTemplateError;
+use crate::text::chat::ChatTemplateOverride;
 use crate::text::tokenize::{ChatTemplate, TextCodec};
 
 /// The fake model's vocabulary: `<unk>` and `a` .. `k`, ids 0 ..= 11.
@@ -264,7 +267,8 @@ fn tiny_store(variant: Variant) -> WeightStore {
             .insert(
                 "q",
                 WeightEntry::Dense(
-                    DenseWeight::try_new(DType::F32, vec![VOCAB, 4], Arc::from(values)).unwrap(),
+                    DenseWeight::try_new(DType::F32, vec![VOCAB, 4], StoredBytes::from(values))
+                        .unwrap(),
                 ),
             )
             .unwrap();
@@ -292,7 +296,7 @@ fn tiny_config(granule: usize, max_positions: usize, variant: Variant) -> serde_
 }
 
 /// The fake family's text services: a word-level tokenizer over `a`..`k` (decode joins with spaces).
-fn tiny_text() -> TextCodec {
+pub(super) fn tiny_text() -> TextCodec {
     let mut vocab = HashMap::new();
     vocab.insert("<unk>".to_string(), 0u32);
     for (i, w) in ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k"]
@@ -510,13 +514,21 @@ impl Device for FakeDevice {
         Ok(())
     }
 
-    fn write(&mut self, dst: &FakeBuffer, offset: usize, bytes: &[u8]) -> Result<(), FakeError> {
+    fn write_with(
+        &mut self,
+        dst: &FakeBuffer,
+        offset: usize,
+        len: usize,
+        fill: &mut dyn FnMut(std::ops::Range<usize>, &mut [u8]),
+    ) -> Result<(), FakeError> {
         let mut world = self.world.borrow_mut();
         match dst.role {
             BufferRole::Input => {
-                world.writes.insert(dst.id, bytes.to_vec());
+                let mut bytes = vec![0u8; len];
+                fill(offset..offset + len, &mut bytes);
+                world.writes.insert(dst.id, bytes);
             }
-            BufferRole::State => world.state_writes.push((offset, bytes.len())),
+            BufferRole::State => world.state_writes.push((offset, len)),
             _ => {}
         }
         Ok(())
@@ -1450,6 +1462,7 @@ fn an_integrity_manifest_pins_the_weights_file() {
     ModelHandle::load(&dir, &registry, &LoadOptions::default()).unwrap();
     let pinned = LoadOptions {
         integrity: Some(manifest),
+        ..LoadOptions::default()
     };
     ModelHandle::load(&dir, &registry, &pinned).expect("the right pin admits the checkpoint");
 
@@ -1457,6 +1470,7 @@ fn an_integrity_manifest_pins_the_weights_file() {
     let (dir, manifest) = pinned_hf_directory("driver_integrity_bad", None, Some(&wrong));
     let pinned = LoadOptions {
         integrity: Some(manifest),
+        ..LoadOptions::default()
     };
     let err = ModelHandle::load(&dir, &registry, &pinned).unwrap_err();
     assert!(
@@ -1465,6 +1479,178 @@ fn an_integrity_manifest_pins_the_weights_file() {
             DriverError::Load(LoadError::Integrity(
                 poot_load::packed_safetensors::PackedSafetensorsError::DigestMismatch { ref file }
             )) if file == "model.safetensors"
+        ),
+        "{err:?}"
+    );
+}
+
+const OVERRIDE_TEMPLATE: &str = "{% for m in messages %}[{{ m['role'] }}:{{ m['content'] }}]{% endfor %}{% if add_generation_prompt %}[assistant:{% endif %}";
+
+/// An HF directory (the integrity fixture) that ships `tokenizer_config.json` with `model_template`, or
+/// none.
+fn hf_directory_with_template(
+    name: &str,
+    model_template: Option<&str>,
+) -> poot_test_util::UniqueTempPath {
+    let (dir, _) = pinned_hf_directory(name, None, None);
+    if let Some(template) = model_template {
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            serde_json::json!({ "chat_template": template }).to_string(),
+        )
+        .unwrap();
+    }
+    dir
+}
+
+fn first_user_turn(handle: &ModelHandle) -> Option<String> {
+    handle
+        .text()
+        .render_user_turn(None, "Hi")
+        .unwrap()
+        .map(|chat| chat.prompt)
+}
+
+/// A chat template given at load (as text, or as a file) renders a known turn to the expected prompt, in
+/// place of the checkpoint's own and for a base model that ships none; with no override the checkpoint's
+/// own template is unchanged. Mutation: make `TextCodec::with_chat_template` ignore its template
+/// (`let _ = template.0`); the override rows keep the checkpoint's template (or none).
+#[test]
+fn a_chat_template_override_replaces_the_checkpoints_own() {
+    let registry = Registry::builtin().unwrap();
+    let own = "<own>{{ messages[0]['content'] }}";
+    let shipping = hf_directory_with_template("driver_template_own", Some(own));
+    let base = hf_directory_with_template("driver_template_base", None);
+    let file = shipping.join("override.jinja");
+    std::fs::write(&file, OVERRIDE_TEMPLATE).unwrap();
+    let load = |dir: &std::path::Path, chat_template| {
+        ModelHandle::load(
+            dir,
+            &registry,
+            &LoadOptions {
+                chat_template,
+                ..LoadOptions::default()
+            },
+        )
+        .unwrap()
+    };
+
+    assert_eq!(
+        first_user_turn(&load(&shipping, None)).as_deref(),
+        Some("<own>Hi")
+    );
+    assert_eq!(first_user_turn(&load(&base, None)), None);
+    for template in [
+        ChatTemplateOverride::Jinja(OVERRIDE_TEMPLATE.into()),
+        ChatTemplateOverride::File(file),
+    ] {
+        for dir in [&shipping, &base] {
+            assert_eq!(
+                first_user_turn(&load(dir, Some(template.clone()))).as_deref(),
+                Some("[user:Hi][assistant:"),
+                "{template:?} over {dir:?}"
+            );
+        }
+    }
+}
+
+/// A template poot cannot use is refused at load with the typed reason: a built-in name (poot has none),
+/// a file that cannot be read, and text that does not compile. Mutations: in `ChatTemplateOverride::check`,
+/// make the built-in-name arm never match (the name loads as literal text); skip `check_compiles`.
+#[test]
+fn an_unusable_chat_template_is_refused_at_load() {
+    let registry = Registry::builtin().unwrap();
+    let dir = hf_directory_with_template("driver_template_refused", None);
+    let refused = |template| {
+        let err = ModelHandle::load(
+            &dir,
+            &registry,
+            &LoadOptions {
+                chat_template: Some(template),
+                ..LoadOptions::default()
+            },
+        )
+        .unwrap_err();
+        match err {
+            DriverError::Load(LoadError::ChatTemplate(error)) => error,
+            other => panic!("not a chat template refusal: {other:?}"),
+        }
+    };
+    assert!(matches!(
+        refused(ChatTemplateOverride::Jinja("chatml".into())),
+        ChatTemplateError::UnknownBuiltin { name } if name == "chatml"
+    ));
+    assert!(matches!(
+        refused(ChatTemplateOverride::File(dir.join("absent.jinja"))),
+        ChatTemplateError::Unreadable { .. }
+    ));
+    assert!(matches!(
+        refused(ChatTemplateOverride::Jinja("{% if %}".into())),
+        ChatTemplateError::Invalid(_)
+    ));
+}
+
+const FAILING_TEMPLATE: &str = "{{ raise_exception('no such conversation') }}";
+
+/// A template that compiles but fails to render is an error when it is the override, and falls back to
+/// the family's chat format when it is the checkpoint's own: a template the caller asked for is never
+/// quietly replaced by another format. Mutation: drop the `chat_template_overridden` arm of
+/// `TextCodec::render_chat_value`; the override row renders in ChatML.
+#[test]
+fn an_override_that_fails_to_render_is_an_error_not_a_fallback() {
+    let registry = Registry::builtin().unwrap();
+    let own = hf_directory_with_template("driver_template_failing_own", Some(FAILING_TEMPLATE));
+    let own = ModelHandle::load(&own, &registry, &LoadOptions::default()).unwrap();
+    let rendered = own.text().render_user_turn(None, "Hi").unwrap().unwrap();
+    assert_eq!(
+        rendered.prompt, "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n",
+        "the checkpoint's own failing template falls back to its family's format"
+    );
+
+    let base = hf_directory_with_template("driver_template_failing_override", None);
+    let overridden = ModelHandle::load(
+        &base,
+        &registry,
+        &LoadOptions {
+            chat_template: Some(ChatTemplateOverride::Jinja(FAILING_TEMPLATE.into())),
+            ..LoadOptions::default()
+        },
+    )
+    .unwrap();
+    let err = overridden.text().render_user_turn(None, "Hi").unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::TextError::ChatTemplate(ChatTemplateError::Render(ref reason))
+                if reason.contains("no such conversation")
+        ),
+        "{err:?}"
+    );
+}
+
+/// A refused chat template fails the load before any weight file is read. The checkpoint's weights file
+/// is not a safetensors file, so a load that reached it would fail as `LoadError::Weights`; the
+/// template's own typed refusal is what comes back. Mutation: swallow the refusal at the top of
+/// `ModelHandle::load` (`check().ok()`); the load reaches the weights and the error is `Weights`.
+#[test]
+fn a_refused_chat_template_fails_the_load_before_the_weights_are_read() {
+    let (dir, _) =
+        pinned_hf_directory("driver_template_before_weights", Some(b"not weights"), None);
+    let err = ModelHandle::load(
+        &dir,
+        &Registry::builtin().unwrap(),
+        &LoadOptions {
+            chat_template: Some(ChatTemplateOverride::Jinja("chatml".into())),
+            ..LoadOptions::default()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            DriverError::Load(LoadError::ChatTemplate(
+                ChatTemplateError::UnknownBuiltin { .. }
+            ))
         ),
         "{err:?}"
     );
@@ -1489,6 +1675,7 @@ fn a_wrong_pin_is_refused_before_any_tensor_is_read() {
     );
     let pinned = LoadOptions {
         integrity: Some(manifest),
+        ..LoadOptions::default()
     };
     let err = ModelHandle::load(&dir, &registry, &pinned).unwrap_err();
     assert!(
@@ -1523,6 +1710,7 @@ fn a_manifest_that_does_not_pin_the_gguf_is_refused() {
     );
     let pinned = LoadOptions {
         integrity: Some(manifest),
+        ..LoadOptions::default()
     };
     let err = ModelHandle::load(&gguf, &registry, &pinned).unwrap_err();
     assert!(
@@ -1542,6 +1730,7 @@ fn an_unpinned_shard_is_refused() {
     std::fs::write(dir.join("model-extra.safetensors"), b"an unpinned shard").unwrap();
     let pinned = LoadOptions {
         integrity: Some(manifest),
+        ..LoadOptions::default()
     };
     let err = ModelHandle::load(&dir, &registry, &pinned).unwrap_err();
     assert!(
@@ -1550,10 +1739,8 @@ fn an_unpinned_shard_is_refused() {
     );
 }
 
-/// `ModelHandle::load` of a GGUF file: the family comes from `general.architecture`, the weights from
-/// `read_gguf`, the end-of-sequence id and tokenizer from the file's own metadata.
-#[test]
-fn a_gguf_file_loads_through_the_registry() {
+/// A tiny qwen2 GGUF checkpoint: dense F32 tensors, the family's metadata and a byte-pair tokenizer.
+fn qwen2_gguf_fixture() -> Vec<u8> {
     use poot_load::gguf::{GgufValue, write_gguf};
     let (h, inter, vocab) = (8usize, 16usize, 8usize);
     let mut tensors = Vec::new();
@@ -1608,8 +1795,15 @@ fn a_gguf_file_loads_through_the_registry() {
             GgufValue::Array(vec![GgufValue::Str("a b".into())]),
         ),
     ];
+    write_gguf(&kvs, &tensors)
+}
+
+/// `ModelHandle::load` of a GGUF file: the family comes from `general.architecture`, the weights from
+/// `read_gguf`, the end-of-sequence id and tokenizer from the file's own metadata.
+#[test]
+fn a_gguf_file_loads_through_the_registry() {
     let path = poot_test_util::unique_temp_path("driver_gguf_checkpoint.gguf");
-    std::fs::write(&path, write_gguf(&kvs, &tensors)).unwrap();
+    std::fs::write(&path, qwen2_gguf_fixture()).unwrap();
 
     let handle = ModelHandle::load(
         &path,
@@ -1624,6 +1818,117 @@ fn a_gguf_file_loads_through_the_registry() {
         handle.text().encode("ab").unwrap(),
         [7],
         "the file's own merges"
+    );
+}
+
+/// MB-8: a pinned GGUF is hashed from the mapping the header and tensors are read from. The right pin
+/// admits the file; a wrong digest is the typed `DigestMismatch`, a wrong length `ArtifactChanged`.
+/// (A regression row: hashing a second open of the path instead would still pass, because the file does
+/// not change under the load; the single-inode claim is structural, see `load_gguf`.)
+#[test]
+fn a_gguf_pin_is_checked_against_the_mapped_file() {
+    use poot_load::packed_safetensors::PackedSafetensorsError;
+    let registry = Registry::builtin().unwrap();
+    let bytes = qwen2_gguf_fixture();
+    let dir = poot_test_util::unique_temp_path("driver_integrity_gguf_pinned");
+    std::fs::create_dir_all(&dir).unwrap();
+    let gguf = dir.join("model.gguf");
+    std::fs::write(&gguf, &bytes).unwrap();
+    let real: String = poot_load::packed_safetensors::sha256_digest(&bytes)
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let pin_with = |length: usize, sha256: &str| {
+        let manifest = dir.join("integrity.json");
+        std::fs::write(
+            &manifest,
+            serde_json::json!({"files": {"model.gguf": {"length": length, "sha256": sha256}}})
+                .to_string(),
+        )
+        .unwrap();
+        LoadOptions {
+            integrity: Some(manifest),
+            ..LoadOptions::default()
+        }
+    };
+    ModelHandle::load(&gguf, &registry, &pin_with(bytes.len(), &real))
+        .expect("the right pin admits the GGUF");
+    let wrong = "00".repeat(32);
+    let err = ModelHandle::load(&gguf, &registry, &pin_with(bytes.len(), &wrong)).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            DriverError::Load(LoadError::Integrity(PackedSafetensorsError::DigestMismatch { ref file }))
+                if file == "model.gguf"
+        ),
+        "{err:?}"
+    );
+    let err = ModelHandle::load(&gguf, &registry, &pin_with(bytes.len() + 1, &real)).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            DriverError::Load(LoadError::Integrity(PackedSafetensorsError::ArtifactChanged { ref file }))
+                if file == "model.gguf"
+        ),
+        "{err:?}"
+    );
+}
+
+/// ADR-0103 amendment (MB-8, and its HF-directory twin): a pin is checked against the mapping the store
+/// views, never against a second open of the path. The row drives `check_integrity` where the two sides
+/// differ: the file is replaced by rename after it was mapped, so the mapping holds the pinned bytes and
+/// the path holds others (and the reverse). Mutation: hash `File::open(dir.join(name))` instead of the
+/// mapping; the first assertion fails with `DigestMismatch`.
+#[test]
+fn a_pin_is_checked_over_the_mapping_not_the_path() {
+    use super::handle::check_integrity;
+    use poot_load::packed_safetensors::PackedSafetensorsError;
+    let dir = poot_test_util::unique_temp_path("driver_pin_over_mapping");
+    std::fs::create_dir_all(&dir).unwrap();
+    let weights = dir.join("model.safetensors");
+    let pinned_bytes = vec![7u8; 64];
+    std::fs::write(&weights, &pinned_bytes).unwrap();
+    let mapped = StoredBytes::map(std::fs::File::open(&weights).unwrap()).unwrap();
+    let hex = |bytes: &[u8]| -> String {
+        poot_load::packed_safetensors::sha256_digest(bytes)
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    };
+    let options = |bytes: &[u8]| {
+        let manifest = dir.join("integrity.json");
+        std::fs::write(
+            &manifest,
+            serde_json::json!({"files": {"model.safetensors": {
+                "length": bytes.len(),
+                "sha256": hex(bytes),
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        LoadOptions {
+            integrity: Some(manifest),
+            ..LoadOptions::default()
+        }
+    };
+    let files = [("model.safetensors".to_string(), mapped)];
+    // The path now names other bytes; the mapping still holds the pinned ones.
+    let replacement = dir.join("replacement");
+    std::fs::write(&replacement, vec![9u8; 64]).unwrap();
+    std::fs::rename(&replacement, &weights).unwrap();
+    check_integrity(&options(&pinned_bytes), &dir, None, &files)
+        .expect("the pin matches the mapped bytes, whatever the path holds now");
+    // A pin for what the path holds now does not match the mapping the store would view.
+    let err = check_integrity(&options(&[9u8; 64]), &dir, None, &files).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            LoadError::Integrity(PackedSafetensorsError::DigestMismatch { ref file })
+                if file == "model.safetensors"
+        ),
+        "{err:?}"
     );
 }
 
@@ -1671,4 +1976,208 @@ fn phase_timing_is_reported_only_when_asked_for() {
     let generation = run(&mut timed, request(&[1, 2, 3], 2, Sampler::greedy())).unwrap();
     let timing = generation.timing.expect("a timed driver reports phases");
     assert_eq!(timing.prefill.tokens, 3);
+}
+
+/// One turn of `conversation` over the whole `context`: the generation, and the positions each prefill
+/// and decode step of the turn fed (the steps the rig recorded since the turn began).
+fn turn(
+    rig: &mut Rig,
+    conversation: &mut crate::driver::Conversation,
+    context: &[u32],
+    max_new: usize,
+) -> (Generation, Vec<Vec<i32>>) {
+    let before = rig.world.borrow().steps.len();
+    let generation = rig
+        .driver
+        .generate_turn(
+            conversation,
+            request(context, max_new, Sampler::greedy()),
+            &mut |_: u32, _: &str| GenerationControl::Continue(()),
+        )
+        .unwrap();
+    let positions = rig.world.borrow().steps[before..]
+        .iter()
+        .map(|step| step.positions.clone())
+        .collect();
+    (generation, positions)
+}
+
+/// The positions of the prefill steps of a turn: every step before the decode steps, which feed one.
+fn prefill_positions(positions: &[Vec<i32>], prompt_len: usize, first: usize) -> Vec<i32> {
+    let flat: Vec<i32> = positions.iter().flatten().copied().collect();
+    flat.into_iter().take(prompt_len - first).collect()
+}
+
+/// POOT-1094 SC-001: a conversation's next turn prefills only the context the sequence does not hold.
+/// Turn one generates three tokens over a three-token prompt, so positions 0..=4 hold K/V (the last
+/// token has none yet); a second turn whose context extends all six tokens feeds positions 5, 6 and 7
+/// and no earlier one. Mutation: `Driver::resume` keeps nothing (`reused = 0`); turn two feeds
+/// positions from 0.
+#[test]
+fn a_conversations_next_turn_prefills_only_the_new_context() {
+    let mut rig = rig_default(logits_script(vec![favoring(1)]));
+    let mut conversation = crate::driver::Conversation::default();
+    let (first, _) = turn(&mut rig, &mut conversation, &[5, 6, 7], 3);
+    assert_eq!(first.tokens, [1, 1, 1]);
+    let context = [5, 6, 7, 1, 1, 1, 8, 9];
+    let (second, positions) = turn(&mut rig, &mut conversation, &context, 2);
+    assert_eq!(second.tokens, [1, 1]);
+    assert_eq!(prefill_positions(&positions, context.len(), 5), [5, 6, 7]);
+}
+
+/// POOT-1094 SC-002: a context that changes the history keeps the run it still shares and re-prefills
+/// from the first difference, the same K/V a fresh run would compute. The second context differs from the
+/// sequence's tokens at index 2, so positions 2.. are fed. Mutation: keep the whole resident run without
+/// comparing it to the new context (`shared = resident`); turn two feeds from position 5 over a changed
+/// history.
+#[test]
+fn a_changed_history_is_reprefilled_from_the_first_difference() {
+    let mut rig = rig_default(logits_script(vec![favoring(1)]));
+    let mut conversation = crate::driver::Conversation::default();
+    turn(&mut rig, &mut conversation, &[5, 6, 7], 3);
+    let context = [5, 6, 9, 1, 1, 1, 8];
+    let (_, positions) = turn(&mut rig, &mut conversation, &context, 2);
+    assert_eq!(
+        prefill_positions(&positions, context.len(), 2),
+        [2, 3, 4, 5, 6]
+    );
+}
+
+/// POOT-1094 SC-003: a context that the resident K/V covers whole (here the first five tokens, all
+/// resident) still prefills its last token, whose pick is the turn's first. Mutation: drop the
+/// `prompt.len() - 1` bound on the kept run; the turn has nothing to prefill and the driver refuses it.
+#[test]
+fn an_unchanged_context_still_prefills_its_last_token() {
+    let mut rig = rig_default(logits_script(vec![favoring(1)]));
+    let mut conversation = crate::driver::Conversation::default();
+    turn(&mut rig, &mut conversation, &[5, 6, 7], 3);
+    let (_, positions) = turn(&mut rig, &mut conversation, &[5, 6, 7, 1, 1], 1);
+    assert_eq!(positions[0], [4]);
+}
+
+/// POOT-1094 SC-004: a recurrent state cannot be rewound, so a turn resumes only when the new context
+/// holds all that the state has consumed; otherwise the row restarts from zero (its state reset) and the
+/// whole context is prefilled. Mutation: drop the `residency == Recurrent` restart; the changed context
+/// resumes at position 2 over a state that consumed the old tokens.
+#[test]
+fn a_recurrent_conversation_resumes_only_over_what_its_state_consumed() {
+    let options = || RigOptions {
+        variant: Variant::Recurrent,
+        ..RigOptions::default()
+    };
+    let mut rig = build_rig(options(), logits_script(vec![favoring(1)])).unwrap();
+    let mut conversation = crate::driver::Conversation::default();
+    turn(&mut rig, &mut conversation, &[5, 6, 7], 3);
+    let resets = rig.world.borrow().state_writes.len();
+    let extended = [5, 6, 7, 1, 1, 1, 8];
+    let (_, positions) = turn(&mut rig, &mut conversation, &extended, 1);
+    assert_eq!(prefill_positions(&positions, extended.len(), 5), [5, 6]);
+    assert_eq!(
+        rig.world.borrow().state_writes.len(),
+        resets,
+        "the state of the shared run was kept"
+    );
+
+    let mut rig = build_rig(options(), logits_script(vec![favoring(1)])).unwrap();
+    let mut conversation = crate::driver::Conversation::default();
+    turn(&mut rig, &mut conversation, &[5, 6, 7], 3);
+    let resets = rig.world.borrow().state_writes.len();
+    let changed = [5, 6, 9, 1, 1, 1, 8];
+    let (_, positions) = turn(&mut rig, &mut conversation, &changed, 1);
+    assert_eq!(
+        prefill_positions(&positions, changed.len(), 0),
+        [0, 1, 2, 3, 4, 5, 6]
+    );
+    assert_eq!(
+        rig.world.borrow().state_writes.len(),
+        resets + 1,
+        "the row's state restarted from zero"
+    );
+}
+
+/// POOT-1094 SC-005: a conversation holds the contiguous layout's one slot between its turns and
+/// `end_conversation` frees it; a paged sequence is refused a resume with the typed error. Mutations:
+/// release the sequence after each turn (the second `generate` succeeds while the conversation is open);
+/// drop the paged check in `resume`.
+#[test]
+fn a_conversation_holds_its_slot_until_it_ends_and_a_paged_one_is_not_resumed() {
+    let mut rig = rig_default(logits_script(vec![favoring(1)]));
+    let mut conversation = crate::driver::Conversation::default();
+    turn(&mut rig, &mut conversation, &[5, 6, 7], 2);
+    let busy = run(&mut rig, request(&[1, 2], 1, Sampler::greedy())).unwrap_err();
+    assert!(
+        matches!(busy, DriverError::InvalidRequest(InvalidRequest::SlotsBusy)),
+        "{busy:?}"
+    );
+    rig.driver.end_conversation(conversation).unwrap();
+    run(&mut rig, request(&[1, 2], 1, Sampler::greedy())).unwrap();
+
+    let mut paged = rig_default(logits_script(vec![favoring(1)]));
+    paged
+        .driver
+        .prepare(&ServingShapes {
+            layout: Layout::Paged(crate::driver::PoolShape {
+                blocks: nz(4),
+                max_seqs: nz(1),
+            }),
+            rows: &[NonZeroUsize::MIN],
+            heads: &[Head::GREEDY],
+            warm: Warm::Admitted,
+            windows: &[],
+            adapters: &[],
+        })
+        .unwrap();
+    let mut conversation = crate::driver::Conversation::default();
+    let (_, _) = turn(&mut paged, &mut conversation, &[5, 6, 7], 2);
+    let refused = paged
+        .driver
+        .generate_turn(
+            &mut conversation,
+            request(&[5, 6, 7, 1, 1, 8], 1, Sampler::greedy()),
+            &mut |_: u32, _: &str| GenerationControl::Continue(()),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            DriverError::InvalidRequest(InvalidRequest::ResumePaged)
+        ),
+        "{refused:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// POOT-746: recovery and the expert pool's per-graph placement.
+// ---------------------------------------------------------------------------------------------
+
+/// A run that dies on the device leaves the executable refusing steps; with nothing else open the
+/// driver resets its executables (and their residency managers), so the next run proceeds. Mutation: drop
+/// the `recover_after` call in `generate_with`; the second run is `NeedsReset` and this row goes red.
+#[test]
+fn a_failed_run_with_nothing_else_open_recovers_its_executables() {
+    let mut rig = rig_default(logits_script(vec![favoring(1)]));
+    rig.world.borrow_mut().fail_synchronize = true;
+    let failed = run(&mut rig, request(&[1, 2], 2, Sampler::greedy()));
+    assert!(
+        matches!(failed, Err(DriverError::Device(ExecError::Device(_)))),
+        "got {failed:?}"
+    );
+    rig.world.borrow_mut().fail_synchronize = false;
+    run(&mut rig, request(&[1, 2], 2, Sampler::greedy()))
+        .expect("the executable was reset by the failed run's recovery");
+}
+
+/// A pooled driver pages the graphs that have routed experts and keeps every other graph resident: a
+/// dense model's trace (a draft model's, an encode graph's) compiles and runs under a pool. Mutation: make
+/// `Driver::compile` answer `Pooled` for every graph; the first compile is `NoRoutedExperts` and this
+/// row goes red.
+#[test]
+fn a_pooled_driver_keeps_graphs_without_routed_experts_resident() {
+    let mut rig = rig_default(logits_script(vec![favoring(1)]));
+    rig.driver.pool = Some(super::ExpertPool {
+        slots: nz(3),
+        managers: HashMap::new(),
+    });
+    run(&mut rig, request(&[1, 2, 3], 3, Sampler::greedy()))
+        .expect("a dense graph compiles resident under a pool");
 }

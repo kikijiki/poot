@@ -20,7 +20,8 @@ pub use kernel::{PackedKernelOp, PackedKernelSpec, packed_kernel};
 #[cfg(test)]
 mod float_decode_tests {
     //! SC-002 (card 542a): `emit_float_decode` matches `poot_quant::scalar::float_to_f32`'s `to_bits`
-    //! for every admitted bit pattern of every `FloatFormat`, run through the KIR interpreter
+    //! for every admitted bit pattern (every one `FloatFormat::non_finite` does not name) of every
+    //! `FloatFormat`, run through the KIR interpreter
     //! (tier 1, GPU-free).
 
     use poot_kernel_ir::interp::{Buffer, run};
@@ -58,63 +59,51 @@ mod float_decode_tests {
         buffers[1].to_f32s().unwrap()[0].to_bits()
     }
 
-    #[test]
-    fn e8m0_matches_scalar_for_the_admitted_domain_0_to_254() {
-        let body = decode_body(FloatFormat::E8m0);
-        for byte in 0..=254u32 {
-            let want = float_to_f32(FloatFormat::E8m0, byte).to_bits();
-            let got = decode_at(&body, byte);
+    /// The emitted decode of `format` equals the scalar decoder for every stored pattern of the
+    /// admitted domain: every pattern `FloatFormat::non_finite` does not name (a payload never holds
+    /// a non-finite one, so the decoders implement no branch for them). The domain is derived from
+    /// `non_finite`, never restated here.
+    fn assert_matches_scalar_on_the_admitted_domain(format: FloatFormat) {
+        let body = decode_body(format);
+        let mut admitted = 0u32;
+        for bits in 0..1u32 << format.bits() {
+            if format.non_finite().is_some_and(|n| n.matches(bits)) {
+                continue;
+            }
+            admitted += 1;
+            let want = float_to_f32(format, bits).to_bits();
+            let got = decode_at(&body, bits);
             assert_eq!(
                 got, want,
-                "E8M0 byte {byte:#04x}: got {got:#010x} want {want:#010x}"
+                "{format:?} bits {bits:#06x}: got {got:#010x} want {want:#010x}"
             );
         }
+        assert!(admitted > 0, "{format:?}");
+    }
+
+    #[test]
+    fn e8m0_matches_scalar_on_the_admitted_domain() {
+        assert_matches_scalar_on_the_admitted_domain(FloatFormat::E8m0);
     }
 
     #[test]
     fn e2m1_matches_scalar_for_all_16_codes() {
-        let body = decode_body(FloatFormat::E2m1);
-        for code in 0..16u32 {
-            let want = float_to_f32(FloatFormat::E2m1, code).to_bits();
-            let got = decode_at(&body, code);
-            assert_eq!(got, want, "E2M1 code {code}");
-        }
+        assert_matches_scalar_on_the_admitted_domain(FloatFormat::E2m1);
     }
 
     #[test]
-    fn e4m3fn_matches_scalar_for_every_non_nan_byte() {
-        let body = decode_body(FloatFormat::E4m3Fn);
-        for byte in 0..=255u32 {
-            if byte == 0x7f || byte == 0xff {
-                continue; // the two NaN bytes: outside the admitted domain (refused at load).
-            }
-            let want = float_to_f32(FloatFormat::E4m3Fn, byte).to_bits();
-            let got = decode_at(&body, byte);
-            assert_eq!(got, want, "E4M3FN byte {byte:#04x}");
-        }
+    fn e4m3fn_matches_scalar_on_the_admitted_domain() {
+        assert_matches_scalar_on_the_admitted_domain(FloatFormat::E4m3Fn);
     }
 
     #[test]
-    fn f16_matches_scalar_for_every_finite_pattern() {
-        let body = decode_body(FloatFormat::F16);
-        for bits in 0..=0xffffu32 {
-            if (bits >> 10) & 0x1f == 0x1f {
-                continue; // infinities and NaN: outside the admitted domain (refused at load).
-            }
-            let want = float_to_f32(FloatFormat::F16, bits).to_bits();
-            let got = decode_at(&body, bits);
-            assert_eq!(got, want, "F16 bits {bits:#06x}");
-        }
+    fn f16_matches_scalar_on_the_admitted_domain() {
+        assert_matches_scalar_on_the_admitted_domain(FloatFormat::F16);
     }
 
     #[test]
-    fn bf16_matches_scalar_for_every_pattern() {
-        let body = decode_body(FloatFormat::Bf16);
-        for bits in 0..=0xffffu32 {
-            let want = float_to_f32(FloatFormat::Bf16, bits).to_bits();
-            let got = decode_at(&body, bits);
-            assert_eq!(got, want, "BF16 bits {bits:#06x}");
-        }
+    fn bf16_matches_scalar_on_the_admitted_domain() {
+        assert_matches_scalar_on_the_admitted_domain(FloatFormat::Bf16);
     }
 
     #[test]

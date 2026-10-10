@@ -109,11 +109,11 @@ pub fn gdn_prefill_chunked_case() -> GdnChunkedCase {
         .iter()
         .map(|call| {
             [
-                (q.id, vec![1, H_K, LEN, D], &call.q),
-                (k.id, vec![1, H_K, LEN, D], &call.k),
-                (v.id, vec![1, H_V, LEN, D], &call.v),
-                (g.id, vec![1, H_V, LEN, 1], &call.g),
-                (beta.id, vec![1, H_V, LEN, 1], &call.beta),
+                (q.id(), vec![1, H_K, LEN, D], &call.q),
+                (k.id(), vec![1, H_K, LEN, D], &call.k),
+                (v.id(), vec![1, H_V, LEN, D], &call.v),
+                (g.id(), vec![1, H_V, LEN, 1], &call.g),
+                (beta.id(), vec![1, H_V, LEN, 1], &call.beta),
             ]
             .into_iter()
             .map(|(id, shape, data)| StepFixture {

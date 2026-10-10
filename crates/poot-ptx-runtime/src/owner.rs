@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{DriverError, sys};
@@ -93,6 +94,48 @@ impl Drop for CurrentContextGuard {
     }
 }
 
+/// How many native resources one context has created and how many graph launches it has issued: the
+/// numbers a warm replay must leave unchanged. A snapshot of [`OwnerCounters`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NativeCounters {
+    /// CUDA graphs instantiated from a capture.
+    pub graph_instantiations: u64,
+    /// `cuGraphLaunch` calls.
+    pub graph_launches: u64,
+    /// CUDA events created (cross-device ordering events and device-timing pairs).
+    pub events: u64,
+    /// PTX modules loaded.
+    pub modules: u64,
+    /// Peer copies recorded into a capture.
+    pub peer_copies: u64,
+}
+
+/// The live counters behind [`NativeCounters`]; `Relaxed` is enough because they only count.
+#[derive(Default)]
+pub(crate) struct OwnerCounters {
+    pub(crate) graph_instantiations: AtomicU64,
+    pub(crate) graph_launches: AtomicU64,
+    pub(crate) events: AtomicU64,
+    pub(crate) modules: AtomicU64,
+    pub(crate) peer_copies: AtomicU64,
+}
+
+impl OwnerCounters {
+    pub(crate) fn bump(counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn snapshot(&self) -> NativeCounters {
+        NativeCounters {
+            graph_instantiations: self.graph_instantiations.load(Ordering::Relaxed),
+            graph_launches: self.graph_launches.load(Ordering::Relaxed),
+            events: self.events.load(Ordering::Relaxed),
+            modules: self.modules.load(Ordering::Relaxed),
+            peer_copies: self.peer_copies.load(Ordering::Relaxed),
+        }
+    }
+}
+
 pub(crate) struct PtxOwner {
     pub(crate) driver: Arc<dyn CudaDriver>,
     pub(crate) device: sys::CUdevice,
@@ -102,6 +145,7 @@ pub(crate) struct PtxOwner {
     /// Live/peak bytes and allocation count by role (Card 547a): the one memory service's view of
     /// every allocation this context has made.
     pub(crate) memory: poot_runtime_common::MemoryCounters,
+    pub(crate) counters: OwnerCounters,
 }
 
 // SAFETY: every field here is either a plain address (the `sys::CU*` handles and
@@ -191,5 +235,6 @@ pub(crate) fn construct_owner(
         stream,
         modules: Mutex::new(Vec::new()),
         memory: poot_runtime_common::MemoryCounters::new(),
+        counters: OwnerCounters::default(),
     }))
 }

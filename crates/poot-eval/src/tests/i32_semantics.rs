@@ -35,7 +35,7 @@ fn words_through_both_bindings(
         .collect();
     let out = build(&builder, &constants);
     let graph = builder.finish(out);
-    let ids: Vec<ValueId> = constants.iter().map(|constant| constant.id).collect();
+    let ids: Vec<ValueId> = constants.iter().map(|constant| constant.id()).collect();
     (
         dense_bound_words(&graph, &ids, inputs),
         exact_bound_words(&graph, &ids, inputs),
@@ -160,7 +160,10 @@ fn exact_i32_add_published_as_the_output_evaluates_to_wrapped_words() {
             ExactI32TensorView::try_from_words(vec![2], Arc::from(words)).unwrap(),
         ))
     };
-    let inputs = HashMap::from([(left.id, view([i32::MAX, -5])), (right.id, view([1, 2]))]);
+    let inputs = HashMap::from([
+        (left.id(), view([i32::MAX, -5])),
+        (right.id(), view([1, 2])),
+    ]);
     let out = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
         .expect("an observable I32 Add is ordinary I32 arithmetic through the one walk")
         .output;

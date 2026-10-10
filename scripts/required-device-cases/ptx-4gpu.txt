@@ -1,0 +1,9 @@
+# Required cases for `just test-device-ptx-4gpu` (POOT-1102), one per line:
+# binary_id<TAB>test_name, the identity the lane's JUnit report carries as classname and name.
+# Hand-maintained: never generated from the lane's selection. The gate
+# (scripts/check-required-cases.py ptx-4gpu) fails the lane unless every case here ran and passed -
+# a skip is never a pass. Sorted in canonical (LC_ALL=C) order.
+#
+# The captured coordinator across four NVIDIA GPUs: a world-four tensor-parallel qwen2 decode against
+# single-device decode, every rank folding the partials of all four.
+poot-ptx-gpu::tensor_parallel	qwen2_four_way_tensor_parallel_decode_matches_single_device_on_ptx

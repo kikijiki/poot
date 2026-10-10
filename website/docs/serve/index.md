@@ -10,7 +10,7 @@ sidebar_position: 1
 checkpoints, first-time bring-up, and the features that are available. For embedding poot as a library,
 see [Develop](../develop/index.md).
 
-The server loads a registered model, fits it to the device and serves `/v1/completions` and `/v1/chat/completions` from one scheduling loop over the driver ([Continuous batching](./continuous-batching.md)). `/health` answers `200` `serving` once the engine thread is running, `503` while it starts, drains, or after it dies (`"status": "dead"` with the cause and reason). The embeddings and reranking routes and LoRA administration run on the same engine thread. Tensor parallelism and pooled MoE serving are not implemented. A SmolVLM checkpoint also takes images on `/v1/chat/completions` ([Multimodal](./multimodal.md)). Speculative decoding is served through the same loop ([Speculative decoding](./speculative-decoding.md)).
+The server loads a registered model, fits it to the device and serves `/v1/completions` and `/v1/chat/completions` from one scheduling loop over the driver ([Continuous batching](./continuous-batching.md)). `/health` answers `200` `serving` once the engine thread is running, `503` while it starts, drains, or after it dies (`"status": "dead"` with the cause and reason). The embeddings and reranking routes and LoRA administration run on the same engine thread. A model can be split over several GPUs as a layer pipeline (`--placement pipeline:...`, `ptx` backend); tensor parallelism is requested the same way (`--placement tensor:...`) and divides the paged KV pool by KV heads. A tensor group and a layer pipeline have served requests on a two-GPU NVLink A100 pair, and a four-GPU tensor group has decoded a tiny model; serving a group of four and a real checkpoint are not covered ([Tensor parallelism](./tensor-parallelism.md)). Pooled MoE serving is not implemented. A SmolVLM or Qwen2.5-VL checkpoint also takes images on `/v1/chat/completions` ([Multimodal](./multimodal.md)). Speculative decoding is served through the same loop ([Speculative decoding](./speculative-decoding.md)).
 
 Design and paper provenance for continuous batching, speculative decoding, LoRA, quantization,
 and tensor parallelism live under [Serving design](../architecture/serving-design.mdx).
@@ -35,14 +35,14 @@ and tensor parallelism live under [Serving design](../architecture/serving-desig
 - **[OpenAI-compatible API](./api.md)**: Endpoints, error classes, bounds and metrics.
 - **[Guided decoding](./guided-decoding.md)**: Constrained output (regex, grammar, JSON schema, tools).
 - **[Embeddings and reranking](./embeddings-and-reranking.md)**: `/v1/embeddings` and `/v1/rerank`.
-- **[Multimodal](./multimodal.md)**: Image input for a SmolVLM checkpoint.
+- **[Multimodal](./multimodal.md)**: Image input for a SmolVLM or Qwen2.5-VL checkpoint.
 
 ## Serving features
 
 - **[Continuous batching and concurrency](./continuous-batching.md)**: The scheduling loop, rows and bounds.
 - **[Speculative decoding](./speculative-decoding.md)**: Prompt lookup and draft-model policies, served through the one loop.
 - **[Using LoRA adapters](./lora-adapters.md)**: Hot-load, select and unload adapters.
-- **[Tensor parallelism](./tensor-parallelism.md)**: Not implemented; what the server does instead.
+- **[Tensor parallelism](./tensor-parallelism.md)**: Weights and the paged KV pool divided over ranks; served on a two-GPU PTX pair.
 
 ## Library users
 

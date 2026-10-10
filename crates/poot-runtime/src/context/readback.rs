@@ -146,13 +146,13 @@ impl Context {
     ///
     /// Card 547a: the device-side copy is padded up to `COPY_BUFFER_ALIGNMENT` (4 bytes) when
     /// `out.len()` is not already a multiple of 4 (a BF16/F16 buffer with an odd element count),
-    /// mirroring [`Self::write_bytes`]'s own padding and `alloc_storage`'s padded allocation (which
+    /// mirroring [`Self::write_with`]'s own padding and `alloc_storage`'s padded allocation (which
     /// guarantees the source buffer holds at least that many bytes); only `out.len()` bytes are copied
     /// back into `out`.
     ///
     /// Card 547a: `out` longer than `b`'s byte capacity is refused with the typed
     /// [`RuntimeError::RangeOutOfBounds`]/[`RuntimeError::RangeOverflow`] (mirroring
-    /// [`Self::write_bytes`]'s own `checked_write_range` call), and the device-side copy is capped at
+    /// [`Self::write_with`]'s own `checked_write_range` call), and the device-side copy is capped at
     /// `b`'s own padded byte capacity - never past it, even though both are already multiples of 4 by
     /// construction (`alloc_storage` pads the same way), so a future allocator that pads differently
     /// cannot reopen the overrun this closes.

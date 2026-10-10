@@ -56,6 +56,7 @@ pub use publication::{
     DeviceStoreFence, QueueHostLink, QueueHostTarget, QueuePublicationContract,
     QueuePublicationError, QueueRingMemory, take_issued_device_store_fence_count,
 };
+pub use upload::UPLOAD_CHUNK_BYTES;
 
 use std::ffi::{OsString, c_char, c_void};
 
@@ -103,6 +104,7 @@ mod owner;
 mod queue;
 mod replay;
 mod transfer;
+mod upload;
 
 pub use aql::*;
 pub use buffer::*;

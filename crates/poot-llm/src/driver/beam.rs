@@ -220,8 +220,7 @@ impl Driver {
         self.prepare_beam(width, prompt.len())?;
         if self.residency == super::StateResidency::Recurrent {
             // A recurrent state folds every token in: the prompt must start from zero.
-            self.executor
-                .reset_state(self.exe, poot_executor::StateScope::All)?;
+            self.reset_exe(self.exe)?;
         }
 
         let handle = Arc::clone(&self.handle);

@@ -5,7 +5,7 @@ use cudarc::driver::sys;
 
 use super::buffer::PtxBuffer;
 use super::error::PtxError;
-use super::owner::PtxOwner;
+use super::owner::{OwnerCounters, PtxOwner};
 
 /// An instantiated, replayable CUDA graph (the captured dispatch sequence). [`PtxGraphExec::launch`] re-issues
 /// the recorded sequence with one host call (`cuGraphLaunch`, G3c). Replays use the device addresses recorded
@@ -39,7 +39,9 @@ impl PtxGraphExec {
     /// for this call; the calling thread's prior state is restored. Does not sync.
     pub fn launch(&self) -> Result<(), PtxError> {
         self.owner
-            .with_current(|driver| driver.launch_graph(self.exec, self.owner.stream))
+            .with_current(|driver| driver.launch_graph(self.exec, self.owner.stream))?;
+        OwnerCounters::bump(&self.owner.counters.graph_launches);
+        Ok(())
     }
 
     /// Wait for this graph's originating stream. Usable even when the graph outlives its `PtxContext` handle
@@ -114,12 +116,13 @@ pub(crate) fn instantiate_graph(
         captured,
     };
     instantiate(&mut construction.exec)?;
+    OwnerCounters::bump(&construction.owner.counters.graph_instantiations);
     Ok(construction.finish())
 }
 
-/// The buffers an open stream capture has recorded device addresses of. A captured graph replays those raw
-/// addresses, so every dispatch recorded during the capture retains its buffers here, and `end_capture` moves
-/// them into the [`PtxGraphExec`]. `None` means no capture is open.
+/// What an open stream capture has recorded device addresses of. A captured graph replays those raw
+/// addresses, so every dispatch or copy recorded during the capture retains its buffers, and
+/// `end_capture` moves them into the [`PtxGraphExec`]. `None` means no capture is open.
 #[derive(Default)]
 pub(crate) struct CaptureRetention(RefCell<Option<Vec<PtxBuffer>>>);
 
@@ -163,6 +166,7 @@ impl ModuleConstruction {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(module);
+        OwnerCounters::bump(&self.owner.counters.modules);
     }
 }
 
@@ -181,10 +185,28 @@ pub(crate) struct PtxEvent {
     pub(crate) owner: Arc<PtxOwner>,
 }
 
+// SAFETY: `event` is a plain driver handle (an address, never dereferenced by Rust) and `owner` is
+// `Send + Sync` (see its doc). CUDA events are usable from any thread (record and wait name the event
+// by handle and take the stream's own context), and `Drop` scopes the owning context current first.
+unsafe impl Send for PtxEvent {}
+// SAFETY: as above; no method of `PtxEvent` mutates anything, so a shared reference is a copy of the handle.
+unsafe impl Sync for PtxEvent {}
+
 impl PtxEvent {
     pub(crate) fn new(event: sys::CUevent, owner: Arc<PtxOwner>) -> Self {
+        OwnerCounters::bump(&owner.counters.events);
         Self { event, owner }
     }
+}
+
+/// A CUDA event that orders work between two streams, possibly on two devices: one context records it
+/// after the graph it just launched ([`crate::PtxContext::record_sync_event`]) and another's stream waits
+/// on it before the graph it launches next ([`crate::PtxContext::wait_sync_event`]). Both calls are
+/// stream-ordered at the host call, so a wait always names the record the host enqueued before it. It
+/// belongs to the context that created it.
+#[derive(Clone)]
+pub struct PtxSyncEvent {
+    pub(crate) event: Arc<PtxEvent>,
 }
 
 impl Drop for PtxEvent {

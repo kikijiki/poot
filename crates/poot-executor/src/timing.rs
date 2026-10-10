@@ -47,6 +47,13 @@ pub struct DetailedTiming {
 }
 
 impl DetailedTiming {
+    /// The bounds a diagnostic run uses when its operator names none: every step, 4096 retained steps,
+    /// 65536 retained dispatch records and 64 timestamp queries in flight. The one owner of these figures;
+    /// the server's flags, the bench runner and the timed-executor rows start from it.
+    pub fn default_diagnostic() -> Self {
+        Self::every_step(4096, 1 << 16, 64)
+    }
+
     /// Every step, bounded to `max_retained_steps` records and `max_retained_dispatch_records`
     /// dispatch records, at most `max_in_flight_queries` query resources in flight at once.
     pub fn every_step(
@@ -82,6 +89,20 @@ mod tests {
     #[test]
     fn default_is_counters_only() {
         assert_eq!(TimingOptions::default(), TimingOptions::CountersOnly);
+    }
+
+    #[test]
+    fn default_diagnostic_is_every_step_within_finite_bounds() {
+        let d = DetailedTiming::default_diagnostic();
+        assert_eq!(d.sample_every, 1);
+        assert_eq!(
+            (
+                d.max_retained_steps,
+                d.max_retained_dispatch_records,
+                d.max_in_flight_queries
+            ),
+            (4096, 65_536, 64)
+        );
     }
 
     #[test]

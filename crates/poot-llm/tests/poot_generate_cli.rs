@@ -24,13 +24,11 @@ fn stderr(output: &Output) -> String {
 }
 
 /// A flag poot has no capability for is refused by name, and a positional argument (the old command
-/// line) is refused too. Mutations: declare `--chat-template` (a template override poot cannot honour)
-/// on the parser; accept positional arguments.
+/// line) is refused too. Mutations: declare `--n-gpu-layers` (an offload poot cannot honour) on the
+/// parser; accept positional arguments.
 #[test]
 fn a_flag_poot_lacks_and_a_positional_argument_are_refused() {
     for lacking in [
-        &["-p", "hi", "--chat-template", "chatml"][..],
-        &["-p", "hi", "--conversation"][..],
         &["-p", "hi", "--n-gpu-layers", "99"][..],
         &["/models/qwen", "The capital of France is", "16"][..],
     ] {
@@ -57,8 +55,76 @@ fn a_run_without_a_prompt_is_refused() {
     );
 }
 
+/// A conversation reads its turns from stdin, so it needs no `-p`/`-f`: the parser accepts it and the run
+/// reaches the model load (the path does not exist), as `--single-turn` and `-p` with a conversation do.
+/// Mutations: leave `-p`/`-f` required beside `--conversation`; drop `single_turn` from the
+/// `required_unless_present_any` of `-p`.
+#[test]
+fn a_conversation_needs_no_prompt_flag() {
+    for flags in [
+        &["--conversation"][..],
+        &["--single-turn"][..],
+        &["--conversation", "-p", "hi"][..],
+        &["--single-turn", "-p", "hi"][..],
+    ] {
+        let mut args = vec!["-m", "/nonexistent", "--backend", "wgpu"];
+        args.extend_from_slice(flags);
+        let output = poot_generate(&args);
+        assert!(!output.status.success(), "{flags:?}");
+        let message = stderr(&output);
+        assert!(
+            !message.contains("required arguments"),
+            "{flags:?} was refused by the parser: {message}"
+        );
+    }
+}
+
+/// A conversation answers through the chat template, so asking for the prompt as written beside it is
+/// refused naming both flags, before a model is read. Mutation: drop `conflicts_with_all` from
+/// `--no-chat-template`.
+#[test]
+fn a_conversation_refuses_the_prompt_as_written() {
+    for conversing in ["--conversation", "--single-turn"] {
+        let output = poot_generate(&["-m", "/nonexistent", conversing, "--no-chat-template"]);
+        assert!(!output.status.success());
+        let message = stderr(&output);
+        assert!(
+            message.contains(conversing) && message.contains("--no-chat-template"),
+            "{message}"
+        );
+    }
+}
+
+/// A chat template override is one template: given as text or as a file, not both, and not beside the
+/// prompt as written. Each pair is refused naming both flags, before a model is read. Mutations: drop
+/// `conflicts_with_all` from `--chat-template`; drop `conflicts_with` from `--chat-template-file`.
+#[test]
+fn a_chat_template_override_refuses_a_second_source_and_the_prompt_as_written() {
+    for pair in [
+        ["--chat-template", "--chat-template-file"],
+        ["--chat-template", "--no-chat-template"],
+        ["--chat-template-file", "--no-chat-template"],
+    ] {
+        let mut args = vec!["-m", "/nonexistent", "-p", "hi"];
+        for flag in pair {
+            args.push(flag);
+            if flag != "--no-chat-template" {
+                args.push("x");
+            }
+        }
+        let output = poot_generate(&args);
+        assert!(!output.status.success());
+        let message = stderr(&output);
+        assert!(
+            message.contains("cannot be used with")
+                && pair.iter().all(|flag| message.contains(flag)),
+            "{pair:?}: {message}"
+        );
+    }
+}
+
 /// `--help` lists every flag the tool accepts and none it lacks. Mutations: rename a flag (`--ignore-eos`
-/// to `--ignore_eos`); declare `--chat-template`.
+/// to `--ignore_eos`); declare `--n-gpu-layers`.
 #[test]
 fn help_lists_the_accepted_flags_and_not_the_missing_ones() {
     let output = poot_generate(&["--help"]);
@@ -73,6 +139,10 @@ fn help_lists_the_accepted_flags_and_not_the_missing_ones() {
         "--file",
         "--system-prompt",
         "--no-chat-template",
+        "--chat-template",
+        "--chat-template-file",
+        "--conversation",
+        "--single-turn",
         "--predict",
         "--ctx-size",
         "--temp",
@@ -90,9 +160,10 @@ fn help_lists_the_accepted_flags_and_not_the_missing_ones() {
     ] {
         assert!(words.contains(&flag), "--help lacks {flag}:\n{help}");
     }
-    for lacking in ["--chat-template", "--conversation", "--n-gpu-layers"] {
-        assert!(!words.contains(&lacking), "--help lists {lacking}");
-    }
+    assert!(
+        !words.contains(&"--n-gpu-layers"),
+        "--help lists --n-gpu-layers"
+    );
 }
 
 /// A backend this build lacks is refused naming the cargo feature that enables it, before any model is

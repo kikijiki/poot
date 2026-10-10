@@ -6,8 +6,9 @@
 //! (completions and chat, `n` choices as `n` concurrent jobs), `Encode` steps (embeddings and rerank) and
 //! LoRA administration. Pure std HTTP, serde JSON. Accept/parse/shape run on per-connection threads.
 //!
-//! Usage: `poot-serve [--backend wgpu|rocm|ptx|vulkan|auto] [MODEL_DIR] [ADDR]` (defaults: `auto`, the local
-//! Qwen2.5-0.5B dir, `127.0.0.1:8080`). Startup computes one typed engine plan (`engine_plan`): it opens the
+//! Usage: `poot-serve [--backend wgpu|rocm|ptx|vulkan|auto] [OPTIONS] [MODEL_DIR] [ADDR]` (defaults: `auto`, the
+//! local Qwen2.5-0.5B dir, `127.0.0.1:8080`). Every setting is a flag (`--help`); the process reads no
+//! environment variable that selects a mode or a limit. Startup computes one typed engine plan (`engine_plan`): it opens the
 //! chosen device once, fits the workload to its memory and prepares it; `GET /health` is `503` until then. Logs go through `tracing` (`RUST_LOG`, default `info`). SIGINT/SIGTERM stop accepting
 //! connections and let in-flight requests drain.
 //!
@@ -17,8 +18,8 @@
 //! Sampling knobs are optional and default to greedy; `max_tokens` is bounded once at parse time.
 //!
 //! LoRA administration (`/v1/lora_adapters`) keeps its trust boundary: it is local-only on the default
-//! loopback listener; on a non-loopback listener it is disabled unless `POOT_LORA_ADMIN_KEY` is set, in
-//! which case every `/v1/lora_adapters` request needs `Authorization: Bearer <key>`. A request naming a
+//! loopback listener; on a non-loopback listener it is disabled unless `--lora-admin-key-file` names a
+//! key file, in which case every `/v1/lora_adapters` request needs `Authorization: Bearer <key>`. A request naming a
 //! `lora_adapter` that no loaded adapter has is a 400. Ordinary inference endpoints are not authenticated.
 
 // `deliver_terminal` publishes the request-outcome count before it sends the terminal event, so it has
@@ -35,6 +36,8 @@ mod api;
 mod engine_plan;
 
 mod batch;
+
+mod config;
 
 mod handlers;
 

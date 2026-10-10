@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 #[cfg(test)]
 use poot_graph_ir::ValidationOutputs;
-use poot_graph_ir::{Graph, OpKind, Operand, ValidationChannel, ValueId};
+use poot_graph_ir::{Graph, OpKind, Operand, ValidationChannel, ValueId, ValueTable};
 
 #[cfg(test)]
 use poot_target::{Backend, DeviceCaps};
@@ -73,7 +73,7 @@ pub(crate) fn state_commit_from_plans<V: ValidationChannel>(
 ) -> Result<StateCommitPlan, PlanError> {
     check_state_shapes(g)?;
 
-    let mut roots: Vec<ValueId> = (0..g.values.len()).collect();
+    let mut roots: ValueTable<ValueId> = g.values.ids().collect();
     let mut producers: HashMap<ValueId, usize> = HashMap::new();
 
     for (eqn_idx, (eqn, plan)) in g.eqns.iter().zip(plans).enumerate() {
@@ -96,7 +96,7 @@ fn check_state_shapes<V: ValidationChannel>(g: &Graph<V>) -> Result<(), PlanErro
         let output = g.aval(state_output);
         if input.shape != output.shape || input.dtype != output.dtype {
             return Err(PlanError::BadShape(format!(
-                "state v{state_input} <- v{state_output} has mismatched types: {:?} {:?} <- {:?} {:?}",
+                "state {state_input} <- {state_output} has mismatched types: {:?} {:?} <- {:?} {:?}",
                 input.shape, input.dtype, output.shape, output.dtype
             )));
         }
@@ -108,7 +108,7 @@ fn check_state_shapes<V: ValidationChannel>(g: &Graph<V>) -> Result<(), PlanErro
 /// alias root and producer.
 fn commit_from_roots<V: ValidationChannel>(
     g: &Graph<V>,
-    roots: &[ValueId],
+    roots: &ValueTable<ValueId>,
     producers: &HashMap<ValueId, usize>,
 ) -> StateCommitPlan {
     let state_roots: Vec<ValueId> = g
@@ -237,7 +237,7 @@ fn journal_donated_updates<V: ValidationChannel>(
                         shape: g.aval(*update).shape.clone(),
                     }),
                     _ => Err(PlanError::BadShape(format!(
-                        "state v{state_input} donated DynamicUpdateSlice v{state_root} has no value update operand"
+                        "state {state_input} donated DynamicUpdateSlice {state_root} has no value update operand"
                     ))),
                 },
                 other => Err(PlanError::UnrecoverableDonation {
@@ -300,7 +300,6 @@ fn commit_for_test<V: ValidationChannel>(
                 g,
                 eqn,
                 backend,
-                1,
                 &views,
                 caps,
                 &poot_test_util::graph_fixtures::roomy_body_limits(),
@@ -353,12 +352,12 @@ mod tests {
             plan.copies,
             [
                 StateCommitCopy {
-                    state_input: a.id,
-                    state_output: b.id,
+                    state_input: a.id(),
+                    state_output: b.id(),
                 },
                 StateCommitCopy {
-                    state_input: b.id,
-                    state_output: a.id,
+                    state_input: b.id(),
+                    state_output: a.id(),
                 },
             ]
         );
@@ -394,8 +393,8 @@ mod tests {
         assert_eq!(
             plan.copies,
             [StateCommitCopy {
-                state_input: a.id,
-                state_output: reshaped.id,
+                state_input: a.id(),
+                state_output: reshaped.id(),
             }]
         );
 
@@ -436,7 +435,7 @@ mod tests {
         let graph = builder.finish_with_state(updated, &[(state, updated)]);
         let plan =
             commit_for_test(&graph, Backend::Nvptx, &default_caps_for(Backend::Nvptx)).unwrap();
-        assert_eq!(plan.inplace, HashMap::from([(updated.id, state.id)]));
+        assert_eq!(plan.inplace, HashMap::from([(updated.id(), state.id())]));
         assert!(plan.copies.is_empty());
 
         let builder = Builder::new();
@@ -466,14 +465,14 @@ mod tests {
         let graph = builder.finish_with_state(updated, &[(state, updated)]);
         let commit =
             commit_for_test(&graph, Backend::Nvptx, &default_caps_for(Backend::Nvptx)).unwrap();
-        assert_eq!(commit.inplace, HashMap::from([(updated.id, state.id)]));
+        assert_eq!(commit.inplace, HashMap::from([(updated.id(), state.id())]));
 
         let donations = journal_donated_updates(&graph, &commit).unwrap();
         assert_eq!(
             donations,
             [DonationFootprint {
-                state_root: updated.id,
-                state_input: state.id,
+                state_root: updated.id(),
+                state_input: state.id(),
                 axis: 0,
                 shape: vec![1, 3],
             }]
@@ -542,32 +541,32 @@ mod tests {
             donations,
             [
                 DonationFootprint {
-                    state_root: updated1.id,
-                    state_input: s1.id,
+                    state_root: updated1.id(),
+                    state_input: s1.id(),
                     axis: 0,
                     shape: vec![1],
                 },
                 DonationFootprint {
-                    state_root: updated2.id,
-                    state_input: s2.id,
+                    state_root: updated2.id(),
+                    state_input: s2.id(),
                     axis: 0,
                     shape: vec![2],
                 },
                 DonationFootprint {
-                    state_root: updated3.id,
-                    state_input: s3.id,
+                    state_root: updated3.id(),
+                    state_input: s3.id(),
                     axis: 0,
                     shape: vec![3],
                 },
                 DonationFootprint {
-                    state_root: updated4.id,
-                    state_input: s4.id,
+                    state_root: updated4.id(),
+                    state_input: s4.id(),
                     axis: 0,
                     shape: vec![4],
                 },
                 DonationFootprint {
-                    state_root: updated5.id,
-                    state_input: s5.id,
+                    state_root: updated5.id(),
+                    state_input: s5.id(),
                     axis: 0,
                     shape: vec![5],
                 },
@@ -604,13 +603,13 @@ mod tests {
             commit_for_test(&graph, Backend::Nvptx, &default_caps_for(Backend::Nvptx)).unwrap();
         assert_eq!(
             commit.inplace,
-            HashMap::from([(updated.id, state.id)]),
+            HashMap::from([(updated.id(), state.id())]),
             "premise: state_commit_from_plans still donates a proved-dead ScatterUpdate pairing"
         );
 
         match journal_donated_updates(&graph, &commit) {
             Err(PlanError::UnrecoverableDonation { state_input, op }) => {
-                assert_eq!(state_input, state.id);
+                assert_eq!(state_input, state.id());
                 assert_eq!(op, "scatter_update");
             }
             other => panic!("expected UnrecoverableDonation, got {other:?}"),
@@ -660,8 +659,8 @@ mod tests {
         assert_eq!(
             transaction.donations,
             [DonationFootprint {
-                state_root: updated.id,
-                state_input: state.id,
+                state_root: updated.id(),
+                state_input: state.id(),
                 axis: 0,
                 shape: vec![1, 3],
             }]
@@ -692,7 +691,7 @@ mod tests {
 
         match plan_native_state_transaction(&graph, Backend::Nvptx) {
             Err(PlanError::UnrecoverableDonation { state_input, op }) => {
-                assert_eq!(state_input, state.id);
+                assert_eq!(state_input, state.id());
                 assert_eq!(op, "scatter_update");
             }
             other => panic!("expected UnrecoverableDonation, got {other:?}"),

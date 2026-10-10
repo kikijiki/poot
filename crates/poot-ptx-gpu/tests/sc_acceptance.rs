@@ -27,6 +27,7 @@ use poot_graph_plan::{
 };
 use poot_models::model::{LogitRows, Phase};
 use poot_ptx_gpu::PtxDevice;
+use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_runtime_common::DeviceBackend;
 use poot_tensor::HostTensor;
@@ -106,7 +107,7 @@ fn store_for(graphs: &[&Graph]) -> WeightStore {
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect();
-        let dense = DenseWeight::try_new(DType::F32, shape, Arc::from(bytes)).unwrap();
+        let dense = DenseWeight::try_new(DType::F32, shape, StoredBytes::from(bytes)).unwrap();
         builder.insert(name, WeightEntry::Dense(dense)).unwrap();
     }
     builder.build()
@@ -367,7 +368,7 @@ fn sc002_parity_suite_has_real_per_op_bite_ptx() {
         let a = b.constant("a", TensorType::f32(vec![n]));
         let c = b.constant("c", TensorType::f32(vec![n]));
         let out = b.binary(BinOp::Add, a, c);
-        let (ai, ci) = (a.id, c.id);
+        let (ai, ci) = (a.id(), c.id());
         let g = b.finish(out);
         let inputs = make_inputs(&[(ai, vec![n], fill(n, 701)), (ci, vec![n], fill(n, 702))]);
         let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -390,7 +391,7 @@ fn sc002_parity_suite_has_real_per_op_bite_ptx() {
         let a = b.constant("a", TensorType::f32(vec![m, k]));
         let w = b.constant("w", TensorType::f32(vec![k, n]));
         let out = b.matmul(a, w);
-        let (ai, wi) = (a.id, w.id);
+        let (ai, wi) = (a.id(), w.id());
         let g = b.finish(out);
         let inputs = make_inputs(&[
             (ai, vec![m, k], fill(m * k, 703)),
@@ -415,7 +416,7 @@ fn sc002_parity_suite_has_real_per_op_bite_ptx() {
         let b = Builder::new();
         let x = b.constant("x", TensorType::f32(vec![rows, cols]));
         let out = b.reduce(RedOp::Sum, x, 1, false);
-        let xi = x.id;
+        let xi = x.id();
         let g = b.finish(out);
         let inputs = make_inputs(&[(xi, vec![rows, cols], fill(rows * cols, 705))]);
         let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -559,13 +560,14 @@ impl Device for FaultyOnceDevice {
     fn replay(&mut self, recording: &Self::Recording) -> Result<(), Self::Error> {
         self.inner.replay(recording)
     }
-    fn write(
+    fn write_with(
         &mut self,
         dst: &Self::Buffer,
         offset: usize,
-        bytes: &[u8],
+        len: usize,
+        fill: &mut dyn FnMut(std::ops::Range<usize>, &mut [u8]),
     ) -> Result<(), Self::Error> {
-        self.inner.write(dst, offset, bytes)
+        self.inner.write_with(dst, offset, len, fill)
     }
     fn read(&mut self, src: &Self::Buffer, out: &mut [u8]) -> Result<(), Self::Error> {
         self.inner.read(src, out)
@@ -714,13 +716,14 @@ impl Device for FaultyOnceSyncDevice {
     fn replay(&mut self, recording: &Self::Recording) -> Result<(), Self::Error> {
         self.inner.replay(recording)
     }
-    fn write(
+    fn write_with(
         &mut self,
         dst: &Self::Buffer,
         offset: usize,
-        bytes: &[u8],
+        len: usize,
+        fill: &mut dyn FnMut(std::ops::Range<usize>, &mut [u8]),
     ) -> Result<(), Self::Error> {
-        self.inner.write(dst, offset, bytes)
+        self.inner.write_with(dst, offset, len, fill)
     }
     fn read(&mut self, src: &Self::Buffer, out: &mut [u8]) -> Result<(), Self::Error> {
         self.inner.read(src, out)
@@ -894,11 +897,14 @@ fn card551b_suffix_graph(rule: SampleRule) -> (Graph, Graph, ValueId, ValueId) {
     let base_for_slots = base.clone();
     let resumed = Builder::resume(base);
     let sh = sample_head(&resumed.builder, resumed.out, rule);
-    let seed_id = sh.seed.expect("a non-Greedy rule declares a seed slot").id;
+    let seed_id = sh
+        .seed
+        .expect("a non-Greedy rule declares a seed slot")
+        .id();
     let params_id = sh
         .params
         .expect("a non-Greedy rule declares a params slot")
-        .id;
+        .id();
     let g = resumed.builder.finish_with_state(sh.out, &resumed.state);
     (base_for_slots, g, seed_id, params_id)
 }
@@ -1022,7 +1028,7 @@ fn card551b_sc003_nan_logits_are_a_typed_fault_ptx() {
         let base_for_slots = base.clone();
         let resumed = Builder::resume(base);
         let sh = sample_head(&resumed.builder, resumed.out, rule);
-        let (seed_id, params_id) = (sh.seed.map(|t| t.id), sh.params.map(|t| t.id));
+        let (seed_id, params_id) = (sh.seed.map(|t| t.id()), sh.params.map(|t| t.id()));
         let suffix_g = resumed.builder.finish_with_state(sh.out, &resumed.state);
 
         let mut entries: HashMap<String, Vec<usize>> = HashMap::new();
@@ -1041,7 +1047,7 @@ fn card551b_sc003_nan_logits_are_a_typed_fault_ptx() {
                 data[row..row + hidden].fill(f32::NAN);
             }
             let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-            let dense = DenseWeight::try_new(DType::F32, shape, Arc::from(bytes)).unwrap();
+            let dense = DenseWeight::try_new(DType::F32, shape, StoredBytes::from(bytes)).unwrap();
             builder.insert(name, WeightEntry::Dense(dense)).unwrap();
         }
         let store = Arc::new(builder.build());

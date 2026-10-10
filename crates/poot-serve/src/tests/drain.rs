@@ -1,4 +1,5 @@
 use super::*;
+use crate::lifecycle::MAX_DRAIN_TIMEOUT_SECS;
 use crate::startup::sigint_handler;
 
 pub static DRAIN_FIXTURE_RELEASE: AtomicBool = AtomicBool::new(false);
@@ -7,32 +8,41 @@ pub extern "C" fn drain_fixture_release_handler(_: libc::c_int) {
     DRAIN_FIXTURE_RELEASE.store(true, Ordering::SeqCst);
 }
 
+/// The drain bound is a positive duration of at most one day; zero and anything longer are refused
+/// rather than clamped or replaced by the default, and an unrepresentable deadline expires at once.
 #[test]
-fn bounded_drain_timeout_parser_keeps_positive_default() {
+fn bounded_drain_timeout_refuses_zero_and_over_a_day() {
+    use crate::lifecycle::{DrainTimeoutError, ServerDrainTimeout};
+
     assert_eq!(
-        server_drain_timeout_from(None).duration(),
-        Duration::from_secs(30)
-    );
-    assert_eq!(
-        server_drain_timeout_from(Some(" 7 ")).duration(),
+        ServerDrainTimeout::from_secs(7).unwrap().duration(),
         Duration::from_secs(7)
     );
     assert_eq!(
-        server_drain_timeout_from(Some("0")).duration(),
-        Duration::from_secs(30)
-    );
-    assert_eq!(
-        server_drain_timeout_from(Some("invalid")).duration(),
-        Duration::from_secs(30)
-    );
-    assert_eq!(
-        server_drain_timeout_from(Some(&u64::MAX.to_string())).duration(),
+        ServerDrainTimeout::from_secs(MAX_DRAIN_TIMEOUT_SECS)
+            .unwrap()
+            .duration(),
         Duration::from_secs(MAX_DRAIN_TIMEOUT_SECS)
+    );
+    assert_eq!(
+        ServerDrainTimeout::from_secs(0),
+        Err(DrainTimeoutError::Zero)
+    );
+    assert_eq!(
+        ServerDrainTimeout::from_secs(MAX_DRAIN_TIMEOUT_SECS + 1),
+        Err(DrainTimeoutError::TooLong {
+            seconds: MAX_DRAIN_TIMEOUT_SECS + 1
+        })
     );
 
     let start = Instant::now();
     assert_eq!(deadline_after(start, Duration::MAX), start);
-    assert!(server_drain_timeout_from(Some("1")).deadline_from(start) > start);
+    assert!(
+        ServerDrainTimeout::from_secs(1)
+            .unwrap()
+            .deadline_from(start)
+            > start
+    );
 }
 
 static SLOW_THREAD_EXIT_ENTERED: AtomicBool = AtomicBool::new(false);
@@ -252,9 +262,11 @@ fn bounded_drain_subprocess_child() {
     drop(listener);
     println!("DRAIN_FIXTURE_DRAINING {case}");
     std::io::stdout().flush().unwrap();
-    // The graceful window is the injected clock: the parent sets `POOT_DRAIN_TIMEOUT_SECS`, so the
-    // bounded wait below uses the configured deadline rather than a hard-coded duration.
-    let deadline = crate::lifecycle::server_drain_timeout().deadline_from(Instant::now());
+    // The graceful window is the injected clock: a one-second `ServerDrainTimeout`, the value the server
+    // would hold from `--drain-timeout-secs 1`.
+    let deadline = crate::lifecycle::ServerDrainTimeout::from_secs(1)
+        .unwrap()
+        .deadline_from(Instant::now());
     let graceful = workers.wait_for_connections_until(deadline);
     if !graceful {
         workers.cancel_connections();
@@ -283,7 +295,6 @@ impl BoundedDrainChild {
                 "--test-threads=1",
             ])
             .env("POOT_DRAIN_FIXTURE_CASE", case)
-            .env("POOT_DRAIN_TIMEOUT_SECS", "1")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -425,7 +436,7 @@ fn bounded_drain_subprocess_cancels_barrier_on_timeout() {
     child.marker("DRAIN_FIXTURE_ACCEPTED B", Duration::from_secs(3));
     child.signal(libc::SIGTERM);
     child.marker("DRAIN_FIXTURE_DRAINING", Duration::from_secs(3));
-    // Ordering under the injected graceful window (`POOT_DRAIN_TIMEOUT_SECS=1`): the accepted work is
+    // Ordering under the injected graceful window (a one-second `ServerDrainTimeout`, as `--drain-timeout-secs 1`): the accepted work is
     // still alive when the drain starts, and it is cancelled only when that window expires.
     child.assert_alive();
     child.marker("DRAIN_FIXTURE_CANCELLED", Duration::from_secs(3));

@@ -642,6 +642,8 @@ impl RocmContext {
         tag: &'static str,
     ) -> Result<usize, RocmError> {
         self.ensure_not_poisoned(tag)?;
+        // The packets read what upload copies wrote: every copy in flight lands before any is published.
+        self.drain_uploads(tag)?;
         let validated = dispatches
             .iter()
             .enumerate()

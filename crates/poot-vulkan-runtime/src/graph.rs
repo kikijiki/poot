@@ -276,7 +276,7 @@ impl VulkanGraph {
 
     /// Re-submit the recorded command buffers in order, fence-waiting after each (spec 133 FR-009).
     /// Write new per-replay input data into the bound persistent buffers (via
-    /// [`DeviceBuffer::write_bytes`]) before calling. Nothing is re-recorded.
+    /// [`DeviceBuffer::write_with`]) before calling. Nothing is re-recorded.
     ///
     /// Every trapping kernel's error word is zeroed before the first submit and read after the last
     /// wait: a kernel that asserted comes back as [`Replay::fault`], a program result and not a device
@@ -296,7 +296,7 @@ impl VulkanGraph {
             .unwrap_or_else(PoisonError::into_inner);
         for trap in &core.traps {
             trap.chunk
-                .write_bytes_at("replay", trap.offset, &[0u8; 4])?;
+                .write_with_at("replay", trap.offset, 4, &mut |_, out| out.fill(0))?;
         }
         for &command_buffer in &core.segments {
             // SAFETY: `core.fence` is this graph's own fence, and no submission signalling it is

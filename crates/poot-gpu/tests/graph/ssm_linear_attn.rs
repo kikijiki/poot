@@ -18,7 +18,7 @@ fn causal_conv1d_decode_gpu_matches_cpu() {
         let w = b.constant("w", TensorType::f32(vec![k, c]));
         let cache = b.constant("cache", TensorType::f32(vec![1, k - 1, c]));
         let (out, new_cache) = causal_conv1d_decode(&b, x, w, cache, k);
-        let (xi, wi, ci) = (x.id, w.id, cache.id);
+        let (xi, wi, ci) = (x.id(), w.id(), cache.id());
         let g = b.finish(if pick_state { new_cache } else { out });
         let mut inputs = HashMap::new();
         inputs.insert(xi, HostTensor::f32(vec![1, 1, c], xv.clone()));
@@ -81,7 +81,7 @@ fn in_graph_decay_mask_gated_linear_attention_gpu_matches_cpu() {
         let v = b.constant("v", TensorType::f32(vec![1, hkv, l, d]));
         let gates = b.constant("g", TensorType::f32(vec![1, hq, 1, l]));
         let tr = b.constant("tr", TensorType::f32(vec![1, hq, l, l]));
-        let ids = [q.id, k.id, v.id, gates.id, tr.id];
+        let ids = [q.id(), k.id(), v.id(), gates.id(), tr.id()];
         let mask = decay_mask_from_gates(&b, gates, tr, hq, l);
         let o = linear_attention_prefill(&b, q, k, v, n_rep, mask);
         let g = b.finish(if pick_mask { mask } else { o });
@@ -144,7 +144,13 @@ fn mamba2_ssd_decode_gpu_matches_cpu() {
         let h_in = b.constant("h", TensorType::f32(vec![1, hq, n, p]));
         let (y, h_out) = mamba2_ssd_decode(&b, x, bin, cin, delta, a_param, d_skip, h_in);
         let (xi, bi, ci, dli, ai, di, hi) = (
-            x.id, bin.id, cin.id, delta.id, a_param.id, d_skip.id, h_in.id,
+            x.id(),
+            bin.id(),
+            cin.id(),
+            delta.id(),
+            a_param.id(),
+            d_skip.id(),
+            h_in.id(),
         );
         let g = b.finish(if pick_state { h_out } else { y });
         let mut inputs = HashMap::new();
@@ -215,7 +221,15 @@ fn mamba_core_path_gpu_matches_cpu() {
         let dsk = b.constant("d", TensorType::f32(vec![1, hq, 1, 1]));
         let h_in = b.constant("h", TensorType::f32(vec![1, hq, n, pdim]));
         let ids = [
-            x.id, wc.id, cache.id, bb.id, cc.id, dt.id, ap.id, dsk.id, h_in.id,
+            x.id(),
+            wc.id(),
+            cache.id(),
+            bb.id(),
+            cc.id(),
+            dt.id(),
+            ap.id(),
+            dsk.id(),
+            h_in.id(),
         ];
         let (conv_out, conv_cache_out) = causal_conv1d_decode(&b, x, wc, cache, kk);
         let xact = poot_graph_ir::ops::silu(&b, conv_out);
@@ -307,8 +321,19 @@ fn mamba2_block_gpu_matches_cpu() {
         let cache = b.constant("cv", TensorType::f32(vec![1, kk - 1, ch]));
         let h_in = b.constant("h", TensorType::f32(vec![1, hq, n, pdim]));
         let ids = [
-            x.id, cz.id, cxc.id, cb.id, cc.id, cdt.id, cdtb.id, cwconv.id, ca.id, cd.id, cwout.id,
-            cache.id, h_in.id,
+            x.id(),
+            cz.id(),
+            cxc.id(),
+            cb.id(),
+            cc.id(),
+            cdt.id(),
+            cdtb.id(),
+            cwconv.id(),
+            ca.id(),
+            cd.id(),
+            cwout.id(),
+            cache.id(),
+            h_in.id(),
         ];
         let z = linear(&b, x, cz, None);
         let xc = linear(&b, x, cxc, None);
@@ -400,7 +425,7 @@ fn linear_attention_decode_gated_gpu_matches_cpu() {
         let gate = b.constant("g", TensorType::f32(vec![1, hq, dk, 1]));
         let s = b.constant("s", TensorType::f32(vec![1, hq, dk, dv]));
         let (o, s_out) = linear_attention_decode_gated(&b, q, k, v, n_rep, gate, s);
-        let (qi, ki, vi, gi, si) = (q.id, k.id, v.id, gate.id, s.id);
+        let (qi, ki, vi, gi, si) = (q.id(), k.id(), v.id(), gate.id(), s.id());
         let g = b.finish(if pick_state { s_out } else { o });
         let mut inputs = HashMap::new();
         inputs.insert(qi, HostTensor::f32(vec![1, hq, 1, dk], qd.clone()));
@@ -463,7 +488,7 @@ fn linear_attention_prefill_gpu_matches_cpu() {
     let v = b.constant("v", TensorType::f32(vec![1, hkv, l, dv]));
     let mask = b.constant("m", TensorType::f32(vec![1, 1, l, l]));
     let o = linear_attention_prefill(&b, q, k, v, n_rep, mask);
-    let (qi, ki, vi, mi) = (q.id, k.id, v.id, mask.id);
+    let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
     let g = b.finish(o);
     let mut inputs = HashMap::new();
     inputs.insert(qi, HostTensor::f32(vec![1, hq, l, dk], qd));
@@ -512,7 +537,7 @@ fn gpu_causal_conv1d_prefill_matches_cpu() {
     let x = b.constant("x", TensorType::f32(vec![1, l, c]));
     let w = b.constant("w", TensorType::f32(vec![k, c]));
     let out = causal_conv1d_prefill(&b, x, w, k);
-    let (xi, wi) = (x.id, w.id);
+    let (xi, wi) = (x.id(), w.id());
     let g = b.finish(out);
 
     let mut inputs = HashMap::new();
@@ -584,7 +609,15 @@ fn mamba2_ssd_decode_gpu_fuzz_matches_cpu() {
             let a = b.constant("a", TensorType::f32(vec![1, hq, 1, 1]));
             let dsk = b.constant("d", TensorType::f32(vec![1, hq, 1, 1]));
             let h_in = b.constant("h", TensorType::f32(vec![1, hq, n, p]));
-            let ids = [x.id, bin.id, cin.id, dl.id, a.id, dsk.id, h_in.id];
+            let ids = [
+                x.id(),
+                bin.id(),
+                cin.id(),
+                dl.id(),
+                a.id(),
+                dsk.id(),
+                h_in.id(),
+            ];
             let (y, h_out) = mamba2_ssd_decode(&b, x, bin, cin, dl, a, dsk, h_in);
             let g = b.finish(if pick_state { h_out } else { y });
             let mut inputs = HashMap::new();

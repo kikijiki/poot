@@ -4,10 +4,9 @@
 //! shift of the high half both matter) and words a widening must carry bit for bit (a quiet NaN with a payload,
 //! a negative one, a subnormal, a negative subnormal).
 
-use std::sync::Arc;
-
 use poot_graph_ir::{Builder, TensorType};
 use poot_graph_plan::{ImportedKernel, KernelChoice, Submission, Target};
+use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::{DType, HostTensor};
 
@@ -54,8 +53,12 @@ pub fn bf16_const_cast_fixtures() -> Vec<Fixture> {
                 .insert(
                     "x",
                     WeightEntry::Dense(
-                        DenseWeight::try_new(DType::BF16, vec![words.len()], Arc::from(bytes))
-                            .expect("a BF16 dense weight"),
+                        DenseWeight::try_new(
+                            DType::BF16,
+                            vec![words.len()],
+                            StoredBytes::from(bytes),
+                        )
+                        .expect("a BF16 dense weight"),
                     ),
                 )
                 .expect("one weight");

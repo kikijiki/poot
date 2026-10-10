@@ -2,10 +2,8 @@
 //! written from the two format definitions, not from the production decode: comparing a model or a
 //! projection against it compares two independent implementations.
 
-use std::sync::Arc;
-
 use poot_quant::format::{ScaleEncoding, WeightFormat};
-use poot_quant::{OperandRole, PackedPayload, PackedWeight, SourceRole};
+use poot_quant::{OperandRole, PackedPayload, PackedWeight, SourceRole, StoredBytes};
 
 /// The routed experts: adjacent-K E2M1 codes with one E8M0 scale per row per 32 values of K.
 pub(super) const FP4: WeightFormat = WeightFormat::E2m1Row32;
@@ -70,8 +68,8 @@ pub(super) fn payload(
     PackedPayload::try_new(
         weight,
         [
-            (codes, Arc::<[u8]>::from(code_bytes)),
-            (scales, Arc::<[u8]>::from(scale_bytes)),
+            (codes, StoredBytes::from(code_bytes)),
+            (scales, StoredBytes::from(scale_bytes)),
         ],
     )
     .expect("a valid packed payload")

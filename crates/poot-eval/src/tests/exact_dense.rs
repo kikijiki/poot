@@ -217,7 +217,7 @@ fn dense_view_lifecycle_bytes(elements: usize) -> usize {
     let (output, bytes) = allocated_bytes(|| {
         let view = DenseOwnerTensorView::new(Arc::clone(&owner)).unwrap();
         let _reshaped = view.reshape(vec![2, elements / 2]).unwrap();
-        let bound = HashMap::from([(constant.id, Value::from(view.clone()))]);
+        let bound = HashMap::from([(constant.id(), Value::from(view.clone()))]);
         eval(&graph, &bound, EvalOptions::new(EvalBudget::UNBOUNDED))
             .map(|r| r.output)
             .unwrap()
@@ -291,7 +291,7 @@ fn dense_exact_value_rejects_nonview_ops() {
         Err(EvalError::ExactDense(_))
     ));
     assert!(matches!(
-        value.scatter_update(&value, &index, 0),
+        value.scatter_update(&value, &index, ValueId::new(0)),
         Err(EvalError::ExactDense(_))
     ));
 
@@ -311,12 +311,12 @@ fn dense_exact_value_rejects_nonview_ops() {
         let graph = builder.finish(output);
         let error = eval(
             &graph,
-            &HashMap::from([(source.id, value.clone())]),
+            &HashMap::from([(source.id(), value.clone())]),
             EvalOptions::new(EvalBudget::UNBOUNDED),
         )
         .map(|r| r.output)
         .unwrap_err();
-        assert_graph_consumer(error, consumer, source.id);
+        assert_graph_consumer(error, consumer, source.id());
     }
 }
 
@@ -331,7 +331,7 @@ fn dense_eval_preflight_precedes_execution() {
         .map(|index| {
             builder
                 .constant(&format!("padding.{index}"), TensorType::f32([1]))
-                .id
+                .id()
         })
         .collect();
     let unrelated = builder.constant("unrelated", TensorType::f32([UNRELATED_ELEMENTS]));
@@ -341,13 +341,13 @@ fn dense_eval_preflight_precedes_execution() {
     let graph = builder.finish(output);
     let mut inputs = HashMap::from([
         (
-            unrelated.id,
+            unrelated.id(),
             Value::Host(HostTensor::f32(
                 vec![UNRELATED_ELEMENTS],
                 vec![1.0; UNRELATED_ELEMENTS],
             )),
         ),
-        (exact.id, Value::from(bf16.reshape(vec![2, 3]).unwrap())),
+        (exact.id(), Value::from(bf16.reshape(vec![2, 3]).unwrap())),
     ]);
     // Every graph input must be bound now (`walk::preflight_bindings`'s own MissingInput check, SC-010),
     // so the padding consts (here purely to inflate `g.values.len()`, never read) need a binding too -
@@ -361,7 +361,7 @@ fn dense_eval_preflight_precedes_execution() {
             .map(|r| r.output)
             .unwrap_err()
     });
-    assert_graph_consumer(error, "slice", exact.id);
+    assert_graph_consumer(error, "slice", exact.id());
     // The rejection must come before the per-value environment, any input copy, and the prefix equation's
     // output. Each of those alone is larger than this bound.
     let environment = PADDING_VALUES * std::mem::size_of::<Option<Value>>();
@@ -379,7 +379,7 @@ fn dense_eval_identity_reuses_typed_metadata_validation() {
     let graph = builder.finish(exact);
     let error = eval(
         &graph,
-        &HashMap::from([(exact.id, Value::from(bf16.clone()))]),
+        &HashMap::from([(exact.id(), Value::from(bf16.clone()))]),
         EvalOptions::new(EvalBudget::UNBOUNDED),
     )
     .map(|r| r.output)
@@ -387,7 +387,7 @@ fn dense_eval_identity_reuses_typed_metadata_validation() {
     assert!(matches!(
         error,
         EvalError::ExactDense(ExactDenseError::NameMismatch { value_id, .. })
-            if value_id == exact.id
+            if value_id == exact.id()
     ));
 
     let builder = Builder::new();
@@ -395,7 +395,7 @@ fn dense_eval_identity_reuses_typed_metadata_validation() {
     let graph = builder.finish(exact);
     let output = eval(
         &graph,
-        &HashMap::from([(exact.id, Value::from(bf16.clone()))]),
+        &HashMap::from([(exact.id(), Value::from(bf16.clone()))]),
         EvalOptions::new(EvalBudget::UNBOUNDED),
     )
     .map(|r| r.output)

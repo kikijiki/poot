@@ -16,7 +16,7 @@ fn matmul_fixture(name: &'static str, m: usize, k: usize, n: usize) -> Fixture {
     let w = b.constant("w", TensorType::f32(vec![k, n]));
     let out = b.matmul(x, w);
     let graph = b.finish(out);
-    let key = graph.meta(x.id).slot_key().unwrap().clone();
+    let key = graph.meta(x.id()).slot_key().unwrap().clone();
     let steps = (0..2u64)
         .map(|step| {
             vec![StepFixture {
@@ -73,8 +73,8 @@ fn wmma_fixture(name: &'static str, s: usize) -> Fixture {
     let w = b.constant("w", TensorType::new(vec![s, s], DType::BF16));
     let out = b.matmul(b.cast(x, DType::BF16), w);
     let mut graph = b.finish(out);
-    graph.values[out.id].aval.dtype = DType::F32;
-    let key = graph.meta(x.id).slot_key().unwrap().clone();
+    graph.values[out.id()].aval.dtype = DType::F32;
+    let key = graph.meta(x.id()).slot_key().unwrap().clone();
     let steps = (0..2u64)
         .map(|step| {
             let values = small_integers(s * s, 0xB0 + step, 1);
@@ -137,8 +137,8 @@ fn wmma_batched_fixture(name: &'static str, operand: DType) -> Fixture {
     );
     let out = b.matmul(b.cast(x, operand), w);
     let mut graph = b.finish(out);
-    graph.values[out.id].aval.dtype = DType::F32;
-    let key = graph.meta(x.id).slot_key().unwrap().clone();
+    graph.values[out.id()].aval.dtype = DType::F32;
+    let key = graph.meta(x.id()).slot_key().unwrap().clone();
     let steps = (0..2usize)
         .map(|step| {
             let values = (0..WMMA_BATCH * WMMA_M * WMMA_K).map(|flat| {
@@ -207,8 +207,8 @@ pub fn wide_grid_fixture() -> Fixture {
     );
     let graph = b.finish(out);
     let (kx, ky) = (
-        graph.meta(x.id).slot_key().unwrap().clone(),
-        graph.meta(y.id).slot_key().unwrap().clone(),
+        graph.meta(x.id()).slot_key().unwrap().clone(),
+        graph.meta(y.id()).slot_key().unwrap().clone(),
     );
     let steps = (0..2u64)
         .map(|step| {

@@ -63,14 +63,17 @@ mod driver;
 mod error;
 mod graph;
 mod owner;
+mod upload;
 
 pub use buffer::{AllocGuard, BufferRole, MemoryCounterSnapshot, PtxBuffer};
 pub use context::{PtxContext, f32_to_bf16};
 pub use error::{BufferElement, BufferStorage, LogicalDType, PtxError, StorageLayout};
-pub use graph::{PtxGraphExec, PtxSpan};
+pub use graph::{PtxGraphExec, PtxSpan, PtxSyncEvent};
+pub use owner::NativeCounters;
 /// The compiler-produced kernel handle every dispatch takes (card 608): re-exported so callers need not
 /// depend on `poot-runtime-common` directly just to name the type.
 pub use poot_runtime_common::CompiledKernel;
+pub use upload::UPLOAD_CHUNK_BYTES;
 
 #[cfg(test)]
 pub(crate) use {

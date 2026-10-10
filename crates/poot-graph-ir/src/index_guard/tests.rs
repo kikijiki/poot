@@ -23,7 +23,7 @@ fn guarded_graph() -> (crate::Graph<crate::ValidationOutputs>, ValueId, ValueId)
         &[(ValidationId(7), "bounds", guard.witness)],
     )
     .unwrap();
-    (graph, guard.guarded.id, guard.witness.id)
+    (graph, guard.guarded.id(), guard.witness.id())
 }
 
 #[test]
@@ -77,7 +77,7 @@ fn guard_helper_rejects_a_selector_it_cannot_guard() {
     assert_eq!(
         builder.guard_index_bounds(float, UPPER).unwrap_err(),
         IndexGuardError::RawNotI32 {
-            raw: float.id,
+            raw: float.id(),
             dtype: DType::F32
         }
     );
@@ -85,7 +85,7 @@ fn guard_helper_rejects_a_selector_it_cannot_guard() {
     let scalar = i32_input(&builder, "scalar", vec![]);
     assert_eq!(
         builder.guard_index_bounds(scalar, UPPER).unwrap_err(),
-        IndexGuardError::RawNotRanked { raw: scalar.id }
+        IndexGuardError::RawNotRanked { raw: scalar.id() }
     );
 
     let raw = i32_input(&builder, "raw", vec![4]);
@@ -116,9 +116,9 @@ fn guard_recognizer_rejects_each_noncanonical_edit() {
     )
     .unwrap();
     assert_eq!(
-        recognize_index_bounds_guard(&graph, guarded.id, witness.id),
+        recognize_index_bounds_guard(&graph, guarded.id(), witness.id()),
         Err(IndexGuardRejection::ConditionNotUnsignedBound {
-            invalid: invalid.id
+            invalid: invalid.id()
         })
     );
 
@@ -138,11 +138,11 @@ fn guard_recognizer_rejects_each_noncanonical_edit() {
     )
     .unwrap();
     assert_eq!(
-        recognize_index_bounds_guard(&graph, guarded.id, witness.id),
+        recognize_index_bounds_guard(&graph, guarded.id(), witness.id()),
         Err(IndexGuardRejection::ConditionComparesAnotherValue {
-            invalid: invalid.id,
-            expected: raw.id,
-            actual: other.id,
+            invalid: invalid.id(),
+            expected: raw.id(),
+            actual: other.id(),
         })
     );
 
@@ -163,10 +163,10 @@ fn guard_recognizer_rejects_each_noncanonical_edit() {
     )
     .unwrap();
     assert_eq!(
-        recognize_index_bounds_guard(&graph, guarded.id, witness.id),
+        recognize_index_bounds_guard(&graph, guarded.id(), witness.id()),
         Err(IndexGuardRejection::FallbackNotZeroOfSource {
-            zero: not_zero.id,
-            expected: raw.id
+            zero: not_zero.id(),
+            expected: raw.id()
         })
     );
 
@@ -184,9 +184,9 @@ fn guard_recognizer_rejects_each_noncanonical_edit() {
     )
     .unwrap();
     assert_eq!(
-        recognize_index_bounds_guard(&graph, guarded.id, witness.id),
+        recognize_index_bounds_guard(&graph, guarded.id(), witness.id()),
         Err(IndexGuardRejection::GuardedNotSelect {
-            guarded: guarded.id
+            guarded: guarded.id()
         })
     );
 }
@@ -210,11 +210,11 @@ fn guard_recognizer_rejects_a_witness_over_another_observation() {
     )
     .unwrap();
     assert_eq!(
-        recognize_index_bounds_guard(&graph, guarded.id, witness.id),
+        recognize_index_bounds_guard(&graph, guarded.id(), witness.id()),
         Err(IndexGuardRejection::WitnessObservesAnotherValue {
-            witness: witness.id,
-            observed: decoy.id,
-            invalid: invalid.id,
+            witness: witness.id(),
+            observed: decoy.id(),
+            invalid: invalid.id(),
         })
     );
 }
@@ -241,9 +241,9 @@ fn guard_recognizer_rejects_a_witness_that_is_not_a_keepdim_last_axis_sum() {
         )
         .unwrap();
         assert_eq!(
-            recognize_index_bounds_guard(&graph, guarded.id, witness.id),
+            recognize_index_bounds_guard(&graph, guarded.id(), witness.id()),
             Err(IndexGuardRejection::WitnessNotSumOfCast {
-                witness: witness.id
+                witness: witness.id()
             })
         );
     }
@@ -263,9 +263,9 @@ fn guard_recognizer_rejects_a_witness_that_is_not_a_keepdim_last_axis_sum() {
     )
     .unwrap();
     assert_eq!(
-        recognize_index_bounds_guard(&graph, guarded.id, witness.id),
+        recognize_index_bounds_guard(&graph, guarded.id(), witness.id()),
         Err(IndexGuardRejection::WitnessNotSumOfCast {
-            witness: witness.id
+            witness: witness.id()
         })
     );
 }
@@ -331,7 +331,7 @@ fn recognize_edited(
         &[(ValidationId(1), "bounds", guard.witness)],
     )
     .unwrap();
-    let (guarded, witness) = edit(&mut graph, guard.guarded.id, guard.witness.id);
+    let (guarded, witness) = edit(&mut graph, guard.guarded.id(), guard.witness.id());
     recognize_index_bounds_guard(&graph, guarded, witness)
 }
 
@@ -373,11 +373,11 @@ fn guard_recognizer_rejects_a_bound_that_is_not_an_i32_literal() {
         &[(ValidationId(1), "bounds", witness)],
     )
     .unwrap();
-    let rejection = recognize_index_bounds_guard(&graph, guarded.id, witness.id).unwrap_err();
+    let rejection = recognize_index_bounds_guard(&graph, guarded.id(), witness.id()).unwrap_err();
     assert_eq!(
         rejection,
         IndexGuardRejection::BoundNotI32Literal {
-            invalid: invalid.id
+            invalid: invalid.id()
         }
     );
 }
@@ -558,7 +558,7 @@ fn index_guard_rejection_table_covers_every_reason() {
                 &[(ValidationId(1), "bounds", witness)],
             )
             .unwrap();
-            recognize_index_bounds_guard(&graph, guard.guarded.id, witness.id).unwrap_err()
+            recognize_index_bounds_guard(&graph, guard.guarded.id(), witness.id()).unwrap_err()
         },
         // The witness observes some other value.
         || {
@@ -575,7 +575,7 @@ fn index_guard_rejection_table_covers_every_reason() {
                 &[(ValidationId(1), "bounds", witness)],
             )
             .unwrap();
-            recognize_index_bounds_guard(&graph, guard.guarded.id, witness.id).unwrap_err()
+            recognize_index_bounds_guard(&graph, guard.guarded.id(), witness.id()).unwrap_err()
         },
     ];
     for case in cases {
@@ -614,9 +614,9 @@ fn guard_recognizer_rejects_a_witness_whose_source_is_not_a_cast() {
     .unwrap();
 
     assert_eq!(
-        recognize_index_bounds_guard(&graph, guard.guarded.id, witness.id),
+        recognize_index_bounds_guard(&graph, guard.guarded.id(), witness.id()),
         Err(IndexGuardRejection::WitnessNotSumOfCast {
-            witness: witness.id
+            witness: witness.id()
         })
     );
 }

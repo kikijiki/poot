@@ -14,6 +14,8 @@ poot-llm.workspace = true
 poot-models.workspace = true
 # The engine plan opens an executor, reads its targets and fits the workload to their memory.
 poot-executor.workspace = true
+# The timing snapshot the engine publishes is summarized with its own report.
+poot-profile.workspace = true
 poot-graph-plan.workspace = true
 poot-target.workspace = true
 # LoRA administration loads a PEFT adapter directory; the synthetic GGUF writer of the startup and

@@ -154,7 +154,7 @@ fn check_large_vocab_decomposition(logits: Vec<f32>) {
         "fixture must actually exercise the decomposition (vocab={v})"
     );
 
-    let inputs = dense_inputs([(x.id, HostTensor::f32(vec![v], logits))]);
+    let inputs = dense_inputs([(x.id(), HostTensor::f32(vec![v], logits))]);
     let want = eval_every_combination("sample_token_greedy_undecomposed", &g, &inputs).unwrap();
     let got =
         eval_every_combination("sample_token_greedy_decomposed", &decomposed, &inputs).unwrap();
@@ -237,7 +237,7 @@ fn large_vocab_greedy_decomposition_matches_the_oracle_at_card_scale_b1_and_b4()
                 >= 2,
             "B={b_rows}: fixture must exercise the decomposition"
         );
-        let inputs = dense_inputs([(x.id, HostTensor::f32(vec![b_rows, v], logits))]);
+        let inputs = dense_inputs([(x.id(), HostTensor::f32(vec![b_rows, v], logits))]);
         let want = eval_every_combination("card_scale_undecomposed", &g, &inputs).unwrap();
         let got = eval_every_combination("card_scale_decomposed", &decomposed, &inputs).unwrap();
         assert_eq!(

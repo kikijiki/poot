@@ -25,8 +25,8 @@ use crate::api::{
 use crate::http::{error_body, respond_error};
 use crate::lifecycle::{ClientGone, GenerationRequest, peer_closed, submit, submit_encode};
 use crate::metrics::{InFlight, Metrics};
-use crate::types::{Completion, EncodeRow, GenerationError, PromptInput, Served};
-use crate::vision::{ImageClient, ImageError};
+use crate::types::{Completion, EncodeRow, GenerationError, PromptInput, PromptRows, Served};
+use crate::vision::{ImageClient, ImageError, ImageTurn};
 
 /// Count only response-side transport failures. Explicit `Failed`, `Done`, and receiver cancellation are
 /// already counted at their engine terminal boundary; a dead engine/job channel has no producer left.
@@ -284,7 +284,7 @@ fn shape_chat(served: &Served, req: &ChatReq) -> Result<Shaped> {
             (image_prompt(images, req)?, Vec::new())
         }
         _ => {
-            let (prompt, turn_stops) = chat_prompt_and_stops(&served.model, req);
+            let (prompt, turn_stops) = chat_prompt_and_stops(&served.model, req)?;
             (
                 PromptInput::Tokens(tokenize(&served.model, &prompt)?),
                 turn_stops,
@@ -307,47 +307,53 @@ fn shape_chat(served: &Served, req: &ChatReq) -> Result<Shaped> {
     })
 }
 
-/// The prompt of a chat request whose message carries images: the image front end lowers the images and
-/// the question to the prompt's tokens and the embedding rows at its placeholders. The front end's own
-/// turn template builds the prompt, so the request is the one user message that holds the images; a
-/// longer conversation has no rendering through it yet.
+/// The prompt of a chat request whose messages carry images: the image front end renders the whole
+/// conversation through the checkpoint's chat template, with an image part where each image sits, and
+/// lowers the images to the embedding rows at their placeholders. Each message's images come first in
+/// its content, then its text; the request's images are those of its messages in order.
 fn image_prompt(images: &ImageClient, req: &ChatReq) -> Result<PromptInput> {
     let refuse = |reason: &str| anyhow::Error::new(RefusedRequest(reason.into()));
-    let [message] = req.messages.as_slice() else {
-        return Err(refuse(
-            "a request with images is one user message: the image front end renders no longer conversation",
-        ));
-    };
-    // The tools go into the chat template, which an image prompt bypasses; `stop`, `response_format` and
-    // the guided fields act on the sampler and the stop scanner, so they apply unchanged.
+    // The tools go into the chat template, whose tool branch the image template does not have;
+    // `stop`, `response_format` and the guided fields act on the sampler and the stop scanner, so they
+    // apply unchanged.
     if req.tools.is_some() || req.tool_choice.is_some() {
         return Err(refuse(
-            "`tools` and `tool_choice` are not supported with images: the image prompt is not rendered through the chat template",
+            "`tools` and `tool_choice` are not supported with images: the image chat template has no tool branch",
         ));
     }
-    if message.role != "user" {
-        return Err(refuse(
-            "the message that carries images must be a user message",
-        ));
+    let mut urls = Vec::new();
+    let mut turns = Vec::with_capacity(req.messages.len());
+    for message in &req.messages {
+        if message.role == "tool" || message.tool_calls.is_some() {
+            return Err(refuse(
+                "tool calls and tool results are not supported with images: the image chat template has no tool branch",
+            ));
+        }
+        let image_parts = message
+            .non_text_parts
+            .iter()
+            .filter(|part| is_image_part(part))
+            .count();
+        if image_parts != message.image_urls.len() {
+            return Err(refuse("an image part carries no `image_url`"));
+        }
+        urls.extend(message.image_urls.iter().cloned());
+        turns.push(ImageTurn {
+            role: message.role.clone(),
+            images: message.image_urls.len(),
+            text: message.content.clone().unwrap_or_default(),
+        });
     }
-    let image_parts = message
-        .non_text_parts
-        .iter()
-        .filter(|part| is_image_part(part))
-        .count();
-    if image_parts != message.image_urls.len() {
-        return Err(refuse("an image part carries no `image_url`"));
-    }
-    let question = message.content.as_deref().unwrap_or_default();
-    let prepared = images
-        .prepare(&message.image_urls, question)
-        .map_err(|error| match error {
-            ImageError::Refused(refused) => anyhow::Error::new(refused),
-            ImageError::Failed(reason) => anyhow::anyhow!(reason),
-        })?;
+    let prepared = images.prepare(&urls, turns).map_err(|error| match error {
+        ImageError::Refused(refused) => anyhow::Error::new(refused),
+        ImageError::Failed(reason) => anyhow::anyhow!(reason),
+    })?;
     Ok(PromptInput::Multimodal {
         tokens: prepared.prompt,
-        embeds: prepared.embeds,
+        rows: PromptRows {
+            embeds: prepared.embeds,
+            mrope: prepared.mrope,
+        },
     })
 }
 
@@ -548,16 +554,23 @@ pub(crate) fn handle_completion(
     Ok(serde_json::to_string(&resp)?)
 }
 
-/// Render a chat request into its prompt and the assistant turn-end stop markers: the model's jinja
-/// `chat_template` when it ships one, else the per-arch `ChatFormat`. Shared by the stream and non-stream
-/// paths. The prompt must come from the model's own template; wrong markup degrades output and the
-/// turn-end never matches.
-pub(crate) fn chat_prompt_and_stops(handle: &ModelHandle, req: &ChatReq) -> (String, Vec<String>) {
+/// Render a chat request into its prompt and the assistant turn-end stop markers: the jinja chat template
+/// (the checkpoint's, or the `--chat-template` given at startup) when there is one, else the per-arch
+/// `ChatFormat`. Shared by the stream and non-stream paths. The prompt must come from the template; wrong
+/// markup degrades output and the turn-end never matches. A startup override that fails to render the
+/// conversation refuses the request rather than answering in another format.
+pub(crate) fn chat_prompt_and_stops(
+    handle: &ModelHandle,
+    req: &ChatReq,
+) -> Result<(String, Vec<String>)> {
     // Pass the full message objects (role, content, tool_calls, tool_call_id, name) so multi-turn tool
     // conversations render through the template's tool-history branch.
     let msgs = serde_json::to_value(&req.messages).unwrap_or(serde_json::Value::Null);
-    let rendered = handle.text().render_chat_value(&msgs, req.tools.as_ref());
-    (rendered.prompt, rendered.stops)
+    let rendered = handle
+        .text()
+        .render_chat_value(&msgs, req.tools.as_ref())
+        .map_err(|e| anyhow::Error::new(RefusedRequest(format!("{e:#}"))))?;
+    Ok((rendered.prompt, rendered.stops))
 }
 
 /// `/v1/chat/completions` (non-streaming): render the conversation, generate the assistant turn, and trim

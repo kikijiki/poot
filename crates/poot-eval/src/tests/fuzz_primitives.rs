@@ -171,7 +171,7 @@ fn fuzz_reduce_all_axes_and_keepdim() {
                     let g = b.finish(r);
                     let mut inp = HashMap::new();
                     inp.insert(
-                        x.id,
+                        x.id(),
                         Value::from(HostTensor::f32(shape.to_vec(), xd.clone())),
                     );
                     let got = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -247,11 +247,11 @@ fn fuzz_matmul_random_shapes() {
         let g = bld.finish(out);
         let mut inp = HashMap::new();
         inp.insert(
-            av.id,
+            av.id(),
             Value::from(HostTensor::f32(a_shape.to_vec(), ad.clone())),
         );
         inp.insert(
-            bv.id,
+            bv.id(),
             Value::from(HostTensor::f32(b_shape.to_vec(), bd.clone())),
         );
         let got = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -326,7 +326,7 @@ fn fuzz_transpose_correctness() {
         let g = bld.finish(t);
         let mut inp = HashMap::new();
         inp.insert(
-            x.id,
+            x.id(),
             Value::from(HostTensor::f32(shape.to_vec(), xd.clone())),
         );
         let got = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -392,7 +392,7 @@ fn fuzz_broadcast_correctness() {
         let g = bld.finish(y);
         let mut inp = HashMap::new();
         inp.insert(
-            x.id,
+            x.id(),
             Value::from(HostTensor::f32(in_shape.to_vec(), xd.clone())),
         );
         let got = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -440,7 +440,10 @@ fn fuzz_elementwise_correctness() {
             let y = bld.unary(UnOp::Neg, x);
             let g = bld.finish(y);
             let mut inp = HashMap::new();
-            inp.insert(x.id, Value::from(HostTensor::f32(vec![width], xd.clone())));
+            inp.insert(
+                x.id(),
+                Value::from(HostTensor::f32(vec![width], xd.clone())),
+            );
             let got = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
                 .map(|r| {
                     r.output
@@ -465,7 +468,10 @@ fn fuzz_elementwise_correctness() {
             let y = bld.unary(UnOp::Exp, x);
             let g = bld.finish(y);
             let mut inp = HashMap::new();
-            inp.insert(x.id, Value::from(HostTensor::f32(vec![width], xd.clone())));
+            inp.insert(
+                x.id(),
+                Value::from(HostTensor::f32(vec![width], xd.clone())),
+            );
             let got = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
                 .map(|r| {
                     r.output
@@ -497,7 +503,10 @@ fn fuzz_elementwise_correctness() {
             let y = bld.unary(op, x);
             let g = bld.finish(y);
             let mut inp = HashMap::new();
-            inp.insert(x.id, Value::from(HostTensor::f32(vec![width], xd.clone())));
+            inp.insert(
+                x.id(),
+                Value::from(HostTensor::f32(vec![width], xd.clone())),
+            );
             let got = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
                 .map(|r| {
                     r.output
@@ -534,8 +543,14 @@ fn fuzz_elementwise_correctness() {
             let r = bld.binary(*op, av, bv);
             let g = bld.finish(r);
             let mut inp = HashMap::new();
-            inp.insert(av.id, Value::from(HostTensor::f32(vec![width], ad.clone())));
-            inp.insert(bv.id, Value::from(HostTensor::f32(vec![width], bd.clone())));
+            inp.insert(
+                av.id(),
+                Value::from(HostTensor::f32(vec![width], ad.clone())),
+            );
+            inp.insert(
+                bv.id(),
+                Value::from(HostTensor::f32(vec![width], bd.clone())),
+            );
             let got = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
                 .map(|r| {
                     r.output
@@ -588,7 +603,7 @@ fn fuzz_softmax_vs_independent_formula() {
         let g = bld.finish(s);
         let mut inp = HashMap::new();
         inp.insert(
-            x.id,
+            x.id(),
             Value::from(HostTensor::f32(shape.to_vec(), xd.clone())),
         );
         let got = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -646,7 +661,10 @@ fn softmax_stays_accurate_at_extreme_score_magnitude() {
     let s = softmax(&b, x);
     let g = b.finish(s);
     let mut inp = HashMap::new();
-    inp.insert(x.id, Value::from(HostTensor::f32(vec![l], scores.clone())));
+    inp.insert(
+        x.id(),
+        Value::from(HostTensor::f32(vec![l], scores.clone())),
+    );
     let two_pass = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
         .map(|r| {
             r.output

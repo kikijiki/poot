@@ -1,6 +1,7 @@
 //! B2 sliding-window attention oracle, gemma3 per-layer mask selection, softcap config wiring.
 
 use crate::{EvalBudget, EvalError, EvalOptions, Value};
+use poot_graph_ir::ValueId;
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::ops::attention_prefill;
 use poot_graph_ir::types::TensorType;
@@ -35,10 +36,10 @@ fn eval_prefill_attn(
     let out = attention_prefill(&b, q, k, v, n_rep, scale, mask);
     let g = b.finish(out);
     let mut inputs = HashMap::new();
-    inputs.insert(q.id, HostTensor::f32(vec![1, hq, l, d], q_data));
-    inputs.insert(k.id, HostTensor::f32(vec![1, hkv, l, d], k_data));
-    inputs.insert(v.id, HostTensor::f32(vec![1, hkv, l, d], v_data));
-    inputs.insert(mask.id, HostTensor::f32(vec![1, 1, l, l], mask_data));
+    inputs.insert(q.id(), HostTensor::f32(vec![1, hq, l, d], q_data));
+    inputs.insert(k.id(), HostTensor::f32(vec![1, hkv, l, d], k_data));
+    inputs.insert(v.id(), HostTensor::f32(vec![1, hkv, l, d], v_data));
+    inputs.insert(mask.id(), HostTensor::f32(vec![1, 1, l, l], mask_data));
     let out_t = (|| -> Result<HostTensor, EvalError> {
         let values: HashMap<_, Value> = inputs
             .iter()
@@ -246,10 +247,10 @@ fn causal_mask_from_pos_matches_host_built_mask_row_table() {
         let b = Builder::new();
         let pos = b.slot(Slot::Pos, TensorType::new(vec![1, 1], DType::I32));
         let mask = poot_graph_ir::ops::causal_mask_from_pos(&b, pos, cap, window);
-        let posi = pos.id;
+        let posi = pos.id();
         let g = b.finish(mask);
 
-        let mut inputs: HashMap<usize, Value> = HashMap::new();
+        let mut inputs: HashMap<ValueId, Value> = HashMap::new();
         inputs.insert(
             posi,
             HostTensor::i32(vec![1, 1], vec![position as i32]).into(),
@@ -311,10 +312,10 @@ fn causal_mask_from_pos_prefill_shape_matches_visibility_pattern_and_flushes_eit
         let b = Builder::new();
         let pos = b.slot(Slot::Pos, TensorType::new(vec![1, l], DType::I32));
         let mask = poot_graph_ir::ops::causal_mask_from_pos(&b, pos, l, window);
-        let posi = pos.id;
+        let posi = pos.id();
         let g = b.finish(mask);
 
-        let mut inputs: HashMap<usize, Value> = HashMap::new();
+        let mut inputs: HashMap<ValueId, Value> = HashMap::new();
         inputs.insert(
             posi,
             HostTensor::i32(vec![1, l], (0..l as i32).collect()).into(),
@@ -473,7 +474,7 @@ pub(super) fn run_step(
 ) -> (HostTensor, Vec<HostTensor>) {
     use poot_graph_ir::{Slot, Storage};
 
-    let mut inputs: HashMap<usize, Value> = HashMap::new();
+    let mut inputs: HashMap<ValueId, Value> = HashMap::new();
     for &id in &g.inputs {
         let m = g.meta(id);
         let shape = m.aval.shape.clone();

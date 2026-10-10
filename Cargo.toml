@@ -100,6 +100,8 @@ syn = { version = "2", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"
 thiserror = "2.0"
+# The one file mapping behind `poot_quant::StoredBytes` (ADR-0103 amendment, POOT-1099): owns mmap/munmap/madvise.
+memmap2 = "0.9"
 # Command-line parsing for the binaries (`poot-serve`, `poot-orchestrator`): one requirement string.
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"

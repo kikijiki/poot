@@ -1,17 +1,12 @@
-//! Card 543 SC-001 (the GGUF loader RSS gate): reading a real Q4_K_M or Q8_0 GGUF through
-//! [`poot_load::gguf::read_gguf`] alone peaks at no more than 1.3x the file size in host RSS.
-//! `read_gguf` range-reads each tensor's own bytes into a [`poot_quant::weights::WeightStore`] with
-//! no widening (card 543); this proves that at the reader itself. The driver-level row
-//! (the GGUF load, packed storage end to end) is `poot-llm/tests/gguf_load_rss.rs`.
+//! Card 543 SC-001 (the GGUF loader RSS gate), restated for the mapped store (POOT-1099): reading a
+//! real Q4_K_M or Q8_0 GGUF through [`poot_load::gguf::read_gguf`] holds the file as one mapping, so
+//! the store's ANONYMOUS host memory (`RssAnon`) stays bookkeeping-sized - far below the file size -
+//! and the peak total RSS (`VmHWM`, which counts the mapped pages validation touched) stays within
+//! 1.3x the file size. The driver-level row is `poot-llm/tests/gguf_load_rss.rs`.
 //!
-//! Mutation (recorded here, never left in the tree; `crates/poot-load/src/gguf.rs`, `read_gguf`):
-//! reading the whole file into a buffer kept alive for the whole scan, alongside every range-read
-//! tensor buffer (the old `Gguf.bytes` field's lifetime), turns this row red for the Q4_K_M fixture:
-//! observed incremental peak RSS 1,006,071,808 bytes (~959.4 MiB) against the 655,597,257-byte
-//! (~625.2 MiB) limit (491,400,032-byte file x 1.3 + 16 MiB slack). Removing the extra whole-file
-//! read (the landed code) restores green: observed incremental peak 517,160,960 bytes (~493.1 MiB,
-//! ~1.05x file size) for Q4_K_M and 700,010,496 bytes (~667.6 MiB, ~1.04x file size) for Q8_0
-//! (675,710,816-byte file).
+//! Mutation (recorded here, never left in the tree; `crates/poot-quant/src/stored.rs`, `slice`):
+//! copying the sliced bytes into a new owned region makes every tensor an anonymous copy; the
+//! `RssAnon` row goes red (anonymous growth ~ the file size against the 64 MiB limit).
 
 fn proc_status_kib(field: &str) -> u64 {
     let status = std::fs::read_to_string("/proc/self/status").expect("read /proc/self/status");
@@ -32,14 +27,29 @@ impl poot_load::gguf::TensorNameMap for IdentityNames {
     }
 }
 
-fn assert_read_gguf_peaks_under_1_3x_file_size(path: &std::path::Path) {
+fn assert_read_gguf_maps_without_anonymous_copies(path: &std::path::Path) {
     let file_bytes = std::fs::metadata(path).expect("stat gguf file").len();
 
     let baseline_rss = proc_status_kib("VmRSS") * 1024;
-    let file = std::fs::File::open(path).expect("open gguf file");
-    let index = poot_load::gguf::GgufIndex::open(path).expect("open gguf index");
-    let store = poot_load::gguf::read_gguf(&index, &file, &IdentityNames).expect("read_gguf");
+    let baseline_anon = proc_status_kib("RssAnon") * 1024;
+    let file = poot_quant::StoredBytes::map(std::fs::File::open(path).expect("open gguf file"))
+        .expect("map gguf file");
+    let index = poot_load::gguf::GgufIndex::parse(&file).expect("parse gguf index");
+    let store = poot_load::gguf::read_gguf(
+        &index,
+        &file,
+        &IdentityNames,
+        poot_load::plan::default_workers(),
+    )
+    .expect("read_gguf");
     std::hint::black_box(&store);
+    let anon_growth = (proc_status_kib("RssAnon") * 1024).saturating_sub(baseline_anon);
+    const ANON_LIMIT: u64 = 64 * 1024 * 1024;
+    println!("anon_growth_bytes={anon_growth} anon_limit_bytes={ANON_LIMIT}");
+    assert!(
+        anon_growth <= ANON_LIMIT,
+        "anonymous host memory grew by {anon_growth} bytes for a {file_bytes}-byte mapped checkpoint"
+    );
     let peak_rss = proc_status_kib("VmHWM") * 1024;
     let incremental_peak = peak_rss.saturating_sub(baseline_rss);
     let limit = (file_bytes * 13 / 10) + 16 * 1024 * 1024; // 1.3x file size + slack
@@ -54,7 +64,7 @@ fn assert_read_gguf_peaks_under_1_3x_file_size(path: &std::path::Path) {
     );
 }
 
-/// Runs `assert_read_gguf_peaks_under_1_3x_file_size` in a freshly spawned copy of this test binary
+/// Runs `assert_read_gguf_maps_without_anonymous_copies` in a freshly spawned copy of this test binary
 /// (a clean RSS baseline), as `bf16_load_rss_gate.rs` does for the driver-level M4 gate.
 fn run_in_fresh_process(child_env: &str, test_name: &str, checkpoint: poot_test_util::Checkpoint) {
     let Some(path) = poot_test_util::model_path(checkpoint) else {
@@ -62,7 +72,7 @@ fn run_in_fresh_process(child_env: &str, test_name: &str, checkpoint: poot_test_
     };
 
     if std::env::var_os(child_env).is_some() {
-        assert_read_gguf_peaks_under_1_3x_file_size(&path);
+        assert_read_gguf_maps_without_anonymous_copies(&path);
         return;
     }
 
@@ -83,19 +93,19 @@ fn run_in_fresh_process(child_env: &str, test_name: &str, checkpoint: poot_test_
 }
 
 #[test]
-fn read_gguf_of_q4_k_m_peaks_under_one_point_three_x_file_size_in_host_rss() {
+fn read_gguf_of_q4_k_m_maps_without_anonymous_copies() {
     run_in_fresh_process(
         "POOT_CARD543_RSS_CHILD_Q4KM",
-        "read_gguf_of_q4_k_m_peaks_under_one_point_three_x_file_size_in_host_rss",
+        "read_gguf_of_q4_k_m_maps_without_anonymous_copies",
         poot_test_util::checkpoint!("qwen2.5-0.5b-gguf/qwen2.5-0.5b-instruct-q4_k_m.gguf"),
     );
 }
 
 #[test]
-fn read_gguf_of_q8_0_peaks_under_one_point_three_x_file_size_in_host_rss() {
+fn read_gguf_of_q8_0_maps_without_anonymous_copies() {
     run_in_fresh_process(
         "POOT_CARD543_RSS_CHILD_Q80",
-        "read_gguf_of_q8_0_peaks_under_one_point_three_x_file_size_in_host_rss",
+        "read_gguf_of_q8_0_maps_without_anonymous_copies",
         poot_test_util::checkpoint!("qwen2.5-0.5b-gguf/qwen2.5-0.5b-instruct-q8_0.gguf"),
     );
 }

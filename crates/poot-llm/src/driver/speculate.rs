@@ -188,6 +188,15 @@ impl Speculation {
         }
     }
 
+    /// `seq` continues with a new prompt that shares its first `kept` positions with the old context:
+    /// the draft's K/V holds nothing valid past them.
+    pub(super) fn rewind(&mut self, seq: SeqId, kept: usize) {
+        if let Some(state) = self.seqs.get_mut(&seq) {
+            state.valid = state.valid.min(kept);
+            state.sampler = None;
+        }
+    }
+
     pub(super) fn close(&mut self, seq: SeqId) {
         self.seqs.remove(&seq);
     }

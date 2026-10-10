@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use poot_quant::StoredBytes;
 use poot_quant::format::WeightFormat;
 
 use crate::LoadError;
@@ -179,7 +180,7 @@ pub(crate) fn gguf_encode_value(val: &GgufValue) -> (u32, Vec<u8>) {
 }
 
 /// Build a GGUF v3 byte buffer from metadata KVs and tensors `(name, ggml-ne-dims, ggml_type,
-/// raw_bytes)`, the inverse of [`GgufIndex::from_bytes`] plus [`crate::gguf::read_gguf`]. Tensor data offsets are aligned to 32. A
+/// raw_bytes)`, the inverse of [`GgufIndex::parse`] plus [`crate::gguf::read_gguf`]. Tensor data offsets are aligned to 32. A
 /// fixture utility (poot is not a converter) for building small in-memory GGUFs in tests.
 pub fn write_gguf(
     kvs: &[(&str, GgufValue)],
@@ -225,8 +226,8 @@ pub fn write_gguf(
 }
 
 /// The result of parsing a GGUF header and tensor directory (magic through the last tensor info,
-/// data start aligned per `general.alignment`): the one binary-format parse [`GgufIndex::open`] and
-/// [`GgufIndex::from_bytes`] (header and directory only, dquant.md 8.1) build on.
+/// data start aligned per `general.alignment`): the one binary-format parse [`GgufIndex::parse`]
+/// (header and directory only, dquant.md 8.1) builds on.
 struct ParsedHeader {
     version: u32,
     metadata: HashMap<String, GgufValue>,
@@ -309,25 +310,6 @@ fn parse_header(bytes: &[u8]) -> Result<ParsedHeader, LoadError> {
     })
 }
 
-/// Reads at most 256 MB from the start of `path`: enough for any realistic GGUF header, including
-/// large tokenizer tables, without reading tensor data ([`GgufIndex::open`]).
-fn read_bounded_header(path: &std::path::Path) -> Result<Vec<u8>, LoadError> {
-    use std::io::Read;
-    let mut f =
-        std::fs::File::open(path).map_err(|e| gerr(&format!("open {}: {e}", path.display())))?;
-    let file_len = f
-        .metadata()
-        .map_err(|e| gerr(&format!("stat {}: {e}", path.display())))?
-        .len() as usize;
-    // Tokenizer tables are the largest header part (typically 5-20 MB for 200k-vocab models).
-    const MAX_HEADER: usize = 256 * 1024 * 1024;
-    let read_len = file_len.min(MAX_HEADER);
-    let mut bytes = vec![0u8; read_len];
-    f.read_exact(&mut bytes)
-        .map_err(|e| gerr(&format!("read header {}: {e}", path.display())))?;
-    Ok(bytes)
-}
-
 /// Every ggml tensor type id a GGUF file can name (0..=39, ggml.h's `ggml_type`), mapped to the
 /// [`WeightFormat`] poot reads it as, or `None` when poot has no packed or dense representation for
 /// it: a ggml id ggml itself no longer assigns (a removed legacy variant, e.g. `Q4_2`), or a real
@@ -383,10 +365,9 @@ pub fn weight_format_of(ggml_type: u32) -> Option<WeightFormat> {
 }
 
 /// A GGUF file's header and tensor directory, with no tensor data read (dquant.md 8.1): the metadata
-/// key-value table and the `(name, ggml type, ne, data offset)` of every tensor, bounded the same way
-/// as the 256 MB header read cap ([`read_bounded_header`]). [`crate::gguf::read_gguf`] range-reads each tensor's bytes from a
-/// separately opened [`std::fs::File`] using [`Self::data_start`], so nothing here keeps file
-/// contents resident once parsing returns.
+/// key-value table and the `(name, ggml type, ne, data offset)` of every tensor.
+/// [`crate::gguf::read_gguf`] slices each tensor's bytes out of the same [`StoredBytes`] using
+/// [`Self::data_start`]; nothing here copies file contents.
 pub struct GgufIndex {
     pub version: u32,
     pub metadata: HashMap<String, GgufValue>,
@@ -395,24 +376,11 @@ pub struct GgufIndex {
 }
 
 impl GgufIndex {
-    /// Header and directory only (bounded read; no tensor data).
-    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, LoadError> {
-        let path = path.as_ref();
-        let header = parse_header(&read_bounded_header(path)?)?;
-        Ok(Self {
-            version: header.version,
-            metadata: header.metadata,
-            tensors: header.tensors,
-            data_start: header.data_start,
-        })
-    }
-
-    /// Parse a GGUF header and tensor directory from an in-memory buffer, for a fixture or test that
-    /// already has the whole (small) GGUF in memory. `bytes` may hold only the header and tensor
-    /// table plus the tensor data (`crate::gguf::read_gguf` then range-reads directly from the same
-    /// buffer via its [`crate::gguf::GgufSource`] impl for `[u8]`); it never needs to be a real file.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, LoadError> {
-        let header = parse_header(bytes)?;
+    /// Parse a GGUF header and tensor directory from `file`, a mapping of a checkpoint or an in-memory
+    /// buffer (a fixture). Only the header pages are touched, so it also works on a partial download.
+    /// Header and tensor data come from the one `StoredBytes` that [`crate::gguf::read_gguf`] slices.
+    pub fn parse(file: &StoredBytes) -> Result<Self, LoadError> {
+        let header = parse_header(file.as_slice())?;
         Ok(Self {
             version: header.version,
             metadata: header.metadata,

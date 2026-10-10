@@ -13,6 +13,7 @@ use std::sync::Arc;
 use poot_graph_ir::{Graph, NoValidations, Storage, ValidationChannel, ValidationOutputs};
 use poot_models::model::{KvLayout, LogitRows, StepShape};
 use poot_models::registry::{RawConfig, Registry};
+use poot_quant::StoredBytes;
 use poot_quant::format::WeightFormat;
 use poot_quant::weights::{
     DenseWeight, WeightEntry, WeightKey, WeightMap, WeightStore, WeightView,
@@ -295,8 +296,8 @@ impl Dense {
         let mut store = WeightStore::builder();
         for (key, shape) in self.tensors() {
             let n: usize = shape.iter().product();
-            let dense =
-                DenseWeight::try_new(dtype, shape, Arc::from(vec![0u8; width * n])).unwrap();
+            let dense = DenseWeight::try_new(dtype, shape, StoredBytes::from(vec![0u8; width * n]))
+                .unwrap();
             store.insert(key, WeightEntry::Dense(dense)).unwrap();
         }
         self.register(store.build())
@@ -364,7 +365,7 @@ fn dense(dtype: DType, shape: Vec<usize>, values: &[f32]) -> WeightEntry {
             .collect(),
         other => panic!("fixture weights are F32 or BF16, not {other:?}"),
     };
-    WeightEntry::Dense(DenseWeight::try_new(dtype, shape, Arc::from(bytes)).unwrap())
+    WeightEntry::Dense(DenseWeight::try_new(dtype, shape, StoredBytes::from(bytes)).unwrap())
 }
 
 /// The weights `g` reads, as a store keyed by the const names `g` declares (what the CPU oracle

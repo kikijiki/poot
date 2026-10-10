@@ -33,8 +33,8 @@ pub(super) fn i32_constant(
         Storage::Const,
     )?;
     let mut prepared = b.preflight_append(plan)?;
-    let id = b.commit_append(&mut prepared)?;
-    debug_assert_eq!(id, value.id);
+    let committed = b.commit_append(&mut prepared)?;
+    debug_assert_eq!(committed.id(), value.id());
     Ok(value)
 }
 
@@ -58,7 +58,7 @@ pub(super) fn finish_with_state_and_validations(
             .map(|&(id, name, value)| ValidationOutput {
                 id,
                 name: name.to_owned(),
-                value: value.id,
+                value: value.id(),
             })
             .collect(),
     );

@@ -198,7 +198,7 @@ impl ScanFixture {
         );
         operands.push(s_in);
         let result = b.scan(self.attrs(), &operands);
-        let ids = operands.iter().map(|t| t.id).collect();
+        let ids = operands.iter().map(|t| t.id()).collect();
         let output = if packed { result.packed } else { result.y };
         let graph = b.finish_with_state(output, &[(s_in, result.s_out)]);
         ScanGraph {

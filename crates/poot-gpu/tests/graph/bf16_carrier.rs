@@ -28,14 +28,14 @@ fn bf16_host_tensor_binds_to_the_oracle_and_wgpu_without_widening() {
     let reads_before = poot_tensor::read_counter::reads();
     let oracle = eval(
         &g,
-        &HashMap::from([(x.id, Value::from(input.clone()))]),
+        &HashMap::from([(x.id(), Value::from(input.clone()))]),
         EvalOptions::new(EvalBudget::UNBOUNDED),
     )
     .unwrap()
     .output
     .into_host()
     .unwrap();
-    let got = run_via_contract(&mut gpu, target, &g, &HashMap::from([(x.id, input)]));
+    let got = run_via_contract(&mut gpu, target, &g, &HashMap::from([(x.id(), input)]));
 
     assert_eq!(
         poot_tensor::read_counter::reads() - reads_before,

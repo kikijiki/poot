@@ -28,7 +28,7 @@ cargo run -p poot-serve --release -- ~/models/qwen2.5-0.5b
 
 If you omit the address, poot-serve binds `127.0.0.1:8080`. If you omit the model path, it falls back to a
 developer-local `qwen2.5-0.5b` path, so always pass one. `--release` keeps model loading usable: debug
-builds are 10-50x slower. The server has no `--backend` option; see [Picking a backend](./choosing-a-backend.md).
+builds are 10-50x slower. `--backend` picks the device; see [Picking a backend](./choosing-a-backend.md).
 
 ## 3. Check it, then call it
 
@@ -52,10 +52,10 @@ curl http://localhost:8080/v1/completions \
   DeepSeek-V2/V3/V3.2, Nemotron-H, Qwen3-Next, Qwen3.8-Flash-Next), BERT-class encoders (all-MiniLM, E5, BGE) and cross-encoders (ms-marco-MiniLM).
   A decoder serves generation from the scheduling loop, and its embeddings, reranking and LoRA routes run on the
   same engine thread.
-- A checkpoint whose family the registry does not know, SmolVLM / idefics3 among them, is refused at
-  startup with the registry's error naming its `model_type`. SmolVLM runs through the library (`poot-caption`).
+- A checkpoint whose family the registry does not know is refused at startup with the registry's error naming its
+  `model_type`. SmolVLM and Qwen2.5-VL checkpoints are served with image input ([Multimodal](./multimodal.md)).
 
 ## Next steps
 
 - [Embeddings and reranking](./embeddings-and-reranking.md) for what the server serves today.
-- [Configuration reference](./configuration.md) for the options and environment variables.
+- [Configuration reference](./configuration.md) for every option.

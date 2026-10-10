@@ -11,7 +11,208 @@ use crate::rope_table::{self, RopeSpec, RopeTable};
 use crate::types::{DType, Scalar, TensorType};
 
 /// An SSA value: an index into [`Graph::values`] (the jaxpr `Var`, an arena index not object identity).
-pub type ValueId = usize;
+///
+/// A newtype over `u32`, so an arbitrary `usize` (an equation index, a dimension, an element count)
+/// cannot be passed where a value is meant, and a value cannot be used to index anything but a
+/// [`ValueTable`].
+///
+/// ```compile_fail,E0308
+/// use poot_graph_ir::ValueId;
+///
+/// fn takes_value(_: ValueId) {}
+/// takes_value(3usize);
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ValueId(u32);
+
+impl ValueId {
+    /// The value at table position `index`.
+    pub const fn new(index: u32) -> ValueId {
+        ValueId(index)
+    }
+
+    /// The position of this value in [`Graph::values`].
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+
+    /// The value at table position `index`, or `None` when `index` is past the `u32` id space.
+    pub fn from_index(index: usize) -> Option<ValueId> {
+        u32::try_from(index).ok().map(ValueId)
+    }
+}
+
+impl fmt::Display for ValueId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "v{}", self.0)
+    }
+}
+
+impl fmt::Debug for ValueId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+/// A table indexed by [`ValueId`]: the value table of a [`Graph`], and every per-value side table a
+/// pass keeps beside it. The only way to index it is with a `ValueId`, and the only way to grow it
+/// is [`ValueTable::push`], which mints the id of the new entry.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ValueTable<T> {
+    entries: Vec<T>,
+}
+
+impl<T> ValueTable<T> {
+    pub const fn new() -> Self {
+        ValueTable {
+            entries: Vec::new(),
+        }
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        ValueTable {
+            entries: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// A table of `len` copies of `fill`, one per value id `0..len`.
+    pub fn filled(len: usize, fill: T) -> Self
+    where
+        T: Clone,
+    {
+        ValueTable {
+            entries: vec![fill; len],
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The id the next [`ValueTable::push`] mints, or `None` when the `u32` id space is full.
+    pub fn next_id(&self) -> Option<ValueId> {
+        ValueId::from_index(self.entries.len())
+    }
+
+    /// Append `entry` and return the id it is addressed by.
+    ///
+    /// # Panics
+    /// When the table already holds `2^32` entries: callers that stage ids from outside check
+    /// [`ValueTable::next_id`] first.
+    pub fn push(&mut self, entry: T) -> ValueId {
+        let id = self
+            .next_id()
+            .expect("a value table holds at most 2^32 entries");
+        self.entries.push(entry);
+        id
+    }
+
+    pub fn get(&self, id: ValueId) -> Option<&T> {
+        self.entries.get(id.index())
+    }
+
+    pub fn get_mut(&mut self, id: ValueId) -> Option<&mut T> {
+        self.entries.get_mut(id.index())
+    }
+
+    pub fn contains(&self, id: ValueId) -> bool {
+        id.index() < self.entries.len()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, T> {
+        self.entries.iter()
+    }
+
+    pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, T> {
+        self.entries.iter_mut()
+    }
+
+    /// Every entry with the id it is addressed by, in id order.
+    pub fn iter_enumerated(&self) -> impl ExactSizeIterator<Item = (ValueId, &T)> + '_ {
+        self.entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (ValueId(index as u32), entry))
+    }
+
+    /// Every id of this table, in order.
+    pub fn ids(&self) -> impl ExactSizeIterator<Item = ValueId> + use<T> {
+        (0..self.entries.len() as u32).map(ValueId)
+    }
+
+    pub fn truncate(&mut self, len: usize) {
+        self.entries.truncate(len);
+    }
+
+    /// Remove the newest entry and return it with the id it was addressed by.
+    pub fn pop_last(&mut self) -> Option<(ValueId, T)> {
+        let entry = self.entries.pop()?;
+        Some((ValueId(self.entries.len() as u32), entry))
+    }
+
+    pub fn try_reserve(
+        &mut self,
+        additional: usize,
+    ) -> Result<(), std::collections::TryReserveError> {
+        self.entries.try_reserve(additional)
+    }
+}
+
+impl<T> Default for ValueTable<T> {
+    fn default() -> Self {
+        ValueTable::new()
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for ValueTable<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(&self.entries).finish()
+    }
+}
+
+impl<T> std::ops::Index<ValueId> for ValueTable<T> {
+    type Output = T;
+
+    fn index(&self, id: ValueId) -> &T {
+        &self.entries[id.index()]
+    }
+}
+
+impl<T> std::ops::IndexMut<ValueId> for ValueTable<T> {
+    fn index_mut(&mut self, id: ValueId) -> &mut T {
+        &mut self.entries[id.index()]
+    }
+}
+
+impl<T> FromIterator<T> for ValueTable<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        ValueTable {
+            entries: iter.into_iter().collect(),
+        }
+    }
+}
+
+impl<T> IntoIterator for ValueTable<T> {
+    type Item = T;
+    type IntoIter = std::vec::IntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.into_iter()
+    }
+}
+
+impl<'a, T> IntoIterator for &'a ValueTable<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter()
+    }
+}
 
 /// A decoder-layer tag on an equation: the layer whose loop emitted it, as reported by
 /// [`crate::Builder::layer_scope`].
@@ -70,7 +271,10 @@ impl BoundaryId {
     /// The [`SlotKey`] a consuming stage binds this boundary under: [`Slot::Activation`] tagged with
     /// the boundary, so it never collides with the stage's own activation input.
     pub fn slot_key(self) -> SlotKey {
-        SlotKey::new(Slot::Activation, Some(&format!("boundary.{}", self.0)))
+        SlotKey::new(
+            Slot::Activation,
+            Some(&format!("boundary.{}", self.0.index())),
+        )
     }
 }
 
@@ -179,6 +383,13 @@ pub enum Slot {
     /// between slots), so a `Slot`, never a `Const`: the const cache keys by name + element count and would serve a
     /// stale table.
     ExpertPoolMap,
+    /// An expert table paged through a pool (POOT-746): one `[P, ..]` slot per pooled routed table
+    /// (a dense `[E, ..]` stack or one packed source role of it), declared by the pool pass in place of
+    /// the table's `Const` and tagged with that const's name. Unlike every other slot it is not written
+    /// from the step's inputs: it is resident for the executable's life and the expert-residency
+    /// manager refills one row at a time at a sync point. Several occurrences exist in one graph, one
+    /// per table, so the key is its tag, never the kind.
+    ExpertPool,
     /// Card 551a (R-551a-4): the sampler suffix's per-step inputs, declared through
     /// [`crate::builder::Builder::slot_named`] with one of the three fixed tags `seed`, `params` or
     /// `top_k` (never the untagged [`crate::builder::Builder::slot`] form - a graph's sampler suffix
@@ -207,6 +418,7 @@ impl Slot {
             Slot::TokenEmbed => "tokenembed",
             Slot::LoraIdx => "loraidx",
             Slot::ExpertPoolMap => "expertpoolmap",
+            Slot::ExpertPool => "expertpool",
             Slot::Sampler => "sampler",
         }
     }
@@ -224,6 +436,16 @@ pub enum Storage {
     Computed(ComputedConst),
     Slot(Slot),
     State,
+}
+
+impl Storage {
+    /// Whether the buffer holds a weight's stored bytes in the lane its readers' storage plan chose: a
+    /// `Const` uploaded once, or the resident [`Slot::ExpertPool`] a host refills row by row from the
+    /// same stored bytes. Lane decisions made for a weight (a packed BF16 table, a packed contraction
+    /// source) apply to both.
+    pub fn holds_weight_bytes(self) -> bool {
+        matches!(self, Storage::Const | Storage::Slot(Slot::ExpertPool))
+    }
 }
 
 /// A constant the compiler computes, not a checkpoint binder. The `fold_iota` transform turns a nullary
@@ -660,7 +882,7 @@ impl ValidationChannel for ValidationOutputs {
 /// ```
 #[derive(Clone, Debug)]
 pub struct Graph<V: ValidationChannel = NoValidations> {
-    pub values: Vec<ValueMeta>,
+    pub values: ValueTable<ValueMeta>,
     /// All input binders (consts + slots), in declaration order.
     pub inputs: Vec<ValueId>,
     /// The subset of `inputs` that are constants (weights/tables), for binding at close.
@@ -686,12 +908,12 @@ pub struct Graph<V: ValidationChannel = NoValidations> {
 impl Default for Graph {
     fn default() -> Self {
         Graph {
-            values: Vec::new(),
+            values: ValueTable::new(),
             inputs: Vec::new(),
             consts: Vec::new(),
             slots: Vec::new(),
             eqns: Vec::new(),
-            output: 0,
+            output: ValueId::new(0),
             validations: NoValidations,
             exports: Vec::new(),
             state: Vec::new(),
@@ -819,6 +1041,69 @@ impl<V: ValidationChannel> Graph<V> {
         })
     }
 
+    /// Turn the named `Const` input `value` into the resident [`Slot::ExpertPool`] of a pool of `rows`
+    /// rows: the leading axis shrinks to `rows`, the value keeps its id and dtype, and its identity is
+    /// the key tagged with the const's own name, which is returned. The const's name is therefore
+    /// still how the table is found in the weight map; only its role in the graph changes.
+    ///
+    /// # Panics
+    ///
+    /// When `value` is not a named `Const` input with a leading axis.
+    pub fn rebind_const_as_pool(&mut self, value: ValueId, rows: usize) -> SlotKey {
+        let meta = &mut self.values[value];
+        assert_eq!(
+            meta.storage,
+            Storage::Const,
+            "rebind_const_as_pool: {value} is not a const"
+        );
+        let tag = meta
+            .name
+            .clone()
+            .expect("rebind_const_as_pool: a const input carries its name");
+        let leading = meta
+            .aval
+            .shape
+            .first_mut()
+            .expect("rebind_const_as_pool: a pooled table has a leading expert axis");
+        *leading = rows;
+        let key = SlotKey::new(Slot::ExpertPool, Some(&tag));
+        meta.storage = Storage::Slot(Slot::ExpertPool);
+        meta.name = Some(key.to_string());
+        meta.key = Some(key.clone());
+        self.consts.retain(|&c| c != value);
+        self.slots.push((value, Slot::ExpertPool));
+        key
+    }
+
+    /// Declare a new keyed `slot` input of type `aval`, tagged `tag` like
+    /// [`crate::builder::Builder::slot_named`], and return its value. For a transform that rewrites a
+    /// finished graph and so has no builder: the key is built here, from typed data.
+    ///
+    /// # Panics
+    ///
+    /// When a slot of this kind and tag is already declared.
+    pub fn declare_slot(&mut self, slot: Slot, tag: &str, aval: TensorType) -> ValueId {
+        let key = SlotKey::new(slot, Some(tag));
+        let name = key.to_string();
+        assert!(
+            !self
+                .values
+                .iter()
+                .any(|v| v.storage == Storage::Slot(slot) && v.name.as_deref() == Some(&name)),
+            "declare_slot: duplicate tag {tag:?} for slot {slot:?}"
+        );
+        let id = self.values.push(ValueMeta {
+            aval,
+            storage: Storage::Slot(slot),
+            name: Some(name),
+            key: Some(key),
+            state_role: None,
+        });
+        self.inputs.push(id);
+        self.slots.push((id, slot));
+        id
+    }
+
     pub fn observable_values(&self) -> impl Iterator<Item = ValueId> + '_ {
         std::iter::once(self.output)
             .chain(self.validation_outputs().iter().map(|output| output.value))
@@ -862,14 +1147,14 @@ impl<V: ValidationChannel> Graph<V> {
     /// Validate basic SSA and binding-table well-formedness. Cheap structural check.
     pub fn validate(&self) -> Result<(), GraphValidationError> {
         let n = self.values.len();
-        if self.output >= n {
+        if !self.values.contains(self.output) {
             return Err(GraphValidationError::OutputNotDefined { value: self.output });
         }
         let validations = self.validation_outputs();
         let mut validation_ids = HashSet::with_capacity(validations.len());
         let mut validation_names = HashSet::with_capacity(validations.len());
         for validation in validations {
-            if validation.value >= n {
+            if !self.values.contains(validation.value) {
                 return Err(GraphValidationError::ValidationValueOutOfRange {
                     value: validation.value,
                     value_count: n,
@@ -890,7 +1175,7 @@ impl<V: ValidationChannel> Graph<V> {
         // The packet layout checks each validation value's F32 dtype, static shape, and payload bound.
         ValidationPacketLayout::for_outputs(&self.values, validations)?;
         for &(state_input, state_output) in &self.state {
-            if state_input >= n || state_output >= n {
+            if !self.values.contains(state_input) || !self.values.contains(state_output) {
                 return Err(GraphValidationError::StatePairOutOfRange {
                     state_input,
                     state_output,
@@ -900,7 +1185,7 @@ impl<V: ValidationChannel> Graph<V> {
         }
         let mut export_ids = HashSet::with_capacity(self.exports.len());
         for export in &self.exports {
-            if export.value >= n {
+            if !self.values.contains(export.value) {
                 return Err(GraphValidationError::ExportValueOutOfRange {
                     id: export.id,
                     value: export.value,
@@ -913,9 +1198,9 @@ impl<V: ValidationChannel> Graph<V> {
         }
         // Input binders are defined up front. Binding tables are an executor-facing contract, so validate them before
         // equation inspection can follow malformed metadata.
-        let mut input_bindings = vec![false; n];
+        let mut input_bindings = ValueTable::filled(n, false);
         for &id in &self.inputs {
-            if id >= n {
+            if !self.values.contains(id) {
                 return Err(GraphValidationError::InputOutOfRange {
                     value: id,
                     value_count: n,
@@ -930,9 +1215,9 @@ impl<V: ValidationChannel> Graph<V> {
             input_bindings[id] = true;
         }
 
-        let mut const_bindings = vec![false; n];
+        let mut const_bindings = ValueTable::filled(n, false);
         for &id in &self.consts {
-            if id >= n {
+            if !self.values.contains(id) {
                 return Err(GraphValidationError::ConstOutOfRange {
                     value: id,
                     value_count: n,
@@ -956,9 +1241,9 @@ impl<V: ValidationChannel> Graph<V> {
             const_bindings[id] = true;
         }
 
-        let mut slot_bindings = vec![false; n];
+        let mut slot_bindings = ValueTable::filled(n, false);
         for &(id, slot) in &self.slots {
-            if id >= n {
+            if !self.values.contains(id) {
                 return Err(GraphValidationError::SlotOutOfRange {
                     value: id,
                     value_count: n,
@@ -999,7 +1284,7 @@ impl<V: ValidationChannel> Graph<V> {
         // Every `Storage::State` value carries a `StateRole`, and no other value does (R-644-1): checked over
         // every value, not just the pairs in `self.state`, so an orphaned state binder (rejected below by
         // `StateInputNotInput`) still gets a role check first, in id order.
-        for (id, meta) in self.values.iter().enumerate() {
+        for (id, meta) in self.values.iter_enumerated() {
             match (meta.storage, meta.state_role) {
                 (Storage::State, None) => {
                     return Err(GraphValidationError::MissingStateRole { value: id });
@@ -1028,7 +1313,7 @@ impl<V: ValidationChannel> Graph<V> {
         // State metadata is an executor-facing table like inputs, consts, and slots. Validate every property
         // independent of equation production before walking equations, so malformed state declarations take
         // deterministic precedence over unrelated equation defects.
-        let mut state_destinations = vec![false; n];
+        let mut state_destinations = ValueTable::filled(n, false);
         for &(state_input, state_output) in &self.state {
             if state_destinations[state_input] {
                 return Err(GraphValidationError::DuplicateStateDestination { value: state_input });
@@ -1060,7 +1345,7 @@ impl<V: ValidationChannel> Graph<V> {
         // still proves SSA order.
         let mut bound_or_produced = input_bindings.clone();
         for (i, eqn) in self.eqns.iter().enumerate() {
-            if eqn.out >= n {
+            if !self.values.contains(eqn.out) {
                 return Err(GraphValidationError::EquationOutputOutOfRange {
                     equation: i,
                     operation: eqn.op.name(),
@@ -1103,7 +1388,7 @@ impl<V: ValidationChannel> Graph<V> {
             for op in &eqn.inputs {
                 match op {
                     Operand::Value(v) => {
-                        if *v >= n || !defined[*v] {
+                        if !self.values.contains(*v) || !defined[*v] {
                             return Err(GraphValidationError::EquationOperandNotDefined {
                                 equation: i,
                                 value: *v,
@@ -1162,7 +1447,7 @@ impl ValidationPacketLayout {
     }
 
     fn for_outputs(
-        values: &[ValueMeta],
+        values: &ValueTable<ValueMeta>,
         validations: &[ValidationOutput],
     ) -> Result<Self, GraphValidationError> {
         let mut entries = Vec::with_capacity(validations.len());
@@ -1283,7 +1568,7 @@ impl<V: ValidationChannel> fmt::Display for Graph<V> {
                 Some(InputKey::Slot(key)) => key,
                 _ => SlotKey::new(*slot, None),
             };
-            writeln!(f, "    v{id} : {} = slot {key}", self.values[*id].aval)?;
+            writeln!(f, "    {id} : {} = slot {key}", self.values[*id].aval)?;
         }
         writeln!(
             f,
@@ -1293,13 +1578,13 @@ impl<V: ValidationChannel> fmt::Display for Graph<V> {
         writeln!(f, "  // body ({} eqns):", self.eqns.len())?;
         for eqn in &self.eqns {
             let outm = &self.values[eqn.out];
-            write!(f, "    v{} : {} = {} (", eqn.out, outm.aval, eqn.op.name())?;
+            write!(f, "    {} : {} = {} (", eqn.out, outm.aval, eqn.op.name())?;
             for (i, inp) in eqn.inputs.iter().enumerate() {
                 if i > 0 {
                     write!(f, ", ")?;
                 }
                 match inp {
-                    Operand::Value(id) => write!(f, "v{id}")?,
+                    Operand::Value(id) => write!(f, "{id}")?,
                     Operand::Lit(s) => write!(f, "{s}")?,
                 }
             }
@@ -1308,14 +1593,14 @@ impl<V: ValidationChannel> fmt::Display for Graph<V> {
                 None => writeln!(f, ")")?,
             }
         }
-        writeln!(f, "  output: v{} : {}", self.output, self.aval(self.output))?;
+        writeln!(f, "  output: {} : {}", self.output, self.aval(self.output))?;
         let validations = self.validation_outputs();
         if !validations.is_empty() {
             writeln!(f, "  // validations (in declaration order):")?;
             for validation in validations {
                 writeln!(
                     f,
-                    "  validation {:?} {:?}: v{} : {}",
+                    "  validation {:?} {:?}: {} : {}",
                     validation.id,
                     validation.name,
                     validation.value,
@@ -1328,7 +1613,7 @@ impl<V: ValidationChannel> fmt::Display for Graph<V> {
             for pair in self.state_pairs() {
                 writeln!(
                     f,
-                    "    v{} : {} <- v{}  [{:?}]",
+                    "    {} : {} <- {}  [{:?}]",
                     pair.input, self.values[pair.input].aval, pair.output, pair.role
                 )?;
             }
@@ -1402,10 +1687,10 @@ mod tests {
         (
             graph,
             BindingFixtureIds {
-                weight: weight.id,
-                first_pool: first_pool.id,
-                first_state: first_state.id,
-                output: output.id,
+                weight: weight.id(),
+                first_pool: first_pool.id(),
+                first_state: first_state.id(),
+                output: output.id(),
             },
         )
     }
@@ -1507,17 +1792,15 @@ mod tests {
         let mut graph = b.finish(primary).with_validations(vec![ValidationOutput {
             id: ValidationId(1),
             name: "range".into(),
-            value: usize::MAX,
+            value: ValueId::new(u32::MAX),
         }]);
         assert!(matches!(
             graph.validate(),
-            Err(GraphValidationError::ValidationValueOutOfRange {
-                value: usize::MAX,
-                ..
-            })
+            Err(GraphValidationError::ValidationValueOutOfRange { value, .. })
+                if value == ValueId::new(u32::MAX)
         ));
 
-        graph.validations.0[0].value = graph.values.len();
+        graph.validations.0[0].value = ValueId::from_index(graph.values.len()).unwrap();
         graph.values.push(ValueMeta {
             aval: TensorType::f32([1]),
             storage: Storage::Device,
@@ -1537,8 +1820,8 @@ mod tests {
         let primary = b.constant("primary", TensorType::f32([1]));
         let witness = b.constant("witness", TensorType::f32([1]));
         let cases = [
-            (ValidationId(1), "", witness.id),
-            (ValidationId(1), "same", witness.id),
+            (ValidationId(1), "", witness.id()),
+            (ValidationId(1), "same", witness.id()),
         ];
         let mut graph = b.finish(primary).with_validations(
             cases
@@ -1579,7 +1862,7 @@ mod tests {
                 id: ValidationId(1),
                 value,
                 actual: DType::I32,
-            }) if value == witness.id
+            }) if value == witness.id()
         ));
 
         let b = Builder::new();
@@ -1621,7 +1904,7 @@ mod tests {
             Err(GraphValidationError::EmptyValidationValue {
                 id: ValidationId(1),
                 value,
-            }) if value == witness.id
+            }) if value == witness.id()
         ));
 
         let b = Builder::new();
@@ -1633,7 +1916,7 @@ mod tests {
                 id: ValidationId(1),
                 value,
                 ..
-            }) if value == witness.id
+            }) if value == witness.id()
         ));
 
         let b = Builder::new();
@@ -1744,16 +2027,18 @@ mod tests {
             let (mut graph, ids) = binding_fixture();
             let expected = match corruption {
                 Corruption::ConstIdOutOfRange => {
-                    graph.consts.push(usize::MAX);
+                    graph.consts.push(ValueId::new(u32::MAX));
                     GraphValidationError::ConstOutOfRange {
-                        value: usize::MAX,
+                        value: ValueId::new(u32::MAX),
                         value_count: graph.values.len(),
                     }
                 }
                 Corruption::SlotIdOutOfRange => {
-                    graph.slots.push((usize::MAX, Slot::ExpertPoolMap));
+                    graph
+                        .slots
+                        .push((ValueId::new(u32::MAX), Slot::ExpertPoolMap));
                     GraphValidationError::SlotOutOfRange {
-                        value: usize::MAX,
+                        value: ValueId::new(u32::MAX),
                         value_count: graph.values.len(),
                     }
                 }
@@ -1851,12 +2136,12 @@ mod tests {
         let b = Builder::new();
         let output = b.constant("output", TensorType::f32(vec![1]));
         let mut graph = b.finish(output);
-        graph.inputs.push(usize::MAX);
+        graph.inputs.push(ValueId::new(u32::MAX));
 
         assert_eq!(
             graph.validate(),
             Err(GraphValidationError::InputOutOfRange {
-                value: usize::MAX,
+                value: ValueId::new(u32::MAX),
                 value_count: graph.values.len(),
             })
         );
@@ -1884,9 +2169,9 @@ mod tests {
         ] {
             let (graph, ids) = binding_fixture();
             let mut graph = graph.with_validations(Vec::new());
-            graph.eqns[0].inputs[0] = Operand::Value(usize::MAX);
+            graph.eqns[0].inputs[0] = Operand::Value(ValueId::new(u32::MAX));
             // An in-range, correctly typed value with neither an input binder nor a producer.
-            let undefined = graph.values.len();
+            let undefined = ValueId::from_index(graph.values.len()).unwrap();
             graph.values.push(ValueMeta {
                 aval: TensorType::f32([1]),
                 storage: Storage::Device,
@@ -1952,12 +2237,12 @@ mod tests {
         let state = b.state_input("state", TensorType::f32(vec![1]), StateRole::Recurrent);
         let output = b.constant("output", TensorType::f32(vec![1]));
         let mut graph = b.finish_with_state(output, &[(state, output)]);
-        graph.inputs.retain(|&id| id != state.id);
-        graph.consts.retain(|&id| id != state.id);
+        graph.inputs.retain(|&id| id != state.id());
+        graph.consts.retain(|&id| id != state.id());
 
         assert_eq!(
             graph.validate(),
-            Err(GraphValidationError::StateInputNotInput { value: state.id })
+            Err(GraphValidationError::StateInputNotInput { value: state.id() })
         );
     }
 
@@ -1975,7 +2260,7 @@ mod tests {
         assert_eq!(
             graph.validate(),
             Err(GraphValidationError::StateRoleAxis {
-                value: state.id,
+                value: state.id(),
                 axis: 4,
                 rank: 4,
             })
@@ -1990,7 +2275,7 @@ mod tests {
         let mut g = b.finish(out);
         // Corrupt an equation's output id to point past the value table. validate() must return an Err, not panic on
         // the out-of-bounds `self.values[eqn.out]` index.
-        let bad = g.values.len() + 5;
+        let bad = ValueId::from_index(g.values.len() + 5).unwrap();
         g.eqns.last_mut().unwrap().out = bad;
         assert_eq!(
             g.validate(),
@@ -2018,7 +2303,7 @@ mod tests {
                 equation: 2,
                 value,
                 ..
-            }) if value == internal.id
+            }) if value == internal.id()
         ));
     }
 
@@ -2032,11 +2317,11 @@ mod tests {
         );
         let replacement = b.constant("replacement", TensorType::new(vec![2, 5], DType::E4M3FN));
         let mut g = b.finish_with_state(replacement, &[(state, replacement)]);
-        g.inputs.retain(|&id| id != state.id);
+        g.inputs.retain(|&id| id != state.id());
 
         assert_eq!(
             g.validate(),
-            Err(GraphValidationError::ConstNotInput { value: state.id })
+            Err(GraphValidationError::ConstNotInput { value: state.id() })
         );
     }
 
@@ -2049,7 +2334,7 @@ mod tests {
         g.eqns[0].inputs.swap(0, 1);
         // Card 149 deliberately makes literal-first Binary graph-valid. Consumers with a narrower operand
         // grammar must reject it locally without changing Graph's general validity contract.
-        g.values[out.id].aval = OpKind::Binary(BinOp::Add)
+        g.values[out.id()].aval = OpKind::Binary(BinOp::Add)
             .infer(&[Scalar::F32(1.0).ty(), TensorType::f32(vec![2])])
             .unwrap();
         g.validate()
@@ -2063,7 +2348,7 @@ mod tests {
         let int = b.constant("int", TensorType::scalar(DType::I32));
         let out = b.binary_scalar(BinOp::Add, float, Scalar::F32(1.0));
         let mut g = b.finish(out);
-        g.eqns[0].inputs = vec![Operand::Value(float.id), Operand::Value(int.id)];
+        g.eqns[0].inputs = vec![Operand::Value(float.id()), Operand::Value(int.id())];
 
         assert_eq!(
             g.validate(),
@@ -2088,7 +2373,7 @@ mod tests {
             let packed = b.constant("packed", TensorType::new(vec![2], dtype));
             let out = b.binary_scalar(BinOp::Add, float, Scalar::F32(1.0));
             let mut g = b.finish(out);
-            g.eqns[0].inputs = vec![Operand::Value(packed.id), Operand::Value(packed.id)];
+            g.eqns[0].inputs = vec![Operand::Value(packed.id()), Operand::Value(packed.id())];
 
             assert_eq!(
                 g.validate(),
@@ -2172,8 +2457,8 @@ mod tests {
         let out = b.binary(BinOp::Add, layer0, layer0);
         let g = b.finish(out);
 
-        let key0 = g.input_key(layer0.id).expect("declared slot input");
-        let key1 = g.input_key(layer1.id).expect("declared slot input");
+        let key0 = g.input_key(layer0.id()).expect("declared slot input");
+        let key1 = g.input_key(layer1.id()).expect("declared slot input");
         assert_ne!(
             key0, key1,
             "same role, different Builder::slot_named tag, must key differently"
@@ -2198,12 +2483,12 @@ mod tests {
         let b = Builder::new();
         let layer0 = b.slot_named(Slot::ExpertPoolMap, "layer_0", TensorType::f32(vec![4]));
         let mut g = b.finish(layer0);
-        let original = g.input_key(layer0.id).expect("declared slot input");
+        let original = g.input_key(layer0.id()).expect("declared slot input");
 
         // Corrupt the wire name a parser would read; the typed key lives elsewhere and must be
         // unaffected.
-        g.values[layer0.id].name = Some("not.a.recoverable.name".to_string());
-        let after = g.input_key(layer0.id);
+        g.values[layer0.id()].name = Some("not.a.recoverable.name".to_string());
+        let after = g.input_key(layer0.id());
 
         assert_eq!(
             after,

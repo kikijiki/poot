@@ -27,7 +27,7 @@ use poot_graph_ir::builder::Resumed;
 use poot_graph_ir::graph::{Eqn, Graph, Operand, Storage, ValidationChannel, ValueId, ValueMeta};
 use poot_graph_ir::op::{BinOp, OpKind};
 use poot_graph_ir::types::TensorType;
-use poot_graph_ir::{Builder, PackedSourceName, Slot};
+use poot_graph_ir::{Builder, PackedSourceName, Slot, ValueTable};
 use poot_quant::weights::{LoraRole, LoraTarget, WeightId, WeightRole};
 use poot_tensor::DType;
 
@@ -155,13 +155,13 @@ pub fn apply_lora<V: ValidationChannel>(
         state: carried,
     } = Builder::resume(plain);
     let b = &builder;
-    let idx = b.slot(Slot::LoraIdx, TensorType::f32(vec![rows])).id;
+    let idx = b.slot(Slot::LoraIdx, TensorType::f32(vec![rows])).id();
     let scale = b
         .constant(
             &WeightId::model(WeightRole::Lora(LoraRole::Scale)).const_name(),
             TensorType::f32(vec![stack]),
         )
-        .id;
+        .id();
     let mut factors: HashMap<(usize, LoraTarget), (ValueId, ValueId)> = HashMap::new();
     for site in &sites {
         factors.entry((site.layer, site.target)).or_insert_with(|| {
@@ -172,12 +172,12 @@ pub fn apply_lora<V: ValidationChannel>(
                     &a.const_name(),
                     TensorType::f32(vec![stack, site.in_dim, rank]),
                 )
-                .id,
+                .id(),
                 b.constant(
                     &bb.const_name(),
                     TensorType::f32(vec![stack, rank, site.out_dim]),
                 )
-                .id,
+                .id(),
             )
         });
     }
@@ -310,7 +310,7 @@ fn declared_shape(emitter: &Emitter<'_>, value: ValueId) -> Vec<usize> {
 
 /// The contractions of `g` whose weight is a targeted projection, in equation order.
 fn sites<V: ValidationChannel>(g: &Graph<V>, plan: &LoraPlan) -> Vec<Site> {
-    let mut producer: Vec<Option<usize>> = vec![None; g.values.len()];
+    let mut producer: ValueTable<Option<usize>> = ValueTable::filled(g.values.len(), None);
     for (e, eqn) in g.eqns.iter().enumerate() {
         producer[eqn.out] = Some(e);
     }
@@ -347,7 +347,7 @@ fn sites<V: ValidationChannel>(g: &Graph<V>, plan: &LoraPlan) -> Vec<Site> {
 /// or the `PackedDequant` of its source tensors, whichever way the tracer spelled the linear.
 fn weight_name<V: ValidationChannel>(
     g: &Graph<V>,
-    producer: &[Option<usize>],
+    producer: &ValueTable<Option<usize>>,
     operand: ValueId,
 ) -> Option<String> {
     let through = match producer[operand].map(|e| &g.eqns[e]) {
@@ -398,7 +398,7 @@ fn projection(name: &str, targets: &[LoraTarget]) -> Option<(usize, LoraTarget)>
 /// Appends values and equations to the graph under rewrite, each through the budget, with each
 /// output type computed by [`OpKind::infer`] rather than written down.
 struct Emitter<'a> {
-    values: &'a mut Vec<ValueMeta>,
+    values: &'a mut ValueTable<ValueMeta>,
     eqns: Vec<Eqn>,
     budget: &'a GraphBudget,
     layer: Option<poot_graph_ir::graph::LayerIndex>,
