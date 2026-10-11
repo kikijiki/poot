@@ -160,7 +160,11 @@ fn len_probe_reads_the_operand_own_length_never_a_larger_slots_capacity_on_rocm(
     poot_codegen::compile(&body, codegen_target, &out_path)
         .expect("len_probe must compile to HSACO");
     let bytes = std::fs::read(&out_path).unwrap();
-    let compiled = poot_codegen::kernel_handle(&body, codegen_target, bytes);
+    let compiled = poot_codegen::kernel_handle(
+        &body,
+        poot_codegen::GpuTarget::try_from(codegen_target).expect("a byte-artifact target"),
+        bytes,
+    );
     let kernel = device
         .load_kernel("sc002_len_probe", compiled)
         .expect("load the len_probe kernel");

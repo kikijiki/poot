@@ -21,7 +21,9 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use poot_graph_ir::{PackedSourceName, SlotKey, TensorType, ValueId, packed_stack_source_type};
+use poot_graph_ir::{
+    IndexRange, PackedSourceName, SlotKey, TensorType, ValueId, packed_stack_source_type,
+};
 use poot_quant::SourceRole;
 use poot_quant::weights::{
     HandleFormat, StoreGeneration, WeightEntry, WeightId, WeightKey, WeightMap, WeightStore,
@@ -41,6 +43,9 @@ pub(crate) struct BoundSlot {
     pub storage: BufferStorage,
     /// Index into the entry's `locals`.
     pub buffer: usize,
+    /// The range the graph declares for this slot's I32 words ([`poot_graph_ir::ValueMeta::range`]):
+    /// checked at every bind, so the planner and the graph's consumers may rely on it.
+    pub range: Option<IndexRange>,
 }
 
 /// Check one step input against its matched slot and encode it into `slot.storage`'s lane.
@@ -75,6 +80,20 @@ pub(crate) fn check_and_encode(
             expected: slot.aval.dtype,
             got: view.dtype(),
         });
+    }
+    if let Some(range) = slot.range {
+        // The lane check above made this an I32 view: its bytes are little-endian words.
+        for (index, word) in view.bytes().as_chunks::<4>().0.iter().enumerate() {
+            let value = i32::from_le_bytes(*word);
+            if !range.contains(value) {
+                return Err(BindError::Range {
+                    key: slot.key.clone(),
+                    index,
+                    value,
+                    range,
+                });
+            }
+        }
     }
     crate::lanes::encode_host(view.dtype(), view.bytes(), slot.storage).ok_or_else(|| {
         BindError::Lane {
@@ -686,6 +705,63 @@ impl WeightBinder {
                 })
             })
             .collect()
+    }
+
+    /// Every word of the I32 const `name` (stored as `bytes`) lies in `range`, the range its graph
+    /// declares ([`poot_graph_ir::Builder::constant_ranged`]): the check that makes the declaration a
+    /// fact the graph's consumers may rely on, as [`check_and_encode`] is for a slot. The first word
+    /// outside is refused by its row-major index, with the range.
+    pub fn check_range(
+        &self,
+        name: &str,
+        bytes: &ConstBytes,
+        range: IndexRange,
+    ) -> Result<(), LoadError> {
+        let StoredAs::Dense(dtype) = bytes.stored else {
+            return Err(LoadError::Unimplemented(
+                "a declared range on a packed weight source",
+            ));
+        };
+        if dtype != DType::I32 {
+            return Err(LoadError::WeightDtype {
+                name: name.to_string(),
+                stored: dtype,
+                declared: DType::I32,
+            });
+        }
+        let mut base = 0;
+        for span in &bytes.spans {
+            let stored = stored_bytes(&self.store, span);
+            // A narrowed span is an I64 table whose map already range-checked every word into I32.
+            let words: Box<dyn Iterator<Item = i32> + '_> = if span.narrowed {
+                Box::new(stored.as_chunks::<8>().0.iter().map(|word| {
+                    i32::try_from(i64::from_le_bytes(*word))
+                        .expect("WeightMapBuilder::map range-checked this table against the store")
+                }))
+            } else {
+                Box::new(
+                    stored
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|word| i32::from_le_bytes(*word)),
+                )
+            };
+            let mut len = 0;
+            for (index, value) in words.enumerate() {
+                len += 1;
+                if !range.contains(value) {
+                    return Err(LoadError::WeightRange {
+                        name: name.to_string(),
+                        index: base + index,
+                        value,
+                        range,
+                    });
+                }
+            }
+            base += len;
+        }
+        Ok(())
     }
 
     /// The writer that lands `bytes` (a const of logical `shape`, planned in `storage`) in its device

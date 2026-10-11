@@ -9,7 +9,7 @@
 
 use poot_executor::Executor;
 use poot_graph_ir::op::FusedOp;
-use poot_graph_ir::{Builder, OpKind, Slot, TensorType, Traced, UnOp};
+use poot_graph_ir::{Builder, IndexRange, OpKind, Slot, TensorType, Traced, UnOp};
 use poot_graph_plan::{Submission, Target};
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
@@ -94,8 +94,18 @@ fn slot_fixture(
     let b = Builder::new();
     let n = inputs[0].numel();
     let cond = b.slot_named(Slot::Token, "cond", TensorType::new(vec![n], DType::I32));
-    let if_true = b.slot_named(branch.0, "if_true", TensorType::new(vec![n], branch.1));
-    let if_false = b.slot_named(branch.0, "if_false", TensorType::new(vec![n], branch.1));
+    // An I32 branch is read back through a cast to F32: its slot declares the exact f32 integers, which
+    // `compile` needs to prove that cast and the binder checks.
+    let branch_slot = |tag: &str| {
+        let aval = TensorType::new(vec![n], branch.1);
+        if branch.1 == DType::I32 {
+            b.slot_named_ranged(branch.0, tag, aval, IndexRange::F32_EXACT)
+        } else {
+            b.slot_named(branch.0, tag, aval)
+        }
+    };
+    let if_true = branch_slot("if_true");
+    let if_false = branch_slot("if_false");
     let out = build(&b, [cond, if_true, if_false]);
     let graph = b.finish(out);
     let step = || -> Vec<StepFixture> {
@@ -190,8 +200,8 @@ fn check_bit_exact(fixture: &Fixture, who: &str, got: &HostTensor) -> Result<(),
     }
 }
 
-/// `fixture` compiled for `target` plans its select the way the case says: the standalone cases run a
-/// plain `Select` equation, the fused case runs one `Fused` region that holds the select as a step. A row
+/// `fixture` compiled for `target` plans its select the way the case says: the standalone F32 cases run a
+/// plain `Select` equation, the fused cases run one `Fused` region that holds the select as a step. A row
 /// then shows which lowering produced its words.
 fn check_lowering(fixture: &Fixture, target: Target) -> Result<(), String> {
     let staged = crate::staged(fixture, target, Submission::Replay);
@@ -209,7 +219,10 @@ fn check_lowering(fixture: &Fixture, target: Target) -> Result<(), String> {
             }
         }
     }
-    let expected = if fixture.name == FUSED_F32 {
+    // The I32 case's select has the readback cast as its only reader, so `fuse_index_casts` (POOT-1108) makes
+    // it a step of the region that converts it: the select is exercised inside an exact-I32 chain of a float
+    // region, not as a standalone equation.
+    let expected = if fixture.name == FUSED_F32 || fixture.name == STANDALONE_I32 {
         (0, 1)
     } else {
         (1, 0)

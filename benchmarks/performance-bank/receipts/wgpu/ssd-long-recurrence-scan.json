@@ -1,0 +1,174 @@
+{
+  "backend": "wgpu",
+  "case": "ssd-long-recurrence-scan",
+  "cells": {
+    "kernel": {
+      "repeats": [
+        {
+          "metrics": {
+            "step_us": 9995.69
+          },
+          "slot": 0,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 9848.515000000001
+          },
+          "slot": 1,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 9815.393
+          },
+          "slot": 2,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 9960.704000000002
+          },
+          "slot": 3,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 9815.553
+          },
+          "slot": 4,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 9818.658
+          },
+          "slot": 5,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 9485.886
+          },
+          "slot": 6,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 9647.999000000002
+          },
+          "slot": 7,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 9712.189
+          },
+          "slot": 8,
+          "status": "ok"
+        }
+      ]
+    }
+  },
+  "memory": [
+    {
+      "live_bytes": 21168160,
+      "peak_bytes": 21168160,
+      "role": "Weight"
+    },
+    {
+      "live_bytes": 4325376,
+      "peak_bytes": 4325376,
+      "role": "Activation"
+    },
+    {
+      "live_bytes": 36,
+      "peak_bytes": 4325412,
+      "role": "Staging"
+    }
+  ],
+  "observed": {
+    "layout": "bhsd",
+    "shape": {
+      "family": "ssd",
+      "heads": 4,
+      "n": 128,
+      "p": 64,
+      "steps": 4096
+    },
+    "storage": "f32",
+    "weight_bytes_per_copy": 21168160,
+    "weight_copies": 1
+  },
+  "plan": [
+    "scan [a9f2e4c8ec1d5f27160c373c141d340b71dc144cc3b83dd3d7ee9b7e630d4c56]"
+  ],
+  "plan_id": "b642c31ce982f9d55053f8c58ee6546f90fd0d6ebdf395d745df75ae94f89838",
+  "recordings": 1,
+  "reference": {
+    "agrees": true,
+    "max_relative_error": 3.513941863497212e-07,
+    "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
+    "provenance": "independent-golden",
+    "tolerance": 0.002
+  },
+  "replays": 13,
+  "role": "baseline",
+  "schema": 1,
+  "command": [
+    "cargo",
+    "run",
+    "--release",
+    "-p",
+    "poot-gpu",
+    "--example",
+    "performance_bank",
+    "--",
+    "--bank",
+    "benchmarks/performance-bank/cases.json",
+    "--case",
+    "ssd-long-recurrence-scan",
+    "--out",
+    "benchmarks/performance-bank/receipts/wgpu/ssd-long-recurrence-scan.json"
+  ],
+  "parent_revision": "2f1101ab3028740aed658e1068aa6638d2328447",
+  "binary_sha256": "4be305c1c3c2c541b1ad2401348c8c89f72f1d5b4fadb058862f5a87b77d7fe9",
+  "identity": {
+    "checkpoint_digest": "synthetic-no-checkpoint",
+    "token_fixture": "splitmix64-seed0-unit:237900849bc67b83",
+    "precision": "f32",
+    "layout": "bhsd",
+    "dimensions": {
+      "family": "ssd",
+      "heads": 4,
+      "p": 64,
+      "n": 128,
+      "steps": 4096
+    },
+    "prompt_tokens": 1,
+    "live_context": "n/a",
+    "max_context": "n/a",
+    "requested_output": "n/a",
+    "actual_output": "n/a",
+    "sampler": "n/a",
+    "template": "n/a",
+    "cache_state": {
+      "condition": "weights-resident-hot",
+      "id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb"
+    },
+    "prepared_set": [
+      "ssd-long-recurrence-scan"
+    ],
+    "timing_policy": {
+      "warmup": 3,
+      "repeats": 9,
+      "clock": "wall step plus readback",
+      "profiled": false
+    },
+    "backend": "wgpu",
+    "device": "AMD Radeon 8060S Graphics",
+    "driver": "host kernel 7.2.9"
+  },
+  "identity_digest": "f3b8726d4167010315acb06c43709e241c5d3dffdd9d50ebb10819acbdee3ed9",
+  "schedule_id": "0025f9f93a3783297d48f02335370f21db17d7e285fc7929024e391dd5d514cb"
+}

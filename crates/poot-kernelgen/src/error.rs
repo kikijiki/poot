@@ -79,13 +79,21 @@ pub enum KernelGenError {
         format: poot_quant::format::WeightFormat,
         reason: &'static str,
     },
-    /// An I32 leaf of a float region feeds something other than a `Select` condition: an I32 word has no
-    /// float meaning, so it may only be read as the condition of a select.
-    #[error("{generator}: I32 leaf {leaf} feeds {consumer}; it may only be a Select condition")]
+    /// An I32 leaf of a float region feeds something other than a `Select` condition or an `I32ToF32`
+    /// step: an I32 word has no float meaning until that cast gives it one.
+    #[error(
+        "{generator}: I32 leaf {leaf} feeds {consumer}; it may only be a Select condition or be cast to f32"
+    )]
     IndexLeafOperand {
         generator: &'static str,
         leaf: usize,
         consumer: String,
+    },
+    /// An `I32ToF32` step whose operand is not an I32 word: `step` is its index in the region.
+    #[error("{generator}: I32ToF32 step {step} reads an operand that is not an I32 value")]
+    IndexCastOperand {
+        generator: &'static str,
+        step: usize,
     },
     /// A two-byte float value feeds an op that would compute on it. Such a value is only moved: a `Select`'s
     /// branch or the region output.
@@ -150,6 +158,7 @@ impl KernelGenError {
             | Self::CountMismatch { generator, .. }
             | Self::IndexLeafOperand { generator, .. }
             | Self::NarrowOperand { generator, .. }
+            | Self::IndexCastOperand { generator, .. }
             | Self::ShapeMismatch { generator, .. } => generator,
             Self::UnsupportedDescriptor { .. } => "packed_kernel",
             Self::Unsupported { request, .. } => request,

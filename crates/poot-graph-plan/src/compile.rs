@@ -29,10 +29,11 @@ use poot_graph_ir::analysis::{
     implied_numerics, verify_pass_numerics,
 };
 use poot_graph_ir::{
-    BoundaryId, Eqn, Export, Graph, NoValidations, OpKind, Operand, Slot, ValidationChannel,
-    ValueId, ValueTable,
+    BoundaryId, Eqn, Export, Graph, IndexRange, NoValidations, OpKind, Operand, Slot,
+    ValidationChannel, ValueId, ValueTable, value_ranges,
 };
 use poot_target::{Backend, DeviceCaps};
+use poot_tensor::DType;
 
 use crate::passes::{self as transform, GraphBudget, LegalizeError, PackedDequantProductionError};
 pub use crate::passes::{LoraError, LoraPlan};
@@ -170,6 +171,56 @@ pub enum CompileError {
     /// program exists.
     #[error(transparent)]
     Expansion(Box<ExpansionError>),
+    /// An `I32 -> F32` cast whose operand the graph does not prove exactly representable (POOT-726).
+    #[error(transparent)]
+    CastRange(Box<CastRangeError>),
+}
+
+/// A `Cast(I32 -> F32)` whose operand is not proven inside `[-2^24, 2^24]`, the integers an `f32`
+/// holds exactly (POOT-726). The ranges are [`poot_graph_ir::value_ranges`]: what the equations and the
+/// declared slot ranges prove, never a caller's claim. A graph that wants the cast declares the range of
+/// its slot, clamps with [`poot_graph_ir::Builder::guard_index_bounds`], or does not widen the word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "equation {cast}: Cast I32 -> F32 of {operand}, whose proven range is {proven}, not inside the \
+     exact f32 integers {exact}"
+)]
+pub struct CastRangeError {
+    /// The cast equation's output value.
+    pub cast: ValueId,
+    /// The I32 value it widens.
+    pub operand: ValueId,
+    /// What the graph proves about `operand`.
+    pub proven: IndexRange,
+    /// What the cast needs: [`IndexRange::F32_EXACT`].
+    pub exact: IndexRange,
+}
+
+/// Refuse every `Cast(I32 -> F32)` of `g` whose operand's proven range leaves the exact f32 integers.
+/// The device casts convert without checking, so a word past `2^24` would round silently; the oracle
+/// faults at run time on the same words, and this refuses the graph before any of them exist.
+fn refuse_unproven_i32_casts<V: ValidationChannel>(g: &Graph<V>) -> Result<(), CastRangeError> {
+    let facts = value_ranges(g);
+    for eqn in &g.eqns {
+        let (OpKind::Cast { to: DType::F32 }, [Operand::Value(operand)]) =
+            (&eqn.op, eqn.inputs.as_slice())
+        else {
+            continue;
+        };
+        if g.aval(*operand).dtype != DType::I32 {
+            continue;
+        }
+        let proven = facts[*operand].unwrap_or(IndexRange::I32);
+        if !proven.within(&IndexRange::F32_EXACT) {
+            return Err(CastRangeError {
+                cast: eqn.out,
+                operand: *operand,
+                proven,
+                exact: IndexRange::F32_EXACT,
+            });
+        }
+    }
+    Ok(())
 }
 
 impl From<PlanError> for CompileError {
@@ -199,6 +250,12 @@ impl From<LoraError> for CompileError {
 impl From<ExpansionError> for CompileError {
     fn from(error: ExpansionError) -> Self {
         CompileError::Expansion(Box::new(error))
+    }
+}
+
+impl From<CastRangeError> for CompileError {
+    fn from(error: CastRangeError) -> Self {
+        CompileError::CastRange(Box::new(error))
     }
 }
 
@@ -350,6 +407,25 @@ impl<V: ValidationChannel> Program<V> {
         &self.choices[index]
     }
 
+    /// Rebind every dispatch of equation `index`'s plan through `rebind`, as the executor's load-time
+    /// refusal rows need a plan the planner would never emit (ADR-0113: gated, no production caller). The
+    /// new plan declares `scratch` scratch buffers and passes [`DispatchPlan::new`] like any other.
+    #[cfg(feature = "test-support")]
+    pub fn rebind_dispatches(
+        &mut self,
+        index: usize,
+        scratch: usize,
+        rebind: impl Fn(&Binding) -> Binding,
+    ) -> Result<(), DispatchPlanError> {
+        let dispatches = self.plans[index]
+            .dispatches()
+            .iter()
+            .map(|dispatch| dispatch.clone().with_binding(rebind(dispatch.binding())))
+            .collect();
+        self.plans[index] = Plan::Dispatches(DispatchPlan::new(dispatches, scratch)?);
+        Ok(())
+    }
+
     /// Every value's storage, as the plan chose it.
     pub fn storage(&self) -> &GraphStorage {
         &self.storage
@@ -424,6 +500,9 @@ pub fn compile<V: ValidationChannel>(
         }
         None => g,
     };
+    // Every `I32 -> F32` cast is proven exact from the graph as the caller wrote it, before a pass
+    // rewrites it: a pass preserves the words, so its casts are the traced ones.
+    refuse_unproven_i32_casts(g)?;
     let _scope = CompileScope::enter();
     // A flash prefill launches `Hq * L` workgroups on one grid axis; cap the rewrite at the target's grid so
     // the planner is never handed a launch the device cannot issue.
@@ -495,6 +574,9 @@ pub fn compile<V: ValidationChannel>(
     })?;
     pipeline.run("fuse", transform::fuse)?;
     pipeline.run("fuse_widening_casts", transform::fuse_widening_casts)?;
+    // After `fuse`: the casts it left between an I32 word and the float pointwise kernels that read it or
+    // the exact-I32 kernels that write it become steps of those kernels (POOT-1108).
+    pipeline.run("fuse_index_casts", transform::fuse_index_casts)?;
     let (graph, baseline, passes) = pipeline.finish()?;
     // `legalize` fitted every constant, but a later pass's revert of an unplannable split (`after_apply`) can
     // put an oversized one back: re-check the graph the planner receives, never trust the pass's own result.
@@ -808,13 +890,12 @@ fn revert_unplannable_rewrites<V: ValidationChannel>(
             .get(&eqn.out)
             .is_none_or(|&i| before.eqns[i].op != eqn.op)
     });
-    // Probe exactly as `plan_graph` plans: with the graph's own strided views and one exact-I32 analysis.
+    // Probe exactly as `plan_graph` plans: with the graph's own strided views.
     // A probe stricter than the final plan would drop a rewrite the target can run.
-    let analysis = ExactI32StorageAnalysis::new(&after);
     let views = compute_views(&after, target.backend);
     let mut refused: Vec<(ValueId, Refusal)> = Vec::new();
     for eqn in rewritten {
-        match plan_eqn_compiled(&analysis, &after, eqn, target, &views, limits) {
+        match plan_eqn_compiled(&after, eqn, target, &views, limits) {
             Ok(_) => {}
             Err(PlanError::Refused(refusal)) => refused.push((eqn.out, *refusal)),
             Err(error) => return Err(error.into()),
@@ -999,6 +1080,7 @@ mod tests {
                     capacity: n(8),
                     kv: KvLayout::Contiguous,
                     logits: LogitRows::Last,
+                    hidden: None,
                 },
             )
             .expect("the fixture traces");
@@ -1426,7 +1508,7 @@ mod tests {
         let b = Builder::new();
         let base = b.constant("base", TensorType::new(vec![2, 5], DType::E4M3FN));
         let src = b.constant("src", TensorType::f32(vec![1, 5]));
-        let inverse = b.constant("inverse", TensorType::f32(vec![2]));
+        let inverse = b.constant("inverse", TensorType::new(vec![2], DType::I32));
         let out = b.scatter_update(base, src, inverse);
         let refusal = refusal(
             compile(&b.finish(out), &wgpu(), &REPLAY),
@@ -1461,8 +1543,7 @@ mod tests {
             .expect("fuse fuses the chain");
         assert!(
             matches!(
-                plan_eqn_analyzed(
-                    &ExactI32StorageAnalysis::new(&optimized),
+                plan_eqn(
                     &optimized,
                     fused,
                     Backend::SpirvVulkan,
@@ -1525,8 +1606,7 @@ mod tests {
         let before = per_eqn_plans_outside_compile();
         compile(&g, &wgpu(), &REPLAY).expect("the chain compiles");
         assert_eq!(per_eqn_plans_outside_compile(), before);
-        plan_eqn_analyzed(
-            &ExactI32StorageAnalysis::new(&g),
+        plan_eqn(
             &g,
             &g.eqns[0],
             Backend::SpirvVulkan,
@@ -1979,7 +2059,7 @@ mod tests {
                     }
                     assert!(
                         plan.single()
-                            .is_some_and(|dispatch| !dispatch.launch.meta.is_empty()),
+                            .is_some_and(|dispatch| !dispatch.launch().meta.is_empty()),
                         "{what}: {plan:?}"
                     );
                     assert!(
@@ -2067,7 +2147,11 @@ mod tests {
     fn packed_moe_graph(format: poot_quant::format::WeightFormat) -> Graph {
         let b = Builder::new();
         let x = b.slot_named(Slot::Activation, "moe-x", TensorType::f32(vec![3, STACK_K]));
-        let selector = b.slot_named(Slot::Activation, "moe-ids", TensorType::f32(vec![3]));
+        let selector = b.slot_named(
+            Slot::Activation,
+            "moe-ids",
+            TensorType::new(vec![3], DType::I32),
+        );
         let table = poot_graph_ir::ops::PackedExpertStack {
             stack_id: "moe.experts".to_string(),
             descriptor: stack_descriptor(format),
@@ -2138,7 +2222,11 @@ mod tests {
     fn compile_refuses_the_materializing_packed_moe_chain() {
         let b = Builder::new();
         let x = b.slot_named(Slot::Activation, "moe-x", TensorType::f32(vec![3, MOE_K]));
-        let selector = b.slot_named(Slot::Activation, "moe-ids", TensorType::f32(vec![3]));
+        let selector = b.slot_named(
+            Slot::Activation,
+            "moe-ids",
+            TensorType::new(vec![3], DType::I32),
+        );
         let branch = |id: &str| {
             let dequant = staged_dequant(&b, id);
             let t = b.transpose(dequant, vec![1, 0]);
@@ -2155,17 +2243,40 @@ mod tests {
         }
     }
 
-    /// Spike 562 F-9: one I32 `Slot::Pos` that is both a Gather index and an I32->F32 Cast source. Its
-    /// component holds no exact-I32 arithmetic, so every reader reads the f32 mirror: the Gather through a
-    /// `Slice<f32>` index, the Cast as an alias of the mirror bytes. Before the fix the Cast read
-    /// `Slice<i32>` regardless and `compile` refused with `I32ReaderLaneConflict` (the wgpu executor, which
-    /// does not run the check, bound dense I32 words the Gather read as floats). Mutation (never left in the
-    /// tree): disabling that `Plan::Alias` arm -> `Plan(I32ReaderLaneConflict { value: 0, i32_reader: 3,
-    /// f32_reader: 2 })`.
+    /// The element type of the `Slice<T>` param of `plan`'s first dispatch that reads `value`, the equation's
+    /// value operand `position` (a data param comes first, in operand order).
+    fn read_element(plan: &Plan, position: usize) -> poot_kernel_ir::Ty {
+        let dispatch = plan
+            .dispatches()
+            .first()
+            .unwrap_or_else(|| panic!("no dispatch: {plan:?}"));
+        let params: Vec<_> = dispatch.body().params().collect();
+        let mut ty = dispatch.body().local_ty(params[position]);
+        if let poot_kernel_ir::Ty::Ref { pointee, .. } = ty {
+            ty = pointee;
+        }
+        match ty {
+            poot_kernel_ir::Ty::Slice(element) => (**element).clone(),
+            other => panic!("param {position} is not a slice: {other:?}"),
+        }
+    }
+
+    /// POOT-725, POOT-643's fixture (spike 562 F-9): one I32 `Slot::Pos` that is both a Gather index and an
+    /// I32->F32 Cast source. Before, the Gather read it as an f32 mirror and the Cast as `Slice<i32>`, so the
+    /// slot's one buffer was read on two lanes. Now the slot is dense I32 words and both readers read
+    /// `Slice<i32>`, through the production planner. POOT-1108 folds the cast into the `Add` region that
+    /// reads it, so that reader is the region's I32 leaf (a view of the slot).
+    ///
+    /// Mutation (never left in the tree): type the Gather's index param `Slice<f32>` in the movement
+    /// generator -> `Plan(I32ReadAsF32 { value: 0, reader: .. })`.
     #[test]
-    fn compile_reads_a_mirror_i32_slot_on_one_lane_for_gather_and_cast() {
+    fn compile_reads_an_i32_slot_on_one_lane_for_gather_and_cast() {
         let b = Builder::new();
-        let idx = b.slot(Slot::Pos, TensorType::new(vec![4], DType::I32));
+        let idx = b.slot_ranged(
+            Slot::Pos,
+            TensorType::new(vec![4], DType::I32),
+            IndexRange::below(16).unwrap(),
+        );
         let table = b.constant("table", TensorType::f32(vec![16, 8]));
         let gathered = b.gather(table, 0, idx);
         let q = b.cast(idx, DType::F32);
@@ -2176,33 +2287,52 @@ mod tests {
         );
         let g = b.finish(out);
 
-        let program =
-            compile(&g, &wgpu(), &REPLAY).expect("every reader agrees on the mirror lane");
+        let program = compile(&g, &wgpu(), &REPLAY).expect("every reader reads Slice<i32>");
         let graph = program.graph();
         let &(slot, _) = graph
             .slots
             .iter()
             .find(|&&(_, kind)| kind == Slot::Pos)
             .expect("the Pos slot survives compile");
-        assert!(program.storage().storage(slot).is_f32_mirror());
-        let (_, cast_plan) = program
-            .planned()
-            .find(|(eqn, _)| matches!(eqn.op, OpKind::Cast { .. }))
-            .expect("the cast survives compile");
-        assert!(
-            matches!(cast_plan, Plan::Alias(source) if *source == slot),
-            "a mirror-lane cast aliases its source, got {cast_plan:?}"
+        assert_eq!(
+            program.storage().storage(slot).buffer_storage(),
+            poot_target::BufferStorage::i32()
         );
+        let (_, gather_plan) = program
+            .planned()
+            .find(|(eqn, _)| matches!(eqn.op, OpKind::Gather { .. }))
+            .expect("the gather survives compile");
+        let (region_eqn, region_plan) = program
+            .planned()
+            .find(|(eqn, _)| matches!(eqn.op, OpKind::Fused(_)))
+            .expect("the cast folds into the region that adds it");
+        assert!(
+            !graph
+                .eqns
+                .iter()
+                .any(|eqn| matches!(eqn.op, OpKind::Cast { .. })),
+            "no cast equation is left to launch"
+        );
+        // The region reads the slot through the reshape and broadcast views the cast result had.
+        let leaf = region_eqn
+            .inputs
+            .iter()
+            .position(|operand| {
+                matches!(operand, Operand::Value(v) if graph.aval(*v).dtype == DType::I32)
+            })
+            .expect("the region reads an I32 word");
+        // Gather operands are (table, index); the region's leaves are its inputs.
+        assert_eq!(read_element(gather_plan, 1), poot_kernel_ir::Ty::I32);
+        assert_eq!(read_element(region_plan, leaf), poot_kernel_ir::Ty::I32);
     }
 
-    /// The reader-lane contract on the production entry: an exact-I32 component (a `GeU` observes it) whose
-    /// member is also a `ScatterUpdate` inverse map, while the component's Gather reads it as an index. Every
-    /// movement reads an index on its component's lane, so the scatter reads the slot as exact i32 beside the
-    /// Gather and `compile` plans one lane for the slot. Mutation (never left in the tree): type the
-    /// scatter's inverse map as `Ty::F32` whatever its component (`planner/movement.rs`) -> the scatter reads
-    /// the exact bytes as floats and `compile` refuses with `I32ReaderLaneConflict`.
+    /// An I32 slot that is a Gather index and a `ScatterUpdate` inverse map reads both on `Slice<i32>`, and
+    /// `compile` plans one dense I32 buffer for the slot.
+    ///
+    /// Mutation (never left in the tree): type the scatter's inverse map as `Ty::F32`
+    /// (`planner/movement.rs`) -> `Plan(I32ReadAsF32)`.
     #[test]
-    fn compile_reads_an_exact_i32_slot_on_one_lane_for_gather_and_scatter_update() {
+    fn compile_reads_an_i32_slot_on_one_lane_for_gather_and_scatter_update() {
         let b = Builder::new();
         let idx = b.slot(Slot::Pos, TensorType::new(vec![4], DType::I32));
         let table = b.constant("table", TensorType::f32(vec![16, 8]));
@@ -2217,26 +2347,27 @@ mod tests {
         let written = b.scatter_update(cache, update, idx);
         let g = b.finish_with_state(written, &[(cache, written)]);
 
-        let program = compile(&g, &wgpu(), &REPLAY).expect("every reader agrees on the exact lane");
+        let program = compile(&g, &wgpu(), &REPLAY).expect("every reader reads Slice<i32>");
         let &(slot, _) = program
             .graph()
             .slots
             .iter()
             .find(|&&(_, kind)| kind == Slot::Pos)
             .expect("the Pos slot survives compile");
-        assert!(!program.storage().storage(slot).is_f32_mirror());
+        assert_eq!(
+            program.storage().storage(slot).buffer_storage(),
+            poot_target::BufferStorage::i32()
+        );
+        let (_, scatter_plan) = program
+            .planned()
+            .find(|(eqn, _)| matches!(eqn.op, OpKind::ScatterUpdate))
+            .expect("the scatter survives compile");
+        // ScatterUpdate operands are (base, src, inv).
+        assert_eq!(read_element(scatter_plan, 2), poot_kernel_ir::Ty::I32);
     }
 
     /// POOT-1074: an I32 state pool read by a `Gather` and written back by a `ScatterUpdate` (the paged PLE
-    /// token history) plans on every backend. The Gather reads the pool as exact i32 (an I32 table is an
-    /// authoritative integer source), so the ScatterUpdate that writes the carried value back reads and
-    /// writes the same lane: base, source, result and the next value of the state edge are one component.
-    ///
-    /// The pool is exact through the `Gather`'s pin alone; the two union rules are each pinned by their own
-    /// test below (`..._scatter_update_joins_...`, `..._carried_state_edge_...`).
-    ///
-    /// Mutation (never left in the tree): drop both the `ScatterUpdate` union and the state-edge union in
-    /// `ExactI32StorageAnalysis::new` -> `Plan(I32ReaderLaneConflict { value: 0, .. })`.
+    /// token history) plans on every backend, each reading the pool as I32 words.
     #[test]
     fn compile_plans_an_i32_state_pool_gathered_and_scattered_on_one_lane() {
         let b = Builder::new();
@@ -2261,18 +2392,20 @@ mod tests {
         }
     }
 
-    /// POOT-1074, the ScatterUpdate rule: an I32 `ScatterUpdate` that is NOT a state edge moves its base's and
-    /// its source's words, so base, source and result are one lane. Here the result is gathered as a table
-    /// (an authoritative integer source: pinned exact) while the source is also cast to F32, a reader that
-    /// alone would leave it on the mirror lane. The scatter reads the source exact beside the cast.
-    ///
-    /// Mutation (never left in the tree): drop the `ScatterUpdate` union in `ExactI32StorageAnalysis::new`
-    /// -> `Plan(I32ReaderLaneConflict)` on the source.
+    /// POOT-1074: an I32 `ScatterUpdate` that is NOT a state edge moves its base's and its source's words.
+    /// Here the result is gathered as a table while the source is also cast to F32; every reader of the
+    /// source reads `Slice<i32>`.
     #[test]
-    fn compile_joins_an_i32_scatter_update_source_to_its_gathered_result() {
+    fn compile_plans_an_i32_scatter_update_source_beside_a_cast_reader() {
         let b = Builder::new();
-        let base = b.constant("base", TensorType::new(vec![4, 3], DType::I32));
-        let src = b.slot(Slot::Activation, TensorType::new(vec![2, 3], DType::I32));
+        // The cast readers' words are proven exact: the base is an iota table and the source declares
+        // its range, so the result of the scatter (one or the other) is inside `[0, 12)`.
+        let base = b.reshape(b.iota_i32(12), vec![4, 3]);
+        let src = b.slot_ranged(
+            Slot::Activation,
+            TensorType::new(vec![2, 3], DType::I32),
+            IndexRange::below(12).unwrap(),
+        );
         let inv = b.slot(Slot::SlotMap, TensorType::new(vec![4], DType::I32));
         let at = b.slot(Slot::Pos, TensorType::new(vec![2], DType::I32));
         let updated = b.scatter_update(base, src, inv);
@@ -2289,16 +2422,243 @@ mod tests {
         }
     }
 
-    /// POOT-1074, the state-edge rule: an I32 carried value is one buffer across steps. The state `s` is read
-    /// only as a `Gather` index into an F32 table, which alone leaves it on the mirror lane; its next value is
-    /// `GeU(slot, 3)`, an exact-only comparison observed through the state output. The next step reads the
-    /// carried buffer, so `s` and its next value must be one lane: `required(s) == required(next)`, both
-    /// exact, and `compile` plans every backend.
+    // POOT-726: which `I32 -> F32` casts `compile` proves exact, from value ranges alone.
+
+    fn compile_verdict<V: ValidationChannel>(g: &Graph<V>) -> Result<(), CompileError> {
+        compile(g, &wgpu(), &REPLAY).map(|_| ())
+    }
+
+    fn refused_cast(error: CompileError) -> CastRangeError {
+        match error {
+            CompileError::CastRange(error) => *error,
+            other => panic!("expected a cast-range refusal, got {other:?}"),
+        }
+    }
+
+    /// SC-001: an unbounded slot and `Add(pos, big)` past `2^24` are refused with a typed error naming
+    /// the cast equation and its operand; the proven range is in the error.
     ///
-    /// Mutation (never left in the tree): drop the state-edge union in `ExactI32StorageAnalysis::new` ->
-    /// `required(s)` is false while `required(next)` is true (`left: false, right: true`).
+    /// Mutation (never left in the tree): delete the `refuse_unproven_i32_casts(g)?` call in
+    /// `compile`; both graphs compile and this test goes red at `unwrap_err`.
     #[test]
-    fn compile_joins_a_carried_i32_state_to_its_next_value() {
+    fn compile_refuses_an_i32_cast_the_graph_does_not_prove_exact() {
+        let b = Builder::new();
+        let ids = b.slot(Slot::Token, TensorType::new(vec![4], DType::I32));
+        let cast = b.cast(ids, DType::F32);
+        let g = b.finish(cast);
+        let error = refused_cast(compile_verdict(&g).unwrap_err());
+        assert_eq!(
+            error,
+            CastRangeError {
+                cast: cast.id(),
+                operand: ids.id(),
+                proven: IndexRange::I32,
+                exact: IndexRange::F32_EXACT,
+            }
+        );
+
+        // `pos` is `[0, 16)`, so `pos + 2^24` is `[2^24, 2^24 + 16)`: one lane past the exact integers.
+        let b = Builder::new();
+        let pos = b.slot_ranged(
+            Slot::Pos,
+            TensorType::new(vec![4], DType::I32),
+            IndexRange::below(16).unwrap(),
+        );
+        let late = b.binary_scalar(BinOp::Add, pos, Scalar::I32(1 << 24));
+        let cast = b.cast(late, DType::F32);
+        let g = b.finish(cast);
+        let error = refused_cast(compile_verdict(&g).unwrap_err());
+        assert_eq!(error.cast, cast.id());
+        assert_eq!(error.operand, late.id());
+        assert_eq!(
+            error.proven,
+            IndexRange::new(1 << 24, (1 << 24) + 16).unwrap()
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("equation {}", cast.id()))
+        );
+    }
+
+    /// SC-001: a declared position, `ArgTopK` ids, a `guard_index_bounds` output and the successor of one
+    /// compile, with no authorization of any kind.
+    ///
+    /// Mutation (never left in the tree): make `Select`'s rule in `poot-graph-ir`'s `range.rs` drop its
+    /// branch narrowing (union of the two raw branches); the guarded rows are refused and this goes red.
+    /// Mutation: make the `Add` rule return the whole `i32` range; the `Add(guarded, 1)` row is refused.
+    #[test]
+    fn compile_proves_declared_positions_top_k_ids_and_guarded_selectors() {
+        // A declared position.
+        let b = Builder::new();
+        let pos = b.slot_ranged(
+            Slot::Pos,
+            TensorType::new(vec![4], DType::I32),
+            IndexRange::below(1 << 20).unwrap(),
+        );
+        let out = b.cast(pos, DType::F32);
+        let g = b.finish(out);
+        compile_verdict(&g).expect("a declared position is exact");
+
+        // `ArgTopK` ids over an extent of 16.
+        let b = Builder::new();
+        let scores = b.constant("scores", TensorType::f32(vec![2, 16]));
+        let ids = b.arg_top_k(scores, 4);
+        let out = b.cast(ids, DType::F32);
+        let g = b.finish(out);
+        compile_verdict(&g).expect("top-k ids are below the extent");
+
+        // A guard output over an unbounded selector, and its successor (the live length).
+        for successor in [false, true] {
+            let b = Builder::new();
+            let raw = b.slot(Slot::SlotMap, TensorType::new(vec![4], DType::I32));
+            let guard = b.guard_index_bounds(raw, 4).unwrap();
+            let used = if successor {
+                b.binary_scalar(BinOp::Add, guard.guarded, Scalar::I32(1))
+            } else {
+                guard.guarded
+            };
+            let out = b.cast(used, DType::F32);
+            let g = b.finish(out);
+            compile_verdict(&g)
+                .unwrap_or_else(|error| panic!("guarded (successor {successor}): {error}"));
+        }
+    }
+
+    /// SC-002: every cast the deleted `cast_authority` used to authorize, as a table. `range` is what
+    /// the analysis says; `authority` is what the authority said for the same graph. The two differ on
+    /// exactly the rows where the authority leant on a caller claim (the host-checked selector's
+    /// `expert_count`) or on a shape (a guard over arithmetic, a guard bound the claim never checked).
+    ///
+    /// Mutation (never left in the tree): delete `refuse_unproven_i32_casts(g)?` from `compile`; every
+    /// refused row compiles and this test goes red naming the row.
+    #[test]
+    fn compile_gives_the_cast_authority_cases_a_range_verdict() {
+        use poot_graph_ir::{ValidationId, ValidationOutput};
+
+        #[derive(Debug, PartialEq, Eq)]
+        enum Verdict {
+            Proved,
+            Refused,
+        }
+        fn verdict<V: ValidationChannel>(g: &Graph<V>) -> Verdict {
+            match compile_verdict(g) {
+                Ok(()) => Verdict::Proved,
+                Err(CompileError::CastRange(_)) => Verdict::Refused,
+                Err(other) => panic!("a refusal other than the cast range: {other:?}"),
+            }
+        }
+        fn guarded_selector(bound: usize) -> Graph<poot_graph_ir::ValidationOutputs> {
+            // The `exact_i32.rs` selector chain: a Gather over an I32 weight table, the guard, the
+            // selector Cast as the output, the guard's flag as the validation output.
+            let b = Builder::new();
+            let table = b.constant("route.table", TensorType::new(vec![4], DType::I32));
+            let indices = b.constant("route.indices", TensorType::new(vec![4], DType::I32));
+            let raw = b.gather(table, 0, indices);
+            let guard = b.guard_index_bounds(raw, bound).unwrap();
+            let selected = b.cast(guard.guarded, DType::F32);
+            let witness = guard.witness.id();
+            b.finish(selected).with_validations(vec![ValidationOutput {
+                id: ValidationId(3),
+                name: "route.bounds".to_owned(),
+                value: witness,
+            }])
+        }
+
+        // (row, authority's verdict, range analysis' verdict, graph)
+        let mut rows: Vec<(&str, Verdict, Verdict, Verdict)> = Vec::new();
+
+        // HostCheckedSelector: `Cast(Gather(table, index))` of an I32 weight table. The authority took
+        // the caller's `expert_count`; nothing in the graph bounds the table.
+        let b = Builder::new();
+        let table = b.constant("table", TensorType::new(vec![3], DType::I32));
+        let index = b.constant("index", TensorType::new(vec![2], DType::I32));
+        let out = b.cast(b.gather(table, 0, index), DType::F32);
+        let g = b.finish(out);
+        rows.push((
+            "host-checked selector over a weight table",
+            Verdict::Proved,
+            Verdict::Refused,
+            verdict(&g),
+        ));
+
+        // The same selector over a table the graph defines (an iota): bounded by its definition.
+        let b = Builder::new();
+        let table = b.iota_i32(3);
+        let index = b.constant("index", TensorType::new(vec![2], DType::I32));
+        let out = b.cast(b.gather(table, 0, index), DType::F32);
+        let g = b.finish(out);
+        rows.push((
+            "host-checked selector over a defined table",
+            Verdict::Proved,
+            Verdict::Proved,
+            verdict(&g),
+        ));
+
+        // GuardedSelector over a Gather: the guard's range, however the table was produced.
+        rows.push((
+            "guarded selector over a weight table",
+            Verdict::Proved,
+            Verdict::Proved,
+            verdict(&guarded_selector(4)),
+        ));
+
+        // The guard bound 2^25 the authority never read: a selector the f32 cannot hold.
+        rows.push((
+            "guarded selector with a forged bound",
+            Verdict::Proved,
+            Verdict::Refused,
+            verdict(&guarded_selector(1 << 25)),
+        ));
+
+        // Witness: the guard's flag cast, `[0, 2)` from the comparison rule alone.
+        let b = Builder::new();
+        let raw = b.constant("raw", TensorType::new(vec![4], DType::I32));
+        let flag = b.binary_scalar(BinOp::GeU, raw, Scalar::I32(4));
+        let out = b.cast(flag, DType::F32);
+        let g = b.finish(out);
+        rows.push((
+            "witness lane flag",
+            Verdict::Proved,
+            Verdict::Proved,
+            verdict(&g),
+        ));
+
+        // An authorized cast whose source is neither a gather nor a guard nor a comparison.
+        let b = Builder::new();
+        let left = b.constant("left", TensorType::new(vec![2], DType::I32));
+        let right = b.constant("right", TensorType::new(vec![2], DType::I32));
+        let out = b.cast(b.binary(BinOp::Sub, left, right), DType::F32);
+        let g = b.finish(out);
+        rows.push((
+            "difference of two weight words",
+            Verdict::Refused,
+            Verdict::Refused,
+            verdict(&g),
+        ));
+
+        for (row, authority, expected, actual) in &rows {
+            assert_eq!(actual, expected, "{row}: authority said {authority:?}");
+        }
+        // The rows where the verdicts differ are the authority's two holes, not a regression.
+        let differing: Vec<&str> = rows
+            .iter()
+            .filter(|(_, authority, range, _)| authority != range)
+            .map(|(row, ..)| *row)
+            .collect();
+        assert_eq!(
+            differing,
+            [
+                "host-checked selector over a weight table",
+                "guarded selector with a forged bound"
+            ]
+        );
+    }
+
+    /// POOT-1074: an I32 carried value is one buffer across steps. The state `s` is read as a `Gather` index
+    /// and its next value is `GeU(slot, 3)`. Both are dense I32 words on every backend.
+    #[test]
+    fn compile_stores_a_carried_i32_state_and_its_next_value_as_i32() {
         let b = Builder::new();
         let s = b.state_input(
             "s",
@@ -2310,32 +2670,28 @@ mod tests {
         let pos = b.slot(Slot::Pos, TensorType::new(vec![4], DType::I32));
         let next = b.binary_scalar(BinOp::GeU, pos, Scalar::I32(3));
         let g = b.finish_with_state(gathered, &[(s, next)]);
-        let analysis = ExactI32StorageAnalysis::new(&g);
-        assert_eq!(analysis.required(s.id()), analysis.required(next.id()));
-        assert!(
-            analysis.required(next.id()),
-            "the comparison pins the component exact"
-        );
         for backend in [
             Backend::SpirvVulkan,
             Backend::Nvptx,
             Backend::AmdGcn(poot_target::AmdArch::gfx1151()),
         ] {
-            compile(&g, &target_for(backend), &REPLAY)
+            let program = compile(&g, &target_for(backend), &REPLAY)
                 .unwrap_or_else(|error| panic!("{backend:?}: {error:?}"));
+            for value in [s.id(), next.id()] {
+                assert_eq!(
+                    program.storage().storage(value).buffer_storage(),
+                    poot_target::BufferStorage::i32(),
+                    "{backend:?} {value}"
+                );
+            }
         }
     }
 
-    /// The same agreement reached through an alias: the exact-I32 `[4]` slot is the Gather's index, and its
-    /// `Reshape` round trip (a `Plan::Alias` of the slot's buffer) is the scatter's inverse map. Per value
-    /// each is read on one lane; per buffer the slot is read on one lane too, and `compile` plans it as exact
-    /// i32 for both readers.
-    ///
-    /// Mutation (never left in the tree): record reads under the read value instead of its alias root in
-    /// `I32ReadLanes::of_plans` and type the inverse map as `Ty::F32` -> the conflict hides behind the alias
-    /// and `compile` returns a program whose scatter reads exact bytes as floats.
+    /// The same agreement reached through an alias: the I32 `[4]` slot is the Gather's index, and its
+    /// `Reshape` round trip (a `Plan::Alias` of the slot's buffer) is the scatter's inverse map. `compile`
+    /// plans the slot as dense I32 for both readers.
     #[test]
-    fn compile_reads_an_exact_i32_buffer_on_one_lane_through_an_alias() {
+    fn compile_reads_an_i32_buffer_on_one_lane_through_an_alias() {
         let b = Builder::new();
         let idx = b.slot(Slot::Pos, TensorType::new(vec![4], DType::I32));
         let table = b.constant("table", TensorType::f32(vec![16, 8]));
@@ -2351,14 +2707,17 @@ mod tests {
         let written = b.scatter_update(cache, update, inverse);
         let g = b.finish_with_state(written, &[(cache, written)]);
 
-        let program = compile(&g, &wgpu(), &REPLAY).expect("the slot's buffer is read on one lane");
+        let program = compile(&g, &wgpu(), &REPLAY).expect("the slot's buffer is read as i32");
         let &(slot, _) = program
             .graph()
             .slots
             .iter()
             .find(|&&(_, kind)| kind == Slot::Pos)
             .expect("the Pos slot survives compile");
-        assert!(!program.storage().storage(slot).is_f32_mirror());
+        assert_eq!(
+            program.storage().storage(slot).buffer_storage(),
+            poot_target::BufferStorage::i32()
+        );
     }
 
     // mutants-m4 H5: the packed-chain recognizers' `consumers[x].len() != 1 || is_graph_escape(g, x)`
@@ -2823,7 +3182,7 @@ mod tests {
     /// prefill).
     fn packed_embedding_graph(ids_shape: Vec<usize>) -> Graph {
         let b = Builder::new();
-        let ids = b.slot(Slot::Token, TensorType::f32(ids_shape));
+        let ids = b.slot(Slot::Token, TensorType::new(ids_shape, DType::I32));
         let rows = poot_graph_ir::ops::packed_embedding(
             &b,
             ids,
@@ -2865,7 +3224,7 @@ mod tests {
                         OpKind::PackedRowGather { .. }
                     ) && plan
                         .single()
-                        .is_some_and(|dispatch| !dispatch.launch.meta.is_empty())
+                        .is_some_and(|dispatch| !dispatch.launch().meta.is_empty())
                         && matches!(
                             program.kernel_choice(eqn),
                             KernelChoice::Generated(KernelRequest::Packed(request))
@@ -2884,8 +3243,11 @@ mod tests {
         let raw = b.constant("w.weight", TensorType::new(vec![3, 5], DType::E4M3FN));
         let decoded = b.cast(raw, DType::F32);
         let scale = b.constant("w.weight_scale", TensorType::f32(vec![2, 3]));
-        let out_index = b.constant("w.fp8_out_block_index", TensorType::f32(vec![3]));
-        let in_index = b.constant("w.fp8_in_block_index", TensorType::f32(vec![5]));
+        let out_index = b.constant(
+            "w.fp8_out_block_index",
+            TensorType::new(vec![3], DType::I32),
+        );
+        let in_index = b.constant("w.fp8_in_block_index", TensorType::new(vec![5], DType::I32));
         let rows = b.gather(scale, 0, out_index);
         let expanded_scale = b.gather(rows, 1, in_index);
         let scaled = b.binary(BinOp::Mul, decoded, expanded_scale);
@@ -2958,7 +3320,7 @@ mod tests {
     #[test]
     fn compile_refuses_a_packed_gather_along_another_axis() {
         let b = Builder::new();
-        let ids = b.slot(Slot::Token, TensorType::f32(vec![2]));
+        let ids = b.slot(Slot::Token, TensorType::new(vec![2], DType::I32));
         let sources: Vec<poot_graph_ir::Traced> =
             poot_graph_ir::packed_source_constants("table", embedding_descriptor())
                 .into_iter()
@@ -2981,12 +3343,12 @@ mod tests {
     /// included, in an order that crosses the range boundaries. The limit is 544 bytes: two experts per piece,
     /// ranges 0..2, 2..4, 4..5.
     /// Mutation: in `split_oversized_expert_stacks` shift the ids of every piece after the first by one less than
-    /// `range.start`. Red: `Index(IndexFault { eqn: 27, position: 3, value: F32(2.0), len: 2, kind: OutOfRange })`
+    /// `range.start`. Red: `Index(IndexFault { eqn: 27, position: 3, value: I32(2), len: 2, kind: OutOfRange })`
     /// (the row routed to expert 3 reads local expert 2 of a two-expert piece).
     #[test]
     fn compile_splits_an_oversized_expert_stack_and_matches_the_unsplit_contraction() {
         let fixture = SplitStack::new();
-        let routed = [0.0, 1.0, 2.0, 3.0, 4.0, 4.0, 0.0, 3.0, 2.0, 1.0, 4.0];
+        let routed = [0, 1, 2, 3, 4, 4, 0, 3, 2, 1, 4];
         let unsplit = fixture
             .run(&fixture.graph, &routed, &fixture.unsplit_stacks())
             .unwrap();
@@ -3018,16 +3380,16 @@ mod tests {
     }
 
     /// SC-002 (card 1067), model-free, through `compile`: an id no expert of the stack holds - past the last
-    /// expert, negative, NaN, fractional - is the same typed index fault from the split graph as from the unsplit
+    /// expert, or negative - is the same typed index fault from the split graph as from the unsplit
     /// one (the same row): a split never turns an invalid id into a valid row.
-    /// Mutation: in `split_oversized_expert_stacks` drop the invalid-row offset (`-UNHELD_ID * 0.0`). Red: `split
+    /// Mutation: in `split_oversized_expert_stacks` drop the invalid-row offset (`UNHELD_ID * (1 - held)`). Red: `split
     /// graph, id 5: HostTensor { .. }` - the invalid id reads expert 0 in every piece and the split graph evaluates.
     #[test]
     fn a_split_expert_stack_keeps_invalid_ids_invalid() {
         let fixture = SplitStack::new();
         let (split_graph, split_stacks) = fixture.oracle_split(&fixture.legalize());
-        for invalid in [5.0, 9.0, -1.0, f32::NAN, 1.5, 3.5] {
-            let routed = [0.0, 3.0, invalid, 4.0, 1.0, 0.0, 2.0, 2.0, 3.0, 1.0, 4.0];
+        for invalid in [5, 9, -1, i32::MIN, i32::MAX] {
+            let routed = [0, 3, invalid, 4, 1, 0, 2, 2, 3, 1, 4];
             let unsplit = fixture
                 .run(&fixture.graph, &routed, &fixture.unsplit_stacks())
                 .expect_err("the unsplit oracle refuses an invalid id");
@@ -3060,7 +3422,11 @@ mod tests {
         };
         let b = Builder::new();
         let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![1, k]));
-        let ids = b.slot_named(Slot::Activation, "ids", TensorType::f32(vec![1]));
+        let ids = b.slot_named(
+            Slot::Activation,
+            "ids",
+            TensorType::new(vec![1], DType::I32),
+        );
         let y = poot_graph_ir::ops::packed_indexed_linear(&b, x, ids, &table).unwrap();
         b.finish(y)
     }
@@ -3116,7 +3482,11 @@ mod tests {
             };
             let b = Builder::new();
             let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![11, 64]));
-            let ids = b.slot_named(Slot::Activation, "ids", TensorType::f32(vec![11]));
+            let ids = b.slot_named(
+                Slot::Activation,
+                "ids",
+                TensorType::new(vec![11], DType::I32),
+            );
             let y = poot_graph_ir::ops::packed_indexed_linear(&b, x, ids, &table).unwrap();
             Self {
                 graph: b.finish(y),
@@ -3211,7 +3581,7 @@ mod tests {
         fn run(
             &self,
             graph: &Graph,
-            routed: &[f32],
+            routed: &[i32],
             stacks: &dyn Fn(&str) -> poot_quant::PackedStackComponentRef,
         ) -> Result<poot_tensor::HostTensor, poot_eval::EvalError> {
             use poot_eval::{EvalBudget, EvalOptions, Value, eval};
@@ -3226,7 +3596,7 @@ mod tests {
                         activation.clone(),
                     ))
                 } else if id == self.ids {
-                    Value::from(poot_tensor::HostTensor::f32(vec![11], routed.to_vec()))
+                    Value::from(poot_tensor::HostTensor::i32(vec![11], routed.to_vec()))
                 } else {
                     Value::from(stacks(
                         graph.meta(id).name.as_deref().expect("a named carrier"),

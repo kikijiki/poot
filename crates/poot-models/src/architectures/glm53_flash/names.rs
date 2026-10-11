@@ -7,14 +7,17 @@
 //! tensor no row claims is ignored (a fine-tune may add tensors). No count of tensors is checked.
 //!
 //! The multi-token-prediction layers the checkpoint stores after the text layers
-//! (`num_nextn_predict_layers` of them, at the layer indices past the text stack) are claimed as
-//! known and read by no weight: the map's [`LoadReport`](poot_quant::weights::LoadReport) lists them
-//! as known, not unknown.
+//! (`num_nextn_predict_layers` of them, at the layer indices past the text stack) have a DSA block
+//! with no hyper-connections and the four tensors that fuse the embedding with the hidden state and
+//! norm the output ([`MtpRole`]). The first one is mapped and traced ([`Phase::Mtp`]); the others,
+//! and the embedding and head copies a layer may store (the shared head reads the target's), are
+//! claimed as known: the map's [`LoadReport`](poot_quant::weights::LoadReport) lists them as known,
+//! not unknown.
 
 use poot_quant::weights::{
     AttnRole, CompressRole, DsaRole, ExpertProj, FfnRole, KdaRole, MhcRole, MlaRole, MoeRole,
-    NormRole, WeightId, WeightKey, WeightMap, WeightMapBuilder, WeightMapError, WeightRole,
-    WeightStore, WeightView,
+    MtpRole, NormRole, WeightId, WeightKey, WeightMap, WeightMapBuilder, WeightMapError,
+    WeightRole, WeightStore, WeightView,
 };
 
 use super::FAMILY;
@@ -34,6 +37,7 @@ pub(super) fn weights_of(cfg: &Glm53Config, store: &WeightStore) -> Result<Weigh
     for (layer, kind) in cfg.layers.iter().enumerate() {
         rows.layer(cfg, layer, kind.mixer, kind.ffn)?;
     }
+    rows.mtp(cfg)?;
     rows.known(cfg);
     Ok(rows.map.build())
 }
@@ -124,14 +128,9 @@ impl Rows<'_> {
         mixer: Mixer,
         ffn: Ffn,
     ) -> Result<(), ModelError> {
-        let l = Some(layer);
         let at = |name: &str| format!("{LAYERS}{layer}.{name}");
+        self.norms(layer)?;
         for (role, name) in [
-            (WeightRole::Norm(NormRole::Attn), "input_layernorm.weight"),
-            (
-                WeightRole::Norm(NormRole::Ffn),
-                "post_attention_layernorm.weight",
-            ),
             (WeightRole::Mhc(MhcRole::AttnFn), "hc_attn_fn"),
             (WeightRole::Mhc(MhcRole::AttnBase), "hc_attn_base"),
             (WeightRole::Mhc(MhcRole::AttnScale), "hc_attn_scale"),
@@ -139,14 +138,35 @@ impl Rows<'_> {
             (WeightRole::Mhc(MhcRole::FfnBase), "hc_ffn_base"),
             (WeightRole::Mhc(MhcRole::FfnScale), "hc_ffn_scale"),
         ] {
-            self.tensor(role, l, at(name))?;
+            self.tensor(role, Some(layer), at(name))?;
         }
 
         match mixer {
             Mixer::Kda => self.kda(layer, &at("self_attn."))?,
             Mixer::Dsa => self.dsa(layer, &at("self_attn."))?,
         }
+        self.ffn(cfg, layer, ffn)
+    }
 
+    /// The two norms around a layer's blocks, `input_layernorm` and `post_attention_layernorm`.
+    fn norms(&mut self, layer: usize) -> Result<(), ModelError> {
+        for (role, name) in [
+            (WeightRole::Norm(NormRole::Attn), "input_layernorm.weight"),
+            (
+                WeightRole::Norm(NormRole::Ffn),
+                "post_attention_layernorm.weight",
+            ),
+        ] {
+            self.tensor(role, Some(layer), format!("{LAYERS}{layer}.{name}"))?;
+        }
+        Ok(())
+    }
+
+    /// A layer's feed-forward rows: one dense gated block, or the router, the shared expert and the
+    /// routed experts.
+    fn ffn(&mut self, cfg: &Glm53Config, layer: usize, ffn: Ffn) -> Result<(), ModelError> {
+        let l = Some(layer);
+        let at = |name: &str| format!("{LAYERS}{layer}.{name}");
         match ffn {
             Ffn::Dense => {
                 for (role, stem) in [
@@ -179,6 +199,31 @@ impl Rows<'_> {
             }
         }
         Ok(())
+    }
+
+    /// The first multi-token-prediction layer, at the index past the text stack: the fusing
+    /// projection and the three norms, then a DSA block and a feed-forward under the ordinary roles.
+    fn mtp(&mut self, cfg: &Glm53Config) -> Result<(), ModelError> {
+        let Some(mtp) = cfg.mtp else {
+            return Ok(());
+        };
+        let layer = cfg.layers.len();
+        let at = |name: &str| format!("{LAYERS}{layer}.{name}");
+        self.linear(
+            WeightRole::Mtp(MtpRole::EhProj),
+            Some(layer),
+            &at("eh_proj"),
+        )?;
+        for (role, name) in [
+            (MtpRole::ENorm, "enorm.weight"),
+            (MtpRole::HNorm, "hnorm.weight"),
+            (MtpRole::HeadNorm, "shared_head.norm.weight"),
+        ] {
+            self.tensor(WeightRole::Mtp(role), Some(layer), at(name))?;
+        }
+        self.norms(layer)?;
+        self.dsa(layer, &at("self_attn."))?;
+        self.ffn(cfg, layer, mtp.ffn)
     }
 
     /// A KDA mixer's rows under `prefix` (`...self_attn.`).
@@ -272,17 +317,26 @@ impl Rows<'_> {
         Ok(())
     }
 
-    /// Claim every tensor of the multi-token-prediction layers (the layer indices past the text
-    /// stack) as known: the family recognises them and traces none of them.
+    /// Claim as known what the family recognises and does not read: every tensor of the
+    /// multi-token-prediction layers past the first (one MTP layer is traced), and the embedding and
+    /// head copies the first stores (the shared head reads the target's embedding and head).
     fn known(&mut self, cfg: &Glm53Config) {
-        let text = cfg.layers.len();
+        let Some(mtp) = cfg.mtp else {
+            return;
+        };
+        let first = cfg.layers.len();
         for key in self.store.keys() {
-            let layer = key
+            let Some((layer, rest)) = key
                 .as_str()
                 .strip_prefix(LAYERS)
                 .and_then(|rest| rest.split_once('.'))
-                .and_then(|(index, _)| index.parse::<usize>().ok());
-            if layer.is_some_and(|l| (text..text + cfg.mtp_layers).contains(&l)) {
+                .and_then(|(index, rest)| Some((index.parse::<usize>().ok()?, rest)))
+            else {
+                continue;
+            };
+            let in_range = (first..first + mtp.count).contains(&layer);
+            let shared_copy = rest == "embed_tokens.weight" || rest.starts_with("shared_head.head");
+            if in_range && (layer > first || shared_copy) {
                 self.map.known(key.clone());
             }
         }

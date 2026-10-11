@@ -71,7 +71,7 @@ fn dyn_update_slice_plan_selection() {
         let mut ushape = dt.shape.clone();
         ushape[1] = 2;
         let update = b.constant("update", TensorType::new(ushape, dt.dtype));
-        let index = b.constant("index", TensorType::scalar(poot_tensor::DType::F32));
+        let index = b.constant("index", TensorType::scalar(poot_tensor::DType::I32));
         let out = b.dynamic_update_slice_dyn(operand, update, index, 1);
         let g = b.finish(out);
         let eqn = g
@@ -119,9 +119,7 @@ fn dyn_update_slice_plan_selection() {
         let (plan_, choice_) = plan_dyn(table, backend);
         assert_eq!(
             update_index(&plan_, choice_),
-            UpdateIndex::Runtime {
-                dtype: poot_kernel_ir::Ty::F32
-            },
+            UpdateIndex::Runtime,
             "{backend:?}"
         );
     }
@@ -164,7 +162,7 @@ fn dyn_update_slice_dynamic_gpu_matches_static() {
     let b = Builder::new();
     let operand = b.constant("operand", TensorType::f32(vec![rows, cap, cols]));
     let update = b.constant("update", TensorType::f32(vec![rows, 1, cols]));
-    let index = b.constant("index", TensorType::scalar(poot_tensor::DType::F32));
+    let index = b.constant("index", TensorType::scalar(poot_tensor::DType::I32));
     let out = b.dynamic_update_slice_dyn(operand, update, index, 1);
     let (oi, ui, ii) = (operand.id(), update.id(), index.id());
     let g = b.finish(out);
@@ -174,7 +172,7 @@ fn dyn_update_slice_dynamic_gpu_matches_static() {
         HostTensor::f32(vec![rows, cap, cols], operand_d.clone()),
     );
     inputs.insert(ui, HostTensor::f32(vec![rows, 1, cols], update_d.clone()));
-    inputs.insert(ii, HostTensor::scalar(idx as f32));
+    inputs.insert(ii, HostTensor::i32(vec![], vec![idx as i32]));
 
     let eval_inputs: HashMap<_, Value> = inputs
         .iter()

@@ -5,16 +5,28 @@
 //!
 //! The ops are exact (a gather, an integer-valued cast, one add, a dynamic update slice and a slice), so
 //! device, CPU oracle and the plain-Rust ground truth must agree bit for bit.
+//!
+//! A fourth variant (POOT-725) writes a state at a runtime I32 index that is a named `Slot::Activation`
+//! input, not a `Slot::Pos`: the index is bound by name as raw I32 words and the write lands at a nonzero
+//! offset.
 
 use poot_tensor::DType;
 use std::collections::HashMap;
 
 use poot_eval::Value;
-use poot_graph_ir::{BinOp, Builder, Graph, Slot, StateRole, Storage, TensorType, ValueId};
+use poot_graph_ir::{
+    BinOp, Builder, Graph, IndexRange, Slot, StateRole, Storage, TensorType, ValueId,
+};
 use poot_tensor::HostTensor;
 
 /// The step's positions: the `Slot::Pos` payload, the Gather rows and the DUS start (`POSITIONS[0]`).
 const POSITIONS: [i32; 4] = [3, 4, 5, 6];
+/// The DUS start of the named-activation variant: nonzero, so an index read as a denormal (0) misplaces the write.
+const ACTIVATION_START: i32 = 4;
+/// The tag of that variant's index input, and the name the graph gives the slot (`Slot::Activation` is named
+/// `activation.<tag>`).
+const START_TAG: &str = "start";
+const START_NAME: &str = "activation.start";
 const ROWS: usize = 16;
 const WIDTH: usize = 8;
 const CACHE_ROWS: usize = 32;
@@ -29,6 +41,8 @@ enum Use {
     Dus,
     /// v2: `dus(cache, gather + broadcast(cast(idx)), idx[0])`, sliced.
     CastDus,
+    /// v3: `dus(cache, table[0..4], start)`, sliced, with `start` a named `Slot::Activation` scalar I32.
+    ActivationDus,
 }
 
 /// One spike-562 micro graph with its input payloads.
@@ -47,6 +61,7 @@ fn i32_slot_gather_variants() -> Vec<I32SlotGatherVariant> {
         ("slot_gather_plus_cast_v0", Use::Cast),
         ("slot_gather_plus_dus_v1", Use::Dus),
         ("slot_gather_plus_cast_and_dus_v2", Use::CastDus),
+        ("dus_at_a_named_activation_index_v3", Use::ActivationDus),
     ]
     .into_iter()
     .map(|(name, kind)| I32SlotGatherVariant {
@@ -64,7 +79,30 @@ fn i32_slot_gather_variants() -> Vec<I32SlotGatherVariant> {
 fn build(kind: Use) -> Graph {
     let t = POSITIONS.len();
     let b = Builder::new();
-    let idx = b.slot(Slot::Pos, TensorType::new(vec![t], DType::I32));
+    if kind == Use::ActivationDus {
+        let start = b.slot_named(
+            Slot::Activation,
+            START_TAG,
+            TensorType::new(Vec::new(), DType::I32),
+        );
+        let table = b.constant("table", TensorType::f32(vec![ROWS, WIDTH]));
+        let cache = b.state_input(
+            "cache",
+            TensorType::f32(vec![CACHE_ROWS, WIDTH]),
+            StateRole::Recurrent,
+        );
+        let update = b.slice(table, 0, 0, t);
+        let written = b.dynamic_update_slice_dyn(cache, update, start, 0);
+        let out = b.slice(written, 0, 0, OUT_ROWS);
+        return b.finish_with_state(out, &[(cache, written)]);
+    }
+    // The positions index the table's rows, so the slot declares them below `ROWS`: the cast of the
+    // slot is then proven exact (POOT-726) and the binder checks the declaration.
+    let idx = b.slot_ranged(
+        Slot::Pos,
+        TensorType::new(vec![t], DType::I32),
+        IndexRange::below(ROWS).expect("a nonempty table"),
+    );
     let table = b.constant("table", TensorType::f32(vec![ROWS, WIDTH]));
     let rows = b.gather(table, 0, idx);
     let update = if kind == Use::Dus {
@@ -104,6 +142,9 @@ impl I32SlotGatherVariant {
                     (Storage::Slot(Slot::Pos), _) => {
                         HostTensor::i32(vec![POSITIONS.len()], POSITIONS.to_vec())
                     }
+                    (Storage::Slot(Slot::Activation), Some(START_NAME)) => {
+                        HostTensor::i32(Vec::new(), vec![ACTIVATION_START])
+                    }
                     (Storage::Const, Some("table")) => {
                         HostTensor::f32(vec![ROWS, WIDTH], self.table.clone())
                     }
@@ -122,7 +163,7 @@ impl I32SlotGatherVariant {
     pub fn state(&self) -> Vec<Vec<f32>> {
         match self.kind {
             Use::Cast => Vec::new(),
-            Use::Dus | Use::CastDus => vec![self.cache.clone()],
+            Use::Dus | Use::CastDus | Use::ActivationDus => vec![self.cache.clone()],
         }
     }
 
@@ -138,6 +179,13 @@ impl I32SlotGatherVariant {
         };
         match self.kind {
             Use::Cast => POSITIONS.iter().flat_map(|&p| row(p)).collect(),
+            Use::ActivationDus => {
+                let mut out = self.cache[..OUT_ROWS * WIDTH].to_vec();
+                let at = ACTIVATION_START as usize * WIDTH;
+                out[at..at + POSITIONS.len() * WIDTH]
+                    .copy_from_slice(&self.table[..POSITIONS.len() * WIDTH]);
+                out
+            }
             Use::Dus | Use::CastDus => {
                 let mut out = self.cache[..OUT_ROWS * WIDTH].to_vec();
                 let start = POSITIONS[0] as usize;

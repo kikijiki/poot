@@ -1,0 +1,170 @@
+{
+  "backend": "wgpu",
+  "case": "recurrence-scan-narrow-state",
+  "cells": {
+    "kernel": {
+      "repeats": [
+        {
+          "metrics": {
+            "step_us": 483.065
+          },
+          "slot": 0,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 473.197
+          },
+          "slot": 1,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 480.992
+          },
+          "slot": 2,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 469.399
+          },
+          "slot": 3,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 482.083
+          },
+          "slot": 4,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 479.15799999999996
+          },
+          "slot": 5,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 479.709
+          },
+          "slot": 6,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 470.38100000000003
+          },
+          "slot": 7,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 470.291
+          },
+          "slot": 8,
+          "status": "ok"
+        }
+      ]
+    }
+  },
+  "memory": [
+    {
+      "live_bytes": 1654784,
+      "peak_bytes": 1654784,
+      "role": "Weight"
+    },
+    {
+      "live_bytes": 589824,
+      "peak_bytes": 589824,
+      "role": "Activation"
+    },
+    {
+      "live_bytes": 32,
+      "peak_bytes": 589856,
+      "role": "Staging"
+    }
+  ],
+  "observed": {
+    "layout": "bhsd",
+    "shape": {
+      "d": 64,
+      "heads": 4,
+      "steps": 512
+    },
+    "storage": "f32",
+    "weight_bytes_per_copy": 1654784,
+    "weight_copies": 1
+  },
+  "plan": [
+    "scan [baceaa926e3e1dd82d674f76126f52ac9c8250a822629d87613d4afafdc1e2f3]"
+  ],
+  "plan_id": "3f59a3ee73c46fe07ed3284333af7a5dc74aa58e648fe37baab2f190e34c1743",
+  "recordings": 1,
+  "reference": {
+    "agrees": true,
+    "max_relative_error": 3.483022146729999e-08,
+    "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
+    "provenance": "independent-golden",
+    "tolerance": 0.002
+  },
+  "replays": 13,
+  "role": "baseline",
+  "schema": 1,
+  "command": [
+    "cargo",
+    "run",
+    "--release",
+    "-p",
+    "poot-gpu",
+    "--example",
+    "performance_bank",
+    "--",
+    "--bank",
+    "benchmarks/performance-bank/cases.json",
+    "--case",
+    "recurrence-scan-narrow-state",
+    "--out",
+    "benchmarks/performance-bank/receipts/wgpu/recurrence-scan-narrow-state.json"
+  ],
+  "parent_revision": "88f20d0bcd98025ef3ba1a513c751afab816254a",
+  "binary_sha256": "1a099b137867355838e0810568bb63fdae2ea1a0b71189802530410e9f40a7f4",
+  "identity": {
+    "checkpoint_digest": "synthetic-no-checkpoint",
+    "token_fixture": "splitmix64-seed0-unit:237900849bc67b83",
+    "precision": "f32",
+    "layout": "bhsd",
+    "dimensions": {
+      "heads": 4,
+      "d": 64,
+      "steps": 512
+    },
+    "prompt_tokens": 1,
+    "live_context": "n/a",
+    "max_context": "n/a",
+    "requested_output": "n/a",
+    "actual_output": "n/a",
+    "sampler": "n/a",
+    "template": "n/a",
+    "cache_state": {
+      "condition": "weights-resident-hot",
+      "id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb"
+    },
+    "prepared_set": [
+      "recurrence-scan-narrow-state"
+    ],
+    "timing_policy": {
+      "warmup": 3,
+      "repeats": 9,
+      "clock": "wall step plus readback",
+      "profiled": false
+    },
+    "backend": "wgpu",
+    "device": "AMD Radeon 8060S Graphics",
+    "driver": "host kernel 7.2.9"
+  },
+  "identity_digest": "6119332034e17d8c4c2311a3d60d95d9db31fd51ef4f0ef12badb6365a79d701",
+  "schedule_id": "0025f9f93a3783297d48f02335370f21db17d7e285fc7929024e391dd5d514cb"
+}

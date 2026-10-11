@@ -173,6 +173,7 @@ pub(super) fn options(chunk: usize, capacity: usize) -> DriverOptions {
         },
         charge: crate::driver::program_retention,
         draft: crate::driver::DraftPolicy::Off,
+        hidden_window: None,
     }
 }
 
@@ -4195,6 +4196,166 @@ per_backend!(
     glm53_flash_every_position_matches_the_reference_in_pieces_of_two_ptx
 );
 
+/// The independent f64 reference's logits of the GLM-5.3-Flash fixture's MTP chain (`k = 3` over a
+/// six-token prefix and a bonus token), one line per draft step
+/// (`glm53_flash::tests::the_device_mtp_logit_literals_are_the_references_chain` pins the file to the
+/// reference).
+const GLM53_FLASH_REFERENCE_MTP_LOGITS: &str =
+    include_str!("device_tests/glm53_flash_reference_mtp_logits.txt");
+
+/// POOT-1110: the `Phase::Mtp` program of the GLM-5.3-Flash fixture executes on the device through the
+/// executor contract (compile, load, add entry, step; no driver role) over the carry the target's own
+/// prefill wrote into the executable's shared state. The target prefills six tokens with a hidden-state
+/// carry; the MTP layer then catches up over all six positions with the token that follows each (the
+/// last the bonus), and two one-token chain steps each feed the greedy draft of the step before and
+/// read the post-norm state that step left in the carry. Every draft step's whole logit row equals the
+/// f64 reference chain's within `2e-3` and every draft token is the reference's. Mutation: swap the
+/// concatenation order in `glm53_flash::mtp::MtpLayer::trace`; the first logit row leaves the reference
+/// and the row goes red.
+fn glm53_flash_mtp_chain_matches_the_reference(choice: BackendChoice) {
+    use poot_executor::{HostView, NoSync, StepInputs};
+    use poot_graph_ir::{Slot, SlotKey};
+    use poot_graph_plan::{
+        DeviceId, DevicePlacement, ExpertPlacement, Partition, WeightFormats, bind_packed_weights,
+        compile_staged,
+    };
+    use poot_models::components::standard::HIDDEN_CARRY_STATE;
+    use poot_models::model::{HiddenCarry, KvLayout, LogitRows, Phase, StepShape};
+
+    const PREFIX: [i32; 6] = [3, 17, 40, 8, 25, 9];
+    const BONUS: i32 = 31;
+    const K: usize = 3;
+    let recorded = RECORDED
+        .iter()
+        .find(|recorded| recorded.family == "glm53_flash")
+        .unwrap();
+    let handle = recorded_family_handle(recorded);
+    let model = handle.model();
+    let want: Vec<Vec<f64>> = GLM53_FLASH_REFERENCE_MTP_LOGITS
+        .lines()
+        .map(|line| line.split(' ').map(|v| v.parse().unwrap()).collect())
+        .collect();
+    assert_eq!(want.len(), K);
+    let Some(mut exec) = open(choice) else {
+        return;
+    };
+    let carry = HiddenCarry {
+        positions: nz((K + 1).max(PREFIX.len())),
+    };
+    let shape = |tokens: usize| StepShape {
+        rows: nz(1),
+        tokens: nz(tokens),
+        capacity: nz(16),
+        kv: KvLayout::Contiguous,
+        logits: LogitRows::Last,
+        hidden: Some(carry),
+    };
+    let formats = WeightFormats::from_weight_map(model.weights());
+    let exe = exec
+        .load_weights(
+            Arc::new(handle.store().clone()),
+            Arc::new(model.weights().clone()),
+        )
+        .unwrap();
+    // One entry per program, all on the one executable: the carry is shared by its name and aval.
+    let mut entry = |phase: Phase, tokens: usize| {
+        let graph = model.trace(phase, shape(tokens)).unwrap();
+        assert!(
+            graph
+                .state
+                .iter()
+                .any(|&(input, _)| graph.meta(input).name.as_deref() == Some(HIDDEN_CARRY_STATE)),
+            "{phase:?} at {tokens} tokens declares the carry"
+        );
+        let graph = bind_packed_weights(&graph, &formats).unwrap();
+        let program = compile_staged(
+            &graph,
+            &exec.target_set(),
+            &Partition {
+                experts: ExpertPlacement::AllResident,
+                devices: DevicePlacement::Single(DeviceId(0)),
+            },
+            &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+        )
+        .unwrap_or_else(|e| panic!("{phase:?} at {tokens} tokens on {choice:?}: {e}"));
+        exec.add_entry(exe, &program).unwrap()
+    };
+    let prefill = entry(Phase::Prefill, PREFIX.len());
+    let catch_up = entry(Phase::Mtp, PREFIX.len());
+    let chain = entry(Phase::Mtp, 1);
+
+    let mut run = |entry, tokens: &[i32], start: i32| -> Vec<f32> {
+        let shape = [1, tokens.len()];
+        let token_bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+        let pos_bytes: Vec<u8> = (start..)
+            .take(tokens.len())
+            .flat_map(|p| p.to_le_bytes())
+            .collect();
+        let mut inputs = StepInputs::new();
+        for (slot, bytes) in [(Slot::Token, &token_bytes), (Slot::Pos, &pos_bytes)] {
+            inputs.push(
+                SlotKey::new(slot, None),
+                &shape,
+                HostView::new(poot_tensor::DType::I32, tokens.len(), bytes).unwrap(),
+            );
+        }
+        let bytes = exec
+            .step(exe, entry, &inputs, &mut NoSync)
+            .unwrap_or_else(|e| panic!("step on {choice:?}: {e}"))
+            .read()
+            .unwrap();
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect()
+    };
+    run(prefill, &PREFIX, 0);
+    let following: Vec<i32> = PREFIX[1..].iter().copied().chain([BONUS]).collect();
+    let n = PREFIX.len();
+    let mut steps = vec![run(catch_up, &following, 0)];
+    for i in 1..K {
+        let previous = &steps[i - 1];
+        let token = previous
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap()
+            .0 as i32;
+        steps.push(run(chain, &[token], (n - 1 + i) as i32));
+    }
+    let argmax = |row: &[f64]| {
+        row.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap()
+            .0
+    };
+    for (step, (got, want)) in steps.iter().zip(&want).enumerate() {
+        assert_eq!(got.len(), want.len(), "the whole vocabulary");
+        for (token, (&got, &want)) in got.iter().zip(want).enumerate() {
+            assert!(
+                (f64::from(got) - want).abs() <= 2e-3 * (1.0 + want.abs()),
+                "glm53_flash MTP on {choice:?}, draft step {step}, token {token}: logit {got}, \
+                 the reference gives {want}"
+            );
+        }
+        let got_row: Vec<f64> = got.iter().map(|&v| f64::from(v)).collect();
+        assert_eq!(
+            argmax(&got_row),
+            argmax(want),
+            "draft step {step}: the draft token"
+        );
+    }
+}
+per_backend!(
+    glm53_flash_mtp_chain_matches_the_reference,
+    glm53_flash_mtp_chain_matches_the_reference_wgpu,
+    glm53_flash_mtp_chain_matches_the_reference_rocm,
+    glm53_flash_mtp_chain_matches_the_reference_ptx
+);
+
 /// POOT-570 SC-005: three positions of the MiniMax-M2 fixture through the driver against the reference:
 /// the greedy tokens after a three-token prompt and the log-probability of each (within 1e-3), which
 /// read the key and value caches of every earlier position. Literals are the reference's
@@ -4252,6 +4413,7 @@ fn oracle_step_logits(
             capacity: nz(capacity),
             kv: KvLayout::Contiguous,
             logits: LogitRows::Last,
+            hidden: None,
         };
         let graph = model.trace(phase, shape).unwrap();
         let formats = poot_graph_plan::WeightFormats::from_weight_map(model.weights());
@@ -4486,6 +4648,7 @@ fn encode_shape(rows: usize, tokens: usize) -> StepShape {
         capacity: nz(tokens),
         kv: KvLayout::Contiguous,
         logits: LogitRows::All,
+        hidden: None,
     }
 }
 
@@ -4662,6 +4825,7 @@ fn decoder_encode_matches_the_oracle_and_its_recorded_mean(choice: BackendChoice
             capacity: nz(5),
             kv: KvLayout::Contiguous,
             logits: LogitRows::All,
+            hidden: None,
         },
         &[
             (SlotKey::new(Slot::Token, None), tokens),

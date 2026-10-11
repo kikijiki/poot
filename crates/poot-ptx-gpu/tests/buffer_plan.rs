@@ -169,7 +169,7 @@ fn len_probe_reads_the_operand_own_length_never_a_larger_slots_capacity_on_ptx()
     poot_codegen::compile(&body, poot_codegen::Target::Nvptx, &out_path)
         .expect("len_probe must compile to PTX");
     let bytes = std::fs::read(&out_path).unwrap();
-    let compiled = poot_codegen::kernel_handle(&body, poot_codegen::Target::Nvptx, bytes);
+    let compiled = poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::Nvptx, bytes);
     let kernel = device
         .load_kernel("sc002_len_probe", compiled)
         .expect("load the len_probe kernel");

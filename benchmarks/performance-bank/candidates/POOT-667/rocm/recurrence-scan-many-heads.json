@@ -1,0 +1,170 @@
+{
+  "backend": "rocm",
+  "case": "recurrence-scan-many-heads",
+  "cells": {
+    "kernel": {
+      "repeats": [
+        {
+          "metrics": {
+            "step_us": 6069.824
+          },
+          "slot": 0,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 6083.749000000001
+          },
+          "slot": 1,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 5951.261
+          },
+          "slot": 2,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 6086.073
+          },
+          "slot": 3,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 6328.317
+          },
+          "slot": 4,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 5876.381
+          },
+          "slot": 5,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 6161.724999999999
+          },
+          "slot": 6,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 6198.003
+          },
+          "slot": 7,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 6812.314
+          },
+          "slot": 8,
+          "status": "ok"
+        }
+      ]
+    }
+  },
+  "memory": [
+    {
+      "live_bytes": 29491200,
+      "peak_bytes": 29491200,
+      "role": "Weight"
+    },
+    {
+      "live_bytes": 12582912,
+      "peak_bytes": 12582912,
+      "role": "Activation"
+    },
+    {
+      "live_bytes": 112,
+      "peak_bytes": 112,
+      "role": "Meta"
+    }
+  ],
+  "observed": {
+    "layout": "bhsd",
+    "shape": {
+      "d": 128,
+      "heads": 64,
+      "steps": 256
+    },
+    "storage": "f32",
+    "weight_bytes_per_copy": 29491200,
+    "weight_copies": 1
+  },
+  "plan": [
+    "scan [f2a67a80bb5a35e2f70f072df96b9a617eb8ec8645cbd2541b6ce275e05f266a]"
+  ],
+  "plan_id": "46e1d8150c8836ac824ec6a9e73d4c0d88e5c84bded974083d8da4d739f50612",
+  "recordings": 1,
+  "reference": {
+    "agrees": true,
+    "max_relative_error": 9.729629341899762e-08,
+    "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
+    "provenance": "independent-golden",
+    "tolerance": 0.002
+  },
+  "replays": 13,
+  "role": "baseline",
+  "schema": 1,
+  "command": [
+    "cargo",
+    "run",
+    "--release",
+    "-p",
+    "poot-rocm-gpu",
+    "--example",
+    "performance_bank",
+    "--",
+    "--bank",
+    "benchmarks/performance-bank/cases.json",
+    "--case",
+    "recurrence-scan-many-heads",
+    "--out",
+    "benchmarks/performance-bank/receipts/rocm/recurrence-scan-many-heads.json"
+  ],
+  "parent_revision": "88f20d0bcd98025ef3ba1a513c751afab816254a",
+  "binary_sha256": "d582328a01926b67d81d4085cd6bf907c3c1136fbcf48d395e5f0d38e05af1e5",
+  "identity": {
+    "checkpoint_digest": "synthetic-no-checkpoint",
+    "token_fixture": "splitmix64-seed0-unit:237900849bc67b83",
+    "precision": "f32",
+    "layout": "bhsd",
+    "dimensions": {
+      "heads": 64,
+      "d": 128,
+      "steps": 256
+    },
+    "prompt_tokens": 1,
+    "live_context": "n/a",
+    "max_context": "n/a",
+    "requested_output": "n/a",
+    "actual_output": "n/a",
+    "sampler": "n/a",
+    "template": "n/a",
+    "cache_state": {
+      "condition": "weights-resident-hot",
+      "id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb"
+    },
+    "prepared_set": [
+      "recurrence-scan-many-heads"
+    ],
+    "timing_policy": {
+      "warmup": 3,
+      "repeats": 9,
+      "clock": "wall step plus readback",
+      "profiled": false
+    },
+    "backend": "rocm",
+    "device": "AMD Radeon 8060S Graphics",
+    "driver": "host kernel 7.2.9"
+  },
+  "identity_digest": "62555c1b559f74007f398d2abc5a62a313f761da8f210924dae1dd2ec27846b4",
+  "schedule_id": "0025f9f93a3783297d48f02335370f21db17d7e285fc7929024e391dd5d514cb"
+}

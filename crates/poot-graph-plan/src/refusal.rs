@@ -68,8 +68,9 @@ pub enum Capability {
         workgroup_width: usize,
         limit: usize,
     },
-    /// The op has no exact I32 lowering (reduction, row fusion, a division without total exact
-    /// semantics, a unary that is not an exact integer primitive, a remainder by a literal zero).
+    /// The op has no I32 kernel (reduction, row fusion, a division without total exact semantics, a unary
+    /// that is not an exact integer primitive, a remainder by a literal zero). Every such refusal names a
+    /// missing kernel: an I32 value is always stored as I32 words.
     ExactI32Op,
     /// The equation is an unfolded `Iota`. It is a pure compile-time constant: `transform::fold_iota`
     /// folds it to a `Storage::Computed` graph constant before planning (R466-019), so no kernel exists.
@@ -118,6 +119,9 @@ pub enum Capability {
         format: poot_quant::format::WeightFormat,
         op: crate::packed_block_float::PackedKernelOpKind,
     },
+    /// The plan is not an AIE sequential schedule: an AIE core runs one loop, so a plan built from a thread
+    /// grid or a shipped GPU template cannot run there.
+    AieSchedule,
 }
 
 /// What a fused region step cannot be lowered to, by the region's arithmetic.
@@ -148,8 +152,6 @@ pub enum StorageGap {
     /// An E4M3FN `DenseRowGather` table is stored packed four elements per `u32` word with padded rows
     /// (POOT-1060), so it must be a const no other equation reads and no output observes.
     E4m3PackedLanes,
-    /// Exact I32 values compile, but production bind, replay and typed readback are not wired.
-    ExactI32BindReplay,
 }
 
 impl RefusalDtypes {
@@ -283,7 +285,7 @@ impl fmt::Display for Capability {
                 f,
                 "the packed E4M3FN dispatch needs {threads} threads ({workgroups_x} x-workgroups at width {workgroup_width}), above the grid limit {limit}"
             ),
-            Capability::ExactI32Op => f.write_str("no exact I32 lowering for this op"),
+            Capability::ExactI32Op => f.write_str("no I32 kernel for this op"),
             Capability::UnfoldedIota => f.write_str(
                 "iota must be folded to a computed constant before planning (transform::fold_iota)",
             ),
@@ -328,6 +330,9 @@ impl fmt::Display for Capability {
             Capability::PackedLowering { format, op } => {
                 write!(f, "no packed lowering admits {format:?} for {op:?}")
             }
+            Capability::AieSchedule => f.write_str(
+                "the plan is not an AIE sequential schedule (a shipped GPU template or a thread-grid kernel)",
+            ),
         }
     }
 }
@@ -368,9 +373,6 @@ impl fmt::Display for StorageGap {
                 "a packed-E4M3 row-gather table must be a const read only by dense row gathers, \
                  not a computed value, an output or a buffer another kernel reads as raw bytes",
             ),
-            StorageGap::ExactI32BindReplay => {
-                f.write_str("production bind, replay and typed readback are not wired")
-            }
         }
     }
 }

@@ -4,8 +4,9 @@ mod kernel;
 mod memory;
 pub mod telemetry;
 pub use kernel::{
-    ArgAccess, ArgSchema, CompiledKernel, KernelArgError, KernelCode, check_element_schema,
-    check_kernel_args,
+    AieArtifactError, AieBindError, AieBinding, AieBound, AieLinkedArtifact, AieShapeAbi,
+    ArgAccess, ArgSchema, CompiledKernel, KernelArgError, KernelCode, check_aie_bindings,
+    check_element_schema, check_kernel_args,
 };
 pub use memory::{AllocGuard, BufferRole, MemoryCounterSnapshot, MemoryCounters};
 pub use telemetry::{

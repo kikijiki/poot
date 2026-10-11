@@ -37,6 +37,7 @@ fn shape(
         capacity: nz(capacity),
         kv,
         logits,
+        hidden: None,
     }
 }
 

@@ -48,6 +48,7 @@ fn step(tokens: usize, capacity: usize) -> StepShape {
         capacity: NonZeroUsize::new(capacity).unwrap(),
         kv: KvLayout::Contiguous,
         logits: LogitRows::Last,
+        hidden: None,
     }
 }
 

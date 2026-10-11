@@ -1,0 +1,120 @@
+{
+  "card": "POOT-1112",
+  "candidate": "scan row split applies to the SSD family (planner family gate removed)",
+  "policy": {
+    "direction": "lower",
+    "practical_threshold": 0.2,
+    "max_uncertainty": 0.1
+  },
+  "entries": [
+    {
+      "backend": "ptx",
+      "case": "ssd-long-recurrence-scan",
+      "verdict": "improvement",
+      "baseline_median_us": 25258.996,
+      "candidate_median_us": 5272.732,
+      "note": " pooled over 3 interleaved parent/candidate runs (27/27 repeats); same plan: False",
+      "reference_agrees": true
+    },
+    {
+      "backend": "ptx",
+      "case": "ssd-recurrence-scan-boundary",
+      "verdict": "improvement",
+      "baseline_median_us": 1963.1929999999998,
+      "candidate_median_us": 549.147,
+      "note": " pooled over 3 interleaved parent/candidate runs (27/27 repeats); same plan: False",
+      "reference_agrees": true
+    },
+    {
+      "backend": "ptx",
+      "case": "ssd-recurrence-scan-many-heads",
+      "verdict": "unverified",
+      "baseline_median_us": 4875.036999999999,
+      "candidate_median_us": 5008.198,
+      "note": "band 15.6% exceeds the tolerated uncertainty 10.0%; the repeat budget is exhausted pooled over 3 interleaved parent/candidate runs (27/27 repeats); same plan: True",
+      "reference_agrees": true
+    },
+    {
+      "backend": "ptx",
+      "case": "ssd-recurrence-scan-short",
+      "verdict": "within noise",
+      "baseline_median_us": 285.183,
+      "candidate_median_us": 283.743,
+      "note": " pooled over 3 interleaved parent/candidate runs (27/27 repeats); same plan: True",
+      "reference_agrees": true
+    },
+    {
+      "backend": "rocm",
+      "case": "ssd-long-recurrence-scan",
+      "verdict": "improvement",
+      "baseline_median_us": 8286.249000000002,
+      "candidate_median_us": 1966.242,
+      "note": "",
+      "reference_agrees": true
+    },
+    {
+      "backend": "rocm",
+      "case": "ssd-recurrence-scan-boundary",
+      "verdict": "improvement",
+      "baseline_median_us": 1036.737,
+      "candidate_median_us": 231.482,
+      "note": " pooled over 5 interleaved parent/candidate runs (45/45 repeats); same plan: False",
+      "reference_agrees": true
+    },
+    {
+      "backend": "rocm",
+      "case": "ssd-recurrence-scan-many-heads",
+      "verdict": "unverified",
+      "baseline_median_us": 3182.22,
+      "candidate_median_us": 3009.8070000000002,
+      "note": "band 25.2% exceeds the tolerated uncertainty 10.0%; more repeats may narrow it",
+      "reference_agrees": true
+    },
+    {
+      "backend": "rocm",
+      "case": "ssd-recurrence-scan-short",
+      "verdict": "unverified",
+      "baseline_median_us": 158.90699999999998,
+      "candidate_median_us": 152.185,
+      "note": "band 91.5% exceeds the tolerated uncertainty 10.0%; more repeats may narrow it",
+      "reference_agrees": true
+    },
+    {
+      "backend": "wgpu",
+      "case": "ssd-long-recurrence-scan",
+      "verdict": "improvement",
+      "baseline_median_us": 9815.553,
+      "candidate_median_us": 2170.123,
+      "note": "",
+      "reference_agrees": true
+    },
+    {
+      "backend": "wgpu",
+      "case": "ssd-recurrence-scan-boundary",
+      "verdict": "improvement",
+      "baseline_median_us": 1438.273,
+      "candidate_median_us": 320.441,
+      "note": "",
+      "reference_agrees": true
+    },
+    {
+      "backend": "wgpu",
+      "case": "ssd-recurrence-scan-many-heads",
+      "verdict": "unverified",
+      "baseline_median_us": 2815.6740000000004,
+      "candidate_median_us": 3157.765,
+      "note": "band 51.1% exceeds the tolerated uncertainty 10.0%; more repeats may narrow it",
+      "reference_agrees": true
+    },
+    {
+      "backend": "wgpu",
+      "case": "ssd-recurrence-scan-short",
+      "verdict": "unverified",
+      "baseline_median_us": 237.976,
+      "candidate_median_us": 321.452,
+      "note": "band 199.8% exceeds the tolerated uncertainty 10.0%; more repeats may narrow it",
+      "reference_agrees": true
+    }
+  ],
+  "method": "wgpu and ROCm (except the ROCm boundary row) compare one candidate receipt with the checked-in baseline; the ROCm boundary row and every PTX row pool the repeats of interleaved parent/candidate runs of prebuilt binaries (parent = the planner with the SSD family gate, candidate = this branch)"
+}

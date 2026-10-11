@@ -2090,7 +2090,7 @@ fn compile_and_load(
     let out = poot_codegen::artifact_path(&dir, name, target);
     poot_codegen::compile(body, target, &out).unwrap_or_else(|e| panic!("compile {name}: {e}"));
     let bytes = std::fs::read(&out).unwrap_or_else(|e| panic!("read compiled {name}: {e}"));
-    let kernel = poot_codegen::kernel_handle(body, target, bytes);
+    let kernel = poot_codegen::kernel_handle(body, poot_codegen::GpuTarget::AmdGcn(arch), bytes);
     let module = ctx
         .load_hsaco(&kernel)
         .unwrap_or_else(|e| panic!("load_hsaco {name}: {e}"));

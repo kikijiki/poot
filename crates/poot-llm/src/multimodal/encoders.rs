@@ -59,6 +59,7 @@ fn open(
         },
         charge: program_retention,
         draft: DraftPolicy::Off,
+        hidden_window: None,
     };
     Ok((Driver::new(Arc::clone(&handle), executor, options)?, handle))
 }

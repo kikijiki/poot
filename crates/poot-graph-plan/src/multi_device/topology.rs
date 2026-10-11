@@ -81,6 +81,6 @@ pub(crate) fn backend_link_kinds(backend: Backend) -> &'static [CollectiveKind] 
             CollectiveKind::AllGather,
             CollectiveKind::AllToAll,
         ],
-        Backend::SpirvVulkan | Backend::AmdGcn(_) => &[],
+        Backend::SpirvVulkan | Backend::AmdGcn(_) | Backend::Aie(_) => &[],
     }
 }

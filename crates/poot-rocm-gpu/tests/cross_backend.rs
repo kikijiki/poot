@@ -53,15 +53,8 @@ fn run_once_rocm(
             .get(&id)
             .unwrap_or_else(|| panic!("run_once_rocm: no input bound for const {name}"));
         let tensor = value.as_host().expect("dense const input");
-        let bytes = StoredBytes::from(
-            tensor
-                .as_f32()
-                .unwrap()
-                .iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect::<Vec<u8>>(),
-        );
-        let dense = DenseWeight::try_new(DType::F32, tensor.shape().to_vec(), bytes).unwrap();
+        let bytes = StoredBytes::from(tensor.view().bytes().to_vec());
+        let dense = DenseWeight::try_new(tensor.dtype(), tensor.shape().to_vec(), bytes).unwrap();
         builder.insert(name, WeightEntry::Dense(dense)).unwrap();
     }
     let store = Arc::new(builder.build());
@@ -681,14 +674,15 @@ fn gather_axis0_rocm_matches_cpu() {
     let idx_count = 3usize;
     let b = Builder::new();
     let data = b.constant("data", TensorType::f32(vec![n, d]));
-    let idx = b.constant("idx", TensorType::f32(vec![idx_count]));
+    let idx = b.constant(
+        "idx",
+        TensorType::new(vec![idx_count], poot_tensor::DType::I32),
+    );
     let out = b.gather(data, 0, idx);
     let (di, ii) = (data.id(), idx.id());
     let g = b.finish(out);
-    let inputs = make_inputs(&[
-        (di, vec![n, d], fill(901, n * d)),
-        (ii, vec![idx_count], vec![3.0, 0.0, 6.0]),
-    ]);
+    let mut inputs = make_inputs(&[(di, vec![n, d], fill(901, n * d))]);
+    inputs.insert(ii, HostTensor::i32(vec![idx_count], vec![3, 0, 6]).into());
     let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
         .unwrap()
         .output
@@ -705,10 +699,10 @@ fn gather_axis0_rocm_matches_cpu() {
 }
 
 /// A `Gather` over an I32 const table whose words need all 32 bits ([`poot_test_util::i32_table_gather`])
-/// returns the table's words exactly on ROCm: the table is stored as raw I32, not as its F32 mirror.
+/// returns the table's words exactly on ROCm: the table is stored as raw I32.
 ///
-/// Mutation: pin the Gather-over-I32-data component to the mirror lane (drop the `pinned` pass of
-/// `ExactI32StorageAnalysis::new`); the output is the table rounded through F32 and this row goes red.
+/// Mutation: type the I32 table through `Ty::F32` in `movement_storage`; the output is the table rounded
+/// through F32 and this row goes red.
 #[test]
 fn i32_table_gather_is_exact_beyond_f32_rocm() {
     use poot_test_util::i32_table_gather as fixture;

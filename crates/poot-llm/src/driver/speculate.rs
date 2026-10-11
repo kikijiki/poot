@@ -8,14 +8,27 @@
 //! logits: All, .. }`), so every family that traces chunked prefill verifies; nothing lists families.
 //! `prepare` compiles one window entry per row count beside decode. A row with fewer than `k`
 //! proposals repeats its last draft as filler to the window's width, and verification reads only the
-//! picks of the real drafts (masked by length), so a changing proposal count never recompiles. A row
-//! with no proposal, or too near its capacity to hold the window, is an ordinary decode step.
+//! picks of the real drafts (masked by length), so a changing proposal count never recompiles. (A
+//! recurrent model's window is exactly as wide as the row's drafts instead, see below.) A row with no
+//! proposal, or too near its capacity to hold the window, is an ordinary decode step.
 //!
 //! A [`DraftPolicy::DraftModel`] loads a second executable on the same executor. Its entries are the
 //! same shapes as the target's and its state is addressed through the same block tables, so the
-//! sequences mirror each other through the one `open`/`commit`/`release` surface. Speculation is
-//! refused typed for a model whose state is recurrent: a rejected draft token has already been folded
-//! into that state and `commit(kept)` cannot undo it.
+//! sequences mirror each other through the one `open`/`commit`/`release` surface. A draft model
+//! with recurrent state is refused typed: only the target's state is rolled back.
+//!
+//! A target with `StateRole::Recurrent` state rolls back by copy (POOT-631, POOT-647): before the
+//! window runs, the rows that hold drafts are copied into a shadow state set ([`super::snapshot`]).
+//! The window is as wide as the row's drafts, because filler would fold into the state: rows are
+//! grouped by width, and `prepare` admits every width `2..=k + 1`. A row that keeps every draft keeps
+//! the live state; a row that rejects one is restored from the shadow and replays its kept prefix,
+//! the query token and the accepted drafts, as one chunk of a prepared width `1..=k`. The bonus
+//! token is the next step's query, so it is never folded early. `commit(kept)` must keep the whole
+//! result of such a row or end the sequence: recurrent state holds the folded kept prefix and cannot
+//! step back from it, so a shorter commit followed by another step is refused typed
+//! ([`InvalidRequest::RecurrentStateAhead`](super::error::InvalidRequest)). Positional state needs none of this: a stale K/V write is masked until the
+//! next write overwrites it. A model whose recurrent state advances in granules of more than one
+//! token is refused typed ([`SpeculationRefusal::RecurrentGranule`]).
 //!
 //! Acceptance is greedy (a draft survives while it equals the target's argmax) or, for a sampled row,
 //! speculative sampling over host distributions ([`spec_sample_round`]): the target's `p` from
@@ -29,12 +42,20 @@ use std::sync::Arc;
 
 use poot_executor::ExecutableId;
 use poot_graph_plan::WeightFormats;
+use poot_models::model::{KvLayout, LogitRows, Phase, StepShape};
 
-use super::error::{DraftMismatch, DriverError, SpeculationRefusal, Unsupported};
+use super::chunks::Piece;
+use super::error::{
+    DraftMismatch, DriverError, PreparedSetRefusal, SpeculationRefusal, Unsupported,
+};
 use super::handle::ModelHandle;
-use super::step::{Lane, Readback, RowPlan, SeqId, StepRow};
+use super::lora::GenerationId;
+use super::snapshot::copy_rows;
+use super::step::{Lane, Readback, RowPlan, SeqId, StepRow, serving_phase};
 use super::suffix::{self, Head};
-use super::{Driver, ModelRole, StateResidency};
+use super::{
+    Driver, EntryKey, ModelRole, ServingShapes, SlotRole, StateResidency, StepData, window_wall,
+};
 use crate::core::sampler::{Sampler, SamplerFault};
 use crate::text::tokenize::TextCodec;
 
@@ -120,6 +141,11 @@ pub struct SpeculationStats {
     pub skipped_no_room: u64,
     /// Decode rows that decoded one token because nothing was proposed.
     pub skipped_no_proposal: u64,
+    /// Verified rows that rejected a draft, so their recurrent state was restored from its snapshot
+    /// and replayed. Zero for positional state.
+    pub restored: u64,
+    /// Tokens those replays folded back into recurrent state.
+    pub replayed: u64,
 }
 
 impl SpeculationStats {
@@ -138,6 +164,26 @@ impl SpeculationStats {
             }
         }
     }
+}
+
+/// The engine wall time of one kind of rollback step, summed: the steps run and the time the
+/// executor measured for them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StepTime {
+    pub steps: u64,
+    pub wall: std::time::Duration,
+}
+
+/// What a recurrent target's rounds spent on rollback, measured on a driver built
+/// [`Driver::with_phase_timing`](super::Driver::with_phase_timing) (zero otherwise): the snapshot
+/// copy before a window, the restore copy after a rejecting one, and the replay chunks that follow
+/// it. The engine's own clock, so a replay's share of a decode step is read against the decode
+/// phase of [`GenerationTiming`](super::GenerationTiming).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RollbackTiming {
+    pub snapshots: StepTime,
+    pub restores: StepTime,
+    pub replays: StepTime,
 }
 
 /// The salt that derives the draft's proposal stream from a row's sampler: one request seed gives two
@@ -247,11 +293,19 @@ impl Driver {
         }
     }
 
-    /// Refuse speculation on a model whose state is recurrent, read from the state roles of what
-    /// compiled.
+    /// Refuse speculation on a model whose recurrent state the rollback cannot cover, read from the
+    /// state roles and the config of what compiled. The snapshot copies every `Recurrent` pair of the
+    /// program, so the one case left is a granule above one token, which the replay chunk cannot
+    /// honor.
     pub(super) fn check_speculation_state(&self) -> Result<(), DriverError> {
-        if self.speculation.policy.caps().is_some() && self.residency == StateResidency::Recurrent {
-            return Err(Unsupported::Speculation(SpeculationRefusal::RecurrentState).into());
+        if self.speculation.policy.caps().is_none() || self.residency != StateResidency::Recurrent {
+            return Ok(());
+        }
+        let granule = self.handle.config().prefill_granule.get();
+        if granule > 1 {
+            return Err(
+                Unsupported::Speculation(SpeculationRefusal::RecurrentGranule { granule }).into(),
+            );
         }
         Ok(())
     }
@@ -307,21 +361,277 @@ impl Driver {
                 }
             };
             if let Some(&last) = proposal.drafts.last() {
-                // Every window is `window` wide, so a changing proposal count never changes the
-                // entry. A row with fewer drafts repeats its last one as filler: causal attention
-                // keeps a position's pick independent of what follows it, and verification reads
-                // only the picks of the real drafts (masked by length).
+                // A positional model's window is `window` wide, so a changing proposal count never
+                // changes the entry. A row with fewer drafts repeats its last one as filler: causal
+                // attention keeps a position's pick independent of what follows it, and
+                // verification reads only the picks of the real drafts (masked by length). Filler
+                // would fold into recurrent state, so a recurrent model's window is as wide as its
+                // drafts; its rows are grouped by width and each width is a prepared entry.
                 plan.feed.extend_from_slice(&proposal.drafts);
-                let window = self
-                    .speculation
-                    .policy
-                    .caps()
-                    .expect("a proposal needs a policy")
-                    .window;
-                plan.feed.resize(window.get(), last);
+                if self.residency != StateResidency::Recurrent {
+                    let window = self
+                        .speculation
+                        .policy
+                        .caps()
+                        .expect("a proposal needs a policy")
+                        .window;
+                    plan.feed.resize(window.get(), last);
+                }
                 plan.picks = plan.feed.len();
             }
             plan.spec = Some(SpecRow { room, proposal });
+        }
+        self.snapshot_rows(rows, plans)
+    }
+
+    /// The rollback entry of `role` over `kv`: one program per executable, whatever the row count of
+    /// the steps it serves, because a recurrent value's row axis is the pool's sequence slots (or the
+    /// one private row), not the step's rows.
+    fn rollback_key(
+        &self,
+        role: ModelRole,
+        kv: KvLayout,
+        adapters: Option<GenerationId>,
+    ) -> EntryKey {
+        EntryKey {
+            role,
+            phase: Phase::Decode,
+            shape: StepShape {
+                rows: NonZeroUsize::MIN,
+                tokens: NonZeroUsize::MIN,
+                capacity: self.options.capacity,
+                kv,
+                logits: LogitRows::Last,
+                hidden: self.hidden_of(role),
+            },
+            head: Head::GREEDY,
+            adapters,
+        }
+    }
+
+    /// Admit what a recurrent target's speculative rounds run beyond the full-width window: the
+    /// snapshot and restore copies on each executable, a window of every narrower width `2..=k` (a
+    /// row with fewer drafts, since filler would fold into its state), the replay chunk of every width
+    /// a rejection can keep (`1..=k`, the query token and up to `k - 1` accepted drafts) at each row
+    /// count, and, for the step that groups its rows by width, the prompt pieces and the decode step
+    /// under the head a window step reads (the greedy suffix, and the logits head when a request
+    /// samples). A model with positional state needs none of it: its window carries every row at one
+    /// width.
+    pub(super) fn prepare_rollback(
+        &mut self,
+        shapes: &ServingShapes<'_>,
+        kv: KvLayout,
+        pieces: &[Piece],
+    ) -> Result<(), DriverError> {
+        let Some(speculation) = self.speculation.policy.caps() else {
+            return Ok(());
+        };
+        if self.residency != StateResidency::Recurrent {
+            return Ok(());
+        }
+        let sampled = shapes.heads.iter().any(|&head| head != Head::GREEDY);
+        let heads: &[Head] = if sampled {
+            &[Head::GREEDY, Head::Logits]
+        } else {
+            &[Head::GREEDY]
+        };
+        for adapters in std::iter::once(None).chain(shapes.adapters.iter().copied().map(Some)) {
+            for role in [ModelRole::Snapshot, ModelRole::Restore] {
+                self.prepared(self.rollback_key(role, kv, adapters))?;
+            }
+            let capacity = self.options.capacity;
+            let hidden = self.hidden_of(ModelRole::Target);
+            for &rows in shapes.rows {
+                let key = |width: usize, logits: LogitRows, head: Head| EntryKey {
+                    role: ModelRole::Target,
+                    phase: serving_phase(width, logits),
+                    shape: StepShape {
+                        rows,
+                        tokens: NonZeroUsize::new(width).expect("a width is at least one"),
+                        capacity,
+                        kv,
+                        logits,
+                        hidden,
+                    },
+                    head,
+                    adapters,
+                };
+                for width in 1..=speculation.k.get() {
+                    self.prepared(key(width, LogitRows::Last, Head::GREEDY))?;
+                }
+                for width in 2..=speculation.k.get() {
+                    for &head in heads {
+                        self.prepared(key(width, LogitRows::All, head))?;
+                    }
+                }
+                for &piece in pieces {
+                    let width = match piece {
+                        Piece::Prefill(n) => n.get(),
+                        Piece::Decode => 1,
+                    };
+                    for &head in heads {
+                        self.prepared(key(width, LogitRows::Last, head))?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy the recurrent state of the sequence slots `slots` between live state and the shadow set,
+    /// by `role`. Every other slot keeps its own row.
+    fn copy_state_rows(
+        &mut self,
+        role: ModelRole,
+        adapter: Option<GenerationId>,
+        slots: &[usize],
+    ) -> Result<(), DriverError> {
+        let kv = self.serving.as_ref().expect("a step is served").kv();
+        let key = self.rollback_key(role, kv, adapter);
+        let entry = self
+            .entries
+            .get(&key)
+            .ok_or(PreparedSetRefusal::NotAdmitted {
+                phase: key.phase,
+                shape: key.shape,
+                head: key.head,
+                adapters: key.adapters,
+            })?
+            .clone();
+        let rows = entry
+            .slots
+            .iter()
+            .find(|spec| spec.role == SlotRole::BeamRows)
+            .expect("a rollback entry declares its row index")
+            .shape[0];
+        let data = StepData {
+            beam_rows: copy_rows(rows, slots),
+            ..StepData::default()
+        };
+        let started = self
+            .time_phases
+            .then(|| self.executor.stats().timing.mark());
+        self.execute(&entry, &data)?;
+        if let Some(started) = started {
+            let wall = window_wall(&self.executor.stats().timing, &started);
+            let timing = &mut self.stats.rollback;
+            let kind = match role {
+                ModelRole::Snapshot => &mut timing.snapshots,
+                _ => &mut timing.restores,
+            };
+            kind.steps += 1;
+            kind.wall += wall;
+        }
+        Ok(())
+    }
+
+    /// Snapshot the recurrent state of every row that holds drafts, before its window runs. A row
+    /// with no drafts folds one token, which a decode step never needs to take back.
+    fn snapshot_rows(
+        &mut self,
+        rows: &[StepRow<'_>],
+        plans: &[RowPlan],
+    ) -> Result<(), DriverError> {
+        if self.residency != StateResidency::Recurrent {
+            return Ok(());
+        }
+        let serving = self.serving.as_ref().expect("a step is served");
+        let mut speculating = rows
+            .iter()
+            .zip(plans)
+            .filter(|(_, plan)| !plan.drafts().is_empty())
+            .map(|(row, _)| &serving.seqs[&row.seq]);
+        let Some(first) = speculating.next() else {
+            return Ok(());
+        };
+        let adapter = first.adapter.generation();
+        let slots: Vec<usize> = std::iter::once(first)
+            .chain(speculating)
+            .map(|seq| seq.slot)
+            .collect();
+        self.copy_state_rows(ModelRole::Snapshot, adapter, &slots)
+    }
+
+    /// Settle the recurrent state of the rows a step verified: `settled` is `(seq, committed, proposed,
+    /// kept)` per row with drafts, as [`Driver::settle`] takes it. A row that kept every draft keeps
+    /// its live state. Any other row restores its snapshot and replays the query token and its
+    /// accepted drafts, grouped by width so each width is one prepared chunk.
+    pub(super) fn roll_back(
+        &mut self,
+        settled: &[(SeqId, usize, usize, usize)],
+    ) -> Result<(), DriverError> {
+        if self.residency != StateResidency::Recurrent || settled.is_empty() {
+            return Ok(());
+        }
+        let serving = self.serving.as_ref().expect("a step is served");
+        let mut replays: Vec<(SeqId, usize, Vec<u32>)> = Vec::new();
+        let mut slots = Vec::new();
+        let mut adapter = None;
+        for &(seq, committed, proposed, kept) in settled {
+            // The window folded the query token and every draft: a row that kept them all has the
+            // state its result describes.
+            if kept == proposed + 1 {
+                continue;
+            }
+            let state = &serving.seqs[&seq];
+            adapter = state.adapter.generation();
+            slots.push(state.slot);
+            let mut feed = vec![state.tokens[committed - 1]];
+            feed.extend_from_slice(&state.pending[..kept - 1]);
+            replays.push((seq, committed - 1, feed));
+        }
+        if replays.is_empty() {
+            return Ok(());
+        }
+        self.copy_state_rows(ModelRole::Restore, adapter, &slots)?;
+        self.stats.speculation.restored += replays.len() as u64;
+        self.stats.speculation.replayed += replays
+            .iter()
+            .map(|(_, _, feed)| feed.len() as u64)
+            .sum::<u64>();
+        let mut widths: Vec<usize> = replays.iter().map(|(_, _, feed)| feed.len()).collect();
+        widths.sort_unstable();
+        widths.dedup();
+        for width in widths {
+            let group: Vec<&(SeqId, usize, Vec<u32>)> = replays
+                .iter()
+                .filter(|(_, _, feed)| feed.len() == width)
+                .collect();
+            let plans: Vec<RowPlan> = group
+                .iter()
+                .map(|(_, start, feed)| RowPlan {
+                    feed: feed.clone(),
+                    start: *start,
+                    picks: 0,
+                    prefill: true,
+                    embeds: false,
+                    spec: None,
+                    not_speculated: None,
+                })
+                .collect();
+            let mut idle: Vec<Sampler> = group.iter().map(|_| Sampler::greedy()).collect();
+            let mut lanes: Vec<Lane<'_>> = group
+                .iter()
+                .zip(&mut idle)
+                .map(|((seq, _, _), sampler)| Lane { seq: *seq, sampler })
+                .collect();
+            let key = self.step_entry(
+                ModelRole::Target,
+                group.len(),
+                width,
+                (false, false),
+                Some(Head::GREEDY),
+                adapter,
+            )?;
+            let started = self
+                .time_phases
+                .then(|| self.executor.stats().timing.mark());
+            self.run_plans(&mut lanes, &plans, key)?;
+            if let Some(started) = started {
+                let wall = window_wall(&self.executor.stats().timing, &started);
+                self.stats.rollback.replays.steps += 1;
+                self.stats.rollback.replays.wall += wall;
+            }
         }
         Ok(())
     }

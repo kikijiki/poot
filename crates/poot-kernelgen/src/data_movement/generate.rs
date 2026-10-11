@@ -31,19 +31,15 @@ pub fn movement_body(
     // Parameters: the thread unit, the data inputs, an index buffer where the op reads one, the output.
     let mut params: Vec<LocalDecl> = vec![ld(Ty::Unit, false)];
     let mut data_shapes: Vec<Vec<usize>> = Vec::new();
-    let mut index_ty: Option<Ty> = None;
+    let mut reads_index = false;
     match &spec.op {
         MovementOp::Transpose { in_shape, .. }
         | MovementOp::Slice { in_shape, .. }
         | MovementOp::Broadcast { in_shape }
         | MovementOp::Reshape { in_shape } => data_shapes.push(in_shape.clone()),
-        MovementOp::Gather {
-            in_shape,
-            index_dtype,
-            ..
-        } => {
+        MovementOp::Gather { in_shape, .. } => {
             data_shapes.push(in_shape.clone());
-            index_ty = Some(index_dtype.clone());
+            reads_index = true;
         }
         MovementOp::Concat { in_shapes, .. } => data_shapes.extend(in_shapes.iter().cloned()),
         MovementOp::UpdateSlice {
@@ -53,25 +49,16 @@ pub fn movement_body(
         } => {
             data_shapes.push(spec.out_shape.clone());
             data_shapes.push(update_shape.clone());
-            if let UpdateIndex::Runtime { dtype } = index {
-                index_ty = Some(dtype.clone());
-            }
+            reads_index = matches!(index, UpdateIndex::Runtime);
         }
-        MovementOp::ScatterRows {
-            src_shape,
-            inverse_dtype,
-            ..
-        } => {
+        MovementOp::ScatterRows { src_shape, .. } => {
             data_shapes.push(spec.out_shape.clone());
             data_shapes.push(src_shape.clone());
-            index_ty = Some(inverse_dtype.clone());
+            reads_index = true;
         }
-        MovementOp::PermuteRows {
-            src_shape,
-            index_dtype,
-        } => {
+        MovementOp::PermuteRows { src_shape } => {
             data_shapes.push(src_shape.clone());
-            index_ty = Some(index_dtype.clone());
+            reads_index = true;
         }
     }
     let mut inputs = Vec::new();
@@ -84,9 +71,9 @@ pub fn movement_body(
     }
     // The scatter reads its index buffer after both data inputs; every other op has at most one input
     // before it, or (a runtime update) two, so the order is always data inputs, index, output.
-    let index = index_ty.map(|ty| {
-        params.push(slice(&ty, false));
-        (local(params.len() as u32 - 1), ty)
+    let index = reads_index.then(|| {
+        params.push(slice(&Ty::I32, false));
+        local(params.len() as u32 - 1)
     });
     params.push(slice(&unit_ty, true));
     let out = Buf {
@@ -100,12 +87,12 @@ pub fn movement_body(
         MovementOp::PermuteRows { src_shape, .. } => {
             let numel: usize = src_shape.iter().product();
             let in_bounds = cfg.bin(Ty::Bool, BinOp::Lt, copy(thread), cu(numel));
-            let (index, index_ty) = index.expect("PermuteRows reads an index buffer");
+            let index = index.expect("PermuteRows reads an index buffer");
             cfg.if_then(in_bounds, |cfg| {
                 let rest: usize = src_shape[1..].iter().product();
                 let row = cfg.bin(Ty::Usize, BinOp::Div, copy(thread), cu(rest));
                 let column = cfg.bin(Ty::Usize, BinOp::Rem, copy(thread), cu(rest));
-                let destination_row = read_index(cfg, index, &index_ty, row);
+                let destination_row = read_index(cfg, index, row);
                 let base = cfg.bin(Ty::Usize, BinOp::Mul, copy(destination_row), cu(rest));
                 let destination = cfg.bin(Ty::Usize, BinOp::Add, copy(base), copy(column));
                 let value = read_lane(cfg, storage, &inputs[0], thread);
@@ -203,7 +190,7 @@ pub(crate) fn write_packed_word(
 struct Source<'a> {
     spec: &'a MovementSpec,
     inputs: &'a [Buf],
-    index: Option<(Local, Ty)>,
+    index: Option<Local>,
 }
 
 impl Source<'_> {
@@ -240,8 +227,7 @@ impl Source<'_> {
                 index_numel,
                 ..
             } => {
-                let (index, index_ty) =
-                    self.index.as_ref().expect("a gather reads an index buffer");
+                let index = self.index.expect("a gather reads an index buffer");
                 let inner: usize = in_shape[axis + 1..].iter().product();
                 let outer_extent: usize = in_shape[..*axis].iter().product();
                 let axis_len = in_shape[*axis];
@@ -255,7 +241,7 @@ impl Source<'_> {
                 } else {
                     cfg.bin(Ty::Usize, BinOp::Rem, copy(mid), cu(*index_numel))
                 };
-                let picked = read_index(cfg, *index, index_ty, position);
+                let picked = read_index(cfg, index, position);
                 let mut src = if inner == 1 {
                     picked
                 } else {
@@ -312,13 +298,10 @@ impl Source<'_> {
                 let value = cfg.var(storage.unit_ty(), Rvalue::Use(copy(kept)));
                 let start = match update_index {
                     UpdateIndex::Static(start) => cfg.usize_const(*start),
-                    UpdateIndex::Runtime { dtype } => {
-                        let (index, _) = self
-                            .index
-                            .as_ref()
-                            .expect("a runtime update reads an index");
+                    UpdateIndex::Runtime => {
+                        let index = self.index.expect("a runtime update reads an index");
                         let first = cfg.usize_const(0);
-                        read_index(cfg, *index, dtype, first)
+                        read_index(cfg, index, first)
                     }
                 };
                 let end = cfg.bin(Ty::Usize, BinOp::Add, copy(start), cu(extent));
@@ -334,24 +317,13 @@ impl Source<'_> {
                 value
             }
             MovementOp::ScatterRows { .. } => {
-                let (inverse, inverse_ty) =
-                    self.index.as_ref().expect("a scatter reads an inverse map");
+                let inverse = self.index.expect("a scatter reads an inverse map");
                 let rest: usize = out_shape[1..].iter().product();
                 let row = cfg.bin(Ty::Usize, BinOp::Div, copy(flat), cu(rest));
                 let column = cfg.bin(Ty::Usize, BinOp::Rem, copy(flat), cu(rest));
                 let kept = read_lane(cfg, storage, &self.inputs[0], flat);
                 let value = cfg.var(storage.unit_ty(), Rvalue::Use(copy(kept)));
-                let mapped = cfg.let_(
-                    inverse_ty.clone(),
-                    Rvalue::Use(Operand::Copy(elem(*inverse, row))),
-                );
-                let source_row = cfg.let_(
-                    Ty::I32,
-                    Rvalue::Cast {
-                        to: Ty::I32,
-                        operand: copy(mapped),
-                    },
-                );
+                let source_row = cfg.let_(Ty::I32, Rvalue::Use(Operand::Copy(elem(inverse, row))));
                 let written = cfg.bin(
                     Ty::Bool,
                     BinOp::Ge,
@@ -444,12 +416,9 @@ fn remap_index(
     src
 }
 
-/// Element `position` of an F32 or I32 index buffer, as a `usize`.
-fn read_index(cfg: &mut Cfg, buffer: Local, dtype: &Ty, position: Local) -> Local {
-    let value = cfg.let_(
-        dtype.clone(),
-        Rvalue::Use(Operand::Copy(elem(buffer, position))),
-    );
+/// Element `position` of an `I32` index buffer, as a `usize`.
+fn read_index(cfg: &mut Cfg, buffer: Local, position: Local) -> Local {
+    let value = cfg.let_(Ty::I32, Rvalue::Use(Operand::Copy(elem(buffer, position))));
     cfg.let_(
         Ty::Usize,
         Rvalue::Cast {

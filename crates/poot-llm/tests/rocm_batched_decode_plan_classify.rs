@@ -33,8 +33,8 @@ fn qwen25_05b() -> Dense {
 
 fn plan_tag(p: &Plan) -> &'static str {
     match p {
-        Plan::Dispatches(dispatches) => match dispatches.as_slice() {
-            [dispatch] if dispatch.launch.meta.is_empty() => "Dispatch",
+        Plan::Dispatches(dispatches) => match &dispatches[..] {
+            [dispatch] if dispatch.launch().meta.is_empty() => "Dispatch",
             [_] => "DispatchWithMeta",
             _ => "SplitDispatches",
         },

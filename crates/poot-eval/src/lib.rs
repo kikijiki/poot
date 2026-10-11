@@ -10,7 +10,6 @@
 //! scalar index is read back via `round`. [`Value`] is the typed storage-aware entry point, which also
 //! carries the E4M3FN and packed-quant executor slices.
 
-pub mod cast_authority;
 pub mod exact_bf16;
 pub mod exact_dense;
 pub mod exact_value;
@@ -38,7 +37,7 @@ mod routing;
 mod value;
 mod walk;
 
-pub use error::{CastFault, CastOperand, EvalError};
+pub use error::{CastFault, CastOperand, EvalError, SlotRangeFault};
 pub use exact_value::{ExactI32TensorView, ExactValue};
 pub use ops::index_rule::{IndexFault, IndexFaultKind, IndexValue};
 #[cfg(any(test, feature = "test-support"))]

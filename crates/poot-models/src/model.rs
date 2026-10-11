@@ -85,6 +85,15 @@ pub enum Phase {
     /// (`HeadKind::Hidden`; [`ModelOutput::Hidden`]) for the host to pool or score: an encoder's
     /// forward, or a decoder's embedding pass. A step carries no cache a later step reads.
     Encode,
+    /// The multi-token-prediction layer over the hidden-state carry (POOT-1110): a step of `tokens`
+    /// positions whose `Slot::Pos` input holds the absolute position `p` of each hidden row the
+    /// carry holds and whose `Slot::Token` input holds the host token that follows it, `t[p + 1]`.
+    /// The program reads the first `tokens` rows of the [`HiddenCarry`] the step's shape carries,
+    /// continues the layer's own cache, and returns the logits of the next-next token. It writes its
+    /// own post-norm hidden state of the step's last position into row 0 of the carry, the row a
+    /// following one-token `Mtp` step of a draft chain reads. A family that does not trace it refuses
+    /// it typed in [`check_step`](crate::components::standard::check_step).
+    Mtp,
 }
 
 /// How the traced step's KV cache is laid out.
@@ -122,6 +131,18 @@ pub struct StepShape {
     pub capacity: NonZeroUsize,
     pub kv: KvLayout,
     pub logits: LogitRows,
+    /// The hidden-state carry the step also writes, when its caller asks for one.
+    pub hidden: Option<HiddenCarry>,
+}
+
+/// A request that a step write its final hidden state, at every position of the step and before any
+/// last-token slice, into a per-sequence carry a later program of the same driver step reads (the
+/// MTP draft source, POOT-1109). The carry is one f32 `[seqs, positions, width]` value; `positions`
+/// is the driver's one extent for it (the verify window or the widest prefill piece, whichever is
+/// larger), so every program of an executable declares the same aval.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HiddenCarry {
+    pub positions: NonZeroUsize,
 }
 
 /// One model behind the driver: its config, its weights and its tracer.
@@ -190,6 +211,29 @@ pub enum ShapeReason {
     RoutedRows {
         max: usize,
     },
+    /// A hidden-state carry with fewer positions than the step has tokens: the step would write
+    /// positions the carry does not have.
+    HiddenCarryNarrow {
+        positions: usize,
+        tokens: usize,
+    },
+    /// A step that asked for a hidden-state carry and whose program carries none: the family does
+    /// not trace one.
+    HiddenCarryMissing,
+    /// A carried [`StateRole::Handoff`](poot_graph_ir::StateRole::Handoff) value that is not an F32
+    /// `[rows, positions, width]` value.
+    HiddenCarryLayout,
+    /// A hidden-state carry of `found` positions where the step asked for `expected`: the readers of
+    /// the carry would bind another buffer than the writers.
+    HiddenCarryPositions {
+        found: usize,
+        expected: usize,
+    },
+    /// A hidden-state carry written by a step that asked for none.
+    HiddenCarryUnrequested,
+    /// A [`Phase::Mtp`] step whose shape names no hidden-state carry: there is nothing for the
+    /// layer to read.
+    MtpWithoutCarry,
 }
 
 /// A model could not be built from its config and weights.

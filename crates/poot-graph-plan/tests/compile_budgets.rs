@@ -12,9 +12,9 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use poot_graph_ir::op::SampleRule;
 use poot_graph_ir::{BinOp, Builder, Graph, OpKind, RedOp, TensorType, UnOp};
 use poot_graph_plan::{
-    Capability, CompileError, CompileLimits, CompileOptions, ExactI32StorageAnalysis,
-    ExpansionError, GraphResource, KernelChoice, PlanError, Submission, Target, compile,
-    decompose_large_vocab_greedy, plan_eqn_choice_analyzed,
+    Capability, CompileError, CompileLimits, CompileOptions, ExpansionError, GraphResource,
+    KernelChoice, PlanError, Submission, Target, compile, decompose_large_vocab_greedy,
+    plan_eqn_choice,
 };
 use poot_kernelgen::{BodyLimits, BodyResource, BodyStage, KernelGenError, KernelRequest};
 use poot_target::Backend;
@@ -284,11 +284,9 @@ fn a_real_fused_region_is_refused_before_it_is_generated_under_small_body_limits
     assert!(spec.kernel.steps.len() >= 12, "a real region, not one step");
 
     let graph = fused.graph();
-    let analysis = ExactI32StorageAnalysis::new(graph);
     let target = wgpu();
     let plan_with = |limits: &BodyLimits| {
-        plan_eqn_choice_analyzed(
-            &analysis,
+        plan_eqn_choice(
             graph,
             eqn,
             target.backend,

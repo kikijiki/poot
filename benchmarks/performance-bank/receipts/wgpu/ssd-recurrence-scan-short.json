@@ -1,0 +1,174 @@
+{
+  "backend": "wgpu",
+  "case": "ssd-recurrence-scan-short",
+  "cells": {
+    "kernel": {
+      "repeats": [
+        {
+          "metrics": {
+            "step_us": 239.047
+          },
+          "slot": 0,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 241.823
+          },
+          "slot": 1,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 228.21699999999998
+          },
+          "slot": 2,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 229.801
+          },
+          "slot": 3,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 233.117
+          },
+          "slot": 4,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 237.976
+          },
+          "slot": 5,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 231.123
+          },
+          "slot": 6,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 273.662
+          },
+          "slot": 7,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 308.517
+          },
+          "slot": 8,
+          "status": "ok"
+        }
+      ]
+    }
+  },
+  "memory": [
+    {
+      "live_bytes": 459808,
+      "peak_bytes": 459808,
+      "role": "Weight"
+    },
+    {
+      "live_bytes": 196608,
+      "peak_bytes": 196608,
+      "role": "Activation"
+    },
+    {
+      "live_bytes": 36,
+      "peak_bytes": 196644,
+      "role": "Staging"
+    }
+  ],
+  "observed": {
+    "layout": "bhsd",
+    "shape": {
+      "family": "ssd",
+      "heads": 4,
+      "n": 128,
+      "p": 64,
+      "steps": 64
+    },
+    "storage": "f32",
+    "weight_bytes_per_copy": 459808,
+    "weight_copies": 1
+  },
+  "plan": [
+    "scan [baf0095059f056c208278a8580526dce555c370a8568f90031010ab60b8728eb]"
+  ],
+  "plan_id": "f4619d536799149996c70507089a46b64832a32a314fce5a347b116bc97db2b3",
+  "recordings": 1,
+  "reference": {
+    "agrees": true,
+    "max_relative_error": 2.8409135107169533e-07,
+    "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
+    "provenance": "independent-golden",
+    "tolerance": 0.002
+  },
+  "replays": 13,
+  "role": "baseline",
+  "schema": 1,
+  "command": [
+    "cargo",
+    "run",
+    "--release",
+    "-p",
+    "poot-gpu",
+    "--example",
+    "performance_bank",
+    "--",
+    "--bank",
+    "benchmarks/performance-bank/cases.json",
+    "--case",
+    "ssd-recurrence-scan-short",
+    "--out",
+    "benchmarks/performance-bank/receipts/wgpu/ssd-recurrence-scan-short.json"
+  ],
+  "parent_revision": "2f1101ab3028740aed658e1068aa6638d2328447",
+  "binary_sha256": "4be305c1c3c2c541b1ad2401348c8c89f72f1d5b4fadb058862f5a87b77d7fe9",
+  "identity": {
+    "checkpoint_digest": "synthetic-no-checkpoint",
+    "token_fixture": "splitmix64-seed0-unit:237900849bc67b83",
+    "precision": "f32",
+    "layout": "bhsd",
+    "dimensions": {
+      "family": "ssd",
+      "heads": 4,
+      "p": 64,
+      "n": 128,
+      "steps": 64
+    },
+    "prompt_tokens": 1,
+    "live_context": "n/a",
+    "max_context": "n/a",
+    "requested_output": "n/a",
+    "actual_output": "n/a",
+    "sampler": "n/a",
+    "template": "n/a",
+    "cache_state": {
+      "condition": "weights-resident-hot",
+      "id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb"
+    },
+    "prepared_set": [
+      "ssd-recurrence-scan-short"
+    ],
+    "timing_policy": {
+      "warmup": 3,
+      "repeats": 9,
+      "clock": "wall step plus readback",
+      "profiled": false
+    },
+    "backend": "wgpu",
+    "device": "AMD Radeon 8060S Graphics",
+    "driver": "host kernel 7.2.9"
+  },
+  "identity_digest": "1ffdd59f5c2acb9deb74dc4b33855b423094b8441d1a100bfaf12c9ce7d98d3a",
+  "schedule_id": "0025f9f93a3783297d48f02335370f21db17d7e285fc7929024e391dd5d514cb"
+}

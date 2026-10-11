@@ -481,7 +481,11 @@ fn indexed_graph(
     };
     let b = Builder::new();
     let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![m, k]));
-    let selector = b.slot_named(Slot::Activation, "selector", TensorType::f32(vec![m]));
+    let selector = b.slot_named(
+        Slot::Activation,
+        "selector",
+        TensorType::new(vec![m], DType::I32),
+    );
     let output = packed_indexed_linear(&b, x, selector, &table).unwrap();
     let graph = b.finish(output);
     let stack = Arc::new(PackedStack::try_new(experts.to_vec()).unwrap());
@@ -492,9 +496,9 @@ fn indexed_graph(
     );
     inputs.insert(
         selector.id(),
-        Value::Host(HostTensor::f32(
+        Value::Host(HostTensor::i32(
             vec![m],
-            route.iter().map(|&expert| expert as f32).collect(),
+            route.iter().map(|&expert| expert as i32).collect(),
         )),
     );
     for graph_input in &graph.inputs {
@@ -617,7 +621,7 @@ fn the_indexed_oracle_decodes_only_the_selected_experts() {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![m, k]));
     let w = b.constant("w", TensorType::f32(vec![experts.len(), k, out]));
-    let ids = b.constant("ids", TensorType::f32(vec![m]));
+    let ids = b.constant("ids", TensorType::new(vec![m], DType::I32));
     let y = b.indexed_matmul(x, w, ids);
     let dense = b.finish(y);
     let dense_inputs: HashMap<ValueId, Value> = [
@@ -625,7 +629,7 @@ fn the_indexed_oracle_decodes_only_the_selected_experts() {
         (w.id(), HostTensor::f32(vec![experts.len(), k, out], table)),
         (
             ids.id(),
-            HostTensor::f32(vec![m], route.iter().map(|&e| e as f32).collect()),
+            HostTensor::i32(vec![m], route.iter().map(|&e| e as i32).collect()),
         ),
     ]
     .into_iter()
@@ -2150,7 +2154,7 @@ fn packed_row_gather_oracle_decodes_only_the_gathered_rows() {
             .unwrap(),
     );
     let b = Builder::new();
-    let ids = b.slot(Slot::Token, TensorType::f32(vec![3]));
+    let ids = b.slot(Slot::Token, TensorType::new(vec![3], DType::I32));
     let out = poot_graph_ir::ops::packed_embedding(&b, ids, "embed", descriptor).unwrap();
     let graph = recognize_packed_row_gathers(&b.finish(out));
     assert!(matches!(
@@ -2177,7 +2181,7 @@ fn packed_row_gather_oracle_decodes_only_the_gathered_rows() {
     let wanted = [32_999usize, 0, 250];
     inputs.insert(
         ids.id(),
-        HostTensor::f32(vec![3], wanted.iter().map(|&r| r as f32).collect()).into(),
+        HostTensor::i32(vec![3], wanted.iter().map(|&r| r as i32).collect()).into(),
     );
     let Value::Host(got) = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
         .map(|r| r.output)
@@ -2199,19 +2203,16 @@ fn packed_row_gather_oracle_decodes_only_the_gathered_rows() {
     }
     inputs.insert(
         ids.id(),
-        HostTensor::f32(vec![3], vec![0.0, rows as f32, 1.0]).into(),
+        HostTensor::i32(vec![3], vec![0, rows as i32, 1]).into(),
     );
     assert!(matches!(
         eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).map(|r| r.output),
         Err(EvalError::Packed(PackedEvalError::Binding {
             field: "row_ids.range"
         }))
-    )); // Review minor 12: a NaN or fractional id names no row and is refused, never rounded.
-    for bad in [f32::NAN, 1.5] {
-        inputs.insert(
-            ids.id(),
-            HostTensor::f32(vec![3], vec![0.0, bad, 1.0]).into(),
-        );
+    )); // A negative id names no row and is refused, never wrapped.
+    for bad in [-1, i32::MIN] {
+        inputs.insert(ids.id(), HostTensor::i32(vec![3], vec![0, bad, 1]).into());
         assert!(
             matches!(
                 eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).map(|r| r.output),

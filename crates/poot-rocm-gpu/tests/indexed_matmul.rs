@@ -14,7 +14,7 @@ use poot_graph_ir::op::BinOp;
 use poot_graph_ir::{Builder, Graph, Storage, TensorType, ValueId};
 use poot_rocm_gpu::device::RocmDevice;
 use poot_runtime_common::DeviceBackend;
-use poot_tensor::HostTensor;
+use poot_tensor::{DType, HostTensor};
 use poot_test_util::device_skip::open_or_skip;
 
 const EXPERTS: usize = 4;
@@ -24,7 +24,7 @@ const N: usize = 21;
 
 struct Case {
     name: &'static str,
-    ids: Vec<f32>,
+    ids: Vec<i32>,
 }
 
 /// Integer-valued fill in `[-3, 3]`.
@@ -41,29 +41,29 @@ fn int_fill(seed: u64, count: usize) -> Vec<f32> {
 }
 
 /// Sorted expert ids, runs of unequal length so tile boundaries (every 8 rows) cut across expert boundaries.
-fn sorted_ids(rows: usize) -> Vec<f32> {
+fn sorted_ids(rows: usize) -> Vec<i32> {
     let bounds = [37, 78, 116];
     (0..rows)
-        .map(|r| bounds.iter().filter(|&&b| r >= b).count() as f32)
+        .map(|r| bounds.iter().filter(|&&b| r >= b).count() as i32)
         .collect()
 }
 
 /// The same multiset in a deterministic shuffled order (stride 7 is coprime to 160).
-fn shuffled_ids(rows: usize) -> Vec<f32> {
+fn shuffled_ids(rows: usize) -> Vec<i32> {
     let sorted = sorted_ids(rows);
     (0..rows).map(|r| sorted[(r * 7) % rows]).collect()
 }
 
 /// One expert per 8-row tile.
-fn tile_aligned_ids(rows: usize) -> Vec<f32> {
-    (0..rows).map(|r| ((r / 8) % EXPERTS) as f32).collect()
+fn tile_aligned_ids(rows: usize) -> Vec<i32> {
+    (0..rows).map(|r| ((r / 8) % EXPERTS) as i32).collect()
 }
 
 fn cases() -> Vec<Case> {
     vec![
         Case {
             name: "decode, unsorted ids with a repeat",
-            ids: vec![2.0, 0.0, 3.0, 2.0, 1.0],
+            ids: vec![2, 0, 3, 2, 1],
         },
         Case {
             name: "prefill, sorted ids",
@@ -86,19 +86,19 @@ struct Program {
 }
 
 /// `IndexedMatMul(x, w, ids)` with every operand a named const; with `gate`, that product times `gate[m]`.
-fn program(ids: &[f32], gate: Option<Vec<f32>>) -> Program {
+fn program(ids: &[i32], gate: Option<Vec<f32>>) -> Program {
     let m = ids.len();
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![m, K]));
     let w = b.constant("w", TensorType::f32(vec![EXPERTS, K, N]));
-    let idx = b.constant("idx", TensorType::f32(vec![m]));
+    let idx = b.constant("idx", TensorType::new(vec![m], DType::I32));
     let mut inputs = HashMap::new();
     inputs.insert(x.id(), HostTensor::f32(vec![m, K], int_fill(1, m * K)));
     inputs.insert(
         w.id(),
         HostTensor::f32(vec![EXPERTS, K, N], int_fill(2, EXPERTS * K * N)),
     );
-    inputs.insert(idx.id(), HostTensor::f32(vec![m], ids.to_vec()));
+    inputs.insert(idx.id(), HostTensor::i32(vec![m], ids.to_vec()));
     let mut out = b.indexed_matmul(x, w, idx);
     if let Some(gate) = gate {
         let gate_t = b.constant("gate", TensorType::f32(vec![m]));
@@ -119,17 +119,17 @@ const CHECKPOINT_EXPERTS: usize = 8;
 /// The stored-orientation spelling: the stacked weight is held `[E, N, K]` (the checkpoint order) and the graph
 /// reads it as `indexed_matmul(x, transpose(w, [0, 2, 1]), ids)`. `compile` must fold that transpose into the
 /// contraction, and the oracle evaluates the transpose literally.
-fn checkpoint_program(ids: &[f32]) -> Program {
+fn checkpoint_program(ids: &[i32]) -> Program {
     checkpoint_program_gated(ids, None)
 }
 
 /// [`checkpoint_program`], with `gate` the routed gate weighting after the product (`ContractionEpilogue`).
-fn checkpoint_program_gated(ids: &[f32], gate: Option<Vec<f32>>) -> Program {
+fn checkpoint_program_gated(ids: &[i32], gate: Option<Vec<f32>>) -> Program {
     let m = ids.len();
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![m, K]));
     let w = b.constant("w", TensorType::f32(vec![CHECKPOINT_EXPERTS, N, K]));
-    let idx = b.constant("idx", TensorType::f32(vec![m]));
+    let idx = b.constant("idx", TensorType::new(vec![m], DType::I32));
     let mut inputs = HashMap::new();
     inputs.insert(x.id(), HostTensor::f32(vec![m, K], int_fill(1, m * K)));
     inputs.insert(
@@ -139,7 +139,7 @@ fn checkpoint_program_gated(ids: &[f32], gate: Option<Vec<f32>>) -> Program {
             int_fill(2, CHECKPOINT_EXPERTS * N * K),
         ),
     );
-    inputs.insert(idx.id(), HostTensor::f32(vec![m], ids.to_vec()));
+    inputs.insert(idx.id(), HostTensor::i32(vec![m], ids.to_vec()));
     let mut out = b.indexed_matmul(x, b.transpose(w, vec![0, 2, 1]), idx);
     if let Some(gate) = gate {
         let gate_t = b.constant("gate", TensorType::f32(vec![m]));
@@ -228,7 +228,7 @@ fn indexed_matmul_matches_the_oracle_bit_for_bit() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// SC-004: an id outside `0..E` or not an integer (`4`, `-1`, `NaN`, `1.5`) makes its device row NaN and every
+/// SC-004: an id outside `0..E` (`4`, `-1`, `i32::MIN`, `i32::MAX`) makes its device row NaN and every
 /// other row exact.
 #[test]
 fn indexed_matmul_invalid_ids_write_nan_rows() {
@@ -237,18 +237,15 @@ fn indexed_matmul_invalid_ids_write_nan_rows() {
     };
     let target = device.target();
     let mut engine = Engine::new(device);
-    let decode = vec![4.0, -1.0, f32::NAN, 1.5, 2.0, 0.0];
+    let decode = vec![4, -1, i32::MIN, i32::MAX, 2, 0];
     let mut prefill = shuffled_ids(160);
-    for (row, value) in [(3, 4.0), (17, -1.0), (64, f32::NAN), (159, 1.5)] {
+    for (row, value) in [(3, 4), (17, -1), (64, i32::MIN), (159, i32::MAX)] {
         prefill[row] = value;
     }
     for (name, ids) in [("decode", decode), ("prefill", prefill)] {
-        let valid = |id: f32| (0.0..EXPERTS as f32).contains(&id) && id.fract() == 0.0;
+        let valid = |id: i32| (0..EXPERTS as i32).contains(&id);
         // The oracle refuses a bad id, so its values come from the same program with the bad ids replaced.
-        let clean: Vec<f32> = ids
-            .iter()
-            .map(|&v| if valid(v) { v } else { 0.0 })
-            .collect();
+        let clean: Vec<i32> = ids.iter().map(|&v| if valid(v) { v } else { 0 }).collect();
         let want = oracle(&program(&clean, None));
         let got = run(&mut engine, target, &program(&ids, None));
         let (got, want) = (got.as_f32().unwrap(), want.as_f32().unwrap());
@@ -303,12 +300,12 @@ fn indexed_matmul_checkpoint_order_experts_match_the_oracle_bit_for_bit() {
     };
     let target = device.target();
     let mut engine = Engine::new(device);
-    let prefill: Vec<f32> = (0..160)
-        .map(|r| [7.0, 2.0, 2.0, 5.0, 0.0, 7.0, 3.0][(r * 5) % 7])
+    let prefill: Vec<i32> = (0..160)
+        .map(|r| [7, 2, 2, 5, 0, 7, 3][(r * 5) % 7])
         .collect();
     let cases = [
-        ("M=1", vec![5.0]),
-        ("M=5, unsorted with repeats", vec![6.0, 0.0, 6.0, 3.0, 1.0]),
+        ("M=1", vec![5]),
+        ("M=5, unsorted with repeats", vec![6, 0, 6, 3, 1]),
         ("M=160, shuffled", prefill),
     ];
     let mut failures = Vec::new();
@@ -338,7 +335,7 @@ fn routed_gate_weighting_checkpoint_order_equals_the_oracle_bit_for_bit() {
     };
     let target = device.target();
     let mut engine = Engine::new(device);
-    for ids in [vec![6.0, 0.0, 6.0, 3.0, 1.0], shuffled_ids(160)] {
+    for ids in [vec![6, 0, 6, 3, 1], shuffled_ids(160)] {
         // Dyadic gates, so the product with an exact integer sum is exact.
         let gate: Vec<f32> = (0..ids.len())
             .map(|r| [0.5, -2.0, 1.25, 3.0, -0.75][r % 5])
@@ -353,7 +350,7 @@ fn routed_gate_weighting_checkpoint_order_equals_the_oracle_bit_for_bit() {
 /// `[E, N, K]` read through `transpose(w, [0, 2, 1])`, with an f32 activation and output; with `gate`, the routed
 /// gate weighting after the product (`ContractionEpilogue`). The fill is integer-valued, so every element is exactly
 /// a BF16 and the oracle's widened sum is the device's sum bit for bit.
-fn bf16_program(ids: &[f32], checkpoint_order: bool, gate: Option<Vec<f32>>) -> Program {
+fn bf16_program(ids: &[i32], checkpoint_order: bool, gate: Option<Vec<f32>>) -> Program {
     let m = ids.len();
     let experts = CHECKPOINT_EXPERTS;
     let words = |values: Vec<f32>| -> Vec<u16> {
@@ -361,10 +358,10 @@ fn bf16_program(ids: &[f32], checkpoint_order: bool, gate: Option<Vec<f32>>) -> 
     };
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![m, K]));
-    let idx = b.constant("idx", TensorType::f32(vec![m]));
+    let idx = b.constant("idx", TensorType::new(vec![m], DType::I32));
     let mut inputs = HashMap::new();
     inputs.insert(x.id(), HostTensor::f32(vec![m, K], int_fill(1, m * K)));
-    inputs.insert(idx.id(), HostTensor::f32(vec![m], ids.to_vec()));
+    inputs.insert(idx.id(), HostTensor::i32(vec![m], ids.to_vec()));
     let stored = if checkpoint_order {
         vec![experts, N, K]
     } else {
@@ -409,9 +406,9 @@ fn indexed_matmul_bf16_experts_match_the_oracle_bit_for_bit() {
     };
     let target = device.target();
     let mut engine = Engine::new(device);
-    let decode = vec![6.0, 0.0, 6.0, 3.0, 1.0];
-    let prefill: Vec<f32> = (0..160)
-        .map(|r| [7.0, 2.0, 2.0, 5.0, 0.0, 7.0, 3.0][(r * 5) % 7])
+    let decode = vec![6, 0, 6, 3, 1];
+    let prefill: Vec<i32> = (0..160)
+        .map(|r| [7, 2, 2, 5, 0, 7, 3][(r * 5) % 7])
         .collect();
     let mut failures = Vec::new();
     for (name, ids) in [("M=5", decode), ("M=160, shuffled", prefill)] {

@@ -90,6 +90,15 @@ fn step_inputs(binds: &[SlotBind]) -> StepInputs<'_> {
     inputs
 }
 
+/// A host tensor's little-endian words: F32 or I32 (the index dtype).
+fn host_bytes(t: &HostTensor) -> Vec<u8> {
+    match (t.as_f32(), t.as_i32()) {
+        (Some(values), _) => values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        (_, Some(words)) => words.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        _ => panic!("a test input is F32 or I32, got {}", t.dtype()),
+    }
+}
+
 /// Every input here is a plain F32 `Storage::Const` (no slots, no state, no packed weights), so this
 /// splits a `HashMap<ValueId, Tensor>` bind straight into a one-shot [`WeightStore`] (the `Vec<SlotBind>`
 /// is always empty).
@@ -107,14 +116,10 @@ fn split_consts_and_slots(
                 let t = inputs
                     .get(&id)
                     .unwrap_or_else(|| panic!("missing const input {id:?}"));
-                let bytes: Vec<u8> = t
-                    .as_f32()
-                    .unwrap()
-                    .iter()
-                    .flat_map(|v| v.to_le_bytes())
-                    .collect();
+                let dtype = t.dtype();
+                let bytes: Vec<u8> = host_bytes(t);
                 let dense =
-                    DenseWeight::try_new(DType::F32, t.shape().to_vec(), StoredBytes::from(bytes))
+                    DenseWeight::try_new(dtype, t.shape().to_vec(), StoredBytes::from(bytes))
                         .unwrap();
                 builder.insert(name, WeightEntry::Dense(dense)).unwrap();
             }
@@ -125,13 +130,8 @@ fn split_consts_and_slots(
                 slots.push(SlotBind {
                     key: m.slot_key().unwrap().clone(),
                     shape: t.shape().to_vec(),
-                    dtype: DType::F32,
-                    bytes: t
-                        .as_f32()
-                        .unwrap()
-                        .iter()
-                        .flat_map(|v| v.to_le_bytes())
-                        .collect(),
+                    dtype: t.dtype(),
+                    bytes: host_bytes(t),
                 });
             }
             Storage::State | Storage::Computed(_) => {}
@@ -774,16 +774,19 @@ fn gather_axis0_cross_backend() {
     let idx_count = 3usize;
     let b = Builder::new();
     let data = b.constant("data", TensorType::f32(vec![n, d]));
-    let idx = b.constant("idx", TensorType::f32(vec![idx_count]));
+    let idx = b.constant(
+        "idx",
+        TensorType::new(vec![idx_count], poot_tensor::DType::I32),
+    );
     let out = b.gather(data, 0, idx);
     let (di, ii) = (data.id(), idx.id());
     let g = b.finish(out);
 
     let dd: Vec<f32> = fill(901, n * d);
-    let id: Vec<f32> = vec![3.0, 0.0, 6.0];
+    let id: Vec<i32> = vec![3, 0, 6];
     let mut inputs = HashMap::new();
     inputs.insert(di, HostTensor::f32(vec![n, d], dd));
-    inputs.insert(ii, HostTensor::f32(vec![idx_count], id));
+    inputs.insert(ii, HostTensor::i32(vec![idx_count], id));
 
     let cpu = eval(
         &g,
@@ -807,8 +810,8 @@ fn gather_axis0_cross_backend() {
 /// A `Gather` over an I32 const table whose words need all 32 bits ([`poot_test_util::i32_table_gather`])
 /// returns the table's words exactly: the table is stored as raw I32, not as its F32 mirror.
 ///
-/// Mutation: pin the Gather-over-I32-data component to the mirror lane (drop the `pinned` pass of
-/// `ExactI32StorageAnalysis::new`); the output is the table rounded through F32 and this row goes red.
+/// Mutation: store an I32 table through F32 (map `fty_ty`'s I32 arm to `Ty::F32`); the output is the table
+/// rounded through F32 and this row goes red.
 #[test]
 fn i32_table_gather_is_exact_beyond_f32_cross_backend() {
     use poot_test_util::i32_table_gather as fixture;

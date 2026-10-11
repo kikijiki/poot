@@ -1,8 +1,8 @@
 //! POOT-631: measurement and design evidence for rolling recurrent state back, so a GDN or Mamba2
-//! model could verify speculative drafts. Speculation on a recurrent family stays refused
-//! (`Unsupported::Speculation(RecurrentState)`, covered by `speculate.rs`); this binary measures what a
-//! per-row state snapshot and restore would cost, over the same row-gather machinery the beam reorder
-//! uses, and proves on the CPU oracle that snapshot-then-restore undoes folded draft tokens.
+//! model can verify speculative drafts (the rollback itself is POOT-647's, covered end to end by
+//! `speculate_recurrent.rs`); this binary measures what a per-row state snapshot and restore cost, over
+//! the same row-gather machinery the beam reorder uses, and proves on the CPU oracle that
+//! snapshot-then-restore undoes folded draft tokens.
 //!
 //! Families: Qwen3-Next (Gated DeltaNet layers plus gated attention) and Nemotron-H (Mamba2 layers
 //! plus attention and MLP), both through their shipped synthetic fixtures. Both are hybrids: only the
@@ -30,7 +30,7 @@ use poot_graph_plan::{
     Submission, Target, compile_staged,
 };
 use poot_llm::driver::capacity::Planner;
-use poot_llm::driver::error::{DriverError, SpeculationRefusal, Unsupported};
+use poot_llm::driver::error::DriverError;
 use poot_llm::driver::placement::Placement;
 use poot_llm::driver::{
     BackendChoice, DraftPolicy, Driver, DriverOptions, GenerateRequest, Head, Layout, LoadOptions,
@@ -120,6 +120,7 @@ fn options() -> DriverOptions {
         },
         charge: program_retention,
         draft: DraftPolicy::Off,
+        hidden_window: None,
     }
 }
 
@@ -214,6 +215,39 @@ fn copy_graph(state: &[Carried], rows: usize, restore: bool) -> Graph<Validation
             copied
         } else {
             let copied = b.gather(live, 0, index);
+            pairs.push((live, live));
+            pairs.push((shadow, copied));
+            copied
+        };
+        out = Some(copied);
+    }
+    b.finish_with_state(out.expect("a recurrent model carries state"), &pairs)
+        .with_validations(Vec::new())
+}
+
+/// The graphs POOT-647's driver compiles (`driver/snapshot.rs`): the destination's rows kept or taken
+/// from the source by index, `Gather(Concat0(destination, source), idx)` with `idx[r] = r` to keep and
+/// `rows + r` to copy. Each row of a round it copies is a bandwidth cost the plain gather above does
+/// not show, so the cost rows time both.
+fn concat_copy_graph(state: &[Carried], rows: usize, restore: bool) -> Graph<ValidationOutputs> {
+    let b = Builder::new();
+    let index = b.slot_named(
+        Slot::Activation,
+        ROWS_TAG,
+        TensorType::new(vec![rows], DType::I32),
+    );
+    let mut pairs = Vec::new();
+    let mut out = None;
+    for s in state {
+        let live = b.state_input(&s.name, s.aval.clone(), StateRole::Recurrent);
+        let shadow = b.state_input(&shadow_name(&s.name), s.aval.clone(), StateRole::Recurrent);
+        let copied = if restore {
+            let copied = b.gather(b.concat(0, &[live, shadow]), 0, index);
+            pairs.push((live, copied));
+            pairs.push((shadow, shadow));
+            copied
+        } else {
+            let copied = b.gather(b.concat(0, &[shadow, live]), 0, index);
             pairs.push((live, live));
             pairs.push((shadow, copied));
             copied
@@ -561,6 +595,8 @@ const REPS: usize = 30;
 struct Arm {
     label: &'static str,
     graph: Graph<ValidationOutputs>,
+    /// The row index the arm binds: identity for a gather, `rows + r` for a concat copy of every row.
+    index: Vec<i32>,
 }
 
 /// Device time per step of `arm` on `executor`, and the host wall time per step, over [`REPS`] steps
@@ -578,11 +614,10 @@ fn time_arm(
     )
     .unwrap();
     let entry = executor.add_entry(exe, &program).unwrap();
-    let rows = identity_rows(ROWS);
+    let index = HostTensor::i32(vec![ROWS], arm.index.clone());
+    let key = rows_slot();
     let mut inputs = StepInputs::new();
-    for (key, tensor) in &rows {
-        inputs.push(key.clone(), tensor.shape(), tensor.view());
-    }
+    inputs.push(key, index.shape(), index.view());
     let step_once = |executor: &mut dyn Executor| {
         executor
             .step(exe, entry, &inputs, &mut NoSync)
@@ -647,14 +682,27 @@ fn measure(backend: DeviceBackend, choice: BackendChoice) {
             Arm {
                 label: "reorder (gather all state)",
                 graph: reorder_graph(&state, ROWS),
+                index: (0..ROWS as i32).collect(),
             },
             Arm {
                 label: "snapshot (recurrent -> shadow)",
                 graph: copy_graph(&recurrent_state, ROWS, false),
+                index: (0..ROWS as i32).collect(),
             },
             Arm {
                 label: "restore (shadow -> recurrent)",
                 graph: copy_graph(&recurrent_state, ROWS, true),
+                index: (0..ROWS as i32).collect(),
+            },
+            Arm {
+                label: "snapshot, concat+gather (driver)",
+                graph: concat_copy_graph(&recurrent_state, ROWS, false),
+                index: (ROWS as i32..2 * ROWS as i32).collect(),
+            },
+            Arm {
+                label: "restore, concat+gather (driver)",
+                graph: concat_copy_graph(&recurrent_state, ROWS, true),
+                index: (ROWS as i32..2 * ROWS as i32).collect(),
             },
         ];
         eprintln!(
@@ -698,7 +746,7 @@ fn snapshot_restore_and_reorder_cost_on_rocm() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// SC-002: the refusal stands, end to end.
+// Guard: speculation on a recurrent family does not diverge from greedy decode.
 // ---------------------------------------------------------------------------------------------
 
 fn generate(
@@ -712,7 +760,8 @@ fn generate(
         DriverOptions { draft, ..options() },
     )?;
     // A repeating prompt and a one-token n-gram, so prompt lookup proposes drafts the random fixture
-    // then rejects: with the refusal removed, the folded drafts change what greedy decode generates.
+    // then rejects: a rejected draft left folded in the GDN state would change what greedy decode
+    // generates.
     let prompt = [3u32, 5, 1, 3, 5, 1, 3, 5].to_vec();
     driver
         .generate(
@@ -728,20 +777,21 @@ fn generate(
         .map(|generated| generated.tokens)
 }
 
-/// SC-002: a GDN fixture generating with prompt lookup is refused with the typed recurrent refusal on
-/// the production `generate` path (a real device, the compiled program's state roles), and plain
-/// greedy decode on the same checkpoint generates. Mutation: make `check_speculation_state` return
-/// `Ok(())`; generation succeeds, its tokens diverge from greedy decode (a rejected draft was already
-/// folded into the GDN state) and the match arm panics, printing both token lists.
+/// A GDN fixture generating with prompt lookup (ngram 1, k 3) over a prompt whose drafts the model
+/// rejects returns the tokens plain greedy decode returns, on the production `generate` path (a real
+/// device). Before POOT-647 this row asserted the typed refusal instead, because a rejected draft
+/// stayed folded in the state and the tokens diverged; it is the guard that speculation does not do
+/// that. Mutation: make `roll_back` skip the restore (return before `copy_state_rows(Restore, ..)`);
+/// the rejected drafts stay folded, the tokens diverge from greedy and the assertion prints both lists.
 #[test]
-fn a_gdn_fixture_refuses_prompt_lookup_instead_of_diverging_from_greedy_wgpu() {
+fn a_gdn_fixture_speculates_with_prompt_lookup_without_diverging_from_greedy_wgpu() {
     let Some(greedy_executor) = poot_test_util::device_skip::open_or_skip(
         DeviceBackend::Wgpu,
         poot_llm::driver::open_executor(BackendChoice::Wgpu),
     ) else {
         return;
     };
-    let dir = poot_test_util::unique_temp_path("recurrent_snapshot_cost_refusal");
+    let dir = poot_test_util::unique_temp_path("recurrent_snapshot_cost_guard");
     write_checkpoint(&dir, &(entry(poot_models::qwen3next::FAMILY).fixture)());
     let handle = Arc::new(
         ModelHandle::load(&dir, &Registry::builtin().unwrap(), &LoadOptions::default()).unwrap(),
@@ -753,12 +803,9 @@ fn a_gdn_fixture_refuses_prompt_lookup_instead_of_diverging_from_greedy_wgpu() {
         ngram: nz(1),
         k: nz(3),
     };
-    match generate(&handle, executor, lookup) {
-        Err(DriverError::Unsupported(Unsupported::Speculation(refusal))) => {
-            assert_eq!(refusal, SpeculationRefusal::RecurrentState);
-        }
-        other => {
-            panic!("expected the recurrent-state refusal, got {other:?}; greedy was {greedy:?}")
-        }
-    }
+    let speculated = generate(&handle, executor, lookup).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        speculated, greedy,
+        "speculation over recurrent state differs from greedy decode"
+    );
 }

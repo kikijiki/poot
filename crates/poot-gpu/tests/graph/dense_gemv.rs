@@ -255,7 +255,7 @@ fn a_contraction_keeps_its_lds_width_through_the_planner_on_wgpu() {
         panic!("a single dispatch: {plan:?}");
     };
     assert_eq!(
-        dispatch.body.workgroup_size,
+        dispatch.body().workgroup_size,
         [128, 1, 1],
         "the baked LDS width"
     );

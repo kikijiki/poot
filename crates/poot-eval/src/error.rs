@@ -4,10 +4,11 @@
 //! bind check that produced it. Card 626 deleted the one untyped `String` variant,
 //! `Executor`: its 14 executor-built sites died with the pre-contract device executors (Cards 546b/549).
 
-use poot_graph_ir::{ExecutionValidationFailure, GraphValidationError, TensorType, ValueId};
+use poot_graph_ir::{
+    ExecutionValidationFailure, GraphValidationError, IndexRange, TensorType, ValueId,
+};
 use poot_tensor::DType;
 
-use crate::cast_authority::CastAuthorityError;
 use crate::ops::index_rule::IndexFault;
 use crate::{PackedEvalError, exact_dense};
 
@@ -37,6 +38,18 @@ pub struct CastFault {
     pub to: DType,
     pub index: usize,
     pub value: CastOperand,
+}
+
+/// A slot input holds the word `word` at `index`, outside the `range` its graph declares for the slot
+/// (POOT-726: `Token` in `[0, vocab)`, `Pos` in `[0, capacity)`). The declaration is a fact every
+/// consumer of the slot may rely on, so a binder refuses the step instead of running it.
+#[derive(Clone, Copy, Debug, PartialEq, thiserror::Error)]
+#[error("input {value} word {index} is {word}, outside its declared range {range}")]
+pub struct SlotRangeFault {
+    pub value: ValueId,
+    pub index: usize,
+    pub word: i32,
+    pub range: IndexRange,
 }
 
 /// One evaluator, one error type. Every walk refusal is one of these.
@@ -114,8 +127,10 @@ pub enum EvalError {
         needed: usize,
         limit: usize,
     },
+    /// A slot input holds a word outside the range its graph declares for it (POOT-726): the same
+    /// refusal a device executor gives at bind, raised before any equation runs.
     #[error(transparent)]
-    CastAuthority(#[from] Box<CastAuthorityError>),
+    SlotRange(Box<SlotRangeFault>),
 }
 
 impl EvalError {
@@ -144,8 +159,8 @@ impl From<IndexFault> for EvalError {
     }
 }
 
-impl From<CastAuthorityError> for EvalError {
-    fn from(value: CastAuthorityError) -> Self {
-        EvalError::CastAuthority(Box::new(value))
+impl From<SlotRangeFault> for EvalError {
+    fn from(value: SlotRangeFault) -> Self {
+        EvalError::SlotRange(Box::new(value))
     }
 }

@@ -9,9 +9,18 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # Package recipes for XRT, the amdxdna userspace plugin, Peano (llvm-aie) and IRON (mlir-aie) for the
+    # XDNA2 NPU (POOT-1118), pinned by revision and instantiated against THIS flake's nixpkgs (not its
+    # `packages` output): one glibc/libstdc++ closure, so a poot binary can link libxrt without mixing
+    # runtimes. `flake = false` also keeps its nixpkgs/nix-darwin inputs out of flake.lock.
+    # See https://github.com/noamsto/nix-amd-ai (retrieved 2026-10-11).
+    nix-amd-ai = {
+      url = "github:noamsto/nix-amd-ai/756e66909fc4cb48d2f655c42cfd5dc3364120e1";
+      flake = false;
+    };
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay }:
+  outputs = { self, nixpkgs, flake-utils, rust-overlay, nix-amd-ai }:
     flake-utils.lib.eachSystem [ "x86_64-linux" ] (system:
       let
         overlays = [ (import rust-overlay) ];
@@ -38,6 +47,41 @@
         # KFD ioctl; hsakmt merged there in 2025-03). The compiler and the device-libs bitcode come from
         # TheRock above, not from nixpkgs.
         rocm = pkgs.rocmPackages;
+
+        # XDNA2 NPU toolchain (POOT-1118, designs/npu-device-641.md): XRT (native API headers + libraries +
+        # xrt-smi) with the amdxdna userspace plugin, Peano (llvm-aie, `llc --march=aie2p`) and IRON
+        # (mlir-aie, `aiecc`). The recipes come from the pinned `nix-amd-ai` input and are built against this
+        # flake's nixpkgs; Peano and mlir-aie repackage the upstream release wheels by hash. The kernel
+        # driver (amdxdna, /dev/accel/accel0) is the host's, not nix's.
+        #
+        # Pinned versions (the `nix-amd-ai` input in flake.lock is the single pin; bump it deliberately):
+        #   XRT            Xilinx/XRT e9db9ab15f10173f8d2fc93ff92ab4c7eb09d2e6 (library 2.26.0)
+        #   amdxdna plugin amd/xdna-driver e2fad18d9510c1894122d30531b035d181afd828 (branch 1.9)
+        #   Peano          Xilinx/llvm-aie wheel 21.0.0.2026080301+c9c5ecb7 (llc registers aie2p)
+        #   IRON           Xilinx/mlir-aie wheel 1.4.2 (aiecc)
+        # The devshell banner prints the resolved versions; `$POOT_AIE_IRON --version` the link driver's.
+        xrt = pkgs.callPackage "${nix-amd-ai}/pkgs/xrt" {};
+        xrtPluginAmdxdna = pkgs.callPackage "${nix-amd-ai}/pkgs/xrt-plugin-amdxdna" { inherit xrt; };
+        peano = pkgs.callPackage "${nix-amd-ai}/pkgs/llvm-aie" {};
+        mlirAie = pkgs.callPackage "${nix-amd-ai}/pkgs/mlir-aie" { llvm-aie = peano; };
+
+        # One XRT prefix: the core runtime plus the amdxdna plugin beside it (XRT loads
+        # libxrt_driver_xdna.so from the directory libxrt_core lives in). XILINX_XRT names it.
+        xrtPrefix = pkgs.runCommand "xrt-with-amdxdna" {} ''
+          mkdir -p $out
+          cp -rs ${xrt}/opt/xilinx/xrt/* $out/
+          chmod -R u+w $out
+          ln -sf ${xrtPluginAmdxdna}/opt/xilinx/xrt/lib/libxrt_driver_xdna* $out/lib/
+        '';
+
+        # The IRON link driver `$POOT_AIE_IRON` names (scripts/poot-aie-link.py): pinned interpreter,
+        # PYTHONPATH and Peano, so the wrapper's bytes change with the toolchain (poot-codegen hashes them).
+        pootAieLink = pkgs.writeShellScriptBin "poot-aie-link" ''
+          export PYTHONPATH=${mlirAie.passthru.pythonPath}
+          export PEANO_INSTALL_DIR=${peano}
+          export PATH=${mlirAie}/bin:$PATH
+          exec ${mlirAie.passthru.python.interpreter} ${./scripts/poot-aie-link.py} "$@"
+        '';
 
         # Environment shared by every devShell that builds the workspace.
         #
@@ -209,5 +253,29 @@
             echo "  VK_ICD: ''${VK_ICD_FILENAMES:-<none>}"
           '';
         };
+
+        # The XDNA2 NPU shell (POOT-1118): the default shell plus the pinned XRT, Peano and IRON driver, for
+        # `xrt-smi`, a poot-npu FFI build and the ignored real-toolchain rows. A separate shell on purpose
+        # (POOT-1120): XRT builds from source (about 4 minutes cold) and Peano and mlir-aie are large
+        # closures, and no default-lane test needs them: the model-free rows run the AIE orchestration
+        # against scripted tools, and the one real-toolchain row is `#[ignore]`d and run by name here.
+        # Folding the shell in would charge every lane that build for no row it can run.
+        devShells.npu = self.devShells.${system}.default.overrideAttrs (old: {
+          nativeBuildInputs = old.nativeBuildInputs ++ [ xrtPrefix peano pootAieLink ];
+          shellHook = old.shellHook + ''
+            # ---- XDNA2 NPU toolchain (POOT-1118) ----
+            # XILINX_XRT is the prefix a poot-npu FFI shim compiles and links against (include/, lib/);
+            # xrt-smi sees the device through the amdxdna plugin beside libxrt_core. POOT_AIE_LLC is the
+            # Peano llc (`--version` lists the aie2p backend) and POOT_AIE_IRON the pinned link driver
+            # poot-codegen's compile_aie resolves. The device node is the host's; an unreadable
+            # /dev/accel/accel0 or a low memlock limit is a host setting, reported by xrt-smi itself.
+            export XILINX_XRT="${xrtPrefix}"
+            export PATH="${xrtPrefix}/bin:$PATH"
+            export LD_LIBRARY_PATH="${xrtPrefix}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            export POOT_AIE_LLC="${peano}/bin/llc"
+            export POOT_AIE_IRON="${pootAieLink}/bin/poot-aie-link"
+            echo "  npu: xrt ${xrt.version}, peano ${peano.version}, mlir-aie ${mlirAie.version}"
+          '';
+        });
       });
 }

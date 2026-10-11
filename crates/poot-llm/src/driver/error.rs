@@ -69,12 +69,17 @@ pub enum Unsupported {
 /// Why a [`DraftPolicy`](crate::driver::DraftPolicy) is refused at `prepare`.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SpeculationRefusal {
-    /// The model carries a recurrent state: a rejected draft token has already been folded into it
-    /// and `commit(kept)` cannot undo that.
+    /// The model's recurrent state advances in granules of more than one token: a rollback replays
+    /// the kept prefix, whose length (the accepted drafts and the query token) is not a multiple of
+    /// the granule.
     #[error(
-        "speculation needs positional state; a rejected draft cannot be rolled out of recurrent state"
+        "speculation over recurrent state needs a prefill granule of 1; this model's is {granule}"
     )]
-    RecurrentState,
+    RecurrentGranule { granule: usize },
+    /// The draft model carries recurrent state: the target's rollback does not cover the draft's, so
+    /// a rejected draft token would stay folded into it.
+    #[error("a draft model with recurrent state cannot be rolled back, only the target's is")]
+    RecurrentDraft,
     /// The draft model cannot propose tokens the target verifies.
     #[error("the draft model does not fit the target: {0}")]
     DraftMismatch(DraftMismatch),
@@ -119,6 +124,13 @@ pub enum InvalidRequest {
     /// The previous step's tokens for this sequence were never committed.
     #[error("sequence {0:?} has an uncommitted result")]
     UncommittedResult(SeqId),
+    /// A speculative round folded its kept prefix into this sequence's recurrent state, and the
+    /// caller then committed fewer tokens than that result held. The state cannot step back, so the
+    /// sequence can only be released (or resumed from a reset).
+    #[error(
+        "sequence {0:?} committed fewer tokens than a verified result, and its recurrent state holds the rest"
+    )]
+    RecurrentStateAhead(SeqId),
     #[error("prefill of sequence {seq:?} to {upto} is outside prompt positions {done}..={prompt}")]
     PrefillRange {
         seq: SeqId,
@@ -288,8 +300,8 @@ pub enum InvalidOptions {
         per_token: usize,
         granule: usize,
     },
-    /// A verify window runs drafts the sequence may reject, and recurrent state has no rollback: the
-    /// rejected drafts would already have advanced it.
+    /// A caller-named verify window runs drafts the sequence may reject, and only the driver's own
+    /// speculative rounds snapshot recurrent state: the rejected drafts would already have advanced it.
     #[error("a model with recurrent state cannot verify a window of drafts")]
     RecurrentHasNoVerifyWindows,
     /// A timing bound of zero would disable what it bounds: a detailed run needs every bound positive.

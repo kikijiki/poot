@@ -32,6 +32,7 @@ pub(crate) fn codegen_target(backend: Backend) -> poot_codegen::Target {
         Backend::SpirvVulkan => poot_codegen::Target::SpirvVulkan,
         Backend::Nvptx => poot_codegen::Target::Nvptx,
         Backend::AmdGcn(arch) => poot_codegen::Target::AmdGcn(arch),
+        Backend::Aie(_) => poot_codegen::Target::AieCore,
     }
 }
 
@@ -190,8 +191,19 @@ pub fn compute_views<V: ValidationChannel>(
         // A strided view is read element by element, so any f32 reader that takes strides reads it. A BF16 view
         // is only ever the packed expert stack an indexed contraction reads in place; its other readers have no
         // BF16 lane.
+        //
+        // An I32 view is read only by float pointwise regions (a region whose output is F32 reads an I32 leaf
+        // through its layout like any other): a cast step or an exact step of the region consumes the word in
+        // place, where a materialized I32 copy would cost a dispatch. An exact-I32 reader keeps its own plan
+        // for an I32 movement.
         let admitted = match g.aval(out).dtype {
             DType::F32 => true,
+            DType::I32 => cons.get(&out).is_some_and(|users| {
+                users.iter().all(|&i| {
+                    matches!(g.eqns[i].op, OpKind::Fused(_))
+                        && g.aval(g.eqns[i].out).dtype == DType::F32
+                })
+            }),
             DType::BF16 => cons.get(&out).is_some_and(|users| {
                 users
                     .iter()
@@ -272,7 +284,7 @@ pub const GEMV_TILE: usize = 32;
 ///
 /// Card 671/ADR-0113: this used to have a `pub` generic-over-`V` wrapper for cross-crate tests, with no
 /// production caller of its own - deleted. Cross-crate tests that used to call it now assert on the `Plan`
-/// [`crate::plan_eqn_analyzed`] returns instead (its key always starts with `"matmul:gemv"` for this path,
+/// [`crate::plan_eqn`] returns instead (its key always starts with `"matmul:gemv"` for this path,
 /// `"matmul:tiled"` for [`is_tiled_gemm_in`]'s).
 pub(crate) fn is_decode_gemv_in(
     g: GraphTables<'_>,
@@ -368,7 +380,7 @@ pub(crate) fn decode_gemv_plan(
         } else {
             ImportedKernel::GemvCoalesced
         };
-        return Ok(Planned::imported(kernel, backend, batch_meta, grid));
+        return Planned::imported(kernel, backend, batch_meta, grid);
     }
     let request = |elems, offset| {
         KernelRequest::Contraction(ContractionSpec::GemvChunk {
@@ -487,7 +499,6 @@ pub(crate) fn scatter_update_plan(
     storage: &kg::Storage,
     out_shape: &[usize],
     src_shape: Vec<usize>,
-    inverse_dtype: poot_kernel_ir::Ty,
     caps: &DeviceCaps,
 ) -> Result<Planned, PlanError> {
     let units = storage.units(out_shape);
@@ -497,7 +508,6 @@ pub(crate) fn scatter_update_plan(
             out_shape.to_vec(),
             kg::MovementOp::ScatterRows {
                 src_shape: src_shape.clone(),
-                inverse_dtype: inverse_dtype.clone(),
                 window,
             },
         )
@@ -646,13 +656,13 @@ pub(crate) fn tiled_gemm_plan(
         .tiled_gemm_max_workgroups
         .is_some_and(|max| groups >= max as usize);
     if !over_cap {
-        return Ok(Planned::imported(
+        return Planned::imported(
             kernel,
             backend,
             Some(vec![mrows as u32, kk as u32, nn as u32, 0]),
             // GEMM_TILE^2 lanes per (2*GEMM_TILE) x GEMM_TILE output tile (see `is_tiled_gemm_in`'s doc).
             [(groups * ts * ts) as u32, 1, 1],
-        ));
+        );
     }
     // Card 096: the tile offset rides in the metadata buffer of each sub-cap dispatch.
     // `over_cap` is only true when a cap exists, so this is always `Some`.
@@ -787,17 +797,17 @@ pub(crate) fn indexed_gemv_in(m: usize, n: usize, caps: &DeviceCaps) -> Option<k
 }
 
 /// Whether an `IndexedMatMul` (or a `ContractionEpilogue` over one) has a generated lowering by dtype: f32
-/// activation and output, an f32 id operand (the kernel reads ids as f32; the oracle also reads I32 words), and a
-/// stacked weight that is f32 or BF16. A BF16 weight additionally has to be a const, or a promoted view of one,
-/// which only the planner can tell ([`view_source`] over the views table); `plan_indexed` refuses any other BF16
-/// weight, so no BF16 buffer is read as packed lanes without having been uploaded as them.
+/// activation and output, an I32 id operand, and a stacked weight that is f32 or BF16. A BF16 weight
+/// additionally has to be a const, or a promoted view of one, which only the planner can tell
+/// ([`view_source`] over the views table); `plan_indexed` refuses any other BF16 weight, so no BF16 buffer is
+/// read as packed lanes without having been uploaded as them.
 pub(crate) fn indexed_matmul_lowers(g: GraphTables<'_>, eqn: &Eqn) -> bool {
     let ids = value_ids(eqn);
     g.aval(eqn.out).dtype == DType::F32
         && ids.len() >= 3
         && g.aval(ids[0]).dtype == DType::F32
         && matches!(g.aval(ids[1]).dtype, DType::F32 | DType::BF16)
-        && g.aval(ids[2]).dtype == DType::F32
+        && g.aval(ids[2]).dtype == DType::I32
 }
 
 /// The value a promoted view `value` reads in place ([`compute_views`]'s table): the input of the movement op
@@ -942,7 +952,8 @@ fn matmul_takes_tensorcore(
             arch.tensor_core == TensorCoreSupport::Wmma16x16x16Rdna3
                 && out_shape[..r - 2].iter().product::<usize>() == 1
         }
-        _ => false,
+        // No tensor-core kernel: the portable body, and an AIE core has no fragment hardware.
+        Backend::SpirvVulkan | Backend::Aie(_) => false,
     }
 }
 

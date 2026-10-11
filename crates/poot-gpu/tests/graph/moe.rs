@@ -444,6 +444,8 @@ fn stable_moe_ties_gpu_match_independent_oracle() {
         let ids = b.arg_top_k(rank, k);
         let mask = poot_graph_ir::ops::top_k_keep_mask(&b, rank, k);
         let gate = poot_graph_ir::ops::top_k_gate(&b, scores, k);
+        // The ids are I32; the concatenated probe row is F32 (ids below 2^24 widen exactly).
+        let ids = b.cast(ids, poot_tensor::DType::F32);
         let out = b.concat(1, &[ids, mask, gate]);
         let graph = b.finish(out);
         let inputs: HashMap<_, _> = graph

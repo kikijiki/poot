@@ -23,5 +23,8 @@ pub fn default_caps_for(backend: Backend) -> DeviceCaps {
             ..DeviceCaps::rocm_default()
         },
         Backend::Nvptx => DeviceCaps::ptx_default(),
+        Backend::Aie(_) => {
+            panic!("an AIE target has no GPU DeviceCaps; a test builds `poot_target::AieCaps`")
+        }
     }
 }

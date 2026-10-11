@@ -65,6 +65,7 @@ fn shape(tokens: usize) -> StepShape {
         capacity: n(CAPACITY),
         kv: KvLayout::Contiguous,
         logits: LogitRows::Last,
+        hidden: None,
     }
 }
 

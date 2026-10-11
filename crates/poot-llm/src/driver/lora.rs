@@ -94,10 +94,12 @@ impl AdapterRef {
     }
 
     /// The row value bound to `Slot::LoraIdx`: 0 for the base weights.
-    pub(crate) fn row_value(self) -> f32 {
+    pub(crate) fn row_value(self) -> i32 {
         match self {
-            AdapterRef::Base => 0.0,
-            AdapterRef::Adapter { index, .. } => index.get() as f32,
+            AdapterRef::Base => 0,
+            AdapterRef::Adapter { index, .. } => {
+                i32::try_from(index.get()).expect("an adapter index is below i32::MAX")
+            }
         }
     }
 }

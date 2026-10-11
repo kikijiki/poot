@@ -13,11 +13,12 @@ use poot_target::{AmdArch, Backend, DeviceCaps};
 use poot_tensor::DType;
 
 use super::*;
-use crate::components::standard::oracle::{eval, run_step};
+use crate::components::standard::oracle::{eval, run_shape, run_step, step_shape};
 use crate::components::testing::{assert_missing_weight_is_named, build, close, close_all, values};
-use crate::model::{ConfigReason, KvLayout, LogitRows, Phase, ShapeReason};
+use crate::model::{ConfigReason, HiddenCarry, KvLayout, LogitRows, Phase, ShapeReason};
 use crate::registry::Registry;
 use reference::Reference;
+use std::collections::BTreeMap;
 
 /// The cache capacity of the rows here: 8 pools of the indexer's pool size 2.
 const CAPACITY: usize = 16;
@@ -36,6 +37,7 @@ fn shape(tokens: usize, capacity: usize, logits: LogitRows) -> StepShape {
         capacity: NonZeroUsize::new(capacity).unwrap(),
         kv: KvLayout::Contiguous,
         logits,
+        hidden: None,
     }
 }
 
@@ -227,6 +229,90 @@ fn a_prefill_then_a_decode_equals_decode_steps_at_every_state_element() {
     }
 }
 
+/// POOT-1109 SC-001: a step that asks for the hidden-state carry writes the reference's closing-norm
+/// output (the normalized mean of the `hc_mult` streams) at every position it carries, for a prefill
+/// chunk read as a last-token step, a verify window over all positions and a replay of the kept
+/// prefix after the rollback. The carry is not rolled back: the replay leaves the window's later
+/// rows where they were. The head stays last-only (the chunk's logits are the reference's last
+/// position). Mutation: write the pre-norm mean (`carry_hidden(b, mean)`) or one stream's value in
+/// the tracer; the first assertion is red at every element.
+#[test]
+fn the_hidden_carry_is_the_references_post_norm_stream_mean_for_a_chunk_a_window_and_a_replay() {
+    let fx = fixture();
+    let model = model_of(&fx);
+    let tokens = &PROMPT[..9];
+    let want = Reference::new(&fx.config, &fx.store).run(
+        &tokens.iter().map(|&t| t as usize).collect::<Vec<_>>(),
+        CAPACITY,
+    );
+    let width = want.hidden[0].len();
+    let rows = |range: std::ops::Range<usize>| -> Vec<f32> {
+        range
+            .flat_map(|p| want.hidden[p].iter().map(|&v| v as f32))
+            .collect()
+    };
+    let positions = 8;
+    let carry = HiddenCarry {
+        positions: NonZeroUsize::new(positions).unwrap(),
+    };
+    let step = |logits, count, hidden| step_shape(count, CAPACITY, logits, hidden);
+    let carry_of = |state: &[Vec<f32>]| -> Vec<f32> {
+        assert_eq!(state.last().unwrap().len(), positions * width);
+        state.last().unwrap().clone()
+    };
+
+    // A prefill chunk of six, logits at the last position only.
+    let (logits, after_chunk) = run_shape(
+        &*model,
+        &fx.store,
+        Phase::Prefill,
+        step(LogitRows::Last, 6, Some(carry)),
+        &tokens[..6],
+        0,
+        &[],
+    );
+    let mut expect = rows(0..6);
+    expect.resize(positions * width, 0.0);
+    close(&carry_of(&after_chunk), &expect);
+    let last: Vec<f32> = want.logits[5].iter().map(|&v| v as f32).collect();
+    close(&logits, &last);
+
+    // A window of three over all positions, continuing the chunk: its positions are the carry's
+    // first three, the older rows beyond stay.
+    let (_, after_window) = run_shape(
+        &*model,
+        &fx.store,
+        Phase::Prefill,
+        step(LogitRows::All, 3, Some(carry)),
+        &tokens[6..9],
+        6,
+        &after_chunk,
+    );
+    let mut expect = rows(6..9);
+    expect.extend(&rows(3..6));
+    expect.resize(positions * width, 0.0);
+    close(&carry_of(&after_window), &expect);
+
+    // The rollback restores the state the chunk left, not the carry; the kept prefix of two replays
+    // as a chunk from there. Only its own two positions change.
+    let mut restored = after_chunk.clone();
+    *restored.last_mut().unwrap() = after_window.last().unwrap().clone();
+    let (_, after_replay) = run_shape(
+        &*model,
+        &fx.store,
+        Phase::Prefill,
+        step(LogitRows::Last, 2, Some(carry)),
+        &tokens[6..8],
+        6,
+        &restored,
+    );
+    let mut expect = rows(6..8);
+    expect.extend(&rows(8..9));
+    expect.extend(&rows(3..6));
+    expect.resize(positions * width, 0.0);
+    close(&carry_of(&after_replay), &expect);
+}
+
 /// SC-011 (the driver's alignment half): a six-token prompt split in the pieces `[4, 2]` the
 /// driver plans for a chunk of four matches six decode steps at every output and every recurrent
 /// state. A KDA step is a per-token unrolled recurrence, so the pieces are bounded by the caller's
@@ -412,35 +498,41 @@ fn the_hyper_connection_weights_decide_the_logits() {
     }
 }
 
-/// SC-010 (R-640-2): a store carrying a multi-token-prediction layer loads, and the load report
-/// lists its tensors as known: not unknown and not loaded. The same store under a config with no
-/// such layer reports them unknown, so the claim comes from the config's layer count. Mutation: drop
-/// the known claims in `Rows::known`; the tensors are reported unknown and the row goes red.
+/// SC-010 (R-640-2, POOT-1110): a store carrying a multi-token-prediction layer loads it: the
+/// first layer's fusing projection, its three norms and its DSA block and feed-forward are read, not
+/// merely known, and the copies of the embedding and the head the layer may store are known. The same
+/// store under a config with no such layer reports every tensor of the layer unknown, so the claim
+/// comes from the config's layer count. Mutation: skip the `Rows::mtp` call in `weights_of`; the
+/// tower cannot find the layer's weights and the build panics naming the missing map entry.
 #[test]
-fn a_multi_token_prediction_layer_is_known_and_not_loaded() {
+fn a_multi_token_prediction_layer_is_loaded_and_its_shared_copies_are_known() {
     let fx = fixture();
     let model = model_of(&fx);
     let report = model.weights().report(&fx.store);
-    let mtp: Vec<&str> = [
-        "eh_proj.weight",
-        "enorm.weight",
-        "hnorm.weight",
-        "shared_head.norm.weight",
-    ]
-    .into_iter()
-    .collect();
-    for name in mtp {
-        let key =
-            poot_quant::weights::WeightKey::from(format!("model.language_model.layers.4.{name}"));
-        assert!(fx.store.contains(key.as_str()), "{key} is in the fixture");
-        assert!(report.known.contains(&key), "{key} is known");
-        assert!(!report.unknown.contains(&key), "{key} is not unknown");
-        assert!(!report.loaded.contains(&key), "{key} is not loaded");
+    let prefix = "model.language_model.layers.4.";
+    let layer: Vec<_> = fx
+        .store
+        .keys()
+        .filter(|key| key.as_str().starts_with(prefix))
+        .cloned()
+        .collect();
+    assert!(
+        layer.len() > 30,
+        "the fixture stores a whole layer: {}",
+        layer.len()
+    );
+    for key in &layer {
+        assert!(report.loaded.contains(key), "{key} is loaded");
+        assert!(!report.unknown.contains(key), "{key} is not unknown");
+    }
+    for name in ["eh_proj.weight", "enorm.weight", "hnorm.weight"] {
+        let key = poot_quant::weights::WeightKey::from(format!("{prefix}{name}"));
+        assert!(report.loaded.contains(&key), "{key} is loaded");
     }
     assert_eq!(
         report.unknown.len(),
         0,
-        "every other tensor is read: {:?}",
+        "every tensor is read: {:?}",
         report.unknown
     );
 
@@ -457,7 +549,57 @@ fn a_multi_token_prediction_layer_is_known_and_not_loaded() {
     );
     let report = model.weights().report(&fx.store);
     assert_eq!(report.known.len(), 0);
-    assert_eq!(report.unknown.len(), 4);
+    assert_eq!(report.unknown.len(), layer.len());
+}
+
+/// What the layer's checkpoint rows name as extra copies: a stored `embed_tokens.weight` or
+/// `shared_head.head.weight` of the first MTP layer (the shared head reads the target's) and every
+/// tensor of a second layer are known, not unknown and not loaded.
+#[test]
+fn the_shared_copies_and_a_second_layer_are_known_and_not_loaded() {
+    let fx = fixture();
+    let mut store = poot_quant::weights::WeightStore::builder();
+    for (key, entry) in fx.store.iter() {
+        store
+            .insert(key.as_str().to_string(), entry.clone())
+            .unwrap();
+    }
+    let copies = [
+        "model.language_model.layers.4.embed_tokens.weight",
+        "model.language_model.layers.4.shared_head.head.weight",
+        "model.language_model.layers.5.eh_proj.weight",
+    ];
+    let dense = |shape: Vec<usize>| {
+        WeightEntry::Dense(
+            DenseWeight::try_new(
+                DType::F32,
+                shape.clone(),
+                vec![0u8; 4 * shape.iter().product::<usize>()].into(),
+            )
+            .unwrap(),
+        )
+    };
+    for key in copies {
+        store.insert(key.to_string(), dense(vec![2, 2])).unwrap();
+    }
+    let store = store.build();
+    let mut config = fx.config.clone();
+    config["text_config"]["num_nextn_predict_layers"] = serde_json::json!(2);
+    let model = build(
+        &ENTRY,
+        &RawConfig::HfJson {
+            config: &config,
+            generation: None,
+        },
+        &store,
+    );
+    let report = model.weights().report(&store);
+    for key in copies {
+        let key = poot_quant::weights::WeightKey::from(key);
+        assert!(report.known.contains(&key), "{key} is known");
+        assert!(!report.unknown.contains(&key), "{key} is not unknown");
+        assert!(!report.loaded.contains(&key), "{key} is not loaded");
+    }
 }
 
 fn config_error_of(edit: impl FnOnce(&mut serde_json::Value)) -> (&'static str, ConfigReason) {
@@ -606,6 +748,47 @@ fn the_device_logprob_literals_are_the_references() {
     }
 }
 
+/// The prefix and the bonus token of the device rows' MTP chain, and its length.
+const MTP_DEVICE_PREFIX: [usize; 6] = [3, 17, 40, 8, 25, 9];
+const MTP_DEVICE_BONUS: usize = 31;
+const MTP_DEVICE_K: usize = 3;
+
+/// POOT-1110: the logits the device rows of the MTP program compare with (one line per draft step)
+/// are the independent reference's chain over the fixture, within `1e-6`. Regenerate by replacing the
+/// file with the text in the failure message. Mutation: change one value in the file; the row goes
+/// red.
+#[test]
+fn the_device_mtp_logit_literals_are_the_references_chain() {
+    let recorded = include_str!(
+        "../../../../poot-llm/src/driver/device_tests/glm53_flash_reference_mtp_logits.txt"
+    );
+    let fx = fixture();
+    let want = Reference::new(&fx.config, &fx.store)
+        .mtp_chain(&MTP_DEVICE_PREFIX, MTP_DEVICE_BONUS, MTP_DEVICE_K)
+        .logits;
+    let regenerated: String = want
+        .iter()
+        .map(|row| {
+            let values: Vec<String> = row.iter().map(|v| format!("{v:.8e}")).collect();
+            values.join(" ") + "\n"
+        })
+        .collect();
+    let got: Vec<Vec<f64>> = recorded
+        .lines()
+        .map(|line| line.split(' ').map(|v| v.parse().unwrap()).collect())
+        .collect();
+    assert_eq!(got.len(), want.len(), "regenerated:\n{regenerated}");
+    for (step, (got, want)) in got.iter().zip(&want).enumerate() {
+        assert_eq!(got.len(), want.len(), "regenerated:\n{regenerated}");
+        for (token, (got, want)) in got.iter().zip(want).enumerate() {
+            assert!(
+                (got - want).abs() <= 1e-6,
+                "step {step} token {token}: recorded {got}, reference {want}; regenerated:\n{regenerated}"
+            );
+        }
+    }
+}
+
 /// SC-001 (tier 3): the reference's greedy decode over the fixture is the recorded literal, and the
 /// model on the oracle generates the same tokens. Mutation: swap two experts' routing indices in
 /// the tracer; the oracle's tokens leave the literal and the row goes red.
@@ -630,6 +813,7 @@ fn target_of(backend: Backend) -> Target {
             Backend::SpirvVulkan => DeviceCaps::wgpu_rdna3_igpu(),
             Backend::Nvptx => DeviceCaps::ptx_default(),
             Backend::AmdGcn(_) => DeviceCaps::rocm_default(),
+            Backend::Aie(_) => unreachable!("an AIE target has no GPU DeviceCaps"),
         },
     }
 }
@@ -717,4 +901,330 @@ fn compile_preserves_every_witness_lane() {
             );
         }
     }
+}
+
+/// The carried state of a program by the name the graph gives each value, so the two programs of a
+/// driver step (the target's and the multi-token-prediction layer's) hand the carry over by name
+/// and each keeps its own caches.
+type NamedState = BTreeMap<String, Vec<f32>>;
+
+/// One step of `model` over the named state: every value the graph carries is read from `state` by
+/// name (zeros when absent) and written back after the step. Returns the step's logits.
+fn run_named(
+    model: &dyn Model,
+    store: &WeightStore,
+    phase: Phase,
+    step: StepShape,
+    tokens: &[i32],
+    start: i32,
+    state: &mut NamedState,
+) -> Vec<f32> {
+    let graph = model.trace(phase, step).unwrap();
+    let names: Vec<String> = graph
+        .state
+        .iter()
+        .map(|&(input, _)| graph.meta(input).name.clone().unwrap())
+        .collect();
+    let input: Vec<Vec<f32>> = graph
+        .state
+        .iter()
+        .zip(&names)
+        .map(|(&(input, _), name)| {
+            state
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| vec![0.0; graph.aval(input).numel()])
+        })
+        .collect();
+    let (logits, next) = run_shape(model, store, phase, step, tokens, start, &input);
+    state.extend(names.into_iter().zip(next));
+    logits
+}
+
+fn argmax(row: &[f32]) -> usize {
+    row.iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .unwrap()
+        .0
+}
+
+const CARRY_NAME: &str = crate::components::standard::HIDDEN_CARRY_STATE;
+
+/// Run the traced `Phase::Mtp` chain the driver of a round would: the target prefills `prefix` with
+/// the carry, then the layer catches up over every position with the token that follows it (the last
+/// with `bonus`), then `k - 1` one-token steps, each fed the greedy token of the step before and the
+/// post-norm state that step left in the carry. Returns every draft step's logits and tokens.
+fn traced_mtp_chain(
+    fx: &Fixture,
+    prefix: &[i32],
+    bonus: i32,
+    k: usize,
+) -> (Vec<Vec<f32>>, Vec<usize>) {
+    let model = model_of(fx);
+    let n = prefix.len();
+    let carry = HiddenCarry {
+        positions: NonZeroUsize::new((k + 1).max(n)).unwrap(),
+    };
+    let mut target = NamedState::new();
+    run_named(
+        &*model,
+        &fx.store,
+        Phase::Prefill,
+        step_shape(n, CAPACITY, LogitRows::Last, Some(carry)),
+        prefix,
+        0,
+        &mut target,
+    );
+    // The layer's program has its own caches and reads the carry the target wrote.
+    let mut mtp = NamedState::new();
+    mtp.insert(CARRY_NAME.to_string(), target[CARRY_NAME].clone());
+    let mtp_step = |tokens: usize| step_shape(tokens, CAPACITY, LogitRows::Last, Some(carry));
+    let following: Vec<i32> = prefix[1..].iter().copied().chain([bonus]).collect();
+    let mut logits = vec![run_named(
+        &*model,
+        &fx.store,
+        Phase::Mtp,
+        mtp_step(n),
+        &following,
+        0,
+        &mut mtp,
+    )];
+    let mut drafts = vec![argmax(&logits[0])];
+    for i in 1..k {
+        let token = *drafts.last().unwrap() as i32;
+        logits.push(run_named(
+            &*model,
+            &fx.store,
+            Phase::Mtp,
+            mtp_step(1),
+            &[token],
+            (n - 1 + i) as i32,
+            &mut mtp,
+        ));
+        drafts.push(argmax(&logits[i]));
+    }
+    (logits, drafts)
+}
+
+/// SC-001 (POOT-1110): the traced `Phase::Mtp` program over the hidden-state carry equals a
+/// from-scratch f64 chain for `k = 3`, at every draft step's every logit and every drawn token. The
+/// reference runs the target and the layer one position at a time with no carry and no cache but its
+/// own history; the traced run catches up over the whole prefix in one step of width `n`, then
+/// recycles the layer's own post-norm state through the carry for two one-token steps. Mutations
+/// (each restored before the next; a failure message is recorded in the card): swap the concatenation
+/// order in `MtpLayer::trace` (`norm(hnorm)` before `norm(enorm)`); carry the closing mean before
+/// the final norm (`step.carry_hidden(b, mean)` in `Tower::trace`); write the block's output before
+/// `shared_head.norm` into the carry (`carry_last_hidden(.., block)`); leave the position-0 embedding
+/// unmasked; each moves the first or the later draft logits and the row goes red.
+#[test]
+fn the_traced_mtp_chain_over_the_carry_equals_the_from_scratch_chain_for_k_3() {
+    let fx = fixture();
+    let reference = Reference::new(&fx.config, &fx.store);
+    for (prefix, bonus) in [(&PROMPT[..6], PROMPT[6]), (&PROMPT[..3], PROMPT[3])] {
+        let k = 3;
+        let want = reference.mtp_chain(
+            &prefix.iter().map(|&t| t as usize).collect::<Vec<_>>(),
+            bonus as usize,
+            k,
+        );
+        let (logits, drafts) = traced_mtp_chain(&fx, prefix, bonus, k);
+        assert_eq!(logits.len(), k);
+        for (step, (got, want)) in logits.iter().zip(&want.logits).enumerate() {
+            let want: Vec<f32> = want.iter().map(|&v| v as f32).collect();
+            eprintln!("prefix {} draft step {step}", prefix.len());
+            close(got, &want);
+        }
+        assert_eq!(drafts, want.drafts, "the greedy draft tokens");
+        // The drafts are not one repeated token: every step's input differs.
+        assert!(
+            drafts.windows(2).any(|w| w[0] != w[1]) || drafts.len() < 2,
+            "the chain is not degenerate: {drafts:?}"
+        );
+    }
+}
+
+/// The layer's step needs the carry it reads: a `Phase::Mtp` shape that names none is a typed
+/// refusal before any graph is built, and a carry narrower than the step's tokens is the carry's own
+/// refusal. Mutation: drop the `MtpWithoutCarry` return in `check_mtp_step`; the shape traces the
+/// layer over a carry that does not exist (or panics at the `expect`) and the row goes red.
+#[test]
+fn an_mtp_step_without_a_carry_or_with_a_narrow_one_is_a_typed_refusal() {
+    let model = model_of(&fixture());
+    let refusal = |shape| match model.trace(Phase::Mtp, shape) {
+        Err(TraceError::ShapeUnsupported { reason, .. }) => reason,
+        other => panic!("expected a shape refusal, got {:?}", other.map(|_| ())),
+    };
+    assert_eq!(
+        refusal(shape(1, CAPACITY, LogitRows::Last)),
+        ShapeReason::MtpWithoutCarry
+    );
+    let narrow = HiddenCarry {
+        positions: NonZeroUsize::new(2).unwrap(),
+    };
+    assert_eq!(
+        refusal(step_shape(3, CAPACITY, LogitRows::Last, Some(narrow))),
+        ShapeReason::HiddenCarryNarrow {
+            positions: 2,
+            tokens: 3
+        }
+    );
+}
+
+/// A checkpoint that stores no MTP layer, or more than one (the reference cycles them by draft step,
+/// which a step shape does not name), refuses `Phase::Mtp` typed and still traces its text phases.
+/// Mutation: drop the `count == 1` filter in `Tower::trace_mtp`; the two-layer checkpoint traces the
+/// first layer for every step and the row goes red.
+#[test]
+fn a_checkpoint_without_exactly_one_mtp_layer_refuses_the_phase_typed() {
+    let carry = HiddenCarry {
+        positions: NonZeroUsize::new(4).unwrap(),
+    };
+    let step = step_shape(1, CAPACITY, LogitRows::Last, Some(carry));
+    let model = model_of(&finetune_fixture());
+    assert!(matches!(
+        model.trace(Phase::Mtp, step),
+        Err(TraceError::PhaseUnsupported {
+            phase: Phase::Mtp,
+            ..
+        })
+    ));
+
+    let fx = fixture();
+    let mut config = fx.config.clone();
+    config["text_config"]["num_nextn_predict_layers"] = serde_json::json!(2);
+    let model = build(
+        &ENTRY,
+        &RawConfig::HfJson {
+            config: &config,
+            generation: None,
+        },
+        &fx.store,
+    );
+    assert!(matches!(
+        model.trace(Phase::Mtp, step),
+        Err(TraceError::PhaseUnsupported {
+            phase: Phase::Mtp,
+            ..
+        })
+    ));
+    model
+        .trace(Phase::Decode, shape(1, CAPACITY, LogitRows::Last))
+        .unwrap();
+}
+
+/// Every other registered family refuses `Phase::Mtp` typed, whatever the shape: the phase is the
+/// family's to opt into, and none but this one does. Mutation: let `check_step` pass `Phase::Mtp`
+/// through; the dense decoders trace an ordinary step for it and the row goes red naming the family.
+#[test]
+fn every_other_family_refuses_phase_mtp_typed() {
+    let carry = HiddenCarry {
+        positions: NonZeroUsize::new(4).unwrap(),
+    };
+    let step = step_shape(1, 8, LogitRows::Last, Some(carry));
+    let registry = Registry::builtin().unwrap();
+    let mut refused = 0;
+    for entry in registry.entries() {
+        if entry.family == FAMILY {
+            continue;
+        }
+        let fx = (entry.fixture)();
+        let model = build(entry, &fx.raw(), &fx.store);
+        match model.trace(Phase::Mtp, step) {
+            Err(TraceError::PhaseUnsupported {
+                phase: Phase::Mtp, ..
+            }) => refused += 1,
+            other => panic!(
+                "{} must refuse Phase::Mtp typed, got {:?}",
+                entry.family,
+                other.map(|_| ())
+            ),
+        }
+    }
+    assert!(
+        refused > 10,
+        "the registry's families were walked: {refused}"
+    );
+}
+
+/// The MTP program plans for the wgpu, PTX and ROCm targets: a family runs on a backend when its
+/// graph plans there (the catch-up width and the one-token chain step). Mutation: refuse the
+/// `Select` the position-0 mask lowers to on the ROCm planner; the ROCm rows go red naming it.
+#[test]
+fn the_mtp_graphs_compile_for_every_backend() {
+    let model = model_of(&fixture());
+    let carry = HiddenCarry {
+        positions: NonZeroUsize::new(6).unwrap(),
+    };
+    for tokens in [1, 6] {
+        let graph = model
+            .trace(
+                Phase::Mtp,
+                step_shape(tokens, CAPACITY, LogitRows::Last, Some(carry)),
+            )
+            .unwrap();
+        let graph = poot_graph_plan::bind_packed_weights(
+            &graph,
+            &poot_graph_plan::WeightFormats::from_weight_map(model.weights()),
+        )
+        .unwrap();
+        for backend in backends() {
+            compile(&graph, &target_of(backend), &REPLAY)
+                .unwrap_or_else(|e| panic!("Mtp at {tokens} tokens on {backend:?}: {e}"));
+        }
+    }
+}
+
+/// The fixture with the embedding row of `token` set to NaN (stored as bf16, as the checkpoint).
+fn with_nan_embedding_row(fx: &Fixture, token: usize) -> Fixture {
+    let key = "model.language_model.embed_tokens.weight";
+    let mut store = WeightStore::builder();
+    for (name, entry) in fx.store.iter() {
+        let entry = if name.as_str() == key {
+            let mut rows = values(entry);
+            let width =
+                rows.len() / fx.config["text_config"]["vocab_size"].as_u64().unwrap() as usize;
+            rows[token * width..(token + 1) * width].fill(f32::NAN);
+            let bytes: Vec<u8> = rows
+                .iter()
+                .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+                .collect();
+            let shape = match entry {
+                WeightEntry::Dense(dense) => dense.shape().to_vec(),
+                other => panic!("the embedding is stored dense: {other:?}"),
+            };
+            WeightEntry::Dense(DenseWeight::try_new(DType::BF16, shape, bytes.into()).unwrap())
+        } else {
+            entry.clone()
+        };
+        store.insert(name.as_str().to_string(), entry).unwrap();
+    }
+    Fixture {
+        config: fx.config.clone(),
+        generation: None,
+        store: store.build(),
+    }
+}
+
+/// A non-finite embedding row at position 0 is zeroed, not multiplied by zero: the step holds the
+/// row of the token that follows position 0 (here the bonus token of a one-token prefix), which is
+/// NaN, and the layer's logits equal the reference's, whose position-0 embedding is a literal zero.
+/// Mutation: build the masked value as `embedded * 0` (the unselected branch of the select); the NaN
+/// reaches `enorm` and every logit is NaN, so the row goes red.
+#[test]
+fn a_non_finite_embedding_row_at_position_zero_is_zeroed_not_propagated() {
+    let fx = fixture();
+    let (prefix, bonus) = ([PROMPT[0]], PROMPT[1] + 20);
+    let want = Reference::new(&fx.config, &fx.store)
+        .mtp_chain(&[prefix[0] as usize], bonus as usize, 1)
+        .logits
+        .remove(0);
+    let poisoned = with_nan_embedding_row(&fx, bonus as usize);
+    let (logits, _) = traced_mtp_chain(&poisoned, &prefix, bonus, 1);
+    let want: Vec<f32> = want.iter().map(|&v| v as f32).collect();
+    assert!(
+        logits[0].iter().all(|v| v.is_finite()),
+        "the logits are finite"
+    );
+    close(&logits[0], &want);
 }

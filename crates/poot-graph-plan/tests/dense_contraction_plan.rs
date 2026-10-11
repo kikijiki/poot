@@ -33,6 +33,7 @@ fn target(backend: Backend) -> Target {
             Backend::SpirvVulkan => DeviceCaps::wgpu_rdna3_igpu(),
             Backend::Nvptx => DeviceCaps::ptx_default(),
             Backend::AmdGcn(_) => DeviceCaps::rocm_default(),
+            Backend::Aie(_) => unreachable!("an AIE target has no GPU DeviceCaps"),
         },
     }
 }

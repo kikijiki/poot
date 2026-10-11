@@ -182,7 +182,7 @@ impl Device for PtxDevice {
             poot_graph_plan::CompileLimits::STANDARD.max_artifact_bytes,
         )?;
         let compiled =
-            poot_codegen::kernel_handle(&body, poot_codegen::Target::Nvptx, artifact.bytes);
+            poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::Nvptx, artifact.bytes);
         let threads = u32::try_from(n).map_err(|_| {
             PtxGpuError::Graph(format!("copy of {n} elements exceeds the launch ABI"))
         })?;

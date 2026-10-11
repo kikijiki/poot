@@ -51,9 +51,8 @@ pub struct Glm53Config {
     pub(super) width: usize,
     pub(super) max_positions: usize,
     pub(super) layers: Vec<LayerKind>,
-    /// MTP layers the checkpoint stores after the text layers: tensors the family knows and does not
-    /// read.
-    pub(super) mtp_layers: usize,
+    /// The multi-token-prediction layers the checkpoint stores after the text layers.
+    pub(super) mtp: Option<MtpLayers>,
     pub(super) tied_head: bool,
     pub(super) norm: NormParams,
     pub(super) mhc: MhcParams,
@@ -64,6 +63,16 @@ pub struct Glm53Config {
     pub(super) moe: Option<MoeParams>,
     pub(super) eos: BTreeSet<u32>,
     pub(super) bos: Option<u32>,
+}
+
+/// The multi-token-prediction layers of a checkpoint: how many it stores and the feed-forward kind
+/// of each. An MTP layer is a DSA block (latent attention under the pooled indexer, no
+/// hyper-connections), whose feed-forward is the last text layer's kind, as in vLLM
+/// `Glm5NextDecoderLayer`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct MtpLayers {
+    pub count: usize,
+    pub ffn: Ffn,
 }
 
 /// The dense feed-forward block: its width and gate.
@@ -154,8 +163,23 @@ impl Glm53Config {
         .map_err(param)?;
 
         let kinds = layer_kinds(&fields, &text, layers)?;
-        let has = |mixer: Mixer| kinds.iter().any(|k| k.mixer == mixer);
-        let has_ffn = |ffn: Ffn| kinds.iter().any(|k| k.ffn == ffn);
+        let mtp_count = fields
+            .opt_u64(Field::hf("num_nextn_predict_layers"))?
+            .map_or(Ok(0), |n| {
+                usize::try_from(n)
+                    .map_err(|_| fields.error("num_nextn_predict_layers", ConfigReason::WrongType))
+            })?;
+        let mtp = (mtp_count > 0).then(|| MtpLayers {
+            count: mtp_count,
+            ffn: kinds.last().map_or(Ffn::Sparse, |kind| kind.ffn),
+        });
+        // The parameters of a kind are read exactly when a text layer or an MTP layer has it.
+        let has = |mixer: Mixer| {
+            kinds.iter().any(|k| k.mixer == mixer) || (mixer == Mixer::Dsa && mtp.is_some())
+        };
+        let has_ffn = |ffn: Ffn| {
+            kinds.iter().any(|k| k.ffn == ffn) || mtp.is_some_and(|layers| layers.ffn == ffn)
+        };
 
         let kda = has(Mixer::Kda)
             .then(|| -> Result<KdaParams, ModelError> {
@@ -263,19 +287,12 @@ impl Glm53Config {
             })
             .transpose()?;
 
-        let mtp_layers = fields
-            .opt_u64(Field::hf("num_nextn_predict_layers"))?
-            .map_or(Ok(0), |n| {
-                usize::try_from(n)
-                    .map_err(|_| fields.error("num_nextn_predict_layers", ConfigReason::WrongType))
-            })?;
-
         Ok(Self {
             vocab: fields.vocab()?,
             width,
             max_positions,
             layers: kinds,
-            mtp_layers,
+            mtp,
             tied_head: fields.flag(Field::hf("tie_word_embeddings"), false)?,
             norm,
             mhc,

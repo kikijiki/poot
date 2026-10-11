@@ -57,8 +57,9 @@ pub(crate) fn unpack_i8(
 /// index `i` along the last axis with `rank[..,i] == r`, for `r` in `0..k`; per leading index this equals
 /// `scatter(iota, rank)` sliced to `[0..k]`, without materializing the full `[..,E]` scatter. Each row's
 /// `rank` must be a permutation of `0..E`; [`poot_graph_ir::ops::stable_descending_rank`] guarantees that
-/// for tied and canonicalized non-finite scores. Ids are emitted as F32. `ArgTopK` only inverts rank and
-/// owns no score-order semantic.
+/// for tied and canonicalized non-finite scores. Ids are emitted as I32. `ArgTopK` only inverts rank and
+/// owns no score-order semantic. The rank is an F32 value (an integral count computed by arithmetic), the
+/// one place an [`IndexValue::F32`] reaches the index rule.
 pub(crate) fn arg_top_k(
     rank: &HostTensor,
     k: usize,
@@ -72,15 +73,15 @@ pub(crate) fn arg_top_k(
     let rows = view.len() / e.max(1);
     let mut out_shape = rank.shape().to_vec();
     *out_shape.last_mut().unwrap() = k;
-    let mut data = vec![0.0f32; rows * k];
+    let mut data = vec![0i32; rows * k];
     for l in 0..rows {
         let row = &view[l * e..(l + 1) * e];
         for (i, &ri) in row.iter().enumerate() {
             let r = index_at(IndexValue::F32(ri), l * e + i, e, eqn)?;
             if r < k {
-                data[l * k + r] = i as f32;
+                data[l * k + r] = i as i32;
             }
         }
     }
-    Ok(HostTensor::f32(out_shape, data))
+    Ok(HostTensor::i32(out_shape, data))
 }

@@ -37,7 +37,8 @@ Each helper appends primitive eqns; none of them is an opcode. `Builder::finish(
 
 A model family lives in `poot-models` and implements the `Model` trait. Its `trace(phase, shape)` builds the
 graph of one step: a `StepShape` gives the rows, the new tokens per row, the cache capacity, the KV layout
-(contiguous or paged) and whether logits come back for the last token or every token. A dense decoder is a
+(contiguous or paged), whether logits come back for the last token or every token and, when asked, a
+hidden-state carry. A dense decoder is a
 short call of the shared residual pair in `poot_models::components::standard`:
 
 ```rust

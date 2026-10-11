@@ -13,8 +13,8 @@ use poot_graph_ir::ops::{
     AttentionKeys, attention_live, attention_masked_softcap, causal_mask_from_pos,
 };
 use poot_graph_ir::{
-    Builder, Graph, Slot, TensorType, Traced, ValidationId, ValidationOutput, ValidationOutputs,
-    ValueId,
+    Builder, Graph, IndexRange, Slot, TensorType, Traced, ValidationId, ValidationOutput,
+    ValidationOutputs, ValueId,
 };
 use poot_tensor::{DType, HostTensor};
 
@@ -80,7 +80,14 @@ impl LiveAttentionFixture {
         let b = Builder::new();
         let q = b.constant("q", TensorType::f32(vec![batch, hq, 1, dk]));
         let v = b.constant("v", TensorType::f32(vec![batch, hkv, cap, dv]));
-        let pos = b.slot(Slot::Pos, TensorType::new(vec![batch, 1], DType::I32));
+        // Every position an `f32` holds exactly binds, so the in-graph length guard (not the binder)
+        // is what rejects a length outside `1..=cap`; the mask's `I32 -> F32` cast of `pos` is proven
+        // exact from this range.
+        let pos = b.slot_ranged(
+            Slot::Pos,
+            TensorType::new(vec![batch, 1], DType::I32),
+            IndexRange::F32_EXACT,
+        );
         let head_dim = dk - shared_dim.unwrap_or(0);
         let k = b.constant("k", TensorType::f32(vec![batch, hkv, cap, head_dim]));
         let shared = shared_dim

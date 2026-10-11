@@ -7,7 +7,7 @@
 //! y + gather(lora.scale, idx) * IndexedMatMul(IndexedMatMul(x, lora.a, idx), lora.b, idx)
 //! ```
 //!
-//! where `idx` is the one [`Slot::LoraIdx`] input `[rows]` (f32, `IndexedMatMul`'s index convention),
+//! where `idx` is the one [`Slot::LoraIdx`] input `[rows]` (I32, the index dtype),
 //! expanded to one entry per token. The adapters of one set are stacked on a leading axis beside the
 //! base weights, in the `x @ W` orientation (`A [adapters + 1, in, r]`, `B [adapters + 1, r, out]`,
 //! `scale [adapters + 1]`), zero-padded to a common rank `r`; entry 0 is the no-adapter row, whose `A`
@@ -155,7 +155,9 @@ pub fn apply_lora<V: ValidationChannel>(
         state: carried,
     } = Builder::resume(plain);
     let b = &builder;
-    let idx = b.slot(Slot::LoraIdx, TensorType::f32(vec![rows])).id();
+    let idx = b
+        .slot(Slot::LoraIdx, TensorType::new(vec![rows], DType::I32))
+        .id();
     let scale = b
         .constant(
             &WeightId::model(WeightRole::Lora(LoraRole::Scale)).const_name(),
@@ -609,7 +611,7 @@ mod tests {
         g: &Graph,
         overrides: &HashMap<String, Vec<f32>>,
         tokens: &[i32],
-        lora: &[f32],
+        lora: &[i32],
     ) -> Vec<f32> {
         let mut inputs: HashMap<ValueId, Value> = HashMap::new();
         for &id in &g.inputs {
@@ -618,7 +620,7 @@ mod tests {
             let tensor = match meta.storage {
                 Storage::Slot(Slot::Token) => HostTensor::i32(aval.shape, tokens.to_vec()),
                 Storage::Slot(Slot::Pos) => HostTensor::i32(aval.shape, vec![3; tokens.len()]),
-                Storage::Slot(Slot::LoraIdx) => HostTensor::f32(aval.shape, lora.to_vec()),
+                Storage::Slot(Slot::LoraIdx) => HostTensor::i32(aval.shape, lora.to_vec()),
                 Storage::Slot(other) => panic!("unexpected slot {other:?}"),
                 Storage::Computed(c) => c.tensor(),
                 Storage::State => HostTensor::f32(aval.shape.clone(), vec![0.0; aval.numel()]),
@@ -681,7 +683,7 @@ mod tests {
         let program = compiled(&g, Some(plan()));
         let base = compiled(&g, None);
         let consts = stacked(&[&first, &second]);
-        let idx = [1.0, 2.0, 0.0, 2.0];
+        let idx = [1, 2, 0, 2];
         let adapted = run(&program, &consts, &TOKENS, &idx);
 
         let reference = |adapter: &Adapter| run(&base, &merged(adapter), &TOKENS, &[]);

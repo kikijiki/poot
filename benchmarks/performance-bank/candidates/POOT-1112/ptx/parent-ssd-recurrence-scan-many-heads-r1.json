@@ -1,0 +1,119 @@
+{
+  "backend": "ptx",
+  "binary": "/root/bank-parent",
+  "case": "ssd-recurrence-scan-many-heads",
+  "cells": {
+    "kernel": {
+      "repeats": [
+        {
+          "metrics": {
+            "step_us": 4856.137
+          },
+          "slot": 0,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 4856.807000000001
+          },
+          "slot": 1,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 4843.586
+          },
+          "slot": 2,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 4863.437
+          },
+          "slot": 3,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 4851.9169999999995
+          },
+          "slot": 4,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 4922.068
+          },
+          "slot": 5,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 4998.678
+          },
+          "slot": 6,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 4918.737999999999
+          },
+          "slot": 7,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 4875.036999999999
+          },
+          "slot": 8,
+          "status": "ok"
+        }
+      ]
+    }
+  },
+  "hardware": {
+    "backend": "ptx",
+    "device": "NVIDIA RTX A4000",
+    "driver": "580.119.02"
+  },
+  "memory": [
+    {
+      "live_bytes": 46269440,
+      "peak_bytes": 46269440,
+      "role": "Weight"
+    },
+    {
+      "live_bytes": 12582912,
+      "peak_bytes": 12582912,
+      "role": "Activation"
+    }
+  ],
+  "observed": {
+    "layout": "bhsd",
+    "shape": {
+      "family": "ssd",
+      "heads": 128,
+      "n": 128,
+      "p": 64,
+      "steps": 256
+    },
+    "storage": "f32",
+    "weight_bytes_per_copy": 46269440,
+    "weight_copies": 1
+  },
+  "plan": [
+    "scan [59e6a6eb5be63779de829522f4b2fc6b2876a73935799c7575978a9643244ba6]"
+  ],
+  "plan_id": "bd6b0df258998350bb0724d78e38fbcee6b1da3a13f3feef66c4da53fdecfd17",
+  "recordings": 1,
+  "reference": {
+    "agrees": true,
+    "max_relative_error": 4.978966387356044e-7,
+    "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
+    "provenance": "independent-golden",
+    "tolerance": 0.002
+  },
+  "replays": 13,
+  "role": "baseline",
+  "schema": 1
+}

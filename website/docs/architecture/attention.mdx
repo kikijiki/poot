@@ -130,14 +130,18 @@ hide the unused ones. The live form takes an `I32 len [B]` operand and visits on
 and the recorded launch do not depend on `len`, so capture and replay stay valid. The length is built
 in the graph from the position (`len = pos + 1`).
 
-`ops::attention_live` is the one definition. It requires `1 <= len[b] <= Lk` and checks the range
-with the canonical index-bounds guard: an out-of-range length fails through the validation channel
-and publishes nothing. It then selects the inactive key and value rows to zero before either matmul
-(a true select, so a NaN in an unused row cannot reach the output; multiplying by zero would keep
-it) and selects the inactive scores to `-inf` before the softmax. The rewrite emits the live bound
-only for a graph that already has that shape and declares the length witness as a validation output.
+`ops::attention_live` is the one definition. It requires `1 <= len[b] <= Lk` and bounds the length in
+the graph with an index guard whose witness is a validation output: an out-of-range length fails
+through the validation channel and publishes nothing. It then selects the inactive key and value rows
+to zero before either matmul (a true select, so a NaN in an unused row cannot reach the output;
+multiplying by zero would keep it) and selects the inactive scores to `-inf` before the softmax. The
+rewrite emits the live bound when the graph proves `1 <= len <= Lk` from value ranges, and it holds
+the clamp to the same contract: a length whose range comes from an index guard's clamp fuses only
+when that guard's witness is a declared validation output, so a bad length never turns silently into
+a valid-looking answer; a range that comes from a declared position slot, which every binder checks,
+needs no witness.
 A graph with only a score mask (the in-graph causal mask of the dense families), a guard on some
-operands, or a length no validation bounds keeps its capacity form or its primitive decomposition,
+operands, or a length it cannot prove keeps its capacity form or its primitive decomposition,
 and its results do not change. The live bound types at every float dtype, but the generated kernel is F32 only: a
 BF16 or F16 chain (live or not) stays the primitive decomposition, with the same selects at its own dtype, and runs on
 ROCm and PTX (a SPIR-V target refuses the two-byte select with a typed `DtypeLowering`). That primitive form runs on every device: the key positions it

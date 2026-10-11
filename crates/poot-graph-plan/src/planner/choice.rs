@@ -27,8 +27,16 @@ pub enum NoDispatch {
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum KernelChoice {
-    /// A body `poot-kernelgen` generated from this request.
+    /// A body `poot-kernelgen` generated from this request, launched as a thread grid.
     Generated(KernelRequest),
+    /// The same request under the target's sequential one-core schedule (an AIE core): one invocation of a
+    /// one-thread workgroup. `bindings` are what the generator proved of the body it produced (one per
+    /// parameter, in binding order); the shape ABI the body is linked against is derived from them, so
+    /// the body and its ABI come from one generation.
+    Sequential {
+        request: KernelRequest,
+        bindings: Box<[poot_kernelgen::SequentialBinding]>,
+    },
     /// A shipped template body, bound with a metadata buffer of `meta_schema` words (zero for none). The
     /// count is read from the metadata the plan carries, never typed in a second place. `index` is the
     /// element type of the runtime index operand the equation binds, for a template that reads one: the
@@ -50,6 +58,7 @@ impl KernelChoice {
     pub fn label(&self) -> String {
         match self {
             Self::Generated(request) => format!("generated:{}", request.family()),
+            Self::Sequential { request, .. } => format!("sequential:{}", request.family()),
             Self::Imported { kernel, .. } => format!("imported:{kernel:?}").to_lowercase(),
             Self::NoDispatch(kind) => format!("nodispatch:{kind:?}").to_lowercase(),
         }
@@ -59,7 +68,7 @@ impl KernelChoice {
     /// ([`KernelRequest::display_label`]), a shipped template its kernel. Carried by the plan beside its key.
     fn display_label(&self) -> String {
         match self {
-            Self::Generated(request) => request.display_label(),
+            Self::Generated(request) | Self::Sequential { request, .. } => request.display_label(),
             other => other.label(),
         }
     }
@@ -98,10 +107,22 @@ pub struct Planned {
     pub choice: KernelChoice,
 }
 
-/// One dispatch of a split plan, with the choice that built it.
+/// One dispatch of a split plan. The choice that built it travels inside the [`Dispatch`].
 pub(crate) struct PlannedDispatch {
     dispatch: Dispatch,
-    choice: KernelChoice,
+}
+
+/// The binding of a dispatch over an equation's value operands: the kernel's params are `[operands..,
+/// meta?, out]`, so the operand count is what is left after the metadata buffer and the output.
+fn eqn_binding(body: &Body, launch: &Launch) -> Binding {
+    let meta = usize::from(!launch.meta.is_empty());
+    Binding::eqn(body.params().count().saturating_sub(meta + 1))
+}
+
+/// A one-dispatch plan with no scratch. Its binding is the equation's own, so only a kernel whose
+/// params break the calling convention fails here.
+fn single_plan(dispatch: Dispatch) -> Result<Plan, PlanError> {
+    Ok(Plan::Dispatches(DispatchPlan::new(vec![dispatch], 0)?))
 }
 
 /// A generation request, run for `backend`: the body, its launch and the choice that names them.
@@ -119,9 +140,31 @@ fn build(
     backend: Backend,
     caps: &DeviceCaps,
 ) -> Result<Built, PlanError> {
-    let generated = generate(&request, caps, site.limits())
-        .map_err(|error| site.refuse(Capability::KernelGen(error)))?;
-    let choice = KernelChoice::Generated(request);
+    // The same request every target plans; only its schedule is the target's. An AIE core runs one
+    // sequential loop (one invocation of a one-thread workgroup), the GPU targets a thread grid.
+    let (generated, choice) = match backend {
+        Backend::Aie(_) => {
+            let sequential = poot_kernelgen::sequential_schedule(&request, site.limits())
+                .map_err(|error| site.refuse(Capability::KernelGen(error)))?;
+            let generated = poot_kernelgen::Generated {
+                body: sequential.body,
+                launch: poot_kernelgen::Launch {
+                    grid: [1, 1, 1],
+                    meta: None,
+                },
+            };
+            let choice = KernelChoice::Sequential {
+                request,
+                bindings: sequential.bindings,
+            };
+            (generated, choice)
+        }
+        Backend::SpirvVulkan | Backend::Nvptx | Backend::AmdGcn(_) => {
+            let generated = generate(&request, caps, site.limits())
+                .map_err(|error| site.refuse(Capability::KernelGen(error)))?;
+            (generated, KernelChoice::Generated(request))
+        }
+    };
     let key = choice.digest(backend).to_string();
     let label = choice.display_label();
     Ok(Built {
@@ -141,10 +184,10 @@ impl Planned {
         backend: Backend,
         caps: &DeviceCaps,
     ) -> Result<Self, PlanError> {
-        let PlannedDispatch { dispatch, choice } =
-            Self::generated_dispatch(site, request, backend, caps)?;
+        let PlannedDispatch { dispatch } = Self::generated_dispatch(site, request, backend, caps)?;
+        let choice = dispatch.choice().clone();
         Ok(Self {
-            plan: Plan::Dispatches(vec![dispatch]),
+            plan: single_plan(dispatch)?,
             choice,
         })
     }
@@ -163,27 +206,24 @@ impl Planned {
             key,
             label,
         } = build(site, request, backend, caps)?;
+        let launch = Launch {
+            grid: launch.grid,
+            meta: launch.meta.unwrap_or_default(),
+        };
+        let binding = eqn_binding(&body, &launch);
         Ok(PlannedDispatch {
-            dispatch: Dispatch {
-                body,
-                key,
-                label,
-                launch: Launch {
-                    grid: launch.grid,
-                    meta: launch.meta.unwrap_or_default(),
-                },
-            },
-            choice,
+            dispatch: Dispatch::new(body, key, label, launch, binding, choice),
         })
     }
 
-    /// Plan a shipped template. `meta` is its metadata buffer (`None` for a kernel that takes none).
+    /// Plan a shipped template. `meta` is its metadata buffer (`None` for a kernel that takes none). A
+    /// template whose params break the dispatch calling convention is a typed error, not a panic.
     pub(crate) fn imported(
         kernel: ImportedKernel,
         backend: Backend,
         meta: Option<Vec<u32>>,
         grid: [u32; 3],
-    ) -> Self {
+    ) -> Result<Self, PlanError> {
         Self::imported_indexed(kernel, backend, meta, grid, None)
     }
 
@@ -194,13 +234,14 @@ impl Planned {
         meta: Option<Vec<u32>>,
         grid: [u32; 3],
         index: Option<DType>,
-    ) -> Self {
-        let PlannedDispatch { dispatch, choice } =
+    ) -> Result<Self, PlanError> {
+        let PlannedDispatch { dispatch } =
             Self::imported_dispatch(kernel, backend, meta, grid, index);
-        Self {
-            plan: Plan::Dispatches(vec![dispatch]),
+        let choice = dispatch.choice().clone();
+        Ok(Self {
+            plan: single_plan(dispatch)?,
             choice,
-        }
+        })
     }
 
     /// One dispatch of a split plan that runs a shipped template; `meta` is its metadata, and the grid is
@@ -226,22 +267,19 @@ impl Planned {
         let choice = imported_choice(kernel, meta.as_deref(), index);
         let key = choice.digest(backend).to_string();
         let label = choice.display_label();
+        let body = kernel.body().clone();
+        let launch = Launch {
+            grid,
+            meta: meta.unwrap_or_default(),
+        };
+        let binding = eqn_binding(&body, &launch);
         PlannedDispatch {
-            dispatch: Dispatch {
-                body: kernel.body().clone(),
-                key,
-                label,
-                launch: Launch {
-                    grid,
-                    meta: meta.unwrap_or_default(),
-                },
-            },
-            choice,
+            dispatch: Dispatch::new(body, key, label, launch, binding, choice),
         }
     }
 
-    /// Several dispatches over disjoint ranges of one output. The equation's choice is its first
-    /// dispatch's: the dispatches are one kernel family and differ only in the range they cover. An empty
+    /// Several dispatches over disjoint ranges of one output, each bound to the equation's operands. Each
+    /// dispatch keeps its own choice; the equation's recorded choice is its first dispatch's. An empty
     /// split (a zero-element output) has no choice to record and is refused.
     pub(crate) fn split(dispatches: Vec<PlannedDispatch>) -> Result<Self, PlanError> {
         let Some(first) = dispatches.first() else {
@@ -249,14 +287,13 @@ impl Planned {
                 "a split plan needs at least one dispatch (zero-element output)".into(),
             ));
         };
-        let choice = first.choice.clone();
+        let choice = first.dispatch.choice().clone();
+        let dispatches = dispatches
+            .into_iter()
+            .map(|PlannedDispatch { dispatch }| dispatch)
+            .collect();
         Ok(Self {
-            plan: Plan::Dispatches(
-                dispatches
-                    .into_iter()
-                    .map(|PlannedDispatch { dispatch, .. }| dispatch)
-                    .collect(),
-            ),
+            plan: Plan::Dispatches(DispatchPlan::new(dispatches, 0)?),
             choice,
         })
     }
@@ -344,7 +381,7 @@ mod tests {
 
     fn key_of(plan: &Plan) -> &str {
         match plan {
-            Plan::Dispatches(dispatches) if dispatches.len() == 1 => &dispatches[0].key,
+            Plan::Dispatches(dispatches) if dispatches.len() == 1 => dispatches[0].key(),
             other => panic!("expected a single dispatch, got {other:?}"),
         }
     }
@@ -463,8 +500,8 @@ mod tests {
             ContractionSpec, ElementwiseSpec, Fold, FusedInput, FusedKernel, FusedScalarOp,
             FusedStep, LeafTy, MatmulShapes, MovementOp, MovementSpec, PackedContraction,
             PackedKernelOp, PackedKernelSpec, PackedRequest, PointwiseForm, PointwiseSpec,
-            RopeSpec, RowKernel, RowOp, RowSpec, Schedule, Storage, TileSize, TopKSpec, UnaryOp,
-            ViewOperand,
+            RopeSpec, RowKernel, RowOp, RowSpec, ScanKernel, ScanPhase, ScanSpec, Schedule,
+            Storage, TileSize, TopKSpec, UnaryOp, ViewOperand,
         };
         use poot_quant::format::WeightFormat;
 
@@ -599,6 +636,20 @@ mod tests {
             })
         };
         let topk = |k: usize| KernelRequest::TopK(TopKSpec { e: 8, k, numel: 2 });
+        // The same workgroup width and sequence, the rows shared by one or two lanes: the schedule field is
+        // the only difference between two different bodies.
+        let scan = |row_split: usize| {
+            KernelRequest::Scan(ScanSpec {
+                kernel: ScanKernel::DeltaRule,
+                heads: 1,
+                len: 8,
+                rows: 8,
+                width: 8,
+                cols: 16,
+                row_split,
+                phase: ScanPhase { start: 0, count: 8 },
+            })
+        };
 
         let pairs = [
             ("elementwise", unary(8), unary(9)),
@@ -615,6 +666,7 @@ mod tests {
             ("packed", packed(8), packed(16)),
             ("rope", rope(2), rope(4)),
             ("topk", topk(2), topk(3)),
+            ("scan row split", scan(1), scan(2)),
             (
                 "packed tiled tile edge",
                 packed_contraction(tiled(8)),
@@ -663,5 +715,37 @@ mod tests {
             &default_caps_for(backend),
         );
         assert!(matches!(planned, Err(PlanError::BadShape(_))));
+    }
+
+    /// POOT-1115: a shipped template whose read param is mutable breaks the dispatch calling convention.
+    /// Planning it is a typed [`PlanError::InvalidDispatchPlan`], not a panic: `imported` returns the
+    /// error of the same `single_plan` its callers reach with `?`.
+    ///
+    /// Mutation: have `single_plan` `expect` the validation result; the row panics instead of returning.
+    #[test]
+    fn a_template_with_a_mutable_read_param_is_a_typed_plan_error() {
+        let PlannedDispatch { mut dispatch } = Planned::imported_dispatch(
+            ImportedKernel::PackI8,
+            Backend::SpirvVulkan,
+            Some(vec![4]),
+            [8, 1, 1],
+            None,
+        );
+        let honest = dispatch.clone();
+        single_plan(honest).expect("the shipped template follows the calling convention");
+        let param = dispatch.body.params().next().expect("a read param");
+        let slot = &mut dispatch.body.locals[param.index as usize].ty;
+        let poot_kernel_ir::Ty::Ref { mutable, .. } = slot else {
+            panic!("the template's read param is a reference: {slot:?}");
+        };
+        *mutable = true;
+        match single_plan(dispatch) {
+            Err(PlanError::InvalidDispatchPlan(DispatchPlanError::MutabilityMismatch {
+                dispatch: 0,
+                param: 0,
+                kernel_mutable: true,
+            })) => {}
+            other => panic!("expected a MutabilityMismatch on param 0, got {other:?}"),
+        }
     }
 }

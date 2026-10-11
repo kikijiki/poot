@@ -15,7 +15,7 @@ use crate::{Fixture, const_fixture};
 pub struct ArgTopKCase {
     pub fixture: Fixture,
     /// The `[rows, k]` ids `fixture` must produce, row-major.
-    pub expected: Vec<f32>,
+    pub expected: Vec<i32>,
 }
 
 /// `ArgTopK` runs one thread per output element, so `rows * k` lanes. The cases:
@@ -51,7 +51,7 @@ fn arg_top_k_case(name: &'static str, rows: usize, e: usize, k: usize) -> ArgTop
             (0..k).map(move |r| {
                 (0..e)
                     .find(|&i| rank_of(row, i) == r)
-                    .expect("a permutation ranks every expert") as f32
+                    .expect("a permutation ranks every expert") as i32
             })
         })
         .collect();
@@ -126,7 +126,7 @@ fn tie_case(name: &'static str, rows: &[[f32; 5]], k: usize) -> TieCase {
     let b = Builder::new();
     let scores_in = b.constant("scores", TensorType::f32(vec![l, e]));
     let rank = ops::stable_descending_rank(&b, scores_in);
-    let ids = b.arg_top_k(rank, k);
+    let ids = b.cast(b.arg_top_k(rank, k), poot_tensor::DType::F32);
     let mask = ops::top_k_keep_mask(&b, rank, k);
     let gate = ops::top_k_gate(&b, scores_in, k);
     let out = b.concat(1, &[ids, mask, gate]);

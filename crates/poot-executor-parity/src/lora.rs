@@ -245,9 +245,9 @@ fn run_projection(
         .unwrap_or_else(|e| panic!("{lora_target:?}: add_entry: {e}"));
 
     let activation = HostTensor::f32(vec![BATCH, tokens, in_dim], x);
-    let lora_idx = HostTensor::f32(
+    let lora_idx = HostTensor::i32(
         vec![BATCH],
-        rows_adapter.iter().map(|&i| i as f32).collect(),
+        rows_adapter.iter().map(|&i| i as i32).collect(),
     );
     let x_key = poot_graph_ir::SlotKey::new(Slot::Activation, Some("x"));
     let idx_key = poot_graph_ir::SlotKey::new(Slot::LoraIdx, None);

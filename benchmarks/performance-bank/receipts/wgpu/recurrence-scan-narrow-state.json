@@ -1,0 +1,170 @@
+{
+  "backend": "wgpu",
+  "case": "recurrence-scan-narrow-state",
+  "cells": {
+    "kernel": {
+      "repeats": [
+        {
+          "metrics": {
+            "step_us": 625.5110000000001
+          },
+          "slot": 0,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 613.67
+          },
+          "slot": 1,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 631.203
+          },
+          "slot": 2,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 628.558
+          },
+          "slot": 3,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 617.467
+          },
+          "slot": 4,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 626.794
+          },
+          "slot": 5,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 629.96
+          },
+          "slot": 6,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 633.356
+          },
+          "slot": 7,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 609.241
+          },
+          "slot": 8,
+          "status": "ok"
+        }
+      ]
+    }
+  },
+  "memory": [
+    {
+      "live_bytes": 1654784,
+      "peak_bytes": 1654784,
+      "role": "Weight"
+    },
+    {
+      "live_bytes": 589824,
+      "peak_bytes": 589824,
+      "role": "Activation"
+    },
+    {
+      "live_bytes": 32,
+      "peak_bytes": 589856,
+      "role": "Staging"
+    }
+  ],
+  "observed": {
+    "layout": "bhsd",
+    "shape": {
+      "d": 64,
+      "heads": 4,
+      "steps": 512
+    },
+    "storage": "f32",
+    "weight_bytes_per_copy": 1654784,
+    "weight_copies": 1
+  },
+  "plan": [
+    "scan [c3c88b7a809e3019e6fa18d6889aa0f395e62641872ac65b5e443a39201f0231]"
+  ],
+  "plan_id": "bea31aca5b97ab35100fce4bb4e285f1ff777f090f38b6765de744a568cff4a0",
+  "recordings": 1,
+  "reference": {
+    "agrees": true,
+    "max_relative_error": 6.869838255067018e-08,
+    "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
+    "provenance": "independent-golden",
+    "tolerance": 0.002
+  },
+  "replays": 13,
+  "role": "baseline",
+  "schema": 1,
+  "command": [
+    "cargo",
+    "run",
+    "--release",
+    "-p",
+    "poot-gpu",
+    "--example",
+    "performance_bank",
+    "--",
+    "--bank",
+    "benchmarks/performance-bank/cases.json",
+    "--case",
+    "recurrence-scan-narrow-state",
+    "--out",
+    "benchmarks/performance-bank/receipts/wgpu/recurrence-scan-narrow-state.json"
+  ],
+  "parent_revision": "6bef68f754b33c3259b4ed7aad536c0e2f623eee",
+  "binary_sha256": "826eee80bd5dfb745ba4af348a17d251c23640d98e0f98348a696d4902942d27",
+  "identity": {
+    "checkpoint_digest": "synthetic-no-checkpoint",
+    "token_fixture": "splitmix64-seed0-unit:237900849bc67b83",
+    "precision": "f32",
+    "layout": "bhsd",
+    "dimensions": {
+      "heads": 4,
+      "d": 64,
+      "steps": 512
+    },
+    "prompt_tokens": 1,
+    "live_context": "n/a",
+    "max_context": "n/a",
+    "requested_output": "n/a",
+    "actual_output": "n/a",
+    "sampler": "n/a",
+    "template": "n/a",
+    "cache_state": {
+      "condition": "weights-resident-hot",
+      "id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb"
+    },
+    "prepared_set": [
+      "recurrence-scan-narrow-state"
+    ],
+    "timing_policy": {
+      "warmup": 3,
+      "repeats": 9,
+      "clock": "wall step plus readback",
+      "profiled": false
+    },
+    "backend": "wgpu",
+    "device": "AMD Radeon 8060S Graphics",
+    "driver": "host kernel 7.2.9"
+  },
+  "identity_digest": "6119332034e17d8c4c2311a3d60d95d9db31fd51ef4f0ef12badb6365a79d701",
+  "schedule_id": "0025f9f93a3783297d48f02335370f21db17d7e285fc7929024e391dd5d514cb"
+}

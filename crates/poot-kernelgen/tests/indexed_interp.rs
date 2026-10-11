@@ -11,29 +11,29 @@ const EXPERTS: usize = 4;
 const K: usize = 10;
 const N: usize = 9;
 
-/// Ids covering every refusal (`4`, `-1`, `NaN`, `1.5`, a huge id, `inf`) around valid and repeated ones.
-fn ids(rows: usize) -> Vec<f32> {
+/// Ids covering every refusal (`4`, `-1`, a huge id, `i32::MIN`, `i32::MAX`) around valid and repeated ones.
+fn ids(rows: usize) -> Vec<i32> {
     let cycle = [
-        2.0,
-        0.0,
-        4.0,
-        3.0,
-        -1.0,
-        2.0,
-        f32::NAN,
-        1.0,
-        1.5,
-        1e9,
-        0.0,
-        f32::INFINITY,
-        3.0,
-        1.0,
+        2,
+        0,
+        4,
+        3,
+        -1,
+        2,
+        i32::MIN,
+        1,
+        i32::MAX,
+        1_000_000_000,
+        0,
+        -7,
+        3,
+        1,
     ];
     (0..rows).map(|r| cycle[r % cycle.len()]).collect()
 }
 
-fn valid(id: f32) -> bool {
-    (0.0..EXPERTS as f32).contains(&id) && id.fract() == 0.0
+fn valid(id: i32) -> bool {
+    (0..EXPERTS as i32).contains(&id)
 }
 
 fn fill(seed: usize, count: usize) -> Vec<f32> {
@@ -122,7 +122,7 @@ fn run_indexed(
     let mut buffers = [
         Buffer::from_f32s(&fill(1, m * K)),
         weight_buffer(weight, layout),
-        Buffer::from_f32s(&ids(m)),
+        Buffer::from_i32s(&ids(m)),
         Buffer::from_u32s(generated.launch.meta.as_ref().unwrap()),
         Buffer::from_f32s(&vec![f32::MIN; m * N]),
     ];

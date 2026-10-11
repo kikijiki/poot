@@ -72,8 +72,8 @@ impl KernelBuffer {
         Self::new(bytemuck::cast_slice(data).to_vec(), ElementKind::F32, false)
     }
     /// A read-only buffer of exact i32 bytes, for a kernel param the body declares as `Slice<i32>` (e.g.
-    /// a `PackedDequant`/`PackedContraction` carrier, whose words exceed 2^24 and cannot survive the f32
-    /// `Tensor` mirror). The wgpu storage buffer is just bytes; the SPIR-V declares the i32 interpretation.
+    /// a `PackedDequant`/`PackedContraction` carrier or an index buffer). The wgpu storage buffer is just
+    /// bytes; the SPIR-V declares the i32 interpretation.
     pub fn read_only_i32(data: &[i32]) -> Self {
         Self::new(bytemuck::cast_slice(data).to_vec(), ElementKind::I32, false)
     }
@@ -256,7 +256,7 @@ impl DeviceBuffer {
 /// check on element kind, logical dtype and layout together, not element kind alone (which a packed or
 /// widened value can share with a buffer of a different logical meaning; see
 /// [`poot_target::BufferStorage`]). A caller that legitimately changes what a reused buffer holds (e.g.
-/// a slot cache hit whose lane flips between the raw-i32 and f32-mirror upload) retags it first via
+/// a slot cache hit whose lane flips between two uploads of one buffer) retags it first via
 /// [`DeviceBuffer::with_storage`], so the check here only ever catches a genuine mismatch.
 pub(crate) fn checked_storage(
     op: &'static str,

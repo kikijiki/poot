@@ -184,7 +184,7 @@ fn broadcast_kv_attention_stays_decomposed_and_matches_the_oracle() {
 /// SC-003 (R467-002, 467 probe p04): a rotate-half chain whose per-head cos/sin broadcast a shared x up
 /// (`x[1,1,S,D]`, `cos[1,H,S,D]`) optimizes to a graph that validates, equals the raw oracle, and plans on
 /// every backend. Before the fix `rope_fusion` emitted a `Rope` typed as x (`[1,1,S,D]`) against the
-/// declared `[1,H,S,D]`: `Graph::validate` refuses it, while the planner alone (`plan_eqn_analyzed`,
+/// declared `[1,H,S,D]`: `Graph::validate` refuses it, while the planner alone (`plan_eqn`,
 /// then named `plan_eqn`) accepts it and plans a rope body over x's shape launched over the larger
 /// output.
 #[test]

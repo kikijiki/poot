@@ -15,12 +15,12 @@
 //! A [`WeightLayout::Nk`] weight is the same stack with each expert stored `[N, K]` (the checkpoint order): the
 //! slab stride is still `K * N` and only the in-slab index swaps, so no transpose of the experts ever runs.
 //!
-//! An expert id outside `0..E`, or not an integer (NaN included), is not read: its output row is NaN on every
+//! An expert id outside `0..E` is not read: its output row is NaN on every
 //! schedule (R-632-4), and the slab it would have addressed is clamped in range so no read leaves the buffer.
 
 use poot_kernel_ir::{
-    BasicBlock, BinOp, BlockId, Body, Constant, IndexAxis, Local, LocalDecl, MathOp, Operand,
-    Place, Rvalue, Statement, Terminator, Ty, WorkgroupLocalDecl,
+    BasicBlock, BinOp, BlockId, Body, Constant, IndexAxis, Local, LocalDecl, Operand, Place,
+    Rvalue, Statement, Terminator, Ty, WorkgroupLocalDecl,
 };
 
 use poot_target::BufferStorage;
@@ -63,15 +63,14 @@ struct RowSlab {
     poison: Local,
 }
 
-/// `ids[row]` as an expert: valid when it is an integer in `0..experts` (ordered comparisons, so NaN fails each),
-/// with the expert taken from the id clamped after the cast, so whatever the cast of a non-finite or negative id
-/// yields, the expert stays inside the table.
+/// `ids[row]` as an expert: valid when it is in `0..experts`, with the expert taken from the id clamped after
+/// the cast, so whatever the cast of a negative id yields, the expert stays inside the table.
 pub(crate) fn emit_row_expert(e: &mut Emit, ids: Local, row: Local, experts: Local) -> RowExpert {
-    let id = e.let_(Ty::F32, Rvalue::Use(Operand::Copy(elem(ids, row))));
-    let experts_f = e.let_(
-        Ty::F32,
+    let id = e.let_(Ty::I32, Rvalue::Use(Operand::Copy(elem(ids, row))));
+    let experts_i = e.let_(
+        Ty::I32,
         Rvalue::Cast {
-            to: Ty::F32,
+            to: Ty::I32,
             operand: copy(experts),
         },
     );
@@ -80,19 +79,16 @@ pub(crate) fn emit_row_expert(e: &mut Emit, ids: Local, row: Local, experts: Loc
         Ty::Bool,
         BinOp::Ge,
         copy(id),
-        Operand::Const(Constant::F32(0.0)),
+        Operand::Const(Constant::I32(0)),
     );
-    let in_range = bin(e, Ty::Bool, BinOp::Lt, copy(id), copy(experts_f));
-    let floor = e.let_(Ty::F32, Rvalue::MathUnary(MathOp::Floor, copy(id)));
-    let integral = bin(e, Ty::Bool, BinOp::Eq, copy(floor), copy(id));
-    let bounded = bin(
+    let in_range = bin(e, Ty::Bool, BinOp::Lt, copy(id), copy(experts_i));
+    let valid = bin(
         e,
         Ty::Bool,
         BinOp::BitAnd,
         copy(non_negative),
         copy(in_range),
     );
-    let valid = bin(e, Ty::Bool, BinOp::BitAnd, copy(bounded), copy(integral));
     let raw = e.let_(
         Ty::Usize,
         Rvalue::Cast {
@@ -171,7 +167,7 @@ fn emit_in_slab(
 /// storage (f32, or BF16 packed two per `u32` word and widened in-register: no f32 copy of an expert stack ever
 /// exists) under `schedule`, with the weight's experts read as `layout` says, params `(x, w, ids, epilogue leaves..,
 /// metadata,
-/// out)`; `ids` is f32 and `metadata` is `[K, N, E, M, x_groups]` ([`META_K`]..). `epilogue` (f32) runs over each
+/// out)`; `ids` is `I32` and `metadata` is `[K, N, E, M, x_groups]` ([`META_K`]..). `epilogue` (f32) runs over each
 /// output element's sum before its store.
 pub(crate) fn indexed_contraction(
     name: &str,
@@ -226,7 +222,7 @@ fn indexed_gemv(
         ld(Ty::Unit, false),
         ld(slice_f32(false), false),
         lane.param(),
-        ld(slice_f32(false), false),
+        ld(slice_dtype(Ty::I32, false), false),
     ];
     if let Some(epilogue) = epilogue {
         params.extend(lanes.iter().map(|&lane| epilogue.leaf_param(lane)));
@@ -319,7 +315,7 @@ fn indexed_tiled(
         ld(Ty::Unit, false),
         ld(slice_f32(false), false),
         lane.param(),
-        ld(slice_f32(false), false),
+        ld(slice_dtype(Ty::I32, false), false),
     ];
     if let Some(epilogue) = epilogue {
         params.extend(lanes.iter().map(|&lane| epilogue.leaf_param(lane)));

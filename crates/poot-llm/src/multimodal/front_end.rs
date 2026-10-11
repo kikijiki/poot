@@ -901,6 +901,7 @@ mod smolvlm {
             },
             charge: crate::driver::program_retention,
             draft: DraftPolicy::Off,
+            hidden_window: None,
         }
     }
 

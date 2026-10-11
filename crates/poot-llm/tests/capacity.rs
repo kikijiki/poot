@@ -102,7 +102,17 @@ impl Model for Tiny {
             n - 1
         };
         let out = n - first;
-        let token = b.cast(b.slice(step.tokens(), 1, first, n), DType::F32);
+        let token = b.cast(
+            b.slice(
+                b.guard_index_bounds(step.tokens(), VOCAB)
+                    .expect("the step's ids are a rank-2 I32 tensor")
+                    .guarded,
+                1,
+                first,
+                n,
+            ),
+            DType::F32,
+        );
         let pos = b.cast(b.slice(step.pos(), 1, first, n), DType::F32);
         let seed = b.binary(BinOp::Add, token, pos);
         let (dims, role) = match (self.variant, shape.kv) {
@@ -123,7 +133,17 @@ impl Model for Tiny {
         // The state folds the last position's value; one row, so the folded scalar reshapes to ones.
         let last = b.binary(
             BinOp::Add,
-            b.cast(b.slice(step.tokens(), 1, n - 1, n), DType::F32),
+            b.cast(
+                b.slice(
+                    b.guard_index_bounds(step.tokens(), VOCAB)
+                        .expect("the step's ids are a rank-2 I32 tensor")
+                        .guarded,
+                    1,
+                    n - 1,
+                    n,
+                ),
+                DType::F32,
+            ),
             b.cast(b.slice(step.pos(), 1, n - 1, n), DType::F32),
         );
         let spread = b.broadcast(b.reshape(last, vec![1; dims.len()]), dims);
@@ -316,6 +336,7 @@ fn options(capacity: usize) -> DriverOptions {
         },
         charge: poot_llm::driver::program_retention,
         draft: poot_llm::driver::DraftPolicy::Off,
+        hidden_window: None,
     }
 }
 

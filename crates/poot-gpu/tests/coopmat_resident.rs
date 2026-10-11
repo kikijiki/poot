@@ -168,7 +168,7 @@ fn coopmat_matmul_resident_graph_selects_coopmat_arm() {
     .expect("the coopmat-eligible graph must plan on SpirvVulkan");
     assert!(
         plan.single()
-            .is_some_and(|dispatch| dispatch.launch.meta.is_empty()),
+            .is_some_and(|dispatch| dispatch.launch().meta.is_empty()),
         "expected one dispatch without metadata, got {plan:?}"
     );
     assert!(
@@ -192,8 +192,7 @@ fn plan_eqn_with_choice(
     backend: poot_target::Backend,
     caps: &poot_target::DeviceCaps,
 ) -> Result<(poot_graph_plan::Plan, poot_graph_plan::KernelChoice), poot_graph_plan::PlanError> {
-    poot_graph_plan::plan_eqn_choice_analyzed(
-        &poot_graph_plan::ExactI32StorageAnalysis::new(g),
+    poot_graph_plan::plan_eqn_choice(
         g,
         eqn,
         backend,

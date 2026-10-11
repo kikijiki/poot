@@ -639,6 +639,7 @@ mod tests {
             capacity: NonZeroUsize::new(patches).unwrap(),
             kv: KvLayout::Contiguous,
             logits: LogitRows::All,
+            hidden: None,
         }
     }
 

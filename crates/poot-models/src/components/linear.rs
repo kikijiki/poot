@@ -13,7 +13,7 @@ use poot_graph_ir::{BinOp, Builder, TensorType, Traced};
 use poot_quant::weights::{HandleFormat, WeightHandle, WeightId, WeightMap, WeightMapError};
 use poot_tensor::DType;
 
-use crate::model::{FamilyKey, ModelError};
+use crate::model::{ConfigReason, FamilyKey, ModelError};
 
 /// One weight a component reads: its typed id and handle, checked against the shape the component
 /// needs when it is made, so tracing with it cannot fail.
@@ -36,6 +36,14 @@ pub enum WeightError {
     },
     #[error("weight {id} is stored as {format:?}, which is not a float weight")]
     Format { id: WeightId, format: HandleFormat },
+    /// The config field `field` (`bound` of it) cannot bound the I32 words of the index table `id`:
+    /// zero leaves no word to hold, and a bound past `2^31` is not a range of I32 words.
+    #[error("weight {id}: config field {field} = {bound} cannot bound its I32 index words")]
+    IndexBound {
+        id: WeightId,
+        field: &'static str,
+        bound: usize,
+    },
 }
 
 impl WeightError {
@@ -57,6 +65,18 @@ impl WeightError {
                 found,
             },
             WeightError::Format { id, format } => ModelError::WeightFormat { family, id, format },
+            WeightError::IndexBound { field, bound, .. } => ModelError::Config {
+                family,
+                field,
+                reason: if bound == 0 {
+                    ConfigReason::Zero
+                } else {
+                    // Ids `0..bound` are I32 words: at most `i32::MAX + 1` of them.
+                    ConfigReason::Exceeds {
+                        max: i32::MAX as usize + 1,
+                    }
+                },
+            },
         }
     }
 }

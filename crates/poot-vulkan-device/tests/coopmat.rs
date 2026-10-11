@@ -66,14 +66,12 @@ fn coopmat_matmul_plans_the_coopmat_arm_and_matches_the_cpu_product_on_vulkan() 
     let graph = f16_in_f32_out_matmul_graph(m, k, n);
 
     // The planner selects the coopmat arm for this target.
-    let analysis = poot_graph_plan::ExactI32StorageAnalysis::new(&graph);
     let eqn = graph
         .eqns
         .iter()
         .find(|e| matches!(e.op, OpKind::MatMul))
         .unwrap();
-    let planned = poot_graph_plan::plan_eqn_choice_analyzed(
-        &analysis,
+    let planned = poot_graph_plan::plan_eqn_choice(
         &graph,
         eqn,
         Backend::SpirvVulkan,

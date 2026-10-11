@@ -120,6 +120,7 @@ fn shape(tokens: usize) -> StepShape {
         capacity: nz(CAPACITY),
         kv: KvLayout::Contiguous,
         logits: LogitRows::Last,
+        hidden: None,
     }
 }
 
@@ -528,6 +529,7 @@ fn driver_options(chunk: usize, max_trace_tokens: usize) -> DriverOptions {
         },
         charge: program_retention,
         draft: DraftPolicy::Off,
+        hidden_window: None,
     }
 }
 
@@ -780,6 +782,7 @@ fn oracle_paged_step(
                     seqs: nz(rows),
                 },
                 logits: LogitRows::Last,
+                hidden: None,
             },
         )
         .unwrap();

@@ -39,7 +39,7 @@ fn wmma_tile_dispatches_and_matches_cpu_on_ptx() {
     let out = artifact_path(&dir, "wmma_tile_ptx", Target::Nvptx);
     compile(&body, Target::Nvptx, &out).expect("wmma_tile must compile to PTX");
     let ptx_bytes = std::fs::read(&out).expect("read compiled PTX");
-    let kernel = poot_codegen::kernel_handle(&body, Target::Nvptx, ptx_bytes);
+    let kernel = poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::Nvptx, ptx_bytes);
 
     let a_data: Vec<f32> = (0..256).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
     let b_data: Vec<f32> = (0..256).map(|i| ((i % 11) as f32 - 5.0) * 0.05).collect();
@@ -133,7 +133,7 @@ fn run_attention_over_keys_on_ptx(
     let out_path = artifact_path(&dir, name, Target::Nvptx);
     compile(&body, Target::Nvptx, &out_path).expect("the attention kernel must compile to PTX");
     let ptx_bytes = std::fs::read(&out_path).expect("read compiled PTX");
-    let kernel = poot_codegen::kernel_handle(&body, Target::Nvptx, ptx_bytes);
+    let kernel = poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::Nvptx, ptx_bytes);
 
     let q_buf = ctx.upload_f32(q).expect("upload q");
     let k_buf = ctx.upload_f32(k).expect("upload k");

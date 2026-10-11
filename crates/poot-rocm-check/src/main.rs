@@ -112,7 +112,7 @@ fn run_add() -> Result<(), CheckError> {
         out.display(),
         hsaco_bytes.len()
     );
-    let kernel = kernel_handle(&body, target, hsaco_bytes);
+    let kernel = kernel_handle(&body, poot_codegen::GpuTarget::AmdGcn(arch), hsaco_bytes);
 
     // SC-001 inputs: a = 1..=64, b = 3*1..=64, c = a + b (64 elements, one workgroup).
     //
@@ -282,7 +282,7 @@ fn run_pcie_publication_receipt() -> Result<(), CheckError> {
     let out = artifact_path(&dir, "add-pcie-receipt", target);
     compile(&body, target, &out)?;
     let hsaco_bytes = std::fs::read(&out)?;
-    let compiled_kernel = kernel_handle(&body, target, hsaco_bytes);
+    let compiled_kernel = kernel_handle(&body, poot_codegen::GpuTarget::AmdGcn(arch), hsaco_bytes);
     let module = ctx.load_hsaco(&compiled_kernel)?;
     let add_kernel = ctx.lookup_kernel(&module, compiled_kernel.entry_point())?;
 

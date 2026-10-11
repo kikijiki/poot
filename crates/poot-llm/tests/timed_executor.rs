@@ -78,6 +78,7 @@ fn options() -> DriverOptions {
         },
         charge: program_retention,
         draft: DraftPolicy::Off,
+        hidden_window: None,
     }
 }
 

@@ -269,10 +269,10 @@ fn decode_step<V: ValidationChannel>(graph: &Graph<V>) -> Step {
             }
             Storage::Slot(Slot::LoraIdx) => {
                 // Alternating rows: adapter 1, no adapter, adapter 2, ...
-                let idx = (0..numel).map(|row| ((row + 1) % 3) as f32).collect();
+                let idx = (0..numel).map(|row| ((row + 1) % 3) as i32).collect();
                 slots.insert(
                     meta.slot_key().cloned().unwrap(),
-                    HostTensor::f32(shape, idx),
+                    HostTensor::i32(shape, idx),
                 );
             }
             Storage::State => {

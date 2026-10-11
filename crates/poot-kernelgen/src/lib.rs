@@ -35,8 +35,9 @@ pub use error::{BodyResource, BodyStage, KernelGenError};
 pub use request::{
     BodyUse, CastSpec, ContractionSpec, ElementwiseSpec, Fold, FragmentUse, Generated, I32Binary,
     IndexedContraction, KernelRequest, KernelRequirements, Launch, MatmulShapes, PackedContraction,
-    PackedRequest, PackedRows, PointwiseForm, PointwiseSpec, RopeSpec, RowSpec, SerialWork,
-    TopKSpec, UnaryOp, UnmeasurableLds, ValueBinary, ViewOperand, fold_groups, generate,
+    PackedRequest, PackedRows, PointwiseForm, PointwiseSpec, RopeSpec, RowSpec, SequentialBinding,
+    SequentialGenerated, SerialWork, TopKSpec, UnaryOp, UnmeasurableLds, ValueBinary, ViewOperand,
+    fold_groups, generate, sequential_schedule,
 };
 pub use scan::{ScanKernel, ScanPhase, ScanSpec};
 
@@ -96,7 +97,7 @@ pub(crate) mod test_support {
         let out = poot_codegen::artifact_path(&dir, name, Target::SpirvVulkan);
         compile(body, Target::SpirvVulkan, &out).expect("compile");
         let bytes = std::fs::read(&out).unwrap();
-        poot_codegen::kernel_handle(body, Target::SpirvVulkan, bytes)
+        poot_codegen::kernel_handle(body, poot_codegen::GpuTarget::SpirvVulkan, bytes)
     }
 
     /// The compiled SPIR-V word count of a handle [`spv`] built, for callers that just want to assert a

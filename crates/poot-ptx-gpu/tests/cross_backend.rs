@@ -590,14 +590,15 @@ fn gather_axis0_ptx_matches_cpu() {
     let idx_count = 3usize;
     let b = Builder::new();
     let data = b.constant("data", TensorType::f32(vec![n, d]));
-    let idx = b.constant("idx", TensorType::f32(vec![idx_count]));
+    let idx = b.constant(
+        "idx",
+        TensorType::new(vec![idx_count], poot_tensor::DType::I32),
+    );
     let out = b.gather(data, 0, idx);
     let (di, ii) = (data.id(), idx.id());
     let g = b.finish(out);
-    let inputs = make_inputs(&[
-        (di, vec![n, d], fill(901, n * d)),
-        (ii, vec![idx_count], vec![3.0, 0.0, 6.0]),
-    ]);
+    let mut inputs = make_inputs(&[(di, vec![n, d], fill(901, n * d))]);
+    inputs.insert(ii, HostTensor::i32(vec![idx_count], vec![3, 0, 6]).into());
     let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
         .unwrap()
         .output
@@ -1131,10 +1132,10 @@ fn sample_token_gumbel_topp_only_excludes_untruncated_winner_ptx_matches_cpu() {
 }
 
 /// A `Gather` over an I32 const table whose words need all 32 bits ([`poot_test_util::i32_table_gather`])
-/// returns the table's words exactly on PTX: the table is stored as raw I32, not as its F32 mirror.
+/// returns the table's words exactly on PTX: the table is stored as raw I32.
 ///
-/// Mutation: pin the Gather-over-I32-data component to the mirror lane (drop the `pinned` pass of
-/// `ExactI32StorageAnalysis::new`); the output is the table rounded through F32 and this row goes red.
+/// Mutation: type the I32 table through `Ty::F32` in `movement_storage`; the output is the table rounded
+/// through F32 and this row goes red.
 #[test]
 fn i32_table_gather_is_exact_beyond_f32_ptx() {
     use poot_test_util::i32_table_gather as fixture;

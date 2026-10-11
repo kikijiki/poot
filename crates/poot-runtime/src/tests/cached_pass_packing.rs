@@ -17,7 +17,7 @@ fn kernel(body: &Body, name: &str) -> CompiledKernel {
     poot_codegen::compile(body, poot_codegen::Target::SpirvVulkan, &path).unwrap();
     poot_codegen::kernel_handle(
         body,
-        poot_codegen::Target::SpirvVulkan,
+        poot_codegen::GpuTarget::SpirvVulkan,
         std::fs::read(path).unwrap(),
     )
 }

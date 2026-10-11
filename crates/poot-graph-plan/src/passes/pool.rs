@@ -28,6 +28,7 @@ use poot_graph_ir::graph::{BoundaryId, Eqn, Graph, Operand, Slot, SlotKey, Stora
 use poot_graph_ir::graph::{ValidationChannel, ValueMeta};
 use poot_graph_ir::op::{ContractionRows, OpKind};
 use poot_graph_ir::types::TensorType;
+use poot_tensor::DType;
 
 use super::GraphBudget;
 use super::routed_experts::routed_expert_sites;
@@ -53,7 +54,7 @@ pub struct PoolSite {
     pub experts: usize,
     /// Pool rows, `P`.
     pub slots: usize,
-    /// The router's expert ids (F32, one per routed row): the value the host reads at the sync.
+    /// The router's expert ids (I32, one per routed row): the value the host reads at the sync.
     pub ids: BoundaryId,
     /// The `[E]` map slot: pool row of each global expert, `-1` when not resident.
     pub map: SlotKey,
@@ -186,7 +187,7 @@ pub(crate) fn pool_experts<V: ValidationChannel>(
         let map = pooled.declare_slot(
             Slot::ExpertPoolMap,
             &tag,
-            TensorType::f32(vec![site.experts]),
+            TensorType::new(vec![site.experts], DType::I32),
         );
         let ids_aval = g.aval(site.ids).clone();
         let translated = pooled

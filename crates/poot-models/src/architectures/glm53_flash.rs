@@ -15,21 +15,26 @@
 //! One body traces every phase. The mixers carry their conv windows, matrix states and caches, so a
 //! prefill chunk continues from the positions already written and one token is a decode step. Every
 //! dimension, count and the schedule is the checkpoint's: a fine-tune with fewer layers or experts
-//! is the same family. The multi-token-prediction layers the checkpoint stores are known to the
-//! weight map and traced by nothing.
+//! is the same family.
+//!
+//! The checkpoint's multi-token-prediction layer is traced by [`Phase::Mtp`] ([`mtp`]): a DSA block
+//! over the hidden-state carry and a host token. A checkpoint that stores no such layer, or more than
+//! one (the reference cycles them by draft step, which a step shape does not name), refuses the
+//! phase typed.
 
 use poot_graph_ir::{Builder, Graph, ValidationOutputs};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
 use poot_tensor::DType;
 
 use crate::chat::ChatFormat;
-use crate::components::standard::{Step, check_step};
+use crate::components::standard::{Step, check_mtp_step};
 use crate::model::{
     FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, StepShape, TraceError,
 };
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
 
 mod config;
+mod mtp;
 mod names;
 mod stack;
 
@@ -94,13 +99,23 @@ impl Model for Glm53Flash {
         shape: StepShape,
     ) -> Result<Graph<ValidationOutputs>, TraceError> {
         let p = &self.params;
-        check_step(FAMILY, phase, shape, p.max_positions)?;
+        check_mtp_step(FAMILY, phase, shape, p.max_positions)?;
         if let Some(moe) = &p.moe {
             crate::components::moe::check_step(FAMILY, shape, moe)?;
         }
         let b = Builder::new();
         let step = Step::new(&b, shape);
-        let logits = self.tower.trace(&b, &step, p);
+        let logits = match phase {
+            Phase::Mtp => {
+                self.tower
+                    .trace_mtp(&b, &step, p)
+                    .ok_or(TraceError::PhaseUnsupported {
+                        family: FAMILY,
+                        phase,
+                    })?
+            }
+            _ => self.tower.trace(&b, &step, p),
+        };
         Ok(step.finish(b, logits))
     }
 }
@@ -109,7 +124,7 @@ impl Model for Glm53Flash {
 /// experts), two hyper-connection streams, 6 experts of which 2 route with one shared expert, and
 /// every dimension small. The indexer pools 2 positions and keeps 2 pools, so a few tokens already
 /// leave pools out of the attention. A checkpoint stores one multi-token-prediction layer after the
-/// four.
+/// four: a DSA layer over routed experts with no hyper-connections.
 pub(crate) fn fixture_config() -> serde_json::Value {
     let mut text = serde_json::json!({
         "model_type": "glm5_next_text",
@@ -246,6 +261,101 @@ pub(crate) fn tensors(config: &serde_json::Value) -> Vec<(String, Vec<usize>, St
     );
     use Stored::{Bf16, F32};
     let p = "model.language_model.";
+    let dsa_rows = |at: &dyn Fn(&str) -> String| -> Vec<(String, Vec<usize>, Stored)> {
+        vec![
+            (at("self_attn.q_a_proj.weight"), vec![q_rank, w], Bf16),
+            (at("self_attn.q_a_layernorm.weight"), vec![q_rank], Bf16),
+            (
+                at("self_attn.q_b_proj.weight"),
+                vec![heads * qk, q_rank],
+                Bf16,
+            ),
+            (
+                at("self_attn.kv_a_proj_with_mqa.weight"),
+                vec![kv_rank, w],
+                Bf16,
+            ),
+            (at("self_attn.kv_a_layernorm.weight"), vec![kv_rank], Bf16),
+            (
+                at("self_attn.kv_b_proj.weight"),
+                vec![heads * (qk + v), kv_rank],
+                Bf16,
+            ),
+            (at("self_attn.o_proj.weight"), vec![w, heads * v], Bf16),
+            (
+                at("self_attn.indexer.wq_b.weight"),
+                vec![index_heads * index_dim, q_rank],
+                Bf16,
+            ),
+            (at("self_attn.indexer.wk.weight"), vec![index_dim, w], Bf16),
+            (
+                at("self_attn.indexer.weights_proj.weight"),
+                vec![index_heads, w],
+                Bf16,
+            ),
+            (at("self_attn.indexer.k_norm.weight"), vec![index_dim], Bf16),
+            (at("self_attn.indexer.k_norm.bias"), vec![index_dim], Bf16),
+            (
+                at("self_attn.indexer.index_kpool_compress_gate"),
+                vec![index_dim, w],
+                Bf16,
+            ),
+            (
+                at("self_attn.indexer.index_kpool_compress_ape"),
+                vec![pool, index_dim],
+                Bf16,
+            ),
+        ]
+    };
+    let ffn_rows =
+        |at: &dyn Fn(&str) -> String, dense: bool| -> Vec<(String, Vec<usize>, Stored)> {
+            if dense {
+                return vec![
+                    (at("mlp.gate_proj.weight"), vec![inter, w], Bf16),
+                    (at("mlp.up_proj.weight"), vec![inter, w], Bf16),
+                    (at("mlp.down_proj.weight"), vec![w, inter], Bf16),
+                ];
+            }
+            let mut rows = vec![
+                (at("mlp.gate.weight"), vec![experts, w], Bf16),
+                (at("mlp.gate.e_score_correction_bias"), vec![experts], F32),
+                (
+                    at("mlp.shared_experts.gate_proj.weight"),
+                    vec![moe_inter * shared, w],
+                    Bf16,
+                ),
+                (
+                    at("mlp.shared_experts.up_proj.weight"),
+                    vec![moe_inter * shared, w],
+                    Bf16,
+                ),
+                (
+                    at("mlp.shared_experts.down_proj.weight"),
+                    vec![w, moe_inter * shared],
+                    Bf16,
+                ),
+            ];
+            for e in 0..experts {
+                rows.extend([
+                    (
+                        at(&format!("mlp.experts.{e}.gate_proj.weight")),
+                        vec![moe_inter, w],
+                        Bf16,
+                    ),
+                    (
+                        at(&format!("mlp.experts.{e}.up_proj.weight")),
+                        vec![moe_inter, w],
+                        Bf16,
+                    ),
+                    (
+                        at(&format!("mlp.experts.{e}.down_proj.weight")),
+                        vec![w, moe_inter],
+                        Bf16,
+                    ),
+                ]);
+            }
+            rows
+        };
     let mut shapes = vec![
         (format!("{p}embed_tokens.weight"), vec![vocab, w], Bf16),
         (format!("{p}norm.weight"), vec![w], Bf16),
@@ -284,99 +394,19 @@ pub(crate) fn tensors(config: &serde_json::Value) -> Vec<(String, Vec<usize>, St
                     (at("self_attn.o_proj.weight"), vec![w, qkv], Bf16),
                 ]);
             }
-            _ => shapes.extend([
-                (at("self_attn.q_a_proj.weight"), vec![q_rank, w], Bf16),
-                (at("self_attn.q_a_layernorm.weight"), vec![q_rank], Bf16),
-                (
-                    at("self_attn.q_b_proj.weight"),
-                    vec![heads * qk, q_rank],
-                    Bf16,
-                ),
-                (
-                    at("self_attn.kv_a_proj_with_mqa.weight"),
-                    vec![kv_rank, w],
-                    Bf16,
-                ),
-                (at("self_attn.kv_a_layernorm.weight"), vec![kv_rank], Bf16),
-                (
-                    at("self_attn.kv_b_proj.weight"),
-                    vec![heads * (qk + v), kv_rank],
-                    Bf16,
-                ),
-                (at("self_attn.o_proj.weight"), vec![w, heads * v], Bf16),
-                (
-                    at("self_attn.indexer.wq_b.weight"),
-                    vec![index_heads * index_dim, q_rank],
-                    Bf16,
-                ),
-                (at("self_attn.indexer.wk.weight"), vec![index_dim, w], Bf16),
-                (
-                    at("self_attn.indexer.weights_proj.weight"),
-                    vec![index_heads, w],
-                    Bf16,
-                ),
-                (at("self_attn.indexer.k_norm.weight"), vec![index_dim], Bf16),
-                (at("self_attn.indexer.k_norm.bias"), vec![index_dim], Bf16),
-                (
-                    at("self_attn.indexer.index_kpool_compress_gate"),
-                    vec![index_dim, w],
-                    Bf16,
-                ),
-                (
-                    at("self_attn.indexer.index_kpool_compress_ape"),
-                    vec![pool, index_dim],
-                    Bf16,
-                ),
-            ]),
+            _ => shapes.extend(dsa_rows(&at)),
         }
-        if text["mlp_layer_types"][l].as_str().unwrap() == "dense" {
-            shapes.extend([
-                (at("mlp.gate_proj.weight"), vec![inter, w], Bf16),
-                (at("mlp.up_proj.weight"), vec![inter, w], Bf16),
-                (at("mlp.down_proj.weight"), vec![w, inter], Bf16),
-            ]);
-        } else {
-            shapes.extend([
-                (at("mlp.gate.weight"), vec![experts, w], Bf16),
-                (at("mlp.gate.e_score_correction_bias"), vec![experts], F32),
-                (
-                    at("mlp.shared_experts.gate_proj.weight"),
-                    vec![moe_inter * shared, w],
-                    Bf16,
-                ),
-                (
-                    at("mlp.shared_experts.up_proj.weight"),
-                    vec![moe_inter * shared, w],
-                    Bf16,
-                ),
-                (
-                    at("mlp.shared_experts.down_proj.weight"),
-                    vec![w, moe_inter * shared],
-                    Bf16,
-                ),
-            ]);
-            for e in 0..experts {
-                shapes.extend([
-                    (
-                        at(&format!("mlp.experts.{e}.gate_proj.weight")),
-                        vec![moe_inter, w],
-                        Bf16,
-                    ),
-                    (
-                        at(&format!("mlp.experts.{e}.up_proj.weight")),
-                        vec![moe_inter, w],
-                        Bf16,
-                    ),
-                    (
-                        at(&format!("mlp.experts.{e}.down_proj.weight")),
-                        vec![w, moe_inter],
-                        Bf16,
-                    ),
-                ]);
-            }
-        }
+        shapes.extend(ffn_rows(
+            &at,
+            text["mlp_layer_types"][l].as_str().unwrap() == "dense",
+        ));
     }
-    // The multi-token-prediction layers past the text stack.
+    // The multi-token-prediction layers past the text stack: an MLA and DSA block with the last
+    // text layer's feed-forward kind and no hyper-connection weights, behind the fusing projection.
+    let last_dense = text["mlp_layer_types"]
+        .as_array()
+        .and_then(|kinds| kinds.last())
+        .is_some_and(|kind| kind == "dense");
     for l in layers..layers + n("num_nextn_predict_layers") {
         let at = |s: &str| format!("{p}layers.{l}.{s}");
         shapes.extend([
@@ -384,7 +414,11 @@ pub(crate) fn tensors(config: &serde_json::Value) -> Vec<(String, Vec<usize>, St
             (at("enorm.weight"), vec![w], Bf16),
             (at("hnorm.weight"), vec![w], Bf16),
             (at("shared_head.norm.weight"), vec![w], Bf16),
+            (at("input_layernorm.weight"), vec![w], Bf16),
+            (at("post_attention_layernorm.weight"), vec![w], Bf16),
         ]);
+        shapes.extend(dsa_rows(&at));
+        shapes.extend(ffn_rows(&at, last_dense));
     }
     shapes
 }

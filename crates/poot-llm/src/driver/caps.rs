@@ -163,6 +163,7 @@ impl Driver {
             residency == StateResidency::Recurrent && !shapes.windows.is_empty()
         };
         self.check_draft()?;
+        self.plan_hidden_carry();
         let kv = match shapes.layout {
             Layout::Contiguous => KvLayout::Contiguous,
             Layout::Paged(pool) => pool.kv(),
@@ -306,6 +307,7 @@ impl Driver {
                 }
             }
         }
+        self.prepare_rollback(shapes, kv, pieces)?;
         self.load_draft()?;
         if self.speculation.draft.is_some() {
             // The draft's prompt pieces run unread and a proposal is one decode step: only that
@@ -341,6 +343,7 @@ impl Driver {
                 capacity: self.options.capacity,
                 kv,
                 logits,
+                hidden: self.hidden_of(role),
             },
             head,
             adapters,
@@ -385,6 +388,7 @@ impl Driver {
                             capacity: self.options.capacity,
                             kv,
                             logits: LogitRows::Last,
+                            hidden: self.hidden_of(ModelRole::Target),
                         },
                         head,
                         adapters: None,

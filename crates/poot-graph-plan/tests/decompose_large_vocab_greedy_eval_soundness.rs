@@ -8,44 +8,27 @@
 //! Card 626: moved here from `poot-eval/src/tests/admission_corpus.rs` with the pass itself -
 //! poot-eval must never depend on poot-graph-plan (its own architecture test); this crate already
 //! dev-depends on poot-eval, so an integration test here can drive both. `eval_every_combination`/
-//! `value_bits`/`dense_inputs`/`NoOpObserver`/`SilentAuthority` are duplicated from that file's own
+//! `value_bits`/`dense_inputs`/`NoOpObserver` are duplicated from that file's own
 //! (much more widely used there) copies - all built from poot-eval's already-public API, so there is
 //! no drift risk the way duplicating a pass itself would carry.
 
-use poot_eval::cast_authority::CastAuthority;
 use poot_eval::exact_value::ExactValue;
 use poot_eval::observer::EvalObserver;
 use poot_eval::{EvalBudget, EvalError, EvalOptions, Value, eval};
 use poot_graph_ir::Builder;
 use poot_graph_ir::op::SampleRule;
 use poot_graph_plan::decompose_large_vocab_greedy;
-use poot_tensor::DType;
 use poot_tensor::HostTensor;
 use std::collections::HashMap;
 
 struct NoOpObserver;
 impl EvalObserver for NoOpObserver {}
 
-struct SilentAuthority;
-impl CastAuthority for SilentAuthority {
-    fn role(
-        &mut self,
-        _cast: poot_graph_ir::ValueId,
-    ) -> Option<poot_eval::cast_authority::ExactI32CastRole> {
-        None
-    }
-}
-
 fn eval_every_combination(
     label: &str,
     graph: &poot_graph_ir::Graph,
     inputs: &HashMap<poot_graph_ir::ValueId, Value>,
 ) -> Result<Value, EvalError> {
-    let has_i32_cast = graph.eqns.iter().any(|eqn| {
-        matches!(eqn.op, poot_graph_ir::OpKind::Cast { .. })
-            && matches!(eqn.inputs.first(), Some(poot_graph_ir::Operand::Value(id)) if graph.aval(*id).dtype == DType::I32)
-    });
-
     let plain = eval(graph, inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).map(|r| r.output);
 
     let mut observer = NoOpObserver;
@@ -63,21 +46,8 @@ fn eval_every_combination(
     )
     .map(|r| r.output);
 
-    let mut authority = SilentAuthority;
-    let authorized = (!has_i32_cast).then(|| {
-        eval(
-            graph,
-            inputs,
-            EvalOptions::new(EvalBudget::UNBOUNDED).cast_authority(&mut authority),
-        )
-        .map(|r| r.output)
-    });
-
-    let mut combos: Vec<(&str, &Result<Value, EvalError>)> =
+    let combos: Vec<(&str, &Result<Value, EvalError>)> =
         vec![("observer", &observed), ("keep_environment", &kept)];
-    if let Some(authorized) = &authorized {
-        combos.push(("cast_authority", authorized));
-    }
 
     match &plain {
         Ok(value) => {

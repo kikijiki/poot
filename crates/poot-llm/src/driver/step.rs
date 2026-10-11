@@ -129,7 +129,7 @@ pub enum Release {
 #[derive(Debug)]
 pub(super) struct Seq {
     /// The sequence's slot in the paged cache: its block table.
-    slot: usize,
+    pub(super) slot: usize,
     /// The prompt, then the committed generated tokens.
     pub(super) tokens: Vec<u32>,
     prompt_len: usize,
@@ -137,11 +137,17 @@ pub(super) struct Seq {
     done: usize,
     /// Positions the block table covers: the prompt and `max_new`.
     reserved: usize,
-    adapter: AdapterRef,
+    pub(super) adapter: AdapterRef,
     identity: PrefixIdentity,
     seeded: bool,
     /// The last step's picks, until `commit` takes them.
-    pending: Vec<u32>,
+    pub(super) pending: Vec<u32>,
+    /// The tokens of `pending` a recurrent state already holds: a verified row's result, whose kept
+    /// prefix the round folded (or replayed) into it. Zero for a row whose state folds nothing ahead.
+    folded: usize,
+    /// A commit kept fewer tokens than `folded`, so the recurrent state holds tokens the sequence
+    /// dropped. Only a release, or a resume that resets the row, ends it.
+    state_ahead: bool,
     /// Rows the prompt supplies in place of its tokens' embeddings, bound on every prefill step
     /// that covers one.
     embeds: Option<PromptEmbeds>,
@@ -308,10 +314,19 @@ impl Readback {
                 }
                 Readback::Tokens(tokens)
             }
-            Some(Readback::Logits {
-                vocab, positions, ..
-            }) => {
-                let (vocab, positions) = (*vocab, *positions);
+            Some(Readback::Logits { vocab, .. }) => {
+                let vocab = *vocab;
+                // A row's picks are its last positions, so a group that read fewer positions than
+                // the widest is right-aligned in the merged stride; the positions in front hold
+                // nothing a pick reads.
+                let positions = readbacks
+                    .iter()
+                    .map(|readback| match readback {
+                        Readback::Logits { positions, .. } => *positions,
+                        Readback::Tokens(_) => unreachable!("every group of a step runs one head"),
+                    })
+                    .max()
+                    .expect("a step runs at least one group");
                 let stride = positions * vocab;
                 let mut merged = vec![0.0; rows * stride];
                 for (readback, group) in readbacks.into_iter().zip(groups) {
@@ -324,13 +339,14 @@ impl Readback {
                         unreachable!("every group of a step runs the same head")
                     };
                     assert_eq!(
-                        (group_vocab, group_positions),
-                        (vocab, positions),
-                        "the groups of a step read the same logits"
+                        group_vocab, vocab,
+                        "the groups of a step share a vocabulary"
                     );
+                    let group_stride = group_positions * vocab;
                     for (k, &row) in group.iter().enumerate() {
-                        merged[row * stride..(row + 1) * stride]
-                            .copy_from_slice(&group_rows[k * stride..(k + 1) * stride]);
+                        let end = (row + 1) * stride;
+                        merged[end - group_stride..end]
+                            .copy_from_slice(&group_rows[k * group_stride..(k + 1) * group_stride]);
                     }
                 }
                 Readback::Logits {
@@ -438,6 +454,8 @@ impl Driver {
                 identity,
                 seeded: false,
                 pending: Vec::new(),
+                folded: 0,
+                state_ahead: false,
                 embeds,
                 mrope,
             },
@@ -515,7 +533,7 @@ impl Driver {
             .take_while(|(held, new)| held == new)
             .count();
         let mut reused = shared.min(prompt.len() - 1);
-        if residency == StateResidency::Recurrent && reused != resident {
+        if residency == StateResidency::Recurrent && (reused != resident || state.state_ahead) {
             reused = 0;
         }
         state.tokens = prompt.to_vec();
@@ -525,6 +543,7 @@ impl Driver {
         state.seeded = false;
         let slot = state.slot;
         if reused == 0 {
+            state.state_ahead = false;
             self.reset_row_state(slot)?;
         }
         self.speculation.rewind(seq, reused);
@@ -648,7 +667,7 @@ impl Driver {
                 sampler: &mut *row.sampler,
             })
             .collect();
-        let readback = self.run_rows(lanes, &mut plans, (window, head, adapter))?;
+        let readback = self.run_rows(lanes, &mut plans, (head, adapter))?;
 
         let mut picked: Vec<Vec<u32>> = Vec::with_capacity(rows.len());
         let mut host_picks = false;
@@ -689,6 +708,7 @@ impl Driver {
         }
         self.mirror_prefill(rows, &plans)?;
 
+        let recurrent = self.residency == StateResidency::Recurrent;
         let serving = self.serving.as_mut().expect("checked above");
         let mut results = Vec::with_capacity(rows.len());
         let mut settled = Vec::new();
@@ -698,6 +718,11 @@ impl Driver {
             seq.done += consumed;
             seq.seeded = true;
             seq.pending.clone_from(&tokens);
+            seq.folded = if recurrent && !plan.drafts().is_empty() {
+                tokens.len()
+            } else {
+                0
+            };
             if !plan.drafts().is_empty() {
                 settled.push((row.seq, seq.tokens.len(), plan.drafts().len(), tokens.len()));
             }
@@ -715,22 +740,24 @@ impl Driver {
                 tokens,
             });
         }
-        for (seq, committed, proposed, kept) in settled {
+        for &(seq, committed, proposed, kept) in &settled {
             self.settle(seq, committed, proposed, kept);
         }
+        self.roll_back(&settled)?;
         Ok(results)
     }
 
     /// Run `lanes` once per feed width and merge what the runs return into one readback in lane order.
     /// A row feeding fewer tokens than the step's widest is left-padded, which is harmless to attention
     /// (the padding is masked) and fatal to recurrent state (the padding would fold into it): a
-    /// recurrent model's rows are grouped by the tokens they feed and each group runs its own entry.
-    /// Every other model runs all its rows as one.
+    /// recurrent model's rows are grouped by the tokens they feed and each group runs its own entry,
+    /// reading every position only when one of its rows verifies a window. Every other model runs all
+    /// its rows as one.
     fn run_rows(
         &mut self,
         lanes: Vec<Lane<'_>>,
         plans: &mut Vec<RowPlan>,
-        (window, head, adapter): (bool, Option<Head>, Option<GenerationId>),
+        (head, adapter): (Option<Head>, Option<GenerationId>),
     ) -> Result<Readback, DriverError> {
         let mut groups: Vec<Vec<usize>> = Vec::new();
         for (i, plan) in plans.iter().enumerate() {
@@ -758,6 +785,7 @@ impl Driver {
                 .max()
                 .unwrap_or(1);
             let embeds = group_plans.iter().any(|plan| plan.embeds);
+            let window = group_plans.iter().any(|plan| plan.picks > 1);
             let ran = self
                 .step_entry(
                     ModelRole::Target,
@@ -811,7 +839,7 @@ impl Driver {
         let mut data = StepData {
             tokens: vec![0; entry_rows * width],
             pos: vec![0; entry_rows * width],
-            lora: vec![0.0; entry_rows],
+            lora: vec![0; entry_rows],
             ..StepData::default()
         };
         if let KvLayout::Paged { pool_slots, .. } = kv {
@@ -1015,6 +1043,9 @@ impl Driver {
             .into());
         }
         let pending = std::mem::take(&mut state.pending);
+        // A recurrent state cannot step back from the tokens a verified row folded: keeping fewer
+        // leaves it ahead of the sequence.
+        state.state_ahead |= kept < std::mem::take(&mut state.folded);
         for &token in &pending[..kept] {
             sampler.observe(token);
         }
@@ -1081,6 +1112,9 @@ impl Driver {
                 .ok_or(InvalidRequest::UnknownSeq(row.seq))?;
             if !seq.pending.is_empty() {
                 return Err(InvalidRequest::UncommittedResult(row.seq).into());
+            }
+            if seq.state_ahead {
+                return Err(InvalidRequest::RecurrentStateAhead(row.seq).into());
             }
             plans.push(match row.work {
                 RowWork::Prefill { upto } => {
@@ -1279,6 +1313,7 @@ impl Driver {
                     capacity: self.options.capacity,
                     kv,
                     logits,
+                    hidden: self.hidden_of(role),
                 },
                 head: head.unwrap_or(Head::GREEDY),
                 adapters,

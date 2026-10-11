@@ -31,12 +31,10 @@ pub(crate) fn plan_validation_packet(
 /// zero equations, so `plan_eqn` is never called. Every legacy tensor-only executor called this before
 /// binding host tensors. Storage-aware value entry points must instead validate their typed raw
 /// representation. The portable host layout oracle and per-byte kernel conversions do not make an
-/// `Arc<[f32]>` executor tensor safe to reinterpret as packed E4M3FN storage. Exact-I32 planning and
-/// cross-target compilation are available, but production bind/replay and typed readback remain gated
-/// until that representation is wired end to end.
+/// `Arc<[f32]>` executor tensor safe to reinterpret as packed E4M3FN storage.
 ///
 /// `pub(crate)`/test-only: no production caller survives Card 546b's `GpuExecutor` deletion; kept for
-/// the exact-i32/structural gating coverage in `tests.rs`.
+/// the structural gating coverage in `tests.rs`.
 #[cfg(test)]
 pub(crate) fn validate_graph_execution<V: ValidationChannel>(
     g: &Graph<V>,
@@ -57,7 +55,7 @@ pub(crate) fn validate_graph_execution<V: ValidationChannel>(
             gap: StorageGap::E4m3RawBytes,
         });
     }
-    validate_graph_exact_i32(g)
+    Ok(())
 }
 
 /// Card 380: sibling to [`validate_graph_execution`] for the wgpu entry points that bind every value as a
@@ -114,21 +112,6 @@ pub(crate) fn validate_graph_structure<V: ValidationChannel>(
     g: &Graph<V>,
 ) -> Result<(), PlanError> {
     g.validate().map_err(PlanError::InvalidGraph)
-}
-
-#[cfg(test)]
-pub(crate) fn validate_graph_exact_i32<V: ValidationChannel>(
-    g: &Graph<V>,
-) -> Result<(), PlanError> {
-    let exact_i32 = ExactI32StorageAnalysis::new(g);
-    if let Some(value) = g.values.ids().find(|&id| exact_i32.required(id)) {
-        return Err(PlanError::UnrepresentableValue {
-            value,
-            dtype: DType::I32,
-            gap: StorageGap::ExactI32BindReplay,
-        });
-    }
-    Ok(())
 }
 
 /// Card 259: is this flash-attention op's mask per head (one bias row/plane per query head, which ALiBi

@@ -44,6 +44,7 @@ fn shape(tokens: usize, capacity: usize, logits: LogitRows) -> StepShape {
         capacity: NonZeroUsize::new(capacity).unwrap(),
         kv: KvLayout::Contiguous,
         logits,
+        hidden: None,
     }
 }
 
@@ -293,6 +294,75 @@ fn a_hash_table_word_outside_i32_is_a_typed_error_and_in_range_tables_route_as_t
     let model = model_of(&swapped);
     let (moved, _) = run_chunked(&*model, &swapped.store, CAPACITY, &[], &PROMPT[..4]);
     assert_ne!(base, moved, "the hash table decides the experts of layer 0");
+}
+
+/// POOT-1114: a hash layer's table is traced as a ranged const: every word is declared to be an
+/// expert id, `[0, experts)` (the fixture routes 8), which the weight binder checks at bind. The
+/// score-routed layers have no table. Mutation: trace the table with `Builder::constant`; its
+/// range is every `i32` word and this row goes red.
+#[test]
+fn the_hash_table_is_declared_in_the_expert_range() {
+    let fx = fixture();
+    let model = model_of(&fx);
+    let g = model
+        .trace(Phase::Decode, shape(1, CAPACITY, LogitRows::All))
+        .unwrap();
+    let tables: Vec<_> = g
+        .inputs
+        .iter()
+        .map(|&id| g.meta(id))
+        .filter(|meta| {
+            meta.name
+                .as_deref()
+                .is_some_and(|name| name.ends_with(".moe.hash_table"))
+        })
+        .collect();
+    assert!(!tables.is_empty(), "the fixture has a hash-routed layer");
+    for meta in tables {
+        assert_eq!(
+            meta.range(),
+            poot_graph_ir::IndexRange::below(8),
+            "{:?}",
+            meta.name
+        );
+    }
+}
+
+/// POOT-1114: the expert count that bounds the hash table's words is config data, so a count that
+/// cannot bound I32 words (zero, or more than `2^31` ids) is a typed refusal naming the config field, not
+/// a panic. The positive control is the fixture's own count. Mutation: replace the `ok_or(..)?` in
+/// `HashTable::new` with an `expect`; the zero row panics and this row goes red.
+#[test]
+fn an_expert_count_that_cannot_bound_the_hash_table_is_a_typed_config_refusal() {
+    use super::moe::HashTable;
+    use crate::components::linear::WeightError;
+
+    let fx = fixture();
+    let cfg = super::config::DeepseekV4Config::from_raw(&fx.raw()).unwrap();
+    let map = super::names::weights_of(&cfg, &fx.store).unwrap();
+    let (vocab, k) = (48, 2);
+    HashTable::new(&map, 0, vocab, k, 8).expect("the fixture's 8 experts bound the table");
+    for (bound, reason) in [
+        (0, ConfigReason::Zero),
+        (
+            i32::MAX as usize + 2,
+            ConfigReason::Exceeds {
+                max: i32::MAX as usize + 1,
+            },
+        ),
+    ] {
+        let error = HashTable::new(&map, 0, vocab, k, bound).unwrap_err();
+        assert!(
+            matches!(error, WeightError::IndexBound { bound: got, .. } if got == bound),
+            "{error:?}"
+        );
+        match error.for_family(FAMILY) {
+            ModelError::Config {
+                field, reason: got, ..
+            } => assert_eq!((field, got), ("n_routed_experts", reason)),
+            other => panic!("expected a config refusal, got {other:?}"),
+        }
+    }
 }
 
 /// The prefill granule: a prefill step must cover whole windows (a multiple of 4 here), a decode
@@ -720,6 +790,7 @@ fn target_of(backend: Backend) -> Target {
             Backend::SpirvVulkan => DeviceCaps::wgpu_rdna3_igpu(),
             Backend::Nvptx => DeviceCaps::ptx_default(),
             Backend::AmdGcn(_) => DeviceCaps::rocm_default(),
+            Backend::Aie(_) => unreachable!("an AIE target has no GPU DeviceCaps"),
         },
     }
 }

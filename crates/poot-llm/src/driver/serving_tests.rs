@@ -316,13 +316,20 @@ fn lora_idx(index: u32) -> LoraIdx {
     LoraIdx::new(index).unwrap()
 }
 
-/// Whether an input buffer of the last replayed step holds exactly `expected` as f32 words: the
-/// `Slot::LoraIdx` row values (the token, position and map buffers hold i32 words, whose bit patterns
-/// read as f32 are never a small whole number).
-fn last_step_bound(rig: &Rig, expected: &[f32]) -> bool {
+/// Whether an input buffer of the last replayed step holds exactly `expected` as i32 words: the
+/// `Slot::LoraIdx` row values. The step's token buffer is `[3]`/`[4]`/`[5]` and its position buffer `[0]`,
+/// so a one- or two-valued adapter index is told apart by its value.
+fn last_step_bound(rig: &Rig, expected: &[i32]) -> bool {
     let world = rig.world.borrow();
     let last = world.steps.last().expect("a step ran");
-    last.inputs.iter().any(|bytes| floats(bytes) == expected)
+    last.inputs.iter().any(|bytes| {
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| i32::from_le_bytes(*word))
+            .eq(expected.iter().copied())
+    })
 }
 
 /// SC-003: two captured sets with identical names and shapes but distinct source identity are two
@@ -371,9 +378,9 @@ fn adapter_generations_have_their_own_entries_and_indices_do_not() {
     let second = open_one(&mut rig, &[4], on(g1, 2));
     let other = open_one(&mut rig, &[5], on(g2, 1));
     step_rows(&mut rig, &mut [(first, PREFILL1, plain())]).unwrap();
-    assert!(last_step_bound(&rig, &[1.0]));
+    assert!(last_step_bound(&rig, &[1]));
     step_rows(&mut rig, &mut [(second, PREFILL1, plain())]).unwrap();
-    assert!(last_step_bound(&rig, &[2.0]), "the index is a bound input");
+    assert!(last_step_bound(&rig, &[2]), "the index is a bound input");
     step_rows(&mut rig, &mut [(other, PREFILL1, plain())]).unwrap();
     assert_eq!(
         rig.driver.compile_count(),
@@ -635,8 +642,7 @@ fn opening_a_recurrent_sequence_zeroes_its_state_row() {
     assert_eq!(writes, [(0, 16)]);
 }
 
-/// Every input the last step bound, read as the f32 mirror an index slot is stored as on the fake's
-/// target (an exact integer), rounded back to the integers the driver wrote.
+/// Every input the last step bound, read as the i32 words an index slot is stored as.
 fn last_step_inputs(rig: &Rig) -> Vec<Vec<i32>> {
     rig.world
         .borrow()
@@ -648,7 +654,7 @@ fn last_step_inputs(rig: &Rig) -> Vec<Vec<i32>> {
                 .as_chunks::<4>()
                 .0
                 .iter()
-                .map(|word| f32::from_le_bytes(*word) as i32)
+                .map(|word| i32::from_le_bytes(*word))
                 .collect()
         })
         .collect()

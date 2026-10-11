@@ -49,7 +49,7 @@ Driver: token loop, sampling suffix, stops, KV slots  ->  serve: one scheduling 
 2. **Optimization.** Graph transforms (CSE, RoPE fusion, the flash-attention rewrite, pointwise and
    reduction fusion, matmul tiling) rewrite the graph without changing its meaning. See
    [Fusion](./fusion.mdx).
-3. **Planning.** `plan_eqn_analyzed` in `poot-graph-plan` gives each equation a plan: an imported or
+3. **Planning.** `plan_eqn` in `poot-graph-plan` gives each equation a plan: an imported or
    synthesized kernel, a view or alias, or a refusal. `compile` runs this planning as its last step.
 4. **Capture.** The executor allocates stable buffers for weights, intermediates and per-step inputs
    and records the dispatch sequence once per model and KV capacity.

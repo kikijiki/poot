@@ -13,7 +13,6 @@
 mod family;
 
 use std::cell::Cell;
-use std::collections::BTreeSet;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::rc::Rc;
@@ -23,9 +22,7 @@ use poot_executor::{
     BufferRole, Device, Dispatch, Engine, EntryId, ExecError, ExecutableId, Executor,
     ExecutorStats, HostSync, StateScope, StepInputs, StepOutputs,
 };
-use poot_graph_ir::{
-    BinOp, Builder, Graph, Slot, SlotKey, StateRole, TensorType, ValidationOutputs,
-};
+use poot_graph_ir::{Slot, SlotKey, ValidationOutputs};
 use poot_graph_plan::{
     CompileLimits, CompileOptions, StagedProgram, Submission, Target, TargetSet,
 };
@@ -40,17 +37,12 @@ use poot_llm::driver::{
 };
 use poot_llm::driver::{NotSpeculated, PoolShape, RowSpeculation, SpeculationStats};
 use poot_llm::{GenerationControl, Sampler};
-use poot_models::chat::ChatFormat;
-use poot_models::components::standard::{Step, check_step};
-use poot_models::model::{
-    FamilyKey, KvLayout, LogitRows, Model, ModelConfig, ModelError, ModelOutput, Phase, StepShape,
-    TraceError,
-};
-use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig, Registry};
+use poot_models::model::{KvLayout, LogitRows, Phase, StepShape};
+use poot_models::registry::{Fixture, Registry};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
 use poot_runtime_common::DeviceBackend;
 use poot_target::{Backend, DeviceCaps};
-use poot_tensor::{DType, HostTensor};
+use poot_tensor::HostTensor;
 use poot_test_util::weight_map_oracle::eval_mapped;
 use tokenizers::Tokenizer;
 use tokenizers::models::wordlevel::WordLevel;
@@ -104,12 +96,10 @@ fn write_checkpoint(dir: &Path, fixture: &Fixture, tokenizer: &Tokenizer) {
     poot_test_util::safetensors::write(&dir.join("model.safetensors"), &fixture.store);
 }
 
-/// The built-in families plus the fixture family and the recurrent fake, registered from outside the
-/// production crates.
+/// The built-in families plus the fixture family, registered from outside the production crates.
 fn registry() -> Registry {
     let mut registry = Registry::builtin().unwrap();
     registry.register(ENTRY).unwrap();
-    registry.register(RECURRENT_ENTRY).unwrap();
     registry
 }
 
@@ -164,107 +154,6 @@ fn draft_handle(scale: f32) -> (Arc<ModelHandle>, poot_test_util::UniqueTempPath
         &perturbed(&family::fixture(), scale),
         &tokenizer(VOCAB, false),
     );
-    (load(&dir), dir)
-}
-
-// ---------------------------------------------------------------------------------------------
-// A recurrent fake family: one `StateRole::Recurrent` state folded with every token.
-// ---------------------------------------------------------------------------------------------
-
-const RECURRENT: FamilyKey = FamilyKey::new("poot_fixture_recurrentish");
-
-const RECURRENT_ENTRY: FamilyEntry = FamilyEntry {
-    family: RECURRENT,
-    keys: &[(ConfigSource::HfModelType, "poot_fixture_recurrentish")],
-    build: build_recurrent,
-    fixture: recurrent_fixture,
-    variants: &[],
-};
-
-#[derive(Debug)]
-struct Recurrentish {
-    config: ModelConfig,
-    weights: WeightMap,
-}
-
-fn build_recurrent(_: &RawConfig<'_>, _: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
-    Ok(Box::new(Recurrentish {
-        config: ModelConfig {
-            family: RECURRENT,
-            vocab: VOCAB,
-            max_positions: CAPACITY,
-            eos: BTreeSet::from([family::EOS]),
-            bos: None,
-            prompt_bos: None,
-            output: ModelOutput::Logits { vocab: VOCAB },
-            prefill_granule: NonZeroUsize::MIN,
-            chat: ChatFormat::ChatML,
-        },
-        weights: WeightMap::default(),
-    }))
-}
-
-fn recurrent_fixture() -> Fixture {
-    let mut store = WeightStore::builder();
-    let dummy = DenseWeight::try_new(DType::BF16, vec![1], vec![0u8, 0].into()).unwrap();
-    store.insert("dummy", WeightEntry::Dense(dummy)).unwrap();
-    Fixture {
-        config: serde_json::json!({
-            "model_type": "poot_fixture_recurrentish",
-            "vocab_size": VOCAB,
-            "max_position_embeddings": CAPACITY,
-            "eos_token_id": family::EOS,
-        }),
-        generation: None,
-        store: store.build(),
-    }
-}
-
-impl Model for Recurrentish {
-    fn config(&self) -> &ModelConfig {
-        &self.config
-    }
-
-    fn weights(&self) -> &WeightMap {
-        &self.weights
-    }
-
-    fn trace(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-    ) -> Result<Graph<ValidationOutputs>, TraceError> {
-        check_step(RECURRENT, phase, shape, self.config.max_positions)?;
-        let b = Builder::new();
-        let step = Step::new(&b, shape);
-        let (n, rows) = (shape.tokens.get(), shape.rows.get());
-        let first = if shape.logits == LogitRows::All {
-            0
-        } else {
-            n - 1
-        };
-        let out = n - first;
-        let token = b.cast(b.slice(step.tokens(), 1, first, n), DType::F32);
-        let pos = b.cast(b.slice(step.pos(), 1, first, n), DType::F32);
-        let seed = b.binary(BinOp::Add, token, pos);
-        let dims = vec![rows, 4];
-        let state = b.state_input(
-            "toy.state",
-            TensorType::f32(dims.clone()),
-            StateRole::Recurrent,
-        );
-        // The state folds the step's last token, whatever width the step has.
-        let last = b.slice(seed, 1, out - 1, out);
-        let folded = b.binary(BinOp::Add, state, b.broadcast(last, dims));
-        step.carry(state, folded);
-        let logits = b.broadcast(b.reshape(seed, vec![rows, out, 1]), vec![rows, out, VOCAB]);
-        Ok(step.finish(b, logits))
-    }
-}
-
-fn recurrent_handle() -> (Arc<ModelHandle>, poot_test_util::UniqueTempPath) {
-    let dir = poot_test_util::unique_temp_path("speculate_recurrent");
-    write_checkpoint(&dir, &recurrent_fixture(), &tokenizer(VOCAB, false));
     (load(&dir), dir)
 }
 
@@ -412,6 +301,7 @@ fn options(draft: DraftPolicy) -> DriverOptions {
         },
         charge: program_retention,
         draft,
+        hidden_window: None,
     }
 }
 
@@ -461,23 +351,10 @@ fn refusal(error: DriverError) -> SpeculationRefusal {
 // Host half.
 // ---------------------------------------------------------------------------------------------
 
-/// SC-004: a recurrent family (one `StateRole::Recurrent` state, registered from outside the
-/// production crates) with prompt lookup is refused at `prepare` with the typed recurrent refusal,
-/// read from the compiled program's state roles; the dense fixture with the same policy prepares and
-/// publishes its window. Mutation: skip the role check in `check_speculation_state`; the recurrent
-/// `prepare` succeeds and the first assertion is red.
+/// The dense fixture with prompt lookup prepares and publishes its window beside decode. (The
+/// recurrent families' refusal and rollback rows are `speculate_recurrent.rs`.)
 #[test]
-fn a_recurrent_family_refuses_speculation_and_the_dense_fixture_prepares() {
-    let (recurrent, _dir) = recurrent_handle();
-    let (mut driver, _) = fake_driver(recurrent, lookup());
-    let error =
-        prepare(&mut driver, &[Head::GREEDY]).expect_err("recurrent state cannot roll back");
-    assert_eq!(refusal(error), SpeculationRefusal::RecurrentState);
-    assert!(
-        driver.caps().is_none(),
-        "a refused prepare publishes nothing"
-    );
-
+fn the_dense_fixture_prepares_and_publishes_its_window() {
     let (dense, _dir) = target_handle();
     let (mut driver, _) = fake_driver(dense, lookup());
     prepare(&mut driver, &[Head::GREEDY]).unwrap_or_else(|e| panic!("{e}"));
@@ -706,6 +583,7 @@ fn oracle_rows(store: &WeightStore, tokens: &[u32]) -> Vec<Vec<f32>> {
         capacity: nz(CAPACITY),
         kv: KvLayout::Contiguous,
         logits: LogitRows::All,
+        hidden: None,
     };
     let graph = model.trace(Phase::Prefill, shape).unwrap();
     let state: Vec<HostTensor> = graph
@@ -1273,6 +1151,154 @@ fn a_row_that_does_not_speculate_says_why_rocm() {
 #[test]
 fn a_row_that_does_not_speculate_says_why_ptx() {
     assert_rows_report_why_they_did_not_speculate(BackendChoice::Ptx, DeviceBackend::Ptx);
+}
+
+/// POOT-726: `Slot::Pos` declares `[0, capacity)`, so a verify window may never place a draft past the last
+/// position. The proposer is clamped by the sequence's reservation (at most the capacity): a sequence that
+/// fills its whole capacity under prompt lookup speculates up to the end, decodes its last positions one
+/// token at a time (`NoRoom`), returns the tokens `Off` returns and never reaches a bind refusal.
+/// Two clauses in `Driver::plan_rows` each keep the window inside the capacity (the room is the
+/// reservation's remainder, and a window that would end past the capacity gets none). Mutation: remove
+/// both (`room = caps.k`, no `start + window <= capacity`); the last windows place drafts at `capacity`,
+/// the step is refused at bind (`slot pos: word 64 at index 2 is outside its declared range [0, 64)`) and
+/// this row is red. Either clause alone is covered by the other.
+fn assert_a_speculating_sequence_fills_its_capacity(choice: BackendChoice, backend: DeviceBackend) {
+    let Some(executor) = poot_test_util::device_skip::open_or_skip(backend, open_executor(choice))
+    else {
+        return;
+    };
+    let (target, _dir) = target_handle();
+    let prompt = &REPETITIVE[..];
+    let new = CAPACITY - prompt.len();
+    // The same device without speculation: `Off` equals the oracle (`off_generate_equals_the_oracle_*`),
+    // and unlike the oracle it has no near-tie margin guard to trip on the fixture's late tokens.
+    let Some(reference_executor) =
+        poot_test_util::device_skip::open_or_skip(backend, open_executor(choice))
+    else {
+        return;
+    };
+    let mut off = device_driver(target.clone(), reference_executor, DraftPolicy::Off);
+    let reference = generate(&mut off, prompt, new, Sampler::greedy());
+    assert_eq!(reference.len(), new);
+    let mut driver = device_driver(target, executor, lookup());
+    let (served, rounds) = serve(
+        &mut driver,
+        prompt,
+        new,
+        &mut Sampler::greedy(),
+        &[Head::GREEDY],
+    );
+    assert_eq!(served, reference, "the filled sequence differs from Off");
+    assert!(
+        rounds.iter().any(|&kept| kept > 1),
+        "the repetitive prompt speculates before the end: {rounds:?}"
+    );
+    let stats = driver.stats().speculation;
+    assert!(
+        stats.skipped_no_room >= 1,
+        "the last positions hold no window and decode one token: {stats:?}"
+    );
+}
+
+#[test]
+fn a_speculating_sequence_fills_its_capacity_wgpu() {
+    assert_a_speculating_sequence_fills_its_capacity(BackendChoice::Wgpu, DeviceBackend::Wgpu);
+}
+
+#[test]
+fn a_speculating_sequence_fills_its_capacity_rocm() {
+    assert_a_speculating_sequence_fills_its_capacity(BackendChoice::Rocm, DeviceBackend::Rocm);
+}
+
+#[test]
+fn a_speculating_sequence_fills_its_capacity_ptx() {
+    assert_a_speculating_sequence_fills_its_capacity(BackendChoice::Ptx, DeviceBackend::Ptx);
+}
+
+/// POOT-726: a caller-supplied `ahead` window past the capacity is a typed `InvalidRequest::Capacity` when
+/// the step is planned, before any input is bound, so the position slot's `[0, capacity)` declaration is
+/// never what refuses it. The sequence is left as it was: a window that fits still decodes afterwards.
+/// Mutation: drop the `start + 1 + ahead.len() > capacity` check in `Driver::plan_rows`; the step is no
+/// longer the typed capacity refusal (it reaches the prepared set and fails there) and this row is red.
+fn assert_a_window_past_the_capacity_is_refused_at_plan_time(
+    choice: BackendChoice,
+    backend: DeviceBackend,
+) {
+    use poot_llm::driver::error::InvalidRequest;
+
+    let Some(executor) = poot_test_util::device_skip::open_or_skip(backend, open_executor(choice))
+    else {
+        return;
+    };
+    let (target, _dir) = target_handle();
+    let mut driver = device_driver(target, executor, DraftPolicy::Off);
+    driver
+        .prepare(&ServingShapes {
+            layout: Layout::Contiguous,
+            rows: &[NonZeroUsize::MIN],
+            heads: &[Head::GREEDY],
+            warm: Warm::Admitted,
+            windows: &[nz(K + 1)],
+            adapters: &[],
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+    let mut sampler = Sampler::greedy();
+    let prompt = &REPETITIVE[..];
+    let seq = open_prefilled(&mut driver, prompt, CAPACITY - prompt.len(), &mut sampler);
+    // The next token sits at position `prompt.len()`; a window of `CAPACITY - prompt.len()` drafts after
+    // it ends one position past the last.
+    let ahead = vec![1u32; CAPACITY - prompt.len()];
+    let mut rows = [StepRow {
+        seq,
+        work: RowWork::Decode {
+            ahead: &ahead,
+            pick: PickPolicy::Greedy,
+        },
+        sampler: &mut sampler,
+    }];
+    let error = driver.step(&mut rows).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            DriverError::InvalidRequest(InvalidRequest::Capacity { max: CAPACITY, .. })
+        ),
+        "expected a plan-time capacity refusal, got {error:?}"
+    );
+    // Nothing was bound or committed: a window that fits (K drafts) still runs.
+    let ahead = vec![1u32; K];
+    let mut rows = [StepRow {
+        seq,
+        work: RowWork::Decode {
+            ahead: &ahead,
+            pick: PickPolicy::Greedy,
+        },
+        sampler: &mut sampler,
+    }];
+    driver.step(&mut rows).unwrap_or_else(|e| panic!("{e}"));
+}
+
+#[test]
+fn a_window_past_the_capacity_is_refused_at_plan_time_wgpu() {
+    assert_a_window_past_the_capacity_is_refused_at_plan_time(
+        BackendChoice::Wgpu,
+        DeviceBackend::Wgpu,
+    );
+}
+
+#[test]
+fn a_window_past_the_capacity_is_refused_at_plan_time_rocm() {
+    assert_a_window_past_the_capacity_is_refused_at_plan_time(
+        BackendChoice::Rocm,
+        DeviceBackend::Rocm,
+    );
+}
+
+#[test]
+fn a_window_past_the_capacity_is_refused_at_plan_time_ptx() {
+    assert_a_window_past_the_capacity_is_refused_at_plan_time(
+        BackendChoice::Ptx,
+        DeviceBackend::Ptx,
+    );
 }
 
 /// The temperature of the lookup row: low enough that the target's distribution is peaked and a

@@ -387,6 +387,7 @@ pub fn trace(
         capacity: NonZeroUsize::new(capacity).unwrap(),
         kv: KvLayout::Contiguous,
         logits: LogitRows::All,
+        hidden: None,
     };
     let g = model.trace(phase, shape).unwrap();
     bind_packed_weights(&g, &WeightFormats::from_weight_map(map)).unwrap()

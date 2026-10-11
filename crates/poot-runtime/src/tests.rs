@@ -114,7 +114,8 @@ mod pending_fault_tests {
         poot_codegen::compile(&body, poot_codegen::Target::SpirvVulkan, &out)
             .expect("assert_trap must compile to SpirV");
         let bytes = std::fs::read(&out).expect("read compiled spv");
-        let kernel = poot_codegen::kernel_handle(&body, poot_codegen::Target::SpirvVulkan, bytes);
+        let kernel =
+            poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::SpirvVulkan, bytes);
         (kernel, body)
     }
 
@@ -482,7 +483,7 @@ mod profiled_dispatch_tests {
         poot_codegen::compile(body, poot_codegen::Target::SpirvVulkan, &out)
             .expect("compile spirv");
         let bytes = std::fs::read(&out).unwrap();
-        poot_codegen::kernel_handle(body, poot_codegen::Target::SpirvVulkan, bytes)
+        poot_codegen::kernel_handle(body, poot_codegen::GpuTarget::SpirvVulkan, bytes)
     }
 
     #[test]
@@ -622,7 +623,7 @@ mod no_contract_tests {
         poot_codegen::compile(body, poot_codegen::Target::SpirvVulkan, &out)
             .expect("compile spirv");
         let bytes = std::fs::read(&out).unwrap();
-        poot_codegen::kernel_handle(body, poot_codegen::Target::SpirvVulkan, bytes)
+        poot_codegen::kernel_handle(body, poot_codegen::GpuTarget::SpirvVulkan, bytes)
     }
 
     /// `n` `(a, b, c, d)` rows where `a*b - c*d` computed with two separate f32 roundings (`m1 = a*b`,
@@ -1012,7 +1013,7 @@ mod exec_counters_tests {
         poot_codegen::compile(body, poot_codegen::Target::SpirvVulkan, &out)
             .expect("compile spirv");
         let bytes = std::fs::read(&out).unwrap();
-        poot_codegen::kernel_handle(body, poot_codegen::Target::SpirvVulkan, bytes)
+        poot_codegen::kernel_handle(body, poot_codegen::GpuTarget::SpirvVulkan, bytes)
     }
 
     /// MUTATION (recorded here, not left in the tree; Card 552 SC-007): in
@@ -1121,7 +1122,7 @@ mod device_timing_tests {
         poot_codegen::compile(body, poot_codegen::Target::SpirvVulkan, &path).unwrap();
         poot_codegen::kernel_handle(
             body,
-            poot_codegen::Target::SpirvVulkan,
+            poot_codegen::GpuTarget::SpirvVulkan,
             std::fs::read(path).unwrap(),
         )
     }

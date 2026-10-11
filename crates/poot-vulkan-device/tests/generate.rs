@@ -120,6 +120,7 @@ fn options(chunk: usize, capacity: usize) -> DriverOptions {
         },
         charge: program_retention,
         draft: poot_llm::driver::DraftPolicy::Off,
+        hidden_window: None,
     }
 }
 

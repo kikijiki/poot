@@ -93,6 +93,12 @@ pub enum LoadError {
     /// `WeightId::const_name` (even when a store key equals it).
     #[error("const {value} ({name}) is bound to no weight")]
     Unbound { value: ValueId, name: String },
+    /// The device's backend loads linked artifacts, not the byte artifacts the engine's kernel cache
+    /// compiles (an AIE core): no engine path builds its kernel handle.
+    #[error(
+        "{backend:?} kernels are linked artifacts; the engine's byte-artifact path cannot load them"
+    )]
+    NoByteArtifact { backend: poot_target::Backend },
     #[error("const {value} has no name to bind by")]
     UnnamedConst { value: ValueId },
     #[error("slot {value} has no structured slot key")]
@@ -120,6 +126,16 @@ pub enum LoadError {
         name: String,
         stored: DType,
         declared: DType,
+    },
+    /// A weight table holds a word outside the range its graph declares
+    /// ([`poot_graph_ir::Builder::constant_ranged`]): the graph's consumers rely on the declaration
+    /// (a gathered word's cast to F32 was proven exact from it), so the weight is not uploaded.
+    #[error("weight {name}: word {value} at index {index} is outside its declared range {range}")]
+    WeightRange {
+        name: String,
+        index: usize,
+        value: i32,
+        range: poot_graph_ir::IndexRange,
     },
     #[error("weight {name}: stored shape {stored:?}, graph declares {declared:?}")]
     WeightShape {
@@ -163,8 +179,8 @@ pub enum LoadError {
     /// engine could not say which stored table it pages or in which lane.
     #[error("pool slot {key} is declared by no sync point of the program, or read by no stage")]
     PoolUndeclared { key: SlotKey },
-    /// A sync point reads a value the engine cannot hand a host as F32.
-    #[error("sync point {point:?} reads boundary {id:?}, which is not a plain F32 value")]
+    /// A sync point reads a value the engine cannot hand a host as I32 expert ids.
+    #[error("sync point {point:?} reads boundary {id:?}, which is not a plain I32 value")]
     SyncReadLane { point: SyncId, id: BoundaryId },
     /// A pooled table whose experts do not fall on whole device words of its lane cannot be refilled
     /// one row at a time.
@@ -201,6 +217,16 @@ pub enum BindError {
         key: SlotKey,
         expected: DType,
         got: DType,
+    },
+    /// A step input holds a word outside the range its slot declares (POOT-726: `Token` in
+    /// `[0, vocab)`, `Pos` in `[0, capacity)`). The graph's consumers rely on the declaration (an
+    /// `I32 -> F32` cast of the slot was proven exact from it), so nothing dispatches.
+    #[error("slot {key}: word {value} at index {index} is outside its declared range {range}")]
+    Range {
+        key: SlotKey,
+        index: usize,
+        value: i32,
+        range: poot_graph_ir::IndexRange,
     },
     /// `reset_state(Row(row))` named a row outside the carried state's leading axis, or the state
     /// is not a whole number of equal rows.

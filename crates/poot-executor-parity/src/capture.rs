@@ -8,7 +8,7 @@ use poot_graph_ir::ops::{
     attention_masked_softcap, causal_conv1d_decode, causal_mask_from_pos, gated_delta_net_decode,
     linear, moe_grouped, rmsnorm, rope, sigmoid, silu, softplus,
 };
-use poot_graph_ir::{BinOp, Builder, Slot, StateRole, TensorType, UnOp};
+use poot_graph_ir::{BinOp, Builder, IndexRange, Slot, StateRole, TensorType, UnOp};
 use poot_tensor::{DType, HostTensor};
 
 use poot_test_util::StepFixture;
@@ -44,7 +44,11 @@ pub fn bias_toy_fixture() -> Fixture {
 fn toy_fixture(name: &'static str, bias: bool) -> Fixture {
     let b = Builder::new();
     let token = b.slot(Slot::Token, TensorType::scalar(DType::I32));
-    let pos = b.slot(Slot::Pos, TensorType::scalar(DType::I32));
+    let pos = b.slot_ranged(
+        Slot::Pos,
+        TensorType::scalar(DType::I32),
+        IndexRange::below(CAP).expect("a nonempty cache"),
+    );
     let mask4 = causal_mask_from_pos(&b, b.reshape(pos, vec![1, 1]), CAP, None);
 
     let embed = b.constant("toy.embed", TensorType::f32(vec![VOCAB, H]));

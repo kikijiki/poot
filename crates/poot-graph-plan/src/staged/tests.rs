@@ -385,11 +385,9 @@ fn adapted_input(
     match meta.storage {
         poot_graph_ir::Storage::Slot(Slot::LoraIdx) => {
             let numel = meta.aval.numel();
-            Value::from(HostTensor::f32(
+            Value::from(HostTensor::i32(
                 meta.aval.shape.clone(),
-                (0..numel)
-                    .map(|row| if row == 0 { 1.0 } else { 0.0 })
-                    .collect(),
+                (0..numel).map(|row| i32::from(row == 0)).collect(),
             ))
         }
         poot_graph_ir::Storage::Computed(payload) => Value::from(payload.tensor()),
@@ -410,11 +408,9 @@ fn adapted_input(
     }
 }
 
-/// `ids = token + token` in layer 0, which layer 0 also reads as the index of a gather (an exact
-/// I32 read), then handed to layer 1. Layer 1 either only gathers by it (a float-mirror read: the
-/// consumer's component has no arithmetic that reaches an output) or does arithmetic on it that is
-/// itself the graph output (an exact read).
-fn i32_boundary(consumer_agrees: bool) -> Graph {
+/// `ids = token + token` in layer 0, which layer 0 also reads as the index of a gather, then handed to
+/// layer 1. Layer 1 either only gathers by it or does arithmetic on it that is itself the graph output.
+fn i32_boundary(consumer_does_arithmetic: bool) -> Graph {
     let b = Builder::new();
     let token = b.slot(Slot::Token, TensorType::new(vec![4], DType::I32));
     let table = b.constant("table", TensorType::f32(vec![8, 4]));
@@ -429,7 +425,7 @@ fn i32_boundary(consumer_agrees: bool) -> Graph {
     {
         let _layer = b.layer_scope(1);
         k_out = b.binary(BinOp::Add, k_in, rows);
-        out = if consumer_agrees {
+        out = if consumer_does_arithmetic {
             b.binary(BinOp::Add, ids, ids)
         } else {
             b.gather(table, 0, ids)
@@ -438,50 +434,23 @@ fn i32_boundary(consumer_agrees: bool) -> Graph {
     b.finish_with_state(out, &[(k_in, k_out)])
 }
 
-/// SC-008: the two sides of a boundary must agree on dtype, shape and exact storage. An I32 value
-/// the producer computes arithmetically and exports is exact words; a consumer that only gathers by
-/// it reads the float mirror lane. Both are four 32-bit words, the same byte count and the same
-/// logical extent, yet different representations: compile refuses the cut with both schemas named.
-/// A consumer that also does arithmetic on it agrees with the producer and compiles.
+/// SC-008, POOT-725: an I32 boundary value has one representation, dense I32 words, however its consumer
+/// reads it. A consumer that only gathers by it and one that does arithmetic on it both compile across the
+/// cut, with the ids and the gathered rows crossing (before, the gather-only consumer read an F32 mirror and
+/// the cut was a `LinkSchema` refusal).
 ///
-/// Mutation: compare only the byte length in `check_link`: the mismatched cut is admitted and the
-/// first assertion goes red.
+/// Mutation: make `value_storage_kind` store an I32 value no `Binary` consumes as F32; the gather-only
+/// boundary is refused as a `LinkSchema` mismatch and the first loop goes red.
 #[test]
-fn a_boundary_the_two_stages_represent_differently_is_refused_at_compile() {
-    let mismatched = i32_boundary(false);
-    match compile_staged(
-        &mismatched,
-        &TargetSet::single(DeviceId(0), target()),
-        &partition(pipeline(&[0])),
-        &options(),
-    ) {
-        Err(StagedCompileError::LinkSchema {
-            producer, consumer, ..
-        }) => {
-            assert_eq!(producer.aval, consumer.aval, "same dtype and shape");
-            assert_eq!(
-                producer.storage.element().byte_width(),
-                consumer.storage.element().byte_width(),
-                "same bytes per element"
-            );
-            assert_ne!(
-                producer.storage, consumer.storage,
-                "different representation"
-            );
-        }
-        other => panic!(
-            "expected a LinkSchema refusal for the mirror/exact boundary, got {:?}",
-            other.map(|_| ())
-        ),
+fn an_i32_boundary_has_one_representation_whatever_its_consumer_reads() {
+    for arithmetic in [false, true] {
+        let program = staged(&i32_boundary(arithmetic), pipeline(&[0]), &options());
+        assert_eq!(
+            program.links().len(),
+            2,
+            "arithmetic {arithmetic}: the ids and the gathered rows both cross"
+        );
     }
-
-    let agreeing = i32_boundary(true);
-    let program = staged(&agreeing, pipeline(&[0]), &options());
-    assert_eq!(
-        program.links().len(),
-        2,
-        "the ids and the gathered rows both cross"
-    );
 }
 
 /// The partition's refusals are typed and come before any compile work.
@@ -634,20 +603,20 @@ struct PoolHost<'g> {
 }
 
 impl PoolHost<'_> {
-    fn sync(&mut self, point: &SyncPoint, ids: &[f32]) -> HashMap<SlotKey, Value> {
+    fn sync(&mut self, point: &SyncPoint, ids: &[i32]) -> HashMap<SlotKey, Value> {
         let mut needed: Vec<usize> = ids.iter().map(|&id| id as usize).collect();
         needed.sort_unstable();
         needed.dedup();
         assert!(needed.len() <= point.site.slots);
         self.resident.push(needed.clone());
-        let mut map = vec![-1.0f32; point.site.experts];
+        let mut map = vec![-1i32; point.site.experts];
         for (row, &expert) in needed.iter().enumerate() {
-            map[expert] = row as f32;
+            map[expert] = row as i32;
         }
         let mut writes = HashMap::new();
         writes.insert(
             point.site.map.clone(),
-            Value::from(HostTensor::f32(vec![point.site.experts], map)),
+            Value::from(HostTensor::i32(vec![point.site.experts], map)),
         );
         for weight in &point.site.weights {
             let (shape, data) = &self.tables[&weight.name];
@@ -755,8 +724,8 @@ fn eval_pooled(
             let ids = boundaries[&read.slot_key()]
                 .as_host()
                 .expect("dense")
-                .as_f32()
-                .expect("f32")
+                .as_i32()
+                .expect("i32")
                 .to_vec();
             resident_slots.extend(host.sync(point, &ids));
         }

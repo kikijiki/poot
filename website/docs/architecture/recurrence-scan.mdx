@@ -27,7 +27,9 @@ reassociating tolerance, every element of the output and of the state.
 ## The schedule
 
 The planner records a generated schedule: one streaming kernel with a workgroup per head and column block, each
-lane owning one state column in workgroup memory. The loop over the sequence is a runtime loop, so the kernel
+lane owning one state column in workgroup memory. For a long delta-rule sequence over too few heads to fill the
+device, the rows of a column are shared between several lanes that sum their partial dot products through workgroup
+memory each token; every other scan keeps one lane per column. The loop over the sequence is a runtime loop, so the kernel
 and the graph stay the same size at every prompt length. When a device reports a bound on the work of one
 dispatch, the sequence is split into launches that each stay within it, handing the state on through the result.
 A state column that does not fit the device's workgroup memory is refused at plan time.

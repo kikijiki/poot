@@ -432,6 +432,7 @@ fn driver_options(capacity: NonZeroUsize, chunk: usize) -> anyhow::Result<Driver
         },
         charge: poot_llm::driver::program_retention,
         draft: poot_llm::driver::DraftPolicy::Off,
+        hidden_window: None,
     })
 }
 

@@ -1,4 +1,4 @@
-//! Whole-graph storage representation analysis, including exact-I32 requirements.
+//! Whole-graph storage representation: every value's physical storage, read from one plan per equation.
 
 use poot_tensor::DType;
 use std::collections::{HashMap, HashSet};
@@ -8,292 +8,6 @@ use poot_target::Backend;
 
 use crate::dtype_widen::bf16_const_is_packed;
 use crate::*;
-use poot_graph_ir::ValueTable;
-
-#[derive(Debug)]
-pub(crate) struct ValueComponents {
-    pub(crate) parent: ValueTable<ValueId>,
-    pub(crate) rank: ValueTable<u8>,
-}
-
-impl ValueComponents {
-    pub(crate) fn new<T>(values: &ValueTable<T>) -> Self {
-        Self {
-            parent: values.ids().collect(),
-            rank: ValueTable::filled(values.len(), 0),
-        }
-    }
-
-    pub(crate) fn find(&mut self, mut value: ValueId) -> ValueId {
-        while self.parent[value] != value {
-            self.parent[value] = self.parent[self.parent[value]];
-            value = self.parent[value];
-        }
-        value
-    }
-
-    pub(crate) fn union(&mut self, left: ValueId, right: ValueId) {
-        let left = self.find(left);
-        let right = self.find(right);
-        if left != right {
-            let (root, child) = match self.rank[left].cmp(&self.rank[right]) {
-                std::cmp::Ordering::Less => (right, left),
-                std::cmp::Ordering::Greater => (left, right),
-                std::cmp::Ordering::Equal => {
-                    self.rank[left] += 1;
-                    (left, right)
-                }
-            };
-            self.parent[child] = root;
-        }
-    }
-}
-
-/// Reusable whole-graph representation selection for exact I32 components.
-///
-/// Binary, Reshape, Transpose, Slice, Broadcast, and Concat connect I32 values in both directions, and so do a
-/// ScatterUpdate (its base, source and result) and a carried state edge (the state input and its next value). A
-/// Binary-containing component is exact when it reaches the graph/state output or contains GeU, whose unsigned
-/// bit-pattern meaning has no legacy float interpretation. Construction is linear in graph values, equations,
-/// and operands. Borrowing the graph prevents mutation, while every public analyzed query also checks graph
-/// identity so unrelated graphs with overlapping value IDs cannot reuse the result silently.
-///
-/// Generic over the validation channel. Observation is seeded from [`Graph::liveness_roots`]. A validation
-/// value is F32, so it never joins an I32 component; the canonical helper is used so the root rule cannot
-/// drift from the other planner seams.
-#[derive(Debug)]
-pub struct ExactI32StorageAnalysis<'g, V: ValidationChannel = NoValidations> {
-    pub(crate) graph: &'g Graph<V>,
-    pub(crate) required: ValueTable<bool>,
-}
-
-/// The requirement table of one [`ExactI32StorageAnalysis`], without its graph type. The per-equation planner
-/// body reads only this table, so it is compiled once for every validation channel.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct ExactI32Requirements<'a>(&'a ValueTable<bool>);
-
-impl ExactI32Requirements<'_> {
-    pub(crate) fn required(self, id: ValueId) -> bool {
-        self.0.get(id).copied().unwrap_or(false)
-    }
-}
-
-impl<'g, V: ValidationChannel> ExactI32StorageAnalysis<'g, V> {
-    /// Analyze exact-I32 storage requirements for one immutable graph.
-    pub fn new(graph: &'g Graph<V>) -> Self {
-        let mut components = ValueComponents::new(&graph.values);
-        let is_i32 = |id: ValueId| {
-            graph
-                .values
-                .get(id)
-                .is_some_and(|value| value.aval.dtype == DType::I32)
-        };
-        // A Gather over I32 data moves the data's words, and an I32 table is an authoritative integer
-        // source (a hash table of expert ids), so data and output are exact whatever else touches them.
-        let mut pinned = Vec::new();
-        for eqn in &graph.eqns {
-            if let (OpKind::Gather { .. }, Some(Operand::Value(data))) =
-                (&eqn.op, eqn.inputs.first())
-                && is_i32(*data)
-                && is_i32(eqn.out)
-            {
-                components.union(eqn.out, *data);
-                pinned.push(eqn.out);
-                continue;
-            }
-            // A ScatterUpdate over I32 rows moves the base's and the source's words, the same way a
-            // Gather does: base, source and result share one lane. Its `inv` operand is an index, a
-            // value of its own.
-            if matches!(eqn.op, OpKind::ScatterUpdate) && is_i32(eqn.out) {
-                for input in eqn.inputs.iter().take(2) {
-                    if let Operand::Value(input) = input
-                        && is_i32(*input)
-                    {
-                        components.union(eqn.out, *input);
-                    }
-                }
-                continue;
-            }
-            if graph
-                .values
-                .get(eqn.out)
-                .is_none_or(|value| value.aval.dtype != DType::I32)
-                || !matches!(
-                    eqn.op,
-                    OpKind::Binary(_)
-                        | OpKind::Unary(_)
-                        | OpKind::Select
-                        | OpKind::Fused(_)
-                        | OpKind::Reshape { .. }
-                        | OpKind::Transpose { .. }
-                        | OpKind::Slice { .. }
-                        | OpKind::Broadcast { .. }
-                        | OpKind::Concat { .. }
-                )
-            {
-                continue;
-            }
-            for input in &eqn.inputs {
-                if let Operand::Value(input) = input
-                    && graph
-                        .values
-                        .get(*input)
-                        .is_some_and(|value| value.aval.dtype == DType::I32)
-                {
-                    components.union(eqn.out, *input);
-                }
-            }
-        }
-
-        // A carried state value is one buffer across steps: its input and its next value are read by
-        // later kernels on one lane, whichever equations produce and consume them.
-        for &(input, output) in &graph.state {
-            if is_i32(input) && is_i32(output) {
-                components.union(input, output);
-            }
-        }
-
-        let mut has_binary = ValueTable::filled(graph.values.len(), false);
-        let mut observed = ValueTable::filled(graph.values.len(), false);
-        for eqn in &graph.eqns {
-            let Some(op_observed) = exact_i32_pointwise_observation(&eqn.op) else {
-                continue;
-            };
-            let touched = std::iter::once(eqn.out)
-                .chain(eqn.inputs.iter().filter_map(|input| match input {
-                    Operand::Value(value) => Some(*value),
-                    Operand::Lit(_) => None,
-                }))
-                .filter(|&id| {
-                    graph
-                        .values
-                        .get(id)
-                        .is_some_and(|value| value.aval.dtype == DType::I32)
-                });
-            for id in touched {
-                let root = components.find(id);
-                has_binary[root] = true;
-                if op_observed {
-                    observed[root] = true;
-                }
-            }
-        }
-        for id in pinned {
-            let root = components.find(id);
-            has_binary[root] = true;
-            observed[root] = true;
-        }
-        for root in graph.liveness_roots() {
-            if graph.values.contains(root) {
-                let root = components.find(root);
-                observed[root] = true;
-            }
-        }
-
-        let mut required = ValueTable::filled(graph.values.len(), false);
-        for (id, value) in graph.values.iter_enumerated() {
-            let root = components.find(id);
-            required[id] = value.aval.dtype == DType::I32 && has_binary[root] && observed[root];
-        }
-        Self { graph, required }
-    }
-
-    /// Return the graph this analysis describes.
-    pub fn graph(&self) -> &'g Graph<V> {
-        self.graph
-    }
-
-    pub(crate) fn ensure_graph(&self, graph: &Graph<V>) -> Result<(), PlanError> {
-        if std::ptr::eq(self.graph, graph) {
-            Ok(())
-        } else {
-            Err(PlanError::AnalysisContextMismatch(
-                "analysis and supplied graph have different identities".into(),
-            ))
-        }
-    }
-
-    pub(crate) fn ensure_eqn(&self, eqn: &Eqn) -> Result<(), PlanError> {
-        let element_size = std::mem::size_of::<Eqn>();
-        let start = self.graph.eqns.as_ptr() as usize;
-        let byte_len = element_size
-            .checked_mul(self.graph.eqns.len())
-            .ok_or_else(|| {
-                PlanError::AnalysisContextMismatch(
-                    "analyzed graph equation storage length overflowed".into(),
-                )
-            })?;
-        let address = std::ptr::from_ref(eqn) as usize;
-        let Some(offset) = address.checked_sub(start) else {
-            return Err(PlanError::AnalysisContextMismatch(
-                "equation is not a member of the analyzed graph".into(),
-            ));
-        };
-        if element_size != 0 && offset < byte_len && offset.is_multiple_of(element_size) {
-            Ok(())
-        } else {
-            Err(PlanError::AnalysisContextMismatch(
-                "equation is not a member of the analyzed graph".into(),
-            ))
-        }
-    }
-
-    /// Test-only convenience: production planning reads [`Self::requirement_table`] directly (card
-    /// 546b: `graph_validation::validate_graph_exact_i32`, this method's last production caller, is
-    /// gone with the rest of the legacy tensor-only executor gate).
-    #[cfg(test)]
-    pub(crate) fn required(&self, id: ValueId) -> bool {
-        self.requirement_table().required(id)
-    }
-
-    pub(crate) fn requirement_table(&self) -> ExactI32Requirements<'_> {
-        ExactI32Requirements(&self.required)
-    }
-}
-
-pub(crate) fn exact_i32_pointwise_observation(op: &OpKind) -> Option<bool> {
-    match op {
-        OpKind::Binary(
-            GBinOp::GeU
-            | GBinOp::RemU
-            | GBinOp::And
-            | GBinOp::Or
-            | GBinOp::Xor
-            | GBinOp::Shl
-            | GBinOp::Shr,
-        ) => Some(true),
-        OpKind::Binary(_) => Some(false),
-        OpKind::Unary(GUnOp::Not | GUnOp::Clz) => Some(true),
-        OpKind::Select => Some(true),
-        OpKind::Fused(region) => {
-            let mut observed = false;
-            let mut pointwise = false;
-            for step in &region.steps {
-                match step.op {
-                    FusedOp::Binary(
-                        GBinOp::GeU
-                        | GBinOp::RemU
-                        | GBinOp::And
-                        | GBinOp::Or
-                        | GBinOp::Xor
-                        | GBinOp::Shl
-                        | GBinOp::Shr,
-                    )
-                    | FusedOp::Unary(GUnOp::Not | GUnOp::Clz)
-                    | FusedOp::Select => {
-                        pointwise = true;
-                        observed = true;
-                    }
-                    FusedOp::Binary(_) | FusedOp::Unary(_) | FusedOp::Cast { .. } => {
-                        pointwise = true
-                    }
-                }
-            }
-            pointwise.then_some(observed)
-        }
-        _ => None,
-    }
-}
 
 /// Card 526: every value's physical storage (dtype and packing) for one graph on one backend,
 /// computed once for the whole graph. Folds in the packed-vs-native distinction of a BF16 const each
@@ -306,22 +20,14 @@ pub(crate) fn exact_i32_pointwise_observation(op: &OpKind) -> Option<bool> {
 /// A value's declared dtype and storage `Const`/`Device`/`Slot`/`State` residency, both already on
 /// `poot_graph_ir::ValueMeta`, are not restated here.
 ///
-/// The I32-slot-vs-F32-mirror decision (card 621) is a real per-eqn planning question - whether a value's
-/// consuming kernel param is `Slice<i32>` - that only the planner can answer (a `Gather` index is
-/// `Slice<i32>` exactly when [`ExactI32StorageAnalysis`] proves the value's whole component is authoritative
-/// I32, `Slice<f32>` otherwise; card 545b: no const is `Slice<i32>` unconditionally any more -
-/// `MatMulDequant`, the only op that ever consumed one that way, is deleted). That is why this takes the plans.
+/// A value's storage is its declared dtype (POOT-725): an I32 value is stored as I32 words, so there is no
+/// per-consumer lane to choose. The plans are read for two checks the declared dtype cannot make alone: a BF16
+/// const's readers must have the lane the storage plan gave it, and no kernel may read an I32 value through
+/// a `Slice<f32>` param ([`PlanError::I32ReadAsF32`]).
 ///
 /// Every value's storage, read from one plan per equation (in `g.eqns` order; `None` for an equation that
 /// did not plan, which constrains no operand). A pure function of the graph and the plans:
 /// it plans nothing.
-///
-/// Refuses an I32 value whose readers disagree on its lane ([`PlanError::I32ReaderLaneConflict`]): the
-/// storage below gives each value one representation, so a disagreeing reader would read reinterpreted
-/// bits.
-///
-/// The plans may carry strided views ([`compute_views`]): a view only ever promotes an F32 movement output,
-/// so it never changes which I32 value a kernel reads through a `Slice<i32>` param.
 ///
 /// Also refuses a dense-contraction weight stored in a layout of its own (packed F16, Card 1007) that another
 /// reader shares ([`StorageGap::F16PackedLanes`]).
@@ -331,12 +37,11 @@ pub(crate) fn value_storage_of_plans<'p, V: ValidationChannel>(
     plans: impl Iterator<Item = Option<&'p Plan>>,
 ) -> Result<GraphStorage, PlanError> {
     let plans: Vec<Option<&Plan>> = plans.collect();
-    let lanes = I32ReadLanes::of_plans(g, plans.iter().copied());
-    lanes.check_agreement()?;
+    check_i32_reads(g, &plans)?;
     let mut weights = dense_contraction_weight_storages(g)?;
     weights.extend(e4m3_row_gather_table_storages(g)?);
     let views = compute_views(g, backend);
-    let storage = storage_of_read_lanes(g, backend, &views, &lanes, &weights);
+    let storage = storage_of_kinds(g, backend, &views, &weights);
     check_bf16_const_reads(g, backend, &storage, &plans)?;
     Ok(storage)
 }
@@ -347,11 +52,10 @@ pub(crate) fn value_storage_of_plans<'p, V: ValidationChannel>(
 /// wgpu, a packed-lane contraction sharing a native-lane weight) is refused by name, naming the equation,
 /// instead of reading the buffer at the wrong element width or failing later in codegen.
 ///
-/// The invariant this relies on: a plan's value operand `i` is its kernel's data param `i` (data params come
-/// first with or without a metadata buffer, which rides after them), and every dispatch of a
-/// split plan shares the first dispatch's param types. A reader whose params were not 1:1 with its value
-/// operands would be skipped here, so `bf16_const_reads_refuse_a_reader_without_the_lane` pins the refusal on a
-/// real reader.
+/// Each dispatch is read through its own binding: its data param `p` reads the value operand
+/// `binding.reads()[p]` names (data params come first with or without a metadata buffer, which rides after
+/// them). A read bound to scratch has no graph value and is skipped.
+/// `bf16_const_reads_refuse_a_reader_without_the_lane` pins the refusal on a real reader.
 fn check_bf16_const_reads<V: ValidationChannel>(
     g: &Graph<V>,
     backend: Backend,
@@ -365,18 +69,12 @@ fn check_bf16_const_reads<V: ValidationChannel>(
             roots.insert(eqn.out, root);
             continue;
         }
-        let Some(Dispatch { body, .. }) = plan.and_then(|plan| plan.dispatches().first()) else {
-            continue;
-        };
-        let params: Vec<_> = body.params().collect();
-        for (i, &vid) in value_ids(eqn).iter().enumerate() {
+        let operands = value_ids(eqn);
+        for (body, vid, param) in plan.iter().flat_map(|plan| operand_reads(plan, &operands)) {
             let root = roots.get(&vid).copied().unwrap_or(vid);
             if !g.meta(root).storage.holds_weight_bytes() || g.aval(root).dtype != DType::BF16 {
                 continue;
             }
-            let Some(&param) = params.get(i) else {
-                continue;
-            };
             let want = if storage.storage(root).buffer_storage()
                 == poot_target::BufferStorage::bf16_packed()
             {
@@ -397,11 +95,10 @@ fn check_bf16_const_reads<V: ValidationChannel>(
     Ok(())
 }
 
-fn storage_of_read_lanes<V: ValidationChannel>(
+fn storage_of_kinds<V: ValidationChannel>(
     g: &Graph<V>,
     backend: Backend,
     views: &HashMap<ValueId, Layout>,
-    lanes: &I32ReadLanes,
     weights: &HashMap<ValueId, StorageKind>,
 ) -> GraphStorage {
     let values = g
@@ -410,7 +107,7 @@ fn storage_of_read_lanes<V: ValidationChannel>(
         .map(|id| {
             ValueStorage::new(match weights.get(&id) {
                 Some(&kind) => kind,
-                None => value_storage_kind(g, views, id, backend, lanes),
+                None => value_storage_kind(g, views, id, backend),
             })
         })
         .collect();
@@ -509,103 +206,73 @@ fn e4m3_row_gather_table_storages<V: ValidationChannel>(
         .collect())
 }
 
-/// Card 621 (generalizing the pre-card-621 `i32_param_value_ids` duplicated in `poot-gpu`,
-/// `poot-rocm-gpu` and `poot-ptx-gpu`): which kernel param type each value is read through. `exact` holds
-/// the values some kernel consumes through a `Slice<i32>` param, i.e. that must be bound as exact i32 bytes
-/// rather than the f32 `Tensor` mirror; storage is decided from it per value.
+/// The consistency check on I32 reads (POOT-725, the structural fix of POOT-643's class): an I32 value's
+/// buffer holds I32 words, so a kernel that reads it through a `Slice<f32>` param would read reinterpreted
+/// bits. The planner never produces such a body; a plan that does is refused here, naming the buffer and
+/// the equation that reads it.
 ///
-/// The agreement check reads buffers, not values: a [`Plan::Alias`] or [`Plan::View`] output shares its
-/// source's buffer, so a read of it is a read of the source's bytes. `buffer_exact` and `buffer_mirror` key
-/// each read by its root buffer (the value an alias/view chain bottoms out at) and map it to the first such
-/// reader's output, to name it in an error; a `Slice<f32>` read counts as a mirror read when the root is
-/// declared I32. Without the walk, an exact-I32 value reshaped into the f32-only DynamicUpdateSlice index
-/// has two values, each read on one lane, and the conflict hides.
-///
-/// A value's consumer is well-defined (a `Slot::SlotMap` feeds only its
-/// `ScatterUpdate`/`DynamicUpdateSlice` as an f32 mirror; a `Gather` index or an I32->F32 `Cast` source
-/// is i32 only when [`ExactI32StorageAnalysis`] proves its whole component authoritative, e.g. a
-/// `Slot::Token` feeding embedding lookup alone never is - card 545b: a quant
-/// const's `MatMulDequant` consumer, once the third case here, is deleted), so one pass over the eqns
-/// suffices: each value's planned kernel body is inspected at most where it is actually consumed.
-#[derive(Debug, Default)]
-struct I32ReadLanes {
-    exact: HashSet<ValueId>,
-    buffer_exact: HashMap<ValueId, ValueId>,
-    buffer_mirror: HashMap<ValueId, ValueId>,
-}
-
-impl I32ReadLanes {
-    fn of_plans<'p, V: ValidationChannel>(
-        g: &Graph<V>,
-        plans: impl Iterator<Item = Option<&'p Plan>>,
-    ) -> Self {
-        let mut lanes = Self::default();
-        // Each alias/view output's root buffer. Equations are topological, so a source's root is known
-        // before any alias of it, and before any reader of that alias.
-        let mut roots: HashMap<ValueId, ValueId> = HashMap::new();
-        for (eqn, plan) in g.eqns.iter().zip(plans) {
-            if let Some(Plan::Alias(src) | Plan::View { src, .. }) = plan {
-                let root = roots.get(src).copied().unwrap_or(*src);
-                roots.insert(eqn.out, root);
-                continue;
-            }
-            // Data-input params come first, with or without a metadata buffer (it rides after them), so
-            // value_ids[i] maps to params[i] either way. A split plan is scanned via its first
-            // dispatch's body (every dispatch shares the same param types).
-            let Some(Dispatch { body, .. }) = plan.and_then(|plan| plan.dispatches().first())
-            else {
-                continue;
-            };
-            let params: Vec<_> = body.params().collect();
-            for (i, &vid) in value_ids(eqn).iter().enumerate() {
-                let Some(&param) = params.get(i) else {
-                    continue;
-                };
-                let root = roots.get(&vid).copied().unwrap_or(vid);
-                match slice_elem(body.local_ty(param)) {
-                    Some(poot_kernel_ir::Ty::I32) => {
-                        lanes.exact.insert(vid);
-                        lanes.buffer_exact.entry(root).or_insert(eqn.out);
-                    }
-                    Some(poot_kernel_ir::Ty::F32) if g.aval(root).dtype == DType::I32 => {
-                        lanes.buffer_mirror.entry(root).or_insert(eqn.out);
-                    }
-                    _ => {}
-                }
+/// The check reads buffers, not values: a [`Plan::Alias`] or [`Plan::View`] output shares its source's
+/// buffer, so a read of it is a read of the source's bytes. Each read is keyed by its root buffer (the value
+/// an alias/view chain bottoms out at). Data-input params come first, with or without a metadata buffer (it
+/// rides after them): each dispatch of a plan is scanned through its own binding.
+fn check_i32_reads<V: ValidationChannel>(
+    g: &Graph<V>,
+    plans: &[Option<&Plan>],
+) -> Result<(), PlanError> {
+    // Each alias/view output's root buffer. Equations are topological, so a source's root is known
+    // before any alias of it, and before any reader of that alias.
+    let mut roots: HashMap<ValueId, ValueId> = HashMap::new();
+    for (eqn, plan) in g.eqns.iter().zip(plans) {
+        if let Some(Plan::Alias(src) | Plan::View { src, .. }) = plan {
+            let root = roots.get(src).copied().unwrap_or(*src);
+            roots.insert(eqn.out, root);
+            continue;
+        }
+        let operands = value_ids(eqn);
+        for (body, vid, param) in plan.iter().flat_map(|plan| operand_reads(plan, &operands)) {
+            let root = roots.get(&vid).copied().unwrap_or(vid);
+            if g.aval(root).dtype == DType::I32
+                && matches!(
+                    slice_elem(body.local_ty(param)),
+                    Some(poot_kernel_ir::Ty::F32)
+                )
+            {
+                return Err(PlanError::I32ReadAsF32 {
+                    value: root,
+                    reader: eqn.out,
+                });
             }
         }
-        lanes
     }
+    Ok(())
+}
 
-    fn is_exact(&self, id: ValueId) -> bool {
-        self.exact.contains(&id)
-    }
-
-    /// Refuse the lowest-id buffer read on both lanes, if any.
-    fn check_agreement(&self) -> Result<(), PlanError> {
-        let conflict = self
-            .buffer_exact
+/// Every operand read of `plan`, per dispatch: the dispatch's body, the graph value its binding names (an
+/// entry of `operands`, the equation's value ids) and the kernel param that reads it. A read bound to
+/// scratch has no graph value and is not listed.
+fn operand_reads<'a>(
+    plan: &'a Plan,
+    operands: &'a [ValueId],
+) -> impl Iterator<Item = (&'a poot_kernel_ir::Body, ValueId, poot_kernel_ir::Local)> + 'a {
+    plan.dispatches().iter().flat_map(move |dispatch| {
+        let params: Vec<_> = dispatch.body().params().collect();
+        dispatch
+            .binding()
+            .reads()
             .iter()
-            .filter_map(|(&value, &i32_reader)| {
-                self.buffer_mirror
-                    .get(&value)
-                    .map(|&f32_reader| (value, i32_reader, f32_reader))
+            .enumerate()
+            .filter_map(move |(position, source)| match *source {
+                Source::Operand(operand) => Some((
+                    dispatch.body(),
+                    *operands.get(operand)?,
+                    *params.get(position)?,
+                )),
+                Source::Scratch(_) => None,
             })
-            .min();
-        match conflict {
-            None => Ok(()),
-            Some((value, i32_reader, f32_reader)) => Err(PlanError::I32ReaderLaneConflict {
-                value,
-                i32_reader,
-                f32_reader,
-            }),
-        }
-    }
+    })
 }
 
-/// A kernel param's slice element type (`Slice<T>` or `&[mut] Slice<T>`). A `Slice<i32>` buffer must be
-/// bound as exact i32 bytes rather than the f32 `Tensor` mirror. Generalizes the (now-deleted) copies in
-/// `poot-gpu`, `poot-rocm-gpu` and `poot-ptx-gpu`.
+/// A kernel param's slice element type (`Slice<T>` or `&[mut] Slice<T>`).
 fn slice_elem(ty: &poot_kernel_ir::Ty) -> Option<&poot_kernel_ir::Ty> {
     use poot_kernel_ir::Ty;
     let inner = match ty {
@@ -618,27 +285,16 @@ fn slice_elem(ty: &poot_kernel_ir::Ty) -> Option<&poot_kernel_ir::Ty> {
     }
 }
 
-/// [`fixture_value_storage`]'s per-value decision. A declared-I32 value no kernel reads through `Slice<i32>`
-/// ([`I32ReadLanes`]) is the F32-mirror lane (card 621: a `Slot::SlotMap` index, an
-/// embedding-lookup `Slot::Token`, or any other I32 value whose planned consumers read `Slice<f32>`). Every other
-/// value that is not a BF16 const keeps its declared dtype, densely stored. A BF16 const is never widened
-/// (Card 1011): it is BF16 on every backend, and [`bf16_const_is_packed`] decides whether the buffer is
-/// packed two-per-`u32` word or native two-byte bf16, the one answer the cast planner reads too.
+/// One value's storage kind. A value keeps its declared dtype, densely stored, except a BF16 const: it is never
+/// widened (Card 1011), it is BF16 on every backend, and [`bf16_const_is_packed`] decides whether the buffer
+/// is packed two-per-`u32` word or native two-byte bf16, the one answer the cast planner reads too.
 fn value_storage_kind<V: ValidationChannel>(
     g: &Graph<V>,
     views: &HashMap<ValueId, Layout>,
     id: ValueId,
     backend: Backend,
-    lanes: &I32ReadLanes,
 ) -> StorageKind {
     let declared = g.aval(id).dtype;
-    if declared == DType::I32 {
-        return if lanes.is_exact(id) {
-            StorageKind::Dense(DType::I32)
-        } else {
-            StorageKind::I32F32Mirror
-        };
-    }
     if !g.meta(id).storage.holds_weight_bytes() || declared != DType::BF16 {
         return StorageKind::Dense(declared);
     }
@@ -655,9 +311,9 @@ mod value_storage_tests {
     use poot_target::{AmdArch, Backend, DeviceCaps};
     use poot_tensor::DType;
 
-    use super::{ExactI32StorageAnalysis, GraphStorage, Plan};
+    use super::{GraphStorage, Plan};
     use crate::dtype_widen::prepare_target_graph;
-    use crate::planner::plan_eqn_analyzed;
+    use crate::planner::plan_eqn;
 
     /// The public `plan_value_storage` entry point was deleted (Card 626; its only callers were the
     /// pre-`compile` executors); `compile`'s live path is [`super::value_storage_of_plans`], which
@@ -674,13 +330,11 @@ mod value_storage_tests {
         backend: Backend,
         caps: &DeviceCaps,
     ) -> Result<GraphStorage, crate::PlanError> {
-        let exact_i32 = ExactI32StorageAnalysis::new(g);
         let plans: Vec<Option<Plan>> = g
             .eqns
             .iter()
             .map(|eqn| {
-                plan_eqn_analyzed(
-                    &exact_i32,
+                plan_eqn(
                     g,
                     eqn,
                     backend,
@@ -766,13 +420,11 @@ mod value_storage_tests {
         }
     }
 
-    /// Card 621 fixture, rebuilt for card 545b: an authoritative-I32 `Gather` index consumer (`idx`,
-    /// `ExactI32StorageAnalysis`-required via `Binary(GeU)`, feeding `Gather` as raw I32), a
-    /// `Slot::SlotMap` I32 consumer (feeding `ScatterUpdate`'s `inv` operand as an F32 mirror), and a
-    /// `Slot::Token`-shaped I32 consumer feeding a plain embedding `Gather` (also an F32 mirror: it is
-    /// not part of any exact-I32 component, the real-regression shape `poot-gpu`'s
-    /// `qwen2_decode_gpu_resident_matches_cpu` exercises) - all in the same graph. Returns `(graph,
-    /// gather_index_value_id, slotmap_value_id, token_value_id)`.
+    /// One graph holding every shape of I32 consumer that used to choose a lane: a computed `Gather` index
+    /// (`Binary(GeU)`), a `Slot::SlotMap` index feeding `ScatterUpdate`'s `inv` operand, and a
+    /// `Slot::Token` feeding a plain embedding `Gather` (the shape `poot-gpu`'s
+    /// `qwen2_decode_gpu_resident_matches_cpu` exercises). Returns `(graph, gather_index_value_id,
+    /// slotmap_value_id, token_value_id)`.
     fn gather_index_slotmap_and_token_graph() -> (
         Graph,
         poot_graph_ir::ValueId,
@@ -783,12 +435,6 @@ mod value_storage_tests {
         use poot_graph_ir::op::BinOp;
         let b = Builder::new();
 
-        // Card 545b: `MatMulDequant`'s packed-quant I32 const (the original raw-I32-lane producer here) is
-        // deleted; the surviving I32-lane consumer this pure-planner test can use is a `Gather` index
-        // `ExactI32StorageAnalysis` proves authoritative (`ExactI32StorageAnalysis::new`):
-        // `Binary(GeU, idx_a, idx_b)`'s unsigned bit-pattern comparison has no legacy float
-        // interpretation, so its whole component - `idx_a`, `idx_b` and the `GeU` output feeding
-        // `Gather`'s index - is "required", unconditionally, unlike the isolated Token/SlotMap cases below.
         let (rows, cols) = (8usize, 3usize);
         let idx_a = b.constant("idx_a", TensorType::new(vec![2], DType::I32));
         let idx_b = b.constant("idx_b", TensorType::new(vec![2], DType::I32));
@@ -819,19 +465,14 @@ mod value_storage_tests {
         (b.finish(out), gather_index_id, slot_id, token_id)
     }
 
-    /// Card 621 SC-001, rebuilt for card 545b: `fixture_value_storage` keeps an authoritative-I32 `Gather`
-    /// index consumer on the raw I32 lane (`Dense(I32)`) but puts a `Slot::SlotMap` I32 consumer of
-    /// `ScatterUpdate`'s `inv` operand, and a `Slot::Token` I32 consumer of a plain embedding `Gather`,
-    /// on the F32-mirror lane - in the same graph, on every backend. The claim (storage analysis flags
-    /// exactly the i32-consumed values, not by construction) survives `MatMulDequant`'s deletion because
-    /// `ExactI32StorageAnalysis`'s component rule is a general property of I32-typed pointwise/movement
-    /// chains, not specific to the packed-quant carrier that originally demonstrated it.
+    /// POOT-725: every declared-I32 value is stored as dense I32 words, whatever reads it: a computed `Gather`
+    /// index, a `Slot::SlotMap` feeding `ScatterUpdate`'s `inv`, and a `Slot::Token` feeding an embedding
+    /// `Gather`, in the same graph, on every backend. There is no F32 mirror to choose.
     ///
-    /// Mutation (card 621 review; never left in the tree): swapping `I32ReadLanes::of_plans`'s
-    /// `exact` insert for one that also inserts the SlotMap/Token ids turns this test red, naming
-    /// the mismatched value in the assertion message below.
+    /// Mutation: make `value_storage_kind` return `StorageKind::Dense(DType::F32)` for every I32 value; each
+    /// row goes red naming the value.
     #[test]
-    fn fixture_value_storage_distinguishes_i32_lanes() {
+    fn fixture_value_storage_keeps_every_i32_value_dense_i32() {
         let (g, gather_index_id, slot_id, token_id) = gather_index_slotmap_and_token_graph();
         for backend in [
             Backend::SpirvVulkan,
@@ -840,24 +481,121 @@ mod value_storage_tests {
         ] {
             let caps = poot_test_util::device_caps::default_caps_for(backend);
             let storage = fixture_value_storage(&g, backend, &caps);
-            let gather_index_storage = storage.storage(gather_index_id);
-            assert_eq!(gather_index_storage.dtype(), DType::I32);
-            assert!(
-                !gather_index_storage.is_f32_mirror(),
-                "{backend:?}: authoritative Gather index {gather_index_id} must stay on the raw I32 lane, not the F32 mirror"
-            );
-            let slot_storage = storage.storage(slot_id);
-            assert_eq!(slot_storage.dtype(), DType::I32);
-            assert!(
-                slot_storage.is_f32_mirror(),
-                "{backend:?}: SlotMap {slot_id} feeding ScatterUpdate's inv operand must be the F32 mirror, not raw I32"
-            );
-            let token_storage = storage.storage(token_id);
-            assert_eq!(token_storage.dtype(), DType::I32);
-            assert!(
-                token_storage.is_f32_mirror(),
-                "{backend:?}: Token {token_id} feeding a plain embedding Gather must be the F32 mirror, not raw I32"
-            );
+            for (what, id) in [
+                ("a computed Gather index", gather_index_id),
+                ("a SlotMap feeding ScatterUpdate's inv", slot_id),
+                ("a Token feeding an embedding Gather", token_id),
+            ] {
+                assert_eq!(
+                    storage.storage(id).buffer_storage(),
+                    poot_target::BufferStorage::i32(),
+                    "{backend:?}: {what} ({id}) must be dense I32 words"
+                );
+            }
+        }
+    }
+
+    /// POOT-725 SC-004 (the consistency check, POOT-643's class): a plan that binds an I32 value to a
+    /// `Slice<f32>` param is a typed [`crate::PlanError::I32ReadAsF32`] naming the buffer and the reading
+    /// equation, through the production storage entry `value_storage_of_plans` that `compile` calls.
+    ///
+    /// The plan is hand-built from the planner's own body for the F32 twin of the equation: `y = x + 1` over an
+    /// F32 `x` plans a `Slice<f32>` body, which is then offered as the plan of `y = x + 1` over an I32 `x`.
+    /// The honest I32 plan of the same equation (the planner's own) is accepted.
+    ///
+    /// Mutation: delete the `check_i32_reads` call in `value_storage_of_plans`; the F32 body is accepted and
+    /// this row goes red.
+    #[test]
+    fn an_i32_value_read_through_a_slice_f32_param_is_a_typed_plan_error() {
+        use poot_graph_ir::Scalar;
+        use poot_graph_ir::op::BinOp;
+
+        let build = |dtype: DType| {
+            let b = Builder::new();
+            let x = b.constant("x", TensorType::new(vec![4], dtype));
+            let scalar = match dtype {
+                DType::I32 => Scalar::I32(1),
+                _ => Scalar::F32(1.0),
+            };
+            let y = b.binary_scalar(BinOp::Add, x, scalar);
+            (b.finish(y), x.id(), y.id())
+        };
+        let (f32_graph, ..) = build(DType::F32);
+        let (i32_graph, x, y) = build(DType::I32);
+        let backend = Backend::SpirvVulkan;
+        let caps = poot_test_util::device_caps::default_caps_for(backend);
+        let limits = poot_test_util::graph_fixtures::roomy_body_limits();
+        let plan_of = |g: &Graph| plan_eqn(g, &g.eqns[0], backend, &caps, &limits).unwrap();
+
+        let honest = plan_of(&i32_graph);
+        super::value_storage_of_plans(&i32_graph, backend, [Some(&honest)].into_iter())
+            .expect("the planner's own I32 body reads Slice<i32>");
+
+        let forged = plan_of(&f32_graph);
+        match super::value_storage_of_plans(&i32_graph, backend, [Some(&forged)].into_iter()) {
+            Err(crate::PlanError::I32ReadAsF32 { value, reader }) => {
+                assert_eq!((value, reader), (x, y));
+            }
+            other => panic!("expected I32ReadAsF32 naming {x} read by {y}, got {other:?}"),
+        }
+    }
+
+    /// POOT-1115 SC-002: the storage checks read a dispatch's params through its binding, not by position.
+    /// The planner's own plan for `gather(table: f32, index: i32)` is rebuilt with its two reads swapped:
+    /// the kernel's first param, a `Slice<f32>`, now reads the I32 index. The honest binding is accepted.
+    ///
+    /// Mutation: in `operand_reads`, pair param `p` with operand `p` instead of the operand
+    /// `binding.reads()[p]` names; the swapped plan is accepted and this row goes red.
+    #[test]
+    fn storage_checks_read_params_through_the_binding() {
+        use crate::{Binding, Dispatch};
+
+        let b = Builder::new();
+        let table = b.constant("table", TensorType::new(vec![8, 3], DType::F32));
+        let index = b.constant("index", TensorType::new(vec![2], DType::I32));
+        let gathered = b.gather(table, 0, index);
+        let (g, index, gathered) = (b.finish(gathered), index.id(), gathered.id());
+        let backend = Backend::SpirvVulkan;
+        let caps = poot_test_util::device_caps::default_caps_for(backend);
+        let limits = poot_test_util::graph_fixtures::roomy_body_limits();
+        let gather = g
+            .eqns
+            .iter()
+            .find(|eqn| matches!(eqn.op, OpKind::Gather { .. }))
+            .expect("the gather");
+        let honest = plan_eqn(&g, gather, backend, &caps, &limits).unwrap();
+        super::value_storage_of_plans(&g, backend, [Some(&honest)].into_iter())
+            .expect("the planner's own binding reads the index through a Slice<i32>");
+
+        let Plan::Dispatches(plan) = plan_eqn(&g, gather, backend, &caps, &limits).unwrap() else {
+            panic!("a gather dispatches");
+        };
+        let swapped: Vec<_> = plan
+            .into_dispatches()
+            .into_iter()
+            .map(|dispatch| {
+                let mut reads = dispatch.binding().reads().to_vec();
+                reads.swap(0, 1);
+                let binding = Binding::new(reads, dispatch.binding().write());
+                let choice = dispatch.choice().clone();
+                let Dispatch {
+                    body,
+                    key,
+                    label,
+                    launch,
+                    ..
+                } = dispatch;
+                Dispatch::new(body, key, label, launch, binding, choice)
+            })
+            .collect();
+        let swapped = Plan::Dispatches(crate::DispatchPlan::new(swapped, 0).unwrap());
+        match super::value_storage_of_plans(&g, backend, [Some(&swapped)].into_iter()) {
+            Err(crate::PlanError::I32ReadAsF32 { value, reader }) => {
+                assert_eq!((value, reader), (index, gathered));
+            }
+            other => {
+                panic!("expected I32ReadAsF32 naming {index} read by {gathered}, got {other:?}")
+            }
         }
     }
 

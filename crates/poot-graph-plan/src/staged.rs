@@ -146,7 +146,7 @@ pub struct Link {
 }
 
 /// One boundary value crossing devices: the producer's export and the consumer's import, joined by one
-/// communication row (held for POOT-748, which executes the rows). Unlike a [`Link`], the consumer does not bind the producer's buffer: the row
+/// communication row, which the captured coordinator executes. Unlike a [`Link`], the consumer does not bind the producer's buffer: the row
 /// moves `bytes` of the exported value's planned storage into the consumer device's own buffer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Transfer {
@@ -239,19 +239,19 @@ impl<V: ValidationChannel> StagedProgram<V> {
         &self.links
     }
 
-    /// Every boundary value that crosses devices, in producing order (held for POOT-748). Together with [`Self::links`] it
+    /// Every boundary value that crosses devices, in producing order; the coordinator builds one hop per transfer. Together with [`Self::links`] it
     /// binds every stage's boundary input exactly once.
     pub fn transfers(&self) -> &[Transfer] {
         &self.transfers
     }
 
-    /// The communication rows carrying [`Self::transfers`]; empty on one device (held for POOT-748).
+    /// The communication rows carrying [`Self::transfers`]; empty on one device; the coordinator admits and schedules these rows.
     pub fn comm(&self) -> &CommunicationPlan {
         &self.comm
     }
 
     /// What each device holds, by category, when the stages sit on distinct devices; empty on one
-    /// device. The footprint admission checked against each device's budget (held for POOT-748).
+    /// device. The footprint admission checked against each device's budget at plan time; the plan tests read it back.
     pub fn footprints(&self) -> &[(DeviceId, ByteCategories)] {
         &self.footprints
     }

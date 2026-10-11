@@ -41,7 +41,7 @@ impl FakeLoader {
             self.loaded.extend(
                 plan.dispatches()
                     .iter()
-                    .map(|dispatch| dispatch.key.clone()),
+                    .map(|dispatch| dispatch.key().to_string()),
             );
         }
     }
@@ -80,7 +80,7 @@ fn dispatched(program: &Program) -> Vec<(&Body, [u32; 3])> {
     program
         .planned()
         .filter_map(|(_, plan)| plan.single())
-        .map(|dispatch| (&dispatch.body, dispatch.launch.grid))
+        .map(|dispatch| (dispatch.body(), dispatch.launch().grid))
         .collect()
 }
 
@@ -518,8 +518,8 @@ fn a_finalizer_workgroup_bump_is_reflected_in_the_plan_key() {
     let plain_program = compile(&add_graph(n), &plain, &options()).unwrap();
     let tight_program = compile(&add_graph(n), &tight, &options()).unwrap();
     let key_and_wg = |program: &Program| match the_plan(program).single() {
-        Some(dispatch) if dispatch.launch.meta.is_empty() => {
-            (dispatch.key.clone(), dispatch.body.workgroup_size)
+        Some(dispatch) if dispatch.launch().meta.is_empty() => {
+            (dispatch.key().to_string(), dispatch.body().workgroup_size)
         }
         _ => panic!("expected one plain dispatch, got {:?}", the_plan(program)),
     };

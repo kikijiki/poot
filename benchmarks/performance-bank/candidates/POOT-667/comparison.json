@@ -1,0 +1,203 @@
+{
+  "card": "POOT-667",
+  "candidate": "scan row split (row_split schedule + planner gate)",
+  "policy": {
+    "direction": "lower",
+    "practical_threshold": 0.2,
+    "max_uncertainty": 0.1
+  },
+  "entries": [
+    {
+      "backend": "wgpu",
+      "case": "long-recurrence-scan",
+      "verdict": "improvement",
+      "baseline_median_us": 12771.503999999999,
+      "candidate_median_us": 5605.332,
+      "note": "",
+      "reference_agrees": true
+    },
+    {
+      "backend": "wgpu",
+      "case": "recurrence-scan-many-heads",
+      "verdict": "unverified",
+      "baseline_median_us": 6009.016,
+      "candidate_median_us": 7936.0,
+      "note": "band 92.9% exceeds the tolerated uncertainty 10.0%; more repeats may narrow it",
+      "reference_agrees": true
+    },
+    {
+      "backend": "wgpu",
+      "case": "recurrence-scan-narrow-state",
+      "verdict": "improvement",
+      "baseline_median_us": 626.794,
+      "candidate_median_us": 479.15799999999996,
+      "note": "",
+      "reference_agrees": true
+    },
+    {
+      "backend": "wgpu",
+      "case": "recurrence-scan-short",
+      "verdict": "unverified",
+      "baseline_median_us": 325.48,
+      "candidate_median_us": 303.789,
+      "note": "band 41.2% exceeds the tolerated uncertainty 10.0%; more repeats may narrow it",
+      "reference_agrees": true
+    },
+    {
+      "backend": "rocm",
+      "case": "long-recurrence-scan",
+      "verdict": "improvement",
+      "baseline_median_us": 19430.920000000002,
+      "candidate_median_us": 6792.878,
+      "note": "",
+      "reference_agrees": true
+    },
+    {
+      "backend": "rocm",
+      "case": "recurrence-scan-many-heads",
+      "verdict": "unverified",
+      "baseline_median_us": 6457.7480000000005,
+      "candidate_median_us": 6086.073,
+      "note": "band 29.0% exceeds the tolerated uncertainty 10.0%; more repeats may narrow it",
+      "reference_agrees": true
+    },
+    {
+      "backend": "rocm",
+      "case": "recurrence-scan-narrow-state",
+      "verdict": "improvement",
+      "baseline_median_us": 1154.092,
+      "candidate_median_us": 481.733,
+      "note": "",
+      "reference_agrees": true
+    },
+    {
+      "backend": "rocm",
+      "case": "recurrence-scan-short",
+      "verdict": "unverified",
+      "baseline_median_us": 1658.277,
+      "candidate_median_us": 2635.438,
+      "note": "band 144.7% exceeds the tolerated uncertainty 10.0%; more repeats may narrow it",
+      "reference_agrees": true
+    },
+    {
+      "backend": "ptx",
+      "case": "long-recurrence-scan",
+      "round": 1,
+      "verdict": "improvement",
+      "baseline_median_us": 50284.971999999994,
+      "candidate_median_us": 12013.601,
+      "note": "",
+      "reference_agrees": true
+    },
+    {
+      "backend": "ptx",
+      "case": "long-recurrence-scan",
+      "round": 2,
+      "verdict": "improvement",
+      "baseline_median_us": 50891.24,
+      "candidate_median_us": 12031.886,
+      "note": "",
+      "reference_agrees": true
+    },
+    {
+      "backend": "ptx",
+      "case": "long-recurrence-scan",
+      "round": 3,
+      "verdict": "improvement",
+      "baseline_median_us": 51062.564999999995,
+      "candidate_median_us": 11732.309,
+      "note": "",
+      "reference_agrees": true
+    },
+    {
+      "backend": "ptx",
+      "case": "recurrence-scan-many-heads",
+      "round": 1,
+      "verdict": "unverified",
+      "baseline_median_us": 11754.511,
+      "candidate_median_us": 12259.618,
+      "note": "band 16.4% exceeds the tolerated uncertainty 10.0%; more repeats may narrow it",
+      "reference_agrees": true
+    },
+    {
+      "backend": "ptx",
+      "case": "recurrence-scan-many-heads",
+      "round": 2,
+      "verdict": "unverified",
+      "baseline_median_us": 11172.529,
+      "candidate_median_us": 12549.236,
+      "note": "band 25.9% exceeds the tolerated uncertainty 10.0%; more repeats may narrow it",
+      "reference_agrees": true
+    },
+    {
+      "backend": "ptx",
+      "case": "recurrence-scan-many-heads",
+      "round": 3,
+      "verdict": "within noise",
+      "baseline_median_us": 10893.892,
+      "candidate_median_us": 11141.841,
+      "note": "",
+      "reference_agrees": true
+    },
+    {
+      "backend": "ptx",
+      "case": "recurrence-scan-narrow-state",
+      "round": 1,
+      "verdict": "improvement",
+      "baseline_median_us": 1124.75,
+      "candidate_median_us": 687.151,
+      "note": "",
+      "reference_agrees": true
+    },
+    {
+      "backend": "ptx",
+      "case": "recurrence-scan-narrow-state",
+      "round": 2,
+      "verdict": "improvement",
+      "baseline_median_us": 1122.145,
+      "candidate_median_us": 686.29,
+      "note": "",
+      "reference_agrees": true
+    },
+    {
+      "backend": "ptx",
+      "case": "recurrence-scan-narrow-state",
+      "round": 3,
+      "verdict": "improvement",
+      "baseline_median_us": 1127.2050000000002,
+      "candidate_median_us": 677.012,
+      "note": "",
+      "reference_agrees": true
+    },
+    {
+      "backend": "ptx",
+      "case": "recurrence-scan-short",
+      "round": 1,
+      "verdict": "within noise",
+      "baseline_median_us": 530.515,
+      "candidate_median_us": 533.4200000000001,
+      "note": "",
+      "reference_agrees": true
+    },
+    {
+      "backend": "ptx",
+      "case": "recurrence-scan-short",
+      "round": 2,
+      "verdict": "within noise",
+      "baseline_median_us": 532.678,
+      "candidate_median_us": 531.867,
+      "note": "",
+      "reference_agrees": true
+    },
+    {
+      "backend": "ptx",
+      "case": "recurrence-scan-short",
+      "round": 3,
+      "verdict": "within noise",
+      "baseline_median_us": 530.284,
+      "candidate_median_us": 531.055,
+      "note": "",
+      "reference_agrees": true
+    }
+  ]
+}

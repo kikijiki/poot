@@ -109,7 +109,7 @@ The matchers recognize bounded patterns.
 
 ## Kernel specialization (planning)
 
-`plan_eqn_analyzed` (in `poot-graph-plan`) assigns each eqn of the optimized graph a `Plan`: a compute
+`plan_eqn` (in `poot-graph-plan`) assigns each eqn of the optimized graph a `Plan`: a compute
 body, a compute body plus a `u32` metadata buffer, chunked dispatches, a
 buffer alias or strided view, or a cross-rank collective. `compile` runs this planning as its last
 step. The same `OpKind` can map to different bodies depending on shape and dtype. Kernel choice

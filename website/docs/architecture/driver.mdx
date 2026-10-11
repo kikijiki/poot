@@ -36,10 +36,13 @@ pub trait Model: Send + Sync {
 
 - `trace` builds the graph of one step. A `StepShape` is the semantic shape of that step: `rows`
   sequences of `tokens` new tokens each over a cache of `capacity` positions, a KV layout (contiguous, or
-  paged over a pool of slots) and whether logits come back for the last token or all of them.
+  paged over a pool of slots), whether logits come back for the last token or all of them and, when
+  asked, a hidden-state carry.
 - A `Phase` is `Prefill`, `Decode`, `PrefillEmbeds` (a prefill whose prompt carries caller-computed
-  embedding rows, for example image rows) or `Encode` (the whole input in one step, returning hidden states
-  or scores, for an embedding model, a reranker or a vision tower). Prefill and decode are one body: token
+  embedding rows, for example image rows), `Encode` (the whole input in one step, returning hidden states
+  or scores, for an embedding model, a reranker or a vision tower) or `Mtp` (a multi-token-prediction layer
+  run over the hidden-state carry and the host tokens that follow it; only GLM-5.3-Flash traces it and every
+  other family refuses it with a typed error). Prefill and decode are one body: token
   and position inputs are typed slots and positions are absolute, so a prefill is a step that continues from
   a position.
 - A shape or phase a family cannot trace is a typed `TraceError`, never a panic. A routed model's graph also

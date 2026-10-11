@@ -15,7 +15,7 @@ use poot_kernel_ir::{
 };
 
 use crate::imported::ImportedKernel;
-use crate::{ExactI32StorageAnalysis, GEMV_TILE, GEMV_WIDTH};
+use crate::{GEMV_TILE, GEMV_WIDTH};
 
 #[derive(Clone, Copy, Debug)]
 enum Val {
@@ -540,8 +540,7 @@ fn gemv_coalesced_grid_matches_dispatch_formula() {
         let y = bld.matmul(x, w);
         let g = bld.finish(y);
         let eqn = &g.eqns[0];
-        let plan = crate::plan_eqn_analyzed(
-            &ExactI32StorageAnalysis::new(&g),
+        let plan = crate::plan_eqn(
             &g,
             eqn,
             poot_target::Backend::SpirvVulkan,
@@ -550,7 +549,7 @@ fn gemv_coalesced_grid_matches_dispatch_formula() {
         )
         .unwrap();
         let grid = match plan.single() {
-            Some(dispatch) => dispatch.launch.grid,
+            Some(dispatch) => dispatch.launch().grid,
             None => panic!("decode GEMV must plan as one dispatch, got {plan:?}"),
         };
         let (gx, gy) = tiled_grid(n);
@@ -589,8 +588,7 @@ fn gemv_coalesced_grid_matches_dispatch_formula() {
         watchdog_budget: None,
         ..poot_test_util::device_caps::default_caps_for(spirv)
     };
-    let plan = crate::plan_eqn_analyzed(
-        &ExactI32StorageAnalysis::new(&g),
+    let plan = crate::plan_eqn(
         &g,
         eqn,
         spirv,
@@ -599,7 +597,7 @@ fn gemv_coalesced_grid_matches_dispatch_formula() {
     )
     .unwrap();
     let grid = match plan.single() {
-        Some(dispatch) if dispatch.launch.meta.is_empty() => dispatch.launch.grid,
+        Some(dispatch) if dispatch.launch().meta.is_empty() => dispatch.launch().grid,
         _ => panic!(
             "Y-spill decode GEMV with no watchdog budget must plan as one plain dispatch, got {plan:?}"
         ),

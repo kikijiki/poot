@@ -1,0 +1,170 @@
+{
+  "backend": "wgpu",
+  "case": "recurrence-scan-many-heads",
+  "cells": {
+    "kernel": {
+      "repeats": [
+        {
+          "metrics": {
+            "step_us": 7936.0
+          },
+          "slot": 0,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 7795.5960000000005
+          },
+          "slot": 1,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 9329.189999999999
+          },
+          "slot": 2,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 8350.547
+          },
+          "slot": 3,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 8031.579000000001
+          },
+          "slot": 4,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 7511.705
+          },
+          "slot": 5,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 7545.278
+          },
+          "slot": 6,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 9172.647
+          },
+          "slot": 7,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 7478.423
+          },
+          "slot": 8,
+          "status": "ok"
+        }
+      ]
+    }
+  },
+  "memory": [
+    {
+      "live_bytes": 29491200,
+      "peak_bytes": 29491200,
+      "role": "Weight"
+    },
+    {
+      "live_bytes": 12582912,
+      "peak_bytes": 12582912,
+      "role": "Activation"
+    },
+    {
+      "live_bytes": 32,
+      "peak_bytes": 12582944,
+      "role": "Staging"
+    }
+  ],
+  "observed": {
+    "layout": "bhsd",
+    "shape": {
+      "d": 128,
+      "heads": 64,
+      "steps": 256
+    },
+    "storage": "f32",
+    "weight_bytes_per_copy": 29491200,
+    "weight_copies": 1
+  },
+  "plan": [
+    "scan [a6f5ce7dce57d37374f6e5102a3c9407efcd5b34c42e60bc492b6d67b739cf24]"
+  ],
+  "plan_id": "e6efe83dc6110c7270cdb7715cf07e7f20c810f54c713d3385cdb7a7d2704339",
+  "recordings": 1,
+  "reference": {
+    "agrees": true,
+    "max_relative_error": 8.71575622033482e-08,
+    "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
+    "provenance": "independent-golden",
+    "tolerance": 0.002
+  },
+  "replays": 13,
+  "role": "baseline",
+  "schema": 1,
+  "command": [
+    "cargo",
+    "run",
+    "--release",
+    "-p",
+    "poot-gpu",
+    "--example",
+    "performance_bank",
+    "--",
+    "--bank",
+    "benchmarks/performance-bank/cases.json",
+    "--case",
+    "recurrence-scan-many-heads",
+    "--out",
+    "benchmarks/performance-bank/receipts/wgpu/recurrence-scan-many-heads.json"
+  ],
+  "parent_revision": "88f20d0bcd98025ef3ba1a513c751afab816254a",
+  "binary_sha256": "1a099b137867355838e0810568bb63fdae2ea1a0b71189802530410e9f40a7f4",
+  "identity": {
+    "checkpoint_digest": "synthetic-no-checkpoint",
+    "token_fixture": "splitmix64-seed0-unit:237900849bc67b83",
+    "precision": "f32",
+    "layout": "bhsd",
+    "dimensions": {
+      "heads": 64,
+      "d": 128,
+      "steps": 256
+    },
+    "prompt_tokens": 1,
+    "live_context": "n/a",
+    "max_context": "n/a",
+    "requested_output": "n/a",
+    "actual_output": "n/a",
+    "sampler": "n/a",
+    "template": "n/a",
+    "cache_state": {
+      "condition": "weights-resident-hot",
+      "id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb"
+    },
+    "prepared_set": [
+      "recurrence-scan-many-heads"
+    ],
+    "timing_policy": {
+      "warmup": 3,
+      "repeats": 9,
+      "clock": "wall step plus readback",
+      "profiled": false
+    },
+    "backend": "wgpu",
+    "device": "AMD Radeon 8060S Graphics",
+    "driver": "host kernel 7.2.9"
+  },
+  "identity_digest": "62555c1b559f74007f398d2abc5a62a313f761da8f210924dae1dd2ec27846b4",
+  "schedule_id": "0025f9f93a3783297d48f02335370f21db17d7e285fc7929024e391dd5d514cb"
+}

@@ -24,6 +24,7 @@ poot-graph-ir.workspace = true
 poot-kernel-ir = { workspace = true, features = ["serde"] }
 poot-kernelgen.workspace = true
 poot-quant.workspace = true
+poot-runtime-common.workspace = true
 poot-target.workspace = true
 poot-tensor.workspace = true
 thiserror.workspace = true

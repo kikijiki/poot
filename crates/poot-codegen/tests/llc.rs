@@ -268,7 +268,6 @@ fn e4m3fn_software_conversion_lowers_on_all_gpu_targets() {
                 MovementOp::Gather {
                     in_shape: vec![2, 3, 5],
                     axis: 1,
-                    index_dtype: Ty::F32,
                     index_numel: 2,
                 },
             ),
@@ -293,7 +292,7 @@ fn e4m3fn_software_conversion_lowers_on_all_gpu_targets() {
                 MovementOp::UpdateSlice {
                     update_shape: vec![2, 2],
                     axis: 1,
-                    index: UpdateIndex::Runtime { dtype: Ty::F32 },
+                    index: UpdateIndex::Runtime,
                 },
             ),
             "e4m3fn_dynamic_update_runtime",
@@ -314,7 +313,6 @@ fn e4m3fn_software_conversion_lowers_on_all_gpu_targets() {
                 vec![4, 2, 5],
                 MovementOp::ScatterRows {
                     src_shape: vec![3, 2, 5],
-                    inverse_dtype: Ty::F32,
                     window: None,
                 },
             ),
@@ -326,7 +324,6 @@ fn e4m3fn_software_conversion_lowers_on_all_gpu_targets() {
                 vec![5],
                 MovementOp::ScatterRows {
                     src_shape: vec![3],
-                    inverse_dtype: Ty::F32,
                     window: None,
                 },
             ),
@@ -411,17 +408,6 @@ fn concurrent_same_body_compiles_do_not_corrupt_the_shared_artifact() {
     );
 }
 
-/// Resolve a runnable Peano `llc` (`$POOT_AIE_LLC`, an FHS wrapper on NixOS) that knows `aie2p`, or `None`
-/// to skip. Peano is a separate llc fork from system LLVM.
-fn peano_llc() -> Option<String> {
-    let p = std::env::var("POOT_AIE_LLC").ok()?;
-    let v = Command::new(&p).arg("--version").output().ok()?;
-    if !String::from_utf8_lossy(&v.stdout).contains("aie2p") {
-        return None;
-    }
-    Some(p)
-}
-
 /// Lower a body to an AIE2p object via Peano and assert it is an ELF carrying the kernel `symbol`. Peano
 /// runs under an FHS sandbox (steam-run) that binds $HOME but not the nix-shell TMPDIR, so the .ll input and
 /// .o output must live under $HOME.
@@ -445,15 +431,14 @@ fn assert_lowers_to_aie2p(body: &poot_kernel_ir::Body, symbol: &str) {
 /// Card 089 / spec 057 (FR-002): poot's LLVM IR for a scalar kernel lowers to an AIE2p core object through
 /// Peano (`llc --march=aie2p`). This is the codegen half only; dispatch on the NPU needs XRT + the IRON
 /// harness (a separate on-hardware test). `vadd_loop` is the elementwise case; `gemv_loop` covers the
-/// nested-loop + f32-accumulator shape of decode matvec. Skips when Peano is absent.
+/// nested-loop + f32-accumulator shape of decode matvec.
+///
+/// Ignored, not skipped (POOT-1120): without `POOT_AIE_LLC` it reports as ignored and the row stays
+/// unverified; run by exact name under `nix develop .#npu` with `--run-ignored ignored-only`. With the
+/// variable unset the compile is the typed missing-toolchain error, so a run never passes vacuously.
 #[test]
+#[ignore = "needs the pinned Peano llc (POOT_AIE_LLC, `nix develop .#npu`); unverified without it"]
 fn aie_kernels_lower_to_aie2p_via_peano() {
-    if peano_llc().is_none() {
-        eprintln!(
-            "POOT_AIE_LLC (Peano llc with aie2p) not set/runnable; skipping AIE-core lowering test"
-        );
-        return;
-    }
     assert_lowers_to_aie2p(&vadd_loop_kernel(), "vadd_loop");
     // GEMV (M=8, K=16): outer and inner back-edged loops, an accumulator carried across the inner loop,
     // a multiply, and `i*K + j` flat indexing.

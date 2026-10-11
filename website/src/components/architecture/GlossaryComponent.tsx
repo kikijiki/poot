@@ -223,7 +223,7 @@ const ENTRIES: Entry[] = [
   },
   {
     term: "Plan",
-    def: "The per-eqn output of planning (poot-graph-plan plan_eqn_analyzed): a compute body (optionally with a metadata buffer), chunked compute, a buffer alias or strided view. The executor maps the Plans of a graph to a sequence of device dispatches.",
+    def: "The per-eqn output of planning (poot-graph-plan plan_eqn): a compute body (optionally with a metadata buffer), chunked compute, a buffer alias or strided view. The executor maps the Plans of a graph to a sequence of device dispatches.",
     see: "fusion",
   },
   {
@@ -341,12 +341,12 @@ const ENTRIES: Entry[] = [
   },
   {
     term: "StepShape",
-    def: "The semantic shape of one traced step: rows, new tokens per row, cache capacity, KV layout (contiguous or paged) and whether logits return for the last token or all tokens.",
+    def: "The semantic shape of one traced step: rows, new tokens per row, cache capacity, KV layout (contiguous or paged), whether logits return for the last token or all tokens and, when asked, a hidden-state carry.",
     see: "driver",
   },
   {
     term: "XDNA2",
-    def: "AMD's second-generation AI Engine tile array, present in Ryzen AI Max processors. poot retains Peano codegen support (an LLVM fork with aie2p target support), but its NPU runtime and executor were removed.",
+    def: "AMD's second-generation AI Engine tile array, present in Ryzen AI Max processors. poot compiles to a typed AIE artifact through Peano (an LLVM fork with aie2p target support) and an IRON link step, but its NPU runtime and executor were removed, so nothing runs on the device.",
     see: "npu",
   },
 ].sort((a, b) => a.term.localeCompare(b.term));

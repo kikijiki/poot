@@ -155,7 +155,7 @@ fn pootc_compile(kernel_file: &str, src_name: &str) -> (CompiledKernel, u32, boo
     let param_count = body.param_count;
     let has_trap = body.has_trap();
     let compiled_kernel =
-        poot_codegen::kernel_handle(&body, poot_codegen::Target::SpirvVulkan, bytes);
+        poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::SpirvVulkan, bytes);
     (compiled_kernel, param_count, has_trap)
 }
 
@@ -456,7 +456,7 @@ fn llc_spin_depth4_and_reproducer() {
         .expect("pootc must publish llc_spin_depth4_and.kir.json");
     let body: Body = serde_json::from_str(&kir_json).expect("llc_spin_depth4_and.kir.json parses");
     let compiled_kernel =
-        poot_codegen::kernel_handle(&body, poot_codegen::Target::SpirvVulkan, compiled_kernel);
+        poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::SpirvVulkan, compiled_kernel);
 
     // llc rebuilds the selection merges from exactly the CFG this pass shapes, so the module has to be
     // strictly valid, not merely tolerated by RADV.
@@ -703,7 +703,7 @@ fn assert_trap_traps_on_ptx() {
         "assert_trap's data[idx[i]] bounds check is a real Assert; the compiled body must have a trap"
     );
     let ptx_kernel =
-        poot_codegen::kernel_handle(&body, poot_codegen::Target::Nvptx, ptx.into_bytes());
+        poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::Nvptx, ptx.into_bytes());
 
     let ctx = match poot_ptx_runtime::PtxContext::new() {
         Ok(c) => c,
@@ -1225,7 +1225,8 @@ fn imported_kernel_matches_kernelgen_reduce_last() {
         poot_codegen::compile(&body, Target::SpirvVulkan, &kg_path)
             .expect("compile kernelgen reduce_last");
         let kg_spv = std::fs::read(&kg_path).unwrap();
-        let kg_kernel = poot_codegen::kernel_handle(&body, Target::SpirvVulkan, kg_spv);
+        let kg_kernel =
+            poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::SpirvVulkan, kg_spv);
         let mut kg_bufs = [
             KernelBuffer::read_only_f32(&x),
             KernelBuffer::write_f32(rows),
@@ -1341,7 +1342,7 @@ fn imported_lds_reduction_matches_kernelgen() {
     let kg_path = std::env::temp_dir().join("pootc_kg_wg_sum.spv");
     poot_codegen::compile(&kg, Target::SpirvVulkan, &kg_path).expect("compile kernelgen wg_sum");
     let kg_spv = std::fs::read(&kg_path).unwrap();
-    let kg_kernel = poot_codegen::kernel_handle(&kg, Target::SpirvVulkan, kg_spv);
+    let kg_kernel = poot_codegen::kernel_handle(&kg, poot_codegen::GpuTarget::SpirvVulkan, kg_spv);
     let mut kg_bufs = [KernelBuffer::read_only_f32(&a), KernelBuffer::write_f32(1)];
     ctx.dispatch("kg", &kg_kernel, wg, threads, &mut kg_bufs)
         .expect("dispatch kernelgen wg_sum");
@@ -2316,7 +2317,7 @@ fn imported_atomic_add_sum_smoke_runs_on_gpu() {
         .expect("atomic_add_sum_smoke must compile to SPIR-V");
     let spv = std::fs::read(&out_path).unwrap();
     let compiled_kernel =
-        poot_codegen::kernel_handle(&body, poot_codegen::Target::SpirvVulkan, spv);
+        poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::SpirvVulkan, spv);
 
     let _gpu_guard = gpu_lock();
     let ctx = match Context::new() {
@@ -2842,243 +2843,4 @@ fn barrier_in_branchy_loop_runs_on_gpu() {
         "barrier-in-branchy-loop GPU output must match the CPU reference"
     );
     eprintln!("barrier-in-branchy-loop runs on RADV = matches CPU (SC-002 runtime confirmed)");
-}
-
-/// Check Peano is present and return the path; else None (the test should skip).
-fn peano_llc_or_skip() -> Option<String> {
-    match std::env::var("POOT_AIE_LLC") {
-        Ok(p)
-            if std::process::Command::new(&p)
-                .arg("--version")
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).contains("aie2p"))
-                .unwrap_or(false) =>
-        {
-            Some(p)
-        }
-        _ => {
-            eprintln!(
-                "POOT_AIE_LLC (Peano llc with aie2p) not set/runnable; skipping AIE import-lower test"
-            );
-            None
-        }
-    }
-}
-
-/// Import `kernel_file` via pootc, lower the Body to AIE2p via Peano, and write the .o to
-/// `~/.cache/pootc-test/aie/{obj_name}`. Returns the ELF bytes. Panics on any failure.
-fn lower_kernel_to_aie2p(kernel_file: &str, src_name: &str, obj_name: &str) -> Vec<u8> {
-    use poot_codegen::{Target, compile};
-
-    let (_spv, _pc, _needs_error_word) = pootc_compile(kernel_file, src_name);
-    let out_dir = std::env::temp_dir().join(format!("pootc-{src_name}"));
-    let body: Body = serde_json::from_str(
-        &std::fs::read_to_string(out_dir.join(format!("{src_name}.kir.json")))
-            .unwrap_or_else(|_| panic!("{src_name}.kir.json missing")),
-    )
-    .expect("imported Body parses");
-
-    // Sequential kernels must not have a dispatch-id injected.
-    assert!(
-        !format!("{body:?}").contains("ThreadIndexCall"),
-        "sequential kernel `{src_name}` should import without a ThreadIndexCall"
-    );
-
-    // Peano runs under steam-run's FHS which only binds $HOME; write artifacts there.
-    let aie_dir =
-        std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".cache/pootc-test/aie");
-    std::fs::create_dir_all(&aie_dir).unwrap();
-    let obj = aie_dir.join(obj_name);
-    let ir = compile(&body, Target::AieCore, &obj)
-        .unwrap_or_else(|e| panic!("AIE-core compile of `{src_name}` failed: {e}"));
-    let bytes = std::fs::read(&obj).unwrap();
-    assert_eq!(
-        &bytes[0..4],
-        b"\x7fELF",
-        "not an ELF object for {src_name}\n{ir}"
-    );
-    assert!(
-        bytes
-            .windows(body.name.len())
-            .any(|w| w == body.name.as_bytes()),
-        "kernel symbol `{}` not found in the AIE object for {src_name}",
-        body.name
-    );
-    eprintln!(
-        "imported-from-MIR sequential kernel `{}` lowered to AIE2p ({} bytes) -> {}",
-        body.name,
-        bytes.len(),
-        obj.display()
-    );
-    bytes
-}
-
-/// For the AIE-core (XDNA2 NPU) target: a sequential Rust `#[kernel]` (`vadd_seq.rs`, a
-/// `while i < len` loop, no `thread_index()`) is MIR-imported by pootc to a `Body`, then lowered through
-/// poot's emitter to AIE2p machine code by Peano (`llc --march=aie2p`). Unlike the codegen-side tests
-/// (hand-built fixture Bodies), this lowers a real rustc-MIR Body (card 089 / spec 057 FR-002).
-///
-/// Peano is a separate llc fork (`$POOT_AIE_LLC`, an FHS wrapper on NixOS); skips when absent. The on-NPU
-/// dispatch (XRT + IRON) is a separate gated step.
-#[test]
-fn imported_sequential_kernel_lowers_to_aie2p() {
-    if peano_llc_or_skip().is_none() {
-        return;
-    }
-    let kernel = manifest_path("tests/kernels/vadd_seq.rs");
-    lower_kernel_to_aie2p(kernel, "vadd_seq", "vadd_seq.o");
-}
-
-/// vmul_seq (c[i] = a[i] * b[i]) lowers to AIE2p via Peano. Produces
-/// ~/.cache/pootc-test/aie/vmul_seq.o, input to an IRON vmul xclbin build.
-#[test]
-fn imported_vmul_sequential_kernel_lowers_to_aie2p() {
-    if peano_llc_or_skip().is_none() {
-        return;
-    }
-    let kernel = manifest_path("tests/kernels/vmul_seq.rs");
-    lower_kernel_to_aie2p(kernel, "vmul_seq", "vmul_seq.o");
-}
-
-/// vsub_seq (c[i] = a[i] - b[i]) lowers to AIE2p via Peano. Produces
-/// ~/.cache/pootc-test/aie/vsub_seq.o, input to an IRON vsub xclbin build.
-#[test]
-fn imported_vsub_sequential_kernel_lowers_to_aie2p() {
-    if peano_llc_or_skip().is_none() {
-        return;
-    }
-    let kernel = manifest_path("tests/kernels/vsub_seq.rs");
-    lower_kernel_to_aie2p(kernel, "vsub_seq", "vsub_seq.o");
-}
-
-/// Fused 2-op AIE kernel: d[i] = (a[i] + b[i]) * e[i] via a single 3-input sequential loop. Produces
-/// ~/.cache/pootc-test/aie/vadd_then_vmul_seq.o for a fused 2-op xclbin build
-/// (a 4-ObjectFifo IRON design).
-#[test]
-fn imported_vadd_then_vmul_sequential_kernel_lowers_to_aie2p() {
-    if peano_llc_or_skip().is_none() {
-        return;
-    }
-    let kernel = manifest_path("tests/kernels/vadd_then_vmul_seq.rs");
-    lower_kernel_to_aie2p(kernel, "vadd_then_vmul_seq", "vadd_then_vmul_seq.o");
-}
-
-/// Sequential scalar gemv kernel for the AIE-core: y[m] = sum_k A[m*K+k]*x[k], A flat row-major [M*K],
-/// K = x.len(), M = y.len(). Nested while-loop body, no thread_index(). Produces
-/// ~/.cache/pootc-test/aie/gemv_seq.o for an IRON gemv xclbin build.
-#[test]
-fn imported_gemv_sequential_kernel_lowers_to_aie2p() {
-    if peano_llc_or_skip().is_none() {
-        return;
-    }
-    let kernel = manifest_path("tests/kernels/gemv_seq.rs");
-    lower_kernel_to_aie2p(kernel, "gemv_seq", "gemv_seq.o");
-}
-
-/// Sequential scalar gemm kernel for the AIE-core: C[m,n] = sum_k A[m*K+k]*B[k*N+n], A [M,K], B [K,N],
-/// C [M,N], all row-major.
-///
-/// Length encoding: the IRON caller passes N (not M*N) as the `c` slice length; the kernel recovers N from
-/// c.len(), K = b.len()/N, M = a.len()/K. This keeps A+B as the only two S2MM (host->tile) input channels,
-/// matching gemv.
-///
-/// Produces ~/.cache/pootc-test/aie/gemm_seq.o for an IRON gemm xclbin build.
-#[test]
-fn imported_gemm_sequential_kernel_lowers_to_aie2p() {
-    if peano_llc_or_skip().is_none() {
-        return;
-    }
-    let kernel = manifest_path("tests/kernels/gemm_seq.rs");
-    lower_kernel_to_aie2p(kernel, "gemm_seq", "gemm_seq.o");
-}
-
-/// Unary activation kernel for the AIE-core: y[i] = max(x[i], 0.0) (ReLU). No transcendentals (a
-/// conditional move); always links under Peano. Produces ~/.cache/pootc-test/aie/vrelu_seq.o for relu
-/// xclbins (an IRON unary-activation build, ReLU).
-#[test]
-fn imported_vrelu_sequential_kernel_lowers_to_aie2p() {
-    if peano_llc_or_skip().is_none() {
-        return;
-    }
-    let kernel = manifest_path("tests/kernels/vrelu_seq.rs");
-    lower_kernel_to_aie2p(kernel, "vrelu_seq", "vrelu_seq.o");
-}
-
-/// Unary activation kernel for the AIE-core: y[i] = x[i] / (1 + exp(-x[i])) (SiLU). Requires __expf from
-/// Peano's math library at link time; if the aie2p libm lacks expf this test fails with a link error, in
-/// which case only vrelu is usable and silu waits on a math-lib follow-up. Produces
-/// ~/.cache/pootc-test/aie/vsilu_seq.o for silu xclbins
-/// (an IRON unary-activation build, SiLU).
-#[test]
-fn imported_vsilu_sequential_kernel_lowers_to_aie2p() {
-    if peano_llc_or_skip().is_none() {
-        return;
-    }
-    let kernel = manifest_path("tests/kernels/vsilu_seq.rs");
-    lower_kernel_to_aie2p(kernel, "vsilu_seq", "vsilu_seq.o");
-}
-
-/// Numerically-stable softmax kernel for the AIE-core (XDNA2 NPU): 3-pass sequential (find max, sum
-/// exp(x-max), normalize). Requires exp via Peano's math library at link time. Produces
-/// ~/.cache/pootc-test/aie/vsoftmax_seq.o for softmax xclbins
-/// (an IRON unary-activation build, softmax).
-#[test]
-fn imported_vsoftmax_sequential_kernel_lowers_to_aie2p() {
-    if peano_llc_or_skip().is_none() {
-        return;
-    }
-    let kernel = manifest_path("tests/kernels/softmax_seq.rs");
-    lower_kernel_to_aie2p(kernel, "vsoftmax_seq", "vsoftmax_seq.o");
-}
-
-/// Sequential scalar gemm-NT (B transposed) kernel for the AIE-core: C[i,j] = sum_d A[i*D+d] * B[j*D+d]
-/// (= A @ B^T without data movement), A[L,D] and B[L,D] row-major, C[L,L]. Length encoding: IRON passes L
-/// (not L*L) as c's length; the kernel recovers L=c.len(), D=a.len()/L. No transcendentals. Produces
-/// ~/.cache/pootc-test/aie/gemm_nt_seq.o for an IRON attention xclbin build.
-#[test]
-fn imported_gemm_nt_sequential_kernel_lowers_to_aie2p() {
-    if peano_llc_or_skip().is_none() {
-        return;
-    }
-    let kernel = manifest_path("tests/kernels/gemm_nt_seq.rs");
-    lower_kernel_to_aie2p(kernel, "gemm_nt_seq", "gemm_nt_seq.o");
-}
-
-/// Sequential row-wise softmax kernel for the AIE-core: numerically-stable softmax of each row of a [L,L]
-/// score matrix. Length encoding: IRON passes L (not L*L) as y's length; the kernel recovers L=y.len().
-/// Requires exp via Peano's math library at link time (as softmax_seq / vsilu_seq). Produces
-/// ~/.cache/pootc-test/aie/softmax_row_seq.o for an IRON attention xclbin build.
-#[test]
-fn imported_softmax_row_sequential_kernel_lowers_to_aie2p() {
-    if peano_llc_or_skip().is_none() {
-        return;
-    }
-    let kernel = manifest_path("tests/kernels/softmax_row_seq.rs");
-    lower_kernel_to_aie2p(kernel, "softmax_row_seq", "softmax_row_seq.o");
-}
-
-/// Sequential 2-input RMSNorm kernel for the AIE-core (XDNA2 NPU): y[i] = x[i] * rsqrt(mean(x^2) + eps) *
-/// w[i], eps=1e-6. Two passes: sum squares, compute rsqrt(ss/N+eps), scale + weight. 2 inputs (x[N], w[N]),
-/// 1 output (y[N]): fits the 2-S2MM IRON binary design. Produces ~/.cache/pootc-test/aie/rmsnorm_seq.o for
-/// an IRON rmsnorm xclbin build.
-#[test]
-fn imported_rmsnorm_sequential_kernel_lowers_to_aie2p() {
-    if peano_llc_or_skip().is_none() {
-        return;
-    }
-    let kernel = manifest_path("tests/kernels/rmsnorm_seq.rs");
-    lower_kernel_to_aie2p(kernel, "rmsnorm_seq", "rmsnorm_seq.o");
-}
-
-/// Sequential half-split RoPE kernel for the AIE-core (XDNA2 NPU): y[i] = x[i]*cos[i] - x[i+half]*sin[i]
-/// (and symmetric for y[i+half]). 2 inputs (x[D], cs[2D] = [cos, sin] concatenated), 1 output (y[D]). No
-/// transcendentals; stack_size=2048. Produces ~/.cache/pootc-test/aie/rope_seq.o for an IRON rope
-/// xclbin build.
-#[test]
-fn imported_rope_sequential_kernel_lowers_to_aie2p() {
-    if peano_llc_or_skip().is_none() {
-        return;
-    }
-    let kernel = manifest_path("tests/kernels/rope_seq.rs");
-    lower_kernel_to_aie2p(kernel, "rope_seq", "rope_seq.o");
 }

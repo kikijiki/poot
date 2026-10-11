@@ -232,7 +232,7 @@ fn packed_graph(descriptor: poot_quant::PackedWeight, m: usize) -> PackedGraph {
     let x = b.slot_named(Slot::Activation, "onehot", TensorType::f32(vec![m, K]));
     let y = poot_graph_ir::ops::packed_linear(&b, x, "layer", descriptor, None, None).unwrap();
     if m == 1 {
-        let pos = b.slot(Slot::Pos, TensorType::f32(vec![]));
+        let pos = b.slot(Slot::Pos, TensorType::scalar(DType::I32));
         let cache = b.state_input(
             "decoded",
             TensorType::f32(vec![STEPS, OUT]),
@@ -329,7 +329,7 @@ fn packed_decode_through_resident_serving_path_is_bit_exact() {
         let path = "step";
         let mut init_inputs = weights.clone();
         init_inputs.insert(packed.x, one_hot(1, |_| column(0)).into());
-        init_inputs.insert(packed.pos.unwrap(), HostTensor::scalar(0.0).into());
+        init_inputs.insert(packed.pos.unwrap(), HostTensor::i32(vec![], vec![0]).into());
         let (store, _) = split_consts_and_slots(&packed.graph, &init_inputs);
         let (bound, map) = ConstWeights::bind(&packed.graph, &store);
         let program = staged(&bound, target);
@@ -340,7 +340,10 @@ fn packed_decode_through_resident_serving_path_is_bit_exact() {
             let k = column(step);
             let mut inputs = weights.clone();
             inputs.insert(packed.x, one_hot(1, |_| k).into());
-            inputs.insert(packed.pos.unwrap(), HostTensor::scalar(step as f32).into());
+            inputs.insert(
+                packed.pos.unwrap(),
+                HostTensor::i32(vec![], vec![step as i32]).into(),
+            );
             let (_, slot_binds) = split_consts_and_slots(&packed.graph, &inputs);
             let step_in = step_inputs(&slot_binds);
             let y = f32_bytes(
@@ -608,7 +611,11 @@ fn run_indexed_case(
     let what = format!("{format:?}");
     let b = Builder::new();
     let x = b.slot_named(Slot::Activation, "moe-x", TensorType::f32(vec![rows, k]));
-    let ids = b.slot_named(Slot::Activation, "moe-ids", TensorType::f32(vec![rows]));
+    let ids = b.slot_named(
+        Slot::Activation,
+        "moe-ids",
+        TensorType::new(vec![rows], DType::I32),
+    );
     let y = poot_graph_ir::ops::packed_indexed_linear(&b, x, ids, &table).unwrap();
     let g = b.finish(y);
     let mut inputs: HashMap<ValueId, Value> = HashMap::new();
@@ -622,8 +629,8 @@ fn run_indexed_case(
         );
     }
     inputs.insert(x.id(), indexed_one_hot(rows, k).into());
-    let selected: Vec<f32> = (0..rows).map(|m| expert_of(m) as f32).collect();
-    inputs.insert(ids.id(), HostTensor::f32(vec![rows], selected).into());
+    let selected: Vec<i32> = (0..rows).map(|m| expert_of(m) as i32).collect();
+    inputs.insert(ids.id(), HostTensor::i32(vec![rows], selected).into());
 
     let (store, slot_binds) = split_consts_and_slots(&g, &inputs);
     let (bound, map) = ConstWeights::bind(&g, &store);
@@ -838,7 +845,7 @@ fn packed_embedding_row_gather_is_bit_exact() {
                 vec![ids.len()]
             };
             let b = Builder::new();
-            let token = b.slot(Slot::Token, TensorType::f32(shape.clone()));
+            let token = b.slot(Slot::Token, TensorType::new(shape.clone(), DType::I32));
             let rows = poot_graph_ir::ops::packed_embedding(
                 &b,
                 token,
@@ -848,8 +855,8 @@ fn packed_embedding_row_gather_is_bit_exact() {
             .unwrap();
             let g = b.finish(rows);
             let mut inputs = carriers(&g, &owner);
-            let token_ids: Vec<f32> = ids.iter().map(|&id| id as f32).collect();
-            inputs.insert(token.id(), HostTensor::f32(shape, token_ids).into());
+            let token_ids: Vec<i32> = ids.iter().map(|&id| id as i32).collect();
+            inputs.insert(token.id(), HostTensor::i32(shape, token_ids).into());
             let (store, slot_binds) = split_consts_and_slots(&g, &inputs);
             let (bound, map) = ConstWeights::bind(&g, &store);
             let program = staged(&bound, target);
@@ -925,7 +932,11 @@ fn a_dense_traced_q6_k_expert_stack_binds_and_matches_the_oracle() {
 
     let b = Builder::new();
     let x = b.slot_named(Slot::Activation, "moe-x", TensorType::f32(vec![ROWS, K]));
-    let ids = b.slot_named(Slot::Activation, "moe-ids", TensorType::f32(vec![ROWS]));
+    let ids = b.slot_named(
+        Slot::Activation,
+        "moe-ids",
+        TensorType::new(vec![ROWS], DType::I32),
+    );
     let w = b.constant("experts.weight", TensorType::f32(vec![EXPERTS, OUT, K]));
     let y = b.indexed_matmul(x, b.transpose(w, vec![0, 2, 1]), ids);
     let traced = b.finish(y);
@@ -950,9 +961,9 @@ fn a_dense_traced_q6_k_expert_stack_binds_and_matches_the_oracle() {
             .map(|i| ((i * 7 % 23) as f32 - 11.0) * 0.03125)
             .collect::<Vec<f32>>(),
     );
-    let selected = HostTensor::f32(
+    let selected = HostTensor::i32(
         vec![ROWS],
-        (0..ROWS).map(|m| expert_of(m) as f32).collect::<Vec<f32>>(),
+        (0..ROWS).map(|m| expert_of(m) as i32).collect::<Vec<i32>>(),
     );
     let stack = Arc::new(PackedStack::try_new(owners.clone()).unwrap());
     let mut inputs: HashMap<ValueId, Value> = HashMap::new();

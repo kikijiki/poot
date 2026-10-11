@@ -89,7 +89,11 @@ fn run_moe(exec: &mut dyn Executor, target: Target, out: usize, k: usize) -> (Ve
     let column = |m: usize| (m * 37 + 11) % k;
     let b = Builder::new();
     let x = b.slot_named(Slot::Activation, "moe-x", TensorType::f32(vec![ROWS, k]));
-    let ids = b.slot_named(Slot::Activation, "moe-ids", TensorType::f32(vec![ROWS]));
+    let ids = b.slot_named(
+        Slot::Activation,
+        "moe-ids",
+        TensorType::new(vec![ROWS], DType::I32),
+    );
     let y = poot_graph_ir::ops::packed_indexed_linear(&b, x, ids, &table).unwrap();
     let g = b.finish(y);
 
@@ -128,7 +132,7 @@ fn run_moe(exec: &mut dyn Executor, target: Target, out: usize, k: usize) -> (Ve
     for m in 0..ROWS {
         one_hot[m * k + column(m)] = 1.0;
     }
-    let selected: Vec<f32> = (0..ROWS).map(|m| (m % EXPERTS) as f32).collect();
+    let selected: Vec<i32> = (0..ROWS).map(|m| (m % EXPERTS) as i32).collect();
     let x_shape = [ROWS, k];
     let ids_shape = [ROWS];
     let mut inputs = StepInputs::new();
@@ -140,7 +144,7 @@ fn run_moe(exec: &mut dyn Executor, target: Target, out: usize, k: usize) -> (Ve
     inputs.push(
         g.meta(ids.id()).slot_key().unwrap().clone(),
         &ids_shape,
-        HostView::new(DType::F32, ROWS, bytemuck::cast_slice(&selected)).unwrap(),
+        HostView::new(DType::I32, ROWS, bytemuck::cast_slice(&selected)).unwrap(),
     );
     let got = f32_bytes(
         &exec
@@ -207,7 +211,7 @@ fn a_widened_row_gather_after_a_narrow_one_is_bit_exact() {
     ));
     for n in [8, 4096] {
         let b = Builder::new();
-        let token = b.slot(Slot::Token, TensorType::f32(vec![n]));
+        let token = b.slot(Slot::Token, TensorType::new(vec![n], DType::I32));
         let rows =
             poot_graph_ir::ops::packed_embedding(&b, token, "model.embed_tokens", owner.weight())
                 .unwrap();
@@ -236,13 +240,13 @@ fn a_widened_row_gather_after_a_narrow_one_is_bit_exact() {
         let entry = exec.add_entry(exe, &program).unwrap();
 
         let ids: Vec<usize> = (0..n).map(|r| (r * 13 + 5) % VOCAB).collect();
-        let id_values: Vec<f32> = ids.iter().map(|&id| id as f32).collect();
+        let id_values: Vec<i32> = ids.iter().map(|&id| id as i32).collect();
         let token_shape = [n];
         let mut inputs = StepInputs::new();
         inputs.push(
             g.meta(token.id()).slot_key().unwrap().clone(),
             &token_shape,
-            HostView::new(DType::F32, n, bytemuck::cast_slice(&id_values)).unwrap(),
+            HostView::new(DType::I32, n, bytemuck::cast_slice(&id_values)).unwrap(),
         );
         let got = f32_bytes(
             &exec

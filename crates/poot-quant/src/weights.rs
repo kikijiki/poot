@@ -428,6 +428,9 @@ pub enum WeightRole {
     Kda(KdaRole),
     /// The DeepSeek sparse-attention lightning indexer's weights.
     Dsa(DsaRole),
+    /// A multi-token-prediction layer's input fusion and closing norm (GLM's `eh_proj`, `enorm`,
+    /// `hnorm` and `shared_head.norm`); the layer's own block reads the ordinary roles.
+    Mtp(MtpRole),
     /// The block indexer of Qwen Sparse Attention.
     Qsa(QsaRole),
     /// One Hyper-Connections gate around a block (Qwen4Exp's `*_hyper_connection` modules), and the
@@ -738,6 +741,21 @@ pub enum KdaRole {
     Out,
 }
 
+/// The weights a multi-token-prediction layer adds around an ordinary block: its input fuses the
+/// normalized embedding of the next token with the normalized hidden state of the position, and the
+/// shared head reads the block's output through its own norm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MtpRole {
+    /// The fusing projection `[width, 2 * width]` over `concat(enorm(embed), hnorm(hidden))`.
+    EhProj,
+    /// The RMSNorm scale `[width]` of the next token's embedding (`enorm`).
+    ENorm,
+    /// The RMSNorm scale `[width]` of the position's hidden state (`hnorm`).
+    HNorm,
+    /// The RMSNorm scale `[width]` applied to the block's output before the shared head.
+    HeadNorm,
+}
+
 /// The lightning indexer of DeepSeek sparse attention.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DsaRole {
@@ -917,6 +935,12 @@ impl WeightRole {
                 KdaRole::DtBias => "kda.dt_bias",
                 KdaRole::ONorm => "kda.o_norm",
                 KdaRole::Out => "kda.out",
+            },
+            WeightRole::Mtp(role) => match role {
+                MtpRole::EhProj => "mtp.eh_proj",
+                MtpRole::ENorm => "mtp.enorm",
+                MtpRole::HNorm => "mtp.hnorm",
+                MtpRole::HeadNorm => "mtp.head_norm",
             },
             WeightRole::Dsa(role) => match role {
                 DsaRole::Q => "dsa.q",

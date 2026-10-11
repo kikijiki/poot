@@ -7,8 +7,10 @@
 //! `plan_eqn` decides how to run it: synthesize a kernelgen [`Body`] (+ a cache key), run it on the host
 //! (the rare layout-op fallback), or alias an input buffer (reshape). The wgpu, PTX, ROCm, and restricted
 //! raw-Vulkan GPU executors consume this planner with `Backend::SpirvVulkan`, `Backend::Nvptx`, or
-//! `Backend::AmdGcn`; target compilation and recorder dispatch remain runtime-specific. NPU graph lowering
-//! is a separate direct path and does not claim a planner backend. The generated `Body` is named `"k"`, the
+//! `Backend::AmdGcn`; target compilation and recorder dispatch remain runtime-specific. An AIE target
+//! (`Backend::Aie`) plans the same requests under a sequential one-core schedule instead of a thread grid
+//! (POOT-664); a plan that is not that schedule is refused with `Capability::AieSchedule`. The generated
+//! `Body` is named `"k"`, the
 //! shared entry point used by the GPU emitters.
 //!
 //! # The graph passes are sealed behind `compile` (card 626, SC-001)
@@ -30,7 +32,7 @@ use poot_graph_ir::op::{
 #[cfg(test)]
 use poot_graph_ir::ValidationOutputs;
 use poot_graph_ir::{
-    Eqn, Graph, NoValidations, Operand, Scalar, ValidationChannel, ValidationPacketLayout, ValueId,
+    Eqn, Graph, Operand, Scalar, ValidationChannel, ValidationPacketLayout, ValueId,
 };
 
 use poot_kernel_ir::{BinOp, Body, MathOp, Ty, UnOp};
@@ -164,12 +166,12 @@ pub use passes::{
     PackedDequantProductionError, canonicalize, canonicalize_with_declines,
     collapse_reshape_chains, cse, dce, dce_with_roots, decompose_large_vocab_greedy,
     elide_noop_transposes, flash_attention_capped, fold_iota, fuse, fuse_contraction_epilogues,
-    fuse_widening_casts, legalize, passes_without_target, reject_packed_dequant_escapes,
-    rope_fusion,
+    fuse_index_casts, fuse_widening_casts, legalize, passes_without_target,
+    reject_packed_dequant_escapes, rope_fusion,
 };
 pub use planner::*;
 pub use refusal::*;
-pub use storage_analysis::*;
+pub(crate) use storage_analysis::*;
 
 #[cfg(test)]
 mod tests;

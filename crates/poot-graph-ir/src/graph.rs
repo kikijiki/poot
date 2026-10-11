@@ -7,6 +7,7 @@ use poot_tensor::HostTensor;
 
 use crate::error::GraphValidationError;
 use crate::op::OpKind;
+use crate::range::IndexRange;
 use crate::rope_table::{self, RopeSpec, RopeTable};
 use crate::types::{DType, Scalar, TensorType};
 
@@ -362,14 +363,14 @@ pub enum Slot {
     /// Const, needed when its dense-f32 size exceeds a backend's max single-buffer size (gemma4's `hidden=5376`
     /// gives ~5.6 GB, over wgpu's ~2 GB `max_buffer_size` here).
     TokenEmbed,
-    /// Spec 248 (epic 129 B8): a batched LoRA decode graph's per-row adapter selection `[batch]` (f32,
-    /// `IndexedMatMul`'s idx convention, see its doc comment on why idx is always f32): row `m`'s value is the
+    /// Spec 248 (epic 129 B8): a batched LoRA decode graph's per-row adapter selection `[batch]` (I32, the index
+    /// dtype `IndexedMatMul` reads): row `m`'s value is the
     /// adapter index (1-based; 0 is the no-adapter row) whose stacked `A`/`B` the LoRA compile pass applies to
     /// that row this step. A distinct variant from `Slot::SlotMap`: an engine binder resolves one whole `Slot` kind
     /// from one buffer per bind call. Per-step-varying (requests and adapters change as the batch admits/evicts),
     /// so a `Slot` rebound every step, never a `Const` (const-cache staleness).
     LoraIdx,
-    /// Spec 266: an MoE layer's expert-pool assignment table `[E]` (f32, `IndexedMatMul`'s idx convention): entry
+    /// Spec 266: an MoE layer's expert-pool assignment table `[E]` (I32, the index dtype `Gather` reads): entry
     /// `e` is the pool slot currently holding global expert `e`, or `-1` when
     /// not resident in that layer's pool this step. An in-graph `Gather` translates the router's global expert ids
     /// into pool-slot ids with this table, so the unmodified `IndexedMatMul` op addresses a smaller
@@ -575,6 +576,13 @@ pub enum StateRole {
     /// every existing state pair is traced with; `Positional` is declared only by `components::attention`
     /// and later family cards.
     Recurrent,
+    /// A value one program writes and a later program of the same driver step reads (the hidden-state
+    /// carry of POOT-1109): never rolled back, so a snapshot skips it and a restore leaves it alone,
+    /// and it leaves a graph's residency `KvOnly` when nothing else is `Recurrent`. A writer
+    /// overwrites only the rows its step carries (the first `tokens` of the carry's position axis);
+    /// the rest keep what earlier steps wrote, so a reader must know how many rows the last writer
+    /// covered and read no more.
+    Handoff,
 }
 
 /// One `(state_in, state_out)` pair from [`Graph::state`], with the input's declared [`StateRole`] read
@@ -604,6 +612,11 @@ pub struct ValueMeta {
     /// [`Graph::validate`] checks both directions (a `State` value with no role, and any other value
     /// with one).
     pub(crate) state_role: Option<StateRole>,
+    /// The range a [`Storage::Slot`] or [`Storage::Const`] input declares for its I32 words, set once
+    /// at construction ([`crate::builder::Builder::slot_ranged`],
+    /// [`crate::builder::Builder::constant_ranged`]) and checked by the binder against the bound
+    /// words, so [`crate::value_ranges`] may treat it as a fact. `None` for every other value.
+    pub(crate) range: Option<IndexRange>,
 }
 
 impl ValueMeta {
@@ -622,6 +635,7 @@ impl ValueMeta {
             name,
             key: None,
             state_role: None,
+            range: None,
         }
     }
 
@@ -636,6 +650,7 @@ impl ValueMeta {
             name: Some(key.to_string()),
             key: Some(key),
             state_role: None,
+            range: None,
         }
     }
 
@@ -649,7 +664,14 @@ impl ValueMeta {
             name,
             key: None,
             state_role: Some(role),
+            range: None,
         }
+    }
+
+    /// The range this input declares for its I32 words, if any. The binders check it at bind;
+    /// [`crate::value_ranges`] reads it as proven.
+    pub fn range(&self) -> Option<IndexRange> {
+        self.range
     }
 
     /// The structured [`SlotKey`] of a [`Storage::Slot`] input built through [`crate::builder::Builder`]
@@ -1098,6 +1120,7 @@ impl<V: ValidationChannel> Graph<V> {
             name: Some(name),
             key: Some(key),
             state_role: None,
+            range: None,
         });
         self.inputs.push(id);
         self.slots.push((id, slot));
@@ -1299,7 +1322,7 @@ impl<V: ValidationChannel> Graph<V> {
                         });
                     }
                 }
-                (Storage::State, Some(StateRole::Recurrent)) => {}
+                (Storage::State, Some(StateRole::Recurrent | StateRole::Handoff)) => {}
                 (_, Some(_)) => {
                     return Err(GraphValidationError::UnexpectedStateRole {
                         value: id,
@@ -1667,8 +1690,16 @@ mod tests {
     fn binding_fixture() -> (super::Graph, BindingFixtureIds) {
         let b = Builder::new();
         let weight = b.constant("weight", TensorType::f32(vec![1]));
-        let first_pool = b.slot_named(Slot::ExpertPoolMap, "layer_0", TensorType::f32(vec![1]));
-        let _second_pool = b.slot_named(Slot::ExpertPoolMap, "layer_1", TensorType::f32(vec![1]));
+        let first_pool = b.slot_named(
+            Slot::ExpertPoolMap,
+            "layer_0",
+            TensorType::new(vec![1], DType::I32),
+        );
+        let _second_pool = b.slot_named(
+            Slot::ExpertPoolMap,
+            "layer_1",
+            TensorType::new(vec![1], DType::I32),
+        );
         let first_state = b.state_input(
             "first_state",
             TensorType::f32(vec![1]),
@@ -1807,6 +1838,7 @@ mod tests {
             name: None,
             key: None,
             state_role: None,
+            range: None,
         });
         assert!(matches!(
             graph.validate(),
@@ -2178,6 +2210,7 @@ mod tests {
                 name: None,
                 key: None,
                 state_role: None,
+                range: None,
             });
             let expected = match corruption {
                 ResultCorruption::DuplicateStateDestination => {

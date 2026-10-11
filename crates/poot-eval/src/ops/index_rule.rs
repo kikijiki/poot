@@ -7,9 +7,8 @@ use poot_graph_ir::ValueId;
 
 use crate::EvalError;
 
-/// An index value as the graph's two index dtypes carry it ([`poot_tensor::DType::is_index_operand`]):
-/// an authoritative I32 word, or the dense walk's F32 index convention (an exact integer encoded as
-/// f32, never pre-rounded).
+/// A value the index rule checks: an I32 index word (the one index dtype), or the F32 rank value `ArgTopK`
+/// inverts (an integral count computed by float arithmetic, never pre-rounded). No index operand is F32.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum IndexValue {
     I32(i32),
@@ -27,7 +26,7 @@ impl std::fmt::Display for IndexValue {
 
 /// Why [`index_at`] refused a value, checked in this order: a non-finite F32 value is [`Self::NotFinite`]
 /// before its sign or fraction are inspected; a finite value with a nonzero fraction is
-/// [`Self::NotIntegral`] before its sign; a finite integral negative value (I32 or F32) is
+/// [`Self::NotIntegral`] before its sign; a finite integral negative value (I32 or F32 rank) is
 /// [`Self::Negative`]; only a finite, integral, non-negative value can reach [`Self::OutOfRange`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IndexFaultKind {
@@ -57,8 +56,7 @@ pub struct IndexFault {
 /// The one row-selection rule (deval 4): `value` at `position` of an index operand selects a row of
 /// `0..len`, or [`EvalError::Index`] names why not.
 ///
-/// I32: `0 <= v < len`. F32 (the dense walk's index convention, still admitted by
-/// [`poot_tensor::DType::is_index_operand`] until 558b): finite, integral, non-negative, in range.
+/// I32: `0 <= v < len`. F32 (an `ArgTopK` rank value): finite, integral, non-negative, in range.
 pub(crate) fn index_at(
     value: IndexValue,
     position: usize,

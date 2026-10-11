@@ -43,7 +43,7 @@ fn compiled_add(body: &poot_kernel_ir::Body, name: &str) -> poot_runtime_common:
     let out = poot_codegen::artifact_path(&dir, name, Target::SpirvVulkan);
     compile(body, Target::SpirvVulkan, &out).expect("compile add kernel to SPIR-V");
     let bytes = std::fs::read(&out).expect("read compiled .spv");
-    kernel_handle(body, Target::SpirvVulkan, bytes)
+    kernel_handle(body, poot_codegen::GpuTarget::SpirvVulkan, bytes)
 }
 
 fn run_add() -> i32 {

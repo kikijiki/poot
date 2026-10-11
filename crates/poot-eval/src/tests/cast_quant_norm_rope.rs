@@ -263,7 +263,7 @@ fn packed_i8_survives_copy_ops_in_eval() {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![rows, cols]));
     let packed = b.pack_i8(x);
-    let idx = b.constant("idx", TensorType::f32(vec![rows]));
+    let idx = b.constant("idx", TensorType::new(vec![rows], DType::I32));
     let rt = b.unpack_i8(b.gather(packed, 0, idx), cols);
     let (xi, ii) = (x.id(), idx.id());
     let g = b.finish(rt);
@@ -274,9 +274,9 @@ fn packed_i8_survives_copy_ops_in_eval() {
     );
     inputs.insert(
         ii,
-        Value::from(HostTensor::f32(
+        Value::from(HostTensor::i32(
             vec![rows],
-            (0..rows).rev().map(|i| i as f32).collect(),
+            (0..rows).rev().map(|i| i as i32).collect(),
         )),
     );
     let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -612,10 +612,7 @@ fn rope_partial_matches_direct() {
 
 /// SC-006: every exact-range Cast violation is `EvalError::Cast(CastFault)` with the
 /// literal `from`/`to`/`index`/`value` - `Cast(I32, F32)` of `16_777_217` (one past the largest
-/// exactly-f32-representable integer) with and without a `cast_authority` attached (card 554d's
-/// `exact_i32.rs::exact_i32_errors_preserve_typed_sources` already covers the with-authority case;
-/// this proves the without-authority path hits the exact same fault, not a different one), plus
-/// `Cast(F32, I32)` of a non-integer value and of NaN, and `Cast(I32, I8)` of a value outside
+/// exactly-f32-representable integer), plus `Cast(F32, I32)` of a non-integer value and of NaN, and `Cast(I32, I8)` of a value outside
 /// `-128..=127`.
 ///
 /// Mutation: remove the `F32_EXACT_I32_MAX` range check in `walk.rs`'s `(I32, F32)` cast arm; the
@@ -624,7 +621,7 @@ fn rope_partial_matches_direct() {
 fn cast_fault_carries_the_literal_from_to_index_and_value() {
     use crate::{CastFault, CastOperand, EvalError};
 
-    // Cast(I32, F32) of 16_777_217 (one past F32_EXACT_I32_MAX), no cast_authority attached.
+    // Cast(I32, F32) of 16_777_217 (one past F32_EXACT_I32_MAX).
     let b = Builder::new();
     let x = i32_constant(&b, "x", vec![2]).unwrap();
     let y = b.cast(x, poot_tensor::DType::F32);

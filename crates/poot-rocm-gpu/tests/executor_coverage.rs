@@ -50,7 +50,7 @@ fn dispatched_bodies(fixture: &Fixture, target: Target) -> Vec<(Body, [u32; 3])>
                 .planned()
                 .filter_map(|(_, plan)| {
                     plan.single()
-                        .map(|dispatch| (dispatch.body.clone(), dispatch.launch.grid))
+                        .map(|dispatch| (dispatch.body().clone(), dispatch.launch().grid))
                 })
                 .collect::<Vec<_>>()
         })
@@ -88,7 +88,7 @@ fn arg_top_k_over_a_partial_last_workgroup_matches_the_oracle_on_rocm() {
             .unwrap_or_else(|e| panic!("{e}"));
         for (step, got) in outputs.iter().enumerate() {
             assert_eq!(
-                got.as_f32().expect("ids are F32"),
+                got.as_i32().expect("ids are I32"),
                 case.expected.as_slice(),
                 "{name} step {step}: ids differ from the rank permutation's inverse"
             );

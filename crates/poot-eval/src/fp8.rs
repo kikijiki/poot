@@ -150,7 +150,7 @@ pub fn validate_dynamic_update_runtime_index(
     operand_shape: &[usize],
     update_shape: &[usize],
     axis: usize,
-    index: f32,
+    index: i32,
     eqn: poot_graph_ir::ValueId,
 ) -> Result<usize, EvalError> {
     let starts = operand_shape
@@ -166,7 +166,7 @@ pub fn validate_dynamic_update_runtime_index(
                 ),
             )
         })?;
-    index_at(IndexValue::F32(index), 0, starts, eqn)
+    index_at(IndexValue::I32(index), 0, starts, eqn)
 }
 
 #[cfg(test)]
@@ -528,14 +528,14 @@ mod tests {
             StateRole::Recurrent,
         );
         let update = builder.constant("raw_update", TensorType::new(vec![2, 2], DType::E4M3FN));
-        let index = builder.constant("index", TensorType::f32(vec![]));
+        let index = builder.constant("index", TensorType::scalar(DType::I32));
         let state_out = builder.dynamic_update_slice_dyn(state, update, index, 1);
         let graph = builder.finish_with_state(state_out, &[(state, state_out)]);
 
         let initial = e4m3fn_tensor(vec![2, 5], vec![0x7f, 1, 2, 3, 4, 0xff, 5, 6, 7, 8]).unwrap();
         let updates = [
-            (1.0, vec![0x80, 0x7e, 0xfe, 0x00]),
-            (3.0, vec![0xff, 0x7f, 0x38, 0xb8]),
+            (1, vec![0x80, 0x7e, 0xfe, 0x00]),
+            (3, vec![0xff, 0x7f, 0x38, 0xb8]),
         ];
         let mut carried = crate::Value::Host(initial);
         for (position, raw_update) in updates {
@@ -547,7 +547,7 @@ mod tests {
                 ),
                 (
                     index.id(),
-                    crate::Value::Host(poot_tensor::HostTensor::scalar(position)),
+                    crate::Value::Host(poot_tensor::HostTensor::i32(vec![], vec![position])),
                 ),
             ]);
             let result = crate::eval(
@@ -756,7 +756,7 @@ mod tests {
     fn generic_value_gather_preserves_raw_bytes() {
         let builder = Builder::new();
         let x = builder.constant("raw", TensorType::new(vec![3, 5], DType::E4M3FN));
-        let index = builder.constant("index", TensorType::f32(vec![]));
+        let index = builder.constant("index", TensorType::scalar(DType::I32));
         let y = builder.gather(x, 0, index);
         let graph = builder.finish(y);
         let bytes = vec![
@@ -768,7 +768,7 @@ mod tests {
             (x.id(), crate::Value::Host(input)),
             (
                 index.id(),
-                crate::Value::Host(poot_tensor::HostTensor::f32(vec![], vec![1.0])),
+                crate::Value::Host(poot_tensor::HostTensor::i32(vec![], vec![1])),
             ),
         ]);
 
@@ -786,15 +786,14 @@ mod tests {
         assert_eq!(got.view().bytes(), [0xff, 0x38, 0xb8, 0x55, 0xd5]);
     }
 
-    /// Card 555: [`crate::Value::gather`] (the standalone entry point outside the
-    /// walk's own equation loop) routes an I32 index through the exact `IndexValue` path - correct
-    /// above 2^24, where the F32 index has already collided with its rounded neighbour.
+    /// Card 555, POOT-725: [`crate::Value::gather`] (the standalone entry point outside the walk's own
+    /// equation loop) reads an I32 index through the exact `IndexValue` path - correct above 2^24, where an
+    /// f32 index would collide with its rounded neighbour - and refuses an F32 index by name.
     ///
     /// Red mutation (recorded): revert `Value::gather` to widen every index to f32. An I32 index
-    /// above 2^24 then silently selects the rounded neighbor's row instead of the one requested -
-    /// confirmed red, reverted, confirmed green.
+    /// above 2^24 then silently selects the rounded neighbor's row instead of the one requested.
     #[test]
-    fn value_gather_routes_authoritative_i32_index_through_exact_path() {
+    fn value_gather_routes_i32_index_through_exact_path_and_refuses_f32() {
         const COLLIDING_ID: i32 = 16_777_217;
         const ROUNDED_ID: i32 = 16_777_216;
         let axis_len = COLLIDING_ID as usize + 1;
@@ -804,18 +803,13 @@ mod tests {
         let table = e4m3fn_tensor(vec![axis_len], bytes).unwrap();
         let value = crate::Value::Host(table);
 
-        // An F32 index keeps the f32 path and its collision.
-        let f32_only_index = poot_tensor::HostTensor::f32(vec![], vec![COLLIDING_ID as f32]);
-        let crate::Value::Host(via_f32) = value.gather(0, &f32_only_index).unwrap() else {
-            panic!("must stay e4m3fn")
-        };
-        assert_eq!(
-            via_f32.view().bytes(),
-            [0x38],
-            "an F32 index must keep the existing f32 behaviour, collision included"
+        let f32_index = poot_tensor::HostTensor::f32(vec![], vec![COLLIDING_ID as f32]);
+        let error = value.gather(0, &f32_index).unwrap_err().to_string();
+        assert!(
+            error.contains("an index operand is I32, got f32"),
+            "{error}"
         );
 
-        // An I32 index takes the exact path.
         let exact_index = poot_tensor::HostTensor::i32(vec![], vec![COLLIDING_ID]);
         let crate::Value::Host(via_exact) = value.gather(0, &exact_index).unwrap() else {
             panic!("must stay e4m3fn")
@@ -830,7 +824,7 @@ mod tests {
             let builder = Builder::new();
             let operand = builder.constant("operand", TensorType::new(vec![2, 5], DType::E4M3FN));
             let update = builder.constant("update", TensorType::new(vec![2, 2], DType::E4M3FN));
-            let index = runtime.then(|| builder.constant("index", TensorType::f32(vec![])));
+            let index = runtime.then(|| builder.constant("index", TensorType::scalar(DType::I32)));
             let output = match index {
                 Some(index) => builder.dynamic_update_slice_dyn(operand, update, index, 1),
                 None => builder.dynamic_update_slice(operand, update, position, 1),
@@ -851,7 +845,7 @@ mod tests {
             if let Some(index) = index {
                 inputs.insert(
                     index.id(),
-                    crate::Value::Host(poot_tensor::HostTensor::f32(vec![], vec![position as f32])),
+                    crate::Value::Host(poot_tensor::HostTensor::i32(vec![], vec![position as i32])),
                 );
             }
 
@@ -881,15 +875,15 @@ mod tests {
         }
     }
 
-    /// A dynamic index/scatter inverse declared F32 but bound as an I32 tensor (a payload that is
+    /// A dynamic index/scatter inverse declared I32 but bound as an F32 tensor (a payload that is
     /// not the declared dtype) is caught at bind time (`walk::preflight_bindings`), before any
-    /// equation could index it; there is no implicit I32 -> F32 conversion at bind.
+    /// equation could index it; there is no implicit F32 -> I32 conversion at bind.
     #[test]
-    fn generic_value_rejects_a_non_f32_index_binding_before_indexing() {
+    fn generic_value_rejects_a_non_i32_index_binding_before_indexing() {
         let builder = Builder::new();
         let operand = builder.constant("operand", TensorType::new(vec![2, 5], DType::E4M3FN));
         let update = builder.constant("update", TensorType::new(vec![2, 2], DType::E4M3FN));
-        let index = builder.constant("index", TensorType::f32(vec![]));
+        let index = builder.constant("index", TensorType::scalar(DType::I32));
         let output = builder.dynamic_update_slice_dyn(operand, update, index, 1);
         let graph = builder.finish(output);
         let inputs = HashMap::from([
@@ -903,7 +897,7 @@ mod tests {
             ),
             (
                 index.id(),
-                crate::Value::Host(poot_tensor::HostTensor::i32(vec![], vec![1])),
+                crate::Value::Host(poot_tensor::HostTensor::f32(vec![], vec![1.0])),
             ),
         ]);
 
@@ -920,7 +914,7 @@ mod tests {
         let builder = Builder::new();
         let base = builder.constant("base", TensorType::new(vec![2, 5], DType::E4M3FN));
         let src = builder.constant("src", TensorType::new(vec![1, 5], DType::E4M3FN));
-        let inverse = builder.constant("inverse", TensorType::f32(vec![2]));
+        let inverse = builder.constant("inverse", TensorType::new(vec![2], DType::I32));
         let output = builder.scatter_update(base, src, inverse);
         let graph = builder.finish(output);
         let inputs = HashMap::from([
@@ -934,7 +928,7 @@ mod tests {
             ),
             (
                 inverse.id(),
-                crate::Value::Host(poot_tensor::HostTensor::i32(vec![2], vec![0, -1])),
+                crate::Value::Host(poot_tensor::HostTensor::f32(vec![2], vec![0.0, -1.0])),
             ),
         ]);
 
@@ -977,7 +971,7 @@ mod tests {
         let builder = Builder::new();
         let base = builder.constant("base", TensorType::new(vec![3, 5], DType::E4M3FN));
         let src = builder.constant("src", TensorType::new(vec![2, 5], DType::E4M3FN));
-        let inverse = builder.constant("inverse", TensorType::f32(vec![3]));
+        let inverse = builder.constant("inverse", TensorType::new(vec![3], DType::I32));
         let output = builder.scatter_update(base, src, inverse);
         let graph = builder.finish(output);
         let base_value = e4m3fn_tensor(
@@ -992,7 +986,7 @@ mod tests {
             (src.id(), crate::Value::Host(src_value)),
             (
                 inverse.id(),
-                crate::Value::Host(poot_tensor::HostTensor::f32(vec![3], vec![1.0, -1.0, 0.0])),
+                crate::Value::Host(poot_tensor::HostTensor::i32(vec![3], vec![1, -1, 0])),
             ),
         ]);
         let crate::Value::Host(got) = crate::eval(

@@ -1,0 +1,117 @@
+{
+  "backend": "ptx",
+  "binary": "/root/bank_cand",
+  "case": "recurrence-scan-narrow-state",
+  "cells": {
+    "kernel": {
+      "repeats": [
+        {
+          "metrics": {
+            "step_us": 713.6519999999999
+          },
+          "slot": 0,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 688.173
+          },
+          "slot": 1,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 681.891
+          },
+          "slot": 2,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 682.933
+          },
+          "slot": 3,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 675.559
+          },
+          "slot": 4,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 684.235
+          },
+          "slot": 5,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 699.174
+          },
+          "slot": 6,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 691.229
+          },
+          "slot": 7,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 687.151
+          },
+          "slot": 8,
+          "status": "ok"
+        }
+      ]
+    }
+  },
+  "hardware": {
+    "backend": "ptx",
+    "device": "NVIDIA GeForce RTX 3090",
+    "driver": "580.159.03"
+  },
+  "memory": [
+    {
+      "live_bytes": 1654784,
+      "peak_bytes": 1654784,
+      "role": "Weight"
+    },
+    {
+      "live_bytes": 589824,
+      "peak_bytes": 589824,
+      "role": "Activation"
+    }
+  ],
+  "observed": {
+    "layout": "bhsd",
+    "shape": {
+      "d": 64,
+      "heads": 4,
+      "steps": 512
+    },
+    "storage": "f32",
+    "weight_bytes_per_copy": 1654784,
+    "weight_copies": 1
+  },
+  "plan": [
+    "scan [c0415f6dbd7be34a019a8010da6d5190dfc2817b4f98731a73d1fbda01c5a368]"
+  ],
+  "plan_id": "d893f8d254f2133e76b59d9157c2c59a489ade24c3df3c94866244450bc816d6",
+  "recordings": 1,
+  "reference": {
+    "agrees": true,
+    "max_relative_error": 4.753722347043083e-08,
+    "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
+    "provenance": "independent-golden",
+    "tolerance": 0.002
+  },
+  "replays": 13,
+  "role": "baseline",
+  "schema": 1
+}

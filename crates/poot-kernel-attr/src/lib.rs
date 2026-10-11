@@ -142,7 +142,7 @@ fn host_wrapper(func: &ItemFn) -> syn::Result<TokenStream2> {
             let body = crate::poot_kernel_body(#name_str);
             let kernel = ::poot_codegen::kernel_handle(
                 &body,
-                ::poot_codegen::Target::SpirvVulkan,
+                ::poot_codegen::GpuTarget::SpirvVulkan,
                 crate::poot_kernel_spv(#name_str).to_vec(),
             );
             ctx.launch(&kernel, &[#(#inputs),*], #output)

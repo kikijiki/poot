@@ -14,12 +14,9 @@ use poot_graph_ir::{Graph, OpKind, Operand, ValidationChannel, ValueId, ValueTab
 #[cfg(test)]
 use poot_target::{Backend, DeviceCaps};
 
-#[cfg(test)]
-use crate::{
-    ExactI32StorageAnalysis, ValidationPacketPlan, compute_views, plan_eqn_views_analyzed,
-    plan_validation_packet,
-};
 use crate::{Plan, PlanError, value_ids};
+#[cfg(test)]
+use crate::{ValidationPacketPlan, compute_views, plan_eqn_views, plan_validation_packet};
 #[cfg(test)]
 use poot_test_util::device_caps::default_caps_for;
 
@@ -290,13 +287,11 @@ fn commit_for_test<V: ValidationChannel>(
     caps: &DeviceCaps,
 ) -> Result<StateCommitPlan, PlanError> {
     let views = compute_views(g, backend);
-    let exact_i32 = ExactI32StorageAnalysis::new(g);
     let plans: Vec<Plan> = g
         .eqns
         .iter()
         .map(|eqn| {
-            plan_eqn_views_analyzed(
-                &exact_i32,
+            plan_eqn_views(
                 g,
                 eqn,
                 backend,
@@ -501,7 +496,10 @@ mod tests {
         let u3 = builder.slot(poot_graph_ir::Slot::Activation, TensorType::f32(vec![3]));
         let updated3 = builder.dynamic_update_slice(s3, u3, 0, 0);
         let s4 = builder.state_input("s4", TensorType::f32(vec![10]), StateRole::Recurrent);
-        let u4 = builder.slot(poot_graph_ir::Slot::Activation, TensorType::f32(vec![4]));
+        let u4 = builder.slot(
+            poot_graph_ir::Slot::Activation,
+            TensorType::new(vec![4], poot_tensor::DType::I32),
+        );
         let updated4 = builder.dynamic_update_slice(s4, u4, 0, 0);
         let s5 = builder.state_input("s5", TensorType::f32(vec![10]), StateRole::Recurrent);
         let u5 = builder.slot(poot_graph_ir::Slot::Activation, TensorType::f32(vec![5]));
@@ -594,7 +592,10 @@ mod tests {
         let builder = Builder::new();
         let state = builder.state_input("pool", TensorType::f32(vec![4, 2]), StateRole::Recurrent);
         let src = builder.slot(poot_graph_ir::Slot::Activation, TensorType::f32(vec![2, 2]));
-        let inv = builder.slot(poot_graph_ir::Slot::Activation, TensorType::f32(vec![4]));
+        let inv = builder.slot(
+            poot_graph_ir::Slot::Activation,
+            TensorType::new(vec![4], poot_tensor::DType::I32),
+        );
         let updated = builder.scatter_update(state, src, inv);
         let graph = builder.finish_with_state(updated, &[(state, updated)]);
 
@@ -674,7 +675,10 @@ mod tests {
         let builder = Builder::new();
         let state = builder.state_input("pool", TensorType::f32(vec![4, 2]), StateRole::Recurrent);
         let src = builder.slot(poot_graph_ir::Slot::Activation, TensorType::f32(vec![2, 2]));
-        let inv = builder.slot(poot_graph_ir::Slot::Activation, TensorType::f32(vec![4]));
+        let inv = builder.slot(
+            poot_graph_ir::Slot::Activation,
+            TensorType::new(vec![4], poot_tensor::DType::I32),
+        );
         let updated = builder.scatter_update(state, src, inv);
         let witness = builder.binary_scalar(
             BinOp::Ge,

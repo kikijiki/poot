@@ -114,13 +114,13 @@ impl SiteIdentity {
     }
 }
 
-/// What the host reads at a sync point: the boundary values the point names (F32, as the stage that
-/// exported them left them) and the site's canonical identity and per-row costs.
+/// What the host reads at a sync point: the boundary values the point names (I32 expert ids, as the
+/// stage that exported them left them) and the site's canonical identity and per-row costs.
 #[derive(Clone, Debug)]
 pub struct SyncReads {
     site: SiteIdentity,
     row_bytes: Vec<usize>,
-    values: Vec<(BoundaryId, Vec<f32>)>,
+    values: Vec<(BoundaryId, Vec<i32>)>,
 }
 
 impl SyncReads {
@@ -136,7 +136,7 @@ impl SyncReads {
     }
 
     /// The values `id` named, as the point's stage left them.
-    pub fn values(&self, id: BoundaryId) -> Option<&[f32]> {
+    pub fn values(&self, id: BoundaryId) -> Option<&[i32]> {
         self.values
             .iter()
             .find(|(read, _)| *read == id)
@@ -160,7 +160,7 @@ pub struct RowFill {
 pub struct SyncWrites {
     pub rows: Vec<RowFill>,
     /// The site's whole `[E]` map: the pool row of each global expert, `-1` when absent.
-    pub map: Option<Vec<f32>>,
+    pub map: Option<Vec<i32>>,
 }
 
 /// The host side of a step's sync points (the expert-residency manager is the one implementation):

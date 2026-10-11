@@ -6,16 +6,11 @@
 //! -pub, still-production-used methods (`finish_with_state`, `Graph::with_validations`, `Graph::validate`,
 //! `ValidationPacketLayout::for_graph`, `Builder::append_plan`/`preflight_append`/`commit_append`) - the
 //! originals' only crate-private dependency (`exact_i32_input`) turned out to be a thin wrapper over those
-//! same public primitives. [`plan_eqn`] is likewise reimplemented by composing the superseding, still-pub
-//! [`poot_graph_plan::plan_eqn_analyzed`] with a caller-owned [`poot_graph_plan::ExactI32StorageAnalysis`] -
-//! byte-identical to what the deleted wrapper did internally. `plan_eqn`'s own siblings `plan_eqn_ws`/
-//! `plan_eqn_views` (also deleted from poot-graph-plan) have no real caller left anywhere in the workspace -
-//! every one of their test callers went straight to `plan_eqn_analyzed`/`plan_eqn_views_analyzed` instead, so
-//! they are not reconstructed here.
+//! same public primitives. [`plan_eqn`] is [`poot_graph_plan::plan_eqn`] under [`roomy_body_limits`].
 //!
 //! ADR-0113: `is_decode_gemv`/`is_tiled_gemm` had no production caller at all (production routes through
 //! `poot-graph-plan`'s private `_in` twins) and were deleted; their cross-crate callers now assert on the
-//! `Plan` [`poot_graph_plan::plan_eqn_analyzed`] returns instead of calling a test-only predicate.
+//! `Plan` [`poot_graph_plan::plan_eqn`] returns instead of calling a test-only predicate.
 //! `reassociation_class` and `per_eqn_plans_outside_compile` read `poot-graph-plan`'s private state
 //! (`recorded_numerics`, a crate-private thread-local counter) and stay there under
 //! `#[cfg(any(test, feature = "test-support"))]` (ADR-0113 point 2); their consumers call them directly
@@ -26,7 +21,7 @@ use poot_graph_ir::{
     Builder, BuilderAppendError, Eqn, Graph, GraphValidationError, Storage, TensorType, Traced,
     ValidationId, ValidationOutput, ValidationPacketLayout,
 };
-use poot_graph_plan::{ExactI32StorageAnalysis, Plan, PlanError};
+use poot_graph_plan::{Plan, PlanError};
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::DType;
 
@@ -104,15 +99,13 @@ pub fn roomy_body_limits() -> poot_kernelgen::BodyLimits {
     }
 }
 
-/// Choose how to execute an eqn at `world_size = 1`, with no caller-owned graph-wide analysis. Reimplements
-/// `poot-graph-plan`'s deleted `plan_eqn` by building the one-shot analysis the deleted wrapper built
-/// internally, then calling the still-pub, still-production-used `plan_eqn_analyzed`.
+/// Choose how to execute an eqn at `world_size = 1`: `poot-graph-plan`'s `plan_eqn` under
+/// [`roomy_body_limits`].
 pub fn plan_eqn(
     g: &Graph,
     eqn: &Eqn,
     backend: Backend,
     caps: &DeviceCaps,
 ) -> Result<Plan, PlanError> {
-    let analysis = ExactI32StorageAnalysis::new(g);
-    poot_graph_plan::plan_eqn_analyzed(&analysis, g, eqn, backend, caps, &roomy_body_limits())
+    poot_graph_plan::plan_eqn(g, eqn, backend, caps, &roomy_body_limits())
 }

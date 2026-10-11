@@ -122,14 +122,6 @@ impl DType {
             DType::I64 | DType::U64 | DType::F64 => 8,
         }
     }
-
-    /// Whether `infer` accepts this dtype for an index-role operand (`Gather`, `Scatter`,
-    /// `ScatterUpdate`'s `inv`, `IndexedMatMul`'s `idx`, `DynamicUpdateSlice`'s runtime index, and
-    /// friends): R466-010. F32 stays accepted too because indices are F32 by evaluator convention
-    /// until Card 558b switches them to I32 everywhere. Every other dtype is rejected.
-    pub fn is_index_operand(self) -> bool {
-        matches!(self, DType::F32 | DType::I32)
-    }
 }
 
 /// A borrowed, byte-level view of one host-resident tensor, typed by [`DType`] (X1): the contract's

@@ -318,7 +318,7 @@ fn packed_indexed_linear_is_one_claimed_contraction_over_stacked_carriers()
         };
         let b = Builder::new();
         let x = b.constant("x", TensorType::f32(vec![4, k]));
-        let selector = b.constant("selector", TensorType::f32(vec![4]));
+        let selector = b.constant("selector", TensorType::new(vec![4], DType::I32));
         let output = packed_indexed_linear(&b, x, selector, &table)?;
         let graph = b.finish(output);
 
@@ -370,7 +370,7 @@ fn packed_indexed_linear_refuses_a_bad_table_or_operand_without_mutation() {
     let (m, k) = (4, 32);
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![m, k]));
-    let selector = b.constant("selector", TensorType::f32(vec![m]));
+    let selector = b.constant("selector", TensorType::new(vec![m], DType::I32));
     let before = b.generation();
     let unnamed = PackedExpertStack {
         stack_id: String::new(),
@@ -395,31 +395,31 @@ fn packed_indexed_linear_refuses_a_bad_table_or_operand_without_mutation() {
         (
             "x f16",
             TensorType::new(vec![m, k], DType::F16),
-            TensorType::f32(vec![m]),
+            TensorType::new(vec![m], DType::I32),
             true,
         ),
         (
             "x rank 3",
             TensorType::f32(vec![m, k, 1]),
-            TensorType::f32(vec![m]),
+            TensorType::new(vec![m], DType::I32),
             true,
         ),
         (
             "x K + 1",
             TensorType::f32(vec![m, k + 1]),
-            TensorType::f32(vec![m]),
+            TensorType::new(vec![m], DType::I32),
             true,
         ),
         (
             "selector m + 1",
             TensorType::f32(vec![m, k]),
-            TensorType::f32(vec![m + 1]),
+            TensorType::new(vec![m + 1], DType::I32),
             false,
         ),
         (
-            "selector i32",
+            "selector f32",
             TensorType::f32(vec![m, k]),
-            TensorType::new(vec![m], DType::I32),
+            TensorType::f32(vec![m]),
             false,
         ),
     ];

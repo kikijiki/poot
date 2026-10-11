@@ -215,7 +215,7 @@ fn compile_copy_words_kernel(
     let out_path = poot_codegen::artifact_path(&tmp, "copy_words", target);
     poot_codegen::compile(&body, target, &out_path)?;
     let bytes = std::fs::read(&out_path)?;
-    let compiled = poot_codegen::kernel_handle(&body, target, bytes);
+    let compiled = poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::AmdGcn(arch), bytes);
     let module = Arc::new(ctx.load_hsaco(&compiled)?);
     let kernel = ctx.lookup_kernel(&module, compiled.entry_point())?;
     Ok((RocmKernel { module, kernel }, workgroup))

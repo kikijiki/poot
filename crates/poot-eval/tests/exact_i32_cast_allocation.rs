@@ -18,7 +18,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use poot_eval::cast_authority::{ExactI32CastBounds, ExactI32CastRole};
 use poot_eval::{EvalBudget, EvalOptions, ExactI32TensorView, Value, eval};
 use poot_graph_ir::Builder;
 
@@ -149,20 +148,8 @@ fn selected_cast_allocates_only_its_published_result() {
             Value::from(ExactI32TensorView::try_from_words(vec![SELECTED], index_words).unwrap()),
         ),
     ]);
-    let mut authority = |value: poot_graph_ir::ValueId| {
-        (value == cast.id()).then_some(ExactI32CastRole::HostCheckedSelector(ExactI32CastBounds {
-            selected_element_ceiling: SELECTED,
-            expert_count: 3,
-        }))
-    };
-
-    let (result, records) = record_large_allocations(|| {
-        eval(
-            &graph,
-            &inputs,
-            EvalOptions::new(EvalBudget::UNBOUNDED).cast_authority(&mut authority),
-        )
-    });
+    let (result, records) =
+        record_large_allocations(|| eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)));
 
     let Value::Host(tensor) = result.unwrap().output else {
         panic!("selected cast must publish a dense f32 result")

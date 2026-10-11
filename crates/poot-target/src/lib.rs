@@ -16,7 +16,9 @@
 //! [`storage`]: a device buffer's storage contract (element kind, logical dtype, layout), shared by
 //! every runtime's buffer handle and by the planner's per-value storage record (card 527).
 
+pub mod aie;
 pub mod storage;
+pub use aie::{AieCaps, AieIsa, AiePlatform, AieTargetId};
 pub use storage::{BufferStorage, ElementKind, LogicalDType, StorageLayout};
 
 /// The lowering backend. Most of `plan_eqn` is backend-neutral; the NVPTX-only kernels (tensor-core
@@ -28,6 +30,9 @@ pub enum Backend {
     /// ROCm/AMDGPU executor. Carries the per-device arch (gfx code, wavefront, tensor-core family) so
     /// `plan_eqn` can gate the WMMA path on `TensorCoreSupport::Wmma16x16x16Rdna3` (spec 130).
     AmdGcn(AmdArch),
+    /// An AMD XDNA NPU: one core runs a sequential loop and a typed link recipe moves the data (POOT-664).
+    /// Its limits are [`AieCaps`], not [`DeviceCaps`].
+    Aie(AieTargetId),
 }
 
 /// Matrix (tensor-core) hardware a device exposes, as measured from a real capability query - never

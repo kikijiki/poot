@@ -310,7 +310,7 @@ fn plan_indexed(
     caps: &DeviceCaps,
 ) -> Result<(Schedule, Vec<u32>, [u32; 3]), PlanError> {
     let ids = value_ids(eqn);
-    if g.aval(ids[1]).dtype != DType::F32 {
+    if g.aval(ids[1]).dtype != DType::I32 {
         return Err(site.refuse(Capability::IndexOperand));
     }
     let [out, k] = descriptor.shape();
@@ -540,10 +540,10 @@ mod tests {
     /// `compile` itself, since `compile`'s pipeline reverts a rewrite the target cannot plan (treating
     /// an over-cap `PackedContraction` like any other unplannable rewrite)
     /// and re-reports it as an unrelated "escaped dequant" error, burying the refusal this test wants
-    /// to observe. [`crate::plan_eqn_analyzed`], the still-production entry point every wgpu executor
+    /// to observe. [`crate::plan_eqn`], the still-production entry point every wgpu executor
     /// call site and test now uses, drives `try_plan_contraction` directly off the already-recognized
     /// eqn instead, the real entry point one level below the rewrite pipeline.
-    /// The index (not a clone) of the one `PackedContraction` eqn: `plan_eqn_analyzed`'s `ensure_eqn`
+    /// The index (not a clone) of the one `PackedContraction` eqn: `plan_eqn`'s `ensure_eqn`
     /// checks the equation's address against the analyzed graph's own `eqns` storage (card 671 - a
     /// cloned `Eqn` detached from that storage is correctly rejected, which a clone here used to
     /// paper over when these tests called the deleted, identity-unchecked `plan_eqn`).
@@ -597,8 +597,7 @@ mod tests {
     fn over_cap_tiled_contraction_folds_onto_a_2d_grid_not_the_wg_bump() {
         let (graph, index) = over_cap_tiled_eqn(1, 40, 8);
         let eqn = &graph.eqns[index];
-        let plan = crate::plan_eqn_analyzed(
-            &crate::ExactI32StorageAnalysis::new(&graph),
+        let plan = crate::plan_eqn(
             &graph,
             eqn,
             Backend::SpirvVulkan,
@@ -641,8 +640,7 @@ mod tests {
     fn over_cap_tiled_contraction_refuses_when_even_the_fold_cannot_address_every_tile() {
         let (graph, index) = over_cap_tiled_eqn(1, 200, 8);
         let eqn = &graph.eqns[index];
-        let error = crate::plan_eqn_analyzed(
-            &crate::ExactI32StorageAnalysis::new(&graph),
+        let error = crate::plan_eqn(
             &graph,
             eqn,
             Backend::SpirvVulkan,
@@ -744,7 +742,11 @@ mod tests {
         };
         let builder = Builder::new();
         let x = builder.slot_named(Slot::Activation, "x", TensorType::f32(vec![rows, k]));
-        let ids = builder.slot_named(Slot::Activation, "ids", TensorType::f32(vec![rows]));
+        let ids = builder.slot_named(
+            Slot::Activation,
+            "ids",
+            TensorType::new(vec![rows], poot_tensor::DType::I32),
+        );
         let y = poot_graph_ir::ops::packed_indexed_linear(&builder, x, ids, &table).unwrap();
         let graph = builder.finish(y);
         let index = graph
@@ -760,8 +762,7 @@ mod tests {
         index: usize,
         caps: &DeviceCaps,
     ) -> Result<crate::Plan, PlanError> {
-        crate::plan_eqn_analyzed(
-            &crate::ExactI32StorageAnalysis::new(graph),
+        crate::plan_eqn(
             graph,
             &graph.eqns[index],
             Backend::SpirvVulkan,
@@ -862,8 +863,7 @@ mod tests {
         );
         let (graph, index) = over_cap_tiled_eqn(blocks, m_per_block, out_per_block);
         let eqn = &graph.eqns[index];
-        let plan = crate::plan_eqn_analyzed(
-            &crate::ExactI32StorageAnalysis::new(&graph),
+        let plan = crate::plan_eqn(
             &graph,
             eqn,
             Backend::SpirvVulkan,

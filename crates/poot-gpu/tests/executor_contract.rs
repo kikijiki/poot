@@ -810,13 +810,16 @@ fn binder_and_target_refusals_are_typed() {
         "{err}"
     );
 
-    // SC-006: an f32 value bound to a declared-I32 scalar slot (Pos and
-    // Token are both I32), same shape and element count, must be refused by dtype lane rather than
-    // silently converted by the binder.
+    // SC-006 / POOT-725 SC-002: an f32 value bound to the declared-I32 `Slot::Pos` (same shape and element
+    // count) must be refused by dtype lane, a typed `BindError::Lane`, rather than silently converted by the
+    // binder: there is no f32 lane an index could ride.
+    //
+    // Mutation: encode an I32 slot's words as f32 values in `lanes::encode_host` and drop the dtype check in
+    // `binder::check_and_encode`; the f32 `Pos` binds and this row goes red.
     let i32_slot = values
         .iter()
-        .find(|v| v.dtype == DType::I32)
-        .expect("qwen2 decode graph has an I32 slot (Token/Pos)")
+        .find(|v| v.dtype == DType::I32 && v.key.role() == Slot::Pos)
+        .expect("qwen2 decode graph has an I32 `Slot::Pos`")
         .key
         .clone();
     let others: Vec<&SlotValue> = values.iter().filter(|v| v.key != i32_slot).collect();
@@ -839,6 +842,42 @@ fn binder_and_target_refusals_are_typed() {
     assert!(
         matches!(&err, poot_executor::ExecError::Bind(b) if matches!(**b, BindError::Lane { .. })),
         "{err}"
+    );
+
+    // POOT-726 SC-003: the graph declares `Slot::Pos` in `[0, capacity)` (the tracer's `Step`), so a
+    // position at the capacity is refused at bind, a typed `BindError::Range` naming the word, before
+    // any dispatch (the engine's replay counter does not move). The in-range position binds.
+    //
+    // Mutation: skip the `slot.range` check in `binder::check_and_encode`; the step runs and this row
+    // goes red.
+    let replays_before = engine.stats().replays;
+    let mut out_of_range = StepInputs::new();
+    for v in &others {
+        out_of_range.push(v.key.clone(), &v.shape, view(v));
+    }
+    let at_capacity = [i32::try_from(CAP).unwrap()];
+    out_of_range.push(
+        i32_slot.clone(),
+        &i32_value.shape,
+        HostView::new(DType::I32, 1, bytemuck::cast_slice(&at_capacity)).unwrap(),
+    );
+    let err = engine
+        .step(exe, decode, &out_of_range, &mut NoSync)
+        .err()
+        .unwrap();
+    assert!(
+        matches!(
+            &err,
+            poot_executor::ExecError::Bind(b)
+                if matches!(&**b, BindError::Range { index: 0, value, range, .. }
+                    if *value == CAP as i32 && !range.contains(*value))
+        ),
+        "{err}"
+    );
+    assert_eq!(
+        engine.stats().replays,
+        replays_before,
+        "a refused bind dispatches nothing"
     );
 
     // SC-012: a tensor whose declared shape matches the slot (so a check that
@@ -1225,7 +1264,7 @@ fn wgpu_device_classifies_a_kernel_assert_fault_from_synchronize() {
     poot_codegen::compile(&body, poot_codegen::Target::SpirvVulkan, &out_path)
         .expect("assert_trap must compile to SpirV");
     let spv = std::fs::read(&out_path).unwrap();
-    let compiled = poot_codegen::kernel_handle(&body, poot_codegen::Target::SpirvVulkan, spv);
+    let compiled = poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::SpirvVulkan, spv);
     let kernel = device
         .load_kernel("sc015_assert_trap", compiled)
         .expect("load the assert_trap kernel");

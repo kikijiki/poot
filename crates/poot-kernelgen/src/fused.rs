@@ -45,6 +45,10 @@ pub enum FusedScalarOp {
     /// `leaf_storage`) already decodes its elements to f32 as it reads them, so the step is the register
     /// copy that names the widened value; no f32 copy of the stored leaf exists.
     Widen,
+    /// `Cast` of an I32 value (a leaf, or an I32 step) to f32, rounding to nearest like the standalone cast
+    /// kernel. The one step that takes an I32 word into a float region: the words are read in place and
+    /// converted in a register, so neither a producer nor a consumer of the cast needs a kernel for it.
+    I32ToF32,
 }
 
 /// A kernel-ir comparison op: yields i1, so when it appears in an f32 pipeline its result is cast to f32
@@ -130,6 +134,10 @@ pub(crate) fn emit_scalar_op(
         }
         FusedScalarOp::Binary(b) => Rvalue::BinaryOp(b, operands[0].clone(), operands[1].clone()),
         FusedScalarOp::Widen => Rvalue::Use(operands[0].clone()),
+        FusedScalarOp::I32ToF32 => Rvalue::Cast {
+            to: Ty::F32,
+            operand: operands[0].clone(),
+        },
         FusedScalarOp::Recip => Rvalue::BinaryOp(
             BinOp::Div,
             Operand::Const(Constant::F32(1.0)),
@@ -299,7 +307,12 @@ impl FusedScalarOp {
     /// statements and the fresh temporaries it allocates, not counting the step's own result register.
     fn size(self) -> BodySize {
         let (instructions, locals) = match self {
-            Self::Unary(_) | Self::Math(_) | Self::Recip | Self::Clz | Self::Widen => (1, 0),
+            Self::Unary(_)
+            | Self::Math(_)
+            | Self::Recip
+            | Self::Clz
+            | Self::Widen
+            | Self::I32ToF32 => (1, 0),
             Self::Binary(BinOp::Shl) => (2, 1),
             Self::Binary(BinOp::Shr) => (5, 4),
             Self::Binary(op) if is_cmp(op) => (2, 1),
@@ -448,10 +461,14 @@ struct FloatRegionTys {
     output: Ty,
 }
 
-/// Type a float region and refuse what no float body can state. An I32 leaf has no float meaning, so it is
-/// read only as a `Select` condition. A two-byte float leaf or step is moved, never computed on, so only a
-/// `Select`'s branches (and the region output) may be one; a `Select` over two-byte floats is itself that
-/// type, its two branches agree, and every other step computes in F32.
+/// Type a region the float synthesizer lowers and refuse what no body can state. A step computes in F32,
+/// except that a step over I32 words is an I32 step: exact integer arithmetic (a comparison writes I32
+/// 0 or 1) that only a `Select` or an `I32ToF32` step turns into a float. So an I32 producer chain and the
+/// float chain that consumes it are one region, with the cast between them. An I32 leaf feeds an I32 step,
+/// a `Select` condition or a cast; mixing I32 and F32 operands in one arithmetic step has no meaning and is
+/// refused. A two-byte float leaf or step is moved, never computed on, so only a `Select`'s branches (and
+/// the region output) may be one; a `Select` over words of one type is itself that type, its two branches
+/// agree. The region output is a float: an I32 result is the exact-I32 synthesizer's.
 fn check_float_region_tys(
     generator: &'static str,
     k: &FusedKernel,
@@ -461,7 +478,8 @@ fn check_float_region_tys(
     let input_ty = |input: &FusedInput, steps: &[Ty]| match input {
         FusedInput::Leaf(leaf) => leaf_ty(*leaf).unwrap_or(Ty::F32),
         FusedInput::Step(step) => steps.get(*step).cloned().unwrap_or(Ty::F32),
-        FusedInput::Lit(_) | FusedInput::LitI32(_) | FusedInput::LeafLane { .. } => Ty::F32,
+        FusedInput::LitI32(_) => Ty::I32,
+        FusedInput::Lit(_) | FusedInput::LeafLane { .. } => Ty::F32,
     };
     let consumer_error = |input: &FusedInput, ty: &Ty, consumer: String| match (input, ty) {
         (FusedInput::Leaf(leaf), Ty::I32) => KernelGenError::IndexLeafOperand {
@@ -474,27 +492,36 @@ fn check_float_region_tys(
             consumer,
         },
     };
-    for step in &k.steps {
-        let is_select = matches!(step.op, FusedScalarOp::Select);
-        for (position, input) in step.inputs.iter().enumerate() {
-            let ty = input_ty(input, &steps);
-            let allowed = match ty {
-                Ty::I32 => is_select && position == 0,
-                Ty::BF16 | Ty::F16 => is_select && position != 0,
-                _ => true,
-            };
-            if !allowed {
-                return Err(consumer_error(input, &ty, format!("{:?}", step.op)));
-            }
-        }
+    for (index, step) in k.steps.iter().enumerate() {
+        let operand_tys: Vec<Ty> = step
+            .inputs
+            .iter()
+            .map(|input| input_ty(input, &steps))
+            .collect();
+        let refuse = |position: usize| {
+            consumer_error(
+                &step.inputs[position],
+                &operand_tys[position],
+                format!("{:?}", step.op),
+            )
+        };
         let result = match step.op {
+            FusedScalarOp::I32ToF32 => {
+                if operand_tys.first() != Some(&Ty::I32) {
+                    return Err(KernelGenError::IndexCastOperand {
+                        generator,
+                        step: index,
+                    });
+                }
+                Ty::F32
+            }
             FusedScalarOp::Select => {
-                let branches = step.inputs.get(1..).unwrap_or_default();
-                let first = branches.first().map(|input| input_ty(input, &steps));
-                if branches
-                    .iter()
-                    .any(|input| Some(input_ty(input, &steps)) != first)
-                {
+                if operand_tys.first() != Some(&Ty::I32) {
+                    return Err(refuse(0));
+                }
+                let branches = operand_tys.get(1..).unwrap_or_default();
+                let first = branches.first().cloned();
+                if branches.iter().any(|ty| Some(ty) != first.as_ref()) {
                     return Err(KernelGenError::NarrowOperand {
                         generator,
                         consumer: "a Select whose branches differ in type".to_string(),
@@ -502,7 +529,22 @@ fn check_float_region_tys(
                 }
                 first.unwrap_or(Ty::F32)
             }
-            _ => Ty::F32,
+            FusedScalarOp::GeU
+            | FusedScalarOp::RemU
+            | FusedScalarOp::Clz
+            | FusedScalarOp::Unary(UnOp::Not)
+            | FusedScalarOp::Binary(_)
+                if !operand_tys.is_empty() && operand_tys.iter().all(|ty| ty == &Ty::I32) =>
+            {
+                Ty::I32
+            }
+            _ => {
+                // A float step: an I32 or a two-byte operand has no float meaning here.
+                if let Some(position) = operand_tys.iter().position(|ty| ty != &Ty::F32) {
+                    return Err(refuse(position));
+                }
+                Ty::F32
+            }
         };
         steps.push(result);
     }
@@ -629,15 +671,21 @@ pub fn fused_views(
             FusedInput::Leaf(j) => copy(Place::local(leaf_val[*j])),
             FusedInput::Step(s) => copy(Place::local(step_reg[*s])),
             FusedInput::Lit(c) => Operand::Const(Constant::F32(*c)),
-            FusedInput::LitI32(_) | FusedInput::LeafLane { .. } => {
-                panic!("f32 fused kernel cannot carry an I32 packed lane or literal")
+            FusedInput::LitI32(c) => Operand::Const(Constant::I32(*c)),
+            FusedInput::LeafLane { .. } => {
+                panic!("a float fused kernel cannot carry an I32 packed lane")
             }
         }
     };
-    // evaluate the steps in order (each references only earlier leaves/steps).
+    // evaluate the steps in order (each references only earlier leaves/steps); a step over I32 words is
+    // emitted by the exact-integer emitter.
     for (s, step) in k.steps.iter().enumerate() {
         let operands: Vec<Operand> = step.inputs.iter().map(&resolve).collect();
-        emit_scalar_op(step_reg[s], step.op, &operands, &mut al, &mut body);
+        if region_tys.steps[s] == Ty::I32 {
+            emit_scalar_op_i32(step_reg[s], step.op, &operands, &mut al, &mut body);
+        } else {
+            emit_scalar_op(step_reg[s], step.op, &operands, &mut al, &mut body);
+        }
     }
     // out[i] = the region output value.
     body.push(Statement::Assign(

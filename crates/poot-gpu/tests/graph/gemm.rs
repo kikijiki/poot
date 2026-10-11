@@ -358,7 +358,7 @@ fn concat_n_gpu_matches_cpu() {
     .unwrap();
     assert!(
         plan.single()
-            .is_some_and(|dispatch| dispatch.launch.meta.is_empty()),
+            .is_some_and(|dispatch| dispatch.launch().meta.is_empty()),
         ">2-input concat must lower to a kernel, not the host fallback"
     );
     let mk = |off: f32, n: usize| -> Vec<f32> { (0..n).map(|i| i as f32 + off).collect() };
@@ -421,7 +421,7 @@ fn concat_n_rank4_axis2_gpu_matches_cpu() {
     .unwrap();
     assert!(
         plan.single()
-            .is_some_and(|dispatch| dispatch.launch.meta.is_empty()),
+            .is_some_and(|dispatch| dispatch.launch().meta.is_empty()),
         ">2-input concat must lower to a kernel"
     );
     let mut inputs = HashMap::new();
@@ -463,7 +463,7 @@ struct IndexedCase {
     k: usize,
     n: usize,
     e: usize,
-    ids: Vec<f32>,
+    ids: Vec<i32>,
 }
 
 /// Integer-valued fill in `[-3, 3]`: with `K * 3 * 3` far below `2^24` every partial sum is exact, so every
@@ -487,28 +487,28 @@ const INDEXED_N: usize = 21;
 
 /// Sorted expert ids over `rows` rows, runs of unequal length so tile boundaries (every 8 rows) cut across
 /// expert boundaries.
-fn sorted_ids(rows: usize) -> Vec<f32> {
+fn sorted_ids(rows: usize) -> Vec<i32> {
     let bounds = [37, 78, 116];
     (0..rows)
-        .map(|r| bounds.iter().filter(|&&b| r >= b).count() as f32)
+        .map(|r| bounds.iter().filter(|&&b| r >= b).count() as i32)
         .collect()
 }
 
 /// The same multiset in a deterministic shuffled order (stride 7 is coprime to 160).
-fn shuffled_ids(rows: usize) -> Vec<f32> {
+fn shuffled_ids(rows: usize) -> Vec<i32> {
     let sorted = sorted_ids(rows);
     (0..rows).map(|r| sorted[(r * 7) % rows]).collect()
 }
 
 /// One expert per 8-row tile: the fixture on which a walk that stops after its first step stays green.
-fn tile_aligned_ids(rows: usize) -> Vec<f32> {
+fn tile_aligned_ids(rows: usize) -> Vec<i32> {
     (0..rows)
-        .map(|r| ((r / 8) % INDEXED_EXPERTS) as f32)
+        .map(|r| ((r / 8) % INDEXED_EXPERTS) as i32)
         .collect()
 }
 
 fn indexed_cases() -> Vec<IndexedCase> {
-    let case = |name, m, ids: Vec<f32>| IndexedCase {
+    let case = |name, m, ids: Vec<i32>| IndexedCase {
         name,
         m,
         k: INDEXED_K,
@@ -517,11 +517,7 @@ fn indexed_cases() -> Vec<IndexedCase> {
         ids,
     };
     vec![
-        case(
-            "decode, unsorted ids with a repeat",
-            5,
-            vec![2.0, 0.0, 3.0, 2.0, 1.0],
-        ),
+        case("decode, unsorted ids with a repeat", 5, vec![2, 0, 3, 2, 1]),
         case("prefill, sorted ids", 160, sorted_ids(160)),
         case("prefill, shuffled ids", 160, shuffled_ids(160)),
         case("prefill, one expert per tile", 160, tile_aligned_ids(160)),
@@ -543,14 +539,14 @@ fn indexed_program(case: &IndexedCase, gate: Option<Vec<f32>>) -> IndexedProgram
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![m, k]));
     let w = b.constant("w", TensorType::f32(vec![e, k, n]));
-    let idx = b.constant("idx", TensorType::f32(vec![m]));
+    let idx = b.constant("idx", TensorType::new(vec![m], poot_tensor::DType::I32));
     let mut inputs = HashMap::new();
     inputs.insert(x.id(), HostTensor::f32(vec![m, k], int_fill(1, m * k)));
     inputs.insert(
         w.id(),
         HostTensor::f32(vec![e, k, n], int_fill(2, e * k * n)),
     );
-    inputs.insert(idx.id(), HostTensor::f32(vec![m], ids.clone()));
+    inputs.insert(idx.id(), HostTensor::i32(vec![m], ids.clone()));
     let mut out = b.indexed_matmul(x, w, idx);
     if let Some(gate) = gate {
         let gate_t = b.constant("gate", TensorType::f32(vec![m]));
@@ -636,12 +632,12 @@ fn indexed_matmul_checkpoint_order_experts_match_the_oracle_bit_for_bit() {
         return;
     };
     let (e, k, n) = (8usize, INDEXED_K, INDEXED_N);
-    let prefill: Vec<f32> = (0..160)
-        .map(|r| [7.0, 2.0, 2.0, 5.0, 0.0, 7.0, 3.0][(r * 5) % 7])
+    let prefill: Vec<i32> = (0..160)
+        .map(|r| [7, 2, 2, 5, 0, 7, 3][(r * 5) % 7])
         .collect();
     let cases = [
-        ("M=1", vec![5.0]),
-        ("M=5, unsorted with repeats", vec![6.0, 0.0, 6.0, 3.0, 1.0]),
+        ("M=1", vec![5]),
+        ("M=5, unsorted with repeats", vec![6, 0, 6, 3, 1]),
         ("M=160, shuffled", prefill),
     ];
     let mut failures = Vec::new();
@@ -650,14 +646,14 @@ fn indexed_matmul_checkpoint_order_experts_match_the_oracle_bit_for_bit() {
         let b = Builder::new();
         let x = b.constant("x", TensorType::f32(vec![m, k]));
         let w = b.constant("w", TensorType::f32(vec![e, n, k]));
-        let idx = b.constant("idx", TensorType::f32(vec![m]));
+        let idx = b.constant("idx", TensorType::new(vec![m], poot_tensor::DType::I32));
         let mut inputs = HashMap::new();
         inputs.insert(x.id(), HostTensor::f32(vec![m, k], int_fill(1, m * k)));
         inputs.insert(
             w.id(),
             HostTensor::f32(vec![e, n, k], int_fill(2, e * n * k)),
         );
-        inputs.insert(idx.id(), HostTensor::f32(vec![m], ids));
+        inputs.insert(idx.id(), HostTensor::i32(vec![m], ids));
         let out = b.indexed_matmul(x, b.transpose(w, vec![0, 2, 1]), idx);
         let program = IndexedProgram {
             graph: b.finish(out),
@@ -692,10 +688,10 @@ fn indexed_matmul_invalid_ids_write_nan_rows_and_the_oracle_refuses_them() {
         return;
     };
     let bad = [
-        (4.0f32, IndexFaultKind::OutOfRange),
-        (-1.0, IndexFaultKind::Negative),
-        (f32::NAN, IndexFaultKind::NotFinite),
-        (1.5, IndexFaultKind::NotIntegral),
+        (4i32, IndexFaultKind::OutOfRange),
+        (-1, IndexFaultKind::Negative),
+        (i32::MIN, IndexFaultKind::Negative),
+        (i32::MAX, IndexFaultKind::OutOfRange),
     ];
     for (id, kind) in bad {
         let case = IndexedCase {
@@ -704,20 +700,20 @@ fn indexed_matmul_invalid_ids_write_nan_rows_and_the_oracle_refuses_them() {
             k: INDEXED_K,
             n: INDEXED_N,
             e: INDEXED_EXPERTS,
-            ids: vec![id, 0.0, 1.0, 2.0],
+            ids: vec![id, 0, 1, 2],
         };
         let Err(EvalError::Index(fault)) = indexed_oracle(&indexed_program(&case, None)) else {
             panic!("the oracle must refuse id {id}");
         };
         assert_eq!((fault.position, fault.len, fault.kind), (0, 4, kind));
         match fault.value {
-            IndexValue::F32(v) => assert_eq!(v.to_bits(), id.to_bits()),
+            IndexValue::I32(v) => assert_eq!(v, id),
             other => panic!("id {id} reported as {other:?}"),
         }
     }
-    let mut decode = vec![4.0, -1.0, f32::NAN, 1.5, 2.0, 0.0];
+    let mut decode = vec![4, -1, i32::MIN, i32::MAX, 2, 0];
     let mut prefill = shuffled_ids(160);
-    for (row, value) in [(3, 4.0), (17, -1.0), (64, f32::NAN), (159, 1.5)] {
+    for (row, value) in [(3, 4), (17, -1), (64, i32::MIN), (159, i32::MAX)] {
         prefill[row] = value;
     }
     for (name, ids) in [
@@ -733,15 +729,9 @@ fn indexed_matmul_invalid_ids_write_nan_rows_and_the_oracle_refuses_them() {
             ids: ids.clone(),
         };
         // The oracle's values for the rows that have a valid id: the same program with the bad ids replaced.
-        let clean: Vec<f32> = ids
+        let clean: Vec<i32> = ids
             .iter()
-            .map(|&v| {
-                if (0.0..4.0).contains(&v) && v.fract() == 0.0 {
-                    v
-                } else {
-                    0.0
-                }
-            })
+            .map(|&v| if (0..4).contains(&v) { v } else { 0 })
             .collect();
         let want =
             indexed_oracle(&indexed_program(&IndexedCase { ids: clean, ..case }, None)).unwrap();
@@ -759,7 +749,7 @@ fn indexed_matmul_invalid_ids_write_nan_rows_and_the_oracle_refuses_them() {
         let got = run_via_contract(&mut gpu, target, &program.graph, &program.inputs);
         let (got, want) = (got.as_f32().unwrap(), want.as_f32().unwrap());
         for (row, &id) in ids.iter().enumerate() {
-            let valid = (0.0..4.0).contains(&id) && id.fract() == 0.0;
+            let valid = (0..4).contains(&id);
             for col in 0..INDEXED_N {
                 let i = row * INDEXED_N + col;
                 if valid {
@@ -816,12 +806,12 @@ fn routed_gate_weighting_checkpoint_order_equals_the_oracle_bit_for_bit() {
         return;
     };
     let (e, k, n) = (8usize, INDEXED_K, INDEXED_N);
-    for ids in [vec![6.0, 0.0, 6.0, 3.0, 1.0], shuffled_ids(160)] {
+    for ids in [vec![6, 0, 6, 3, 1], shuffled_ids(160)] {
         let m = ids.len();
         let b = Builder::new();
         let x = b.constant("x", TensorType::f32(vec![m, k]));
         let w = b.constant("w", TensorType::f32(vec![e, n, k]));
-        let idx = b.constant("idx", TensorType::f32(vec![m]));
+        let idx = b.constant("idx", TensorType::new(vec![m], poot_tensor::DType::I32));
         let gate_t = b.constant("gate", TensorType::f32(vec![m]));
         let mut inputs = HashMap::new();
         inputs.insert(x.id(), HostTensor::f32(vec![m, k], int_fill(1, m * k)));
@@ -829,7 +819,7 @@ fn routed_gate_weighting_checkpoint_order_equals_the_oracle_bit_for_bit() {
             w.id(),
             HostTensor::f32(vec![e, n, k], int_fill(2, e * n * k)),
         );
-        inputs.insert(idx.id(), HostTensor::f32(vec![m], ids));
+        inputs.insert(idx.id(), HostTensor::i32(vec![m], ids));
         // Dyadic gates, so the product with an exact integer sum is exact.
         let gate: Vec<f32> = (0..m)
             .map(|r| [0.5, -2.0, 1.25, 3.0, -0.75][r % 5])
@@ -867,9 +857,9 @@ fn indexed_matmul_bf16_experts_match_the_oracle_bit_for_bit() {
         return;
     };
     let (e, k, n) = (8usize, INDEXED_K, INDEXED_N);
-    let decode = vec![6.0, 0.0, 6.0, 3.0, 1.0];
-    let prefill: Vec<f32> = (0..160)
-        .map(|r| [7.0, 2.0, 2.0, 5.0, 0.0, 7.0, 3.0][(r * 5) % 7])
+    let decode = vec![6, 0, 6, 3, 1];
+    let prefill: Vec<i32> = (0..160)
+        .map(|r| [7, 2, 2, 5, 0, 7, 3][(r * 5) % 7])
         .collect();
     let mut failures = Vec::new();
     for (name, ids) in [("M=5", decode), ("M=160, shuffled", prefill)] {
@@ -878,7 +868,7 @@ fn indexed_matmul_bf16_experts_match_the_oracle_bit_for_bit() {
                 let m = ids.len();
                 let b = Builder::new();
                 let x = b.constant("x", TensorType::f32(vec![m, k]));
-                let idx = b.constant("idx", TensorType::f32(vec![m]));
+                let idx = b.constant("idx", TensorType::new(vec![m], poot_tensor::DType::I32));
                 let stored = if checkpoint_order {
                     vec![e, n, k]
                 } else {
@@ -890,7 +880,7 @@ fn indexed_matmul_bf16_experts_match_the_oracle_bit_for_bit() {
                 );
                 let mut inputs = HashMap::new();
                 inputs.insert(x.id(), HostTensor::f32(vec![m, k], int_fill(1, m * k)));
-                inputs.insert(idx.id(), HostTensor::f32(vec![m], ids.clone()));
+                inputs.insert(idx.id(), HostTensor::i32(vec![m], ids.clone()));
                 let words = int_fill(2, e * k * n)
                     .iter()
                     .map(|v| (v.to_bits() >> 16) as u16)

@@ -1,0 +1,124 @@
+{
+  "backend": "rocm",
+  "binary": "/tmp/claude-1000/ab/parent-rocm",
+  "case": "ssd-recurrence-scan-boundary",
+  "cells": {
+    "kernel": {
+      "repeats": [
+        {
+          "metrics": {
+            "step_us": 1030.9360000000001
+          },
+          "slot": 0,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 1041.646
+          },
+          "slot": 1,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 1026.518
+          },
+          "slot": 2,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 1037.238
+          },
+          "slot": 3,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 1038.931
+          },
+          "slot": 4,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 1032.3890000000001
+          },
+          "slot": 5,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 1045.984
+          },
+          "slot": 6,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 1026.508
+          },
+          "slot": 7,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 1036.737
+          },
+          "slot": 8,
+          "status": "ok"
+        }
+      ]
+    }
+  },
+  "hardware": {
+    "backend": "rocm",
+    "device": "AMD Radeon 8060S Graphics",
+    "driver": "host kernel 7.2.9"
+  },
+  "memory": [
+    {
+      "live_bytes": 2760736,
+      "peak_bytes": 2760736,
+      "role": "Weight"
+    },
+    {
+      "live_bytes": 655360,
+      "peak_bytes": 655360,
+      "role": "Activation"
+    },
+    {
+      "live_bytes": 128,
+      "peak_bytes": 128,
+      "role": "Meta"
+    }
+  ],
+  "observed": {
+    "layout": "bhsd",
+    "shape": {
+      "family": "ssd",
+      "heads": 4,
+      "n": 128,
+      "p": 64,
+      "steps": 512
+    },
+    "storage": "f32",
+    "weight_bytes_per_copy": 2760736,
+    "weight_copies": 1
+  },
+  "plan": [
+    "scan [0121a756ae6418382b1cf3857da2e734ea38dadc5fec4203d26b239a7fd160a8]"
+  ],
+  "plan_id": "fdf0a641633795d4ba1488167c2556b156fc9b58b681ecb167ac2b2dbaba449c",
+  "recordings": 1,
+  "reference": {
+    "agrees": true,
+    "max_relative_error": 3.714123961044333e-7,
+    "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
+    "provenance": "independent-golden",
+    "tolerance": 0.002
+  },
+  "replays": 13,
+  "role": "baseline",
+  "schema": 1
+}

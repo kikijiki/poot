@@ -210,6 +210,7 @@ fn backend_label(backend: TargetBackend) -> String {
         TargetBackend::Nvptx => "nvptx".to_string(),
         TargetBackend::SpirvVulkan => "spirv-vulkan".to_string(),
         TargetBackend::AmdGcn(arch) => format!("amdgcn-{}", arch.mcpu()),
+        TargetBackend::Aie(target) => target.canonical(),
     }
 }
 
@@ -430,6 +431,7 @@ fn driver_options(
         },
         charge: program_retention,
         draft,
+        hidden_window: None,
     }
 }
 

@@ -89,6 +89,7 @@ let options = DriverOptions {
     },
     charge: poot_llm::driver::program_retention,
     draft: DraftPolicy::Off, // or PromptLookup / DraftModel: see Speculative decoding
+    hidden_window: None,    // Some(window): every program also writes a hidden-state carry
 };
 let mut driver = Driver::new(Arc::clone(&handle), open_executor(BackendChoice::Auto)?, options)?;
 let generation = driver.generate(

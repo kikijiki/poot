@@ -7,7 +7,7 @@
 //! device output even though a device and the oracle both read the same constant.
 
 use poot_graph_ir::ops::{alibi_mask_from_pos, attention_masked};
-use poot_graph_ir::{Builder, ComputedConst, Graph, Slot, TensorType};
+use poot_graph_ir::{Builder, ComputedConst, Graph, IndexRange, Slot, TensorType};
 use poot_quant::weights::{WeightEntry, WeightStore};
 use poot_tensor::{DType, HostTensor};
 
@@ -28,7 +28,11 @@ fn graph(tokens: usize) -> Graph {
     let q = b.constant("q", TensorType::f32(vec![1, HEADS, tokens, D]));
     let k = b.constant("k", TensorType::f32(vec![1, HEADS, CAP, D]));
     let v = b.constant("v", TensorType::f32(vec![1, HEADS, CAP, D]));
-    let pos = b.slot(Slot::Pos, TensorType::new(vec![1, tokens], DType::I32));
+    let pos = b.slot_ranged(
+        Slot::Pos,
+        TensorType::new(vec![1, tokens], DType::I32),
+        IndexRange::below(CAP).expect("a nonempty cache"),
+    );
     let slopes = b.computed(ComputedConst::AlibiSlopes { heads: HEADS });
     let mask = alibi_mask_from_pos(&b, pos, CAP, None, slopes, HEADS);
     let y = attention_masked(&b, q, k, v, 1, 1.0 / (D as f32).sqrt(), mask);

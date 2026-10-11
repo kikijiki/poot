@@ -22,12 +22,12 @@ use std::time::Instant;
 
 use poot_graph_ir::{
     BoundaryId, Eqn, Slot, SlotKey, StateRole, Storage, TensorType, ValidationOutputs, ValueId,
-    ValueTable,
+    ValueMeta, ValueTable,
 };
 use poot_graph_plan::multi_device::PlanNodeId;
 use poot_graph_plan::{
-    DeviceId, Link, Plan, PoolSite, Program, StageId, StagedProgram, Submission, SyncPoint,
-    TargetSet, Transfer, dispatch_work, value_ids,
+    DeviceId, Link, Plan, PoolSite, Program, Sink, Source, StageId, StagedProgram, Submission,
+    SyncPoint, TargetSet, Transfer, dispatch_work, value_ids,
 };
 use poot_kernel_ir::Body;
 use poot_quant::SourceRole;
@@ -44,6 +44,10 @@ use crate::{
     EntryId, ExecutableId, Executor, ExecutorStats, HostSync, OutputSource, RowFill, SiteIdentity,
     StageStats, StateScope, StepInputs, StepOutputs, SyncReads, SyncWrites, TableIdentity,
 };
+
+/// The refusal for a dispatch bound to a scratch buffer: the planner emits none until the engine
+/// allocates scratch (POOT-1113).
+const SCRATCH_BINDING: &str = "a dispatch bound to a scratch buffer";
 
 pub struct Engine<D: Device> {
     // Field order is drop order: executables (and their recordings and buffers) drop before the
@@ -393,17 +397,10 @@ pub(crate) fn device_error<E: std::error::Error + Send + Sync + 'static>(
                 Backend::SpirvVulkan => "wgpu",
                 Backend::AmdGcn(_) => "rocm",
                 Backend::Nvptx => "ptx",
+                Backend::Aie(_) => "xdna",
             },
             source: Box::new(source),
         })
-    }
-}
-
-fn codegen_target(backend: Backend) -> poot_codegen::Target {
-    match backend {
-        Backend::SpirvVulkan => poot_codegen::Target::SpirvVulkan,
-        Backend::Nvptx => poot_codegen::Target::Nvptx,
-        Backend::AmdGcn(arch) => poot_codegen::Target::AmdGcn(arch),
     }
 }
 
@@ -542,7 +539,7 @@ impl<D: Device> Engine<D> {
             pending_release: Vec::new(),
             kernels: Vec::new(),
             kernel_index: HashMap::new(),
-            kernel_cache: poot_codegen::KernelCache::open(codegen_target(backend)),
+            kernel_cache: poot_codegen::KernelCache::open(poot_codegen::Target::from(backend)),
             shared_kernels: None,
             kernels_resolved: 0,
             residency: HashMap::new(),
@@ -656,7 +653,11 @@ impl<D: Device> Engine<D> {
                 resolve().map_err(codegen_error)?
             }
         };
-        let compiled = poot_codegen::kernel_handle(body, codegen_target(backend), bytes);
+        // An AIE kernel is a linked artifact, not a byte artifact, and no AIE `Device` exists yet: the
+        // arm is unreachable today and is a typed refusal, not a panic, if one is ever wired here.
+        let target = poot_codegen::GpuTarget::try_from(poot_codegen::Target::from(backend))
+            .map_err(|_| LoadError::NoByteArtifact { backend })?;
+        let compiled = poot_codegen::kernel_handle(body, target, bytes);
         let kernel = self
             .device
             .load_kernel(key, compiled)
@@ -1024,8 +1025,8 @@ impl<D: Device> Engine<D> {
                         stage: point.after,
                     })?;
                 let lane = stage.storage().storage(exported.value).buffer_storage();
-                if lane != BufferStorage::f32()
-                    || stage.graph().aval(exported.value).dtype != DType::F32
+                if lane != BufferStorage::i32()
+                    || stage.graph().aval(exported.value).dtype != DType::I32
                 {
                     return Err(LoadError::SyncReadLane {
                         point: point.id,
@@ -1163,7 +1164,7 @@ impl<D: Device> Engine<D> {
                         .clone()
                         .ok_or(LoadError::UnnamedConst { value: id })?;
                     let (idx, elems) =
-                        self.weight_buffer(exe, id, &name, &meta.aval, chunks.get(&id), storage)?;
+                        self.weight_buffer(exe, id, &name, meta, chunks.get(&id), storage)?;
                     (Loc::Weight(idx), elems)
                 }
                 Storage::Computed(computed) => {
@@ -1261,7 +1262,10 @@ impl<D: Device> Engine<D> {
                         (loc, elems)
                     } else if let Some(shared) = slots.iter().find(|slot| slot.key == key) {
                         // The same slot declared by an earlier stage: one host-written buffer.
-                        if shared.aval != meta.aval || shared.storage != storage {
+                        if shared.aval != meta.aval
+                            || shared.storage != storage
+                            || shared.range != meta.range()
+                        {
                             return Err(LoadError::SlotConflict { key }.into());
                         }
                         (Loc::Local(shared.buffer), elems_of(id)?)
@@ -1276,6 +1280,7 @@ impl<D: Device> Engine<D> {
                             aval: meta.aval.clone(),
                             storage,
                             buffer,
+                            range: meta.range(),
                         });
                         (loc, elems)
                     }
@@ -1330,16 +1335,24 @@ impl<D: Device> Engine<D> {
                         &values,
                     )?;
                     let output = (output_loc, elems_of(eqn.out)?);
+                    let operands = operands_with_elems(&values, eqn)?;
                     let per_dispatch_work = work / (dispatches.len().max(1) as u64);
-                    for dispatch in dispatches {
-                        let poot_graph_plan::Dispatch {
-                            body,
-                            key,
-                            label,
-                            launch,
-                        } = dispatch;
-                        let kernel = self.kernel(key, body, max_artifact_bytes)?;
-                        let mut inputs = operands_with_elems(&values, eqn)?;
+                    for dispatch in dispatches.iter() {
+                        let (body, launch) = (dispatch.body(), dispatch.launch());
+                        let kernel = self.kernel(dispatch.key(), body, max_artifact_bytes)?;
+                        let binding = dispatch.binding();
+                        let Sink::Out = binding.write() else {
+                            return Err(LoadError::Unimplemented(SCRATCH_BINDING).into());
+                        };
+                        let mut inputs = Vec::with_capacity(binding.reads().len() + 1);
+                        for source in binding.reads() {
+                            let Source::Operand(operand) = *source else {
+                                return Err(LoadError::Unimplemented(SCRATCH_BINDING).into());
+                            };
+                            inputs.push(*operands.get(operand).ok_or(LoadError::Unimplemented(
+                                "a dispatch binds an operand its equation lacks",
+                            ))?);
+                        }
                         if !launch.meta.is_empty() {
                             let meta_loc = self.meta_buffer(&launch.meta, locals)?;
                             inputs.push((meta_loc, launch.meta.len() as u32));
@@ -1352,7 +1365,7 @@ impl<D: Device> Engine<D> {
                             workgroup: body.workgroup_size,
                             work: per_dispatch_work,
                             kind_name: eqn.op.kind_name(),
-                            label: label.clone(),
+                            label: dispatch.label().to_string(),
                         });
                     }
                     values[eqn.out] = Some(output);
@@ -1558,12 +1571,18 @@ impl<D: Device> Engine<D> {
         exe: ExecutableId,
         value: ValueId,
         name: &str,
-        aval: &TensorType,
+        meta: &ValueMeta,
         chunk: Option<&binder::Chunk>,
         storage: BufferStorage,
     ) -> Result<(usize, u32), ExecError> {
+        let aval = &meta.aval;
         let loaded = self.loaded(exe)?;
         let bytes = loaded.binder.const_bytes(value, name, aval, chunk)?;
+        // Before the residency lookup: the bytes may be resident under another executable that
+        // declared no range, and this graph's declaration is what its consumers rely on.
+        if let Some(range) = meta.range() {
+            loaded.binder.check_range(name, &bytes, range)?;
+        }
         let key = Residency {
             runs: bytes
                 .spans
@@ -1992,13 +2011,13 @@ impl<D: Device> Engine<D> {
                     .read(resolve::<D>(loc, &e.locals, &e.arena, &held), &mut bytes)
                     .map_err(device_error(backend))?;
                 sync_counters.read_bytes += bytes.len() as u64;
-                let floats = bytes
+                let words = bytes
                     .as_chunks::<4>()
                     .0
                     .iter()
-                    .map(|c| f32::from_le_bytes(*c))
+                    .map(|c| i32::from_le_bytes(*c))
                     .collect();
-                values.push((id, floats));
+                values.push((id, words));
             }
             sync_counters.syncs += 1;
             (
@@ -2127,8 +2146,8 @@ impl<D: Device> Engine<D> {
         }
         if let Some(values) = &writes.map {
             let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-            let encoded = crate::lanes::encode_host(DType::F32, &bytes, *storage)
-                .ok_or(LoadError::Unimplemented("a pool map lane that is not F32"))?;
+            let encoded = crate::lanes::encode_host(DType::I32, &bytes, *storage)
+                .ok_or(LoadError::Unimplemented("a pool map lane that is not I32"))?;
             crate::device::write_slice(device, &map.buffer, 0, &encoded)
                 .map_err(device_error(backend))?;
         }
@@ -3667,7 +3686,7 @@ mod f16_packed_weight_upload_tests {
 mod weight_source_tests {
     use super::*;
     use crate::{NoSync, StepInputs};
-    use poot_graph_ir::{BinOp, Builder, Graph};
+    use poot_graph_ir::{BinOp, Builder, Graph, IndexRange};
     use poot_graph_plan::{
         CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, TargetSet,
         WeightFormats, bind_packed_weights, compile_staged,
@@ -4137,8 +4156,9 @@ mod weight_source_tests {
             0,
             tokens,
         );
-        let out = b.cast(rows, DType::F32);
-        let g = b.finish(out);
+        // The gathered words are the output as they are: the table's range is not declared, so no
+        // `I32 -> F32` cast of it is provable (POOT-726).
+        let g = b.finish(rows);
         let mut engine = Engine::new(Recorder::default());
         let program = compile(&engine, &g);
         let exe = engine
@@ -4154,6 +4174,118 @@ mod weight_source_tests {
             "no upload holds the table as its narrowed I32 words"
         );
         assert_size_only_matches_bytes(&weights, &mapped, &g);
+    }
+
+    /// A hash-routing table declared in `[0, experts)` ([`Builder::constant_ranged`]) is a checked
+    /// fact: the weight binder reads every stored word (here narrowed from I64, as the checkpoint
+    /// stores `tid2eid`) and refuses a table with one outside, naming the word and the range, before
+    /// anything uploads. The same graph over an in-range table loads.
+    ///
+    /// Mutation: skip the `check_range` call in `weight_buffer`; the out-of-range table uploads and
+    /// this row goes red (`load` returns Ok where a `WeightRange` refusal is required).
+    #[test]
+    fn a_ranged_index_table_with_a_word_outside_its_range_is_refused_at_weight_bind() {
+        const EXPERTS: usize = 4;
+        let table = WeightId::layer(0, WeightRole::Moe(poot_quant::weights::MoeRole::HashTable));
+        let load = |words: [i64; 4]| {
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let weights = store(vec![(
+                "tid2eid",
+                WeightEntry::Dense(
+                    DenseWeight::try_new(DType::I64, vec![2, 2], StoredBytes::from(bytes)).unwrap(),
+                ),
+            )]);
+            let mapped = map(
+                &weights,
+                vec![(table, WeightView::IndexNarrow("tid2eid".into()))],
+            );
+            let b = Builder::new();
+            let tokens = b.slot(Slot::Token, TensorType::new(vec![1], DType::I32));
+            let rows = b.gather(
+                b.constant_ranged(
+                    &table.const_name(),
+                    TensorType::new(vec![2, 2], DType::I32),
+                    IndexRange::below(EXPERTS).unwrap(),
+                ),
+                0,
+                tokens,
+            );
+            let g = b.finish(rows);
+            let mut engine = Engine::new(Recorder::default());
+            let program = compile(&engine, &g);
+            let exe = engine.load_weights(weights, mapped).unwrap();
+            engine.add_entry(exe, &program)
+        };
+
+        load([0, 3, 2, 1]).expect("a table inside [0, 4) loads");
+        let error = load([0, 3, 4, 1]).expect_err("word 4 is outside [0, 4)");
+        match &error {
+            ExecError::Load(load) => match &**load {
+                LoadError::WeightRange {
+                    name,
+                    index,
+                    value,
+                    range,
+                } => {
+                    assert_eq!(name, &table.const_name());
+                    assert_eq!((*index, *value), (2, 4));
+                    assert_eq!(*range, IndexRange::below(EXPERTS).unwrap());
+                }
+                other => panic!("expected a weight range refusal, got {other:?}"),
+            },
+            other => panic!("expected a load refusal, got {other:?}"),
+        }
+        assert!(
+            error.to_string().contains("[0, 4)"),
+            "the refusal names the declared range: {error}"
+        );
+    }
+
+    /// A cast of a gathered ranged table compiles (its words are proven inside the exactly
+    /// representable integers of `f32` from the declaration, through the `Gather` rule), and the
+    /// same graph over an undeclared table is refused as an unproven cast.
+    ///
+    /// Mutation: make `Builder::declare_constant` record `None` for a ranged const; the declared
+    /// graph is refused and this row goes red naming the cast.
+    #[test]
+    fn a_cast_of_a_gathered_ranged_table_compiles_and_an_undeclared_one_is_refused() {
+        let graph = |range: Option<IndexRange>| {
+            let b = Builder::new();
+            let tokens = b.slot(Slot::Token, TensorType::new(vec![1], DType::I32));
+            let aval = TensorType::new(vec![2, 2], DType::I32);
+            let table = match range {
+                Some(range) => b.constant_ranged("hash.table", aval, range),
+                None => b.constant("hash.table", aval),
+            };
+            let out = b.cast(b.gather(table, 0, tokens), DType::F32);
+            b.finish(out)
+        };
+        let engine = Engine::new(Recorder::default());
+        let compiled = |g: &Graph| {
+            compile_staged(
+                &g.clone().with_validations(Vec::new()),
+                &TargetSet::single(DeviceId(0), engine.device().target()),
+                &Partition {
+                    experts: ExpertPlacement::AllResident,
+                    devices: DevicePlacement::Single(DeviceId(0)),
+                },
+                &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+            )
+        };
+        compiled(&graph(Some(IndexRange::below(4).unwrap())))
+            .expect("a gathered table declared in [0, 4) casts to F32");
+        let Err(refused) = compiled(&graph(None)) else {
+            panic!("an undeclared table's cast is refused");
+        };
+        assert!(
+            matches!(
+                refused,
+                poot_graph_plan::StagedCompileError::Compile(
+                    poot_graph_plan::CompileError::CastRange(_)
+                )
+            ),
+            "expected the cast-range refusal, got {refused:?}"
+        );
     }
 
     /// The packed half of the row-view bytes: a fused Q8_0 `[3N, K]` payload viewed as Q/K/V by
@@ -4717,7 +4849,7 @@ mod weight_source_tests {
                     first_row: 0,
                     experts: vec![3],
                 }],
-                map: Some(vec![-1.0; EXPERTS]),
+                map: Some(vec![-1; EXPERTS]),
             },
         };
         log.lock().unwrap().clear();
@@ -4746,8 +4878,8 @@ mod weight_source_tests {
     #[test]
     fn a_refill_writes_the_experts_stored_bytes_into_its_row() {
         let (mut engine, exe, entry, log) = pooled_engine(1);
-        let mut map = vec![-1.0f32; EXPERTS];
-        map[4] = 1.0;
+        let mut map = vec![-1i32; EXPERTS];
+        map[4] = 1;
         let mut host = LoggingHost {
             log,
             calls: Vec::new(),
@@ -4974,7 +5106,7 @@ mod weight_source_tests {
                     experts: vec![row + 1],
                 })
                 .collect(),
-            map: Some(vec![-1.0, 0.0, 1.0, 2.0, -1.0, -1.0]),
+            map: Some(vec![-1, 0, 1, 2, -1, -1]),
         };
         let map_bytes: Vec<u8> = fill
             .map
