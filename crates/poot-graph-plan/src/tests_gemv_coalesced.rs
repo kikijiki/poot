@@ -538,8 +538,8 @@ fn gemv_coalesced_grid_matches_dispatch_formula() {
         let x = bld.constant("x", TensorType::f32(vec![1, 1]));
         let w = bld.constant("w", TensorType::f32(vec![1, n]));
         let y = bld.matmul(x, w);
-        let g = bld.finish(y);
-        let eqn = &g.eqns[0];
+        let g = bld.finish(y).unwrap();
+        let eqn = &g.eqns()[0];
         let plan = crate::plan_eqn(
             &g,
             eqn,
@@ -581,8 +581,8 @@ fn gemv_coalesced_grid_matches_dispatch_formula() {
     let x = bld.constant("x", TensorType::f32(vec![1, 1]));
     let w = bld.constant("w", TensorType::f32(vec![1, n]));
     let y = bld.matmul(x, w);
-    let g = bld.finish(y);
-    let eqn = &g.eqns[0];
+    let g = bld.finish(y).unwrap();
+    let eqn = &g.eqns()[0];
     let spirv = poot_target::Backend::SpirvVulkan;
     let no_watchdog_caps = poot_target::DeviceCaps {
         watchdog_budget: None,

@@ -23,7 +23,7 @@ fn scatter_axis0_inverts_a_permutation() {
     let idx = b.constant("idx", TensorType::new(vec![3], DType::I32));
     let s = b.scatter(src, idx);
     let (si, ii) = (src.id(), idx.id());
-    let g = b.finish(s);
+    let g = b.finish(s).unwrap();
 
     let mut inputs = HashMap::new();
     inputs.insert(
@@ -54,7 +54,7 @@ fn scatter_axis0_inverts_a_permutation() {
     let idx2 = b2.constant("i", TensorType::new(vec![4], DType::I32));
     let sc = b2.scatter(src2, idx2);
     let (s2, i2) = (src2.id(), idx2.id());
-    let g2 = b2.finish(sc);
+    let g2 = b2.finish(sc).unwrap();
     let mut in2 = HashMap::new();
     in2.insert(
         s2,
@@ -85,7 +85,7 @@ fn scatter_refuses_an_index_outside_the_rows() {
         let idx = b.constant("idx", TensorType::new(vec![3], DType::I32));
         let scattered = b.scatter(src, idx);
         let (si, ii) = (src.id(), idx.id());
-        let g = b.finish(scattered);
+        let g = b.finish(scattered).unwrap();
         let mut inputs = HashMap::new();
         inputs.insert(si, Value::from(HostTensor::f32(vec![3, 2], vec![0.0; 6])));
         inputs.insert(ii, Value::from(HostTensor::i32(vec![3], index.clone())));
@@ -132,7 +132,7 @@ fn arg_top_k_matches_per_row_scatter_iota_rank_slice() {
     let gt = br.binary_scalar(BinOp::Add, gt, poot_graph_ir::types::Scalar::F32(1.0));
     let rank = br.reduce(RedOp::Sum, gt, 2, false); // [L, E]
     let lgi = lg.id();
-    let gr = br.finish(rank);
+    let gr = br.finish(rank).unwrap();
     let mut rank_inputs = HashMap::new();
     rank_inputs.insert(lgi, Value::from(HostTensor::f32(vec![l, e], logits)));
     let rank_t = eval(&gr, &rank_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -157,9 +157,9 @@ fn arg_top_k_matches_per_row_scatter_iota_rank_slice() {
         "ArgTopK ids are I32, the one index dtype"
     );
     let rki = rk.id();
-    let ga = ba.finish(out);
+    let ga = ba.finish(out).unwrap();
     assert!(
-        matches!(ga.eqns.last().unwrap().op, OpKind::ArgTopK { k: kk } if kk == k),
+        matches!(ga.eqns().last().unwrap().op, OpKind::ArgTopK { k: kk } if kk == k),
         "the traced graph carries an ArgTopK eqn"
     );
     let mut a_inputs = HashMap::new();
@@ -224,7 +224,7 @@ fn ge_indicator_with_broadcast() {
     let y = b.constant("y", TensorType::f32(vec![3]));
     let g = b.binary(BinOp::Ge, x, y);
     let (xi, yi) = (x.id(), y.id());
-    let g = b.finish(g);
+    let g = b.finish(g).unwrap();
 
     let mut inputs = HashMap::new();
     inputs.insert(
@@ -254,7 +254,7 @@ fn top_k_gate_selects_topk_and_normalizes() {
     let x = b.constant("x", TensorType::f32(vec![2, 4]));
     let g = top_k_gate(&b, x, 2);
     let xi = x.id();
-    let g = b.finish(g);
+    let g = b.finish(g).unwrap();
 
     let xd = vec![1.0, 3.0, 2.0, 0.0, 5.0, 5.0, 1.0, 4.0];
     let mut inputs = HashMap::new();
@@ -284,7 +284,7 @@ fn top_k_gate_composition_matches_sort_reference() {
     let x = b.constant("x", TensorType::f32(vec![rows, e]));
     let xi = x.id();
     let gate = top_k_gate(&b, x, k);
-    let g = b.finish(gate);
+    let g = b.finish(gate).unwrap();
 
     // distinct pseudo-random logits (a cheap hash, scaled), no ties.
     let xd: Vec<f32> = (0..rows * e)
@@ -327,7 +327,7 @@ fn moe_matches_reference() {
     let w_out = b.constant("w_out", TensorType::f32(vec![e, i, h]));
     let out = moe_dense(&b, x, router, w_in, w_out, e, k, i);
     let (xi, ri, wii, woi) = (x.id(), router.id(), w_in.id(), w_out.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let xd = fill(l * h, 1);
     let rd = fill(h * e, 2);
@@ -401,7 +401,7 @@ fn moe_sparse_matches_dense() {
 
     let bind_by_name = |g: &poot_graph_ir::Graph| -> HashMap<ValueId, Value> {
         let mut inputs = HashMap::new();
-        for &id in &g.inputs {
+        for &id in g.inputs() {
             let meta = g.meta(id);
             let name = meta.name.as_deref().unwrap();
             inputs.insert(
@@ -418,7 +418,7 @@ fn moe_sparse_matches_dense() {
     let wid = bd.constant("w_in", TensorType::f32(vec![e, h, 2 * i]));
     let wod = bd.constant("w_out", TensorType::f32(vec![e, i, h]));
     let dense_out = moe_dense(&bd, xd, rd, wid, wod, e, k, i);
-    let gd = bd.finish(dense_out);
+    let gd = bd.finish(dense_out).unwrap();
     let dense = eval(
         &gd,
         &bind_by_name(&gd),
@@ -435,7 +435,7 @@ fn moe_sparse_matches_dense() {
     let wis = bs.constant("w_in", TensorType::f32(vec![e, h, 2 * i]));
     let wos = bs.constant("w_out", TensorType::f32(vec![e, i, h]));
     let sparse_out = moe_sparse(&bs, xs, rs, wis, wos, e, k, i);
-    let gs = bs.finish(sparse_out);
+    let gs = bs.finish(sparse_out).unwrap();
     let sparse = eval(
         &gs,
         &bind_by_name(&gs),
@@ -469,7 +469,7 @@ fn moe_grouped_matches_dense() {
 
     let bind_by_name = |g: &poot_graph_ir::Graph| -> HashMap<ValueId, Value> {
         let mut inputs = HashMap::new();
-        for &id in &g.inputs {
+        for &id in g.inputs() {
             let meta = g.meta(id);
             let name = meta.name.as_deref().unwrap();
             inputs.insert(
@@ -486,7 +486,7 @@ fn moe_grouped_matches_dense() {
     let wid = bd.constant("w_in", TensorType::f32(vec![e, h, 2 * i]));
     let wod = bd.constant("w_out", TensorType::f32(vec![e, i, h]));
     let dense_out = moe_dense(&bd, xd, rd, wid, wod, e, k, i);
-    let gd = bd.finish(dense_out);
+    let gd = bd.finish(dense_out).unwrap();
     let dense = eval(
         &gd,
         &bind_by_name(&gd),
@@ -503,7 +503,7 @@ fn moe_grouped_matches_dense() {
     let wig = bg.constant("w_in", TensorType::f32(vec![e, h, 2 * i]));
     let wog = bg.constant("w_out", TensorType::f32(vec![e, i, h]));
     let grouped_out = moe_grouped(&bg, xg, rg, wig, wog, e, k, i);
-    let gg = bg.finish(grouped_out);
+    let gg = bg.finish(grouped_out).unwrap();
     let grouped = eval(
         &gg,
         &bind_by_name(&gg),
@@ -520,7 +520,7 @@ fn moe_grouped_matches_dense() {
 
     // SC-004 (structural): the IndexedMatMul rows equal M = L*k, not L*E (not a disguised dense pass).
     let mut checked = 0;
-    for eqn in &gg.eqns {
+    for eqn in gg.eqns() {
         if matches!(eqn.op, OpKind::IndexedMatMul) {
             let x_id = match eqn.inputs[0] {
                 poot_graph_ir::Operand::Value(id) => id,
@@ -574,9 +574,9 @@ fn eval_tied_route(route: RouteKind, scores: &[f32], k: usize, w_in: &[f32], w_o
         RouteKind::Sparse => moe_sparse(&b, x, router, wi, wo, e, k, 1),
         RouteKind::Grouped => moe_grouped(&b, x, router, wi, wo, e, k, 1),
     };
-    let graph = b.finish(out);
+    let graph = b.finish(out).unwrap();
     let inputs = graph
-        .inputs
+        .inputs()
         .iter()
         .map(|&id| {
             let name = graph.meta(id).name.as_deref().expect("named fixture input");
@@ -754,9 +754,9 @@ fn deterministic_moe_routes_match_stable_sort_table() {
         let mask = poot_graph_ir::ops::top_k_keep_mask(&b, rank, case.k);
         let gate = top_k_gate(&b, scores, case.k);
         let route = b.concat(1, &[mask, gate]);
-        let graph = b.finish(route);
+        let graph = b.finish(route).unwrap();
         let inputs = graph
-            .inputs
+            .inputs()
             .iter()
             .copied()
             .map(|id| {
@@ -822,9 +822,9 @@ fn deterministic_moe_routes_match_stable_sort_table() {
         let (_, ids, weights) = poot_graph_ir::ops::moe_grouped_prep(&b, xm, logits, 5, case.k);
         let route = b.concat(0, &[b.cast(ids, DType::F32), weights]);
         let (xm_id, logits_id) = (xm.id(), logits.id());
-        let graph = b.finish(route);
+        let graph = b.finish(route).unwrap();
         let inputs: HashMap<_, _> = graph
-            .inputs
+            .inputs()
             .iter()
             .copied()
             .map(|id| {

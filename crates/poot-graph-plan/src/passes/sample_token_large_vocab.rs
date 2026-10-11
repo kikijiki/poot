@@ -38,7 +38,7 @@
 //! pass targets.
 
 use poot_graph_ir::graph::{
-    ComputedConst, Eqn, Graph, LayerIndex, Operand, Storage, ValidationChannel, ValueId, ValueMeta,
+    ComputedConst, Eqn, Graph, LayerIndex, Operand, Storage, ValueId, ValueMeta,
 };
 use poot_graph_ir::op::{BinOp, OpKind, RedOp, SampleRule, UnOp};
 use poot_graph_ir::types::{Scalar, TensorType};
@@ -154,17 +154,17 @@ impl RawEmitter<'_> {
 /// `vocab.div_ceil(CHUNK_LEN)`) then sits at or under the threshold and passes through unchanged on a
 /// second pass. Beyond that bound, stage 2's reduction would itself exceed the threshold and a second
 /// application would decompose it further - still correct, just not maximally parallel.
-pub fn decompose_large_vocab_greedy<V: ValidationChannel>(
-    g: &Graph<V>,
+pub fn decompose_large_vocab_greedy(
+    g: &Graph,
     limits: &CompileLimits,
-) -> Result<Graph<V>, ExpansionError> {
+) -> Result<Graph, DecomposeError> {
     let budget = GraphBudget::of(limits);
-    let mut values = g.values.clone();
-    let mut eqns = Vec::with_capacity(g.eqns.len());
+    let mut values = g.values().clone();
+    let mut eqns = Vec::with_capacity(g.eqns().len());
     let mut computed: Vec<ValueId> = Vec::new();
     let mut any = false;
 
-    for eqn in &g.eqns {
+    for eqn in g.eqns() {
         let Eqn {
             op: OpKind::SampleToken {
                 rule: SampleRule::Greedy,
@@ -227,17 +227,29 @@ pub fn decompose_large_vocab_greedy<V: ValidationChannel>(
     if !any {
         return Ok(g.clone());
     }
-    let mut inputs = g.inputs.clone();
-    inputs.extend(computed.iter().copied());
-    let mut consts = g.consts.clone();
-    consts.extend(computed);
-    Ok(Graph {
-        values,
-        eqns,
-        inputs,
-        consts,
-        ..g.clone()
-    })
+    let mut decomposed = g.edit();
+    *decomposed.values_mut() = values;
+    *decomposed.eqns_mut() = eqns;
+    decomposed.inputs_mut().extend(computed.iter().copied());
+    decomposed.consts_mut().extend(computed);
+    Ok(decomposed.commit()?)
+}
+
+/// Why [`decompose_large_vocab_greedy`] produced no graph.
+#[derive(Debug, thiserror::Error)]
+pub enum DecomposeError {
+    /// The decomposition would grow the graph past the caller's [`CompileLimits`].
+    #[error(transparent)]
+    Expansion(#[from] ExpansionError),
+    /// The rewrite produced a graph the edit check refused: a defect of the pass, never of the input.
+    #[error(transparent)]
+    Edit(Box<poot_graph_ir::EditError>),
+}
+
+impl From<poot_graph_ir::EditError> for DecomposeError {
+    fn from(error: poot_graph_ir::EditError) -> Self {
+        Self::Edit(Box::new(error))
+    }
 }
 
 /// Build the decomposition for one `SampleToken{Greedy}` equation (`logits_id`, shape `lead ++
@@ -525,7 +537,7 @@ mod tests {
         let v = logits.len();
         let x = b.constant("logits", TensorType::f32(vec![v]));
         let out = b.sample_token(SampleRule::Greedy, x, None, None, None);
-        b.finish(out)
+        b.finish(out).unwrap()
     }
 
     /// The decomposition's own oracle for a single row: lowest index of the max among finite logits,
@@ -562,7 +574,7 @@ mod tests {
         let g = greedy_row(b, &vec![0.0f32; v][..]);
         let out = decompose_large_vocab_greedy(&g, &CompileLimits::STANDARD).unwrap();
         let count = out
-            .eqns
+            .eqns()
             .iter()
             .filter(|e| matches!(e.op, OpKind::SampleToken { .. }))
             .count();
@@ -583,8 +595,8 @@ mod tests {
         let g = greedy_row(b, &[1.0, 5.0, 3.0, 2.0]);
         let out = decompose_large_vocab_greedy(&g, &CompileLimits::STANDARD).unwrap();
         assert_eq!(
-            out.eqns.len(),
-            g.eqns.len(),
+            out.eqns().len(),
+            g.eqns().len(),
             "a small vocab must not be rewritten"
         );
     }

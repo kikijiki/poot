@@ -10,7 +10,7 @@ const UPPER: usize = 4;
 
 fn range_of(builder: Builder, value: crate::Traced) -> IndexRange {
     let id = value.id();
-    let graph = builder.finish(value);
+    let graph = builder.finish(value).unwrap();
     value_ranges(&graph)[id].expect("an I32 value has a range")
 }
 
@@ -25,7 +25,7 @@ fn a_float_value_has_no_range_and_an_undeclared_i32_input_is_every_word() {
     let word = b.constant("w", TensorType::new(vec![2], DType::I32));
     let sum = b.binary_scalar(BinOp::Add, x, Scalar::F32(1.0));
     let out = b.cast(word, DType::F32);
-    let graph = b.finish(out);
+    let graph = b.finish(out).unwrap();
     let ranges = value_ranges(&graph);
     assert_eq!(ranges[x.id()], None);
     assert_eq!(ranges[sum.id()], None);
@@ -65,7 +65,7 @@ fn arithmetic_is_interval_arithmetic_and_a_possible_wrap_is_every_word() {
     let max = b.binary_scalar(BinOp::Max, pos, Scalar::I32(7));
     let wraps = b.binary_scalar(BinOp::Add, pos, Scalar::I32(i32::MAX));
     let out = b.concat(0, &[add, sub, mul, max, wraps]);
-    let graph = b.finish(out);
+    let graph = b.finish(out).unwrap();
     let ranges = value_ranges(&graph);
     assert_eq!(ranges[pos.id()], Some(r(0, 10)));
     assert_eq!(ranges[add.id()], Some(r(5, 15)));
@@ -108,7 +108,7 @@ fn the_guard_output_is_below_its_bound_without_matching_the_chain() {
     // The raw selector proves nothing; the guarded one is `[0, UPPER)` and its successor `[1, UPPER]`.
     let successor = b.binary_scalar(BinOp::Add, guard.guarded, Scalar::I32(1));
     let (raw_id, guarded, succ) = (raw.id(), guard.guarded.id(), successor.id());
-    let graph = b.finish(successor);
+    let graph = b.finish(successor).unwrap();
     let ranges = value_ranges(&graph);
     assert_eq!(ranges[raw_id], Some(IndexRange::I32));
     assert_eq!(ranges[guarded], Some(r(0, UPPER as i64)));
@@ -131,10 +131,10 @@ fn clamped_ranges_name_the_guard_condition_they_rest_on() {
     let declared = b.binary_scalar(BinOp::Add, pos, Scalar::I32(1));
     let iota = b.iota_i32(UPPER);
     let out = b.concat(0, &[successor, declared, iota]);
-    let graph = b.finish(out);
+    let graph = b.finish(out).unwrap();
     // The guard's condition is the comparison its `Select` reads.
     let condition = graph
-        .eqns
+        .eqns()
         .iter()
         .find_map(|eqn| match (&eqn.op, eqn.inputs.as_slice()) {
             (OpKind::Select, [Operand::Value(condition), ..]) => Some(*condition),
@@ -165,7 +165,7 @@ fn a_comparison_narrows_only_the_value_it_compares() {
     let clamped_above = b.select(flag, x, other);
     let (below, above) = (clamped_below.id(), clamped_above.id());
     let out = b.concat(0, &[clamped_below, clamped_above]);
-    let graph = b.finish(out);
+    let graph = b.finish(out).unwrap();
     let ranges = value_ranges(&graph);
     // The other branch is unbounded, so each union is every word: only the narrowed branch is checked
     // through the guard-shaped case below.
@@ -199,7 +199,7 @@ fn a_slot_range_is_declared_per_slot_and_must_bound_an_i32() {
     );
     let plain = b.slot(Slot::Pos, TensorType::new(vec![2], DType::I32));
     let out = b.concat(0, &[ranged, plain]);
-    let graph = b.finish(out);
+    let graph = b.finish(out).unwrap();
     let ranges = value_ranges(&graph);
     assert_eq!(ranges[ranged.id()], Some(r(0, 32_000)));
     assert_eq!(ranges[plain.id()], Some(IndexRange::I32));
@@ -241,7 +241,7 @@ fn a_ranged_const_table_declares_its_range_and_a_gather_inherits_it() {
     );
     let tokens = b.constant("tokens", TensorType::new(vec![3], DType::I32));
     let rows = b.gather(table, 0, tokens);
-    let graph = b.finish(rows);
+    let graph = b.finish(rows).unwrap();
     let ranges = value_ranges(&graph);
     assert_eq!(ranges[table.id()], Some(r(0, 8)));
     assert_eq!(ranges[rows.id()], Some(r(0, 8)));

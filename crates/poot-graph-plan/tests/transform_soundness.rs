@@ -35,7 +35,7 @@ use poot_tensor::HostTensor;
 
 /// Bind every graph input to a deterministic tensor of its declared shape.
 fn bind_inputs(g: &Graph) -> HashMap<ValueId, HostTensor> {
-    g.inputs
+    g.inputs()
         .iter()
         .map(|&id| {
             let shape = g.aval(id).shape.clone();
@@ -84,14 +84,14 @@ fn assert_same_bits(a: &HostTensor, b: &HostTensor) {
 }
 
 fn flash_count(g: &Graph) -> usize {
-    g.eqns
+    g.eqns()
         .iter()
         .filter(|e| matches!(e.op, OpKind::Attention(_)))
         .count()
 }
 
 fn rope_count(g: &Graph) -> usize {
-    g.eqns
+    g.eqns()
         .iter()
         .filter(|e| matches!(e.op, OpKind::Rope { .. }))
         .count()
@@ -141,7 +141,7 @@ fn hand_attention_decode(spelling: AttentionSpelling) -> Graph {
         b.binary(BinOp::Div, e, denom)
     };
     let out = b.matmul(p, v);
-    b.finish(out)
+    b.finish(out).unwrap()
 }
 
 /// A full-rotary rotate-half rope with free `x`/`cos`/`sin` shapes; `commute` writes `Mul(cos, x)`.
@@ -164,7 +164,7 @@ fn hand_rope(x_shape: Vec<usize>, cos_shape: Vec<usize>, commute: bool) -> Graph
     };
     let rs = b.binary(BinOp::Mul, rotate_half, sin);
     let out = b.binary(BinOp::Add, xc, rs);
-    b.finish(out)
+    b.finish(out).unwrap()
 }
 
 /// Legal attention spellings fuse without changing arithmetic boundaries. Pre-scaling Q remains
@@ -179,9 +179,9 @@ fn card536a_attention_spellings_fuse_like_the_helper() {
     let v = b.constant("v", TensorType::f32(vec![1, hq, cap, d]));
     let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
     let helper_out = attention_masked(&b, q, k, v, 1, 0.25, mask);
-    let helper = b.finish(helper_out);
+    let helper = b.finish(helper_out).unwrap();
 
-    let optimized_helper = optimize(&helper);
+    let optimized_helper = optimize(&helper).unwrap();
     assert_eq!(
         flash_count(&optimized_helper),
         1,
@@ -215,7 +215,7 @@ fn card536a_attention_spellings_fuse_like_the_helper() {
     ];
     for (name, spelling) in spellings {
         let graph = hand_attention_decode(spelling);
-        let optimized = optimize(&graph);
+        let optimized = optimize(&graph).unwrap();
         let expected_flash = usize::from(!spelling.recip_softmax);
         assert_eq!(
             flash_count(&optimized),
@@ -241,13 +241,13 @@ fn card536a_rope_commuted_spelling_fuses_like_the_helper() {
     let helper = hand_rope(vec![1, 4, 3, 8], vec![1, 1, 3, 8], false);
     let commuted = hand_rope(vec![1, 4, 3, 8], vec![1, 1, 3, 8], true);
     for (name, graph) in [("helper", &helper), ("Mul(cos, x)", &commuted)] {
-        let optimized = optimize(graph);
+        let optimized = optimize(graph).unwrap();
         assert_eq!(rope_count(&optimized), 1, "{name}: one fused Rope expected");
         assert_same_bits(&eval_graph(graph), &eval_graph(&optimized));
     }
     assert_eq!(
-        dispatch_count(&optimize(&helper)),
-        dispatch_count(&optimize(&commuted)),
+        dispatch_count(&optimize(&helper).unwrap()),
+        dispatch_count(&optimize(&commuted).unwrap()),
         "commuted rope must reach the helper's dispatch count"
     );
 }
@@ -262,7 +262,7 @@ fn card536a_attention_near_misses_decline_with_a_reason() {
     let mut cases: Vec<(&str, Graph)> = Vec::new();
 
     // Axis: the row softmax reduces the wrong axis.
-    let mut wrong_axis = {
+    let wrong_axis = {
         let (hq, cap, d) = (4usize, 6usize, 16usize);
         let b = Builder::new();
         let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d]));
@@ -270,13 +270,13 @@ fn card536a_attention_near_misses_decline_with_a_reason() {
         let v = b.constant("v", TensorType::f32(vec![1, hq, cap, d]));
         let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
         let out = attention_masked(&b, q, k, v, 1, 0.25, mask);
-        b.finish(out)
+        b.finish(out).unwrap()
     };
     // Axis 0 is the batch dim and is always 1 in these fixtures, so forcing the reduce there with
     // `keepdim: true` leaves the shape unchanged - the declared aval is still correct, it just needs
     // recomputing from each reduce's own input (not left at its pre-mutation value).
     let reduce_input_avals: Vec<(ValueId, TensorType)> = wrong_axis
-        .eqns
+        .eqns()
         .iter()
         .filter_map(|eqn| match (&eqn.op, eqn.inputs.first()) {
             (OpKind::Reduce { .. }, Some(Operand::Value(input))) => {
@@ -285,18 +285,21 @@ fn card536a_attention_near_misses_decline_with_a_reason() {
             _ => None,
         })
         .collect();
-    for eqn in wrong_axis.eqns.iter_mut() {
-        if let OpKind::Reduce { axis, .. } = &mut eqn.op {
-            *axis = 0;
+    let wrong_axis = poot_test_util::graph_fixtures::derive(&wrong_axis, |draft| {
+        for eqn in draft.eqns_mut().iter_mut() {
+            if let OpKind::Reduce { axis, .. } = &mut eqn.op {
+                *axis = 0;
+            }
         }
-    }
-    for (out, aval) in reduce_input_avals {
-        wrong_axis.values[out].aval = aval;
-    }
+        for (out, aval) in reduce_input_avals {
+            draft.values_mut()[out].aval = aval;
+        }
+    })
+    .unwrap();
     cases.push(("wrong reduce axis", wrong_axis));
 
     // Scale: a softcap chain whose two constants are not reciprocals.
-    let mut wrong_softcap = {
+    let wrong_softcap = {
         let (hq, cap, d) = (4usize, 6usize, 16usize);
         let b = Builder::new();
         let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d]));
@@ -304,17 +307,20 @@ fn card536a_attention_near_misses_decline_with_a_reason() {
         let v = b.constant("v", TensorType::f32(vec![1, hq, cap, d]));
         let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
         let out = attention_masked_softcap(&b, q, k, v, 1, 0.25, mask, Some(2.0));
-        b.finish(out)
+        b.finish(out).unwrap()
     };
     let mut rewrote = false;
-    for eqn in wrong_softcap.eqns.iter_mut() {
-        if let OpKind::Binary(BinOp::Mul) = eqn.op
-            && let Some(Operand::Lit(Scalar::F32(0.5))) = eqn.inputs.get(1)
-        {
-            eqn.inputs[1] = Operand::Lit(Scalar::F32(0.6));
-            rewrote = true;
+    let wrong_softcap = poot_test_util::graph_fixtures::derive(&wrong_softcap, |draft| {
+        for eqn in draft.eqns_mut().iter_mut() {
+            if let OpKind::Binary(BinOp::Mul) = eqn.op
+                && let Some(Operand::Lit(Scalar::F32(0.5))) = eqn.inputs.get(1)
+            {
+                eqn.inputs[1] = Operand::Lit(Scalar::F32(0.6));
+                rewrote = true;
+            }
         }
-    }
+    })
+    .unwrap();
     assert!(rewrote, "the softcap reciprocal literal must be present");
     cases.push(("softcap constants not reciprocal", wrong_softcap));
 
@@ -327,12 +333,12 @@ fn card536a_attention_near_misses_decline_with_a_reason() {
         let v = b.constant("v", TensorType::f32(vec![1, 1, 5, 2]));
         let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, 5]));
         let out = attention_masked(&b, q, k, v, 1, 1.0, mask);
-        b.finish(out)
+        b.finish(out).unwrap()
     };
     cases.push(("a size-1 key head broadcast by the matmul", broadcast_key));
 
     for (name, graph) in cases {
-        let optimized = optimize(&graph);
+        let optimized = optimize(&graph).unwrap();
         assert_eq!(flash_count(&optimized), 0, "{name}: must stay unfused");
         assert_same_bits(&eval_graph(&graph), &eval_graph(&optimized));
     }
@@ -350,20 +356,24 @@ fn card536a_flash_head_dim_is_aware() {
         let v = b.constant("v", TensorType::f32(vec![1, 2, 5, d]));
         let mask = b.constant("mask", TensorType::f32(vec![1, 1, m, 5]));
         let out = attention_masked(&b, q, k, v, 1, 0.25, mask);
-        b.finish(out)
+        b.finish(out).unwrap()
     };
 
     let narrow = build(1, 256);
-    assert_eq!(flash_count(&optimize(&narrow)), 1, "D=256 decode must fuse");
+    assert_eq!(
+        flash_count(&optimize(&narrow).unwrap()),
+        1,
+        "D=256 decode must fuse"
+    );
 
     let wide = build(1, 512);
-    let optimized = optimize(&wide);
+    let optimized = optimize(&wide).unwrap();
     assert_eq!(flash_count(&optimized), 1, "D=512 decode must fuse");
     assert_same_bits(&eval_graph(&wide), &eval_graph(&optimized));
 
     let prefill_wide = build(5, 512);
     assert_eq!(
-        flash_count(&optimize(&prefill_wide)),
+        flash_count(&optimize(&prefill_wide).unwrap()),
         1,
         "D=512 prefill must fuse"
     );
@@ -379,12 +389,12 @@ fn card536a_contraction_is_covered_by_the_in_crate_oracle() {
     let x = b.constant("x", TensorType::f32(vec![1, 16, 32]));
     let w = b.constant("w", TensorType::f32(vec![32, 16]));
     let raw_out = b.matmul(x, w);
-    let raw = b.finish(raw_out);
+    let raw = b.finish(raw_out).unwrap();
 
-    let optimized = optimize(&raw);
+    let optimized = optimize(&raw).unwrap();
     assert!(
         optimized
-            .eqns
+            .eqns()
             .iter()
             .any(|eqn| matches!(eqn.op, OpKind::MatMul)),
         "the contraction stays a plain MatMul through the passes"
@@ -440,10 +450,10 @@ fn flash_decode_batched_matches_attention_masked() {
             let v = b.constant("v", TensorType::f32(vec![bsz, hkv, cap, d]));
             let mask = b.constant("m", TensorType::f32(vec![bsz, 1, 1, cap]));
             let out = attention_masked(&b, q, k, v, n_rep, scale, mask);
-            let materialized = b.finish(out);
+            let materialized = b.finish(out).unwrap();
             // Card 557: tracers cannot build the flash op; the matcher forms it from the chain.
             let g = if flash {
-                let fused = optimize(&materialized);
+                let fused = optimize(&materialized).unwrap();
                 assert_eq!(flash_count(&fused), 1, "the batched decode chain must fuse");
                 fused
             } else {

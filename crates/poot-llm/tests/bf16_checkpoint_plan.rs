@@ -18,7 +18,7 @@ use std::collections::BTreeSet;
 
 use poot_graph_plan::passes_without_target as optimize;
 
-use poot_executor_parity::dense::{Dense, Family, plain, step};
+use poot_executor_parity::dense::{Dense, Family, step};
 use poot_graph_ir::{Eqn, Graph, OpKind, Operand, Storage, ValueId};
 use poot_graph_plan::{PlanError, prepare_target_graph};
 use poot_models::model::{LogitRows, Phase};
@@ -39,11 +39,9 @@ fn olmo2_like(family: Family) -> Dense {
 /// `dense`'s BF16 checkpoint traced at `phase` (`tokens` new tokens over `cap` positions).
 fn traced(dense: &Dense, phase: Phase, tokens: usize, cap: usize) -> Graph {
     let m = dense.zeroed_model(DType::BF16);
-    plain(
-        m.model
-            .trace(phase, step(1, tokens, cap, LogitRows::Last))
-            .unwrap(),
-    )
+    m.model
+        .trace(phase, step(1, tokens, cap, LogitRows::Last))
+        .unwrap()
 }
 
 fn backends() -> Vec<Backend> {
@@ -55,7 +53,7 @@ fn backends() -> Vec<Backend> {
 
 /// Every eqn's plan result, as `(index, error)` for the ones that fail.
 fn plan_failures(g: &Graph, backend: Backend) -> Vec<(usize, PlanError)> {
-    g.eqns
+    g.eqns()
         .iter()
         .enumerate()
         .filter_map(|(i, eqn)| {
@@ -88,7 +86,7 @@ fn bf16_matmul(g: &Graph, eqn: &Eqn) -> bool {
 
 /// The BF16 consts of `g`.
 fn bf16_consts(g: &Graph) -> BTreeSet<ValueId> {
-    g.values
+    g.values()
         .iter_enumerated()
         .filter(|(_, meta)| meta.storage == Storage::Const && meta.aval.dtype == DType::BF16)
         .map(|(id, _)| id)
@@ -97,7 +95,7 @@ fn bf16_consts(g: &Graph) -> BTreeSet<ValueId> {
 
 /// The `Cast{BF16 -> F32}` equations of `g`.
 fn bf16_widening_casts(g: &Graph) -> usize {
-    g.eqns
+    g.eqns()
         .iter()
         .filter(|e| {
             matches!(e.op, OpKind::Cast { to: DType::F32 })
@@ -113,7 +111,7 @@ fn bf16_widening_casts(g: &Graph) -> usize {
 
 /// Op, output shape, and operand shapes/dtypes of an eqn.
 fn describe(g: &Graph, index: usize) -> String {
-    let eqn = &g.eqns[index];
+    let eqn = &g.eqns()[index];
     let ins: Vec<String> = eqn
         .inputs
         .iter()
@@ -139,15 +137,15 @@ fn bf16_prefill_and_decode_graphs_plan_on_wgpu_and_rocm() {
     let graphs = [
         (
             "olmo2 prefill",
-            optimize(&traced(&olmo2, Phase::Prefill, n, cap)),
+            optimize(&traced(&olmo2, Phase::Prefill, n, cap)).unwrap(),
         ),
         (
             "olmo2 decode",
-            optimize(&traced(&olmo2, Phase::Decode, 1, cap)),
+            optimize(&traced(&olmo2, Phase::Decode, 1, cap)).unwrap(),
         ),
         (
             "qwen2 prefill",
-            optimize(&traced(&olmo2_like(Family::Qwen2), Phase::Prefill, n, cap)),
+            optimize(&traced(&olmo2_like(Family::Qwen2), Phase::Prefill, n, cap)).unwrap(),
         ),
     ];
 
@@ -158,7 +156,7 @@ fn bf16_prefill_and_decode_graphs_plan_on_wgpu_and_rocm() {
             // projection has none. Every rejection must be a BF16 consumer, and no BF16 `MatMul` may be
             // missing from the rejected set.
             let expected_rejected: BTreeSet<usize> = g
-                .eqns
+                .eqns()
                 .iter()
                 .enumerate()
                 .filter(|(_, eqn)| bf16_matmul(g, eqn))
@@ -185,7 +183,7 @@ fn bf16_prefill_and_decode_graphs_plan_on_wgpu_and_rocm() {
                     .join("; "),
             );
 
-            let prepared = prepare_target_graph(g, backend);
+            let prepared = prepare_target_graph(g, backend).unwrap();
             let failures = plan_failures(&prepared, backend);
             assert!(
                 failures.is_empty(),
@@ -209,12 +207,12 @@ fn bf16_prefill_and_decode_graphs_plan_on_wgpu_and_rocm() {
                 "{what} on {backend:?}: the checkpoint graph must hold BF16 consts"
             );
             assert!(
-                !prepared.eqns.iter().any(|e| bf16_matmul(&prepared, e)),
+                !prepared.eqns().iter().any(|e| bf16_matmul(&prepared, e)),
                 "{what} on {backend:?}: a BF16 MatMul survived the dense fold"
             );
             assert!(
                 prepared
-                    .eqns
+                    .eqns()
                     .iter()
                     .any(|e| matches!(e.op, OpKind::DenseContraction { .. })),
                 "{what} on {backend:?}: the BF16 projections must fold into DenseContractions"

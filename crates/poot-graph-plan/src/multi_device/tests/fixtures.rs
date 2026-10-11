@@ -7,7 +7,7 @@ use poot_target::Backend;
 pub fn device(id: u32, usable_bytes: u64) -> DeviceSpec {
     DeviceSpec {
         id: DeviceId(id),
-        backend: Backend::SpirvVulkan,
+        target: Backend::SpirvVulkan.into(),
         usable_bytes,
     }
 }

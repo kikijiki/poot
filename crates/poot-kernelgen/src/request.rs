@@ -21,7 +21,9 @@ use poot_kernel_ir::{
 use poot_target::{BufferStorage, DeviceCaps};
 
 use crate::KernelGenError;
-use crate::attention::{AttentionSchedule, AttentionSpec, attention_body};
+use crate::attention::{
+    AttentionCombineSpec, AttentionSpec, attention_body, attention_combine_body,
+};
 use crate::contraction::{Epilogue, Schedule, dense_contraction, indexed_contraction};
 use crate::data_movement::{MovementSpec, Storage, arg_top_k_dt, movement_body, rope_dt};
 use crate::elementwise::{
@@ -251,6 +253,8 @@ pub enum KernelRequest {
     Row(RowSpec),
     Contraction(ContractionSpec),
     Attention(AttentionSpec),
+    /// The combine stage of a split-KV attention ([`AttentionSchedule::SplitKv`]).
+    AttentionCombine(AttentionCombineSpec),
     Scan(ScanSpec),
     Movement(MovementSpec),
     Packed(PackedRequest),
@@ -283,6 +287,10 @@ impl KernelRequest {
                 }),
             },
             Self::Attention(spec) => KernelRequirements {
+                subgroup_lanes: None,
+                serial_work: Some(spec.serial_work()),
+            },
+            Self::AttentionCombine(spec) => KernelRequirements {
                 subgroup_lanes: None,
                 serial_work: Some(spec.serial_work()),
             },
@@ -332,6 +340,7 @@ impl KernelRequest {
             Self::Row(_) => "row",
             Self::Contraction(_) => "contraction",
             Self::Attention(_) => "attention",
+            Self::AttentionCombine(_) => "attention_combine",
             Self::Scan(_) => "scan",
             Self::Movement(_) => "movement",
             Self::Packed(_) => "packed",
@@ -768,6 +777,7 @@ fn build(req: &KernelRequest, caps: &DeviceCaps) -> Result<Generated, KernelGenE
         KernelRequest::Row(spec) => row(spec, caps),
         KernelRequest::Contraction(spec) => contraction(spec, caps),
         KernelRequest::Attention(spec) => attention(spec, caps),
+        KernelRequest::AttentionCombine(spec) => attention_combine(spec, caps),
         KernelRequest::Scan(spec) => scan(spec, caps),
         KernelRequest::Movement(spec) => movement(spec, caps),
         KernelRequest::Packed(spec) => {
@@ -1186,13 +1196,43 @@ fn contraction(spec: &ContractionSpec, caps: &DeviceCaps) -> Result<Generated, K
     }
 }
 
+/// The 2-D workgroup fold of `workgroups` onto `caps`' grid, refused when the Y extent it needs is past
+/// the device's Y cap (a launch the device cannot make is not a launch).
+fn fold_within_grid(
+    generator: &'static str,
+    workgroups: usize,
+    caps: &DeviceCaps,
+) -> Result<(usize, usize), KernelGenError> {
+    let (x, y) = fold_groups(workgroups, caps.max_grid[0]);
+    if y > caps.max_grid[1] as usize {
+        return Err(KernelGenError::ExceedsBound {
+            generator,
+            what: "workgroup rows".to_string(),
+            value: y,
+            bound: caps.max_grid[1] as usize,
+        });
+    }
+    Ok((x, y))
+}
+
 fn attention(spec: &AttentionSpec, caps: &DeviceCaps) -> Result<Generated, KernelGenError> {
-    let AttentionSchedule::Streaming { lanes } = spec.schedule;
-    // One workgroup of `lanes` threads per (batch, head, row), folded onto a 2-D grid past the X cap.
-    let (x, y) = fold_groups(spec.workgroups(), caps.max_grid[0]);
+    let lanes = spec.schedule.lanes();
+    // One workgroup of `lanes` threads per (batch, head, row[, split]), folded onto a 2-D grid past the X cap.
+    let (x, y) = fold_within_grid("attention_body", spec.workgroups(), caps)?;
     with(
         attention_body(ENTRY, spec, x)?,
         Launch::grid([(x * lanes) as u32, y as u32, 1]),
+    )
+}
+
+fn attention_combine(
+    spec: &AttentionCombineSpec,
+    caps: &DeviceCaps,
+) -> Result<Generated, KernelGenError> {
+    let (x, y) = fold_within_grid("attention_combine_body", spec.rows, caps)?;
+    with(
+        attention_combine_body(ENTRY, spec, x)?,
+        Launch::grid([(x * spec.lanes) as u32, y as u32, 1]),
     )
 }
 

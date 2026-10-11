@@ -15,7 +15,7 @@
 
 use std::num::NonZeroUsize;
 
-use poot_graph_ir::{Graph, OpKind, Operand, ValidationOutputs, ValueId};
+use poot_graph_ir::{Graph, OpKind, Operand, ValueId};
 use poot_graph_plan::{
     CompileError, CompileLimits, CompileOptions, LegalizeError, Submission, Target, WeightFormats,
     bind_packed_weights, compile, prepare_target_graph,
@@ -25,6 +25,7 @@ use poot_models::registry::{Fixture, Registry};
 use poot_quant::weights::{WeightId, WeightRole};
 use poot_target::{AmdArch, Backend};
 use poot_tensor::DType;
+use poot_test_util::graph_fixtures::gpu_caps_mut;
 
 /// The KV positions of every traced step.
 const CAPACITY: usize = 8;
@@ -70,7 +71,7 @@ fn shape(tokens: usize) -> StepShape {
 }
 
 /// The family's decode graph, as the planner receives it.
-fn decode_graph(model: &dyn Model) -> Graph<ValidationOutputs> {
+fn decode_graph(model: &dyn Model) -> Graph {
     let traced = model.trace(Phase::Decode, shape(1)).expect("decode traces");
     bind_packed_weights(&traced, &WeightFormats::from_weight_map(model.weights()))
         .expect("the weights bind")
@@ -92,9 +93,9 @@ fn operand_value(eqn: &poot_graph_ir::Eqn, position: usize) -> Option<ValueId> {
     }
 }
 
-fn value_named<V: poot_graph_ir::ValidationChannel>(graph: &Graph<V>, name: &str) -> ValueId {
+fn value_named(graph: &Graph, name: &str) -> ValueId {
     graph
-        .values
+        .values()
         .iter_enumerated()
         .find_map(|(id, value)| (value.name.as_deref() == Some(name)).then_some(id))
         .unwrap_or_else(|| panic!("the graph declares {name}"))
@@ -121,7 +122,7 @@ fn qwen35_wgpu_prepared_graph_holds_no_widened_lm_head_weight() {
     assert_eq!(traced.aval(traced_head).dtype, DType::BF16);
     assert_eq!(traced.aval(traced_head).shape, vec![vocab, hidden]);
 
-    let prepared = prepare_target_graph(&traced, Backend::SpirvVulkan);
+    let prepared = prepare_target_graph(&traced, Backend::SpirvVulkan).unwrap();
 
     // The typed walk uploads the checkpoint's BF16 matrix as packed u32 lanes, so preparation must
     // neither retype nor widen it.
@@ -135,7 +136,7 @@ fn qwen35_wgpu_prepared_graph_holds_no_widened_lm_head_weight() {
     // Exactly one contraction reads the head constant directly, with no transpose (a second full-size
     // buffer; card 258 tripped the iGPU watchdog with that dispatch shape).
     let readers = prepared
-        .eqns
+        .eqns()
         .iter()
         .filter(|eqn| operand_value(eqn, 1) == Some(prepared_head))
         .collect::<Vec<_>>();
@@ -148,7 +149,7 @@ fn qwen35_wgpu_prepared_graph_holds_no_widened_lm_head_weight() {
         "the head is a BF16 contraction over the checkpoint constant, not a copy of it"
     );
     assert!(
-        !prepared.eqns.iter().any(|eqn| {
+        !prepared.eqns().iter().any(|eqn| {
             matches!(eqn.op, OpKind::Transpose { .. })
                 && operand_value(eqn, 0) == Some(prepared_head)
         }),
@@ -156,7 +157,7 @@ fn qwen35_wgpu_prepared_graph_holds_no_widened_lm_head_weight() {
     );
 
     // No equation widens the head, and no value is an F32 `[vocab, hidden]` matrix.
-    for eqn in &prepared.eqns {
+    for eqn in prepared.eqns() {
         let OpKind::Cast { to: DType::F32 } = eqn.op else {
             continue;
         };
@@ -166,7 +167,7 @@ fn qwen35_wgpu_prepared_graph_holds_no_widened_lm_head_weight() {
             "Cast(BF16 -> F32) over the head weight"
         );
     }
-    for value in &prepared.values {
+    for value in prepared.values() {
         assert!(
             value.aval.dtype != DType::F32 || value.aval.shape != vec![vocab, hidden],
             "F32 vocabulary matrix {:?} in the prepared graph",
@@ -196,13 +197,13 @@ fn qwen35_wgpu_prepared_graph_holds_no_widened_embedding_table() {
     assert_eq!(traced.aval(table).dtype, DType::BF16);
     assert_eq!(traced.aval(table).shape, vec![vocab, hidden]);
     assert!(
-        traced.eqns.iter().any(|eqn| {
+        traced.eqns().iter().any(|eqn| {
             matches!(eqn.op, OpKind::Gather { axis: 0 }) && operand_value(eqn, 0) == Some(table)
         }),
         "the traced graph must still gather the table, or this test proves nothing"
     );
 
-    let prepared = prepare_target_graph(&traced, Backend::SpirvVulkan);
+    let prepared = prepare_target_graph(&traced, Backend::SpirvVulkan).unwrap();
 
     // The typed walk uploads the BF16 table as packed u32 lanes, so preparation must neither retype
     // nor widen it.
@@ -214,7 +215,7 @@ fn qwen35_wgpu_prepared_graph_holds_no_widened_embedding_table() {
     );
 
     let gathers = prepared
-        .eqns
+        .eqns()
         .iter()
         .filter(|eqn| matches!(eqn.op, OpKind::DenseRowGather { .. }))
         .collect::<Vec<_>>();
@@ -232,7 +233,7 @@ fn qwen35_wgpu_prepared_graph_holds_no_widened_embedding_table() {
     );
     assert!(
         !prepared
-            .eqns
+            .eqns()
             .iter()
             .any(|eqn| matches!(eqn.op, OpKind::Gather { .. })
                 && operand_value(eqn, 0) == Some(prepared_table)),
@@ -241,7 +242,7 @@ fn qwen35_wgpu_prepared_graph_holds_no_widened_embedding_table() {
 
     // No equation casts a vocabulary-sized value in either direction (the widening pass's `Gather`
     // rule used to put a `Cast { to: BF16 }` on the retyped table, a 2.54 GB copy).
-    for eqn in &prepared.eqns {
+    for eqn in prepared.eqns() {
         if !matches!(eqn.op, OpKind::Cast { .. }) {
             continue;
         }
@@ -274,17 +275,17 @@ fn ptx_and_rocm_preparation_is_untouched_by_this_card() {
     let (model, _) = qwen35();
     let traced = decode_graph(&*model);
     for backend in [Backend::Nvptx, Backend::AmdGcn(AmdArch::gfx1151())] {
-        let prepared = poot_graph_plan::widen_mismatched_matmul_dtypes(&traced, backend);
+        let prepared = poot_graph_plan::widen_mismatched_matmul_dtypes(&traced, backend).unwrap();
         assert!(
             !prepared
-                .eqns
+                .eqns()
                 .iter()
                 .any(|eqn| matches!(eqn.op, OpKind::DenseContraction { .. })),
             "no DenseContraction may reach {backend:?}, whose planner rejects it by name"
         );
         assert!(
             !prepared
-                .eqns
+                .eqns()
                 .iter()
                 .any(|eqn| matches!(eqn.op, OpKind::DenseRowGather { .. })),
             "no DenseRowGather may reach {backend:?}, whose planner rejects it by name"
@@ -292,7 +293,7 @@ fn ptx_and_rocm_preparation_is_untouched_by_this_card() {
         let table = value_named(&prepared, &embedding());
         assert_eq!(prepared.aval(table).dtype, DType::BF16);
         assert!(
-            !prepared.eqns.iter().any(|eqn| {
+            !prepared.eqns().iter().any(|eqn| {
                 matches!(eqn.op, OpKind::Cast { to: DType::BF16 })
                     && operand_value(eqn, 0) == Some(table)
             }),
@@ -306,7 +307,7 @@ fn options() -> CompileOptions {
 }
 
 fn target(backend: Backend) -> Target {
-    Target {
+    Target::Gpu {
         backend,
         caps: poot_test_util::device_caps::default_caps_for(backend),
     }
@@ -349,16 +350,16 @@ fn qwen35_decode_and_prefill_plan_on_every_backend() {
 }
 
 /// The byte size of a named const of `graph`.
-fn const_bytes<V: poot_graph_ir::ValidationChannel>(graph: &Graph<V>, id: ValueId) -> u64 {
+fn const_bytes(graph: &Graph, id: ValueId) -> u64 {
     let aval = graph.aval(id);
     aval.shape.iter().product::<usize>() as u64 * aval.dtype.byte_size() as u64
 }
 
 /// The largest projection the decode graph reads that is not the embedding or the head, by bytes.
-fn largest_projection(graph: &Graph<ValidationOutputs>) -> (String, u64, u64) {
+fn largest_projection(graph: &Graph) -> (String, u64, u64) {
     let skip = [embedding(), head()];
     graph
-        .consts
+        .consts()
         .iter()
         .filter_map(|&id| {
             let name = graph.meta(id).name.clone()?;
@@ -391,7 +392,7 @@ fn a_cap_below_the_largest_projection_splits_it_on_every_backend() {
     );
     for backend in capped_backends() {
         let mut target = target(backend);
-        target.caps.max_buffer_bytes = cap;
+        gpu_caps_mut(&mut target).max_buffer_bytes = cap;
         let program = compile(&graph, &target, &options()).unwrap_or_else(|e| {
             panic!("{backend:?}: a cap of {cap} bytes over {name} ({bytes}): {e}")
         });
@@ -400,7 +401,7 @@ fn a_cap_below_the_largest_projection_splits_it_on_every_backend() {
         // program holds the projection as row chunks, not as the original oversized constant.
         assert!(
             !planned
-                .consts
+                .consts()
                 .iter()
                 .any(|&id| planned.meta(id).name.as_deref() == Some(name.as_str())),
             "{backend:?}: {name} is still one constant after compile"
@@ -408,7 +409,7 @@ fn a_cap_below_the_largest_projection_splits_it_on_every_backend() {
         // The embedding gather is hosted off the device (`Slot::TokenEmbed`) where the target admits
         // it, so the cap binds every other constant: the projections, split, and the head, split.
         for &id in planned
-            .consts
+            .consts()
             .iter()
             .filter(|&&id| planned.meta(id).name.as_deref() != Some(&*embedding()))
         {
@@ -434,7 +435,7 @@ fn a_cap_below_one_projection_row_is_a_typed_refusal_naming_the_constant() {
     let cap = row - 1;
     for backend in capped_backends() {
         let mut target = target(backend);
-        target.caps.max_buffer_bytes = cap;
+        gpu_caps_mut(&mut target).max_buffer_bytes = cap;
         match compile(&graph, &target, &options()) {
             Err(CompileError::Legalize(error)) => match *error {
                 LegalizeError::OversizedConstant { name, bytes, limit } => {
@@ -442,7 +443,7 @@ fn a_cap_below_one_projection_row_is_a_typed_refusal_naming_the_constant() {
                     assert!(bytes > cap, "{name}: {bytes} bytes fits the cap {cap}");
                     assert!(
                         graph
-                            .consts
+                            .consts()
                             .iter()
                             .any(|&id| graph.meta(id).name.as_deref() == Some(name.as_str())),
                         "{name} is a constant of the graph"

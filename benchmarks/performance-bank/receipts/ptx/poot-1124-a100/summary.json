@@ -1,0 +1,125 @@
+{
+  "card": "POOT-1124",
+  "device": "NVIDIA A100-SXM4-80GB (RunPod secure, 2-GPU pod, GPU 0 used)",
+  "driver": "580.159.04",
+  "build": "candidate: bank example from commit 2f6eca457 (split-KV planner rule on); parent: the same tree with attention_splits returning None (streaming plan), same runner and cases.json; not committed",
+  "policy": "3 interleaved runs per side and case (r1..r3), each run 9 timed repeats of 'wall step plus readback' after 3 warmups; median is of all 27 samples per side; spread = (max-min)/median over those 27",
+  "cases": {
+    "attention-low-head-decode": {
+      "parent": {
+        "median_us": 1927.5,
+        "min_us": 1923.1,
+        "max_us": 1935.4,
+        "spread": 0.006,
+        "per_run_medians_us": [
+          1927.8,
+          1929.2,
+          1925.1
+        ],
+        "plan_ops": [
+          [
+            "attention"
+          ]
+        ]
+      },
+      "candidate": {
+        "median_us": 168.0,
+        "min_us": 166.4,
+        "max_us": 171.9,
+        "spread": 0.033,
+        "per_run_medians_us": [
+          168.7,
+          167.7,
+          167.9
+        ],
+        "plan_ops": [
+          [
+            "attention",
+            "attention_combine"
+          ]
+        ]
+      },
+      "speedup": 11.47
+    },
+    "attention-low-head-decode-live-full": {
+      "parent": {
+        "median_us": 15354.8,
+        "min_us": 12655.2,
+        "max_us": 15462.8,
+        "spread": 0.183,
+        "per_run_medians_us": [
+          15449.4,
+          12774.1,
+          15350.6
+        ],
+        "plan_ops": [
+          [
+            "pointwise",
+            "pointwise",
+            "attention"
+          ]
+        ]
+      },
+      "candidate": {
+        "median_us": 851.4,
+        "min_us": 848.3,
+        "max_us": 855.2,
+        "spread": 0.008,
+        "per_run_medians_us": [
+          849.6,
+          851.7,
+          851.9
+        ],
+        "plan_ops": [
+          [
+            "pointwise",
+            "pointwise",
+            "attention",
+            "attention_combine"
+          ]
+        ]
+      },
+      "speedup": 18.03
+    },
+    "attention-low-head-decode-live-short": {
+      "parent": {
+        "median_us": 521.3,
+        "min_us": 434.7,
+        "max_us": 563.4,
+        "spread": 0.247,
+        "per_run_medians_us": [
+          528.3,
+          435.3,
+          521.3
+        ],
+        "plan_ops": [
+          [
+            "pointwise",
+            "pointwise",
+            "attention"
+          ]
+        ]
+      },
+      "candidate": {
+        "median_us": 531.6,
+        "min_us": 526.0,
+        "max_us": 557.8,
+        "spread": 0.06,
+        "per_run_medians_us": [
+          527.3,
+          533.6,
+          531.9
+        ],
+        "plan_ops": [
+          [
+            "pointwise",
+            "pointwise",
+            "attention",
+            "attention_combine"
+          ]
+        ]
+      },
+      "speedup": 0.98
+    }
+  }
+}

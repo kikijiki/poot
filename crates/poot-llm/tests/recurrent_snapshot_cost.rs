@@ -24,7 +24,7 @@ use poot_executor::{
 };
 use poot_executor_parity::dense::step as step_shape;
 use poot_executor_parity::weight_map::MappedModel;
-use poot_graph_ir::{Builder, Graph, Slot, SlotKey, StateRole, TensorType, ValidationOutputs};
+use poot_graph_ir::{Builder, Graph, Slot, SlotKey, StateRole, TensorType};
 use poot_graph_plan::{
     CompileLimits, CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition,
     Submission, Target, compile_staged,
@@ -142,7 +142,7 @@ impl Carried {
     }
 }
 
-fn decode_graph(m: &MappedModel, rows: usize) -> Graph<ValidationOutputs> {
+fn decode_graph(m: &MappedModel, rows: usize) -> Graph {
     m.model
         .trace(
             Phase::Decode,
@@ -152,7 +152,7 @@ fn decode_graph(m: &MappedModel, rows: usize) -> Graph<ValidationOutputs> {
 }
 
 /// Every carried state value of `decode`, in its state order.
-fn carried(decode: &Graph<ValidationOutputs>) -> Vec<Carried> {
+fn carried(decode: &Graph) -> Vec<Carried> {
     decode
         .state_pairs()
         .map(|pair| {
@@ -196,7 +196,7 @@ fn identity_rows(rows: usize) -> Vec<(SlotKey, HostTensor)> {
 /// `live_i` and `shadow_i` for each recurrent value, in that interleaved order: snapshot copies live
 /// into the shadow, restore copies the shadow back into live. The untouched side is its own state
 /// output (an alias, no copy).
-fn copy_graph(state: &[Carried], rows: usize, restore: bool) -> Graph<ValidationOutputs> {
+fn copy_graph(state: &[Carried], rows: usize, restore: bool) -> Graph {
     let b = Builder::new();
     let index = b.slot_named(
         Slot::Activation,
@@ -221,15 +221,18 @@ fn copy_graph(state: &[Carried], rows: usize, restore: bool) -> Graph<Validation
         };
         out = Some(copied);
     }
-    b.finish_with_state(out.expect("a recurrent model carries state"), &pairs)
-        .with_validations(Vec::new())
+    b.finish(
+        poot_graph_ir::Outputs::new(out.expect("a recurrent model carries state"))
+            .with_state(&pairs),
+    )
+    .unwrap()
 }
 
 /// The graphs POOT-647's driver compiles (`driver/snapshot.rs`): the destination's rows kept or taken
 /// from the source by index, `Gather(Concat0(destination, source), idx)` with `idx[r] = r` to keep and
 /// `rows + r` to copy. Each row of a round it copies is a bandwidth cost the plain gather above does
 /// not show, so the cost rows time both.
-fn concat_copy_graph(state: &[Carried], rows: usize, restore: bool) -> Graph<ValidationOutputs> {
+fn concat_copy_graph(state: &[Carried], rows: usize, restore: bool) -> Graph {
     let b = Builder::new();
     let index = b.slot_named(
         Slot::Activation,
@@ -254,12 +257,15 @@ fn concat_copy_graph(state: &[Carried], rows: usize, restore: bool) -> Graph<Val
         };
         out = Some(copied);
     }
-    b.finish_with_state(out.expect("a recurrent model carries state"), &pairs)
-        .with_validations(Vec::new())
+    b.finish(
+        poot_graph_ir::Outputs::new(out.expect("a recurrent model carries state"))
+            .with_state(&pairs),
+    )
+    .unwrap()
 }
 
 /// The beam reorder's shape: every state value of the decode program gathered by row.
-fn reorder_graph(state: &[Carried], rows: usize) -> Graph<ValidationOutputs> {
+fn reorder_graph(state: &[Carried], rows: usize) -> Graph {
     let b = Builder::new();
     let index = b.slot_named(
         Slot::Activation,
@@ -274,8 +280,8 @@ fn reorder_graph(state: &[Carried], rows: usize) -> Graph<ValidationOutputs> {
         pairs.push((value, moved));
         out = Some(moved);
     }
-    b.finish_with_state(out.expect("a model carries state"), &pairs)
-        .with_validations(Vec::new())
+    b.finish(poot_graph_ir::Outputs::new(out.expect("a model carries state")).with_state(&pairs))
+        .unwrap()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -298,7 +304,7 @@ impl Device for CountingDevice {
     type Error = CountingError;
 
     fn target(&self) -> Target {
-        Target {
+        Target::Gpu {
             backend: Backend::SpirvVulkan,
             caps: DeviceCaps::wgpu_rdna3_igpu(),
         }
@@ -489,7 +495,7 @@ const NEXT: i32 = 4;
 /// Run decode steps of `tokens` from position `at`, carrying `state`.
 fn run(
     m: &MappedModel,
-    graph: &Graph<ValidationOutputs>,
+    graph: &Graph,
     mut state: Vec<HostTensor>,
     tokens: &[i32],
     at: usize,
@@ -518,7 +524,7 @@ fn recurrent_at(state: &[Carried]) -> Vec<usize> {
 /// graph's state order): the pair after the copy.
 fn copy(
     m: &MappedModel,
-    graph: &Graph<ValidationOutputs>,
+    graph: &Graph,
     live: &[HostTensor],
     shadow: &[HostTensor],
 ) -> (Vec<HostTensor>, Vec<HostTensor>) {
@@ -594,7 +600,7 @@ const REPS: usize = 30;
 
 struct Arm {
     label: &'static str,
-    graph: Graph<ValidationOutputs>,
+    graph: Graph,
     /// The row index the arm binds: identity for a gather, `rows + r` for a concat copy of every row.
     index: Vec<i32>,
 }

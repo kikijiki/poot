@@ -20,13 +20,12 @@ const OPTIONS: CompileOptions =
     CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
 
 fn target(backend: Backend) -> Target {
-    Target {
+    Target::Gpu {
         backend,
         caps: match backend {
             Backend::SpirvVulkan => DeviceCaps::wgpu_rdna3_igpu(),
             Backend::Nvptx => DeviceCaps::ptx_default(),
             Backend::AmdGcn(_) => DeviceCaps::rocm_default(),
-            Backend::Aie(_) => unreachable!("an AIE target has no GPU DeviceCaps"),
         },
     }
 }
@@ -99,7 +98,11 @@ fn with_states(b: Builder, output: poot_graph_ir::Traced) -> Graph {
     let second = b.state_input("second", ty, StateRole::Recurrent);
     let next_first = b.binary(BinOp::Add, output, first);
     let next_second = b.binary(BinOp::Sub, second, output);
-    b.finish_with_state(output, &[(first, next_first), (second, next_second)])
+    b.finish(
+        poot_graph_ir::Outputs::new(output)
+            .with_state(&[(first, next_first), (second, next_second)]),
+    )
+    .unwrap()
 }
 
 fn bind_states(graph: &Graph, inputs: &mut HashMap<ValueId, HostTensor>) {
@@ -154,8 +157,8 @@ fn finite_scaled_contraction_survives_compile() {
     .into_iter()
     .map(|v| v.map(|v| v.into_host().unwrap()))
     .collect();
-    let original = &original[graph.output].as_ref().unwrap().as_f32().unwrap();
-    let compiled = &compiled[program.graph().output]
+    let original = &original[graph.result()].as_ref().unwrap().as_f32().unwrap();
+    let compiled = &compiled[program.graph().result()]
         .as_ref()
         .unwrap()
         .as_f32()
@@ -215,7 +218,7 @@ fn scalar_contraction_corner_corpus_is_bitwise() {
             ]);
             bind_states(&graph, &mut inputs);
             println!("case={name}, scale_rhs={scale_rhs}");
-            assert_observables(&graph, &canonicalize(&graph), &inputs);
+            assert_observables(&graph, &canonicalize(&graph).unwrap(), &inputs);
             let program = compile(&graph, &target(Backend::SpirvVulkan), &OPTIONS).unwrap();
             assert_observables(&graph, program.graph(), &inputs);
         }
@@ -255,7 +258,7 @@ fn reciprocal_rounding_is_not_division() {
         (3.0f32 / 7.0).to_bits(),
         "the pinned reciprocal counterexample must distinguish division"
     );
-    assert_observables(&graph, &canonicalize(&graph), &inputs);
+    assert_observables(&graph, &canonicalize(&graph).unwrap(), &inputs);
     let program = compile(&graph, &target(Backend::SpirvVulkan), &OPTIONS).unwrap();
     assert_observables(&graph, program.graph(), &inputs);
 }
@@ -295,7 +298,7 @@ fn narrow_contraction_rounds_before_fused_epilogue() {
         assert!(
             program
                 .graph()
-                .eqns
+                .eqns()
                 .iter()
                 .any(|eqn| matches!(eqn.op, OpKind::Fused(_))),
             "the real compiler must select the F32 epilogue region"
@@ -315,7 +318,7 @@ fn narrow_contraction_rounds_before_fused_epilogue() {
         .into_iter()
         .map(|v| v.map(|v| v.into_host().unwrap()))
         .collect();
-        let actual = &compiled[program.graph().output]
+        let actual = &compiled[program.graph().result()]
             .as_ref()
             .unwrap()
             .as_f32()
@@ -329,7 +332,7 @@ fn narrow_contraction_rounds_before_fused_epilogue() {
         assert!(
             program
                 .graph()
-                .eqns
+                .eqns()
                 .iter()
                 .any(|eqn| matches!(eqn.op, OpKind::MatMul)
                     && program.graph().aval(eqn.out).dtype == dtype),
@@ -375,7 +378,7 @@ fn explicit_narrow_casts_remain_between_contraction_and_epilogue() {
         .into_iter()
         .map(|v| v.map(|v| v.into_host().unwrap()))
         .collect();
-        let actual = &result[program.graph().output]
+        let actual = &result[program.graph().result()]
             .as_ref()
             .unwrap()
             .as_f32()
@@ -394,7 +397,7 @@ fn nonfinite_inputs_keep_ieee_classification() {
     let w = b.constant("w", TensorType::f32([2, 2]));
     let scaled = b.binary_scalar(BinOp::Mul, x, Scalar::F32(0.5));
     let output = b.matmul(scaled, w);
-    let graph = b.finish(output);
+    let graph = b.finish(output).unwrap();
     let program = compile(&graph, &target(Backend::SpirvVulkan), &OPTIONS).unwrap();
     for data in [vec![f32::INFINITY, 1.0], vec![f32::NAN, 1.0]] {
         let inputs = HashMap::from([
@@ -408,7 +411,7 @@ fn nonfinite_inputs_keep_ieee_classification() {
             .iter()
             .map(|(&k, v)| (k, Value::from(v.clone())))
             .collect();
-        for candidate in [&graph, &canonicalize(&graph), program.graph()] {
+        for candidate in [&graph, &canonicalize(&graph).unwrap(), program.graph()] {
             let env: ValueTable<Option<HostTensor>> = eval(
                 candidate,
                 &values,
@@ -420,7 +423,7 @@ fn nonfinite_inputs_keep_ieee_classification() {
             .into_iter()
             .map(|v| v.map(|v| v.into_host().unwrap()))
             .collect();
-            let actual = &env[candidate.output].as_ref().unwrap().as_f32().unwrap();
+            let actual = &env[candidate.result()].as_ref().unwrap().as_f32().unwrap();
             if data[0].is_infinite() {
                 assert_eq!(actual[0], f32::INFINITY);
             } else {
@@ -519,7 +522,7 @@ fn legal_attention_regions_keep_selection_and_prescaled_query() {
         let program = compile(&graph, &target(Backend::SpirvVulkan), &OPTIONS).unwrap();
         let flash: Vec<_> = program
             .graph()
-            .eqns
+            .eqns()
             .iter()
             .filter(|eqn| matches!(eqn.op, OpKind::Attention(_)))
             .collect();
@@ -593,26 +596,31 @@ fn softcap_requires_the_exact_reciprocal_literal() {
     ]);
     bind_states(&original, &mut inputs);
     for exact in [true, false] {
-        let mut graph = original.clone();
-        if !exact {
+        let graph = if exact {
+            original.clone()
+        } else {
             let mut changed = 0;
-            for eqn in &mut graph.eqns {
-                if matches!(eqn.op, OpKind::Binary(BinOp::Mul)) {
-                    for operand in &mut eqn.inputs {
-                        if matches!(operand, Operand::Lit(Scalar::F32(0.5))) {
-                            *operand =
-                                Operand::Lit(Scalar::F32(f32::from_bits(0.5f32.to_bits() + 1)));
-                            changed += 1;
+            let perturbed = poot_test_util::graph_fixtures::derive(&original, |draft| {
+                for eqn in draft.eqns_mut().iter_mut() {
+                    if matches!(eqn.op, OpKind::Binary(BinOp::Mul)) {
+                        for operand in &mut eqn.inputs {
+                            if matches!(operand, Operand::Lit(Scalar::F32(0.5))) {
+                                *operand =
+                                    Operand::Lit(Scalar::F32(f32::from_bits(0.5f32.to_bits() + 1)));
+                                changed += 1;
+                            }
                         }
                     }
                 }
-            }
+            })
+            .unwrap();
             assert_eq!(changed, 1, "exactly the reciprocal is perturbed by one ULP");
-        }
+            perturbed
+        };
         let program = compile(&graph, &target(Backend::SpirvVulkan), &OPTIONS).unwrap();
         let flash = program
             .graph()
-            .eqns
+            .eqns()
             .iter()
             .filter(|eqn| matches!(eqn.op, OpKind::Attention(_)))
             .count();
@@ -677,8 +685,8 @@ fn underflow_before_contraction(scale_rhs: bool) {
     .into_iter()
     .map(|v| v.map(|v| v.into_host().unwrap()))
     .collect();
-    let expected = &before[graph.output].as_ref().unwrap().as_f32().unwrap();
-    let actual = &after[program.graph().output]
+    let expected = &before[graph.result()].as_ref().unwrap().as_f32().unwrap();
+    let actual = &after[program.graph().result()]
         .as_ref()
         .unwrap()
         .as_f32()

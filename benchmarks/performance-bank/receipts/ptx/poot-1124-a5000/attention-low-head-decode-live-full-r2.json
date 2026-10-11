@@ -1,0 +1,127 @@
+{
+  "backend": "ptx",
+  "binary": "/root/bank",
+  "case": "attention-low-head-decode-live-full",
+  "cells": {
+    "kernel": {
+      "repeats": [
+        {
+          "metrics": {
+            "step_us": 689.19
+          },
+          "slot": 0,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 690.213
+          },
+          "slot": 1,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 689.4960000000001
+          },
+          "slot": 2,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 686.2529999999999
+          },
+          "slot": 3,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 687.3009999999999
+          },
+          "slot": 4,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 686.519
+          },
+          "slot": 5,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 685.01
+          },
+          "slot": 6,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 687.38
+          },
+          "slot": 7,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 686.339
+          },
+          "slot": 8,
+          "status": "ok"
+        }
+      ]
+    }
+  },
+  "hardware": {
+    "backend": "ptx",
+    "device": "NVIDIA RTX A5000",
+    "driver": "580.178.04"
+  },
+  "memory": [
+    {
+      "live_bytes": 33555456,
+      "peak_bytes": 33555456,
+      "role": "Weight"
+    },
+    {
+      "live_bytes": 148740,
+      "peak_bytes": 148740,
+      "role": "Activation"
+    },
+    {
+      "live_bytes": 262148,
+      "peak_bytes": 262148,
+      "role": "Input"
+    }
+  ],
+  "observed": {
+    "layout": "bhsd",
+    "shape": {
+      "cap": 32768,
+      "d": 128,
+      "hkv": 1,
+      "hq": 2,
+      "live": 32768
+    },
+    "storage": "f32",
+    "weight_bytes_per_copy": 33554432,
+    "weight_copies": 1
+  },
+  "plan": [
+    "pointwise [5f133fb4fe102e4e98d3bd18c2690a7d0ddae10ab6164df1c8b44a79967c77dd]",
+    "pointwise [8b17e914478dacb658e7782ed8f5449aa4ec4186023814ae593a7bcea943cfba]",
+    "attention [8d06338a075fd22ddc1616fc7c12e7964ce599d4ab7cf48b607be62608e4f0f6]",
+    "attention_combine [06272e9261da19551609d082f3eca791c96f6c9f662d668ccb1fca9f82dbf69a]"
+  ],
+  "plan_id": "24cdf329d310e6b527307d9bd1bcb4dd7199b0af73dcb3e90c00b66ec3ddbf09",
+  "recordings": 1,
+  "reference": {
+    "agrees": true,
+    "max_relative_error": 2.3208179658823674e-09,
+    "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
+    "provenance": "independent-golden",
+    "tolerance": 0.002
+  },
+  "replays": 13,
+  "role": "baseline",
+  "schema": 1
+}

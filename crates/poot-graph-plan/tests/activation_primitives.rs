@@ -120,9 +120,12 @@ fn run_table(f: impl Fn(&Builder, Traced) -> Traced) -> (Vec<u32>, Vec<u32>) {
     let x = b.constant("x", TensorType::f32(vec![TABLE.len()]));
     let y = f(&b, x);
     let xi = x.id();
-    let g = b.finish(y);
+    let g = b.finish(y).unwrap();
     let input = || HashMap::from([(xi, HostTensor::f32(vec![TABLE.len()], TABLE.to_vec()))]);
-    (eval_bits(&g, input()), eval_bits(&optimize(&g), input()))
+    (
+        eval_bits(&g, input()),
+        eval_bits(&optimize(&g).unwrap(), input()),
+    )
 }
 
 /// The MLP fixture inputs: a gate sweeping `[-5, 5)` and an oscillating up projection.
@@ -144,10 +147,10 @@ fn run_mlp(act: fn(&Builder, Traced) -> Traced) -> (Vec<u32>, Vec<u32>) {
     let up = b.constant("up", TensorType::f32(vec![1, 1, 32]));
     let out = b.binary(poot_graph_ir::BinOp::Mul, act(&b, gate), up);
     let (gi, ui) = (gate.id(), up.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     (
         eval_bits(&g, mlp_inputs(gi, ui)),
-        eval_bits(&optimize(&g), mlp_inputs(gi, ui)),
+        eval_bits(&optimize(&g).unwrap(), mlp_inputs(gi, ui)),
     )
 }
 
@@ -267,7 +270,7 @@ fn glu_wrappers_equal_activation_times_up() {
         let up = b.constant("up", TensorType::f32(vec![1, 1, 32]));
         let (gi, ui) = (gate.id(), up.id());
         let out = glu(&b, gate, up);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         let want = run_mlp(act).0;
         assert_eq!(eval_bits(&g, mlp_inputs(gi, ui)), want);
     }

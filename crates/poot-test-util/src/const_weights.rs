@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use poot_graph_ir::{Graph, PackedSourceName, Storage, ValidationChannel};
+use poot_graph_ir::{Graph, PackedSourceName, Storage};
 use poot_quant::weights::{
     AttnRole, FfnRole, WeightId, WeightKey, WeightMap, WeightRole, WeightStore, WeightView,
 };
@@ -47,9 +47,9 @@ impl<'s> ConstWeights<'s> {
     }
 
     /// `g` with each const the store holds named by its [`WeightId`]; every other value is untouched.
-    pub fn graph<V: ValidationChannel + Clone>(&mut self, g: &Graph<V>) -> Graph<V> {
-        let mut named = g.clone();
-        for &input in &g.inputs {
+    pub fn graph(&mut self, g: &Graph) -> Graph {
+        let mut named = g.edit();
+        for &input in g.inputs() {
             let meta = g.meta(input);
             if meta.storage != Storage::Const {
                 continue;
@@ -77,16 +77,15 @@ impl<'s> ConstWeights<'s> {
                     _ => continue,
                 },
             };
-            named.values[input].name = Some(renamed);
+            named.values_mut()[input].name = Some(renamed);
         }
         named
+            .commit()
+            .expect("renaming a const keeps the graph well formed")
     }
 
     /// `g` alone: its named graph and the map over `store`, for an executable that loads one graph.
-    pub fn bind<V: ValidationChannel + Clone>(
-        g: &Graph<V>,
-        store: &'s WeightStore,
-    ) -> (Graph<V>, WeightMap) {
+    pub fn bind(g: &Graph, store: &'s WeightStore) -> (Graph, WeightMap) {
         let mut weights = Self::new(store);
         let named = weights.graph(g);
         (named, weights.map())

@@ -1,6 +1,6 @@
 //! Throwaway diagnostic (spec 023): print the cse'd prefill graph eqns around the V-bias add (eqn 14) with their
 //! input value-ids and each input's producing eqn/op, to verify the wiring the PTX runtime executes.
-use poot_executor_parity::dense::{Dense, Family, plain, step};
+use poot_executor_parity::dense::{Dense, Family, step};
 use poot_graph_ir::Operand;
 use poot_models::model::{LogitRows, Phase};
 
@@ -14,18 +14,16 @@ fn dump_eqns() {
         .head_dim(64)
         .max_positions(32768);
     let model = dense.model();
-    let g0 = plain(
-        model
-            .model
-            .trace(Phase::Prefill, step(1, 864, 896, LogitRows::Last))
-            .unwrap(),
-    );
-    let g = poot_graph_plan::cse(&g0);
+    let g0 = model
+        .model
+        .trace(Phase::Prefill, step(1, 864, 896, LogitRows::Last))
+        .unwrap();
+    let g = poot_graph_plan::cse(&g0).unwrap();
     let mut producer = std::collections::HashMap::new();
-    for (i, e) in g.eqns.iter().enumerate() {
+    for (i, e) in g.eqns().iter().enumerate() {
         producer.insert(e.out, (i, e.op.name()));
     }
-    for (i, e) in g.eqns.iter().enumerate().take(17).skip(8) {
+    for (i, e) in g.eqns().iter().enumerate().take(17).skip(8) {
         let ins: Vec<String> = e
             .inputs
             .iter()

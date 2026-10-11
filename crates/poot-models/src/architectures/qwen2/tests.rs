@@ -1,5 +1,5 @@
 use poot_graph_ir::Slot;
-use poot_graph_ir::{Graph, OpKind, Storage, ValidationOutputs};
+use poot_graph_ir::{Graph, OpKind, Storage};
 use std::num::NonZeroUsize;
 
 use crate::model::{KvLayout, LogitRows, Model, Phase, StepShape};
@@ -74,15 +74,14 @@ fn dims(model: &dyn Model, family: &str) -> (usize, usize, usize, usize) {
 
 /// A traced step carries one K and one V cache per layer, each `[rows, kv_heads, cap, head_dim]`,
 /// and yields `[rows, 1, vocab]` logits.
-fn assert_contiguous_state(g: &Graph<ValidationOutputs>, family: &str, rows: usize, cap: usize) {
+fn assert_contiguous_state(g: &Graph, family: &str, rows: usize, cap: usize) {
     let m = fixture_model(family);
     let (layers, kv_heads, head_dim, vocab) = dims(&*m, family);
-    g.validate().expect("the traced graph validates");
-    assert_eq!(g.aval(g.output).shape, vec![rows, 1, vocab]);
-    assert_eq!(g.state.len(), 2 * layers);
-    for (si, _so) in &g.state {
-        assert_eq!(g.aval(*si).shape, vec![rows, kv_heads, cap, head_dim]);
-        assert_eq!(g.values[*si].storage, Storage::State);
+    assert_eq!(g.aval(g.result()).shape, vec![rows, 1, vocab]);
+    assert_eq!(g.state().count(), 2 * layers);
+    for (si, _so) in g.state() {
+        assert_eq!(g.aval(si).shape, vec![rows, kv_heads, cap, head_dim]);
+        assert_eq!(g.values()[si].storage, Storage::State);
     }
 }
 
@@ -91,9 +90,8 @@ fn decode_traces_and_validates() {
     let m = fixture_model("qwen2");
     let g = m.trace(Phase::Decode, contiguous(1, 1, 16)).unwrap();
     // structural well-formedness: every operand defined before use, stored avals match infer.
-    g.validate().expect("graph should validate");
-    assert!(g.eqns.len() > 100);
-    assert_eq!(g.aval(g.output).shape, vec![1, 1, 48]);
+    assert!(g.eqns().len() > 100);
+    assert_eq!(g.aval(g.result()).shape, vec![1, 1, 48]);
 }
 
 #[test]
@@ -102,8 +100,7 @@ fn prefill_traces_and_validates_both_archs() {
     for family in ["qwen2", "qwen3"] {
         let m = fixture_model(family);
         let g = m.trace(Phase::Prefill, contiguous(1, 5, 8)).unwrap();
-        g.validate().expect("prefill graph should validate");
-        assert_eq!(g.aval(g.output).shape, vec![1, 1, m.config().vocab]);
+        assert_eq!(g.aval(g.result()).shape, vec![1, 1, m.config().vocab]);
     }
 }
 
@@ -153,11 +150,10 @@ fn rope_fusion_collapses_every_rope_in_the_decode_graph() {
     let m = fixture_model("qwen2");
     let (layers, _, head_dim, _) = dims(&*m, "qwen2");
     let g = m.trace(Phase::Decode, contiguous(1, 1, 16)).unwrap();
-    let base = dce(&cse(&g));
-    let fused = dce(&rope_fusion(&cse(&g)));
-    fused.validate().expect("fused decode graph valid");
+    let base = dce(&cse(&g).unwrap()).unwrap();
+    let fused = dce(&rope_fusion(&cse(&g).unwrap()).unwrap()).unwrap();
     let ropes: Vec<usize> = fused
-        .eqns
+        .eqns()
         .iter()
         .filter_map(|e| match e.op {
             OpKind::Rope { rot } => Some(rot),
@@ -171,8 +167,8 @@ fn rope_fusion_collapses_every_rope_in_the_decode_graph() {
         "full-rotary: rot == head_dim"
     );
     // Other ops negate too (`silu` is `x * exp(-x)`); only the rotate-half Negs, one per rope, go.
-    let count_negs = |g: &Graph<ValidationOutputs>| {
-        g.eqns
+    let count_negs = |g: &Graph| {
+        g.eqns()
             .iter()
             .filter(|e| matches!(e.op, OpKind::Unary(UnOp::Neg)))
             .count()
@@ -184,8 +180,8 @@ fn rope_fusion_collapses_every_rope_in_the_decode_graph() {
     );
     // Every op but a `Reshape` alias is one dispatch (`poot_graph_ir::analysis::dispatch_count`, which
     // takes a graph without a validation channel).
-    let dispatch_count = |g: &Graph<ValidationOutputs>| {
-        g.eqns
+    let dispatch_count = |g: &Graph| {
+        g.eqns()
             .iter()
             .filter(|e| !matches!(e.op, OpKind::Reshape { .. }))
             .count()
@@ -208,17 +204,16 @@ fn collapse_reshape_chains_shrinks_the_decode_graph() {
     let g = fixture_model("qwen2")
         .trace(Phase::Decode, contiguous(1, 1, 16))
         .unwrap();
-    let elided = elide_noop_transposes(&g);
-    let collapsed = collapse_reshape_chains(&elided);
-    collapsed.validate().expect("collapsed decode graph valid");
+    let elided = elide_noop_transposes(&g).unwrap();
+    let collapsed = collapse_reshape_chains(&elided).unwrap();
     assert!(
-        collapsed.eqns.len() < elided.eqns.len(),
+        collapsed.eqns().len() < elided.eqns().len(),
         "collapse should shrink the decode graph: {} -> {} eqns",
-        elided.eqns.len(),
-        collapsed.eqns.len()
+        elided.eqns().len(),
+        collapsed.eqns().len()
     );
     assert_eq!(
-        collapsed.aval(collapsed.output).shape,
+        collapsed.aval(collapsed.result()).shape,
         vec![1, 1, 48],
         "output unchanged"
     );
@@ -245,8 +240,7 @@ fn batched_decode_traces_with_state_pairs() {
     assert_contiguous_state(&g, "qwen2", 3, 16);
     // B=1 must reduce to the same output shape as the scalar decode.
     let g1 = m.trace(Phase::Decode, contiguous(1, 1, 16)).unwrap();
-    g1.validate().expect("B=1 batched decode should validate");
-    assert_eq!(g1.aval(g1.output).shape, vec![1, 1, 48]);
+    assert_eq!(g1.aval(g1.result()).shape, vec![1, 1, 48]);
 }
 
 #[test]
@@ -255,8 +249,7 @@ fn decode_handles_qwen3() {
     let g = fixture_model("qwen3")
         .trace(Phase::Decode, contiguous(1, 1, 8))
         .unwrap();
-    g.validate().expect("qwen3 kv decode should validate");
-    assert_eq!(g.state.len(), 2 * 2);
+    assert_eq!(g.state().count(), 2 * 2);
 }
 
 #[test]
@@ -265,8 +258,8 @@ fn exactly_two_slots() {
     let g = fixture_model("qwen2")
         .trace(Phase::Decode, contiguous(1, 1, 16))
         .unwrap();
-    assert_eq!(g.slots.len(), 2);
-    let mut kinds: Vec<Slot> = g.slots.iter().map(|(_, s)| *s).collect();
+    assert_eq!(g.slots().len(), 2);
+    let mut kinds: Vec<Slot> = g.slots().iter().map(|(_, s)| *s).collect();
     kinds.sort_by_key(|s| format!("{s:?}"));
     assert_eq!(kinds, vec![Slot::Pos, Slot::Token]);
 }
@@ -276,9 +269,9 @@ fn inputs_are_const_slot_or_state() {
     let g = fixture_model("qwen2")
         .trace(Phase::Decode, contiguous(1, 1, 16))
         .unwrap();
-    for &id in &g.inputs {
+    for &id in g.inputs() {
         assert!(matches!(
-            g.values[id].storage,
+            g.values()[id].storage,
             Storage::Const | Storage::Computed(_) | Storage::Slot(_) | Storage::State
         ));
     }
@@ -297,10 +290,10 @@ fn assert_flash_fused_prefill(family: &str, kv: KvLayout) {
     let g = m
         .trace(Phase::Prefill, shape(1, n, n, kv, LogitRows::Last))
         .unwrap();
-    let opt = crate::test_support::optimize(&g);
+    let opt = crate::test_support::optimize(&g).unwrap();
 
     let flash_prefill = opt
-        .eqns
+        .eqns()
         .iter()
         .filter(|e| matches!(e.op, OpKind::Attention(_)))
         .count();
@@ -311,7 +304,7 @@ fn assert_flash_fused_prefill(family: &str, kv: KvLayout) {
 
     // no MatMul should produce a full [.,Hq,L,L] (or larger) score-matrix-shaped output; flash
     // attention never materializes it.
-    for e in &opt.eqns {
+    for e in opt.eqns() {
         if matches!(e.op, OpKind::MatMul) {
             // Shape-aware, not a size threshold (Card 557: the projections are plain `MatMul`s too
             // now, and an `[1,L,inter]` MLP output can exceed L*L elements): a rank-4 `[.,Hq,L,L']`
@@ -349,10 +342,10 @@ fn optimize_fuses_flash_prefill_vlm_embeds_no_materialized_scores() {
             shape(1, n, n, KvLayout::Contiguous, LogitRows::Last),
         )
         .unwrap();
-    let opt = crate::test_support::optimize(&g);
+    let opt = crate::test_support::optimize(&g).unwrap();
 
     let flash_prefill = opt
-        .eqns
+        .eqns()
         .iter()
         .filter(|e| matches!(e.op, OpKind::Attention(_)))
         .count();
@@ -360,7 +353,7 @@ fn optimize_fuses_flash_prefill_vlm_embeds_no_materialized_scores() {
         flash_prefill, layers,
         "expected one fused flash-prefill op per layer"
     );
-    for e in &opt.eqns {
+    for e in opt.eqns() {
         if matches!(e.op, OpKind::MatMul) {
             let shape = &opt.aval(e.out).shape;
             let r = shape.len();
@@ -381,8 +374,8 @@ fn cse_only_leaves_naive_materialized_scores() {
     let n = 2048usize;
     let m = model("qwen2", |c| c["max_position_embeddings"] = 4096.into());
     let g = m.trace(Phase::Prefill, contiguous(1, n, n)).unwrap();
-    let g = poot_graph_plan::cse(&g);
-    let has_naive_scores = g.eqns.iter().any(|e| {
+    let g = poot_graph_plan::cse(&g).unwrap();
+    let has_naive_scores = g.eqns().iter().any(|e| {
         matches!(e.op, OpKind::MatMul) && g.aval(e.out).shape.iter().product::<usize>() >= n * n
     });
     assert!(
@@ -416,11 +409,8 @@ fn olmo2_prefill_traces_with_state_pairs() {
     let g = m.trace(Phase::Prefill, contiguous(1, 5, 16)).unwrap();
     assert_contiguous_state(&g, "olmo2", 1, 16);
     let decode = m.trace(Phase::Decode, contiguous(1, 1, 16)).unwrap();
-    let shapes = |g: &Graph<ValidationOutputs>| -> Vec<Vec<usize>> {
-        g.state
-            .iter()
-            .map(|(si, _)| g.aval(*si).shape.clone())
-            .collect()
+    let shapes = |g: &Graph| -> Vec<Vec<usize>> {
+        g.state().map(|(si, _)| g.aval(si).shape.clone()).collect()
     };
     assert_eq!(shapes(&g), shapes(&decode));
 }
@@ -672,7 +662,7 @@ mod vl {
             .unwrap();
         let zeros = state
             .is_empty()
-            .then(|| g.state.iter().map(|&(si, _)| vec![0.0; g.aval(si).numel()]));
+            .then(|| g.state().map(|(si, _)| vec![0.0; g.aval(si).numel()]));
         let zeros: Vec<Vec<f32>> = zeros.into_iter().flatten().collect();
         let state: Vec<&[f32]> = if state.is_empty() { &zeros } else { state }
             .iter()
@@ -780,9 +770,8 @@ mod vl {
             )
             .unwrap();
         let zeros: Vec<Vec<f32>> = g
-            .state
-            .iter()
-            .map(|&(si, _)| vec![0.0; g.aval(si).numel()])
+            .state()
+            .map(|(si, _)| vec![0.0; g.aval(si).numel()])
             .collect();
         let zeros: Vec<&[f32]> = zeros.iter().map(Vec::as_slice).collect();
         let (want, _) = oracle::eval_slots(

@@ -13,8 +13,8 @@ these tables.
 This page answers "does X work on backend Y?". The model and weight-format tables are generated from what the
 planner says; the other tables are written by hand.
 
-NPU offload was removed; it is not listed as a column here. See
-[NPU offload](../architecture/npu.mdx).
+The AMD XDNA2 NPU is not a column here: it runs only F32 `add`, `sub` and `mul` programs (see
+[NPU offload](../architecture/npu.mdx)).
 
 For lower-level kernel/dispatch capability (elementwise, GEMV, flash attention, capture/replay, ...), see
 the [Backends](../architecture/backends.mdx#capability-comparison) architecture page, this page is the
@@ -172,6 +172,7 @@ ROCm; the PTX run is pending, and the matrix cells above describe the resident p
 | KV preemption / swap on eviction                                                                     | Not needed: a request's blocks are reserved at open; a request that finds no room waits | Not needed: a request's blocks are reserved at open; a request that finds no room waits | Not needed: a request's blocks are reserved at open; a request that finds no room waits |
 | Speculative decoding, single-sequence (prompt-lookup + draft-model, greedy + sampled)                | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--no">No</span> (no served test)[^ptx-served] |
 | Speculative decoding, inside continuous batching (prompt-lookup and draft-model, greedy and sampled) | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--no">No</span> (no served test)[^ptx-served] |
+| Speculative decoding, the model's own MTP layer (GLM-5.3-Flash fixture, greedy + sampled; prefix caching is off under it) | <span class="matrix-status matrix-status--yes">Yes</span> | <span class="matrix-status matrix-status--yes">Yes</span> | <span class="matrix-status matrix-status--no">No</span> (rows registered, pod batch pending) |
 | On-device sampling: greedy                                                                           | <span class="matrix-status matrix-status--yes">Yes</span>[^device-sample]                | <span class="matrix-status matrix-status--yes">Yes</span>[^device-sample]                | <span class="matrix-status matrix-status--yes">Yes</span>[^device-sample]                |
 | On-device sampling: temperature/top-k/top-p/min-p                                                    | <span class="matrix-status matrix-status--yes">Yes</span>[^device-sample]                | <span class="matrix-status matrix-status--yes">Yes</span>[^device-sample]                | <span class="matrix-status matrix-status--yes">Yes</span>[^device-sample]                |
 | LoRA adapter serving (hot-load, per-request selection)                                               | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--no">No</span> (no served test)[^lora-scope]    |
@@ -242,7 +243,7 @@ driver.
 - **Anything else (Intel iGPU/dGPU, other Vulkan-capable hardware):** wgpu is the supported choice. Raw Vulkan
   runs there in principle but is verified on AMD (RADV) only. Pick either through the `poot-llm` API
   or the `poot-serve` `--backend` option.
-- **NPU:** removed. See
+- **NPU:** AMD XDNA2 only, experimental: F32 `add`, `sub` and `mul` programs, no model. See
   [Architecture: NPU Offload](../architecture/npu.mdx).
 
 See [Picking a backend](../serve/choosing-a-backend.md) for the decision walkthrough.

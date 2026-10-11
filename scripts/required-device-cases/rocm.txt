@@ -119,6 +119,11 @@ poot-llm	driver::device_tests::smolvlm_batched_paged_embeds_match_single_row_run
 poot-llm	driver::device_tests::smolvlm_caption_matches_the_oracle_rows_rocm
 poot-llm	driver::device_tests::smolvlm_front_end_requests_served_batched_equal_single_row_captions_rocm
 poot-llm	driver::device_tests::two_frames_of_one_size_embed_differently_rocm
+poot-llm	driver::step::mtp_tests::mtp_all_accepted_equals_off_rocm
+poot-llm	driver::step::mtp_tests::mtp_greedy_equals_off_rocm
+poot-llm	driver::step::mtp_tests::mtp_proposals_equal_the_oracle_chain_rocm
+poot-llm	driver::step::mtp_tests::mtp_serves_a_sampled_row_rocm
+poot-llm	driver::step::mtp_tests::mtp_two_rows_equal_off_rocm
 poot-llm::add_a_model	four_paged_rows_equal_single_row_runs_rocm
 poot-llm::add_a_model	generate_equals_the_oracle_tokens_rocm
 poot-llm::beam	beam_matches_the_host_reference_rocm
@@ -169,6 +174,7 @@ poot-rocm-gpu::attention	prefill_into_a_cache_matches_the_oracle_on_rocm
 poot-rocm-gpu::attention	softcapped_prefill_over_many_key_tiles_matches_the_oracle_on_rocm
 poot-rocm-gpu::batched_lora_rocm	batched_lora_decode_rocm_matches_per_row_merged_weight_reference
 poot-rocm-gpu::buffer_plan	a_short_value_reusing_a_larger_slot_matches_the_oracle_on_rocm
+poot-rocm-gpu::buffer_plan	an_aie_launch_is_a_typed_refusal_on_rocm
 poot-rocm-gpu::buffer_plan	len_probe_reads_the_operand_own_length_never_a_larger_slots_capacity_on_rocm
 poot-rocm-gpu::cross_backend	a_dense_gemv_epilogue_matches_the_oracle_on_rocm
 poot-rocm-gpu::cross_backend	a_dense_tiled_epilogue_matches_the_oracle_on_rocm
@@ -263,6 +269,8 @@ poot-rocm-gpu::parity	dense_gemv::the_dense_gemv_meets_tier_2_in_every_lane_and_
 poot-rocm-gpu::parity	f16_checkpoint_orientation_projection_matches_the_oracle_on_rocm
 poot-rocm-gpu::parity	parity_table_matches_the_oracle_on_rocm
 poot-rocm-gpu::parity	select_is_bitwise_on_rocm
+poot-rocm-gpu::parity	split_kv_decode_matches_the_oracle_on_rocm
+poot-rocm-gpu::parity	split_kv_decode_replay_equals_the_recording_step_on_rocm
 poot-rocm-gpu::parity	state_pool_rows_reset_independently_on_rocm
 poot-rocm-gpu::parity	two_byte_select_is_bitwise_on_rocm
 poot-rocm-gpu::routed_prefill_unguarded	routed_prefill_unguarded_rocm
@@ -307,6 +315,7 @@ poot-rocm-runtime	tests::weight_and_activation_allocations_use_the_coarse_pool
 poot-serve::bin/poot-serve	tests::lifecycle::device::a_hot_loaded_adapter_serves_requests_and_unload_frees_it_rocm
 poot-serve::bin/poot-serve	tests::lifecycle::device::a_multimodal_job_through_the_loop_matches_generate_with_embeds_rocm
 poot-serve::bin/poot-serve	tests::lifecycle::device::an_encode_job_on_the_serving_driver_matches_a_fresh_drivers_encode_rocm
+poot-serve::served_groups	a_model_without_an_mtp_layer_refuses_draft_mtp_startup_rocm
 poot-serve::served_groups	draft_with_a_larger_vocabulary_refuses_startup_rocm
 poot-serve::served_groups	served_bloom_rocm
 poot-serve::served_groups	served_deepseek2_rocm
@@ -326,6 +335,7 @@ poot-serve::served_groups	served_lookup_speculation_returns_the_off_tokens_rocm
 poot-serve::served_groups	served_minimax_m2_rocm
 poot-serve::served_groups	served_mixtral_rocm
 poot-serve::served_groups	served_mpt_rocm
+poot-serve::served_groups	served_mtp_speculation_returns_the_off_tokens_rocm
 poot-serve::served_groups	served_nemotron_h_rocm
 poot-serve::served_groups	served_olmo2_rocm
 poot-serve::served_groups	served_olmoe_rocm

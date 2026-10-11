@@ -42,7 +42,7 @@ fn reshape_collapse_is_value_identical() {
     let yt = b.transpose(b.reshape(y, vec![1, 1, 4, 6]), vec![0, 2, 1, 3]); // no-op at seq 1
     let yr = b.reshape(yt, vec![4, 6]);
     let out = b.binary(BinOp::Add, scaled, yr);
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let inputs = {
         let mut m = HashMap::new();
@@ -62,12 +62,12 @@ fn reshape_collapse_is_value_identical() {
         .output
         .into_host()
         .unwrap();
-    let collapsed = eval(&collapse_reshape_chains(&g), &inputs, opts())
+    let collapsed = eval(&collapse_reshape_chains(&g).unwrap(), &inputs, opts())
         .unwrap()
         .output
         .into_host()
         .unwrap();
-    let fused = eval(&fuse(&cse(&g)), &inputs, opts())
+    let fused = eval(&fuse(&cse(&g).unwrap()).unwrap(), &inputs, opts())
         .unwrap()
         .output
         .into_host()
@@ -82,10 +82,14 @@ fn reshape_collapse_is_value_identical() {
             .collect::<Vec<_>>()
     };
     assert_eq!(bits(&collapsed), bits(&base), "collapse changed values");
-    assert_eq!(bits(&fused), bits(&base), "fuse(collapse) changed values");
+    assert_eq!(
+        bits(&fused),
+        bits(&base),
+        "fuse(collapse).unwrap() changed values"
+    );
     // the collapse actually shrank the graph (the chain's two intermediate reshapes are gone).
     assert!(
-        collapse_reshape_chains(&g).eqns.len() < g.eqns.len(),
+        collapse_reshape_chains(&g).unwrap().eqns().len() < g.eqns().len(),
         "collapse should remove dead intermediate reshapes"
     );
 }
@@ -221,10 +225,8 @@ fn fused_equals_unfused_over_random_movement_graphs() {
             }
         }
         let (out, _) = *pool.last().unwrap();
-        let g = b.finish(out);
-        g.validate()
-            .unwrap_or_else(|e| panic!("seed {seed}: invalid graph: {e}"));
-        if !g.eqns.is_empty() {
+        let g = b.finish(out).unwrap();
+        if !g.eqns().is_empty() {
             had_eqns += 1;
         }
         let base = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -241,10 +243,13 @@ fn fused_equals_unfused_over_random_movement_graphs() {
         };
         let want = bits(&base);
         for (name, gg) in [
-            ("cse", cse(&g)),
-            ("elide_noop_transposes", elide_noop_transposes(&g)),
-            ("collapse_reshape_chains", collapse_reshape_chains(&g)),
-            ("fuse(cse)", fuse(&cse(&g))),
+            ("cse", cse(&g).unwrap()),
+            ("elide_noop_transposes", elide_noop_transposes(&g).unwrap()),
+            (
+                "collapse_reshape_chains",
+                collapse_reshape_chains(&g).unwrap(),
+            ),
+            ("fuse(cse).unwrap()", fuse(&cse(&g).unwrap()).unwrap()),
         ] {
             let got = eval(&gg, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
                 .unwrap()
@@ -285,7 +290,7 @@ fn fused_multi_axis_broadcast_leaf_matches_unfused() {
         let sum = b.binary(BinOp::Add, bc, other);
         let out = b.unary(UnOp::Neg, sum);
         let out = b.binary(BinOp::Mul, out, other);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
 
         let mut inputs = HashMap::new();
         inputs.insert(
@@ -303,13 +308,12 @@ fn fused_multi_axis_broadcast_leaf_matches_unfused() {
             )),
         );
 
-        let fg = fuse(&cse(&g));
-        fg.validate().expect("fused graph valid");
+        let fg = fuse(&cse(&g).unwrap()).unwrap();
         assert!(
-            fg.eqns.len() < g.eqns.len(),
+            fg.eqns().len() < g.eqns().len(),
             "m={m} n={n} k={k}: expected fusion to merge the chain ({} -> {} eqns)",
-            g.eqns.len(),
-            fg.eqns.len()
+            g.eqns().len(),
+            fg.eqns().len()
         );
 
         let unfused = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -359,7 +363,7 @@ fn fused_pointwise_over_empty_tensor_edges() {
         // a movement op (reshape to the same numel, still 0) on top, so the fused region carries a zero-size value through a
         // shape change.
         let reshaped = b.reshape(neg, shape.clone());
-        let g = b.finish(reshaped);
+        let g = b.finish(reshaped).unwrap();
 
         let mut inputs = HashMap::new();
         inputs.insert(x.id(), Value::from(HostTensor::f32(shape.clone(), vec![])));
@@ -382,9 +386,7 @@ fn fused_pointwise_over_empty_tensor_edges() {
             "shape {shape:?}: 0-size dim must yield no data"
         );
 
-        let fg = fuse(&cse(&g));
-        fg.validate()
-            .unwrap_or_else(|e| panic!("shape {shape:?}: fused graph invalid: {e}"));
+        let fg = fuse(&cse(&g).unwrap()).unwrap();
         let fused = eval(&fg, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
             .unwrap_or_else(|e| {
                 panic!("shape {shape:?}: eval (fused) failed on an empty tensor: {e}")
@@ -414,7 +416,7 @@ fn compile_chooses_the_generated_tiled_gemm_for_m_over_one_only() {
 
     let options = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
     let backend = Backend::AmdGcn(AmdArch::gfx1151());
-    let target = Target {
+    let target = Target::Gpu {
         backend,
         caps: poot_test_util::device_caps::default_caps_for(backend),
     };
@@ -424,7 +426,8 @@ fn compile_chooses_the_generated_tiled_gemm_for_m_over_one_only() {
         let a = b.constant("a", TensorType::f32(vec![m, k]));
         let w = b.constant("w", TensorType::f32(vec![k, n]));
         let y = b.matmul(a, w);
-        let program = compile(&b.finish(y), &target, &options).expect("the matmul compiles");
+        let program =
+            compile(&b.finish(y).unwrap(), &target, &options).expect("the matmul compiles");
         let (eqn, _) = program
             .planned()
             .find(|(eqn, _)| matches!(eqn.op, OpKind::MatMul))

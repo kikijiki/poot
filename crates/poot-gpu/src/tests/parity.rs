@@ -237,7 +237,7 @@ fn run_once_matches_a_hand_computed_elementwise_add() {
     let w = b.constant("w", TensorType::f32(vec![2, 2]));
     let x = b.slot(Slot::Activation, TensorType::f32(vec![2, 2]));
     let out = b.binary(BinOp::Add, w, x);
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let slot_key = g
         .meta(x.id())
         .slot_key()
@@ -356,4 +356,42 @@ fn state_pool_rows_reset_independently_on_wgpu() {
     let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
     poot_executor_parity::state_row::run_state_pool_row_reset(exec.as_mut(), t)
         .unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// POOT-1113: a low-head live decode (2 query rows over a 1024-key cache, `Slot::Pos` bounding the keys)
+/// plans the split-KV schedule (two launches through one scratch) and, stepped at live lengths 1024, 5, 400,
+/// 1, 1024 over one executable, matches the CPU oracle's evaluation of each length within
+/// `SPLIT_KV_DEVICE_TOLERANCE`. The scratch slot is stale from the
+/// previous step at every step but the first (length 5 leaves seven of the eight splits with no key), so a
+/// split that did not publish its own neutral partial reads the first step's.
+/// Mutation: in `poot-kernelgen`'s `attention_body`, skip the partial writes of a split with no key; the
+/// length-5 and length-1 steps go red. Dropping one split's partial in the combine (`count` starting at 1)
+/// goes red on every step.
+#[test]
+fn split_kv_decode_matches_the_oracle_on_wgpu() {
+    let Ok(device) = WgpuDevice::new() else {
+        eprintln!("skip: no wgpu adapter");
+        return;
+    };
+    let t = target(&device);
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    poot_executor_parity::attention::assert_split_kv_decode_matches_the_oracle(exec.as_mut(), t)
+        .unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// POOT-1113: the split-KV decode stepped through its live lengths twice over one entry: the second pass
+/// replays the captured two-launch plan, and every step's output equals the first pass's bit for bit.
+#[test]
+fn split_kv_decode_replay_equals_the_recording_step_on_wgpu() {
+    let Ok(device) = WgpuDevice::new() else {
+        eprintln!("skip: no wgpu adapter");
+        return;
+    };
+    let t = target(&device);
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    poot_executor_parity::attention::assert_split_kv_decode_replays_bit_identically(
+        exec.as_mut(),
+        t,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
 }

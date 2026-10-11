@@ -229,7 +229,7 @@ mod tests {
             let b = Builder::new();
             let xs = b.constant("x", TensorType::f32(vec![t, w]));
             let y = plain_mlp(&b, xs, &weights, gelu);
-            fx.eval(&b.finish(y), &[("x", &x)], &[], &[]).0
+            fx.eval(&b.finish(y).unwrap(), &[("x", &x)], &[], &[]).0
         };
         let got = run(&fx);
         let (u, d) = (fx.values(id(FfnRole::Up)), fx.values(id(FfnRole::Down)));
@@ -311,7 +311,7 @@ mod tests {
                 let b = Builder::new();
                 let xs = b.constant("x", TensorType::f32(vec![t, w]));
                 let y = relu2_mlp(&b, xs, &weights);
-                fx.eval(&b.finish(y), &[("x", &x)], &[], &[]).0
+                fx.eval(&b.finish(y).unwrap(), &[("x", &x)], &[], &[]).0
             };
             let got = run(&fx);
             let (u, d) = (fx.values(id(FfnRole::Up)), fx.values(id(FfnRole::Down)));
@@ -373,7 +373,7 @@ mod tests {
             let b = Builder::new();
             let xs = b.constant("x", TensorType::f32(vec![t, w]));
             let y = f(&b, xs, &weights);
-            fx.eval(&b.finish(y), &[("x", &x)], &[], &[]).0
+            fx.eval(&b.finish(y).unwrap(), &[("x", &x)], &[], &[]).0
         };
         let got = run(&fx, geglu_ffn);
         let (g, u, d) = (
@@ -430,7 +430,12 @@ mod tests {
             let u = b.constant("up", TensorType::f32(vec![n]));
             let y = glu(&b, g, u, &Glu::clamped(alpha, limit).unwrap());
             Fx::new(1)
-                .eval(&b.finish(y), &[("gate", gate), ("up", up)], &[], &[])
+                .eval(
+                    &b.finish(y).unwrap(),
+                    &[("gate", gate), ("up", up)],
+                    &[],
+                    &[],
+                )
                 .0
         };
         let got = run(&gate, &up, limit);
@@ -490,7 +495,7 @@ mod tests {
             let b = Builder::new();
             let xs = b.constant("x", TensorType::f32(vec![t, w]));
             let y = gated_ffn(&b, xs, &weights);
-            fx.eval(&b.finish(y), &[("x", &x)], &[], &[]).0
+            fx.eval(&b.finish(y).unwrap(), &[("x", &x)], &[], &[]).0
         };
         let got = run(&fx);
         let (g, u, d) = (
@@ -542,7 +547,12 @@ mod tests {
             let u = b.constant("up", TensorType::f32(vec![n]));
             let y = glu(&b, g, u, &Glu::clamped_silu(limit).unwrap());
             Fx::new(1)
-                .eval(&b.finish(y), &[("gate", gate), ("up", up)], &[], &[])
+                .eval(
+                    &b.finish(y).unwrap(),
+                    &[("gate", gate), ("up", up)],
+                    &[],
+                    &[],
+                )
                 .0
         };
         let limit = f64::from(limit);

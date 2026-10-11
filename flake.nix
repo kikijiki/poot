@@ -270,6 +270,8 @@
             # poot-codegen's compile_aie resolves. The device node is the host's; an unreadable
             # /dev/accel/accel0 or a low memlock limit is a host setting, reported by xrt-smi itself.
             export XILINX_XRT="${xrtPrefix}"
+            # XRT's xclbin.h includes <uuid/uuid.h>; the poot-npu shim build finds it here (POOT-641).
+            export POOT_LIBUUID_INCLUDE="${pkgs.lib.getDev pkgs.util-linux}/include"
             export PATH="${xrtPrefix}/bin:$PATH"
             export LD_LIBRARY_PATH="${xrtPrefix}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
             export POOT_AIE_LLC="${peano}/bin/llc"

@@ -227,7 +227,7 @@ fn pooled_deepseek3_stages_run_the_contraction_and_pointwise_passes() {
         ("ptx", Backend::Nvptx, DeviceCaps::ptx_default()),
     ];
     for (label, backend, caps) in presets {
-        let target = poot_graph_plan::Target { backend, caps };
+        let target = poot_graph_plan::Target::Gpu { backend, caps };
         let device = poot_graph_plan::DeviceId(0);
         let compile = |experts| {
             compile_staged(

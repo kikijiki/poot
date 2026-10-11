@@ -145,7 +145,7 @@ mod tests {
         let b = Builder::new();
         let xs = b.constant("x", TensorType::f32(vec![x.len()]));
         let w = build(&b, xs);
-        let out = fx.eval(&b.finish(w), &[("x", x)], &[], &[]).0;
+        let out = fx.eval(&b.finish(w).unwrap(), &[("x", x)], &[], &[]).0;
         assert_eq!(out.len(), 1, "a witness is one lane");
         out[0]
     }
@@ -170,7 +170,9 @@ mod tests {
             let b = Builder::new();
             let slot = b.slot(Slot::Token, TensorType::new(vec![ids.len()], DType::I32));
             let w = out_of_range_count(&b, slot, 4);
-            let out = fx.eval(&b.finish(w), &[], &[(Slot::Token, ids)], &[]).0;
+            let out = fx
+                .eval(&b.finish(w).unwrap(), &[], &[(Slot::Token, ids)], &[])
+                .0;
             assert_eq!(out.len(), 1, "a witness is one lane");
             out[0]
         };

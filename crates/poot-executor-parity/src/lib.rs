@@ -50,7 +50,7 @@ pub mod write_probe;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::dense::{Dense, Family, plain, step};
+use crate::dense::{Dense, Family, step};
 use poot_executor::{Executor, NoSync, StateScope, StepInputs};
 use poot_graph_ir::{Graph, Slot, Storage, TensorType};
 use poot_graph_plan::{
@@ -106,7 +106,7 @@ fn store_for(g: &Graph) -> WeightStore {
 /// [`store_for`] with each named constant's data rewritten in place by `adjust(name, data)`.
 fn store_with(g: &Graph, adjust: impl Fn(&str, &mut [f32])) -> WeightStore {
     let mut entries: HashMap<String, Vec<usize>> = HashMap::new();
-    for &id in &g.inputs {
+    for &id in g.inputs() {
         let meta = g.meta(id);
         if meta.storage == Storage::Const {
             entries.insert(meta.name.clone().unwrap(), meta.aval.shape.clone());
@@ -124,7 +124,7 @@ fn store_with(g: &Graph, adjust: impl Fn(&str, &mut [f32])) -> WeightStore {
 }
 
 fn step_fixtures(g: &Graph, tokens: &[u32], start: usize) -> Vec<StepFixture> {
-    g.inputs
+    g.inputs()
         .iter()
         .filter_map(|&id| {
             let meta = g.meta(id);
@@ -185,11 +185,10 @@ pub(crate) fn decode_fixture(
     store: impl Fn(&Graph) -> WeightStore,
 ) -> Fixture {
     let m = dense.f32_model();
-    let g = plain(
-        m.model
-            .trace(Phase::Decode, step(1, 1, cap, LogitRows::Last))
-            .unwrap(),
-    );
+    let g = m
+        .model
+        .trace(Phase::Decode, step(1, 1, cap, LogitRows::Last))
+        .unwrap();
     let store = store(&g);
     let steps = (0..cap)
         .map(|pos| step_fixtures(&g, &[((pos * 7 + 3) % 32) as u32], pos))
@@ -211,11 +210,10 @@ fn prefill_fixture(
     store: impl Fn(&Graph) -> WeightStore,
 ) -> Fixture {
     let m = dense.f32_model();
-    let g = plain(
-        m.model
-            .trace(Phase::Prefill, step(1, n, cap, LogitRows::Last))
-            .unwrap(),
-    );
+    let g = m
+        .model
+        .trace(Phase::Prefill, step(1, n, cap, LogitRows::Last))
+        .unwrap();
     let store = store(&g);
     let prompt: Vec<u32> = (0..n as u32).map(|t| (t * 11 + 2) % 32).collect();
     let steps = vec![step_fixtures(&g, &prompt, 0)];
@@ -311,7 +309,7 @@ fn checkpoint_projection_fixture(
     let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![m, k]));
     let w = b.constant("w", TensorType::new(vec![n, k], weight));
     let out = b.matmul(x, b.transpose(w, vec![1, 0]));
-    let graph = b.finish(out);
+    let graph = b.finish(out).unwrap();
     let key = graph.meta(x.id()).slot_key().unwrap().clone();
     let steps = (0..2u64)
         .map(|step| {
@@ -429,7 +427,7 @@ fn grouped_projection_fixture(
     let w = b.constant("w", TensorType::new(vec![groups * n, k], DType::BF16));
     let blocks = b.reshape(w, vec![groups, n, k]);
     let out = b.matmul(x, b.transpose(blocks, vec![0, 2, 1]));
-    let graph = b.finish(out);
+    let graph = b.finish(out).unwrap();
     let key = graph.meta(x.id()).slot_key().unwrap().clone();
     let steps = (0..2u64)
         .map(|step| {
@@ -573,12 +571,8 @@ pub fn fixture_weights(fixture: &Fixture) -> Arc<poot_quant::weights::WeightMap>
 
 /// Compile `fixture.graph` for `target` under `submission`, single-stage, single-device (Card
 /// 546a's only shape).
-pub fn staged(
-    fixture: &Fixture,
-    target: Target,
-    submission: Submission,
-) -> StagedProgram<poot_graph_ir::ValidationOutputs> {
-    let g = bound(fixture).0.with_validations(Vec::new());
+pub fn staged(fixture: &Fixture, target: Target, submission: Submission) -> StagedProgram {
+    let g = bound(fixture).0;
     compile_staged(
         &g,
         &TargetSet::single(DeviceId(0), target),
@@ -671,7 +665,7 @@ pub fn run_once(
     }
     let store = builder.build();
     let mut weights = ConstWeights::new(&store);
-    let g = weights.graph(g).with_validations(Vec::new());
+    let g = weights.graph(g);
     let exe = exec
         .load_weights(Arc::new(store.clone()), Arc::new(weights.map()))
         .map_err(|e| format!("run_once: load_weights: {e}"))?;

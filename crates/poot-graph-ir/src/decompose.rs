@@ -197,7 +197,7 @@ pub fn decompose(op: &OpKind, operands: &[TensorType]) -> Option<Decomposition> 
     }
     Some(Decomposition {
         operands: inputs.iter().map(|input| input.id()).collect(),
-        graph: b.finish(result),
+        graph: b.finish(result).unwrap(),
     })
 }
 
@@ -772,7 +772,7 @@ mod tests {
             );
             if let Some(decomposition) = decomposition {
                 let graph = &decomposition.graph;
-                assert_eq!(graph.aval(graph.output), &declared, "{}", op.name());
+                assert_eq!(graph.aval(graph.result()), &declared, "{}", op.name());
                 assert_eq!(
                     decomposition.operands.len(),
                     operands.len(),
@@ -784,7 +784,7 @@ mod tests {
                 }
                 assert!(
                     graph
-                        .eqns
+                        .eqns()
                         .iter()
                         .all(|eqn| eqn.op.class() == OpClass::Primitive),
                     "{}: a decomposition is primitive equations",

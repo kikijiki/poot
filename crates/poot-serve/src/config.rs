@@ -104,13 +104,24 @@ pub(crate) struct ServeConfig {
         long,
         value_name = "NGRAM:K",
         value_parser = parse_draft_lookup,
-        conflicts_with = "draft_model"
+        conflicts_with_all = ["draft_model", "draft_mtp"]
     )]
     pub(crate) draft_lookup: Option<PromptLookup>,
     /// Speculate with a second model that proposes K tokens a round, written `PATH:K` (split at the last
     /// colon, so the path may contain colons). Its vocabulary must agree with the served model's.
-    #[arg(long, value_name = "PATH:K", value_parser = parse_draft_model)]
+    #[arg(
+        long,
+        value_name = "PATH:K",
+        value_parser = parse_draft_model,
+        conflicts_with = "draft_mtp"
+    )]
     pub(crate) draft_model: Option<DraftModel>,
+    /// Speculate with the served model's own multi-token-prediction layer, K tokens a round. There is
+    /// no default K (1 is the usual start; 2 to 3 are worth measuring); a model with no such layer, or
+    /// one whose layer carries recurrent state, is refused at startup. Exclusive with `--draft-lookup`
+    /// and `--draft-model`, and with adapters, beam search and a device group.
+    #[arg(long, value_name = "K", value_parser = parse_draft_mtp)]
+    pub(crate) draft_mtp: Option<NonZeroUsize>,
     /// `--expert-pool ROWS` pages every routed expert table through a pool of ROWS resident rows per
     /// layer, instead of holding every expert on the device. At least the experts one token selects
     /// and below the model's expert count; a model with no routed experts is refused at startup.
@@ -353,6 +364,10 @@ fn positive(text: &str, what: &str) -> Result<NonZeroUsize, String> {
 
 fn parse_expert_pool(raw: &str) -> Result<NonZeroUsize, String> {
     positive(raw, "the pool row count")
+}
+
+fn parse_draft_mtp(raw: &str) -> Result<NonZeroUsize, String> {
+    positive(raw, "the draft length")
 }
 
 fn parse_draft_lookup(spec: &str) -> Result<PromptLookup, String> {

@@ -287,14 +287,6 @@ pub struct Export {
     pub value: ValueId,
 }
 
-/// One named validation root. The value remains an ordinary F32 graph value.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ValidationOutput {
-    pub id: ValidationId,
-    pub name: String,
-    pub value: ValueId,
-}
-
 pub const MAX_VALIDATION_PACKET_BYTES: usize = 4096;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -751,230 +743,193 @@ pub struct Eqn {
     pub layer: Option<LayerIndex>,
 }
 
-mod sealed {
-    use super::ValidationOutput;
-
-    /// Proof that a call comes from inside this crate. The type cannot be named or built elsewhere, so a generic
-    /// caller that sees [`Sealed::outputs_mut`] through a [`super::ValidationChannel`] bound cannot call it.
-    pub struct Internal;
-
-    pub trait Sealed {
-        /// Mutable declarations for canonical result remapping. The declaration order cannot change.
-        fn outputs_mut(&mut self, _: Internal) -> &mut [ValidationOutput];
-
-        /// Drop declarations the predicate rejects, keeping the survivors' order. In-crate transforms
-        /// that split a graph use it to keep each piece's witnesses with the piece that defines them.
-        /// Like [`Sealed::outputs_mut`], the token keeps it out of generic callers' reach, so a caller
-        /// outside this crate still cannot empty a validation-bearing channel.
-        fn retain_outputs(&mut self, _: Internal, keep: &mut dyn FnMut(&ValidationOutput) -> bool);
-    }
-}
-
-/// The validation result channel of a [`Graph`].
+/// What one entry of a graph's output list publishes.
 ///
-/// The trait is sealed: [`NoValidations`] and [`ValidationOutputs`] are its only implementations. A graph's
-/// channel is part of its type, so an executor typed on [`Graph`] (`Graph<NoValidations>`) cannot receive a
-/// validation-bearing graph; there is no conversion from `Graph<ValidationOutputs>` to `Graph`.
-///
-/// Declarations are read-only outside this crate:
-///
-/// ```
-/// use poot_graph_ir::{ValidationChannel, ValidationOutput};
-///
-/// fn declarations<V: ValidationChannel>(channel: &V) -> &[ValidationOutput] {
-///     channel.outputs()
-/// }
-/// ```
-///
-/// Only [`Graph::remap_results`] retargets them, so a generic caller cannot:
-///
-/// ```compile_fail,E0061
-/// use poot_graph_ir::ValidationChannel;
-///
-/// fn retarget<V: ValidationChannel>(channel: &mut V) {
-///     channel.outputs_mut()[0].value = 0;
-/// }
-/// ```
-///
-/// and neither can a caller holding a concrete validation-bearing graph:
-///
-/// ```compile_fail,E0599
-/// use poot_graph_ir::{Graph, ValidationChannel};
-///
-/// let mut graph = Graph::default().with_validations(Vec::new());
-/// let _declarations = graph.validations.outputs_mut();
-/// ```
-pub trait ValidationChannel: sealed::Sealed + Clone + fmt::Debug {
-    /// Validation declarations in declaration order.
-    fn outputs(&self) -> &[ValidationOutput];
-}
-
-/// The channel of an ordinary graph: no validation outputs can be represented.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct NoValidations;
-
-impl sealed::Sealed for NoValidations {
-    fn outputs_mut(&mut self, _: sealed::Internal) -> &mut [ValidationOutput] {
-        &mut []
-    }
-
-    fn retain_outputs(
-        &mut self,
-        _: sealed::Internal,
-        _: &mut dyn FnMut(&ValidationOutput) -> bool,
-    ) {
-    }
-}
-
-impl ValidationChannel for NoValidations {
-    fn outputs(&self) -> &[ValidationOutput] {
-        &[]
-    }
-}
-
-/// The channel of a validation-bearing graph: ordered, bounded F32 witnesses checked before result or state
-/// publication.
-///
-/// The list is private and has no `Default`, so code outside this module cannot empty a validation-bearing
-/// graph's declarations. It is created only by
-/// [`Graph::with_validations`] and the validating builder finish methods. Only [`Graph::remap_results`] edits a
-/// declaration in place, and it cannot add, remove, or reorder one.
-///
-/// Neither the list nor an empty replacement is reachable:
-///
-/// ```compile_fail,E0616
-/// # use poot_graph_ir::Graph;
-/// let mut graph = Graph::default().with_validations(Vec::new());
-/// graph.validations.0.clear();
-/// ```
-///
-/// ```compile_fail,E0277
-/// # use poot_graph_ir::Graph;
-/// let mut graph = Graph::default().with_validations(Vec::new());
-/// let _declarations = std::mem::take(&mut graph.validations);
-/// ```
+/// A graph has one output list, private to [`Graph`], and every observable or carried value is an
+/// entry of it: the primary result, the validation witnesses, the values handed to other stages, and
+/// the next value of each carried-state buffer. There is no second encoding to keep in step.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ValidationOutputs(Vec<ValidationOutput>);
-
-impl sealed::Sealed for ValidationOutputs {
-    fn outputs_mut(&mut self, _: sealed::Internal) -> &mut [ValidationOutput] {
-        &mut self.0
-    }
-
-    fn retain_outputs(
-        &mut self,
-        _: sealed::Internal,
-        keep: &mut dyn FnMut(&ValidationOutput) -> bool,
-    ) {
-        self.0.retain(keep);
-    }
+pub enum OutputKind {
+    /// The primary output (the next-token logits). Exactly one per graph.
+    Result,
+    /// A bounded F32 validation witness, checked before the result or state is published. The value
+    /// remains an ordinary F32 graph value.
+    Witness { id: ValidationId, name: String },
+    /// A value handed to another stage of a split program, named by `BoundaryId`.
+    Export(BoundaryId),
+    /// The value a [`Storage::State`] input is overwritten with at the end of the step (the jax
+    /// `donate_argnums` / XLA `input_output_aliases` contract).
+    StateNext { input: ValueId },
 }
 
-impl ValidationChannel for ValidationOutputs {
-    fn outputs(&self) -> &[ValidationOutput] {
-        &self.0
-    }
+/// One entry of a graph's output list: what it publishes, and the value it publishes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphOutput {
+    pub kind: OutputKind,
+    pub value: ValueId,
+}
+
+/// One validation witness, borrowed from the output list it is declared in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Witness<'g> {
+    pub id: ValidationId,
+    pub name: &'g str,
+    pub value: ValueId,
+}
+
+/// Why an edit was refused. The graph the edit was opened from is untouched; no refused draft
+/// becomes a [`Graph`].
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum EditError {
+    /// The draft is not a well-formed graph: a dangling operand, an operand or output type that
+    /// disagrees with its operation's inference, a malformed binding or state table, ...
+    #[error("the edit leaves an invalid graph: {0}")]
+    Invalid(#[from] GraphValidationError),
+    /// The edit changed the type of the primary result: a rewrite preserves what the graph computes.
+    #[error("the edit changes the result type from {before} to {after}")]
+    ResultRetyped {
+        before: TensorType,
+        after: TensorType,
+    },
+    /// The edit lost a validation witness: a graph that publishes fewer checks than the one it
+    /// replaces would run unverified.
+    #[error("the edit drops validation witness {id:?} ({name:?})")]
+    WitnessDropped { id: ValidationId, name: String },
+    /// The edit declares a witness the graph it was opened from does not carry.
+    #[error("the edit adds validation witness {id:?} ({name:?})")]
+    WitnessAdded { id: ValidationId, name: String },
+    /// The edit lost an export: a later stage would wait for a value no stage produces.
+    #[error("the edit drops export {id:?}")]
+    ExportDropped { id: BoundaryId },
+    /// The edit lost a carried-state pair: the buffer would stop being carried across steps.
+    #[error("the edit drops the carried-state pair of input {input}")]
+    StateDropped { input: ValueId },
+    /// A piece of a split claims a witness the split graph does not carry.
+    #[error("witness {id:?} is not a witness of the split graph")]
+    WitnessNotClaimable { id: ValidationId },
+}
+
+/// The interface of the graph an edit was opened from: what a rewrite must preserve.
+#[derive(Clone, Debug)]
+struct Interface {
+    result: TensorType,
+    witnesses: Vec<(ValidationId, String)>,
+    exports: Vec<BoundaryId>,
+    state_inputs: Vec<ValueId>,
 }
 
 /// A flat SSA primitive tensor-op graph.
 ///
-/// `V` is the validation channel. `Graph` alone means `Graph<NoValidations>`, the type every device and
-/// specialized executor accepts. A validation-bearing `Graph<ValidationOutputs>` does not coerce to it:
+/// A `Graph` is always well formed: its tables are private, so the only ways to obtain one are
+/// [`Builder::finish`](crate::Builder::finish) and [`GraphEdit::commit`], and both check the whole
+/// graph first (SSA order, operand and output types, binding and state tables, one result, bounded
+/// F32 witnesses). A pass or executor that holds a `Graph` need not re-validate it, and cannot
+/// change it in place: it edits through [`Graph::edit`], and the result is checked again.
 ///
-/// ```compile_fail,E0308
+/// ```compile_fail,E0616
 /// use poot_graph_ir::{Builder, Graph, TensorType};
 ///
-/// fn unsupported_executor(_: &Graph) {}
-///
 /// let b = Builder::new();
-/// let output = b.constant("output", TensorType::f32([1]));
-/// let graph = b.finish_with_state(output, &[]).with_validations(vec![]);
-/// unsupported_executor(&graph);
+/// let out = b.constant("out", TensorType::f32([1]));
+/// let graph: Graph = b.finish(out).unwrap();
+/// let _ = graph.outputs;
 /// ```
 ///
-/// and has no implicit conversion:
-///
-/// ```compile_fail,E0277
+/// ```compile_fail,E0616
 /// use poot_graph_ir::{Builder, Graph, TensorType};
 ///
 /// let b = Builder::new();
-/// let output = b.constant("output", TensorType::f32([1]));
-/// let graph = b.finish_with_state(output, &[]).with_validations(vec![]);
-/// let _ordinary: Graph = graph.into();
+/// let out = b.constant("out", TensorType::f32([1]));
+/// let mut graph: Graph = b.finish(out).unwrap();
+/// graph.eqns.clear();
+/// ```
+///
+/// ```compile_fail,E0599
+/// use poot_graph_ir::Graph;
+///
+/// let _ = Graph::default();
 /// ```
 #[derive(Clone, Debug)]
-pub struct Graph<V: ValidationChannel = NoValidations> {
-    pub values: ValueTable<ValueMeta>,
+pub struct Graph {
+    values: ValueTable<ValueMeta>,
     /// All input binders (consts + slots), in declaration order.
-    pub inputs: Vec<ValueId>,
+    inputs: Vec<ValueId>,
     /// The subset of `inputs` that are constants (weights/tables), for binding at close.
-    pub consts: Vec<ValueId>,
+    consts: Vec<ValueId>,
     /// The per-token-varying inputs and their slot kind.
-    pub slots: Vec<(ValueId, Slot)>,
-    pub eqns: Vec<Eqn>,
-    /// The primary output (the next-token logits).
-    pub output: ValueId,
-    /// The validation channel: none for `Graph`, ordered bounded F32 witnesses for
-    /// `Graph<ValidationOutputs>`.
-    pub validations: V,
-    /// Values handed to other stages, each a liveness root that [`Graph::remap_results`] rewrites.
-    /// Empty for a graph that is not one stage of a split program.
-    pub exports: Vec<Export>,
-    /// Input-output alias pairs `(state_in, state_out)` carried across decode steps: `state_in` is a
-    /// `Storage::State` input binder and `state_out` a produced (or pass-through) value of identical type. The
-    /// executor feeds each cache buffer in as `state_in` and overwrites it with `state_out` (the jax
-    /// `donate_argnums` / XLA `input_output_aliases` contract). Empty for stateless graphs.
-    pub state: Vec<(ValueId, ValueId)>,
-}
-
-impl Default for Graph {
-    fn default() -> Self {
-        Graph {
-            values: ValueTable::new(),
-            inputs: Vec::new(),
-            consts: Vec::new(),
-            slots: Vec::new(),
-            eqns: Vec::new(),
-            output: ValueId::new(0),
-            validations: NoValidations,
-            exports: Vec::new(),
-            state: Vec::new(),
-        }
-    }
+    slots: Vec<(ValueId, Slot)>,
+    eqns: Vec<Eqn>,
+    /// Every published value: one [`OutputKind::Result`], then witnesses, exports and carried-state
+    /// next values, each in declaration order within its kind.
+    outputs: Vec<GraphOutput>,
 }
 
 impl Graph {
-    /// Attach validation declarations. The result is not validated; call [`Graph::validate`].
-    pub fn with_validations(self, validations: Vec<ValidationOutput>) -> Graph<ValidationOutputs> {
-        let Graph {
-            values,
-            inputs,
-            consts,
-            slots,
-            eqns,
-            output,
-            validations: NoValidations,
-            exports,
-            state,
-        } = self;
-        Graph {
-            values,
-            inputs,
-            consts,
-            slots,
-            eqns,
-            output,
-            validations: ValidationOutputs(validations),
-            exports,
-            state,
-        }
+    pub fn values(&self) -> &ValueTable<ValueMeta> {
+        &self.values
     }
-}
 
-impl<V: ValidationChannel> Graph<V> {
-    /// Validation declarations in declaration order; always empty for `Graph`.
-    pub fn validation_outputs(&self) -> &[ValidationOutput] {
-        self.validations.outputs()
+    /// All input binders (consts + slots), in declaration order.
+    pub fn inputs(&self) -> &[ValueId] {
+        &self.inputs
+    }
+
+    /// The subset of [`Graph::inputs`] that are constants (weights/tables), for binding at close.
+    pub fn consts(&self) -> &[ValueId] {
+        &self.consts
+    }
+
+    /// The per-token-varying inputs and their slot kind.
+    pub fn slots(&self) -> &[(ValueId, Slot)] {
+        &self.slots
+    }
+
+    pub fn eqns(&self) -> &[Eqn] {
+        &self.eqns
+    }
+
+    /// The primary result (the next-token logits).
+    pub fn result(&self) -> ValueId {
+        self.outputs
+            .iter()
+            .find(|output| output.kind == OutputKind::Result)
+            .map(|output| output.value)
+            .expect("a Graph always has one Result output: `check` refuses a draft without one")
+    }
+
+    /// Validation witnesses in declaration order.
+    pub fn witnesses(&self) -> impl Iterator<Item = Witness<'_>> + '_ {
+        self.outputs.iter().filter_map(|output| match &output.kind {
+            OutputKind::Witness { id, name } => Some(Witness {
+                id: *id,
+                name,
+                value: output.value,
+            }),
+            _ => None,
+        })
+    }
+
+    /// Values handed to other stages, each a liveness root that [`GraphEdit::remap_results`]
+    /// rewrites. Empty for a graph that is not one stage of a split program.
+    pub fn exports(&self) -> impl Iterator<Item = Export> + '_ {
+        self.outputs.iter().filter_map(|output| match &output.kind {
+            OutputKind::Export(id) => Some(Export {
+                id: *id,
+                value: output.value,
+            }),
+            _ => None,
+        })
+    }
+
+    /// The carried-state pairs `(state_in, state_out)` in declaration order: `state_in` is a
+    /// `Storage::State` input binder and `state_out` a produced (or pass-through) value of
+    /// identical type. The executor feeds each cache buffer in as `state_in` and overwrites it with
+    /// `state_out`. Empty for stateless graphs.
+    pub fn state(&self) -> impl Iterator<Item = (ValueId, ValueId)> + '_ {
+        self.outputs.iter().filter_map(|output| match output.kind {
+            OutputKind::StateNext { input } => Some((input, output.value)),
+            _ => None,
+        })
     }
 
     /// The one tag query: where each decoder layer's equations sit. The tagged region (first to
@@ -1051,16 +1006,266 @@ impl<V: ValidationChannel> Graph<V> {
     }
 
     /// [`Graph::state`]'s pairs, each with its input's declared [`StateRole`] read from
-    /// [`ValueMeta::state_role`]. A validated graph gives every pair a role (`Graph::validate`
-    /// rejects a `Storage::State` input with none); an unvalidated or hand-built graph's missing
-    /// role reads as [`StateRole::Recurrent`], the safe default every state pair traced before
-    /// `components::attention` carries.
+    /// [`ValueMeta::state_role`]. A graph gives every pair a role (the edit check rejects a
+    /// `Storage::State` input with none).
     pub fn state_pairs(&self) -> impl Iterator<Item = StatePair> + '_ {
-        self.state.iter().map(move |&(input, output)| StatePair {
+        self.state().map(move |(input, output)| StatePair {
             input,
             output,
             role: self.state_role(input).unwrap_or(StateRole::Recurrent),
         })
+    }
+
+    /// The values a caller can observe: the result, the witnesses and the exports.
+    pub fn observable_values(&self) -> impl Iterator<Item = ValueId> + '_ {
+        std::iter::once(self.result())
+            .chain(self.witnesses().map(|witness| witness.value))
+            .chain(self.exports().map(|export| export.value))
+    }
+
+    pub fn liveness_roots(&self) -> impl Iterator<Item = ValueId> + '_ {
+        self.observable_values()
+            .chain(self.state().map(|(_, output)| output))
+    }
+
+    pub fn pinned_values(&self) -> impl Iterator<Item = ValueId> + '_ {
+        self.liveness_roots()
+            .chain(self.state().map(|(input, _)| input))
+    }
+
+    /// Open this graph for editing. The returned draft is a copy: nothing changes until
+    /// [`GraphEdit::commit`] checks it and returns the new graph.
+    pub fn edit(&self) -> GraphEdit {
+        self.clone().into_edit()
+    }
+
+    /// Open this graph for editing, consuming it. See [`Graph::edit`].
+    pub fn into_edit(self) -> GraphEdit {
+        let interface = Interface {
+            result: self.aval(self.result()).clone(),
+            witnesses: self
+                .witnesses()
+                .map(|witness| (witness.id, witness.name.to_owned()))
+                .collect(),
+            exports: self.exports().map(|export| export.id).collect(),
+            state_inputs: self.state().map(|(input, _)| input).collect(),
+        };
+        GraphEdit {
+            draft: self,
+            interface: Some(interface),
+        }
+    }
+
+    /// Open this graph as the start of a new program: the draft has every table of this graph and no
+    /// baseline, so it may publish a different result (a sampler suffix over the logits) and is
+    /// checked for well-formedness only. A rewrite that must preserve what the graph computes uses
+    /// [`Graph::edit`].
+    pub(crate) fn into_draft(self) -> GraphEdit {
+        GraphEdit {
+            draft: self,
+            interface: None,
+        }
+    }
+}
+
+/// A draft of a graph under edit: the one way to change a [`Graph`].
+///
+/// A draft reads like the graph it holds (it derefs to [`Graph`]) and is changed through the typed
+/// operations below. It is never executed or planned: [`GraphEdit::commit`] checks the whole draft
+/// and either returns the new [`Graph`] or a typed [`EditError`] naming what is wrong.
+///
+/// A draft opened from a graph ([`Graph::edit`]) is a rewrite: it must preserve that graph's
+/// interface. The result keeps its type, every witness and export stays declared, and every carried
+/// state pair stays carried; losing a witness is [`EditError::WitnessDropped`]. A new draft
+/// ([`GraphEdit::new`], and the one a [`Builder`](crate::Builder) fills) has no such baseline. A
+/// graph split into pieces accounts its witnesses through a [`WitnessLedger`] instead.
+///
+/// ```compile_fail,E0616
+/// use poot_graph_ir::{Builder, TensorType};
+///
+/// let b = Builder::new();
+/// let out = b.constant("out", TensorType::f32([1]));
+/// let graph = b.finish(out).unwrap();
+/// let edit = graph.edit();
+/// let _ = edit.draft;
+/// ```
+#[derive(Clone, Debug)]
+pub struct GraphEdit {
+    draft: Graph,
+    interface: Option<Interface>,
+}
+
+impl std::ops::Deref for GraphEdit {
+    type Target = Graph;
+
+    fn deref(&self) -> &Graph {
+        &self.draft
+    }
+}
+
+impl Default for GraphEdit {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GraphEdit {
+    /// An empty draft with no baseline: no values, no equations and no result yet.
+    pub fn new() -> Self {
+        GraphEdit {
+            draft: Graph {
+                values: ValueTable::new(),
+                inputs: Vec::new(),
+                consts: Vec::new(),
+                slots: Vec::new(),
+                eqns: Vec::new(),
+                outputs: Vec::new(),
+            },
+            interface: None,
+        }
+    }
+
+    /// The draft's value table, to push new values or retype existing ones.
+    pub fn values_mut(&mut self) -> &mut ValueTable<ValueMeta> {
+        &mut self.draft.values
+    }
+
+    /// The draft's equation list, in SSA order.
+    pub fn eqns_mut(&mut self) -> &mut Vec<Eqn> {
+        &mut self.draft.eqns
+    }
+
+    pub fn inputs_mut(&mut self) -> &mut Vec<ValueId> {
+        &mut self.draft.inputs
+    }
+
+    pub fn consts_mut(&mut self) -> &mut Vec<ValueId> {
+        &mut self.draft.consts
+    }
+
+    pub fn slots_mut(&mut self) -> &mut Vec<(ValueId, Slot)> {
+        &mut self.draft.slots
+    }
+
+    /// Declare the primary result, replacing the previous one.
+    pub fn set_result(&mut self, value: ValueId) {
+        match self
+            .draft
+            .outputs
+            .iter_mut()
+            .find(|output| output.kind == OutputKind::Result)
+        {
+            Some(output) => output.value = value,
+            None => self.draft.outputs.insert(
+                0,
+                GraphOutput {
+                    kind: OutputKind::Result,
+                    value,
+                },
+            ),
+        }
+    }
+
+    /// Declare a validation witness after the ones already declared.
+    pub fn push_witness(&mut self, id: ValidationId, name: impl Into<String>, value: ValueId) {
+        let at = self
+            .draft
+            .outputs
+            .iter()
+            .rposition(|output| {
+                matches!(output.kind, OutputKind::Result | OutputKind::Witness { .. })
+            })
+            .map_or(0, |last| last + 1);
+        self.draft.outputs.insert(
+            at,
+            GraphOutput {
+                kind: OutputKind::Witness {
+                    id,
+                    name: name.into(),
+                },
+                value,
+            },
+        );
+    }
+
+    /// Declare an export after the ones already declared.
+    pub fn push_export(&mut self, export: Export) {
+        let at = self
+            .draft
+            .outputs
+            .iter()
+            .rposition(|output| !matches!(output.kind, OutputKind::StateNext { .. }))
+            .map_or(0, |last| last + 1);
+        self.draft.outputs.insert(
+            at,
+            GraphOutput {
+                kind: OutputKind::Export(export.id),
+                value: export.value,
+            },
+        );
+    }
+
+    /// Declare a carried-state pair after the ones already declared.
+    pub fn push_state(&mut self, input: ValueId, output: ValueId) {
+        self.draft.outputs.push(GraphOutput {
+            kind: OutputKind::StateNext { input },
+            value: output,
+        });
+    }
+
+    /// Retarget the next value of the state pair of `input`. Returns whether `input` is carried.
+    pub fn set_state_next(&mut self, input: ValueId, value: ValueId) -> bool {
+        match self
+            .draft
+            .outputs
+            .iter_mut()
+            .find(|output| output.kind == (OutputKind::StateNext { input }))
+        {
+            Some(output) => {
+                output.value = value;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Retarget every output value (result, witnesses, exports and state next values) through
+    /// `remap`. The declarations themselves keep their identity and order.
+    pub fn remap_results(&mut self, mut remap: impl FnMut(ValueId) -> ValueId) {
+        for output in &mut self.draft.outputs {
+            output.value = remap(output.value);
+        }
+    }
+
+    /// Drop the witnesses the predicate rejects, keeping the survivors in declaration order. A
+    /// rewrite that drops a witness is refused at [`GraphEdit::commit`]; a split accounts the
+    /// dropped ones through a [`WitnessLedger`].
+    pub fn retain_witnesses(&mut self, mut keep: impl FnMut(Witness<'_>) -> bool) {
+        self.draft.outputs.retain(|output| match &output.kind {
+            OutputKind::Witness { id, name } => keep(Witness {
+                id: *id,
+                name,
+                value: output.value,
+            }),
+            _ => true,
+        });
+    }
+
+    /// Remove the carried-state pairs the predicate rejects (`(input, output)`), keeping the
+    /// survivors in declaration order. A rewrite that drops a pair is refused at
+    /// [`GraphEdit::commit`].
+    pub fn retain_state(&mut self, mut keep: impl FnMut(ValueId, ValueId) -> bool) {
+        self.draft.outputs.retain(|output| match output.kind {
+            OutputKind::StateNext { input } => keep(input, output.value),
+            _ => true,
+        });
+    }
+
+    /// Remove every export. A rewrite that drops one is refused at [`GraphEdit::commit`].
+    pub fn clear_exports(&mut self) {
+        self.draft
+            .outputs
+            .retain(|output| !matches!(output.kind, OutputKind::Export(_)));
     }
 
     /// Turn the named `Const` input `value` into the resident [`Slot::ExpertPool`] of a pool of `rows`
@@ -1072,7 +1277,7 @@ impl<V: ValidationChannel> Graph<V> {
     ///
     /// When `value` is not a named `Const` input with a leading axis.
     pub fn rebind_const_as_pool(&mut self, value: ValueId, rows: usize) -> SlotKey {
-        let meta = &mut self.values[value];
+        let meta = &mut self.draft.values[value];
         assert_eq!(
             meta.storage,
             Storage::Const,
@@ -1092,8 +1297,8 @@ impl<V: ValidationChannel> Graph<V> {
         meta.storage = Storage::Slot(Slot::ExpertPool);
         meta.name = Some(key.to_string());
         meta.key = Some(key.clone());
-        self.consts.retain(|&c| c != value);
-        self.slots.push((value, Slot::ExpertPool));
+        self.draft.consts.retain(|&c| c != value);
+        self.draft.slots.push((value, Slot::ExpertPool));
         key
     }
 
@@ -1109,12 +1314,13 @@ impl<V: ValidationChannel> Graph<V> {
         let name = key.to_string();
         assert!(
             !self
+                .draft
                 .values
                 .iter()
                 .any(|v| v.storage == Storage::Slot(slot) && v.name.as_deref() == Some(&name)),
             "declare_slot: duplicate tag {tag:?} for slot {slot:?}"
         );
-        let id = self.values.push(ValueMeta {
+        let id = self.draft.values.push(ValueMeta {
             aval,
             storage: Storage::Slot(slot),
             name: Some(name),
@@ -1122,61 +1328,148 @@ impl<V: ValidationChannel> Graph<V> {
             state_role: None,
             range: None,
         });
-        self.inputs.push(id);
-        self.slots.push((id, slot));
+        self.draft.inputs.push(id);
+        self.draft.slots.push((id, slot));
         id
     }
 
-    pub fn observable_values(&self) -> impl Iterator<Item = ValueId> + '_ {
-        std::iter::once(self.output)
-            .chain(self.validation_outputs().iter().map(|output| output.value))
-            .chain(self.exports.iter().map(|export| export.value))
-    }
-
-    pub fn liveness_roots(&self) -> impl Iterator<Item = ValueId> + '_ {
-        self.observable_values()
-            .chain(self.state.iter().map(|&(_, output)| output))
-    }
-
-    pub fn pinned_values(&self) -> impl Iterator<Item = ValueId> + '_ {
-        self.liveness_roots()
-            .chain(self.state.iter().map(|&(input, _)| input))
-    }
-
-    pub fn remap_results(&mut self, mut remap: impl FnMut(ValueId) -> ValueId) {
-        self.output = remap(self.output);
-        for validation in sealed::Sealed::outputs_mut(&mut self.validations, sealed::Internal) {
-            validation.value = remap(validation.value);
-        }
-        for export in &mut self.exports {
-            export.value = remap(export.value);
-        }
-        for (_, output) in &mut self.state {
-            *output = remap(*output);
-        }
-    }
-
-    /// Drop the declarations the predicate rejects, keeping the survivors in declaration order.
+    /// Check the whole draft and return it as a [`Graph`].
     ///
-    /// A split graph keeps exactly the witnesses it still defines (`poot-graph-plan`'s `split_stages`,
-    /// card 626, is the one caller outside this crate). The real seal is `sealed::Internal`: it
-    /// cannot be named or built outside this crate, so no fully generic
-    /// `ValidationChannel`-bound caller can reach `Sealed::retain_outputs` directly and shed a
-    /// channel's declarations - only this concrete, crate-owned method can.
-    pub fn retain_validations(&mut self, mut keep: impl FnMut(&ValidationOutput) -> bool) {
-        sealed::Sealed::retain_outputs(&mut self.validations, sealed::Internal, &mut keep);
+    /// # Errors
+    ///
+    /// [`EditError::Invalid`] when the draft is not well formed; for a rewrite, the typed
+    /// conservation error ([`EditError::WitnessDropped`], [`EditError::ResultRetyped`], ...) when it
+    /// loses part of the interface of the graph it was opened from.
+    pub fn commit(self) -> Result<Graph, EditError> {
+        self.draft.check()?;
+        if let Some(interface) = &self.interface {
+            self.draft.conserves(interface)?;
+        }
+        Ok(self.draft)
     }
 
-    /// Validate basic SSA and binding-table well-formedness. Cheap structural check.
-    pub fn validate(&self) -> Result<(), GraphValidationError> {
-        let n = self.values.len();
-        if !self.values.contains(self.output) {
-            return Err(GraphValidationError::OutputNotDefined { value: self.output });
+    /// [`GraphEdit::commit`] for one piece of a split: the piece may carry fewer witnesses than the
+    /// graph the split started from, and must claim each one it carries from `ledger`. The piece
+    /// still has to be well formed.
+    pub fn commit_piece(self, ledger: &mut WitnessLedger) -> Result<Graph, EditError> {
+        self.draft.check()?;
+        ledger.claim(&self.draft)?;
+        Ok(self.draft)
+    }
+}
+
+impl Graph {
+    /// Whether `self`, a rewrite of the graph `interface` describes, still publishes all of it.
+    fn conserves(&self, interface: &Interface) -> Result<(), EditError> {
+        let after = self.aval(self.result());
+        if *after != interface.result {
+            return Err(EditError::ResultRetyped {
+                before: interface.result.clone(),
+                after: after.clone(),
+            });
         }
-        let validations = self.validation_outputs();
+        for (id, name) in &interface.witnesses {
+            if !self.witnesses().any(|witness| witness.id == *id) {
+                return Err(EditError::WitnessDropped {
+                    id: *id,
+                    name: name.clone(),
+                });
+            }
+        }
+        for witness in self.witnesses() {
+            if !interface.witnesses.iter().any(|(id, _)| *id == witness.id) {
+                return Err(EditError::WitnessAdded {
+                    id: witness.id,
+                    name: witness.name.to_owned(),
+                });
+            }
+        }
+        for id in &interface.exports {
+            if !self.exports().any(|export| export.id == *id) {
+                return Err(EditError::ExportDropped { id: *id });
+            }
+        }
+        for input in &interface.state_inputs {
+            if !self.state().any(|(state_input, _)| state_input == *input) {
+                return Err(EditError::StateDropped { input: *input });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The accounting of a graph's witnesses across the pieces it is split into.
+///
+/// A split gives each piece only the witnesses it defines, so no piece conserves the whole set and
+/// [`GraphEdit::commit`] cannot be the check. The ledger is: every piece [claims](Self::claim) what
+/// it carries, and [`WitnessLedger::finish`] fails closed when some witness of the split graph was
+/// claimed by no piece, so a split cannot silently shed a check.
+#[derive(Debug)]
+pub struct WitnessLedger {
+    /// The witnesses no piece has claimed yet.
+    pending: Vec<(ValidationId, String)>,
+    /// Every witness the split graph carried.
+    known: Vec<ValidationId>,
+}
+
+impl WitnessLedger {
+    /// A ledger holding every witness of `graph`, none claimed yet.
+    pub fn of(graph: &Graph) -> Self {
+        WitnessLedger {
+            pending: graph
+                .witnesses()
+                .map(|witness| (witness.id, witness.name.to_owned()))
+                .collect(),
+            known: graph.witnesses().map(|witness| witness.id).collect(),
+        }
+    }
+
+    /// Record that `piece` carries its witnesses. A witness may be carried by several pieces (a
+    /// check whose value a later stage reads runs in each), but never one the split graph lacks.
+    fn claim(&mut self, piece: &Graph) -> Result<(), EditError> {
+        for witness in piece.witnesses() {
+            if !self.known.contains(&witness.id) {
+                return Err(EditError::WitnessNotClaimable { id: witness.id });
+            }
+            self.pending.retain(|(id, _)| *id != witness.id);
+        }
+        Ok(())
+    }
+
+    /// Succeed when every witness the ledger was opened with was claimed by some piece.
+    pub fn finish(self) -> Result<(), EditError> {
+        match self.pending.into_iter().next() {
+            Some((id, name)) => Err(EditError::WitnessDropped { id, name }),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Graph {
+    /// Check basic SSA and binding-table well-formedness. Cheap structural check.
+    fn check(&self) -> Result<(), GraphValidationError> {
+        let result = self
+            .outputs
+            .iter()
+            .filter(|o| o.kind == OutputKind::Result)
+            .count();
+        if result == 0 {
+            return Err(GraphValidationError::MissingResult);
+        }
+        if result > 1 {
+            return Err(GraphValidationError::MultipleResults);
+        }
+        let output = self.result();
+        let n = self.values.len();
+        if !self.values.contains(output) {
+            return Err(GraphValidationError::OutputNotDefined { value: output });
+        }
+        let validations: Vec<Witness<'_>> = self.witnesses().collect();
+        let exports: Vec<Export> = self.exports().collect();
+        let state: Vec<(ValueId, ValueId)> = self.state().collect();
         let mut validation_ids = HashSet::with_capacity(validations.len());
         let mut validation_names = HashSet::with_capacity(validations.len());
-        for validation in validations {
+        for validation in &validations {
             if !self.values.contains(validation.value) {
                 return Err(GraphValidationError::ValidationValueOutOfRange {
                     value: validation.value,
@@ -1189,15 +1482,15 @@ impl<V: ValidationChannel> Graph<V> {
             if validation.name.is_empty() {
                 return Err(GraphValidationError::EmptyValidationName { id: validation.id });
             }
-            if !validation_names.insert(validation.name.as_str()) {
+            if !validation_names.insert(validation.name) {
                 return Err(GraphValidationError::DuplicateValidationName {
-                    name: validation.name.clone(),
+                    name: validation.name.to_owned(),
                 });
             }
         }
         // The packet layout checks each validation value's F32 dtype, static shape, and payload bound.
-        ValidationPacketLayout::for_outputs(&self.values, validations)?;
-        for &(state_input, state_output) in &self.state {
+        ValidationPacketLayout::for_outputs(&self.values, validations.iter().copied())?;
+        for &(state_input, state_output) in &state {
             if !self.values.contains(state_input) || !self.values.contains(state_output) {
                 return Err(GraphValidationError::StatePairOutOfRange {
                     state_input,
@@ -1206,8 +1499,8 @@ impl<V: ValidationChannel> Graph<V> {
                 });
             }
         }
-        let mut export_ids = HashSet::with_capacity(self.exports.len());
-        for export in &self.exports {
+        let mut export_ids = HashSet::with_capacity(exports.len());
+        for export in &exports {
             if !self.values.contains(export.value) {
                 return Err(GraphValidationError::ExportValueOutOfRange {
                     id: export.id,
@@ -1337,7 +1630,7 @@ impl<V: ValidationChannel> Graph<V> {
         // independent of equation production before walking equations, so malformed state declarations take
         // deterministic precedence over unrelated equation defects.
         let mut state_destinations = ValueTable::filled(n, false);
-        for &(state_input, state_output) in &self.state {
+        for &(state_input, state_output) in &state {
             if state_destinations[state_input] {
                 return Err(GraphValidationError::DuplicateStateDestination { value: state_input });
             }
@@ -1378,10 +1671,10 @@ impl<V: ValidationChannel> Graph<V> {
             }
             bound_or_produced[eqn.out] = true;
         }
-        if !bound_or_produced[self.output] {
-            return Err(GraphValidationError::OutputNotDefined { value: self.output });
+        if !bound_or_produced[output] {
+            return Err(GraphValidationError::OutputNotDefined { value: output });
         }
-        for validation in validations {
+        for validation in &validations {
             if !bound_or_produced[validation.value] {
                 return Err(GraphValidationError::ValidationOutputNotDefined {
                     id: validation.id,
@@ -1389,7 +1682,7 @@ impl<V: ValidationChannel> Graph<V> {
                 });
             }
         }
-        for export in &self.exports {
+        for export in &exports {
             if !bound_or_produced[export.value] {
                 return Err(GraphValidationError::ExportNotDefined {
                     id: export.id,
@@ -1397,7 +1690,7 @@ impl<V: ValidationChannel> Graph<V> {
                 });
             }
         }
-        for &(_, state_output) in &self.state {
+        for &(_, state_output) in &state {
             if !bound_or_produced[state_output] {
                 return Err(GraphValidationError::StateOutputNotDefined {
                     value: state_output,
@@ -1464,16 +1757,18 @@ impl<V: ValidationChannel> Graph<V> {
 }
 
 impl ValidationPacketLayout {
-    /// Checked packet layout of a graph's validation declarations. An ordinary `Graph` has the empty layout.
-    pub fn for_graph<V: ValidationChannel>(graph: &Graph<V>) -> Result<Self, GraphValidationError> {
-        Self::for_outputs(&graph.values, graph.validation_outputs())
+    /// Checked packet layout of a graph's validation declarations. A graph with no witnesses has the
+    /// empty layout.
+    pub fn for_graph(graph: &Graph) -> Self {
+        Self::for_outputs(&graph.values, graph.witnesses())
+            .expect("a Graph's witnesses were checked when it was built")
     }
 
-    fn for_outputs(
+    fn for_outputs<'g>(
         values: &ValueTable<ValueMeta>,
-        validations: &[ValidationOutput],
+        validations: impl Iterator<Item = Witness<'g>>,
     ) -> Result<Self, GraphValidationError> {
-        let mut entries = Vec::with_capacity(validations.len());
+        let mut entries = Vec::new();
         let mut lane_count = 0usize;
         for validation in validations {
             let aval = values.get(validation.value).ok_or(
@@ -1511,7 +1806,7 @@ impl ValidationPacketLayout {
                 .ok_or(GraphValidationError::ValidationPacketLaneOverflow)?;
             entries.push(ValidationPacketEntry {
                 id: validation.id,
-                name: validation.name.clone(),
+                name: validation.name.to_owned(),
                 first_lane,
                 lane_count: lanes,
             });
@@ -1580,7 +1875,7 @@ fn is_matmul_f32_accumulate_widening(
         && matches!(inferred.dtype, DType::F16 | DType::BF16)
 }
 
-impl<V: ValidationChannel> fmt::Display for Graph<V> {
+impl fmt::Display for Graph {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "graph {{")?;
         writeln!(f, "  // slots (per-token-varying inputs):")?;
@@ -1616,9 +1911,14 @@ impl<V: ValidationChannel> fmt::Display for Graph<V> {
                 None => writeln!(f, ")")?,
             }
         }
-        writeln!(f, "  output: {} : {}", self.output, self.aval(self.output))?;
-        let validations = self.validation_outputs();
-        if !validations.is_empty() {
+        writeln!(
+            f,
+            "  output: {} : {}",
+            self.result(),
+            self.aval(self.result())
+        )?;
+        let mut validations = self.witnesses().peekable();
+        if validations.peek().is_some() {
             writeln!(f, "  // validations (in declaration order):")?;
             for validation in validations {
                 writeln!(
@@ -1631,7 +1931,7 @@ impl<V: ValidationChannel> fmt::Display for Graph<V> {
                 )?;
             }
         }
-        if !self.state.is_empty() {
+        if self.state().next().is_some() {
             writeln!(f, "  // state (carried cache, in -> out):")?;
             for pair in self.state_pairs() {
                 writeln!(
@@ -1651,10 +1951,18 @@ mod tests {
     use crate::op::{BinOp, OpKind};
     use crate::types::{Scalar, TensorType};
     use crate::{
-        GraphValidationError, Operand, Slot, StateRole, Storage, ValidationId, ValidationOutput,
-        ValidationPacketError, ValidationPacketLayout, ValueId, ValueMeta,
+        EditError, GraphEdit, GraphValidationError, Operand, Slot, StateRole, Storage,
+        ValidationId, ValidationPacketError, ValidationPacketLayout, ValueId, ValueMeta,
     };
     use poot_tensor::DType;
+
+    /// The typed validity error a draft's commit refuses with.
+    fn commit_invalid(draft: GraphEdit) -> GraphValidationError {
+        match draft.commit() {
+            Err(EditError::Invalid(error)) => error,
+            other => panic!("expected an invalid draft, got {other:?}"),
+        }
+    }
 
     /// The ALiBi slopes of a power-of-two head count are `2^(-8 (i + 1) / n)`; a head count between
     /// powers takes the closest lower power's series, then every other slope of the doubled series
@@ -1711,10 +2019,12 @@ mod tests {
             StateRole::Recurrent,
         );
         let output = b.binary(BinOp::Add, first_state, second_state);
-        let graph = b.finish_with_state(
-            output,
-            &[(first_state, second_state), (second_state, first_state)],
-        );
+        let graph = b
+            .finish(
+                crate::Outputs::new(output)
+                    .with_state(&[(first_state, second_state), (second_state, first_state)]),
+            )
+            .unwrap();
         (
             graph,
             BindingFixtureIds {
@@ -1731,8 +2041,8 @@ mod tests {
         let b = Builder::new();
         let x = b.constant("x", TensorType::f32(vec![4]));
         let out = b.binary(BinOp::Mul, x, x);
-        let g = b.finish(out);
-        g.validate().expect("a well-formed graph must validate");
+        let g = b.finish(out).unwrap();
+        crate::test_support::verdict(&g).expect("a well-formed graph must validate");
     }
 
     #[test]
@@ -1751,7 +2061,7 @@ mod tests {
         )
         .unwrap();
 
-        let layout = ValidationPacketLayout::for_graph(&graph).unwrap();
+        let layout = ValidationPacketLayout::for_graph(&graph);
         assert_eq!(layout.lane_count, 3);
         assert_eq!(layout.byte_len, 12);
         assert_eq!(layout.entries[0].id, ValidationId(7));
@@ -1792,7 +2102,7 @@ mod tests {
             &[(ValidationId(7), "check", witness)],
         )
         .unwrap();
-        let layout = ValidationPacketLayout::for_graph(&graph).unwrap();
+        let layout = ValidationPacketLayout::for_graph(&graph);
 
         layout
             .validate_f32_bits(&[0.0f32.to_bits(), (-0.0f32).to_bits()])
@@ -1820,19 +2130,16 @@ mod tests {
     fn validation_declarations_and_packet_bound_are_checked() {
         let b = Builder::new();
         let primary = b.constant("primary", TensorType::f32([1]));
-        let mut graph = b.finish(primary).with_validations(vec![ValidationOutput {
-            id: ValidationId(1),
-            name: "range".into(),
-            value: ValueId::new(u32::MAX),
-        }]);
+        let mut graph = b.finish(primary).unwrap().into_draft();
+        graph.push_witness(ValidationId(1), "range", ValueId::new(u32::MAX));
         assert!(matches!(
-            graph.validate(),
-            Err(GraphValidationError::ValidationValueOutOfRange { value, .. })
+            commit_invalid(graph.clone()),
+            GraphValidationError::ValidationValueOutOfRange { value, .. }
                 if value == ValueId::new(u32::MAX)
         ));
 
-        graph.validations.0[0].value = ValueId::from_index(graph.values.len()).unwrap();
-        graph.values.push(ValueMeta {
+        let undefined = ValueId::from_index(graph.values().len()).unwrap();
+        graph.values_mut().push(ValueMeta {
             aval: TensorType::f32([1]),
             storage: Storage::Device,
             name: None,
@@ -1840,49 +2147,53 @@ mod tests {
             state_role: None,
             range: None,
         });
+        graph.remap_results(|value| {
+            if value == ValueId::new(u32::MAX) {
+                undefined
+            } else {
+                value
+            }
+        });
         assert!(matches!(
-            graph.validate(),
-            Err(GraphValidationError::ValidationOutputNotDefined {
+            commit_invalid(graph),
+            GraphValidationError::ValidationOutputNotDefined {
                 id: ValidationId(1),
                 ..
-            })
+            }
         ));
 
-        let b = Builder::new();
-        let primary = b.constant("primary", TensorType::f32([1]));
-        let witness = b.constant("witness", TensorType::f32([1]));
-        let cases = [
-            (ValidationId(1), "", witness.id()),
-            (ValidationId(1), "same", witness.id()),
-        ];
-        let mut graph = b.finish(primary).with_validations(
-            cases
-                .into_iter()
-                .map(|(id, name, value)| ValidationOutput {
-                    id,
-                    name: name.into(),
-                    value,
-                })
-                .collect(),
-        );
+        let declare = |cases: [(ValidationId, &str); 2]| {
+            let mut draft = GraphEdit::new();
+            let value = draft.values_mut().push(ValueMeta::new(
+                TensorType::f32([1]),
+                Storage::Device,
+                None,
+            ));
+            draft.set_result(value);
+            for (id, name) in cases {
+                draft.push_witness(id, name, value);
+            }
+            draft
+        };
+        let mut graph = declare([(ValidationId(1), ""), (ValidationId(1), "same")]);
         assert!(matches!(
-            graph.validate(),
-            Err(GraphValidationError::EmptyValidationName {
+            commit_invalid(graph.clone()),
+            GraphValidationError::EmptyValidationName {
                 id: ValidationId(1)
-            })
+            }
         ));
 
-        graph.validations.0[0].name = "same".into();
+        graph = declare([(ValidationId(1), "same"), (ValidationId(1), "same")]);
         assert!(matches!(
-            graph.validate(),
-            Err(GraphValidationError::DuplicateValidationId {
+            commit_invalid(graph.clone()),
+            GraphValidationError::DuplicateValidationId {
                 id: ValidationId(1)
-            })
+            }
         ));
-        graph.validations.0[1].id = ValidationId(2);
+        graph = declare([(ValidationId(1), "same"), (ValidationId(2), "same")]);
         assert!(matches!(
-            graph.validate(),
-            Err(GraphValidationError::DuplicateValidationName { ref name }) if name == "same"
+            commit_invalid(graph),
+            GraphValidationError::DuplicateValidationName { ref name } if name == "same"
         ));
 
         let b = Builder::new();
@@ -1984,7 +2295,7 @@ mod tests {
         let (graph, _) = binding_fixture();
         assert_eq!(
             graph
-                .slots
+                .slots()
                 .iter()
                 .filter(|(_, slot)| *slot == Slot::ExpertPoolMap)
                 .count(),
@@ -1992,12 +2303,11 @@ mod tests {
             "fixture must exercise two separately named slots of one kind"
         );
         assert_ne!(
-            graph.meta(graph.slots[0].0).name,
-            graph.meta(graph.slots[1].0).name,
+            graph.meta(graph.slots()[0].0).name,
+            graph.meta(graph.slots()[1].0).name,
             "the same-kind slots must remain distinguishable by name"
         );
-        graph
-            .validate()
+        crate::test_support::verdict(&graph)
             .expect("same-kind named slots and a state swap are valid");
 
         for (label, state) in [
@@ -2010,8 +2320,10 @@ mod tests {
             let output = b.binary(BinOp::Add, first, second);
             let values = [first, second];
             let state = state.map(|(destination, source)| (values[destination], values[source]));
-            b.finish_with_state(output, &state)
-                .validate()
+            let graph = b
+                .finish(crate::Outputs::new(output).with_state(&state))
+                .unwrap();
+            crate::test_support::verdict(&graph)
                 .unwrap_or_else(|error| panic!("{label} state topology must validate: {error}"));
         }
     }
@@ -2056,57 +2368,60 @@ mod tests {
         ];
 
         for corruption in cases {
-            let (mut graph, ids) = binding_fixture();
+            let (graph, ids) = binding_fixture();
+            let mut graph = graph.into_draft();
             let expected = match corruption {
                 Corruption::ConstIdOutOfRange => {
-                    graph.consts.push(ValueId::new(u32::MAX));
+                    graph.consts_mut().push(ValueId::new(u32::MAX));
                     GraphValidationError::ConstOutOfRange {
                         value: ValueId::new(u32::MAX),
-                        value_count: graph.values.len(),
+                        value_count: graph.values().len(),
                     }
                 }
                 Corruption::SlotIdOutOfRange => {
                     graph
-                        .slots
+                        .slots_mut()
                         .push((ValueId::new(u32::MAX), Slot::ExpertPoolMap));
                     GraphValidationError::SlotOutOfRange {
                         value: ValueId::new(u32::MAX),
-                        value_count: graph.values.len(),
+                        value_count: graph.values().len(),
                     }
                 }
                 Corruption::DuplicateInput => {
-                    graph.inputs.push(ids.weight);
+                    graph.inputs_mut().push(ids.weight);
                     GraphValidationError::DuplicateInput { value: ids.weight }
                 }
                 Corruption::DuplicateConst => {
-                    graph.consts.push(ids.weight);
+                    graph.consts_mut().push(ids.weight);
                     GraphValidationError::DuplicateConst { value: ids.weight }
                 }
                 Corruption::DuplicateSlot => {
-                    graph.slots.push((ids.first_pool, Slot::ExpertPoolMap));
+                    graph
+                        .slots_mut()
+                        .push((ids.first_pool, Slot::ExpertPoolMap));
                     GraphValidationError::DuplicateSlot {
                         value: ids.first_pool,
                     }
                 }
                 Corruption::ConstMissingFromInputs => {
-                    graph.inputs.retain(|&id| id != ids.weight);
+                    graph.inputs_mut().retain(|&id| id != ids.weight);
                     GraphValidationError::ConstNotInput { value: ids.weight }
                 }
                 Corruption::SlotMissingFromInputs => {
-                    graph.inputs.retain(|&id| id != ids.first_pool);
+                    graph.inputs_mut().retain(|&id| id != ids.first_pool);
                     GraphValidationError::SlotNotInput {
                         value: ids.first_pool,
                     }
                 }
                 Corruption::ConstStorageMismatch => {
-                    graph.consts.push(ids.first_pool);
+                    graph.consts_mut().push(ids.first_pool);
                     GraphValidationError::ConstStorageMismatch {
                         value: ids.first_pool,
                         storage: Storage::Slot(Slot::ExpertPoolMap),
                     }
                 }
                 Corruption::SlotStorageMismatch => {
-                    graph.slots.push((ids.weight, Slot::ExpertPoolMap));
+                    graph.slots_mut().push((ids.weight, Slot::ExpertPoolMap));
                     GraphValidationError::SlotStorageMismatch {
                         value: ids.weight,
                         table_slot: Slot::ExpertPoolMap,
@@ -2115,7 +2430,7 @@ mod tests {
                 }
                 Corruption::SlotKindMismatch => {
                     graph
-                        .slots
+                        .slots_mut()
                         .iter_mut()
                         .find(|(id, _)| *id == ids.first_pool)
                         .unwrap()
@@ -2127,39 +2442,43 @@ mod tests {
                     }
                 }
                 Corruption::MissingConstBinding => {
-                    graph.consts.retain(|&id| id != ids.weight);
+                    graph.consts_mut().retain(|&id| id != ids.weight);
                     GraphValidationError::MissingConstBinding {
                         value: ids.weight,
                         storage: Storage::Const,
                     }
                 }
                 Corruption::MissingStateBinding => {
-                    graph.consts.retain(|&id| id != ids.first_state);
+                    graph.consts_mut().retain(|&id| id != ids.first_state);
                     GraphValidationError::MissingConstBinding {
                         value: ids.first_state,
                         storage: Storage::State,
                     }
                 }
                 Corruption::MissingSlotBinding => {
-                    graph.slots.retain(|&(id, _)| id != ids.first_pool);
+                    graph.slots_mut().retain(|&(id, _)| id != ids.first_pool);
                     GraphValidationError::MissingSlotBinding {
                         value: ids.first_pool,
                         slot: Slot::ExpertPoolMap,
                     }
                 }
                 Corruption::DeviceInput => {
-                    graph.inputs.push(ids.output);
+                    graph.inputs_mut().push(ids.output);
                     GraphValidationError::DeviceInput { value: ids.output }
                 }
                 Corruption::ConflictingStateDestination => {
-                    graph.state.push((ids.first_state, ids.first_state));
+                    graph.push_state(ids.first_state, ids.first_state);
                     GraphValidationError::DuplicateStateDestination {
                         value: ids.first_state,
                     }
                 }
             };
 
-            assert_eq!(graph.validate(), Err(expected), "{corruption:?}");
+            assert_eq!(
+                crate::test_support::verdict(&graph),
+                Err(expected),
+                "{corruption:?}"
+            );
         }
     }
 
@@ -2167,14 +2486,14 @@ mod tests {
     fn validate_rejects_out_of_range_graph_input_id() {
         let b = Builder::new();
         let output = b.constant("output", TensorType::f32(vec![1]));
-        let mut graph = b.finish(output);
-        graph.inputs.push(ValueId::new(u32::MAX));
+        let mut graph = b.finish(output).unwrap().into_draft();
+        graph.inputs_mut().push(ValueId::new(u32::MAX));
 
         assert_eq!(
-            graph.validate(),
+            crate::test_support::verdict(&graph),
             Err(GraphValidationError::InputOutOfRange {
                 value: ValueId::new(u32::MAX),
-                value_count: graph.values.len(),
+                value_count: graph.values().len(),
             })
         );
     }
@@ -2200,11 +2519,11 @@ mod tests {
             ResultCorruption::StateOutputNotDefined,
         ] {
             let (graph, ids) = binding_fixture();
-            let mut graph = graph.with_validations(Vec::new());
-            graph.eqns[0].inputs[0] = Operand::Value(ValueId::new(u32::MAX));
+            let mut graph = graph.into_draft();
+            graph.eqns_mut()[0].inputs[0] = Operand::Value(ValueId::new(u32::MAX));
             // An in-range, correctly typed value with neither an input binder nor a producer.
-            let undefined = ValueId::from_index(graph.values.len()).unwrap();
-            graph.values.push(ValueMeta {
+            let undefined = ValueId::from_index(graph.values().len()).unwrap();
+            graph.values_mut().push(ValueMeta {
                 aval: TensorType::f32([1]),
                 storage: Storage::Device,
                 name: None,
@@ -2214,7 +2533,8 @@ mod tests {
             });
             let expected = match corruption {
                 ResultCorruption::DuplicateStateDestination => {
-                    graph.state.push(graph.state[0]);
+                    let first = graph.state().next().unwrap();
+                    graph.push_state(first.0, first.1);
                     GraphValidationError::DuplicateStateDestination {
                         value: ids.first_state,
                     }
@@ -2222,16 +2542,16 @@ mod tests {
                 ResultCorruption::StateStorage => {
                     // Clear the role too (R-644-1: a non-State value carries none), isolating this
                     // corruption to the storage-table mismatch the row below still exercises.
-                    graph.values[ids.first_state].storage = Storage::Const;
-                    graph.values[ids.first_state].state_role = None;
+                    graph.values_mut()[ids.first_state].storage = Storage::Const;
+                    graph.values_mut()[ids.first_state].state_role = None;
                     GraphValidationError::StateInputStorageMismatch {
                         value: ids.first_state,
                         storage: Storage::Const,
                     }
                 }
                 ResultCorruption::StateType => {
-                    let state_output = graph.state[0].1;
-                    graph.values[state_output].aval = TensorType::f32([2]);
+                    let state_output = graph.state().next().unwrap().1;
+                    graph.values_mut()[state_output].aval = TensorType::f32([2]);
                     GraphValidationError::StateTypeMismatch {
                         state_input: ids.first_state,
                         state_output,
@@ -2240,27 +2560,28 @@ mod tests {
                     }
                 }
                 ResultCorruption::OutputNotDefined => {
-                    graph.output = undefined;
+                    graph.set_result(undefined);
                     GraphValidationError::OutputNotDefined { value: undefined }
                 }
                 ResultCorruption::ValidationOutputNotDefined => {
-                    graph.validations.0.push(ValidationOutput {
-                        id: ValidationId(12),
-                        name: "undefined".into(),
-                        value: undefined,
-                    });
+                    graph.push_witness(ValidationId(12), "undefined", undefined);
                     GraphValidationError::ValidationOutputNotDefined {
                         id: ValidationId(12),
                         value: undefined,
                     }
                 }
                 ResultCorruption::StateOutputNotDefined => {
-                    graph.state[0].1 = undefined;
+                    let input = graph.state().next().unwrap().0;
+                    graph.set_state_next(input, undefined);
                     GraphValidationError::StateOutputNotDefined { value: undefined }
                 }
             };
 
-            assert_eq!(graph.validate(), Err(expected), "{corruption:?}");
+            assert_eq!(
+                crate::test_support::verdict(&graph),
+                Err(expected),
+                "{corruption:?}"
+            );
         }
     }
 
@@ -2269,12 +2590,15 @@ mod tests {
         let b = Builder::new();
         let state = b.state_input("state", TensorType::f32(vec![1]), StateRole::Recurrent);
         let output = b.constant("output", TensorType::f32(vec![1]));
-        let mut graph = b.finish_with_state(output, &[(state, output)]);
-        graph.inputs.retain(|&id| id != state.id());
-        graph.consts.retain(|&id| id != state.id());
+        let mut graph = b
+            .finish(crate::Outputs::new(output).with_state(&[(state, output)]))
+            .unwrap()
+            .into_draft();
+        graph.inputs_mut().retain(|&id| id != state.id());
+        graph.consts_mut().retain(|&id| id != state.id());
 
         assert_eq!(
-            graph.validate(),
+            crate::test_support::verdict(&graph),
             Err(GraphValidationError::StateInputNotInput { value: state.id() })
         );
     }
@@ -2288,15 +2612,15 @@ mod tests {
             StateRole::Positional { axis: 4 },
         );
         let output = b.constant("output", TensorType::f32(vec![1]));
-        let graph = b.finish_with_state(output, &[(state, state)]);
+        let refused = b.finish(crate::Outputs::new(output).with_state(&[(state, state)]));
 
         assert_eq!(
-            graph.validate(),
-            Err(GraphValidationError::StateRoleAxis {
+            refused.err(),
+            Some(EditError::Invalid(GraphValidationError::StateRoleAxis {
                 value: state.id(),
                 axis: 4,
                 rank: 4,
-            })
+            }))
         );
     }
 
@@ -2305,18 +2629,18 @@ mod tests {
         let b = Builder::new();
         let x = b.constant("x", TensorType::f32(vec![4]));
         let out = b.binary(BinOp::Mul, x, x);
-        let mut g = b.finish(out);
+        let mut g = b.finish(out).unwrap().into_draft();
         // Corrupt an equation's output id to point past the value table. validate() must return an Err, not panic on
         // the out-of-bounds `self.values[eqn.out]` index.
-        let bad = ValueId::from_index(g.values.len() + 5).unwrap();
-        g.eqns.last_mut().unwrap().out = bad;
+        let bad = ValueId::from_index(g.values().len() + 5).unwrap();
+        g.eqns_mut().last_mut().unwrap().out = bad;
         assert_eq!(
-            g.validate(),
+            crate::test_support::verdict(&g),
             Err(GraphValidationError::EquationOutputOutOfRange {
                 equation: 0,
                 operation: "mul".into(),
                 value: bad,
-                value_count: g.values.len(),
+                value_count: g.values().len(),
             })
         );
     }
@@ -2327,11 +2651,12 @@ mod tests {
         let x = b.constant("x", TensorType::f32(vec![4]));
         let internal = b.binary(BinOp::Mul, x, x);
         let out = b.binary(BinOp::Mul, internal, internal);
-        let mut g = b.finish(out);
-        g.eqns.push(g.eqns[0].clone());
+        let mut g = b.finish(out).unwrap().into_draft();
+        let first = g.eqns()[0].clone();
+        g.eqns_mut().push(first);
 
         assert!(matches!(
-            g.validate(),
+            crate::test_support::verdict(&g),
             Err(GraphValidationError::EquationOutputRedefined {
                 equation: 2,
                 value,
@@ -2349,11 +2674,14 @@ mod tests {
             StateRole::Recurrent,
         );
         let replacement = b.constant("replacement", TensorType::new(vec![2, 5], DType::E4M3FN));
-        let mut g = b.finish_with_state(replacement, &[(state, replacement)]);
-        g.inputs.retain(|&id| id != state.id());
+        let mut g = b
+            .finish(crate::Outputs::new(replacement).with_state(&[(state, replacement)]))
+            .unwrap()
+            .into_draft();
+        g.inputs_mut().retain(|&id| id != state.id());
 
         assert_eq!(
-            g.validate(),
+            crate::test_support::verdict(&g),
             Err(GraphValidationError::ConstNotInput { value: state.id() })
         );
     }
@@ -2363,15 +2691,14 @@ mod tests {
         let b = Builder::new();
         let float = b.constant("float", TensorType::f32(vec![2]));
         let out = b.binary_scalar(BinOp::Add, float, Scalar::F32(1.0));
-        let mut g = b.finish(out);
-        g.eqns[0].inputs.swap(0, 1);
+        let mut g = b.finish(out).unwrap().into_draft();
+        g.eqns_mut()[0].inputs.swap(0, 1);
         // Card 149 deliberately makes literal-first Binary graph-valid. Consumers with a narrower operand
         // grammar must reject it locally without changing Graph's general validity contract.
-        g.values[out.id()].aval = OpKind::Binary(BinOp::Add)
+        g.values_mut()[out.id()].aval = OpKind::Binary(BinOp::Add)
             .infer(&[Scalar::F32(1.0).ty(), TensorType::f32(vec![2])])
             .unwrap();
-        g.validate()
-            .expect("literal-first Binary remains graph-valid");
+        crate::test_support::verdict(&g).expect("literal-first Binary remains graph-valid");
     }
 
     #[test]
@@ -2380,11 +2707,11 @@ mod tests {
         let float = b.constant("float", TensorType::scalar(DType::F32));
         let int = b.constant("int", TensorType::scalar(DType::I32));
         let out = b.binary_scalar(BinOp::Add, float, Scalar::F32(1.0));
-        let mut g = b.finish(out);
-        g.eqns[0].inputs = vec![Operand::Value(float.id()), Operand::Value(int.id())];
+        let mut g = b.finish(out).unwrap().into_draft();
+        g.eqns_mut()[0].inputs = vec![Operand::Value(float.id()), Operand::Value(int.id())];
 
         assert_eq!(
-            g.validate(),
+            crate::test_support::verdict(&g),
             Err(GraphValidationError::BinaryValueDtypeMismatch {
                 equation: 0,
                 operation: "add".into(),
@@ -2405,11 +2732,11 @@ mod tests {
             let float = b.constant("float", TensorType::f32(vec![2]));
             let packed = b.constant("packed", TensorType::new(vec![2], dtype));
             let out = b.binary_scalar(BinOp::Add, float, Scalar::F32(1.0));
-            let mut g = b.finish(out);
-            g.eqns[0].inputs = vec![Operand::Value(packed.id()), Operand::Value(packed.id())];
+            let mut g = b.finish(out).unwrap().into_draft();
+            g.eqns_mut()[0].inputs = vec![Operand::Value(packed.id()), Operand::Value(packed.id())];
 
             assert_eq!(
-                g.validate(),
+                crate::test_support::verdict(&g),
                 Err(GraphValidationError::EquationInference {
                     equation: 0,
                     operation: "add".into(),
@@ -2441,7 +2768,7 @@ mod tests {
         let token_graph = || {
             let b = Builder::new();
             let t = b.slot(Slot::Token, TensorType::scalar(DType::I32));
-            b.finish(t)
+            b.finish(t).unwrap()
         };
         let g1 = token_graph();
         let g2 = token_graph();
@@ -2459,7 +2786,7 @@ mod tests {
 
         let b = Builder::new();
         let p = b.slot(Slot::Pos, TensorType::scalar(DType::I32));
-        let g3 = b.finish(p);
+        let g3 = b.finish(p).unwrap();
         assert_eq!(
             g3.slots[0].0, token_id,
             "same allocated id, a different role"
@@ -2488,7 +2815,7 @@ mod tests {
         let layer0 = b.slot_named(Slot::ExpertPoolMap, "layer_0", TensorType::f32(vec![4]));
         let layer1 = b.slot_named(Slot::ExpertPoolMap, "layer_1", TensorType::f32(vec![4]));
         let out = b.binary(BinOp::Add, layer0, layer0);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
 
         let key0 = g.input_key(layer0.id()).expect("declared slot input");
         let key1 = g.input_key(layer1.id()).expect("declared slot input");
@@ -2515,12 +2842,12 @@ mod tests {
     fn input_key_reads_the_stored_key_never_the_name_string() {
         let b = Builder::new();
         let layer0 = b.slot_named(Slot::ExpertPoolMap, "layer_0", TensorType::f32(vec![4]));
-        let mut g = b.finish(layer0);
+        let mut g = b.finish(layer0).unwrap().into_draft();
         let original = g.input_key(layer0.id()).expect("declared slot input");
 
         // Corrupt the wire name a parser would read; the typed key lives elsewhere and must be
         // unaffected.
-        g.values[layer0.id()].name = Some("not.a.recoverable.name".to_string());
+        g.values_mut()[layer0.id()].name = Some("not.a.recoverable.name".to_string());
         let after = g.input_key(layer0.id());
 
         assert_eq!(

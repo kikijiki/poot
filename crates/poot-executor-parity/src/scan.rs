@@ -141,7 +141,7 @@ fn load_entry(
     scan: &ScanGraph,
     label: &str,
 ) -> (poot_executor::ExecutableId, poot_executor::EntryId) {
-    let graph = scan.graph.clone().with_validations(Vec::new());
+    let graph = scan.graph.clone();
     // The scan graph binds no weights: its operands are activation slots and the carried state.
     let store = WeightStore::builder().build();
     let map = WeightMap::builder(&store).build();

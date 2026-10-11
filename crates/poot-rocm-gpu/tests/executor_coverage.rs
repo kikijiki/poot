@@ -387,7 +387,9 @@ fn chunked_gdn_prefill_matches_the_sequential_recurrence_on_rocm() {
         StateRole::Recurrent,
     );
     let (out, state_out) = gated_delta_net_decode(&b, q, k, v, g, beta, state);
-    let graph = b.finish_with_state(out, &[(state, state_out)]);
+    let graph = b
+        .finish(poot_graph_ir::Outputs::new(out).with_state(&[(state, state_out)]))
+        .unwrap();
     let mut carried = HostTensor::zeros(vec![1, H_V, D, D]);
     for (call, (inputs, got)) in case.inputs.iter().zip(&outputs).enumerate() {
         let GdnInputs {
@@ -444,7 +446,7 @@ fn chunked_gdn_prefill_matches_the_sequential_recurrence_on_rocm() {
 /// embedding), traced for one decode token, its weights bound by const name as stored (bf16 words
 /// for the projections), and one decode step per prompt token.
 fn qwen05b_fixture(checkpoint: &std::path::Path, prompt: &[u32]) -> Fixture {
-    use poot_executor_parity::dense::{const_named_weights, plain, step};
+    use poot_executor_parity::dense::{const_named_weights, step};
     use poot_executor_parity::weight_map::MappedModel;
     use poot_models::model::{LogitRows, Phase};
     use poot_models::registry::{RawConfig, Registry};
@@ -475,17 +477,15 @@ fn qwen05b_fixture(checkpoint: &std::path::Path, prompt: &[u32]) -> Fixture {
         store: Arc::new(stored),
         map,
     };
-    let graph = plain(
-        mapped
-            .model
-            .trace(Phase::Decode, step(1, 1, CAP, LogitRows::Last))
-            .unwrap(),
-    );
+    let graph = mapped
+        .model
+        .trace(Phase::Decode, step(1, 1, CAP, LogitRows::Last))
+        .unwrap();
     let (store, _) = const_named_weights(&mapped, &graph);
 
     let slot = |wanted: poot_graph_ir::Slot| {
         graph
-            .inputs
+            .inputs()
             .iter()
             .map(|&id| graph.meta(id))
             .find(|meta| meta.storage == Storage::Slot(wanted))

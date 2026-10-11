@@ -17,7 +17,7 @@ use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
 use poot_graph_ir::rope_table::RopeFlavor;
-use poot_graph_ir::{Builder, Graph, ValidationOutputs};
+use poot_graph_ir::{Builder, Graph};
 use poot_models::chat::ChatFormat;
 use poot_models::components::attention::{AttentionParams, AttentionWeights, attention};
 use poot_models::components::dims::{Field, Fields};
@@ -253,11 +253,7 @@ impl Model for Neoxish {
         &self.weights
     }
 
-    fn trace(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-    ) -> Result<Graph<ValidationOutputs>, TraceError> {
+    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(FAMILY, phase, shape, p.max_positions)?;
         let b = Builder::new();
@@ -273,7 +269,7 @@ impl Model for Neoxish {
                 |b, BlockInput { block: h, .. }| plain_mlp(b, h, &layer.mlp, Gelu::Erf),
             )
         });
-        Ok(step.finish(b, logits))
+        Ok(step.finish(b, logits).unwrap())
     }
 }
 

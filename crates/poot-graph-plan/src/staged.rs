@@ -25,7 +25,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use poot_graph_ir::{BoundaryId, Graph, TensorType, ValidationChannel, ValueId};
+use poot_graph_ir::{BoundaryId, Graph, TensorType, ValueId};
 use poot_quant::weights::{WeightId, WeightMap};
 use poot_target::BufferStorage;
 
@@ -178,8 +178,8 @@ pub struct TensorParallel {
 /// A graph compiled into stages, each placed on one device, joined by [`Link`]s on one device and by
 /// [`Transfer`]s over communication rows between devices.
 #[derive(Debug)]
-pub struct StagedProgram<V: ValidationChannel> {
-    stages: Vec<(StageId, DeviceId, Program<V>)>,
+pub struct StagedProgram {
+    stages: Vec<(StageId, DeviceId, Program)>,
     links: Vec<Link>,
     transfers: Vec<Transfer>,
     comm: CommunicationPlan,
@@ -188,9 +188,9 @@ pub struct StagedProgram<V: ValidationChannel> {
     tensor: Option<TensorParallel>,
 }
 
-impl<V: ValidationChannel> StagedProgram<V> {
+impl StagedProgram {
     /// One stage on one device, no links.
-    pub fn single(program: Program<V>, device: DeviceId) -> Self {
+    pub fn single(program: Program, device: DeviceId) -> Self {
         Self {
             stages: vec![(StageId(0), device, program)],
             links: Vec::new(),
@@ -202,7 +202,7 @@ impl<V: ValidationChannel> StagedProgram<V> {
         }
     }
 
-    pub fn stages(&self) -> impl Iterator<Item = (StageId, DeviceId, &Program<V>)> {
+    pub fn stages(&self) -> impl Iterator<Item = (StageId, DeviceId, &Program)> {
         self.stages.iter().map(|(s, d, p)| (*s, *d, p))
     }
 
@@ -210,7 +210,7 @@ impl<V: ValidationChannel> StagedProgram<V> {
     /// executor's load-time invariant rows build programs `compile_staged` would never produce
     /// (ADR-0113: gated, no production caller).
     #[cfg(feature = "test-support")]
-    pub fn into_parts(self) -> StagedParts<V> {
+    pub fn into_parts(self) -> StagedParts {
         StagedParts {
             stages: self.stages,
             links: self.links,
@@ -221,7 +221,7 @@ impl<V: ValidationChannel> StagedProgram<V> {
     /// Assemble a staged program from parts without any of `compile_staged`'s checks. Test-only, see
     /// [`Self::into_parts`].
     #[cfg(feature = "test-support")]
-    pub fn from_parts(parts: StagedParts<V>) -> Self {
+    pub fn from_parts(parts: StagedParts) -> Self {
         Self {
             stages: parts.stages,
             links: parts.links,
@@ -270,8 +270,8 @@ impl<V: ValidationChannel> StagedProgram<V> {
 /// A [`StagedProgram`] taken apart: see [`StagedProgram::into_parts`].
 #[cfg(feature = "test-support")]
 #[derive(Debug)]
-pub struct StagedParts<V: ValidationChannel> {
-    pub stages: Vec<(StageId, DeviceId, Program<V>)>,
+pub struct StagedParts {
+    pub stages: Vec<(StageId, DeviceId, Program)>,
     pub links: Vec<Link>,
     pub sync_points: Vec<SyncPoint>,
 }
@@ -354,12 +354,12 @@ impl From<StageSplitError> for StagedCompileError {
 }
 
 /// Compile `g` for the partition's devices: the fixed step list in the module doc.
-pub fn compile_staged<V: ValidationChannel>(
-    g: &Graph<V>,
+pub fn compile_staged(
+    g: &Graph,
     targets: &TargetSet,
     partition: &Partition,
     options: &CompileOptions,
-) -> Result<StagedProgram<V>, StagedCompileError> {
+) -> Result<StagedProgram, StagedCompileError> {
     let mut placement = devices::resolve(targets, partition)?;
     let adapted = lora::apply(g, options)?;
     if matches!(partition.experts, ExpertPlacement::Pooled { .. }) && placement.spans_devices() {
@@ -543,7 +543,7 @@ pub fn compile_staged<V: ValidationChannel>(
 
     let mut footprints = Vec::new();
     if placement.spans_devices() {
-        let stage_graphs: Vec<&Graph<V>> = split.stages.iter().map(|stage| &stage.graph).collect();
+        let stage_graphs: Vec<&Graph> = split.stages.iter().map(|stage| &stage.graph).collect();
         devices::place_weights(&adapted, &stage_graphs, &placement)?;
         footprints = devices::footprints(&stages, &transfers, &plan.communication, &links);
         devices::admit_capacity(&placement, &footprints)?;
@@ -556,7 +556,7 @@ pub fn compile_staged<V: ValidationChannel>(
         let Some(site) = cut.site else { continue };
         let site = placed.sites[site].0.clone();
         let from = StageId(stage as u32);
-        if !stages[stage].2.exports().iter().any(|e| e.id == site.ids) {
+        if !stages[stage].2.exports().any(|e| e.id == site.ids) {
             return Err(StagedCompileError::BoundaryLost {
                 id: site.ids,
                 stage: from,
@@ -592,21 +592,20 @@ struct LinkSides {
 /// The two sides of one link, as each program compiled them, must agree on logical dtype and shape
 /// and on the exact storage (so bytes and logical extent follow). An equal byte count is not a
 /// representation: a mismatch is refused here, before any executor allocates.
-fn check_link<V: ValidationChannel>(
+fn check_link(
     id: BoundaryId,
-    (from, producer): (StageId, &Program<V>),
-    (to, consumer): (StageId, &Program<V>),
+    (from, producer): (StageId, &Program),
+    (to, consumer): (StageId, &Program),
 ) -> Result<LinkSides, StagedCompileError> {
     let exported = producer
         .exports()
-        .iter()
         .find(|export| export.id == id)
         .ok_or(StagedCompileError::BoundaryLost { id, stage: from })?
         .value;
     let input = consumer
         .boundary_input(id)
         .ok_or(StagedCompileError::BoundaryLost { id, stage: to })?;
-    let schema = |program: &Program<V>, value| BoundarySchema {
+    let schema = |program: &Program, value| BoundarySchema {
         aval: program.graph().aval(value).clone(),
         storage: program.storage().storage(value).buffer_storage(),
     };

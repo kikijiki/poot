@@ -141,7 +141,7 @@ fn attention_masked_with_alibi_bias_matches_hand_rolled_reference() {
     let mask = b.constant("mask", TensorType::f32(vec![1, hq, 1, cap]));
     let out = attention_masked(&b, q, k, v, n_rep, scale, mask);
     let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let mut inputs = HashMap::new();
     inputs.insert(
@@ -195,8 +195,8 @@ fn bloom_alibi_decode_skips_rope() {
     let g = trace_step(&*model, Phase::Decode, (1, 1, cap), None, LogitRows::Last);
 
     // FR-002: no rope tables declared on the ALiBi path.
-    for id in &g.inputs {
-        let m = &g.values[*id];
+    for id in g.inputs() {
+        let m = &g.values()[*id];
         if let Storage::Const = m.storage {
             let name = m.name.as_deref().unwrap_or("");
             assert!(
@@ -208,8 +208,8 @@ fn bloom_alibi_decode_skips_rope() {
 
     // The widened per-head bias is a graph computation over Slot::Pos ([1,1]) and the slopes.
     assert!(
-        g.inputs.iter().any(|id| matches!(
-            g.values[*id].storage,
+        g.inputs().iter().any(|id| matches!(
+            g.values()[*id].storage,
             Storage::Computed(ComputedConst::AlibiSlopes { .. })
         )),
         "an ALiBi decode graph must read the per-head slopes"
@@ -344,7 +344,7 @@ fn flash_decode_per_head_alibi_mask_matches_reference_and_decomposition() {
         let mask = b.constant("mask", TensorType::f32(mask_shape.clone()));
         let out = stage_flash(&b, decode(n_rep, scale), [q, k, v, mask]);
         let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         let mut inputs = HashMap::new();
         inputs.insert(
             qi,
@@ -383,7 +383,7 @@ fn flash_decode_per_head_alibi_mask_matches_reference_and_decomposition() {
     let mask = b.constant("mask", TensorType::f32(vec![1, hq, 1, cap]));
     let out = attention_masked(&b, q, k, v, n_rep, scale, mask);
     let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let mut inputs = HashMap::new();
     inputs.insert(
         qi,
@@ -458,7 +458,7 @@ fn flash_decode_broadcast_mask_unchanged_batched() {
     let mask = b.constant("mask", TensorType::f32(vec![bsz, 1, 1, cap]));
     let out = stage_flash(&b, decode(n_rep, scale), [q, k, v, mask]);
     let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let mut inputs = HashMap::new();
     inputs.insert(
         qi,
@@ -529,7 +529,7 @@ fn flash_prefill_per_head_alibi_mask_matches_reference() {
         let mask = b.constant("mask", TensorType::f32(mask_shape.clone()));
         let out = stage_flash(&b, prefill(n_rep, scale), [q, k, v, mask]);
         let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         let mut inputs = HashMap::new();
         inputs.insert(
             qi,
@@ -588,7 +588,7 @@ fn flash_prefill_broadcast_mask_unchanged() {
     let mask = b.constant("mask", TensorType::f32(vec![1, 1, l, l]));
     let out = stage_flash(&b, prefill(n_rep, scale), [q, k, v, mask]);
     let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let mut inputs = HashMap::new();
     inputs.insert(
         qi,
@@ -619,9 +619,9 @@ fn flash_prefill_broadcast_mask_unchanged() {
     assert_close_rel(got.as_f32().unwrap(), &want, 1e-5);
 }
 
-/// A mask whose head axis is neither 1 nor Hq is rejected clearly, not misread. The
-/// op's typing rule refuses it (card 496), so the tracer cannot build it; a graph mutated after tracing
-/// fails `Graph::validate` with the typed operand error, and eval's own stride guard still refuses it.
+/// A mask whose head axis is neither 1 nor Hq is rejected clearly, not misread. The op's typing rule
+/// refuses it (card 496), so the tracer cannot build it, and a graph retyped after tracing is refused by
+/// the edit check with the typed operand error: no graph with such a mask exists for `eval` to misread.
 #[test]
 fn flash_decode_rejects_bad_mask_head_axis() {
     let (hq, hkv, cap, d) = (4usize, 2usize, 5usize, 4usize);
@@ -631,50 +631,16 @@ fn flash_decode_rejects_bad_mask_head_axis() {
     let v = b.constant("v", TensorType::f32(vec![1, hkv, cap, d]));
     let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
     let out = stage_flash(&b, decode(hq / hkv, 1.0), [q, k, v, mask]);
-    let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
-    let mut g = b.finish(out);
-    g.values[mi].aval.shape = vec![1, 2, 1, cap]; // 2 is neither 1 nor Hq=4
-    let mut inputs = HashMap::new();
-    inputs.insert(
-        qi,
-        Value::from(HostTensor::f32(vec![1, hq, 1, d], fill(hq * d, 61))),
-    );
-    inputs.insert(
-        ki,
-        Value::from(HostTensor::f32(
-            vec![1, hkv, cap, d],
-            fill(hkv * cap * d, 62),
-        )),
-    );
-    inputs.insert(
-        vi,
-        Value::from(HostTensor::f32(
-            vec![1, hkv, cap, d],
-            fill(hkv * cap * d, 63),
-        )),
-    );
-    inputs.insert(
-        mi,
-        Value::from(HostTensor::f32(vec![1, 2, 1, cap], fill(2 * cap, 64))),
-    );
-    let invalid = g.validate().unwrap_err().to_string();
+    let mi = mask.id();
+    let g = b.finish(out).unwrap();
+    let refused = poot_test_util::graph_fixtures::derive(&g, |draft| {
+        draft.values_mut()[mi].aval.shape = vec![1, 2, 1, cap]; // 2 is neither 1 nor Hq=4
+    })
+    .unwrap_err();
     assert!(
-        invalid.contains("attention mask must be [1, 1, 1, 5], got [1, 2, 1, 5]"),
-        "expected the typed mask operand error, got: {invalid}"
-    );
-    // Card 554d: `eval` now runs `g.validate()` as its own first step (SC-010's fail-closed
-    // binding sits behind the same gate), so the walk's error for this malformed graph is the same
-    // typed `g.validate()` mismatch just asserted above, not a distinct "mask head axis" message.
-    let err = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
-        .map(|r| {
-            r.output
-                .into_host()
-                .expect("alibi_attention tests evaluate dense graphs")
-        })
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains("attention mask must be [1, 1, 1, 5], got [1, 2, 1, 5]"),
-        "expected the same typed mask error from eval, got: {err}"
+        refused
+            .to_string()
+            .contains("attention mask must be [1, 1, 1, 5], got [1, 2, 1, 5]"),
+        "expected the typed mask operand error, got: {refused}"
     );
 }

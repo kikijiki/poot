@@ -5,7 +5,7 @@
 //! charges every packed output against the caller's `EvalBudget` instead, so the limit is an option,
 //! not a hardcoded wall (deval A5).
 
-use poot_graph_ir::{Graph, OpKind, Operand, ValidationChannel, ValueId, ValueTable};
+use poot_graph_ir::{Graph, OpKind, Operand, ValueId, ValueTable};
 use poot_quant::{PackedComponentRef, PackedPayload, PackedStack, SourceRole};
 
 use crate::value::PackedEvalError;
@@ -29,8 +29,8 @@ pub(crate) fn checked_packed_oracle_product(
 /// carrier, a registered E4M3/E2M1 cell has two, and GPTQ/AWQ have three or four. Every carrier must
 /// share one `Arc<PackedPayload>` owner and one linear id, so this decodes only through that one
 /// `poot-quant` payload - never a second, ad hoc decode.
-pub(crate) fn packed_components<'a, V: ValidationChannel>(
-    g: &Graph<V>,
+pub(crate) fn packed_components<'a>(
+    g: &Graph,
     eqn: &poot_graph_ir::Eqn,
     env: &'a ValueTable<Option<Value>>,
     descriptor: poot_quant::PackedWeight,
@@ -47,8 +47,8 @@ pub(crate) fn packed_components<'a, V: ValidationChannel>(
 /// The shared binding contract of [`packed_components`]. `bound`
 /// resolves a carrier to its bound value, `None` when it is not supplied (skipped). Returns the
 /// payload owner of the first supplied carrier, `None` when none was supplied.
-fn bind_packed_carriers<'a, V: ValidationChannel>(
-    g: &Graph<V>,
+fn bind_packed_carriers<'a>(
+    g: &Graph,
     eqn: &poot_graph_ir::Eqn,
     descriptor: poot_quant::PackedWeight,
     bound: impl Fn(ValueId) -> Result<Option<&'a Value>, EvalError>,
@@ -229,8 +229,8 @@ pub(crate) fn evaluate_packed_row_gather(
 /// [`PackedStack`] every source resolves to. The stacked counterpart of [`packed_components`]: each
 /// carrier must be a [`Value::PackedStack`] of its role, of `descriptor` and `experts` experts, over one
 /// shared stack, and named after one stack id.
-pub(crate) fn packed_stack_components<'a, V: ValidationChannel>(
-    g: &Graph<V>,
+pub(crate) fn packed_stack_components<'a>(
+    g: &Graph,
     eqn: &poot_graph_ir::Eqn,
     env: &'a ValueTable<Option<Value>>,
     descriptor: poot_quant::PackedWeight,

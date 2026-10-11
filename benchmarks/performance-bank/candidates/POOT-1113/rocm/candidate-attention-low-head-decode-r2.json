@@ -1,0 +1,124 @@
+{
+  "backend": "rocm",
+  "binary": "/home/kikijiki/.cache/poot-cargo-target/release/examples/performance_bank",
+  "case": "attention-low-head-decode",
+  "cells": {
+    "kernel": {
+      "repeats": [
+        {
+          "metrics": {
+            "step_us": 62.788
+          },
+          "slot": 0,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 58.458999999999996
+          },
+          "slot": 1,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 50.094
+          },
+          "slot": 2,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 45.796
+          },
+          "slot": 3,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 41.939
+          },
+          "slot": 4,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 42.479
+          },
+          "slot": 5,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 42.218999999999994
+          },
+          "slot": 6,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 41.066
+          },
+          "slot": 7,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 45.825
+          },
+          "slot": 8,
+          "status": "ok"
+        }
+      ]
+    }
+  },
+  "hardware": {
+    "backend": "rocm",
+    "device": "AMD Radeon 8060S Graphics",
+    "driver": "host kernel 7.2.9"
+  },
+  "memory": [
+    {
+      "live_bytes": 4211712,
+      "peak_bytes": 4211712,
+      "role": "Weight"
+    },
+    {
+      "live_bytes": 17664,
+      "peak_bytes": 17664,
+      "role": "Activation"
+    },
+    {
+      "live_bytes": 112,
+      "peak_bytes": 112,
+      "role": "Meta"
+    }
+  ],
+  "observed": {
+    "layout": "bhsd",
+    "shape": {
+      "cap": 4096,
+      "d": 128,
+      "hkv": 1,
+      "hq": 2
+    },
+    "storage": "f32",
+    "weight_bytes_per_copy": 4194304,
+    "weight_copies": 1
+  },
+  "plan": [
+    "attention [c9fc1783247cedc898ddca6ea31a1ee8921d875ccf92ccf1983cba5c574b2d46]",
+    "attention_combine [ab98131947c3b59c56bff03678f73c16653e4028a2695636d871530e9f32c86b]"
+  ],
+  "plan_id": "864ca01f0cb2e371ff83f1544a9ebc840d3a867a7b80be33e274ba81c4b8ffe2",
+  "recordings": 1,
+  "reference": {
+    "agrees": true,
+    "max_relative_error": 6.516092134265499e-9,
+    "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
+    "provenance": "independent-golden",
+    "tolerance": 0.002
+  },
+  "replays": 13,
+  "role": "baseline",
+  "schema": 1
+}

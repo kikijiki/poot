@@ -72,7 +72,7 @@ fn gdn_core_on_realistic_frontend_inputs_per_head_real_dims() {
         let g4 = fb.transpose(fb.reshape(g, vec![1, l, hv, 1]), vec![0, 2, 1, 3]); // [1,Hv,L,1]
         let beta4 = fb.transpose(fb.reshape(beta, vec![1, l, hv, 1]), vec![0, 2, 1, 3]);
         // Multiple outputs via eval_all and reading ids.
-        let fg = fb.finish(q); // primary irrelevant; use eval_all to read every tap.
+        let fg = fb.finish(q).unwrap(); // primary irrelevant; use eval_all to read every tap.
         let mut fin = HashMap::new();
         fin.insert(x.id(), HostTensor::f32(vec![1, l, h], fill(l * h, 111)));
         fin.insert(
@@ -153,7 +153,9 @@ fn gdn_core_on_realistic_frontend_inputs_per_head_real_dims() {
             StateRole::Recurrent,
         );
         let (_o, s_out) = gated_delta_net_decode(&db, q_in, k_in, v_in, g_in, bt_in, ds_in);
-        let dg = db.finish_with_state(_o, &[(ds_in, s_out)]);
+        let dg = db
+            .finish(poot_graph_ir::Outputs::new(_o).with_state(&[(ds_in, s_out)]))
+            .unwrap();
         let mut state = HostTensor::f32(vec![1, hv, d, d], vec![0.0; hv * d * d]);
         for t in 0..l {
             let qt: Vec<f32> = (0..hv * d)
@@ -227,7 +229,9 @@ fn gdn_core_on_realistic_frontend_inputs_per_head_real_dims() {
             let cti = cb.constant("ti", TensorType::f32(vec![1, 1, c, c]));
             let cts = cb.constant("ts", TensorType::f32(vec![1, 1, c, c]));
             let (co, cso) = gdn_prefill_chunked(&cb, cq, ckk, cv, cg, cbeta, cs, cti, cts, c);
-            let cgraph = cb.finish_with_state(co, &[(cs, cso)]);
+            let cgraph = cb
+                .finish(poot_graph_ir::Outputs::new(co).with_state(&[(cs, cso)]))
+                .unwrap();
             let mut cin = HashMap::new();
             cin.insert(cq.id(), HostTensor::f32(vec![1, hk, l, d], qd.clone()));
             cin.insert(ckk.id(), HostTensor::f32(vec![1, hk, l, d], kd.clone()));
@@ -325,7 +329,12 @@ fn mamba_core_path_decode_loop_matches_reference() {
     let xheads = b.reshape(xact, vec![1, hq, 1, pdim]);
     let delta = softplus(&b, dt); // Delta = softplus(dt)
     let (y, h_out) = mamba2_ssd_decode(&b, xheads, bb, cc, delta, ap, dsk, h_in);
-    let g = b.finish_with_state(y, &[(conv_cache, conv_cache_out), (h_in, h_out)]);
+    let g = b
+        .finish(
+            poot_graph_ir::Outputs::new(y)
+                .with_state(&[(conv_cache, conv_cache_out), (h_in, h_out)]),
+        )
+        .unwrap();
 
     let bind_scalars = |inp: &mut HashMap<ValueId, HostTensor>| {
         inp.insert(
@@ -464,7 +473,9 @@ fn mamba2_ssd_decode_matches_recurrence() {
         StateRole::Recurrent,
     );
     let (y, h_out) = mamba2_ssd_decode(&b, x, bin, cin, delta, a_param, d_skip, h_in);
-    let g = b.finish_with_state(y, &[(h_in, h_out)]);
+    let g = b
+        .finish(poot_graph_ir::Outputs::new(y).with_state(&[(h_in, h_out)]))
+        .unwrap();
     let ad: Vec<f32> = (0..hq).map(av).collect();
     let dd: Vec<f32> = (0..hq).map(dv).collect();
 

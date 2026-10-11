@@ -117,12 +117,17 @@ pub enum BuilderAppendError {
     },
 }
 
-/// A structural or binding-table failure returned by [`crate::Graph::validate`].
+/// A structural or binding-table failure of a graph draft, reported by [`crate::GraphEdit::commit`] as
+/// [`crate::EditError::Invalid`].
 ///
 /// Value ids are kept as fields so callers can classify malformed graphs without parsing diagnostics.
 /// Equation errors also retain the operation name and inference source needed to locate the failure.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum GraphValidationError {
+    #[error("the graph declares no primary result")]
+    MissingResult,
+    #[error("the graph declares more than one primary result")]
+    MultipleResults,
     #[error("validation output {value} out of range for {value_count} values")]
     ValidationValueOutOfRange { value: ValueId, value_count: usize },
     #[error("duplicate validation id {id:?}")]
@@ -284,7 +289,7 @@ pub enum GraphValidationError {
 /// during tracing is a trace-time programmer error (the model wired incompatible shapes), so the
 /// `Builder` surfaces it as a panic with context, the way `abstract_eval` raises in JAX; the typed error
 /// is what the inference API and its tests return.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ShapeError {
     #[error("cannot broadcast shapes {a:?} and {b:?}")]
     Broadcast { a: Vec<usize>, b: Vec<usize> },

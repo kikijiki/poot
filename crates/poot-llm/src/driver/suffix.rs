@@ -14,9 +14,10 @@
 use std::collections::HashMap;
 
 use poot_eval::{EvalBudget, EvalOptions, Value};
+use poot_graph_ir::builder::Resumed;
 use poot_graph_ir::op::SampleRule;
 use poot_graph_ir::ops::sampling::sample_head;
-use poot_graph_ir::{Builder, Graph, NoValidations, Slot, TensorType, ValidationOutputs, ValueId};
+use poot_graph_ir::{Builder, EditError, Graph, Outputs, Slot, TensorType, ValueId};
 use poot_tensor::DType;
 use poot_tensor::HostTensor;
 
@@ -37,76 +38,22 @@ impl Head {
     pub const GREEDY: Head = Head::Sample(SampleRule::Greedy);
 }
 
-/// `g` (and its appended suffix inputs' ids), after [`with_head`]. `Logits` returns `g` itself
-/// unchanged and no ids; `Sample(rule)` returns the three ids [`SuffixRows`]'s
-/// tensors bind by - `None` for a tag `rule` does not declare (R-551a-4: `Greedy` declares none).
-pub(crate) struct Appended {
-    pub(crate) graph: Graph,
-    pub(crate) seed: Option<ValueId>,
-    pub(crate) params: Option<ValueId>,
-    pub(crate) top_k: Option<ValueId>,
-}
-
-/// Append `head`'s suffix after `g`'s raw logits output (card 551a): reopens the
-/// finished graph (`Builder::resume`), appends [`sample_head`]'s suffix, and finishes again over the
-/// same (possibly unchanged) state pairs. `Logits` is a no-op (the raw graph, unchanged) - infallible,
-/// since `resume`/`sample_head`/`finish_with_state` are.
-pub(crate) fn with_head(g: Graph, head: Head) -> Appended {
+/// Append `head`'s suffix after `g`'s raw logits output (card 551a): reopens the finished graph
+/// (`Builder::resume`), appends [`sample_head`]'s suffix, and finishes again over the same state
+/// pairs. The resumed builder keeps every witness `g` declares, and the suffix only appends values,
+/// so a validation-bearing graph keeps its checks. `Logits` is a no-op (the raw graph, unchanged).
+pub(crate) fn with_head(g: Graph, head: Head) -> Result<Graph, EditError> {
     match head {
-        Head::Logits => Appended {
-            graph: g,
-            seed: None,
-            params: None,
-            top_k: None,
-        },
+        Head::Logits => Ok(g),
         Head::Sample(rule) => {
-            let resumed = Builder::resume(g);
-            let sh = sample_head(&resumed.builder, resumed.out, rule);
-            let graph = resumed.builder.finish_with_state(sh.out, &resumed.state);
-            Appended {
-                graph,
-                seed: sh.seed.map(|t| t.id()),
-                params: sh.params.map(|t| t.id()),
-                top_k: sh.top_k.map(|t| t.id()),
-            }
+            let Resumed { builder, outputs } = Builder::resume(g);
+            let sh = sample_head(&builder, outputs.result, rule);
+            builder.finish(Outputs {
+                result: sh.out,
+                ..outputs
+            })
         }
     }
-}
-
-/// [`with_head`] over a validation-bearing graph, which is what [`poot_models::model::Model::trace`]
-/// returns. The suffix only appends values, so every declared validation keeps its value id: the
-/// declarations are set aside, the plain graph is extended and they are attached again.
-pub(crate) fn append_head(
-    g: Graph<ValidationOutputs>,
-    head: Head,
-) -> (Graph<ValidationOutputs>, SuffixIds) {
-    let validations = g.validation_outputs().to_vec();
-    let plain = Graph {
-        values: g.values,
-        inputs: g.inputs,
-        consts: g.consts,
-        slots: g.slots,
-        eqns: g.eqns,
-        output: g.output,
-        validations: NoValidations,
-        exports: g.exports,
-        state: g.state,
-    };
-    let appended = with_head(plain, head);
-    let ids = SuffixIds {
-        seed: appended.seed,
-        params: appended.params,
-        top_k: appended.top_k,
-    };
-    (appended.graph.with_validations(validations), ids)
-}
-
-/// The suffix's own input ids: `None` for a tag the head's rule does not declare.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct SuffixIds {
-    pub(crate) seed: Option<ValueId>,
-    pub(crate) params: Option<ValueId>,
-    pub(crate) top_k: Option<ValueId>,
 }
 
 /// Which [`SampleRule`] a temperature draw's `top_k`/`top_p` knobs select (R-551a-4's three rule
@@ -256,7 +203,7 @@ pub(crate) fn eval_sample_token(
     let vocab = logits.len();
     let logits_in = b.slot(Slot::Activation, TensorType::new(vec![vocab], DType::F32));
     let head = sample_head(&b, logits_in, rule);
-    let g = b.finish(head.out);
+    let g = b.finish(head.out).unwrap();
 
     let mut inputs: HashMap<ValueId, Value> = HashMap::new();
     inputs.insert(

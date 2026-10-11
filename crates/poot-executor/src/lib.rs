@@ -21,9 +21,9 @@ pub use coordinator::{
     ScheduleError, SupportActual, SupportPlan,
 };
 pub use device::{
-    Arg, BufferRole, Collectives, Device, DeviceTime, Dispatch, DispatchDeviceTime,
-    MeasuredDeviceTime, MemoryCounterSnapshot, NativeCounters, SupportBound, WeightUpload,
-    write_slice,
+    AieInvocation, Arg, BufferRole, Collectives, Device, DeviceTime, Dispatch, DispatchDeviceTime,
+    LaunchKind, MeasuredDeviceTime, MemoryCounterSnapshot, NativeCounters, SupportBound,
+    WeightUpload, write_slice,
 };
 pub use engine::Engine;
 pub use error::{BindError, DeviceError, ExecError, LoadError};
@@ -309,7 +309,7 @@ pub trait Executor {
     fn add_entry(
         &mut self,
         exe: ExecutableId,
-        program: &StagedProgram<poot_graph_ir::ValidationOutputs>,
+        program: &StagedProgram,
     ) -> Result<EntryId, ExecError>;
     /// Binds `inputs`, replays the entry's recording (recording it first if this is its first step),
     /// and checks the validation packet before any output readback (R472-006).

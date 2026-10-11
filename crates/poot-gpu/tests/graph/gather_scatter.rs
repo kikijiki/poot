@@ -29,7 +29,7 @@ fn scatter_axis0_gpu_matches_cpu() {
     let idx = b.constant("idx", TensorType::new(vec![n], poot_tensor::DType::I32));
     let out = b.scatter(src, idx);
     let (si, ii) = (src.id(), idx.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let srcd: Vec<f32> = (0..n * rest).map(|i| i as f32 + 1.0).collect();
     let idxd: Vec<i32> = (0..n).map(|j| (n - 1 - j) as i32).collect(); // reverse permutation
@@ -84,7 +84,7 @@ fn arg_top_k_gpu_matches_cpu() {
     let rank = b.constant("rank", TensorType::f32(vec![l, e]));
     let out = b.arg_top_k(rank, k);
     let ri = rank.id();
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     // rank[row,i] = (i*7 + row*3) % e: a permutation of 0..e per row (gcd(7,e)=1 for e=16), with a
     // distinct per-row shift so the L rows are not all the same permutation (batching over leading dims
@@ -141,9 +141,9 @@ fn gather_nonaxis0_gpu_matches_cpu() {
         let idx = b.constant("idx", TensorType::new(vec![2], poot_tensor::DType::I32));
         let out = b.gather(data, 1, idx);
         let (di, ii) = (data.id(), idx.id());
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         let eqn = g
-            .eqns
+            .eqns()
             .iter()
             .find(|e| matches!(e.op, OpKind::Gather { .. }))
             .unwrap();
@@ -203,9 +203,9 @@ fn gather_nonaxis0_gpu_matches_cpu() {
         let idx = b.constant("idx", TensorType::new(vec![], poot_tensor::DType::I32));
         let out = b.gather(data, 2, idx);
         let (di, ii) = (data.id(), idx.id());
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         let eqn = g
-            .eqns
+            .eqns()
             .iter()
             .find(|e| matches!(e.op, OpKind::Gather { .. }))
             .unwrap();
@@ -272,9 +272,9 @@ fn gather_nonaxis0_plan_selection() {
         let data = b.constant("data", TensorType::new(vec![3, 4, 5], dt));
         let idx = b.constant("idx", TensorType::new(vec![2], poot_tensor::DType::I32));
         let out = b.gather(data, 1, idx); // axis 1: inner = 5, axis_len = 4
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         let eqn = g
-            .eqns
+            .eqns()
             .iter()
             .find(|e| matches!(e.op, OpKind::Gather { .. }))
             .unwrap();
@@ -359,7 +359,7 @@ fn gather_nonaxis0_gpu_matches_cpu_over_random_shapes() {
         );
         let out = b.gather(data, axis, idx);
         let (di, ii) = (data.id(), idx.id());
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         let mut inputs = HashMap::new();
         inputs.insert(di, HostTensor::f32(dims.clone(), datad));
         inputs.insert(ii, HostTensor::i32(vec![idx_size], idxd));
@@ -400,7 +400,7 @@ fn scatter_update_gpu_matches_cpu() {
     let inv = b.constant("inv", TensorType::new(vec![pool], poot_tensor::DType::I32));
     let out = b.scatter_update(base, src, inv);
     let (bi, si, ii) = (base.id(), src.id(), inv.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let based: Vec<f32> = (0..pool * rest).map(|i| 100.0 + i as f32).collect();
     let srcd: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
@@ -453,9 +453,9 @@ fn gather_axis0_plan_selection() {
         let data = b.constant("data", dt);
         let idx = b.constant("idx", TensorType::new(vec![3], poot_tensor::DType::I32));
         let out = b.gather(data, 0, idx);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         let eqn = g
-            .eqns
+            .eqns()
             .iter()
             .find(|e| matches!(e.op, OpKind::Gather { axis: 0 }))
             .unwrap();
@@ -501,9 +501,9 @@ fn scatter_update_plan_selection() {
         let src = b.constant("src", TensorType::new(vec![2, 3], dt));
         let inv = b.constant("inv", TensorType::new(vec![4], poot_tensor::DType::I32));
         let out = b.scatter_update(base, src, inv);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         let eqn = g
-            .eqns
+            .eqns()
             .iter()
             .find(|e| matches!(e.op, OpKind::ScatterUpdate))
             .unwrap();
@@ -544,9 +544,9 @@ fn scatter_axis0_plan_selection() {
         let src = b.constant("src", dt);
         let idx = b.constant("idx", TensorType::new(vec![4], poot_tensor::DType::I32));
         let out = b.scatter(src, idx);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         let eqn = g
-            .eqns
+            .eqns()
             .iter()
             .find(|e| matches!(e.op, OpKind::Scatter { axis: 0 }))
             .unwrap();
@@ -590,8 +590,8 @@ fn index_remap_layout_plan_selection() {
                    backend| {
         let b = Builder::new();
         let out = build(&b);
-        let g = b.finish(out);
-        let eqn = g.eqns.iter().find(|e| want(&e.op)).unwrap();
+        let g = b.finish(out).unwrap();
+        let eqn = g.eqns().iter().find(|e| want(&e.op)).unwrap();
         plan_eqn_with_choice(
             &g,
             eqn,
@@ -767,9 +767,9 @@ fn gather_composition_gpu_matches_cpu_over_random_graphs() {
         if had_chain {
             chained_gathers += 1;
         }
-        let g = b.finish(acc);
-        let fg = fuse(&cse(&g));
-        if fg.eqns.len() < g.eqns.len() {
+        let g = b.finish(acc).unwrap();
+        let fg = fuse(&cse(&g).unwrap()).unwrap();
+        if fg.eqns().len() < g.eqns().len() {
             fused_total += 1;
         }
         let eval_inputs: HashMap<_, Value> = inputs
@@ -794,8 +794,8 @@ fn gather_composition_gpu_matches_cpu_over_random_graphs() {
             assert!(
                 (a - c).abs() <= tol,
                 "seed {seed} elem {i}: fused-gpu {a} vs cpu {c} ({} -> {} eqns)",
-                g.eqns.len(),
-                fg.eqns.len()
+                g.eqns().len(),
+                fg.eqns().len()
             );
         }
     }
@@ -907,9 +907,9 @@ fn scatter_composition_gpu_matches_cpu_over_random_graphs() {
         if did_scatter {
             scattered += 1;
         }
-        let g = b.finish(acc);
-        let fg = fuse(&cse(&g));
-        if fg.eqns.len() < g.eqns.len() {
+        let g = b.finish(acc).unwrap();
+        let fg = fuse(&cse(&g).unwrap()).unwrap();
+        if fg.eqns().len() < g.eqns().len() {
             fused_total += 1;
         }
         let eval_inputs: HashMap<_, Value> = inputs
@@ -934,8 +934,8 @@ fn scatter_composition_gpu_matches_cpu_over_random_graphs() {
             assert!(
                 (a - c).abs() <= tol,
                 "seed {seed} elem {i}: fused-gpu {a} vs cpu {c} ({} -> {} eqns)",
-                g.eqns.len(),
-                fg.eqns.len()
+                g.eqns().len(),
+                fg.eqns().len()
             );
         }
     }
@@ -982,7 +982,7 @@ fn i32_slot_gather_variants_compiled_match_cpu_bit_exact() {
     // priming entry writes the seed into that shared, name-keyed state buffer first (Z5: two entries on
     // one executable share state by name) before the real variant's entry reads it.
     run_all("wgpu", |variant| {
-        // `compile()` (not `staged_replay`'s own `compile_staged`) so `graph` stays `Graph<NoValidations>`,
+        // `compile()` (not `staged_replay`'s own `compile_staged`) so `graph` stays `Graph`,
         // matching `variant.inputs`'s signature; `staged_replay` below compiles it a second time into a
         // `StagedProgram` for the engine, mirroring `legalize.rs`'s already-landed split test (compile
         // once to inspect/bind, `run_via_contract`/`staged_replay` compiles again to execute).
@@ -999,7 +999,7 @@ fn i32_slot_gather_variants_compiled_match_cpu_bit_exact() {
         let mut slots = StepInputs::new();
         let mut slot_bytes: Vec<(poot_graph_ir::SlotKey, Vec<usize>, DType, Vec<u8>)> = Vec::new();
         let mut state_seed: Option<(String, Vec<usize>)> = None;
-        for &id in &graph.inputs {
+        for &id in graph.inputs() {
             let meta = graph.meta(id);
             let Some(Value::Host(t)) = bound.get(&id) else {
                 return Err(format!("{id:?}: expected a dense input"));
@@ -1077,7 +1077,10 @@ fn i32_slot_gather_variants_compiled_match_cpu_bit_exact() {
             let b = Builder::new();
             let seed = b.constant(&format!("{name}.seed"), TensorType::f32(shape.clone()));
             let cache = b.state_input(name, TensorType::f32(shape.clone()), StateRole::Recurrent);
-            weights.graph(&b.finish_with_state(seed, &[(cache, seed)]))
+            weights.graph(
+                &b.finish(poot_graph_ir::Outputs::new(seed).with_state(&[(cache, seed)]))
+                    .unwrap(),
+            )
         });
         let map = Arc::new(weights.map());
         let exe = gpu
@@ -1112,7 +1115,7 @@ fn i32_slot_gather_variants_compiled_match_cpu_bit_exact() {
             .map_err(|e| format!("remove_entry: {e}"))?;
         gpu.unload(exe).map_err(|e| format!("unload: {e}"))?;
 
-        let out = graph.aval(graph.output);
+        let out = graph.aval(graph.result());
         Ok(HostTensor::f32(
             out.shape.clone(),
             bytes

@@ -1,0 +1,132 @@
+{
+  "backend": "wgpu",
+  "binary": "/home/kikijiki/.cache/poot-cargo-target/release/examples/performance_bank",
+  "case": "attention-low-head-decode-live-short",
+  "cells": {
+    "kernel": {
+      "repeats": [
+        {
+          "metrics": {
+            "step_us": 206.927
+          },
+          "slot": 0,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 248.96599999999998
+          },
+          "slot": 1,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 203.571
+          },
+          "slot": 2,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 201.997
+          },
+          "slot": 3,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 206.36499999999998
+          },
+          "slot": 4,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 194.263
+          },
+          "slot": 5,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 203.23
+          },
+          "slot": 6,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 201.577
+          },
+          "slot": 7,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 201.637
+          },
+          "slot": 8,
+          "status": "ok"
+        }
+      ]
+    }
+  },
+  "hardware": {
+    "backend": "wgpu",
+    "device": "AMD Radeon 8060S Graphics",
+    "driver": "host kernel 7.2.9"
+  },
+  "memory": [
+    {
+      "live_bytes": 33555456,
+      "peak_bytes": 33555456,
+      "role": "Weight"
+    },
+    {
+      "live_bytes": 148740,
+      "peak_bytes": 148740,
+      "role": "Activation"
+    },
+    {
+      "live_bytes": 262148,
+      "peak_bytes": 262148,
+      "role": "Input"
+    },
+    {
+      "live_bytes": 68,
+      "peak_bytes": 1092,
+      "role": "Staging"
+    }
+  ],
+  "observed": {
+    "layout": "bhsd",
+    "shape": {
+      "cap": 32768,
+      "d": 128,
+      "hkv": 1,
+      "hq": 2,
+      "live": 1024
+    },
+    "storage": "f32",
+    "weight_bytes_per_copy": 33554432,
+    "weight_copies": 1
+  },
+  "plan": [
+    "pointwise [cfcf7972dfbe67cd3365ab4e284961c6c1d3ef73a2231527efb5d8a9ac1cf3dd]",
+    "pointwise [0263a96514a041ac87fee222ecc5ef780a6973c1a8a589a3a7f0ea4840403e12]",
+    "attention [a8e47198ebda3c828e68008937b33f00a7deb24a714edf5aab34a9ee801f42fe]",
+    "attention_combine [f6e7be4dc6536291db2eb7fc8ef150860c0413f59422ef020abcf347f4d0dc3a]"
+  ],
+  "plan_id": "dd5d46be2e9b6f4c8d909c547124793134c85a640da5606466b0184a262042c0",
+  "recordings": 1,
+  "reference": {
+    "agrees": true,
+    "max_relative_error": 1.1557628961054546e-8,
+    "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
+    "provenance": "independent-golden",
+    "tolerance": 0.002
+  },
+  "replays": 13,
+  "role": "baseline",
+  "schema": 1
+}

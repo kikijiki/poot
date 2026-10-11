@@ -1,0 +1,113 @@
+{
+  "card": "POOT-1113",
+  "candidate": "split-KV decode attention (scratch contract + SplitKv schedule + planner rule)",
+  "policy": {
+    "direction": "lower",
+    "practical_threshold": 0.2,
+    "max_uncertainty": 0.1
+  },
+  "entries": [
+    {
+      "backend": "wgpu",
+      "case": "attention-low-head-decode",
+      "verdict": "unverified",
+      "baseline_median_us": 527.237,
+      "candidate_median_us": 116.699,
+      "baseline_range_us": 396.6329999999999,
+      "candidate_range_us": 228.03699999999998,
+      "speedup": 4.51792217585412,
+      "samples_per_side": [
+        27,
+        27
+      ],
+      "plan_ids_differ": true,
+      "note": "band 150.5% exceeds the tolerated uncertainty 10.0%; the repeat budget is exhausted",
+      "reference_agrees": true
+    },
+    {
+      "backend": "wgpu",
+      "case": "attention-low-head-decode-live-full",
+      "verdict": "improvement",
+      "baseline_median_us": 4193.831,
+      "candidate_median_us": 356.616,
+      "baseline_range_us": 1493.932999999999,
+      "candidate_range_us": 219.54000000000002,
+      "speedup": 11.76007526302802,
+      "samples_per_side": [
+        27,
+        27
+      ],
+      "plan_ids_differ": true,
+      "note": "",
+      "reference_agrees": true
+    },
+    {
+      "backend": "wgpu",
+      "case": "attention-low-head-decode-live-short",
+      "verdict": "unverified",
+      "baseline_median_us": 200.024,
+      "candidate_median_us": 201.307,
+      "baseline_range_us": 257.642,
+      "candidate_range_us": 56.52699999999999,
+      "speedup": 0.9936266498432743,
+      "samples_per_side": [
+        27,
+        27
+      ],
+      "plan_ids_differ": true,
+      "note": "band 257.6% exceeds the tolerated uncertainty 10.0%; the repeat budget is exhausted",
+      "reference_agrees": true
+    },
+    {
+      "backend": "rocm",
+      "case": "attention-low-head-decode",
+      "verdict": "improvement",
+      "baseline_median_us": 232.966,
+      "candidate_median_us": 46.887,
+      "baseline_range_us": 12.443000000000012,
+      "candidate_range_us": 21.972,
+      "speedup": 4.968669353978715,
+      "samples_per_side": [
+        27,
+        27
+      ],
+      "plan_ids_differ": true,
+      "note": "",
+      "reference_agrees": true
+    },
+    {
+      "backend": "rocm",
+      "case": "attention-low-head-decode-live-full",
+      "verdict": "improvement",
+      "baseline_median_us": 1910.883,
+      "candidate_median_us": 162.193,
+      "baseline_range_us": 98.36400000000026,
+      "candidate_range_us": 19.325999999999993,
+      "speedup": 11.78153804418193,
+      "samples_per_side": [
+        27,
+        27
+      ],
+      "plan_ids_differ": true,
+      "note": "",
+      "reference_agrees": true
+    },
+    {
+      "backend": "rocm",
+      "case": "attention-low-head-decode-live-short",
+      "verdict": "unverified",
+      "baseline_median_us": 91.941,
+      "candidate_median_us": 90.78,
+      "baseline_range_us": 76.31300000000002,
+      "candidate_range_us": 38.301,
+      "speedup": 1.0127891606080635,
+      "samples_per_side": [
+        27,
+        27
+      ],
+      "plan_ids_differ": true,
+      "note": "band 166.0% exceeds the tolerated uncertainty 10.0%; the repeat budget is exhausted",
+      "reference_agrees": true
+    }
+  ]
+}

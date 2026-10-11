@@ -16,7 +16,7 @@ use poot_executor::{
     BufferRole, Device, Dispatch, Engine, EntryId, ExecutableId, Executor, ExecutorStats,
     MemoryCounterSnapshot, NoSync, StepInputs,
 };
-use poot_executor_parity::dense::{Dense, Family, plain, step};
+use poot_executor_parity::dense::{Dense, Family, step};
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::op::{BinOp, RedOp, SampleRule};
 use poot_graph_ir::ops::sampling::sample_head;
@@ -50,11 +50,9 @@ fn qwen2_graph(phase: Phase, tokens: usize) -> Graph {
         .head_dim(4)
         .max_positions(16)
         .f32_model();
-    plain(
-        m.model
-            .trace(phase, step(1, tokens, CAP, LogitRows::Last))
-            .unwrap(),
-    )
+    m.model
+        .trace(phase, step(1, tokens, CAP, LogitRows::Last))
+        .unwrap()
 }
 
 fn prefill_graph(n: usize) -> Graph {
@@ -94,7 +92,7 @@ fn const_data(name: &str, shape: &[usize]) -> Vec<f32> {
 fn store_for(graphs: &[&Graph]) -> WeightStore {
     let mut entries: HashMap<String, Vec<usize>> = HashMap::new();
     for g in graphs {
-        for &id in &g.inputs {
+        for &id in g.inputs() {
             let meta = g.meta(id);
             if meta.storage == Storage::Const {
                 entries.insert(meta.name.clone().unwrap(), meta.aval.shape.clone());
@@ -118,12 +116,8 @@ fn map_source(weights: ConstWeights<'_>) -> Arc<poot_quant::weights::WeightMap> 
     Arc::new(weights.map())
 }
 
-fn staged(
-    g: &Graph,
-    target: Target,
-    submission: Submission,
-) -> poot_graph_plan::StagedProgram<poot_graph_ir::ValidationOutputs> {
-    let g = g.clone().with_validations(Vec::new());
+fn staged(g: &Graph, target: Target, submission: Submission) -> poot_graph_plan::StagedProgram {
+    let g = g.clone();
     compile_staged(
         &g,
         &TargetSet::single(DeviceId(0), target),
@@ -145,7 +139,7 @@ struct SlotValue {
 }
 
 fn slot_values(g: &Graph, tokens: &[u32], start: usize) -> Vec<SlotValue> {
-    g.inputs
+    g.inputs()
         .iter()
         .filter_map(|&id| {
             let meta = g.meta(id);
@@ -202,7 +196,7 @@ fn oracle_step(
     state: &mut HashMap<String, HostTensor>,
 ) -> Vec<f32> {
     let mut inputs: HashMap<ValueId, Value> = HashMap::new();
-    for &id in &g.inputs {
+    for &id in g.inputs() {
         let meta = g.meta(id);
         let value = match meta.storage {
             Storage::Const => {
@@ -233,7 +227,7 @@ fn oracle_step(
         inputs.insert(id, value);
     }
     let evaluation = eval(g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap();
-    for (&(si, _), t) in g.state.iter().zip(evaluation.state) {
+    for ((si, _), t) in g.state().zip(evaluation.state) {
         state.insert(
             g.meta(si).name.clone().unwrap(),
             t.into_host().expect("dense state tensor"),
@@ -369,7 +363,7 @@ fn sc002_parity_suite_has_real_per_op_bite_ptx() {
         let c = b.constant("c", TensorType::f32(vec![n]));
         let out = b.binary(BinOp::Add, a, c);
         let (ai, ci) = (a.id(), c.id());
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         let inputs = make_inputs(&[(ai, vec![n], fill(n, 701)), (ci, vec![n], fill(n, 702))]);
         let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
             .unwrap()
@@ -392,7 +386,7 @@ fn sc002_parity_suite_has_real_per_op_bite_ptx() {
         let w = b.constant("w", TensorType::f32(vec![k, n]));
         let out = b.matmul(a, w);
         let (ai, wi) = (a.id(), w.id());
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         let inputs = make_inputs(&[
             (ai, vec![m, k], fill(m * k, 703)),
             (wi, vec![k, n], fill(k * n, 704)),
@@ -417,7 +411,7 @@ fn sc002_parity_suite_has_real_per_op_bite_ptx() {
         let x = b.constant("x", TensorType::f32(vec![rows, cols]));
         let out = b.reduce(RedOp::Sum, x, 1, false);
         let xi = x.id();
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         let inputs = make_inputs(&[(xi, vec![rows, cols], fill(rows * cols, 705))]);
         let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
             .unwrap()
@@ -546,8 +540,7 @@ impl Device for FaultyOnceDevice {
                 buffer: d.output.buffer,
                 elems: d.output.elems,
             },
-            threads: d.threads,
-            workgroup: d.workgroup,
+            launch: d.launch,
             work: d.work,
         })
     }
@@ -702,8 +695,7 @@ impl Device for FaultyOnceSyncDevice {
                 buffer: d.output.buffer,
                 elems: d.output.elems,
             },
-            threads: d.threads,
-            workgroup: d.workgroup,
+            launch: d.launch,
             work: d.work,
         })
     }
@@ -896,7 +888,7 @@ fn card551b_suffix_graph(rule: SampleRule) -> (Graph, Graph, ValueId, ValueId) {
     let base = decode_graph();
     let base_for_slots = base.clone();
     let resumed = Builder::resume(base);
-    let sh = sample_head(&resumed.builder, resumed.out, rule);
+    let sh = sample_head(&resumed.builder, resumed.outputs.result, rule);
     let seed_id = sh
         .seed
         .expect("a non-Greedy rule declares a seed slot")
@@ -905,7 +897,10 @@ fn card551b_suffix_graph(rule: SampleRule) -> (Graph, Graph, ValueId, ValueId) {
         .params
         .expect("a non-Greedy rule declares a params slot")
         .id();
-    let g = resumed.builder.finish_with_state(sh.out, &resumed.state);
+    let g = resumed
+        .builder
+        .finish(poot_graph_ir::Outputs::new(sh.out).with_state(&resumed.outputs.state))
+        .unwrap();
     (base_for_slots, g, seed_id, params_id)
 }
 
@@ -1027,12 +1022,15 @@ fn card551b_sc003_nan_logits_are_a_typed_fault_ptx() {
         let base = decode_graph();
         let base_for_slots = base.clone();
         let resumed = Builder::resume(base);
-        let sh = sample_head(&resumed.builder, resumed.out, rule);
+        let sh = sample_head(&resumed.builder, resumed.outputs.result, rule);
         let (seed_id, params_id) = (sh.seed.map(|t| t.id()), sh.params.map(|t| t.id()));
-        let suffix_g = resumed.builder.finish_with_state(sh.out, &resumed.state);
+        let suffix_g = resumed
+            .builder
+            .finish(poot_graph_ir::Outputs::new(sh.out).with_state(&resumed.outputs.state))
+            .unwrap();
 
         let mut entries: HashMap<String, Vec<usize>> = HashMap::new();
-        for &id in &suffix_g.inputs {
+        for &id in suffix_g.inputs() {
             let meta = suffix_g.meta(id);
             if meta.storage == Storage::Const {
                 entries.insert(meta.name.clone().unwrap(), meta.aval.shape.clone());

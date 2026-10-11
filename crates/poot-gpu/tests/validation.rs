@@ -12,7 +12,7 @@ use poot_executor::{Device, ExecError, Executor, HostView, NoSync, StepInputs};
 use poot_gpu::device::WgpuDevice;
 use poot_graph_ir::{
     BinOp, Builder, ExecutionValidationFailure, Graph, Scalar, Slot, SlotKey, StateRole,
-    TensorType, Traced, UnOp, ValidationId, ValidationOutputs, ValidationPacketError, ValueId,
+    TensorType, Traced, UnOp, ValidationId, ValidationPacketError, ValueId,
 };
 use poot_graph_plan::{
     CompileError, CompileOptions, DeviceId, DevicePlacement, DeviceWitnessRejection,
@@ -30,11 +30,11 @@ fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
     GPU.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Compile `g` (already `Graph<ValidationOutputs>`-typed, its own validations intact - unlike this
+/// Compile `g` (already `Graph`-typed, its own validations intact - unlike this
 /// file's other migrated helpers, this one must NOT route through a `with_validations(Vec::new())`
 /// type-coercion step, which would silently strip the very validations under test) for `target` with
 /// `Submission::Replay` (Card 546b: the contract admits no other submission).
-fn staged(g: &Graph<ValidationOutputs>, target: Target) -> StagedProgram<ValidationOutputs> {
+fn staged(g: &Graph, target: Target) -> StagedProgram {
     compile_staged(
         g,
         &TargetSet::single(DeviceId(0), target),
@@ -81,12 +81,12 @@ fn step_inputs(binds: &[SlotBind]) -> StepInputs<'_> {
 /// migrated test files (`Storage::Const` -> a named [`WeightStore`] entry, `Storage::Slot` -> a
 /// [`StepInputs`] row); `Storage::State` is left for the contract to zero-seed on first use.
 fn split_consts_and_slots(
-    g: &Graph<ValidationOutputs>,
+    g: &Graph,
     inputs: &HashMap<ValueId, Value>,
 ) -> (WeightStore, Vec<SlotBind>) {
     let mut builder = WeightStore::builder();
     let mut slots = Vec::new();
-    for &id in &g.inputs {
+    for &id in g.inputs() {
         let m = g.meta(id);
         match m.storage {
             poot_graph_ir::Storage::Const => {
@@ -169,10 +169,7 @@ fn finite_input() -> Vec<f32> {
     vec![0.5, -1.25, 2.0, 3.0, -0.0, 1.0e-3, 7.0, -8.5]
 }
 
-fn cpu_failure(
-    graph: &Graph<ValidationOutputs>,
-    inputs: &HashMap<ValueId, Value>,
-) -> ExecutionValidationFailure {
+fn cpu_failure(graph: &Graph, inputs: &HashMap<ValueId, Value>) -> ExecutionValidationFailure {
     match poot_eval::eval(graph, inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).map(|e| e.output)
     {
         Err(EvalError::Validation(failure)) => failure,
@@ -384,7 +381,7 @@ fn wgpu_validation_prefill_refuses_noncanonical_witness_at_compile_staged() {
 /// A graph whose sole output IS one named state value: a production entry an `Executor` steps like any
 /// other, which happens to let the test read a state buffer through its real step output (same pattern
 /// as `executor_contract.rs`'s `state_probe_graph` - no `read_state` accessor exists).
-fn state_probe_graph(name: &str, aval: TensorType) -> Graph<ValidationOutputs> {
+fn state_probe_graph(name: &str, aval: TensorType) -> Graph {
     let b = Builder::new();
     let state = b.state_input(name, aval, StateRole::Recurrent);
     poot_test_util::graph_fixtures::finish_with_state_and_validations(

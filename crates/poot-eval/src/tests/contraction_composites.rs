@@ -436,7 +436,7 @@ fn packed_contraction(
     plan.declare_result(output).expect("declare the result");
     let mut prepared = b.preflight_append(plan).expect("preflight the append");
     let out = b.commit_append(&mut prepared).expect("commit the append");
-    (b.finish(out), inputs)
+    (b.finish(out).unwrap(), inputs)
 }
 
 fn payload_of(case: &Case) -> Arc<PackedPayload> {
@@ -568,7 +568,7 @@ fn dense_contraction(weight: HostTensor) -> (Graph, HashMap<ValueId, Value>) {
         (x.id(), Value::Host(activation(&[2, 4]))),
         (w.id(), Value::Host(weight)),
     ]);
-    (b.finish(out), inputs)
+    (b.finish(out).unwrap(), inputs)
 }
 
 fn dense_row_gather(table: HostTensor, ids: Vec<i32>) -> (Graph, HashMap<ValueId, Value>) {
@@ -601,7 +601,7 @@ fn dense_row_gather(table: HostTensor, ids: Vec<i32>) -> (Graph, HashMap<ValueId
             Value::Host(HostTensor::i32(vec![ids.len()], ids)),
         ),
     ]);
-    (b.finish(out), inputs)
+    (b.finish(out).unwrap(), inputs)
 }
 
 /// Every fixture of SC-001 as `(label, graph, inputs)`.
@@ -968,7 +968,7 @@ fn a_grouped_dense_contraction_equals_each_groups_own_block_product() {
     plan.declare_result(output).expect("declare the result");
     let mut prepared = b.preflight_append(plan).expect("preflight the append");
     let out = b.commit_append(&mut prepared).expect("commit the append");
-    let graph = b.finish(out);
+    let graph = b.finish(out).unwrap();
     let inputs = HashMap::from([
         (xs.id(), Value::Host(x.clone())),
         (

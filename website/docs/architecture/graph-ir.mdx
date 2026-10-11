@@ -30,20 +30,27 @@ and rewrites them to a single fused dispatch. A model author composes attention 
 
 ## Graph structure
 
-A simplified view of the main fields:
+A simplified view of the main tables (all private; a `Graph` is read through accessors and changed only
+through a checked edit):
 
 ```rust
 struct Graph {
-    values:  Vec<ValueMeta>,               // shape + dtype + storage class per id
+    values:  ValueTable<ValueMeta>,        // shape + dtype + storage class per id
     inputs:  Vec<ValueId>,                 // all input binders: consts, slots, state
     consts:  Vec<ValueId>,                 // the subset of inputs that are weights/tables
     slots:   Vec<(ValueId, Slot)>,         // per-step inputs and their kind
     eqns:    Vec<Eqn>,                     // topologically ordered SSA equations
-    output:  ValueId,                      // the primary output (logits)
-    state:   Vec<(ValueId, ValueId)>,      // (state_in, state_out) pairs: KV cache donation
-    // plus an optional validation channel
+    outputs: Vec<GraphOutput>,             // one list: the result, witnesses, exports, state next values
 }
 
+enum OutputKind { Result, Witness { .. }, Export(BoundaryId), StateNext { input: ValueId } }
+```
+
+A `Graph` is always well formed: `Builder::finish` and `GraphEdit::commit` check the whole graph. A pass
+opens `graph.edit()`, changes the draft and commits it; a rewrite that loses a witness, an export or a
+carried-state pair, or changes the result's type, is refused with a typed error.
+
+```rust
 struct Eqn {
     op:     OpKind,                        // the operation, with its parameters inline
     inputs: Vec<Operand>,                  // Value(ValueId) or Lit(Scalar)
@@ -69,14 +76,14 @@ Activation tensors such as attention scores, MLP outputs and the residual stream
 
 **`Const`**. A weight or constant tensor (weight matrices, embedding tables, RoPE tables).
 Bound from the input map and uploaded for execution. Weight caches use payload identity and storage
-representation, so reusing a name for different bytes does not reuse the previous weight. `Graph.consts` lists the const binders.
+representation, so reusing a name for different bytes does not reuse the previous weight. `Graph::consts()` lists the const binders.
 
 **`Slot(Slot)`**. A per-step input routed through a stable device buffer that the host
 rewrites in place. The `Slot` kind says what it carries: `Token`, `Pos`, `SlotMap` (paged KV),
 `LoraIdx`, and others. The attention mask is not a slot: it is computed in-graph from `Pos`.
 
 **`State`**. A persistent buffer carried across decode steps: the KV cache. Pre-allocated to
-`cap` capacity per layer. `Graph.state` pairs each `state_in` binder with a `state_out`
+`cap` capacity per layer. `Graph::state()` pairs each `state_in` binder with a `state_out`
 value of identical type. The executor feeds the buffer in and overwrites it with `state_out`
 (the JAX `donate_argnums` contract), which also orders the KV read before the KV write.
 

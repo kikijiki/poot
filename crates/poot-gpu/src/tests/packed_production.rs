@@ -11,7 +11,7 @@ use poot_executor::{Device, Engine, Executor, NoSync, StepInputs};
 use poot_executor_parity::{ConstFixture, run_once};
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::types::{Scalar, TensorType};
-use poot_graph_ir::{Graph, OpKind, Slot, ValidationOutputs};
+use poot_graph_ir::{Graph, OpKind, Slot};
 use poot_graph_plan::{
     CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram,
     Submission, Target, TargetSet, compile_staged,
@@ -38,7 +38,7 @@ fn bytemuck_f32(bytes: &[u8]) -> Vec<f32> {
 
 /// Compile `g` for `target` through the contract's one staged program: single stage, single device,
 /// `Submission::Replay` (the only submission the engine admits, Card 546a).
-fn staged(g: &Graph<ValidationOutputs>, target: Target) -> StagedProgram<ValidationOutputs> {
+fn staged(g: &Graph, target: Target) -> StagedProgram {
     compile_staged(
         g,
         &TargetSet::single(DeviceId(0), target),
@@ -70,7 +70,7 @@ fn packed_linear_case(
     let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![m, k]));
     let y = packed_linear(&b, x, "layer", owner.weight(), None, None)
         .unwrap_or_else(|e| panic!("{format:?} K={k} N={n} M={m}: packed_linear: {e}"));
-    let compiled = b.finish(y).with_validations(Vec::new());
+    let compiled = b.finish(y).unwrap();
     let store = {
         let mut builder = WeightStore::builder();
         builder
@@ -95,7 +95,7 @@ fn packed_linear_case(
     let entry = engine.add_entry(exe, &staged).unwrap();
 
     let x_id = compiled
-        .slots
+        .slots()
         .iter()
         .find(|&&(_, kind)| kind == Slot::Activation)
         .expect("packed_linear declares an activation slot")
@@ -202,7 +202,7 @@ fn wgpu_q6k_gemv_determinism_probe() {
     let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![m, k]));
     let y = packed_linear(&b, x, "layer", owner.weight(), None, None)
         .expect("Q6_K packed_linear at the GEMV shape");
-    let compiled = b.finish(y).with_validations(Vec::new());
+    let compiled = b.finish(y).unwrap();
     let store = {
         let mut builder = WeightStore::builder();
         builder
@@ -217,7 +217,7 @@ fn wgpu_q6k_gemv_determinism_probe() {
     let entry = engine.add_entry(exe, &staged).unwrap();
 
     let x_id = compiled
-        .slots
+        .slots()
         .iter()
         .find(|&&(_, kind)| kind == Slot::Activation)
         .expect("packed_linear declares an activation slot")
@@ -315,7 +315,7 @@ fn packed_kv_read_path_gpu_matches_cpu() {
     let sg = b.gather(scale, 0, idx); // f32 scale gather, same permutation
     let un = b.unpack_i8(pg, cols); // [rows, cols] f32
     let deq = b.binary(BinOp::Mul, un, sg); // dequant: codes * per-row scale (broadcasts over cols)
-    let g = b.finish(deq);
+    let g = b.finish(deq).unwrap();
 
     let xd: Vec<f32> = (0..rows * cols)
         .map(|i| (i as f32 * 0.41).cos() * 6.0 - 1.0)

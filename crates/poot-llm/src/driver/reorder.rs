@@ -11,7 +11,7 @@
 //! whose state row `i` takes. The snapshot and restore entries ([`super::snapshot`]) build on the same
 //! [`row_index`] and [`state_row_gather`], so beam reorder and snapshot cannot drift (R-647-2).
 
-use poot_graph_ir::{Builder, Graph, Slot, SlotKey, TensorType, Traced, ValidationOutputs};
+use poot_graph_ir::{Builder, Graph, Slot, SlotKey, TensorType, Traced};
 use poot_tensor::DType;
 
 /// The tag of the row-index activation slot.
@@ -41,7 +41,7 @@ pub(super) fn state_row_gather(b: &Builder, source: Traced, index: Traced) -> Tr
 /// The reorder graph over `decode`'s state pairs: each state value becomes its own rows gathered by
 /// `row_index`. Panics if `decode` carries no state or a state value has no leading row axis of the
 /// common length; the driver checks the row axis of every state pair before it reorders.
-pub(super) fn reorder_graph(decode: &Graph<ValidationOutputs>) -> Graph<ValidationOutputs> {
+pub(super) fn reorder_graph(decode: &Graph) -> Graph {
     let b = Builder::new();
     let mut pairs = decode.state_pairs().peekable();
     let rows = pairs
@@ -65,6 +65,6 @@ pub(super) fn reorder_graph(decode: &Graph<ValidationOutputs>) -> Graph<Validati
         moved.push((state, state_row_gather(&b, state, index)));
     }
     let (_, out) = moved[0];
-    b.finish_with_state(out, &moved)
-        .with_validations(Vec::new())
+    b.finish(poot_graph_ir::Outputs::new(out).with_state(&moved))
+        .unwrap()
 }

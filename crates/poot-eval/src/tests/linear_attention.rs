@@ -27,7 +27,7 @@ fn attention_matches_direct() {
     let v = b.constant("v", TensorType::f32(vec![1, hkv, s, d]));
     let out = attention(&b, q, k, v, n_rep, scale);
     let (qi, ki, vi) = (q.id(), k.id(), v.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let qd = fill(hq * d, 8);
     let kd = fill(hkv * s * d, 9);
@@ -119,7 +119,7 @@ fn linear_attention_decode_gated_matches_direct() {
         let s = b.constant("s", TensorType::f32(vec![1, hq, dk, dv]));
         let (o, s_out) = linear_attention_decode_gated(&b, q, k, v, n_rep, gate, s);
         let (qi, ki, vi, gi, si) = (q.id(), k.id(), v.id(), gate.id(), s.id());
-        let g = b.finish(if pick_state { s_out } else { o });
+        let g = b.finish(if pick_state { s_out } else { o }).unwrap();
         let mut inputs = HashMap::new();
         inputs.insert(
             qi,
@@ -181,7 +181,7 @@ fn linear_attention_prefill_matches_recurrence() {
     let mask = b.constant("m", TensorType::f32(vec![1, 1, l, l]));
     let o = linear_attention_prefill(&b, q, k, v, n_rep, mask);
     let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
-    let g = b.finish(o);
+    let g = b.finish(o).unwrap();
     let mut inputs = HashMap::new();
     inputs.insert(
         qi,
@@ -253,7 +253,7 @@ fn ut_transform_inverse_reconstructs_identity() {
     let attn_t = b.constant("attn", TensorType::f32(vec![c, c]));
     let t = unit_lower_triangular_inverse(&b, attn_t);
     assert_eq!(b.aval(t).shape, vec![c, c], "T keeps the [C,C] shape");
-    let g = b.finish(t);
+    let g = b.finish(t).unwrap();
     let mut inputs = HashMap::new();
     inputs.insert(
         attn_t.id(),
@@ -323,7 +323,7 @@ fn ut_transform_inverse_reconstructs_identity_c64() {
     let b = Builder::new();
     let attn_t = b.constant("attn", TensorType::f32(vec![c, c]));
     let t = unit_lower_triangular_inverse(&b, attn_t);
-    let g = b.finish(t);
+    let g = b.finish(t).unwrap();
     let mut inputs = HashMap::new();
     inputs.insert(
         attn_t.id(),
@@ -390,7 +390,7 @@ fn ut_transform_inverse_matches_forward_substitution_under_adversarial_input() {
     let b = Builder::new();
     let attn_t = b.constant("attn", TensorType::f32(vec![c, c]));
     let t = unit_lower_triangular_inverse(&b, attn_t);
-    let g = b.finish(t);
+    let g = b.finish(t).unwrap();
     let mut inputs = HashMap::new();
     inputs.insert(
         attn_t.id(),
@@ -445,7 +445,7 @@ fn ut_transform_inverse_reconstructs_identity_batched() {
     let attn_t = b.constant("attn", TensorType::f32(vec![h, c, c]));
     let t = unit_lower_triangular_inverse(&b, attn_t);
     assert_eq!(b.aval(t).shape, vec![h, c, c]);
-    let g = b.finish(t);
+    let g = b.finish(t).unwrap();
     let mut inputs = HashMap::new();
     inputs.insert(
         attn_t.id(),
@@ -556,7 +556,9 @@ fn check_gdn_prefill_chunked_matches_decode_ex(
         StateRole::Recurrent,
     );
     let (o, s_out) = gated_delta_net_decode(&db, q_in, k_in, v_in, g_in, bt_in, ds_in);
-    let dg = db.finish_with_state(o, &[(ds_in, s_out)]);
+    let dg = db
+        .finish(poot_graph_ir::Outputs::new(o).with_state(&[(ds_in, s_out)]))
+        .unwrap();
 
     let mut state = HostTensor::f32(vec![1, h_v, d, d], s0.clone());
     let mut want_o = vec![0.0f32; h_v * l * d];
@@ -671,7 +673,9 @@ fn check_gdn_prefill_chunked_matches_decode_ex(
         vec![1, h_v, d, d],
         "gdn_prefill_chunked state shape [1,H_v,D,D]"
     );
-    let cgraph = cb.finish_with_state(co, &[(cs_in, cs_out)]);
+    let cgraph = cb
+        .finish(poot_graph_ir::Outputs::new(co).with_state(&[(cs_in, cs_out)]))
+        .unwrap();
 
     let mut cinp = HashMap::new();
     cinp.insert(
@@ -847,7 +851,9 @@ fn gdn_prefill_chunked_decay_magnitude_sweep_real_dims() {
     let cti = cb.constant("tril_incl", TensorType::f32(vec![1, 1, c, c]));
     let cts = cb.constant("tril_strict", TensorType::f32(vec![1, 1, c, c]));
     let (co, cs_out) = gdn_prefill_chunked(&cb, cq, ck, cv, cg, cbeta, cs_in, cti, cts, c);
-    let cgraph = cb.finish_with_state(co, &[(cs_in, cs_out)]);
+    let cgraph = cb
+        .finish(poot_graph_ir::Outputs::new(co).with_state(&[(cs_in, cs_out)]))
+        .unwrap();
 
     // Sequential decode-recurrence reference graph (single step, H_v heads).
     let db = Builder::new();
@@ -862,7 +868,9 @@ fn gdn_prefill_chunked_decay_magnitude_sweep_real_dims() {
         StateRole::Recurrent,
     );
     let (o, s_out) = gated_delta_net_decode(&db, q_in, k_in, v_in, g_in, bt_in, ds_in);
-    let dg = db.finish_with_state(o, &[(ds_in, s_out)]);
+    let dg = db
+        .finish(poot_graph_ir::Outputs::new(o).with_state(&[(ds_in, s_out)]))
+        .unwrap();
 
     eprintln!(
         "=== gdn_prefill_chunked vs sequential recurrence, REAL dims (H_v=32,D=128,C=64,L=115) ==="
@@ -1089,7 +1097,9 @@ fn gdn_decode_continuation_one_level(
     let cti = cb.constant("tril_incl", TensorType::f32(vec![1, 1, c, c]));
     let cts = cb.constant("tril_strict", TensorType::f32(vec![1, 1, c, c]));
     let (_co, cs_out) = gdn_prefill_chunked(&cb, cq, ck, cv, cg, cbeta, cs_in, cti, cts, c);
-    let cgraph = cb.finish_with_state(_co, &[(cs_in, cs_out)]);
+    let cgraph = cb
+        .finish(poot_graph_ir::Outputs::new(_co).with_state(&[(cs_in, cs_out)]))
+        .unwrap();
     let mut cinp = HashMap::new();
     cinp.insert(
         cq.id(),
@@ -1154,7 +1164,9 @@ fn gdn_decode_continuation_one_level(
         StateRole::Recurrent,
     );
     let (o, s_out) = gated_delta_net_decode(&db, q_in, k_in, v_in, g_in, bt_in, ds_in);
-    let dg = db.finish_with_state(o, &[(ds_in, s_out)]);
+    let dg = db
+        .finish(poot_graph_ir::Outputs::new(o).with_state(&[(ds_in, s_out)]))
+        .unwrap();
 
     let step = |state: &HostTensor,
                 qt: Vec<f32>,
@@ -1309,7 +1321,7 @@ fn cumulative_log_decay_scan_at_least_as_precise_as_matmul_cumsum() {
     let mg = mb.constant("g", TensorType::f32(vec![1, hv, c, 1]));
     let mt = mb.constant("ti", TensorType::f32(vec![1, 1, c, c]));
     let mcum = mb.matmul(mt, mg);
-    let mgraph = mb.finish(mcum);
+    let mgraph = mb.finish(mcum).unwrap();
     let mut minp = HashMap::new();
     minp.insert(
         mg.id(),
@@ -1326,7 +1338,7 @@ fn cumulative_log_decay_scan_at_least_as_precise_as_matmul_cumsum() {
     let sb = Builder::new();
     let sg = sb.constant("g", TensorType::f32(vec![1, hv, c, 1]));
     let scum = poot_graph_ir::ops::cumulative_log_decay_scan(&sb, sg, c);
-    let sgraph = sb.finish(scum);
+    let sgraph = sb.finish(scum).unwrap();
     let mut sinp = HashMap::new();
     sinp.insert(
         sg.id(),
@@ -1426,7 +1438,9 @@ fn gdn_prefill_chunked_matches_decode_at_extreme_within_chunk_decay_step() {
     let cti = cb.constant("ti", TensorType::f32(vec![1, 1, c, c]));
     let cts = cb.constant("ts", TensorType::f32(vec![1, 1, c, c]));
     let (co, cso) = gdn_prefill_chunked(&cb, cq, ck, cv, cg, cbeta, cs, cti, cts, c);
-    let cgraph = cb.finish_with_state(co, &[(cs, cso)]);
+    let cgraph = cb
+        .finish(poot_graph_ir::Outputs::new(co).with_state(&[(cs, cso)]))
+        .unwrap();
     let mut cin = HashMap::new();
     cin.insert(
         cq.id(),
@@ -1483,7 +1497,9 @@ fn gdn_prefill_chunked_matches_decode_at_extreme_within_chunk_decay_step() {
         StateRole::Recurrent,
     );
     let (o, s_out) = gated_delta_net_decode(&db, q_in, k_in, v_in, g_in, bt_in, ds_in);
-    let dg = db.finish_with_state(o, &[(ds_in, s_out)]);
+    let dg = db
+        .finish(poot_graph_ir::Outputs::new(o).with_state(&[(ds_in, s_out)]))
+        .unwrap();
     let mut state = HostTensor::f32(vec![1, h_v, d, d], s0.clone());
     let mut want_o = vec![0.0f32; l * d];
     for t in 0..l {
@@ -1568,7 +1584,7 @@ fn causal_conv1d_prefill_vs_decode_real_dims() {
     let px = pb.constant("x", TensorType::f32(vec![1, l, conv_dim]));
     let pw = pb.constant("w", TensorType::f32(vec![k, conv_dim]));
     let po = causal_conv1d_prefill(&pb, px, pw, k);
-    let pg = pb.finish(po);
+    let pg = pb.finish(po).unwrap();
     let mut pin = HashMap::new();
     pin.insert(
         px.id(),
@@ -1595,7 +1611,9 @@ fn causal_conv1d_prefill_vs_decode_real_dims() {
         StateRole::Recurrent,
     );
     let (dout, dcout) = causal_conv1d_decode(&db, dx, dw, dc, k);
-    let dgg = db.finish_with_state(dout, &[(dc, dcout)]);
+    let dgg = db
+        .finish(poot_graph_ir::Outputs::new(dout).with_state(&[(dc, dcout)]))
+        .unwrap();
     let mut cache = HostTensor::f32(vec![1, k - 1, conv_dim], vec![0.0f32; (k - 1) * conv_dim]);
     let mut want = vec![0.0f32; l * conv_dim];
     for t in 0..l {
@@ -1667,7 +1685,7 @@ fn linear_attention_prefill_per_head_gate_matches_recurrence() {
     let mask = b.constant("m", TensorType::f32(vec![1, hq, l, l])); // PER-HEAD mask (not broadcast)
     let o = linear_attention_prefill(&b, q, k, v, n_rep, mask);
     let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
-    let g = b.finish(o);
+    let g = b.finish(o).unwrap();
     let mut inputs = HashMap::new();
     inputs.insert(
         qi,
@@ -1724,7 +1742,7 @@ fn reduce_over_non_last_axis_keepdim_is_correct() {
     let bld = Builder::new();
     let x = bld.constant("x", TensorType::f32(vec![a, b_, c]));
     let r = bld.reduce(RedOp::Sum, x, 1, true); // [a,1,c]
-    let g = bld.finish(r);
+    let g = bld.finish(r).unwrap();
     let mut inp = HashMap::new();
     inp.insert(
         x.id(),
@@ -1765,7 +1783,9 @@ fn causal_conv1d_decode_loop_matches_reference() {
         StateRole::Recurrent,
     );
     let (out, new_cache) = causal_conv1d_decode(&b, x, w, cache, k);
-    let g = b.finish_with_state(out, &[(cache, new_cache)]);
+    let g = b
+        .finish(poot_graph_ir::Outputs::new(out).with_state(&[(cache, new_cache)]))
+        .unwrap();
 
     let mut caches = vec![HostTensor::f32(
         vec![1, k - 1, c],
@@ -1837,7 +1857,9 @@ fn causal_conv1d_prefill_matches_decode() {
         StateRole::Recurrent,
     );
     let (dout, dcache_out) = causal_conv1d_decode(&db, dx, dw, dcache, k);
-    let dg = db.finish_with_state(dout, &[(dcache, dcache_out)]);
+    let dg = db
+        .finish(poot_graph_ir::Outputs::new(dout).with_state(&[(dcache, dcache_out)]))
+        .unwrap();
 
     let mut cache = HostTensor::f32(vec![1, k - 1, c], vec![0.0f32; (k - 1) * c]);
     let mut want = vec![0.0f32; l * c];
@@ -1884,7 +1906,7 @@ fn causal_conv1d_prefill_matches_decode() {
         vec![1, l, c],
         "causal_conv1d_prefill output shape [1,L,C]"
     );
-    let pg = pb.finish(pout);
+    let pg = pb.finish(pout).unwrap();
 
     let mut pinp = HashMap::new();
     pinp.insert(px.id(), Value::from(HostTensor::f32(vec![1, l, c], xd)));

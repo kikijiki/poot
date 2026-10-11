@@ -1,7 +1,7 @@
 //! Card 516a F1: `--pcie-publication-receipt` sets `HSA_ALLOCATE_QUEUE_DEV_MEM` itself, so a launch
 //! without it reaches the device checks instead of failing the queue-ring provenance check. On an APU
-//! that means the documented SKIP (exit 0); with the device hidden it means the no-GPU error; on a
-//! discrete GPU the receipt runs. Removing the binary's own `set_var` fails every case with the
+//! that means the documented SKIP (exit 0); on a host with no device (hidden, or no /dev/kfd) it means
+//! the binary's typed no-device exit (status 2); on a discrete GPU the receipt runs. Removing the binary's own `set_var` fails every case with the
 //! provenance conflict.
 
 use poot_test_util::contained_child::ContainChild;
@@ -32,9 +32,9 @@ fn pcie_receipt_without_the_env_reaches_the_device_checks() {
     let skipped_on_apu = output.status.success()
         && stdout.contains("SKIP: --pcie-publication-receipt requires a discrete PCIe GPU");
     let receipt_passed = output.status.success() && stdout.contains("OK: pcie-publication-receipt");
-    let no_device = !output.status.success()
-        && (stderr.contains("no GPU agent found")
-            || stderr.contains("libhsa-runtime64.so.1 not found"));
+    // The binary's own typed no-device exit: status 2 and the `no ROCm device:` message, which it
+    // emits for a missing HSA library, no GPU agent, or no /dev/kfd (hsa_init OUT_OF_RESOURCES).
+    let no_device = output.status.code() == Some(2) && stderr.starts_with("no ROCm device: ");
     assert!(
         skipped_on_apu || receipt_passed || no_device,
         "expected the APU skip, a passing receipt, or a missing-device error; got status {:?}\n\

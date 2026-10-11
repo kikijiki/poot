@@ -9,7 +9,7 @@
 
 use std::num::NonZeroUsize;
 
-use poot_graph_ir::{BinOp, Builder, Graph, ValidationOutputs};
+use poot_graph_ir::{BinOp, Builder, Graph};
 use poot_quant::weights::{
     AttnRole, DenseWeight, ExpertProj, FfnRole, MoeRole, NormRole, WeightEntry, WeightId,
     WeightKey, WeightMap, WeightMapError, WeightRole, WeightStore,
@@ -325,11 +325,7 @@ impl Model for Gemma4 {
         &self.weights
     }
 
-    fn trace(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-    ) -> Result<Graph<ValidationOutputs>, TraceError> {
+    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(FAMILY, phase, shape, p.max_positions)?;
         let b = Builder::new();
@@ -368,7 +364,7 @@ impl Model for Gemma4 {
             );
             layer.scale.apply(b, x)
         });
-        Ok(step.finish(b, logits))
+        Ok(step.finish(b, logits)?)
     }
 }
 

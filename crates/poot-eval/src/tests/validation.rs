@@ -8,8 +8,8 @@ use poot_tensor::DType;
 use std::collections::HashMap;
 
 use poot_graph_ir::{
-    BinOp, Builder, ExecutionValidationFailure, Graph, GraphValidationError, Scalar, StateRole,
-    TensorType, ValidationId, ValidationOutput, ValidationOutputs, ValueId,
+    BinOp, Builder, ExecutionValidationFailure, Graph, Scalar, StateRole, TensorType, ValidationId,
+    ValueId,
 };
 
 use super::helpers;
@@ -18,9 +18,9 @@ use crate::walk::publication_probe;
 use crate::{EvalBudget, EvalError, EvalOptions, ExactI32TensorView, Value, eval};
 use poot_tensor::HostTensor;
 
-type ValueFixture = fn(f32) -> (Graph<ValidationOutputs>, HashMap<ValueId, Value>);
+type ValueFixture = fn(f32) -> (Graph, HashMap<ValueId, Value>);
 
-fn stateless_fixture(value: f32) -> (Graph<ValidationOutputs>, HashMap<ValueId, Value>) {
+fn stateless_fixture(value: f32) -> (Graph, HashMap<ValueId, Value>) {
     let b = Builder::new();
     let primary = b.constant("primary", TensorType::f32([1]));
     let witness = b.constant("witness", TensorType::f32([2]));
@@ -38,7 +38,7 @@ fn stateless_fixture(value: f32) -> (Graph<ValidationOutputs>, HashMap<ValueId, 
 }
 
 /// A dense graph with one computed primary output and one computed state update.
-fn stateful_fixture(value: f32) -> (Graph<ValidationOutputs>, HashMap<ValueId, Value>) {
+fn stateful_fixture(value: f32) -> (Graph, HashMap<ValueId, Value>) {
     let b = Builder::new();
     let state = b.state_input("state", TensorType::f32([2]), StateRole::Recurrent);
     let x = b.constant("x", TensorType::f32([2]));
@@ -62,7 +62,7 @@ fn stateful_fixture(value: f32) -> (Graph<ValidationOutputs>, HashMap<ValueId, V
 
 /// A graph that touches E4M3FN: the one walk dispatches its equations through the storage-aware path
 /// instead of the plain dense one.
-fn storage_aware_fixture(value: f32) -> (Graph<ValidationOutputs>, HashMap<ValueId, Value>) {
+fn storage_aware_fixture(value: f32) -> (Graph, HashMap<ValueId, Value>) {
     let b = Builder::new();
     let raw = b.constant("raw", TensorType::new([2], DType::E4M3FN));
     let witness = b.constant("witness", TensorType::f32([2]));
@@ -77,9 +77,7 @@ fn storage_aware_fixture(value: f32) -> (Graph<ValidationOutputs>, HashMap<Value
 }
 
 /// Storage-aware (E4M3FN) and stateful: the state update is an ordinary dense equation.
-fn storage_aware_stateful_fixture(
-    value: f32,
-) -> (Graph<ValidationOutputs>, HashMap<ValueId, Value>) {
+fn storage_aware_stateful_fixture(value: f32) -> (Graph, HashMap<ValueId, Value>) {
     let b = Builder::new();
     let raw = b.constant("raw", TensorType::new([2], DType::E4M3FN));
     let state = b.state_input("state", TensorType::f32([2]), StateRole::Recurrent);
@@ -102,7 +100,7 @@ fn storage_aware_stateful_fixture(
 
 /// An exact-I32 graph with carried state (card 371's carrier). The counter's update is an exact I32
 /// equation, so the walk keeps the exact carrier through to publication.
-fn exact_i32_stateful_fixture(value: f32) -> (Graph<ValidationOutputs>, HashMap<ValueId, Value>) {
+fn exact_i32_stateful_fixture(value: f32) -> (Graph, HashMap<ValueId, Value>) {
     let b = Builder::new();
     let counter = b.state_input(
         "counter",
@@ -201,46 +199,8 @@ fn eval_rejects_the_same_lane_regardless_of_options() {
 }
 
 #[test]
-fn oversized_packet_is_rejected_before_evaluation() {
-    let b = Builder::new();
-    let unbound = b.constant("unbound", TensorType::f32([1]));
-    let primary = b.binary(BinOp::Mul, unbound, unbound);
-    let witness = b.constant("oversized", TensorType::f32([1025]));
-    // `with_validations` does not validate, so the oversized declaration reaches the evaluator.
-    let graph = b.finish(primary).with_validations(vec![ValidationOutput {
-        id: ValidationId(17),
-        name: "oversized".into(),
-        value: witness.id(),
-    }]);
-    // No input is bound: evaluating the equation would report `MissingInput` instead.
-    let inputs = HashMap::new();
-
-    for (name, opts) in [
-        ("default", EvalOptions::new(EvalBudget::UNBOUNDED)),
-        (
-            "keep_environment",
-            EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
-        ),
-    ] {
-        let result = eval(&graph, &inputs, opts).map(drop);
-        assert!(
-            matches!(
-                result,
-                Err(EvalError::InvalidGraph(
-                    GraphValidationError::ValidationPacketTooLarge {
-                        byte_len: 4100,
-                        max_bytes: 4096,
-                    }
-                ))
-            ),
-            "{name}: {result:?}"
-        );
-    }
-}
-
-#[test]
 fn empty_validation_graph_is_compatible() {
-    fn build() -> (Graph<ValidationOutputs>, Graph, HashMap<ValueId, Value>) {
+    fn build() -> (Graph, Graph, HashMap<ValueId, Value>) {
         let b = Builder::new();
         let state = b.state_input("state", TensorType::f32([1]), StateRole::Recurrent);
         let x = b.constant("x", TensorType::f32([1]));
@@ -250,8 +210,10 @@ fn empty_validation_graph_is_compatible() {
             (state.id(), dense_value(vec![3.0])),
             (x.id(), dense_value(vec![5.0])),
         ]);
-        let plain = b.finish_with_state(primary, &[(state, next)]);
-        (plain.clone().with_validations(Vec::new()), plain, inputs)
+        let plain = b
+            .finish(poot_graph_ir::Outputs::new(primary).with_state(&[(state, next)]))
+            .unwrap();
+        (plain.clone(), plain, inputs)
     }
 
     let (empty, plain, inputs) = build();

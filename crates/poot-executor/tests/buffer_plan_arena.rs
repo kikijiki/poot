@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use poot_executor::{Arg, BufferRole, Device, Dispatch, Engine, Executor, NoSync, StepInputs};
 use poot_graph_ir::op::RedOp;
-use poot_graph_ir::{BinOp, Builder, TensorType, ValidationOutputs};
+use poot_graph_ir::{BinOp, Builder, TensorType};
 use poot_graph_plan::{
     CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram,
     Submission, Target, TargetSet, compile_staged,
@@ -34,7 +34,7 @@ use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::DType;
 
-type Graph = poot_graph_ir::Graph<ValidationOutputs>;
+type Graph = poot_graph_ir::Graph;
 
 const K: usize = 64;
 
@@ -51,7 +51,7 @@ fn fixture() -> (Graph, Arc<WeightStore>, Arc<poot_quant::weights::WeightMap>) {
     let v2 = b.binary(BinOp::Add, tc, tc);
     let s2 = b.reduce(RedOp::Sum, v2, 0, true);
     let out = b.binary(BinOp::Add, s1, s2);
-    let g = b.finish(out).with_validations(Vec::new());
+    let g = b.finish(out).unwrap();
 
     let mut wb = WeightStore::builder();
     for (name, n) in [("a", K), ("b", K), ("c", 1)] {
@@ -71,7 +71,7 @@ fn fixture() -> (Graph, Arc<WeightStore>, Arc<poot_quant::weights::WeightMap>) {
     (g, store, map)
 }
 
-fn staged(g: &Graph, target: Target) -> StagedProgram<ValidationOutputs> {
+fn staged(g: &Graph, target: Target) -> StagedProgram {
     compile_staged(
         g,
         &TargetSet::single(DeviceId(0), target),
@@ -85,7 +85,7 @@ fn staged(g: &Graph, target: Target) -> StagedProgram<ValidationOutputs> {
 }
 
 fn fake_target() -> Target {
-    Target {
+    Target::Gpu {
         backend: Backend::SpirvVulkan,
         caps: DeviceCaps::wgpu_rdna3_igpu(),
     }
@@ -382,8 +382,8 @@ fn state_commit_export_keeps_its_own_slot_through_the_epilogue() {
     let new_s = b.binary(BinOp::Add, a, bias);
     let result = b.binary(BinOp::Add, junk, new_s);
     let g = b
-        .finish_with_state(result, &[(a, new_a), (s, new_s)])
-        .with_validations(Vec::new());
+        .finish(poot_graph_ir::Outputs::new(result).with_state(&[(a, new_a), (s, new_s)]))
+        .unwrap();
 
     let mut wb = WeightStore::builder();
     let bias_bytes: Vec<u8> = (0..K).flat_map(|_| 1.0f32.to_le_bytes()).collect();

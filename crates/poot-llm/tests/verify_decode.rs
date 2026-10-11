@@ -7,9 +7,9 @@
 mod common;
 
 use common::{slot_maps, step, token_pos, zero_state};
-use poot_executor_parity::dense::{Dense, Family, paged_step, plain, step as step_shape};
+use poot_executor_parity::dense::{Dense, Family, paged_step, step as step_shape};
 use poot_executor_parity::weight_map::MappedModel;
-use poot_graph_ir::{Graph, ValidationOutputs};
+use poot_graph_ir::Graph;
 use poot_graph_plan::passes_without_target as optimize;
 use poot_models::model::{LogitRows, Phase};
 use poot_tensor::HostTensor;
@@ -36,14 +36,14 @@ fn tiny() -> MappedModel {
 }
 
 /// The one-token decode graph over `cap` positions.
-fn decode_graph(m: &MappedModel, cap: usize) -> Graph<ValidationOutputs> {
+fn decode_graph(m: &MappedModel, cap: usize) -> Graph {
     m.model
         .trace(Phase::Decode, step_shape(1, 1, cap, LogitRows::Last))
         .unwrap()
 }
 
 /// The verify graph: an `l`-token query with logits at every row, over `cap` positions.
-fn verify_graph(m: &MappedModel, l: usize, cap: usize) -> Graph<ValidationOutputs> {
+fn verify_graph(m: &MappedModel, l: usize, cap: usize) -> Graph {
     m.model
         .trace(Phase::Prefill, step_shape(1, l, cap, LogitRows::All))
         .unwrap()
@@ -52,7 +52,7 @@ fn verify_graph(m: &MappedModel, l: usize, cap: usize) -> Graph<ValidationOutput
 /// One decode step of `tok` at `pos` over carried `caches`.
 fn decode(
     m: &MappedModel,
-    g: &Graph<ValidationOutputs>,
+    g: &Graph,
     caches: &[HostTensor],
     tok: i32,
     pos: usize,
@@ -63,7 +63,7 @@ fn decode(
 /// One verify step of the `toks` block at absolute `pos`.
 fn verify(
     m: &MappedModel,
-    g: &Graph<ValidationOutputs>,
+    g: &Graph,
     caches: &[HostTensor],
     toks: &[i32],
     pos: usize,
@@ -130,7 +130,7 @@ fn paged_decode_matches_contiguous_decode_cpu() {
 /// first `snapshot` positions were written.
 fn sequential(
     m: &MappedModel,
-    dg: &Graph<ValidationOutputs>,
+    dg: &Graph,
     toks: &[i32],
     snapshot: usize,
 ) -> (Vec<Vec<f32>>, Vec<HostTensor>) {
@@ -339,8 +339,8 @@ fn optimize_preserves_verify_forward_semantics() {
     let m = tiny();
     let (p, l, cap) = (3usize, 4usize, 12usize);
     let dg = decode_graph(&m, cap);
-    let vg = plain(verify_graph(&m, l, cap));
-    let vg_opt = optimize(&vg);
+    let vg = verify_graph(&m, l, cap);
+    let vg_opt = optimize(&vg).unwrap();
 
     // A non-empty prefix cache (cap=12 > l=4) exposes the bug; an empty-cache verify at pos=0 can
     // have cap==l and would not.

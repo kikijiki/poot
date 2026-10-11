@@ -5,7 +5,7 @@
 use std::fmt;
 
 use poot_kernelgen::BodyLimits;
-use poot_target::Backend;
+use poot_target::TargetId;
 
 use crate::*;
 
@@ -22,7 +22,7 @@ pub struct Refusal {
     /// The dtypes the equation reads and writes.
     pub dtypes: RefusalDtypes,
     /// The target the equation was planned for.
-    pub target: Backend,
+    pub target: TargetId,
     /// The capability the target lacks for this equation.
     pub missing: Capability,
 }
@@ -104,6 +104,11 @@ pub enum Capability {
     /// The scan kernel keeps one state column (`rows` floats) per lane in workgroup memory, and not even one
     /// lane's fits the device's `lds_bytes`.
     ScanLds { rows: usize, lds_bytes: u32 },
+    /// A plan-local scratch buffer (`DispatchPlan::scratch`) is larger than the device's single-buffer
+    /// ceiling. The split-KV attention rule chooses the streaming schedule when its scratch does not fit,
+    /// so this is the backstop for a plan that reached validation anyway: a typed refusal, never a failed
+    /// device allocation.
+    ScratchBytes { needed: u64, max_buffer_bytes: u64 },
     /// The selected generator's own precondition on its shape or count arguments rejected this
     /// equation (card 531b): the planner chose this lowering for the equation's dtypes and target, but
     /// forwarded it a static value the generator itself refuses to build a body for.
@@ -122,6 +127,15 @@ pub enum Capability {
     /// The plan is not an AIE sequential schedule: an AIE core runs one loop, so a plan built from a thread
     /// grid or a shipped GPU template cannot run there.
     AieSchedule,
+    /// The equation's lowering reads GPU capabilities ([`poot_target::DeviceCaps`]) and the target is an
+    /// AIE target, which has none.
+    GpuOnly,
+    /// The plan's shape ABI does not fit the AIE target's measured limits (POOT-664): the limit that is
+    /// unknown, or the need and the offer.
+    AieLimit(crate::AieLimitRefusal),
+    /// The plan has no AIE shape ABI (the choice is not an AIE sequential schedule, or a binding is
+    /// malformed).
+    AieAbi(crate::AieAbiRefusal),
 }
 
 /// What a fused region step cannot be lowered to, by the region's arithmetic.
@@ -177,7 +191,7 @@ impl RefusalDtypes {
 pub(crate) struct Site<'a> {
     g: GraphTables<'a>,
     eqn: &'a Eqn,
-    target: Backend,
+    target: TargetId,
     limits: BodyLimits,
 }
 
@@ -185,13 +199,13 @@ impl<'a> Site<'a> {
     pub(crate) fn new(
         g: GraphTables<'a>,
         eqn: &'a Eqn,
-        target: Backend,
+        target: impl Into<TargetId>,
         limits: BodyLimits,
     ) -> Self {
         Self {
             g,
             eqn,
-            target,
+            target: target.into(),
             limits,
         }
     }
@@ -211,9 +225,10 @@ impl<'a> Site<'a> {
 pub(crate) fn refusal_at(
     g: GraphTables<'_>,
     eqn: &Eqn,
-    target: Backend,
+    target: impl Into<TargetId>,
     missing: Capability,
 ) -> PlanError {
+    let target = target.into();
     PlanError::Refused(Box::new(Refusal {
         eqn: eqn.out,
         op: eqn.op.clone(),
@@ -325,6 +340,13 @@ impl fmt::Display for Capability {
                 "the scan kernel needs {} bytes of workgroup memory for one state column of {rows} rows, the device has {lds_bytes}",
                 4 * rows
             ),
+            Capability::ScratchBytes {
+                needed,
+                max_buffer_bytes,
+            } => write!(
+                f,
+                "a scratch buffer of {needed} bytes exceeds the device's {max_buffer_bytes}-byte buffer limit"
+            ),
             Capability::KernelGen(err) => write!(f, "kernel generator: {err}"),
             Capability::KernelResources(err) => write!(f, "kernel resources: {err}"),
             Capability::PackedLowering { format, op } => {
@@ -333,6 +355,11 @@ impl fmt::Display for Capability {
             Capability::AieSchedule => f.write_str(
                 "the plan is not an AIE sequential schedule (a shipped GPU template or a thread-grid kernel)",
             ),
+            Capability::GpuOnly => f.write_str(
+                "the lowering reads GPU capabilities and an AIE target has none",
+            ),
+            Capability::AieLimit(refusal) => write!(f, "AIE limit: {refusal}"),
+            Capability::AieAbi(refusal) => write!(f, "AIE shape ABI: {refusal}"),
         }
     }
 }

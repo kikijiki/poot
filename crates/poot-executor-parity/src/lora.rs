@@ -185,7 +185,7 @@ fn run_projection(
             y,
             builder.broadcast(bias_const, shape),
         );
-        builder.finish(y)
+        builder.finish(y).unwrap()
     };
 
     let ids = [
@@ -228,7 +228,7 @@ fn run_projection(
         projections: vec![lora_target],
     };
     let program = compile_staged(
-        &graph.with_validations(Vec::new()),
+        &graph,
         &TargetSet::single(DeviceId(0), target),
         &Partition {
             experts: ExpertPlacement::AllResident,

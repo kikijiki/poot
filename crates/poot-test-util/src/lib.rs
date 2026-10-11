@@ -1,6 +1,8 @@
 //! Test helpers that were copy-pasted across the workspace test modules: deterministic pseudo-random
 //! fills and name-derived seeds, plain-Rust reference kernels, and small comparison helpers. Dev-dependency only.
 
+#[cfg(feature = "kernel-fixtures")]
+pub mod aie_fixtures;
 pub mod checkpoints;
 pub mod const_weights;
 pub mod contained_child;

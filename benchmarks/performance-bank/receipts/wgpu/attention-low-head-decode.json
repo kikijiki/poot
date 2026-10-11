@@ -6,63 +6,63 @@
       "repeats": [
         {
           "metrics": {
-            "step_us": 704.997
+            "step_us": 100.589
           },
           "slot": 0,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 556.236
+            "step_us": 101.72
           },
           "slot": 1,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 530.198
+            "step_us": 102.102
           },
           "slot": 2,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 519.507
+            "step_us": 101.71
           },
           "slot": 3,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 516.502
+            "step_us": 134.071
           },
           "slot": 4,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 611.841
+            "step_us": 130.283
           },
           "slot": 5,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 520.86
+            "step_us": 104.946
           },
           "slot": 6,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 526.45
+            "step_us": 127.94
           },
           "slot": 7,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 526.37
+            "step_us": 106.078
           },
           "slot": 8,
           "status": "ok"
@@ -77,13 +77,13 @@
       "role": "Weight"
     },
     {
-      "live_bytes": 1024,
-      "peak_bytes": 1024,
+      "live_bytes": 17664,
+      "peak_bytes": 17664,
       "role": "Activation"
     },
     {
-      "live_bytes": 24,
-      "peak_bytes": 1048,
+      "live_bytes": 36,
+      "peak_bytes": 1060,
       "role": "Staging"
     }
   ],
@@ -100,13 +100,14 @@
     "weight_copies": 1
   },
   "plan": [
-    "attention [da0cfb7e667cf6a48d06c88f9caf41e4e093b4a6c1914ad19cd24b141775b71e]"
+    "attention [f55b02f74ad3c5bd9dad3f1f964f50f24bf0ab2162b9be3970df643e20aa432e]",
+    "attention_combine [f6e7be4dc6536291db2eb7fc8ef150860c0413f59422ef020abcf347f4d0dc3a]"
   ],
-  "plan_id": "385e33ea1ee461740d29152f9baedff71b5c4db728f30a42e8f5153ba97235be",
+  "plan_id": "0c5d256de83e9080f88b07f51b5c23605ea2d2d449a3fdcc7365023ffabc2f98",
   "recordings": 1,
   "reference": {
     "agrees": true,
-    "max_relative_error": 9.016222914173896e-09,
+    "max_relative_error": 6.189377941927862e-09,
     "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
     "provenance": "independent-golden",
     "tolerance": 0.002
@@ -130,8 +131,8 @@
     "--out",
     "benchmarks/performance-bank/receipts/wgpu/attention-low-head-decode.json"
   ],
-  "parent_revision": "e178f51722183668cf2f554e21b0dca17d3b0caf",
-  "binary_sha256": "ac158d08f5360e51d7a612b83aca1e868a126f6da5fb7058acff3b679a8d76dc",
+  "parent_revision": "d03659c4efa0e259809a15c917fb76df7b77cfc0",
+  "binary_sha256": "2d84fb0389a192e33788ba33951cdfa98680951065893d58c33902854614f297",
   "identity": {
     "checkpoint_digest": "synthetic-no-checkpoint",
     "token_fixture": "splitmix64-seed0-unit:237900849bc67b83",

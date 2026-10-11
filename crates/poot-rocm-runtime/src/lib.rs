@@ -21,7 +21,7 @@
 //! ```compile_fail,E0133
 //! fn from_any_bytes(bytes: &[u8]) -> poot_rocm_runtime::CompiledKernel {
 //!     poot_rocm_runtime::CompiledKernel::new(
-//!         poot_target::Backend::AmdGcn(poot_target::AmdArch::gfx1151()),
+//!         poot_target::TargetId::Gpu(poot_target::Backend::AmdGcn(poot_target::AmdArch::gfx1151())),
 //!         "add",
 //!         poot_runtime_common::KernelCode::Hsaco(bytes.to_vec().into_boxed_slice()),
 //!         Vec::new(),
@@ -33,7 +33,7 @@
 //! ```compile_fail,E0451
 //! fn forge(code: poot_runtime_common::KernelCode) -> poot_rocm_runtime::CompiledKernel {
 //!     poot_rocm_runtime::CompiledKernel {
-//!         target: poot_target::Backend::AmdGcn(poot_target::AmdArch::gfx1151()),
+//!         target: poot_target::TargetId::Gpu(poot_target::Backend::AmdGcn(poot_target::AmdArch::gfx1151())),
 //!         entry_point: "add".into(),
 //!         code,
 //!         args: Vec::new().into(),

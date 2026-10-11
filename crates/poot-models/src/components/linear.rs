@@ -195,7 +195,7 @@ mod tests {
             let b = Builder::new();
             let xs = b.constant("x", TensorType::f32(vec![m, k]));
             let y = linear(&b, xs, &w, Some(&bias));
-            let g = b.finish(y);
+            let g = b.finish(y).unwrap();
             fx.eval(&g, &[("x", &x)], &[], &[]).0
         };
         let got = run(&fx);
@@ -239,8 +239,8 @@ mod tests {
         let b = Builder::new();
         let xs = b.constant("x", TensorType::f32(vec![m, k]));
         let y = linear(&b, xs, &w, None);
-        let g = b.finish(y);
-        let declared = g.aval(g.inputs[1]);
+        let g = b.finish(y).unwrap();
+        let declared = g.aval(g.inputs()[1]);
         assert_eq!(
             (declared.dtype, declared.shape.clone()),
             (DType::F32, vec![n, k])
@@ -248,7 +248,7 @@ mod tests {
         let bound = bind_packed_weights(&g, &WeightFormats::from_weight_map(&map)).unwrap();
         assert!(
             bound
-                .eqns
+                .eqns()
                 .iter()
                 .any(|e| matches!(e.op, OpKind::PackedDequant { .. }))
         );

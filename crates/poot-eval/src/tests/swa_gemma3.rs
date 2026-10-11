@@ -34,7 +34,7 @@ fn eval_prefill_attn(
     let mask = b.constant("mask", TensorType::f32(vec![1, 1, l, l]));
     let n_rep = hq / hkv;
     let out = attention_prefill(&b, q, k, v, n_rep, scale, mask);
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let mut inputs = HashMap::new();
     inputs.insert(q.id(), HostTensor::f32(vec![1, hq, l, d], q_data));
     inputs.insert(k.id(), HostTensor::f32(vec![1, hkv, l, d], k_data));
@@ -248,7 +248,7 @@ fn causal_mask_from_pos_matches_host_built_mask_row_table() {
         let pos = b.slot(Slot::Pos, TensorType::new(vec![1, 1], DType::I32));
         let mask = poot_graph_ir::ops::causal_mask_from_pos(&b, pos, cap, window);
         let posi = pos.id();
-        let g = b.finish(mask);
+        let g = b.finish(mask).unwrap();
 
         let mut inputs: HashMap<ValueId, Value> = HashMap::new();
         inputs.insert(
@@ -313,7 +313,7 @@ fn causal_mask_from_pos_prefill_shape_matches_visibility_pattern_and_flushes_eit
         let pos = b.slot(Slot::Pos, TensorType::new(vec![1, l], DType::I32));
         let mask = poot_graph_ir::ops::causal_mask_from_pos(&b, pos, l, window);
         let posi = pos.id();
-        let g = b.finish(mask);
+        let g = b.finish(mask).unwrap();
 
         let mut inputs: HashMap<ValueId, Value> = HashMap::new();
         inputs.insert(
@@ -466,7 +466,7 @@ fn swa_windowed_mask_fuzz_matches_hand_windowed_reference() {
 /// absolute position `pos0`, every const filled by `weight(name, shape)`, every carried state from `state` (zeros
 /// when empty). Returns the output and the state outputs.
 pub(super) fn run_step(
-    g: &poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs>,
+    g: &poot_graph_ir::Graph,
     tokens: &[i32],
     pos0: usize,
     weight: &dyn Fn(&str, &[usize]) -> Vec<f32>,
@@ -475,7 +475,7 @@ pub(super) fn run_step(
     use poot_graph_ir::{Slot, Storage};
 
     let mut inputs: HashMap<ValueId, Value> = HashMap::new();
-    for &id in &g.inputs {
+    for &id in g.inputs() {
         let m = g.meta(id);
         let shape = m.aval.shape.clone();
         let t = match m.storage {
@@ -494,7 +494,7 @@ pub(super) fn run_step(
         };
         inputs.insert(id, Value::from(t));
     }
-    for (i, &(input, _)) in g.state.iter().enumerate() {
+    for (i, (input, _)) in g.state().enumerate() {
         let t = state
             .get(i)
             .cloned()
@@ -654,10 +654,9 @@ fn gemma3_decode_per_layer_mask_selection() {
             .trace(Phase::Decode, step(1, 1, cap, LogitRows::Last))
             .unwrap();
         let state: Vec<HostTensor> = g
-            .state
-            .iter()
+            .state()
             .enumerate()
-            .map(|(i, &(input, _))| {
+            .map(|(i, (input, _))| {
                 let shape = g.aval(input).shape.clone();
                 HostTensor::f32(shape.clone(), named_weights(&format!("kv.{i}"), &shape))
             })
@@ -733,16 +732,14 @@ fn config_wiring_softcap_changes_graph_and_output() {
     // attention softcap fires once per layer, the final one once after the head: extra = (layers + 1) * 3.
     let expected_extra = (layers + 1) * 3;
     assert_eq!(
-        g_cap.eqns.len() - g_none.eqns.len(),
+        g_cap.eqns().len() - g_none.eqns().len(),
         expected_extra,
         "unexpected op delta: capped {} vs uncapped {}",
-        g_cap.eqns.len(),
-        g_none.eqns.len()
+        g_cap.eqns().len(),
+        g_none.eqns().len()
     );
 
-    let out = |g: &poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs>| {
-        run_step(g, &[5], pos, &named_weights, &[]).0
-    };
+    let out = |g: &poot_graph_ir::Graph| run_step(g, &[5], pos, &named_weights, &[]).0;
     // Check 2: softcap changes the output, not just the graph structure.
     let max_diff = max_abs_error(
         out(&g_none).as_f32().unwrap(),
@@ -755,8 +752,8 @@ fn config_wiring_softcap_changes_graph_and_output() {
 
     // Check 3: the window only affects mask values at run time.
     assert_eq!(
-        gemma2(None, None, 2).eqns.len(),
-        g_none.eqns.len(),
+        gemma2(None, None, 2).eqns().len(),
+        g_none.eqns().len(),
         "sliding_window does not change graph structure"
     );
 }

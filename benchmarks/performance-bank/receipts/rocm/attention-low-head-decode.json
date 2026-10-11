@@ -6,63 +6,63 @@
       "repeats": [
         {
           "metrics": {
-            "step_us": 2329.22
+            "step_us": 62.637
           },
           "slot": 0,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2365.148
+            "step_us": 58.399
           },
           "slot": 1,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2331.815
+            "step_us": 57.979
           },
           "slot": 2,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2316.627
+            "step_us": 58.199000000000005
           },
           "slot": 3,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2337.436
+            "step_us": 58.379
           },
           "slot": 4,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2373.994
+            "step_us": 58.440000000000005
           },
           "slot": 5,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2317.4990000000003
+            "step_us": 58.389
           },
           "slot": 6,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2460.678
+            "step_us": 58.32899999999999
           },
           "slot": 7,
           "status": "ok"
         },
         {
           "metrics": {
-            "step_us": 2339.73
+            "step_us": 63.69
           },
           "slot": 8,
           "status": "ok"
@@ -77,13 +77,13 @@
       "role": "Weight"
     },
     {
-      "live_bytes": 1024,
-      "peak_bytes": 1024,
+      "live_bytes": 17664,
+      "peak_bytes": 17664,
       "role": "Activation"
     },
     {
-      "live_bytes": 80,
-      "peak_bytes": 80,
+      "live_bytes": 112,
+      "peak_bytes": 112,
       "role": "Meta"
     }
   ],
@@ -100,13 +100,14 @@
     "weight_copies": 1
   },
   "plan": [
-    "attention [2761f9d5c7fc02832025502382f63752666c98ec6a549204859db3d6b3eed821]"
+    "attention [c9fc1783247cedc898ddca6ea31a1ee8921d875ccf92ccf1983cba5c574b2d46]",
+    "attention_combine [ab98131947c3b59c56bff03678f73c16653e4028a2695636d871530e9f32c86b]"
   ],
-  "plan_id": "6a7d7499b63aa1b77ff8fa7a34c192760689b0e1bc950ae25261abe9bc4ca985",
+  "plan_id": "864ca01f0cb2e371ff83f1544a9ebc840d3a867a7b80be33e274ba81c4b8ffe2",
   "recordings": 1,
   "reference": {
     "agrees": true,
-    "max_relative_error": 1.1986723837032765e-08,
+    "max_relative_error": 6.516092134265499e-09,
     "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
     "provenance": "independent-golden",
     "tolerance": 0.002
@@ -130,8 +131,8 @@
     "--out",
     "benchmarks/performance-bank/receipts/rocm/attention-low-head-decode.json"
   ],
-  "parent_revision": "e178f51722183668cf2f554e21b0dca17d3b0caf",
-  "binary_sha256": "7a8e978a9087ff303dd4f147cc5d1bb86a841f8b46790086293ff7e5c02f0928",
+  "parent_revision": "d03659c4efa0e259809a15c917fb76df7b77cfc0",
+  "binary_sha256": "40e581af43fecf10dba65fff766e2fd0591f2fded88ebe8f460fa710ed120ef3",
   "identity": {
     "checkpoint_digest": "synthetic-no-checkpoint",
     "token_fixture": "splitmix64-seed0-unit:237900849bc67b83",

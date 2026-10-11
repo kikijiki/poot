@@ -387,7 +387,7 @@ impl<'a> Emitter<'a> {
                 // f32 -> bf16, round-to-nearest-even: bias = 0x7FFF + ((bits>>16)&1); (bits+bias)>>16. The bias
                 // add is wrong for a NaN (a payload in the low bits carries into the exponent and yields Inf, an
                 // all-ones payload wraps to -0.0), so a NaN takes its top 16 bits with the quiet bit forced, the
-                // same value `poot_runtime_common::f32_to_bf16` produces on the host.
+                // same value `poot_quant::scalar::f32_to_bf16` produces on the host.
                 let iv = self.fresh();
                 let _ = writeln!(w, "  {iv} = bitcast float {v} to i32");
                 let sh = self.fresh();

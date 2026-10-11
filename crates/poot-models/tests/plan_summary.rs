@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-use poot_graph_ir::{Eqn, Graph, Operand, ValidationChannel};
+use poot_graph_ir::{Eqn, Graph, Operand};
 use poot_graph_plan::{
     CompileError, CompileOptions, Dispatch, KernelChoice, Plan, PlanError, Target, compile,
 };
@@ -109,7 +109,7 @@ fn attention_detail(eqn: &Eqn, choice: &KernelChoice, dispatch: &Dispatch) -> St
     let KernelChoice::Generated(poot_kernelgen::KernelRequest::Attention(spec)) = choice else {
         return "-".to_string();
     };
-    let poot_kernelgen::AttentionSchedule::Streaming { lanes } = spec.schedule;
+    let lanes = spec.schedule.lanes();
     let used = poot_kernelgen::BodyUse::measure(dispatch.body())
         .expect("an attention body states measurable workgroup memory");
     let key = match spec.key {
@@ -256,13 +256,7 @@ fn render(registry: &Registry, target: &Target) -> String {
 }
 
 /// One graph's lines: one per planned equation, or one for the whole graph when `compile` refuses it.
-fn summarize<V: ValidationChannel>(
-    out: &mut String,
-    name: &str,
-    g: &Graph<V>,
-    target: &Target,
-    options: &CompileOptions,
-) {
+fn summarize(out: &mut String, name: &str, g: &Graph, target: &Target, options: &CompileOptions) {
     match compile(g, target, options) {
         Ok(program) => {
             for (i, (eqn, plan)) in program.planned().enumerate() {
@@ -506,7 +500,7 @@ fn every_corpus_trace_is_primitive_before_compile() {
     let options = targets::options();
     for row in corpus(&registry()) {
         let g = row.graph();
-        for (i, eqn) in g.eqns.iter().enumerate() {
+        for (i, eqn) in g.eqns().iter().enumerate() {
             if matches!(eqn.op, poot_graph_ir::OpKind::Scan(_)) {
                 continue;
             }
@@ -521,7 +515,7 @@ fn every_corpus_trace_is_primitive_before_compile() {
         if let Ok(program) = compile(&g, &target, &options) {
             composites_after_compile += program
                 .graph()
-                .eqns
+                .eqns()
                 .iter()
                 .filter(|eqn| eqn.op.class() == OpClass::Composite)
                 .count();

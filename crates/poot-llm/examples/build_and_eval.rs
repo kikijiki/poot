@@ -20,10 +20,10 @@ fn main() {
     let x = b.constant("x", TensorType::f32(vec![1, 1, n]));
     let w = b.constant("w", TensorType::f32(vec![n]));
     let out = ops::rmsnorm(&b, x, w, eps);
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     println!(
         "rmsnorm traced to {} primitive eqns (mul, reduce-sum, scalar mul/add, sqrt, div, mul)",
-        g.eqns.len()
+        g.eqns().len()
     );
 
     // evaluate with a sample input.

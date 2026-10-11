@@ -59,7 +59,7 @@ fn arg_top_k_case(name: &'static str, rows: usize, e: usize, k: usize) -> ArgTop
     let b = Builder::new();
     let rank_in = b.constant("rank", TensorType::f32(vec![rows, e]));
     let ids = b.arg_top_k(rank_in, k);
-    let graph = b.finish(ids);
+    let graph = b.finish(ids).unwrap();
     ArgTopKCase {
         fixture: const_fixture(
             name,
@@ -130,7 +130,7 @@ fn tie_case(name: &'static str, rows: &[[f32; 5]], k: usize) -> TieCase {
     let mask = ops::top_k_keep_mask(&b, rank, k);
     let gate = ops::top_k_gate(&b, scores_in, k);
     let out = b.concat(1, &[ids, mask, gate]);
-    let graph = b.finish(out);
+    let graph = b.finish(out).unwrap();
     TieCase {
         fixture: const_fixture(
             name,

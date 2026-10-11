@@ -459,7 +459,7 @@ mod tests {
     use super::*;
     use crate::chat::ChatFormat;
     use crate::model::{ModelConfig, ModelOutput, Phase, StepShape, TraceError};
-    use poot_graph_ir::{Graph, ValidationOutputs};
+    use poot_graph_ir::Graph;
     use poot_quant::StoredBytes;
     use poot_quant::weights::WeightMap;
     use std::num::NonZeroUsize;
@@ -581,7 +581,7 @@ mod tests {
         fn weights(&self) -> &WeightMap {
             unreachable!("never built")
         }
-        fn trace(&self, _: Phase, _: StepShape) -> Result<Graph<ValidationOutputs>, TraceError> {
+        fn trace(&self, _: Phase, _: StepShape) -> Result<Graph, TraceError> {
             unreachable!("never built")
         }
     }

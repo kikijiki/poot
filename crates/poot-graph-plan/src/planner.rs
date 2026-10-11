@@ -11,7 +11,7 @@
 //! refusal is a typed [`Refusal`], built by `Site::refuse`.
 
 use poot_kernelgen::BodyLimits;
-use poot_target::{Backend, DeviceCaps};
+use poot_target::{AieCaps, AieTargetId, Backend, DeviceCaps};
 
 use crate::dtype_widen::bf16_const_is_packed;
 use crate::*;
@@ -55,6 +55,29 @@ macro_rules! moe_ops {
             }
             | OpKind::ArgTopK { .. }
     };
+}
+
+/// What a family planner generates for: a GPU backend and the device's measured capabilities, or an AIE
+/// core (whose limits are checked by its own finalizer, never read by a request builder). A family that has
+/// a sequential schedule takes this instead of a `(Backend, &DeviceCaps)` pair, so it cannot read GPU
+/// capabilities for a target that has none.
+#[derive(Clone, Copy)]
+pub(crate) enum Lowering<'a> {
+    Gpu {
+        backend: Backend,
+        caps: &'a DeviceCaps,
+    },
+    Aie(AieTargetId),
+}
+
+impl Lowering<'_> {
+    /// The target identity, for a refusal site.
+    pub(crate) fn id(self) -> poot_target::TargetId {
+        match self {
+            Lowering::Gpu { backend, .. } => backend.into(),
+            Lowering::Aie(target) => target.into(),
+        }
+    }
 }
 
 /// Ops planned by `planner::elementwise`.
@@ -163,16 +186,16 @@ pub(crate) struct PlannedGraph {
 /// `compile` derives the native state-commit plan from this call's own `plans`
 /// (`crate::state_commit::state_commit_from_plans`) rather than planning the graph a
 /// second time.
-pub(crate) fn plan_graph<V: ValidationChannel>(
-    g: &Graph<V>,
+pub(crate) fn plan_graph(
+    g: &Graph,
     target: &Target,
     limits: &BodyLimits,
 ) -> Result<PlannedGraph, CompileError> {
     let _scope = CompileScope::enter();
-    let backend = target.backend;
-    let views = compute_views(g, backend);
+    let id = target.id();
+    let views = compute_views(g, id);
     let (plans, choices): (Vec<_>, Vec<_>) = g
-        .eqns
+        .eqns()
         .iter()
         .map(|eqn| {
             plan_eqn_compiled(g, eqn, target, &views, limits)
@@ -182,9 +205,9 @@ pub(crate) fn plan_graph<V: ValidationChannel>(
         .into_iter()
         .unzip();
     // Storage reads the plans just made: no equation is planned a second time.
-    let storage = value_storage_of_plans(g, backend, plans.iter().map(Some))?;
+    let storage = value_storage_of_plans(g, id, plans.iter().map(Some))?;
     let slots = g
-        .slots
+        .slots()
         .iter()
         .map(|&(value, slot)| SlotSchema {
             value,
@@ -268,8 +291,8 @@ pub(crate) fn per_eqn_plans_inside_compile() -> u64 {
 ///
 /// A collective (`AllReduce`/`AllGather`) is refused with [`Capability::CollectiveInStage`]: it is a cut
 /// between stage programs, never an equation one plans.
-pub fn plan_eqn<V: ValidationChannel>(
-    g: &Graph<V>,
+pub fn plan_eqn(
+    g: &Graph,
     eqn: &Eqn,
     backend: Backend,
     caps: &DeviceCaps,
@@ -316,7 +339,7 @@ pub(crate) fn fty_ty(d: DType) -> Ty {
 /// onto `Schedule::Tiled`'s fold-aware grid (never `Schedule::Serial`'s per-thread-unbounded K loop),
 /// so the O(K) serial-reduction gap an earlier design named is already closed - the output
 /// element count bounds the per-thread work for every op class this planner emits.
-pub fn dispatch_work<V: ValidationChannel>(g: &Graph<V>, eqn: &Eqn) -> u64 {
+pub fn dispatch_work(g: &Graph, eqn: &Eqn) -> u64 {
     numel(&g.aval(eqn.out).shape) as u64
 }
 
@@ -332,41 +355,45 @@ pub fn dispatch_work<V: ValidationChannel>(g: &Graph<V>, eqn: &Eqn) -> u64 {
 /// e.g. `poot_test_util::device_caps::default_caps_for`). `out_shape`/`out_numel` are graph-derived, not
 /// caller-supplied (card 525 R469-019).
 #[allow(clippy::too_many_arguments)]
-pub fn plan_eqn_views<V: ValidationChannel>(
-    g: &Graph<V>,
+pub fn plan_eqn_views(
+    g: &Graph,
     eqn: &Eqn,
     backend: Backend,
     views: &HashMap<ValueId, Layout>,
     caps: &DeviceCaps,
     limits: &BodyLimits,
 ) -> Result<Plan, PlanError> {
-    plan_eqn_choice(g, eqn, backend, views, caps, limits).map(|planned| planned.plan)
+    let target = Target::Gpu {
+        backend,
+        caps: *caps,
+    };
+    plan_eqn_choice(g, eqn, &target, views, limits).map(|planned| planned.plan)
 }
 
-/// [`plan_eqn_views`], keeping the [`KernelChoice`] the plan was built from. A planner test that
-/// asserts on the choice calls it directly.
-#[allow(clippy::too_many_arguments)]
-pub fn plan_eqn_choice<V: ValidationChannel>(
-    g: &Graph<V>,
-    eqn: &Eqn,
-    backend: Backend,
-    views: &HashMap<ValueId, Layout>,
-    caps: &DeviceCaps,
-    limits: &BodyLimits,
-) -> Result<Planned, PlanError> {
-    plan_eqn_policy(g, eqn, backend, views, caps, limits)
-}
-
-/// The single-device per-equation plan [`crate::compile`] makes, in [`plan_graph`] and in its rewrite
-/// legality probes: `target`'s backend and caps and the graph's strided `views`.
-pub(crate) fn plan_eqn_compiled<V: ValidationChannel>(
-    g: &Graph<V>,
+/// [`plan_eqn_views`] for any [`Target`], keeping the [`KernelChoice`] the plan was built from: the one
+/// per-equation planner entry. A GPU target plans a thread grid, an AIE target the same requests under its
+/// sequential one-core schedule; an equation whose lowering reads GPU capabilities is refused for an AIE
+/// target with [`Capability::GpuOnly`]. A planner test that asserts on the choice calls it directly.
+pub fn plan_eqn_choice(
+    g: &Graph,
     eqn: &Eqn,
     target: &Target,
     views: &HashMap<ValueId, Layout>,
     limits: &BodyLimits,
 ) -> Result<Planned, PlanError> {
-    plan_eqn_policy(g, eqn, target.backend, views, &target.caps, limits)
+    plan_eqn_policy(g, eqn, target, views, limits)
+}
+
+/// The single-device per-equation plan [`crate::compile`] makes, in [`plan_graph`] and in its rewrite
+/// legality probes: `target` and the graph's strided `views`.
+pub(crate) fn plan_eqn_compiled(
+    g: &Graph,
+    eqn: &Eqn,
+    target: &Target,
+    views: &HashMap<ValueId, Layout>,
+    limits: &BodyLimits,
+) -> Result<Planned, PlanError> {
+    plan_eqn_policy(g, eqn, target, views, limits)
 }
 
 /// Whether `op` can read a BF16 const operand through a packed lane: the `Cast` kernel, and the fused regions
@@ -378,13 +405,11 @@ fn reads_narrow_operands(op: &OpKind) -> bool {
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn plan_eqn_policy<V: ValidationChannel>(
-    g: &Graph<V>,
+fn plan_eqn_policy(
+    g: &Graph,
     eqn: &Eqn,
-    backend: Backend,
+    target: &Target,
     views: &HashMap<ValueId, Layout>,
-    caps: &DeviceCaps,
     limits: &BodyLimits,
 ) -> Result<Planned, PlanError> {
     let out_shape = g.aval(eqn.out).shape.clone();
@@ -401,7 +426,7 @@ fn plan_eqn_policy<V: ValidationChannel>(
                     Operand::Value(src)
                         if g.meta(*src).storage.holds_weight_bytes()
                             && g.aval(*src).dtype == DType::BF16
-                            && bf16_const_is_packed(g, views, *src, backend)
+                            && bf16_const_is_packed(g, views, *src, target.id())
                 )
             })
             .collect()
@@ -413,9 +438,8 @@ fn plan_eqn_policy<V: ValidationChannel>(
         eqn,
         &out_shape,
         out_numel,
-        backend,
+        target,
         views,
-        caps,
         &packed_operands,
         *limits,
     )
@@ -434,12 +458,119 @@ fn out_numel_saturating(shape: &[usize]) -> usize {
         .max(1)
 }
 
-/// The per-equation planner body. `out_shape`/`out_numel` are the caller's already-derived
+/// The per-equation planner entry over a [`Target`]: a GPU target runs the family dispatcher
+/// ([`plan_gpu_eqn`]), an AIE target the sequential-schedule one ([`plan_aie_eqn`]). `out_shape`/`out_numel`
+/// are the caller's already-derived
 /// [`Graph::aval`] of `eqn.out` (card 525 R469-019: no entry point takes a caller-supplied shape that
 /// could disagree with the graph's own inferred one). It reads only the value table, so it is not generic
 /// over the validation channel and is compiled once in this crate.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_eqn_views_impl(
+    g: GraphTables<'_>,
+    eqn: &Eqn,
+    out_shape: &[usize],
+    out_numel: usize,
+    target: &Target,
+    views: &HashMap<ValueId, Layout>,
+    packed_operands: &[bool],
+    limits: BodyLimits,
+) -> Result<Planned, PlanError> {
+    count_per_eqn_plan();
+    match target {
+        Target::Gpu { backend, caps } => plan_gpu_eqn(
+            g,
+            eqn,
+            out_shape,
+            out_numel,
+            *backend,
+            views,
+            caps,
+            packed_operands,
+            limits,
+        ),
+        Target::Aie { target, caps } => plan_aie_eqn(
+            g,
+            eqn,
+            out_shape,
+            out_numel,
+            *target,
+            caps,
+            views,
+            packed_operands,
+            limits,
+        ),
+    }
+}
+
+/// An AIE target's per-equation plan. The AIE core runs one sequential loop, and `poot-kernelgen` has a
+/// sequential schedule for the elementwise family only, so that family is planned (through the same
+/// request builder every target uses, under [`Lowering::Aie`]) and finalized against the target's own
+/// limits. Every other family's lowering reads GPU capabilities ([`DeviceCaps`]) and is refused with
+/// [`Capability::GpuOnly`]; a collective is a cut between stage programs on every target.
+#[allow(clippy::too_many_arguments)]
+fn plan_aie_eqn(
+    g: GraphTables<'_>,
+    eqn: &Eqn,
+    out_shape: &[usize],
+    out_numel: usize,
+    target: AieTargetId,
+    caps: &AieCaps,
+    views: &HashMap<ValueId, Layout>,
+    packed_operands: &[bool],
+    limits: BodyLimits,
+) -> Result<Planned, PlanError> {
+    let site = Site::new(g, eqn, target, limits);
+    // An AIE core has no E4M3FN storage lane: refused before scalar type selection can reinterpret it.
+    let touches_e4m3fn = g.aval(eqn.out).dtype == DType::E4M3FN
+        || value_ids(eqn)
+            .iter()
+            .any(|&id| g.aval(id).dtype == DType::E4M3FN);
+    if touches_e4m3fn {
+        return Err(site.refuse(Capability::E4m3Storage));
+    }
+    let odt = g.aval(eqn.out).dtype;
+    let planned = match &eqn.op {
+        elementwise_ops!() => elementwise::plan(
+            g,
+            eqn,
+            out_shape,
+            out_numel,
+            Lowering::Aie(target),
+            views,
+            odt,
+            limits,
+            packed_operands,
+        )?,
+        OpKind::Iota { .. } => return Err(site.refuse(Capability::UnfoldedIota)),
+        imported_ops!()
+        | packed_ops!()
+        | moe_ops!()
+        | matmul_ops!()
+        | attention_ops!()
+        | scan_ops!()
+        | cast_ops!()
+        | sampling_ops!()
+        | movement_ops!() => {
+            // A collective is a cut between stage programs on every target; any other op's lowering
+            // reads GPU capabilities.
+            let missing = match eqn.op {
+                OpKind::AllReduce { .. } | OpKind::AllGather { .. } => {
+                    Capability::CollectiveInStage
+                }
+                _ => Capability::GpuOnly,
+            };
+            return Err(site.refuse(missing));
+        }
+    };
+    finalize_aie(&planned, g, eqn, target, caps)?;
+    Ok(planned)
+}
+
+/// A GPU target's per-equation planner body: one thin dispatch table. It runs the shared dtype/storage
+/// guards, routes each op family to its owned function and applies the shared launch-shaping postamble
+/// (`finalize`).
+#[allow(clippy::too_many_arguments)]
+fn plan_gpu_eqn(
     g: GraphTables<'_>,
     eqn: &Eqn,
     out_shape: &[usize],
@@ -450,7 +581,6 @@ pub(crate) fn plan_eqn_views_impl(
     packed_operands: &[bool],
     limits: BodyLimits,
 ) -> Result<Planned, PlanError> {
-    count_per_eqn_plan();
     let site = Site::new(g, eqn, backend, limits);
     if matches!(eqn.op, imported_ops!()) {
         // Card 542a: a block-32 descriptor (the seven GGUF schemes `packed_block_float::
@@ -643,10 +773,9 @@ pub(crate) fn plan_eqn_views_impl(
             eqn,
             out_shape,
             out_numel,
-            backend,
+            Lowering::Gpu { backend, caps },
             views,
             odt,
-            caps,
             limits,
             packed_operands,
         )?,

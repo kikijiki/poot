@@ -953,11 +953,6 @@ impl KernelArgs {
     }
 }
 
-/// Round an f32 to bf16 (the high 16 bits, round-to-nearest-even). bf16 shares f32's exponent, so only the
-/// mantissa is rounded and the range is unchanged. Public PTX path; the body lives in
-/// `poot-runtime-common` (quiet NaN stays quiet with its sign, sNaN is quieted).
-pub use poot_runtime_common::f32_to_bf16;
-
 #[cfg(test)]
 mod caps_tests {
     use super::*;

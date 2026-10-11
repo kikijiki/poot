@@ -12,9 +12,7 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
-use poot_graph_ir::{
-    BinOp, Builder, Graph, IndexRange, Slot, TensorType, Traced, ValidationOutputs, ops,
-};
+use poot_graph_ir::{BinOp, Builder, Graph, IndexRange, Slot, TensorType, Traced, ops};
 use poot_quant::weights::{
     AttnRole, FfnRole, NormRole, WeightId, WeightMap, WeightRole, WeightStore,
 };
@@ -489,11 +487,7 @@ impl Model for Bert {
         &self.weights
     }
 
-    fn trace(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-    ) -> Result<Graph<ValidationOutputs>, TraceError> {
+    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
         let p = &self.params;
         if phase != Phase::Encode {
             return Err(TraceError::PhaseUnsupported {
@@ -563,7 +557,7 @@ impl Model for Bert {
                 linear(&b, pooled, &c.head, Some(&c.head_bias))
             }
         };
-        Ok(step.finish(b, out))
+        Ok(step.finish(b, out)?)
     }
 }
 

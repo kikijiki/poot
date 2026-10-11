@@ -17,14 +17,6 @@ pub struct ValidationPacketPlan {
     pub sources: Vec<ValidationPacketSource>,
 }
 
-/// Plan the packet for a validation-bearing graph. Only `Graph<ValidationOutputs>` has a packet.
-#[cfg(test)]
-pub(crate) fn plan_validation_packet(
-    g: &Graph<ValidationOutputs>,
-) -> Result<ValidationPacketPlan, PlanError> {
-    device_validation::validation_packet_plan(g)
-}
-
 /// Reject graph execution while generic executor buffers cannot represent authoritative typed bytes.
 ///
 /// This is graph-wide rather than per-equation: an identity graph can return an input or constant with
@@ -36,15 +28,9 @@ pub(crate) fn plan_validation_packet(
 /// `pub(crate)`/test-only: no production caller survives Card 546b's `GpuExecutor` deletion; kept for
 /// the structural gating coverage in `tests.rs`.
 #[cfg(test)]
-pub(crate) fn validate_graph_execution<V: ValidationChannel>(
-    g: &Graph<V>,
-) -> Result<(), PlanError> {
-    // Several executor entry points call this on a caller-supplied Graph before any prepared-graph
-    // constructor has validated it. Validate first so capability inspection cannot mask the structural
-    // error (or panic on a malformed value id).
-    validate_graph_structure(g)?;
+pub(crate) fn validate_graph_execution(g: &Graph) -> Result<(), PlanError> {
     if let Some(value) = g
-        .values
+        .values()
         .iter_enumerated()
         .find(|(_, value)| value.aval.dtype == DType::E4M3FN)
         .map(|(id, _)| id)
@@ -89,14 +75,12 @@ pub(crate) fn validate_graph_execution<V: ValidationChannel>(
 /// `pub(crate)`/test-only: no production caller survives Card 546b's `GpuExecutor` deletion; kept for
 /// the packed-BF16 contract coverage in `tests.rs`.
 #[cfg(test)]
-pub(crate) fn validate_wgpu_tensor_execution<V: ValidationChannel>(
-    g: &Graph<V>,
-) -> Result<(), PlanError> {
+pub(crate) fn validate_wgpu_tensor_execution(g: &Graph) -> Result<(), PlanError> {
     validate_graph_execution(g)?;
     if let Some(value) = g
-        .values
+        .values()
         .ids()
-        .find(|&id| g.values[id].aval.dtype == DType::BF16)
+        .find(|&id| g.values()[id].aval.dtype == DType::BF16)
     {
         return Err(PlanError::UnrepresentableValue {
             value,
@@ -105,13 +89,6 @@ pub(crate) fn validate_wgpu_tensor_execution<V: ValidationChannel>(
         });
     }
     Ok(())
-}
-
-#[cfg(test)]
-pub(crate) fn validate_graph_structure<V: ValidationChannel>(
-    g: &Graph<V>,
-) -> Result<(), PlanError> {
-    g.validate().map_err(PlanError::InvalidGraph)
 }
 
 /// Card 259: is this flash-attention op's mask per head (one bias row/plane per query head, which ALiBi

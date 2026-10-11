@@ -21,12 +21,14 @@ mod packed;
 mod reduce;
 mod request;
 mod scan;
+#[cfg(test)]
 mod synchronization;
 mod tiled_region;
 mod wmma;
 
 pub use attention::{
-    AttentionSchedule, AttentionSpec, KeyBound, KeyLayout, MaskKind, ScoreTransform,
+    AttentionCombineSpec, AttentionSchedule, AttentionSpec, KeyBound, KeyLayout, MaskKind,
+    ScoreTransform,
 };
 
 // The one generation seam. `poot-graph-plan` plans every generated kernel through `generate` and the request
@@ -75,7 +77,6 @@ pub use gemv::{attn_scores_v_gemv_lds, gemv_lds};
 pub use matmul::{matmul_batched_dt_grid, matmul_batched_epilogue_dt_grid};
 pub use packed::packed_kernel;
 pub use reduce::reduce_last_dt;
-pub use synchronization::cross_block_fence_spin_wait_coop;
 pub use tiled_region::tiled_region;
 pub use wmma::{matmul_tensorcore, matmul_tensorcore_coopmat};
 

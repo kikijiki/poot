@@ -11,17 +11,26 @@ use poot_graph_ir::{KeyLayout, KvBound, value_ranges};
 use poot_graph_ir::{LayerIndex, LayerTagError};
 use poot_quant::PackedWeight;
 use poot_quant::format::WeightFormat;
+use poot_test_util::graph_fixtures::derive;
+
+/// A new program derived from `graph` with `change` applied to its draft: the fixture shape for a
+/// near miss whose operands the matcher must decline (well formed, so the edit check accepts it).
+fn mutated(graph: &Graph, change: impl FnOnce(&mut poot_graph_ir::GraphEdit)) -> Graph {
+    derive(graph, |draft| {
+        change(draft);
+        poot_test_util::graph_fixtures::reinfer(draft);
+    })
+    .expect("the near miss is a well-formed graph")
+}
 
 /// The graph-level packed-dequant preparation these tests exercise: validate, eliminate dead
 /// oracle-only decoding, recognize dense contractions, then reject every remaining escape. The planner's
 /// production entry adds block-float claims on top of the same passes.
 fn prepare_packed_dequant_production(g: &Graph) -> Result<Graph, PackedDequantProductionError> {
-    g.validate()?;
     reject_preexisting_packed_contractions(g)?;
-    let graph = dce_with_roots(g, &[]);
-    let graph = recognize_packed_contractions(&graph);
+    let graph = dce_with_roots(g, &[]).unwrap();
+    let graph = recognize_packed_contractions(&graph).unwrap();
     reject_packed_dequant_escapes(&graph)?;
-    graph.validate()?;
     Ok(graph)
 }
 
@@ -31,67 +40,69 @@ fn packed_graph() -> Result<Graph, poot_graph_ir::BuilderAppendError> {
     let activation = b.constant("activation", TensorType::f32(vec![2, 35]));
     let output =
         poot_graph_ir::ops::packed_linear(&b, activation, "layer", descriptor, None, None)?;
-    Ok(b.finish(output))
+    Ok(b.finish(output).unwrap())
 }
 
 fn packed_graph_with_extra_consumer() -> Result<Graph, poot_graph_ir::BuilderAppendError> {
-    let mut graph = packed_graph()?;
-    let dequant = graph.eqns[0].out;
-    let first_output = graph.output;
-    let transpose_meta = graph.values[graph.eqns[1].out].clone();
-    let transpose2 = graph.values.push(transpose_meta);
-    graph.eqns.push(Eqn {
+    let base = packed_graph()?;
+    let mut graph = base.edit();
+    let dequant = base.eqns()[0].out;
+    let first_output = base.result();
+    let transpose_meta = base.values()[base.eqns()[1].out].clone();
+    let transpose2 = graph.values_mut().push(transpose_meta);
+    graph.eqns_mut().push(Eqn {
         op: OpKind::Transpose { perm: vec![1, 0] },
         inputs: vec![Operand::Value(dequant)],
         out: transpose2,
         layer: None,
     });
-    let activation = match graph.eqns[2].inputs[0] {
+    let activation = match base.eqns()[2].inputs[0] {
         Operand::Value(value) => value,
         Operand::Lit(_) => unreachable!(),
     };
-    let second_output = graph.values.push(graph.values[first_output].clone());
-    graph.eqns.push(Eqn {
+    let second_output = graph.values_mut().push(base.values()[first_output].clone());
+    graph.eqns_mut().push(Eqn {
         op: OpKind::MatMul,
         inputs: vec![Operand::Value(activation), Operand::Value(transpose2)],
         out: second_output,
         layer: None,
     });
-    let combined = graph.values.push(graph.values[first_output].clone());
-    graph.eqns.push(Eqn {
+    let combined = graph.values_mut().push(base.values()[first_output].clone());
+    graph.eqns_mut().push(Eqn {
         op: OpKind::Binary(BinOp::Add),
         inputs: vec![Operand::Value(first_output), Operand::Value(second_output)],
         out: combined,
         layer: None,
     });
-    graph.output = combined;
-    Ok(graph)
+    graph.set_result(combined);
+    Ok(graph.commit().unwrap())
 }
 
 fn packed_graph_with_extra_carrier_consumer() -> Result<Graph, poot_graph_ir::BuilderAppendError> {
-    let mut graph = packed_graph()?;
-    let weight = match graph.eqns[0].inputs[0] {
+    let base = packed_graph()?;
+    let mut graph = base.edit();
+    let weight = match base.eqns()[0].inputs[0] {
         Operand::Value(value) => value,
         Operand::Lit(_) => unreachable!(),
     };
-    let original_output = graph.output;
-    let cast = graph.values.push(poot_graph_ir::ValueMeta::new(
+    let original_output = base.result();
+    let cast = graph.values_mut().push(poot_graph_ir::ValueMeta::new(
         TensorType::f32(vec![3, 18]),
         Storage::Device,
         None,
     ));
-    graph.eqns.push(Eqn {
+    graph.eqns_mut().push(Eqn {
         op: OpKind::Cast { to: DType::F32 },
         inputs: vec![Operand::Value(weight)],
         out: cast,
         layer: None,
     });
-    let reduced = graph.values.push(poot_graph_ir::ValueMeta::new(
+    let reduced = graph.values_mut().push(poot_graph_ir::ValueMeta::new(
         TensorType::f32(vec![3]),
         Storage::Device,
         None,
     ));
-    graph.eqns.push(Eqn {
+    graph.eqns_mut().push(Eqn {
         op: OpKind::Reduce {
             op: RedOp::Sum,
             axis: 1,
@@ -101,30 +112,56 @@ fn packed_graph_with_extra_carrier_consumer() -> Result<Graph, poot_graph_ir::Bu
         out: reduced,
         layer: None,
     });
-    let broadcast = graph.values.push(poot_graph_ir::ValueMeta::new(
+    let broadcast = graph.values_mut().push(poot_graph_ir::ValueMeta::new(
         TensorType::f32(vec![2, 3]),
         Storage::Device,
         None,
     ));
-    graph.eqns.push(Eqn {
+    graph.eqns_mut().push(Eqn {
         op: OpKind::Broadcast { shape: vec![2, 3] },
         inputs: vec![Operand::Value(reduced)],
         out: broadcast,
         layer: None,
     });
-    let combined = graph.values.push(poot_graph_ir::ValueMeta::new(
+    let combined = graph.values_mut().push(poot_graph_ir::ValueMeta::new(
         TensorType::f32(vec![2, 3]),
         Storage::Device,
         None,
     ));
-    graph.eqns.push(Eqn {
+    graph.eqns_mut().push(Eqn {
         op: OpKind::Binary(BinOp::Add),
         inputs: vec![Operand::Value(original_output), Operand::Value(broadcast)],
         out: combined,
         layer: None,
     });
-    graph.output = combined;
-    Ok(graph)
+    graph.set_result(combined);
+    Ok(graph.commit().unwrap())
+}
+
+/// `g` with its transpose's permutation replaced by the identity and every type that follows retyped
+/// to match, so the graph stays well formed and only the recognizer's permutation check can refuse it.
+fn wrong_permutation(g: &Graph) -> Graph {
+    let transpose = g
+        .eqns()
+        .iter()
+        .position(|eqn| matches!(eqn.op, OpKind::Transpose { .. }))
+        .unwrap();
+    let matmul = g
+        .eqns()
+        .iter()
+        .position(|eqn| matches!(eqn.op, OpKind::MatMul))
+        .unwrap();
+    let Operand::Value(activation) = g.eqns()[matmul].inputs[0] else {
+        unreachable!()
+    };
+    let (transpose_out, matmul_out) = (g.eqns()[transpose].out, g.eqns()[matmul].out);
+    derive(g, |draft| {
+        draft.eqns_mut()[transpose].op = OpKind::Transpose { perm: vec![0, 1] };
+        draft.values_mut()[transpose_out].aval = TensorType::f32(vec![3, 35]);
+        draft.values_mut()[activation].aval = TensorType::f32(vec![2, 3]);
+        draft.values_mut()[matmul_out].aval = TensorType::f32(vec![2, 35]);
+    })
+    .unwrap()
 }
 
 #[test]
@@ -132,8 +169,11 @@ fn packed_dequant_fusion_matches_only_exact_linear() -> Result<(), poot_graph_ir
 {
     let graph = packed_graph()?;
     let fused = prepare_packed_dequant_production(&graph).unwrap();
-    assert_eq!(fused.eqns.len(), 1);
-    assert!(matches!(fused.eqns[0].op, OpKind::PackedContraction { .. }));
+    assert_eq!(fused.eqns().len(), 1);
+    assert!(matches!(
+        fused.eqns()[0].op,
+        OpKind::PackedContraction { .. }
+    ));
 
     let descriptor = PackedWeight::try_new(WeightFormat::E2m1Row32, [3, 35]).unwrap();
     let builder = Builder::new();
@@ -146,33 +186,16 @@ fn packed_dequant_fusion_matches_only_exact_linear() -> Result<(), poot_graph_ir
         Some(vec![35, 3]),
         None,
     )?;
-    let alias_graph = builder.finish(output);
+    let alias_graph = builder.finish(output).unwrap();
     let alias_fused = prepare_packed_dequant_production(&alias_graph).unwrap();
-    assert_eq!(alias_fused.eqns.len(), 1);
+    assert_eq!(alias_fused.eqns().len(), 1);
     assert!(matches!(
-        alias_fused.eqns[0].op,
+        alias_fused.eqns()[0].op,
         OpKind::PackedContraction { .. }
     ));
-    assert_eq!(alias_fused.aval(alias_fused.output).shape, vec![2, 3]);
+    assert_eq!(alias_fused.aval(alias_fused.result()).shape, vec![2, 3]);
 
-    let mut wrong_perm = graph.clone();
-    let transpose = wrong_perm
-        .eqns
-        .iter_mut()
-        .find(|eqn| matches!(eqn.op, OpKind::Transpose { .. }))
-        .unwrap();
-    transpose.op = OpKind::Transpose { perm: vec![0, 1] };
-    wrong_perm.values[transpose.out].aval = TensorType::f32(vec![3, 35]);
-    let matmul = wrong_perm
-        .eqns
-        .iter()
-        .find(|eqn| matches!(eqn.op, OpKind::MatMul))
-        .unwrap();
-    let Operand::Value(activation) = matmul.inputs[0] else {
-        unreachable!()
-    };
-    wrong_perm.values[activation].aval = TensorType::f32(vec![2, 3]);
-    wrong_perm.values[matmul.out].aval = TensorType::f32(vec![2, 35]);
+    let wrong_perm = wrong_permutation(&graph);
     assert!(matches!(
         prepare_packed_dequant_production(&wrong_perm),
         Err(PackedDequantProductionError::TransposePermutation { .. })
@@ -198,17 +221,17 @@ fn packed_block_diagonal_chain_is_recognized_as_one_contraction()
     let output = poot_graph_ir::ops::packed_block_diagonal_linear(
         &builder, activation, "blocked", descriptor, 4, None,
     )?;
-    let graph = builder.finish(output);
+    let graph = builder.finish(output).unwrap();
     let fused = prepare_packed_dequant_production(&graph).unwrap();
-    assert_eq!(fused.eqns.len(), 1);
+    assert_eq!(fused.eqns().len(), 1);
     assert!(matches!(
-        fused.eqns[0].op,
+        fused.eqns()[0].op,
         OpKind::PackedContraction {
             rows: poot_graph_ir::ContractionRows::Blocks(4),
             ..
         }
     ));
-    assert_eq!(fused.aval(fused.output).shape, vec![4, 5, 2]);
+    assert_eq!(fused.aval(fused.result()).shape, vec![4, 5, 2]);
     Ok(())
 }
 
@@ -219,7 +242,7 @@ fn packed_block_diagonal_graph() -> Result<Graph, poot_graph_ir::BuilderAppendEr
     let output = poot_graph_ir::ops::packed_block_diagonal_linear(
         &b, activation, "blocked", descriptor, 4, None,
     )?;
-    Ok(b.finish(output))
+    Ok(b.finish(output).unwrap())
 }
 
 /// A second full branch off the same `PackedDequant` output (reshape/transpose/matmul cloned from
@@ -227,44 +250,49 @@ fn packed_block_diagonal_graph() -> Result<Graph, poot_graph_ir::BuilderAppendEr
 /// without hand-computing any new tensor shape.
 fn packed_block_diagonal_graph_with_extra_consumer()
 -> Result<Graph, poot_graph_ir::BuilderAppendError> {
-    let mut graph = packed_block_diagonal_graph()?;
-    let dequant = graph.eqns[0].out;
-    let first_output = graph.output;
+    let base = packed_block_diagonal_graph()?;
+    let mut graph = base.edit();
+    let dequant = base.eqns()[0].out;
+    let first_output = base.result();
 
-    let reshape2 = graph.values.push(graph.values[graph.eqns[1].out].clone());
-    graph.eqns.push(Eqn {
-        op: graph.eqns[1].op.clone(),
+    let reshape2 = graph
+        .values_mut()
+        .push(base.values()[base.eqns()[1].out].clone());
+    graph.eqns_mut().push(Eqn {
+        op: base.eqns()[1].op.clone(),
         inputs: vec![Operand::Value(dequant)],
         out: reshape2,
         layer: None,
     });
-    let transpose2 = graph.values.push(graph.values[graph.eqns[2].out].clone());
-    graph.eqns.push(Eqn {
-        op: graph.eqns[2].op.clone(),
+    let transpose2 = graph
+        .values_mut()
+        .push(base.values()[base.eqns()[2].out].clone());
+    graph.eqns_mut().push(Eqn {
+        op: base.eqns()[2].op.clone(),
         inputs: vec![Operand::Value(reshape2)],
         out: transpose2,
         layer: None,
     });
-    let activation = match graph.eqns[3].inputs[0] {
+    let activation = match base.eqns()[3].inputs[0] {
         Operand::Value(value) => value,
         Operand::Lit(_) => unreachable!(),
     };
-    let second_output = graph.values.push(graph.values[first_output].clone());
-    graph.eqns.push(Eqn {
+    let second_output = graph.values_mut().push(base.values()[first_output].clone());
+    graph.eqns_mut().push(Eqn {
         op: OpKind::MatMul,
         inputs: vec![Operand::Value(activation), Operand::Value(transpose2)],
         out: second_output,
         layer: None,
     });
-    let combined = graph.values.push(graph.values[first_output].clone());
-    graph.eqns.push(Eqn {
+    let combined = graph.values_mut().push(base.values()[first_output].clone());
+    graph.eqns_mut().push(Eqn {
         op: OpKind::Binary(BinOp::Add),
         inputs: vec![Operand::Value(first_output), Operand::Value(second_output)],
         out: combined,
         layer: None,
     });
-    graph.output = combined;
-    Ok(graph)
+    graph.set_result(combined);
+    Ok(graph.commit().unwrap())
 }
 
 #[test]
@@ -285,7 +313,6 @@ fn packed_block_diagonal_production_rejects_extra_dequant_consumer()
 fn packed_dequant_production_rejects_live_extra_carrier_consumer()
 -> Result<(), poot_graph_ir::BuilderAppendError> {
     let graph = packed_graph_with_extra_carrier_consumer()?;
-    graph.validate().unwrap();
     assert!(matches!(
         prepare_packed_dequant_production(&graph),
         Err(PackedDequantProductionError::CarrierConsumerCount { consumers: 2, .. })
@@ -297,26 +324,28 @@ fn packed_dequant_production_rejects_live_extra_carrier_consumer()
 fn packed_recognition_keeps_validation_observed_members()
 -> Result<(), poot_graph_ir::BuilderAppendError> {
     let base = packed_graph()?;
-    let dequant = base.eqns[0].out;
-    let graph = base.with_validations(vec![poot_graph_ir::graph::ValidationOutput {
-        id: poot_graph_ir::graph::ValidationId(7),
-        name: "observes-dequant".into(),
-        value: dequant,
-    }]);
-    graph.validate().unwrap();
+    let dequant = base.eqns()[0].out;
+    let graph = derive(&base, |draft| {
+        draft.push_witness(
+            poot_graph_ir::graph::ValidationId(7),
+            "observes-dequant",
+            dequant,
+        );
+    })
+    .unwrap();
 
-    let recognized = recognize_packed_contractions(&graph);
-    assert_eq!(recognized.validation_outputs(), graph.validation_outputs());
+    let recognized = recognize_packed_contractions(&graph).unwrap();
+    assert!(recognized.witnesses().eq(graph.witnesses()));
     assert!(
         recognized
-            .eqns
+            .eqns()
             .iter()
             .any(|eqn| eqn.out == dequant && matches!(eqn.op, OpKind::PackedDequant { .. })),
         "a witness-observed dequant must stay unrecognized"
     );
     assert!(
         !recognized
-            .eqns
+            .eqns()
             .iter()
             .any(|eqn| matches!(eqn.op, OpKind::PackedContraction { .. }))
     );
@@ -331,44 +360,42 @@ fn packed_recognition_keeps_validation_observed_members()
 fn production_rejects_packed_dequant_escape_table() -> Result<(), poot_graph_ir::BuilderAppendError>
 {
     let base = packed_graph()?;
-    let dequant = base.eqns[0].out;
-    let transpose = base.eqns[1].out;
-    let weight = match base.eqns[0].inputs[0] {
+    let dequant = base.eqns()[0].out;
+    let transpose = base.eqns()[1].out;
+    let weight = match base.eqns()[0].inputs[0] {
         Operand::Value(value) => value,
         Operand::Lit(_) => unreachable!(),
     };
     type Reject = fn(&PackedDequantProductionError) -> bool;
     let mut cases: Vec<(&str, Graph, Reject)> = Vec::new();
 
-    let mut output = base.clone();
-    output.output = dequant;
+    let output = derive(&base, |draft| draft.set_result(dequant)).unwrap();
     cases.push(("graph output", output, |error| {
         matches!(error, PackedDequantProductionError::GraphOutput { .. })
     }));
 
-    let mut state_carrier = base.clone();
-    // R-644-1: a State value must carry a role, or validate()'s own MissingStateRole check fires
-    // before this test's target (CarrierStorage) gets a chance to. `ValueMeta::new_state` is the only
-    // constructor that can produce one (`state_role` is private outside `poot-graph-ir`).
-    state_carrier.values[weight] = poot_graph_ir::ValueMeta::new_state(
-        state_carrier.values[weight].aval.clone(),
-        state_carrier.values[weight].name.clone(),
-        poot_graph_ir::StateRole::Recurrent,
-    );
+    // R-644-1: a State value must carry a role, or the graph is malformed before this test's target
+    // (CarrierStorage) is reached. `ValueMeta::new_state` is the only constructor that can produce one
+    // (`state_role` is private outside `poot-graph-ir`).
+    let as_state = |draft: &mut poot_graph_ir::GraphEdit, value: ValueId| {
+        let meta = poot_graph_ir::ValueMeta::new_state(
+            draft.values()[value].aval.clone(),
+            draft.values()[value].name.clone(),
+            poot_graph_ir::StateRole::Recurrent,
+        );
+        draft.values_mut()[value] = meta;
+    };
+    let state_carrier = derive(&base, |draft| as_state(draft, weight)).unwrap();
     cases.push(("state carrier", state_carrier, |error| {
         matches!(error, PackedDequantProductionError::CarrierStorage { .. })
     }));
 
-    let mut direct_storage = prepare_packed_dequant_production(&base).unwrap();
-    let direct_weight = match direct_storage.eqns[0].inputs[1] {
+    let recognized = prepare_packed_dequant_production(&base).unwrap();
+    let direct_weight = match recognized.eqns()[0].inputs[1] {
         Operand::Value(value) => value,
         Operand::Lit(_) => unreachable!(),
     };
-    direct_storage.values[direct_weight] = poot_graph_ir::ValueMeta::new_state(
-        direct_storage.values[direct_weight].aval.clone(),
-        direct_storage.values[direct_weight].name.clone(),
-        poot_graph_ir::StateRole::Recurrent,
-    );
+    let direct_storage = derive(&recognized, |draft| as_state(draft, direct_weight)).unwrap();
     cases.push(("direct candidate state carrier", direct_storage, |error| {
         matches!(
             error,
@@ -376,8 +403,10 @@ fn production_rejects_packed_dequant_escape_table() -> Result<(), poot_graph_ir:
         )
     }));
 
-    let mut direct_identity = prepare_packed_dequant_production(&base).unwrap();
-    direct_identity.values[direct_weight].name = Some("layer.not_a_packed_weight".into());
+    let direct_identity = derive(&recognized, |draft| {
+        draft.values_mut()[direct_weight].name = Some("layer.not_a_packed_weight".into());
+    })
+    .unwrap();
     cases.push((
         "direct candidate carrier identity",
         direct_identity,
@@ -394,46 +423,39 @@ fn production_rejects_packed_dequant_escape_table() -> Result<(), poot_graph_ir:
     }));
 
     for (label, state_out) in [("dequant state", dequant), ("transpose state", transpose)] {
-        let mut graph = base.clone();
-        let state_in = graph.values.push(poot_graph_ir::ValueMeta::new_state(
-            graph.aval(state_out).clone(),
-            Some(format!("{label}.state")),
-            poot_graph_ir::StateRole::Recurrent,
-        ));
-        graph.inputs.push(state_in);
-        graph.consts.push(state_in);
-        graph.state.push((state_in, state_out));
+        let graph = derive(&base, |draft| {
+            let state_in = draft.values_mut().push(poot_graph_ir::ValueMeta::new_state(
+                base.aval(state_out).clone(),
+                Some(format!("{label}.state")),
+                poot_graph_ir::StateRole::Recurrent,
+            ));
+            draft.inputs_mut().push(state_in);
+            draft.consts_mut().push(state_in);
+            draft.push_state(state_in, state_out);
+        })
+        .unwrap();
         cases.push((label, graph, |error| {
             matches!(error, PackedDequantProductionError::StateOutput { .. })
         }));
     }
 
-    let mut candidate_state = base.clone();
-    let state_meta = poot_graph_ir::ValueMeta::new_state(
-        candidate_state.aval(candidate_state.output).clone(),
-        Some("candidate.state".into()),
-        poot_graph_ir::StateRole::Recurrent,
-    );
-    let state_in = candidate_state.values.push(state_meta);
-    candidate_state.inputs.push(state_in);
-    candidate_state.consts.push(state_in);
-    candidate_state
-        .state
-        .push((state_in, candidate_state.output));
+    let candidate_state = derive(&base, |draft| {
+        let state_meta = poot_graph_ir::ValueMeta::new_state(
+            base.aval(base.result()).clone(),
+            Some("candidate.state".into()),
+            poot_graph_ir::StateRole::Recurrent,
+        );
+        let state_in = draft.values_mut().push(state_meta);
+        draft.inputs_mut().push(state_in);
+        draft.consts_mut().push(state_in);
+        draft.push_state(state_in, base.result());
+    })
+    .unwrap();
     cases.push(("candidate state", candidate_state, |error| {
         matches!(error, PackedDequantProductionError::StateOutput { .. })
     }));
 
-    let mut wrong = base.clone();
-    let transpose_eqn = &mut wrong.eqns[1];
-    transpose_eqn.op = OpKind::Transpose { perm: vec![0, 1] };
-    wrong.values[transpose_eqn.out].aval = TensorType::f32(vec![3, 35]);
-    let matmul = &wrong.eqns[2];
-    let Operand::Value(activation) = matmul.inputs[0] else {
-        unreachable!()
-    };
-    wrong.values[activation].aval = TensorType::f32(vec![2, 3]);
-    wrong.values[matmul.out].aval = TensorType::f32(vec![2, 35]);
+    let wrong = wrong_permutation(&base);
     cases.push(("wrong permutation", wrong, |error| {
         matches!(
             error,
@@ -441,19 +463,20 @@ fn production_rejects_packed_dequant_escape_table() -> Result<(), poot_graph_ir:
         )
     }));
 
-    let mut unmatched = base.clone();
-    unmatched.eqns.remove(1);
-    let matmul = unmatched.eqns.remove(1);
-    unmatched.output = dequant;
-    let output = unmatched.values.push(unmatched.values[dequant].clone());
-    unmatched.eqns.push(Eqn {
-        op: OpKind::Reshape { shape: vec![3, 35] },
-        inputs: vec![Operand::Value(dequant)],
-        out: output,
-        layer: None,
-    });
-    unmatched.output = output;
-    let _ = matmul;
+    let unmatched = derive(&base, |draft| {
+        draft.eqns_mut().remove(1);
+        draft.eqns_mut().remove(1);
+        draft.set_result(dequant);
+        let output = draft.values_mut().push(base.values()[dequant].clone());
+        draft.eqns_mut().push(Eqn {
+            op: OpKind::Reshape { shape: vec![3, 35] },
+            inputs: vec![Operand::Value(dequant)],
+            out: output,
+            layer: None,
+        });
+        draft.set_result(output);
+    })
+    .unwrap();
     cases.push(("unsupported movement", unmatched, |error| {
         matches!(error, PackedDequantProductionError::Movement { .. })
     }));
@@ -476,9 +499,9 @@ fn production_rejects_packed_dequant_escape_table() -> Result<(), poot_graph_ir:
         .map(|(name, tensor_type)| builder.constant(name.as_str(), tensor_type))
         .collect();
     let _dead = builder.packed_dequant(&sources, descriptor);
-    let dead_graph = builder.finish(output);
+    let dead_graph = builder.finish(output).unwrap();
     let prepared = prepare_packed_dequant_production(&dead_graph).unwrap();
-    assert!(prepared.eqns.is_empty(), "DCE removes oracle-only decode");
+    assert!(prepared.eqns().is_empty(), "DCE removes oracle-only decode");
     Ok(())
 }
 
@@ -492,13 +515,13 @@ fn flash_attention_fuses_a_distinct_value_head_width() {
     let v = b.constant("v", TensorType::f32(vec![1, 2, 5, 2]));
     let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, 5]));
     let out = attention_masked(&b, q, k, v, 1, 1.0, mask);
-    let g = b.finish(out);
-    let optimized = flash_attention_capped(&g, None);
+    let g = b.finish(out).unwrap();
+    let optimized = flash_attention_capped(&g, None).unwrap();
 
-    assert_eq!(optimized.aval(optimized.output).shape, vec![1, 2, 1, 2]);
+    assert_eq!(optimized.aval(optimized.result()).shape, vec![1, 2, 1, 2]);
     assert!(
         optimized
-            .eqns
+            .eqns()
             .iter()
             .any(|eqn| matches!(eqn.op, OpKind::Attention(_))),
         "the generated kernel takes a value width of its own"
@@ -535,12 +558,9 @@ fn flash_attention_declines_broadcast_kv() {
         let v = b.constant("v", TensorType::f32(kvs.to_vec()));
         let mask = b.constant("mask", TensorType::f32(ms.to_vec()));
         let out = attention_masked(&b, q, k, v, 1, 0.25, mask);
-        let optimized = flash_attention_capped(&b.finish(out), None);
-        optimized
-            .validate()
-            .unwrap_or_else(|e| panic!("{name}: optimized graph invalid: {e}"));
+        let optimized = flash_attention_capped(&b.finish(out).unwrap(), None).unwrap();
         let flash: Vec<String> = optimized
-            .eqns
+            .eqns()
             .iter()
             .filter(|e| is_flash(&e.op))
             .map(|e| e.op.name())
@@ -569,8 +589,8 @@ fn flash_graph(decode: bool) -> (Graph, [ValueId; 3]) {
         poot_graph_ir::ops::attention_prefill(&b, q, k, v, 1, 0.25, mask)
     };
     // A tracer states attention as primitives; the flash op is the matcher's.
-    let g = dce(&flash_attention_capped(&b.finish(out), None));
-    let flash = g.eqns.last().expect("the flash equation");
+    let g = dce(&flash_attention_capped(&b.finish(out).unwrap(), None).unwrap()).unwrap();
+    let flash = g.eqns().last().expect("the flash equation");
     assert!(
         matches!(flash.op, OpKind::Attention(_)),
         "the matcher forms the flash op: {:?}",
@@ -579,38 +599,38 @@ fn flash_graph(decode: bool) -> (Graph, [ValueId; 3]) {
     (g, [k.id(), v.id(), mask.id()])
 }
 
-/// R467-001: `Graph::validate` rejects a fused flash op whose K/V or mask the op would index past, from
+/// R467-001: the edit check rejects a fused flash op whose K/V or mask the op would index past, from
 /// any source (not just the matcher), with the typed `AttentionOperand` error.
 #[test]
 fn validate_rejects_flash_ops_with_inconsistent_kv_or_mask() {
     for decode in [true, false] {
         let name = if decode { "decode" } else { "prefill" };
         let (dense, [k, v, mask]) = flash_graph(decode);
-        dense
-            .validate()
-            .unwrap_or_else(|e| panic!("{name}: dense operands must validate: {e}"));
         // (operand id, rank-4 axis to shrink to 1, operand name): a broadcast K head axis, a broadcast V
         // batch/row axis, and a mask whose head axis is neither 1 nor Hq.
         for (id, axis, size, operand) in [(k, 1, 1, "k"), (v, 0, 1, "v"), (mask, 1, 2, "mask")] {
-            let mut bad = dense.clone();
-            let expected = bad.values[id].aval.shape.clone();
+            let expected = dense.values()[id].aval.shape.clone();
             let mut actual = expected.clone();
             actual[axis] = size;
             if actual == expected {
                 // Prefill is batch 1, so shrinking V's batch axis changes nothing: shrink its rows.
                 actual[2] = 1;
             }
-            bad.values[id].aval.shape = actual.clone();
-            match bad.validate() {
-                Err(GraphValidationError::EquationInference {
-                    source:
-                        poot_graph_ir::error::ShapeError::AttentionOperand {
-                            operand: got,
-                            expected: want,
-                            actual: seen,
-                        },
-                    ..
-                }) => {
+            let bad = derive(&dense, |draft| {
+                draft.values_mut()[id].aval.shape = actual.clone();
+            });
+            match bad {
+                Err(poot_graph_ir::EditError::Invalid(
+                    poot_graph_ir::GraphValidationError::EquationInference {
+                        source:
+                            poot_graph_ir::error::ShapeError::AttentionOperand {
+                                operand: got,
+                                expected: want,
+                                actual: seen,
+                            },
+                        ..
+                    },
+                )) => {
                     assert_eq!(got, operand, "{name}");
                     assert_eq!(want, expected, "{name}: {operand} expected shape");
                     assert_eq!(seen, actual, "{name}: {operand} actual shape");
@@ -639,7 +659,7 @@ fn rope_chain(x_shape: Vec<usize>, table_shape: Vec<usize>) -> Graph {
     let xc = b.binary(BinOp::Mul, x, cos);
     let rs = b.binary(BinOp::Mul, rotate_half, sin);
     let out = b.binary(BinOp::Add, xc, rs);
-    b.finish(out)
+    b.finish(out).unwrap()
 }
 
 /// R467-002: a rotate-half chain whose per-head cos/sin broadcast a shared x up (`x[1,1,S,D]`,
@@ -652,12 +672,12 @@ fn rope_fusion_declines_a_chain_that_broadcasts_x_up() {
         (vec![1, 4, 3, 8], vec![1, 1, 3, 8], 1),
     ] {
         let g = rope_chain(x.clone(), table.clone());
-        let fused = rope_fusion(&g);
-        fused.validate().unwrap_or_else(|e| {
+        // The pass's result is a checked graph: an ill-typed rewrite is an `EditError`, not a graph.
+        let fused = rope_fusion(&g).unwrap_or_else(|e| {
             panic!("x {x:?}, cos {table:?}: rope_fusion left an ill-typed graph: {e}")
         });
         let got = fused
-            .eqns
+            .eqns()
             .iter()
             .filter(|e| matches!(e.op, OpKind::Rope { .. }))
             .count();
@@ -699,11 +719,13 @@ fn dce_drops_dead_eqns() {
     let x = b.constant("x", TensorType::f32(vec![4]));
     let _dead = b.binary(BinOp::Add, x, x); // never used
     let out = b.binary(BinOp::Mul, x, x);
-    let g = b.finish(out);
-    let d = dce(&g);
-    d.validate().expect("dce graph valid");
-    assert!(d.eqns.len() < g.eqns.len(), "dce should drop the dead add");
-    assert_eq!(d.aval(d.output).shape, vec![4]);
+    let g = b.finish(out).unwrap();
+    let d = dce(&g).unwrap();
+    assert!(
+        d.eqns().len() < g.eqns().len(),
+        "dce should drop the dead add"
+    );
+    assert_eq!(d.aval(d.result()).shape, vec![4]);
 }
 
 #[test]
@@ -717,7 +739,7 @@ fn peak_transient_bytes_counts_the_live_working_set() {
     let a = b.unary(poot_graph_ir::op::UnOp::Neg, x);
     let bb = b.unary(poot_graph_ir::op::UnOp::Neg, a);
     let c = b.unary(poot_graph_ir::op::UnOp::Neg, bb);
-    let g = b.finish(c);
+    let g = b.finish(c).unwrap();
     // a born (live={a}=N), b born (live={a,b}=2N) then a freed, c born (live={b,c}=2N) then b freed.
     assert_eq!(peak_transient_bytes(&g), 2 * n * 4);
 }
@@ -730,8 +752,8 @@ fn dispatch_count_excludes_reshape_aliases() {
     let r = b.reshape(x, vec![3, 2]); // alias - not a dispatch
     let t = b.transpose(r, vec![1, 0]); // a real kernel
     let out = b.binary(BinOp::Add, t, t); // a real kernel
-    let g = b.finish(out);
-    assert_eq!(g.eqns.len(), 3, "reshape + transpose + add");
+    let g = b.finish(out).unwrap();
+    assert_eq!(g.eqns().len(), 3, "reshape + transpose + add");
     assert_eq!(dispatch_count(&g), 2, "reshape aliases, so 2 dispatches");
 }
 
@@ -743,16 +765,15 @@ fn cse_folds_duplicate_eqns_and_stays_valid() {
     let a1 = b.binary(BinOp::Add, x, x);
     let a2 = b.binary(BinOp::Add, x, x); // a duplicate of a1
     let out = b.binary(BinOp::Mul, a1, a2);
-    let g = b.finish(out);
-    let c = cse(&g);
-    c.validate().expect("cse graph should validate");
+    let g = b.finish(out).unwrap();
+    let c = cse(&g).unwrap();
     assert!(
-        c.eqns.len() < g.eqns.len(),
+        c.eqns().len() < g.eqns().len(),
         "cse should drop the duplicate add: {} -> {}",
-        g.eqns.len(),
-        c.eqns.len()
+        g.eqns().len(),
+        c.eqns().len()
     );
-    assert_eq!(c.aval(c.output).shape, g.aval(g.output).shape);
+    assert_eq!(c.aval(c.result()).shape, g.aval(g.result()).shape);
 }
 
 #[test]
@@ -762,10 +783,10 @@ fn cse_is_idempotent() {
     let a1 = b.binary(BinOp::Add, x, x);
     let a2 = b.binary(BinOp::Add, x, x);
     let out = b.binary(BinOp::Mul, a1, a2);
-    let g = b.finish(out);
-    let c1 = cse(&g);
-    let c2 = cse(&c1);
-    assert_eq!(c1.eqns.len(), c2.eqns.len());
+    let g = b.finish(out).unwrap();
+    let c1 = cse(&g).unwrap();
+    let c2 = cse(&c1).unwrap();
+    assert_eq!(c1.eqns().len(), c2.eqns().len());
 }
 
 #[test]
@@ -785,19 +806,18 @@ fn cse_merges_computed_constants_of_one_payload_and_drops_the_duplicate_binder()
     let rows = |t| b.gather(t, 0, pos);
     let out = b.binary(BinOp::Add, rows(first), rows(second));
     let out = b.binary(BinOp::Add, out, rows(other));
-    let g = b.finish(out);
-    let c = cse(&g);
-    c.validate().expect("cse graph should validate");
+    let g = b.finish(out).unwrap();
+    let c = cse(&g).unwrap();
     let gathers = |g: &Graph| {
-        g.eqns
+        g.eqns()
             .iter()
             .filter(|e| matches!(e.op, OpKind::Gather { .. }))
             .count()
     };
     assert_eq!(gathers(&g), 3);
     assert_eq!(gathers(&c), 2, "the two gathers of one payload merge");
-    assert_eq!(c.consts.len(), g.consts.len() - 1);
-    assert_eq!(c.inputs.len(), g.inputs.len() - 1);
+    assert_eq!(c.consts().len(), g.consts().len() - 1);
+    assert_eq!(c.inputs().len(), g.inputs().len() - 1);
 }
 
 fn f(b: &Builder, shape: &[usize]) -> poot_graph_ir::builder::Traced {
@@ -811,20 +831,23 @@ fn fuse_collapses_pointwise_chain() {
     let (a, c, d) = (f(&b, &[1, 1, 8]), f(&b, &[1, 1, 8]), f(&b, &[1, 1, 8]));
     let t = b.binary(BinOp::Add, a, c);
     let out = b.binary(BinOp::Mul, t, d);
-    let g = b.finish(out);
-    assert_eq!(g.eqns.len(), 2);
-    let fg = fuse(&g);
-    fg.validate().expect("fused graph valid");
-    assert_eq!(fg.eqns.len(), 1, "the add+mul chain should fuse to one eqn");
-    match &fg.eqns[0].op {
+    let g = b.finish(out).unwrap();
+    assert_eq!(g.eqns().len(), 2);
+    let fg = fuse(&g).unwrap();
+    assert_eq!(
+        fg.eqns().len(),
+        1,
+        "the add+mul chain should fuse to one eqn"
+    );
+    match &fg.eqns()[0].op {
         OpKind::Fused(r) => {
             assert_eq!(r.n_inputs, 3); // a, c, d
             assert_eq!(r.steps.len(), 2);
-            assert_eq!(fg.eqns[0].inputs.len(), 3);
+            assert_eq!(fg.eqns()[0].inputs.len(), 3);
         }
         other => panic!("expected a Fused eqn, got {}", other.name()),
     }
-    assert_eq!(fg.aval(fg.output).shape, vec![1, 1, 8]);
+    assert_eq!(fg.aval(fg.result()).shape, vec![1, 1, 8]);
 }
 
 #[test]
@@ -844,11 +867,10 @@ fn fuse_fuses_a_multi_use_value_read_only_inside_the_region() {
     let u = b.binary(BinOp::Mul, t, c);
     let v = b.binary(BinOp::Sub, t, d);
     let out = b.binary(BinOp::Add, u, v);
-    let g = b.finish(out);
-    let fg = fuse(&g);
-    fg.validate().expect("fused graph valid");
-    assert_eq!(fg.eqns.len(), 1, "t joins the region that reads it twice");
-    assert!(matches!(&fg.eqns[0].op, OpKind::Fused(r) if r.steps.len() == 4));
+    let g = b.finish(out).unwrap();
+    let fg = fuse(&g).unwrap();
+    assert_eq!(fg.eqns().len(), 1, "t joins the region that reads it twice");
+    assert!(matches!(&fg.eqns()[0].op, OpKind::Fused(r) if r.steps.len() == 4));
 }
 
 #[test]
@@ -857,11 +879,10 @@ fn fuse_does_not_wrap_a_singleton() {
     let b = Builder::new();
     let (a, c) = (f(&b, &[3]), f(&b, &[3]));
     let out = b.binary(BinOp::Add, a, c);
-    let g = b.finish(out);
-    let fg = fuse(&g);
-    fg.validate().expect("valid");
-    assert_eq!(fg.eqns.len(), 1);
-    assert!(matches!(fg.eqns[0].op, OpKind::Binary(_)));
+    let g = b.finish(out).unwrap();
+    let fg = fuse(&g).unwrap();
+    assert_eq!(fg.eqns().len(), 1);
+    assert!(matches!(fg.eqns()[0].op, OpKind::Binary(_)));
 }
 
 #[test]
@@ -872,11 +893,10 @@ fn fuse_collapses_exact_i32_pointwise_chain() {
     let y = b.constant("y", ty);
     let sum = b.binary(BinOp::Add, x, y);
     let out = b.binary_scalar(BinOp::GeU, sum, poot_graph_ir::types::Scalar::I32(-1));
-    let g = b.finish(out);
-    let fg = fuse(&g);
-    fg.validate().expect("fused exact-I32 graph remains valid");
-    assert_eq!(fg.eqns.len(), 1, "same-shape I32 Add+GeU should fuse");
-    match &fg.eqns[0].op {
+    let g = b.finish(out).unwrap();
+    let fg = fuse(&g).unwrap();
+    assert_eq!(fg.eqns().len(), 1, "same-shape I32 Add+GeU should fuse");
+    match &fg.eqns()[0].op {
         OpKind::Fused(region) => assert_eq!(region.steps.len(), 2),
         other => panic!("expected Fused, got {}", other.name()),
     }
@@ -893,11 +913,10 @@ fn fuse_i32_closed_dag_absorbs_non_escaping_multi_use() {
     let u = b.binary(BinOp::Or, t, z);
     let v = b.unary(UnOp::Not, t);
     let out = b.select(u, v, t);
-    let g = b.finish(out);
-    let fg = fuse(&g);
-    fg.validate().expect("fused I32 DAG remains valid");
-    assert_eq!(fg.eqns.len(), 1);
-    match &fg.eqns[0].op {
+    let g = b.finish(out).unwrap();
+    let fg = fuse(&g).unwrap();
+    assert_eq!(fg.eqns().len(), 1);
+    match &fg.eqns()[0].op {
         OpKind::Fused(region) => {
             assert_eq!(region.steps.len(), 4);
             assert!(
@@ -921,12 +940,11 @@ fn fuse_float_select_is_a_step_of_a_float_region_with_the_condition_as_a_leaf() 
     let if_false = b.constant("f", TensorType::f32(vec![4]));
     let selected = b.select(cond, if_true, if_false);
     let out = b.unary(UnOp::Neg, selected);
-    let g = b.finish(out);
-    let fg = fuse(&g);
-    fg.validate().expect("the fused graph stays valid");
-    assert_eq!(fg.eqns.len(), 1);
-    let OpKind::Fused(region) = &fg.eqns[0].op else {
-        panic!("expected Fused, got {}", fg.eqns[0].op.name());
+    let g = b.finish(out).unwrap();
+    let fg = fuse(&g).unwrap();
+    assert_eq!(fg.eqns().len(), 1);
+    let OpKind::Fused(region) = &fg.eqns()[0].op else {
+        panic!("expected Fused, got {}", fg.eqns()[0].op.name());
     };
     assert!(
         region
@@ -934,7 +952,7 @@ fn fuse_float_select_is_a_step_of_a_float_region_with_the_condition_as_a_leaf() 
             .iter()
             .any(|step| matches!(step.op, FusedOp::Select))
     );
-    let leaf_dtypes: Vec<_> = fg.eqns[0]
+    let leaf_dtypes: Vec<_> = fg.eqns()[0]
         .inputs
         .iter()
         .map(|input| match input {
@@ -968,11 +986,10 @@ fn fuse_keeps_a_float_select_out_of_row_regions() {
     let exp = b.unary(UnOp::Exp, masked);
     let sum = b.reduce(RedOp::Sum, exp, 1, true);
     let out = b.binary(BinOp::Div, exp, sum);
-    let g = b.finish(out);
-    let fg = fuse(&g);
-    fg.validate().expect("the fused graph stays valid");
+    let g = b.finish(out).unwrap();
+    let fg = fuse(&g).unwrap();
     let mut selects = 0;
-    for eqn in &fg.eqns {
+    for eqn in fg.eqns() {
         match &eqn.op {
             OpKind::FusedRow(region) => assert!(
                 region.steps.iter().all(|step| !matches!(
@@ -1008,11 +1025,10 @@ fn fuse_i32_pack_concat_keeps_shared_operands_in_one_region() {
     let low = b.binary(BinOp::Or, shared, x);
     let high = b.binary(BinOp::Xor, shared, y);
     let packed = b.concat(0, &[low, high]);
-    let g = b.finish(packed);
-    let fg = fuse(&g);
-    fg.validate().expect("packed I32 concat remains valid");
-    assert_eq!(fg.eqns.len(), 1);
-    match &fg.eqns[0].op {
+    let g = b.finish(packed).unwrap();
+    let fg = fuse(&g).unwrap();
+    assert_eq!(fg.eqns().len(), 1);
+    match &fg.eqns()[0].op {
         OpKind::Fused(region) => {
             assert_eq!(region.pack.len(), 2);
             assert_eq!(region.steps.len(), 3);
@@ -1034,22 +1050,21 @@ fn fuse_i32_pack_concat_absorbs_unit_last_axis_unpack_slices() {
     let right = b.slice(packed, 0, 1, 2);
     let masked = b.binary(BinOp::And, left, right);
     let out = b.binary(BinOp::Or, masked, left);
-    let g = b.finish(out);
-    let fg = fuse(&g);
-    fg.validate().expect("packed unpack fusion remains valid");
+    let g = b.finish(out).unwrap();
+    let fg = fuse(&g).unwrap();
     assert!(
-        !fg.eqns
+        !fg.eqns()
             .iter()
             .any(|eqn| matches!(eqn.op, OpKind::Slice { .. })),
         "unit last-axis unpack slices must be absorbed"
     );
     let fused = fg
-        .eqns
+        .eqns()
         .iter()
         .filter(|eqn| matches!(eqn.op, OpKind::Fused(_)))
         .count();
     assert_eq!(fused, 2, "one packed concat region and one unpack consumer");
-    match &fg.eqns[1].op {
+    match &fg.eqns()[1].op {
         OpKind::Fused(region) => {
             assert_eq!(region.n_inputs, 1);
             assert!(region.steps.iter().any(|step| {
@@ -1075,13 +1090,11 @@ fn fuse_i32_pack_concat_keeps_a_pinned_unpack_slice() {
     let right = b.slice(packed, 0, 1, 2);
     let masked = b.binary(BinOp::And, left, right);
     let _keep = b.binary(BinOp::Or, masked, left);
-    let g = b.finish(left);
-    let fg = fuse(&g);
-    fg.validate()
-        .expect("pinned unpack slice must remain a produced graph output");
-    assert_eq!(fg.output, left.id());
+    let g = b.finish(left).unwrap();
+    let fg = fuse(&g).expect("pinned unpack slice must remain a produced graph output");
+    assert_eq!(fg.result(), left.id());
     assert!(
-        fg.eqns.iter().any(|eqn| eqn.out == left.id()),
+        fg.eqns().iter().any(|eqn| eqn.out == left.id()),
         "pinned unit last-axis slice must not be absorbed"
     );
 }
@@ -1096,12 +1109,11 @@ fn fuse_does_not_cross_a_matmul_boundary() {
     let m = b.matmul(s, w); // [1,4], a boundary
     let e = f(&b, &[1, 4]);
     let out = b.binary(BinOp::Add, m, e);
-    let g = b.finish(out);
-    let fg = fuse(&g);
-    fg.validate().expect("valid");
+    let g = b.finish(out).unwrap();
+    let fg = fuse(&g).unwrap();
     // matmul stays; neither add fuses with anything (each is a singleton across the boundary).
-    assert!(fg.eqns.iter().any(|e| matches!(e.op, OpKind::MatMul)));
-    assert!(!fg.eqns.iter().any(|e| matches!(e.op, OpKind::Fused(_))));
+    assert!(fg.eqns().iter().any(|e| matches!(e.op, OpKind::MatMul)));
+    assert!(!fg.eqns().iter().any(|e| matches!(e.op, OpKind::Fused(_))));
 }
 
 #[test]
@@ -1114,23 +1126,22 @@ fn fuse_forms_a_rmsnorm_row_region() {
     let x = b.constant("x", TensorType::f32(vec![1, 1, n]));
     let w = b.constant("w", TensorType::f32(vec![n]));
     let out = rmsnorm(&b, x, w, 1e-6);
-    let g = b.finish(out);
-    let fg = fuse(&g);
-    fg.validate().expect("fused graph valid");
+    let g = b.finish(out).unwrap();
+    let fg = fuse(&g).unwrap();
     let rows = fg
-        .eqns
+        .eqns()
         .iter()
         .filter(|e| matches!(e.op, OpKind::FusedRow(_)))
         .count();
     assert_eq!(rows, 1, "rmsnorm fuses to one FusedRow eqn");
     assert!(
-        fg.eqns.len() < g.eqns.len(),
+        fg.eqns().len() < g.eqns().len(),
         "fusion drops eqns: {} -> {}",
-        g.eqns.len(),
-        fg.eqns.len()
+        g.eqns().len(),
+        fg.eqns().len()
     );
     if let OpKind::FusedRow(r) = &fg
-        .eqns
+        .eqns()
         .iter()
         .find(|e| matches!(e.op, OpKind::FusedRow(_)))
         .unwrap()
@@ -1153,16 +1164,19 @@ fn fuse_does_not_form_a_reduced_output_row_region() {
     // real-model test caught.
     use poot_graph_ir::Scalar;
     use poot_graph_ir::op::RedOp;
-    let has_row = |g: &Graph| g.eqns.iter().any(|e| matches!(e.op, OpKind::FusedRow(_)));
-    let has_reduce = |g: &Graph| g.eqns.iter().any(|e| matches!(e.op, OpKind::Reduce { .. }));
+    let has_row = |g: &Graph| g.eqns().iter().any(|e| matches!(e.op, OpKind::FusedRow(_)));
+    let has_reduce = |g: &Graph| {
+        g.eqns()
+            .iter()
+            .any(|e| matches!(e.op, OpKind::Reduce { .. }))
+    };
 
     // (a) bare reduce of a pointwise: sum(x + x) over the last axis -> output [1,4,1].
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![1, 4, 8]));
     let s = b.binary(BinOp::Add, x, x);
     let r = b.reduce(RedOp::Sum, s, 2, true);
-    let fg = fuse(&b.finish(r));
-    fg.validate().expect("valid");
+    let fg = fuse(&b.finish(r).unwrap()).unwrap();
     assert!(
         !has_row(&fg),
         "bare reduce-output region must not be a FusedRow (0196)"
@@ -1174,8 +1188,7 @@ fn fuse_does_not_form_a_reduced_output_row_region() {
     let x = b.constant("x", TensorType::f32(vec![1, 4, 8]));
     let m = b.reduce(RedOp::Max, x, 2, true);
     let sc = b.binary_scalar(BinOp::Mul, m, Scalar::F32(1.0 / 127.0));
-    let fg = fuse(&b.finish(sc));
-    fg.validate().expect("valid");
+    let fg = fuse(&b.finish(sc).unwrap()).unwrap();
     assert!(
         !has_row(&fg),
         "scalar-after-reduce reduced output must not be a FusedRow (0197)"
@@ -1189,10 +1202,10 @@ fn fuse_is_idempotent() {
     let (a, c, d) = (f(&b, &[1, 1, 8]), f(&b, &[1, 1, 8]), f(&b, &[1, 1, 8]));
     let t = b.binary(BinOp::Add, a, c);
     let out = b.binary(BinOp::Mul, t, d);
-    let g = b.finish(out);
-    let f1 = fuse(&g);
-    let f2 = fuse(&f1);
-    assert_eq!(f1.eqns.len(), f2.eqns.len());
+    let g = b.finish(out).unwrap();
+    let f1 = fuse(&g).unwrap();
+    let f2 = fuse(&f1).unwrap();
+    assert_eq!(f1.eqns().len(), f2.eqns().len());
 }
 
 #[test]
@@ -1210,15 +1223,15 @@ fn elide_noop_transposes_rewrites_only_noops() {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![1, 4, 1, 8]));
     let t = b.transpose(x, vec![0, 2, 1, 3]);
-    let g = elide_noop_transposes(&b.finish(t));
+    let g = elide_noop_transposes(&b.finish(t).unwrap()).unwrap();
     assert!(
-        g.eqns
+        g.eqns()
             .iter()
             .any(|e| matches!(e.op, OpKind::Reshape { .. })),
         "no-op transpose -> reshape"
     );
     assert!(
-        !g.eqns
+        !g.eqns()
             .iter()
             .any(|e| matches!(e.op, OpKind::Transpose { .. })),
         "no transpose dispatch remains"
@@ -1227,9 +1240,9 @@ fn elide_noop_transposes_rewrites_only_noops() {
     let b2 = Builder::new();
     let y = b2.constant("y", TensorType::f32(vec![3, 5]));
     let ty = b2.transpose(y, vec![1, 0]);
-    let g2 = elide_noop_transposes(&b2.finish(ty));
+    let g2 = elide_noop_transposes(&b2.finish(ty).unwrap()).unwrap();
     assert!(
-        g2.eqns
+        g2.eqns()
             .iter()
             .any(|e| matches!(e.op, OpKind::Transpose { .. })),
         "real transpose preserved"
@@ -1245,17 +1258,20 @@ fn collapse_reshape_chains_merges_a_chain() {
     let r1 = b.reshape(x, vec![6, 4]);
     let r2 = b.reshape(r1, vec![24]);
     let r3 = b.reshape(r2, vec![4, 6]);
-    let g = b.finish(r3);
-    assert_eq!(g.eqns.len(), 3);
-    let c = collapse_reshape_chains(&g);
-    c.validate().expect("collapsed graph valid");
-    assert_eq!(c.eqns.len(), 1, "the reshape chain collapses to one");
-    assert!(matches!(c.eqns[0].op, OpKind::Reshape { .. }));
+    let g = b.finish(r3).unwrap();
+    assert_eq!(g.eqns().len(), 3);
+    let c = collapse_reshape_chains(&g).unwrap();
+    assert_eq!(c.eqns().len(), 1, "the reshape chain collapses to one");
+    assert!(matches!(c.eqns()[0].op, OpKind::Reshape { .. }));
     assert!(
-        matches!(c.eqns[0].inputs[0], Operand::Value(v) if v == x.id()),
+        matches!(c.eqns()[0].inputs[0], Operand::Value(v) if v == x.id()),
         "reads the source"
     );
-    assert_eq!(c.aval(c.output).shape, vec![4, 6], "final shape preserved");
+    assert_eq!(
+        c.aval(c.result()).shape,
+        vec![4, 6],
+        "final shape preserved"
+    );
 }
 
 #[test]
@@ -1268,11 +1284,10 @@ fn collapse_keeps_a_still_used_intermediate() {
     let r2 = b.reshape(r1, vec![2, 8]);
     let add = b.binary(BinOp::Add, r1, r1); // second consumer of r1 -> r1 stays live
     let out = b.binary(BinOp::Add, b.reshape(r2, vec![16]), add);
-    let g = b.finish(out);
-    let c = collapse_reshape_chains(&g);
-    c.validate().expect("collapsed graph valid");
+    let g = b.finish(out).unwrap();
+    let c = collapse_reshape_chains(&g).unwrap();
     assert!(
-        c.eqns.iter().any(|e| e.out == r1.id()),
+        c.eqns().iter().any(|e| e.out == r1.id()),
         "the multi-use intermediate reshape is retained"
     );
 }
@@ -1286,24 +1301,23 @@ fn fuse_collapses_the_reshape_after_eliding_a_noop_transpose() {
     let r1 = b.reshape(x, vec![1, 1, 4, 8]);
     let t = b.transpose(r1, vec![0, 2, 1, 3]); // [1,4,1,8] - no-op at seq 1
     let out = b.reshape(t, vec![1, 4, 8]);
-    let g = b.finish(out);
-    let fg = fuse(&g);
-    fg.validate().expect("fused graph valid");
+    let g = b.finish(out).unwrap();
+    let fg = fuse(&g).unwrap();
     assert!(
-        !fg.eqns
+        !fg.eqns()
             .iter()
             .any(|e| matches!(e.op, OpKind::Transpose { .. })),
         "no transpose dispatch remains"
     );
     assert_eq!(
-        fg.eqns
+        fg.eqns()
             .iter()
             .filter(|e| matches!(e.op, OpKind::Reshape { .. }))
             .count(),
         1,
         "the reshape/transpose/reshape run collapses to one reshape"
     );
-    assert_eq!(fg.aval(fg.output).shape, vec![1, 4, 8]);
+    assert_eq!(fg.aval(fg.result()).shape, vec![1, 4, 8]);
 }
 
 #[test]
@@ -1319,12 +1333,11 @@ fn rope_fusion_full_collapses_the_rotate_half_chain() {
     let sin = b.constant("sin", TensorType::f32(vec![max_pos, d]));
     let pos = b.slot(Slot::Pos, TensorType::scalar(DType::I32));
     let out = poot_graph_ir::ops::rope(&b, x, cos, sin, pos);
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let before = dispatch_count(&g);
-    let fused = dce(&rope_fusion(&cse(&g)));
-    fused.validate().expect("fused graph valid");
+    let fused = dce(&rope_fusion(&cse(&g).unwrap()).unwrap()).unwrap();
     let ropes = fused
-        .eqns
+        .eqns()
         .iter()
         .filter(|e| matches!(e.op, OpKind::Rope { .. }))
         .count();
@@ -1332,7 +1345,7 @@ fn rope_fusion_full_collapses_the_rotate_half_chain() {
     // the rotate-half remnants (neg/concat/the split slices) are dead and gone.
     assert!(
         !fused
-            .eqns
+            .eqns()
             .iter()
             .any(|e| matches!(e.op, OpKind::Unary(UnOp::Neg) | OpKind::Concat { .. })),
         "rotate-half neg/concat should be fused away"
@@ -1343,7 +1356,7 @@ fn rope_fusion_full_collapses_the_rotate_half_chain() {
         "fusion cuts dispatches: {before} -> {after}"
     );
     let rope = fused
-        .eqns
+        .eqns()
         .iter()
         .find(|e| matches!(e.op, OpKind::Rope { .. }))
         .unwrap();
@@ -1366,11 +1379,10 @@ fn rope_fusion_partial_absorbs_passthrough() {
     let sin = b.constant("sin", TensorType::f32(vec![max_pos, rot]));
     let pos = b.slot(Slot::Pos, TensorType::scalar(DType::I32));
     let out = poot_graph_ir::ops::rope(&b, x, cos, sin, pos);
-    let g = b.finish(out);
-    let fused = dce(&rope_fusion(&cse(&g)));
-    fused.validate().expect("fused graph valid");
+    let g = b.finish(out).unwrap();
+    let fused = dce(&rope_fusion(&cse(&g).unwrap()).unwrap()).unwrap();
     let ropes: Vec<&Eqn> = fused
-        .eqns
+        .eqns()
         .iter()
         .filter(|e| matches!(e.op, OpKind::Rope { .. }))
         .collect();
@@ -1391,7 +1403,7 @@ fn rope_fusion_partial_absorbs_passthrough() {
         "Rope over full x"
     );
     assert!(
-        !fused.eqns.iter().any(|e| matches!(
+        !fused.eqns().iter().any(|e| matches!(
             e.op,
             OpKind::Unary(UnOp::Neg) | OpKind::Concat { .. } | OpKind::Slice { .. }
         )),
@@ -1415,12 +1427,11 @@ fn optimize_fuses_the_rope_chain_into_one_rope_op() {
     let sin = b.constant("sin", TensorType::f32(vec![max_pos, d]));
     let pos = b.slot(Slot::Pos, TensorType::scalar(DType::I32));
     let out = poot_graph_ir::ops::rope(&b, x, cos, sin, pos);
-    let g = b.finish(out);
-    let optimized = dce(&rope_fusion(&cse(&g)));
-    optimized.validate().expect("optimized graph valid");
+    let g = b.finish(out).unwrap();
+    let optimized = dce(&rope_fusion(&cse(&g).unwrap()).unwrap()).unwrap();
     assert_eq!(
         optimized
-            .eqns
+            .eqns()
             .iter()
             .filter(|e| matches!(e.op, OpKind::Rope { .. }))
             .count(),
@@ -1429,7 +1440,7 @@ fn optimize_fuses_the_rope_chain_into_one_rope_op() {
     );
     assert!(
         !optimized
-            .eqns
+            .eqns()
             .iter()
             .any(|e| matches!(e.op, OpKind::Unary(UnOp::Neg) | OpKind::Concat { .. })),
         "dce must leave no rotate-half neg/concat remnants"
@@ -1445,11 +1456,11 @@ fn rope_fusion_ignores_a_non_rope_add_of_two_muls() {
     let m0 = b.binary(BinOp::Mul, p, q);
     let m1 = b.binary(BinOp::Mul, q, p);
     let out = b.binary(BinOp::Add, m0, m1);
-    let g = b.finish(out);
-    let fused = rope_fusion(&cse(&g));
+    let g = b.finish(out).unwrap();
+    let fused = rope_fusion(&cse(&g).unwrap()).unwrap();
     assert!(
         !fused
-            .eqns
+            .eqns()
             .iter()
             .any(|e| matches!(e.op, OpKind::Rope { .. })),
         "a non-rope add of two muls must not match"
@@ -1472,12 +1483,11 @@ fn cse_remaps_validation_roots() {
     )
     .unwrap();
 
-    let transformed = cse(&graph);
-    transformed.validate().unwrap();
-    assert_eq!(transformed.eqns.len(), 1);
+    let transformed = cse(&graph).unwrap();
+    assert_eq!(transformed.eqns().len(), 1);
     assert_eq!(
-        transformed.validation_outputs()[0].value,
-        transformed.output
+        transformed.witnesses().next().unwrap().value,
+        transformed.result()
     );
 }
 
@@ -1497,9 +1507,8 @@ fn dce_keeps_validation_only_producer() {
     )
     .unwrap();
 
-    let transformed = dce(&graph);
-    transformed.validate().unwrap();
-    assert!(transformed.eqns.iter().any(|eqn| eqn.out == witness.id()));
+    let transformed = dce(&graph).unwrap();
+    assert!(transformed.eqns().iter().any(|eqn| eqn.out == witness.id()));
 }
 
 #[test]
@@ -1518,10 +1527,9 @@ fn fusion_pins_validation_packet_values() {
     )
     .unwrap();
 
-    let transformed = fuse(&graph);
-    transformed.validate().unwrap();
+    let transformed = fuse(&graph).unwrap();
     assert!(
-        transformed.eqns.iter().any(|eqn| eqn.out == witness.id()),
+        transformed.eqns().iter().any(|eqn| eqn.out == witness.id()),
         "the validation root must not be absorbed into its consumer"
     );
 }
@@ -1542,12 +1550,11 @@ fn movement_cleanup_preserves_validation_only_root() {
     )
     .unwrap();
 
-    let transformed = collapse_reshape_chains(&elide_noop_transposes(&graph));
-    transformed.validate().unwrap();
-    assert_eq!(transformed.validations, graph.validations);
+    let transformed = collapse_reshape_chains(&elide_noop_transposes(&graph).unwrap()).unwrap();
+    assert!(transformed.witnesses().eq(graph.witnesses()));
     assert!(
         transformed
-            .eqns
+            .eqns()
             .iter()
             .any(|eqn| eqn.out == witness.id() && matches!(eqn.op, OpKind::Reshape { .. })),
         "the validation-only movement value must stay independently materialized"
@@ -1579,13 +1586,14 @@ fn stage_split_layered_graph(layers: usize) -> Graph {
         state.push((k_in, k_out));
         hidden = next;
     }
-    b.finish_with_state(hidden, &state)
+    b.finish(poot_graph_ir::Outputs::new(hidden).with_state(&state))
+        .unwrap()
 }
 
 #[test]
 fn adr0099_s2_stage_graphs_partition_every_equation_and_validate() {
     let graph = stage_split_layered_graph(3);
-    assert_eq!(graph.eqns.len(), 9, "three equations per block");
+    assert_eq!(graph.eqns().len(), 9, "three equations per block");
 
     for (cuts, expected_boundaries, expected_pairs) in [
         (vec![3usize], 1usize, vec![vec![0usize], vec![1, 2]]),
@@ -1601,7 +1609,7 @@ fn adr0099_s2_stage_graphs_partition_every_equation_and_validate() {
         // renumber their values, so the equations are compared by operation and layer, not by id.
         let shape_of = |graph: &Graph| -> Vec<String> {
             graph
-                .eqns
+                .eqns()
                 .iter()
                 .map(|eqn| format!("{:?}/{:?}", eqn.op, eqn.layer))
                 .collect()
@@ -1618,13 +1626,12 @@ fn adr0099_s2_stage_graphs_partition_every_equation_and_validate() {
         for (stage_index, stage) in split.stages.iter().enumerate() {
             let owned: Vec<String> = stage
                 .graph
-                .state
-                .iter()
-                .map(|&(state_input, _)| state_name(&stage.graph, state_input))
+                .state()
+                .map(|(state_input, _)| state_name(&stage.graph, state_input))
                 .collect();
             let expected: Vec<String> = expected_pairs[stage_index]
                 .iter()
-                .map(|&pair| state_name(&graph, graph.state[pair].0))
+                .map(|&pair| state_name(&graph, graph.state().nth(pair).unwrap().0))
                 .collect();
             assert_eq!(
                 owned, expected,
@@ -1632,7 +1639,7 @@ fn adr0099_s2_stage_graphs_partition_every_equation_and_validate() {
             );
             let bound_state: Vec<String> = stage
                 .graph
-                .inputs
+                .inputs()
                 .iter()
                 .filter(|&&id| stage.graph.meta(id).storage == Storage::State)
                 .map(|&id| state_name(&stage.graph, id))
@@ -1648,8 +1655,7 @@ fn adr0099_s2_stage_graphs_partition_every_equation_and_validate() {
         for boundary in &split.boundaries {
             let producer = &split.stages[boundary.producing_stage].graph;
             let export = producer
-                .exports
-                .iter()
+                .exports()
                 .find(|export| export.id == boundary.id)
                 .unwrap_or_else(|| {
                     panic!(
@@ -1658,15 +1664,15 @@ fn adr0099_s2_stage_graphs_partition_every_equation_and_validate() {
                     )
                 });
             assert!(
-                producer.eqns.iter().any(|eqn| eqn.out == export.value),
+                producer.eqns().iter().any(|eqn| eqn.out == export.value),
                 "the producing stage still defines {:?}",
                 boundary.id
             );
-            assert_eq!(producer.values[export.value].storage, Storage::Device);
+            assert_eq!(producer.values()[export.value].storage, Storage::Device);
             for &consumer in &boundary.consuming_stages {
                 let stage = &split.stages[consumer].graph;
                 let input = stage
-                    .inputs
+                    .inputs()
                     .iter()
                     .copied()
                     .find(|&id| stage.meta(id).slot_key() == Some(&boundary.id.slot_key()))
@@ -1674,20 +1680,20 @@ fn adr0099_s2_stage_graphs_partition_every_equation_and_validate() {
                         panic!("{:?} is an explicit input of stage {consumer}", boundary.id)
                     });
                 assert_eq!(
-                    stage.values[input].storage,
+                    stage.values()[input].storage,
                     Storage::Slot(poot_graph_ir::graph::Slot::Activation),
                     "{:?} is bound as an activation input of stage {consumer}",
                     boundary.id
                 );
                 assert!(
                     stage
-                        .slots
+                        .slots()
                         .contains(&(input, poot_graph_ir::graph::Slot::Activation)),
                     "{:?} has a slot binding in stage {consumer}",
                     boundary.id
                 );
                 assert!(
-                    !stage.eqns.iter().any(|eqn| eqn.out == input),
+                    !stage.eqns().iter().any(|eqn| eqn.out == input),
                     "stage {consumer} reads {:?}, it does not redefine it",
                     boundary.id
                 );
@@ -1714,8 +1720,8 @@ fn adr0099_s2_boundary_descriptors_carry_dtype_shape_and_byte_len() {
     let back_i8 = b.cast(i8, DType::F32);
     let mixed = b.binary(BinOp::Add, back_bf16, back_i32);
     let out = b.binary(BinOp::Add, mixed, back_i8);
-    let graph = b.finish(out);
-    assert_eq!(graph.eqns.len(), 9);
+    let graph = b.finish(out).unwrap();
+    assert_eq!(graph.eqns().len(), 9);
 
     let assignment =
         crate::test_support::assignment_before(&graph, &[4]).expect("the cut is legal");
@@ -1751,13 +1757,6 @@ fn adr0099_s2_boundary_descriptors_carry_dtype_shape_and_byte_len() {
             (i8.id(), DType::I8, 12, 0, vec![1]),
         ]
     );
-    assert!(
-        split
-            .stages
-            .iter()
-            .all(|stage| stage.graph.validate().is_ok()),
-        "every stage graph validates"
-    );
 }
 
 #[test]
@@ -1771,7 +1770,9 @@ fn adr0099_s2_state_pair_split_across_stages_is_rejected() {
     let early = b.binary(BinOp::Add, x, k_in);
     let mid = b.binary(BinOp::Mul, early, early);
     let k_out = b.binary(BinOp::Add, mid, mid);
-    let graph = b.finish_with_state(k_out, &[(k_in, k_out)]);
+    let graph = b
+        .finish(poot_graph_ir::Outputs::new(k_out).with_state(&[(k_in, k_out)]))
+        .unwrap();
 
     let assignment =
         crate::test_support::assignment_before(&graph, &[1]).expect("the cut is legal");
@@ -1798,7 +1799,7 @@ fn four_eqn_graph() -> Graph {
     for _ in 0..4 {
         hidden = b.binary(BinOp::Add, hidden, x);
     }
-    b.finish(hidden)
+    b.finish(hidden).unwrap()
 }
 
 #[test]
@@ -1882,7 +1883,7 @@ fn adr0099_s2_a_stage_that_hands_off_nothing_is_rejected() {
     let t0 = b.binary(BinOp::Add, x, x);
     let _d1 = b.binary(BinOp::Mul, t0, t0);
     let out = b.binary(BinOp::Mul, t0, t0);
-    let graph = b.finish(out);
+    let graph = b.finish(out).unwrap();
 
     let assignment =
         crate::test_support::assignment_before(&graph, &[1, 2]).expect("the cuts are legal");
@@ -1903,7 +1904,7 @@ fn adr0099_s2_a_final_stage_that_never_sees_the_output_is_rejected() {
     let t0 = b.binary(BinOp::Add, x, x);
     let t1 = b.binary(BinOp::Mul, t0, t0);
     let _after_t1 = b.binary(BinOp::Mul, t1, t1);
-    let graph = b.finish(t0);
+    let graph = b.finish(t0).unwrap();
 
     let assignment =
         crate::test_support::assignment_before(&graph, &[1, 2]).expect("the cuts are legal");
@@ -1946,18 +1947,15 @@ fn adr0099_s2_each_stage_keeps_only_the_witnesses_it_defines() {
 
     // Stage graphs renumber their values, so a witness is identified by what computes it: the
     // producing equation's op and what each operand is (an equation's op, or the binder's storage).
-    fn describe<V: poot_graph_ir::ValidationChannel>(graph: &Graph<V>, value: ValueId) -> String {
-        match graph.eqns.iter().find(|eqn| eqn.out == value) {
+    fn describe(graph: &Graph, value: ValueId) -> String {
+        match graph.eqns().iter().find(|eqn| eqn.out == value) {
             Some(eqn) => format!("{:?}", eqn.op),
             None => format!("{:?}", graph.meta(value).storage),
         }
     }
-    fn computation<V: poot_graph_ir::ValidationChannel>(
-        graph: &Graph<V>,
-        value: ValueId,
-    ) -> (String, Vec<String>) {
+    fn computation(graph: &Graph, value: ValueId) -> (String, Vec<String>) {
         let eqn = graph
-            .eqns
+            .eqns()
             .iter()
             .find(|eqn| eqn.out == value)
             .expect("a witness is an equation result");
@@ -1975,12 +1973,11 @@ fn adr0099_s2_each_stage_keeps_only_the_witnesses_it_defines() {
         |stage: usize| -> Vec<(poot_graph_ir::ValidationId, String, (String, Vec<String>))> {
             let stage_graph = &split.stages[stage].graph;
             stage_graph
-                .validation_outputs()
-                .iter()
+                .witnesses()
                 .map(|declaration| {
                     (
                         declaration.id,
-                        declaration.name.clone(),
+                        declaration.name.to_owned(),
                         computation(stage_graph, declaration.value),
                     )
                 })
@@ -2025,12 +2022,12 @@ fn layer_scoped_graph() -> Graph {
         hidden = b.binary(BinOp::Add, scaled, x);
     }
     let out = b.binary(BinOp::Mul, hidden, hidden);
-    b.finish(out)
+    b.finish(out).unwrap()
 }
 
 fn layer_tags(graph: &Graph) -> Vec<Option<usize>> {
     graph
-        .eqns
+        .eqns()
         .iter()
         .map(|eqn| eqn.layer.map(|layer| layer.0))
         .collect()
@@ -2128,7 +2125,7 @@ fn adr0099_s2_layer_cut_errors_are_typed() {
         let _layer_scope = b.layer_scope(1);
         b.binary(BinOp::Mul, hole, hole)
     };
-    let holey = b.finish(in_layer_one);
+    let holey = b.finish(in_layer_one).unwrap();
     let _ = in_layer_zero;
     assert_eq!(
         crate::test_support::assignment_after_layers(&holey, &[0]),
@@ -2151,7 +2148,7 @@ fn adr0099_s2_layer_cut_errors_are_typed() {
         let _layer_scope = b.layer_scope(2);
         b.binary(BinOp::Mul, x, x)
     };
-    let skipped = b.finish(skipped);
+    let skipped = b.finish(skipped).unwrap();
     assert_eq!(
         crate::test_support::assignment_after_layers(&skipped, &[0]),
         Err(StageSplitError::LayerTags(LayerTagError::NonContiguous {
@@ -2171,7 +2168,7 @@ fn adr0099_s2_layer_cut_errors_are_typed() {
         let _layer_scope = b.layer_scope(1);
         b.binary(BinOp::Mul, x, x)
     };
-    let started_at_one = b.finish(started_at_one);
+    let started_at_one = b.finish(started_at_one).unwrap();
     assert_eq!(
         crate::test_support::assignment_after_layers(&started_at_one, &[0]),
         Err(StageSplitError::LayerTags(LayerTagError::NonContiguous {
@@ -2195,7 +2192,7 @@ fn adr0099_s2_layer_cut_errors_are_typed() {
         TensorType::f32(vec![4]),
     );
     let untagged_value = b.binary(BinOp::Add, x, x);
-    let untagged = b.finish(untagged_value);
+    let untagged = b.finish(untagged_value).unwrap();
     assert_eq!(
         crate::test_support::assignment_after_layers(&untagged, &[0]),
         Err(StageSplitError::LayerCutOutOfRange { cut: 0, layers: 0 })
@@ -2215,15 +2212,18 @@ fn adr0099_s2_layer_cut_errors_are_typed() {
 #[test]
 fn adr0099_s2_cse_and_dce_preserve_layer_tags() {
     let graph = layer_scoped_graph();
-    let original: HashMap<ValueId, Option<LayerIndex>> =
-        graph.eqns.iter().map(|eqn| (eqn.out, eqn.layer)).collect();
+    let original: HashMap<ValueId, Option<LayerIndex>> = graph
+        .eqns()
+        .iter()
+        .map(|eqn| (eqn.out, eqn.layer))
+        .collect();
 
-    let folded = cse(&graph);
+    let folded = cse(&graph).unwrap();
     assert!(
-        folded.eqns.len() < graph.eqns.len(),
+        folded.eqns().len() < graph.eqns().len(),
         "cse must fold the duplicate Mul in each layer, or this row proves nothing"
     );
-    for eqn in &folded.eqns {
+    for eqn in folded.eqns() {
         assert_eq!(
             eqn.layer, original[&eqn.out],
             "cse changed the layer tag of {}",
@@ -2231,12 +2231,12 @@ fn adr0099_s2_cse_and_dce_preserve_layer_tags() {
         );
     }
 
-    let trimmed = dce(&graph);
+    let trimmed = dce(&graph).unwrap();
     assert!(
-        trimmed.eqns.len() < graph.eqns.len(),
+        trimmed.eqns().len() < graph.eqns().len(),
         "dce must drop the dead layer equation, or this row proves nothing"
     );
-    for eqn in &trimmed.eqns {
+    for eqn in trimmed.eqns() {
         assert_eq!(
             eqn.layer, original[&eqn.out],
             "dce changed the layer tag of {}",
@@ -2253,7 +2253,7 @@ fn adr0099_s2_cse_and_dce_preserve_layer_tags() {
             split
                 .stages
                 .iter()
-                .map(|stage| stage.graph.eqns.iter().any(|eqn| eqn.layer.is_some()))
+                .map(|stage| stage.graph.eqns().iter().any(|eqn| eqn.layer.is_some()))
                 .collect::<Vec<_>>(),
             vec![true, true, true],
             "{label} leaves every layer with equations of its own"
@@ -2271,8 +2271,7 @@ fn adr0099_s2_cse_and_dce_preserve_layer_tags() {
 #[test]
 fn card533_optimize_passes_keep_witness_outputs() {
     use poot_graph_ir::ValidationId;
-    type PassFn =
-        fn(&Graph<poot_graph_ir::ValidationOutputs>) -> Graph<poot_graph_ir::ValidationOutputs>;
+    type PassFn = fn(&Graph) -> Result<Graph, poot_graph_ir::EditError>;
 
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32([4]));
@@ -2299,17 +2298,15 @@ fn card533_optimize_passes_keep_witness_outputs() {
         ("fuse", fuse),
     ];
     for (name, pass) in passes {
-        let transformed = pass(&graph);
-        transformed.validate().unwrap();
-        assert_eq!(
-            transformed.validation_outputs(),
-            graph.validation_outputs(),
+        let transformed = pass(&graph).unwrap();
+        assert!(
+            transformed.witnesses().eq(graph.witnesses()),
             "{name} dropped or changed a witness declaration"
         );
         assert!(
-            transformed.validation_outputs().iter().all(|output| {
-                transformed.eqns.iter().any(|eqn| eqn.out == output.value)
-                    || transformed.consts.contains(&output.value)
+            transformed.witnesses().all(|output| {
+                transformed.eqns().iter().any(|eqn| eqn.out == output.value)
+                    || transformed.consts().contains(&output.value)
             }),
             "{name} dropped the witness producer"
         );
@@ -2328,12 +2325,12 @@ fn card533_pass_numerics_are_checked_against_produced_ops() {
     let y = b.constant("y", TensorType::f32([4]));
     let product = b.binary(BinOp::Mul, x, y);
     let sum = b.binary(BinOp::Add, product, y);
-    let graph = b.finish(sum);
+    let graph = b.finish(sum).unwrap();
 
-    let fused = fuse(&graph);
+    let fused = fuse(&graph).unwrap();
     assert!(
         fused
-            .eqns
+            .eqns()
             .iter()
             .any(|eqn| matches!(eqn.op, OpKind::Fused(_))),
         "the pointwise chain must fuse, or this row proves nothing"
@@ -2370,10 +2367,10 @@ fn card533_unfused_decode_matmul_is_not_bit_exact() {
     let activation = b.constant("activation", TensorType::f32([1, 8]));
     let weight = b.constant("weight", TensorType::f32([8, 8]));
     let out = b.matmul(activation, weight);
-    let graph = b.finish(out);
+    let graph = b.finish(out).unwrap();
     assert!(
         matches!(
-            graph.eqns.as_slice(),
+            graph.eqns(),
             [eqn] if matches!(eqn.op, OpKind::MatMul)
         ),
         "the M==1 decode MatMul must stay a bare MatMul (no pass retags it), or this row proves nothing"
@@ -2388,7 +2385,7 @@ fn card533_unfused_decode_matmul_is_not_bit_exact() {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32([2, 2]));
     let moved = b.reshape(x, vec![4]);
-    let movement = b.finish(moved);
+    let movement = b.finish(moved).unwrap();
     assert_eq!(
         implied_numerics(&movement).tier2_class(),
         Tier2Class::BitExact
@@ -2406,10 +2403,10 @@ use super::attention_match::{
     AttentionDecline, RopeDecline, canonicalize, match_attention, match_rope_core, producer_map,
 };
 
-fn output_eqn<V: ValidationChannel>(g: &Graph<V>) -> &Eqn {
-    g.eqns
+fn output_eqn(g: &Graph) -> &Eqn {
+    g.eqns()
         .iter()
-        .find(|eqn| eqn.out == g.output)
+        .find(|eqn| eqn.out == g.result())
         .expect("the graph output has a producer")
 }
 
@@ -2433,7 +2430,7 @@ fn hand_rope(x_shape: Vec<usize>, cos_shape: Vec<usize>, commute: bool) -> Graph
     };
     let rs = b.binary(BinOp::Mul, rotate_half, sin);
     let out = b.binary(BinOp::Add, xc, rs);
-    b.finish(out)
+    b.finish(out).unwrap()
 }
 
 /// SC-002 near-miss attention decline reasons, by semantic detail (the oracle-unchanged half of
@@ -2446,7 +2443,7 @@ fn card536a_attention_near_misses_decline_with_a_reason() {
     let mut cases: Vec<(&str, Graph, AttentionDecline)> = Vec::new();
 
     // Axis: the row softmax reduces the wrong axis.
-    let mut wrong_axis = {
+    let wrong_axis = {
         let (hq, cap, d) = (4usize, 6usize, 16usize);
         let b = Builder::new();
         let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d]));
@@ -2454,17 +2451,19 @@ fn card536a_attention_near_misses_decline_with_a_reason() {
         let v = b.constant("v", TensorType::f32(vec![1, hq, cap, d]));
         let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
         let out = attention_masked(&b, q, k, v, 1, 0.25, mask);
-        b.finish(out)
+        b.finish(out).unwrap()
     };
-    for eqn in wrong_axis.eqns.iter_mut() {
-        if let OpKind::Reduce { axis, .. } = &mut eqn.op {
-            *axis = 0;
+    let wrong_axis = mutated(&wrong_axis, |draft| {
+        for eqn in draft.eqns_mut().iter_mut() {
+            if let OpKind::Reduce { axis, .. } = &mut eqn.op {
+                *axis = 0;
+            }
         }
-    }
+    });
     cases.push(("wrong reduce axis", wrong_axis, AttentionDecline::Denom));
 
     // Scale: a softcap chain whose two constants are not reciprocals.
-    let mut wrong_softcap = {
+    let wrong_softcap = {
         let (hq, cap, d) = (4usize, 6usize, 16usize);
         let b = Builder::new();
         let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d]));
@@ -2472,17 +2471,19 @@ fn card536a_attention_near_misses_decline_with_a_reason() {
         let v = b.constant("v", TensorType::f32(vec![1, hq, cap, d]));
         let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
         let out = attention_masked_softcap(&b, q, k, v, 1, 0.25, mask, Some(2.0));
-        b.finish(out)
+        b.finish(out).unwrap()
     };
     let mut rewrote = false;
-    for eqn in wrong_softcap.eqns.iter_mut() {
-        if let OpKind::Binary(BinOp::Mul) = eqn.op
-            && let Some(Operand::Lit(poot_graph_ir::Scalar::F32(0.5))) = eqn.inputs.get(1)
-        {
-            eqn.inputs[1] = Operand::Lit(poot_graph_ir::Scalar::F32(0.6));
-            rewrote = true;
+    let wrong_softcap = mutated(&wrong_softcap, |draft| {
+        for eqn in draft.eqns_mut().iter_mut() {
+            if let OpKind::Binary(BinOp::Mul) = eqn.op
+                && let Some(Operand::Lit(poot_graph_ir::Scalar::F32(0.5))) = eqn.inputs.get(1)
+            {
+                eqn.inputs[1] = Operand::Lit(poot_graph_ir::Scalar::F32(0.6));
+                rewrote = true;
+            }
         }
-    }
+    });
     assert!(rewrote, "the softcap reciprocal literal must be present");
     cases.push((
         "softcap constants not reciprocal",
@@ -2492,7 +2493,7 @@ fn card536a_attention_near_misses_decline_with_a_reason() {
 
     // Shape: a softcap chain whose `Tanh` slot holds another unary (here `Neg`): same literals, same
     // arity, but not a tanh. Mutation: drop the `Tanh` check in `match_pre_mask`; this fuses.
-    let mut not_tanh = {
+    let not_tanh = {
         let (hq, cap, d) = (4usize, 6usize, 16usize);
         let b = Builder::new();
         let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d]));
@@ -2500,15 +2501,17 @@ fn card536a_attention_near_misses_decline_with_a_reason() {
         let v = b.constant("v", TensorType::f32(vec![1, hq, cap, d]));
         let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
         let out = attention_masked_softcap(&b, q, k, v, 1, 0.25, mask, Some(2.0));
-        b.finish(out)
+        b.finish(out).unwrap()
     };
     let mut swapped = 0;
-    for eqn in not_tanh.eqns.iter_mut() {
-        if matches!(eqn.op, OpKind::Unary(poot_graph_ir::UnOp::Tanh)) {
-            eqn.op = OpKind::Unary(poot_graph_ir::UnOp::Neg);
-            swapped += 1;
+    let not_tanh = mutated(&not_tanh, |draft| {
+        for eqn in draft.eqns_mut().iter_mut() {
+            if matches!(eqn.op, OpKind::Unary(poot_graph_ir::UnOp::Tanh)) {
+                eqn.op = OpKind::Unary(poot_graph_ir::UnOp::Neg);
+                swapped += 1;
+            }
         }
-    }
+    });
     assert_eq!(swapped, 1, "exactly the softcap tanh is replaced");
     cases.push((
         "softcap tanh slot is not a tanh",
@@ -2525,7 +2528,7 @@ fn card536a_attention_near_misses_decline_with_a_reason() {
         let v = b.constant("v", TensorType::f32(vec![1, 1, 5, 2]));
         let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, 5]));
         let out = attention_masked(&b, q, k, v, 1, 1.0, mask);
-        b.finish(out)
+        b.finish(out).unwrap()
     };
     cases.push((
         "a size-1 key head broadcast by the matmul",
@@ -2552,52 +2555,31 @@ fn card536a_rope_near_misses_decline_with_a_reason() {
         |graph: &Graph| match_rope_core(graph, &producer_map(graph), output_eqn(graph)).err();
     let mut cases: Vec<(&str, Graph, RopeDecline)> = Vec::new();
 
-    // The rotate-half concat joins on a non-last axis.
-    let mut wrong_axis = hand_rope(vec![1, 4, 3, 8], vec![1, 1, 3, 8], false);
-    for eqn in wrong_axis.eqns.iter_mut() {
-        if let OpKind::Concat { axis } = &mut eqn.op {
-            *axis = 0;
-        }
-    }
-    cases.push((
-        "rotate-half on axis 0",
-        wrong_axis,
-        RopeDecline::RotateHalfConcat,
-    ));
-
     // The two slices do not split the same tensor: cut the keep slice from a different tensor.
-    let mut wrong_source = hand_rope(vec![1, 4, 3, 8], vec![1, 1, 3, 8], false);
-    let other = wrong_source
-        .values
-        .push(poot_graph_ir::graph::ValueMeta::new(
-            TensorType::f32(vec![1, 4, 3, 8]),
-            Storage::Const,
-            Some("other".into()),
-        ));
-    wrong_source.consts.push(other);
-    for eqn in wrong_source.eqns.iter_mut() {
-        let keep_slice = matches!(&eqn.op, OpKind::Slice { start: 0, .. });
-        if keep_slice && let Some(Operand::Value(value)) = eqn.inputs.first_mut() {
-            *value = other;
-        }
-    }
+    let wrong_source = mutated(
+        &hand_rope(vec![1, 4, 3, 8], vec![1, 1, 3, 8], false),
+        |draft| {
+            let other = draft
+                .values_mut()
+                .push(poot_graph_ir::graph::ValueMeta::new(
+                    TensorType::f32(vec![1, 4, 3, 8]),
+                    Storage::Const,
+                    Some("other".into()),
+                ));
+            draft.inputs_mut().push(other);
+            draft.consts_mut().push(other);
+            for eqn in draft.eqns_mut().iter_mut() {
+                let keep_slice = matches!(&eqn.op, OpKind::Slice { start: 0, .. });
+                if keep_slice && let Some(Operand::Value(value)) = eqn.inputs.first_mut() {
+                    *value = other;
+                }
+            }
+        },
+    );
     cases.push((
         "slices from different tensors",
         wrong_source,
         RopeDecline::SliceMismatch,
-    ));
-
-    // The cos/sin table is not the rotated width.
-    let mut wrong_width = hand_rope(vec![1, 4, 3, 8], vec![1, 1, 3, 8], false);
-    for value in wrong_width.values.iter_mut() {
-        if value.name.as_deref() == Some("cos") {
-            value.aval = TensorType::f32(vec![1, 1, 3, 4]);
-        }
-    }
-    cases.push((
-        "cos is not the rotated width",
-        wrong_width,
-        RopeDecline::TableWidth,
     ));
 
     for (name, graph, expected) in cases {
@@ -2628,7 +2610,7 @@ fn card536a_guards_have_killing_reasons() {
         let v = b.constant("v", TensorType::f32(vec![1, hq, cap, d]));
         let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
         let out = attention_masked_softcap(&b, q, k, v, 1, 0.25, mask, Some(30.0));
-        b.finish(out)
+        b.finish(out).unwrap()
     };
     let matched = match_attention(
         &decode_softcap,
@@ -2661,7 +2643,7 @@ fn card536a_guards_have_killing_reasons() {
     let denom = b.reduce(RedOp::Sum, e, last, true);
     let p = b.binary(BinOp::Div, e, denom);
     let gqa_out = b.matmul(p, v);
-    let gqa = b.finish(gqa_out);
+    let gqa = b.finish(gqa_out).unwrap();
     assert_eq!(
         match_attention(
             &gqa,
@@ -2686,7 +2668,7 @@ fn a_wide_head_dim_still_matches() {
         let v = b.constant("v", TensorType::f32(vec![1, 2, 5, d]));
         let mask = b.constant("mask", TensorType::f32(vec![1, 1, m, 5]));
         let out = attention_masked(&b, q, k, v, 1, 0.25, mask);
-        b.finish(out)
+        b.finish(out).unwrap()
     };
     for m in [1, 3] {
         let wide = build(m, 512);
@@ -2719,7 +2701,7 @@ fn a_split_key_with_a_narrower_value_matches_as_a_split_attention() {
     let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
     let k = b.concat(3, &[k_nope, poot_graph_ir::ops::repeat_kv(&b, k_pe, hq)]);
     let out = attention_masked(&b, q, k, v, 1, 0.25, mask);
-    let graph = b.finish(out);
+    let graph = b.finish(out).unwrap();
     let matched = match_attention(
         &graph,
         &producer_map(&graph),
@@ -2743,10 +2725,7 @@ fn a_split_key_with_a_narrower_value_matches_as_a_split_attention() {
 /// A live-capacity decode over `cap` keys, built by the one composite ([`ops::attention_live`]): batch 2, two
 /// key heads shared by four query heads, an additive mask, an optional softcap, a split key when `split`,
 /// and the raw I32 `len`. The length witness is declared as a validation output when `validated`.
-fn live_attention_graph(
-    split: bool,
-    validated: bool,
-) -> poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs> {
+fn live_attention_graph(split: bool, validated: bool) -> poot_graph_ir::Graph {
     let (batch, hq, hkv, cap, d, dv) = (2usize, 4usize, 2usize, 6usize, 8usize, 5usize);
     let b = Builder::new();
     let q = b.constant("q", TensorType::f32(vec![batch, hq, 1, d]));
@@ -2766,26 +2745,23 @@ fn live_attention_graph(
     let live =
         poot_graph_ir::ops::attention_live(&b, q, keys, v, hq / hkv, 0.25, mask, Some(30.0), len)
             .expect("the live composite builds");
-    let validations = if validated {
-        vec![poot_graph_ir::ValidationOutput {
-            id: poot_graph_ir::ValidationId(1),
-            name: "attention.len".to_owned(),
-            value: live.witness.id(),
-        }]
+    let outputs = if validated {
+        poot_graph_ir::Outputs::new(live.out).with_witness(
+            poot_graph_ir::ValidationId(1),
+            "attention.len",
+            live.witness,
+        )
     } else {
-        Vec::new()
+        poot_graph_ir::Outputs::new(live.out)
     };
-    let graph = b.finish(live.out).with_validations(validations);
-    graph
-        .validate()
-        .expect("the live composite is a valid graph");
-    graph
+    b.finish(outputs)
+        .expect("the live composite is a valid graph")
 }
 
 /// The float selects of a live composite in construction order: the key source(s), the value, the scores.
-fn float_selects(graph: &poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs>) -> Vec<usize> {
+fn float_selects(graph: &poot_graph_ir::Graph) -> Vec<usize> {
     graph
-        .eqns
+        .eqns()
         .iter()
         .enumerate()
         .filter(|(_, eqn)| {
@@ -2796,13 +2772,14 @@ fn float_selects(graph: &poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs>)
 }
 
 /// Replace the select at `index` with a reshape of its data operand: the same value, no guard.
-fn remove_guard(graph: &mut poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs>, index: usize) {
-    let eqn = &mut graph.eqns[index];
-    let data = eqn.inputs[1];
-    eqn.op = OpKind::Reshape {
-        shape: graph.values[eqn.out].aval.shape.clone(),
-    };
-    eqn.inputs = vec![data];
+fn remove_guard(graph: &poot_graph_ir::Graph, index: usize) -> poot_graph_ir::Graph {
+    let data = graph.eqns()[index].inputs[1];
+    let shape = graph.aval(graph.eqns()[index].out).shape.clone();
+    mutated(graph, |draft| {
+        let eqn = &mut draft.eqns_mut()[index];
+        eqn.op = OpKind::Reshape { shape };
+        eqn.inputs = vec![data];
+    })
 }
 
 /// The guarded live-capacity composite matches as a `Live` attention over the proved length, for a dense and a
@@ -2839,29 +2816,26 @@ fn the_guarded_live_composite_matches_as_a_live_attention() {
 #[test]
 fn live_near_misses_decline_with_a_reason() {
     use poot_graph_ir::{BinOp as B, Scalar};
-    let mut cases: Vec<(&str, poot_graph_ir::Graph<_>, AttentionDecline)> = Vec::new();
+    let mut cases: Vec<(&str, poot_graph_ir::Graph, AttentionDecline)> = Vec::new();
 
-    let mut no_key_guard = live_attention_graph(false, true);
-    let target = float_selects(&no_key_guard)[0];
-    remove_guard(&mut no_key_guard, target);
+    let base = live_attention_graph(false, true);
+    let no_key_guard = remove_guard(&base, float_selects(&base)[0]);
     cases.push((
         "K without its guard",
         no_key_guard,
         AttentionDecline::LiveKeyGuard,
     ));
 
-    let mut no_value_guard = live_attention_graph(false, true);
-    let target = float_selects(&no_value_guard)[1];
-    remove_guard(&mut no_value_guard, target);
+    let base = live_attention_graph(false, true);
+    let no_value_guard = remove_guard(&base, float_selects(&base)[1]);
     cases.push((
         "V without its guard",
         no_value_guard,
         AttentionDecline::LiveKeyGuard,
     ));
 
-    let mut no_shared_guard = live_attention_graph(true, true);
-    let target = float_selects(&no_shared_guard)[1];
-    remove_guard(&mut no_shared_guard, target);
+    let base = live_attention_graph(true, true);
+    let no_shared_guard = remove_guard(&base, float_selects(&base)[1]);
     cases.push((
         "the shared part of a split key without its guard",
         no_shared_guard,
@@ -2869,9 +2843,9 @@ fn live_near_misses_decline_with_a_reason() {
     ));
 
     // One key off: the key positions start at 2 instead of 1.
-    let mut off_by_one = live_attention_graph(false, true);
+    let off_by_one = live_attention_graph(false, true);
     let iotas: Vec<ValueId> = off_by_one
-        .eqns
+        .eqns()
         .iter()
         .filter(|eqn| {
             matches!(
@@ -2885,15 +2859,17 @@ fn live_near_misses_decline_with_a_reason() {
         .map(|eqn| eqn.out)
         .collect();
     let mut changed = 0;
-    for eqn in &mut off_by_one.eqns {
-        if matches!(eqn.op, OpKind::Binary(B::Add))
-            && matches!(eqn.inputs.first(), Some(Operand::Value(id)) if iotas.contains(id))
-            && matches!(eqn.inputs.get(1), Some(Operand::Lit(Scalar::I32(1))))
-        {
-            eqn.inputs[1] = Operand::Lit(Scalar::I32(2));
-            changed += 1;
+    let off_by_one = mutated(&off_by_one, |draft| {
+        for eqn in draft.eqns_mut().iter_mut() {
+            if matches!(eqn.op, OpKind::Binary(B::Add))
+                && matches!(eqn.inputs.first(), Some(Operand::Value(id)) if iotas.contains(id))
+                && matches!(eqn.inputs.get(1), Some(Operand::Lit(Scalar::I32(1))))
+            {
+                eqn.inputs[1] = Operand::Lit(Scalar::I32(2));
+                changed += 1;
+            }
         }
-    }
+    });
     assert_eq!(changed, 1, "exactly the key-position offset is rewritten");
     cases.push((
         "conditions one key off",
@@ -2902,38 +2878,44 @@ fn live_near_misses_decline_with_a_reason() {
     ));
 
     // The key rows select by another length than the scores do.
-    let mut other_len = live_attention_graph(false, true);
-    let rows = other_len
-        .eqns
+    let base = live_attention_graph(false, true);
+    let rows = base
+        .eqns()
         .iter()
         .position(|eqn| {
-            matches!(eqn.op, OpKind::Binary(B::Ge)) && other_len.aval(eqn.out).shape == [2, 1, 6, 1]
+            matches!(eqn.op, OpKind::Binary(B::Ge)) && base.aval(eqn.out).shape == [2, 1, 6, 1]
         })
         .expect("the key-row condition");
-    let other = other_len.values.push(poot_graph_ir::graph::ValueMeta::new(
-        TensorType::new(vec![2], poot_tensor::DType::I32),
-        Storage::Const,
-        Some("other_len".into()),
-    ));
-    other_len.consts.push(other);
-    other_len.inputs.push(other);
-    let view = other_len.values.push(poot_graph_ir::graph::ValueMeta::new(
-        TensorType::new(vec![2, 1, 1, 1], poot_tensor::DType::I32),
-        Storage::Device,
-        None,
-    ));
-    other_len.eqns.insert(
-        rows,
-        Eqn {
-            op: OpKind::Reshape {
-                shape: vec![2, 1, 1, 1],
+    let other_len = mutated(&base, |draft| {
+        let other = draft
+            .values_mut()
+            .push(poot_graph_ir::graph::ValueMeta::new(
+                TensorType::new(vec![2], poot_tensor::DType::I32),
+                Storage::Const,
+                Some("other_len".into()),
+            ));
+        draft.consts_mut().push(other);
+        draft.inputs_mut().push(other);
+        let view = draft
+            .values_mut()
+            .push(poot_graph_ir::graph::ValueMeta::new(
+                TensorType::new(vec![2, 1, 1, 1], poot_tensor::DType::I32),
+                Storage::Device,
+                None,
+            ));
+        draft.eqns_mut().insert(
+            rows,
+            Eqn {
+                op: OpKind::Reshape {
+                    shape: vec![2, 1, 1, 1],
+                },
+                inputs: vec![Operand::Value(other)],
+                out: view,
+                layer: None,
             },
-            inputs: vec![Operand::Value(other)],
-            out: view,
-            layer: None,
-        },
-    );
-    other_len.eqns[rows + 1].inputs[0] = Operand::Value(view);
+        );
+        draft.eqns_mut()[rows + 1].inputs[0] = Operand::Value(view);
+    });
     cases.push((
         "K/V select by another length",
         other_len,
@@ -2941,12 +2923,13 @@ fn live_near_misses_decline_with_a_reason() {
     ));
 
     // A guard bounding the length by one more than the capacity, and no witness at all.
-    let mut wrong_bound = live_attention_graph(false, true);
-    for eqn in &mut wrong_bound.eqns {
-        if matches!(eqn.op, OpKind::Binary(B::GeU)) {
-            eqn.inputs[1] = Operand::Lit(Scalar::I32(7));
+    let wrong_bound = mutated(&live_attention_graph(false, true), |draft| {
+        for eqn in draft.eqns_mut().iter_mut() {
+            if matches!(eqn.op, OpKind::Binary(B::GeU)) {
+                eqn.inputs[1] = Operand::Lit(Scalar::I32(7));
+            }
         }
-    }
+    });
     cases.push((
         "length bounded by capacity + 1",
         wrong_bound,
@@ -2960,9 +2943,6 @@ fn live_near_misses_decline_with_a_reason() {
     ));
 
     for (name, graph, expected) in cases {
-        graph
-            .validate()
-            .unwrap_or_else(|error| panic!("{name}: {error:?}"));
         let reason = match_attention(
             &graph,
             &producer_map(&graph),
@@ -2983,17 +2963,19 @@ fn canonicalize_preserves_unproved_spellings_and_removes_identity() {
         let w = b.constant("w", TensorType::f32(vec![8, 5]));
         let scaled = b.binary_scalar(BinOp::Mul, x, poot_graph_ir::Scalar::F32(scale));
         let output = b.matmul(scaled, w);
-        let graph = b.finish(output);
-        let (canonical, declines) = canonicalize_with_declines(&graph);
-        canonical.validate().unwrap();
-        let root = canonical.eqns.last().unwrap();
+        let graph = b.finish(output).unwrap();
+        let (canonical, declines) = canonicalize_with_declines(&graph).unwrap();
+        let root = canonical.eqns().last().unwrap();
         assert!(matches!(root.op, OpKind::MatMul));
-        assert_eq!(root.out, graph.output);
+        assert_eq!(root.out, graph.result());
         if scale == 1.0 {
             assert!(matches!(root.inputs[0], Operand::Value(id) if id == x.id()));
             assert!(declines.is_empty());
         } else {
-            assert_eq!(format!("{:?}", canonical.eqns), format!("{:?}", graph.eqns));
+            assert_eq!(
+                format!("{:?}", canonical.eqns()),
+                format!("{:?}", graph.eqns())
+            );
             assert_eq!(
                 declines,
                 vec![NumericalRewriteDecline {
@@ -3003,8 +2985,8 @@ fn canonicalize_preserves_unproved_spellings_and_removes_identity() {
             );
         }
         assert_eq!(
-            format!("{:?}", canonicalize(&canonical).eqns),
-            format!("{:?}", canonical.eqns)
+            format!("{:?}", canonicalize(&canonical).unwrap().eqns()),
+            format!("{:?}", canonical.eqns())
         );
     }
     let b = Builder::new();
@@ -3012,9 +2994,12 @@ fn canonicalize_preserves_unproved_spellings_and_removes_identity() {
     let denom = b.constant("denom", TensorType::f32(vec![3, 1]));
     let recip = b.unary(UnOp::Recip, denom);
     let mul = b.binary(BinOp::Mul, e, recip);
-    let graph = b.finish(mul);
-    let (canonical, declines) = canonicalize_with_declines(&graph);
-    assert_eq!(format!("{:?}", canonical.eqns), format!("{:?}", graph.eqns));
+    let graph = b.finish(mul).unwrap();
+    let (canonical, declines) = canonicalize_with_declines(&graph).unwrap();
+    assert_eq!(
+        format!("{:?}", canonical.eqns()),
+        format!("{:?}", graph.eqns())
+    );
     assert_eq!(
         declines,
         vec![NumericalRewriteDecline {
@@ -3046,7 +3031,7 @@ fn card536a_scale_as_a_runtime_value_declines() {
     let denom = b.reduce(RedOp::Sum, e, last, true);
     let p = b.binary(BinOp::Div, e, denom);
     let graph_out = b.matmul(p, v);
-    let graph = b.finish(graph_out);
+    let graph = b.finish(graph_out).unwrap();
 
     assert_eq!(
         match_attention(
@@ -3080,19 +3065,19 @@ fn a_traced_bias_linear_is_primitive_and_fuses_into_one_contraction_epilogue() {
     let w = b.constant("w", TensorType::f32(vec![k, n]));
     let bias = b.constant("bias", TensorType::f32(vec![n]));
     let out = poot_graph_ir::ops::linear(&b, x, w, Some(bias));
-    let traced = b.finish(out);
+    let traced = b.finish(out).unwrap();
     assert!(
         traced
-            .eqns
+            .eqns()
             .iter()
             .all(|eqn| eqn.op.class() == OpClass::Primitive),
         "a tracer emits primitives only: {:?}",
-        traced.eqns
+        traced.eqns()
     );
 
-    let fused = fuse_contraction_epilogues(&traced, |_, _| true);
+    let fused = fuse_contraction_epilogues(&traced, |_, _| true).unwrap();
     let epilogues: Vec<&Eqn> = fused
-        .eqns
+        .eqns()
         .iter()
         .filter(|eqn| matches!(eqn.op, OpKind::ContractionEpilogue { .. }))
         .collect();
@@ -3100,7 +3085,7 @@ fn a_traced_bias_linear_is_primitive_and_fuses_into_one_contraction_epilogue() {
         epilogues.len(),
         1,
         "one ContractionEpilogue: {:?}",
-        fused.eqns
+        fused.eqns()
     );
     assert!(
         matches!(
@@ -3112,12 +3097,13 @@ fn a_traced_bias_linear_is_primitive_and_fuses_into_one_contraction_epilogue() {
         epilogues[0].inputs
     );
     assert_eq!(
-        fused.eqns.len(),
+        fused.eqns().len(),
         1,
         "the matmul and the add are one equation"
     );
     assert_eq!(
-        epilogues[0].out, traced.output,
+        epilogues[0].out,
+        traced.result(),
         "the add's output id is kept"
     );
 
@@ -3153,7 +3139,7 @@ fn a_traced_bias_linear_is_primitive_and_fuses_into_one_contraction_epilogue() {
 
 /// The `ContractionEpilogue` equations of `g`.
 fn epilogues_of(g: &Graph) -> Vec<&Eqn> {
-    g.eqns
+    g.eqns()
         .iter()
         .filter(|eqn| matches!(eqn.op, OpKind::ContractionEpilogue { .. }))
         .collect()
@@ -3166,7 +3152,7 @@ fn eval_bits(g: &Graph) -> Vec<u32> {
     use poot_tensor::HostTensor;
 
     let inputs: HashMap<ValueId, Value> = g
-        .inputs
+        .inputs()
         .iter()
         .map(|&id| {
             let shape = g.aval(id).shape.clone();
@@ -3209,45 +3195,45 @@ fn contraction_epilogue_near_misses_stay_unfused() {
     let (head, bias) = linear(&b);
     let residual = b.constant("residual", TensorType::f32(vec![m, n]));
     let out = b.binary(BinOp::Add, b.binary(BinOp::Add, head, bias), residual);
-    let fused_case = b.finish(out);
-    let fused = fuse_contraction_epilogues(&fused_case, |_, _| true);
-    assert_eq!(epilogues_of(&fused).len(), 1, "{:?}", fused.eqns);
-    assert_eq!(fused.eqns.len(), 1, "head and both adds are one equation");
+    let fused_case = b.finish(out).unwrap();
+    let fused = fuse_contraction_epilogues(&fused_case, |_, _| true).unwrap();
+    assert_eq!(epilogues_of(&fused).len(), 1, "{:?}", fused.eqns());
+    assert_eq!(fused.eqns().len(), 1, "head and both adds are one equation");
     assert_eq!(eval_bits(&fused), eval_bits(&fused_case), "fused fixture");
 
     // A head read twice: the add and a second consumer.
     let b = Builder::new();
     let (head, bias) = linear(&b);
     let out = b.binary(BinOp::Mul, b.binary(BinOp::Add, head, bias), head);
-    let two_consumers = b.finish(out);
+    let two_consumers = b.finish(out).unwrap();
     // A reducing consumer.
     let b = Builder::new();
     let (head, _) = linear(&b);
     let out = b.reduce(RedOp::Sum, head, 1, true);
-    let reducing = b.finish(out);
+    let reducing = b.finish(out).unwrap();
     // A step whose output is larger than the head: a leaf of another shape broadcast against it.
     let b = Builder::new();
     let (head, _) = linear(&b);
     let wide = b.constant("wide", TensorType::f32(vec![2, m, n]));
     let out = b.binary(BinOp::Add, head, wide);
-    let shape_changing = b.finish(out);
+    let shape_changing = b.finish(out).unwrap();
     // The head is the graph output, so a step beyond it cannot absorb it.
     let b = Builder::new();
     let (head, _) = linear(&b);
-    let pinned = b.finish(head);
+    let pinned = b.finish(head).unwrap();
     for (name, graph) in [
         ("a head with two consumers", &two_consumers),
         ("a reducing consumer", &reducing),
         ("a shape-changing step", &shape_changing),
         ("a head that is the graph output", &pinned),
     ] {
-        let after = fuse_contraction_epilogues(graph, |_, _| true);
+        let after = fuse_contraction_epilogues(graph, |_, _| true).unwrap();
         assert!(
             epilogues_of(&after).is_empty(),
             "{name} must stay unfused: {:?}",
-            after.eqns
+            after.eqns()
         );
-        assert_eq!(after.eqns.len(), graph.eqns.len(), "{name}: untouched");
+        assert_eq!(after.eqns().len(), graph.eqns().len(), "{name}: untouched");
         assert_eq!(eval_bits(&after), eval_bits(graph), "{name}: same bits");
     }
 }
@@ -3266,15 +3252,15 @@ fn a_single_use_bias_broadcast_folds_into_the_epilogue_leaf() {
     let bias = b.constant("bias", TensorType::f32(vec![n]));
     let expanded = b.broadcast(bias, vec![m, n]);
     let out = b.binary(BinOp::Add, b.matmul(x, w), expanded);
-    let traced = b.finish(out);
-    let fused = fuse_contraction_epilogues(&traced, |_, _| true);
+    let traced = b.finish(out).unwrap();
+    let fused = fuse_contraction_epilogues(&traced, |_, _| true).unwrap();
     let epilogues = epilogues_of(&fused);
-    assert_eq!(epilogues.len(), 1, "{:?}", fused.eqns);
+    assert_eq!(epilogues.len(), 1, "{:?}", fused.eqns());
     assert_eq!(
-        fused.eqns.len(),
+        fused.eqns().len(),
         1,
         "the broadcast folds away: {:?}",
-        fused.eqns
+        fused.eqns()
     );
     assert!(
         matches!(
@@ -3298,15 +3284,15 @@ fn a_single_use_bias_broadcast_folds_into_the_epilogue_leaf() {
         b.binary(BinOp::Add, b.matmul(x, w), expanded),
         expanded,
     );
-    let shared = b.finish(out);
-    let after = fuse_contraction_epilogues(&shared, |_, _| true);
+    let shared = b.finish(out).unwrap();
+    let after = fuse_contraction_epilogues(&shared, |_, _| true).unwrap();
     assert!(
         after
-            .eqns
+            .eqns()
             .iter()
             .any(|eqn| matches!(eqn.op, OpKind::Broadcast { .. })),
         "a shared broadcast stays: {:?}",
-        after.eqns
+        after.eqns()
     );
     assert_eq!(eval_bits(&after), eval_bits(&shared));
 }
@@ -3321,8 +3307,8 @@ fn float_select_is_exact_not_float_arithmetic() {
     let if_true = b.constant("t", TensorType::f32(vec![4]));
     let if_false = b.constant("f", TensorType::f32(vec![4]));
     let selected = b.select(cond, if_true, if_false);
-    let graph = b.finish(selected);
-    assert!(matches!(graph.eqns.as_slice(), [eqn] if matches!(eqn.op, OpKind::Select)));
+    let graph = b.finish(selected).unwrap();
+    assert!(matches!(graph.eqns(), [eqn] if matches!(eqn.op, OpKind::Select)));
     assert_eq!(implied_numerics(&graph), NumericsProperty::Exact);
     assert_eq!(implied_numerics(&graph).tier2_class(), Tier2Class::BitExact);
 }

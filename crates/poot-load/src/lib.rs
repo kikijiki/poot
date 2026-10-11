@@ -1,6 +1,6 @@
 //! Dependency-light loading of safetensors and GGUF weights into a `WeightStore` (every tensor's bytes as
-//! stored, quantized tensors packed) and of an HF `config.json`. [`safetensors::decode_dense`] widens one dense
-//! entry to f32 for the CPU oracle.
+//! stored, quantized tensors packed) and of an HF `config.json`. A dense entry widens to f32 through
+//! `poot_quant::weights::DenseWeight::decode_f32`.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -23,7 +23,7 @@ pub use config::{QuantConfig, QuantKind, QuantScheme};
 pub use error::LoadError;
 
 // Re-export helper functions from dtype for internal use
-pub(crate) use dtype::{checked_header_end, decode, miss, parse_dtype};
+pub(crate) use dtype::{checked_header_end, miss, parse_dtype};
 
 #[cfg(test)]
 mod tests;

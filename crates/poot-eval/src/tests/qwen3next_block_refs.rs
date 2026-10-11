@@ -47,7 +47,9 @@ fn gated_delta_net_decode_matches_recurrence() {
     // check shape inference before b is consumed
     assert_eq!(b.aval(o).shape, vec![1, h, 1, d], "output shape");
     assert_eq!(b.aval(s_out).shape, vec![1, h, d, d], "state shape");
-    let g = b.finish_with_state(o, &[(s_in, s_out)]);
+    let g = b
+        .finish(poot_graph_ir::Outputs::new(o).with_state(&[(s_in, s_out)]))
+        .unwrap();
 
     // --- run L decode steps ---
     let mut state = HostTensor::f32(vec![1, h, d, d], vec![0.0f32; h * d * d]);
@@ -193,7 +195,9 @@ fn gated_delta_net_decode_batch_generalizes_from_batch1() {
                 let s0 =
                     b.state_input("s", TensorType::f32(vec![1, h, d, d]), StateRole::Recurrent);
                 let (o, s_out) = gated_delta_net_decode(&b, q_in, k_in, v_in, g_in, bt_in, s0);
-                let g_graph = b.finish_with_state(o, &[(s0, s_out)]);
+                let g_graph = b
+                    .finish(poot_graph_ir::Outputs::new(o).with_state(&[(s0, s_out)]))
+                    .unwrap();
 
                 let mut inp = HashMap::new();
                 inp.insert(q_in.id(), HostTensor::f32(vec![1, h, 1, d], q.clone()));
@@ -244,7 +248,9 @@ fn gated_delta_net_decode_batch_generalizes_from_batch1() {
             vec![b_batch, h, d, d],
             "batched s_out shape"
         );
-        let g_graph = b.finish_with_state(o, &[(s0, s_out)]);
+        let g_graph = b
+            .finish(poot_graph_ir::Outputs::new(o).with_state(&[(s0, s_out)]))
+            .unwrap();
 
         let flat = |pick: fn(&GdnRow) -> &Vec<f32>| -> Vec<f32> {
             rows.iter().flat_map(|r| pick(r).clone()).collect()

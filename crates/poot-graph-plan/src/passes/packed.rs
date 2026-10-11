@@ -30,8 +30,6 @@ impl std::fmt::Display for PackedDequantErrorContext {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum PackedDequantProductionError {
-    #[error(transparent)]
-    InvalidGraph(#[from] GraphValidationError),
     #[error("packed contraction {context} was present before Card 355 recognition")]
     PreexistingContraction { context: PackedDequantErrorContext },
     #[error(
@@ -97,9 +95,9 @@ pub enum PackedDequantProductionError {
     Unmatched { context: PackedDequantErrorContext },
 }
 
-pub(super) fn packed_consumer_map<V: ValidationChannel>(g: &Graph<V>) -> ValueTable<Vec<usize>> {
-    let mut consumers = ValueTable::filled(g.values.len(), Vec::new());
-    for (equation, eqn) in g.eqns.iter().enumerate() {
+pub(super) fn packed_consumer_map(g: &Graph) -> ValueTable<Vec<usize>> {
+    let mut consumers = ValueTable::filled(g.values().len(), Vec::new());
+    for (equation, eqn) in g.eqns().iter().enumerate() {
         for operand in &eqn.inputs {
             if let Operand::Value(value) = operand {
                 consumers[*value].push(equation);
@@ -109,15 +107,15 @@ pub(super) fn packed_consumer_map<V: ValidationChannel>(g: &Graph<V>) -> ValueTa
     consumers
 }
 
-fn is_graph_escape<V: ValidationChannel>(g: &Graph<V>, value: ValueId) -> bool {
+fn is_graph_escape(g: &Graph, value: ValueId) -> bool {
     g.liveness_roots().any(|root| root == value)
 }
 
 #[cfg_attr(not(test), expect(dead_code, reason = "held for POOT-672"))]
-pub(crate) fn reject_preexisting_packed_contractions<V: ValidationChannel>(
-    g: &Graph<V>,
+pub(crate) fn reject_preexisting_packed_contractions(
+    g: &Graph,
 ) -> Result<(), PackedDequantProductionError> {
-    for eqn in &g.eqns {
+    for eqn in g.eqns() {
         if let OpKind::PackedContraction { descriptor, .. }
         | OpKind::PackedRowGather { descriptor } = eqn.op
         {
@@ -147,14 +145,14 @@ pub(super) fn value_input(eqn: &Eqn, position: usize) -> Option<ValueId> {
 /// consumer, no two roles aliasing the same value). R469-007: identity is checked by graph structure,
 /// not by parsing a `PackedSourceName` suffix off `ValueMeta::name` and matching linear-id prefixes -
 /// one tracer's naming convention, not the graph's.
-fn validate_packed_carriers<V: ValidationChannel>(
-    g: &Graph<V>,
+fn validate_packed_carriers(
+    g: &Graph,
     equation: usize,
     descriptor: poot_quant::PackedWeight,
     carrier_inputs: &[Operand],
     consumers: &ValueTable<Vec<usize>>,
 ) -> Result<Vec<ValueId>, PackedDequantProductionError> {
-    let context = PackedDequantErrorContext::new(g.eqns[equation].out, descriptor);
+    let context = PackedDequantErrorContext::new(g.eqns()[equation].out, descriptor);
     let roles = descriptor.sources();
     if carrier_inputs.len() != roles.len() {
         return Err(PackedDequantProductionError::CarrierOperands { context });
@@ -174,26 +172,22 @@ fn validate_packed_carriers<V: ValidationChannel>(
                 storage: g.meta(carrier).storage,
             });
         }
-        if g.output == carrier {
+        if g.result() == carrier {
             return Err(PackedDequantProductionError::CarrierEscape {
                 context,
                 carrier,
                 destination: "graph output",
             });
         }
-        if g.validation_outputs()
-            .iter()
-            .any(|validation| validation.value == carrier)
-        {
+        if g.witnesses().any(|validation| validation.value == carrier) {
             return Err(PackedDequantProductionError::CarrierEscape {
                 context,
                 carrier,
                 destination: "validation output",
             });
         }
-        if g.state
-            .iter()
-            .any(|&(state_in, state_out)| state_in == carrier || state_out == carrier)
+        if g.state()
+            .any(|(state_in, state_out)| state_in == carrier || state_out == carrier)
         {
             return Err(PackedDequantProductionError::CarrierEscape {
                 context,
@@ -237,32 +231,32 @@ struct PackedContractionCandidate {
 /// Reshape -> MatMul`. The optional reshape (`packed_linear`'s `alias_weight_shape`) follows the
 /// transpose, so this chain can only express an ordinary `[out, k]` dequant - never a view that needs to
 /// split the stored rows into blocks before the transpose (Card 385).
-fn recognize_canonical_packed_chain<V: ValidationChannel>(
-    g: &Graph<V>,
+fn recognize_canonical_packed_chain(
+    g: &Graph,
     producer: &HashMap<ValueId, usize>,
     consumers: &ValueTable<Vec<usize>>,
     mut weight: ValueId,
 ) -> Option<PackedContractionCandidate> {
     let mut member_indices = Vec::new();
     if let Some(&reshape_index) = producer.get(&weight)
-        && matches!(g.eqns[reshape_index].op, OpKind::Reshape { .. })
+        && matches!(g.eqns()[reshape_index].op, OpKind::Reshape { .. })
     {
         if consumers[weight].len() != 1 || is_graph_escape(g, weight) {
             return None;
         }
         member_indices.push(reshape_index);
-        weight = value_input(&g.eqns[reshape_index], 0)?;
+        weight = value_input(&g.eqns()[reshape_index], 0)?;
     }
     let &transpose_index = producer.get(&weight)?;
-    let OpKind::Transpose { perm } = &g.eqns[transpose_index].op else {
+    let OpKind::Transpose { perm } = &g.eqns()[transpose_index].op else {
         return None;
     };
     if perm.as_slice() != [1, 0] || consumers[weight].len() != 1 || is_graph_escape(g, weight) {
         return None;
     }
-    let dequant_out = value_input(&g.eqns[transpose_index], 0)?;
+    let dequant_out = value_input(&g.eqns()[transpose_index], 0)?;
     let &dequant_index = producer.get(&dequant_out)?;
-    let OpKind::PackedDequant { descriptor } = g.eqns[dequant_index].op else {
+    let OpKind::PackedDequant { descriptor } = g.eqns()[dequant_index].op else {
         return None;
     };
     if consumers[dequant_out].len() != 1 || is_graph_escape(g, dequant_out) {
@@ -272,7 +266,7 @@ fn recognize_canonical_packed_chain<V: ValidationChannel>(
         g,
         dequant_index,
         descriptor,
-        &g.eqns[dequant_index].inputs,
+        &g.eqns()[dequant_index].inputs,
         consumers,
     )
     .ok()?;
@@ -291,31 +285,31 @@ fn recognize_canonical_packed_chain<V: ValidationChannel>(
 /// stored `[out, k]` pair cannot otherwise expose (Card 385). `blocks` is read from the reshape in the
 /// graph; a value that disagrees with `descriptor` is caught by the shared infer-and-compare gate in
 /// the caller.
-fn recognize_blocked_packed_chain<V: ValidationChannel>(
-    g: &Graph<V>,
+fn recognize_blocked_packed_chain(
+    g: &Graph,
     producer: &HashMap<ValueId, usize>,
     consumers: &ValueTable<Vec<usize>>,
     weight: ValueId,
 ) -> Option<PackedContractionCandidate> {
     let &transpose_index = producer.get(&weight)?;
-    let OpKind::Transpose { perm } = &g.eqns[transpose_index].op else {
+    let OpKind::Transpose { perm } = &g.eqns()[transpose_index].op else {
         return None;
     };
     if perm.as_slice() != [0, 2, 1] || consumers[weight].len() != 1 || is_graph_escape(g, weight) {
         return None;
     }
-    let reshape_out = value_input(&g.eqns[transpose_index], 0)?;
+    let reshape_out = value_input(&g.eqns()[transpose_index], 0)?;
     let &reshape_index = producer.get(&reshape_out)?;
-    let OpKind::Reshape { shape } = &g.eqns[reshape_index].op else {
+    let OpKind::Reshape { shape } = &g.eqns()[reshape_index].op else {
         return None;
     };
     if shape.len() != 3 || consumers[reshape_out].len() != 1 || is_graph_escape(g, reshape_out) {
         return None;
     }
     let blocks = shape[0];
-    let dequant_out = value_input(&g.eqns[reshape_index], 0)?;
+    let dequant_out = value_input(&g.eqns()[reshape_index], 0)?;
     let &dequant_index = producer.get(&dequant_out)?;
-    let OpKind::PackedDequant { descriptor } = g.eqns[dequant_index].op else {
+    let OpKind::PackedDequant { descriptor } = g.eqns()[dequant_index].op else {
         return None;
     };
     if consumers[dequant_out].len() != 1 || is_graph_escape(g, dequant_out) {
@@ -325,7 +319,7 @@ fn recognize_blocked_packed_chain<V: ValidationChannel>(
         g,
         dequant_index,
         descriptor,
-        &g.eqns[dequant_index].inputs,
+        &g.eqns()[dequant_index].inputs,
         consumers,
     )
     .ok()?;
@@ -346,15 +340,15 @@ fn recognize_blocked_packed_chain<V: ValidationChannel>(
 /// recognized candidate and the original (untransposed) activation; the caller still runs the shared
 /// infer-and-compare gate against the outer `Transpose`'s declared output, so a near-miss (a shape that
 /// does not actually correspond to `x @ W^T`) is declined there exactly like the other two chains.
-fn recognize_transposed_canonical_packed_chain<V: ValidationChannel>(
-    g: &Graph<V>,
+fn recognize_transposed_canonical_packed_chain(
+    g: &Graph,
     producer: &HashMap<ValueId, usize>,
     consumers: &ValueTable<Vec<usize>>,
     mut weight: ValueId,
     activation_t: ValueId,
 ) -> Option<(PackedContractionCandidate, ValueId)> {
     let &at_index = producer.get(&activation_t)?;
-    let OpKind::Transpose { perm } = &g.eqns[at_index].op else {
+    let OpKind::Transpose { perm } = &g.eqns()[at_index].op else {
         return None;
     };
     if perm.as_slice() != [1, 0]
@@ -363,20 +357,20 @@ fn recognize_transposed_canonical_packed_chain<V: ValidationChannel>(
     {
         return None;
     }
-    let activation = value_input(&g.eqns[at_index], 0)?;
+    let activation = value_input(&g.eqns()[at_index], 0)?;
 
     let mut member_indices = vec![at_index];
     if let Some(&reshape_index) = producer.get(&weight)
-        && matches!(g.eqns[reshape_index].op, OpKind::Reshape { .. })
+        && matches!(g.eqns()[reshape_index].op, OpKind::Reshape { .. })
     {
         if consumers[weight].len() != 1 || is_graph_escape(g, weight) {
             return None;
         }
         member_indices.push(reshape_index);
-        weight = value_input(&g.eqns[reshape_index], 0)?;
+        weight = value_input(&g.eqns()[reshape_index], 0)?;
     }
     let &dequant_index = producer.get(&weight)?;
-    let OpKind::PackedDequant { descriptor } = g.eqns[dequant_index].op else {
+    let OpKind::PackedDequant { descriptor } = g.eqns()[dequant_index].op else {
         return None;
     };
     if consumers[weight].len() != 1 || is_graph_escape(g, weight) {
@@ -386,7 +380,7 @@ fn recognize_transposed_canonical_packed_chain<V: ValidationChannel>(
         g,
         dequant_index,
         descriptor,
-        &g.eqns[dequant_index].inputs,
+        &g.eqns()[dequant_index].inputs,
         consumers,
     )
     .ok()?;
@@ -409,16 +403,16 @@ fn recognize_transposed_canonical_packed_chain<V: ValidationChannel>(
 ///
 /// Generic over the validation channel: a validation value is a liveness root, so a member that a witness
 /// observes is a graph escape and its composition is left unrecognized.
-pub fn recognize_packed_contractions<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
+pub fn recognize_packed_contractions(g: &Graph) -> Result<Graph, EditError> {
     let consumers = packed_consumer_map(g);
     let mut producer = HashMap::new();
-    for (index, eqn) in g.eqns.iter().enumerate() {
+    for (index, eqn) in g.eqns().iter().enumerate() {
         producer.insert(eqn.out, index);
     }
     let mut replacements: HashMap<usize, Eqn> = HashMap::new();
     let mut removed = HashSet::new();
 
-    for (matmul_index, matmul) in g.eqns.iter().enumerate() {
+    for (matmul_index, matmul) in g.eqns().iter().enumerate() {
         if !matches!(matmul.op, OpKind::MatMul) || matmul.inputs.len() != 2 {
             continue;
         }
@@ -466,7 +460,7 @@ pub fn recognize_packed_contractions<V: ValidationChannel>(g: &Graph<V>) -> Grap
         );
     }
 
-    for (transpose_index, transpose_eqn) in g.eqns.iter().enumerate() {
+    for (transpose_index, transpose_eqn) in g.eqns().iter().enumerate() {
         if replacements.contains_key(&transpose_index) || removed.contains(&transpose_index) {
             continue;
         }
@@ -485,7 +479,7 @@ pub fn recognize_packed_contractions<V: ValidationChannel>(g: &Graph<V>) -> Grap
         if replacements.contains_key(&inner_matmul_index) || removed.contains(&inner_matmul_index) {
             continue;
         }
-        let inner_matmul = &g.eqns[inner_matmul_index];
+        let inner_matmul = &g.eqns()[inner_matmul_index];
         if !matches!(inner_matmul.op, OpKind::MatMul) || inner_matmul.inputs.len() != 2 {
             continue;
         }
@@ -543,7 +537,7 @@ pub fn recognize_packed_contractions<V: ValidationChannel>(g: &Graph<V>) -> Grap
     }
 
     let eqns = g
-        .eqns
+        .eqns()
         .iter()
         .enumerate()
         .filter_map(|(index, eqn)| {
@@ -553,22 +547,22 @@ pub fn recognize_packed_contractions<V: ValidationChannel>(g: &Graph<V>) -> Grap
                 .or_else(|| (!removed.contains(&index)).then(|| eqn.clone()))
         })
         .collect();
-    Graph { eqns, ..g.clone() }
+    with_eqns(g, eqns)
 }
 
 /// Card 545a: claim `Gather { axis: 0 }(PackedDequant(carriers..), ids)` - a quantized
 /// token-embedding lookup - as one `PackedRowGather(carriers.., ids)`, so only the gathered rows are
 /// decoded and no `[out, K]` table is materialized. The dequant must have the gather as its only
 /// consumer and not escape; its carriers must pass the same structural check as every claim.
-pub fn recognize_packed_row_gathers<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
+pub fn recognize_packed_row_gathers(g: &Graph) -> Result<Graph, EditError> {
     let consumers = packed_consumer_map(g);
     let mut producer = HashMap::new();
-    for (index, eqn) in g.eqns.iter().enumerate() {
+    for (index, eqn) in g.eqns().iter().enumerate() {
         producer.insert(eqn.out, index);
     }
     let mut replacements: HashMap<usize, Eqn> = HashMap::new();
     let mut removed = HashSet::new();
-    for (gather_index, gather) in g.eqns.iter().enumerate() {
+    for (gather_index, gather) in g.eqns().iter().enumerate() {
         if !matches!(gather.op, OpKind::Gather { axis: 0 }) {
             continue;
         }
@@ -578,7 +572,7 @@ pub fn recognize_packed_row_gathers<V: ValidationChannel>(g: &Graph<V>) -> Graph
         let Some(&dequant_index) = producer.get(&table) else {
             continue;
         };
-        let OpKind::PackedDequant { descriptor } = g.eqns[dequant_index].op else {
+        let OpKind::PackedDequant { descriptor } = g.eqns()[dequant_index].op else {
             continue;
         };
         if consumers[table].len() != 1 || is_graph_escape(g, table) {
@@ -588,7 +582,7 @@ pub fn recognize_packed_row_gathers<V: ValidationChannel>(g: &Graph<V>) -> Graph
             g,
             dequant_index,
             descriptor,
-            &g.eqns[dequant_index].inputs,
+            &g.eqns()[dequant_index].inputs,
             &consumers,
         ) else {
             continue;
@@ -618,7 +612,7 @@ pub fn recognize_packed_row_gathers<V: ValidationChannel>(g: &Graph<V>) -> Graph
         );
     }
     let eqns = g
-        .eqns
+        .eqns()
         .iter()
         .enumerate()
         .filter_map(|(index, eqn)| {
@@ -628,15 +622,13 @@ pub fn recognize_packed_row_gathers<V: ValidationChannel>(g: &Graph<V>) -> Graph
                 .or_else(|| (!removed.contains(&index)).then(|| eqn.clone()))
         })
         .collect();
-    Graph { eqns, ..g.clone() }
+    with_eqns(g, eqns)
 }
 
 /// Card 355's final production policy gate. It scans live equations only, after DCE.
-pub fn reject_packed_dequant_escapes<V: ValidationChannel>(
-    g: &Graph<V>,
-) -> Result<(), PackedDequantProductionError> {
+pub fn reject_packed_dequant_escapes(g: &Graph) -> Result<(), PackedDequantProductionError> {
     let consumers = packed_consumer_map(g);
-    for (equation, eqn) in g.eqns.iter().enumerate() {
+    for (equation, eqn) in g.eqns().iter().enumerate() {
         if let OpKind::PackedRowGather { descriptor } = eqn.op {
             let carriers = &eqn.inputs[..eqn.inputs.len().saturating_sub(1)];
             validate_packed_carriers(g, equation, descriptor, carriers, &consumers)?;
@@ -644,7 +636,7 @@ pub fn reject_packed_dequant_escapes<V: ValidationChannel>(
         if let OpKind::PackedContraction { descriptor, rows } = eqn.op {
             let carriers = &eqn.inputs[rows.leading_operands()..];
             validate_packed_carriers(g, equation, descriptor, carriers, &consumers)?;
-            if g.state.iter().any(|&(_, state_out)| state_out == eqn.out) {
+            if g.state().any(|(_, state_out)| state_out == eqn.out) {
                 return Err(PackedDequantProductionError::StateOutput {
                     context: PackedDequantErrorContext::new(eqn.out, descriptor),
                 });
@@ -654,20 +646,17 @@ pub fn reject_packed_dequant_escapes<V: ValidationChannel>(
             continue;
         };
         validate_packed_carriers(g, equation, descriptor, &eqn.inputs, &consumers)?;
-        if g.output == eqn.out {
+        if g.result() == eqn.out {
             return Err(PackedDequantProductionError::GraphOutput {
                 context: PackedDequantErrorContext::new(eqn.out, descriptor),
             });
         }
-        if g.validation_outputs()
-            .iter()
-            .any(|validation| validation.value == eqn.out)
-        {
+        if g.witnesses().any(|validation| validation.value == eqn.out) {
             return Err(PackedDequantProductionError::ValidationOutput {
                 context: PackedDequantErrorContext::new(eqn.out, descriptor),
             });
         }
-        if g.state.iter().any(|&(_, state_out)| state_out == eqn.out) {
+        if g.state().any(|(_, state_out)| state_out == eqn.out) {
             return Err(PackedDequantProductionError::StateOutput {
                 context: PackedDequantErrorContext::new(eqn.out, descriptor),
             });
@@ -679,7 +668,7 @@ pub fn reject_packed_dequant_escapes<V: ValidationChannel>(
                 consumers: consumers[eqn.out].len(),
             });
         }
-        let next = &g.eqns[consumers[eqn.out][0]];
+        let next = &g.eqns()[consumers[eqn.out][0]];
         match &next.op {
             OpKind::Transpose { perm } if perm.as_slice() != [1, 0] => {
                 return Err(PackedDequantProductionError::TransposePermutation {
@@ -688,7 +677,7 @@ pub fn reject_packed_dequant_escapes<V: ValidationChannel>(
                 });
             }
             OpKind::Transpose { .. } => {
-                if g.state.iter().any(|&(_, state_out)| state_out == next.out) {
+                if g.state().any(|(_, state_out)| state_out == next.out) {
                     return Err(PackedDequantProductionError::StateOutput {
                         context: PackedDequantErrorContext::new(eqn.out, descriptor),
                     });
@@ -739,7 +728,7 @@ mod tests {
         let out =
             poot_graph_ir::ops::packed_linear(&b, activation, "layer", descriptor(), None, None)
                 .unwrap();
-        b.finish(out)
+        b.finish(out).unwrap()
     }
 
     /// R467-009's equivalent spelling: the same linear as `y = (W @ x^T)^T` instead. `canonical`'s
@@ -747,49 +736,46 @@ mod tests {
     /// transposes back to `[batch, out]` under the graph's own output id.
     fn transposed_spelling_graph() -> Graph {
         let canonical = canonical_graph();
-        let dequant = canonical.eqns[0].out;
-        let Operand::Value(activation) = canonical.eqns[2].inputs[0] else {
+        let dequant = canonical.eqns()[0].out;
+        let Operand::Value(activation) = canonical.eqns()[2].inputs[0] else {
             unreachable!("packed_linear's MatMul reads the activation first")
         };
-        let activation_shape = canonical.values[activation].aval.shape.clone();
-        let dequant_shape = canonical.values[dequant].aval.shape.clone();
+        let activation_shape = canonical.values()[activation].aval.shape.clone();
+        let dequant_shape = canonical.values()[dequant].aval.shape.clone();
 
-        let mut g = canonical.clone();
-        let xt = g.values.push(ValueMeta::new(
-            TensorType::f32(vec![activation_shape[1], activation_shape[0]]),
-            Storage::Device,
-            None,
-        ));
-        let wx = g.values.push(ValueMeta::new(
-            TensorType::f32(vec![dequant_shape[0], activation_shape[0]]),
-            Storage::Device,
-            None,
-        ));
-        let y = g.output;
-        g.eqns.truncate(1);
-        g.eqns.push(Eqn {
-            op: OpKind::Transpose { perm: vec![1, 0] },
-            inputs: vec![Operand::Value(activation)],
-            out: xt,
-            layer: None,
-        });
-        g.eqns.push(Eqn {
-            op: OpKind::MatMul,
-            inputs: vec![Operand::Value(dequant), Operand::Value(xt)],
-            out: wx,
-            layer: None,
-        });
-        g.eqns.push(Eqn {
-            op: OpKind::Transpose { perm: vec![1, 0] },
-            inputs: vec![Operand::Value(wx)],
-            out: y,
-            layer: None,
-        });
-        g
-    }
-
-    fn eqn_kinds(g: &Graph) -> Vec<String> {
-        g.eqns.iter().map(|e| e.op.name()).collect()
+        let y = canonical.result();
+        poot_test_util::graph_fixtures::derive(&canonical, |g| {
+            let xt = g.values_mut().push(ValueMeta::new(
+                TensorType::f32(vec![activation_shape[1], activation_shape[0]]),
+                Storage::Device,
+                None,
+            ));
+            let wx = g.values_mut().push(ValueMeta::new(
+                TensorType::f32(vec![dequant_shape[0], activation_shape[0]]),
+                Storage::Device,
+                None,
+            ));
+            g.eqns_mut().truncate(1);
+            g.eqns_mut().push(Eqn {
+                op: OpKind::Transpose { perm: vec![1, 0] },
+                inputs: vec![Operand::Value(activation)],
+                out: xt,
+                layer: None,
+            });
+            g.eqns_mut().push(Eqn {
+                op: OpKind::MatMul,
+                inputs: vec![Operand::Value(dequant), Operand::Value(xt)],
+                out: wx,
+                layer: None,
+            });
+            g.eqns_mut().push(Eqn {
+                op: OpKind::Transpose { perm: vec![1, 0] },
+                inputs: vec![Operand::Value(wx)],
+                out: y,
+                layer: None,
+            });
+        })
+        .unwrap()
     }
 
     /// The graph-level packed-dequant production pipeline (same steps as `transform/tests.rs`'s
@@ -797,12 +783,10 @@ mod tests {
     /// reject every remaining escape. Driving this instead of `recognize_packed_contractions` alone
     /// proves the reversed spelling survives the real production entry point, not just an isolated call.
     fn prepare_packed_dequant_production(g: &Graph) -> Result<Graph, PackedDequantProductionError> {
-        g.validate()?;
         reject_preexisting_packed_contractions(g)?;
-        let graph = crate::passes::cse_dce::dce_with_roots(g, &[]);
-        let graph = recognize_packed_contractions(&graph);
+        let graph = crate::passes::cse_dce::dce_with_roots(g, &[]).unwrap();
+        let graph = recognize_packed_contractions(&graph).unwrap();
         reject_packed_dequant_escapes(&graph)?;
-        graph.validate()?;
         Ok(graph)
     }
 
@@ -816,11 +800,11 @@ mod tests {
         let g = transposed_spelling_graph();
         let recognized = prepare_packed_dequant_production(&g).unwrap();
         assert_eq!(
-            recognized.eqns.len(),
+            recognized.eqns().len(),
             1,
             "expected the whole chain to collapse to one eqn: {recognized:?}"
         );
-        match &recognized.eqns[0].op {
+        match &recognized.eqns()[0].op {
             OpKind::PackedContraction {
                 descriptor: d,
                 rows,
@@ -830,31 +814,7 @@ mod tests {
             }
             other => panic!("expected PackedContraction, got {other:?}"),
         }
-        assert_eq!(recognized.aval(recognized.output).shape, vec![2, 3]);
-    }
-
-    /// SC-001's near miss: one operand shape changed (the outer transpose's declared output no longer
-    /// agrees with what `activation @ W^T` actually produces) must decline, leaving the graph's
-    /// equations untouched. Mutation: drop the shared infer-and-compare gate (accept the structural
-    /// match alone); this fixture would then also fuse and the row goes red.
-    #[test]
-    fn transposed_spelling_with_wrong_output_shape_is_declined() {
-        let mut g = transposed_spelling_graph();
-        let before = eqn_kinds(&g);
-        g.values[g.output].aval = TensorType::f32(vec![3, 3]);
-        let recognized = recognize_packed_contractions(&g);
-        assert!(
-            !recognized
-                .eqns
-                .iter()
-                .any(|eqn| matches!(eqn.op, OpKind::PackedContraction { .. })),
-            "a shape near-miss must not be recognized as a packed contraction: {recognized:?}"
-        );
-        assert_eq!(
-            eqn_kinds(&recognized),
-            before,
-            "declining must leave the graph's equations untouched"
-        );
+        assert_eq!(recognized.aval(recognized.result()).shape, vec![2, 3]);
     }
 
     /// R469-007: `validate_packed_carriers` must identify the weight and scale carriers by their
@@ -867,21 +827,24 @@ mod tests {
     /// `CarrierIdentity { roles: (Planar(Codes), Planar(Scale)), name: None }`.
     #[test]
     fn canonical_chain_is_recognized_with_no_packed_source_names() {
-        let mut g = canonical_graph();
+        let named = canonical_graph();
         assert!(
-            g.values.iter().any(|value| value.name.is_some()),
+            named.values().iter().any(|value| value.name.is_some()),
             "fixture has no named value, so clearing names would prove nothing"
         );
-        for value in g.values.iter_mut() {
-            value.name = None;
-        }
+        let g = poot_test_util::graph_fixtures::derive(&named, |draft| {
+            for value in draft.values_mut().iter_mut() {
+                value.name = None;
+            }
+        })
+        .unwrap();
         let recognized = prepare_packed_dequant_production(&g).unwrap();
         assert_eq!(
-            recognized.eqns.len(),
+            recognized.eqns().len(),
             1,
             "expected the whole chain to collapse to one eqn: {recognized:?}"
         );
-        match &recognized.eqns[0].op {
+        match &recognized.eqns()[0].op {
             OpKind::PackedContraction {
                 descriptor: d,
                 rows,
@@ -891,7 +854,7 @@ mod tests {
             }
             other => panic!("expected PackedContraction, got {other:?}"),
         }
-        assert_eq!(recognized.aval(recognized.output).shape, vec![2, 3]);
+        assert_eq!(recognized.aval(recognized.result()).shape, vec![2, 3]);
     }
 
     /// Card 541: the recognizer's carrier validation and candidate replacement are role-indexed, not
@@ -948,15 +911,15 @@ mod tests {
         plan.declare_result(output).unwrap();
         let mut prepared = b.preflight_append(plan).unwrap();
         let committed = b.commit_append(&mut prepared).unwrap();
-        let g = b.finish(committed);
+        let g = b.finish(committed).unwrap();
 
         let recognized = prepare_packed_dequant_production(&g).unwrap();
         assert_eq!(
-            recognized.eqns.len(),
+            recognized.eqns().len(),
             1,
             "expected the whole chain to collapse to one eqn: {recognized:?}"
         );
-        match &recognized.eqns[0].op {
+        match &recognized.eqns()[0].op {
             OpKind::PackedContraction {
                 descriptor: d,
                 rows,
@@ -967,7 +930,7 @@ mod tests {
             other => panic!("expected PackedContraction, got {other:?}"),
         }
         assert_eq!(
-            recognized.eqns[0].inputs.len(),
+            recognized.eqns()[0].inputs.len(),
             2,
             "activation plus the one Blocks carrier"
         );

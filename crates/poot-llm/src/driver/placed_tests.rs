@@ -21,7 +21,7 @@ use poot_executor::{
     BufferRole, Collectives, Coordinator, Device, DeviceTime, Dispatch, Engine,
     MemoryCounterSnapshot, NativeCounters, SupportBound,
 };
-use poot_graph_ir::{BinOp, Builder, Graph, ValidationOutputs};
+use poot_graph_ir::{BinOp, Builder, Graph};
 use poot_graph_plan::{
     CompileOptions, DeviceId, ShardRule, StagedProgram, Submission, Target, TargetSet,
 };
@@ -101,11 +101,7 @@ impl Model for Mlp {
         &self.weights
     }
 
-    fn trace(
-        &self,
-        _phase: Phase,
-        shape: StepShape,
-    ) -> Result<Graph<ValidationOutputs>, TraceError> {
+    fn trace(&self, _phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
         if shape.capacity.get() > self.config.max_positions {
             return Err(TraceError::ShapeUnsupported {
                 family: MLP,
@@ -152,7 +148,7 @@ impl Model for Mlp {
         }
         let logits = linear(&b, x, &weight(head(), &[VOCAB, HIDDEN]), None);
         let logits = b.reshape(logits, vec![rows, out, VOCAB]);
-        Ok(step.finish(b, logits))
+        Ok(step.finish(b, logits).unwrap())
     }
 }
 
@@ -293,11 +289,7 @@ impl Model for Attn {
         &self.weights
     }
 
-    fn trace(
-        &self,
-        _phase: Phase,
-        shape: StepShape,
-    ) -> Result<Graph<ValidationOutputs>, TraceError> {
+    fn trace(&self, _phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
         if shape.capacity.get() > self.config.max_positions {
             return Err(TraceError::ShapeUnsupported {
                 family: ATTN,
@@ -342,7 +334,7 @@ impl Model for Attn {
         let head = Weight::new(&self.weights, head(), &[VOCAB, HIDDEN])
             .expect("the fixture maps the head");
         let logits = b.reshape(linear(&b, x, &head, None), vec![rows, out, VOCAB]);
-        Ok(step.finish(b, logits))
+        Ok(step.finish(b, logits).unwrap())
     }
 }
 
@@ -434,7 +426,7 @@ thread_local! {
 
 /// [`DriverOptions::charge`] for these rows: remember every dispatch's body by its kernel key, then
 /// charge as the production measure does.
-fn record_bodies(program: &StagedProgram<ValidationOutputs>) -> Retention {
+fn record_bodies(program: &StagedProgram) -> Retention {
     for (_, _, stage) in program.stages() {
         for (_, plan) in stage.planned() {
             if let poot_graph_plan::Plan::Dispatches(dispatches) = plan {
@@ -524,7 +516,7 @@ fn interp(world: &Rc<World>, index: usize) -> Interp {
 }
 
 fn target() -> Target {
-    Target {
+    Target::Gpu {
         backend: Backend::Nvptx,
         caps: DeviceCaps {
             memory_budget_bytes: Some(1 << 30),
@@ -661,7 +653,10 @@ impl Device for Interp {
             .map(|arg| (Rc::clone(arg.buffer), arg.elems as usize))
             .chain([(Rc::clone(d.output.buffer), d.output.elems as usize)])
             .collect();
-        let workgroups = [0, 1, 2].map(|axis| d.threads[axis].div_ceil(d.workgroup[axis].max(1)));
+        let poot_executor::LaunchKind::Grid { threads, workgroup } = d.launch else {
+            panic!("the interpreter device runs thread grids only");
+        };
+        let workgroups = [0, 1, 2].map(|axis| threads[axis].div_ceil(workgroup[axis].max(1)));
         self.open
             .as_mut()
             .expect("a dispatch inside a recording")

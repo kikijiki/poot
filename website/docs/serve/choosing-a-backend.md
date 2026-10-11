@@ -34,8 +34,8 @@ is the lowest-priority backend: it is verified on AMD (RADV) only. See the
 [feature matrix](../reference/feature-matrix.md) for what each supports and
 [Architecture: Backends](../architecture/backends.mdx) for the design.
 
-NPU offload was removed. See [Architecture: NPU
-Offload](../architecture/npu.mdx).
+The AMD XDNA2 NPU is not a serving backend: it is an experimental library device that runs a few F32
+elementwise programs. See [Architecture: NPU Offload](../architecture/npu.mdx).
 
 ## Verifying the sanity check for your box
 

@@ -32,6 +32,7 @@ members = [
     "crates/poot-graph-plan",
     "crates/poot-gpu",
     "crates/poot-ptx-gpu",
+    "crates/poot-npu",
     "crates/pootc",
     "crates/poot-kernel-attr",
     "crates/poot-kernel-intrinsics",
@@ -135,3 +136,21 @@ minijinja-contrib = { version = "2", features = ["pycompat"] }
 anyhow = "1"
 ring = "0.17"
 subtle = "2.6"
+# Raw system calls (poot-serve's process and signal handling, poot-test-util's child-process guard).
+libc = "0.2"
+# Correctly rounded libm functions for the CPU oracle's transcendental ops (poot-eval).
+libm = "0.2.16"
+# Vulkan device-memory budget query (poot-runtime), pinned to the versions wgpu 29 itself uses.
+ash = "0.38"
+wgpu-hal = { version = "29.0.3", features = ["vulkan"] }
+# Guided decoding: byte-level DFA for regex-constrained generation (same 0.4 line as tokenizers/regex).
+regex-automata = "0.4"
+# poot-orchestrator: blocking HTTP with rustls (no system OpenSSL) for the RunPod REST API, the bundled
+# SQLite run-state store, its config format, the Ctrl-C handler and the read-only dashboard server.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+toml = "0.8"
+ctrlc = { version = "3", features = ["termination"] }
+tiny_http = "0.12"
+# poot-npu's build script (the optional XRT FFI shim).
+cc = "1"

@@ -174,7 +174,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    use poot_graph_ir::{Builder, GraphValidationError, StateRole, TensorType};
+    use poot_graph_ir::{Builder, StateRole, TensorType};
 
     fn reference_decode(bits: u8) -> f32 {
         let sign = if bits & 0x80 == 0 { 1.0 } else { -1.0 };
@@ -309,13 +309,13 @@ mod tests {
         // versa) instead of carrying authoritative raw bytes through `Value::E4M3Fn`.
         let builder = Builder::new();
         let x = builder.constant("x", TensorType::new(vec![2], DType::E4M3FN));
-        let graph = builder.finish(x);
+        let graph = builder.finish(x).unwrap();
         assert!(
-            graph.eqns.is_empty(),
+            graph.eqns().is_empty(),
             "regression requires an identity graph"
         );
         let inputs: HashMap<_, crate::Value> = HashMap::from([(
-            graph.inputs[0],
+            graph.inputs()[0],
             poot_tensor::HostTensor::f32(vec![2], vec![1.0, 2.0]).into(),
         )]);
         let message = crate::eval(
@@ -337,9 +337,9 @@ mod tests {
         let builder = Builder::new();
         let x = builder.constant("x", TensorType::f32(vec![2]));
         let y = builder.cast(x, DType::E4M3FN);
-        let graph = builder.finish(y);
+        let graph = builder.finish(y).unwrap();
         let inputs: HashMap<_, crate::Value> = HashMap::from([(
-            graph.inputs[0],
+            graph.inputs()[0],
             poot_tensor::HostTensor::f32(vec![2], vec![1.0, 2.0]).into(),
         )]);
         let output = crate::eval(
@@ -364,7 +364,7 @@ mod tests {
         let builder = Builder::new();
         let x = builder.constant("x", TensorType::new(vec![2, 5], DType::E4M3FN));
         let reshaped = builder.reshape(x, vec![5, 2]);
-        let graph = builder.finish(reshaped);
+        let graph = builder.finish(reshaped).unwrap();
         let bytes = vec![0x00, 0x80, 0x01, 0x7e, 0x7f, 0xff, 0x38, 0xb8, 0x55, 0xd5];
         let inputs = HashMap::from([(
             x.id(),
@@ -387,7 +387,7 @@ mod tests {
         let x = builder.constant("x", TensorType::f32(vec![2, 5]));
         let encoded = builder.cast(x, DType::E4M3FN);
         let decoded = builder.cast(encoded, DType::F32);
-        let graph = builder.finish(decoded);
+        let graph = builder.finish(decoded).unwrap();
         let values = vec![
             0.0,
             -0.0,
@@ -427,7 +427,7 @@ mod tests {
         let builder = Builder::new();
         let x = builder.constant("raw", TensorType::new(vec![2, 5], DType::E4M3FN));
         let same_dtype = builder.cast(x, DType::E4M3FN);
-        let graph = builder.finish(same_dtype);
+        let graph = builder.finish(same_dtype).unwrap();
         let bytes = vec![0x00, 0x80, 0x01, 0x7e, 0x7f, 0xff, 0x38, 0xb8, 0x55, 0xd5];
         let raw = e4m3fn_tensor(vec![2, 5], bytes.clone()).unwrap();
         let raw_bytes = raw.view().bytes().as_ptr();
@@ -455,9 +455,9 @@ mod tests {
     fn generic_value_zero_eqn_raw_identity_returns_input_without_reencoding() {
         let builder = Builder::new();
         let x = builder.constant("raw", TensorType::new(vec![2, 5], DType::E4M3FN));
-        let graph = builder.finish(x);
+        let graph = builder.finish(x).unwrap();
         assert!(
-            graph.eqns.is_empty(),
+            graph.eqns().is_empty(),
             "identity path must have zero equations"
         );
         let bytes = vec![0x00, 0x80, 0x01, 0x7e, 0x7f, 0xff, 0x38, 0xb8, 0x55, 0xd5];
@@ -492,7 +492,9 @@ mod tests {
             TensorType::new(vec![2, 5], DType::E4M3FN),
             StateRole::Recurrent,
         );
-        let graph = builder.finish_with_state(state, &[(state, state)]);
+        let graph = builder
+            .finish(poot_graph_ir::Outputs::new(state).with_state(&[(state, state)]))
+            .unwrap();
         let bytes = vec![0x7f, 0xff, 1, 2, 3, 4, 5, 6, 7, 8];
         let input = e4m3fn_tensor(vec![2, 5], bytes.clone()).unwrap();
         let input_ptr = input.view().bytes().as_ptr();
@@ -530,7 +532,9 @@ mod tests {
         let update = builder.constant("raw_update", TensorType::new(vec![2, 2], DType::E4M3FN));
         let index = builder.constant("index", TensorType::scalar(DType::I32));
         let state_out = builder.dynamic_update_slice_dyn(state, update, index, 1);
-        let graph = builder.finish_with_state(state_out, &[(state, state_out)]);
+        let graph = builder
+            .finish(poot_graph_ir::Outputs::new(state_out).with_state(&[(state, state_out)]))
+            .unwrap();
 
         let initial = e4m3fn_tensor(vec![2, 5], vec![0x7f, 1, 2, 3, 4, 0xff, 5, 6, 7, 8]).unwrap();
         let updates = [
@@ -584,47 +588,16 @@ mod tests {
     }
 
     #[test]
-    fn generic_value_state_rejects_graph_and_binding_dtype_mismatches() {
+    fn generic_value_state_rejects_a_binding_dtype_mismatch() {
         let builder = Builder::new();
         let state = builder.state_input(
             "raw_state",
             TensorType::new(vec![2, 5], DType::E4M3FN),
             StateRole::Recurrent,
         );
-        let dense = builder.constant("dense", TensorType::f32(vec![2, 5]));
-        let malformed = builder.finish_with_state(state, &[(state, dense)]);
-        let inputs = HashMap::from([
-            (
-                state.id(),
-                crate::Value::Host(e4m3fn_tensor(vec![2, 5], vec![0; 10]).unwrap()),
-            ),
-            (
-                dense.id(),
-                crate::Value::Host(poot_tensor::HostTensor::f32(vec![2, 5], vec![0.0; 10])),
-            ),
-        ]);
-        assert!(matches!(
-            crate::eval(
-                &malformed,
-                &inputs,
-                crate::EvalOptions::new(crate::EvalBudget::UNBOUNDED),
-            ),
-            Err(crate::EvalError::InvalidGraph(
-                GraphValidationError::StateTypeMismatch {
-                    state_input,
-                    state_output,
-                    ..
-                }
-            )) if state_input == state.id() && state_output == dense.id()
-        ));
-
-        let builder = Builder::new();
-        let state = builder.state_input(
-            "raw_state",
-            TensorType::new(vec![2, 5], DType::E4M3FN),
-            StateRole::Recurrent,
-        );
-        let graph = builder.finish_with_state(state, &[(state, state)]);
+        let graph = builder
+            .finish(poot_graph_ir::Outputs::new(state).with_state(&[(state, state)]))
+            .unwrap();
         let wrong = HashMap::from([(
             state.id(),
             crate::Value::Host(poot_tensor::HostTensor::f32(vec![2, 5], vec![0.0; 10])),
@@ -644,40 +617,11 @@ mod tests {
     }
 
     #[test]
-    fn generic_value_state_rejects_a_state_input_missing_from_graph_binders() {
-        let builder = Builder::new();
-        let state = builder.state_input(
-            "raw_state",
-            TensorType::new(vec![2, 5], DType::E4M3FN),
-            StateRole::Recurrent,
-        );
-        let replacement =
-            builder.constant("replacement", TensorType::new(vec![2, 5], DType::E4M3FN));
-        let mut graph = builder.finish_with_state(replacement, &[(state, replacement)]);
-        graph.inputs.retain(|&id| id != state.id());
-
-        let inputs = HashMap::from([(
-            replacement.id(),
-            crate::Value::Host(e4m3fn_tensor(vec![2, 5], vec![0x7f; 10]).unwrap()),
-        )]);
-        assert!(matches!(
-            crate::eval(
-                &graph,
-                &inputs,
-                crate::EvalOptions::new(crate::EvalBudget::UNBOUNDED),
-            ),
-            Err(crate::EvalError::InvalidGraph(
-                GraphValidationError::ConstNotInput { value }
-            )) if value == state.id()
-        ));
-    }
-
-    #[test]
     fn generic_value_transpose_preserves_raw_bytes() {
         let builder = Builder::new();
         let x = builder.constant("raw", TensorType::new(vec![2, 5], DType::E4M3FN));
         let y = builder.transpose(x, vec![1, 0]);
-        let graph = builder.finish(y);
+        let graph = builder.finish(y).unwrap();
         let bytes = vec![0x00, 0x80, 0x01, 0x7e, 0x7f, 0xff, 0x38, 0xb8, 0x55, 0xd5];
         let input = e4m3fn_tensor(vec![2, 5], bytes).unwrap();
         let inputs = HashMap::from([(x.id(), crate::Value::Host(input))]);
@@ -704,7 +648,7 @@ mod tests {
         let builder = Builder::new();
         let x = builder.constant("raw", TensorType::new(vec![2, 5], DType::E4M3FN));
         let y = builder.slice(x, 1, 1, 4);
-        let graph = builder.finish(y);
+        let graph = builder.finish(y).unwrap();
         let bytes = vec![0x00, 0x80, 0x01, 0x7e, 0x7f, 0xff, 0x38, 0xb8, 0x55, 0xd5];
         let input = e4m3fn_tensor(vec![2, 5], bytes).unwrap();
         let inputs = HashMap::from([(x.id(), crate::Value::Host(input))]);
@@ -729,7 +673,7 @@ mod tests {
         let a = builder.constant("a", TensorType::new(vec![2, 3], DType::E4M3FN));
         let b = builder.constant("b", TensorType::new(vec![2, 2], DType::E4M3FN));
         let output = builder.concat(1, &[a, b]);
-        let graph = builder.finish(output);
+        let graph = builder.finish(output).unwrap();
         let inputs = HashMap::from([
             (
                 a.id(),
@@ -758,7 +702,7 @@ mod tests {
         let x = builder.constant("raw", TensorType::new(vec![3, 5], DType::E4M3FN));
         let index = builder.constant("index", TensorType::scalar(DType::I32));
         let y = builder.gather(x, 0, index);
-        let graph = builder.finish(y);
+        let graph = builder.finish(y).unwrap();
         let bytes = vec![
             0x00, 0x80, 0x01, 0x7e, 0x7f, 0xff, 0x38, 0xb8, 0x55, 0xd5, 0xff, 0x7f, 0x01, 0x02,
             0x03,
@@ -829,7 +773,7 @@ mod tests {
                 Some(index) => builder.dynamic_update_slice_dyn(operand, update, index, 1),
                 None => builder.dynamic_update_slice(operand, update, position, 1),
             };
-            let graph = builder.finish(output);
+            let graph = builder.finish(output).unwrap();
             let operand_bytes = vec![0x7f, 1, 2, 3, 0xff, 4, 5, 6, 7, 8];
             let update_bytes = vec![0xff, 0x7f, 0x55, 0xaa];
             let mut inputs = HashMap::from([
@@ -885,7 +829,7 @@ mod tests {
         let update = builder.constant("update", TensorType::new(vec![2, 2], DType::E4M3FN));
         let index = builder.constant("index", TensorType::scalar(DType::I32));
         let output = builder.dynamic_update_slice_dyn(operand, update, index, 1);
-        let graph = builder.finish(output);
+        let graph = builder.finish(output).unwrap();
         let inputs = HashMap::from([
             (
                 operand.id(),
@@ -916,7 +860,7 @@ mod tests {
         let src = builder.constant("src", TensorType::new(vec![1, 5], DType::E4M3FN));
         let inverse = builder.constant("inverse", TensorType::new(vec![2], DType::I32));
         let output = builder.scatter_update(base, src, inverse);
-        let graph = builder.finish(output);
+        let graph = builder.finish(output).unwrap();
         let inputs = HashMap::from([
             (
                 base.id(),
@@ -948,7 +892,7 @@ mod tests {
         let builder = Builder::new();
         let x = builder.constant("raw", TensorType::new(vec![1, 3], DType::E4M3FN));
         let y = builder.broadcast(x, vec![2, 3]);
-        let graph = builder.finish(y);
+        let graph = builder.finish(y).unwrap();
         let input = e4m3fn_tensor(vec![1, 3], vec![0x7f, 0xff, 0x01]).unwrap();
         let inputs = HashMap::from([(x.id(), crate::Value::Host(input))]);
 
@@ -973,7 +917,7 @@ mod tests {
         let src = builder.constant("src", TensorType::new(vec![2, 5], DType::E4M3FN));
         let inverse = builder.constant("inverse", TensorType::new(vec![3], DType::I32));
         let output = builder.scatter_update(base, src, inverse);
-        let graph = builder.finish(output);
+        let graph = builder.finish(output).unwrap();
         let base_value = e4m3fn_tensor(
             vec![3, 5],
             vec![0x7f, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],

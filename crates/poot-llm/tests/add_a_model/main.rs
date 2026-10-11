@@ -25,7 +25,7 @@ use poot_executor::{
     ExecutorStats, HostSync, StateScope, StepInputs, StepOutputs,
 };
 use poot_graph_ir::op::SampleRule;
-use poot_graph_ir::{Slot, SlotKey, ValidationOutputs};
+use poot_graph_ir::{Slot, SlotKey};
 use poot_graph_plan::{
     CompileLimits, CompileOptions, StagedProgram, Submission, Target, TargetSet, WeightFormats,
     bind_packed_weights, compile,
@@ -138,9 +138,8 @@ fn oracle_step(
     let graph = model.trace(phase, shape(n)).unwrap();
     if state.is_empty() {
         *state = graph
-            .state
-            .iter()
-            .map(|&(input, _)| HostTensor::zeros(graph.aval(input).shape.clone()))
+            .state()
+            .map(|(input, _)| HostTensor::zeros(graph.aval(input).shape.clone()))
             .collect();
     }
     let slots = [
@@ -241,21 +240,21 @@ fn the_fixture_family_registers_loads_and_compiles_for_every_reference_target() 
     let targets = [
         (
             "wgpu",
-            Target {
+            Target::Gpu {
                 backend: Backend::SpirvVulkan,
                 caps: default_caps_for(Backend::SpirvVulkan),
             },
         ),
         (
             "ROCm",
-            Target {
+            Target::Gpu {
                 backend: Backend::AmdGcn(AmdArch::gfx1151()),
                 caps: default_caps_for(Backend::AmdGcn(AmdArch::gfx1151())),
             },
         ),
         (
             "PTX",
-            Target {
+            Target::Gpu {
                 backend: Backend::Nvptx,
                 caps: default_caps_for(Backend::Nvptx),
             },
@@ -386,7 +385,7 @@ impl Device for FakeDevice {
     type Error = FakeError;
 
     fn target(&self) -> Target {
-        Target {
+        Target::Gpu {
             backend: Backend::SpirvVulkan,
             caps: DeviceCaps::wgpu_rdna3_igpu(),
         }
@@ -488,7 +487,7 @@ impl Executor for Counting {
     fn add_entry(
         &mut self,
         exe: ExecutableId,
-        program: &StagedProgram<ValidationOutputs>,
+        program: &StagedProgram,
     ) -> Result<EntryId, ExecError> {
         self.inner.add_entry(exe, program)
     }
@@ -788,9 +787,8 @@ fn oracle_paged_step(
         .unwrap();
     if state.is_empty() {
         *state = graph
-            .state
-            .iter()
-            .map(|&(input, _)| HostTensor::zeros(graph.aval(input).shape.clone()))
+            .state()
+            .map(|(input, _)| HostTensor::zeros(graph.aval(input).shape.clone()))
             .collect();
     }
     let read: Vec<i32> = (0..rows)

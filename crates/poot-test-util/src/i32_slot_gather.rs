@@ -94,7 +94,9 @@ fn build(kind: Use) -> Graph {
         let update = b.slice(table, 0, 0, t);
         let written = b.dynamic_update_slice_dyn(cache, update, start, 0);
         let out = b.slice(written, 0, 0, OUT_ROWS);
-        return b.finish_with_state(out, &[(cache, written)]);
+        return b
+            .finish(poot_graph_ir::Outputs::new(out).with_state(&[(cache, written)]))
+            .unwrap();
     }
     // The positions index the table's rows, so the slot declares them below `ROWS`: the cast of the
     // slot is then proven exact (POOT-726) and the binder checks the declaration.
@@ -116,7 +118,7 @@ fn build(kind: Use) -> Graph {
         )
     };
     if kind == Use::Cast {
-        return b.finish(update);
+        return b.finish(update).unwrap();
     }
     let start = b.reshape(b.slice(idx, 0, 0, 1), vec![]);
     let cache = b.state_input(
@@ -126,7 +128,8 @@ fn build(kind: Use) -> Graph {
     );
     let written = b.dynamic_update_slice_dyn(cache, update, start, 0);
     let out = b.slice(written, 0, 0, OUT_ROWS);
-    b.finish_with_state(out, &[(cache, written)])
+    b.finish(poot_graph_ir::Outputs::new(out).with_state(&[(cache, written)]))
+        .unwrap()
 }
 
 impl I32SlotGatherVariant {
@@ -134,7 +137,7 @@ impl I32SlotGatherVariant {
     /// bound by what it is, not by id.
     pub fn inputs(&self, graph: &Graph) -> HashMap<ValueId, Value> {
         graph
-            .inputs
+            .inputs()
             .iter()
             .map(|&id| {
                 let meta = graph.meta(id);

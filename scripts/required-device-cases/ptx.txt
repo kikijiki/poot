@@ -17,6 +17,9 @@
 #
 # Card 675: the Gumbel-max sampler's SC-001 (sample_gumbel_no_contract.rs) - the
 # committed production asset dispatched on a fixture where FMA contraction would flip the winner.
+#
+# POOT-1124: the split-KV decode attention (split_kv_decode.rs) against the CPU oracle at the named tolerance, and its
+# captured replay bit-identical to the recording pass. The two-device row is in ptx-2gpu.txt.
 poot-kernelgen::ptx_dispatch_probe	attention_fixture_bank_matches_cpu_on_ptx
 poot-kernelgen::ptx_dispatch_probe	attention_leading_true_inf_mask_dispatches_and_matches_cpu_on_ptx
 poot-kernelgen::ptx_dispatch_probe	attention_split_key_and_live_bound_match_cpu_on_ptx
@@ -109,6 +112,11 @@ poot-llm	driver::device_tests::smolvlm_batched_paged_embeds_match_single_row_run
 poot-llm	driver::device_tests::smolvlm_caption_matches_the_oracle_rows_ptx
 poot-llm	driver::device_tests::smolvlm_front_end_requests_served_batched_equal_single_row_captions_ptx
 poot-llm	driver::device_tests::two_frames_of_one_size_embed_differently_ptx
+poot-llm	driver::step::mtp_tests::mtp_all_accepted_equals_off_ptx
+poot-llm	driver::step::mtp_tests::mtp_greedy_equals_off_ptx
+poot-llm	driver::step::mtp_tests::mtp_proposals_equal_the_oracle_chain_ptx
+poot-llm	driver::step::mtp_tests::mtp_serves_a_sampled_row_ptx
+poot-llm	driver::step::mtp_tests::mtp_two_rows_equal_off_ptx
 poot-llm::add_a_model	four_paged_rows_equal_single_row_runs_ptx
 poot-llm::add_a_model	generate_equals_the_oracle_tokens_ptx
 poot-llm::pooled_deepseek3	pooled_deepseek3_tokens_equal_the_recorded_literals_ptx
@@ -141,6 +149,7 @@ poot-llm::staged_timing	a_timed_pipeline_step_reports_a_device_span_ptx
 poot-llm::timed_executor	profiled_executor_reports_a_nonzero_device_span_ptx
 poot-ptx-gpu::batched_lora_ptx	batched_lora_decode_ptx_matches_per_row_merged_weight_reference
 poot-ptx-gpu::buffer_plan	a_short_value_reusing_a_larger_slot_matches_the_oracle_on_ptx
+poot-ptx-gpu::buffer_plan	an_aie_launch_is_a_typed_refusal_on_ptx
 poot-ptx-gpu::buffer_plan	len_probe_reads_the_operand_own_length_never_a_larger_slots_capacity_on_ptx
 poot-ptx-gpu::buffer_plan	lp3_ptx_write_with_is_exact_across_ring_chunks
 poot-ptx-gpu::cross_backend	a_dense_tiled_epilogue_matches_the_oracle_on_ptx
@@ -159,11 +168,13 @@ poot-ptx-gpu::cross_backend	masked_attention_ptx_matches_cpu
 poot-ptx-gpu::cross_backend	matmul_bias_ptx_matches_cpu
 poot-ptx-gpu::cross_backend	matmul_ptx_matches_cpu
 poot-ptx-gpu::cross_backend	non_power_of_2_ptx_matches_cpu
+poot-ptx-gpu::cross_backend	random_uniform_ptx_matches_cpu
 poot-ptx-gpu::cross_backend	reduce_max_last_axis_ptx_matches_cpu
 poot-ptx-gpu::cross_backend	reduce_max_nonpow2_wide_real_magnitude_ptx_matches_cpu
 poot-ptx-gpu::cross_backend	reduce_sum_nonpow2_wide_real_magnitude_ptx_matches_cpu
 poot-ptx-gpu::cross_backend	reduce_sum_ptx_matches_cpu
 poot-ptx-gpu::cross_backend	rmsnorm_ptx_matches_cpu
+poot-ptx-gpu::cross_backend	sample_token_greedy_ptx_matches_cpu
 poot-ptx-gpu::cross_backend	sample_token_gumbel_topp_only_excludes_untruncated_winner_ptx_matches_cpu
 poot-ptx-gpu::cross_backend	single_element_ptx_matches_cpu
 poot-ptx-gpu::cross_backend	transpose_slice_ptx_matches_cpu
@@ -225,6 +236,8 @@ poot-ptx-gpu::scan_contract	delta_rule_scan_matches_the_oracle_on_ptx
 poot-ptx-gpu::scan_contract	long_scan_agrees_with_the_oracle_and_with_stepped_pieces_on_ptx
 poot-ptx-gpu::scan_contract	ssd_scan_matches_the_oracle_on_ptx
 poot-ptx-gpu::schedule_policy	scan_schedules_match_the_oracle_in_every_regime_on_ptx
+poot-ptx-gpu::split_kv_decode	split_kv_decode_matches_the_oracle_on_ptx
+poot-ptx-gpu::split_kv_decode	split_kv_decode_replay_equals_the_recording_step_on_ptx
 poot-ptx-gpu::staged_pipeline_ptx	a_pipeline_step_waits_once_on_ptx
 poot-ptx-gpu::staged_pipeline_ptx	exported_boundaries_reach_every_consumer_on_ptx
 poot-ptx-gpu::staged_pipeline_ptx	qwen2_pipeline_cut_after_layers_zero_and_one_matches_the_single_stage_on_ptx

@@ -6,7 +6,7 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use poot_graph_ir::{Graph, OpKind, ValidationChannel, ValueId};
+use poot_graph_ir::{Graph, OpKind, ValueId};
 use poot_graph_plan::{WeightFormats, bind_packed_weights};
 use poot_load::gguf::{GgufIndex, GgufValue, IdentityNames, read_gguf, write_gguf};
 use poot_load::plan::default_workers;
@@ -137,8 +137,8 @@ pub(crate) fn projection_consts(model: &dyn Model) -> Vec<String> {
         .collect()
 }
 
-pub(crate) fn declared_dtype<V: ValidationChannel>(g: &Graph<V>, name: &str) -> Option<DType> {
-    g.inputs
+pub(crate) fn declared_dtype(g: &Graph, name: &str) -> Option<DType> {
+    g.inputs()
         .iter()
         .find(|&&id| g.meta(id).name.as_deref() == Some(name))
         .map(|&id| g.aval(id).dtype)
@@ -277,16 +277,16 @@ pub(crate) fn assert_bf16_and_q8_0_trace_through_the_packed_transform(
 /// After the packed-weight transform fed by `model`'s map, `g` holds one `PackedDequant` per
 /// projection and no projection const when `packed`, and declares each projection at its stored
 /// BF16 with no dequant otherwise.
-pub(crate) fn assert_packed_binding<V: ValidationChannel + Clone>(
+pub(crate) fn assert_packed_binding(
     model: &dyn Model,
-    g: &Graph<V>,
+    g: &Graph,
     projections: &[String],
     packed: bool,
     label: &str,
 ) {
     let bound = bind_packed_weights(g, &WeightFormats::from_weight_map(model.weights())).unwrap();
     let dequants = bound
-        .eqns
+        .eqns()
         .iter()
         .filter(|e| matches!(e.op, OpKind::PackedDequant { .. }))
         .count();
@@ -520,12 +520,9 @@ pub(crate) fn read_back_owned(
 
 /// Two graphs are the same equation by equation: the same ops, operands, layer tags and output
 /// names, and the same named inputs (spec 999 SC-002).
-pub(crate) fn assert_same_graph<V: ValidationChannel, W: ValidationChannel>(
-    a: &Graph<V>,
-    b: &Graph<W>,
-) {
-    assert_eq!(a.eqns.len(), b.eqns.len(), "equation count");
-    for (i, (x, y)) in a.eqns.iter().zip(&b.eqns).enumerate() {
+pub(crate) fn assert_same_graph(a: &Graph, b: &Graph) {
+    assert_eq!(a.eqns().len(), b.eqns().len(), "equation count");
+    for (i, (x, y)) in a.eqns().iter().zip(b.eqns()).enumerate() {
         assert_eq!(format!("{x:?}"), format!("{y:?}"), "equation {i}");
         assert_eq!(a.meta(x.out).name, b.meta(y.out).name, "equation {i} name");
     }
@@ -533,8 +530,8 @@ pub(crate) fn assert_same_graph<V: ValidationChannel, W: ValidationChannel>(
         ids.iter().map(|&id| g(id)).collect()
     };
     assert_eq!(
-        named(&|id| a.meta(id).name.clone(), &a.inputs),
-        named(&|id| b.meta(id).name.clone(), &b.inputs),
+        named(&|id| a.meta(id).name.clone(), a.inputs()),
+        named(&|id| b.meta(id).name.clone(), b.inputs()),
         "named inputs"
     );
 }

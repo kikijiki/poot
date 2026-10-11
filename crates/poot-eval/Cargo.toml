@@ -20,14 +20,10 @@ test-support = []
 poot-graph-ir.workspace = true
 poot-quant.workspace = true
 poot-tensor.workspace = true
-# spec 135: the F16 Cast/matmul oracle reuses poot-load's f32_to_f16 / f16_to_f32 so precision loss matches
-# native f16 checkpoint bytes bit-for-bit. poot-load depends only on thiserror/serde, so there is no cycle.
+# The exact route's owner-backed sources (`ExactSourceOwner`, `ExactSourceKind`) are loader vocabulary; POOT-755's
+# direction check lists this edge in FORBIDDEN_NORMAL until the exact route stops naming them.
 poot-load.workspace = true
-# card 528b/531: `Tensor::const_upload`'s BF16<->F32 narrow/widen uses the shared round-to-nearest-even owner
-# every GPU backend already re-exports locally (poot-runtime-common depends only on poot-target, so this is
-# not a cycle either).
-poot-runtime-common.workspace = true
-libm = "0.2.16"
+libm.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

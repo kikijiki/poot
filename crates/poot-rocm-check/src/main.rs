@@ -58,8 +58,43 @@ fn main() {
         Mode::PciePublicationReceipt => run_pcie_publication_receipt(),
     };
     if let Err(e) = res {
+        let kfd_present = std::path::Path::new(KFD_DEVICE_NODE).exists();
+        if let CheckError::Rocm(error) = &e
+            && is_no_device(error, kfd_present)
+        {
+            eprintln!("no ROCm device: {error}");
+            std::process::exit(EXIT_NO_DEVICE);
+        }
         eprintln!("{e}");
-        std::process::exit(1);
+        std::process::exit(EXIT_FAILURE);
+    }
+}
+
+/// Exit status of a check that failed for any reason other than the host having no ROCm device.
+const EXIT_FAILURE: i32 = 1;
+
+/// Exit status of a check that could not run because the host offers no ROCm device: the HSA
+/// library is absent, HSA sees no GPU agent, or the KFD node is missing. Distinct from
+/// [`EXIT_FAILURE`] so a caller on a device-less host can tell "nothing to check" from "the check failed".
+const EXIT_NO_DEVICE: i32 = 2;
+
+/// The kernel driver node `hsa_init` opens first; its absence is what a host without an AMD device
+/// looks like to the ROCm runtime.
+const KFD_DEVICE_NODE: &str = "/dev/kfd";
+
+/// `HSA_STATUS_ERROR_OUT_OF_RESOURCES`, the status `hsa_init` returns when it cannot open the KFD node.
+const HSA_STATUS_ERROR_OUT_OF_RESOURCES: u32 = 0x1008;
+
+/// Whether `error` means this host has no ROCm device, as opposed to a device that failed.
+/// `hsa_init` reports a missing KFD node as `OUT_OF_RESOURCES`, a status that also means real resource
+/// exhaustion, so it counts as "no device" only while the KFD node is actually absent.
+fn is_no_device(error: &RocmError, kfd_present: bool) -> bool {
+    match error {
+        RocmError::LibraryNotFound(_) | RocmError::NoGpuAgent => true,
+        RocmError::Driver(status) => {
+            status.code == HSA_STATUS_ERROR_OUT_OF_RESOURCES && !kfd_present
+        }
+        _ => false,
     }
 }
 
@@ -528,6 +563,7 @@ enum CheckError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use poot_rocm_runtime::HsaStatus;
 
     /// The discrete-GPU receipt skips on an APU host only while ROCm is not required, and no other
     /// backend's variable makes it fail.
@@ -550,5 +586,27 @@ mod tests {
         }
         // A real failure is never a skip, required or not.
         assert!(!pcie_receipt_may_skip(&RocmError::NoGpuAgent, |_| None));
+    }
+
+    fn out_of_resources() -> RocmError {
+        RocmError::Driver(HsaStatus {
+            code: HSA_STATUS_ERROR_OUT_OF_RESOURCES,
+        })
+    }
+
+    /// A missing KFD node makes `hsa_init`'s OUT_OF_RESOURCES a no-device outcome; with the node
+    /// present the same status is a real failure, and so is any other driver status.
+    #[test]
+    fn out_of_resources_is_no_device_only_without_the_kfd_node() {
+        assert!(is_no_device(&out_of_resources(), false));
+        assert!(!is_no_device(&out_of_resources(), true));
+        let other = RocmError::Driver(HsaStatus { code: 0x1000 });
+        assert!(!is_no_device(&other, false));
+        assert!(is_no_device(&RocmError::NoGpuAgent, true));
+        assert!(is_no_device(
+            &RocmError::LibraryNotFound(String::new()),
+            true
+        ));
+        assert!(!is_no_device(&RocmError::ApuNotDiscrete, false));
     }
 }

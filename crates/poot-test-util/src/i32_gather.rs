@@ -60,7 +60,7 @@ fn build(dtype: DType, table_shape: &[usize], axis: usize, index: &[i32]) -> Gra
     } else {
         rows
     };
-    b.finish(out)
+    b.finish(out).unwrap()
 }
 
 /// Every case: axis 0 and axis 1 over F32 and I32 data, and over BF16 data when `bf16` (a backend whose
@@ -115,7 +115,7 @@ impl GatherCase {
     /// `graph`'s inputs, each bound by what it is: the index slot and the `"table"` const.
     pub fn inputs(&self, graph: &Graph) -> HashMap<ValueId, HostTensor> {
         graph
-            .inputs
+            .inputs()
             .iter()
             .map(|&id| {
                 let tensor = match &graph.meta(id).storage {

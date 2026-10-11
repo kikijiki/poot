@@ -22,7 +22,7 @@ pub fn graph() -> Graph {
     let tokens = b.slot(Slot::Token, TensorType::new(vec![TOKENS.len()], DType::I32));
     let table = b.constant("table", TensorType::new(vec![ROWS, WIDTH], DType::I32));
     let rows = b.gather(table, 0, tokens);
-    b.finish(rows)
+    b.finish(rows).unwrap()
 }
 
 /// The table's words, row-major: odd integers from 2^24 + 1 up, then the I32 extremes at the corners.
@@ -48,7 +48,7 @@ pub fn out_shape() -> Vec<usize> {
 /// `graph`'s inputs bound by what they are: the token slot and the `"table"` const.
 pub fn inputs(graph: &Graph) -> HashMap<ValueId, Value> {
     graph
-        .inputs
+        .inputs()
         .iter()
         .map(|&id| {
             let tensor = match &graph.meta(id).storage {

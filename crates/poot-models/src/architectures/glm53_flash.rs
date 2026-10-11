@@ -22,7 +22,7 @@
 //! one (the reference cycles them by draft step, which a step shape does not name), refuses the
 //! phase typed.
 
-use poot_graph_ir::{Builder, Graph, ValidationOutputs};
+use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
 use poot_tensor::DType;
 
@@ -93,11 +93,7 @@ impl Model for Glm53Flash {
         &self.weights
     }
 
-    fn trace(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-    ) -> Result<Graph<ValidationOutputs>, TraceError> {
+    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_mtp_step(FAMILY, phase, shape, p.max_positions)?;
         if let Some(moe) = &p.moe {
@@ -116,7 +112,7 @@ impl Model for Glm53Flash {
             }
             _ => self.tower.trace(&b, &step, p),
         };
-        Ok(step.finish(b, logits))
+        Ok(step.finish(b, logits)?)
     }
 }
 

@@ -32,7 +32,7 @@ use poot_llm::driver::{
     PoolShape, PreparedSetLimits, ServingShapes, Warm, program_retention,
 };
 use poot_models::model::ModelOutput;
-use poot_target::Backend as TargetBackend;
+use poot_target::{Backend as TargetBackend, TargetId};
 
 use crate::config::PlacementSpec;
 
@@ -171,7 +171,7 @@ impl BudgetReport {
 /// The plan the server runs: computed once, read by the gauges and `/health`.
 #[derive(Debug)]
 pub(crate) struct EnginePlan {
-    pub(crate) backend: TargetBackend,
+    pub(crate) backend: TargetId,
     /// The devices the model runs on, in rank order.
     pub(crate) devices: Vec<DeviceId>,
     /// How the model is placed over them.
@@ -205,12 +205,12 @@ pub(crate) fn device_budget(observation: &Observation) -> Budget {
     Budget::observed(observation, SUPPORT_RESERVE_BYTES)
 }
 
-fn backend_label(backend: TargetBackend) -> String {
-    match backend {
-        TargetBackend::Nvptx => "nvptx".to_string(),
-        TargetBackend::SpirvVulkan => "spirv-vulkan".to_string(),
-        TargetBackend::AmdGcn(arch) => format!("amdgcn-{}", arch.mcpu()),
-        TargetBackend::Aie(target) => target.canonical(),
+fn backend_label(target: TargetId) -> String {
+    match target {
+        TargetId::Gpu(TargetBackend::Nvptx) => "nvptx".to_string(),
+        TargetId::Gpu(TargetBackend::SpirvVulkan) => "spirv-vulkan".to_string(),
+        TargetId::Gpu(TargetBackend::AmdGcn(arch)) => format!("amdgcn-{}", arch.mcpu()),
+        TargetId::Aie(target) => target.canonical(),
     }
 }
 
@@ -430,8 +430,9 @@ fn driver_options(
             max_retained_bytes: NonZeroU64::new(MAX_RETAINED_BYTES).expect("nonzero"),
         },
         charge: program_retention,
+        // The window the policy reads the hidden-state carry over; none for a policy that reads none.
+        hidden_window: draft.carry_window(),
         draft,
-        hidden_window: None,
     }
 }
 
@@ -550,7 +551,7 @@ fn place(
                 ))?;
                 specs.push(DeviceSpec {
                     id,
-                    backend: target.backend,
+                    target: target.id(),
                     usable_bytes,
                 });
             }
@@ -598,7 +599,7 @@ impl EnginePlan {
         let (placement, launch) = place(opened, handle, &discovered)?;
         let targets = launch.executor().target_set();
         let devices: Vec<DeviceId> = targets.devices().iter().map(|&(id, _)| id).collect();
-        let backend = targets.devices()[0].1.backend;
+        let backend = targets.devices()[0].1.id();
         let Fitted {
             candidate,
             driver,

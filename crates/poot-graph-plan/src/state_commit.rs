@@ -7,16 +7,14 @@
 
 use std::collections::HashMap;
 
-#[cfg(test)]
-use poot_graph_ir::ValidationOutputs;
-use poot_graph_ir::{Graph, OpKind, Operand, ValidationChannel, ValueId, ValueTable};
+use poot_graph_ir::{Graph, OpKind, Operand, ValueId, ValueTable};
 
 #[cfg(test)]
 use poot_target::{Backend, DeviceCaps};
 
 use crate::{Plan, PlanError, value_ids};
 #[cfg(test)]
-use crate::{ValidationPacketPlan, compute_views, plan_eqn_views, plan_validation_packet};
+use crate::{ValidationPacketPlan, compute_views, plan_eqn_views};
 #[cfg(test)]
 use poot_test_util::device_caps::default_caps_for;
 
@@ -61,19 +59,19 @@ fn update_base(eqn: &poot_graph_ir::Eqn) -> Option<ValueId> {
 /// and ScatterUpdate have an overlapping base/output kernel contract.
 ///
 /// Generic over the validation channel (Card 375c) so a captured backend can plan a
-/// `Graph<ValidationOutputs>` like an ordinary `Graph`. A donation admitted here is not necessarily safe to
+/// `Graph` like an ordinary `Graph`. A donation admitted here is not necessarily safe to
 /// roll back; see `journal_donated_updates` for the statically-recoverable-footprint requirement a
 /// native transaction adds.
-pub(crate) fn state_commit_from_plans<V: ValidationChannel>(
-    g: &Graph<V>,
+pub(crate) fn state_commit_from_plans(
+    g: &Graph,
     plans: &[Plan],
 ) -> Result<StateCommitPlan, PlanError> {
     check_state_shapes(g)?;
 
-    let mut roots: ValueTable<ValueId> = g.values.ids().collect();
+    let mut roots: ValueTable<ValueId> = g.values().ids().collect();
     let mut producers: HashMap<ValueId, usize> = HashMap::new();
 
-    for (eqn_idx, (eqn, plan)) in g.eqns.iter().zip(plans).enumerate() {
+    for (eqn_idx, (eqn, plan)) in g.eqns().iter().zip(plans).enumerate() {
         match plan {
             Plan::Alias(source) => roots[eqn.out] = roots[*source],
             Plan::View { src, .. } => roots[eqn.out] = roots[*src],
@@ -87,8 +85,8 @@ pub(crate) fn state_commit_from_plans<V: ValidationChannel>(
     Ok(commit_from_roots(g, &roots, &producers))
 }
 
-fn check_state_shapes<V: ValidationChannel>(g: &Graph<V>) -> Result<(), PlanError> {
-    for &(state_input, state_output) in &g.state {
+fn check_state_shapes(g: &Graph) -> Result<(), PlanError> {
+    for (state_input, state_output) in g.state() {
         let input = g.aval(state_input);
         let output = g.aval(state_output);
         if input.shape != output.shape || input.dtype != output.dtype {
@@ -103,32 +101,31 @@ fn check_state_shapes<V: ValidationChannel>(g: &Graph<V>) -> Result<(), PlanErro
 
 /// [`state_commit_from_plans`]'s tail: donation and explicit-commit decisions from each state edge's
 /// alias root and producer.
-fn commit_from_roots<V: ValidationChannel>(
-    g: &Graph<V>,
+fn commit_from_roots(
+    g: &Graph,
     roots: &ValueTable<ValueId>,
     producers: &HashMap<ValueId, usize>,
 ) -> StateCommitPlan {
     let state_roots: Vec<ValueId> = g
-        .state
-        .iter()
-        .map(|&(_, state_output)| roots[state_output])
+        .state()
+        .map(|(_, state_output)| roots[state_output])
         .collect();
     let mut root_counts: HashMap<ValueId, usize> = HashMap::new();
     for &root in &state_roots {
         *root_counts.entry(root).or_default() += 1;
     }
 
-    let output_root = roots[g.output];
+    let output_root = roots[g.result()];
     let mut result = StateCommitPlan::default();
-    for (edge_idx, (&(state_input, state_output), &state_root)) in
-        g.state.iter().zip(&state_roots).enumerate()
+    for (edge_idx, ((state_input, state_output), &state_root)) in
+        g.state().zip(&state_roots).enumerate()
     {
         if state_root == state_input {
             continue;
         }
 
         let can_donate = producers.get(&state_root).is_some_and(|&producer_idx| {
-            let producer = &g.eqns[producer_idx];
+            let producer = &g.eqns()[producer_idx];
             let paired_base = update_base(producer).is_some_and(|base| roots[base] == state_input);
             let independent_update_inputs = value_ids(producer)
                 .into_iter()
@@ -140,7 +137,7 @@ fn commit_from_roots<V: ValidationChannel>(
                 .enumerate()
                 .all(|(other_idx, &root)| other_idx == edge_idx || root != state_input);
             let input_is_not_primary_output = output_root != state_input;
-            let input_dead_after_update = g.eqns[producer_idx + 1..].iter().all(|eqn| {
+            let input_dead_after_update = g.eqns()[producer_idx + 1..].iter().all(|eqn| {
                 value_ids(eqn)
                     .into_iter()
                     .all(|value| roots[value] != state_input)
@@ -212,8 +209,8 @@ impl DonationFootprint {
 /// exists; snapshotting the entire state would defeat the donation, so it is rejected with
 /// [`PlanError::UnrecoverableDonation`].
 #[cfg(test)]
-fn journal_donated_updates<V: ValidationChannel>(
-    g: &Graph<V>,
+fn journal_donated_updates(
+    g: &Graph,
     commit: &StateCommitPlan,
 ) -> Result<Vec<DonationFootprint>, PlanError> {
     let mut donations = commit
@@ -221,7 +218,7 @@ fn journal_donated_updates<V: ValidationChannel>(
         .iter()
         .map(|(&state_root, &state_input)| {
             let producer = g
-                .eqns
+                .eqns()
                 .iter()
                 .find(|eqn| eqn.out == state_root)
                 .expect("state planner only donates materializing equation outputs");
@@ -281,14 +278,14 @@ struct NativeStateTransactionPlan {
 /// (test-only; `compile` itself never does this twice) and routes the result through the real
 /// production function instead of restating `commit_from_roots`'s logic a second time.
 #[cfg(test)]
-fn commit_for_test<V: ValidationChannel>(
-    g: &Graph<V>,
+fn commit_for_test(
+    g: &Graph,
     backend: Backend,
     caps: &DeviceCaps,
 ) -> Result<StateCommitPlan, PlanError> {
     let views = compute_views(g, backend);
     let plans: Vec<Plan> = g
-        .eqns
+        .eqns()
         .iter()
         .map(|eqn| {
             plan_eqn_views(
@@ -310,12 +307,12 @@ fn commit_for_test<V: ValidationChannel>(
 /// without re-deriving their analyses; it adds no compute or packet semantics of its own.
 #[cfg(test)]
 fn plan_native_state_transaction(
-    g: &Graph<ValidationOutputs>,
+    g: &Graph,
     backend: Backend,
 ) -> Result<NativeStateTransactionPlan, PlanError> {
     let commit = commit_for_test(g, backend, &default_caps_for(backend))?;
     let donations = journal_donated_updates(g, &commit)?;
-    let packet = plan_validation_packet(g)?;
+    let packet = crate::device_validation::validation_packet_plan(g);
     Ok(NativeStateTransactionPlan {
         commit,
         packet,
@@ -338,7 +335,9 @@ mod tests {
         let a = builder.state_input("a", TensorType::f32(vec![1]), StateRole::Recurrent);
         let b = builder.state_input("b", TensorType::f32(vec![1]), StateRole::Recurrent);
         let output = builder.binary(BinOp::Sub, a, b);
-        let graph = builder.finish_with_state(output, &[(a, b), (b, a)]);
+        let graph = builder
+            .finish(poot_graph_ir::Outputs::new(output).with_state(&[(a, b), (b, a)]))
+            .unwrap();
         let plan =
             commit_for_test(&graph, Backend::Nvptx, &default_caps_for(Backend::Nvptx)).unwrap();
         assert!(plan.inplace.is_empty());
@@ -360,7 +359,9 @@ mod tests {
         let builder = Builder::new();
         let a = builder.state_input("a", TensorType::f32(vec![1]), StateRole::Recurrent);
         let b = builder.state_input("b", TensorType::f32(vec![1]), StateRole::Recurrent);
-        let graph = builder.finish_with_state(a, &[(a, b), (b, a)]);
+        let graph = builder
+            .finish(poot_graph_ir::Outputs::new(a).with_state(&[(a, b), (b, a)]))
+            .unwrap();
         let plan =
             commit_for_test(&graph, Backend::Nvptx, &default_caps_for(Backend::Nvptx)).unwrap();
         assert!(
@@ -371,7 +372,9 @@ mod tests {
         let builder = Builder::new();
         let state = builder.state_input("state", TensorType::f32(vec![1, 1]), StateRole::Recurrent);
         let reshaped = builder.reshape(state, vec![1, 1]);
-        let graph = builder.finish_with_state(reshaped, &[(state, reshaped)]);
+        let graph = builder
+            .finish(poot_graph_ir::Outputs::new(reshaped).with_state(&[(state, reshaped)]))
+            .unwrap();
         let plan =
             commit_for_test(&graph, Backend::Nvptx, &default_caps_for(Backend::Nvptx)).unwrap();
         assert!(plan.inplace.is_empty());
@@ -381,7 +384,9 @@ mod tests {
         let a = builder.state_input("a", TensorType::f32(vec![1, 2]), StateRole::Recurrent);
         let b = builder.state_input("b", TensorType::f32(vec![2]), StateRole::Recurrent);
         let reshaped = builder.reshape(b, vec![1, 2]);
-        let graph = builder.finish_with_state(a, &[(a, reshaped), (b, b)]);
+        let graph = builder
+            .finish(poot_graph_ir::Outputs::new(a).with_state(&[(a, reshaped), (b, b)]))
+            .unwrap();
         let plan =
             commit_for_test(&graph, Backend::Nvptx, &default_caps_for(Backend::Nvptx)).unwrap();
         assert!(plan.inplace.is_empty());
@@ -398,7 +403,9 @@ mod tests {
         let b = builder.state_input("b", TensorType::f32(vec![1]), StateRole::Recurrent);
         let c = builder.state_input("c", TensorType::f32(vec![1]), StateRole::Recurrent);
         let output = builder.binary(BinOp::Add, a, b);
-        let graph = builder.finish_with_state(output, &[(a, b), (b, c), (c, a)]);
+        let graph = builder
+            .finish(poot_graph_ir::Outputs::new(output).with_state(&[(a, b), (b, c), (c, a)]))
+            .unwrap();
         let plan =
             commit_for_test(&graph, Backend::Nvptx, &default_caps_for(Backend::Nvptx)).unwrap();
         assert!(plan.inplace.is_empty());
@@ -409,8 +416,13 @@ mod tests {
         let b = builder.state_input("b", TensorType::f32(vec![1]), StateRole::Recurrent);
         let source = builder.state_input("source", TensorType::f32(vec![1]), StateRole::Recurrent);
         let output = builder.binary(BinOp::Add, a, b);
-        let graph =
-            builder.finish_with_state(output, &[(a, source), (b, source), (source, source)]);
+        let graph = builder
+            .finish(poot_graph_ir::Outputs::new(output).with_state(&[
+                (a, source),
+                (b, source),
+                (source, source),
+            ]))
+            .unwrap();
         let plan =
             commit_for_test(&graph, Backend::Nvptx, &default_caps_for(Backend::Nvptx)).unwrap();
         assert!(plan.inplace.is_empty());
@@ -427,7 +439,9 @@ mod tests {
         let state = builder.state_input("state", TensorType::f32(vec![2]), StateRole::Recurrent);
         let update = builder.slot(poot_graph_ir::Slot::Activation, TensorType::f32(vec![1]));
         let updated = builder.dynamic_update_slice(state, update, 1, 0);
-        let graph = builder.finish_with_state(updated, &[(state, updated)]);
+        let graph = builder
+            .finish(poot_graph_ir::Outputs::new(updated).with_state(&[(state, updated)]))
+            .unwrap();
         let plan =
             commit_for_test(&graph, Backend::Nvptx, &default_caps_for(Backend::Nvptx)).unwrap();
         assert_eq!(plan.inplace, HashMap::from([(updated.id(), state.id())]));
@@ -439,7 +453,9 @@ mod tests {
         let updated = builder.dynamic_update_slice(state, update, 1, 0);
         let old_state_sum = builder.binary_scalar(BinOp::Mul, state, Scalar::F32(2.0));
         let output = builder.binary(BinOp::Add, updated, old_state_sum);
-        let graph = builder.finish_with_state(output, &[(state, updated)]);
+        let graph = builder
+            .finish(poot_graph_ir::Outputs::new(output).with_state(&[(state, updated)]))
+            .unwrap();
         let plan =
             commit_for_test(&graph, Backend::Nvptx, &default_caps_for(Backend::Nvptx)).unwrap();
         assert!(
@@ -457,7 +473,9 @@ mod tests {
         let state = builder.state_input("state", TensorType::f32(vec![6, 3]), StateRole::Recurrent);
         let update = builder.slot(poot_graph_ir::Slot::Activation, TensorType::f32(vec![1, 3]));
         let updated = builder.dynamic_update_slice(state, update, 2, 0);
-        let graph = builder.finish_with_state(updated, &[(state, updated)]);
+        let graph = builder
+            .finish(poot_graph_ir::Outputs::new(updated).with_state(&[(state, updated)]))
+            .unwrap();
         let commit =
             commit_for_test(&graph, Backend::Nvptx, &default_caps_for(Backend::Nvptx)).unwrap();
         assert_eq!(commit.inplace, HashMap::from([(updated.id(), state.id())]));
@@ -513,16 +531,15 @@ mod tests {
             ),
             updated5,
         );
-        let graph = builder.finish_with_state(
-            output,
-            &[
+        let graph = builder
+            .finish(poot_graph_ir::Outputs::new(output).with_state(&[
                 (s1, updated1),
                 (s2, updated2),
                 (s3, updated3),
                 (s4, updated4),
                 (s5, updated5),
-            ],
-        );
+            ]))
+            .unwrap();
 
         let commit =
             commit_for_test(&graph, Backend::Nvptx, &default_caps_for(Backend::Nvptx)).unwrap();
@@ -597,7 +614,9 @@ mod tests {
             TensorType::new(vec![4], poot_tensor::DType::I32),
         );
         let updated = builder.scatter_update(state, src, inv);
-        let graph = builder.finish_with_state(updated, &[(state, updated)]);
+        let graph = builder
+            .finish(poot_graph_ir::Outputs::new(updated).with_state(&[(state, updated)]))
+            .unwrap();
 
         // Premise: the commit plan does donate this edge, as `update_base` grants ScatterUpdate.
         let commit =
@@ -623,7 +642,9 @@ mod tests {
         let builder = Builder::new();
         let a = builder.state_input("a", TensorType::f32(vec![1]), StateRole::Recurrent);
         let b = builder.state_input("b", TensorType::f32(vec![1]), StateRole::Recurrent);
-        let graph = builder.finish_with_state(a, &[(a, b), (b, a)]);
+        let graph = builder
+            .finish(poot_graph_ir::Outputs::new(a).with_state(&[(a, b), (b, a)]))
+            .unwrap();
         let commit =
             commit_for_test(&graph, Backend::Nvptx, &default_caps_for(Backend::Nvptx)).unwrap();
         assert!(commit.inplace.is_empty());
@@ -656,7 +677,10 @@ mod tests {
             transaction.commit,
             commit_for_test(&graph, Backend::Nvptx, &default_caps_for(Backend::Nvptx)).unwrap()
         );
-        assert_eq!(transaction.packet, plan_validation_packet(&graph).unwrap());
+        assert_eq!(
+            transaction.packet,
+            crate::device_validation::validation_packet_plan(&graph)
+        );
         assert_eq!(
             transaction.donations,
             [DonationFootprint {

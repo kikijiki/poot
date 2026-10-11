@@ -4,10 +4,10 @@
 use super::*;
 use poot_graph_ir::{AttentionAttrs, KeyLayout, KvBound, MaskOperand};
 use poot_kernelgen::{
-    AttentionSchedule, AttentionSpec, KeyBound, KeyLayout as KernelKeyLayout, MaskKind,
-    ScoreTransform,
+    AttentionCombineSpec, AttentionSchedule, AttentionSpec, KeyBound, KeyLayout as KernelKeyLayout,
+    MaskKind, ScoreTransform,
 };
-use poot_target::{Backend, DeviceCaps};
+use poot_target::{Backend, BufferStorage, DeviceCaps};
 
 /// Plan one attention equation and record the kernel it takes.
 ///
@@ -63,31 +63,89 @@ pub(super) fn plan(
             cap_bits: cap.to_bits(),
         },
     };
-    Planned::generated(
+    let streaming = AttentionSpec {
+        batch,
+        hq,
+        n_rep: *n_rep,
+        lq,
+        lk,
+        dk,
+        dv,
+        key: match key {
+            KeyLayout::Single => KernelKeyLayout::Single,
+            KeyLayout::Split { shared_dim } => KernelKeyLayout::Split {
+                shared_dim: *shared_dim,
+            },
+        },
+        score,
+        mask: mask_kind,
+        bound: match bound {
+            KvBound::Capacity => KeyBound::Static,
+            KvBound::Live => KeyBound::Live,
+        },
+        schedule: AttentionSchedule::Streaming { lanes },
+    };
+    // This is the GPU planner: an AIE target never reaches it (`Target::Aie` plans through the AIE schedule).
+    let splits = attention_splits(&streaming, caps);
+    match splits {
+        None => Planned::generated(site, KernelRequest::Attention(streaming), backend, caps),
+        Some(splits) => split_kv(
+            site,
+            streaming,
+            SplitKv { lanes, splits },
+            ids.len(),
+            backend,
+            caps,
+        ),
+    }
+}
+
+/// The lanes and key chunks of a split-KV attention.
+struct SplitKv {
+    lanes: usize,
+    splits: usize,
+}
+
+/// The split-KV plan of a decode attention (POOT-1113): stage one writes the `splits` partial `(o, m, l)`
+/// states of every row into one scratch buffer, stage two combines them into the output. The scratch is the
+/// equation's own (`ScratchDecl`), colored by the buffer plan with the values, so it is budgeted and reused
+/// across layers with no allocator of its own.
+fn split_kv(
+    site: Site<'_>,
+    streaming: AttentionSpec,
+    split: SplitKv,
+    operands: usize,
+    backend: Backend,
+    caps: &DeviceCaps,
+) -> Result<Planned, PlanError> {
+    let partials = AttentionSpec {
+        schedule: AttentionSchedule::SplitKv {
+            lanes: split.lanes,
+            splits: split.splits,
+        },
+        ..streaming
+    };
+    let combine =
+        AttentionCombineSpec::of(&partials).expect("a split schedule has a combine stage");
+    let elems = partials
+        .partial_elems()
+        .expect("a split schedule has a partial state");
+    let scratch = ScratchId::new(0);
+    let stage_one =
+        Planned::generated_dispatch(site, KernelRequest::Attention(partials), backend, caps)?;
+    // Stage one reads the equation's operands in order, as the streaming kernel does, and writes the
+    // scratch; its default binding names the output, so it is rebound with the scratch as the sink.
+    let reads = (0..operands).map(Source::Operand).collect();
+    let partials = stage_one.bound(Binding::new(reads, Sink::Scratch(scratch)));
+    let combine = Planned::generated_dispatch(
         site,
-        KernelRequest::Attention(AttentionSpec {
-            batch,
-            hq,
-            n_rep: *n_rep,
-            lq,
-            lk,
-            dk,
-            dv,
-            key: match key {
-                KeyLayout::Single => KernelKeyLayout::Single,
-                KeyLayout::Split { shared_dim } => KernelKeyLayout::Split {
-                    shared_dim: *shared_dim,
-                },
-            },
-            score,
-            mask: mask_kind,
-            bound: match bound {
-                KvBound::Capacity => KeyBound::Static,
-                KvBound::Live => KeyBound::Live,
-            },
-            schedule: AttentionSchedule::Streaming { lanes },
-        }),
+        KernelRequest::AttentionCombine(combine),
         backend,
         caps,
+    )?
+    .bound(Binding::new(vec![Source::Scratch(scratch)], Sink::Out));
+    Planned::pipeline(
+        vec![partials, combine],
+        vec![ScratchDecl::new(BufferStorage::f32(), elems)],
     )
 }

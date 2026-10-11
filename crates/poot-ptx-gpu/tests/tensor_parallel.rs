@@ -17,8 +17,9 @@ use std::sync::Arc;
 use poot_executor::{Coordinator, Device, Engine, Executor, NoSync};
 use poot_executor_parity::dense::{Dense, Family};
 use poot_executor_parity::weight_map::{
-    CAPACITY, MappedModel, Step, TIER2, assert_close, decode_steps, trace,
+    MappedModel, Step, TIER2, assert_close, decode_steps, trace,
 };
+use poot_graph_ir::{IndexRange, Slot};
 use poot_graph_plan::{
     CompileLimits, CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition,
     ShardRule, StagedProgram, Submission, TargetSet, compile_staged,
@@ -28,6 +29,21 @@ use poot_ptx_gpu::PtxDevice;
 use poot_runtime_common::DeviceBackend;
 
 const TOKENS: [i32; 6] = [3, 11, 7, 29, 5, 17];
+
+/// The cache capacity every row traces with: at least the longest run any row drives (24 steps), so
+/// every position stays inside the `Pos` slot's declared range `[0, CAPACITY)`.
+const CAPACITY: usize = 32;
+
+/// Token-by-token decode of `ids` from position 0, refusing a run that would leave the traced
+/// capacity (a position past it is rejected at bind, and the row would test the rejection).
+fn decode(ids: &[i32]) -> Vec<Step> {
+    assert!(
+        ids.len() <= CAPACITY,
+        "{} steps exceed the traced capacity {CAPACITY}",
+        ids.len()
+    );
+    decode_steps(ids)
+}
 
 /// NVIDIA devices `0..count`, or a skip: `None` without device 0, and without a later one unless
 /// `require` names an environment variable that makes the absence a failure.
@@ -106,7 +122,7 @@ struct Group {
     coordinator: Coordinator<PtxDevice>,
     exe: poot_executor::ExecutableId,
     entry: poot_executor::EntryId,
-    program: StagedProgram<poot_graph_ir::ValidationOutputs>,
+    program: StagedProgram,
 }
 
 fn tensor_parallel(devices: Vec<PtxDevice>, mapped: &MappedModel) -> Group {
@@ -155,7 +171,7 @@ fn assert_tensor_parallel_matches_single(
     mapped: &MappedModel,
     label: &str,
 ) {
-    let steps = decode_steps(&TOKENS);
+    let steps = decode(&TOKENS);
     let want = single_device(mapped, &steps);
     assert!(
         want.windows(2).any(|pair| pair[0] != pair[1]),
@@ -235,7 +251,7 @@ fn qwen3_tensor_parallel_decode_matches_single_device_on_ptx() {
 fn sixteen_tensor_parallel_steps_upload_the_weight_shares_once_on_ptx() {
     let Some(devices) = open_two() else { return };
     let mapped = Dense::new(Family::Qwen2).dims(64, 96, 3).model();
-    let steps = decode_steps(&(0..16).map(|i| (i * 5 + 1) % 48).collect::<Vec<_>>());
+    let steps = decode(&(0..16).map(|i| (i * 5 + 1) % 48).collect::<Vec<_>>());
     let mut group = tensor_parallel(devices, &mapped);
     logits(&mut group.coordinator, group.exe, group.entry, &steps[..1]);
     let before = group.coordinator.counters();
@@ -260,5 +276,32 @@ fn sixteen_tensor_parallel_steps_upload_the_weight_shares_once_on_ptx() {
             a.device
         );
         assert!(a.launches > b.launches);
+    }
+}
+
+/// Model-free twin of the long-run rows on a device-less box: the fixture traced over
+/// [`CAPACITY`] declares its `Pos` slot `[0, CAPACITY)`, and every position the 16-step
+/// run drives is inside it, so the device rows exercise the programs, not the bind rejection.
+///
+/// Mutation: `CAPACITY = 8` (the old shared capacity); `decode` refuses the run with "N steps exceed
+/// the traced capacity 8" (with that guard removed, the range check names position 8).
+#[test]
+fn the_long_run_stays_inside_the_traced_position_range() {
+    let mapped = Dense::new(Family::Qwen2).dims(64, 96, 3).model();
+    let g = trace(&*mapped.model, &mapped.map, Phase::Decode, 1, CAPACITY);
+    let pos = g
+        .slots()
+        .iter()
+        .find(|(_, slot)| *slot == Slot::Pos)
+        .map(|(id, _)| g.meta(*id).range())
+        .expect("a decode trace has a Pos slot")
+        .expect("the production tracer declares the Pos range");
+    assert_eq!(pos, IndexRange::below(CAPACITY).unwrap());
+    for step in &decode(&(0..16).map(|i| (i * 5 + 1) % 48).collect::<Vec<_>>()) {
+        let last = step.start + step.ids.len() - 1;
+        assert!(
+            pos.contains(last as i32),
+            "position {last} is outside the declared Pos range {pos:?}"
+        );
     }
 }

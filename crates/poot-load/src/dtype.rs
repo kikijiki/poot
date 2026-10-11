@@ -1,8 +1,6 @@
 use super::*;
 use poot_tensor::DType;
 
-use poot_quant::scalar;
-
 pub(crate) fn miss(name: &str, field: &str) -> LoadError {
     LoadError::SafeTensors(format!("{name}: missing {field}"))
 }
@@ -32,44 +30,6 @@ pub(crate) fn parse_dtype(dtype: &str) -> Result<DType, LoadError> {
 /// expectations together.
 pub(crate) fn element_width_bytes(dtype: &str) -> Option<usize> {
     DType::parse(dtype).ok().map(DType::byte_size)
-}
-
-pub(crate) fn decode(dtype: &str, raw: &[u8]) -> Result<Vec<f32>, LoadError> {
-    match parse_dtype(dtype)? {
-        DType::F32 => Ok(raw
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| f32::from_bits(u32::from_le_bytes(*c)))
-            .collect()),
-        DType::BF16 => Ok(raw
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|c| scalar::bf16_to_f32(u16::from_le_bytes(*c)))
-            .collect()),
-        DType::F16 => Ok(raw
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|c| scalar::f16_to_f32(u16::from_le_bytes(*c)))
-            .collect()),
-        // FP8 E4M3 codes, unscaled: a quantized linear's codes and scale are packed together by
-        // `safetensors::pack_quantized_linears` and decoded by `poot-quant`, never here.
-        DType::E4M3FN => Ok(raw.iter().map(|&b| scalar::e4m3fn_to_f32(b)).collect()),
-        // The block FP8 E8M0 scale dtype (one byte per block), as a plain tensor.
-        DType::E8M0 => Ok(raw.iter().map(|&b| scalar::e8m0_to_f32(b)).collect()),
-        DType::Bool
-        | DType::I8
-        | DType::U8
-        | DType::I16
-        | DType::U16
-        | DType::I32
-        | DType::U32
-        | DType::I64
-        | DType::U64
-        | DType::F64 => Err(LoadError::UndecodableCheckpointDtype { name: dtype.into() }),
-    }
 }
 
 #[cfg(test)]
@@ -120,16 +80,5 @@ mod tests {
             Err(LoadError::UnknownCheckpointDtype { name }) if name == "COMPLEX64"
         ));
         assert_eq!(element_width_bytes("COMPLEX64"), None);
-    }
-
-    /// `decode` supports exactly the five float dtypes poot-load decodes to an f32 oracle; every
-    /// other recognized dtype (kept raw or skipped by `SafeTensors::load_ranges_opts`) is a typed
-    /// error rather than silently decoding garbage.
-    #[test]
-    fn decode_rejects_a_recognized_but_non_decodable_dtype() {
-        assert!(matches!(
-            decode("I32", &[0u8; 4]),
-            Err(LoadError::UndecodableCheckpointDtype { name }) if name == "I32"
-        ));
     }
 }

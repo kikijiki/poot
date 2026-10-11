@@ -10,7 +10,7 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use poot_graph_ir::{Graph, NoValidations, Storage, ValidationChannel, ValidationOutputs};
+use poot_graph_ir::{Graph, Storage};
 use poot_models::model::{KvLayout, LogitRows, StepShape};
 use poot_models::registry::{RawConfig, Registry};
 use poot_quant::StoredBytes;
@@ -373,10 +373,7 @@ fn dense(dtype: DType, shape: Vec<usize>, values: &[f32]) -> WeightEntry {
 /// `m`'s checkpoint, and its id viewing that entry. Load the store with
 /// the map (`Executor::load_weights`). A const the model's map does not name is a
 /// panic, not a silent zero.
-pub fn const_named_weights<V: ValidationChannel>(
-    m: &MappedModel,
-    g: &Graph<V>,
-) -> (WeightStore, WeightMap) {
+pub fn const_named_weights(m: &MappedModel, g: &Graph) -> (WeightStore, WeightMap) {
     let ids: std::collections::HashMap<String, _> = m
         .map
         .iter()
@@ -384,7 +381,7 @@ pub fn const_named_weights<V: ValidationChannel>(
         .collect();
     let mut store = WeightStore::builder();
     let mut named = Vec::new();
-    for &input in &g.inputs {
+    for &input in g.inputs() {
         let meta = g.meta(input);
         if meta.storage != Storage::Const {
             continue;
@@ -406,37 +403,6 @@ pub fn const_named_weights<V: ValidationChannel>(
     }
     let map = map.build();
     (store, map)
-}
-
-/// `g` as an ordinary [`Graph`], for the fixtures and passes that take one. A dense family declares
-/// no validation output, so nothing is dropped; a graph that declared one is a panic.
-pub fn plain(g: Graph<ValidationOutputs>) -> Graph {
-    assert!(
-        g.validation_outputs().is_empty(),
-        "a dense family declares no validation output"
-    );
-    let Graph {
-        values,
-        inputs,
-        consts,
-        slots,
-        eqns,
-        output,
-        state,
-        exports,
-        validations: _,
-    } = g;
-    Graph {
-        values,
-        inputs,
-        consts,
-        slots,
-        eqns,
-        output,
-        validations: NoValidations,
-        exports,
-        state,
-    }
 }
 
 /// One contiguous-cache step of `rows` sequences of `tokens` new tokens over `capacity` positions.

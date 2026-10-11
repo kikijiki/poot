@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
 use poot_executor::{Device, Executor, HostView, NoSync, StepInputs};
-use poot_executor_parity::dense::{Dense, Family, plain, step};
+use poot_executor_parity::dense::{Dense, Family, step};
 use poot_gpu::device::WgpuDevice;
 use poot_graph_ir::op::{FusedOp, FusedOperand, OpKind, UnOp};
 use poot_graph_ir::{Graph, Slot, SlotKey, Storage, ValueId};
@@ -35,8 +35,8 @@ use poot_test_util::{assert_close_rel, max_abs_error};
 /// Compile `g` for `target` with `Submission::Replay` (Card 546b: the contract admits no other
 /// submission; fusion is submission-independent, so the structural assertions below see exactly the
 /// same graph the old `Submission::Eager` compile produced).
-fn staged(g: &Graph, target: Target) -> StagedProgram<poot_graph_ir::ValidationOutputs> {
-    let g = g.clone().with_validations(Vec::new());
+fn staged(g: &Graph, target: Target) -> StagedProgram {
+    let g = g.clone();
     compile_staged(
         &g,
         &TargetSet::single(DeviceId(0), target),
@@ -106,8 +106,8 @@ fn bind(
     include_state: bool,
 ) -> HashMap<ValueId, Value> {
     let mut inputs: HashMap<ValueId, Value> = HashMap::new();
-    for &id in &g.inputs {
-        let m = &g.values[id];
+    for &id in g.inputs() {
+        let m = &g.values()[id];
         let t = match m.storage {
             Storage::Slot(Slot::Token) => HostTensor::i32(
                 m.aval.shape.clone(),
@@ -148,8 +148,8 @@ fn gpu_consts_and_slots(
 ) -> (WeightStore, Vec<SlotBind>) {
     let mut builder = WeightStore::builder();
     let mut slots = Vec::new();
-    for &id in &g.inputs {
-        let m = &g.values[id];
+    for &id in g.inputs() {
+        let m = &g.values()[id];
         match m.storage {
             Storage::Slot(Slot::Token) => {
                 let bytes: Vec<u8> = tokens
@@ -232,12 +232,11 @@ fn gemma2_softcap_flash_prefill_gpu_matches_cpu() {
     let tokens: Vec<u32> = (0..n)
         .map(|i| (i * 7 + 3) as u32 % cfg.vocab as u32)
         .collect();
-    let g = plain(
-        cfg.f32_model()
-            .model
-            .trace(Phase::Prefill, step(1, n, n, LogitRows::Last))
-            .unwrap(),
-    );
+    let g = cfg
+        .f32_model()
+        .model
+        .trace(Phase::Prefill, step(1, n, n, LogitRows::Last))
+        .unwrap();
 
     // Card 535b: `compile` (not the raw `optimize()`), like `prefill_runs_a_flash_fused_compiled_graph_and_matches_cpu`
     // (qwen2.rs) and `deepseek32_dsa_prefill_gpu_matches_cpu` - the same graph the contract steps below,
@@ -251,7 +250,7 @@ fn gemma2_softcap_flash_prefill_gpu_matches_cpu() {
     let opt = stage.graph();
     // Confirm the softcap fusion fires on this graph (as in the CPU-only test in poot-models).
     let flash_eqns: Vec<&poot_graph_ir::Eqn> = opt
-        .eqns
+        .eqns()
         .iter()
         .filter(|e| matches!(e.op, OpKind::Attention(_)))
         .collect();
@@ -312,7 +311,7 @@ fn gemma2_softcap_flash_prefill_gpu_matches_cpu() {
     exec.unload(exe).unwrap();
     let gpu_logits = f32_bytes(&gpu_bytes);
 
-    assert_eq!(g.aval(g.output).shape, cpu_logits.shape());
+    assert_eq!(g.aval(g.result()).shape, cpu_logits.shape());
     assert_eq!(gpu_logits.len(), cpu_logits.as_f32().unwrap().len());
     assert_eq!(cpu_logits.shape(), vec![1, 1, cfg.vocab]);
     let mut max_abs = 0.0f32;
@@ -347,7 +346,7 @@ fn gemma2_softcap_flash_prefill_gpu_matches_cpu() {
 /// tensors for `eval_with_state`.
 fn bind_decode(g: &poot_graph_ir::Graph, pos: usize, token: u32) -> HashMap<ValueId, Value> {
     let mut inputs: HashMap<ValueId, Value> = HashMap::new();
-    for (i, &id) in g.inputs.iter().enumerate() {
+    for (i, &id) in g.inputs().iter().enumerate() {
         let m = g.meta(id);
         match m.storage {
             Storage::State => continue,
@@ -388,7 +387,7 @@ fn gpu_consts_and_slots_decode(
 ) -> (WeightStore, Vec<SlotBind>) {
     let mut builder = WeightStore::builder();
     let mut slots = Vec::new();
-    for (i, &id) in g.inputs.iter().enumerate() {
+    for (i, &id) in g.inputs().iter().enumerate() {
         let m = g.meta(id);
         match m.storage {
             Storage::State => continue,
@@ -500,19 +499,17 @@ fn gemma2_geglu_fused_decode_matches_unfused_and_cpu_on_gpu() {
         .with("query_pre_attn_scalar", serde_json::Value::Null);
     let pos = 3usize;
     let cap = 8usize;
-    let g = plain(
-        cfg.f32_model()
-            .model
-            .trace(Phase::Decode, step(1, 1, cap, LogitRows::Last))
-            .unwrap(),
-    );
+    let g = cfg
+        .f32_model()
+        .model
+        .trace(Phase::Decode, step(1, 1, cap, LogitRows::Last))
+        .unwrap();
     let inputs = bind_decode(&g, pos, 5);
 
-    let base = cse(&g); // the resident executor's normal pre-pass; fusion groups on top of it.
-    let fg = fuse(&base);
-    fg.validate().expect("fused graph valid");
+    let base = cse(&g).unwrap(); // the resident executor's normal pre-pass; fusion groups on top of it.
+    let fg = fuse(&base).unwrap();
     let geglu_region_count = fg
-        .eqns
+        .eqns()
         .iter()
         .filter(|e| match &e.op {
             OpKind::Fused(region) => carries_gelu(region),
@@ -523,26 +520,25 @@ fn gemma2_geglu_fused_decode_matches_unfused_and_cpu_on_gpu() {
         geglu_region_count,
         cfg.layers,
         "expected one Fused region carrying the GeGLU Gelu step per layer: {} eqns {:?}",
-        fg.eqns.len(),
-        fg.eqns.iter().map(|e| e.op.name()).collect::<Vec<_>>()
+        fg.eqns().len(),
+        fg.eqns().iter().map(|e| e.op.name()).collect::<Vec<_>>()
     );
     assert!(
-        fg.eqns.len() < base.eqns.len(),
+        fg.eqns().len() < base.eqns().len(),
         "fewer dispatches after fusion: {} -> {}",
-        base.eqns.len(),
-        fg.eqns.len()
+        base.eqns().len(),
+        fg.eqns().len()
     );
 
     // Real carried KV cache, zero-seeded (this is the graph's first decode step in isolation - `pos`
     // names where in the RoPE table/valid-prefix slice the step reads, not how many prior steps ran).
     let zero_state: Vec<HostTensor> = g
-        .state
-        .iter()
-        .map(|&(si, _)| HostTensor::zeros(g.aval(si).shape.clone()))
+        .state()
+        .map(|(si, _)| HostTensor::zeros(g.aval(si).shape.clone()))
         .collect();
 
     let mut cpu_inputs = inputs.clone();
-    for (i, &(si, _)) in g.state.iter().enumerate() {
+    for (i, (si, _)) in g.state().enumerate() {
         cpu_inputs.insert(si, zero_state[i].clone().into());
     }
     let cpu_eval = eval(&g, &cpu_inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap();

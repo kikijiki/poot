@@ -46,7 +46,7 @@ pub fn bf16_const_cast_fixtures() -> Vec<Fixture> {
             let b = Builder::new();
             let x = b.constant("x", TensorType::new(vec![words.len()], DType::BF16));
             let widened = b.cast(x, DType::F32);
-            let graph = b.finish(widened);
+            let graph = b.finish(widened).unwrap();
             let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
             let mut store = WeightStore::builder();
             store

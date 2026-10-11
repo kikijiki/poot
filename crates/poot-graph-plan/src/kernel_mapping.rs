@@ -205,9 +205,9 @@ pub(crate) fn map_unary(site: Site<'_>, op: GUnOp) -> Result<UnaryOp, PlanError>
     })
 }
 
-/// The one finalizer: shape the launch of `planned`, then check every kernel it dispatches against
+/// The one GPU finalizer: shape the launch of `planned`, then check every kernel it dispatches against
 /// `caps`. Takes the plan by `&mut` so the launch-owning families run it at their own tail while the
-/// dispatcher runs it after its match.
+/// dispatcher runs it after its match. An AIE target finalizes through [`finalize_aie`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn finalize(
     planned: &mut Planned,
@@ -220,14 +220,36 @@ pub(crate) fn finalize(
     caps: &DeviceCaps,
 ) -> Result<(), PlanError> {
     check_operand_bindings(planned, eqn)?;
-    // An AIE core runs one sequential loop. Its schedule was chosen at generation (the request is the
-    // ordinary one); the GPU launch shaping and the device resource finalizer do not apply, and what does
-    // is checked here, by type: the plan must be a generated, grid-free, workgroup-memory-free body.
-    if let Backend::Aie(_) = backend {
-        return validate_aie_schedule(planned, g, eqn, backend);
-    }
     shape_launch(planned, g, eqn, out_shape, out_numel, backend, odt, caps)?;
     validate_planned_resources(planned, g, eqn, out_numel, backend, caps)
+}
+
+/// The AIE finalizer. An AIE core runs one sequential loop. Its schedule was chosen at generation (the
+/// request is the ordinary one); the GPU launch shaping and the device resource finalizer do not apply, and
+/// what does is checked here, by type: the plan must be a generated, grid-free, workgroup-memory-free body,
+/// and the shape ABI it links against must fit the target's measured limits (an unmeasured limit refuses).
+/// The limits only the linked artifact can answer are checked by [`validate_linked_artifact`] before load.
+pub(crate) fn finalize_aie(
+    planned: &Planned,
+    g: GraphTables<'_>,
+    eqn: &Eqn,
+    target: AieTargetId,
+    caps: &AieCaps,
+) -> Result<(), PlanError> {
+    check_operand_bindings(planned, eqn)?;
+    let refuse = |missing| refusal_at(g, eqn, target, missing);
+    match planned.choice {
+        KernelChoice::NoDispatch(_) => Ok(()),
+        KernelChoice::Sequential { .. } => {
+            let abi = aie_shape_abi(&planned.choice)
+                .map_err(|refusal| refuse(Capability::AieAbi(refusal)))?;
+            check_shape_abi_limits(&abi, caps)
+                .map_err(|refusal| refuse(Capability::AieLimit(refusal)))
+        }
+        KernelChoice::Generated(_) | KernelChoice::Imported { .. } => {
+            Err(refuse(Capability::AieSchedule))
+        }
+    }
 }
 
 /// Every operand a dispatch binds is one the equation has. [`DispatchPlan::new`] cannot know the
@@ -251,27 +273,9 @@ fn check_operand_bindings(planned: &Planned, eqn: &Eqn) -> Result<(), PlanError>
     Ok(())
 }
 
-/// Check that `planned` is an AIE sequential schedule: every dispatch comes from a [`KernelChoice::Sequential`]
-/// (the one body-and-bindings generation the target's schedule produces). A shipped GPU template, or a
-/// request generated as a thread grid, has no AIE form. Plans that launch nothing (an alias, a view) pass.
-fn validate_aie_schedule(
-    planned: &Planned,
-    g: GraphTables<'_>,
-    eqn: &Eqn,
-    backend: Backend,
-) -> Result<(), PlanError> {
-    match planned.choice {
-        KernelChoice::Sequential { .. } | KernelChoice::NoDispatch(_) => Ok(()),
-        KernelChoice::Generated(_) | KernelChoice::Imported { .. } => {
-            Err(refusal_at(g, eqn, backend, Capability::AieSchedule))
-        }
-    }
-}
-
 /// Why an AIE limit check refused: the limit that is unknown, or the need and the offer.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[cfg_attr(not(test), expect(dead_code, reason = "held for POOT-641"))]
-pub(crate) enum AieLimitRefusal {
+pub enum AieLimitRefusal {
     /// The artifact was linked for another target than the limits describe.
     #[error("the artifact was linked for {artifact:?}, the limits describe {caps:?}")]
     Target {
@@ -281,7 +285,7 @@ pub(crate) enum AieLimitRefusal {
     /// The target's limit is not measured, so the artifact's need of it cannot be admitted.
     #[error("the target's {limit} is not measured")]
     Unknown { limit: &'static str },
-    #[error("the artifact needs {needed} {resource}; the target offers {available}")]
+    #[error("{resource}: needed {needed}, the target offers {available}")]
     Exceeded {
         resource: &'static str,
         needed: u64,
@@ -305,13 +309,34 @@ fn within<T: Into<u64> + Copy>(
     }
 }
 
-/// The finalization only a linked artifact can answer, run before it is loaded: its tile-local
-/// reservation, host bindings and instruction stream against `caps`. An unmeasured limit refuses.
-///
-/// The ordinary planner entry (`plan_eqn`) cannot run this at plan time: its target caps are the GPU-shaped
-/// `DeviceCaps`, which has no AIE limits (the tagged carrier of spec 1002 is the follow-up).
-#[cfg_attr(not(test), expect(dead_code, reason = "held for POOT-641"))]
-pub(crate) fn validate_linked_artifact(
+/// The part of finalization a plan answers on its own: the host bindings its shape ABI needs against the
+/// target's. An unmeasured limit refuses.
+fn check_shape_abi_limits(abi: &AieShapeAbi, caps: &AieCaps) -> Result<(), AieLimitRefusal> {
+    within(
+        caps.host_bindings,
+        "host bindings",
+        abi.bindings().len() as u64,
+    )
+}
+
+/// The tile-local bytes a link recipe reserves, against the target's limit, before anything is linked: the
+/// recipe's FIFO buffers are fixed by the shape ABI, so an over-limit plan is refused here as a typed value
+/// instead of as a toolchain failure. An unmeasured limit refuses.
+pub fn validate_recipe_tile_local(
+    reserved_bytes: u64,
+    caps: &AieCaps,
+) -> Result<(), AieLimitRefusal> {
+    within(
+        caps.tile_local_bytes,
+        "link recipe tile-local bytes",
+        reserved_bytes,
+    )
+}
+
+/// The finalization only a linked artifact can answer, run by the loader before it wraps the artifact: the
+/// artifact was linked for `caps`' target, and its tile-local reservation, host bindings and instruction
+/// stream fit the target's limits. An unmeasured limit refuses.
+pub fn validate_linked_artifact(
     artifact: &AieLinkedArtifact,
     caps: &AieCaps,
 ) -> Result<(), AieLimitRefusal> {
@@ -326,11 +351,7 @@ pub(crate) fn validate_linked_artifact(
         "tile-local bytes",
         artifact.tile_local_bytes(),
     )?;
-    within(
-        caps.host_bindings,
-        "host bindings",
-        artifact.abi().bindings().len() as u64,
-    )?;
+    check_shape_abi_limits(artifact.abi(), caps)?;
     within(
         caps.instruction_bytes,
         "instruction bytes",
@@ -341,8 +362,7 @@ pub(crate) fn validate_linked_artifact(
 /// The shape ABI of a planned sequential schedule: one binding per body parameter, in binding order,
 /// each with the dimensions and access range the generator proved when it produced the body. The ABI is
 /// read from the plan's own choice, so the body and the ABI come from the one generation the planner ran.
-#[cfg_attr(not(test), expect(dead_code, reason = "held for POOT-641"))]
-pub(crate) fn aie_shape_abi(choice: &KernelChoice) -> Result<AieShapeAbi, AieAbiRefusal> {
+pub fn aie_shape_abi(choice: &KernelChoice) -> Result<AieShapeAbi, AieAbiRefusal> {
     let KernelChoice::Sequential { bindings, .. } = choice else {
         return Err(AieAbiRefusal::NotSequential);
     };
@@ -368,8 +388,7 @@ pub(crate) fn aie_shape_abi(choice: &KernelChoice) -> Result<AieShapeAbi, AieAbi
 
 /// Why a plan has no AIE shape ABI.
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
-#[cfg_attr(not(test), expect(dead_code, reason = "held for POOT-641"))]
-pub(crate) enum AieAbiRefusal {
+pub enum AieAbiRefusal {
     #[error("the plan's choice is not an AIE sequential schedule")]
     NotSequential,
     #[error(transparent)]
@@ -450,6 +469,23 @@ fn validate_planned_resources(
     caps: &DeviceCaps,
 ) -> Result<(), PlanError> {
     let refuse = |refusal| refusal_at(g, eqn, backend, Capability::KernelResources(refusal));
+    // The backstop of the planner's own fit check (split-KV attention falls back to streaming when its
+    // scratch does not fit): a plan that declares a scratch the device cannot allocate is refused here.
+    if let Plan::Dispatches(plan) = &planned.plan {
+        for decl in plan.scratch() {
+            if decl.bytes() > caps.max_buffer_bytes {
+                return Err(refusal_at(
+                    g,
+                    eqn,
+                    backend,
+                    Capability::ScratchBytes {
+                        needed: decl.bytes(),
+                        max_buffer_bytes: caps.max_buffer_bytes,
+                    },
+                ));
+            }
+        }
+    }
     let dispatches = planned.plan.dispatches();
     // A dispatch covers the part of the output its launch's thread count is of the plan's total.
     let total_threads: u128 = dispatches.iter().map(|d| launch_threads(d.launch())).sum();
@@ -629,10 +665,10 @@ mod tests {
             let x = b.constant("x", poot_graph_ir::TensorType::f32(vec![4]));
             let n = b.unary(UnOp::Neg, x);
             let y = b.unary(op, n);
-            let graph = b.finish(y);
-            let fused = fuse(&graph);
+            let graph = b.finish(y).unwrap();
+            let fused = fuse(&graph).unwrap();
             let eqn = fused
-                .eqns
+                .eqns()
                 .iter()
                 .find(|e| matches!(e.op, OpKind::Fused(_)))
                 .unwrap_or_else(|| panic!("{op:?} did not fuse into a region: {fused:?}"));
@@ -658,28 +694,27 @@ mod tests {
 
     use std::collections::HashMap;
     use std::num::NonZeroU64;
-    use std::os::unix::fs::PermissionsExt;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     use poot_codegen::{
-        AieCompileError, KernelCache, Target as CodegenTarget, Toolchain, aie_kernel_handle,
+        AieCompileError, AieLinkRecipe, KernelCache, Target as CodegenTarget, aie_kernel_handle,
         compile_aie,
     };
     use poot_graph_ir::op::RedOp;
     use poot_graph_ir::{Graph, TensorType};
     use poot_runtime_common::{AieBindError, AieBound, check_aie_bindings};
-    use poot_target::{AieCaps, AieTargetId, DeviceCaps, Queried};
+    use poot_target::{AieCaps, AieTargetId, Queried, TargetId};
     use poot_tensor::DType;
 
-    use crate::{Capability, PlanError};
+    use crate::{Capability, PlanError, Target};
 
     use super::{AieLimitRefusal, aie_shape_abi, validate_linked_artifact};
 
-    const AIE: Backend = Backend::Aie(AieTargetId::Xdna2);
+    const AIE: TargetId = TargetId::Aie(AieTargetId::Xdna2);
 
     fn aie_caps() -> AieCaps {
         // SYNTHETIC limits: roomy enough for a [2,3] kernel, not a device measurement.
-        AieCaps::synthetic(AieTargetId::Xdna2, 1 << 16, 8, 1 << 20)
+        AieCaps::synthetic(AieTargetId::Xdna2, 1 << 16, 8, 1 << 20, 1 << 30)
     }
 
     fn limits() -> poot_kernelgen::BodyLimits {
@@ -689,7 +724,7 @@ mod tests {
     fn graph_of(build: impl FnOnce(&Builder) -> poot_graph_ir::Traced) -> Graph {
         let b = Builder::new();
         let out = build(&b);
-        b.finish(out)
+        b.finish(out).unwrap()
     }
 
     fn add_graph(a_shape: Vec<usize>, b_shape: Vec<usize>, dtype: DType) -> Graph {
@@ -701,20 +736,20 @@ mod tests {
     }
 
     fn last_eqn(g: &Graph) -> &poot_graph_ir::Eqn {
-        g.eqns.last().expect("the graph has an equation")
+        g.eqns().last().expect("the graph has an equation")
     }
 
-    /// The ordinary planner entry for an AIE target. The `DeviceCaps` it takes are GPU limits the AIE
-    /// schedule never reads (the tagged carrier of spec 1002 is the follow-up), so a fixture value is passed.
+    /// The ordinary planner entry for an AIE target carrying `caps`.
+    fn plan_aie_with(g: &Graph, caps: AieCaps) -> Result<crate::Planned, PlanError> {
+        let target = Target::Aie {
+            target: AieTargetId::Xdna2,
+            caps,
+        };
+        crate::plan_eqn_choice(g, last_eqn(g), &target, &HashMap::new(), &limits())
+    }
+
     fn plan_aie(g: &Graph) -> Result<crate::Planned, PlanError> {
-        crate::plan_eqn_choice(
-            g,
-            last_eqn(g),
-            AIE,
-            &HashMap::new(),
-            &DeviceCaps::wgpu_rdna3_igpu(),
-            &limits(),
-        )
+        plan_aie_with(g, aie_caps())
     }
 
     fn aie_refusal(g: &Graph) -> Capability {
@@ -735,43 +770,13 @@ mod tests {
         dir
     }
 
-    fn script(dir: &Path, name: &str, body: &str) -> String {
-        let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path.to_string_lossy().into_owned()
-    }
-
-    /// Scripted Peano and IRON drivers (the compiler's protocol handling, not machine code).
-    fn scripted_toolchain(dir: &Path, with_iron: bool) -> Toolchain {
-        let peano = script(
-            dir,
-            "peano",
-            r#"case "$1" in --version) echo "fake-peano (aie2p)"; exit 0;; esac
-for last; do :; done
-printf '\177ELF' > "$last"; printf 'poot_seq_binary' >> "$last""#,
-        );
-        let iron = script(
-            dir,
-            "iron",
-            r#"case "$1" in --version) echo "fake-iron"; exit 0;; --platforms) echo npu2; exit 0;; esac
-while [ $# -gt 0 ]; do case "$1" in --xclbin) x="$2";; --insts) i="$2";; esac; shift; done
-printf 'xclbin2\0payload' > "$x"; printf 'IIII' > "$i""#,
-        );
-        Toolchain::from_env_with(move |name| match name {
-            "POOT_AIE_LLC" => Some(peano.clone()),
-            "POOT_AIE_IRON" => with_iron.then(|| iron.clone()),
-            _ => None,
-        })
-    }
-
     /// The planner positive: `plan_eqn` itself plans an F32 `[2,3]` add for an AIE target, as the ordinary
     /// elementwise request under the sequential schedule on the existing plan types (one dispatch, one
     /// invocation, a one-thread workgroup). The compiler links its body against the ABI derived from that
     /// request, the ordinary handle wraps it, and a fake loader sees three ordered arguments and core
     /// lengths `[6, 6, 6]`. A fake loader does not claim numerical execution or hardware.
-    /// Mutation: restore the `Backend::Aie` refusal in `finalize` or give the AIE arm of `build` a GPU
-    /// grid; the plan or the dispatch-shape assertion fails.
+    /// Mutation: refuse the elementwise family in `plan_aie_eqn` or give `build_sequential` a GPU grid; the
+    /// plan or the dispatch-shape assertion fails.
     #[test]
     fn plan_eqn_plans_an_f32_add_under_the_aie_sequential_schedule_and_it_links() {
         let g = add_graph(vec![2, 3], vec![2, 3], DType::F32);
@@ -789,12 +794,11 @@ printf 'xclbin2\0payload' > "$x"; printf 'IIII' > "$i""#,
         }
 
         let dir = scratch("positive");
-        let tc = scripted_toolchain(&dir, true);
+        let tc = poot_test_util::aie_fixtures::scripted_toolchain(&dir, true);
         let cache = KernelCache::at(dir.join("cache"), CodegenTarget::AieCore);
         let compiled = compile_aie(
             &dispatch.body,
-            &abi,
-            AieTargetId::Xdna2,
+            &AieLinkRecipe::sequential(&dispatch.body.name, AieTargetId::Xdna2, &abi).unwrap(),
             &tc,
             &cache,
             NonZeroU64::new(1 << 20).unwrap(),
@@ -861,15 +865,57 @@ printf 'xclbin2\0payload' > "$x"; printf 'IIII' > "$i""#,
         ));
     }
 
-    /// A shipped GPU template (an imported kernel) reaches finalization and is refused by type there.
-    /// Mutation: make `validate_aie_schedule` return `Ok(())`; the template is planned for an AIE core.
+    /// A lowering that reads GPU capabilities (a shipped GPU template, a contraction) is a typed
+    /// [`Capability::GpuOnly`] refusal for an AIE target, through the ordinary planner, on a deliberately
+    /// unsupported fixture: the AIE target has no `DeviceCaps` to read, and the refusal names the target.
+    /// Mutation: dispatch the family to its GPU planner for an AIE target (give `plan_aie_eqn` a `matmul`
+    /// arm that plans with a fixture `DeviceCaps`); the contraction is planned as a GPU kernel and the row
+    /// returns `Ok`.
     #[test]
-    fn an_imported_gpu_template_is_not_an_aie_schedule() {
-        let g = graph_of(|b| {
+    fn a_gpu_only_lowering_is_a_typed_refusal_for_an_aie_target() {
+        let template = graph_of(|b| {
             let seed = b.constant("seed", TensorType::new(vec![2], DType::I32));
             b.random_uniform(seed, 4)
         });
-        assert_eq!(aie_refusal(&g), Capability::AieSchedule);
+        assert_eq!(aie_refusal(&template), Capability::GpuOnly);
+        let contraction = graph_of(|b| {
+            let x = b.constant("x", TensorType::f32(vec![2, 3]));
+            let w = b.constant("w", TensorType::f32(vec![3, 4]));
+            b.matmul(x, w)
+        });
+        assert_eq!(aie_refusal(&contraction), Capability::GpuOnly);
+    }
+
+    /// The planner finalizes an AIE plan against the target's own limits: the shape ABI it derives from the
+    /// plan's choice needs three host bindings, an unmeasured limit refuses (never a guess), and a measured
+    /// one the ABI exceeds refuses with both numbers. Mutation: drop `check_shape_abi_limits` from
+    /// `finalize_aie`; both rows plan.
+    #[test]
+    fn the_planner_refuses_a_shape_abi_the_target_cannot_bind() {
+        let add = add_graph(vec![2, 3], vec![2, 3], DType::F32);
+        let refusal = |caps| match plan_aie_with(&add, caps) {
+            Err(PlanError::Refused(refusal)) => refusal.missing,
+            other => panic!("expected a typed refusal, got {:?}", other.map(|_| ())),
+        };
+        assert_eq!(
+            refusal(AieCaps::unmeasured(AieTargetId::Xdna2)),
+            Capability::AieLimit(AieLimitRefusal::Unknown {
+                limit: "host bindings"
+            })
+        );
+        let two = AieCaps {
+            host_bindings: Queried::Known(2),
+            ..aie_caps()
+        };
+        assert_eq!(
+            refusal(two),
+            Capability::AieLimit(AieLimitRefusal::Exceeded {
+                resource: "host bindings",
+                needed: 3,
+                available: 2
+            })
+        );
+        assert!(plan_aie(&add).is_ok(), "control: the roomy target plans it");
     }
 
     /// Finalization of the linked artifact reads the target's limits: an unmeasured limit refuses (never
@@ -884,9 +930,8 @@ printf 'xclbin2\0payload' > "$x"; printf 'IIII' > "$i""#,
         let dir = scratch("limits");
         let compiled = compile_aie(
             &body,
-            &abi,
-            AieTargetId::Xdna2,
-            &scripted_toolchain(&dir, true),
+            &AieLinkRecipe::sequential(&body.name, AieTargetId::Xdna2, &abi).unwrap(),
+            &poot_test_util::aie_fixtures::scripted_toolchain(&dir, true),
             &KernelCache::at(dir.join("cache"), CodegenTarget::AieCore),
             NonZeroU64::new(1 << 20).unwrap(),
         )
@@ -951,9 +996,8 @@ printf 'xclbin2\0payload' > "$x"; printf 'IIII' > "$i""#,
         let cache = KernelCache::at(dir.join("cache"), CodegenTarget::AieCore);
         let error = compile_aie(
             &body,
-            &abi,
-            AieTargetId::Xdna2,
-            &scripted_toolchain(&dir, false),
+            &AieLinkRecipe::sequential(&body.name, AieTargetId::Xdna2, &abi).unwrap(),
+            &poot_test_util::aie_fixtures::scripted_toolchain(&dir, false),
             &cache,
             NonZeroU64::new(1 << 20).unwrap(),
         )

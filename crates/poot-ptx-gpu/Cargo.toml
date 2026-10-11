@@ -27,6 +27,7 @@ poot-eval.workspace = true
 poot-executor-parity.workspace = true
 poot-quant.workspace = true
 poot-tensor.workspace = true
+# The performance-bank example loads a checkpoint through the loader.
 poot-load.workspace = true
 bytemuck.workspace = true
 serde_json.workspace = true

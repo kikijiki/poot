@@ -73,8 +73,31 @@ snapshots), a separate, unresolved cost from the naive-attention pass above.
 | 2048          | 43.1         | 23.2 ms          |
 | 8192          | 16.5         | 60.6 ms          |
 
-Per-token cost grows with context because attention over the KV cache is O(context) per token on this
-path (no flash-decode kernel wired here yet). This describes the measured binary.
+Per-token cost grows with context because attention over the KV cache is O(context) per token. This
+table was measured before the split-KV decode schedule existed: that binary walked the whole cache with
+one workgroup per head. The planner now splits the keys of a low-head decode across workgroups (see
+the attention architecture page), which the next section measures at the kernel level.
+
+## Low-head decode attention at the kernel level (Strix Halo iGPU)
+
+One decode attention, 2 query heads of width 128 over 1 key/value head, f32, step time (wall step plus
+readback) of the planner's schedule before and after the split-KV schedule, median of 27 samples per
+side, interleaved runs on the same device and driver:
+
+| Cache | Live keys | wgpu before | wgpu after | ROCm before | ROCm after |
+| ----- | --------- | ----------- | ---------- | ----------- | ---------- |
+| 4096 (full cache bound) | all | 527 us | 117 us | 233 us | 47 us |
+| 32768 | 32768 | 4194 us | 357 us | 1911 us | 162 us |
+| 32768 | 1024 | 200 us | 201 us | 92 us | 91 us |
+
+A low-head decode over a long cache is about 5x (4096 keys) to 12x (32768 keys) faster on both
+backends: two workgroups on a 40-compute-unit device become thirty-two (sixteen splits per head). At a short live length the
+cache's capacity does not matter (the live bound already limits the keys a step visits), so the split
+neither helps nor costs measurable time there. The wgpu 4096-key row has outlier repeats that widen
+the harness's uncertainty band, so its verdict is "unverified" under the harness rule even though
+every "after" sample is below every "before" sample; the other rows are verdict "improvement" or
+"within noise". Receipts and the comparator's verdicts are under
+`benchmarks/performance-bank/candidates`. The CUDA (PTX) rows are not measured yet.
 
 ## Cross-backend: one engine, three backends (Qwen2.5-0.5B, decode)
 

@@ -6,7 +6,7 @@
 //! cross-crate reference the other way would be a dependency cycle) and the pure functions that read
 //! a graph's ops to classify them, independent of which crate runs the pass that produced them.
 
-use crate::graph::{Graph, Operand, ValidationChannel, ValueId, ValueTable};
+use crate::graph::{Graph, Operand, ValueId, ValueTable};
 use crate::op::OpKind;
 
 mod numerics;

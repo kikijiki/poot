@@ -27,13 +27,12 @@ const K: usize = 200;
 const N: usize = 37;
 
 fn target(backend: Backend) -> Target {
-    Target {
+    Target::Gpu {
         backend,
         caps: match backend {
             Backend::SpirvVulkan => DeviceCaps::wgpu_rdna3_igpu(),
             Backend::Nvptx => DeviceCaps::ptx_default(),
             Backend::AmdGcn(_) => DeviceCaps::rocm_default(),
-            Backend::Aie(_) => unreachable!("an AIE target has no GPU DeviceCaps"),
         },
     }
 }
@@ -50,7 +49,7 @@ fn projection(m: usize) -> Graph {
     let x = b.constant("x", TensorType::f32(vec![m, K]));
     let w = b.constant("w", TensorType::f32(vec![N, K]));
     let out = b.matmul(x, b.transpose(w, vec![1, 0]));
-    b.finish(out)
+    b.finish(out).unwrap()
 }
 
 fn op_names(program: &Program) -> Vec<String> {
@@ -129,7 +128,7 @@ fn a_transposed_weight_with_a_second_consumer_keeps_the_transpose_and_the_matmul
     let column_sums = b.reduce(RedOp::Sum, wt, 0, false);
     let row_sums = b.reduce(RedOp::Sum, y, 0, false);
     let total = b.binary(BinOp::Add, row_sums, column_sums);
-    let g = b.finish(total);
+    let g = b.finish(total).unwrap();
     for backend in backends() {
         let program = program(&g, backend);
         let label = format!("{backend:?}: {:?}", op_names(&program));
@@ -161,7 +160,9 @@ fn a_transposed_weight_that_escapes_the_graph_keeps_the_transpose_and_the_matmul
     let kept = b.state_input("kept", TensorType::f32(vec![K, N]), StateRole::Recurrent);
     let wt = b.transpose(w, vec![1, 0]);
     let y = b.matmul(x, wt);
-    let g = b.finish_with_state(y, &[(kept, wt)]);
+    let g = b
+        .finish(poot_graph_ir::Outputs::new(y).with_state(&[(kept, wt)]))
+        .unwrap();
     for backend in backends() {
         let program = program(&g, backend);
         let label = format!("{backend:?}: {:?}", op_names(&program));
@@ -191,7 +192,7 @@ fn f16_projection(m: usize) -> Graph {
     let x = b.constant("x", TensorType::f32(vec![m, K]));
     let w = b.constant("w", TensorType::new(vec![N, K], DType::F16));
     let out = b.matmul(x, b.transpose(w, vec![1, 0]));
-    b.finish(out)
+    b.finish(out).unwrap()
 }
 
 fn is_dense_f16(op: &OpKind) -> bool {
@@ -279,7 +280,7 @@ fn an_f16_weight_with_a_second_reader_is_not_folded() {
     let rows = b.cast(b.gather(w, 0, ids), DType::F32);
     let y = b.matmul(x, b.transpose(w, vec![1, 0]));
     let total = b.binary(BinOp::Add, total_sum(&b, y), total_sum(&b, rows));
-    let g = b.finish(total);
+    let g = b.finish(total).unwrap();
     let options = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
     for backend in backends() {
         match compile(&g, &target(backend), &options) {
@@ -322,16 +323,19 @@ fn a_packed_f16_weight_with_a_native_reader_is_a_typed_refusal() {
     let y = b.matmul(x, b.transpose(w, vec![1, 0]));
     let widened = b.cast(w, DType::F32);
     let total = b.binary(BinOp::Add, total_sum(&b, y), total_sum(&b, widened));
-    let mut g = b.finish(total);
+    let traced = b.finish(total).unwrap();
     // The contraction the fold would make of the projection, written into the graph directly: the fold itself
     // never makes this one, because `w` has a second reader. (The transpose stays, now unread.)
-    let matmul = g
-        .eqns
-        .iter_mut()
-        .find(|eqn| matches!(eqn.op, OpKind::MatMul))
-        .expect("the traced graph multiplies");
-    matmul.op = OpKind::DenseContraction { weight: DType::F16 };
-    matmul.inputs[1] = Operand::Value(w.id());
+    let g = poot_test_util::graph_fixtures::derive(&traced, |draft| {
+        let matmul = draft
+            .eqns_mut()
+            .iter_mut()
+            .find(|eqn| matches!(eqn.op, OpKind::MatMul))
+            .expect("the traced graph multiplies");
+        matmul.op = OpKind::DenseContraction { weight: DType::F16 };
+        matmul.inputs[1] = Operand::Value(w.id());
+    })
+    .unwrap();
     let options = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
     for backend in backends() {
         match compile(&g, &target(backend), &options) {
@@ -362,7 +366,7 @@ fn biased_residual_projection(m: usize, weight: DType) -> Graph {
     let residual = b.constant("residual", TensorType::f32(vec![m, N]));
     let projection = b.matmul(x, b.transpose(w, vec![1, 0]));
     let out = b.binary(BinOp::Add, b.binary(BinOp::Add, projection, bias), residual);
-    b.finish(out)
+    b.finish(out).unwrap()
 }
 
 /// POOT-1032: a dense head with a bias and a residual plans ONE `ContractionEpilogue` at every `M`, on every
@@ -426,7 +430,7 @@ fn a_biased_residual_tiled_matmul_head_is_one_epilogue_contraction() {
             let residual = b.constant("residual", TensorType::f32(vec![m, N]));
             let head = b.matmul(x, w);
             let out = b.binary(BinOp::Add, b.binary(BinOp::Add, head, bias), residual);
-            let g = b.finish(out);
+            let g = b.finish(out).unwrap();
             let fused = program(&g, backend);
             let label = format!("{backend:?} M={m}: {:?}", op_names(&fused));
             let is_head = |op: &OpKind| {
@@ -470,7 +474,7 @@ fn biased_residual_matmul(xs: Vec<usize>, ws: Vec<usize>, head_dtype: DType) -> 
         b.binary(BinOp::Add, b.matmul(x, w), bias),
         residual,
     );
-    b.finish(out)
+    b.finish(out).unwrap()
 }
 
 /// POOT-1036: only an f32 `[K, N]` `MatMul` head above one row takes the generated tiled GEMM with an epilogue.
@@ -583,7 +587,7 @@ fn grouped_projection(
     let blocks = b.reshape(w, vec![GROUPS, N, K]);
     let y = b.matmul(x, b.transpose(blocks, vec![0, 2, 1]));
     let out = blocks_reader(&b, blocks, y);
-    b.finish(out)
+    b.finish(out).unwrap()
 }
 
 fn is_grouped_bf16(op: &OpKind) -> bool {
@@ -708,7 +712,7 @@ fn a_grouped_weight_that_is_not_bf16_keeps_the_traced_chain() {
         let w = b.constant("w", TensorType::new(vec![GROUPS * N, K], weight));
         let blocks = b.reshape(w, vec![GROUPS, N, K]);
         let out = b.matmul(x, b.transpose(blocks, vec![0, 2, 1]));
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         let options =
             CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
         for backend in backends() {

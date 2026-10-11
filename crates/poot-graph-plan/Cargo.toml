@@ -52,11 +52,6 @@ poot-executor-parity.workspace = true
 # `poot-graph-plan/test-support` back to this same crate for `reassociation_class`/
 # `per_eqn_plans_outside_compile` (ADR-0113).
 poot-test-util = { workspace = true, features = ["graph-fixtures", "kernel-fixtures"] }
-criterion.workspace = true
-
-[[bench]]
-name = "decode"
-harness = false
 
 [lints]
 workspace = true

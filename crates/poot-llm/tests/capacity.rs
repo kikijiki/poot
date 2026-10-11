@@ -10,7 +10,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
 use poot_executor::{BufferRole, Device, Dispatch, Engine};
-use poot_graph_ir::{BinOp, Builder, Graph, StateRole, TensorType, ValidationOutputs};
+use poot_graph_ir::{BinOp, Builder, Graph, StateRole, TensorType};
 use poot_graph_plan::{CompileLimits, CompileOptions, DeviceId, Submission, Target};
 use poot_llm::driver::capacity::Planner;
 use poot_llm::driver::placement::Placement;
@@ -78,11 +78,7 @@ impl Model for Tiny {
         &self.weights
     }
 
-    fn trace(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-    ) -> Result<Graph<ValidationOutputs>, TraceError> {
+    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
         let refuse = |reason| {
             Err(TraceError::ShapeUnsupported {
                 family: FAMILY,
@@ -149,7 +145,7 @@ impl Model for Tiny {
         let spread = b.broadcast(b.reshape(last, vec![1; dims.len()]), dims);
         step.carry(state, b.binary(BinOp::Add, state, spread));
         let logits = b.broadcast(b.reshape(seed, vec![rows, out, 1]), vec![rows, out, VOCAB]);
-        Ok(step.finish(b, logits))
+        Ok(step.finish(b, logits).unwrap())
     }
 }
 
@@ -259,7 +255,7 @@ impl Device for CountingDevice {
     type Error = FakeError;
 
     fn target(&self) -> Target {
-        Target {
+        Target::Gpu {
             backend: Backend::SpirvVulkan,
             caps: DeviceCaps::wgpu_rdna3_igpu(),
         }

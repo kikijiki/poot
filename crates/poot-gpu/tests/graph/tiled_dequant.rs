@@ -21,7 +21,7 @@ fn pack_unpack_i8_gpu_matches_cpu() {
     let packed = b.pack_i8(x);
     let out = b.unpack_i8(packed, cols);
     let xi = x.id();
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     // span past +-127 so the clamp is exercised; mix signs.
     let xd: Vec<f32> = (0..rows * cols)
@@ -68,7 +68,7 @@ fn pack_unpack_i8_plan_selection() {
     use poot_graph_ir::op::OpKind;
     use poot_target::Backend;
     let plan_of = |g: &poot_graph_ir::Graph, want: fn(&OpKind) -> bool, backend| {
-        let eqn = g.eqns.iter().find(|e| want(&e.op)).unwrap();
+        let eqn = g.eqns().iter().find(|e| want(&e.op)).unwrap();
         plan_eqn_with_choice(
             g,
             eqn,
@@ -83,7 +83,7 @@ fn pack_unpack_i8_plan_selection() {
         let x = b.constant("x", TensorType::f32(vec![4, 10]));
         let packed = b.pack_i8(x);
         let out = b.unpack_i8(packed, 10);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         let (plan_, choice_) = plan_of(&g, |op| matches!(op, OpKind::PackI8), backend);
         match (single_meta(&plan_), choice_) {
             (Some(meta @ [_, ..]), choice) => {

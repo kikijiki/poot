@@ -1,0 +1,182 @@
+{
+  "backend": "wgpu",
+  "case": "attention-low-head-decode-live-full",
+  "cells": {
+    "kernel": {
+      "repeats": [
+        {
+          "metrics": {
+            "step_us": 357.73
+          },
+          "slot": 0,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 361.517
+          },
+          "slot": 1,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 356.508
+          },
+          "slot": 2,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 363.31
+          },
+          "slot": 3,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 347.531
+          },
+          "slot": 4,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 340.678
+          },
+          "slot": 5,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 353.492
+          },
+          "slot": 6,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 346.529
+          },
+          "slot": 7,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 358.45099999999996
+          },
+          "slot": 8,
+          "status": "ok"
+        }
+      ]
+    }
+  },
+  "memory": [
+    {
+      "live_bytes": 33555456,
+      "peak_bytes": 33555456,
+      "role": "Weight"
+    },
+    {
+      "live_bytes": 148740,
+      "peak_bytes": 148740,
+      "role": "Activation"
+    },
+    {
+      "live_bytes": 262148,
+      "peak_bytes": 262148,
+      "role": "Input"
+    },
+    {
+      "live_bytes": 68,
+      "peak_bytes": 1092,
+      "role": "Staging"
+    }
+  ],
+  "observed": {
+    "layout": "bhsd",
+    "shape": {
+      "cap": 32768,
+      "d": 128,
+      "hkv": 1,
+      "hq": 2,
+      "live": 32768
+    },
+    "storage": "f32",
+    "weight_bytes_per_copy": 33554432,
+    "weight_copies": 1
+  },
+  "plan": [
+    "pointwise [cfcf7972dfbe67cd3365ab4e284961c6c1d3ef73a2231527efb5d8a9ac1cf3dd]",
+    "pointwise [0263a96514a041ac87fee222ecc5ef780a6973c1a8a589a3a7f0ea4840403e12]",
+    "attention [a8e47198ebda3c828e68008937b33f00a7deb24a714edf5aab34a9ee801f42fe]",
+    "attention_combine [f6e7be4dc6536291db2eb7fc8ef150860c0413f59422ef020abcf347f4d0dc3a]"
+  ],
+  "plan_id": "dd5d46be2e9b6f4c8d909c547124793134c85a640da5606466b0184a262042c0",
+  "recordings": 1,
+  "reference": {
+    "agrees": true,
+    "max_relative_error": 2.8236322711750312e-09,
+    "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
+    "provenance": "independent-golden",
+    "tolerance": 0.002
+  },
+  "replays": 13,
+  "role": "baseline",
+  "schema": 1,
+  "command": [
+    "cargo",
+    "run",
+    "--release",
+    "-p",
+    "poot-gpu",
+    "--example",
+    "performance_bank",
+    "--",
+    "--bank",
+    "benchmarks/performance-bank/cases.json",
+    "--case",
+    "attention-low-head-decode-live-full",
+    "--out",
+    "benchmarks/performance-bank/receipts/wgpu/attention-low-head-decode-live-full.json"
+  ],
+  "parent_revision": "9335bb8febe0def56a03a92df84e3d1b6104cff1",
+  "binary_sha256": "a81ec3b5600d6ebebe4a23e14fa47d3aaf4b596af49f2da496359baa0bc8ca49",
+  "identity": {
+    "checkpoint_digest": "synthetic-no-checkpoint",
+    "token_fixture": "splitmix64-seed0-unit:237900849bc67b83",
+    "precision": "f32",
+    "layout": "bhsd",
+    "dimensions": {
+      "hq": 2,
+      "hkv": 1,
+      "d": 128,
+      "cap": 32768,
+      "live": 32768
+    },
+    "prompt_tokens": 1,
+    "live_context": 32768,
+    "max_context": 32768,
+    "requested_output": "n/a",
+    "actual_output": "n/a",
+    "sampler": "n/a",
+    "template": "n/a",
+    "cache_state": {
+      "condition": "weights-resident-hot",
+      "id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb"
+    },
+    "prepared_set": [
+      "attention-low-head-decode-live-full"
+    ],
+    "timing_policy": {
+      "warmup": 3,
+      "repeats": 9,
+      "clock": "wall step plus readback",
+      "profiled": false
+    },
+    "backend": "wgpu",
+    "device": "AMD Radeon 8060S Graphics",
+    "driver": "host kernel 7.2.9"
+  },
+  "identity_digest": "6d3686ddf309fb60202dbcb17aec8b5ff085e03040985ba04de1ea773ddc261e",
+  "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77"
+}

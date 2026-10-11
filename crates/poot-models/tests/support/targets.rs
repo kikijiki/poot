@@ -21,7 +21,7 @@ pub fn preset(column: &'static str, file: &'static str, backend: Backend) -> Ref
     RefTarget {
         column,
         file,
-        target: Target {
+        target: Target::Gpu {
             backend,
             caps: poot_test_util::device_caps::default_caps_for(backend),
         },

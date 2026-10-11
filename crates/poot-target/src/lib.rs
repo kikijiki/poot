@@ -21,8 +21,17 @@ pub mod storage;
 pub use aie::{AieCaps, AieIsa, AiePlatform, AieTargetId};
 pub use storage::{BufferStorage, ElementKind, LogicalDType, StorageLayout};
 
-/// The lowering backend. Most of `plan_eqn` is backend-neutral; the NVPTX-only kernels (tensor-core
+/// The GPU lowering backend. Most of `plan_eqn` is backend-neutral; the NVPTX-only kernels (tensor-core
 /// gemm, spec 025) are gated on this so the SPIR-V/wgpu path keeps the portable kernel.
+///
+/// A GPU backend only: an AIE target is not a variant here, so a plan, a capability descriptor and a
+/// backend tag can never disagree about which kind of device they describe (POOT-1117). The AIE identity
+/// is [`AieTargetId`]; [`TargetId`] names either.
+///
+/// ```compile_fail,E0599
+/// // An AIE target is not a GPU `Backend`: there is no value that pairs one with GPU `DeviceCaps`.
+/// let _ = poot_target::Backend::Aie(poot_target::AieTargetId::Xdna2);
+/// ```
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Backend {
     Nvptx,
@@ -30,9 +39,28 @@ pub enum Backend {
     /// ROCm/AMDGPU executor. Carries the per-device arch (gfx code, wavefront, tensor-core family) so
     /// `plan_eqn` can gate the WMMA path on `TensorCoreSupport::Wmma16x16x16Rdna3` (spec 130).
     AmdGcn(AmdArch),
+}
+
+/// What a kernel, a plan or a refusal is for, by identity: a GPU lowering backend or an AIE target. The
+/// capability descriptor that goes with it is the compiler's `Target`; this is the tag without the limits.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TargetId {
+    Gpu(Backend),
     /// An AMD XDNA NPU: one core runs a sequential loop and a typed link recipe moves the data (POOT-664).
     /// Its limits are [`AieCaps`], not [`DeviceCaps`].
     Aie(AieTargetId),
+}
+
+impl From<Backend> for TargetId {
+    fn from(backend: Backend) -> Self {
+        TargetId::Gpu(backend)
+    }
+}
+
+impl From<AieTargetId> for TargetId {
+    fn from(target: AieTargetId) -> Self {
+        TargetId::Aie(target)
+    }
 }
 
 /// Matrix (tensor-core) hardware a device exposes, as measured from a real capability query - never

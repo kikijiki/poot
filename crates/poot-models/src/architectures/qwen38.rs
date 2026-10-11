@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use poot_graph_ir::{Builder, Graph, ValidationOutputs};
+use poot_graph_ir::{Builder, Graph};
 use poot_quant::format::{OperandRole, ScaleEncoding, WeightFormat};
 use poot_quant::weights::{WeightEntry, WeightMap, WeightStore};
 use poot_quant::{PackedPayload, PackedWeight, SourceRole, StoredBytes};
@@ -105,11 +105,7 @@ impl Model for Qwen4Exp {
         &self.weights
     }
 
-    fn trace(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-    ) -> Result<Graph<ValidationOutputs>, TraceError> {
+    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(FAMILY, phase, shape, p.max_positions)?;
         moe::check_step(FAMILY, shape, &p.moe)?;
@@ -127,7 +123,7 @@ impl Model for Qwen4Exp {
         let b = Builder::new();
         let step = Step::new(&b, shape);
         let logits = trace::trace_step(&b, &step, &self.body, p);
-        Ok(step.finish(b, logits))
+        Ok(step.finish(b, logits)?)
     }
 }
 

@@ -7,7 +7,7 @@ pub enum RuntimeError {
     #[error(
         "wgpu dispatch requires a SpirvVulkan-compiled kernel, got one compiled for {actual:?}"
     )]
-    WrongKernelTarget { actual: poot_target::Backend },
+    WrongKernelTarget { actual: poot_target::TargetId },
     /// The bound buffers did not meet the compiled kernel's argument schema (card 608, SC-002): a typed
     /// release-build error before any submission.
     #[error("kernel argument schema violation: {0}")]

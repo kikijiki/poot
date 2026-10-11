@@ -7,7 +7,7 @@
 
 use poot_kernel_ir::{Body, Ty};
 use poot_runtime_common::{AieLinkedArtifact, ArgAccess, ArgSchema, CompiledKernel, KernelCode};
-use poot_target::{AieTargetId, Backend, ElementKind};
+use poot_target::{AieTargetId, Backend, ElementKind, TargetId};
 
 use crate::Target;
 use crate::aie::{AieAbiMismatch, check_body_abi};
@@ -92,6 +92,16 @@ impl From<GpuTarget> for Target {
 #[error("{0:?} has no byte-artifact kernel handle: its kernel is a linked artifact")]
 pub struct NotAByteTarget(pub Target);
 
+impl From<Backend> for GpuTarget {
+    fn from(backend: Backend) -> Self {
+        match backend {
+            Backend::SpirvVulkan => GpuTarget::SpirvVulkan,
+            Backend::Nvptx => GpuTarget::Nvptx,
+            Backend::AmdGcn(arch) => GpuTarget::AmdGcn(arch),
+        }
+    }
+}
+
 impl TryFrom<Target> for GpuTarget {
     type Error = NotAByteTarget;
 
@@ -138,16 +148,25 @@ impl GpuTarget {
 }
 
 /// The reverse mapping, total and lossless: every [`Backend`] a device capability descriptor or a planned
-/// [`poot_target::Backend`]-tagged `Target` names has exactly one codegen [`Target`] (the one AIE target
-/// id is a closed enum, so no id is dropped). The executor engine uses this to pick which `Target` to
-/// compile a program's bodies for from the device's own backend, instead of writing its own copy.
+/// `Target` names has exactly one codegen [`Target`]. The executor engine uses this to pick which `Target`
+/// to compile a program's bodies for from the device's own backend, instead of writing its own copy.
 impl From<Backend> for Target {
     fn from(backend: Backend) -> Target {
         match backend {
             Backend::SpirvVulkan => Target::SpirvVulkan,
             Backend::Nvptx => Target::Nvptx,
             Backend::AmdGcn(arch) => Target::AmdGcn(arch),
-            Backend::Aie(AieTargetId::Xdna2) => Target::AieCore,
+        }
+    }
+}
+
+/// The codegen [`Target`] of a target identity (the one AIE target id is a closed enum, so no id is
+/// dropped).
+impl From<TargetId> for Target {
+    fn from(target: TargetId) -> Target {
+        match target {
+            TargetId::Gpu(backend) => backend.into(),
+            TargetId::Aie(AieTargetId::Xdna2) => Target::AieCore,
         }
     }
 }
@@ -173,7 +192,15 @@ pub fn kernel_handle(body: &Body, target: GpuTarget, bytes: Vec<u8>) -> Compiled
     // (the caller's obligation, stated in this function's doc); `entry_point`, `args` and `has_trap` are
     // read straight from that same `body`, so they describe the compiled code exactly, not a
     // caller-guessed shape.
-    unsafe { CompiledKernel::new(gpu.backend(), entry_point, code, args, has_trap) }
+    unsafe {
+        CompiledKernel::new(
+            TargetId::Gpu(gpu.backend()),
+            entry_point,
+            code,
+            args,
+            has_trap,
+        )
+    }
 }
 
 /// The [`CompiledKernel`] for an AIE `body` and the `artifact` linked for it. Fallible: the artifact's shape
@@ -186,7 +213,7 @@ pub fn aie_kernel_handle(
     check_body_abi(body, artifact.abi())?;
     let args = try_arg_schema(body).expect("check_body_abi accepted every parameter");
     let entry_point: Box<str> = artifact.entry().into();
-    let target = Backend::Aie(artifact.target());
+    let target = TargetId::Aie(artifact.target());
     // SAFETY: `artifact` came out of the artifact validator (an xclbin, a whole instruction stream and a
     // self-consistent shape ABI), and `check_body_abi` proved its bindings are exactly `body`'s buffer
     // parameters in order with the same element kinds and write flags; `args` is read from that same
@@ -206,7 +233,7 @@ mod tests {
         let body = add_kernel();
         let handle = kernel_handle(&body, GpuTarget::SpirvVulkan, vec![0u8; 4]);
         assert_eq!(handle.entry_point(), "main");
-        assert_eq!(handle.target(), Backend::SpirvVulkan);
+        assert_eq!(handle.target(), TargetId::Gpu(Backend::SpirvVulkan));
         let args = handle.args();
         assert_eq!(args.len(), 3, "two inputs + one output");
         assert_eq!(args[0].element(), ElementKind::F32);

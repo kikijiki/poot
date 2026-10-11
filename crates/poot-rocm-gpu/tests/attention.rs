@@ -18,7 +18,7 @@ use poot_graph_ir::ops::{attention_masked, attention_prefill_softcap};
 use poot_graph_ir::types::TensorType;
 use poot_graph_ir::{Graph, OpKind};
 use poot_graph_plan::{CompileLimits, CompileOptions, KernelChoice, Submission, compile};
-use poot_kernelgen::{AttentionSchedule, KernelRequest};
+use poot_kernelgen::KernelRequest;
 use poot_rocm_gpu::device::RocmDevice;
 use poot_runtime_common::DeviceBackend;
 use poot_tensor::{DType, HostTensor};
@@ -71,7 +71,7 @@ fn case(
     ];
     let ids = [q.id(), k.id(), v.id(), m.id()];
     Case {
-        graph: b.finish(out),
+        graph: b.finish(out).unwrap(),
         ids,
         consts: tensors.map(|(name, shape, data)| ConstFixture {
             name,
@@ -99,7 +99,7 @@ fn check(name: &str, case: &Case) {
     let KernelChoice::Generated(KernelRequest::Attention(spec)) = program.kernel_choice(eqn) else {
         panic!("{name}: expected the generated attention kernel");
     };
-    let AttentionSchedule::Streaming { lanes } = spec.schedule;
+    let lanes = spec.schedule.lanes();
     assert!(
         case.lk > lanes,
         "{name}: {} keys must exceed the {lanes} lanes so lanes walk several keys",
@@ -237,7 +237,7 @@ fn gemma2_softcap_decode_matches_the_oracle_on_rocm() {
     check(
         "gemma2 softcap decode",
         &Case {
-            graph: b.finish(out),
+            graph: b.finish(out).unwrap(),
             ids,
             consts: tensors.map(|(name, shape, data)| ConstFixture {
                 name,
@@ -277,7 +277,7 @@ fn deepseek_v2_mla_split_key_decode_matches_the_oracle_on_rocm() {
         ("m", vec![1, 1, 1, lk], mask),
     ];
     let ids = [q.id(), k_nope.id(), k_pe.id(), v.id(), m.id()];
-    let graph = b.finish(out);
+    let graph = b.finish(out).unwrap();
     let Some(device) = open_or_skip(DeviceBackend::Rocm, RocmDevice::new()) else {
         return;
     };

@@ -93,7 +93,7 @@ fn run_case(x_shape: Vec<usize>, x_data: Vec<f32>, bytes: Vec<Vec<u8>>, scales: 
     plan.declare_result(output).expect("declare result");
     let mut prepared = b.preflight_append(plan).expect("preflight append");
     let out = b.commit_append(&mut prepared).expect("commit append");
-    let graph = b.finish(out);
+    let graph = b.finish(out).unwrap();
 
     let expected = dense_oracle(&x_data, k, &bytes, &scales);
 

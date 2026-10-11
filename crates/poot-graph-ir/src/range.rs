@@ -22,7 +22,7 @@
 //! `poot-graph-plan`'s `compile` reads this to refuse an `I32 -> F32` cast whose operand is not proven
 //! inside the exactly representable integers of `f32` ([`IndexRange::F32_EXACT`]).
 
-use crate::graph::{Graph, Operand, Storage, ValidationChannel, ValueId, ValueTable};
+use crate::graph::{Graph, Operand, Storage, ValueId, ValueTable};
 use crate::op::{BinOp, OpKind, RedOp, UnOp};
 use crate::types::{DType, Scalar};
 
@@ -164,9 +164,9 @@ impl std::ops::Index<ValueId> for RangeFacts {
 ///
 /// One forward pass: equations are in definition order, so every operand's range is known when its
 /// consumer is read.
-pub fn value_ranges<V: ValidationChannel>(graph: &Graph<V>) -> RangeFacts {
-    let mut ranges: ValueTable<Option<IndexRange>> = ValueTable::filled(graph.values.len(), None);
-    for (id, meta) in graph.values.iter_enumerated() {
+pub fn value_ranges(graph: &Graph) -> RangeFacts {
+    let mut ranges: ValueTable<Option<IndexRange>> = ValueTable::filled(graph.values().len(), None);
+    for (id, meta) in graph.values().iter_enumerated() {
         if meta.aval.dtype != DType::I32 {
             continue;
         }
@@ -181,12 +181,12 @@ pub fn value_ranges<V: ValidationChannel>(graph: &Graph<V>) -> RangeFacts {
         });
     }
     // The equation that defines each value: a `Select` reads its condition's comparison.
-    let mut defs: ValueTable<Option<usize>> = ValueTable::filled(graph.values.len(), None);
-    for (index, eqn) in graph.eqns.iter().enumerate() {
+    let mut defs: ValueTable<Option<usize>> = ValueTable::filled(graph.values().len(), None);
+    for (index, eqn) in graph.eqns().iter().enumerate() {
         defs[eqn.out] = Some(index);
     }
-    let mut clamps: ValueTable<Vec<ValueId>> = ValueTable::filled(graph.values.len(), Vec::new());
-    for eqn in &graph.eqns {
+    let mut clamps: ValueTable<Vec<ValueId>> = ValueTable::filled(graph.values().len(), Vec::new());
+    for eqn in graph.eqns() {
         if graph.aval(eqn.out).dtype != DType::I32 {
             continue;
         }
@@ -223,8 +223,8 @@ fn operand_range(ranges: &ValueTable<Option<IndexRange>>, operand: &Operand) -> 
 }
 
 /// The range an I32-producing equation proves for its output.
-fn equation_range<V: ValidationChannel>(
-    graph: &Graph<V>,
+fn equation_range(
+    graph: &Graph,
     ranges: &ValueTable<Option<IndexRange>>,
     op: &OpKind,
     inputs: &[Operand],
@@ -333,8 +333,8 @@ fn equation_range<V: ValidationChannel>(
 /// unsigned test covers both bounds); where `Ge(x, k)` is zero, `x < k`, and where it is nonzero,
 /// `x >= k`. This is how `Select(GeU(x, k), Sub(x, x), x)` is proven `[0, k)` without the shape being
 /// matched as a whole: each equation of it is an ordinary rule.
-fn select_range<V: ValidationChannel>(
-    graph: &Graph<V>,
+fn select_range(
+    graph: &Graph,
     defs: &ValueTable<Option<usize>>,
     ranges: &ValueTable<Option<IndexRange>>,
     inputs: &[Operand],
@@ -343,7 +343,7 @@ fn select_range<V: ValidationChannel>(
         return (IndexRange::I32, None);
     };
     let comparison = match condition {
-        Operand::Value(id) => defs[*id].map(|index| &graph.eqns[index]).and_then(|eqn| {
+        Operand::Value(id) => defs[*id].map(|index| &graph.eqns()[index]).and_then(|eqn| {
             match (&eqn.op, eqn.inputs.as_slice()) {
                 (
                     OpKind::Binary(op @ (BinOp::Ge | BinOp::GeU)),

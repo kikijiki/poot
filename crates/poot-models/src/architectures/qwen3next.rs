@@ -16,7 +16,7 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
-use poot_graph_ir::{Builder, Graph, ValidationOutputs};
+use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{
     AttnRole, ExpertProj, GdnRole, NormRole, WeightId, WeightKey, WeightMap, WeightMapError,
     WeightRole, WeightStore, WeightView,
@@ -616,11 +616,7 @@ impl Model for Qwen3Next {
         &self.weights
     }
 
-    fn trace(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-    ) -> Result<Graph<ValidationOutputs>, TraceError> {
+    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(FAMILY, phase, shape, p.max_positions)?;
         moe::check_step(FAMILY, shape, &p.moe)?;
@@ -649,7 +645,7 @@ impl Model for Qwen3Next {
                 )
             },
         );
-        Ok(step.finish(b, logits))
+        Ok(step.finish(b, logits)?)
     }
 }
 
@@ -822,9 +818,8 @@ mod tests {
             .trace(Phase::Decode, step_shape(1, CAP, LogitRows::Last))
             .unwrap();
         let names: Vec<String> = g
-            .state
-            .iter()
-            .map(|&(input, _)| g.meta(input).name.clone().unwrap())
+            .state()
+            .map(|(input, _)| g.meta(input).name.clone().unwrap())
             .collect();
         assert_eq!(
             names,

@@ -33,7 +33,7 @@
       "backend": "rocm",
       "status": "verified",
       "receipt": "receipts/rocm/attention-low-head-decode.json",
-      "receipt_sha256": "ef017414268c3ae2cc92cf8c6a4647e5ff5e4c37831ebb3eeb4aab427690c08a",
+      "receipt_sha256": "2a4c0faf2860f6b1752643d601b8379d4e35a50edd065202bc5836ef97a0348f",
       "command": [
         "cargo",
         "run",
@@ -50,16 +50,16 @@
         "--out",
         "benchmarks/performance-bank/receipts/rocm/attention-low-head-decode.json"
       ],
-      "spread": 0.0616,
+      "spread": 0.0978,
       "exceeds_max_uncertainty": true,
-      "note": "submit/readback-bound: ROCm steps sit at a ~2.2-2.35 ms floor whatever the kernel does, so this receipt does not discriminate kernel cost"
+      "note": "recorded on the split-KV plan (attention + attention_combine); the streaming plan measured 233 us median on this device, see candidates/POOT-1113/comparison.json (the earlier ~2.2 ms floor note described a previous runtime and no longer holds)"
     },
     {
       "case": "attention-low-head-decode",
       "backend": "wgpu",
       "status": "verified",
       "receipt": "receipts/wgpu/attention-low-head-decode.json",
-      "receipt_sha256": "e11e22fe7e44f504d26a6c5153f62abd97313f4804ef60ff046c217ac758c2f8",
+      "receipt_sha256": "0f9f396976ec37d9a9fac522652acfd2796c4712a0a412caf5160a7c17a7c43a",
       "command": [
         "cargo",
         "run",
@@ -76,7 +76,139 @@
         "--out",
         "benchmarks/performance-bank/receipts/wgpu/attention-low-head-decode.json"
       ],
-      "spread": 0.358,
+      "spread": 0.319,
+      "exceeds_max_uncertainty": true
+    },
+    {
+      "case": "attention-low-head-decode-live-full",
+      "backend": "ptx",
+      "status": "verified",
+      "receipt": "receipts/ptx/attention-low-head-decode-live-full.json",
+      "receipt_sha256": "de2a19c02fc7cf708d3e9ce2f23390d390ac107dd6ebf6bcf37e92da17c65117",
+      "command": [
+        "cargo",
+        "run",
+        "--release",
+        "-p",
+        "poot-ptx-gpu",
+        "--example",
+        "performance_bank",
+        "--",
+        "--bank",
+        "benchmarks/performance-bank/cases.json",
+        "--case",
+        "attention-low-head-decode-live-full",
+        "--out",
+        "benchmarks/performance-bank/receipts/ptx/attention-low-head-decode-live-full.json"
+      ],
+      "spread": 0.0032,
+      "exceeds_max_uncertainty": false,
+      "note": "measured on a RunPod secure RTX A5000 via poot-orchestrator exec on the split-KV plan (attention + attention_combine); the recorded binary digest is the local pre-patchelf file; three runs of 9 repeats are in receipts/ptx/poot-1124-a5000"
+    },
+    {
+      "case": "attention-low-head-decode-live-full",
+      "backend": "rocm",
+      "status": "verified",
+      "receipt": "receipts/rocm/attention-low-head-decode-live-full.json",
+      "receipt_sha256": "6717cb0c8d2fdbc3c313a576fad63702e1f373d8d1a652c65e4a58c060a16a38",
+      "command": [
+        "cargo",
+        "run",
+        "--release",
+        "-p",
+        "poot-rocm-gpu",
+        "--example",
+        "performance_bank",
+        "--",
+        "--bank",
+        "benchmarks/performance-bank/cases.json",
+        "--case",
+        "attention-low-head-decode-live-full",
+        "--out",
+        "benchmarks/performance-bank/receipts/rocm/attention-low-head-decode-live-full.json"
+      ],
+      "spread": 7.2581,
+      "exceeds_max_uncertainty": true
+    },
+    {
+      "case": "attention-low-head-decode-live-full",
+      "backend": "wgpu",
+      "status": "verified",
+      "receipt": "receipts/wgpu/attention-low-head-decode-live-full.json",
+      "receipt_sha256": "35238023b6a91867697635c53659347cb9a1c729bf1811eac53c202c36b04f93",
+      "command": [
+        "cargo",
+        "run",
+        "--release",
+        "-p",
+        "poot-gpu",
+        "--example",
+        "performance_bank",
+        "--",
+        "--bank",
+        "benchmarks/performance-bank/cases.json",
+        "--case",
+        "attention-low-head-decode-live-full",
+        "--out",
+        "benchmarks/performance-bank/receipts/wgpu/attention-low-head-decode-live-full.json"
+      ],
+      "spread": 0.0635,
+      "exceeds_max_uncertainty": true
+    },
+    {
+      "case": "attention-low-head-decode-live-short",
+      "backend": "ptx",
+      "status": "missing",
+      "reason": "measured on a RunPod secure RTX A5000 (receipts/ptx/poot-1124-a5000, three runs, spread under 1.5%) and on an A100 SXM (receipts/ptx/poot-1124-a100, parent spread 24.7%, candidate 6.0%); the case is noise-bound on the A100, so it is not promoted to a verified receipt"
+    },
+    {
+      "case": "attention-low-head-decode-live-short",
+      "backend": "rocm",
+      "status": "verified",
+      "receipt": "receipts/rocm/attention-low-head-decode-live-short.json",
+      "receipt_sha256": "353de1b22f24fad86979b8bc78e1e3616293305b2823e271b9cbe3974a5155af",
+      "command": [
+        "cargo",
+        "run",
+        "--release",
+        "-p",
+        "poot-rocm-gpu",
+        "--example",
+        "performance_bank",
+        "--",
+        "--bank",
+        "benchmarks/performance-bank/cases.json",
+        "--case",
+        "attention-low-head-decode-live-short",
+        "--out",
+        "benchmarks/performance-bank/receipts/rocm/attention-low-head-decode-live-short.json"
+      ],
+      "spread": 13.1205,
+      "exceeds_max_uncertainty": true
+    },
+    {
+      "case": "attention-low-head-decode-live-short",
+      "backend": "wgpu",
+      "status": "verified",
+      "receipt": "receipts/wgpu/attention-low-head-decode-live-short.json",
+      "receipt_sha256": "afd5a797c51b7cbd045606a69044b7710c03c9a36aa797554dd5417549ff0ed8",
+      "command": [
+        "cargo",
+        "run",
+        "--release",
+        "-p",
+        "poot-gpu",
+        "--example",
+        "performance_bank",
+        "--",
+        "--bank",
+        "benchmarks/performance-bank/cases.json",
+        "--case",
+        "attention-low-head-decode-live-short",
+        "--out",
+        "benchmarks/performance-bank/receipts/wgpu/attention-low-head-decode-live-short.json"
+      ],
+      "spread": 2.2812,
       "exceeds_max_uncertainty": true
     },
     {

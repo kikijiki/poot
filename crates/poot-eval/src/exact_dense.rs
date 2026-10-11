@@ -4,9 +4,7 @@ use poot_tensor::DType;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use poot_graph_ir::{
-    Graph, GraphValidationError, OpKind, Operand, Storage, ValidationChannel, ValueId,
-};
+use poot_graph_ir::{Graph, OpKind, Operand, Storage, ValueId};
 use poot_load::packed_safetensors::{
     AuthenticatedArtifactIdentity, AuthenticatedTensorDescriptor, ExactSourceKind, ExactSourceOwner,
 };
@@ -160,7 +158,7 @@ impl DenseOwnerTensorView {
 /// Whether `eqn` reads a BF16 operand through the exact BF16 view: a Spec 376 equation, or a BF16
 /// contraction or row-gather composite, whose decomposition is made of Spec 376 equations (`infer` has
 /// already fixed their operand dtypes and ranks).
-fn reads_bf16_view<V: ValidationChannel>(g: &Graph<V>, eqn: &poot_graph_ir::Eqn) -> bool {
+fn reads_bf16_view(g: &Graph, eqn: &poot_graph_ir::Eqn) -> bool {
     resolve::classify(g, eqn).is_some()
         || matches!(
             eqn.op,
@@ -179,8 +177,8 @@ fn reads_bf16_view<V: ValidationChannel>(g: &Graph<V>, eqn: &poot_graph_ir::Eqn)
 /// each bound view's metadata must match its graph constant, and a BF16/F32 owner view not consumed
 /// by an admitted Spec 376 equation (`resolve::classify`) - and not the graph's own output - is an
 /// unconsumed non-output binding, not a silent pass.
-pub(crate) fn validate_exact_dense_bindings<V: ValidationChannel>(
-    g: &Graph<V>,
+pub(crate) fn validate_exact_dense_bindings(
+    g: &Graph,
     inputs: &HashMap<ValueId, Value>,
 ) -> Result<(), EvalError> {
     for (&value_id, value) in inputs {
@@ -201,7 +199,7 @@ pub(crate) fn validate_exact_dense_bindings<V: ValidationChannel>(
         .into()
     };
     let mut consumed = std::collections::HashSet::new();
-    for eqn in &g.eqns {
+    for eqn in g.eqns() {
         // An owner-backed dense view also feeds a plain `Gather` (any residency dtype, card 396's
         // lazy decode): `evaluate_gather`'s own `ExactValue::Dense` arm reads it directly whenever the
         // index is I32, regardless of the Spec 376 BF16-table admission `classify` checks for.
@@ -227,7 +225,7 @@ pub(crate) fn validate_exact_dense_bindings<V: ValidationChannel>(
     }
     for (&value_id, value) in inputs {
         if matches!(value, Value::Owner(ExactValue::Dense(_)))
-            && value_id != g.output
+            && value_id != g.result()
             && !consumed.contains(&value_id)
         {
             return Err(graph_consumer(
@@ -239,17 +237,17 @@ pub(crate) fn validate_exact_dense_bindings<V: ValidationChannel>(
     Ok(())
 }
 
-pub(crate) fn validate_exact_dense_binding_metadata<V: ValidationChannel>(
-    graph: &Graph<V>,
+pub(crate) fn validate_exact_dense_binding_metadata(
+    graph: &Graph,
     value_id: ValueId,
     view: &DenseOwnerTensorView,
 ) -> Result<(), ExactDenseError> {
     let meta = graph
-        .values
+        .values()
         .get(value_id)
         .ok_or(ExactDenseError::ValueIdOutOfRange {
             value_id,
-            value_count: graph.values.len(),
+            value_count: graph.values().len(),
         })?;
     let graph_name = meta
         .name
@@ -373,8 +371,6 @@ pub enum ExactDenseError {
         expected: usize,
         actual: usize,
     },
-    #[error("exact dense binding graph is invalid: {0}")]
-    InvalidGraph(#[from] GraphValidationError),
     #[error("exact dense binding id {value_id} is outside graph value count {value_count}")]
     ValueIdOutOfRange {
         value_id: ValueId,

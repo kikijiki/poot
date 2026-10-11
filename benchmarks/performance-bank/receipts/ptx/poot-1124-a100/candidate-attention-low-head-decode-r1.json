@@ -1,0 +1,119 @@
+{
+  "backend": "ptx",
+  "binary": "/root/bank-candidate",
+  "case": "attention-low-head-decode",
+  "cells": {
+    "kernel": {
+      "repeats": [
+        {
+          "metrics": {
+            "step_us": 168.03
+          },
+          "slot": 0,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 168.61
+          },
+          "slot": 1,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 170.764
+          },
+          "slot": 2,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 168.53
+          },
+          "slot": 3,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 171.89700000000002
+          },
+          "slot": 4,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 169.53199999999998
+          },
+          "slot": 5,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 168.901
+          },
+          "slot": 6,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 168.69000000000003
+          },
+          "slot": 7,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 167.929
+          },
+          "slot": 8,
+          "status": "ok"
+        }
+      ]
+    }
+  },
+  "hardware": {
+    "backend": "ptx",
+    "device": "NVIDIA A100-SXM4-80GB",
+    "driver": "580.159.04"
+  },
+  "memory": [
+    {
+      "live_bytes": 4211712,
+      "peak_bytes": 4211712,
+      "role": "Weight"
+    },
+    {
+      "live_bytes": 17664,
+      "peak_bytes": 17664,
+      "role": "Activation"
+    }
+  ],
+  "observed": {
+    "layout": "bhsd",
+    "shape": {
+      "cap": 4096,
+      "d": 128,
+      "hkv": 1,
+      "hq": 2
+    },
+    "storage": "f32",
+    "weight_bytes_per_copy": 4194304,
+    "weight_copies": 1
+  },
+  "plan": [
+    "attention [8e84558d8bbd3fa2321f51697b825001fcc08ae7b52621a78afce3587148b0fa]",
+    "attention_combine [06272e9261da19551609d082f3eca791c96f6c9f662d668ccb1fca9f82dbf69a]"
+  ],
+  "plan_id": "e25a702363be29276547fb9e1a36c786c730ae6e1a004a42e406d433a073a317",
+  "recordings": 1,
+  "reference": {
+    "agrees": true,
+    "max_relative_error": 6.529526611467363e-09,
+    "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
+    "provenance": "independent-golden",
+    "tolerance": 0.002
+  },
+  "replays": 13,
+  "role": "baseline",
+  "schema": 1
+}

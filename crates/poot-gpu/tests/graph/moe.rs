@@ -24,7 +24,7 @@ fn moe_sparse_vs_dense_decode_timing() {
     data.insert("w_in".into(), f(e * h * 2 * i, 3));
     data.insert("w_out".into(), f(e * i * h, 4));
     let bind = |g: &poot_graph_ir::Graph| -> HashMap<poot_graph_ir::ValueId, HostTensor> {
-        g.inputs
+        g.inputs()
             .iter()
             .map(|&id| {
                 let m = g.meta(id);
@@ -49,7 +49,7 @@ fn moe_sparse_vs_dense_decode_timing() {
         } else {
             moe_dense(&b, x, r, wi, wo, e, k, i)
         };
-        b.finish(out)
+        b.finish(out).unwrap()
     };
     let gd = build(false);
     let gs = build(true);
@@ -128,9 +128,9 @@ fn moe_prefill_dense_timing() {
     let wi = b.constant("w_in", TensorType::f32(vec![e, h, 2 * i]));
     let wo = b.constant("w_out", TensorType::f32(vec![e, i, h]));
     let out = moe(&b, x, r, wi, wo, e, k, i); // L>1 -> moe_dense
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let inp: HashMap<poot_graph_ir::ValueId, HostTensor> = g
-        .inputs
+        .inputs()
         .iter()
         .map(|&id| {
             let m = g.meta(id);
@@ -181,7 +181,7 @@ fn moe_sparse_gpu_matches_dense() {
     data.insert("w_out".into(), fill(e * i * h, 4));
     let bind = |g: &poot_graph_ir::Graph| -> HashMap<poot_graph_ir::ValueId, HostTensor> {
         let mut inputs = HashMap::new();
-        for &id in &g.inputs {
+        for &id in g.inputs() {
             let meta = g.meta(id);
             let name = meta.name.as_deref().unwrap();
             inputs.insert(
@@ -200,7 +200,7 @@ fn moe_sparse_gpu_matches_dense() {
     let wid = bd.constant("w_in", TensorType::f32(vec![e, h, 2 * i]));
     let wod = bd.constant("w_out", TensorType::f32(vec![e, i, h]));
     let dout = moe_dense(&bd, xd, rd, wid, wod, e, k, i);
-    let gd = bd.finish(dout);
+    let gd = bd.finish(dout).unwrap();
     let dense = run_via_contract(&mut gpu, target, &gd, &bind(&gd));
 
     let bs = Builder::new();
@@ -211,7 +211,7 @@ fn moe_sparse_gpu_matches_dense() {
     let wis = bs.constant("w_in", TensorType::f32(vec![e, h, 2 * i]));
     let wos = bs.constant("w_out", TensorType::f32(vec![e, i, h]));
     let sout = moe_sparse(&bs, xs, rs, wis, wos, e, k, i);
-    let gs = bs.finish(sout);
+    let gs = bs.finish(sout).unwrap();
     let sparse = run_via_contract(&mut gpu, target, &gs, &bind(&gs));
 
     assert_eq!(sparse.shape(), dense.shape());
@@ -269,9 +269,9 @@ fn moe_sparse_decode_with_separated_experts_matches_the_oracle() {
     let w_in = b.constant("w_in", TensorType::f32(vec![e, h, 2 * i]));
     let w_out = b.constant("w_out", TensorType::f32(vec![e, i, h]));
     let out = moe_sparse(&b, x, router, w_in, w_out, e, k, i);
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let inputs: HashMap<_, HostTensor> = g
-        .inputs
+        .inputs()
         .iter()
         .map(|&id| {
             let meta = g.meta(id);
@@ -339,7 +339,7 @@ fn moe_grouped_gpu_matches_cpu() {
     data.insert("w_out".into(), fill(e * i * h, 4));
     let bind = |g: &poot_graph_ir::Graph| -> HashMap<poot_graph_ir::ValueId, HostTensor> {
         let mut inputs = HashMap::new();
-        for &id in &g.inputs {
+        for &id in g.inputs() {
             let meta = g.meta(id);
             let name = meta.name.as_deref().unwrap();
             inputs.insert(
@@ -356,11 +356,11 @@ fn moe_grouped_gpu_matches_cpu() {
     let w_in = b.constant("w_in", TensorType::f32(vec![e, h, 2 * i]));
     let w_out = b.constant("w_out", TensorType::f32(vec![e, i, h]));
     let out = moe_grouped(&b, x, router, w_in, w_out, e, k, i);
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     // SC-004 (structural, on the graph run below): IndexedMatMul's M dim must be L*k, not L*E.
     let mut checked = 0;
-    for eqn in &g.eqns {
+    for eqn in g.eqns() {
         if matches!(eqn.op, OpKind::IndexedMatMul) {
             let x_id = match eqn.inputs[0] {
                 poot_graph_ir::Operand::Value(id) => id,
@@ -447,9 +447,9 @@ fn stable_moe_ties_gpu_match_independent_oracle() {
         // The ids are I32; the concatenated probe row is F32 (ids below 2^24 widen exactly).
         let ids = b.cast(ids, poot_tensor::DType::F32);
         let out = b.concat(1, &[ids, mask, gate]);
-        let graph = b.finish(out);
+        let graph = b.finish(out).unwrap();
         let inputs: HashMap<_, _> = graph
-            .inputs
+            .inputs()
             .iter()
             .copied()
             .map(|id| {

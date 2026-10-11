@@ -856,7 +856,7 @@ mod vec4_probe_tests {
         // bindings match `args` exactly, by construction of this fixture.
         unsafe {
             CompiledKernel::new(
-                poot_target::Backend::SpirvVulkan,
+                poot_target::TargetId::Gpu(poot_target::Backend::SpirvVulkan),
                 "main",
                 KernelCode::SpirvWords(words.into_boxed_slice()),
                 args,

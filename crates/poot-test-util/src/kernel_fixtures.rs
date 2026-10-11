@@ -889,6 +889,122 @@ pub fn fused_i32_views(
     poot_kernelgen::fused_i32_views_grid(name, out_shape, leaf_shapes, leaf_layouts, k, None)
 }
 
+/// Cross-block producer/consumer handoff for a cooperative grid, with the ordering made explicit via
+/// `Statement::Fence` pairs instead of relying on an atomic's monotonic ordering alone. Producer:
+/// `data[0]=42`, `Fence{Device,Release}`, then bump `flag[0]` (still a monotonic atomic; the fence
+/// carries the ordering). Consumer: spin on `flag[0]` (unfenced atomic load), and once ready,
+/// `Fence{Device,Acquire}` before reading `data[0]`; only then is the read guaranteed to observe the
+/// producer's release. Needs every block co-resident on a real NVIDIA GPU (RADV cannot prove cross-CTA
+/// forward progress), so it is compile-checked locally (PTX `fence`) only; see
+/// `poot-kernelgen/tests/llc.rs`'s AMDGCN compile-only coverage of the same body.
+pub fn cross_block_fence_spin_wait_coop(name: &str) -> Body {
+    use poot_kernel_ir::{AtomicOp, MemoryOrdering, MemoryScope};
+
+    let locals = vec![
+        ld(Ty::Unit, false),       // 0 ret
+        ld(slice_f32(true), true), // 1 data
+        ld(slice_f32(true), true), // 2 flag
+        ld(slice_f32(true), true), // 3 result
+        ld(Ty::Usize, false),      // 4 block (GroupX)
+        ld(Ty::Usize, false),      // 5 zero
+        ld(Ty::Bool, false),       // 6 is_producer (block==0)
+        ld(Ty::F32, false),        // 7 fval (atomic read / producer's old)
+        ld(Ty::Bool, false),       // 8 not_ready (fval < 1.0)
+        ld(Ty::F32, false),        // 9 dval
+    ];
+    let (data, flag, result, block, zero, isp, fval, notready, dval) = (
+        local(1),
+        local(2),
+        local(3),
+        local(4),
+        local(5),
+        local(6),
+        local(7),
+        local(8),
+        local(9),
+    );
+    let cf = |x: f32| Operand::Const(Constant::F32(x));
+    let assign = |d: Local, rv: Rvalue| Statement::Assign(Place::local(d), rv);
+    // bb0: block = GroupX
+    let bb0 = BasicBlock {
+        statements: vec![],
+        terminator: Terminator::ThreadIndexCall {
+            destination: Place::local(block),
+            dim: IndexAxis::GroupX,
+            target: BlockId { index: 1 },
+        },
+    };
+    // bb1: zero=0; is_producer = block==0; producer -> bb2, else consumer spin -> bb3
+    let bb1 = BasicBlock {
+        statements: vec![
+            assign(zero, Rvalue::Use(Operand::Const(Constant::Usize(0)))),
+            assign(
+                isp,
+                Rvalue::BinaryOp(
+                    BinOp::Eq,
+                    copy(Place::local(block)),
+                    Operand::Const(Constant::Usize(0)),
+                ),
+            ),
+        ],
+        terminator: guard(isp, 3, 2),
+    };
+    // bb2 (producer): data[0]=42; Fence{Device,Release}; atomic_add(flag[0], 1.0); return
+    let bb2 = BasicBlock {
+        statements: vec![
+            Statement::Assign(elem(data, zero), Rvalue::Use(cf(42.0))),
+            Statement::Fence {
+                scope: MemoryScope::Device,
+                ordering: MemoryOrdering::Release,
+            },
+            assign(
+                fval,
+                Rvalue::GlobalAtomic {
+                    place: elem(flag, zero),
+                    value: cf(1.0),
+                    op: AtomicOp::Add,
+                },
+            ),
+        ],
+        terminator: Terminator::Return,
+    };
+    // bb3 (consumer spin head, SINGLE-EXIT self-loop): fval = atomic_add(flag[0], 0.0);
+    //   not_ready = fval < 1.0; if not_ready loop to bb3 else done (bb4)
+    let bb3 = BasicBlock {
+        statements: vec![
+            assign(
+                fval,
+                Rvalue::GlobalAtomic {
+                    place: elem(flag, zero),
+                    value: cf(0.0),
+                    op: AtomicOp::Add,
+                },
+            ),
+            assign(
+                notready,
+                Rvalue::BinaryOp(BinOp::Lt, copy(Place::local(fval)), cf(1.0)),
+            ),
+        ],
+        terminator: guard(notready, 4, 3),
+    };
+    // bb4 (done): Fence{Device,Acquire}; result[0] = data[0]; return. The fence must come before the read, or the
+    // read is not guaranteed to observe the producer's release.
+    let bb4 = BasicBlock {
+        statements: vec![
+            Statement::Fence {
+                scope: MemoryScope::Device,
+                ordering: MemoryOrdering::Acquire,
+            },
+            assign(dval, Rvalue::Use(copy(elem(data, zero)))),
+            Statement::Assign(elem(result, zero), Rvalue::Use(copy(Place::local(dval)))),
+        ],
+        terminator: Terminator::Return,
+    };
+    let mut body = Body::new(name, 3, locals, vec![bb0, bb1, bb2, bb3, bb4]);
+    body.workgroup_size = [1, 1, 1];
+    body
+}
+
 /// A workgroup-scope producer/consumer fence handoff (`Statement::Fence{Workgroup, ..}`), locally verifiable
 /// on RADV. Thread 0 (producer): LDS `data[0] = 42`, `Fence{Workgroup, Release}`, bumps an LDS flag. Every
 /// other thread (consumer): spin-reads the flag until it observes it set, `Fence{Workgroup, Acquire}`, then

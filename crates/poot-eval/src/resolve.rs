@@ -13,7 +13,7 @@
 //! level down, the first time an equation of that shape is evaluated (`EvalError::Unsupported`), not
 //! before the walk starts.
 
-use poot_graph_ir::{Eqn, Graph, OpKind, Operand, ValidationChannel};
+use poot_graph_ir::{Eqn, Graph, OpKind, Operand};
 use poot_tensor::DType;
 
 /// A static label for [`EvalError::Unsupported`], one per [`OpKind`] discriminant (never the dynamic,
@@ -76,7 +76,7 @@ pub(crate) enum Bf16Equation<'a> {
 }
 
 /// Whether `eqn` reads or produces a BF16 value.
-pub(crate) fn touches_bf16<V: ValidationChannel>(graph: &Graph<V>, eqn: &Eqn) -> bool {
+pub(crate) fn touches_bf16(graph: &Graph, eqn: &Eqn) -> bool {
     graph.aval(eqn.out).dtype == DType::BF16
         || eqn.inputs.iter().any(|operand| match operand {
             Operand::Value(value) => graph.aval(*value).dtype == DType::BF16,
@@ -85,10 +85,7 @@ pub(crate) fn touches_bf16<V: ValidationChannel>(graph: &Graph<V>, eqn: &Eqn) ->
 }
 
 /// The Spec 376 equation `eqn` is, if any. Admission, owner preflight, and evaluation all use this one table.
-pub(crate) fn classify<'a, V: ValidationChannel>(
-    graph: &Graph<V>,
-    eqn: &'a Eqn,
-) -> Option<Bf16Equation<'a>> {
+pub(crate) fn classify<'a>(graph: &Graph, eqn: &'a Eqn) -> Option<Bf16Equation<'a>> {
     if !touches_bf16(graph, eqn) {
         return None;
     }

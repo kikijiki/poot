@@ -32,9 +32,6 @@ pub enum PackedLoweringBackend {
     SpirvVulkan,
     AmdGcn,
     Nvptx,
-    /// An AIE core has no packed block-float lowering: no table row names it, so every packed request
-    /// refuses with a typed [`Capability::PackedLowering`].
-    Aie,
 }
 
 impl From<Backend> for PackedLoweringBackend {
@@ -43,7 +40,6 @@ impl From<Backend> for PackedLoweringBackend {
             Backend::SpirvVulkan => Self::SpirvVulkan,
             Backend::AmdGcn(_) => Self::AmdGcn,
             Backend::Nvptx => Self::Nvptx,
-            Backend::Aie(_) => Self::Aie,
         }
     }
 }

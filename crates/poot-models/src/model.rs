@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::num::NonZeroUsize;
 
-use poot_graph_ir::{Graph, ValidationOutputs};
+use poot_graph_ir::Graph;
 use poot_quant::weights::{HandleFormat, WeightId, WeightMap, WeightMapError};
 
 use crate::chat::ChatFormat;
@@ -153,8 +153,7 @@ pub trait Model: Send + Sync + fmt::Debug {
 
     /// The graph of one step of `phase` at `shape`. A shape the family cannot trace is a typed
     /// refusal, never a panic.
-    fn trace(&self, phase: Phase, shape: StepShape)
-    -> Result<Graph<ValidationOutputs>, TraceError>;
+    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError>;
 }
 
 /// Why a config field cannot configure a family.
@@ -285,4 +284,13 @@ pub enum TraceError {
         shape: StepShape,
         reason: ShapeReason,
     },
+    /// The traced graph is malformed: a defect of the tracer, never of the checkpoint.
+    #[error("the traced graph is malformed: {0}")]
+    Malformed(Box<poot_graph_ir::EditError>),
+}
+
+impl From<poot_graph_ir::EditError> for TraceError {
+    fn from(error: poot_graph_ir::EditError) -> Self {
+        TraceError::Malformed(Box::new(error))
+    }
 }

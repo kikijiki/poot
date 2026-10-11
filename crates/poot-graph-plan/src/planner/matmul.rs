@@ -160,8 +160,8 @@ pub(super) fn matmul_route(
 /// the epilogue fuse rule forms a [`OpKind::ContractionEpilogue`] only over such a head, so no head loses a faster schedule (a tensor-core,
 /// tiled or decode-GEMV `MatMul`) to gain a fused store. The generated Gemv, serial and tiled bodies carry an
 /// epilogue; a `MatMul` head's fragment, GEMV and imported schedules do not.
-pub(crate) fn epilogue_head_lowers<V: ValidationChannel>(
-    g: &Graph<V>,
+pub(crate) fn epilogue_head_lowers(
+    g: &Graph,
     eqn: &Eqn,
     backend: Backend,
     caps: &DeviceCaps,

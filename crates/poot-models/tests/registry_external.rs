@@ -5,7 +5,7 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
-use poot_graph_ir::{Builder, Graph, TensorType, ValidationOutputs};
+use poot_graph_ir::{Builder, Graph, TensorType};
 use poot_models::chat::ChatFormat;
 use poot_models::model::{
     ConfigReason, FamilyKey, KvLayout, LogitRows, Model, ModelConfig, ModelError, ModelOutput,
@@ -38,17 +38,13 @@ impl Model for FakeLm {
         &self.weights
     }
 
-    fn trace(
-        &self,
-        _phase: Phase,
-        _shape: StepShape,
-    ) -> Result<Graph<ValidationOutputs>, TraceError> {
+    fn trace(&self, _phase: Phase, _shape: StepShape) -> Result<Graph, TraceError> {
         let b = Builder::new();
         let embed = b.constant(
             &WeightId::model(WeightRole::Embed).const_name(),
             TensorType::f32(vec![self.config.vocab, self.width]),
         );
-        Ok(b.finish(embed).with_validations(Vec::new()))
+        Ok(b.finish(embed).unwrap())
     }
 }
 
@@ -169,9 +165,9 @@ fn an_externally_registered_family_resolves_by_model_type_and_builds() {
 
     let graph = model.trace(Phase::Decode, decode_shape()).unwrap();
     let names: Vec<&str> = graph
-        .consts
+        .consts()
         .iter()
-        .filter_map(|&id| graph.values[id].name.as_deref())
+        .filter_map(|&id| graph.values()[id].name.as_deref())
         .collect();
     assert_eq!(names, ["w.embed"]);
 }

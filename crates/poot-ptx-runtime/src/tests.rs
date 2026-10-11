@@ -1220,7 +1220,7 @@ fn lifecycle_kernel() -> poot_runtime_common::CompiledKernel {
     // output pointer/length pair, matching this schema; it never traps.
     unsafe {
         poot_runtime_common::CompiledKernel::new(
-            poot_target::Backend::Nvptx,
+            poot_target::TargetId::Gpu(poot_target::Backend::Nvptx),
             "card305_add_one",
             poot_runtime_common::KernelCode::Ptx(LIFECYCLE_PTX.into()),
             vec![

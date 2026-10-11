@@ -18,13 +18,13 @@ use poot_graph_plan::fold_iota;
 fn bound_range_graph() -> poot_graph_ir::Graph {
     let b = Builder::new();
     let out = b.cast(b.constant("range", TensorType::f32(vec![6])), DType::F32);
-    b.finish(out)
+    b.finish(out).unwrap()
 }
 
 fn computed_iota_graph() -> poot_graph_ir::Graph {
     let b = Builder::new();
     let out = b.iota(6);
-    b.finish(out)
+    b.finish(out).unwrap()
 }
 
 #[test]
@@ -32,7 +32,7 @@ fn iota_matches_the_bound_range_oracle_and_folds_to_the_same_values() {
     let bound = bound_range_graph();
     let mut bound_inputs = HashMap::new();
     bound_inputs.insert(
-        bound.inputs[0],
+        bound.inputs()[0],
         Value::from(HostTensor::f32(vec![6], (0..6).map(|i| i as f32).collect())),
     );
     let expected = eval(
@@ -62,16 +62,16 @@ fn iota_matches_the_bound_range_oracle_and_folds_to_the_same_values() {
     );
     assert_eq!(expected.as_f32().unwrap(), &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
 
-    let folded = fold_iota(&computed);
+    let folded = fold_iota(&computed).unwrap();
     assert!(
         folded
-            .eqns
+            .eqns()
             .iter()
             .all(|eqn| !matches!(eqn.op, OpKind::Iota { .. })),
         "fold_iota must remove every Iota equation"
     );
     let folded_value = folded
-        .inputs
+        .inputs()
         .iter()
         .copied()
         .find(|&id| matches!(folded.meta(id).storage, Storage::Computed(_)))
@@ -100,7 +100,7 @@ fn iota_matches_the_bound_range_oracle_and_folds_to_the_same_values() {
 fn the_i32_iota_is_exact_through_the_oracle_and_the_folded_constant() {
     let b = Builder::new();
     let out = b.iota_i32(6);
-    let graph = b.finish(out);
+    let graph = b.finish(out).unwrap();
     let run = |g: &poot_graph_ir::Graph| {
         eval(g, &HashMap::new(), EvalOptions::new(EvalBudget::UNBOUNDED))
             .expect("oracle eval")
@@ -111,7 +111,7 @@ fn the_i32_iota_is_exact_through_the_oracle_and_the_folded_constant() {
     let direct = run(&graph);
     assert_eq!(direct.dtype(), DType::I32);
     assert_eq!(direct.as_i32().unwrap(), &[0, 1, 2, 3, 4, 5]);
-    let folded = run(&fold_iota(&graph));
+    let folded = run(&fold_iota(&graph).unwrap());
     assert_eq!(folded.dtype(), DType::I32);
     assert_eq!(folded.as_i32().unwrap(), direct.as_i32().unwrap());
 

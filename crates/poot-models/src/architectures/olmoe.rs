@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
-use poot_graph_ir::{Builder, Graph, ValidationOutputs};
+use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{ExpertProj, WeightMap, WeightStore};
 
 use crate::chat::ChatFormat;
@@ -242,11 +242,7 @@ impl Model for Olmoe {
         &self.weights
     }
 
-    fn trace(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-    ) -> Result<Graph<ValidationOutputs>, TraceError> {
+    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(FAMILY, phase, shape, p.max_positions)?;
         moe::check_step(FAMILY, shape, &p.moe)?;
@@ -263,7 +259,7 @@ impl Model for Olmoe {
                 |b, BlockInput { block: h, .. }| moe::moe(b, &step, l, h, None, &layer.moe, &p.moe),
             )
         });
-        Ok(step.finish(b, logits))
+        Ok(step.finish(b, logits)?)
     }
 }
 
@@ -368,12 +364,12 @@ pub(crate) mod moe_support {
             let bound =
                 bind_packed_weights(&g, &WeightFormats::from_weight_map(model.weights())).unwrap();
             let dequants = bound
-                .eqns
+                .eqns()
                 .iter()
                 .filter(|e| matches!(e.op, OpKind::PackedDequant { .. }))
                 .count();
             let indexed = bound
-                .eqns
+                .eqns()
                 .iter()
                 .filter(|e| {
                     matches!(
@@ -657,13 +653,12 @@ mod family_tests {
             Backend::Nvptx,
             Backend::AmdGcn(AmdArch::gfx1151()),
         ] {
-            let target = Target {
+            let target = Target::Gpu {
                 backend,
                 caps: match backend {
                     Backend::SpirvVulkan => DeviceCaps::wgpu_rdna3_igpu(),
                     Backend::Nvptx => DeviceCaps::ptx_default(),
                     Backend::AmdGcn(_) => DeviceCaps::rocm_default(),
-                    Backend::Aie(_) => unreachable!("an AIE target has no GPU DeviceCaps"),
                 },
             };
             let options = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);

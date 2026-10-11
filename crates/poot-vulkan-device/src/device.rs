@@ -18,14 +18,15 @@
 //! `copy` is `vkCmdCopyBuffer` in the same command stream, ordered by the barrier every command carries.
 
 use poot_executor::{
-    Arg, BufferRole, Device, DeviceTime, Dispatch, DispatchDeviceTime, MeasuredDeviceTime,
-    MemoryCounterSnapshot,
+    Arg, BufferRole, Device, DeviceTime, Dispatch, DispatchDeviceTime, LaunchKind,
+    MeasuredDeviceTime, MemoryCounterSnapshot,
 };
 use poot_graph_plan::{Submission, Target};
 use poot_runtime_common::CompiledKernel;
-use poot_target::{Backend, BufferStorage};
+use poot_target::{Backend, BufferStorage, TargetId};
 use poot_vulkan_runtime::{
-    Binding, Context, DeviceBuffer, GraphTiming, KernelFault, Pipeline, RecordingGraph, VulkanGraph,
+    Binding, Context, DeviceBuffer, GraphTiming, KernelFault, Pipeline, RecordingGraph,
+    RuntimeError, VulkanGraph,
 };
 use std::sync::Arc;
 
@@ -114,7 +115,7 @@ impl Device for VulkanDevice {
     type Error = VulkanGpuError;
 
     fn target(&self) -> Target {
-        Target {
+        Target::Gpu {
             backend: Backend::SpirvVulkan,
             caps: self.ctx.device_caps(),
         }
@@ -163,6 +164,16 @@ impl Device for VulkanDevice {
     }
 
     fn dispatch(&mut self, d: Dispatch<'_, Self>) -> Result<(), VulkanGpuError> {
+        // A thread-grid device: an AIE invocation has no grid to run, and its kernel was never loadable here.
+        let (threads, workgroup) = match d.launch {
+            LaunchKind::Grid { threads, workgroup } => (threads, workgroup),
+            LaunchKind::Aie(invocation) => {
+                return Err(RuntimeError::WrongKernelTarget {
+                    actual: TargetId::Aie(invocation.target()),
+                }
+                .into());
+            }
+        };
         self.make_room(d.work)?;
         // Each argument's own element count from the plan, never the bound buffer's capacity (an arena
         // slot's buffer is sized to its largest occupant; Card 547b). The output is last.
@@ -180,8 +191,8 @@ impl Device for VulkanDevice {
             &mut step.graph,
             &d.kernel.key,
             &d.kernel.pipeline,
-            d.workgroup,
-            d.threads,
+            workgroup,
+            threads,
             &args,
         )?;
         step.commands_since_cut += 1;

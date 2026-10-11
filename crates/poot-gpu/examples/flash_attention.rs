@@ -40,7 +40,7 @@ fn main() {
     let v = b.constant("v", TensorType::f32(vec![1, hkv, cap, d]));
     let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
     let y = poot_graph_ir::ops::attention_masked(&b, q, k, v, n_rep, scale, mask);
-    let g = b.finish(y);
+    let g = b.finish(y).unwrap();
 
     let device = match WgpuDevice::new() {
         Ok(d) => d,

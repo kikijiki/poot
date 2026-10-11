@@ -2,7 +2,7 @@
 //! moved to `poot-target` (card 522 review): callers import it from there directly.
 //! Re-exported at the crate root.
 
-use poot_graph_ir::{GraphValidationError, ValidationId, ValueId, ValueTable};
+use poot_graph_ir::{ValidationId, ValueId, ValueTable};
 use poot_tensor::DType;
 
 use crate::{DeviceWitnessRejection, KernelChoice, Refusal, StorageGap};
@@ -10,8 +10,6 @@ use poot_kernel_ir::Body;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PlanError {
-    #[error("invalid graph: {0}")]
-    InvalidGraph(#[from] GraphValidationError),
     /// The planner built dispatches whose bindings are not a valid [`DispatchPlan`].
     #[error("invalid dispatch plan: {0}")]
     InvalidDispatchPlan(#[from] DispatchPlanError),
@@ -138,8 +136,8 @@ impl Dispatch {
         self.key.push_str(suffix);
     }
 
-    /// This dispatch under another binding, for [`Program::rebind_dispatches`].
-    #[cfg(feature = "test-support")]
+    /// This dispatch under another binding: a planner stage that reads or writes a scratch, and
+    /// [`Program::rebind_dispatches`].
     pub(crate) fn with_binding(self, binding: Binding) -> Self {
         Self { binding, ..self }
     }
@@ -157,7 +155,7 @@ impl Dispatch {
 
 /// A plan-local scratch buffer: an intermediate that lives for one equation. The id indexes the scratch
 /// buffers its [`DispatchPlan`] declares.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct ScratchId(u32);
 
 impl ScratchId {
@@ -167,6 +165,39 @@ impl ScratchId {
 
     pub fn index(self) -> u32 {
         self.0
+    }
+}
+
+/// What a [`DispatchPlan`] declares of one scratch buffer: the storage its elements have and how many
+/// device elements it holds. Contents are undefined when the equation starts (arena slots are not zeroed
+/// between occupants), so the plan writes a scratch before any read of it ([`DispatchPlan::new`]).
+///
+/// A scratch buffer is never an export and lives for exactly its equation: the buffer plan colors it with
+/// birth and death at that equation's index (POOT-ADR-0115, `BufferKey::Scratch`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ScratchDecl {
+    storage: poot_target::BufferStorage,
+    elems: usize,
+}
+
+impl ScratchDecl {
+    /// A scratch of `elems` native device elements of `storage`.
+    pub fn new(storage: poot_target::BufferStorage, elems: usize) -> Self {
+        Self { storage, elems }
+    }
+
+    pub fn storage(&self) -> poot_target::BufferStorage {
+        self.storage
+    }
+
+    /// The native device-element count (the unit `Device::allocate` takes), not a logical `numel`.
+    pub fn elems(&self) -> usize {
+        self.elems
+    }
+
+    /// The buffer's size in bytes.
+    pub fn bytes(&self) -> u64 {
+        self.elems as u64 * self.storage.element().byte_width() as u64
     }
 }
 
@@ -228,6 +259,12 @@ pub enum DispatchPlanError {
         bound: usize,
         params: usize,
     },
+    #[error(
+        "scratch {scratch:?} is declared in a raw-byte lane, which the executors cannot allocate as an intermediate"
+    )]
+    ScratchRawBytes { scratch: ScratchId },
+    #[error("scratch {scratch:?} declares no elements")]
+    ScratchEmpty { scratch: ScratchId },
     #[error("dispatch {dispatch} binds scratch {scratch:?}, but the plan declares {declared}")]
     ScratchOutOfRange {
         dispatch: usize,
@@ -272,16 +309,28 @@ pub enum DispatchPlanError {
 #[derive(Clone, Debug)]
 pub struct DispatchPlan {
     dispatches: Vec<Dispatch>,
-    scratch: usize,
+    scratch: Vec<ScratchDecl>,
 }
 
 impl DispatchPlan {
-    /// Validate `dispatches`, which bind among `scratch` scratch buffers.
-    pub fn new(dispatches: Vec<Dispatch>, scratch: usize) -> Result<Self, DispatchPlanError> {
+    /// Validate `dispatches`, which bind among the declared `scratch` buffers.
+    pub fn new(
+        dispatches: Vec<Dispatch>,
+        scratch: Vec<ScratchDecl>,
+    ) -> Result<Self, DispatchPlanError> {
         if dispatches.is_empty() {
             return Err(DispatchPlanError::Empty);
         }
-        let mut written = vec![false; scratch];
+        for (index, decl) in scratch.iter().enumerate() {
+            let id = ScratchId::new(index as u32);
+            if decl.elems == 0 {
+                return Err(DispatchPlanError::ScratchEmpty { scratch: id });
+            }
+            if decl.storage.element() == poot_target::ElementKind::RawBytes {
+                return Err(DispatchPlanError::ScratchRawBytes { scratch: id });
+            }
+        }
+        let mut written = vec![false; scratch.len()];
         let mut out_written = false;
         for (index, dispatch) in dispatches.iter().enumerate() {
             let Binding { reads, write } = &dispatch.binding;
@@ -302,11 +351,11 @@ impl DispatchPlan {
                 )
             };
             let scratch_slot = |id: ScratchId| {
-                if id.index() as usize >= scratch {
+                if id.index() as usize >= scratch.len() {
                     Err(DispatchPlanError::ScratchOutOfRange {
                         dispatch: index,
                         scratch: id,
-                        declared: scratch,
+                        declared: scratch.len(),
                     })
                 } else {
                     Ok(id.index() as usize)
@@ -322,7 +371,7 @@ impl DispatchPlan {
                 }
                 match *source {
                     Source::Operand(operand) => {
-                        if scratch > 0 && out_written {
+                        if !scratch.is_empty() && out_written {
                             return Err(DispatchPlanError::OperandReadAfterOutWrite {
                                 dispatch: index,
                                 operand,
@@ -379,9 +428,9 @@ impl DispatchPlan {
         self.dispatches
     }
 
-    /// How many scratch buffers the plan declares.
-    pub fn scratch(&self) -> usize {
-        self.scratch
+    /// The scratch buffers the plan declares, indexed by [`ScratchId`].
+    pub fn scratch(&self) -> &[ScratchDecl] {
+        &self.scratch
     }
 
     /// The one dispatch of a plan that launches exactly one kernel.
@@ -703,8 +752,13 @@ mod tests {
 
     const SCRATCH: ScratchId = ScratchId(0);
 
+    /// `n` one-element f32 scratch declarations.
+    fn decls(n: usize) -> Vec<ScratchDecl> {
+        vec![ScratchDecl::new(poot_target::BufferStorage::f32(), 1); n]
+    }
+
     fn error_of(dispatches: Vec<Dispatch>, scratch: usize) -> DispatchPlanError {
-        DispatchPlan::new(dispatches, scratch).expect_err("the plan must be refused")
+        DispatchPlan::new(dispatches, decls(scratch)).expect_err("the plan must be refused")
     }
 
     #[test]
@@ -715,7 +769,8 @@ mod tests {
     #[test]
     fn split_plans_and_a_scratch_pipeline_are_accepted() {
         let eqn = || dispatch([Source::Operand(0), Source::Operand(1)], Sink::Out);
-        let plan = DispatchPlan::new(vec![eqn(), eqn()], 0).expect("two disjoint-range dispatches");
+        let plan = DispatchPlan::new(vec![eqn(), eqn()], Vec::new())
+            .expect("two disjoint-range dispatches");
         assert_eq!(plan.len(), 2);
         // Stage one writes the scratch from the operands; stage two reads it and writes the output.
         let plan = DispatchPlan::new(
@@ -726,10 +781,31 @@ mod tests {
                 ),
                 dispatch([Source::Scratch(SCRATCH), Source::Operand(0)], Sink::Out),
             ],
-            1,
+            decls(1),
         )
         .expect("a scratch written before it is read");
-        assert_eq!(plan.scratch(), 1);
+        assert_eq!(plan.scratch(), decls(1).as_slice());
+    }
+
+    /// A scratch of no elements or in a raw-byte lane is not a buffer an executor can hand a kernel.
+    #[test]
+    fn an_empty_or_raw_byte_scratch_is_refused() {
+        let writes = || {
+            vec![dispatch(
+                [Source::Operand(0), Source::Operand(1)],
+                Sink::Out,
+            )]
+        };
+        let empty = ScratchDecl::new(poot_target::BufferStorage::f32(), 0);
+        assert_eq!(
+            DispatchPlan::new(writes(), vec![empty]).expect_err("an empty scratch"),
+            DispatchPlanError::ScratchEmpty { scratch: SCRATCH }
+        );
+        let raw = ScratchDecl::new(poot_target::BufferStorage::raw_bytes(), 4);
+        assert_eq!(
+            DispatchPlan::new(writes(), vec![raw]).expect_err("a raw-byte scratch"),
+            DispatchPlanError::ScratchRawBytes { scratch: SCRATCH }
+        );
     }
 
     #[test]
@@ -861,7 +937,7 @@ mod tests {
                 operand: 0,
             }
         );
-        DispatchPlan::new(vec![write_out(), write_out()], 0)
+        DispatchPlan::new(vec![write_out(), write_out()], Vec::new())
             .expect("disjoint-range splits read their operands after the first output write");
     }
 

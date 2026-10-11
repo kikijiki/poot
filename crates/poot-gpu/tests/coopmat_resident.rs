@@ -23,13 +23,13 @@ use poot_graph_ir::builder::Builder;
 use poot_graph_ir::op::OpKind;
 use poot_graph_ir::types::TensorType;
 
-/// `a`/`w` are declared F16: honest F16 words, the same narrowing `poot_load::gguf::f32_to_f16` already
+/// `a`/`w` are declared F16: honest F16 words, the same narrowing `poot_quant::scalar::f32_to_f16` already
 /// does for the CPU oracle below.
 fn f16_tensor(shape: Vec<usize>, data: &[f32]) -> HostTensor {
     HostTensor::f16(
         shape,
         data.iter()
-            .map(|&x| poot_load::gguf::f32_to_f16(x))
+            .map(|&x| poot_quant::scalar::f32_to_f16(x))
             .collect(),
     )
 }
@@ -56,19 +56,20 @@ fn f16_in_f32_out_matmul_graph(
     let w = bld.constant("w", TensorType::new(vec![k, n], DType::F16));
     let mm = bld.matmul(a, w);
     let (ai, wi) = (a.id(), w.id());
-    let mut g = bld.finish(mm);
+    let g = bld.finish(mm).unwrap();
     let out = g
-        .eqns
+        .eqns()
         .iter()
         .find(|e| matches!(e.op, OpKind::MatMul))
         .expect("a matmul eqn")
         .out;
     assert_eq!(
-        g.values[out].aval.dtype,
+        g.values()[out].aval.dtype,
         DType::F16,
         "sanity: Builder::matmul must still infer F16 (operand A's dtype) before the retag"
     );
-    g.values[out].aval.dtype = DType::F32;
+    let retagged = TensorType::new(g.aval(out).shape.clone(), DType::F32);
+    let g = poot_test_util::graph_fixtures::with_declared_type(&g, out, retagged).unwrap();
     (g, ai, wi)
 }
 
@@ -114,7 +115,7 @@ fn coopmat_matmul_resident_matches_cpu_on_radv() {
     };
 
     // CPU oracle: round A/W to f16 (the coopmat load narrows), f32-accumulate.
-    let round = |x: f32| poot_quant::scalar::f16_to_f32(poot_load::gguf::f32_to_f16(x));
+    let round = |x: f32| poot_quant::scalar::f16_to_f32(poot_quant::scalar::f32_to_f16(x));
     let ra: Vec<f32> = a_data.iter().map(|&x| round(x)).collect();
     let rw: Vec<f32> = w_data.iter().map(|&x| round(x)).collect();
     let mut max_abs = 0.0f32;
@@ -153,9 +154,9 @@ fn coopmat_matmul_resident_graph_selects_coopmat_arm() {
     use poot_target::Backend;
 
     let (g, _ai, _wi) = f16_in_f32_out_matmul_graph(32, 16, 32);
-    let g = cse(&g);
+    let g = cse(&g).unwrap();
     let eqn = g
-        .eqns
+        .eqns()
         .iter()
         .find(|e| matches!(e.op, OpKind::MatMul))
         .expect("a matmul eqn");
@@ -195,9 +196,11 @@ fn plan_eqn_with_choice(
     poot_graph_plan::plan_eqn_choice(
         g,
         eqn,
-        backend,
+        &poot_graph_plan::Target::Gpu {
+            backend,
+            caps: *caps,
+        },
         &std::collections::HashMap::new(),
-        caps,
         &poot_test_util::graph_fixtures::roomy_body_limits(),
     )
     .map(|planned| (planned.plan, planned.choice))

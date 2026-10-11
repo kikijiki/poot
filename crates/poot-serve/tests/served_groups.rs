@@ -636,7 +636,13 @@ fn served_sampled_request_returns_the_samplers_tokens_ptx() {
 /// Mutations: accept every draft in the driver's verification (the tokens diverge from `Off`); record
 /// `tokens.len()` instead of the driver's accepted count in the loop (the sum goes red).
 fn served_speculative(choice: BackendChoice, backend: DeviceBackend, flag: &str, draft: Draft) {
-    let dir = write_checkpoint("qwen2");
+    // The MTP policy needs a family with an MTP program: the GLM-5.3-Flash fixture, which is also
+    // recurrent, so its rejecting rounds restore and replay under the server's own loop.
+    let family = match draft {
+        Draft::Mtp => "glm53_flash",
+        Draft::Lookup | Draft::Model => "qwen2",
+    };
+    let dir = write_checkpoint(family);
     let Some(off) = reference(
         choice,
         backend,
@@ -652,6 +658,7 @@ fn served_speculative(choice: BackendChoice, backend: DeviceBackend, flag: &str,
     let draft_dir;
     match draft {
         Draft::Lookup => args.extend(["--draft-lookup".to_string(), "2:4".to_string()]),
+        Draft::Mtp => args.extend(["--draft-mtp".to_string(), "3".to_string()]),
         Draft::Model => {
             draft_dir = write_checkpoint("qwen3");
             args.extend([
@@ -696,6 +703,12 @@ fn served_speculative(choice: BackendChoice, backend: DeviceBackend, flag: &str,
             accepted < proposed,
             "{draft:?}: a wrong draft was never rejected: {metrics}"
         ),
+        // The fixture's random MTP layer mostly misses, so the target rejects and the recurrent
+        // rollback runs inside the served loop.
+        Draft::Mtp => assert!(
+            proposed > 0 && accepted < proposed,
+            "{draft:?}: no draft was proposed, or none was rejected: {metrics}"
+        ),
     }
     assert_eq!(
         1 + rounds + accepted + skipped,
@@ -708,6 +721,7 @@ fn served_speculative(choice: BackendChoice, backend: DeviceBackend, flag: &str,
 enum Draft {
     Lookup,
     Model,
+    Mtp,
 }
 
 macro_rules! speculative_rows {
@@ -729,6 +743,44 @@ macro_rules! speculative_rows {
 speculative_rows! {
     Draft::Lookup => served_lookup_speculation_returns_the_off_tokens_wgpu, served_lookup_speculation_returns_the_off_tokens_rocm;
     Draft::Model => served_draft_model_speculation_returns_the_off_tokens_wgpu, served_draft_model_speculation_returns_the_off_tokens_rocm;
+    Draft::Mtp => served_mtp_speculation_returns_the_off_tokens_wgpu, served_mtp_speculation_returns_the_off_tokens_rocm;
+}
+
+/// `--draft-mtp` on a family with no MTP program stops startup with the family's typed phase refusal,
+/// before the listener binds. Mutation: build `DraftPolicy::Off` for the flag in `draft_policy`; the
+/// server starts and serves, and the row goes red.
+fn a_model_without_an_mtp_layer_refuses_draft_mtp_startup(
+    choice: BackendChoice,
+    backend: DeviceBackend,
+    flag: &str,
+) {
+    if poot_test_util::device_skip::open_or_skip(backend, open_executor(choice)).is_none() {
+        return;
+    }
+    let dir = write_checkpoint("qwen2");
+    let stderr = refused(&dir, flag, &["--draft-mtp".to_string(), "2".to_string()]);
+    assert!(
+        stderr.contains("Mtp") || stderr.to_lowercase().contains("mtp"),
+        "the refusal does not name the MTP phase: {stderr}"
+    );
+}
+
+#[test]
+fn a_model_without_an_mtp_layer_refuses_draft_mtp_startup_wgpu() {
+    a_model_without_an_mtp_layer_refuses_draft_mtp_startup(
+        BackendChoice::Wgpu,
+        DeviceBackend::Wgpu,
+        "wgpu",
+    );
+}
+
+#[test]
+fn a_model_without_an_mtp_layer_refuses_draft_mtp_startup_rocm() {
+    a_model_without_an_mtp_layer_refuses_draft_mtp_startup(
+        BackendChoice::Rocm,
+        DeviceBackend::Rocm,
+        "rocm",
+    );
 }
 
 /// A `--draft-model` path that holds no checkpoint stops startup with the load error, before the engine

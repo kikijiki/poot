@@ -101,7 +101,7 @@ mod tests {
             let b = Builder::new();
             let xs = b.constant("x", TensorType::f32(vec![t, w]));
             let y = norm(&b, xs, &weight, NormParams::new(eps).unwrap());
-            fx.eval(&b.finish(y), &[("x", &x)], &[], &[]).0
+            fx.eval(&b.finish(y).unwrap(), &[("x", &x)], &[], &[]).0
         };
         let got = run(&fx);
         let scale = fx.values(id);
@@ -136,7 +136,7 @@ mod tests {
             let b = Builder::new();
             let xs = b.constant("x", TensorType::f32(vec![t, w]));
             let y = norm(&b, xs, &weight, NormParams::of(kind, eps).unwrap());
-            fx.eval(&b.finish(y), &[("x", &x)], &[], &[]).0
+            fx.eval(&b.finish(y).unwrap(), &[("x", &x)], &[], &[]).0
         };
         let got = run(&fx, NormKind::Layer);
         let scale = fx.values(id);
@@ -177,7 +177,7 @@ mod tests {
             let b = Builder::new();
             let xs = b.constant("x", TensorType::f32(vec![t, w]));
             let y = norm(&b, xs, &weight, NormParams::of(kind, eps).unwrap());
-            fx.eval(&b.finish(y), &[("x", &x)], &[], &[]).0
+            fx.eval(&b.finish(y).unwrap(), &[("x", &x)], &[], &[]).0
         };
         let got = run(&fx, NormKind::RmsPlusOne);
         let scale = fx.values(id);

@@ -345,7 +345,7 @@ impl Driver {
             .map_err(Unsupported::Trace)?;
         let graph = reorder::reorder_graph(&graph);
         let slots = Prepared::slots_of(&graph)?;
-        let output = graph.aval(graph.output).shape.clone();
+        let output = graph.aval(graph.result()).shape.clone();
         let program = self.compile(&graph, &self.options.decode.clone())?;
         let reservation = self.admit(&program)?;
         let entry = self.add_entry(self.exe, &program, reservation, slots, output)?;

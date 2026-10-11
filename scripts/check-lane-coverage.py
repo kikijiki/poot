@@ -9,7 +9,7 @@ classes every test that matches nothing:
   model-free, real-dims   run by the model-free lane (`just test`); not this gate's concern
   checkpoint              loads a model, so it runs in `just test-optional`; never a hardware test
   device                  dispatches on a device: it MUST match a lane selection
-  not in the inventory    a test of a package the model-free lane excludes (poot-gpu, poot-rocm-gpu,
+  not in the inventory    a test of a package the model-free lane excludes (poot-gpu, poot-rocm-gpu, poot-npu,
                           poot-vulkan-device, poot-bench-runner), or one that exists only under a feature
                           (poot-llm/rocm): it MUST match a lane selection
 

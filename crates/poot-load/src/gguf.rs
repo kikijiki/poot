@@ -8,10 +8,8 @@
 //! tensor data. A GGUF string is a `u64` length followed by that many UTF-8 bytes.
 
 mod format;
-mod quantization;
 
 pub use format::*;
-pub use quantization::*;
 
 use poot_tensor::DType;
 use std::num::NonZeroUsize;
@@ -184,7 +182,7 @@ mod tests {
 
     use crate::plan::default_workers;
     use poot_quant::format::Storage;
-    use poot_quant::scalar::{bf16_to_f32, e2m1_to_f32, e8m0_to_f32, f16_to_f32};
+    use poot_quant::scalar::{bf16_to_f32, f16_to_f32, f32_to_f16};
     use poot_quant::weights::WeightEntry;
 
     // ggml tensor type ids the fixtures below write.
@@ -255,6 +253,18 @@ mod tests {
         dequant(WeightFormat::Mxfp4, raw, numel)
     }
 
+    /// Test-only now: production GGUF reads bound-check through `poot_quant`'s block decoder, not this
+    /// helper. Kept for the test-oracle `dequant` (in `gguf.rs`) and its own truncation-guard test below.
+    fn bytes_ok(raw: &[u8], need: usize) -> Result<(), LoadError> {
+        if raw.len() < need {
+            return Err(LoadError::GgufTensorTruncated {
+                need,
+                have: raw.len(),
+            });
+        }
+        Ok(())
+    }
+
     /// Test fixture: a whole (small) GGUF in memory, its index plus its bytes, decoding a named
     /// tensor through [`read_gguf`] and the oracle above. The production loader maps the file and
     /// slices it through [`read_gguf`].
@@ -320,29 +330,16 @@ mod tests {
         }
     }
 
-    fn q8_0_roundtrip_block(vals: &[f32; 32]) -> ([u8; 34], f32) {
-        // Encode a Q8_0 block as ggml does: d = max|x|/127, q = round(x/d).
-        let amax = vals.iter().cloned().fold(0.0f32, |a, b| a.max(b.abs()));
-        let d = amax / 127.0;
-        let mut buf = [0u8; 34];
-        // Store d as a real f16.
-        let h = f32_to_f16(d);
-        buf[0..2].copy_from_slice(&h.to_le_bytes());
-        for i in 0..32 {
-            let q = if d != 0.0 {
-                (vals[i] / d).round().clamp(-127.0, 127.0) as i8
-            } else {
-                0
-            };
-            buf[2 + i] = q as u8;
-        }
-        (buf, d)
+    /// One Q8_0 block of `vals`, from the reference encoder.
+    fn q8_0_block(vals: &[f32; 32]) -> Vec<u8> {
+        let payload = poot_quant::encode(WeightFormat::Q8_0, 1, 32, vals).unwrap();
+        payload.bytes(SourceRole::Blocks).to_vec()
     }
 
     #[test]
     fn q8_0_dequant_matches_block_encoding() {
         let vals: [f32; 32] = std::array::from_fn(|i| (i as f32 - 16.0) * 0.1);
-        let (buf, _d) = q8_0_roundtrip_block(&vals);
+        let buf = q8_0_block(&vals);
         let got = dequant_q8_0(&buf, 32).unwrap();
         // Dequant recovers the values within the Q8_0 step (d ~= amax/127).
         for (g, w) in got.iter().zip(vals.iter()) {
@@ -350,64 +347,23 @@ mod tests {
         }
     }
 
+    /// Mutant M5 (mutants-m4.md): `bytes_ok -> Ok(())` lets a tensor one byte short of its blocks
+    /// reach a `raw[..need]` slice and panic. `bytes_ok` must refuse it with the typed
+    /// `GgufTensorTruncated` error (card 545a: no longer a `SafeTensors(String)`), and accept a
+    /// buffer of exactly (or more than) the needed length.
     #[test]
-    fn encode_q8_0_round_trips_through_dequant() {
-        // Fixture encoder: encode 96 elements (3 blocks), dequant, and check within the Q8_0 step.
-        let vals: Vec<f32> = (0..96).map(|i| (i as f32 - 48.0) * 0.05).collect();
-        let raw = encode_q8_0(&vals);
-        assert_eq!(raw.len(), 3 * 34);
-        let got = dequant_q8_0(&raw, 96).unwrap();
-        for (g, w) in got.iter().zip(&vals) {
-            assert!((g - w).abs() <= 0.02, "{g} vs {w}");
-        }
-    }
-
-    #[test]
-    fn encode_q5_0_round_trips_through_dequant() {
-        // Card 179 fixture encoder: encode 96 elements (3 blocks spanning several sign/scale
-        // ranges), dequant, and check within the Q5_0 step (per block d = amax/16). The element at
-        // amax hits the encoder's clamp (x/d = 16 rounds to code 32, clamped to 31, the same quirk
-        // as `encode_q4_0`), so worst-case error is a full step `d`; amax is up to ~2.4, so <= ~0.15.
-        let vals: Vec<f32> = (0..96).map(|i| (i as f32 - 48.0) * 0.05).collect();
-        let raw = encode_q5_0(&vals);
-        assert_eq!(raw.len(), 3 * 22);
-        let got = dequant_q5_0(&raw, 96).unwrap();
-        for (g, w) in got.iter().zip(&vals) {
-            assert!((g - w).abs() <= 0.16, "{g} vs {w}");
-        }
-        assert_block_scales(&raw, 22, &vals, 16.0);
-    }
-
-    #[test]
-    fn encode_q4_0_round_trips_through_dequant() {
-        // Same shape as the Q5_0 case: per block d = amax/8, and the element at amax hits the clamp
-        // (x/d = 8 rounds to code 16, clamped to 15), so the worst-case error is a full step `d`.
-        let vals: Vec<f32> = (0..96).map(|i| (i as f32 - 48.0) * 0.05).collect();
-        let raw = encode_q4_0(&vals);
-        assert_eq!(raw.len(), 3 * 18);
-        let got = dequant_q4_0(&raw, 96).unwrap();
-        for (g, w) in got.iter().zip(&vals) {
-            assert!((g - w).abs() <= 0.31, "{g} vs {w}");
-        }
-        assert_block_scales(&raw, 18, &vals, 8.0);
-    }
-
-    /// Every block's leading f16 scale must be `amax / divisor` of that block's source values, computed
-    /// here independently of the encoder. The dequant round trip alone cannot see a wrong scale: both
-    /// sides read the same bytes, and a coarser scale still lands inside the loose per-element bound.
-    fn assert_block_scales(raw: &[u8], block_bytes: usize, vals: &[f32], divisor: f32) {
-        for (blk, chunk) in vals.chunks(32).enumerate() {
-            let amax = chunk.iter().fold(0.0f32, |a, &x| a.max(x.abs()));
-            let d = f16_to_f32(u16::from_le_bytes([
-                raw[blk * block_bytes],
-                raw[blk * block_bytes + 1],
-            ]));
-            let want = amax / divisor;
-            assert!(
-                (d - want).abs() <= want * 1e-3,
-                "block {blk}: scale {d} vs amax/{divisor} = {want}"
-            );
-        }
+    fn truncated_tensor_data_is_a_typed_error() {
+        let need = 68;
+        assert!(bytes_ok(&vec![0u8; need], need).is_ok());
+        assert!(bytes_ok(&vec![0u8; need + 1], need).is_ok());
+        let result = bytes_ok(&vec![0u8; need - 1], need);
+        assert!(
+            matches!(
+                result,
+                Err(LoadError::GgufTensorTruncated { need: n, have }) if n == need && have == need - 1
+            ),
+            "{result:?}"
+        );
     }
 
     #[test]
@@ -650,54 +606,6 @@ mod tests {
         }
     }
 
-    /// `pack_mxfp4` must reproduce `dequant_mxfp4` bit-exactly once its packed nibbles/scales are
-    /// unpacked as the kernel/CPU oracle does (`w = e2m1(code) * e8m0(scales, k/32)`,
-    /// 8 codes per i32 word in natural element order), like every other packer here. Multi-row,
-    /// multi-block, varying exponents and codes.
-    #[test]
-    fn encode_mxfp4_round_trips_through_dequant() {
-        // On-grid signal: exact E2M1 multiples of one power of two, so quantization is lossless.
-        let on_grid: Vec<f32> = (0..64)
-            .map(|i| {
-                let e2m1 = [0.0f32, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
-                let v = e2m1[i % 8] * 2.0;
-                if i % 16 >= 8 { -v } else { v }
-            })
-            .collect();
-        let bytes = encode_mxfp4(&on_grid);
-        assert_eq!(bytes.len(), 2 * 17);
-        let back = dequant_mxfp4(&bytes, 64).unwrap();
-        for (i, (&a, &b)) in on_grid.iter().zip(back.iter()).enumerate() {
-            assert_eq!(a, b, "on-grid value {i} must round-trip exactly");
-        }
-        // Off-grid signal: every decoded value must be exactly representable (kvalue * scale)
-        // and within one grid step of the source.
-        let off_grid: Vec<f32> = (0..32).map(|i| (i as f32) * 0.037 - 0.4).collect();
-        let bytes = encode_mxfp4(&off_grid);
-        let back = dequant_mxfp4(&bytes, 32).unwrap();
-        let d = e8m0_to_f32(bytes[0]);
-        let grid: Vec<f32> = (0..16u8).map(|code| e2m1_to_f32(code) * d).collect();
-        for (i, &b) in back.iter().enumerate() {
-            assert!(
-                grid.contains(&b),
-                "decoded value {i} ({b}) must be on the MXFP4 grid for scale {d}"
-            );
-            // ...and the nearest grid point to the source (as ggml's `best_index_mxfp4`). A plain
-            // absolute tolerance would be wrong: the grid is non-uniform (kvalue gaps
-            // 1,1,1,2,2,4), so the worst-case step is 4*d.
-            let best = grid
-                .iter()
-                .copied()
-                .min_by(|x, y| (x - off_grid[i]).abs().total_cmp(&(y - off_grid[i]).abs()))
-                .unwrap();
-            assert_eq!(
-                b, best,
-                "decoded value {i} must be the nearest MXFP4 grid point to {}",
-                off_grid[i]
-            );
-        }
-    }
-
     #[test]
     fn q2_k_block_dequants_to_known_values() {
         // Q2_K layout: scales[16], qs[64], d f16, dmin f16 (84 bytes). x = d*(sc&0xF)*q - dmin*(sc>>4).
@@ -930,7 +838,7 @@ mod tests {
         let bf16_bytes: Vec<u8> = bf16_words.iter().flat_map(|x| x.to_le_bytes()).collect();
         let bf16_vals: Vec<f32> = bf16_words.iter().map(|&x| bf16_to_f32(x)).collect();
         let q8_vals: [f32; 32] = std::array::from_fn(|i| (i as f32 - 16.0) * 0.1);
-        let (q8_block, _) = q8_0_roundtrip_block(&q8_vals);
+        let q8_block = q8_0_block(&q8_vals);
 
         let kvs = vec![
             ("general.architecture", GgufValue::Str("test".into())),
@@ -945,7 +853,7 @@ mod tests {
         let tensors: Vec<(&str, Vec<u64>, u32, Vec<u8>)> = vec![
             ("a_f32", vec![4, 3, 2], GGML_F32, f32_bytes),
             ("b_f16", vec![8], GGML_F16, f16_bytes.clone()),
-            ("c_q8", vec![32, 1], GGML_Q8_0, q8_block.to_vec()),
+            ("c_q8", vec![32, 1], GGML_Q8_0, q8_block),
             ("d_bf16", vec![4], GGML_BF16, bf16_bytes.clone()),
         ];
         let g = WholeGguf::from_bytes(write_gguf(&kvs, &tensors)).expect("parse written gguf");
@@ -1476,7 +1384,7 @@ mod tests {
     #[test]
     fn a_truncated_gguf_is_a_typed_error() {
         let q8: [f32; 32] = std::array::from_fn(|i| i as f32 * 0.25);
-        let (block, _) = q8_0_roundtrip_block(&q8);
+        let block = q8_0_block(&q8);
         let bytes = write_gguf(
             &[
                 ("general.architecture", GgufValue::Str("test".into())),
@@ -1486,7 +1394,7 @@ mod tests {
                     GgufValue::Array(vec![GgufValue::Str("x".into()); 4]),
                 ),
             ],
-            &[("w", vec![32, 1], GGML_Q8_0, block.to_vec())],
+            &[("w", vec![32, 1], GGML_Q8_0, block)],
         );
         let parse = |bytes: &[u8]| GgufIndex::parse(&StoredBytes::from(bytes.to_vec()));
         let header_end = parse(&bytes).unwrap().data_start();

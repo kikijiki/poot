@@ -17,8 +17,8 @@ pollster.workspace = true
 bytemuck.workspace = true
 # wgpu-hal + ash (pinned to wgpu's versions): used only to query device VRAM through the Vulkan
 # runtime (VK_EXT_memory_budget) for the GPU-memory metric (no sysfs/CLI).
-wgpu-hal = { version = "29.0.3", features = ["vulkan"] }
-ash = "0.38"
+wgpu-hal.workspace = true
+ash.workspace = true
 
 [dev-dependencies]
 poot-codegen.workspace = true

@@ -209,6 +209,56 @@ impl DenseWeight {
     }
 }
 
+/// A dense tensor's stored dtype has no f32 decode (an integer or boolean tensor, or f64).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UndecodableDtype {
+    pub dtype: poot_tensor::DType,
+}
+
+impl fmt::Display for UndecodableDtype {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "stored dtype {:?} has no f32 decode", self.dtype)
+    }
+}
+
+impl std::error::Error for UndecodableDtype {}
+
+impl DenseWeight {
+    /// This tensor's stored bytes widened to row-major f32 (the CPU oracle's payload): F32, BF16, F16,
+    /// the unscaled E4M3FN codes and E8M0 scale bytes decode through [`crate::scalar`]; any other stored
+    /// dtype is a typed error. A quantized linear's codes and scale are packed together as a
+    /// [`PackedPayload`] and decoded by the format descriptor, never here.
+    pub fn decode_f32(&self) -> Result<Vec<f32>, UndecodableDtype> {
+        use crate::scalar;
+        use poot_tensor::DType;
+
+        let raw = self.bytes.as_slice();
+        match self.dtype {
+            DType::F32 => Ok(raw
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|word| f32::from_le_bytes(*word))
+                .collect()),
+            DType::BF16 => Ok(raw
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|word| scalar::bf16_to_f32(u16::from_le_bytes(*word)))
+                .collect()),
+            DType::F16 => Ok(raw
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|word| scalar::f16_to_f32(u16::from_le_bytes(*word)))
+                .collect()),
+            DType::E4M3FN => Ok(raw.iter().map(|&b| scalar::e4m3fn_to_f32(b)).collect()),
+            DType::E8M0 => Ok(raw.iter().map(|&b| scalar::e8m0_to_f32(b)).collect()),
+            dtype => Err(UndecodableDtype { dtype }),
+        }
+    }
+}
+
 /// One stored weight: a dense stored tensor ([`poot_tensor::DType`]-named), or a packed weight's
 /// authoritative source bytes ([`PackedPayload`], [`format::WeightFormat`]-named). The two live in
 /// different type spaces (see the module docs), so a consumer that needs the dtype or the
@@ -3078,6 +3128,54 @@ mod tests {
                 id: GATE_UP,
                 axis: 1
             }
+        );
+    }
+
+    /// `DenseWeight::decode_f32` widens each decodable stored dtype through the scalar decoders and
+    /// refuses every other dtype with a typed error (the loader's former `decode` contract).
+    #[test]
+    fn dense_weight_decodes_the_float_dtypes_and_refuses_the_rest() {
+        use crate::scalar::f32_to_f16;
+        use poot_tensor::DType;
+
+        let dense = |dtype, bytes: Vec<u8>, len| {
+            DenseWeight::try_new(dtype, vec![len], StoredBytes::from(bytes)).unwrap()
+        };
+        let f32s = dense(
+            DType::F32,
+            [1.5f32, -2.0]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+            2,
+        );
+        assert_eq!(f32s.decode_f32().unwrap(), vec![1.5, -2.0]);
+        let bf16s = dense(
+            DType::BF16,
+            [0x3f80u16, 0xc000]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+            2,
+        );
+        assert_eq!(bf16s.decode_f32().unwrap(), vec![1.0, -2.0]);
+        let f16s = dense(
+            DType::F16,
+            [f32_to_f16(0.5), f32_to_f16(-3.0)]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+            2,
+        );
+        assert_eq!(f16s.decode_f32().unwrap(), vec![0.5, -3.0]);
+        let e4m3 = dense(DType::E4M3FN, vec![0x38, 0xb8], 2);
+        assert_eq!(e4m3.decode_f32().unwrap(), vec![1.0, -1.0]);
+        let e8m0 = dense(DType::E8M0, vec![127, 128], 2);
+        assert_eq!(e8m0.decode_f32().unwrap(), vec![1.0, 2.0]);
+        let ints = dense(DType::I32, vec![0; 4], 1);
+        assert_eq!(
+            ints.decode_f32(),
+            Err(UndecodableDtype { dtype: DType::I32 })
         );
     }
 }

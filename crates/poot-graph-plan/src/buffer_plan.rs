@@ -20,14 +20,21 @@
 //! length, unlike a kernel dispatch's [`crate::Plan`]-carried argument. Such a value always gets a
 //! freshly allocated, never-reused slot (see `is_export` below), so nothing it was never sized for can
 //! ever widen it.
+//!
+//! A plan-local scratch buffer ([`crate::ScratchDecl`], POOT-1113) is a second kind of buffer in the same
+//! plan, keyed by [`BufferKey::Scratch`]: its lifetime is exactly its equation's index (it is written
+//! and read by that equation's dispatches and nothing else), it is never an export, and it is colored
+//! in its own storage class beside the values. The equation's operands and output are alive at that same
+//! index, so a scratch never shares a slot with them; it does share with any earlier or later
+//! equation's scratch or temporary.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use poot_graph_ir::{Graph, ValidationChannel, ValueId, ValueTable};
+use poot_graph_ir::{Graph, ValueId, ValueTable};
 use poot_target::BufferStorage;
 
-use crate::{GraphStorage, Plan, StateCommitPlan, ValidationPacketPlan, value_ids};
+use crate::{GraphStorage, Plan, ScratchId, StateCommitPlan, ValidationPacketPlan, value_ids};
 
 /// One arena slot: a device buffer reused by every locally-computed value assigned to it (never two
 /// at once - their lifetimes are disjoint by construction), sized to the largest.
@@ -44,6 +51,17 @@ impl ArenaSlotId {
     pub fn index(self) -> usize {
         self.0 as usize
     }
+}
+
+/// A buffer the plan assigns a slot: one scratch buffer of the equation at `eqn` (the index into the
+/// graph's equations), or a locally computed value. The derived order is the deterministic tie-break of
+/// equal births, and it colors an equation's scratch *before* that equation's output: the lifetime rule
+/// (the scratch is alive through its equation, so the output born there cannot take its slot), not the
+/// processing order, is what keeps them apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum BufferKey {
+    Scratch { eqn: usize, id: ScratchId },
+    Value(ValueId),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -64,7 +82,7 @@ struct SlotInfo {
 #[derive(Clone, Debug, Default)]
 pub struct BufferPlan {
     slots: Vec<SlotInfo>,
-    assignment: HashMap<ValueId, ArenaSlotId>,
+    assignment: HashMap<BufferKey, ArenaSlotId>,
 }
 
 impl BufferPlan {
@@ -109,7 +127,16 @@ impl BufferPlan {
     /// consumer, `poot_executor::Engine::load_entry`, does) never needs this module to resolve them
     /// again.
     pub fn slot(&self, value: ValueId) -> Option<ArenaSlotId> {
-        self.assignment.get(&value).copied()
+        self.assignment.get(&BufferKey::Value(value)).copied()
+    }
+
+    /// The arena slot backing scratch `id` of the equation at index `eqn`. Every scratch a validated
+    /// [`crate::DispatchPlan`] declares has one, so `None` names a scratch of an equation this plan was
+    /// not built for.
+    pub fn scratch_slot(&self, eqn: usize, id: ScratchId) -> Option<ArenaSlotId> {
+        self.assignment
+            .get(&BufferKey::Scratch { eqn, id })
+            .copied()
     }
 
     /// Sum of every arena slot's bytes (SC-001, SC-003, SC-004): this program's peak locally-computed-
@@ -137,21 +164,21 @@ impl SlotInfo {
 /// already runs) to the last equation that reads it, inclusive: an equation that both reads a value
 /// last and produces a new one is one dispatch with distinct input/output buffers, so the two are
 /// always treated as live at once and never share a slot.
-pub(crate) fn plan_buffers<V: ValidationChannel>(
-    g: &Graph<V>,
+pub(crate) fn plan_buffers(
+    g: &Graph,
     plans: &[Plan],
     storage: &GraphStorage,
     state_commit: &StateCommitPlan,
     validation: &ValidationPacketPlan,
 ) -> BufferPlan {
-    let n = g.eqns.len();
-    let mut roots: ValueTable<ValueId> = g.values.ids().collect();
-    let mut birth: HashMap<ValueId, usize> = HashMap::new();
-    let mut death: HashMap<ValueId, usize> = HashMap::new();
-    let mut elems: HashMap<ValueId, usize> = HashMap::new();
-    let mut store_of: HashMap<ValueId, BufferStorage> = HashMap::new();
+    let n = g.eqns().len();
+    let mut roots: ValueTable<ValueId> = g.values().ids().collect();
+    let mut birth: HashMap<BufferKey, usize> = HashMap::new();
+    let mut death: HashMap<BufferKey, usize> = HashMap::new();
+    let mut elems: HashMap<BufferKey, usize> = HashMap::new();
+    let mut store_of: HashMap<BufferKey, BufferStorage> = HashMap::new();
 
-    for (eqn_idx, (eqn, plan)) in g.eqns.iter().zip(plans).enumerate() {
+    for (eqn_idx, (eqn, plan)) in g.eqns().iter().zip(plans).enumerate() {
         match plan {
             Plan::Alias(source) => {
                 roots[eqn.out] = roots[*source];
@@ -164,6 +191,19 @@ pub(crate) fn plan_buffers<V: ValidationChannel>(
             _ => {}
         }
         roots[eqn.out] = eqn.out;
+        // A scratch lives for exactly this equation, whether or not its output is donated in place.
+        if let Plan::Dispatches(dispatches) = plan {
+            for (index, decl) in dispatches.scratch().iter().enumerate() {
+                let key = BufferKey::Scratch {
+                    eqn: eqn_idx,
+                    id: ScratchId::new(index as u32),
+                };
+                birth.insert(key, eqn_idx);
+                death.insert(key, eqn_idx);
+                elems.insert(key, decl.elems());
+                store_of.insert(key, decl.storage());
+            }
+        }
         // Donated in place: `Engine::load_entry`'s `out_loc` writes this output
         // straight into the paired state buffer, never a local allocation - no slot to assign.
         if state_commit.inplace.contains_key(&eqn.out) {
@@ -176,18 +216,19 @@ pub(crate) fn plan_buffers<V: ValidationChannel>(
             // nothing a caller could observe.
             continue;
         };
-        birth.insert(eqn.out, eqn_idx);
-        death.insert(eqn.out, eqn_idx);
-        elems.insert(eqn.out, value_elems);
-        store_of.insert(eqn.out, value_storage);
+        let key = BufferKey::Value(eqn.out);
+        birth.insert(key, eqn_idx);
+        death.insert(key, eqn_idx);
+        elems.insert(key, value_elems);
+        store_of.insert(key, value_storage);
     }
 
     // Every operand read extends its root's death to the reading equation's index (inputs feeding the
     // eqn that also reads them keep `death == birth`, i.e. alive for only their own dispatch).
-    for (eqn_idx, eqn) in g.eqns.iter().enumerate() {
+    for (eqn_idx, eqn) in g.eqns().iter().enumerate() {
         for value in value_ids(eqn) {
             let root = roots[value];
-            if let Some(d) = death.get_mut(&root) {
+            if let Some(d) = death.get_mut(&BufferKey::Value(root)) {
                 *d = (*d).max(eqn_idx);
             }
         }
@@ -196,16 +237,16 @@ pub(crate) fn plan_buffers<V: ValidationChannel>(
     // Exports (SC-004's "logical extent" guarantee, module doc): alive past the dispatch loop, into
     // the epilogue's whole-buffer `copy`/`read` - forced past every eqn index so nothing reuses the
     // slot afterward, and (`is_export`, below) never handed a slot anything else ever occupied first.
-    let mut is_export: HashSet<ValueId> = HashSet::new();
+    let mut is_export: HashSet<BufferKey> = HashSet::new();
     let mut export = |value: ValueId| {
-        let root = roots[value];
-        if let Some(d) = death.get_mut(&root) {
+        let key = BufferKey::Value(roots[value]);
+        if let Some(d) = death.get_mut(&key) {
             *d = n;
-            is_export.insert(root);
+            is_export.insert(key);
         }
     };
-    export(g.output);
-    for exported in &g.exports {
+    export(g.result());
+    for exported in g.exports() {
         export(exported.value);
     }
     for copy in &state_commit.copies {
@@ -216,8 +257,8 @@ pub(crate) fn plan_buffers<V: ValidationChannel>(
     }
 
     // Linear-scan arena coloring (Card 547b), independently per `BufferStorage` class (a slot never
-    // mixes two - module doc), birth order within a class, ties by `ValueId` for a deterministic plan.
-    let mut groups: HashMap<BufferStorage, Vec<ValueId>> = HashMap::new();
+    // mixes two - module doc), birth order within a class, ties by [`BufferKey`] for a deterministic plan.
+    let mut groups: HashMap<BufferStorage, Vec<BufferKey>> = HashMap::new();
     for &value in birth.keys() {
         groups.entry(store_of[&value]).or_default().push(value);
     }
@@ -231,7 +272,7 @@ pub(crate) fn plan_buffers<V: ValidationChannel>(
     });
 
     let mut slots: Vec<SlotInfo> = Vec::new();
-    let mut assignment: HashMap<ValueId, ArenaSlotId> = HashMap::new();
+    let mut assignment: HashMap<BufferKey, ArenaSlotId> = HashMap::new();
 
     for key in group_keys {
         let mut members = groups.remove(&key).expect("key came from this map");

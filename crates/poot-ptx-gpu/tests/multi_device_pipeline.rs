@@ -21,8 +21,9 @@ use poot_executor::{
 };
 use poot_executor_parity::dense::{Dense, Family};
 use poot_executor_parity::weight_map::{
-    CAPACITY, MappedModel, Step, TIER2, assert_close, decode_steps, trace,
+    MappedModel, Step, TIER2, assert_close, decode_steps, trace,
 };
+use poot_graph_ir::{IndexRange, Slot};
 use poot_graph_plan::{
     CompileLimits, CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition,
     StagedProgram, Submission, Target, TargetSet, compile_staged,
@@ -35,6 +36,21 @@ use poot_runtime_common::DeviceBackend;
 /// The qwen2/minimax/glm tokens every row decodes: distinct so a stale or missing boundary value
 /// changes the logits.
 const TOKENS: [i32; 6] = [3, 11, 7, 29, 5, 17];
+
+/// The cache capacity every row traces with: at least the longest run any row drives (24 steps), so
+/// every position stays inside the `Pos` slot's declared range `[0, CAPACITY)`.
+const CAPACITY: usize = 32;
+
+/// Token-by-token decode of `ids` from position 0, refusing a run that would leave the traced
+/// capacity (a position past it is rejected at bind, and the row would test the rejection).
+fn decode(ids: &[i32]) -> Vec<Step> {
+    assert!(
+        ids.len() <= CAPACITY,
+        "{} steps exceed the traced capacity {CAPACITY}",
+        ids.len()
+    );
+    decode_steps(ids)
+}
 
 /// Both devices, or a skip. A host with one GPU skips every row here (the single-GPU PTX lane runs this
 /// binary too); `POOT_REQUIRE_PTX_2GPU=1`, which `just test-device-ptx-2gpu` sets, makes a missing
@@ -55,10 +71,10 @@ fn open_two() -> Option<(PtxDevice, PtxDevice)> {
 }
 
 fn compile(
-    g: &poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs>,
+    g: &poot_graph_ir::Graph,
     targets: &TargetSet,
     devices: DevicePlacement,
-) -> StagedProgram<poot_graph_ir::ValidationOutputs> {
+) -> StagedProgram {
     compile_staged(
         g,
         targets,
@@ -211,7 +227,7 @@ fn assert_two_device_matches_single(mapped: &MappedModel, after_layers: &[usize]
     let Some((first, second)) = open_two() else {
         return;
     };
-    let steps = decode_steps(&TOKENS);
+    let steps = decode(&TOKENS);
     let want = single_device(PtxDevice::open(0).unwrap(), mapped, &steps, &[]);
     assert_non_constant(&want, label);
     let mut placement = vec![0u32; after_layers.len() + 1];
@@ -276,7 +292,7 @@ fn sixteen_unchanged_steps_are_one_recording_session_per_device_on_ptx() {
         return;
     };
     let mapped = Dense::new(Family::Qwen2).dims(64, 96, 3).model();
-    let steps = decode_steps(&(0..16).map(|i| (i * 5 + 1) % 48).collect::<Vec<_>>());
+    let steps = decode(&(0..16).map(|i| (i * 5 + 1) % 48).collect::<Vec<_>>());
     let Pipelined {
         counters: after_first,
         mut coordinator,
@@ -339,7 +355,7 @@ fn rank_zero_to_rank_one_to_rank_zero_never_consumes_a_prior_generation_on_ptx()
     };
     let mapped = Dense::new(Family::Qwen2).dims(64, 96, 3).model();
     let tokens: Vec<i32> = (0..24).map(|i| (i * 7 + 2) % 48).collect();
-    let steps = decode_steps(&tokens);
+    let steps = decode(&tokens);
     let want = single_device(PtxDevice::open(0).unwrap(), &mapped, &steps, &[0, 1]);
     assert_non_constant(&want, "three-stage reference");
     let Pipelined {
@@ -480,8 +496,7 @@ impl Device for FailingFinish {
                 buffer: d.output.buffer,
                 elems: d.output.elems,
             },
-            threads: d.threads,
-            workgroup: d.workgroup,
+            launch: d.launch,
             work: d.work,
         })
     }
@@ -585,7 +600,7 @@ fn a_capture_failure_on_the_later_rank_aborts_cleanly_and_the_retry_runs_on_ptx(
         return;
     };
     let mapped = Dense::new(Family::Qwen2).model();
-    let steps = decode_steps(&TOKENS[..3]);
+    let steps = decode(&TOKENS[..3]);
     let want = single_device(PtxDevice::open(0).unwrap(), &mapped, &steps, &[0]);
 
     let fail_at = Rc::new(Cell::new(Some(1)));
@@ -691,4 +706,56 @@ fn a_peer_copy_in_a_graph_delivers_its_bytes_and_an_event_orders_the_peer_on_ptx
     let mut got = vec![0u8; 256];
     one.read_bytes(&destination, &mut got).unwrap();
     assert_eq!(got, pattern, "the peer copy delivered the source bytes");
+}
+
+/// POOT-1124 (POOT-1113): the split-KV decode attention in each stage of a two-device layer pipeline.
+/// Layer 0 attends on GPU 0 and layer 1 on GPU 1, each over a 1024-key cache of one key/value head with the
+/// live length `Slot::Pos` bounds; layer 0's output crosses the cut as a peer copy and layer 1 adds it to its
+/// own. Each stage must plan the split schedule (two launches, one scratch) on its own device's caps, and
+/// every step of the live lengths 1024, 5, 400, 1, 1024 must equal the CPU oracle's sum of the two layers.
+///
+/// Mutation: in `poot-kernelgen`'s `attention_body`, skip the numerator term of split 0 in the combine; the
+/// first step goes red. Skip the `(m, l)` publication of a split with no key; the length-5 step goes red.
+/// Deliver zero bytes at the stage boundary (`peer_copy` of `bytes.min(0)`); the first step goes red.
+#[test]
+fn split_kv_decode_in_each_stage_of_a_two_device_pipeline_matches_the_oracle_on_ptx() {
+    let Some((first, second)) = open_two() else {
+        return;
+    };
+    let ids = [DeviceId(0), DeviceId(1)];
+    let set = targets(first.target(), second.target());
+    let mut coordinator = Coordinator::new(vec![(ids[0], first), (ids[1], second)]).unwrap();
+    poot_executor_parity::attention::assert_split_kv_pipeline_matches_the_oracle(
+        &mut coordinator,
+        &set,
+        ids,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// Model-free twin of the long-run rows on a device-less box: the fixture traced over
+/// [`CAPACITY`] declares its `Pos` slot `[0, CAPACITY)`, and every position the 24-step
+/// run drives is inside it, so the device rows exercise the programs, not the bind rejection.
+///
+/// Mutation: `CAPACITY = 8` (the old shared capacity); `decode` refuses the run with "N steps exceed
+/// the traced capacity 8" (with that guard removed, the range check names position 8).
+#[test]
+fn the_long_run_stays_inside_the_traced_position_range() {
+    let mapped = Dense::new(Family::Qwen2).dims(64, 96, 3).model();
+    let g = trace(&*mapped.model, &mapped.map, Phase::Decode, 1, CAPACITY);
+    let pos = g
+        .slots()
+        .iter()
+        .find(|(_, slot)| *slot == Slot::Pos)
+        .map(|(id, _)| g.meta(*id).range())
+        .expect("a decode trace has a Pos slot")
+        .expect("the production tracer declares the Pos range");
+    assert_eq!(pos, IndexRange::below(CAPACITY).unwrap());
+    for step in &decode(&(0..24).map(|i| (i * 7 + 2) % 48).collect::<Vec<_>>()) {
+        let last = step.start + step.ids.len() - 1;
+        assert!(
+            pos.contains(last as i32),
+            "position {last} is outside the declared Pos range {pos:?}"
+        );
+    }
 }

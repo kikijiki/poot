@@ -11,7 +11,7 @@ use crate::*;
 /// ```compile_fail,E0133
 /// fn from_any_bytes(spv: &[u8]) -> poot_vulkan_runtime::CompiledKernel {
 ///     poot_vulkan_runtime::CompiledKernel::new(
-///         poot_target::Backend::SpirvVulkan,
+///         poot_target::TargetId::Gpu(poot_target::Backend::SpirvVulkan),
 ///         "main",
 ///         poot_runtime_common::KernelCode::spirv_from_le_bytes(spv),
 ///         Vec::new(),
@@ -23,7 +23,7 @@ use crate::*;
 /// ```compile_fail,E0451
 /// fn forge(code: poot_runtime_common::KernelCode) -> poot_vulkan_runtime::CompiledKernel {
 ///     poot_vulkan_runtime::CompiledKernel {
-///         target: poot_target::Backend::SpirvVulkan,
+///         target: poot_target::TargetId::Gpu(poot_target::Backend::SpirvVulkan),
 ///         entry_point: "main".into(),
 ///         code,
 ///         args: Vec::new().into(),

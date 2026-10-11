@@ -15,7 +15,7 @@
 //! positional KV needs no restore, since a write beyond the committed position is overwritten or masked.
 //! The side a graph does not write is an alias pair `(x, x)`, which validates and copies nothing.
 
-use poot_graph_ir::{Builder, Graph, StateRole, TensorType, ValidationOutputs};
+use poot_graph_ir::{Builder, Graph, StateRole, TensorType};
 
 use super::reorder::{row_index, state_row_gather};
 
@@ -33,15 +33,15 @@ struct Carried {
 /// The two graphs of a round's rollback.
 pub(super) struct SnapshotEntries {
     /// Copy the rows `idx` names from live state into the shadow set.
-    pub(super) snapshot: Graph<ValidationOutputs>,
+    pub(super) snapshot: Graph,
     /// Copy the rows `idx` names from the shadow set back into live state.
-    pub(super) restore: Graph<ValidationOutputs>,
+    pub(super) restore: Graph,
 }
 
 /// The snapshot and restore graphs over the `Recurrent` pairs of `schema` (a decode program), or `None`
 /// for a program that carries no recurrent state. Panics if the recurrent values disagree on their row
 /// axis; the driver checks every state pair's row axis before it compiles the program.
-pub(super) fn snapshot_entries(schema: &Graph<ValidationOutputs>) -> Option<SnapshotEntries> {
+pub(super) fn snapshot_entries(schema: &Graph) -> Option<SnapshotEntries> {
     let carried: Vec<Carried> = schema
         .state_pairs()
         .filter(|pair| pair.role == StateRole::Recurrent)
@@ -75,7 +75,7 @@ enum Copy {
     ShadowToLive,
 }
 
-fn copy_graph(carried: &[Carried], rows: usize, direction: Copy) -> Graph<ValidationOutputs> {
+fn copy_graph(carried: &[Carried], rows: usize, direction: Copy) -> Graph {
     let b = Builder::new();
     let index = row_index(&b, rows);
     let mut pairs = Vec::with_capacity(2 * carried.len());
@@ -103,8 +103,11 @@ fn copy_graph(carried: &[Carried], rows: usize, direction: Copy) -> Graph<Valida
         };
         last = Some(copied);
     }
-    b.finish_with_state(last.expect("a recurrent program carries state"), &pairs)
-        .with_validations(Vec::new())
+    b.finish(
+        poot_graph_ir::Outputs::new(last.expect("a recurrent program carries state"))
+            .with_state(&pairs),
+    )
+    .unwrap()
 }
 
 /// The row index of a copy: `slots` take their row from the source, every other row keeps its own.

@@ -8,15 +8,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use poot_graph_ir::{
-    BoundaryId, ComputedConst, Graph, OpKind, Operand, Storage, TensorType, ValidationChannel,
-    ValueId,
+    BoundaryId, ComputedConst, Graph, OpKind, Operand, Storage, TensorType, ValueId,
 };
 use poot_target::BufferStorage;
 
 use super::{
     DeviceId, DevicePlacement, Partition, StageId, StagedCompileError, TargetSet, Transfer,
 };
-use crate::multi_device::topology::backend_link_kinds;
+use crate::multi_device::topology::target_link_kinds;
 use crate::multi_device::{
     AccountingError, ByteCategories, CommunicationPlan, DeviceSpec, HostOwner, LinkCapability,
     OwnerId, PlacementRow, StagePlan, Topology, admit_communication_capability,
@@ -79,8 +78,8 @@ impl Placement {
                 .iter()
                 .map(|stage| DeviceSpec {
                     id: stage.device,
-                    backend: stage.target.backend,
-                    usable_bytes: stage.target.caps.memory_budget_bytes.unwrap_or(0),
+                    target: stage.target.id(),
+                    usable_bytes: stage.target.memory_budget_bytes().unwrap_or(0),
                 })
                 .collect(),
             links: distinct
@@ -88,8 +87,8 @@ impl Placement {
                 .flat_map(|from| distinct.iter().map(move |to| (*from, *to)))
                 .filter(|(from, to)| from.device != to.device)
                 .flat_map(|(from, to)| {
-                    let to_kinds = backend_link_kinds(to.target.backend);
-                    backend_link_kinds(from.target.backend)
+                    let to_kinds = target_link_kinds(to.target.id());
+                    target_link_kinds(from.target.id())
                         .iter()
                         .filter(move |kind| to_kinds.contains(kind))
                         .map(move |&kind| LinkCapability {
@@ -161,8 +160,8 @@ pub(super) fn resolve(
 /// `boundaries` are sized by the uncut graph's logical bytes here: capability depends on which devices a
 /// value crosses, not on how many bytes, so the refusal comes before any stage is compiled.
 /// [`communication`] then rebuilds the rows with the exact planned bytes.
-pub(super) fn admit_links<V: ValidationChannel>(
-    adapted: &Graph<V>,
+pub(super) fn admit_links(
+    adapted: &Graph,
     boundaries: &[BoundaryDescriptor],
     placement: &Placement,
 ) -> Result<(), StagedCompileError> {
@@ -183,11 +182,11 @@ pub(super) fn admit_links<V: ValidationChannel>(
         .map(|(_, transfer)| transfer)
         .expect("a refused row is one of the plan's rows");
     let eqn = adapted
-        .eqns
+        .eqns()
         .iter()
         .find(|eqn| eqn.out == transfer.boundary.0)
         .expect("a boundary value is an equation result of the uncut graph");
-    let target = placement.stages[transfer.producing_stage].target.backend;
+    let target = placement.stages[transfer.producing_stage].target.id();
     Err(StagedCompileError::Refused(Box::new(Refusal {
         eqn: eqn.out,
         op: eqn.op.clone(),
@@ -200,13 +199,13 @@ pub(super) fn admit_links<V: ValidationChannel>(
 /// The collectives of a sharded graph, refused when the ranks' devices have no link that performs
 /// them. `placement` has one entry per rank. The refusal names the collective equation and
 /// [`Capability::Collective`], before the program is lowered to exchanges or any stage is compiled.
-pub(super) fn admit_collectives<V: ValidationChannel>(
-    sharded: &ShardedGraph<V>,
+pub(super) fn admit_collectives(
+    sharded: &ShardedGraph,
     placement: &Placement,
 ) -> Result<(), StagedCompileError> {
     let topology = placement.topology();
     let ranks = placement.stage_devices();
-    for eqn in &sharded.graph.eqns {
+    for eqn in sharded.graph.eqns() {
         let kind = match eqn.op {
             OpKind::AllReduce { .. } => CollectiveKind::AllReduce,
             OpKind::AllGather { .. } => CollectiveKind::AllGather,
@@ -221,7 +220,7 @@ pub(super) fn admit_collectives<V: ValidationChannel>(
             .find(|stage| stage.device == missing.from)
             .expect("a refused link starts at a placed device")
             .target
-            .backend;
+            .id();
         return Err(StagedCompileError::Refused(Box::new(Refusal {
             eqn: eqn.out,
             op: eqn.op.clone(),
@@ -311,9 +310,9 @@ pub(super) fn check_bound(
 }
 
 /// The named constants `g`'s equations read, with their types, in first-read order.
-fn read_weights<V: ValidationChannel>(g: &Graph<V>) -> Vec<(String, TensorType)> {
+fn read_weights(g: &Graph) -> Vec<(String, TensorType)> {
     let read: HashSet<ValueId> = g
-        .eqns
+        .eqns()
         .iter()
         .flat_map(|eqn| &eqn.inputs)
         .filter_map(|operand| match operand {
@@ -321,7 +320,7 @@ fn read_weights<V: ValidationChannel>(g: &Graph<V>) -> Vec<(String, TensorType)>
             Operand::Lit(_) => None,
         })
         .collect();
-    g.consts
+    g.consts()
         .iter()
         .copied()
         .filter(|value| read.contains(value))
@@ -348,9 +347,9 @@ fn read_weights<V: ValidationChannel>(g: &Graph<V>) -> Vec<(String, TensorType)>
 /// `legalize` renames an oversized constant to `{name}.chunk{n}`, so reading owners back from them would
 /// refuse a legitimate chunked weight. [`validate_stage_placement`] still checks both, and its own rows
 /// drive them with placements the derivation would never build.
-pub(super) fn place_weights<V: ValidationChannel>(
-    adapted: &Graph<V>,
-    stage_graphs: &[&Graph<V>],
+pub(super) fn place_weights(
+    adapted: &Graph,
+    stage_graphs: &[&Graph],
     placement: &Placement,
 ) -> Result<(), StagedCompileError> {
     let expected_keys: Vec<String> = read_weights(adapted)
@@ -422,8 +421,8 @@ enum SharedBuffer {
 /// computed constants (a store key a device's stages share is one buffer), carried state, every stage's
 /// retained arena, the stage inputs that are not boundary values, and the boundary buffers a transfer
 /// delivers plus each row's declared scratch.
-pub(super) fn footprints<V: ValidationChannel>(
-    stages: &[(StageId, DeviceId, Program<V>)],
+pub(super) fn footprints(
+    stages: &[(StageId, DeviceId, Program)],
     transfers: &[Transfer],
     comm: &CommunicationPlan,
     links: &[super::Link],
@@ -440,7 +439,7 @@ pub(super) fn footprints<V: ValidationChannel>(
             .filter_map(|(id, _)| program.boundary_input(id))
             .collect();
         let mut categories = usage.get(device).copied().unwrap_or_default();
-        for &input in &graph.inputs {
+        for &input in graph.inputs() {
             let meta = graph.meta(input);
             let bytes = value_bytes(
                 &meta.aval,
@@ -504,11 +503,10 @@ pub(super) fn admit_capacity(
         .map(|stage| {
             stage
                 .target
-                .caps
-                .memory_budget_bytes
+                .memory_budget_bytes()
                 .map(|usable_bytes| DeviceSpec {
                     id: stage.device,
-                    backend: stage.target.backend,
+                    target: stage.target.id(),
                     usable_bytes,
                 })
                 .ok_or(StagedCompileError::UnknownBudget(stage.device))

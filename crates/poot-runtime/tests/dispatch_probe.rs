@@ -32,7 +32,7 @@ fn kernel_from_spv(spv: &[u8], args: Vec<ArgSchema>) -> CompiledKernel {
     // match `args` exactly, by construction of each fixture below.
     unsafe {
         CompiledKernel::new(
-            poot_target::Backend::SpirvVulkan,
+            poot_target::TargetId::Gpu(poot_target::Backend::SpirvVulkan),
             "main",
             KernelCode::SpirvWords(words.into_boxed_slice()),
             args,

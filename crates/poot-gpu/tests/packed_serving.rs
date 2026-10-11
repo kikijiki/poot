@@ -36,11 +36,12 @@ use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_quant::{PackedComponentRef, PackedPayload, PackedStack, PackedStackComponentRef};
 use poot_runtime_common::DeviceBackend;
 use poot_tensor::HostTensor;
+use poot_test_util::graph_fixtures::gpu_caps;
 
 /// Compile `g` for `target` with `Submission::Replay` (Card 546b: the contract admits no other
 /// submission).
-fn staged(g: &Graph, target: Target) -> StagedProgram<poot_graph_ir::ValidationOutputs> {
-    let g = g.clone().with_validations(Vec::new());
+fn staged(g: &Graph, target: Target) -> StagedProgram {
+    let g = g.clone();
     compile_staged(
         &g,
         &TargetSet::single(DeviceId(0), target),
@@ -98,7 +99,7 @@ fn split_consts_and_slots(
     let mut packed_owners: HashMap<String, Arc<PackedPayload>> = HashMap::new();
     let mut dense_consts: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::new();
     let mut slots = Vec::new();
-    for &id in &g.inputs {
+    for &id in g.inputs() {
         let m = g.meta(id);
         match m.storage {
             Storage::Const => {
@@ -182,7 +183,8 @@ fn split_consts_and_slots(
 fn state_probe_graph(name: &str, aval: TensorType) -> Graph {
     let b = Builder::new();
     let state = b.state_input(name, aval, StateRole::Recurrent);
-    b.finish_with_state(state, &[(state, state)])
+    b.finish(poot_graph_ir::Outputs::new(state).with_state(&[(state, state)]))
+        .unwrap()
 }
 
 const K: usize = 256;
@@ -240,7 +242,9 @@ fn packed_graph(descriptor: poot_quant::PackedWeight, m: usize) -> PackedGraph {
         );
         let cache_out = b.dynamic_update_slice_dyn(cache, y, pos, 0);
         PackedGraph {
-            graph: b.finish_with_state(y, &[(cache, cache_out)]),
+            graph: b
+                .finish(poot_graph_ir::Outputs::new(y).with_state(&[(cache, cache_out)]))
+                .unwrap(),
             x: x.id(),
             pos: Some(pos.id()),
         }
@@ -252,16 +256,18 @@ fn packed_graph(descriptor: poot_quant::PackedWeight, m: usize) -> PackedGraph {
         );
         let cache_out = b.dynamic_update_slice(cache, y, 0, 0);
         PackedGraph {
-            graph: b.finish_with_state(y, &[(cache, cache_out)]),
+            graph: b
+                .finish(poot_graph_ir::Outputs::new(y).with_state(&[(cache, cache_out)]))
+                .unwrap(),
             x: x.id(),
             pos: None,
         }
     }
 }
 
-fn assert_claims_packed_contraction<V: poot_graph_ir::ValidationChannel>(g: &Graph<V>) {
+fn assert_claims_packed_contraction(g: &Graph) {
     assert!(
-        g.eqns
+        g.eqns()
             .iter()
             .any(|eqn| matches!(eqn.op, poot_graph_ir::OpKind::PackedContraction { .. })),
         "compile claims the packed linear"
@@ -271,7 +277,7 @@ fn assert_claims_packed_contraction<V: poot_graph_ir::ValidationChannel>(g: &Gra
 /// The packed carriers of `graph`, bound as components of `owner` by the role their names carry.
 fn carriers(graph: &Graph, owner: &Arc<PackedPayload>) -> HashMap<ValueId, Value> {
     graph
-        .inputs
+        .inputs()
         .iter()
         .filter_map(|&id| {
             let name = PackedSourceName::parse(graph.meta(id).name.as_deref()?)?;
@@ -552,13 +558,13 @@ impl StackBuffers {
                 );
                 let caps = poot_target::DeviceCaps {
                     max_buffer_bytes: 2 * slab,
-                    ..target.caps
+                    ..gpu_caps(&target)
                 };
                 let split =
                     poot_graph_plan::legalize(g, &caps, &poot_graph_plan::CompileLimits::STANDARD)
                         .expect("the stacked table splits");
                 let carriers: Vec<usize> = split
-                    .consts
+                    .consts()
                     .iter()
                     .map(|&id| split.aval(id).shape[0])
                     .collect();
@@ -617,9 +623,9 @@ fn run_indexed_case(
         TensorType::new(vec![rows], DType::I32),
     );
     let y = poot_graph_ir::ops::packed_indexed_linear(&b, x, ids, &table).unwrap();
-    let g = b.finish(y);
+    let g = b.finish(y).unwrap();
     let mut inputs: HashMap<ValueId, Value> = HashMap::new();
-    for &id in &g.inputs {
+    for &id in g.inputs() {
         let Some(name) = g.meta(id).name.as_deref().and_then(PackedSourceName::parse) else {
             continue;
         };
@@ -638,7 +644,7 @@ fn run_indexed_case(
     let program = staged(&bound, target);
     let compiled = program.stages().next().expect("single stage").2.graph();
     let carriers: Vec<usize> = compiled
-        .consts
+        .consts()
         .iter()
         .map(|&id| compiled.aval(id).shape[0])
         .collect();
@@ -648,8 +654,8 @@ fn run_indexed_case(
         "{what}: the experts each stacked carrier holds"
     );
     if buffers == StackBuffers::One {
-        let [contraction] = compiled.eqns.as_slice() else {
-            panic!("{what}: one equation, got {:?}", compiled.eqns);
+        let [contraction] = compiled.eqns() else {
+            panic!("{what}: one equation, got {:?}", compiled.eqns());
         };
         assert!(
             matches!(
@@ -853,7 +859,7 @@ fn packed_embedding_row_gather_is_bit_exact() {
                 owner.weight(),
             )
             .unwrap();
-            let g = b.finish(rows);
+            let g = b.finish(rows).unwrap();
             let mut inputs = carriers(&g, &owner);
             let token_ids: Vec<i32> = ids.iter().map(|&id| id as i32).collect();
             inputs.insert(token.id(), HostTensor::i32(shape, token_ids).into());
@@ -867,7 +873,7 @@ fn packed_embedding_row_gather_is_bit_exact() {
                     .unwrap()
                     .2
                     .graph()
-                    .eqns
+                    .eqns()
                     .iter()
                     .any(|eqn| matches!(eqn.op, poot_graph_ir::OpKind::PackedRowGather { .. })),
                 "{what}: compile claims the embedding"
@@ -939,7 +945,7 @@ fn a_dense_traced_q6_k_expert_stack_binds_and_matches_the_oracle() {
     );
     let w = b.constant("experts.weight", TensorType::f32(vec![EXPERTS, OUT, K]));
     let y = b.indexed_matmul(x, b.transpose(w, vec![0, 2, 1]), ids);
-    let traced = b.finish(y);
+    let traced = b.finish(y).unwrap();
 
     let mut formats = WeightFormats::default();
     formats
@@ -967,7 +973,7 @@ fn a_dense_traced_q6_k_expert_stack_binds_and_matches_the_oracle() {
     );
     let stack = Arc::new(PackedStack::try_new(owners.clone()).unwrap());
     let mut inputs: HashMap<ValueId, Value> = HashMap::new();
-    for &id in &graph.inputs {
+    for &id in graph.inputs() {
         let meta = graph.meta(id);
         match meta.name.as_deref() {
             Some("activation.moe-x") => {
@@ -1013,7 +1019,7 @@ fn a_dense_traced_q6_k_expert_stack_binds_and_matches_the_oracle() {
         }
     }
     let mut dense: HashMap<ValueId, Value> = HashMap::new();
-    for &id in &traced.inputs {
+    for &id in traced.inputs() {
         let value = match traced.meta(id).name.as_deref() {
             Some("activation.moe-x") => activation.clone(),
             Some("activation.moe-ids") => selected.clone(),
@@ -1074,7 +1080,7 @@ fn dense_e4m3_row_gather_is_bit_exact() {
             TensorType::new(vec![ids.len()], DType::I32),
         );
         let gathered = b.cast(b.gather(table_value, 0, idx), DType::F32);
-        let graph = b.finish(gathered);
+        let graph = b.finish(gathered).unwrap();
         let idx_key = graph.meta(idx.id()).slot_key().unwrap().clone();
 
         let store = {
@@ -1210,7 +1216,7 @@ fn packed_loaders_match_the_oracle_on_every_output_on_wgpu() {
             let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![m, K]));
             let y = poot_graph_ir::ops::packed_linear(&b, x, "layer", owner.weight(), None, None)
                 .unwrap();
-            let graph = b.finish(y);
+            let graph = b.finish(y).unwrap();
             let mut inputs = carriers(&graph, &owner);
             inputs.insert(
                 x.id(),
@@ -1274,11 +1280,11 @@ fn a_packed_gemv_head_is_shared_with_the_standalone_gemv_on_wgpu() {
                 poot_graph_ir::ops::packed_linear(&b, x, "layer", owner.weight(), None, None)
                     .unwrap();
             if !with_bias {
-                return (b.finish(head), x.id(), None);
+                return (b.finish(head).unwrap(), x.id(), None);
             }
             let bias = b.constant("bias", TensorType::f32(vec![OUT]));
             let out = b.binary(BinOp::Add, head, bias);
-            (b.finish(out), x.id(), Some(bias.id()))
+            (b.finish(out).unwrap(), x.id(), Some(bias.id()))
         };
 
         let (head_graph, head_x, _) = build(false);
@@ -1291,7 +1297,7 @@ fn a_packed_gemv_head_is_shared_with_the_standalone_gemv_on_wgpu() {
         let fused_program = staged(&graph, target);
         let fused_graph = fused_program.stages().next().unwrap().2.graph();
         let heads: Vec<ContractionHead> = fused_graph
-            .eqns
+            .eqns()
             .iter()
             .filter_map(|eqn| match &eqn.op {
                 poot_graph_ir::OpKind::ContractionEpilogue { head, .. } => Some(*head),
@@ -1301,7 +1307,7 @@ fn a_packed_gemv_head_is_shared_with_the_standalone_gemv_on_wgpu() {
         assert!(
             matches!(heads.as_slice(), [ContractionHead::Packed { .. }]),
             "{what}: one fused packed contraction: {:?}",
-            fused_graph.eqns
+            fused_graph.eqns()
         );
         for (label, bias_values) in [
             ("generic bias", fill(4, OUT)),
@@ -1370,7 +1376,7 @@ fn a_packed_gemv_epilogue_agrees_with_the_oracle_on_wgpu() {
                 poot_graph_ir::ops::packed_linear(&b, x, "layer", owner.weight(), None, None)
                     .unwrap();
             if !with_chain {
-                return (b.finish(head), x.id(), None);
+                return (b.finish(head).unwrap(), x.id(), None);
             }
             let bias = b.constant("bias", TensorType::f32(vec![OUT]));
             let residual = b.constant("residual", TensorType::f32(vec![1, OUT]));
@@ -1378,7 +1384,11 @@ fn a_packed_gemv_epilogue_agrees_with_the_oracle_on_wgpu() {
             let activated = b.unary(UnOp::Tanh, biased);
             let scaled = b.binary_scalar(BinOp::Mul, activated, Scalar::F32(0.5));
             let out = b.binary(BinOp::Add, scaled, residual);
-            (b.finish(out), x.id(), Some((bias.id(), residual.id())))
+            (
+                b.finish(out).unwrap(),
+                x.id(),
+                Some((bias.id(), residual.id())),
+            )
         };
 
         // The device head alone, to cancel against.
@@ -1394,7 +1404,7 @@ fn a_packed_gemv_epilogue_agrees_with_the_oracle_on_wgpu() {
         let fused_program = staged(&graph, target);
         let fused_graph = fused_program.stages().next().unwrap().2.graph();
         let heads: Vec<ContractionHead> = fused_graph
-            .eqns
+            .eqns()
             .iter()
             .filter_map(|eqn| match &eqn.op {
                 poot_graph_ir::OpKind::ContractionEpilogue { head, .. } => Some(*head),
@@ -1404,7 +1414,7 @@ fn a_packed_gemv_epilogue_agrees_with_the_oracle_on_wgpu() {
         assert!(
             matches!(heads.as_slice(), [ContractionHead::Packed { .. }]),
             "{what}: one fused packed contraction: {:?}",
-            fused_graph.eqns
+            fused_graph.eqns()
         );
         for (label, bias_values) in [
             ("generic bias", fill(4, OUT)),

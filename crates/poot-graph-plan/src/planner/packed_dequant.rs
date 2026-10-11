@@ -421,7 +421,7 @@ mod tests {
             let weight = PackedWeight::try_new(WeightFormat::Q8_0, [n, k]).unwrap();
             let out = poot_graph_ir::ops::packed_linear(&builder, x, "layer", weight, None, None)
                 .unwrap();
-            let target = Target {
+            let target = Target::Gpu {
                 backend: Backend::SpirvVulkan,
                 caps: DeviceCaps {
                     compute_units,
@@ -430,7 +430,7 @@ mod tests {
                 },
             };
             let options = CompileOptions::new(Submission::Replay, crate::CompileLimits::STANDARD);
-            let program = compile(&builder.finish(out), &target, &options)
+            let program = compile(&builder.finish(out).unwrap(), &target, &options)
                 .unwrap_or_else(|error| panic!("{what}: {error}"));
             let (eqn, plan) = program
                 .planned()
@@ -495,12 +495,12 @@ mod tests {
             &builder, x, "layer", descriptor, blocks, None,
         )
         .unwrap();
-        let target = Target {
+        let target = Target::Gpu {
             backend: Backend::SpirvVulkan,
             caps: DeviceCaps::wgpu_rdna3_igpu(),
         };
         let options = CompileOptions::new(Submission::Replay, crate::CompileLimits::STANDARD);
-        let program = compile(&builder.finish(out_value), &target, &options).unwrap();
+        let program = compile(&builder.finish(out_value).unwrap(), &target, &options).unwrap();
         let (eqn, plan) = program
             .planned()
             .find(|(eqn, _)| matches!(eqn.op, OpKind::PackedContraction { .. }))
@@ -565,9 +565,10 @@ mod tests {
             &builder, x, "layer", descriptor, blocks, None,
         )
         .unwrap();
-        let graph = crate::recognize_packed_contractions(&builder.finish(out_value));
+        let graph =
+            crate::recognize_packed_contractions(&builder.finish(out_value).unwrap()).unwrap();
         let index = graph
-            .eqns
+            .eqns()
             .iter()
             .position(|eqn| matches!(eqn.op, OpKind::PackedContraction { .. }))
             .unwrap_or_else(|| panic!("not recognized as one PackedContraction"));
@@ -596,7 +597,7 @@ mod tests {
     #[test]
     fn over_cap_tiled_contraction_folds_onto_a_2d_grid_not_the_wg_bump() {
         let (graph, index) = over_cap_tiled_eqn(1, 40, 8);
-        let eqn = &graph.eqns[index];
+        let eqn = &graph.eqns()[index];
         let plan = crate::plan_eqn(
             &graph,
             eqn,
@@ -639,7 +640,7 @@ mod tests {
     #[test]
     fn over_cap_tiled_contraction_refuses_when_even_the_fold_cannot_address_every_tile() {
         let (graph, index) = over_cap_tiled_eqn(1, 200, 8);
-        let eqn = &graph.eqns[index];
+        let eqn = &graph.eqns()[index];
         let error = crate::plan_eqn(
             &graph,
             eqn,
@@ -691,8 +692,8 @@ mod tests {
         )
         .unwrap();
         let out_id = out_value.id();
-        let graph = builder.finish(out_value);
-        let target = Target {
+        let graph = builder.finish(out_value).unwrap();
+        let target = Target::Gpu {
             backend: Backend::SpirvVulkan,
             caps: tiny_grid_caps(),
         };
@@ -748,9 +749,9 @@ mod tests {
             TensorType::new(vec![rows], poot_tensor::DType::I32),
         );
         let y = poot_graph_ir::ops::packed_indexed_linear(&builder, x, ids, &table).unwrap();
-        let graph = builder.finish(y);
+        let graph = builder.finish(y).unwrap();
         let index = graph
-            .eqns
+            .eqns()
             .iter()
             .position(|eqn| matches!(eqn.op, OpKind::PackedContraction { .. }))
             .expect("the builder emits the claimed contraction");
@@ -764,7 +765,7 @@ mod tests {
     ) -> Result<crate::Plan, PlanError> {
         crate::plan_eqn(
             graph,
-            &graph.eqns[index],
+            &graph.eqns()[index],
             Backend::SpirvVulkan,
             caps,
             &poot_test_util::graph_fixtures::roomy_body_limits(),
@@ -862,7 +863,7 @@ mod tests {
             "fixture must be above the wg-bump threshold: {out_numel}"
         );
         let (graph, index) = over_cap_tiled_eqn(blocks, m_per_block, out_per_block);
-        let eqn = &graph.eqns[index];
+        let eqn = &graph.eqns()[index];
         let plan = crate::plan_eqn(
             &graph,
             eqn,

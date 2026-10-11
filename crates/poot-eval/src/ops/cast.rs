@@ -19,14 +19,14 @@ pub(crate) fn narrow_f32(
             shape,
             values
                 .iter()
-                .map(|&v| poot_runtime_common::f32_to_bf16(v))
+                .map(|&v| poot_quant::scalar::f32_to_bf16(v))
                 .collect::<Vec<u16>>(),
         )),
         DType::F16 => Ok(HostTensor::f16(
             shape,
             values
                 .iter()
-                .map(|&v| poot_load::gguf::f32_to_f16(v))
+                .map(|&v| poot_quant::scalar::f32_to_f16(v))
                 .collect::<Vec<u16>>(),
         )),
         other => Err(EvalError::unsupported(

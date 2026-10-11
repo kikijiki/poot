@@ -25,7 +25,7 @@ fn two_stage_split() -> (Vec<crate::BoundaryDescriptor>, Vec<DeviceId>) {
     let x = b.slot(Slot::Activation, TensorType::f32(vec![2, 3]));
     let t0 = b.binary(BinOp::Add, x, x);
     let out = b.binary(BinOp::Mul, t0, t0);
-    let graph = b.finish(out);
+    let graph = b.finish(out).unwrap();
     let split = crate::test_support::split_before(&graph, &[1]).expect("the graph splits");
     assert_eq!(split.boundaries.len(), 1, "one value crosses this cut");
     (split.boundaries, vec![device(0), device(1)])
@@ -40,7 +40,7 @@ fn three_stage_split() -> Vec<crate::BoundaryDescriptor> {
     let t1 = b.cast(t0, poot_tensor::DType::BF16);
     let back = b.cast(t1, poot_tensor::DType::F32);
     let out = b.binary(BinOp::Add, back, t0);
-    let graph = b.finish(out);
+    let graph = b.finish(out).unwrap();
     let split = crate::test_support::split_before(&graph, &[1, 2]).expect("the graph splits");
     assert_eq!(
         split

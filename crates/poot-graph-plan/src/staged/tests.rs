@@ -8,7 +8,7 @@ use std::num::NonZeroUsize;
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
 use poot_graph_ir::{
     BinOp, Builder, Graph, Scalar, Slot, SlotKey, StateRole, Storage, TensorType, UnOp,
-    ValidationChannel, ValidationId, ValidationOutputs, ValueId,
+    ValidationId, ValueId,
 };
 use poot_quant::weights::LoraTarget;
 use poot_target::Backend;
@@ -22,7 +22,7 @@ use crate::test_support::{
 use crate::{CompileLimits, LoraPlan, Submission};
 
 fn target() -> Target {
-    Target {
+    Target::Gpu {
         backend: Backend::SpirvVulkan,
         caps: default_caps_for(Backend::SpirvVulkan),
     }
@@ -46,11 +46,7 @@ fn pipeline(after_layers: &[usize]) -> DevicePlacement {
     }
 }
 
-fn staged<V: ValidationChannel>(
-    g: &Graph<V>,
-    devices: DevicePlacement,
-    options: &CompileOptions,
-) -> StagedProgram<V> {
+fn staged(g: &Graph, devices: DevicePlacement, options: &CompileOptions) -> StagedProgram {
     compile_staged(
         g,
         &TargetSet::single(DeviceId(0), target()),
@@ -60,17 +56,14 @@ fn staged<V: ValidationChannel>(
     .unwrap_or_else(|error| panic!("compile_staged: {error}"))
 }
 
-fn stage_graphs<V: ValidationChannel>(program: &StagedProgram<V>) -> Vec<&Graph<V>> {
+fn stage_graphs(program: &StagedProgram) -> Vec<&Graph> {
     program
         .stages()
         .map(|(_, _, stage)| stage.graph())
         .collect()
 }
 
-fn uncut<V: ValidationChannel>(
-    g: &Graph<V>,
-    inputs: &HashMap<ValueId, Value>,
-) -> poot_eval::Evaluation {
+fn uncut(g: &Graph, inputs: &HashMap<ValueId, Value>) -> poot_eval::Evaluation {
     eval(
         g,
         inputs,
@@ -95,12 +88,8 @@ fn a_qwen2_pipeline_cut_after_layers_zero_and_one_equals_the_uncut_oracle() {
     );
     let chained = chain(&graph, &stage_graphs(&program), &inputs);
     assert_eq!(bits(&chained.output), bits(&whole.output));
-    assert_eq!(chained.state.len(), graph.state.len());
-    for (pair, (got, expected)) in graph
-        .state
-        .iter()
-        .zip(chained.state.iter().zip(&whole.state))
-    {
+    assert_eq!(chained.state.len(), graph.state().count());
+    for (pair, (got, expected)) in graph.state().zip(chained.state.iter().zip(&whole.state)) {
         assert_eq!(
             bits(got),
             bits(expected),
@@ -115,7 +104,7 @@ fn a_qwen2_pipeline_cut_after_layers_zero_and_one_equals_the_uncut_oracle() {
 /// layer 0 (`a`, a structural duplicate `a2` that CSE merges into `a`, `c`, and `d`), `c` fans out to
 /// both later stages, layer 0's carried state is fed by a boundary value, and a validation witness
 /// hangs off another boundary.
-fn export_fixture() -> Graph<ValidationOutputs> {
+fn export_fixture() -> Graph {
     let b = Builder::new();
     let x = b.slot(Slot::Activation, TensorType::f32(vec![4]));
     let w = b.constant("w", TensorType::f32(vec![4]));
@@ -157,9 +146,9 @@ fn export_fixture() -> Graph<ValidationOutputs> {
     .expect("the fixture validates")
 }
 
-fn export_inputs(g: &Graph<ValidationOutputs>) -> HashMap<ValueId, Value> {
+fn export_inputs(g: &Graph) -> HashMap<ValueId, Value> {
     let mut inputs = HashMap::new();
-    for (index, &id) in g.inputs.iter().enumerate() {
+    for (index, &id) in g.inputs().iter().enumerate() {
         let shape = g.aval(id).shape.clone();
         let data = fill(shape.iter().product(), 100 + index as u64);
         inputs.insert(id, Value::from(HostTensor::f32(shape, data)));
@@ -185,7 +174,7 @@ fn exports_survive_cse_dce_and_renumbering_and_every_consumer_sees_its_value() {
 
     // Stage 0 exports a, a2, c and d; a2 was merged into a by CSE, so two exports share one value.
     let (_, _, first) = program.stages().next().unwrap();
-    let exports = first.exports();
+    let exports: Vec<_> = first.exports().collect();
     assert_eq!(exports.len(), 4, "a, a2, c and d all leave stage 0");
     let distinct: std::collections::BTreeSet<ValueId> =
         exports.iter().map(|export| export.value).collect();
@@ -194,10 +183,14 @@ fn exports_survive_cse_dce_and_renumbering_and_every_consumer_sees_its_value() {
         3,
         "CSE merged the duplicate into one compiled value, each export keeps its own id"
     );
-    for export in exports {
+    for export in &exports {
         assert!(
-            first.graph().eqns.iter().any(|eqn| eqn.out == export.value)
-                || first.graph().inputs.contains(&export.value),
+            first
+                .graph()
+                .eqns()
+                .iter()
+                .any(|eqn| eqn.out == export.value)
+                || first.graph().inputs().contains(&export.value),
             "{:?} resolves to a value the compiled stage defines",
             export.id
         );
@@ -222,15 +215,11 @@ fn exports_survive_cse_dce_and_renumbering_and_every_consumer_sees_its_value() {
 
     let chained = chain(&graph, &stage_graphs(&program), &inputs);
     assert_eq!(bits(&chained.output), bits(&whole.output), "the output");
-    for (pair, (got, expected)) in graph
-        .state
-        .iter()
-        .zip(chained.state.iter().zip(&whole.state))
-    {
+    for (pair, (got, expected)) in graph.state().zip(chained.state.iter().zip(&whole.state)) {
         assert_eq!(bits(got), bits(expected), "state {} -> {}", pair.0, pair.1);
     }
     let environment = whole.environment.as_ref().unwrap();
-    let declared = &graph.validation_outputs()[0];
+    let declared = graph.witnesses().next().unwrap();
     assert_eq!(
         bits(&chained.witnesses[&declared.id]),
         bits(environment[declared.value].as_ref().unwrap()),
@@ -258,7 +247,7 @@ fn long_chain(blocks: usize) -> Graph {
         let shifted = b.binary(BinOp::Add, scaled, x);
         hidden = b.binary(BinOp::Mul, shifted, scaled);
     }
-    b.finish(hidden)
+    b.finish(hidden).unwrap()
 }
 
 /// SC-006 (metadata half): the value tables the stages own add up to the graph plus the explicit
@@ -271,7 +260,7 @@ fn long_chain(blocks: usize) -> Graph {
 fn stage_metadata_is_linear_in_the_graph_plus_links_not_stages_times_values() {
     let blocks = 64;
     let graph = long_chain(blocks);
-    let values = graph.values.len();
+    let values = graph.values().len();
     assert!(
         values > 3 * blocks,
         "a long graph, or the bound proves nothing"
@@ -282,7 +271,7 @@ fn stage_metadata_is_linear_in_the_graph_plus_links_not_stages_times_values() {
         let cuts: Vec<usize> = (1..stages).map(|s| s * blocks / stages - 1).collect();
         let split = crate::test_support::split_after_layers(&graph, &cuts).unwrap();
         assert_eq!(split.stages.len(), stages);
-        let owned: usize = split.stages.iter().map(|s| s.graph.values.len()).sum();
+        let owned: usize = split.stages.iter().map(|s| s.graph.values().len()).sum();
         let links: usize = split
             .boundaries
             .iter()
@@ -299,7 +288,7 @@ fn stage_metadata_is_linear_in_the_graph_plus_links_not_stages_times_values() {
         let program = staged(&graph, pipeline(&cuts), &options());
         let compiled: usize = program
             .stages()
-            .map(|(_, _, stage)| stage.graph().values.len())
+            .map(|(_, _, stage)| stage.graph().values().len())
             .sum();
         assert!(
             compiled <= values + links + stages * replicated,
@@ -335,7 +324,7 @@ fn a_lora_graph_cut_across_stages_equals_the_unpartitioned_adapted_graph() {
     // The adapted graph is the one the oracle evaluates, so bind its inputs by declared identity.
     let single_graph = stage_graphs(&single)[0];
     let adapted_inputs: HashMap<ValueId, Value> = single_graph
-        .inputs
+        .inputs()
         .iter()
         .map(|&id| (id, adapted_input(single_graph, id, &graph, &inputs)))
         .collect();
@@ -373,7 +362,7 @@ fn adapted_input(
     inputs: &HashMap<ValueId, Value>,
 ) -> Value {
     let meta = adapted.meta(id);
-    let found = original.inputs.iter().find(|&&candidate| {
+    let found = original.inputs().iter().find(|&&candidate| {
         let theirs = original.meta(candidate);
         theirs.storage == meta.storage
             && theirs.name == meta.name
@@ -431,7 +420,8 @@ fn i32_boundary(consumer_does_arithmetic: bool) -> Graph {
             b.gather(table, 0, ids)
         };
     }
-    b.finish_with_state(out, &[(k_in, k_out)])
+    b.finish(poot_graph_ir::Outputs::new(out).with_state(&[(k_in, k_out)]))
+        .unwrap()
 }
 
 /// SC-008, POOT-725: an I32 boundary value has one representation, dense I32 words, however its consumer
@@ -517,7 +507,9 @@ fn a_boundary_that_views_carried_state_is_refused_at_compile() {
         let _layer = b.layer_scope(1);
         out = b.binary(BinOp::Add, view, view);
     }
-    let graph = b.finish_with_state(out, &[(k_in, k_out)]);
+    let graph = b
+        .finish(poot_graph_ir::Outputs::new(out).with_state(&[(k_in, k_out)]))
+        .unwrap();
     match compile_staged(
         &graph,
         &TargetSet::single(DeviceId(0), target()),
@@ -569,7 +561,7 @@ fn moe_model(tokens: usize, layers: usize) -> Graph {
         let y = poot_graph_ir::ops::moe(&b, x, router, w_in, w_out, EXPERTS, TOP_K, INTER);
         x = b.binary(BinOp::Add, x, y);
     }
-    b.finish(x)
+    b.finish(x).unwrap()
 }
 
 fn pooled_partition(slots_per_layer: usize) -> Partition {
@@ -579,10 +571,7 @@ fn pooled_partition(slots_per_layer: usize) -> Partition {
     }
 }
 
-fn compile_pooled(
-    g: &Graph,
-    slots_per_layer: usize,
-) -> Result<StagedProgram<poot_graph_ir::NoValidations>, StagedCompileError> {
+fn compile_pooled(g: &Graph, slots_per_layer: usize) -> Result<StagedProgram, StagedCompileError> {
     compile_staged(
         g,
         &TargetSet::single(DeviceId(0), target()),
@@ -640,14 +629,14 @@ impl PoolHost<'_> {
 /// Evaluate a pooled program stage by stage on the oracle: each stage binds the unpooled graph's
 /// inputs by name, the boundaries earlier stages exported, and whatever the sync before it wrote.
 fn eval_pooled(
-    program: &StagedProgram<poot_graph_ir::NoValidations>,
+    program: &StagedProgram,
     graph: &Graph,
     inputs: &HashMap<ValueId, Value>,
 ) -> (Value, Vec<Vec<usize>>) {
     let mut by_name: HashMap<String, Value> = HashMap::new();
     let mut tables = HashMap::new();
     let mut activations: HashMap<SlotKey, Value> = HashMap::new();
-    for &id in &graph.inputs {
+    for &id in graph.inputs() {
         let meta = graph.meta(id);
         let value = inputs[&id].clone();
         match meta.storage {
@@ -681,7 +670,7 @@ fn eval_pooled(
     for (index, (stage, _, program_stage)) in program.stages().enumerate() {
         let g = program_stage.graph();
         let stage_inputs: HashMap<ValueId, Value> = g
-            .inputs
+            .inputs()
             .iter()
             .map(|&id| {
                 let meta = g.meta(id);
@@ -711,7 +700,7 @@ fn eval_pooled(
         )
         .unwrap_or_else(|error| panic!("stage {index} did not evaluate: {error}"));
         let environment = result.environment.expect("the environment was kept");
-        for export in &g.exports {
+        for export in g.exports() {
             boundaries.insert(
                 export.id.slot_key(),
                 environment[export.value].clone().expect("exported"),

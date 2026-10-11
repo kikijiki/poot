@@ -124,11 +124,13 @@ pub enum DeviceBackend {
     Rocm,
     /// The NVIDIA PTX runtime (`poot-ptx-runtime`, `poot-ptx-gpu`).
     Ptx,
+    /// The AMD XDNA2 NPU over XRT (`poot-npu`).
+    Npu,
 }
 
 impl DeviceBackend {
     /// Every backend, for tests and scripts that must cover all of them.
-    pub const ALL: [Self; 4] = [Self::Wgpu, Self::Vulkan, Self::Rocm, Self::Ptx];
+    pub const ALL: [Self; 5] = [Self::Wgpu, Self::Vulkan, Self::Rocm, Self::Ptx, Self::Npu];
 
     /// The environment variable that requires this backend (`POOT_REQUIRE_<BACKEND>`).
     pub const fn variable(self) -> &'static str {
@@ -137,6 +139,7 @@ impl DeviceBackend {
             Self::Vulkan => "POOT_REQUIRE_VULKAN",
             Self::Rocm => "POOT_REQUIRE_ROCM",
             Self::Ptx => "POOT_REQUIRE_PTX",
+            Self::Npu => "POOT_REQUIRE_NPU",
         }
     }
 
@@ -147,6 +150,7 @@ impl DeviceBackend {
             Self::Vulkan => "Vulkan",
             Self::Rocm => "ROCm",
             Self::Ptx => "PTX",
+            Self::Npu => "NPU",
         }
     }
 
@@ -232,20 +236,6 @@ pub fn fnv1a_bytes(bytes: &[u8]) -> u64 {
 /// FNV-1a (64-bit) over a string: a deterministic content fingerprint for backend cache keys.
 pub fn fnv1a(s: &str) -> u64 {
     fnv1a_bytes(s.as_bytes())
-}
-
-/// Round an f32 to bf16 bits (round-to-nearest, ties-to-even) and return the 16-bit pattern.
-/// NaN keeps its sign: a quiet NaN stays quiet with its high payload bits, and a signaling NaN is
-/// quieted (bf16 has no signaling NaN). Infinities, the sign, and the exponent range carry through;
-/// values above bf16's max finite round to infinity.
-pub fn f32_to_bf16(x: f32) -> u16 {
-    let bits = x.to_bits();
-    if x.is_nan() {
-        // Keep it a NaN: force the quiet bit (bf16's top mantissa bit) and preserve sign + payload.
-        return ((bits >> 16) as u16) | 0x0040;
-    }
-    let rounding_bias = 0x7fff + ((bits >> 16) & 1);
-    ((bits + rounding_bias) >> 16) as u16
 }
 
 #[cfg(test)]
@@ -410,66 +400,6 @@ mod tests {
         // Non-1-D with a legal X: unchanged even when Z > 1.
         assert_eq!(fold_grid([10, 1, 4], L, L), Some([10, 1, 4]));
     }
-
-    /// Golden table for [`f32_to_bf16`]. Every expectation is a hex literal, never computed by the
-    /// function under test. Covers exact ties (round to even both directions), values just above and
-    /// below the midpoint, max-finite overflow to infinity, +/-inf, qNaN and sNaN staying NaN,
-    /// +/-0, and subnormals (including a tie at the subnormal/normal boundary).
-    #[test]
-    fn f32_to_bf16_golden_table() {
-        const CASES: &[(u32, u16)] = &[
-            // Exact ties: low16 == 0x8000, round to even (even result both down and up).
-            (0x3F80_8000, 0x3F80),
-            (0x3F81_8000, 0x3F82),
-            (0xBF80_8000, 0xBF80),
-            (0xBF81_8000, 0xBF82),
-            // Just below / just above the same midpoints.
-            (0x3F80_7FFF, 0x3F80),
-            (0x3F80_8001, 0x3F81),
-            (0x3F81_7FFF, 0x3F81),
-            (0x3F81_8001, 0x3F82),
-            (0xBF80_7FFF, 0xBF80),
-            (0xBF80_8001, 0xBF81),
-            // Above the midpoint but far from it (the value the old ROCm body got wrong).
-            (0x3F80_A000, 0x3F81),
-            (0x3F80_9FFF, 0x3F81),
-            // Exactly representable: identity on the high 16 bits.
-            (0x3F80_0000, 0x3F80),
-            (0xC000_0000, 0xC000),
-            (0x3F81_0000, 0x3F81),
-            // Max finite overflows to infinity; a tie at the top boundary goes to the even side.
-            (0x7F7F_FFFF, 0x7F80),
-            (0xFF7F_FFFF, 0xFF80),
-            (0x7F7F_8000, 0x7F80),
-            (0x7F7E_8000, 0x7F7E),
-            // +/-infinity.
-            (0x7F80_0000, 0x7F80),
-            (0xFF80_0000, 0xFF80),
-            // Quiet NaN stays quiet NaN, sign and high payload bits preserved.
-            (0x7FC0_0000, 0x7FC0),
-            (0x7FD2_ABCD, 0x7FD2),
-            (0xFFC0_0000, 0xFFC0),
-            // Signaling NaN is quieted (bf16 has no sNaN), sign preserved.
-            (0x7F80_0001, 0x7FC0),
-            (0xFF80_0001, 0xFFC0),
-            (0x7FBF_FFFF, 0x7FFF),
-            // +/-0.
-            (0x0000_0000, 0x0000),
-            (0x8000_0000, 0x8000),
-            // Subnormals: flush to zero, tie to even, just off the tie, and the sub/normal boundary.
-            (0x0000_0001, 0x0000),
-            (0x8000_0001, 0x8000),
-            (0x0000_8000, 0x0000),
-            (0x0000_8001, 0x0001),
-            (0x0001_8000, 0x0002),
-            (0x007F_FFFF, 0x0080),
-            (0x007F_8000, 0x0080),
-        ];
-        for &(bits, want) in CASES {
-            let got = f32_to_bf16(f32::from_bits(bits));
-            assert_eq!(got, want, "f32_to_bf16({bits:#010x}) = {got:#06x}");
-        }
-    }
 }
 
 #[cfg(test)]
@@ -500,6 +430,7 @@ mod device_backend_tests {
             "POOT_REQUIRE_VULKAN",
             "POOT_REQUIRE_ROCM",
             "POOT_REQUIRE_PTX",
+            "POOT_REQUIRE_NPU",
         ];
         for (backend, own) in DeviceBackend::ALL.into_iter().zip(variables) {
             assert_eq!(backend.variable(), own);

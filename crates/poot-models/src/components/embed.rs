@@ -97,7 +97,8 @@ mod tests {
             let ids = b.slot(Slot::Token, TensorType::new(vec![1, 4], DType::I32));
             let y = e.embed(&b, ids);
             assert_eq!(b.aval(y).shape, vec![1, 4, w]);
-            fx.eval(&b.finish(y), &[], &[(Slot::Token, &tokens)], &[]).0
+            fx.eval(&b.finish(y).unwrap(), &[], &[(Slot::Token, &tokens)], &[])
+                .0
         };
         let got = run(&fx);
         let table = fx.values(id);

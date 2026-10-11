@@ -6,23 +6,23 @@
 
 use std::borrow::Cow;
 
-use poot_graph_ir::{Graph, ValidationChannel};
+use poot_graph_ir::Graph;
 
 use super::{ExpertPlacement, StagedCompileError};
 use crate::passes::{GraphBudget, PoolSite, StageSplitError, pool_experts};
 
 /// The graph after the expert placement and the routed selections it cut at, in equation order.
-pub(super) struct Placed<'g, V: ValidationChannel> {
-    pub(super) graph: Cow<'g, Graph<V>>,
+pub(super) struct Placed<'g> {
+    pub(super) graph: Cow<'g, Graph>,
     /// Each pooled selection and the equation that opens the stage after its sync.
     pub(super) sites: Vec<(PoolSite, usize)>,
 }
 
-pub(super) fn apply<'g, V: ValidationChannel>(
-    graph: Cow<'g, Graph<V>>,
+pub(super) fn apply<'g>(
+    graph: Cow<'g, Graph>,
     experts: ExpertPlacement,
     budget: &GraphBudget,
-) -> Result<Placed<'g, V>, StagedCompileError> {
+) -> Result<Placed<'g>, StagedCompileError> {
     match experts {
         ExpertPlacement::AllResident => Ok(Placed {
             graph,
@@ -49,8 +49,8 @@ pub(super) struct Cut {
 /// The cuts of a pooled graph in stage order: its sync cuts and the placement's layer cuts, both
 /// resolved to equation positions of `graph` (the pooled graph, whose layer tags the gathers carry).
 /// Two cuts at one position are one stage boundary.
-pub(super) fn cuts<V: ValidationChannel>(
-    graph: &Graph<V>,
+pub(super) fn cuts(
+    graph: &Graph,
     after_layers: &[usize],
     sites: &[(PoolSite, usize)],
 ) -> Result<Vec<Cut>, StageSplitError> {

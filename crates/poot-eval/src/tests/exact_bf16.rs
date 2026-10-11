@@ -28,37 +28,41 @@ static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 /// the exact post-fold shape the real pass would produce for that one chain - not a
 /// re-implementation of the pass's general pattern match, just this fixture's own known shape,
 /// preserving every value id the eval-side assertions key on (`logits.id`, `widened.id`).
-fn as_dense_contraction(mut g: Graph, x: ValueId, weight: ValueId) -> Graph {
+fn as_dense_contraction(g: Graph, x: ValueId, weight: ValueId) -> Graph {
     let dtype = g.aval(weight).dtype;
-    let out = g.output;
-    g.eqns = vec![poot_graph_ir::Eqn {
-        op: OpKind::DenseContraction { weight: dtype },
-        inputs: vec![
-            poot_graph_ir::Operand::Value(x),
-            poot_graph_ir::Operand::Value(weight),
-        ],
-        out,
-        layer: None,
-    }];
-    g
+    let out = g.result();
+    poot_test_util::graph_fixtures::derive(&g, |draft| {
+        *draft.eqns_mut() = vec![poot_graph_ir::Eqn {
+            op: OpKind::DenseContraction { weight: dtype },
+            inputs: vec![
+                poot_graph_ir::Operand::Value(x),
+                poot_graph_ir::Operand::Value(weight),
+            ],
+            out,
+            layer: None,
+        }];
+    })
+    .unwrap()
 }
 
 /// See [`as_dense_contraction`]'s doc. Only valid when the traced chain is a plain
 /// `Cast(F32, Gather(table, index))` with no `Reshape` link (`dense_row_gather_matches_gather_then_widen`'s
 /// reshaped case hand-rewrites its own two-equation shape inline instead).
-fn as_dense_row_gather(mut g: Graph, table: ValueId, index: ValueId) -> Graph {
+fn as_dense_row_gather(g: Graph, table: ValueId, index: ValueId) -> Graph {
     let dtype = g.aval(table).dtype;
-    let out = g.output;
-    g.eqns = vec![poot_graph_ir::Eqn {
-        op: OpKind::DenseRowGather { source: dtype },
-        inputs: vec![
-            poot_graph_ir::Operand::Value(table),
-            poot_graph_ir::Operand::Value(index),
-        ],
-        out,
-        layer: None,
-    }];
-    g
+    let out = g.result();
+    poot_test_util::graph_fixtures::derive(&g, |draft| {
+        *draft.eqns_mut() = vec![poot_graph_ir::Eqn {
+            op: OpKind::DenseRowGather { source: dtype },
+            inputs: vec![
+                poot_graph_ir::Operand::Value(table),
+                poot_graph_ir::Operand::Value(index),
+            ],
+            out,
+            layer: None,
+        }];
+    })
+    .unwrap()
 }
 
 /// BF16 words with their f32 values spelled as literals, so a decode with another exponent bias, byte order,
@@ -205,7 +209,7 @@ fn bf16_cast_decodes_owner_words_bit_exactly() {
     let builder = Builder::new();
     let source = builder.constant("source", TensorType::new([2, 3], DType::BF16));
     let widened = builder.cast(source, DType::F32);
-    let graph = builder.finish(widened);
+    let graph = builder.finish(widened).unwrap();
 
     let output = eval(
         &graph,
@@ -231,7 +235,7 @@ fn bf16_gather_reads_the_selected_rows() {
     let token = builder.slot(Slot::Token, TensorType::new([3], DType::I32));
     let rows = builder.gather(source, 0, token);
     let widened = builder.cast(rows, DType::F32);
-    let graph = builder.finish(widened);
+    let graph = builder.finish(widened).unwrap();
     let inputs = |ids: Vec<i32>| {
         HashMap::from([
             (source.id(), Value::from(table(&[4, 2]))),
@@ -285,7 +289,7 @@ fn bf16_gather_reads_the_selected_rows() {
     let source = builder.constant("table", TensorType::new([2, 3], DType::BF16));
     let token = builder.slot(Slot::Token, TensorType::new([2], DType::I32));
     let columns = builder.cast(builder.gather(source, 1, token), DType::F32);
-    let graph = builder.finish(columns);
+    let graph = builder.finish(columns).unwrap();
     let output = eval(
         &graph,
         &HashMap::from([
@@ -310,7 +314,7 @@ fn bf16_weight_matmul_decodes_the_weight_and_keeps_f32_precision() {
     let x = builder.slot(Slot::Activation, TensorType::f32(vec![1, 3]));
     let transposed = builder.transpose(weight, vec![1, 0]);
     let logits = builder.matmul(x, transposed);
-    let graph = builder.finish(logits);
+    let graph = builder.finish(logits).unwrap();
     // 0.5 + 7/1024 is not a BF16 value, so narrowing the activation or the product would change the result.
     let activation = vec![0.5 + 7.0 / 1024.0, -0.5, 2.0];
 
@@ -356,10 +360,10 @@ fn dense_contraction_matches_the_mixed_matmul_definition() {
     let x = builder.slot(Slot::Activation, TensorType::f32(vec![1, 3]));
     let transposed = builder.transpose(weight, vec![1, 0]);
     let logits = builder.matmul(x, transposed);
-    let graph = as_dense_contraction(builder.finish(logits), x.id(), weight.id());
+    let graph = as_dense_contraction(builder.finish(logits).unwrap(), x.id(), weight.id());
 
     assert!(
-        graph.eqns.iter().any(|eqn| eqn.op
+        graph.eqns().iter().any(|eqn| eqn.op
             == poot_graph_ir::OpKind::DenseContraction {
                 weight: DType::BF16
             }),
@@ -367,7 +371,7 @@ fn dense_contraction_matches_the_mixed_matmul_definition() {
     );
     assert!(
         !graph
-            .eqns
+            .eqns()
             .iter()
             .any(|eqn| matches!(eqn.op, poot_graph_ir::OpKind::Transpose { .. })),
         "the folded graph holds no transpose to materialize"
@@ -413,10 +417,10 @@ fn dense_row_gather_matches_gather_then_widen() {
     let token = builder.slot(Slot::Token, TensorType::new([3], DType::I32));
     let rows = builder.gather(source, 0, token);
     let widened = builder.cast(rows, DType::F32);
-    let graph = as_dense_row_gather(builder.finish(widened), source.id(), token.id());
+    let graph = as_dense_row_gather(builder.finish(widened).unwrap(), source.id(), token.id());
 
     assert!(
-        graph.eqns.iter().any(|eqn| eqn.op
+        graph.eqns().iter().any(|eqn| eqn.op
             == poot_graph_ir::OpKind::DenseRowGather {
                 source: DType::BF16
             }),
@@ -424,7 +428,7 @@ fn dense_row_gather_matches_gather_then_widen() {
     );
     assert!(
         !graph
-            .eqns
+            .eqns()
             .iter()
             .any(|eqn| matches!(eqn.op, poot_graph_ir::OpKind::Gather { .. })),
         "the folded graph holds no BF16 gather to materialize"
@@ -485,36 +489,41 @@ fn dense_row_gather_matches_gather_then_widen() {
     let token = builder.slot(Slot::Token, TensorType::new([3], DType::I32));
     let shaped = builder.reshape(builder.gather(source, 0, token), vec![1, 3, 2]);
     let widened = builder.cast(shaped, DType::F32);
-    let mut graph = builder.finish(widened);
+    let traced = builder.finish(widened).unwrap();
     // Hand-rewrite to the post-fold shape for a `Reshape` link (Card 381 FR-004): the row gather
     // writes the ungathered `[3, 2]` F32 rows at a fresh id, and the same reshape, rebuilt over F32,
     // reads it and writes `widened.id`.
-    let gathered_f32 = graph.values.push(poot_graph_ir::graph::ValueMeta::new(
-        TensorType::f32(vec![3, 2]),
-        poot_graph_ir::graph::Storage::Device,
-        None,
-    ));
-    graph.eqns = vec![
-        poot_graph_ir::Eqn {
-            op: OpKind::DenseRowGather {
-                source: DType::BF16,
+    let graph = poot_test_util::graph_fixtures::derive(&traced, |draft| {
+        let gathered_f32 = draft
+            .values_mut()
+            .push(poot_graph_ir::graph::ValueMeta::new(
+                TensorType::f32(vec![3, 2]),
+                poot_graph_ir::graph::Storage::Device,
+                None,
+            ));
+        *draft.eqns_mut() = vec![
+            poot_graph_ir::Eqn {
+                op: OpKind::DenseRowGather {
+                    source: DType::BF16,
+                },
+                inputs: vec![
+                    poot_graph_ir::Operand::Value(source.id()),
+                    poot_graph_ir::Operand::Value(token.id()),
+                ],
+                out: gathered_f32,
+                layer: None,
             },
-            inputs: vec![
-                poot_graph_ir::Operand::Value(source.id()),
-                poot_graph_ir::Operand::Value(token.id()),
-            ],
-            out: gathered_f32,
-            layer: None,
-        },
-        poot_graph_ir::Eqn {
-            op: OpKind::Reshape {
-                shape: vec![1, 3, 2],
+            poot_graph_ir::Eqn {
+                op: OpKind::Reshape {
+                    shape: vec![1, 3, 2],
+                },
+                inputs: vec![poot_graph_ir::Operand::Value(gathered_f32)],
+                out: widened.id(),
+                layer: None,
             },
-            inputs: vec![poot_graph_ir::Operand::Value(gathered_f32)],
-            out: widened.id(),
-            layer: None,
-        },
-    ];
+        ];
+    })
+    .unwrap();
     let output = eval(
         &graph,
         &HashMap::from([
@@ -540,7 +549,7 @@ fn bf16_reshape_aliases_contiguous_views_only() {
     let builder = Builder::new();
     let source = builder.constant("table", TensorType::new([2, 3], DType::BF16));
     let reshaped = builder.reshape(source, vec![3, 2]);
-    let graph = builder.finish(reshaped);
+    let graph = builder.finish(reshaped).unwrap();
     let view = table(&[2, 3]);
     let output = eval(
         &graph,
@@ -564,7 +573,7 @@ fn bf16_reshape_aliases_contiguous_views_only() {
     let builder = Builder::new();
     let source = builder.constant("table", TensorType::new([2, 3], DType::BF16));
     let reshaped = builder.reshape(builder.transpose(source, vec![1, 0]), vec![6]);
-    let graph = builder.finish(reshaped);
+    let graph = builder.finish(reshaped).unwrap();
     let output = eval(
         &graph,
         &HashMap::from([(source.id(), Value::from(table(&[2, 3])))]),
@@ -636,7 +645,7 @@ fn f32_owner_view_is_rejected_as_a_matmul_activation_before_execution() {
     // This widening runs first if preflight lets the F32 owner through, and records an allocation.
     let _earlier = builder.cast(other, DType::F32);
     let product = builder.matmul(activation, weight);
-    let graph = builder.finish(product);
+    let graph = builder.finish(product).unwrap();
     let output = eval(
         &graph,
         &HashMap::from([
@@ -675,7 +684,7 @@ fn bf16_widening_cast_above_budget_is_refused() {
     let builder = Builder::new();
     let source = builder.constant("table", TensorType::new([2, 3], DType::BF16));
     let widened = builder.cast(source, DType::F32);
-    let graph = builder.finish(widened);
+    let graph = builder.finish(widened).unwrap();
     let inputs = HashMap::from([(source.id(), Value::from(table(&[2, 3])))]);
 
     // 6 elements decode to 24 F32 bytes; a 20-byte ceiling must refuse before any byte is written.
@@ -756,7 +765,7 @@ fn an_unrelated_e4m3fn_branch_does_not_change_an_otherwise_ordinary_mixed_dtype_
     // Graph A: the chain alone.
     let b = Builder::new();
     let (bf16_table, idx, cond, zero, one, sum) = chain(&b);
-    let graph_a = b.finish(sum);
+    let graph_a = b.finish(sum).unwrap();
     let inputs_a = common_inputs(bf16_table.id(), idx.id(), cond.id(), zero.id(), one.id());
     let out_a = eval(&graph_a, &inputs_a, EvalOptions::new(EvalBudget::UNBOUNDED))
         .expect("the chain alone must evaluate")
@@ -771,7 +780,7 @@ fn an_unrelated_e4m3fn_branch_does_not_change_an_otherwise_ordinary_mixed_dtype_
     let e4m3_mid = b.cast(e4m3_in, DType::E4M3FN);
     let e4m3_out = b.cast(e4m3_mid, DType::F32);
     let output_b = b.binary(poot_graph_ir::BinOp::Add, sum, e4m3_out);
-    let graph_b = b.finish(output_b);
+    let graph_b = b.finish(output_b).unwrap();
     let mut inputs_b = common_inputs(bf16_table.id(), idx.id(), cond.id(), zero.id(), one.id());
     inputs_b.insert(
         e4m3_in.id(),

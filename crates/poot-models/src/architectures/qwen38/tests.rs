@@ -782,9 +782,8 @@ impl Case {
             hidden: None,
         };
         let g = model.trace(Phase::Prefill, shape).unwrap();
-        g.state
-            .iter()
-            .map(|&(input, _)| g.meta(input).name.clone().expect("state is named"))
+        g.state()
+            .map(|(input, _)| g.meta(input).name.clone().expect("state is named"))
             .collect()
     }
 }
@@ -1119,8 +1118,7 @@ fn an_out_of_vocabulary_token_is_a_typed_validation_fault() {
     };
     let g = model.trace(Phase::Prefill, shape).unwrap();
     let witnesses: Vec<usize> = g
-        .validation_outputs()
-        .iter()
+        .witnesses()
         .filter_map(|v| PleWitness::decode(v.id))
         .collect();
     assert_eq!(witnesses, vec![1], "one PLE witness, on layer 1");
@@ -1151,7 +1149,7 @@ fn packed_experts_trace_as_packed_weights_and_dense_ones_as_stored_stacks() {
         let formats = poot_graph_plan::WeightFormats::from_weight_map(model.weights());
         let bound = poot_graph_plan::bind_packed_weights(&g, &formats).unwrap();
         let dequants = bound
-            .eqns
+            .eqns()
             .iter()
             .filter(|e| {
                 matches!(
@@ -1161,7 +1159,7 @@ fn packed_experts_trace_as_packed_weights_and_dense_ones_as_stored_stacks() {
             })
             .count();
         let expert_consts: Vec<(String, DType)> = bound
-            .inputs
+            .inputs()
             .iter()
             .filter_map(|&id| {
                 let meta = bound.meta(id);

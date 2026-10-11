@@ -40,7 +40,7 @@ and tensor parallelism live under [Serving design](../architecture/serving-desig
 ## Serving features
 
 - **[Continuous batching and concurrency](./continuous-batching.md)**: The scheduling loop, rows and bounds.
-- **[Speculative decoding](./speculative-decoding.md)**: Prompt lookup and draft-model policies, served through the one loop.
+- **[Speculative decoding](./speculative-decoding.md)**: Prompt lookup, draft-model and the model's own MTP layer, served through the one loop.
 - **[Using LoRA adapters](./lora-adapters.md)**: Hot-load, select and unload adapters.
 - **[Tensor parallelism](./tensor-parallelism.md)**: Weights and the paged KV pool divided over ranks; served on a two-GPU PTX pair.
 

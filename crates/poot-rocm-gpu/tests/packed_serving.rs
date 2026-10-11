@@ -36,6 +36,7 @@ use poot_runtime_common::DeviceBackend;
 use poot_tensor::DType;
 use poot_test_util::const_weights::ConstWeights;
 use poot_test_util::device_skip::open_or_skip;
+use poot_test_util::graph_fixtures::gpu_caps;
 
 const K: usize = 256;
 const OUT: usize = 8;
@@ -70,11 +71,8 @@ fn canonical(value: f32) -> u32 {
     (value + 0.0).to_bits()
 }
 
-fn staged(
-    target: Target,
-    graph: &Graph,
-) -> poot_graph_plan::StagedProgram<poot_graph_ir::ValidationOutputs> {
-    let graph = graph.clone().with_validations(Vec::new());
+fn staged(target: Target, graph: &Graph) -> poot_graph_plan::StagedProgram {
+    let graph = graph.clone();
     compile_staged(
         &graph,
         &TargetSet::single(DeviceId(0), target),
@@ -93,7 +91,7 @@ fn staged(
 fn store_for(graph: &Graph, owners: &HashMap<String, Arc<PackedPayload>>) -> Arc<WeightStore> {
     let mut builder = WeightStore::builder();
     let mut seen = std::collections::HashSet::new();
-    for &id in &graph.inputs {
+    for &id in graph.inputs() {
         let Some(name) = graph
             .meta(id)
             .name
@@ -195,7 +193,8 @@ fn bytemuck_f32(bytes: &[u8]) -> Vec<f32> {
 fn state_probe_graph(name: &str, aval: TensorType) -> Graph {
     let b = Builder::new();
     let state = b.state_input(name, aval, StateRole::Recurrent);
-    b.finish_with_state(state, &[(state, state)])
+    b.finish(poot_graph_ir::Outputs::new(state).with_state(&[(state, state)]))
+        .unwrap()
 }
 
 /// Decode over an explicit one-hot activation slot: `y = x @ W^T`, the `[STEPS, OUT]` cache written
@@ -211,7 +210,9 @@ fn slot_decode_graph(descriptor: poot_quant::PackedWeight) -> (Graph, SlotKey, S
         StateRole::Recurrent,
     );
     let cache_out = b.dynamic_update_slice_dyn(cache, y, pos, 0);
-    let g = b.finish_with_state(y, &[(cache, cache_out)]);
+    let g = b
+        .finish(poot_graph_ir::Outputs::new(y).with_state(&[(cache, cache_out)]))
+        .unwrap();
     let xk = g.meta(x.id()).slot_key().unwrap().clone();
     let pk = g.meta(pos.id()).slot_key().unwrap().clone();
     (g, xk, pk)
@@ -382,7 +383,9 @@ fn packed_prefill_through_the_contract_is_bit_exact() {
             StateRole::Recurrent,
         );
         let cache_out = b.dynamic_update_slice(cache, y, 0, 0);
-        let graph = b.finish_with_state(y, &[(cache, cache_out)]);
+        let graph = b
+            .finish(poot_graph_ir::Outputs::new(y).with_state(&[(cache, cache_out)]))
+            .unwrap();
         let x_key = graph.meta(x.id()).slot_key().unwrap().clone();
 
         let owners = HashMap::from([("layer".to_string(), Arc::clone(&owner))]);
@@ -542,13 +545,13 @@ impl StackBuffers {
                 );
                 let caps = poot_target::DeviceCaps {
                     max_buffer_bytes: 2 * slab,
-                    ..target.caps
+                    ..gpu_caps(&target)
                 };
                 let split =
                     poot_graph_plan::legalize(g, &caps, &poot_graph_plan::CompileLimits::STANDARD)
                         .expect("the stacked table splits");
                 let carriers: Vec<usize> = split
-                    .consts
+                    .consts()
                     .iter()
                     .map(|&id| split.aval(id).shape[0])
                     .collect();
@@ -606,7 +609,7 @@ fn run_indexed_case(
         TensorType::new(vec![rows], DType::I32),
     );
     let y = poot_graph_ir::ops::packed_indexed_linear(&b, x, ids, &table).unwrap();
-    let graph = b.finish(y);
+    let graph = b.finish(y).unwrap();
     let x_key = graph.meta(x.id()).slot_key().unwrap().clone();
     let ids_key = graph.meta(ids.id()).slot_key().unwrap().clone();
 
@@ -623,7 +626,7 @@ fn run_indexed_case(
     let program = staged(target, &named);
     let compiled = program.stages().next().expect("single stage").2.graph();
     let carriers: Vec<usize> = compiled
-        .consts
+        .consts()
         .iter()
         .map(|&id| compiled.aval(id).shape[0])
         .collect();
@@ -635,7 +638,7 @@ fn run_indexed_case(
     if buffers == StackBuffers::One {
         assert!(
             matches!(
-                compiled.eqns.as_slice(),
+                compiled.eqns(),
                 [poot_graph_ir::Eqn {
                     op: poot_graph_ir::OpKind::PackedContraction {
                         rows: poot_graph_ir::ContractionRows::Indexed { experts: EXPERTS },
@@ -645,7 +648,7 @@ fn run_indexed_case(
                 }]
             ),
             "{what}: {:?}",
-            compiled.eqns
+            compiled.eqns()
         );
     }
     let entry = engine.add_entry(exe, &program).unwrap();
@@ -837,7 +840,7 @@ fn packed_embedding_row_gather_is_bit_exact() {
                 owner.weight(),
             )
             .unwrap();
-            let graph = b.finish(rows);
+            let graph = b.finish(rows).unwrap();
             let token_key = graph.meta(token.id()).slot_key().unwrap().clone();
 
             let owners = HashMap::from([("model.embed_tokens".to_string(), Arc::clone(&owner))]);
@@ -905,7 +908,7 @@ fn dense_e4m3_row_gather_is_bit_exact() {
             TensorType::new(vec![ids.len()], DType::I32),
         );
         let gathered = b.cast(b.gather(table_value, 0, idx), DType::F32);
-        let graph = b.finish(gathered);
+        let graph = b.finish(gathered).unwrap();
         let idx_key = graph.meta(idx.id()).slot_key().unwrap().clone();
 
         let store = {
@@ -1004,7 +1007,7 @@ fn run_dense_activation(
 ) -> Vec<f32> {
     let mut builder = WeightStore::builder();
     let mut seen = std::collections::HashSet::new();
-    for &id in &graph.inputs {
+    for &id in graph.inputs() {
         let Some(name) = graph
             .meta(id)
             .name
@@ -1079,7 +1082,7 @@ fn packed_loaders_match_the_oracle_on_every_output_on_rocm() {
             let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![m, K]));
             let y = poot_graph_ir::ops::packed_linear(&b, x, "layer", owner.weight(), None, None)
                 .unwrap();
-            let graph = b.finish(y);
+            let graph = b.finish(y).unwrap();
             let x_key = graph.meta(x.id()).slot_key().unwrap().clone();
             let activation = fill(7 + m as u64, m * K);
             let got = run_dense_activation(
@@ -1093,7 +1096,7 @@ fn packed_loaders_match_the_oracle_on_every_output_on_rocm() {
             );
             let mut oracle_inputs: HashMap<poot_graph_ir::ValueId, poot_eval::Value> =
                 HashMap::new();
-            for &id in &graph.inputs {
+            for &id in graph.inputs() {
                 if let Some(name) = graph
                     .meta(id)
                     .name
@@ -1165,7 +1168,7 @@ fn a_packed_gemv_head_is_shared_with_the_standalone_gemv_on_rocm() {
             } else {
                 head
             };
-            let g = b.finish(out);
+            let g = b.finish(out).unwrap();
             let key = g.meta(x.id()).slot_key().unwrap().clone();
             (g, key)
         };
@@ -1185,7 +1188,7 @@ fn a_packed_gemv_head_is_shared_with_the_standalone_gemv_on_rocm() {
         let fused_program = staged(target, &graph);
         let fused_graph = fused_program.stages().next().unwrap().2.graph();
         let heads: Vec<ContractionHead> = fused_graph
-            .eqns
+            .eqns()
             .iter()
             .filter_map(|eqn| match &eqn.op {
                 poot_graph_ir::OpKind::ContractionEpilogue { head, .. } => Some(*head),
@@ -1195,7 +1198,7 @@ fn a_packed_gemv_head_is_shared_with_the_standalone_gemv_on_rocm() {
         assert!(
             matches!(heads.as_slice(), [ContractionHead::Packed { .. }]),
             "{what}: one fused packed contraction: {:?}",
-            fused_graph.eqns
+            fused_graph.eqns()
         );
         for (label, bias_values) in [
             ("generic bias", fill(4, OUT)),
@@ -1265,7 +1268,7 @@ fn a_packed_gemv_epilogue_agrees_with_the_standalone_head_chain_on_rocm() {
                 poot_graph_ir::ops::packed_linear(&b, x, "layer", owner.weight(), None, None)
                     .unwrap();
             if !with_chain {
-                let g = b.finish(head);
+                let g = b.finish(head).unwrap();
                 let key = g.meta(x.id()).slot_key().unwrap().clone();
                 return (g, x.id(), key);
             }
@@ -1275,7 +1278,7 @@ fn a_packed_gemv_epilogue_agrees_with_the_standalone_head_chain_on_rocm() {
             let activated = b.unary(UnOp::Tanh, biased);
             let scaled = b.binary_scalar(BinOp::Mul, activated, Scalar::F32(0.5));
             let out = b.binary(BinOp::Add, scaled, residual);
-            let g = b.finish(out);
+            let g = b.finish(out).unwrap();
             let key = g.meta(x.id()).slot_key().unwrap().clone();
             (g, x.id(), key)
         };
@@ -1298,7 +1301,7 @@ fn a_packed_gemv_epilogue_agrees_with_the_standalone_head_chain_on_rocm() {
         let fused_program = staged(target, &graph);
         let fused_graph = fused_program.stages().next().unwrap().2.graph();
         let heads: Vec<ContractionHead> = fused_graph
-            .eqns
+            .eqns()
             .iter()
             .filter_map(|eqn| match &eqn.op {
                 poot_graph_ir::OpKind::ContractionEpilogue { head, .. } => Some(*head),
@@ -1308,7 +1311,7 @@ fn a_packed_gemv_epilogue_agrees_with_the_standalone_head_chain_on_rocm() {
         assert!(
             matches!(heads.as_slice(), [ContractionHead::Packed { .. }]),
             "{what}: one fused packed contraction: {:?}",
-            fused_graph.eqns
+            fused_graph.eqns()
         );
         for (label, bias_values) in [
             ("generic bias", fill(4, OUT)),

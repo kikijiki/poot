@@ -49,7 +49,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 
-use poot_graph_ir::graph::{Eqn, Graph, LayerIndex, Operand, Storage, ValidationChannel, ValueId};
+use poot_graph_ir::graph::{Eqn, Graph, LayerIndex, Operand, Storage, ValueId};
 use poot_graph_ir::op::{BinOp, OpKind, RedOp, UnOp};
 use poot_graph_ir::{PackedSourceName, TensorType, ValueMeta, ValueTable, packed_source_type};
 use poot_quant::format::Storage as FormatStorage;
@@ -114,13 +114,22 @@ pub enum ShardError {
     /// The final stage of the lowered program does not hold the graph's output.
     #[error("the output is not computed by the final stage of the rank program")]
     OutputNotLast,
+    /// A rewrite produced a graph the edit check refused: a defect of the pass, never of the input.
+    #[error(transparent)]
+    Edit(Box<poot_graph_ir::EditError>),
+}
+
+impl From<poot_graph_ir::EditError> for ShardError {
+    fn from(error: poot_graph_ir::EditError) -> Self {
+        Self::Edit(Box::new(error))
+    }
 }
 
 /// A sharded graph: the program every rank runs.
 #[derive(Clone, Debug)]
-pub struct ShardedGraph<V: ValidationChannel> {
+pub struct ShardedGraph {
     /// The traced graph over per-rank shapes, with its collectives as equations.
-    pub graph: Graph<V>,
+    pub graph: Graph,
     /// Each weight the rule cuts and the axis of its mapped logical shape that is divided.
     pub weights: Vec<(WeightId, usize)>,
     /// The result of every collective equation, in equation order.
@@ -196,12 +205,12 @@ fn weight_share(rule: ShardRule, role: WeightRole) -> Share {
 
 /// Rewrite `g` for `world` ranks under `rule`: per-rank weights and shapes, one collective where ranks
 /// must agree. `weights` supplies each const's role and stored format.
-pub fn shard<V: ValidationChannel>(
-    g: &Graph<V>,
+pub fn shard(
+    g: &Graph,
     weights: &WeightMap,
     rule: ShardRule,
     world: NonZeroU32,
-) -> Result<ShardedGraph<V>, ShardError> {
+) -> Result<ShardedGraph, ShardError> {
     if world.get() == 1 {
         return Ok(ShardedGraph {
             graph: g.clone(),
@@ -220,8 +229,8 @@ pub fn shard<V: ValidationChannel>(
     sharder.finalize()
 }
 
-struct Sharder<'a, V: ValidationChannel> {
-    g: &'a Graph<V>,
+struct Sharder<'a> {
+    g: &'a Graph,
     rule: ShardRule,
     world: usize,
     world_n: NonZeroU32,
@@ -251,9 +260,9 @@ struct Sharder<'a, V: ValidationChannel> {
 
 type Rewrite = Result<(OpKind, Vec<Operand>, Layout), ShardError>;
 
-impl<'a, V: ValidationChannel> Sharder<'a, V> {
+impl<'a> Sharder<'a> {
     fn new(
-        g: &'a Graph<V>,
+        g: &'a Graph,
         weights: &'a WeightMap,
         rule: ShardRule,
         world: NonZeroU32,
@@ -270,9 +279,9 @@ impl<'a, V: ValidationChannel> Sharder<'a, V> {
             world_n: world,
             ids,
             weights,
-            values: g.values.clone(),
-            layout: ValueTable::filled(g.values.len(), Layout::Whole),
-            eqns: Vec::with_capacity(g.eqns.len()),
+            values: g.values().clone(),
+            layout: ValueTable::filled(g.values().len(), Layout::Whole),
+            eqns: Vec::with_capacity(g.eqns().len()),
             reduced: HashMap::new(),
             gathered: HashMap::new(),
             collectives: Vec::new(),
@@ -286,10 +295,10 @@ impl<'a, V: ValidationChannel> Sharder<'a, V> {
     }
 
     fn walk(&mut self) -> Result<(), ShardError> {
-        for &input in &self.g.inputs {
+        for &input in self.g.inputs() {
             self.bind_input(input)?;
         }
-        for (index, eqn) in self.g.eqns.iter().enumerate() {
+        for (index, eqn) in self.g.eqns().iter().enumerate() {
             self.index = index;
             self.layer = eqn.layer;
             let (op, inputs, layout) = self.rewrite(eqn)?;
@@ -1013,9 +1022,9 @@ impl<'a, V: ValidationChannel> Sharder<'a, V> {
         Ok(())
     }
 
-    fn finalize(mut self) -> Result<ShardedGraph<V>, ShardError> {
+    fn finalize(mut self) -> Result<ShardedGraph, ShardError> {
         // The output is a value every rank holds.
-        let output = self.g.output;
+        let output = self.g.result();
         let mut new_output = output;
         if matches!(self.layout[output], Layout::Partial | Layout::Split(_)) {
             self.layer = None;
@@ -1025,7 +1034,7 @@ impl<'a, V: ValidationChannel> Sharder<'a, V> {
             };
         }
         // Carried state is written with the layout it is read with.
-        let mut state = self.g.state.clone();
+        let mut state: Vec<(ValueId, ValueId)> = self.g.state().collect();
         for pair in &mut state {
             let (read, written) = (self.layout[pair.0], self.layout[pair.1]);
             let name = self.g.meta(pair.0).name.clone().unwrap_or_default();
@@ -1049,25 +1058,27 @@ impl<'a, V: ValidationChannel> Sharder<'a, V> {
                 });
             }
         }
-        for declaration in self.g.validation_outputs() {
+        for declaration in self.g.witnesses() {
             if self.layout[declaration.value] != Layout::Whole {
                 return Err(ShardError::SplitResult {
                     what: "a validation witness",
                 });
             }
         }
-        for export in &self.g.exports {
+        for export in self.g.exports() {
             if self.layout[export.value] != Layout::Whole {
                 return Err(ShardError::SplitResult { what: "an export" });
             }
         }
-        let mut graph = self.g.clone();
-        graph.values = self.values;
-        graph.eqns = self.eqns;
-        graph.output = new_output;
-        graph.state = state;
+        let mut graph = self.g.edit();
+        *graph.values_mut() = self.values;
+        *graph.eqns_mut() = self.eqns;
+        graph.set_result(new_output);
+        for (input, next) in state {
+            graph.set_state_next(input, next);
+        }
         Ok(ShardedGraph {
-            graph,
+            graph: graph.commit()?,
             weights: self.cut,
             collectives: self.collectives,
             world: self.world_n,
@@ -1089,8 +1100,8 @@ enum Linear {
 /// The rank program [`expand_ranks`] lowers a sharded graph to: one graph holding every rank's
 /// equations, and where its stages begin.
 #[derive(Debug)]
-pub(crate) struct RankProgram<V: ValidationChannel> {
-    pub graph: Graph<V>,
+pub(crate) struct RankProgram {
+    pub graph: Graph,
     /// The equation each stage after the first starts at, strictly increasing.
     pub cuts: Vec<usize>,
     /// The rank each stage runs on, one entry per stage (`cuts.len() + 1`).
@@ -1099,21 +1110,19 @@ pub(crate) struct RankProgram<V: ValidationChannel> {
 
 /// Lower the collectives of `sharded` to the point-to-point exchanges the stage split derives, and
 /// unroll the graph once per rank. See the module docs.
-pub(crate) fn expand_ranks<V: ValidationChannel>(
-    sharded: &ShardedGraph<V>,
-) -> Result<RankProgram<V>, ShardError> {
+pub(crate) fn expand_ranks(sharded: &ShardedGraph) -> Result<RankProgram, ShardError> {
     let g = &sharded.graph;
     let world = sharded.world.get() as usize;
 
-    let mut values = g.values.clone();
-    let mut inputs = g.inputs.clone();
-    let mut consts = g.consts.clone();
+    let mut values = g.values().clone();
+    let mut inputs = g.inputs().to_vec();
+    let mut consts = g.consts().to_vec();
     // Rank `r >= 1`'s copy of each value it computes or carries; rank 0 keeps the original ids and
     // names, and consts, slots and computed constants are shared by every rank.
     let mut copies: Vec<HashMap<ValueId, ValueId>> = vec![HashMap::new(); world];
-    let mut state = g.state.clone();
+    let mut state: Vec<(ValueId, ValueId)> = g.state().collect();
     for (rank, rank_copies) in copies.iter_mut().enumerate().skip(1) {
-        for &(state_in, _) in &g.state {
+        for (state_in, _) in g.state() {
             let mut meta = g.meta(state_in).clone();
             meta.name = meta.name.map(|name| format!("{name}.tp{rank}"));
             let carried = values.push(meta);
@@ -1132,9 +1141,9 @@ pub(crate) fn expand_ranks<V: ValidationChannel>(
         rank: usize,
         eqn: Eqn,
     }
-    let mut emitted: Vec<Placed> = Vec::with_capacity(g.eqns.len() * world);
+    let mut emitted: Vec<Placed> = Vec::with_capacity(g.eqns().len() * world);
     let mut segment = 0usize;
-    for eqn in &g.eqns {
+    for eqn in g.eqns() {
         let collective = matches!(eqn.op, OpKind::AllReduce { .. } | OpKind::AllGather { .. });
         if collective {
             segment += 1;
@@ -1217,16 +1226,16 @@ pub(crate) fn expand_ranks<V: ValidationChannel>(
 
     // Liveness: the output, every rank's carried state, the witnesses and the exports.
     let mut live: ValueTable<bool> = ValueTable::filled(values.len(), false);
-    live[g.output] = true;
+    live[g.result()] = true;
     for rank in 0..world {
-        for &(_, state_out) in &g.state {
+        for (_, state_out) in g.state() {
             live[at(&copies, rank, state_out)] = true;
         }
     }
-    for declaration in g.validation_outputs() {
+    for declaration in g.witnesses() {
         live[declaration.value] = true;
     }
-    for export in &g.exports {
+    for export in g.exports() {
         live[export.value] = true;
     }
     let mut keep = vec![false; emitted.len()];
@@ -1258,25 +1267,28 @@ pub(crate) fn expand_ranks<V: ValidationChannel>(
     }
     let defines_output = eqns
         .iter()
-        .rposition(|eqn| eqn.out == g.output)
+        .rposition(|eqn| eqn.out == g.result())
         .is_none_or(|position| position >= cuts.last().copied().unwrap_or(0));
     if !defines_output {
         return Err(ShardError::OutputNotLast);
     }
 
     for rank in 1..world {
-        state.extend(g.state.iter().map(|&(state_in, state_out)| {
+        state.extend(g.state().map(|(state_in, state_out)| {
             (at(&copies, rank, state_in), at(&copies, rank, state_out))
         }));
     }
-    let mut graph = g.clone();
-    graph.values = values;
-    graph.inputs = inputs;
-    graph.consts = consts;
-    graph.eqns = eqns;
-    graph.state = state;
+    let mut graph = g.edit();
+    *graph.values_mut() = values;
+    *graph.inputs_mut() = inputs;
+    *graph.consts_mut() = consts;
+    *graph.eqns_mut() = eqns;
+    graph.retain_state(|_, _| false);
+    for (input, next) in state {
+        graph.push_state(input, next);
+    }
     Ok(RankProgram {
-        graph,
+        graph: graph.commit()?,
         cuts,
         stage_ranks,
     })

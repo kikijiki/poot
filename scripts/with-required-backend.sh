@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run a command with exactly one backend made mandatory.
 #
-#   with-required-backend.sh POOT_REQUIRE_{WGPU,VULKAN,ROCM,PTX} command [args...]
+#   with-required-backend.sh POOT_REQUIRE_{WGPU,VULKAN,ROCM,PTX,NPU} command [args...]
 #
 # Two guarantees, both independent of the tests the command runs:
 #   1. Only the selected POOT_REQUIRE_* variable is set; every other one is cleared.
@@ -15,6 +15,7 @@ readonly backend_vars=(
   POOT_REQUIRE_VULKAN
   POOT_REQUIRE_ROCM
   POOT_REQUIRE_PTX
+  POOT_REQUIRE_NPU
 )
 
 # Succeeds when a device for the backend is visible. Each probe reads the tool's own view of the machine, so
@@ -35,6 +36,10 @@ probe_device() {
       listing=$(nvidia-smi -L 2>/dev/null || true)
       grep -qE '^GPU [0-9]+:' <<<"$listing"
       ;;
+    POOT_REQUIRE_NPU)
+      listing=$(xrt-smi examine 2>/dev/null || true)
+      grep -qE '^\|\[[0-9a-fA-F:.]+\] +\|NPU ' <<<"$listing"
+      ;;
   esac
 }
 
@@ -46,6 +51,7 @@ run_with_only() {
     -u POOT_REQUIRE_VULKAN \
     -u POOT_REQUIRE_ROCM \
     -u POOT_REQUIRE_PTX \
+    -u POOT_REQUIRE_NPU \
     "$selected=1" \
     "$@"
 }
@@ -65,7 +71,10 @@ make_stub_tools() {
   printf '#!/bin/sh\necho "        deviceType         = %s"\n' "$vulkan_type" >"$dir/vulkaninfo"
   printf '#!/bin/sh\necho "  Device Type:             %s"\n' "$rocm_type" >"$dir/rocminfo"
   printf '#!/bin/sh\n[ -n "%s" ] && echo "%s"\nexit %s\n' "$nvidia_line" "$nvidia_line" "$nvidia_status" >"$dir/nvidia-smi"
-  chmod +x "$dir/vulkaninfo" "$dir/rocminfo" "$dir/nvidia-smi"
+  local xrt_line=''
+  [[ "$state" == "present" ]] && xrt_line='|[0000:c7:00.1]  |NPU Strix Halo  |aie2p         |6x8       |'
+  printf '#!/bin/sh\n[ -n "%s" ] && echo "%s"\nexit 0\n' "$xrt_line" "$xrt_line" >"$dir/xrt-smi"
+  chmod +x "$dir/vulkaninfo" "$dir/rocminfo" "$dir/nvidia-smi" "$dir/xrt-smi"
 }
 
 self_test() {
@@ -128,9 +137,9 @@ fi
 selected=${1:-}
 shift || true
 case "$selected" in
-  POOT_REQUIRE_WGPU | POOT_REQUIRE_VULKAN | POOT_REQUIRE_ROCM | POOT_REQUIRE_PTX) ;;
+  POOT_REQUIRE_WGPU | POOT_REQUIRE_VULKAN | POOT_REQUIRE_ROCM | POOT_REQUIRE_PTX | POOT_REQUIRE_NPU) ;;
   *)
-    echo "usage: $0 POOT_REQUIRE_{WGPU,VULKAN,ROCM,PTX} command [args...]" >&2
+    echo "usage: $0 POOT_REQUIRE_{WGPU,VULKAN,ROCM,PTX,NPU} command [args...]" >&2
     exit 2
     ;;
 esac

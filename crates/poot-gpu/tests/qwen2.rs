@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
 use poot_executor::{Device, Executor, HostView, NoSync, StepInputs};
-use poot_executor_parity::dense::{Dense, Family, paged_step, plain, step};
+use poot_executor_parity::dense::{Dense, Family, paged_step, step};
 use poot_gpu::device::WgpuDevice;
 use poot_graph_ir::Slot;
 use poot_graph_ir::{Graph, SlotKey, Storage, ValueId, ValueTable};
@@ -31,8 +31,8 @@ use poot_test_util::{assert_close_rel, max_abs_error};
 
 /// Compile `g` for `target` with `Submission::Replay` (Card 546b: the contract admits no other
 /// submission).
-fn staged(g: &Graph, target: Target) -> StagedProgram<poot_graph_ir::ValidationOutputs> {
-    let g = g.clone().with_validations(Vec::new());
+fn staged(g: &Graph, target: Target) -> StagedProgram {
+    let g = g.clone();
     compile_staged(
         &g,
         &TargetSet::single(DeviceId(0), target),
@@ -99,7 +99,7 @@ fn split_consts_and_slots_v(
 ) -> (WeightStore, Vec<SlotBind>) {
     let mut builder = WeightStore::builder();
     let mut slots = Vec::new();
-    for &id in &g.inputs {
+    for &id in g.inputs() {
         let m = g.meta(id);
         let dtype = m.aval.dtype;
         match m.storage {
@@ -165,7 +165,8 @@ fn run_once_contract_v(
 fn state_probe_graph(name: &str, aval: poot_graph_ir::TensorType) -> Graph {
     let b = poot_graph_ir::Builder::new();
     let state = b.state_input(name, aval, poot_graph_ir::StateRole::Recurrent);
-    b.finish_with_state(state, &[(state, state)])
+    b.finish(poot_graph_ir::Outputs::new(state).with_state(&[(state, state)]))
+        .unwrap()
 }
 
 /// Compares raw contract output bytes against the CPU oracle `Tensor`, within relative tolerance.
@@ -173,7 +174,7 @@ fn state_probe_graph(name: &str, aval: poot_graph_ir::TensorType) -> Graph {
 /// only source of the shape the comparison checks (review 546b-b1b F1): a length-only check would
 /// miss a same-numel shape mismatch.
 fn assert_close_bytes(g: &Graph, got: &[f32], cpu: &HostTensor, label: &str) {
-    assert_eq!(g.aval(g.output).shape, cpu.shape(), "{label}: shape");
+    assert_eq!(g.aval(g.result()).shape, cpu.shape(), "{label}: shape");
     assert_eq!(got.len(), cpu.as_f32().unwrap().len(), "{label}: length");
     assert_close_rel(got, cpu.as_f32().unwrap(), 5e-3);
     eprintln!(
@@ -224,7 +225,7 @@ fn tiny() -> Dense {
 
 /// `dense`'s graph for `phase` at `shape`, as an ordinary graph.
 fn trace(dense: &Dense, phase: Phase, shape: StepShape) -> Graph {
-    plain(dense.f32_model().model.trace(phase, shape).unwrap())
+    dense.f32_model().model.trace(phase, shape).unwrap()
 }
 
 /// One step's slot values: the new tokens and their absolute positions (`[rows, tokens]`, row major)
@@ -258,7 +259,7 @@ impl Feed {
 /// own).
 fn bind(g: &Graph, feed: &Feed, seed_state: bool) -> HashMap<ValueId, Value> {
     let mut m = HashMap::new();
-    for &id in &g.inputs {
+    for &id in g.inputs() {
         let meta = g.meta(id);
         let shape = meta.aval.shape.clone();
         let t = match meta.storage {
@@ -292,7 +293,7 @@ fn cpu_step(
     state: &[HostTensor],
 ) -> (HostTensor, Vec<HostTensor>) {
     let mut cpu_inputs = inputs.clone();
-    for (ci, &(si, _)) in g.state.iter().enumerate() {
+    for (ci, (si, _)) in g.state().enumerate() {
         let carried = state
             .get(ci)
             .cloned()
@@ -393,12 +394,14 @@ fn flash_attention_pass_prefill_gpu_matches_cpu() {
     let g = trace(&tiny(), Phase::Prefill, step(1, l, l, LogitRows::Last));
     let feed = Feed::new(tokens.to_vec(), (0..l as i32).collect());
     let fused = dce(&flash_attention_capped(
-        &rope_fusion(&fold_iota(&cse(&canonicalize(&g)))),
+        &rope_fusion(&fold_iota(&cse(&canonicalize(&g).unwrap()).unwrap()).unwrap()).unwrap(),
         None,
-    ));
+    )
+    .unwrap())
+    .unwrap();
     assert!(
         fused
-            .eqns
+            .eqns()
             .iter()
             .any(|e| matches!(e.op, OpKind::Attention(_))),
         "the flash pass must rewrite the prefill attention"
@@ -433,7 +436,7 @@ fn prefill_runs_a_flash_fused_compiled_graph_and_matches_cpu() {
     );
     let (cpu, _) = cpu_step(&g, &bind(&g, &feed, false), &[]);
     let got = run_once_contract_v(&mut *exec, target, &g, &bind(&g, &feed, false));
-    assert_eq!(g.aval(g.output).shape, cpu.shape());
+    assert_eq!(g.aval(g.result()).shape, cpu.shape());
     assert_eq!(got.len(), cpu.as_f32().unwrap().len());
     assert_close_rel(&got, cpu.as_f32().unwrap(), 5e-3);
     eprintln!(
@@ -484,9 +487,9 @@ fn assert_paged_prefill_matches_contiguous(slot_map: &[usize], cap: usize, pool:
         .collect()
     };
     let (env_c, env_p) = (env(&g_cont, &feed_c), env(&g_paged, &feed_p));
-    assert_eq!(g_cont.state.len(), g_paged.state.len());
+    assert_eq!(g_cont.state().count(), g_paged.state().count());
     // each layer: contiguous [1,Hkv,cap,D] position p vs the pool [pool,Hkv,D] slot slot_map[p].
-    for (&(_, so_c), &(_, so_p)) in g_cont.state.iter().zip(g_paged.state.iter()) {
+    for ((_, so_c), (_, so_p)) in g_cont.state().zip(g_paged.state()) {
         let cc = env_c[so_c].as_ref().unwrap().as_f32().unwrap();
         let cp = env_p[so_p].as_ref().unwrap().as_f32().unwrap();
         for (p, &slot) in slot_map.iter().enumerate() {
@@ -503,7 +506,7 @@ fn assert_paged_prefill_matches_contiguous(slot_map: &[usize], cap: usize, pool:
         }
     }
     // unused pool slots stay zero (passed through from the zero-seeded base).
-    let pool0 = env_p[g_paged.state[0].1]
+    let pool0 = env_p[g_paged.state().next().unwrap().1]
         .as_ref()
         .unwrap()
         .as_f32()
@@ -514,8 +517,8 @@ fn assert_paged_prefill_matches_contiguous(slot_map: &[usize], cap: usize, pool:
         }
     }
     let logit_diff = max_abs_error(
-        env_p[g_paged.output].as_ref().unwrap().as_f32().unwrap(),
-        env_c[g_cont.output].as_ref().unwrap().as_f32().unwrap(),
+        env_p[g_paged.result()].as_ref().unwrap().as_f32().unwrap(),
+        env_c[g_cont.result()].as_ref().unwrap().as_f32().unwrap(),
     );
     assert!(
         logit_diff < 1e-5,
@@ -550,7 +553,7 @@ fn assert_paged_prefill_matches_contiguous(slot_map: &[usize], cap: usize, pool:
         d < 1e-3,
         "GPU paged prefill logits diverge from contiguous: {d}"
     );
-    for (i, &(si, so)) in g_paged.state.iter().enumerate() {
+    for (i, (si, so)) in g_paged.state().enumerate() {
         let cpu = env_p[so].as_ref().unwrap();
         let name = g_paged.meta(si).name.clone().expect("named state");
         let probe = state_probe_graph(&name, g_paged.aval(si).clone());
@@ -616,31 +619,30 @@ fn fused_decode_matches_unfused_on_gpu() {
     let target = device.target();
     let mut exec: Box<dyn Executor> = Box::new(poot_executor::Engine::new(device));
     let (g, feed) = tiny_decode_graph();
-    let base = cse(&g); // the executor's normal pre-pass; fusion groups on top of it.
-    let fg = fuse(&base);
-    fg.validate().expect("fused graph valid");
+    let base = cse(&g).unwrap(); // the executor's normal pre-pass; fusion groups on top of it.
+    let fg = fuse(&base).unwrap();
     let n_fused = fg
-        .eqns
+        .eqns()
         .iter()
         .filter(|e| matches!(e.op, OpKind::Fused(_)))
         .count();
     let n_row = fg
-        .eqns
+        .eqns()
         .iter()
         .filter(|e| matches!(e.op, OpKind::FusedRow(_)))
         .count();
     assert!(n_fused > 0, "pointwise fusion should fire");
     assert!(n_row > 0, "reduction-rooted fusion should fire");
     assert!(
-        fg.eqns.len() < base.eqns.len(),
+        fg.eqns().len() < base.eqns().len(),
         "fewer dispatches after fusion: {} -> {}",
-        base.eqns.len(),
-        fg.eqns.len()
+        base.eqns().len(),
+        fg.eqns().len()
     );
     eprintln!(
         "fused decode: {} eqns -> {} ({} Fused, {} FusedRow regions)",
-        base.eqns.len(),
-        fg.eqns.len(),
+        base.eqns().len(),
+        fg.eqns().len(),
         n_fused,
         n_row
     );
@@ -811,13 +813,11 @@ fn real_dense() -> Dense {
 
 /// `dense`'s decode graph over `cap` positions, from a zero checkpoint.
 fn real_trace(dense: &Dense, phase: Phase, shape: StepShape) -> Graph {
-    plain(
-        dense
-            .zeroed_model(DType::BF16)
-            .model
-            .trace(phase, shape)
-            .unwrap(),
-    )
+    dense
+        .zeroed_model(DType::BF16)
+        .model
+        .trace(phase, shape)
+        .unwrap()
 }
 
 /// G5 dispatch-reduction receipt on the real Qwen2.5-0.5B architecture (weights-free: dispatch count depends
@@ -831,7 +831,7 @@ fn fusion_dispatch_reduction_on_real_qwen2_config() {
     use poot_test_util::graph_fixtures::plan_eqn;
 
     fn count_dispatches(g: &poot_graph_ir::Graph) -> usize {
-        g.eqns
+        g.eqns()
             .iter()
             .filter(|eqn| {
                 matches!(
@@ -852,18 +852,19 @@ fn fusion_dispatch_reduction_on_real_qwen2_config() {
         &real_dense(),
         Phase::Decode,
         step(1, 1, cap, LogitRows::Last),
-    ));
-    let fused = fuse(&base);
+    ))
+    .unwrap();
+    let fused = fuse(&base).unwrap();
 
     let before = count_dispatches(&base);
     let after = count_dispatches(&fused);
     let n_fused = fused
-        .eqns
+        .eqns()
         .iter()
         .filter(|e| matches!(e.op, poot_graph_ir::op::OpKind::Fused(_)))
         .count();
     let n_row = fused
-        .eqns
+        .eqns()
         .iter()
         .filter(|e| matches!(e.op, poot_graph_ir::op::OpKind::FusedRow(_)))
         .count();
@@ -880,7 +881,7 @@ fn fusion_dispatch_reduction_on_real_qwen2_config() {
 
     // breakdown of the post-fusion dispatching eqns by op kind, to see whether a fusion/aliasing win is left.
     let mut by_kind: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-    for eqn in &fused.eqns {
+    for eqn in fused.eqns() {
         if matches!(
             plan_eqn(
                 &fused,
@@ -902,7 +903,7 @@ fn fusion_dispatch_reduction_on_real_qwen2_config() {
     // distinguish residual adds (output = hidden) from rope/mask adds (head_dim / cap): are the standalone adds
     // inherent (multi-use residual) or a missed fusion chain.
     let mut add_shapes: std::collections::BTreeMap<Vec<usize>, usize> = Default::default();
-    for eqn in &fused.eqns {
+    for eqn in fused.eqns() {
         if eqn.op.name().starts_with("add")
             && matches!(
                 plan_eqn(
@@ -941,8 +942,9 @@ fn fusion_decode_latency_on_gpu() {
         &real_dense(),
         Phase::Decode,
         step(1, 1, cap, LogitRows::Last),
-    ));
-    let fused = fuse(&base);
+    ))
+    .unwrap();
+    let fused = fuse(&base).unwrap();
 
     let iters = 100;
     fn run(
@@ -983,8 +985,8 @@ fn fusion_decode_latency_on_gpu() {
         "Qwen2.5-0.5B decode/token on GPU: unfused {unfused_ms:.3} ms -> fused {fused_ms:.3} ms \
          ({:.2}x speedup; {} -> {} eqns)",
         unfused_ms / fused_ms,
-        base.eqns.len(),
-        fused.eqns.len()
+        base.eqns().len(),
+        fused.eqns().len()
     );
     assert!(
         fused_ms < unfused_ms,
@@ -1047,7 +1049,7 @@ fn chunked_prefill_at_nonzero_start_matches_stepped_decode_gpu() {
         let mut builder = WeightStore::builder();
         let mut seen = std::collections::HashSet::new();
         for g in [&g_prefill, &g_decode] {
-            for &id in &g.inputs {
+            for &id in g.inputs() {
                 let meta = g.meta(id);
                 if meta.storage != Storage::Const {
                     continue;

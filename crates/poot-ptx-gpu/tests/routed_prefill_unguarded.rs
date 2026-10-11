@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use poot_executor::{Device, Engine, Executor, NoSync};
 use poot_executor_parity::weight_map::{self, Step};
-use poot_graph_ir::{Graph, ValidationOutputs};
+use poot_graph_ir::Graph;
 use poot_graph_plan::{KernelChoice, Target};
 use poot_kernelgen::{ContractionSpec, KernelRequest};
 use poot_models::model::{Model, Phase};
@@ -86,7 +86,7 @@ struct PlanFacts {
     tiled_routers: usize,
 }
 
-fn plan(graph: &Graph<ValidationOutputs>, target: &Target, experts: usize) -> PlanFacts {
+fn plan(graph: &Graph, target: &Target, experts: usize) -> PlanFacts {
     let program = poot_graph_plan::compile(
         graph,
         target,
@@ -98,7 +98,7 @@ fn plan(graph: &Graph<ValidationOutputs>, target: &Target, experts: usize) -> Pl
     .expect("the prefill compiles");
     let router_shape = [PROMPT, experts];
     let (mut tiled, mut tiled_routers) = (0, 0);
-    for eqn in &program.graph().eqns {
+    for eqn in program.graph().eqns() {
         if is_tiled(program.kernel_choice(eqn)) {
             tiled += 1;
             if program.graph().aval(eqn.out).shape == router_shape {
@@ -115,11 +115,10 @@ fn plan(graph: &Graph<ValidationOutputs>, target: &Target, experts: usize) -> Pl
 
 /// The CPU oracle's logits for `graph`: the fixture's weights through its map, every slot its step
 /// input, every state zero (at its own dtype).
-fn oracle_logits(fixture: &Fixture, graph: &Graph<ValidationOutputs>, step: &Step) -> HostTensor {
+fn oracle_logits(fixture: &Fixture, graph: &Graph, step: &Step) -> HostTensor {
     let zeros: Vec<HostTensor> = graph
-        .state
-        .iter()
-        .map(|&(state, _)| {
+        .state()
+        .map(|(state, _)| {
             let aval = graph.aval(state);
             match aval.dtype {
                 poot_tensor::DType::I32 => {
@@ -151,7 +150,7 @@ fn run(
     engine: &mut Engine<PtxDevice>,
     target: Target,
     fixture: &Fixture,
-    graph: &Graph<ValidationOutputs>,
+    graph: &Graph,
     step: &Step,
 ) -> Run {
     let staged = weight_map::compile(graph, target);

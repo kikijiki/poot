@@ -7,7 +7,7 @@
 //! traced input, and the output of every pass, so a pass that grows without reserving is still refused
 //! at its boundary.
 
-use poot_graph_ir::graph::{Eqn, Graph, ValidationChannel, ValueId, ValueMeta};
+use poot_graph_ir::graph::{Eqn, Graph, ValueId, ValueMeta};
 
 use crate::{CompileLimits, ExpansionError, GraphResource};
 use poot_graph_ir::ValueTable;
@@ -57,26 +57,22 @@ impl GraphBudget {
     }
 
     /// A finished graph is within both caps.
-    pub(crate) fn admit<V: ValidationChannel>(
-        &self,
-        stage: &'static str,
-        g: &Graph<V>,
-    ) -> Result<(), ExpansionError> {
-        self.check(stage, GraphResource::Values, g.values.len(), 0)?;
-        self.check(stage, GraphResource::Eqns, g.eqns.len(), 0)
+    pub(crate) fn admit(&self, stage: &'static str, g: &Graph) -> Result<(), ExpansionError> {
+        self.check(stage, GraphResource::Values, g.values().len(), 0)?;
+        self.check(stage, GraphResource::Eqns, g.eqns().len(), 0)
     }
 
     /// A pass that will add up to `values` values and `eqns` equations to `g` fits, from a conservative
     /// bound the caller derived from `g` alone. Refused before the pass runs.
-    pub(crate) fn reserve<V: ValidationChannel>(
+    pub(crate) fn reserve(
         &self,
         stage: &'static str,
-        g: &Graph<V>,
+        g: &Graph,
         values: usize,
         eqns: usize,
     ) -> Result<(), ExpansionError> {
-        self.check(stage, GraphResource::Values, g.values.len(), values)?;
-        self.check(stage, GraphResource::Eqns, g.eqns.len(), eqns)
+        self.check(stage, GraphResource::Values, g.values().len(), values)?;
+        self.check(stage, GraphResource::Eqns, g.eqns().len(), eqns)
     }
 
     /// Append `eqn` to the equations a pass is building, or refuse without appending.

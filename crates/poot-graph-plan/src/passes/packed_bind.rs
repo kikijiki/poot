@@ -167,7 +167,7 @@ pub enum PackedBindError {
     Graph {
         name: String,
         #[source]
-        source: Box<GraphValidationError>,
+        source: Box<EditError>,
     },
 }
 
@@ -191,21 +191,18 @@ pub enum ExpertStackRefusal {
 /// Rewrite every constant of `g` that `formats` records packed into the decode of its owners (see
 /// the module docs). Constants `formats` does not name are untouched, so a dense model's graph is
 /// returned unchanged.
-pub fn bind_packed_weights<V: ValidationChannel>(
-    g: &Graph<V>,
-    formats: &WeightFormats,
-) -> Result<Graph<V>, PackedBindError> {
+pub fn bind_packed_weights(g: &Graph, formats: &WeightFormats) -> Result<Graph, PackedBindError> {
     if formats.is_empty() {
         return Ok(g.clone());
     }
     let consumers = packed_consumer_map(g);
-    let mut out = g.clone();
+    let mut out = g.edit();
     let mut decode: Vec<Eqn> = Vec::new();
     let mut bound: Vec<ValueId> = Vec::new();
     let mut removed: HashSet<usize> = HashSet::new();
     let mut claimed: HashMap<usize, Eqn> = HashMap::new();
     let mut last_name = None;
-    for &id in &g.inputs {
+    for &id in g.inputs() {
         let meta = g.meta(id);
         if meta.storage != Storage::Const {
             continue;
@@ -240,17 +237,17 @@ pub fn bind_packed_weights<V: ValidationChannel>(
                 reason,
             };
             let (transpose, indexed) = expert_stack_use(g, id, &consumers).map_err(refuse)?;
-            let mut inputs = vec![g.eqns[indexed].inputs[0], g.eqns[indexed].inputs[2]];
+            let mut inputs = vec![g.eqns()[indexed].inputs[0], g.eqns()[indexed].inputs[2]];
             for (carrier_name, carrier_type) in
                 packed_stack_source_constants(&packed.linear_id, packed.weight, experts)
             {
-                let carrier = out.values.push(ValueMeta::new(
+                let carrier = out.values_mut().push(ValueMeta::new(
                     carrier_type,
                     Storage::Const,
                     Some(carrier_name.into()),
                 ));
-                out.inputs.push(carrier);
-                out.consts.push(carrier);
+                out.inputs_mut().push(carrier);
+                out.consts_mut().push(carrier);
                 inputs.push(Operand::Value(carrier));
             }
             removed.insert(transpose);
@@ -262,8 +259,8 @@ pub fn bind_packed_weights<V: ValidationChannel>(
                         rows: ContractionRows::Indexed { experts },
                     },
                     inputs,
-                    out: g.eqns[indexed].out,
-                    layer: g.eqns[indexed].layer,
+                    out: g.eqns()[indexed].out,
+                    layer: g.eqns()[indexed].layer,
                 },
             );
             bound.push(id);
@@ -272,20 +269,20 @@ pub fn bind_packed_weights<V: ValidationChannel>(
         }
         let mut carriers = Vec::new();
         for role in packed.weight.sources() {
-            let carrier = out.values.push(ValueMeta::new(
+            let carrier = out.values_mut().push(ValueMeta::new(
                 packed_source_type(packed.weight, role),
                 Storage::Const,
                 Some(PackedSourceName::new(&packed.linear_id, role).into()),
             ));
-            out.inputs.push(carrier);
-            out.consts.push(carrier);
+            out.inputs_mut().push(carrier);
+            out.consts_mut().push(carrier);
             carriers.push(Operand::Value(carrier));
         }
         // The decoded owner, then (projection) its transpose; the last step writes the declared value id
         // itself.
         let dequant_out = match packed.layout {
             PackedLayout::Rows => id,
-            PackedLayout::Columns => out.values.push(ValueMeta::new(
+            PackedLayout::Columns => out.values_mut().push(ValueMeta::new(
                 TensorType::f32(vec![rows, k]),
                 Storage::Device,
                 None,
@@ -308,49 +305,48 @@ pub fn bind_packed_weights<V: ValidationChannel>(
                 layer: None,
             });
         }
-        out.values[id].storage = Storage::Device;
-        out.values[id].name = None;
+        out.values_mut()[id].storage = Storage::Device;
+        out.values_mut()[id].name = None;
         bound.push(id);
         last_name = Some(name.to_string());
     }
     if bound.is_empty() {
-        return Ok(out);
+        return Ok(g.clone());
     }
-    out.inputs.retain(|id| !bound.contains(id));
-    out.consts.retain(|id| !bound.contains(id));
-    let kept = std::mem::take(&mut out.eqns)
+    out.inputs_mut().retain(|id| !bound.contains(id));
+    out.consts_mut().retain(|id| !bound.contains(id));
+    let kept = std::mem::take(out.eqns_mut())
         .into_iter()
         .enumerate()
         .filter(|(index, _)| !removed.contains(index))
         .map(|(index, eqn)| claimed.remove(&index).unwrap_or(eqn));
     decode.extend(kept);
-    out.eqns = decode;
-    out.validate().map_err(|source| PackedBindError::Graph {
+    *out.eqns_mut() = decode;
+    out.commit().map_err(|source| PackedBindError::Graph {
         name: last_name.unwrap_or_default(),
         source: Box::new(source),
-    })?;
-    Ok(out)
+    })
 }
 
 /// The two equations that read expert stack `stack`: the `Transpose([0, 2, 1])` that is its only consumer and
 /// the `IndexedMatMul` that is the transpose's only consumer (the typing rule makes the rank-3 table its weight
 /// operand). Anything else is the
 /// stack's refusal.
-fn expert_stack_use<V: ValidationChannel>(
-    g: &Graph<V>,
+fn expert_stack_use(
+    g: &Graph,
     stack: ValueId,
     consumers: &ValueTable<Vec<usize>>,
 ) -> Result<(usize, usize), ExpertStackRefusal> {
     let escapes = |value: ValueId| {
         g.liveness_roots().any(|root| root == value)
-            || g.state.iter().any(|&(_, state_out)| state_out == value)
+            || g.state().any(|(_, state_out)| state_out == value)
     };
     let &[transpose] = consumers[stack].as_slice() else {
         return Err(ExpertStackRefusal::Consumers {
             consumers: consumers[stack].len(),
         });
     };
-    let transpose_eqn = &g.eqns[transpose];
+    let transpose_eqn = &g.eqns()[transpose];
     if !matches!(&transpose_eqn.op, OpKind::Transpose { perm } if perm.as_slice() == [0, 2, 1]) {
         return Err(ExpertStackRefusal::NotTransposed {
             op: transpose_eqn.op.name(),
@@ -364,7 +360,7 @@ fn expert_stack_use<V: ValidationChannel>(
             consumers: consumers[transpose_eqn.out].len(),
         });
     };
-    let indexed_eqn = &g.eqns[indexed];
+    let indexed_eqn = &g.eqns()[indexed];
     if !matches!(indexed_eqn.op, OpKind::IndexedMatMul) {
         return Err(ExpertStackRefusal::NotIndexed {
             op: indexed_eqn.op.name(),
@@ -403,7 +399,7 @@ mod tests {
     }
 
     fn ops(g: &Graph) -> Vec<String> {
-        g.eqns.iter().map(|eqn| eqn.op.name()).collect()
+        g.eqns().iter().map(|eqn| eqn.op.name()).collect()
     }
 
     /// A projection `x @ W` whose `[K, out]` weight is stored packed binds to `packed_linear`'s
@@ -416,22 +412,22 @@ mod tests {
         let x = b.constant("x", TensorType::f32(vec![2, 64]));
         let w = b.constant("layer.weight", TensorType::f32(vec![64, 8]));
         let y = b.matmul(x, w);
-        let g = b.finish(y);
+        let g = b.finish(y).unwrap();
         let bound = bind_packed_weights(&g, &formats(&[("layer.weight", column(8, 64))])).unwrap();
         assert_eq!(
             ops(&bound),
             ["packed_dequant q8_0", "transpose [1, 0]", "matmul"]
         );
         let names: Vec<&str> = bound
-            .inputs
+            .inputs()
             .iter()
             .filter_map(|&id| bound.meta(id).name.as_deref())
             .collect();
         assert_eq!(names, ["x", "layer.packed_blocks_source"]);
-        let claimed = recognize_packed_contractions(&bound);
+        let claimed = recognize_packed_contractions(&bound).unwrap();
         assert!(
             matches!(
-                claimed.eqns.as_slice(),
+                claimed.eqns(),
                 [Eqn {
                     op: OpKind::PackedContraction { .. },
                     ..
@@ -483,13 +479,13 @@ mod tests {
         let x = b.constant("x", TensorType::f32(vec![2, 64]));
         let w = b.constant(&q.const_name(), TensorType::f32(vec![8, 64]));
         let y = b.matmul(x, b.transpose(w, vec![1, 0]));
-        let bound = bind_packed_weights(&b.finish(y), &formats).unwrap();
+        let bound = bind_packed_weights(&b.finish(y).unwrap(), &formats).unwrap();
         assert_eq!(
             ops(&bound),
             ["packed_dequant q8_0", "transpose [1, 0]", "matmul"]
         );
         assert!(matches!(
-            recognize_packed_contractions(&bound).eqns.as_slice(),
+            recognize_packed_contractions(&bound).unwrap().eqns(),
             [Eqn {
                 op: OpKind::PackedContraction { .. },
                 ..
@@ -506,13 +502,13 @@ mod tests {
         let w = b.constant("layer.weight", TensorType::f32(vec![64, 8]));
         let bias = b.constant("layer.bias", TensorType::f32(vec![8]));
         let y = poot_graph_ir::ops::linear(&b, x, w, Some(bias));
-        let g = b.finish(y);
+        let g = b.finish(y).unwrap();
         let bound = bind_packed_weights(&g, &formats(&[("layer.weight", column(8, 64))])).unwrap();
-        assert_eq!(bound.output, g.output);
-        let claimed = recognize_packed_contractions(&bound);
+        assert_eq!(bound.result(), g.result());
+        let claimed = recognize_packed_contractions(&bound).unwrap();
         assert!(
             matches!(
-                claimed.eqns.as_slice(),
+                claimed.eqns(),
                 [
                     Eqn {
                         op: OpKind::PackedContraction { .. },
@@ -536,9 +532,10 @@ mod tests {
         let b = Builder::new();
         let w = b.constant("layer.weight", TensorType::f32(vec![64, 8]));
         let y = b.unary(poot_graph_ir::op::UnOp::Exp, w);
-        let g = b.finish(y);
+        let g = b.finish(y).unwrap();
         let bound = bind_packed_weights(&g, &formats(&[("layer.weight", column(8, 64))])).unwrap();
-        let claimed = recognize_packed_row_gathers(&recognize_packed_contractions(&bound));
+        let claimed =
+            recognize_packed_row_gathers(&recognize_packed_contractions(&bound).unwrap()).unwrap();
         assert!(reject_packed_dequant_escapes(&claimed).is_err());
     }
 
@@ -553,7 +550,7 @@ mod tests {
         );
         let table = b.constant("embed.weight", TensorType::f32(vec![16, 64]));
         let rows = b.gather(table, 0, ids);
-        let g = b.finish(rows);
+        let g = b.finish(rows).unwrap();
         let bound = bind_packed_weights(
             &g,
             &formats(&[(
@@ -568,7 +565,7 @@ mod tests {
         .unwrap();
         assert_eq!(ops(&bound), ["packed_dequant q8_0", "gather ax=0"]);
         assert!(matches!(
-            recognize_packed_row_gathers(&bound).eqns.as_slice(),
+            recognize_packed_row_gathers(&bound).unwrap().eqns(),
             [Eqn {
                 op: OpKind::PackedRowGather { .. },
                 ..
@@ -589,13 +586,13 @@ mod tests {
             let sel = b.constant("sel", TensorType::new(vec![3], DType::I32));
             let w = b.constant("experts.weight", TensorType::f32(vec![experts, 8, 64]));
             let y = b.indexed_matmul(x, b.transpose(w, vec![0, 2, 1]), sel);
-            let g = b.finish(y);
+            let g = b.finish(y).unwrap();
             let bound = bind_packed_weights(&g, &formats(&[("experts.weight", stack(experts))]))
                 .unwrap_or_else(|error| panic!("{experts} experts: {error}"));
             reject_packed_dequant_escapes(&bound)
                 .unwrap_or_else(|error| panic!("{experts} experts: {error}"));
-            assert_eq!(bound.output, g.output);
-            let [eqn] = bound.eqns.as_slice() else {
+            assert_eq!(bound.result(), g.result());
+            let [eqn] = bound.eqns() else {
                 panic!("{experts} experts: {:?}", ops(&bound));
             };
             assert_eq!(
@@ -606,12 +603,12 @@ mod tests {
                 }
             );
             let names: Vec<&str> = bound
-                .inputs
+                .inputs()
                 .iter()
                 .filter_map(|&id| bound.meta(id).name.as_deref())
                 .collect();
             assert_eq!(names, ["x", "sel", "experts.weight.packed_blocks_source"]);
-            let carrier = bound.inputs[2];
+            let carrier = bound.inputs()[2];
             assert_eq!(
                 bound.aval(carrier),
                 &TensorType::new(
@@ -667,7 +664,7 @@ mod tests {
             let sel = b.constant("sel", TensorType::new(vec![3], DType::I32));
             let w = b.constant("experts.weight", TensorType::f32(vec![2, 64, 64]));
             let y = f(&b, x, sel, w);
-            b.finish(y)
+            b.finish(y).unwrap()
         };
         // No transpose: the stack `[E, out, K]` read where the matmul wants `[E, K, out]`.
         let g = build(&|b, x, sel, w| b.indexed_matmul(x, b.transpose(w, vec![0, 1, 2]), sel));
@@ -709,7 +706,7 @@ mod tests {
         let x = b.constant("x", TensorType::f32(vec![2, 8]));
         let w = b.constant("layer.weight", TensorType::f32(vec![8, 64]));
         let y = b.matmul(x, w);
-        let g = b.finish(y);
+        let g = b.finish(y).unwrap();
         assert!(matches!(
             bind_packed_weights(&g, &formats(&[("layer.weight", packed.clone())])),
             Err(PackedBindError::Shape { ref name, .. }) if name == "layer.weight"
@@ -718,7 +715,7 @@ mod tests {
         let x = b.constant("x", TensorType::new(vec![2, 64], DType::BF16));
         let w = b.constant("layer.weight", TensorType::new(vec![64, 8], DType::BF16));
         let y = b.matmul(x, w);
-        let g = b.finish(y);
+        let g = b.finish(y).unwrap();
         assert!(matches!(
             bind_packed_weights(&g, &formats(&[("layer.weight", packed)])),
             Err(PackedBindError::Dtype { .. })

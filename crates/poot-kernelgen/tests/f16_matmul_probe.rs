@@ -23,11 +23,11 @@ fn which(tool: &str) -> bool {
 }
 
 /// Encode f32 -> f16 bytes (little-endian), reusing the loader's own f32->f16 narrowing
-/// (`poot_load::gguf::f32_to_f16`) so this probe's precision loss matches what a real f16 checkpoint
+/// (`poot_quant::scalar::f32_to_f16`) so this probe's precision loss matches what a real f16 checkpoint
 /// tensor's bytes would already look like.
 fn f16_encode(data: &[f32]) -> Vec<u8> {
     data.iter()
-        .flat_map(|&f| poot_load::gguf::f32_to_f16(f).to_le_bytes())
+        .flat_map(|&f| poot_quant::scalar::f32_to_f16(f).to_le_bytes())
         .collect()
 }
 
@@ -122,7 +122,7 @@ fn f16_matmul_compiles_valid_spirv_and_matches_cpu_on_radv() {
     let want_f32 = cpu_matmul(&a_data, &b_data, m, k, n);
     let want: Vec<f32> = want_f32
         .iter()
-        .map(|&x| poot_quant::scalar::f16_to_f32(poot_load::gguf::f32_to_f16(x)))
+        .map(|&x| poot_quant::scalar::f16_to_f32(poot_quant::scalar::f32_to_f16(x)))
         .collect();
 
     assert_eq!(got.len(), want.len());

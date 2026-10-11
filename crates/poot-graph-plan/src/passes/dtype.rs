@@ -29,14 +29,14 @@ pub(crate) fn transpose_is_noop(in_shape: &[usize], perm: &[usize]) -> bool {
 /// (and the `transpose -> reshape` on the output) becomes `reshape -> reshape` once the no-op transpose
 /// is a reshape, in every layer. Reshapes are free buffer aliases, so this removes no dispatches; it
 /// cuts node count, and so the per-token host capture/plan work, on the launch-bound decode path.
-pub fn collapse_reshape_chains<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
-    let mut producer: ValueTable<Option<usize>> = ValueTable::filled(g.values.len(), None);
-    for (i, e) in g.eqns.iter().enumerate() {
+pub fn collapse_reshape_chains(g: &Graph) -> Result<Graph, EditError> {
+    let mut producer: ValueTable<Option<usize>> = ValueTable::filled(g.values().len(), None);
+    for (i, e) in g.eqns().iter().enumerate() {
         producer[e.out] = Some(i);
     }
-    let is_reshape = |i: usize| matches!(g.eqns[i].op, OpKind::Reshape { .. });
+    let is_reshape = |i: usize| matches!(g.eqns()[i].op, OpKind::Reshape { .. });
     let eqns: Vec<Eqn> = g
-        .eqns
+        .eqns()
         .iter()
         .map(|e| {
             if !matches!(e.op, OpKind::Reshape { .. }) {
@@ -51,7 +51,7 @@ pub fn collapse_reshape_chains<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
             loop {
                 match producer[cur] {
                     Some(p) if is_reshape(p) => {
-                        src = g.eqns[p].inputs[0];
+                        src = g.eqns()[p].inputs[0];
                         match src {
                             Operand::Value(v) => cur = v,
                             Operand::Lit(_) => break,
@@ -69,16 +69,16 @@ pub fn collapse_reshape_chains<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
             }
         })
         .collect();
-    dce(&Graph { eqns, ..g.clone() })
+    dce(&with_eqns(g, eqns)?)
 }
 
 /// Rewrite data-no-op `Transpose`s to `Reshape`s. A `Reshape` plans as a free buffer alias (no
 /// dispatch) where a `Transpose` is a Compute dispatch, so this cuts launch overhead on the
 /// launch-bound wgpu decode (the seq-1 attention transposes move no data). Shape- and
 /// value-preserving, so it composes anywhere.
-pub fn elide_noop_transposes<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
+pub fn elide_noop_transposes(g: &Graph) -> Result<Graph, EditError> {
     let eqns: Vec<Eqn> = g
-        .eqns
+        .eqns()
         .iter()
         .map(|e| {
             if let OpKind::Transpose { perm } = &e.op
@@ -95,5 +95,5 @@ pub fn elide_noop_transposes<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
             e.clone()
         })
         .collect();
-    Graph { eqns, ..g.clone() }
+    with_eqns(g, eqns)
 }

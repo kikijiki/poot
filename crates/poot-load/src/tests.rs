@@ -375,14 +375,6 @@ fn file_load_peak_rss_is_bounded() {
 }
 
 #[test]
-fn bf16_roundtrip() {
-    // 1.0 in bf16 is 0x3F80; high 16 bits of f32 1.0 (0x3F800000).
-    let raw = 0x3F80u16.to_le_bytes();
-    let v = decode("BF16", &raw).unwrap();
-    assert_eq!(v, vec![1.0]);
-}
-
-#[test]
 fn f16_one() {
     // 1.0 in f16 is 0x3C00.
     assert_eq!(f16_to_f32(0x3C00), 1.0);

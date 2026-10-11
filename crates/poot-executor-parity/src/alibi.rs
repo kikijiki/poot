@@ -36,7 +36,7 @@ fn graph(tokens: usize) -> Graph {
     let slopes = b.computed(ComputedConst::AlibiSlopes { heads: HEADS });
     let mask = alibi_mask_from_pos(&b, pos, CAP, None, slopes, HEADS);
     let y = attention_masked(&b, q, k, v, 1, 1.0 / (D as f32).sqrt(), mask);
-    b.finish(y)
+    b.finish(y).unwrap()
 }
 
 fn fixture(name: &'static str, tokens: usize, starts: &[usize]) -> Fixture {

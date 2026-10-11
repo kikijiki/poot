@@ -17,6 +17,15 @@
 //! combine. The combine then runs on every lane over a slice of the output channels: with `M` the maximum of
 //! the lane maxima, `out[c] = sum_i o_i[c] * exp(m_i - M) / sum_i l_i * exp(m_i - M)`.
 //!
+//! [`AttentionSchedule::SplitKv`] is the same row split over the keys across `splits` workgroups (decode,
+//! where `batch * heads` workgroups leave a many-CU device idle). Stage one is this body with each
+//! workgroup visiting only its own contiguous chunk of the keys and publishing the combine's inputs
+//! instead of dividing: `o[dv]` unnormalized, then `m` and `l`, at `[(row * splits + split) * (dv + 2)]` of
+//! the scratch it writes. A split with no key to visit (a live length short of its chunk) publishes the
+//! neutral `(o = 0, m = -inf, l = 0)` by the same arithmetic as a lane that saw nothing, so the scratch
+//! needs no initialization. Stage two ([`AttentionCombineSpec`]) is the `lanes`-wide combine over the
+//! splits.
+//!
 //! Operands are dense: `q [B, Hq, Lq, Dk]`, `k [B, Hkv, Lk, Dk]` and `v [B, Hkv, Lk, Dv]`, `mask [B, Hm, Lq, Lk]`
 //! (additive), `out [B, Hq, Lq, Dv]`, GQA through `kv_head = head / n_rep`. A [`KeyLayout::Split`] key
 //! is `k [B, Hkv, Lk, Dk - s]` plus `k_shared [B, 1, Lk, s]`, the shared part read by every key head, and
@@ -61,20 +70,79 @@ pub struct AttentionSpec {
 }
 
 impl AttentionSpec {
-    /// Workgroups the streaming schedule launches: one per `(batch, head, query row)`.
-    pub fn workgroups(&self) -> usize {
+    /// Query rows: one per `(batch, head, query row)`.
+    pub fn rows(&self) -> usize {
         self.batch * self.hq * self.lq
     }
-}
 
-impl AttentionSpec {
+    /// Workgroups the schedule launches: one per row, or one per `(row, split)`.
+    pub fn workgroups(&self) -> usize {
+        match self.schedule {
+            AttentionSchedule::Streaming { .. } => self.rows(),
+            AttentionSchedule::SplitKv { splits, .. } => self.rows() * splits,
+        }
+    }
+
+    /// The keys one workgroup walks: all `lk`, or one split's chunk.
+    pub fn keys_per_workgroup(&self) -> usize {
+        match self.schedule {
+            AttentionSchedule::Streaming { .. } => self.lk,
+            AttentionSchedule::SplitKv { splits, .. } => self.lk.div_ceil(splits),
+        }
+    }
+
+    /// The `f32` elements the split schedule's partial state occupies: `(o[dv], m, l)` per `(row,
+    /// split)`. `None` for the streaming schedule, which has no intermediate.
+    pub fn partial_elems(&self) -> Option<usize> {
+        match self.schedule {
+            AttentionSchedule::Streaming { .. } => None,
+            AttentionSchedule::SplitKv { splits, .. } => Some(self.rows() * splits * (self.dv + 2)),
+        }
+    }
+
     /// The serial work of one dispatch: `workgroups * lanes` threads, each stepping over its share of the
     /// keys and, per key, over the key width (the score dot product) and the value width (the output update).
     pub(crate) fn serial_work(&self) -> SerialWork {
-        let AttentionSchedule::Streaming { lanes } = self.schedule;
+        let lanes = self.schedule.lanes();
         SerialWork {
             threads: (self.workgroups() * lanes) as u64,
-            steps_per_thread: (self.lk.div_ceil(lanes) * (self.dk + self.dv)) as u64,
+            steps_per_thread: (self.keys_per_workgroup().div_ceil(lanes) * (self.dk + self.dv))
+                as u64,
+        }
+    }
+}
+
+/// The combine stage of a split-KV attention: one workgroup of `lanes` threads per row, each lane a strided
+/// share of the `dv` output channels, reduces the row's `splits` partials stage one wrote into the scratch.
+/// Params: the partials `[rows, splits, dv + 2]` (read), then `out [rows, dv]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttentionCombineSpec {
+    /// `batch * hq * lq` rows.
+    pub rows: usize,
+    pub splits: usize,
+    pub dv: usize,
+    pub lanes: usize,
+}
+
+impl AttentionCombineSpec {
+    /// The combine stage that reads the partials `spec`'s split schedule writes: the same rows, splits
+    /// and value width, `None` for a streaming schedule.
+    pub fn of(spec: &AttentionSpec) -> Option<Self> {
+        match spec.schedule {
+            AttentionSchedule::Streaming { .. } => None,
+            AttentionSchedule::SplitKv { lanes, splits } => Some(Self {
+                rows: spec.rows(),
+                splits,
+                dv: spec.dv,
+                lanes,
+            }),
+        }
+    }
+
+    pub(crate) fn serial_work(&self) -> SerialWork {
+        SerialWork {
+            threads: (self.rows * self.lanes) as u64,
+            steps_per_thread: (self.dv.div_ceil(self.lanes) * self.splits) as u64,
         }
     }
 }
@@ -124,6 +192,19 @@ pub enum KeyBound {
 pub enum AttentionSchedule {
     /// One workgroup of `lanes` threads per `(batch, head, query row)`, lanes striding over the keys.
     Streaming { lanes: usize },
+    /// Stage one of split-KV attention: one workgroup of `lanes` threads per `(batch, head, query row,
+    /// split)`, each walking its own contiguous `ceil(lk / splits)`-key chunk and writing a partial state
+    /// to a scratch instead of the output. [`AttentionCombineSpec`] reduces the partials.
+    SplitKv { lanes: usize, splits: usize },
+}
+
+impl AttentionSchedule {
+    /// The workgroup width: the lanes that stride the keys.
+    pub fn lanes(self) -> usize {
+        match self {
+            Self::Streaming { lanes } | Self::SplitKv { lanes, .. } => lanes,
+        }
+    }
 }
 
 const GENERATOR: &str = "attention_body";
@@ -145,8 +226,13 @@ fn bad(what: &str, value: usize, min: usize) -> KernelGenError {
 /// Check the spec's own preconditions: every extent nonzero, `hq` a multiple of `n_rep`, and a split key's
 /// shared part a proper, nonempty slice of the key width.
 fn validate(spec: &AttentionSpec) -> Result<usize, KernelGenError> {
-    let AttentionSchedule::Streaming { lanes } = spec.schedule;
+    let lanes = spec.schedule.lanes();
+    let splits = match spec.schedule {
+        AttentionSchedule::Streaming { .. } => 1,
+        AttentionSchedule::SplitKv { splits, .. } => splits,
+    };
     for (what, value) in [
+        ("splits", splits),
         ("batch", spec.batch),
         ("hq", spec.hq),
         ("n_rep", spec.n_rep),
@@ -166,6 +252,15 @@ fn validate(spec: &AttentionSpec) -> Result<usize, KernelGenError> {
             dim: "hq".to_string(),
             value: spec.hq,
             divisor: spec.n_rep,
+        });
+    }
+    // A split with no key at all is a wasted workgroup, and `ceil(lk / splits)` would leave it empty.
+    if splits > spec.lk {
+        return Err(KernelGenError::ExceedsBound {
+            generator: GENERATOR,
+            what: "splits".to_string(),
+            value: splits,
+            bound: spec.lk,
         });
     }
     if let KeyLayout::Split { shared_dim } = spec.key {
@@ -283,7 +378,9 @@ pub(crate) fn count_to(
 /// Build the attention kernel `spec` describes. The launch is `spec.workgroups()` workgroups of `lanes`
 /// threads laid over a 2-D grid `x_groups` workgroups across: `gi = GroupY * x_groups + GroupX` is the flat
 /// `(batch, head, row)` index, and a workgroup past `workgroups()` (the fold's remainder) returns.
-/// Parameters: `q`, `k`, `v`, `mask`, then `k_shared` for a split key, then `len` for a live bound, then `out`.
+/// Parameters: `q`, `k`, `v`, `mask`, then `k_shared` for a split key, then `len` for a live bound, then `out`
+/// (the partial-state scratch under [`AttentionSchedule::SplitKv`]: the `x_groups`/`gi` index then runs over
+/// `(row, split)`, `gi = row * splits + split`).
 pub(crate) fn attention_body(
     name: &str,
     spec: &AttentionSpec,
@@ -302,8 +399,13 @@ pub(crate) fn attention_body(
         score,
         mask: mask_kind,
         bound,
-        schedule: _,
+        schedule,
     } = *spec;
+    let splits = match schedule {
+        AttentionSchedule::Streaming { .. } => None,
+        AttentionSchedule::SplitKv { splits, .. } => Some(splits),
+    };
+    let chunk = spec.keys_per_workgroup();
     let hkv = hq / n_rep;
     let mask_heads = match mask_kind {
         MaskKind::Broadcast => 1,
@@ -353,13 +455,20 @@ pub(crate) fn attention_body(
     let in_range = c.bin(Ty::Bool, BinOp::Lt, local_op(gi), cu(spec.workgroups()));
 
     c.if_then(in_range, |c| {
-        // gi = (b * hq + h) * lq + i.
-        let i = uc(c, BinOp::Rem, gi, lq);
-        let bh = uc(c, BinOp::Div, gi, lq);
+        // row = (b * hq + h) * lq + i; under the split schedule gi = row * splits + split.
+        let (row, split) = match splits {
+            None => (gi, None),
+            Some(splits) => (
+                uc(c, BinOp::Div, gi, splits),
+                Some(uc(c, BinOp::Rem, gi, splits)),
+            ),
+        };
+        let i = uc(c, BinOp::Rem, row, lq);
+        let bh = uc(c, BinOp::Div, row, lq);
         let h = uc(c, BinOp::Rem, bh, hq);
         let b = uc(c, BinOp::Div, bh, hq);
         let kv_head = uc(c, BinOp::Div, h, n_rep);
-        let qbase = uc(c, BinOp::Mul, gi, dk);
+        let qbase = uc(c, BinOp::Mul, row, dk);
         let kv_row = {
             let by_batch = uc(c, BinOp::Mul, b, hkv);
             ubin(c, BinOp::Add, by_batch, kv_head)
@@ -419,7 +528,23 @@ pub(crate) fn attention_body(
                 local_op(end)
             }
         };
-        count_to(c, local_op(lane), key_end, lanes, |c, t| {
+        // One workgroup's keys: all of them, or its split's contiguous chunk of the live range (empty when
+        // the live length stops short of the chunk).
+        let (first_key, key_end) = match split {
+            None => (local_op(lane), key_end),
+            Some(split) => {
+                let begin = uc(c, BinOp::Mul, split, chunk);
+                let end = c.var(Ty::Usize, Rvalue::Use(key_end));
+                let chunk_end = uc(c, BinOp::Add, begin, chunk);
+                let shorter = c.bin(Ty::Bool, BinOp::Lt, local_op(chunk_end), local_op(end));
+                c.if_then(shorter, |c| {
+                    c.assign(Place::local(end), Rvalue::Use(local_op(chunk_end)));
+                });
+                let first = ubin(c, BinOp::Add, begin, lane);
+                (local_op(first), local_op(end))
+            }
+        };
+        count_to(c, first_key, key_end, lanes, |c, t| {
             // dot = q[row] . k[t], over the key's own part and then its shared part
             let dot = c.var(Ty::F32, Rvalue::Use(f32c(0.0)));
             let accumulate = |c: &mut Cfg,
@@ -519,7 +644,11 @@ pub(crate) fn attention_body(
             let next = fbin(c, BinOp::Add, denominator, part);
             c.assign(Place::local(denominator), Rvalue::Use(local_op(next)));
         });
-        let out_base = uc(c, BinOp::Mul, gi, dv);
+        // The streaming schedule writes the normalized row; a split writes its unnormalized state.
+        let out_base = match split {
+            None => uc(c, BinOp::Mul, gi, dv),
+            Some(_) => uc(c, BinOp::Mul, gi, dv + 2),
+        };
         count(c, local_op(lane), dv, lanes, |c, channel| {
             let acc = c.var(Ty::F32, Rvalue::Use(f32c(0.0)));
             count(c, cu(0), lanes, 1, |c, other| {
@@ -533,16 +662,138 @@ pub(crate) fn attention_body(
                 let next = fbin(c, BinOp::Add, acc, part);
                 c.assign(Place::local(acc), Rvalue::Use(local_op(next)));
             });
-            let result = fbin(c, BinOp::Div, acc, denominator);
+            let result = match split {
+                None => fbin(c, BinOp::Div, acc, denominator),
+                Some(_) => acc,
+            };
             let oi = ubin(c, BinOp::Add, out_base, channel);
             c.assign(elem(out, oi), Rvalue::Use(local_op(result)));
         });
+        if split.is_some() {
+            let first_lane = c.bin(Ty::Bool, BinOp::Eq, local_op(lane), cu(0));
+            c.if_then(first_lane, |c| {
+                let m_at = uc(c, BinOp::Add, out_base, dv);
+                c.assign(elem(out, m_at), Rvalue::Use(local_op(big_m)));
+                let l_at = uc(c, BinOp::Add, out_base, dv + 1);
+                c.assign(elem(out, l_at), Rvalue::Use(local_op(denominator)));
+            });
+        }
     });
 
     let mut body = c.finish(name);
     body.workgroup_size = [lanes as u32, 1, 1];
     body.workgroup_locals = vec![f32_array(lanes * dv), f32_array(lanes), f32_array(lanes)];
     Ok(body)
+}
+
+/// The combine stage of split-KV attention (see [`AttentionCombineSpec`]). The launch is one workgroup of
+/// `lanes` threads per row over the same 2-D `x_groups` fold as [`attention_body`]. Parameters: `partials`,
+/// then `out`. A lane reads each split's `(m, l)` once, then every channel of its strided share; a split
+/// whose maximum is `-inf` saw no unmasked key and weighs zero, so no `-inf - -inf` is formed.
+pub(crate) fn attention_combine_body(
+    name: &str,
+    spec: &AttentionCombineSpec,
+    x_groups: usize,
+) -> Result<Body, KernelGenError> {
+    for (what, value) in [
+        ("rows", spec.rows),
+        ("splits", spec.splits),
+        ("dv", spec.dv),
+        ("lanes", spec.lanes),
+    ] {
+        if value == 0 {
+            return Err(bad(what, value, 1));
+        }
+    }
+    let AttentionCombineSpec {
+        rows,
+        splits,
+        dv,
+        lanes,
+    } = *spec;
+    let params = vec![
+        ld(Ty::Unit, false),
+        ld(slice_f32(false), false), // 1 partials
+        ld(slice_f32(true), true),   // 2 out
+    ];
+    let (partials, out) = (
+        poot_kernel_ir::Local { index: 1 },
+        poot_kernel_ir::Local { index: 2 },
+    );
+    let mut c = Cfg::new(params);
+    let group_x = c.index(IndexAxis::GroupX);
+    let group_y = c.index(IndexAxis::GroupY);
+    let lane = c.index(IndexAxis::LocalX);
+    let row_offset = uc(&mut c, BinOp::Mul, group_y, x_groups);
+    let row = ubin(&mut c, BinOp::Add, row_offset, group_x);
+    let in_range = c.bin(Ty::Bool, BinOp::Lt, local_op(row), cu(rows));
+    c.if_then(in_range, |c| {
+        let row_base = uc(c, BinOp::Mul, row, splits * (dv + 2));
+        // `(m, l)` of split `s` sit at `row_base + s * (dv + 2) + dv` and the element after it.
+        let split_at = |c: &mut Cfg, s: poot_kernel_ir::Local, extra: usize| {
+            let start = uc(c, BinOp::Mul, s, dv + 2);
+            let at = ubin(c, BinOp::Add, row_base, start);
+            uc(c, BinOp::Add, at, extra)
+        };
+        let big_m = c.var(Ty::F32, Rvalue::Use(f32c(f32::NEG_INFINITY)));
+        count(c, cu(0), splits, 1, |c, s| {
+            let at = split_at(c, s, dv);
+            let m_s = c.let_(Ty::F32, Rvalue::Use(copy(elem(partials, at))));
+            let next = fbin(c, BinOp::Max, big_m, m_s);
+            c.assign(Place::local(big_m), Rvalue::Use(local_op(next)));
+        });
+        let denominator = c.var(Ty::F32, Rvalue::Use(f32c(0.0)));
+        count(c, cu(0), splits, 1, |c, s| {
+            let m_at = split_at(c, s, dv);
+            let w = split_weight(c, partials, m_at, big_m);
+            let l_at = split_at(c, s, dv + 1);
+            let l_s = c.let_(Ty::F32, Rvalue::Use(copy(elem(partials, l_at))));
+            let part = fbin(c, BinOp::Mul, l_s, w);
+            let next = fbin(c, BinOp::Add, denominator, part);
+            c.assign(Place::local(denominator), Rvalue::Use(local_op(next)));
+        });
+        let out_base = uc(c, BinOp::Mul, row, dv);
+        count(c, local_op(lane), dv, lanes, |c, channel| {
+            let acc = c.var(Ty::F32, Rvalue::Use(f32c(0.0)));
+            count(c, cu(0), splits, 1, |c, s| {
+                let m_at = split_at(c, s, dv);
+                let w = split_weight(c, partials, m_at, big_m);
+                let o_at = {
+                    let start = split_at(c, s, 0);
+                    ubin(c, BinOp::Add, start, channel)
+                };
+                let o_s = c.let_(Ty::F32, Rvalue::Use(copy(elem(partials, o_at))));
+                let part = fbin(c, BinOp::Mul, o_s, w);
+                let next = fbin(c, BinOp::Add, acc, part);
+                c.assign(Place::local(acc), Rvalue::Use(local_op(next)));
+            });
+            let result = fbin(c, BinOp::Div, acc, denominator);
+            let oi = ubin(c, BinOp::Add, out_base, channel);
+            c.assign(elem(out, oi), Rvalue::Use(local_op(result)));
+        });
+    });
+    let mut body = c.finish(name);
+    body.workgroup_size = [lanes as u32, 1, 1];
+    Ok(body)
+}
+
+/// `exp(m_s - big_m)` for the split whose maximum is at `partials[m_at]`, or zero for a split that saw no
+/// unmasked key.
+fn split_weight(
+    c: &mut Cfg,
+    partials: poot_kernel_ir::Local,
+    m_at: poot_kernel_ir::Local,
+    big_m: poot_kernel_ir::Local,
+) -> poot_kernel_ir::Local {
+    let weight = c.var(Ty::F32, Rvalue::Use(f32c(0.0)));
+    let m_s = c.let_(Ty::F32, Rvalue::Use(copy(elem(partials, m_at))));
+    let seen = c.bin(Ty::Bool, BinOp::Ne, local_op(m_s), f32c(f32::NEG_INFINITY));
+    c.if_then(seen, |c| {
+        let behind = fbin(c, BinOp::Sub, m_s, big_m);
+        let w = exp(c, behind);
+        c.assign(Place::local(weight), Rvalue::Use(local_op(w)));
+    });
+    weight
 }
 
 /// `exp(m_other - big_m)`, or zero for a lane that saw no unmasked key.

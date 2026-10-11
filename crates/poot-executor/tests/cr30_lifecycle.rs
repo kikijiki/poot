@@ -69,7 +69,7 @@ impl Device for FaultyDevice {
     type Error = FaultyError;
 
     fn target(&self) -> Target {
-        Target {
+        Target::Gpu {
             backend: Backend::SpirvVulkan,
             caps: DeviceCaps::wgpu_rdna3_igpu(),
         }
@@ -183,7 +183,7 @@ impl Device for FaultyDevice {
 /// (neither new state can be written in place before the other reads it), no slot inputs at all, so
 /// `step` needs nothing but `StepInputs::new()`.
 fn fixture() -> (
-    poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs>,
+    poot_graph_ir::Graph,
     Arc<WeightStore>,
     Arc<poot_quant::weights::WeightMap>,
 ) {
@@ -195,8 +195,8 @@ fn fixture() -> (
     let new_a = b.binary(BinOp::Add, s, bias);
     let new_s = b.binary(BinOp::Add, a, bias);
     let g = b
-        .finish_with_state(output, &[(a, new_a), (s, new_s)])
-        .with_validations(Vec::new());
+        .finish(poot_graph_ir::Outputs::new(output).with_state(&[(a, new_a), (s, new_s)]))
+        .unwrap();
 
     let mut builder = WeightStore::builder();
     builder
@@ -219,11 +219,7 @@ fn fixture() -> (
     (g, store, map)
 }
 
-fn staged(
-    g: &poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs>,
-    target: Target,
-    submission: Submission,
-) -> StagedProgram<poot_graph_ir::ValidationOutputs> {
+fn staged(g: &poot_graph_ir::Graph, target: Target, submission: Submission) -> StagedProgram {
     compile_staged(
         g,
         &TargetSet::single(DeviceId(0), target),

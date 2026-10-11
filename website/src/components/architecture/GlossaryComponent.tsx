@@ -346,7 +346,7 @@ const ENTRIES: Entry[] = [
   },
   {
     term: "XDNA2",
-    def: "AMD's second-generation AI Engine tile array, present in Ryzen AI Max processors. poot compiles to a typed AIE artifact through Peano (an LLVM fork with aie2p target support) and an IRON link step, but its NPU runtime and executor were removed, so nothing runs on the device.",
+    def: "AMD's second-generation AI Engine tile array, present in Ryzen AI Max processors. poot compiles to a typed AIE artifact through Peano (an LLVM fork with aie2p target support) and an IRON link step, and the experimental `poot-npu` device (behind its `xdna` feature) runs the linked artifacts on the NPU. It is verified for F32 add, sub and mul only.",
     see: "npu",
   },
 ].sort((a, b) => a.term.localeCompare(b.term));

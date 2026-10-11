@@ -7,7 +7,7 @@
 )]
 
 use poot_executor_parity::weight_map::MappedModel;
-use poot_graph_ir::{Graph, Slot, SlotKey, ValidationOutputs};
+use poot_graph_ir::{Graph, Slot, SlotKey};
 use poot_tensor::HostTensor;
 use poot_test_util::weight_map_oracle::eval_mapped;
 
@@ -51,17 +51,16 @@ pub fn slot_maps(
 }
 
 /// Zero carried state, in `g.state` order.
-pub fn zero_state(g: &Graph<ValidationOutputs>) -> Vec<HostTensor> {
-    g.state
-        .iter()
-        .map(|&(input, _)| HostTensor::zeros(g.aval(input).shape.clone()))
+pub fn zero_state(g: &Graph) -> Vec<HostTensor> {
+    g.state()
+        .map(|(input, _)| HostTensor::zeros(g.aval(input).shape.clone()))
         .collect()
 }
 
 /// One CPU-oracle step of `g` over `m`'s weights: its logits and the carried state.
 pub fn step(
     m: &MappedModel,
-    g: &Graph<ValidationOutputs>,
+    g: &Graph,
     slots: &[(SlotKey, HostTensor)],
     state: &[HostTensor],
 ) -> (HostTensor, Vec<HostTensor>) {

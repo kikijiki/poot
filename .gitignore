@@ -28,3 +28,7 @@ result-*
 # local logs and env files
 *.log
 .env.*
+
+# python bytecode from scripts/
+__pycache__/
+*.pyc

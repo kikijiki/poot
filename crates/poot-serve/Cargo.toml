@@ -27,7 +27,7 @@ base64.workspace = true
 anyhow.workspace = true
 ring.workspace = true
 subtle.workspace = true
-libc = "0.2"
+libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
@@ -36,7 +36,7 @@ sysinfo.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-poot-test-util = { path = "../poot-test-util" }
+poot-test-util.workspace = true
 # The fixture device of the engine-plan rows counts allocations the way a runtime does.
 poot-runtime-common.workspace = true
 poot-quant.workspace = true

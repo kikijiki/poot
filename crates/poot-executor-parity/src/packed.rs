@@ -224,7 +224,7 @@ pub fn packed_linear_fixtures() -> Vec<Fixture> {
             let b = Builder::new();
             let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![m, K]));
             let y = ops::packed_linear(&b, x, "layer", payload.weight(), None, None).unwrap();
-            let graph = b.finish(y);
+            let graph = b.finish(y).unwrap();
             let key = graph.meta(x.id()).slot_key().unwrap().clone();
             let steps = (0..2)
                 .map(|step| {
@@ -272,7 +272,7 @@ pub fn packed_expert_fixtures() -> Vec<Fixture> {
             TensorType::new(vec![ROWS], poot_tensor::DType::I32),
         );
         let y = packed_indexed_linear(&b, x, ids, &table).unwrap();
-        let graph = b.finish(y);
+        let graph = b.finish(y).unwrap();
         let (kx, ki) = (
             graph.meta(x.id()).slot_key().unwrap().clone(),
             graph.meta(ids.id()).slot_key().unwrap().clone(),

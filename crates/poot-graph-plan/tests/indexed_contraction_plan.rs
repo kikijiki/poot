@@ -26,13 +26,12 @@ fn backends() -> [Backend; 3] {
 }
 
 fn target(backend: Backend) -> Target {
-    Target {
+    Target::Gpu {
         backend,
         caps: match backend {
             Backend::SpirvVulkan => DeviceCaps::wgpu_rdna3_igpu(),
             Backend::Nvptx => DeviceCaps::ptx_default(),
             Backend::AmdGcn(_) => DeviceCaps::rocm_default(),
-            Backend::Aie(_) => unreachable!("an AIE target has no GPU DeviceCaps"),
         },
     }
 }
@@ -58,7 +57,7 @@ fn indexed(m: usize, gate: bool) -> Graph {
         let gate = b.constant("gate", TensorType::f32(vec![m]));
         out = b.binary(BinOp::Mul, out, b.reshape(gate, vec![m, 1]));
     }
-    b.finish(out)
+    b.finish(out).unwrap()
 }
 
 fn is_indexed_head(op: &OpKind) -> bool {
@@ -195,9 +194,9 @@ fn checkpoint_order(m: usize, second_consumer: bool) -> Graph {
         let per_expert = sum(sum(w_ekn, 2, false), 1, false);
         let total = b.reshape(sum(per_expert, 0, true), vec![1, 1]);
         let joined = b.binary(BinOp::Add, out, total);
-        return b.finish(joined);
+        return b.finish(joined).unwrap();
     }
-    b.finish(out)
+    b.finish(out).unwrap()
 }
 
 /// The `Transpose` equations that launch a kernel: one that planned as a view moves no data.
@@ -282,7 +281,7 @@ fn a_sliced_then_transposed_weight_is_refused_by_layout() {
     let ids = b.constant("ids", TensorType::new(vec![5], DType::I32));
     let sliced = b.slice(w, 2, 0, K);
     let out = b.indexed_matmul(x, b.transpose(sliced, vec![0, 2, 1]), ids);
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     for backend in backends() {
         let error = compile(&g, &target(backend), &options())
             .err()
@@ -310,7 +309,7 @@ fn a_checkpoint_order_weight_under_the_gate_epilogue_plans_no_transpose() {
             let gate = b.constant("gate", TensorType::f32(vec![m]));
             let product = b.indexed_matmul(x, b.transpose(w, vec![0, 2, 1]), ids);
             let out = b.binary(BinOp::Mul, product, b.reshape(gate, vec![m, 1]));
-            let program = program(&b.finish(out), backend);
+            let program = program(&b.finish(out).unwrap(), backend);
             let label = format!("{backend:?} M={m}");
             assert_eq!(
                 count(&program, |op| matches!(
@@ -349,7 +348,7 @@ fn bf16_experts(m: usize, checkpoint_order: bool, gate: bool) -> Graph {
         let gate = b.constant("gate", TensorType::f32(vec![m]));
         out = b.binary(BinOp::Mul, out, b.reshape(gate, vec![m, 1]));
     }
-    b.finish(out)
+    b.finish(out).unwrap()
 }
 
 /// POOT-1028: a BF16 expert stack plans one indexed contraction that reads it as packed BF16 lanes, on every
@@ -391,7 +390,7 @@ fn a_bf16_expert_stack_plans_the_packed_lane_without_a_widened_copy() {
                 assert_eq!(request.epilogue.is_some(), gate, "{label}");
                 let graph = program.graph();
                 let stack = graph
-                    .consts
+                    .consts()
                     .iter()
                     .copied()
                     .find(|&id| graph.meta(id).name.as_deref() == Some("w"))
@@ -418,7 +417,7 @@ fn a_computed_bf16_expert_stack_is_refused() {
     let w = b.constant("w", TensorType::f32(vec![EXPERTS, K, N]));
     let ids = b.constant("ids", TensorType::new(vec![5], DType::I32));
     let out = b.indexed_matmul(x, b.cast(w, DType::BF16), ids);
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     for backend in backends() {
         let error = compile(&g, &target(backend), &options())
             .err()
@@ -473,7 +472,7 @@ fn bf16_checkpoint_order_shared(reader: SecondReader) -> Graph {
         SecondReader::Cast | SecondReader::Binary | SecondReader::Fused => total,
     };
     let joined = b.binary(BinOp::Add, out, total);
-    b.finish(joined)
+    b.finish(joined).unwrap()
 }
 
 /// POOT-1028: a BF16 checkpoint-order stack whose `Transpose` another reader also reads is refused with the typed
@@ -520,7 +519,7 @@ fn an_f16_expert_stack_is_refused() {
     let w = b.constant("w", TensorType::new(vec![EXPERTS, K, N], DType::F16));
     let ids = b.constant("ids", TensorType::new(vec![5], DType::I32));
     let out = b.indexed_matmul(x, w, ids);
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     for backend in backends() {
         let error = compile(&g, &target(backend), &options())
             .err()

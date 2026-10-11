@@ -8,7 +8,7 @@
 use std::fmt;
 
 use poot_kernelgen::{KernelRequest, generate};
-use poot_target::{Backend, DeviceCaps};
+use poot_target::{AieTargetId, Backend, DeviceCaps, TargetId};
 
 use crate::*;
 
@@ -73,8 +73,8 @@ impl KernelChoice {
         }
     }
 
-    /// The digest of this choice's canonical encoding for `backend`'s codegen epoch.
-    fn digest(&self, backend: Backend) -> ChoiceDigest {
+    /// The digest of this choice's canonical encoding for `target`'s codegen epoch.
+    fn digest(&self, target: TargetId) -> ChoiceDigest {
         // The `Debug` form of the plain-data choice is its encoding. That is sound only while no type
         // reachable from a request has a lossy `Debug`: the audit (card 636) found one hand-written
         // impl, `TileSize`, which prints its `u32` edge, and `f32` fields (`FusedInput::Lit`), whose `Debug`
@@ -82,7 +82,9 @@ impl KernelChoice {
         // `every_request_family_has_a_field_that_changes_the_digest` test pins one field per family (and the
         // `TileSize` edge and the Gemv launch shape of the packed family).
         let mut hasher = blake3::Hasher::new();
-        hasher.update(poot_codegen::kernel_cache_epoch(codegen_target(backend)).as_bytes());
+        hasher.update(
+            poot_codegen::kernel_cache_epoch(poot_codegen::Target::from(target)).as_bytes(),
+        );
         hasher.update(b"\n");
         hasher.update(format!("{self:?}").as_bytes());
         ChoiceDigest(*hasher.finalize().as_bytes())
@@ -112,6 +114,16 @@ pub(crate) struct PlannedDispatch {
     dispatch: Dispatch,
 }
 
+impl PlannedDispatch {
+    /// This dispatch bound as `binding` says instead of to the equation's operands and output: a stage of
+    /// a plan that passes an intermediate through a scratch buffer.
+    pub(crate) fn bound(self, binding: Binding) -> Self {
+        Self {
+            dispatch: self.dispatch.with_binding(binding),
+        }
+    }
+}
+
 /// The binding of a dispatch over an equation's value operands: the kernel's params are `[operands..,
 /// meta?, out]`, so the operand count is what is left after the metadata buffer and the output.
 fn eqn_binding(body: &Body, launch: &Launch) -> Binding {
@@ -122,10 +134,13 @@ fn eqn_binding(body: &Body, launch: &Launch) -> Binding {
 /// A one-dispatch plan with no scratch. Its binding is the equation's own, so only a kernel whose
 /// params break the calling convention fails here.
 fn single_plan(dispatch: Dispatch) -> Result<Plan, PlanError> {
-    Ok(Plan::Dispatches(DispatchPlan::new(vec![dispatch], 0)?))
+    Ok(Plan::Dispatches(DispatchPlan::new(
+        vec![dispatch],
+        Vec::new(),
+    )?))
 }
 
-/// A generation request, run for `backend`: the body, its launch and the choice that names them.
+/// A generation request, run for one target: the body, its launch and the choice that names them.
 struct Built {
     body: Body,
     launch: poot_kernelgen::Launch,
@@ -134,42 +149,70 @@ struct Built {
     label: String,
 }
 
+impl Built {
+    /// The one-dispatch form of this generation, bound to the equation's own operands.
+    fn into_dispatch(self) -> PlannedDispatch {
+        let Built {
+            body,
+            launch,
+            choice,
+            key,
+            label,
+        } = self;
+        let launch = Launch {
+            grid: launch.grid,
+            meta: launch.meta.unwrap_or_default(),
+        };
+        let binding = eqn_binding(&body, &launch);
+        PlannedDispatch {
+            dispatch: Dispatch::new(body, key, label, launch, binding, choice),
+        }
+    }
+}
+
 fn build(
     site: Site<'_>,
     request: KernelRequest,
     backend: Backend,
     caps: &DeviceCaps,
 ) -> Result<Built, PlanError> {
-    // The same request every target plans; only its schedule is the target's. An AIE core runs one
-    // sequential loop (one invocation of a one-thread workgroup), the GPU targets a thread grid.
-    let (generated, choice) = match backend {
-        Backend::Aie(_) => {
-            let sequential = poot_kernelgen::sequential_schedule(&request, site.limits())
-                .map_err(|error| site.refuse(Capability::KernelGen(error)))?;
-            let generated = poot_kernelgen::Generated {
-                body: sequential.body,
-                launch: poot_kernelgen::Launch {
-                    grid: [1, 1, 1],
-                    meta: None,
-                },
-            };
-            let choice = KernelChoice::Sequential {
-                request,
-                bindings: sequential.bindings,
-            };
-            (generated, choice)
-        }
-        Backend::SpirvVulkan | Backend::Nvptx | Backend::AmdGcn(_) => {
-            let generated = generate(&request, caps, site.limits())
-                .map_err(|error| site.refuse(Capability::KernelGen(error)))?;
-            (generated, KernelChoice::Generated(request))
-        }
-    };
-    let key = choice.digest(backend).to_string();
+    let generated = generate(&request, caps, site.limits())
+        .map_err(|error| site.refuse(Capability::KernelGen(error)))?;
+    let choice = KernelChoice::Generated(request);
+    let key = choice.digest(backend.into()).to_string();
     let label = choice.display_label();
     Ok(Built {
         body: generated.body,
         launch: generated.launch,
+        choice,
+        key,
+        label,
+    })
+}
+
+/// The same request under an AIE core's sequential one-core schedule: one invocation of a one-thread
+/// workgroup, with the access ranges the generator proved. Only the schedule is the target's; the request is
+/// the one every target plans.
+fn build_sequential(
+    site: Site<'_>,
+    request: KernelRequest,
+    target: AieTargetId,
+) -> Result<Built, PlanError> {
+    let sequential = poot_kernelgen::sequential_schedule(&request, site.limits())
+        .map_err(|error| site.refuse(Capability::KernelGen(error)))?;
+    let launch = poot_kernelgen::Launch {
+        grid: [1, 1, 1],
+        meta: None,
+    };
+    let choice = KernelChoice::Sequential {
+        request,
+        bindings: sequential.bindings,
+    };
+    let key = choice.digest(target.into()).to_string();
+    let label = choice.display_label();
+    Ok(Built {
+        body: sequential.body,
+        launch,
         choice,
         key,
         label,
@@ -192,6 +235,33 @@ impl Planned {
         })
     }
 
+    /// Generate `request` under `lowering`'s schedule: a thread grid for a GPU backend, the sequential
+    /// one-core loop for an AIE target. The request is the same either way.
+    pub(crate) fn lowered(
+        site: Site<'_>,
+        request: KernelRequest,
+        lowering: Lowering<'_>,
+    ) -> Result<Self, PlanError> {
+        match lowering {
+            Lowering::Gpu { backend, caps } => Self::generated(site, request, backend, caps),
+            Lowering::Aie(target) => Self::sequential(site, request, target),
+        }
+    }
+
+    /// Plan `request` for an AIE target: its sequential schedule as one dispatch.
+    fn sequential(
+        site: Site<'_>,
+        request: KernelRequest,
+        target: AieTargetId,
+    ) -> Result<Self, PlanError> {
+        let PlannedDispatch { dispatch } = build_sequential(site, request, target)?.into_dispatch();
+        let choice = dispatch.choice().clone();
+        Ok(Self {
+            plan: single_plan(dispatch)?,
+            choice,
+        })
+    }
+
     /// Generate `request` as one dispatch of a split plan.
     pub(crate) fn generated_dispatch(
         site: Site<'_>,
@@ -199,21 +269,7 @@ impl Planned {
         backend: Backend,
         caps: &DeviceCaps,
     ) -> Result<PlannedDispatch, PlanError> {
-        let Built {
-            body,
-            launch,
-            choice,
-            key,
-            label,
-        } = build(site, request, backend, caps)?;
-        let launch = Launch {
-            grid: launch.grid,
-            meta: launch.meta.unwrap_or_default(),
-        };
-        let binding = eqn_binding(&body, &launch);
-        Ok(PlannedDispatch {
-            dispatch: Dispatch::new(body, key, label, launch, binding, choice),
-        })
+        Ok(build(site, request, backend, caps)?.into_dispatch())
     }
 
     /// Plan a shipped template. `meta` is its metadata buffer (`None` for a kernel that takes none). A
@@ -265,7 +321,7 @@ impl Planned {
         index: Option<DType>,
     ) -> PlannedDispatch {
         let choice = imported_choice(kernel, meta.as_deref(), index);
-        let key = choice.digest(backend).to_string();
+        let key = choice.digest(backend.into()).to_string();
         let label = choice.display_label();
         let body = kernel.body().clone();
         let launch = Launch {
@@ -282,6 +338,16 @@ impl Planned {
     /// dispatch keeps its own choice; the equation's recorded choice is its first dispatch's. An empty
     /// split (a zero-element output) has no choice to record and is refused.
     pub(crate) fn split(dispatches: Vec<PlannedDispatch>) -> Result<Self, PlanError> {
+        Self::pipeline(dispatches, Vec::new())
+    }
+
+    /// Ordered dispatches over `scratch` buffers: a later dispatch reads what an earlier one wrote
+    /// (POOT-ADR-0115). The equation's recorded choice is its first dispatch's. Each dispatch's binding
+    /// is the one its [`PlannedDispatch::bound`] gave it; [`DispatchPlan::new`] validates the lot.
+    pub(crate) fn pipeline(
+        dispatches: Vec<PlannedDispatch>,
+        scratch: Vec<ScratchDecl>,
+    ) -> Result<Self, PlanError> {
         let Some(first) = dispatches.first() else {
             return Err(PlanError::BadShape(
                 "a split plan needs at least one dispatch (zero-element output)".into(),
@@ -293,7 +359,7 @@ impl Planned {
             .map(|PlannedDispatch { dispatch }| dispatch)
             .collect();
         Ok(Self {
-            plan: Plan::Dispatches(DispatchPlan::new(dispatches, 0)?),
+            plan: Plan::Dispatches(DispatchPlan::new(dispatches, scratch)?),
             choice,
         })
     }
@@ -357,14 +423,14 @@ mod tests {
         let v = b.constant("v", TensorType::new(vec![1, hq, cap, d], DType::F32));
         let mask = b.constant("mask", TensorType::new(vec![1, 1, 1, cap], DType::F32));
         let out = poot_graph_ir::ops::attention_masked(&b, q, k, v, 1, scale, mask);
-        b.finish(out)
+        b.finish(out).unwrap()
     }
 
     const OPTIONS: CompileOptions =
         CompileOptions::new(Submission::Replay, crate::CompileLimits::STANDARD);
 
     fn target(backend: Backend) -> Target {
-        Target {
+        Target::Gpu {
             backend,
             caps: default_caps_for(backend),
         }
@@ -444,7 +510,7 @@ mod tests {
         plan.declare_result(out).expect("declare the result");
         let mut prepared = b.preflight_append(plan).expect("preflight");
         let committed = b.commit_append(&mut prepared).expect("commit");
-        b.finish(committed)
+        b.finish(committed).unwrap()
     }
 
     /// Card 636 SC-004: a request the device cannot hold is a typed refusal out of `compile`, not a panic.
@@ -454,7 +520,7 @@ mod tests {
     #[test]
     fn a_device_too_small_for_the_request_compiles_to_a_typed_refusal() {
         let g = flash_decode_composite(512);
-        let small = Target {
+        let small = Target::Gpu {
             backend: Backend::SpirvVulkan,
             caps: poot_target::DeviceCaps {
                 lds_bytes: 2048,
@@ -484,7 +550,7 @@ mod tests {
 
     fn digest_of(request: KernelRequest) -> String {
         KernelChoice::Generated(request)
-            .digest(Backend::SpirvVulkan)
+            .digest(Backend::SpirvVulkan.into())
             .to_string()
     }
 
@@ -699,7 +765,7 @@ mod tests {
         ));
 
         let g = flash_decode_graph(8, 1.0);
-        let eqn = g.eqns.last().expect("the graph has an equation");
+        let eqn = g.eqns().last().expect("the graph has an equation");
         let backend = Backend::SpirvVulkan;
         let site = Site::new(
             (&g).into(),

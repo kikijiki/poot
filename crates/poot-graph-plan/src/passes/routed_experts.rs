@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use poot_graph_ir::graph::{Graph, Operand, ValidationChannel, ValueId};
+use poot_graph_ir::graph::{Graph, Operand, ValueId};
 use poot_graph_ir::op::{ContractionRows, OpKind};
 
 /// One routed-expert site, as equation indices into the graph's `eqns`.
@@ -34,22 +34,22 @@ fn value_inputs(inputs: &[Operand]) -> impl Iterator<Item = ValueId> + '_ {
 }
 
 /// Every routed-expert site of `g`.
-pub(crate) fn routed_expert_sites<V: ValidationChannel>(g: &Graph<V>) -> Vec<RoutedExpertSite> {
+pub(crate) fn routed_expert_sites(g: &Graph) -> Vec<RoutedExpertSite> {
     let producer: HashMap<ValueId, usize> = g
-        .eqns
+        .eqns()
         .iter()
         .enumerate()
         .map(|(i, eqn)| (eqn.out, i))
         .collect();
     let mut consumers: HashMap<ValueId, Vec<usize>> = HashMap::new();
-    for (i, eqn) in g.eqns.iter().enumerate() {
+    for (i, eqn) in g.eqns().iter().enumerate() {
         for input in value_inputs(&eqn.inputs) {
             consumers.entry(input).or_default().push(i);
         }
     }
 
     let mut sites = Vec::new();
-    for (select, eqn) in g.eqns.iter().enumerate() {
+    for (select, eqn) in g.eqns().iter().enumerate() {
         if !matches!(eqn.op, OpKind::ArgTopK { .. }) {
             continue;
         }
@@ -71,18 +71,14 @@ pub(crate) fn routed_expert_sites<V: ValidationChannel>(g: &Graph<V>) -> Vec<Rou
 
 /// The nearest `MatMul` feeding equation `start`: the walk stops at the first contraction on every
 /// path, so it never reaches an earlier layer's.
-fn upstream_router<V: ValidationChannel>(
-    g: &Graph<V>,
-    producer: &HashMap<ValueId, usize>,
-    start: usize,
-) -> Option<usize> {
-    let mut seen = vec![false; g.eqns.len()];
+fn upstream_router(g: &Graph, producer: &HashMap<ValueId, usize>, start: usize) -> Option<usize> {
+    let mut seen = vec![false; g.eqns().len()];
     let mut stack = vec![start];
     while let Some(i) = stack.pop() {
         if std::mem::replace(&mut seen[i], true) {
             continue;
         }
-        let eqn = &g.eqns[i];
+        let eqn = &g.eqns()[i];
         if i != start && matches!(eqn.op, OpKind::MatMul) {
             return Some(i);
         }
@@ -106,17 +102,17 @@ fn expert_index_position(op: &OpKind) -> Option<usize> {
 /// Every indexed contraction whose per-row expert index is reached from the output of equation
 /// `start`, in equation order. The walk does not continue through a contraction: its result is an
 /// activation, never an index, so a later layer's selection is not this one's.
-fn downstream_indexed<V: ValidationChannel>(
-    g: &Graph<V>,
+fn downstream_indexed(
+    g: &Graph,
     consumers: &HashMap<ValueId, Vec<usize>>,
     start: usize,
 ) -> Vec<usize> {
-    let mut seen = vec![false; g.eqns.len()];
+    let mut seen = vec![false; g.eqns().len()];
     let mut found = Vec::new();
-    let mut stack = vec![g.eqns[start].out];
+    let mut stack = vec![g.eqns()[start].out];
     while let Some(value) = stack.pop() {
         for &i in consumers.get(&value).into_iter().flatten() {
-            let eqn = &g.eqns[i];
+            let eqn = &g.eqns()[i];
             if let Some(position) = expert_index_position(&eqn.op) {
                 if matches!(eqn.inputs.get(position), Some(Operand::Value(idx)) if *idx == value)
                     && !found.contains(&i)
@@ -157,7 +153,7 @@ mod tests {
         } else {
             b.reshape(ids, vec![rows, 1])
         };
-        b.finish(out)
+        b.finish(out).unwrap()
     }
 
     fn sites(g: &Graph) -> usize {
@@ -184,7 +180,7 @@ mod tests {
         let scores = b.constant("scores", TensorType::f32(vec![4, 3]));
         let ids = b.arg_top_k(scores, 1);
         assert_eq!(
-            sites(&b.finish(ids)),
+            sites(&b.finish(ids).unwrap()),
             0,
             "no router contraction behind the selection"
         );
@@ -197,9 +193,12 @@ mod tests {
         let [ref site] = routed_expert_sites(&g)[..] else {
             panic!("one site");
         };
-        assert!(matches!(g.eqns[site.router].op, OpKind::MatMul));
-        assert!(matches!(g.eqns[site.select].op, OpKind::ArgTopK { .. }));
+        assert!(matches!(g.eqns()[site.router].op, OpKind::MatMul));
+        assert!(matches!(g.eqns()[site.select].op, OpKind::ArgTopK { .. }));
         assert_eq!(site.experts.len(), 1);
-        assert!(matches!(g.eqns[site.experts[0]].op, OpKind::IndexedMatMul));
+        assert!(matches!(
+            g.eqns()[site.experts[0]].op,
+            OpKind::IndexedMatMul
+        ));
     }
 }

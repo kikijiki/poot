@@ -29,11 +29,8 @@ use poot_tensor::HostTensor;
 use poot_test_util::const_weights::ConstWeights;
 
 /// `g` staged for the executor contract against `target` (Card 546a: `Submission::Replay` only).
-pub fn staged_program(
-    g: &Graph,
-    target: Target,
-) -> StagedProgram<poot_graph_ir::ValidationOutputs> {
-    let g = g.clone().with_validations(Vec::new());
+pub fn staged_program(g: &Graph, target: Target) -> StagedProgram {
+    let g = g.clone();
     compile_staged(
         &g,
         &TargetSet::single(DeviceId(0), target),
@@ -55,7 +52,7 @@ pub fn staged_program(
 fn const_store(g: &Graph, inputs: &HashMap<ValueId, Value>) -> WeightStore {
     let mut builder = WeightStore::builder();
     let mut packed_linear_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for &id in &g.inputs {
+    for &id in g.inputs() {
         let meta = g.meta(id);
         if meta.storage != Storage::Const {
             continue;
@@ -154,7 +151,7 @@ fn load_consts(
 /// `inputs`'s `Storage::Slot` entries only, as the `SlotKey`-keyed [`StepInputs`] `step` takes.
 fn slot_inputs<'a>(g: &Graph, inputs: &'a HashMap<ValueId, Value>) -> StepInputs<'a> {
     let mut step_inputs = StepInputs::new();
-    for &id in &g.inputs {
+    for &id in g.inputs() {
         let meta = g.meta(id);
         let Storage::Slot(_) = meta.storage else {
             continue;
@@ -203,7 +200,7 @@ pub fn run_resident_prepared(
     engine.remove_entry(exe, entry).expect("remove_entry");
     engine.unload(exe).expect("unload");
     HostTensor::f32(
-        g.aval(g.output).shape.clone(),
+        g.aval(g.result()).shape.clone(),
         bytemuck::cast_slice::<u8, f32>(&bytes).to_vec(),
     )
 }
@@ -249,7 +246,7 @@ impl<'d> DecodeEntry<'d> {
             engine,
             exe,
             entry,
-            output_shape: g.aval(g.output).shape.clone(),
+            output_shape: g.aval(g.result()).shape.clone(),
         }
     }
 
@@ -289,7 +286,7 @@ impl<'d> DecodeEntry<'d> {
             poot_graph_ir::TensorType::f32(shape.clone()),
             poot_graph_ir::StateRole::Recurrent,
         );
-        let probe = b.finish(state);
+        let probe = b.finish(state).unwrap();
         let staged = staged_program(&probe, Device::target(self.engine.device()));
         let probe_entry = self
             .engine
@@ -373,8 +370,7 @@ impl Device for PtxDeviceProxy<'_> {
                 buffer: d.output.buffer,
                 elems: d.output.elems,
             },
-            threads: d.threads,
-            workgroup: d.workgroup,
+            launch: d.launch,
             work: d.work,
         })
     }

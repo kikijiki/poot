@@ -46,9 +46,8 @@ fn state_names(model: &dyn Model, capacity: usize) -> Vec<String> {
     let g = model
         .trace(Phase::Decode, shape(1, capacity, LogitRows::All))
         .unwrap();
-    g.state
-        .iter()
-        .map(|&(input, _)| g.meta(input).name.clone().unwrap())
+    g.state()
+        .map(|(input, _)| g.meta(input).name.clone().unwrap())
         .collect()
 }
 
@@ -389,9 +388,8 @@ fn two_rows_do_not_share_state() {
     let run = |phase, tokens: usize, ids: Vec<i32>, pos: Vec<i32>, state: Vec<Vec<f32>>| {
         let g = model.trace(phase, two(tokens)).unwrap();
         let zeros: Vec<Vec<f32>> = g
-            .state
-            .iter()
-            .map(|&(si, _)| vec![0.0; g.aval(si).numel()])
+            .state()
+            .map(|(si, _)| vec![0.0; g.aval(si).numel()])
             .collect();
         let state = if state.is_empty() { zeros } else { state };
         let views: Vec<&[f32]> = state.iter().map(Vec::as_slice).collect();
@@ -807,13 +805,12 @@ fn the_driver_literals_are_the_references_greedy_decode() {
 }
 
 fn target_of(backend: Backend) -> Target {
-    Target {
+    Target::Gpu {
         backend,
         caps: match backend {
             Backend::SpirvVulkan => DeviceCaps::wgpu_rdna3_igpu(),
             Backend::Nvptx => DeviceCaps::ptx_default(),
             Backend::AmdGcn(_) => DeviceCaps::rocm_default(),
-            Backend::Aie(_) => unreachable!("an AIE target has no GPU DeviceCaps"),
         },
     }
 }
@@ -829,11 +826,7 @@ fn backends() -> [Backend; 3] {
 const REPLAY: CompileOptions = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
 
 /// The traced and weight-bound graph of one step of `phase` at `tokens` tokens.
-fn bound_step(
-    model: &dyn Model,
-    phase: Phase,
-    tokens: usize,
-) -> poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs> {
+fn bound_step(model: &dyn Model, phase: Phase, tokens: usize) -> poot_graph_ir::Graph {
     let graph = model
         .trace(phase, shape(tokens, CAPACITY, LogitRows::Last))
         .unwrap();
@@ -873,9 +866,8 @@ fn compile_preserves_every_witness_lane() {
     for (phase, tokens) in [(Phase::Decode, 1), (Phase::Prefill, 4)] {
         let graph = bound_step(&*model, phase, tokens);
         let traced: Vec<(poot_graph_ir::ValidationId, String, usize)> = graph
-            .validation_outputs()
-            .iter()
-            .map(|o| (o.id, o.name.clone(), graph.aval(o.value).numel()))
+            .witnesses()
+            .map(|o| (o.id, o.name.to_owned(), graph.aval(o.value).numel()))
             .collect();
         assert_eq!(
             traced.len(),
@@ -921,15 +913,13 @@ fn run_named(
 ) -> Vec<f32> {
     let graph = model.trace(phase, step).unwrap();
     let names: Vec<String> = graph
-        .state
-        .iter()
-        .map(|&(input, _)| graph.meta(input).name.clone().unwrap())
+        .state()
+        .map(|(input, _)| graph.meta(input).name.clone().unwrap())
         .collect();
     let input: Vec<Vec<f32>> = graph
-        .state
-        .iter()
+        .state()
         .zip(&names)
-        .map(|(&(input, _), name)| {
+        .map(|((input, _), name)| {
             state
                 .get(name)
                 .cloned()

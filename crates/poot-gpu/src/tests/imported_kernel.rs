@@ -71,8 +71,10 @@ fn rowsum_for_asset_matches_cpu_on_wgpu() {
                 buffer: &out_buf,
                 elems: rows as u32,
             },
-            threads: [rows as u32, 1, 1],
-            workgroup: [64, 1, 1],
+            launch: poot_executor::LaunchKind::Grid {
+                threads: [rows as u32, 1, 1],
+                workgroup: [64, 1, 1],
+            },
             work: rows as u64,
         })
         .unwrap();
@@ -166,8 +168,10 @@ fn rmsnorm_dyn_asset_matches_cpu_on_wgpu() {
                 buffer: &out_buf,
                 elems: (rows * d) as u32,
             },
-            threads: [rows as u32, 1, 1],
-            workgroup: [64, 1, 1],
+            launch: poot_executor::LaunchKind::Grid {
+                threads: [rows as u32, 1, 1],
+                workgroup: [64, 1, 1],
+            },
             work: rows as u64,
         })
         .unwrap();

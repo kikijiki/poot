@@ -1,0 +1,177 @@
+{
+  "backend": "ptx",
+  "case": "attention-low-head-decode-live-full",
+  "cells": {
+    "kernel": {
+      "repeats": [
+        {
+          "metrics": {
+            "step_us": 687.2189999999999
+          },
+          "slot": 0,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 688.413
+          },
+          "slot": 1,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 688.552
+          },
+          "slot": 2,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 686.83
+          },
+          "slot": 3,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 686.357
+          },
+          "slot": 4,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 688.072
+          },
+          "slot": 5,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 687.498
+          },
+          "slot": 6,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 687.408
+          },
+          "slot": 7,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 687.805
+          },
+          "slot": 8,
+          "status": "ok"
+        }
+      ]
+    }
+  },
+  "memory": [
+    {
+      "live_bytes": 33555456,
+      "peak_bytes": 33555456,
+      "role": "Weight"
+    },
+    {
+      "live_bytes": 148740,
+      "peak_bytes": 148740,
+      "role": "Activation"
+    },
+    {
+      "live_bytes": 262148,
+      "peak_bytes": 262148,
+      "role": "Input"
+    }
+  ],
+  "observed": {
+    "layout": "bhsd",
+    "shape": {
+      "cap": 32768,
+      "d": 128,
+      "hkv": 1,
+      "hq": 2,
+      "live": 32768
+    },
+    "storage": "f32",
+    "weight_bytes_per_copy": 33554432,
+    "weight_copies": 1
+  },
+  "plan": [
+    "pointwise [5f133fb4fe102e4e98d3bd18c2690a7d0ddae10ab6164df1c8b44a79967c77dd]",
+    "pointwise [8b17e914478dacb658e7782ed8f5449aa4ec4186023814ae593a7bcea943cfba]",
+    "attention [8d06338a075fd22ddc1616fc7c12e7964ce599d4ab7cf48b607be62608e4f0f6]",
+    "attention_combine [06272e9261da19551609d082f3eca791c96f6c9f662d668ccb1fca9f82dbf69a]"
+  ],
+  "plan_id": "24cdf329d310e6b527307d9bd1bcb4dd7199b0af73dcb3e90c00b66ec3ddbf09",
+  "recordings": 1,
+  "reference": {
+    "agrees": true,
+    "max_relative_error": 2.3208179658823674e-09,
+    "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
+    "provenance": "independent-golden",
+    "tolerance": 0.002
+  },
+  "replays": 13,
+  "role": "baseline",
+  "schema": 1,
+  "command": [
+    "cargo",
+    "run",
+    "--release",
+    "-p",
+    "poot-ptx-gpu",
+    "--example",
+    "performance_bank",
+    "--",
+    "--bank",
+    "benchmarks/performance-bank/cases.json",
+    "--case",
+    "attention-low-head-decode-live-full",
+    "--out",
+    "benchmarks/performance-bank/receipts/ptx/attention-low-head-decode-live-full.json"
+  ],
+  "parent_revision": "00e3fd0a95a84c278918fcbd1c4f19220dca8040",
+  "binary_sha256": "d5d97d5d5b6b9d4d83c0bea518843aea0c2845fad60f10d0e6d9a4a5cb890aae",
+  "identity": {
+    "checkpoint_digest": "synthetic-no-checkpoint",
+    "token_fixture": "splitmix64-seed0-unit:237900849bc67b83",
+    "precision": "f32",
+    "layout": "bhsd",
+    "dimensions": {
+      "hq": 2,
+      "hkv": 1,
+      "d": 128,
+      "cap": 32768,
+      "live": 32768
+    },
+    "prompt_tokens": 1,
+    "live_context": 32768,
+    "max_context": 32768,
+    "requested_output": "n/a",
+    "actual_output": "n/a",
+    "sampler": "n/a",
+    "template": "n/a",
+    "cache_state": {
+      "condition": "weights-resident-hot",
+      "id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb"
+    },
+    "prepared_set": [
+      "attention-low-head-decode-live-full"
+    ],
+    "timing_policy": {
+      "warmup": 3,
+      "repeats": 9,
+      "clock": "wall step plus readback",
+      "profiled": false
+    },
+    "backend": "ptx",
+    "device": "NVIDIA RTX A5000",
+    "driver": "580.178.04"
+  },
+  "identity_digest": "6d3686ddf309fb60202dbcb17aec8b5ff085e03040985ba04de1ea773ddc261e",
+  "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77"
+}

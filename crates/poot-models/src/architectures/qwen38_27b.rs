@@ -25,7 +25,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use poot_graph_ir::op::{PackedWeight, ScaleEncoding, WeightFormat};
-use poot_graph_ir::{Builder, Graph, ValidationOutputs};
+use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{
     AttnRole, FfnRole, GdnRole, NormRole, WeightEntry, WeightId, WeightKey, WeightMap,
     WeightMapError, WeightRole, WeightStore, WeightView,
@@ -466,11 +466,7 @@ impl Model for Qwen35 {
         &self.weights
     }
 
-    fn trace(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-    ) -> Result<Graph<ValidationOutputs>, TraceError> {
+    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(FAMILY, phase, shape, p.max_positions)?;
         let b = Builder::new();
@@ -496,7 +492,7 @@ impl Model for Qwen35 {
                 )
             },
         );
-        Ok(step.finish(b, logits))
+        Ok(step.finish(b, logits)?)
     }
 }
 
@@ -1322,9 +1318,8 @@ mod tests {
             .trace(Phase::Decode, step_shape(1, CAP, LogitRows::Last))
             .unwrap();
         let names: Vec<String> = g
-            .state
-            .iter()
-            .map(|&(input, _)| g.meta(input).name.clone().unwrap())
+            .state()
+            .map(|(input, _)| g.meta(input).name.clone().unwrap())
             .collect();
         assert_eq!(
             names,

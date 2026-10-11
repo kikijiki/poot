@@ -19,13 +19,14 @@ use poot_kernelgen::{ContractionSpec, FragmentUse, KernelRequest};
 use poot_target::{AmdArch, Backend, DeviceCaps, Queried, SubgroupSupport, TensorCoreSupport};
 use poot_tensor::DType;
 use poot_test_util::device_caps::default_caps_for;
+use poot_test_util::graph_fixtures::{gpu_caps, gpu_caps_mut};
 
 fn options() -> CompileOptions {
     CompileOptions::new(Submission::Replay, CompileLimits::STANDARD)
 }
 
 fn target(backend: Backend, caps: DeviceCaps) -> Target {
-    Target { backend, caps }
+    Target::Gpu { backend, caps }
 }
 
 /// A stand-in for the device's kernel loader: it records every body a program would hand to
@@ -131,7 +132,7 @@ fn generated_lds_graph() -> poot_graph_ir::Graph {
     let a = b.constant("a", TensorType::f32(vec![1, 8, 1024]));
     let w = b.constant("w", TensorType::f32(vec![1024, 8]));
     let out = b.matmul(a, w);
-    b.finish(out)
+    b.finish(out).unwrap()
 }
 
 /// The imported fixture: a decode GEMV (`M = 1`) on the wgpu target plans the shipped coalesced GEMV.
@@ -140,7 +141,7 @@ fn imported_gemv_graph() -> poot_graph_ir::Graph {
     let a = b.constant("a", TensorType::f32(vec![1, 1, 256]));
     let w = b.constant("w", TensorType::f32(vec![256, 512]));
     let out = b.matmul(a, w);
-    b.finish(out)
+    b.finish(out).unwrap()
 }
 
 fn choice_of(program: &Program) -> &KernelChoice {
@@ -177,19 +178,19 @@ fn static_lds_over_the_budget_is_refused_before_any_load() {
     assert!(lds > 0, "the fixture must carry static workgroup memory");
 
     let mut exact = roomy;
-    exact.caps.lds_bytes = u32::try_from(lds).unwrap();
+    gpu_caps_mut(&mut exact).lds_bytes = u32::try_from(lds).unwrap();
     let (loader, result) = compile_and_load(&generated_lds_graph(), &exact);
     result.expect("a device offering exactly the declared bytes admits the kernel");
     assert_eq!(loader.loaded.len(), 1);
 
     let mut short = roomy;
-    short.caps.lds_bytes = u32::try_from(lds).unwrap() - 1;
+    gpu_caps_mut(&mut short).lds_bytes = u32::try_from(lds).unwrap() - 1;
     let (loader, result) = compile_and_load(&generated_lds_graph(), &short);
     assert_eq!(
         resource_refusal(result, "one byte of LDS short"),
         ResourceRefusal::StaticLds {
             needed: lds,
-            available: short.caps.lds_bytes,
+            available: gpu_caps(&short).lds_bytes,
         }
     );
     assert!(
@@ -224,13 +225,13 @@ fn an_overlarge_workgroup_is_refused_for_generated_and_imported_kernels_alike() 
         let wg = body.workgroup_size;
 
         let mut too_many = roomy;
-        too_many.caps.max_workgroup_invocations = u32::try_from(total).unwrap() - 1;
+        gpu_caps_mut(&mut too_many).max_workgroup_invocations = u32::try_from(total).unwrap() - 1;
         let (loader, result) = compile_and_load(&graph, &too_many);
         assert_eq!(
             resource_refusal(result, what),
             ResourceRefusal::WorkgroupInvocations {
                 invocations: total,
-                limit: too_many.caps.max_workgroup_invocations,
+                limit: gpu_caps(&too_many).max_workgroup_invocations,
             },
             "{what}"
         );
@@ -240,7 +241,7 @@ fn an_overlarge_workgroup_is_refused_for_generated_and_imported_kernels_alike() 
         );
 
         let mut too_wide = roomy;
-        too_wide.caps.max_workgroup_size[0] = wg[0] - 1;
+        gpu_caps_mut(&mut too_wide).max_workgroup_size[0] = wg[0] - 1;
         let (loader, result) = compile_and_load(&graph, &too_wide);
         assert_eq!(
             resource_refusal(result, what),
@@ -257,8 +258,8 @@ fn an_overlarge_workgroup_is_refused_for_generated_and_imported_kernels_alike() 
         );
 
         let mut exact = roomy;
-        exact.caps.max_workgroup_invocations = u32::try_from(total).unwrap();
-        exact.caps.max_workgroup_size[0] = wg[0];
+        gpu_caps_mut(&mut exact).max_workgroup_invocations = u32::try_from(total).unwrap();
+        gpu_caps_mut(&mut exact).max_workgroup_size[0] = wg[0];
         let (loader, result) = compile_and_load(&graph, &exact);
         result.unwrap_or_else(|error| panic!("{what}: exact limits admit the kernel: {error}"));
         assert_eq!(loader.loaded.len(), 1, "{what}");
@@ -281,13 +282,13 @@ fn an_imported_kernel_over_the_lds_budget_is_refused_before_any_load() {
     assert!(lds > 0);
 
     let mut short = roomy;
-    short.caps.lds_bytes = u32::try_from(lds).unwrap() - 1;
+    gpu_caps_mut(&mut short).lds_bytes = u32::try_from(lds).unwrap() - 1;
     let (loader, result) = compile_and_load(&imported_gemv_graph(), &short);
     assert_eq!(
         resource_refusal(result, "imported, one byte of LDS short"),
         ResourceRefusal::StaticLds {
             needed: lds,
-            available: short.caps.lds_bytes,
+            available: gpu_caps(&short).lds_bytes,
         }
     );
     assert!(loader.loaded.is_empty());
@@ -300,10 +301,12 @@ fn bf16_fragment_graph() -> poot_graph_ir::Graph {
     let a = b.constant("a", TensorType::new(vec![1, 16, 32], DType::BF16));
     let w = b.constant("w", TensorType::new(vec![32, 16], DType::BF16));
     let out = b.matmul(a, w);
-    let mut graph = b.finish(out);
-    let out = graph.output;
-    graph.values[out].aval.dtype = DType::F32;
-    graph
+    let graph = b.finish(out).unwrap();
+    let out = graph.result();
+    poot_test_util::graph_fixtures::derive(&graph, |draft| {
+        draft.values_mut()[out].aval.dtype = DType::F32;
+    })
+    .unwrap()
 }
 
 /// One degraded-device row: what changed, how, and the refusal it must produce.
@@ -385,7 +388,7 @@ fn fragment_kernels_need_the_subgroup_and_matrix_hardware_the_device_reports() {
     ];
     for (what, degrade, expected) in rows {
         let mut degraded = roomy;
-        degrade(&mut degraded.caps);
+        degrade(gpu_caps_mut(&mut degraded));
         let (loader, result) = compile_and_load(&graph, &degraded);
         assert_eq!(resource_refusal(result, what), expected, "{what}");
         assert!(
@@ -401,10 +404,12 @@ fn f16_coopmat_graph() -> poot_graph_ir::Graph {
     let a = b.constant("a", TensorType::new(vec![1, 16, 16], DType::F16));
     let w = b.constant("w", TensorType::new(vec![16, 16], DType::F16));
     let out = b.matmul(a, w);
-    let mut graph = b.finish(out);
-    let out = graph.output;
-    graph.values[out].aval.dtype = DType::F32;
-    graph
+    let graph = b.finish(out).unwrap();
+    let out = graph.result();
+    poot_test_util::graph_fixtures::derive(&graph, |draft| {
+        draft.values_mut()[out].aval.dtype = DType::F32;
+    })
+    .unwrap()
 }
 
 /// SC-001, the same rule for the SPIR-V cooperative-matrix kernel: a Vulkan device with no subgroup
@@ -423,7 +428,7 @@ fn the_cooperative_matrix_kernel_is_refused_without_subgroups() {
     assert_eq!(loader.loaded.len(), 1);
 
     let mut no_subgroups = roomy;
-    no_subgroups.caps.subgroup = Queried::Known(SubgroupSupport::Absent);
+    gpu_caps_mut(&mut no_subgroups).subgroup = Queried::Known(SubgroupSupport::Absent);
     let (loader, result) = compile_and_load(&graph, &no_subgroups);
     assert_eq!(
         resource_refusal(result, "no subgroups"),
@@ -439,7 +444,7 @@ fn serial_contraction_graph(h: usize, m: usize, k: usize, n: usize) -> poot_grap
     let a = b.constant("a", TensorType::f32(vec![1, h, m, k]));
     let w = b.constant("w", TensorType::f32(vec![1, h, k, n]));
     let out = b.matmul(a, w);
-    b.finish(out)
+    b.finish(out).unwrap()
 }
 
 /// SC-002: a long serial contraction under a deliberately small per-dispatch budget. `threads * K`
@@ -468,13 +473,13 @@ fn a_long_serial_contraction_over_the_dispatch_budget_is_refused_before_dispatch
     let work = (h * m * n * k) as u64;
 
     let mut exact = roomy;
-    exact.caps.max_dispatch_work = Queried::Known(work);
+    gpu_caps_mut(&mut exact).max_dispatch_work = Queried::Known(work);
     let (loader, result) = compile_and_load(&graph, &exact);
     result.expect("a budget equal to the dispatch's work admits it");
     assert_eq!(loader.loaded.len(), 1);
 
     let mut small = roomy;
-    small.caps.max_dispatch_work = Queried::Known(work - 1);
+    gpu_caps_mut(&mut small).max_dispatch_work = Queried::Known(work - 1);
     let (loader, result) = compile_and_load(&graph, &small);
     assert_eq!(
         resource_refusal(result, "one step over the budget"),
@@ -498,7 +503,7 @@ fn add_graph(n: usize) -> poot_graph_ir::Graph {
     let x = b.constant("x", TensorType::f32(vec![n]));
     let y = b.constant("y", TensorType::f32(vec![n]));
     let out = b.binary(poot_graph_ir::BinOp::Add, x, y);
-    b.finish(out)
+    b.finish(out).unwrap()
 }
 
 /// The finalizer's workgroup bump changes the kernel a request builds, so the plan key must change with
@@ -513,7 +518,7 @@ fn a_finalizer_workgroup_bump_is_reflected_in_the_plan_key() {
     let n = 1024 * 64 + 1;
     let plain = target(backend, default_caps_for(backend));
     let mut tight = plain;
-    tight.caps.max_grid = [1024; 3];
+    gpu_caps_mut(&mut tight).max_grid = [1024; 3];
 
     let plain_program = compile(&add_graph(n), &plain, &options()).unwrap();
     let tight_program = compile(&add_graph(n), &tight, &options()).unwrap();
@@ -565,13 +570,13 @@ fn imported_contractions_are_bounded_by_the_dispatch_work_budget() {
     let _ = imported_kernel(&program);
 
     let mut exact = roomy;
-    exact.caps.max_dispatch_work = Queried::Known(work);
+    gpu_caps_mut(&mut exact).max_dispatch_work = Queried::Known(work);
     let (loader, result) = compile_and_load(&graph, &exact);
     result.unwrap_or_else(|error| panic!("{what}: a budget equal to the work admits it: {error}"));
     assert_eq!(loader.loaded.len(), 1, "{what}");
 
     let mut short = roomy;
-    short.caps.max_dispatch_work = Queried::Known(work - 1);
+    gpu_caps_mut(&mut short).max_dispatch_work = Queried::Known(work - 1);
     let (loader, result) = compile_and_load(&graph, &short);
     assert_eq!(
         resource_refusal(result, what),

@@ -60,7 +60,6 @@ fn setup(
     let store = builder.build();
     let (g, map) = ConstWeights::bind(g, &store);
     let exe = engine.load_weights(Arc::new(store), Arc::new(map)).ok()?;
-    let g = g.with_validations(Vec::new());
     let staged = compile_staged(
         &g,
         &TargetSet::single(DeviceId(0), target),
@@ -87,7 +86,7 @@ fn bench_elementwise(c: &mut Criterion) {
         let a = b.constant("a", TensorType::f32(vec![n]));
         let c_val = b.constant("c", TensorType::f32(vec![n]));
         let out = b.binary(BinOp::Add, a, c_val);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
 
         let consts = vec![("a", vec![n], fill(42, n)), ("c", vec![n], fill(99, n))];
         let Some((mut engine, exe, entry)) = setup(&g, &consts) else {
@@ -123,7 +122,7 @@ fn bench_matmul(c: &mut Criterion) {
         let a = b.constant("a", TensorType::f32(vec![m, k]));
         let w = b.constant("w", TensorType::f32(vec![k, n]));
         let out = b.matmul(a, w);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
 
         let consts = vec![
             ("a", vec![m, k], fill(101, m * k)),
@@ -155,7 +154,7 @@ fn bench_reduce(c: &mut Criterion) {
         let b = Builder::new();
         let x = b.constant("x", TensorType::f32(vec![rows, cols]));
         let out = b.reduce(RedOp::Sum, x, 1, false);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
 
         let consts = vec![("x", vec![rows, cols], fill(201, rows * cols))];
         let Some((mut engine, exe, entry)) = setup(&g, &consts) else {
@@ -186,7 +185,7 @@ fn bench_rmsnorm(c: &mut Criterion) {
         let x = b.constant("x", TensorType::f32(vec![1, n]));
         let w = b.constant("w", TensorType::f32(vec![n]));
         let out = rmsnorm(&b, x, w, 1e-6);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
 
         let consts = vec![
             ("x", vec![1, n], fill(301, n)),
@@ -221,7 +220,7 @@ fn bench_unary(c: &mut Criterion) {
         let b = Builder::new();
         let x = b.constant("x", TensorType::f32(vec![n]));
         let out = b.unary(UnOp::Exp, x);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
 
         let consts = vec![("x", vec![n], fill(401, n))];
         let Some((mut engine, exe, entry)) = setup(&g, &consts) else {

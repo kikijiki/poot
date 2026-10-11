@@ -22,7 +22,7 @@ use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
 use poot_graph_ir::rope_table::RopeFlavor;
-use poot_graph_ir::{Builder, Graph, ValidationOutputs};
+use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{
     AttnRole, DsaRole, ExpertProj, FfnRole, MlaRole, NormRole, WeightMap, WeightRole, WeightStore,
 };
@@ -947,11 +947,7 @@ impl Model for Deepseek {
         &self.weights
     }
 
-    fn trace(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-    ) -> Result<Graph<ValidationOutputs>, TraceError> {
+    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(self.family, phase, shape, p.max_positions)?;
         moe::check_step(self.family, shape, &p.moe)?;
@@ -978,7 +974,7 @@ impl Model for Deepseek {
                 },
             )
         });
-        Ok(step.finish(b, logits))
+        Ok(step.finish(b, logits)?)
     }
 }
 
@@ -1192,12 +1188,12 @@ pub(crate) mod family_tests {
             let bound =
                 bind_packed_weights(&g, &WeightFormats::from_weight_map(model.weights())).unwrap();
             let dequants = bound
-                .eqns
+                .eqns()
                 .iter()
                 .filter(|e| matches!(e.op, OpKind::PackedDequant { .. }))
                 .count();
             let indexed = bound
-                .eqns
+                .eqns()
                 .iter()
                 .filter(|e| {
                     matches!(

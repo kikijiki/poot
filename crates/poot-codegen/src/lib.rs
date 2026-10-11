@@ -58,7 +58,7 @@ pub enum Target {
     /// scalar loop kernel (no SPMD thread-index, no workgroup barrier, no LDS); the IRON harness tiles the
     /// data and does host<->tile movement. The IR is plain scalar LLVM IR with flat `ptr` args (card 089 /
     /// spec 057). The triple/datalayout come from Peano via `--march`, not the IR text. Its identity is
-    /// [`poot_target::AieTargetId::XDNA2`] (`Backend::Aie`); the loadable artifact is built by [`aie`].
+    /// [`poot_target::AieTargetId::Xdna2`] (`TargetId::Aie`); the loadable artifact is built by [`aie`].
     AieCore,
     /// HSACO for an AMD GPU (e.g. the Radeon 8060S, gfx1151) via the ROCm-flavored clang.
     /// `llc -filetype=obj` produces a relocatable without the `PT_AMDGPU_HSA_LOAD_*` program headers the

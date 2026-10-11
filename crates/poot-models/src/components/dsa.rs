@@ -552,11 +552,10 @@ mod tests {
         } else {
             dsa_scores(&b, &step, 0, xs, qrs, &w, &p)
         };
-        let g = step.finish(b, out);
+        let g = step.finish(b, out).unwrap();
         let zeros: Vec<Vec<f32>> = g
-            .state
-            .iter()
-            .map(|&(si, _)| vec![0.0; g.aval(si).numel()])
+            .state()
+            .map(|(si, _)| vec![0.0; g.aval(si).numel()])
             .collect();
         let state: Vec<&[f32]> = zeros.iter().map(Vec::as_slice).collect();
         let ids = vec![0; T];
@@ -796,11 +795,10 @@ mod tests {
             let step = Step::new(&b, step_shape(tokens, CAPACITY, LogitRows::All));
             let xs = b.constant("x", TensorType::f32(vec![1, tokens, WIDTH]));
             let y = pooled_dsa(&b, &step, 0, xs, &w, &p);
-            let g = step.finish(b, y);
+            let g = step.finish(b, y).unwrap();
             let zeros: Vec<Vec<f32>> = g
-                .state
-                .iter()
-                .map(|&(si, _)| vec![0.0; g.aval(si).numel()])
+                .state()
+                .map(|(si, _)| vec![0.0; g.aval(si).numel()])
                 .collect();
             let state: Vec<&[f32]> = if state.is_empty() { &zeros } else { state }
                 .iter()

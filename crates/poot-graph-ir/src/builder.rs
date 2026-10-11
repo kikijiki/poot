@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{BuilderAppendError, BuilderCollection, BuilderValueNamespace};
 use crate::graph::{
-    ComputedConst, Eqn, Graph, LayerIndex, Operand, Slot, SlotKey, StateRole, Storage, ValueId,
-    ValueMeta, ValueTable,
+    BoundaryId, ComputedConst, EditError, Eqn, Export, Graph, GraphEdit, LayerIndex, Operand, Slot,
+    SlotKey, StateRole, Storage, ValidationId, ValueId, ValueMeta, ValueTable,
 };
 use crate::op::{OpKind, SampleRule};
 use crate::range::IndexRange;
@@ -395,7 +395,10 @@ impl PreparedAppendResult {
 /// ```
 pub struct Builder {
     brand: BuilderBrand,
-    g: RefCell<Graph>,
+    g: RefCell<GraphEdit>,
+    /// The state inputs of the graph this builder resumed (none for a new one): every one must be
+    /// carried again by [`Builder::finish`].
+    carried: Vec<ValueId>,
     generation: Cell<u64>,
     /// The layer tag every equation emitted right now carries. Shared with the [`LayerScope`]s this
     /// builder hands out, so a scope restores the previous tag on drop without borrowing the
@@ -405,13 +408,79 @@ pub struct Builder {
     reservation_failure: Cell<Option<BuilderCollection>>,
 }
 
-/// The result of [`Builder::resume`]: a fresh builder over a previously finished graph, plus that
-/// graph's old primary output and state pairs, rehydrated as [`Traced`] so a caller can append new
-/// equations that read them and finish the graph again.
+/// The result of [`Builder::resume`]: a fresh builder over a previously finished graph, plus
+/// everything that graph published, rehydrated as [`Traced`] so a caller can append new equations
+/// that read it and finish the graph again.
 pub struct Resumed {
     pub builder: Builder,
-    pub out: Traced,
+    pub outputs: Outputs,
+}
+
+/// A validation witness declared at [`Builder::finish`].
+pub struct WitnessDeclaration {
+    pub id: ValidationId,
+    pub name: String,
+    pub value: Traced,
+}
+
+/// Everything a graph publishes, as the handles of the builder that finishes it: the primary
+/// result, the carried-state pairs, the validation witnesses and the exports.
+///
+/// A bare [`Traced`] converts to the outputs of a stateless graph with that result.
+pub struct Outputs {
+    pub result: Traced,
+    /// `(the State input binder, the updated value)` per cache buffer.
     pub state: Vec<(Traced, Traced)>,
+    pub witnesses: Vec<WitnessDeclaration>,
+    pub exports: Vec<(BoundaryId, Traced)>,
+}
+
+impl From<Traced> for Outputs {
+    fn from(result: Traced) -> Self {
+        Outputs::new(result)
+    }
+}
+
+impl Outputs {
+    /// The outputs of a stateless graph whose primary result is `result`.
+    pub fn new(result: Traced) -> Self {
+        Outputs {
+            result,
+            state: Vec::new(),
+            witnesses: Vec::new(),
+            exports: Vec::new(),
+        }
+    }
+
+    /// Carry `state` pairs `(state_in, state_out)` across steps (the KV cache).
+    #[must_use]
+    pub fn with_state(mut self, state: &[(Traced, Traced)]) -> Self {
+        self.state.extend_from_slice(state);
+        self
+    }
+
+    /// Declare a bounded F32 validation witness, checked before the result or state is published.
+    #[must_use]
+    pub fn with_witness(
+        mut self,
+        id: ValidationId,
+        name: impl Into<String>,
+        value: Traced,
+    ) -> Self {
+        self.witnesses.push(WitnessDeclaration {
+            id,
+            name: name.into(),
+            value,
+        });
+        self
+    }
+
+    /// Hand `value` to another stage of a split program under `id`.
+    #[must_use]
+    pub fn with_export(mut self, id: BoundaryId, value: Traced) -> Self {
+        self.exports.push((id, value));
+        self
+    }
 }
 
 /// The active [`Builder::layer_scope`]: tags every equation emitted while alive with one layer and
@@ -488,16 +557,16 @@ fn staged_namespace(
 
 fn live_name_namespace(g: &Graph, name: &str) -> Option<BuilderValueNamespace> {
     let (value, _) = g
-        .values
+        .values()
         .iter_enumerated()
         .find(|(_, meta)| meta.name.as_deref() == Some(name))?;
-    if g.consts.contains(&value) {
+    if g.consts().contains(&value) {
         Some(BuilderValueNamespace::Constant)
-    } else if g.slots.iter().any(|&(id, _)| id == value) {
+    } else if g.slots().iter().any(|&(id, _)| id == value) {
         Some(BuilderValueNamespace::Slot)
-    } else if g.eqns.iter().any(|eqn| eqn.out == value) {
+    } else if g.eqns().iter().any(|eqn| eqn.out == value) {
         Some(BuilderValueNamespace::EquationResult)
-    } else if g.inputs.contains(&value) {
+    } else if g.inputs().contains(&value) {
         Some(BuilderValueNamespace::Input)
     } else {
         Some(BuilderValueNamespace::NamedValue)
@@ -536,7 +605,8 @@ impl Builder {
     pub fn new() -> Self {
         Builder {
             brand: BuilderBrand::mint(),
-            g: RefCell::new(Graph::default()),
+            g: RefCell::new(GraphEdit::new()),
+            carried: Vec::new(),
             generation: Cell::new(0),
             layer: Rc::new(Cell::new(None)),
             #[cfg(test)]
@@ -573,69 +643,95 @@ impl Builder {
         self.layer.get()
     }
 
-    /// Finalize: set the primary output and return the graph.
+    /// Finalize: declare `outputs` and return the checked graph.
+    ///
+    /// Passing a bare [`Traced`] declares it as the primary result with nothing else published. A
+    /// carried-state cache, validation witnesses and exports are declared on [`Outputs`].
+    ///
+    /// # Errors
+    ///
+    /// [`EditError::Invalid`] when the finished graph is not well formed: a state pair whose input
+    /// is not a `State` input or whose types differ, a witness that is not a bounded F32 value, a
+    /// duplicate witness or export id.
     ///
     /// # Panics
-    /// When `out` was minted by another builder.
-    pub fn finish(self, out: Traced) -> Graph {
-        let output = self.id(out);
-        let mut g = self.g.into_inner();
-        g.output = output;
-        g
-    }
-
-    /// Finalize with carried state: set the primary output and the `(state_in, state_out)` alias pairs
-    /// (the KV cache). `state` is `(the State input binder, the updated value)` per cache buffer.
-    ///
-    /// # Panics
-    /// When `out` or a state handle was minted by another builder.
-    pub fn finish_with_state(self, out: Traced, state: &[(Traced, Traced)]) -> Graph {
-        let output = self.id(out);
-        let pairs = state
+    /// When a handle in `outputs` was minted by another builder.
+    pub fn finish(self, outputs: impl Into<Outputs>) -> Result<Graph, EditError> {
+        let outputs = outputs.into();
+        let result = self.id(outputs.result);
+        let state: Vec<(ValueId, ValueId)> = outputs
+            .state
             .iter()
-            .map(|&(si, so)| (self.id(si), self.id(so)))
+            .map(|&(input, next)| (self.id(input), self.id(next)))
             .collect();
-        let mut g = self.g.into_inner();
-        g.output = output;
-        g.state = pairs;
-        g
+        let witnesses: Vec<(ValidationId, String, ValueId)> = outputs
+            .witnesses
+            .into_iter()
+            .map(|witness| (witness.id, witness.name, self.id(witness.value)))
+            .collect();
+        let exports: Vec<Export> = outputs
+            .exports
+            .iter()
+            .map(|&(id, value)| Export {
+                id,
+                value: self.id(value),
+            })
+            .collect();
+        if let Some(&input) = self
+            .carried
+            .iter()
+            .find(|input| !state.iter().any(|&(declared, _)| declared == **input))
+        {
+            return Err(EditError::StateDropped { input });
+        }
+        let mut draft = self.g.into_inner();
+        draft.set_result(result);
+        for (id, name, value) in witnesses {
+            draft.push_witness(id, name, value);
+        }
+        for export in exports {
+            draft.push_export(export);
+        }
+        for (input, next) in state {
+            draft.push_state(input, next);
+        }
+        draft.commit()
     }
 
-    /// Reopen a finished graph for one more append (card 551a): `finish`/
-    /// `finish_with_state` consume `self`, so extending an already-finished graph (card 551b appends a
-    /// sampler suffix after the driver's per-step graph) needs a fresh `Builder` over `g`'s own live
-    /// values/eqns. The returned builder is a new identity (never aliasing whatever builder produced
-    /// `g`), so [`Builder::append_plan`]/[`Builder::preflight_append`] work unchanged on it; `out` and
-    /// `state` rehydrate `g`'s old output and state pairs as [`Traced`] so new equations can read them
-    /// and a later `finish`/`finish_with_state` call can re-close over the (possibly unchanged) state
-    /// pairs. `Builder`'s live storage is always a plain `Graph` (`NoValidations`), and `g`'s type here
-    /// is that same plain `Graph`, not the generic `Graph<V>`: a validated `Graph<ValidationOutputs>`
-    /// has no implicit conversion down to it (see [`Graph`]'s own doc), so it cannot be passed to
-    /// `resume` at all - a caller holding one must consume its validations first.
+    /// Reopen a finished graph for one more append (card 551a): `finish` consumes `self`, so
+    /// extending an already-finished graph (card 551b appends a sampler suffix after the driver's
+    /// per-step graph) needs a fresh `Builder` over `g`'s own live values/eqns. The returned builder
+    /// is a new identity (never aliasing whatever builder produced `g`), so
+    /// [`Builder::append_plan`]/[`Builder::preflight_append`] work unchanged on it.
+    ///
+    /// `outputs` rehydrates `g`'s result and carried-state pairs as [`Traced`], so new equations can
+    /// read them and [`Builder::finish`] re-declares them, changed or not. Its witnesses and exports
+    /// stay declared as they were, and a finish that does not hand back every carried-state pair is
+    /// refused, so extending a graph cannot silently stop carrying a cache.
     pub fn resume(g: Graph) -> Resumed {
+        let result = g.result();
+        let state: Vec<(ValueId, ValueId)> = g.state().collect();
+        let mut draft = g.into_draft();
+        draft.retain_state(|_, _| false);
         let builder = Builder {
             brand: BuilderBrand::mint(),
-            g: RefCell::new(g),
+            g: RefCell::new(draft),
+            carried: state.iter().map(|&(input, _)| input).collect(),
             generation: Cell::new(0),
             layer: Rc::new(Cell::new(None)),
             #[cfg(test)]
             reservation_failure: Cell::new(None),
         };
-        let (out, state) = {
-            let g = builder.g.borrow();
-            (
-                builder.handle(g.output),
-                g.state
-                    .iter()
-                    .map(|&(si, so)| (builder.handle(si), builder.handle(so)))
-                    .collect(),
-            )
+        let outputs = Outputs {
+            result: builder.handle(result),
+            state: state
+                .iter()
+                .map(|&(input, next)| (builder.handle(input), builder.handle(next)))
+                .collect(),
+            witnesses: Vec::new(),
+            exports: Vec::new(),
         };
-        Resumed {
-            builder,
-            out,
-            state,
-        }
+        Resumed { builder, outputs }
     }
 
     /// The handle for `id`, a value this builder just minted.
@@ -660,7 +756,7 @@ impl Builder {
 
     pub fn aval(&self, t: Traced) -> TensorType {
         let id = self.id(t);
-        self.g.borrow().values[id].aval.clone()
+        self.g.borrow().values()[id].aval.clone()
     }
 
     /// The mutation generation used to invalidate prepared transactional appends.
@@ -674,8 +770,8 @@ impl Builder {
         BuilderAppendPlan {
             brand: self.brand,
             generation: self.generation.get(),
-            base_value_count: g.values.len(),
-            base_types: g.values.iter().map(|meta| meta.aval.clone()).collect(),
+            base_value_count: g.values().len(),
+            base_types: g.values().iter().map(|meta| meta.aval.clone()).collect(),
             values: Vec::new(),
             equations: Vec::new(),
             result: None,
@@ -695,17 +791,21 @@ impl Builder {
         }
         let g = self.g.borrow();
         let actual_generation = self.generation.get();
-        if plan.generation != actual_generation || plan.base_value_count != g.values.len() {
+        if plan.generation != actual_generation || plan.base_value_count != g.values().len() {
             return Err(BuilderAppendError::StalePlan {
                 expected: plan.generation,
                 actual: actual_generation,
             });
         }
 
-        checked_growth(BuilderCollection::Values, g.values.len(), plan.values.len())?;
+        checked_growth(
+            BuilderCollection::Values,
+            g.values().len(),
+            plan.values.len(),
+        )?;
         checked_growth(
             BuilderCollection::Equations,
-            g.eqns.len(),
+            g.eqns().len(),
             plan.equations.len(),
         )?;
 
@@ -756,16 +856,16 @@ impl Builder {
                 }
             }
         }
-        checked_growth(BuilderCollection::Inputs, g.inputs.len(), staged_inputs)?;
+        checked_growth(BuilderCollection::Inputs, g.inputs().len(), staged_inputs)?;
         checked_growth(
             BuilderCollection::Constants,
-            g.consts.len(),
+            g.consts().len(),
             staged_constants,
         )?;
-        checked_growth(BuilderCollection::Slots, g.slots.len(), staged_slots)?;
+        checked_growth(BuilderCollection::Slots, g.slots().len(), staged_slots)?;
 
-        let total_values = g.values.len() + plan.values.len();
-        let live_values = g.values.len();
+        let total_values = g.values().len() + plan.values.len();
+        let live_values = g.values().len();
         let mut defined = vec![false; plan.values.len()];
         for (offset, meta) in plan.values.iter().enumerate() {
             if meta.storage != Storage::Device {
@@ -778,8 +878,8 @@ impl Builder {
             for operand in &eqn.inputs {
                 match operand {
                     Operand::Lit(value) => in_types.push(value.ty()),
-                    Operand::Value(value) if g.values.contains(*value) => {
-                        in_types.push(g.values[*value].aval.clone());
+                    Operand::Value(value) if g.values().contains(*value) => {
+                        in_types.push(g.values()[*value].aval.clone());
                     }
                     Operand::Value(value) if value.index() >= total_values => {
                         return Err(BuilderAppendError::InvalidOperand {
@@ -860,7 +960,7 @@ impl Builder {
                 });
             }
         }
-        let result = validate_append_result(&plan, g.values.len(), &defined)?;
+        let result = validate_append_result(&plan, g.values().len(), &defined)?;
 
         let accounting = BuilderAppendAccounting {
             staged_values: plan.values.len(),
@@ -871,7 +971,7 @@ impl Builder {
         Ok(PreparedBuilderAppend {
             brand: plan.brand,
             generation: actual_generation,
-            base_value_count: g.values.len(),
+            base_value_count: g.values().len(),
             accounting,
             staged_inputs,
             staged_constants,
@@ -904,7 +1004,7 @@ impl Builder {
             .checked_add(1)
             .ok_or(BuilderAppendError::GenerationOverflow)?;
         let mut g = self.g.borrow_mut();
-        if prepared.base_value_count != g.values.len() {
+        if prepared.base_value_count != g.values().len() {
             return Err(BuilderAppendError::StalePlan {
                 expected: prepared.generation,
                 actual: actual_generation,
@@ -913,23 +1013,23 @@ impl Builder {
         self.reserve_append_collection(
             prepared.accounting.staged_values,
             BuilderCollection::Values,
-            |n| g.values.try_reserve(n),
+            |n| g.values_mut().try_reserve(n),
         )?;
         self.reserve_append_collection(prepared.staged_inputs, BuilderCollection::Inputs, |n| {
-            g.inputs.try_reserve(n)
+            g.inputs_mut().try_reserve(n)
         })?;
         self.reserve_append_collection(
             prepared.staged_constants,
             BuilderCollection::Constants,
-            |n| g.consts.try_reserve(n),
+            |n| g.consts_mut().try_reserve(n),
         )?;
         self.reserve_append_collection(prepared.staged_slots, BuilderCollection::Slots, |n| {
-            g.slots.try_reserve(n)
+            g.slots_mut().try_reserve(n)
         })?;
         self.reserve_append_collection(
             prepared.accounting.staged_equations,
             BuilderCollection::Equations,
-            |n| g.eqns.try_reserve(n),
+            |n| g.eqns_mut().try_reserve(n),
         )?;
 
         // Presence was checked before reservation; keep the invariant typed if this code is rearranged, and leave the
@@ -941,20 +1041,20 @@ impl Builder {
         let result = prepared.result.value();
         for meta in plan.values {
             let storage = meta.storage;
-            let id = g.values.push(meta);
+            let id = g.values_mut().push(meta);
             match storage {
                 Storage::Const | Storage::Computed(_) | Storage::State => {
-                    g.inputs.push(id);
-                    g.consts.push(id);
+                    g.inputs_mut().push(id);
+                    g.consts_mut().push(id);
                 }
                 Storage::Slot(slot) => {
-                    g.inputs.push(id);
-                    g.slots.push((id, slot));
+                    g.inputs_mut().push(id);
+                    g.slots_mut().push((id, slot));
                 }
                 Storage::Device => {}
             }
         }
-        g.eqns.extend(plan.equations);
+        g.eqns_mut().extend(plan.equations);
         self.generation.set(next_generation);
         Ok(self.handle(result))
     }
@@ -986,7 +1086,7 @@ impl Builder {
         range: Option<IndexRange>,
     ) -> ValueId {
         let mut g = self.g.borrow_mut();
-        let id = g.values.push(ValueMeta {
+        let id = g.values_mut().push(ValueMeta {
             aval,
             storage,
             name,
@@ -1039,8 +1139,8 @@ impl Builder {
         );
         {
             let mut g = self.g.borrow_mut();
-            g.consts.push(id);
-            g.inputs.push(id);
+            g.consts_mut().push(id);
+            g.inputs_mut().push(id);
         }
         self.handle(id)
     }
@@ -1052,8 +1152,8 @@ impl Builder {
         let id = self.push_value(aval, Storage::Computed(computed), None, None, None, None);
         {
             let mut g = self.g.borrow_mut();
-            g.consts.push(id);
-            g.inputs.push(id);
+            g.consts_mut().push(id);
+            g.inputs_mut().push(id);
         }
         self.handle(id)
     }
@@ -1130,7 +1230,7 @@ impl Builder {
         if let Some(tag) = tag {
             let g = self.g.borrow();
             assert!(
-                !g.values
+                !g.values()
                     .iter()
                     .any(|v| v.storage == Storage::Slot(slot) && v.name.as_deref() == Some(&name)),
                 "Builder::slot_named: duplicate tag {tag:?} for slot {slot:?} - a per-name binder would \
@@ -1147,8 +1247,8 @@ impl Builder {
         );
         {
             let mut g = self.g.borrow_mut();
-            g.slots.push((id, slot));
-            g.inputs.push(id);
+            g.slots_mut().push((id, slot));
+            g.inputs_mut().push(id);
         }
         self.handle(id)
     }
@@ -1178,8 +1278,8 @@ impl Builder {
         );
         {
             let mut g = self.g.borrow_mut();
-            g.consts.push(id);
-            g.inputs.push(id);
+            g.consts_mut().push(id);
+            g.inputs_mut().push(id);
         }
         self.handle(id)
     }
@@ -1195,7 +1295,7 @@ impl Builder {
             .infer(in_types)
             .unwrap_or_else(|e| panic!("trace-time shape error in {}: {e}", op.name()));
         let out = self.push_value(aval, Storage::Device, None, None, None, None);
-        self.g.borrow_mut().eqns.push(Eqn {
+        self.g.borrow_mut().eqns_mut().push(Eqn {
             op,
             inputs: operands,
             out,
@@ -1638,7 +1738,6 @@ mod tests {
         constants: usize,
         slots: usize,
         equations: usize,
-        output: ValueId,
         state: usize,
         generation: u64,
         names: Vec<Option<String>>,
@@ -1649,17 +1748,24 @@ mod tests {
     fn state(builder: &Builder) -> State {
         let graph = builder.g.borrow();
         State {
-            values: graph.values.len(),
-            inputs: graph.inputs.len(),
-            constants: graph.consts.len(),
-            slots: graph.slots.len(),
-            equations: graph.eqns.len(),
-            output: graph.output,
-            state: graph.state.len(),
+            values: graph.values().len(),
+            inputs: graph.inputs().len(),
+            constants: graph.consts().len(),
+            slots: graph.slots().len(),
+            equations: graph.eqns().len(),
+            state: graph.state().count(),
             generation: builder.generation(),
-            names: graph.values.iter().map(|meta| meta.name.clone()).collect(),
-            types: graph.values.iter().map(|meta| meta.aval.clone()).collect(),
-            storage: graph.values.iter().map(|meta| meta.storage).collect(),
+            names: graph
+                .values()
+                .iter()
+                .map(|meta| meta.name.clone())
+                .collect(),
+            types: graph
+                .values()
+                .iter()
+                .map(|meta| meta.aval.clone())
+                .collect(),
+            storage: graph.values().iter().map(|meta| meta.storage).collect(),
         }
     }
 
@@ -1689,7 +1795,7 @@ mod tests {
         let (a, foreign) = builder_with_constant("a");
         let (b, _local) = builder_with_constant("b");
         drop(a);
-        b.finish(foreign);
+        b.finish(foreign).unwrap();
     }
 
     #[test]
@@ -1736,18 +1842,18 @@ mod tests {
         );
         assert_eq!(builder.commit_append(&mut prepared)?.id(), ValueId::new(0));
 
-        let graph = builder.finish(result);
-        assert_eq!(graph.output, ValueId::new(0));
-        assert_eq!(graph.inputs, vec![ValueId::new(0)]);
-        assert_eq!(graph.consts, vec![ValueId::new(0)]);
-        assert!(graph.slots.is_empty());
-        assert!(graph.eqns.is_empty());
-        assert_eq!(graph.values[ValueId::new(0)].storage, Storage::Const);
+        let graph = builder.finish(result).unwrap();
+        assert_eq!(graph.result(), ValueId::new(0));
+        assert_eq!(graph.inputs(), vec![ValueId::new(0)]);
+        assert_eq!(graph.consts(), vec![ValueId::new(0)]);
+        assert!(graph.slots().is_empty());
+        assert!(graph.eqns().is_empty());
+        assert_eq!(graph.values()[ValueId::new(0)].storage, Storage::Const);
         assert_eq!(
-            graph.values[ValueId::new(0)].aval,
+            graph.values()[ValueId::new(0)].aval,
             TensorType::new(vec![2, 3], DType::BF16)
         );
-        assert!(graph.validate().is_ok());
+        assert!(crate::test_support::verdict(&graph).is_ok());
         Ok(())
     }
 
@@ -1764,21 +1870,21 @@ mod tests {
         let mut prepared = builder.preflight_append(plan)?;
         assert_eq!(builder.commit_append(&mut prepared)?.id(), ValueId::new(0));
 
-        let graph = builder.finish(result);
-        assert_eq!(graph.output, ValueId::new(0));
-        assert_eq!(graph.inputs, vec![ValueId::new(0)]);
-        assert!(graph.consts.is_empty());
-        assert_eq!(graph.slots, vec![(ValueId::new(0), Slot::SlotMap)]);
-        assert!(graph.eqns.is_empty());
+        let graph = builder.finish(result).unwrap();
+        assert_eq!(graph.result(), ValueId::new(0));
+        assert_eq!(graph.inputs(), vec![ValueId::new(0)]);
+        assert!(graph.consts().is_empty());
+        assert_eq!(graph.slots(), vec![(ValueId::new(0), Slot::SlotMap)]);
+        assert!(graph.eqns().is_empty());
         assert_eq!(
-            graph.values[ValueId::new(0)].storage,
+            graph.values()[ValueId::new(0)].storage,
             Storage::Slot(Slot::SlotMap)
         );
         assert_eq!(
-            graph.values[ValueId::new(0)].aval,
+            graph.values()[ValueId::new(0)].aval,
             TensorType::new(vec![4], DType::I8)
         );
-        assert!(graph.validate().is_ok());
+        assert!(crate::test_support::verdict(&graph).is_ok());
         Ok(())
     }
 
@@ -2028,7 +2134,7 @@ mod tests {
             }
             BuilderValueNamespace::Input | BuilderValueNamespace::Constant => Storage::State,
         };
-        let id = graph.values.push(ValueMeta {
+        let id = graph.values_mut().push(ValueMeta {
             aval: TensorType::f32(vec![1]),
             storage,
             name: Some(name.to_string()),
@@ -2037,18 +2143,18 @@ mod tests {
             range: None,
         });
         match namespace {
-            BuilderValueNamespace::Input => graph.inputs.push(id),
+            BuilderValueNamespace::Input => graph.inputs_mut().push(id),
             BuilderValueNamespace::Constant => {
-                graph.inputs.push(id);
-                graph.consts.push(id);
+                graph.inputs_mut().push(id);
+                graph.consts_mut().push(id);
             }
             BuilderValueNamespace::Slot => {
-                graph.inputs.push(id);
-                graph.slots.push((id, Slot::Activation));
+                graph.inputs_mut().push(id);
+                graph.slots_mut().push((id, Slot::Activation));
             }
             BuilderValueNamespace::EquationResult => {
                 let source = ValueId::new(0);
-                graph.eqns.push(Eqn {
+                graph.eqns_mut().push(Eqn {
                     op: OpKind::Cast { to: DType::F32 },
                     inputs: vec![Operand::Value(source)],
                     out: id,
@@ -2128,8 +2234,8 @@ mod tests {
         foreign.constant("foreign.input", TensorType::new(vec![7], DType::I32));
         assert_eq!(origin.generation(), foreign.generation());
         assert_eq!(
-            origin.g.borrow().values.len(),
-            foreign.g.borrow().values.len()
+            origin.g.borrow().values().len(),
+            foreign.g.borrow().values().len()
         );
         assert_ne!(state(&origin).names, state(&foreign).names);
         assert_ne!(state(&origin).types, state(&foreign).types);
@@ -2267,12 +2373,12 @@ mod tests {
         let generation = builder.generation();
         assert_eq!(builder.commit_append(&mut prepared)?, output);
         assert_eq!(builder.generation(), generation + 1);
-        let graph = builder.finish(output);
-        assert_eq!(graph.values.len(), 3);
-        assert_eq!(graph.inputs, vec![input.id, constant.id]);
-        assert_eq!(graph.consts, vec![input.id, constant.id]);
-        assert_eq!(graph.eqns.len(), 1);
-        assert_eq!(graph.eqns[0].out, output.id);
+        let graph = builder.finish(output).unwrap();
+        assert_eq!(graph.values().len(), 3);
+        assert_eq!(graph.inputs(), vec![input.id, constant.id]);
+        assert_eq!(graph.consts(), vec![input.id, constant.id]);
+        assert_eq!(graph.eqns().len(), 1);
+        assert_eq!(graph.eqns()[0].out, output.id);
         Ok(())
     }
 
@@ -2280,14 +2386,14 @@ mod tests {
     fn exact_i32_builder_append_is_transactional() -> Result<(), BuilderAppendError> {
         let builder = Builder::new();
         let table = crate::test_support::i32_constant(&builder, "routing.table", vec![2, 3])?;
-        let graph = builder.finish(table);
+        let graph = builder.finish(table).unwrap();
         assert_eq!(
             graph.aval(table.id),
             &TensorType::new(vec![2, 3], DType::I32)
         );
         assert_eq!(graph.meta(table.id).storage, Storage::Const);
-        assert!(graph.eqns.is_empty());
-        assert!(graph.validate().is_ok());
+        assert!(graph.eqns().is_empty());
+        assert!(crate::test_support::verdict(&graph).is_ok());
 
         let builder = Builder::new();
         crate::test_support::i32_constant(&builder, "taken", vec![1])?;
@@ -2383,13 +2489,19 @@ mod tests {
         let b = Builder::new();
         let logits = b.constant("logits", TensorType::f32(vec![4]));
         let cache_in = b.state_input("cache", TensorType::f32(vec![4]), StateRole::Recurrent);
-        let g = b.finish_with_state(logits, &[(cache_in, cache_in)]);
-        assert_eq!(g.output, logits.id);
-        assert_eq!(g.state, vec![(cache_in.id, cache_in.id)]);
+        let g = b
+            .finish(crate::Outputs::new(logits).with_state(&[(cache_in, cache_in)]))
+            .unwrap();
+        assert_eq!(g.result(), logits.id);
+        assert_eq!(
+            g.state().collect::<Vec<_>>(),
+            vec![(cache_in.id, cache_in.id)]
+        );
 
         let resumed = Builder::resume(g);
-        assert_eq!(resumed.out.id, logits.id);
+        assert_eq!(resumed.outputs.result.id, logits.id);
         let resumed_state_ids: Vec<(ValueId, ValueId)> = resumed
+            .outputs
             .state
             .iter()
             .map(|(si, so)| (si.id, so.id))
@@ -2398,13 +2510,18 @@ mod tests {
 
         // Append an equation reading the resumed `out` - proves `append_plan`/`preflight_append` still
         // work on the new builder identity.
-        let doubled = resumed
+        let doubled = resumed.builder.binary(
+            crate::op::BinOp::Add,
+            resumed.outputs.result,
+            resumed.outputs.result,
+        );
+        let g2 = resumed
             .builder
-            .binary(crate::op::BinOp::Add, resumed.out, resumed.out);
-        let g2 = resumed.builder.finish_with_state(doubled, &resumed.state);
-        assert_eq!(g2.output, doubled.id);
+            .finish(crate::Outputs::new(doubled).with_state(&resumed.outputs.state))
+            .unwrap();
+        assert_eq!(g2.result(), doubled.id);
         assert_eq!(
-            g2.state,
+            g2.state().collect::<Vec<_>>(),
             vec![(cache_in.id, cache_in.id)],
             "the state pair must survive resume + a second finish_with_state unchanged"
         );

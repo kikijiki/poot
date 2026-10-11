@@ -19,9 +19,7 @@ use poot_executor::{
     Engine, ExecError, ExecutableId, Executor, LoadError, MeasuredDeviceTime, NoSync, StepInputs,
     TimingOptions,
 };
-use poot_graph_ir::{
-    BinOp, BoundaryId, Builder, Export, Slot, SlotKey, StateRole, TensorType, ValidationOutputs,
-};
+use poot_graph_ir::{BinOp, BoundaryId, Builder, Slot, SlotKey, StateRole, TensorType};
 use poot_graph_plan::{
     CompileLimits, CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Link, Partition,
     StageId, StagedParts, StagedProgram, Submission, Target, TargetSet, compile_staged,
@@ -109,7 +107,7 @@ impl Device for FakeDevice {
     type Error = Injected;
 
     fn target(&self) -> Target {
-        Target {
+        Target::Gpu {
             backend: Backend::SpirvVulkan,
             caps: DeviceCaps::wgpu_rdna3_igpu(),
         }
@@ -247,11 +245,7 @@ fn new_engine_timed(timing: TimingOptions) -> (Engine<FakeDevice>, Control) {
 /// `LAYERS` blocks in the shape a pipeline partition cuts: one activation slot, one shared
 /// constant, and one carried state pair per block. Each block is tagged with its layer, so a cut
 /// after layer `k` lands between blocks.
-fn layered() -> (
-    poot_graph_ir::Graph<ValidationOutputs>,
-    Arc<WeightStore>,
-    Arc<WeightMap>,
-) {
+fn layered() -> (poot_graph_ir::Graph, Arc<WeightStore>, Arc<WeightMap>) {
     let b = Builder::new();
     let x = b.slot(Slot::Activation, TensorType::f32(vec![4]));
     let w = b.constant("w", TensorType::f32(vec![4]));
@@ -270,8 +264,8 @@ fn layered() -> (
         state.push((k_in, k_out));
     }
     let g = b
-        .finish_with_state(hidden, &state)
-        .with_validations(Vec::new());
+        .finish(poot_graph_ir::Outputs::new(hidden).with_state(&state))
+        .unwrap();
     let mut builder = WeightStore::builder();
     let bytes: Vec<u8> = [0.5f32, 2.0, -1.25, 1.0]
         .iter()
@@ -293,17 +287,13 @@ fn layered() -> (
 }
 
 fn target() -> Target {
-    Target {
+    Target::Gpu {
         backend: Backend::SpirvVulkan,
         caps: DeviceCaps::wgpu_rdna3_igpu(),
     }
 }
 
-fn compile(
-    g: &poot_graph_ir::Graph<ValidationOutputs>,
-    device: DeviceId,
-    devices: DevicePlacement,
-) -> StagedProgram<ValidationOutputs> {
+fn compile(g: &poot_graph_ir::Graph, device: DeviceId, devices: DevicePlacement) -> StagedProgram {
     compile_staged(
         g,
         &TargetSet::single(device, target()),
@@ -316,12 +306,12 @@ fn compile(
     .expect("the layered fixture compiles for the fake target")
 }
 
-fn single(g: &poot_graph_ir::Graph<ValidationOutputs>) -> StagedProgram<ValidationOutputs> {
+fn single(g: &poot_graph_ir::Graph) -> StagedProgram {
     compile(g, DeviceId(0), DevicePlacement::Single(DeviceId(0)))
 }
 
 /// Cut after layers 0 and 1: three stages, all on device 0.
-fn pipeline(g: &poot_graph_ir::Graph<ValidationOutputs>) -> StagedProgram<ValidationOutputs> {
+fn pipeline(g: &poot_graph_ir::Graph) -> StagedProgram {
     compile(
         g,
         DeviceId(0),
@@ -347,7 +337,7 @@ fn rig() -> Rig {
 fn rig_timed(timing: TimingOptions) -> Rig {
     let (mut engine, control) = new_engine_timed(timing);
     let (g, store, map) = layered();
-    let load = |engine: &mut Engine<FakeDevice>, program: &StagedProgram<ValidationOutputs>| {
+    let load = |engine: &mut Engine<FakeDevice>, program: &StagedProgram| {
         let exe = engine.load_weights(store.clone(), map.clone()).unwrap();
         let entry = engine.add_entry(exe, program).unwrap();
         (exe, entry)
@@ -660,11 +650,7 @@ fn a_detailed_timing_pipeline_step_reports_every_stage() {
 
 /// The load-time invariants the engine keeps for programs `compile_staged` never admits. Each row
 /// assembles such a program from parts and expects the typed refusal, never a panic or a silent load.
-fn load_refusal(
-    parts: StagedParts<ValidationOutputs>,
-    store: Arc<WeightStore>,
-    map: Arc<WeightMap>,
-) -> LoadError {
+fn load_refusal(parts: StagedParts, store: Arc<WeightStore>, map: Arc<WeightMap>) -> LoadError {
     let (mut engine, _control) = new_engine();
     let exe = engine.load_weights(store, map).unwrap();
     let program = StagedProgram::from_parts(parts);
@@ -734,7 +720,7 @@ fn two_stages_declaring_one_slot_differently_conflict() {
         let b = Builder::new();
         let x = b.slot(Slot::Activation, TensorType::f32(vec![8]));
         let out = b.binary(BinOp::Add, x, x);
-        b.finish(out).with_validations(Vec::new())
+        b.finish(out).unwrap()
     };
     let options = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
     let mut parts = single(&g).into_parts();
@@ -764,13 +750,13 @@ fn an_export_viewing_carried_state_is_refused_at_load() {
     let view = b.reshape(k_in, vec![2, 2]);
     let k_out = b.binary(BinOp::Add, k_in, x);
     let out = b.binary(BinOp::Add, view, view);
-    let mut graph = b
-        .finish_with_state(out, &[(k_in, k_out)])
-        .with_validations(Vec::new());
-    graph.exports.push(Export {
-        id: BoundaryId(view.id()),
-        value: view.id(),
-    });
+    let graph = b
+        .finish(
+            poot_graph_ir::Outputs::new(out)
+                .with_state(&[(k_in, k_out)])
+                .with_export(BoundaryId(view.id()), view),
+        )
+        .unwrap();
     let options = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
     let program = poot_graph_plan::compile(&graph, &target(), &options).unwrap();
     let error = load_refusal(
@@ -788,11 +774,10 @@ fn an_export_viewing_carried_state_is_refused_at_load() {
     );
 }
 
-/// Load the layered fixture with its first dispatching equation rebound by `rebind` into a plan declaring
-/// `scratch` scratch buffers, and return the load refusal. The planner emits no such plan; the engine's
-/// binding walk is the invariant for a program assembled some other way.
+/// Load the layered fixture with its first dispatching equation rebound by `rebind`, and return the load
+/// refusal. The planner emits no such plan; the engine's binding walk is the invariant for a program
+/// assembled some other way.
 fn rebound_refusal(
-    scratch: usize,
     rebind: impl Fn(&poot_graph_plan::Binding) -> poot_graph_plan::Binding,
 ) -> LoadError {
     let (g, store, map) = layered();
@@ -803,26 +788,9 @@ fn rebound_refusal(
         .position(|(_, plan)| !plan.dispatches().is_empty())
         .expect("a dispatching equation");
     program
-        .rebind_dispatches(index, scratch, rebind)
+        .rebind_dispatches(index, Vec::new(), rebind)
         .expect("the rebound plan is a valid DispatchPlan");
     load_refusal(parts, store, map)
-}
-
-/// A dispatch bound to a scratch buffer is refused at load: the engine allocates none until POOT-1113.
-/// (A scratch read needs an earlier dispatch's scratch write, which this refusal stops first.)
-///
-/// Mutation: treat `Sink::Scratch` as `Sink::Out` in `load_stage`'s binding walk; the program loads and
-/// this goes red.
-#[test]
-fn a_dispatch_writing_scratch_is_refused_at_load() {
-    use poot_graph_plan::{Binding, ScratchId, Sink};
-    let error = rebound_refusal(1, |binding| {
-        Binding::new(binding.reads().to_vec(), Sink::Scratch(ScratchId::new(0)))
-    });
-    assert!(
-        matches!(error, LoadError::Unimplemented(what) if what.contains("scratch")),
-        "got {error:?}"
-    );
 }
 
 /// A binding naming an operand the equation lacks is refused at load, whoever assembled the program.
@@ -832,7 +800,7 @@ fn a_dispatch_writing_scratch_is_refused_at_load() {
 #[test]
 fn a_dispatch_binding_an_operand_its_equation_lacks_is_refused_at_load() {
     use poot_graph_plan::{Binding, Source};
-    let error = rebound_refusal(0, |binding| {
+    let error = rebound_refusal(|binding| {
         let mut reads = binding.reads().to_vec();
         reads[0] = Source::Operand(reads.len() + 4);
         Binding::new(reads, binding.write())

@@ -12,6 +12,7 @@ use poot_runtime_common::DeviceBackend;
 use poot_target::{Backend, Queried, SubgroupSupport, TensorCoreSupport};
 use poot_tensor::DType;
 use poot_test_util::device_skip::open_or_skip;
+use poot_test_util::graph_fixtures::{gpu_backend, gpu_caps};
 
 /// A live device reports positive workgroup limits, a fixed warp that contains the 32 lanes every fragment
 /// kernel is written for, and a matrix family consistent with its compute capability; a bf16 16-aligned
@@ -25,8 +26,8 @@ fn a_live_device_reports_caps_the_fragment_kernel_plans_against() {
         return;
     };
     let target = device.target();
-    assert_eq!(target.backend, Backend::Nvptx);
-    let caps = target.caps;
+    assert_eq!(gpu_backend(&target), Backend::Nvptx);
+    let caps = gpu_caps(&target);
     eprintln!("live ptx caps: {caps:?}");
     assert!(caps.max_workgroup_invocations >= 1);
     assert!(caps.max_workgroup_size.iter().all(|&extent| extent >= 1));
@@ -50,9 +51,12 @@ fn a_live_device_reports_caps_the_fragment_kernel_plans_against() {
     let a = b.constant("a", TensorType::new(vec![1, 16, 32], DType::BF16));
     let w = b.constant("w", TensorType::new(vec![32, 16], DType::BF16));
     let out = b.matmul(a, w);
-    let mut graph = b.finish(out);
-    let out = graph.output;
-    graph.values[out].aval.dtype = DType::F32;
+    let traced = b.finish(out).unwrap();
+    let out = traced.result();
+    let graph = poot_test_util::graph_fixtures::derive(&traced, |draft| {
+        draft.values_mut()[out].aval.dtype = DType::F32;
+    })
+    .unwrap();
     let options = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
     let program = compile(&graph, &target, &options)
         .unwrap_or_else(|error| panic!("the live caps must admit the fragment kernel: {error}"));
@@ -80,9 +84,7 @@ fn the_ptx_device_reports_live_free_memory_within_its_open_time_ceiling() {
     let Some(device) = open_or_skip(DeviceBackend::Ptx, PtxDevice::new()) else {
         return;
     };
-    let ceiling = device
-        .target()
-        .caps
+    let ceiling = gpu_caps(&device.target())
         .memory_budget_bytes
         .expect("the PTX device queried its total memory at open");
     let free = device

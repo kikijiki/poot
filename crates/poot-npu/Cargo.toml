@@ -1,0 +1,39 @@
+[package]
+name = "poot-npu"
+description = "AMD XDNA2 NPU device backend: the poot-executor Device implementation over XRT, running the ordinary compiled AIE kernels"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+poot-executor.workspace = true
+poot-graph-plan.workspace = true
+poot-runtime-common.workspace = true
+poot-target.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+cc = { workspace = true, optional = true }
+
+[dev-dependencies]
+poot-codegen.workspace = true
+poot-executor-parity.workspace = true
+poot-graph-ir.workspace = true
+poot-kernel-ir.workspace = true
+poot-kernelgen.workspace = true
+poot-quant.workspace = true
+poot-tensor.workspace = true
+poot-test-util = { workspace = true, features = ["graph-fixtures"] }
+
+[features]
+# The XRT FFI and the `Device` itself. Off by default: the shim needs the XRT headers and `libxrt_coreutil`,
+# which only `nix develop .#npu` provides, so a default workspace build and the model-free gate compile this
+# crate to its documentation. The device lane builds it with `--features xdna` (spec 1002, POOT-1118).
+xdna = ["dep:cc"]
+
+[lints]
+workspace = true

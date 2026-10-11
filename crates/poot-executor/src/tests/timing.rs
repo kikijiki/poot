@@ -73,7 +73,7 @@ impl Device for FakeDevice {
     type Error = FakeError;
 
     fn target(&self) -> Target {
-        Target {
+        Target::Gpu {
             backend: Backend::SpirvVulkan,
             caps: DeviceCaps::wgpu_rdna3_igpu(),
         }
@@ -164,7 +164,7 @@ impl Device for FakeDevice {
 /// Two dispatches of two different `OpKind`s (`Binary`/`Unary`), feeding a state commit so the
 /// recorded/replayed step has real work. `output = neg(a + bias)`; `new_a = a + bias` (commit).
 fn fixture() -> (
-    poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs>,
+    poot_graph_ir::Graph,
     Arc<WeightStore>,
     Arc<poot_quant::weights::WeightMap>,
 ) {
@@ -177,8 +177,8 @@ fn fixture() -> (
     let sum = b.binary(BinOp::Add, a, bias);
     let output = b.unary(UnOp::Neg, sum);
     let g = b
-        .finish_with_state(output, &[(a, sum)])
-        .with_validations(Vec::new());
+        .finish(poot_graph_ir::Outputs::new(output).with_state(&[(a, sum)]))
+        .unwrap();
 
     let mut builder = WeightStore::builder();
     builder
@@ -201,10 +201,7 @@ fn fixture() -> (
     (g, store, map)
 }
 
-fn staged(
-    g: &poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs>,
-    target: Target,
-) -> StagedProgram<poot_graph_ir::ValidationOutputs> {
+fn staged(g: &poot_graph_ir::Graph, target: Target) -> StagedProgram {
     compile_staged(
         g,
         &TargetSet::single(DeviceId(0), target),
@@ -234,7 +231,7 @@ fn load(engine: &mut Engine<FakeDevice>) -> (crate::ExecutableId, crate::EntryId
 fn load_with(
     engine: &mut Engine<FakeDevice>,
     (g, store, map): (
-        poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs>,
+        poot_graph_ir::Graph,
         Arc<WeightStore>,
         Arc<poot_quant::weights::WeightMap>,
     ),
@@ -251,7 +248,7 @@ fn load_with(
 /// spans two kernel keys and must still land in one `kind_name` bucket; the different `OpKind`
 /// ("unary") never shares that bucket however the planner keys its own kernel.
 fn fixture_shared_kind_different_keys() -> (
-    poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs>,
+    poot_graph_ir::Graph,
     Arc<WeightStore>,
     Arc<poot_quant::weights::WeightMap>,
 ) {
@@ -267,8 +264,8 @@ fn fixture_shared_kind_different_keys() -> (
     let sum_c = b.binary(BinOp::Add, c, bias3); // Add #2, shape [3] -> a different kernel key
     let output = b.unary(UnOp::Neg, sum_a);
     let g = b
-        .finish_with_state(output, &[(a, sum_a), (c, sum_c)])
-        .with_validations(Vec::new());
+        .finish(poot_graph_ir::Outputs::new(output).with_state(&[(a, sum_a), (c, sum_c)]))
+        .unwrap();
 
     let mut builder = WeightStore::builder();
     builder

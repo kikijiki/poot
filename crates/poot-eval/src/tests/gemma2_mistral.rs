@@ -241,7 +241,7 @@ fn gemma2_decode_ref(
 
 use poot_executor_parity::dense::{Dense, Family, step};
 use poot_executor_parity::weight_map::MappedModel;
-use poot_graph_ir::{Graph, ValidationOutputs};
+use poot_graph_ir::Graph;
 use poot_models::model::{LogitRows, Phase};
 
 /// The tiny Gemma 2 of these rows: `vocab` 8, hidden 8, two layers (layer 0 slides, layer 1 is global), two
@@ -260,24 +260,23 @@ fn gemma2(window: usize, attn: Option<f32>, last: Option<f32>, vocab: usize) -> 
         .f32_model()
 }
 
-fn decode_graph(m: &MappedModel, cap: usize) -> Graph<ValidationOutputs> {
+fn decode_graph(m: &MappedModel, cap: usize) -> Graph {
     m.model
         .trace(Phase::Decode, step(1, 1, cap, LogitRows::Last))
         .unwrap()
 }
 
-fn prefill_graph(m: &MappedModel, n: usize, cap: usize) -> Graph<ValidationOutputs> {
+fn prefill_graph(m: &MappedModel, n: usize, cap: usize) -> Graph {
     m.model
         .trace(Phase::Prefill, step(1, n, cap, LogitRows::Last))
         .unwrap()
 }
 
 /// Per-state-input values: `fill(name)` of the state's index, scaled like the weights.
-fn filled_state(g: &Graph<ValidationOutputs>, tag: &str) -> Vec<HostTensor> {
-    g.state
-        .iter()
+fn filled_state(g: &Graph, tag: &str) -> Vec<HostTensor> {
+    g.state()
         .enumerate()
-        .map(|(i, &(input, _))| {
+        .map(|(i, (input, _))| {
             let shape = g.aval(input).shape.clone();
             HostTensor::f32(shape.clone(), named_weights(&format!("{tag}.{i}"), &shape))
         })
@@ -334,7 +333,6 @@ fn gemma2_swa_affects_output_when_beyond_window() {
     let (pos, cap) = (5, 16);
     let logits = |window: usize| {
         let g = decode_graph(&gemma2(window, None, None, 16), cap);
-        g.validate().expect("graph valid");
         // Non-trivial cached keys, so keys beyond the window differ.
         let state = filled_state(&g, "state");
         run_step(&g, &[7], pos, &named_weights, &state).0
@@ -411,10 +409,9 @@ fn gemma2_decode_bitexact_vs_reference() {
     let g = decode_graph(&gemma2(window, attn_cap, final_cap, vocab), cap);
     let kv_init = make_initial_caches();
     let state: Vec<HostTensor> = g
-        .state
-        .iter()
+        .state()
         .enumerate()
-        .map(|(ci, &(si, _))| {
+        .map(|(ci, (si, _))| {
             let (k_flat, v_flat) = &kv_init[ci / 2];
             let data = if ci % 2 == 0 { k_flat } else { v_flat };
             HostTensor::f32(g.aval(si).shape.clone(), data.clone())
@@ -689,10 +686,9 @@ fn llama_decode_bitexact_vs_reference() {
     let g = decode_graph(&m, cap);
     let kv_init = make_initial_caches();
     let state: Vec<HostTensor> = g
-        .state
-        .iter()
+        .state()
         .enumerate()
-        .map(|(ci, &(si, _))| {
+        .map(|(ci, (si, _))| {
             let (k_flat, v_flat) = &kv_init[ci / 2];
             let data = if ci % 2 == 0 { k_flat } else { v_flat };
             HostTensor::f32(g.aval(si).shape.clone(), data.clone())

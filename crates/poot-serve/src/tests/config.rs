@@ -178,6 +178,17 @@ fn an_invalid_value_for_any_field_is_a_startup_error() {
         (&["--draft-model", "no-colon"], "expected PATH:K"),
         (&["--draft-model", "m:0"], "not a positive integer"),
         (&["--draft-model", ":2"], "model path is empty"),
+        (&["--draft-mtp", "0"], "not a positive integer"),
+        (&["--draft-mtp", "x"], "not a positive integer"),
+        (&["--draft-mtp"], "a value is required"),
+        (
+            &["--draft-mtp", "2", "--draft-lookup", "3:4"],
+            "cannot be used",
+        ),
+        (
+            &["--draft-mtp", "2", "--draft-model", "m:2"],
+            "cannot be used",
+        ),
         (
             &["--draft-lookup", "3:4", "--draft-model", "m:2"],
             "cannot be used",
@@ -470,6 +481,26 @@ fn both_draft_flags_are_refused_by_the_parser_and_by_the_policy() {
     });
     let error = crate::startup::draft_policy(&both).expect_err("both draft flags");
     assert!(error.to_string().contains("exclusive"), "{error}");
+}
+
+/// `--draft-mtp K` names the model's own MTP layer with a required K, and the policy it builds
+/// carries the verify window as its hidden-state carry window. Without it there is no MTP policy.
+/// Mutation: build `DraftPolicy::Off` for the flag; the first assertion is red.
+#[test]
+fn the_draft_mtp_flag_builds_the_mtp_policy_with_its_carry_window() {
+    let policy = crate::startup::draft_policy(&config(&["--draft-mtp", "2"])).unwrap();
+    let DraftPolicy::Mtp { k } = &policy else {
+        panic!("the flag names the MTP policy: {policy:?}");
+    };
+    assert_eq!(k.get(), 2);
+    assert_eq!(
+        policy.carry_window().map(std::num::NonZeroUsize::get),
+        Some(3)
+    );
+    assert!(matches!(
+        crate::startup::draft_policy(&config(&[])).unwrap(),
+        DraftPolicy::Off
+    ));
 }
 
 /// The placement flag defaults to the one default device and parses a device group strictly: the kind,

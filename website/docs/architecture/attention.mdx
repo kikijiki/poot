@@ -149,8 +149,39 @@ compares against `len` are an exact `I32` range, with no round trip through `F32
 kernel clamps `len` into `0..=Lk` before it bounds the loop, so no length can read outside the
 buffers.
 
-This is the portable first schedule. Later schedules (tiled prefill, split-KV decode) reuse the
-same score, mask and softmax-combine semantics and are chosen by the planner per shape.
+## Split-KV decode
+
+A decode step has one query row per head, so the streaming schedule launches `B * n_q_heads`
+workgroups. At a few heads on a device with tens of compute units, most of the device idles while
+each workgroup walks the whole cache. The split-KV schedule (Flash-Decoding [^flashdecoding]) cuts
+the keys into `splits` contiguous chunks and runs two launches:
+
+1. **Partials.** One workgroup per (row, split) runs the streaming body over its own chunk of the
+   live range and writes the *unnormalized* state `(o[dv], m, l)` to a scratch buffer at
+   `[(row * splits + split) * (dv + 2)]`. A split whose chunk is past the live length, or whose keys
+   are all masked, publishes the neutral `(0, -inf, 0)` by the same arithmetic as a lane that saw
+   nothing, so the scratch needs no initialization and a stale slot cannot leak into a result.
+2. **Combine.** One workgroup of `lanes` threads per row reduces the row's partials with the same
+   `exp(m_i - M)` weighting the lane combine uses, and writes the output.
+
+The scratch is a plan-local buffer the equation declares (its storage and element count) beside
+its two dispatches, and the dispatches run in order. The buffer plan colors it with the values:
+it lives exactly as long as its equation, is never an export, and shares its arena slot with the
+next layer's scratch, so the arena does not grow with the layer count and the stage's memory budget
+already counts it.
+
+The planner chooses the split from the device and the shape: only for a decode (`Lq == 1`) whose
+rows do not already fill the device's compute units, at most 16 splits, never a chunk under 128
+keys. It keeps the streaming schedule when the partial state would exceed the device's
+single-buffer limit or the launch's 2-D fold would pass the device's grid; a plan that declares a
+scratch the device cannot allocate anyway is refused with a typed `ScratchBytes`. The split count
+is part of the request, so it is part of the plan key.
+
+The combine reassociates the float sums (per-split partials, then across splits), so it matches
+the streaming schedule and the oracle within a tolerance, not bit for bit.
+
+This is the portable first schedule. Later schedules (tiled prefill) reuse the same score, mask
+and softmax-combine semantics and are chosen by the planner per shape.
 
 ## KV cache
 
@@ -221,6 +252,8 @@ More crate-level notes live on [Crates and implementation details](./implementat
 [^flash2]: Dao, T., "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning," ICLR, 2024. https://arxiv.org/abs/2307.08691
 
 [^onlinesoftmax]: Milakov, M. & Gimelshein, N., "Online Normalizer Calculation for Softmax," arXiv:1805.02867, 2018. https://arxiv.org/abs/1805.02867
+
+[^flashdecoding]: Dao, T., Haziza, D., Massa, F. & Sizov, G., "Flash-Decoding for long-context inference," blog post, 2023. https://pytorch.org/blog/flash-decoding/
 
 [^pagedattn]: Kwon, W. et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention," SOSP, 2023. https://arxiv.org/abs/2309.06180
 

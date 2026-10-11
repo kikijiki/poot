@@ -1,0 +1,126 @@
+{
+  "backend": "ptx",
+  "binary": "/root/bank-parent",
+  "case": "attention-low-head-decode-live-full",
+  "cells": {
+    "kernel": {
+      "repeats": [
+        {
+          "metrics": {
+            "step_us": 15462.804
+          },
+          "slot": 0,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 15451.382
+          },
+          "slot": 1,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 15451.662
+          },
+          "slot": 2,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 15446.503
+          },
+          "slot": 3,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 15450.961
+          },
+          "slot": 4,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 15445.360999999999
+          },
+          "slot": 5,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 15445.41
+          },
+          "slot": 6,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 15448.987000000001
+          },
+          "slot": 7,
+          "status": "ok"
+        },
+        {
+          "metrics": {
+            "step_us": 15449.358
+          },
+          "slot": 8,
+          "status": "ok"
+        }
+      ]
+    }
+  },
+  "hardware": {
+    "backend": "ptx",
+    "device": "NVIDIA A100-SXM4-80GB",
+    "driver": "580.159.04"
+  },
+  "memory": [
+    {
+      "live_bytes": 33555456,
+      "peak_bytes": 33555456,
+      "role": "Weight"
+    },
+    {
+      "live_bytes": 132100,
+      "peak_bytes": 132100,
+      "role": "Activation"
+    },
+    {
+      "live_bytes": 262148,
+      "peak_bytes": 262148,
+      "role": "Input"
+    }
+  ],
+  "observed": {
+    "layout": "bhsd",
+    "shape": {
+      "cap": 32768,
+      "d": 128,
+      "hkv": 1,
+      "hq": 2,
+      "live": 32768
+    },
+    "storage": "f32",
+    "weight_bytes_per_copy": 33554432,
+    "weight_copies": 1
+  },
+  "plan": [
+    "pointwise [5f133fb4fe102e4e98d3bd18c2690a7d0ddae10ab6164df1c8b44a79967c77dd]",
+    "pointwise [8b17e914478dacb658e7782ed8f5449aa4ec4186023814ae593a7bcea943cfba]",
+    "attention [e9e03527fbf824ebd8c60ac300335939cfc81fd6e8ae447eb13c4497d9a324d9]"
+  ],
+  "plan_id": "29d6ba0f5daf153770482bebb0ee6176a6b317efb43e515d0c0ef53df40a5079",
+  "recordings": 1,
+  "reference": {
+    "agrees": true,
+    "max_relative_error": 5.38497252686405e-09,
+    "oracle": "f64 loop in the bank runner, sharing no code with the engine under test",
+    "provenance": "independent-golden",
+    "tolerance": 0.002
+  },
+  "replays": 13,
+  "role": "baseline",
+  "schema": 1
+}

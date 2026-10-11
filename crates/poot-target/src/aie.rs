@@ -95,6 +95,8 @@ pub struct AieCaps {
     pub host_bindings: Queried<u32>,
     /// The largest instruction (transfer-descriptor) stream a loaded kernel may carry, in bytes.
     pub instruction_bytes: Queried<u64>,
+    /// Bytes of device-visible host memory the program's buffer objects may total.
+    pub memory_budget_bytes: Queried<u64>,
 }
 
 impl AieCaps {
@@ -106,6 +108,7 @@ impl AieCaps {
             tile_local_bytes: Queried::Unknown,
             host_bindings: Queried::Unknown,
             instruction_bytes: Queried::Unknown,
+            memory_budget_bytes: Queried::Unknown,
         }
     }
 
@@ -116,12 +119,14 @@ impl AieCaps {
         tile_local_bytes: u32,
         host_bindings: u32,
         instruction_bytes: u64,
+        memory_budget_bytes: u64,
     ) -> Self {
         Self {
             target,
             tile_local_bytes: Queried::Known(tile_local_bytes),
             host_bindings: Queried::Known(host_bindings),
             instruction_bytes: Queried::Known(instruction_bytes),
+            memory_budget_bytes: Queried::Known(memory_budget_bytes),
         }
     }
 }
