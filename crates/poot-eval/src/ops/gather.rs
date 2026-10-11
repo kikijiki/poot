@@ -64,22 +64,17 @@ pub(crate) fn gather<T: Copy>(
 /// An index operand's element count and its by-position reader (see [`index_reader`]).
 pub(crate) type IndexReader<'a> = (usize, Box<dyn Fn(usize) -> IndexValue + 'a>);
 
-/// An index operand read lazily from its own typed words: its element count and a reader of one
-/// [`IndexValue`] by position (I32 words stay exact, F32 values keep their own fault kinds). Any
-/// other dtype is refused.
+/// An index operand read lazily from its own I32 words: its element count and a reader of one
+/// [`IndexValue`] by position. Any other dtype is refused.
 pub(crate) fn index_reader(index: &HostTensor) -> Result<IndexReader<'_>, EvalError> {
     match index.data() {
         HostData::I32(words) => Ok((
             words.len(),
             Box::new(move |p: usize| IndexValue::I32(words[p])),
         )),
-        HostData::F32(values) => Ok((
-            values.len(),
-            Box::new(move |p: usize| IndexValue::F32(values[p])),
-        )),
         _ => Err(EvalError::unsupported(
             "gather",
-            format!("an index operand is F32 or I32, got {}", index.dtype()),
+            format!("an index operand is I32, got {}", index.dtype()),
         )),
     }
 }
@@ -145,9 +140,8 @@ impl crate::Value {
     /// whose row-selecting lanes only exist inside the walk's own I32-index dispatch
     /// (`walk::evaluate_gather`). `eqn` reads as `0` (the `EvalError::unsupported` convention).
     ///
-    /// `index` is read through its own typed words: I32 words route through the exact `IndexValue`
-    /// path (an id above 2^24 is never rounded through f32, card 363's E4M3 PLE n-gram ids), F32
-    /// values through the f32 fault kinds.
+    /// `index` is read through its own I32 words (an id above 2^24 is never rounded through f32, card 363's
+    /// E4M3 PLE n-gram ids); any other dtype is refused.
     pub fn gather(&self, axis: usize, index: &HostTensor) -> Result<Self, EvalError> {
         const NO_EQN: ValueId = ValueId::new(0);
         match self {

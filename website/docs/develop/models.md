@@ -97,7 +97,8 @@ run; the matrix says what is verified.
 ## GLM-5.3-Flash
 
 GLM-5.3-Flash, from an HF `glm5_next` safetensors checkpoint (the multimodal wrapper: the text tower loads
-from `text_config`, and the vision and multi-token-prediction tensors are not read).
+from `text_config`, and the vision tensors are not read). The checkpoint's multi-token-prediction layer loads and
+traces as its own program over the target's hidden state; no serving path drafts with it yet.
 
 The residual stream is several parallel streams per token (`hc_mult`), mixed around every block by learned
 doubly stochastic weights as in DeepSeek-V4, and collapsed by their mean before the closing norm. The config's

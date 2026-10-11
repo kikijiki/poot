@@ -28,8 +28,8 @@ impl Context {
     }
 
     /// Upload exact i32 bytes as a device buffer, for a kernel param declared `Slice<i32>` (a
-    /// `PackedDequant`/`PackedContraction` carrier), whose words exceed 2^24 and cannot survive the
-    /// f32 mirror. The storage buffer is dtype-agnostic bytes; the SPIR-V declares the i32 interpretation.
+    /// `PackedDequant`/`PackedContraction` carrier or an index buffer). The storage buffer is
+    /// dtype-agnostic bytes; the SPIR-V declares the i32 interpretation.
     pub fn upload_i32(&self, data: &[i32]) -> DeviceBuffer {
         let buf = self
             .device

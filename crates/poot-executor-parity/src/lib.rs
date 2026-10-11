@@ -34,6 +34,7 @@ pub mod bf16_cast;
 pub mod capture;
 pub mod dense;
 pub mod gdn;
+pub mod i32_gather;
 pub mod launch;
 pub mod live_attention;
 pub mod lora;

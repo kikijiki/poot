@@ -843,20 +843,14 @@ fn wgpu_scatter_update_grid_over_65535_workgroups() {
     let pool = 16_776_960 / d + 4096; // 16_781_056 elements, ~64MB f32 buffers.
     let n = 4usize; // small src row count.
 
-    let inv_data: Vec<f32> = (0..pool)
-        .map(|i| {
-            if i % 5 == 0 {
-                -1.0
-            } else {
-                ((i / 5) % n) as f32
-            }
-        })
+    let inv_data: Vec<i32> = (0..pool)
+        .map(|i| if i % 5 == 0 { -1 } else { ((i / 5) % n) as i32 })
         .collect();
 
     let b = Builder::new();
     let base = b.constant("big_sc_base", TensorType::f32(vec![pool, d]));
     let src = b.constant("big_sc_src", TensorType::f32(vec![n, d]));
-    let inv = b.constant("big_sc_inv", TensorType::f32(vec![pool]));
+    let inv = b.constant("big_sc_inv", TensorType::new(vec![pool], DType::I32));
     let out = b.scatter_update(base, src, inv);
     let g = b.finish(out);
     let g = poot_graph_plan::cse(&g);
@@ -875,7 +869,7 @@ fn wgpu_scatter_update_grid_over_65535_workgroups() {
     );
     inputs.insert(
         inv.id(),
-        HostTensor::f32(vec![pool], inv_data.clone()).into(),
+        HostTensor::i32(vec![pool], inv_data.clone()).into(),
     );
 
     // CPU oracle first (independent of any GPU dispatch-grid math).
@@ -931,7 +925,7 @@ fn wgpu_dyn_update_slice_grid_over_65535_workgroups() {
     let b = Builder::new();
     let cache = b.constant("big_dus_cache", TensorType::f32(vec![cap, d]));
     let update = b.constant("big_dus_update", TensorType::f32(vec![1, d]));
-    let idx_val = b.constant("big_dus_idx", TensorType::f32(vec![]));
+    let idx_val = b.constant("big_dus_idx", TensorType::scalar(DType::I32));
     let out = b.dynamic_update_slice_dyn(cache, update, idx_val, 0);
     let g = b.finish(out);
     let g = poot_graph_plan::cse(&g);
@@ -942,7 +936,10 @@ fn wgpu_dyn_update_slice_grid_over_65535_workgroups() {
     let mut inputs: HashMap<ValueId, Value> = HashMap::new();
     inputs.insert(cache.id(), HostTensor::f32(vec![cap, d], cache_data).into());
     inputs.insert(update.id(), HostTensor::f32(vec![1, d], update_data).into());
-    inputs.insert(idx_val.id(), HostTensor::scalar(pos as f32).into());
+    inputs.insert(
+        idx_val.id(),
+        HostTensor::i32(vec![], vec![pos as i32]).into(),
+    );
 
     let cpu_out = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
         .expect("cpu eval dyn_update_slice")
@@ -1332,14 +1329,14 @@ fn wgpu_cast_grid_over_65535_workgroups_every_element() {
     );
 
     let b = Builder::new();
-    let src = b.constant("cast_src", TensorType::new(vec![n], DType::I32));
+    // An iota is `[0, n)` by its definition, so `compile` proves the cast exact (POOT-726); n == 2^24
+    // covers lanes 0..=n-1, exact for every lane at or below 2^24 (card 372c).
+    let src = b.iota_i32(n);
     let out = b.cast(src, DType::F32);
     let g = b.finish(out);
 
-    // Exact for every lane at or below 2^24 (card 372c); n == 2^24 covers lanes 0..=n-1.
     let src_data: Vec<i32> = (0..n as i32).collect();
-    let mut inputs = HashMap::new();
-    inputs.insert(src.id(), HostTensor::i32(vec![n], src_data.clone()));
+    let inputs: HashMap<ValueId, HostTensor> = HashMap::new();
 
     let cpu = eval(
         &g,
@@ -1394,18 +1391,18 @@ fn wgpu_gather_grid_over_65535_workgroups_every_element() {
     let b = Builder::new();
     // Tiny table (all indices 0): axis-0 gather only needs data[index[s], :].
     let table = b.constant("gather_table", TensorType::f32(vec![1, rest]));
-    let index = b.constant("gather_index", TensorType::f32(vec![rows]));
+    let index = b.constant("gather_index", TensorType::new(vec![rows], DType::I32));
     let out = b.gather(table, 0, index);
     let g = b.finish(out);
 
     let table_data = fill(11, rest);
-    let index_data = vec![0f32; rows]; // every row reads table row 0
+    let index_data = vec![0i32; rows]; // every row reads table row 0
     let mut inputs = HashMap::new();
     inputs.insert(
         table.id(),
         HostTensor::f32(vec![1, rest], table_data.clone()),
     );
-    inputs.insert(index.id(), HostTensor::f32(vec![rows], index_data));
+    inputs.insert(index.id(), HostTensor::i32(vec![rows], index_data));
 
     let cpu = eval(
         &g,
@@ -1461,9 +1458,10 @@ fn sliding_window_mask_from_pos_gpu_matches_cpu() {
     let q = b.constant("q", TensorType::f32(vec![1, hq, l, d]));
     let k = b.constant("k", TensorType::f32(vec![1, hkv, l, d]));
     let v = b.constant("v", TensorType::f32(vec![1, hkv, l, d]));
-    let pos = b.slot(
+    let pos = b.slot_ranged(
         poot_graph_ir::Slot::Pos,
         TensorType::new(vec![1, l], DType::I32),
+        poot_graph_ir::IndexRange::below(l).unwrap(),
     );
     let mask = poot_graph_ir::ops::causal_mask_from_pos(&b, pos, l, Some(window));
     let out = poot_graph_ir::ops::attention_prefill(&b, q, k, v, n_rep, scale, mask);

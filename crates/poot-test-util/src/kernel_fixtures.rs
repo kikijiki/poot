@@ -666,7 +666,7 @@ pub fn workgroups_covering(body: &Body, threads: usize) -> [u32; 3] {
 
 // --- poot-kernelgen generators with no production caller ----------------------------------------------------
 
-/// A gather of two rows of a four-row `[4, rest]` table in element type `dt`, with an f32 index cast to
+/// A gather of two rows of a four-row `[4, rest]` table in element type `dt`, with an `I32` index cast to
 /// usize internally: [`poot_kernelgen::movement_body`] over a fixed shape, for the tests that compile or
 /// dump a representative body.
 pub fn gather_axis0_dt(name: &str, dt: Ty, rest: usize) -> Body {
@@ -678,7 +678,6 @@ pub fn gather_axis0_dt(name: &str, dt: Ty, rest: usize) -> Body {
             poot_kernelgen::MovementOp::Gather {
                 in_shape: vec![4, rest],
                 axis: 0,
-                index_dtype: Ty::F32,
                 index_numel: 2,
             },
         ),

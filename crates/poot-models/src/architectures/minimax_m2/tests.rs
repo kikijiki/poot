@@ -497,6 +497,7 @@ fn target_of(backend: Backend) -> Target {
             Backend::SpirvVulkan => DeviceCaps::wgpu_rdna3_igpu(),
             Backend::Nvptx => DeviceCaps::ptx_default(),
             Backend::AmdGcn(_) => DeviceCaps::rocm_default(),
+            Backend::Aie(_) => unreachable!("an AIE target has no GPU DeviceCaps"),
         },
     }
 }
@@ -521,6 +522,7 @@ fn bound_step(
         capacity: NonZeroUsize::new(CAP).unwrap(),
         kv: KvLayout::Contiguous,
         logits: LogitRows::Last,
+        hidden: None,
     };
     let graph = model.trace(phase, shape).unwrap();
     poot_graph_plan::bind_packed_weights(

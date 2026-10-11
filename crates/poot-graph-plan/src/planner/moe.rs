@@ -129,11 +129,7 @@ fn plan_indexed(
 ) -> Result<Planned, PlanError> {
     let ids = value_ids(eqn);
     if !indexed_matmul_lowers(g, eqn) {
-        return Err(site.refuse(if g.aval(ids[2]).dtype == DType::F32 {
-            Capability::DtypeLowering
-        } else {
-            Capability::IndexOperand
-        }));
+        return Err(site.refuse(Capability::DtypeLowering));
     }
     let (x, w) = (g.aval(ids[0]).shape.clone(), g.aval(ids[1]).shape.clone());
     let (m, k, experts, n) = (x[0], x[1], w[0], w[2]);

@@ -184,6 +184,22 @@ fn cache_kind(target: Target) -> &'static str {
     }
 }
 
+/// The `poot-codegen` source hash folded into every AIE identity (see [`CODEGEN_SRC_HASH`]).
+pub(crate) fn codegen_src_hash() -> &'static str {
+    CODEGEN_SRC_HASH
+}
+
+/// The entry key of a linked AIE artifact: the digests of its core-object identity and its link identity
+/// (both over canonical, length-tagged text), so a changed Body, shape, layout, recipe, platform or
+/// toolchain names a different entry. The epoch is not part of the name: every input to the compiler's
+/// output is in the identities.
+pub(crate) fn aie_entry_key(core_digest: u64, link_digest: u64) -> KernelKey {
+    KernelKey {
+        name: format!("a{core_digest:016x}{link_digest:016x}.aie"),
+        fingerprint: link_digest,
+    }
+}
+
 /// Every cache entry starts with this magic, then the little-endian [`entry_digest`], then the artifact.
 const ENTRY_MAGIC: &[u8; 8] = b"POOTKC01";
 const ENTRY_HEADER_LEN: usize = ENTRY_MAGIC.len() + size_of::<u64>();
@@ -443,7 +459,7 @@ impl KernelCache {
     }
 
     /// A path beside the entries that no other call in any process shares.
-    fn scratch_path(&self, key: &KernelKey, suffix: &str) -> PathBuf {
+    pub(crate) fn scratch_path(&self, key: &KernelKey, suffix: &str) -> PathBuf {
         static NONCE: AtomicU64 = AtomicU64::new(0);
         let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
         self.dir.join(format!(

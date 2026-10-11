@@ -202,6 +202,7 @@ fn driver_options(capacity: NonZeroUsize, granule: NonZeroUsize) -> DriverOption
         },
         charge: program_retention,
         draft: DraftPolicy::Off,
+        hidden_window: None,
     }
 }
 

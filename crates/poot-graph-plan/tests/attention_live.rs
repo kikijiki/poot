@@ -196,15 +196,25 @@ fn unproved_guards_stay_generic_and_a_score_mask_stays_capacity() {
         );
     }
 
+    // The same graph with its witness declared fuses: the clamp is observed, so a bad length publishes
+    // nothing instead of becoming a valid-looking answer.
+    let validated = fixture.build(true);
+    assert_eq!(
+        attentions(&optimize(&validated.graph)).len(),
+        1,
+        "a clamped length whose witness is declared is matched"
+    );
+
     // The production mask: additive `-1e9` on the scores, no live bound. It fuses as a capacity attention.
     let b = Builder::new();
     let (hq, cap, d) = (2usize, 6usize, 4usize);
     let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d]));
     let k = b.constant("k", TensorType::f32(vec![1, hq, cap, d]));
     let v = b.constant("v", TensorType::f32(vec![1, hq, cap, d]));
-    let pos = b.slot(
+    let pos = b.slot_ranged(
         poot_graph_ir::Slot::Pos,
         TensorType::new(vec![1, 1], poot_tensor::DType::I32),
+        poot_graph_ir::IndexRange::below(cap).unwrap(),
     );
     let mask = poot_graph_ir::ops::causal_mask_from_pos(&b, pos, cap, None);
     let out = attention_masked_softcap(&b, q, k, v, 1, 0.5, mask, None);
@@ -278,8 +288,9 @@ fn an_out_of_range_live_length_fails_validation_and_the_endpoints_run() {
             );
         }
     }
-    // Extreme lengths are not exact in the F32 cast the length guard reads: a typed cast fault, never a
-    // result. Mutation: let them through (clamp `len` before the guard); the row gets `Ok`.
+    // Extreme lengths are outside the exact f32 integers the position slot declares: the bind refuses
+    // them, never a result. Mutation: drop the slot's declared range check in the oracle bind; the row
+    // reaches the cast fault instead.
     for len in [i32::MIN + 1, i32::MAX] {
         let inputs = fixture.inputs(&built, &[len], false).values();
         for (name, graph) in [
@@ -288,8 +299,8 @@ fn an_out_of_range_live_length_fails_validation_and_the_endpoints_run() {
         ] {
             let outcome = evaluate(graph, &inputs);
             assert!(
-                matches!(outcome, Err(EvalError::Cast(_) | EvalError::Validation(_))),
-                "{name}, len {len}: expected a typed cast or validation failure, got {outcome:?}"
+                matches!(outcome, Err(EvalError::SlotRange(_))),
+                "{name}, len {len}: expected a declared-range refusal, got {outcome:?}"
             );
         }
     }
@@ -372,9 +383,10 @@ fn gemma2_softcap_decode_and_mla_select_the_streaming_attention_schedule() {
     let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d]));
     let k = b.constant("k", TensorType::f32(vec![1, hkv, cap, d]));
     let v = b.constant("v", TensorType::f32(vec![1, hkv, cap, d]));
-    let pos = b.slot(
+    let pos = b.slot_ranged(
         poot_graph_ir::Slot::Pos,
         TensorType::new(vec![1, 1], poot_tensor::DType::I32),
+        poot_graph_ir::IndexRange::below(cap).unwrap(),
     );
     let mask = poot_graph_ir::ops::causal_mask_from_pos(&b, pos, cap, None);
     let out = attention_masked_softcap(&b, q, k, v, hq / hkv, 0.25, mask, Some(50.0));
@@ -388,9 +400,10 @@ fn gemma2_softcap_decode_and_mla_select_the_streaming_attention_schedule() {
     let k_nope = b.constant("k_nope", TensorType::f32(vec![1, hq, cap, nope]));
     let k_pe = b.constant("k_pe", TensorType::f32(vec![1, 1, cap, rope]));
     let v = b.constant("v", TensorType::f32(vec![1, hq, cap, dv]));
-    let pos = b.slot(
+    let pos = b.slot_ranged(
         poot_graph_ir::Slot::Pos,
         TensorType::new(vec![1, 1], poot_tensor::DType::I32),
+        poot_graph_ir::IndexRange::below(cap).unwrap(),
     );
     let mask = poot_graph_ir::ops::causal_mask_from_pos(&b, pos, cap, None);
     let key = b.concat(3, &[k_nope, repeat_kv(&b, k_pe, hq)]);
@@ -500,8 +513,8 @@ fn the_live_bound_builds_its_key_ends_in_exact_i32() {
     );
 }
 
-/// POOT-1040: a guarded live graph that fails the matcher's proof (no declared length witness, so the length is
-/// not bounded) stays generic primitives, and a generic graph with no exact-I32 iota would be refused by every
+/// POOT-1040: a guarded live graph that fails the matcher's proof (no declared length witness, so its clamp is
+/// unobserved) stays generic primitives, and a generic graph with no exact-I32 iota would be refused by every
 /// device plan. It compiles for every target with no attention kernel. Mutation: build the key ends from an
 /// F32 iota plus a `Cast` to I32; every target refuses the cast (`DtypeLowering`) and the compile fails.
 #[test]
@@ -523,12 +536,11 @@ fn a_declined_live_graph_plans_on_every_target() {
     }
 }
 
-/// POOT-1040: a declined live graph (no declared length witness) cannot publish a failure, so the index guard's
-/// in-range fallback decides: a length outside `1..=cap` (0, -1, cap, cap + 91) selects the fallback index 0, which
-/// is exactly a live length of 1 (bit for bit, never everything and never nothing); a length the guard's F32 cast
-/// cannot hold (`i32::MIN`, `i32::MIN + 1`, `i32::MAX`) is a typed `Cast` fault, never a result. Mutation: bound
-/// the guard by `lk + 8` in `ops::attention_live`; length 10 then keeps all nine keys and the length-1 comparison
-/// fails.
+/// POOT-1040: a declined live graph (no declared length witness) cannot publish a failure, so the index guard's in-range fallback decides: a length outside `1..=cap` (0, -1, cap, cap + 91)
+/// selects the fallback index 0, which is exactly a live length of 1 (bit for bit, never everything and never
+/// nothing); a length outside the position slot's declared exact-f32 range (`i32::MIN`, `i32::MIN + 1`,
+/// `i32::MAX`) is a typed `SlotRange` refusal at bind, never a result. Mutation: bound the guard by `lk + 8` in
+/// `ops::attention_live`; length 10 then keeps all nine keys and the length-1 comparison fails.
 #[test]
 fn a_declined_live_graph_treats_an_out_of_range_length_as_length_one() {
     let fixture = LiveAttentionFixture {
@@ -555,8 +567,8 @@ fn a_declined_live_graph_treats_an_out_of_range_length_as_length_one() {
     for len in [i32::MIN, i32::MIN + 1, i32::MAX] {
         let outcome = run(len);
         assert!(
-            matches!(outcome, Err(EvalError::Cast(_))),
-            "len {len}: expected a typed cast fault, got {outcome:?}"
+            matches!(outcome, Err(EvalError::SlotRange(_))),
+            "len {len}: expected a declared-range refusal, got {outcome:?}"
         );
     }
 }

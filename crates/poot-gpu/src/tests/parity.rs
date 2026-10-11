@@ -343,8 +343,8 @@ fn packed_linears_and_the_indexed_expert_contraction_match_the_oracle_on_wgpu() 
 /// the exact lane. Mutations: write the row at offset 0 instead of `row * bytes` in `Engine::reset_state`
 /// (the rows after `Row(2)` continue from slot 2's old state); let `Row` zero every state (the counter
 /// resets); drop the fixture's own `b.scatter_update` for the I32 pool (`state_row.rs`; the pool never
-/// changes); pin the I32 values to the F32 mirror lane (`required` always false in
-/// `ExactI32StorageAnalysis::new`; `2^24 + 1` reads back as `2^24`). `Step::carry_recurrent`'s I32 path is
+/// changes); store the I32 values through F32 (map `fty_ty`'s I32 arm to
+/// `Ty::F32`; `2^24 + 1` reads back as `2^24`). `Step::carry_recurrent`'s I32 path is
 /// guarded by `served_qwen4exp_*`, not by this row.
 #[test]
 fn state_pool_rows_reset_independently_on_wgpu() {

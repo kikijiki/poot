@@ -254,7 +254,7 @@
       "cache": "weights-resident-hot",
       "schedules": {
         "parent": "planner-default",
-        "candidate": null
+        "candidate": "scan-row-split"
       },
       "scratch": "planner-owned; reported by the receipt as live/peak bytes",
       "backends": [
@@ -262,12 +262,257 @@
         "rocm",
         "ptx"
       ],
-      "status": "planned",
-      "planned_reason": "the recurrence producer card has not landed; card 667 activates this comparison after it does",
+      "status": "runnable",
       "fixture_id": "b70f2704cfb0f18871ef731629afdf80c560c65df485f4b4a5d731660c70177e",
-      "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
+      "schedule_id": "0025f9f93a3783297d48f02335370f21db17d7e285fc7929024e391dd5d514cb",
       "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
       "identity_digest": "dba518593fec4bb54cf5f501f455252efa9f54a09b2b45b109ef1360f0389b50"
+    },
+    {
+      "id": "recurrence-scan-many-heads",
+      "regime": "recurrence, device-saturating head count",
+      "level": "kernel",
+      "producer": "recurrence_scan",
+      "shape": {
+        "heads": 64,
+        "d": 128,
+        "steps": 256
+      },
+      "storage": "f32",
+      "layout": "bhsd",
+      "numerics": {
+        "accumulate": "f32",
+        "reference": "f64 loop"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-resident-hot",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": "scan-row-split"
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "runnable",
+      "fixture_id": "356a2df03d825266db494280e742f8dbda1cfe10e91c60829380a91f44e0f8df",
+      "schedule_id": "0025f9f93a3783297d48f02335370f21db17d7e285fc7929024e391dd5d514cb",
+      "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
+      "identity_digest": "62555c1b559f74007f398d2abc5a62a313f761da8f210924dae1dd2ec27846b4"
+    },
+    {
+      "id": "recurrence-scan-narrow-state",
+      "regime": "recurrence, narrow per-head state",
+      "level": "kernel",
+      "producer": "recurrence_scan",
+      "shape": {
+        "heads": 4,
+        "d": 64,
+        "steps": 512
+      },
+      "storage": "f32",
+      "layout": "bhsd",
+      "numerics": {
+        "accumulate": "f32",
+        "reference": "f64 loop"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-resident-hot",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": "scan-row-split"
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "runnable",
+      "fixture_id": "4ef0f4b21f26b759620d4bb6ac8489fe8683127dca94b0b1578d72f749d285c1",
+      "schedule_id": "0025f9f93a3783297d48f02335370f21db17d7e285fc7929024e391dd5d514cb",
+      "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
+      "identity_digest": "6119332034e17d8c4c2311a3d60d95d9db31fd51ef4f0ef12badb6365a79d701"
+    },
+    {
+      "id": "recurrence-scan-short",
+      "regime": "recurrence, short sequence",
+      "level": "kernel",
+      "producer": "recurrence_scan",
+      "shape": {
+        "heads": 4,
+        "d": 128,
+        "steps": 64
+      },
+      "storage": "f32",
+      "layout": "bhsd",
+      "numerics": {
+        "accumulate": "f32",
+        "reference": "f64 loop"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-resident-hot",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": "scan-row-split"
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "runnable",
+      "fixture_id": "3d288b8f7ca3d974c2791f61feec467bd727692b394cd593dc59bd09cf7fe4bc",
+      "schedule_id": "0025f9f93a3783297d48f02335370f21db17d7e285fc7929024e391dd5d514cb",
+      "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
+      "identity_digest": "9cfef4297fcd5d218e1724acabc3fccd810d46e55239b14fd5bc88277c4087a2"
+    },
+    {
+      "id": "ssd-long-recurrence-scan",
+      "regime": "SSD long recurrence, few heads",
+      "level": "kernel",
+      "producer": "recurrence_scan",
+      "shape": {
+        "family": "ssd",
+        "heads": 4,
+        "p": 64,
+        "n": 128,
+        "steps": 4096
+      },
+      "storage": "f32",
+      "layout": "bhsd",
+      "numerics": {
+        "accumulate": "f32",
+        "reference": "f64 loop"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-resident-hot",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": "scan-row-split"
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "runnable",
+      "schedule_id": "0025f9f93a3783297d48f02335370f21db17d7e285fc7929024e391dd5d514cb",
+      "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
+      "fixture_id": "bd7b66d443d8cc34ef04fe49f12afabe4cd06a5e195b1e94928dc0de94835fd1",
+      "identity_digest": "f3b8726d4167010315acb06c43709e241c5d3dffdd9d50ebb10819acbdee3ed9"
+    },
+    {
+      "id": "ssd-recurrence-scan-many-heads",
+      "regime": "SSD recurrence, device-saturating head count",
+      "level": "kernel",
+      "producer": "recurrence_scan",
+      "shape": {
+        "family": "ssd",
+        "heads": 128,
+        "p": 64,
+        "n": 128,
+        "steps": 256
+      },
+      "storage": "f32",
+      "layout": "bhsd",
+      "numerics": {
+        "accumulate": "f32",
+        "reference": "f64 loop"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-resident-hot",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": "scan-row-split"
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "runnable",
+      "schedule_id": "0025f9f93a3783297d48f02335370f21db17d7e285fc7929024e391dd5d514cb",
+      "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
+      "fixture_id": "8e8f4e96e7c099ff90402441e1638a529a6f389a3ac9265a91ba8c1329a655a4",
+      "identity_digest": "2698bba5df4640b6b876582f425d998530c0f8bcf680d225fa632825a5aa79ce"
+    },
+    {
+      "id": "ssd-recurrence-scan-short",
+      "regime": "SSD recurrence, short sequence",
+      "level": "kernel",
+      "producer": "recurrence_scan",
+      "shape": {
+        "family": "ssd",
+        "heads": 4,
+        "p": 64,
+        "n": 128,
+        "steps": 64
+      },
+      "storage": "f32",
+      "layout": "bhsd",
+      "numerics": {
+        "accumulate": "f32",
+        "reference": "f64 loop"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-resident-hot",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": "scan-row-split"
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "runnable",
+      "schedule_id": "0025f9f93a3783297d48f02335370f21db17d7e285fc7929024e391dd5d514cb",
+      "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
+      "fixture_id": "e458acf0878ccc0eaafacb7e74221e78bfa796fe63862125206bfd3a665cc47a",
+      "identity_digest": "1ffdd59f5c2acb9deb74dc4b33855b423094b8441d1a100bfaf12c9ce7d98d3a"
+    },
+    {
+      "id": "ssd-recurrence-scan-boundary",
+      "regime": "SSD recurrence, at the split threshold",
+      "level": "kernel",
+      "producer": "recurrence_scan",
+      "shape": {
+        "family": "ssd",
+        "heads": 4,
+        "p": 64,
+        "n": 128,
+        "steps": 512
+      },
+      "storage": "f32",
+      "layout": "bhsd",
+      "numerics": {
+        "accumulate": "f32",
+        "reference": "f64 loop"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-resident-hot",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": "scan-row-split"
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "runnable",
+      "schedule_id": "0025f9f93a3783297d48f02335370f21db17d7e285fc7929024e391dd5d514cb",
+      "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
+      "fixture_id": "8a8df3f29da6a0f78a3b98beb4b66b53eb1904c486aff6ae8eebb7c212324069",
+      "identity_digest": "3f49ab0ebe8014648ae32b36b770d1d1515d0fe1867a5a851a339182ad988e79"
     },
     {
       "id": "expert-routing-sorted",

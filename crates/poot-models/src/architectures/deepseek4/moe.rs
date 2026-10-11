@@ -7,7 +7,7 @@
 //!
 //! [`components::moe`]: crate::components::moe
 
-use poot_graph_ir::{BinOp, Builder, RedOp, Scalar, TensorType, Traced, ops};
+use poot_graph_ir::{BinOp, Builder, IndexRange, RedOp, Scalar, TensorType, Traced, ops};
 use poot_quant::weights::{HandleFormat, MoeRole, WeightId, WeightMap, WeightRole};
 use poot_tensor::DType;
 
@@ -24,6 +24,8 @@ pub(super) struct HashTable {
     id: WeightId,
     vocab: usize,
     top_k: usize,
+    /// `[0, experts)`: every word of the table is an expert id, checked when the weight binds.
+    experts: IndexRange,
 }
 
 impl HashTable {
@@ -32,6 +34,7 @@ impl HashTable {
         layer: usize,
         vocab: usize,
         top_k: usize,
+        experts: usize,
     ) -> Result<Self, WeightError> {
         let id = WeightId::layer(layer, WeightRole::Moe(MoeRole::HashTable));
         let handle = map.handle(id).ok_or(WeightError::Unmapped { id })?;
@@ -48,19 +51,29 @@ impl HashTable {
                 format: handle.format,
             });
         }
-        Ok(Self { id, vocab, top_k })
+        let experts = IndexRange::below(experts).ok_or(WeightError::IndexBound {
+            id,
+            field: "n_routed_experts",
+            bound: experts,
+        })?;
+        Ok(Self {
+            id,
+            vocab,
+            top_k,
+            experts,
+        })
     }
 
-    /// The expert ids of each token of the step, `[rows * tokens, top_k]`, as the F32 values the
-    /// router's selector reads. The tokens gather rows of the I32 table exactly; the gathered ids
-    /// (below the expert count) then convert to F32.
+    /// The expert ids of each token of the step, `[rows * tokens, top_k]`, as the I32 words the
+    /// router's selector reads: the tokens gather rows of the I32 table exactly.
     fn ids(&self, b: &Builder, tokens: Traced) -> Traced {
-        let table = b.constant(
+        let table = b.constant_ranged(
             &self.id.const_name(),
             TensorType::new(vec![self.vocab, self.top_k], DType::I32),
+            self.experts,
         );
         let flat = b.reshape(tokens, vec![b.aval(tokens).numel()]);
-        b.cast(b.gather(table, 0, flat), DType::F32)
+        b.gather(table, 0, flat)
     }
 }
 
@@ -82,7 +95,15 @@ impl RoutedWeights {
                 if hash { &cfg.hash_moe } else { &cfg.score_moe },
             )?,
             table: hash
-                .then(|| HashTable::new(map, layer, cfg.vocab, cfg.hash_moe.top_k()))
+                .then(|| {
+                    HashTable::new(
+                        map,
+                        layer,
+                        cfg.vocab,
+                        cfg.hash_moe.top_k(),
+                        cfg.hash_moe.experts(),
+                    )
+                })
                 .transpose()?,
         })
     }
@@ -145,20 +166,23 @@ fn hash_routes(
         witness::out_of_range_count(b, ids, experts),
     );
 
-    // The score of each selected expert: a one-hot over the expert axis, exact because both
-    // operands are small integers in F32. Canonical scores keep an overflowing one finite, so an
-    // unselected expert's `0 * score` is never NaN.
+    // The score of each selected expert: a one-hot over the expert axis, an exact I32 `0`/`1` that
+    // widens to F32. Canonical scores keep an overflowing one finite, so an unselected expert's
+    // `0 * score` is never NaN.
     let scores =
         ops::canonical_router_scores(b, scores(b, logits, RouterKind::SqrtSoftplusBiasedTopK));
     let experts_row = b.broadcast(
-        b.reshape(b.iota(experts), vec![1, 1, experts]),
+        b.reshape(b.iota_i32(experts), vec![1, 1, experts]),
         vec![count, k, experts],
     );
     let ids_grid = b.broadcast(b.reshape(ids, vec![count, k, 1]), vec![count, k, experts]);
-    let one_hot = b.binary(
-        BinOp::Mul,
-        b.binary(BinOp::Ge, ids_grid, experts_row),
-        b.binary(BinOp::Ge, experts_row, ids_grid),
+    let one_hot = b.cast(
+        b.binary(
+            BinOp::Mul,
+            b.binary(BinOp::Ge, ids_grid, experts_row),
+            b.binary(BinOp::Ge, experts_row, ids_grid),
+        ),
+        DType::F32,
     );
     let scores = b.broadcast(
         b.reshape(scores, vec![count, 1, experts]),

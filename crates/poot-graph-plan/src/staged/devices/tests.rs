@@ -284,14 +284,14 @@ fn a_multi_consumer_boundary_has_a_complete_map_and_an_exact_per_device_footprin
     }
 }
 
-/// SC-006: two stages read a boundary under representations that share a byte count and a logical
-/// extent (the exact I32 words the producer computes against the float mirror a gather-only consumer
-/// reads). On two PTX devices the cut is refused with both schemas named, not admitted because the
-/// byte counts agree.
+/// SC-006, POOT-725: an I32 value one PTX device computes and exports and another reads only as a gather
+/// index crosses the cut in one representation (dense I32 words): the cut compiles and the boundary is a
+/// transfer. Before, the consumer's float-mirror read made the schemas differ and the cut was refused.
 ///
-/// Mutation: compare only the byte length in `check_link`; the cut compiles and this goes red.
+/// Mutation: make `value_storage_kind` store an I32 value no `Binary` consumes as F32; the schemas differ
+/// again and this goes red with a `LinkSchema` refusal.
 #[test]
-fn a_same_byte_size_boundary_in_another_representation_is_refused_across_devices() {
+fn an_i32_boundary_read_only_as_an_index_crosses_devices() {
     let b = Builder::new();
     let token = b.slot(Slot::Token, TensorType::new(vec![4], DType::I32));
     let table = b.constant("table", TensorType::f32(vec![8, 4]));
@@ -310,22 +310,16 @@ fn a_same_byte_size_boundary_in_another_representation_is_refused_across_devices
     }
     let graph = b.finish_with_state(out, &[(k_in, k_out)]);
     let before = per_eqn_plans_inside_compile();
-    match compile_on(&graph, &targets(Backend::Nvptx, &[GIB, GIB]), &pipeline(2)) {
-        Err(StagedCompileError::LinkSchema {
-            producer, consumer, ..
-        }) => {
-            assert_eq!(producer.aval, consumer.aval);
-            assert_ne!(producer.storage, consumer.storage);
-        }
-        other => panic!(
-            "expected a LinkSchema refusal across devices, got {:?}",
-            other.map(|_| ())
-        ),
-    }
+    let program = compile_on(&graph, &targets(Backend::Nvptx, &[GIB, GIB]), &pipeline(2))
+        .unwrap_or_else(|error| panic!("an I32 boundary has one representation: {error}"));
     assert!(
-        per_eqn_plans_inside_compile() > before,
-        "the refusal is the stage schemas, which exist only after the stages compile"
+        program
+            .transfers()
+            .iter()
+            .any(|transfer| transfer.aval.dtype == DType::I32),
+        "the ids cross as a transfer"
     );
+    assert!(per_eqn_plans_inside_compile() > before);
 }
 
 /// SC-003: a device whose footprint exceeds its budget refuses the placement, naming the device, the

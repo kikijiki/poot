@@ -583,7 +583,7 @@ mod row_gather_tests {
         let out_rows = 5;
         let blocks_per_row = 2;
         let ids: [u32; 4] = [3, 0, 4, 3];
-        let ids_f32: Vec<f32> = ids.iter().map(|&id| id as f32).collect();
+        let ids_i32: Vec<i32> = ids.iter().map(|&id| id as i32).collect();
         for (seed, format) in KQUANT.into_iter().enumerate() {
             let (k, bytes, decoded) = fixture(format, out_rows, blocks_per_row, seed as u64);
             let expected: Vec<f32> = ids
@@ -605,7 +605,7 @@ mod row_gather_tests {
             let words = pack_words(&bytes);
             let mut buffers = [
                 Buffer::from_u32s(&words),
-                Buffer::from_f32s(&ids_f32),
+                Buffer::from_i32s(&ids_i32),
                 Buffer::from_u32s(&[k as u32]),
                 Buffer::from_f32s(&vec![0.0; ids.len() * k]),
             ];
@@ -676,7 +676,7 @@ mod row_gather_tests {
         let out_rows = 5;
         let blocks_per_row = 2;
         let ids: [u32; 4] = [3, 0, 4, 3];
-        let ids_f32: Vec<f32> = ids.iter().map(|&id| id as f32).collect();
+        let ids_i32: Vec<i32> = ids.iter().map(|&id| id as i32).collect();
         for (seed, format) in KQUANT.into_iter().enumerate() {
             let (k, bytes, decoded) = fixture(format, out_rows, blocks_per_row, seed as u64);
             let expected: Vec<f32> = ids
@@ -703,12 +703,12 @@ mod row_gather_tests {
             compile(&body, Target::SpirvVulkan, &out_path)
                 .unwrap_or_else(|error| panic!("{format:?}: compile: {error}"));
             let spirv_bytes = std::fs::read(&out_path).unwrap();
-            let kernel = kernel_handle(&body, Target::SpirvVulkan, spirv_bytes);
+            let kernel = kernel_handle(&body, poot_codegen::GpuTarget::SpirvVulkan, spirv_bytes);
 
             let words = pack_words(&bytes);
             let mut buffers = [
                 KernelBuffer::read_only_u32(&words),
-                KernelBuffer::read_only_f32(&ids_f32),
+                KernelBuffer::read_only_i32(&ids_i32),
                 KernelBuffer::read_only_u32(&[k as u32]),
                 KernelBuffer::write_f32(ids.len() * k),
             ];
@@ -736,7 +736,7 @@ mod row_gather_tests {
         let out_rows = 5;
         let blocks_per_row = 2;
         let ids: [u32; 4] = [3, 0, 4, 3];
-        let ids_f32: Vec<f32> = ids.iter().map(|&id| id as f32).collect();
+        let ids_i32: Vec<i32> = ids.iter().map(|&id| id as i32).collect();
         for (seed, format) in BLOCK32.into_iter().enumerate() {
             let (k, bytes, decoded) = fixture(format, out_rows, blocks_per_row, seed as u64);
             let expected: Vec<f32> = ids
@@ -758,7 +758,7 @@ mod row_gather_tests {
             let words = pack_words(&bytes);
             let mut buffers = [
                 Buffer::from_u32s(&words),
-                Buffer::from_f32s(&ids_f32),
+                Buffer::from_i32s(&ids_i32),
                 Buffer::from_u32s(&[k as u32]),
                 Buffer::from_f32s(&vec![0.0; ids.len() * k]),
             ];
@@ -834,7 +834,7 @@ mod row_gather_tests {
         let out_rows = 5;
         let blocks_per_row = 2;
         let ids: [u32; 4] = [3, 0, 4, 3];
-        let ids_f32: Vec<f32> = ids.iter().map(|&id| id as f32).collect();
+        let ids_i32: Vec<i32> = ids.iter().map(|&id| id as i32).collect();
         for (seed, format) in BLOCK32.into_iter().enumerate() {
             let (k, bytes, decoded) = fixture(format, out_rows, blocks_per_row, seed as u64);
             let expected: Vec<f32> = ids
@@ -861,12 +861,12 @@ mod row_gather_tests {
             compile(&body, Target::SpirvVulkan, &out_path)
                 .unwrap_or_else(|error| panic!("{format:?}: compile: {error}"));
             let spirv_bytes = std::fs::read(&out_path).unwrap();
-            let kernel = kernel_handle(&body, Target::SpirvVulkan, spirv_bytes);
+            let kernel = kernel_handle(&body, poot_codegen::GpuTarget::SpirvVulkan, spirv_bytes);
 
             let words = pack_words(&bytes);
             let mut buffers = [
                 KernelBuffer::read_only_u32(&words),
-                KernelBuffer::read_only_f32(&ids_f32),
+                KernelBuffer::read_only_i32(&ids_i32),
                 KernelBuffer::read_only_u32(&[k as u32]),
                 KernelBuffer::write_f32(ids.len() * k),
             ];
@@ -1351,7 +1351,7 @@ mod contraction_tests {
         compile(&body, Target::SpirvVulkan, &out_path)
             .unwrap_or_else(|error| panic!("{format:?}: compile: {error}"));
         let spirv_bytes = std::fs::read(&out_path).unwrap();
-        let kernel = kernel_handle(&body, Target::SpirvVulkan, spirv_bytes);
+        let kernel = kernel_handle(&body, poot_codegen::GpuTarget::SpirvVulkan, spirv_bytes);
 
         let words = pack_words(&bytes);
         // metadata[3] (x_groups): 0 is fine here - every dispatch below is `[threads, 1, 1]`
@@ -1534,8 +1534,11 @@ mod contraction_tests {
             poot_codegen::compile(&body, poot_codegen::Target::SpirvVulkan, &out_path)
                 .unwrap_or_else(|error| panic!("{format:?}: compile: {error}"));
             let spirv_bytes = std::fs::read(&out_path).unwrap();
-            let kernel =
-                poot_codegen::kernel_handle(&body, poot_codegen::Target::SpirvVulkan, spirv_bytes);
+            let kernel = poot_codegen::kernel_handle(
+                &body,
+                poot_codegen::GpuTarget::SpirvVulkan,
+                spirv_bytes,
+            );
 
             let words = pack_words(&bytes);
             let metadata = [k as u32, out_per_block as u32, m_per_block as u32, x_groups];
@@ -1825,7 +1828,8 @@ mod rocm_tests {
         poot_codegen::compile(body, target, &out)
             .unwrap_or_else(|error| panic!("{name}: compile: {error}"));
         let bytes = std::fs::read(&out).unwrap_or_else(|error| panic!("{name}: read: {error}"));
-        let kernel = poot_codegen::kernel_handle(body, target, bytes);
+        let kernel =
+            poot_codegen::kernel_handle(body, poot_codegen::GpuTarget::AmdGcn(arch), bytes);
         let module = ctx
             .load_hsaco(&kernel)
             .unwrap_or_else(|error| panic!("{name}: load_hsaco: {error}"));
@@ -1943,7 +1947,6 @@ mod rocm_tests {
         let out_rows = 5;
         let blocks_per_row = 2;
         let ids: [u32; 4] = [3, 0, 4, 3];
-        let ids_f32: Vec<f32> = ids.iter().map(|&id| id as f32).collect();
         for (seed, format) in BLOCK32.into_iter().enumerate() {
             let (k, bytes, decoded) = fixture(format, out_rows, blocks_per_row, seed as u64);
             let expected: Vec<f32> = ids
@@ -1969,7 +1972,7 @@ mod rocm_tests {
                 &body,
                 &[
                     Arg::U32(&words),
-                    Arg::F32(&ids_f32),
+                    Arg::U32(&ids),
                     Arg::U32(&[k as u32]),
                     Arg::Out(ids.len() * k),
                 ],
@@ -2058,7 +2061,6 @@ mod rocm_tests {
         let out_rows = 5;
         let blocks_per_row = 2;
         let ids: [u32; 4] = [3, 0, 4, 3];
-        let ids_f32: Vec<f32> = ids.iter().map(|&id| id as f32).collect();
         for (seed, format) in KQUANT.into_iter().enumerate() {
             let (k, bytes, decoded) = fixture(format, out_rows, blocks_per_row, seed as u64);
             let expected: Vec<f32> = ids
@@ -2084,7 +2086,7 @@ mod rocm_tests {
                 &body,
                 &[
                     Arg::U32(&words),
-                    Arg::F32(&ids_f32),
+                    Arg::U32(&ids),
                     Arg::U32(&[k as u32]),
                     Arg::Out(ids.len() * k),
                 ],
@@ -2290,7 +2292,7 @@ mod ptx_tests {
         compile(body, Target::Nvptx, &out)
             .unwrap_or_else(|error| panic!("{name}: compile: {error}"));
         let bytes = std::fs::read(&out).unwrap_or_else(|error| panic!("{name}: read: {error}"));
-        kernel_handle(body, Target::Nvptx, bytes)
+        kernel_handle(body, poot_codegen::GpuTarget::Nvptx, bytes)
     }
 
     /// Upload `u32` data through the i32-typed allocator (`u32 as i32` is a bit-preserving
@@ -2309,7 +2311,6 @@ mod ptx_tests {
         let out_rows = 5;
         let blocks_per_row = 2;
         let ids: [u32; 4] = [3, 0, 4, 3];
-        let ids_f32: Vec<f32> = ids.iter().map(|&id| id as f32).collect();
         for (seed, format) in BLOCK32.into_iter().enumerate() {
             let (k, bytes, decoded) = fixture(format, out_rows, blocks_per_row, seed as u64);
             let expected: Vec<f32> = ids
@@ -2330,7 +2331,9 @@ mod ptx_tests {
             let kernel = compile_and_load(&name, &body);
             let words = pack_words(&bytes);
             let words_buf = upload_u32(&ctx, &words);
-            let ids_buf = ctx.upload_f32(&ids_f32).expect("upload ids");
+            let ids_buf = ctx
+                .upload_i32(&ids.map(|id| id as i32))
+                .expect("upload ids");
             let metadata_buf = upload_u32(&ctx, &[k as u32]);
             let out_buf = ctx.alloc_f32(ids.len() * k).expect("allocate out");
             ctx.dispatch_dev(
@@ -2438,7 +2441,6 @@ mod ptx_tests {
         let out_rows = 5;
         let blocks_per_row = 2;
         let ids: [u32; 4] = [3, 0, 4, 3];
-        let ids_f32: Vec<f32> = ids.iter().map(|&id| id as f32).collect();
         for (seed, format) in KQUANT.into_iter().enumerate() {
             let (k, bytes, decoded) = fixture(format, out_rows, blocks_per_row, seed as u64);
             let expected: Vec<f32> = ids
@@ -2459,7 +2461,9 @@ mod ptx_tests {
             let kernel = compile_and_load(&name, &body);
             let words = pack_words(&bytes);
             let words_buf = upload_u32(&ctx, &words);
-            let ids_buf = ctx.upload_f32(&ids_f32).expect("upload ids");
+            let ids_buf = ctx
+                .upload_i32(&ids.map(|id| id as i32))
+                .expect("upload ids");
             let metadata_buf = upload_u32(&ctx, &[k as u32]);
             let out_buf = ctx.alloc_f32(ids.len() * k).expect("allocate out");
             ctx.dispatch_dev(
@@ -2605,7 +2609,7 @@ mod planar_ptx_tests {
         compile(body, Target::Nvptx, &out)
             .unwrap_or_else(|error| panic!("{name}: compile: {error}"));
         let bytes = std::fs::read(&out).unwrap_or_else(|error| panic!("{name}: read: {error}"));
-        kernel_handle(body, Target::Nvptx, bytes)
+        kernel_handle(body, poot_codegen::GpuTarget::Nvptx, bytes)
     }
 
     fn upload_u32(ctx: &PtxContext, data: &[u32]) -> PtxBuffer {

@@ -229,6 +229,218 @@ fn attention_decode(bank: &Value, case: &Value) -> Result<Prepared, String> {
     })
 }
 
+/// The recurrence scan of one family. A case's shape names `"family": "ssd"` for the Mamba2 SSD (`p` head
+/// width, `n` state rows); a shape without a family is the gated delta rule (`d`).
+fn recurrence_scan(bank: &Value, case: &Value) -> Result<Prepared, String> {
+    match case["shape"]["family"].as_str() {
+        None => delta_rule_scan(bank, case),
+        Some("ssd") => ssd_scan(bank, case),
+        Some(other) => Err(format!("unknown scan family {other:?}")),
+    }
+}
+
+/// The Mamba2 SSD over `steps` tokens (`heads` heads, head width `p`, state `n x p`). `delta` is a small
+/// positive step, `a` a negative per-head decay rate, so the state stays bounded; the reference is a plain
+/// f64 loop of the kernel's per-column recurrence. The graph's output is the packed `[1, H, L + N, P]` result.
+fn ssd_scan(bank: &Value, case: &Value) -> Result<Prepared, String> {
+    let shape = &case["shape"];
+    let (heads, p, n, len) = (
+        dim(shape, "heads")?,
+        dim(shape, "p")?,
+        dim(shape, "n")?,
+        dim(shape, "steps")?,
+    );
+    let mut stream = SplitMix64(
+        bank["token_fixtures"][case["token_fixture"].as_str().unwrap()]["seed"]
+            .as_u64()
+            .ok_or("fixture has no seed")?,
+    );
+    let x = stream.tensor(heads * len * p);
+    let b_in: Vec<f32> = stream
+        .tensor(heads * len * n)
+        .into_iter()
+        .map(|u| u * 0.5)
+        .collect();
+    let c_in: Vec<f32> = stream
+        .tensor(heads * len * n)
+        .into_iter()
+        .map(|u| u * 0.5)
+        .collect();
+    // delta in [0.05, 0.15), a in [-0.7, -0.4) per head, d in [0.5, 0.8).
+    let delta: Vec<f32> = stream
+        .tensor(heads * len)
+        .into_iter()
+        .map(|u| 0.1 + 0.05 * u)
+        .collect();
+    let a: Vec<f32> = (0..heads)
+        .map(|h| -(0.4 + 0.3 * h as f32 / heads as f32))
+        .collect();
+    let d_skip: Vec<f32> = (0..heads)
+        .map(|h| 0.5 + 0.3 * h as f32 / heads as f32)
+        .collect();
+    let s_in = vec![0.0f32; heads * n * p];
+    let rows = len + n;
+    let mut want = vec![0.0f64; heads * rows * p];
+    for h in 0..heads {
+        for col in 0..p {
+            let mut s = vec![0.0f64; n];
+            for t in 0..len {
+                let decay = (f64::from(delta[h * len + t]) * f64::from(a[h])).exp();
+                let dx = f64::from(delta[h * len + t]) * f64::from(x[(h * len + t) * p + col]);
+                let bc = (h * len + t) * n;
+                let mut y = 0.0;
+                for r in 0..n {
+                    s[r] = decay * s[r] + f64::from(b_in[bc + r]) * dx;
+                    y += f64::from(c_in[bc + r]) * s[r];
+                }
+                y += f64::from(d_skip[h]) * f64::from(x[(h * len + t) * p + col]);
+                want[(h * rows + t) * p + col] = y;
+            }
+            for r in 0..n {
+                want[(h * rows + len + r) * p + col] = s[r];
+            }
+        }
+    }
+    let b = Builder::new();
+    let x_ty = vec![1, heads, len, p];
+    let bc_ty = vec![1, heads, len, n];
+    let delta_ty = vec![1, heads, len, 1];
+    let head_ty = vec![1, heads, 1, 1];
+    let state_ty = vec![1, heads, n, p];
+    let operands = [
+        b.constant("x", TensorType::f32(x_ty.clone())),
+        b.constant("b", TensorType::f32(bc_ty.clone())),
+        b.constant("c", TensorType::f32(bc_ty.clone())),
+        b.constant("delta", TensorType::f32(delta_ty.clone())),
+        b.constant("a", TensorType::f32(head_ty.clone())),
+        b.constant("d", TensorType::f32(head_ty.clone())),
+        b.constant("s_in", TensorType::f32(state_ty.clone())),
+    ];
+    let scan = b.scan(
+        poot_graph_ir::ScanAttrs {
+            family: poot_graph_ir::ScanFamily::Ssd,
+            chunk: 64,
+        },
+        &operands,
+    );
+    Ok(Prepared {
+        graphs: vec![b.finish(scan.packed)],
+        consts: vec![
+            ("x".into(), HostTensor::f32(x_ty, x)),
+            ("b".into(), HostTensor::f32(bc_ty.clone(), b_in)),
+            ("c".into(), HostTensor::f32(bc_ty, c_in)),
+            ("delta".into(), HostTensor::f32(delta_ty, delta)),
+            ("a".into(), HostTensor::f32(head_ty.clone(), a)),
+            ("d".into(), HostTensor::f32(head_ty, d_skip)),
+            ("s_in".into(), HostTensor::f32(state_ty, s_in)),
+        ],
+        references: vec![want],
+        out_shape: vec![1, heads, rows, p],
+        observed: json!({
+            "shape": { "family": "ssd", "heads": heads, "p": p, "n": n, "steps": len },
+            "storage": "f32",
+            "layout": "bhsd",
+            "weight_copies": 1,
+            "weight_bytes_per_copy": 4 * (heads * len * (p + 2 * n + 1) + 2 * heads + heads * n * p),
+        }),
+    })
+}
+
+/// The gated delta rule over `steps` tokens (`heads` heads, state `d x d`), the bank's recurrence. Keys are
+/// normalised to unit length and `g`, `beta` kept in a contracting range so the 4096-step state stays bounded;
+/// the reference is a plain f64 loop of the kernel's per-column recurrence, sharing no code with the engine.
+/// The graph's output is the packed `[1, H, L + D, D]` result, so every output row and the carried state are
+/// compared.
+fn delta_rule_scan(bank: &Value, case: &Value) -> Result<Prepared, String> {
+    let shape = &case["shape"];
+    let (heads, d, len) = (dim(shape, "heads")?, dim(shape, "d")?, dim(shape, "steps")?);
+    let mut stream = SplitMix64(
+        bank["token_fixtures"][case["token_fixture"].as_str().unwrap()]["seed"]
+            .as_u64()
+            .ok_or("fixture has no seed")?,
+    );
+    let q = stream.tensor(heads * len * d);
+    let mut k = stream.tensor(heads * len * d);
+    let v = stream.tensor(heads * len * d);
+    for row in k.chunks_mut(d) {
+        let norm = row.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+        row.iter_mut().for_each(|x| *x /= norm);
+    }
+    // g in [-0.30, -0.05) (log-domain decay), beta in [0.1, 0.9).
+    let g: Vec<f32> = stream
+        .tensor(heads * len)
+        .into_iter()
+        .map(|u| -0.175 + 0.125 * u)
+        .collect();
+    let beta: Vec<f32> = stream
+        .tensor(heads * len)
+        .into_iter()
+        .map(|u| 0.5 + 0.4 * u)
+        .collect();
+    let s_in = vec![0.0f32; heads * d * d];
+    let scale = 1.0 / (d as f64).sqrt();
+    let rows = len + d;
+    let mut want = vec![0.0f64; heads * rows * d];
+    for h in 0..heads {
+        for col in 0..d {
+            let mut s = vec![0.0f64; d];
+            for t in 0..len {
+                let at = (h * len + t) * d;
+                let decay = f64::from(g[h * len + t]).exp();
+                let kv: f64 = (0..d).map(|r| f64::from(k[at + r]) * decay * s[r]).sum();
+                let delta = f64::from(beta[h * len + t]) * (f64::from(v[at + col]) - kv);
+                let mut o = 0.0;
+                for r in 0..d {
+                    s[r] = decay * s[r] + f64::from(k[at + r]) * delta;
+                    o += f64::from(q[at + r]) * scale * s[r];
+                }
+                want[(h * rows + t) * d + col] = o;
+            }
+            for r in 0..d {
+                want[(h * rows + len + r) * d + col] = s[r];
+            }
+        }
+    }
+    let b = Builder::new();
+    let sequence = vec![1, heads, len, d];
+    let per_token = vec![1, heads, len, 1];
+    let operands = [
+        b.constant("q", TensorType::f32(sequence.clone())),
+        b.constant("k", TensorType::f32(sequence.clone())),
+        b.constant("v", TensorType::f32(sequence.clone())),
+        b.constant("g", TensorType::f32(per_token.clone())),
+        b.constant("beta", TensorType::f32(per_token.clone())),
+        b.constant("s_in", TensorType::f32(vec![1, heads, d, d])),
+    ];
+    let scan = b.scan(
+        poot_graph_ir::ScanAttrs {
+            family: poot_graph_ir::ScanFamily::DeltaRule,
+            chunk: 64,
+        },
+        &operands,
+    );
+    Ok(Prepared {
+        graphs: vec![b.finish(scan.packed)],
+        consts: vec![
+            ("q".into(), HostTensor::f32(sequence.clone(), q)),
+            ("k".into(), HostTensor::f32(sequence.clone(), k)),
+            ("v".into(), HostTensor::f32(sequence, v)),
+            ("g".into(), HostTensor::f32(per_token.clone(), g)),
+            ("beta".into(), HostTensor::f32(per_token, beta)),
+            ("s_in".into(), HostTensor::f32(vec![1, heads, d, d], s_in)),
+        ],
+        references: vec![want],
+        out_shape: vec![1, heads, rows, d],
+        observed: json!({
+            "shape": { "heads": heads, "d": d, "steps": len },
+            "storage": "f32",
+            "layout": "bhsd",
+            "weight_copies": 1,
+            "weight_bytes_per_copy": 4 * (3 * heads * len * d + 2 * heads * len + heads * d * d),
+        }),
+    })
+}
+
 fn prepare(bank: &Value, case: &Value) -> Result<Prepared, String> {
     let generator = &bank["token_fixtures"][case["token_fixture"]
         .as_str()
@@ -239,6 +451,7 @@ fn prepare(bank: &Value, case: &Value) -> Result<Prepared, String> {
     match case["producer"].as_str() {
         Some("dense_matmul") => dense_matmul(bank, case),
         Some("attention_decode") => attention_decode(bank, case),
+        Some("recurrence_scan") => recurrence_scan(bank, case),
         other => Err(format!("no runner for producer {other:?}")),
     }
 }
@@ -267,7 +480,7 @@ fn plan_of(program: &StagedProgram<poot_graph_ir::ValidationOutputs>) -> Vec<Str
         .flat_map(|(_, plan)| {
             plan.dispatches()
                 .iter()
-                .map(|d| format!("{} [{}]", d.label, d.key))
+                .map(|d| format!("{} [{}]", d.label(), d.key()))
         })
         .collect()
 }

@@ -1,7 +1,7 @@
 use super::*;
 use poot_graph_ir::ValueTable;
 use poot_graph_ir::{
-    AttentionAttrs, ComputedConst, KeyLayout, KvBound, recognize_index_bounds_guard,
+    AttentionAttrs, ComputedConst, IndexRange, KeyLayout, KvBound, RangeFacts, value_ranges,
 };
 
 /// Why the attention matcher did not fuse a candidate equation, in the order the checks run. The pass
@@ -564,6 +564,7 @@ fn match_pre_mask<V: ValidationChannel>(
 pub(super) fn match_attention<V: ValidationChannel>(
     g: &Graph<V>,
     prod: &HashMap<ValueId, usize>,
+    facts: &RangeFacts,
     root: &Eqn,
 ) -> Result<AttnMatch, AttentionDecline> {
     let pe = |v: ValueId| -> Option<&Eqn> { prod.get(&v).map(|&i| &g.eqns[i]) };
@@ -714,7 +715,7 @@ pub(super) fn match_attention<V: ValidationChannel>(
         if !same_len {
             return Err(AttentionDecline::LiveKeyGuard);
         }
-        if !live_length_proved(g, prod, len, lk) {
+        if !live_length_proved(g, prod, facts, len, lk) {
             return Err(AttentionDecline::LiveLengthUnproved);
         }
     }
@@ -752,26 +753,63 @@ pub(super) fn match_attention<V: ValidationChannel>(
     Ok(m)
 }
 
-/// Whether `len` is `guarded + 1` of a canonical index-bounds guard over `lk` whose witness the graph declares
-/// as a validation output: the length is then in `1..=lk` on every output an executor publishes.
+/// Whether the graph proves `len` in `1..=lk` on every output an executor publishes (POOT-726).
+///
+/// The range comes from [`value_ranges`] and two sources are told apart. A bound-checked declared slot
+/// needs nothing more: the binder refuses a length outside it. A range that exists only because an index
+/// guard clamped the length (`facts.clamps`) fuses only when each such guard's witness is a declared
+/// validation output, so a bad length publishes nothing instead of turning silently into a valid-looking
+/// answer (spec 375).
 fn live_length_proved<V: ValidationChannel>(
     g: &Graph<V>,
     prod: &HashMap<ValueId, usize>,
+    facts: &RangeFacts,
     len: ValueId,
     lk: usize,
 ) -> bool {
-    let Some(eqn) = prod.get(&len).map(|&i| &g.eqns[i]) else {
-        return false;
-    };
-    if !matches!(eqn.op, OpKind::Binary(BinOp::Add)) {
-        return false;
-    }
-    let Some((guarded, Scalar::I32(1))) = value_and_scalar(&eqn.inputs) else {
-        return false;
-    };
+    let live = i64::try_from(lk)
+        .ok()
+        .and_then(|lk| IndexRange::new(1, lk + 1));
+    let in_range = live.is_some_and(|live| facts[len].is_some_and(|proved| proved.within(&live)));
+    in_range
+        && facts
+            .clamps(len)
+            .iter()
+            .all(|&condition| guard_witnessed(g, prod, condition))
+}
+
+/// Whether a declared validation output counts the lanes where `condition` is set: a keepdim last-axis
+/// `Sum` of its F32 cast, the shape `Builder::guard_index_bounds` declares for its witness. Anything else
+/// (a witness over another value, a reduction over another axis) does not observe every clamped lane.
+fn guard_witnessed<V: ValidationChannel>(
+    g: &Graph<V>,
+    prod: &HashMap<ValueId, usize>,
+    condition: ValueId,
+) -> bool {
+    let producer = |value: ValueId| prod.get(&value).map(|&index| &g.eqns[index]);
     g.validation_outputs().iter().any(|validation| {
-        recognize_index_bounds_guard(g, guarded, validation.value)
-            .is_ok_and(|guard| usize::try_from(guard.upper_exclusive) == Ok(lk))
+        let Some(sum) = producer(validation.value) else {
+            return false;
+        };
+        let (
+            OpKind::Reduce {
+                op: RedOp::Sum,
+                axis,
+                keepdim: true,
+            },
+            [Operand::Value(flag)],
+        ) = (&sum.op, sum.inputs.as_slice())
+        else {
+            return false;
+        };
+        if *axis + 1 != g.aval(*flag).shape.len() {
+            return false;
+        }
+        matches!(
+            producer(*flag),
+            Some(Eqn { op: OpKind::Cast { to: DType::F32 }, inputs, .. })
+                if matches!(inputs.as_slice(), [Operand::Value(observed)] if *observed == condition)
+        )
     })
 }
 
@@ -818,6 +856,8 @@ pub fn flash_attention_capped<V: ValidationChannel>(
     for (i, e) in g.eqns.iter().enumerate() {
         prod.insert(e.out, i);
     }
+    // One range analysis per pass run: every live candidate reads its length from it.
+    let facts = value_ranges(g);
     let fits = |m: &AttnMatch| -> bool {
         if m.decode {
             return true; // decode grid = Hq, always tiny
@@ -833,7 +873,7 @@ pub fn flash_attention_capped<V: ValidationChannel>(
     let eqns: Vec<Eqn> = g
         .eqns
         .iter()
-        .map(|e| match match_attention(g, &prod, e) {
+        .map(|e| match match_attention(g, &prod, &facts, e) {
             Ok(m) if fits(&m) => Eqn {
                 op: m.op(),
                 inputs: m.operands().into_iter().map(Operand::Value).collect(),

@@ -447,6 +447,7 @@ pub fn step(rows: usize, tokens: usize, capacity: usize, logits: LogitRows) -> S
         capacity: NonZeroUsize::new(capacity).unwrap(),
         kv: KvLayout::Contiguous,
         logits,
+        hidden: None,
     }
 }
 

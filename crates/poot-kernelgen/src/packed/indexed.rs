@@ -162,7 +162,7 @@ pub(super) fn indexed_tiled(
     let mut params = vec![
         ld(Ty::Unit, false),
         ld(slice_f32(false), false),
-        ld(slice_f32(false), false),
+        ld(slice_dtype(Ty::I32, false), false),
     ];
     params.extend((0..sources).map(|_| ld(slice_dtype(Ty::U32, false), false)));
     if let Some(epilogue) = epilogue {
@@ -320,7 +320,7 @@ mod tests {
     fn launch(
         case: &Case,
         schedule: Schedule,
-        (x, ids): (&[f32], &[f32]),
+        (x, ids): (&[f32], &[i32]),
         name: &str,
         format: WeightFormat,
     ) -> Vec<f32> {
@@ -330,7 +330,7 @@ mod tests {
     fn launch_with(
         case: &Case,
         schedule: Schedule,
-        (x, ids): (&[f32], &[f32]),
+        (x, ids): (&[f32], &[i32]),
         name: &str,
         format: WeightFormat,
         fold: Option<usize>,
@@ -362,7 +362,7 @@ mod tests {
                 )
             }
         };
-        let mut buffers = vec![Buffer::from_f32s(x), Buffer::from_f32s(ids)];
+        let mut buffers = vec![Buffer::from_f32s(x), Buffer::from_i32s(ids)];
         buffers.extend(case.sources.iter().map(|words| Buffer::from_u32s(words)));
         if let Some((_, leaf)) = epilogue {
             buffers.push(Buffer::from_f32s(leaf));
@@ -386,7 +386,7 @@ mod tests {
         let (out, rows) = (5, 7);
         for (format, k) in formats() {
             let case = case(format, out, k);
-            let ids: Vec<f32> = (0..rows).map(|m| ((m * 2 + 1) % EXPERTS) as f32).collect();
+            let ids: Vec<i32> = (0..rows).map(|m| ((m * 2 + 1) % EXPERTS) as i32).collect();
             let column = |m: usize| (m * 37 + 11) % k;
             let mut x = vec![0.0f32; rows * k];
             for m in 0..rows {
@@ -421,7 +421,7 @@ mod tests {
         let (out, rows) = (6, 5);
         for (format, k) in formats() {
             let case = case(format, out, k);
-            let ids: Vec<f32> = (0..rows).map(|m| ((m * 2 + 2) % EXPERTS) as f32).collect();
+            let ids: Vec<i32> = (0..rows).map(|m| ((m * 2 + 2) % EXPERTS) as i32).collect();
             let x: Vec<f32> = (0..rows * k)
                 .map(|i| ((i * 7 % 23) as f32 - 11.0) * 0.0625)
                 .collect();
@@ -474,7 +474,7 @@ mod tests {
                     })
                     .collect(),
             );
-            let ids: Vec<f32> = (0..rows).map(|m| (m % EXPERTS) as f32).collect();
+            let ids: Vec<i32> = (0..rows).map(|m| (m % EXPERTS) as i32).collect();
             // Row `m` is hot in 32-wide scale block `m % 4`, at a column that moves with `m`.
             let mut x = vec![0.0f32; rows * k];
             for m in 0..rows {
@@ -507,21 +507,21 @@ mod tests {
         }
     }
 
-    /// An expert id outside `0..E`, negative, fractional or NaN makes its whole output row NaN and leaves
+    /// An expert id outside `0..E` (negative, at or past `E`, or `i32::MIN`) makes its whole output row NaN and leaves
     /// every other row untouched (R-632-4), as for the dense indexed contraction; no read leaves the table.
     #[test]
     fn an_invalid_expert_id_makes_only_its_row_nan() {
         let (out, k) = (4, 64);
         let format = WeightFormat::Q8_0;
         let case = case(format, out, k);
-        let ids = [1.0, 3.0, -1.0, 0.5, f32::NAN, 2.0];
+        let ids = [1, EXPERTS as i32, -1, 7 * EXPERTS as i32, i32::MIN, 2];
         let x: Vec<f32> = (0..ids.len() * k).map(|i| 0.25 + (i % 5) as f32).collect();
         for schedule in schedules() {
             let name = format!("indexed_invalid_ids_{}", schedule_tag(schedule));
             let got = launch(&case, schedule, (&x, &ids), &name, format);
             let mut row = vec![0.0f32; k];
             for (m, &id) in ids.iter().enumerate() {
-                let valid = id >= 0.0 && id.fract() == 0.0 && (id as usize) < EXPERTS;
+                let valid = (0..EXPERTS as i32).contains(&id);
                 for n in 0..out {
                     let value = got[m * out + n];
                     if valid {
@@ -555,7 +555,7 @@ mod tests {
         let (out, rows, k) = (6, 5, 64);
         let format = WeightFormat::Q8_0;
         let case = case(format, out, k);
-        let ids: Vec<f32> = (0..rows).map(|m| ((m * 2 + 1) % EXPERTS) as f32).collect();
+        let ids: Vec<i32> = (0..rows).map(|m| ((m * 2 + 1) % EXPERTS) as i32).collect();
         let x: Vec<f32> = (0..rows * k)
             .map(|i| ((i * 5 % 19) as f32 - 9.0) * 0.0625)
             .collect();
@@ -611,7 +611,7 @@ mod tests {
         for format in [WeightFormat::Q8_0, WeightFormat::Q4_K] {
             let k = if format == WeightFormat::Q4_K { 256 } else { k };
             let case = case(format, out, k);
-            let ids = [2.0, 0.0, 2.0, 0.0, 0.0, 2.0, 2.0, 0.0];
+            let ids = [2, 0, 2, 0, 0, 2, 2, 0];
             let rows = ids.len();
             let x: Vec<f32> = (0..rows * k)
                 .map(|i| ((i * 11 % 29) as f32 - 14.0) * 0.03125)
@@ -651,7 +651,7 @@ mod tests {
         let (out, rows, k) = (6, 8, 64);
         let format = WeightFormat::Q8_0;
         let case = case(format, out, k);
-        let ids: Vec<f32> = (0..rows).map(|m| ((m * 2 + 1) % EXPERTS) as f32).collect();
+        let ids: Vec<i32> = (0..rows).map(|m| ((m * 2 + 1) % EXPERTS) as i32).collect();
         let x: Vec<f32> = (0..rows * k)
             .map(|i| ((i * 7 % 23) as f32 - 11.0) * 0.0625)
             .collect();

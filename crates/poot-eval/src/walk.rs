@@ -15,7 +15,6 @@ use poot_graph_ir::{
     ValidationChannel, ValueId, ValueTable,
 };
 
-use crate::cast_authority::{CastAuthority, ExactI32CastRole, validate_cast_source};
 use crate::exact_bf16::{self, ExactBf16TensorView};
 use crate::exact_dense;
 use crate::exact_value::ExactValue;
@@ -57,7 +56,6 @@ pub struct EvalOptions<'a> {
     budget: EvalBudget,
     observer: Option<&'a mut dyn EvalObserver>,
     keep_environment: bool,
-    cast_authority: Option<&'a mut dyn CastAuthority>,
     /// The composite equation whose decomposition is being evaluated, if any: every charge made inside
     /// it is attributed to that equation, the one the caller's graph names.
     composite: Option<ValueId>,
@@ -72,7 +70,6 @@ impl<'a> EvalOptions<'a> {
             budget,
             observer: None,
             keep_environment: false,
-            cast_authority: None,
             composite: None,
             charged_by_composite: false,
         }
@@ -86,14 +83,6 @@ impl<'a> EvalOptions<'a> {
     /// Keep the full per-value environment on [`Evaluation::environment`] (replaces `eval_all`).
     pub fn keep_environment(mut self) -> Self {
         self.keep_environment = true;
-        self
-    }
-
-    /// Authorize exact-I32 `Cast(I32 -> F32)` equations; deleted with this file by Card
-    /// 558b. Without it, every such cast still passes X3's range check; it just never gets a role, so
-    /// `CastAuthorityError::MissingCastAuthorization` fires the moment the graph has one.
-    pub fn cast_authority(mut self, authority: &'a mut dyn CastAuthority) -> Self {
-        self.cast_authority = Some(authority);
         self
     }
 
@@ -168,18 +157,9 @@ pub fn eval<V: ValidationChannel>(
     let mut env: ValueTable<Option<Value>> = ValueTable::filled(g.values.len(), None);
     bind_inputs(g, inputs, &mut env)?;
 
-    let producers = producers(g);
     let mut decompositions = Decompositions::default();
     for (idx, eqn) in g.eqns.iter().enumerate() {
-        let value = evaluate_equation(
-            g,
-            eqn,
-            &env,
-            &producers,
-            idx,
-            &mut opts,
-            &mut decompositions,
-        )?;
+        let value = evaluate_equation(g, eqn, &env, idx, &mut opts, &mut decompositions)?;
         let value = store_as_declared(value, g.aval(eqn.out).dtype)?;
         check_published(g, eqn, &value)?;
         if let Some(observer) = opts.observer.as_deref_mut() {
@@ -211,15 +191,6 @@ pub fn eval<V: ValidationChannel>(
         state,
         environment,
     })
-}
-
-/// The index of the equation that produces each value, if any.
-fn producers<V: ValidationChannel>(g: &Graph<V>) -> ValueTable<Option<usize>> {
-    let mut producers: ValueTable<Option<usize>> = ValueTable::filled(g.values.len(), None);
-    for (index, eqn) in g.eqns.iter().enumerate() {
-        producers[eqn.out] = Some(index);
-    }
-    producers
 }
 
 /// Copy one value out of the completed environment for publication: the one place every output and
@@ -394,11 +365,45 @@ fn preflight_bindings<V: ValidationChannel>(
                 });
             }
         }
+        if let Some(range) = g.meta(id).range() {
+            check_declared_range(id, value, range)?;
+        }
     }
     // Card 396: a BF16/F32 owner view may feed only a Spec 376 BF16 equation (via `classify`), else it
     // is a refused `GraphConsumer`; every owner view not consumed by one, and not the graph's output,
     // is an unconsumed non-output binding.
     exact_dense::validate_exact_dense_bindings(g, inputs)
+}
+
+/// A slot's declared range is a fact its consumers use ([`poot_graph_ir::value_ranges`]), so the bound
+/// words are checked against it before any equation runs, the bind check a device executor makes
+/// (POOT-726).
+fn check_declared_range(
+    id: ValueId,
+    value: &Value,
+    range: poot_graph_ir::IndexRange,
+) -> Result<(), EvalError> {
+    let words = match value {
+        Value::Owner(ExactValue::I32(view)) => std::borrow::Cow::Borrowed(view.i32_words()),
+        Value::Host(tensor) => crate::operand::host_i32_words(tensor, id)?,
+        other => {
+            return Err(EvalError::Input {
+                value: id,
+                expected: TensorType::new(Vec::new(), DType::I32),
+                got: other.carrier_name(),
+            });
+        }
+    };
+    match words.iter().position(|&word| !range.contains(word)) {
+        Some(index) => Err(crate::SlotRangeFault {
+            value: id,
+            index,
+            word: words[index],
+            range,
+        }
+        .into()),
+        None => Ok(()),
+    }
 }
 
 /// Bind every graph input into `env`, exactly as bound: [`preflight_bindings`] has already checked
@@ -434,7 +439,6 @@ fn evaluate_equation<V: ValidationChannel>(
     g: &Graph<V>,
     eqn: &Eqn,
     env: &ValueTable<Option<Value>>,
-    producers: &ValueTable<Option<usize>>,
     idx: usize,
     opts: &mut EvalOptions<'_>,
     decompositions: &mut Decompositions,
@@ -487,7 +491,7 @@ fn evaluate_equation<V: ValidationChannel>(
                 ids, owner, descriptor,
             )?))
         }
-        OpKind::Cast { to } => evaluate_cast(g, eqn, to, env, producers, idx, opts),
+        OpKind::Cast { to } => evaluate_cast(g, eqn, to, env, idx, opts),
         OpKind::Gather { axis } => evaluate_gather(g, eqn, axis, env, idx, opts),
         _ => {
             if let Some(equation) = resolve::classify(g, eqn) {
@@ -606,7 +610,6 @@ fn run_decomposition(
     for (&placeholder, value) in decomposition.operands.iter().zip(bound) {
         inner_env[placeholder] = Some(value);
     }
-    let inner_producers = producers(inner);
     for inner_eqn in &inner.eqns {
         let declared = inner.aval(inner_eqn.out);
         // Every dense equation computes into a 4-byte-per-element F32 or I32 buffer before the
@@ -620,15 +623,7 @@ fn run_decomposition(
             elements.saturating_mul(4),
         )?;
         opts.charged_by_composite = true;
-        let value = evaluate_equation(
-            inner,
-            inner_eqn,
-            &inner_env,
-            &inner_producers,
-            idx,
-            opts,
-            decompositions,
-        );
+        let value = evaluate_equation(inner, inner_eqn, &inner_env, idx, opts, decompositions);
         opts.charged_by_composite = false;
         let value = value?;
         let value = store_as_declared(value, declared.dtype)?;
@@ -739,7 +734,7 @@ fn attributed_to(composite: &Eqn, error: EvalError) -> EvalError {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Cast (X3, X9, X7/cast authority)
+// Cast (X3, X9)
 // ---------------------------------------------------------------------------------------------
 
 fn evaluate_cast<V: ValidationChannel>(
@@ -747,7 +742,6 @@ fn evaluate_cast<V: ValidationChannel>(
     eqn: &Eqn,
     to: DType,
     env: &ValueTable<Option<Value>>,
-    producers: &ValueTable<Option<usize>>,
     idx: usize,
     opts: &mut EvalOptions<'_>,
 ) -> Result<Value, EvalError> {
@@ -808,42 +802,7 @@ fn evaluate_cast<V: ValidationChannel>(
         }
         (DType::I32, DType::F32) => {
             let (words, _) = i32_words(eqn, 0, env)?;
-            let role = match opts.cast_authority.as_deref_mut() {
-                Some(authority) => {
-                    let role = authority.role(eqn.out).ok_or(
-                        crate::cast_authority::CastAuthorityError::MissingCastAuthorization {
-                            cast: eqn.out,
-                        },
-                    )?;
-                    validate_cast_source(g, producers, eqn.out, input_id, role)?;
-                    if words.len() > role.selected_element_ceiling() {
-                        return Err(
-                            crate::cast_authority::CastAuthorityError::SelectedElementLimit {
-                                cast: eqn.out,
-                                actual: words.len(),
-                                limit: role.selected_element_ceiling(),
-                            }
-                            .into(),
-                        );
-                    }
-                    Some(role)
-                }
-                None => None,
-            };
             check_exact_range(&words)?;
-            if let Some(ExactI32CastRole::HostCheckedSelector(bounds)) = role {
-                for (index, &value) in words.iter().enumerate() {
-                    if value < 0 || value as usize >= bounds.expert_count {
-                        return Err(crate::cast_authority::CastAuthorityError::ExpertIdRange {
-                            cast: eqn.out,
-                            index,
-                            value,
-                            experts: bounds.expert_count,
-                        }
-                        .into());
-                    }
-                }
-            }
             opts.charge(eqn.out, idx, DType::F32, words.len(), words.len() * 4)?;
             let data = crate::operand::initialized_arc_slice(words.len(), |i| words[i] as f32);
             Ok(Value::Host(HostTensor::f32_arc(out_shape.clone(), data)))
@@ -972,7 +931,7 @@ fn evaluate_cast<V: ValidationChannel>(
 }
 
 // ---------------------------------------------------------------------------------------------
-// Gather: data-carrier-aware (dense f32 index; exact-I32 index over I32/dense/owner data; E4M3FN)
+// Gather: data-carrier-aware (I32 index over I32/dense/owner data; E4M3FN)
 // ---------------------------------------------------------------------------------------------
 
 fn evaluate_gather<V: ValidationChannel>(
@@ -998,32 +957,11 @@ fn evaluate_gather<V: ValidationChannel>(
     }
     let index_shape = g.aval(index_id).shape.clone();
     let out_shape = g.aval(eqn.out).shape.clone();
-    // Read the index lazily, straight from whichever lane it is bound in - no intermediate
-    // `Vec<IndexValue>` the size of `index` (card 554c allocation bound).
-    let index_words = if g.aval(index_id).dtype == DType::I32 {
-        Some(value_i32_words(index_id, env)?.0)
-    } else {
-        None
-    };
-    let index_data = if index_words.is_none() {
-        Some(host_tensor(eqn, 1, env)?.to_f32()?)
-    } else {
-        None
-    };
-    let (index_len, index_at_pos): (
-        usize,
-        Box<dyn Fn(usize) -> ops::index_rule::IndexValue + '_>,
-    ) = match (&index_words, &index_data) {
-        (Some(words), _) => (
-            words.len(),
-            Box::new(|p: usize| ops::index_rule::IndexValue::I32(words[p])),
-        ),
-        (None, Some(data)) => (
-            data.len(),
-            Box::new(|p: usize| ops::index_rule::IndexValue::F32(data[p])),
-        ),
-        (None, None) => unreachable!("exactly one of index_words/index_data is populated"),
-    };
+    // Read the index lazily, straight from its I32 words - no intermediate `Vec<IndexValue>` the size of
+    // `index` (card 554c allocation bound).
+    let (index_words, _) = value_i32_words(index_id, env)?;
+    let index_len = index_words.len();
+    let index_at_pos = |p: usize| ops::index_rule::IndexValue::I32(index_words[p]);
     match env_value(env, data_id)? {
         Value::Host(table) => Ok(Value::Host(ops::gather::gather_host(
             table,
@@ -1194,14 +1132,12 @@ fn evaluate_e4m3<V: ValidationChannel>(
                     IrOperand::Value(update),
                     IrOperand::Value(index_id),
                 ] => {
-                    let index_tensor = host_tensor(eqn, 2, env)?;
-                    let Some(&runtime_index) = index_tensor.as_f32().and_then(|data| data.first())
-                    else {
+                    let (words, _) = value_i32_words(*index_id, env)?;
+                    let Some(&runtime_index) = words.first() else {
                         return Err(EvalError::Unsupported {
                             eqn: eqn.out,
                             op: "dynamic_update_slice",
-                            detail: "the runtime index needs a dense f32 payload, checked before \
-                                     execution"
+                            detail: "the runtime index needs an I32 word, checked before execution"
                                 .into(),
                         });
                     };
@@ -1212,16 +1148,14 @@ fn evaluate_e4m3<V: ValidationChannel>(
                         runtime_index,
                         eqn.out,
                     )?;
-                    let _ = index_id;
                     (*operand, *update, index)
                 }
                 _ => {
                     return Err(EvalError::Unsupported {
                         eqn: eqn.out,
                         op: "dynamic_update_slice",
-                        detail:
-                            "expected a nonnegative I32 literal or runtime dense-f32 scalar index"
-                                .into(),
+                        detail: "expected a nonnegative I32 literal or runtime I32 scalar index"
+                            .into(),
                     });
                 }
             };
@@ -1449,12 +1383,11 @@ fn evaluate_dense<V: ValidationChannel>(
             let index_t = get(&eqn.inputs[2])?;
             let index_value = match index_t.data() {
                 HostData::I32(words) => ops::index_rule::IndexValue::I32(words[0]),
-                HostData::F32(data) => ops::index_rule::IndexValue::F32(data[0]),
                 _ => {
                     return Err(EvalError::Unsupported {
                         eqn: eqn.out,
                         op: "dynamic_update_slice",
-                        detail: format!("the runtime index is F32 or I32, got {}", index_t.dtype()),
+                        detail: format!("the runtime index is I32, got {}", index_t.dtype()),
                     });
                 }
             };

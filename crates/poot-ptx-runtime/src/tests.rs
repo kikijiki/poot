@@ -1455,7 +1455,7 @@ fn no_contract_nvptx_kernel(marked: bool) -> poot_runtime_common::CompiledKernel
         .unwrap_or_else(|e| panic!("compile no_contract_{tag}: {e}"));
     let bytes =
         std::fs::read(&out).unwrap_or_else(|e| panic!("read compiled no_contract_{tag}: {e}"));
-    poot_codegen::kernel_handle(&body, poot_codegen::Target::Nvptx, bytes)
+    poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::Nvptx, bytes)
 }
 
 /// SC-001 (dquant.md section 7 R1): the marked packed-dequant-style `a*b - c*d` kernel

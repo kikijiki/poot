@@ -31,7 +31,7 @@ pub(super) fn plan(
             backend,
             Some(vec![*cols as u32]),
             [out_numel as u32, 1, 1],
-        ),
+        )?,
         OpKind::SampleToken { rule } => {
             // out_shape is [.., 2]; rows is every leading-axis element flattened, vocab the logits'
             // last-axis extent (not out_shape's - the output's own last axis is always 2).
@@ -50,7 +50,7 @@ pub(super) fn plan(
                 backend,
                 Some(vec![vocab as u32]),
                 [(rows * 64) as u32, 1, 1],
-            )
+            )?
         }
         OpKind::Iota { .. } => {
             unreachable!("plan_eqn refuses an unfolded Iota before dispatching to a family")

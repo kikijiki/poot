@@ -165,14 +165,6 @@ impl BufferStorage {
     pub const fn i32() -> Self {
         Self::dense(ElementKind::I32, LogicalDType::I32)
     }
-    /// A declared-I32 value bound as its F32 bit-pattern mirror (card 621): a `Slot::SlotMap` index (or any other I32-declared value) feeding a
-    /// `ScatterUpdate`/`DynamicUpdateSlice` index operand, whose kernel body reads `Slice<f32>` and
-    /// casts to i32 in-kernel (spec 045) on every backend, independent of device caps. The mirror image
-    /// of [`Self::bf16_packed`]: there the physical element (I32) differs from the logical dtype
-    /// (Bf16); here the physical element (F32) differs from the logical dtype (I32).
-    pub const fn i32_f32_mirror() -> Self {
-        Self::dense(ElementKind::F32, LogicalDType::I32)
-    }
     pub const fn bf16() -> Self {
         Self::dense(ElementKind::Bf16, LogicalDType::Bf16)
     }
@@ -302,24 +294,5 @@ mod tests {
             BufferStorage::dense(ElementKind::RawBytes, LogicalDType::E4M3FN).device_elems(&[4]),
             None
         );
-    }
-
-    /// Card 621: the I32-F32-mirror record shares its element kind with a plain dense F32 buffer (both
-    /// physically F32 words) but keeps logical dtype I32 - the inverse pairing from
-    /// [`bf16_packed_shares_element_kind_with_dense_i32`], and distinct from both `f32()` (same
-    /// element, different dtype) and `i32()` (same dtype, different element).
-    #[test]
-    fn i32_f32_mirror_shares_element_kind_with_dense_f32() {
-        let mirror = BufferStorage::i32_f32_mirror();
-        let f32_dense = BufferStorage::f32();
-        let i32_dense = BufferStorage::i32();
-        assert_eq!(mirror.element(), f32_dense.element());
-        assert_ne!(mirror.dtype(), f32_dense.dtype());
-        assert_ne!(mirror, f32_dense);
-        assert_eq!(mirror.dtype(), i32_dense.dtype());
-        assert_ne!(mirror.element(), i32_dense.element());
-        assert_ne!(mirror, i32_dense);
-        assert_eq!(mirror.layout(), StorageLayout::Dense);
-        assert!(!mirror.is_packed());
     }
 }

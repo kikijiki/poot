@@ -203,7 +203,7 @@ fn kernel_attribute_is_discovered_by_pootc() {
     let kir_json =
         std::fs::read_to_string(out_dir.join("add.kir.json")).expect("add.kir.json emitted");
     let body: Body = serde_json::from_str(&kir_json).expect("add.kir.json parses");
-    let kernel = poot_codegen::kernel_handle(&body, poot_codegen::Target::SpirvVulkan, spv);
+    let kernel = poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::SpirvVulkan, spv);
 
     let _gpu = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let ctx = match Context::new() {

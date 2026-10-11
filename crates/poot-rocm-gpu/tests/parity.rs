@@ -262,8 +262,8 @@ fn bf16_const_cast_is_bit_exact_on_rocm() {
 /// the exact lane. Mutations: write the row at offset 0 instead of `row * bytes` in `Engine::reset_state`
 /// (the rows after `Row(2)` continue from slot 2's old state); let `Row` zero every state (the counter
 /// resets); drop the fixture's own `b.scatter_update` for the I32 pool (`state_row.rs`; the pool never
-/// changes); pin the I32 values to the F32 mirror lane (`required` always false in
-/// `ExactI32StorageAnalysis::new`; `2^24 + 1` reads back as `2^24`). `Step::carry_recurrent`'s I32 path is
+/// changes); type the I32 pool through `Ty::F32` in `fty_ty` (`2^24 + 1` reads back as
+/// `2^24`). `Step::carry_recurrent`'s I32 path is
 /// guarded by `served_qwen4exp_*`, not by this row.
 #[test]
 fn state_pool_rows_reset_independently_on_rocm() {

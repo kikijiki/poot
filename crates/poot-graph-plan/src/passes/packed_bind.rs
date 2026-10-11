@@ -547,7 +547,10 @@ mod tests {
     #[test]
     fn a_packed_embedding_binds_to_the_claimable_row_gather() {
         let b = Builder::new();
-        let ids = b.slot(poot_graph_ir::Slot::Token, TensorType::f32(vec![3]));
+        let ids = b.slot(
+            poot_graph_ir::Slot::Token,
+            TensorType::new(vec![3], poot_tensor::DType::I32),
+        );
         let table = b.constant("embed.weight", TensorType::f32(vec![16, 64]));
         let rows = b.gather(table, 0, ids);
         let g = b.finish(rows);
@@ -583,7 +586,7 @@ mod tests {
         for experts in [1usize, 2] {
             let b = Builder::new();
             let x = b.constant("x", TensorType::f32(vec![3, 64]));
-            let sel = b.constant("sel", TensorType::f32(vec![3]));
+            let sel = b.constant("sel", TensorType::new(vec![3], DType::I32));
             let w = b.constant("experts.weight", TensorType::f32(vec![experts, 8, 64]));
             let y = b.indexed_matmul(x, b.transpose(w, vec![0, 2, 1]), sel);
             let g = b.finish(y);
@@ -661,7 +664,7 @@ mod tests {
         let build = |f: &dyn Fn(&Builder, Traced, Traced, Traced) -> Traced| {
             let b = Builder::new();
             let x = b.constant("x", TensorType::f32(vec![3, 64]));
-            let sel = b.constant("sel", TensorType::f32(vec![3]));
+            let sel = b.constant("sel", TensorType::new(vec![3], DType::I32));
             let w = b.constant("experts.weight", TensorType::f32(vec![2, 64, 64]));
             let y = f(&b, x, sel, w);
             b.finish(y)

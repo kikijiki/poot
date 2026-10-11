@@ -20,7 +20,7 @@ fn scatter_axis0_inverts_a_permutation() {
     // inverse permutation, the argtop-k index inversion sparse MoE needs.
     let b = Builder::new();
     let src = b.constant("src", TensorType::f32(vec![3, 2]));
-    let idx = b.constant("idx", TensorType::f32(vec![3]));
+    let idx = b.constant("idx", TensorType::new(vec![3], DType::I32));
     let s = b.scatter(src, idx);
     let (si, ii) = (src.id(), idx.id());
     let g = b.finish(s);
@@ -34,10 +34,7 @@ fn scatter_axis0_inverts_a_permutation() {
         )),
     );
     // index = [2, 0, 1]: row 0 -> slot 2, row 1 -> slot 0, row 2 -> slot 1.
-    inputs.insert(
-        ii,
-        Value::from(HostTensor::f32(vec![3], vec![2.0, 0.0, 1.0])),
-    );
+    inputs.insert(ii, Value::from(HostTensor::i32(vec![3], vec![2, 0, 1])));
     let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
         .unwrap()
         .output
@@ -54,7 +51,7 @@ fn scatter_axis0_inverts_a_permutation() {
     // scalar-row case: scatter iota [0,1,2,3] by a reverse permutation -> reversed (its own inverse here).
     let b2 = Builder::new();
     let src2 = b2.constant("s", TensorType::f32(vec![4]));
-    let idx2 = b2.constant("i", TensorType::f32(vec![4]));
+    let idx2 = b2.constant("i", TensorType::new(vec![4], DType::I32));
     let sc = b2.scatter(src2, idx2);
     let (s2, i2) = (src2.id(), idx2.id());
     let g2 = b2.finish(sc);
@@ -63,10 +60,7 @@ fn scatter_axis0_inverts_a_permutation() {
         s2,
         Value::from(HostTensor::f32(vec![4], vec![0.0, 1.0, 2.0, 3.0])),
     );
-    in2.insert(
-        i2,
-        Value::from(HostTensor::f32(vec![4], vec![3.0, 2.0, 1.0, 0.0])),
-    );
+    in2.insert(i2, Value::from(HostTensor::i32(vec![4], vec![3, 2, 1, 0])));
     let got2 = eval(&g2, &in2, EvalOptions::new(EvalBudget::UNBOUNDED))
         .unwrap()
         .output
@@ -83,19 +77,18 @@ fn scatter_refuses_an_index_outside_the_rows() {
     use crate::ops::index_rule::IndexFaultKind;
 
     for (index, position, kind) in [
-        (vec![2.0, 3.0, 0.0], 1, IndexFaultKind::OutOfRange),
-        (vec![2.0, 0.0, -1.0], 2, IndexFaultKind::Negative),
-        (vec![f32::NAN, 0.0, 1.0], 0, IndexFaultKind::NotFinite),
+        (vec![2, 3, 0], 1, IndexFaultKind::OutOfRange),
+        (vec![2, 0, -1], 2, IndexFaultKind::Negative),
     ] {
         let b = Builder::new();
         let src = b.constant("src", TensorType::f32(vec![3, 2]));
-        let idx = b.constant("idx", TensorType::f32(vec![3]));
+        let idx = b.constant("idx", TensorType::new(vec![3], DType::I32));
         let scattered = b.scatter(src, idx);
         let (si, ii) = (src.id(), idx.id());
         let g = b.finish(scattered);
         let mut inputs = HashMap::new();
         inputs.insert(si, Value::from(HostTensor::f32(vec![3, 2], vec![0.0; 6])));
-        inputs.insert(ii, Value::from(HostTensor::f32(vec![3], index.clone())));
+        inputs.insert(ii, Value::from(HostTensor::i32(vec![3], index.clone())));
         match eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).map(|r| {
             r.output
                 .into_host()
@@ -160,8 +153,8 @@ fn arg_top_k_matches_per_row_scatter_iota_rank_slice() {
     );
     assert_eq!(
         ba.aval(out).dtype,
-        DType::F32,
-        "ArgTopK ids are F32 (fork c)"
+        DType::I32,
+        "ArgTopK ids are I32, the one index dtype"
     );
     let rki = rk.id();
     let ga = ba.finish(out);
@@ -181,16 +174,22 @@ fn arg_top_k_matches_per_row_scatter_iota_rank_slice() {
     // Reference: per row, `scatter(iota, rank)` (the same `scatter_axis0` the `Scatter` op runs), then the `[0..k]` slice on
     // the last axis (FR-002). Index-exact, no tolerance.
     for row in 0..l {
-        let rank_row = HostTensor::f32(
+        let rank_row = HostTensor::i32(
             vec![e],
-            rank_t.as_f32().unwrap()[row * e..(row + 1) * e].to_vec(),
+            rank_t.as_f32().unwrap()[row * e..(row + 1) * e]
+                .iter()
+                .map(|&rank| rank as i32)
+                .collect(),
         );
         let iota_row = HostTensor::f32(vec![e], (0..e).map(|j| j as f32).collect());
         let inverted = scatter_axis0(&iota_row, &rank_row, ValueId::new(0)).unwrap();
-        let expected = &inverted.as_f32().unwrap()[0..k];
-        let actual = &got.as_f32().unwrap()[row * k..(row + 1) * k];
+        let expected: Vec<i32> = inverted.as_f32().unwrap()[0..k]
+            .iter()
+            .map(|&id| id as i32)
+            .collect();
+        let actual = &got.as_i32().unwrap()[row * k..(row + 1) * k];
         assert_eq!(
-            actual, expected,
+            actual, &expected,
             "row {row}: ArgTopK must equal scatter(iota,rank)[0..k] exactly"
         );
     }
@@ -210,7 +209,7 @@ fn arg_top_k_matches_per_row_scatter_iota_rank_slice() {
         "the highest-logit expert has rank 0"
     );
     assert_eq!(
-        got.as_f32().unwrap()[0] as usize,
+        got.as_i32().unwrap()[0] as usize,
         argmax,
         "ArgTopK[.,0] is the best (rank-0, highest-logit) expert"
     );
@@ -821,7 +820,7 @@ fn deterministic_moe_routes_match_stable_sort_table() {
         let xm = b.constant("x", TensorType::f32(vec![1, 1]));
         let logits = b.constant("scores", TensorType::f32(vec![1, 5]));
         let (_, ids, weights) = poot_graph_ir::ops::moe_grouped_prep(&b, xm, logits, 5, case.k);
-        let route = b.concat(0, &[ids, weights]);
+        let route = b.concat(0, &[b.cast(ids, DType::F32), weights]);
         let (xm_id, logits_id) = (xm.id(), logits.id());
         let graph = b.finish(route);
         let inputs: HashMap<_, _> = graph

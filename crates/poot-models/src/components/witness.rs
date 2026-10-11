@@ -7,6 +7,7 @@
 //! parsing a name.
 
 use poot_graph_ir::{BinOp, Builder, RedOp, Scalar, Traced, UnOp, ValidationId};
+use poot_tensor::DType;
 
 use super::standard::Step;
 
@@ -111,17 +112,17 @@ pub fn unusable_sum_count(b: &Builder, sum: Traced) -> Traced {
     sum_to_scalar(b, logical_not(b, usable))
 }
 
-/// The number of selected ids outside `0..experts`. Ids stay F32 out of `ArgTopK`, so this is an
-/// ordinary F32 witness, not an in-graph clamp.
+/// The number of selected ids outside `0..experts`. The ids are I32 out of `ArgTopK`; one unsigned compare
+/// (`GeU`) is an exact I32 `0`/`1` indicator of an id at or past `experts` or negative, widened to F32, so this
+/// is an ordinary F32 witness, not an in-graph clamp.
 pub fn out_of_range_count(b: &Builder, ids: Traced, experts: usize) -> Traced {
-    let high = b.binary_scalar(BinOp::Ge, ids, Scalar::F32(experts as f32));
-    let low = logical_not(b, b.binary_scalar(BinOp::Ge, ids, Scalar::F32(0.0)));
-    sum_to_scalar(b, b.binary(BinOp::Add, high, low))
+    let outside = b.binary_scalar(BinOp::GeU, ids, Scalar::I32(experts as i32));
+    sum_to_scalar(b, b.cast(outside, DType::F32))
 }
 
 #[cfg(test)]
 mod tests {
-    use poot_graph_ir::TensorType;
+    use poot_graph_ir::{Slot, TensorType};
 
     use super::*;
     use crate::components::standard::oracle::Fx;
@@ -163,8 +164,17 @@ mod tests {
         let unusable = |x: &[f32]| eval(unusable_sum_count, x);
         assert_eq!(unusable(&[0.5, 1.0, 4.0]), 0.0);
         assert_eq!(unusable(&[0.0, -1.0, f32::NAN, f32::INFINITY, 2.0]), 4.0);
-        let out_of_range = |x: &[f32]| eval(|b, ids| out_of_range_count(b, ids, 4), x);
-        assert_eq!(out_of_range(&[0.0, 3.0, 2.0]), 0.0);
-        assert_eq!(out_of_range(&[4.0, -1.0, 3.0, 9.0]), 3.0);
+        // The ids are I32, as `ArgTopK` produces them: a token slot is the oracle harness's I32 input.
+        let out_of_range = |ids: &[i32]| {
+            let fx = Fx::new(1);
+            let b = Builder::new();
+            let slot = b.slot(Slot::Token, TensorType::new(vec![ids.len()], DType::I32));
+            let w = out_of_range_count(&b, slot, 4);
+            let out = fx.eval(&b.finish(w), &[], &[(Slot::Token, ids)], &[]).0;
+            assert_eq!(out.len(), 1, "a witness is one lane");
+            out[0]
+        };
+        assert_eq!(out_of_range(&[0, 3, 2]), 0.0);
+        assert_eq!(out_of_range(&[4, -1, 3, 9]), 3.0);
     }
 }

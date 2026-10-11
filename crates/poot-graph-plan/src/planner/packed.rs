@@ -172,7 +172,7 @@ pub(super) fn plan(
             backend,
             None,
             [out_numel as u32, 1, 1],
-        ),
+        )?,
         // Card 449 D1: the same row gather over a packed-E4M3FN table (Qwen4Exp's sharded PLE
         // embedding). Same u32 transport, same row selection, same in-register widening, and the
         // same 3-param a single plain dispatch with no metadata buffer; only the byte-to-f32 decode differs
@@ -188,7 +188,7 @@ pub(super) fn plan(
             backend,
             None,
             [out_numel as u32, 1, 1],
-        ),
+        )?,
         // The BF16 and E4M3FN rows lower on every backend; an admitted source dtype with no
         // packed-lane kernel refuses by name rather than falling back to a gather kernel that would
         // read the table at the wrong element width.
@@ -210,7 +210,7 @@ pub(super) fn plan(
                 backend,
                 Some(vec![l as u32]),
                 [out_numel as u32, 1, 1],
-            )
+            )?
         }
         OpKind::UnpackI8 { len } => {
             // i32 words [.., ceil(len/4)] -> f32 codes [.., len] (spec 048), fixed dtypes. card 044:
@@ -221,7 +221,7 @@ pub(super) fn plan(
                 backend,
                 Some(vec![*len as u32]),
                 [out_numel as u32, 1, 1],
-            )
+            )?
         }
         OpKind::Iota { .. } => {
             unreachable!("plan_eqn refuses an unfolded Iota before dispatching to a family")

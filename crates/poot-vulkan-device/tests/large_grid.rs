@@ -72,7 +72,7 @@ fn flash_prefill_over_65535_workgroups_is_one_wide_dispatch_and_matches_the_orac
         .planned()
         .filter_map(|(_, plan)| {
             plan.single().map(|dispatch| {
-                dispatch.launch.grid[0].div_ceil(dispatch.body.workgroup_size[0].max(1))
+                dispatch.launch().grid[0].div_ceil(dispatch.body().workgroup_size[0].max(1))
             })
         })
         .max()

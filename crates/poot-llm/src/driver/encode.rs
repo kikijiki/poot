@@ -141,6 +141,7 @@ impl Driver {
                 capacity: tokens,
                 kv: KvLayout::Contiguous,
                 logits: LogitRows::All,
+                hidden: None,
             },
             head: Head::Logits,
             adapters: None,

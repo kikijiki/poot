@@ -3,13 +3,14 @@ use super::*;
 /// Batched argtop-k index extraction (spec 136 P2, naive scalar body, FR-003): `rank [rows,e] -> out
 /// [rows,k]`, `out[l,r]` = the index `i` in `0..e` with `rank[l,i] == r`. One thread per output element
 /// `idx = l*k + r`: `l = idx/k`, `r = idx%k`. Scans the row's `e` entries with a fixed serial loop and no
-/// early exit. `rank` and `out` are always F32 (no `dt` parameter). See bb4 for the accumulation rule.
+/// early exit. `rank` is F32 and `out` holds `I32` expert ids (no `dt` parameter). See bb4 for the
+/// accumulation rule.
 pub fn arg_top_k_dt(name: &str, e: usize, k: usize) -> Body {
     // _1 rank [rows*e], _2 out [rows*k]
     let mut al = Alloc::new(vec![
         ld(Ty::Unit, false),
-        ld(slice_f32(false), false), // rank (f32)
-        ld(slice_f32(true), true),   // out (f32)
+        ld(slice_f32(false), false),          // rank (f32)
+        ld(slice_dtype(Ty::I32, true), true), // out (i32 expert ids)
     ]);
     let (rank, out) = (local(1), local(2));
     let i = al.add(Ty::Usize, false); // flat output index l*k + r
@@ -19,17 +20,17 @@ pub fn arg_top_k_dt(name: &str, e: usize, k: usize) -> Body {
     let r = al.add(Ty::Usize, false);
     let lbase = al.add(Ty::Usize, false); // l * e
     let rf = al.add(Ty::F32, false); // r cast to f32 (the rank value we are looking for)
-    let acc = al.add(Ty::F32, true); // running sum_i i * eq(rank[l,i], r)
+    let acc = al.add(Ty::I32, true); // running sum_i i * eq(rank[l,i], r)
     let ee = al.add(Ty::Usize, true); // loop var over the expert axis
     let ee_lt = al.add(Ty::Bool, false);
     let roff = al.add(Ty::Usize, false); // lbase + ee
     let rv = al.add(Ty::F32, false); // rank[l, ee]
     let eqb = al.add(Ty::Bool, false); // rv == rf
-    let eqf = al.add(Ty::F32, false); // cast eqb to f32
-    let eif = al.add(Ty::F32, false); // ee cast to f32
-    let diff = al.add(Ty::F32, false); // eif - acc (last-wins select delta)
-    let contrib = al.add(Ty::F32, false); // eqf * diff (0 when rank!=r, else eif-acc)
-    let acc_new = al.add(Ty::F32, false);
+    let eqf = al.add(Ty::I32, false); // cast eqb to i32
+    let eif = al.add(Ty::I32, false); // ee cast to i32
+    let diff = al.add(Ty::I32, false); // eif - acc (last-wins select delta)
+    let contrib = al.add(Ty::I32, false); // eqf * diff (0 when rank!=r, else eif-acc)
+    let acc_new = al.add(Ty::I32, false);
     let ee_new = al.add(Ty::Usize, false);
     let cu = |x: usize| Operand::Const(Constant::Usize(x as u64));
 
@@ -80,7 +81,7 @@ pub fn arg_top_k_dt(name: &str, e: usize, k: usize) -> Body {
             ),
             Statement::Assign(
                 Place::local(acc),
-                Rvalue::Use(Operand::Const(Constant::F32(0.0))),
+                Rvalue::Use(Operand::Const(Constant::I32(0))),
             ),
             Statement::Assign(Place::local(ee), Rvalue::Use(cu(0))),
         ],
@@ -95,7 +96,7 @@ pub fn arg_top_k_dt(name: &str, e: usize, k: usize) -> Body {
         )],
         terminator: guard(ee_lt, 5, 4),
     };
-    // bb4: roff = lbase + ee; rv = rank[roff]; eqb = (rv == rf); eqf = (f32) eqb; eif = (f32) ee;
+    // bb4: roff = lbase + ee; rv = rank[roff]; eqb = (rv == rf); eqf = (i32) eqb; eif = (i32) ee;
     //      LAST-WINS SELECT (matches the eval oracle `arg_top_k`, a scatter `out[rank[i]]=i`): on a
     //      match keep the largest such ee, so acc = eqf ? eif : acc = acc + eqf*(eif-acc). A plain sum
     //      (`acc += eqf*eif`) adds every tied id, giving out-of-range expert ids that index the dequant-matmul
@@ -119,14 +120,14 @@ pub fn arg_top_k_dt(name: &str, e: usize, k: usize) -> Body {
             Statement::Assign(
                 Place::local(eqf),
                 Rvalue::Cast {
-                    to: Ty::F32,
+                    to: Ty::I32,
                     operand: copy(Place::local(eqb)),
                 },
             ),
             Statement::Assign(
                 Place::local(eif),
                 Rvalue::Cast {
-                    to: Ty::F32,
+                    to: Ty::I32,
                     operand: copy(Place::local(ee)),
                 },
             ),

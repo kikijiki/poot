@@ -15,7 +15,7 @@ fn spv_for(body: &poot_kernel_ir::Body, name: &str) -> CompiledKernel {
     let out = poot_codegen::artifact_path(&dir, name, Target::SpirvVulkan);
     compile(body, Target::SpirvVulkan, &out).expect("compile spirv");
     let bytes = std::fs::read(&out).unwrap();
-    kernel_handle(body, Target::SpirvVulkan, bytes)
+    kernel_handle(body, poot_codegen::GpuTarget::SpirvVulkan, bytes)
 }
 
 #[test]

@@ -215,7 +215,12 @@ impl Model for Recurrentish {
         let b = Builder::new();
         let step = Step::new(&b, shape);
         let (n, rows) = (shape.tokens.get(), shape.rows.get());
-        let tokens = b.cast(step.tokens(), DType::F32);
+        let tokens = b.cast(
+            b.guard_index_bounds(step.tokens(), VOCAB)
+                .expect("the step's ids are a rank-2 I32 tensor")
+                .guarded,
+            DType::F32,
+        );
         let state_dims = vec![rows, 4];
         let state = b.state_input(
             "toy.state",
@@ -326,6 +331,7 @@ impl Oracle {
             capacity: nz(CAPACITY),
             kv: KvLayout::Contiguous,
             logits: LogitRows::Last,
+            hidden: None,
         };
         let graph = self.model.trace(Phase::Prefill, shape).unwrap();
         let state: Vec<HostTensor> = graph
@@ -522,6 +528,7 @@ fn options() -> DriverOptions {
         },
         charge: program_retention,
         draft: DraftPolicy::Off,
+        hidden_window: None,
     }
 }
 

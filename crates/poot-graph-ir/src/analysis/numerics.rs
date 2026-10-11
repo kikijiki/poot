@@ -313,6 +313,14 @@ pub const PASS_DECLARATIONS: &[PassDeclaration] = &[
         property: NumericsProperty::Exact,
         produces: produces_nothing,
     },
+    // `fuse_index_casts` makes the `Cast` of an I32 word a step of the pointwise region that reads or writes
+    // it, wrapping a lone pointwise equation in a one-step region where it has none. The conversion is the
+    // cast kernel's own, so the class is the fused regions it produces.
+    PassDeclaration {
+        pass: "fuse_index_casts",
+        property: NumericsProperty::Reassociating,
+        produces: produces_fused,
+    },
     // `legalize` needs `Target::caps` (card 522); `compile` (poot-graph-plan) runs it as its own pass,
     // between `dce` and `fuse` (card 523a).
     PassDeclaration {

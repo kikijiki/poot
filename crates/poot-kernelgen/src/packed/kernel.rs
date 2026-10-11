@@ -101,8 +101,7 @@ pub(super) fn emit_block_address(
     (block, i_in_block)
 }
 
-/// `out[r, :] = decode(ids[r], :)` for a `[R, K]` output, `ids` an `R`-length row index (`f32`, the
-/// executors' index-param convention: token ids are bound as f32 and cast in-kernel):
+/// `out[r, :] = decode(ids[r], :)` for a `[R, K]` output, `ids` an `R`-length `I32` row index:
 /// [`PackedKernelOp::RowGather`], the axis-0 `Gather` fused directly onto a `PackedDequant` producer
 /// (GGUF token embeddings). Params `(words, ids, metadata, out)`, one thread per output
 /// element; the row comes from `ids[r]`.
@@ -121,7 +120,7 @@ fn row_gather(name: &str, format: WeightFormat) -> Result<Body, KernelGenError> 
     let mut al = Alloc::new(vec![
         ld(Ty::Unit, false),
         ld(slice_dtype(Ty::U32, false), false),
-        ld(slice_f32(false), false),
+        ld(slice_dtype(Ty::I32, false), false),
         ld(slice_dtype(Ty::U32, false), false),
         ld(slice_f32(true), true),
     ]);
@@ -153,7 +152,7 @@ fn row_gather(name: &str, format: WeightFormat) -> Result<Body, KernelGenError> 
     let k = emit_read_meta(&mut emit, metadata, META_K);
     let r = emit.let_(Ty::Usize, Rvalue::BinaryOp(BinOp::Div, copy(i), copy(k)));
     let kk = emit.let_(Ty::Usize, Rvalue::BinaryOp(BinOp::Rem, copy(i), copy(k)));
-    let row_id = emit.let_(Ty::F32, Rvalue::Use(Operand::Copy(elem(ids, r))));
+    let row_id = emit.let_(Ty::I32, Rvalue::Use(Operand::Copy(elem(ids, r))));
     let row = emit.let_(
         Ty::Usize,
         Rvalue::Cast {
@@ -211,7 +210,7 @@ fn contraction_gemv(
     let lead = rows.leading_params();
     let mut params = vec![ld(Ty::Unit, false), ld(slice_f32(false), false)];
     if rows == PackedRows::Indexed {
-        params.push(ld(slice_f32(false), false));
+        params.push(ld(slice_dtype(Ty::I32, false), false));
     }
     params.push(ld(slice_dtype(Ty::U32, false), false));
     if let Some(epilogue) = epilogue {
@@ -328,7 +327,7 @@ fn contraction_gemv_planar(
     let lead = rows.leading_params();
     let mut params = vec![ld(Ty::Unit, false), ld(slice_f32(false), false)];
     if rows == PackedRows::Indexed {
-        params.push(ld(slice_f32(false), false));
+        params.push(ld(slice_dtype(Ty::I32, false), false));
     }
     for _ in 0..n {
         params.push(ld(slice_dtype(Ty::U32, false), false));

@@ -155,7 +155,17 @@ impl Model for Tiny {
             n - 1
         };
         let out = n - first;
-        let token = b.cast(b.slice(step.tokens(), 1, first, n), DType::F32);
+        let token = b.cast(
+            b.slice(
+                b.guard_index_bounds(step.tokens(), VOCAB)
+                    .expect("the step's ids are a rank-2 I32 tensor")
+                    .guarded,
+                1,
+                first,
+                n,
+            ),
+            DType::F32,
+        );
         let pos = b.cast(b.slice(step.pos(), 1, first, n), DType::F32);
         let seed = b.binary(BinOp::Add, token, pos);
         match self.variant {
@@ -803,6 +813,7 @@ fn build_rig(options: RigOptions, script: Script) -> Result<Rig, DriverError> {
             },
             charge: options.charge,
             draft,
+            hidden_window: None,
         },
     )?;
     Ok(Rig { driver, world })

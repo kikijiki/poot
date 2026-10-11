@@ -88,7 +88,7 @@ pub use stage_split::BoundaryDescriptor;
 pub(crate) use stage_split::StageSplit;
 pub use stage_split::StageSplitError;
 pub(crate) use stage_split::{CutSite, StageAssignment, split_stages};
-pub use widen::fuse_widening_casts;
+pub use widen::{fuse_index_casts, fuse_widening_casts};
 
 #[cfg(test)]
 pub(crate) use dtype::transpose_is_noop;
@@ -99,13 +99,13 @@ pub(crate) use dtype::transpose_is_noop;
 /// production path (`compile` is the pipeline, Card 626).
 #[cfg(any(test, feature = "test-support"))]
 pub fn passes_without_target<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
-    fuse_widening_casts(&fuse(&fuse_contraction_epilogues(
+    fuse_index_casts(&fuse_widening_casts(&fuse(&fuse_contraction_epilogues(
         &dce(&flash_attention_capped(
             &rope_fusion(&fold_iota(&cse(&canonicalize(g)))),
             Some(65_535),
         )),
         |_, _| true,
-    )))
+    ))))
 }
 
 #[cfg(test)]

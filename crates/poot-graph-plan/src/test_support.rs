@@ -271,12 +271,9 @@ pub(crate) fn bind_decode(g: &Graph) -> HashMap<ValueId, Value> {
             Storage::Slot(poot_graph_ir::Slot::Token) => HostTensor::i32(shape, vec![5; numel]),
             Storage::Slot(poot_graph_ir::Slot::Pos) => HostTensor::i32(shape, vec![3; numel]),
             // Adapter 1 on the first row, no adapter on the rest.
-            Storage::Slot(poot_graph_ir::Slot::LoraIdx) => HostTensor::f32(
-                shape,
-                (0..numel)
-                    .map(|row| if row == 0 { 1.0 } else { 0.0 })
-                    .collect(),
-            ),
+            Storage::Slot(poot_graph_ir::Slot::LoraIdx) => {
+                HostTensor::i32(shape, (0..numel).map(|row| i32::from(row == 0)).collect())
+            }
             Storage::Slot(poot_graph_ir::Slot::Activation) => {
                 HostTensor::f32(shape, fill(numel, 31).iter().map(|v| v * 0.5).collect())
             }

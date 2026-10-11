@@ -205,10 +205,10 @@ impl FusedRegion {
         })
     }
 
-    /// The output type, threading the input types through the steps. `ins` are the `n_inputs` external input
-    /// types, in order. Mirrors how the un-fused chain would infer.
+    /// The type of every local, threading the input types through the steps: the `n_inputs` external inputs
+    /// first (`ins`, in order), then each step's result. Mirrors how the un-fused chain would infer.
     #[deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
-    pub fn infer(&self, ins: &[TensorType]) -> Result<TensorType, ShapeError> {
+    pub fn local_types(&self, ins: &[TensorType]) -> Result<Vec<TensorType>, ShapeError> {
         if ins.len() != self.n_inputs {
             return Err(ShapeError::Arity {
                 expected: self.n_inputs,
@@ -236,6 +236,14 @@ impl FusedRegion {
             let ty = step.op.kind().infer(&in_tys)?;
             locals.push(ty);
         }
+        Ok(locals)
+    }
+
+    /// The output type: [`Self::local_types`] read at the output local, or at the packed lanes. `ins` are the
+    /// `n_inputs` external input types, in order.
+    #[deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+    pub fn infer(&self, ins: &[TensorType]) -> Result<TensorType, ShapeError> {
+        let locals = self.local_types(ins)?;
         let Some(&first_local) = self.pack.first() else {
             return Ok(local_ty(&locals, self.output)?.clone());
         };
@@ -664,7 +672,7 @@ pub enum OpKind {
     },
     /// Compiler-only replacement for an axis-0 `Gather` of a packed weight's rows (card 642/545a,
     /// quantized GGUF token embeddings): `out[.., :] = decode(ids[..], :)`. Inputs are the
-    /// weight's `descriptor.sources()` I8 carriers, in that order, then the row ids (F32 or I32, any
+    /// weight's `descriptor.sources()` I8 carriers, in that order, then the row ids (I32, any
     /// shape); the output is `ids.shape ++ [K]` F32. Builders do not expose it: the claim pass rewrites
     /// `Gather { axis: 0 }(PackedDequant(..), ids)` into it, so no `[out, K]` table is ever materialized.
     PackedRowGather {
@@ -733,9 +741,8 @@ pub enum OpKind {
     },
     /// Batched argtop-k index extraction (spec 136, grouped-MoE prefill routing): `rank [..,E] -> [..,k]` expert
     /// ids. `out[..,r]` is the index `i` along the last axis with `rank[..,i] == r`, for `r` in `0..k`. One shared
-    /// `[..,E]` stable rank tensor feeds this directly, with no per-row host loop. Output dtype is F32 (required):
-    /// `IndexedMatMul` reads `idx.data[m] as usize` from the f32 lane, and an `I32` tensor's codes live in the
-    /// separate `.ints` lane, which would read back as zeros. Precondition: each last-axis `rank` slice is a
+    /// `[..,E]` stable rank tensor feeds this directly, with no per-row host loop. The ids are `I32`, the one
+    /// index dtype (`IndexedMatMul`, `Gather` and the other index consumers read them as is). Precondition: each last-axis `rank` slice is a
     /// permutation of `0..E`; [`crate::ops::stable_descending_rank`] guarantees that even for tied scores. `k` is a
     /// trace-time constant (static shape, capture-safe). This op inverts rank and has no score-order or tie-break
     /// semantic of its own.
@@ -743,11 +750,11 @@ pub enum OpKind {
         k: usize,
     },
     /// Indexed matmul (card 088, sparse-MoE gather-free GEMM): `out[m,n] = sum_k x[m,k] * W[idx[m],k,n]`. Inputs are
-    /// the activation `x [M,K]`, a stacked weight `W [E,K,N]`, and per-row expert ids `idx [M]` (f32). Each row `m`
+    /// the activation `x [M,K]`, a stacked weight `W [E,K,N]`, and per-row expert ids `idx [M]` (I32). Each row `m`
     /// contracts against its own expert `W[idx[m]]` with no prior copy of the selected experts' weights (that copy
     /// made `moe_sparse` slower than dense). Output `[M,N]`, dtype = x's. One definition (the eager eval gathers
     /// per-row; the kernel reads the selected expert's rows in-kernel through `ContractionSpec::Indexed`). An id
-    /// outside `0..E` or not an integer is a typed oracle error and a NaN output row on every device.
+    /// outside `0..E` is a typed oracle error and a NaN output row on every device.
     IndexedMatMul,
     /// Write `update` (input 1) into a copy of `operand` (input 0) starting at the scalar index `index` (input 2)
     /// along `axis`, leaving the rest unchanged (XLA DynamicUpdateSlice, single axis). The KV-cache slot write:
@@ -905,11 +912,11 @@ fn reject_non_arithmetic(op: &'static str, dtype: DType) -> Result<(), ShapeErro
     }
 }
 
-/// Card 529 (R466-010): reject an index-role operand (`Gather`'s and `Scatter`'s index,
+/// Card 529 (R466-010), POOT-725: reject an index-role operand (`Gather`'s and `Scatter`'s index,
 /// `ScatterUpdate`'s `inv`, `IndexedMatMul`'s and friends' `idx`, `DynamicUpdateSlice`'s runtime index)
-/// outside [`DType::is_index_operand`].
+/// that is not I32. I32 is the only index dtype.
 fn check_index_dtype(op: &'static str, dtype: DType) -> Result<(), ShapeError> {
-    if dtype.is_index_operand() {
+    if dtype == DType::I32 {
         Ok(())
     } else {
         Err(ShapeError::DtypeOp { op, dtype })
@@ -1385,8 +1392,8 @@ impl OpKind {
                 Ok(ins[0].clone())
             }
             OpKind::ArgTopK { k } => {
-                // rank [..,E] -> [..,k]: same leading dims, last axis replaced by k. Output dtype is always F32 (the idx
-                // convention IndexedMatMul reads via its f32 lane).
+                // rank [..,E] -> [..,k]: same leading dims, last axis replaced by k. The ids are I32, the index dtype
+                // `IndexedMatMul` and the other index consumers read.
                 arity(ins, 1)?;
                 let mut shape = ins[0].shape.clone();
                 let extent = last_axis_mut(&mut shape, "ArgTopK", "input")?;
@@ -1397,7 +1404,7 @@ impl OpKind {
                     });
                 }
                 *extent = *k;
-                Ok(TensorType::new(shape, DType::F32))
+                Ok(TensorType::new(shape, DType::I32))
             }
             OpKind::PackI8 => {
                 arity(ins, 1)?;
@@ -1627,12 +1634,7 @@ impl OpKind {
                 }
                 .infer(&ins[..roles])?;
                 let ids = &ins[roles];
-                if !matches!(ids.dtype, DType::F32 | DType::I32) {
-                    return Err(ShapeError::DtypeOp {
-                        op: "PackedRowGather",
-                        dtype: ids.dtype,
-                    });
-                }
+                check_index_dtype("PackedRowGather", ids.dtype)?;
                 let mut shape = ids.shape.clone();
                 shape.push(descriptor.shape()[1]);
                 Ok(TensorType::f32(shape))
@@ -2681,9 +2683,50 @@ mod tests {
         );
     }
 
-    /// Card 529 (R466-010, SC-002): `infer` rejects an index-role operand outside
-    /// [`DType::is_index_operand`] (F32, I32). The baseline (before Card 529) returned `Ok` for `Gather`
-    /// and `IndexedMatMul` with a BF16 index; both are typed errors now.
+    /// POOT-725: I32 is the only index dtype. Every index-role operand refuses an F32 index with the typed
+    /// `DtypeOp` error naming the op, and `ArgTopK` produces I32 ids.
+    ///
+    /// Mutation: admit `F32` in `check_index_dtype`; every row below goes red.
+    #[test]
+    fn every_index_role_operand_refuses_an_f32_index() {
+        let refused = |op: &'static str, result: Result<TensorType, ShapeError>| {
+            assert!(
+                matches!(
+                    result,
+                    Err(ShapeError::DtypeOp { op: got, dtype: DType::F32 }) if got == op
+                ),
+                "{op}: {result:?}"
+            );
+        };
+        refused(
+            "Gather",
+            OpKind::Gather { axis: 0 }.infer(&[f(&[4, 5]), f(&[2])]),
+        );
+        refused(
+            "Scatter",
+            OpKind::Scatter { axis: 0 }.infer(&[f(&[4, 5]), f(&[4])]),
+        );
+        refused(
+            "ScatterUpdate",
+            OpKind::ScatterUpdate.infer(&[f(&[4, 5]), f(&[2, 5]), f(&[4])]),
+        );
+        refused(
+            "IndexedMatMul",
+            OpKind::IndexedMatMul.infer(&[f(&[2, 3]), f(&[4, 3, 5]), f(&[2])]),
+        );
+        refused(
+            "DynamicUpdateSlice",
+            OpKind::DynamicUpdateSlice { axis: 0 }.infer(&[f(&[4, 5]), f(&[2, 5]), f(&[])]),
+        );
+        assert_eq!(
+            OpKind::ArgTopK { k: 2 }.infer(&[f(&[3, 8])]),
+            Ok(TensorType::new(vec![3, 2], DType::I32))
+        );
+    }
+
+    /// Card 529 (R466-010, SC-002): `infer` rejects an index-role operand outside the index dtype. The baseline
+    /// (before Card 529) returned `Ok` for `Gather` and `IndexedMatMul` with a BF16 index; both are typed
+    /// errors now.
     #[test]
     fn gather_and_indexed_matmul_reject_a_bf16_index() {
         let err = OpKind::Gather { axis: 0 }
@@ -3275,7 +3318,7 @@ mod tests {
             rows: ContractionRows::Indexed { experts },
         };
         let x = TensorType::f32(vec![5, 32]);
-        let ids = TensorType::f32(vec![5]);
+        let ids = TensorType::new(vec![5], DType::I32);
         assert_eq!(
             operation.infer(&[x.clone(), ids.clone(), stacked.clone()]),
             Ok(TensorType::f32(vec![5, 3]))
@@ -3298,7 +3341,11 @@ mod tests {
             );
         }
         assert_eq!(
-            operation.infer(&[x.clone(), TensorType::f32(vec![4]), stacked.clone()]),
+            operation.infer(&[
+                x.clone(),
+                TensorType::new(vec![4], DType::I32),
+                stacked.clone()
+            ]),
             Err(ShapeError::OperandDim {
                 op: "PackedContraction",
                 operand: "ids",

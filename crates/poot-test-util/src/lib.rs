@@ -10,6 +10,8 @@ pub mod device_skip;
 pub mod graph_fixtures;
 mod hang_guard;
 #[cfg(feature = "graph-fixtures")]
+pub mod i32_gather;
+#[cfg(feature = "graph-fixtures")]
 pub mod i32_slot_gather;
 #[cfg(feature = "graph-fixtures")]
 pub mod i32_table_gather;

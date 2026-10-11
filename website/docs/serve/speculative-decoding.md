@@ -32,6 +32,8 @@ The driver proposes drafts, then verifies them in one step: the sequence's last 
 
 `commit` keeps the first `kept` tokens of a result, so a stop string, the end-of-sequence token or the token limit inside a multi-token result needs no rollback: the cache positions past the kept tokens hold stale entries that no later step reads.
 
+A model with recurrent state (Qwen3-Next, Nemotron-H) needs a rollback of its own, because a rejected draft token has already been folded into that state. Before the verify step the driver copies the recurrent state of the rows that hold drafts into a shadow set. A row that keeps every draft keeps its state. A row that rejects one restores the copy and replays the sequence's last committed token and the accepted drafts as one chunk, so its state is exactly what decoding those tokens leaves. The verify window is as wide as the row's drafts, since padding would fold into the state. Positional state needs none of this. The shadow set costs one extra copy of the recurrent state per row, and a rejecting round costs one more forward over the kept tokens, so these models gain only where drafts are accepted often enough to pay for it; measure with the policy and prompts you intend to serve. A result of such a row is kept whole or its sequence ends, since the state already holds the kept tokens: a shorter commit followed by another step on the sequence is refused with a typed `RecurrentStateAhead` error.
+
 ## When a row does not speculate
 
 A decode row under a draft policy decodes one token, with the same output it would have without the policy, in three cases. The row says which in `RowResult::speculation`:
@@ -50,9 +52,10 @@ The `speculation_bench` example of `poot-llm` runs one policy on one checkpoint 
 
 `Driver::prepare` returns a typed `Unsupported::Speculation` error, before anything compiles or uploads where it can:
 
-- `RecurrentState`: the model carries recurrent state (Qwen3-Next, Nemotron-H, Mamba2). A rejected draft token has already been folded into that state and `commit` cannot undo it, so these models do not speculate. The check reads the state roles of the compiled program, never a model name.
+- `RecurrentGranule { granule }`: the model's recurrent state advances in granules of more than one token. The replay chunk after a rejection is not a multiple of the granule, so these models do not speculate. The check reads the state roles of the compiled program and the model's granule, never a model name.
+- `RecurrentDraft`: the draft model carries recurrent state. Only the target's state is rolled back, so a rejected draft token would stay folded into the draft's.
 - `DraftMismatch`: the draft model's vocabulary is larger than the target's, its tokenizer gives a token another id, or it holds fewer positions than the driver's capacity.
 
-`poot-serve` reports the same refusals at startup, before the listener binds: a `--draft-model` that does not load or does not fit, or a draft flag on a model with recurrent state, stops the server with the driver's typed error. A request whose sampler the verify window cannot check (a penalty, `logit_bias`, logprobs or a constraint) decodes one token a step and is counted in `speculative_skipped_rows`.
+`poot-serve` reports the same refusals at startup, before the listener binds: a `--draft-model` that does not load or does not fit, or a draft flag on a model with a recurrent granule above one token, stops the server with the driver's typed error. A request whose sampler the verify window cannot check (a penalty, `logit_bias`, logprobs or a constraint) decodes one token a step and is counted in `speculative_skipped_rows`.
 
 Design notes on the method live under [Architecture: Serving design](../architecture/serving-design.mdx).

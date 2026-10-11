@@ -44,8 +44,8 @@ pub fn stable_descending_rank(b: &Builder, x: Traced) -> Traced {
     let equal = b.binary(BinOp::Mul, pgeq, qgep);
 
     // On equal scores, expert j precedes expert i iff j < i. Indices are exact, finite, and distinct.
-    // Card 558a: compute the range with `iota` (no bound named-constant range); the F32 cast keeps
-    // the rank arithmetic in f32 until the index migration of Card 558b.
+    // Card 558a: compute the range with `iota` (no bound named-constant range). The F32 iota is rank
+    // arithmetic (it is compared with the F32 rank counts), never an index: an index operand is I32.
     let iota = b.iota(e);
     let mut iota_shape = vec![1usize; shape.len()];
     iota_shape[last] = e;

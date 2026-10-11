@@ -445,7 +445,7 @@ pub(super) fn plan(
                         backend,
                         Some(vec![ec as u32, mm as u32, kk as u32, nn as u32]),
                         [(ec * groups * GEMM_TILE * GEMM_TILE) as u32, 1, 1],
-                    )
+                    )?
                 }
                 MatMulRoute::AttnGemv => {
                     // decode attention scores@V: LDS-parallel reduction over cap (card 143 Lever 1b), the

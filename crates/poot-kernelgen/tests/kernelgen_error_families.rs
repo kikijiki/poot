@@ -313,3 +313,51 @@ fn a_two_byte_float_is_only_ever_a_select_branch() {
         "{err:?}"
     );
 }
+
+/// POOT-1108: an `I32ToF32` step reads an I32 word and nothing else. A float operand is the typed
+/// `IndexCastOperand`, never a kernel that converts float bits as an integer; and an I32 word still may not
+/// meet an f32 operand in arithmetic, cast or not. Mutation: drop the operand check of the cast arm in
+/// `check_float_region_tys`; the first row builds a body and goes red.
+#[test]
+fn float_region_rejects_a_cast_of_a_float_operand_and_mixed_arithmetic() {
+    use poot_kernelgen::{FusedInput, FusedKernel, FusedScalarOp, FusedStep, LeafTy};
+    let layouts = vec![poot_kernelgen::Layout::contiguous(&[4]); 2];
+    let cast_of_float = FusedKernel {
+        leaf_tys: vec![LeafTy::F32],
+        steps: vec![FusedStep {
+            op: FusedScalarOp::I32ToF32,
+            inputs: vec![FusedInput::Leaf(0)],
+        }],
+        output: FusedInput::Step(0),
+    };
+    let err = poot_kernelgen::fused_views("t", &[4], &[&[4]], &layouts[..1], &cast_of_float, None)
+        .expect_err("a cast of an f32 leaf has no meaning");
+    assert!(
+        matches!(err, KernelGenError::IndexCastOperand { step: 0, .. }),
+        "{err:?}"
+    );
+
+    // An I32 step is exact integer arithmetic: an I32 word added to an f32 value is refused as the I32 leaf
+    // feeding a float `Add`, even when it came through a `GeU`.
+    let mixed = FusedKernel {
+        leaf_tys: vec![LeafTy::I32, LeafTy::I32, LeafTy::F32],
+        steps: vec![
+            FusedStep {
+                op: FusedScalarOp::GeU,
+                inputs: vec![FusedInput::Leaf(0), FusedInput::Leaf(1)],
+            },
+            FusedStep {
+                op: FusedScalarOp::Binary(poot_kernel_ir::BinOp::Add),
+                inputs: vec![FusedInput::Step(0), FusedInput::Leaf(2)],
+            },
+        ],
+        output: FusedInput::Step(1),
+    };
+    let layouts = vec![poot_kernelgen::Layout::contiguous(&[4]); 3];
+    let err = poot_kernelgen::fused_views("t", &[4], &[&[4], &[4], &[4]], &layouts, &mixed, None)
+        .expect_err("an I32 step feeds a float Add");
+    assert!(
+        matches!(err, KernelGenError::NarrowOperand { .. }),
+        "{err:?}"
+    );
+}

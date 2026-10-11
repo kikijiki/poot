@@ -68,7 +68,7 @@ fn gumbel_select_nvptx_fma_sensitive_fixture_matches_cpu_oracle() {
     let out = artifact_path(&dir, "sample_gumbel_argmax_batched", Target::Nvptx);
     compile(&body, Target::Nvptx, &out).expect("Gumbel asset must compile to NVPTX");
     let ptx_bytes = std::fs::read(&out).expect("read compiled PTX");
-    let kernel = kernel_handle(&body, Target::Nvptx, ptx_bytes);
+    let kernel = kernel_handle(&body, poot_codegen::GpuTarget::Nvptx, ptx_bytes);
 
     let ctx = match PtxContext::new() {
         Ok(c) => c,

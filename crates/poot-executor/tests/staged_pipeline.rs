@@ -787,3 +787,58 @@ fn an_export_viewing_carried_state_is_refused_at_load() {
         "got {error:?}"
     );
 }
+
+/// Load the layered fixture with its first dispatching equation rebound by `rebind` into a plan declaring
+/// `scratch` scratch buffers, and return the load refusal. The planner emits no such plan; the engine's
+/// binding walk is the invariant for a program assembled some other way.
+fn rebound_refusal(
+    scratch: usize,
+    rebind: impl Fn(&poot_graph_plan::Binding) -> poot_graph_plan::Binding,
+) -> LoadError {
+    let (g, store, map) = layered();
+    let mut parts = single(&g).into_parts();
+    let program = &mut parts.stages[0].2;
+    let index = program
+        .planned()
+        .position(|(_, plan)| !plan.dispatches().is_empty())
+        .expect("a dispatching equation");
+    program
+        .rebind_dispatches(index, scratch, rebind)
+        .expect("the rebound plan is a valid DispatchPlan");
+    load_refusal(parts, store, map)
+}
+
+/// A dispatch bound to a scratch buffer is refused at load: the engine allocates none until POOT-1113.
+/// (A scratch read needs an earlier dispatch's scratch write, which this refusal stops first.)
+///
+/// Mutation: treat `Sink::Scratch` as `Sink::Out` in `load_stage`'s binding walk; the program loads and
+/// this goes red.
+#[test]
+fn a_dispatch_writing_scratch_is_refused_at_load() {
+    use poot_graph_plan::{Binding, ScratchId, Sink};
+    let error = rebound_refusal(1, |binding| {
+        Binding::new(binding.reads().to_vec(), Sink::Scratch(ScratchId::new(0)))
+    });
+    assert!(
+        matches!(error, LoadError::Unimplemented(what) if what.contains("scratch")),
+        "got {error:?}"
+    );
+}
+
+/// A binding naming an operand the equation lacks is refused at load, whoever assembled the program.
+///
+/// Mutation: replace the `ok_or` on the operand lookup with `unwrap_or(&operands[0])`; the program loads
+/// and this goes red.
+#[test]
+fn a_dispatch_binding_an_operand_its_equation_lacks_is_refused_at_load() {
+    use poot_graph_plan::{Binding, Source};
+    let error = rebound_refusal(0, |binding| {
+        let mut reads = binding.reads().to_vec();
+        reads[0] = Source::Operand(reads.len() + 4);
+        Binding::new(reads, binding.write())
+    });
+    assert!(
+        matches!(error, LoadError::Unimplemented(what) if what.contains("operand")),
+        "got {error:?}"
+    );
+}

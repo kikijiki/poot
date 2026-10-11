@@ -49,7 +49,7 @@ pub fn packed_linear(
 }
 
 /// A packed embedding lookup (card 545a): `decode(table)[ids]` along axis 0, the table a
-/// packed `[rows, K]` weight (a quantized GGUF `token_embd`). `ids` is any-shape F32/I32 row ids; the
+/// packed `[rows, K]` weight (a quantized GGUF `token_embd`). `ids` is any-shape I32 row ids; the
 /// result is `ids.shape ++ [K]`. `compile` claims the `PackedDequant -> Gather` pair as one
 /// `PackedRowGather`, so only the gathered rows are ever decoded.
 pub fn packed_embedding(
@@ -162,7 +162,11 @@ pub fn packed_indexed_linear(
             actual: x_type,
         });
     }
-    require_operand_type(&plan, selector, TensorType::f32(vec![x_type.shape[0]]))?;
+    require_operand_type(
+        &plan,
+        selector,
+        TensorType::new(vec![x_type.shape[0]], DType::I32),
+    )?;
     let mut operands = vec![Operand::Value(x.id()), Operand::Value(selector.id())];
     for (name, tensor_type) in crate::packed_source::packed_stack_source_constants(
         &table.stack_id,

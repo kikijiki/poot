@@ -6,7 +6,6 @@ use poot_target::{Backend, DeviceCaps};
 /// Plan one elementwise-family equation (Binary/Select/Unary/Rope/Reduce/Fused/FusedRow).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn plan(
-    analysis: ExactI32Requirements<'_>,
     g: GraphTables<'_>,
     eqn: &Eqn,
     out_shape: &[usize],
@@ -61,17 +60,7 @@ pub(super) fn plan(
                     }));
                 }
             }
-            let integer_only = matches!(
-                *bop,
-                GBinOp::GeU
-                    | GBinOp::RemU
-                    | GBinOp::And
-                    | GBinOp::Or
-                    | GBinOp::Xor
-                    | GBinOp::Shl
-                    | GBinOp::Shr
-            );
-            let exact_i32 = odt == DType::I32 && (analysis.required(eqn.out) || integer_only);
+            let exact_i32 = odt == DType::I32;
             if odt == DType::I32 && *bop == GBinOp::Div {
                 return Err(site.refuse(Capability::ExactI32Op));
             }
@@ -250,30 +239,37 @@ pub(super) fn plan(
             }))?
         }
         OpKind::Fused(region) => {
-            let exact_i32 = odt == DType::I32;
+            // A region with an I32 output is exact-I32 end to end (and may pack its words). A float region
+            // may still compute I32 steps: an exact producer chain, then the cast to f32 that feeds the
+            // arithmetic after it.
+            let exact_region = odt == DType::I32;
+            let input_tys: Vec<_> = ids.iter().map(|&id| g.aval(id).clone()).collect();
+            let locals = region
+                .local_types(&input_tys)
+                .expect("a validated fused region infers");
+            let local_dtype = |local: usize| locals[local].dtype;
             let steps = region
                 .steps
                 .iter()
-                .map(|st| {
-                    // The pointwise kernels read every leaf as f32: a `Cast` step has no leaf lane to widen.
-                    check_widening_step(site, st.op, &st.inputs, |_| false)?;
+                .enumerate()
+                .map(|(j, st)| {
+                    let exact_step = local_dtype(region.n_inputs + j) == DType::I32;
                     Ok(kg::FusedStep {
-                        op: map_pointwise_op(site, st.op, exact_i32)?,
+                        op: map_pointwise_step(site, st.op, &st.inputs, exact_step, local_dtype)?,
                         inputs: st
                             .inputs
                             .iter()
-                            .map(|o| {
-                                if exact_i32 {
-                                    map_fused_input_i32(site, o, region.n_inputs)
-                                } else {
-                                    map_fused_input(site, o, region.n_inputs)
-                                }
+                            .map(|o| match (exact_region, exact_step) {
+                                (true, _) => map_fused_input_i32(site, o, region.n_inputs),
+                                (false, true) => map_mixed_input_i32(site, o, region.n_inputs),
+                                (false, false) => map_fused_input(site, o, region.n_inputs),
                             })
                             .collect::<Result<Vec<_>, PlanError>>()?,
                     })
                 })
                 .collect::<Result<Vec<_>, PlanError>>()?;
-            // An I32 leaf is a select condition (a float region) or one of an exact-I32 region's words.
+            // An I32 leaf is a select condition, a cast operand or an exact-I32 step's word (a float region),
+            // or one of an exact-I32 region's words.
             let leaf_tys = ids
                 .iter()
                 .map(|&id| match g.aval(id).dtype {
@@ -287,7 +283,7 @@ pub(super) fn plan(
                 output: map_fused_local(region.output, region.n_inputs),
             };
             // Card 159's row-fold pack (`region.pack`) launches one thread per packed lane.
-            let form = if exact_i32 {
+            let form = if exact_region {
                 PointwiseForm::ExactI32Packed {
                     pack: region
                         .pack

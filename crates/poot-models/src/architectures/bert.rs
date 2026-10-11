@@ -12,7 +12,9 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
-use poot_graph_ir::{BinOp, Builder, Graph, Slot, TensorType, Traced, ValidationOutputs, ops};
+use poot_graph_ir::{
+    BinOp, Builder, Graph, IndexRange, Slot, TensorType, Traced, ValidationOutputs, ops,
+};
 use poot_quant::weights::{
     AttnRole, FfnRole, NormRole, WeightId, WeightMap, WeightRole, WeightStore,
 };
@@ -513,7 +515,13 @@ impl Model for Bert {
         let (rows, tokens) = (shape.rows.get(), shape.tokens.get());
         let ids = TensorType::new(vec![rows, tokens], DType::I32);
         let types = b.slot_named(Slot::Activation, TOKEN_TYPE_SLOT, ids.clone());
-        let real = b.slot_named(Slot::Activation, ATTENTION_MASK_SLOT, ids);
+        // A key is real (1) or padding (0): declared so the mask's `I32 -> F32` cast is proven exact.
+        let real = b.slot_named_ranged(
+            Slot::Activation,
+            ATTENTION_MASK_SLOT,
+            ids,
+            IndexRange::below(2).expect("a two-word range"),
+        );
         // 0 for a real key, -1e9 for padding: the additive key mask every query shares.
         let mask = b.reshape(
             b.binary_scalar(
@@ -819,6 +827,7 @@ mod tests {
             capacity: NonZeroUsize::new(tokens).unwrap(),
             kv: KvLayout::Contiguous,
             logits: LogitRows::All,
+            hidden: None,
         }
     }
 

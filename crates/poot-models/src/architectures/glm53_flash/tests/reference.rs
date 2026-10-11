@@ -123,7 +123,17 @@ impl Dims {
 /// the traced graph gives it, laid out as the graph carries it with zeros past the last position.
 pub(super) struct Run {
     pub logits: Vec<Vec<f64>>,
+    /// The closing norm's output at every position: the mean of the streams, normalized, before the
+    /// head reads it (what the hidden-state carry holds).
+    pub hidden: Vec<Vec<f64>>,
     pub state: Vec<(String, Vec<f64>)>,
+}
+
+/// A draft chain of the multi-token-prediction layer: the logits of every draft step and the greedy
+/// token each drew.
+pub(super) struct MtpChain {
+    pub logits: Vec<Vec<f64>>,
+    pub drafts: Vec<usize>,
 }
 
 pub(super) struct Reference {
@@ -522,11 +532,88 @@ impl Reference {
         out
     }
 
+    /// The multi-token-prediction layer for the token `token` that follows position `p`, whose
+    /// target hidden state is `hidden` (the closing norm's output): `(post-norm state, logits)`. The
+    /// block is a DSA layer at index `layers` over the routed or dense feed-forward of the last text
+    /// layer, with no hyper-connections; the embedding is zero at position 0.
+    fn mtp_step(
+        &self,
+        hidden: &[f64],
+        token: usize,
+        p: usize,
+        hist: &mut LayerHistory,
+    ) -> (Vec<f64>, Vec<f64>) {
+        let d = &self.d;
+        let layer = d.layers;
+        let at = |s: &str| format!("{TOWER}layers.{layer}.{s}");
+        let embed = if p == 0 {
+            vec![0.0; d.width]
+        } else {
+            self.t(&format!("{TOWER}embed_tokens.weight"))[token * d.width..(token + 1) * d.width]
+                .to_vec()
+        };
+        let mut fused_input = rms_scaled(&embed, self.t(&at("enorm.weight")), d.eps);
+        fused_input.extend(rms_scaled(hidden, self.t(&at("hnorm.weight")), d.eps));
+        let x = matvec(
+            self.t(&at("eh_proj.weight")),
+            d.width,
+            2 * d.width,
+            &fused_input,
+        );
+        let normed = rms_scaled(&x, self.t(&at("input_layernorm.weight")), d.eps);
+        let mixed = self.dsa(layer, &normed, p, hist);
+        let r: Vec<f64> = x.iter().zip(&mixed).map(|(a, b)| a + b).collect();
+        let normed = rms_scaled(&r, self.t(&at("post_attention_layernorm.weight")), d.eps);
+        let ffn = if *d.dense.last().unwrap() {
+            self.gated(&at("mlp"), d.inter, &normed)
+        } else {
+            self.moe(layer, &normed)
+        };
+        let out: Vec<f64> = r.iter().zip(&ffn).map(|(a, b)| a + b).collect();
+        let normed = rms_scaled(&out, self.t(&at("shared_head.norm.weight")), d.eps);
+        let logits = matvec(self.t("lm_head.weight"), d.vocab, d.width, &normed);
+        (normed, logits)
+    }
+
+    /// The draft chain from scratch: the target over `tokens` (positions `0..n`) in f64, then the
+    /// layer over every position `p < n` with the token that follows it (the last with `bonus`, the
+    /// token the target chose after the prefix), one position at a time with no cache but its own
+    /// history; then `k - 1` more steps, each fed the previous step's post-norm state and greedy
+    /// token at the next position. Returns the logits of the `k` draft steps and the tokens drawn.
+    pub fn mtp_chain(&self, tokens: &[usize], bonus: usize, k: usize) -> MtpChain {
+        let target = self.run(tokens, tokens.len());
+        let n = tokens.len();
+        let mut hist = LayerHistory::default();
+        let mut last = (Vec::new(), Vec::new());
+        for (p, hidden) in target.hidden.iter().enumerate() {
+            let next = tokens.get(p + 1).copied().unwrap_or(bonus);
+            last = self.mtp_step(hidden, next, p, &mut hist);
+        }
+        let argmax = |v: &[f64]| {
+            v.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .unwrap()
+                .0
+        };
+        let mut chain = MtpChain {
+            logits: vec![last.1.clone()],
+            drafts: vec![argmax(&last.1)],
+        };
+        for i in 1..k {
+            last = self.mtp_step(&last.0, chain.drafts[i - 1], n - 1 + i, &mut hist);
+            chain.drafts.push(argmax(&last.1));
+            chain.logits.push(last.1.clone());
+        }
+        chain
+    }
+
     /// The model over `tokens` from position 0 with a cache of `capacity` positions.
     pub fn run(&self, tokens: &[usize], capacity: usize) -> Run {
         let d = &self.d;
         let mut hist = vec![LayerHistory::default(); d.layers];
         let mut logits = Vec::new();
+        let mut hidden = Vec::new();
         for (p, &token) in tokens.iter().enumerate() {
             let embed = &self.t(&format!("{TOWER}embed_tokens.weight"))
                 [token * d.width..(token + 1) * d.width];
@@ -564,6 +651,7 @@ impl Reference {
                 .collect();
             let normed = rms_scaled(&mean, self.t(&format!("{TOWER}norm.weight")), d.eps);
             logits.push(matvec(self.t("lm_head.weight"), d.vocab, d.width, &normed));
+            hidden.push(normed);
         }
 
         // The carried state, in the order the graph carries it: per layer, the conv windows and
@@ -594,6 +682,10 @@ impl Reference {
                 state.push((format!("kv.l{layer}.index"), pad(&rows, 2 * d.index_dim)));
             }
         }
-        Run { logits, state }
+        Run {
+            logits,
+            hidden,
+            state,
+        }
     }
 }

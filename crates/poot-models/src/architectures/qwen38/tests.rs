@@ -779,6 +779,7 @@ impl Case {
             capacity: NonZeroUsize::new(self.cap).unwrap(),
             kv: KvLayout::Contiguous,
             logits: LogitRows::All,
+            hidden: None,
         };
         let g = model.trace(Phase::Prefill, shape).unwrap();
         g.state
@@ -985,6 +986,7 @@ fn a_shape_off_the_granule_is_a_typed_refusal() {
         capacity: NonZeroUsize::new(capacity).unwrap(),
         kv: KvLayout::Contiguous,
         logits: LogitRows::All,
+        hidden: None,
     };
     for (phase, tokens, capacity) in [
         (Phase::Prefill, 3, 8),
@@ -1113,6 +1115,7 @@ fn an_out_of_vocabulary_token_is_a_typed_validation_fault() {
         capacity: NonZeroUsize::new(CAP).unwrap(),
         kv: KvLayout::Contiguous,
         logits: LogitRows::All,
+        hidden: None,
     };
     let g = model.trace(Phase::Prefill, shape).unwrap();
     let witnesses: Vec<usize> = g
@@ -1140,6 +1143,7 @@ fn packed_experts_trace_as_packed_weights_and_dense_ones_as_stored_stacks() {
         capacity: NonZeroUsize::new(CAP).unwrap(),
         kv: KvLayout::Contiguous,
         logits: LogitRows::All,
+        hidden: None,
     };
     let analyze = |fixture: &Fixture| {
         let model = built(fixture);

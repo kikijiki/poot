@@ -43,7 +43,7 @@ pub enum ResidencyError {
     #[error("the sync point reads no expert ids")]
     NoIds,
     #[error("expert id {id} is not one of the site's {experts} experts")]
-    ExpertId { id: f32, experts: usize },
+    ExpertId { id: i32, experts: usize },
     #[error("a step needs {needed} experts but the pool has {slots} rows")]
     PoolTooSmall { needed: usize, slots: usize },
 }
@@ -144,10 +144,9 @@ impl HostSync for ExpertResidency {
         // The distinct experts the step selects, in first-seen order.
         let mut needed: Vec<usize> = Vec::new();
         for &id in ids {
-            if !(id >= 0.0 && id.fract() == 0.0 && (id as usize) < experts) {
+            let Some(id) = usize::try_from(id).ok().filter(|&id| id < experts) else {
                 return Err(host(ResidencyError::ExpertId { id, experts }));
-            }
-            let id = id as usize;
+            };
             if !needed.contains(&id) {
                 needed.push(id);
             }
@@ -183,7 +182,7 @@ impl HostSync for ExpertResidency {
             writes.map = Some(
                 site.expert_row
                     .iter()
-                    .map(|row| row.map_or(-1.0, |row| row as f32))
+                    .map(|row| row.map_or(-1, |row| row as i32))
                     .collect(),
             );
         }

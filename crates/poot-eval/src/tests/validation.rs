@@ -159,9 +159,8 @@ fn assert_same_failure(error: EvalError, expected_bits: u32) {
     }
 }
 
-/// Every `EvalOptions` combination the walk offers (unbounded budget; plus `keep_environment`; plus a
-/// scratch `cast_authority` that answers nothing, for a graph with no I32 `Cast`) rejects the same
-/// validation failure, on a dense, a stateful, and a storage-aware (E4M3FN) fixture.
+/// Every `EvalOptions` combination the walk offers (unbounded budget; plus `keep_environment`) rejects
+/// the same validation failure, on a dense, a stateful, and a storage-aware (E4M3FN) fixture.
 #[test]
 fn eval_rejects_the_same_lane_regardless_of_options() {
     let dense_fixtures: [(&str, ValueFixture); 2] = [
@@ -179,17 +178,6 @@ fn eval_rejects_the_same_lane_regardless_of_options() {
                 &graph,
                 &values,
                 EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
-            )
-            .unwrap_err(),
-            f32::NAN.to_bits(),
-        );
-        let mut authority =
-            |_: poot_graph_ir::ValueId| -> Option<crate::cast_authority::ExactI32CastRole> { None };
-        assert_same_failure(
-            eval(
-                &graph,
-                &values,
-                EvalOptions::new(EvalBudget::UNBOUNDED).cast_authority(&mut authority),
             )
             .unwrap_err(),
             f32::NAN.to_bits(),

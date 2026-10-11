@@ -127,7 +127,17 @@ impl Model for Mlp {
             n - 1
         };
         let out = n - first;
-        let token = b.cast(b.slice(step.tokens(), 1, first, n), DType::F32);
+        let token = b.cast(
+            b.slice(
+                b.guard_index_bounds(step.tokens(), VOCAB)
+                    .expect("the step's ids are a rank-2 I32 tensor")
+                    .guarded,
+                1,
+                first,
+                n,
+            ),
+            DType::F32,
+        );
         let pos = b.cast(b.slice(step.pos(), 1, first, n), DType::F32);
         let seed = b.binary(BinOp::Add, token, pos);
         let flat = rows * out;
@@ -310,7 +320,12 @@ impl Model for Attn {
             .expect("the fixture's attention parameters are valid");
         let weights = AttentionWeights::new(&self.weights, 0, HIDDEN, &params)
             .expect("the fixture maps every attention weight");
-        let token = b.cast(step.tokens(), DType::F32);
+        let token = b.cast(
+            b.guard_index_bounds(step.tokens(), VOCAB)
+                .expect("the step's ids are a rank-2 I32 tensor")
+                .guarded,
+            DType::F32,
+        );
         let pos = b.cast(step.pos(), DType::F32);
         let seed = b.binary(BinOp::Add, token, pos);
         let seed = b.broadcast(b.reshape(seed, vec![rows, n, 1]), vec![rows, n, HIDDEN]);
@@ -423,12 +438,12 @@ fn record_bodies(program: &StagedProgram<ValidationOutputs>) -> Retention {
     for (_, _, stage) in program.stages() {
         for (_, plan) in stage.planned() {
             if let poot_graph_plan::Plan::Dispatches(dispatches) = plan {
-                for dispatch in dispatches {
+                for dispatch in dispatches.iter() {
                     BODIES.with(|bodies| {
                         bodies
                             .borrow_mut()
-                            .entry(dispatch.key.clone())
-                            .or_insert_with(|| dispatch.body.clone());
+                            .entry(dispatch.key().to_string())
+                            .or_insert_with(|| dispatch.body().clone());
                     });
                 }
             }
@@ -787,6 +802,7 @@ fn options() -> DriverOptions {
         },
         charge: record_bodies,
         draft: DraftPolicy::Off,
+        hidden_window: None,
     }
 }
 

@@ -31,7 +31,7 @@ fn spv(body: &Body, name: &str) -> poot_runtime::CompiledKernel {
     let out = poot_codegen::artifact_path(&dir, name, Target::SpirvVulkan);
     compile(body, Target::SpirvVulkan, &out).expect("compile");
     let bytes = std::fs::read(&out).unwrap();
-    poot_codegen::kernel_handle(body, Target::SpirvVulkan, bytes)
+    poot_codegen::kernel_handle(body, poot_codegen::GpuTarget::SpirvVulkan, bytes)
 }
 
 /// The compiled SPIR-V word count of a handle `spv()` built, for callers that just want to assert a
@@ -308,7 +308,7 @@ fn workgroup_fence_spin_wait_dispatches_on_radv() {
 
 /// `Statement::Fence` is rejected on AieCore with a named diagnostic (a single AIE core has no other core to
 /// fence against), like the Barrier/CAS AIE rejections. Pure Rust check via `emit_llvm_ir`, no llc/Peano needed,
-/// so it always runs (unlike the AIE2p lowering tests gated on `POOT_AIE_LLC`). Uses a minimal single-statement
+/// so it always runs (unlike the `#[ignore]`d real-Peano rows). Uses a minimal single-statement
 /// body (Fence, then `Return`): the spin-wait kernels above also use `Terminator::ThreadIndexCall` (itself
 /// AieCore-rejected), which would let `.is_err()` pass for the wrong reason.
 #[test]
@@ -677,7 +677,7 @@ fn indexed_kernel(
 fn run_indexed(
     ctx: &Context,
     (kernel, launch, workgroup): &(poot_runtime::CompiledKernel, kg::Launch, [u32; 3]),
-    (x, w, ids): (&[f32], &[f32], &[f32]),
+    (x, w, ids): (&[f32], &[f32], &[i32]),
     out_len: usize,
 ) -> Vec<f32> {
     let meta = launch
@@ -687,7 +687,7 @@ fn run_indexed(
     let mut bufs = [
         KernelBuffer::read_only_f32(x),
         KernelBuffer::read_only_f32(w),
-        KernelBuffer::read_only_f32(ids),
+        KernelBuffer::read_only_i32(ids),
         KernelBuffer::read_only_u32(&meta),
         KernelBuffer::write_f32(out_len),
     ];
@@ -698,13 +698,13 @@ fn run_indexed(
 
 /// `out[m, n] = sum_k x[m, k] * W[ids[m], k, n]`, summed `k` ascending (a NaN for an id outside `0..E`).
 fn indexed_oracle(
-    (x, w, ids): (&[f32], &[f32], &[f32]),
+    (x, w, ids): (&[f32], &[f32], &[i32]),
     (k, n, experts): (usize, usize, usize),
 ) -> Vec<f32> {
     let mut want = Vec::new();
     for (row, id) in ids.iter().enumerate() {
         for col in 0..n {
-            if !(id.fract() == 0.0 && (0.0..experts as f32).contains(id)) {
+            if !(0..experts as i32).contains(id) {
                 want.push(f32::NAN);
                 continue;
             }
@@ -735,7 +735,7 @@ fn indexed_gemv_selects_expert_in_kernel() {
     };
     let kernel = indexed_kernel(gemv, (1, k, n, e), "igemv");
     for expert in 0..e {
-        let ids = [expert as f32];
+        let ids = [expert as i32];
         let got = run_indexed(&ctx, &kernel, (&x, &w, &ids), n);
         let want = indexed_oracle((&x, &w, &ids), (k, n, e));
         assert_eq!(
@@ -755,7 +755,7 @@ fn indexed_matmul_routes_rows_to_experts() {
     let (e, m, k, n) = (3usize, 3usize, 4usize, 2usize);
     let x: Vec<f32> = (0..m * k).map(|v| (v as f32) - 5.0).collect();
     let w: Vec<f32> = (0..e * k * n).map(|v| (v as f32) - 11.0).collect();
-    let ids = [2.0f32, 0.0, 1.0];
+    let ids = [2i32, 0, 1];
     let tiled = kg::Schedule::Tiled {
         tile: kg::TileSize::new(4).unwrap(),
     };
@@ -838,14 +838,13 @@ fn scatter_update_writes_mapped_rows_keeps_rest() {
     let (pool, rest) = (4usize, 2usize);
     let base: Vec<f32> = (0..pool * rest).map(|i| 100.0 + i as f32).collect(); // 100..108
     let src: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0]; // src[0]=[1,2], src[1]=[3,4]
-    let inv: Vec<f32> = vec![1.0, -1.0, 0.0, -1.0]; // slot0<-src1, slot1<-base, slot2<-src0, slot3<-base
+    let inv: Vec<i32> = vec![1, -1, 0, -1]; // slot0<-src1, slot1<-base, slot2<-src0, slot3<-base
     let s = spv(
         &movement(
             "scu",
             vec![pool, rest],
             kg::MovementOp::ScatterRows {
                 src_shape: vec![2, rest],
-                inverse_dtype: Ty::F32,
                 window: None,
             },
         ),
@@ -854,7 +853,7 @@ fn scatter_update_writes_mapped_rows_keeps_rest() {
     let mut bufs = [
         KernelBuffer::read_only_f32(&base),
         KernelBuffer::read_only_f32(&src),
-        KernelBuffer::read_only_f32(&inv),
+        KernelBuffer::read_only_i32(&inv),
         KernelBuffer::write_f32(pool * rest),
     ];
     ctx.dispatch(
@@ -879,7 +878,7 @@ fn gather_axis0_embedding() {
     let Some(ctx) = ctx() else { return };
     // data [3,2], index [2,0,1] -> out [3,2]
     let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-    let index = [2.0f32, 0.0, 1.0];
+    let index = [2i32, 0, 1];
     let s = spv(
         &movement(
             "g",
@@ -887,7 +886,6 @@ fn gather_axis0_embedding() {
             kg::MovementOp::Gather {
                 in_shape: vec![3, 2],
                 axis: 0,
-                index_dtype: Ty::F32,
                 index_numel: 3,
             },
         ),
@@ -895,7 +893,7 @@ fn gather_axis0_embedding() {
     );
     let mut bufs = [
         KernelBuffer::read_only_f32(&data),
-        KernelBuffer::read_only_f32(&index),
+        KernelBuffer::read_only_i32(&index),
         KernelBuffer::write_f32(6),
     ];
     ctx.dispatch("test", &s, [64, 1, 1], [6, 1, 1], &mut bufs)

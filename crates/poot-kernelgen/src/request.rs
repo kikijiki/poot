@@ -15,7 +15,8 @@
 //! function and cannot disagree.
 
 use poot_kernel_ir::{
-    BinOp, Body, FRAGMENT_COLLECTIVE_LANES, MathOp, Statement, Ty, UnOp, WmmaDtype, WmmaShape,
+    BasicBlock, BinOp, BlockId, Body, Constant, FRAGMENT_COLLECTIVE_LANES, MathOp, Operand, Place,
+    Rvalue, Statement, Terminator, Ty, UnOp, WmmaDtype, WmmaShape,
 };
 use poot_target::{BufferStorage, DeviceCaps};
 
@@ -38,7 +39,9 @@ use crate::fused::{
     fused_row_parallel_views, fused_views, pointwise_size, row_size,
 };
 use crate::gemv::{attn_scores_v_gemv_lds, gemv_lds};
-use crate::helpers::{BodyBudget, BodyLimits, BodySize, Layout, WeightLayout};
+use crate::helpers::{
+    BodyBudget, BodyLimits, BodySize, Layout, WeightLayout, copy, elem, guard, ld, local, slice_f32,
+};
 use crate::matmul::{
     matmul_batched_dt_grid, matmul_batched_epilogue_dt_grid, matmul_batched_nk_grid,
 };
@@ -631,7 +634,7 @@ pub enum PackedRows {
     /// `(activation, sources.., [epilogue leaves..], metadata, out)`.
     Blocks,
     /// An expert-stacked table: output row `m` reads the slab of expert `ids[m]` in every source, and an id
-    /// outside `0..E` or not an integer makes that row NaN. Params `(activation, ids, sources.., [epilogue
+    /// outside `0..E` makes that row NaN. Params `(activation, ids, sources.., [epilogue
     /// leaves..], metadata, out)`, metadata `[K, N, E, slab_words per source..]`. A [`Schedule::Gemv`] only.
     Indexed,
 }
@@ -647,9 +650,9 @@ impl PackedRows {
 }
 
 /// A contraction over a stacked `[E, K, N]` weight, `out[m, n] = sum over k of x[m, k] * W[ids[m], k, n]`: output
-/// row `m` reads expert slab `ids[m]`, and an id outside `0..E` or not an integer makes that row NaN. `schedule` is
+/// row `m` reads expert slab `ids[m]`, and an id outside `0..E` makes that row NaN. `schedule` is
 /// [`Schedule::Gemv`] (decode) or [`Schedule::Tiled`], which is segmented here: a tile whose rows select several
-/// experts walks them. The activation, ids and output are f32 and the weight is read in `weight` storage (f32 or
+/// experts walks them. The activation and output are f32, the ids are `I32`, and the weight is read in `weight` storage (f32 or
 /// packed BF16); `epilogue` (f32) runs over each output element's sum before its store. The planner chooses the
 /// launch (the grid folded and checked against the device's limits) and the metadata `[K, N, E, M, x_groups]`.
 #[derive(Clone, Debug)]
@@ -1206,6 +1209,219 @@ fn movement(spec: &MovementSpec, caps: &DeviceCaps) -> Result<Generated, KernelG
         movement_body(ENTRY, spec, spec.fold.x_groups(caps))?,
         spec.fold.launch(caps),
     )
+}
+
+/// The sequential schedule of an ordinary request (POOT-664): the iteration space of an AIE core, which
+/// runs one scalar loop over the whole tensor, selected by the target instead of a thread grid. The request
+/// is the one the GPU planner builds; only the schedule differs, so no second recognizer exists. The
+/// finite iteration count and the proved access ranges come back in [`SequentialGenerated`].
+///
+/// Only a dense, equal-shape F32 elementwise binary has a sequential body today; any other request is a
+/// typed [`KernelGenError::Unsupported`] (no emulated grid, no host fallback).
+pub fn sequential_schedule(
+    req: &KernelRequest,
+    limits: &BodyLimits,
+) -> Result<SequentialGenerated, KernelGenError> {
+    let KernelRequest::Elementwise(ElementwiseSpec::Binary {
+        op: ValueBinary::Basic(op, Ty::F32),
+        out_shape,
+        a,
+        b,
+        ..
+    }) = req
+    else {
+        return Err(unsupported(
+            req.family(),
+            "no AIE sequential schedule for this request family",
+        ));
+    };
+    for operand in [a, b] {
+        if operand.shape != *out_shape {
+            return Err(unsupported(
+                "sequential_binary",
+                "an operand is broadcast against the output; the sequential loop reads at the output index",
+            ));
+        }
+        if operand.layout != Layout::contiguous(&operand.shape) {
+            return Err(unsupported(
+                "sequential_binary",
+                "an operand is a strided view; the sequential loop reads dense row-major buffers",
+            ));
+        }
+    }
+    let elems = out_shape
+        .iter()
+        .try_fold(1u64, |n, &d| n.checked_mul(d as u64))
+        .ok_or(KernelGenError::ExceedsBound {
+            generator: "sequential_binary",
+            what: "output element count".into(),
+            value: usize::MAX,
+            bound: u64::MAX as usize,
+        })?;
+    generate_sequential(
+        &SequentialBinary {
+            op: *op,
+            dims: out_shape.iter().map(|&d| d as u64).collect(),
+            a_elems: elems,
+            b_elems: elems,
+            out_elems: elems,
+        },
+        limits,
+    )
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SequentialBinary {
+    op: BinOp,
+    /// The logical dimensions every binding shares (inputs and output have the output's shape).
+    dims: Vec<u64>,
+    a_elems: u64,
+    b_elems: u64,
+    out_elems: u64,
+}
+
+/// A sequentially scheduled kernel: its body, how many loop iterations one invocation runs, and the
+/// number of leading elements the body reads or writes of each parameter (binding order). The access
+/// counts are what the artifact's shape ABI is checked against, so a body cannot be linked against a
+/// shape it would read past.
+#[derive(Clone, Debug)]
+pub struct SequentialGenerated {
+    pub body: Body,
+    pub iterations: u64,
+    /// One entry per body parameter, in binding order.
+    pub bindings: Box<[SequentialBinding]>,
+}
+
+/// One buffer of a sequential kernel: its logical dimensions, whether the loop writes it, and how many
+/// leading elements the loop touches.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SequentialBinding {
+    pub dims: Vec<u64>,
+    pub writes: bool,
+    pub accessed: u64,
+}
+
+/// The entry symbol of a sequential binary body (the AIE core object's C symbol).
+const SEQUENTIAL_BINARY_ENTRY: &str = "poot_seq_binary";
+
+/// Generate the sequential loop `out[i] = a[i] <op> b[i]` for `i in 0..len(out)`.
+///
+/// Admitted ops are those the AIE core's scalar F32 lowering is proved for (`Add`, `Sub`, `Mul`); any
+/// other is a typed [`KernelGenError::Unsupported`]. Pure; returns an error rather than panicking.
+fn generate_sequential(
+    spec: &SequentialBinary,
+    limits: &BodyLimits,
+) -> Result<SequentialGenerated, KernelGenError> {
+    const GENERATOR: &str = "sequential_binary";
+    if !matches!(spec.op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
+        return Err(unsupported(
+            GENERATOR,
+            "the AIE core's scalar F32 lowering is proved for add, sub and mul only",
+        ));
+    }
+    if spec.out_elems == 0 {
+        return Err(KernelGenError::BelowMinimum {
+            generator: GENERATOR,
+            what: "output length".into(),
+            value: 0,
+            min: 1,
+        });
+    }
+    for (what, len) in [
+        ("first input length", spec.a_elems),
+        ("second input length", spec.b_elems),
+    ] {
+        if len < spec.out_elems {
+            return Err(KernelGenError::ExceedsBound {
+                generator: GENERATOR,
+                what: format!("output length against the {what}"),
+                value: spec.out_elems as usize,
+                bound: len as usize,
+            });
+        }
+    }
+    let locals = vec![
+        ld(Ty::Unit, false),
+        ld(slice_f32(false), false),
+        ld(slice_f32(false), false),
+        ld(slice_f32(true), true),
+        ld(Ty::Usize, true),
+        ld(Ty::Usize, false),
+        ld(Ty::Bool, false),
+        ld(Ty::F32, false),
+        ld(Ty::Usize, false),
+    ];
+    let (a, b, out, i, len, cmp, value, next) = (
+        local(1),
+        local(2),
+        local(3),
+        local(4),
+        local(5),
+        local(6),
+        local(7),
+        local(8),
+    );
+    let blocks = vec![
+        BasicBlock {
+            statements: vec![
+                Statement::Assign(Place::local(len), Rvalue::Len(Place::local(out))),
+                Statement::Assign(
+                    Place::local(i),
+                    Rvalue::Use(Operand::Const(Constant::Usize(0))),
+                ),
+            ],
+            terminator: Terminator::Goto {
+                target: BlockId { index: 1 },
+            },
+        },
+        BasicBlock {
+            statements: vec![Statement::Assign(
+                Place::local(cmp),
+                Rvalue::BinaryOp(BinOp::Lt, copy(Place::local(i)), copy(Place::local(len))),
+            )],
+            terminator: guard(cmp, 3, 2),
+        },
+        BasicBlock {
+            statements: vec![
+                Statement::Assign(
+                    Place::local(value),
+                    Rvalue::BinaryOp(spec.op, copy(elem(a, i)), copy(elem(b, i))),
+                ),
+                Statement::Assign(elem(out, i), Rvalue::Use(copy(Place::local(value)))),
+                Statement::Assign(
+                    Place::local(next),
+                    Rvalue::BinaryOp(
+                        BinOp::Add,
+                        copy(Place::local(i)),
+                        Operand::Const(Constant::Usize(1)),
+                    ),
+                ),
+                Statement::Assign(Place::local(i), Rvalue::Use(copy(Place::local(next)))),
+            ],
+            terminator: Terminator::Goto {
+                target: BlockId { index: 1 },
+            },
+        },
+        BasicBlock {
+            statements: vec![],
+            terminator: Terminator::Return,
+        },
+    ];
+    let mut body = Body::new(SEQUENTIAL_BINARY_ENTRY, 3, locals, blocks);
+    // One core, one loop: there is no workgroup to size, and the body states it.
+    body.workgroup_size = [1, 1, 1];
+    BodyBudget::new(*limits).reserve(GENERATOR, BodyStage::Finished, BodySize::of(&body))?;
+    Ok(SequentialGenerated {
+        body,
+        iterations: spec.out_elems,
+        bindings: [false, false, true]
+            .map(|writes| SequentialBinding {
+                dims: spec.dims.clone(),
+                writes,
+                accessed: spec.out_elems,
+            })
+            .into(),
+    })
 }
 
 #[cfg(test)]
@@ -1957,5 +2173,96 @@ mod tests {
                 limit: size.instructions - 1,
             }
         );
+    }
+
+    // ---- POOT-664: the sequential (single-core) schedule ------------------------------------------------
+
+    fn sequential_limits() -> crate::BodyLimits {
+        crate::BodyLimits {
+            max_instructions: NonZeroUsize::new(4096).unwrap(),
+            max_locals: NonZeroUsize::new(256).unwrap(),
+        }
+    }
+
+    fn sequential(
+        op: BinOp,
+        a: u64,
+        b: u64,
+        out: u64,
+    ) -> Result<SequentialGenerated, KernelGenError> {
+        generate_sequential(
+            &SequentialBinary {
+                op,
+                dims: vec![out],
+                a_elems: a,
+                b_elems: b,
+                out_elems: out,
+            },
+            &sequential_limits(),
+        )
+    }
+
+    /// The sequential schedule has no grid: one workgroup of one, a finite iteration count equal to the
+    /// output length, and every parameter's proved access range is that length. Mutation: widen `accessed`
+    /// past `out_elems` or drop the workgroup assignment; the equality below fails.
+    #[test]
+    fn a_sequential_binary_states_its_iteration_space_and_access_ranges() {
+        let generated = sequential(BinOp::Add, 6, 6, 6).unwrap();
+        assert_eq!(generated.body.workgroup_size, [1, 1, 1]);
+        assert_eq!(generated.iterations, 6);
+        let accessed: Vec<u64> = generated.bindings.iter().map(|b| b.accessed).collect();
+        assert_eq!(accessed, [6, 6, 6]);
+        assert_eq!(
+            generated
+                .bindings
+                .iter()
+                .map(|b| b.writes)
+                .collect::<Vec<_>>(),
+            [false, false, true]
+        );
+        assert_eq!(generated.body.name, SEQUENTIAL_BINARY_ENTRY);
+        assert!(generated.body.verify().is_ok());
+    }
+
+    /// A loop over the output that would read past a shorter input is refused by the generator, with the
+    /// first input and the second named apart. Mutation: delete the `len < out_elems` comparison; the short
+    /// input is admitted and both errors below become `Ok`.
+    #[test]
+    fn a_sequential_loop_over_a_shorter_input_is_refused() {
+        for (a, b, side) in [(4, 6, "first input"), (6, 4, "second input")] {
+            let error = sequential(BinOp::Add, a, b, 6).unwrap_err();
+            let KernelGenError::ExceedsBound {
+                generator,
+                what,
+                value,
+                bound,
+            } = error
+            else {
+                panic!("expected ExceedsBound, got {error:?}");
+            };
+            assert_eq!((generator, value, bound), ("sequential_binary", 6, 4));
+            assert!(what.contains(side), "{what}");
+        }
+        assert!(matches!(
+            sequential(BinOp::Add, 0, 0, 0),
+            Err(KernelGenError::BelowMinimum { .. })
+        ));
+    }
+
+    /// Only the ops the AIE core's scalar lowering is proved for generate; the rest are typed refusals.
+    #[test]
+    fn a_sequential_binary_op_without_a_proved_lowering_is_unsupported() {
+        for op in [BinOp::Div, BinOp::Max, BinOp::BitAnd, BinOp::Rem] {
+            assert!(
+                matches!(
+                    sequential(op, 4, 4, 4),
+                    Err(KernelGenError::Unsupported { .. })
+                ),
+                "{op:?}"
+            );
+        }
+        for op in [BinOp::Add, BinOp::Sub, BinOp::Mul] {
+            assert!(sequential(op, 4, 4, 4).is_ok(), "{op:?}");
+        }
     }
 }

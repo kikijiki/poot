@@ -156,8 +156,8 @@ pub(crate) struct PlannedGraph {
 }
 
 /// Plan a whole graph for `target`: the one planner entry per graph. The graph-level decisions run in one
-/// fixed order: strided views, one exact-I32 analysis, every equation's plan (kernel, launch grid, alias or
-/// view), every value's storage and the slot schema. Only [`crate::compile`] calls it, after the graph
+/// fixed order: strided views, every equation's plan (kernel, launch grid, alias or view), every value's
+/// storage and the slot schema. Only [`crate::compile`] calls it, after the graph
 /// passes.
 ///
 /// `compile` derives the native state-commit plan from this call's own `plans`
@@ -171,12 +171,11 @@ pub(crate) fn plan_graph<V: ValidationChannel>(
     let _scope = CompileScope::enter();
     let backend = target.backend;
     let views = compute_views(g, backend);
-    let analysis = ExactI32StorageAnalysis::new(g);
     let (plans, choices): (Vec<_>, Vec<_>) = g
         .eqns
         .iter()
         .map(|eqn| {
-            plan_eqn_compiled(&analysis, g, eqn, target, &views, limits)
+            plan_eqn_compiled(g, eqn, target, &views, limits)
                 .map(|Planned { plan, choice }| (plan, choice))
         })
         .collect::<Result<Vec<_>, _>>()?
@@ -232,7 +231,7 @@ impl Drop for CompileScope {
 /// The number of per-equation plans made on this thread outside [`crate::compile`] so far (card 532
 /// SC-003, [`only_plans_outside_compile_are_counted`](compile::tests::only_plans_outside_compile_are_counted)).
 /// A consumer that has moved onto `compile` reaches the planner only through it, so running its path
-/// leaves this count unchanged; a direct `plan_eqn*` call, or a graph-wide analysis that plans every
+/// leaves this count unchanged; a direct `plan_eqn*` call, or a graph-wide check that plans every
 /// equation again (`storage_analysis`'s test-only `fixture_value_storage`, `state_commit`'s test-only
 /// `commit_for_test`), raises it.
 ///
@@ -262,35 +261,33 @@ pub(crate) fn per_eqn_plans_inside_compile() -> u64 {
     PLANS_INSIDE_COMPILE.with(Cell::get)
 }
 
-/// Plan one equation while reusing graph-wide representation analysis.
-///
-/// Bulk graph planners should construct one [`ExactI32StorageAnalysis`] and call this entry point for every
-/// equation. `caps` is the device's measured [`DeviceCaps`] (a runtime's `Context::device_caps()`, card 522): every device rule (display-watchdog chunk budgets, the RADV tiled-GEMM ceiling, tensor-core
+/// Plan one equation. `caps` is the device's measured [`DeviceCaps`] (a runtime's `Context::device_caps()`,
+/// card 522): every device rule (display-watchdog chunk budgets, the RADV tiled-GEMM ceiling, tensor-core
 /// support) reads it, never a `Backend`-keyed default. A caller with no measured device yet (a test, the
 /// plan-summary corpus) passes a documented fixture.
 ///
 /// A collective (`AllReduce`/`AllGather`) is refused with [`Capability::CollectiveInStage`]: it is a cut
 /// between stage programs, never an equation one plans.
-pub fn plan_eqn_analyzed<V: ValidationChannel>(
-    analysis: &ExactI32StorageAnalysis<'_, V>,
+pub fn plan_eqn<V: ValidationChannel>(
     g: &Graph<V>,
     eqn: &Eqn,
     backend: Backend,
     caps: &DeviceCaps,
     limits: &BodyLimits,
 ) -> Result<Plan, PlanError> {
-    plan_eqn_views_analyzed(analysis, g, eqn, backend, &HashMap::new(), caps, limits)
+    plan_eqn_views(g, eqn, backend, &HashMap::new(), caps, limits)
 }
 
 /// spec 024: map an output storage dtype to the kernel element `Ty`. bf16/f16 bridge to their own
-/// 2-byte kernel type (arithmetic still accumulates in f32); everything else runs the plain f32 kernel
-/// body. A free function so planners outside the main `match` (e.g. [`scatter_update_plan`]'s
-/// chunking) can build a dtype-correct `Body` too.
+/// 2-byte kernel type (arithmetic still accumulates in f32); I32 is its own element type (POOT-725: no
+/// I32 value is computed or stored through f32); everything else runs the plain f32 kernel body. A free
+/// function so planners outside the main `match` can build a dtype-correct `Body` too.
 pub(crate) fn fty_ty(d: DType) -> Ty {
     match d {
         DType::BF16 => Ty::BF16,
         DType::F16 => Ty::F16,
-        DType::F32 | DType::I32 | DType::I8 => Ty::F32,
+        DType::I32 => Ty::I32,
+        DType::F32 | DType::I8 => Ty::F32,
         DType::E4M3FN => {
             unreachable!("e4m3fn is rejected before scalar kernel type selection")
         }
@@ -323,27 +320,19 @@ pub fn dispatch_work<V: ValidationChannel>(g: &Graph<V>, eqn: &Eqn) -> u64 {
     numel(&g.aval(eqn.out).shape) as u64
 }
 
-/// Storage type for data-movement kernels. Unlike arithmetic kernels, these must preserve arbitrary I32
-/// bit patterns instead of routing them through the legacy f32 compute convention.
-pub(crate) fn movement_ty(d: DType, exact_i32: bool) -> Ty {
-    if exact_i32 { Ty::I32 } else { fty_ty(d) }
-}
-
-/// [`plan_eqn_analyzed`] with caller-owned whole-graph representation analysis, generalized to a strided
-/// -views map (spec 132 phase 1, `compute_views`). A `views`
+/// [`plan_eqn`] generalized to a strided-views map (spec 132 phase 1, `compute_views`). A `views`
 /// entry for a Transpose/Slice/Broadcast output routes that eqn to [`Plan::View`] (no dispatch) instead
 /// of a materialize copy; a `views` entry for a Binary/Fused/FusedRow operand routes that leaf's
 /// kernelgen read through the operand's [`Layout`] instead of assuming a plain row-major buffer. An
 /// empty map is a no-op: every arm falls through to the all-copy lowering, byte-identical to
-/// [`plan_eqn_analyzed`]. Reads every device rule
+/// [`plan_eqn`]. Reads every device rule
 /// (display-watchdog chunk budgets, the RADV tiled-GEMM ceiling) from the caller's `caps`, never a
 /// `Backend`-keyed default (card 522: Card 532's `compile` entry point threads a real
 /// per-device `DeviceCaps` to every call site; until a caller has one, it passes a documented fixture,
 /// e.g. `poot_test_util::device_caps::default_caps_for`). `out_shape`/`out_numel` are graph-derived, not
 /// caller-supplied (card 525 R469-019).
 #[allow(clippy::too_many_arguments)]
-pub fn plan_eqn_views_analyzed<V: ValidationChannel>(
-    analysis: &ExactI32StorageAnalysis<'_, V>,
+pub fn plan_eqn_views<V: ValidationChannel>(
     g: &Graph<V>,
     eqn: &Eqn,
     backend: Backend,
@@ -351,15 +340,13 @@ pub fn plan_eqn_views_analyzed<V: ValidationChannel>(
     caps: &DeviceCaps,
     limits: &BodyLimits,
 ) -> Result<Plan, PlanError> {
-    plan_eqn_choice_analyzed(analysis, g, eqn, backend, views, caps, limits)
-        .map(|planned| planned.plan)
+    plan_eqn_choice(g, eqn, backend, views, caps, limits).map(|planned| planned.plan)
 }
 
-/// [`plan_eqn_views_analyzed`], keeping the [`KernelChoice`] the plan was built from. A planner test that
+/// [`plan_eqn_views`], keeping the [`KernelChoice`] the plan was built from. A planner test that
 /// asserts on the choice calls it directly.
 #[allow(clippy::too_many_arguments)]
-pub fn plan_eqn_choice_analyzed<V: ValidationChannel>(
-    analysis: &ExactI32StorageAnalysis<'_, V>,
+pub fn plan_eqn_choice<V: ValidationChannel>(
     g: &Graph<V>,
     eqn: &Eqn,
     backend: Backend,
@@ -367,28 +354,19 @@ pub fn plan_eqn_choice_analyzed<V: ValidationChannel>(
     caps: &DeviceCaps,
     limits: &BodyLimits,
 ) -> Result<Planned, PlanError> {
-    plan_eqn_policy(analysis, g, eqn, backend, views, caps, limits)
+    plan_eqn_policy(g, eqn, backend, views, caps, limits)
 }
 
 /// The single-device per-equation plan [`crate::compile`] makes, in [`plan_graph`] and in its rewrite
 /// legality probes: `target`'s backend and caps and the graph's strided `views`.
 pub(crate) fn plan_eqn_compiled<V: ValidationChannel>(
-    analysis: &ExactI32StorageAnalysis<'_, V>,
     g: &Graph<V>,
     eqn: &Eqn,
     target: &Target,
     views: &HashMap<ValueId, Layout>,
     limits: &BodyLimits,
 ) -> Result<Planned, PlanError> {
-    plan_eqn_policy(
-        analysis,
-        g,
-        eqn,
-        target.backend,
-        views,
-        &target.caps,
-        limits,
-    )
+    plan_eqn_policy(g, eqn, target.backend, views, &target.caps, limits)
 }
 
 /// Whether `op` can read a BF16 const operand through a packed lane: the `Cast` kernel, and the fused regions
@@ -402,7 +380,6 @@ fn reads_narrow_operands(op: &OpKind) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 fn plan_eqn_policy<V: ValidationChannel>(
-    analysis: &ExactI32StorageAnalysis<'_, V>,
     g: &Graph<V>,
     eqn: &Eqn,
     backend: Backend,
@@ -410,8 +387,6 @@ fn plan_eqn_policy<V: ValidationChannel>(
     caps: &DeviceCaps,
     limits: &BodyLimits,
 ) -> Result<Planned, PlanError> {
-    analysis.ensure_graph(g)?;
-    analysis.ensure_eqn(eqn)?;
     let out_shape = g.aval(eqn.out).shape.clone();
     let out_numel = out_numel_saturating(&out_shape);
     // Card 1011: which operands a narrow reader (a `Cast`, or a fused region that widens its input) reads from
@@ -434,7 +409,6 @@ fn plan_eqn_policy<V: ValidationChannel>(
         Vec::new()
     };
     plan_eqn_views_impl(
-        analysis.requirement_table(),
         GraphTables::from(g),
         eqn,
         &out_shape,
@@ -462,11 +436,10 @@ fn out_numel_saturating(shape: &[usize]) -> usize {
 
 /// The per-equation planner body. `out_shape`/`out_numel` are the caller's already-derived
 /// [`Graph::aval`] of `eqn.out` (card 525 R469-019: no entry point takes a caller-supplied shape that
-/// could disagree with the graph's own inferred one). It reads only the value table and the exact-I32
-/// requirement table, so it is not generic over the validation channel and is compiled once in this crate.
+/// could disagree with the graph's own inferred one). It reads only the value table, so it is not generic
+/// over the validation channel and is compiled once in this crate.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_eqn_views_impl(
-    analysis: ExactI32Requirements<'_>,
     g: GraphTables<'_>,
     eqn: &Eqn,
     out_shape: &[usize],
@@ -510,7 +483,7 @@ pub(crate) fn plan_eqn_views_impl(
         if matches!(eqn.op, OpKind::Gather { .. })
             && (ids.len() != 2
                 || g.aval(ids[0]).dtype != DType::E4M3FN
-                || g.aval(ids[1]).dtype != DType::F32)
+                || g.aval(ids[1]).dtype != DType::I32)
         {
             return Err(site.refuse(Capability::DtypeLowering));
         }
@@ -518,7 +491,7 @@ pub(crate) fn plan_eqn_views_impl(
             && (ids.len() != 3
                 || g.aval(ids[0]).dtype != DType::E4M3FN
                 || g.aval(ids[1]).dtype != DType::E4M3FN
-                || g.aval(ids[2]).dtype != DType::F32
+                || g.aval(ids[2]).dtype != DType::I32
                 || g.aval(eqn.out).dtype != DType::E4M3FN)
         {
             return Err(site.refuse(Capability::DtypeLowering));
@@ -529,7 +502,7 @@ pub(crate) fn plan_eqn_views_impl(
                 && matches!(eqn.inputs.get(1), Some(Operand::Value(id)) if g.aval(*id).dtype == DType::E4M3FN)
                 && match eqn.inputs.get(2) {
                     Some(Operand::Lit(Scalar::I32(_))) => true,
-                    Some(Operand::Value(id)) => g.aval(*id).dtype == DType::F32,
+                    Some(Operand::Value(id)) => g.aval(*id).dtype == DType::I32,
                     _ => false,
                 };
             if !valid_storage {
@@ -566,8 +539,8 @@ pub(crate) fn plan_eqn_views_impl(
                 | OpKind::DynamicUpdateSlice { .. }
                 // Card 449 D1: the PLE sharded E4M3FN table lookup `fold_dense_bf16_row_gathers`
                 // rewrites into one equation (the Card 381 BF16 row's second source dtype). The
-                // table is the only E4M3FN operand - the index is exact I32 and the output F32 -
-                // and the storage analysis gives the table its packed lane (`StorageKind::E4m3Packed`, or
+                // table is the only E4M3FN operand - the index is I32 and the output F32 -
+                // and the storage plan gives the table its packed lane (`StorageKind::E4m3Packed`, or
                 // refuses it by name), so no dtype rule beyond "this op may read E4M3FN" is needed here.
                 | OpKind::DenseRowGather { source: DType::E4M3FN }
         ) {
@@ -593,14 +566,13 @@ pub(crate) fn plan_eqn_views_impl(
     // unchanged).
     let odt = g.aval(eqn.out).dtype;
     if odt == DType::I32
-        && analysis.required(eqn.out)
         && out_shape
             .iter()
             .try_fold(1usize, |n, &dim| n.checked_mul(dim))
             .is_none()
     {
         return Err(PlanError::BadShape(format!(
-            "exact I32 output shape {out_shape:?} overflows usize"
+            "I32 output shape {out_shape:?} overflows usize"
         )));
     }
     // spec 135: F16 bridges to Ty::F16 exactly like BF16 bridges to Ty::BF16 (storage is 2 bytes;
@@ -667,7 +639,6 @@ pub(crate) fn plan_eqn_views_impl(
             );
         }
         elementwise_ops!() => elementwise::plan(
-            analysis,
             g,
             eqn,
             out_shape,
@@ -693,7 +664,6 @@ pub(crate) fn plan_eqn_views_impl(
         attention_ops!() => attention::plan(g, eqn, backend, caps, limits)?,
         scan_ops!() => scan::plan(g, eqn, backend, caps, limits)?,
         cast_ops!() => cast::plan(
-            analysis,
             g,
             eqn,
             out_shape,
@@ -704,7 +674,7 @@ pub(crate) fn plan_eqn_views_impl(
             packed_operands.first().copied().unwrap_or(false),
         )?,
         movement_ops!() => movement::plan(
-            analysis, g, eqn, out_shape, out_numel, backend, views, odt, caps, limits,
+            g, eqn, out_shape, out_numel, backend, views, odt, caps, limits,
         )?,
         sampling_ops!() => sampling::plan(g, eqn, out_shape, out_numel, backend, odt, caps)?,
         imported_ops!() => {

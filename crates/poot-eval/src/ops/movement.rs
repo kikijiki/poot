@@ -18,15 +18,14 @@ use poot_tensor::{HostData, HostTensor};
 use super::index_rule::IndexValue;
 use crate::{EvalError, PackedEvalError, Value};
 
-/// An index-role operand's values, typed ([`IndexValue`]). An index-role operand is declared F32 or
-/// I32 ([`poot_tensor::DType::is_index_operand`]); any other dtype is refused.
+/// An index-role operand's values, typed ([`IndexValue`]). An index-role operand is I32; any other
+/// dtype is refused.
 pub(crate) fn index_values(t: &HostTensor) -> Result<Vec<IndexValue>, EvalError> {
     match t.data() {
-        HostData::F32(values) => Ok(values.iter().map(|&v| IndexValue::F32(v)).collect()),
         HostData::I32(words) => Ok(words.iter().map(|&v| IndexValue::I32(v)).collect()),
         _ => Err(EvalError::unsupported(
             "index",
-            format!("an index operand is F32 or I32, got {}", t.dtype()),
+            format!("an index operand is I32, got {}", t.dtype()),
         )),
     }
 }
@@ -153,8 +152,7 @@ pub(crate) mod generic {
         let rest: usize = base_shape[1..].iter().product::<usize>().max(1);
         let mut out = base.to_vec();
         for (p, &value) in inverse.iter().enumerate().take(pool) {
-            let keep_base = matches!(value, IndexValue::F32(v) if v == -1.0)
-                || matches!(value, IndexValue::I32(-1));
+            let keep_base = matches!(value, IndexValue::I32(-1));
             if keep_base {
                 continue;
             }

@@ -159,7 +159,7 @@ fn slot_decode_graph(descriptor: poot_quant::PackedWeight) -> (Graph, ValueId, V
     let b = Builder::new();
     let x = b.slot_named(Slot::Activation, "onehot", TensorType::f32(vec![1, K]));
     let y = poot_graph_ir::ops::packed_linear(&b, x, "layer", descriptor, None, None).unwrap();
-    let pos = b.slot(Slot::Pos, TensorType::f32(vec![]));
+    let pos = b.slot(Slot::Pos, TensorType::new(vec![], DType::I32));
     let cache = b.state_input(
         "decoded",
         TensorType::f32(vec![STEPS, OUT]),
@@ -177,12 +177,12 @@ fn slot_decode_graph(descriptor: poot_quant::PackedWeight) -> (Graph, ValueId, V
 /// row of an identity table as the one-hot activation.
 fn captured_decode_graph(descriptor: poot_quant::PackedWeight) -> Graph {
     let b = Builder::new();
-    let token = b.slot(Slot::Token, TensorType::f32(vec![]));
+    let token = b.slot(Slot::Token, TensorType::new(vec![], DType::I32));
     let eye = b.constant("eye", TensorType::f32(vec![K, K]));
     let row = b.gather_scalar(eye, 0, token);
     let x = b.reshape(row, vec![1, K]);
     let y = poot_graph_ir::ops::packed_linear(&b, x, "layer", descriptor, None, None).unwrap();
-    let pos = b.slot(Slot::Pos, TensorType::f32(vec![]));
+    let pos = b.slot(Slot::Pos, TensorType::new(vec![], DType::I32));
     let cache = b.state_input(
         "decoded",
         TensorType::f32(vec![STEPS, OUT]),
@@ -228,7 +228,7 @@ fn packed_decode_through_resident_path_is_bit_exact_on_ptx() {
             let k = column(step);
             let mut inputs = weights.clone();
             inputs.insert(x, one_hot(1, |_| k).into());
-            inputs.insert(pos, HostTensor::scalar(step as f32).into());
+            inputs.insert(pos, HostTensor::i32(vec![], vec![step as i32]).into());
             let y = decode.step(&graph, &inputs);
             assert_decode_row(
                 &format!("{format:?} {path} step {step}"),
@@ -288,14 +288,17 @@ fn packed_decode_through_capture_and_replay_is_bit_exact_on_ptx() {
             .unwrap();
 
         let mut first_inputs = consts.clone();
-        first_inputs.insert(token_id, HostTensor::scalar(column(0) as f32).into());
-        first_inputs.insert(pos_id, HostTensor::scalar(0.0).into());
+        first_inputs.insert(
+            token_id,
+            HostTensor::i32(vec![], vec![column(0) as i32]).into(),
+        );
+        first_inputs.insert(pos_id, HostTensor::i32(vec![], vec![0]).into());
         let mut decode = common::DecodeEntry::capture(&mut ptx, &graph, &first_inputs);
         for step in 0..STEPS {
             let k = column(step);
             let mut inputs = consts.clone();
-            inputs.insert(token_id, HostTensor::scalar(k as f32).into());
-            inputs.insert(pos_id, HostTensor::scalar(step as f32).into());
+            inputs.insert(token_id, HostTensor::i32(vec![], vec![k as i32]).into());
+            inputs.insert(pos_id, HostTensor::i32(vec![], vec![step as i32]).into());
             let y = decode.step(&graph, &inputs);
             assert_decode_row(
                 &format!("{format:?} decode_step {step}"),
@@ -508,7 +511,11 @@ fn run_indexed_case(
     let what = format!("{format:?}");
     let b = Builder::new();
     let x = b.slot_named(Slot::Activation, "moe-x", TensorType::f32(vec![rows, k]));
-    let ids = b.slot_named(Slot::Activation, "moe-ids", TensorType::f32(vec![rows]));
+    let ids = b.slot_named(
+        Slot::Activation,
+        "moe-ids",
+        TensorType::new(vec![rows], DType::I32),
+    );
     let y = poot_graph_ir::ops::packed_indexed_linear(&b, x, ids, &table).unwrap();
     let graph = b.finish(y);
     let mut inputs: HashMap<ValueId, Value> = HashMap::new();
@@ -527,8 +534,8 @@ fn run_indexed_case(
         );
     }
     inputs.insert(x.id(), indexed_one_hot(rows, k).into());
-    let selected: Vec<f32> = (0..rows).map(|m| expert_of(m) as f32).collect();
-    inputs.insert(ids.id(), HostTensor::f32(vec![rows], selected).into());
+    let selected: Vec<i32> = (0..rows).map(|m| expert_of(m) as i32).collect();
+    inputs.insert(ids.id(), HostTensor::i32(vec![rows], selected).into());
     let target = poot_executor::Device::target(&*ptx);
     let got = common::run_resident_prepared(ptx, &graph, &inputs, |named| {
         buffers.graph(named, target, table.descriptor)
@@ -672,7 +679,7 @@ fn packed_embedding_row_gather_is_bit_exact_on_ptx() {
                 vec![ids.len()]
             };
             let b = Builder::new();
-            let token = b.slot(Slot::Token, TensorType::f32(shape.clone()));
+            let token = b.slot(Slot::Token, TensorType::new(shape.clone(), DType::I32));
             let rows = poot_graph_ir::ops::packed_embedding(
                 &b,
                 token,
@@ -689,8 +696,8 @@ fn packed_embedding_row_gather_is_bit_exact_on_ptx() {
                 "{what}: compile claims the embedding"
             );
             let mut inputs = carriers(&graph, &owner);
-            let token_ids: Vec<f32> = ids.iter().map(|&id| id as f32).collect();
-            inputs.insert(token.id(), HostTensor::f32(shape, token_ids).into());
+            let token_ids: Vec<i32> = ids.iter().map(|&id| id as i32).collect();
+            inputs.insert(token.id(), HostTensor::i32(shape, token_ids).into());
             let out = common::run_resident(&mut ptx, &graph, &inputs);
             assert_eq!(out.as_f32().unwrap().len(), ids.len() * K, "{what}");
             let mut expected = vec![0.0f32; K];

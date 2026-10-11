@@ -971,18 +971,13 @@ fn exact_i32_gather_preserves_large_words() {
 
 #[test]
 fn selected_cast_checks_before_allocation() {
-    // Card 554d: the deleted `ExactI32Observer`'s reservation-forcing seam
-    // (`force_selected_cast_reservation_failure`, `ExactI32Error::SelectedCastReserve`,
-    // `try_new_uninit_arc_slice`, and every `selected_cast_*`/`*_unpublished_peak_bytes` accounting
-    // field) has no replacement: the unified walk's `Cast(I32 -> F32)` arm (`walk.rs::evaluate_cast`)
-    // allocates through a plain `initialized_arc_slice` call with no fallible-reservation
-    // instrumentation and no injectable failure point, and `EvalOptions`'s budget only gates a
-    // caller-stated element/byte ceiling, not an injected allocator fault. That whole "a forged huge
-    // selected-cast size fails cleanly before corrupting state" row is dropped here, flagged in the
-    // migration report rather than reinvented in `walk.rs` (which this task may not edit). The three
-    // still-live admission checks survive, migrated onto their new error shapes.
-    use crate::cast_authority::CastAuthorityError;
-    use crate::cast_authority::{ExactI32CastBounds, ExactI32CastRole};
+    // Card 554d: the deleted `ExactI32Observer`'s reservation-forcing seam has no replacement: the
+    // unified walk's `Cast(I32 -> F32)` arm (`walk.rs::evaluate_cast`) allocates through a plain
+    // `initialized_arc_slice` call with no fallible-reservation instrumentation.
+    //
+    // POOT-726: there is no per-family authorization of the cast any more. Whether a graph's cast is
+    // exact is proven at compile from value ranges (`poot-graph-plan`'s `compile`); the oracle keeps
+    // its run-time fault on the words it is handed.
     use crate::{EvalError, Value};
 
     let builder = Builder::new();
@@ -995,73 +990,27 @@ fn selected_cast_checks_before_allocation() {
         (table.id(), exact_view(vec![3], [0, 1, 2])),
         (index.id(), exact_view(vec![2], [0, 2])),
     ]);
-    let mut ceiling_role = |value: poot_graph_ir::ValueId| {
-        (value == cast.id()).then_some(ExactI32CastRole::HostCheckedSelector(ExactI32CastBounds {
-            selected_element_ceiling: 1,
-            expert_count: 3,
-        }))
-    };
-    let outcome = eval(
-        &graph,
-        &valid_inputs,
-        EvalOptions::new(EvalBudget::UNBOUNDED).cast_authority(&mut ceiling_role),
-    );
-    assert!(matches!(
-        outcome,
-        Err(EvalError::CastAuthority(ref boxed))
-            if matches!(**boxed, CastAuthorityError::SelectedElementLimit { actual: 2, limit: 1, .. })
-    ));
 
-    let mut range_role = |value: poot_graph_ir::ValueId| {
-        (value == cast.id()).then_some(ExactI32CastRole::HostCheckedSelector(ExactI32CastBounds {
-            selected_element_ceiling: 2,
-            expert_count: 3,
-        }))
-    };
     let error = eval(
         &graph,
         &HashMap::from([
             (table.id(), exact_view(vec![3], [0, 16_777_217, 2])),
             (index.id(), exact_view(vec![2], [0, 1])),
         ]),
-        EvalOptions::new(EvalBudget::UNBOUNDED).cast_authority(&mut range_role),
+        EvalOptions::new(EvalBudget::UNBOUNDED),
     )
     .unwrap_err();
-    // the exact-f32 integer range violation is now `EvalError::Cast(CastFault)`, not a
-    // named `ExactI32Error` variant.
+    // the exact-f32 integer range violation is `EvalError::Cast(CastFault)`, not a named
+    // `ExactI32Error` variant.
     assert!(matches!(
         &error,
         EvalError::Cast(fault) if fault.index == 1 && fault.value == crate::CastOperand::I32(16_777_217)
     ));
 
-    let mut expert_role = |value: poot_graph_ir::ValueId| {
-        (value == cast.id()).then_some(ExactI32CastRole::HostCheckedSelector(ExactI32CastBounds {
-            selected_element_ceiling: 2,
-            expert_count: 2,
-        }))
-    };
-    let expert_error = eval(
-        &graph,
-        &valid_inputs,
-        EvalOptions::new(EvalBudget::UNBOUNDED).cast_authority(&mut expert_role),
-    )
-    .unwrap_err();
-    assert!(matches!(
-        expert_error,
-        EvalError::CastAuthority(ref boxed)
-            if matches!(**boxed, CastAuthorityError::ExpertIdRange { index: 1, value: 2, experts: 2, .. })
-    ));
-
-    let mut accept_role = |value: poot_graph_ir::ValueId| {
-        (value == cast.id()).then_some(ExactI32CastRole::HostCheckedSelector(ExactI32CastBounds {
-            selected_element_ceiling: 2,
-            expert_count: 3,
-        }))
-    };
     let result = eval(
         &graph,
         &valid_inputs,
-        EvalOptions::new(EvalBudget::UNBOUNDED).cast_authority(&mut accept_role),
+        EvalOptions::new(EvalBudget::UNBOUNDED),
     )
     .unwrap()
     .output;
@@ -1069,6 +1018,62 @@ fn selected_cast_checks_before_allocation() {
         panic!("expected selected f32")
     };
     assert_eq!(result.as_f32().unwrap(), &[0.0, 2.0]);
+}
+
+/// POOT-726 SC-003, the oracle's half: a slot that declares `[0, vocab)` is checked when the step binds,
+/// before any equation runs, so `Token = vocab` is a typed `SlotRange` naming the word and its index, and
+/// `vocab - 1` evaluates.
+///
+/// Mutation (never left in the tree): delete the `check_declared_range` call in `walk.rs`'s
+/// `preflight_bindings`; the out-of-range bind reaches the gather's own index fault (`EvalError::Index`),
+/// not the declared-range refusal, and this test goes red.
+#[test]
+fn a_slot_outside_its_declared_range_is_refused_before_any_equation() {
+    use crate::{EvalError, SlotRangeFault};
+    use poot_graph_ir::{IndexRange, Slot};
+
+    const VOCAB: usize = 8;
+    let builder = Builder::new();
+    let table = builder.constant("table", TensorType::f32(vec![VOCAB, 2]));
+    let token = builder.slot_ranged(
+        Slot::Token,
+        TensorType::new(vec![3], DType::I32),
+        IndexRange::below(VOCAB).unwrap(),
+    );
+    let rows = builder.gather(table, 0, token);
+    let graph = builder.finish(rows);
+    let run = |words: [i32; 3]| {
+        eval(
+            &graph,
+            &HashMap::from([
+                (
+                    table.id(),
+                    Value::from(HostTensor::f32(
+                        vec![VOCAB, 2],
+                        (0..VOCAB * 2).map(|i| i as f32).collect(),
+                    )),
+                ),
+                (token.id(), exact_view(vec![3], words)),
+            ]),
+            EvalOptions::new(EvalBudget::UNBOUNDED),
+        )
+    };
+
+    assert!(run([0, 7, 3]).is_ok(), "every word below the vocab binds");
+    for (words, index, word) in [([0, 8, 3], 1, 8), ([-1, 2, 3], 0, -1)] {
+        let Err(EvalError::SlotRange(fault)) = run(words) else {
+            panic!("{words:?}: expected a declared-range refusal")
+        };
+        assert_eq!(
+            *fault,
+            SlotRangeFault {
+                value: token.id(),
+                index,
+                word,
+                range: IndexRange::below(VOCAB).unwrap(),
+            }
+        );
+    }
 }
 
 #[test]
@@ -1120,48 +1125,8 @@ fn i32_widening_to_f32_is_exact_only_within_two_pow_24() {
 }
 
 #[test]
-fn exact_i32_cast_authority_set_but_silent_is_missing_authorization() {
-    // Card 554d: this test used to be `exact_i32_rejects_generic_fallback`, proving the deleted
-    // exact-I32 lane's "admitted op list" was a list, not a default (`Transpose` and `BinOp::Max` were
-    // outside it) and exercising the deleted `eval_value` entry point's own narrower named-op-list
-    // fast path. The unified walk has no such list: every op dispatches on its own operands, so
-    // `ops::movement::transpose`/`ops::elementwise::binary_i32_word` (`BinOp::Max`)
-    // evaluate I32 operands unconditionally now - there is no "generic fallback" left to reject. Both
-    // rows are dropped (flagged in the migration report); `eval_value` is one of the eight deleted
-    // entry points with no narrower-path successor to call instead.
-    //
-    // The one surviving check: a `Cast(I32 -> F32)` over a `Gather` is unauthorized when
-    // `cast_authority` is configured but its closure returns `None` for this particular cast.
-    use crate::EvalError;
-    use crate::cast_authority::CastAuthorityError;
-
-    let cast_builder = Builder::new();
-    let table = helpers::i32_constant(&cast_builder, "table", vec![1]).unwrap();
-    let index = helpers::i32_constant(&cast_builder, "index", vec![1]).unwrap();
-    let selected = cast_builder.gather(table, 0, index);
-    let cast = cast_builder.cast(selected, DType::F32);
-    let cast_graph = cast_builder.finish(cast);
-    let mut silent_authority = |_: poot_graph_ir::ValueId| None;
-    let outcome = eval(
-        &cast_graph,
-        &HashMap::from([
-            (table.id(), exact_view(vec![1], [0])),
-            (index.id(), exact_view(vec![1], [0])),
-        ]),
-        EvalOptions::new(EvalBudget::UNBOUNDED).cast_authority(&mut silent_authority),
-    );
-    assert!(matches!(
-        outcome,
-        Err(EvalError::CastAuthority(ref boxed))
-            if matches!(**boxed, CastAuthorityError::MissingCastAuthorization { cast: missing } if missing == cast.id())
-    ));
-}
-
-#[test]
 fn i32_boundary_test_is_scalar_bounded() {
     use crate::EvalError;
-    use crate::cast_authority::CastAuthorityError;
-    use crate::cast_authority::{ExactI32CastBounds, ExactI32CastRole};
 
     let builder = Builder::new();
     let table = helpers::i32_constant(&builder, "boundary.table", vec![2]).unwrap();
@@ -1171,129 +1136,29 @@ fn i32_boundary_test_is_scalar_bounded() {
     let graph = builder.finish(cast);
     let indices = exact_view(vec![2], [0, 1]);
 
-    let run = |words: [i32; 2], experts: usize| {
-        let mut role = |value: poot_graph_ir::ValueId| {
-            (value == cast.id()).then_some(ExactI32CastRole::HostCheckedSelector(
-                ExactI32CastBounds {
-                    selected_element_ceiling: 2,
-                    expert_count: experts,
-                },
-            ))
-        };
+    let run = |words: [i32; 2]| {
         eval(
             &graph,
             &HashMap::from([
                 (table.id(), exact_view(vec![2], words)),
                 (index.id(), indices.clone()),
             ]),
-            EvalOptions::new(EvalBudget::UNBOUNDED).cast_authority(&mut role),
+            EvalOptions::new(EvalBudget::UNBOUNDED),
         )
     };
-    assert!(run([16_777_216, 2], 16_777_217).is_ok());
+    assert!(run([16_777_216, 2]).is_ok());
+    assert!(run([-16_777_216, 2]).is_ok());
+    // One past the exact f32 integers faults at its word, on either side.
     assert!(matches!(
-        run([-16_777_216, 2], 3),
-        Err(EvalError::CastAuthority(ref boxed))
-            if matches!(**boxed, CastAuthorityError::ExpertIdRange { index: 0, value: -16_777_216, .. })
-    ));
-    // the exact-f32 integer range violation (checked before the expert-id range, so it
-    // wins at word 0) is now `EvalError::Cast(CastFault)`, not a named `ExactI32Error` variant.
-    assert!(matches!(
-        &run([16_777_217, 2], 16_777_218),
+        &run([16_777_217, 2]),
         Err(EvalError::Cast(fault))
             if fault.index == 0 && fault.value == crate::CastOperand::I32(16_777_217)
     ));
     assert!(matches!(
-        run([-1, 3], 3),
-        Err(EvalError::CastAuthority(ref boxed))
-            if matches!(**boxed, CastAuthorityError::ExpertIdRange { .. })
+        &run([2, -16_777_217]),
+        Err(EvalError::Cast(fault))
+            if fault.index == 1 && fault.value == crate::CastOperand::I32(-16_777_217)
     ));
-}
-
-/// Coverage rows for the evaluator rejections this table must exercise: the kind of Cast source each
-/// `CastSourceNot*` error says the input is not. Every other `CastAuthorityError` variant maps to
-/// `None` explicitly, so a new variant fails to compile until it is classified here. (Card 554d: this
-/// used to classify the deleted `ExactI32Error`'s variants at large; the three `CastSourceNot*` rows
-/// now live on `cast_authority::CastAuthorityError` instead, which this now matches directly.)
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum ExactI32RejectionRow {
-    Gather,
-    GuardedGather,
-    Observation,
-}
-
-fn exact_i32_rejection_row(
-    error: &crate::cast_authority::CastAuthorityError,
-) -> Option<ExactI32RejectionRow> {
-    use crate::cast_authority::CastAuthorityError as E;
-    match error {
-        E::CastSourceNotGather { .. } => Some(ExactI32RejectionRow::Gather),
-        E::CastSourceNotGuardedGather { .. } => Some(ExactI32RejectionRow::GuardedGather),
-        E::CastSourceNotObservation { .. } => Some(ExactI32RejectionRow::Observation),
-        E::MissingCastAuthorization { .. }
-        | E::SelectedElementLimit { .. }
-        | E::ExpertIdRange { .. } => None,
-    }
-}
-
-#[test]
-fn exact_i32_rejection_table_covers_cast_source() {
-    use crate::EvalError;
-    use crate::cast_authority::CastAuthorityError;
-    use crate::cast_authority::{ExactI32CastBounds, ExactI32CastRole};
-
-    let mut covered = std::collections::BTreeSet::new();
-
-    // An authorized Cast whose input is not a Gather result rejects before any selected allocation.
-    let builder = Builder::new();
-    let left = helpers::i32_constant(&builder, "left", vec![2]).unwrap();
-    let right = helpers::i32_constant(&builder, "right", vec![2]).unwrap();
-    let difference = builder.binary(BinOp::Sub, left, right);
-    let cast = builder.cast(difference, DType::F32);
-    let graph = builder.finish(cast);
-    let mut role = |value: poot_graph_ir::ValueId| {
-        (value == cast.id()).then_some(ExactI32CastRole::HostCheckedSelector(ExactI32CastBounds {
-            selected_element_ceiling: 2,
-            expert_count: 3,
-        }))
-    };
-    let error = eval(
-        &graph,
-        &HashMap::from([
-            (left.id(), exact_view(vec![2], [2, 1])),
-            (right.id(), exact_view(vec![2], [1, 1])),
-        ]),
-        EvalOptions::new(EvalBudget::UNBOUNDED).cast_authority(&mut role),
-    )
-    .unwrap_err();
-    let EvalError::CastAuthority(error) = error else {
-        panic!("expected a cast-authority rejection, got {error:?}")
-    };
-    assert_eq!(
-        exact_i32_rejection_row(&error),
-        Some(ExactI32RejectionRow::Gather)
-    );
-    assert_eq!(
-        *error,
-        CastAuthorityError::CastSourceNotGather {
-            cast: cast.id(),
-            input: difference.id(),
-        }
-    );
-    covered.insert(ExactI32RejectionRow::Gather);
-
-    // Card 372c: the two new roles have their own tests below; record their rows so the coverage set
-    // stays exhaustive over the cast-source rows of `ExactI32RejectionRow`.
-    covered.insert(ExactI32RejectionRow::GuardedGather);
-    covered.insert(ExactI32RejectionRow::Observation);
-
-    assert_eq!(
-        covered.into_iter().collect::<Vec<_>>(),
-        [
-            ExactI32RejectionRow::Gather,
-            ExactI32RejectionRow::GuardedGather,
-            ExactI32RejectionRow::Observation,
-        ]
-    );
 }
 
 // --- Card 372c: the in-graph bounds guard on the CPU oracle ---
@@ -1304,7 +1169,6 @@ fn guarded_selector_graph(
     upper_exclusive: usize,
 ) -> (
     poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs>,
-    poot_graph_ir::ValueId,
     poot_graph_ir::ValueId,
     poot_graph_ir::ValueId,
 ) {
@@ -1322,24 +1186,7 @@ fn guarded_selector_graph(
         &[(ValidationId(3), "route.bounds", guard.witness)],
     )
     .unwrap();
-    (graph, table.id(), indices.id(), selected.id())
-}
-
-/// The authorization a guarded chain needs: the selector Cast is guarded, the flag Cast is a witness.
-fn guarded_roles(
-    selected: poot_graph_ir::ValueId,
-) -> impl FnMut(poot_graph_ir::ValueId) -> Option<crate::cast_authority::ExactI32CastRole> {
-    move |value| {
-        Some(if value == selected {
-            crate::cast_authority::ExactI32CastRole::GuardedSelector {
-                selected_element_ceiling: 16_777_216,
-            }
-        } else {
-            crate::cast_authority::ExactI32CastRole::Witness {
-                selected_element_ceiling: 16_777_216,
-            }
-        })
-    }
+    (graph, table.id(), indices.id())
 }
 
 #[test]
@@ -1350,14 +1197,14 @@ fn guarded_selector_publishes_in_range_ids_unchanged_on_cpu() {
     // (the identity half of the guard; goes red if the `Select` returned the zero branch for a valid
     // lane). The clamp is only observable on device (`wgpu_372c_guard_clamps_out_of_range_lanes`),
     // because CPU publication is refused as soon as any lane is out of range.
-    let (graph, table, indices, selected) = guarded_selector_graph(4);
+    let (graph, table, indices) = guarded_selector_graph(4);
     let value = eval(
         &graph,
         &HashMap::from([
             (table, exact_view(vec![4], [3, 0, 2, 1])),
             (indices, exact_view(vec![4], [0, 1, 2, 3])),
         ]),
-        EvalOptions::new(EvalBudget::UNBOUNDED).cast_authority(&mut guarded_roles(selected)),
+        EvalOptions::new(EvalBudget::UNBOUNDED),
     )
     .unwrap()
     .output;
@@ -1367,85 +1214,22 @@ fn guarded_selector_publishes_in_range_ids_unchanged_on_cpu() {
     assert_eq!(tensor.as_f32().unwrap(), [3.0, 0.0, 2.0, 1.0]);
 }
 
-/// [`guarded_selector_graph`] with the Gather replaced by arithmetic, so the guard is canonical but what
-/// it clamps is not a selector.
-fn guarded_non_gather_graph() -> (
-    poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs>,
-    poot_graph_ir::ValueId,
-    poot_graph_ir::ValueId,
-    poot_graph_ir::ValueId,
-    poot_graph_ir::ValueId,
-) {
-    use poot_graph_ir::ValidationId;
-
-    let builder = Builder::new();
-    let left = helpers::i32_constant(&builder, "route.left", vec![4]).unwrap();
-    let right = helpers::i32_constant(&builder, "route.right", vec![4]).unwrap();
-    let raw = builder.binary(BinOp::Sub, left, right);
-    let guard = builder.guard_index_bounds(raw, 4).unwrap();
-    let selected = builder.cast(guard.guarded, DType::F32);
-    let graph = helpers::finish_with_validations(
-        builder,
-        selected,
-        &[(ValidationId(3), "route.bounds", guard.witness)],
-    )
-    .unwrap();
-    (
-        graph,
-        left.id(),
-        right.id(),
-        selected.id(),
-        guard.guarded.id(),
-    )
-}
-
-#[test]
-fn guarded_selector_role_requires_the_guard_to_clamp_a_gather() {
-    use crate::EvalError;
-    use crate::cast_authority::CastAuthorityError;
-
-    // Mirror of the planner's `authorization_rejects_a_guard_over_something_that_is_not_a_gather`: a
-    // canonical guard clamping arithmetic is not a selector chain (card 371 authorizes a Cast over a
-    // Gather result), and the oracle must be as strict as the planner rather than lean on the exact-f32
-    // range.
-    let (graph, left, right, selected, guarded) = guarded_non_gather_graph();
-    let error = eval(
-        &graph,
-        &HashMap::from([
-            (left, exact_view(vec![4], [3, 2, 1, 0])),
-            (right, exact_view(vec![4], [0, 0, 0, 0])),
-        ]),
-        EvalOptions::new(EvalBudget::UNBOUNDED).cast_authority(&mut guarded_roles(selected)),
-    )
-    .unwrap_err();
-    let EvalError::CastAuthority(error) = error else {
-        panic!("expected a cast-authority rejection, got {error:?}")
-    };
-    assert_eq!(
-        *error,
-        CastAuthorityError::CastSourceNotGuardedGather {
-            cast: selected,
-            input: guarded,
-        }
-    );
-}
-
 #[test]
 fn guarded_selector_with_a_forged_bound_cannot_publish_inexact_lanes() {
     use crate::EvalError;
 
-    // A canonical guard over a Gather whose bound is 2^25, not a real expert count. Nothing checks the
-    // bound (`validate_cast_source` reads the shape; the role carries no expert count), so the clamp
-    // admits 2^24 + 1, which an f32 cannot hold. The witness passes (no lane reaches 2^25), so the
-    // exact-f32 lane range is the only guard against a published "exact" Cast with inexact lanes.
-    let (graph, table, indices, selected) = guarded_selector_graph(1 << 25);
+    // A guard over a Gather whose bound is 2^25, not a real expert count. The clamp admits 2^24 + 1,
+    // which an f32 cannot hold, and `compile` refuses this graph from its proven range. The oracle has
+    // no compile: its witness passes (no lane reaches 2^25), so the exact-f32 lane range is the only
+    // guard against a published "exact" Cast with inexact lanes.
+    let (graph, table, indices) = guarded_selector_graph(1 << 25);
     let result = eval(
         &graph,
         &HashMap::from([
             (table, exact_view(vec![4], [16_777_217, 0, 0, 0])),
             (indices, exact_view(vec![4], [0, 1, 2, 3])),
         ]),
-        EvalOptions::new(EvalBudget::UNBOUNDED).cast_authority(&mut guarded_roles(selected)),
+        EvalOptions::new(EvalBudget::UNBOUNDED),
     );
     // the exact-f32 integer range violation is now `EvalError::Cast(CastFault)`, not a
     // named `ExactI32Error` variant.
@@ -1463,14 +1247,14 @@ fn witness_counts_exactly_the_out_of_range_lanes() {
 
     // Table lanes -1 (negative), 4 (at the bound) and 9 (above it) are out of range; 1 is not. Expected
     // packet bits are the literal count, computed by the test, not the production reduce.
-    let (graph, table, indices, selected) = guarded_selector_graph(4);
+    let (graph, table, indices) = guarded_selector_graph(4);
     let error = eval(
         &graph,
         &HashMap::from([
             (table, exact_view(vec![4], [-1, 4, 9, 1])),
             (indices, exact_view(vec![4], [0, 1, 2, 3])),
         ]),
-        EvalOptions::new(EvalBudget::UNBOUNDED).cast_authority(&mut guarded_roles(selected)),
+        EvalOptions::new(EvalBudget::UNBOUNDED),
     )
     .unwrap_err();
     let EvalError::Validation(failure) = error else {
@@ -1488,14 +1272,14 @@ fn cpu_exact_eval_checks_the_packet_before_publishing() {
 
     // The guard clamps the bad lane so the primary value is computable, but publication must still be
     // refused: a published value would silently route every bad token to expert 0.
-    let (graph, table, indices, selected) = guarded_selector_graph(4);
+    let (graph, table, indices) = guarded_selector_graph(4);
     let result = eval(
         &graph,
         &HashMap::from([
             (table, exact_view(vec![4], [0, 1, 2, 7])),
             (indices, exact_view(vec![4], [0, 1, 2, 3])),
         ]),
-        EvalOptions::new(EvalBudget::UNBOUNDED).cast_authority(&mut guarded_roles(selected)),
+        EvalOptions::new(EvalBudget::UNBOUNDED),
     );
     assert!(
         matches!(result, Err(EvalError::Validation(_))),
@@ -1510,93 +1294,9 @@ fn cpu_exact_eval_checks_the_packet_before_publishing() {
                 (table, exact_view(vec![4], [0, 1, 2, 3])),
                 (indices, exact_view(vec![4], [0, 1, 2, 3])),
             ]),
-            EvalOptions::new(EvalBudget::UNBOUNDED).cast_authority(&mut guarded_roles(selected)),
+            EvalOptions::new(EvalBudget::UNBOUNDED),
         )
         .is_ok()
-    );
-}
-
-/// The `Sub`-fed Cast of [`exact_i32_rejection_table_covers_owner_facts_and_cast_source`], reused by the
-/// two card 372c role tests: an authorized Cast over an unauthorized chain.
-fn unauthorized_cast_graph() -> (
-    poot_graph_ir::Graph,
-    HashMap<poot_graph_ir::ValueId, crate::Value>,
-    poot_graph_ir::ValueId,
-    poot_graph_ir::ValueId,
-) {
-    let builder = Builder::new();
-    let left = helpers::i32_constant(&builder, "left", vec![2]).unwrap();
-    let right = helpers::i32_constant(&builder, "right", vec![2]).unwrap();
-    let difference = builder.binary(BinOp::Sub, left, right);
-    let cast = builder.cast(difference, DType::F32);
-    let graph = builder.finish(cast);
-    let inputs = HashMap::from([
-        (left.id(), exact_view(vec![2], [2, 1])),
-        (right.id(), exact_view(vec![2], [1, 1])),
-    ]);
-    (graph, inputs, cast.id(), difference.id())
-}
-
-#[test]
-fn guarded_selector_role_requires_a_canonical_guard() {
-    use crate::EvalError;
-    use crate::cast_authority::CastAuthorityError;
-    use crate::cast_authority::ExactI32CastRole;
-
-    // Naming the guarded role does not grant its weaker lane checks: the evaluator looks for the guard
-    // in the graph and finds a plain Sub.
-    let (graph, inputs, cast, difference) = unauthorized_cast_graph();
-    let mut role = |value: poot_graph_ir::ValueId| {
-        (value == cast).then_some(ExactI32CastRole::GuardedSelector {
-            selected_element_ceiling: 2,
-        })
-    };
-    let error = eval(
-        &graph,
-        &inputs,
-        EvalOptions::new(EvalBudget::UNBOUNDED).cast_authority(&mut role),
-    )
-    .unwrap_err();
-    let EvalError::CastAuthority(error) = error else {
-        panic!("expected a cast-authority rejection, got {error:?}")
-    };
-    assert_eq!(
-        *error,
-        CastAuthorityError::CastSourceNotGuardedGather {
-            cast,
-            input: difference,
-        }
-    );
-}
-
-#[test]
-fn witness_cast_role_requires_an_observation_source() {
-    use crate::EvalError;
-    use crate::cast_authority::CastAuthorityError;
-    use crate::cast_authority::ExactI32CastRole;
-
-    // The witness role is only for a flag an ordered comparison produced. A Sub is not one.
-    let (graph, inputs, cast, difference) = unauthorized_cast_graph();
-    let mut role = |value: poot_graph_ir::ValueId| {
-        (value == cast).then_some(ExactI32CastRole::Witness {
-            selected_element_ceiling: 2,
-        })
-    };
-    let error = eval(
-        &graph,
-        &inputs,
-        EvalOptions::new(EvalBudget::UNBOUNDED).cast_authority(&mut role),
-    )
-    .unwrap_err();
-    let EvalError::CastAuthority(error) = error else {
-        panic!("expected a cast-authority rejection, got {error:?}")
-    };
-    assert_eq!(
-        *error,
-        CastAuthorityError::CastSourceNotObservation {
-            cast,
-            input: difference,
-        }
     );
 }
 

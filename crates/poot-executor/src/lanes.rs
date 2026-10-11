@@ -24,8 +24,6 @@ pub(crate) enum EncodeError {
 pub(crate) enum Encoding {
     /// The stored bytes are the lane's bytes.
     Verbatim,
-    /// An `i32` index table whose lane mirrors it as `f32`.
-    I32AsF32,
     /// Two-byte elements, zero-padded to a whole `u32` word.
     PackedWords,
     /// Card 1007: as [`Encoding::PackedWords`], once every element is a finite binary16.
@@ -43,7 +41,6 @@ pub(crate) fn encoding_of(stored: DType, planned: BufferStorage) -> Option<Encod
         (DType::F16, p) if p == BufferStorage::f16() => Some(Encoding::Verbatim),
         (DType::BF16, p) if p == BufferStorage::bf16() => Some(Encoding::Verbatim),
         (DType::I32, p) if p == BufferStorage::i32() => Some(Encoding::Verbatim),
-        (DType::I32, p) if p == BufferStorage::i32_f32_mirror() => Some(Encoding::I32AsF32),
         // Two little-endian BF16 elements per u32 word is the stored byte order, padded to a word.
         (DType::BF16, p) if p == BufferStorage::bf16_packed() => Some(Encoding::PackedWords),
         // Card 1007: the same word for F16, element `i` in word `i / 2` at bit `(i % 2) * 16`.
@@ -77,7 +74,7 @@ fn row_widths(shape: &[usize]) -> (usize, usize) {
 /// padding) is the allocation's own zeros.
 pub(crate) fn encoded_len(encoding: Encoding, shape: &[usize], stored_len: usize) -> usize {
     match encoding {
-        Encoding::Verbatim | Encoding::I32AsF32 => stored_len,
+        Encoding::Verbatim => stored_len,
         Encoding::PackedWords | Encoding::PackedWordsFiniteF16 => stored_len.div_ceil(4) * 4,
         Encoding::RowPaddedWords => {
             let (width, padded) = row_widths(shape);
@@ -90,7 +87,7 @@ pub(crate) fn encoded_len(encoding: Encoding, shape: &[usize], stored_len: usize
 /// supplies bytes `r` of the `stored_len` stored bytes. Every encoding is element- or row-local, so any
 /// sub-range encodes on its own: this is the one definition of how a stored dtype lands in a lane, and it is
 /// what lets a device take a weight in chunks without a host copy of the whole. A byte past the stored data
-/// (a word's padding) is zero. An `I32AsF32` range is a whole number of words.
+/// (a word's padding) is zero.
 pub(crate) fn encode_range(
     encoding: Encoding,
     shape: &[usize],
@@ -112,16 +109,6 @@ pub(crate) fn encode_range(
     match encoding {
         Encoding::Verbatim | Encoding::PackedWords | Encoding::PackedWordsFiniteF16 => {
             copy_clipped(range.start, out, read);
-        }
-        Encoding::I32AsF32 => {
-            assert!(
-                range.start.is_multiple_of(4) && range.len().is_multiple_of(4),
-                "an I32 mirror range is whole words"
-            );
-            copy_clipped(range.start, out, read);
-            for word in out.as_chunks_mut::<4>().0 {
-                *word = (i32::from_le_bytes(*word) as f32).to_le_bytes();
-            }
         }
         Encoding::RowPaddedWords => {
             let (width, padded) = row_widths(shape);
@@ -178,19 +165,8 @@ pub(crate) fn encode_host(dtype: DType, bytes: &[u8], planned: BufferStorage) ->
     match (dtype, planned.element(), planned.dtype()) {
         (DType::F32, ElementKind::F32, LogicalDType::F32) => Some(bytes.to_vec()),
         (DType::I32, ElementKind::I32, LogicalDType::I32) => Some(bytes.to_vec()),
-        (DType::I32, ElementKind::F32, LogicalDType::I32) => Some(i32_to_f32_mirror(bytes)),
         _ => None,
     }
-}
-
-/// The F32 bit-pattern mirror of declared-I32 values (Card 621).
-fn i32_to_f32_mirror(bytes: &[u8]) -> Vec<u8> {
-    bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .flat_map(|c| (i32::from_le_bytes(*c) as f32).to_le_bytes())
-        .collect()
 }
 
 #[cfg(test)]
@@ -198,10 +174,7 @@ mod tests {
     use poot_target::BufferStorage;
     use poot_tensor::DType;
 
-    use super::{
-        EncodeError, Encoding, encode_range, encode_stored, encoded_len, encoding_of,
-        i32_to_f32_mirror,
-    };
+    use super::{EncodeError, Encoding, encode_range, encode_stored, encoded_len, encoding_of};
 
     /// POOT-1060: a stored E4M3FN table lands as `u32` words with every row of the last axis zero-padded to
     /// a whole word, so a width that is not a multiple of four starts the next row in the next word, and the
@@ -248,7 +221,6 @@ mod tests {
             BufferStorage::f16(),
             BufferStorage::bf16(),
             BufferStorage::i32(),
-            BufferStorage::i32_f32_mirror(),
             BufferStorage::bf16_packed(),
             BufferStorage::f16_packed(),
             BufferStorage::e4m3_packed(),
@@ -290,7 +262,7 @@ mod tests {
                 }
             }
         }
-        assert!(encodable >= 8, "the table exercises the encodable pairs");
+        assert!(encodable >= 7, "the table exercises the encodable pairs");
     }
 
     /// The encoders as they were before `encode_range`: one whole-buffer pass each, kept here as the oracle the
@@ -314,18 +286,17 @@ mod tests {
 
     /// POOT-1100 LP-3 (model-free half): every encoding, written in chunks of any size, lands the same bytes as
     /// the whole-buffer oracle. Chunk sizes are chosen to cut rows, words and elements in the middle (4 and 12 are
-    /// the I32 mirror's whole words; the rest are odd). Each lane is shown with a shape whose rows are not whole
+    /// whole words; the rest are odd). Each lane is shown with a shape whose rows are not whole
     /// words, so the row-padded encoding has padding to place.
     /// Mutation: in `encode_range`'s `RowPaddedWords` arm read the row from `row * width + lo` (forgetting the
     /// row start); every chunking that cuts a row goes red.
     #[test]
     fn every_encoding_lands_the_oracle_bytes_in_chunks_of_any_size() {
-        let cases: [(DType, BufferStorage, &[usize]); 8] = [
+        let cases: [(DType, BufferStorage, &[usize]); 7] = [
             (DType::F32, BufferStorage::f32(), &[3, 7]),
             (DType::F16, BufferStorage::f16(), &[5, 3]),
             (DType::BF16, BufferStorage::bf16(), &[5, 3]),
             (DType::I32, BufferStorage::i32(), &[3, 5]),
-            (DType::I32, BufferStorage::i32_f32_mirror(), &[3, 5]),
             (DType::BF16, BufferStorage::bf16_packed(), &[5, 3]),
             (DType::F16, BufferStorage::f16_packed(), &[5, 3]),
             (DType::E4M3FN, BufferStorage::e4m3_packed(), &[7, 5]),
@@ -350,7 +321,6 @@ mod tests {
             let encoding = encoding_of(dtype, storage).expect("an encodable pair");
             let oracle = match encoding {
                 Encoding::Verbatim => bytes.clone(),
-                Encoding::I32AsF32 => i32_to_f32_mirror(&bytes),
                 Encoding::PackedWords | Encoding::PackedWordsFiniteF16 => {
                     oracle_word_padded(&bytes)
                 }
@@ -366,9 +336,6 @@ mod tests {
                 oracle
             );
             for chunk in [4usize, 12, 5, 7, 13, 1000] {
-                if encoding == Encoding::I32AsF32 && chunk % 4 != 0 {
-                    continue;
-                }
                 let mut assembled = vec![0u8; oracle.len()];
                 let mut at = 0;
                 while at < oracle.len() {

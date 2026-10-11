@@ -32,7 +32,7 @@ fn is_fusable<V: ValidationChannel>(g: &Graph<V>, eqn: &Eqn) -> bool {
     }
 }
 
-fn is_i32_pointwise<V: ValidationChannel>(g: &Graph<V>, eqn: &Eqn) -> bool {
+pub(super) fn is_i32_pointwise<V: ValidationChannel>(g: &Graph<V>, eqn: &Eqn) -> bool {
     g.aval(eqn.out).dtype == DType::I32 && is_fusable(g, eqn)
 }
 
@@ -43,6 +43,48 @@ fn to_fused_op(op: &OpKind) -> FusedOp {
         OpKind::Select => FusedOp::Select,
         other => unreachable!("non-fusable op in a fused region: {}", other.name()),
     }
+}
+
+/// The pointwise equation `eqn` as a one-step [`FusedRegion`] and its leaves (its value operands, once
+/// each, in first-encounter order), or `None` when it is no pointwise step. The region computes what the
+/// equation computed: a later pass can extend it where a standalone equation has no room.
+pub(super) fn lone_pointwise_region<V: ValidationChannel>(
+    g: &Graph<V>,
+    eqn: &Eqn,
+) -> Option<(FusedRegion, Vec<ValueId>)> {
+    if !is_fusable(g, eqn) {
+        return None;
+    }
+    let mut leaves: Vec<ValueId> = Vec::new();
+    let inputs = eqn
+        .inputs
+        .iter()
+        .map(|operand| match operand {
+            Operand::Value(value) => {
+                let local = leaves
+                    .iter()
+                    .position(|leaf| leaf == value)
+                    .unwrap_or_else(|| {
+                        leaves.push(*value);
+                        leaves.len() - 1
+                    });
+                FusedOperand::Local(local)
+            }
+            Operand::Lit(scalar) => FusedOperand::Lit(*scalar),
+        })
+        .collect();
+    let step = FusedStep {
+        op: to_fused_op(&eqn.op),
+        inputs,
+    };
+    let n_inputs = leaves.len();
+    let region = FusedRegion {
+        n_inputs,
+        steps: vec![step],
+        output: n_inputs,
+        pack: Vec::new(),
+    };
+    Some((region, leaves))
 }
 
 /// Disjoint-set over eqn indices (the fusion grouping). Path-compressing find, union-by-min so the

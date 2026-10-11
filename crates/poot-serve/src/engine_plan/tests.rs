@@ -715,7 +715,10 @@ fn every_candidates_planned_bytes_equal_a_real_preparation_without_reading_weigh
 
 /// POOT-1066: the planned footprint of the fixture's whole domain, frozen as literals recorded from the
 /// per-candidate full-load planning pass at 79bbd35479 (before weights were sized instead of loaded), so the
-/// equality holds against the old numbers and not only against the code that replaced them.
+/// equality holds against the old numbers and not only against the code that replaced them. Activation moved
+/// with the plan, not with the weights: POOT-725 added the I32-to-F32 cast outputs (836616 -> 862664 at four
+/// rows) and POOT-1108 folds those casts into the regions around them, so their output buffers (and the
+/// intermediates of the chains that now end in the cast) are gone: 827336, below the pre-725 836616.
 ///
 /// Mutation: size a dense weight from `shape[..1]` in `Engine::weight_buffer`'s size-only path; `Weight`
 /// is no longer 5344 and this row goes red.
@@ -733,17 +736,17 @@ fn the_planned_footprints_match_the_numbers_the_full_load_pass_produced() {
         (
             4,
             64,
-            "Activation=836616 Input=55224 Meta=868 State=12288 Weight=5344",
+            "Activation=827336 Input=55224 Meta=868 State=12288 Weight=5344",
         ),
         (
             2,
             64,
-            "Activation=418392 Input=36824 Meta=868 State=6144 Weight=5344",
+            "Activation=413752 Input=36824 Meta=868 State=6144 Weight=5344",
         ),
         (
             1,
             64,
-            "Activation=209312 Input=27624 Meta=1220 State=3072 Weight=5344",
+            "Activation=206960 Input=27624 Meta=1220 State=3072 Weight=5344",
         ),
     ];
     let domain = candidates(&handle, &args);

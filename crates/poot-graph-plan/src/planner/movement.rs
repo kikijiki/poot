@@ -11,25 +11,19 @@ use poot_kernelgen::{MovementOp, MovementSpec, Storage, UpdateIndex};
 use poot_target::{Backend, DeviceCaps};
 
 /// The storage a movement over values of `dtype` reads and writes: the packed byte rows of an E4M3FN
-/// value, else one element per value in its movement type (an exact-I32 value keeps its i32 bits).
-pub(crate) fn movement_storage(dtype: DType, exact_i32: bool) -> Storage {
+/// value, else one element per value in its own element type (an I32 value keeps its i32 bits).
+fn movement_storage(dtype: DType) -> Storage {
     match dtype {
         DType::E4M3FN => Storage::BYTE_LANES,
         _ => Storage::Elements {
-            carrier: movement_ty(dtype, exact_i32),
+            carrier: fty_ty(dtype),
         },
     }
-}
-
-/// The element type of a movement's F32 or I32 index buffer.
-fn index_ty(exact_i32: bool) -> Ty {
-    if exact_i32 { Ty::I32 } else { Ty::F32 }
 }
 
 /// Plan one data-movement equation (including the e4m3fn packed forms) and refuse the collectives.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn plan(
-    analysis: ExactI32Requirements<'_>,
     g: GraphTables<'_>,
     eqn: &Eqn,
     out_shape: &[usize],
@@ -43,7 +37,7 @@ pub(super) fn plan(
     let site = Site::new(g, eqn, backend, limits);
     let shape = |vid: ValueId| g.aval(vid).shape.clone();
     let ids = value_ids(eqn);
-    let storage = movement_storage(odt, analysis.required(eqn.out));
+    let storage = movement_storage(odt);
     let packed = odt == DType::E4M3FN;
     // A packed payload is never read through a strided view: the layout has no row padding to stride over.
     let view = views.get(&eqn.out).filter(|_| !packed);
@@ -93,22 +87,15 @@ pub(super) fn plan(
         OpKind::Gather { axis } => {
             let data = shape(ids[0]);
             let index_shape = shape(ids[1]);
-            let exact_index = analysis.required(ids[1]);
             refuse_zero(out_shape.contains(&0) || data[*axis] == 0)?;
-            // An E4M3FN gather indexes by the graph's f32 index convention.
-            if packed && g.aval(ids[1]).dtype != DType::F32 {
-                return Err(site.refuse(Capability::DtypeLowering));
-            }
             generate(MovementOp::Gather {
                 in_shape: data,
                 axis: *axis,
-                index_dtype: index_ty(exact_index),
                 index_numel: numel(&index_shape),
             })?
         }
         OpKind::Scatter { axis: 0 } => generate(MovementOp::PermuteRows {
             src_shape: shape(ids[0]),
-            index_dtype: index_ty(analysis.required(ids[1])),
         })?,
         OpKind::Scatter { axis: 1.. } => {
             unreachable!(
@@ -125,16 +112,7 @@ pub(super) fn plan(
             // chunks by output-unit range (see `scatter_update_plan`) so a wide shared-pool KV write
             // (gemma4-dense batched prefill) does not trip `poot-gpu`'s display-watchdog `flush_work` cap
             // on its own.
-            let inverse_dtype = index_ty(analysis.required(ids[2]));
-            scatter_update_plan(
-                site,
-                backend,
-                &storage,
-                out_shape,
-                src_shape,
-                inverse_dtype,
-                caps,
-            )?
+            scatter_update_plan(site, backend, &storage, out_shape, src_shape, caps)?
         }
         OpKind::Transpose { perm } => {
             refuse_zero(out_shape.contains(&0))?;
@@ -208,23 +186,10 @@ pub(super) fn plan(
                     };
                     UpdateIndex::Static(index)
                 }
-                // An F32 literal is a dense index only; an E4M3FN update takes an I32 literal.
-                Operand::Lit(Scalar::F32(index)) if !packed => UpdateIndex::Static(*index as usize),
                 // A runtime index read from a buffer (G3d constant-shape decode): three input buffers
                 // (operand, update, index), so a captured dispatch is valid at every position. The index
-                // is read on the lane its value's component is stored on: an exact-I32 component (a
-                // paged/shared-pool physical slot, or an exact-I32 `Slot::Pos`) as i32, every other value
-                // as the f32 mirror. The element type is part of the request, so the two never share a
-                // kernel identity (R469-005, card 529) and the storage analysis sees which lane reads it.
-                Operand::Value(index_id) => {
-                    let index_aval = g.aval(*index_id);
-                    if packed && (index_aval.dtype != DType::F32 || !index_aval.shape.is_empty()) {
-                        return Err(site.refuse(Capability::DtypeLowering));
-                    }
-                    UpdateIndex::Runtime {
-                        dtype: index_ty(analysis.required(*index_id)),
-                    }
-                }
+                // is an I32 word, read as i32 on every backend.
+                Operand::Value(_) => UpdateIndex::Runtime,
                 _ => return Err(site.refuse(Capability::IndexOperand)),
             };
             if let UpdateIndex::Static(start) = index {

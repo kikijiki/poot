@@ -310,7 +310,7 @@ fn packed_kv_read_path_gpu_matches_cpu() {
     // pack + the slot-map gather (reverse permutation) on BOTH the i32 words and the f32 scales, then
     // unpack + dequant - the read path of one cached layer.
     let packed = b.pack_i8(codes); // [rows, 2] i32 - the storage word tensor
-    let idx = b.constant("idx", TensorType::f32(vec![rows]));
+    let idx = b.constant("idx", TensorType::new(vec![rows], DType::I32));
     let pg = b.gather(packed, 0, idx); // i32 gather (the byte-copy under test)
     let sg = b.gather(scale, 0, idx); // f32 scale gather, same permutation
     let un = b.unpack_i8(pg, cols); // [rows, cols] f32
@@ -320,7 +320,7 @@ fn packed_kv_read_path_gpu_matches_cpu() {
     let xd: Vec<f32> = (0..rows * cols)
         .map(|i| (i as f32 * 0.41).cos() * 6.0 - 1.0)
         .collect();
-    let idxd: Vec<f32> = (0..rows).rev().map(|i| i as f32).collect(); // [3,2,1,0]
+    let idxd: Vec<i32> = (0..rows).rev().map(|i| i as i32).collect(); // [3,2,1,0]
     let consts = [
         ConstFixture {
             name: "x",
@@ -328,7 +328,7 @@ fn packed_kv_read_path_gpu_matches_cpu() {
         },
         ConstFixture {
             name: "idx",
-            tensor: HostTensor::f32(vec![rows], idxd.clone()),
+            tensor: HostTensor::i32(vec![rows], idxd.clone()),
         },
     ];
     let got = run_once(exec.as_mut(), target, &g, &consts, &[]).unwrap();

@@ -19,8 +19,8 @@ use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
 use crate::components::ffn::{GatedFfnWeights, gated_ffn};
 use crate::components::linear::WeightError;
 use crate::components::standard::{
-    BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_embeddable_step,
-    standard_layer, standard_stack,
+    BlockInput, EmbeddablePhase, LayerNorms, LayerParams, StackParams, StackWeights, Step,
+    check_embeddable_step, standard_layer, standard_stack,
 };
 use crate::model::{
     ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, StepShape,
@@ -297,12 +297,12 @@ impl Model for Qwen2 {
         shape: StepShape,
     ) -> Result<Graph<ValidationOutputs>, TraceError> {
         let p = &self.params;
-        check_embeddable_step(self.family, phase, shape, p.max_positions)?;
+        let phase = check_embeddable_step(self.family, phase, shape, p.max_positions)?;
         let b = Builder::new();
         let step = match phase {
-            Phase::Prefill | Phase::Decode => Step::new(&b, shape),
-            Phase::PrefillEmbeds => Step::with_embeds(&b, shape, p.width),
-            Phase::Encode => Step::new(&b, shape).returning_hidden(),
+            EmbeddablePhase::Prefill | EmbeddablePhase::Decode => Step::new(&b, shape),
+            EmbeddablePhase::PrefillEmbeds => Step::with_embeds(&b, shape, p.width),
+            EmbeddablePhase::Encode => Step::new(&b, shape).returning_hidden(),
         };
         let step = if p.attention.is_sectioned() {
             step.with_mrope(&b)
@@ -707,6 +707,7 @@ mod tests {
             capacity: n(capacity),
             kv: KvLayout::Contiguous,
             logits: LogitRows::Last,
+            hidden: None,
         };
         let cases = [
             (Phase::Decode, shape(1, 2, 8), ShapeReason::DecodeTokens),
@@ -934,6 +935,7 @@ mod tests {
             capacity: NonZeroUsize::new(CAP).unwrap(),
             kv: KvLayout::Contiguous,
             logits: LogitRows::All,
+            hidden: None,
         };
         let g = model.trace(Phase::Prefill, shape).unwrap();
         let bound =

@@ -95,7 +95,7 @@ fn card158_arg_top_k_ties_stay_in_range() {
             .output
             .into_host()
             .unwrap()
-            .as_f32()
+            .as_i32()
             .unwrap()
             .iter()
             .map(|&v| v as usize)

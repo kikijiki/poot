@@ -54,7 +54,7 @@ dropped).
 ## How kernels connect to the graph executor
 
 A kernel binary does not execute on its own; it is bound to a compute `Plan` produced by
-`plan_eqn_analyzed`, which connects the import pipeline to the graph planning layer. `compile` runs
+`plan_eqn`, which connects the import pipeline to the graph planning layer. `compile` runs
 this planning as its last step.
 
 There are two kinds of kernel body:

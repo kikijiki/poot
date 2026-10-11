@@ -6,7 +6,6 @@ use poot_target::{Backend, DeviceCaps};
 /// Plan one Cast equation, matching the (input, output) dtype pair exhaustively.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn plan(
-    analysis: ExactI32Requirements<'_>,
     g: GraphTables<'_>,
     eqn: &Eqn,
     out_shape: &[usize],
@@ -74,19 +73,13 @@ pub(super) fn plan(
                     backend,
                     None,
                     [out_numel as u32, 1, 1],
-                ),
+                )?,
                 (DType::BF16, DType::F32) => cast(CastSpec::Bf16ToF32 { numel: out_numel })?,
                 // Card 372c: the guarded selector Cast and the witness flag Cast. Exact for every lane
                 // at or below 2^24, which the guard's bound and the device witness admission both hold.
                 // The reverse pair stays unwired; nothing needs it.
                 //
-                // Like a Gather index, the source is read in the representation
-                // `ExactI32StorageAnalysis` chose for it. Outside an exact component the source lives on
-                // the f32-mirror lane, whose bytes already are the F32 result, so the cast aliases.
-                // Reading it through `Slice<i32>` regardless voted the value to dense I32 storage while
-                // its other readers (a mirror Gather index, a movement op) still read `Slice<f32>`
-                // (spike-562 F-9).
-                (DType::I32, DType::F32) if !analysis.required(ids[0]) => Planned::alias(ids[0]),
+                // The source is an I32 value, read through `Slice<i32>` like every other reader of it.
                 (DType::I32, DType::F32) => cast(CastSpec::I32ToF32 { numel: out_numel })?,
                 (_, _) => {
                     return Err(site.refuse(Capability::DtypeLowering));

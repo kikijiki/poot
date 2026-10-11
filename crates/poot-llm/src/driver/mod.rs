@@ -48,6 +48,7 @@ pub mod open;
 pub mod placement;
 pub mod prefix_cache;
 mod reorder;
+mod snapshot;
 pub mod speculate;
 pub mod step;
 pub mod stops;
@@ -55,6 +56,8 @@ pub(crate) mod suffix;
 
 #[cfg(test)]
 mod device_tests;
+#[cfg(test)]
+mod hidden_carry_tests;
 #[cfg(test)]
 mod placed_tests;
 #[cfg(test)]
@@ -77,11 +80,12 @@ use poot_models::bert::{ATTENTION_MASK_SLOT, TOKEN_TYPE_SLOT};
 use poot_models::components::embed::{EMBEDS_AT_SLOT, EMBEDS_SLOT};
 use poot_models::components::standard::{STATE_READ_SLOT, STATE_WRITE_SLOT};
 use poot_models::idefics3::PIXELS_SLOT;
-use poot_models::model::{KvLayout, Phase, ShapeReason, StepShape, TraceError};
+use poot_models::model::{HiddenCarry, KvLayout, Phase, ShapeReason, StepShape, TraceError};
 use poot_models::mrope::MropePositionIds;
 use poot_models::qwen_vl_vision::{FRAME_SLOT, POS_H_SLOT, POS_W_SLOT, WINDOW_SLOT};
 use poot_profile::{Mark, Report, TimingSnapshot};
 use poot_quant::weights::WeightMap;
+use poot_tensor::DType;
 use poot_tensor::HostTensor;
 
 use crate::GenerationControl;
@@ -105,7 +109,8 @@ pub use open::{BackendChoice, open_executor, open_group, open_timed_executor};
 use placement::{Placed, Placement};
 pub use prefix_cache::{PrefixOutcome, PrefixSkip};
 pub use speculate::{
-    DraftPolicy, NotSpeculated, RowSpeculation, SpeculationCaps, SpeculationStats,
+    DraftPolicy, NotSpeculated, RollbackTiming, RowSpeculation, SpeculationCaps, SpeculationStats,
+    StepTime,
 };
 use step::PickPolicy;
 pub use step::{Admission, Release, RowResult, RowWork, SeqId, SeqRequest, StepRow};
@@ -177,8 +182,8 @@ pub fn program_retention(program: &StagedProgram<ValidationOutputs>) -> Retentio
         for (_, plan) in p.planned() {
             match plan {
                 poot_graph_plan::Plan::Dispatches(dispatches) => {
-                    for dispatch in dispatches {
-                        own(&dispatch.key, &dispatch.body, &mut retention);
+                    for dispatch in dispatches.iter() {
+                        own(dispatch.key(), dispatch.body(), &mut retention);
                     }
                 }
                 poot_graph_plan::Plan::Alias(_) | poot_graph_plan::Plan::View { .. } => {}
@@ -219,6 +224,11 @@ pub struct DriverOptions {
     pub charge: RetentionCharge,
     /// How a decode row proposes tokens to verify ([`speculate`]).
     pub draft: DraftPolicy,
+    /// The widest verify window the programs of a later step read the hidden-state carry over; `Some`
+    /// makes every target program write the carry ([`StepShape::hidden`]), sized for the window or the
+    /// widest prefill piece, whichever is larger. The draft policy that consumes the carry sets it;
+    /// `None` writes none.
+    pub hidden_window: Option<NonZeroUsize>,
 }
 
 /// One sequence to generate. `sampler` carries its own knobs, penalty history, constraint and seed.
@@ -325,6 +335,8 @@ pub struct DriverStats {
     pub host_picks: u64,
     /// What the draft policy did across the rows stepped.
     pub speculation: SpeculationStats,
+    /// What a recurrent target's rollback cost the executor, on a driver built `with_phase_timing`.
+    pub rollback: RollbackTiming,
     /// What the expert residency managers did, summed over the executables (zero without a pool).
     pub residency: ResidencyCounters,
 }
@@ -340,13 +352,18 @@ pub enum Warm<'a> {
 }
 
 /// Whose program an entry is: the served model's, the draft model's under a
-/// [`DraftPolicy::DraftModel`], or the served model's beam-search entries ([`beam`]): contiguous
-/// layout at the beam width's row count, which serving never selects and the caps never count.
+/// [`DraftPolicy::DraftModel`], the served model's beam-search entries ([`beam`]): contiguous
+/// layout at the beam width's row count, which serving never selects and the caps never count, or
+/// the copies of a speculative round's rollback ([`snapshot`]), which move state and run no model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ModelRole {
     Target,
     Draft,
     Beam,
+    /// Copy recurrent rows from live state into the shadow set.
+    Snapshot,
+    /// Copy recurrent rows from the shadow set back into live state.
+    Restore,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -506,7 +523,7 @@ struct StepData {
     pos: Vec<i32>,
     read: Vec<i32>,
     write: Vec<i32>,
-    lora: Vec<f32>,
+    lora: Vec<i32>,
     seed: Vec<i32>,
     params: Vec<f32>,
     top_k: Vec<i32>,
@@ -574,6 +591,11 @@ pub struct Driver {
     time_phases: bool,
     /// The expert pool, when routed experts are paged ([`Driver::with_expert_pool`]).
     pool: Option<ExpertPool>,
+    /// The hidden-state carry every target program writes: one value per driver, built once at the
+    /// first `prepare` from [`DriverOptions::hidden_window`] and the widest admitted prefill piece. State is keyed by
+    /// (name, aval) inside an executable, so a program that declared another extent would bind a
+    /// separate zero-filled buffer and its readers would see stale rows.
+    hidden: Option<HiddenCarry>,
 }
 
 /// Paged routed experts: the pool's rows per selection and one residency manager per executable (each
@@ -705,6 +727,7 @@ impl Driver {
             capacity: options.capacity,
             kv: KvLayout::Contiguous,
             logits: poot_models::model::LogitRows::Last,
+            hidden: None,
         };
         let graph = handle
             .model()
@@ -755,6 +778,45 @@ impl Driver {
             caps: None,
             time_phases: false,
             pool: None,
+            hidden: None,
+        }
+    }
+
+    /// Fix the driver's hidden-state carry, once: `carry_window` positions for a verify window, at
+    /// least the widest prefill piece the chunk plan admits (a prompt chunk writes its positions in
+    /// one step), so the carry holds every position a step writes and every program declares the same
+    /// extent. A later call keeps the first value.
+    fn plan_hidden_carry(&mut self) {
+        if self.hidden.is_some() {
+            return;
+        }
+        let Some(window) = self.options.hidden_window else {
+            return;
+        };
+        let widest = self
+            .chunks
+            .admitted_pieces()
+            .into_iter()
+            .filter_map(|piece| match piece {
+                chunks::Piece::Prefill(tokens) => Some(tokens),
+                chunks::Piece::Decode => None,
+            })
+            .fold(window, Ord::max);
+        self.hidden = Some(HiddenCarry { positions: widest });
+    }
+
+    /// The hidden-state carry `role`'s programs write: the target's, identically for every key, and
+    /// none for a draft model, a beam or an encode step (its own executable). The rollback copies
+    /// trace the target's decode program as their state schema, so they see the carry too (and leave
+    /// it out: a `Handoff` value is never rolled back).
+    fn hidden_of(&self, role: ModelRole) -> Option<HiddenCarry> {
+        if matches!(
+            role,
+            ModelRole::Target | ModelRole::Snapshot | ModelRole::Restore
+        ) {
+            self.hidden
+        } else {
+            None
         }
     }
 
@@ -771,6 +833,7 @@ impl Driver {
             capacity: self.options.capacity,
             kv: KvLayout::Contiguous,
             logits: poot_models::model::LogitRows::Last,
+            hidden: None,
         };
         let graph = self
             .handle
@@ -906,7 +969,9 @@ impl Driver {
 
     fn options_for(&self, phase: Phase) -> CompileOptions {
         match phase {
-            Phase::Prefill | Phase::PrefillEmbeds | Phase::Encode => self.options.prefill.clone(),
+            Phase::Prefill | Phase::PrefillEmbeds | Phase::Encode | Phase::Mtp => {
+                self.options.prefill.clone()
+            }
             Phase::Decode => self.options.decode.clone(),
         }
     }
@@ -946,11 +1011,25 @@ impl Driver {
             .map_err(Unsupported::Trace)?;
         let residency = Self::check_state_rows(&handle, &graph, key.shape)?;
         if key.role == ModelRole::Draft && residency == StateResidency::Recurrent {
-            return Err(Unsupported::Speculation(SpeculationRefusal::RecurrentState).into());
+            return Err(Unsupported::Speculation(SpeculationRefusal::RecurrentDraft).into());
         }
-        let graph = bind_packed_weights(&graph, self.formats_of(key.role))
-            .map_err(Unsupported::PackedBind)?;
-        let (graph, _) = suffix::append_head(graph, key.head);
+        let graph = match key.role {
+            ModelRole::Snapshot | ModelRole::Restore => {
+                // A rollback copy moves state and binds no weight: its graph is the decode
+                // program's state schema, rows copied by index.
+                let entries = snapshot::snapshot_entries(&graph)
+                    .expect("a rollback entry is prepared for a model with recurrent state");
+                match key.role {
+                    ModelRole::Snapshot => entries.snapshot,
+                    _ => entries.restore,
+                }
+            }
+            _ => {
+                let graph = bind_packed_weights(&graph, self.formats_of(key.role))
+                    .map_err(Unsupported::PackedBind)?;
+                suffix::append_head(graph, key.head).0
+            }
+        };
         let mut slots = Prepared::slots_of(&graph)?;
         let output = graph.aval(graph.output).shape.clone();
         let mut compile = self.options_for(key.phase);
@@ -1123,13 +1202,16 @@ impl Driver {
     /// leading index: the step's rows for a private cache, one row per sequence for a paged layout's
     /// recurrent pool (a step's rows reach it through the state index inputs). A paged KV pool is the
     /// one value without a row axis: the `Positional` cache whose leading axis is the pool's slots.
-    /// Returns the graph's state residency, read from its state roles, never from a family.
+    /// A [`StateRole::Handoff`] value is the hidden-state carry: it must be the aval the step's
+    /// [`StepShape::hidden`] names, and a step that asked for one must carry one. Returns the graph's
+    /// state residency, read from its state roles, never from a family.
     fn check_state_rows(
         handle: &ModelHandle,
         graph: &Graph<ValidationOutputs>,
         shape: StepShape,
     ) -> Result<StateResidency, Unsupported> {
         let mut residency = StateResidency::KvOnly;
+        let mut carried = false;
         for pair in graph.state_pairs() {
             let leading = graph.aval(pair.input).shape.first().copied().unwrap_or(0);
             let pool = matches!(
@@ -1138,7 +1220,9 @@ impl Driver {
                     if pool_slots.get() == leading
             );
             let rows = match (shape.kv, pair.role) {
-                (KvLayout::Paged { seqs, .. }, StateRole::Recurrent) => seqs.get(),
+                (KvLayout::Paged { seqs, .. }, StateRole::Recurrent | StateRole::Handoff) => {
+                    seqs.get()
+                }
                 _ => shape.rows.get(),
             };
             if leading != rows && !pool {
@@ -1148,9 +1232,44 @@ impl Driver {
                     reason: ShapeReason::StateRowAxis { leading, rows },
                 }));
             }
-            if pair.role == StateRole::Recurrent {
-                residency = StateResidency::Recurrent;
+            match pair.role {
+                StateRole::Recurrent => residency = StateResidency::Recurrent,
+                StateRole::Handoff => {
+                    // The hidden-state carry: an f32 `[rows, positions, width]` value of exactly the
+                    // positions the step asked for. It is never rolled back, so it leaves a
+                    // KV-only graph KV-only.
+                    let aval = graph.aval(pair.input);
+                    let reason = match (aval.shape[..].get(1), shape.hidden) {
+                        _ if aval.dtype != DType::F32 || aval.shape.len() != 3 => {
+                            Some(ShapeReason::HiddenCarryLayout)
+                        }
+                        (_, None) => Some(ShapeReason::HiddenCarryUnrequested),
+                        (Some(&found), Some(asked)) if found != asked.positions.get() => {
+                            Some(ShapeReason::HiddenCarryPositions {
+                                found,
+                                expected: asked.positions.get(),
+                            })
+                        }
+                        _ => None,
+                    };
+                    if let Some(reason) = reason {
+                        return Err(Unsupported::Trace(TraceError::ShapeUnsupported {
+                            family: handle.config().family,
+                            shape,
+                            reason,
+                        }));
+                    }
+                    carried = true;
+                }
+                StateRole::Positional { .. } => {}
             }
+        }
+        if shape.hidden.is_some() && !carried {
+            return Err(Unsupported::Trace(TraceError::ShapeUnsupported {
+                family: handle.config().family,
+                shape,
+                reason: ShapeReason::HiddenCarryMissing,
+            }));
         }
         Ok(residency)
     }
@@ -1172,7 +1291,7 @@ impl Driver {
                     SlotRole::MropePosition => HostTensor::i32(shape, data.mrope()),
                     SlotRole::MapRead => HostTensor::i32(shape, data.read.clone()),
                     SlotRole::MapWrite => HostTensor::i32(shape, data.write.clone()),
-                    SlotRole::LoraIdx => HostTensor::f32(shape, data.lora.clone()),
+                    SlotRole::LoraIdx => HostTensor::i32(shape, data.lora.clone()),
                     SlotRole::Seed => HostTensor::i32(shape, data.seed.clone()),
                     SlotRole::Params => HostTensor::f32(shape, data.params.clone()),
                     SlotRole::TopK => HostTensor::i32(shape, data.top_k.clone()),
@@ -1268,7 +1387,9 @@ impl Driver {
     /// The model and executable `role`'s entries run: the served model's, or the loaded draft's.
     fn scope(&self, role: ModelRole) -> Result<(Arc<ModelHandle>, ExecutableId), DriverError> {
         match role {
-            ModelRole::Target | ModelRole::Beam => Ok((Arc::clone(&self.handle), self.exe)),
+            ModelRole::Target | ModelRole::Beam | ModelRole::Snapshot | ModelRole::Restore => {
+                Ok((Arc::clone(&self.handle), self.exe))
+            }
             ModelRole::Draft => self
                 .speculation
                 .draft

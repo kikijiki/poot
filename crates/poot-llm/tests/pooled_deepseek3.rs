@@ -112,6 +112,7 @@ fn options() -> DriverOptions {
         },
         charge: program_retention,
         draft: poot_llm::driver::DraftPolicy::Off,
+        hidden_window: None,
     }
 }
 
@@ -211,6 +212,7 @@ fn pooled_deepseek3_stages_run_the_contraction_and_pointwise_passes() {
         capacity: nz(CAPACITY),
         kv: KvLayout::Contiguous,
         logits: LogitRows::Last,
+        hidden: None,
     };
     let graph = model.trace(Phase::Decode, shape).unwrap();
     let formats = WeightFormats::from_weight_map(model.weights());

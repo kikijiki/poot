@@ -78,22 +78,14 @@ pub(super) fn rows_of(shape: &[usize]) -> (usize, usize) {
     }
 }
 
-/// An index buffer is F32 (the graph's f32 convention) or I32 (an exact-I32 chain).
-fn check_index_dtype(reason: &'static str, dtype: &Ty) -> Result<(), KernelGenError> {
-    if matches!(dtype, Ty::F32 | Ty::I32) {
-        return Ok(());
-    }
-    Err(KernelGenError::Unsupported { request: G, reason })
-}
-
 /// Where a runtime or baked update slice starts along its axis.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UpdateIndex {
     /// Baked into the body.
     Static(usize),
-    /// Read from the first element of an index buffer of element type `dtype` (`F32` or `I32`), so one
-    /// captured dispatch serves every position.
-    Runtime { dtype: Ty },
+    /// Read from the first element of an `I32` index buffer, so one captured dispatch serves every
+    /// position.
+    Runtime,
 }
 
 /// A window of a scatter's output units one dispatch writes: the unit `offset` the window starts at and the
@@ -125,12 +117,11 @@ pub enum MovementOp {
     /// The flat logical order is unchanged and the row length changes. A `PackedRows` reshape that moves
     /// the last axis needs it because row padding is not part of the logical tensor.
     Reshape { in_shape: Vec<usize> },
-    /// `out[.., g, ..] = in[.., index[g], ..]` along `axis`; `index` is an F32 or I32 buffer of
-    /// `index_numel` elements (a scalar index is 1).
+    /// `out[.., g, ..] = in[.., index[g], ..]` along `axis`; `index` is an `I32` buffer of `index_numel`
+    /// elements (a scalar index is 1).
     Gather {
         in_shape: Vec<usize>,
         axis: usize,
-        index_dtype: Ty,
         index_numel: usize,
     },
     /// The inputs joined along `axis`; their extents on it sum to `out_shape[axis]`.
@@ -146,19 +137,15 @@ pub enum MovementOp {
         index: UpdateIndex,
     },
     /// `out[p, ..] = inverse[p] >= 0 ? src[inverse[p], ..] : base[p, ..]`: the paged-KV scatter, where
-    /// `base` has `out_shape`, `inverse` is an F32 or I32 buffer (`inverse_dtype`) of `out_shape[0]` rows
-    /// (`-1` keeps the base row), and `window` restricts the dispatch to part of the output.
+    /// `base` has `out_shape`, `inverse` is an `I32` buffer of `out_shape[0]` rows (`-1` keeps the base
+    /// row), and `window` restricts the dispatch to part of the output.
     ScatterRows {
         src_shape: Vec<usize>,
-        inverse_dtype: Ty,
         window: Option<UnitWindow>,
     },
-    /// `out[index[s], ..] = src[s, ..]` for an F32 or I32 index (`index_dtype`) that is a permutation of
-    /// the output's rows. One thread owns one source element, so only [`Storage::Elements`] stores it.
-    PermuteRows {
-        src_shape: Vec<usize>,
-        index_dtype: Ty,
-    },
+    /// `out[index[s], ..] = src[s, ..]` for an `I32` index that is a permutation of the output's rows. One
+    /// thread owns one source element, so only [`Storage::Elements`] stores it.
+    PermuteRows { src_shape: Vec<usize> },
 }
 
 /// A data-movement kernel: the storage its tensors share, the output shape, the index mapping and how the
@@ -324,12 +311,10 @@ impl MovementSpec {
             MovementOp::Gather {
                 in_shape,
                 axis,
-                index_dtype,
                 index_numel,
             } => {
                 nonempty("in_shape", in_shape)?;
                 axis_in_range(*axis, in_shape.len())?;
-                check_index_dtype("a gather index is an F32 or I32 buffer", index_dtype)?;
                 if *index_numel == 0 {
                     return Err(KernelGenError::BelowMinimum {
                         generator: G,
@@ -415,20 +400,10 @@ impl MovementSpec {
                         }
                         Ok(())
                     }
-                    UpdateIndex::Runtime { dtype } => {
-                        check_index_dtype("an update-slice index is an F32 or I32 buffer", dtype)
-                    }
+                    UpdateIndex::Runtime => Ok(()),
                 }
             }
-            MovementOp::ScatterRows {
-                src_shape,
-                inverse_dtype,
-                window,
-            } => {
-                check_index_dtype(
-                    "a scatter inverse map is an F32 or I32 buffer",
-                    inverse_dtype,
-                )?;
+            MovementOp::ScatterRows { src_shape, window } => {
                 same_rank("src_shape", src_shape)?;
                 nonempty("src_shape", src_shape)?;
                 if rank == 0 || src_shape[1..] != self.out_shape[1..] {
@@ -452,11 +427,7 @@ impl MovementSpec {
                 }
                 Ok(())
             }
-            MovementOp::PermuteRows {
-                src_shape,
-                index_dtype,
-            } => {
-                check_index_dtype("a scatter index is an F32 or I32 buffer", index_dtype)?;
+            MovementOp::PermuteRows { src_shape } => {
                 if !matches!(self.storage, Storage::Elements { .. }) {
                     return Err(KernelGenError::Unsupported {
                         request: G,

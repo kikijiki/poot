@@ -110,7 +110,7 @@ fn attention_detail(eqn: &Eqn, choice: &KernelChoice, dispatch: &Dispatch) -> St
         return "-".to_string();
     };
     let poot_kernelgen::AttentionSchedule::Streaming { lanes } = spec.schedule;
-    let used = poot_kernelgen::BodyUse::measure(&dispatch.body)
+    let used = poot_kernelgen::BodyUse::measure(dispatch.body())
         .expect("an attention body states measurable workgroup memory");
     let key = match spec.key {
         poot_kernelgen::KeyLayout::Single => "single".to_string(),
@@ -142,16 +142,16 @@ fn describe_plan(eqn: &Eqn, plan: &Plan, choice: &KernelChoice) -> PlanCells {
         detail,
     };
     match plan {
-        Plan::Dispatches(dispatches) => match dispatches.as_slice() {
-            [dispatch] if dispatch.launch.meta.is_empty() => cells(
+        Plan::Dispatches(dispatches) => match &dispatches[..] {
+            [dispatch] if dispatch.launch().meta.is_empty() => cells(
                 "compute",
-                grid_str(dispatch.launch.grid),
+                grid_str(dispatch.launch().grid),
                 attention_detail(eqn, choice, dispatch),
             ),
-            [Dispatch { launch, .. }] => cells(
+            [dispatch] => cells(
                 "compute_meta",
-                grid_str(launch.grid),
-                format!("meta={:?}", launch.meta),
+                grid_str(dispatch.launch().grid),
+                format!("meta={:?}", dispatch.launch().meta),
             ),
             dispatches => PlanCells {
                 plan: "chunks",
@@ -162,14 +162,14 @@ fn describe_plan(eqn: &Eqn, plan: &Plan, choice: &KernelChoice) -> PlanCells {
                     "groups={:?}",
                     dispatches
                         .iter()
-                        .map(|d| d.launch.grid[0] / d.body.workgroup_size[0])
+                        .map(|d| d.launch().grid[0] / d.body().workgroup_size[0])
                         .collect::<Vec<_>>()
                 ),
                 detail: format!(
                     "meta={:?}",
                     dispatches
                         .iter()
-                        .map(|d| d.launch.meta.as_slice())
+                        .map(|d| d.launch().meta.as_slice())
                         .collect::<Vec<_>>()
                 ),
             },
@@ -244,7 +244,7 @@ fn write_line(out: &mut String, name: &str, eqn: &str, op: &str, c: &PlanCells) 
 
 /// The whole summary for one target: every corpus graph, in corpus order, compiled through the real
 /// [`compile`] entry point (card 523b: a hand-rolled `optimize`/`widen_mismatched_matmul_dtypes`/
-/// `plan_eqn_views_analyzed` sub-pipeline here was the same "second entry point" anti-pattern R469-021
+/// `plan_eqn_views` sub-pipeline here was the same "second entry point" anti-pattern R469-021
 /// found in the wgpu/ROCm/PTX executors before card 534a unified them onto `compile`).
 fn render(registry: &Registry, target: &Target) -> String {
     let mut out = String::from(HEADER);

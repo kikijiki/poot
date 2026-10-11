@@ -7,7 +7,7 @@ use poot_graph_ir::analysis::{
 use poot_graph_ir::op::{BinOp, RedOp};
 use poot_graph_ir::ops::{attention_masked, attention_masked_softcap};
 use poot_graph_ir::types::TensorType;
-use poot_graph_ir::{KeyLayout, KvBound};
+use poot_graph_ir::{KeyLayout, KvBound, value_ranges};
 use poot_graph_ir::{LayerIndex, LayerTagError};
 use poot_quant::PackedWeight;
 use poot_quant::format::WeightFormat;
@@ -2534,7 +2534,12 @@ fn card536a_attention_near_misses_decline_with_a_reason() {
     ));
 
     for (name, graph, expected) in cases {
-        let reason = match_attention(&graph, &producer_map(&graph), output_eqn(&graph));
+        let reason = match_attention(
+            &graph,
+            &producer_map(&graph),
+            &value_ranges(&graph),
+            output_eqn(&graph),
+        );
         assert_eq!(reason.err(), Some(expected), "{name}: wrong decline reason");
     }
 }
@@ -2628,6 +2633,7 @@ fn card536a_guards_have_killing_reasons() {
     let matched = match_attention(
         &decode_softcap,
         &producer_map(&decode_softcap),
+        &value_ranges(&decode_softcap),
         output_eqn(&decode_softcap),
     );
     assert_eq!(
@@ -2657,7 +2663,13 @@ fn card536a_guards_have_killing_reasons() {
     let gqa_out = b.matmul(p, v);
     let gqa = b.finish(gqa_out);
     assert_eq!(
-        match_attention(&gqa, &producer_map(&gqa), output_eqn(&gqa)).err(),
+        match_attention(
+            &gqa,
+            &producer_map(&gqa),
+            &value_ranges(&gqa),
+            output_eqn(&gqa)
+        )
+        .err(),
         Some(AttentionDecline::GqaRepeatMismatch)
     );
 }
@@ -2678,7 +2690,12 @@ fn a_wide_head_dim_still_matches() {
     };
     for m in [1, 3] {
         let wide = build(m, 512);
-        let matched = match_attention(&wide, &producer_map(&wide), output_eqn(&wide));
+        let matched = match_attention(
+            &wide,
+            &producer_map(&wide),
+            &value_ranges(&wide),
+            output_eqn(&wide),
+        );
         assert!(
             matched.is_ok(),
             "M={m} D=512 must match: {:?}",
@@ -2703,8 +2720,13 @@ fn a_split_key_with_a_narrower_value_matches_as_a_split_attention() {
     let k = b.concat(3, &[k_nope, poot_graph_ir::ops::repeat_kv(&b, k_pe, hq)]);
     let out = attention_masked(&b, q, k, v, 1, 0.25, mask);
     let graph = b.finish(out);
-    let matched = match_attention(&graph, &producer_map(&graph), output_eqn(&graph))
-        .unwrap_or_else(|decline| panic!("the MLA chain must match, declined {decline:?}"));
+    let matched = match_attention(
+        &graph,
+        &producer_map(&graph),
+        &value_ranges(&graph),
+        output_eqn(&graph),
+    )
+    .unwrap_or_else(|decline| panic!("the MLA chain must match, declined {decline:?}"));
     assert_eq!(matched.k, k_nope.id());
     assert_eq!(matched.k_shared, Some(k_pe.id()));
     assert_eq!(matched.key, KeyLayout::Split { shared_dim: rope });
@@ -2790,8 +2812,13 @@ fn remove_guard(graph: &mut poot_graph_ir::Graph<poot_graph_ir::ValidationOutput
 fn the_guarded_live_composite_matches_as_a_live_attention() {
     for split in [false, true] {
         let graph = live_attention_graph(split, true);
-        let matched = match_attention(&graph, &producer_map(&graph), output_eqn(&graph))
-            .unwrap_or_else(|decline| panic!("split={split}: declined {decline:?}"));
+        let matched = match_attention(
+            &graph,
+            &producer_map(&graph),
+            &value_ranges(&graph),
+            output_eqn(&graph),
+        )
+        .unwrap_or_else(|decline| panic!("split={split}: declined {decline:?}"));
         let len = matched.len.expect("a live match carries its length");
         assert_eq!(matched.k_shared.is_some(), split);
         let OpKind::Attention(attrs) = matched.op() else {
@@ -2806,7 +2833,8 @@ fn the_guarded_live_composite_matches_as_a_live_attention() {
 
 /// Everything short of the full guard stays the generic chain, with a typed reason: a source without its
 /// select (K, V), a condition one key off, a condition over another length, a length no declared witness
-/// bounds by the capacity, and a length with no witness at all. Mutation: accept the named shape in the
+/// bounds by the capacity, and a length with no witness at all (POOT-726: the length's range comes from the
+/// guard's clamp, so its witness must be a declared validation output). Mutation: accept the named shape in the
 /// matcher; the row's near miss matches instead.
 #[test]
 fn live_near_misses_decline_with_a_reason() {
@@ -2924,6 +2952,7 @@ fn live_near_misses_decline_with_a_reason() {
         wrong_bound,
         AttentionDecline::LiveLengthUnproved,
     ));
+
     cases.push((
         "length with no declared witness",
         live_attention_graph(false, false),
@@ -2934,7 +2963,12 @@ fn live_near_misses_decline_with_a_reason() {
         graph
             .validate()
             .unwrap_or_else(|error| panic!("{name}: {error:?}"));
-        let reason = match_attention(&graph, &producer_map(&graph), output_eqn(&graph));
+        let reason = match_attention(
+            &graph,
+            &producer_map(&graph),
+            &value_ranges(&graph),
+            output_eqn(&graph),
+        );
         assert_eq!(reason.err(), Some(expected), "{name}: wrong decline reason");
     }
 }
@@ -3015,7 +3049,13 @@ fn card536a_scale_as_a_runtime_value_declines() {
     let graph = b.finish(graph_out);
 
     assert_eq!(
-        match_attention(&graph, &producer_map(&graph), output_eqn(&graph)).err(),
+        match_attention(
+            &graph,
+            &producer_map(&graph),
+            &value_ranges(&graph),
+            output_eqn(&graph)
+        )
+        .err(),
         Some(AttentionDecline::ScoreProduct),
         "a runtime-valued scale is a typed decline, not a dropped parameter"
     );

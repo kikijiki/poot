@@ -30,8 +30,8 @@ const ROWS: usize = 2;
 /// Rows of the step counter pool, which has no row axis.
 const COUNTER_ROWS: usize = 5;
 /// 2^24: above it an F32 cannot hold every integer. The I32 run folds this into its first inputs and
-/// subtracts it from the result before the output is cast to F32, so a pool kept on an F32 mirror lane
-/// rounds `2^24 + 1` to `2^24` and the result reads 0 where an exact lane reads 1.
+/// subtracts it from the result before the output is cast to F32, so a pool computed in F32 rounds
+/// `2^24 + 1` to `2^24` and the result reads 0 where an exact I32 lane reads 1.
 const EXACT_BASE: i32 = 16_777_216;
 
 fn fixture(dtype: DType) -> Fixture {
@@ -69,14 +69,14 @@ fn fixture(dtype: DType) -> Fixture {
     let next = b.binary(BinOp::Add, current, x);
     let updated = b.scatter_update(pool, next, write);
     let counted = b.binary_scalar(BinOp::Add, counter, one);
-    // The output is read back as F32 whatever the state's type: a host tensor of an I32 value that no
-    // kernel needs exactly is a mirrored lane the executor cannot hand out. The I32 result is shifted
-    // down by 2^24 first, in I32, so the cast carries small integers an F32 holds exactly.
+    // The output is the state's own type: an I32 state is read back as I32 words (a cast of carried
+    // words to F32 is not provable from the graph, POOT-726). The I32 result is still shifted down by
+    // 2^24, so the rows show the small integers the model computes.
     let shown = match dtype {
         DType::I32 => b.binary_scalar(BinOp::Sub, next, Scalar::I32(EXACT_BASE)),
         _ => next,
     };
-    let out = b.cast(b.concat(0, &[shown, counted]), DType::F32);
+    let out = b.concat(0, &[shown, counted]);
     let graph: Graph = b.finish_with_state(out, &[(pool, updated), (counter, counted)]);
     Fixture {
         name: "state_pool_row_reset",
@@ -190,12 +190,18 @@ fn run_dtype(exec: &mut dyn Executor, target: Target, dtype: DType) -> Result<()
             .map_err(|e| format!("{what}: step: {e}"))?
             .to_host()
             .map_err(|e| format!("{what}: read: {e}"))?;
-        let got: Vec<i32> = host
-            .as_f32()
-            .ok_or_else(|| format!("{what}: the output is not f32"))?
-            .iter()
-            .map(|&v| v as i32)
-            .collect();
+        let got: Vec<i32> = match dtype {
+            DType::I32 => host
+                .as_i32()
+                .ok_or_else(|| format!("{what}: the output is not i32"))?
+                .to_vec(),
+            _ => host
+                .as_f32()
+                .ok_or_else(|| format!("{what}: the output is not f32"))?
+                .iter()
+                .map(|&v| v as i32)
+                .collect(),
+        };
         if got != want {
             return Err(format!(
                 "{what}: slots {slots:?} live {live:?}: device {got:?} != oracle {want:?}"

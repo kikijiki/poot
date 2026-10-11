@@ -141,6 +141,7 @@ fn main() -> Result<()> {
         },
         charge: poot_llm::driver::program_retention,
         draft: policy,
+        hidden_window: None,
     };
     let mut driver = Driver::new(
         Arc::clone(&target),
@@ -181,6 +182,8 @@ fn main() -> Result<()> {
             skipped_sampler: after.skipped_sampler - before.skipped_sampler,
             skipped_no_room: after.skipped_no_room - before.skipped_no_room,
             skipped_no_proposal: after.skipped_no_proposal - before.skipped_no_proposal,
+            restored: after.restored - before.restored,
+            replayed: after.replayed - before.replayed,
         };
     }
     let acceptance = if measured.proposed > 0 {
@@ -190,7 +193,8 @@ fn main() -> Result<()> {
     };
     println!(
         "policy={policy_name} prompt_tokens={} new={new} decode_tok_s={:.1} acceptance={acceptance} \
-         rounds={} proposed={} accepted={} skipped_no_room={} skipped_no_proposal={} hash={hash:016x}",
+         rounds={} proposed={} accepted={} skipped_no_room={} skipped_no_proposal={} restored={} \
+         replayed={} hash={hash:016x}",
         prompt_tokens.len(),
         median(rates),
         measured.rounds,
@@ -198,6 +202,8 @@ fn main() -> Result<()> {
         measured.accepted,
         measured.skipped_no_room,
         measured.skipped_no_proposal,
+        measured.restored,
+        measured.replayed,
     );
     Ok(())
 }

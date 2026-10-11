@@ -204,10 +204,11 @@ impl MoeParams {
     }
 }
 
-/// The largest count the routing carries exactly: expert ids ride in F32.
+/// The largest count the routing carries exactly: the router's rank counts and slot comparisons are F32.
 const MAX_EXACT_ROWS: usize = 1 << 24;
 
-/// Refuse a step whose `tokens * top_k` routed rows, or whose expert count, exceed what F32 ids index exactly.
+/// Refuse a step whose `tokens * top_k` routed rows, or whose expert count, exceed what the F32 rank counts
+/// carry exactly.
 pub fn check_step(
     family: FamilyKey,
     shape: StepShape,
@@ -290,11 +291,12 @@ impl ExpertProjection {
 fn expert_rows(b: &Builder, bias: &Weight, ids: Traced, out: usize) -> Traced {
     let m = b.aval(ids).shape[0];
     let experts = bias.shape()[0];
-    let ones = b.binary_scalar(
+    let one = b.binary_scalar(
         BinOp::Add,
-        b.binary_scalar(BinOp::Mul, b.reshape(ids, vec![m, 1]), Scalar::F32(0.0)),
+        b.binary_scalar(BinOp::Mul, b.iota(1), Scalar::F32(0.0)),
         Scalar::F32(1.0),
     );
+    let ones = b.broadcast(b.reshape(one, vec![1, 1]), vec![m, 1]);
     b.indexed_matmul(
         ones,
         b.reshape(bias.declare_f32(b), vec![experts, 1, out]),
@@ -917,6 +919,7 @@ mod layout_tests {
                 capacity: NonZeroUsize::new(8).unwrap(),
                 kv: KvLayout::Contiguous,
                 logits: LogitRows::All,
+                hidden: None,
             },
         );
         let xs = b.constant("x", TensorType::f32(vec![1, TOKENS, WIDTH]));

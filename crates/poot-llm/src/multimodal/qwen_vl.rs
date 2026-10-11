@@ -796,6 +796,7 @@ pub(crate) mod fixture {
                         capacity: nz(n),
                         kv: KvLayout::Contiguous,
                         logits: LogitRows::All,
+                        hidden: None,
                     },
                 )
                 .unwrap();
@@ -883,6 +884,7 @@ pub(crate) mod fixture {
                     capacity: nz(text.config().max_positions),
                     kv: KvLayout::Contiguous,
                     logits: LogitRows::Last,
+                    hidden: None,
                 },
             )
             .unwrap();

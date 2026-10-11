@@ -665,7 +665,11 @@ fn a_timed_out_dispatch_through_the_device_trait_retains_its_allocations_and_poi
     let out_path = poot_codegen::artifact_path(&tmp, "spin_busy_sc011", codegen_target);
     poot_codegen::compile(&body, codegen_target, &out_path).expect("spin_busy must compile");
     let bytes = std::fs::read(&out_path).unwrap();
-    let compiled = poot_codegen::kernel_handle(&body, codegen_target, bytes);
+    let compiled = poot_codegen::kernel_handle(
+        &body,
+        poot_codegen::GpuTarget::try_from(codegen_target).expect("a byte-artifact target"),
+        bytes,
+    );
     let kernel = device
         .load_kernel("spin_busy_sc011", compiled)
         .expect("load the spin_busy kernel");
@@ -953,9 +957,10 @@ fn sliding_window_mask_from_pos_rocm_matches_cpu() {
     let q = b.constant("q", TensorType::f32(vec![1, hq, l, d]));
     let k = b.constant("k", TensorType::f32(vec![1, hkv, l, d]));
     let v = b.constant("v", TensorType::f32(vec![1, hkv, l, d]));
-    let pos = b.slot(
+    let pos = b.slot_ranged(
         poot_graph_ir::Slot::Pos,
         TensorType::new(vec![1, l], DType::I32),
+        poot_graph_ir::IndexRange::below(l).unwrap(),
     );
     let mask = poot_graph_ir::ops::causal_mask_from_pos(&b, pos, l, Some(window));
     let out = poot_graph_ir::ops::attention_prefill(&b, q, k, v, n_rep, scale, mask);

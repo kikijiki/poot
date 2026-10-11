@@ -1,7 +1,7 @@
 //! SC-001: for a one-equation graph over every `OpKind` family and every dtype tuple `infer` admits,
 //! `eval` returns the output aval's dtype and shape, never panics, and the same bits come back under
 //! every `EvalOptions` combination this walk offers (an observer attached or not, `keep_environment`
-//! set or not, a `cast_authority` that answers nothing attached on a graph with no I32 `Cast`).
+//! set or not).
 //!
 //! SC-005 (card 555): `Cast` used to admit every `(from, to)` pair at `infer` time and
 //! refuse nine of them only at `eval` time (the walk's declared `REFUSED_CASTS` table). Those nine
@@ -34,7 +34,6 @@ use poot_graph_ir::op::{ContractionHead, FusedOp, FusedOperand, FusedRegion, Fus
 use poot_graph_ir::{BinOp, Builder, OpKind, Operand, RedOp, StateRole, TensorType, UnOp};
 
 use super::helpers;
-use crate::cast_authority::CastAuthority;
 use crate::exact_value::ExactValue;
 use crate::observer::EvalObserver;
 use crate::ops;
@@ -46,19 +45,6 @@ use poot_tensor::HostTensor;
 struct NoOpObserver;
 impl EvalObserver for NoOpObserver {}
 
-/// A `cast_authority` that answers nothing, for graphs with no I32 `Cast` (SC-001's clause): if the
-/// walk ever asked it for a role, that would itself be a bug for a non-I32-cast graph, so this also
-/// doubles as a canary.
-struct SilentAuthority;
-impl CastAuthority for SilentAuthority {
-    fn role(
-        &mut self,
-        _cast: poot_graph_ir::ValueId,
-    ) -> Option<crate::cast_authority::ExactI32CastRole> {
-        None
-    }
-}
-
 /// Evaluate `graph`/`inputs` under every `EvalOptions` combination SC-001 names, asserting they all
 /// agree bit for bit (`ADR-0101`) and none panics. Returns the shared output on success, or the
 /// shared error (asserted identical in `Display` text across every combination) on failure.
@@ -67,14 +53,6 @@ fn eval_every_combination(
     graph: &poot_graph_ir::Graph,
     inputs: &HashMap<poot_graph_ir::ValueId, Value>,
 ) -> Result<Value, EvalError> {
-    // A `cast_authority` attached on a graph that DOES have an I32 Cast changes that cast's own
-    // admission (it then requires a role, SC-007) - SC-001's "every EvalOptions combination" clause
-    // is scoped to graphs with no I32 Cast specifically for exactly this reason.
-    let has_i32_cast = graph.eqns.iter().any(|eqn| {
-        matches!(eqn.op, poot_graph_ir::OpKind::Cast { .. })
-            && matches!(eqn.inputs.first(), Some(poot_graph_ir::Operand::Value(id)) if graph.aval(*id).dtype == DType::I32)
-    });
-
     let plain = eval(graph, inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).map(|r| r.output);
 
     let mut observer = NoOpObserver;
@@ -92,21 +70,8 @@ fn eval_every_combination(
     )
     .map(|r| r.output);
 
-    let mut authority = SilentAuthority;
-    let authorized = (!has_i32_cast).then(|| {
-        eval(
-            graph,
-            inputs,
-            EvalOptions::new(EvalBudget::UNBOUNDED).cast_authority(&mut authority),
-        )
-        .map(|r| r.output)
-    });
-
-    let mut combos: Vec<(&str, &Result<Value, EvalError>)> =
+    let combos: Vec<(&str, &Result<Value, EvalError>)> =
         vec![("observer", &observed), ("keep_environment", &kept)];
-    if let Some(authorized) = &authorized {
-        combos.push(("cast_authority", authorized));
-    }
 
     match &plain {
         Ok(value) => {
@@ -461,13 +426,13 @@ fn gather_scatter_scatter_update_evaluate() {
     let b = Builder::new();
     let base = b.constant("base", TensorType::f32(vec![3, 1]));
     let src = b.constant("src", TensorType::f32(vec![2, 1]));
-    let inv = b.constant("inv", TensorType::f32(vec![3]));
+    let inv = helpers::i32_constant(&b, "inv", vec![3]).unwrap();
     let out = b.scatter_update(base, src, inv);
     let g = b.finish(out);
     let inputs = dense_inputs([
         (base.id(), HostTensor::f32(vec![3, 1], vec![0.0, 0.0, 0.0])),
         (src.id(), HostTensor::f32(vec![2, 1], vec![9.0, 8.0])),
-        (inv.id(), HostTensor::f32(vec![3], vec![-1.0, 1.0, 0.0])),
+        (inv.id(), HostTensor::i32(vec![3], vec![-1, 1, 0])),
     ]);
     let out = eval_every_combination("scatter_update", &g, &inputs).unwrap();
     assert_eq!(out.as_host().unwrap().as_f32().unwrap(), &[0.0, 8.0, 9.0]);
@@ -600,7 +565,7 @@ fn dynamic_update_slice_pack_unpack_i8_arg_top_k_evaluate() {
     let g = b.finish(out);
     let inputs = dense_inputs([(x.id(), HostTensor::f32(vec![4], vec![2.0, 0.0, 3.0, 1.0]))]);
     let out = eval_every_combination("arg_top_k", &g, &inputs).unwrap();
-    assert_eq!(out.as_host().unwrap().as_f32().unwrap(), &[1.0, 3.0]);
+    assert_eq!(out.as_host().unwrap().as_i32().unwrap(), &[1, 3]);
 }
 
 #[test]
@@ -1016,28 +981,6 @@ fn every_infer_admitted_pair_evaluates() {
         ]
     );
 
-    // Probe: a BF16 table gathered by an F32 index does not match the
-    // Spec-376 lane (which requires an I32 index), so it falls to the dense walk's own `Gather`
-    // path (`ops::gather::gather`), which must widen the BF16 table words.
-    let b = Builder::new();
-    let table = b.constant("table", TensorType::new(vec![3, 2], DType::BF16));
-    let index = b.constant("index", TensorType::f32(vec![2]));
-    let out = b.gather(table, 0, index);
-    let g = b.finish(out);
-    let inputs = dense_inputs([
-        (
-            table.id(),
-            bf16_host(vec![3, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
-        ),
-        (index.id(), HostTensor::f32(vec![2], vec![2.0, 0.0])),
-    ]);
-    let out = eval_every_combination("gather bf16 table, f32 index", &g, &inputs).unwrap();
-    let Value::Host(t) = &out else {
-        panic!("expected dense, got {out:?}")
-    };
-    assert!(t.numel() > 0, "published an empty payload");
-    assert_eq!(t.to_f32().unwrap().as_ref(), &[5.0, 6.0, 1.0, 2.0]);
-
     // Probe: an F16 table (never in the Spec-376 admission table, which only matches
     // BF16) gathered by I32 ids falls to the dense `Value::Host` arm of `walk::evaluate_gather`
     // (`ops::gather::gather` over its f32 lane), which must decode through `to_f32` too.
@@ -1166,24 +1109,13 @@ fn f32_declared_input_bound_as_a_bf16_tensor_is_refused_at_bind_time() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// SC-001 (card 555): one index rule, every data dtype. `Gather` with an F32 index of `-1`, `1.5`,
-// `len` and `NaN`, and an I32 index of `-1` and `len`, over F32, BF16, I32 and E4M3FN data: each is
-// `EvalError::Index` with the matching `IndexFaultKind`, `position` and `len`.
+// SC-001 (card 555), POOT-725: one index rule, every data dtype. `Gather` with an I32 index of `-1` and `len`
+// over F32, BF16, I32 and E4M3FN data: each is `EvalError::Index` with the matching `IndexFaultKind`,
+// `position` and `len`. An F32 index never reaches the oracle: shape inference refuses it by name.
 //
-// Pre-change (the dense `gather`'s `index_view[position].round() as usize`, no bounds check): `1.5`
-// read row 2 (rounded), `len` panicked indexing past the table, `-1` read row 0 on the dense lane.
-//
-// Mutation (recorded): in `ops::index_rule::index_at`, read the F32 arm as
-// `let selected = value.round() as usize;` with no `is_finite`/`fract`/`< 0.0` checks at all (the
-// pre-card dense-walk `gather`'s exact rounding rule), keeping only the final `selected >= len`
-// range check. Every row below but the two `len`/`3` (OutOfRange) rows went green by accident
-// (`1.5.round() as usize == 2 < 3`, `(-1.0).round() as usize` wraps to a huge `usize` and the
-// `>= len` check still (coincidentally, on a 64-bit `usize`) fires) - `1.5` must be checked by its
-// own row, not inferred from `len`'s. Narrowing the F32 arm's probe to just `1.5` on F32 data
-// (`EvalError::Unsupported` from the dense lane's old-style panic path is no longer even reachable,
-// so the mutation instead quietly published the wrong row) is the row that actually turns red:
-// confirmed red (the F32/1.5/F32-data row published `20.0`, the row-2 value, instead of erroring),
-// reverted to the real `index_at`, confirmed green.
+// Mutation (recorded): in `ops::index_rule::index_at`, drop the `v < 0` check of the I32 arm
+// (`v as usize` wraps and the `>= len` check still fires, reporting OutOfRange): the `-1` rows go red on
+// the kind (`OutOfRange`, expected `Negative`).
 #[test]
 fn gather_index_faults_cover_every_data_dtype() {
     use crate::ops::index_rule::IndexFaultKind;
@@ -1196,7 +1128,7 @@ fn gather_index_faults_cover_every_data_dtype() {
         E4m3Fn,
     }
 
-    fn run(data: Data, index_is_i32: bool, bad: f32) -> Result<Value, EvalError> {
+    fn run(data: Data, bad: i32) -> Result<Value, EvalError> {
         let b = Builder::new();
         let table_ty = match data {
             Data::F32 => TensorType::f32(vec![3]),
@@ -1205,11 +1137,7 @@ fn gather_index_faults_cover_every_data_dtype() {
             Data::E4m3Fn => TensorType::new(vec![3], DType::E4M3FN),
         };
         let table = b.constant("table", table_ty);
-        let index = if index_is_i32 {
-            helpers::i32_constant(&b, "index", vec![]).unwrap()
-        } else {
-            b.constant("index", TensorType::f32(vec![]))
-        };
+        let index = helpers::i32_constant(&b, "index", vec![]).unwrap();
         let out = b.gather(table, 0, index);
         let g = b.finish(out);
 
@@ -1221,24 +1149,14 @@ fn gather_index_faults_cover_every_data_dtype() {
                 Value::Host(crate::fp8::encode_e4m3fn_tensor(vec![3], &[1.0, 2.0, 3.0]).unwrap())
             }
         };
-        let index_value = if index_is_i32 {
-            Value::from(HostTensor::i32(vec![], vec![bad as i32]))
-        } else {
-            Value::from(HostTensor::f32(vec![], vec![bad]))
-        };
+        let index_value = Value::from(HostTensor::i32(vec![], vec![bad]));
         let inputs = HashMap::from([(table.id(), table_value), (index.id(), index_value)]);
         eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).map(|r| r.output)
     }
 
-    let f32_cases: [(f32, IndexFaultKind); 4] = [
-        (-1.0, IndexFaultKind::Negative),
-        (1.5, IndexFaultKind::NotIntegral),
-        (3.0, IndexFaultKind::OutOfRange),
-        (f32::NAN, IndexFaultKind::NotFinite),
-    ];
-    let i32_cases: [(f32, IndexFaultKind); 2] = [
-        (-1.0, IndexFaultKind::Negative),
-        (3.0, IndexFaultKind::OutOfRange),
+    let cases: [(i32, IndexFaultKind); 2] = [
+        (-1, IndexFaultKind::Negative),
+        (3, IndexFaultKind::OutOfRange),
     ];
 
     for &(data, label) in &[
@@ -1247,17 +1165,8 @@ fn gather_index_faults_cover_every_data_dtype() {
         (Data::I32, "I32"),
         (Data::E4m3Fn, "E4M3FN"),
     ] {
-        for &(bad, kind) in &f32_cases {
-            let result = run(data, false, bad);
-            let Err(EvalError::Index(fault)) = &result else {
-                panic!("{label} data, F32 index {bad}: expected EvalError::Index, got {result:?}")
-            };
-            assert_eq!(fault.position, 0, "{label} data, F32 index {bad}");
-            assert_eq!(fault.len, 3, "{label} data, F32 index {bad}");
-            assert_eq!(fault.kind, kind, "{label} data, F32 index {bad}");
-        }
-        for &(bad, kind) in &i32_cases {
-            let result = run(data, true, bad);
+        for &(bad, kind) in &cases {
+            let result = run(data, bad);
             let Err(EvalError::Index(fault)) = &result else {
                 panic!("{label} data, I32 index {bad}: expected EvalError::Index, got {result:?}")
             };
@@ -1265,13 +1174,25 @@ fn gather_index_faults_cover_every_data_dtype() {
             assert_eq!(fault.len, 3, "{label} data, I32 index {bad}");
             assert_eq!(fault.kind, kind, "{label} data, I32 index {bad}");
         }
+        // A valid index still reads the right row (the fault rows above are not vacuous).
+        run(data, 1).expect("a valid I32 index must still gather");
     }
 
-    // A valid index still reads the right row on every data dtype (the fault rows above are not
-    // vacuous - the same graphs succeed on an in-range index).
-    for &data in &[Data::F32, Data::Bf16, Data::I32, Data::E4m3Fn] {
-        run(data, false, 1.0).expect("a valid F32 index must still gather");
-        run(data, true, 1.0).expect("a valid I32 index must still gather");
+    // An F32 index is a typed refusal of shape inference, whatever the data dtype.
+    for data in [DType::F32, DType::BF16, DType::I32, DType::E4M3FN] {
+        let err = poot_graph_ir::OpKind::Gather { axis: 0 }
+            .infer(&[TensorType::new(vec![3], data), TensorType::f32(vec![])])
+            .expect_err("an F32 gather index must be refused");
+        assert!(
+            matches!(
+                err,
+                poot_graph_ir::ShapeError::DtypeOp {
+                    op: "Gather",
+                    dtype: DType::F32
+                }
+            ),
+            "{data:?}: {err:?}"
+        );
     }
 }
 
@@ -1527,10 +1448,9 @@ fn movement_ops_match_the_literal_index_permutation_on_every_t_copy_lane() {
 // SC-004 (card 555): every other index reader goes through the one index rule.
 //
 // Mutation (recorded): in `ops::movement::generic::scatter_update`, change the `-1` keep-base guard
-// from `matches!(value, IndexValue::F32(v) if v == -1.0) || matches!(value, IndexValue::I32(-1))` to
-// `match value { IndexValue::F32(v) => v < 0.0, IndexValue::I32(v) => v < 0 }` (treat every negative
-// as keep-base). Confirmed red: the `-2.0` row below, which must fault, instead silently kept the
-// base row (no error, wrong-but-plausible output); reverted, confirmed green.
+// from `matches!(value, IndexValue::I32(-1))` to `match value { IndexValue::I32(v) => v < 0, .. }`
+// (treat every negative as keep-base). Confirmed red: the `-2` row below, which must fault, instead
+// silently kept the base row (no error, wrong-but-plausible output); reverted, confirmed green.
 #[test]
 fn scatter_update_dynamic_update_slice_indexed_matmul_arg_top_k_route_through_index_at() {
     use crate::ops::index_rule::IndexFaultKind;
@@ -1540,7 +1460,7 @@ fn scatter_update_dynamic_update_slice_indexed_matmul_arg_top_k_route_through_in
         let b = Builder::new();
         let base = b.constant("base", TensorType::f32(vec![3, 1]));
         let src = b.constant("src", TensorType::f32(vec![2, 1]));
-        let inv = b.constant("inv", TensorType::f32(vec![3]));
+        let inv = helpers::i32_constant(&b, "inv", vec![3]).unwrap();
         let out = b.scatter_update(base, src, inv);
         let g = b.finish(out);
         let base_value = HostTensor::f32(vec![3, 1], vec![7.0, 8.0, 9.0]);
@@ -1549,7 +1469,7 @@ fn scatter_update_dynamic_update_slice_indexed_matmul_arg_top_k_route_through_in
         let inputs = dense_inputs([
             (base.id(), base_value.clone()),
             (src.id(), src_value.clone()),
-            (inv.id(), HostTensor::f32(vec![3], vec![-1.0, 0.0, 1.0])),
+            (inv.id(), HostTensor::i32(vec![3], vec![-1, 0, 1])),
         ]);
         let out = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
             .unwrap()
@@ -1563,13 +1483,13 @@ fn scatter_update_dynamic_update_slice_indexed_matmul_arg_top_k_route_through_in
         );
 
         for (bad, kind) in [
-            (-2.0, IndexFaultKind::Negative),
-            (2.0, IndexFaultKind::OutOfRange),
+            (-2, IndexFaultKind::Negative),
+            (2, IndexFaultKind::OutOfRange),
         ] {
             let inputs = dense_inputs([
                 (base.id(), base_value.clone()),
                 (src.id(), src_value.clone()),
-                (inv.id(), HostTensor::f32(vec![3], vec![-1.0, bad, 1.0])),
+                (inv.id(), HostTensor::i32(vec![3], vec![-1, bad, 1])),
             ]);
             let err = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap_err();
             let EvalError::Index(fault) = &err else {
@@ -1579,13 +1499,13 @@ fn scatter_update_dynamic_update_slice_indexed_matmul_arg_top_k_route_through_in
         }
     }
 
-    // DynamicUpdateSlice: a runtime start past the window, and a non-integral start, both fault; a
-    // valid runtime start still writes.
+    // DynamicUpdateSlice: a runtime start past the window and a negative start both fault; a valid
+    // runtime start still writes.
     {
         let b = Builder::new();
         let operand = b.constant("operand", TensorType::f32(vec![4]));
         let update = b.constant("update", TensorType::f32(vec![2]));
-        let index = b.constant("index", TensorType::f32(vec![]));
+        let index = helpers::i32_constant(&b, "index", vec![]).unwrap();
         let out = b.dynamic_update_slice_dyn(operand, update, index, 0);
         let g = b.finish(out);
         let operand_value = HostTensor::f32(vec![4], vec![0.0, 0.0, 0.0, 0.0]);
@@ -1594,7 +1514,7 @@ fn scatter_update_dynamic_update_slice_indexed_matmul_arg_top_k_route_through_in
         let inputs = dense_inputs([
             (operand.id(), operand_value.clone()),
             (update.id(), update_value.clone()),
-            (index.id(), HostTensor::f32(vec![], vec![1.0])),
+            (index.id(), HostTensor::i32(vec![], vec![1])),
         ]);
         let out = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
             .unwrap()
@@ -1604,13 +1524,13 @@ fn scatter_update_dynamic_update_slice_indexed_matmul_arg_top_k_route_through_in
         assert_eq!(out.as_f32().unwrap(), &[0.0, 9.0, 8.0, 0.0]);
 
         for (bad, kind) in [
-            (3.0, IndexFaultKind::OutOfRange),
-            (2.5, IndexFaultKind::NotIntegral),
+            (3, IndexFaultKind::OutOfRange),
+            (-1, IndexFaultKind::Negative),
         ] {
             let inputs = dense_inputs([
                 (operand.id(), operand_value.clone()),
                 (update.id(), update_value.clone()),
-                (index.id(), HostTensor::f32(vec![], vec![bad])),
+                (index.id(), HostTensor::i32(vec![], vec![bad])),
             ]);
             let err = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap_err();
             let EvalError::Index(fault) = &err else {

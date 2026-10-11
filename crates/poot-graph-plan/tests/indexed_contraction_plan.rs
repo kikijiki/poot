@@ -32,6 +32,7 @@ fn target(backend: Backend) -> Target {
             Backend::SpirvVulkan => DeviceCaps::wgpu_rdna3_igpu(),
             Backend::Nvptx => DeviceCaps::ptx_default(),
             Backend::AmdGcn(_) => DeviceCaps::rocm_default(),
+            Backend::Aie(_) => unreachable!("an AIE target has no GPU DeviceCaps"),
         },
     }
 }
@@ -51,7 +52,7 @@ fn indexed(m: usize, gate: bool) -> Graph {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![m, K]));
     let w = b.constant("w", TensorType::f32(vec![EXPERTS, K, N]));
-    let ids = b.constant("ids", TensorType::f32(vec![m]));
+    let ids = b.constant("ids", TensorType::new(vec![m], DType::I32));
     let mut out = b.indexed_matmul(x, w, ids);
     if gate {
         let gate = b.constant("gate", TensorType::f32(vec![m]));
@@ -155,25 +156,28 @@ fn routed_gate_weighting_compiles_to_one_indexed_contraction_epilogue() {
     }
 }
 
-/// A non-f32 id operand has no generated lowering: the planner refuses with a typed error rather than reading an
-/// i32 id buffer as f32 words.
+/// An F32 id operand never reaches the planner: inference admits an I32 id only, with a typed `DtypeOp` error.
+///
+/// Mutation: admit `F32` in `check_index_dtype` (`op.rs`); the F32 id infers and this row goes red.
 #[test]
-fn an_i32_id_operand_is_refused() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![5, K]));
-    let w = b.constant("w", TensorType::f32(vec![EXPERTS, K, N]));
-    let ids = b.constant("ids", TensorType::new(vec![5], DType::I32));
-    let out = b.indexed_matmul(x, w, ids);
-    let g = b.finish(out);
-    for backend in backends() {
-        let error = compile(&g, &target(backend), &options())
-            .err()
-            .unwrap_or_else(|| panic!("{backend:?}: an i32 id operand must be refused"));
-        assert!(
-            format!("{error:?}").contains("IndexOperand"),
-            "{backend:?}: {error:?}"
-        );
-    }
+fn an_f32_id_operand_is_refused_by_inference() {
+    let error = OpKind::IndexedMatMul
+        .infer(&[
+            TensorType::f32(vec![5, K]),
+            TensorType::f32(vec![EXPERTS, K, N]),
+            TensorType::f32(vec![5]),
+        ])
+        .expect_err("an F32 id operand must be refused");
+    assert!(
+        matches!(
+            error,
+            poot_graph_ir::ShapeError::DtypeOp {
+                op: "IndexedMatMul",
+                dtype: DType::F32
+            }
+        ),
+        "{error:?}"
+    );
 }
 
 /// The checkpoint-order spelling: `indexed_matmul(x, transpose(w_enk, [0, 2, 1]), ids)` with `w_enk` `[E, N, K]`.
@@ -183,7 +187,7 @@ fn checkpoint_order(m: usize, second_consumer: bool) -> Graph {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![m, K]));
     let w = b.constant("w", TensorType::f32(vec![EXPERTS, N, K]));
-    let ids = b.constant("ids", TensorType::f32(vec![m]));
+    let ids = b.constant("ids", TensorType::new(vec![m], DType::I32));
     let w_ekn = b.transpose(w, vec![0, 2, 1]);
     let out = b.indexed_matmul(x, w_ekn, ids);
     if second_consumer {
@@ -275,7 +279,7 @@ fn a_sliced_then_transposed_weight_is_refused_by_layout() {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![5, K]));
     let w = b.constant("w", TensorType::f32(vec![EXPERTS, N, K + 3]));
-    let ids = b.constant("ids", TensorType::f32(vec![5]));
+    let ids = b.constant("ids", TensorType::new(vec![5], DType::I32));
     let sliced = b.slice(w, 2, 0, K);
     let out = b.indexed_matmul(x, b.transpose(sliced, vec![0, 2, 1]), ids);
     let g = b.finish(out);
@@ -302,7 +306,7 @@ fn a_checkpoint_order_weight_under_the_gate_epilogue_plans_no_transpose() {
             let b = Builder::new();
             let x = b.constant("x", TensorType::f32(vec![m, K]));
             let w = b.constant("w", TensorType::f32(vec![EXPERTS, N, K]));
-            let ids = b.constant("ids", TensorType::f32(vec![m]));
+            let ids = b.constant("ids", TensorType::new(vec![m], DType::I32));
             let gate = b.constant("gate", TensorType::f32(vec![m]));
             let product = b.indexed_matmul(x, b.transpose(w, vec![0, 2, 1]), ids);
             let out = b.binary(BinOp::Mul, product, b.reshape(gate, vec![m, 1]));
@@ -333,7 +337,7 @@ fn a_checkpoint_order_weight_under_the_gate_epilogue_plans_no_transpose() {
 fn bf16_experts(m: usize, checkpoint_order: bool, gate: bool) -> Graph {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![m, K]));
-    let ids = b.constant("ids", TensorType::f32(vec![m]));
+    let ids = b.constant("ids", TensorType::new(vec![m], DType::I32));
     let w = if checkpoint_order {
         let w = b.constant("w", TensorType::new(vec![EXPERTS, N, K], DType::BF16));
         b.transpose(w, vec![0, 2, 1])
@@ -354,7 +358,7 @@ fn bf16_experts(m: usize, checkpoint_order: bool, gate: bool) -> Graph {
 /// checkpoint-order spelling still plans no `transpose` dispatch (the const is packed through its view).
 ///
 /// Mutations: restore the all-f32 operand check in `indexed_matmul_lowers` (`predicates.rs`) and every row is
-/// refused (`Refused { op: IndexedMatMul, dtypes: [F32, BF16, F32], missing: DtypeLowering }`); drop the indexed
+/// refused (`Refused { op: IndexedMatMul, dtypes: [F32, BF16, I32], missing: DtypeLowering }`); drop the indexed
 /// arm of `packed_bf16_reader` (`dtype_widen.rs`) and the AMD and NVPTX consts upload native BF16, which
 /// `check_bf16_const_reads` refuses against the packed-lane body.
 #[test]
@@ -412,7 +416,7 @@ fn a_computed_bf16_expert_stack_is_refused() {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![5, K]));
     let w = b.constant("w", TensorType::f32(vec![EXPERTS, K, N]));
-    let ids = b.constant("ids", TensorType::f32(vec![5]));
+    let ids = b.constant("ids", TensorType::new(vec![5], DType::I32));
     let out = b.indexed_matmul(x, b.cast(w, DType::BF16), ids);
     let g = b.finish(out);
     for backend in backends() {
@@ -442,7 +446,7 @@ fn bf16_checkpoint_order_shared(reader: SecondReader) -> Graph {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![5, K]));
     let w = b.constant("w", TensorType::new(vec![EXPERTS, N, K], DType::BF16));
-    let ids = b.constant("ids", TensorType::f32(vec![5]));
+    let ids = b.constant("ids", TensorType::new(vec![5], DType::I32));
     let w_ekn = b.transpose(w, vec![0, 2, 1]);
     let out = b.indexed_matmul(x, w_ekn, ids);
     let shared = match reader {
@@ -514,7 +518,7 @@ fn an_f16_expert_stack_is_refused() {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![5, K]));
     let w = b.constant("w", TensorType::new(vec![EXPERTS, K, N], DType::F16));
-    let ids = b.constant("ids", TensorType::f32(vec![5]));
+    let ids = b.constant("ids", TensorType::new(vec![5], DType::I32));
     let out = b.indexed_matmul(x, w, ids);
     let g = b.finish(out);
     for backend in backends() {

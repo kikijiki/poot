@@ -40,7 +40,7 @@ use poot_test_util::{assert_close, max_abs_error};
 /// every other plan.
 fn single_meta(plan: &poot_graph_plan::Plan) -> Option<&[u32]> {
     plan.single()
-        .map(|dispatch| dispatch.launch.meta.as_slice())
+        .map(|dispatch| dispatch.launch().meta.as_slice())
 }
 
 fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -162,14 +162,13 @@ fn add_resident_entry(
             "add_resident_entry: {id:?} is not Storage::Const"
         );
         let name = meta.name.clone().unwrap();
-        let bytes: Vec<u8> = t
-            .as_f32()
-            .unwrap()
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
+        let bytes: Vec<u8> = match (t.as_f32(), t.as_i32()) {
+            (Some(values), _) => values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            (_, Some(words)) => words.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            _ => panic!("add_resident_entry: {id:?} is neither F32 nor I32"),
+        };
         let dense = poot_quant::weights::DenseWeight::try_new(
-            DType::F32,
+            t.dtype(),
             t.shape().to_vec(),
             StoredBytes::from(bytes),
         )
@@ -496,8 +495,7 @@ fn plan_eqn_with_choice(
     backend: poot_target::Backend,
     caps: &poot_target::DeviceCaps,
 ) -> Result<(poot_graph_plan::Plan, poot_graph_plan::KernelChoice), poot_graph_plan::PlanError> {
-    poot_graph_plan::plan_eqn_choice_analyzed(
-        &poot_graph_plan::ExactI32StorageAnalysis::new(g),
+    poot_graph_plan::plan_eqn_choice(
         g,
         eqn,
         backend,

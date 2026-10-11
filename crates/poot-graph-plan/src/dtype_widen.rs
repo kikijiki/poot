@@ -137,6 +137,8 @@ pub(crate) fn bf16_const_is_packed<V: ValidationChannel>(
         Backend::SpirvVulkan => true,
         Backend::AmdGcn(_) => bf16_const_feeds_only_packed_readers(g, views, id),
         Backend::Nvptx => bf16_const_feeds_only_packed_readers(g, views, id),
+        // An AIE core has no BF16 lane: the const stays unpacked and the BF16 consumers refuse.
+        Backend::Aie(_) => false,
     }
 }
 
@@ -161,7 +163,11 @@ pub fn matmul_bf16_column_gemv(
     m: usize,
     weight_rank: usize,
 ) -> bool {
-    matches!(backend, Backend::SpirvVulkan | Backend::AmdGcn(_))
+    let packed_bf16_lane = match backend {
+        Backend::SpirvVulkan | Backend::AmdGcn(_) => true,
+        Backend::Nvptx | Backend::Aie(_) => false,
+    };
+    packed_bf16_lane
         && a_dtype == DType::F32
         && b_dtype == DType::BF16
         && odt == DType::F32
@@ -1010,7 +1016,6 @@ mod tensor_core_weight_tests {
     use poot_tensor::DType;
 
     use super::widen_mismatched_matmul_dtypes;
-    use crate::ExactI32StorageAnalysis;
 
     #[test]
     fn card278_existing_tensor_core_choice_keeps_eligible_bf16_weight_narrow() {
@@ -1033,8 +1038,7 @@ mod tensor_core_weight_tests {
             .iter()
             .find(|eqn| matches!(eqn.op, poot_graph_ir::OpKind::MatMul))
             .expect("matmul remains");
-        match crate::plan_eqn_choice_analyzed(
-            &ExactI32StorageAnalysis::new(&widened),
+        match crate::plan_eqn_choice(
             &widened,
             eqn,
             Backend::Nvptx,

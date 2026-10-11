@@ -594,8 +594,8 @@ fn expert_ranges(
 }
 
 /// The id every piece of a split expert stack reads for a row no expert of the stack holds: past any expert count,
-/// so the row is invalid in each piece, and exact in `f32`.
-const UNHELD_ID: f32 = (1u32 << 30) as f32;
+/// so the row is invalid in each piece, and exact in `i32`.
+const UNHELD_ID: i32 = 1 << 30;
 
 /// An indexed packed contraction `legalize` can split: its activation, row ids and packed source carriers (named
 /// constants, one per role), and the expert ranges of the pieces.
@@ -652,15 +652,15 @@ impl Appender<'_> {
         )
     }
 
-    /// `1.0` for the rows whose id lies in `range` and `0.0` for any other, a NaN id included: `Ge(id, from) -
-    /// Ge(id, to)` (a NaN compares false twice).
+    /// `1` for the rows whose id lies in `range` and `0` for any other, a negative id included: `Ge(id, from) -
+    /// Ge(id, to)`, an exact I32 indicator.
     fn indicator(
         &mut self,
         ids: ValueId,
         ids_aval: &TensorType,
         range: std::ops::Range<usize>,
     ) -> Result<ValueId, ExpansionError> {
-        let ge = |at: usize| [Operand::Value(ids), Operand::Lit(Scalar::F32(at as f32))];
+        let ge = |at: usize| [Operand::Value(ids), Operand::Lit(Scalar::I32(at as i32))];
         let from = self.push(
             OpKind::Binary(BinOp::Ge),
             &ge(range.start),
@@ -681,13 +681,12 @@ impl Appender<'_> {
 /// Piece `c` holds experts `lo..hi`: its carriers are the constants `{carrier}.chunkC` (the rows `lo..hi` of the
 /// stack's leading expert axis, which the executor binder places as that run of the parent's experts, like a dense
 /// weight's row chunk). Every piece computes every row, so a row the piece does not own is neutralized instead of
-/// selected away (a `Select` needs an I32 condition, and no F32 to I32 cast lowers): the piece reads the
-/// activation row times `owned` (`1.0` when `lo <= id < hi`, else `0.0`), which makes its output row exactly `0`
-/// for a finite activation row, and the id `(id - lo) * owned` shifted into the piece's table, or `0` for a row it
-/// does not own. A row whose id no expert of the stack holds (outside `0..E`, NaN) instead reads an id of
-/// `2^30` in every piece, so every piece outputs the NaN row of the unsplit contraction; a fractional id lies in
-/// its owner's range and stays fractional there. The sum of the pieces is then the owning piece's row plus zeros.
-/// The split costs one full contraction per piece, and a non-finite activation row turns into NaN rather than
+/// selected away: the piece reads the activation row times `owned` (an I32 `1` when `lo <= id < hi`, else `0`,
+/// widened to F32), which makes its output row exactly `0` for a finite activation row, and the id
+/// `(id - lo) * owned` shifted into the piece's table, or `0` for a row it does not own. A row whose id no
+/// expert of the stack holds (outside `0..E`) instead reads an id of `2^30` in every piece, so every piece
+/// outputs the NaN row of the unsplit contraction. The sum of the pieces is then the owning piece's row plus
+/// zeros. The split costs one full contraction per piece, and a non-finite activation row turns into NaN rather than
 /// whatever the unsplit contraction makes of it.
 fn split_oversized_expert_stacks<V: ValidationChannel>(
     g: &Graph<V>,
@@ -717,6 +716,7 @@ fn split_oversized_expert_stacks<V: ValidationChannel>(
         let x_aval = values[x].aval.clone();
         let ids_aval = values[ids].aval.clone();
         let column = TensorType::f32(vec![ids_aval.shape[0], 1]);
+        let owned_aval = TensorType::f32(ids_aval.shape.clone());
         let mut emit = Appender {
             budget,
             values: &mut values,
@@ -724,18 +724,18 @@ fn split_oversized_expert_stacks<V: ValidationChannel>(
             layer: eqn.layer,
         };
 
-        // `2^30` for a row no expert of the stack holds, else `-0.0`: added to every piece's id.
+        // `2^30` for a row no expert of the stack holds, else `0`: added to every piece's id.
         let held = emit.indicator(ids, &ids_aval, 0..experts)?;
         let missing = emit.push(
             OpKind::Binary(BinOp::Sub),
-            &[Operand::Value(held), Operand::Lit(Scalar::F32(1.0))],
+            &[Operand::Value(held), Operand::Lit(Scalar::I32(1))],
             ids_aval.clone(),
         )?;
         let unheld_id = emit.push(
             OpKind::Binary(BinOp::Mul),
             &[
                 Operand::Value(missing),
-                Operand::Lit(Scalar::F32(-UNHELD_ID)),
+                Operand::Lit(Scalar::I32(-UNHELD_ID)),
             ],
             ids_aval.clone(),
         )?;
@@ -750,7 +750,7 @@ fn split_oversized_expert_stacks<V: ValidationChannel>(
                     OpKind::Binary(BinOp::Sub),
                     &[
                         Operand::Value(ids),
-                        Operand::Lit(Scalar::F32(range.start as f32)),
+                        Operand::Lit(Scalar::I32(range.start as i32)),
                     ],
                     ids_aval.clone(),
                 )?
@@ -765,11 +765,16 @@ fn split_oversized_expert_stacks<V: ValidationChannel>(
                 &[Operand::Value(owned_ids), Operand::Value(unheld_id)],
                 ids_aval.clone(),
             )?;
+            let owned_f32 = emit.push(
+                OpKind::Cast { to: DType::F32 },
+                &[Operand::Value(owned)],
+                owned_aval.clone(),
+            )?;
             let owned_column = emit.push(
                 OpKind::Reshape {
                     shape: column.shape.clone(),
                 },
-                &[Operand::Value(owned)],
+                &[Operand::Value(owned_f32)],
                 column.clone(),
             )?;
             let piece_x = emit.push(
@@ -855,7 +860,7 @@ fn split_oversized_expert_stacks<V: ValidationChannel>(
     })
 }
 
-/// The split of `eqn` when it is an indexed packed contraction over named constant carriers and F32 ids whose
+/// The split of `eqn` when it is an indexed packed contraction over named constant carriers and I32 ids whose
 /// stacked table [`expert_ranges`] splits.
 fn splittable_stack<V: ValidationChannel>(
     g: &Graph<V>,
@@ -877,7 +882,7 @@ fn splittable_stack<V: ValidationChannel>(
         .collect::<Option<_>>()?;
     let (&x, &ids) = (operands.first()?, operands.get(1)?);
     let carriers = operands[2..].to_vec();
-    (g.aval(ids).dtype == DType::F32
+    (g.aval(ids).dtype == DType::I32
         && carriers.iter().all(|&carrier| {
             g.meta(carrier).storage == Storage::Const && g.meta(carrier).name.is_some()
         }))

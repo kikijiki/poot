@@ -5,13 +5,16 @@
 use poot_graph_ir::{GraphValidationError, ValidationId, ValueId, ValueTable};
 use poot_tensor::DType;
 
-use crate::{DeviceWitnessRejection, Refusal, StorageGap};
+use crate::{DeviceWitnessRejection, KernelChoice, Refusal, StorageGap};
 use poot_kernel_ir::Body;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PlanError {
     #[error("invalid graph: {0}")]
     InvalidGraph(#[from] GraphValidationError),
+    /// The planner built dispatches whose bindings are not a valid [`DispatchPlan`].
+    #[error("invalid dispatch plan: {0}")]
+    InvalidDispatchPlan(#[from] DispatchPlanError),
     /// The planner cannot lower one equation for the target (ADR-0104 decision 2). Boxed so a `Result`
     /// carrying a `PlanError` stays small.
     #[error(transparent)]
@@ -28,23 +31,12 @@ pub enum PlanError {
     /// whose rank operand is 0-D). A caller-triggerable shape mismatch is a typed error, not a panic.
     #[error("bad shape for planning: {0}")]
     BadShape(String),
-    /// Reusable graph analysis was paired with a different graph, or with an equation not in that graph.
-    /// A programmer error, detected so storage is never selected from unrelated value IDs.
-    #[error("exact-I32 analysis context mismatch: {0}")]
-    AnalysisContextMismatch(String),
-    /// An I32 value whose planned readers disagree on its lane: one kernel reads it through `Slice<i32>`
-    /// (exact words), another through `Slice<f32>` (the f32 mirror). One buffer holds one representation,
-    /// so one of the two would read reinterpreted bits (spike-562 F-9). `value` is the buffer's root: a
-    /// read through a `Plan::Alias`/`Plan::View` chain counts as a read of it. Readers are named by their
+    /// An I32 value's buffer holds I32 words, but a planned kernel reads it through a `Slice<f32>` param, so
+    /// it would read reinterpreted bits (POOT-643's class, spike-562 F-9). `value` is the buffer's root: a
+    /// read through a `Plan::Alias`/`Plan::View` chain counts as a read of it. The reader is named by its
     /// output.
-    #[error(
-        "I32 {value} is read as exact i32 by the equation defining {i32_reader} but as the f32 mirror by {f32_reader}"
-    )]
-    I32ReaderLaneConflict {
-        value: ValueId,
-        i32_reader: ValueId,
-        f32_reader: ValueId,
-    },
+    #[error("I32 {value} is read through a Slice<f32> param by the equation defining {reader}")]
+    I32ReadAsF32 { value: ValueId, reader: ValueId },
     /// A device executor admits only witness heads whose computation is exact on the device.
     #[error("validation {id:?} {value} is not a canonical device witness: {reason}")]
     ValidationWitnessNotCanonical {
@@ -81,14 +73,331 @@ pub enum CollectiveKind {
 }
 
 /// One kernel launch of a [`Plan::Dispatches`] plan.
-#[derive(Debug)]
+///
+/// The kernel's params are `[reads.., meta?, write]`: one per [`Binding::reads`] entry in order, then the
+/// launch's metadata buffer when [`Launch::meta`] is non-empty, then the one written buffer. `binding` and
+/// `choice` are private and the rest is `pub(crate)`: a dispatch is built only by the planner, and a
+/// [`DispatchPlan`] validates its bindings against the kernel body and launch before any other crate sees
+/// it. Outside this crate the fields read through accessors; the only change after validation is the
+/// planner's own launch shaping (`set_workgroup_x`, `append_key`), which cannot change the params.
+#[derive(Clone, Debug)]
 pub struct Dispatch {
-    pub body: Body,
-    pub key: String,
+    pub(crate) body: Body,
+    pub(crate) key: String,
     /// A human-readable name for the kernel (family, form and, for a contraction, its shape):
     /// display only, carried into the per-dispatch timing so device time can be read per shape.
-    pub label: String,
-    pub launch: Launch,
+    pub(crate) label: String,
+    pub(crate) launch: Launch,
+    binding: Binding,
+    choice: KernelChoice,
+}
+
+impl Dispatch {
+    pub(crate) fn new(
+        body: Body,
+        key: String,
+        label: String,
+        launch: Launch,
+        binding: Binding,
+        choice: KernelChoice,
+    ) -> Self {
+        Self {
+            body,
+            key,
+            label,
+            launch,
+            binding,
+            choice,
+        }
+    }
+
+    pub fn body(&self) -> &Body {
+        &self.body
+    }
+
+    /// The kernel's cache key.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub fn launch(&self) -> &Launch {
+        &self.launch
+    }
+
+    /// The planner's launch shaping: bump the workgroup's x extent. Params are unchanged.
+    pub(crate) fn set_workgroup_x(&mut self, x: u32) {
+        self.body.workgroup_size[0] = x;
+    }
+
+    /// The planner's launch shaping: name a changed body in the key.
+    pub(crate) fn append_key(&mut self, suffix: &str) {
+        self.key.push_str(suffix);
+    }
+
+    /// This dispatch under another binding, for [`Program::rebind_dispatches`].
+    #[cfg(feature = "test-support")]
+    pub(crate) fn with_binding(self, binding: Binding) -> Self {
+        Self { binding, ..self }
+    }
+
+    /// Which buffers this dispatch reads and writes.
+    pub fn binding(&self) -> &Binding {
+        &self.binding
+    }
+
+    /// The kernel the planner chose for this dispatch.
+    pub fn choice(&self) -> &KernelChoice {
+        &self.choice
+    }
+}
+
+/// A plan-local scratch buffer: an intermediate that lives for one equation. The id indexes the scratch
+/// buffers its [`DispatchPlan`] declares.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ScratchId(u32);
+
+impl ScratchId {
+    pub fn new(index: u32) -> Self {
+        Self(index)
+    }
+
+    pub fn index(self) -> u32 {
+        self.0
+    }
+}
+
+/// Where one data param of a dispatch reads from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Source {
+    /// The equation's value operand `i` (its position among [`value_ids`](crate::value_ids)).
+    Operand(usize),
+    /// A scratch buffer an earlier dispatch of the same plan wrote.
+    Scratch(ScratchId),
+}
+
+/// Where a dispatch writes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Sink {
+    /// The equation's output buffer.
+    Out,
+    /// A scratch buffer of the same plan.
+    Scratch(ScratchId),
+}
+
+/// The explicit buffer binding of one [`Dispatch`]: its data reads in param order and its one write.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Binding {
+    reads: Vec<Source>,
+    write: Sink,
+}
+
+impl Binding {
+    pub fn new(reads: Vec<Source>, write: Sink) -> Self {
+        Self { reads, write }
+    }
+
+    /// The binding of a dispatch over an equation of `arity` value operands: every operand in order,
+    /// writing the equation's output.
+    pub fn eqn(arity: usize) -> Self {
+        Self::new((0..arity).map(Source::Operand).collect(), Sink::Out)
+    }
+
+    pub fn reads(&self) -> &[Source] {
+        &self.reads
+    }
+
+    pub fn write(&self) -> Sink {
+        self.write
+    }
+}
+
+/// Why a set of dispatches is not a [`DispatchPlan`]. Each variant names the dispatch by its index.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum DispatchPlanError {
+    #[error("a dispatch plan needs at least one dispatch")]
+    Empty,
+    #[error(
+        "dispatch {dispatch} binds {bound} params (reads, metadata, write) but its kernel has {params}"
+    )]
+    ParamCount {
+        dispatch: usize,
+        bound: usize,
+        params: usize,
+    },
+    #[error("dispatch {dispatch} binds scratch {scratch:?}, but the plan declares {declared}")]
+    ScratchOutOfRange {
+        dispatch: usize,
+        scratch: ScratchId,
+        declared: usize,
+    },
+    #[error("dispatch {dispatch} reads scratch {scratch:?} that no earlier dispatch wrote")]
+    ScratchReadBeforeWrite { dispatch: usize, scratch: ScratchId },
+    #[error("dispatch {dispatch} both reads and writes scratch {scratch:?}")]
+    ScratchReadAndWritten { dispatch: usize, scratch: ScratchId },
+    #[error(
+        "dispatch {dispatch} param {param} is {}, but its binding {}",
+        if *kernel_mutable { "mutable" } else { "read-only" },
+        if *kernel_mutable { "reads it" } else { "writes it" }
+    )]
+    MutabilityMismatch {
+        dispatch: usize,
+        param: usize,
+        kernel_mutable: bool,
+    },
+    #[error(
+        "dispatch {dispatch} reads operand {operand} after an earlier dispatch wrote the output; a plan with scratch reads every operand before its first output write"
+    )]
+    OperandReadAfterOutWrite { dispatch: usize, operand: usize },
+    #[error("dispatch {dispatch} reads operand {operand} but the equation has {operands}")]
+    OperandOutOfRange {
+        dispatch: usize,
+        operand: usize,
+        operands: usize,
+    },
+}
+
+/// The ordered dispatches of one equation, validated against their bindings.
+///
+/// **Dispatches run in order.** Dispatch `i + 1` observes every write of dispatch `i` (POOT-ADR-0115).
+/// The split plans the planner emits today (GEMM tile ranges, scatter and GEMV watchdog splits, the scan
+/// row split) write disjoint output ranges and do not depend on the order; a plan with scratch does.
+///
+/// Fields are private: [`DispatchPlan::new`] is the only constructor, so a plan an executor receives has
+/// in-range scratch ids, no read of an unwritten scratch, kernel param mutability matching the bindings,
+/// and (with scratch) every operand read before the first output write.
+#[derive(Clone, Debug)]
+pub struct DispatchPlan {
+    dispatches: Vec<Dispatch>,
+    scratch: usize,
+}
+
+impl DispatchPlan {
+    /// Validate `dispatches`, which bind among `scratch` scratch buffers.
+    pub fn new(dispatches: Vec<Dispatch>, scratch: usize) -> Result<Self, DispatchPlanError> {
+        if dispatches.is_empty() {
+            return Err(DispatchPlanError::Empty);
+        }
+        let mut written = vec![false; scratch];
+        let mut out_written = false;
+        for (index, dispatch) in dispatches.iter().enumerate() {
+            let Binding { reads, write } = &dispatch.binding;
+            let meta = usize::from(!dispatch.launch.meta.is_empty());
+            let bound = reads.len() + meta + 1;
+            let params: Vec<_> = dispatch.body.params().collect();
+            if params.len() != bound {
+                return Err(DispatchPlanError::ParamCount {
+                    dispatch: index,
+                    bound,
+                    params: params.len(),
+                });
+            }
+            let mutable = |param: usize| {
+                matches!(
+                    dispatch.body.local_ty(params[param]),
+                    poot_kernel_ir::Ty::Ref { mutable: true, .. }
+                )
+            };
+            let scratch_slot = |id: ScratchId| {
+                if id.index() as usize >= scratch {
+                    Err(DispatchPlanError::ScratchOutOfRange {
+                        dispatch: index,
+                        scratch: id,
+                        declared: scratch,
+                    })
+                } else {
+                    Ok(id.index() as usize)
+                }
+            };
+            for (param, source) in reads.iter().enumerate() {
+                if mutable(param) {
+                    return Err(DispatchPlanError::MutabilityMismatch {
+                        dispatch: index,
+                        param,
+                        kernel_mutable: true,
+                    });
+                }
+                match *source {
+                    Source::Operand(operand) => {
+                        if scratch > 0 && out_written {
+                            return Err(DispatchPlanError::OperandReadAfterOutWrite {
+                                dispatch: index,
+                                operand,
+                            });
+                        }
+                    }
+                    Source::Scratch(id) => {
+                        if !written[scratch_slot(id)?] {
+                            return Err(DispatchPlanError::ScratchReadBeforeWrite {
+                                dispatch: index,
+                                scratch: id,
+                            });
+                        }
+                    }
+                }
+            }
+            if meta == 1 && mutable(reads.len()) {
+                return Err(DispatchPlanError::MutabilityMismatch {
+                    dispatch: index,
+                    param: reads.len(),
+                    kernel_mutable: true,
+                });
+            }
+            if !mutable(bound - 1) {
+                return Err(DispatchPlanError::MutabilityMismatch {
+                    dispatch: index,
+                    param: bound - 1,
+                    kernel_mutable: false,
+                });
+            }
+            match *write {
+                Sink::Out => out_written = true,
+                Sink::Scratch(id) => {
+                    let slot = scratch_slot(id)?;
+                    if reads.contains(&Source::Scratch(id)) {
+                        return Err(DispatchPlanError::ScratchReadAndWritten {
+                            dispatch: index,
+                            scratch: id,
+                        });
+                    }
+                    written[slot] = true;
+                }
+            }
+        }
+        Ok(Self {
+            dispatches,
+            scratch,
+        })
+    }
+
+    /// The dispatches by value, for a test that takes a plan apart.
+    #[cfg(test)]
+    pub(crate) fn into_dispatches(self) -> Vec<Dispatch> {
+        self.dispatches
+    }
+
+    /// How many scratch buffers the plan declares.
+    pub fn scratch(&self) -> usize {
+        self.scratch
+    }
+
+    /// The one dispatch of a plan that launches exactly one kernel.
+    pub fn single(&self) -> Option<&Dispatch> {
+        match self.dispatches.as_slice() {
+            [dispatch] => Some(dispatch),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn single_mut(&mut self) -> Option<&mut Dispatch> {
+        match self.dispatches.as_mut_slice() {
+            [dispatch] => Some(dispatch),
+            _ => None,
+        }
+    }
 }
 
 /// The shape of one launch: the total thread count and the optional metadata buffer.
@@ -104,15 +413,24 @@ pub struct Launch {
     pub meta: Vec<u32>,
 }
 
+/// Read-only: a validated plan's dispatches are indexed, iterated and counted as a slice.
+impl std::ops::Deref for DispatchPlan {
+    type Target = [Dispatch];
+
+    fn deref(&self) -> &[Dispatch] {
+        &self.dispatches
+    }
+}
+
 /// How to execute one eqn (independent of host vs device buffers, and of the backend).
 #[derive(Debug)]
 pub enum Plan {
-    /// Dispatch these kernels, in order, over the eqn's value-operand buffers (in order) writing its
-    /// output. Never empty. A plan holds several dispatches when one launch cannot cover the output: a
-    /// tiled GEMM split into disjoint sub-2^15 tile ranges (the RADV 2^15-workgroup miscompile), or a
-    /// scatter / decode GEMV split to stay under the device watchdog. Dispatches write disjoint output
-    /// ranges, so their order is irrelevant.
-    Dispatches(Vec<Dispatch>),
+    /// Dispatch these kernels in order, each over the buffers its own [`Binding`] names. Never empty. A
+    /// plan holds several dispatches when one launch cannot cover the output: a tiled GEMM split into
+    /// disjoint sub-2^15 tile ranges (the RADV 2^15-workgroup miscompile), a scatter / decode GEMV split
+    /// to stay under the device watchdog, or a scan split by rows. Those write disjoint output ranges; the
+    /// order of dispatches is nonetheless part of the contract (see [`DispatchPlan`]).
+    Dispatches(DispatchPlan),
     /// The output aliases the given input value's buffer (reshape).
     Alias(ValueId),
     /// The output is a strided view of `src`'s buffer (spec 132): no dispatch, like [`Plan::Alias`], but
@@ -140,21 +458,15 @@ impl Plan {
     /// plan with no launch.
     pub fn single(&self) -> Option<&Dispatch> {
         match self {
-            Plan::Dispatches(dispatches) => match dispatches.as_slice() {
-                [dispatch] => Some(dispatch),
-                _ => None,
-            },
+            Plan::Dispatches(dispatches) => dispatches.single(),
             _ => None,
         }
     }
 
     /// [`Plan::single`], mutably.
-    pub fn single_mut(&mut self) -> Option<&mut Dispatch> {
+    pub(crate) fn single_mut(&mut self) -> Option<&mut Dispatch> {
         match self {
-            Plan::Dispatches(dispatches) => match dispatches.as_mut_slice() {
-                [dispatch] => Some(dispatch),
-                _ => None,
-            },
+            Plan::Dispatches(dispatches) => dispatches.single_mut(),
             _ => None,
         }
     }
@@ -194,14 +506,6 @@ pub enum StorageKind {
     /// padded to a whole word (POOT-1060): a `DenseRowGather` table, which every backend's imported
     /// `PackedE4m3RowGather` body decodes in-register. Always E4M3FN.
     E4m3Packed,
-    /// A declared-I32 value bound as its F32 bit-pattern mirror (card 621): a `Slot::SlotMap` index (or any other I32-declared value) feeding a
-    /// `ScatterUpdate`/`DynamicUpdateSlice` index operand. Those imported/kernelgen bodies read that
-    /// operand as `Slice<f32>` and cast to i32 in-kernel (spec 045) on every backend, so the device
-    /// buffer's own words are F32 while the value's declared dtype stays I32 (see
-    /// [`ValueStorage::dtype`]/`ValueStorage::is_f32_mirror`). Raw I32 bytes in that slot reinterpret
-    /// as a denormal or NaN, and casting that back to i32 collapses to 0, so a `-1` (keep-base) index is
-    /// misread as `0` and corrupts another sequence's pool row.
-    I32F32Mirror,
 }
 
 /// One planned value's physical storage (card 526): the dtype its device buffer holds and whether it is
@@ -234,7 +538,6 @@ impl ValueStorage {
             StorageKind::Bf16Packed => poot_target::BufferStorage::bf16_packed(),
             StorageKind::F16Packed => poot_target::BufferStorage::f16_packed(),
             StorageKind::E4m3Packed => poot_target::BufferStorage::e4m3_packed(),
-            StorageKind::I32F32Mirror => poot_target::BufferStorage::i32_f32_mirror(),
         };
         Self { storage }
     }
@@ -250,18 +553,6 @@ impl ValueStorage {
     /// packed value (still checkpoint bytes, just packed several elements per device word).
     pub fn dtype(&self) -> DType {
         logical_to_dtype(self.storage.dtype())
-    }
-
-    /// Card 621: whether this declared-I32 value's device buffer holds the F32 bit-pattern mirror of
-    /// each element rather than raw I32 bytes (a `Slot::SlotMap` index feeding a
-    /// `ScatterUpdate`/`DynamicUpdateSlice` index operand). A binder reads this to choose the upload
-    /// lane instead of re-deriving it from `t.ints`/a local per-eqn walk (R469-004). `pub(crate)`/
-    /// test-only: no production binder survives Card 546b's `GpuExecutor` deletion to call this; kept
-    /// for the `I32ReadLanes`/`value_storage_kind` coverage in `storage_analysis.rs` and `compile.rs`.
-    #[cfg(test)]
-    pub(crate) fn is_f32_mirror(&self) -> bool {
-        self.storage.element() == poot_target::ElementKind::F32
-            && self.storage.dtype() == poot_target::LogicalDType::I32
     }
 }
 
@@ -357,7 +648,222 @@ impl GraphStorage {
 
 #[cfg(test)]
 mod tests {
+    use poot_kernel_ir::{BasicBlock, LocalDecl, Terminator, Ty};
+
     use super::*;
+    use crate::NoDispatch;
+
+    /// A kernel whose params are the given mutabilities, in order (`true` is `&mut [f32]`).
+    fn body(params: &[bool]) -> Body {
+        let slice = |mutable| LocalDecl {
+            ty: Ty::Ref {
+                mutable,
+                pointee: Box::new(Ty::Slice(Box::new(Ty::F32))),
+            },
+            mutable: false,
+        };
+        let locals = std::iter::once(LocalDecl {
+            ty: Ty::Unit,
+            mutable: false,
+        })
+        .chain(params.iter().map(|&mutable| slice(mutable)))
+        .collect();
+        Body::new(
+            "k",
+            params.len() as u32,
+            locals,
+            vec![BasicBlock {
+                statements: vec![],
+                terminator: Terminator::Return,
+            }],
+        )
+    }
+
+    /// A dispatch of a two-read kernel `[a, b, out]` with the given binding.
+    fn dispatch(reads: [Source; 2], write: Sink) -> Dispatch {
+        dispatch_of(
+            body(&[false, false, true]),
+            Binding::new(reads.to_vec(), write),
+        )
+    }
+
+    fn dispatch_of(body: Body, binding: Binding) -> Dispatch {
+        Dispatch::new(
+            body,
+            "k".into(),
+            "k".into(),
+            Launch {
+                grid: [1, 1, 1],
+                meta: Vec::new(),
+            },
+            binding,
+            KernelChoice::NoDispatch(NoDispatch::Alias),
+        )
+    }
+
+    const SCRATCH: ScratchId = ScratchId(0);
+
+    fn error_of(dispatches: Vec<Dispatch>, scratch: usize) -> DispatchPlanError {
+        DispatchPlan::new(dispatches, scratch).expect_err("the plan must be refused")
+    }
+
+    #[test]
+    fn a_plan_with_no_dispatch_is_refused() {
+        assert_eq!(error_of(Vec::new(), 0), DispatchPlanError::Empty);
+    }
+
+    #[test]
+    fn split_plans_and_a_scratch_pipeline_are_accepted() {
+        let eqn = || dispatch([Source::Operand(0), Source::Operand(1)], Sink::Out);
+        let plan = DispatchPlan::new(vec![eqn(), eqn()], 0).expect("two disjoint-range dispatches");
+        assert_eq!(plan.len(), 2);
+        // Stage one writes the scratch from the operands; stage two reads it and writes the output.
+        let plan = DispatchPlan::new(
+            vec![
+                dispatch(
+                    [Source::Operand(0), Source::Operand(1)],
+                    Sink::Scratch(SCRATCH),
+                ),
+                dispatch([Source::Scratch(SCRATCH), Source::Operand(0)], Sink::Out),
+            ],
+            1,
+        )
+        .expect("a scratch written before it is read");
+        assert_eq!(plan.scratch(), 1);
+    }
+
+    #[test]
+    fn a_scratch_id_beyond_the_declared_buffers_is_refused() {
+        let error = error_of(
+            vec![dispatch(
+                [Source::Operand(0), Source::Scratch(SCRATCH)],
+                Sink::Out,
+            )],
+            0,
+        );
+        assert_eq!(
+            error,
+            DispatchPlanError::ScratchOutOfRange {
+                dispatch: 0,
+                scratch: SCRATCH,
+                declared: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn a_scratch_read_before_any_write_is_refused() {
+        let error = error_of(
+            vec![
+                dispatch([Source::Scratch(SCRATCH), Source::Operand(0)], Sink::Out),
+                dispatch(
+                    [Source::Operand(0), Source::Operand(1)],
+                    Sink::Scratch(SCRATCH),
+                ),
+            ],
+            1,
+        );
+        assert_eq!(
+            error,
+            DispatchPlanError::ScratchReadBeforeWrite {
+                dispatch: 0,
+                scratch: SCRATCH,
+            }
+        );
+    }
+
+    #[test]
+    fn a_dispatch_that_reads_and_writes_one_scratch_is_refused() {
+        let error = error_of(
+            vec![
+                dispatch(
+                    [Source::Operand(0), Source::Operand(1)],
+                    Sink::Scratch(SCRATCH),
+                ),
+                dispatch(
+                    [Source::Scratch(SCRATCH), Source::Operand(1)],
+                    Sink::Scratch(SCRATCH),
+                ),
+            ],
+            1,
+        );
+        assert_eq!(
+            error,
+            DispatchPlanError::ScratchReadAndWritten {
+                dispatch: 1,
+                scratch: SCRATCH,
+            }
+        );
+    }
+
+    #[test]
+    fn kernel_param_mutability_must_match_the_binding() {
+        let reads = || vec![Source::Operand(0), Source::Operand(1)];
+        // The kernel writes its first param, which the binding reads.
+        let writes_a_read =
+            dispatch_of(body(&[true, false, true]), Binding::new(reads(), Sink::Out));
+        assert_eq!(
+            error_of(vec![writes_a_read], 0),
+            DispatchPlanError::MutabilityMismatch {
+                dispatch: 0,
+                param: 0,
+                kernel_mutable: true,
+            }
+        );
+        // The kernel's last param is read-only, but the binding writes it.
+        let reads_its_write = dispatch_of(
+            body(&[false, false, false]),
+            Binding::new(reads(), Sink::Out),
+        );
+        assert_eq!(
+            error_of(vec![reads_its_write], 0),
+            DispatchPlanError::MutabilityMismatch {
+                dispatch: 0,
+                param: 2,
+                kernel_mutable: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_binding_must_cover_the_kernels_params() {
+        let two_reads_for_a_one_read_kernel = dispatch_of(
+            body(&[false, true]),
+            Binding::new(vec![Source::Operand(0), Source::Operand(1)], Sink::Out),
+        );
+        assert_eq!(
+            error_of(vec![two_reads_for_a_one_read_kernel], 0),
+            DispatchPlanError::ParamCount {
+                dispatch: 0,
+                bound: 3,
+                params: 2,
+            }
+        );
+    }
+
+    /// A donated output shares an operand's buffer, so once a plan with scratch has written `Out` an
+    /// operand read would see the overwritten bytes. Without scratch the split plans' ranges are disjoint
+    /// and the rule does not apply.
+    #[test]
+    fn an_operand_read_after_the_output_write_is_refused_in_a_plan_with_scratch() {
+        let write_out = || dispatch([Source::Operand(0), Source::Operand(1)], Sink::Out);
+        let write_scratch = || {
+            dispatch(
+                [Source::Operand(0), Source::Operand(1)],
+                Sink::Scratch(SCRATCH),
+            )
+        };
+        let error = error_of(vec![write_scratch(), write_out(), write_out()], 1);
+        assert_eq!(
+            error,
+            DispatchPlanError::OperandReadAfterOutWrite {
+                dispatch: 2,
+                operand: 0,
+            }
+        );
+        DispatchPlan::new(vec![write_out(), write_out()], 0)
+            .expect("disjoint-range splits read their operands after the first output write");
+    }
 
     /// The one field of [`ValueStorage`] is private: the planner is the only constructor.
     #[test]
@@ -376,24 +882,6 @@ mod tests {
             packed_f16.buffer_storage(),
             poot_target::BufferStorage::f16_packed()
         );
-    }
-
-    /// Card 621: [`StorageKind::I32F32Mirror`] keeps [`ValueStorage::dtype`] at I32 (the value's
-    /// declared dtype, not the physical element) while `is_f32_mirror` distinguishes it from a plain
-    /// `Dense(I32)` record, and it is never packed.
-    #[test]
-    fn i32_f32_mirror_dtype_and_predicate() {
-        let mirror = ValueStorage::new(StorageKind::I32F32Mirror);
-        assert_eq!(mirror.dtype(), DType::I32);
-        assert!(mirror.is_f32_mirror());
-        assert!(!mirror.buffer_storage().is_packed());
-
-        let dense_i32 = ValueStorage::new(StorageKind::Dense(DType::I32));
-        assert_eq!(dense_i32.dtype(), DType::I32);
-        assert!(!dense_i32.is_f32_mirror());
-
-        let dense_f32 = ValueStorage::new(StorageKind::Dense(DType::F32));
-        assert!(!dense_f32.is_f32_mirror());
     }
 
     /// Card 527: `ValueStorage`'s private field is `poot_target::BufferStorage` (this crate's own

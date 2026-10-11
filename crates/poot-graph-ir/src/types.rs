@@ -22,8 +22,7 @@ pub enum DTypeClass {
     /// F32, BF16, F16: participate in elementwise arithmetic, reductions and matmul.
     Arithmetic,
     /// I32: the exact-integer dtype (position arithmetic, hash bit ops, an index/count value). Stays
-    /// admitted wherever arithmetic is, and is one of the two dtypes `infer` accepts for an index-role
-    /// operand (see [`DType::is_index_operand`]).
+    /// admitted wherever arithmetic is, and is the one dtype `infer` accepts for an index-role operand.
     Index,
     /// A logical storage dtype with no arithmetic meaning of its own (`E4M3FN`, `E8M0`, and every
     /// checkpoint-only integer/float width). Values enter or leave computation only through `Cast`;

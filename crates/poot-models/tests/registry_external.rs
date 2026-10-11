@@ -144,6 +144,7 @@ fn decode_shape() -> StepShape {
         capacity: NonZeroUsize::new(8).unwrap(),
         kv: KvLayout::Contiguous,
         logits: LogitRows::Last,
+        hidden: None,
     }
 }
 

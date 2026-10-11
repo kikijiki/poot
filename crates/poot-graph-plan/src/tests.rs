@@ -1,9 +1,7 @@
 //! Unit tests for the planner: dispatch-predicate gating, cache-key stability, strided-view promotion,
 //! real-config dispatch-count regressions.
 
-use poot_graph_ir::{
-    AttentionAttrs, Builder, ShapeError, StateRole, Storage, TensorType, ValidationId,
-};
+use poot_graph_ir::{AttentionAttrs, Builder, ShapeError, Storage, TensorType, ValidationId};
 use poot_target::{
     AmdArch, Backend, DECODE_GEMV_CHUNK_TRIGGER, DeviceCaps, Queried, TensorCoreSupport,
     WatchdogBudget,
@@ -17,7 +15,7 @@ use crate::device_validation::ResourceRefusal;
 /// The one dispatch of a plan that launches one kernel and binds no metadata buffer.
 fn plain(plan: &Plan) -> &Dispatch {
     match plan.single() {
-        Some(dispatch) if dispatch.launch.meta.is_empty() => dispatch,
+        Some(dispatch) if dispatch.launch().meta.is_empty() => dispatch,
         _ => panic!("expected one dispatch without a metadata buffer, got {plan:?}"),
     }
 }
@@ -25,14 +23,14 @@ fn plain(plan: &Plan) -> &Dispatch {
 /// The one dispatch of a plan that launches one kernel and binds a metadata buffer.
 fn with_meta(plan: &Plan) -> &Dispatch {
     match plan.single() {
-        Some(dispatch) if !dispatch.launch.meta.is_empty() => dispatch,
+        Some(dispatch) if !dispatch.launch().meta.is_empty() => dispatch,
         _ => panic!("expected one dispatch with a metadata buffer, got {plan:?}"),
     }
 }
 
 fn is_plain(plan: &Plan) -> bool {
     plan.single()
-        .is_some_and(|dispatch| dispatch.launch.meta.is_empty())
+        .is_some_and(|dispatch| dispatch.launch().meta.is_empty())
 }
 
 /// [`plain`], taking the plan by value.
@@ -49,14 +47,11 @@ fn into_with_meta(plan: Plan) -> Dispatch {
 
 fn one_dispatch(plan: Plan) -> Dispatch {
     match plan {
-        Plan::Dispatches(mut dispatches) if dispatches.len() == 1 => dispatches.remove(0),
+        Plan::Dispatches(dispatches) if dispatches.len() == 1 => {
+            dispatches.into_dispatches().remove(0)
+        }
         other => panic!("expected one dispatch, got {other:?}"),
     }
-}
-
-/// Whole-graph exact-I32 storage query, as the planner and executors ask it.
-fn value_requires_exact_i32_storage(g: &Graph, id: ValueId) -> bool {
-    ExactI32StorageAnalysis::new(g).required(id)
 }
 
 /// Dispatch count with the planner's strided-view promotion applied: a promoted eqn counts as 0
@@ -196,381 +191,6 @@ fn batched_matmul_graph(batch: usize, m: usize, k: usize, n: usize, dt: GDt) -> 
     bld.finish(mm)
 }
 
-fn prior_exact_i32_storage_query(graph: &Graph, id: ValueId) -> bool {
-    if graph
-        .values
-        .get(id)
-        .is_none_or(|value| value.aval.dtype != GDt::I32)
-    {
-        return false;
-    }
-    let mut adjacency: std::collections::HashMap<ValueId, Vec<ValueId>> =
-        std::collections::HashMap::new();
-    for eqn in &graph.eqns {
-        if graph
-            .values
-            .get(eqn.out)
-            .is_none_or(|value| value.aval.dtype != GDt::I32)
-            || !matches!(
-                eqn.op,
-                OpKind::Binary(_)
-                    | OpKind::Unary(_)
-                    | OpKind::Select
-                    | OpKind::Fused(_)
-                    | OpKind::Reshape { .. }
-                    | OpKind::Transpose { .. }
-                    | OpKind::Slice { .. }
-                    | OpKind::Broadcast { .. }
-                    | OpKind::Concat { .. }
-            )
-        {
-            continue;
-        }
-        for input in &eqn.inputs {
-            if let Operand::Value(input) = input
-                && graph
-                    .values
-                    .get(*input)
-                    .is_some_and(|value| value.aval.dtype == GDt::I32)
-            {
-                adjacency.entry(eqn.out).or_default().push(*input);
-                adjacency.entry(*input).or_default().push(eqn.out);
-            }
-        }
-    }
-    // A carried I32 state value is one buffer: its input and its next value are adjacent.
-    for &(input, output) in &graph.state {
-        let is_i32 = |id: ValueId| {
-            graph
-                .values
-                .get(id)
-                .is_some_and(|value| value.aval.dtype == GDt::I32)
-        };
-        if is_i32(input) && is_i32(output) {
-            adjacency.entry(input).or_default().push(output);
-            adjacency.entry(output).or_default().push(input);
-        }
-    }
-    let mut seen = std::collections::HashSet::new();
-    let mut pending = std::collections::VecDeque::from([id]);
-    while let Some(value) = pending.pop_front() {
-        if !seen.insert(value) {
-            continue;
-        }
-        if let Some(neighbors) = adjacency.get(&value) {
-            pending.extend(neighbors.iter().copied());
-        }
-    }
-    let has_binary = graph.eqns.iter().any(|eqn| {
-        matches!(
-            eqn.op,
-            OpKind::Binary(_) | OpKind::Unary(_) | OpKind::Select | OpKind::Fused(_)
-        ) && (seen.contains(&eqn.out)
-            || eqn
-                .inputs
-                .iter()
-                .any(|input| matches!(input, Operand::Value(input) if seen.contains(input))))
-    });
-    has_binary
-        && (seen.contains(&graph.output)
-            || graph
-                .state
-                .iter()
-                .any(|&(_, output)| seen.contains(&output))
-            || graph.eqns.iter().any(|eqn| {
-                let observed = match &eqn.op {
-                    OpKind::Binary(
-                        GBinOp::GeU
-                        | GBinOp::RemU
-                        | GBinOp::And
-                        | GBinOp::Or
-                        | GBinOp::Xor
-                        | GBinOp::Shl
-                        | GBinOp::Shr,
-                    )
-                    | OpKind::Unary(GUnOp::Not | GUnOp::Clz)
-                    | OpKind::Select => true,
-                    OpKind::Fused(region) => region.steps.iter().any(|step| {
-                        matches!(
-                            step.op,
-                            FusedOp::Binary(
-                                GBinOp::GeU
-                                    | GBinOp::RemU
-                                    | GBinOp::And
-                                    | GBinOp::Or
-                                    | GBinOp::Xor
-                                    | GBinOp::Shl
-                                    | GBinOp::Shr
-                            ) | FusedOp::Unary(GUnOp::Not | GUnOp::Clz)
-                                | FusedOp::Select
-                        )
-                    }),
-                    _ => false,
-                };
-                observed
-                    && (seen.contains(&eqn.out)
-                        || eqn.inputs.iter().any(
-                            |input| matches!(input, Operand::Value(input) if seen.contains(input)),
-                        ))
-            }))
-}
-
-fn assert_analysis_matches_prior(graph: &Graph, label: &str) {
-    let analysis = ExactI32StorageAnalysis::new(graph);
-    assert!(
-        std::ptr::eq(analysis.graph(), graph),
-        "{label}: analysis must borrow the supplied graph"
-    );
-    let ids = graph
-        .values
-        .ids()
-        .chain(graph.values.next_id())
-        .chain([ValueId::new(u32::MAX)]);
-    for id in ids {
-        let analyzed = analysis.required(id);
-        assert_eq!(
-            analyzed,
-            prior_exact_i32_storage_query(graph, id),
-            "{label}: {id}"
-        );
-        if !graph.values.contains(id) {
-            assert!(
-                !value_requires_exact_i32_storage(graph, id),
-                "{label}: {id}"
-            );
-        }
-    }
-}
-
-fn exact_i32_component_fixture() -> Graph {
-    let b = Builder::new();
-    let exact_input = b.constant("exact", TensorType::new(vec![2], GDt::I32));
-    let exact_moved = b.broadcast(exact_input, vec![2, 2]);
-    let exact_moved = b.transpose(exact_moved, vec![1, 0]);
-    let exact_moved = b.slice(exact_moved, 0, 0, 1);
-    let exact_moved = b.reshape(exact_moved, vec![2]);
-    let exact_moved = b.concat(0, &[exact_moved, exact_moved]);
-    let exact = b.binary_scalar(GBinOp::GeU, exact_moved, Scalar::I32(i32::MIN));
-
-    let legacy_input = b.constant("legacy", TensorType::new(vec![2], GDt::I32));
-    let legacy = b.binary_scalar(GBinOp::Add, legacy_input, Scalar::I32(1));
-    let table = b.constant("table", TensorType::f32(vec![4, 1]));
-    let _legacy_output = b.gather(table, 0, legacy);
-
-    let disconnected_input = b.constant("disconnected", TensorType::new(vec![1], GDt::I32));
-    let _disconnected = b.binary_scalar(GBinOp::Add, disconnected_input, Scalar::I32(i32::MAX));
-    b.finish(exact)
-}
-
-#[test]
-fn reusable_exact_i32_analysis_matches_the_prior_component_query() {
-    assert_analysis_matches_prior(&Graph::default(), "empty graph");
-
-    let b = Builder::new();
-    let identity = b.constant("identity", TensorType::new(vec![1], GDt::I32));
-    assert_analysis_matches_prior(&b.finish(identity), "i32 constant identity");
-
-    let graph = exact_i32_component_fixture();
-    assert_analysis_matches_prior(&graph, "movement/GeU/legacy/disconnected");
-
-    let b = Builder::new();
-    let output_input = b.constant("output", TensorType::new(vec![1], GDt::I32));
-    let output = b.binary_scalar(GBinOp::Add, output_input, Scalar::I32(1));
-    let output_graph = b.finish(output);
-    assert_analysis_matches_prior(&output_graph, "primary output");
-
-    let b = Builder::new();
-    let state = b.state_input(
-        "state",
-        TensorType::new(vec![1], GDt::I32),
-        StateRole::Recurrent,
-    );
-    let state_output = b.binary_scalar(GBinOp::Add, state, Scalar::I32(1));
-    let visible = b.constant("visible", TensorType::f32(vec![1]));
-    let state_graph = b.finish_with_state(visible, &[(state, state_output)]);
-    assert_analysis_matches_prior(&state_graph, "state output");
-
-    let fixtures = [graph, output_graph, state_graph];
-    for (fixture_index, fixture) in fixtures.into_iter().enumerate() {
-        for bad in [fixture.values.next_id().unwrap(), ValueId::new(u32::MAX)] {
-            let mut malformed = fixture.clone();
-            malformed.output = bad;
-            assert_analysis_matches_prior(
-                &malformed,
-                &format!("fixture {fixture_index} malformed graph output {bad}"),
-            );
-
-            let mut malformed = fixture.clone();
-            malformed.state.push((bad, bad));
-            assert_analysis_matches_prior(
-                &malformed,
-                &format!("fixture {fixture_index} malformed state pair {bad}"),
-            );
-
-            for equation in 0..fixture.eqns.len() {
-                let mut malformed = fixture.clone();
-                malformed.eqns[equation].out = bad;
-                assert_analysis_matches_prior(
-                    &malformed,
-                    &format!("fixture {fixture_index} malformed eqn {equation} output {bad}"),
-                );
-
-                for operand in 0..fixture.eqns[equation].inputs.len() {
-                    if !matches!(fixture.eqns[equation].inputs[operand], Operand::Value(_)) {
-                        continue;
-                    }
-                    let mut malformed = fixture.clone();
-                    malformed.eqns[equation].inputs[operand] = Operand::Value(bad);
-                    assert_analysis_matches_prior(
-                        &malformed,
-                        &format!(
-                            "fixture {fixture_index} malformed eqn {equation} operand {operand} {bad}"
-                        ),
-                    );
-                }
-            }
-        }
-
-        for value in fixture.values.ids() {
-            let mut malformed = fixture.clone();
-            malformed.values[value].aval.dtype = if malformed.values[value].aval.dtype == GDt::I32 {
-                GDt::F32
-            } else {
-                GDt::I32
-            };
-            assert_analysis_matches_prior(
-                &malformed,
-                &format!("fixture {fixture_index} malformed dtype {value}"),
-            );
-        }
-    }
-}
-
-/// Card 671: `plan_eqn`, the legacy single-equation wrapper this test used to contrast against, is
-/// deleted (it called the per-eqn body directly, skipping `ensure_eqn`'s pointer-identity check -
-/// `poot_test_util::graph_fixtures::plan_eqn` reconstructs that call shape for cross-crate test
-/// callers, but every in-crate caller, this test included, now goes straight through
-/// `plan_eqn_analyzed`). `ensure_eqn` rejects a foreign or cloned `Eqn` unconditionally - it checks
-/// that `eqn`'s address falls inside `analysis`'s own graph's `eqns` backing storage, not whether
-/// the analysis happens to be freshly built from a graph with equivalent contents - so there is no
-/// longer a lenient entry point to assert compatibility with a detached equation through.
-#[test]
-fn analyzed_planner_rejects_a_different_graph_or_foreign_equation() {
-    let graph = exact_i32_component_fixture();
-    let foreign = exact_i32_component_fixture();
-    let analysis = ExactI32StorageAnalysis::new(&graph);
-
-    let foreign_eqn = &foreign.eqns[0];
-    assert!(matches!(
-        plan_eqn_analyzed(
-            &analysis,
-            &foreign,
-            foreign_eqn,
-            Backend::Nvptx,
-            &default_caps_for(Backend::Nvptx),
-            &poot_test_util::graph_fixtures::roomy_body_limits()
-        ),
-        Err(PlanError::AnalysisContextMismatch(_))
-    ));
-
-    assert!(matches!(
-        plan_eqn_analyzed(
-            &analysis,
-            &graph,
-            foreign_eqn,
-            Backend::Nvptx,
-            &default_caps_for(Backend::Nvptx),
-            &poot_test_util::graph_fixtures::roomy_body_limits()
-        ),
-        Err(PlanError::AnalysisContextMismatch(_))
-    ));
-
-    let cloned = graph.eqns[0].clone();
-    assert!(
-        matches!(
-            plan_eqn_analyzed(
-                &analysis,
-                &graph,
-                &cloned,
-                Backend::Nvptx,
-                &default_caps_for(Backend::Nvptx),
-                &poot_test_util::graph_fixtures::roomy_body_limits()
-            ),
-            Err(PlanError::AnalysisContextMismatch(_))
-        ),
-        "analyzed planning requires the stored equation, not a clone"
-    );
-}
-
-#[test]
-fn fresh_and_reused_storage_analysis_plan_identically() {
-    let graph = exact_i32_component_fixture();
-    let analysis = ExactI32StorageAnalysis::new(&graph);
-    let views = compute_views(&graph, Backend::SpirvVulkan);
-    for eqn in &graph.eqns {
-        for backend in [
-            Backend::SpirvVulkan,
-            Backend::Nvptx,
-            Backend::AmdGcn(AmdArch::gfx1151()),
-        ] {
-            assert_eq!(
-                format!(
-                    "{:?}",
-                    plan_eqn_analyzed(
-                        &ExactI32StorageAnalysis::new(&graph),
-                        &graph,
-                        eqn,
-                        backend,
-                        &default_caps_for(backend),
-                        &poot_test_util::graph_fixtures::roomy_body_limits()
-                    )
-                ),
-                format!(
-                    "{:?}",
-                    plan_eqn_analyzed(
-                        &analysis,
-                        &graph,
-                        eqn,
-                        backend,
-                        &default_caps_for(backend),
-                        &poot_test_util::graph_fixtures::roomy_body_limits()
-                    )
-                ),
-                "{:?} on {backend:?}",
-                eqn.op
-            );
-        }
-        assert_eq!(
-            format!(
-                "{:?}",
-                plan_eqn_views_analyzed(
-                    &ExactI32StorageAnalysis::new(&graph),
-                    &graph,
-                    eqn,
-                    Backend::SpirvVulkan,
-                    &views,
-                    &default_caps_for(Backend::SpirvVulkan),
-                    &poot_test_util::graph_fixtures::roomy_body_limits()
-                )
-            ),
-            format!(
-                "{:?}",
-                plan_eqn_views_analyzed(
-                    &analysis,
-                    &graph,
-                    eqn,
-                    Backend::SpirvVulkan,
-                    &views,
-                    &default_caps_for(Backend::SpirvVulkan),
-                    &poot_test_util::graph_fixtures::roomy_body_limits()
-                )
-            ),
-            "view plan for {:?}",
-            eqn.op
-        );
-    }
-}
-
 /// The plan and the kernel choice behind it for one equation (single-device, no views).
 fn planned_with_choice(
     g: &Graph,
@@ -587,8 +207,7 @@ fn planned_with_choice_caps(
     backend: Backend,
     caps: &DeviceCaps,
 ) -> Result<(Plan, KernelChoice), PlanError> {
-    plan_eqn_choice_analyzed(
-        &ExactI32StorageAnalysis::new(g),
+    plan_eqn_choice(
         g,
         eqn,
         backend,
@@ -948,8 +567,7 @@ fn half_width_select_is_refused_as_a_dtype_lowering_gap() {
     let g = b.finish(selected);
     let eqn = &g.eqns[0];
     let refusal = refusal_of(
-        plan_eqn_analyzed(
-            &ExactI32StorageAnalysis::new(&g),
+        plan_eqn(
             &g,
             eqn,
             Backend::SpirvVulkan,
@@ -962,18 +580,16 @@ fn half_width_select_is_refused_as_a_dtype_lowering_gap() {
 }
 
 #[test]
-fn bounded_i32_planning_remains_compatible_outside_exact_paths() {
-    // The legacy helper is unchanged for index-consuming kernels. Exact integer selection is limited to
-    // Binary and bit-preserving movement, so bounded position/index consumers are not globally retyped.
-    assert_eq!(fty_ty(GDt::I32), Ty::F32);
+fn i32_is_its_own_kernel_element_type() {
+    // POOT-725: no I32 value is computed through f32. Its element type is I32 wherever it is read.
+    assert_eq!(fty_ty(GDt::I32), Ty::I32);
 
     let b = Builder::new();
     let x = b.constant("x", TensorType::new(vec![2], GDt::I32));
     let y = b.binary_scalar(GBinOp::Add, x, Scalar::I32(1));
     let g = b.finish(y);
     let eqn = &g.eqns[0];
-    let planned_plan = plan_eqn_analyzed(
-        &ExactI32StorageAnalysis::new(&g),
+    let planned_plan = plan_eqn(
         &g,
         eqn,
         Backend::Nvptx,
@@ -1004,13 +620,17 @@ fn slice_element_ty(body: &Body, param: usize) -> &Ty {
     element
 }
 
+/// An I32 movement moves I32 words whatever reads its result: the same kernel (same request, same plan key)
+/// whether an arithmetic op or a `Gather` index consumes it.
+///
+/// Mutation: have `movement_storage` carry an I32 value through `Ty::F32`; both carriers go red.
 #[test]
-fn i32_movement_storage_is_graph_connected_and_cache_distinct() {
-    let movement_plan = |exact: bool| {
+fn i32_movement_carries_i32_whatever_consumes_it() {
+    let movement_plan = |arithmetic: bool| {
         let b = Builder::new();
         let x = b.constant("x", TensorType::new(vec![1], GDt::I32));
         let moved = b.broadcast(x, vec![2]);
-        let output = if exact {
+        let output = if arithmetic {
             b.binary_scalar(GBinOp::Add, moved, Scalar::I32(1))
         } else {
             let table = b.constant("table", TensorType::f32(vec![4, 1]));
@@ -1027,10 +647,10 @@ fn i32_movement_storage_is_graph_connected_and_cache_distinct() {
         (body, key, choice)
     };
 
-    let (legacy_body, legacy_key, legacy_choice) = movement_plan(false);
-    let (exact_body, exact_key, exact_choice) = movement_plan(true);
-    assert_eq!(slice_element_ty(&legacy_body, 1), &Ty::F32);
-    assert_eq!(slice_element_ty(&exact_body, 1), &Ty::I32);
+    let (arith_body, arith_key, arith_choice) = movement_plan(true);
+    let (index_body, index_key, index_choice) = movement_plan(false);
+    assert_eq!(slice_element_ty(&arith_body, 1), &Ty::I32);
+    assert_eq!(slice_element_ty(&index_body, 1), &Ty::I32);
     let broadcast_dtype = |choice: &KernelChoice| match choice {
         KernelChoice::Generated(KernelRequest::Movement(kg::MovementSpec {
             storage: kg::Storage::Elements { carrier },
@@ -1039,18 +659,22 @@ fn i32_movement_storage_is_graph_connected_and_cache_distinct() {
         })) => carrier.clone(),
         other => panic!("a broadcast must be generated: {other:?}"),
     };
-    assert_eq!(broadcast_dtype(&legacy_choice), Ty::F32);
-    assert_eq!(broadcast_dtype(&exact_choice), Ty::I32);
-    assert_ne!(legacy_key, exact_key);
+    assert_eq!(broadcast_dtype(&arith_choice), Ty::I32);
+    assert_eq!(broadcast_dtype(&index_choice), Ty::I32);
+    assert_eq!(arith_key, index_key);
 }
 
+/// An I32 `Add` plans one I32 kernel whether the sum is observed, or only feeds a `Gather` index: the kernel
+/// does not depend on its consumer.
+///
+/// Mutation: have `fty_ty` map I32 back to `Ty::F32`; the unobserved case's param goes `Slice<f32>`.
 #[test]
-fn exact_and_legacy_i32_binary_cache_keys_cannot_collide() {
-    let binary_plan = |exact: bool| {
+fn an_i32_binary_plans_the_same_kernel_whatever_consumes_it() {
+    let binary_plan = |observed: bool| {
         let b = Builder::new();
         let x = b.constant("x", TensorType::new(vec![2], GDt::I32));
         let y = b.binary_scalar(GBinOp::Add, x, Scalar::I32(1));
-        let output = if exact {
+        let output = if observed {
             y
         } else {
             let table = b.constant("table", TensorType::f32(vec![4, 1]));
@@ -1066,34 +690,33 @@ fn exact_and_legacy_i32_binary_cache_keys_cannot_collide() {
         let Dispatch { body, key, .. } = into_plain(planned_plan);
         (body, key, choice)
     };
-    let (exact_body, exact_key, exact_choice) = binary_plan(true);
-    let (legacy_body, legacy_key, legacy_choice) = binary_plan(false);
-    assert_eq!(slice_element_ty(&exact_body, 1), &Ty::I32);
-    assert_eq!(slice_element_ty(&legacy_body, 1), &Ty::F32);
-    assert!(
-        matches!(
-            &exact_choice,
-            KernelChoice::Generated(KernelRequest::Elementwise(
-                ElementwiseSpec::ScalarI32 { .. }
-            ))
-        ),
-        "{exact_choice:?}"
-    );
-    assert!(
-        matches!(
-            &legacy_choice,
-            KernelChoice::Generated(KernelRequest::Elementwise(
-                ElementwiseSpec::ScalarFloat { .. }
-            ))
-        ),
-        "{legacy_choice:?}"
-    );
-    assert_ne!(exact_key, legacy_key);
+    let (observed_body, observed_key, observed_choice) = binary_plan(true);
+    let (index_body, index_key, index_choice) = binary_plan(false);
+    for (body, choice) in [
+        (&observed_body, &observed_choice),
+        (&index_body, &index_choice),
+    ] {
+        assert_eq!(slice_element_ty(body, 1), &Ty::I32, "{choice:?}");
+        assert!(
+            matches!(
+                choice,
+                KernelChoice::Generated(KernelRequest::Elementwise(
+                    ElementwiseSpec::ScalarI32 { .. }
+                ))
+            ),
+            "{choice:?}"
+        );
+    }
+    assert_eq!(observed_key, index_key);
 }
 
+/// A `Gather` reads its index through `Slice<i32>` on axis 0 and axis 1, whether the index is a plain I32 value
+/// or computed by I32 arithmetic, and the movement request names no index element type.
+///
+/// Mutation: read the index param as `Slice<f32>` in the movement generator; the param assertions go red.
 #[test]
-fn gather_reads_exact_i32_index_chains_without_retyping_legacy_indices() {
-    let gather_plan = |exact: bool, axis: usize| {
+fn gather_reads_i32_indices_through_slice_i32() {
+    let gather_plan = |computed: bool, axis: usize| {
         let b = Builder::new();
         let table = if axis == 0 {
             b.constant("table", TensorType::f32(vec![4, 2]))
@@ -1101,15 +724,13 @@ fn gather_reads_exact_i32_index_chains_without_retyping_legacy_indices() {
             b.constant("table", TensorType::f32(vec![2, 4, 2]))
         };
         let index = b.constant("index", TensorType::new(vec![2], GDt::I32));
-        let index = if exact {
+        let index = if computed {
             b.binary_scalar(GBinOp::Add, index, Scalar::I32(1))
         } else {
             b.broadcast(index, vec![2])
         };
         let gathered = b.gather(table, axis, index);
-        // An early exact-I32 primary output keeps the later Gather in the graph and makes the shared index
-        // component externally observed. The legacy case observes only the gathered float result.
-        let g = b.finish(if exact { index } else { gathered });
+        let g = b.finish(gathered);
         let eqn = g
             .eqns
             .iter()
@@ -1118,32 +739,24 @@ fn gather_reads_exact_i32_index_chains_without_retyping_legacy_indices() {
         planned_with_choice(&g, eqn, Backend::Nvptx).unwrap()
     };
 
-    // The index element type the request names.
-    let generated_index = |choice: &KernelChoice| match choice {
-        KernelChoice::Generated(KernelRequest::Movement(kg::MovementSpec {
-            op: kg::MovementOp::Gather { index_dtype, .. },
-            ..
-        })) => index_dtype.clone(),
-        other => panic!("expected a generated gather: {other:?}"),
-    };
     for axis in [0, 1] {
-        let (planned_plan, choice) = gather_plan(true, axis);
-        let Dispatch { body, .. } = into_plain(planned_plan);
-        assert_eq!(slice_element_ty(&body, 1), &Ty::F32);
-        assert_eq!(slice_element_ty(&body, 2), &Ty::I32);
-        assert_eq!(generated_index(&choice), Ty::I32);
-
-        let (legacy, choice) = gather_plan(false, axis);
-        let Dispatch { body, .. } = into_plain(legacy);
-        assert_eq!(slice_element_ty(&body, 2), &Ty::F32);
-        assert_eq!(generated_index(&choice), Ty::F32);
+        for computed in [true, false] {
+            let (planned_plan, choice) = gather_plan(computed, axis);
+            let Dispatch { body, .. } = into_plain(planned_plan);
+            assert_eq!(slice_element_ty(&body, 1), &Ty::F32, "axis {axis}");
+            assert_eq!(
+                slice_element_ty(&body, 2),
+                &Ty::I32,
+                "axis {axis} computed {computed}: {choice:?}"
+            );
+        }
     }
 }
 
-/// A Gather over I32 data moves the table's words: data and output are exact whatever else touches them.
+/// A Gather over I32 data moves the table's words as i32 and reads its index as i32.
 ///
-/// Mutation: drop the `pinned` pass of `ExactI32StorageAnalysis::new`; the table is read through `Slice<f32>`
-/// and this row goes red.
+/// Mutation: have `movement_storage` carry an I32 table through `Ty::F32`; the table and output params go
+/// `Slice<f32>` and this row goes red.
 #[test]
 fn gather_over_i32_data_reads_the_table_on_the_i32_lane() {
     for axis in [0, 1] {
@@ -1158,9 +771,7 @@ fn gather_over_i32_data_reads_the_table_on_the_i32_lane() {
             .iter()
             .find(|eqn| matches!(eqn.op, OpKind::Gather { .. }))
             .unwrap();
-        let analysis = ExactI32StorageAnalysis::new(&g);
-        let body = match plan_eqn_analyzed(
-            &analysis,
+        let body = match plan_eqn(
             &g,
             eqn,
             Backend::SpirvVulkan,
@@ -1169,18 +780,17 @@ fn gather_over_i32_data_reads_the_table_on_the_i32_lane() {
         )
         .unwrap()
         {
-            plan if is_plain(&plan) => one_dispatch(plan).body,
-            other => panic!("axis {axis}: exact I32 Gather planned as {other:?}"),
+            plan if is_plain(&plan) => one_dispatch(plan).body().clone(),
+            other => panic!("axis {axis}: I32 Gather planned as {other:?}"),
         };
-        // The table is an authoritative integer source: its words move as i32, the index stays on its own lane.
         assert_eq!(slice_element_ty(&body, 1), &Ty::I32, "axis {axis} data");
         assert_eq!(slice_element_ty(&body, 3), &Ty::I32, "axis {axis} out");
-        assert_eq!(slice_element_ty(&body, 2), &Ty::F32, "axis {axis} index");
+        assert_eq!(slice_element_ty(&body, 2), &Ty::I32, "axis {axis} index");
     }
 }
 
 #[test]
-fn an_isolated_i32_gather_plans_the_i32_carrier_with_an_f32_index() {
+fn an_isolated_i32_gather_plans_the_i32_carrier_with_an_i32_index() {
     for (axis, table_shape) in [(0, vec![4, 2]), (1, vec![2, 4, 2])] {
         let b = Builder::new();
         let table = b.constant("table", TensorType::new(table_shape, GDt::I32));
@@ -1206,33 +816,14 @@ fn an_isolated_i32_gather_plans_the_i32_carrier_with_an_f32_index() {
                 kg::MovementOp::Gather {
                     in_shape,
                     axis,
-                    index_dtype: Ty::F32,
                     index_numel: 3,
                 },
             ),
             "axis {axis}"
         );
         assert_eq!(slice_element_ty(&body, 1), &Ty::I32, "axis {axis} data");
-        assert_eq!(slice_element_ty(&body, 2), &Ty::F32, "axis {axis} index");
+        assert_eq!(slice_element_ty(&body, 2), &Ty::I32, "axis {axis} index");
     }
-}
-
-/// Binary arithmetic over the gathered rows joins their component: table, gather output and addend are
-/// all exact.
-#[test]
-fn a_gather_over_i32_data_shares_its_component_with_the_arithmetic_over_its_rows() {
-    let b = Builder::new();
-    let table = b.constant("table", TensorType::new(vec![4], GDt::I32));
-    let index = b.constant("index", TensorType::new(vec![3], GDt::I32));
-    let addend = b.constant("addend", TensorType::new(vec![3], GDt::I32));
-    let gathered = b.gather(table, 0, index);
-    let output = b.binary(GBinOp::Add, gathered, addend);
-    let g = b.finish(output);
-    let analysis = ExactI32StorageAnalysis::new(&g);
-    assert!(analysis.required(gathered.id()));
-    assert!(analysis.required(table.id()));
-    assert!(analysis.required(addend.id()));
-    assert!(!analysis.required(index.id()));
 }
 
 #[test]
@@ -1244,8 +835,7 @@ fn planner_rejects_literal_first_binary_locally_without_panicking() {
     g.eqns[0].inputs.swap(0, 1);
     g.validate().expect("literal-first Binary is graph-valid");
     let refusal = refusal_of(
-        plan_eqn_analyzed(
-            &ExactI32StorageAnalysis::new(&g),
+        plan_eqn(
             &g,
             &g.eqns[0],
             Backend::SpirvVulkan,
@@ -1271,8 +861,7 @@ fn planner_refuses_an_unfolded_iota_with_a_typed_refusal() {
         .find(|eqn| matches!(eqn.op, OpKind::Iota { .. }))
         .expect("the graph must hold an Iota equation");
     let refusal = refusal_of(
-        plan_eqn_analyzed(
-            &ExactI32StorageAnalysis::new(&graph),
+        plan_eqn(
             &graph,
             iota,
             Backend::SpirvVulkan,
@@ -1282,62 +871,6 @@ fn planner_refuses_an_unfolded_iota_with_a_typed_refusal() {
         "unfolded Iota",
     );
     assert_eq!(refusal.missing, Capability::UnfoldedIota);
-}
-
-#[test]
-fn exact_i32_runtime_is_gated_without_blocking_bounded_index_graphs() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::new(vec![2], GDt::I32));
-    let exact = b.binary_scalar(GBinOp::Add, x, Scalar::I32(1));
-    let exact_graph = b.finish(exact);
-    let error = validate_graph_execution(&exact_graph).unwrap_err();
-    assert!(
-        matches!(
-            error,
-            PlanError::UnrepresentableValue {
-                value,
-                dtype: GDt::I32,
-                gap: StorageGap::ExactI32BindReplay,
-            } if value == x.id()
-        ),
-        "{error:?}"
-    );
-
-    let b = Builder::new();
-    let table = b.constant("table", TensorType::f32(vec![4, 1]));
-    let pos = b.constant("pos", TensorType::new(vec![2], GDt::I32));
-    let index = b.binary_scalar(GBinOp::Add, pos, Scalar::I32(1));
-    let gathered = b.gather(table, 0, index);
-    let legacy_graph = b.finish(gathered);
-    validate_graph_execution(&legacy_graph)
-        .expect("bounded I32 arithmetic used only as an index retains legacy execution");
-    assert!(!value_requires_exact_i32_storage(&legacy_graph, pos.id()));
-}
-
-#[test]
-fn exact_i32_runtime_gate_precedes_binder_payload_choice() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::new(vec![1], GDt::I32));
-    let output = b.binary_scalar(GBinOp::Add, x, Scalar::I32(1));
-    let g = b.finish(output);
-    for tensor in [
-        poot_tensor::HostTensor::i32(vec![1], vec![7]),
-        poot_tensor::HostTensor::f32(vec![1], vec![7.0]),
-    ] {
-        let inputs = std::collections::HashMap::from([(x.id(), tensor)]);
-        assert!(inputs.contains_key(&x.id()));
-        let error = validate_graph_execution(&g).unwrap_err();
-        assert!(
-            matches!(
-                error,
-                PlanError::UnrepresentableValue {
-                    gap: StorageGap::ExactI32BindReplay,
-                    ..
-                }
-            ),
-            "{error:?}"
-        );
-    }
 }
 
 #[test]
@@ -1360,17 +893,13 @@ fn planner_structural_boundary_rejects_invalid_binding_table_first() {
 }
 
 #[test]
-fn exact_i32_runtime_inspection_is_total_for_a_malformed_graph() {
+fn i32_graph_inspection_is_total_for_a_malformed_graph() {
     let b = Builder::new();
     let x = b.constant("x", TensorType::new(vec![1], GDt::I32));
     let output = b.binary_scalar(GBinOp::Add, x, Scalar::I32(1));
     let mut g = b.finish(output);
     g.eqns[0].inputs[0] = Operand::Value(g.values.next_id().unwrap());
 
-    assert!(!value_requires_exact_i32_storage(
-        &g,
-        g.values.next_id().unwrap()
-    ));
     assert!(matches!(
         validate_graph_execution(&g),
         Err(PlanError::InvalidGraph(
@@ -1392,8 +921,7 @@ fn exact_i32_planner_rejects_static_numel_overflow() {
     // card 525: plan_eqn now derives out_shape/out_numel from this same mutated aval itself (it can no
     // longer be told a different shape than the graph's own), so the overflow it must survive without
     // panicking is now computed inside plan_eqn, not passed in by the caller.
-    let error = plan_eqn_analyzed(
-        &ExactI32StorageAnalysis::new(&g),
+    let error = plan_eqn(
         &g,
         &g.eqns[0],
         Backend::Nvptx,
@@ -1422,8 +950,7 @@ fn plan_eqn_derives_shape_from_the_graph_not_a_caller_argument() {
     let out = b.binary(GBinOp::Add, x, y);
     let g = b.finish(out);
     let eqn = &g.eqns[0];
-    let planned_plan = plan_eqn_analyzed(
-        &ExactI32StorageAnalysis::new(&g),
+    let planned_plan = plan_eqn(
         &g,
         eqn,
         Backend::SpirvVulkan,
@@ -1599,7 +1126,7 @@ fn e4m3fn_scatter_update_materializes_exact_packed_output_and_keys_all_shapes() 
         let builder = Builder::new();
         let base = builder.constant("base", TensorType::new(vec![4, 2, 5], GDt::E4M3FN));
         let src = builder.constant("src", TensorType::new(vec![source_rows, 2, 5], GDt::E4M3FN));
-        let inverse = builder.constant("inverse", TensorType::f32(vec![4]));
+        let inverse = builder.constant("inverse", TensorType::new(vec![4], GDt::I32));
         let output = builder.scatter_update(base, src, inverse);
         builder.finish(output)
     };
@@ -1622,7 +1149,6 @@ fn e4m3fn_scatter_update_materializes_exact_packed_output_and_keys_all_shapes() 
         spec.op,
         kg::MovementOp::ScatterRows {
             src_shape: vec![3, 2, 5],
-            inverse_dtype: Ty::F32,
             window: None
         }
     );
@@ -1630,8 +1156,7 @@ fn e4m3fn_scatter_update_materializes_exact_packed_output_and_keys_all_shapes() 
 
     let other = build(2);
     let other_eqn = &other.eqns[0];
-    let planned_plan = plan_eqn_analyzed(
-        &ExactI32StorageAnalysis::new(&other),
+    let planned_plan = plan_eqn(
         &other,
         other_eqn,
         Backend::SpirvVulkan,
@@ -1643,8 +1168,7 @@ fn e4m3fn_scatter_update_materializes_exact_packed_output_and_keys_all_shapes() 
     assert_ne!(key, other_key, "source row count must separate plan keys");
 
     assert!(is_plain(
-        &plan_eqn_analyzed(
-            &ExactI32StorageAnalysis::new(&graph),
+        &plan_eqn(
             &graph,
             eqn,
             Backend::Nvptx,
@@ -1655,8 +1179,7 @@ fn e4m3fn_scatter_update_materializes_exact_packed_output_and_keys_all_shapes() 
     ));
     let backend = Backend::AmdGcn(AmdArch::gfx1151());
     let refusal = refusal_of(
-        plan_eqn_analyzed(
-            &ExactI32StorageAnalysis::new(&graph),
+        plan_eqn(
             &graph,
             eqn,
             backend,
@@ -1672,7 +1195,7 @@ fn e4m3fn_scatter_update_materializes_exact_packed_output_and_keys_all_shapes() 
     let builder = Builder::new();
     let base = builder.constant("base_rank1", TensorType::new(vec![5], GDt::E4M3FN));
     let src = builder.constant("src_rank1", TensorType::new(vec![3], GDt::E4M3FN));
-    let inverse = builder.constant("inverse_rank1", TensorType::f32(vec![5]));
+    let inverse = builder.constant("inverse_rank1", TensorType::new(vec![5], GDt::I32));
     let output = builder.scatter_update(base, src, inverse);
     let rank1 = builder.finish(output);
     let rank1_eqn = &rank1.eqns[0];
@@ -1739,7 +1262,7 @@ fn e4m3fn_dynamic_update_slice_plans_static_and_runtime_exact_packed_outputs() {
     let builder = Builder::new();
     let operand = builder.constant("operand", TensorType::new(vec![2, 5], GDt::E4M3FN));
     let update = builder.constant("update", TensorType::new(vec![2, 2], GDt::E4M3FN));
-    let index = builder.constant("index", TensorType::f32(vec![]));
+    let index = builder.constant("index", TensorType::new(vec![], GDt::I32));
     let output = builder.dynamic_update_slice_dyn(operand, update, index, 1);
     let graph = builder.finish(output);
     let eqn = &graph.eqns[0];
@@ -1759,7 +1282,7 @@ fn e4m3fn_dynamic_update_slice_plans_static_and_runtime_exact_packed_outputs() {
                 op: kg::MovementOp::UpdateSlice {
                     update_shape,
                     axis: 1,
-                    index: kg::UpdateIndex::Runtime { dtype: Ty::F32 },
+                    index: kg::UpdateIndex::Runtime,
                 },
                 ..
             })) if out_shape == &[2, 5] && update_shape == &[2, 2]
@@ -1768,8 +1291,7 @@ fn e4m3fn_dynamic_update_slice_plans_static_and_runtime_exact_packed_outputs() {
     );
     assert_eq!(grid, [4, 1, 1]);
     assert!(is_plain(
-        &plan_eqn_analyzed(
-            &ExactI32StorageAnalysis::new(&graph),
+        &plan_eqn(
             &graph,
             eqn,
             Backend::Nvptx,
@@ -1780,8 +1302,7 @@ fn e4m3fn_dynamic_update_slice_plans_static_and_runtime_exact_packed_outputs() {
     ));
     let backend = Backend::AmdGcn(AmdArch::gfx1151());
     let refusal = refusal_of(
-        plan_eqn_analyzed(
-            &ExactI32StorageAnalysis::new(&graph),
+        plan_eqn(
             &graph,
             eqn,
             backend,
@@ -1801,13 +1322,12 @@ fn e4m3fn_scatter_update_rejects_empty_and_mixed_storage_by_name() {
         let builder = Builder::new();
         let base = builder.constant("base", TensorType::new(vec![pool, 5], GDt::E4M3FN));
         let src = builder.constant("src", TensorType::new(vec![source_rows, 5], GDt::E4M3FN));
-        let inverse = builder.constant("inverse", TensorType::f32(vec![pool]));
+        let inverse = builder.constant("inverse", TensorType::new(vec![pool], GDt::I32));
         let output = builder.scatter_update(base, src, inverse);
         let graph = builder.finish(output);
         let eqn = &graph.eqns[0];
         let refusal = refusal_of(
-            plan_eqn_analyzed(
-                &ExactI32StorageAnalysis::new(&graph),
+            plan_eqn(
                 &graph,
                 eqn,
                 Backend::SpirvVulkan,
@@ -1823,13 +1343,12 @@ fn e4m3fn_scatter_update_rejects_empty_and_mixed_storage_by_name() {
     let builder = Builder::new();
     let base = builder.constant("base", TensorType::new(vec![2, 5], GDt::E4M3FN));
     let src = builder.constant("src", TensorType::f32(vec![1, 5]));
-    let inverse = builder.constant("inverse", TensorType::f32(vec![2]));
+    let inverse = builder.constant("inverse", TensorType::new(vec![2], GDt::I32));
     let output = builder.scatter_update(base, src, inverse);
     let graph = builder.finish(output);
     let eqn = &graph.eqns[0];
     let refusal = refusal_of(
-        plan_eqn_analyzed(
-            &ExactI32StorageAnalysis::new(&graph),
+        plan_eqn(
             &graph,
             eqn,
             Backend::SpirvVulkan,
@@ -1841,7 +1360,7 @@ fn e4m3fn_scatter_update_rejects_empty_and_mixed_storage_by_name() {
     assert_eq!(refusal.missing, Capability::DtypeLowering);
     assert_eq!(
         refusal.dtypes.operands,
-        [GDt::E4M3FN, GDt::F32, GDt::F32],
+        [GDt::E4M3FN, GDt::F32, GDt::I32],
         "the refusal must carry the mixed operand dtypes"
     );
 
@@ -1877,13 +1396,12 @@ fn e4m3fn_dynamic_update_slice_cache_keys_separate_forms_axes_windows_and_layout
         let output = if let Some(index) = index {
             builder.dynamic_update_slice(operand, update, index, axis)
         } else {
-            let index = builder.constant("index", TensorType::f32(vec![]));
+            let index = builder.constant("index", TensorType::new(vec![], GDt::I32));
             builder.dynamic_update_slice_dyn(operand, update, index, axis)
         };
         let graph = builder.finish(output);
         let eqn = &graph.eqns[0];
-        let planned_plan = plan_eqn_analyzed(
-            &ExactI32StorageAnalysis::new(&graph),
+        let planned_plan = plan_eqn(
             &graph,
             eqn,
             Backend::SpirvVulkan,
@@ -1919,8 +1437,7 @@ fn e4m3fn_dynamic_update_slice_rejects_zero_invalid_window_and_index_storage() {
     let graph = builder.finish(output);
     let eqn = &graph.eqns[0];
     let refusal = refusal_of(
-        plan_eqn_analyzed(
-            &ExactI32StorageAnalysis::new(&graph),
+        plan_eqn(
             &graph,
             eqn,
             Backend::SpirvVulkan,
@@ -1946,8 +1463,7 @@ fn e4m3fn_dynamic_update_slice_rejects_zero_invalid_window_and_index_storage() {
     let graph = builder.finish(output);
     let eqn = &graph.eqns[0];
     let refusal = refusal_of(
-        plan_eqn_analyzed(
-            &ExactI32StorageAnalysis::new(&graph),
+        plan_eqn(
             &graph,
             eqn,
             Backend::SpirvVulkan,
@@ -1959,83 +1475,73 @@ fn e4m3fn_dynamic_update_slice_rejects_zero_invalid_window_and_index_storage() {
     assert_eq!(refusal.missing, Capability::ZeroElementE4m3);
     assert_eq!(refusal.op, eqn.op);
 
-    let builder = Builder::new();
-    let operand = builder.constant("operand", TensorType::new(vec![2, 5], GDt::E4M3FN));
-    let update = builder.constant("update", TensorType::new(vec![2, 2], GDt::E4M3FN));
-    let index = builder.constant("index", TensorType::scalar(GDt::I32));
-    let output = builder.dynamic_update_slice_dyn(operand, update, index, 1);
-    let graph = builder.finish(output);
-    let eqn = &graph.eqns[0];
-    let refusal = refusal_of(
-        plan_eqn_analyzed(
-            &ExactI32StorageAnalysis::new(&graph),
-            &graph,
-            eqn,
-            Backend::SpirvVulkan,
-            &default_caps_for(Backend::SpirvVulkan),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
-        ),
-        "E4M3FN DynamicUpdateSlice with an I32 runtime index",
-    );
-    assert_eq!(refusal.missing, Capability::DtypeLowering);
-    assert_eq!(
-        refusal.dtypes.operands,
-        [GDt::E4M3FN, GDt::E4M3FN, GDt::I32],
-        "the refusal must carry the I32 index dtype"
-    );
+    // An F32 runtime index never reaches the planner: `infer` admits an I32 index only.
+    let err = OpKind::DynamicUpdateSlice { axis: 1 }
+        .infer(&[
+            TensorType::new(vec![2, 5], GDt::E4M3FN),
+            TensorType::new(vec![2, 2], GDt::E4M3FN),
+            TensorType::scalar(GDt::F32),
+        ])
+        .expect_err("an F32 DynamicUpdateSlice index must be rejected by infer");
+    assert!(matches!(
+        err,
+        ShapeError::DtypeOp {
+            op: "DynamicUpdateSlice",
+            dtype: GDt::F32
+        }
+    ));
 }
 
-/// Card 529 (SC-004): a runtime `DynamicUpdateSlice` index's OWN dtype is part of the plan
-/// cache key, not just the data dtype. The baseline shared one key (`dus_dyn:imported`) for an F32-index
-/// and an I32-index DUS over the same F32 data, so the imported body's binding assumption for one dtype
-/// could silently apply to the other.
+/// POOT-725: a runtime `DynamicUpdateSlice` index is I32 and nothing else. An F32 index is refused by shape
+/// inference (it never reaches the planner), and the I32 form plans one request whose index buffer the body
+/// reads as `Slice<i32>`.
+///
+/// Mutation: admit `F32` in `check_index_dtype` (`op.rs`); the F32 row goes red (the index infers).
 #[test]
-fn dynamic_update_slice_runtime_index_dtype_separates_the_plan_key() {
-    // An exact-I32 index (an integer-only `Or` makes its component authoritative, so it is stored as i32)
-    // against an F32 one.
-    let key_for = |index_dtype: GDt| {
-        let builder = Builder::new();
-        let operand = builder.constant("operand", TensorType::f32(vec![4, 5]));
-        let update = builder.constant("update", TensorType::f32(vec![2, 5]));
-        let index = builder.constant("index", TensorType::scalar(index_dtype));
-        let index = if index_dtype == GDt::I32 {
-            builder.binary_scalar(GBinOp::Or, index, Scalar::I32(0))
-        } else {
-            index
-        };
-        let output = builder.dynamic_update_slice_dyn(operand, update, index, 0);
-        let graph = builder.finish(output);
-        let eqn = graph
-            .eqns
-            .iter()
-            .find(|eqn| matches!(eqn.op, OpKind::DynamicUpdateSlice { .. }))
-            .unwrap();
-        let (planned_plan, choice) =
-            planned_with_choice(&graph, eqn, Backend::SpirvVulkan).unwrap();
-        let Dispatch { key, .. } = into_plain(planned_plan);
-        (key, choice)
-    };
+fn dynamic_update_slice_runtime_index_is_i32_only() {
+    let err = OpKind::DynamicUpdateSlice { axis: 0 }
+        .infer(&[
+            TensorType::f32(vec![4, 5]),
+            TensorType::f32(vec![2, 5]),
+            TensorType::scalar(GDt::F32),
+        ])
+        .expect_err("an F32 DynamicUpdateSlice index must be rejected by infer");
+    assert!(matches!(
+        err,
+        ShapeError::DtypeOp {
+            op: "DynamicUpdateSlice",
+            dtype: GDt::F32
+        }
+    ));
 
-    let (f32_key, f32_choice) = key_for(GDt::F32);
-    let (i32_key, i32_choice) = key_for(GDt::I32);
-    assert_ne!(
-        f32_key, i32_key,
-        "an F32-index and an I32-index DUS over F32 data must not share a cache key"
-    );
-    // The choice records the index element type the equation binds.
-    let index_of = |choice: KernelChoice| match choice {
-        KernelChoice::Generated(KernelRequest::Movement(kg::MovementSpec {
-            op:
-                kg::MovementOp::UpdateSlice {
-                    index: kg::UpdateIndex::Runtime { dtype },
+    let builder = Builder::new();
+    let operand = builder.constant("operand", TensorType::f32(vec![4, 5]));
+    let update = builder.constant("update", TensorType::f32(vec![2, 5]));
+    let index = builder.constant("index", TensorType::scalar(GDt::I32));
+    let output = builder.dynamic_update_slice_dyn(operand, update, index, 0);
+    let graph = builder.finish(output);
+    let eqn = graph
+        .eqns
+        .iter()
+        .find(|eqn| matches!(eqn.op, OpKind::DynamicUpdateSlice { .. }))
+        .unwrap();
+    let (planned_plan, choice) = planned_with_choice(&graph, eqn, Backend::SpirvVulkan).unwrap();
+    let Dispatch { body, .. } = into_plain(planned_plan);
+    assert!(
+        matches!(
+            choice,
+            KernelChoice::Generated(KernelRequest::Movement(kg::MovementSpec {
+                op: kg::MovementOp::UpdateSlice {
+                    index: kg::UpdateIndex::Runtime,
                     ..
                 },
-            ..
-        })) => dtype,
-        other => panic!("expected the generated dynamic-update-slice: {other:?}"),
-    };
-    assert_eq!(index_of(f32_choice), Ty::F32);
-    assert_eq!(index_of(i32_choice), Ty::I32);
+                ..
+            }))
+        ),
+        "{choice:?}"
+    );
+    // (operand, update, index, out): the index is the third data param.
+    assert_eq!(slice_element_ty(&body, 3), &Ty::I32);
 }
 
 #[test]
@@ -2070,8 +1576,7 @@ fn e4m3fn_concat_preserves_n_input_contract_and_aliases_only_one_input_on_wgpu()
     );
     assert_eq!(grid, [12, 1, 1]);
     assert!(is_plain(
-        &plan_eqn_analyzed(
-            &ExactI32StorageAnalysis::new(&graph),
+        &plan_eqn(
             &graph,
             eqn,
             Backend::Nvptx,
@@ -2082,8 +1587,7 @@ fn e4m3fn_concat_preserves_n_input_contract_and_aliases_only_one_input_on_wgpu()
     ));
     let backend = Backend::AmdGcn(AmdArch::gfx1151());
     let refusal = refusal_of(
-        plan_eqn_analyzed(
-            &ExactI32StorageAnalysis::new(&graph),
+        plan_eqn(
             &graph,
             eqn,
             backend,
@@ -2103,8 +1607,7 @@ fn e4m3fn_concat_preserves_n_input_contract_and_aliases_only_one_input_on_wgpu()
     let graph = builder.finish(output);
     let eqn = &graph.eqns[0];
     let shape = graph.aval(eqn.out).shape.clone();
-    let planned_plan = plan_eqn_analyzed(
-        &ExactI32StorageAnalysis::new(&graph),
+    let planned_plan = plan_eqn(
         &graph,
         eqn,
         Backend::SpirvVulkan,
@@ -2125,9 +1628,7 @@ fn e4m3fn_concat_preserves_n_input_contract_and_aliases_only_one_input_on_wgpu()
     let graph = builder.finish(output);
     let eqn = &graph.eqns[0];
     assert!(matches!(
-           plan_eqn_analyzed(
-       &ExactI32StorageAnalysis::new(&graph),
-       &graph,
+           plan_eqn(&graph,
        eqn,
        Backend::SpirvVulkan,
        &default_caps_for(Backend::SpirvVulkan),
@@ -2145,8 +1646,7 @@ fn e4m3fn_concat_rejects_zero_element_and_mixed_storage_by_name() {
     let graph = builder.finish(output);
     let eqn = &graph.eqns[0];
     let refusal = refusal_of(
-        plan_eqn_analyzed(
-            &ExactI32StorageAnalysis::new(&graph),
+        plan_eqn(
             &graph,
             eqn,
             Backend::SpirvVulkan,
@@ -2165,8 +1665,7 @@ fn e4m3fn_concat_rejects_zero_element_and_mixed_storage_by_name() {
     let graph = builder.finish(output);
     let eqn = &graph.eqns[0];
     let refusal = refusal_of(
-        plan_eqn_analyzed(
-            &ExactI32StorageAnalysis::new(&graph),
+        plan_eqn(
             &graph,
             eqn,
             Backend::SpirvVulkan,
@@ -2193,8 +1692,7 @@ fn e4m3fn_broadcast_materializes_expansions_and_aliases_only_identity_on_wgpu() 
         let eqn = &graph.eqns[0];
         let shape = graph.aval(eqn.out).shape.clone();
         assert_eq!(shape, output_shape);
-        let planned_plan = plan_eqn_analyzed(
-            &ExactI32StorageAnalysis::new(&graph),
+        let planned_plan = plan_eqn(
             &graph,
             eqn,
             Backend::SpirvVulkan,
@@ -2208,8 +1706,7 @@ fn e4m3fn_broadcast_materializes_expansions_and_aliases_only_identity_on_wgpu() 
         } = into_plain(planned_plan);
         assert_eq!(grid, [expected_words, 1, 1]);
         assert!(is_plain(
-            &plan_eqn_analyzed(
-                &ExactI32StorageAnalysis::new(&graph),
+            &plan_eqn(
                 &graph,
                 eqn,
                 Backend::Nvptx,
@@ -2220,8 +1717,7 @@ fn e4m3fn_broadcast_materializes_expansions_and_aliases_only_identity_on_wgpu() 
         ));
         let backend = Backend::AmdGcn(AmdArch::gfx1151());
         let refusal = refusal_of(
-            plan_eqn_analyzed(
-                &ExactI32StorageAnalysis::new(&graph),
+            plan_eqn(
                 &graph,
                 eqn,
                 backend,
@@ -2241,9 +1737,7 @@ fn e4m3fn_broadcast_materializes_expansions_and_aliases_only_identity_on_wgpu() 
     let graph = builder.finish(output);
     let eqn = &graph.eqns[0];
     assert!(matches!(
-           plan_eqn_analyzed(
-       &ExactI32StorageAnalysis::new(&graph),
-       &graph,
+           plan_eqn(&graph,
        eqn,
        Backend::SpirvVulkan,
        &default_caps_for(Backend::SpirvVulkan),
@@ -2260,8 +1754,7 @@ fn e4m3fn_empty_output_broadcast_is_rejected_by_name() {
     let graph = builder.finish(output);
     let eqn = &graph.eqns[0];
     let refusal = refusal_of(
-        plan_eqn_analyzed(
-            &ExactI32StorageAnalysis::new(&graph),
+        plan_eqn(
             &graph,
             eqn,
             Backend::SpirvVulkan,
@@ -2298,8 +1791,7 @@ fn e4m3fn_cast_and_reshape_plan_only_for_spirv_wgpu_value_executor() {
     for graph in [&decode, &encode, &repack] {
         let eqn = &graph.eqns[0];
         let shape = graph.aval(eqn.out).shape.clone();
-        let planned_plan = plan_eqn_analyzed(
-            &ExactI32StorageAnalysis::new(graph),
+        let planned_plan = plan_eqn(
             graph,
             eqn,
             Backend::SpirvVulkan,
@@ -2318,9 +1810,7 @@ fn e4m3fn_cast_and_reshape_plan_only_for_spirv_wgpu_value_executor() {
         }
 
         assert!(matches!(
-            plan_eqn_analyzed(
-                &ExactI32StorageAnalysis::new(graph),
-                graph,
+            plan_eqn(graph,
                 eqn,
                 Backend::Nvptx,
                 &default_caps_for(Backend::Nvptx),
@@ -2331,8 +1821,7 @@ fn e4m3fn_cast_and_reshape_plan_only_for_spirv_wgpu_value_executor() {
         ));
         let backend = Backend::AmdGcn(AmdArch::gfx1151());
         let refusal = refusal_of(
-            plan_eqn_analyzed(
-                &ExactI32StorageAnalysis::new(graph),
+            plan_eqn(
                 graph,
                 eqn,
                 backend,
@@ -2370,8 +1859,7 @@ fn e4m3fn_materializing_cast_and_reshape_reject_zero_element_outputs() {
     for graph in [&encode, &decode, &repack] {
         let eqn = &graph.eqns[0];
         let refusal = refusal_of(
-            plan_eqn_analyzed(
-                &ExactI32StorageAnalysis::new(graph),
+            plan_eqn(
                 graph,
                 eqn,
                 Backend::SpirvVulkan,
@@ -2404,8 +1892,7 @@ fn e4m3fn_materializing_dispatch_rejects_a_grid_beyond_wgpu_x_limit() {
     for graph in [&encode, &decode] {
         let eqn = &graph.eqns[0];
         let refusal = refusal_of(
-            plan_eqn_analyzed(
-                &ExactI32StorageAnalysis::new(graph),
+            plan_eqn(
                 graph,
                 eqn,
                 Backend::SpirvVulkan,
@@ -2456,8 +1943,7 @@ fn sc003_grid_cap_bump_respects_custom_device_caps_not_hardcoded_65535() {
     let y = bld.binary(GBinOp::Add, a, b);
     let g = bld.finish(y);
     let eqn = &g.eqns[0];
-    let plan = plan_eqn_analyzed(
-        &ExactI32StorageAnalysis::new(&g),
+    let plan = plan_eqn(
         &g,
         eqn,
         Backend::SpirvVulkan,
@@ -2510,8 +1996,7 @@ fn sc003_elementwise_2d_fold_respects_custom_device_caps_not_hardcoded_65535x256
     let y = bld.binary(GBinOp::Add, a, b);
     let g = bld.finish(y);
     let eqn = &g.eqns[0];
-    let plan = plan_eqn_analyzed(
-        &ExactI32StorageAnalysis::new(&g),
+    let plan = plan_eqn(
         &g,
         eqn,
         Backend::SpirvVulkan,
@@ -2557,9 +2042,7 @@ fn e4m3fn_same_dtype_cast_is_an_alias_only_on_spirv_wgpu_value_path() {
     let eqn = &graph.eqns[0];
 
     assert!(matches!(
-           plan_eqn_analyzed(
-       &ExactI32StorageAnalysis::new(&graph),
-       &graph,
+           plan_eqn(&graph,
        eqn,
        Backend::SpirvVulkan,
        &default_caps_for(Backend::SpirvVulkan),
@@ -2567,9 +2050,7 @@ fn e4m3fn_same_dtype_cast_is_an_alias_only_on_spirv_wgpu_value_path() {
            Plan::Alias(id) if id == x.id()
        ));
     assert!(matches!(
-           plan_eqn_analyzed(
-       &ExactI32StorageAnalysis::new(&graph),
-       &graph,
+           plan_eqn(&graph,
        eqn,
        Backend::Nvptx,
        &default_caps_for(Backend::Nvptx),
@@ -2578,8 +2059,7 @@ fn e4m3fn_same_dtype_cast_is_an_alias_only_on_spirv_wgpu_value_path() {
        ));
     let backend = Backend::AmdGcn(AmdArch::gfx1151());
     let refusal = refusal_of(
-        plan_eqn_analyzed(
-            &ExactI32StorageAnalysis::new(&graph),
+        plan_eqn(
             &graph,
             eqn,
             backend,
@@ -2599,8 +2079,7 @@ fn e4m3fn_transpose_materializes_nonidentity_and_aliases_only_identity_on_wgpu()
     let transposed = builder.transpose(x, vec![1, 0]);
     let graph = builder.finish(transposed);
     let eqn = &graph.eqns[0];
-    let planned_plan = plan_eqn_analyzed(
-        &ExactI32StorageAnalysis::new(&graph),
+    let planned_plan = plan_eqn(
         &graph,
         eqn,
         Backend::SpirvVulkan,
@@ -2614,8 +2093,7 @@ fn e4m3fn_transpose_materializes_nonidentity_and_aliases_only_identity_on_wgpu()
     } = into_plain(planned_plan);
     assert_eq!(grid, [5, 1, 1]);
     assert!(is_plain(
-        &plan_eqn_analyzed(
-            &ExactI32StorageAnalysis::new(&graph),
+        &plan_eqn(
             &graph,
             eqn,
             Backend::Nvptx,
@@ -2626,8 +2104,7 @@ fn e4m3fn_transpose_materializes_nonidentity_and_aliases_only_identity_on_wgpu()
     ));
     let backend = Backend::AmdGcn(AmdArch::gfx1151());
     let refusal = refusal_of(
-        plan_eqn_analyzed(
-            &ExactI32StorageAnalysis::new(&graph),
+        plan_eqn(
             &graph,
             eqn,
             backend,
@@ -2646,9 +2123,7 @@ fn e4m3fn_transpose_materializes_nonidentity_and_aliases_only_identity_on_wgpu()
     let graph = builder.finish(identity);
     let eqn = &graph.eqns[0];
     assert!(matches!(
-           plan_eqn_analyzed(
-       &ExactI32StorageAnalysis::new(&graph),
-       &graph,
+           plan_eqn(&graph,
        eqn,
        Backend::SpirvVulkan,
        &default_caps_for(Backend::SpirvVulkan),
@@ -2662,8 +2137,7 @@ fn e4m3fn_transpose_materializes_nonidentity_and_aliases_only_identity_on_wgpu()
     let graph = builder.finish(moved_unit_axis);
     let eqn = &graph.eqns[0];
     assert!(is_plain(
-        &plan_eqn_analyzed(
-            &ExactI32StorageAnalysis::new(&graph),
+        &plan_eqn(
             &graph,
             eqn,
             Backend::SpirvVulkan,
@@ -2683,8 +2157,7 @@ fn e4m3fn_zero_element_transpose_is_rejected_by_name() {
         let graph = builder.finish(transposed);
         let eqn = &graph.eqns[0];
         let refusal = refusal_of(
-            plan_eqn_analyzed(
-                &ExactI32StorageAnalysis::new(&graph),
+            plan_eqn(
                 &graph,
                 eqn,
                 Backend::SpirvVulkan,
@@ -2706,8 +2179,7 @@ fn e4m3fn_slice_materializes_proper_ranges_and_aliases_only_full_range_on_wgpu()
     let graph = builder.finish(sliced);
     let eqn = &graph.eqns[0];
     let shape = graph.aval(eqn.out).shape.clone();
-    let planned_plan = plan_eqn_analyzed(
-        &ExactI32StorageAnalysis::new(&graph),
+    let planned_plan = plan_eqn(
         &graph,
         eqn,
         Backend::SpirvVulkan,
@@ -2722,8 +2194,7 @@ fn e4m3fn_slice_materializes_proper_ranges_and_aliases_only_full_range_on_wgpu()
     assert_eq!(shape, [2, 3]);
     assert_eq!(grid, [2, 1, 1]);
     assert!(is_plain(
-        &plan_eqn_analyzed(
-            &ExactI32StorageAnalysis::new(&graph),
+        &plan_eqn(
             &graph,
             eqn,
             Backend::Nvptx,
@@ -2734,8 +2205,7 @@ fn e4m3fn_slice_materializes_proper_ranges_and_aliases_only_full_range_on_wgpu()
     ));
     let backend = Backend::AmdGcn(AmdArch::gfx1151());
     let refusal = refusal_of(
-        plan_eqn_analyzed(
-            &ExactI32StorageAnalysis::new(&graph),
+        plan_eqn(
             &graph,
             eqn,
             backend,
@@ -2754,9 +2224,7 @@ fn e4m3fn_slice_materializes_proper_ranges_and_aliases_only_full_range_on_wgpu()
     let graph = builder.finish(identity);
     let eqn = &graph.eqns[0];
     assert!(matches!(
-           plan_eqn_analyzed(
-       &ExactI32StorageAnalysis::new(&graph),
-       &graph,
+           plan_eqn(&graph,
        eqn,
        Backend::SpirvVulkan,
        &default_caps_for(Backend::SpirvVulkan),
@@ -2769,8 +2237,7 @@ fn e4m3fn_slice_materializes_proper_ranges_and_aliases_only_full_range_on_wgpu()
     let contiguous_rows = builder.slice(x, 0, 1, 3);
     let graph = builder.finish(contiguous_rows);
     let eqn = &graph.eqns[0];
-    let planned_plan = plan_eqn_analyzed(
-        &ExactI32StorageAnalysis::new(&graph),
+    let planned_plan = plan_eqn(
         &graph,
         eqn,
         Backend::SpirvVulkan,
@@ -2793,8 +2260,7 @@ fn e4m3fn_empty_output_slice_is_rejected_by_name() {
     let graph = builder.finish(empty);
     let eqn = &graph.eqns[0];
     let refusal = refusal_of(
-        plan_eqn_analyzed(
-            &ExactI32StorageAnalysis::new(&graph),
+        plan_eqn(
             &graph,
             eqn,
             Backend::SpirvVulkan,
@@ -2816,14 +2282,13 @@ fn e4m3fn_gather_always_materializes_exact_packed_output_on_wgpu() {
     ] {
         let builder = Builder::new();
         let data = builder.constant("raw", TensorType::new(data_shape, GDt::E4M3FN));
-        let index = builder.constant("index", TensorType::f32(index_shape));
+        let index = builder.constant("index", TensorType::new(index_shape, GDt::I32));
         let gathered = builder.gather(data, axis, index);
         let graph = builder.finish(gathered);
         let eqn = &graph.eqns[0];
         let shape = graph.aval(eqn.out).shape.clone();
         assert_eq!(shape, expected_shape);
-        let planned_plan = plan_eqn_analyzed(
-            &ExactI32StorageAnalysis::new(&graph),
+        let planned_plan = plan_eqn(
             &graph,
             eqn,
             Backend::SpirvVulkan,
@@ -2840,13 +2305,12 @@ fn e4m3fn_gather_always_materializes_exact_packed_output_on_wgpu() {
 
     let builder = Builder::new();
     let data = builder.constant("raw", TensorType::new(vec![4, 5], GDt::E4M3FN));
-    let index = builder.constant("index", TensorType::f32(vec![4]));
+    let index = builder.constant("index", TensorType::new(vec![4], GDt::I32));
     let gathered = builder.gather(data, 0, index);
     let graph = builder.finish(gathered);
     let eqn = &graph.eqns[0];
     assert!(is_plain(
-        &plan_eqn_analyzed(
-            &ExactI32StorageAnalysis::new(&graph),
+        &plan_eqn(
             &graph,
             eqn,
             Backend::Nvptx,
@@ -2857,8 +2321,7 @@ fn e4m3fn_gather_always_materializes_exact_packed_output_on_wgpu() {
     ));
     let backend = Backend::AmdGcn(AmdArch::gfx1151());
     let refusal = refusal_of(
-        plan_eqn_analyzed(
-            &ExactI32StorageAnalysis::new(&graph),
+        plan_eqn(
             &graph,
             eqn,
             backend,
@@ -2873,16 +2336,15 @@ fn e4m3fn_gather_always_materializes_exact_packed_output_on_wgpu() {
 }
 
 #[test]
-fn e4m3fn_gather_rejects_empty_output_and_non_f32_indices_by_name() {
+fn e4m3fn_gather_rejects_empty_output_and_non_i32_indices_by_name() {
     let builder = Builder::new();
     let data = builder.constant("raw", TensorType::new(vec![4, 5], GDt::E4M3FN));
-    let index = builder.constant("index", TensorType::f32(vec![0]));
+    let index = builder.constant("index", TensorType::new(vec![0], GDt::I32));
     let gathered = builder.gather(data, 0, index);
     let graph = builder.finish(gathered);
     let eqn = &graph.eqns[0];
     let refusal = refusal_of(
-        plan_eqn_analyzed(
-            &ExactI32StorageAnalysis::new(&graph),
+        plan_eqn(
             &graph,
             eqn,
             Backend::SpirvVulkan,
@@ -3296,7 +2758,9 @@ fn mixed_bf16_tc_key_encodes_operand_dtype_not_just_output() {
             .iter()
             .find(|e| matches!(e.op, OpKind::MatMul))
             .unwrap();
-        into_plain(planned_with_choice(g, eqn, gfx1151).unwrap().0).key
+        into_plain(planned_with_choice(g, eqn, gfx1151).unwrap().0)
+            .key()
+            .to_string()
     };
     assert_ne!(
         plan_key(&gm),
@@ -3678,8 +3142,7 @@ fn a_refusal_names_the_equation_op_dtypes_target_and_missing_capability_on_every
         let g = bld.finish(c);
         let eqn = &g.eqns[0];
         let refusal = refusal_of(
-            plan_eqn_analyzed(
-                &ExactI32StorageAnalysis::new(&g),
+            plan_eqn(
                 &g,
                 eqn,
                 backend,
@@ -3747,7 +3210,7 @@ fn cast_i32_to_f32_plans_an_i32_in_f32_out_kernel() {
         },
         "the source operand must be an i32 slice, not bf16 or f32 bytes"
     );
-    let body = &plan.single().expect("one dispatch").body;
+    let body = &plan.single().expect("one dispatch").body();
     assert_eq!(
         body.locals[2].ty,
         Ty::Ref {
@@ -3756,24 +3219,6 @@ fn cast_i32_to_f32_plans_an_i32_in_f32_out_kernel() {
         },
         "the destination must be a mutable f32 slice"
     );
-}
-
-/// Spike 562 F-9: the source of an I32->F32 cast outside an exact-I32 component lives on the f32-mirror
-/// lane, whose bytes already are the F32 result, so the cast aliases it (like every other reader of that
-/// component, it reads the representation `ExactI32StorageAnalysis` chose).
-#[test]
-fn cast_i32_to_f32_of_a_mirror_source_aliases_it() {
-    for backend in [
-        Backend::SpirvVulkan,
-        Backend::Nvptx,
-        Backend::AmdGcn(poot_target::AmdArch::gfx1151()),
-    ] {
-        let plan = cast_plan(GDt::I32, GDt::F32, backend);
-        assert!(
-            matches!(plan, Ok(Plan::Alias(_))),
-            "{backend:?}: a mirror-lane i32->f32 cast must alias, got {plan:?}"
-        );
-    }
 }
 
 #[test]
@@ -3794,8 +3239,7 @@ fn matmul_plan(g: &Graph, backend: Backend) -> Plan {
         .iter()
         .find(|e| matches!(e.op, OpKind::MatMul))
         .expect("a matmul eqn");
-    plan_eqn_analyzed(
-        &ExactI32StorageAnalysis::new(g),
+    plan_eqn(
         g,
         eqn,
         backend,
@@ -3812,7 +3256,7 @@ fn body_param1_ty(plan: &Plan) -> Ty {
     let body = &plan
         .single()
         .unwrap_or_else(|| panic!("expected a single-dispatch plan, got {plan:?}"))
-        .body;
+        .body();
     body.locals[1].ty.clone()
 }
 
@@ -3870,7 +3314,7 @@ fn f16_non_wired_op_rejected_with_diagnostic() {
     let b = Builder::new();
     let x = b.constant("x", TensorType::new(vec![4, 8], GDt::F16));
     let w = b.constant("w", TensorType::new(vec![2, 8, 16], GDt::F16));
-    let idx = b.constant("idx", TensorType::new(vec![4], GDt::F32));
+    let idx = b.constant("idx", TensorType::new(vec![4], GDt::I32));
     let out = b.indexed_matmul(x, w, idx);
     let g = b.finish(out);
     let eqn = g
@@ -3883,8 +3327,7 @@ fn f16_non_wired_op_rejected_with_diagnostic() {
         GDt::F16,
         "sanity: output follows x's F16 dtype"
     );
-    let res = plan_eqn_analyzed(
-        &ExactI32StorageAnalysis::new(&g),
+    let res = plan_eqn(
         &g,
         eqn,
         Backend::SpirvVulkan,
@@ -3920,8 +3363,7 @@ fn only_an_f32_m_gt_1_matmul_takes_the_tiled_gemm() {
             .iter()
             .find(|e| matches!(e.op, OpKind::MatMul))
             .expect("a matmul eqn");
-        let planned = plan_eqn_choice_analyzed(
-            &ExactI32StorageAnalysis::new(&g),
+        let planned = plan_eqn_choice(
             &g,
             eqn,
             backend,
@@ -3951,8 +3393,7 @@ fn f16_matmul_never_reaches_tiled_region() {
         .iter()
         .find(|e| matches!(e.op, OpKind::MatMul))
         .expect("a matmul eqn");
-    let planned = plan_eqn_choice_analyzed(
-        &ExactI32StorageAnalysis::new(&g),
+    let planned = plan_eqn_choice(
         &g,
         eqn,
         Backend::SpirvVulkan,
@@ -4083,7 +3524,7 @@ fn nvptx_tc_batched_bf16_matmul_grid_includes_batch_factor() {
         .expect("a matmul eqn");
     let (plan, choice) = planned_with_choice(&g, eqn, Backend::Nvptx)
         .expect("a batched 16x16x16 bf16 matmul must plan on Nvptx");
-    let grid = into_plain(plan).launch.grid;
+    let grid = into_plain(plan).launch().grid;
     assert!(
         is_tensor_core(&choice),
         "expected the NVPTX tc arm to fire: got {choice:?}"
@@ -4130,7 +3571,7 @@ fn coopmat_arm_admits_multi_block_batched_shapes_and_refuses_a_ragged_k() {
         "expected the coopmat arm for K = 48: got {choice:?}"
     );
     assert_eq!(
-        into_plain(plan).launch.grid,
+        into_plain(plan).launch().grid,
         [8 * 32, 1, 1],
         "one 32-lane subgroup per output tile of every batch element"
     );
@@ -4160,7 +3601,7 @@ fn amd_tensor_core_arm_admits_multi_block_batched_shapes() {
         is_tensor_core(&choice),
         "expected the WMMA tensor-core arm for a batched K = 48: got {choice:?}"
     );
-    assert_eq!(into_plain(plan).launch.grid, [8 * 256, 1, 1]);
+    assert_eq!(into_plain(plan).launch().grid, [8 * 256, 1, 1]);
 }
 
 #[test]
@@ -4217,7 +3658,7 @@ fn tiled_matmul_gets_the_tiled_grid_not_the_naive_fallthrough() {
         is_tiled_region(choice),
         "the compile chooses the tiled GEMM: {choice:?}"
     );
-    let tiled = plain(plan).launch.grid;
+    let tiled = plain(plan).launch().grid;
 
     let groups = m.div_ceil(2 * GEMM_TILE) * n.div_ceil(GEMM_TILE);
     assert_eq!(
@@ -4256,7 +3697,7 @@ fn a_tiled_gemm_over_the_tile_ceiling_splits_into_disjoint_launches() {
     let lanes = GEMM_TILE * GEMM_TILE;
     let mut covered = 0usize;
     for dispatch in dispatches {
-        let launch = &dispatch.launch;
+        let launch = dispatch.launch();
         let chunk_groups = launch.grid[0] as usize / lanes;
         assert_eq!(
             launch.grid,
@@ -4289,7 +3730,7 @@ fn a_large_tiled_matmul_keeps_its_tile_workgroup_on_amdgcn() {
     let bodies: Vec<&Body> = plan
         .dispatches()
         .iter()
-        .map(|dispatch| &dispatch.body)
+        .map(|dispatch| dispatch.body())
         .collect();
     assert!(
         !bodies.is_empty(),
@@ -4409,8 +3850,7 @@ fn transpose_into_binary_add_lowers_to_view_zero_dispatch() {
         "a Transpose feeding only a Binary(Add) must be promoted to a view"
     );
     let eqn = &g.eqns[move_eqn];
-    match plan_eqn_views_analyzed(
-        &ExactI32StorageAnalysis::new(&g),
+    match plan_eqn_views(
         &g,
         eqn,
         Backend::SpirvVulkan,
@@ -4425,8 +3865,7 @@ fn transpose_into_binary_add_lowers_to_view_zero_dispatch() {
     }
     // AS-003: with an empty views map (every other backend) the same eqn still takes the materialize
     // copy, so views change nothing for a caller that does not opt in.
-    match plan_eqn_analyzed(
-        &ExactI32StorageAnalysis::new(&g),
+    match plan_eqn(
         &g,
         eqn,
         Backend::SpirvVulkan,
@@ -4458,8 +3897,7 @@ fn transpose_into_matmul_keeps_the_materialize_copy() {
         "a Transpose feeding a MatMul must NOT be promoted to a view (FR-004)"
     );
     let move_eqn = g.eqns.iter().find(|e| e.out == t_id).unwrap();
-    match plan_eqn_views_analyzed(
-        &ExactI32StorageAnalysis::new(&g),
+    match plan_eqn_views(
         &g,
         move_eqn,
         Backend::SpirvVulkan,
@@ -4504,8 +3942,7 @@ fn view_cache_key_never_collides_with_a_plain_buffer_of_the_same_shape() {
         body: body_view,
         ..
     } = into_plain(
-        plan_eqn_views_analyzed(
-            &ExactI32StorageAnalysis::new(&g),
+        plan_eqn_views(
             &g,
             eqn_view,
             Backend::SpirvVulkan,
@@ -4520,8 +3957,7 @@ fn view_cache_key_never_collides_with_a_plain_buffer_of_the_same_shape() {
         body: body_plain,
         ..
     } = into_plain(
-        plan_eqn_views_analyzed(
-            &ExactI32StorageAnalysis::new(&g),
+        plan_eqn_views(
             &g,
             eqn_plain,
             Backend::SpirvVulkan,
@@ -4722,9 +4158,12 @@ fn view_broadcast_matches_oracle_fuzz() {
 }
 
 /// Dispatches per token of the 24-layer Qwen2.5-0.5B real-config decode graph (the legacy tracer planned 415).
+/// POOT-725 made the `Cast(Slot::Pos -> F32)` of the position a kernel (368); POOT-1108 folds it into the
+/// mask region that reads it, so the launch is gone again.
 const QWEN2_0_5B_DISPATCHES: usize = 367;
 
 /// Dispatches per token of the 28-layer Qwen3-0.6B real-config decode graph (the legacy tracer planned 539).
+/// POOT-725: 484; POOT-1108: 483, the position cast folded as for Qwen2.5 above.
 const QWEN3_0_6B_DISPATCHES: usize = 483;
 
 /// Dispatches `program` runs per step: every planned equation but the free ones (an alias or a strided view).
@@ -4800,8 +4239,7 @@ fn planned_graph_summary(g: &Graph, backend: Backend) -> Vec<String> {
         .map(|id| format!("view {id}: {:?}", views[&id]))
         .collect();
     for eqn in &g.eqns {
-        let plan = plan_eqn_views_analyzed(
-            &ExactI32StorageAnalysis::new(g),
+        let plan = plan_eqn_views(
             g,
             eqn,
             backend,
@@ -5244,7 +4682,7 @@ fn scatter_update_chunks_on_wgpu_at_gemma4_local_layer_pool_shape() {
     let b = Builder::new();
     let base = b.constant("base", TensorType::f32(vec![pool_slots, hkv, d]));
     let src = b.constant("src", TensorType::f32(vec![l, hkv, d]));
-    let inv = b.constant("inv", TensorType::f32(vec![pool_slots]));
+    let inv = b.constant("inv", TensorType::new(vec![pool_slots], GDt::I32));
     let out = b.scatter_update(base, src, inv);
     let g = b.finish(out);
     let eqn = g
@@ -5255,8 +4693,7 @@ fn scatter_update_chunks_on_wgpu_at_gemma4_local_layer_pool_shape() {
     let out_shape = g.aval(eqn.out).shape.clone();
     assert_eq!(numel(&out_shape), out_numel);
 
-    let plan = plan_eqn_analyzed(
-        &ExactI32StorageAnalysis::new(&g),
+    let plan = plan_eqn(
         &g,
         eqn,
         Backend::SpirvVulkan,
@@ -5272,7 +4709,9 @@ fn scatter_update_chunks_on_wgpu_at_gemma4_local_layer_pool_shape() {
     // dispatches must be disjoint and fully cover out_numel (the split-plan contract).
     let covered: usize = chunks
         .iter()
-        .map(|c| c.launch.grid[0] as usize / c.body.workgroup_size[0] as usize * SCATTER_UPDATE_WG)
+        .map(|c| {
+            c.launch().grid[0] as usize / c.body().workgroup_size[0] as usize * SCATTER_UPDATE_WG
+        })
         .sum::<usize>()
         .min(out_numel + (chunks.len() - 1) * SCATTER_UPDATE_WG); // last chunk may over-launch to a wg boundary
     assert!(covered >= out_numel, "chunks must cover the full output");
@@ -5282,7 +4721,7 @@ fn scatter_update_chunks_on_wgpu_at_gemma4_local_layer_pool_shape() {
     let small_b = Builder::new();
     let small_base = small_b.constant("base", TensorType::f32(vec![4, 3]));
     let small_src = small_b.constant("src", TensorType::f32(vec![2, 3]));
-    let small_inv = small_b.constant("inv", TensorType::f32(vec![4]));
+    let small_inv = small_b.constant("inv", TensorType::new(vec![4], GDt::I32));
     let small_out = small_b.scatter_update(small_base, small_src, small_inv);
     let small_g = small_b.finish(small_out);
     let small_eqn = small_g
@@ -5341,8 +4780,7 @@ fn decode_gemv_chunks_on_wgpu_at_bloom_lm_head_shape() {
         "test fixture must exceed the chunk trigger"
     );
 
-    let plan = plan_eqn_analyzed(
-        &ExactI32StorageAnalysis::new(&g),
+    let plan = plan_eqn(
         &g,
         eqn,
         Backend::SpirvVulkan,
@@ -5358,11 +4796,11 @@ fn decode_gemv_chunks_on_wgpu_at_bloom_lm_head_shape() {
     // every chunk's workgroup count must clear the wgpu per-dim grid cap (chunk size is capped at
     // caps.max_grid[0]; each chunk is a plain 1-D grid).
     let grid_cap = default_caps_for(Backend::SpirvVulkan).max_grid[0] as usize;
-    let groups = |c: &Dispatch| c.launch.grid[0] as usize / c.body.workgroup_size[0] as usize;
+    let groups = |c: &Dispatch| c.launch().grid[0] as usize / c.body().workgroup_size[0] as usize;
     for c in chunks {
         assert!(groups(c) <= grid_cap, "chunk grid must clear the grid cap");
         assert!(
-            c.launch.meta.is_empty(),
+            c.launch().meta.is_empty(),
             "a kernelgen chunk bakes its offset as a const, no meta buffer"
         );
     }
@@ -5456,8 +4894,7 @@ fn decode_gemv_chunking_follows_the_caps_watchdog_trigger_not_a_fixed_constant()
 
     // Low trigger (under this shape's 230_000 elements): chunks, like the BLOOM-scale case above.
     let low = caps_for(100_000);
-    let chunked = plan_eqn_analyzed(
-        &ExactI32StorageAnalysis::new(&g),
+    let chunked = plan_eqn(
         &g,
         eqn,
         Backend::SpirvVulkan,
@@ -5797,7 +5234,7 @@ fn the_streaming_schedule_records_its_exact_resources_and_finalization_enforces_
             fixture.name
         );
         let dispatch = plan.single().expect("one dispatch");
-        let used = kg::BodyUse::measure(&dispatch.body).expect("measurable workgroup memory");
+        let used = kg::BodyUse::measure(dispatch.body()).expect("measurable workgroup memory");
         assert_eq!(used.lds_bytes, lds_bytes as u64, "{}: LDS", fixture.name);
         assert_eq!(
             used.workgroup,
@@ -5859,8 +5296,7 @@ fn arg_top_k_plan_rejects_0d_rank_operand_as_typed_error_not_panic() {
         .iter()
         .find(|e| matches!(e.op, OpKind::ArgTopK { .. }))
         .expect("an ArgTopK eqn");
-    match plan_eqn_analyzed(
-        &ExactI32StorageAnalysis::new(&g),
+    match plan_eqn(
         &g,
         eqn,
         Backend::SpirvVulkan,
@@ -5885,8 +5321,7 @@ fn pack_i8_plan_rejects_0d_input_as_typed_error_not_panic() {
         .iter()
         .find(|e| matches!(e.op, OpKind::PackI8))
         .expect("a PackI8 eqn");
-    match plan_eqn_analyzed(
-        &ExactI32StorageAnalysis::new(&g),
+    match plan_eqn(
         &g,
         eqn,
         Backend::SpirvVulkan,
@@ -6531,7 +5966,7 @@ fn card381_row_gather_plan_key_names_the_source_dtype() {
     let Ok(e4m3_plan) = try_dense_row_gather_plan(&e4m3_folded, Backend::SpirvVulkan) else {
         panic!("the E4M3FN row gather must plan on SpirvVulkan, with no metadata buffer");
     };
-    let e4m3_key = into_plain(e4m3_plan).key;
+    let e4m3_key = into_plain(e4m3_plan).key().to_string();
     assert_ne!(
         key, e4m3_key,
         "the BF16 and E4M3FN row gathers of the same shapes must not share a cache entry"
@@ -6541,7 +5976,10 @@ fn card381_row_gather_plan_key_names_the_source_dtype() {
     let f32_gather = {
         let bld = Builder::new();
         let table = bld.constant("embed", TensorType::f32(vec![8, 4]));
-        let token = bld.slot(poot_graph_ir::Slot::Token, TensorType::f32(vec![3]));
+        let token = bld.slot(
+            poot_graph_ir::Slot::Token,
+            TensorType::new(vec![3], GDt::I32),
+        );
         let gathered = bld.gather(table, 0, token);
         bld.finish(gathered)
     };
@@ -6562,7 +6000,7 @@ fn card381_row_gather_plan_key_names_the_source_dtype() {
         ),
         "{choice:?}"
     );
-    let f32_key = one_dispatch(f32_plan).key;
+    let f32_key = one_dispatch(f32_plan).key().to_string();
     assert_ne!(key, f32_key);
 }
 
@@ -6603,7 +6041,9 @@ fn card380_dense_contraction_plan_key_names_the_operand_dtype() {
         let mm = bld.matmul(a, w);
         bld.finish(mm)
     };
-    let f32_key = one_dispatch(try_matmul_plan(&f32_matmul, Backend::SpirvVulkan).unwrap()).key;
+    let f32_key = one_dispatch(try_matmul_plan(&f32_matmul, Backend::SpirvVulkan).unwrap())
+        .key()
+        .to_string();
     assert_ne!(key, f32_key);
 }
 
@@ -6946,5 +6386,215 @@ fn a_k_by_n_bf16_decode_projection_is_refused_on_the_packed_lane_backends() {
                 "{backend:?} [K, N]: expected a DtypeLowering refusal, got {kn:?}"
             );
         }
+    }
+}
+
+/// POOT-1108 on the production path: an exact-I32 chain, its cast and the float arithmetic after it plan as ONE
+/// launch on every planned backend, and the launch is the pointwise generator's (no `I32ToF32` kernel).
+/// Mutation: remove `fuse_index_casts` from `compile`; the cast launches on its own and the count is 2 (the
+/// region and the cast), or 3 where the chain does not fuse.
+#[test]
+fn an_i32_chain_cast_and_float_scale_compile_to_one_launch_on_every_backend() {
+    let b = Builder::new();
+    let a = b.slot_named(
+        poot_graph_ir::Slot::Token,
+        "a",
+        TensorType::new(vec![2, 4], GDt::I32),
+    );
+    let c = b.slot_named(
+        poot_graph_ir::Slot::Token,
+        "c",
+        TensorType::new(vec![2, 4], GDt::I32),
+    );
+    let w = b.constant("w", TensorType::f32(vec![2, 4]));
+    let hit = b.binary(GBinOp::Ge, a, c);
+    let out = b.binary(GBinOp::Mul, b.cast(hit, GDt::F32), w);
+    let g = b.finish(out);
+    for backend in [
+        Backend::SpirvVulkan,
+        Backend::Nvptx,
+        Backend::AmdGcn(AmdArch::gfx1151()),
+    ] {
+        let program = compiled(&g, backend);
+        assert_eq!(
+            dispatches(&program),
+            1,
+            "{backend:?}: the chain, its cast and the scale are one launch"
+        );
+        let (eqn, plan) = program
+            .planned()
+            .find(|(_, plan)| !matches!(plan, Plan::Alias(_) | Plan::View { .. }))
+            .expect("one launching equation");
+        assert!(
+            matches!(eqn.op, OpKind::Fused(_)),
+            "{backend:?}: planned as a fused region, got {}",
+            eqn.op.name()
+        );
+        assert!(
+            matches!(
+                program.kernel_choice(eqn),
+                KernelChoice::Generated(KernelRequest::Pointwise(_))
+            ),
+            "{backend:?}: the pointwise generator writes it"
+        );
+        assert!(matches!(plan, Plan::Dispatches(d) if d.len() == 1));
+    }
+}
+
+/// Rebuild `plan`'s dispatches with `rebind` applied to every binding, through the production
+/// `DispatchPlan::new`.
+fn rebound(plan: Plan, rebind: impl Fn(&Binding) -> Binding) -> Plan {
+    let Plan::Dispatches(dispatches) = plan else {
+        panic!("expected a dispatching plan");
+    };
+    let rebuilt = dispatches
+        .into_dispatches()
+        .into_iter()
+        .map(|dispatch| {
+            let binding = rebind(dispatch.binding());
+            dispatch.with_binding(binding)
+        })
+        .collect();
+    Plan::Dispatches(DispatchPlan::new(rebuilt, 0).expect("the rebound plan validates"))
+}
+
+/// POOT-1115: a dispatch binding an operand the equation lacks is refused by `finalize`, the one place the
+/// bindings and the equation are in hand together. [`DispatchPlan::new`] cannot catch it: it knows kernel
+/// params, not equations.
+///
+/// Mutation: delete the `check_operand_bindings` call in `finalize`; the rebound plan is accepted and this
+/// row goes red.
+#[test]
+fn a_binding_naming_an_operand_the_equation_lacks_is_refused_by_finalize() {
+    use crate::kernel_mapping::finalize;
+
+    let b = Builder::new();
+    let table = b.constant("table", TensorType::new(vec![8, 3], GDt::F32));
+    let index = b.constant("index", TensorType::new(vec![2], GDt::I32));
+    let gathered = b.gather(table, 0, index);
+    let g = b.finish(gathered);
+    let backend = Backend::SpirvVulkan;
+    let caps = default_caps_for(backend);
+    let eqn = g
+        .eqns
+        .iter()
+        .find(|eqn| matches!(eqn.op, OpKind::Gather { .. }))
+        .expect("the gather");
+    let (plan, choice) = planned_with_choice(&g, eqn, backend).expect("the gather plans");
+    let operands = value_ids(eqn).len();
+    let plan = rebound(plan, |binding| {
+        let mut reads = binding.reads().to_vec();
+        reads[0] = Source::Operand(operands);
+        Binding::new(reads, binding.write())
+    });
+    let mut planned = Planned { plan, choice };
+    let shape = g.aval(eqn.out).shape.clone();
+    let error = finalize(
+        &mut planned,
+        GraphTables::from(&g),
+        eqn,
+        &shape,
+        numel(&shape),
+        backend,
+        g.aval(eqn.out).dtype,
+        &caps,
+    )
+    .expect_err("an operand the equation lacks");
+    assert!(
+        matches!(
+            error,
+            PlanError::InvalidDispatchPlan(DispatchPlanError::OperandOutOfRange {
+                dispatch: 0,
+                operand,
+                operands: have,
+            }) if operand == operands && have == operands
+        ),
+        "got {error:?}"
+    );
+}
+
+/// POOT-1115 decision 3, a deliberate tightening: an imported kernel's serial work is apportioned over
+/// the dispatches of an unequal split by each launch's share of the plan, not divided evenly by the
+/// dispatch count. A 4096 x 4096 F32 imported tiled GEMM on RADV splits its tile groups at the device's
+/// tile ceiling into full dispatches and a one-group remainder; a full dispatch carries more than an even
+/// share of the output, so its serial work is the bound.
+///
+/// The plan is `tiled_gemm_plan`'s (the matmul route's own constructor) through `finalize`: the compile
+/// pipeline prefers the generated tiled region for this shape, so the imported route is not reached by
+/// `compile` today.
+///
+/// Mutation: apportion by `(1, dispatches.len())` in `validate_planned_resources` (the old even split);
+/// one step short of the largest dispatch's work is then admitted and the refusal below goes red.
+#[test]
+fn an_unequal_tile_split_apportions_serial_work_by_launch_share() {
+    use crate::device_validation::ResourceRefusal;
+    use crate::kernel_mapping::finalize;
+
+    let (m, k, n) = (4096usize, 8usize, 4096usize);
+    let g = matmul_graph(m, k, n, GDt::F32);
+    let backend = Backend::SpirvVulkan;
+    let caps = default_caps_for(backend);
+    let eqn = g
+        .eqns
+        .iter()
+        .find(|eqn| matches!(eqn.op, OpKind::MatMul))
+        .expect("a matmul eqn");
+    let shape = g.aval(eqn.out).shape.clone();
+    let out_numel = numel(&shape);
+    let split = |caps: &DeviceCaps| {
+        let mut planned = crate::predicates::tiled_gemm_plan(backend, m, k, n, caps)?;
+        finalize(
+            &mut planned,
+            GraphTables::from(&g),
+            eqn,
+            &shape,
+            out_numel,
+            backend,
+            GDt::F32,
+            caps,
+        )
+        .map(|()| planned)
+    };
+    let planned = split(&caps).expect("an unbudgeted device admits the split");
+    let launches: Vec<u128> = planned
+        .plan
+        .dispatches()
+        .iter()
+        .map(|d| d.launch().grid.iter().map(|&e| u128::from(e)).product())
+        .collect();
+    let last = launches.len() - 1;
+    assert!(launches.len() > 1, "the GEMM splits: {launches:?}");
+    assert!(
+        launches[0] > launches[last],
+        "the split is unequal: {launches:?}"
+    );
+    let total: u128 = launches.iter().sum();
+    let (out, steps) = (out_numel as u128, k as u128);
+    let first_work = (out * launches[0]).div_ceil(total) * steps;
+    let even_work = out.div_ceil(launches.len() as u128) * steps;
+    assert!(
+        first_work > even_work,
+        "the tightening: {first_work} vs {even_work}"
+    );
+
+    let budgeted = |budget: u128| DeviceCaps {
+        max_dispatch_work: Queried::Known(budget as u64),
+        ..caps
+    };
+    split(&budgeted(first_work)).expect("the exact budget admits the largest dispatch");
+    match split(&budgeted(first_work - 1)) {
+        Err(PlanError::Refused(refusal)) => assert!(
+            matches!(
+                refusal.missing,
+                Capability::KernelResources(ResourceRefusal::DispatchWork { work, .. })
+                    if u128::from(work) == first_work
+            ),
+            "got {:?}",
+            refusal.missing
+        ),
+        other => panic!(
+            "one step short must refuse, got {:?}",
+            other.map(|p| p.plan)
+        ),
     }
 }

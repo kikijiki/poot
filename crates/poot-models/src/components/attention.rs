@@ -833,6 +833,7 @@ mod tests {
                 capacity: NonZeroUsize::new(CAP).unwrap(),
                 kv: KvLayout::Contiguous,
                 logits: LogitRows::All,
+                hidden: None,
             },
         );
         let xs = b.constant("x", TensorType::f32(vec![1, t, WIDTH]));
@@ -1263,6 +1264,7 @@ mod tests {
                     capacity: NonZeroUsize::new(cap).unwrap(),
                     kv: KvLayout::Contiguous,
                     logits: LogitRows::All,
+                    hidden: None,
                 },
             );
             let xs = b.constant("x", TensorType::f32(vec![1, t, WIDTH]));
@@ -1448,6 +1450,7 @@ mod tests {
                 capacity: NonZeroUsize::new(CAP).unwrap(),
                 kv,
                 logits: LogitRows::All,
+                hidden: None,
             },
         );
         let xs = b.constant("x", TensorType::f32(vec![rows, t, WIDTH]));

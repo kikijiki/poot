@@ -52,6 +52,7 @@ fn main() -> anyhow::Result<()> {
         },
         charge: poot_llm::driver::program_retention,
         draft: poot_llm::driver::DraftPolicy::Off,
+        hidden_window: None,
     };
     let mut driver = Driver::new(
         Arc::clone(&handle),

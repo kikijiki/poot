@@ -63,6 +63,7 @@ fn driver_trace() -> Driver {
         capacity: NonZeroUsize::new(CAPACITY).unwrap(),
         kv: KvLayout::Contiguous,
         logits: LogitRows::Last,
+        hidden: None,
     };
     Driver {
         graph: model.trace(Phase::Decode, shape).unwrap(),

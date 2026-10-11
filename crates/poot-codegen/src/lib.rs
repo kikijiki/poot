@@ -3,14 +3,14 @@
 //! HSACO for AMDGPU/ROCm, or an AIE core object for AMD XDNA2. [`Target`] names all four paths; individual
 //! IR operations can have narrower target support.
 //!
-//! # `AieCore` is retained and inactive
+//! # The AIE (XDNA2) path
 //!
-//! Supporting NPUs (Intel, AMD XDNA2) remains a poot objective (POOT-1093); the AIE core emitter, the
-//! `POOT_AIE_LLC` toolchain override and the golden tests are kept on purpose as research for it. Nothing
-//! in the pipeline calls the AIE path: the planner has no AIE target, no executor `Device` implements it,
-//! there are no driver rows or `--backend` for it, and no runtime `CompiledKernel` handle exists for it
-//! (`kernel_handle` refuses it). Reactivating it means adding those pieces on the single
-//! pipeline, not reviving the removed NPU runtime.
+//! Supporting NPUs (Intel, AMD XDNA2) remains a poot objective (POOT-1093). The [`aie`] module is this
+//! crate's half of it (POOT-664): a core object compiled by Peano from a sequential `Body`, a typed
+//! shape/layout [`AieLinkRecipe`], IRON linking to a loadable xclbin/instruction artifact, the
+//! shape-and-toolchain-keyed cache identity, and the ordinary [`kernel_handle`] over the linked artifact.
+//! Device loading and execution are the XDNA runtime's (POOT-641); nothing here runs on hardware, and no
+//! Peano/IRON positive compile is claimed unless a receipt names the toolchain.
 //!
 //! The rustc-bearing MIR import (Stable MIR -> Body) is the separate `pootc` crate; this crate is the
 //! rustc-free emit + llc half, host-testable with hand-built fixtures.
@@ -24,6 +24,7 @@
 //! and its version into the cache key precisely so a toolchain change cannot silently serve a stale
 //! artifact). Kept per the Scope exception for a read that is a toolchain path or a cache kill-switch.
 
+mod aie;
 mod cache;
 mod debranch;
 mod emit;
@@ -34,12 +35,16 @@ mod structurize;
 use std::path::Path;
 use std::process::Command;
 
+pub use aie::{
+    AieAbiMismatch, AieCompileError, AieCompiled, AieFifo, AieIdentity, AieLinkRecipe, AieStage,
+    AieToolIdentity, AieTools, FifoDirection, compile_aie,
+};
 pub use cache::{
     Artifact, ArtifactTooLarge, KernelCache, KernelKey, body_fingerprint,
     epoch as kernel_cache_epoch, kernel_cache_root, kernel_entry_key,
 };
 pub use emit::emit_llvm_ir;
-pub use handle::kernel_handle;
+pub use handle::{GpuTarget, NotAByteTarget, aie_kernel_handle, kernel_handle};
 use poot_target::AmdArch;
 
 /// A codegen backend target.
@@ -52,8 +57,8 @@ pub enum Target {
     /// AIE core machine code for the AMD XDNA2 NPU, via Peano (`llc --march=aie2p`). One AIE core runs a
     /// scalar loop kernel (no SPMD thread-index, no workgroup barrier, no LDS); the IRON harness tiles the
     /// data and does host<->tile movement. The IR is plain scalar LLVM IR with flat `ptr` args (card 089 /
-    /// spec 057). The triple/datalayout come from Peano via `--march`, not the IR text. Retained but inactive
-    /// (POOT-1093): nothing in the pipeline compiles for this target.
+    /// spec 057). The triple/datalayout come from Peano via `--march`, not the IR text. Its identity is
+    /// [`poot_target::AieTargetId::XDNA2`] (`Backend::Aie`); the loadable artifact is built by [`aie`].
     AieCore,
     /// HSACO for an AMD GPU (e.g. the Radeon 8060S, gfx1151) via the ROCm-flavored clang.
     /// `llc -filetype=obj` produces a relocatable without the `PT_AMDGPU_HSA_LOAD_*` program headers the
@@ -194,10 +199,10 @@ pub enum CompileError {
     Io(#[from] std::io::Error),
     /// The toolchain that produces a loadable object for `target` is not configured. AMDGCN needs the AMD clang:
     /// a bare `llc` object has no HSA load headers, so the loader rejects it after `compile` would have reported
-    /// success (R468-019).
+    /// success (R468-019). AIE needs Peano: the system llc has no `aie2p` target.
     #[error(
         "{target:?} codegen needs ${variable} (the AMD-flavored clang; the devshell sets it); a bare llc \
-         object is rejected by the HSA loader"
+         object is rejected by the HSA loader (AIE: Peano, which the system llc cannot stand in for)"
     )]
     ToolchainMissing {
         target: Target,
@@ -221,8 +226,8 @@ pub enum CompileError {
 }
 
 /// Emit + `llc` a body to a target artifact written at `out`. Returns the emitted LLVM IR (for debugging
-/// and golden tests). The tools come from `POOT_LLC` (SPIR-V, PTX), `POOT_AIE_LLC` (AIE core; it only
-/// matters for the retained, inactive `AieCore` path, POOT-1093), and
+/// and golden tests). The tools come from `POOT_LLC` (SPIR-V, PTX), `POOT_AIE_LLC` (the AIE core's Peano,
+/// with no fallback to the system llc, which cannot lower `aie2p`), and
 /// `POOT_AMD_CLANG` with `POOT_ROCM_DEVICE_LIBS` (AMDGCN, which has no fallback).
 pub fn compile(
     body: &poot_kernel_ir::Body,
@@ -233,12 +238,15 @@ pub fn compile(
 }
 
 /// The external tools [`compile`] shells out to, resolved from the environment once per compile.
-struct Toolchain {
+pub struct Toolchain {
     /// `$POOT_LLC` or `llc` on PATH: lowers SPIR-V and PTX.
     llc: String,
-    /// `$POOT_AIE_LLC` (Peano, a separate llc fork from the system LLVM), else `llc`. Only the retained,
-    /// inactive `AieCore` path reads it (POOT-1093).
-    aie_llc: String,
+    /// `$POOT_AIE_LLC`: Peano, a separate llc fork from the system LLVM. There is no fallback: the system
+    /// llc cannot lower `aie2p`, so an unset variable is a typed missing-toolchain error.
+    aie_llc: Option<String>,
+    /// `$POOT_AIE_IRON`: the IRON link driver that turns a core object and a typed link recipe into an
+    /// xclbin and instruction stream (the protocol is in [`aie`]). No fallback.
+    aie_iron: Option<String>,
     /// `$POOT_AMD_CLANG`: the AMD-flavored clang that links the HSACO and adds the `PT_AMDGPU_HSA_LOAD_*` program
     /// headers the HSA loader needs. There is no fallback: a bare llc object is rejected at load with
     /// `HSA_STATUS_ERROR_INVALID_CODE_OBJECT` (card 106b).
@@ -248,16 +256,18 @@ struct Toolchain {
 }
 
 impl Toolchain {
-    fn from_env() -> Self {
+    /// The toolchain the process environment describes.
+    pub fn from_env() -> Self {
         Self::from_env_with(|name| std::env::var(name).ok())
     }
 
     /// The toolchain `lookup` describes: the environment lookup is injected so tests can present an environment
     /// without mutating the process's.
-    fn from_env_with(lookup: impl Fn(&str) -> Option<String>) -> Self {
+    pub fn from_env_with(lookup: impl Fn(&str) -> Option<String>) -> Self {
         let llc = lookup("POOT_LLC").unwrap_or_else(|| "llc".to_string());
         Toolchain {
-            aie_llc: lookup("POOT_AIE_LLC").unwrap_or_else(|| llc.clone()),
+            aie_llc: lookup("POOT_AIE_LLC"),
+            aie_iron: lookup("POOT_AIE_IRON"),
             llc,
             amd_clang: lookup("POOT_AMD_CLANG"),
             rocm_device_libs: lookup("POOT_ROCM_DEVICE_LIBS"),
@@ -268,8 +278,15 @@ impl Toolchain {
     fn binary(&self, target: Target) -> Result<&str, CompileError> {
         match target {
             // AIE core uses Peano (llvm-aie), a separate llc fork from the system LLVM that lowers SPIR-V/PTX
-            // (a manylinux binary run via an FHS wrapper on NixOS).
-            Target::AieCore => Ok(&self.aie_llc),
+            // (a manylinux binary run via an FHS wrapper on NixOS). The system llc has no `aie2p` backend, so
+            // there is no fallback.
+            Target::AieCore => self
+                .aie_llc
+                .as_deref()
+                .ok_or(CompileError::ToolchainMissing {
+                    target,
+                    variable: "POOT_AIE_LLC",
+                }),
             Target::AmdGcn(_) => self
                 .amd_clang
                 .as_deref()
@@ -482,8 +499,9 @@ mod arch_tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The environment seam maps each variable to its tool: `POOT_AMD_CLANG` selects the AMDGCN binary (and only
-    /// that), and SPIR-V/PTX/AIE keep their llc defaults.
+    /// The environment seam maps each variable to its tool: `POOT_AMD_CLANG` selects the AMDGCN binary,
+    /// `POOT_AIE_LLC` the AIE one, and SPIR-V/PTX keep their llc default. Unset, neither AMDGCN nor AIE has a
+    /// fallback.
     #[test]
     fn toolchain_maps_the_environment_to_one_binary_per_target() {
         let env = |name: &str| match name {
@@ -497,6 +515,15 @@ mod arch_tests {
         assert_eq!(binary(Target::AieCore), "/opt/peano/llc");
         assert_eq!(binary(Target::SpirvVulkan), "llc");
         assert_eq!(binary(Target::Nvptx), "llc");
+
+        let bare = Toolchain::from_env_with(|_| None);
+        assert!(matches!(
+            bare.binary(Target::AieCore),
+            Err(CompileError::ToolchainMissing {
+                target: Target::AieCore,
+                variable: "POOT_AIE_LLC"
+            })
+        ));
     }
 
     #[test]

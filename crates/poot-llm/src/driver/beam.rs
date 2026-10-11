@@ -304,6 +304,7 @@ impl Driver {
                 capacity: self.options.capacity,
                 kv: KvLayout::Contiguous,
                 logits: LogitRows::Last,
+                hidden: None,
             },
             head: Head::Logits,
             adapters: None,
@@ -367,7 +368,7 @@ impl Driver {
             let mut data = StepData {
                 tokens: vec![0; rows.get() * n],
                 pos: vec![0; rows.get() * n],
-                lora: vec![0.0; rows.get()],
+                lora: vec![0; rows.get()],
                 ..StepData::default()
             };
             for j in 0..n {
@@ -395,7 +396,7 @@ impl Driver {
         let mut data = StepData {
             tokens: vec![0; rows.get()],
             pos: vec![0; rows.get()],
-            lora: vec![0.0; rows.get()],
+            lora: vec![0; rows.get()],
             ..StepData::default()
         };
         for (row, beam) in live.iter().enumerate() {

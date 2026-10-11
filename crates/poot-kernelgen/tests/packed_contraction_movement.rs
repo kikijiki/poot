@@ -202,39 +202,16 @@ struct Case {
     out_shape: Vec<usize>,
     op: MovementOp,
     inputs: Vec<Tensor>,
-    index: Option<Index>,
+    index: Option<Vec<i32>>,
     expected: Tensor,
 }
 
-#[derive(Clone)]
-enum Index {
-    F32(Vec<f32>),
-    I32(Vec<i32>),
-}
-
-impl Index {
-    /// The index buffer's words.
-    fn words(&self) -> Vec<u32> {
-        match self {
-            Index::F32(values) => values.iter().map(|v| v.to_bits()).collect(),
-            Index::I32(values) => values.iter().map(|&v| v as u32).collect(),
-        }
-    }
-
-    fn dtype(&self) -> Ty {
-        match self {
-            Index::F32(_) => Ty::F32,
-            Index::I32(_) => Ty::I32,
-        }
-    }
-}
-
-/// One movement launch, as words: the spec, the data inputs, the index buffer (with its element type) and
-/// the output buffer's initial words.
+/// One movement launch, as words: the spec, the data inputs, the `I32` index buffer and the output buffer's
+/// initial words.
 struct Launch {
     spec: MovementSpec,
     data: Vec<Vec<u32>>,
-    index: Option<(Ty, Vec<u32>)>,
+    index: Option<Vec<u32>>,
     out: Vec<u32>,
 }
 
@@ -242,11 +219,11 @@ struct Launch {
 type Device<'a> = dyn FnMut(&Launch) -> Vec<u32> + 'a;
 
 /// The launch of `spec` over `inputs` and `index`, with an all-ones output buffer.
-fn launch(kind: Kind, spec: &MovementSpec, inputs: &[Tensor], index: Option<&Index>) -> Launch {
+fn launch(kind: Kind, spec: &MovementSpec, inputs: &[Tensor], index: Option<&[i32]>) -> Launch {
     Launch {
         spec: spec.clone(),
         data: inputs.iter().map(|t| kind.words(t)).collect(),
-        index: index.map(|i| (i.dtype(), i.words())),
+        index: index.map(|words| words.iter().map(|&w| w as u32).collect()),
         out: kind.blank(&spec.out_shape),
     }
 }
@@ -258,13 +235,10 @@ fn interpret(launch: &Launch) -> Vec<u32> {
     let body = poot_kernelgen::movement_body("movement", spec, None).expect("a valid request");
     body.verify().expect("the generated body verifies");
     let mut buffers: Vec<Buffer> = launch.data.iter().map(|w| kind.interp_buffer(w)).collect();
-    if let Some((dtype, words)) = &launch.index {
-        buffers.push(match dtype {
-            Ty::F32 => {
-                Buffer::from_f32s(&words.iter().map(|&w| f32::from_bits(w)).collect::<Vec<_>>())
-            }
-            _ => Buffer::from_i32s(&words.iter().map(|&w| w as i32).collect::<Vec<_>>()),
-        });
+    if let Some(words) = &launch.index {
+        buffers.push(Buffer::from_i32s(
+            &words.iter().map(|&w| w as i32).collect::<Vec<_>>(),
+        ));
     }
     buffers.push(kind.interp_buffer(&launch.out));
     run(
@@ -279,7 +253,7 @@ fn interpret(launch: &Launch) -> Vec<u32> {
 /// `case` on `kind`'s storage through `device`, compared to the reference.
 fn run_case(kind: Kind, case: &Case, device: &mut Device<'_>) {
     let spec = MovementSpec::new(kind.storage(), case.out_shape.clone(), case.op.clone());
-    let out = device(&launch(kind, &spec, &case.inputs, case.index.as_ref()));
+    let out = device(&launch(kind, &spec, &case.inputs, case.index.as_deref()));
     let got = kind.tensor(&out, &case.out_shape);
     assert_eq!(got, case.expected, "{} on {kind:?}", case.name);
 }
@@ -492,11 +466,10 @@ fn bank(width: u32) -> Vec<Case> {
             op: MovementOp::Gather {
                 in_shape,
                 axis,
-                index_dtype: Ty::F32,
                 index_numel,
             },
             inputs: vec![input],
-            index: Some(Index::F32(index.iter().map(|&i| i as f32).collect())),
+            index: Some(index.iter().map(|&i| i as i32).collect()),
             expected,
         });
     }
@@ -561,25 +534,18 @@ fn bank(width: u32) -> Vec<Case> {
             index: None,
             expected: expected.clone(),
         });
-        for index in [
-            Index::F32(vec![start as f32]),
-            Index::I32(vec![start as i32]),
-        ] {
-            cases.push(Case {
-                name,
-                out_shape: operand_shape.clone(),
-                op: MovementOp::UpdateSlice {
-                    update_shape: update_shape.clone(),
-                    axis,
-                    index: UpdateIndex::Runtime {
-                        dtype: index.dtype(),
-                    },
-                },
-                inputs: vec![operand.clone(), new.clone()],
-                index: Some(index),
-                expected: expected.clone(),
-            });
-        }
+        cases.push(Case {
+            name,
+            out_shape: operand_shape.clone(),
+            op: MovementOp::UpdateSlice {
+                update_shape: update_shape.clone(),
+                axis,
+                index: UpdateIndex::Runtime,
+            },
+            inputs: vec![operand.clone(), new.clone()],
+            index: Some(vec![start as i32]),
+            expected: expected.clone(),
+        });
     }
 
     for (name, base_shape, src_shape, inverse) in [
@@ -600,23 +566,17 @@ fn bank(width: u32) -> Vec<Case> {
         let base = t(&base_shape, 30);
         let src = t(&src_shape, 31);
         let expected = scatter_rows(&base, &src, &inverse);
-        for index in [
-            Index::F32(inverse.iter().map(|&i| i as f32).collect()),
-            Index::I32(inverse.clone()),
-        ] {
-            cases.push(Case {
-                name,
-                out_shape: base_shape.clone(),
-                op: MovementOp::ScatterRows {
-                    src_shape: src_shape.clone(),
-                    inverse_dtype: index.dtype(),
-                    window: None,
-                },
-                inputs: vec![base.clone(), src.clone()],
-                index: Some(index),
-                expected: expected.clone(),
-            });
-        }
+        cases.push(Case {
+            name,
+            out_shape: base_shape.clone(),
+            op: MovementOp::ScatterRows {
+                src_shape: src_shape.clone(),
+                window: None,
+            },
+            inputs: vec![base.clone(), src.clone()],
+            index: Some(inverse.clone()),
+            expected: expected.clone(),
+        });
     }
     cases
 }
@@ -650,7 +610,13 @@ const FP8_SPECIALS: [u32; 12] = [
 ];
 
 /// One raw-bit fixture: the op, its output shape, its index buffer, its data inputs and the reference.
-type RawBitCase = (MovementOp, Vec<usize>, Option<Index>, Vec<Tensor>, Tensor);
+type RawBitCase = (
+    MovementOp,
+    Vec<usize>,
+    Option<Vec<i32>>,
+    Vec<Tensor>,
+    Tensor,
+);
 
 /// The raw-bit fixture: a `[3, 5]` table of the specials (odd width, so every row ends in padding lanes), and
 /// a gather, a slice and a concat over it, each with its reference.
@@ -664,11 +630,10 @@ fn fp8_raw_bit_cases() -> Vec<RawBitCase> {
             MovementOp::Gather {
                 in_shape: vec![3, 5],
                 axis: 0,
-                index_dtype: Ty::F32,
                 index_numel: 4,
             },
             vec![4, 5],
-            Some(Index::F32(vec![2.0, 0.0, 1.0, 2.0])),
+            Some(vec![2, 0, 1, 2]),
             vec![table.clone()],
             gather(&table, 0, &[4], &[2, 0, 1, 2]),
         ),
@@ -717,7 +682,7 @@ fn fp8_raw_bits_on(device: &mut Device<'_>) {
             byte_kind,
             &spec(byte_kind.storage()),
             &inputs,
-            index.as_ref(),
+            index.as_deref(),
         ));
         let moved = byte_kind.tensor(&moved_words, &out_shape);
         assert_eq!(moved, reference, "raw bits through {op:?}");
@@ -728,7 +693,7 @@ fn fp8_raw_bits_on(device: &mut Device<'_>) {
             dense_kind,
             &spec(dense_kind.storage()),
             &dense_inputs,
-            index.as_ref(),
+            index.as_deref(),
         ));
         let dense = dense_kind.tensor(&dense_words, &out_shape);
         let moved_decoded = decoded(&moved);
@@ -760,7 +725,7 @@ fn windowed_scatter_on(kind: Kind, device: &mut Device<'_>) {
     let inverse = [-1, 1, -1, 0, -1, -1];
     let expected = scatter_rows(&base, &src, &inverse);
     let units = kind.storage().units(&[6, 5]);
-    let index = Index::F32(inverse.iter().map(|&i| i as f32).collect());
+    let index: Vec<i32> = inverse.to_vec();
     let mut merged = vec![0u32; units];
     let cut = units / 2 + 1;
     for (offset, threads) in [(0, cut), (cut, units - cut)] {
@@ -769,7 +734,6 @@ fn windowed_scatter_on(kind: Kind, device: &mut Device<'_>) {
             vec![6, 5],
             MovementOp::ScatterRows {
                 src_shape: vec![2, 5],
-                inverse_dtype: Ty::F32,
                 window: Some(UnitWindow { offset, threads }),
             },
         );
@@ -801,26 +765,21 @@ fn permuted_scatter_on(kind: Kind, device: &mut Device<'_>) {
     let src = Tensor::counting(&[4, 3], 50, 32);
     let destination = [2usize, 0, 3, 1];
     let expected = permute_rows(&src, &destination);
-    for index in [
-        Index::F32(destination.iter().map(|&i| i as f32).collect()),
-        Index::I32(destination.iter().map(|&i| i as i32).collect()),
-    ] {
-        let spec = MovementSpec::new(
-            kind.storage(),
-            vec![4, 3],
-            MovementOp::PermuteRows {
-                src_shape: vec![4, 3],
-                index_dtype: index.dtype(),
-            },
-        );
-        let out = device(&launch(
-            kind,
-            &spec,
-            std::slice::from_ref(&src),
-            Some(&index),
-        ));
-        assert_eq!(kind.tensor(&out, &[4, 3]), expected, "{kind:?}");
-    }
+    let index: Vec<i32> = destination.iter().map(|&i| i as i32).collect();
+    let spec = MovementSpec::new(
+        kind.storage(),
+        vec![4, 3],
+        MovementOp::PermuteRows {
+            src_shape: vec![4, 3],
+        },
+    );
+    let out = device(&launch(
+        kind,
+        &spec,
+        std::slice::from_ref(&src),
+        Some(&index),
+    ));
+    assert_eq!(kind.tensor(&out, &[4, 3]), expected, "{kind:?}");
 }
 
 #[test]
@@ -833,7 +792,6 @@ fn a_permuted_row_scatter_inverts_the_row_gather() {
         vec![4, 3],
         MovementOp::PermuteRows {
             src_shape: vec![4, 3],
-            index_dtype: Ty::F32,
         },
     );
     assert!(matches!(
@@ -888,24 +846,10 @@ fn malformed_requests_are_typed_refusals() {
             MovementOp::Gather {
                 in_shape: vec![4, 3],
                 axis: 2,
-                index_dtype: Ty::F32,
                 index_numel: 2
             }
         ),
         KernelGenError::AxisOutOfRange { .. }
-    ));
-    assert!(matches!(
-        refuse(
-            element.clone(),
-            vec![2, 3],
-            MovementOp::Gather {
-                in_shape: vec![4, 3],
-                axis: 0,
-                index_dtype: Ty::U32,
-                index_numel: 2
-            }
-        ),
-        KernelGenError::Unsupported { .. }
     ));
     assert!(matches!(
         refuse(
@@ -973,13 +917,17 @@ fn the_movement_bank_matches_the_reference_on_wgpu() {
         let body = poot_kernelgen::movement_body(&name, &launch.spec, None).unwrap();
         let path = artifact_path(&dir, &name, Target::SpirvVulkan);
         compile(&body, Target::SpirvVulkan, &path).unwrap_or_else(|e| panic!("{name}: {e}"));
-        let kernel = kernel_handle(&body, Target::SpirvVulkan, std::fs::read(&path).unwrap());
+        let kernel = kernel_handle(
+            &body,
+            poot_codegen::GpuTarget::SpirvVulkan,
+            std::fs::read(&path).unwrap(),
+        );
         let mut buffers: Vec<KernelBuffer> = launch
             .data
             .iter()
             .map(|w| KernelBuffer::read_only_u32(w))
             .collect();
-        if let Some((_, words)) = &launch.index {
+        if let Some(words) = &launch.index {
             buffers.push(KernelBuffer::read_only_u32(words));
         }
         buffers.push(KernelBuffer::write_i32(launch.out.len()));
@@ -1021,7 +969,11 @@ fn the_movement_bank_matches_the_reference_on_rocm() {
         let body = poot_kernelgen::movement_body(&name, &launch.spec, None).unwrap();
         let path = poot_codegen::artifact_path(&dir, &name, target);
         poot_codegen::compile(&body, target, &path).unwrap_or_else(|e| panic!("{name}: {e}"));
-        let compiled = poot_codegen::kernel_handle(&body, target, std::fs::read(&path).unwrap());
+        let compiled = poot_codegen::kernel_handle(
+            &body,
+            poot_codegen::GpuTarget::AmdGcn(arch),
+            std::fs::read(&path).unwrap(),
+        );
         let module = ctx
             .load_hsaco(&compiled)
             .unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -1032,7 +984,7 @@ fn the_movement_bank_matches_the_reference_on_rocm() {
             ctx.upload_f32(&as_f32, BufferRole::Input).unwrap()
         };
         let mut owned: Vec<_> = launch.data.iter().map(|w| upload(w)).collect();
-        if let Some((_, words)) = &launch.index {
+        if let Some(words) = &launch.index {
             owned.push(upload(words));
         }
         let inputs = owned.len();
@@ -1086,13 +1038,17 @@ fn the_movement_bank_matches_the_reference_on_ptx() {
         let body = poot_kernelgen::movement_body(&name, &launch.spec, None).unwrap();
         let path = artifact_path(&dir, &name, Target::Nvptx);
         compile(&body, Target::Nvptx, &path).unwrap_or_else(|e| panic!("{name}: {e}"));
-        let kernel = kernel_handle(&body, Target::Nvptx, std::fs::read(&path).unwrap());
+        let kernel = kernel_handle(
+            &body,
+            poot_codegen::GpuTarget::Nvptx,
+            std::fs::read(&path).unwrap(),
+        );
         let upload = |words: &[u32]| {
             let as_i32: Vec<i32> = words.iter().map(|&w| w as i32).collect();
             ctx.upload_i32(&as_i32).unwrap()
         };
         let mut owned: Vec<_> = launch.data.iter().map(|w| upload(w)).collect();
-        if let Some((_, words)) = &launch.index {
+        if let Some(words) = &launch.index {
             owned.push(upload(words));
         }
         let lengths: Vec<u32> = owned.iter().map(|b| b.elem_count()).collect();

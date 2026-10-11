@@ -13,6 +13,7 @@ use crate::graph::{
     ValueMeta, ValueTable,
 };
 use crate::op::{OpKind, SampleRule};
+use crate::range::IndexRange;
 use crate::types::{DType, Scalar, TensorType};
 use poot_quant::PackedWeight;
 
@@ -160,6 +161,7 @@ impl BuilderAppendPlan {
             // returns a real `ValueId`.
             key: None,
             state_role: None,
+            range: None,
         });
         Ok(self.handle(id))
     }
@@ -250,6 +252,7 @@ impl BuilderAppendPlan {
             name,
             key: None,
             state_role: None,
+            range: None,
         });
         self.equations.push(Eqn {
             op,
@@ -980,6 +983,7 @@ impl Builder {
         name: Option<String>,
         key: Option<SlotKey>,
         state_role: Option<StateRole>,
+        range: Option<IndexRange>,
     ) -> ValueId {
         let mut g = self.g.borrow_mut();
         let id = g.values.push(ValueMeta {
@@ -988,6 +992,7 @@ impl Builder {
             name,
             key,
             state_role,
+            range,
         });
         self.generation.set(
             self.generation
@@ -1002,7 +1007,36 @@ impl Builder {
 
     /// A constant input (weight / table), bound at graph close. Not per-token.
     pub fn constant(&self, name: &str, aval: TensorType) -> Traced {
-        let id = self.push_value(aval, Storage::Const, Some(name.to_string()), None, None);
+        self.declare_constant(name, aval, None)
+    }
+
+    /// [`Builder::constant`] for an I32 table whose words are declared to lie in `range`: a hash
+    /// router's token-to-experts table in `[0, experts)`.
+    ///
+    /// The declaration is a fact the graph's consumers rely on ([`crate::value_ranges`]: a `Gather`
+    /// of the table inherits it, so an `I32 -> F32` cast of a gathered word is proven exact), so the
+    /// weight binder checks every stored word against it and refuses a weight with a word outside it.
+    ///
+    /// # Panics
+    /// When `aval` is not I32: a range is a fact about integer words.
+    pub fn constant_ranged(&self, name: &str, aval: TensorType, range: IndexRange) -> Traced {
+        assert!(
+            aval.dtype == DType::I32,
+            "Builder::constant_ranged: const {name:?} declares a range but is {}; a range bounds I32 words",
+            aval.dtype
+        );
+        self.declare_constant(name, aval, Some(range))
+    }
+
+    fn declare_constant(&self, name: &str, aval: TensorType, range: Option<IndexRange>) -> Traced {
+        let id = self.push_value(
+            aval,
+            Storage::Const,
+            Some(name.to_string()),
+            None,
+            None,
+            range,
+        );
         {
             let mut g = self.g.borrow_mut();
             g.consts.push(id);
@@ -1015,7 +1049,7 @@ impl Builder {
     /// no name, no weight. Declared in [`ComputedConst::dtype`] and [`ComputedConst::shape`].
     pub fn computed(&self, computed: ComputedConst) -> Traced {
         let aval = TensorType::new(computed.shape(), computed.dtype());
-        let id = self.push_value(aval, Storage::Computed(computed), None, None, None);
+        let id = self.push_value(aval, Storage::Computed(computed), None, None, None, None);
         {
             let mut g = self.g.borrow_mut();
             g.consts.push(id);
@@ -1026,15 +1060,20 @@ impl Builder {
 
     /// A per-token-varying input (token / pos / seq_len), routed through a stable device buffer.
     pub fn slot(&self, slot: Slot, aval: TensorType) -> Traced {
-        let key = SlotKey::new(slot, None);
-        let name = key.to_string();
-        let id = self.push_value(aval, Storage::Slot(slot), Some(name), Some(key), None);
-        {
-            let mut g = self.g.borrow_mut();
-            g.slots.push((id, slot));
-            g.inputs.push(id);
-        }
-        self.handle(id)
+        self.declare_slot(slot, None, aval, None)
+    }
+
+    /// [`Builder::slot`] for an I32 input whose words are declared to lie in `range`: `Token` in
+    /// `[0, vocab)`, `Pos` in `[0, capacity)`.
+    ///
+    /// The declaration is a fact the graph's consumers rely on ([`crate::value_ranges`]: an
+    /// `I32 -> F32` cast of the slot is proven exact from it), so every binder checks the bound words
+    /// against it and refuses a step with a word outside it.
+    ///
+    /// # Panics
+    /// When `aval` is not I32: a range is a fact about integer words.
+    pub fn slot_ranged(&self, slot: Slot, aval: TensorType, range: IndexRange) -> Traced {
+        self.declare_slot(slot, None, aval, Some(range))
     }
 
     /// A runtime input whose name carries a caller-supplied disambiguator, so one graph can hold several inputs of
@@ -1055,9 +1094,40 @@ impl Builder {
             "Builder::slot_named: an empty tag for slot {slot:?} is not a valid disambiguator - \
              pass a tag or use Builder::slot for the untagged occurrence"
         );
-        let key = SlotKey::new(slot, Some(tag));
+        self.declare_slot(slot, Some(tag), aval, None)
+    }
+
+    /// [`Builder::slot_named`] for an I32 input with a declared `range` ([`Builder::slot_ranged`]).
+    pub fn slot_named_ranged(
+        &self,
+        slot: Slot,
+        tag: &str,
+        aval: TensorType,
+        range: IndexRange,
+    ) -> Traced {
+        assert!(
+            !tag.is_empty(),
+            "Builder::slot_named_ranged: an empty tag for slot {slot:?} is not a valid \
+             disambiguator - pass a tag or use Builder::slot_ranged for the untagged occurrence"
+        );
+        self.declare_slot(slot, Some(tag), aval, Some(range))
+    }
+
+    fn declare_slot(
+        &self,
+        slot: Slot,
+        tag: Option<&str>,
+        aval: TensorType,
+        range: Option<IndexRange>,
+    ) -> Traced {
+        assert!(
+            range.is_none() || aval.dtype == DType::I32,
+            "Builder: slot {slot:?} declares a range but is {}; a range bounds I32 words",
+            aval.dtype
+        );
+        let key = SlotKey::new(slot, tag);
         let name = key.to_string();
-        {
+        if let Some(tag) = tag {
             let g = self.g.borrow();
             assert!(
                 !g.values
@@ -1067,7 +1137,14 @@ impl Builder {
                  bind both ids from one buffer, the collision slot_named exists to prevent"
             );
         }
-        let id = self.push_value(aval, Storage::Slot(slot), Some(name), Some(key), None);
+        let id = self.push_value(
+            aval,
+            Storage::Slot(slot),
+            Some(name),
+            Some(key),
+            None,
+            range,
+        );
         {
             let mut g = self.g.borrow_mut();
             g.slots.push((id, slot));
@@ -1097,6 +1174,7 @@ impl Builder {
             Some(name.to_string()),
             None,
             Some(role),
+            None,
         );
         {
             let mut g = self.g.borrow_mut();
@@ -1116,7 +1194,7 @@ impl Builder {
         let aval = op
             .infer(in_types)
             .unwrap_or_else(|e| panic!("trace-time shape error in {}: {e}", op.name()));
-        let out = self.push_value(aval, Storage::Device, None, None, None);
+        let out = self.push_value(aval, Storage::Device, None, None, None, None);
         self.g.borrow_mut().eqns.push(Eqn {
             op,
             inputs: operands,
@@ -1802,6 +1880,7 @@ mod tests {
                 name: None,
                 key: None,
                 state_role: None,
+                range: None,
             });
             plan.declare_result(plan.handle(value))?;
             let before = state(&builder);
@@ -1955,6 +2034,7 @@ mod tests {
             name: Some(name.to_string()),
             key: None,
             state_role: (storage == Storage::State).then_some(StateRole::Recurrent),
+            range: None,
         });
         match namespace {
             BuilderValueNamespace::Input => graph.inputs.push(id),

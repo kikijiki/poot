@@ -24,7 +24,7 @@ use poot_quant::format::WeightFormat;
 use poot_quant::{PackedComponentRef, PackedPayload, PackedStack, PackedStackComponentRef};
 use poot_runtime_common::DeviceBackend;
 use poot_target::Backend;
-use poot_tensor::HostTensor;
+use poot_tensor::{DType, HostTensor};
 
 mod common;
 
@@ -97,7 +97,11 @@ fn run_moe(gpu: &mut PtxDevice, out: usize, k: usize) -> (Vec<f32>, Vec<f32>) {
     let column = |m: usize| (m * 37 + 11) % k;
     let b = Builder::new();
     let x = b.slot_named(Slot::Activation, "moe-x", TensorType::f32(vec![ROWS, k]));
-    let ids = b.slot_named(Slot::Activation, "moe-ids", TensorType::f32(vec![ROWS]));
+    let ids = b.slot_named(
+        Slot::Activation,
+        "moe-ids",
+        TensorType::new(vec![ROWS], DType::I32),
+    );
     let y = poot_graph_ir::ops::packed_indexed_linear(&b, x, ids, &table).unwrap();
     let graph = compiled(gpu, &b.finish(y));
     assert!(
@@ -130,8 +134,8 @@ fn run_moe(gpu: &mut PtxDevice, out: usize, k: usize) -> (Vec<f32>, Vec<f32>) {
         one_hot[m * k + column(m)] = 1.0;
     }
     inputs.insert(x.id(), HostTensor::f32(vec![ROWS, k], one_hot).into());
-    let selected: Vec<f32> = (0..ROWS).map(|m| (m % EXPERTS) as f32).collect();
-    inputs.insert(ids.id(), HostTensor::f32(vec![ROWS], selected).into());
+    let selected: Vec<i32> = (0..ROWS).map(|m| (m % EXPERTS) as i32).collect();
+    inputs.insert(ids.id(), HostTensor::i32(vec![ROWS], selected).into());
     let got = common::run_resident(gpu, &graph, &inputs)
         .as_f32()
         .unwrap()
@@ -187,7 +191,7 @@ fn a_widened_row_gather_after_a_narrow_one_is_bit_exact() {
     ));
     for n in [8, 4096] {
         let b = Builder::new();
-        let token = b.slot(Slot::Token, TensorType::f32(vec![n]));
+        let token = b.slot(Slot::Token, TensorType::new(vec![n], DType::I32));
         let rows =
             poot_graph_ir::ops::packed_embedding(&b, token, "model.embed_tokens", owner.weight())
                 .unwrap();
@@ -203,7 +207,7 @@ fn a_widened_row_gather_after_a_narrow_one_is_bit_exact() {
         let ids: Vec<usize> = (0..n).map(|r| (r * 13 + 5) % VOCAB).collect();
         inputs.insert(
             token.id(),
-            HostTensor::f32(vec![n], ids.iter().map(|&id| id as f32).collect()).into(),
+            HostTensor::i32(vec![n], ids.iter().map(|&id| id as i32).collect()).into(),
         );
         let got = common::run_resident(&mut gpu, &graph, &inputs)
             .as_f32()

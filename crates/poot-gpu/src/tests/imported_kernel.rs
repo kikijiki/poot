@@ -29,7 +29,7 @@ fn load(
     poot_codegen::compile(body, poot_codegen::Target::SpirvVulkan, &out_path)
         .unwrap_or_else(|e| panic!("{name} must compile to SPIR-V: {e}"));
     let spv = std::fs::read(&out_path).unwrap();
-    let compiled = poot_codegen::kernel_handle(body, poot_codegen::Target::SpirvVulkan, spv);
+    let compiled = poot_codegen::kernel_handle(body, poot_codegen::GpuTarget::SpirvVulkan, spv);
     device
         .load_kernel(name, compiled)
         .unwrap_or_else(|e| panic!("load {name}: {e:?}"))

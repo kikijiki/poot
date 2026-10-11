@@ -1373,7 +1373,7 @@ mod tests {
         );
     }
 
-    /// SC-002: a row id above `2^24`, which an F32 index rounds to a neighbour, reads its own row.
+    /// SC-002: a row id above `2^24`, which an F32 round trip rounds to a neighbour, reads its own row.
     /// A table of `2^24 + 3` one-byte rows is cut in two so the id (`2^24 + 1`) and its F32 round
     /// trip (`2^24`) lie in different shards, with 2.0 only in the id's row. Mutation: round the
     /// ids through F32 before the lookup (`ids` cast to F32 and back in `Table::lookup`); the id

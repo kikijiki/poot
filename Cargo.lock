@@ -1921,6 +1921,7 @@ dependencies = [
  "poot-kernelgen",
  "poot-models",
  "poot-quant",
+ "poot-runtime-common",
  "poot-target",
  "poot-tensor",
  "poot-test-util",

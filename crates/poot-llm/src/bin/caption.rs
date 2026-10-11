@@ -43,6 +43,7 @@ fn options(capacity: usize, chunk: usize) -> DriverOptions {
         },
         charge: program_retention,
         draft: DraftPolicy::Off,
+        hidden_window: None,
     }
 }
 

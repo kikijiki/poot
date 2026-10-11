@@ -548,7 +548,7 @@ mod tests {
         let out = poot_codegen::artifact_path(&dir, name, Target::SpirvVulkan);
         compile(body, Target::SpirvVulkan, &out).expect("compile");
         let bytes = std::fs::read(&out).unwrap();
-        poot_codegen::kernel_handle(body, Target::SpirvVulkan, bytes)
+        poot_codegen::kernel_handle(body, poot_codegen::GpuTarget::SpirvVulkan, bytes)
     }
 
     fn ctx() -> Option<Context> {

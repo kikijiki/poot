@@ -627,7 +627,6 @@ mod needs_tests {
                 let mut caps = default_caps_for(backend);
                 caps.max_dispatch_work = Queried::Known(budget);
                 crate::plan_eqn_compiled(
-                    &crate::ExactI32StorageAnalysis::new(&graph),
                     &graph,
                     eqn,
                     &Target { backend, caps },
@@ -748,7 +747,6 @@ mod needs_tests {
                 .unwrap_or_else(|| panic!("{kernel:?}: fixture has no matching equation"));
             let plan = |caps: DeviceCaps| {
                 crate::plan_eqn_compiled(
-                    &crate::ExactI32StorageAnalysis::new(&graph),
                     &graph,
                     eqn,
                     &Target { backend, caps },

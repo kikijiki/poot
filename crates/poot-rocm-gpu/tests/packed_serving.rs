@@ -154,6 +154,10 @@ fn f32_bytes(data: &[f32]) -> Vec<u8> {
     data.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
+fn i32_bytes(data: &[i32]) -> Vec<u8> {
+    data.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
 fn one_hot_bytes(rows: usize, cols: usize, hot: impl Fn(usize) -> usize) -> Vec<u8> {
     let mut data = vec![0.0f32; rows * cols];
     for r in 0..rows {
@@ -200,7 +204,7 @@ fn slot_decode_graph(descriptor: poot_quant::PackedWeight) -> (Graph, SlotKey, S
     let b = Builder::new();
     let x = b.slot_named(Slot::Activation, "onehot", TensorType::f32(vec![1, K]));
     let y = poot_graph_ir::ops::packed_linear(&b, x, "layer", descriptor, None, None).unwrap();
-    let pos = b.slot(Slot::Pos, TensorType::f32(vec![]));
+    let pos = b.slot(Slot::Pos, TensorType::new(vec![], DType::I32));
     let cache = b.state_input(
         "decoded",
         TensorType::f32(vec![STEPS, OUT]),
@@ -250,8 +254,8 @@ fn packed_decode_through_the_contract_is_bit_exact() {
                 (
                     pos_key.clone(),
                     vec![],
-                    DType::F32,
-                    f32_bytes(&[step as f32]),
+                    DType::I32,
+                    i32_bytes(&[step as i32]),
                 ),
             ];
             let inputs = slot_inputs(&graph, &values);
@@ -333,8 +337,8 @@ fn packed_e4m3_per_channel_decode_through_the_contract_is_bit_exact() {
             (
                 pos_key.clone(),
                 vec![],
-                DType::F32,
-                f32_bytes(&[step as f32]),
+                DType::I32,
+                i32_bytes(&[step as i32]),
             ),
         ];
         let inputs = slot_inputs(&graph, &values);
@@ -596,7 +600,11 @@ fn run_indexed_case(
     let what = format!("{format:?}");
     let b = Builder::new();
     let x = b.slot_named(Slot::Activation, "moe-x", TensorType::f32(vec![rows, k]));
-    let ids = b.slot_named(Slot::Activation, "moe-ids", TensorType::f32(vec![rows]));
+    let ids = b.slot_named(
+        Slot::Activation,
+        "moe-ids",
+        TensorType::new(vec![rows], DType::I32),
+    );
     let y = poot_graph_ir::ops::packed_indexed_linear(&b, x, ids, &table).unwrap();
     let graph = b.finish(y);
     let x_key = graph.meta(x.id()).slot_key().unwrap().clone();
@@ -642,7 +650,7 @@ fn run_indexed_case(
     }
     let entry = engine.add_entry(exe, &program).unwrap();
 
-    let selected: Vec<f32> = (0..rows).map(|m| expert_of(m) as f32).collect();
+    let selected: Vec<i32> = (0..rows).map(|m| expert_of(m) as i32).collect();
     let values = [
         (
             x_key,
@@ -650,7 +658,7 @@ fn run_indexed_case(
             DType::F32,
             one_hot_bytes(rows, k, |m| column_of(m, k)),
         ),
-        (ids_key, vec![rows], DType::F32, f32_bytes(&selected)),
+        (ids_key, vec![rows], DType::I32, i32_bytes(&selected)),
     ];
     let inputs = slot_inputs(&graph, &values);
     let got = bytemuck_f32(
@@ -817,7 +825,11 @@ fn packed_embedding_row_gather_is_bit_exact() {
                 vec![ids.len()]
             };
             let b = Builder::new();
-            let token = b.slot_named(Slot::Token, "token", TensorType::f32(shape.clone()));
+            let token = b.slot_named(
+                Slot::Token,
+                "token",
+                TensorType::new(shape.clone(), DType::I32),
+            );
             let rows = poot_graph_ir::ops::packed_embedding(
                 &b,
                 token,
@@ -836,8 +848,8 @@ fn packed_embedding_row_gather_is_bit_exact() {
                 .load_weights(Arc::clone(&store), Arc::new(weights.map()))
                 .unwrap();
             let entry = engine.add_entry(exe, &staged(target, &named)).unwrap();
-            let token_ids: Vec<f32> = ids.iter().map(|&id| id as f32).collect();
-            let values = [(token_key, shape.clone(), DType::F32, f32_bytes(&token_ids))];
+            let token_ids: Vec<i32> = ids.iter().map(|&id| id as i32).collect();
+            let values = [(token_key, shape.clone(), DType::I32, i32_bytes(&token_ids))];
             let inputs = slot_inputs(&graph, &values);
             let out = bytemuck_f32(
                 &engine
